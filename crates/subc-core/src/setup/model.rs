@@ -5,12 +5,6 @@ use super::{
     mc_detection::{self, McDetection},
 };
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ReleaseResolutionStrategy {
-    Latest,
-    TagPrefix(&'static str),
-}
-
 /// The independently selectable pieces of an alpha CortexKit installation.
 ///
 /// Core owns the daemon and MCP bridge. Every other entry is independently
@@ -54,31 +48,6 @@ impl Component {
             Self::Insula => Some("insula"),
             Self::Claustrum => Some("claustrum"),
             Self::Synapse => Some("synapse"),
-        }
-    }
-
-    pub const fn repository(self) -> &'static str {
-        match self {
-            Self::Core => "subconscious",
-            Self::Aft => "aft",
-            Self::Mc => "magic-context",
-            Self::Insula => "insula",
-            Self::Claustrum => "claustrum",
-            Self::Synapse => "synapse",
-        }
-    }
-
-    pub const fn release_resolution_strategy(self) -> ReleaseResolutionStrategy {
-        match self {
-            // Owner-ruled: magic-context's releases/latest surface belongs to
-            // its standalone npm product and its users' tooling. A fleet
-            // channel must not squat on a repo's public Latest surface, so mc
-            // module releases are prerelease-tagged and resolved by tag
-            // pattern. Do not "simplify" this back to latest-resolution.
-            Self::Mc => ReleaseResolutionStrategy::TagPrefix("ck-mc-"),
-            Self::Core | Self::Aft | Self::Insula | Self::Claustrum | Self::Synapse => {
-                ReleaseResolutionStrategy::Latest
-            }
         }
     }
 

@@ -4,6 +4,10 @@ use serde::{Deserialize, Serialize};
 
 pub const UPDATE_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
+/// Bumped when the cache document's meaning changed (signed index instead of
+/// GitHub latest-release payloads). Older files are treated as absent.
+pub const UPDATE_CACHE_FORMAT_VERSION: u32 = 2;
+
 /// Release evidence retained after a successful user-initiated update check.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CachedRelease {
@@ -15,6 +19,8 @@ pub struct CachedRelease {
 /// this module, so release metadata can only be read or refreshed by `ck`.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct UpdateMetadata {
+    #[serde(default)]
+    pub format_version: u32,
     pub checked_at_unix_secs: u64,
     pub targets: BTreeMap<String, CachedRelease>,
 }
@@ -65,8 +71,11 @@ impl UpdateCache {
             Err(error) if error.kind() == ErrorKind::NotFound => return CacheRead::Absent,
             Err(error) => return CacheRead::Unreadable(error.to_string()),
         };
-        match serde_json::from_slice(&bytes) {
-            Ok(metadata) => CacheRead::Present(metadata),
+        match serde_json::from_slice::<UpdateMetadata>(&bytes) {
+            Ok(metadata) if metadata.format_version == UPDATE_CACHE_FORMAT_VERSION => {
+                CacheRead::Present(metadata)
+            }
+            Ok(_) => CacheRead::Absent,
             Err(_) => CacheRead::Malformed,
         }
     }
@@ -123,6 +132,7 @@ mod tests {
 
     fn metadata(checked_at_unix_secs: u64) -> UpdateMetadata {
         UpdateMetadata {
+            format_version: UPDATE_CACHE_FORMAT_VERSION,
             checked_at_unix_secs,
             targets: BTreeMap::from([(
                 "ck".to_string(),
@@ -132,6 +142,15 @@ mod tests {
                 },
             )]),
         }
+    }
+
+    #[test]
+    fn old_cache_format_is_treated_as_absent() {
+        let _dir = TestTempDir::new("old-format");
+        let path = _dir.path().join("update-metadata.json");
+        let cache = UpdateCache::new(&path);
+        fs::write(&path, r#"{"checked_at_unix_secs":1,"targets":{}}"#).unwrap();
+        assert_eq!(cache.load(), CacheRead::Absent);
     }
 
     #[test]

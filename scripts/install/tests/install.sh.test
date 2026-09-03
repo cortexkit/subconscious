@@ -40,29 +40,36 @@ while (($# > 0)); do
   esac
 done
 printf '%s\n' "$url" >>"$CK_TEST_REQUEST_LOG"
-case "$url" in
-  *.sha256)
-    if [[ "${CK_TEST_DOWNLOAD_FAILURE:-}" == "sidecar" ]]; then
-      exit 22
-    fi
-    if [[ "${CK_TEST_DIGEST_MISMATCH:-}" == "1" ]]; then
-      archive_name="${url##*/}"
-      archive_name="${archive_name%.sha256}"
-      printf '%064d  %s\n' 0 "$archive_name" >"$out"
-    else
-      archive_name="${url##*/}"
-      archive_name="${archive_name%.sha256}"
-      digest=$(printf 'fixture archive\n' | shasum -a 256 | awk '{print $1}')
-      printf '%s  %s\n' "$digest" "$archive_name" >"$out"
-    fi
-    ;;
-  *)
-    if [[ "${CK_TEST_DOWNLOAD_FAILURE:-}" == "archive" ]]; then
-      exit 22
-    fi
-    printf 'fixture archive\n' >"$out"
-    ;;
-esac
+if [[ "$url" == *index.json ]]; then
+  if [[ "${CK_TEST_DOWNLOAD_FAILURE:-}" == "index" ]]; then
+    exit 22
+  fi
+  digest=$(printf 'fixture archive\n' | shasum -a 256 | awk '{print $1}')
+  if [[ "${CK_TEST_DIGEST_MISMATCH:-}" == "1" ]]; then
+    digest=$(printf '%064d' 0)
+  fi
+  sha_json="\"$digest\""
+  if [[ "${CK_TEST_DOWNLOAD_FAILURE:-}" == "sidecar" ]]; then
+    sha_json=null
+  fi
+  ck_json="{\"url\":\"https://release.fixture.example/ck-ASSET.zip\",\"sha256\":$sha_json,\"bytes\":16,\"reports\":\"0.16.0\"}"
+  if [[ "${CK_TEST_DOWNLOAD_FAILURE:-}" == "sidecar" && "${CK_TEST_OMIT_CK:-}" == "1" ]]; then
+    ck_json="{}"
+  fi
+  cat >"$out" <<INDEX
+{"schema":1,"channel":"alpha","generated_at_ms":1788425000000,"components":{"core":{"repository":"cortexkit/subconscious","release":"subc-core-v0.16.0","version":"0.16.0","assets":{"linux-x64":{"ck":{"url":"https://release.fixture.example/ck-linux-x64.zip","sha256":$sha_json,"bytes":16,"reports":"0.16.0"}},"darwin-arm64":{"ck":{"url":"https://release.fixture.example/ck-darwin-arm64.zip","sha256":$sha_json,"bytes":16,"reports":"0.16.0"}},"linux-arm64":{"ck":{"url":"https://release.fixture.example/ck-linux-arm64.zip","sha256":$sha_json,"bytes":16,"reports":"0.16.0"}}}}}}
+INDEX
+  if [[ "${CK_TEST_MISSING_ASSET:-}" == "1" ]]; then
+    cat >"$out" <<'INDEX'
+{"schema":1,"channel":"alpha","generated_at_ms":1788425000000,"components":{"core":{"repository":"cortexkit/subconscious","release":"subc-core-v0.16.0","version":"0.16.0","assets":{}}}}
+INDEX
+  fi
+  exit 0
+fi
+if [[ "${CK_TEST_DOWNLOAD_FAILURE:-}" == "archive" ]]; then
+  exit 22
+fi
+printf 'fixture archive\n' >"$out"
 EOF
 cat >"$stub_dir/unzip" <<'EOF'
 #!/usr/bin/env bash
@@ -104,7 +111,7 @@ run_installer() {
     HOME="$home" \
     SHELL=/bin/bash \
     PATH="$stub_dir:$PATH" \
-    CK_RELEASE_BASE_URL=https://release.fixture.example/download \
+    CK_RELEASE_INDEX_URL=https://release.fixture.example/releases/v1/index.json \
     CK_TEST_REQUEST_LOG="$home/requests.log" \
     CK_TEST_SETUP_MARKER="$home/setup-called" \
     "$@" \
@@ -119,8 +126,8 @@ linux_output="$test_root/linux-output"
 run_installer "$linux_home" "$linux_output" \
   CK_TEST_OS=Linux CK_TEST_ARCH=x86_64 CK_TEST_KERNEL=generic
 
+grep -Fq 'index.json' "$linux_home/requests.log" || fail 'Linux installer did not fetch the release index'
 grep -Fq 'ck-linux-x64.zip' "$linux_home/requests.log" || fail 'Linux archive name was not requested'
-grep -Fq 'ck-linux-x64.zip.sha256' "$linux_home/requests.log" || fail 'Linux sidecar name was not requested'
 grep -Fq 'Next: ck setup' "$linux_output" || fail 'installer did not print the setup command'
 [[ ! -e "$linux_home/setup-called" ]] || fail 'installer started the extracted ck process'
 [[ -x "$linux_home/.local/share/cortexkit/bin/ck" ]] || fail 'installer did not place ck'
@@ -166,7 +173,7 @@ expect_refusal unsupported-platform unsupported-platform \
 expect_refusal missing-archive release-incomplete \
   CK_TEST_OS=Linux CK_TEST_ARCH=x86_64 CK_TEST_KERNEL=generic CK_TEST_DOWNLOAD_FAILURE=archive
 expect_refusal missing-sidecar release-incomplete \
-  CK_TEST_OS=Linux CK_TEST_ARCH=x86_64 CK_TEST_KERNEL=generic CK_TEST_DOWNLOAD_FAILURE=sidecar
+  CK_TEST_OS=Linux CK_TEST_ARCH=x86_64 CK_TEST_KERNEL=generic CK_TEST_MISSING_ASSET=1
 expect_refusal digest-mismatch digest-mismatch \
   CK_TEST_OS=Linux CK_TEST_ARCH=x86_64 CK_TEST_KERNEL=generic CK_TEST_DIGEST_MISMATCH=1
 expect_refusal extraction-failed extraction-failed \

@@ -1,14 +1,14 @@
-# Bootstrap only ck from the latest subconscious GitHub Release. Setup owns all
-# runtime and configuration work, so this script must never invoke `ck setup`.
+# Bootstrap only ck from the CortexKit release index. Setup owns all runtime
+# and configuration work, so this script must never invoke `ck setup`. The
+# index signature is not checked here: bootstrap trust is TLS to the index
+# host, and the placed `ck` verifies the signed index on its first setup.
 [CmdletBinding()]
-param(
-    [string]$ReleaseBaseUrl = $env:CK_RELEASE_BASE_URL
-)
+param()
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$ReleaseBaseUrlDefault = 'https://github.com/cortexkit/subconscious/releases/latest/download'
+$IndexUrlDefault = 'https://cortexkit.io/releases/v1/index.json'
 
 function Refuse {
     param(
@@ -54,34 +54,6 @@ function Test-FileBytesEqual {
         }
     }
     return $true
-}
-
-function Get-ExpectedDigest {
-    param(
-        [Parameter(Mandatory = $true)][string]$Sidecar,
-        [Parameter(Mandatory = $true)][string]$ArchiveName
-    )
-
-    try {
-        $lines = [System.IO.File]::ReadAllLines($Sidecar)
-    }
-    catch {
-        Refuse 'digest-sidecar-invalid' "could not read $Sidecar ($($_.Exception.Message))"
-    }
-    if ($lines.Count -ne 1) {
-        Refuse 'digest-sidecar-invalid' "$Sidecar must contain one shasum-compatible record"
-    }
-
-    $record = $lines[0]
-    $pattern = '^(?<digest>[0-9A-Fa-f]{64})(?:[ \t]+\*?(?<filename>[^ \t]+))?$'
-    $match = [System.Text.RegularExpressions.Regex]::Match($record, $pattern)
-    if (-not $match.Success) {
-        Refuse 'digest-sidecar-invalid' "$Sidecar is not a shasum-compatible record"
-    }
-    if ($match.Groups['filename'].Success -and $match.Groups['filename'].Value -ne $ArchiveName) {
-        Refuse 'digest-sidecar-invalid' "$Sidecar names $($match.Groups['filename'].Value), expected $ArchiveName"
-    }
-    return $match.Groups['digest'].Value.ToLowerInvariant()
 }
 
 function Ensure-UserPath {
@@ -167,10 +139,10 @@ function Write-InstallerManifest {
     }
 }
 
-if ([string]::IsNullOrWhiteSpace($ReleaseBaseUrl)) {
-    $ReleaseBaseUrl = $ReleaseBaseUrlDefault
+$IndexUrl = $env:CK_RELEASE_INDEX_URL
+if ([string]::IsNullOrWhiteSpace($IndexUrl)) {
+    $IndexUrl = $IndexUrlDefault
 }
-$ReleaseBaseUrl = $ReleaseBaseUrl.TrimEnd('/')
 
 $rawArchitecture = $env:PROCESSOR_ARCHITEW6432
 if ([string]::IsNullOrWhiteSpace($rawArchitecture)) {
@@ -194,32 +166,41 @@ if ([string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
 
 $os = 'windows'
 $archiveName = "ck-$os-$arch.zip"
-$sidecarName = "$archiveName.sha256"
 $dataDir = Join-Path $env:LOCALAPPDATA 'cortexkit'
 $binDir = Join-Path $dataDir 'bin'
 $destination = Join-Path $binDir 'ck.exe'
 $manifest = Join-Path $dataDir 'installer-manifest.json'
 $tempDir = Join-Path ([System.IO.Path]::GetTempPath()) ("ck-install-" + [System.Guid]::NewGuid().ToString('N'))
 $archivePath = Join-Path $tempDir $archiveName
-$sidecarPath = Join-Path $tempDir $sidecarName
 $extractDir = Join-Path $tempDir 'extracted'
+$indexPath = Join-Path $tempDir 'index.json'
 
 try {
     New-Item -ItemType Directory -Path $tempDir -Force -ErrorAction Stop | Out-Null
     try {
-        Invoke-WebRequest -Uri "$ReleaseBaseUrl/$archiveName" -OutFile $archivePath -UseBasicParsing -ErrorAction Stop
+        Invoke-WebRequest -Uri $IndexUrl -OutFile $indexPath -UseBasicParsing -ErrorAction Stop
     }
     catch {
-        Refuse 'release-incomplete' "ck archive unavailable: $archiveName from $ReleaseBaseUrl ($($_.Exception.Message))"
+        Refuse 'release-incomplete' "release index unavailable: $IndexUrl ($($_.Exception.Message))"
     }
     try {
-        Invoke-WebRequest -Uri "$ReleaseBaseUrl/$sidecarName" -OutFile $sidecarPath -UseBasicParsing -ErrorAction Stop
+        $index = Get-Content -LiteralPath $indexPath -Raw -ErrorAction Stop | ConvertFrom-Json
+        $asset = $index.components.core.assets.'windows-x64'.ck
+        $archiveUrl = [string]$asset.url
+        $expectedDigest = ([string]$asset.sha256).ToLowerInvariant()
     }
     catch {
-        Refuse 'release-incomplete' "ck digest sidecar unavailable: $sidecarName from $ReleaseBaseUrl ($($_.Exception.Message))"
+        Refuse 'release-incomplete' "ck asset for windows-x64 is missing from $IndexUrl ($($_.Exception.Message))"
     }
-
-    $expectedDigest = Get-ExpectedDigest -Sidecar $sidecarPath -ArchiveName $archiveName
+    if ([string]::IsNullOrWhiteSpace($archiveUrl) -or $expectedDigest.Length -ne 64) {
+        Refuse 'release-incomplete' "ck asset for windows-x64 is missing from $IndexUrl"
+    }
+    try {
+        Invoke-WebRequest -Uri $archiveUrl -OutFile $archivePath -UseBasicParsing -ErrorAction Stop
+    }
+    catch {
+        Refuse 'release-incomplete' "ck archive unavailable: $archiveName from $archiveUrl ($($_.Exception.Message))"
+    }
     $actualDigest = Get-Sha256 -Path $archivePath
     if ($actualDigest -ne $expectedDigest) {
         Refuse 'digest-mismatch' "$archiveName expected $expectedDigest but downloaded $actualDigest"

@@ -7,13 +7,13 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use serde::Deserialize;
 use tokio::time;
 
 use super::{
     model::{
         PlatformObservation, ReleaseAvailability, UpgradeObserved, UpgradeState, UpgradeTarget,
     },
+    release_index::{self, IndexRefusal, ReleaseIndex},
     update_cache::{CacheRead, CachedRelease, UpdateCache, UpdateMetadata},
 };
 
@@ -38,18 +38,18 @@ pub trait ReleaseSource: Send + Sync {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ReleaseSourceError {
     Offline(String),
-    RateLimited,
     InvalidResponse(String),
+    IndexStale { url: String },
 }
 
 impl fmt::Display for ReleaseSourceError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Offline(reason) => write!(formatter, "release source unavailable: {reason}"),
-            Self::RateLimited => formatter.write_str("release source rate limited the check"),
             Self::InvalidResponse(reason) => {
                 write!(formatter, "invalid release response: {reason}")
             }
+            Self::IndexStale { url } => write!(formatter, "updates: index stale ({url})"),
         }
     }
 }
@@ -68,6 +68,12 @@ pub enum UpdateCheckError {
         source: ReleaseSourceError,
     },
     CacheWrite(String),
+    IndexStale {
+        url: String,
+    },
+    IndexUnreachable {
+        reason: String,
+    },
 }
 
 impl fmt::Display for UpdateCheckError {
@@ -84,92 +90,118 @@ impl fmt::Display for UpdateCheckError {
             Self::CacheWrite(reason) => {
                 write!(formatter, "could not save update metadata: {reason}")
             }
+            Self::IndexStale { .. } => formatter.write_str("updates: index stale"),
+            Self::IndexUnreachable { reason } => {
+                write!(formatter, "updates: not checked ({reason})")
+            }
         }
     }
 }
 
 impl Error for UpdateCheckError {}
 
-/// A GitHub latest-release source. The base URL override exists so tests and
-/// air-gapped release mirrors can provide the same `/repos/<owner>/<repo>` API
-/// shape without changing the daemon or its network policy.
-pub struct GitHubReleaseSource {
-    client: reqwest::Client,
-    api_base: String,
+/// Resolves installed-vs-available from one fetched signed index. Construction
+/// does not touch the network; the first `fetch` downloads the document once
+/// and every later target reads the cache.
+pub struct IndexReleaseSource {
+    url: String,
+    cached: std::sync::Mutex<Option<Result<ReleaseIndex, IndexRefusal>>>,
 }
 
-impl GitHubReleaseSource {
-    pub fn from_environment() -> Result<Self, ReleaseSourceError> {
-        let api_base = std::env::var("CK_UPDATE_SOURCE_BASE_URL")
-            .unwrap_or_else(|_| "https://api.github.com".to_string());
-        let client = reqwest::Client::builder()
-            .user_agent("ck-update-check")
-            .build()
-            .map_err(|error| ReleaseSourceError::Offline(error.to_string()))?;
-        Ok(Self {
-            client,
-            api_base: api_base.trim_end_matches('/').to_string(),
-        })
+impl IndexReleaseSource {
+    pub fn from_environment() -> Self {
+        Self {
+            url: release_index::index_url(),
+            cached: std::sync::Mutex::new(None),
+        }
     }
 
-    fn release_url(&self, target: UpgradeTarget) -> String {
-        let repository = match target {
-            UpgradeTarget::Aft => "cortexkit/aft",
-            UpgradeTarget::SubcMcp | UpgradeTarget::Daemon | UpgradeTarget::Ck => {
-                "cortexkit/subconscious"
-            }
-        };
-        format!("{}/repos/{repository}/releases/latest", self.api_base)
+    #[cfg(test)]
+    pub fn from_index(index: ReleaseIndex) -> Self {
+        Self {
+            url: String::new(),
+            cached: std::sync::Mutex::new(Some(Ok(index))),
+        }
+    }
+
+    pub fn cloned_index(&self) -> Result<ReleaseIndex, IndexRefusal> {
+        match self.cached.lock().unwrap().as_ref() {
+            Some(Ok(index)) => Ok(index.clone()),
+            Some(Err(refusal)) => Err(refusal.clone()),
+            None => release_index::fetch_index(&self.url),
+        }
     }
 }
 
-impl ReleaseSource for GitHubReleaseSource {
+impl ReleaseSource for IndexReleaseSource {
     fn fetch<'a>(&'a self, target: UpgradeTarget) -> SourceFuture<'a> {
         Box::pin(async move {
-            let response = self
-                .client
-                .get(self.release_url(target))
-                .header(reqwest::header::ACCEPT, "application/vnd.github+json")
-                .send()
-                .await
-                .map_err(|error| ReleaseSourceError::Offline(error.to_string()))?;
-            let status = response.status();
-            let exhausted = response
-                .headers()
-                .get("x-ratelimit-remaining")
-                .and_then(|value| value.to_str().ok())
-                == Some("0");
-            if status.as_u16() == 429 || exhausted {
-                return Err(ReleaseSourceError::RateLimited);
-            }
-            if !status.is_success() {
-                return Err(ReleaseSourceError::Offline(format!("HTTP {status}")));
-            }
-            let release = response
-                .json::<LatestRelease>()
-                .await
-                .map_err(|error| ReleaseSourceError::InvalidResponse(error.to_string()))?;
-            let version = normalize_release_version(&release.tag_name).ok_or_else(|| {
-                ReleaseSourceError::InvalidResponse("latest release tag has no version".to_string())
-            })?;
-            Ok(ReleaseEvidence {
-                version,
-                assets: release.assets.into_iter().map(|asset| asset.name).collect(),
-            })
+            let cached = {
+                let guard = self.cached.lock().unwrap();
+                guard.clone()
+            };
+            let result = if let Some(result) = cached {
+                result
+            } else {
+                let url = self.url.clone();
+                let fetched = tokio::task::spawn_blocking(move || release_index::fetch_index(&url))
+                    .await
+                    .unwrap_or_else(|error| {
+                        Err(IndexRefusal::Unreachable {
+                            url: self.url.clone(),
+                            reason: error.to_string(),
+                        })
+                    });
+                let mut guard = self.cached.lock().unwrap();
+                if guard.is_none() {
+                    *guard = Some(fetched.clone());
+                }
+                guard.as_ref().expect("index was just stored").clone()
+            };
+            evidence_from_index(&result, target)
         })
     }
 }
 
-#[derive(Deserialize)]
-struct LatestRelease {
-    tag_name: String,
-    #[serde(default)]
-    assets: Vec<LatestAsset>,
+fn evidence_from_index(
+    result: &Result<ReleaseIndex, IndexRefusal>,
+    target: UpgradeTarget,
+) -> Result<ReleaseEvidence, ReleaseSourceError> {
+    match result {
+        Err(IndexRefusal::Unreachable { url, reason }) => {
+            Err(ReleaseSourceError::Offline(format!("{url}: {reason}")))
+        }
+        Err(IndexRefusal::Stale { url, .. }) => {
+            Err(ReleaseSourceError::IndexStale { url: url.clone() })
+        }
+        Err(other) => Err(ReleaseSourceError::InvalidResponse(other.to_string())),
+        Ok(index) => {
+            let (component, binary) = upgrade_target_index_path(target);
+            let Some(entry) = index.components.get(component) else {
+                return Ok(ReleaseEvidence {
+                    version: String::new(),
+                    assets: BTreeSet::new(),
+                });
+            };
+            let version = entry.version.clone().unwrap_or_default();
+            let mut assets = BTreeSet::new();
+            for (platform, binaries) in &entry.assets {
+                if binaries.contains_key(binary) {
+                    assets.insert(format!("{binary}-{platform}.zip"));
+                }
+            }
+            Ok(ReleaseEvidence { version, assets })
+        }
+    }
 }
 
-#[derive(Deserialize)]
-struct LatestAsset {
-    name: String,
+pub(super) fn upgrade_target_index_path(target: UpgradeTarget) -> (&'static str, &'static str) {
+    match target {
+        UpgradeTarget::Ck => ("core", "ck"),
+        UpgradeTarget::Daemon => ("core", "ck-subc"),
+        UpgradeTarget::SubcMcp => ("core", "ck-subc-mcp"),
+        UpgradeTarget::Aft => ("aft", "ck-aft"),
+    }
 }
 
 /// The state shown by bare `ck`. A failed refresh deliberately does not turn a
@@ -187,6 +219,7 @@ pub enum DashboardUpdate {
     NotChecked {
         cache_age: Option<Duration>,
     },
+    IndexStale,
 }
 
 impl DashboardUpdate {
@@ -218,6 +251,7 @@ impl DashboardUpdate {
             Self::NotChecked { cache_age: None } => {
                 "updates: not checked (cache unavailable)".to_string()
             }
+            Self::IndexStale => "updates: index stale".to_string(),
         }
     }
 }
@@ -269,17 +303,21 @@ pub async fn dashboard_update_at<S: ReleaseSource>(
     }
 
     let refreshed = time::timeout(budget, refresh_all(source, now_unix_secs)).await;
-    let Ok(Ok(metadata)) = refreshed else {
-        return DashboardUpdate::NotChecked {
+    match refreshed {
+        Ok(Ok(metadata)) => {
+            if cache.write(&metadata).is_err() {
+                DashboardUpdate::NotChecked {
+                    cache_age: cached.map(|metadata| metadata.age_at(now_unix_secs)),
+                }
+            } else {
+                dashboard_state(&metadata, installed_versions, now_unix_secs)
+            }
+        }
+        Ok(Err(ReleaseSourceError::IndexStale { .. })) => DashboardUpdate::IndexStale,
+        _ => DashboardUpdate::NotChecked {
             cache_age: cached.map(|metadata| metadata.age_at(now_unix_secs)),
-        };
-    };
-    if cache.write(&metadata).is_err() {
-        return DashboardUpdate::NotChecked {
-            cache_age: cached.map(|metadata| metadata.age_at(now_unix_secs)),
-        };
+        },
     }
-    dashboard_state(&metadata, installed_versions, now_unix_secs)
 }
 
 /// Refreshes every target using a separate ten-second deadline. This is only
@@ -294,6 +332,12 @@ pub async fn check_update_metadata<S: ReleaseSource>(
     for target in UpgradeTarget::ORDERED {
         let evidence = match time::timeout(TARGET_CHECK_BUDGET, source.fetch(target)).await {
             Ok(Ok(evidence)) => evidence,
+            Ok(Err(ReleaseSourceError::IndexStale { url })) => {
+                return Err(UpdateCheckError::IndexStale { url })
+            }
+            Ok(Err(ReleaseSourceError::Offline(reason))) => {
+                return Err(UpdateCheckError::IndexUnreachable { reason })
+            }
             Ok(Err(source)) => return Err(UpdateCheckError::Source { target, source }),
             Err(_) => return Err(UpdateCheckError::ExpiredTarget { target }),
         };
@@ -306,6 +350,7 @@ pub async fn check_update_metadata<S: ReleaseSource>(
         );
     }
     let metadata = UpdateMetadata {
+        format_version: super::update_cache::UPDATE_CACHE_FORMAT_VERSION,
         checked_at_unix_secs: now_unix_secs,
         targets,
     };
@@ -385,6 +430,7 @@ async fn refresh_all<S: ReleaseSource>(
         );
     }
     Ok(UpdateMetadata {
+        format_version: super::update_cache::UPDATE_CACHE_FORMAT_VERSION,
         checked_at_unix_secs: now_unix_secs,
         targets,
     })
@@ -572,6 +618,7 @@ mod tests {
 
     fn metadata(checked_at_unix_secs: u64, version: &str) -> UpdateMetadata {
         UpdateMetadata {
+            format_version: super::super::update_cache::UPDATE_CACHE_FORMAT_VERSION,
             checked_at_unix_secs,
             targets: UpgradeTarget::ORDERED
                 .into_iter()
@@ -686,38 +733,50 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn offline_and_rate_limited_refreshes_render_the_stale_not_checked_form() {
-        for error in [
-            ReleaseSourceError::Offline("offline".to_string()),
-            ReleaseSourceError::RateLimited,
-        ] {
-            let (_dir, cache) = cache("failed-refresh");
-            cache.write(&metadata(100, "0.13.0")).unwrap();
-            let source = StaticSource::failing(error);
-            let now =
-                100 + super::super::update_cache::UPDATE_CACHE_TTL.as_secs() + 3 * 24 * 60 * 60;
+    async fn offline_refresh_renders_the_stale_not_checked_form() {
+        let (_dir, cache) = cache("failed-refresh");
+        cache.write(&metadata(100, "0.13.0")).unwrap();
+        let source = StaticSource::failing(ReleaseSourceError::Offline("offline".to_string()));
+        let now = 100 + super::super::update_cache::UPDATE_CACHE_TTL.as_secs() + 3 * 24 * 60 * 60;
 
-            let update = dashboard_update_at(
-                &cache,
-                &source,
-                &installed("0.12.0"),
-                now,
-                Duration::from_millis(20),
-            )
-            .await;
+        let update = dashboard_update_at(
+            &cache,
+            &source,
+            &installed("0.12.0"),
+            now,
+            Duration::from_millis(20),
+        )
+        .await;
 
-            assert_eq!(
-                update,
-                DashboardUpdate::NotChecked {
-                    cache_age: Some(Duration::from_secs(
-                        super::super::update_cache::UPDATE_CACHE_TTL.as_secs() + 3 * 24 * 60 * 60
-                    )),
-                }
-            );
-            assert!(update
-                .render()
-                .starts_with("updates: not checked (cache 4d old)"));
-        }
+        assert_eq!(
+            update,
+            DashboardUpdate::NotChecked {
+                cache_age: Some(Duration::from_secs(
+                    super::super::update_cache::UPDATE_CACHE_TTL.as_secs() + 3 * 24 * 60 * 60
+                )),
+            }
+        );
+        assert!(update
+            .render()
+            .starts_with("updates: not checked (cache 4d old)"));
+    }
+
+    #[tokio::test]
+    async fn stale_index_renders_the_index_stale_form() {
+        let (_dir, cache) = cache("index-stale");
+        let source = StaticSource::failing(ReleaseSourceError::IndexStale {
+            url: "https://cortexkit.io/releases/v1/index.json".to_string(),
+        });
+        let update = dashboard_update_at(
+            &cache,
+            &source,
+            &installed("0.12.0"),
+            500,
+            Duration::from_millis(20),
+        )
+        .await;
+        assert_eq!(update, DashboardUpdate::IndexStale);
+        assert_eq!(update.render(), "updates: index stale");
     }
 
     #[tokio::test]
@@ -785,6 +844,59 @@ mod tests {
             observed.release(UpgradeTarget::Aft),
             ReleaseAvailability::Incomplete { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn check_from_a_shared_index_writes_the_cache_once() {
+        let sha = "ab".repeat(32);
+        let asset = super::super::release_index::IndexAsset {
+            url: "http://127.0.0.1/a.zip".to_string(),
+            sha256: sha,
+            reports: Some("0.99.0".to_string()),
+        };
+        let mut binaries = std::collections::BTreeMap::new();
+        binaries.insert("ck".to_string(), asset.clone());
+        binaries.insert("ck-subc".to_string(), asset.clone());
+        binaries.insert("ck-subc-mcp".to_string(), asset.clone());
+        let mut aft = std::collections::BTreeMap::new();
+        aft.insert("ck-aft".to_string(), asset);
+        let mut core_targets = std::collections::BTreeMap::new();
+        let mut aft_targets = std::collections::BTreeMap::new();
+        for platform in ["darwin-arm64", "linux-x64", "windows-x64"] {
+            core_targets.insert(platform.to_string(), binaries.clone());
+            aft_targets.insert(platform.to_string(), aft.clone());
+        }
+        let mut components = std::collections::BTreeMap::new();
+        components.insert(
+            "core".to_string(),
+            super::super::release_index::IndexComponent {
+                release: "subc-core-v0.99.0".to_string(),
+                version: Some("0.99.0".to_string()),
+                assets: core_targets,
+            },
+        );
+        components.insert(
+            "aft".to_string(),
+            super::super::release_index::IndexComponent {
+                release: "v0.99.0".to_string(),
+                version: Some("0.99.0".to_string()),
+                assets: aft_targets,
+            },
+        );
+        let index = super::super::release_index::ReleaseIndex {
+            schema: 1,
+            channel: "alpha".to_string(),
+            generated_at_ms: 1_788_425_000_000,
+            components,
+        };
+        let (_dir, cache) = cache("from-index");
+        let source = IndexReleaseSource::from_index(index);
+        let metadata = check_update_metadata(&cache, &source).await.unwrap();
+        assert_eq!(
+            metadata.format_version,
+            super::super::update_cache::UPDATE_CACHE_FORMAT_VERSION
+        );
+        assert!(matches!(cache.load(), CacheRead::Present(_)));
     }
 
     #[test]

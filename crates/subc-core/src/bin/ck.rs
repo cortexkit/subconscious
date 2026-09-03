@@ -336,10 +336,7 @@ async fn dashboard(args: &CkArgs) -> Result<(), CkError> {
 
 async fn bare_update_line() -> String {
     let cache = setup::UpdateCache::from_environment();
-    let source = match setup::GitHubReleaseSource::from_environment() {
-        Ok(source) => source,
-        Err(_) => return setup::not_checked_from_cache(&cache).render(),
-    };
+    let source = setup::IndexReleaseSource::from_environment();
     setup::dashboard_update(&cache, &source, &setup::compiled_installed_versions())
         .await
         .render()
@@ -4046,11 +4043,19 @@ async fn upgrade_command(
     let discovered = setup::discover_current_upgrade_targets(executable, daemon_catalog.as_ref())
         .map_err(CkError::Rejected)?;
     let cache = setup::UpdateCache::from_environment();
-    let source = setup::GitHubReleaseSource::from_environment()
-        .map_err(|error| CkError::Message(error.to_string()))?;
-    let metadata = setup::check_update_metadata(&cache, &source)
-        .await
-        .map_err(CkError::UpdateCheck)?;
+    let source = setup::IndexReleaseSource::from_environment();
+    let metadata = match setup::check_update_metadata(&cache, &source).await {
+        Ok(metadata) => metadata,
+        Err(error @ setup::UpdateCheckError::IndexStale { .. }) => {
+            println!("{error}");
+            return Err(CkError::UpdateCheck(error));
+        }
+        Err(error @ setup::UpdateCheckError::IndexUnreachable { .. }) => {
+            println!("{}", setup::not_checked_from_cache(&cache).render());
+            return Err(CkError::UpdateCheck(error));
+        }
+        Err(error) => return Err(CkError::UpdateCheck(error)),
+    };
     let observed = setup::observed_upgrade_targets(&metadata, &discovered);
     let plan = setup::plan_upgrade(&observed);
     print_upgrade_plan(&plan);
@@ -4076,9 +4081,16 @@ async fn upgrade_command(
         return Ok(());
     }
 
-    let mut backend =
-        setup::SystemUpgradeBackend::new(executable, subc.map(Path::to_path_buf), discovered)
-            .map_err(CkError::Rejected)?;
+    let index = source
+        .cloned_index()
+        .map_err(|error| CkError::Message(error.to_string()))?;
+    let mut backend = setup::SystemUpgradeBackend::new(
+        executable,
+        subc.map(Path::to_path_buf),
+        discovered,
+        index,
+    )
+    .map_err(CkError::Rejected)?;
     for target in setup::UpgradeTarget::ORDERED {
         if let setup::UpgradeState::UpdateAvailable { to, .. } = observed.target_state(target) {
             backend.set_expected_version(target, to);

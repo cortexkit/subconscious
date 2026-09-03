@@ -84,6 +84,9 @@ impl SetupBackend {
             .or(self.paths.claustrum_key_path.as_deref());
         let mut components = BTreeMap::new();
         let mut releases = BTreeMap::new();
+        // A failed index is about the document, not a single component: setup
+        // must not plan any installation from it.
+        self.artifacts.ensure_index()?;
         for component in Component::ALL {
             if matches!(
                 PlatformObservation::current(),
@@ -116,11 +119,9 @@ impl SetupBackend {
                     ComponentState::Missing
                 },
             );
-            // A release that cannot be resolved is a fact about that component,
-            // never about the plan: one module whose owner has not published
-            // (or whose release host is unreachable) must not abort installing
-            // everything else. The planner renders the typed outcome per
-            // component and skips it.
+            // A component the index does not list is a fact about that
+            // component, never about the plan: one unpublished module must not
+            // abort installing everything else.
             let availability = match self.artifacts.release_availability(component) {
                 Ok(availability) => availability,
                 Err(reason) => ReleaseAvailability::Unresolvable { reason },

@@ -1,19 +1,18 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
     fs,
-    path::{Path, PathBuf},
+    path::Path,
     process::{self, Command},
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use serde::Deserialize;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
 use super::{
     config,
     inventory::Inventory,
-    model::{AlphaTarget, Component, ReleaseAvailability, ReleaseResolutionStrategy},
+    model::{AlphaTarget, Component, ReleaseAvailability},
+    release_index::{self, IndexAsset, IndexRefusal, ReleaseIndex},
 };
 
 pub trait ArtifactSource {
@@ -36,78 +35,38 @@ pub trait ArtifactSource {
     }
 }
 
-/// Downloads only convention-derived archives and verifies each archive against
-/// its matching sidecar before extracting the binary into the managed home.
+/// Downloads archives named by the signed release index and verifies each
+/// archive against the index digest before extracting the binary into the
+/// managed home. The sidecar files on GitHub are not fetched: the index is
+/// the digest source.
 pub struct ReleaseArtifactSource {
     target: AlphaTarget,
-    api_base: String,
-    release_bases: BTreeMap<Component, String>,
-    manifests: BTreeMap<Component, ReleaseManifest>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-struct ReleaseManifest {
-    tag_name: String,
-    #[serde(default)]
-    assets: Vec<ReleaseAsset>,
-    #[serde(default)]
-    draft: bool,
-    #[serde(default)]
-    #[allow(
-        dead_code,
-        reason = "prereleases intentionally qualify for tag-pattern resolution"
-    )]
-    prerelease: bool,
-    #[serde(default)]
-    created_at: String,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-struct ReleaseAsset {
-    name: String,
+    index_url: String,
+    index: Option<Result<ReleaseIndex, IndexRefusal>>,
 }
 
 impl ReleaseArtifactSource {
     pub fn current() -> Self {
-        let mut release_bases = BTreeMap::new();
-        for component in Component::ALL {
-            let key = if component == Component::Core {
-                "CK_RELEASE_BASE_URL".to_string()
-            } else {
-                format!(
-                    "CK_{}_RELEASE_BASE_URL",
-                    component.label().to_ascii_uppercase().replace('-', "_")
-                )
-            };
-            release_bases.insert(
-                component,
-                std::env::var(key).unwrap_or_else(|_| {
-                    match component.release_resolution_strategy() {
-                        ReleaseResolutionStrategy::Latest => format!(
-                            "https://github.com/cortexkit/{}/releases/latest/download",
-                            component.repository()
-                        ),
-                        ReleaseResolutionStrategy::TagPrefix(_) => format!(
-                            "https://github.com/cortexkit/{}/releases/download",
-                            component.repository()
-                        ),
-                    }
-                }),
-            );
-        }
         Self {
-            target: if cfg!(target_os = "macos") {
-                AlphaTarget::DarwinArm64
-            } else if cfg!(windows) {
-                AlphaTarget::WindowsX64
-            } else {
-                AlphaTarget::LinuxX64
-            },
-            api_base: std::env::var("CK_RELEASE_API_BASE_URL")
-                .unwrap_or_else(|_| "https://api.github.com".to_string()),
-            release_bases,
-            manifests: BTreeMap::new(),
+            target: host_alpha_target(),
+            index_url: release_index::index_url(),
+            index: None,
         }
+    }
+
+    #[cfg(test)]
+    pub fn from_index(index: ReleaseIndex, target: AlphaTarget) -> Self {
+        Self {
+            target,
+            index_url: String::new(),
+            index: Some(Ok(index)),
+        }
+    }
+
+    /// Fetch the signed index once. A failure is about the document, not a
+    /// single component, so setup must not plan any installation from it.
+    pub fn ensure_index(&mut self) -> Result<(), String> {
+        self.loaded_index().map(|_| ())
     }
 
     pub fn release_availability(
@@ -115,122 +74,61 @@ impl ReleaseArtifactSource {
         component: Component,
     ) -> Result<ReleaseAvailability, String> {
         let target = self.target;
-        let manifest = self.manifest(component)?;
-        let assets = manifest
-            .assets
-            .iter()
-            .map(|asset| asset.name.as_str())
-            .collect::<BTreeSet<_>>();
-        let missing_asset = component_binaries_for_target(component, target)
-            .iter()
-            .flat_map(|binary| {
-                let archive = format!("{}-{}.zip", binary, target.label());
-                [archive.clone(), format!("{archive}.sha256")]
-            })
-            .find(|asset| !assets.contains(asset.as_str()));
+        let needed = component_binaries_for_target(component, target);
+        let index = self.loaded_index()?;
+        let Some(entry) = index.components.get(component.label()) else {
+            let missing_asset = needed
+                .first()
+                .map(|binary| format!("{}-{}.zip", binary, target.label()))
+                .unwrap_or_else(|| component.label().to_string());
+            return Ok(ReleaseAvailability::NotYetPublished {
+                release_tag: "no published release".to_string(),
+                missing_asset,
+            });
+        };
+        let target_assets = entry.assets.get(target.label());
+        let missing_asset = needed.iter().find_map(|binary| {
+            if target_assets.is_some_and(|assets| assets.contains_key(*binary)) {
+                None
+            } else {
+                Some(format!("{}-{}.zip", binary, target.label()))
+            }
+        });
         Ok(match missing_asset {
             Some(missing_asset) => ReleaseAvailability::NotYetPublished {
-                release_tag: manifest.tag_name.clone(),
+                release_tag: entry.release.clone(),
                 missing_asset,
             },
             None => ReleaseAvailability::Available,
         })
     }
 
-    fn release_base(&self, component: Component, tag: &str) -> String {
-        let base = self
-            .release_bases
-            .get(&component)
-            .expect("all setup components have a release base")
-            .trim_end_matches('/');
-        match component.release_resolution_strategy() {
-            ReleaseResolutionStrategy::Latest => base.to_string(),
-            ReleaseResolutionStrategy::TagPrefix(_) => format!("{base}/{tag}"),
+    fn loaded_index(&mut self) -> Result<&ReleaseIndex, String> {
+        if self.index.is_none() {
+            self.index = Some(release_index::fetch_index(&self.index_url));
+        }
+        match self.index.as_ref() {
+            Some(Ok(index)) => Ok(index),
+            Some(Err(refusal)) => Err(refusal.to_string()),
+            None => unreachable!("index is inserted before this match"),
         }
     }
 
-    fn manifest_url(&self, component: Component) -> String {
-        let api_base = self.api_base.trim_end_matches('/');
-        match component.release_resolution_strategy() {
-            ReleaseResolutionStrategy::Latest => format!(
-                "{api_base}/repos/cortexkit/{}/releases/latest",
-                component.repository()
-            ),
-            ReleaseResolutionStrategy::TagPrefix(_) => format!(
-                "{api_base}/repos/cortexkit/{}/releases?per_page=100",
-                component.repository()
-            ),
-        }
-    }
-
-    fn manifest(&mut self, component: Component) -> Result<&ReleaseManifest, String> {
-        if !self.manifests.contains_key(&component) {
-            let temporary = temporary_path("release.json");
-            let url = self.manifest_url(component);
-            let download_result = download(&url, &temporary);
-            // GitHub answers `releases/latest` with 404 when a repository has
-            // no published (non-draft) release. That is the owner-has-not-
-            // published-yet state the temporal outcome exists for, not a
-            // resolution failure: an empty manifest lets availability report
-            // exactly which asset is missing under a `latest` that does not
-            // exist yet.
-            if let Err(error) = &download_result {
-                if matches!(
-                    component.release_resolution_strategy(),
-                    ReleaseResolutionStrategy::Latest
-                ) && http_status_from_download_error(error) == Some(404)
-                {
-                    let _ = fs::remove_file(&temporary);
-                    self.manifests.insert(
-                        component,
-                        ReleaseManifest {
-                            tag_name: "latest".to_string(),
-                            assets: Vec::new(),
-                            draft: false,
-                            prerelease: false,
-                            created_at: String::new(),
-                        },
-                    );
-                    return Ok(self
-                        .manifests
-                        .get(&component)
-                        .expect("manifest inserted above"));
-                }
-            }
-            download_result
-                .map_err(|error| format!("could not resolve {} release: {error}", component))?;
-            let contents = fs::read_to_string(&temporary)
-                .map_err(|error| format!("could not read {} release: {error}", component))?;
-            let _ = fs::remove_file(&temporary);
-            let manifest = match component.release_resolution_strategy() {
-                ReleaseResolutionStrategy::Latest => {
-                    serde_json::from_str::<ReleaseManifest>(&contents).map_err(|error| {
-                        format!("could not parse latest {} release: {error}", component)
-                    })?
-                }
-                ReleaseResolutionStrategy::TagPrefix(prefix) => {
-                    let releases = serde_json::from_str::<Vec<ReleaseManifest>>(&contents)
-                        .map_err(|error| {
-                            format!("could not parse {} release list: {error}", component)
-                        })?;
-                    newest_matching_release(releases, prefix).unwrap_or_else(|| ReleaseManifest {
-                        tag_name: format!("{prefix}*"),
-                        assets: Vec::new(),
-                        draft: false,
-                        prerelease: false,
-                        created_at: String::new(),
-                    })
-                }
-            };
-            if manifest.tag_name.trim().is_empty() {
-                return Err(format!("{component} release has no tag"));
-            }
-            self.manifests.insert(component, manifest);
-        }
-        Ok(self
-            .manifests
-            .get(&component)
-            .expect("manifest was inserted for the requested component"))
+    fn lookup_asset(&mut self, component: Component, binary: &str) -> Result<IndexAsset, String> {
+        let target = self.target;
+        let index = self.loaded_index()?;
+        index
+            .components
+            .get(component.label())
+            .and_then(|entry| entry.assets.get(target.label()))
+            .and_then(|assets| assets.get(binary))
+            .cloned()
+            .ok_or_else(|| {
+                format!(
+                    "release-incomplete: no {binary}-{} asset for {component}",
+                    target.label()
+                )
+            })
     }
 }
 
@@ -243,7 +141,7 @@ impl ArtifactSource for ReleaseArtifactSource {
     ) -> Result<String, String> {
         let binary_name = platform_binary(binary);
         let archive_name = format!("{}-{}.zip", binary, self.target.label());
-        let sidecar_name = format!("{archive_name}.sha256");
+        let asset = self.lookup_asset(component, binary)?;
         let temp = std::env::temp_dir().join(format!(
             "ck-setup-{binary}-{}-{}",
             process::id(),
@@ -259,20 +157,8 @@ impl ArtifactSource for ReleaseArtifactSource {
             )
         })?;
         let archive = temp.join(&archive_name);
-        let sidecar = temp.join(&sidecar_name);
-        let tag = self.manifest(component)?.tag_name.clone();
-        let base = self.release_base(component, &tag);
-        download(&format!("{base}/{archive_name}"), &archive)?;
-        download(&format!("{base}/{sidecar_name}"), &sidecar)?;
-        let expected = parse_sidecar(
-            &fs::read_to_string(&sidecar).map_err(|error| {
-                format!(
-                    "could not read digest sidecar {}: {error}",
-                    sidecar.display()
-                )
-            })?,
-            &archive_name,
-        )?;
+        release_index::download(&asset.url, &archive)?;
+        let expected = asset.sha256.to_ascii_lowercase();
         let actual = digest_file(&archive)?;
         if actual != expected {
             return Err(format!(
@@ -330,20 +216,16 @@ impl ArtifactSource for ReleaseArtifactSource {
     }
 
     fn acceptance(&mut self, component: Component, binary: &str) -> Result<Acceptance, String> {
-        let tag = self.manifest(component)?.tag_name.trim().to_string();
-        acceptance_for(component, binary, &tag)
+        let asset = self.lookup_asset(component, binary)?;
+        Ok(match asset.reports {
+            Some(reports) => Acceptance::Reports(reports),
+            None => Acceptance::RunsAndReports,
+        })
     }
 }
 
 pub fn component_binaries(component: Component) -> &'static [&'static str] {
-    let target = if cfg!(target_os = "macos") {
-        AlphaTarget::DarwinArm64
-    } else if cfg!(windows) {
-        AlphaTarget::WindowsX64
-    } else {
-        AlphaTarget::LinuxX64
-    };
-    component_binaries_for_target(component, target)
+    component_binaries_for_target(component, host_alpha_target())
 }
 
 /// Release asset sets are data, not filesystem discovery, so setup never loses
@@ -493,87 +375,18 @@ pub fn configuration_is_correct(
     }
 }
 
-fn temporary_path(name: &str) -> PathBuf {
-    std::env::temp_dir().join(format!(
-        "ck-setup-{name}-{}-{}",
-        process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time is after the Unix epoch")
-            .as_nanos()
-    ))
-}
-
 /// What a placed binary can prove about the release it came from, read off
-/// its `--version` line. The archive's sidecar already proves the bytes are
-/// the release's; this is the second, independent check that the release
-/// itself carries the binary it claims to.
+/// its `--version` line. The index digest already proves the bytes are the
+/// release's; this is the second, independent check that the binary reports
+/// what the index said it would.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Acceptance {
-    /// The tag names this binary's crate version; `--version` must report it.
-    Version(String),
-    /// The tag is a build train; `--version` must carry the train id (mc's
-    /// `ck-mc <ver> (<full sha>)` where the tag id is that sha's prefix).
-    TrainId(String),
-    /// A sibling binary in a multi-crate workspace release: the tag names
-    /// another crate's version, and this crate's own version appears nowhere
-    /// in the release. It must execute and self-report (the run is the
-    /// first-exec toll paid before the daemon spawns it), and provenance rests
-    /// on the sidecar. Refusing it against the sibling's version would refuse
-    /// every correct release; accepting it on the sidecar is what the sidecar
-    /// is for.
+    /// `--version` output must contain this substring, copied from the
+    /// index asset's `reports` field.
+    Reports(String),
+    /// The index did not name a substring. The binary must execute and print
+    /// a name and a version; provenance rests on the verified sha256.
     RunsAndReports,
-}
-
-/// Per-binary acceptance. The core release ships `ck-subc` (the crate the tag
-/// names) beside `ck-subc-mcp` (its own crate, its own version); only the
-/// first can be held to the tag's version.
-fn acceptance_for(component: Component, binary: &str, tag: &str) -> Result<Acceptance, String> {
-    match component.release_resolution_strategy() {
-        ReleaseResolutionStrategy::TagPrefix(prefix) => {
-            let id = tag.strip_prefix(prefix).unwrap_or(tag).trim();
-            // `ck-mc-alpha.<sha8>`: the train id is the part after the channel dot.
-            let id = id.rsplit('.').next().unwrap_or(id);
-            if id.len() < 7 || !id.chars().all(|c| c.is_ascii_hexdigit()) {
-                return Err(format!(
-                    "{component} release tag '{tag}' does not end in a build sha train id"
-                ));
-            }
-            Ok(Acceptance::TrainId(id.to_string()))
-        }
-        ReleaseResolutionStrategy::Latest => {
-            if component == Component::Core && binary != "ck-subc" {
-                return Ok(Acceptance::RunsAndReports);
-            }
-            expected_version_from_tag(component, tag).map(Acceptance::Version)
-        }
-    }
-}
-
-/// The version a placed binary must self-report, derived from the resolved
-/// release tag. Owners tag in two shapes: bare `v<version>` (aft, insula,
-/// claustrum) and workspace-crate `subc-core-v<version>` (core, the release
-/// lane's convention for a multi-crate workspace). Both carry the crate
-/// version, so both derive it. A train-shaped tag (`ck-mc-alpha.<sha>`) carries
-/// no version at all; acceptance for that shape needs the binary to self-report
-/// the train sha, which is the owner's contract to provide — until it does, the
-/// refusal names the gap instead of claiming the tag is malformed.
-fn expected_version_from_tag(component: Component, tag: &str) -> Result<String, String> {
-    let version = tag
-        .rsplit_once("-v")
-        .map(|(_, rest)| rest)
-        .unwrap_or(tag)
-        .trim_start_matches('v');
-    let looks_like_version = !version.is_empty()
-        && version != tag
-        && version.chars().next().is_some_and(|c| c.is_ascii_digit());
-    if !looks_like_version {
-        return Err(format!(
-            "latest {component} release tag '{tag}' must be v<crate-version> or \
-             <crate>-v<crate-version>"
-        ));
-    }
-    Ok(version.to_string())
 }
 
 /// Runs the placed binary before configuration and checks its `--version`
@@ -605,17 +418,9 @@ fn verify_acceptance(path: &Path, acceptance: &Acceptance) -> Result<(), String>
 /// The pure half of acceptance, over the captured `--version` line.
 fn check_reported(reported: &str, acceptance: &Acceptance) -> Result<(), String> {
     match acceptance {
-        Acceptance::Version(expected) => {
-            if reported
-                .split_whitespace()
-                .all(|token| token.trim_start_matches('v') != expected)
-            {
-                return Err(format!("did not report release version {expected}"));
-            }
-        }
-        Acceptance::TrainId(id) => {
-            if !reported.contains(id.as_str()) {
-                return Err(format!("did not report release train id {id}"));
+        Acceptance::Reports(expected) => {
+            if !reported.contains(expected.as_str()) {
+                return Err(format!("did not report {expected}"));
             }
         }
         Acceptance::RunsAndReports => {
@@ -625,98 +430,6 @@ fn check_reported(reported: &str, acceptance: &Acceptance) -> Result<(), String>
         }
     }
     Ok(())
-}
-
-/// A GitHub token, when the operator has one in the environment. The release
-/// API's unauthenticated budget is 60 requests per hour per source address,
-/// shared by everyone behind the same NAT; one setup costs one request per
-/// component, so a handful of installs on one network exhausts it and every
-/// later install sees 403 for the rest of the hour. A token lifts that to
-/// 5,000. Never required, never stored, only read.
-fn github_token() -> Option<String> {
-    ["CK_GITHUB_TOKEN", "GITHUB_TOKEN", "GH_TOKEN"]
-        .into_iter()
-        .find_map(|key| std::env::var(key).ok())
-        .map(|token| token.trim().to_string())
-        .filter(|token| !token.is_empty())
-}
-
-fn download(url: &str, destination: &Path) -> Result<(), String> {
-    let destination = destination.to_string_lossy().into_owned();
-    let token = if url.starts_with("https://api.github.com/") {
-        github_token()
-    } else {
-        None
-    };
-    let (program, args) = if cfg!(windows) {
-        let headers = token
-            .as_deref()
-            .map(|token| format!(" -Headers @{{Authorization='Bearer {token}'}}"))
-            .unwrap_or_default();
-        (
-            "powershell.exe",
-            vec![
-                "-NoProfile".to_string(),
-                "-NonInteractive".to_string(),
-                "-Command".to_string(),
-                format!(
-                    "Invoke-WebRequest -Uri '{url}' -OutFile '{destination}' -UseBasicParsing{headers}"
-                ),
-            ],
-        )
-    } else {
-        let mut args = vec![
-            "--fail".to_string(),
-            "--location".to_string(),
-            "--silent".to_string(),
-            "--show-error".to_string(),
-            // The status code is the only thing that distinguishes "no
-            // such release yet" from a broken host; write it where the
-            // error path can read it.
-            "--write-out".to_string(),
-            "http_status=%{http_code}".to_string(),
-            "--output".to_string(),
-            destination,
-        ];
-        if let Some(token) = token.as_deref() {
-            args.push("--header".to_string());
-            args.push(format!("Authorization: Bearer {token}"));
-        }
-        args.push(url.to_string());
-        ("curl", args)
-    };
-    let output = Command::new(program)
-        .args(args)
-        .output()
-        .map_err(|error| format!("could not download {url}: {error}"))?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        Err(format!(
-            "release-incomplete: could not download {url}: {stderr} {stdout}"
-        ))
-    }
-}
-
-/// Best-effort HTTP status recovered from a `download` error message. curl's
-/// arm stamps `http_status=NNN` explicitly; the PowerShell arm's exception
-/// text carries the code in prose (`(404) Not Found`, `status code ... 404`).
-fn http_status_from_download_error(error: &str) -> Option<u16> {
-    if let Some(rest) = error.split("http_status=").nth(1) {
-        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-        if let Ok(code) = digits.parse::<u16>() {
-            if code != 0 {
-                return Some(code);
-            }
-        }
-    }
-    error
-        .split(|c: char| !c.is_ascii_digit())
-        .filter(|token| token.len() == 3)
-        .filter_map(|token| token.parse::<u16>().ok())
-        .find(|code| (400..600).contains(code))
 }
 
 fn extract(archive: &Path, destination: &Path) -> Result<(), String> {
@@ -756,43 +469,20 @@ fn extract(archive: &Path, destination: &Path) -> Result<(), String> {
     }
 }
 
-fn parse_sidecar(contents: &str, archive_name: &str) -> Result<String, String> {
-    let mut lines = contents.lines();
-    let line = lines
-        .next()
-        .ok_or_else(|| format!("digest sidecar for {archive_name} is empty"))?;
-    if lines.next().is_some() {
-        return Err(format!(
-            "digest sidecar for {archive_name} has more than one record"
-        ));
-    }
-    let mut fields = line.split_whitespace();
-    let digest = fields
-        .next()
-        .filter(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
-        .ok_or_else(|| format!("digest sidecar for {archive_name} has no SHA-256 digest"))?;
-    if let Some(name) = fields.next() {
-        if name.trim_start_matches('*') != archive_name || fields.next().is_some() {
-            return Err(format!("digest sidecar does not name {archive_name}"));
-        }
-    }
-    Ok(digest.to_ascii_lowercase())
-}
-
 pub fn digest_file(path: &Path) -> Result<String, String> {
     let bytes =
         fs::read(path).map_err(|error| format!("could not hash {}: {error}", path.display()))?;
     Ok(format!("{:x}", Sha256::digest(bytes)))
 }
 
-fn newest_matching_release(
-    releases: impl IntoIterator<Item = ReleaseManifest>,
-    tag_prefix: &str,
-) -> Option<ReleaseManifest> {
-    releases
-        .into_iter()
-        .filter(|release| !release.draft && release.tag_name.starts_with(tag_prefix))
-        .max_by(|left, right| left.created_at.cmp(&right.created_at))
+fn host_alpha_target() -> AlphaTarget {
+    if cfg!(target_os = "macos") {
+        AlphaTarget::DarwinArm64
+    } else if cfg!(windows) {
+        AlphaTarget::WindowsX64
+    } else {
+        AlphaTarget::LinuxX64
+    }
 }
 
 fn platform_binary(binary: &str) -> String {
@@ -839,7 +529,7 @@ mod tests {
             _component: Component,
             _binary: &str,
         ) -> Result<Acceptance, String> {
-            Ok(Acceptance::Version("1.2.3".to_string()))
+            Ok(Acceptance::Reports("1.2.3".to_string()))
         }
 
         #[cfg(windows)]
@@ -895,7 +585,7 @@ mod tests {
             _component: Component,
             _binary: &str,
         ) -> Result<Acceptance, String> {
-            Ok(Acceptance::Version("9.9.9".to_string()))
+            Ok(Acceptance::Reports("9.9.9".to_string()))
         }
 
         #[cfg(windows)]
@@ -965,7 +655,7 @@ mod tests {
             _component: Component,
             binary: &str,
         ) -> Result<Acceptance, String> {
-            Ok(Acceptance::Version(
+            Ok(Acceptance::Reports(
                 if binary == "ck-subc" {
                     "1.2.3"
                 } else {
@@ -1047,269 +737,136 @@ mod tests {
         );
     }
 
-    #[test]
-    fn sidecar_parser_accepts_the_published_shasum_shape() {
-        let digest = "a".repeat(64);
-        assert_eq!(
-            parse_sidecar(
-                &format!("{digest} *ck-subc-linux-x64.zip\n"),
-                "ck-subc-linux-x64.zip"
-            )
-            .expect("valid sidecar"),
-            digest
-        );
-    }
-
-    fn release(tag: &str, created_at: &str, draft: bool, prerelease: bool) -> ReleaseManifest {
-        ReleaseManifest {
-            tag_name: tag.to_string(),
-            assets: vec![
-                ReleaseAsset {
-                    name: "ck-mc-linux-x64.zip".to_string(),
-                },
-                ReleaseAsset {
-                    name: "ck-mc-linux-x64.zip.sha256".to_string(),
-                },
-            ],
-            draft,
-            prerelease,
-            created_at: created_at.to_string(),
+    fn asset(reports: Option<&str>) -> super::super::release_index::IndexAsset {
+        super::super::release_index::IndexAsset {
+            url: "http://127.0.0.1/archive.zip".to_string(),
+            sha256: "ab".repeat(32),
+            reports: reports.map(str::to_string),
         }
     }
 
-    fn source_with_manifest(
-        component: Component,
-        manifest: ReleaseManifest,
-    ) -> ReleaseArtifactSource {
-        ReleaseArtifactSource {
-            target: AlphaTarget::LinuxX64,
-            api_base: "https://api.example.test".to_string(),
-            release_bases: BTreeMap::new(),
-            manifests: BTreeMap::from([(component, manifest)]),
+    fn index_with_core_linux() -> ReleaseIndex {
+        let mut binaries = std::collections::BTreeMap::new();
+        binaries.insert("ck-subc".to_string(), asset(Some("0.16.0")));
+        binaries.insert("ck-subc-mcp".to_string(), asset(None));
+        let mut targets = std::collections::BTreeMap::new();
+        targets.insert("linux-x64".to_string(), binaries);
+        let mut components = std::collections::BTreeMap::new();
+        components.insert(
+            "core".to_string(),
+            super::super::release_index::IndexComponent {
+                release: "subc-core-v0.16.0".to_string(),
+                version: Some("0.16.0".to_string()),
+                assets: targets,
+            },
+        );
+        ReleaseIndex {
+            schema: 1,
+            channel: "alpha".to_string(),
+            generated_at_ms: 1_788_425_000_000,
+            components,
         }
     }
 
     #[test]
-    fn newest_matching_release_uses_created_at_not_tag_order() {
-        let newest = newest_matching_release(
-            [
-                release("ck-mc-alpha.ffffffff", "2026-01-01T00:00:00Z", false, true),
-                release("ck-mc-alpha.00000000", "2026-02-01T00:00:00Z", false, true),
-                release("v0.41.1", "2026-03-01T00:00:00Z", false, false),
-            ],
-            "ck-mc-",
-        )
-        .expect("matching release");
-        assert_eq!(newest.tag_name, "ck-mc-alpha.00000000");
-    }
-
-    #[test]
-    fn prerelease_qualifies_for_mc_resolution() {
-        let selected = newest_matching_release(
-            [release(
-                "ck-mc-alpha.1234abcd",
-                "2026-02-01T00:00:00Z",
-                false,
-                true,
-            )],
-            "ck-mc-",
-        )
-        .expect("prerelease qualifies");
-        assert_eq!(selected.tag_name, "ck-mc-alpha.1234abcd");
-        assert!(selected.prerelease);
-    }
-
-    #[test]
-    fn draft_matching_release_is_excluded() {
-        let selected = newest_matching_release(
-            [
-                release("ck-mc-alpha.11111111", "2026-01-01T00:00:00Z", false, true),
-                release("ck-mc-alpha.22222222", "2026-02-01T00:00:00Z", true, true),
-            ],
-            "ck-mc-",
-        )
-        .expect("published matching release");
-        assert_eq!(selected.tag_name, "ck-mc-alpha.11111111");
-    }
-
-    #[test]
-    fn no_matching_release_uses_not_yet_published_arm() {
-        let manifest = newest_matching_release(
-            [release("v0.41.1", "2026-03-01T00:00:00Z", false, false)],
-            "ck-mc-",
-        )
-        .unwrap_or_else(|| ReleaseManifest {
-            tag_name: "ck-mc-*".to_string(),
-            assets: Vec::new(),
-            draft: false,
-            prerelease: false,
-            created_at: String::new(),
-        });
-        let mut source = source_with_manifest(Component::Mc, manifest);
+    fn absent_component_is_not_yet_published() {
+        let mut source =
+            ReleaseArtifactSource::from_index(index_with_core_linux(), AlphaTarget::LinuxX64);
         assert_eq!(
             source
-                .release_availability(Component::Mc)
+                .release_availability(Component::Aft)
                 .expect("availability"),
             ReleaseAvailability::NotYetPublished {
-                release_tag: "ck-mc-*".to_string(),
-                missing_asset: "ck-mc-linux-x64.zip".to_string(),
+                release_tag: "no published release".to_string(),
+                missing_asset: "ck-aft-linux-x64.zip".to_string(),
             }
         );
     }
 
-    /// A repository whose only releases are drafts answers `releases/latest`
-    /// with 404. The resolver turns that into an empty `latest` manifest, and
-    /// availability must then report the owner-has-not-published state naming
-    /// the first missing archive — never a resolution error.
     #[test]
-    fn latest_404_reports_not_yet_published_for_the_first_archive() {
-        let manifest = ReleaseManifest {
-            tag_name: "latest".to_string(),
-            assets: Vec::new(),
-            draft: false,
-            prerelease: false,
-            created_at: String::new(),
-        };
-        let mut source = source_with_manifest(Component::Synapse, manifest);
+    fn present_component_missing_host_target_names_the_missing_asset() {
+        let mut source =
+            ReleaseArtifactSource::from_index(index_with_core_linux(), AlphaTarget::DarwinArm64);
         assert_eq!(
             source
-                .release_availability(Component::Synapse)
+                .release_availability(Component::Core)
                 .expect("availability"),
             ReleaseAvailability::NotYetPublished {
-                release_tag: "latest".to_string(),
-                missing_asset: "ck-synapse-linux-x64.zip".to_string(),
+                release_tag: "subc-core-v0.16.0".to_string(),
+                missing_asset: "ck-subc-darwin-arm64.zip".to_string(),
             }
         );
     }
 
-    /// Owners publish two version-carrying tag shapes; both must derive the
-    /// version a placed binary self-reports. Found on the first macOS operator
-    /// drive: core's real tag `subc-core-v0.14.1` was refused as malformed, so
-    /// the alpha was never installable by `ck setup` on any OS while the CI
-    /// stub served bare `v<version>` tags the code assumed.
     #[test]
-    fn expected_version_derives_from_both_owner_tag_shapes() {
+    fn complete_host_assets_are_available() {
+        let mut source =
+            ReleaseArtifactSource::from_index(index_with_core_linux(), AlphaTarget::LinuxX64);
         assert_eq!(
-            expected_version_from_tag(Component::Core, "subc-core-v0.14.1").as_deref(),
-            Ok("0.14.1")
-        );
-        assert_eq!(
-            expected_version_from_tag(Component::Aft, "v0.55.0").as_deref(),
-            Ok("0.55.0")
-        );
-        assert_eq!(
-            expected_version_from_tag(Component::Claustrum, "v0.1.0").as_deref(),
-            Ok("0.1.0")
+            source
+                .release_availability(Component::Core)
+                .expect("availability"),
+            ReleaseAvailability::Available
         );
     }
 
     #[test]
-    fn expected_version_refuses_versionless_latest_tags_naming_both_shapes() {
-        let error = expected_version_from_tag(Component::Aft, "nightly").unwrap_err();
-        assert!(error.contains("v<crate-version>"), "{error}");
-        assert!(error.contains("<crate>-v<crate-version>"), "{error}");
-    }
-
-    /// Fourth finding of the macOS drive: the core release ships `ck-subc-mcp`
-    /// (crate 0.1.0) beside `ck-subc` (the crate the tag names, 0.14.1). One
-    /// version cannot hold both; the sibling proves it runs and reports, and
-    /// provenance rests on the sidecar.
-    #[test]
-    fn acceptance_is_per_binary_within_a_workspace_release() {
+    fn reports_some_acceptance_passes_and_fails_on_the_version_line() {
+        let mut source =
+            ReleaseArtifactSource::from_index(index_with_core_linux(), AlphaTarget::LinuxX64);
         assert_eq!(
-            acceptance_for(Component::Core, "ck-subc", "subc-core-v0.14.1"),
-            Ok(Acceptance::Version("0.14.1".to_string()))
+            source
+                .acceptance(Component::Core, "ck-subc")
+                .expect("acceptance"),
+            Acceptance::Reports("0.16.0".to_string())
         );
-        assert_eq!(
-            acceptance_for(Component::Core, "ck-subc-mcp", "subc-core-v0.14.1"),
-            Ok(Acceptance::RunsAndReports)
-        );
-        // Single-crate owners: every binary is the tag's crate.
-        assert_eq!(
-            acceptance_for(Component::Claustrum, "ck-auth", "v0.1.0"),
-            Ok(Acceptance::Version("0.1.0".to_string()))
-        );
-    }
-
-    /// mc's tag is a build train (`ck-mc-alpha.<sha8>`); its `--version`
-    /// self-reports the full build sha, of which the tag id is a prefix.
-    #[test]
-    fn train_tagged_components_are_accepted_on_the_train_id() {
-        assert_eq!(
-            acceptance_for(Component::Mc, "ck-mc", "ck-mc-alpha.22464bf2"),
-            Ok(Acceptance::TrainId("22464bf2".to_string()))
-        );
-        let error = acceptance_for(Component::Mc, "ck-mc", "ck-mc-alpha.nightly").unwrap_err();
-        assert!(error.contains("build sha train id"), "{error}");
+        let reports = Acceptance::Reports("0.16.0".to_string());
+        assert!(check_reported("ck-subc 0.16.0\n", &reports).is_ok());
+        assert!(check_reported("ck-subc v0.16.0\n", &reports).is_ok());
+        assert!(check_reported("ck-subc 0.15.0\n", &reports).is_err());
     }
 
     #[test]
-    fn reported_line_check_covers_all_three_acceptance_arms() {
-        let version = Acceptance::Version("0.14.1".to_string());
-        assert!(check_reported("ck-subc 0.14.1\n", &version).is_ok());
-        assert!(check_reported("ck-subc v0.14.1\n", &version).is_ok());
-        assert!(check_reported("ck-subc 0.13.0\n", &version).is_err());
-
-        let train = Acceptance::TrainId("22464bf2".to_string());
-        assert!(check_reported(
-            "ck-mc 0.1.0 (22464bf2a1b2c3d4e5f60718293a4b5c6d7e8f90)\n",
-            &train
-        )
-        .is_ok());
-        // An unstamped dev build prints the crate version alone: refused.
-        let error = check_reported("ck-mc 0.1.0\n", &train).unwrap_err();
-        assert!(error.contains("train id 22464bf2"), "{error}");
-
+    fn reports_none_requires_a_name_and_version() {
+        let mut source =
+            ReleaseArtifactSource::from_index(index_with_core_linux(), AlphaTarget::LinuxX64);
+        assert_eq!(
+            source
+                .acceptance(Component::Core, "ck-subc-mcp")
+                .expect("acceptance"),
+            Acceptance::RunsAndReports
+        );
         assert!(check_reported("ck-subc-mcp 0.1.0\n", &Acceptance::RunsAndReports).is_ok());
         assert!(check_reported("\n", &Acceptance::RunsAndReports).is_err());
     }
 
     #[test]
-    fn download_error_status_is_recovered_from_both_download_arms() {
-        // curl arm: explicit stamp wins even when prose carries other digits.
+    fn available_core_index_plans_install_and_offers_extras() {
+        let mut source =
+            ReleaseArtifactSource::from_index(index_with_core_linux(), AlphaTarget::LinuxX64);
         assert_eq!(
-            http_status_from_download_error(
-                "release-incomplete: could not download https://x/releases/latest: curl: (22) The requested URL returned error: 404 http_status=404"
-            ),
-            Some(404)
+            source.release_availability(Component::Core).unwrap(),
+            ReleaseAvailability::Available
         );
-        // PowerShell arm: code only in prose.
-        assert_eq!(
-            http_status_from_download_error(
-                "release-incomplete: could not download https://x: The remote server returned an error: (404) Not Found."
-            ),
-            Some(404)
+        let mut observed = super::super::model::SetupObserved::unconfigured_current_host();
+        observed.platform =
+            super::super::model::PlatformObservation::Supported(AlphaTarget::LinuxX64);
+        observed
+            .releases
+            .insert(Component::Core, ReleaseAvailability::Available);
+        let plan = super::super::planner::plan_setup(
+            &observed,
+            &super::super::model::SetupRequest::install(Vec::new()),
         );
-        // A curl transport error stamps 000 and carries no HTTP code: not a 404.
-        assert_eq!(
-            http_status_from_download_error(
-                "release-incomplete: could not download https://x: curl: (6) Could not resolve host http_status=000"
-            ),
-            None
-        );
-    }
-
-    #[test]
-    fn only_mc_uses_tag_pattern_resolution() {
-        let source = source_with_manifest(
-            Component::Mc,
-            release("ck-mc-alpha.1234abcd", "2026-01-01T00:00:00Z", false, true),
-        );
-        assert!(matches!(
-            Component::Mc.release_resolution_strategy(),
-            ReleaseResolutionStrategy::TagPrefix("ck-mc-")
-        ));
-        assert_eq!(
-            Component::Aft.release_resolution_strategy(),
-            ReleaseResolutionStrategy::Latest
-        );
-        assert_eq!(
-            source.manifest_url(Component::Aft),
-            "https://api.example.test/repos/cortexkit/aft/releases/latest"
-        );
-        assert_eq!(
-            source.manifest_url(Component::Mc),
-            "https://api.example.test/repos/cortexkit/magic-context/releases?per_page=100"
-        );
+        assert!(plan.operations.iter().any(|operation| matches!(
+            operation,
+            super::super::model::SetupOperation::InstallComponent {
+                component: Component::Core
+            }
+        )));
+        assert!(plan.operations.iter().any(|operation| matches!(
+            operation,
+            super::super::model::SetupOperation::OfferOptionalComponents
+        )));
     }
 }

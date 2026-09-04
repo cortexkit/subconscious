@@ -54,6 +54,7 @@ export {
   buildFlags,
   encodeFrame,
   decodeHeader,
+  hasBinary,
   hasDaemonOrigin,
   encodeHeader,
   DecodeError,

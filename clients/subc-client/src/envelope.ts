@@ -72,6 +72,11 @@ export function admissionClass(flags: number): AdmissionClass {
   return ((flags & FLAG_ADMISSION_MASK) >> FLAG_ADMISSION_SHIFT) as AdmissionClass;
 }
 
+/** True when the body is opaque bytes rather than a JSON payload. */
+export function hasBinary(flags: number): boolean {
+  return (flags & FLAG_BINARY) !== 0;
+}
+
 export function hasDaemonOrigin(flags: number): boolean {
   return (flags & DAEMON_ORIGIN_FLAG) !== 0;
 }

@@ -20,6 +20,7 @@ import {
   buildFlags,
   encodeFrame,
   FrameType,
+  hasBinary,
   Priority,
   type Frame,
 } from "./envelope.js";
@@ -159,6 +160,12 @@ export interface RequestOptions {
   priority?: Priority;
   admissionClass?: AdmissionClass;
   timeoutMs?: number;
+  /**
+   * Set when the request body is opaque bytes rather than JSON. This flag is the
+   * receiver's only signal about the body representation; reply decoding follows
+   * the response frame's flag instead of this request option.
+   */
+  binary?: boolean;
   /** Called for each interim PUSH / StreamData frame before the terminal reply. */
   onProgress?: (body: Uint8Array) => void;
 }
@@ -285,6 +292,12 @@ export class SubcError extends Error {
   ) {
     super(message);
   }
+}
+
+function requireBinaryBody(body: unknown): Uint8Array {
+  if (body instanceof Uint8Array) return body;
+  const type = body === null ? "null" : Array.isArray(body) ? "array" : typeof body;
+  throw new SubcError(`binary request body must be a Uint8Array; got ${type}`, "binary_body_required");
 }
 
 interface Pending {
@@ -575,14 +588,25 @@ export class SubcClient {
     return installed;
   }
 
-    /** Send a data-plane request on exactly the supplied route generation. */
+  /** Send a data-plane request on exactly the supplied route generation. */
   async request(handle: RouteHandle, body: unknown, opts: RequestOptions = {}): Promise<unknown> {
     this.assertLiveHandle(handle);
-    const bytes = body instanceof Uint8Array ? body : this.encode(body);
+    const binary = opts.binary ?? false;
+    const bytes = binary ? requireBinaryBody(body) : body instanceof Uint8Array ? body : this.encode(body);
     const priority = opts.priority ?? Priority.Interactive;
     const admission = opts.admissionClass ?? AdmissionClass.Normal;
-    const reply = await this.send(handle, bytes, priority, admission, opts.timeoutMs, opts.onProgress);
-    return this.parseJson(reply);
+    const reply = await this.send(
+      handle,
+      bytes,
+      priority,
+      admission,
+      opts.timeoutMs,
+      opts.onProgress,
+      undefined,
+      undefined,
+      binary,
+    );
+    return this.decodeReply(reply);
   }
 
   /**
@@ -595,13 +619,37 @@ export class SubcClient {
     params?: unknown,
     opts: ManagedCallOptions = {},
   ): Promise<Response> {
+    if (opts.binary) {
+      throw new SubcError(
+        "call() builds a JSON body and cannot send a binary request; got object; use callBinary(moduleId, body, opts) with a Uint8Array",
+        "binary_call_requires_call_binary",
+      );
+    }
     const body = params === undefined ? { method } : { method, params };
+    return (await this.managedCall(moduleId, body, opts)) as Response;
+  }
 
+  /**
+   * Managed route + raw opaque-body request convenience. Unlike call(), this
+   * sends bytes without a JSON method envelope because the BINARY flag is the
+   * receiver's only signal that the body is not JSON. A BINARY reply resolves
+   * to Uint8Array; a non-binary reply is decoded as JSON.
+   */
+  async callBinary(
+    moduleId: string,
+    body: Uint8Array,
+    opts: ManagedCallOptions = {},
+  ): Promise<Uint8Array | unknown> {
+    const bytes = requireBinaryBody(body);
+    return this.managedCall(moduleId, bytes, { ...opts, binary: true });
+  }
+
+  private async managedCall(moduleId: string, body: unknown, opts: ManagedCallOptions): Promise<unknown> {
     let retriedUnknownChannel = false;
     for (;;) {
       const routeHandle = await this.cachedRouteHandle(moduleId, opts);
       try {
-        return (await this.managedRequest(routeHandle, body, opts)) as Response;
+        return await this.managedRequest(routeHandle, body, opts);
       } catch (err) {
         if (!(err instanceof SubcCallError)) throw this.terminalCallError("managed call failed", err);
         // unknown_channel is the daemon ROUTER refusing an unrouted channel — the
@@ -850,6 +898,7 @@ export class SubcClient {
     onProgress: ((body: Uint8Array) => void) | undefined,
     acceptFrame?: (frame: Frame) => boolean,
     onLateResponse?: (frame: Frame) => void,
+    binary = false,
   ): Promise<Frame> {
     if (handle) this.assertLiveHandle(handle);
     if (this.closedErr) return Promise.reject(this.closedErr);
@@ -864,7 +913,7 @@ export class SubcClient {
     const epoch = handle?.epoch ?? 0;
     const frame = buildFrame(
       FrameType.Request,
-      buildFlags(false, priority, false, admission),
+      buildFlags(binary, priority, false, admission),
       channel,
       epoch,
       corr,
@@ -929,12 +978,21 @@ export class SubcClient {
   }
 
   private async managedRequest(handle: RouteHandle, body: unknown, opts: ManagedCallOptions): Promise<unknown> {
-    const bytes = body instanceof Uint8Array ? body : this.encode(body);
+    const binary = opts.binary ?? false;
+    const bytes = binary ? requireBinaryBody(body) : body instanceof Uint8Array ? body : this.encode(body);
     const priority = opts.priority ?? Priority.Interactive;
     const admission = opts.admissionClass ?? AdmissionClass.Normal;
     try {
-      const reply = await this.sendManaged(handle, bytes, priority, admission, opts.timeoutMs, opts.onProgress);
-      return this.parseJson(reply);
+      const reply = await this.sendManaged(
+        handle,
+        bytes,
+        priority,
+        admission,
+        opts.timeoutMs,
+        opts.onProgress,
+        binary,
+      );
+      return this.decodeReply(reply);
     } catch (error) {
       if (error instanceof SubcCallError) throw error;
       throw this.terminalCallError("managed call failed", error);
@@ -948,6 +1006,7 @@ export class SubcClient {
     admission: AdmissionClass,
     timeoutMs: number | undefined,
     onProgress: ((body: Uint8Array) => void) | undefined,
+    binary = false,
   ): Promise<Frame> {
     try {
       this.assertLiveHandle(handle);
@@ -969,7 +1028,7 @@ export class SubcClient {
     const key = pendingKey(handle, corr);
     const frame = buildFrame(
       FrameType.Request,
-      buildFlags(false, priority, false, admission),
+      buildFlags(binary, priority, false, admission),
       handle.channel,
       handle.epoch,
       corr,
@@ -1577,6 +1636,11 @@ export class SubcClient {
 
   private encode(value: unknown): Uint8Array {
     return Buffer.from(JSON.stringify(value), "utf8");
+  }
+
+  /** Decode a terminal response according to the representation on the wire. */
+  private decodeReply(frame: Frame): unknown {
+    return hasBinary(frame.header.flags) ? frame.body : this.parseJson(frame);
   }
 
   private parseJson(frame: Frame): unknown {

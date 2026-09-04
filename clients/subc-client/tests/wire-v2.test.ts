@@ -6,9 +6,11 @@ import {
   buildFrame,
   decodeHeader,
   FrameType,
+  hasBinary,
   HEADER_LEN,
   Priority,
   StaleRouteHandleError,
+  SubcCallError,
   SubcClient,
   SubcError,
   SubcProvider,
@@ -306,6 +308,107 @@ describe("RouteHandle fencing and endpoint validation", () => {
         expect(socket.closeCount).toBe(1);
       }
     }
+  });
+});
+
+describe("binary request and reply bodies", () => {
+  test("sets BINARY and preserves bytes while decoding a JSON reply from the wire flag", async () => {
+    const { client, internals, socket, handle } = clientHarness();
+    const body = new Uint8Array([0, 255, 1, 254]);
+    const pending = client.request(handle, body, { binary: true });
+    const outbound = socket.writes[0]!;
+
+    expect(hasBinary(outbound.header.flags)).toBe(true);
+    expect(outbound.body).toEqual(body);
+
+    internals.dispatch(response(outbound, { accepted: true }));
+    await expect(pending).resolves.toEqual({ accepted: true });
+  });
+
+  test("rejects a non-byte binary request before writing a frame and names its type", async () => {
+    const { client, socket, handle } = clientHarness();
+
+    await expect(client.request(handle, { dishonest: true }, { binary: true }))
+      .rejects.toMatchObject({ code: "binary_body_required", message: expect.stringContaining("got object") });
+    expect(socket.writes).toEqual([]);
+  });
+
+  test("returns a binary Response body without attempting JSON decoding", async () => {
+    const { client, internals, socket, handle } = clientHarness();
+    const pending = client.request(handle, { method: "download" });
+    const outbound = socket.writes[0]!;
+    const reply = new Uint8Array([137, 80, 78, 71, 0]);
+
+    internals.dispatch(buildFrame(
+      FrameType.Response,
+      buildFlags(true, Priority.Interactive, false),
+      outbound.header.channel,
+      outbound.header.epoch,
+      outbound.header.corr,
+      reply,
+    ));
+    await expect(pending).resolves.toEqual(reply);
+  });
+
+  test("keeps call() JSON-only and rejects binary before route.open", async () => {
+    const { client, internals, socket, handle } = clientHarness();
+    let routeOpened = false;
+    internals.cachedRouteHandle = () => {
+      routeOpened = true;
+      return handle;
+    };
+
+    await expect(client.call("provider", "download", { offset: 0 }, { binary: true }))
+      .rejects.toMatchObject({
+        code: "binary_call_requires_call_binary",
+        message: expect.stringContaining("callBinary"),
+      });
+    expect(routeOpened).toBe(false);
+    expect(socket.writes).toEqual([]);
+  });
+
+  test("callBinary uses the managed request path and returns a binary reply", async () => {
+    const { client, internals, socket, handle } = clientHarness();
+    internals.cachedRouteHandle = () => handle;
+    const body = new Uint8Array([3, 1, 4, 1, 5]);
+    const pending = client.callBinary("provider", body);
+    await Promise.resolve();
+    const outbound = socket.writes[0]!;
+    const reply = new Uint8Array([8, 2, 8]);
+
+    expect(outbound.header.ty).toBe(FrameType.Request);
+    expect(hasBinary(outbound.header.flags)).toBe(true);
+    expect(outbound.body).toEqual(body);
+
+    internals.dispatch(buildFrame(
+      FrameType.Response,
+      buildFlags(true, Priority.Interactive, false),
+      outbound.header.channel,
+      outbound.header.epoch,
+      outbound.header.corr,
+      reply,
+    ));
+    await expect(pending).resolves.toEqual(reply);
+  });
+
+  test("keeps Error frames on the JSON error path and surfaces SubcCallError", async () => {
+    const { client, internals, socket, handle } = clientHarness();
+    internals.cachedRouteHandle = () => handle;
+    const pending = client.call("provider", "download");
+    await Promise.resolve();
+    const outbound = socket.writes[0]!;
+
+    const error = buildFrame(
+      FrameType.Error,
+      buildFlags(false, Priority.Interactive, false),
+      outbound.header.channel,
+      outbound.header.epoch,
+      outbound.header.corr,
+      json({ code: "bad_request", message: "module rejected request" }),
+    );
+    expect(hasBinary(error.header.flags)).toBe(false);
+    internals.dispatch(error);
+    await expect(pending).rejects.toBeInstanceOf(SubcCallError);
   });
 });
 

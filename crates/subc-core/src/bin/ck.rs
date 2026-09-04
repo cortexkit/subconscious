@@ -58,7 +58,23 @@ const TOP_HELP_TAIL: &str = "flags:\n  --subc <file>   use a specific connection
 
 const DOMAIN_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const DOMAIN_PROBE_CACHE_FILE: &str = "domain-probes.json";
-const MODULE_BINARY_NAMES: &[&str] = &["aft", "claustrum", "insula", "subc", "subc-mcp"];
+
+/// Names of installed module programs, derived from setup's component tables so
+/// the dispatcher cannot drift when a component gains another supported target.
+fn module_binary_names() -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    for component in setup::Component::ALL {
+        if let Some(program) = setup::module_program(component) {
+            names.insert(program.strip_prefix("ck-").unwrap_or(program).to_string());
+        }
+    }
+    for target in setup::AlphaTarget::ALL {
+        for binary in setup::component_binaries_for_target(setup::Component::Core, target) {
+            names.insert(binary.strip_prefix("ck-").unwrap_or(binary).to_string());
+        }
+    }
+    names
+}
 
 #[derive(Clone, Debug)]
 struct ExternalDomainCandidate {
@@ -824,11 +840,16 @@ fn display_home_path(path: &Path) -> String {
 /// result is cached, but a changed executable gets a new stamp and is probed
 /// again before it can receive operator input.
 fn dispatch_external(domain: &str, tail: &[OsString]) -> Result<(), CkError> {
+    let module_names = module_binary_names();
     let candidate = external_domain_candidates().remove(domain);
     let Some(candidate) = candidate else {
-        return Err(CkError::Usage(format!(
-            "unknown command '{domain}'. Run ck --help."
-        )));
+        return if module_names.contains(domain) {
+            Err(CkError::ModuleNotCommand(domain.to_string()))
+        } else {
+            Err(CkError::Usage(format!(
+                "unknown command '{domain}'. Run ck --help."
+            )))
+        };
     };
     if probe_external_domain(&candidate).is_some() {
         let status = process::Command::new(&candidate.path)
@@ -842,7 +863,7 @@ fn dispatch_external(domain: &str, tail: &[OsString]) -> Result<(), CkError> {
             })?;
         process::exit(status.code().unwrap_or(1));
     }
-    if MODULE_BINARY_NAMES.contains(&domain) {
+    if module_names.contains(domain) {
         return Err(CkError::ModuleNotCommand(domain.to_string()));
     }
     Err(CkError::Usage(format!(
@@ -5123,6 +5144,19 @@ mod tests {
     /// ones; within each cohort the order stays alphabetical. The cohort test
     /// is structural, so a NEW balance provider lands at the end without a
     /// name list knowing about it.
+    #[test]
+    fn module_binary_names_include_every_setup_module_program() {
+        let names = module_binary_names();
+        assert!(
+            names.contains("mc"),
+            "MC must remain a module command rejection"
+        );
+        assert!(
+            names.contains("synapse"),
+            "synapse must remain a module command rejection"
+        );
+    }
+
     #[test]
     fn setup_and_upgrade_identity_does_not_use_a_bare_argv_zero() {
         let argv_zero = Path::new("ck");

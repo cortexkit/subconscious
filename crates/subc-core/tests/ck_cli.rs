@@ -337,6 +337,7 @@ fn external_domains_opt_in_dispatch_and_cache_their_probe() {
     write_program("ck-no", "exit 1");
     write_program("ck-hang", "sleep 3");
     write_program("ck-aft", "exit 1");
+    write_program("ck-mc", "exit 1");
 
     let started = std::time::Instant::now();
     let help = ck_command()
@@ -436,6 +437,18 @@ fn external_domains_opt_in_dispatch_and_cache_their_probe() {
     assert_eq!(
         text(&module.stderr).trim(),
         "'aft' is a module, not a command. Try: ck module status aft"
+    );
+
+    let mc = ck_command()
+        .arg("mc")
+        .env("PATH", &bin)
+        .env("CK_UPDATE_CACHE_PATH", &cache)
+        .output()
+        .expect("reject magic-context module binary");
+    assert_exit(&mc, 64);
+    assert_eq!(
+        text(&mc.stderr).trim(),
+        "'mc' is a module, not a command. Try: ck module status mc"
     );
 
     let unknown = ck_command()

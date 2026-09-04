@@ -201,6 +201,37 @@ final class BoardModelsTests: XCTestCase {
         XCTAssertEqual(again.laneBlocks, state.laneBlocks)
     }
 
+    /// Consumers run `JSONKeyNormalizer.camelize` over replies before decoding,
+    /// and the lane elements are snake_case on the wire while the rest of the
+    /// board is camelCase. Pinning one spelling made every lane opaque on the
+    /// phone (degraded 4 of 4) while the raw-fixture test above stayed green.
+    /// The typed arm must decode the fixture AFTER camelization too.
+    func testLaneBlocksDecodeTypedAfterConsumerCamelization() throws {
+        let fixture = try loadV3FixtureObject()
+        let snapshot: [String: Any] = [
+            "roomId": "rm_x", "sessionId": "ses_x", "vocabulary": "v2", "servedSeq": 1,
+            "lanes": ["status"], "blocks": [],
+            "laneBlocks": fixture["laneBlocks"] as Any,
+        ]
+        let camelized = JSONKeyNormalizer.camelize(snapshot)
+        let data = try JSONSerialization.data(withJSONObject: camelized)
+        // Control: the normalizer really did rewrite the keys we care about.
+        let text = String(decoding: data, as: UTF8.self)
+        XCTAssertTrue(text.contains("\"updatedAtMs\""))
+        XCTAssertFalse(text.contains("\"updated_at_ms\""))
+
+        let state = try JSONDecoder().decode(BoardState.self, from: data)
+        XCTAssertEqual(state.degradedLaneBlockCount, 1, "only the malformed lane degrades after camelization")
+        guard case .lane(let release) = try XCTUnwrap(state.laneBlocks)[0] else {
+            return XCTFail("camelized lane must decode typed")
+        }
+        XCTAssertEqual(release.updatedAtMs, 1_700_000_400_000)
+        let rotten = try XCTUnwrap(release.items[3].wait)
+        XCTAssertEqual(rotten.refTerminalAtMs, 1_699_990_000_000)
+        XCTAssertEqual(rotten.sinceMs, 1_700_000_000_000)
+        XCTAssertEqual(rotten.rotten, true)
+    }
+
     /// A producer older than the V3 cut sends no `laneBlocks`; that is `nil`,
     /// distinct from an empty array.
     func testLaneBlocksAbsentDecodesAsNil() throws {

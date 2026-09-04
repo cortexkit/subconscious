@@ -476,6 +476,12 @@ public enum BoardLaneEntry: Codable, Equatable {
 
 /// A thread lane as the module serves it. Required fields are the ones the
 /// producer fixture marks a lane malformed without.
+///
+/// The lane elements are spelled snake_case on the wire (`updated_at_ms`)
+/// while the rest of board.state is camelCase, and consumers run
+/// `JSONKeyNormalizer.camelize` over replies before decoding. Pinning one
+/// spelling in CodingKeys made every lane opaque on the phone. These types
+/// decode either spelling and encode camelCase, the SDK's convention.
 public struct BoardLaneBlock: Codable, Equatable {
     public var id: String
     public var title: String
@@ -484,9 +490,36 @@ public struct BoardLaneBlock: Codable, Equatable {
     public var items: [BoardLaneItem]
     public var attached: [BoardLaneAttachment]?
 
-    enum CodingKeys: String, CodingKey {
-        case id, title, status, items, attached
-        case updatedAtMs = "updated_at_ms"
+    public init(
+        id: String, title: String, status: String, updatedAtMs: Int64,
+        items: [BoardLaneItem], attached: [BoardLaneAttachment]? = nil
+    ) {
+        self.id = id
+        self.title = title
+        self.status = status
+        self.updatedAtMs = updatedAtMs
+        self.items = items
+        self.attached = attached
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: AnyCodingKey.self)
+        id = try c.either("id")
+        title = try c.either("title")
+        status = try c.either("status")
+        updatedAtMs = try c.either("updatedAtMs")
+        items = try c.either("items")
+        attached = try c.eitherIfPresent("attached")
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: AnyCodingKey.self)
+        try c.encode(id, forKey: .named("id"))
+        try c.encode(title, forKey: .named("title"))
+        try c.encode(status, forKey: .named("status"))
+        try c.encode(updatedAtMs, forKey: .named("updatedAtMs"))
+        try c.encode(items, forKey: .named("items"))
+        try c.encodeIfPresent(attached, forKey: .named("attached"))
     }
 }
 
@@ -496,6 +529,13 @@ public struct BoardLaneItem: Codable, Equatable {
     /// `pending`, `active`, `done`, `blocked`; open for the producer to extend.
     public var state: String
     public var wait: BoardLaneWait?
+
+    public init(id: String, text: String, state: String, wait: BoardLaneWait? = nil) {
+        self.id = id
+        self.text = text
+        self.state = state
+        self.wait = wait
+    }
 }
 
 /// Why a blocked item is blocked, decorated by the module against the thing
@@ -513,13 +553,49 @@ public struct BoardLaneWait: Codable, Equatable {
     public var sender: String?
     public var excerpt: String?
 
-    enum CodingKeys: String, CodingKey {
-        case on, ref, rotten, sender, excerpt
-        case refState = "ref_state"
-        case refTerminalAtMs = "ref_terminal_at_ms"
-        case sinceMs = "since_ms"
-        case agentId = "agent_id"
-        case displayName = "display_name"
+    public init(
+        on: String, ref: String? = nil, refState: String? = nil, refTerminalAtMs: Int64? = nil,
+        rotten: Bool? = nil, sinceMs: Int64, agentId: String? = nil, displayName: String? = nil,
+        sender: String? = nil, excerpt: String? = nil
+    ) {
+        self.on = on
+        self.ref = ref
+        self.refState = refState
+        self.refTerminalAtMs = refTerminalAtMs
+        self.rotten = rotten
+        self.sinceMs = sinceMs
+        self.agentId = agentId
+        self.displayName = displayName
+        self.sender = sender
+        self.excerpt = excerpt
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: AnyCodingKey.self)
+        on = try c.either("on")
+        ref = try c.eitherIfPresent("ref")
+        refState = try c.eitherIfPresent("refState")
+        refTerminalAtMs = try c.eitherIfPresent("refTerminalAtMs")
+        rotten = try c.eitherIfPresent("rotten")
+        sinceMs = try c.either("sinceMs")
+        agentId = try c.eitherIfPresent("agentId")
+        displayName = try c.eitherIfPresent("displayName")
+        sender = try c.eitherIfPresent("sender")
+        excerpt = try c.eitherIfPresent("excerpt")
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: AnyCodingKey.self)
+        try c.encode(on, forKey: .named("on"))
+        try c.encodeIfPresent(ref, forKey: .named("ref"))
+        try c.encodeIfPresent(refState, forKey: .named("refState"))
+        try c.encodeIfPresent(refTerminalAtMs, forKey: .named("refTerminalAtMs"))
+        try c.encodeIfPresent(rotten, forKey: .named("rotten"))
+        try c.encode(sinceMs, forKey: .named("sinceMs"))
+        try c.encodeIfPresent(agentId, forKey: .named("agentId"))
+        try c.encodeIfPresent(displayName, forKey: .named("displayName"))
+        try c.encodeIfPresent(sender, forKey: .named("sender"))
+        try c.encodeIfPresent(excerpt, forKey: .named("excerpt"))
     }
 }
 
@@ -530,12 +606,69 @@ public struct BoardLaneAttachment: Codable, Equatable {
     public var terminal: Bool?
     public var updatedAtMs: Int64?
 
-    enum CodingKeys: String, CodingKey {
-        case id, kind, status, terminal
-        case updatedAtMs = "updated_at_ms"
+    public init(id: String, kind: String, status: String, terminal: Bool? = nil, updatedAtMs: Int64? = nil) {
+        self.id = id
+        self.kind = kind
+        self.status = status
+        self.terminal = terminal
+        self.updatedAtMs = updatedAtMs
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: AnyCodingKey.self)
+        id = try c.either("id")
+        kind = try c.either("kind")
+        status = try c.either("status")
+        terminal = try c.eitherIfPresent("terminal")
+        updatedAtMs = try c.eitherIfPresent("updatedAtMs")
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: AnyCodingKey.self)
+        try c.encode(id, forKey: .named("id"))
+        try c.encode(kind, forKey: .named("kind"))
+        try c.encode(status, forKey: .named("status"))
+        try c.encodeIfPresent(terminal, forKey: .named("terminal"))
+        try c.encodeIfPresent(updatedAtMs, forKey: .named("updatedAtMs"))
     }
 }
 
+extension AnyCodingKey {
+    static func named(_ name: String) -> AnyCodingKey {
+        // The failable initializer never fails for a non-empty literal.
+        AnyCodingKey(stringValue: name)!
+    }
+
+    /// The snake_case spelling of a camelCase key: the wire form of the lane
+    /// elements before a consumer's normalizer touches them.
+    fileprivate var snakeCased: AnyCodingKey {
+        var out = ""
+        for scalar in stringValue.unicodeScalars {
+            if scalar.properties.isUppercase {
+                out.append("_")
+                out.append(Character(scalar).lowercased())
+            } else {
+                out.append(Character(scalar))
+            }
+        }
+        return .named(out)
+    }
+}
+
+extension KeyedDecodingContainer where K == AnyCodingKey {
+    /// Decodes the camelCase key, falling back to its snake_case spelling.
+    fileprivate func either<T: Decodable>(_ camel: String) throws -> T {
+        let key = AnyCodingKey.named(camel)
+        if contains(key) { return try decode(T.self, forKey: key) }
+        return try decode(T.self, forKey: key.snakeCased)
+    }
+
+    fileprivate func eitherIfPresent<T: Decodable>(_ camel: String) throws -> T? {
+        let key = AnyCodingKey.named(camel)
+        if contains(key) { return try decodeIfPresent(T.self, forKey: key) }
+        return try decodeIfPresent(T.self, forKey: key.snakeCased)
+    }
+}
 /// Decodes any JSON value and keeps nothing: used to step past an element
 /// whose shape this SDK does not model without failing the container.
 private struct OpaqueJSONValue: Decodable {

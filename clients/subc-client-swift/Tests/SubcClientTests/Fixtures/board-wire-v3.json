@@ -1,0 +1,163 @@
+{
+  "golden": {
+    "after": {
+      "id": "91930b74",
+      "text": "ship the fixture"
+    },
+    "before": {
+      "id": "9009c013",
+      "text": "ship fixture"
+    },
+    "rule": "reword-is-new"
+  },
+  "laneBlocks": [
+    {
+      "attached": [
+        {
+          "id": "wi_terminal",
+          "kind": "work",
+          "status": "done",
+          "terminal": true,
+          "updated_at_ms": 1700000300000
+        }
+      ],
+      "id": "ln_11111111",
+      "items": [
+        {
+          "id": "6f64d7c7",
+          "state": "pending",
+          "text": "queued follow-up"
+        },
+        {
+          "id": "19176882",
+          "state": "active",
+          "text": "implement store"
+        },
+        {
+          "id": "2460dc26",
+          "state": "done",
+          "text": "pin schema"
+        },
+        {
+          "id": "d2893b6f",
+          "state": "blocked",
+          "text": "read operator answer",
+          "wait": {
+            "on": "user",
+            "ref": "ask:ask_0123abcd",
+            "ref_state": "terminal",
+            "ref_terminal_at_ms": 1699990000000,
+            "rotten": true,
+            "since_ms": 1700000000000
+          }
+        },
+        {
+          "id": "bd68fba7",
+          "state": "blocked",
+          "text": "seal fixture",
+          "wait": {
+            "on": "external",
+            "ref": "artifact:art_0123abcd",
+            "ref_state": "pending",
+            "since_ms": 1700000000000
+          }
+        }
+      ],
+      "status": "Shipping Board V3.",
+      "title": "release",
+      "updated_at_ms": 1700000400000
+    },
+    {
+      "attached": [
+        {
+          "id": "ct_active",
+          "kind": "consult",
+          "status": "fanout",
+          "terminal": false,
+          "updated_at_ms": 1700000250000
+        }
+      ],
+      "id": "ln_22222222",
+      "items": [
+        {
+          "id": "69050d1a",
+          "state": "blocked",
+          "text": "collect panel result",
+          "wait": {
+            "on": "external",
+            "ref": "consult:ct_0123abcd",
+            "ref_state": "terminal",
+            "ref_terminal_at_ms": 1700000200000,
+            "since_ms": 1700000000000
+          }
+        },
+        {
+          "id": "3fab3295",
+          "state": "blocked",
+          "text": "settle worker",
+          "wait": {
+            "on": "ci",
+            "ref": "work:wi_0123abcd",
+            "ref_state": "pending",
+            "since_ms": 1700000000000
+          }
+        },
+        {
+          "id": "7731a6c1",
+          "state": "blocked",
+          "text": "receive peer delta",
+          "wait": {
+            "agent_id": "agent_fusi",
+            "display_name": "FUSI",
+            "on": "agent_fusi",
+            "ref": "peer:agent_fusi",
+            "ref_state": "pending",
+            "since_ms": 1700000000000
+          }
+        }
+      ],
+      "status": "Waiting on module work.",
+      "title": "delegations",
+      "updated_at_ms": 1700000300000
+    },
+    {
+      "id": "ln_33333333",
+      "items": [
+        {
+          "id": "35f1a9bc",
+          "state": "blocked",
+          "text": "read peer message",
+          "wait": {
+            "excerpt": "The payload is pinned; consumer re-pin can proceed.",
+            "on": "agent_fusi",
+            "ref": "pm:pm_0123abcd",
+            "ref_state": "terminal",
+            "ref_terminal_at_ms": 1700000100000,
+            "sender": "FUSI",
+            "since_ms": 1700000000000
+          }
+        },
+        {
+          "id": "b62d9cba",
+          "state": "blocked",
+          "text": "resolve absent target",
+          "wait": {
+            "on": "external",
+            "ref": "work:wi_absent",
+            "ref_state": "unknown",
+            "since_ms": 1700000000000
+          }
+        }
+      ],
+      "status": "Showing pending and unknown distinctly.",
+      "title": "wire edges",
+      "updated_at_ms": 1700000200000
+    },
+    {
+      "id": "ln_bad00000",
+      "items": [],
+      "title": "opaque malformed lane"
+    }
+  ],
+  "version": "3.0"
+}

@@ -40,6 +40,7 @@ let package = Package(
             resources: [
                 .copy("Fixtures/wire_vectors.json"),
                 .copy("Fixtures/board-wire-fixtures-v1.json"),
+                .copy("Fixtures/board-wire-v3.json"),
             ]
         ),
     ]

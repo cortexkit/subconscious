@@ -306,6 +306,11 @@ public struct BoardState: Codable, Equatable {
     /// producer; non-zero is a wire disagreement the UI should surface, not
     /// hide -- the same reasoning as `degradedBlockCount`.
     public var unreadableLaneCount: Int = 0
+    /// Board V3 thread lanes, on their own key so the V1 lane-name list above
+    /// keeps its type. Absent from producers older than the V3 cut. A
+    /// malformed element decodes to `.opaque` and is counted by
+    /// `degradedLaneBlockCount`; the rest of the snapshot is unaffected.
+    public var laneBlocks: [BoardLaneEntry]?
     public var blocks: [BoardBlock]
     public var health: BoardHealth?
     /// Server-side truncation counts. Absent from older module builds.
@@ -337,6 +342,14 @@ public struct BoardState: Codable, Equatable {
         }
     }
 
+    /// Thread lanes that arrived malformed. Same contract as
+    /// `degradedBlockCount`: computed, so it cannot disagree with `laneBlocks`.
+    public var degradedLaneBlockCount: Int {
+        (laneBlocks ?? []).reduce(into: 0) { total, entry in
+            if case .opaque = entry { total += 1 }
+        }
+    }
+
     public func folded() -> BoardState {
         var copy = self
         copy.blocks = BoardBlock.foldNewest(blocks)
@@ -344,7 +357,7 @@ public struct BoardState: Codable, Equatable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case roomId, sessionId, vocabulary, servedSeq, lanes, blocks, health
+        case roomId, sessionId, vocabulary, servedSeq, lanes, laneBlocks, blocks, health
         case servedBlocks, totalBlocks
     }
 
@@ -355,6 +368,7 @@ public struct BoardState: Codable, Equatable {
         servedSeq: Int64,
         lanes: [String],
         unreadableLaneCount: Int = 0,
+        laneBlocks: [BoardLaneEntry]? = nil,
         blocks: [BoardBlock],
         health: BoardHealth? = nil,
         servedBlocks: Int? = nil,
@@ -366,6 +380,7 @@ public struct BoardState: Codable, Equatable {
         self.servedSeq = servedSeq
         self.lanes = lanes
         self.unreadableLaneCount = unreadableLaneCount
+        self.laneBlocks = laneBlocks
         self.blocks = blocks
         self.health = health
         self.servedBlocks = servedBlocks
@@ -393,6 +408,7 @@ public struct BoardState: Codable, Equatable {
         }
         lanes = laneNames
         unreadableLaneCount = unreadable
+        laneBlocks = try container.decodeIfPresent([BoardLaneEntry].self, forKey: .laneBlocks)
         blocks = try container.decode([BoardBlock].self, forKey: .blocks)
         health = try container.decodeIfPresent(BoardHealth.self, forKey: .health)
         servedBlocks = try container.decodeIfPresent(Int.self, forKey: .servedBlocks)
@@ -406,10 +422,117 @@ public struct BoardState: Codable, Equatable {
         try container.encode(vocabulary, forKey: .vocabulary)
         try container.encode(servedSeq, forKey: .servedSeq)
         try container.encode(lanes, forKey: .lanes)
+        try container.encodeIfPresent(laneBlocks, forKey: .laneBlocks)
         try container.encode(blocks, forKey: .blocks)
         try container.encodeIfPresent(health, forKey: .health)
         try container.encodeIfPresent(servedBlocks, forKey: .servedBlocks)
         try container.encodeIfPresent(totalBlocks, forKey: .totalBlocks)
+    }
+}
+
+// MARK: - Board V3 thread lanes (board.state.laneBlocks)
+
+/// One entry of `laneBlocks`: a typed lane, or an opaque placeholder for an
+/// element that did not decode. The id is kept when the element carried one
+/// so the UI can still show that something is there and name it.
+public enum BoardLaneEntry: Codable, Equatable {
+    case lane(BoardLaneBlock)
+    case opaque(id: String?)
+
+    public var id: String? {
+        switch self {
+        case .lane(let lane): return lane.id
+        case .opaque(let id): return id
+        }
+    }
+
+    public init(from decoder: Decoder) throws {
+        if let lane = try? BoardLaneBlock(from: decoder) {
+            self = .lane(lane)
+            return
+        }
+        // Consume the whole element so the enclosing array advances, then keep
+        // the id if there was one.
+        let container = try? decoder.container(keyedBy: AnyCodingKey.self)
+        let id = container.flatMap { keyed in
+            AnyCodingKey(stringValue: "id").flatMap { try? keyed.decode(String.self, forKey: $0) }
+        }
+        _ = try OpaqueJSONValue(from: decoder)
+        self = .opaque(id: id)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        switch self {
+        case .lane(let lane):
+            try lane.encode(to: encoder)
+        case .opaque(let id):
+            var container = encoder.container(keyedBy: AnyCodingKey.self)
+            if let id, let key = AnyCodingKey(stringValue: "id") {
+                try container.encode(id, forKey: key)
+            }
+        }
+    }
+}
+
+/// A thread lane as the module serves it. Required fields are the ones the
+/// producer fixture marks a lane malformed without.
+public struct BoardLaneBlock: Codable, Equatable {
+    public var id: String
+    public var title: String
+    public var status: String
+    public var updatedAtMs: Int64
+    public var items: [BoardLaneItem]
+    public var attached: [BoardLaneAttachment]?
+
+    enum CodingKeys: String, CodingKey {
+        case id, title, status, items, attached
+        case updatedAtMs = "updated_at_ms"
+    }
+}
+
+public struct BoardLaneItem: Codable, Equatable {
+    public var id: String
+    public var text: String
+    /// `pending`, `active`, `done`, `blocked`; open for the producer to extend.
+    public var state: String
+    public var wait: BoardLaneWait?
+}
+
+/// Why a blocked item is blocked, decorated by the module against the thing
+/// it waits on. `rotten` is the module's verdict that the referenced thing
+/// went terminal without the item moving; consumers render it, never derive it.
+public struct BoardLaneWait: Codable, Equatable {
+    public var on: String
+    public var ref: String?
+    public var refState: String?
+    public var refTerminalAtMs: Int64?
+    public var rotten: Bool?
+    public var sinceMs: Int64
+    public var agentId: String?
+    public var displayName: String?
+    public var sender: String?
+    public var excerpt: String?
+
+    enum CodingKeys: String, CodingKey {
+        case on, ref, rotten, sender, excerpt
+        case refState = "ref_state"
+        case refTerminalAtMs = "ref_terminal_at_ms"
+        case sinceMs = "since_ms"
+        case agentId = "agent_id"
+        case displayName = "display_name"
+    }
+}
+
+public struct BoardLaneAttachment: Codable, Equatable {
+    public var id: String
+    public var kind: String
+    public var status: String
+    public var terminal: Bool?
+    public var updatedAtMs: Int64?
+
+    enum CodingKeys: String, CodingKey {
+        case id, kind, status, terminal
+        case updatedAtMs = "updated_at_ms"
     }
 }
 

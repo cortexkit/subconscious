@@ -150,6 +150,91 @@ final class BoardModelsTests: XCTestCase {
         XCTAssertEqual(encoded.unreadableLaneCount, 0)
     }
 
+    /// Board V3 thread lanes ride `laneBlocks`, a new key beside the V1
+    /// `lanes` name list, decoded from the producer's v3.0 fixture: three
+    /// well-formed lanes plus one deliberately malformed one that must land as
+    /// `.opaque` with its id and be counted, never fail the snapshot.
+    func testLaneBlocksDecodeTypedWithOpaqueFallbackFromProducerFixture() throws {
+        let fixture = try loadV3FixtureObject()
+        let snapshot: [String: Any] = [
+            "roomId": "rm_x", "sessionId": "ses_x", "vocabulary": "v2", "servedSeq": 1,
+            "lanes": ["status"], "blocks": [],
+            "laneBlocks": fixture["laneBlocks"] as Any,
+        ]
+        let data = try JSONSerialization.data(withJSONObject: snapshot)
+        let state = try JSONDecoder().decode(BoardState.self, from: data)
+        let entries = try XCTUnwrap(state.laneBlocks)
+        XCTAssertEqual(entries.count, 4)
+        XCTAssertEqual(state.degradedLaneBlockCount, 1, "exactly the malformed lane degrades")
+        XCTAssertEqual(entries[3], .opaque(id: "ln_bad00000"), "the malformed lane keeps its id")
+
+        guard case .lane(let release) = entries[0] else { return XCTFail("first lane is typed") }
+        XCTAssertEqual(release.id, "ln_11111111")
+        XCTAssertEqual(release.title, "release")
+        XCTAssertEqual(release.updatedAtMs, 1_700_000_400_000)
+        XCTAssertEqual(release.items.map(\.state), ["pending", "active", "done", "blocked", "blocked"])
+        XCTAssertEqual(release.attached?.first?.kind, "work")
+        XCTAssertEqual(release.attached?.first?.terminal, true)
+
+        // The rotten wait is the module's verdict, decoded not derived.
+        let rotten = try XCTUnwrap(release.items[3].wait)
+        XCTAssertEqual(rotten.on, "user")
+        XCTAssertEqual(rotten.ref, "ask:ask_0123abcd")
+        XCTAssertEqual(rotten.refState, "terminal")
+        XCTAssertEqual(rotten.refTerminalAtMs, 1_699_990_000_000)
+        XCTAssertEqual(rotten.rotten, true)
+        XCTAssertEqual(rotten.sinceMs, 1_700_000_000_000)
+        let pending = try XCTUnwrap(release.items[4].wait)
+        XCTAssertNil(pending.rotten, "absent rotten stays absent, never coerced to false")
+
+        // Peer and message enrichment fields decode where the producer sends them.
+        guard case .lane(let delegations) = entries[1] else { return XCTFail("second lane is typed") }
+        XCTAssertEqual(delegations.items[2].wait?.agentId != nil, true)
+        XCTAssertEqual(delegations.items[2].wait?.displayName != nil, true)
+        guard case .lane(let edges) = entries[2] else { return XCTFail("third lane is typed") }
+        XCTAssertNil(edges.attached, "attached is optional")
+        XCTAssertNotNil(edges.items[0].wait?.excerpt)
+        XCTAssertNotNil(edges.items[0].wait?.sender)
+
+        // Round trip keeps the typed lanes and the opaque id.
+        let again = try JSONDecoder().decode(BoardState.self, from: JSONEncoder().encode(state))
+        XCTAssertEqual(again.laneBlocks, state.laneBlocks)
+    }
+
+    /// A producer older than the V3 cut sends no `laneBlocks`; that is `nil`,
+    /// distinct from an empty array.
+    func testLaneBlocksAbsentDecodesAsNil() throws {
+        let state = try loadFixtureBoardState()
+        XCTAssertNil(state.laneBlocks)
+        XCTAssertEqual(state.degradedLaneBlockCount, 0)
+    }
+
+    func testVendoredV3FixtureMatchesTheProducerDigest() throws {
+        guard let url = Bundle.module.url(forResource: "board-wire-v3", withExtension: "json") else {
+            throw FixtureError.missingResource
+        }
+        let digest = SHA256.hash(data: try Data(contentsOf: url))
+            .map { String(format: "%02x", $0) }
+            .joined()
+        XCTAssertEqual(
+            digest,
+            // board-wire-v3.json as re-minted under the laneBlocks key after
+            // the lanes-key collision; digest from the producer's notice.
+            "d991bf85014564931820b000f107c229647bd77d6656a95badc172c89fd9628f",
+            "Re-sync the v3 fixture from prefrontal rather than updating this digest."
+        )
+    }
+
+    private func loadV3FixtureObject() throws -> [String: Any] {
+        guard let url = Bundle.module.url(forResource: "board-wire-v3", withExtension: "json") else {
+            throw FixtureError.missingResource
+        }
+        guard let object = try JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any] else {
+            throw FixtureError.invalidShape
+        }
+        return object
+    }
+
     func testBoardStateDecodesWithLaneOrderAndHealthCounters() throws {
         let state = try loadFixtureBoardState()
         XCTAssertEqual(state.roomId, "rm_board_ses_example")

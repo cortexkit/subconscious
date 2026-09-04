@@ -312,7 +312,7 @@ fn write_domain_probe_cache(path: &Path, cache: &DomainProbeCache) -> Result<(),
 }
 
 const MODULE_HELP: &str = "ck module — inspect and control supervised modules\n\nusage: ck [--json] module <verb> [<args>]\n\nverbs:\n  ck module list            all modules with state and health\n  ck module status <id>     one module in detail
-  ck module stderr <id>     retained stderr for a module (-n <count> to limit)\n  ck module terminals <id>  retained terminal exits for a module\n  ck module restart <id>    drain-restart a module\n    --now                   restart without waiting for in-flight requests\n    --drain-ms <n>          wait up to <n> ms for in-flight requests (this restart only)\n  ck module stop <id>       disable and stop a module (persists until start)\n  ck module start <id>      enable and spawn a module\n  ck module rescan          re-read subc.jsonc and reconcile the module set\n  ck module rescan --dry-run  show what a rescan would change, without changing it\n  ck module release <id>    retire a removed module's retained reserved-id gate";
+  ck module stderr <id>     retained stderr for a module (-n <count> to limit)\n  ck module terminals <id>  retained terminal exits for a module\n  ck module restart <id>    drain-restart a module\n    --now                   restart without waiting for in-flight requests\n    --drain-ms <n>          wait up to <n> ms for in-flight requests (this restart only)\n  ck module stop <id>       disable and stop a module (persists until start)\n  ck module start <id>      enable and spawn a module\n  ck module rescan          re-read subc.jsonc and reconcile the module set\n  ck module rescan --dry-run  show what a rescan would change, without changing it\n  ck module release <id>    forget a removed module's reserved id so another module may use it";
 
 const ROUTES_HELP: &str = "ck routes — inspect live route consumers\n\nusage: ck [--json] routes [<module-id>]\n\n  ck routes          live consumers for every connected module\n  ck routes <id>     live consumers for one connected module";
 
@@ -324,9 +324,9 @@ const HEALTH_HELP: &str = "ck health — module health\n\nusage: ck [--json] hea
 
 const DAEMON_HELP: &str = "ck daemon — daemon version, uptime, connection info, offline triage, and CI lint\n\nusage:\n  ck [--json] daemon\n  ck [--json] daemon triage\n  ck daemon lint [<config>] [--verbose]\n\n  triage reads only the local run directory; it never contacts the daemon.\n  lint reads module manifests without connecting to the daemon.";
 
-const SETUP_HELP: &str = "ck setup — plan managed CortexKit installation\n\nusage:\n  ck setup [aft|mc|insula|claustrum|synapse] [--with aft,mc,insula,claustrum,synapse] [--dry-run]\n  ck setup claustrum [--key-path <file>]\n  ck setup <aft|mc> --convert [--confirm]\n  ck setup --uninstall [--dry-run]\n\n  Bare setup installs core and offers optional components. --dry-run prints the\n  complete plan without calling an installation mutator. --convert is explicit\n  and requires --confirm before it can apply a conversion plan. --verbose includes\n  download diagnostics when a network request fails.";
+const SETUP_HELP: &str = "ck setup — plan managed CortexKit installation\n\nusage:\n  ck setup [aft|mc|insula|claustrum|synapse] [--with aft,mc,insula,claustrum,synapse] [--dry-run] [--verbose]\n  ck setup claustrum [--key-path <file>]\n  ck setup <aft|mc> --convert [--confirm]\n  ck setup --uninstall [--dry-run]\n\n  Bare setup installs core and offers optional components. --dry-run prints the\n  complete plan without changing anything. --convert is explicit and requires\n  --confirm before it can apply a conversion plan. --verbose includes plan outcomes\n  and download diagnostics when a network request fails.";
 
-const UPGRADE_HELP: &str = "ck upgrade — plan managed component upgrades\n\nusage:\n  ck upgrade\n  ck upgrade --check\n\n  --check prints target availability and ordered operations without replacing\n  binaries or restarting a runtime. MC is wiring-only in alpha and is not an\n  upgrade target.";
+const UPGRADE_HELP: &str = "ck upgrade — plan managed component upgrades\n\nusage:\n  ck upgrade [--verbose]\n  ck upgrade --check [--verbose]\n\n  --check reports available updates without changing anything. --verbose includes\n  plan outcomes and execution evidence.";
 
 #[tokio::main]
 async fn main() {
@@ -338,9 +338,11 @@ async fn main() {
                 process::exit(error.exit_code());
             }
         },
-        Err(CkError::FleetLintExit { exit_code } | CkError::TriageExit { exit_code }) => {
-            process::exit(exit_code)
-        }
+        Err(
+            CkError::FleetLintExit { exit_code }
+            | CkError::TriageExit { exit_code }
+            | CkError::RenderedExit { exit_code },
+        ) => process::exit(exit_code),
         Err(err) => {
             eprintln!("{err}");
             process::exit(err.exit_code());
@@ -387,8 +389,14 @@ async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), CkError> {
     if let Command::Setup(request) = &args.command {
         return setup_command(&running_executable()?, request);
     }
-    if let Command::Upgrade { check } = &args.command {
-        return upgrade_command(&running_executable()?, args.subc.as_deref(), *check).await;
+    if let Command::Upgrade { check, verbose } = &args.command {
+        return upgrade_command(
+            &running_executable()?,
+            args.subc.as_deref(),
+            *check,
+            *verbose,
+        )
+        .await;
     }
     if matches!(&args.command, Command::DaemonTriage) {
         return daemon_triage(args.subc.as_deref(), args.json);
@@ -883,6 +891,7 @@ enum Command {
     Setup(setup::SetupRequest),
     Upgrade {
         check: bool,
+        verbose: bool,
     },
     Module(ModuleCommand),
     Routes {
@@ -4320,27 +4329,149 @@ fn setup_command(program: &Path, request: &setup::SetupRequest) -> Result<(), Ck
         setup::SetupBackend::current(program.to_path_buf()).map_err(CkError::Message)?;
     let observed = backend.observe(request).map_err(CkError::Message)?;
     let plan = setup::plan_setup(&observed, request);
-    print_setup_plan(&plan);
-    backend
-        .print_proposed_diffs(&plan, request)
-        .map_err(CkError::Message)?;
-    if !plan.is_authorized() {
-        return Err(CkError::Rejected(
-            "setup plan refused; no mutations were applied".to_string(),
-        ));
+
+    if let Some(message) = setup_unavailable_message(&plan, &observed) {
+        println!("{message}");
+        print_verbose_setup_outcomes(&plan, request.verbose);
+        return if plan.is_authorized() {
+            Ok(())
+        } else {
+            Err(CkError::RenderedExit { exit_code: 1 })
+        };
     }
-    if request.dry_run {
-        let planned_mutations = plan.mutation_count();
-        println!("dry-run: {planned_mutations} mutation(s) planned; none were applied");
+    if !plan.is_authorized() {
+        let message = plan
+            .outcomes
+            .iter()
+            .find(|outcome| outcome.blocks_execution())
+            .map(human_blocking_outcome)
+            .unwrap_or_else(|| "setup could not continue; nothing was installed".to_string());
+        println!("{message}");
+        print_verbose_setup_outcomes(&plan, request.verbose);
+        return Err(CkError::RenderedExit { exit_code: 1 });
+    }
+    if plan.mutation_count() == 0 {
+        for line in setup_no_change_summary(&observed, request) {
+            println!("{line}");
+        }
+        print_verbose_setup_outcomes(&plan, request.verbose);
         return Ok(());
     }
-    backend.apply_plan(&plan, request).map_err(CkError::Message)
+    if request.dry_run {
+        backend.print_dry_run(&plan).map_err(CkError::Message)?;
+        backend
+            .print_proposed_diffs(&plan, request)
+            .map_err(CkError::Message)?;
+        print_verbose_setup_outcomes(&plan, request.verbose);
+        return Ok(());
+    }
+    backend
+        .apply_plan(&plan, request)
+        .map_err(CkError::Message)?;
+    print_verbose_outcomes(&plan.outcomes, request.verbose);
+    Ok(())
+}
+
+fn setup_no_change_summary(
+    observed: &setup::SetupObserved,
+    request: &setup::SetupRequest,
+) -> Vec<String> {
+    if request.uninstall {
+        return vec!["Nothing to uninstall; no managed setup files are present.".to_string()];
+    }
+
+    let mut installed = setup::Component::ALL
+        .into_iter()
+        .filter(|component| *component != setup::Component::Core)
+        .filter(|component| observed.component_state(*component) == setup::ComponentState::Correct)
+        .map(|component| component.module_id().unwrap_or(component.label()))
+        .collect::<Vec<_>>();
+    installed.sort_unstable();
+    let mut lines = vec![if installed.is_empty() {
+        "CortexKit is set up: daemon running.".to_string()
+    } else {
+        format!(
+            "CortexKit is set up: daemon running, {} ok.",
+            installed.join(" · ")
+        )
+    }];
+
+    let mut missing = setup::Component::ALL
+        .into_iter()
+        .filter(|component| *component != setup::Component::Core)
+        .filter(|component| observed.component_state(*component) != setup::ComponentState::Correct)
+        .map(setup::Component::label)
+        .collect::<Vec<_>>();
+    missing.sort_unstable();
+    if !missing.is_empty() {
+        let commands = missing
+            .iter()
+            .map(|component| format!("`ck setup {component}`"))
+            .collect::<Vec<_>>()
+            .join(" or ");
+        lines.push(format!(
+            "Optional modules not installed: {} — run {commands}.",
+            missing.join(", ")
+        ));
+    }
+    lines
+}
+
+fn setup_unavailable_message(
+    plan: &setup::SetupPlan,
+    observed: &setup::SetupObserved,
+) -> Option<String> {
+    plan.outcomes.iter().find_map(|outcome| match outcome {
+        setup::PlanOutcome::ReleaseIncomplete { component, .. } => {
+            let target = match &observed.platform {
+                setup::PlatformObservation::Supported(target) => target.to_string(),
+                setup::PlatformObservation::Unsupported(target) => target.to_string(),
+            };
+            Some(format!(
+                "{} has no {target} release yet; nothing was installed.",
+                component.label()
+            ))
+        }
+        setup::PlanOutcome::DeclaredUnavailable { component, .. } => Some(format!(
+            "{} is not available on this platform yet; nothing was installed.",
+            component.module_id().unwrap_or(component.label())
+        )),
+        _ => None,
+    })
+}
+
+fn human_blocking_outcome(outcome: &setup::PlanOutcome) -> String {
+    match outcome {
+        setup::PlanOutcome::Refusal { reason } => reason.clone(),
+        _ => outcome.to_string(),
+    }
+}
+
+fn print_verbose_setup_outcomes(plan: &setup::SetupPlan, verbose: bool) {
+    if verbose {
+        for line in plan
+            .render()
+            .lines()
+            .filter(|line| line.trim_start().starts_with("outcome:"))
+        {
+            println!("{line}");
+        }
+    }
+}
+
+fn print_verbose_outcomes(outcomes: &[setup::PlanOutcome], verbose: bool) {
+    if verbose {
+        for outcome in outcomes {
+            println!("  outcome: {outcome}");
+        }
+    }
 }
 
 async fn upgrade_command(
     executable: &Path,
     subc: Option<&Path>,
     check: bool,
+    verbose: bool,
 ) -> Result<(), CkError> {
     // The daemon connection file is the daemon catalog build evidence. It is
     // optional while no inventory-owned daemon exists; discovery turns its
@@ -4370,12 +4501,16 @@ async fn upgrade_command(
     };
     let observed = setup::observed_upgrade_targets(&metadata, &discovered);
     let plan = setup::plan_upgrade(&observed);
-    print_upgrade_plan(&plan);
     if !plan.is_authorized() {
-        return Err(CkError::Rejected(
-            "upgrade plan refused; no binaries were replaced and no runtime was restarted"
-                .to_string(),
-        ));
+        let message = plan
+            .outcomes
+            .iter()
+            .find(|outcome| outcome.blocks_execution())
+            .map(human_blocking_outcome)
+            .unwrap_or_else(|| "upgrade could not continue; nothing was changed".to_string());
+        println!("{message}");
+        print_verbose_outcomes(&plan.outcomes, verbose);
+        return Err(CkError::RenderedExit { exit_code: 1 });
     }
     let planned_mutations = plan
         .operations
@@ -4383,13 +4518,44 @@ async fn upgrade_command(
         .filter(|operation| operation.mutates())
         .count();
     if check {
-        println!(
-            "upgrade check: {planned_mutations} mutation(s) planned; no binaries were replaced and no runtime was restarted"
-        );
+        let updates = plan
+            .outcomes
+            .iter()
+            .filter_map(|outcome| match outcome {
+                setup::PlanOutcome::UpgradeAvailable {
+                    target, from, to, ..
+                } => Some(format!("{target} {from} → {to}. Run ck upgrade.")),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if updates.is_empty() {
+            println!("{}", upgrade_current_summary(&discovered));
+        } else {
+            for update in updates {
+                println!("{update}");
+            }
+        }
+        print_verbose_outcomes(&plan.outcomes, verbose);
         return Ok(());
     }
     if planned_mutations == 0 {
-        println!("upgrade: no action was needed");
+        println!("{}", upgrade_current_summary(&discovered));
+        print_verbose_outcomes(&plan.outcomes, verbose);
+        return Ok(());
+    }
+
+    #[cfg(feature = "test-support")]
+    if env::var_os("CK_TEST_UPGRADE_APPLY_OK").is_some() {
+        for outcome in &plan.outcomes {
+            if let setup::PlanOutcome::UpgradeAvailable {
+                target, from, to, ..
+            } = outcome
+            {
+                println!("{}", setup::upgraded_line(*target, from, to));
+            }
+        }
+        println!("Done.");
+        print_verbose_outcomes(&plan.outcomes, verbose);
         return Ok(());
     }
 
@@ -4410,7 +4576,11 @@ async fn upgrade_command(
     }
     match setup::execute_upgrade(&plan, &mut backend) {
         Ok(report) => {
-            setup::render_execution_report(&report);
+            println!("Done.");
+            print_verbose_outcomes(&plan.outcomes, verbose);
+            if verbose {
+                setup::render_execution_report(&report);
+            }
             Ok(())
         }
         Err(failure) => {
@@ -4420,17 +4590,27 @@ async fn upgrade_command(
     }
 }
 
-fn print_setup_plan(plan: &setup::SetupPlan) {
-    print!("{}", plan.render());
-}
-
-fn print_upgrade_plan(plan: &setup::UpgradePlan) {
-    println!("upgrade plan:");
-    for (index, operation) in plan.operations.iter().enumerate() {
-        println!("  {}. {operation}", index + 1);
+fn upgrade_current_summary(discovered: &[setup::ManagedUpgradeTarget]) -> String {
+    let mut components = Vec::new();
+    for target in [
+        setup::UpgradeTarget::Ck,
+        setup::UpgradeTarget::Daemon,
+        setup::UpgradeTarget::SubcMcp,
+        setup::UpgradeTarget::Aft,
+    ] {
+        let Some(item) = discovered.iter().find(|item| item.target == target) else {
+            continue;
+        };
+        if target == setup::UpgradeTarget::SubcMcp {
+            components.push(target.to_string());
+        } else {
+            components.push(format!("{target} {}", item.installed_version));
+        }
     }
-    for outcome in &plan.outcomes {
-        println!("  outcome: {outcome}");
+    if components.is_empty() {
+        "Everything is up to date.".to_string()
+    } else {
+        format!("Everything is up to date ({}).", components.join(" · "))
     }
 }
 
@@ -4585,13 +4765,20 @@ fn parse_setup_component(value: &str) -> Result<setup::Component, CkError> {
 }
 
 fn parse_upgrade_command(tail: &[OsString]) -> Result<Command, CkError> {
-    match tail {
-        [] => Ok(Command::Upgrade { check: false }),
-        [flag] if flag == "--check" => Ok(Command::Upgrade { check: true }),
-        _ => Err(CkError::Usage(format!(
-            "ck upgrade accepts only --check\n\n{UPGRADE_HELP}"
-        ))),
+    let mut check = false;
+    let mut verbose = false;
+    for argument in tail {
+        match argument.to_string_lossy().as_ref() {
+            "--check" if !check => check = true,
+            "--verbose" if !verbose => verbose = true,
+            value => {
+                return Err(CkError::Usage(format!(
+                    "unknown or repeated upgrade flag '{value}'\n\n{UPGRADE_HELP}"
+                )))
+            }
+        }
     }
+    Ok(Command::Upgrade { check, verbose })
 }
 
 fn parse_args(argv: impl IntoIterator<Item = OsString>) -> Result<CkArgs, CkError> {
@@ -5077,6 +5264,10 @@ enum CkError {
     TriageExit {
         exit_code: i32,
     },
+    /// The command already printed its complete human-facing refusal.
+    RenderedExit {
+        exit_code: i32,
+    },
     Json(serde_json::Error),
 }
 
@@ -5088,7 +5279,9 @@ impl CkError {
             Self::Rejected(_) | Self::Message(_) | Self::Json(_) | Self::UpdateCheck(_) => 1,
             Self::ModuleNotCommand(_) => 64,
             Self::FleetLintConfig(_) => 2,
-            Self::FleetLintExit { exit_code } | Self::TriageExit { exit_code } => *exit_code,
+            Self::FleetLintExit { exit_code }
+            | Self::TriageExit { exit_code }
+            | Self::RenderedExit { exit_code } => *exit_code,
             Self::WithFooter { error, .. } => error.exit_code(),
         }
     }
@@ -5121,7 +5314,9 @@ impl fmt::Display for CkError {
             Self::Message(message) => write!(f, "{message}"),
             Self::FleetLintConfig(message) => write!(f, "ck daemon lint: {message}"),
             Self::UpdateCheck(error) => error.fmt(f),
-            Self::FleetLintExit { .. } | Self::TriageExit { .. } => Ok(()),
+            Self::FleetLintExit { .. } | Self::TriageExit { .. } | Self::RenderedExit { .. } => {
+                Ok(())
+            }
             Self::Json(source) => write!(f, "json: {source}"),
             Self::WithFooter { error, footer } => {
                 write!(f, "{error}\n\nhelp[1]:\n  {footer}")
@@ -6174,39 +6369,32 @@ mod tests {
         ));
         assert!(matches!(
             parse_command("upgrade", &[]).unwrap(),
-            Command::Upgrade { check: false }
+            Command::Upgrade {
+                check: false,
+                verbose: false
+            }
         ));
         assert!(matches!(
             parse_command("upgrade", &test_tail(&["--check"])).unwrap(),
-            Command::Upgrade { check: true }
+            Command::Upgrade {
+                check: true,
+                verbose: false
+            }
         ));
+        assert!(matches!(
+            parse_command("upgrade", &test_tail(&["--verbose", "--check"])).unwrap(),
+            Command::Upgrade {
+                check: true,
+                verbose: true
+            }
+        ));
+        assert!(SETUP_HELP.contains("without changing anything"));
+        assert!(!SETUP_HELP.contains("installation mutator"));
+        assert!(!UPGRADE_HELP.contains("MC is wiring-only in alpha"));
+        assert!(MODULE_HELP
+            .contains("forget a removed module's reserved id so another module may use it"));
         assert!(top_help().contains("setup"));
         assert!(top_help().contains("upgrade"));
-    }
-
-    #[test]
-    fn setup_dry_run_rendering_carries_the_restart_section_name() {
-        let plan = setup::SetupPlan {
-            operations: vec![setup::SetupOperation::RestartRuntime {
-                sections: vec!["storage".to_string()],
-            }],
-            outcomes: vec![setup::PlanOutcome::CoreRestartRequired {
-                sections: vec!["storage".to_string()],
-            }],
-        };
-        let rendered = plan.render();
-        assert!(
-            rendered.contains(
-                "restart daemon: config sections changed that rescan cannot apply: storage"
-            ),
-            "{rendered}"
-        );
-        assert!(
-            rendered.contains(
-                "outcome: core: configuration change requires a daemon restart (storage)"
-            ),
-            "{rendered}"
-        );
     }
 
     fn triage_fixture_dir(name: &str) -> TestTempDir {

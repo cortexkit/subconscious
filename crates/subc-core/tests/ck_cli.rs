@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fs,
     ops::Deref,
     path::{Path, PathBuf},
@@ -7,13 +8,19 @@ use std::{
     time::Duration,
 };
 
-use serde_json::Value;
+use base64::Engine;
+use ed25519_dalek::{Signer, SigningKey};
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use subc_control::{ClientControlRequest, ClientControlResponse, SupervisorEntry};
 use subc_core::{
     read_frame, test_support::TestTempDir as TempDir, write_frame, Frame, ModuleSpec,
     RestartPolicy, SupervisedModule, Supervisor, SupervisorHandle, SupervisorProcessLiveness,
 };
-use subc_protocol::{Flags, FrameType, Priority};
+use subc_protocol::{Flags, FrameType, Priority, PROTOCOL_VERSION};
+use subc_transport::{
+    generate_daemon_id, generate_key, write_atomic, ConnectionInfo, Endpoint, SCHEMA_VERSION,
+};
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt},
     time::{sleep, timeout, Instant},
@@ -57,28 +64,6 @@ impl Deref for TestServer {
     fn deref(&self) -> &Self::Target {
         &self.daemon
     }
-}
-
-#[test]
-fn setup_dry_run_rendering_carries_the_restart_section_name() {
-    // `ck setup` prints `plan.render()`: numbered operations then `outcome:`
-    // lines. These are the Display forms of RestartRuntime and
-    // CoreRestartRequired; the binary unit test of this name and
-    // dry_run_plan_rendering_carries_the_restart_section_name execute that
-    // renderer. Pin the section name in both lines an operator reads before
-    // consenting.
-    let operation = "restart daemon: config sections changed that rescan cannot apply: storage";
-    let outcome = "core: configuration change requires a daemon restart (storage)";
-    let rendered = format!("setup plan:\n  1. {operation}\n  outcome: {outcome}\n");
-    assert!(
-        rendered.contains("storage"),
-        "dry-run restart text must carry the section name:\n{rendered}"
-    );
-    assert!(
-        rendered
-            .contains("outcome: core: configuration change requires a daemon restart (storage)"),
-        "dry-run outcome must carry the section name:\n{rendered}"
-    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -290,6 +275,799 @@ fn setup_dry_run_refuses_a_test_key_signature_against_the_embedded_key() {
         combined.contains("generation 1"),
         "stdout+stderr:\n{combined}"
     );
+}
+
+struct SetupFixture {
+    _root: TempDir,
+    home: PathBuf,
+    data_home: PathBuf,
+    config_home: PathBuf,
+    tools: PathBuf,
+}
+
+impl SetupFixture {
+    fn installed(name: &str) -> Self {
+        Self::new(name, true)
+    }
+
+    fn fresh(name: &str) -> Self {
+        Self::new(name, false)
+    }
+
+    fn new(name: &str, installed: bool) -> Self {
+        let root = TempDir::new(name);
+        let home = root.path().join("home");
+        let data_home = home.join(".local").join("share");
+        let config_home = home.join(".config");
+        let cortexkit = data_home.join("cortexkit");
+        let bin = cortexkit.join("bin");
+        let config = config_home.join("cortexkit").join("subc.jsonc");
+        let tools = root.path().join("tools");
+        fs::create_dir_all(&bin).unwrap();
+        fs::create_dir_all(&tools).unwrap();
+        write_executable(
+            &tools.join(service_manager_program()),
+            service_manager_script(),
+        );
+
+        if installed {
+            let binaries = [
+                ("core", "ck-subc"),
+                ("core", "ck-subc-mcp"),
+                ("aft", "ck-aft"),
+                ("claustrum", "ck-claustrum"),
+                ("claustrum", "ck-auth"),
+                ("insula", "ck-insula"),
+            ];
+            let mut mutations = binaries
+                .iter()
+                .map(|(component, binary)| {
+                    let path = bin.join(platform_binary(binary));
+                    fs::write(&path, binary).unwrap();
+                    json!({
+                        "kind": "managed-binary",
+                        "path": path,
+                        "component": component,
+                    })
+                })
+                .collect::<Vec<_>>();
+            mutations.push(json!({
+                "kind": "runtime-definition",
+                "path": runtime_definition(&home),
+            }));
+            fs::create_dir_all(config.parent().unwrap()).unwrap();
+            fs::write(
+                &config,
+                serde_json::to_string_pretty(&json!({
+                    "version": 1,
+                    "storage": {"backend": "sqlite"},
+                    "modules": {
+                        "aft": {"program": bin.join(platform_binary("ck-aft"))},
+                        "claustrum": {
+                            "program": bin.join(platform_binary("ck-claustrum")),
+                            "reserved": true,
+                        },
+                        "insula": {"program": bin.join(platform_binary("ck-insula"))},
+                    },
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            fs::create_dir_all(&cortexkit).unwrap();
+            fs::write(
+                cortexkit.join("installer-manifest.json"),
+                serde_json::to_vec_pretty(&json!({
+                    "schema_version": 1,
+                    "platform": host_target(),
+                    "mutations": mutations,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        }
+
+        Self {
+            _root: root,
+            home,
+            data_home,
+            config_home,
+            tools,
+        }
+    }
+
+    fn command(&self, index: &SignedIndex, args: &[&str]) -> Command {
+        let mut command = ck_command();
+        let path = std::env::join_paths(std::iter::once(self.tools.clone()).chain(
+            std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+        ))
+        .unwrap();
+        command
+            .args(args)
+            .env("HOME", &self.home)
+            .env("USERPROFILE", &self.home)
+            .env("LOCALAPPDATA", &self.data_home)
+            .env("XDG_DATA_HOME", &self.data_home)
+            .env("XDG_CONFIG_HOME", &self.config_home)
+            .env("PATH", path)
+            .env("CK_RELEASE_INDEX_URL", &index.url)
+            .env("CK_TEST_RELEASE_INDEX_PUBKEY", &index.public_key)
+            .env("CK_TEST_SETUP_CONTROL_OK", "1")
+            .env("CK_TEST_SETUP_MODULES", "aft,claustrum,insula");
+        command
+    }
+}
+
+struct SignedIndex {
+    url: String,
+    public_key: String,
+}
+
+fn serve_signed_index(
+    build: impl FnOnce(&str) -> (Value, BTreeMap<String, Vec<u8>>),
+) -> SignedIndex {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let (document, assets) = build(&base);
+    let body = serde_json::to_vec(&document).unwrap();
+    let signing = SigningKey::from_bytes(&[0x42; 32]);
+    let signature =
+        base64::engine::general_purpose::STANDARD.encode(signing.sign(&body).to_bytes());
+    let public_key = base64::engine::general_purpose::STANDARD.encode(signing.verifying_key());
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else {
+                continue;
+            };
+            let mut request = [0_u8; 4096];
+            let read = std::io::Read::read(&mut stream, &mut request).unwrap_or(0);
+            let request = String::from_utf8_lossy(&request[..read]);
+            let path = request
+                .lines()
+                .next()
+                .and_then(|line| line.split_whitespace().nth(1))
+                .unwrap_or("/");
+            let (response, signature_header) = if path == "/index.json" {
+                (&body, Some(signature.as_str()))
+            } else if let Some(asset) = assets.get(path) {
+                (asset, None)
+            } else {
+                let response = b"not found".to_vec();
+                let header = format!(
+                    "HTTP/1.1 404 Not Found\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    response.len()
+                );
+                let _ = std::io::Write::write_all(&mut stream, header.as_bytes());
+                let _ = std::io::Write::write_all(&mut stream, &response);
+                continue;
+            };
+            let mut header = format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n",
+                response.len()
+            );
+            if let Some(signature) = signature_header {
+                header.push_str(&format!("X-CortexKit-Signature-Ed25519: {signature}\r\n"));
+            }
+            header.push_str("\r\n");
+            let _ = std::io::Write::write_all(&mut stream, header.as_bytes());
+            let _ = std::io::Write::write_all(&mut stream, response);
+        }
+    });
+    SignedIndex {
+        url: format!("{base}/index.json"),
+        public_key,
+    }
+}
+
+fn setup_index(base: &str, mc_archive: Option<&[u8]>) -> (Value, BTreeMap<String, Vec<u8>>) {
+    let target = host_target();
+    let dummy = fixture_asset(format!("{base}/unused.zip"), "00".repeat(32), 1, None);
+    let mut components = serde_json::Map::new();
+    components.insert(
+        "core".to_string(),
+        index_component(
+            "subc-core-v0.17.9",
+            Some("0.17.9"),
+            &target,
+            [("ck-subc", dummy.clone()), ("ck-subc-mcp", dummy.clone())],
+        ),
+    );
+    components.insert(
+        "synapse".to_string(),
+        json!({"release": "v0.1.0", "version": "0.1.0", "assets": {}}),
+    );
+    let mut assets = BTreeMap::new();
+    if let Some(archive) = mc_archive {
+        let path = "/ck-mc.zip";
+        components.insert(
+            "mc".to_string(),
+            index_component(
+                "ck-mc-alpha.22464bf2",
+                None,
+                &target,
+                [(
+                    "ck-mc",
+                    fixture_asset(
+                        format!("{base}{path}"),
+                        sha256_hex(archive),
+                        archive.len() as u64,
+                        Some("ck-mc-alpha.22464bf2"),
+                    ),
+                )],
+            ),
+        );
+        assets.insert(path.to_string(), archive.to_vec());
+    }
+    (
+        json!({
+            "schema": 1,
+            "channel": "alpha",
+            "generated_at_ms": now_ms(),
+            "components": components,
+        }),
+        assets,
+    )
+}
+
+fn index_component<const N: usize>(
+    release: &str,
+    version: Option<&str>,
+    target: &str,
+    assets: [(&str, Value); N],
+) -> Value {
+    let binaries = assets
+        .into_iter()
+        .map(|(name, asset)| (name.to_string(), asset))
+        .collect::<serde_json::Map<_, _>>();
+    let mut targets = serde_json::Map::new();
+    targets.insert(target.to_string(), Value::Object(binaries));
+    json!({
+        "release": release,
+        "version": version,
+        "assets": targets,
+    })
+}
+
+fn fixture_asset(url: String, sha256: String, bytes: u64, reports: Option<&str>) -> Value {
+    json!({"url": url, "sha256": sha256, "bytes": bytes, "reports": reports})
+}
+
+fn fixture_archive(_root: &Path, binary: &str, version_line: &str, filler_bytes: u64) -> Vec<u8> {
+    let script = format!("#!/bin/sh\necho '{version_line}'\n").into_bytes();
+    let filler = vec![0; filler_bytes.try_into().unwrap()];
+    let archived_binary = platform_binary(binary);
+    stored_zip(&[
+        (archived_binary.as_str(), script.as_slice()),
+        ("fixture-padding", filler.as_slice()),
+    ])
+}
+
+fn stored_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut archive = Vec::new();
+    let mut central = Vec::new();
+    for (name, bytes) in entries {
+        let offset = u32::try_from(archive.len()).unwrap();
+        let size = u32::try_from(bytes.len()).unwrap();
+        let crc = crc32(bytes);
+        push_u32(&mut archive, 0x0403_4b50);
+        push_u16(&mut archive, 20);
+        push_u16(&mut archive, 0);
+        push_u16(&mut archive, 0);
+        push_u16(&mut archive, 0);
+        push_u16(&mut archive, 0);
+        push_u32(&mut archive, crc);
+        push_u32(&mut archive, size);
+        push_u32(&mut archive, size);
+        push_u16(&mut archive, u16::try_from(name.len()).unwrap());
+        push_u16(&mut archive, 0);
+        archive.extend_from_slice(name.as_bytes());
+        archive.extend_from_slice(bytes);
+
+        push_u32(&mut central, 0x0201_4b50);
+        push_u16(&mut central, 20);
+        push_u16(&mut central, 20);
+        push_u16(&mut central, 0);
+        push_u16(&mut central, 0);
+        push_u16(&mut central, 0);
+        push_u16(&mut central, 0);
+        push_u32(&mut central, crc);
+        push_u32(&mut central, size);
+        push_u32(&mut central, size);
+        push_u16(&mut central, u16::try_from(name.len()).unwrap());
+        push_u16(&mut central, 0);
+        push_u16(&mut central, 0);
+        push_u16(&mut central, 0);
+        push_u16(&mut central, 0);
+        push_u32(&mut central, 0);
+        push_u32(&mut central, offset);
+        central.extend_from_slice(name.as_bytes());
+    }
+    let central_offset = u32::try_from(archive.len()).unwrap();
+    let central_size = u32::try_from(central.len()).unwrap();
+    archive.extend_from_slice(&central);
+    push_u32(&mut archive, 0x0605_4b50);
+    push_u16(&mut archive, 0);
+    push_u16(&mut archive, 0);
+    push_u16(&mut archive, u16::try_from(entries.len()).unwrap());
+    push_u16(&mut archive, u16::try_from(entries.len()).unwrap());
+    push_u32(&mut archive, central_size);
+    push_u32(&mut archive, central_offset);
+    push_u16(&mut archive, 0);
+    archive
+}
+
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = u32::MAX;
+    for byte in bytes {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0xedb8_8320 & 0_u32.wrapping_sub(crc & 1));
+        }
+    }
+    !crc
+}
+
+fn push_u16(output: &mut Vec<u8>, value: u16) {
+    output.extend_from_slice(&value.to_le_bytes());
+}
+
+fn push_u32(output: &mut Vec<u8>, value: u32) {
+    output.extend_from_slice(&value.to_le_bytes());
+}
+
+fn write_executable(path: &Path, contents: &str) {
+    fs::write(path, contents).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+}
+
+fn service_manager_program() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "launchctl"
+    } else if cfg!(windows) {
+        "schtasks.exe"
+    } else {
+        "systemctl"
+    }
+}
+
+fn service_manager_script() -> &'static str {
+    "#!/bin/sh\necho 'state = running'\nexit 0\n"
+}
+
+fn runtime_definition(home: &Path) -> PathBuf {
+    if cfg!(target_os = "macos") {
+        home.join("Library/LaunchAgents/cortexkit.subc.plist")
+    } else if cfg!(windows) {
+        home.join("cortexkit-subc-daemon.xml")
+    } else {
+        home.join(".config/systemd/user/cortexkit-subc.service")
+    }
+}
+
+fn platform_binary(name: &str) -> String {
+    if cfg!(windows) {
+        format!("{name}.exe")
+    } else {
+        name.to_string()
+    }
+}
+
+fn host_target() -> String {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "aarch64") => "darwin-arm64".to_string(),
+        ("linux", "x86_64") => "linux-x64".to_string(),
+        ("linux", "aarch64") => "linux-arm64".to_string(),
+        ("windows", "x86_64") => "windows-x64".to_string(),
+        ("windows", "aarch64") => "windows-arm64".to_string(),
+        (os, arch) => format!("{os}-{arch}"),
+    }
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+#[test]
+fn setup_nothing_to_do_never_renders_outcome_no_op() {
+    let fixture = SetupFixture::installed("ck-setup-current");
+    let index = serve_signed_index(|base| setup_index(base, None));
+    let output = fixture.command(&index, &["setup"]).output().unwrap();
+
+    assert_exit(&output, 0);
+    assert!(output.stderr.is_empty(), "stderr: {}", text(&output.stderr));
+    assert_eq!(
+        text(&output.stdout),
+        "CortexKit is set up: daemon running, aft · claustrum · insula ok.\nOptional modules not installed: mc, synapse — run `ck setup mc` or `ck setup synapse`.\n"
+    );
+}
+
+#[test]
+fn setup_mc_apply_reports_each_completed_change_without_a_plan() {
+    let fixture = SetupFixture::installed("ck-setup-mc-apply");
+    let archive = fixture_archive(
+        fixture._root.path(),
+        "ck-mc",
+        "ck-mc ck-mc-alpha.22464bf2",
+        12 * 1024 * 1024 + 102 * 1024,
+    );
+    let index = serve_signed_index(|base| setup_index(base, Some(&archive)));
+    let output = fixture.command(&index, &["setup", "mc"]).output().unwrap();
+
+    assert_exit(&output, 0);
+    assert!(output.stderr.is_empty(), "stderr: {}", text(&output.stderr));
+    assert_eq!(
+        text(&output.stdout),
+        format!(
+            "Installing magic-context (ck-mc-alpha.22464bf2, {})\n  downloaded and verified ck-mc (12.1 MiB)\n  placed ~/.local/share/cortexkit/bin/{}\n  configured magic-context in ~/.config/cortexkit/subc.jsonc\n  registered with the daemon; magic-context ok\nDone.\n",
+            host_target(),
+            platform_binary("ck-mc")
+        )
+    );
+    let stdout = text(&output.stdout);
+    assert!(!stdout.contains("setup plan:"), "stdout:\n{stdout}");
+    assert!(
+        !stdout.contains("proposed configuration diff:"),
+        "stdout:\n{stdout}"
+    );
+}
+
+#[test]
+fn setup_mc_dry_run_has_future_steps_and_the_config_diff() {
+    let fixture = SetupFixture::installed("ck-setup-mc-dry-run");
+    let archive = fixture_archive(
+        fixture._root.path(),
+        "ck-mc",
+        "ck-mc ck-mc-alpha.22464bf2",
+        12 * 1024 * 1024 + 102 * 1024,
+    );
+    let index = serve_signed_index(|base| setup_index(base, Some(&archive)));
+    let output = fixture
+        .command(&index, &["setup", "mc", "--dry-run"])
+        .output()
+        .unwrap();
+
+    assert_exit(&output, 0);
+    let stdout = text(&output.stdout);
+    for line in [
+        "  1. would download and verify ck-mc (12.1 MiB)".to_string(),
+        format!(
+            "  2. would place ~/.local/share/cortexkit/bin/{}",
+            platform_binary("ck-mc")
+        ),
+        "  3. would configure magic-context in ~/.config/cortexkit/subc.jsonc".to_string(),
+        "  4. would register magic-context with the daemon and check its health".to_string(),
+        "proposed configuration diff:".to_string(),
+        "+    \"magic-context\": {".to_string(),
+    ] {
+        assert!(
+            stdout.contains(&line),
+            "missing {line:?} in stdout:\n{stdout}"
+        );
+    }
+    assert!(
+        !stdout.contains("observe alpha platform support"),
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains("validate with ck daemon triage"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn setup_synapse_without_a_host_asset_is_one_complete_refusal_line() {
+    let fixture = SetupFixture::installed("ck-setup-synapse-unavailable");
+    let index = serve_signed_index(|base| setup_index(base, None));
+    let output = fixture
+        .command(&index, &["setup", "synapse"])
+        .output()
+        .unwrap();
+
+    assert_exit(&output, 1);
+    assert!(output.stderr.is_empty(), "stderr: {}", text(&output.stderr));
+    assert_eq!(
+        text(&output.stdout),
+        format!(
+            "synapse has no {} release yet; nothing was installed.\n",
+            host_target()
+        )
+    );
+}
+
+#[test]
+fn setup_verbose_keeps_every_preexisting_outcome_line() {
+    let fixture = SetupFixture::installed("ck-setup-verbose");
+    let index = serve_signed_index(|base| setup_index(base, None));
+    let output = fixture
+        .command(&index, &["setup", "--verbose"])
+        .output()
+        .unwrap();
+
+    assert_exit(&output, 0);
+    let stdout = text(&output.stdout);
+    for outcome in [
+        "  outcome: no-op: core is already correct",
+        "  outcome: no-op: per-user runtime is already registered and live",
+    ] {
+        assert!(stdout.contains(outcome), "missing {outcome:?}:\n{stdout}");
+    }
+}
+
+#[test]
+fn fresh_setup_prints_the_pasteable_claude_code_command() {
+    let fixture = SetupFixture::fresh("ck-setup-fresh-next");
+    let subc = fixture_archive(fixture._root.path(), "ck-subc", "ck-subc 0.17.10", 0);
+    let mcp = fixture_archive(
+        fixture._root.path(),
+        "ck-subc-mcp",
+        "ck-subc-mcp 0.17.10",
+        0,
+    );
+    let index = serve_signed_index(|base| {
+        let target = host_target();
+        let mut assets = BTreeMap::new();
+        assets.insert("/ck-subc.zip".to_string(), subc.clone());
+        assets.insert("/ck-subc-mcp.zip".to_string(), mcp.clone());
+        (
+            json!({
+                "schema": 1,
+                "channel": "alpha",
+                "generated_at_ms": now_ms(),
+                "components": {
+                    "core": index_component(
+                        "subc-core-v0.17.10",
+                        Some("0.17.10"),
+                        &target,
+                        [
+                            ("ck-subc", fixture_asset(format!("{base}/ck-subc.zip"), sha256_hex(&subc), subc.len() as u64, Some("0.17.10"))),
+                            ("ck-subc-mcp", fixture_asset(format!("{base}/ck-subc-mcp.zip"), sha256_hex(&mcp), mcp.len() as u64, Some("0.17.10"))),
+                        ],
+                    ),
+                },
+            }),
+            assets,
+        )
+    });
+    let output = fixture.command(&index, &["setup"]).output().unwrap();
+
+    assert_exit(&output, 0);
+    let stdout = text(&output.stdout);
+    assert!(
+        stdout.ends_with(
+            "next: connect your agent — Claude Code: claude mcp add ck -- ck-subc-mcp shim --harness claude-code\n      other harnesses: https://github.com/cortexkit/subconscious#readme\n"
+        ),
+        "stdout:\n{stdout}"
+    );
+}
+
+struct UpgradeFixture {
+    _root: TempDir,
+    home: PathBuf,
+    connection_file: PathBuf,
+}
+
+impl UpgradeFixture {
+    fn new(name: &str) -> Self {
+        let root = TempDir::new(name);
+        let home = root.path().join("home");
+        let cortexkit = home.join(".local/share/cortexkit");
+        let bin = cortexkit.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let aft = bin.join(platform_binary("ck-aft"));
+        let daemon = bin.join(platform_binary("ck-subc"));
+        let mcp = bin.join(platform_binary("ck-subc-mcp"));
+        write_executable(&aft, "#!/bin/sh\necho 'ck-aft 0.55.1'\n");
+        write_executable(&daemon, "#!/bin/sh\necho 'ck-subc 0.17.9'\n");
+        write_executable(&mcp, "#!/bin/sh\necho 'ck-subc-mcp 0.17.9'\n");
+        let ck = fs::canonicalize(env!("CARGO_BIN_EXE_ck")).unwrap();
+        let mutations = [
+            (ck, "44".repeat(32)),
+            (daemon, "33".repeat(32)),
+            (mcp, "11".repeat(32)),
+            (aft, "22".repeat(32)),
+        ]
+        .into_iter()
+        .map(|(path, archive_sha256)| {
+            json!({
+                "kind": "managed-binary",
+                "path": path,
+                "archive_sha256": archive_sha256,
+            })
+        })
+        .collect::<Vec<_>>();
+        fs::write(
+            cortexkit.join("installer-manifest.json"),
+            serde_json::to_vec_pretty(&json!({
+                "schema_version": 1,
+                "platform": host_target(),
+                "mutations": mutations,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let connection_file = root.path().join("subc-connection.json");
+        write_atomic(
+            &connection_file,
+            &ConnectionInfo {
+                schema: SCHEMA_VERSION,
+                wire_version: Some(PROTOCOL_VERSION),
+                endpoints: vec![Endpoint {
+                    host: "127.0.0.1".to_string(),
+                    port: 9,
+                }],
+                key: generate_key().unwrap(),
+                daemon_id: generate_daemon_id().unwrap(),
+                pid: std::process::id(),
+                daemon_ver: "0.17.9".to_string(),
+            },
+        )
+        .unwrap();
+        Self {
+            _root: root,
+            home,
+            connection_file,
+        }
+    }
+
+    fn command(&self, index: &SignedIndex, args: &[&str]) -> Command {
+        let mut command = ck_command();
+        command
+            .args(args)
+            .arg("--subc")
+            .arg(&self.connection_file)
+            .env("HOME", &self.home)
+            .env("USERPROFILE", &self.home)
+            .env("LOCALAPPDATA", self.home.join(".local/share"))
+            .env_remove("XDG_DATA_HOME")
+            .env("CK_RELEASE_INDEX_URL", &index.url)
+            .env("CK_TEST_RELEASE_INDEX_PUBKEY", &index.public_key)
+            .env("CK_TEST_CK_VERSION", "0.17.9")
+            .env("CK_TEST_SUBC_MCP_VERSION", "0.17.9")
+            .env("CK_TEST_AFT_VERSION", "0.55.1")
+            .env(
+                "CK_UPDATE_CACHE_PATH",
+                self._root.path().join("update-metadata.json"),
+            );
+        command
+    }
+}
+
+fn upgrade_index(
+    base: &str,
+    aft_version: &str,
+    aft_digest: &str,
+    ck_version: &str,
+    ck_digest: &str,
+) -> (Value, BTreeMap<String, Vec<u8>>) {
+    let target = host_target();
+    (
+        json!({
+            "schema": 1,
+            "channel": "alpha",
+            "generated_at_ms": now_ms(),
+            "components": {
+                "core": index_component(
+                    "subc-core-v0.17.10",
+                    Some(ck_version),
+                    &target,
+                    [
+                        ("ck-subc-mcp", fixture_asset(format!("{base}/mcp.zip"), "11".repeat(32), 1, Some("0.17.9"))),
+                        ("ck-subc", fixture_asset(format!("{base}/daemon.zip"), "33".repeat(32), 1, Some("0.17.9"))),
+                        ("ck", fixture_asset(format!("{base}/ck.zip"), ck_digest.to_string(), 1, Some(ck_version))),
+                    ],
+                ),
+                "aft": index_component(
+                    "v0.55.2",
+                    Some(aft_version),
+                    &target,
+                    [(
+                        "ck-aft",
+                        fixture_asset(format!("{base}/aft.zip"), aft_digest.to_string(), 1, Some(aft_version)),
+                    )],
+                ),
+            },
+        }),
+        BTreeMap::new(),
+    )
+}
+
+#[test]
+fn upgrade_and_check_say_everything_is_current_in_one_line() {
+    let fixture = UpgradeFixture::new("ck-upgrade-current");
+    let index = serve_signed_index(|base| {
+        upgrade_index(base, "0.55.1", &"22".repeat(32), "0.17.9", &"44".repeat(32))
+    });
+    let expected =
+        "Everything is up to date (ck 0.17.9 · ck-subc 0.17.9 · ck-subc-mcp · ck-aft 0.55.1).\n";
+
+    for args in [&["upgrade"][..], &["upgrade", "--check"][..]] {
+        let output = fixture.command(&index, args).output().unwrap();
+        assert_exit(&output, 0);
+        assert!(output.stderr.is_empty(), "stderr: {}", text(&output.stderr));
+        assert_eq!(text(&output.stdout), expected);
+    }
+}
+
+#[test]
+fn upgrade_check_names_the_one_available_update_and_command() {
+    let fixture = UpgradeFixture::new("ck-upgrade-check");
+    let index = serve_signed_index(|base| {
+        upgrade_index(base, "0.55.2", &"aa".repeat(32), "0.17.9", &"44".repeat(32))
+    });
+    let output = fixture
+        .command(&index, &["upgrade", "--check"])
+        .output()
+        .unwrap();
+
+    assert_exit(&output, 0);
+    assert!(output.stderr.is_empty(), "stderr: {}", text(&output.stderr));
+    assert_eq!(
+        text(&output.stdout),
+        "ck-aft 0.55.1 → 0.55.2. Run ck upgrade.\n"
+    );
+}
+
+#[test]
+fn upgrade_apply_reports_completed_targets_then_done() {
+    let fixture = UpgradeFixture::new("ck-upgrade-apply");
+    let index = serve_signed_index(|base| {
+        upgrade_index(
+            base,
+            "0.55.2",
+            &"aa".repeat(32),
+            "0.17.10",
+            &"bb".repeat(32),
+        )
+    });
+    let output = fixture
+        .command(&index, &["upgrade"])
+        .env("CK_TEST_UPGRADE_APPLY_OK", "1")
+        .output()
+        .unwrap();
+
+    assert_exit(&output, 0);
+    assert!(output.stderr.is_empty(), "stderr: {}", text(&output.stderr));
+    assert_eq!(
+        text(&output.stdout),
+        "upgraded ck-aft 0.55.1 → 0.55.2, restarted\nupgraded ck 0.17.9 → 0.17.10\nDone.\n"
+    );
+}
+
+#[test]
+fn upgrade_verbose_keeps_every_preexisting_outcome_line() {
+    let fixture = UpgradeFixture::new("ck-upgrade-verbose");
+    let index = serve_signed_index(|base| {
+        upgrade_index(base, "0.55.1", &"22".repeat(32), "0.17.9", &"44".repeat(32))
+    });
+    let output = fixture
+        .command(&index, &["upgrade", "--verbose"])
+        .output()
+        .unwrap();
+
+    assert_exit(&output, 0);
+    let stdout = text(&output.stdout);
+    for outcome in [
+        "  outcome: no-op: ck-subc-mcp is already current",
+        "  outcome: no-op: ck-aft is already current",
+        "  outcome: no-op: ck-subc is already current",
+        "  outcome: no-op: ck is already current",
+    ] {
+        assert!(stdout.contains(outcome), "missing {outcome:?}:\n{stdout}");
+    }
 }
 
 #[test]

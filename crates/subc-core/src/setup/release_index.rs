@@ -54,6 +54,8 @@ pub struct IndexAsset {
     pub url: String,
     pub sha256: String,
     #[serde(default)]
+    pub bytes: u64,
+    #[serde(default)]
     pub reports: Option<String>,
 }
 
@@ -107,12 +109,25 @@ pub fn index_url() -> String {
 /// `X-CortexKit-Signature-Ed25519` response header, verify it against the
 /// embedded generation-1 key, parse, and refuse a stale document.
 pub fn fetch_index(url: &str, deadline: Duration) -> Result<ReleaseIndex, IndexRefusal> {
+    #[cfg(feature = "test-support")]
+    if let Some(key) = test_release_index_key() {
+        return fetch_index_with_verifying_key(url, &key, RELEASE_INDEX_KEY_GENERATION, deadline);
+    }
     fetch_index_with_verifying_key(
         url,
         &RELEASE_INDEX_PUBKEY,
         RELEASE_INDEX_KEY_GENERATION,
         deadline,
     )
+}
+
+#[cfg(feature = "test-support")]
+fn test_release_index_key() -> Option<[u8; 32]> {
+    let encoded = std::env::var("CK_TEST_RELEASE_INDEX_PUBKEY").ok()?;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .ok()?;
+    decoded.try_into().ok()
 }
 
 /// How long an installer may wait for the index. Generous: an install is an

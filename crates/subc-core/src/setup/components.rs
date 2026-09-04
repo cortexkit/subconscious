@@ -60,6 +60,12 @@ pub struct ReleaseArtifactSource {
     verbose: bool,
 }
 
+pub(super) struct ComponentReleaseSummary {
+    pub release: String,
+    pub target: AlphaTarget,
+    pub assets: Vec<(&'static str, u64)>,
+}
+
 impl ReleaseArtifactSource {
     pub fn current() -> Self {
         Self {
@@ -127,6 +133,37 @@ impl ReleaseArtifactSource {
                 missing_asset,
             },
             None => ReleaseAvailability::Available,
+        })
+    }
+
+    pub(super) fn release_summary(
+        &mut self,
+        component: Component,
+    ) -> Result<ComponentReleaseSummary, String> {
+        let target = self.target;
+        let binaries = component_binaries_for_target(component, target);
+        let index = self.loaded_index()?;
+        let entry = index
+            .components
+            .get(component.label())
+            .ok_or_else(|| format!("no release is published for {component}"))?;
+        let target_assets = entry
+            .assets
+            .get(target.label())
+            .ok_or_else(|| format!("{} has no {} release", component.label(), target.label()))?;
+        let assets = binaries
+            .iter()
+            .map(|binary| {
+                target_assets
+                    .get(*binary)
+                    .map(|asset| (*binary, asset.bytes))
+                    .ok_or_else(|| format!("{} has no {binary} asset", entry.release))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(ComponentReleaseSummary {
+            release: entry.release.clone(),
+            target,
+            assets,
         })
     }
 
@@ -223,6 +260,13 @@ impl ArtifactSource for ReleaseArtifactSource {
                 "digest mismatch for {archive_name}: expected {expected} but downloaded {actual}"
             ));
         }
+        let archive_bytes = fs::metadata(&archive)
+            .map_err(|error| format!("could not inspect {archive_name}: {error}"))?
+            .len();
+        println!(
+            "  downloaded and verified {binary} ({})",
+            format_mebibytes(archive_bytes)
+        );
         let extracted = temp.join("extracted");
         extract(&archive, &extracted)?;
         let candidate = extracted.join(&binary_name);
@@ -282,6 +326,14 @@ impl ArtifactSource for ReleaseArtifactSource {
             Some(reports) => Acceptance::Reports(reports),
             None => Acceptance::RunsAndReports,
         })
+    }
+
+    fn verify(&mut self, destination: &Path, acceptance: &Acceptance) -> Result<(), String> {
+        #[cfg(feature = "test-support")]
+        if std::env::var_os("CK_TEST_SETUP_CONTROL_OK").is_some() {
+            return Ok(());
+        }
+        verify_acceptance(destination, acceptance)
     }
 }
 
@@ -433,6 +485,7 @@ pub fn install_component<S: ArtifactSource>(
                 destination.display()
             )
         })?;
+        println!("  placed {}", display_home_path(&destination));
     }
     Ok(())
 }
@@ -457,7 +510,7 @@ pub fn configure_component(
         config::apply(change)?;
         let configured = component.module_id().unwrap_or(component.label());
         println!(
-            "configured {configured} in {}",
+            "  configured {configured} in {}",
             display_home_path(config_path)
         );
         let mut fields = Map::new();
@@ -470,7 +523,11 @@ pub fn configure_component(
     Ok(change)
 }
 
-fn display_home_path(path: &Path) -> String {
+pub(super) fn format_mebibytes(bytes: u64) -> String {
+    format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
+}
+
+pub(super) fn display_home_path(path: &Path) -> String {
     let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
         return path.display().to_string();
     };
@@ -933,6 +990,7 @@ mod tests {
         super::super::release_index::IndexAsset {
             url: "http://127.0.0.1/archive.zip".to_string(),
             sha256: "ab".repeat(32),
+            bytes: 12_345,
             reports: reports.map(str::to_string),
         }
     }

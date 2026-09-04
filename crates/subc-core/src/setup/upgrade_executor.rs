@@ -56,6 +56,9 @@ pub trait UpgradeExecutionBackend {
     ) -> Result<String, String>;
     fn poll_daemon_service_ready(&mut self, drain_timeout: Duration) -> Result<String, String>;
     fn post_verify(&mut self, target: UpgradeTarget) -> Result<String, String>;
+
+    fn completed(&mut self, _target: UpgradeTarget) {}
+
     fn rollback_decision(&mut self, target: UpgradeTarget) -> RollbackDecision;
     fn rollback(&mut self, target: UpgradeTarget) -> Result<String, String>;
 }
@@ -163,6 +166,7 @@ pub fn execute_upgrade<B: UpgradeExecutionBackend>(
                         report,
                     });
                 }
+                backend.completed(*target);
                 (*target, "post-verification", result)
             }
         };
@@ -263,6 +267,9 @@ mod tests {
                 Ok("pid=2 inode=2 health=healthy version=2.0.0".to_string())
             }
         }
+        fn completed(&mut self, _target: UpgradeTarget) {
+            self.calls.push("completed");
+        }
         fn rollback_decision(&mut self, _target: UpgradeTarget) -> RollbackDecision {
             if self.rollback {
                 RollbackDecision::Accepted
@@ -318,6 +325,28 @@ mod tests {
         assert_eq!(failure.stage, "restart-initiation");
         assert!(!backend.calls.contains(&"poll"));
         assert!(!backend.calls.contains(&"verify"));
+        assert!(!backend.calls.contains(&"completed"));
+    }
+
+    #[test]
+    fn a_successful_target_is_announced_after_post_verification() {
+        let mut observed = UpgradeObserved::no_updates_on_current_host();
+        observed.targets.insert(
+            UpgradeTarget::Ck.label().to_string(),
+            super::super::model::UpgradeState::UpdateAvailable {
+                from: "1.0.0".to_string(),
+                to: "2.0.0".to_string(),
+                reason: None,
+            },
+        );
+        let mut backend = RecordingBackend::default();
+
+        execute_upgrade(&plan_upgrade(&observed), &mut backend).unwrap();
+
+        assert_eq!(
+            backend.calls,
+            ["download", "copy", "replace", "warm", "verify", "completed"]
+        );
     }
 
     #[test]

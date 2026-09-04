@@ -295,11 +295,7 @@ mod tests {
 
     #[test]
     fn asset_names_are_directly_derived_for_every_alpha_tuple() {
-        for platform in [
-            AlphaTarget::DarwinArm64,
-            AlphaTarget::LinuxX64,
-            AlphaTarget::WindowsX64,
-        ] {
+        for platform in AlphaTarget::ALL {
             let names = convention_asset_names(UpgradeTarget::Aft, platform);
             assert_eq!(names.archive, format!("ck-aft-{}.zip", platform.label()));
         }

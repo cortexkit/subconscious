@@ -52,12 +52,18 @@ impl Component {
     }
 
     pub const fn is_declared_unsupported_on(self, target: AlphaTarget) -> bool {
-        matches!((self, target), (Self::Mc, AlphaTarget::WindowsX64))
+        matches!(
+            (self, target),
+            (
+                Self::Mc,
+                AlphaTarget::WindowsX64 | AlphaTarget::WindowsArm64
+            )
+        )
     }
 
     pub const fn unavailable_message(self, target: AlphaTarget) -> Option<&'static str> {
         match (self, target) {
-            (Self::Mc, AlphaTarget::WindowsX64) => {
+            (Self::Mc, AlphaTarget::WindowsX64 | AlphaTarget::WindowsArm64) => {
                 Some("magic-context: not available on windows in alpha")
             }
             _ => None,
@@ -79,6 +85,7 @@ pub enum AlphaTarget {
     LinuxX64,
     LinuxArm64,
     WindowsX64,
+    WindowsArm64,
 }
 
 impl AlphaTarget {
@@ -88,15 +95,17 @@ impl AlphaTarget {
             Self::LinuxX64 => "linux-x64",
             Self::LinuxArm64 => "linux-arm64",
             Self::WindowsX64 => "windows-x64",
+            Self::WindowsArm64 => "windows-arm64",
         }
     }
 
     /// Every alpha tuple, for tables that must cover all of them.
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
         Self::DarwinArm64,
         Self::LinuxX64,
         Self::LinuxArm64,
         Self::WindowsX64,
+        Self::WindowsArm64,
     ];
 
     pub fn from_parts(os: &str, arch: &str) -> Option<Self> {
@@ -105,6 +114,7 @@ impl AlphaTarget {
             ("linux", "x86_64" | "x64") => Some(Self::LinuxX64),
             ("linux", "aarch64" | "arm64") => Some(Self::LinuxArm64),
             ("windows", "x86_64" | "x64") => Some(Self::WindowsX64),
+            ("windows", "aarch64" | "arm64") => Some(Self::WindowsArm64),
             _ => None,
         }
     }

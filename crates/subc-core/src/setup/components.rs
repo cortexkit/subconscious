@@ -284,7 +284,7 @@ pub fn component_binaries_for_target(
             Component::Mc,
             AlphaTarget::DarwinArm64 | AlphaTarget::LinuxX64 | AlphaTarget::LinuxArm64,
         ) => &["ck-mc"],
-        (Component::Mc, AlphaTarget::WindowsX64) => &[],
+        (Component::Mc, AlphaTarget::WindowsX64 | AlphaTarget::WindowsArm64) => &[],
         (Component::Insula, _) => &["ck-insula"],
         (Component::Claustrum, _) => &["ck-claustrum", "ck-auth"],
         // ck-synapse-worker-mlx is deliberately absent: it is synapse's frozen
@@ -303,7 +303,10 @@ pub fn component_binaries_for_target(
         ],
         (
             Component::Synapse,
-            AlphaTarget::LinuxX64 | AlphaTarget::LinuxArm64 | AlphaTarget::WindowsX64,
+            AlphaTarget::LinuxX64
+            | AlphaTarget::LinuxArm64
+            | AlphaTarget::WindowsX64
+            | AlphaTarget::WindowsArm64,
         ) => &["ck-synapse", "ck-synapse-opctl", "ck-synapse-worker-llama"],
     }
 }

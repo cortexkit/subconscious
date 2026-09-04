@@ -42,6 +42,34 @@ fn protocol_wire_shapes_match_golden_json_and_round_trip() {
             service_id: "llm".to_string(),
         },
     );
+    assert_golden(
+        "tool_call_request_minimal",
+        &subc_protocol::tool_call::ToolCallRequest::new(
+            "grep",
+            serde_json::json!({ "pattern": "needle" }),
+        ),
+    );
+    // The shape a model runner actually emits: an id, no progress token.
+    // This is the vector that discriminates a reader that ignores the
+    // optionals or is sensitive to field count.
+    assert_golden(
+        "tool_call_request_with_id",
+        &subc_protocol::tool_call::ToolCallRequest {
+            name: "edit".to_string(),
+            arguments: serde_json::json!({ "path": "a.rs" }),
+            tool_call_id: Some("wal-intent-42".to_string()),
+            progress_token: None,
+        },
+    );
+    assert_golden(
+        "tool_call_request_with_id_and_progress",
+        &subc_protocol::tool_call::ToolCallRequest {
+            name: "edit".to_string(),
+            arguments: serde_json::json!({ "path": "a.rs" }),
+            tool_call_id: Some("wal-intent-42".to_string()),
+            progress_token: Some(serde_json::json!("pt-7")),
+        },
+    );
     assert_golden("error_body", &error_body());
     assert_golden("error_body_with_detail", &error_body_with_detail());
     assert_golden("error_body_module_removed", &error_body_module_removed());

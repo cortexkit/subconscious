@@ -37,6 +37,7 @@ use serde::{Deserialize, Serialize};
 pub mod frame;
 pub mod manifest;
 pub mod session;
+pub mod tool_call;
 
 /// Canonical error codes emitted while opening a client route.
 ///

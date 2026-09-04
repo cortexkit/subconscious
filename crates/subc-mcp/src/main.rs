@@ -52,6 +52,7 @@ use subc_protocol::{
         HealthReport, HealthStatus, ModuleControlRequest, ModuleControlResponse,
         MODULE_CONTROL_OP_HEALTH_CHECK,
     },
+    tool_call::ToolCallRequest,
     BindIdentity, ErrorBody, Flags, Frame as SubcFrame, FrameType, ModuleHelloAckBody,
     ModuleHelloBody, Priority, RouteTarget, MAX_FRAME_BODY_LEN, PROTOCOL_VERSION,
     SUBC_LAUNCH_NONCE_ENV, SUBC_MODULE_ID_ENV,
@@ -4145,17 +4146,28 @@ struct SubcMcpServer {
     prompts: PromptService,
 }
 
-/// v1 subc-mcp ↔ provider tool-call request contract carried as an opaque
-/// subc route-channel `REQUEST` body. `name` is the provider's bare manifest
-/// tool name and `arguments` is the exact MCP request object. `Tool.schema` in
-/// the manifest is the agent-facing schema the provider accepts; the gateway
-/// never translates arguments.
-#[derive(Debug, Serialize)]
-struct RouteToolCallRequest {
+/// The tool-call request body the gateway sends on a route is the shared
+/// wire type; `name` is the provider's bare manifest tool name and
+/// `arguments` the exact MCP request object. `Tool.schema` in the manifest is
+/// the agent-facing schema the provider accepts; the gateway never translates
+/// arguments. The gateway mints no `tool_call_id` of its own: the host's
+/// request id is the host's, and correlating it would claim an identity the
+/// gateway cannot vouch for across reconnects.
+fn route_tool_call_request(
     name: String,
     arguments: JsonObject,
-    #[serde(skip_serializing_if = "Option::is_none")]
     progress_token: Option<ProgressToken>,
+) -> std::result::Result<ToolCallRequest, ErrorData> {
+    let progress_token = progress_token
+        .map(serde_json::to_value)
+        .transpose()
+        .map_err(mcp_internal_error)?;
+    Ok(ToolCallRequest {
+        name,
+        arguments: serde_json::Value::Object(arguments),
+        tool_call_id: None,
+        progress_token,
+    })
 }
 
 /// Magic-context mutation tools whose module-side replay ledger dedups on a
@@ -4503,11 +4515,8 @@ impl SubcMcpServer {
         }
         let route = binding.route;
         let progress_token = context.meta.get_progress_token();
-        let body = RouteToolCallRequest {
-            name: binding.bare_tool_name,
-            arguments,
-            progress_token: progress_token.clone(),
-        };
+        let body =
+            route_tool_call_request(binding.bare_tool_name, arguments, progress_token.clone())?;
         let body = serde_json::to_vec(&body).map_err(mcp_internal_error)?;
         let corr = self.subc.next_corr().map_err(mcp_internal_error)?;
         let frame = self

@@ -1,0 +1,8 @@
+{
+  "arguments": {
+    "path": "a.rs"
+  },
+  "name": "edit",
+  "progress_token": "pt-7",
+  "tool_call_id": "wal-intent-42"
+}

@@ -1169,14 +1169,11 @@ struct RequestBehavior {
     cancellable: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-struct ToolCallRouteRequest {
-    name: String,
-    #[serde(default)]
-    arguments: Value,
-    #[serde(default)]
-    progress_token: Option<Value>,
-}
+/// A route request is a tool call when it decodes as the shared tool-call
+/// body with a name and object arguments; anything else is a bare test body.
+/// A body without `arguments` fails the shared decode, which is the same
+/// verdict the object check gives it.
+type ToolCallRouteRequest = subc_protocol::tool_call::ToolCallRequest;
 
 fn request_behavior(config: &StubConfig, body: &[u8]) -> RequestBehavior {
     if let Some(tool_call) = parse_tool_call(body) {

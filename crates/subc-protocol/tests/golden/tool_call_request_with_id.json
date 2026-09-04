@@ -1,0 +1,7 @@
+{
+  "arguments": {
+    "path": "a.rs"
+  },
+  "name": "edit",
+  "tool_call_id": "wal-intent-42"
+}

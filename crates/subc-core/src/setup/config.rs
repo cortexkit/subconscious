@@ -5,7 +5,7 @@ use std::{
 };
 
 use serde_json::{Map, Value};
-use subc_jsonc::jsonc_to_json;
+use subc_jsonc::{jsonc_object_span, jsonc_to_json};
 
 use super::model::Component;
 
@@ -22,15 +22,106 @@ pub struct ConfigChange {
 }
 
 impl ConfigChange {
+    /// Renders the planned insertion without showing two complete copies of an
+    /// operator-owned configuration file.
     pub fn render_diff(&self) -> String {
-        format!(
-            "--- {}\n+++ {}\n@@ proposed CortexKit setup change @@\n-{}\n+{}",
-            self.path.display(),
-            self.path.display(),
-            self.before.trim_end(),
-            self.after.trim_end()
-        )
+        unified_insertion_diff(&self.before, &self.after, &self.path)
     }
+}
+
+fn unified_insertion_diff(before: &str, after: &str, path: &Path) -> String {
+    let before_lines = before.lines().collect::<Vec<_>>();
+    let after_lines = after.lines().collect::<Vec<_>>();
+    let mut lcs = vec![vec![0_usize; after_lines.len() + 1]; before_lines.len() + 1];
+    for before_index in (0..before_lines.len()).rev() {
+        for after_index in (0..after_lines.len()).rev() {
+            lcs[before_index][after_index] =
+                if before_lines[before_index] == after_lines[after_index] {
+                    lcs[before_index + 1][after_index + 1] + 1
+                } else {
+                    lcs[before_index + 1][after_index].max(lcs[before_index][after_index + 1])
+                };
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum DiffLine<'a> {
+        Context(&'a str),
+        Added(&'a str),
+        Removed(&'a str),
+    }
+
+    let mut lines = Vec::new();
+    let mut before_index = 0;
+    let mut after_index = 0;
+    while before_index < before_lines.len() || after_index < after_lines.len() {
+        if before_index < before_lines.len()
+            && after_index < after_lines.len()
+            && before_lines[before_index] == after_lines[after_index]
+        {
+            lines.push(DiffLine::Context(before_lines[before_index]));
+            before_index += 1;
+            after_index += 1;
+        } else if after_index < after_lines.len()
+            && (before_index == before_lines.len()
+                || lcs[before_index][after_index + 1] >= lcs[before_index + 1][after_index])
+        {
+            lines.push(DiffLine::Added(after_lines[after_index]));
+            after_index += 1;
+        } else {
+            lines.push(DiffLine::Removed(before_lines[before_index]));
+            before_index += 1;
+        }
+    }
+
+    let mut changed = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| (!matches!(line, DiffLine::Context(_))).then_some(index))
+        .collect::<Vec<_>>();
+    let mut rendered = format!("--- {}\n+++ {}\n", path.display(), path.display());
+    while let Some(first) = changed.first().copied() {
+        let mut start = first.saturating_sub(3);
+        let mut end = (first + 4).min(lines.len());
+        let mut consumed = 1;
+        while consumed < changed.len() && changed[consumed] <= end + 3 {
+            end = (changed[consumed] + 4).min(lines.len());
+            consumed += 1;
+        }
+        changed.drain(..consumed);
+        if start > end {
+            start = end;
+        }
+        let old_start = lines[..start]
+            .iter()
+            .filter(|line| !matches!(line, DiffLine::Added(_)))
+            .count()
+            + 1;
+        let new_start = lines[..start]
+            .iter()
+            .filter(|line| !matches!(line, DiffLine::Removed(_)))
+            .count()
+            + 1;
+        let old_count = lines[start..end]
+            .iter()
+            .filter(|line| !matches!(line, DiffLine::Added(_)))
+            .count();
+        let new_count = lines[start..end]
+            .iter()
+            .filter(|line| !matches!(line, DiffLine::Removed(_)))
+            .count();
+        rendered.push_str(&format!(
+            "@@ -{old_start},{old_count} +{new_start},{new_count} @@\n"
+        ));
+        for line in &lines[start..end] {
+            match line {
+                DiffLine::Context(text) => rendered.push_str(&format!(" {text}\n")),
+                DiffLine::Added(text) => rendered.push_str(&format!("+{text}\n")),
+                DiffLine::Removed(text) => rendered.push_str(&format!("-{text}\n")),
+            }
+        }
+    }
+    rendered
 }
 
 /// Inspect one component's exact leaf values without changing the file. Existing
@@ -83,17 +174,32 @@ pub fn plan_component_with_key(
         return Ok(None);
     }
     let additions = desired_values_with_key(component, binary_home, claustrum_key_path);
+    let mut after = before.clone();
     for (key, desired) in additions {
         if pending.iter().any(|pending_key| pending_key == &key) {
-            insert_value(&mut document, &key, desired).map_err(|key| ConfigConflict { key })?;
+            // Keep the parsed document as the conflict authority. The textual
+            // insertion below deliberately changes only missing values.
+            insert_value(&mut document, &key, desired.clone())
+                .map_err(|key| ConfigConflict { key })?;
+            if !before.is_empty() {
+                insert_textual_value(
+                    &mut after,
+                    &key,
+                    desired,
+                    component == Component::Claustrum && key == "modules.claustrum",
+                )
+                .map_err(|key| ConfigConflict { key })?;
+            }
         }
     }
-    let mut after = format!(
-        "{}\n",
-        serde_json::to_string_pretty(&document).expect("JSON values always serialize")
-    );
-    if component == Component::Claustrum {
-        insert_claustrum_reserved_comment(&mut after);
+    if before.is_empty() {
+        after = format!(
+            "{}\n",
+            serde_json::to_string_pretty(&document).expect("JSON values always serialize")
+        );
+        if component == Component::Claustrum {
+            insert_claustrum_reserved_comment(&mut after, "\n");
+        }
     }
     Ok(Some(ConfigChange {
         path,
@@ -317,7 +423,7 @@ fn desired_values_with_key(
     values
 }
 
-fn insert_claustrum_reserved_comment(rendered: &mut String) {
+fn insert_claustrum_reserved_comment(rendered: &mut String, newline: &str) {
     let Some(claustrum) = rendered.find("\"claustrum\": {") else {
         return;
     };
@@ -330,9 +436,153 @@ fn insert_claustrum_reserved_comment(rendered: &mut String) {
     rendered.insert_str(
         line_start,
         &format!(
-            "{indentation}// without it any local process completing the handshake can claim the vault's module id and be handed bearer capability handles\n"
+            "{indentation}// without it any local process completing the handshake can claim the vault's module id and be handed bearer capability handles{newline}"
         ),
     );
+}
+
+/// Inserts a missing dotted value at the closest existing parent object. The
+/// parser gives byte offsets in the original JSONC so comments and user layout
+/// survive rather than being reconstructed from a serde value.
+fn insert_textual_value(
+    document: &mut String,
+    dotted_key: &str,
+    desired: Value,
+    add_claustrum_comment: bool,
+) -> Result<(), String> {
+    let keys = dotted_key.split('.').collect::<Vec<_>>();
+    let mut existing_depth = 0;
+    for depth in 1..keys.len() {
+        match jsonc_object_span(document, &keys[..depth]).map_err(|_| dotted_key.to_string())? {
+            Some(_) => existing_depth = depth,
+            None => break,
+        }
+    }
+
+    let key = keys
+        .get(existing_depth)
+        .ok_or_else(|| dotted_key.to_string())?;
+    let mut value = desired;
+    for parent in keys[existing_depth + 1..].iter().rev() {
+        let mut nested = Map::new();
+        nested.insert((*parent).to_string(), value);
+        value = Value::Object(nested);
+    }
+    insert_object_member(
+        document,
+        &keys[..existing_depth],
+        key,
+        &value,
+        add_claustrum_comment,
+    )
+    .map_err(|_| dotted_key.to_string())
+}
+
+fn insert_object_member(
+    document: &mut String,
+    parent_path: &[&str],
+    key: &str,
+    value: &Value,
+    add_claustrum_comment: bool,
+) -> Result<(), String> {
+    let mut object = jsonc_object_span(document, parent_path)?
+        .ok_or_else(|| "parent object is absent".to_string())?;
+    if !object.is_empty && !object.has_trailing_comma {
+        let last_value_end = object
+            .last_member_end
+            .ok_or_else(|| "non-empty object has no final member".to_string())?;
+        // A line comment may follow the value. Put the separator before that
+        // comment so the comment continues to describe the existing member.
+        document.insert(last_value_end, ',');
+        object = jsonc_object_span(document, parent_path)?
+            .ok_or_else(|| "parent object disappeared".to_string())?;
+    }
+
+    let newline = if document.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
+    let indentation = indentation_unit(document);
+    let closing_line_start = document[..object.closing_brace]
+        .rfind('\n')
+        .map_or(0, |index| index + 1);
+    let closing_indent = &document[closing_line_start..object.closing_brace];
+    let closing_has_only_indent = closing_indent
+        .chars()
+        .all(|character| matches!(character, ' ' | '\t' | '\r'));
+    let member_indent = if closing_has_only_indent {
+        format!("{closing_indent}{indentation}")
+    } else {
+        indentation.repeat(parent_path.len() + 1)
+    };
+    let mut member = render_member(key, value, &member_indent, &indentation, newline);
+    if add_claustrum_comment {
+        insert_claustrum_reserved_comment(&mut member, newline);
+    }
+
+    if closing_has_only_indent {
+        document.insert_str(
+            closing_line_start,
+            &format!("{member_indent}{member}{newline}"),
+        );
+    } else {
+        let closing_indent = indentation.repeat(parent_path.len());
+        document.insert_str(
+            object.closing_brace,
+            &format!("{newline}{member_indent}{member}{newline}{closing_indent}"),
+        );
+    }
+    Ok(())
+}
+
+fn indentation_unit(document: &str) -> String {
+    document
+        .lines()
+        .find_map(|line| {
+            let indent = line
+                .chars()
+                .take_while(|character| matches!(character, ' ' | '\t'))
+                .collect::<String>();
+            (!indent.is_empty()
+                && line[indent.len()..]
+                    .chars()
+                    .any(|character| !character.is_whitespace()))
+            .then_some(indent)
+        })
+        .unwrap_or_else(|| "  ".to_string())
+}
+
+fn render_member(
+    key: &str,
+    value: &Value,
+    member_indent: &str,
+    indentation: &str,
+    newline: &str,
+) -> String {
+    let rendered = serde_json::to_string_pretty(value).expect("JSON values always serialize");
+    let mut lines = rendered.lines();
+    let first = lines.next().expect("serialized JSON has a first line");
+    if lines.next().is_none() {
+        return format!(
+            "{}: {first}",
+            serde_json::to_string(key).expect("key encodes")
+        );
+    }
+
+    let mut output = format!(
+        "{}: {first}",
+        serde_json::to_string(key).expect("key encodes")
+    );
+    for line in rendered.lines().skip(1) {
+        let spaces = line.bytes().take_while(|byte| *byte == b' ').count();
+        let depth = spaces / 2;
+        output.push_str(newline);
+        output.push_str(member_indent);
+        output.push_str(&indentation.repeat(depth));
+        output.push_str(line.trim_start());
+    }
+    output
 }
 
 /// The binary the daemon spawns for a module, read from the components
@@ -467,6 +717,82 @@ mod tests {
     /// daemon at `bin/aft`, and the spawn failed on a path that did not
     /// exist. The program the config names must be the first binary the
     /// component installs — the same table, so they cannot disagree.
+    #[test]
+    fn commented_config_insertion_is_byte_identical_outside_the_new_member() {
+        let root = fixture_path("config-comment-preservation");
+        let config = root.join("subc.jsonc");
+        let original = "{\n  // root comment\n  \"version\": 1, // version comment\n  /* preserve this block comment */\n  \"modules\": {\n    // keep the module comment\n    \"aft\": { \"program\": \"/user/aft\" }, // keep the aft comment\n  }, // keep the modules comment\n}\n";
+        fs::write(&config, original).expect("write fixture");
+
+        let change = plan_component(&config, Component::Mc, root.path())
+            .expect("additive configuration")
+            .expect("missing MC configuration");
+        let suffix_start = original.rfind("\n  },").expect("modules closing line");
+        assert!(
+            change.after.starts_with(&original[..suffix_start]),
+            "the existing prefix changed:\n{}",
+            change.after
+        );
+        assert!(
+            change.after.ends_with(&original[suffix_start..]),
+            "the existing suffix changed:\n{}",
+            change.after
+        );
+        assert!(change.after.contains("// root comment"));
+        assert!(change.after.contains("/* preserve this block comment */"));
+        assert!(change.after.contains("// keep the module comment"));
+        assert!(change.after.contains("\"magic-context\""));
+        assert!(
+            change.render_diff().contains("+    \"magic-context\":"),
+            "diff must show the insertion only:\n{}",
+            change.render_diff()
+        );
+
+        apply(&change).expect("apply insertion");
+        let loaded = subc_core::daemon_config::load(&config).expect("daemon parses JSONC");
+        assert!(
+            loaded.is_some(),
+            "daemon must load the inserted configuration"
+        );
+    }
+
+    #[test]
+    fn four_space_files_keep_their_indentation_for_root_insertions() {
+        let root = fixture_path("config-four-space-indent");
+        let config = root.join("subc.jsonc");
+        fs::write(&config, "{\n    \"version\": 1\n}\n").expect("write fixture");
+
+        let change = plan_component(&config, Component::Core, root.path())
+            .expect("additive configuration")
+            .expect("storage is missing");
+        assert!(
+            change.after.contains("\n    \"storage\": {"),
+            "root insertion must use the file's four-space indentation:\n{}",
+            change.after
+        );
+    }
+
+    #[test]
+    fn empty_modules_object_needs_no_leading_comma() {
+        let root = fixture_path("config-empty-modules");
+        let config = root.join("subc.jsonc");
+        fs::write(&config, "{\n  \"version\": 1,\n  \"modules\": {}\n}\n").expect("write fixture");
+
+        let change = plan_component(&config, Component::Mc, root.path())
+            .expect("additive configuration")
+            .expect("missing MC configuration");
+        assert!(
+            !change.after.contains("\"modules\": {,"),
+            "an empty object cannot have a separator before its first member:\n{}",
+            change.after
+        );
+        assert!(
+            !change.after.contains("{,\n"),
+            "the first member needs no leading comma:\n{}",
+            change.after
+        );
+    }
+
     #[test]
     fn configured_program_is_the_component_s_first_installed_binary() {
         for component in [

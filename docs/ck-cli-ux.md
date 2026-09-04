@@ -1,6 +1,6 @@
 # `ck` operator CLI — UX treatment
 
-Status: normative for the alpha CLI. Written from a full walk of every verb on a
+Status: S1 landed; normative for the alpha CLI. Written from a full walk of every verb on a
 fresh macOS alpha VM (released 0.17.5, all five modules installed) on
 2026-09-04, after the operator reported the mechanical voice and the
 module-binaries-as-domains defect. The captured "before" outputs live in the

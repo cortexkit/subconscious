@@ -306,6 +306,7 @@ pub struct SetupRequest {
     pub optional_components: Vec<Component>,
     pub uninstall: bool,
     pub dry_run: bool,
+    pub verbose: bool,
     pub convert: Option<Component>,
     pub conversion_confirmed: bool,
     /// The one key-file answer used for both claustrum bootstrap and daemon env.
@@ -318,6 +319,7 @@ impl SetupRequest {
             optional_components,
             uninstall: false,
             dry_run: false,
+            verbose: false,
             convert: None,
             conversion_confirmed: false,
             claustrum_key_path: None,

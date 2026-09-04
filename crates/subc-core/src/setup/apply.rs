@@ -91,6 +91,15 @@ impl SetupBackend {
     pub fn observe(&mut self, request: &SetupRequest) -> Result<SetupObserved, String> {
         self.runtime_status = runtime::observe(self.platform, &mut self.runner)?;
         let selected = selected_components(request);
+        self.artifacts.set_download_context(
+            request
+                .optional_components
+                .first()
+                .copied()
+                .or(request.convert)
+                .unwrap_or(Component::Core),
+            request.verbose,
+        );
         let claustrum_key_path = request
             .claustrum_key_path
             .as_deref()
@@ -197,6 +206,9 @@ impl SetupBackend {
         plan: &SetupPlan,
         request: &SetupRequest,
     ) -> Result<(), String> {
+        if !request.dry_run {
+            return Ok(());
+        }
         for operation in &plan.operations {
             let SetupOperation::ConfigureComponent { component } = operation else {
                 continue;
@@ -547,12 +559,28 @@ struct CkValidator<'a> {
 }
 
 impl Validator for CkValidator<'_> {
-    fn run(&mut self, label: &str, args: &[String]) -> Result<bool, String> {
-        let status = Command::new(self.executable)
+    fn run(
+        &mut self,
+        label: &str,
+        args: &[String],
+    ) -> Result<validation::ValidationResult, String> {
+        let output = Command::new(self.executable)
             .args(args)
-            .status()
+            .output()
             .map_err(|error| format!("could not run {label} {}: {error}", args.join(" ")))?;
-        Ok(status.success())
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let captured = match (stdout.is_empty(), stderr.is_empty()) {
+            (true, true) => String::new(),
+            (false, true) => stdout,
+            (true, false) => stderr,
+            (false, false) => format!("{stdout}\n{stderr}"),
+        };
+        Ok(if output.status.success() {
+            validation::ValidationResult::success()
+        } else {
+            validation::ValidationResult::failed(captured)
+        })
     }
 }
 

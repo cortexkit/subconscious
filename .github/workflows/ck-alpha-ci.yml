@@ -123,8 +123,12 @@ jobs:
             throw 'The alpha setup contract test selection did not execute.'
           }
 
+      # Verbose so the rustc invocation for the `ck` bin is in the log: the
+      # ck_cli tests read binary-side test knobs behind the test-support
+      # feature, and a bin built without it fails them in ways that look
+      # like product bugs. The log line names the cfg set actually used.
       - name: Prove CLI update-check contract
-        run: cargo test -p subc-core --test ck_cli --locked
+        run: cargo test -p subc-core --test ck_cli --locked -v
 
   self-update-unix:
     name: Unix self-update inode contract

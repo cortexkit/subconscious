@@ -1,0 +1,754 @@
+
+################ ck 
+ck — CortexKit operator CLI
+bin: ~/.local/share/cortexkit/bin/ck
+daemon: 0.17.5 (3af17351) · pid 6257 · up 4h · 4 clients
+modules: 3 running, 3 ok
+alerts: none
+updates: current (cache 11m old)
+
+domains:
+  module  routes  health  quota  fleet  daemon  aft  auth  claustrum  insula  subc  subc-mcp
+
+help[2]:
+  Run `ck health <id>` for one module's metrics
+  Run `ck module status <id>` for supervision state
+[rc=0]
+
+################ ck --help
+ck — CortexKit operator CLI
+
+usage:
+  ck [--subc <connection-file>] [--json] <domain> [<verb>] [<args>]
+
+domains:
+  setup     plan and apply the managed CortexKit installation
+  upgrade   plan managed component upgrades
+  module    supervised modules: list, status, stderr, terminals, restart, stop, start, rescan, release
+  routes    live consumers for one module or the whole daemon
+  provenance daemon-attested and module-declared build/process facts
+  health    one-line health for every supervised module
+  quota     AI-provider quota and usage windows
+  fleet     offline configured-module inspection
+  daemon    daemon version, uptime, connection info, and offline triage
+  aft
+  auth
+  claustrum
+  insula
+  subc
+  subc-mcp
+
+flags:
+  --subc <file>   use a specific connection file (default: auto-discover)
+  --json          raw JSON output instead of tables
+
+run 'ck <domain>' with no verb to see that domain's commands
+[rc=0]
+
+################ ck module
+ck module — inspect and control supervised modules
+
+usage: ck [--json] module <verb> [<args>]
+
+verbs:
+  ck module list            all modules with state and health
+  ck module status <id>     one module in detail
+  ck module stderr <id>     retained stderr for a module (-n <count> to limit)
+  ck module terminals <id>  retained terminal exits for a module
+  ck module restart <id>    drain-restart a module
+    --now                   restart without waiting for in-flight requests
+    --drain-ms <n>          wait up to <n> ms for in-flight requests (this restart only)
+  ck module stop <id>       disable and stop a module (persists until start)
+  ck module start <id>      enable and spawn a module
+  ck module rescan          re-read subc.jsonc and reconcile the module set
+  ck module rescan --dry-run  show what a rescan would change, without changing it
+  ck module release <id>    retire a removed module's retained reserved-id gate
+[rc=0]
+
+################ ck module --help
+ck module — inspect and control supervised modules
+
+usage: ck [--json] module <verb> [<args>]
+
+verbs:
+  ck module list            all modules with state and health
+  ck module status <id>     one module in detail
+  ck module stderr <id>     retained stderr for a module (-n <count> to limit)
+  ck module terminals <id>  retained terminal exits for a module
+  ck module restart <id>    drain-restart a module
+    --now                   restart without waiting for in-flight requests
+    --drain-ms <n>          wait up to <n> ms for in-flight requests (this restart only)
+  ck module stop <id>       disable and stop a module (persists until start)
+  ck module start <id>      enable and spawn a module
+  ck module rescan          re-read subc.jsonc and reconcile the module set
+  ck module rescan --dry-run  show what a rescan would change, without changing it
+  ck module release <id>    retire a removed module's retained reserved-id gate
+[rc=0]
+
+################ ck module list
+id         state    enabled  live  health
+aft        running  true     true  ok    
+claustrum  running  true     true  ok    
+insula     running  true     true  ok    
+
+help[1]:
+  Run `ck module status <id>` for one module's supervision state
+[rc=0]
+
+################ ck module status aft
+id   state    enabled  live  health  failures  restarts  last_action  last_exit  detail  metrics                                                                                                                                    
+aft  running  true     true  ok      0         0/3       -            -          -       {"actor_count":0,"callgraph_commits_60s_total":0,"callgraph_pages_or_bytes_written_60s_total":0,"callgraph_repair_entrie… (--json for full)
+[rc=0]
+
+################ ck module status
+ck module status needs a module id
+
+ck module — inspect and control supervised modules
+
+usage: ck [--json] module <verb> [<args>]
+
+verbs:
+  ck module list            all modules with state and health
+  ck module status <id>     one module in detail
+  ck module stderr <id>     retained stderr for a module (-n <count> to limit)
+  ck module terminals <id>  retained terminal exits for a module
+  ck module restart <id>    drain-restart a module
+    --now                   restart without waiting for in-flight requests
+    --drain-ms <n>          wait up to <n> ms for in-flight requests (this restart only)
+  ck module stop <id>       disable and stop a module (persists until start)
+  ck module start <id>      enable and spawn a module
+  ck module rescan          re-read subc.jsonc and reconcile the module set
+  ck module rescan --dry-run  show what a rescan would change, without changing it
+  ck module release <id>    retire a removed module's retained reserved-id gate
+[rc=2]
+
+################ ck module terminals aft
+daemon_started_at_ms=1788487030621 · 0 terminal record(s) · 0 dropped
+[rc=0]
+
+################ ck module stderr aft
+2026-09-04T01:57:19Z [aft] log retention sweep: removed_files=0 bytes_freed=0
+2026-09-04T01:57:19Z [aft] subc mode, pid 6291
+2026-09-04T01:57:19Z [aft] subc attach: authenticated to daemon via /var/folders/kr/rqmxz_9d2l91359qbjs8jshh0000gn/T/subc-501.connection.json
+2026-09-04T01:57:19Z [aft] subc attach: registered (HelloAck received)
+2026-09-04T02:57:19Z [aft] log retention sweep: removed_files=0 bytes_freed=0
+2026-09-04T03:57:19Z [aft] log retention sweep: removed_files=0 bytes_freed=0
+2026-09-04T04:57:20Z [aft] log retention sweep: removed_files=0 bytes_freed=0
+2026-09-04T05:57:20Z [aft] log retention sweep: removed_files=0 bytes_freed=0
+[rc=0]
+
+################ ck module rescan --dry-run
+change                  modules / count
+added                   -              
+removed                 -              
+changed-pending-reload  -              
+enabled-changed         -              
+unchanged               3              
+
+preview only — nothing was changed. Run `ck module rescan` to apply.
+[rc=0]
+
+################ ck routes
+(no live routes)
+
+help[1]:
+  Run `ck module list` to check which modules can own routes
+[rc=0]
+
+################ ck routes aft
+(no live routes)
+
+help[1]:
+  Run `ck module list` to check which modules can own routes
+[rc=0]
+
+################ ck health
+aft        ● ok            
+claustrum  ● ok            
+insula     ● ok            0 serving, 1 degraded, 36 unconfigured of 37; 0 of 9 cookie logins stale
+[rc=0]
+
+################ ck health aft
+aft: ok
+  actor_count: 0
+  callgraph_commits_60s_total: 0
+  callgraph_pages_or_bytes_written_60s_total: 0
+  callgraph_repair_entries_60s_total: 0
+  callgraph_repair_roots_annotated: 0
+  callgraph_repair_roots_total: 0
+  dispatch_liveness:
+    interactive: oldest_age_ms=null · queued=0
+    interactive_reserve: 1
+    maintenance: oldest_age_ms=null · queued=0
+    maintenance_cap: 2
+    running: interactive=0 · maintenance=0
+  dispatch_path:
+    budget_deferrals: maintenance=0 · reliable_push=0
+    completion_channels: bash_deferred=0 · bash_poll_touch=0 · control=0 · maintenance=0
+    frame_loop: last_tick_age_ms=62
+    mutating_lanes: []
+    pending_binds: count=0 · oldest_age_ms=null
+    response_tasks: live=0
+    writer: active=false · capacity=256 · queued=0 · saturation_count=0
+  memory:
+    allocator_slack_bytes: 15828000
+    allocator_slack_measured: true
+    phys_footprint_bytes: 6685824
+    roots: {}
+    roots_omitted: 0
+    roots_omitted_bytes: 0
+    roots_total: 0
+    rss_bytes: 11927552
+    sqlite_bytes: 0
+    status: ready
+    total_attributed_bytes: 0
+  reap:
+    blockers:
+      absence_unconfirmed: 0
+      actor_busy: 0
+      actor_state_busy: 0
+      artifact_eviction_blocked: 0
+      artifact_eviction_failed: 0
+      bash_waits: 0
+      bound_routes: 0
+      maintenance_pending: 0
+      maintenance_queued: 0
+      pending_binds: 0
+      unbound_quiesced: 0
+    deleted_retained: 0
+    last_sweep_ms: 1788504016025
+  root_count: 0
+  root_details_omitted: 0
+  roots: []
+  runtime:
+    bg_arm_misses_60s_total: 0
+    bg_nudges_enqueued_60s_total: 0
+    bg_subscriptions: 0
+    bg_wake_pending: 0
+    live_actor_roots: 0
+    live_watchers: 0
+    lsp_children_with_deleted_cwd: 0
+    open_routes: 0
+    spawned_lsp_children: 0
+  snapshot_age_ms: 1199
+[rc=0]
+
+################ ck health insula
+insula: ok
+  0 serving, 1 degraded, 36 unconfigured of 37; 0 of 9 cookie logins stale
+  buildCommit: b5d61da65729
+  cookieCohortTotal: 9
+  cookieLoginsStale: []
+  degraded:
+    - antigravity
+  fetchBlackout: false
+  fresh: 0
+  handlesWithoutAccount: []
+  lastFetchSuccessAgeSecs: null
+  lastRefusedAgeSecs: null
+  lastServedAgeSecs: 765
+  lastTickAgeSecs: 2
+  pending: 0
+  providersTotal: 37
+  quotaComparisonsNoDrop: 0
+  quotaDropsByProvider: {}
+  quotaDropsObservedContinuously: 0
+  quotaNotComparable: prior_reading_was_an_error=2074
+  refresherStalled: false
+  stale: 0
+  staleEpisodes: 0
+  staleEpisodesByProvider: {}
+  unconfigured:
+    - codex
+    - claude
+    - codebuff
+    - copilot
+    - cursor
+    - deepseek
+    - doubao
+    - elevenlabs
+    - factory
+    - gemini
+    - grok
+    - jetbrains
+    - kimi
+    - kimi-for-coding
+    - clinepass
+    - llmproxy
+    - manus
+    - mimo
+    - minimax
+    - neuralwatt
+    - ollama
+    - opencode
+    - opencodego
+    - openrouter
+    - qoder
+    - qwen-cloud
+    - sakana
+    - stepfun
+    - sub2api
+    - warp
+    - synthetic
+    - zai
+    - zenmux
+    - kilo
+    - alibaba
+    - amp
+  usageRequestsRefused: 0
+  usageRequestsServed: 2
+  vaultConnectionsEstablished: 0
+  vaultStaleGenerationDrops: 0
+  vaultUnmatchedDrops: 0
+  withoutHandles: []
+[rc=0]
+
+################ ck quota
+Usage
+
+Antigravity — 1 account
+  ○ account [local_source_unavailable] — local source unavailable: no Antigravity language server or agy CLI process running
+
+36 providers not connected (--verbose to list)
+[rc=0]
+
+################ ck quota --verbose
+Usage
+
+Alibaba — 1 account
+  ○ account — no session: none of ["ALIBABA_CODING_PLAN_API_KEY", "ALIBABA_QWEN_API_KEY", "DASHSCOPE_API_KEY"] is set
+
+Amp — 1 account
+  ○ account — no session: no Chrome cookie store found
+
+Antigravity — 1 account
+  ○ account [local_source_unavailable] — local source unavailable: no Antigravity language server or agy CLI process running
+
+Claude — 1 account
+  ○ account — no session: no anthropic entry in opencode auth.json
+
+Clinepass — 1 account
+  ○ account — no session: none of ["CLINE_API_KEY", "CLINEPASS_API_KEY"] is set
+
+Codebuff — 1 account
+  ○ account — no session: no CODEBUFF_API_KEY or ~/.config/manicode/credentials.json
+
+Codex — 1 account
+  ○ account — no session: reading codex auth.json: No such file or directory (os error 2)
+
+Copilot — 1 account
+  ○ account — no session: none of ["COPILOT_API_TOKEN", "GITHUB_TOKEN", "GH_TOKEN"] is set
+
+Cursor — 1 account
+  ○ account — no session: no Chrome cookie store found
+
+Deepseek — 1 account
+  ○ account — no session: no DEEPSEEK_API_KEY and no deepseek entry in the opencode auth store
+
+Doubao — 1 account
+  ○ account — no session: no Doubao credentials: set one of ["ARK_API_KEY", "VOLCENGINE_API_KEY", "DOUBAO_API_KEY"], or a Volcengine s… (--json for full)
+
+Elevenlabs — 1 account
+  ○ account — no session: none of ["ELEVENLABS_API_KEY", "XI_API_KEY"] is set
+
+Factory — 1 account
+  ○ account — no session: no Chrome cookie store found
+
+Gemini — 1 account
+  ○ account — no session: reading gemini oauth_creds.json: No such file or directory (os error 2)
+
+Grok — 1 account
+  ○ account — no session: no xai entry in opencode auth.json
+
+Jetbrains — 1 account
+  ○ account — no session: no JetBrains AIAssistantQuotaManager2.xml found
+
+Kilo — 1 account
+  ○ account — no session: none of ["KILO_API_KEY"] is set and no ~/.local/share/kilo/auth.json token
+
+Kimi — 1 account
+  ○ account — no session: none of ["KIMI_AUTH_TOKEN", "kimi_auth_token"] is set
+
+Kimi For Coding — 1 account
+  ○ account — no session: KIMI_CODE_API_KEY is not set
+
+Llmproxy — 1 account
+  ○ account — no session: none of ["LLM_PROXY_API_KEY"] is set
+
+Manus — 1 account
+  ○ account — no session: none of ["MANUS_SESSION_TOKEN", "MANUS_SESSION_ID", "MANUS_COOKIE"] is set
+
+Mimo — 1 account
+  ○ account — no session: no Chrome cookie store found
+
+Minimax — 1 account
+  ○ account — no session: none of ["MINIMAX_CODING_API_KEY", "MINIMAX_API_KEY"] is set
+
+################ ck daemon
+daemon_ver  protocol  pid   connected_clients  uptime
+0.17.5      2         6257  4                  4h    
+counter                                                  value
+client_connections_with_routes                           0    
+client_egress_close_delivery_failed                      0    
+client_frames_dropped_stale_route                        0    
+goodbye_relay_client_failed                              0    
+goodbye_relay_module_dropped                             0    
+max_routes_on_one_connection                             0    
+module_frames_dropped_no_route                           0    
+module_frames_dropped_no_route_last_10m                  0    
+module_frames_dropped_no_route_nonzero_minutes_last_10m  0    
+module_requests_dropped_stale_route                      0    
+route_release_stale_skipped                              0    
+route_released_epoch_fenced                              4    
+[rc=0]
+
+################ ck daemon triage
+run dir: /var/folders/kr/rqmxz_9d2l91359qbjs8jshh0000gn/T
+start-lock:
+  /Users/cortexkit/.local/share/cortexkit/run/subc-connection.json.start-lock: absent
+    finding: start-lock absent
+  /var/folders/kr/rqmxz_9d2l91359qbjs8jshh0000gn/T/subc-501.connection.json.start-lock: present
+    size: 0 bytes
+    mtime: {"age_seconds":86644,"status":"known"}
+connection-file:
+  /Users/cortexkit/.local/share/cortexkit/run/subc-connection.json: absent
+    finding: connection file absent
+  /var/folders/kr/rqmxz_9d2l91359qbjs8jshh0000gn/T/subc-501.connection.json: present
+    size: 662 bytes
+    mtime: {"age_seconds":17085,"status":"known"}
+    parses as JSON: "valid"
+    fields: {"daemon_id":{"present":true},"port":{"present":true,"value":8757},"wire_version":{"present":true}}
+  selected: /var/folders/kr/rqmxz_9d2l91359qbjs8jshh0000gn/T/subc-501.connection.json
+    port: 8757
+    daemon_id: "c678c16279be5e192fb0abce697f628a"
+    wire_version: 2
+process-liveness:
+  {"executable":{"expected":"ck-subc","observed":"ck-subc","status":"match"},"pid":6257,"status":"live"}
+log-tail:
+  /var/folders/kr/rqmxz_9d2l91359qbjs8jshh0000gn/T/subc.log: absent
+  finding: log absent
+verdict: daemon-appears-live — connection file is present and pid is alive
+[rc=0]
+
+################ ck provenance aft
+DAEMON BUILD
+  COMMIT: 3af17351a61f47380cc6ef83ea2fa8940b0d1b88
+  LOCK DIGEST: 3b98b5cd19d02371beb199b395f49963b949b9030374ddb0840228474b152736
+DAEMON-OBSERVED
+  PID: 6257
+  START TIME: 1788487030621
+  RUNNING IMAGE: match (macos_spawn_inode)
+MODULE: aft
+MODULE-DECLARED
+  unverifiable
+DAEMON-OBSERVED
+  PID: 6291
+  SPAWN TIME: 1788487039556
+  SPAWNED-FROM: /Users/cortexkit/.local/share/cortexkit/bin/ck-aft
+  RUNNING IMAGE: match (macos_spawn_inode)
+[rc=0]
+
+################ ck provenance
+ck provenance — inspect source-tagged module provenance
+
+usage: ck [--json] provenance <module-id>
+
+  ck provenance <id>  daemon-attested process facts beside module declarations
+[rc=0]
+
+################ ck upgrade --check
+upgrade plan:
+  1. observe alpha platform support
+  outcome: no-op: ck-subc-mcp is already current
+  outcome: no-op: ck-aft is already current
+  outcome: no-op: ck-subc is already current
+  outcome: no-op: ck is already current
+upgrade check: 0 mutation(s) planned; no binaries were replaced and no runtime was restarted
+[rc=0]
+
+################ ck upgrade --help
+ck upgrade — plan managed component upgrades
+
+usage:
+  ck upgrade
+  ck upgrade --check
+
+  --check prints target availability and ordered operations without replacing
+  binaries or restarting a runtime. MC is wiring-only in alpha and is not an
+  upgrade target.
+[rc=0]
+
+################ ck setup --help
+ck setup — plan managed CortexKit installation
+
+usage:
+  ck setup [aft|mc|insula|claustrum|synapse] [--with aft,mc,insula,claustrum,synapse] [--dry-run]
+  ck setup claustrum [--key-path <file>]
+  ck setup <aft|mc> --convert [--confirm]
+  ck setup --uninstall [--dry-run]
+
+  Bare setup installs core and offers optional components. --dry-run prints the
+  complete plan without calling an installation mutator. --convert is explicit
+  and requires --confirm before it can apply a conversion plan.
+[rc=0]
+
+################ ck setup --dry-run
+setup plan:
+  1. observe alpha platform support
+  2. offer optional components:
+  aft
+  mc
+  insula — browser-cookie providers dark by construction on Windows (Chrome App-Bound Encryption); file/API providers full; cookie lane via claustrum deposit
+  claustrum
+  synapse — healthy immediately with an empty catalog; inference remains typed-refused until model.load arrives
+  3. validate with ck daemon triage
+  4. validate with ck health
+  outcome: no-op: core is already correct
+  outcome: no-op: per-user runtime is already registered and live
+dry-run: 0 mutation(s) planned; none were applied
+[rc=0]
+
+################ ck setup synapse --dry-run
+setup plan:
+  1. observe alpha platform support
+  2. validate with ck daemon triage
+  3. validate with ck health
+  outcome: no-op: core is already correct
+  outcome: synapse: no ck-synapse-darwin-arm64.zip asset in no published release yet — the module's owner has not published this platform
+  outcome: no-op: per-user runtime is already registered and live
+setup plan refused; no mutations were applied
+[rc=1]
+
+################ ck projects
+unknown domain 'projects' (no built-in command and no 'ck-projects' on PATH)
+
+ck — CortexKit operator CLI
+
+usage:
+  ck [--subc <connection-file>] [--json] <domain> [<verb>] [<args>]
+
+domains:
+  setup     plan and apply the managed CortexKit installation
+  upgrade   plan managed component upgrades
+  module    supervised modules: list, status, stderr, terminals, restart, stop, start, rescan, release
+  routes    live consumers for one module or the whole daemon
+  provenance daemon-attested and module-declared build/process facts
+  health    one-line health for every supervised module
+  quota     AI-provider quota and usage windows
+  fleet     offline configured-module inspection
+  daemon    daemon version, uptime, connection info, and offline triage
+  aft
+  auth
+  claustrum
+  insula
+  subc
+  subc-mcp
+
+flags:
+  --subc <file>   use a specific connection file (default: auto-discover)
+  --json          raw JSON output instead of tables
+
+run 'ck <domain>' with no verb to see that domain's commands
+[rc=2]
+
+################ ck workspaces
+unknown domain 'workspaces' (no built-in command and no 'ck-workspaces' on PATH)
+
+ck — CortexKit operator CLI
+
+usage:
+  ck [--subc <connection-file>] [--json] <domain> [<verb>] [<args>]
+
+domains:
+  setup     plan and apply the managed CortexKit installation
+  upgrade   plan managed component upgrades
+  module    supervised modules: list, status, stderr, terminals, restart, stop, start, rescan, release
+  routes    live consumers for one module or the whole daemon
+  provenance daemon-attested and module-declared build/process facts
+  health    one-line health for every supervised module
+  quota     AI-provider quota and usage windows
+  fleet     offline configured-module inspection
+  daemon    daemon version, uptime, connection info, and offline triage
+  aft
+  auth
+  claustrum
+  insula
+  subc
+  subc-mcp
+
+flags:
+  --subc <file>   use a specific connection file (default: auto-discover)
+  --json          raw JSON output instead of tables
+
+run 'ck <domain>' with no verb to see that domain's commands
+[rc=2]
+
+################ ck auth
+ck auth — CortexKit provider-credential vault
+
+usage: ck auth <verb> [flags]
+
+verbs:
+login               OAuth/device/api-key login (interactive with no flags)
+logout              stop serving a credential (reversible)
+remove              permanently delete a credential
+status              vault health + credential inventory (no secrets)
+list                credential ids + lifecycle state (no secrets)
+grants              principal-scoped grants (no secrets)
+put                 ingest an api key, session cookie, or opaque secret
+mint-signing-key    generate and custody a new Ed25519 signing key
+import              import from opencode/pi/gemini-cli/antigravity
+set-identity        attach non-secret account metadata to one credential
+mint-handle         mint a capability handle for a credential
+revoke-handle       revoke one capability handle
+revoke-all-handles  revoke every handle for a credential
+grant               grant a reserved module a credential-id prefix
+revoke-grant        revoke a reserved module's credential-id prefix
+invalidate          mark a credential needs-reauth
+reactivate          clear needs-reauth without replacing the secret
+audit               print the audit chain
+events              why credentials failed to authenticate
+usable              which credentials can still serve or refresh
+verify-audit        verify the audit-chain integrity
+rotate-master-key   rotate the vault master key (offline)
+bootstrap           initialize a new vault (offline)
+
+On a standard install commands need no flags — the vault location and the
+running daemon auto-discover. Run 'ck auth help <verb>' for flags and details.
+[rc=0]
+
+################ ck auth --help
+ck auth — CortexKit provider-credential vault
+
+usage: ck auth <verb> [flags]
+
+verbs:
+login               OAuth/device/api-key login (interactive with no flags)
+logout              stop serving a credential (reversible)
+remove              permanently delete a credential
+status              vault health + credential inventory (no secrets)
+list                credential ids + lifecycle state (no secrets)
+grants              principal-scoped grants (no secrets)
+put                 ingest an api key, session cookie, or opaque secret
+mint-signing-key    generate and custody a new Ed25519 signing key
+import              import from opencode/pi/gemini-cli/antigravity
+set-identity        attach non-secret account metadata to one credential
+mint-handle         mint a capability handle for a credential
+revoke-handle       revoke one capability handle
+revoke-all-handles  revoke every handle for a credential
+grant               grant a reserved module a credential-id prefix
+revoke-grant        revoke a reserved module's credential-id prefix
+invalidate          mark a credential needs-reauth
+reactivate          clear needs-reauth without replacing the secret
+audit               print the audit chain
+events              why credentials failed to authenticate
+usable              which credentials can still serve or refresh
+verify-audit        verify the audit-chain integrity
+rotate-master-key   rotate the vault master key (offline)
+bootstrap           initialize a new vault (offline)
+
+On a standard install commands need no flags — the vault location and the
+running daemon auto-discover. Run 'ck auth help <verb>' for flags and details.
+[rc=0]
+
+################ ck auth list
+error: the running module refused the op: cannot resolve the master key to authorize the op: keychain command failed: security exited with Some(36): 
+[rc=1]
+
+################ ck fleet
+ck fleet — offline configured-module inspection
+
+usage:
+  ck fleet lint [<config>] [--verbose]
+
+`lint` reads module manifests without connecting to the daemon.
+[rc=0]
+
+################ ck fleet lint
+examined 0 of 3 configured
+partial: evaluation incomplete (manifest_exit_nonzero: claustrum)
+partial: evaluation incomplete (manifest_exit_nonzero: insula)
+partial: evaluation incomplete (manifest_unparsable: aft)
+operational failure: no modules examined (vacuity floor)
+deny consistency = self-contradiction check
+[rc=2]
+
+################ ck aft
+2026-09-04T06:48:11Z [aft] log retention sweep: removed_files=0 bytes_freed=0
+2026-09-04T06:48:11Z [aft] started, pid 9485
+2026-09-04T06:48:11Z [aft] stdin closed, shutting down
+2026-09-04T06:48:11Z [aft] shutdown phase=begin graceful_stdin=true
+2026-09-04T06:48:11Z [aft] shutdown phase=pending_responses_drained
+2026-09-04T06:48:11Z [aft] shutdown phase=search_index_flush_start runtime=0
+2026-09-04T06:48:11Z [aft] shutdown phase=search_index_flush_done runtime=0 flushed=false elapsed_ms=0
+2026-09-04T06:48:11Z [aft] shutdown phase=callgraph_refresh_flush_start
+2026-09-04T06:48:11Z [aft] shutdown phase=callgraph_refresh_flush_done drained=true elapsed_ms=0
+2026-09-04T06:48:11Z [aft] shutdown phase=runtime_cleanup_start
+2026-09-04T06:48:11Z [aft] shutdown phase=runtime_cleanup_done
+2026-09-04T06:48:11Z [aft] shutdown phase=complete elapsed_ms=0
+[rc=0]
+
+################ ck nosuchverb
+unknown domain 'nosuchverb' (no built-in command and no 'ck-nosuchverb' on PATH)
+
+ck — CortexKit operator CLI
+
+usage:
+  ck [--subc <connection-file>] [--json] <domain> [<verb>] [<args>]
+
+domains:
+  setup     plan and apply the managed CortexKit installation
+  upgrade   plan managed component upgrades
+  module    supervised modules: list, status, stderr, terminals, restart, stop, start, rescan, release
+  routes    live consumers for one module or the whole daemon
+  provenance daemon-attested and module-declared build/process facts
+  health    one-line health for every supervised module
+  quota     AI-provider quota and usage windows
+  fleet     offline configured-module inspection
+  daemon    daemon version, uptime, connection info, and offline triage
+  aft
+  auth
+  claustrum
+  insula
+  subc
+  subc-mcp
+
+flags:
+  --subc <file>   use a specific connection file (default: auto-discover)
+  --json          raw JSON output instead of tables
+
+run 'ck <domain>' with no verb to see that domain's commands
+[rc=2]
+
+################ ck module nosuch
+unknown verb 'module nosuch'
+
+ck module — inspect and control supervised modules
+
+usage: ck [--json] module <verb> [<args>]
+
+verbs:
+  ck module list            all modules with state and health
+  ck module status <id>     one module in detail
+  ck module stderr <id>     retained stderr for a module (-n <count> to limit)
+  ck module terminals <id>  retained terminal exits for a module
+  ck module restart <id>    drain-restart a module
+    --now                   restart without waiting for in-flight requests
+    --drain-ms <n>          wait up to <n> ms for in-flight requests (this restart only)
+  ck module stop <id>       disable and stop a module (persists until start)
+  ck module start <id>      enable and spawn a module
+  ck module rescan          re-read subc.jsonc and reconcile the module set
+  ck module rescan --dry-run  show what a rescan would change, without changing it
+  ck module release <id>    retire a removed module's retained reserved-id gate
+[rc=2]
+
+################ ck module status nosuch
+module_id 'nosuch' is not supervised
+
+help[1]:
+  Run `ck module list` to see valid module ids
+[rc=1]
+
+################ ck health nosuch
+unknown_module — module_id 'nosuch' is not registered
+[rc=1]

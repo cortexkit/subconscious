@@ -60,8 +60,14 @@ else
   # cutting AT the tests module assumes the module is terminal, and top-level
   # code appended after it (where the least careful edit lands) would read as
   # test code. The safe shape skips the module's brace-balanced extent.
-  echo "Anchor on '#[cfg(test)] mod tests' and skip its brace-balanced extent;"
-  echo "code after the module is production, so a cut-at-marker is still wrong."
+  # `mod tests` by name is its own blind spot: 6 of 65 test modules in one
+  # sibling crate are named otherwise (`stage_tests`, `wallet_tests`), and an
+  # anchor that never fires counts the whole test module AS production. The
+  # predicate is the attribute followed by `mod <any identifier> {`.
+  echo "Anchor on '#[cfg(test)] mod <name>' (any name, not only 'tests'), skip"
+  echo "each module's brace-balanced extent, and keep the code after it: that is"
+  echo "production. Then assert the stripped body has no #[test] or"
+  echo "#[tokio::test] left; truncation and a missed module both fail that."
 fi
 
 # The recommended anchor is better than the naive cut and still incomplete, in

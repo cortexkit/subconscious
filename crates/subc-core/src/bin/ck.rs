@@ -544,12 +544,17 @@ fn dashboard_module_is_warming(health_entries: &[Value], module: &Value) -> bool
         return false;
     }
     let module_id = display_field(module, "module_id");
-    health_entries
+    // The two surfaces spell "never probed" differently on the wire: the
+    // health entry omits the key, the supervisor entry serializes it as
+    // `null`. `Value::get` returns `Some(Null)` for the latter, so a bare
+    // `is_none()` read every registered module as probed — which is how the
+    // dashboard alerted on three modules 38 s after a fresh install.
+    let probed = |value: &Value| value.get("last_probe_ms").is_some_and(|v| !v.is_null());
+    let health_probed = health_entries
         .iter()
         .find(|entry| display_field(entry, "module_id") == module_id)
-        .and_then(|entry| entry.get("last_probe_ms"))
-        .or_else(|| module.get("last_probe_ms"))
-        .is_none()
+        .is_some_and(probed);
+    !(health_probed || probed(module))
 }
 
 fn print_static_domains() {
@@ -5062,9 +5067,14 @@ mod tests {
 
     #[test]
     fn unknown_without_a_probe_stamp_warms_but_unknown_after_a_probe_alerts() {
+        // The supervisor entry carries `"last_probe_ms": null` on the wire for
+        // a never-probed module (serde default without skip); the health entry
+        // omits the key. Both spellings mean never probed. The fixture uses
+        // the null form on the module row because that is what the running
+        // daemon sends, and it is the form that read as "probed" once.
         let modules = vec![
-            json!({"module_id": "aft", "state": "running"}),
-            json!({"module_id": "synapse", "state": "running"}),
+            json!({"module_id": "aft", "state": "running", "last_probe_ms": null}),
+            json!({"module_id": "synapse", "state": "running", "last_probe_ms": 1}),
         ];
         let health = vec![
             json!({"module_id": "aft", "status": "unknown"}),

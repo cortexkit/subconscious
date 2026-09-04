@@ -37,6 +37,56 @@ Everything observable is designed to fail loud and typed: refusals carry
 codes, drops carry counters, and provenance is attested by whichever party
 can actually verify it.
 
+## Install (alpha)
+
+macOS and Linux:
+
+```
+curl -fsSL https://cortexkit.io/install | bash
+ck setup
+```
+
+Windows (PowerShell):
+
+```
+irm https://cortexkit.io/install/win | iex
+ck setup
+```
+
+`ck setup` places the daemon, registers it with your session's service
+manager (launchd, systemd --user, or a logon task), and starts it. Modules
+are added one at a time: `ck setup aft`, `ck setup mc`, `ck setup insula`,
+`ck setup claustrum`, `ck setup synapse`. Bare `ck` shows what is running;
+`ck upgrade` updates everything that has a newer release.
+
+### Connect your agent
+
+The fleet is exposed to an agent as one MCP server, `ck-subc-mcp`, run in
+`shim` mode with the harness named so the tool surface can be shaped for it.
+
+Claude Code:
+
+```
+claude mcp add ck -- ck-subc-mcp shim --harness claude-code
+```
+
+OpenCode (`opencode.json`):
+
+```json
+{ "mcp": { "ck": { "type": "local", "command": ["ck-subc-mcp", "shim", "--harness", "opencode"] } } }
+```
+
+Codex (`~/.codex/config.toml`):
+
+```toml
+[mcp_servers.ck]
+command = "ck-subc-mcp"
+args = ["shim", "--harness", "codex"]
+```
+
+Any other MCP host: run `ck-subc-mcp shim --harness <name>` as a stdio
+server, where `<name>` is the host's name.
+
 ## Build
 
 ```

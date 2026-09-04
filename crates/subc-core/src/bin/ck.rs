@@ -54,26 +54,32 @@ const FRAME_DROP_ALERT_REQUIRED_NONZERO_MINUTES: u64 = 10;
 
 const TOP_HELP_BASE: &str = "ck — CortexKit operator CLI\n\nusage:\n  ck [--subc <connection-file>] [--json] <domain> [<verb>] [<args>]\n\ndomains:\n  setup     plan and apply the managed CortexKit installation\n  upgrade   plan managed component upgrades\n  module    supervised modules: list, status, stderr, terminals, restart, stop, start, rescan, release\n  routes    live consumers for one module or the whole daemon\n  provenance daemon-attested and module-declared build/process facts\n  health    one-line health for every supervised module\n  quota     AI-provider quota and usage windows\n  daemon    daemon version, uptime, connection info, offline triage, and CI lint";
 
-const TOP_HELP_TAIL: &str = "flags:\n  --subc <file>   use a specific connection file (default: auto-discover)\n  --json          raw JSON output instead of tables\n\nrun 'ck <domain>' with no verb to see that domain's commands";
+const TOP_HELP_TAIL: &str = "flags:\n  --subc <file>   use a specific connection file (default: auto-discover)\n  --json          raw JSON output instead of tables\n  --verbose       include diagnostic detail and complete metrics\n\nrun 'ck <domain>' with no verb to see that domain's commands";
+const TOP_HELP_JSON_COMPAT_TAIL: &str = "flags:\n  --subc <file>   use a specific connection file (default: auto-discover)\n  --json          raw JSON output instead of tables\n\nrun 'ck <domain>' with no verb to see that domain's commands";
 
 const DOMAIN_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const DOMAIN_PROBE_CACHE_FILE: &str = "domain-probes.json";
 
 /// Names of installed module programs, derived from setup's component tables so
 /// the dispatcher cannot drift when a component gains another supported target.
-fn module_binary_names() -> BTreeSet<String> {
-    let mut names = BTreeSet::new();
+fn module_command_ids() -> BTreeMap<String, String> {
+    let mut modules = BTreeMap::new();
     for component in setup::Component::ALL {
         if let Some(program) = setup::module_program(component) {
-            names.insert(program.strip_prefix("ck-").unwrap_or(program).to_string());
+            let command = program.strip_prefix("ck-").unwrap_or(program);
+            let module_id = component.module_id().unwrap_or(command);
+            modules.insert(command.to_string(), module_id.to_string());
         }
     }
     for target in setup::AlphaTarget::ALL {
         for binary in setup::component_binaries_for_target(setup::Component::Core, target) {
-            names.insert(binary.strip_prefix("ck-").unwrap_or(binary).to_string());
+            let command = binary.strip_prefix("ck-").unwrap_or(binary);
+            modules
+                .entry(command.to_string())
+                .or_insert_with(|| command.to_string());
         }
     }
-    names
+    modules
 }
 
 #[derive(Clone, Debug)]
@@ -104,13 +110,21 @@ struct DomainProbeCacheEntry {
 /// Top-level help has one domain list. External commands have to opt in so a
 /// module binary on PATH cannot accidentally become an operator command.
 fn top_help() -> String {
+    top_help_with_tail(TOP_HELP_TAIL)
+}
+
+fn top_help_json_compat() -> String {
+    top_help_with_tail(TOP_HELP_JSON_COMPAT_TAIL)
+}
+
+fn top_help_with_tail(tail: &str) -> String {
     let external = discover_external_domains();
     let mut out = String::from(TOP_HELP_BASE);
     for domain in &external {
         out.push_str(&format!("\n  {:<9} {}", domain.name, domain.headline));
     }
     out.push_str("\n\n");
-    out.push_str(TOP_HELP_TAIL);
+    out.push_str(tail);
     out
 }
 
@@ -311,18 +325,18 @@ fn write_domain_probe_cache(path: &Path, cache: &DomainProbeCache) -> Result<(),
     Ok(())
 }
 
-const MODULE_HELP: &str = "ck module — inspect and control supervised modules\n\nusage: ck [--json] module <verb> [<args>]\n\nverbs:\n  ck module list            all modules with state and health\n  ck module status <id>     one module in detail
+const MODULE_HELP: &str = "ck module — inspect and control supervised modules\n\nusage: ck [--json] [--verbose] module <verb> [<args>]\n\nverbs:\n  ck module list            all modules with state and health\n  ck module status <id>     one module in detail
   ck module stderr <id>     retained stderr for a module (-n <count> to limit)\n  ck module terminals <id>  retained terminal exits for a module\n  ck module restart <id>    drain-restart a module\n    --now                   restart without waiting for in-flight requests\n    --drain-ms <n>          wait up to <n> ms for in-flight requests (this restart only)\n  ck module stop <id>       disable and stop a module (persists until start)\n  ck module start <id>      enable and spawn a module\n  ck module rescan          re-read subc.jsonc and reconcile the module set\n  ck module rescan --dry-run  show what a rescan would change, without changing it\n  ck module release <id>    forget a removed module's reserved id so another module may use it";
 
 const ROUTES_HELP: &str = "ck routes — inspect live route consumers\n\nusage: ck [--json] routes [<module-id>]\n\n  ck routes          live consumers for every connected module\n  ck routes <id>     live consumers for one connected module";
 
-const PROVENANCE_HELP: &str = "ck provenance — inspect source-tagged module provenance\n\nusage: ck [--json] provenance <module-id>\n\n  ck provenance <id>  daemon-attested process facts beside module declarations";
+const PROVENANCE_HELP: &str = "ck provenance — inspect source-tagged module provenance\n\nusage: ck [--json] [--verbose] provenance <module-id>\n\n  ck provenance <id>  daemon-attested process facts beside module declarations";
 
 const QUOTA_HELP: &str = "ck quota - AI-provider quota and usage windows\n\nusage: ck [--json] quota [--verbose] [<provider-id>]\n\n  ck quota              connected providers and their usage windows\n  ck quota --verbose    all tracked providers, including unavailable ones\n  ck quota claude       one provider's windows and status in detail";
 
-const HEALTH_HELP: &str = "ck health — module health\n\nusage: ck [--json] health [<module-id>]\n\n  ck health            one-line health for every supervised module (cached)\n  ck health <id>       fresh health.check probe with FULL metrics — bypasses\n                       the supervisor cache and its size truncation";
+const HEALTH_HELP: &str = "ck health — module health\n\nusage: ck [--json] [--verbose] health [<module-id>]\n\n  ck health            one-line health for every supervised module (cached)\n  ck health <id>       fresh health.check probe with headline metrics\n  ck health <id> --verbose  fresh probe with the complete metrics tree";
 
-const DAEMON_HELP: &str = "ck daemon — daemon version, uptime, connection info, offline triage, and CI lint\n\nusage:\n  ck [--json] daemon\n  ck [--json] daemon triage\n  ck daemon lint [<config>] [--verbose]\n\n  triage reads only the local run directory; it never contacts the daemon.\n  lint reads module manifests without connecting to the daemon.";
+const DAEMON_HELP: &str = "ck daemon — daemon version, uptime, connection info, offline triage, and CI lint\n\nusage:\n  ck [--json] [--verbose] daemon\n  ck [--json] daemon triage\n  ck daemon lint [<config>] [--verbose]\n\n  triage reads only the local run directory; it never contacts the daemon.\n  lint reads module manifests without connecting to the daemon.";
 
 const SETUP_HELP: &str = "ck setup — plan managed CortexKit installation\n\nusage:\n  ck setup [aft|mc|insula|claustrum|synapse] [--with aft,mc,insula,claustrum,synapse] [--dry-run] [--verbose]\n  ck setup claustrum [--key-path <file>]\n  ck setup <aft|mc> --convert [--confirm]\n  ck setup --uninstall [--dry-run]\n\n  Bare setup installs core and offers optional components. --dry-run prints the\n  complete plan without changing anything. --convert is explicit and requires\n  --confirm before it can apply a conversion plan. --verbose includes plan outcomes\n  and download diagnostics when a network request fails.";
 
@@ -411,17 +425,17 @@ async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), CkError> {
     let result = match args.command {
         Command::Dashboard => unreachable!("handled before connecting"),
         Command::Module(ModuleCommand::List) => {
-            module_list(&mut client, args.json, args.subc.as_deref()).await
+            module_list(&mut client, args.json, args.verbose, args.subc.as_deref()).await
         }
         Command::Module(ModuleCommand::Status { module_id }) => {
-            module_status(&mut client, &module_id, args.json).await
+            module_status(&mut client, &module_id, args.json, args.verbose).await
         }
         Command::Module(ModuleCommand::StderrTail {
             module_id,
             max_lines,
         }) => module_stderr_tail(&mut client, &module_id, max_lines, args.json).await,
         Command::Module(ModuleCommand::Terminals { module_id }) => {
-            module_terminals(&mut client, &module_id, args.json).await
+            module_terminals(&mut client, &module_id, args.json, args.verbose).await
         }
         Command::Module(ModuleCommand::Restart {
             module_id,
@@ -440,20 +454,16 @@ async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), CkError> {
             module_set_enabled(&mut client, &module_id, true, args.json).await
         }
         Command::Routes { module_id } => {
-            supervisor_routes(
-                &mut client,
-                module_id.as_deref(),
-                args.json,
-                args.subc.as_deref(),
-            )
-            .await
+            supervisor_routes(&mut client, module_id.as_deref(), args.json).await
         }
-        Command::Provenance { module_id } => provenance(&mut client, &module_id, args.json).await,
-        Command::Health => health(&mut client, args.json, args.subc.as_deref()).await,
+        Command::Provenance { module_id } => {
+            provenance(&mut client, &module_id, args.json, args.verbose).await
+        }
+        Command::Health => health(&mut client, args.json, args.verbose, args.subc.as_deref()).await,
         Command::HealthDetail { module_id } => {
-            health_detail(&mut client, &module_id, args.json).await
+            health_detail(&mut client, &module_id, args.json, args.verbose).await
         }
-        Command::Daemon => daemon(&mut client, args.json).await,
+        Command::Daemon => daemon(&mut client, args.json, args.verbose).await,
         Command::DaemonTriage => unreachable!("handled before connecting"),
         Command::Quota {
             provider_id,
@@ -487,6 +497,11 @@ struct DashboardSnapshot {
     describe: Value,
     modules: Value,
     health: Value,
+}
+
+struct DashboardUpdateLines {
+    summary: String,
+    cache_detail: Option<String>,
 }
 
 async fn fleet_lint_command(config: Option<&Path>, verbose: bool) -> Result<(), CkError> {
@@ -523,26 +538,43 @@ async fn dashboard(args: &CkArgs) -> Result<(), CkError> {
         }
         Err(error) => Err(error),
     };
-    let update_line = update_task
-        .await
-        .unwrap_or_else(|_| "updates: not checked (cache unavailable)".to_string());
+    let update = update_task.await.unwrap_or_else(|_| DashboardUpdateLines {
+        summary: "updates: unknown (could not reach cortexkit.io)".to_string(),
+        cache_detail: None,
+    });
 
     match result {
-        Ok(snapshot) => {
-            print_dashboard(&args.program, &snapshot, args.subc.as_deref(), &update_line)
-        }
-        Err(error) => print_degraded_dashboard(&args.program, &error, &update_line),
+        Ok(snapshot) => print_dashboard(&args.program, &snapshot, &update, args.verbose),
+        Err(error) => print_degraded_dashboard(&args.program, &error, &update, args.verbose),
     }
     Ok(())
 }
 
-async fn bare_update_line() -> String {
+async fn bare_update_line() -> DashboardUpdateLines {
     let cache = setup::UpdateCache::from_environment();
     let source = setup::IndexReleaseSource::from_environment(setup::BARE_REFRESH_BUDGET);
     let installed = setup::dashboard_installed_binaries().unwrap_or_default();
-    setup::dashboard_update(&cache, &source, &installed)
+    let rendered = setup::dashboard_update(&cache, &source, &installed)
         .await
-        .render()
+        .render();
+    let (without_cache, cache_detail) = rendered
+        .strip_suffix(')')
+        .and_then(|line| line.rsplit_once(" (cache "))
+        .map(|(summary, cache)| (summary.to_string(), Some(cache.to_string())))
+        .unwrap_or_else(|| (rendered.clone(), None));
+    let summary = if without_cache == "updates: current" {
+        "updates: none".to_string()
+    } else if without_cache.starts_with("updates: not checked") {
+        "updates: unknown (could not reach cortexkit.io)".to_string()
+    } else if without_cache == "updates: index stale" {
+        without_cache
+    } else {
+        format!("{without_cache} (run ck upgrade)")
+    };
+    DashboardUpdateLines {
+        summary,
+        cache_detail,
+    }
 }
 
 async fn dashboard_probe(resolved: ResolvedConnection) -> Result<DashboardSnapshot, CkError> {
@@ -571,39 +603,63 @@ async fn dashboard_probe(resolved: ResolvedConnection) -> Result<DashboardSnapsh
 fn print_dashboard(
     program: &Path,
     snapshot: &DashboardSnapshot,
-    subc: Option<&Path>,
-    update_line: &str,
+    update: &DashboardUpdateLines,
+    verbose: bool,
 ) {
-    print_dashboard_identity(program);
-    let build = snapshot
-        .describe
-        .get("build_git_sha")
-        .and_then(Value::as_str)
-        .filter(|sha| !sha.is_empty() && *sha != "unavailable")
-        .map(short_build_sha)
-        .unwrap_or_else(|| "build unknown".to_string());
     let clients = display_field(&snapshot.describe, "connected_clients");
     let uptime = connection_file_age(&snapshot.path)
         .map(format_duration)
         .unwrap_or_else(|| "-".to_string());
     println!(
-        "daemon: {} ({build}) · pid {} · up {uptime} · {clients} clients",
-        snapshot.daemon_ver, snapshot.pid
+        "ck {} · daemon running (pid {}, up {uptime}, {clients} clients)",
+        env!("CARGO_PKG_VERSION"),
+        snapshot.pid
     );
-    print_dashboard_module_summary(&snapshot.modules, &snapshot.health, &snapshot.describe);
-    println!("{update_line}");
+    print_dashboard_module_summary(&snapshot.modules, &snapshot.health);
+    if let Some(alerts) = dashboard_alerts_line(&snapshot.describe) {
+        println!("{alerts}");
+    }
+    println!("{}", update.summary);
+
+    if verbose {
+        print_dashboard_identity(program);
+        println!("daemon version: {}", snapshot.daemon_ver);
+        if let Some(cache_detail) = &update.cache_detail {
+            println!("update cache: {cache_detail}");
+        }
+    }
+    let cli_sha = env!("SUBC_BUILD_GIT_SHA");
+    if snapshot
+        .describe
+        .get("build_git_sha")
+        .and_then(Value::as_str)
+        .is_some_and(|daemon_sha| daemon_sha != cli_sha)
+    {
+        print_build_skew(&snapshot.describe);
+    }
+
     print_static_domains();
-    let footer = [
-        next_step("ck health <id>", "for one module's metrics", subc),
-        next_step("ck module status <id>", "for supervision state", subc),
-    ];
-    print_help_footer(&footer);
+    println!("run `ck <command>` for its verbs, `ck --help` for everything");
 }
 
-fn print_degraded_dashboard(program: &Path, error: &CkError, update_line: &str) {
-    print_dashboard_identity(program);
-    println!("daemon: unreachable — {}", dashboard_error_text(error));
-    println!("{update_line}");
+fn print_degraded_dashboard(
+    program: &Path,
+    error: &CkError,
+    update: &DashboardUpdateLines,
+    verbose: bool,
+) {
+    println!(
+        "ck {} · daemon stopped ({})",
+        env!("CARGO_PKG_VERSION"),
+        dashboard_error_text(error)
+    );
+    println!("{}", update.summary);
+    if verbose {
+        print_dashboard_identity(program);
+        if let Some(cache_detail) = &update.cache_detail {
+            println!("update cache: {cache_detail}");
+        }
+    }
     print_static_domains();
     print_help_footer(&[
         "Check the connection file path above, then run `ck daemon --subc <connection-file>`",
@@ -628,64 +684,46 @@ fn print_dashboard_identity(program: &Path) {
     let (path, real_path) = executable_identity(program);
     let path = display_home_path(&path);
     match real_path {
-        Some(real_path) => println!(
-            "ck — CortexKit operator CLI\nbin: {path} ({})",
-            display_home_path(&real_path)
-        ),
-        None => println!("ck — CortexKit operator CLI\nbin: {path}"),
+        Some(real_path) => println!("bin: {path} ({})", display_home_path(&real_path)),
+        None => println!("bin: {path}"),
     }
 }
 
-fn print_dashboard_module_summary(modules: &Value, health: &Value, describe: &Value) {
+fn print_dashboard_module_summary(modules: &Value, health: &Value) {
     let module_entries = modules_array(modules);
     let health_entries = modules_array(health);
-    let running = module_entries
-        .iter()
-        .filter(|module| display_field(module, "state") == "running")
-        .count();
-    let ok = module_entries
-        .iter()
-        .filter(|module| dashboard_health_status(health_entries, module) == "ok")
-        .count();
-    println!("modules: {running} running, {ok} ok");
-    let warming = dashboard_warming_modules(module_entries, health_entries);
-    if !warming.is_empty() {
-        println!("warming: {}", warming.join(", "));
+    if module_entries.is_empty() {
+        println!("modules: none");
+        return;
     }
-    println!(
-        "{}",
-        dashboard_alerts_line(module_entries, health_entries, describe)
-    );
+
+    let summaries = module_entries
+        .iter()
+        .map(|module| {
+            let module_id = display_field(module, "module_id");
+            if dashboard_module_is_warming(health_entries, module) {
+                return format!("{module_id} warming");
+            }
+            let status = human_health_status(&dashboard_health_status(health_entries, module));
+            let detail = health_entries
+                .iter()
+                .find(|entry| display_field(entry, "module_id") == module_id)
+                .and_then(health_operator_detail);
+            if status != "ok" {
+                if let Some(detail) = detail {
+                    return format!("{module_id} {status} ({detail})");
+                }
+            }
+            format!("{module_id} {status}")
+        })
+        .collect::<Vec<_>>();
+    println!("modules: {}", summaries.join(" · "));
 }
 
-/// The dashboard's alert line is kept as a rendered string so tests assert the
-/// exact operator-facing surface instead of only the counters that feed it.
-fn dashboard_alerts_line(modules: &[Value], health: &[Value], describe: &Value) -> String {
-    let mut alerts = Vec::new();
-    for module in modules {
-        let status = dashboard_health_status(health, module);
-        if status != "ok" && !dashboard_module_is_warming(health, module) {
-            alerts.push(display_field(module, "module_id"));
-        }
-    }
-    for entry in health {
-        let module_id = display_field(entry, "module_id");
-        if !modules
-            .iter()
-            .any(|module| display_field(module, "module_id") == module_id)
-            && display_field(entry, "status") != "ok"
-        {
-            alerts.push(module_id);
-        }
-    }
-    if let Some(alert) = dashboard_frame_drop_alert(describe) {
-        alerts.push(alert);
-    }
-    if alerts.is_empty() {
-        "alerts: none".to_string()
-    } else {
-        format!("alerts: {}", alerts.join(", "))
-    }
+/// Alerts that do not already appear in the inline module summary stay on a
+/// separate line. Omitting an empty line keeps a healthy dashboard scannable.
+fn dashboard_alerts_line(describe: &Value) -> Option<String> {
+    dashboard_frame_drop_alert(describe).map(|alert| format!("alerts: {alert}"))
 }
 
 fn dashboard_frame_drop_alert(describe: &Value) -> Option<String> {
@@ -730,14 +768,6 @@ fn dashboard_health_status(health_entries: &[Value], module: &Value) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
-fn dashboard_warming_modules(modules: &[Value], health_entries: &[Value]) -> Vec<String> {
-    modules
-        .iter()
-        .filter(|module| dashboard_module_is_warming(health_entries, module))
-        .map(|module| display_field(module, "module_id"))
-        .collect()
-}
-
 /// `last_probe_ms: None` means the supervisor has never probed this module, so
 /// an unknown status is expected while its first probe is pending. A present
 /// stamp proves the probe ran; an unknown result after that is an alarm.
@@ -760,7 +790,9 @@ fn dashboard_module_is_warming(health_entries: &[Value], module: &Value) -> bool
 }
 
 fn print_static_domains() {
-    const BUILTIN_DOMAINS: [&str; 5] = ["module", "routes", "health", "quota", "daemon"];
+    const BUILTIN_DOMAINS: [&str; 7] = [
+        "setup", "upgrade", "module", "health", "routes", "quota", "daemon",
+    ];
     let mut domains = BUILTIN_DOMAINS
         .iter()
         .map(|domain| (*domain).to_string())
@@ -770,11 +802,7 @@ fn print_static_domains() {
             domains.push(external.name);
         }
     }
-    println!("\ndomains:\n  {}", domains.join("  "));
-}
-
-fn short_build_sha(sha: &str) -> String {
-    sha.chars().take(8).collect()
+    println!("\ncommands: {}", domains.join(" · "));
 }
 
 /// Lifecycle mutations identify the executable inode, not argv[0]: a shell
@@ -848,13 +876,16 @@ fn display_home_path(path: &Path) -> String {
 /// result is cached, but a changed executable gets a new stamp and is probed
 /// again before it can receive operator input.
 fn dispatch_external(domain: &str, tail: &[OsString]) -> Result<(), CkError> {
-    let module_names = module_binary_names();
+    let module_ids = module_command_ids();
     let candidate = external_domain_candidates().remove(domain);
     let Some(candidate) = candidate else {
-        return if module_names.contains(domain) {
-            Err(CkError::ModuleNotCommand(domain.to_string()))
+        return if let Some(module_id) = module_ids.get(domain) {
+            Err(CkError::ModuleNotCommand {
+                command: domain.to_string(),
+                module_id: module_id.clone(),
+            })
         } else {
-            Err(CkError::Usage(format!(
+            Err(CkError::Message(format!(
                 "unknown command '{domain}'. Run ck --help."
             )))
         };
@@ -871,10 +902,13 @@ fn dispatch_external(domain: &str, tail: &[OsString]) -> Result<(), CkError> {
             })?;
         process::exit(status.code().unwrap_or(1));
     }
-    if module_names.contains(domain) {
-        return Err(CkError::ModuleNotCommand(domain.to_string()));
+    if let Some(module_id) = module_ids.get(domain) {
+        return Err(CkError::ModuleNotCommand {
+            command: domain.to_string(),
+            module_id: module_id.clone(),
+        });
     }
-    Err(CkError::Usage(format!(
+    Err(CkError::Message(format!(
         "unknown command '{domain}'. Run ck --help."
     )))
 }
@@ -883,6 +917,7 @@ struct CkArgs {
     program: PathBuf,
     subc: Option<PathBuf>,
     json: bool,
+    verbose: bool,
     command: Command,
 }
 
@@ -1174,6 +1209,7 @@ impl CkClient {
 async fn module_list(
     client: &mut CkClient,
     json_output: bool,
+    verbose: bool,
     subc: Option<&Path>,
 ) -> Result<(), CkError> {
     let value = supervisor_list(client).await?;
@@ -1182,7 +1218,7 @@ async fn module_list(
     } else {
         let modules = modules_array(&value);
         if modules.is_empty() {
-            println!("(no supervised modules)");
+            println!("no supervised modules");
             let footer = [next_step(
                 "ck module rescan",
                 "to reconcile configured modules",
@@ -1190,13 +1226,7 @@ async fn module_list(
             )];
             print_help_footer(&footer);
         } else {
-            print_module_table(modules);
-            let footer = [next_step(
-                "ck module status <id>",
-                "for one module's supervision state",
-                subc,
-            )];
-            print_help_footer(&footer);
+            print_module_table(modules, verbose);
         }
     }
     Ok(())
@@ -1206,11 +1236,20 @@ async fn module_status(
     client: &mut CkClient,
     module_id: &str,
     json_output: bool,
+    verbose: bool,
 ) -> Result<(), CkError> {
     let list = supervisor_list(client).await?;
-    let module = find_module(&list, module_id)
-        .cloned()
-        .ok_or_else(|| CkError::Rejected(format!("module_id '{module_id}' is not supervised")))?;
+    let Some(module) = find_module(&list, module_id).cloned() else {
+        return if json_output {
+            Err(CkError::Rejected(format!(
+                "module_id '{module_id}' is not supervised"
+            )))
+        } else {
+            Err(CkError::Rejected(format!(
+                "no module named '{module_id}'. Run ck module list."
+            )))
+        };
+    };
     let health = supervisor_health(client).await?;
     let health_entry = find_module(&health, module_id).cloned();
     let describe = client
@@ -1221,7 +1260,21 @@ async fn module_status(
     if json_output {
         print_json(&json!({ "module": module, "health": health_entry }))?;
     } else {
-        print_status_table(&module, health_entry.as_ref(), frame_drops);
+        let provenance = client
+            .rpc_value(ClientControlRequest::SupervisorProvenance {
+                module_id: Some(module_id.to_string()),
+            })
+            .await?;
+        let observed = modules_array(&provenance)
+            .first()
+            .and_then(|entry| entry.get("daemon_observed"));
+        print_status_table(
+            &module,
+            health_entry.as_ref(),
+            frame_drops,
+            observed,
+            verbose,
+        );
     }
     Ok(())
 }
@@ -1410,6 +1463,7 @@ async fn module_terminals(
     client: &mut CkClient,
     module_id: &str,
     json_output: bool,
+    verbose: bool,
 ) -> Result<(), CkError> {
     let response = client
         .rpc_value(ClientControlRequest::SupervisorTerminals {
@@ -1422,40 +1476,44 @@ async fn module_terminals(
         return Ok(());
     }
 
-    let daemon_started_at_ms = response
-        .get("daemon_started_at_ms")
-        .and_then(Value::as_u64)
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "unknown".to_string());
+    let daemon_started_at_ms = response.get("daemon_started_at_ms").and_then(Value::as_u64);
     let dropped = response.get("dropped").and_then(Value::as_u64).unwrap_or(0);
     let entries = response
         .get("entries")
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    println!(
-        "daemon_started_at_ms={daemon_started_at_ms} · {} terminal record(s) · {dropped} dropped",
-        entries.len()
-    );
-    for entry in entries {
-        let at_ms = entry.get("at_ms").and_then(Value::as_u64).unwrap_or(0);
-        let disposition = entry
-            .get("disposition")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown");
-        let exit_kind = entry
-            .get("exit_kind")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown");
-        let exit = match (
-            entry.get("exit_signal").and_then(Value::as_i64),
-            entry.get("exit_code").and_then(Value::as_i64),
-        ) {
-            (Some(signal), _) => format!("signal {signal}"),
-            (None, Some(code)) => format!("code {code}"),
-            (None, None) => "unknown exit".to_string(),
-        };
-        println!("{at_ms} {exit} [{exit_kind}] → {disposition}");
+    if entries.is_empty() {
+        let started = daemon_started_at_ms
+            .map(format_age_from_epoch_ms_now)
+            .unwrap_or_else(|| "an unknown time ago".to_string());
+        println!("no exits recorded since the daemon started ({started})");
+    } else {
+        let rows = entries
+            .iter()
+            .map(|entry| {
+                let when = entry
+                    .get("at_ms")
+                    .and_then(Value::as_u64)
+                    .map(format_age_from_epoch_ms_now)
+                    .unwrap_or_else(|| "-".to_string());
+                let exit = format_exit(
+                    entry.get("exit_signal").and_then(Value::as_i64),
+                    entry.get("exit_code").and_then(Value::as_i64),
+                )
+                .unwrap_or_else(|| "unknown".to_string());
+                let disposition = entry
+                    .get("disposition")
+                    .and_then(Value::as_str)
+                    .map(humanize_identifier)
+                    .unwrap_or_else(|| "unknown".to_string());
+                vec![when, exit, disposition]
+            })
+            .collect();
+        print_table(&["when", "exit", "disposition"], rows);
+    }
+    if verbose && dropped > 0 {
+        println!("{dropped} earlier exits were dropped from the daemon's retained history");
     }
     Ok(())
 }
@@ -1557,7 +1615,6 @@ async fn supervisor_routes(
     client: &mut CkClient,
     module_id: Option<&str>,
     json_output: bool,
-    subc: Option<&Path>,
 ) -> Result<(), CkError> {
     let response = client
         .rpc_value(ClientControlRequest::SupervisorRoutes {
@@ -1594,24 +1651,22 @@ async fn supervisor_routes(
                         .get("connection_id")
                         .and_then(Value::as_u64)
                         .map(|id| format!("connection {id}"))
-                        .unwrap_or_else(|| "connection unavailable".to_string())
+                        .unwrap_or_else(|| "connection unknown".to_string())
                 ),
-                None => "direct (connection unavailable)".to_string(),
+                None => "direct (connection unknown)".to_string(),
             };
             let age = route
                 .get("age_ms")
                 .and_then(Value::as_u64)
                 .map(|age| format_duration(Duration::from_millis(age)))
-                .unwrap_or_else(|| "?".to_string());
+                .unwrap_or_else(|| "-".to_string());
             let state = if route
                 .get("draining")
                 .and_then(Value::as_bool)
                 .unwrap_or(false)
             {
-                // Name the WHY when the daemon serves it. An older daemon omits
-                // the reason; bare "draining" stays honest rather than guessing.
                 match route.get("drain_reason").and_then(Value::as_str) {
-                    Some(reason) => format!("draining({reason})"),
+                    Some(reason) => format!("draining ({})", humanize_identifier(reason)),
                     None => "draining".to_string(),
                 }
             } else {
@@ -1622,15 +1677,9 @@ async fn supervisor_routes(
     }
 
     if rows.is_empty() {
-        println!("(no live routes)");
-        let footer = [next_step(
-            "ck module list",
-            "to check which modules can own routes",
-            subc,
-        )];
-        print_help_footer(&footer);
+        println!("no live routes");
     } else {
-        print_table(&["MODULE", "CONSUMER", "AGE", "STATE"], rows);
+        print_table(&["module", "consumer", "age", "state"], rows);
     }
     Ok(())
 }
@@ -1639,6 +1688,7 @@ async fn provenance(
     client: &mut CkClient,
     module_id: &str,
     json_output: bool,
+    verbose: bool,
 ) -> Result<(), CkError> {
     let response = client
         .rpc_value(ClientControlRequest::SupervisorProvenance {
@@ -1657,73 +1707,79 @@ async fn provenance(
         .first()
         .ok_or_else(|| CkError::Message("provenance response omitted module".to_string()))?;
 
-    println!("DAEMON BUILD");
+    println!("Daemon build");
     let daemon_build = daemon.get("daemon_build").unwrap_or(&Value::Null);
     println!(
-        "  COMMIT: {}",
+        "  commit: {}",
         provenance_value(daemon_build.get("build_git_sha"))
     );
     println!(
-        "  LOCK DIGEST: {}",
+        "  lock digest: {}",
         provenance_value(daemon_build.get("build_lock_digest"))
     );
-    println!("DAEMON-OBSERVED");
+    println!("Daemon observed");
     let daemon_observed = daemon.get("daemon_observed").unwrap_or(&Value::Null);
-    println!("  PID: {}", provenance_value(daemon_observed.get("pid")));
+    println!("  pid: {}", provenance_value(daemon_observed.get("pid")));
     println!(
-        "  START TIME: {}",
-        provenance_value(daemon_observed.get("started_at_ms"))
+        "  started {}",
+        provenance_timestamp(daemon_observed.get("started_at_ms"))
     );
     println!(
-        "  RUNNING IMAGE: {}",
+        "  running image {}",
         provenance_image(daemon_observed.get("running_image"))
     );
+    if verbose {
+        print_running_image_evidence(daemon_observed.get("running_image"), 2);
+    }
 
-    println!("MODULE: {}", provenance_value(module.get("module_id")));
-    println!("MODULE-DECLARED");
+    println!("Module: {}", provenance_value(module.get("module_id")));
+    println!("Module declared");
     match module.get("module_declared") {
         Some(declared) if declared.get("status").and_then(Value::as_str) == Some("reported") => {
             let build = declared.get("build").unwrap_or(&Value::Null);
             let commit = build.get("build_git_sha");
-            println!("  COMMIT: {}", provenance_value(commit));
+            println!("  commit: {}", provenance_value(commit));
             if commit
                 .and_then(Value::as_str)
                 .is_some_and(|value| value.ends_with("-dirty"))
             {
-                println!("  STATUS: commit match only");
+                println!("  status: commit match only");
             }
             let lock = build.get("build_lock_digest");
-            println!("  LOCK DIGEST: {}", provenance_value(lock));
+            println!("  lock digest: {}", provenance_value(lock));
             if commit.is_none() && lock.is_some() {
-                println!("  STATUS: change-detectable; commit identity unavailable");
+                println!("  status: change-detectable; commit identity unavailable");
             }
             println!(
-                "  WIRE CRATE VERSION: {}",
+                "  wire crate version: {}",
                 provenance_value(build.get("wire_crate_version"))
             );
             println!(
-                "  STORE SCHEMA VERSION: {}",
+                "  store schema version: {}",
                 provenance_value(build.get("store_schema_version"))
             );
         }
         _ => println!("  unverifiable"),
     }
 
-    println!("DAEMON-OBSERVED");
+    println!("Daemon observed");
     let observed = module.get("daemon_observed").unwrap_or(&Value::Null);
-    println!("  PID: {}", provenance_value(observed.get("pid")));
+    println!("  pid: {}", provenance_value(observed.get("pid")));
     println!(
-        "  SPAWN TIME: {}",
-        provenance_value(observed.get("spawned_at_ms"))
+        "  started {}",
+        provenance_timestamp(observed.get("spawned_at_ms"))
     );
     println!(
-        "  SPAWNED-FROM: {}",
+        "  spawned from: {}",
         provenance_value(observed.get("spawned_from"))
     );
     println!(
-        "  RUNNING IMAGE: {}",
+        "  running image {}",
         provenance_image(observed.get("running_image"))
     );
+    if verbose {
+        print_running_image_evidence(observed.get("running_image"), 2);
+    }
     Ok(())
 }
 
@@ -1737,38 +1793,54 @@ fn provenance_value(value: Option<&Value>) -> String {
             })
             .collect(),
         Some(Value::Number(value)) => value.to_string(),
-        Some(Value::Bool(value)) => value.to_string(),
-        _ => "unavailable".to_string(),
+        Some(Value::Bool(true)) => "enabled".to_string(),
+        Some(Value::Bool(false)) => "disabled".to_string(),
+        _ => "none".to_string(),
     }
 }
 
 fn provenance_image(value: Option<&Value>) -> String {
     let Some(value) = value else {
-        return "unavailable".to_string();
+        return "is unknown".to_string();
     };
     let status = value
         .get("status")
         .and_then(Value::as_str)
-        .unwrap_or("unavailable");
+        .unwrap_or("unknown");
     match status {
-        "match" => format!(
-            "match ({})",
-            provenance_value(
-                value
-                    .get("evidence")
-                    .and_then(|evidence| evidence.get("method"))
-            )
+        "match" => "matches the file it was spawned from".to_string(),
+        "mismatch" => "differs from the file it was spawned from (running vs disk)".to_string(),
+        "unavailable" => format!(
+            "could not be compared with the file it was spawned from ({})",
+            provenance_value(value.get("reason"))
         ),
-        "mismatch" => "mismatch (running vs disk)".to_string(),
-        "unavailable" => format!("unavailable ({})", provenance_value(value.get("reason"))),
         other => {
             let tag = provenance_value(Some(&Value::String(other.to_string())));
             let body = serde_json::to_string(value)
                 .map(|body| provenance_value(Some(&Value::String(body))))
-                .unwrap_or_else(|_| "unavailable".to_string());
-            format!("unknown ({tag}; body={body})")
+                .unwrap_or_else(|_| "none".to_string());
+            format!("has unknown status ({tag}; body={body})")
         }
     }
+}
+
+fn print_running_image_evidence(image: Option<&Value>, depth: usize) {
+    let Some(image) = image else {
+        return;
+    };
+    for key in ["evidence", "running", "disk"] {
+        if let Some(value) = image.get(key) {
+            println!("{}{}:", "  ".repeat(depth), humanize_identifier(key));
+            print_metrics_tree(value, depth + 1);
+        }
+    }
+}
+
+fn provenance_timestamp(value: Option<&Value>) -> String {
+    value
+        .and_then(Value::as_u64)
+        .map(format_age_from_epoch_ms_now)
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 async fn print_ack_with_state(
@@ -1826,26 +1898,33 @@ async fn print_ack_with_state(
 async fn health(
     client: &mut CkClient,
     json_output: bool,
+    verbose: bool,
     subc: Option<&Path>,
 ) -> Result<(), CkError> {
     let value = supervisor_health(client).await?;
     if json_output {
         print_json(&value)?;
     } else {
-        print_health_table(modules_array(&value), subc);
+        print_health_table(modules_array(&value), verbose, subc);
     }
     Ok(())
 }
 
-/// `ck health <id>` — issue a FRESH health.check to the module (via the
-/// daemon's supervisor.health_probe one-shot) and render the full report.
-/// The probe path carries the module's complete metrics object; nothing
-/// passes through the supervisor's cached-status blob or its size cap.
 async fn health_detail(
     client: &mut CkClient,
     module_id: &str,
     json_output: bool,
+    verbose: bool,
 ) -> Result<(), CkError> {
+    if !json_output {
+        let modules = supervisor_list(client).await?;
+        if find_module(&modules, module_id).is_none() {
+            return Err(CkError::Rejected(format!(
+                "no module named '{module_id}'. Run ck module list."
+            )));
+        }
+    }
+
     let value = client
         .rpc_value(ClientControlRequest::SupervisorHealthProbe {
             module_id: module_id.to_string(),
@@ -1855,23 +1934,19 @@ async fn health_detail(
         print_json(&value)?;
         return Ok(());
     }
-    let status = value.get("status").and_then(Value::as_str).unwrap_or("?");
+    let status = value
+        .get("status")
+        .and_then(Value::as_str)
+        .map(human_health_status)
+        .unwrap_or_else(|| "unknown".to_string());
     println!("{module_id}: {status}");
-    if let Some(detail) = value.get("detail").and_then(Value::as_str) {
-        if !detail.is_empty() {
-            println!("  {detail}");
-        }
+    if let Some(detail) = health_operator_detail(&value) {
+        println!("  {detail}");
     }
-    // Say so when a module published nothing, rather than printing a bare
-    // status line. The operator ran this verb to see metrics, so silence is
-    // read as "nothing to report" when it is equally the shape of a module
-    // that publishes no metrics at all and of a reporting path that regressed.
-    // Naming the absence does not distinguish those two, but it stops the
-    // third reading -- that metrics were seen and were unremarkable -- which
-    // is the one a bare `module: ok` invites.
     match value.get("metrics") {
-        Some(metrics) if !metrics.is_null() => print_metrics_tree(metrics, 1),
-        _ => println!("  (module published no metrics on this probe)"),
+        Some(metrics) if !metrics.is_null() && verbose => print_metrics_tree(metrics, 1),
+        Some(metrics) if !metrics.is_null() => print_headline_metrics(metrics, 1),
+        _ => println!("  metrics: none"),
     }
     Ok(())
 }
@@ -1911,12 +1986,12 @@ fn print_metrics_entry(key: &str, child: &Value, depth: usize) {
                 print_metrics_tree(child, depth + 1);
             }
         }
-        Value::Array(items) if items.is_empty() => println!("{indent}{key}: []"),
+        Value::Array(items) if items.is_empty() => println!("{indent}{key}: none"),
         Value::Array(_) => {
             println!("{indent}{key}:");
             print_metrics_tree(child, depth + 1);
         }
-        other => println!("{indent}{key}: {}", scalar_text(other)),
+        other => println!("{indent}{key}: {}", format_metric_value(key, other)),
     }
 }
 
@@ -1949,30 +2024,123 @@ fn print_metrics_array_item(item: &Value, depth: usize) {
     }
 }
 
-/// Collapse an all-scalar object onto one line when it stays short:
-/// `bash: pending_completions=0 · running=0`. Anything nested or long
-/// keeps the tree form.
 fn inline_scalar_object(map: &serde_json::Map<String, Value>) -> Option<String> {
     if map.is_empty() {
-        return Some("{}".to_string());
+        return Some("none".to_string());
     }
     let mut parts = Vec::with_capacity(map.len());
     for (key, value) in map {
         match value {
             Value::Object(_) | Value::Array(_) => return None,
-            other => parts.push(format!("{key}={}", scalar_text(other))),
+            other => parts.push(format!("{key}={}", format_metric_value(key, other))),
         }
     }
     let line = parts.join(" · ");
     (line.chars().count() <= 88).then_some(line)
 }
 
-/// Scalar leaf rendering: strings unquoted (these are human-facing labels
-/// and paths, not re-parseable JSON — `--json` serves that need).
 fn scalar_text(value: &Value) -> String {
     match value {
-        Value::String(s) => s.clone(),
+        Value::Null => "none".to_string(),
+        Value::String(value) if value.is_empty() => "none".to_string(),
+        Value::String(value) => value.clone(),
+        Value::Bool(true) => "enabled".to_string(),
+        Value::Bool(false) => "disabled".to_string(),
         other => other.to_string(),
+    }
+}
+
+fn print_headline_metrics(metrics: &Value, depth: usize) {
+    let Some(map) = metrics.as_object() else {
+        print_metrics_tree(metrics, depth);
+        return;
+    };
+    let marked = map
+        .get("headline")
+        .or_else(|| map.get("_headline"))
+        .and_then(Value::as_array)
+        .map(|keys| keys.iter().filter_map(Value::as_str).collect::<Vec<_>>());
+    let entries = match marked {
+        Some(keys) => keys
+            .into_iter()
+            .filter_map(|key| map.get(key).map(|value| (key, value)))
+            .collect::<Vec<_>>(),
+        None => map
+            .iter()
+            .filter(|(_, value)| !value.is_array() && !value.is_object())
+            .map(|(key, value)| (key.as_str(), value))
+            .collect::<Vec<_>>(),
+    };
+    if entries.is_empty() {
+        println!("{}metrics: none", "  ".repeat(depth));
+        return;
+    }
+    for (key, value) in entries {
+        print_metrics_entry(key, value, depth);
+    }
+}
+
+fn format_metric_value(key: &str, value: &Value) -> String {
+    match value {
+        Value::Number(number) => {
+            let normalized = key.to_ascii_lowercase();
+            if normalized.contains("bytes") {
+                return number
+                    .as_u64()
+                    .map(format_bytes)
+                    .unwrap_or_else(|| number.to_string());
+            }
+            if normalized.ends_with("age_ms") || normalized.ends_with("agems") {
+                return number
+                    .as_u64()
+                    .map(format_milliseconds)
+                    .unwrap_or_else(|| number.to_string());
+            }
+            if normalized.ends_with("age_secs") || normalized.ends_with("agesecs") {
+                return number
+                    .as_u64()
+                    .map(format_age_seconds)
+                    .unwrap_or_else(|| number.to_string());
+            }
+            if normalized.ends_with("_ms") || normalized.ends_with("ms") {
+                return number.as_u64().map_or_else(
+                    || number.to_string(),
+                    |milliseconds| {
+                        if milliseconds >= 100_000_000_000 {
+                            format_age_from_epoch_ms_now(milliseconds)
+                        } else {
+                            format_milliseconds(milliseconds)
+                        }
+                    },
+                );
+            }
+            number.to_string()
+        }
+        other => scalar_text(other),
+    }
+}
+
+fn format_milliseconds(milliseconds: u64) -> String {
+    if milliseconds < 1_000 {
+        format!("{milliseconds} ms")
+    } else {
+        format_duration(Duration::from_millis(milliseconds))
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    const GIB: f64 = MIB * 1024.0;
+    let bytes_f64 = bytes as f64;
+    if bytes_f64 >= GIB {
+        format!("{:.1} GiB", bytes_f64 / GIB)
+    } else if bytes_f64 >= MIB {
+        format!("{:.1} MiB", bytes_f64 / MIB)
+    } else if bytes_f64 >= KIB {
+        format!("{:.1} KiB", bytes_f64 / KIB)
+    } else {
+        format!("{bytes} B")
     }
 }
 
@@ -2364,7 +2532,23 @@ fn triage_log_fact(path: &Path) -> Value {
 }
 
 fn print_daemon_triage(report: &TriageReport) {
+    let verdict = &report.json["verdict"];
+    let status = triage_string(verdict.get("status"));
+    let reason = triage_string(verdict.get("reason"));
+    let pid = report.json["process_liveness"]
+        .get("pid")
+        .and_then(Value::as_u64);
+    let verdict_line = match (status, pid) {
+        ("daemon-appears-live", Some(pid)) => {
+            format!("daemon appears live: connection file present, pid {pid} alive")
+        }
+        ("daemon-appears-down", _) => format!("daemon appears down: {reason}"),
+        ("daemon-state-ambiguous", _) => format!("daemon state ambiguous: {reason}"),
+        (_, _) => format!("{}: {reason}", humanize_identifier(status)),
+    };
+    println!("{verdict_line}");
     println!("{}", report.text.trim_end());
+
     let connection = &report.json["connection_file"];
     println!("start-lock:");
     for fact in report.json["start_lock"]["candidates"]
@@ -2372,54 +2556,26 @@ fn print_daemon_triage(report: &TriageReport) {
         .into_iter()
         .flatten()
     {
-        println!(
-            "  {}: {}",
-            triage_string(fact.get("path")),
-            triage_string(fact.get("status"))
-        );
-        if let Some(size) = fact.get("size_bytes") {
-            println!("    size: {size} bytes");
-        }
-        if let Some(mtime) = fact.get("mtime") {
-            println!("    mtime: {mtime}");
-        }
-        if let Some(finding) = fact.get("finding").and_then(Value::as_str) {
-            println!("    finding: {finding}");
-        }
+        print_triage_file_fact(fact, false);
     }
     println!("connection-file:");
     for fact in connection["candidates"].as_array().into_iter().flatten() {
-        println!(
-            "  {}: {}",
-            triage_string(fact.get("path")),
-            triage_string(fact.get("status"))
-        );
-        if let Some(size) = fact.get("size_bytes") {
-            println!("    size: {size} bytes");
-        }
-        if let Some(mtime) = fact.get("mtime") {
-            println!("    mtime: {mtime}");
-        }
-        if let Some(json_status) = fact.get("json") {
-            println!("    parses as JSON: {json_status}");
-        }
-        if let Some(finding) = fact.get("finding").and_then(Value::as_str) {
-            println!("    finding: {finding}");
-        }
-        if let Some(fields) = fact.get("fields") {
-            println!("    fields: {fields}");
-        }
+        print_triage_file_fact(fact, true);
     }
     if let Some(path) = connection.get("selected_path").and_then(Value::as_str) {
         println!("  selected: {path}");
         for field in ["port", "daemon_id", "wire_version"] {
             if let Some(value) = connection.get(field) {
-                println!("    {field}: {value}");
+                println!("    {field}: {}", scalar_text(value));
             }
         }
     }
+
     println!("process-liveness:");
-    println!("  {}", report.json["process_liveness"]);
+    println!(
+        "  {}",
+        triage_process_line(&report.json["process_liveness"])
+    );
     println!("log-tail:");
     let log = &report.json["log_tail"];
     println!(
@@ -2430,6 +2586,9 @@ fn print_daemon_triage(report: &TriageReport) {
     if let Some(finding) = log.get("finding").and_then(Value::as_str) {
         println!("  finding: {finding}");
     }
+    if let Some(skipped) = log.get("skipped").and_then(Value::as_str) {
+        println!("  skipped: {skipped}");
+    }
     if let Some(summary) = log.get("summary").and_then(Value::as_str) {
         println!("  {summary}");
     }
@@ -2438,47 +2597,130 @@ fn print_daemon_triage(report: &TriageReport) {
             println!("  {line}");
         }
     }
+}
+
+fn print_triage_file_fact(fact: &Value, include_connection_fields: bool) {
     println!(
-        "verdict: {} — {}",
-        triage_string(report.json["verdict"].get("status")),
-        triage_string(report.json["verdict"].get("reason"))
+        "  {}: {}",
+        triage_string(fact.get("path")),
+        triage_string(fact.get("status"))
     );
+    if let Some(size) = fact.get("size_bytes").and_then(Value::as_u64) {
+        println!("    size: {}", format_bytes(size));
+    }
+    if let Some(mtime) = fact.get("mtime") {
+        let rendered = mtime
+            .get("age_seconds")
+            .and_then(Value::as_u64)
+            .map(format_age_seconds)
+            .or_else(|| {
+                mtime
+                    .get("skipped")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| "unknown".to_string());
+        println!("    modified: {rendered}");
+    }
+    if let Some(json_status) = fact.get("json").and_then(Value::as_str) {
+        println!("    parses as JSON: {json_status}");
+    }
+    if include_connection_fields {
+        if let Some(fields) = fact.get("fields").and_then(Value::as_object) {
+            let rendered = ["daemon_id", "port", "wire_version"]
+                .iter()
+                .map(|field| {
+                    let field_value = fields.get(*field);
+                    let present = field_value
+                        .and_then(|value| value.get("present"))
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    let status = if present { "present" } else { "absent" };
+                    let value = field_value
+                        .and_then(|value| value.get("value"))
+                        .filter(|value| !value.is_boolean())
+                        .map(|value| format!(" ({})", scalar_text(value)))
+                        .unwrap_or_default();
+                    format!("{field} {status}{value}")
+                })
+                .collect::<Vec<_>>()
+                .join(" · ");
+            println!("    fields: {rendered}");
+        }
+    }
+    if let Some(finding) = fact.get("finding").and_then(Value::as_str) {
+        println!("    finding: {finding}");
+    }
+    if let Some(skipped) = fact.get("skipped").and_then(Value::as_str) {
+        println!("    skipped: {skipped}");
+    }
+}
+
+fn triage_process_line(process: &Value) -> String {
+    let status = process
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let pid = process
+        .get("pid")
+        .and_then(Value::as_u64)
+        .map(|pid| format!("pid {pid} "))
+        .unwrap_or_default();
+    let mut line = match status {
+        "live" => format!("{pid}alive"),
+        "dead" => format!("{pid}stopped"),
+        other => format!("{pid}{}", humanize_identifier(other)),
+    };
+    if let Some(executable) = process.get("executable").and_then(Value::as_object) {
+        let observed = executable
+            .get("observed")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let expected = executable
+            .get("expected")
+            .and_then(Value::as_str)
+            .unwrap_or(EXPECTED_DAEMON_BINARY);
+        let agreement = match executable.get("status").and_then(Value::as_str) {
+            Some("match") => "matches",
+            Some("mismatch") => "differs from",
+            Some("not-running") => "was expected to be",
+            _ => "could not be compared with",
+        };
+        line.push_str(&format!("; executable {observed} {agreement} {expected}"));
+    }
+    if let Some(skipped) = process.get("skipped").and_then(Value::as_str) {
+        line.push_str(&format!("; {skipped}"));
+    }
+    line
 }
 
 fn triage_string(value: Option<&Value>) -> &str {
     value.and_then(Value::as_str).unwrap_or("-")
 }
 
-async fn daemon(client: &mut CkClient, json_output: bool) -> Result<(), CkError> {
-    let connected_clients = client
+async fn daemon(client: &mut CkClient, json_output: bool, verbose: bool) -> Result<(), CkError> {
+    let describe = client
         .rpc_value(ClientControlRequest::ServerDescribe {})
         .await?;
     if json_output {
-        print_json(&connected_clients)?;
-    } else {
-        let uptime = connection_file_age(&client.path)
-            .map(format_duration)
-            .unwrap_or_else(|| "-".to_string());
-        let protocol = display_field(&connected_clients, "protocol_ver");
-        let clients = display_field(&connected_clients, "connected_clients");
-        print_table(
-            &[
-                "daemon_ver",
-                "protocol",
-                "pid",
-                "connected_clients",
-                "uptime",
-            ],
-            vec![vec![
-                client.info.daemon_ver.clone(),
-                protocol,
-                client.info.pid.to_string(),
-                clients,
-                uptime,
-            ]],
-        );
-        print_build_skew(&connected_clients);
-        if let Some(counters) = connected_clients.get("counters").and_then(Value::as_object) {
+        print_json(&describe)?;
+        return Ok(());
+    }
+
+    let uptime = connection_file_age(&client.path)
+        .map(format_duration)
+        .unwrap_or_else(|| "-".to_string());
+    let clients = display_field(&describe, "connected_clients");
+    println!(
+        "daemon {} · pid {} · up {uptime} · {clients} clients · {}",
+        client.info.daemon_ver,
+        client.info.pid,
+        daemon_frame_drop_summary(&describe)
+    );
+    print_build_skew(&describe);
+    if verbose {
+        println!("protocol: {}", display_field(&describe, "protocol_ver"));
+        if let Some(counters) = describe.get("counters").and_then(Value::as_object) {
             let mut rows = counters
                 .iter()
                 .map(|(name, value)| vec![name.clone(), display_json_value(value)])
@@ -2488,6 +2730,35 @@ async fn daemon(client: &mut CkClient, json_output: bool) -> Result<(), CkError>
         }
     }
     Ok(())
+}
+
+fn daemon_frame_drop_summary(describe: &Value) -> String {
+    let drops = describe
+        .get("counters")
+        .and_then(|counters| counters.get("module_frames_dropped_no_route_last_10m"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if drops == 0 {
+        return "no frame drops in the last 10 minutes".to_string();
+    }
+    let top = describe
+        .get("counters")
+        .and_then(|counters| counters.get("module_frames_dropped_no_route_by_module"))
+        .and_then(Value::as_object)
+        .and_then(|modules| {
+            modules
+                .iter()
+                .filter_map(|(module_id, count)| count.as_u64().map(|count| (module_id, count)))
+                .max_by(|(left_id, left_count), (right_id, right_count)| {
+                    left_count
+                        .cmp(right_count)
+                        .then_with(|| right_id.cmp(left_id))
+                })
+                .map(|(module_id, _)| module_id.as_str())
+        })
+        .unwrap_or("unknown");
+    let noun = if drops == 1 { "drop" } else { "drops" };
+    format!("{drops} frame {noun} in the last 10 minutes, top: {top}")
 }
 
 /// Compare the daemon's embedded build provenance against this CLI's own.
@@ -2514,13 +2785,6 @@ fn print_build_skew(describe: &Value) {
             println!(
                 "build skew: this ck build recorded no commit (daemon {sha:.12}); unverifiable"
             );
-        }
-        // A -dirty build embeds HEAD while running code that differs from it,
-        // so equality of two dirty identities proves the STARTING commit
-        // matched and nothing about the code. Say so instead of staying
-        // silent: silence here is the match signal.
-        Some(sha) if sha == cli_sha && sha.ends_with("-dirty") => {
-            println!("build skew: both built from {sha:.12} with uncommitted changes; commit match only, code match unproven");
         }
         Some(sha) if sha == cli_sha => {}
         Some(sha) => {
@@ -2784,6 +3048,17 @@ fn quota_entries_for_table<'a>(
         .collect()
 }
 
+fn quota_entry_not_running_locally(entry: &Value) -> bool {
+    entry.get("errorClass").and_then(Value::as_str) == Some("local_source_unavailable")
+        || entry
+            .get("error")
+            .and_then(Value::as_str)
+            .is_some_and(|error| {
+                error.contains("no Antigravity language server")
+                    || error.contains("no local provider process")
+            })
+}
+
 fn print_quota_table(
     providers: &[Value],
     filter: Option<&str>,
@@ -2806,15 +3081,12 @@ fn print_quota_table(
         grouped.entry(id).or_default().push(entry);
     }
 
-    println!("{}", bold_text("Usage", color_enabled));
-
     // An empty provider array is never "nothing configured": a host with no
     // usable credentials still returns a full array of unavailable entries, so
     // the only way to reach zero is a cold module or a structural failure
     // upstream. Saying so beats printing a bare header that reads as "all
     // quiet".
     if order.is_empty() {
-        println!();
         let reason = quota_empty_reason(providers.is_empty(), filter.is_some());
         println!("{}", dim_text(reason, color_enabled));
         let next_step = if providers.is_empty() {
@@ -2836,7 +3108,12 @@ fn print_quota_table(
         return;
     }
 
+    let mut first_provider = true;
     for id in order {
+        if !first_provider {
+            println!();
+        }
+        first_provider = false;
         let group = &grouped[&id];
         let connected: Vec<&&Value> = group
             .iter()
@@ -2847,7 +3124,17 @@ fn print_quota_table(
         } else {
             "accounts"
         };
-        println!();
+        if group
+            .iter()
+            .all(|entry| quota_entry_not_running_locally(entry))
+        {
+            println!(
+                "{} {}",
+                color_text(&format_provider_display_name(&id), "1;36", color_enabled),
+                dim_text("— not running locally", color_enabled)
+            );
+            continue;
+        }
         println!(
             "{} {}",
             color_text(&format_provider_display_name(&id), "1;36", color_enabled),
@@ -2908,10 +3195,7 @@ fn print_quota_table(
             println!();
             println!(
                 "{}",
-                dim_text(
-                    &format!("{inert} providers not connected (--verbose to list)"),
-                    color_enabled
-                )
+                dim_text(&format!("{inert} providers not configured"), color_enabled)
             );
         }
     }
@@ -3762,23 +4046,121 @@ fn month_abbr(month: u32) -> &'static str {
     }
 }
 
-fn print_module_table(modules: &[Value]) {
+fn print_module_table(modules: &[Value], verbose: bool) {
+    if verbose {
+        let rows = modules
+            .iter()
+            .map(|module| {
+                vec![
+                    display_field(module, "module_id"),
+                    display_field(module, "state"),
+                    enabled_word(module.get("enabled").and_then(Value::as_bool)),
+                    running_word(module.get("live").and_then(Value::as_bool)),
+                    human_health_status(&display_field(module, "health")),
+                ]
+            })
+            .collect::<Vec<_>>();
+        print_table(&["module", "state", "enabled", "live", "health"], rows);
+        return;
+    }
+
     let rows = modules
         .iter()
         .map(|module| {
             vec![
                 display_field(module, "module_id"),
-                display_field(module, "state"),
-                display_field(module, "enabled"),
-                display_field(module, "live"),
-                display_field(module, "health"),
+                module_status_text(module),
+                human_health_status(&display_field(module, "health")),
             ]
         })
         .collect::<Vec<_>>();
-    print_table(&["id", "state", "enabled", "live", "health"], rows);
+    print_table(&["module", "status", "health"], rows);
 }
 
 fn print_rescan_table(result: &Value) {
+    let preview = result
+        .get("preview")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if !preview {
+        print_applied_rescan_table(result);
+        return;
+    }
+
+    let module_ids = |field: &str| {
+        result
+            .get(field)
+            .and_then(Value::as_array)
+            .map(|ids| {
+                ids.iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .filter(|ids| !ids.is_empty())
+    };
+    let added = module_ids("added");
+    let removed = module_ids("removed");
+    let changed = module_ids("changed_pending_reload");
+    let enabled = module_ids("enabled_changes");
+    let restart_required = module_ids("restart_required");
+    let warnings = result
+        .get("capability_warnings")
+        .and_then(Value::as_array)
+        .map(|items| items.iter().filter_map(Value::as_str).collect::<Vec<_>>())
+        .unwrap_or_default();
+
+    if added.is_none()
+        && removed.is_none()
+        && changed.is_none()
+        && enabled.is_none()
+        && restart_required.is_none()
+        && warnings.is_empty()
+    {
+        let unchanged = result.get("unchanged").and_then(Value::as_u64).unwrap_or(0);
+        println!("no changes: {unchanged} modules match subc.jsonc");
+        return;
+    }
+
+    if let Some(ids) = added {
+        println!("{}: {ids}", if preview { "would add" } else { "added" });
+    }
+    if let Some(ids) = removed {
+        println!(
+            "{}: {ids}",
+            if preview { "would remove" } else { "removed" }
+        );
+    }
+    if let Some(ids) = changed {
+        println!(
+            "{}: {ids}",
+            if preview {
+                "would restart"
+            } else {
+                "restarted"
+            }
+        );
+    }
+    if let Some(ids) = enabled {
+        println!(
+            "{}: {ids}",
+            if preview {
+                "would change enabled state"
+            } else {
+                "changed enabled state"
+            }
+        );
+    }
+    if let Some(sections) = restart_required {
+        println!("needs daemon restart: {sections}");
+        println!("ignored sections: {sections}");
+    }
+    for warning in warnings {
+        println!("warning: {warning}");
+    }
+}
+
+fn print_applied_rescan_table(result: &Value) {
     let module_ids = |field: &str| {
         result
             .get(field)
@@ -3810,90 +4192,189 @@ fn print_rescan_table(result: &Value) {
         ],
     ];
     print_table(&["change", "modules / count"], rows);
-
-    // Say which operation this was. Without it the CLI reproduces the defect the
-    // preview exists to fix: a table of changes that cannot tell the reader
-    // whether they HAPPENED. The line goes after the table so it is the last thing
-    // read, and it names the applying command so the next step is not a guess.
-    if result
-        .get("preview")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
-        println!("\npreview only — nothing was changed. Run `ck module rescan` to apply.");
-    }
-
     if let Some(warnings) = result.get("capability_warnings").and_then(Value::as_array) {
         for warning in warnings.iter().filter_map(Value::as_str) {
-            println!("{warning}");
+            println!("warning: {warning}");
         }
     }
-
-    // Sections rescan cannot apply. Printed AFTER the change table and the
-    // preview line, so it is the last thing on screen: it is the only part of
-    // this output that requires a further action, and a module whose config did
-    // not take crash-loops rather than failing visibly.
     let restart_required = module_ids("restart_required");
     if restart_required != "-" {
-        println!(
-            "\nRESTART REQUIRED — these config sections changed and rescan cannot apply them: {restart_required}\n\
-             Modules depending on them keep running their old config until the daemon restarts."
-        );
+        println!("needs daemon restart: {restart_required}");
     }
 }
 
-fn print_status_table(module: &Value, health: Option<&Value>, frame_drops: Option<u64>) {
+fn print_status_table(
+    module: &Value,
+    health: Option<&Value>,
+    frame_drops: Option<u64>,
+    observed: Option<&Value>,
+    verbose: bool,
+) {
+    let module_id = display_field(module, "module_id");
     let health_status = health
         .map(|entry| display_field(entry, "status"))
         .filter(|value| value != "-")
         .unwrap_or_else(|| display_field(module, "health"));
-    let detail = append_frame_drop_detail(
-        health
-            .map(|entry| display_field(entry, "detail"))
-            .unwrap_or_else(|| "-".to_string()),
-        frame_drops,
+    println!(
+        "{module_id} — {}, {}",
+        module_status_text(module),
+        health_sentence_status(&health_status)
     );
-    let metrics = health
-        .and_then(|entry| entry.get("metrics"))
-        .map(display_json_value)
-        .unwrap_or_else(|| "-".to_string());
-    let failures = health
-        .map(|entry| display_field(entry, "consecutive_failures"))
-        .unwrap_or_else(|| "-".to_string());
-    let last_action = health
-        .map(|entry| display_field(entry, "last_action"))
-        .unwrap_or_else(|| "-".to_string());
-    let last_exit = format_last_exit(module);
-    let restarts = format_restart_budget(module);
 
-    print_table(
-        &[
-            "id",
-            "state",
-            "enabled",
-            "live",
-            "health",
-            "failures",
-            "restarts",
-            "last_action",
-            "last_exit",
-            "detail",
-            "metrics",
-        ],
-        vec![vec![
-            display_field(module, "module_id"),
-            display_field(module, "state"),
-            display_field(module, "enabled"),
-            display_field(module, "live"),
-            health_status,
-            failures,
-            restarts,
-            last_action,
-            last_exit,
-            detail,
-            truncate_cell(&metrics),
-        ]],
+    let pid = observed
+        .and_then(|value| value.get("pid"))
+        .map(display_json_value)
+        .unwrap_or_else(|| "none".to_string());
+    let started = observed
+        .and_then(|value| value.get("spawned_at_ms"))
+        .and_then(Value::as_u64)
+        .map(format_age_from_epoch_ms_now)
+        .unwrap_or_else(|| "unknown".to_string());
+    println!(
+        "  pid {pid} · started {started} · restarts {}",
+        format_restart_budget(module)
     );
+    println!("  last exit: {}", format_last_exit(module));
+
+    let binary = observed
+        .and_then(|value| value.get("spawned_from"))
+        .and_then(Value::as_str)
+        .map(|path| display_home_path(Path::new(path)))
+        .unwrap_or_else(|| "none".to_string());
+    let image = observed
+        .and_then(|value| value.get("running_image"))
+        .map(running_image_clause)
+        .unwrap_or_else(|| "running image status unknown".to_string());
+    println!("  binary: {binary} ({image})");
+    if health_status != "ok" {
+        if let Some(detail) = health.and_then(health_operator_detail) {
+            println!("  health: {detail}");
+        }
+    }
+
+    if verbose {
+        let failures = health
+            .and_then(|entry| entry.get("consecutive_failures"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let last_action = health
+            .and_then(|entry| entry.get("last_action"))
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(humanize_identifier)
+            .unwrap_or_else(|| "none".to_string());
+        let drops = frame_drops
+            .map(|count| count.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        println!(
+            "  supervision: {} · {} · {failures} consecutive failures · last action {last_action} · {drops} frame drops",
+            enabled_word(module.get("enabled").and_then(Value::as_bool)),
+            running_word(module.get("live").and_then(Value::as_bool)),
+        );
+        if health_status == "ok" {
+            if let Some(detail) = health.and_then(health_operator_detail) {
+                println!("  health: {detail}");
+            }
+        }
+        if let Some(metrics) = health.and_then(|entry| entry.get("metrics")) {
+            println!("  metrics:");
+            print_metrics_tree(metrics, 2);
+        }
+    }
+    println!("metrics: run `ck health {module_id}`");
+}
+
+fn module_status_text(module: &Value) -> String {
+    if module.get("enabled").and_then(Value::as_bool) == Some(false) {
+        return "stopped".to_string();
+    }
+    let state = module
+        .get("state")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    match state {
+        "disabled" | "stopped" => "stopped".to_string(),
+        "spawning" | "starting" => "starting".to_string(),
+        "restarting" => "restarting".to_string(),
+        "failed" => {
+            let mut detail = Vec::new();
+            if let Some(exit) = format_exit(
+                module.get("last_exit_signal").and_then(Value::as_i64),
+                module.get("last_exit_code").and_then(Value::as_i64),
+            ) {
+                detail.push(exit);
+            }
+            if let Some(restarts) = module.get("restart_count").and_then(Value::as_u64) {
+                let noun = if restarts == 1 { "restart" } else { "restarts" };
+                detail.push(format!("{restarts} {noun}"));
+            }
+            if detail.is_empty() {
+                "failed".to_string()
+            } else {
+                format!("failed ({})", detail.join(", "))
+            }
+        }
+        "running" if module.get("live").and_then(Value::as_bool) == Some(false) => {
+            "starting".to_string()
+        }
+        other => humanize_identifier(other),
+    }
+}
+
+fn enabled_word(value: Option<bool>) -> String {
+    match value {
+        Some(true) => "enabled".to_string(),
+        Some(false) => "disabled".to_string(),
+        None => "-".to_string(),
+    }
+}
+
+fn running_word(value: Option<bool>) -> String {
+    match value {
+        Some(true) => "running".to_string(),
+        Some(false) => "stopped".to_string(),
+        None => "-".to_string(),
+    }
+}
+
+fn human_health_status(status: &str) -> String {
+    match status {
+        "failed" | "unresponsive" => "unhealthy".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn health_sentence_status(status: &str) -> String {
+    match status {
+        "ok" => "healthy".to_string(),
+        "failed" | "unresponsive" => "unhealthy".to_string(),
+        other => humanize_identifier(other),
+    }
+}
+
+fn running_image_clause(image: &Value) -> String {
+    match image.get("status").and_then(Value::as_str) {
+        Some("match") => "running image matches".to_string(),
+        Some("mismatch") => "running image differs: running vs disk".to_string(),
+        Some("unavailable") => format!(
+            "running image differs: {}",
+            provenance_value(image.get("reason"))
+        ),
+        Some(other) => format!("running image status {}", humanize_identifier(other)),
+        None => "running image status unknown".to_string(),
+    }
+}
+
+fn format_exit(signal: Option<i64>, code: Option<i64>) -> Option<String> {
+    match (signal, code) {
+        (Some(signal), _) => Some(format!("signal {signal}")),
+        (None, Some(code)) => Some(format!("exit {code}")),
+        (None, None) => None,
+    }
+}
+
+fn humanize_identifier(value: &str) -> String {
+    value.replace(['_', '-'], " ")
 }
 
 fn module_frame_drop_count(describe: &Value, module_id: &str) -> Option<u64> {
@@ -3907,26 +4388,6 @@ fn module_frame_drop_count(describe: &Value, module_id: &str) -> Option<u64> {
         .filter(|count| *count > 0)
 }
 
-/// Add daemon-owned frame-drop telemetry to the module's existing detail cell,
-/// where the owning operator already looks for module-specific diagnostics.
-fn append_frame_drop_detail(detail: String, frame_drops: Option<u64>) -> String {
-    match frame_drops {
-        Some(frame_drops) if detail == "-" => format!("frames_dropped_no_route: {frame_drops}"),
-        Some(frame_drops) => format!("{detail}; frames_dropped_no_route: {frame_drops}"),
-        None => detail,
-    }
-}
-
-/// Render the restart budget as `used/allowed`, e.g. `2/3`.
-///
-/// Shown next to `failures` because the two counters look interchangeable and
-/// are not: `failures` returns to zero on any successful probe, while this one
-/// only falls when an operator restarts, reloads, or re-enables the module.
-/// A module one restart from being disabled reports `failures 0`, and without
-/// this column nothing on the row says so.
-///
-/// `-` when the daemon predates the field: an older daemon reports nothing here,
-/// and printing `0/0` would assert a spent budget on a healthy module.
 fn format_restart_budget(module: &Value) -> String {
     match (
         module.get("restart_count").and_then(Value::as_u64),
@@ -3934,31 +4395,30 @@ fn format_restart_budget(module: &Value) -> String {
         module.get("lifetime_restarts").and_then(Value::as_u64),
     ) {
         (Some(used), Some(allowed), Some(lifetime)) if lifetime != used => {
-            format!("{used}/{allowed} ({lifetime} lifetime)")
+            format!("{used} of {allowed} ({lifetime} lifetime)")
         }
-        (Some(used), Some(allowed), _) => format!("{used}/{allowed}"),
-        _ => "-".to_string(),
+        (Some(used), Some(allowed), _) => format!("{used} of {allowed}"),
+        _ => "unknown".to_string(),
     }
 }
 
-/// Render the module's most recent process exit as a compact cell, e.g.
-/// `sig9` (SIGKILL), `code101` (panic-abort exit), or `-` when the module has
-/// never exited. Survives respawn, so a running module still shows what killed
-/// its previous incarnation — the signal that tells a crash-loop apart from a
-/// clean restart.
 fn format_last_exit(module: &Value) -> String {
-    let signal = module.get("last_exit_signal").and_then(Value::as_i64);
-    let code = module.get("last_exit_code").and_then(Value::as_i64);
-    match (signal, code) {
-        (Some(sig), _) => format!("sig{sig}"),
-        (None, Some(c)) => format!("code{c}"),
-        (None, None) => "-".to_string(),
+    let exit = format_exit(
+        module.get("last_exit_signal").and_then(Value::as_i64),
+        module.get("last_exit_code").and_then(Value::as_i64),
+    );
+    let Some(exit) = exit else {
+        return "none".to_string();
+    };
+    match module.get("last_exit_ms").and_then(Value::as_u64) {
+        Some(at_ms) => format!("{exit}, {}", format_age_from_epoch_ms_now(at_ms)),
+        None => exit,
     }
 }
 
-fn print_health_table(modules: &[Value], subc: Option<&Path>) {
+fn print_health_table(modules: &[Value], verbose: bool, subc: Option<&Path>) {
     if modules.is_empty() {
-        println!("(no supervised modules)");
+        println!("no supervised modules");
         let footer = [next_step(
             "ck module rescan",
             "to reconcile configured modules",
@@ -3967,152 +4427,96 @@ fn print_health_table(modules: &[Value], subc: Option<&Path>) {
         print_help_footer(&footer);
         return;
     }
-    let color = ansi_color_enabled();
-    let width = terminal_width();
 
     let id_width = modules
         .iter()
         .map(|module| display_field(module, "module_id").chars().count())
         .max()
-        .unwrap_or(0)
-        .max("module".len());
-    // id + gap + dot + status word + gap; detail wraps in the remainder.
-    let status_width = "unresponsive".len();
-    let detail_col = id_width + 2 + 2 + status_width + 2;
-    let detail_width = width.saturating_sub(detail_col).max(20);
+        .unwrap_or(0);
+    let status_width = modules
+        .iter()
+        .map(|module| {
+            human_health_status(&display_field(module, "status"))
+                .chars()
+                .count()
+        })
+        .max()
+        .unwrap_or(0);
 
     for module in modules {
         let id = display_field(module, "module_id");
-        let status = display_field(module, "status");
-        let failures = module
-            .get("consecutive_failures")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-        let last_action = display_field(module, "last_action");
-
-        let (dot_code, status_code) = match status.as_str() {
-            "ok" => ("32", "32"),
-            "degraded" => ("33", "33"),
-            "unresponsive" | "failed" => ("31", "1;31"),
-            _ => ("2", "2"),
-        };
-        let dot = color_text("●", dot_code, color);
-        let status_cell = color_text(&format!("{status:<status_width$}"), status_code, color);
-
-        // First line: id, status, and the start of the detail text.
-        let mut annotations = Vec::new();
-        if failures > 0 {
-            annotations.push(format!("{failures} missed probe(s)"));
-        }
-        if last_action != "-" {
-            annotations.push(format!("last action: {last_action}"));
-        }
-        // This whole table is the supervisor's STORED record, not a probe issued
-        // for the question -- so every status here describes some moment in the
-        // past. Age is what tells a reader whether that moment was before or
-        // after the restart they just performed: a pre-restart record reports the
-        // old process, reads as a failed deploy, and invites redeploying
-        // something already correct. Shown only past a minute, since a fresh
-        // record is the ordinary case and annotating it would train the reader to
-        // skip the line. `ck health <id>` needs none of this -- it probes.
-        if let Some(age_s) = health_record_age_secs(module) {
-            if age_s >= 60 {
-                annotations.push(format!(
+        let status = human_health_status(&display_field(module, "status"));
+        let mut details = health_operator_detail(module)
+            .into_iter()
+            .collect::<Vec<_>>();
+        if verbose {
+            let failures = module
+                .get("consecutive_failures")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            details.push(format!("{failures} consecutive failures"));
+            if let Some(action) = module
+                .get("last_action")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+            {
+                details.push(format!("last action {}", humanize_identifier(action)));
+            }
+            if let Some(age_s) = health_record_age_secs(module) {
+                details.push(format!(
                     "record {} old",
                     format_duration(Duration::from_secs(age_s))
                 ));
             }
         }
-        let detail = display_field(module, "detail");
-        let mut detail_text = if detail == "-" { String::new() } else { detail };
-        if !annotations.is_empty() {
-            let joined = annotations.join(" · ");
-            if detail_text.is_empty() {
-                detail_text = joined;
-            } else {
-                detail_text = format!("{detail_text} · {joined}");
-            }
-        }
-
-        let lines = wrap_text(&detail_text, detail_width);
-        let first = lines.first().map(String::as_str).unwrap_or("");
-        println!("{id:<id_width$}  {dot} {status_cell}  {first}");
-        for line in lines.iter().skip(1) {
-            println!("{:detail_col$}{line}", "");
-        }
+        let detail = if details.is_empty() {
+            "-".to_string()
+        } else {
+            details.join(" · ")
+        };
+        println!("{id:<id_width$}  {status:<status_width$}  {detail}");
     }
 }
 
-/// Best-effort terminal width: $COLUMNS, then the tty query, then 100.
-fn terminal_width() -> usize {
-    if let Some(cols) = env::var("COLUMNS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-    {
-        if cols >= 40 {
-            return cols;
-        }
+fn health_operator_detail(entry: &Value) -> Option<String> {
+    let metrics = entry.get("metrics").and_then(Value::as_object);
+    let degraded = metrics
+        .and_then(|metrics| metrics.get("degraded"))
+        .and_then(Value::as_array);
+    let unconfigured = metrics
+        .and_then(|metrics| metrics.get("unconfigured"))
+        .and_then(Value::as_array);
+    if degraded.is_some() || unconfigured.is_some() {
+        let degraded = degraded
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>();
+        let unconfigured_count = unconfigured.map(Vec::len).unwrap_or(0);
+        let provider = if degraded.len() == 1 {
+            "provider"
+        } else {
+            "providers"
+        };
+        let degraded_detail = if degraded.is_empty() {
+            "no providers degraded".to_string()
+        } else {
+            format!(
+                "{} {provider} degraded ({})",
+                degraded.len(),
+                degraded.join(", ")
+            )
+        };
+        return Some(format!(
+            "{degraded_detail}; {unconfigured_count} not configured"
+        ));
     }
-    if let Some((terminal_size::Width(cols), _)) = terminal_size::terminal_size() {
-        if cols >= 40 {
-            return usize::from(cols);
-        }
-    }
-    100
-}
 
-/// Greedy word wrap. Words longer than the width are hard-split so a single
-/// unbroken token (a path, a JSON fragment) cannot push past the margin.
-fn wrap_text(text: &str, width: usize) -> Vec<String> {
-    if text.is_empty() {
-        return Vec::new();
-    }
-    let mut lines = Vec::new();
-    let mut current = String::new();
-    let mut current_len = 0;
-    for word in text.split_whitespace() {
-        let word_len = word.chars().count();
-        if current_len > 0 && current_len + 1 + word_len > width {
-            lines.push(std::mem::take(&mut current));
-            current_len = 0;
-        }
-        if word_len > width {
-            let mut chars = word.chars().peekable();
-            while chars.peek().is_some() {
-                let take = if current_len > 0 {
-                    if current_len + 1 > width {
-                        lines.push(std::mem::take(&mut current));
-                        current_len = 0;
-                        width
-                    } else {
-                        current.push(' ');
-                        current_len += 1;
-                        width - current_len
-                    }
-                } else {
-                    width
-                };
-                let chunk: String = chars.by_ref().take(take.max(1)).collect();
-                current_len += chunk.chars().count();
-                current.push_str(&chunk);
-                if current_len >= width {
-                    lines.push(std::mem::take(&mut current));
-                    current_len = 0;
-                }
-            }
-            continue;
-        }
-        if current_len > 0 {
-            current.push(' ');
-            current_len += 1;
-        }
-        current.push_str(word);
-        current_len += word_len;
-    }
-    if !current.is_empty() {
-        lines.push(current);
-    }
-    lines
+    entry
+        .get("detail")
+        .and_then(Value::as_str)
+        .filter(|detail| !detail.is_empty())
+        .map(str::to_string)
 }
 
 /// Cap a table cell so one module's large opaque metrics blob cannot make the
@@ -4136,7 +4540,7 @@ fn print_help_footer<S: AsRef<str>>(lines: &[S]) {
     if count == 0 {
         return;
     }
-    println!("\nhelp[{count}]:");
+    println!("\nnext:");
     for line in lines.iter().take(count) {
         println!("  {}", line.as_ref());
     }
@@ -4269,6 +4673,35 @@ fn format_duration(duration: Duration) -> String {
         format!("{}h", secs / (60 * 60))
     } else {
         format!("{}d", secs / (60 * 60 * 24))
+    }
+}
+
+fn format_age_from_epoch_ms_now(timestamp_ms: u64) -> String {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(timestamp_ms);
+    format_age_from_epoch_ms(timestamp_ms, now_ms)
+}
+
+fn format_age_from_epoch_ms(timestamp_ms: u64, now_ms: u64) -> String {
+    if timestamp_ms > now_ms {
+        let seconds = (timestamp_ms - now_ms) / 1_000;
+        if seconds == 0 {
+            "just now".to_string()
+        } else {
+            format!("in {}", format_duration(Duration::from_secs(seconds)))
+        }
+    } else {
+        format_age_seconds((now_ms - timestamp_ms) / 1_000)
+    }
+}
+
+fn format_age_seconds(seconds: u64) -> String {
+    if seconds == 0 {
+        "just now".to_string()
+    } else {
+        format!("{} ago", format_duration(Duration::from_secs(seconds)))
     }
 }
 
@@ -4790,6 +5223,7 @@ fn parse_args(argv: impl IntoIterator<Item = OsString>) -> Result<CkArgs, CkErro
         .unwrap_or_else(|| PathBuf::from("ck"));
     let mut subc = None;
     let mut json = false;
+    let mut verbose = false;
 
     // Dispatcher-local flags are only parsed BEFORE the domain; everything from
     // the first positional on is the command tail (an unknown domain forwards it
@@ -4801,8 +5235,9 @@ fn parse_args(argv: impl IntoIterator<Item = OsString>) -> Result<CkArgs, CkErro
                     program,
                     subc,
                     json,
+                    verbose,
                     command: if json {
-                        Command::Help(top_help())
+                        Command::Help(top_help_json_compat())
                     } else {
                         Command::Dashboard
                     },
@@ -4812,11 +5247,13 @@ fn parse_args(argv: impl IntoIterator<Item = OsString>) -> Result<CkArgs, CkErro
                 subc = Some(PathBuf::from(take_value(&mut args, "--subc")?));
             }
             Some(arg) if arg == OsStr::new("--json") => json = true,
+            Some(arg) if arg == OsStr::new("--verbose") => verbose = true,
             Some(arg) if arg == OsStr::new("-h") || arg == OsStr::new("--help") => {
                 return Ok(CkArgs {
                     program: program.clone(),
                     subc,
                     json,
+                    verbose,
                     command: Command::Help(top_help()),
                 })
             }
@@ -4825,6 +5262,7 @@ fn parse_args(argv: impl IntoIterator<Item = OsString>) -> Result<CkArgs, CkErro
                     program: program.clone(),
                     subc,
                     json,
+                    verbose,
                     command: Command::Help(format!("ck {}", env!("CARGO_PKG_VERSION"))),
                 })
             }
@@ -4847,6 +5285,7 @@ fn parse_args(argv: impl IntoIterator<Item = OsString>) -> Result<CkArgs, CkErro
     };
 
     let raw_tail: Vec<OsString> = args.collect();
+    verbose |= raw_tail.iter().any(|arg| arg == "--verbose");
 
     // Built-in domains accept the dispatcher flags anywhere (`ck module list
     // --subc <file>` is long-standing usage); an external domain's tail is
@@ -4873,6 +5312,7 @@ fn parse_args(argv: impl IntoIterator<Item = OsString>) -> Result<CkArgs, CkErro
         program,
         subc,
         json,
+        verbose,
         command,
     })
 }
@@ -4992,20 +5432,37 @@ fn parse_command(domain: &str, tail: &[OsString]) -> Result<Command, CkError> {
             };
             Ok(Command::Module(command))
         }
-        "routes" => match tail {
-            [] => Ok(Command::Routes { module_id: None }),
-            [module_id] if module_id != "-h" && module_id != "--help" && module_id != "help" => {
-                Ok(Command::Routes {
-                    module_id: Some(module_id.to_string_lossy().into_owned()),
-                })
+        "routes" => {
+            let positional = tail
+                .iter()
+                .filter(|argument| argument.as_os_str() != "--verbose")
+                .collect::<Vec<_>>();
+            match positional.as_slice() {
+                [] => Ok(Command::Routes { module_id: None }),
+                [module_id]
+                    if module_id.as_os_str() != "-h"
+                        && module_id.as_os_str() != "--help"
+                        && module_id.as_os_str() != "help" =>
+                {
+                    Ok(Command::Routes {
+                        module_id: Some(module_id.to_string_lossy().into_owned()),
+                    })
+                }
+                _ => Ok(Command::Help(ROUTES_HELP.into())),
             }
-            _ => Ok(Command::Help(ROUTES_HELP.into())),
-        },
+        }
         "provenance" => {
-            let Some(module_id) = tail.first() else {
+            let positional = tail
+                .iter()
+                .filter(|argument| argument.as_os_str() != "--verbose")
+                .collect::<Vec<_>>();
+            let Some(module_id) = positional.first() else {
                 return Ok(Command::Help(PROVENANCE_HELP.into()));
             };
-            if tail.len() != 1 || module_id == "-h" || module_id == "--help" || module_id == "help"
+            if positional.len() != 1
+                || module_id.as_os_str() == "-h"
+                || module_id.as_os_str() == "--help"
+                || module_id.as_os_str() == "help"
             {
                 return Ok(Command::Help(PROVENANCE_HELP.into()));
             }
@@ -5013,7 +5470,10 @@ fn parse_command(domain: &str, tail: &[OsString]) -> Result<Command, CkError> {
                 module_id: module_id.to_string_lossy().into_owned(),
             })
         }
-        "health" => match tail.first() {
+        "health" => match tail
+            .iter()
+            .find(|argument| argument.as_os_str() != "--verbose")
+        {
             None => Ok(Command::Health),
             Some(argument) => {
                 let argument = argument.to_string_lossy();
@@ -5027,22 +5487,24 @@ fn parse_command(domain: &str, tail: &[OsString]) -> Result<Command, CkError> {
             }
         },
         "daemon" => {
-            if tail.is_empty() {
-                return Ok(Command::Daemon);
-            }
             if tail
                 .iter()
                 .any(|arg| arg == "-h" || arg == "--help" || arg == "help")
             {
                 return Ok(Command::Help(DAEMON_HELP.into()));
             }
-            if tail.len() == 1 && tail[0] == "triage" {
-                return Ok(Command::DaemonTriage);
-            }
             if tail.first().is_some_and(|verb| verb == "lint") {
                 return parse_daemon_lint(&tail[1..]);
             }
-            Ok(Command::Help(DAEMON_HELP.into()))
+            let positional = tail
+                .iter()
+                .filter(|argument| argument.as_os_str() != "--verbose")
+                .collect::<Vec<_>>();
+            match positional.as_slice() {
+                [] => Ok(Command::Daemon),
+                [verb] if verb.as_os_str() == "triage" => Ok(Command::DaemonTriage),
+                _ => Ok(Command::Help(DAEMON_HELP.into())),
+            }
         }
         "quota" => {
             let mut provider_id = None;
@@ -5248,7 +5710,10 @@ enum CkError {
         source: String,
     },
     Rejected(String),
-    ModuleNotCommand(String),
+    ModuleNotCommand {
+        command: String,
+        module_id: String,
+    },
     WithFooter {
         error: Box<CkError>,
         footer: String,
@@ -5277,7 +5742,7 @@ impl CkError {
             Self::Usage(_) | Self::Discovery { .. } => 2,
             Self::Connection { .. } => 3,
             Self::Rejected(_) | Self::Message(_) | Self::Json(_) | Self::UpdateCheck(_) => 1,
-            Self::ModuleNotCommand(_) => 64,
+            Self::ModuleNotCommand { .. } => 1,
             Self::FleetLintConfig(_) => 2,
             Self::FleetLintExit { exit_code }
             | Self::TriageExit { exit_code }
@@ -5307,9 +5772,9 @@ impl fmt::Display for CkError {
                 )
             }
             Self::Rejected(message) => write!(f, "{message}"),
-            Self::ModuleNotCommand(module) => write!(
+            Self::ModuleNotCommand { command, module_id } => write!(
                 f,
-                "'{module}' is a module, not a command. Try: ck module status {module}"
+                "'{command}' is a module, not a command. Try: ck module status {module_id}"
             ),
             Self::Message(message) => write!(f, "{message}"),
             Self::FleetLintConfig(message) => write!(f, "ck daemon lint: {message}"),
@@ -5319,7 +5784,7 @@ impl fmt::Display for CkError {
             }
             Self::Json(source) => write!(f, "json: {source}"),
             Self::WithFooter { error, footer } => {
-                write!(f, "{error}\n\nhelp[1]:\n  {footer}")
+                write!(f, "{error}\n\nnext:\n  {footer}")
             }
         }
     }
@@ -5341,13 +5806,15 @@ mod tests {
     /// name list knowing about it.
     #[test]
     fn module_binary_names_include_every_setup_module_program() {
-        let names = module_binary_names();
-        assert!(
-            names.contains("mc"),
-            "MC must remain a module command rejection"
+        let modules = module_command_ids();
+        assert_eq!(
+            modules.get("mc").map(String::as_str),
+            Some("magic-context"),
+            "MC must point at its daemon module id"
         );
-        assert!(
-            names.contains("synapse"),
+        assert_eq!(
+            modules.get("synapse").map(String::as_str),
+            Some("synapse"),
             "synapse must remain a module command rejection"
         );
     }
@@ -5444,7 +5911,8 @@ mod tests {
 
         let rendered = provenance_image(Some(&value));
 
-        assert!(rendered.starts_with("unavailable (future_reason"));
+        assert!(rendered
+            .starts_with("could not be compared with the file it was spawned from (future_reason"));
         assert!(rendered.contains(r"\x1b"));
         assert!(rendered.contains(r"\x07"));
         assert!(!rendered.bytes().any(|byte| byte < 0x20));
@@ -5459,7 +5927,7 @@ mod tests {
 
         let rendered = provenance_image(Some(&value));
 
-        assert!(rendered.starts_with("unknown (future_status"));
+        assert!(rendered.starts_with("has unknown status (future_status"));
         assert!(rendered.contains("body="));
         assert!(rendered.contains(r#"\u001b"#));
         assert!(rendered.contains(r#"\u0007"#));
@@ -5474,7 +5942,7 @@ mod tests {
             "lifetime_restarts": 2,
         });
 
-        assert_eq!(format_restart_budget(&module), "2/3");
+        assert_eq!(format_restart_budget(&module), "2 of 3");
     }
 
     #[test]
@@ -5485,7 +5953,7 @@ mod tests {
             "lifetime_restarts": 2,
         });
 
-        assert_eq!(format_restart_budget(&module), "0/3 (2 lifetime)");
+        assert_eq!(format_restart_budget(&module), "0 of 3 (2 lifetime)");
     }
 
     #[test]
@@ -5495,29 +5963,22 @@ mod tests {
         // omits the key. Both spellings mean never probed. The fixture uses
         // the null form on the module row because that is what the running
         // daemon sends, and it is the form that read as "probed" once.
-        let modules = vec![
+        let modules = [
             json!({"module_id": "aft", "state": "running", "last_probe_ms": null}),
             json!({"module_id": "synapse", "state": "running", "last_probe_ms": 1}),
         ];
-        let health = vec![
+        let health = [
             json!({"module_id": "aft", "status": "unknown"}),
             json!({"module_id": "synapse", "status": "unknown", "last_probe_ms": 1}),
         ];
 
-        assert_eq!(
-            dashboard_warming_modules(&modules, &health),
-            vec!["aft".to_string()]
-        );
-        assert_eq!(
-            dashboard_alerts_line(&modules, &health, &json!({})),
-            "alerts: synapse"
-        );
+        assert!(dashboard_module_is_warming(&health, &modules[0]));
+        assert!(!dashboard_module_is_warming(&health, &modules[1]));
+        assert_eq!(dashboard_alerts_line(&json!({})), None);
     }
 
     #[test]
     fn dashboard_alert_line_requires_drops_in_every_window_minute() {
-        let modules = Vec::new();
-        let health = Vec::new();
         let scattered = json!({
             "counters": {
                 "module_frames_dropped_no_route_last_10m": 9,
@@ -5526,8 +5987,8 @@ mod tests {
             }
         });
         assert_eq!(
-            dashboard_alerts_line(&modules, &health, &scattered),
-            "alerts: none",
+            dashboard_alerts_line(&scattered),
+            None,
             "scattered drops must not create a dashboard alarm"
         );
 
@@ -5539,8 +6000,8 @@ mod tests {
             }
         });
         assert_eq!(
-            dashboard_alerts_line(&modules, &health, &sustained),
-            "alerts: frame drops (14 in 10m, top: omega)"
+            dashboard_alerts_line(&sustained),
+            Some("alerts: frame drops (14 in 10m, top: omega)".to_string())
         );
     }
 
@@ -5553,20 +6014,26 @@ mod tests {
         });
         assert_eq!(module_frame_drop_count(&describe, "alpha"), Some(3));
         assert_eq!(module_frame_drop_count(&describe, "idle"), None);
-        assert_eq!(
-            append_frame_drop_detail(
-                "healthy".to_string(),
-                module_frame_drop_count(&describe, "alpha")
-            ),
-            "healthy; frames_dropped_no_route: 3"
-        );
-        assert_eq!(
-            append_frame_drop_detail(
-                "healthy".to_string(),
-                module_frame_drop_count(&describe, "idle")
-            ),
-            "healthy"
-        );
+    }
+
+    #[test]
+    fn age_formatter_uses_operator_scale_at_every_boundary() {
+        let now = 2 * 86_400 * 1_000;
+        for (delta_seconds, expected) in [
+            (0, "just now"),
+            (59, "59s ago"),
+            (60, "1m ago"),
+            (59 * 60, "59m ago"),
+            (60 * 60, "1h ago"),
+            (23 * 60 * 60, "23h ago"),
+            (24 * 60 * 60, "1d ago"),
+        ] {
+            assert_eq!(
+                format_age_from_epoch_ms(now - delta_seconds * 1_000, now),
+                expected
+            );
+        }
+        assert_eq!(format_age_from_epoch_ms(now + 5_000, now), "in 5s");
     }
 
     #[test]
@@ -5988,6 +6455,20 @@ mod tests {
     /// This fixture pins the bytes emitted by the `--json` renderer. Human-only
     /// dashboard and footer changes must not alter machine-consumed output.
     #[test]
+    fn module_rescan_json_output_is_byte_stable_against_fixture() {
+        let reply = serde_json::json!({
+            "added": [],
+            "changed_pending_reload": [],
+            "op": "supervisor.rescan",
+            "preview": true,
+            "removed": [],
+            "unchanged": 3
+        });
+        let expected = "{\n  \"added\": [],\n  \"changed_pending_reload\": [],\n  \"op\": \"supervisor.rescan\",\n  \"preview\": true,\n  \"removed\": [],\n  \"unchanged\": 3\n}";
+        assert_eq!(format_json_output(&reply).unwrap(), expected);
+    }
+
+    #[test]
     fn quota_json_output_is_byte_stable_against_fixture() {
         let reply = serde_json::json!({
             "result": [{
@@ -6214,7 +6695,7 @@ mod tests {
         assert!(matches!(bare.command, Command::Dashboard));
 
         let json = parse_args([OsString::from("ck"), OsString::from("--json")]).unwrap();
-        assert!(matches!(json.command, Command::Help(text) if text == top_help()));
+        assert!(matches!(json.command, Command::Help(text) if text == top_help_json_compat()));
     }
 
     #[test]

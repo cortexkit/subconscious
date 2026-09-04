@@ -12,9 +12,11 @@ use base64::Engine;
 use ed25519_dalek::{Signer, SigningKey};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use subc_control::{ClientControlRequest, ClientControlResponse, SupervisorEntry};
+use subc_control::{
+    ClientControlRequest, ClientControlResponse, SupervisorEntry, SupervisorHealthStatus,
+};
 use subc_core::{
-    read_frame, test_support::TestTempDir as TempDir, write_frame, Frame, ModuleSpec,
+    read_frame, test_support::TestTempDir as TempDir, write_frame, Frame, HealthConfig, ModuleSpec,
     RestartPolicy, SupervisedModule, Supervisor, SupervisorHandle, SupervisorProcessLiveness,
 };
 use subc_protocol::{Flags, FrameType, Priority, PROTOCOL_VERSION};
@@ -79,7 +81,18 @@ async fn daemon_reports_and_renders_route_counters() {
 
     let output = ck_with_subc(&server.connection_file_path, ["daemon"]);
     assert_exit(&output, 0);
-    let stdout = text(&output.stdout);
+    let uptime = connection_file_elapsed(&server.connection_file_path);
+    assert_eq!(
+        text(&output.stdout),
+        format!(
+            "daemon test-subc · pid {} · up {uptime} · 1 clients · no frame drops in the last 10 minutes\n",
+            std::process::id()
+        )
+    );
+
+    let verbose = ck_with_subc(&server.connection_file_path, ["daemon", "--verbose"]);
+    assert_exit(&verbose, 0);
+    let stdout = text(&verbose.stdout);
     assert!(stdout.contains("counter"), "stdout:\n{stdout}");
     assert!(
         stdout.contains("module_frames_dropped_no_route"),
@@ -88,23 +101,96 @@ async fn daemon_reports_and_renders_route_counters() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn bare_ck_renders_live_dashboard_and_navigation_footer() {
+async fn bare_ck_renders_live_dashboard_and_commands() {
     let server = TestServer::start().await;
     let output = ck_with_subc(&server.connection_file_path, []);
     assert_exit(&output, 0);
     let stdout = text(&output.stdout);
     assert!(
-        stdout.contains("ck — CortexKit operator CLI"),
+        stdout.starts_with(&format!(
+            "ck {} · daemon running (pid {}, up ",
+            env!("CARGO_PKG_VERSION"),
+            std::process::id()
+        )),
         "stdout:\n{stdout}"
     );
-    assert!(stdout.contains("daemon: "), "stdout:\n{stdout}");
+    assert!(stdout.contains("modules: none"), "stdout:\n{stdout}");
     assert!(
-        stdout.contains("modules: 0 running, 0 ok"),
+        stdout.contains("updates: unknown (could not reach cortexkit.io)"),
         "stdout:\n{stdout}"
     );
-    assert!(stdout.contains("alerts: none"), "stdout:\n{stdout}");
-    assert!(stdout.contains("domains:"), "stdout:\n{stdout}");
-    assert!(stdout.contains("help[2]:"), "stdout:\n{stdout}");
+    assert!(stdout.contains("commands:"), "stdout:\n{stdout}");
+    assert!(
+        stdout.ends_with("run `ck <command>` for its verbs, `ck --help` for everything\n"),
+        "stdout:\n{stdout}"
+    );
+}
+
+#[test]
+fn bare_json_keeps_the_captured_master_help_bytes() {
+    let empty_path = TempDir::new("ck-bare-json-path");
+    let output = ck_command()
+        .arg("--json")
+        .env("PATH", empty_path.path())
+        .output()
+        .unwrap();
+    assert_exit(&output, 0);
+    assert_eq!(
+        text(&output.stdout),
+        "ck — CortexKit operator CLI\n\nusage:\n  ck [--subc <connection-file>] [--json] <domain> [<verb>] [<args>]\n\ndomains:\n  setup     plan and apply the managed CortexKit installation\n  upgrade   plan managed component upgrades\n  module    supervised modules: list, status, stderr, terminals, restart, stop, start, rescan, release\n  routes    live consumers for one module or the whole daemon\n  provenance daemon-attested and module-declared build/process facts\n  health    one-line health for every supervised module\n  quota     AI-provider quota and usage windows\n  daemon    daemon version, uptime, connection info, offline triage, and CI lint\n\nflags:\n  --subc <file>   use a specific connection file (default: auto-discover)\n  --json          raw JSON output instead of tables\n\nrun 'ck <domain>' with no verb to see that domain's commands\n"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bare_ck_renders_degraded_module_and_no_updates_byte_for_byte() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor_with_fast_health(&server);
+    let module = spawn_stub_with_env(
+        &server,
+        &supervisor,
+        "insula",
+        vec![
+            ("FAKE_AFT_ADVERTISE_HEALTH", "1"),
+            ("FAKE_AFT_HEALTH_STATUS", "degraded"),
+            ("FAKE_AFT_HEALTH_DETAIL", "1 provider failing"),
+        ],
+    )
+    .await;
+    wait_for_health_status(
+        &server.connection_file_path,
+        "insula",
+        SupervisorHealthStatus::Degraded,
+    )
+    .await;
+
+    let cache_dir = TempDir::new("ck-dashboard-current-cache");
+    let cache = cache_dir.path().join("update-metadata.json");
+    fs::write(
+        &cache,
+        format!(
+            r#"{{"format_version":3,"checked_at_unix_secs":{},"targets":{{}}}}"#,
+            now_ms() / 1_000
+        ),
+    )
+    .unwrap();
+    let output = ck_command()
+        .args(["--subc"])
+        .arg(&server.connection_file_path)
+        .env("CK_UPDATE_CACHE_PATH", &cache)
+        .output()
+        .unwrap();
+    assert_exit(&output, 0);
+    let uptime = connection_file_elapsed(&server.connection_file_path);
+    assert_eq!(
+        text(&output.stdout),
+        format!(
+            "ck {} · daemon running (pid {}, up {uptime}, 2 clients)\nmodules: insula degraded (1 provider failing)\nupdates: none\n\ncommands: setup · upgrade · module · health · routes · quota · daemon\nrun `ck <command>` for its verbs, `ck --help` for everything\n",
+            env!("CARGO_PKG_VERSION"),
+            std::process::id()
+        )
+    );
+
+    module.stop().await.unwrap();
 }
 
 #[test]
@@ -120,19 +206,23 @@ fn bare_ck_degrades_to_domains_when_daemon_is_unreachable() {
     assert!(output.stderr.is_empty(), "stderr: {}", text(&output.stderr));
     let stdout = text(&output.stdout);
     assert!(
-        stdout.contains("ck — CortexKit operator CLI"),
+        stdout.starts_with(&format!(
+            "ck {} · daemon stopped",
+            env!("CARGO_PKG_VERSION")
+        )),
         "stdout:\n{stdout}"
     );
-    assert!(stdout.contains("bin:"), "stdout:\n{stdout}");
-    assert!(stdout.contains("daemon: unreachable"), "stdout:\n{stdout}");
     assert!(
         stdout.contains(&missing.display().to_string()),
         "stdout:\n{stdout}"
     );
-    assert!(stdout.contains("updates: not checked"), "stdout:\n{stdout}");
-    assert!(stdout.contains("domains:"), "stdout:\n{stdout}");
+    assert!(
+        stdout.contains("updates: unknown (could not reach cortexkit.io)"),
+        "stdout:\n{stdout}"
+    );
+    assert!(stdout.contains("commands:"), "stdout:\n{stdout}");
     assert!(stdout.contains("module"), "stdout:\n{stdout}");
-    assert!(stdout.contains("help[1]:"), "stdout:\n{stdout}");
+    assert!(stdout.contains("next:"), "stdout:\n{stdout}");
 }
 
 #[test]
@@ -180,7 +270,7 @@ fn bare_ck_hanging_release_source_uses_stale_cache_within_the_refresh_budget() {
     );
     let stdout = text(&output.stdout);
     assert!(
-        stdout.contains("updates: not checked (cache"),
+        stdout.contains("updates: unknown (could not reach cortexkit.io)"),
         "stdout:\n{stdout}"
     );
 }
@@ -663,6 +753,84 @@ fn host_target() -> String {
         ("windows", "x86_64") => "windows-x64".to_string(),
         ("windows", "aarch64") => "windows-arm64".to_string(),
         (os, arch) => format!("{os}-{arch}"),
+    }
+}
+
+fn single_row_table(headers: [&str; 3], row: [&str; 3]) -> String {
+    let widths = [
+        headers[0].len().max(row[0].len()),
+        headers[1].len().max(row[1].len()),
+        headers[2].len().max(row[2].len()),
+    ];
+    let render = |cells: [&str; 3]| {
+        format!(
+            "{:<w0$}  {:<w1$}  {:<w2$}\n",
+            cells[0],
+            cells[1],
+            cells[2],
+            w0 = widths[0],
+            w1 = widths[1],
+            w2 = widths[2]
+        )
+    };
+    format!("{}{}", render(headers), render(row))
+}
+
+fn home_relative(path: &str) -> String {
+    std::env::var("HOME")
+        .ok()
+        .and_then(|home| {
+            path.strip_prefix(&home)
+                .filter(|tail| tail.starts_with(std::path::MAIN_SEPARATOR))
+                .map(|tail| format!("~{tail}"))
+        })
+        .unwrap_or_else(|| path.to_string())
+}
+
+fn connection_file_elapsed(path: &Path) -> String {
+    let seconds = fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .and_then(|modified| modified.elapsed().map_err(std::io::Error::other))
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 3_600 {
+        format!("{}m", seconds / 60)
+    } else if seconds < 86_400 {
+        format!("{}h", seconds / 3_600)
+    } else {
+        format!("{}d", seconds / 86_400)
+    }
+}
+
+fn age_from_ms(timestamp_ms: u64) -> String {
+    let now = now_ms();
+    if timestamp_ms > now {
+        let seconds = (timestamp_ms - now) / 1_000;
+        return if seconds == 0 {
+            "just now".to_string()
+        } else {
+            format!("in {}", compact_duration(seconds))
+        };
+    }
+    let seconds = (now - timestamp_ms) / 1_000;
+    if seconds == 0 {
+        "just now".to_string()
+    } else {
+        format!("{} ago", compact_duration(seconds))
+    }
+}
+
+fn compact_duration(seconds: u64) -> String {
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 3_600 {
+        format!("{}m", seconds / 60)
+    } else if seconds < 86_400 {
+        format!("{}h", seconds / 3_600)
+    } else {
+        format!("{}d", seconds / 86_400)
     }
 }
 
@@ -1169,7 +1337,7 @@ fn external_domains_opt_in_dispatch_and_cache_their_probe() {
         .env("CK_UPDATE_CACHE_PATH", &cache)
         .output()
         .expect("reject unapproved domain");
-    assert_exit(&refusing, 2);
+    assert_exit(&refusing, 1);
     assert!(
         refusing.stdout.is_empty(),
         "unapproved domain was dispatched"
@@ -1211,7 +1379,7 @@ fn external_domains_opt_in_dispatch_and_cache_their_probe() {
         .env("CK_UPDATE_CACHE_PATH", &cache)
         .output()
         .expect("reject module binary");
-    assert_exit(&module, 64);
+    assert_exit(&module, 1);
     assert_eq!(
         text(&module.stderr).trim(),
         "'aft' is a module, not a command. Try: ck module status aft"
@@ -1223,10 +1391,10 @@ fn external_domains_opt_in_dispatch_and_cache_their_probe() {
         .env("CK_UPDATE_CACHE_PATH", &cache)
         .output()
         .expect("reject magic-context module binary");
-    assert_exit(&mc, 64);
+    assert_exit(&mc, 1);
     assert_eq!(
         text(&mc.stderr).trim(),
-        "'mc' is a module, not a command. Try: ck module status mc"
+        "'mc' is a module, not a command. Try: ck module status magic-context"
     );
 
     let unknown = ck_command()
@@ -1235,12 +1403,22 @@ fn external_domains_opt_in_dispatch_and_cache_their_probe() {
         .env("CK_UPDATE_CACHE_PATH", &cache)
         .output()
         .expect("reject unknown command");
-    assert_exit(&unknown, 2);
+    assert_exit(&unknown, 1);
     assert_eq!(
         text(&unknown.stderr).trim(),
         "unknown command 'nosuch'. Run ck --help."
     );
     assert!(!text(&unknown.stderr).contains("usage:"));
+}
+
+#[test]
+fn mc_hint_names_the_daemon_module_id() {
+    let output = ck_command().arg("mc").output().unwrap();
+    assert_exit(&output, 1);
+    assert_eq!(
+        text(&output.stderr),
+        "'mc' is a module, not a command. Try: ck module status magic-context\n"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1276,14 +1454,168 @@ async fn module_list_json_uses_subc_override_and_shows_stub() {
     let text_output = ck_with_subc(&server.connection_file_path, ["module", "list"]);
     assert_exit(&text_output, 0);
     let text_stdout = text(&text_output.stdout);
-    assert!(text_stdout.contains("help[1]:"), "stdout:\n{text_stdout}");
-    assert!(
-        text_stdout.contains("ck module status <id> --subc <connection-file>"),
-        "stdout:\n{text_stdout}"
+    assert_eq!(
+        text_stdout,
+        "module        status   health \nck-list-stub  running  unknown\n"
     );
     assert!(
-        !json_stdout.contains("help["),
+        !json_stdout.contains("next:"),
         "JSON output must not gain human footer: {json_stdout}"
+    );
+
+    module.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn module_list_renders_status_words_not_wire_booleans() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor_with_fast_health(&server);
+    let module = spawn_stub_with_env(
+        &server,
+        &supervisor,
+        "insula",
+        vec![
+            ("FAKE_AFT_ADVERTISE_HEALTH", "1"),
+            ("FAKE_AFT_HEALTH_STATUS", "degraded"),
+        ],
+    )
+    .await;
+    wait_for_health_status(
+        &server.connection_file_path,
+        "insula",
+        SupervisorHealthStatus::Degraded,
+    )
+    .await;
+
+    let output = ck_with_subc(&server.connection_file_path, ["module", "list"]);
+    assert_exit(&output, 0);
+    assert_eq!(
+        text(&output.stdout),
+        "module  status   health  \ninsula  running  degraded\n"
+    );
+    assert!(!text(&output.stdout).contains("true"));
+    assert!(!text(&output.stdout).contains("false"));
+
+    module.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn module_status_renders_key_value_block_byte_for_byte() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor_with_fast_health(&server);
+    let module = spawn_stub_with_env(
+        &server,
+        &supervisor,
+        "aft",
+        vec![
+            ("FAKE_AFT_ADVERTISE_HEALTH", "1"),
+            ("FAKE_AFT_HEALTH_STATUS", "degraded"),
+        ],
+    )
+    .await;
+    wait_for_health_status(
+        &server.connection_file_path,
+        "aft",
+        SupervisorHealthStatus::Degraded,
+    )
+    .await;
+
+    let status_json = assert_json_success(ck_with_subc(
+        &server.connection_file_path,
+        ["module", "status", "aft", "--json"],
+    ));
+    assert_eq!(status_json["module"]["module_id"], "aft");
+    assert_eq!(status_json["health"]["status"], "degraded");
+
+    let provenance = control_rpc_value_on_stream_within(
+        &mut wait_for_client(&server.connection_file_path).await,
+        92,
+        ClientControlRequest::SupervisorProvenance {
+            module_id: Some("aft".to_string()),
+        },
+        Duration::from_secs(120),
+    )
+    .await;
+    let observed = &provenance["modules"][0]["daemon_observed"];
+    let pid = observed["pid"].as_u64().unwrap();
+    let started = age_from_ms(observed["spawned_at_ms"].as_u64().unwrap());
+    let binary = home_relative(observed["spawned_from"].as_str().unwrap());
+    let image = match observed["running_image"]["status"].as_str() {
+        Some("match") => "running image matches".to_string(),
+        Some("mismatch") => "running image differs: running vs disk".to_string(),
+        Some("unavailable") => format!(
+            "running image differs: {}",
+            observed["running_image"]["reason"]
+                .as_str()
+                .unwrap_or("none")
+        ),
+        status => format!("running image status {}", status.unwrap_or("unknown")),
+    };
+
+    let output = ck_with_subc(&server.connection_file_path, ["module", "status", "aft"]);
+    assert_exit(&output, 0);
+    assert_eq!(
+        text(&output.stdout),
+        format!(
+            "aft — running, degraded\n  pid {pid} · started {started} · restarts 0 of 1\n  last exit: none\n  binary: {binary} ({image})\nmetrics: run `ck health aft`\n"
+        )
+    );
+
+    module.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn module_terminals_renders_empty_history_byte_for_byte() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor(&server);
+    let module = spawn_stub(&server, &supervisor, "aft").await;
+    let json = assert_json_success(ck_with_subc(
+        &server.connection_file_path,
+        ["module", "terminals", "aft", "--json"],
+    ));
+    let started = age_from_ms(json["daemon_started_at_ms"].as_u64().unwrap());
+
+    let output = ck_with_subc(&server.connection_file_path, ["module", "terminals", "aft"]);
+    assert_exit(&output, 0);
+    assert_eq!(
+        text(&output.stdout),
+        format!("no exits recorded since the daemon started ({started})\n")
+    );
+
+    module.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn module_terminals_renders_one_record_byte_for_byte() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor_with_restart_limit(&server, 0);
+    let module = supervisor
+        .spawn(stub_spec_with_env("aft", vec![("FAKE_AFT_EXIT_CODE", "7")]))
+        .unwrap();
+    wait_for_supervisor_entry(&server.connection_file_path, "aft", |entry| {
+        entry.state == "failed" && !entry.live
+    })
+    .await;
+    let json = assert_json_success(ck_with_subc(
+        &server.connection_file_path,
+        ["module", "terminals", "aft", "--json"],
+    ));
+    let entry = &json["entries"][0];
+    assert_eq!(json["entries"].as_array().unwrap().len(), 1);
+    let when = age_from_ms(entry["at_ms"].as_u64().unwrap());
+    let disposition = entry["disposition"]
+        .as_str()
+        .unwrap()
+        .replace(['_', '-'], " ");
+
+    let output = ck_with_subc(&server.connection_file_path, ["module", "terminals", "aft"]);
+    assert_exit(&output, 0);
+    assert_eq!(
+        text(&output.stdout),
+        single_row_table(
+            ["when", "exit", "disposition"],
+            [&when, "exit 7", &disposition]
+        )
     );
 
     module.stop().await.unwrap();
@@ -1340,36 +1672,34 @@ async fn module_list_empty_result_has_a_next_step_and_json_has_no_footer() {
     assert_exit(&output, 0);
     let stdout = text(&output.stdout);
     assert!(
-        stdout.contains("(no supervised modules)"),
+        stdout.contains("no supervised modules"),
         "stdout:\n{stdout}"
     );
-    assert!(stdout.contains("help[1]:"), "stdout:\n{stdout}");
+    assert!(stdout.contains("next:"), "stdout:\n{stdout}");
     assert!(stdout.contains("ck module rescan"), "stdout:\n{stdout}");
 
     let json_output = ck_with_subc(&server.connection_file_path, ["module", "list", "--json"]);
     let json_stdout = text(&json_output.stdout);
     let _ = assert_json_success(json_output);
     assert!(
-        !json_stdout.contains("help["),
+        !json_stdout.contains("next:"),
         "JSON output must not gain human footer"
     );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn routes_empty_result_has_a_next_step_and_json_has_no_footer() {
+async fn routes_empty_result_is_one_line_and_json_has_no_footer() {
     let server = TestServer::start().await;
 
     let output = ck_with_subc(&server.connection_file_path, ["routes"]);
     assert_exit(&output, 0);
-    let stdout = text(&output.stdout);
-    assert!(stdout.contains("(no live routes)"), "stdout:\n{stdout}");
-    assert!(stdout.contains("help[1]:"), "stdout:\n{stdout}");
+    assert_eq!(text(&output.stdout), "no live routes\n");
 
     let json_output = ck_with_subc(&server.connection_file_path, ["routes", "--json"]);
     let json_stdout = text(&json_output.stdout);
     let _ = assert_json_success(json_output);
     assert!(
-        !json_stdout.contains("help["),
+        !json_stdout.contains("next:"),
         "JSON output must not gain human footer"
     );
 }
@@ -1428,7 +1758,7 @@ async fn provenance_json_preserves_the_complete_daemon_response_without_a_footer
     assert_eq!(actual, expected);
     assert!(stdout.contains("\"module_declared\""), "stdout:\n{stdout}");
     assert!(stdout.contains("\"daemon_observed\""), "stdout:\n{stdout}");
-    assert!(!stdout.contains("help["), "stdout:\n{stdout}");
+    assert!(!stdout.contains("next:"), "stdout:\n{stdout}");
 
     module.stop().await.unwrap();
 }
@@ -1454,16 +1784,16 @@ async fn provenance_human_output_keeps_declared_values_under_the_declared_label(
     assert_exit(&output, 0);
     let stdout = text(&output.stdout);
     let declared_at = stdout
-        .find("MODULE-DECLARED")
+        .find("Module declared")
         .unwrap_or_else(|| panic!("stdout:\n{stdout}"));
     let observed_at = stdout
-        .rfind("DAEMON-OBSERVED")
+        .rfind("Daemon observed")
         .unwrap_or_else(|| panic!("stdout:\n{stdout}"));
     assert!(declared_at < observed_at, "stdout:\n{stdout}");
     let module_declared = &stdout[declared_at..observed_at];
     let module_observed = &stdout[observed_at..];
     assert!(
-        module_observed.starts_with("DAEMON-OBSERVED\n  PID:"),
+        module_observed.starts_with("Daemon observed\n  pid:"),
         "module-level observed section boundary was not verified:\n{module_observed}"
     );
     for declared in [
@@ -1484,36 +1814,25 @@ async fn provenance_human_output_keeps_declared_values_under_the_declared_label(
             "declared value {declared:?} leaked into module-level observed section:\n{module_observed}"
         );
     }
-    assert!(stdout.contains("DAEMON BUILD"), "stdout:\n{stdout}");
+    assert!(stdout.contains("Daemon build"), "stdout:\n{stdout}");
     assert_eq!(
-        stdout.matches("DAEMON BUILD").count(),
+        stdout.matches("Daemon build").count(),
         1,
         "stdout:\n{stdout}"
     );
-    assert!(stdout.contains("MODULE: aft"), "stdout:\n{stdout}");
-    assert!(stdout.contains("PID:"), "stdout:\n{stdout}");
-    assert!(stdout.contains("SPAWN TIME:"), "stdout:\n{stdout}");
-    assert!(stdout.contains("SPAWNED-FROM:"), "stdout:\n{stdout}");
-    assert!(stdout.contains("RUNNING IMAGE:"), "stdout:\n{stdout}");
-    let running_image = stdout
-        .lines()
-        .find_map(|line| line.strip_prefix("  RUNNING IMAGE: "))
-        .unwrap_or_else(|| panic!("missing running-image line in:\n{stdout}"));
+    assert!(stdout.contains("Module: aft"), "stdout:\n{stdout}");
+    assert!(stdout.contains("pid:"), "stdout:\n{stdout}");
+    assert!(stdout.contains("started "), "stdout:\n{stdout}");
+    assert!(stdout.contains("spawned from:"), "stdout:\n{stdout}");
+    assert!(stdout.contains("running image "), "stdout:\n{stdout}");
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    {
-        assert!(running_image.starts_with("match ("), "stdout:\n{stdout}");
-        let method = running_image
-            .strip_prefix("match (")
-            .and_then(|value| value.strip_suffix(')'))
-            .unwrap_or_else(|| panic!("malformed running-image line:\n{stdout}"));
-        assert!(
-            matches!(method, "linux_proc_sha256" | "macos_spawn_inode"),
-            "unexpected running-image evidence method {method:?}:\n{stdout}"
-        );
-    }
+    assert!(
+        stdout.contains("running image matches the file it was spawned from"),
+        "stdout:\n{stdout}"
+    );
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    assert_eq!(
-        running_image, "unavailable (unsupported_platform)",
+    assert!(
+        stdout.contains("running image could not be compared"),
         "stdout:\n{stdout}"
     );
     assert!(stdout.contains("commit match only"), "stdout:\n{stdout}");
@@ -1588,7 +1907,7 @@ async fn provenance_unknown_module_preserves_the_daemon_error_and_exit_code() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn unknown_module_error_has_a_next_step_and_json_has_no_footer() {
+async fn module_status_and_health_unknown_module_errors_are_one_line() {
     let server = TestServer::start().await;
 
     let output = ck_with_subc(
@@ -1596,15 +1915,16 @@ async fn unknown_module_error_has_a_next_step_and_json_has_no_footer() {
         ["module", "status", "missing-module"],
     );
     assert_exit(&output, 1);
-    let stderr = text(&output.stderr);
-    assert!(
-        stderr.contains("module_id 'missing-module'"),
-        "stderr:\n{stderr}"
+    assert_eq!(
+        text(&output.stderr),
+        "no module named 'missing-module'. Run ck module list.\n"
     );
-    assert!(stderr.contains("help[1]:"), "stderr:\n{stderr}");
-    assert!(
-        stderr.contains("ck module list --subc <connection-file>"),
-        "stderr:\n{stderr}"
+
+    let health = ck_with_subc(&server.connection_file_path, ["health", "missing-module"]);
+    assert_exit(&health, 1);
+    assert_eq!(
+        text(&health.stderr),
+        "no module named 'missing-module'. Run ck module list.\n"
     );
 
     let json_output = ck_with_subc(
@@ -1614,9 +1934,69 @@ async fn unknown_module_error_has_a_next_step_and_json_has_no_footer() {
     let json_stderr = text(&json_output.stderr);
     assert_exit(&json_output, 1);
     assert!(
-        !json_stderr.contains("help["),
+        !json_stderr.contains("next:"),
         "JSON error gained footer: {json_stderr}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn health_summarizes_provider_state_and_headline_metrics() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor_with_fast_health(&server);
+    let unconfigured = (0..36)
+        .map(|index| format!("provider-{index}"))
+        .collect::<Vec<_>>();
+    let metrics = serde_json::json!({
+        "degraded": ["antigravity"],
+        "fetchBlackout": false,
+        "lastTickAgeSecs": 2,
+        "unconfigured": unconfigured,
+    })
+    .to_string();
+    let module = spawn_stub_with_env(
+        &server,
+        &supervisor,
+        "insula",
+        vec![
+            ("FAKE_AFT_ADVERTISE_HEALTH", "1"),
+            ("FAKE_AFT_HEALTH_STATUS", "degraded"),
+            ("FAKE_AFT_HEALTH_METRICS", metrics.as_str()),
+        ],
+    )
+    .await;
+    wait_for_health_status(
+        &server.connection_file_path,
+        "insula",
+        SupervisorHealthStatus::Degraded,
+    )
+    .await;
+
+    let overview_json = assert_json_success(ck_with_subc(
+        &server.connection_file_path,
+        ["health", "--json"],
+    ));
+    assert_eq!(overview_json["modules"][0]["module_id"], "insula");
+    let detail_json = assert_json_success(ck_with_subc(
+        &server.connection_file_path,
+        ["health", "insula", "--json"],
+    ));
+    assert_eq!(detail_json["metrics"]["lastTickAgeSecs"], 2);
+
+    let overview = ck_with_subc(&server.connection_file_path, ["health"]);
+    assert_exit(&overview, 0);
+    assert_eq!(
+        text(&overview.stdout),
+        "insula  degraded  1 provider degraded (antigravity); 36 not configured\n"
+    );
+
+    let detail = ck_with_subc(&server.connection_file_path, ["health", "insula"]);
+    assert_exit(&detail, 0);
+    assert_eq!(
+        text(&detail.stdout),
+        "insula: degraded\n  1 provider degraded (antigravity); 36 not configured\n  fetchBlackout: disabled\n  lastTickAgeSecs: 2s ago\n"
+    );
+
+    module.stop().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1633,7 +2013,7 @@ async fn quota_empty_result_has_a_next_step_and_json_has_no_footer() {
         stdout.contains("no providers reported"),
         "stdout:\n{stdout}"
     );
-    assert!(stdout.contains("help[1]:"), "stdout:\n{stdout}");
+    assert!(stdout.contains("next:"), "stdout:\n{stdout}");
     assert!(
         stdout.contains("ck module status <module-id> --subc <connection-file>"),
         "stdout:\n{stdout}"
@@ -1643,9 +2023,28 @@ async fn quota_empty_result_has_a_next_step_and_json_has_no_footer() {
     let json_stdout = text(&json_output.stdout);
     let _ = assert_json_success(json_output);
     assert!(
-        !json_stdout.contains("help["),
+        !json_stdout.contains("next:"),
         "JSON output must not gain human footer"
     );
+
+    module.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quota_reports_local_provider_not_running_in_one_line() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor(&server);
+    let fixture = serde_json::json!([{
+        "provider": "antigravity",
+        "account": "local",
+        "errorClass": "local_source_unavailable",
+        "error": "no Antigravity language server or agy CLI process running"
+    }]);
+    let module = spawn_quota_stub(&server, &supervisor, "insula", &fixture).await;
+
+    let output = ck_with_subc(&server.connection_file_path, ["quota"]);
+    assert_exit(&output, 0);
+    assert_eq!(text(&output.stdout), "Antigravity — not running locally\n");
 
     module.stop().await.unwrap();
 }
@@ -1677,7 +2076,7 @@ async fn quota_table_renders_providers_and_used_percent() {
     // The default view lists connected providers only; entries without a
     // usage object collapse into the summary line.
     assert!(
-        stdout.contains("1 providers not connected (--verbose to list)"),
+        stdout.contains("1 providers not configured"),
         "not-connected summary should appear, stdout:\n{stdout}"
     );
     assert!(
@@ -1747,7 +2146,7 @@ async fn quota_unknown_provider_lists_valid_ids_and_exits_nonzero() {
     assert!(stderr.contains("anthropic"), "stderr:\n{stderr}");
     assert!(stderr.contains("openai"), "stderr:\n{stderr}");
     assert!(stderr.contains("grok"), "stderr:\n{stderr}");
-    assert!(stderr.contains("help[1]:"), "stderr:\n{stderr}");
+    assert!(stderr.contains("next:"), "stderr:\n{stderr}");
     assert!(stderr.contains("ck quota --verbose"), "stderr:\n{stderr}");
 
     module.stop().await.unwrap();
@@ -1824,7 +2223,7 @@ fn discovery_failure_lists_tried_paths_and_exits_2() {
         .unwrap();
     assert_exit(&text_output, 2);
     let text_stderr = text(&text_output.stderr);
-    assert!(text_stderr.contains("help[1]:"), "stderr:\n{text_stderr}");
+    assert!(text_stderr.contains("next:"), "stderr:\n{text_stderr}");
     assert!(
         text_stderr.contains("ck daemon --subc <connection-file>"),
         "stderr:\n{text_stderr}"
@@ -1852,13 +2251,20 @@ fn ck_with_subc<const N: usize>(connection_file: &Path, args: [&str; N]) -> Outp
 
 fn assert_json_success(output: Output) -> Value {
     assert_exit(&output, 0);
-    serde_json::from_slice(&output.stdout).unwrap_or_else(|err| {
-        panic!(
-            "ck stdout was not JSON: {err}\nstdout:\n{}\nstderr:\n{}",
-            text(&output.stdout),
-            text(&output.stderr)
-        )
-    })
+    assert!(
+        output.stderr.is_empty(),
+        "JSON command wrote stderr: {}",
+        text(&output.stderr)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|error| panic!("stdout was not JSON: {error}: {}", text(&output.stdout)));
+    let expected = format!("{}\n", serde_json::to_string_pretty(&value).unwrap());
+    assert_eq!(
+        text(&output.stdout),
+        expected,
+        "--json bytes changed from the captured pretty-JSON renderer"
+    );
+    value
 }
 
 fn assert_exit(output: &Output, expected: i32) {
@@ -1884,15 +2290,27 @@ fn home_connection_file(home: &Path) -> PathBuf {
 }
 
 fn supervisor(server: &TestServer) -> Supervisor {
+    supervisor_with_restart_limit(server, 1)
+}
+
+fn supervisor_with_restart_limit(server: &TestServer, max_restarts: u32) -> Supervisor {
     Supervisor::new(
         Arc::clone(&server.registry),
-        RestartPolicy::new(1, Duration::from_millis(10)),
+        RestartPolicy::new(max_restarts, Duration::from_millis(10)),
     )
     .with_process_liveness(Arc::clone(&server.process_liveness))
     .with_forwarding(Arc::clone(&server.forwarding))
     .with_handle(server.supervisor_handle.clone())
     .with_drain_timeout(Duration::from_millis(25))
     .with_connection_file_path(server.connection_file_path.clone())
+}
+
+fn supervisor_with_fast_health(server: &TestServer) -> Supervisor {
+    supervisor(server).with_health_config(HealthConfig {
+        cadence: Duration::from_millis(10),
+        deadline: Duration::from_secs(1),
+        ..HealthConfig::default()
+    })
 }
 
 async fn spawn_stub(
@@ -2045,6 +2463,30 @@ async fn wait_for_supervisor_entry(
         if Instant::now() >= deadline {
             let modules = supervisor_modules(path, corr + 10_000).await;
             panic!("module {module_id} did not reach expected supervisor state within {SETUP_TIMEOUT:?}; modules: {modules:?}");
+        }
+        corr += 1;
+        sleep(Duration::from_millis(20)).await;
+    }
+}
+
+async fn wait_for_health_status(path: &Path, module_id: &str, expected: SupervisorHealthStatus) {
+    let deadline = Instant::now() + SETUP_TIMEOUT;
+    let mut corr = 30_000;
+    loop {
+        let mut client = wait_for_client(path).await;
+        let response =
+            control_rpc_on_stream(&mut client, corr, ClientControlRequest::SupervisorHealth {})
+                .await;
+        if let ClientControlResponse::SupervisorHealth { modules, .. } = response {
+            if modules
+                .iter()
+                .any(|entry| entry.module_id == module_id && entry.status == expected)
+            {
+                return;
+            }
+        }
+        if Instant::now() >= deadline {
+            panic!("module {module_id} did not report {expected:?} within {SETUP_TIMEOUT:?}");
         }
         corr += 1;
         sleep(Duration::from_millis(20)).await;

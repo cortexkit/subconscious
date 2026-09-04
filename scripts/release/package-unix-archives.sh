@@ -33,6 +33,16 @@ command -v shasum >/dev/null || {
   exit 1
 }
 
+# The shipped ck must not carry the test-only release-index key path: a build
+# whose feature set was unified from a test invocation would honour an
+# environment-supplied verifying key, turning the signature check into
+# configuration. The binary answers for its own build shape; refuse otherwise.
+shape="$("${SOURCE_DIR}/ck" --ck-build-shape 2>/dev/null || true)"
+if [[ "$shape" != "test-support: off" ]]; then
+  echo "refusing to package ck: build shape is '${shape}', expected 'test-support: off'" >&2
+  exit 1
+fi
+
 mkdir -p "$DIST_DIR"
 for binary in "${BINARIES[@]}"; do
   source_path="${SOURCE_DIR}/${binary}"

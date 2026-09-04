@@ -17,6 +17,19 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 $binaries = @("ck", "ck-subc", "ck-subc-mcp")
+
+# The shipped ck must not carry the test-only release-index key path; it answers
+# for its own build shape. Only the host-native x64 binary can be executed on
+# the runner; the arm64 lane is cross-built from the same invocation and
+# inherits the x64 verdict.
+if ($Arch -eq "x64") {
+    $ckPath = Join-Path $SourceDirectory "ck.exe"
+    $shape = (& $ckPath --ck-build-shape 2>$null | Out-String).Trim()
+    if ($shape -ne "test-support: off") {
+        throw "Refusing to package ck: build shape is '$shape', expected 'test-support: off'"
+    }
+}
+
 New-Item -ItemType Directory -Force -Path $DistDirectory | Out-Null
 
 foreach ($binary in $binaries) {

@@ -1375,7 +1375,9 @@ fn external_domains_opt_in_dispatch_and_cache_their_probe() {
         "if [ \"$1\" = \"--ck-domain\" ]; then printf x >> \"$CK_DOMAIN_PROBE_COUNT\"; echo \"helpful fake domain\"; exit 0; fi\necho dispatched-yes",
     );
     write_program("ck-no", "exit 1");
-    write_program("ck-hang", "sleep 3");
+    // Far longer than the probe deadline, so the elapsed-time bound below
+    // distinguishes "the deadline fired" from "the probe finished on its own".
+    write_program("ck-hang", "sleep 30");
     write_program("ck-aft", "exit 1");
     write_program("ck-mc", "exit 1");
 
@@ -1388,9 +1390,14 @@ fn external_domains_opt_in_dispatch_and_cache_their_probe() {
         .output()
         .expect("run help");
     assert_exit(&help, 0);
+    // The two-second deadline plus generous headroom: a loaded host (a full
+    // workspace test run) once pushed this past a bound with one second of
+    // slack. The hang is 30s, so anything under 15s proves the deadline
+    // fired and nothing else.
     assert!(
-        started.elapsed() < Duration::from_secs(3),
-        "a hanging probe must stop at its two-second deadline"
+        started.elapsed() < Duration::from_secs(15),
+        "a hanging probe must stop at its two-second deadline (took {:?})",
+        started.elapsed()
     );
     let help_text = text(&help.stdout);
     assert!(

@@ -89,7 +89,19 @@ impl SetupBackend {
     }
 
     pub fn observe(&mut self, request: &SetupRequest) -> Result<SetupObserved, String> {
-        self.runtime_status = runtime::observe(self.platform, &mut self.runner)?;
+        #[cfg(feature = "test-support")]
+        if env::var_os("CK_TEST_SETUP_CONTROL_OK").is_some() {
+            self.runtime_status = RuntimeStatus {
+                registered: true,
+                live: true,
+            };
+        } else {
+            self.runtime_status = runtime::observe(self.platform, &mut self.runner)?;
+        }
+        #[cfg(not(feature = "test-support"))]
+        {
+            self.runtime_status = runtime::observe(self.platform, &mut self.runner)?;
+        }
         let selected = selected_components(request);
         self.artifacts.set_download_context(
             request
@@ -201,6 +213,94 @@ impl SetupBackend {
         Ok(observed)
     }
 
+    pub fn print_dry_run(&mut self, plan: &SetupPlan) -> Result<(), String> {
+        for operation in &plan.operations {
+            if let SetupOperation::InstallComponent { component } = operation {
+                let release = self.artifacts.release_summary(*component)?;
+                println!(
+                    "Installing {} ({}, {})",
+                    component.module_id().unwrap_or("CortexKit"),
+                    release.release,
+                    release.target
+                );
+            }
+        }
+
+        let mut steps = Vec::new();
+        let registering_runtime = plan
+            .operations
+            .iter()
+            .any(|operation| matches!(operation, SetupOperation::RegisterRuntime));
+        for operation in &plan.operations {
+            match operation {
+                SetupOperation::InstallComponent { component } => {
+                    let release = self.artifacts.release_summary(*component)?;
+                    for (binary, bytes) in release.assets {
+                        steps.push(format!(
+                            "would download and verify {binary} ({})",
+                            components::format_mebibytes(bytes)
+                        ));
+                        let destination = self.paths.binary_home.join(if cfg!(windows) {
+                            format!("{binary}.exe")
+                        } else {
+                            binary.to_string()
+                        });
+                        steps.push(format!(
+                            "would place {}",
+                            components::display_home_path(&destination)
+                        ));
+                    }
+                }
+                SetupOperation::ConfigureComponent { component } => steps.push(format!(
+                    "would configure {} in {}",
+                    component.module_id().unwrap_or(component.label()),
+                    components::display_home_path(&self.paths.config_path)
+                )),
+                SetupOperation::BootstrapClaustrum { .. } => {
+                    steps.push("would initialize claustrum credentials".to_string())
+                }
+                SetupOperation::AdoptRunningCk { path } => steps.push(format!(
+                    "would adopt {} as the managed ck binary",
+                    components::display_home_path(path)
+                )),
+                SetupOperation::EnableComponent { component } => steps.push(format!(
+                    "would register {} with the daemon and check its health",
+                    component.module_id().unwrap_or(component.label())
+                )),
+                SetupOperation::RestartRuntime { sections } => steps.push(format!(
+                    "would restart the daemon to apply {}",
+                    sections.join(", ")
+                )),
+                SetupOperation::RegisterRuntime => {
+                    steps.push("would register and start the daemon".to_string())
+                }
+                SetupOperation::StartRuntime if !registering_runtime => {
+                    steps.push("would start the daemon".to_string())
+                }
+                SetupOperation::DeregisterRuntime => {
+                    steps.push("would stop and deregister the daemon".to_string())
+                }
+                SetupOperation::RemoveManagedComponent { component } => steps.push(format!(
+                    "would remove managed {component} binaries and links"
+                )),
+                SetupOperation::RetainUserData => {
+                    steps.push("would retain configuration and component stores".to_string())
+                }
+                SetupOperation::ObservePlatform
+                | SetupOperation::OfferOptionalComponents
+                | SetupOperation::OfferConversion { .. }
+                | SetupOperation::ConfirmConversion { .. }
+                | SetupOperation::RescanComponent { .. }
+                | SetupOperation::StartRuntime
+                | SetupOperation::Validate { .. } => {}
+            }
+        }
+        for (index, step) in steps.iter().enumerate() {
+            println!("  {}. {step}", index + 1);
+        }
+        Ok(())
+    }
+
     pub fn print_proposed_diffs(
         &self,
         plan: &SetupPlan,
@@ -257,27 +357,51 @@ impl SetupBackend {
             }
             return Ok(());
         }
-        if plan.mutation_count() == 0 {
-            println!("setup: no action was needed; managed setup is already correct.");
-        }
         let selected = selected_components(request).into_iter().collect::<Vec<_>>();
         let mut validator = CkValidator {
             executable: &self.executable,
         };
         validation::validate_selected(&mut validator, &selected)?;
-        println!("{}", validation::MCP_HARNESS_SNIPPET);
+        for operation in &plan.operations {
+            if let SetupOperation::EnableComponent { component } = operation {
+                let module_id = component
+                    .module_id()
+                    .expect("setup enables only daemon modules");
+                println!("  registered with the daemon; {module_id} ok");
+            }
+        }
+        println!("Done.");
+        if plan.operations.iter().any(|operation| {
+            matches!(
+                operation,
+                SetupOperation::InstallComponent {
+                    component: Component::Core
+                }
+            )
+        }) {
+            println!("{}", validation::MCP_HARNESS_NEXT);
+        }
         Ok(())
     }
 
     fn run_ck(&self, args: &[&str]) -> Result<(), String> {
-        let status = Command::new(&self.executable)
+        #[cfg(feature = "test-support")]
+        if env::var_os("CK_TEST_SETUP_CONTROL_OK").is_some() {
+            return Ok(());
+        }
+        let output = Command::new(&self.executable)
             .args(args)
-            .status()
+            .output()
             .map_err(|error| format!("could not run ck {}: {error}", args.join(" ")))?;
-        if status.success() {
+        if output.status.success() {
             Ok(())
         } else {
-            Err(format!("ck {} failed with {status}", args.join(" ")))
+            let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            Err(if detail.is_empty() {
+                format!("ck {} failed with {}", args.join(" "), output.status)
+            } else {
+                format!("ck {} failed: {detail}", args.join(" "))
+            })
         }
     }
 
@@ -286,6 +410,17 @@ impl SetupBackend {
     fn live_enabled_modules(&self) -> Result<Option<BTreeSet<String>>, String> {
         if !self.runtime_status.live {
             return Ok(None);
+        }
+        #[cfg(feature = "test-support")]
+        if let Some(modules) = env::var_os("CK_TEST_SETUP_MODULES") {
+            return Ok(Some(
+                modules
+                    .to_string_lossy()
+                    .split(',')
+                    .filter(|module| !module.is_empty())
+                    .map(ToOwned::to_owned)
+                    .collect(),
+            ));
         }
         let output = Command::new(&self.executable)
             .args(["--json", "module", "list"])
@@ -362,8 +497,8 @@ impl SetupBackend {
         self.inventory.record("managed-binary", path, fields);
         self.inventory.save()?;
         println!(
-            "adopted: {} (placed by the bootstrap installer)",
-            path.display()
+            "  adopted {} from the bootstrap installer",
+            components::display_home_path(path)
         );
         Ok(())
     }
@@ -404,6 +539,13 @@ impl SetupExecutor for SetupBackend {
     fn apply(&mut self, operation: &SetupOperation) -> Result<(), Self::Error> {
         match operation {
             SetupOperation::InstallComponent { component } => {
+                let release = self.artifacts.release_summary(*component)?;
+                println!(
+                    "Installing {} ({}, {})",
+                    component.module_id().unwrap_or("CortexKit"),
+                    release.release,
+                    release.target
+                );
                 let paths = components::component_binary_paths(*component, &self.paths.binary_home);
                 let owned_before = paths
                     .iter()
@@ -443,7 +585,9 @@ impl SetupExecutor for SetupBackend {
                 Ok(())
             }
             SetupOperation::BootstrapClaustrum { key_path } => {
-                self.bootstrap_claustrum(key_path.as_deref())
+                self.bootstrap_claustrum(key_path.as_deref())?;
+                println!("  initialized claustrum credentials");
+                Ok(())
             }
             SetupOperation::AdoptRunningCk { path } => self.adopt_running_ck(path),
             SetupOperation::RescanComponent { .. } => self.run_ck(&["module", "rescan"]),
@@ -454,14 +598,22 @@ impl SetupExecutor for SetupBackend {
                     .module_id()
                     .expect("only modules are enabled by setup"),
             ]),
-            SetupOperation::RestartRuntime { sections } => self.restart_runtime(sections),
-            SetupOperation::RegisterRuntime => runtime::ensure(
-                self.platform,
-                &self.paths.runtime_paths,
-                self.runtime_status,
-                &mut self.runner,
-                &mut self.inventory,
-            ),
+            SetupOperation::RestartRuntime { sections } => {
+                self.restart_runtime(sections)?;
+                println!("  restarted the daemon");
+                Ok(())
+            }
+            SetupOperation::RegisterRuntime => {
+                runtime::ensure(
+                    self.platform,
+                    &self.paths.runtime_paths,
+                    self.runtime_status,
+                    &mut self.runner,
+                    &mut self.inventory,
+                )?;
+                println!("  registered and started the daemon");
+                Ok(())
+            }
             // Registration starts the daemon immediately on every platform. The
             // separate operation remains in the plan so its current-liveness
             // requirement is visible before execution.
@@ -564,6 +716,10 @@ impl Validator for CkValidator<'_> {
         label: &str,
         args: &[String],
     ) -> Result<validation::ValidationResult, String> {
+        #[cfg(feature = "test-support")]
+        if env::var_os("CK_TEST_SETUP_CONTROL_OK").is_some() {
+            return Ok(validation::ValidationResult::success());
+        }
         let output = Command::new(self.executable)
             .args(args)
             .output()

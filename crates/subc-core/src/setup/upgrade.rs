@@ -164,7 +164,16 @@ pub fn discover_managed_upgrade_targets(
                 })?
                 .version
                 .clone(),
-            _ => binary_version(&destination)?,
+            _ => {
+                #[cfg(feature = "test-support")]
+                if let Some(version) = test_installed_version(target) {
+                    version
+                } else {
+                    binary_version(&destination)?
+                }
+                #[cfg(not(feature = "test-support"))]
+                binary_version(&destination)?
+            }
         };
         let installed_archive_sha256 = inventory_string(inventory, &destination, "archive_sha256");
         targets.push(ManagedUpgradeTarget {
@@ -175,6 +184,17 @@ pub fn discover_managed_upgrade_targets(
         });
     }
     Ok(targets)
+}
+
+#[cfg(feature = "test-support")]
+fn test_installed_version(target: UpgradeTarget) -> Option<String> {
+    let key = match target {
+        UpgradeTarget::SubcMcp => "CK_TEST_SUBC_MCP_VERSION",
+        UpgradeTarget::Aft => "CK_TEST_AFT_VERSION",
+        UpgradeTarget::Ck => "CK_TEST_CK_VERSION",
+        UpgradeTarget::Daemon => return None,
+    };
+    env::var_os(key).map(|version| version.to_string_lossy().into_owned())
 }
 
 /// Combines inventory and running-version evidence with the release check.
@@ -655,6 +675,19 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
         })
     }
 
+    fn completed(&mut self, target: UpgradeTarget) {
+        let from = &self
+            .targets
+            .get(target.label())
+            .expect("a completed upgrade has a discovered target")
+            .installed_version;
+        let to = self
+            .expected_versions
+            .get(target.label())
+            .expect("a completed upgrade has an expected version");
+        println!("{}", upgraded_line(target, from, to));
+    }
+
     fn rollback_decision(&mut self, _target: UpgradeTarget) -> RollbackDecision {
         match env::var("CK_UPGRADE_ROLLBACK") {
             Ok(value) if matches!(value.as_str(), "accept" | "accepted" | "yes") => {
@@ -693,6 +726,14 @@ pub fn render_execution_report(report: &UpgradeExecutionReport) {
     for evidence in &report.evidence {
         println!("{evidence}");
     }
+}
+
+pub fn upgraded_line(target: UpgradeTarget, from: &str, to: &str) -> String {
+    let restarted = match target {
+        UpgradeTarget::SubcMcp | UpgradeTarget::Aft | UpgradeTarget::Daemon => ", restarted",
+        UpgradeTarget::Ck => "",
+    };
+    format!("upgraded {target} {from} → {to}{restarted}")
 }
 
 pub fn binary_version(path: &Path) -> Result<String, String> {

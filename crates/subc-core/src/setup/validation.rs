@@ -89,7 +89,7 @@ pub fn validate_selected<V: Validator>(
     Ok(())
 }
 
-pub const MCP_HARNESS_SNIPPET: &str = "MCP harness snippet:\n  ck-subc-mcp --harness ck";
+pub const MCP_HARNESS_NEXT: &str = "next: connect your agent — Claude Code: claude mcp add ck -- ck-subc-mcp shim --harness claude-code\n      other harnesses: https://github.com/cortexkit/subconscious#readme";
 
 /// Wait until `ck daemon triage` reports the daemon live, bounded by the
 /// same settle deadline used after registration. A daemon that does not

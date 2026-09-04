@@ -941,6 +941,7 @@ mod tests {
         let asset = super::super::release_index::IndexAsset {
             url: "http://127.0.0.1/a.zip".to_string(),
             sha256: sha,
+            bytes: 99,
             reports: Some("0.99.0".to_string()),
         };
         let mut binaries = std::collections::BTreeMap::new();

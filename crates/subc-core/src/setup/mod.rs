@@ -25,10 +25,11 @@ mod validation;
 
 pub use apply::{default_claustrum_key_path, SetupBackend};
 pub(crate) use components::{component_binaries_for_target, module_program};
-pub use model::{AlphaTarget, Component, SetupRequest, UpgradeState, UpgradeTarget};
-#[cfg(test)]
-pub use model::{PlanOutcome, SetupOperation};
-pub use planner::{plan_setup, plan_upgrade, SetupPlan, UpgradePlan};
+pub use model::{
+    AlphaTarget, Component, ComponentState, PlanOutcome, PlatformObservation, SetupObserved,
+    SetupRequest, UpgradeState, UpgradeTarget,
+};
+pub use planner::{plan_setup, plan_upgrade, SetupPlan};
 #[cfg(windows)]
 pub(crate) use self_update::cleanup_replaced_windows_ck;
 pub use update_cache::UpdateCache;
@@ -38,6 +39,7 @@ pub use update_check::{
 };
 pub use upgrade::{
     dashboard_installed_binaries, discover_current_upgrade_targets, observed_upgrade_targets,
-    render_execution_report, DaemonCatalogBuild, SystemUpgradeBackend,
+    render_execution_report, upgraded_line, DaemonCatalogBuild, ManagedUpgradeTarget,
+    SystemUpgradeBackend,
 };
 pub use upgrade_executor::execute_upgrade;

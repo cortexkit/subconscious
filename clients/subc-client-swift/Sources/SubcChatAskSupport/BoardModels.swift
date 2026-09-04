@@ -296,7 +296,16 @@ public struct BoardState: Codable, Equatable {
     public var sessionId: String
     public var vocabulary: String
     public var servedSeq: Int64
+    /// The block-lane NAMES (`status`, `artifacts`, ...). Elements that are not
+    /// strings are dropped and counted in `unreadableLaneCount` rather than
+    /// failing the whole snapshot: a producer once put a new object shape under
+    /// this key and every phone read failed at `lanes[0]`, showing a cached
+    /// board under an error banner. One unreadable field must cost one field.
     public var lanes: [String]
+    /// Entries under `lanes` that were not strings. Zero on a conforming
+    /// producer; non-zero is a wire disagreement the UI should surface, not
+    /// hide -- the same reasoning as `degradedBlockCount`.
+    public var unreadableLaneCount: Int = 0
     public var blocks: [BoardBlock]
     public var health: BoardHealth?
     /// Server-side truncation counts. Absent from older module builds.
@@ -333,6 +342,103 @@ public struct BoardState: Codable, Equatable {
         copy.blocks = BoardBlock.foldNewest(blocks)
         return copy
     }
+
+    private enum CodingKeys: String, CodingKey {
+        case roomId, sessionId, vocabulary, servedSeq, lanes, blocks, health
+        case servedBlocks, totalBlocks
+    }
+
+    public init(
+        roomId: String,
+        sessionId: String,
+        vocabulary: String,
+        servedSeq: Int64,
+        lanes: [String],
+        unreadableLaneCount: Int = 0,
+        blocks: [BoardBlock],
+        health: BoardHealth? = nil,
+        servedBlocks: Int? = nil,
+        totalBlocks: Int? = nil
+    ) {
+        self.roomId = roomId
+        self.sessionId = sessionId
+        self.vocabulary = vocabulary
+        self.servedSeq = servedSeq
+        self.lanes = lanes
+        self.unreadableLaneCount = unreadableLaneCount
+        self.blocks = blocks
+        self.health = health
+        self.servedBlocks = servedBlocks
+        self.totalBlocks = totalBlocks
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        roomId = try container.decode(String.self, forKey: .roomId)
+        sessionId = try container.decode(String.self, forKey: .sessionId)
+        vocabulary = try container.decode(String.self, forKey: .vocabulary)
+        servedSeq = try container.decode(Int64.self, forKey: .servedSeq)
+        var laneNames: [String] = []
+        var unreadable = 0
+        var laneContainer = try container.nestedUnkeyedContainer(forKey: .lanes)
+        while !laneContainer.isAtEnd {
+            if let name = try? laneContainer.decode(String.self) {
+                laneNames.append(name)
+            } else {
+                // Consume the element so the container advances; its shape is
+                // whatever the producer put there and is not ours to interpret.
+                _ = try laneContainer.decode(OpaqueJSONValue.self)
+                unreadable += 1
+            }
+        }
+        lanes = laneNames
+        unreadableLaneCount = unreadable
+        blocks = try container.decode([BoardBlock].self, forKey: .blocks)
+        health = try container.decodeIfPresent(BoardHealth.self, forKey: .health)
+        servedBlocks = try container.decodeIfPresent(Int.self, forKey: .servedBlocks)
+        totalBlocks = try container.decodeIfPresent(Int.self, forKey: .totalBlocks)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(roomId, forKey: .roomId)
+        try container.encode(sessionId, forKey: .sessionId)
+        try container.encode(vocabulary, forKey: .vocabulary)
+        try container.encode(servedSeq, forKey: .servedSeq)
+        try container.encode(lanes, forKey: .lanes)
+        try container.encode(blocks, forKey: .blocks)
+        try container.encodeIfPresent(health, forKey: .health)
+        try container.encodeIfPresent(servedBlocks, forKey: .servedBlocks)
+        try container.encodeIfPresent(totalBlocks, forKey: .totalBlocks)
+    }
+}
+
+/// Decodes any JSON value and keeps nothing: used to step past an element
+/// whose shape this SDK does not model without failing the container.
+private struct OpaqueJSONValue: Decodable {
+    init(from decoder: Decoder) throws {
+        let single = try? decoder.singleValueContainer()
+        if let single, single.decodeNil() { return }
+        if let single, (try? single.decode(Bool.self)) != nil { return }
+        if let single, (try? single.decode(Double.self)) != nil { return }
+        if let single, (try? single.decode(String.self)) != nil { return }
+        if var unkeyed = try? decoder.unkeyedContainer() {
+            while !unkeyed.isAtEnd { _ = try unkeyed.decode(OpaqueJSONValue.self) }
+            return
+        }
+        if let keyed = try? decoder.container(keyedBy: AnyCodingKey.self) {
+            for key in keyed.allKeys { _ = try keyed.decode(OpaqueJSONValue.self, forKey: key) }
+            return
+        }
+        throw DecodingError.dataCorrupted(.init(codingPath: decoder.codingPath, debugDescription: "unreadable JSON value"))
+    }
+}
+
+private struct AnyCodingKey: CodingKey {
+    var stringValue: String
+    var intValue: Int?
+    init?(stringValue: String) { self.stringValue = stringValue }
+    init?(intValue: Int) { self.stringValue = String(intValue); self.intValue = intValue }
 }
 
 // MARK: - Board discovery (board.list)

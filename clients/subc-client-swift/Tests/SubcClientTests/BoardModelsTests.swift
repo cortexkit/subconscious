@@ -124,6 +124,32 @@ final class BoardModelsTests: XCTestCase {
         XCTAssertEqual(props.answeredAtMs, 1030)
     }
 
+    /// The Board v3 cutover put thread-lane OBJECTS under the `lanes` key the
+    /// SDK types as the lane-name list; every phone read failed at `lanes[0]`
+    /// and the app showed a cached board under an error banner. One field's
+    /// wire disagreement must cost that field, counted, never the snapshot.
+    func testBoardStateSurvivesNonStringLaneEntriesAndCountsThem() throws {
+        let json = """
+        {"roomId":"rm_x","sessionId":"ses_x","vocabulary":"v2","servedSeq":9,
+         "lanes":["status",{"id":"ln_1","title":"drive","items":[{"text":"t"}]},"artifacts",42],
+         "blocks":[]}
+        """
+        let state = try JSONDecoder().decode(BoardState.self, from: Data(json.utf8))
+        XCTAssertEqual(state.lanes, ["status", "artifacts"], "string entries survive in order")
+        XCTAssertEqual(state.unreadableLaneCount, 2, "the object and the number are counted, not hidden")
+        XCTAssertEqual(state.servedSeq, 9, "fields after lanes still decode")
+
+        // Control: a conforming producer reads zero, so the count can go bad.
+        let clean = try loadFixtureBoardState()
+        XCTAssertEqual(clean.unreadableLaneCount, 0)
+
+        // Encoding round-trips the names only; the dropped entries are gone and
+        // the count is not a wire field.
+        let encoded = try JSONDecoder().decode(BoardState.self, from: JSONEncoder().encode(state))
+        XCTAssertEqual(encoded.lanes, ["status", "artifacts"])
+        XCTAssertEqual(encoded.unreadableLaneCount, 0)
+    }
+
     func testBoardStateDecodesWithLaneOrderAndHealthCounters() throws {
         let state = try loadFixtureBoardState()
         XCTAssertEqual(state.roomId, "rm_board_ses_example")

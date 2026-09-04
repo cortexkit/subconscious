@@ -55,7 +55,6 @@ const FRAME_DROP_ALERT_REQUIRED_NONZERO_MINUTES: u64 = 10;
 const TOP_HELP_BASE: &str = "ck — CortexKit operator CLI\n\nusage:\n  ck [--subc <connection-file>] [--json] <domain> [<verb>] [<args>]\n\ndomains:\n  setup     plan and apply the managed CortexKit installation\n  upgrade   plan managed component upgrades\n  module    supervised modules: list, status, stderr, terminals, restart, stop, start, rescan, release\n  routes    live consumers for one module or the whole daemon\n  provenance daemon-attested and module-declared build/process facts\n  health    one-line health for every supervised module\n  quota     AI-provider quota and usage windows\n  daemon    daemon version, uptime, connection info, offline triage, and CI lint";
 
 const TOP_HELP_TAIL: &str = "flags:\n  --subc <file>   use a specific connection file (default: auto-discover)\n  --json          raw JSON output instead of tables\n  --verbose       include diagnostic detail and complete metrics\n\nrun 'ck <domain>' with no verb to see that domain's commands";
-const TOP_HELP_JSON_COMPAT_TAIL: &str = "flags:\n  --subc <file>   use a specific connection file (default: auto-discover)\n  --json          raw JSON output instead of tables\n\nrun 'ck <domain>' with no verb to see that domain's commands";
 
 const DOMAIN_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const DOMAIN_PROBE_CACHE_FILE: &str = "domain-probes.json";
@@ -111,10 +110,6 @@ struct DomainProbeCacheEntry {
 /// module binary on PATH cannot accidentally become an operator command.
 fn top_help() -> String {
     top_help_with_tail(TOP_HELP_TAIL)
-}
-
-fn top_help_json_compat() -> String {
-    top_help_with_tail(TOP_HELP_JSON_COMPAT_TAIL)
 }
 
 fn top_help_with_tail(tail: &str) -> String {
@@ -5237,7 +5232,7 @@ fn parse_args(argv: impl IntoIterator<Item = OsString>) -> Result<CkArgs, CkErro
                     json,
                     verbose,
                     command: if json {
-                        Command::Help(top_help_json_compat())
+                        Command::Help(top_help())
                     } else {
                         Command::Dashboard
                     },
@@ -6695,7 +6690,7 @@ mod tests {
         assert!(matches!(bare.command, Command::Dashboard));
 
         let json = parse_args([OsString::from("ck"), OsString::from("--json")]).unwrap();
-        assert!(matches!(json.command, Command::Help(text) if text == top_help_json_compat()));
+        assert!(matches!(json.command, Command::Help(text) if text == top_help()));
     }
 
     #[test]

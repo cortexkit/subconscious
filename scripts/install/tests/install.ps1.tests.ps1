@@ -109,6 +109,10 @@ Describe 'native ck installer' {
         $archiveDigest | Should -Not -Be $binaryDigest
         $placement.archive_sha256 | Should -Be $archiveDigest
         $placement.sha256 | Should -Be $binaryDigest
+        # No byte-order mark: ck's JSON reader refuses one, and Windows
+        # PowerShell 5.1 writes one under -Encoding UTF8. ConvertFrom-Json
+        # tolerates it, so only a byte-level check can see this.
+        ([System.IO.File]::ReadAllBytes($manifest))[0] | Should -Be 0x7B
     }
 
     It 'installs the arm64 archive on Windows on ARM and records the tuple' {

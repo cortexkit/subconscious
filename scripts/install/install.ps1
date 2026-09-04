@@ -129,7 +129,12 @@ function Write-InstallerManifest {
     $content = $manifestObject | ConvertTo-Json -Depth 5
     $temporaryManifest = "$Manifest.tmp"
     try {
-        Set-Content -LiteralPath $temporaryManifest -Value $content -Encoding UTF8 -NoNewline -ErrorAction Stop
+        # Windows PowerShell 5.1's `-Encoding UTF8` writes a byte-order mark,
+        # and the JSON reader in ck refuses a document that starts with one
+        # ("expected value at line 1 column 1"), so every later ck command
+        # refused the inventory. Write the bytes with an explicit BOM-less
+        # encoder, which behaves the same on 5.1 and on PowerShell 7.
+        [System.IO.File]::WriteAllBytes($temporaryManifest, [System.Text.UTF8Encoding]::new($false).GetBytes($content))
         if ((Test-Path -LiteralPath $Manifest) -and ([System.IO.File]::ReadAllText($Manifest) -eq [System.IO.File]::ReadAllText($temporaryManifest))) {
             Remove-Item -LiteralPath $temporaryManifest -Force -ErrorAction Stop
             return

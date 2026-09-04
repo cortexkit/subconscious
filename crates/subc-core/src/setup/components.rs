@@ -1,6 +1,6 @@
 use std::{
     fs,
-    path::Path,
+    path::{Path, PathBuf},
     process::{self, Command},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -56,6 +56,8 @@ pub struct ReleaseArtifactSource {
     target: AlphaTarget,
     index_url: String,
     index: Option<Result<ReleaseIndex, IndexRefusal>>,
+    retry_component: Component,
+    verbose: bool,
 }
 
 impl ReleaseArtifactSource {
@@ -64,6 +66,8 @@ impl ReleaseArtifactSource {
             target: host_alpha_target(),
             index_url: release_index::index_url(),
             index: None,
+            retry_component: Component::Core,
+            verbose: false,
         }
     }
 
@@ -73,7 +77,17 @@ impl ReleaseArtifactSource {
             target,
             index_url: String::new(),
             index: Some(Ok(index)),
+            retry_component: Component::Core,
+            verbose: false,
         }
+    }
+
+    /// Records the command that can retry a setup download before setup fetches
+    /// its shared release index. The raw transport details stay behind verbose
+    /// mode because they diagnose a network path, not a corrupt release.
+    pub fn set_download_context(&mut self, component: Component, verbose: bool) {
+        self.retry_component = component;
+        self.verbose = verbose;
     }
 
     /// Fetch the signed index once. A failure is about the document, not a
@@ -125,8 +139,35 @@ impl ReleaseArtifactSource {
         }
         match self.index.as_ref() {
             Some(Ok(index)) => Ok(index),
+            Some(Err(IndexRefusal::Unreachable { reason, .. })) => {
+                Err(self.network_index_error(reason))
+            }
             Some(Err(refusal)) => Err(refusal.to_string()),
             None => unreachable!("index is inserted before this match"),
+        }
+    }
+
+    fn network_index_error(&self, raw: &str) -> String {
+        let retry = self.retry_component.label();
+        let message = format!(
+            "could not reach CortexKit to download the release index (network error); nothing was installed. Retry: ck setup {retry}"
+        );
+        if self.verbose {
+            format!("{message}\n{raw}")
+        } else {
+            message
+        }
+    }
+
+    fn network_download_error(&self, binary: &str, raw: &str) -> String {
+        let retry = self.retry_component.label();
+        let message = format!(
+            "could not reach GitHub to download {binary} (network error); nothing was installed. Retry: ck setup {retry}"
+        );
+        if self.verbose {
+            format!("{message}\n{raw}")
+        } else {
+            message
         }
     }
 
@@ -173,7 +214,8 @@ impl ArtifactSource for ReleaseArtifactSource {
             )
         })?;
         let archive = temp.join(&archive_name);
-        release_index::download(&asset.url, &archive)?;
+        release_index::download(&asset.url, &archive)
+            .map_err(|raw| self.network_download_error(binary, &raw))?;
         let expected = asset.sha256.to_ascii_lowercase();
         let actual = digest_file(&archive)?;
         if actual != expected {
@@ -412,8 +454,12 @@ pub fn configure_component(
                 )
             })?;
     if let Some(change) = &change {
-        println!("proposed configuration diff:\n{}", change.render_diff());
         config::apply(change)?;
+        let configured = component.module_id().unwrap_or(component.label());
+        println!(
+            "configured {configured} in {}",
+            display_home_path(config_path)
+        );
         let mut fields = Map::new();
         fields.insert(
             "component".to_string(),
@@ -422,6 +468,17 @@ pub fn configure_component(
         inventory.record("configuration", config_path, fields);
     }
     Ok(change)
+}
+
+fn display_home_path(path: &Path) -> String {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return path.display().to_string();
+    };
+    match path.strip_prefix(&home) {
+        Ok(relative) if relative.as_os_str().is_empty() => "~".to_string(),
+        Ok(relative) => format!("~/{}", relative.display()),
+        Err(_) => path.display().to_string(),
+    }
 }
 
 pub fn configuration_is_correct(
@@ -943,6 +1000,32 @@ mod tests {
                 .expect("availability"),
             ReleaseAvailability::Available
         );
+    }
+
+    #[test]
+    fn network_download_refusal_names_the_retry_and_hides_transport_detail() {
+        let mut source =
+            ReleaseArtifactSource::from_index(index_with_core_linux(), AlphaTarget::LinuxX64);
+        source.set_download_context(Component::Mc, false);
+        let hidden = source.network_download_error("ck-mc", "curl: (7) connection refused");
+        assert_eq!(
+            hidden,
+            "could not reach GitHub to download ck-mc (network error); nothing was installed. Retry: ck setup mc"
+        );
+        let index_hidden = source.network_index_error("curl: (7) connection refused");
+        assert!(
+            !index_hidden.contains("curl: (7) connection refused"),
+            "index transport details must also stay behind --verbose: {index_hidden}"
+        );
+        source.set_download_context(Component::Mc, true);
+        let verbose = source.network_download_error("ck-mc", "curl: (7) connection refused");
+        assert!(
+            verbose.contains("curl: (7) connection refused"),
+            "{verbose}"
+        );
+        assert!(source
+            .network_index_error("curl: (7) connection refused")
+            .contains("curl: (7) connection refused"));
     }
 
     #[test]

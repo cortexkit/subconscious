@@ -2,8 +2,29 @@ use std::time::{Duration, Instant};
 
 use super::model::Component;
 
+pub struct ValidationResult {
+    pub success: bool,
+    pub output: String,
+}
+
+impl ValidationResult {
+    pub fn success() -> Self {
+        Self {
+            success: true,
+            output: String::new(),
+        }
+    }
+
+    pub fn failed(output: impl Into<String>) -> Self {
+        Self {
+            success: false,
+            output: output.into(),
+        }
+    }
+}
+
 pub trait Validator {
-    fn run(&mut self, label: &str, args: &[String]) -> Result<bool, String>;
+    fn run(&mut self, label: &str, args: &[String]) -> Result<ValidationResult, String>;
 
     /// Wait between settle attempts. Tests override this to keep the clock
     /// out of the suite; production sleeps.
@@ -31,7 +52,7 @@ const SETTLE_PAUSE: Duration = Duration::from_millis(500);
 /// Existing ck interfaces are the post-setup evidence. Runtime registration and
 /// current liveness are intentionally validated separately by the runtime layer.
 ///
-/// `ck fleet lint` is deliberately not a setup validator: it is the OFFLINE
+/// `ck daemon lint` is deliberately not a setup validator: it is the OFFLINE
 /// capability linter, examining each configured binary through `--manifest`,
 /// and a module binary that does not emit one (aft does not) is
 /// `manifest_unparsable` to it — which its vacuity floor correctly refuses
@@ -99,15 +120,21 @@ fn require_settled<V: Validator>(
 ) -> Result<(), String> {
     let started = Instant::now();
     loop {
-        if validator.run(label, args)? {
+        let result = validator.run(label, args)?;
+        if result.success {
             return Ok(());
         }
         if started.elapsed() >= deadline {
-            return Err(format!(
-                "validation failed after {}s: {label} {}",
-                deadline.as_secs(),
-                args.join(" ")
-            ));
+            let check = format!("{label} {}", args.join(" "));
+            return Err(if result.output.trim().is_empty() {
+                format!("validation failed after {}s: {check}", deadline.as_secs())
+            } else {
+                format!(
+                    "validation failed after {}s: {check}\n{}",
+                    deadline.as_secs(),
+                    result.output
+                )
+            });
         }
         validator.settle_pause(SETTLE_PAUSE);
     }
@@ -122,9 +149,17 @@ mod tests {
         calls: Vec<Vec<String>>,
     }
     impl Validator for RecordingValidator {
-        fn run(&mut self, _label: &str, args: &[String]) -> Result<bool, String> {
+        fn run(&mut self, _label: &str, args: &[String]) -> Result<ValidationResult, String> {
             self.calls.push(args.to_vec());
-            Ok(true)
+            Ok(ValidationResult::success())
+        }
+    }
+
+    struct FailingValidator;
+
+    impl Validator for FailingValidator {
+        fn run(&mut self, _label: &str, _args: &[String]) -> Result<ValidationResult, String> {
+            Ok(ValidationResult::failed("captured daemon diagnostic"))
         }
     }
 
@@ -140,11 +175,16 @@ mod tests {
         // The offline linter cannot examine a module binary that does not
         // emit --manifest; the live catalog is the authority for an install.
         assert!(
-            !validator
-                .calls
-                .iter()
-                .any(|args| args.first().map(String::as_str) == Some("fleet")),
-            "fleet lint is not a setup validator: {:?}",
+            !validator.calls.iter().any(|args| {
+                matches!(
+                    (
+                        args.first().map(String::as_str),
+                        args.get(1).map(String::as_str)
+                    ),
+                    (Some("daemon"), Some("lint"))
+                )
+            }),
+            "daemon lint is not a setup validator: {:?}",
             validator.calls
         );
     }
@@ -157,12 +197,16 @@ mod tests {
         pauses: usize,
     }
     impl Validator for LateDaemon {
-        fn run(&mut self, _label: &str, args: &[String]) -> Result<bool, String> {
+        fn run(&mut self, _label: &str, args: &[String]) -> Result<ValidationResult, String> {
             if args.first().map(String::as_str) == Some("daemon") {
                 self.triage_probes += 1;
-                return Ok(self.triage_probes >= self.answers_on_probe);
+                return Ok(if self.triage_probes >= self.answers_on_probe {
+                    ValidationResult::success()
+                } else {
+                    ValidationResult::failed("daemon is not ready")
+                });
             }
-            Ok(true)
+            Ok(ValidationResult::success())
         }
         fn settle_pause(&mut self, _pause: Duration) {
             self.pauses += 1;
@@ -198,17 +242,21 @@ mod tests {
         pauses: usize,
     }
     impl Validator for LateModule {
-        fn run(&mut self, _label: &str, args: &[String]) -> Result<bool, String> {
+        fn run(&mut self, _label: &str, args: &[String]) -> Result<ValidationResult, String> {
             match (args.first().map(String::as_str), args.get(1)) {
                 (Some("health"), Some(_)) => {
                     self.module_probes += 1;
-                    Ok(self.module_probes >= self.registers_on_probe)
+                    Ok(if self.module_probes >= self.registers_on_probe {
+                        ValidationResult::success()
+                    } else {
+                        ValidationResult::failed("module is not registered")
+                    })
                 }
                 (Some("health"), None) => {
                     self.core_probes += 1;
-                    Ok(true)
+                    Ok(ValidationResult::success())
                 }
-                _ => Ok(true),
+                _ => Ok(ValidationResult::success()),
             }
         }
         fn settle_pause(&mut self, _pause: Duration) {
@@ -237,6 +285,20 @@ mod tests {
             module.pauses, 2,
             "one pause between each failed module probe"
         );
+    }
+
+    #[test]
+    fn terminal_validation_failure_names_the_check_and_its_captured_output() {
+        let mut validator = FailingValidator;
+        let error = require_settled(
+            &mut validator,
+            "ck",
+            &["daemon".to_string(), "triage".to_string()],
+            Duration::ZERO,
+        )
+        .expect_err("the failing result must stop validation");
+        assert!(error.contains("ck daemon triage"), "{error}");
+        assert!(error.contains("captured daemon diagnostic"), "{error}");
     }
 
     #[test]

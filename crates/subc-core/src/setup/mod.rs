@@ -24,7 +24,8 @@ mod upgrade_verification;
 mod validation;
 
 pub use apply::{default_claustrum_key_path, SetupBackend};
-pub use model::{Component, SetupRequest, UpgradeState, UpgradeTarget};
+pub(crate) use components::{component_binaries_for_target, module_program};
+pub use model::{AlphaTarget, Component, SetupRequest, UpgradeState, UpgradeTarget};
 #[cfg(test)]
 pub use model::{PlanOutcome, SetupOperation};
 pub use planner::{plan_setup, plan_upgrade, SetupPlan, UpgradePlan};

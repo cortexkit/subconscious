@@ -293,13 +293,13 @@ fn setup_dry_run_refuses_a_test_key_signature_against_the_embedded_key() {
 }
 
 #[test]
-fn fleet_lint_uses_its_explicit_config_without_a_daemon_connection() {
-    let temp = TempDir::new("ck-fleet-lint");
+fn daemon_lint_uses_its_explicit_config_without_a_daemon_connection() {
+    let temp = TempDir::new("ck-daemon-lint");
     let config = temp.path().join("subc.jsonc");
     fs::write(&config, r#"{"version":1,"modules":{}}"#).unwrap();
 
     let output = ck_command()
-        .args(["fleet", "lint"])
+        .args(["daemon", "lint"])
         .arg(&config)
         .output()
         .unwrap();
@@ -307,10 +307,162 @@ fn fleet_lint_uses_its_explicit_config_without_a_daemon_connection() {
     assert_exit(&output, 2);
     assert!(output.stderr.is_empty(), "stderr: {}", text(&output.stderr));
     assert!(
-        text(&output.stdout).contains("examined 0 of 0 configured"),
+        text(&output.stdout).contains("checked 0 of 0 configured modules"),
         "stdout: {}",
         text(&output.stdout)
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn external_domains_opt_in_dispatch_and_cache_their_probe() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = TempDir::new("ck-domain-probes");
+    let bin = temp.path().join("bin");
+    fs::create_dir_all(&bin).expect("create fake PATH");
+    let count = temp.path().join("yes-probe-count");
+    let cache = temp.path().join("update-metadata.json");
+    let write_program = |name: &str, body: &str| {
+        let path = bin.join(name);
+        fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("write fake domain");
+        let mut permissions = fs::metadata(&path).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).expect("mark fake domain executable");
+    };
+    write_program(
+        "ck-yes",
+        "if [ \"$1\" = \"--ck-domain\" ]; then printf x >> \"$CK_DOMAIN_PROBE_COUNT\"; echo \"helpful fake domain\"; exit 0; fi\necho dispatched-yes",
+    );
+    write_program("ck-no", "exit 1");
+    write_program("ck-hang", "sleep 3");
+    write_program("ck-aft", "exit 1");
+    write_program("ck-mc", "exit 1");
+
+    let started = std::time::Instant::now();
+    let help = ck_command()
+        .arg("--help")
+        .env("PATH", &bin)
+        .env("CK_DOMAIN_PROBE_COUNT", &count)
+        .env("CK_UPDATE_CACHE_PATH", &cache)
+        .output()
+        .expect("run help");
+    assert_exit(&help, 0);
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "a hanging probe must stop at its two-second deadline"
+    );
+    let help_text = text(&help.stdout);
+    assert!(
+        help_text.contains("yes       helpful fake domain"),
+        "approved domain is listed with its headline:\n{help_text}"
+    );
+    assert!(
+        !help_text.contains("\n  no "),
+        "refusing binary leaked into help:\n{help_text}"
+    );
+    assert!(
+        !help_text.contains("\n  hang "),
+        "hanging binary leaked into help:\n{help_text}"
+    );
+    assert!(
+        !help_text.contains("\n  aft "),
+        "module binary leaked into help:\n{help_text}"
+    );
+    assert_eq!(fs::read_to_string(&count).expect("probe count"), "x");
+
+    let second_help = ck_command()
+        .arg("--help")
+        .env("PATH", &bin)
+        .env("CK_DOMAIN_PROBE_COUNT", &count)
+        .env("CK_UPDATE_CACHE_PATH", &cache)
+        .output()
+        .expect("run cached help");
+    assert_exit(&second_help, 0);
+    assert_eq!(
+        fs::read_to_string(&count).expect("cached probe count"),
+        "x",
+        "a matching executable stamp must skip the probe"
+    );
+
+    let refusing = ck_command()
+        .arg("no")
+        .env("PATH", &bin)
+        .env("CK_UPDATE_CACHE_PATH", &cache)
+        .output()
+        .expect("reject unapproved domain");
+    assert_exit(&refusing, 2);
+    assert!(
+        refusing.stdout.is_empty(),
+        "unapproved domain was dispatched"
+    );
+
+    let dispatched = ck_command()
+        .arg("yes")
+        .env("PATH", &bin)
+        .env("CK_DOMAIN_PROBE_COUNT", &count)
+        .env("CK_UPDATE_CACHE_PATH", &cache)
+        .output()
+        .expect("dispatch approved domain");
+    assert_exit(&dispatched, 0);
+    assert_eq!(text(&dispatched.stdout).trim(), "dispatched-yes");
+
+    fs::write(
+        bin.join("ck-yes"),
+        "#!/bin/sh\nif [ \"$1\" = \"--ck-domain\" ]; then printf x >> \"$CK_DOMAIN_PROBE_COUNT\"; echo \"helpful fake domain\"; exit 0; fi\necho dispatched-yes\n# changed\n",
+    )
+    .expect("change fake domain");
+    let refreshed = ck_command()
+        .arg("--help")
+        .env("PATH", &bin)
+        .env("CK_DOMAIN_PROBE_COUNT", &count)
+        .env("CK_UPDATE_CACHE_PATH", &cache)
+        .output()
+        .expect("run changed help");
+    assert_exit(&refreshed, 0);
+    assert_eq!(
+        fs::read_to_string(&count).expect("changed probe count"),
+        "xx",
+        "a changed binary must be probed again"
+    );
+
+    let module = ck_command()
+        .arg("aft")
+        .env("PATH", &bin)
+        .env("CK_DOMAIN_PROBE_COUNT", &count)
+        .env("CK_UPDATE_CACHE_PATH", &cache)
+        .output()
+        .expect("reject module binary");
+    assert_exit(&module, 64);
+    assert_eq!(
+        text(&module.stderr).trim(),
+        "'aft' is a module, not a command. Try: ck module status aft"
+    );
+
+    let mc = ck_command()
+        .arg("mc")
+        .env("PATH", &bin)
+        .env("CK_UPDATE_CACHE_PATH", &cache)
+        .output()
+        .expect("reject magic-context module binary");
+    assert_exit(&mc, 64);
+    assert_eq!(
+        text(&mc.stderr).trim(),
+        "'mc' is a module, not a command. Try: ck module status mc"
+    );
+
+    let unknown = ck_command()
+        .arg("nosuch")
+        .env("PATH", &bin)
+        .env("CK_UPDATE_CACHE_PATH", &cache)
+        .output()
+        .expect("reject unknown command");
+    assert_exit(&unknown, 2);
+    assert_eq!(
+        text(&unknown.stderr).trim(),
+        "unknown command 'nosuch'. Run ck --help."
+    );
+    assert!(!text(&unknown.stderr).contains("usage:"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

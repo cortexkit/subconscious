@@ -1,4 +1,4 @@
-//! Offline capability-manifest evaluation for `ck fleet lint`.
+//! Offline capability-manifest evaluation for `ck daemon lint`.
 //!
 //! The evaluator deliberately starts only each configured program's `--manifest`
 //! mode. It never contacts the daemon, so its findings describe static assembly
@@ -185,10 +185,24 @@ async fn lint_with_timeout(
         .iter()
         .filter(|module| !is_daemon_entry(module))
         .count();
-    let mut lines = vec![format!(
-        "examined {} of {configured} configured",
+    let unavailable = failures
+        .iter()
+        .map(|failure| failure.module.as_str())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let checked = format!(
+        "checked {} of {configured} configured modules",
         examined.len()
-    )];
+    );
+    let mut lines = vec![if unavailable.is_empty() {
+        checked
+    } else {
+        format!(
+            "{checked} — {} do not expose a manifest",
+            unavailable.join(", ")
+        )
+    }];
 
     if verbose {
         for module in &skipped_daemons {
@@ -201,21 +215,22 @@ async fn lint_with_timeout(
             .cmp(&right.class)
             .then_with(|| left.module.cmp(&right.module))
     });
-    for failure in &failures {
-        lines.push(format!(
-            "partial: evaluation incomplete ({}: {})",
-            failure.class.as_str(),
-            failure.module
-        ));
+    if verbose {
+        for failure in &failures {
+            lines.push(format!(
+                "partial: evaluation incomplete ({}: {})",
+                failure.class.as_str(),
+                failure.module
+            ));
+        }
+        if examined.is_empty() {
+            // An empty set must remain an operational failure, but the internal
+            // classification belongs in verbose diagnostics rather than the
+            // ordinary operator summary.
+            lines.push("operational failure: no modules examined (vacuity floor)".to_string());
+        }
+        lines.push("deny consistency = self-contradiction check".to_string());
     }
-    if examined.is_empty() {
-        // The eight named classes classify failed configured programs. An empty
-        // set has no program to name, but must still be an operational failure
-        // rather than a vacuous clean report.
-        lines.push("operational failure: no modules examined (vacuity floor)".to_string());
-    }
-
-    lines.push("deny consistency = self-contradiction check".to_string());
 
     let enabled_providers = capability_claimants(&examined, true);
     let all_providers = capability_claimants(&examined, false);
@@ -866,7 +881,7 @@ mod tests {
         assert_eq!(report.configured, 2);
         assert_eq!(
             report.render(),
-            "examined 2 of 2 configured\n\
+            "checked 2 of 2 configured modules\n\
 verbose: skipped daemon entry daemon\n\
 deny consistency = self-contradiction check\n\
 optional context-transform/v1: no provider (consumer degrades, by declaration)\n\
@@ -931,10 +946,17 @@ note: disabled (disabled) claims credentials-provider/v1"
 
         let report = lint_config(&config, false).await;
         assert_eq!(report.outcome, LintOutcome::SemanticViolation);
-        assert!(report
+        assert!(
+            !report
+                .render()
+                .contains("deny consistency = self-contradiction check"),
+            "internal consistency vocabulary belongs behind --verbose"
+        );
+        let verbose = lint_config(&config, true).await;
+        assert!(verbose
             .render()
             .contains("deny consistency = self-contradiction check"));
-        assert!(report.render().contains(
+        assert!(verbose.render().contains(
             "requires_deny_conflict module=contradictory capability=credentials-provider/v1"
         ));
     }
@@ -966,8 +988,13 @@ note: disabled (disabled) claims credentials-provider/v1"
         assert!(
             report
                 .render()
-                .contains("partial: evaluation incomplete (manifest_exit_nonzero: broken)"),
+                .contains("checked 1 of 2 configured modules — broken do not expose a manifest"),
             "report:\n{}",
+            report.render()
+        );
+        assert!(
+            !report.render().contains("partial: evaluation incomplete"),
+            "instrument detail belongs behind --verbose:\n{}",
             report.render()
         );
         assert!(report
@@ -982,7 +1009,12 @@ note: disabled (disabled) claims credentials-provider/v1"
 
         let report = lint_config(&config, false).await;
         assert_eq!(report.outcome, LintOutcome::OperationalFailure);
-        assert_eq!(report.render(), "examined 0 of 0 configured\noperational failure: no modules examined (vacuity floor)\ndeny consistency = self-contradiction check");
+        assert_eq!(report.render(), "checked 0 of 0 configured modules");
+        let verbose = lint_config(&config, true).await;
+        assert!(verbose.render().contains("vacuity floor"));
+        assert!(verbose
+            .render()
+            .contains("deny consistency = self-contradiction check"));
     }
 
     #[tokio::test]

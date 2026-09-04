@@ -19,10 +19,11 @@ use std::{
     io::{self, IsTerminal, Read, Seek, SeekFrom},
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
-    process,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    process, thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use subc_control::{CatalogEntry, ClientControlRequest, ClientControlResponse};
 // The connection-file name embeds a per-user token. `ck` must derive it the same
@@ -51,68 +52,263 @@ const CK_HARNESS: &str = "ck";
 // production baseline data; then calibrate whether every window minute is needed.
 const FRAME_DROP_ALERT_REQUIRED_NONZERO_MINUTES: u64 = 10;
 
-const TOP_HELP_BASE: &str = "ck — CortexKit operator CLI\n\nusage:\n  ck [--subc <connection-file>] [--json] <domain> [<verb>] [<args>]\n\ndomains:\n  setup     plan and apply the managed CortexKit installation\n  upgrade   plan managed component upgrades\n  module    supervised modules: list, status, stderr, terminals, restart, stop, start, rescan, release\n  routes    live consumers for one module or the whole daemon\n  provenance daemon-attested and module-declared build/process facts\n  health    one-line health for every supervised module\n  quota     AI-provider quota and usage windows\n  fleet     offline configured-module inspection\n  daemon    daemon version, uptime, connection info, and offline triage";
+const TOP_HELP_BASE: &str = "ck — CortexKit operator CLI\n\nusage:\n  ck [--subc <connection-file>] [--json] <domain> [<verb>] [<args>]\n\ndomains:\n  setup     plan and apply the managed CortexKit installation\n  upgrade   plan managed component upgrades\n  module    supervised modules: list, status, stderr, terminals, restart, stop, start, rescan, release\n  routes    live consumers for one module or the whole daemon\n  provenance daemon-attested and module-declared build/process facts\n  health    one-line health for every supervised module\n  quota     AI-provider quota and usage windows\n  daemon    daemon version, uptime, connection info, offline triage, and CI lint";
 
 const TOP_HELP_TAIL: &str = "flags:\n  --subc <file>   use a specific connection file (default: auto-discover)\n  --json          raw JSON output instead of tables\n\nrun 'ck <domain>' with no verb to see that domain's commands";
 
-/// Top-level help: ONE domains list. Built-ins carry descriptions; the rest
-/// are discovered from PATH (any executable named ck-<domain>) and listed in
-/// the same block. Whether a domain is compiled in or dispatched to a
-/// ck-<domain> binary is an implementation detail an operator has no use for
-/// -- the earlier two-section rendering (\"domains\" vs \"installed domains\")
-/// made users learn it anyway.
+const DOMAIN_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+const DOMAIN_PROBE_CACHE_FILE: &str = "domain-probes.json";
+
+/// Names of installed module programs, derived from setup's component tables so
+/// the dispatcher cannot drift when a component gains another supported target.
+fn module_binary_names() -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    for component in setup::Component::ALL {
+        if let Some(program) = setup::module_program(component) {
+            names.insert(program.strip_prefix("ck-").unwrap_or(program).to_string());
+        }
+    }
+    for target in setup::AlphaTarget::ALL {
+        for binary in setup::component_binaries_for_target(setup::Component::Core, target) {
+            names.insert(binary.strip_prefix("ck-").unwrap_or(binary).to_string());
+        }
+    }
+    names
+}
+
+#[derive(Clone, Debug)]
+struct ExternalDomainCandidate {
+    name: String,
+    path: PathBuf,
+}
+
+#[derive(Clone, Debug)]
+struct ExternalDomain {
+    name: String,
+    headline: String,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+struct DomainProbeCache {
+    entries: BTreeMap<String, DomainProbeCacheEntry>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct DomainProbeCacheEntry {
+    size: u64,
+    modified_secs: u64,
+    modified_nanos: u32,
+    headline: Option<String>,
+}
+
+/// Top-level help has one domain list. External commands have to opt in so a
+/// module binary on PATH cannot accidentally become an operator command.
 fn top_help() -> String {
     let external = discover_external_domains();
     let mut out = String::from(TOP_HELP_BASE);
     for domain in &external {
-        out.push_str(&format!("\n  {domain}"));
+        out.push_str(&format!("\n  {:<9} {}", domain.name, domain.headline));
     }
     out.push_str("\n\n");
     out.push_str(TOP_HELP_TAIL);
     out
 }
 
-/// Executables named `ck-<domain>` on PATH, deduped and sorted. The `ck-`
-/// prefix is also the fleet's supervised-daemon naming convention, so daemon
-/// binaries living in module data dirs are naturally absent (not on PATH).
-fn discover_external_domains() -> Vec<String> {
+/// Finds the first executable for each `ck-<name>` PATH entry, matching the
+/// executable that dispatch would run when more than one directory has a name.
+fn external_domain_candidates() -> BTreeMap<String, ExternalDomainCandidate> {
     let Some(path_var) = env::var_os("PATH") else {
-        return Vec::new();
+        return BTreeMap::new();
     };
-    let mut domains = Vec::new();
-    for dir in env::split_paths(&path_var) {
-        let Ok(entries) = fs::read_dir(&dir) else {
+    let mut candidates = BTreeMap::new();
+    for directory in env::split_paths(&path_var) {
+        let Ok(entries) = fs::read_dir(&directory) else {
             continue;
         };
         for entry in entries.flatten() {
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
-            let Some(domain) = name.strip_prefix("ck-") else {
+            let Some(name) = name.strip_prefix("ck-") else {
                 continue;
             };
-            if domain.is_empty() {
+            let name = name.strip_suffix(".exe").unwrap_or(name);
+            if name.is_empty() || candidates.contains_key(name) {
                 continue;
             }
+            let path = entry.path();
             #[cfg(unix)]
-            {
+            let executable = {
                 use std::os::unix::fs::PermissionsExt;
-                // fs::metadata (not DirEntry::metadata) so symlinked tools count:
-                // installed ck-* binaries are conventionally symlinks into
-                // target/release trees.
-                let executable = fs::metadata(entry.path())
-                    .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-                    .unwrap_or(false);
-                if !executable {
-                    continue;
-                }
+                fs::metadata(&path)
+                    .map(|metadata| {
+                        metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+                    })
+                    .unwrap_or(false)
+            };
+            #[cfg(not(unix))]
+            let executable = fs::metadata(&path)
+                .map(|metadata| metadata.is_file())
+                .unwrap_or(false);
+            if !executable {
+                continue;
             }
-            let domain = domain.strip_suffix(".exe").unwrap_or(domain);
-            domains.push(domain.to_string());
+            let absolute = fs::canonicalize(&path).unwrap_or_else(|_| {
+                if path.is_absolute() {
+                    path
+                } else {
+                    env::current_dir()
+                        .map(|current| current.join(path))
+                        .unwrap_or_else(|_| PathBuf::from(name))
+                }
+            });
+            candidates.insert(
+                name.to_string(),
+                ExternalDomainCandidate {
+                    name: name.to_string(),
+                    path: absolute,
+                },
+            );
         }
     }
-    domains.sort();
-    domains.dedup();
-    domains
+    candidates
+}
+
+fn discover_external_domains() -> Vec<ExternalDomain> {
+    external_domain_candidates()
+        .into_values()
+        .filter(|candidate| !is_builtin_domain(&candidate.name))
+        .filter_map(|candidate| {
+            probe_external_domain(&candidate).map(|headline| ExternalDomain {
+                name: candidate.name,
+                headline,
+            })
+        })
+        .collect()
+}
+
+fn probe_external_domain(candidate: &ExternalDomainCandidate) -> Option<String> {
+    let cache_path = domain_probe_cache_path();
+    let mut cache = read_domain_probe_cache(&cache_path);
+    let stamp = domain_probe_stamp(&candidate.path)?;
+    let key = candidate.path.to_string_lossy().into_owned();
+    if let Some(entry) = cache.entries.get(&key) {
+        if entry.size == stamp.size
+            && entry.modified_secs == stamp.modified_secs
+            && entry.modified_nanos == stamp.modified_nanos
+        {
+            return entry.headline.clone();
+        }
+    }
+
+    let headline = run_domain_probe(&candidate.path);
+    cache.entries.insert(
+        key,
+        DomainProbeCacheEntry {
+            size: stamp.size,
+            modified_secs: stamp.modified_secs,
+            modified_nanos: stamp.modified_nanos,
+            headline: headline.clone(),
+        },
+    );
+    let _ = write_domain_probe_cache(&cache_path, &cache);
+    headline
+}
+
+fn domain_probe_stamp(path: &Path) -> Option<DomainProbeCacheEntry> {
+    let metadata = fs::metadata(path).ok()?;
+    let modified = metadata.modified().ok()?.duration_since(UNIX_EPOCH).ok()?;
+    Some(DomainProbeCacheEntry {
+        size: metadata.len(),
+        modified_secs: modified.as_secs(),
+        modified_nanos: modified.subsec_nanos(),
+        headline: None,
+    })
+}
+
+fn run_domain_probe(path: &Path) -> Option<String> {
+    let mut child = process::Command::new(path)
+        .arg("--ck-domain")
+        .stdout(process::Stdio::piped())
+        .stderr(process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let stdout = child.stdout.take()?;
+    let reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut std::io::BufReader::new(stdout), &mut bytes);
+        bytes
+    });
+    let deadline = Instant::now() + DOMAIN_PROBE_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+        }
+    };
+    let output = reader.join().ok()?;
+    let status = status?;
+    if !status.success() {
+        return None;
+    }
+    let output = String::from_utf8(output).ok()?;
+    let mut lines = output.lines();
+    let headline = lines.next()?.trim();
+    if headline.is_empty() || lines.next().is_some() {
+        return None;
+    }
+    Some(headline.to_string())
+}
+
+fn domain_probe_cache_path() -> PathBuf {
+    if let Some(update_cache_path) =
+        env::var_os("CK_UPDATE_CACHE_PATH").filter(|path| !path.is_empty())
+    {
+        let update_cache_path = PathBuf::from(update_cache_path);
+        if let Some(parent) = update_cache_path.parent() {
+            return parent.join(DOMAIN_PROBE_CACHE_FILE);
+        }
+    }
+    if let Some(cache_home) = env::var_os("XDG_CACHE_HOME").filter(|path| !path.is_empty()) {
+        return PathBuf::from(cache_home)
+            .join("cortexkit")
+            .join(DOMAIN_PROBE_CACHE_FILE);
+    }
+    if let Some(home) = env::var_os("HOME").filter(|path| !path.is_empty()) {
+        return PathBuf::from(home)
+            .join(".cache")
+            .join("cortexkit")
+            .join(DOMAIN_PROBE_CACHE_FILE);
+    }
+    PathBuf::from(".cache")
+        .join("cortexkit")
+        .join(DOMAIN_PROBE_CACHE_FILE)
+}
+
+fn read_domain_probe_cache(path: &Path) -> DomainProbeCache {
+    fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+fn write_domain_probe_cache(path: &Path, cache: &DomainProbeCache) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("cache path {} has no parent", path.display()))?;
+    fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    let temporary = path.with_extension(format!("tmp-{}", process::id()));
+    let bytes = serde_json::to_vec(cache).map_err(|error| error.to_string())?;
+    fs::write(&temporary, bytes).map_err(|error| error.to_string())?;
+    if let Err(error) = fs::rename(&temporary, path) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error.to_string());
+    }
+    Ok(())
 }
 
 const MODULE_HELP: &str = "ck module — inspect and control supervised modules\n\nusage: ck [--json] module <verb> [<args>]\n\nverbs:\n  ck module list            all modules with state and health\n  ck module status <id>     one module in detail
@@ -126,11 +322,9 @@ const QUOTA_HELP: &str = "ck quota - AI-provider quota and usage windows\n\nusag
 
 const HEALTH_HELP: &str = "ck health — module health\n\nusage: ck [--json] health [<module-id>]\n\n  ck health            one-line health for every supervised module (cached)\n  ck health <id>       fresh health.check probe with FULL metrics — bypasses\n                       the supervisor cache and its size truncation";
 
-const DAEMON_HELP: &str = "ck daemon — daemon version, uptime, connection info, and offline triage\n\nusage:\n  ck [--json] daemon\n  ck [--json] daemon triage\n\n  triage reads only the local run directory; it never contacts the daemon.";
+const DAEMON_HELP: &str = "ck daemon — daemon version, uptime, connection info, offline triage, and CI lint\n\nusage:\n  ck [--json] daemon\n  ck [--json] daemon triage\n  ck daemon lint [<config>] [--verbose]\n\n  triage reads only the local run directory; it never contacts the daemon.\n  lint reads module manifests without connecting to the daemon.";
 
-const FLEET_HELP: &str = "ck fleet — offline configured-module inspection\n\nusage:\n  ck fleet lint [<config>] [--verbose]\n\n`lint` reads module manifests without connecting to the daemon.";
-
-const SETUP_HELP: &str = "ck setup — plan managed CortexKit installation\n\nusage:\n  ck setup [aft|mc|insula|claustrum|synapse] [--with aft,mc,insula,claustrum,synapse] [--dry-run]\n  ck setup claustrum [--key-path <file>]\n  ck setup <aft|mc> --convert [--confirm]\n  ck setup --uninstall [--dry-run]\n\n  Bare setup installs core and offers optional components. --dry-run prints the\n  complete plan without calling an installation mutator. --convert is explicit\n  and requires --confirm before it can apply a conversion plan.";
+const SETUP_HELP: &str = "ck setup — plan managed CortexKit installation\n\nusage:\n  ck setup [aft|mc|insula|claustrum|synapse] [--with aft,mc,insula,claustrum,synapse] [--dry-run]\n  ck setup claustrum [--key-path <file>]\n  ck setup <aft|mc> --convert [--confirm]\n  ck setup --uninstall [--dry-run]\n\n  Bare setup installs core and offers optional components. --dry-run prints the\n  complete plan without calling an installation mutator. --convert is explicit\n  and requires --confirm before it can apply a conversion plan. --verbose includes\n  download diagnostics when a network request fails.";
 
 const UPGRADE_HELP: &str = "ck upgrade — plan managed component upgrades\n\nusage:\n  ck upgrade\n  ck upgrade --check\n\n  --check prints target availability and ordered operations without replacing\n  binaries or restarting a runtime. MC is wiring-only in alpha and is not an\n  upgrade target.";
 
@@ -558,14 +752,14 @@ fn dashboard_module_is_warming(health_entries: &[Value], module: &Value) -> bool
 }
 
 fn print_static_domains() {
-    const BUILTIN_DOMAINS: [&str; 6] = ["module", "routes", "health", "quota", "fleet", "daemon"];
+    const BUILTIN_DOMAINS: [&str; 5] = ["module", "routes", "health", "quota", "daemon"];
     let mut domains = BUILTIN_DOMAINS
         .iter()
         .map(|domain| (*domain).to_string())
         .collect::<Vec<_>>();
     for external in discover_external_domains() {
-        if !domains.iter().any(|domain| domain == &external) {
-            domains.push(external);
+        if !domains.iter().any(|domain| domain == &external.name) {
+            domains.push(external.name);
         }
     }
     println!("\ndomains:\n  {}", domains.join("  "));
@@ -642,20 +836,39 @@ fn display_home_path(path: &Path) -> String {
     }
 }
 
-/// Git-style external dispatch: `ck <domain> …` runs `ck-<domain> …` from PATH,
-/// passing the tail through verbatim and propagating the child's exit code.
-/// Dispatcher-local flags (`--subc`, `--json`) given BEFORE the domain are not
-/// forwarded; an external tool parses its own flags from the tail.
+/// Dispatch only a binary that completed the domain handshake. The handshake
+/// result is cached, but a changed executable gets a new stamp and is probed
+/// again before it can receive operator input.
 fn dispatch_external(domain: &str, tail: &[OsString]) -> Result<(), CkError> {
-    let program = format!("ck-{domain}");
-    match process::Command::new(&program).args(tail).status() {
-        Ok(status) => process::exit(status.code().unwrap_or(1)),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Err(CkError::Usage(format!(
-            "unknown domain '{domain}' (no built-in command and no '{program}' on PATH)\n\n{}",
-            top_help()
-        ))),
-        Err(err) => Err(CkError::Message(format!("failed to run {program}: {err}"))),
+    let module_names = module_binary_names();
+    let candidate = external_domain_candidates().remove(domain);
+    let Some(candidate) = candidate else {
+        return if module_names.contains(domain) {
+            Err(CkError::ModuleNotCommand(domain.to_string()))
+        } else {
+            Err(CkError::Usage(format!(
+                "unknown command '{domain}'. Run ck --help."
+            )))
+        };
+    };
+    if probe_external_domain(&candidate).is_some() {
+        let status = process::Command::new(&candidate.path)
+            .args(tail)
+            .status()
+            .map_err(|error| {
+                CkError::Message(format!(
+                    "failed to run {}: {error}",
+                    candidate.path.display()
+                ))
+            })?;
+        process::exit(status.code().unwrap_or(1));
     }
+    if module_names.contains(domain) {
+        return Err(CkError::ModuleNotCommand(domain.to_string()));
+    }
+    Err(CkError::Usage(format!(
+        "unknown command '{domain}'. Run ck --help."
+    )))
 }
 
 struct CkArgs {
@@ -4227,6 +4440,7 @@ fn parse_setup_command(tail: &[OsString]) -> Result<setup::SetupRequest, CkError
     let mut used_with = false;
     let mut uninstall = false;
     let mut dry_run = false;
+    let mut verbose = false;
     let mut convert = false;
     let mut conversion_confirmed = false;
     let mut claustrum_key_path = None;
@@ -4265,6 +4479,10 @@ fn parse_setup_command(tail: &[OsString]) -> Result<setup::SetupRequest, CkError
             }
             "--dry-run" => {
                 dry_run = true;
+                index += 1;
+            }
+            "--verbose" => {
+                verbose = true;
                 index += 1;
             }
             "--uninstall" => {
@@ -4341,6 +4559,7 @@ fn parse_setup_command(tail: &[OsString]) -> Result<setup::SetupRequest, CkError
     let mut request = setup::SetupRequest::install(optional.into_iter().collect());
     request.uninstall = uninstall;
     request.dry_run = dry_run;
+    request.verbose = verbose;
     request.convert = if convert { explicit_component } else { None };
     request.conversion_confirmed = conversion_confirmed;
     if claustrum_selected {
@@ -4482,7 +4701,6 @@ fn is_builtin_domain(domain: &str) -> bool {
             | "health"
             | "daemon"
             | "quota"
-            | "fleet"
             | "help"
     )
 }
@@ -4500,7 +4718,6 @@ fn parse_command(domain: &str, tail: &[OsString]) -> Result<Command, CkError> {
                 Some("routes") => ROUTES_HELP.into(),
                 Some("provenance") => PROVENANCE_HELP.into(),
                 Some("quota") => QUOTA_HELP.into(),
-                Some("fleet") => FLEET_HELP.into(),
                 Some("health") => HEALTH_HELP.into(),
                 Some("daemon") => DAEMON_HELP.into(),
                 _ => top_help(),
@@ -4635,40 +4852,10 @@ fn parse_command(domain: &str, tail: &[OsString]) -> Result<Command, CkError> {
             if tail.len() == 1 && tail[0] == "triage" {
                 return Ok(Command::DaemonTriage);
             }
+            if tail.first().is_some_and(|verb| verb == "lint") {
+                return parse_daemon_lint(&tail[1..]);
+            }
             Ok(Command::Help(DAEMON_HELP.into()))
-        }
-        "fleet" => {
-            let Some(verb) = tail.first().map(|value| value.to_string_lossy()) else {
-                return Ok(Command::Help(FLEET_HELP.into()));
-            };
-            if matches!(verb.as_ref(), "-h" | "--help" | "help") {
-                return Ok(Command::Help(FLEET_HELP.into()));
-            }
-            if verb != "lint" {
-                return Err(CkError::Usage(format!(
-                    "unknown verb 'fleet {verb}'\n\n{FLEET_HELP}"
-                )));
-            }
-
-            let mut config = None;
-            let mut verbose = false;
-            for argument in &tail[1..] {
-                let argument = argument.to_string_lossy();
-                if argument == "--verbose" {
-                    verbose = true;
-                } else if argument.starts_with('-') {
-                    return Err(CkError::Usage(format!(
-                        "unknown fleet lint flag '{argument}'\n\n{FLEET_HELP}"
-                    )));
-                } else if config.is_none() {
-                    config = Some(PathBuf::from(argument.into_owned()));
-                } else {
-                    return Err(CkError::Usage(format!(
-                        "ck fleet lint accepts at most one config path\n\n{FLEET_HELP}"
-                    )));
-                }
-            }
-            Ok(Command::FleetLint { config, verbose })
         }
         "quota" => {
             let mut provider_id = None;
@@ -4694,6 +4881,28 @@ fn parse_command(domain: &str, tail: &[OsString]) -> Result<Command, CkError> {
             tail: tail.to_vec(),
         }),
     }
+}
+
+fn parse_daemon_lint(tail: &[OsString]) -> Result<Command, CkError> {
+    let mut config = None;
+    let mut verbose = false;
+    for argument in tail {
+        let argument = argument.to_string_lossy();
+        if argument == "--verbose" {
+            verbose = true;
+        } else if argument.starts_with('-') {
+            return Err(CkError::Usage(format!(
+                "unknown daemon lint flag '{argument}'\n\n{DAEMON_HELP}"
+            )));
+        } else if config.is_none() {
+            config = Some(PathBuf::from(argument.into_owned()));
+        } else {
+            return Err(CkError::Usage(format!(
+                "ck daemon lint accepts at most one config path\n\n{DAEMON_HELP}"
+            )));
+        }
+    }
+    Ok(Command::FleetLint { config, verbose })
 }
 
 fn take_value(args: &mut impl Iterator<Item = OsString>, flag: &str) -> Result<OsString, CkError> {
@@ -4852,6 +5061,7 @@ enum CkError {
         source: String,
     },
     Rejected(String),
+    ModuleNotCommand(String),
     WithFooter {
         error: Box<CkError>,
         footer: String,
@@ -4876,6 +5086,7 @@ impl CkError {
             Self::Usage(_) | Self::Discovery { .. } => 2,
             Self::Connection { .. } => 3,
             Self::Rejected(_) | Self::Message(_) | Self::Json(_) | Self::UpdateCheck(_) => 1,
+            Self::ModuleNotCommand(_) => 64,
             Self::FleetLintConfig(_) => 2,
             Self::FleetLintExit { exit_code } | Self::TriageExit { exit_code } => *exit_code,
             Self::WithFooter { error, .. } => error.exit_code(),
@@ -4903,8 +5114,12 @@ impl fmt::Display for CkError {
                 )
             }
             Self::Rejected(message) => write!(f, "{message}"),
+            Self::ModuleNotCommand(module) => write!(
+                f,
+                "'{module}' is a module, not a command. Try: ck module status {module}"
+            ),
             Self::Message(message) => write!(f, "{message}"),
-            Self::FleetLintConfig(message) => write!(f, "ck fleet lint: {message}"),
+            Self::FleetLintConfig(message) => write!(f, "ck daemon lint: {message}"),
             Self::UpdateCheck(error) => error.fmt(f),
             Self::FleetLintExit { .. } | Self::TriageExit { .. } => Ok(()),
             Self::Json(source) => write!(f, "json: {source}"),
@@ -4929,6 +5144,19 @@ mod tests {
     /// ones; within each cohort the order stays alphabetical. The cohort test
     /// is structural, so a NEW balance provider lands at the end without a
     /// name list knowing about it.
+    #[test]
+    fn module_binary_names_include_every_setup_module_program() {
+        let names = module_binary_names();
+        assert!(
+            names.contains("mc"),
+            "MC must remain a module command rejection"
+        );
+        assert!(
+            names.contains("synapse"),
+            "synapse must remain a module command rejection"
+        );
+    }
+
     #[test]
     fn setup_and_upgrade_identity_does_not_use_a_bare_argv_zero() {
         let argv_zero = Path::new("ck");

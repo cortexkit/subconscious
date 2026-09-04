@@ -4507,10 +4507,14 @@ fn health_operator_detail(entry: &Value) -> Option<String> {
         ));
     }
 
+    // A detail that only restates the status (`ok` beside `ok`) tells the
+    // reader nothing; the row reads cleaner with the absence mark.
+    let status = entry.get("status").and_then(Value::as_str);
     entry
         .get("detail")
         .and_then(Value::as_str)
         .filter(|detail| !detail.is_empty())
+        .filter(|detail| Some(detail.trim()) != status)
         .map(str::to_string)
 }
 
@@ -5795,6 +5799,22 @@ impl From<serde_json::Error> for CkError {
 
 #[cfg(test)]
 mod tests {
+    /// A module whose detail string is just its status again (synapse sends
+    /// `detail: "ok"`) rendered `ok  ok` on the health overview; a real detail
+    /// still shows, and an absent one stays absent.
+    #[test]
+    fn health_detail_that_restates_the_status_is_elided() {
+        let restated = json!({"status": "ok", "detail": "ok"});
+        assert_eq!(health_operator_detail(&restated), None);
+        let real = json!({"status": "ok", "detail": "3 roots warming"});
+        assert_eq!(
+            health_operator_detail(&real).as_deref(),
+            Some("3 roots warming")
+        );
+        let absent = json!({"status": "ok"});
+        assert_eq!(health_operator_detail(&absent), None);
+    }
+
     /// Balance-only providers (spend, no primary window) sort AFTER windowed
     /// ones; within each cohort the order stays alphabetical. The cohort test
     /// is structural, so a NEW balance provider lands at the end without a

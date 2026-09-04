@@ -1,0 +1,168 @@
+=== ck 
+ck 0.17.12 · daemon running (pid 6257, up 8h, 5 clients)
+modules: aft ok · claustrum ok · insula ok · synapse ok
+updates: none
+BUILD SKEW: daemon 3af17351a61f != ck e83801329579 -- one of the pair is stale;
+  fields this ck expects may be absent from the daemon (or arrive unrecognized)
+
+commands: setup · upgrade · module · health · routes · quota · daemon
+run `ck <command>` for its verbs, `ck --help` for everything
+rc=0
+=== ck --help
+ck — CortexKit operator CLI
+
+usage:
+  ck [--subc <connection-file>] [--json] <domain> [<verb>] [<args>]
+
+domains:
+  setup     plan and apply the managed CortexKit installation
+  upgrade   plan managed component upgrades
+  module    supervised modules: list, status, stderr, terminals, restart, stop, start, rescan, release
+  routes    live consumers for one module or the whole daemon
+  provenance daemon-attested and module-declared build/process facts
+  health    one-line health for every supervised module
+  quota     AI-provider quota and usage windows
+  daemon    daemon version, uptime, connection info, offline triage, and CI lint
+
+flags:
+  --subc <file>   use a specific connection file (default: auto-discover)
+  --json          raw JSON output instead of tables
+  --verbose       include diagnostic detail and complete metrics
+
+run 'ck <domain>' with no verb to see that domain's commands
+rc=0
+=== ck health
+aft        ok  -
+claustrum  ok  -
+insula     ok  1 provider degraded (antigravity); 36 not configured
+synapse    ok  -
+rc=0
+=== ck module list
+module     status   health
+aft        running  ok    
+claustrum  running  ok    
+insula     running  ok    
+synapse    running  ok    
+rc=0
+=== ck module status aft
+aft — running, healthy
+  pid 6291 · started 8h ago · restarts 0 of 3
+  last exit: none
+  binary: ~/.local/share/cortexkit/bin/ck-aft (running image matches)
+metrics: run `ck health aft`
+rc=0
+=== ck module status nosuch
+no module named 'nosuch'. Run ck module list.
+rc=1
+=== ck module terminals aft
+no exits recorded since the daemon started (8h ago)
+rc=0
+=== ck module rescan --dry-run
+no changes: 4 modules match subc.jsonc
+rc=0
+=== ck health insula
+insula: ok
+  1 provider degraded (antigravity); 36 not configured
+  buildCommit: b5d61da65729
+  cookieCohortTotal: 9
+  fetchBlackout: disabled
+  fresh: 0
+  lastFetchSuccessAgeSecs: none
+  lastRefusedAgeSecs: none
+  lastServedAgeSecs: 16s ago
+  lastTickAgeSecs: 1s ago
+  pending: 0
+  providersTotal: 37
+  quotaComparisonsNoDrop: 0
+  quotaDropsObservedContinuously: 0
+  refresherStalled: disabled
+  stale: 0
+  staleEpisodes: 0
+  usageRequestsRefused: 0
+  usageRequestsServed: 5
+  vaultConnectionsEstablished: 0
+  vaultStaleGenerationDrops: 0
+  vaultUnmatchedDrops: 0
+rc=0
+=== ck health aft
+aft: ok
+  actor_count: 0
+  callgraph_commits_60s_total: 0
+  callgraph_pages_or_bytes_written_60s_total: 0 B
+  callgraph_repair_entries_60s_total: 0
+  callgraph_repair_roots_annotated: 0
+  callgraph_repair_roots_total: 0
+  root_count: 0
+  root_details_omitted: 0
+  snapshot_age_ms: 480 ms
+rc=0
+=== ck quota
+Antigravity — not running locally
+
+36 providers not configured
+rc=0
+=== ck daemon
+daemon 0.17.5 · pid 6257 · up 8h · 5 clients · no frame drops in the last 10 minutes
+BUILD SKEW: daemon 3af17351a61f != ck e83801329579 -- one of the pair is stale;
+  fields this ck expects may be absent from the daemon (or arrive unrecognized)
+rc=0
+=== ck daemon triage
+daemon appears live: connection file present, pid 6257 alive
+run dir: /var/folders/kr/rqmxz_9d2l91359qbjs8jshh0000gn/T
+start-lock:
+  /Users/cortexkit/.local/share/cortexkit/run/subc-connection.json.start-lock: absent
+    finding: start-lock absent
+  /var/folders/kr/rqmxz_9d2l91359qbjs8jshh0000gn/T/subc-501.connection.json.start-lock: present
+    size: 0 B
+    modified: 1d ago
+connection-file:
+  /Users/cortexkit/.local/share/cortexkit/run/subc-connection.json: absent
+    finding: connection file absent
+  /var/folders/kr/rqmxz_9d2l91359qbjs8jshh0000gn/T/subc-501.connection.json: present
+    size: 662 B
+    modified: 8h ago
+    parses as JSON: valid
+    fields: daemon_id present · port present (8757) · wire_version present
+  selected: /var/folders/kr/rqmxz_9d2l91359qbjs8jshh0000gn/T/subc-501.connection.json
+    port: 8757
+    daemon_id: c678c16279be5e192fb0abce697f628a
+    wire_version: 2
+process-liveness:
+  pid 6257 alive; executable ck-subc matches ck-subc
+log-tail:
+  /var/folders/kr/rqmxz_9d2l91359qbjs8jshh0000gn/T/subc.log: absent
+  finding: log absent
+rc=0
+=== ck provenance aft
+Daemon build
+  commit: 3af17351a61f47380cc6ef83ea2fa8940b0d1b88
+  lock digest: 3b98b5cd19d02371beb199b395f49963b949b9030374ddb0840228474b152736
+Daemon observed
+  pid: 6257
+  started 8h ago
+  running image matches the file it was spawned from
+Module: aft
+Module declared
+  unverifiable
+Daemon observed
+  pid: 6291
+  started 8h ago
+  spawned from: /Users/cortexkit/.local/share/cortexkit/bin/ck-aft
+  running image matches the file it was spawned from
+rc=0
+=== ck routes
+no live routes
+rc=0
+=== ck nosuch
+unknown command 'nosuch'. Run ck --help.
+rc=1
+=== ck mc
+'mc' is a module, not a command. Try: ck module status magic-context
+rc=1
+=== ck setup
+CortexKit is set up: daemon running, aft · claustrum · insula · synapse ok.
+Optional modules not installed: mc — run `ck setup mc`.
+rc=0
+=== ck upgrade
+Everything is up to date (ck-subc 0.17.5 · ck-subc-mcp · ck-aft 0.55.1).
+rc=0

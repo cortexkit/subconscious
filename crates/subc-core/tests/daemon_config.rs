@@ -2,7 +2,6 @@ use std::{
     collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
-    process::Command,
     time::Duration,
 };
 
@@ -33,7 +32,7 @@ use tokio::{
 };
 
 mod common;
-use common::connect_authed_client;
+use common::{ck_under_test_command, connect_authed_client};
 
 const READ_TIMEOUT: Duration = Duration::from_secs(2);
 const START_TIMEOUT: Duration = Duration::from_secs(10);
@@ -896,7 +895,7 @@ async fn ck_module_rescan_prints_reconcile_table() {
     )
     .unwrap();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_ck"))
+    let output = ck_under_test_command()
         .args(["module", "rescan", "--subc"])
         .arg(&daemon.connection_file_path)
         .output()
@@ -998,7 +997,7 @@ async fn required_capability_absence_surfaces_in_health_and_server_describe() {
             daemon.connection_file_path.to_str().unwrap(),
         ],
     ] {
-        let output = Command::new(env!("CARGO_BIN_EXE_ck"))
+        let output = ck_under_test_command()
             .args(args)
             .output()
             .expect("ck launches");
@@ -1067,7 +1066,7 @@ async fn rescan_preview_reports_removal_that_strands_a_capability_consumer() {
             == 1,
         "preview must not remove the provider it warns about"
     );
-    let output = Command::new(env!("CARGO_BIN_EXE_ck"))
+    let output = ck_under_test_command()
         .args(["module", "rescan", "--dry-run", "--subc"])
         .arg(&daemon.connection_file_path)
         .output()

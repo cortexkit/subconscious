@@ -1,6 +1,6 @@
 [package]
 name = "subc-core"
-version = "0.17.13"
+version = "0.17.14"
 edition = "2021"
 license = "MIT"
 publish = false
@@ -15,13 +15,28 @@ description = "subc daemon core: loopback TCP transport and opaque-byte splice r
 name = "ck-subc"
 path = "src/main.rs"
 
+# Keep the shipped CLI explicit because the test-only target shares its source.
+# It has no required features, so release builds cannot include test-only code.
+[[bin]]
+name = "ck"
+path = "src/bin/ck.rs"
+
+# Integration tests run this target rather than the shipped `ck`. Its required
+# feature makes the test key path a property of the target, never of the Cargo
+# invocation.
+[[bin]]
+name = "ck-under-test"
+path = "src/bin/ck.rs"
+required-features = ["test-support"]
+
 [features]
 bench-harness = []
 loom = []
 # Test-only: enables the `test_support` module (the `TestTempDir` RAII guard)
 # for the crate's integration tests. The crate's own unit tests get the module
 # via `#[cfg(test)]`; integration tests (a separate crate) enable this feature
-# through the self dev-dependency below. Never enabled in a production build.
+# through the self dev-dependency below. A required-feature test binary keeps
+# this code, including the release-index test key, out of shipped `ck` builds.
 test-support = []
 
 [[bench]]

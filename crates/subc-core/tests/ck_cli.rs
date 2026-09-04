@@ -356,6 +356,70 @@ fn setup_dry_run_refuses_when_the_signature_header_is_stripped() {
 }
 
 #[test]
+fn production_ck_ignores_the_test_release_index_key() {
+    let production = Path::new(env!("CARGO_BIN_EXE_ck"));
+    let shape = Command::new(production)
+        .arg("--ck-build-shape")
+        .output()
+        .expect("production ck build shape");
+    let shape = String::from_utf8_lossy(&shape.stdout);
+    if shape.trim() == "test-support: on" {
+        eprintln!(
+            "skipping production-key control: {} was built with test-support for this invocation",
+            production.display()
+        );
+        return;
+    }
+    assert_eq!(
+        shape.trim(),
+        "test-support: off",
+        "production ck returned an unknown build shape: {shape:?}"
+    );
+
+    let index = serve_signed_index(|base| setup_index(base, None));
+    let temp = TempDir::new("production-ck-release-key");
+    let home = temp.path().join("home");
+    let data_home = home.join(".local").join("share");
+    let config_home = home.join(".config");
+    let tools = temp.path().join("tools");
+    fs::create_dir_all(&tools).expect("service-manager fixture directory");
+    // A successful but non-running service-manager response lets setup reach the
+    // release-index check without consulting a real user daemon.
+    write_executable(
+        &tools.join(service_manager_program()),
+        "#!/bin/sh\nexit 0\n",
+    );
+    let path = std::env::join_paths(std::iter::once(tools).chain(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )))
+    .expect("fixture PATH");
+    let output = Command::new(production)
+        .args(["setup", "--dry-run"])
+        .env("CK_RELEASE_INDEX_URL", &index.url)
+        .env("CK_TEST_RELEASE_INDEX_PUBKEY", &index.public_key)
+        .env(
+            "CK_UPDATE_CACHE_PATH",
+            temp.path().join("update-metadata.json"),
+        )
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("LOCALAPPDATA", &data_home)
+        .env("XDG_DATA_HOME", &data_home)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("PATH", path)
+        .env("SUBC_CONNECTION_FILE", home.join("no-daemon.json"))
+        .output()
+        .expect("production ck launches");
+
+    assert_ne!(output.status.code(), Some(0), "foreign key must refuse");
+    let combined = format!("{}{}", text(&output.stdout), text(&output.stderr));
+    assert!(
+        combined.contains("index_signature_invalid"),
+        "stdout+stderr:\n{combined}"
+    );
+}
+
+#[test]
 fn setup_dry_run_refuses_a_test_key_signature_against_the_embedded_key() {
     let url = serve_index(&fixture_index_body(), Some(FOREIGN_SIGNATURE));
     let output = bare_setup_dry_run(&url).output().unwrap();
@@ -1070,7 +1134,7 @@ impl UpgradeFixture {
         write_executable(&aft, "#!/bin/sh\necho 'ck-aft 0.55.1'\n");
         write_executable(&daemon, "#!/bin/sh\necho 'ck-subc 0.17.9'\n");
         write_executable(&mcp, "#!/bin/sh\necho 'ck-subc-mcp 0.17.9'\n");
-        let ck = fs::canonicalize(env!("CARGO_BIN_EXE_ck")).unwrap();
+        let ck = fs::canonicalize(env!("CARGO_BIN_EXE_ck-under-test")).unwrap();
         let mutations = [
             (ck, "44".repeat(32)),
             (daemon, "33".repeat(32)),
@@ -2289,7 +2353,7 @@ fn looks_like_age(text: &str) -> bool {
 }
 
 fn ck_command() -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_ck"));
+    let mut command = common::ck_under_test_command();
     // Every CLI test gets an isolated update cache and a closed local endpoint.
     // This proves dashboard output without reaching public release infrastructure.
     command

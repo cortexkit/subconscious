@@ -48,6 +48,11 @@ const PROD_CONNECTION_RELATIVE_PATH: &[&str] =
     &[".local", "share", "cortexkit", "run", CONNECTION_FILE_NAME];
 const QUOTA_MODULE_ID: &str = "insula";
 const CK_HARNESS: &str = "ck";
+
+#[cfg(feature = "test-support")]
+const CK_BUILD_SHAPE: &str = "test-support: on";
+#[cfg(not(feature = "test-support"))]
+const CK_BUILD_SHAPE: &str = "test-support: off";
 // Keep this conservative until the per-module split has supplied a week of
 // production baseline data; then calibrate whether every window minute is needed.
 const FRAME_DROP_ALERT_REQUIRED_NONZERO_MINUTES: u64 = 10;
@@ -371,6 +376,11 @@ fn cleanup_replaced_windows_ck() -> Result<(), CkError> {
 async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), CkError> {
     let args = parse_args(argv)?;
 
+    if matches!(&args.command, Command::BuildShape) {
+        println!("{CK_BUILD_SHAPE}");
+        return Ok(());
+    }
+
     // Help and external dispatch resolve without a daemon connection: help is
     // static text, and an external ck-<domain> tool discovers its own connection.
     if let Command::Help(text) = &args.command {
@@ -468,7 +478,8 @@ async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), CkError> {
         | Command::Setup(_)
         | Command::Upgrade { .. }
         | Command::Help(_)
-        | Command::External { .. } => unreachable!("handled before connect"),
+        | Command::External { .. }
+        | Command::BuildShape => unreachable!("handled before connect"),
     };
     result.map_err(|error| decorate_error(error, args.json, args.subc.as_deref()))
 }
@@ -908,6 +919,9 @@ struct CkArgs {
 }
 
 enum Command {
+    /// Prints the compile-time test-support state so integration tests reject a
+    /// binary that cannot verify their fixture-signed release index.
+    BuildShape,
     Dashboard,
     Setup(setup::SetupRequest),
     Upgrade {
@@ -5254,6 +5268,15 @@ fn parse_args(argv: impl IntoIterator<Item = OsString>) -> Result<CkArgs, CkErro
                     json,
                     verbose,
                     command: Command::Help(format!("ck {}", env!("CARGO_PKG_VERSION"))),
+                })
+            }
+            Some(arg) if arg == OsStr::new("--ck-build-shape") => {
+                return Ok(CkArgs {
+                    program: program.clone(),
+                    subc,
+                    json,
+                    verbose,
+                    command: Command::BuildShape,
                 })
             }
             Some(arg) if arg.to_string_lossy().starts_with('-') => {

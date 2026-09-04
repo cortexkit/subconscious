@@ -221,6 +221,8 @@ async fn supervisor_provenance_detects_replaced_executable_image() {
         .unwrap();
     wait_for_registration(&daemon, "provenance-replacement").await;
     let replacement = temp_dir.join("replacement");
+    // This is an inert byte fixture for the provenance hash comparison; the
+    // test never dispatches `ck`, so it intentionally uses the shipped binary.
     fs::copy(env!("CARGO_BIN_EXE_ck"), &replacement).unwrap();
     fs::rename(&replacement, &copied_stub).unwrap();
 

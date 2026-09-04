@@ -109,6 +109,9 @@ pub fn index_url() -> String {
 /// `X-CortexKit-Signature-Ed25519` response header, verify it against the
 /// embedded generation-1 key, parse, and refuse a stale document.
 pub fn fetch_index(url: &str, deadline: Duration) -> Result<ReleaseIndex, IndexRefusal> {
+    // This gate keeps the environment-supplied fixture key out of the shipped
+    // verifier. Reading it in production would let runtime configuration replace
+    // the embedded key that authenticates the release index.
     #[cfg(feature = "test-support")]
     if let Some(key) = test_release_index_key() {
         return fetch_index_with_verifying_key(url, &key, RELEASE_INDEX_KEY_GENERATION, deadline);

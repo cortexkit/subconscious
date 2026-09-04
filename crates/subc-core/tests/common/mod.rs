@@ -4,8 +4,8 @@ use std::{
     io,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
-    process,
-    sync::Arc,
+    process::{self, Command},
+    sync::{Arc, Once},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -25,6 +25,34 @@ use tokio::{
 
 const TEST_DAEMON_VER: &str = "test-subc";
 const TEST_AUTH_DEADLINE: Duration = Duration::from_secs(2);
+
+/// Returns the dedicated CLI target after proving it contains the fixture-key
+/// support required by integration tests. A build-shape check makes a Cargo
+/// feature-resolution change fail before any test fixture can mask it.
+pub fn ck_under_test_command() -> Command {
+    assert_ck_under_test_build_shape();
+    Command::new(env!("CARGO_BIN_EXE_ck-under-test"))
+}
+
+fn assert_ck_under_test_build_shape() {
+    static CHECKED: Once = Once::new();
+
+    CHECKED.call_once(|| {
+        let path = Path::new(env!("CARGO_BIN_EXE_ck-under-test"));
+        let output = Command::new(path)
+            .arg("--ck-build-shape")
+            .output()
+            .unwrap_or_else(|error| panic!("could not inspect ck-under-test {}: {error}", path.display()));
+        let build_shape = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(
+            build_shape.trim(),
+            "test-support: on",
+            "ck-under-test was built without test-support; the test spawn target's features must not vary by invocation: {}\nstderr: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    });
+}
 
 pub struct TestDaemon {
     pub registry: Arc<Registry>,

@@ -32,7 +32,7 @@ pub use model::{
 pub use planner::{plan_setup, plan_upgrade, SetupPlan};
 #[cfg(windows)]
 pub(crate) use self_update::cleanup_replaced_windows_ck;
-pub use update_cache::UpdateCache;
+pub use update_cache::{cache_directory, UpdateCache};
 pub use update_check::{
     check_update_metadata, dashboard_update, not_checked_from_cache, IndexReleaseSource,
     UpdateCheckError, BARE_REFRESH_BUDGET, TARGET_CHECK_BUDGET,

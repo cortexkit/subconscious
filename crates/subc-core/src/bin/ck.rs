@@ -196,7 +196,9 @@ fn discover_external_domains() -> Vec<ExternalDomain> {
 }
 
 fn probe_external_domain(candidate: &ExternalDomainCandidate) -> Option<String> {
-    let cache_path = domain_probe_cache_path();
+    let Some(cache_path) = domain_probe_cache_path() else {
+        return run_domain_probe(&candidate.path);
+    };
     let mut cache = read_domain_probe_cache(&cache_path);
     let stamp = domain_probe_stamp(&candidate.path)?;
     let key = candidate.path.to_string_lossy().into_owned();
@@ -273,29 +275,18 @@ fn run_domain_probe(path: &Path) -> Option<String> {
     Some(headline.to_string())
 }
 
-fn domain_probe_cache_path() -> PathBuf {
+/// Beside the update cache, so a test or operator that relocates one
+/// relocates both. `None` means no cache: probes run every time.
+fn domain_probe_cache_path() -> Option<PathBuf> {
     if let Some(update_cache_path) =
         env::var_os("CK_UPDATE_CACHE_PATH").filter(|path| !path.is_empty())
     {
         let update_cache_path = PathBuf::from(update_cache_path);
         if let Some(parent) = update_cache_path.parent() {
-            return parent.join(DOMAIN_PROBE_CACHE_FILE);
+            return Some(parent.join(DOMAIN_PROBE_CACHE_FILE));
         }
     }
-    if let Some(cache_home) = env::var_os("XDG_CACHE_HOME").filter(|path| !path.is_empty()) {
-        return PathBuf::from(cache_home)
-            .join("cortexkit")
-            .join(DOMAIN_PROBE_CACHE_FILE);
-    }
-    if let Some(home) = env::var_os("HOME").filter(|path| !path.is_empty()) {
-        return PathBuf::from(home)
-            .join(".cache")
-            .join("cortexkit")
-            .join(DOMAIN_PROBE_CACHE_FILE);
-    }
-    PathBuf::from(".cache")
-        .join("cortexkit")
-        .join(DOMAIN_PROBE_CACHE_FILE)
+    setup::cache_directory().map(|directory| directory.join(DOMAIN_PROBE_CACHE_FILE))
 }
 
 fn read_domain_probe_cache(path: &Path) -> DomainProbeCache {

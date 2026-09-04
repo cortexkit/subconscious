@@ -52,25 +52,38 @@ pub enum CacheRead {
 /// override; it never changes daemon behavior because the daemon has no caller.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UpdateCache {
-    path: PathBuf,
+    /// `None` when no per-user cache directory resolves on this host: the
+    /// cache then reads as absent and writes nothing, so `ck` re-checks
+    /// within its budget instead of persisting somewhere surprising.
+    path: Option<PathBuf>,
 }
 
 impl UpdateCache {
     pub fn from_environment() -> Self {
-        Self::new(default_cache_path())
+        Self {
+            path: default_cache_path(),
+        }
     }
 
+    /// Only tests pin a cache to an explicit path; production resolves it
+    /// from the environment.
+    #[cfg(test)]
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
+        Self {
+            path: Some(path.into()),
+        }
     }
 
     #[cfg(test)]
     pub fn path(&self) -> &PathBuf {
-        &self.path
+        self.path.as_ref().expect("test caches always have a path")
     }
 
     pub fn load(&self) -> CacheRead {
-        let bytes = match fs::read(&self.path) {
+        let Some(path) = &self.path else {
+            return CacheRead::Absent;
+        };
+        let bytes = match fs::read(path) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == ErrorKind::NotFound => return CacheRead::Absent,
             Err(error) => return CacheRead::Unreadable(error.to_string()),
@@ -88,14 +101,17 @@ impl UpdateCache {
     /// succeeds. A temporary sibling prevents a truncated cache from replacing a
     /// prior good observation if this process is interrupted while writing.
     pub fn write(&self, metadata: &UpdateMetadata) -> Result<(), String> {
-        let Some(parent) = self.path.parent() else {
-            return Err(format!("cache path {} has no parent", self.path.display()));
+        let Some(path) = &self.path else {
+            return Ok(());
+        };
+        let Some(parent) = path.parent() else {
+            return Err(format!("cache path {} has no parent", path.display()));
         };
         fs::create_dir_all(parent).map_err(|error| error.to_string())?;
         let bytes = serde_json::to_vec(metadata).map_err(|error| error.to_string())?;
-        let temporary = self.path.with_extension(format!("tmp-{}", process::id()));
+        let temporary = path.with_extension(format!("tmp-{}", process::id()));
         fs::write(&temporary, bytes).map_err(|error| error.to_string())?;
-        if let Err(error) = fs::rename(&temporary, &self.path) {
+        if let Err(error) = fs::rename(&temporary, path) {
             let _ = fs::remove_file(&temporary);
             return Err(error.to_string());
         }
@@ -103,24 +119,31 @@ impl UpdateCache {
     }
 }
 
-fn default_cache_path() -> PathBuf {
+fn default_cache_path() -> Option<PathBuf> {
     if let Some(path) = non_empty_os_var("CK_UPDATE_CACHE_PATH") {
-        return PathBuf::from(path);
+        return Some(PathBuf::from(path));
     }
+    cache_directory().map(|directory| directory.join("update-metadata.json"))
+}
+
+/// The per-user directory every `ck` cache lives under. There is deliberately
+/// no relative fallback: a cache written relative to the working directory
+/// lands in whatever the user or a test runner happened to be standing in
+/// (a Windows runner with no `HOME` once wrote it into the source tree).
+/// When nothing resolves, `ck` runs without a cache.
+pub fn cache_directory() -> Option<PathBuf> {
     if let Some(cache_home) = non_empty_os_var("XDG_CACHE_HOME") {
-        return PathBuf::from(cache_home)
-            .join("cortexkit")
-            .join("update-metadata.json");
+        return Some(PathBuf::from(cache_home).join("cortexkit"));
     }
-    if let Some(home) = non_empty_os_var("HOME") {
-        return PathBuf::from(home)
-            .join(".cache")
-            .join("cortexkit")
-            .join("update-metadata.json");
+    #[cfg(windows)]
+    if let Some(local_app_data) = non_empty_os_var("LOCALAPPDATA") {
+        return Some(
+            PathBuf::from(local_app_data)
+                .join("cortexkit")
+                .join("cache"),
+        );
     }
-    PathBuf::from(".cache")
-        .join("cortexkit")
-        .join("update-metadata.json")
+    non_empty_os_var("HOME").map(|home| PathBuf::from(home).join(".cache").join("cortexkit"))
 }
 
 fn non_empty_os_var(key: &str) -> Option<std::ffi::OsString> {

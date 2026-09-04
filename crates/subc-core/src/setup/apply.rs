@@ -681,6 +681,21 @@ impl SetupExecutor for SetupBackend {
     }
 
     fn preview_restart_required(&mut self) -> Result<Vec<String>, Self::Error> {
+        // The faked-live runtime has no daemon to ask; the sections come from
+        // the test instead, empty unless it names some.
+        #[cfg(feature = "test-support")]
+        if env::var_os("CK_TEST_SETUP_CONTROL_OK").is_some() {
+            return Ok(env::var("CK_TEST_SETUP_RESTART_REQUIRED")
+                .ok()
+                .map(|sections| {
+                    sections
+                        .split(',')
+                        .filter(|section| !section.is_empty())
+                        .map(ToOwned::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default());
+        }
         crate::preview_rescan_restart_required()
     }
 }

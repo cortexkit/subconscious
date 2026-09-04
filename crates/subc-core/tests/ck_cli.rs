@@ -319,14 +319,26 @@ fn fixture_index_body() -> Vec<u8> {
 const FOREIGN_SIGNATURE: &str =
     "fjYZ87Tka7M+yJ+lmjD7vjSjflypCGi2KIvmSktgssO79FN8/mntGhobmTCwYDeQRAEAu7oDdv7zrAkI9N9uDA==";
 
+/// A bare `ck setup --dry-run` for the index-refusal tests. The host's own
+/// service manager answers for the real user regardless of HOME (launchd
+/// knows the developer's daemon), so the runtime is faked the same way the
+/// fixtures do; otherwise the refusal under test is masked by a registry
+/// read against whatever daemon the developer happens to be running.
+fn bare_setup_dry_run(index_url: &str) -> Command {
+    let mut command = ck_command();
+    command
+        .args(["setup", "--dry-run"])
+        .env("CK_RELEASE_INDEX_URL", index_url)
+        .env("CK_TEST_SETUP_CONTROL_OK", "1")
+        .env("CK_TEST_SETUP_MODULES", "")
+        .env("SUBC_CONNECTION_FILE", "/nonexistent/subc-connection.json");
+    command
+}
+
 #[test]
 fn setup_dry_run_refuses_when_the_signature_header_is_stripped() {
     let url = serve_index(&fixture_index_body(), None);
-    let output = ck_command()
-        .args(["setup", "--dry-run"])
-        .env("CK_RELEASE_INDEX_URL", &url)
-        .output()
-        .unwrap();
+    let output = bare_setup_dry_run(&url).output().unwrap();
     assert_ne!(output.status.code(), Some(0), "stripped header must refuse");
     let combined = format!("{}{}", text(&output.stdout), text(&output.stderr));
     assert!(
@@ -346,11 +358,7 @@ fn setup_dry_run_refuses_when_the_signature_header_is_stripped() {
 #[test]
 fn setup_dry_run_refuses_a_test_key_signature_against_the_embedded_key() {
     let url = serve_index(&fixture_index_body(), Some(FOREIGN_SIGNATURE));
-    let output = ck_command()
-        .args(["setup", "--dry-run"])
-        .env("CK_RELEASE_INDEX_URL", &url)
-        .output()
-        .unwrap();
+    let output = bare_setup_dry_run(&url).output().unwrap();
     assert_ne!(
         output.status.code(),
         Some(0),
@@ -433,10 +441,7 @@ impl SetupFixture {
                     "storage": {"backend": "sqlite"},
                     "modules": {
                         "aft": {"program": bin.join(platform_binary("ck-aft"))},
-                        "claustrum": {
-                            "program": bin.join(platform_binary("ck-claustrum")),
-                            "reserved": true,
-                        },
+                        "claustrum": installed_claustrum_entry(&bin, &data_home),
                         "insula": {"program": bin.join(platform_binary("ck-insula"))},
                     },
                 }))
@@ -479,12 +484,37 @@ impl SetupFixture {
             .env("XDG_DATA_HOME", &self.data_home)
             .env("XDG_CONFIG_HOME", &self.config_home)
             .env("PATH", path)
+            // Daemon discovery falls back to the system temp directory, which
+            // is outside this fixture's HOME: without the fence a setup path
+            // that reaches for a daemon finds the developer's live one and
+            // passes here while failing on a runner with no daemon.
+            .env("SUBC_CONNECTION_FILE", self.home.join("no-daemon.json"))
             .env("CK_RELEASE_INDEX_URL", &index.url)
             .env("CK_TEST_RELEASE_INDEX_PUBKEY", &index.public_key)
             .env("CK_TEST_SETUP_CONTROL_OK", "1")
             .env("CK_TEST_SETUP_MODULES", "aft,claustrum,insula");
         command
     }
+}
+
+/// The claustrum entry `ck setup claustrum` writes on this host: macOS keeps
+/// the master key in the keychain, every other platform records its file path
+/// in the module environment. A fixture that omits the path reads as
+/// misconfigured (and so "not installed") everywhere except macOS.
+fn installed_claustrum_entry(bin: &Path, data_home: &Path) -> Value {
+    let mut entry = json!({
+        "program": bin.join(platform_binary("ck-claustrum")),
+        "reserved": true,
+    });
+    if !cfg!(target_os = "macos") {
+        entry["env"] = json!({
+            "CK_MASTER_KEY_PATH": data_home
+                .join("cortexkit")
+                .join("claustrum")
+                .join("master.key"),
+        });
+    }
+    entry
 }
 
 struct SignedIndex {
@@ -1554,10 +1584,26 @@ async fn module_status_renders_key_value_block_byte_for_byte() {
 
     let output = ck_with_subc(&server.connection_file_path, ["module", "status", "aft"]);
     assert_exit(&output, 0);
+    // The age is computed twice from two clocks a few hundred milliseconds
+    // apart, so on a slow runner `5s ago` becomes `6s ago` across the second
+    // boundary; the rendered age is checked for form, everything else for
+    // bytes.
+    let rendered = text(&output.stdout);
+    let (before, after) = rendered
+        .split_once(" · started ")
+        .expect("status line carries a start age");
+    let (rendered_age, rest) = after
+        .split_once(" · restarts ")
+        .expect("start age is followed by the restart budget");
+    assert!(
+        looks_like_age(rendered_age) && looks_like_age(&started),
+        "start age renders as an age: {rendered_age:?} vs {started:?}"
+    );
+    assert_eq!(before, format!("aft — running, degraded\n  pid {pid}"));
     assert_eq!(
-        text(&output.stdout),
+        rest,
         format!(
-            "aft — running, degraded\n  pid {pid} · started {started} · restarts 0 of 1\n  last exit: none\n  binary: {binary} ({image})\nmetrics: run `ck health aft`\n"
+            "0 of 1\n  last exit: none\n  binary: {binary} ({image})\nmetrics: run `ck health aft`\n"
         )
     );
 
@@ -1577,9 +1623,15 @@ async fn module_terminals_renders_empty_history_byte_for_byte() {
 
     let output = ck_with_subc(&server.connection_file_path, ["module", "terminals", "aft"]);
     assert_exit(&output, 0);
-    assert_eq!(
-        text(&output.stdout),
-        format!("no exits recorded since the daemon started ({started})\n")
+    // Same two-clock age as the status test: form-checked, not byte-matched.
+    let rendered = text(&output.stdout);
+    let age = rendered
+        .strip_prefix("no exits recorded since the daemon started (")
+        .and_then(|rest| rest.strip_suffix(")\n"))
+        .expect("one sentence naming the daemon start age");
+    assert!(
+        looks_like_age(age) && looks_like_age(&started),
+        "start age renders as an age: {age:?} vs {started:?}"
     );
 
     module.stop().await.unwrap();
@@ -2228,6 +2280,12 @@ fn discovery_failure_lists_tried_paths_and_exits_2() {
         text_stderr.contains("ck daemon --subc <connection-file>"),
         "stderr:\n{text_stderr}"
     );
+}
+
+/// The age vocabulary `ck` renders (`just now`, `5s ago`, `4h ago`), as
+/// opposed to a raw timestamp leaking through.
+fn looks_like_age(text: &str) -> bool {
+    text == "just now" || text.ends_with(" ago")
 }
 
 fn ck_command() -> Command {

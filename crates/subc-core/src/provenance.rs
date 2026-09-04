@@ -432,26 +432,33 @@ mod tests {
         ));
     }
 
+    /// The child runs a copy of `sleep` that this test owns, not `/bin/sleep`
+    /// itself. On GitHub's ubuntu runners this test twice reported
+    /// `Mismatch` with two genuine, different digests and the start time
+    /// intact — the shape of `/usr/bin/sleep` being replaced on disk
+    /// between spawn and comparison (the image runs unattended package
+    /// upgrades after boot), which no local machine reproduces (0/70 on an
+    /// arm64 VM under load). A file under the test's own temp dir cannot
+    /// be replaced by anything but the test.
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn live_spawned_process_with_matching_start_time_still_matches() {
-        let executable = PathBuf::from("/bin/sleep");
+        let dir = temp_dir("live-child");
+        let executable = dir.join("sleep");
+        fs::copy("/bin/sleep", &executable).unwrap();
         let mut child = Command::new(&executable).arg("60").spawn().unwrap();
         let pid = child.id().unwrap();
         let start_time = process_start_time(pid).unwrap();
         let agreement = ExecutableIdentityProbe::default()
             .observe(Some(pid), Some(&executable), None, Some(start_time))
             .await;
+        let running_target = fs::read_link(format!("/proc/{pid}/exe")).ok();
         child.start_kill().unwrap();
         child.wait().await.unwrap();
 
-        // Name the variant on failure: this test failed once on a GitHub
-        // ubuntu runner on a docs-only commit and passed 70/70 on an arm64
-        // Ubuntu VM including under load, so the next failure must say what
-        // the probe actually returned rather than only that it was not Match.
         assert!(
             matches!(agreement, RunningImageAgreement::Match { .. }),
-            "expected Match for a live child spawned from {}, got {agreement:?}",
+            "expected Match for a live child spawned from {}, got {agreement:?}; /proc/{pid}/exe -> {running_target:?}",
             executable.display()
         );
     }

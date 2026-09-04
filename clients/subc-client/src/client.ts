@@ -621,7 +621,7 @@ export class SubcClient {
   ): Promise<Response> {
     if (opts.binary) {
       throw new SubcError(
-        "call() builds a JSON body and cannot send a binary request; got object; use callBinary(moduleId, body, opts) with a Uint8Array",
+        "call() builds a JSON body and cannot send a binary request; use callBinary(moduleId, body, opts) with a Uint8Array",
         "binary_call_requires_call_binary",
       );
     }

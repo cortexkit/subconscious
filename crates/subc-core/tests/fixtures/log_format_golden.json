@@ -57,6 +57,13 @@
       "line": "2026-09-05T10:41:09.000Z INFO  prefrontal-core session=opencode:ses_abc run started broca_session=broca:8f3a1c02 agent=ag_9"
     },
     {
+      "name": "backslash-in-message-and-value",
+      "event": { "at_ms": 1788604871000, "level": "info", "module": "aft", "session": null, "tag": null,
+                 "message": "path C:\\Users\\x", "fields": [["root", "C:\\Users\\x\\My Project"], ["bare", "C:\\x"]] },
+      "line": "2026-09-05T10:41:11.000Z INFO  aft path C:\\\\Users\\\\x root=\"C:\\\\Users\\\\x\\\\My Project\" bare=C:\\x",
+      "note": "message and quoted values escape backslash; an unquoted value is verbatim because only the quoted form has an escape grammar"
+    },
+    {
       "name": "empty-value-is-quoted",
       "event": { "at_ms": 1788604870000, "level": "info", "module": "claustrum", "session": null, "tag": null,
                  "message": "handshake", "fields": [["reason", ""]] },

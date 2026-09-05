@@ -405,8 +405,11 @@ function defaultRedactor(line: string): string {
 }
 
 function resolveLogPath(config: LogConfig): string {
-  const dataDir = moduleDataDir(config.moduleId);
+  // A custom lane names its file outright; resolving the module data dir for
+  // it would let the store's module-id validation refuse a path the caller
+  // already chose.
   if (config.lane.kind === "custom") return config.lane.path;
+  const dataDir = moduleDataDir(config.moduleId);
   if (config.lane.kind === "module") {
     return path.join(dataDir, "logs", `${config.moduleId}.log`);
   }

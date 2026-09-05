@@ -207,6 +207,11 @@ fn emit_golden_case(name: &str) {
             "run started"
         ),
         "empty-value-is-quoted" => tracing::info!(reason = "", "handshake"),
+        "backslash-in-message-and-value" => tracing::info!(
+            root = "C:\\Users\\x\\My Project",
+            bare = "C:\\x",
+            "path C:\\Users\\x"
+        ),
         other => panic!("unimplemented golden fixture case: {other}"),
     }
 }
@@ -294,9 +299,10 @@ fn debug_session_fields_are_normalized_and_global_is_absent() {
         tracing::info!("debug session");
     });
     tracing::dispatcher::with_default(&dispatcher, || {
-        let span = session_span("opencode", "global");
+        // An empty id is the "no session" form; the line must carry no field.
+        let span = session_span("opencode", "");
         let _entered = span.enter();
-        tracing::info!("global session");
+        tracing::info!("no session");
     });
 
     let contents = fs::read_to_string(handle.path()).expect("session lines");

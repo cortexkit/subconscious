@@ -183,7 +183,10 @@ pub fn init(config: Config) -> Result<Handle, InitError> {
 
 /// Creates a span carrying canonical session lineage for nested events.
 pub fn session_span(issuer: &str, id: &str) -> tracing::Span {
-    if issuer.is_empty() || id.is_empty() || id == "global" {
+    // An empty half means "no session": the line carries no field rather
+    // than a placeholder. Callers that used to log a synthetic id must pass
+    // nothing here instead; the crate does not know their sentinels.
+    if issuer.is_empty() || id.is_empty() {
         tracing::Span::none()
     } else {
         let session = format!("{issuer}:{id}");
@@ -367,7 +370,7 @@ struct SessionVisitor {
 
 impl Visit for SessionVisitor {
     fn record_str(&mut self, field: &Field, value: &str) {
-        if field.name() == "session" && value != "global" {
+        if field.name() == "session" && !value.is_empty() {
             self.session = Some(value.to_owned());
         }
     }
@@ -379,7 +382,7 @@ impl Visit for SessionVisitor {
                 .strip_prefix('"')
                 .and_then(|unquoted| unquoted.strip_suffix('"'))
                 .unwrap_or(&rendered);
-            if value != "global" {
+            if !value.is_empty() {
                 self.session = Some(value.to_owned());
             }
         }

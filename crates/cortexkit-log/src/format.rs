@@ -16,7 +16,7 @@ pub(crate) fn render_line(
     let timestamp = DateTime::<Utc>::from(at).to_rfc3339_opts(SecondsFormat::Millis, true);
     let mut line = format!("{timestamp} {:<5} {module_id}", level.as_str());
 
-    if let Some(session) = session.filter(|value| *value != "global") {
+    if let Some(session) = session {
         line.push_str(" session=");
         line.push_str(session);
     }
@@ -38,8 +38,13 @@ pub(crate) fn render_line(
     line
 }
 
+// Backslash is escaped first so a literal `\n` in the input survives as
+// `\\n` and cannot be read back as a newline. Same order as @cortexkit/log.
 fn escape_message(message: &str) -> String {
-    message.replace('\r', "\\r").replace('\n', "\\n")
+    message
+        .replace('\\', "\\\\")
+        .replace('\r', "\\r")
+        .replace('\n', "\\n")
 }
 
 fn format_value(value: &str) -> String {
@@ -49,11 +54,14 @@ fn format_value(value: &str) -> String {
             .any(|character| matches!(character, ' ' | '"' | '\n' | '\r'))
     {
         let escaped = value
+            .replace('\\', "\\\\")
             .replace('"', "\\\"")
             .replace('\r', "\\r")
             .replace('\n', "\\n");
         format!("\"{escaped}\"")
     } else {
+        // An unquoted value is verbatim, backslashes included: only the quoted
+        // form has an escape grammar, and a reader decodes only quoted values.
         value.to_owned()
     }
 }
@@ -237,7 +245,10 @@ pub(crate) fn parse(line: &str) -> Result<ParsedLine<'_>, ParseError> {
         let valid = value
             .rsplit_once(':')
             .is_some_and(|(issuer, id)| !issuer.is_empty() && !id.is_empty());
-        if !valid || value == "global" {
+        // `session=global` and other issuer-less placeholders fail here on
+        // their missing `issuer:` half; the renderer never has to know any
+        // particular sentinel.
+        if !valid {
             return Err(ParseError::new("session_missing_issuer"));
         }
         session = Some(value);

@@ -102,6 +102,10 @@ fn prepare_parent(path: &Path, enforce_directory_mode: bool) -> io::Result<()> {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
     }
+    // Windows has no mode bits to enforce; the per-user data directory's ACL is
+    // inherited. The inputs exist only for the Unix arm above.
+    #[cfg(not(unix))]
+    let _ = (enforce_directory_mode, existed);
 
     Ok(())
 }

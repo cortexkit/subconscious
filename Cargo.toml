@@ -8,7 +8,6 @@ members = [
     "crates/subc-jsonc",
     "crates/subc-core",
     "crates/subc-mcp",
-    "crates/cortexkit-log",
     "crates/mcp-stdio-adapter",
     "crates/agent-token-vectors",
     "cortexkit-release",

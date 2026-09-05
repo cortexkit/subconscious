@@ -19,10 +19,11 @@ format, rotation, retention, levels, tags, session field and redaction all come
 from one place a module initialises with its module id and nothing else — the
 same lesson the data-path resolver taught.
 
-- Rust: `cortexkit-log` in `commons/crates/cortexkit-log` (published; path-dep
+- Rust: `cortexkit-log` in `commons/crates/cortexkit-log` (landed at commons
+  `01da197`; publish to crates.io follows the first fleet adopter; path-dep
   consumers get the usual lock-wave notice).
 - TypeScript: `@cortexkit/log` in `subconscious/clients/log` (beside
-  `@cortexkit/store`), for harness-hosted plugins.
+  `@cortexkit/store`), for harness-hosted plugins; landed at `a4575374`.
 - Both are conformance-tested against one golden fixture set that lives in
   `subconscious/crates/subc-core/tests/fixtures/log_format_golden.json` and is
   vendored into commons (authority side owns the fixture; same rule as the

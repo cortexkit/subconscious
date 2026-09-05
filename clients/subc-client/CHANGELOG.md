@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.11.1 — 2026-09-05
+
+- Add per-route fault isolation during reconnect reopen, so one refused route no longer fails waiting calls on other routes.
+
 ## 0.11.0 — 2026-09-04
 
 - Add opaque binary request bodies and wire-flag-driven binary replies.

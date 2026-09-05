@@ -15,6 +15,7 @@ import {
   HEADER_LEN,
   Priority,
   SERVER_PROOF_DOMAIN,
+  SocketClosedError,
   SubcCallError,
   SubcClient,
   type BindIdentity,
@@ -65,6 +66,17 @@ interface FakeDaemonOptions {
   dataMode?: "echo" | "drop" | "error" | "delay-body" | "silent-hold" | "half-open" | "unknown-channel-once" | "unknown-channel-always" | "stale-epoch-once";
   delayBodyMs?: number;
   routeOpenError?: { code: string; message: string };
+  // Refuse this module on every connection at or after the selected connection;
+  // unlike fail-first, a refused identity never becomes healthy by attempt count.
+  routeOpenRefuseModule?: {
+    module_id: string;
+    code: string;
+    message: string;
+    refuseFromConnection?: number;
+  };
+  // Drop the transport while opening this module, so reconnect tests can prove a
+  // dead socket remains connection-wide rather than looking like a route refusal.
+  routeOpenDropModule?: { module_id: string; dropFromConnection?: number };
   // Reject the first N route.open requests with this code (a booting-target
   // simulation), then serve subsequent ones normally.
   routeOpenFailFirst?: { count: number; code: string; message: string };
@@ -406,6 +418,143 @@ describe("SubcClient managed call", () => {
     }
   });
 
+  test("isolates a refused cached route while reconnecting healthy managed routes", async () => {
+    const { connFile } = tempConnectionFile();
+    const stats = newStats();
+    const daemonOptions: FakeDaemonOptions = {
+      stats,
+      routeOpenRefuseModule: {
+        module_id: "beta",
+        code: "project_origin_unclassifiable",
+        message: "beta identity is no longer classifiable",
+        refuseFromConnection: 2,
+      },
+    };
+    const daemon = await startFakeDaemon(daemonOptions);
+    writeConnectionFile(connFile, daemon.port);
+
+    const client = await SubcClient.connect({
+      connectionFile: connFile,
+      identity: IDENTITY,
+      reconnectBackoff: BACKOFF,
+    });
+    try {
+      await expect(client.call("alpha", "echo", { phase: "cache" })).resolves.toMatchObject({
+        params: { phase: "cache" },
+      });
+      await expect(client.call("beta", "echo", { phase: "cache" })).resolves.toMatchObject({
+        params: { phase: "cache" },
+      });
+
+      // Arm the existing response-count drop only after both routes are cached.
+      // The successful trigger response then closes connection 1 without losing
+      // either cached identity needed by the bulk reconnect reopen.
+      daemonOptions.closeAfterDataResponses = 1;
+      await expect(client.call("alpha", "echo", { phase: "drop" })).resolves.toMatchObject({
+        params: { phase: "drop" },
+      });
+      daemonOptions.closeAfterDataResponses = undefined;
+      await waitFor(() => clientClosedErr(client) !== null, "client to observe the route-isolation drop");
+
+      await expect(client.call("alpha", "echo", { phase: "reconnected" })).resolves.toMatchObject({
+        params: { phase: "reconnected" },
+      });
+      expect(stats.connections).toBe(2);
+
+      await expect(client.call("beta", "echo", { phase: "caller-owned-refusal" })).rejects.toMatchObject({
+        kind: "terminal",
+        code: "project_origin_unclassifiable",
+      });
+      expect(stats.connections).toBe(2);
+      expect(stats.routeOpens).toBe(5);
+    } finally {
+      client.close();
+    }
+  });
+
+  test("a transport drop during cached-route reopen still fails the reconnect", async () => {
+    const { connFile } = tempConnectionFile();
+    const stats = newStats();
+    const daemonOptions: FakeDaemonOptions = {
+      stats,
+      routeOpenDropModule: { module_id: "beta", dropFromConnection: 2 },
+    };
+    const daemon = await startFakeDaemon(daemonOptions);
+    writeConnectionFile(connFile, daemon.port);
+
+    const client = await SubcClient.connect({
+      connectionFile: connFile,
+      identity: IDENTITY,
+      reconnectBackoff: { baseMs: 1, capMs: 1, maxAttempts: 1 },
+    });
+    try {
+      await client.call("alpha", "echo", { phase: "cache" });
+      await client.call("beta", "echo", { phase: "cache" });
+      daemonOptions.closeAfterDataResponses = 1;
+      await client.call("alpha", "echo", { phase: "drop" });
+      daemonOptions.closeAfterDataResponses = undefined;
+      await waitFor(() => clientClosedErr(client) !== null, "client to observe the transport-arm drop");
+
+      const error = await client.call("alpha", "echo", { phase: "reconnect" }).then(
+        () => null,
+        (cause: unknown) => cause,
+      );
+      expect(error).toBeInstanceOf(SubcCallError);
+      expect(error).toMatchObject({ kind: "not_sent", code: undefined });
+      expect((error as SubcCallError).cause).toBeInstanceOf(SocketClosedError);
+      expect(stats.connections).toBe(2);
+    } finally {
+      client.close();
+    }
+  });
+
+  test("does not wait out retryable route patience while reopening other cached routes", async () => {
+    const { connFile } = tempConnectionFile();
+    const stats = newStats();
+    const daemonOptions: FakeDaemonOptions = {
+      stats,
+      routeOpenRefuseModule: {
+        module_id: "beta",
+        code: "module_reloading",
+        message: "beta is reloading",
+        refuseFromConnection: 2,
+      },
+    };
+    const daemon = await startFakeDaemon(daemonOptions);
+    writeConnectionFile(connFile, daemon.port);
+
+    const client = await SubcClient.connect({
+      connectionFile: connFile,
+      identity: IDENTITY,
+      reconnectBackoff: BACKOFF,
+      routeOpenRetryDeadlineMs: 120,
+    });
+    try {
+      await client.call("alpha", "echo", { phase: "cache" });
+      await client.call("beta", "echo", { phase: "cache" });
+      daemonOptions.closeAfterDataResponses = 1;
+      await client.call("alpha", "echo", { phase: "drop" });
+      daemonOptions.closeAfterDataResponses = undefined;
+      await waitFor(() => clientClosedErr(client) !== null, "client to observe the retryable-refusal drop");
+
+      const reconnectStartedAt = Date.now();
+      await expect(client.call("alpha", "echo", { phase: "reconnected" })).resolves.toMatchObject({
+        params: { phase: "reconnected" },
+      });
+      expect(Date.now() - reconnectStartedAt).toBeLessThan(2_000);
+      expect(stats.connections).toBe(2);
+
+      // Reopen discarded beta's cache entry without consuming its retry budget;
+      // beta's own next call now owns the bounded module-reload patience.
+      await expect(client.call("beta", "echo", { phase: "patient-open" })).rejects.toMatchObject({
+        kind: "not_sent",
+        code: "module_reloading",
+      });
+    } finally {
+      client.close();
+    }
+  });
+
   test("surfaces outcome_unknown and does not retry after bytes were written but no response arrived", async () => {
     const { connFile } = tempConnectionFile();
     const sleeps: number[] = [];
@@ -572,7 +721,7 @@ describe("SubcClient managed call", () => {
     }
   });
 
-  test("does not retry a non-transient route re-open error after reconnect", async () => {
+  test("surfaces a non-transient reconnect refusal from the caller's fresh route.open", async () => {
     const { connFile } = tempConnectionFile();
     const firstStats = newStats();
     const first = await startFakeDaemon({ stats: firstStats, closeAfterDataResponses: 1 });
@@ -604,7 +753,9 @@ describe("SubcClient managed call", () => {
         kind: "terminal",
         code: "route_rejected",
       });
-      expect(secondStats.routeOpens).toBe(1);
+      // The bulk reconnect open is isolated and evicted; the waiting caller then
+      // owns one fresh route.open and receives that route's refusal directly.
+      expect(secondStats.routeOpens).toBe(2);
       expect(sleeps).toEqual([]);
     } finally {
       client.close();
@@ -890,6 +1041,7 @@ async function startFakeDaemon(options: FakeDaemonOptions): Promise<FakeDaemon> 
 }
 
 async function handleFakeConnection(socket: Socket, options: FakeDaemonOptions): Promise<void> {
+  const connectionNumber = options.stats.connections;
   const reader = new SocketReader(socket);
   const deadline = Date.now() + 5_000;
   await authenticateFakeServer(reader, socket, deadline, options.key ?? KEY);
@@ -912,7 +1064,7 @@ async function handleFakeConnection(socket: Socket, options: FakeDaemonOptions):
     const requestFrame: { channel: number; controlOp?: string } = { channel: frame.header.channel };
     options.stats.requestFrames.push(requestFrame);
     if (frame.header.channel === 0) {
-      const request = parseJson(frame.body) as { op?: string };
+      const request = parseJson(frame.body) as { op?: string; target?: { module_id?: string } };
       requestFrame.controlOp = request.op;
       if (request.op === "catalog.list") {
         if (options.holdCatalogList) {
@@ -942,17 +1094,45 @@ async function handleFakeConnection(socket: Socket, options: FakeDaemonOptions):
         options.stats.routeOpenConsumerIdentities.push(
           (request as { consumer_identity?: unknown }).consumer_identity,
         );
-        const failFirst = options.routeOpenFailFirst;
-        if (failFirst && options.stats.routeOpens <= failFirst.count) {
+        const moduleId = request.target?.module_id;
+        const dropModule = options.routeOpenDropModule;
+        if (
+          dropModule &&
+          moduleId === dropModule.module_id &&
+          connectionNumber >= (dropModule.dropFromConnection ?? 1)
+        ) {
+          socket.destroy();
+          return;
+        }
+
+        const refusedModule = options.routeOpenRefuseModule;
+        if (
+          refusedModule &&
+          moduleId === refusedModule.module_id &&
+          connectionNumber >= (refusedModule.refuseFromConnection ?? 1)
+        ) {
           await writeFrame(
             socket,
-            errorFrame(frame, { code: failFirst.code, message: failFirst.message }),
+            errorFrame(frame, { code: refusedModule.code, message: refusedModule.message }),
             deadline,
           );
-        } else if (options.routeOpenError) {
-          await writeFrame(socket, errorFrame(frame, options.routeOpenError), deadline);
         } else {
-          await writeFrame(socket, responseFrame(frame, { op: "route.open", route_channel: routeChannel++, route_epoch: 1 }), deadline);
+          const failFirst = options.routeOpenFailFirst;
+          if (failFirst && options.stats.routeOpens <= failFirst.count) {
+            await writeFrame(
+              socket,
+              errorFrame(frame, { code: failFirst.code, message: failFirst.message }),
+              deadline,
+            );
+          } else if (options.routeOpenError) {
+            await writeFrame(socket, errorFrame(frame, options.routeOpenError), deadline);
+          } else {
+            await writeFrame(
+              socket,
+              responseFrame(frame, { op: "route.open", route_channel: routeChannel++, route_epoch: 1 }),
+              deadline,
+            );
+          }
         }
       }
       continue;

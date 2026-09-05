@@ -2363,13 +2363,36 @@ fn ck_command() -> Command {
     let mut command = common::ck_under_test_command();
     // Every CLI test gets an isolated update cache and a closed local endpoint.
     // This proves dashboard output without reaching public release infrastructure.
+    // The domain list is discovered from PATH (`ck-<name> --ck-domain`), so a
+    // test that pins rendered output must not see the host's real `ck-auth`
+    // or `ck-models`. Every CLI test therefore runs with the SYSTEM path only:
+    // `curl` and `sh` stay reachable (the update check shells out, and a ck
+    // that cannot spawn curl never connects to a test's listener, which wedges
+    // that test in `accept()` rather than failing it), while the user-level
+    // directories that hold installed `ck-*` binaries are absent. A test that
+    // wants a domain builds one in its own directory and prepends it.
     command
         .env(
             "CK_UPDATE_CACHE_PATH",
             unique_temp_dir("ck-update-cache").join("update-metadata.json"),
         )
-        .env("CK_RELEASE_INDEX_URL", "http://127.0.0.1:0/index.json");
+        .env("CK_RELEASE_INDEX_URL", "http://127.0.0.1:0/index.json")
+        .env("PATH", system_path_only());
     command
+}
+
+/// The platform's system tool directories and nothing else.
+fn system_path_only() -> std::ffi::OsString {
+    #[cfg(windows)]
+    {
+        let root = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
+        let root = Path::new(&root);
+        std::env::join_paths([root.join("System32"), root.to_path_buf()]).unwrap()
+    }
+    #[cfg(not(windows))]
+    {
+        "/usr/bin:/bin:/usr/sbin:/sbin".into()
+    }
 }
 
 fn ck_with_subc<const N: usize>(connection_file: &Path, args: [&str; N]) -> Output {

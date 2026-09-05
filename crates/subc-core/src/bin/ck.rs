@@ -1,11 +1,9 @@
-#![forbid(unsafe_code)]
-
-//! `ck` — the CortexKit operator CLI.
-//!
-//! This binary is the founding piece of the CortexKit umbrella command. The
-//! daemon/module control domain ships first, and the argument parser is shaped as
-//! a small `<domain> <verb>` dispatcher so future domains such as `ck vault ...`,
-//! `ck quota ...`, and `ck account ...` can be added without reshaping the CLI.
+// `ck` — the CortexKit operator CLI.
+//
+// This binary is the founding piece of the CortexKit umbrella command. The
+// daemon/module control domain ships first, and the argument parser is shaped as
+// a small `<domain> <verb>` dispatcher so future domains such as `ck vault ...`,
+// `ck quota ...`, and `ck account ...` can be added without reshaping the CLI.
 
 #[path = "../setup/mod.rs"]
 mod setup;

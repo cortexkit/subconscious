@@ -1,6 +1,6 @@
 [package]
 name = "subc-core"
-version = "0.17.14"
+version = "0.17.15"
 edition = "2021"
 license = "MIT"
 publish = false
@@ -26,7 +26,7 @@ path = "src/bin/ck.rs"
 # invocation.
 [[bin]]
 name = "ck-under-test"
-path = "src/bin/ck.rs"
+path = "src/bin/ck-under-test.rs"
 required-features = ["test-support"]
 
 [features]
@@ -80,4 +80,8 @@ tokio = { version = "1", features = ["test-util"] }
 subc-core = { path = ".", features = ["test-support"] }
 
 [lints.rust]
+# Package-wide so every target carries it, including the test-only `ck`
+# target that `include!`s the shipped source (an inner attribute there would
+# not compile inside `include!`).
+unsafe_code = "forbid"
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }

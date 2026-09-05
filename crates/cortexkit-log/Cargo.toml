@@ -1,0 +1,20 @@
+[package]
+name = "cortexkit-log"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/cortexkit/commons"
+authors = ["CortexKit contributors"]
+publish = false
+description = "Fleet logging format, filtering, redaction, and retention for CortexKit modules"
+
+[dependencies]
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+regex = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"

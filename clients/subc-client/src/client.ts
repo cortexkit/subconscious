@@ -1335,18 +1335,31 @@ export class SubcClient {
   }
 
   private async reopenCachedRoutes(): Promise<void> {
-    for (const cached of this.routes.values()) cached.handle = null;
-    for (const cached of this.routes.values()) {
-      if (cached.closed) continue;
-      const handle = await this.routeOpen(cached.target, cached.identity, {
-        consumerIdentity: cached.consumerIdentity ?? null,
-      });
-      if (cached.closed) {
-        this.liveRoutes.delete(handle.channel);
-        this.sendRouteGoodbye(handle);
-        continue;
+    const routeKeys = [...this.routes.keys()];
+    for (const key of routeKeys) {
+      const cached = this.routes.get(key);
+      if (cached) cached.handle = null;
+    }
+    for (const key of routeKeys) {
+      const cached = this.routes.get(key);
+      if (!cached || cached.closed) continue;
+      try {
+        const handle = await this.routeOpen(cached.target, cached.identity, {
+          consumerIdentity: cached.consumerIdentity ?? null,
+        });
+        if (cached.closed) {
+          this.liveRoutes.delete(handle.channel);
+          this.sendRouteGoodbye(handle);
+          continue;
+        }
+        cached.handle = handle;
+      } catch (error) {
+        if (isRouteOpenRefusal(error)) {
+          this.routes.delete(key);
+          continue;
+        }
+        throw error;
       }
-      cached.handle = handle;
     }
   }
 
@@ -1667,6 +1680,15 @@ export function isConsumerReconnectTransient(err: unknown): boolean {
 
   const code = errorCode(err);
   return code === "ECONNREFUSED" || code === "ECONNRESET" || code === "EPIPE" || code === "ETIMEDOUT" || code === "ENOENT";
+}
+
+/**
+ * A coded SubcError came from a complete wire Error frame, so the connection
+ * survived long enough to refuse only this route. An uncoded SubcError can mean
+ * the socket or protocol exchange failed mid-open and must still fail reconnect.
+ */
+function isRouteOpenRefusal(err: unknown): err is SubcError & { code: string } {
+  return err instanceof SubcError && typeof err.code === "string";
 }
 
 /**

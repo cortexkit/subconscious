@@ -180,7 +180,7 @@ jobs:
           bash scripts/fleet/check-wire-crate-versions.sh "$BASE"
         shell: bash
 
-  # Both TypeScript packages ship from this repo and are wire-compatible with the
+  # The TypeScript packages ship from this repo and are wire-compatible with the
   # Rust crates, so their typecheck + tests gate here too — otherwise a TS-only
   # break (e.g. a private-member test-harness type error) stays invisible until a
   # release workflow that runs typecheck fails.
@@ -195,7 +195,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        pkg: [subc-client, store]
+        pkg: [subc-client, store, log]
     defaults:
       run:
         working-directory: clients/${{ matrix.pkg }}
@@ -240,8 +240,8 @@ jobs:
       # stickier than a false one, because checking it returns a real reason and
       # the reader stops.
       #
-      # Restricted to the subc-client leg: the store package has no daemon tests,
-      # so building a daemon there would be pure cost.
+      # Restricted to the subc-client leg: the store and log packages have no
+      # daemon tests, so building a daemon there would be pure cost.
       - uses: dtolnay/rust-toolchain@stable
         if: ${{ !cancelled() && matrix.pkg == 'subc-client' }}
       # tests/live-daemon.ts builds the daemon itself when target/debug/ck-subc is

@@ -110,6 +110,14 @@ it; nothing else configures verbosity.
 
 ## Retention
 
+Defaults are sized against the noisiest module, not the median (ENGRAM's
+rule from the GC-grace incident): a module at `progress` verbosity writes
+~50 MB/day, so `32 MiB × keep 2` bounds the active set and `max_age_days`
+bounds the rotated set independently of rate. Rate-driven tags (upload
+progress, walk slices) are declared tags that ship OFF by default in the
+module's own `CK_LOG` baseline; a module must not put a per-object line
+behind `info`.
+
 Size cap per file (`max_file_mb`, checked on every write), `keep` rotated
 generations, and `max_age_days` applied to rotated generations at every
 rotation and at init. Rotation renames `.log → .log.1 → … → .log.<keep>` and
@@ -145,6 +153,28 @@ backstop, not the policy.
   same release as the doctor; the old `$TMPDIR` plugin log and pid-suffixed
   file are read-only compatibility inputs, never written again after the cut.
   Nothing else in the fleet waits on them.
+
+  Measured doctor contracts (2026-09-05), which the format satisfies without
+  special cases: both doctors are line-regex over free text, keyed on message
+  words (`failed:`, `Error:`, `EMERGENCY`, `exception`, `crashed:`,
+  `panicked at`, `timed out after <n>ms`) that the module's message text keeps;
+  neither parses timestamp, level, or fields. Session filters widen to accept
+  `session=<issuer>:<id>` beside the bracketed form for one release, with the
+  raw `ses_…` / uuid preserved as the id. AFT's telemetry parsers anchor on
+  the message (`index_event kind=… root=…`, `perf tick:`, `slow tool_call …`)
+  and require the `key=value` tail unquoted — satisfied because AFT sanitises
+  those values (no spaces, no `=`) and the format quotes only values that
+  contain a space, `"` or newline. MC's dashboard sorts lexically on the
+  timestamp capture; RFC3339 with `Z` and fixed millisecond width is
+  lexically monotonic. Owners re-key error extraction on `<LEVEL>` once
+  levels exist (their migration, not a format requirement).
+
+  Consumers pin their parsers against
+  `crates/subc-core/tests/fixtures/log_format_golden.json` (the authority
+  fixture) rather than against sample lines.
+- `logs/` under a module data dir is never captured by engram, as an
+  engram-wide rule independent of descriptors (rotation churn would otherwise
+  be a fresh upload every capture); the status surface says it was excluded.
 - Every other module: replace `eprintln!` with the crate; the census items
   each owner took (broca session ids on every line, insula heartbeat only on
   change, thalamus/astrocyte/synapse prefixes, synapse worker rings forwarded,

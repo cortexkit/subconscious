@@ -1,0 +1,86 @@
+{
+  "schema": 1,
+  "description": "Fleet log line format (docs/specs/fleet-logging.md). Each case gives the structured event and the exact line both cortexkit-log (Rust) and @cortexkit/log (TS) must render. Timestamps are fixed inputs; a renderer that reads the clock cannot pass this fixture and must accept an injected instant.",
+  "cases": [
+    {
+      "name": "plain-info-no-session",
+      "event": { "at_ms": 1788604863123, "level": "info", "module": "fusiform", "session": null, "tag": null,
+                 "message": "poll changed", "fields": [["version", "1788526509641"], ["eras", "22"], ["facts_changed", "0"], ["arrived", "2"]] },
+      "line": "2026-09-05T10:41:03.123Z INFO  fusiform poll changed version=1788526509641 eras=22 facts_changed=0 arrived=2"
+    },
+    {
+      "name": "session-and-tag",
+      "event": { "at_ms": 1788604863130, "level": "warn", "module": "magic-context", "session": { "issuer": "opencode", "id": "ses_00fc88222ffe" }, "tag": "perf",
+                 "message": "transform stage folded", "fields": [["ms", "412"], ["retry", "2"]] },
+      "line": "2026-09-05T10:41:03.130Z WARN  magic-context session=opencode:ses_00fc88222ffe tag=perf transform stage folded ms=412 retry=2"
+    },
+    {
+      "name": "error-level-padding",
+      "event": { "at_ms": 1788604864002, "level": "error", "module": "insula", "session": null, "tag": null,
+                 "message": "refresh failed", "fields": [["provider", "codex"], ["account", "ufuk3"], ["class", "auth_invalid"]] },
+      "line": "2026-09-05T10:41:04.002Z ERROR insula refresh failed provider=codex account=ufuk3 class=auth_invalid"
+    },
+    {
+      "name": "debug-and-trace-padding",
+      "event": { "at_ms": 1788604865000, "level": "debug", "module": "broca", "session": { "issuer": "broca", "id": "8f3a1c02" }, "tag": null,
+                 "message": "dispatch admitted", "fields": [["run", "r_12"], ["model", "anthropic/claude-sonnet-4-5"]] },
+      "line": "2026-09-05T10:41:05.000Z DEBUG broca session=broca:8f3a1c02 dispatch admitted run=r_12 model=anthropic/claude-sonnet-4-5"
+    },
+    {
+      "name": "trace-level",
+      "event": { "at_ms": 1788604865001, "level": "trace", "module": "callosum", "session": null, "tag": "wire",
+                 "message": "frame", "fields": [["channel", "716"], ["bytes", "1024"]] },
+      "line": "2026-09-05T10:41:05.001Z TRACE callosum tag=wire frame channel=716 bytes=1024"
+    },
+    {
+      "name": "value-with-space-is-quoted",
+      "event": { "at_ms": 1788604866000, "level": "info", "module": "aft", "session": { "issuer": "opencode", "id": "ses_f8f153e60ffe" }, "tag": null,
+                 "message": "slow tool_call", "fields": [["name", "aft_search"], ["root", "/Users/x/My Project"], ["ms", "1602"]] },
+      "line": "2026-09-05T10:41:06.000Z INFO  aft session=opencode:ses_f8f153e60ffe slow tool_call name=aft_search root=\"/Users/x/My Project\" ms=1602"
+    },
+    {
+      "name": "value-with-quote-and-newline-is-escaped",
+      "event": { "at_ms": 1788604867000, "level": "warn", "module": "plexus", "session": null, "tag": null,
+                 "message": "vendor error", "fields": [["body", "line one\nsaid \"no\""]] },
+      "line": "2026-09-05T10:41:07.000Z WARN  plexus vendor error body=\"line one\\nsaid \\\"no\\\"\""
+    },
+    {
+      "name": "message-newline-is-escaped",
+      "event": { "at_ms": 1788604868000, "level": "error", "module": "synapse", "session": null, "tag": null,
+                 "message": "engine crashed\nlast stderr: boom", "fields": [] },
+      "line": "2026-09-05T10:41:08.000Z ERROR synapse engine crashed\\nlast stderr: boom"
+    },
+    {
+      "name": "two-session-fields",
+      "event": { "at_ms": 1788604869000, "level": "info", "module": "prefrontal-core", "session": { "issuer": "opencode", "id": "ses_abc" }, "tag": null,
+                 "message": "run started", "fields": [["broca_session", "broca:8f3a1c02"], ["agent", "ag_9"]] },
+      "line": "2026-09-05T10:41:09.000Z INFO  prefrontal-core session=opencode:ses_abc run started broca_session=broca:8f3a1c02 agent=ag_9"
+    },
+    {
+      "name": "empty-value-is-quoted",
+      "event": { "at_ms": 1788604870000, "level": "info", "module": "claustrum", "session": null, "tag": null,
+                 "message": "handshake", "fields": [["reason", ""]] },
+      "line": "2026-09-05T10:41:10.000Z INFO  claustrum handshake reason=\"\""
+    }
+  ],
+  "parse_rejects": [
+    { "name": "ansi-in-line", "line": "2026-09-05T10:41:03.123Z \u001b[32mINFO\u001b[0m  fusiform x", "reason": "ansi_forbidden" },
+    { "name": "placeholder-session", "line": "2026-09-05T10:41:03.123Z INFO  magic-context session=global x", "reason": "session_missing_issuer" },
+    { "name": "unpadded-level", "line": "2026-09-05T10:41:03.123Z INFO fusiform x", "reason": "level_column_width" },
+    { "name": "local-time", "line": "2026-09-05T13:41:03.123+03:00 INFO  fusiform x", "reason": "timestamp_not_utc_z" }
+  ],
+  "level_filter": {
+    "description": "CK_LOG grammar cases: spec -> whether an event at (level, tag) is emitted.",
+    "cases": [
+      { "spec": "info", "level": "debug", "tag": null, "emit": false },
+      { "spec": "info", "level": "info", "tag": null, "emit": true },
+      { "spec": "info,perf=debug", "level": "debug", "tag": "perf", "emit": true },
+      { "spec": "info,perf=debug", "level": "debug", "tag": "wire", "emit": false },
+      { "spec": "warn,wire=trace", "level": "trace", "tag": "wire", "emit": true },
+      { "spec": "warn,wire=trace", "level": "info", "tag": null, "emit": false },
+      { "spec": "off", "level": "error", "tag": null, "emit": false },
+      { "spec": "", "level": "info", "tag": null, "emit": true, "note": "empty spec is the default: info" },
+      { "spec": "garbage=", "level": "info", "tag": null, "emit": true, "note": "malformed spec falls back to info and reports once" }
+    ]
+  }
+}

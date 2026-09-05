@@ -1,6 +1,6 @@
 # `ck module logs` — daemon-owned per-module log files
 
-Status: normative for the daemon slice and the verb. Written 2026-09-05 from a
+Status: SUPERSEDED by `fleet-logging.md` (operator ruling 2026-09-05: modules own their log files through one shared crate; the daemon owns only its own log and a stray-stderr capture). Kept for the census record below; the verb is re-specified in `fleet-logging.md`. Written 2026-09-05 from a
 fourteen-module census (twelve answered; MC, ENGRAM, WERNI outstanding and folded
 in when they land) and a source read of `crates/subc-core/src/stderr_tail.rs`
 and `supervise.rs`.

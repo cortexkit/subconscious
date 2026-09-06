@@ -35,7 +35,7 @@ const AUTH_DEADLINE: Duration = Duration::from_secs(2);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const DASHBOARD_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
-const CONNECTION_FILE_NAME: &str = "subc-connection.json";
+use subc_transport::CONNECTION_FILE_NAME;
 const TRIAGE_LOG_MAX_BYTES: u64 = 64 * 1024;
 const TRIAGE_LOG_TAIL_LINES: usize = 20;
 const EXPECTED_DAEMON_BINARY: &str = "ck-subc";

@@ -36,7 +36,7 @@ use std::sync::Arc;
 
 pub const DEFAULT_SUBC_PORT: u16 = 8757;
 pub const SUBC_PORT_ENV: &str = "SUBC_PORT";
-const CONNECTION_FILE_NAME: &str = "subc-connection.json";
+use subc_transport::CONNECTION_FILE_NAME;
 const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const PROBE_AUTH_DEADLINE: Duration = Duration::from_secs(2);

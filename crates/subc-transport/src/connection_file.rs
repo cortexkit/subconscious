@@ -18,7 +18,10 @@ pub const MIN_KEY_LEN: usize = 32;
 pub const KEY_LEN: usize = 32;
 pub const DAEMON_ID_LEN: usize = 16;
 
-const CONNECTION_FILE_NAME: &str = "subc-connection.json";
+/// The daemon's connection-file name. Public so the writer (bootstrap) and
+/// every reader spell it once; three private copies of this literal used to
+/// exist and nothing asserted they agreed.
+pub const CONNECTION_FILE_NAME: &str = "subc-connection.json";
 const PROD_CONNECTION_RELATIVE_PATH: &[&str] =
     &[".local", "share", "cortexkit", "run", CONNECTION_FILE_NAME];
 
@@ -668,7 +671,7 @@ mod tests {
     }
 
     #[test]
-    fn claustrum_defect_set_and_wrong_environment_path_fails_without_fallback() {
+    fn set_and_wrong_environment_path_fails_without_fallback() {
         let root = unique_temp_dir("env-exclusive");
         let runtime = root.join("runtime");
         let home = root.join("home");

@@ -12219,3 +12219,18 @@ store, not as an error. Copy with `sqlite3 "file:<path>?mode=ro" ".backup
 2026-09-06: a `cp` copy of the v5 store read back as v4 and briefly looked
 like the daemon had not migrated. Same trap ENGRAM named for backup
 enrollment — `backup-api-live`, never file copy.)
+
+## Placement arm: the commit a binary EMBEDS must equal the tag's commit
+
+A staged artifact's sha describes the artifact; the build-stamp commit inside
+it (`strings <bin> | grep <tag-sha-prefix>`) describes the TREE the build ran
+on, and it must equal `git rev-parse <tag>^{commit}`. Read it on every card
+whose binary embeds one, with the deployed image as the control (the string
+must be ABSENT there, or it is an incidental byte pattern). It answers "which
+commit did this build believe it was" after the fact; it cannot answer "was
+the tree actually that commit" — a stamped build over a dirty tree carries a
+correct-looking stale value — so the staging procedure's clean-tree refusal
+stays load-bearing beside it. A stamped-release module whose staged binary
+embeds NO commit did not come from its staging script and is not placed.
+(BROCA 0.3.76, 2026-09-06: their near-miss was a cherry-pick landing mid-build;
+this arm would have read the pre-pick commit against the tag.)

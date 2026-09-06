@@ -7,16 +7,31 @@
 # build on master then fails, and the finder's symptom is a mystifying dirty
 # Cargo.lock after a read-only command. Checking the commit's own tree (not the
 # working tree) is the property that matters.
-tmp=$(mktemp -d) || exit 1
-trap 'rm -rf "$tmp"' EXIT
-# Archive the WHOLE tree: a hardcoded path roster here decayed the day a new
-# top-level crate dir (cortexkit-release) appeared — the extraction lacked a
-# declared workspace member and cargo metadata failed on a phantom, refusing
-# a correct push. Whole-HEAD costs a moment more and cannot rot.
-if git archive HEAD 2>/dev/null | tar -x -C "$tmp" 2>/dev/null; then
-  if ! (cd "$tmp" && cargo metadata --locked --format-version 1 >/dev/null 2>&1); then
-    echo "pre-push: HEAD's Cargo.lock does not match its manifests (run cargo update -w or commit the lock)" >&2
-    exit 1
+# git hands the pushed refs on stdin: `<local ref> <local sha> <remote ref>
+# <remote sha>` per line. Check the sha being PUSHED, not the checkout's HEAD:
+# under train branches the two differ, and a branch deletion (local sha all
+# zeros) carries no tree to check at all — running the gate on HEAD for a
+# deletion is wasted seconds on every train cleanup.
+zero=0000000000000000000000000000000000000000
+pushed=""
+while read -r _ local_sha _ _; do
+  [ -n "$local_sha" ] && [ "$local_sha" != "$zero" ] && pushed="$local_sha"
+done
+# No stdin (a direct invocation) falls back to HEAD; a deletion-only push
+# leaves `pushed` empty and skips the lock check.
+[ -n "$pushed" ] || { [ -t 0 ] && pushed=$(git rev-parse HEAD); }
+if [ -n "$pushed" ]; then
+  tmp=$(mktemp -d) || exit 1
+  trap 'rm -rf "$tmp"' EXIT
+  # Archive the WHOLE tree: a hardcoded path roster here decayed the day a new
+  # top-level crate dir (cortexkit-release) appeared — the extraction lacked a
+  # declared workspace member and cargo metadata failed on a phantom, refusing
+  # a correct push. Whole-tree costs a moment more and cannot rot.
+  if git archive "$pushed" 2>/dev/null | tar -x -C "$tmp" 2>/dev/null; then
+    if ! (cd "$tmp" && cargo metadata --locked --format-version 1 >/dev/null 2>&1); then
+      echo "pre-push: the pushed commit's Cargo.lock does not match its manifests (run cargo update -w or commit the lock)" >&2
+      exit 1
+    fi
   fi
 fi
 

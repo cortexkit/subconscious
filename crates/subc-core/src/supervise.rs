@@ -214,8 +214,9 @@ impl RestartPolicy {
     }
 
     /// Calculate the capped exponential delay for the next crash replacement.
-    /// `restart_in_window` is zero for the first replacement after a reset or
-    /// after all older crash replacements have aged out.
+    /// `restart_in_window` is zero for the first replacement after an operator
+    /// action (restart, reload, re-enable) cleared the crash ring, or after all
+    /// older crash replacements have aged out of the window.
     fn delay_for_restart(&self, restart_in_window: u32) -> Duration {
         if self.backoff.is_zero() || self.max_backoff.is_zero() {
             return Duration::ZERO;

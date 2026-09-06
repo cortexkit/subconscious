@@ -51,7 +51,7 @@ block), and every key is independent: whatever you omit keeps its default.
   "modules": {
     "flappy-worker": {
       "program": "/usr/local/bin/flappy-worker",
-      "restart": { "max_restarts": 3, "window_secs": 600, "backoff_ms": 100 }
+      "restart": { "max_restarts": 3, "window_secs": 600, "backoff_ms": 100, "max_backoff_ms": 30000 }
     }
   }
 }
@@ -61,7 +61,8 @@ block), and every key is independent: whatever you omit keeps its default.
 | --- | --- | --- | --- |
 | `max_restarts` | Replacement processes allowed *within* `window_secs`. | 3 | Accepted: never replace this module. |
 | `window_secs` | The span those restarts are counted over. Restarts older than this release their slot. | 600 s | Refused: a zero window holds no crash, so the budget can never be spent and the module restarts forever. |
-| `backoff_ms` | Delay before each replacement spawn. | 100 ms | Accepted: respawn immediately. |
+| `backoff_ms` | Base delay before a replacement spawn. | 100 ms | Accepted: respawn immediately. |
+| `max_backoff_ms` | Upper bound for the escalating delay before a replacement spawn. Must be at least `backoff_ms`. | 30,000 ms | Accepted: `0` is valid only when `backoff_ms` is also `0`. |
 
 The budget is a RATE, not a lifetime total, and the distinction is the whole
 point of the window. A module that crashed twice yesterday has a full budget
@@ -70,6 +71,12 @@ stopped. This matters now that modules exit non-zero whenever the daemon's
 connection to them drops, since each of those drops spends a unit of the same
 budget: under a lifetime total, one flappy hour would stop a healthy module
 permanently.
+
+Crash respawn delay escalates from `backoff_ms` by a factor of ten for each
+restart already in the window, up to `max_backoff_ms`. This gives peers time to
+finish warming during a daemon-wide boot storm: a fixed short delay can make a
+module repeatedly probe a peer before it is ready and exhaust its restart budget
+while the fleet is still settling.
 
 When the budget refuses a respawn, the module goes to `failed` and both the log
 line and the retained terminal record name the limit AND the window:

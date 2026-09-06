@@ -46,6 +46,7 @@ pub const SUBC_ARG: &str = "--subc";
 
 const DEFAULT_MAX_RESTARTS: u32 = 3;
 const DEFAULT_BACKOFF: Duration = Duration::from_millis(100);
+const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// The span `DEFAULT_MAX_RESTARTS` is counted over. Ten minutes is long enough
 /// to contain a real crash loop (which respawns in seconds) and short enough
 /// that unrelated crashes hours apart never accumulate into a permanent stop.
@@ -178,7 +179,11 @@ pub struct ModuleSpec {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RestartPolicy {
     pub max_restarts: u32,
+    /// Base delay before a crash replacement. The actual delay escalates with
+    /// the number of recent crash replacements and is capped by `max_backoff`.
     pub backoff: Duration,
+    /// Maximum delay before a crash replacement.
+    pub max_backoff: Duration,
     /// The span `max_restarts` is counted over. `Duration::ZERO` makes the
     /// budget effectively infinite (nothing is ever in-window), which is why
     /// daemon config refuses `window_secs: 0` rather than quietly accepting it.
@@ -193,13 +198,40 @@ impl RestartPolicy {
         Self {
             max_restarts,
             backoff,
+            max_backoff: DEFAULT_MAX_BACKOFF,
             window: DEFAULT_RESTART_WINDOW,
         }
+    }
+
+    pub fn with_max_backoff(mut self, max_backoff: Duration) -> Self {
+        self.max_backoff = max_backoff;
+        self
     }
 
     pub fn with_window(mut self, window: Duration) -> Self {
         self.window = window;
         self
+    }
+
+    /// Calculate the capped exponential delay for the next crash replacement.
+    /// `restart_in_window` is zero for the first replacement after a reset or
+    /// after all older crash replacements have aged out.
+    fn delay_for_restart(&self, restart_in_window: u32) -> Duration {
+        if self.backoff.is_zero() || self.max_backoff.is_zero() {
+            return Duration::ZERO;
+        }
+
+        let mut delay = self.backoff;
+        for _ in 0..restart_in_window {
+            if delay >= self.max_backoff {
+                return self.max_backoff;
+            }
+            delay = delay
+                .checked_mul(10)
+                .unwrap_or(self.max_backoff)
+                .min(self.max_backoff);
+        }
+        delay.min(self.max_backoff)
     }
 
     /// The one sentence that explains a budget-exhausted stop, used for both the
@@ -220,9 +252,16 @@ impl Default for RestartPolicy {
         Self {
             max_restarts: DEFAULT_MAX_RESTARTS,
             backoff: DEFAULT_BACKOFF,
+            max_backoff: DEFAULT_MAX_BACKOFF,
             window: DEFAULT_RESTART_WINDOW,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CrashRestartSchedule {
+    restart_in_window: u32,
+    delay: Duration,
 }
 
 /// Whether the daemon itself will bring this module back after the exit being
@@ -494,6 +533,25 @@ impl SupervisorSnapshot {
             self.crash_restarts.pop_front();
         }
         self.lifetime_restarts += 1;
+    }
+
+    /// Reserve one crash-restart slot and calculate the delay before respawning.
+    /// The count is captured before recording this restart, so the first retry
+    /// uses the base delay and each later in-window retry escalates once.
+    fn next_crash_restart(
+        &mut self,
+        policy: &RestartPolicy,
+        now: Instant,
+    ) -> Option<CrashRestartSchedule> {
+        let restart_in_window = self.crash_restarts_in_window(policy.window, now);
+        if restart_in_window >= policy.max_restarts {
+            return None;
+        }
+        self.record_crash_restart(policy, now);
+        Some(CrashRestartSchedule {
+            restart_in_window,
+            delay: policy.delay_for_restart(restart_in_window),
+        })
     }
 
     /// Give the module its full budget back, as an operator restart, reload, or
@@ -2351,12 +2409,15 @@ async fn health_restart_child(
     detail: Option<&str>,
     now_ms: u64,
 ) -> Result<(), SuperviseError> {
-    let (enabled, will_restart) = {
+    let (enabled, schedule) = {
         let mut state = lock_snapshot(snapshot)?;
-        (
-            state.enabled,
-            daemon_will_restart(&mut state, &runtime.restart_policy, Instant::now()),
-        )
+        let enabled = state.enabled;
+        let schedule = if enabled {
+            state.next_crash_restart(&runtime.restart_policy, Instant::now())
+        } else {
+            None
+        };
+        (enabled, schedule)
     };
 
     if !enabled {
@@ -2365,7 +2426,7 @@ async fn health_restart_child(
         });
     }
 
-    if !will_restart {
+    if schedule.is_none() {
         record_health_action(snapshot, &spec.module_id, "disabled".to_string(), now_ms);
         error!(
             module_id = %spec.module_id,
@@ -2398,9 +2459,9 @@ async fn health_restart_child(
         return Ok(());
     }
 
+    let schedule = schedule.expect("a health restart must have a crash-restart schedule");
     let mut restart_count = 0;
     update_snapshot(snapshot, Some(&spec.module_id), |state| {
-        state.record_crash_restart(&runtime.restart_policy, Instant::now());
         restart_count = state.crash_restarts.len();
         state.state = ModuleState::Unresponsive;
         state.health.status = status;
@@ -2412,6 +2473,8 @@ async fn health_restart_child(
         status = ?status,
         detail,
         restart_count,
+        restart_in_window = schedule.restart_in_window,
+        delay_ms = schedule.delay.as_millis() as u64,
         "health-triggered module restart"
     );
 
@@ -2434,7 +2497,7 @@ async fn health_restart_child(
         Some(true),
     )
     .await?;
-    sleep(runtime.restart_policy.backoff).await;
+    sleep(schedule.delay).await;
     process_liveness.track(spec.module_id.clone(), Arc::clone(snapshot));
     match spawn_and_mark_running(spec, runtime, snapshot) {
         Ok(next_child) => {
@@ -2799,8 +2862,15 @@ async fn supervise_loop(
                             }
                             child = None;
                         }
-                        NextAction::Restart => {
-                            sleep(runtime.restart_policy.backoff).await;
+                        NextAction::Restart { schedule } => {
+                            let delay = schedule.map_or(
+                                runtime.restart_policy.delay_for_restart(0),
+                                |schedule| schedule.delay,
+                            );
+                            if let Some(schedule) = schedule {
+                                log_crash_respawn(&spec.module_id, schedule);
+                            }
+                            sleep(delay).await;
                             if let Err(err) = wait_for_registration_release(
                                 &registry,
                                 &spec.module_id,
@@ -2880,9 +2950,22 @@ async fn supervise_loop(
     }
 }
 
+fn log_crash_respawn(module_id: &str, schedule: CrashRestartSchedule) {
+    info!(
+        module_id,
+        restart_in_window = schedule.restart_in_window,
+        delay_ms = schedule.delay.as_millis() as u64,
+        "respawning after crash"
+    );
+}
+
 enum NextAction {
-    Stop { registration_released: bool },
-    Restart,
+    Stop {
+        registration_released: bool,
+    },
+    Restart {
+        schedule: Option<CrashRestartSchedule>,
+    },
 }
 
 async fn handle_supervisor_command(
@@ -3387,7 +3470,7 @@ async fn on_child_exit(
                 exit_signal = ?exit_report.signal,
                 "supervised module exited abnormally (crash)"
             );
-            let mut should_restart = false;
+            let mut restart_schedule = None;
             let mut disposition = TerminalDisposition::Disabled;
             // Set only when the budget is what stopped the module, so the
             // terminal record says which limit was hit rather than leaving
@@ -3397,15 +3480,16 @@ async fn on_child_exit(
             if let Err(err) = update_snapshot(snapshot, Some(&spec.module_id), |state| {
                 clear_current_process_facts(state);
                 state.last_exit = Some(exit_report.clone());
-                if daemon_will_restart(state, &policy, now) {
-                    state.record_crash_restart(&policy, now);
-                    state.state = ModuleState::Restarting;
-                    should_restart = true;
-                    disposition = TerminalDisposition::Restarting;
-                } else if state.enabled {
-                    state.state = ModuleState::Failed;
-                    disposition = TerminalDisposition::Failed;
-                    disposition_detail = Some(policy.budget_exhausted_detail());
+                if state.enabled {
+                    if let Some(schedule) = state.next_crash_restart(&policy, now) {
+                        state.state = ModuleState::Restarting;
+                        restart_schedule = Some(schedule);
+                        disposition = TerminalDisposition::Restarting;
+                    } else {
+                        state.state = ModuleState::Failed;
+                        disposition = TerminalDisposition::Failed;
+                        disposition_detail = Some(policy.budget_exhausted_detail());
+                    }
                 } else {
                     state.state = ModuleState::Disabled;
                     disposition = TerminalDisposition::Disabled;
@@ -3436,8 +3520,10 @@ async fn on_child_exit(
                 disposition_detail,
             );
 
-            if should_restart {
-                NextAction::Restart
+            if let Some(schedule) = restart_schedule {
+                NextAction::Restart {
+                    schedule: Some(schedule),
+                }
             } else {
                 let registration_released = match wait_for_registration_release(
                     registry,
@@ -3486,7 +3572,7 @@ async fn on_child_exit(
             record_terminal(terminal_ring, &exit_report, disposition);
 
             if should_restart {
-                NextAction::Restart
+                NextAction::Restart { schedule: None }
             } else {
                 let registration_released = match wait_for_registration_release(
                     registry,
@@ -4097,8 +4183,14 @@ async fn handle_reload_child_registration_failure(
                 process_liveness.untrack_if_current(&spec.module_id, snapshot);
             }
         }
-        NextAction::Restart => {
-            sleep(runtime.restart_policy.backoff).await;
+        NextAction::Restart { schedule } => {
+            let delay = schedule.map_or(runtime.restart_policy.delay_for_restart(0), |schedule| {
+                schedule.delay
+            });
+            if let Some(schedule) = schedule {
+                log_crash_respawn(&spec.module_id, schedule);
+            }
+            sleep(delay).await;
             if let Err(err) =
                 wait_for_registration_release(registry, &spec.module_id, REGISTRY_RELEASE_TIMEOUT)
                     .await
@@ -4660,6 +4752,86 @@ mod terminal_history_tests {
         ));
     }
 
+    #[test]
+    fn crash_restart_backoff_escalates_with_in_window_count() {
+        let policy = RestartPolicy::new(4, Duration::from_millis(100))
+            .with_max_backoff(Duration::from_secs(30));
+        let now = ClockInstant::now();
+        let mut state = SupervisorSnapshot::new(ModuleState::Running, true);
+        let schedules = (0..4)
+            .map(|_| {
+                state
+                    .next_crash_restart(&policy, now)
+                    .expect("the test policy allows four crash restarts")
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            schedules
+                .iter()
+                .map(|schedule| schedule.restart_in_window)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2, 3]
+        );
+        assert_eq!(
+            schedules
+                .iter()
+                .map(|schedule| schedule.delay)
+                .collect::<Vec<_>>(),
+            vec![
+                Duration::from_millis(100),
+                Duration::from_secs(1),
+                Duration::from_secs(10),
+                Duration::from_secs(30),
+            ]
+        );
+    }
+
+    #[test]
+    fn crash_restart_backoff_resets_after_ring_clear() {
+        let policy = RestartPolicy::new(3, Duration::from_millis(100));
+        let now = ClockInstant::now();
+        let mut state = SupervisorSnapshot::new(ModuleState::Running, true);
+        assert_eq!(
+            state.next_crash_restart(&policy, now).unwrap().delay,
+            Duration::from_millis(100)
+        );
+        assert_eq!(
+            state.next_crash_restart(&policy, now).unwrap().delay,
+            Duration::from_secs(1)
+        );
+
+        state.clear_crash_restarts();
+        let schedule = state
+            .next_crash_restart(&policy, now)
+            .expect("a cleared ring must allow another restart");
+        assert_eq!(schedule.restart_in_window, 0);
+        assert_eq!(schedule.delay, Duration::from_millis(100));
+    }
+
+    #[test]
+    fn crash_restart_backoff_ignores_aged_restarts() {
+        let policy = RestartPolicy::new(3, Duration::from_millis(100));
+        let now = ClockInstant::now();
+        let mut state = SupervisorSnapshot::new(ModuleState::Running, true);
+        state
+            .next_crash_restart(&policy, now)
+            .expect("the first restart is allowed");
+        state
+            .next_crash_restart(&policy, now)
+            .expect("the second restart is allowed");
+        state.crash_restarts[0] = now
+            .checked_sub(policy.window + Duration::from_secs(1))
+            .expect("the fake clock can age a restart past the window");
+
+        let schedule = state
+            .next_crash_restart(&policy, now)
+            .expect("an aged restart must release its slot");
+        assert_eq!(schedule.restart_in_window, 1);
+        assert_eq!(schedule.delay, Duration::from_secs(1));
+        assert_eq!(state.crash_restarts.len(), 2);
+    }
+
     /// The budget is a rate: the same three spent restarts refuse a respawn
     /// while they are recent and allow one once they have aged past the window.
     /// Nothing about the module changed in between, which is the whole point.
@@ -4851,7 +5023,7 @@ mod terminal_history_tests {
                 },
             )
             .await,
-            NextAction::Restart
+            NextAction::Restart { schedule: _ }
         ));
         let (crash_restarts, crash_lifetime) = {
             let state = lock_snapshot(&crash_snapshot).unwrap();
@@ -4949,7 +5121,7 @@ mod terminal_history_tests {
                 exit_report,
             )
             .await,
-            NextAction::Restart
+            NextAction::Restart { schedule: _ }
         ));
         let state = lock_snapshot(&snapshot).unwrap();
         assert_eq!(state.lifetime_restarts, 1);
@@ -4988,7 +5160,7 @@ mod terminal_history_tests {
                 },
             )
             .await,
-            NextAction::Restart
+            NextAction::Restart { schedule: _ }
         ));
         let state = lock_snapshot(&snapshot).unwrap();
         assert_eq!(state.lifetime_restarts, 1);
@@ -5043,7 +5215,7 @@ mod terminal_history_tests {
                         crash_exit_report(attempt),
                     )
                     .await,
-                    NextAction::Restart
+                    NextAction::Restart { schedule: _ }
                 ),
                 "crash {attempt} is inside the budget and must respawn"
             );
@@ -5119,7 +5291,7 @@ mod terminal_history_tests {
                     crash_exit_report(attempt),
                 )
                 .await,
-                NextAction::Restart
+                NextAction::Restart { schedule: _ }
             ));
         }
 
@@ -5141,7 +5313,7 @@ mod terminal_history_tests {
                     crash_exit_report(3),
                 )
                 .await,
-                NextAction::Restart
+                NextAction::Restart { schedule: _ }
             ),
             "a crash older than the window must not hold a budget slot"
         );
@@ -5184,7 +5356,7 @@ mod terminal_history_tests {
                     crash_exit_report(attempt),
                 )
                 .await,
-                NextAction::Restart
+                NextAction::Restart { schedule: _ }
             ));
         }
 
@@ -5212,7 +5384,7 @@ mod terminal_history_tests {
                     crash_exit_report(3),
                 )
                 .await,
-                NextAction::Restart
+                NextAction::Restart { schedule: _ }
             ),
             "the cleared budget must be spendable again"
         );

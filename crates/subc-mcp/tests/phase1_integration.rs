@@ -36,8 +36,8 @@ use subc_core::{
 };
 use subc_protocol::{
     manifest::{
-        Bindings, Concurrency, ExecutionMode, IdentityBinding, IdentityScope, ModuleManifest,
-        ProviderRole, StorageBinding, StorageKind, StorageScope, Tool as ProviderTool, TrustTier,
+        Concurrency, ExecutionMode, IdentityScope, ModuleManifest, ProviderRole,
+        Tool as ProviderTool,
     },
     session::{HealthStatus as ControlHealthStatus, ModuleControlRequest, ModuleControlResponse},
     BindIdentity, ErrorBody, Flags, FrameType, ModuleHelloAckBody, ModuleHelloBody, Priority,
@@ -4579,36 +4579,20 @@ async fn run_raw_provider(
 }
 
 fn raw_provider_manifest(module_id: &str, tool_name: &str) -> ModuleManifest {
-    ModuleManifest::builder(
-        module_id,
-        "0.0.0-raw-test",
-        TrustTier::FirstParty,
-        Bindings {
-            storage: StorageBinding {
-                kind: StorageKind::Sqlite,
-                scope: StorageScope::Project,
-                owns_schema: true,
-            },
-            vault_grants: Vec::new(),
-            identity: IdentityBinding {
-                requires: vec![IdentityScope::Project],
-                optional: vec![IdentityScope::Session],
-            },
-        },
-    )
-    .provides(vec![ProviderRole::ToolProvider {
-        tools: vec![ProviderTool {
-            name: tool_name.to_owned(),
-            description: None,
-            execution_mode: ExecutionMode::Pure,
-            schema: json!({"type": "object"}),
-        }],
-        identity_scope: vec![IdentityScope::Project, IdentityScope::Session],
-        concurrency: Concurrency::ModuleManaged,
-        emits_push: true,
-        sub_supervises: true,
-    }])
-    .build()
+    ModuleManifest::builder(module_id, "0.0.0-raw-test")
+        .provides(vec![ProviderRole::ToolProvider {
+            tools: vec![ProviderTool {
+                name: tool_name.to_owned(),
+                description: None,
+                execution_mode: ExecutionMode::Pure,
+                schema: json!({"type": "object"}),
+            }],
+            identity_scope: vec![IdentityScope::Project, IdentityScope::Session],
+            concurrency: Concurrency::ModuleManaged,
+            emits_push: true,
+            sub_supervises: true,
+        }])
+        .build()
 }
 
 async fn read_len_prefixed_json<R, T>(reader: &mut R, max_len: u32) -> Result<Option<T>, String>

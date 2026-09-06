@@ -17,12 +17,8 @@ use subc_core::{
     write_frame, Frame,
 };
 use subc_protocol::{
-    manifest::{
-        Bindings, IdentityBinding, IdentityScope, ModuleManifest, StorageBinding, StorageKind,
-        StorageScope, TrustTier,
-    },
-    BindIdentity, ErrorBody, Flags, FrameType, ModuleHelloBody, Priority, RouteTarget,
-    PROTOCOL_VERSION,
+    manifest::ModuleManifest, BindIdentity, ErrorBody, Flags, FrameType, ModuleHelloBody, Priority,
+    RouteTarget, PROTOCOL_VERSION,
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt},
@@ -1491,24 +1487,7 @@ fn control_request_frame(corr: u64, request: ClientControlRequest) -> Frame {
 }
 
 fn untrusted_hello_frame(module_id: &str, corr: u64) -> Frame {
-    let manifest = ModuleManifest::builder(
-        module_id,
-        "0.0.0-test",
-        TrustTier::FirstParty,
-        Bindings {
-            storage: StorageBinding {
-                kind: StorageKind::Sqlite,
-                scope: StorageScope::Project,
-                owns_schema: false,
-            },
-            vault_grants: Vec::new(),
-            identity: IdentityBinding {
-                requires: Vec::new(),
-                optional: vec![IdentityScope::Project],
-            },
-        },
-    )
-    .build();
+    let manifest = ModuleManifest::builder(module_id, "0.0.0-test").build();
     let body = serde_json::to_vec(&ModuleHelloBody {
         manifest,
         protocol_ver: PROTOCOL_VERSION,

@@ -25,12 +25,15 @@ pub struct ModuleManifest {
     pub module_id: String,
     pub module_version: String,
     pub protocol_ver: u8,
-    pub trust_tier: TrustTier,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust_tier: Option<TrustTier>,
     /// Existing role declarations; capability grammar claims deliberately live in
     /// the separate [`CapabilityDeclarations`] block below.
     pub provides: Vec<ProviderRole>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub consumes: Vec<ConsumerRole>,
-    pub bindings: Bindings,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bindings: Option<Bindings>,
     /// Optional capability-grammar declarations.
     ///
     /// Omitting this block preserves the manifest contract used before capability
@@ -84,35 +87,35 @@ pub struct ModuleManifestBuilder {
     module_id: String,
     module_version: String,
     protocol_ver: u8,
-    trust_tier: TrustTier,
+    trust_tier: Option<TrustTier>,
     provides: Vec<ProviderRole>,
     consumes: Vec<ConsumerRole>,
-    bindings: Bindings,
+    bindings: Option<Bindings>,
     capabilities: Option<CapabilityDeclarations>,
     self_signals: Option<Vec<SelfSignalDeclaration>>,
     provenance: Option<ManifestProvenance>,
 }
 
 impl ModuleManifest {
-    /// Starts a manifest with the fields that cannot be honestly absent.
+    /// Starts a manifest builder with the minimal identification fields.
     ///
     /// `protocol_ver` defaults to the protocol version linked into this crate;
-    /// providers and consumers default to empty declarations. The trust tier and
-    /// bindings stay required because neither has a safe invented value.
+    /// `provides` and `consumes` default to empty declarations. `trust_tier`
+    /// and `bindings` default to `None` because the daemon reads neither on any
+    /// production path; a required unread field forces producers to invent
+    /// fabricated values.
     pub fn builder(
         module_id: impl Into<String>,
         module_version: impl Into<String>,
-        trust_tier: TrustTier,
-        bindings: Bindings,
     ) -> ModuleManifestBuilder {
         ModuleManifestBuilder {
             module_id: module_id.into(),
             module_version: module_version.into(),
             protocol_ver: PROTOCOL_VERSION,
-            trust_tier,
+            trust_tier: None,
             provides: Vec::new(),
             consumes: Vec::new(),
-            bindings,
+            bindings: None,
             capabilities: None,
             self_signals: None,
             provenance: None,
@@ -127,6 +130,14 @@ impl ModuleManifestBuilder {
         self
     }
 
+    /// Declares the optional trust tier of this module.
+    ///
+    /// The daemon does not evaluate this field on any production path.
+    pub fn trust_tier(mut self, trust_tier: Option<TrustTier>) -> Self {
+        self.trust_tier = trust_tier;
+        self
+    }
+
     /// Declares the provider roles this module exposes.
     pub fn provides(mut self, provides: Vec<ProviderRole>) -> Self {
         self.provides = provides;
@@ -136,6 +147,14 @@ impl ModuleManifestBuilder {
     /// Declares the consumer roles this module requests.
     pub fn consumes(mut self, consumes: Vec<ConsumerRole>) -> Self {
         self.consumes = consumes;
+        self
+    }
+
+    /// Declares the optional resource and subsystem bindings of this module.
+    ///
+    /// The daemon does not evaluate this field on any production path.
+    pub fn bindings(mut self, bindings: Option<Bindings>) -> Self {
+        self.bindings = bindings;
         self
     }
 
@@ -196,10 +215,13 @@ struct ModuleManifestWire {
     module_id: String,
     module_version: String,
     protocol_ver: u8,
-    trust_tier: TrustTier,
+    #[serde(default)]
+    trust_tier: Option<TrustTier>,
     provides: Vec<ProviderRole>,
+    #[serde(default)]
     consumes: Vec<ConsumerRole>,
-    bindings: Bindings,
+    #[serde(default)]
+    bindings: Option<Bindings>,
     #[serde(default)]
     capabilities: Option<CapabilityDeclarations>,
     #[serde(default)]
@@ -221,19 +243,16 @@ impl<'de> Deserialize<'de> for ModuleManifest {
         let wire = ModuleManifestWire::deserialize(deserializer)?;
         validate_runtime_computed(wire.runtime_computed.as_ref(), "runtime_computed")
             .map_err(D::Error::custom)?;
-        let manifest = Self::builder(
-            wire.module_id,
-            wire.module_version,
-            wire.trust_tier,
-            wire.bindings,
-        )
-        .protocol_ver(wire.protocol_ver)
-        .provides(wire.provides)
-        .consumes(wire.consumes)
-        .capabilities(wire.capabilities)
-        .self_signals(wire.self_signals)
-        .provenance(wire.provenance)
-        .build();
+        let manifest = Self::builder(wire.module_id, wire.module_version)
+            .protocol_ver(wire.protocol_ver)
+            .trust_tier(wire.trust_tier)
+            .provides(wire.provides)
+            .consumes(wire.consumes)
+            .bindings(wire.bindings)
+            .capabilities(wire.capabilities)
+            .self_signals(wire.self_signals)
+            .provenance(wire.provenance)
+            .build();
         manifest
             .validate_capability_grammar()
             .map_err(D::Error::custom)?;
@@ -1347,11 +1366,9 @@ mod tests {
     use serde_json::json;
 
     fn aft_manifest_fixture() -> ModuleManifest {
-        ModuleManifest::builder(
-            "aft",
-            "0.39.2",
-            TrustTier::FirstParty,
-            Bindings {
+        ModuleManifest::builder("aft", "0.39.2")
+            .trust_tier(Some(TrustTier::FirstParty))
+            .bindings(Some(Bindings {
                 storage: StorageBinding {
                     kind: StorageKind::Sqlite,
                     scope: StorageScope::Project,
@@ -1365,63 +1382,62 @@ mod tests {
                     requires: vec![IdentityScope::Project],
                     optional: vec![IdentityScope::Session],
                 },
-            },
-        )
-        .protocol_ver(1)
-        .provides(vec![ProviderRole::ToolProvider {
-            tools: vec![
-                Tool {
-                    name: "read".to_string(),
-                    description: None,
-                    execution_mode: ExecutionMode::Pure,
-                    schema: json!({"type": "object"}),
-                },
-                Tool {
-                    name: "grep".to_string(),
-                    description: None,
-                    execution_mode: ExecutionMode::Pure,
-                    schema: json!({"type": "object"}),
-                },
-                Tool {
-                    name: "outline".to_string(),
-                    description: None,
-                    execution_mode: ExecutionMode::Pure,
-                    schema: json!({"type": "object"}),
-                },
-                Tool {
-                    name: "semantic_search".to_string(),
-                    description: None,
-                    execution_mode: ExecutionMode::Pure,
-                    schema: json!({"type": "object"}),
-                },
-                Tool {
-                    name: "edit".to_string(),
-                    description: None,
-                    execution_mode: ExecutionMode::Mutating,
-                    schema: json!({"type": "object"}),
-                },
-                Tool {
-                    name: "write".to_string(),
-                    description: None,
-                    execution_mode: ExecutionMode::Mutating,
-                    schema: json!({"type": "object"}),
-                },
-                Tool {
-                    name: "bash".to_string(),
-                    description: None,
-                    execution_mode: ExecutionMode::Unfenceable,
-                    schema: json!({"type": "object"}),
-                },
-            ],
-            identity_scope: vec![IdentityScope::Session, IdentityScope::Project],
-            concurrency: Concurrency::ModuleManaged,
-            emits_push: true,
-            sub_supervises: true,
-        }])
-        .consumes(vec![ConsumerRole::ServiceClient {
-            of: vec!["embedding.v2".to_string()],
-        }])
-        .build()
+            }))
+            .protocol_ver(1)
+            .provides(vec![ProviderRole::ToolProvider {
+                tools: vec![
+                    Tool {
+                        name: "read".to_string(),
+                        description: None,
+                        execution_mode: ExecutionMode::Pure,
+                        schema: json!({"type": "object"}),
+                    },
+                    Tool {
+                        name: "grep".to_string(),
+                        description: None,
+                        execution_mode: ExecutionMode::Pure,
+                        schema: json!({"type": "object"}),
+                    },
+                    Tool {
+                        name: "outline".to_string(),
+                        description: None,
+                        execution_mode: ExecutionMode::Pure,
+                        schema: json!({"type": "object"}),
+                    },
+                    Tool {
+                        name: "semantic_search".to_string(),
+                        description: None,
+                        execution_mode: ExecutionMode::Pure,
+                        schema: json!({"type": "object"}),
+                    },
+                    Tool {
+                        name: "edit".to_string(),
+                        description: None,
+                        execution_mode: ExecutionMode::Mutating,
+                        schema: json!({"type": "object"}),
+                    },
+                    Tool {
+                        name: "write".to_string(),
+                        description: None,
+                        execution_mode: ExecutionMode::Mutating,
+                        schema: json!({"type": "object"}),
+                    },
+                    Tool {
+                        name: "bash".to_string(),
+                        description: None,
+                        execution_mode: ExecutionMode::Unfenceable,
+                        schema: json!({"type": "object"}),
+                    },
+                ],
+                identity_scope: vec![IdentityScope::Session, IdentityScope::Project],
+                concurrency: Concurrency::ModuleManaged,
+                emits_push: true,
+                sub_supervises: true,
+            }])
+            .consumes(vec![ConsumerRole::ServiceClient {
+                of: vec!["embedding.v2".to_string()],
+            }])
+            .build()
     }
 
     #[test]
@@ -1435,37 +1451,28 @@ mod tests {
 
     #[test]
     fn builder_defaults_additions_to_honest_absence_and_round_trips() {
-        let manifest = ModuleManifest::builder(
-            "builder-defaults",
-            "2.0.0",
-            TrustTier::Reviewed,
-            Bindings {
-                storage: StorageBinding {
-                    kind: StorageKind::Sqlite,
-                    scope: StorageScope::Project,
-                    owns_schema: false,
-                },
-                vault_grants: Vec::new(),
-                identity: IdentityBinding {
-                    requires: vec![IdentityScope::Project],
-                    optional: Vec::new(),
-                },
-            },
-        )
-        .build();
+        let manifest = ModuleManifest::builder("builder-defaults", "2.0.0").build();
 
         assert_eq!(manifest.module_id, "builder-defaults");
         assert_eq!(manifest.module_version, "2.0.0");
         assert_eq!(manifest.protocol_ver, PROTOCOL_VERSION);
-        assert_eq!(manifest.trust_tier, TrustTier::Reviewed);
+        assert_eq!(manifest.trust_tier, None);
         assert!(manifest.provides.is_empty());
         assert!(manifest.consumes.is_empty());
+        assert_eq!(manifest.bindings, None);
         assert_eq!(manifest.capabilities, None);
         assert_eq!(manifest.self_signals, None);
         assert_eq!(manifest.provenance, None);
 
         let encoded = serde_json::to_value(&manifest).expect("builder manifest serializes");
-        for optional in ["capabilities", "self_signals", "provenance"] {
+        for optional in [
+            "trust_tier",
+            "consumes",
+            "bindings",
+            "capabilities",
+            "self_signals",
+            "provenance",
+        ] {
             assert!(
                 encoded.get(optional).is_none(),
                 "an absent {optional} declaration must stay absent on the wire"
@@ -1478,11 +1485,9 @@ mod tests {
 
     #[test]
     fn fully_populated_builder_manifest_matches_the_literal_wire_golden() {
-        let manifest = ModuleManifest::builder(
-            "full-builder",
-            "2.0.0",
-            TrustTier::Reviewed,
-            Bindings {
+        let manifest = ModuleManifest::builder("full-builder", "2.0.0")
+            .trust_tier(Some(TrustTier::Reviewed))
+            .bindings(Some(Bindings {
                 storage: StorageBinding {
                     kind: StorageKind::Sqlite,
                     scope: StorageScope::Project,
@@ -1493,53 +1498,101 @@ mod tests {
                     requires: vec![IdentityScope::Project],
                     optional: Vec::new(),
                 },
-            },
-        )
-        .provides(vec![ProviderRole::ToolProvider {
-            tools: vec![Tool {
-                name: "read".to_string(),
-                description: None,
-                execution_mode: ExecutionMode::Pure,
-                schema: json!({"type": "object"}),
-            }],
-            identity_scope: vec![IdentityScope::Project],
-            concurrency: Concurrency::Serial,
-            emits_push: false,
-            sub_supervises: false,
-        }])
-        .consumes(vec![ConsumerRole::ServiceClient {
-            of: vec!["embedding.v2".to_string()],
-        }])
-        .capabilities(Some(CapabilityDeclarations {
-            provides: vec!["embedding/v2".to_string()],
-            requires: Vec::new(),
-            must_never_reach: Vec::new(),
-        }))
-        .self_signals(Some(vec![SelfSignalDeclaration {
-            name: "usage_poller".to_string(),
-            kind: SelfSignalKind::Poller,
-            effect: SelfSignalEffect::Observe,
-            anchored_to: SignalAnchor::FixedInterval,
-            cadence: Some(SignalCadence::Literal {
-                interval_ms: 60_000,
-            }),
-            domain: Some("provider-usage".to_string()),
-            note: None,
-        }]))
-        .provenance(Some(ManifestProvenance {
-            build_git_sha: Some("0123456789abcdef0123456789abcdef01234567".to_string()),
-            build_lock_digest: Some(
-                "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789".to_string(),
-            ),
-            wire_crate_version: Some("0.16.0".to_string()),
-            store_schema_version: Some("42".to_string()),
-        }))
-        .build();
+            }))
+            .provides(vec![ProviderRole::ToolProvider {
+                tools: vec![Tool {
+                    name: "read".to_string(),
+                    description: None,
+                    execution_mode: ExecutionMode::Pure,
+                    schema: json!({"type": "object"}),
+                }],
+                identity_scope: vec![IdentityScope::Project],
+                concurrency: Concurrency::Serial,
+                emits_push: false,
+                sub_supervises: false,
+            }])
+            .consumes(vec![ConsumerRole::ServiceClient {
+                of: vec!["embedding.v2".to_string()],
+            }])
+            .capabilities(Some(CapabilityDeclarations {
+                provides: vec!["embedding/v2".to_string()],
+                requires: Vec::new(),
+                must_never_reach: Vec::new(),
+            }))
+            .self_signals(Some(vec![SelfSignalDeclaration {
+                name: "usage_poller".to_string(),
+                kind: SelfSignalKind::Poller,
+                effect: SelfSignalEffect::Observe,
+                anchored_to: SignalAnchor::FixedInterval,
+                cadence: Some(SignalCadence::Literal {
+                    interval_ms: 60_000,
+                }),
+                domain: Some("provider-usage".to_string()),
+                note: None,
+            }]))
+            .provenance(Some(ManifestProvenance {
+                build_git_sha: Some("0123456789abcdef0123456789abcdef01234567".to_string()),
+                build_lock_digest: Some(
+                    "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789".to_string(),
+                ),
+                wire_crate_version: Some("0.16.0".to_string()),
+                store_schema_version: Some("42".to_string()),
+            }))
+            .build();
 
         assert_eq!(
             serde_json::to_vec(&manifest).expect("builder manifest serializes"),
             include_bytes!("../tests/golden/module_manifest_builder_full.json"),
             "the builder must preserve the prior fully populated literal wire bytes"
+        );
+    }
+
+    #[test]
+    fn old_manifest_with_unread_fields_decodes_and_round_trips_verbatim() {
+        let raw = include_bytes!("../tests/golden/module_manifest_builder_full.json");
+        let decoded: ModuleManifest =
+            serde_json::from_slice(raw).expect("old manifest with all unread fields decodes");
+
+        assert_eq!(decoded.trust_tier, Some(TrustTier::Reviewed));
+        assert!(!decoded.consumes.is_empty());
+        assert!(decoded.bindings.is_some());
+
+        let reencoded = serde_json::to_vec(&decoded).expect("re-encode succeeds");
+        assert_eq!(
+            reencoded, raw,
+            "old manifest relay stays byte-for-byte verbatim"
+        );
+    }
+
+    #[test]
+    fn new_manifest_omits_unread_fields_on_wire_and_decodes_cleanly() {
+        let raw = include_bytes!("../tests/golden/module_manifest_diet.json");
+        let decoded: ModuleManifest =
+            serde_json::from_slice(raw).expect("new manifest omitting unread fields decodes");
+
+        assert_eq!(decoded.trust_tier, None);
+        assert!(decoded.consumes.is_empty());
+        assert_eq!(decoded.bindings, None);
+
+        let pretty = format!("{}\n", serde_json::to_string_pretty(&decoded).unwrap());
+        assert_eq!(
+            pretty.as_bytes(),
+            raw,
+            "new manifest matches golden byte-for-byte without unread keys"
+        );
+
+        let as_val: serde_json::Value = serde_json::to_value(&decoded).unwrap();
+        assert!(
+            as_val.get("trust_tier").is_none(),
+            "no trust_tier on wire for new manifest"
+        );
+        assert!(
+            as_val.get("consumes").is_none(),
+            "no consumes on wire for empty consumes"
+        );
+        assert!(
+            as_val.get("bindings").is_none(),
+            "no bindings on wire for new manifest"
         );
     }
 

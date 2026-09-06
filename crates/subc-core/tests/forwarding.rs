@@ -18,10 +18,7 @@ use subc_core::{
     SupervisedModule, Supervisor, SupervisorHandle, SupervisorProcessLiveness,
 };
 use subc_protocol::{
-    manifest::{
-        Bindings, Concurrency, ExecutionMode, IdentityBinding, IdentityScope, ModuleManifest,
-        ProviderRole, StorageBinding, StorageKind, StorageScope, Tool, TrustTier,
-    },
+    manifest::{Concurrency, ExecutionMode, IdentityScope, ModuleManifest, ProviderRole, Tool},
     session::HealthStatus,
     BindIdentity, ErrorBody, Flags, FrameType, ModuleHelloAckBody, ModuleHelloBody, Priority,
     RouteTarget, PROTOCOL_VERSION,
@@ -5362,24 +5359,7 @@ fn active_tool_provider_module_id(registry: &Registry) -> String {
 }
 
 fn consumer_manifest(module_id: &str) -> ModuleManifest {
-    ModuleManifest::builder(
-        module_id,
-        "0.0.0-consumer",
-        TrustTier::FirstParty,
-        Bindings {
-            storage: StorageBinding {
-                kind: StorageKind::Sqlite,
-                scope: StorageScope::Project,
-                owns_schema: false,
-            },
-            vault_grants: Vec::new(),
-            identity: IdentityBinding {
-                requires: Vec::new(),
-                optional: vec![IdentityScope::Project],
-            },
-        },
-    )
-    .build()
+    ModuleManifest::builder(module_id, "0.0.0-consumer").build()
 }
 
 fn tool_provider_manifest(module_id: &str) -> ModuleManifest {

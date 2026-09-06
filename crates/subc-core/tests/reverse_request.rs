@@ -5,10 +5,7 @@ use subc_core::{
     read_frame, test_support::TestTempDir, write_frame, ForwardingTable, Frame, Registry,
 };
 use subc_protocol::{
-    manifest::{
-        Bindings, Concurrency, ExecutionMode, IdentityBinding, IdentityScope, ModuleManifest,
-        ProviderRole, StorageBinding, StorageKind, StorageScope, Tool, TrustTier,
-    },
+    manifest::{Concurrency, ExecutionMode, IdentityScope, ModuleManifest, ProviderRole, Tool},
     session::{ModuleControlRequest, ModuleControlResponse},
     BindIdentity, Flags, FrameType, ModuleHelloAckBody, ModuleHelloBody, Priority, RouteTarget,
     PROTOCOL_VERSION,
@@ -1003,36 +1000,20 @@ fn control_flags() -> Flags {
 }
 
 fn tool_provider_manifest(module_id: &str, concurrency: Concurrency) -> ModuleManifest {
-    ModuleManifest::builder(
-        module_id,
-        "0.0.0-reverse-test",
-        TrustTier::FirstParty,
-        Bindings {
-            storage: StorageBinding {
-                kind: StorageKind::Sqlite,
-                scope: StorageScope::Project,
-                owns_schema: false,
-            },
-            vault_grants: Vec::new(),
-            identity: IdentityBinding {
-                requires: vec![IdentityScope::Project],
-                optional: vec![IdentityScope::Session],
-            },
-        },
-    )
-    .provides(vec![ProviderRole::ToolProvider {
-        tools: vec![Tool {
-            name: "read".to_string(),
-            description: None,
-            execution_mode: ExecutionMode::Pure,
-            schema: serde_json::json!({"type": "object"}),
-        }],
-        identity_scope: vec![IdentityScope::Project, IdentityScope::Session],
-        concurrency,
-        emits_push: true,
-        sub_supervises: true,
-    }])
-    .build()
+    ModuleManifest::builder(module_id, "0.0.0-reverse-test")
+        .provides(vec![ProviderRole::ToolProvider {
+            tools: vec![Tool {
+                name: "read".to_string(),
+                description: None,
+                execution_mode: ExecutionMode::Pure,
+                schema: serde_json::json!({"type": "object"}),
+            }],
+            identity_scope: vec![IdentityScope::Project, IdentityScope::Session],
+            concurrency,
+            emits_push: true,
+            sub_supervises: true,
+        }])
+        .build()
 }
 
 async fn wait_for_registration(registry: &Registry, module_id: &str, wait: Duration) {

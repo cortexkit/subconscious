@@ -19,11 +19,9 @@ use serde_json::{json, Value};
 use subc_core::{read_frame, write_frame, Frame};
 use subc_protocol::{
     manifest::{
-        Bindings, CapabilityDeclarations, Concurrency, ExecutionMode, IdentityBinding,
-        IdentityScope, InternalTransport, ManagementOperation, ManagementOperationKind,
-        ManifestProvenance, ObservabilityKind, ObservabilitySurface, PipelineAppliesTo,
-        PipelineStageKind, ProviderRole, StorageBinding, StorageKind, StorageScope, Tool,
-        TrustTier,
+        CapabilityDeclarations, Concurrency, ExecutionMode, IdentityScope, InternalTransport,
+        ManagementOperation, ManagementOperationKind, ManifestProvenance, ObservabilityKind,
+        ObservabilitySurface, PipelineAppliesTo, PipelineStageKind, ProviderRole, Tool,
     },
     session::{
         HealthStatus, ModuleControlPush, ModuleControlRequest, ModuleControlResponse,
@@ -1285,27 +1283,11 @@ fn manifest(
     tools: &[String],
     capabilities: Option<CapabilityDeclarations>,
 ) -> subc_protocol::manifest::ModuleManifest {
-    subc_protocol::manifest::ModuleManifest::builder(
-        module_id,
-        "0.0.0-fake",
-        TrustTier::FirstParty,
-        Bindings {
-            storage: StorageBinding {
-                kind: StorageKind::Sqlite,
-                scope: StorageScope::Project,
-                owns_schema: true,
-            },
-            vault_grants: Vec::new(),
-            identity: IdentityBinding {
-                requires: vec![IdentityScope::Project],
-                optional: vec![IdentityScope::Session],
-            },
-        },
-    )
-    .provides(vec![provider_role(role, concurrency, tools)])
-    .capabilities(capabilities)
-    .provenance(manifest_provenance())
-    .build()
+    subc_protocol::manifest::ModuleManifest::builder(module_id, "0.0.0-fake")
+        .provides(vec![provider_role(role, concurrency, tools)])
+        .capabilities(capabilities)
+        .provenance(manifest_provenance())
+        .build()
 }
 
 fn manifest_provenance() -> Option<ManifestProvenance> {

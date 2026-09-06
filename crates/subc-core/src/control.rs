@@ -4000,9 +4000,8 @@ mod tests {
     use serde_json::{json, Value};
     use subc_protocol::{
         manifest::{
-            Bindings, Concurrency, ExecutionMode, IdentityBinding, IdentityScope,
-            ManagementOperation, ManagementOperationKind, ObservabilityKind, ObservabilitySurface,
-            ProviderRole, StorageBinding, StorageKind, StorageScope, Tool,
+            Concurrency, ExecutionMode, IdentityScope, ManagementOperation,
+            ManagementOperationKind, ObservabilityKind, ObservabilitySurface, ProviderRole, Tool,
         },
         session::HealthStatus,
         FrameType,
@@ -4231,37 +4230,21 @@ mod tests {
     }
 
     fn manifest(module_id: &str, protocol_ver: u8) -> ModuleManifest {
-        ModuleManifest::builder(
-            module_id,
-            "0.1.0",
-            subc_protocol::manifest::TrustTier::FirstParty,
-            Bindings {
-                storage: StorageBinding {
-                    kind: StorageKind::Sqlite,
-                    scope: StorageScope::Project,
-                    owns_schema: true,
-                },
-                vault_grants: Vec::new(),
-                identity: IdentityBinding {
-                    requires: vec![IdentityScope::Project],
-                    optional: vec![IdentityScope::Session],
-                },
-            },
-        )
-        .protocol_ver(protocol_ver)
-        .provides(vec![ProviderRole::ToolProvider {
-            tools: vec![Tool {
-                name: "read".to_string(),
-                description: None,
-                execution_mode: ExecutionMode::Pure,
-                schema: json!({"type": "object"}),
-            }],
-            identity_scope: vec![IdentityScope::Project, IdentityScope::Session],
-            concurrency: Concurrency::ModuleManaged,
-            emits_push: true,
-            sub_supervises: true,
-        }])
-        .build()
+        ModuleManifest::builder(module_id, "0.1.0")
+            .protocol_ver(protocol_ver)
+            .provides(vec![ProviderRole::ToolProvider {
+                tools: vec![Tool {
+                    name: "read".to_string(),
+                    description: None,
+                    execution_mode: ExecutionMode::Pure,
+                    schema: json!({"type": "object"}),
+                }],
+                identity_scope: vec![IdentityScope::Project, IdentityScope::Session],
+                concurrency: Concurrency::ModuleManaged,
+                emits_push: true,
+                sub_supervises: true,
+            }])
+            .build()
     }
 
     fn hello_frame(module_id: &str, protocol_ver: u8, corr: u64) -> Frame {

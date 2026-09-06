@@ -11,7 +11,6 @@
     },
     "vault_grants": []
   },
-  "consumes": [],
   "module_id": "future-signal-tools",
   "module_version": "0.14.0",
   "protocol_ver": 2,

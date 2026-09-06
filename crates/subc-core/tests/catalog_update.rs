@@ -4,9 +4,9 @@ use subc_control::{CatalogEntry, ClientControlRequest, ClientControlResponse};
 use subc_core::{read_frame, test_support::TestTempDir, write_frame, Frame};
 use subc_protocol::{
     manifest::{
-        Bindings, Concurrency, ExecutionMode, IdentityBinding, IdentityScope, ManifestProvenance,
-        ModuleManifest, ProviderRole, SelfSignalDeclaration, SelfSignalEffect, SelfSignalKind,
-        SignalAnchor, SignalCadence, StorageBinding, StorageKind, StorageScope, Tool, TrustTier,
+        Concurrency, ExecutionMode, IdentityScope, ManifestProvenance, ModuleManifest,
+        ProviderRole, SelfSignalDeclaration, SelfSignalEffect, SelfSignalKind, SignalAnchor,
+        SignalCadence, Tool,
     },
     session::{
         ModuleControlRequest, ModuleControlRequestFromModule, ModuleControlResponse,
@@ -292,6 +292,43 @@ async fn hello_self_signals_are_mirrored_and_missing_axes_are_refused() {
     assert!(error.message.contains("effect"));
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hello_with_fields_absent_manifest_registers_and_serves_catalog_list() {
+    let server = TestServer::start().await;
+    let module_id = "fields-absent-provider";
+    let mut module = connect_endpoint(&server, "module").await;
+
+    let manifest = ModuleManifest::builder(module_id, "1.0.0")
+        .provides(vec![tool_provider_role(
+            &["test_tool"],
+            Concurrency::ModuleManaged,
+        )])
+        .build();
+    assert!(manifest.trust_tier.is_none());
+    assert!(manifest.consumes.is_empty());
+    assert!(manifest.bindings.is_none());
+
+    let hello_body = serde_json::to_value(&ModuleHelloBody {
+        manifest: manifest.clone(),
+        protocol_ver: PROTOCOL_VERSION,
+        control_ops: None,
+        launch_nonce: None,
+    })
+    .unwrap();
+    let manifest_obj = hello_body.get("manifest").unwrap();
+    assert!(manifest_obj.get("trust_tier").is_none());
+    assert!(manifest_obj.get("consumes").is_none());
+    assert!(manifest_obj.get("bindings").is_none());
+
+    let hello_ack = register_module(&server, &mut module, manifest, 101).await;
+    assert_eq!(hello_ack.negotiated_ver, PROTOCOL_VERSION);
+
+    let (_generation, modules) = catalog_list(&server, Some(module_id), 201).await;
+    assert_eq!(modules.len(), 1);
+    assert_eq!(modules[0].module_id, module_id);
+    assert_tool_names(&modules[0], &["test_tool"]);
+}
+
 async fn register_module(
     server: &TestServer,
     module: &mut Endpoint,
@@ -500,24 +537,7 @@ fn tool_provider_manifest(
 }
 
 fn supervision_only_manifest(module_id: &str) -> ModuleManifest {
-    ModuleManifest::builder(
-        module_id,
-        "0.0.0-catalog-update-test",
-        TrustTier::FirstParty,
-        Bindings {
-            storage: StorageBinding {
-                kind: StorageKind::Sqlite,
-                scope: StorageScope::Project,
-                owns_schema: false,
-            },
-            vault_grants: Vec::new(),
-            identity: IdentityBinding {
-                requires: vec![IdentityScope::Project],
-                optional: vec![IdentityScope::Session],
-            },
-        },
-    )
-    .build()
+    ModuleManifest::builder(module_id, "0.0.0-catalog-update-test").build()
 }
 
 fn tool_provider_role(tools: &[&str], concurrency: Concurrency) -> ProviderRole {

@@ -273,31 +273,12 @@ pub fn module_id_path_hazard(module_id: &str) -> Result<(), String> {
 mod path_hazard_tests {
     use super::*;
     use crate::ConnectionId;
-    use subc_protocol::manifest::{
-        Bindings, IdentityBinding, IdentityScope, ModuleManifest, StorageBinding, StorageKind,
-        StorageScope, TrustTier,
-    };
+    use subc_protocol::manifest::ModuleManifest;
 
     fn manifest(module_id: &str) -> ModuleManifest {
-        ModuleManifest::builder(
-            module_id,
-            "0.1.0",
-            TrustTier::FirstParty,
-            Bindings {
-                storage: StorageBinding {
-                    kind: StorageKind::Sqlite,
-                    scope: StorageScope::Project,
-                    owns_schema: true,
-                },
-                vault_grants: Vec::new(),
-                identity: IdentityBinding {
-                    requires: vec![IdentityScope::Project],
-                    optional: Vec::new(),
-                },
-            },
-        )
-        .protocol_ver(1)
-        .build()
+        ModuleManifest::builder(module_id, "0.1.0")
+            .protocol_ver(1)
+            .build()
     }
 
     #[test]

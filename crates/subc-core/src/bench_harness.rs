@@ -3,10 +3,7 @@
 use std::sync::Arc;
 
 use subc_protocol::{
-    manifest::{
-        Bindings, Concurrency, ExecutionMode, IdentityBinding, IdentityScope, ModuleManifest,
-        ProviderRole, StorageBinding, StorageKind, StorageScope, Tool, TrustTier,
-    },
+    manifest::{Concurrency, ExecutionMode, IdentityScope, ModuleManifest, ProviderRole, Tool},
     Flags, FrameType, Principal, Priority, PROTOCOL_VERSION,
 };
 use tokio::sync::mpsc;
@@ -39,36 +36,20 @@ pub struct BenchForwardingSetup {
 }
 
 pub fn bench_tool_provider_manifest(module_id: &str) -> ModuleManifest {
-    ModuleManifest::builder(
-        module_id,
-        "0.0.0-bench",
-        TrustTier::FirstParty,
-        Bindings {
-            storage: StorageBinding {
-                kind: StorageKind::Sqlite,
-                scope: StorageScope::Project,
-                owns_schema: false,
-            },
-            vault_grants: Vec::new(),
-            identity: IdentityBinding {
-                requires: vec![IdentityScope::Project],
-                optional: vec![IdentityScope::Session],
-            },
-        },
-    )
-    .provides(vec![ProviderRole::ToolProvider {
-        tools: vec![Tool {
-            name: "read".to_string(),
-            description: None,
-            execution_mode: ExecutionMode::Pure,
-            schema: serde_json::json!({"type": "object"}),
-        }],
-        identity_scope: vec![IdentityScope::Project, IdentityScope::Session],
-        concurrency: Concurrency::StatelessParallel,
-        emits_push: false,
-        sub_supervises: false,
-    }])
-    .build()
+    ModuleManifest::builder(module_id, "0.0.0-bench")
+        .provides(vec![ProviderRole::ToolProvider {
+            tools: vec![Tool {
+                name: "read".to_string(),
+                description: None,
+                execution_mode: ExecutionMode::Pure,
+                schema: serde_json::json!({"type": "object"}),
+            }],
+            identity_scope: vec![IdentityScope::Project, IdentityScope::Session],
+            concurrency: Concurrency::StatelessParallel,
+            emits_push: false,
+            sub_supervises: false,
+        }])
+        .build()
 }
 
 fn manifest_concurrency(manifest: &ModuleManifest) -> Concurrency {

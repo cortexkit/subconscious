@@ -10,9 +10,8 @@ use mcp_stdio_adapter::{
 use serde_json::json;
 use subc_client_rs::{serve_with_handle, ConsumerIdentity};
 use subc_protocol::manifest::{
-    Bindings, Concurrency, IdentityBinding, IdentityScope, ManagementOperation,
-    ManagementOperationKind, ModuleManifest, ObservabilityKind, ObservabilitySurface, ProviderRole,
-    StorageBinding, StorageKind, StorageScope, TrustTier,
+    Concurrency, IdentityScope, ManagementOperation, ManagementOperationKind, ModuleManifest,
+    ObservabilityKind, ObservabilitySurface, ProviderRole,
 };
 
 const MODULE_ID: &str = "mcp-stdio-adapter";
@@ -96,24 +95,8 @@ fn print_manifest(manifest: ModuleManifest) -> Result<()> {
 }
 
 fn manifest() -> ModuleManifest {
-    ModuleManifest::builder(
-        MODULE_ID,
-        env!("CARGO_PKG_VERSION"),
-        TrustTier::FirstParty,
-        Bindings {
-            storage: StorageBinding {
-                kind: StorageKind::Sqlite,
-                scope: StorageScope::Project,
-                owns_schema: false,
-            },
-            vault_grants: Vec::new(),
-            identity: IdentityBinding {
-                requires: vec![IdentityScope::Project],
-                optional: vec![IdentityScope::Session],
-            },
-        },
-    )
-    .provides(vec![ProviderRole::ManagementSurface {
+    ModuleManifest::builder(MODULE_ID, env!("CARGO_PKG_VERSION"))
+        .provides(vec![ProviderRole::ManagementSurface {
         operations: vec![
             ManagementOperation {
                 name: "tools/list".to_string(),

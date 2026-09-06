@@ -13,7 +13,6 @@
     },
     "vault_grants": []
   },
-  "consumes": [],
   "module_id": "legacy-signal-tools",
   "module_version": "0.13.0",
   "protocol_ver": 2,

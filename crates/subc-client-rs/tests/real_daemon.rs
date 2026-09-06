@@ -21,9 +21,8 @@ use subc_client_rs::{
 use subc_control::{ClientControlRequest, ClientControlResponse};
 use subc_protocol::{
     manifest::{
-        Bindings, CapabilityDeclarations, Concurrency, ExecutionMode, IdentityBinding,
-        IdentityScope, ManagementOperation, ManagementOperationKind, ModuleManifest, ProviderRole,
-        StorageBinding, StorageKind, StorageScope, Tool, TrustTier,
+        CapabilityDeclarations, Concurrency, ExecutionMode, IdentityScope, ManagementOperation,
+        ManagementOperationKind, ModuleManifest, ProviderRole, Tool,
     },
     session::HealthStatus,
     BindIdentity, ErrorBody, Flags, Frame, FrameType, Priority, RouteTarget,
@@ -1586,25 +1585,9 @@ where
 }
 
 fn inline_module_manifest(module_id: &str, tool_names: &[&str]) -> ModuleManifest {
-    ModuleManifest::builder(
-        module_id,
-        env!("CARGO_PKG_VERSION"),
-        TrustTier::FirstParty,
-        Bindings {
-            storage: StorageBinding {
-                kind: StorageKind::Sqlite,
-                scope: StorageScope::Project,
-                owns_schema: false,
-            },
-            vault_grants: Vec::new(),
-            identity: IdentityBinding {
-                requires: vec![IdentityScope::Project],
-                optional: vec![IdentityScope::Session],
-            },
-        },
-    )
-    .provides(vec![tool_provider_role(tool_names)])
-    .build()
+    ModuleManifest::builder(module_id, env!("CARGO_PKG_VERSION"))
+        .provides(vec![tool_provider_role(tool_names)])
+        .build()
 }
 
 fn inline_capability_module_manifest(module_id: &str, capability: Option<&str>) -> ModuleManifest {

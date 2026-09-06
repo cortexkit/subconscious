@@ -44,10 +44,7 @@ use serde::{
 use subc_control::{CatalogEntry, ClientControlRequest, ClientControlResponse, ConsumerIdentity};
 use subc_jsonc::jsonc_to_json;
 use subc_protocol::{
-    manifest::{
-        Bindings, ConsumerRole, ExecutionMode, IdentityBinding, ModuleManifest, ProviderRole,
-        StorageBinding, StorageKind, StorageScope, Tool as ManifestTool, TrustTier,
-    },
+    manifest::{ConsumerRole, ExecutionMode, ModuleManifest, ProviderRole, Tool as ManifestTool},
     session::{
         HealthReport, HealthStatus, ModuleControlRequest, ModuleControlResponse,
         MODULE_CONTROL_OP_HEALTH_CHECK,
@@ -1971,34 +1968,9 @@ fn manifest_output_keeps_provenance_in_the_static_manifest_object() {
 }
 
 fn supervision_manifest(module_id: String) -> ModuleManifest {
-    ModuleManifest::builder(
-        module_id,
-        env!("CARGO_PKG_VERSION"),
-        TrustTier::FirstParty,
-        supervision_bindings(),
-    )
-    .consumes(vec![ConsumerRole::ToolClient { of: Vec::new() }])
-    .build()
-}
-
-fn supervision_bindings() -> Bindings {
-    // Manifest v1 requires concrete binding records. subc-mcp is only a
-    // gateway/consumer here: it owns no subc-managed storage schema, secrets,
-    // or identity grant for the supervision registration itself. Per-call
-    // identity is supplied later when the route is opened. Keep every grant
-    // empty and explicitly decline storage schema ownership.
-    Bindings {
-        storage: StorageBinding {
-            kind: StorageKind::Sqlite,
-            scope: StorageScope::Project,
-            owns_schema: false,
-        },
-        vault_grants: Vec::new(),
-        identity: IdentityBinding {
-            requires: Vec::new(),
-            optional: Vec::new(),
-        },
-    }
+    ModuleManifest::builder(module_id, env!("CARGO_PKG_VERSION"))
+        .consumes(vec![ConsumerRole::ToolClient { of: Vec::new() }])
+        .build()
 }
 
 fn publish_module_connection_file(

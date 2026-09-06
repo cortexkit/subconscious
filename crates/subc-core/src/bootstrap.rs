@@ -549,6 +549,7 @@ async fn serve_bound_daemon(
             enabled,
             health,
             configured.drain_timeout_ms,
+            configured.restart,
         ) {
             Ok(_) => {
                 // A raised failure threshold is normally a temporary allowance for a

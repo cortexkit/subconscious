@@ -1320,6 +1320,14 @@ pub struct TerminalEntry {
     /// enclosing terminal record.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit_kind: Option<TerminalExitKind>,
+    /// Why the supervisor chose this disposition, when the disposition alone
+    /// does not say. A `failed` record carries the exhausted crash budget here
+    /// (`crash budget exhausted: max_restarts=3 within window_secs=600`), which
+    /// is the difference between an operator seeing "it failed" and seeing which
+    /// limit stopped it. Prose for humans: render it, never parse it. Absent for
+    /// ordinary dispositions and on daemons predating the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disposition_detail: Option<String>,
 }
 
 /// Exit classification carried by supervisor history and census records.
@@ -1551,6 +1559,17 @@ pub struct SupervisorEntry {
     /// Unlike `restart_count`, this value is never reset by an operator action.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lifetime_restarts: Option<u32>,
+    /// The span `restart_count` is counted over, in seconds. The crash budget is
+    /// a RATE, not a lifetime total: `restart_count` counts only the restarts
+    /// inside the last `restart_window_secs`, and older ones no longer hold a
+    /// slot. Without this field a reader cannot tell "2 of 3 crashes, ever" from
+    /// "2 of 3 crashes in the last ten minutes", and those two call for opposite
+    /// reactions.
+    ///
+    /// Absent on daemons predating the windowed budget, where the count really
+    /// was a lifetime total.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restart_window_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -1627,6 +1646,7 @@ mod tests {
             at_ms: 1_700_000_000_123,
             disposition: TerminalDisposition::Restarting,
             exit_kind: Some(TerminalExitKind::DeliberateSeverance),
+            disposition_detail: None,
         };
         let wire = serde_json::to_string(&entry).expect("terminal entry serializes");
         assert_eq!(

@@ -61,6 +61,10 @@ fn control_wire_shapes_match_golden_json_and_round_trip() {
         },
     );
     assert_golden("supervisor_entry", &supervisor_entry());
+    assert_golden(
+        "supervisor_entry_with_restart_window",
+        &supervisor_entry_with_restart_window(),
+    );
     assert_golden("poll_kind_status", &PollKind::Status);
     assert_golden("poll_kind_liveness", &PollKind::Liveness);
 }
@@ -800,6 +804,21 @@ fn supervisor_entry() -> SupervisorEntry {
         restart_count: Some(2),
         max_restarts: Some(3),
         lifetime_restarts: None,
+        // The pre-window shape: a daemon that never had a window omits the key,
+        // and this golden is what pins that omission.
+        restart_window_secs: None,
+    }
+}
+
+/// The windowed budget on the wire: the same count and cap, plus the span they
+/// are counted over. Pinned as its own case because the two shapes mean
+/// different things -- "2 of 3 crashes ever" vs "2 of 3 in the last ten
+/// minutes" -- and a reader that cannot see which one it has will read a
+/// recovered module as a nearly-dead one.
+fn supervisor_entry_with_restart_window() -> SupervisorEntry {
+    SupervisorEntry {
+        restart_window_secs: Some(600),
+        ..supervisor_entry()
     }
 }
 
@@ -824,6 +843,28 @@ fn supervisor_entry_lifetime_restarts_round_trips_and_old_wire_stays_unknown() {
     }"#;
     let old_entry: SupervisorEntry = serde_json::from_str(old_wire).expect("old wire decodes");
     assert_eq!(old_entry.lifetime_restarts, None);
+}
+
+/// A daemon that predates the windowed budget must stay decodable, and its
+/// missing window must read as unknown rather than as some invented span. A
+/// defaulted `0` would claim "no window", which is the one value that means an
+/// unlimited budget -- the opposite of what an old daemon actually did.
+#[test]
+fn supervisor_entry_restart_window_round_trips_and_old_wire_stays_unknown() {
+    let entry = supervisor_entry_with_restart_window();
+
+    let encoded = serde_json::to_value(&entry).expect("supervisor entry serializes");
+    assert_eq!(encoded["restart_window_secs"], 600);
+    let decoded: SupervisorEntry = serde_json::from_value(encoded).expect("new wire decodes");
+    assert_eq!(decoded.restart_window_secs, Some(600));
+
+    let windowless = serde_json::to_value(supervisor_entry()).expect("supervisor entry serializes");
+    assert!(
+        windowless.get("restart_window_secs").is_none(),
+        "an absent window must not be serialized: {windowless}"
+    );
+    let decoded: SupervisorEntry = serde_json::from_value(windowless).expect("old shape decodes");
+    assert_eq!(decoded.restart_window_secs, None);
 }
 
 fn supervisor_health_entry() -> SupervisorHealthEntry {

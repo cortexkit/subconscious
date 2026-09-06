@@ -5,13 +5,14 @@ use std::{
     ffi::OsString,
     fmt, fs, io,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use serde::Deserialize;
 use subc_jsonc::jsonc_to_json;
 use subc_protocol::manifest::is_valid_capability_identifier;
 
-use crate::{HealthAction, HealthConfig, ModuleSpec};
+use crate::{HealthAction, HealthConfig, ModuleSpec, RestartPolicy};
 
 const DAEMON_CONFIG_RELATIVE_PATH: &str = "cortexkit/subc.jsonc";
 const SUPPORTED_CONFIG_VERSION: u32 = 1;
@@ -59,6 +60,14 @@ impl RestartRequiredSection {
 /// The per-module variant prefixes the offending module id before this
 /// message — see `parse_doc`.
 const ROUTE_BIND_RELAY_ZERO_MESSAGE: &str = "route_bind_relay_timeout_ms must be greater than 0 (a zero budget fails every bind to the module; to make a module unreachable use enabled: false)";
+
+/// Refused at parse time because a zero window and a large one are different
+/// settings that look alike in a diff. The crash budget counts restarts inside
+/// `window_secs`; with `0`, no restart is ever inside it, so the cap can never
+/// be reached and the module restarts forever. That is a real posture, but it
+/// is "unlimited restarts", and anyone choosing it must say so by name rather
+/// than by writing a zero that reads like "no delay".
+const RESTART_WINDOW_ZERO_MESSAGE: &str = "restart.window_secs must be greater than 0 (a zero window holds no crash, so the budget can never be spent; for effectively unlimited restarts set a deliberately large window_secs, and to stop restarting entirely set restart.max_restarts: 0)";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DaemonConfig {
@@ -179,6 +188,17 @@ pub struct ConfiguredModule {
     /// (12s). A `0` is refused at parse time at both layers — see
     /// `DaemonConfig::route_bind_relay_timeout_ms` and `ROUTE_BIND_RELAY_ZERO_MESSAGE`.
     pub route_bind_relay_timeout_ms: Option<u64>,
+    /// This module's crash-restart budget, fully resolved at parse time: every
+    /// absent key of the optional `restart` block falls back to the supervisor
+    /// default (3 restarts per 600s, 100ms backoff). Stored resolved rather than
+    /// as an `Option` so no later layer has to re-derive the defaults and get
+    /// them subtly different.
+    ///
+    /// Read when a module STARTS being supervised (daemon start, or a rescan
+    /// that adds the module). Like `drain_timeout_ms`, an edit to this block for
+    /// an already-running module is not part of the rescan diff, so it takes
+    /// effect on the next daemon start rather than immediately.
+    pub restart: RestartPolicy,
 }
 
 impl ConfiguredModule {
@@ -269,6 +289,18 @@ struct RawModuleConfig {
     drain_timeout_ms: Option<u64>,
     #[serde(default)]
     route_bind_relay_timeout_ms: Option<u64>,
+    #[serde(default)]
+    restart: Option<RawRestartConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawRestartConfig {
+    #[serde(default)]
+    max_restarts: Option<u32>,
+    #[serde(default)]
+    window_secs: Option<u64>,
+    #[serde(default)]
+    backoff_ms: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -409,6 +441,7 @@ fn parse_doc(doc: &str, path: &Path) -> Result<DaemonConfig, DaemonConfigError> 
                 Some(value) => Some(value),
                 None => default_route_bind_relay_timeout_ms,
             };
+            let restart = parse_restart_config(module.restart, path, &module_id)?;
             Ok(ConfiguredModule {
                 module_id,
                 program: module.program,
@@ -426,6 +459,7 @@ fn parse_doc(doc: &str, path: &Path) -> Result<DaemonConfig, DaemonConfigError> 
                 // (see "off is not a budget"), so `None` means "use the
                 // daemon-wide value" and `Some(value > 0)` means "use this".
                 route_bind_relay_timeout_ms: per_module_route_bind_relay_timeout_ms,
+                restart,
             })
         })
         .collect::<Result<Vec<_>, DaemonConfigError>>()?;
@@ -671,6 +705,48 @@ fn parse_health_config(
             .map(health_action)
             .unwrap_or(defaults.on_failing),
         critical: raw.critical,
+    })
+}
+
+/// Resolve one module's `restart` block against the supervisor defaults.
+///
+/// Every key is optional and independent: a config that sets only
+/// `window_secs` keeps the default cap and backoff, and a config with no
+/// `restart` block at all gets exactly the policy the daemon used before the
+/// block existed.
+fn parse_restart_config(
+    raw: Option<RawRestartConfig>,
+    path: &Path,
+    module_id: &str,
+) -> Result<RestartPolicy, DaemonConfigError> {
+    let defaults = RestartPolicy::default();
+    let Some(raw) = raw else {
+        return Ok(defaults);
+    };
+
+    let window = match raw.window_secs {
+        Some(0) => {
+            return Err(DaemonConfigError::InvalidValue {
+                path: path.to_path_buf(),
+                message: format!(
+                    "module '{module_id}' {RESTART_WINDOW_ZERO_MESSAGE}",
+                    module_id = module_id.escape_debug()
+                ),
+            });
+        }
+        Some(secs) => Duration::from_secs(secs),
+        None => defaults.window,
+    };
+
+    Ok(RestartPolicy {
+        // `0` is a deliberate posture here ("never replace this module"), unlike
+        // the window, so it is accepted as written.
+        max_restarts: raw.max_restarts.unwrap_or(defaults.max_restarts),
+        backoff: raw
+            .backoff_ms
+            .map(Duration::from_millis)
+            .unwrap_or(defaults.backoff),
+        window,
     })
 }
 
@@ -1116,6 +1192,117 @@ mod tests {
         .unwrap();
         assert_eq!(config.modules[0].route_bind_relay_timeout_ms, None);
         assert_eq!(config.route_bind_relay_timeout_ms, None);
+    }
+
+    /// The shape every config in the field has today: no `restart` block at
+    /// all. It must keep parsing, and it must land on the exact policy the
+    /// daemon used before the block existed -- all three numbers asserted, so
+    /// that quietly changing one is a failing test rather than a fleet-wide
+    /// behaviour change nobody configured.
+    #[test]
+    fn a_config_without_a_restart_block_keeps_the_supervisor_defaults() {
+        let path = Path::new("/tmp/subc.jsonc");
+        let config = parse_doc(
+            r#"{ "version": 1, "modules": { "m": { "program": "m" } } }"#,
+            path,
+        )
+        .unwrap();
+        assert_eq!(config.modules[0].restart.max_restarts, 3);
+        assert_eq!(config.modules[0].restart.window, Duration::from_secs(600));
+        assert_eq!(
+            config.modules[0].restart.backoff,
+            Duration::from_millis(100)
+        );
+    }
+
+    #[test]
+    fn a_restart_block_resolves_each_key_independently() {
+        let path = Path::new("/tmp/subc.jsonc");
+        let config = parse_doc(
+            r#"
+            {
+              "version": 1,
+              "modules": {
+                "all": {
+                  "program": "all",
+                  "restart": { "max_restarts": 5, "window_secs": 60, "backoff_ms": 250 }
+                },
+                "window-only": {
+                  "program": "window-only",
+                  "restart": { "window_secs": 7200 }
+                },
+                "never": {
+                  "program": "never",
+                  "restart": { "max_restarts": 0 }
+                }
+              }
+            }
+            "#,
+            path,
+        )
+        .unwrap();
+        let by_id = |id: &str| {
+            config
+                .modules
+                .iter()
+                .find(|m| m.module_id == id)
+                .unwrap()
+                .restart
+        };
+
+        let all = by_id("all");
+        assert_eq!(all.max_restarts, 5);
+        assert_eq!(all.window, Duration::from_secs(60));
+        assert_eq!(all.backoff, Duration::from_millis(250));
+
+        // A module that only widens its window keeps the default cap and
+        // backoff: the keys do not travel as a set.
+        let window_only = by_id("window-only");
+        assert_eq!(window_only.max_restarts, 3);
+        assert_eq!(window_only.window, Duration::from_secs(7_200));
+        assert_eq!(window_only.backoff, Duration::from_millis(100));
+
+        // `max_restarts: 0` is a posture, not a mistake: never replace this
+        // module. Unlike a zero window, it is accepted as written.
+        assert_eq!(by_id("never").max_restarts, 0);
+    }
+
+    /// A zero window makes the budget unspendable, which is the opposite of a
+    /// tight limit and looks almost identical in a diff. Refuse it by name so
+    /// the operator writes what they meant.
+    #[test]
+    fn restart_window_zero_is_refused_by_name() {
+        let path = Path::new("/tmp/subc.jsonc");
+        let err = parse_doc(
+            r#"
+            {
+              "version": 1,
+              "modules": {
+                "good": { "program": "good" },
+                "broken": { "program": "broken", "restart": { "window_secs": 0 } }
+              }
+            }
+            "#,
+            path,
+        )
+        .expect_err("a zero crash window must refuse parse");
+        assert!(
+            matches!(err, DaemonConfigError::InvalidValue { .. }),
+            "a zero window is an invalid value, not a parse failure: {err:?}"
+        );
+        let text = format!("{err}");
+        assert!(
+            text.contains("restart.window_secs"),
+            "error must name the offending key: {text}"
+        );
+        assert!(
+            text.contains("broken"),
+            "error must name the offending module id: {text}"
+        );
+        assert!(
+            text.contains("max_restarts: 0"),
+            "error must name the setting that actually stops restarts: {text}"
+        );
     }
 
     #[test]

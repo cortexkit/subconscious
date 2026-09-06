@@ -10,6 +10,7 @@
     {
       "at_ms": 1700000000002,
       "disposition": "failed",
+      "disposition_detail": "crash budget exhausted: max_restarts=1 within window_secs=600",
       "exit_code": 23,
       "exit_kind": "crash"
     }

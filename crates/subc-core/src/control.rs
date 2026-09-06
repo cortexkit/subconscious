@@ -1955,6 +1955,7 @@ impl ControlHandler {
                     restart_count: Some(status.restart_count),
                     max_restarts: Some(status.max_restarts),
                     lifetime_restarts: Some(status.lifetime_restarts),
+                    restart_window_secs: Some(status.restart_window.as_secs()),
                 })
             })
             .collect::<Result<Vec<_>, RouterError>>()?;
@@ -2048,6 +2049,7 @@ impl ControlHandler {
                         at_ms: entry.at_ms,
                         disposition: entry.disposition,
                         exit_kind: Some(entry.exit_kind),
+                        disposition_detail: entry.disposition_detail,
                     })
                     .collect(),
                 dropped: snapshot.dropped,
@@ -2687,6 +2689,7 @@ impl ControlHandler {
                     configured_module.enabled,
                     configured_module.health,
                     configured_module.drain_timeout_ms,
+                    configured_module.restart,
                 )
                 .map_err(|err| {
                     format!("failed to add module_id '{module_id}' during rescan: {err}")

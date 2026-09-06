@@ -4386,16 +4386,28 @@ fn module_frame_drop_count(describe: &Value, module_id: &str) -> Option<u64> {
         .filter(|count| *count > 0)
 }
 
+/// The crash budget as `2 of 3 in 10m (5 lifetime)`.
+///
+/// The window belongs to the budget, so it sits with the pair rather than on a
+/// line of its own: `2 of 3` alone reads as a lifetime total, which is what an
+/// operator will act on if nothing says otherwise. A daemon that predates the
+/// windowed budget sends no window and keeps the old two-number rendering,
+/// because inventing a span for it would be a claim this side cannot make.
 fn format_restart_budget(module: &Value) -> String {
+    let window = module
+        .get("restart_window_secs")
+        .and_then(Value::as_u64)
+        .map(|secs| format!(" in {}", format_duration_two_units(secs)))
+        .unwrap_or_default();
     match (
         module.get("restart_count").and_then(Value::as_u64),
         module.get("max_restarts").and_then(Value::as_u64),
         module.get("lifetime_restarts").and_then(Value::as_u64),
     ) {
         (Some(used), Some(allowed), Some(lifetime)) if lifetime != used => {
-            format!("{used} of {allowed} ({lifetime} lifetime)")
+            format!("{used} of {allowed}{window} ({lifetime} lifetime)")
         }
-        (Some(used), Some(allowed), _) => format!("{used} of {allowed}"),
+        (Some(used), Some(allowed), _) => format!("{used} of {allowed}{window}"),
         _ => "unknown".to_string(),
     }
 }
@@ -5981,6 +5993,47 @@ mod tests {
         });
 
         assert_eq!(format_restart_budget(&module), "0 of 3 (2 lifetime)");
+    }
+
+    /// The window is what makes "2 of 3" actionable: without it an operator
+    /// reads a module that crashed twice this morning and one that crashed
+    /// twice since March as the same module.
+    #[test]
+    fn restart_budget_names_the_window_it_is_counted_over() {
+        let module = serde_json::json!({
+            "restart_count": 2,
+            "max_restarts": 3,
+            "lifetime_restarts": 2,
+            "restart_window_secs": 600,
+        });
+
+        assert_eq!(format_restart_budget(&module), "2 of 3 in 10m");
+    }
+
+    /// The lifetime suffix keeps its place after the window: the window
+    /// qualifies the budget pair, the lifetime count is a separate fact.
+    #[test]
+    fn restart_budget_keeps_the_lifetime_suffix_after_the_window() {
+        let module = serde_json::json!({
+            "restart_count": 0,
+            "max_restarts": 3,
+            "lifetime_restarts": 7,
+            "restart_window_secs": 3_600,
+        });
+
+        assert_eq!(format_restart_budget(&module), "0 of 3 in 1h (7 lifetime)");
+    }
+
+    /// A daemon that predates the windowed budget sends no window, and the CLI
+    /// must not invent one: its count really was a lifetime total.
+    #[test]
+    fn restart_budget_without_a_window_renders_the_old_pair() {
+        let module = serde_json::json!({
+            "restart_count": 2,
+            "max_restarts": 3,
+        });
+
+        assert_eq!(format_restart_budget(&module), "2 of 3");
     }
 
     #[test]

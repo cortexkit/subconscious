@@ -1671,10 +1671,12 @@ async fn module_status_renders_key_value_block_byte_for_byte() {
         "start age renders as an age: {rendered_age:?} vs {started:?}"
     );
     assert_eq!(before, format!("aft — running, degraded\n  pid {pid}"));
+    // The budget renders with the window it is counted over (`in 10m`), because
+    // the count alone reads as a lifetime total and stopped being one.
     assert_eq!(
         rest,
         format!(
-            "0 of 1\n  last exit: none\n  binary: {binary} ({image})\nmetrics: run `ck health aft`\n"
+            "0 of 1 in 10m\n  last exit: none\n  binary: {binary} ({image})\nmetrics: run `ck health aft`\n"
         )
     );
 

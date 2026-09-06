@@ -34,6 +34,12 @@ pub struct TerminalRecord {
     pub at_ms: u64,
     pub disposition: TerminalDisposition,
     pub exit_kind: TerminalExitKind,
+    /// Why the supervisor chose this disposition, when the disposition alone
+    /// does not say. `failed` records the exhausted crash budget here, naming
+    /// the limit AND the window it was counted over, because a module stopped
+    /// by three crashes in ten minutes and one stopped by three crashes in a
+    /// week are the same `failed` and call for different reactions.
+    pub disposition_detail: Option<String>,
 }
 
 /// The retained terminal suffix for one module.
@@ -95,6 +101,7 @@ mod tests {
             at_ms,
             disposition: TerminalDisposition::Restarting,
             exit_kind: TerminalExitKind::Crash,
+            disposition_detail: None,
         }
     }
 

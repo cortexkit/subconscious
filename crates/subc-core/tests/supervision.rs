@@ -1,5 +1,6 @@
 use std::{ops::Deref, path::PathBuf, sync::Arc, time::Duration};
 
+use subc_control::TerminalDisposition;
 use subc_core::{
     stderr_tail::{CaptureState, StderrTailSnapshot, TailEntry},
     test_support::TestTempDir,
@@ -462,6 +463,49 @@ async fn restart_cap_marks_module_failed_without_infinite_loop() {
     assert_eq!(status.restart_count, max_restarts);
     assert!(!status.process_alive);
     assert!(!status.live);
+}
+
+/// The window must survive the real supervise loop, not only the exit handler
+/// the unit tests drive: an operator reading a stopped module gets the spent
+/// budget, the cap, AND the span they are counted over from the same status and
+/// terminal history a running daemon serves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_module_stopped_by_its_budget_reports_the_window_it_was_counted_over() {
+    let server = TestServer::start().await;
+    let max_restarts = 2;
+    let supervisor = supervisor(&server, max_restarts, Duration::from_millis(10));
+    let module = supervisor
+        .spawn(stub_spec(
+            &server,
+            "fake-aft-window",
+            [("FAKE_AFT_CRASH_AFTER_MS", "0")],
+        ))
+        .unwrap();
+
+    let status = wait_for_status(&module, Duration::from_secs(2), |status| {
+        status.state == ModuleState::Failed
+    })
+    .await;
+
+    assert_eq!(status.restart_count, max_restarts);
+    assert_eq!(status.max_restarts, max_restarts);
+    assert_eq!(
+        status.restart_window,
+        Duration::from_secs(600),
+        "the count is only readable against the span it was counted over"
+    );
+
+    let history = module.terminal_history();
+    let last = history
+        .entries
+        .last()
+        .expect("the refused crash is retained in the terminal ring");
+    assert_eq!(last.disposition, TerminalDisposition::Failed);
+    assert_eq!(
+        last.disposition_detail.as_deref(),
+        Some("crash budget exhausted: max_restarts=2 within window_secs=600"),
+        "the terminal record must say which limit stopped the module"
+    );
 }
 
 /// The budget a module is spent against must travel with the count that spends

@@ -190,9 +190,9 @@ pub struct ConfiguredModule {
     pub route_bind_relay_timeout_ms: Option<u64>,
     /// This module's crash-restart budget, fully resolved at parse time: every
     /// absent key of the optional `restart` block falls back to the supervisor
-    /// default (3 restarts per 600s, 100ms backoff). Stored resolved rather than
-    /// as an `Option` so no later layer has to re-derive the defaults and get
-    /// them subtly different.
+    /// default (3 restarts per 600s, 100ms base backoff, 30s maximum backoff).
+    /// Stored resolved rather than as an `Option` so no later layer has to
+    /// re-derive the defaults and get them subtly different.
     ///
     /// Read when a module STARTS being supervised (daemon start, or a rescan
     /// that adds the module). Like `drain_timeout_ms`, an edit to this block for
@@ -301,6 +301,8 @@ struct RawRestartConfig {
     window_secs: Option<u64>,
     #[serde(default)]
     backoff_ms: Option<u64>,
+    #[serde(default)]
+    max_backoff_ms: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -737,15 +739,30 @@ fn parse_restart_config(
         Some(secs) => Duration::from_secs(secs),
         None => defaults.window,
     };
+    let backoff = raw
+        .backoff_ms
+        .map(Duration::from_millis)
+        .unwrap_or(defaults.backoff);
+    let max_backoff = raw
+        .max_backoff_ms
+        .map(Duration::from_millis)
+        .unwrap_or(defaults.max_backoff);
+    if max_backoff < backoff {
+        return Err(DaemonConfigError::InvalidValue {
+            path: path.to_path_buf(),
+            message: format!(
+                "module '{}' restart.max_backoff_ms must be greater than or equal to restart.backoff_ms (max_backoff_ms={max_backoff:?}, backoff_ms={backoff:?})",
+                module_id.escape_debug()
+            ),
+        });
+    }
 
     Ok(RestartPolicy {
         // `0` is a deliberate posture here ("never replace this module"), unlike
         // the window, so it is accepted as written.
         max_restarts: raw.max_restarts.unwrap_or(defaults.max_restarts),
-        backoff: raw
-            .backoff_ms
-            .map(Duration::from_millis)
-            .unwrap_or(defaults.backoff),
+        backoff,
+        max_backoff,
         window,
     })
 }
@@ -1213,6 +1230,10 @@ mod tests {
             config.modules[0].restart.backoff,
             Duration::from_millis(100)
         );
+        assert_eq!(
+            config.modules[0].restart.max_backoff,
+            Duration::from_secs(30)
+        );
     }
 
     #[test]
@@ -1225,7 +1246,7 @@ mod tests {
               "modules": {
                 "all": {
                   "program": "all",
-                  "restart": { "max_restarts": 5, "window_secs": 60, "backoff_ms": 250 }
+                  "restart": { "max_restarts": 5, "window_secs": 60, "backoff_ms": 250, "max_backoff_ms": 5000 }
                 },
                 "window-only": {
                   "program": "window-only",
@@ -1254,6 +1275,7 @@ mod tests {
         assert_eq!(all.max_restarts, 5);
         assert_eq!(all.window, Duration::from_secs(60));
         assert_eq!(all.backoff, Duration::from_millis(250));
+        assert_eq!(all.max_backoff, Duration::from_secs(5));
 
         // A module that only widens its window keeps the default cap and
         // backoff: the keys do not travel as a set.
@@ -1261,6 +1283,7 @@ mod tests {
         assert_eq!(window_only.max_restarts, 3);
         assert_eq!(window_only.window, Duration::from_secs(7_200));
         assert_eq!(window_only.backoff, Duration::from_millis(100));
+        assert_eq!(window_only.max_backoff, Duration::from_secs(30));
 
         // `max_restarts: 0` is a posture, not a mistake: never replace this
         // module. Unlike a zero window, it is accepted as written.
@@ -1302,6 +1325,43 @@ mod tests {
         assert!(
             text.contains("max_restarts: 0"),
             "error must name the setting that actually stops restarts: {text}"
+        );
+    }
+
+    #[test]
+    fn restart_max_backoff_below_backoff_is_refused_by_name() {
+        let path = Path::new("/tmp/subc.jsonc");
+        let err = parse_doc(
+            r#"
+            {
+              "version": 1,
+              "modules": {
+                "broken": {
+                  "program": "broken",
+                  "restart": { "backoff_ms": 1000, "max_backoff_ms": 999 }
+                }
+              }
+            }
+            "#,
+            path,
+        )
+        .expect_err("a maximum below the base backoff must refuse parse");
+        assert!(
+            matches!(err, DaemonConfigError::InvalidValue { .. }),
+            "an invalid restart bound must be an InvalidValue: {err:?}"
+        );
+        let text = format!("{err}");
+        assert!(
+            text.contains("restart.max_backoff_ms"),
+            "error must name max_backoff_ms: {text}"
+        );
+        assert!(
+            text.contains("restart.backoff_ms"),
+            "error must name backoff_ms: {text}"
+        );
+        assert!(
+            text.contains("broken"),
+            "error must name the offending module id: {text}"
         );
     }
 

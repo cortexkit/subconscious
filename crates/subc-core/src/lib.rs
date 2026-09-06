@@ -1,7 +1,7 @@
 //! subc daemon core.
 //!
 //! This crate owns the loopback TCP transport and the thin splice-router core:
-//! routing decisions are made from the 17-byte envelope header, while message
+//! routing decisions are made from the 21-byte envelope header, while message
 //! bodies are carried as opaque bytes and are never deserialized by the router.
 
 #![forbid(unsafe_code)]

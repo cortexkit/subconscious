@@ -41,7 +41,7 @@ name: SubcFed
 # nothing refuses an unverified push to clients/subc-client-swift/.
 on:
   push:
-    branches: [master]
+    branches: [master, 'train/**']
     paths:
       - "clients/subc-client-swift/**"
       - ".github/workflows/subc-fed.yml"

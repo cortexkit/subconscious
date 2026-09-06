@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [master]
+    branches: [master, 'train/**']
   pull_request:
   # Reusable so release.yml gates publish on the exact same matrix —
   # release-time and PR-time CI can never drift.

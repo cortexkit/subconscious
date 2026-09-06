@@ -2,7 +2,7 @@ name: CK alpha verification
 
 on:
   push:
-    branches: [master]
+    branches: [master, 'train/**']
     paths:
       - .github/workflows/ck-alpha-ci.yml
       - Cargo.lock

@@ -5416,8 +5416,8 @@ mod tests {
         }
     }
 
-    /// Reproduction of the 2026-09-06 outage. A client had `route.open`s in
-    /// flight to `aft` and was already marked closing -- its egress had refused a
+    /// Reproduction of a production outage. A client had `route.open`s in
+    /// flight to a module and was already marked closing -- its egress had refused a
     /// module frame, so the daemon asked its connection to end -- while its sink
     /// was still open. When the module acked those binds, the daemon refused to
     /// commit a route for a closing client, and that refusal was returned from

@@ -3135,6 +3135,46 @@ impl ControlHandler {
         }
     }
 
+    /// Decide whether a failure while settling a relayed `route.bind` belongs to
+    /// the module connection whose frame is being handled, or to the client that
+    /// relay was opened for.
+    ///
+    /// This runs on the MODULE connection's frame handler, where returning `Err`
+    /// ends that connection -- and a module connection carries every client's
+    /// routes to that module, so ending it costs the whole fleet its tools.
+    /// `ConnectionClosing` carries the id of the connection that is closing, and
+    /// when that id is a CLIENT's, the condition is entirely about that one
+    /// client's route.open. A client-scoped condition has no authority over a
+    /// shared module connection, so it is logged and the single relay is dropped:
+    /// the client is going away, and `complete_pending_relay` already removed the
+    /// relay before failing, so there is nothing left to settle. Anything that
+    /// relay still reserved is released by that client's own connection teardown,
+    /// which is already under way -- that is what "closing" means.
+    ///
+    /// Every other failure is a statement about THIS connection and stays fatal:
+    /// a poisoned forwarding lock, a stale module endpoint, and the module's own
+    /// id in `ConnectionClosing` all mean this connection cannot keep serving
+    /// frames correctly.
+    fn refuse_to_end_module_connection_for_a_client(
+        &self,
+        module_connection_id: ConnectionId,
+        corr: u64,
+        err: ForwardingError,
+    ) -> Result<(), RouterError> {
+        if let ForwardingError::ConnectionClosing { connection_id } = err {
+            if connection_id != module_connection_id {
+                warn!(
+                    module_connection_id = module_connection_id.get(),
+                    client_connection_id = connection_id.get(),
+                    corr,
+                    "dropping a route.bind response for a closing client; the module connection keeps serving"
+                );
+                return Ok(());
+            }
+        }
+        Err(RouterError::Forwarding(err))
+    }
+
     fn handle_module_relay_response(
         &self,
         connection_id: ConnectionId,
@@ -3285,10 +3325,20 @@ impl ControlHandler {
             }
         };
 
-        let completion = self
-            .forwarding
-            .complete_pending_relay(connection_id, frame.header.corr, outcome)
-            .map_err(RouterError::Forwarding)?;
+        let settled =
+            self.forwarding
+                .complete_pending_relay(connection_id, frame.header.corr, outcome);
+        let completion = match settled {
+            Ok(completion) => completion,
+            Err(err) => {
+                self.refuse_to_end_module_connection_for_a_client(
+                    connection_id,
+                    frame.header.corr,
+                    err,
+                )?;
+                return Ok(secondary_error.into_iter().collect());
+            }
+        };
         if let Some(target) = completion.abandoned.as_ref() {
             send_goodbye_target_best_effort(target, "late accepted route.bind");
         }
@@ -3957,6 +4007,7 @@ mod tests {
 
     use super::*;
     use crate::{
+        forwarding::{DataRoute, DataRouteState},
         registry::ChannelState,
         router::FrameSink,
         stderr_tail::DEFAULT_MAX_LINE_BYTES,
@@ -5308,6 +5359,272 @@ mod tests {
         assert!(matches!(
             serde_json::from_slice::<ClientControlResponse>(&published.body).unwrap(),
             ClientControlResponse::RouteOpen { .. }
+        ));
+    }
+
+    /// Start one `route.open` on `client_connection` and return its still-running
+    /// handler task together with the `route.bind` the module received for it.
+    /// The handler blocks until the module answers, so it has to run as a task
+    /// while the test drives the module side.
+    async fn relay_route_open(
+        handler: &ControlHandler,
+        client_connection: ConnectionId,
+        client_egress: &FrameSink,
+        module_rx: &mut mpsc::Receiver<crate::router::OutboundFrame>,
+        corr: u64,
+        module_id: &str,
+        project_root_label: &str,
+    ) -> (tokio::task::JoinHandle<Vec<Frame>>, Frame) {
+        let ctx = RouteCtx {
+            connection_id: client_connection,
+            egress: client_egress.clone(),
+        };
+        let handler = handler.clone();
+        let project_root = unique_project_root(project_root_label);
+        let module_id = module_id.to_string();
+        let task = tokio::spawn(async move {
+            handler
+                .handle_control_frame(&ctx, route_open_frame(corr, &module_id, project_root))
+                .await
+                .unwrap()
+        });
+        let bind = tokio::time::timeout(Duration::from_secs(2), module_rx.recv())
+            .await
+            .expect("module receives the relayed route.bind")
+            .expect("module egress is open");
+        (task, bind.frame)
+    }
+
+    fn route_bind_channel(frame: &Frame) -> (u16, u32) {
+        match serde_json::from_slice::<ModuleControlRequest>(&frame.body).unwrap() {
+            ModuleControlRequest::RouteBind {
+                route_channel,
+                epoch,
+                ..
+            } => (route_channel, epoch),
+            other => panic!("expected a route.bind request, got {other:?}"),
+        }
+    }
+
+    fn published_route(frame: &Frame) -> (u16, u32) {
+        match serde_json::from_slice::<ClientControlResponse>(&frame.body).unwrap() {
+            ClientControlResponse::RouteOpen {
+                route_channel,
+                route_epoch,
+            } => (route_channel, route_epoch),
+            other => panic!("expected a route.open response, got {other:?}"),
+        }
+    }
+
+    /// Reproduction of the 2026-09-06 outage. A client had `route.open`s in
+    /// flight to `aft` and was already marked closing -- its egress had refused a
+    /// module frame, so the daemon asked its connection to end -- while its sink
+    /// was still open. When the module acked those binds, the daemon refused to
+    /// commit a route for a closing client, and that refusal was returned from
+    /// the MODULE connection's frame handler, where a router error that has no
+    /// ERROR-frame translation ends the connection. The module saw EOF, exited 0,
+    /// the supervisor correctly did not respawn a clean exit, and every seat lost
+    /// its tools for hours -- one client's teardown took down a connection
+    /// carrying ~170 other routes.
+    ///
+    /// The window is opened here by calling the production path that opens it
+    /// (`escalate_client_delivery_failure`) rather than by closing a socket. The
+    /// state that matters is "in `closing_connections`, sink still open, relay
+    /// still pending", and it lasts only from the close request until the
+    /// connection loop reacts to it; a socket-level test can flood a client into
+    /// that escalation but cannot pin the module's ack inside the window. Closing
+    /// the socket instead takes the other path entirely -- connection teardown
+    /// removes the pending relay under the same lock, so the ack finds nothing.
+    #[tokio::test]
+    async fn late_bind_ack_for_a_closing_client_keeps_the_module_connection_serving() {
+        let registry = Arc::new(Registry::default());
+        let forwarding = Arc::new(ForwardingTable::default());
+        let handler =
+            ControlHandler::with_forwarding(Arc::clone(&registry), Arc::clone(&forwarding));
+
+        let module_connection = ConnectionId::new(30);
+        let (module_ctx, mut module_rx) = route_ctx(module_connection);
+        handler
+            .handle_control_frame(&module_ctx, hello_frame("aft", PROTOCOL_VERSION, 7))
+            .await
+            .unwrap();
+
+        let dying_client = ConnectionId::new(31);
+        let (dying_ctx, mut dying_rx) = route_ctx(dying_client);
+
+        // A published route on the dying client. The escalation below only marks
+        // a connection closing for a route it has already published.
+        let (first_task, first_bind) = relay_route_open(
+            &handler,
+            dying_client,
+            &dying_ctx.egress,
+            &mut module_rx,
+            100,
+            "aft",
+            "closing-first",
+        )
+        .await;
+        handler
+            .handle_control_frame(&module_ctx, route_bind_ack(first_bind.header.corr))
+            .await
+            .unwrap();
+        assert!(first_task.await.unwrap().is_empty());
+        let (first_channel, first_epoch) = published_route(&dying_rx.recv().await.unwrap());
+
+        // A second route.open from the same client, relayed and awaiting its ack.
+        let (second_task, second_bind) = relay_route_open(
+            &handler,
+            dying_client,
+            &dying_ctx.egress,
+            &mut module_rx,
+            101,
+            "aft",
+            "closing-second",
+        )
+        .await;
+        let (abandoned_channel, abandoned_epoch) = route_bind_channel(&second_bind);
+
+        // The window: the client is closing, its sink is still open, and its
+        // second bind is still pending.
+        assert!(forwarding
+            .escalate_client_delivery_failure(
+                dying_client,
+                first_channel,
+                first_epoch,
+                CloseReason::new(
+                    "module_to_client_delivery_failed",
+                    "client egress refused a module frame",
+                ),
+            )
+            .unwrap());
+        assert!(!dying_ctx.egress.is_closed());
+
+        // The frame that used to end the module connection.
+        let ack = handler
+            .handle_control_frame(&module_ctx, route_bind_ack(second_bind.header.corr))
+            .await;
+        let module_loop_error = ack.as_ref().err().map(ToString::to_string);
+        if module_loop_error.is_some() {
+            // What the server's connection loop does with a router error that has
+            // no ERROR-frame translation: end the connection, which releases the
+            // module's registration and every route on it.
+            handler.cleanup_connection(module_connection).unwrap();
+        }
+        // Read the module's next frame before opening the co-tenant's route, so
+        // the GOODBYE assertion below is about THIS ack and not about later
+        // traffic. `None` means the module was told nothing.
+        let post_ack_module_frame = tokio::time::timeout(Duration::from_secs(1), module_rx.recv())
+            .await
+            .ok()
+            .flatten();
+
+        // 1. The module connection is still registered.
+        assert!(
+            registry
+                .get_module_by_connection(module_connection)
+                .unwrap()
+                .is_some(),
+            "one client's closing connection ended the shared module connection: \
+             {module_loop_error:?}"
+        );
+        // ...and still serving: another client can open and use a route on it.
+        let cotenant = ConnectionId::new(32);
+        let (cotenant_ctx, mut cotenant_rx) = route_ctx(cotenant);
+        let (cotenant_task, cotenant_bind) = relay_route_open(
+            &handler,
+            cotenant,
+            &cotenant_ctx.egress,
+            &mut module_rx,
+            102,
+            "aft",
+            "closing-cotenant",
+        )
+        .await;
+        handler
+            .handle_control_frame(&module_ctx, route_bind_ack(cotenant_bind.header.corr))
+            .await
+            .unwrap();
+        assert!(cotenant_task.await.unwrap().is_empty());
+        let (cotenant_channel, cotenant_epoch) =
+            published_route(&cotenant_rx.recv().await.unwrap());
+        assert!(matches!(
+            forwarding
+                .lookup_data_route(cotenant, cotenant_channel, cotenant_epoch)
+                .unwrap(),
+            DataRoute::Client(DataRouteState::Bound(_))
+        ));
+
+        // 2. The module was told to drop the binding it created for the route
+        //    that will never be published.
+        let goodbye = post_ack_module_frame
+            .expect("module receives a GOODBYE for the abandoned route channel");
+        assert_eq!(goodbye.header.ty, FrameType::Goodbye);
+        assert_eq!(goodbye.header.channel, abandoned_channel);
+        assert_eq!(goodbye.header.epoch, abandoned_epoch);
+
+        // 3. The dying client received nothing: no route was ever published to
+        //    it. Its route.open is answered as unavailable, which the connection
+        //    loop would write to a socket that is already going away.
+        assert!(dying_rx.try_recv().is_err());
+        let second_response = second_task.await.unwrap();
+        assert_eq!(second_response.len(), 1);
+        assert_eq!(
+            parse_error(&second_response[0])["code"],
+            "target_unavailable"
+        );
+    }
+
+    /// The fence at the module-loop boundary, stated as its own contract: which
+    /// forwarding failures are allowed to end the module connection that is being
+    /// served. A `ConnectionClosing` naming some client is about that client, and
+    /// a module connection is shared; the same error naming the module's own
+    /// connection is about this connection and must stay fatal, as must failures
+    /// that are about the forwarding table itself.
+    #[test]
+    fn only_the_modules_own_closing_connection_ends_the_module_loop() {
+        let handler = ControlHandler::default();
+        let module_connection = ConnectionId::new(30);
+        let client_connection = ConnectionId::new(31);
+
+        handler
+            .refuse_to_end_module_connection_for_a_client(
+                module_connection,
+                77,
+                ForwardingError::ConnectionClosing {
+                    connection_id: client_connection,
+                },
+            )
+            .expect("a closing client must never end the module connection");
+
+        assert!(matches!(
+            handler.refuse_to_end_module_connection_for_a_client(
+                module_connection,
+                78,
+                ForwardingError::ConnectionClosing {
+                    connection_id: module_connection,
+                },
+            ),
+            Err(RouterError::Forwarding(ForwardingError::ConnectionClosing {
+                connection_id
+            })) if connection_id == module_connection
+        ));
+        assert!(matches!(
+            handler.refuse_to_end_module_connection_for_a_client(
+                module_connection,
+                79,
+                ForwardingError::Poisoned,
+            ),
+            Err(RouterError::Forwarding(ForwardingError::Poisoned))
+        ));
+        assert!(matches!(
+            handler.refuse_to_end_module_connection_for_a_client(
+                module_connection,
+                80,
+                ForwardingError::StaleModuleEndpoint,
+            ),
+            Err(RouterError::Forwarding(
+                ForwardingError::StaleModuleEndpoint
+            ))
         ));
     }
 

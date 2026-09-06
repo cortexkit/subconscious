@@ -1136,7 +1136,11 @@ fn safe_error_value(value: &str) -> String {
     }
 }
 
-/// Trust gate applied by subc before routing capabilities.
+/// How this module was sourced, as declared by the module itself.
+///
+/// Not read on any daemon routing or admission path; relayed verbatim. A
+/// module declares it because it describes the module, not because the
+/// daemon consumes it, and leaves it absent rather than inventing a value.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum TrustTier {

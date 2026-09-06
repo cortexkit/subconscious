@@ -1157,6 +1157,13 @@ pub enum TrustTier {
 pub enum ProviderRole {
     ToolProvider {
         tools: Vec<Tool>,
+        /// Which `BindIdentity` keys PARTITION this provider's state or
+        /// answers: a module whose reply to a call depends on the caller's
+        /// project declares `Project`; one that threads per session declares
+        /// `Session`; one that answers identically to every caller declares
+        /// `[]`. It states what the module does with the keys it is handed,
+        /// not which keys it will accept — every bind carries all of them.
+        /// Not read on any daemon path; relayed verbatim for consumers.
         identity_scope: Vec<IdentityScope>,
         concurrency: Concurrency,
         emits_push: bool,
@@ -1174,6 +1181,9 @@ pub enum ProviderRole {
         operations: Vec<ManagementOperation>,
         config_schema: Value,
         observability: Vec<ObservabilitySurface>,
+        /// Same meaning as on `ToolProvider`: the keys that partition this
+        /// surface's state or answers; `[]` for a surface that serves the
+        /// same answer to every caller.
         identity_scope: Vec<IdentityScope>,
         #[serde(default)]
         concurrency: Concurrency,
@@ -1255,7 +1265,12 @@ impl Default for Concurrency {
     }
 }
 
-/// Identity keys that route or scope a call.
+/// A `BindIdentity` key a provider partitions its state or answers by.
+///
+/// Declared in a role's `identity_scope` to say which caller keys change
+/// what the module does; the daemon hands every bind all of the keys
+/// regardless, so an empty declaration means "answers do not depend on the
+/// caller", never "keys are refused".
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum IdentityScope {

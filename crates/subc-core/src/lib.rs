@@ -37,6 +37,7 @@ pub use forwarding::{ForwardingError, ForwardingTable, ModuleEndpointId};
 // subc-protocol (pure, with the envelope it accompanies) and the async I/O loop
 // in subc-transport (with the authenticated stream). Re-exported here so the
 // `subc_core::{Frame, read_frame, write_frame, ...}` surface stays stable.
+pub use control::DEFAULT_ROUTE_BIND_RELAY_TIMEOUT;
 pub use identity::{IdentityError, ProjectRootId, RequestIdentity, SessionId};
 pub use observability::{ConnectedClients, DaemonCounters};
 pub use registry::{ChannelState, ConnectionId, ModuleRegistration, Registry, RegistryError};
@@ -53,7 +54,7 @@ pub use subc_transport::{read_frame, write_frame, FrameIoError, ReadStage};
 pub use supervise::{
     ExitKind, ExitReport, HealthAction, HealthConfig, ModuleHealthStatus, ModuleProcessLiveness,
     ModuleSpec, ModuleState, ModuleStatus, RestartPolicy, SuperviseError, SupervisedModule,
-    Supervisor, SupervisorHandle, SupervisorProcessLiveness, SUBC_ARG,
+    Supervisor, SupervisorHandle, SupervisorProcessLiveness, DEFAULT_DRAIN_TIMEOUT, SUBC_ARG,
 };
 pub use watchdog::{
     DaemonSelfWatchdog, DaemonSelfWatchdogConfig, WatchdogStage, WatchdogTickError,

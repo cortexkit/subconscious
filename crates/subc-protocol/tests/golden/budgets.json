@@ -1,0 +1,44 @@
+[
+  {
+    "name": "drain_timeout",
+    "ms": 30000,
+    "owner": "daemon",
+    "note": "Daemon drain ceiling before supervised child process termination; coupled to retry deadline (route_open_retry_deadline >= drain_timeout)"
+  },
+  {
+    "name": "route_bind_relay_timeout",
+    "ms": 12000,
+    "owner": "daemon",
+    "note": "Daemon route.bind relay timeout waiting for module ack"
+  },
+  {
+    "name": "auth_deadline",
+    "ms": 2000,
+    "owner": "daemon",
+    "note": "Daemon deadline for pre-envelope HMAC authentication handshake"
+  },
+  {
+    "name": "route_open_retry_deadline",
+    "ms": 30000,
+    "owner": "sdk",
+    "note": "SDK retry deadline for retryable route.open rejections; coupled to daemon drain ceiling (route_open_retry_deadline >= drain_timeout)"
+  },
+  {
+    "name": "liveness_probe_window",
+    "ms": 2000,
+    "owner": "sdk",
+    "note": "SDK probe window for connection liveness checks"
+  },
+  {
+    "name": "timeout_arbitration_grace",
+    "ms": 50,
+    "owner": "sdk",
+    "note": "SDK event-loop grace period for request timeout arbitration against buffered frames"
+  },
+  {
+    "name": "request_timeout",
+    "ms": 30000,
+    "owner": "sdk",
+    "note": "SDK default request/call timeout when no explicit timeout is provided"
+  }
+]

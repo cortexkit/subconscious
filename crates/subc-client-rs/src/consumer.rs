@@ -38,15 +38,15 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
-const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(30);
+pub const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(30);
 // Sized against the daemon's route.bind relay timeout (12s default): one
 // load-stalled bind relay burns ~12s before the daemon rejects with
 // module_timeout, so a 10s budget could be exhausted by a SINGLE slow bind.
 // 30s leaves room for ~2 full relay waits plus backoff (still clamped by the
 // overall call timeout below).
-const DEFAULT_ROUTE_RETRY_DEADLINE: Duration = Duration::from_secs(30);
+pub const DEFAULT_ROUTE_RETRY_DEADLINE: Duration = Duration::from_secs(30);
 const DEFAULT_RESTORED_DEBOUNCE: Duration = Duration::from_millis(250);
-const DEFAULT_LIVENESS_PROBE_WINDOW: Duration = Duration::from_secs(2);
+pub const DEFAULT_LIVENESS_PROBE_WINDOW: Duration = Duration::from_secs(2);
 const EGRESS_BUFFER: usize = 128;
 const DEFAULT_ROUTE_WINDOW: usize = 1024;
 const DEFAULT_SUBSCRIPTION_EVENT_BUFFER: usize = 128;
@@ -3856,7 +3856,7 @@ fn emit_callbacks(callbacks: Vec<Callback>, state: ConnectionState) {
     }
 }
 
-fn is_retryable_route_open_code(code: &str) -> bool {
+pub fn is_retryable_route_open_code(code: &str) -> bool {
     match code {
         // A capability deny is a policy refusal, not transient target absence.
         // Keep this explicit so a future broad retry matcher cannot reopen it.

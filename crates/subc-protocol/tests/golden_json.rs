@@ -425,6 +425,20 @@ fn protocol_constants_are_published_for_cross_language_comparison() {
     );
 }
 
+#[test]
+fn contract_fixtures_are_valid_json() {
+    for fixture in ["budgets", "decision_tables"] {
+        let path = golden_path(fixture);
+        assert!(
+            path.exists(),
+            "fixture {fixture}.json missing at {}",
+            path.display()
+        );
+        let _: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap())
+            .unwrap_or_else(|err| panic!("fixture {fixture}.json is not valid JSON: {err}"));
+    }
+}
+
 fn assert_golden<T>(name: &str, value: &T)
 where
     T: Serialize + DeserializeOwned + PartialEq + Debug,

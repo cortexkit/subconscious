@@ -1,0 +1,26 @@
+{
+  "route_open_retryable": {
+    "admission_facts_not_permitted": "terminal",
+    "admission_facts_target_not_allowed": "terminal",
+    "bad_consumer_identity": "terminal",
+    "capability_forbidden": "terminal",
+    "forwarding_error": "terminal",
+    "invalid_project_root": "terminal",
+    "module_reloading": "retryable",
+    "module_removed": "terminal",
+    "module_timeout": "retryable",
+    "module_warming": "retryable",
+    "op_not_allowed": "terminal",
+    "route_limit": "terminal",
+    "target_unavailable": "retryable",
+    "unknown_module": "retryable"
+  },
+  "route_close_disposition": {
+    "capability_denied": "must_not_reopen",
+    "crash": "must_not_reopen",
+    "disable": "must_not_reopen",
+    "reload": "may_reopen",
+    "restart": "may_reopen",
+    "unknown": "must_not_reopen"
+  }
+}

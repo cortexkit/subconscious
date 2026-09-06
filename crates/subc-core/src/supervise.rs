@@ -61,7 +61,7 @@ const DEFAULT_RESTART_WINDOW: Duration = Duration::from_secs(600);
 /// `drain_timeout_ms` in subc.jsonc; per-restart override: the operator's
 /// `supervisor.restart{drain_timeout_ms}` (0 = cut now, for wedge bounces
 /// where a stuck request will never settle).
-const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+pub const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 const REGISTRY_RELEASE_TIMEOUT: Duration = Duration::from_secs(1);
 const REGISTRY_RELEASE_POLL: Duration = Duration::from_millis(10);
 const STDERR_PUMP_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);

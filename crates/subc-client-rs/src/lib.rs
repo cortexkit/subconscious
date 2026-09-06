@@ -3,9 +3,11 @@
 pub mod consumer;
 pub mod policy_cache;
 pub use consumer::{
-    CallError, CallOptions, CatalogList, CloseRouteOptions, ConnectionState, ConsumerError,
-    ConsumerOptions, ControlPush, PushEvent, RetryBackoff, RouteCloseDisposition, RouteCloseReason,
-    RoutePollResult, SubcConsumer, SubscribeOptions, Subscription, SubscriptionClosed,
+    is_retryable_route_open_code, CallError, CallOptions, CatalogList, CloseRouteOptions,
+    ConnectionState, ConsumerError, ConsumerOptions, ControlPush, PushEvent, RetryBackoff,
+    RouteCloseDisposition, RouteCloseReason, RoutePollResult, SubcConsumer, SubscribeOptions,
+    Subscription, SubscriptionClosed, DEFAULT_CALL_TIMEOUT, DEFAULT_LIVENESS_PROBE_WINDOW,
+    DEFAULT_ROUTE_RETRY_DEADLINE,
 };
 pub use policy_cache::{
     PolicyResolveError, PolicyResolver, PolicyResolverConfig, PolicyVerdict, ProjectRef, Subject,

@@ -45,7 +45,7 @@ import {
 const debug = debuglog("subc-client");
 
 const DEFAULT_HANDSHAKE_TIMEOUT_MS = 10_000;
-const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
+export const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 // When a request-timeout timer fires, its reply may already be sitting in the
 // socket read buffer, unprocessed only because the event loop was starved (Node
 // runs the TIMERS phase before the POLL phase, so an expired timer can beat an
@@ -56,8 +56,8 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 // one loop turn. This is a demux tiebreak for a reply that RACED the deadline,
 // NOT a deadline extension: an absent reply still settles right after the check
 // phase. Capped so it can never approach BODY_READ_TIMEOUT_MS.
-const TIMEOUT_ARBITRATION_GRACE_MS = 50;
-const LIVENESS_PROBE_WINDOW_MS = 2000;
+export const TIMEOUT_ARBITRATION_GRACE_MS = 50;
+export const LIVENESS_PROBE_WINDOW_MS = 2000;
 // Internal marker set as the `code` on the SubcError a request-deadline timeout
 // rejects with, so the managed classifier can tell a deadline (reply may simply
 // not have been read in time) from an actual connection drop. Never surfaced to
@@ -79,7 +79,7 @@ const DEADLINE_NO_DROP_CODE = "deadline_exceeded_no_drop_observed";
 // rejects with module_timeout, so the deadline must leave room for MULTIPLE
 // full relay waits or one slow bind exhausts the whole retry clock. 30s allows
 // ~2 full relay timeouts plus backoff before surfacing not_sent.
-const ROUTE_OPEN_RETRY_DEADLINE_MS = 30_000;
+export const ROUTE_OPEN_RETRY_DEADLINE_MS = 30_000;
 // Once a header arrives, its body must follow promptly; bound it so a truncated
 // frame cannot wedge the read loop forever.
 const BODY_READ_TIMEOUT_MS = 30_000;

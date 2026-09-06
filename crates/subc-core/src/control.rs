@@ -98,7 +98,7 @@ const MODULE_BASELINE_CONTROL_OPS: &[&str] = &["route.bind", "route.status"];
 /// exceeds a couple of seconds. The default is generous because rejecting a VALID
 /// bind is far worse than waiting on a slow one; a consumer that wants a tighter
 /// bound retries the bind itself (the sanctioned warm-bind-retry pattern).
-const DEFAULT_ROUTE_BIND_RELAY_TIMEOUT: Duration = Duration::from_secs(12);
+pub const DEFAULT_ROUTE_BIND_RELAY_TIMEOUT: Duration = Duration::from_secs(12);
 const DEFAULT_HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const SLOW_CONTROL_DISPATCH_THRESHOLD: Duration = Duration::from_secs(1);
 

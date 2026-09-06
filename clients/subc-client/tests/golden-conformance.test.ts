@@ -2,7 +2,15 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 
-import type { CatalogEntry } from "../src/client";
+import {
+  classifyRouteCloseReason,
+  DEFAULT_REQUEST_TIMEOUT_MS,
+  isRetryableRouteOpenCode,
+  LIVENESS_PROBE_WINDOW_MS,
+  ROUTE_OPEN_RETRY_DEADLINE_MS,
+  TIMEOUT_ARBITRATION_GRACE_MS,
+  type CatalogEntry,
+} from "../src/client";
 import {
   buildFrame,
   decodeHeader,
@@ -45,9 +53,9 @@ const CONTROL_GOLDEN_DIR = join(
   "golden",
 );
 
-function loadGolden(name: string): Record<string, unknown> {
+function loadGolden<T = Record<string, unknown>>(name: string): T {
   const raw = readFileSync(join(GOLDEN_DIR, `${name}.json`), "utf8");
-  return JSON.parse(raw) as Record<string, unknown>;
+  return JSON.parse(raw) as T;
 }
 
 function loadControlGolden(name: string): Record<string, unknown> {
@@ -349,6 +357,80 @@ describe("Rust golden fixtures", () => {
     expect(constants.header_len).toBe(HEADER_LEN);
     expect(constants.frozen_prefix_len).toBe(FROZEN_PREFIX_LEN);
     expect(constants.max_frame_body_len).toBe(MAX_FRAME_BODY_LEN);
+  });
+
+  test("the transcribed timing budgets match the golden contract fixture", () => {
+    interface BudgetRow {
+      name: string;
+      ms: number;
+      owner: string;
+      note: string;
+    }
+    const budgets = loadGolden<BudgetRow[]>("budgets");
+    const byName = new Map(budgets.map((b) => [b.name, b]));
+
+    const retryDeadline = byName.get("route_open_retry_deadline");
+    expect(retryDeadline).toBeDefined();
+    expect(ROUTE_OPEN_RETRY_DEADLINE_MS).toBe(retryDeadline!.ms);
+    expect(retryDeadline!.owner).toBe("sdk");
+
+    const probeWindow = byName.get("liveness_probe_window");
+    expect(probeWindow).toBeDefined();
+    expect(LIVENESS_PROBE_WINDOW_MS).toBe(probeWindow!.ms);
+    expect(probeWindow!.owner).toBe("sdk");
+
+    const arbitrationGrace = byName.get("timeout_arbitration_grace");
+    expect(arbitrationGrace).toBeDefined();
+    expect(TIMEOUT_ARBITRATION_GRACE_MS).toBe(arbitrationGrace!.ms);
+    expect(arbitrationGrace!.owner).toBe("sdk");
+
+    const requestTimeout = byName.get("request_timeout");
+    expect(requestTimeout).toBeDefined();
+    expect(DEFAULT_REQUEST_TIMEOUT_MS).toBe(requestTimeout!.ms);
+    expect(requestTimeout!.owner).toBe("sdk");
+  });
+
+  test("the SDK route-open retry deadline couples to the daemon drain ceiling", () => {
+    interface BudgetRow {
+      name: string;
+      ms: number;
+      owner: string;
+      note: string;
+    }
+    const budgets = loadGolden<BudgetRow[]>("budgets");
+    const drainRow = budgets.find((b) => b.name === "drain_timeout");
+    expect(drainRow).toBeDefined();
+    expect(ROUTE_OPEN_RETRY_DEADLINE_MS).toBeGreaterThanOrEqual(drainRow!.ms);
+  });
+
+  test("execute route_open_retryable decision table over every row", () => {
+    interface DecisionTables {
+      route_open_retryable: Record<string, string>;
+      route_close_disposition: Record<string, string>;
+    }
+    const tables = loadGolden<DecisionTables>("decision_tables");
+    const entries = Object.entries(tables.route_open_retryable);
+    expect(entries.length).toBeGreaterThan(0);
+
+    for (const [code, expectedVerdict] of entries) {
+      const actualVerdict = isRetryableRouteOpenCode(code) ? "retryable" : "terminal";
+      expect(actualVerdict).toBe(expectedVerdict);
+    }
+  });
+
+  test("execute route_close_disposition decision table over every row", () => {
+    interface DecisionTables {
+      route_open_retryable: Record<string, string>;
+      route_close_disposition: Record<string, string>;
+    }
+    const tables = loadGolden<DecisionTables>("decision_tables");
+    const entries = Object.entries(tables.route_close_disposition);
+    expect(entries.length).toBeGreaterThan(0);
+
+    for (const [reason, expectedDisposition] of entries) {
+      const actualDisposition: string = classifyRouteCloseReason(reason);
+      expect(actualDisposition).toBe(expectedDisposition);
+    }
   });
 
   test("a route bind command survives a real frame round trip", () => {

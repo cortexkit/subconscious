@@ -39,6 +39,54 @@ route_bind_relay_timeout_ms must be greater than 0 (a zero budget fails every bi
 At module scope, the error also names the offending module id. At either
 scope, it names the key and the `enabled: false` remedy.
 
+## The crash-restart budget is a rate
+
+`modules.<id>.restart` bounds how often the daemon will replace a module that
+keeps crashing. It is per-module only (there is no daemon-wide `restart`
+block), and every key is independent: whatever you omit keeps its default.
+
+```jsonc
+{
+  "version": 1,
+  "modules": {
+    "flappy-worker": {
+      "program": "/usr/local/bin/flappy-worker",
+      "restart": { "max_restarts": 3, "window_secs": 600, "backoff_ms": 100 }
+    }
+  }
+}
+```
+
+| Key | What it bounds | Built-in default | `0` |
+| --- | --- | --- | --- |
+| `max_restarts` | Replacement processes allowed *within* `window_secs`. | 3 | Accepted: never replace this module. |
+| `window_secs` | The span those restarts are counted over. Restarts older than this release their slot. | 600 s | Refused: a zero window holds no crash, so the budget can never be spent and the module restarts forever. |
+| `backoff_ms` | Delay before each replacement spawn. | 100 ms | Accepted: respawn immediately. |
+
+The budget is a RATE, not a lifetime total, and the distinction is the whole
+point of the window. A module that crashed twice yesterday has a full budget
+today; a module crashing three times in ten minutes is in a loop and is
+stopped. This matters now that modules exit non-zero whenever the daemon's
+connection to them drops, since each of those drops spends a unit of the same
+budget: under a lifetime total, one flappy hour would stop a healthy module
+permanently.
+
+When the budget refuses a respawn, the module goes to `failed` and both the log
+line and the retained terminal record name the limit AND the window:
+
+```
+crash budget exhausted: max_restarts=3 within window_secs=600
+```
+
+`ck module status` renders the live budget the same way — `restarts 2 of 3 in
+10m` — because `2 of 3` alone reads as a lifetime count. An operator restart,
+reload, or re-enable hands the whole budget back; `lifetime_restarts` is the
+ledger and never moves backwards.
+
+The block is read when a module starts being supervised (daemon start, or a
+rescan that adds the module). Like `drain_timeout_ms`, editing it for an
+already-running module takes effect on the next daemon start.
+
 ## Pre-auth limits are not configuration
 
 There is deliberately no `auth_deadline_ms` or

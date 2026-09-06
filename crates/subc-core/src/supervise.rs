@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     error::Error,
     fmt, io,
     path::PathBuf,
@@ -46,6 +46,10 @@ pub const SUBC_ARG: &str = "--subc";
 
 const DEFAULT_MAX_RESTARTS: u32 = 3;
 const DEFAULT_BACKOFF: Duration = Duration::from_millis(100);
+/// The span `DEFAULT_MAX_RESTARTS` is counted over. Ten minutes is long enough
+/// to contain a real crash loop (which respawns in seconds) and short enough
+/// that unrelated crashes hours apart never accumulate into a permanent stop.
+const DEFAULT_RESTART_WINDOW: Duration = Duration::from_secs(600);
 /// How long a drain waits for already-dispatched requests to finalize before
 /// the child is torn down. Sized for TOOL-SCALE work (bash, inspect, builds),
 /// not RPC-scale: the original 2s value silently cut nearly every real tool
@@ -157,20 +161,57 @@ pub struct ModuleSpec {
 /// Bounded restart policy for crash exits.
 ///
 /// `max_restarts` is the number of replacement processes allowed after the
-/// initial spawn. After that many crash restarts the module enters
-/// [`ModuleState::Failed`] and the supervisor stops the crash loop.
+/// initial spawn WITHIN `window`. After that many crash restarts inside one
+/// window the module enters [`ModuleState::Failed`] and the supervisor stops
+/// the crash loop.
+///
+/// The budget is a RATE, not a lifetime total. It used to be a lifetime total,
+/// and that only survived because crashes were rare: a module that crashed
+/// three times across a week was disabled forever by crashes that had nothing
+/// to do with each other. That stopped being survivable once modules began
+/// exiting non-zero whenever the daemon's connection to them drops, because
+/// then every daemon-side connection drop spends a unit of the same budget and
+/// one flappy hour permanently stops a healthy module. Restarts older than
+/// `window` release their slot, so a module that crashed twice yesterday has a
+/// full budget today, while a genuine crash loop -- which is fast by
+/// definition -- still reaches the cap and stops.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RestartPolicy {
     pub max_restarts: u32,
     pub backoff: Duration,
+    /// The span `max_restarts` is counted over. `Duration::ZERO` makes the
+    /// budget effectively infinite (nothing is ever in-window), which is why
+    /// daemon config refuses `window_secs: 0` rather than quietly accepting it.
+    pub window: Duration,
 }
 
 impl RestartPolicy {
+    /// A policy with the default crash window. Callers that care about the
+    /// window say so with [`Self::with_window`]; the ones that do not are
+    /// asking for the standard rate limit, not for no limit.
     pub fn new(max_restarts: u32, backoff: Duration) -> Self {
         Self {
             max_restarts,
             backoff,
+            window: DEFAULT_RESTART_WINDOW,
         }
+    }
+
+    pub fn with_window(mut self, window: Duration) -> Self {
+        self.window = window;
+        self
+    }
+
+    /// The one sentence that explains a budget-exhausted stop, used for both the
+    /// log line and the terminal record so the two cannot drift. It names the
+    /// window because `max_restarts=3` alone reads as a lifetime cap, which is
+    /// exactly what this budget is not.
+    fn budget_exhausted_detail(&self) -> String {
+        format!(
+            "crash budget exhausted: max_restarts={} within window_secs={}",
+            self.max_restarts,
+            self.window.as_secs()
+        )
     }
 }
 
@@ -179,12 +220,23 @@ impl Default for RestartPolicy {
         Self {
             max_restarts: DEFAULT_MAX_RESTARTS,
             backoff: DEFAULT_BACKOFF,
+            window: DEFAULT_RESTART_WINDOW,
         }
     }
 }
 
-pub(crate) fn daemon_will_restart(enabled: bool, restart_count: u32, max_restarts: u32) -> bool {
-    enabled && restart_count < max_restarts
+/// Whether the daemon itself will bring this module back after the exit being
+/// handled: it is enabled AND its in-window crash restarts are below the cap.
+///
+/// Takes `&mut` because reading the budget prunes it. Instants that fell out of
+/// the window are dropped here rather than by a timer, so the count is right
+/// the moment somebody asks and no bookkeeping runs for idle modules.
+fn daemon_will_restart(
+    state: &mut SupervisorSnapshot,
+    policy: &RestartPolicy,
+    now: Instant,
+) -> bool {
+    state.enabled && state.crash_restarts_in_window(policy.window, now) < policy.max_restarts
 }
 
 const DEFAULT_HEALTH_CADENCE: Duration = Duration::from_secs(30);
@@ -357,15 +409,23 @@ pub struct ModuleStatus {
     pub process_alive: bool,
     pub registration_active: bool,
     pub live: bool,
+    /// Crash restarts spent INSIDE `restart_window` as of this read. Older
+    /// restarts have already released their slot, so this count can go down
+    /// without anybody touching the module.
     pub restart_count: u32,
     /// Replacement processes spawned over this module's entire supervisor lifetime;
-    /// unlike `restart_count`, this value is never reset by an operator action.
+    /// unlike `restart_count`, this value is never reset by an operator action
+    /// and never falls out of a window.
     pub lifetime_restarts: u32,
     /// The budget `restart_count` is spent against. Carried alongside the count
     /// because the count alone does not say how close the module is to being
     /// disabled, and reporting one without the other is what makes an
     /// about-to-be-retired module look ordinary.
     pub max_restarts: u32,
+    /// The span `restart_count` is counted over. Carried with the pair above for
+    /// the same reason they are carried together: "2 of 3" means one thing for a
+    /// ten-minute window and something else entirely for a lifetime.
+    pub restart_window: Duration,
     pub pid: Option<u32>,
     pub spawned_at_ms: Option<u64>,
     pub spawned_from: Option<PathBuf>,
@@ -379,7 +439,12 @@ struct SupervisorSnapshot {
     state: ModuleState,
     enabled: bool,
     process_alive: bool,
-    restart_count: u32,
+    /// When each crash restart was spent, oldest first. This IS the crash
+    /// budget: its in-window length is the count an operator sees and the count
+    /// the restart decision is made against, so there is no second counter that
+    /// can disagree with it. Bounded by `max_restarts`, and cleared by the same
+    /// operator actions that used to zero the old lifetime counter.
+    crash_restarts: VecDeque<Instant>,
     lifetime_restarts: u32,
     pid: Option<u32>,
     spawned_at_ms: Option<u64>,
@@ -404,12 +469,47 @@ impl SupervisorSnapshot {
         Self::new(ModuleState::Failed, true)
     }
 
+    /// Crash restarts still inside `window`, having dropped the ones that are
+    /// not. Pruning on read is what makes the budget a rate: an instant older
+    /// than the window stops holding a slot the moment anybody counts.
+    fn crash_restarts_in_window(&mut self, window: Duration, now: Instant) -> u32 {
+        while let Some(oldest) = self.crash_restarts.front() {
+            if now.duration_since(*oldest) > window {
+                self.crash_restarts.pop_front();
+            } else {
+                break;
+            }
+        }
+        u32::try_from(self.crash_restarts.len()).unwrap_or(u32::MAX)
+    }
+
+    /// Spend one unit of the crash budget and record the restart in the ledger.
+    ///
+    /// The ring is bounded by the cap because more than `max_restarts` in-window
+    /// instants can never be reached (the caller refuses the restart first), so
+    /// anything beyond that is an unbounded queue waiting to happen.
+    fn record_crash_restart(&mut self, policy: &RestartPolicy, now: Instant) {
+        self.crash_restarts.push_back(now);
+        while self.crash_restarts.len() > policy.max_restarts as usize {
+            self.crash_restarts.pop_front();
+        }
+        self.lifetime_restarts += 1;
+    }
+
+    /// Give the module its full budget back, as an operator restart, reload, or
+    /// re-enable does. `lifetime_restarts` deliberately does not move: it is the
+    /// ledger of what actually happened, and an operator action does not unmake
+    /// the crashes.
+    fn clear_crash_restarts(&mut self) {
+        self.crash_restarts.clear();
+    }
+
     fn new(state: ModuleState, enabled: bool) -> Self {
         Self {
             state,
             enabled,
             process_alive: false,
-            restart_count: 0,
+            crash_restarts: VecDeque::new(),
             lifetime_restarts: 0,
             pid: None,
             spawned_at_ms: None,
@@ -995,17 +1095,24 @@ impl Supervisor {
         }
     }
 
+    /// Supervise a configured module with its own health, drain, and crash
+    /// budget. The restart policy is per-module because the config file is:
+    /// `modules.<id>.restart` resolves to a full policy at parse time, and a
+    /// module that is expensive to restart should not be forced onto the same
+    /// budget as one that is cheap.
     pub fn supervise_configured_with_health(
         &self,
         spec: ModuleSpec,
         enabled: bool,
         health: HealthConfig,
         drain_timeout_ms: Option<u64>,
+        restart_policy: RestartPolicy,
     ) -> Result<SupervisedModule, SuperviseError> {
         validate_spec(&spec)?;
 
         let mut runtime = self.runtime_config();
         runtime.health = health;
+        runtime.restart_policy = restart_policy;
         if let Some(ms) = drain_timeout_ms {
             runtime.drain_timeout = Duration::from_millis(ms);
         }
@@ -1081,6 +1188,10 @@ impl Supervisor {
         }));
         let stderr_ring = Arc::clone(&runtime.stderr_ring);
         let terminal_ring = Arc::clone(&runtime.terminal_ring);
+        // The module's OWN policy, which may be its per-module config rather than
+        // the supervisor-wide one; status must report the budget the supervise
+        // loop actually enforces.
+        let restart_policy = runtime.restart_policy;
         let (tx, rx) = mpsc::channel(4);
         let monitor = tokio::spawn(supervise_loop(
             spec.clone(),
@@ -1103,7 +1214,7 @@ impl Supervisor {
                 terminal_ring,
                 commands: tx,
                 monitor: Mutex::new(Some(monitor)),
-                max_restarts: self.restart_policy.max_restarts,
+                restart_policy,
                 provenance_probe: self.provenance_probe.clone(),
             }),
         };
@@ -1139,7 +1250,7 @@ struct SupervisedModuleInner {
     /// Copied from the supervisor's runtime config at spawn so `status()` can
     /// report the restart budget without reaching back into the supervisor. The
     /// policy is fixed for the process's lifetime, so a copy cannot drift.
-    max_restarts: u32,
+    restart_policy: RestartPolicy,
     provenance_probe: ExecutableIdentityProbe,
 }
 
@@ -1239,11 +1350,16 @@ impl SupervisedModule {
         snapshot: &SharedSnapshot,
         caller: Option<&'static str>,
     ) -> Result<ModuleStatus, SuperviseError> {
-        let snapshot = match caller {
+        let mut guard = match caller {
             Some(caller) => lock_snapshot_for_control(snapshot, &self.inner.module_id, caller)?,
             None => lock_snapshot(snapshot)?,
-        }
-        .clone();
+        };
+        // Read the budget through the pruning path so a reader sees the same
+        // in-window count the restart decision would use, not a stale total.
+        let restart_count =
+            guard.crash_restarts_in_window(self.inner.restart_policy.window, Instant::now());
+        let snapshot = guard.clone();
+        drop(guard);
         let registration_active = self
             .inner
             .registry
@@ -1262,9 +1378,10 @@ impl SupervisedModule {
             process_alive: snapshot.process_alive,
             registration_active,
             live,
-            restart_count: snapshot.restart_count,
+            restart_count,
             lifetime_restarts: snapshot.lifetime_restarts,
-            max_restarts: self.inner.max_restarts,
+            max_restarts: self.inner.restart_policy.max_restarts,
+            restart_window: self.inner.restart_policy.window,
             pid: snapshot.pid,
             spawned_at_ms: snapshot.spawned_at_ms,
             spawned_from: snapshot.spawned_from,
@@ -1311,15 +1428,11 @@ impl SupervisedModule {
     }
 
     pub(crate) fn will_recover_after_connection_loss(&self) -> Result<bool, SuperviseError> {
-        let snapshot = lock_snapshot(&self.inner.snapshot)?.clone();
+        let mut snapshot = lock_snapshot(&self.inner.snapshot)?;
         Ok(match snapshot.state {
             ModuleState::Restarting => true,
             ModuleState::Failed | ModuleState::Disabled => false,
-            _ => daemon_will_restart(
-                snapshot.enabled,
-                snapshot.restart_count,
-                self.inner.max_restarts,
-            ),
+            _ => daemon_will_restart(&mut snapshot, &self.inner.restart_policy, Instant::now()),
         })
     }
 
@@ -2239,14 +2352,10 @@ async fn health_restart_child(
     now_ms: u64,
 ) -> Result<(), SuperviseError> {
     let (enabled, will_restart) = {
-        let state = lock_snapshot(snapshot)?;
+        let mut state = lock_snapshot(snapshot)?;
         (
             state.enabled,
-            daemon_will_restart(
-                state.enabled,
-                state.restart_count,
-                runtime.restart_policy.max_restarts,
-            ),
+            daemon_will_restart(&mut state, &runtime.restart_policy, Instant::now()),
         )
     };
 
@@ -2262,7 +2371,8 @@ async fn health_restart_child(
             module_id = %spec.module_id,
             status = ?status,
             detail,
-            restart_count = runtime.restart_policy.max_restarts,
+            max_restarts = runtime.restart_policy.max_restarts,
+            window_secs = runtime.restart_policy.window.as_secs(),
             "health restart budget exhausted; disabling module"
         );
         begin_forwarding_drain_if_configured(
@@ -2288,9 +2398,10 @@ async fn health_restart_child(
         return Ok(());
     }
 
+    let mut restart_count = 0;
     update_snapshot(snapshot, Some(&spec.module_id), |state| {
-        state.restart_count += 1;
-        state.lifetime_restarts += 1;
+        state.record_crash_restart(&runtime.restart_policy, Instant::now());
+        restart_count = state.crash_restarts.len();
         state.state = ModuleState::Unresponsive;
         state.health.status = status;
         state.health.last_action = Some(HealthAction::Restart.to_string());
@@ -2300,7 +2411,7 @@ async fn health_restart_child(
         module_id = %spec.module_id,
         status = ?status,
         detail,
-        restart_count = lock_snapshot(snapshot)?.restart_count,
+        restart_count,
         "health-triggered module restart"
     );
 
@@ -3278,18 +3389,23 @@ async fn on_child_exit(
             );
             let mut should_restart = false;
             let mut disposition = TerminalDisposition::Disabled;
+            // Set only when the budget is what stopped the module, so the
+            // terminal record says which limit was hit rather than leaving
+            // `failed` to be read as "crashed once, badly".
+            let mut disposition_detail = None;
+            let now = Instant::now();
             if let Err(err) = update_snapshot(snapshot, Some(&spec.module_id), |state| {
                 clear_current_process_facts(state);
                 state.last_exit = Some(exit_report.clone());
-                if daemon_will_restart(state.enabled, state.restart_count, policy.max_restarts) {
-                    state.restart_count += 1;
-                    state.lifetime_restarts += 1;
+                if daemon_will_restart(state, &policy, now) {
+                    state.record_crash_restart(&policy, now);
                     state.state = ModuleState::Restarting;
                     should_restart = true;
                     disposition = TerminalDisposition::Restarting;
                 } else if state.enabled {
                     state.state = ModuleState::Failed;
                     disposition = TerminalDisposition::Failed;
+                    disposition_detail = Some(policy.budget_exhausted_detail());
                 } else {
                     state.state = ModuleState::Disabled;
                     disposition = TerminalDisposition::Disabled;
@@ -3300,7 +3416,25 @@ async fn on_child_exit(
                     registration_released: false,
                 };
             }
-            record_terminal(terminal_ring, &exit_report, disposition);
+            if disposition_detail.is_some() {
+                // The window is in the message, not only in the fields: this line
+                // is read in a scrollback where a bare `max_restarts=3` reads as a
+                // lifetime cap and sends the operator looking for three crashes
+                // that never happened together.
+                error!(
+                    module_id = %spec.module_id,
+                    max_restarts = policy.max_restarts,
+                    window_secs = policy.window.as_secs(),
+                    "module stopped: {}",
+                    policy.budget_exhausted_detail()
+                );
+            }
+            record_terminal_with_detail(
+                terminal_ring,
+                &exit_report,
+                disposition,
+                disposition_detail,
+            );
 
             if should_restart {
                 NextAction::Restart
@@ -3380,6 +3514,15 @@ fn record_terminal(
     exit_report: &ExitReport,
     disposition: TerminalDisposition,
 ) {
+    record_terminal_with_detail(terminal_ring, exit_report, disposition, None);
+}
+
+fn record_terminal_with_detail(
+    terminal_ring: &Arc<Mutex<TerminalRing>>,
+    exit_report: &ExitReport,
+    disposition: TerminalDisposition,
+    disposition_detail: Option<String>,
+) {
     terminal_ring
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -3389,6 +3532,7 @@ fn record_terminal(
             at_ms: exit_report.at_ms,
             disposition,
             exit_kind: exit_report.kind.into(),
+            disposition_detail,
         });
 }
 
@@ -4000,15 +4144,11 @@ async fn handle_reload_spawn_failure(
     reason: String,
 ) -> Result<(), SuperviseError> {
     let mut should_retry = false;
+    let now = Instant::now();
     update_snapshot(snapshot, Some(&spec.module_id), |state| {
         clear_current_process_facts(state);
-        if daemon_will_restart(
-            state.enabled,
-            state.restart_count,
-            runtime.restart_policy.max_restarts,
-        ) {
-            state.restart_count += 1;
-            state.lifetime_restarts += 1;
+        if daemon_will_restart(state, &runtime.restart_policy, now) {
+            state.record_crash_restart(&runtime.restart_policy, now);
             state.state = ModuleState::Restarting;
             should_retry = true;
         } else if state.enabled {
@@ -4250,9 +4390,14 @@ fn exit_signal(_status: &ExitStatus) -> Option<i32> {
     None
 }
 
+/// Give an operator-touched module its full crash budget back.
+///
+/// Named for the counter it used to zero; it now empties the in-window ring,
+/// which is the same act. `lifetime_restarts` is untouched on purpose -- the
+/// ledger of what happened survives every operator action.
 fn reset_restart_count(snapshot: &SharedSnapshot, module_id: &str) -> Result<(), SuperviseError> {
     update_snapshot(snapshot, Some(module_id), |state| {
-        state.restart_count = 0;
+        state.clear_crash_restarts();
     })
 }
 
@@ -4382,10 +4527,16 @@ mod terminal_history_tests {
         apply_deliberate_severance_marker, daemon_will_restart, drain_child_to_state,
         drained_after_quiescence_wait, handle_reload_spawn_failure, health_restart_child,
         lock_snapshot, on_child_exit, record_deliberate_severance, record_terminal,
-        spawn_and_mark_running, update_snapshot, wait_error_exit_report, ExitKind, ExitReport,
-        ModuleSpec, ModuleState, NextAction, ProcessIdentity, RestartPolicy, SuperviseError,
-        SupervisedModule, Supervisor, SupervisorHandle, SupervisorHealthStatus, SupervisorSnapshot,
+        reset_restart_count, spawn_and_mark_running, update_snapshot, wait_error_exit_report,
+        ExitKind, ExitReport, ModuleSpec, ModuleState, NextAction, ProcessIdentity, RestartPolicy,
+        SuperviseError, SupervisedModule, Supervisor, SupervisorHandle, SupervisorHealthStatus,
+        SupervisorSnapshot,
     };
+    // The supervisor's clock, distinct from the `std::time::Instant` these tests
+    // use for their own wall-clock deadlines: crash-restart instants must be on
+    // the same clock the production code stamps them with, which is tokio's (and
+    // is what `start_paused` tests can move).
+    use super::Instant as ClockInstant;
     use crate::{
         registry::Registry,
         terminal_ring::{TerminalRing, TerminalRingConfig},
@@ -4460,11 +4611,74 @@ mod terminal_history_tests {
             .is_some());
     }
 
+    /// Put `count` crash restarts on a snapshot's ring as if they had all just
+    /// happened, which is what "spent budget" looks like to every reader.
+    fn seed_crash_restarts(state: &mut SupervisorSnapshot, count: u32) {
+        let now = ClockInstant::now();
+        for _ in 0..count {
+            state.crash_restarts.push_back(now);
+        }
+    }
+
+    /// Age the oldest recorded restart out of `window`, standing in for the hours
+    /// that would otherwise have to pass. Injecting the instant is the point: a
+    /// test that slept a real window would take ten minutes and still prove less.
+    fn age_oldest_crash_restart_out_of_window(state: &mut SupervisorSnapshot, window: Duration) {
+        let aged = state
+            .crash_restarts
+            .front()
+            .expect("a crash restart must be recorded before it can be aged")
+            .checked_sub(window + Duration::from_secs(1))
+            .expect("the test clock is far enough from its origin to age an instant");
+        state.crash_restarts[0] = aged;
+    }
+
+    fn snapshot_with_restarts(enabled: bool, count: u32) -> SupervisorSnapshot {
+        let mut state = SupervisorSnapshot::new(ModuleState::Running, enabled);
+        seed_crash_restarts(&mut state, count);
+        state
+    }
+
     #[test]
     fn daemon_owned_recovery_predicate_uses_the_pre_increment_budget() {
-        assert!(daemon_will_restart(true, 2, 3));
-        assert!(!daemon_will_restart(true, 3, 3));
-        assert!(!daemon_will_restart(false, 0, 3));
+        let policy = RestartPolicy::new(3, Duration::ZERO);
+        let now = ClockInstant::now();
+        assert!(daemon_will_restart(
+            &mut snapshot_with_restarts(true, 2),
+            &policy,
+            now
+        ));
+        assert!(!daemon_will_restart(
+            &mut snapshot_with_restarts(true, 3),
+            &policy,
+            now
+        ));
+        assert!(!daemon_will_restart(
+            &mut snapshot_with_restarts(false, 0),
+            &policy,
+            now
+        ));
+    }
+
+    /// The budget is a rate: the same three spent restarts refuse a respawn
+    /// while they are recent and allow one once they have aged past the window.
+    /// Nothing about the module changed in between, which is the whole point.
+    #[test]
+    fn a_budget_spent_before_the_window_no_longer_refuses() {
+        let policy = RestartPolicy::new(3, Duration::ZERO);
+        let mut state = snapshot_with_restarts(true, 3);
+        let now = ClockInstant::now();
+        assert!(!daemon_will_restart(&mut state, &policy, now));
+
+        assert!(daemon_will_restart(
+            &mut state,
+            &policy,
+            now + policy.window + Duration::from_secs(1)
+        ));
+        assert!(
+            state.crash_restarts.is_empty(),
+            "reading the budget must drop the instants that left the window"
+        );
     }
 
     fn module_with_recovery_snapshot(
@@ -4491,7 +4705,7 @@ mod terminal_history_tests {
             |snapshot| {
                 snapshot.state = state;
                 snapshot.enabled = enabled;
-                snapshot.restart_count = restart_count;
+                seed_crash_restarts(snapshot, restart_count);
             },
         )
         .unwrap();
@@ -4641,7 +4855,7 @@ mod terminal_history_tests {
         ));
         let (crash_restarts, crash_lifetime) = {
             let state = lock_snapshot(&crash_snapshot).unwrap();
-            (state.restart_count, state.lifetime_restarts)
+            (state.crash_restarts.len(), state.lifetime_restarts)
         };
         assert_eq!(crash_restarts, 1);
         assert_eq!(crash_lifetime, 1);
@@ -4665,7 +4879,7 @@ mod terminal_history_tests {
         ));
         let (health_restarts, health_lifetime) = {
             let state = lock_snapshot(&health_snapshot).unwrap();
-            (state.restart_count, state.lifetime_restarts)
+            (state.crash_restarts.len(), state.lifetime_restarts)
         };
         assert_eq!(health_restarts, 1);
         assert_eq!(health_lifetime, 1);
@@ -4686,7 +4900,7 @@ mod terminal_history_tests {
         ));
         let (reload_restarts, reload_lifetime) = {
             let state = lock_snapshot(&reload_snapshot).unwrap();
-            (state.restart_count, state.lifetime_restarts)
+            (state.crash_restarts.len(), state.lifetime_restarts)
         };
         assert_eq!(reload_restarts, 1);
         assert_eq!(reload_lifetime, 1);
@@ -4739,7 +4953,7 @@ mod terminal_history_tests {
         ));
         let state = lock_snapshot(&snapshot).unwrap();
         assert_eq!(state.lifetime_restarts, 1);
-        assert_eq!(state.restart_count, 0);
+        assert_eq!(state.crash_restarts.len(), 0);
     }
 
     #[tokio::test]
@@ -4778,7 +4992,233 @@ mod terminal_history_tests {
         ));
         let state = lock_snapshot(&snapshot).unwrap();
         assert_eq!(state.lifetime_restarts, 1);
-        assert_eq!(state.restart_count, 1);
+        assert_eq!(state.crash_restarts.len(), 1);
+    }
+
+    fn crash_exit_report(at_ms: u64) -> ExitReport {
+        ExitReport {
+            kind: ExitKind::Crash,
+            code: Some(1),
+            signal: None,
+            at_ms,
+        }
+    }
+
+    fn windowed_crash_spec(module_id: &str) -> ModuleSpec {
+        ModuleSpec {
+            module_id: module_id.to_string(),
+            program: PathBuf::from("/unused").join(module_id),
+            args: Vec::new(),
+            env: Vec::new(),
+            reserved: false,
+            reserved_prefixes: Vec::new(),
+        }
+    }
+
+    /// A real crash loop still stops. Three crashes with nothing aging out spend
+    /// a budget of two and the third respawn is refused, and both surfaces an
+    /// operator has -- the log line and the retained terminal record -- name the
+    /// window rather than only the cap, because `max_restarts=2` alone is what
+    /// this budget used to mean.
+    #[tokio::test]
+    async fn three_crashes_inside_the_window_stop_the_module_and_name_the_window() {
+        let (logs, _guard) = crate::router::test_log::log_capture(tracing::Level::ERROR);
+        let supervisor = Supervisor::new(
+            Arc::new(Registry::default()),
+            RestartPolicy::new(2, Duration::ZERO),
+        );
+        let runtime = supervisor.runtime_config();
+        let spec = windowed_crash_spec("crash-loop-in-window");
+        let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
+
+        for attempt in 1..=2 {
+            assert!(
+                matches!(
+                    on_child_exit(
+                        &spec,
+                        runtime.restart_policy,
+                        &supervisor.registry,
+                        &snapshot,
+                        &runtime.terminal_ring,
+                        crash_exit_report(attempt),
+                    )
+                    .await,
+                    NextAction::Restart
+                ),
+                "crash {attempt} is inside the budget and must respawn"
+            );
+        }
+
+        assert!(matches!(
+            on_child_exit(
+                &spec,
+                runtime.restart_policy,
+                &supervisor.registry,
+                &snapshot,
+                &runtime.terminal_ring,
+                crash_exit_report(3),
+            )
+            .await,
+            NextAction::Stop { .. }
+        ));
+
+        {
+            let state = lock_snapshot(&snapshot).unwrap();
+            assert_eq!(state.state, ModuleState::Failed);
+            assert_eq!(state.crash_restarts.len(), 2);
+            assert_eq!(state.lifetime_restarts, 2);
+        }
+
+        let history = runtime
+            .terminal_ring
+            .lock()
+            .expect("terminal ring is not poisoned")
+            .snapshot();
+        let last = history
+            .entries
+            .last()
+            .expect("the refused crash is retained");
+        assert_eq!(last.disposition, TerminalDisposition::Failed);
+        assert_eq!(
+            last.disposition_detail.as_deref(),
+            Some("crash budget exhausted: max_restarts=2 within window_secs=600")
+        );
+
+        let captured = crate::router::test_log::captured_logs(&logs);
+        assert!(
+            captured.contains("crash budget exhausted: max_restarts=2 within window_secs=600"),
+            "the stop must be logged with its window: {captured}"
+        );
+    }
+
+    /// The rate, stated as a test: three crashes where the first has aged past
+    /// the window are two crashes as far as the budget is concerned, so the
+    /// third respawn is allowed and the ring holds only the two recent ones.
+    ///
+    /// This is the case a lifetime counter got wrong -- and the case the daemon
+    /// now hits routinely, since a module exits non-zero every time its
+    /// connection to the daemon drops.
+    #[tokio::test]
+    async fn a_crash_older_than_the_window_frees_its_slot_for_a_later_crash() {
+        let supervisor = Supervisor::new(
+            Arc::new(Registry::default()),
+            RestartPolicy::new(2, Duration::ZERO),
+        );
+        let runtime = supervisor.runtime_config();
+        let spec = windowed_crash_spec("crash-across-windows");
+        let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
+
+        for attempt in 1..=2 {
+            assert!(matches!(
+                on_child_exit(
+                    &spec,
+                    runtime.restart_policy,
+                    &supervisor.registry,
+                    &snapshot,
+                    &runtime.terminal_ring,
+                    crash_exit_report(attempt),
+                )
+                .await,
+                NextAction::Restart
+            ));
+        }
+
+        // The oldest crash moves out of the window; nothing else about the
+        // module changes.
+        update_snapshot(&snapshot, Some(&spec.module_id), |state| {
+            age_oldest_crash_restart_out_of_window(state, runtime.restart_policy.window);
+        })
+        .unwrap();
+
+        assert!(
+            matches!(
+                on_child_exit(
+                    &spec,
+                    runtime.restart_policy,
+                    &supervisor.registry,
+                    &snapshot,
+                    &runtime.terminal_ring,
+                    crash_exit_report(3),
+                )
+                .await,
+                NextAction::Restart
+            ),
+            "a crash older than the window must not hold a budget slot"
+        );
+
+        let state = lock_snapshot(&snapshot).unwrap();
+        assert_eq!(state.state, ModuleState::Restarting);
+        assert_eq!(
+            state.crash_restarts.len(),
+            2,
+            "the aged instant is dropped and the new one takes its place"
+        );
+        assert_eq!(
+            state.lifetime_restarts, 3,
+            "the ledger counts every restart, including the ones the window forgot"
+        );
+    }
+
+    /// An operator restart hands the budget back whole, and the ledger keeps
+    /// counting. Those are different questions -- "how close is this module to
+    /// being stopped" and "how many times has it been replaced" -- and the
+    /// operator action answers only the first.
+    #[tokio::test]
+    async fn an_operator_restart_clears_the_ring_and_leaves_the_ledger_alone() {
+        let supervisor = Supervisor::new(
+            Arc::new(Registry::default()),
+            RestartPolicy::new(2, Duration::ZERO),
+        );
+        let runtime = supervisor.runtime_config();
+        let spec = windowed_crash_spec("operator-cleared-budget");
+        let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
+
+        for attempt in 1..=2 {
+            assert!(matches!(
+                on_child_exit(
+                    &spec,
+                    runtime.restart_policy,
+                    &supervisor.registry,
+                    &snapshot,
+                    &runtime.terminal_ring,
+                    crash_exit_report(attempt),
+                )
+                .await,
+                NextAction::Restart
+            ));
+        }
+
+        reset_restart_count(&snapshot, &spec.module_id).unwrap();
+        {
+            let state = lock_snapshot(&snapshot).unwrap();
+            assert!(
+                state.crash_restarts.is_empty(),
+                "an operator restart returns the full budget"
+            );
+            assert_eq!(
+                state.lifetime_restarts, 2,
+                "clearing the budget must not unmake the crashes"
+            );
+        }
+
+        assert!(
+            matches!(
+                on_child_exit(
+                    &spec,
+                    runtime.restart_policy,
+                    &supervisor.registry,
+                    &snapshot,
+                    &runtime.terminal_ring,
+                    crash_exit_report(3),
+                )
+                .await,
+                NextAction::Restart
+            ),
+            "the cleared budget must be spendable again"
+        );
+        let state = lock_snapshot(&snapshot).unwrap();
+        assert_eq!(state.crash_restarts.len(), 1);
+        assert_eq!(state.lifetime_restarts, 3);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4862,7 +5302,7 @@ mod terminal_history_tests {
             Some(ExitKind::DeliberateSeverance)
         );
         assert_eq!(state.lifetime_restarts, 1);
-        assert_eq!(state.restart_count, 0);
+        assert_eq!(state.crash_restarts.len(), 0);
         drop(state);
         let history = runtime.terminal_ring.lock().unwrap().snapshot();
         assert_eq!(
@@ -4909,7 +5349,7 @@ mod terminal_history_tests {
             Some(ExitKind::Crash)
         );
         assert_eq!(state.lifetime_restarts, 0);
-        assert_eq!(state.restart_count, 0);
+        assert_eq!(state.crash_restarts.len(), 0);
     }
 
     #[test]

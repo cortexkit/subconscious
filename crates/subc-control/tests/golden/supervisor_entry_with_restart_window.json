@@ -1,0 +1,12 @@
+{
+  "enabled": true,
+  "health": "degraded",
+  "last_exit_ms": 1700000000123,
+  "last_probe_ms": 1700000000000,
+  "live": true,
+  "max_restarts": 3,
+  "module_id": "aft-tools",
+  "restart_count": 2,
+  "restart_window_secs": 600,
+  "state": "running"
+}

@@ -428,13 +428,26 @@ impl SubscriptionCancel {
 }
 
 impl SubcConsumer {
-    /// Connect, authenticate, and start the connection's I/O. The epoch starts at 1.
+    /// Connect through an explicit connection-file path. The initial connection
+    /// generation uses epoch 1; each reconnect advances it.
     pub async fn connect(
         connection_file: &Path,
         opts: ConsumerOptions,
     ) -> Result<Self, ConsumerError> {
         let opened = open_connection(connection_file, opts.handshake_timeout).await?;
         let shared = Arc::new(Shared::new(connection_file.to_path_buf(), opts));
+        shared.install_initial(opened)?;
+        Ok(Self { shared })
+    }
+
+    /// Discover the daemon's connection file, authenticate, and start the I/O loop.
+    pub async fn connect_default(opts: ConsumerOptions) -> Result<Self, ConsumerError> {
+        let discovered = connection_file::discover(None)
+            .map_err(|source| ConsumerError::Discovery { source })?;
+        let opened =
+            open_connection_with_info(&discovered.path, &discovered.info, opts.handshake_timeout)
+                .await?;
+        let shared = Arc::new(Shared::new(discovered.path, opts));
         shared.install_initial(opened)?;
         Ok(Self { shared })
     }
@@ -1052,9 +1065,12 @@ impl Drop for SubcConsumer {
     }
 }
 
-/// Error returned by [`SubcConsumer::connect`].
+/// Error returned by [`SubcConsumer::connect`] or [`SubcConsumer::connect_default`].
 #[derive(Debug)]
 pub enum ConsumerError {
+    Discovery {
+        source: connection_file::DiscoveryError,
+    },
     ConnectionFile {
         path: PathBuf,
         source: ConnectionFileError,
@@ -1078,6 +1094,7 @@ pub enum ConsumerError {
 impl fmt::Display for ConsumerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Discovery { source } => source.fmt(f),
             Self::ConnectionFile { path, source } => write!(
                 f,
                 "failed to read subc connection file '{}': {source}",
@@ -1116,6 +1133,7 @@ impl fmt::Display for ConsumerError {
 impl Error for ConsumerError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::Discovery { source } => Some(source),
             Self::ConnectionFile { source, .. } => Some(source),
             Self::Connect { source, .. } => Some(source),
             Self::Auth { source, .. } => Some(source),
@@ -3402,6 +3420,14 @@ async fn open_connection(
             path: path.to_path_buf(),
             source,
         })?;
+    open_connection_with_info(path, &conn, deadline).await
+}
+
+async fn open_connection_with_info(
+    path: &Path,
+    conn: &connection_file::ConnectionInfo,
+    deadline: Duration,
+) -> Result<OpenedConnection, ConsumerError> {
     let endpoint = conn
         .endpoints
         .first()
@@ -3424,7 +3450,7 @@ async fn open_connection(
     // dependency here, and a socket too broken to take the option fails the
     // handshake on the next line with a typed error.
     let _ = stream.set_nodelay(true);
-    authenticate_client(&mut stream, &conn, deadline)
+    authenticate_client(&mut stream, conn, deadline)
         .await
         .map_err(|source| ConsumerError::Auth {
             path: path.to_path_buf(),
@@ -3872,7 +3898,9 @@ fn is_reconnect_transient(err: &ConsumerError) -> bool {
         // every attempt. First-connect auth failures stay permanent: connect()
         // surfaces them directly without entering the reconnect classifier.
         ConsumerError::Auth { .. } => true,
-        ConsumerError::NoEndpoint { .. } | ConsumerError::Closed => false,
+        ConsumerError::Discovery { .. }
+        | ConsumerError::NoEndpoint { .. }
+        | ConsumerError::Closed => false,
     }
 }
 

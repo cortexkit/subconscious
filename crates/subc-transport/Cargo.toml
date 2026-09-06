@@ -1,6 +1,6 @@
 [package]
 name = "subc-transport"
-version = "0.5.2"
+version = "0.6.0"
 edition = "2021"
 publish = true
 description = "subc loopback-TCP + key transport: pre-envelope auth handshake, connection-file discovery, and async envelope frame I/O."
@@ -16,6 +16,9 @@ sha2 = "0.10"
 subc-protocol = { path = "../subc-protocol", version = "0.18" }
 subtle = "2"
 tokio = { version = "1", features = ["io-util", "time"] }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", default-features = false, features = ["process"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "time", "test-util"] }

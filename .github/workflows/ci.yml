@@ -7,6 +7,14 @@ on:
   # Reusable so release.yml gates publish on the exact same matrix —
   # release-time and PR-time CI can never drift.
   workflow_call:
+  # The push gate asks "is this change good"; this run asks "is what already
+  # landed still good against the world as it is now". This workspace has no
+  # sibling path dependencies, so the world that moves under it is the
+  # toolchain (`@stable` grows lints that redden a green master) and the
+  # registry. A red here with no commit of ours is that class, not a
+  # regression, and it must not wait for the next unrelated push to surface.
+  schedule:
+    - cron: '0 6 * * *'
 
 concurrency:
   # Deliberate: rapid pushes to the same ref cancel the earlier runs, so only the

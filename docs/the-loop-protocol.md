@@ -6,7 +6,10 @@ finding at source before authorizing any fix, then merges and gates each round a
 starts again. Findings never get fixed on the mason's say-so; the verification gate
 is the whole point.
 
-Invoke by pointing Alfonso at this file: "run THE LOOP on <repo>".
+Invoke by pointing Alfonso at this file: "run THE LOOP on <repo>". It is also a
+knowhow skill: `knowhow({ id: "the-loop" })` returns the same protocol (user tier,
+`~/.cortexkit/skills/the-loop/SKILL.md`). This file is the source of truth; edit it
+first, then the skill.
 
 This is the shared copy. It lives in tracked `docs/` rather than under
 `.cortexkit/`, which is gitignored fleet-wide -- a protocol only one machine can

@@ -12208,3 +12208,14 @@ as unprotected. Read `default_branch` from the repo object first, then ask
 that branch, and match the 404 MESSAGE, not the code. (QTA, 2026-09-06: my
 "AFT and CKCRED both unprotected" was this — AFT has 25 contexts +
 enforce_admins on `main`; claustrum and insula use `master`.)
+
+## Spot-checking a live WAL-mode SQLite store: never `cp`
+
+A file copy of `store.db` misses committed frames still in `store.db-wal`, so
+the copy reads as an OLDER schema/state than the live database, and
+`integrity_check` passes on it. It fails as a wrong answer about your own
+store, not as an error. Copy with `sqlite3 "file:<path>?mode=ro" ".backup
+<copy>"` (resolves the WAL); read in place with `?mode=ro` URIs. (FUSI,
+2026-09-06: a `cp` copy of the v5 store read back as v4 and briefly looked
+like the daemon had not migrated. Same trap ENGRAM named for backup
+enrollment — `backup-api-live`, never file copy.)

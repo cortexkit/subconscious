@@ -24,14 +24,11 @@ use std::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use subc_control::{CatalogEntry, ClientControlRequest, ClientControlResponse};
-// The connection-file name embeds a per-user token. `ck` must derive it the same
-// way the daemon does, so it imports the daemon's function rather than carrying
-// a copy -- these two used to be byte-identical duplicates in different files,
-// with nothing asserting they agreed.
-use subc_core::bootstrap::user_connection_token;
 use subc_core::{fleet_lint, read_frame, write_frame, Frame};
 use subc_protocol::{BindIdentity, Flags, FrameType, Priority, RouteTarget};
-use subc_transport::{authenticate_client, connection_file, ConnectionFileError, ConnectionInfo};
+use subc_transport::{
+    authenticate_client, connection_file, ConnectionInfo, DiscoveryError, TriedCandidate,
+};
 use tokio::{net::TcpStream, time};
 
 const AUTH_DEADLINE: Duration = Duration::from_secs(2);
@@ -42,8 +39,6 @@ const CONNECTION_FILE_NAME: &str = "subc-connection.json";
 const TRIAGE_LOG_MAX_BYTES: u64 = 64 * 1024;
 const TRIAGE_LOG_TAIL_LINES: usize = 20;
 const EXPECTED_DAEMON_BINARY: &str = "ck-subc";
-const PROD_CONNECTION_RELATIVE_PATH: &[&str] =
-    &[".local", "share", "cortexkit", "run", CONNECTION_FILE_NAME];
 const QUOTA_MODULE_ID: &str = "insula";
 const CK_HARNESS: &str = "ck";
 
@@ -2143,7 +2138,8 @@ fn format_bytes(bytes: u64) -> String {
 }
 
 fn daemon_triage(override_path: Option<&Path>, json_output: bool) -> Result<(), CkError> {
-    let candidates = connection_file_candidates(override_path);
+    let env_named = env::var_os("SUBC_CONNECTION_FILE").filter(|value| !value.is_empty());
+    let candidates = connection_file::discovery_candidates(override_path, env_named.as_deref());
     let run_dir = candidates
         .first()
         .and_then(|path| path.parent())
@@ -5583,102 +5579,11 @@ fn take_value(args: &mut impl Iterator<Item = OsString>, flag: &str) -> Result<O
 }
 
 fn discover_connection_file(override_path: Option<&Path>) -> Result<ResolvedConnection, CkError> {
-    let candidates = connection_file_candidates(override_path);
-    let mut tried = Vec::new();
-
-    for path in candidates {
-        match connection_file::read_for_client(&path) {
-            Ok(info) => return Ok(ResolvedConnection { path, info }),
-            Err(source) => tried.push(TriedConnectionFile {
-                path,
-                reason: discovery_reason(&source),
-            }),
-        }
-    }
-
-    Err(CkError::Discovery { tried })
-}
-
-fn connection_file_candidates(override_path: Option<&Path>) -> Vec<PathBuf> {
-    connection_file_candidates_with(
-        override_path,
-        non_empty_os_var("SUBC_CONNECTION_FILE").map(PathBuf::from),
-    )
-}
-
-/// The candidate list, with the environment-named path passed in rather than read.
-///
-/// Taking it as a parameter is what makes the exclusivity rule below testable:
-/// reading it here would force a test to mutate the process environment, which
-/// races under threaded test execution.
-fn connection_file_candidates_with(
-    override_path: Option<&Path>,
-    env_named: Option<PathBuf>,
-) -> Vec<PathBuf> {
-    if let Some(path) = override_path {
-        return vec![path.to_path_buf()];
-    }
-
-    // SUBC_CONNECTION_FILE names the daemon the caller means, so it is EXCLUSIVE
-    // rather than first-in-a-list. It used to be pushed ahead of the discovery
-    // candidates, which reads as honouring it and is not: a path that is set and
-    // wrong falls through to discovery and answers from whichever daemon is found
-    // -- in practice production. The reply is then true and about the wrong
-    // machine, and every later verdict inherits that while the operator believes
-    // they are reading a rig.
-    //
-    // A fallback is only a hazard where the primary is optional, so removing the
-    // fallback for a deliberately supplied value removes the class. Returning a
-    // single candidate keeps the existing error path: the file is stat-ed, and an
-    // unreadable one is reported as a failure naming that path.
-    if let Some(only) = env_named {
-        return vec![only];
-    }
-
-    let mut candidates = Vec::new();
-    if let Some(runtime_dir) = non_empty_os_var("XDG_RUNTIME_DIR") {
-        push_unique(
-            &mut candidates,
-            PathBuf::from(runtime_dir).join(CONNECTION_FILE_NAME),
-        );
-    }
-    if let Some(home) = non_empty_os_var("HOME") {
-        let mut path = PathBuf::from(home);
-        for part in PROD_CONNECTION_RELATIVE_PATH {
-            path.push(part);
-        }
-        push_unique(&mut candidates, path);
-    }
-    push_unique(&mut candidates, temp_fallback_connection_file_path());
-    candidates
-}
-
-fn push_unique(paths: &mut Vec<PathBuf>, path: PathBuf) {
-    if !paths.iter().any(|existing| existing == &path) {
-        paths.push(path);
-    }
-}
-
-fn temp_fallback_connection_file_path() -> PathBuf {
-    env::temp_dir().join(format!("subc-{}.connection.json", user_connection_token()))
-}
-
-fn non_empty_os_var(key: &str) -> Option<OsString> {
-    let value = env::var_os(key)?;
-    if value.is_empty() {
-        None
-    } else {
-        Some(value)
-    }
-}
-
-fn discovery_reason(source: &ConnectionFileError) -> String {
-    match source {
-        ConnectionFileError::Io { source, .. } if source.kind() == std::io::ErrorKind::NotFound => {
-            "not found".to_string()
-        }
-        other => other.to_string(),
-    }
+    let discovered = connection_file::discover(override_path).map_err(CkError::from)?;
+    Ok(ResolvedConnection {
+        path: discovered.path,
+        info: discovered.info,
+    })
 }
 
 fn decode_error_body(body: &[u8]) -> String {
@@ -5717,16 +5622,10 @@ fn decorate_error(error: CkError, json_output: bool, subc: Option<&Path>) -> CkE
 }
 
 #[derive(Debug)]
-struct TriedConnectionFile {
-    path: PathBuf,
-    reason: String,
-}
-
-#[derive(Debug)]
 enum CkError {
     Usage(String),
     Discovery {
-        tried: Vec<TriedConnectionFile>,
+        tried: Vec<TriedCandidate>,
     },
     Connection {
         path: PathBuf,
@@ -5757,6 +5656,14 @@ enum CkError {
         exit_code: i32,
     },
     Json(serde_json::Error),
+}
+
+impl From<DiscoveryError> for CkError {
+    fn from(source: DiscoveryError) -> Self {
+        Self::Discovery {
+            tried: source.tried,
+        }
+    }
 }
 
 impl CkError {
@@ -6602,42 +6509,24 @@ mod tests {
         }
     }
 
-    /// A connection file named in the environment must be the ONLY candidate.
-    ///
-    /// It used to be pushed ahead of the discovery paths, which reads as honouring
-    /// it and is not: a path that is set and wrong falls through and answers from
-    /// whichever daemon discovery finds, in practice production. The reply is then
-    /// true and about the wrong machine. This cost a real operation, where a
-    /// mistyped rig path reported a production module as healthy one step before a
-    /// stop command.
     #[test]
-    fn an_environment_named_connection_file_is_the_only_candidate() {
-        let named = PathBuf::from("/rig/x.json");
-        let candidates = connection_file_candidates_with(None, Some(named.clone()));
-        assert_eq!(
-            candidates,
-            vec![named.clone()],
-            "a named connection file must not be followed by discovery paths"
-        );
+    fn discovery_error_mapping_keeps_cli_rendering_byte_identical() {
+        let source = DiscoveryError {
+            tried: vec![
+                TriedCandidate {
+                    path: PathBuf::from("/rig/missing.json"),
+                    reason: "not found".to_owned(),
+                },
+                TriedCandidate {
+                    path: PathBuf::from("/prod/malformed.json"),
+                    reason: "invalid connection file".to_owned(),
+                },
+            ],
+        };
 
-        // Absence must still produce candidates, or discovery could never run and
-        // the assertion above would hold for the wrong reason.
-        //
-        // The property is that discovery RAN and produced something other than the
-        // named path -- not how many candidates it found. An earlier version
-        // asserted a count above one, which is a Unix-shaped proxy: Windows has no
-        // XDG runtime dir and no HOME, so its discovery correctly yields exactly
-        // one candidate (the per-user temp path the daemon actually publishes to).
-        // The count stood in for the property and disagreed with it on a platform
-        // where the code was right.
-        let discovered = connection_file_candidates_with(None, None);
-        assert!(
-            !discovered.is_empty(),
-            "without a named file, discovery must offer at least one candidate"
-        );
-        assert!(
-            !discovered.contains(&named),
-            "discovery must not reach for the named path it was not given"
+        assert_eq!(
+            CkError::from(source).to_string(),
+            "no usable subc connection file found; tried: /rig/missing.json (not found), /prod/malformed.json (invalid connection file)"
         );
     }
 

@@ -51,6 +51,9 @@ pub use subc_protocol::{
     session::{HealthReport, HealthStatus},
     AdmissionClass, SUBC_PROTOCOL_CRATE_VERSION,
 };
+pub use subc_transport::connection_file::{
+    discover, discovery_candidates, Discovered, DiscoveryError,
+};
 
 use subc_transport::{
     authenticate_client, connection_file, read_frame, write_frame, AuthError, ConnectionFileError,

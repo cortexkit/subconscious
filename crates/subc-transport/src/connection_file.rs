@@ -1,5 +1,7 @@
 use std::{
+    env,
     error::Error,
+    ffi::{OsStr, OsString},
     fmt,
     fs::{self, File, OpenOptions},
     io::{self, Write},
@@ -15,6 +17,10 @@ pub const SCHEMA_VERSION: u32 = 1;
 pub const MIN_KEY_LEN: usize = 32;
 pub const KEY_LEN: usize = 32;
 pub const DAEMON_ID_LEN: usize = 16;
+
+const CONNECTION_FILE_NAME: &str = "subc-connection.json";
+const PROD_CONNECTION_RELATIVE_PATH: &[&str] =
+    &[".local", "share", "cortexkit", "run", CONNECTION_FILE_NAME];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Endpoint {
@@ -49,6 +55,40 @@ impl fmt::Debug for ConnectionInfo {
             .finish()
     }
 }
+
+/// A connection file selected by reader-side discovery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Discovered {
+    pub path: PathBuf,
+    pub info: ConnectionInfo,
+}
+
+/// One connection-file candidate that could not be read or parsed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TriedCandidate {
+    pub path: PathBuf,
+    pub reason: String,
+}
+
+/// Every connection-file candidate reader-side discovery tried.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveryError {
+    pub tried: Vec<TriedCandidate>,
+}
+
+impl fmt::Display for DiscoveryError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let rendered = self
+            .tried
+            .iter()
+            .map(|attempt| format!("{} ({})", attempt.path.display(), attempt.reason))
+            .collect::<Vec<_>>()
+            .join(", ");
+        write!(f, "no usable subc connection file found; tried: {rendered}")
+    }
+}
+
+impl Error for DiscoveryError {}
 
 impl ConnectionInfo {
     pub fn validate(&self) -> Result<(), ConnectionFileError> {
@@ -228,6 +268,158 @@ pub fn read_for_client(path: impl AsRef<Path>) -> Result<ConnectionInfo, Connect
     let info = read(path)?;
     info.validate_wire_version(PROTOCOL_VERSION)?;
     Ok(info)
+}
+
+/// The paths a reader consults, most specific first. `explicit` is the
+/// caller's own override (a `--subc` flag); `env_named` is the value of
+/// `SUBC_CONNECTION_FILE` read by the caller. Either, when present, is the
+/// ONLY candidate.
+pub fn discovery_candidates(explicit: Option<&Path>, env_named: Option<&OsStr>) -> Vec<PathBuf> {
+    let runtime_dir = non_empty_os_var("XDG_RUNTIME_DIR");
+    let home = non_empty_os_var("HOME");
+    discovery_candidates_with_environment(
+        explicit,
+        env_named,
+        runtime_dir.as_deref(),
+        home.as_deref(),
+        &env::temp_dir(),
+    )
+}
+
+/// Read the reader-side environment and return the first usable connection file.
+/// Unlike writer-side `subc_core::bootstrap::connection_file_path()`, this searches
+/// every location where an already-running daemon may have written its file.
+pub fn discover(explicit: Option<&Path>) -> Result<Discovered, DiscoveryError> {
+    let env_named = non_empty_os_var("SUBC_CONNECTION_FILE");
+    discover_candidates(discovery_candidates(explicit, env_named.as_deref()))
+}
+
+fn discovery_candidates_with_environment(
+    explicit: Option<&Path>,
+    env_named: Option<&OsStr>,
+    runtime_dir: Option<&OsStr>,
+    home: Option<&OsStr>,
+    temp_dir: &Path,
+) -> Vec<PathBuf> {
+    if let Some(path) = explicit {
+        return vec![path.to_path_buf()];
+    }
+
+    // SUBC_CONNECTION_FILE names the daemon the caller means, so it is EXCLUSIVE
+    // rather than first-in-a-list. It used to be pushed ahead of the discovery
+    // candidates, which reads as honouring it and is not: a path that is set and
+    // wrong falls through to discovery and answers from whichever daemon is found
+    // -- in practice production. The reply is then true and about the wrong
+    // machine, and every later verdict inherits that while the operator believes
+    // they are reading a rig.
+    //
+    // A fallback is only a hazard where the primary is optional, so removing the
+    // fallback for a deliberately supplied value removes the class. Returning a
+    // single candidate keeps the existing error path: the file is stat-ed, and an
+    // unreadable one is reported as a failure naming that path.
+    if let Some(only) = env_named {
+        return vec![PathBuf::from(only)];
+    }
+
+    let mut candidates = Vec::new();
+    if let Some(runtime_dir) = runtime_dir {
+        push_unique(
+            &mut candidates,
+            PathBuf::from(runtime_dir).join(CONNECTION_FILE_NAME),
+        );
+    }
+    if let Some(home) = home {
+        let mut path = PathBuf::from(home);
+        for part in PROD_CONNECTION_RELATIVE_PATH {
+            path.push(part);
+        }
+        push_unique(&mut candidates, path);
+    }
+    push_unique(
+        &mut candidates,
+        temp_dir.join(format!("subc-{}.connection.json", user_connection_token())),
+    );
+    candidates
+}
+
+fn discover_candidates(candidates: Vec<PathBuf>) -> Result<Discovered, DiscoveryError> {
+    let mut tried = Vec::new();
+    for path in candidates {
+        match read_for_client(&path) {
+            Ok(info) => return Ok(Discovered { path, info }),
+            Err(source) => tried.push(TriedCandidate {
+                path,
+                reason: discovery_reason(&source),
+            }),
+        }
+    }
+    Err(DiscoveryError { tried })
+}
+
+fn push_unique(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    if !paths.iter().any(|existing| existing == &path) {
+        paths.push(path);
+    }
+}
+
+fn non_empty_os_var(key: &str) -> Option<OsString> {
+    let value = env::var_os(key)?;
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+fn discovery_reason(source: &ConnectionFileError) -> String {
+    match source {
+        ConnectionFileError::Io { source, .. } if source.kind() == io::ErrorKind::NotFound => {
+            "not found".to_string()
+        }
+        other => other.to_string(),
+    }
+}
+
+/// The per-user component of the temp-fallback connection-file name.
+///
+/// The daemon writer and every reader use this one implementation so a naming
+/// drift cannot make a running daemon appear absent.
+pub fn user_connection_token() -> String {
+    // On Unix the token is the real uid, read from the kernel. Identity must not
+    // depend on a fallible filesystem probe because a transient failure would
+    // make the same user derive a different connection-file name.
+    #[cfg(unix)]
+    {
+        rustix::process::getuid().as_raw().to_string()
+    }
+
+    #[cfg(not(unix))]
+    {
+        for key in ["USER", "USERNAME", "HOME", "USERPROFILE"] {
+            if let Some(value) = non_empty_os_var(key) {
+                return sanitize_token(&value.to_string_lossy());
+            }
+        }
+
+        "unknown".to_string()
+    }
+}
+
+#[cfg(not(unix))]
+fn sanitize_token(raw: &str) -> String {
+    let mut token = String::new();
+    for ch in raw.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+            token.push(ch);
+        } else {
+            token.push('_');
+        }
+    }
+    if token.is_empty() {
+        "unknown".to_string()
+    } else {
+        token
+    }
 }
 
 #[cfg(unix)]
@@ -447,6 +639,164 @@ mod tests {
         }
         name.push_str(".json");
         std::env::temp_dir().join(name)
+    }
+
+    fn unique_temp_dir(label: &str) -> PathBuf {
+        let path = unique_temp_path().with_extension(label);
+        fs::create_dir_all(&path).expect("create test directory");
+        path
+    }
+
+    fn prod_connection_file(home: &Path) -> PathBuf {
+        let mut path = home.to_path_buf();
+        for part in PROD_CONNECTION_RELATIVE_PATH {
+            path.push(part);
+        }
+        path
+    }
+
+    #[test]
+    fn an_explicit_path_is_the_only_discovery_candidate() {
+        let explicit = PathBuf::from("/rig/explicit.json");
+        let env_named = OsStr::new("/rig/from-env.json");
+
+        assert_eq!(
+            discovery_candidates(Some(&explicit), Some(env_named)),
+            vec![explicit],
+            "the caller's explicit override must exclude every fallback"
+        );
+    }
+
+    #[test]
+    fn claustrum_defect_set_and_wrong_environment_path_fails_without_fallback() {
+        let root = unique_temp_dir("env-exclusive");
+        let runtime = root.join("runtime");
+        let home = root.join("home");
+        let temp = root.join("temp");
+        let named = root.join("missing-rig.json");
+        let production = prod_connection_file(&home);
+        fs::create_dir_all(production.parent().expect("production parent"))
+            .expect("create production parent");
+        write_atomic(&production, &sample_info()).expect("write discoverable production file");
+
+        assert_eq!(
+            discovery_candidates(None, Some(named.as_os_str())),
+            vec![named.clone()],
+            "a named connection file must not be followed by discovery paths"
+        );
+        let candidates = discovery_candidates_with_environment(
+            None,
+            Some(named.as_os_str()),
+            Some(runtime.as_os_str()),
+            Some(home.as_os_str()),
+            &temp,
+        );
+        let error = discover_candidates(candidates)
+            .expect_err("set-and-wrong SUBC_CONNECTION_FILE must fail rather than use production");
+
+        assert_eq!(
+            error.tried,
+            vec![TriedCandidate {
+                path: named.clone(),
+                reason: "not found".to_owned(),
+            }],
+            "the named rig path must be the only attempted file"
+        );
+        assert!(
+            error.to_string().contains(&named.display().to_string()),
+            "the failure must name the operator-selected rig path"
+        );
+        fs::remove_dir_all(root).expect("remove test directory");
+    }
+
+    #[test]
+    fn discovery_without_overrides_keeps_three_rung_order_and_deduplicates() {
+        let root = unique_temp_dir("candidate-order");
+        let runtime = root.join("runtime");
+        let home = root.join("home");
+        let temp = root.join("temp");
+
+        let candidates = discovery_candidates_with_environment(
+            None,
+            None,
+            Some(runtime.as_os_str()),
+            Some(home.as_os_str()),
+            &temp,
+        );
+        assert_eq!(
+            candidates,
+            vec![
+                runtime.join(CONNECTION_FILE_NAME),
+                prod_connection_file(&home),
+                temp.join(format!("subc-{}.connection.json", user_connection_token())),
+            ],
+            "readers must try runtime, production, then the per-user temp fallback"
+        );
+
+        let production = prod_connection_file(&home);
+        let production_dir = production.parent().expect("production directory");
+        let deduplicated = discovery_candidates_with_environment(
+            None,
+            None,
+            Some(production_dir.as_os_str()),
+            Some(home.as_os_str()),
+            &temp,
+        );
+        assert_eq!(
+            deduplicated,
+            vec![
+                production,
+                temp.join(format!("subc-{}.connection.json", user_connection_token())),
+            ],
+            "one path reached through two rungs must only be tried once"
+        );
+        fs::remove_dir_all(root).expect("remove test directory");
+    }
+
+    #[test]
+    fn discover_on_a_temp_home_returns_the_parsed_production_file() {
+        const CHILD_MARKER: &str = "SUBC_TRANSPORT_DISCOVERY_CHILD_EXPECTED";
+        if let Some(expected) = env::var_os(CHILD_MARKER) {
+            let expected = PathBuf::from(expected);
+            let discovered = discover(None).expect("discover production connection file");
+            assert_eq!(discovered.path, expected);
+            assert_eq!(discovered.info, sample_info());
+            return;
+        }
+
+        let root = unique_temp_dir("discover-home");
+        let home = root.join("home");
+        let temp = root.join("temp");
+        fs::create_dir_all(&temp).expect("create child temp directory");
+        let production = prod_connection_file(&home);
+        fs::create_dir_all(production.parent().expect("production parent"))
+            .expect("create production parent");
+        write_atomic(&production, &sample_info()).expect("write production connection file");
+
+        // Run the public environment-reading API in a child so this test does not
+        // mutate process-global environment while sibling tests execute.
+        let output = process::Command::new(env::current_exe().expect("current test executable"))
+            .args([
+                "--exact",
+                "connection_file::tests::discover_on_a_temp_home_returns_the_parsed_production_file",
+                "--nocapture",
+            ])
+            .env(CHILD_MARKER, &production)
+            .env_remove("SUBC_CONNECTION_FILE")
+            .env_remove("XDG_RUNTIME_DIR")
+            .env("HOME", &home)
+            .env("TMPDIR", &temp)
+            .env("TMP", &temp)
+            .env("TEMP", &temp)
+            .output()
+            .expect("run isolated discovery child");
+        assert!(
+            output.status.success(),
+            "discovery child failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        fs::remove_dir_all(root).expect("remove test directory");
     }
 
     #[test]

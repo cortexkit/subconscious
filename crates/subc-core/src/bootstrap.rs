@@ -12,6 +12,7 @@ use std::{
 
 use fs4::{FileExt, TryLockError};
 use subc_protocol::PROTOCOL_VERSION;
+pub use subc_transport::user_connection_token;
 use subc_transport::{
     authenticate_client, connection_file, generate_daemon_id, generate_key, write_atomic,
     AuthError, ConnectionFileError, ConnectionInfo, Endpoint, SCHEMA_VERSION,
@@ -886,56 +887,6 @@ fn non_empty_os_var(key: &str) -> Option<OsString> {
         None
     } else {
         Some(value)
-    }
-}
-
-/// The per-user component of the connection-file name.
-///
-/// Public because `ck` derives the same token when discovering which daemon to
-/// talk to. The daemon writes the file and the CLI finds it, so the two must
-/// agree by construction: a second copy of this logic that drifted by one
-/// character would send `ck` looking for a file the daemon never wrote, and the
-/// symptom would be "no daemon running" rather than anything pointing at a
-/// naming mismatch.
-pub fn user_connection_token() -> String {
-    // On unix the token is the real uid, read from the kernel. An earlier
-    // version probed it by creating a temp file and reading the file's owner;
-    // any transient failure of that probe (fd exhaustion, a same-tick name
-    // collision) silently sent the caller down the env-derived fallback with a
-    // DIFFERENT token for the same user, so ck would look for a connection
-    // file the daemon never wrote. Identity must not depend on a filesystem
-    // operation succeeding.
-    #[cfg(unix)]
-    {
-        rustix::process::getuid().as_raw().to_string()
-    }
-
-    #[cfg(not(unix))]
-    {
-        for key in ["USER", "USERNAME", "HOME", "USERPROFILE"] {
-            if let Some(value) = non_empty_os_var(key) {
-                return sanitize_token(&value.to_string_lossy());
-            }
-        }
-
-        "unknown".to_string()
-    }
-}
-
-#[cfg(not(unix))]
-fn sanitize_token(raw: &str) -> String {
-    let mut token = String::new();
-    for ch in raw.chars() {
-        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
-            token.push(ch);
-        } else {
-            token.push('_');
-        }
-    }
-    if token.is_empty() {
-        "unknown".to_string()
-    } else {
-        token
     }
 }
 

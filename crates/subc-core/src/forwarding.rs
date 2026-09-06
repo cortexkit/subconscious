@@ -884,7 +884,35 @@ impl ForwardingTable {
         }
 
         match outcome {
-            RouteBindRelayOutcome::Accepted if pending.client_sink.is_closed() => {
+            // Two shapes of "the client is not there to receive this route" that
+            // must resolve identically: its egress is already closed, or it is
+            // marked closing (its connection loop has been asked to end, but has
+            // not drained yet, so the sink is still open).
+            //
+            // Only the first used to be caught here. The second fell through to
+            // `commit_route_locked`, which refuses a closing client with
+            // `ConnectionClosing` -- and this function is called from the MODULE
+            // connection's frame handler, so that refusal ended the module's
+            // connection instead of this one client's route. One dying client's
+            // route.open then took down a connection carrying every other
+            // client's routes to that module.
+            //
+            // The remedy for both is the same, which is why they share an arm:
+            // give back the reserved handle pair, tell the waiting route.open the
+            // route is gone, and report the module-side channel so the caller can
+            // send a channel-scoped GOODBYE for the binding the module just
+            // created. Nothing here touches the module connection.
+            RouteBindRelayOutcome::Accepted
+                if pending.client_sink.is_closed()
+                    || inner
+                        .closing_connections
+                        .contains(&pending.reservation.client_key.connection_id) =>
+            {
+                let reason = if pending.client_sink.is_closed() {
+                    "client egress closed before route publication"
+                } else {
+                    "client connection is closing before route publication"
+                };
                 release_reserved_route_locked(
                     &mut inner,
                     pending.reservation.client_key,
@@ -894,9 +922,9 @@ impl ForwardingTable {
                     .relay_enqueued
                     .then(|| abandoned_route_target(&inner, &pending.reservation))
                     .flatten();
-                let _ = pending.sender.send(RouteBindRelayOutcome::ModuleGone(
-                    "client egress closed before route publication".to_string(),
-                ));
+                let _ = pending
+                    .sender
+                    .send(RouteBindRelayOutcome::ModuleGone(reason.to_string()));
                 return Ok(PendingRelayCompletion {
                     settled: true,
                     abandoned,
@@ -2843,6 +2871,101 @@ mod tests {
             .unwrap();
         assert_eq!(released.len(), 1);
         assert_eq!(forwarding.active_binding_count().unwrap(), 0);
+    }
+
+    /// A client can be marked closing while its egress is still open: the daemon
+    /// asks a connection to close (here through the production path, a module
+    /// frame that its egress refused) and the connection loop tears down a moment
+    /// later. A route.bind ack that lands inside that window is answered on the
+    /// MODULE connection's frame handler, so resolving it must not produce an
+    /// error -- an error there ends the module connection, and that connection
+    /// carries every other client's routes to the module.
+    #[test]
+    fn accepted_bind_for_a_closing_client_releases_the_route_instead_of_failing_the_module() {
+        let (forwarding, module_connection, endpoint, client, sink, mut client_rx) =
+            route_fixture("closing-client");
+
+        // A published route on this client: escalate_client_delivery_failure only
+        // marks a connection closing for a route it has already published.
+        let live = begin_test_route(&forwarding, client, sink.clone(), 60, "closing-client");
+        forwarding
+            .complete_pending_relay(
+                module_connection,
+                live.corr,
+                RouteBindRelayOutcome::Accepted,
+            )
+            .unwrap();
+        client_rx.try_recv().unwrap();
+
+        // A second route.open from the same client, relayed and awaiting its ack.
+        let pending = begin_test_route(&forwarding, client, sink.clone(), 61, "closing-client");
+        forwarding
+            .mark_route_bind_relay_enqueued(pending.endpoint, pending.corr)
+            .unwrap();
+
+        // The window: closing, but the sink is still open.
+        assert!(forwarding
+            .escalate_client_delivery_failure(
+                client,
+                live.client_channel,
+                live.client_epoch,
+                CloseReason::new(
+                    "module_to_client_delivery_failed",
+                    "client egress refused a module frame",
+                ),
+            )
+            .unwrap());
+        assert!(!sink.is_closed());
+
+        let completion = forwarding
+            .complete_pending_relay(
+                module_connection,
+                pending.corr,
+                RouteBindRelayOutcome::Accepted,
+            )
+            .expect("a closing client must not turn a module's ack into an error");
+
+        assert!(completion.settled);
+        let abandoned = completion
+            .abandoned
+            .expect("the module must be told to drop the binding it just created");
+        assert_eq!(abandoned.connection_id, module_connection);
+        assert_eq!(abandoned.channel, pending.module_channel);
+        assert_eq!(abandoned.epoch, pending.module_epoch);
+        assert!(matches!(abandoned.kind, GoodbyeTargetKind::Module));
+        assert!(matches!(
+            pending.receiver.blocking_recv().unwrap(),
+            RouteBindRelayOutcome::ModuleGone(_)
+        ));
+        // No route was published to a client that is on its way out, and the
+        // reserved handle pair went back.
+        assert!(client_rx.try_recv().is_err());
+        assert_eq!(forwarding.active_binding_count().unwrap(), 1);
+
+        // The module endpoint is untouched: still live, and still able to take a
+        // route from another client.
+        assert!(forwarding
+            .has_live_module_connection("closing-client")
+            .unwrap());
+        let cotenant = ConnectionId::new(201);
+        let (cotenant_tx, mut cotenant_rx) = mpsc::channel(8);
+        let cotenant_route = begin_test_route(
+            &forwarding,
+            cotenant,
+            FrameSink::new(cotenant_tx),
+            62,
+            "closing-client",
+        );
+        assert_eq!(cotenant_route.endpoint, endpoint);
+        forwarding
+            .complete_pending_relay(
+                module_connection,
+                cotenant_route.corr,
+                RouteBindRelayOutcome::Accepted,
+            )
+            .unwrap();
+        assert_eq!(cotenant_rx.try_recv().unwrap().header.corr, 62);
+        assert_eq!(forwarding.active_binding_count().unwrap(), 2);
     }
 
     #[test]

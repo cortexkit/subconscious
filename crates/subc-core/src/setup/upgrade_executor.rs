@@ -285,6 +285,8 @@ mod tests {
 
     fn update_plan() -> UpgradePlan {
         let mut observed = UpgradeObserved::no_updates_on_current_host();
+        observed.supervised_modules.insert("subc-mcp".to_string());
+        observed.supervised_modules.insert("aft".to_string());
         for target in UpgradeTarget::ORDERED {
             observed.targets.insert(
                 target.label().to_string(),
@@ -372,5 +374,117 @@ mod tests {
             .evidence
             .iter()
             .any(|item| item.stage == "rollback" && item.detail.contains("prior inode=1")));
+    }
+
+    #[test]
+    fn roster_lacking_subc_mcp_and_having_aft_plans_no_subc_mcp_restart_and_executes_to_completion()
+    {
+        let mut observed = UpgradeObserved::no_updates_on_current_host();
+        observed.supervised_modules.insert("aft".to_string());
+        for target in [UpgradeTarget::SubcMcp, UpgradeTarget::Aft] {
+            observed.targets.insert(
+                target.label().to_string(),
+                super::super::model::UpgradeState::UpdateAvailable {
+                    from: "1.0.0".to_string(),
+                    to: "2.0.0".to_string(),
+                    reason: None,
+                },
+            );
+        }
+        let plan = plan_upgrade(&observed);
+
+        assert!(!plan.operations.iter().any(|op| matches!(
+            op,
+            UpgradeOperation::InitiateModuleRestart {
+                target: UpgradeTarget::SubcMcp
+            } | UpgradeOperation::PollModuleRestartCompletion {
+                target: UpgradeTarget::SubcMcp
+            }
+        )));
+        assert!(plan.operations.iter().any(|op| matches!(
+            op,
+            UpgradeOperation::InitiateModuleRestart {
+                target: UpgradeTarget::Aft
+            }
+        )));
+        assert!(plan.operations.iter().any(|op| matches!(
+            op,
+            UpgradeOperation::PollModuleRestartCompletion {
+                target: UpgradeTarget::Aft
+            }
+        )));
+
+        let mut backend = RecordingBackend::default();
+        let report = execute_upgrade(&plan, &mut backend).expect("executes to completion");
+        assert_eq!(
+            backend.calls,
+            [
+                "download",
+                "copy",
+                "replace",
+                "warm",
+                "verify",
+                "completed",
+                "download",
+                "copy",
+                "replace",
+                "warm",
+                "initiate",
+                "poll",
+                "verify",
+                "completed"
+            ]
+        );
+        assert!(report
+            .evidence
+            .iter()
+            .any(|e| e.target == UpgradeTarget::SubcMcp && e.stage == "post-verification"));
+        assert!(report
+            .evidence
+            .iter()
+            .any(|e| e.target == UpgradeTarget::Aft && e.stage == "restart-completion"));
+    }
+
+    #[test]
+    fn roster_having_both_subc_mcp_and_aft_plans_both_restart_pairs() {
+        let mut observed = UpgradeObserved::no_updates_on_current_host();
+        observed.supervised_modules.insert("subc-mcp".to_string());
+        observed.supervised_modules.insert("aft".to_string());
+        for target in [UpgradeTarget::SubcMcp, UpgradeTarget::Aft] {
+            observed.targets.insert(
+                target.label().to_string(),
+                super::super::model::UpgradeState::UpdateAvailable {
+                    from: "1.0.0".to_string(),
+                    to: "2.0.0".to_string(),
+                    reason: None,
+                },
+            );
+        }
+        let plan = plan_upgrade(&observed);
+
+        assert!(plan.operations.iter().any(|op| matches!(
+            op,
+            UpgradeOperation::InitiateModuleRestart {
+                target: UpgradeTarget::SubcMcp
+            }
+        )));
+        assert!(plan.operations.iter().any(|op| matches!(
+            op,
+            UpgradeOperation::PollModuleRestartCompletion {
+                target: UpgradeTarget::SubcMcp
+            }
+        )));
+        assert!(plan.operations.iter().any(|op| matches!(
+            op,
+            UpgradeOperation::InitiateModuleRestart {
+                target: UpgradeTarget::Aft
+            }
+        )));
+        assert!(plan.operations.iter().any(|op| matches!(
+            op,
+            UpgradeOperation::PollModuleRestartCompletion {
+                target: UpgradeTarget::Aft
+            }
+        )));
     }
 }

@@ -324,7 +324,7 @@ const DAEMON_HELP: &str = "ck daemon — daemon version, uptime, connection info
 
 const SETUP_HELP: &str = "ck setup — plan managed CortexKit installation\n\nusage:\n  ck setup [aft|mc|insula|claustrum|synapse] [--with aft,mc,insula,claustrum,synapse] [--dry-run] [--verbose]\n  ck setup claustrum [--key-path <file>]\n  ck setup <aft|mc> --convert [--confirm]\n  ck setup --uninstall [--dry-run]\n\n  Bare setup installs core and offers optional components. --dry-run prints the\n  complete plan without changing anything. --convert is explicit and requires\n  --confirm before it can apply a conversion plan. --verbose includes plan outcomes\n  and download diagnostics when a network request fails.";
 
-const UPGRADE_HELP: &str = "ck upgrade — plan managed component upgrades\n\nusage:\n  ck upgrade [--verbose]\n  ck upgrade --check [--verbose]\n\n  --check reports available updates without changing anything. --verbose includes\n  plan outcomes and execution evidence.";
+const UPGRADE_HELP: &str = "ck upgrade — plan managed component upgrades\n\nusage:\n  ck upgrade [--dry-run] [--verbose]\n  ck upgrade --check [--verbose]\n\n  --check reports available updates without changing anything. --dry-run prints\n  the complete plan without changing anything. --verbose includes plan outcomes\n  and execution evidence.";
 
 #[tokio::main]
 async fn main() {
@@ -392,12 +392,18 @@ async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), CkError> {
     if let Command::Setup(request) = &args.command {
         return setup_command(&running_executable()?, request);
     }
-    if let Command::Upgrade { check, verbose } = &args.command {
+    if let Command::Upgrade {
+        check,
+        verbose,
+        dry_run,
+    } = &args.command
+    {
         return upgrade_command(
             &running_executable()?,
             args.subc.as_deref(),
             *check,
             *verbose,
+            *dry_run,
         )
         .await;
     }
@@ -920,6 +926,7 @@ enum Command {
     Upgrade {
         check: bool,
         verbose: bool,
+        dry_run: bool,
     },
     Module(ModuleCommand),
     Routes {
@@ -4910,11 +4917,44 @@ fn print_verbose_outcomes(outcomes: &[setup::PlanOutcome], verbose: bool) {
     }
 }
 
+async fn fetch_supervised_roster(subc: Option<&Path>) -> Result<BTreeSet<String>, String> {
+    #[cfg(feature = "test-support")]
+    {
+        if let Some(reason) = env::var_os("CK_TEST_DAEMON_UNREACHABLE") {
+            return Err(reason.to_string_lossy().into_owned());
+        }
+        if let Some(modules) = env::var_os("CK_TEST_SETUP_MODULES") {
+            return Ok(modules
+                .to_string_lossy()
+                .split(',')
+                .filter(|m| !m.is_empty())
+                .map(ToOwned::to_owned)
+                .collect());
+        }
+    }
+
+    let resolved = discover_connection_file(subc).map_err(|error| error.to_string())?;
+    let mut client = CkClient::connect(resolved)
+        .await
+        .map_err(|error| error.to_string())?;
+    let value = supervisor_list(&mut client)
+        .await
+        .map_err(|error| error.to_string())?;
+    let modules = modules_array(&value);
+    let ids = modules
+        .iter()
+        .filter_map(|module| module.get("module_id").and_then(Value::as_str))
+        .map(ToOwned::to_owned)
+        .collect();
+    Ok(ids)
+}
+
 async fn upgrade_command(
     executable: &Path,
     subc: Option<&Path>,
     check: bool,
     verbose: bool,
+    dry_run: bool,
 ) -> Result<(), CkError> {
     // The daemon connection file is the daemon catalog build evidence. It is
     // optional while no inventory-owned daemon exists; discovery turns its
@@ -4942,8 +4982,13 @@ async fn upgrade_command(
         }
         Err(error) => return Err(CkError::UpdateCheck(error)),
     };
-    let observed = setup::observed_upgrade_targets(&metadata, &discovered);
+    let roster = fetch_supervised_roster(subc).await;
+    let observed = setup::observed_upgrade_targets(&metadata, &discovered, roster);
     let plan = setup::plan_upgrade(&observed);
+    if dry_run {
+        println!("{}", plan.render());
+        return Ok(());
+    }
     if !plan.is_authorized() {
         let message = plan
             .outcomes
@@ -5012,6 +5057,7 @@ async fn upgrade_command(
         index,
     )
     .map_err(CkError::Rejected)?;
+    backend.set_supervised_modules(observed.supervised_modules.clone());
     for target in setup::UpgradeTarget::ORDERED {
         if let setup::UpgradeState::UpdateAvailable { to, .. } = observed.target_state(target) {
             backend.set_expected_version(target, to);
@@ -5210,10 +5256,12 @@ fn parse_setup_component(value: &str) -> Result<setup::Component, CkError> {
 fn parse_upgrade_command(tail: &[OsString]) -> Result<Command, CkError> {
     let mut check = false;
     let mut verbose = false;
+    let mut dry_run = false;
     for argument in tail {
         match argument.to_string_lossy().as_ref() {
             "--check" if !check => check = true,
             "--verbose" if !verbose => verbose = true,
+            "--dry-run" if !dry_run => dry_run = true,
             value => {
                 return Err(CkError::Usage(format!(
                     "unknown or repeated upgrade flag '{value}'\n\n{UPGRADE_HELP}"
@@ -5221,7 +5269,16 @@ fn parse_upgrade_command(tail: &[OsString]) -> Result<Command, CkError> {
             }
         }
     }
-    Ok(Command::Upgrade { check, verbose })
+    if check && dry_run {
+        return Err(CkError::Usage(format!(
+            "cannot combine --check and --dry-run\n\n{UPGRADE_HELP}"
+        )));
+    }
+    Ok(Command::Upgrade {
+        check,
+        verbose,
+        dry_run,
+    })
 }
 
 fn parse_args(argv: impl IntoIterator<Item = OsString>) -> Result<CkArgs, CkError> {
@@ -6821,21 +6878,32 @@ mod tests {
             parse_command("upgrade", &[]).unwrap(),
             Command::Upgrade {
                 check: false,
-                verbose: false
+                verbose: false,
+                dry_run: false,
             }
         ));
         assert!(matches!(
             parse_command("upgrade", &test_tail(&["--check"])).unwrap(),
             Command::Upgrade {
                 check: true,
-                verbose: false
+                verbose: false,
+                dry_run: false,
             }
         ));
         assert!(matches!(
             parse_command("upgrade", &test_tail(&["--verbose", "--check"])).unwrap(),
             Command::Upgrade {
                 check: true,
-                verbose: true
+                verbose: true,
+                dry_run: false,
+            }
+        ));
+        assert!(matches!(
+            parse_command("upgrade", &test_tail(&["--dry-run"])).unwrap(),
+            Command::Upgrade {
+                check: false,
+                verbose: false,
+                dry_run: true,
             }
         ));
         assert!(SETUP_HELP.contains("without changing anything"));

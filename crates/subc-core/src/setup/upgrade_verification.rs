@@ -70,7 +70,7 @@ pub fn verify_post_activation(
             actual: evidence.inode.clone(),
         });
     }
-    if !evidence.healthy {
+    if expectation.require_pid && !evidence.healthy {
         return Err(VerificationFailure::Unhealthy);
     }
     if evidence.version != expectation.expected_version {
@@ -83,13 +83,23 @@ pub fn verify_post_activation(
         return Err(VerificationFailure::RunningImageMismatch);
     }
     Ok(format!(
-        "pid={}; inode={}; health=healthy; version={}; running-image=matched",
+        "pid={}; inode={}; health={}; version={}; running-image={}",
         evidence
             .pid
             .map(|pid| pid.to_string())
             .unwrap_or_else(|| "not-required".to_string()),
         evidence.inode,
-        evidence.version
+        if expectation.require_pid {
+            "healthy"
+        } else {
+            "not-required"
+        },
+        evidence.version,
+        if expectation.require_running_image_match {
+            "matched"
+        } else {
+            "not-required"
+        },
     ))
 }
 

@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     env, fs,
     path::{Path, PathBuf},
     process::Command,
@@ -201,6 +201,7 @@ fn test_installed_version(target: UpgradeTarget) -> Option<String> {
 pub fn observed_upgrade_targets(
     metadata: &UpdateMetadata,
     discovered: &[ManagedUpgradeTarget],
+    roster: Result<BTreeSet<String>, String>,
 ) -> UpgradeObserved {
     let installed = discovered
         .iter()
@@ -223,6 +224,16 @@ pub fn observed_upgrade_targets(
                 .insert(target.label().to_string(), UpgradeState::NotInstalled);
         }
     }
+    match roster {
+        Ok(modules) => {
+            observed.supervised_modules = modules;
+            observed.daemon_unreachable_reason = None;
+        }
+        Err(reason) => {
+            observed.supervised_modules = BTreeSet::new();
+            observed.daemon_unreachable_reason = Some(reason);
+        }
+    }
     observed
 }
 
@@ -241,6 +252,7 @@ pub struct SystemUpgradeBackend {
     rollback_paths: BTreeMap<String, PathBuf>,
     rollback_archive_sha256: BTreeMap<String, Option<String>>,
     expected_versions: BTreeMap<String, String>,
+    supervised_modules: BTreeSet<String>,
 }
 
 impl SystemUpgradeBackend {
@@ -284,7 +296,18 @@ impl SystemUpgradeBackend {
             rollback_paths: BTreeMap::new(),
             rollback_archive_sha256: BTreeMap::new(),
             expected_versions,
+            supervised_modules: BTreeSet::new(),
         })
+    }
+
+    pub fn set_supervised_modules(&mut self, modules: BTreeSet<String>) {
+        self.supervised_modules = modules;
+    }
+
+    pub fn is_module_supervised(&self, target: UpgradeTarget) -> bool {
+        target
+            .module_id()
+            .is_some_and(|id| self.supervised_modules.contains(id))
     }
 
     pub fn set_expected_version(&mut self, target: UpgradeTarget, version: String) {
@@ -337,7 +360,10 @@ impl SystemUpgradeBackend {
     }
 
     fn module_ready(&self, target: UpgradeTarget) -> Result<bool, String> {
-        let output = self.run_ck(&["--json", "module", "status", target.label()])?;
+        let module_id = target
+            .module_id()
+            .ok_or_else(|| format!("{target} is not a supervised module"))?;
+        let output = self.run_ck(&["--json", "module", "status", module_id])?;
         let value: Value = serde_json::from_str(&output)
             .map_err(|error| format!("invalid module status JSON for {target}: {error}"))?;
         let live = value
@@ -393,7 +419,10 @@ impl SystemUpgradeBackend {
     }
 
     fn module_provenance(&self, target: UpgradeTarget) -> Result<(Option<u32>, bool), String> {
-        let output = self.run_ck(&["--json", "provenance", target.label()])?;
+        let module_id = target
+            .module_id()
+            .ok_or_else(|| format!("{target} is not a supervised module"))?;
+        let output = self.run_ck(&["--json", "provenance", module_id])?;
         let value: Value = serde_json::from_str(&output)
             .map_err(|error| format!("invalid provenance JSON for {target}: {error}"))?;
         let module = value
@@ -580,7 +609,10 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
         drain_timeout: Duration,
     ) -> Result<String, String> {
         let drain = drain_timeout.as_millis().to_string();
-        let output = self.run_ck(&["module", "restart", target.label(), "--drain-ms", &drain])?;
+        let module_id = target
+            .module_id()
+            .ok_or_else(|| format!("{target} is not a supervised module"))?;
+        let output = self.run_ck(&["module", "restart", module_id, "--drain-ms", &drain])?;
         if !output.contains("restart") {
             return Err(format!(
                 "restart command returned no initiation acknowledgement for {target}"
@@ -625,8 +657,12 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
 
     fn post_verify(&mut self, target: UpgradeTarget) -> Result<String, String> {
         let destination = &self.target(target)?.destination;
+        let is_supervised_module = match target {
+            UpgradeTarget::SubcMcp | UpgradeTarget::Aft => self.is_module_supervised(target),
+            _ => false,
+        };
         let (pid, healthy, running_image_matches_destination, version) = match target {
-            UpgradeTarget::SubcMcp | UpgradeTarget::Aft => {
+            UpgradeTarget::SubcMcp | UpgradeTarget::Aft if is_supervised_module => {
                 let (pid, running_image_matches_destination) = self.module_provenance(target)?;
                 let healthy = self.module_ready(target)?;
                 (
@@ -635,6 +671,9 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
                     running_image_matches_destination,
                     binary_version(destination)?,
                 )
+            }
+            UpgradeTarget::SubcMcp | UpgradeTarget::Aft => {
+                (None, false, false, binary_version(destination)?)
             }
             UpgradeTarget::Daemon => {
                 let subc = self.subc.as_ref().ok_or_else(|| {
@@ -657,8 +696,8 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
         let expectation = expected_post_activation(
             destination,
             expected_version,
-            target != UpgradeTarget::Ck,
-            target != UpgradeTarget::Ck,
+            is_supervised_module || target == UpgradeTarget::Daemon,
+            is_supervised_module || target == UpgradeTarget::Daemon,
         )?;
         let evidence = VerificationEvidence {
             pid,
@@ -667,12 +706,19 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
             version,
             running_image_matches_destination,
         };
-        verify_post_activation(&evidence, &expectation).map_err(|error| {
+        let detail = verify_post_activation(&evidence, &expectation).map_err(|error| {
             format!(
                 "{}: {error}",
                 super::upgrade_verification::target_verification_label(target)
             )
-        })
+        })?;
+        if target.module_id().is_some() && !is_supervised_module {
+            Ok(format!(
+                "{detail}; module is not supervised on this host and was verified by binary version only"
+            ))
+        } else {
+            Ok(detail)
+        }
     }
 
     fn completed(&mut self, target: UpgradeTarget) {
@@ -905,10 +951,77 @@ mod tests {
                 sha256: None,
             },
         );
-        let observed = observed_upgrade_targets(&metadata, &[target]);
+        let observed = observed_upgrade_targets(&metadata, &[target], Ok(BTreeSet::new()));
         assert!(matches!(
             observed.release(UpgradeTarget::Aft),
             super::super::model::ReleaseAvailability::Incomplete { .. }
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn initiate_module_restart_uses_module_id_not_binary_label() {
+        let root = fixture_dir("initiate-restart-module-id");
+        let ck = root.join("ck");
+        fs::write(
+            &ck,
+            r#"#!/bin/sh
+if [ "$1" = "module" ] && [ "$2" = "restart" ]; then
+    if [ "$3" = "aft" ]; then
+        echo "restart initiated"
+        exit 0
+    else
+        echo "unknown_module — module_id '$3' is not supervised" >&2
+        exit 1
+    fi
+fi
+exit 1
+"#,
+        )
+        .expect("write mock ck");
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&ck, fs::Permissions::from_mode(0o755)).expect("chmod mock ck");
+
+        let aft_path = root.join("ck-aft");
+        fs::write(&aft_path, "#!/bin/sh\necho 'ck-aft 1.0.0'\n").expect("write mock aft");
+        fs::set_permissions(&aft_path, fs::Permissions::from_mode(0o755)).expect("chmod mock aft");
+
+        let mut inventory =
+            Inventory::load(root.join("installer-manifest.json"), "linux-x64").expect("inventory");
+        inventory.record("managed-binary", &aft_path, Map::new());
+
+        let mut backend = SystemUpgradeBackend {
+            platform: AlphaTarget::LinuxX64,
+            targets: [(
+                UpgradeTarget::Aft.label().to_string(),
+                ManagedUpgradeTarget {
+                    target: UpgradeTarget::Aft,
+                    destination: aft_path,
+                    installed_version: "1.0.0".to_string(),
+                    installed_archive_sha256: None,
+                },
+            )]
+            .into_iter()
+            .collect(),
+            executable: ck,
+            subc: None,
+            assets: ReleaseUpgradeAssetFetcher::from_index(ReleaseIndex {
+                schema: 1,
+                channel: "alpha".to_string(),
+                generated_at_ms: 0,
+                components: BTreeMap::new(),
+            }),
+            inventory,
+            prepared: BTreeMap::new(),
+            rollback_paths: BTreeMap::new(),
+            rollback_archive_sha256: BTreeMap::new(),
+            expected_versions: [(UpgradeTarget::Aft.label().to_string(), "2.0.0".to_string())]
+                .into_iter()
+                .collect(),
+            supervised_modules: ["aft".to_string()].into_iter().collect(),
+        };
+
+        let result = backend.initiate_module_restart(UpgradeTarget::Aft, Duration::from_secs(30));
+        assert!(result.is_ok(), "initiate_module_restart failed: {result:?}");
     }
 }

@@ -1,4 +1,7 @@
-use std::{collections::BTreeMap, fmt};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+};
 
 use super::{
     detection,
@@ -373,6 +376,10 @@ pub enum PlanOutcome {
     CoreRestartRequired {
         sections: Vec<String>,
     },
+    /// A module target is not currently supervised on this host.
+    UnsupervisedModule {
+        target: UpgradeTarget,
+    },
 }
 
 impl PlanOutcome {
@@ -438,6 +445,10 @@ impl fmt::Display for PlanOutcome {
                 formatter,
                 "core: configuration change requires a daemon restart ({})",
                 sections.join(", ")
+            ),
+            Self::UnsupervisedModule { target } => write!(
+                formatter,
+                "{target}: module is not supervised on this host; restart omitted, verified by binary version only"
             ),
         }
     }
@@ -618,6 +629,21 @@ impl UpgradeTarget {
             Self::Ck => "ck",
         }
     }
+
+    /// Returns the module identifier used by the daemon supervisor, if this target
+    /// is supervised as a module.
+    ///
+    /// The binary label (`label()`) and supervisor name (`module_id()`) differ by
+    /// design: `label()` names the binary (`ck-aft`, `ck-subc-mcp`), while
+    /// `module_id()` names the supervisor entry (`aft`, `subc-mcp`). Restart and
+    /// verification RPCs take the latter.
+    pub const fn module_id(self) -> Option<&'static str> {
+        match self {
+            Self::Aft => Some("aft"),
+            Self::SubcMcp => Some("subc-mcp"),
+            Self::Daemon | Self::Ck => None,
+        }
+    }
 }
 
 impl fmt::Display for UpgradeTarget {
@@ -647,6 +673,8 @@ pub struct UpgradeObserved {
     pub platform: PlatformObservation,
     pub targets: BTreeMap<String, UpgradeState>,
     pub releases: BTreeMap<String, ReleaseAvailability>,
+    pub supervised_modules: BTreeSet<String>,
+    pub daemon_unreachable_reason: Option<String>,
 }
 
 impl UpgradeObserved {
@@ -661,7 +689,15 @@ impl UpgradeObserved {
             platform: PlatformObservation::current(),
             targets,
             releases,
+            supervised_modules: BTreeSet::new(),
+            daemon_unreachable_reason: None,
         }
+    }
+
+    pub fn is_module_supervised(&self, target: UpgradeTarget) -> bool {
+        target
+            .module_id()
+            .is_some_and(|id| self.supervised_modules.contains(id))
     }
 
     pub fn target_state(&self, target: UpgradeTarget) -> UpgradeState {

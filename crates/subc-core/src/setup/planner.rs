@@ -376,6 +376,18 @@ impl UpgradePlan {
     pub fn is_authorized(&self) -> bool {
         !self.outcomes.iter().any(PlanOutcome::blocks_execution)
     }
+
+    /// The dry-run text an operator reads before consenting.
+    pub fn render(&self) -> String {
+        let mut rendered = String::from("upgrade plan:\n");
+        for (index, operation) in self.operations.iter().enumerate() {
+            rendered.push_str(&format!("  {}. {operation}\n", index + 1));
+        }
+        for outcome in &self.outcomes {
+            rendered.push_str(&format!("  outcome: {outcome}\n"));
+        }
+        rendered
+    }
 }
 
 /// Plans modules before the daemon and always makes the self-replacement final.
@@ -434,7 +446,23 @@ pub fn plan_upgrade(observed: &UpgradeObserved) -> UpgradePlan {
                             reason,
                         });
                     }
-                    ReleaseAvailability::Available => plan_upgrade_target(&mut plan, target),
+                    ReleaseAvailability::Available => {
+                        if target.module_id().is_some()
+                            && observed.daemon_unreachable_reason.is_some()
+                        {
+                            let reason = observed
+                                .daemon_unreachable_reason
+                                .as_deref()
+                                .unwrap_or("daemon is unreachable");
+                            plan.outcomes.push(PlanOutcome::Refusal {
+                                reason: format!(
+                                    "{target} requires a supervised restart, but the daemon is unreachable: {reason}"
+                                ),
+                            });
+                        } else {
+                            plan_upgrade_target(&mut plan, target, observed);
+                        }
+                    }
                     ReleaseAvailability::NotRequired => plan.outcomes.push(PlanOutcome::Refusal {
                         reason: format!("{target} has no alpha release archive"),
                     }),
@@ -445,7 +473,7 @@ pub fn plan_upgrade(observed: &UpgradeObserved) -> UpgradePlan {
     plan
 }
 
-fn plan_upgrade_target(plan: &mut UpgradePlan, target: UpgradeTarget) {
+fn plan_upgrade_target(plan: &mut UpgradePlan, target: UpgradeTarget, observed: &UpgradeObserved) {
     plan.operations.extend([
         UpgradeOperation::DownloadAndVerify { target },
         UpgradeOperation::CreateRollbackCopy { target },
@@ -454,10 +482,15 @@ fn plan_upgrade_target(plan: &mut UpgradePlan, target: UpgradeTarget) {
     ]);
     match target {
         UpgradeTarget::SubcMcp | UpgradeTarget::Aft => {
-            plan.operations
-                .push(UpgradeOperation::InitiateModuleRestart { target });
-            plan.operations
-                .push(UpgradeOperation::PollModuleRestartCompletion { target });
+            if observed.is_module_supervised(target) {
+                plan.operations
+                    .push(UpgradeOperation::InitiateModuleRestart { target });
+                plan.operations
+                    .push(UpgradeOperation::PollModuleRestartCompletion { target });
+            } else {
+                plan.outcomes
+                    .push(PlanOutcome::UnsupervisedModule { target });
+            }
         }
         UpgradeTarget::Daemon => {
             plan.operations
@@ -1044,10 +1077,15 @@ mod tests {
             );
             releases.insert(target.label().to_string(), ReleaseAvailability::Available);
         }
+        let mut supervised_modules = std::collections::BTreeSet::new();
+        supervised_modules.insert("aft".to_string());
+        supervised_modules.insert("subc-mcp".to_string());
         let plan = plan_upgrade(&UpgradeObserved {
             platform: PlatformObservation::Supported(AlphaTarget::LinuxX64),
             targets,
             releases,
+            supervised_modules,
+            daemon_unreachable_reason: None,
         });
         assert!(!plan
             .operations
@@ -1307,5 +1345,103 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn unreachable_daemon_with_aft_update_emits_typed_refusal_and_plans_non_module_targets() {
+        let mut observed = UpgradeObserved::no_updates_on_current_host();
+        observed.daemon_unreachable_reason = Some("daemon connection refused".to_string());
+        observed.targets.insert(
+            UpgradeTarget::Aft.label().to_string(),
+            UpgradeState::UpdateAvailable {
+                from: "1.0.0".to_string(),
+                to: "2.0.0".to_string(),
+                reason: None,
+            },
+        );
+        observed.targets.insert(
+            UpgradeTarget::Ck.label().to_string(),
+            UpgradeState::UpdateAvailable {
+                from: "1.0.0".to_string(),
+                to: "2.0.0".to_string(),
+                reason: None,
+            },
+        );
+        observed.targets.insert(
+            UpgradeTarget::Daemon.label().to_string(),
+            UpgradeState::UpdateAvailable {
+                from: "1.0.0".to_string(),
+                to: "2.0.0".to_string(),
+                reason: None,
+            },
+        );
+
+        let plan = plan_upgrade(&observed);
+
+        // Typed refusal on aft:
+        let aft_refusal = plan.outcomes.iter().find(|o| {
+            matches!(
+                o,
+                PlanOutcome::Refusal { reason } if reason.contains("ck-aft")
+            )
+        });
+        assert!(
+            aft_refusal.is_some(),
+            "expected typed refusal on aft: {:?}",
+            plan.outcomes
+        );
+
+        // No restart attempted for aft:
+        assert!(!plan.operations.iter().any(|op| matches!(
+            op,
+            UpgradeOperation::InitiateModuleRestart {
+                target: UpgradeTarget::Aft
+            } | UpgradeOperation::PollModuleRestartCompletion {
+                target: UpgradeTarget::Aft
+            }
+        )));
+
+        // Other non-module targets still planned:
+        assert!(plan.operations.iter().any(|op| matches!(
+            op,
+            UpgradeOperation::ReplaceDestination {
+                target: UpgradeTarget::Ck
+            }
+        )));
+        assert!(plan
+            .operations
+            .iter()
+            .any(|op| matches!(op, UpgradeOperation::RestartDaemonViaServiceManager)));
+    }
+
+    #[test]
+    fn dry_run_renders_unsupervised_module_reason_in_one_line_and_omits_restart() {
+        let mut observed = UpgradeObserved::no_updates_on_current_host();
+        observed.supervised_modules.insert("aft".to_string());
+        observed.targets.insert(
+            UpgradeTarget::SubcMcp.label().to_string(),
+            UpgradeState::UpdateAvailable {
+                from: "1.0.0".to_string(),
+                to: "2.0.0".to_string(),
+                reason: None,
+            },
+        );
+        let plan = plan_upgrade(&observed);
+        let rendered = plan.render();
+
+        assert!(!rendered.contains("initiate supervised restart for ck-subc-mcp"));
+        assert!(!rendered.contains("poll supervised restart completion for ck-subc-mcp"));
+        assert!(rendered.contains(
+            "outcome: ck-subc-mcp: module is not supervised on this host; restart omitted, verified by binary version only"
+        ));
+    }
+
+    #[test]
+    fn upgrade_target_module_id_pinned_against_component_module_id() {
+        assert_eq!(UpgradeTarget::Aft.module_id(), Component::Aft.module_id());
+        assert_eq!(UpgradeTarget::SubcMcp.module_id(), Some("subc-mcp"));
+        assert_eq!(UpgradeTarget::Daemon.module_id(), None);
+        assert_eq!(UpgradeTarget::Ck.module_id(), None);
+        assert_eq!(Component::Core.module_id(), None);
     }
 }

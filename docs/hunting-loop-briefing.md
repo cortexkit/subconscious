@@ -12234,3 +12234,25 @@ stays load-bearing beside it. A stamped-release module whose staged binary
 embeds NO commit did not come from its staging script and is not placed.
 (BROCA 0.3.76, 2026-09-06: their near-miss was a cherry-pick landing mid-build;
 this arm would have read the pre-pick commit against the tag.)
+
+## A fail-safe whose safe value equals the normal value is undetectable by construction (2026-09-08)
+
+`alfonso.jsonc` was syntactically broken for days. The ask-policy reader fell back
+to `AlwaysBlock` on the parse error — and `AlwaysBlock` is also the parsed default
+when no seat declares an `autonomy` block. All 559 asks ever recorded carry `block`,
+and could not have come back any other way: there is no observation of behaviour, in
+any seat, on any ask, at any stakes, that separates "broken config" from "healthy
+config" when the fallback and the default are the same value.
+
+Two rules from it:
+
+- Before hunting for a discriminating case, ask what the two states DIFFER in. If
+  the answer is "nothing observable", no instrument exists and the only fix is a
+  WRITE at the fallback site (a log line naming FILE:LINE:COL), plus a validity
+  check on its own schedule. The log line is the detection mechanism, not a
+  courtesy; say so in the comment or the next reader deletes it as noise.
+- A uniform answer over a complete population is not evidence unless you also
+  say why it could not vary. 559 identical rows read as reassurance until the
+  mechanism showed they were constant by construction.
+
+(CKCRED found it as one clause on an unrelated reply; ALF read the rows.)

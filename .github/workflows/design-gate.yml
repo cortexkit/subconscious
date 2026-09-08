@@ -19,7 +19,7 @@ name: Design gate
 # from the checks tab (or push) to turn the check green.
 
 on:
-  pull_request:
+  pull_request_target:
     types: [opened, edited, reopened, synchronize, ready_for_review]
   issues:
     types: [labeled]
@@ -28,13 +28,13 @@ concurrency:
   group: design-gate-${{ github.event.pull_request.number || github.event.issue.number }}
   # Pull request runs are pure re-evaluations, so superseding one is free. The
   # issue arm marks PRs ready and must not be interrupted half way.
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request_target' }}
 
 jobs:
   # The job id is the check name. Branch protection on main requires
   # `design-gate`; renaming this job renames the required check.
   design-gate:
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request_target'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -42,19 +42,30 @@ jobs:
       issues: read # read the linked issue's labels
       pull-requests: write # post the gate comment, convert back to draft
     steps:
+      # Security property: pull_request_target runs in the context of the base
+      # repository and has access to secrets. Contributor code from the PR head
+      # must NEVER be checked out or executed here. The gate script reads PR
+      # metadata via the API only and is checked out from the base repository.
       - uses: actions/checkout@v5
 
       - uses: actions/setup-node@v5
         with:
           node-version: "24"
 
-      # Fork pull requests run with a read-only token: the comment and the
-      # draft conversion are then refused, and the script logs that and still
-      # fails. A side step that cannot run must never turn the gate green.
+      # Mint an app token so commenting and draft conversion work on fork PRs.
+      # The default GITHUB_TOKEN on fork pull_request runs was read-only;
+      # pull_request_target grants access to repo secrets so we mint an app token.
+      - name: Mint gate token
+        id: app_token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.CK_CI_APP_ID }}
+          private-key: ${{ secrets.CK_CI_APP_PRIVATE_KEY }}
+
       - name: Evaluate the design gate
         run: node scripts/design-gate.mjs pull-request
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ steps.app_token.outputs.token }}
 
   # Marking a pull request ready with GITHUB_TOKEN does not start another
   # workflow run, so this job re-runs the gate logic itself and publishes the

@@ -90,8 +90,11 @@ function createFixtureApi({ issues = [], pullRequests = [], comments = [], refus
       // knows nothing about closing keywords. Reproduce that looseness so the
       // caller's re-parse is actually exercised.
       return [...state.pullRequests.values()]
-        .filter((pr) => pr.state === "open" && pr.isDraft && pr.body.includes(`#${issueNumber}`))
+        .filter((pr) => pr.state === "open" && pr.body.includes(`#${issueNumber}`))
         .map((pr) => pr.number);
+    },
+    async searchOpenPullRequests(issueNumber) {
+      return this.searchDraftPullRequests(issueNumber);
     },
     async convertPullRequestToDraft(nodeId) {
       guard("convertPullRequestToDraft");
@@ -512,16 +515,21 @@ describe("runIssueLabeled", () => {
     assert.equal(state.readyForReview.length, 0);
   });
 
-  test("leaves already-ready pull requests alone", async () => {
+  test("re-evaluates open non-draft pull requests and publishes check run", async () => {
     const ready = pullRequest({
       number: 104,
       nodeId: "PR_node_104",
       isDraft: false,
       body: "Closes #42",
+      headSha: "c".repeat(40),
     });
-    const { api, state } = createFixtureApi({ issues: [labelled], pullRequests: [ready] });
+    const { api, state } = createFixtureApi({
+      issues: [labelled],
+      pullRequests: [ready],
+      comments: [{ id: 5, issueNumber: 104, body: `${COMMENT_MARKER}\n\n${GATE_MESSAGE}` }],
+    });
 
-    const { released } = await runIssueLabeled({
+    const { released, updated } = await runIssueLabeled({
       api,
       repoFullName: REPO,
       issue: labelled,
@@ -529,6 +537,122 @@ describe("runIssueLabeled", () => {
     });
 
     assert.deepEqual(released, []);
+    assert.deepEqual(updated, [104]);
     assert.equal(state.readyForReview.length, 0);
+    assert.equal(state.checkRuns.length, 1);
+    assert.equal(state.checkRuns[0].conclusion, "success");
+    assert.equal(state.checkRuns[0].headSha, "c".repeat(40));
+    assert.ok(!state.comments[0].body.includes(GATE_MESSAGE));
+  });
+
+  test("ignores closed pull requests", async () => {
+    const closed = pullRequest({
+      number: 105,
+      nodeId: "PR_node_105",
+      state: "closed",
+      isDraft: false,
+      body: "Closes #42",
+    });
+    const { api, state } = createFixtureApi({ issues: [labelled], pullRequests: [closed] });
+
+    const { released, updated } = await runIssueLabeled({
+      api,
+      repoFullName: REPO,
+      issue: labelled,
+      log: silentLog,
+    });
+
+    assert.deepEqual(released, []);
+    assert.deepEqual(updated, []);
+    assert.equal(state.readyForReview.length, 0);
+    assert.equal(state.checkRuns.length, 0);
+  });
+});
+
+describe("workflow security properties", () => {
+  const workflowPath = new URL("../.github/workflows/design-gate.yml", import.meta.url);
+  const workflowYaml = readFileSync(workflowPath, "utf8");
+
+  test("actions/checkout steps never reference PR head", () => {
+    // Extract each step block across the workflow
+    const stepBlocks = [];
+    const lines = workflowYaml.split("\n");
+    let currentBlock = [];
+    let inSteps = false;
+
+    for (const line of lines) {
+      if (/^\s*steps:\s*$/.test(line)) {
+        inSteps = true;
+        continue;
+      }
+      if (inSteps && /^[^\s#]/.test(line)) {
+        if (currentBlock.length) stepBlocks.push(currentBlock.join("\n"));
+        currentBlock = [];
+        inSteps = false;
+        continue;
+      }
+      if (inSteps && /^\s{0,4}[a-zA-Z]/.test(line)) {
+        if (currentBlock.length) stepBlocks.push(currentBlock.join("\n"));
+        currentBlock = [];
+        inSteps = false;
+        continue;
+      }
+      if (inSteps) {
+        if (/^\s*-\s+/.test(line)) {
+          if (currentBlock.length) stepBlocks.push(currentBlock.join("\n"));
+          currentBlock = [line];
+        } else if (currentBlock.length) {
+          currentBlock.push(line);
+        }
+      }
+    }
+    if (currentBlock.length) stepBlocks.push(currentBlock.join("\n"));
+
+    const checkoutSteps = stepBlocks.filter((step) => step.includes("actions/checkout"));
+    assert.ok(checkoutSteps.length > 0, "must have at least one actions/checkout step");
+    for (const step of checkoutSteps) {
+      assert.ok(
+        !step.includes("github.event.pull_request.head"),
+        `actions/checkout step must never reference PR head (found: ${step})`,
+      );
+    }
+  });
+
+  test("pull-request job uses the App token step output instead of secrets.GITHUB_TOKEN", () => {
+    // Isolate the pull-request job (design-gate)
+    const prJobMatch = workflowYaml.match(
+      /design-gate:\s*\n([\s\S]*?)(?=\n\s{2}[a-zA-Z0-9_-]+:|$)/,
+    );
+    assert.ok(prJobMatch, "design-gate job must be present in workflow");
+    const prJobYaml = prJobMatch[1];
+
+    // Find the App token step id
+    const appTokenStepMatch =
+      prJobYaml.match(/id:\s*([a-zA-Z0-9_-]+)\s*\n\s*uses:\s*actions\/create-github-app-token/m) ||
+      prJobYaml.match(
+        /uses:\s*actions\/create-github-app-token[^\n]*\n[\s\S]*?id:\s*([a-zA-Z0-9_-]+)/m,
+      );
+    assert.ok(appTokenStepMatch, "must have an actions/create-github-app-token step with an id");
+    const appTokenId = appTokenStepMatch[1];
+
+    // Find the step that runs the design gate script
+    const evalStepMatch = prJobYaml.match(
+      /-\s+name:[^\n]*\n(?:[^\n]*\n)*?\s*run:\s*node\s+scripts\/design-gate\.mjs\s+pull-request[\s\S]*?(?=\n\s{6}-\s|\n\s{4}[a-zA-Z]|$)/,
+    );
+    assert.ok(evalStepMatch, "must have a step running design-gate.mjs pull-request");
+    const evalStepYaml = evalStepMatch[0];
+
+    // Assert that GITHUB_TOKEN does not use secrets.GITHUB_TOKEN
+    assert.ok(
+      !evalStepYaml.includes("secrets.GITHUB_TOKEN"),
+      "pull-request job must not use secrets.GITHUB_TOKEN",
+    );
+
+    // Assert that GITHUB_TOKEN uses the App token step's output
+    const expectedOutput = `steps.${appTokenId}.outputs.token`;
+    assert.ok(
+      evalStepYaml.includes(expectedOutput),
+      `pull-request job GITHUB_TOKEN must reference ${expectedOutput} (found: ${evalStepYaml})`,
+    );
   });
 });

@@ -278,19 +278,24 @@ export async function runPullRequestGate({
 
 /**
  * A maintainer labelled an issue `design-approved`: release the draft pull
- * requests that were waiting on it.
+ * requests that were waiting on it, and re-evaluate every open pull request
+ * (draft or not) linking this issue.
  *
  * Marking a PR ready with GITHUB_TOKEN does not start another workflow run, so
  * this arm also publishes the `design-gate` check run itself. Without that the
  * required check would stay red until the author pushed a commit.
  */
 export async function runIssueLabeled({ api, repoFullName, issue, log = console }) {
-  const candidates = await api.searchDraftPullRequests(issue.number);
+  const search = api.searchOpenPullRequests
+    ? (number) => api.searchOpenPullRequests(number)
+    : (number) => api.searchDraftPullRequests(number);
+  const candidates = await search(issue.number);
   const released = [];
+  const updated = [];
 
   for (const number of candidates) {
     const pullRequest = await api.getPullRequest(number);
-    if (!pullRequest || pullRequest.state !== "open" || !pullRequest.isDraft) continue;
+    if (!pullRequest || pullRequest.state !== "open") continue;
 
     // The search index matches the raw string `#N` anywhere in the body, so
     // re-parse with the real grammar before touching anything.
@@ -299,11 +304,14 @@ export async function runIssueLabeled({ api, repoFullName, issue, log = console 
 
     const decision = decide({ pullRequest, repoFullName, issue, action: "labeled" });
     if (decision.conclusion !== "success") {
-      log.warn?.(`design-gate: #${number} still fails the gate; leaving it as a draft`);
+      log.warn?.(`design-gate: #${number} still fails the gate`);
       continue;
     }
 
-    await api.markPullRequestReadyForReview(pullRequest.nodeId);
+    if (pullRequest.isDraft) {
+      await api.markPullRequestReadyForReview(pullRequest.nodeId);
+      released.push(number);
+    }
     await api.createCheckRun({
       headSha: pullRequest.headSha,
       conclusion: "success",
@@ -315,10 +323,10 @@ export async function runIssueLabeled({ api, repoFullName, issue, log = console 
     } catch (error) {
       log.warn?.(`design-gate: could not update the gate comment on #${number}: ${error}`);
     }
-    released.push(number);
+    updated.push(number);
   }
 
-  return { released };
+  return { released, updated };
 }
 
 export function normalizePullRequest(raw) {
@@ -414,13 +422,16 @@ export function createGitHubApi({
     async updateComment(id, body) {
       return await rest("PATCH", `/repos/${repoFullName}/issues/comments/${id}`, { body });
     },
-    async searchDraftPullRequests(issueNumber) {
-      const query = `is:pr is:open draft:true "#${issueNumber}" repo:${repoFullName}`;
+    async searchOpenPullRequests(issueNumber) {
+      const query = `is:pr is:open "#${issueNumber}" repo:${repoFullName}`;
       const result = await rest(
         "GET",
         `/search/issues?per_page=100&q=${encodeURIComponent(query)}`,
       );
       return (result?.items ?? []).map((item) => item.number);
+    },
+    async searchDraftPullRequests(issueNumber) {
+      return this.searchOpenPullRequests(issueNumber);
     },
     async convertPullRequestToDraft(nodeId) {
       // REST cannot move a pull request back to draft; only GraphQL can.
@@ -490,12 +501,26 @@ async function main(argv) {
 
   if (mode === "issue-labeled") {
     const issue = normalizeIssue(event.issue);
-    const { released } = await runIssueLabeled({ api, repoFullName, issue });
-    const summary = released.length
-      ? `Marked ready for review after #${issue.number} was design-approved: ${released
+    const { released, updated = [] } = await runIssueLabeled({ api, repoFullName, issue });
+    const parts = [];
+    if (released.length) {
+      parts.push(
+        `Marked ready for review after #${issue.number} was design-approved: ${released
           .map((number) => `#${number}`)
-          .join(", ")}`
-      : `No draft pull requests were waiting on #${issue.number}.`;
+          .join(", ")}`,
+      );
+    }
+    const readyUpdated = updated.filter((number) => !released.includes(number));
+    if (readyUpdated.length) {
+      parts.push(
+        `Published check for open pull requests after #${issue.number} was design-approved: ${readyUpdated
+          .map((number) => `#${number}`)
+          .join(", ")}`,
+      );
+    }
+    const summary = parts.length
+      ? parts.join("\n")
+      : `No pull requests were waiting on #${issue.number}.`;
     writeStepSummary(summary);
     console.log(`design-gate: ${summary}`);
     return;

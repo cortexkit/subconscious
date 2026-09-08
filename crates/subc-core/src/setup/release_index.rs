@@ -669,7 +669,7 @@ mod tests {
         thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accept");
             // Hold the connection open, answering nothing, until released.
-            let _ = release_rx.recv_timeout(Duration::from_secs(30));
+            let _ = release_rx.recv_timeout(Duration::from_secs(90));
             drop(stream);
         });
         let key = test_signing_key();
@@ -688,12 +688,14 @@ mod tests {
             "a hang is unreachable, never a signature or parse verdict: {error}"
         );
         // Discriminating margin, not a latency claim: a transport that ignores
-        // its deadline cannot return before the 30 s hold. One that honors it
+        // its deadline cannot return before the 90 s hold. One that honors it
         // is back in about a second on unix; on Windows the bound starts only
-        // after powershell.exe itself has started, which on a cold runner is
-        // several seconds on its own.
+        // after powershell.exe itself has started, which on a loaded hosted
+        // runner has been measured at 22 s. The bound sits far above that and
+        // far below the hold so neither a slow start nor a fast hang can be
+        // misread.
         assert!(
-            elapsed < Duration::from_secs(20),
+            elapsed < Duration::from_secs(45),
             "transport ignored its deadline: {elapsed:?}"
         );
     }

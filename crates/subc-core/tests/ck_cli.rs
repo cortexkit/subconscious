@@ -383,11 +383,16 @@ fn production_ck_ignores_the_test_release_index_key() {
     let config_home = home.join(".config");
     let tools = temp.path().join("tools");
     fs::create_dir_all(&tools).expect("service-manager fixture directory");
-    // A successful but non-running service-manager response lets setup reach the
-    // release-index check without consulting a real user daemon.
+    // The service manager must answer "registered but not running" so setup
+    // skips the live-module probe and reaches the release-index check. On
+    // macOS that is a successful `launchctl print` whose output lacks
+    // `state = running`; on Linux liveness is `systemctl --user is-active`
+    // SUCCEEDING, so the fixture has to fail that verb (3 = inactive) while
+    // still succeeding for `is-enabled`. A plain `exit 0` reads as a live
+    // daemon on Linux and sends setup to `ck module list` against no daemon.
     write_executable(
         &tools.join(service_manager_program()),
-        "#!/bin/sh\nexit 0\n",
+        "#!/bin/sh\ncase \"$*\" in *is-active*) exit 3;; esac\nexit 0\n",
     );
     let path = std::env::join_paths(std::iter::once(tools).chain(std::env::split_paths(
         &std::env::var_os("PATH").unwrap_or_default(),

@@ -1543,7 +1543,7 @@ impl ControlHandler {
         info!(
             target: "subc_core::control",
             code,
-            module_id = %module_id.escape_debug(),
+            module_id = ?module_id,
             connection_id = ctx.connection_id.get(),
             "route.open refused"
         );
@@ -1561,7 +1561,7 @@ impl ControlHandler {
         info!(
             target: "subc_core::control",
             code,
-            module_id = %module_id.escape_debug(),
+            module_id = ?module_id,
             connection_id = ctx.connection_id.get(),
             state = %status.state,
             enabled = status.enabled,
@@ -1955,8 +1955,8 @@ impl ControlHandler {
                 info!(
                     target: "subc_core::control",
                     code = "module_rejected",
-                    module_code = %body.code.escape_debug(),
-                    module_id = %target_module_id.escape_debug(),
+                    module_code = ?body.code,
+                    module_id = ?target_module_id,
                     connection_id = ctx.connection_id.get(),
                     "route.open refused"
                 );
@@ -6725,7 +6725,10 @@ mod tests {
                     && event.fields.get("code") == Some(&"\"module_warming\"".to_string())
             })
             .expect("route.open refusal event");
-        assert_eq!(event.fields.get("module_id"), Some(&"warming".to_string()));
+        assert_eq!(
+            event.fields.get("module_id"),
+            Some(&"\"warming\"".to_string())
+        );
         assert_eq!(event.fields.get("connection_id"), Some(&"94".to_string()));
         assert_eq!(event.fields.get("state"), Some(&"running".to_string()));
         assert_eq!(event.fields.get("enabled"), Some(&"true".to_string()));
@@ -6767,7 +6770,7 @@ mod tests {
             .expect("route.open unknown-module refusal event");
         let logged = event.fields.get("module_id").expect("module_id field");
         assert!(!logged.bytes().any(|byte| byte < 0x20));
-        assert!(logged.contains(r"\u{1b}"), "module_id: {logged:?}");
+        assert_eq!(logged, r#""\u{1b}]52;c;AAAA\u{7}""#);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -6834,7 +6837,7 @@ mod tests {
             .expect("route.open module-rejection refusal event");
         let logged = event.fields.get("module_code").expect("module_code field");
         assert!(!logged.bytes().any(|byte| byte < 0x20));
-        assert!(logged.contains(r"\u{1b}"), "module_code: {logged:?}");
+        assert_eq!(logged, r#""\u{1b}]52;c;AAAA\u{7}""#);
     }
 
     #[tokio::test]

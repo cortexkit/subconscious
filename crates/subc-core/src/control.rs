@@ -1526,6 +1526,11 @@ impl ControlHandler {
         )?))
     }
 
+    /// Every refusal of a `route.open` goes through here so the daemon can
+    /// attest which code it sent: without the event, a client's "the daemon
+    /// refused me" and the daemon's own view could only be reconciled by
+    /// argument. Malformed input (`invalid_project_root`) does not come here;
+    /// rejecting a request that was never a valid open is not a refusal of one.
     fn route_open_refusal_frame(
         &self,
         ctx: &RouteCtx,
@@ -1538,6 +1543,10 @@ impl ControlHandler {
         control_error_frame(frame, code, message.into())
     }
 
+    /// `code` is daemon vocabulary and prints plainly; `module_id` is the
+    /// requester's bytes (an unknown target is whatever the client sent) and
+    /// is Debug-formatted so control characters land in the log escaped
+    /// rather than as terminal sequences for whoever tails it.
     fn observe_route_open_refusal(&self, ctx: &RouteCtx, module_id: &str, code: &'static str) {
         self.counters.increment_route_open_refused(code);
         info!(

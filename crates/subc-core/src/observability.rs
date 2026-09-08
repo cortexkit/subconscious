@@ -12,6 +12,13 @@ use tracing::info;
 
 use crate::registry::ConnectionId;
 
+/// The only keys the route.open refusal counter may carry. A module's own
+/// error code on a rejected bind is counted under `module_rejected` and rides
+/// the log event as a separate field: if the module's string were the key, a
+/// module could grow this map for the daemon's lifetime and push terminal
+/// control sequences through `ck daemon` to an operator's screen. The
+/// `&'static str` increment signature plus the debug assertion keep the set
+/// closed at the call site, not just here.
 const ROUTE_OPEN_REFUSAL_COUNTER_CODES: &[&str] = &[
     "module_warming",
     "target_unavailable",

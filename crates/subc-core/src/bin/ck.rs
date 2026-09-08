@@ -1799,6 +1799,10 @@ fn provenance_value(value: Option<&Value>) -> String {
     }
 }
 
+fn terminal_safe_string(value: &str) -> String {
+    provenance_value(Some(&Value::String(value.to_string())))
+}
+
 fn provenance_image(value: Option<&Value>) -> String {
     let Some(value) = value else {
         return "is unknown".to_string();
@@ -2783,9 +2787,9 @@ fn daemon_frame_drop_summary(describe: &Value) -> String {
                         .cmp(right_count)
                         .then_with(|| right_code.cmp(left_code))
                 })
-                .map(|(code, _)| code.as_str())
+                .map(|(code, _)| terminal_safe_string(code))
         })
-        .unwrap_or("unknown");
+        .unwrap_or_else(|| "unknown".to_string());
     let noun = if refusals == 1 { "refusal" } else { "refusals" };
     format!("{frame_drop_summary}; {refusals} route.open {noun}, top: {top}")
 }
@@ -4683,8 +4687,22 @@ fn display_json_value(value: &Value) -> String {
         Value::Bool(value) => value.to_string(),
         Value::Number(value) => value.to_string(),
         Value::Array(_) | Value::Object(_) => {
-            serde_json::to_string(value).unwrap_or_else(|_| value.to_string())
+            serde_json::to_string(&terminal_safe_json(value)).unwrap_or_else(|_| value.to_string())
         }
+    }
+}
+
+fn terminal_safe_json(value: &Value) -> Value {
+    match value {
+        Value::String(value) => Value::String(terminal_safe_string(value)),
+        Value::Array(values) => Value::Array(values.iter().map(terminal_safe_json).collect()),
+        Value::Object(values) => Value::Object(
+            values
+                .iter()
+                .map(|(key, value)| (terminal_safe_string(key), terminal_safe_json(value)))
+                .collect(),
+        ),
+        other => other.clone(),
     }
 }
 
@@ -5930,6 +5948,23 @@ mod tests {
             assert!(
                 escaped.contains(r"\x1b") || escaped.contains(r"\x07") || escaped.contains(r"\x0a")
             );
+        }
+    }
+
+    #[test]
+    fn route_open_refusal_counter_renderers_escape_terminal_controls() {
+        let hostile = "\u{1b}]52;c;AAAA\u{07}";
+        let summary = daemon_frame_drop_summary(&serde_json::json!({
+            "counters": {
+                "module_frames_dropped_no_route_last_10m": 0,
+                "route_open_refused_by_code": { hostile: 1 }
+            }
+        }));
+        let verbose = display_json_value(&serde_json::json!({ hostile: 1 }));
+
+        for rendered in [summary, verbose] {
+            assert!(!rendered.bytes().any(|byte| byte < 0x20));
+            assert!(rendered.contains(r"\x1b"), "rendered: {rendered:?}");
         }
     }
 

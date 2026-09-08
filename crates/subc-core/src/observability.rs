@@ -12,6 +12,23 @@ use tracing::info;
 
 use crate::registry::ConnectionId;
 
+const ROUTE_OPEN_REFUSAL_COUNTER_CODES: &[&str] = &[
+    "module_warming",
+    "target_unavailable",
+    "module_removed",
+    "unknown_module",
+    "module_reloading",
+    "op_not_allowed",
+    "bad_consumer_identity",
+    "capability_forbidden",
+    "admission_facts_not_permitted",
+    "admission_facts_target_not_allowed",
+    "route_limit",
+    "forwarding_error",
+    "module_timeout",
+    "module_rejected",
+];
+
 /// Shared count of authenticated socket connections accepted by the daemon.
 #[derive(Debug, Clone, Default)]
 pub struct ConnectedClients {
@@ -243,7 +260,8 @@ impl DaemonCounters {
             .record(tokio::time::Instant::now());
     }
 
-    pub(crate) fn increment_route_open_refused(&self, code: &str) {
+    pub(crate) fn increment_route_open_refused(&self, code: &'static str) {
+        debug_assert!(ROUTE_OPEN_REFUSAL_COUNTER_CODES.contains(&code));
         increment_keyed_count(&self.route_open_refused_by_code, code);
     }
 

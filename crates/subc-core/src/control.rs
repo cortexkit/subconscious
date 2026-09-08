@@ -1538,7 +1538,7 @@ impl ControlHandler {
         control_error_frame(frame, code, message.into())
     }
 
-    fn observe_route_open_refusal(&self, ctx: &RouteCtx, module_id: &str, code: &str) {
+    fn observe_route_open_refusal(&self, ctx: &RouteCtx, module_id: &str, code: &'static str) {
         self.counters.increment_route_open_refused(code);
         info!(
             target: "subc_core::control",
@@ -1950,7 +1950,16 @@ impl ControlHandler {
             }
             Ok(Ok(RouteBindRelayOutcome::Rejected(body))) => {
                 reservation.release_and_disarm();
-                self.observe_route_open_refusal(ctx, &target_module_id, &body.code);
+                self.counters
+                    .increment_route_open_refused("module_rejected");
+                info!(
+                    target: "subc_core::control",
+                    code = "module_rejected",
+                    module_code = %body.code,
+                    module_id = %target_module_id,
+                    connection_id = ctx.connection_id.get(),
+                    "route.open refused"
+                );
                 Ok(vec![control_error_body_frame(&frame, body)?])
             }
             Ok(Ok(RouteBindRelayOutcome::ModuleGone(message))) => {
@@ -6723,6 +6732,58 @@ mod tests {
             handler.counters().snapshot()["route_open_refused_by_code"],
             json!({ "module_warming": 1 })
         );
+    }
+
+    #[tokio::test]
+    async fn route_open_module_rejection_uses_daemon_counter_key() {
+        let registry = Arc::new(Registry::default());
+        let forwarding = Arc::new(ForwardingTable::default());
+        let handler =
+            ControlHandler::with_forwarding(Arc::clone(&registry), Arc::clone(&forwarding));
+        let module_connection = ConnectionId::new(95);
+        let (module_ctx, mut module_rx) = route_ctx(module_connection);
+        handler
+            .handle_control_frame(&module_ctx, hello_frame("aft", PROTOCOL_VERSION, 395))
+            .await
+            .unwrap();
+
+        let client_connection = ConnectionId::new(96);
+        let (client_ctx, _client_rx) = route_ctx(client_connection);
+        let (route_task, bind) = relay_route_open(
+            &handler,
+            client_connection,
+            &client_ctx.egress,
+            &mut module_rx,
+            396,
+            "aft",
+            "hostile-module-code",
+        )
+        .await;
+        let hostile_code = "\u{1b}]52;c;AAAA\u{07}";
+        let rejection = Frame::build(
+            FrameType::Error,
+            control_flags(),
+            0,
+            0,
+            bind.header.corr,
+            serde_json::to_vec(&ErrorBody::new(hostile_code, "module refused route.bind")).unwrap(),
+        )
+        .unwrap();
+        handler
+            .handle_control_frame(&module_ctx, rejection)
+            .await
+            .unwrap();
+
+        let response = route_task.await.unwrap();
+        assert_eq!(parse_error(&response[0])["code"], hostile_code);
+        let counters = handler.counters().snapshot();
+        assert_eq!(
+            counters["route_open_refused_by_code"],
+            json!({ "module_rejected": 1 })
+        );
+        assert!(counters["route_open_refused_by_code"]
+            .get(hostile_code)
+            .is_none());
     }
 
     #[tokio::test]

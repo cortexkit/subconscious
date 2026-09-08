@@ -1543,7 +1543,7 @@ impl ControlHandler {
         info!(
             target: "subc_core::control",
             code,
-            module_id = %module_id,
+            module_id = %module_id.escape_debug(),
             connection_id = ctx.connection_id.get(),
             "route.open refused"
         );
@@ -1561,7 +1561,7 @@ impl ControlHandler {
         info!(
             target: "subc_core::control",
             code,
-            module_id = %module_id,
+            module_id = %module_id.escape_debug(),
             connection_id = ctx.connection_id.get(),
             state = %status.state,
             enabled = status.enabled,
@@ -1955,8 +1955,8 @@ impl ControlHandler {
                 info!(
                     target: "subc_core::control",
                     code = "module_rejected",
-                    module_code = %body.code,
-                    module_id = %target_module_id,
+                    module_code = %body.code.escape_debug(),
+                    module_id = %target_module_id.escape_debug(),
                     connection_id = ctx.connection_id.get(),
                     "route.open refused"
                 );
@@ -5518,7 +5518,9 @@ mod tests {
         let handler = handler.clone();
         let project_root = unique_project_root(project_root_label);
         let module_id = module_id.to_string();
+        let dispatch = tracing::dispatcher::get_default(|dispatch| dispatch.clone());
         let task = tokio::spawn(async move {
+            let _guard = tracing::dispatcher::set_default(&dispatch);
             handler
                 .handle_control_frame(&ctx, route_open_frame(corr, &module_id, project_root))
                 .await
@@ -6734,7 +6736,41 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
+    async fn route_open_unknown_module_escapes_target_module_id() {
+        let handler = ControlHandler::new(Arc::new(Registry::default()));
+        let capture = EventCapture::default();
+        let _subscriber =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(capture.clone()));
+        let hostile_module_id = "\u{1b}]52;c;AAAA\u{07}";
+        let (ctx, _rx) = route_ctx(ConnectionId::new(95));
+        let response = handler
+            .handle_control_frame(
+                &ctx,
+                route_open_frame(
+                    395,
+                    hostile_module_id,
+                    unique_project_root("hostile-target-module-id"),
+                ),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(parse_error(&response[0])["code"], "unknown_module");
+        let event = capture
+            .events()
+            .into_iter()
+            .find(|event| {
+                event.target == "subc_core::control"
+                    && event.fields.get("code") == Some(&"\"unknown_module\"".to_string())
+            })
+            .expect("route.open unknown-module refusal event");
+        let logged = event.fields.get("module_id").expect("module_id field");
+        assert!(!logged.bytes().any(|byte| byte < 0x20));
+        assert!(logged.contains(r"\u{1b}"), "module_id: {logged:?}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn route_open_module_rejection_uses_daemon_counter_key() {
         let registry = Arc::new(Registry::default());
         let forwarding = Arc::new(ForwardingTable::default());
@@ -6749,6 +6785,9 @@ mod tests {
 
         let client_connection = ConnectionId::new(96);
         let (client_ctx, _client_rx) = route_ctx(client_connection);
+        let capture = EventCapture::default();
+        let _subscriber =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(capture.clone()));
         let (route_task, bind) = relay_route_open(
             &handler,
             client_connection,
@@ -6784,6 +6823,18 @@ mod tests {
         assert!(counters["route_open_refused_by_code"]
             .get(hostile_code)
             .is_none());
+
+        let event = capture
+            .events()
+            .into_iter()
+            .find(|event| {
+                event.target == "subc_core::control"
+                    && event.fields.get("code") == Some(&"\"module_rejected\"".to_string())
+            })
+            .expect("route.open module-rejection refusal event");
+        let logged = event.fields.get("module_code").expect("module_code field");
+        assert!(!logged.bytes().any(|byte| byte < 0x20));
+        assert!(logged.contains(r"\u{1b}"), "module_code: {logged:?}");
     }
 
     #[tokio::test]

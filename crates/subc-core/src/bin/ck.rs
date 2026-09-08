@@ -1799,6 +1799,10 @@ fn provenance_value(value: Option<&Value>) -> String {
     }
 }
 
+fn terminal_safe_string(value: &str) -> String {
+    provenance_value(Some(&Value::String(value.to_string())))
+}
+
 fn provenance_image(value: Option<&Value>) -> String {
     let Some(value) = value else {
         return "is unknown".to_string();
@@ -2739,27 +2743,55 @@ fn daemon_frame_drop_summary(describe: &Value) -> String {
         .and_then(|counters| counters.get("module_frames_dropped_no_route_last_10m"))
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    if drops == 0 {
-        return "no frame drops in the last 10 minutes".to_string();
+    let frame_drop_summary = if drops == 0 {
+        "no frame drops in the last 10 minutes".to_string()
+    } else {
+        let top = describe
+            .get("counters")
+            .and_then(|counters| counters.get("module_frames_dropped_no_route_by_module"))
+            .and_then(Value::as_object)
+            .and_then(|modules| {
+                modules
+                    .iter()
+                    .filter_map(|(module_id, count)| count.as_u64().map(|count| (module_id, count)))
+                    .max_by(|(left_id, left_count), (right_id, right_count)| {
+                        left_count
+                            .cmp(right_count)
+                            .then_with(|| right_id.cmp(left_id))
+                    })
+                    .map(|(module_id, _)| module_id.as_str())
+            })
+            .unwrap_or("unknown");
+        let noun = if drops == 1 { "drop" } else { "drops" };
+        format!("{drops} frame {noun} in the last 10 minutes, top: {top}")
+    };
+    let refusals = describe
+        .get("counters")
+        .and_then(|counters| counters.get("route_open_refused_by_code"))
+        .and_then(Value::as_object)
+        .map(|codes| codes.values().filter_map(Value::as_u64).sum::<u64>())
+        .unwrap_or(0);
+    if refusals == 0 {
+        return frame_drop_summary;
     }
     let top = describe
         .get("counters")
-        .and_then(|counters| counters.get("module_frames_dropped_no_route_by_module"))
+        .and_then(|counters| counters.get("route_open_refused_by_code"))
         .and_then(Value::as_object)
-        .and_then(|modules| {
-            modules
+        .and_then(|codes| {
+            codes
                 .iter()
-                .filter_map(|(module_id, count)| count.as_u64().map(|count| (module_id, count)))
-                .max_by(|(left_id, left_count), (right_id, right_count)| {
+                .filter_map(|(code, count)| count.as_u64().map(|count| (code, count)))
+                .max_by(|(left_code, left_count), (right_code, right_count)| {
                     left_count
                         .cmp(right_count)
-                        .then_with(|| right_id.cmp(left_id))
+                        .then_with(|| right_code.cmp(left_code))
                 })
-                .map(|(module_id, _)| module_id.as_str())
+                .map(|(code, _)| terminal_safe_string(code))
         })
-        .unwrap_or("unknown");
-    let noun = if drops == 1 { "drop" } else { "drops" };
-    format!("{drops} frame {noun} in the last 10 minutes, top: {top}")
+        .unwrap_or_else(|| "unknown".to_string());
+    let noun = if refusals == 1 { "refusal" } else { "refusals" };
+    format!("{frame_drop_summary}; {refusals} route.open {noun}, top: {top}")
 }
 
 /// Compare the daemon's embedded build provenance against this CLI's own.
@@ -4655,8 +4687,22 @@ fn display_json_value(value: &Value) -> String {
         Value::Bool(value) => value.to_string(),
         Value::Number(value) => value.to_string(),
         Value::Array(_) | Value::Object(_) => {
-            serde_json::to_string(value).unwrap_or_else(|_| value.to_string())
+            serde_json::to_string(&terminal_safe_json(value)).unwrap_or_else(|_| value.to_string())
         }
+    }
+}
+
+fn terminal_safe_json(value: &Value) -> Value {
+    match value {
+        Value::String(value) => Value::String(terminal_safe_string(value)),
+        Value::Array(values) => Value::Array(values.iter().map(terminal_safe_json).collect()),
+        Value::Object(values) => Value::Object(
+            values
+                .iter()
+                .map(|(key, value)| (terminal_safe_string(key), terminal_safe_json(value)))
+                .collect(),
+        ),
+        other => other.clone(),
     }
 }
 
@@ -5902,6 +5948,23 @@ mod tests {
             assert!(
                 escaped.contains(r"\x1b") || escaped.contains(r"\x07") || escaped.contains(r"\x0a")
             );
+        }
+    }
+
+    #[test]
+    fn route_open_refusal_counter_renderers_escape_terminal_controls() {
+        let hostile = "\u{1b}]52;c;AAAA\u{07}";
+        let summary = daemon_frame_drop_summary(&serde_json::json!({
+            "counters": {
+                "module_frames_dropped_no_route_last_10m": 0,
+                "route_open_refused_by_code": { hostile: 1 }
+            }
+        }));
+        let verbose = display_json_value(&serde_json::json!({ hostile: 1 }));
+
+        for rendered in [summary, verbose] {
+            assert!(!rendered.bytes().any(|byte| byte < 0x20));
+            assert!(rendered.contains(r"\x1b"), "rendered: {rendered:?}");
         }
     }
 

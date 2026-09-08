@@ -961,6 +961,11 @@ fn setup_nothing_to_do_never_renders_outcome_no_op() {
     );
 }
 
+// Magic Context has no Windows release (`Component::Mc` is declared
+// unsupported there, and the served index carries no Windows asset for it),
+// so on Windows `ck setup mc` refuses before any of the steps these two tests
+// pin; the refusal itself is covered by the planner's unit tests.
+#[cfg(not(windows))]
 #[test]
 fn setup_mc_apply_reports_each_completed_change_without_a_plan() {
     let fixture = SetupFixture::installed("ck-setup-mc-apply");
@@ -991,6 +996,7 @@ fn setup_mc_apply_reports_each_completed_change_without_a_plan() {
     );
 }
 
+#[cfg(not(windows))]
 #[test]
 fn setup_mc_dry_run_has_future_steps_and_the_config_diff() {
     let fixture = SetupFixture::installed("ck-setup-mc-dry-run");
@@ -1073,6 +1079,13 @@ fn setup_verbose_keeps_every_preexisting_outcome_line() {
     }
 }
 
+// The apply path registers and starts the daemon through the service
+// manager, which these tests stand in for with a script on PATH. Windows
+// process creation searches System32 before PATH, so a fixture named
+// `schtasks.exe` can never shadow the real one and the real one refuses the
+// task it cannot find. The Windows registration path is exercised by the
+// setup-runtime CI job against a real scheduled task instead.
+#[cfg(not(windows))]
 #[test]
 fn fresh_setup_prints_the_pasteable_claude_code_command() {
     let fixture = SetupFixture::fresh("ck-setup-fresh-next");
@@ -2390,12 +2403,23 @@ fn ck_command() -> Command {
 }
 
 /// The platform's system tool directories and nothing else.
+///
+/// On Windows the release-index transport is `powershell.exe`, which lives
+/// under `System32\WindowsPowerShell\v1.0`, not `System32` itself; without
+/// that entry every setup and upgrade test fails with "program not found",
+/// and the hanging-source test never connects, so its listener thread waits
+/// on `accept()` forever and the whole suite hangs on the join.
 fn system_path_only() -> std::ffi::OsString {
     #[cfg(windows)]
     {
         let root = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
         let root = Path::new(&root);
-        std::env::join_paths([root.join("System32"), root.to_path_buf()]).unwrap()
+        std::env::join_paths([
+            root.join("System32"),
+            root.to_path_buf(),
+            root.join("System32").join("WindowsPowerShell").join("v1.0"),
+        ])
+        .unwrap()
     }
     #[cfg(not(windows))]
     {

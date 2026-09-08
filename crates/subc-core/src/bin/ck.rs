@@ -2739,27 +2739,55 @@ fn daemon_frame_drop_summary(describe: &Value) -> String {
         .and_then(|counters| counters.get("module_frames_dropped_no_route_last_10m"))
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    if drops == 0 {
-        return "no frame drops in the last 10 minutes".to_string();
+    let frame_drop_summary = if drops == 0 {
+        "no frame drops in the last 10 minutes".to_string()
+    } else {
+        let top = describe
+            .get("counters")
+            .and_then(|counters| counters.get("module_frames_dropped_no_route_by_module"))
+            .and_then(Value::as_object)
+            .and_then(|modules| {
+                modules
+                    .iter()
+                    .filter_map(|(module_id, count)| count.as_u64().map(|count| (module_id, count)))
+                    .max_by(|(left_id, left_count), (right_id, right_count)| {
+                        left_count
+                            .cmp(right_count)
+                            .then_with(|| right_id.cmp(left_id))
+                    })
+                    .map(|(module_id, _)| module_id.as_str())
+            })
+            .unwrap_or("unknown");
+        let noun = if drops == 1 { "drop" } else { "drops" };
+        format!("{drops} frame {noun} in the last 10 minutes, top: {top}")
+    };
+    let refusals = describe
+        .get("counters")
+        .and_then(|counters| counters.get("route_open_refused_by_code"))
+        .and_then(Value::as_object)
+        .map(|codes| codes.values().filter_map(Value::as_u64).sum::<u64>())
+        .unwrap_or(0);
+    if refusals == 0 {
+        return frame_drop_summary;
     }
     let top = describe
         .get("counters")
-        .and_then(|counters| counters.get("module_frames_dropped_no_route_by_module"))
+        .and_then(|counters| counters.get("route_open_refused_by_code"))
         .and_then(Value::as_object)
-        .and_then(|modules| {
-            modules
+        .and_then(|codes| {
+            codes
                 .iter()
-                .filter_map(|(module_id, count)| count.as_u64().map(|count| (module_id, count)))
-                .max_by(|(left_id, left_count), (right_id, right_count)| {
+                .filter_map(|(code, count)| count.as_u64().map(|count| (code, count)))
+                .max_by(|(left_code, left_count), (right_code, right_count)| {
                     left_count
                         .cmp(right_count)
-                        .then_with(|| right_id.cmp(left_id))
+                        .then_with(|| right_code.cmp(left_code))
                 })
-                .map(|(module_id, _)| module_id.as_str())
+                .map(|(code, _)| code.as_str())
         })
         .unwrap_or("unknown");
-    let noun = if drops == 1 { "drop" } else { "drops" };
-    format!("{drops} frame {noun} in the last 10 minutes, top: {top}")
+    let noun = if refusals == 1 { "refusal" } else { "refusals" };
+    format!("{frame_drop_summary}; {refusals} route.open {noun}, top: {top}")
 }
 
 /// Compare the daemon's embedded build provenance against this CLI's own.

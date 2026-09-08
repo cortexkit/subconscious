@@ -1526,6 +1526,58 @@ impl ControlHandler {
         )?))
     }
 
+    fn route_open_refusal_frame(
+        &self,
+        ctx: &RouteCtx,
+        frame: &Frame,
+        module_id: &str,
+        code: &'static str,
+        message: impl Into<String>,
+    ) -> Result<Frame, RouterError> {
+        self.observe_route_open_refusal(ctx, module_id, code);
+        control_error_frame(frame, code, message.into())
+    }
+
+    fn observe_route_open_refusal(&self, ctx: &RouteCtx, module_id: &str, code: &str) {
+        self.counters.increment_route_open_refused(code);
+        info!(
+            target: "subc_core::control",
+            code,
+            module_id = %module_id,
+            connection_id = ctx.connection_id.get(),
+            "route.open refused"
+        );
+    }
+
+    fn supervised_absent_route_open_refusal_frame(
+        &self,
+        ctx: &RouteCtx,
+        frame: &Frame,
+        module_id: &str,
+        code: &'static str,
+        status: &crate::supervise::ModuleStatus,
+    ) -> Result<Frame, RouterError> {
+        self.counters.increment_route_open_refused(code);
+        info!(
+            target: "subc_core::control",
+            code,
+            module_id = %module_id,
+            connection_id = ctx.connection_id.get(),
+            state = %status.state,
+            enabled = status.enabled,
+            live = status.live,
+            "route.open refused"
+        );
+        control_error_frame(
+            frame,
+            code,
+            format!(
+                "module_id '{module_id}' is supervised but not available (state={}, enabled={}, live={})",
+                status.state, status.enabled, status.live
+            ),
+        )
+    }
+
     async fn handle_route_open(
         &self,
         ctx: &RouteCtx,
@@ -1573,46 +1625,54 @@ impl ControlHandler {
             if let Some((status, warming)) =
                 self.supervisor_status(&target_module_id, frame.header.corr)?
             {
-                return Ok(vec![control_error_frame(
+                let code = if warming {
+                    "module_warming"
+                } else {
+                    "target_unavailable"
+                };
+                return Ok(vec![self.supervised_absent_route_open_refusal_frame(
+                    ctx,
                     &frame,
-                    if warming {
-                        "module_warming"
-                    } else {
-                        "target_unavailable"
-                    },
-                    format!(
-                        "module_id '{target_module_id}' is supervised but not available (state={}, enabled={}, live={})",
-                        status.state, status.enabled, status.live
-                    ),
+                    &target_module_id,
+                    code,
+                    &status,
                 )?]);
             }
             if let Some(removed_ago_ms) =
                 self.supervisor.removal_tombstone_age_ms(&target_module_id)
             {
-                return Ok(vec![control_error_frame(
+                return Ok(vec![self.route_open_refusal_frame(
+                    ctx,
                     &frame,
+                    &target_module_id,
                     error_codes::MODULE_REMOVED,
                     format!("module_id '{target_module_id}' was removed {removed_ago_ms} ms ago"),
                 )?]);
             }
-            return Ok(vec![control_error_frame(
+            return Ok(vec![self.route_open_refusal_frame(
+                ctx,
                 &frame,
+                &target_module_id,
                 error_codes::UNKNOWN_MODULE,
                 format!("module_id '{target_module_id}' is not registered"),
             )?]);
         };
 
         if !target_has_required_role(&target, &registration.manifest.provides) {
-            return Ok(vec![control_error_frame(
+            return Ok(vec![self.route_open_refusal_frame(
+                ctx,
                 &frame,
+                &target_module_id,
                 "target_unavailable",
                 format!("module_id '{target_module_id}' does not provide the requested target"),
             )?]);
         }
 
         if registration.state != ChannelState::Active {
-            return Ok(vec![control_error_frame(
+            return Ok(vec![self.route_open_refusal_frame(
+                ctx,
                 &frame,
+                &target_module_id,
                 "target_unavailable",
                 format!("module_id '{target_module_id}' is not active"),
             )?]);
@@ -1623,8 +1683,10 @@ impl ControlHandler {
             .module_is_draining(&target_module_id)
             .map_err(RouterError::Forwarding)?
         {
-            return Ok(vec![control_error_frame(
+            return Ok(vec![self.route_open_refusal_frame(
+                ctx,
                 &frame,
+                &target_module_id,
                 "module_reloading",
                 format!("module_id '{target_module_id}' is reloading"),
             )?]);
@@ -1636,8 +1698,10 @@ impl ControlHandler {
             .and_then(|process_liveness| process_liveness.process_live(&target_module_id))
             == Some(false)
         {
-            return Ok(vec![control_error_frame(
+            return Ok(vec![self.route_open_refusal_frame(
+                ctx,
                 &frame,
+                &target_module_id,
                 "target_unavailable",
                 format!("module_id '{target_module_id}' is not live"),
             )?]);
@@ -1648,8 +1712,10 @@ impl ControlHandler {
             .has_live_module_connection(&target_module_id)
             .map_err(RouterError::Forwarding)?
         {
-            return Ok(vec![control_error_frame(
+            return Ok(vec![self.route_open_refusal_frame(
+                ctx,
                 &frame,
+                &target_module_id,
                 "target_unavailable",
                 format!("module_id '{target_module_id}' has no live forwarding connection"),
             )?]);
@@ -1658,12 +1724,16 @@ impl ControlHandler {
         if let Some(error) =
             self.guard_module_control_op(&frame, &target_module_id, "route.bind")?
         {
+            self.observe_route_open_refusal(ctx, &target_module_id, "op_not_allowed");
             return Ok(vec![error]);
         }
 
         let principal = match self.route_open_principal(&frame, consumer_identity)? {
             Ok(principal) => principal,
-            Err(error) => return Ok(vec![error]),
+            Err(error) => {
+                self.observe_route_open_refusal(ctx, &target_module_id, "bad_consumer_identity");
+                return Ok(vec![error]);
+            }
         };
 
         // This is attested, control-plane policy for supervised module origins.
@@ -1687,8 +1757,10 @@ impl ControlHandler {
                         capability,
                         "refusing route.open because an attested capability deny edge matches"
                     );
-                    return Ok(vec![control_error_frame(
+                    return Ok(vec![self.route_open_refusal_frame(
+                        ctx,
                         &frame,
+                        &target_module_id,
                         "capability_forbidden",
                         format!(
                             "module_id '{opening_module_id}' must never reach capability '{capability}' provided by '{target_module_id}'"
@@ -1705,8 +1777,10 @@ impl ControlHandler {
                     if self.admission_facts_carrier_module_id.as_deref() == Some(module_id)
             );
             if !carrier_matches {
-                return Ok(vec![control_error_frame(
+                return Ok(vec![self.route_open_refusal_frame(
+                    ctx,
                     &frame,
+                    &target_module_id,
                     "admission_facts_not_permitted",
                     "admission facts may only be carried by the configured reserved module",
                 )?]);
@@ -1717,8 +1791,10 @@ impl ControlHandler {
                 .as_ref()
                 .is_some_and(|targets| targets.iter().any(|id| id == &target_module_id));
             if !target_allowed {
-                return Ok(vec![control_error_frame(
+                return Ok(vec![self.route_open_refusal_frame(
+                    ctx,
                     &frame,
+                    &target_module_id,
                     "admission_facts_target_not_allowed",
                     format!(
                         "admission facts are not permitted for target module_id '{target_module_id}'"
@@ -1785,8 +1861,10 @@ impl ControlHandler {
         {
             Ok(pending) => pending,
             Err(err) => {
-                return Ok(vec![control_error_frame(
+                return Ok(vec![self.route_open_refusal_frame(
+                    ctx,
                     &frame,
+                    &target_module_id,
                     forwarding_error_code(&err),
                     err.to_string(),
                 )?])
@@ -1843,8 +1921,10 @@ impl ControlHandler {
 
         if let Err(err) = module_sink.send(relay_frame).await {
             reservation.release_and_disarm();
-            return Ok(vec![control_error_frame(
+            return Ok(vec![self.route_open_refusal_frame(
+                ctx,
                 &frame,
+                &target_module_id,
                 "target_unavailable",
                 err.to_string(),
             )?]);
@@ -1870,6 +1950,7 @@ impl ControlHandler {
             }
             Ok(Ok(RouteBindRelayOutcome::Rejected(body))) => {
                 reservation.release_and_disarm();
+                self.observe_route_open_refusal(ctx, &target_module_id, &body.code);
                 Ok(vec![control_error_body_frame(&frame, body)?])
             }
             Ok(Ok(RouteBindRelayOutcome::ModuleGone(message))) => {
@@ -1884,16 +1965,20 @@ impl ControlHandler {
                     module_id = %target_module_id,
                     "route.bind relay abandoned: {message}"
                 );
-                Ok(vec![control_error_frame(
+                Ok(vec![self.route_open_refusal_frame(
+                    ctx,
                     &frame,
+                    &target_module_id,
                     "target_unavailable",
                     message,
                 )?])
             }
             Ok(Err(_)) => {
                 reservation.release_and_disarm();
-                Ok(vec![control_error_frame(
+                Ok(vec![self.route_open_refusal_frame(
+                    ctx,
                     &frame,
+                    &target_module_id,
                     "target_unavailable",
                     "route.bind relay waiter was canceled before the module responded",
                 )?])
@@ -1912,8 +1997,10 @@ impl ControlHandler {
                     timeout_ms = route_bind_relay_timeout.as_millis() as u64,
                     "route.bind relay timed out: module did not ack within budget"
                 );
-                Ok(vec![control_error_frame(
+                Ok(vec![self.route_open_refusal_frame(
+                    ctx,
                     &frame,
+                    &target_module_id,
                     "module_timeout",
                     format!(
                         "module_id '{target_module_id}' did not answer route.bind within {:?}",
@@ -3995,7 +4082,13 @@ pub(crate) fn send_route_control_pushes(
 
 #[cfg(test)]
 mod tests {
-    use std::{path::PathBuf, sync::Arc, time::Duration};
+    use std::{
+        collections::BTreeMap,
+        fmt,
+        path::PathBuf,
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
 
     use serde_json::{json, Value};
     use subc_protocol::{
@@ -4021,6 +4114,11 @@ mod tests {
         sync::mpsc,
         time::{sleep, Instant},
     };
+    use tracing::{
+        field::{Field, Visit},
+        Event, Subscriber,
+    };
+    use tracing_subscriber::{layer::Context, prelude::*, Layer};
 
     /// Locates the `fake-aft-stub` binary from a `src/lib.rs` unit test.
     ///
@@ -4440,6 +4538,49 @@ mod tests {
         })
         .unwrap();
         Frame::build(FrameType::Request, control_flags(), 0, 0, corr, body).unwrap()
+    }
+
+    #[derive(Clone, Default)]
+    struct EventCapture {
+        events: Arc<Mutex<Vec<CapturedEvent>>>,
+    }
+
+    #[derive(Clone, Debug)]
+    struct CapturedEvent {
+        target: String,
+        fields: BTreeMap<String, String>,
+    }
+
+    impl EventCapture {
+        fn events(&self) -> Vec<CapturedEvent> {
+            self.events.lock().unwrap().clone()
+        }
+    }
+
+    impl<S> Layer<S> for EventCapture
+    where
+        S: Subscriber,
+    {
+        fn on_event(&self, event: &Event<'_>, _context: Context<'_, S>) {
+            let mut visitor = EventFieldVisitor::default();
+            event.record(&mut visitor);
+            self.events.lock().unwrap().push(CapturedEvent {
+                target: event.metadata().target().to_string(),
+                fields: visitor.fields,
+            });
+        }
+    }
+
+    #[derive(Default)]
+    struct EventFieldVisitor {
+        fields: BTreeMap<String, String>,
+    }
+
+    impl Visit for EventFieldVisitor {
+        fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+            self.fields
+                .insert(field.name().to_string(), format!("{value:?}"));
+        }
     }
 
     fn health_response(corr: u64, status: HealthStatus) -> Frame {
@@ -6517,6 +6658,71 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("state=running, enabled=true, live=false"));
+    }
+
+    #[tokio::test]
+    async fn route_open_supervised_absence_emits_refusal_fields_and_counts_code() {
+        let registry = Arc::new(Registry::default());
+        let supervisor_handle = SupervisorHandle::new();
+        let supervisor =
+            Supervisor::new(Arc::clone(&registry), RestartPolicy::new(0, Duration::ZERO))
+                .with_handle(supervisor_handle.clone())
+                .with_connection_file_path(std::env::temp_dir().join(format!(
+                    "subc-route-open-refusal-info-{}",
+                    std::process::id()
+                )));
+        let module = supervisor
+            .supervise_configured(
+                ModuleSpec {
+                    module_id: "warming".to_string(),
+                    program: fake_aft_stub_path(),
+                    args: Vec::new(),
+                    env: Vec::new(),
+                    reserved: false,
+                    reserved_prefixes: Vec::new(),
+                },
+                true,
+            )
+            .unwrap();
+        assert_eq!(module.state().unwrap(), ModuleState::Running);
+
+        let handler = ControlHandler::new(Arc::clone(&registry)).with_supervisor(supervisor_handle);
+        assert!(handler
+            .counters()
+            .snapshot()
+            .get("route_open_refused_by_code")
+            .is_none());
+        let capture = EventCapture::default();
+        let _subscriber =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(capture.clone()));
+        let (ctx, _rx) = route_ctx(ConnectionId::new(94));
+        let response = handler
+            .handle_control_frame(
+                &ctx,
+                route_open_frame(394, "warming", unique_project_root("refusal-info")),
+            )
+            .await
+            .unwrap();
+        module.stop().await.unwrap();
+
+        assert_eq!(parse_error(&response[0])["code"], "module_warming");
+        let event = capture
+            .events()
+            .into_iter()
+            .find(|event| {
+                event.target == "subc_core::control"
+                    && event.fields.get("code") == Some(&"\"module_warming\"".to_string())
+            })
+            .expect("route.open refusal event");
+        assert_eq!(event.fields.get("module_id"), Some(&"warming".to_string()));
+        assert_eq!(event.fields.get("connection_id"), Some(&"94".to_string()));
+        assert_eq!(event.fields.get("state"), Some(&"running".to_string()));
+        assert_eq!(event.fields.get("enabled"), Some(&"true".to_string()));
+        assert_eq!(event.fields.get("live"), Some(&"false".to_string()));
+        assert_eq!(
+            handler.counters().snapshot()["route_open_refused_by_code"],
+            json!({ "module_warming": 1 })
+        );
     }
 
     #[tokio::test]

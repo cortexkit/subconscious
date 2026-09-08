@@ -68,6 +68,7 @@ pub struct DaemonCounters {
     // Per-module maps and the rate window are daemon-lifetime diagnostics only:
     // they deliberately reset on restart instead of becoming durable daemon state.
     module_frames_dropped_no_route_by_module: Arc<Mutex<HashMap<String, u64>>>,
+    route_open_refused_by_code: Arc<Mutex<HashMap<String, u64>>>,
     module_frames_dropped_no_route_window: Arc<Mutex<DropWindow>>,
     module_requests_dropped_stale_route: Arc<AtomicU64>,
     client_frames_dropped_stale_route: Arc<AtomicU64>,
@@ -170,10 +171,15 @@ impl DaemonCounters {
             "module_frames_dropped_no_route_nonzero_minutes_last_10m".into(),
             drop_window.nonzero_minutes_last_10m(now).into(),
         );
-        insert_nonempty_module_counts(
+        insert_nonempty_counts(
             &mut snapshot,
             "module_frames_dropped_no_route_by_module",
             &self.module_frames_dropped_no_route_by_module,
+        );
+        insert_nonempty_counts(
+            &mut snapshot,
+            "route_open_refused_by_code",
+            &self.route_open_refused_by_code,
         );
         snapshot.insert(
             "module_requests_dropped_stale_route".into(),
@@ -205,7 +211,7 @@ impl DaemonCounters {
                 .load(Ordering::Relaxed)
                 .into(),
         );
-        insert_nonempty_module_counts(
+        insert_nonempty_counts(
             &mut snapshot,
             "goodbye_relay_module_dropped_by_module",
             &self.goodbye_relay_module_dropped_by_module,
@@ -229,12 +235,16 @@ impl DaemonCounters {
         self.module_frames_dropped_no_route
             .fetch_add(1, Ordering::Relaxed);
         if let Some(module_id) = module_id {
-            increment_module_count(&self.module_frames_dropped_no_route_by_module, module_id);
+            increment_keyed_count(&self.module_frames_dropped_no_route_by_module, module_id);
         }
         self.module_frames_dropped_no_route_window
             .lock()
             .expect("drop-rate window mutex poisoned")
             .record(tokio::time::Instant::now());
+    }
+
+    pub(crate) fn increment_route_open_refused(&self, code: &str) {
+        increment_keyed_count(&self.route_open_refused_by_code, code);
     }
 
     pub(crate) fn increment_module_requests_dropped_stale_route(&self) {
@@ -261,7 +271,7 @@ impl DaemonCounters {
         self.goodbye_relay_module_dropped
             .fetch_add(1, Ordering::Relaxed);
         if let Some(module_id) = module_id {
-            increment_module_count(&self.goodbye_relay_module_dropped_by_module, module_id);
+            increment_keyed_count(&self.goodbye_relay_module_dropped_by_module, module_id);
         }
     }
 
@@ -276,21 +286,21 @@ impl DaemonCounters {
     }
 }
 
-fn increment_module_count(counts: &Mutex<HashMap<String, u64>>, module_id: &str) {
+fn increment_keyed_count(counts: &Mutex<HashMap<String, u64>>, key: &str) {
     *counts
         .lock()
-        .expect("module drop-count mutex poisoned")
-        .entry(module_id.to_string())
+        .expect("keyed counter mutex poisoned")
+        .entry(key.to_string())
         .or_default() += 1;
 }
 
-fn insert_nonempty_module_counts(
+fn insert_nonempty_counts(
     snapshot: &mut serde_json::Map<String, Value>,
     key: &str,
     counts: &Mutex<HashMap<String, u64>>,
 ) {
     let counts: MutexGuard<'_, HashMap<String, u64>> =
-        counts.lock().expect("module drop-count mutex poisoned");
+        counts.lock().expect("keyed counter mutex poisoned");
     if !counts.is_empty() {
         snapshot.insert(key.to_string(), json!(&*counts));
     }

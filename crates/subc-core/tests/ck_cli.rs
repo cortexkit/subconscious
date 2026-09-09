@@ -457,6 +457,8 @@ impl SetupFixture {
         Self::new(name, true)
     }
 
+    // Used only by the setup-apply tests, which are gated off Windows above.
+    #[cfg(not(windows))]
     fn fresh(name: &str) -> Self {
         Self::new(name, false)
     }
@@ -720,6 +722,8 @@ fn fixture_asset(url: String, sha256: String, bytes: u64, reports: Option<&str>)
     json!({"url": url, "sha256": sha256, "bytes": bytes, "reports": reports})
 }
 
+// Used only by the setup-apply tests, which are gated off Windows above.
+#[cfg(not(windows))]
 fn fixture_archive(_root: &Path, binary: &str, version_line: &str, filler_bytes: u64) -> Vec<u8> {
     let script = format!("#!/bin/sh\necho '{version_line}'\n").into_bytes();
     let filler = vec![0; filler_bytes.try_into().unwrap()];
@@ -730,6 +734,8 @@ fn fixture_archive(_root: &Path, binary: &str, version_line: &str, filler_bytes:
     ])
 }
 
+// Used only by the setup-apply tests, which are gated off Windows above.
+#[cfg(not(windows))]
 fn stored_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
     let mut archive = Vec::new();
     let mut central = Vec::new();
@@ -784,6 +790,8 @@ fn stored_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
     archive
 }
 
+// Used only by the setup-apply tests, which are gated off Windows above.
+#[cfg(not(windows))]
 fn crc32(bytes: &[u8]) -> u32 {
     let mut crc = u32::MAX;
     for byte in bytes {
@@ -795,10 +803,14 @@ fn crc32(bytes: &[u8]) -> u32 {
     !crc
 }
 
+// Used only by the setup-apply tests, which are gated off Windows above.
+#[cfg(not(windows))]
 fn push_u16(output: &mut Vec<u8>, value: u16) {
     output.extend_from_slice(&value.to_le_bytes());
 }
 
+// Used only by the setup-apply tests, which are gated off Windows above.
+#[cfg(not(windows))]
 fn push_u32(output: &mut Vec<u8>, value: u32) {
     output.extend_from_slice(&value.to_le_bytes());
 }

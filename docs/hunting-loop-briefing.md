@@ -12256,3 +12256,20 @@ Two rules from it:
   mechanism showed they were constant by construction.
 
 (CKCRED found it as one clause on an unrelated reply; ALF read the rows.)
+
+## 2026-09-09 — a fixed-provider acceptance leg measures the provider's quota
+
+- BROCA's deploy acceptance script drove one pinned model; that account was inside a spent
+  OAuth window, so a correctly placed binary returned `429 rate_limit_error` and a second
+  provider did the same before a third completed. A red leg then has two explanations the
+  script cannot separate, and the dangerous reading is the inverse one: "just Anthropic" on
+  a placement that broke. Acceptance legs take the model as an argument and map provider
+  refusals to a distinct exit code from serve failures.
+- Instrument class, three times in one day: the line that explains the failure was cut by
+  `head -N`, redirected to `/dev/null`, or dropped by a pipeline — and the reasoning
+  proceeded from the silence. Before reading an empty result as "not dispatched", print the
+  untruncated stderr of the same command.
+- Placement gate arms that can read a plausible zero from a broken instrument (relative
+  path without `./`, `codesign -d` without `-v`, a quoted literal that is not the bytes in
+  the binary) must be re-run with the instrument fixed before any zero is believed; a
+  control that must read non-zero on the same command is the cheap way to know.

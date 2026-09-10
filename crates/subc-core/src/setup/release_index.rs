@@ -352,10 +352,19 @@ pub(super) fn download(url: &str, destination: &Path) -> Result<(), String> {
     }
 }
 
+/// Unique per call within this process and across processes. The pid
+/// separates processes; the counter separates calls, because two fetches
+/// on different threads can read the same wall-clock nanoseconds (Windows
+/// reports the system time in coarse ticks), and a shared path lets one
+/// fetch's body land beside another fetch's signature header, which then
+/// verifies as tampered.
 fn temporary_path(name: &str) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     std::env::temp_dir().join(format!(
-        "ck-setup-{name}-{}-{}",
+        "ck-setup-{name}-{}-{}-{}",
         process::id(),
+        SEQUENCE.fetch_add(1, Ordering::Relaxed),
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system time is after the Unix epoch")

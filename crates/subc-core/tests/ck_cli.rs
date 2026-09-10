@@ -1385,6 +1385,107 @@ fn daemon_lint_uses_its_explicit_config_without_a_daemon_connection() {
     );
 }
 
+// A copy of ck under a `ck-<name>` filename on PATH is what cargo test
+// produces on Windows, where target/debug and its deps directory are
+// prepended to PATH and every other build of ck sits there as `ck-<hash>`.
+// The probe ck sends to domains is `--ck-domain`; if ck answered that flag
+// by rendering help, help would discover domains, discover the copy, probe
+// it, and the copy would do the same: each level waits out the two-second
+// probe deadline and leaves orphans that keep spawning. Two properties keep
+// that impossible, each proven here against real copies of ck rather than
+// scripts, and measured by counting the ck processes a command starts (the
+// test build logs every invocation), because a timing bound cannot tell a
+// probe deadline from a loaded host: ck refuses `--ck-domain` before any
+// discovery, so the probe starts no process at all; and a ck copy is never
+// listed as a domain by `--help`, which probes each copy exactly once.
+#[test]
+fn a_copy_of_ck_on_path_is_neither_probed_recursively_nor_listed() {
+    let temp = TempDir::new("ck-twin-on-path");
+    let bin = temp.path().join("bin");
+    fs::create_dir_all(&bin).expect("create fake PATH");
+    let invocations = temp.path().join("invocations.log");
+    let count_invocations = || {
+        fs::read_to_string(&invocations)
+            .map(|log| log.lines().count())
+            .unwrap_or(0)
+    };
+    // Two copies, because a ck never probes its own executable: the CI shape
+    // has many builds of ck side by side, and the recursion runs between
+    // them, each copy probing the other.
+    for name in ["ck-twin", "ck-twin-two"] {
+        fs::copy(
+            env!("CARGO_BIN_EXE_ck-under-test"),
+            bin.join(platform_binary(name)),
+        )
+        .expect("copy ck as a domain");
+    }
+    let path = std::env::join_paths(
+        std::iter::once(bin.clone()).chain(std::env::split_paths(&system_path_only())),
+    )
+    .expect("fixture PATH");
+
+    // The probe itself: ck must answer without discovering anything, so the
+    // only ck process in the log is the one this test started.
+    let probed = ck_command()
+        .arg("--ck-domain")
+        .env("PATH", &path)
+        .env("CK_TEST_INVOCATION_LOG", &invocations)
+        .output()
+        .expect("probe ck itself");
+    assert_eq!(
+        count_invocations(),
+        1,
+        "ck --ck-domain started other ck processes:\n{}",
+        fs::read_to_string(&invocations).unwrap_or_default()
+    );
+    assert_exit(&probed, 2);
+    assert!(
+        probed.stdout.is_empty(),
+        "a probed ck must print no headline:\n{}",
+        text(&probed.stdout)
+    );
+    assert!(
+        text(&probed.stderr).contains("not a domain"),
+        "refusal names the reason:\n{}",
+        text(&probed.stderr)
+    );
+
+    // Help discovers: each copy is probed exactly once (the copies refuse
+    // without probing anything themselves), and neither is listed.
+    fs::remove_file(&invocations).ok();
+    let help = ck_command()
+        .arg("--help")
+        .env("PATH", &path)
+        .env("CK_TEST_INVOCATION_LOG", &invocations)
+        .output()
+        .expect("run help with a ck copy on PATH");
+    assert_exit(&help, 0);
+    assert_eq!(
+        count_invocations(),
+        3,
+        "help must probe each of the two copies exactly once:\n{}",
+        fs::read_to_string(&invocations).unwrap_or_default()
+    );
+    let help_text = text(&help.stdout);
+    assert!(
+        !help_text.contains("\n  twin"),
+        "a copy of ck was listed as a domain:\n{help_text}"
+    );
+
+    // An unknown flag takes the same no-discovery path: one line and the
+    // next step, never the rendered command tree.
+    let unknown = ck_command()
+        .arg("--no-such-flag")
+        .env("PATH", &path)
+        .output()
+        .expect("unknown flag");
+    assert_exit(&unknown, 2);
+    assert_eq!(
+        text(&unknown.stderr).trim(),
+        "unknown flag '--no-such-flag'. Run ck --help."
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn external_domains_opt_in_dispatch_and_cache_their_probe() {

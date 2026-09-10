@@ -127,6 +127,12 @@ fn external_domain_candidates() -> BTreeMap<String, ExternalDomainCandidate> {
     let Some(path_var) = env::var_os("PATH") else {
         return BTreeMap::new();
     };
+    // A copy of this executable under a `ck-<name>` filename is not a domain
+    // and must never be probed: the probe would run ck, and a ck that
+    // discovered domains on that path would probe the copy again.
+    let own_executable = env::current_exe()
+        .ok()
+        .and_then(|exe| fs::canonicalize(exe).ok());
     let mut candidates = BTreeMap::new();
     for directory in env::split_paths(&path_var) {
         let Ok(entries) = fs::read_dir(&directory) else {
@@ -168,6 +174,9 @@ fn external_domain_candidates() -> BTreeMap<String, ExternalDomainCandidate> {
                         .unwrap_or_else(|_| PathBuf::from(name))
                 }
             });
+            if own_executable.as_ref() == Some(&absolute) {
+                continue;
+            }
             candidates.insert(
                 name.to_string(),
                 ExternalDomainCandidate {
@@ -326,8 +335,29 @@ const SETUP_HELP: &str = "ck setup — plan managed CortexKit installation\n\nus
 
 const UPGRADE_HELP: &str = "ck upgrade — plan managed component upgrades\n\nusage:\n  ck upgrade [--dry-run] [--verbose]\n  ck upgrade --check [--verbose]\n\n  --check reports available updates without changing anything. --dry-run prints\n  the complete plan without changing anything. --verbose includes plan outcomes\n  and execution evidence.";
 
+/// Test builds append one line per invocation to the file named by
+/// `CK_TEST_INVOCATION_LOG`, so a test can count how many ck processes a
+/// command started — the only honest measure of "did ck probe a copy of
+/// itself", since timing bounds cannot separate a probe deadline from a
+/// loaded host. Production builds carry no such hook.
+#[cfg(feature = "test-support")]
+fn record_test_invocation() {
+    if let Some(path) = env::var_os("CK_TEST_INVOCATION_LOG").filter(|value| !value.is_empty()) {
+        let line = env::args_os()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join(" ");
+        if let Ok(mut file) = fs::OpenOptions::new().append(true).create(true).open(path) {
+            use std::io::Write as _;
+            let _ = writeln!(file, "{line}");
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
+    #[cfg(feature = "test-support")]
+    record_test_invocation();
     match run(env::args_os()).await {
         Ok(()) => match cleanup_replaced_windows_ck() {
             Ok(()) => process::exit(0),
@@ -5388,11 +5418,27 @@ fn parse_args(argv: impl IntoIterator<Item = OsString>) -> Result<CkArgs, CkErro
                     command: Command::BuildShape,
                 })
             }
+            // `--ck-domain` is the probe ck sends to `ck-<name>` binaries on
+            // PATH. ck itself is the dispatcher, never a domain, and it must
+            // answer the probe WITHOUT discovering domains: cargo puts
+            // target/debug and its deps directory on PATH for test runs on
+            // Windows, where every other build of ck sits under a `ck-<hash>`
+            // name, so a ck that rendered help here would probe those copies,
+            // each of which would render help and probe again. That recursion
+            // took the Windows CI runner down for a week (2026-09-04..10).
+            Some(arg) if arg == OsStr::new("--ck-domain") => {
+                return Err(CkError::Usage(
+                    "ck is the dispatcher, not a domain; nothing to probe".to_string(),
+                ))
+            }
+            // An unknown flag renders no help: help discovers domains by
+            // probing PATH, and an error path that probes is the recursion
+            // vector named above. One line and the next step is the whole
+            // answer.
             Some(arg) if arg.to_string_lossy().starts_with('-') => {
                 return Err(CkError::Usage(format!(
-                    "unknown flag '{}'\n\n{}",
+                    "unknown flag '{}'. Run ck --help.",
                     arg.to_string_lossy(),
-                    top_help()
                 )))
             }
             Some(arg) => {

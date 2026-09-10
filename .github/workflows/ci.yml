@@ -111,8 +111,16 @@ jobs:
       # window reached production ungated. A red job that means "lint failed and
       # tests passed" is honest; one that means "lint failed and tests are
       # unknown" is not, and the two are indistinguishable from the outside.
+      # The full suite finishes in minutes on every platform (the whole
+      # cross-built set ran in under three minutes on a Windows VM). A step
+      # that is still running at this bound is hung, and a hung step must end
+      # by timeout rather than by the runner dying: a timed-out step keeps its
+      # log, and libtest names any test that has run for over sixty seconds in
+      # that log, while a runner that loses communication with the server
+      # uploads nothing (2026-09-09, Windows, 2h46m, no log).
       - name: Test
         if: ${{ !cancelled() }}
+        timeout-minutes: 40
         run: cargo test --workspace --all-targets --locked
 
       # --all-targets does NOT include doctests, despite the name: it expands to

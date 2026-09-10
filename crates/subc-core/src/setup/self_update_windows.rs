@@ -169,8 +169,12 @@ mod tests {
         TestTempDir::new(name)
     }
 
+    // The bound proves nothing about speed; it only stops a broken handshake
+    // from hanging the suite. The held process waits through the parent's
+    // replacement, which hashes a debug test executable three times and
+    // copies it once, and that has taken over ten seconds on a slow disk.
     fn wait_for(path: &Path) {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_secs(120);
         while !path.exists() {
             assert!(
                 Instant::now() < deadline,

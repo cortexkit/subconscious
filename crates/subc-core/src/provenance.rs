@@ -85,6 +85,9 @@ impl ExecutableIdentityProbe {
                 if process_start_time(pid) != Some(expected_start_time) {
                     return unavailable(RunningImageUnavailableReason::ProcessIdentityUnconfirmed);
                 }
+                if !exe_link_names_spawned_path(pid, &spawned_from) {
+                    return unavailable(RunningImageUnavailableReason::ProcessIdentityUnconfirmed);
+                }
                 let mut cache = cache
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -111,6 +114,39 @@ impl ExecutableIdentityProbe {
             unavailable(RunningImageUnavailableReason::UnsupportedPlatform)
         }
     }
+}
+
+/// Whether `/proc/<pid>/exe` names the path the supervisor spawned, so the
+/// image digested through that link is the spawned program's and not some
+/// other file the pid happens to be executing.
+///
+/// The case this exists for is a child observed in the instant after
+/// `spawn()` returned. With glibc's `posix_spawn` the parent resumes when the
+/// child releases the old address space, which the kernel does in
+/// `exec_mmap` before installing the new one, so for a moment the child's
+/// exe link still names the parent's own binary. A digest read through the
+/// link then is the parent's, it disagrees with the spawned file by
+/// construction, and without this check the probe called that a `Mismatch`
+/// (twice on GitHub's Ubuntu runners; the running digest changed with every
+/// build while the disk digest never did). The same guard covers a program
+/// that re-executes another binary, such as a wrapper script: the probe
+/// cannot confirm that image against the spawned path, and says so, rather
+/// than reporting the wrapper as replaced.
+///
+/// A replaced binary is not this case: rename-over leaves the link naming
+/// the same path with ` (deleted)` appended, which is stripped so the digest
+/// comparison still runs and reports the replacement.
+#[cfg(target_os = "linux")]
+fn exe_link_names_spawned_path(pid: u32, spawned_from: &Path) -> bool {
+    let Ok(link) = std::fs::read_link(format!("/proc/{pid}/exe")) else {
+        return false;
+    };
+    let Ok(spawned) = std::fs::canonicalize(spawned_from) else {
+        return false;
+    };
+    let link = link.to_string_lossy();
+    let link = link.strip_suffix(" (deleted)").unwrap_or(&link);
+    Path::new(link) == spawned
 }
 
 #[cfg(target_os = "linux")]
@@ -298,6 +334,44 @@ mod tests {
         TestTempDir::new(label)
     }
 
+    /// A live child running a copy of `sleep` that the test owns, returned
+    /// once its exe link names that copy.
+    ///
+    /// The spawn retries on `ETXTBSY`. Tests run in parallel threads, and a
+    /// `Command::spawn` on another thread forks while this thread's
+    /// `fs::copy` still holds the file open for write; the forked child
+    /// carries that descriptor until its own exec, and during that window
+    /// the kernel refuses to execute the file (6 in 80 runs on a two-core
+    /// VM). Then the wait: `spawn()` can return while the child's exe link
+    /// still names this test binary (see `exe_link_names_spawned_path`), so
+    /// the probe is only run once the link has moved. Both bounded, so a
+    /// child that never gets there fails the test rather than hanging it.
+    #[cfg(target_os = "linux")]
+    async fn spawn_owned_sleep(dir: &Path) -> (tokio::process::Child, PathBuf) {
+        let executable = dir.join("sleep");
+        fs::copy("/bin/sleep", &executable).unwrap();
+        let mut attempts = 0;
+        let child = loop {
+            match Command::new(&executable).arg("60").spawn() {
+                Ok(child) => break child,
+                Err(err) if err.kind() == io::ErrorKind::ExecutableFileBusy && attempts < 50 => {
+                    attempts += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                Err(err) => panic!("spawn {}: {err}", executable.display()),
+            }
+        };
+        let pid = child.id().unwrap();
+        let canonical = fs::canonicalize(&executable).unwrap();
+        for _ in 0..200 {
+            if fs::read_link(format!("/proc/{pid}/exe")).ok().as_deref() == Some(&*canonical) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        (child, executable)
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn equal_opened_images_match() {
@@ -432,21 +506,15 @@ mod tests {
         ));
     }
 
-    /// The child runs a copy of `sleep` that this test owns, not `/bin/sleep`
-    /// itself. On GitHub's ubuntu runners this test twice reported
-    /// `Mismatch` with two genuine, different digests and the start time
-    /// intact — the shape of `/usr/bin/sleep` being replaced on disk
-    /// between spawn and comparison (the image runs unattended package
-    /// upgrades after boot), which no local machine reproduces (0/70 on an
-    /// arm64 VM under load). A file under the test's own temp dir cannot
-    /// be replaced by anything but the test.
+    /// The child runs a copy of `sleep` that this test owns, so nothing but
+    /// the test can change the file. The three CI failures this test has had
+    /// were all the pre-exec instant `spawn_owned_sleep` now waits out: each
+    /// had a different "running" digest and the same disk digest.
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn live_spawned_process_with_matching_start_time_still_matches() {
         let dir = temp_dir("live-child");
-        let executable = dir.join("sleep");
-        fs::copy("/bin/sleep", &executable).unwrap();
-        let mut child = Command::new(&executable).arg("60").spawn().unwrap();
+        let (mut child, executable) = spawn_owned_sleep(&dir).await;
         let pid = child.id().unwrap();
         let start_time = process_start_time(pid).unwrap();
         let agreement = ExecutableIdentityProbe::default()
@@ -460,6 +528,64 @@ mod tests {
             matches!(agreement, RunningImageAgreement::Match { .. }),
             "expected Match for a live child spawned from {}, got {agreement:?}; /proc/{pid}/exe -> {running_target:?}",
             executable.display()
+        );
+    }
+
+    /// The probe is told the child was spawned from a file other than the
+    /// one its exe link names: the pre-exec instant, or a wrapper that
+    /// re-executed something else. Both files exist and differ, so without
+    /// the link check this reads as a replaced binary; the honest answer is
+    /// that the running image cannot be confirmed against the spawned path.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn exe_link_naming_another_path_is_unconfirmed_not_a_mismatch() {
+        let dir = temp_dir("other-path");
+        let claimed = dir.join("claimed");
+        fs::write(
+            &claimed,
+            b"a different image at the path the probe was told about",
+        )
+        .unwrap();
+        let (mut child, _executable) = spawn_owned_sleep(&dir).await;
+        let pid = child.id().unwrap();
+        let start_time = process_start_time(pid).unwrap();
+        let agreement = ExecutableIdentityProbe::default()
+            .observe(Some(pid), Some(&claimed), None, Some(start_time))
+            .await;
+        child.start_kill().unwrap();
+        child.wait().await.unwrap();
+
+        assert_eq!(
+            agreement,
+            RunningImageAgreement::Unavailable {
+                reason: RunningImageUnavailableReason::ProcessIdentityUnconfirmed,
+            },
+        );
+    }
+
+    /// A binary replaced by rename-over while the process runs: the exe link
+    /// keeps naming the spawned path (with ` (deleted)`), so the link check
+    /// must let the digest comparison through to report the replacement.
+    /// The control for the test above: same shape, opposite verdict.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_binary_replaced_under_a_live_process_is_a_mismatch() {
+        let dir = temp_dir("replaced");
+        let (mut child, executable) = spawn_owned_sleep(&dir).await;
+        let pid = child.id().unwrap();
+        let start_time = process_start_time(pid).unwrap();
+        let replacement = dir.join("sleep.new");
+        fs::write(&replacement, b"not the image the child is running").unwrap();
+        fs::rename(&replacement, &executable).unwrap();
+        let agreement = ExecutableIdentityProbe::default()
+            .observe(Some(pid), Some(&executable), None, Some(start_time))
+            .await;
+        child.start_kill().unwrap();
+        child.wait().await.unwrap();
+
+        assert!(
+            matches!(agreement, RunningImageAgreement::Mismatch { .. }),
+            "expected Mismatch for a replaced binary, got {agreement:?}"
         );
     }
 

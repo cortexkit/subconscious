@@ -439,6 +439,42 @@ fn contract_fixtures_are_valid_json() {
     }
 }
 
+/// The exported predicate is held to the decision table row by row, in both
+/// directions: every code the table calls retryable must answer true, every
+/// terminal code false, and a code the table does not list must be terminal.
+/// The table is the record the daemon and every SDK are tested against, so
+/// the executable predicate cannot drift from it without this going red.
+#[test]
+fn route_open_retry_predicate_matches_the_decision_table() {
+    let table: Value =
+        serde_json::from_str(&fs::read_to_string(golden_path("decision_tables")).unwrap()).unwrap();
+    let rows = table["route_open_retryable"]
+        .as_object()
+        .expect("route_open_retryable is an object");
+    assert!(rows.len() >= 10, "table too small to be the real one");
+    let mut retryable_seen = 0;
+    for (code, verdict) in rows {
+        let expected = match verdict.as_str().unwrap() {
+            "retryable" => true,
+            "terminal" => false,
+            other => panic!("unknown verdict {other} for {code}"),
+        };
+        retryable_seen += usize::from(expected);
+        assert_eq!(
+            subc_protocol::error_codes::is_retryable_route_open(code),
+            expected,
+            "{code}: table says {verdict}"
+        );
+    }
+    assert!(
+        retryable_seen >= 4,
+        "no retryable rows would make this vacuous"
+    );
+    assert!(!subc_protocol::error_codes::is_retryable_route_open(
+        "a_code_nobody_declared"
+    ));
+}
+
 fn assert_golden<T>(name: &str, value: &T)
 where
     T: Serialize + DeserializeOwned + PartialEq + Debug,

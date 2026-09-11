@@ -3856,18 +3856,10 @@ fn emit_callbacks(callbacks: Vec<Callback>, state: ConnectionState) {
     }
 }
 
+/// The route-open retry predicate, defined once in `subc_protocol::error_codes`
+/// so consumers with their own connection layer share it rather than copy it.
 pub fn is_retryable_route_open_code(code: &str) -> bool {
-    match code {
-        // A capability deny is a policy refusal, not transient target absence.
-        // Keep this explicit so a future broad retry matcher cannot reopen it.
-        "capability_forbidden" => false,
-        error_codes::UNKNOWN_MODULE
-        | error_codes::MODULE_RELOADING
-        | error_codes::MODULE_WARMING
-        | error_codes::TARGET_UNAVAILABLE
-        | error_codes::MODULE_TIMEOUT => true,
-        _ => false,
-    }
+    error_codes::is_retryable_route_open(code)
 }
 
 fn is_retryable_catalog_transport_error(err: &CallError) -> bool {

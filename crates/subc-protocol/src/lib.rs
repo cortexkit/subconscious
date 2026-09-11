@@ -50,6 +50,29 @@ pub mod error_codes {
     pub const MODULE_WARMING: &str = "module_warming";
     pub const TARGET_UNAVAILABLE: &str = "target_unavailable";
     pub const MODULE_TIMEOUT: &str = "module_timeout";
+
+    /// Whether a `route.open` refusal carrying `code` may be retried in place
+    /// within the caller's deadline, or is terminal for the target as named.
+    ///
+    /// This lives beside the codes because every consumer with its own
+    /// connection layer needs the same answer: a copied list breaks loudly on
+    /// a renamed code and silently on an added one. The SDKs call this; the
+    /// golden `decision_tables.json` (`route_open_retryable`) is the record
+    /// the daemon and every SDK are tested against, and the test in
+    /// `golden_json.rs` holds this function to it.
+    ///
+    /// Unknown codes are terminal: a refusal this crate has never heard of
+    /// must not be retried on the strength of a match-all arm.
+    pub fn is_retryable_route_open(code: &str) -> bool {
+        matches!(
+            code,
+            UNKNOWN_MODULE
+                | MODULE_RELOADING
+                | MODULE_WARMING
+                | TARGET_UNAVAILABLE
+                | MODULE_TIMEOUT
+        )
+    }
 }
 
 pub use frame::{Frame, FrameBuildError};

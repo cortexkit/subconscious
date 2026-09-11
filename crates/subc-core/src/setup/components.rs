@@ -459,9 +459,11 @@ pub fn owned_binary_paths(inventory: &Inventory) -> Vec<PathBuf> {
 /// `is_installed`, which setup uses to decide whether to place a component
 /// and which recognises only setup's own `managed-binary` rows.
 pub fn component_is_owned(component: Component, binary_home: &Path, inventory: &Inventory) -> bool {
-    component_binary_paths(component, binary_home)
-        .iter()
-        .all(|path| {
+    let paths = component_binary_paths(component, binary_home);
+    // A component with no binaries on this target (MC on Windows) has nothing
+    // to own, and `all` over nothing is true; it must read as not installed.
+    !paths.is_empty()
+        && paths.iter().all(|path| {
             path.is_file()
                 && OWNED_BINARY_KINDS
                     .iter()
@@ -973,6 +975,24 @@ mod tests {
         assert_eq!(labels.first(), Some(&"ck-subc"));
         assert_eq!(labels.last(), Some(&"ck"));
 
+        // A component with an empty binary set on this target is not
+        // installed, even though `all` over nothing would say so.
+        let empty_home = fixture_dir("empty-set-home");
+        let empty_inventory = Inventory::load(
+            empty_home.join("installer-manifest.json"),
+            host_alpha_target().label(),
+        )
+        .expect("inventory");
+        for component in Component::ALL {
+            if component_binaries(component).is_empty() {
+                assert!(!component_is_owned(
+                    component,
+                    empty_home.path(),
+                    &empty_inventory
+                ));
+            }
+        }
+
         // The rows `ck upgrade` itself writes are `binary-placement`; a
         // machine upgraded once must still read as installed, or the next
         // upgrade sees nothing to do.
@@ -1010,6 +1030,11 @@ mod tests {
             };
             let program = module_program(component).expect("module component has a program");
             assert_eq!(supervised_module_id(program), Some(module_id));
+            if component_binaries(component).is_empty() {
+                // Not shipped on this host target (MC on Windows): the table
+                // rows still hold, but there is no roster entry to bind.
+                continue;
+            }
             let restart_target = roster
                 .iter()
                 .find(|target| target.component == component && target.module_id().is_some())

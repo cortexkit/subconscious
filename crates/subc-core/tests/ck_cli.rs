@@ -1237,6 +1237,8 @@ impl UpgradeFixture {
             .env("CK_TEST_CK_VERSION", "0.17.9")
             .env("CK_TEST_SUBC_MCP_VERSION", "0.17.9")
             .env("CK_TEST_AFT_VERSION", "0.55.1")
+            .env("CK_TEST_CLAUSTRUM_VERSION", "0.8.0")
+            .env("CK_TEST_AUTH_VERSION", "0.8.0")
             .env("CK_TEST_SETUP_MODULES", "aft,claustrum")
             .env(
                 "CK_UPDATE_CACHE_PATH",

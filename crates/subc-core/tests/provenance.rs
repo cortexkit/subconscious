@@ -34,7 +34,7 @@ use common::{
     connect_authed_client, start_test_daemon_with_process_liveness_and_supervisor, TestDaemon,
 };
 
-const READ_TIMEOUT: Duration = Duration::from_secs(10);
+const PROVENANCE_REPLY_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn supervisor_provenance_reports_declared_and_observed_module_facts() {
@@ -290,7 +290,14 @@ async fn provenance_request(
     .unwrap();
     write_frame(&mut client, &request).await.unwrap();
     client.flush().await.unwrap();
-    let frame = timeout(READ_TIMEOUT, read_frame(&mut client))
+    // The first provenance evaluation sha256-hashes the module's running
+    // image through /proc and the replacement from disk; the replacement here
+    // is the debug `ck` binary (~18 MiB), and on a cold, contended CI disk
+    // that legitimately exceeds a 10 s read window: the ubuntu leg timed out
+    // here with the same shape the ck_cli caller
+    // (`control_rpc_value_on_stream_within`) had already been sized for.
+    // The window is sized to the slowest acceptable progress, not the median.
+    let frame = timeout(PROVENANCE_REPLY_TIMEOUT, read_frame(&mut client))
         .await
         .unwrap()
         .unwrap()

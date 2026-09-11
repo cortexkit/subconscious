@@ -190,13 +190,18 @@ pub fn discover_managed_upgrade_targets(
 }
 
 #[cfg(feature = "test-support")]
+/// `CK_TEST_<LABEL>_VERSION` for any roster binary, the label upper-cased
+/// with its `ck-` prefix dropped and dashes as underscores: `ck-subc-mcp` →
+/// `CK_TEST_SUBC_MCP_VERSION`, `ck` → `CK_TEST_CK_VERSION`. Derived rather
+/// than listed so a binary the roster gains is coverable by the CLI fixtures
+/// on Windows, where a shell-script fake cannot be executed for its version.
 fn test_installed_version(target: UpgradeTarget) -> Option<String> {
-    let key = match target.label() {
-        "ck-subc-mcp" => "CK_TEST_SUBC_MCP_VERSION",
-        "ck-aft" => "CK_TEST_AFT_VERSION",
-        "ck" => "CK_TEST_CK_VERSION",
-        _ => return None,
-    };
+    let label = target.label();
+    let stem = label.strip_prefix("ck-").unwrap_or(label);
+    let key = format!(
+        "CK_TEST_{}_VERSION",
+        stem.to_ascii_uppercase().replace('-', "_")
+    );
     env::var_os(key).map(|version| version.to_string_lossy().into_owned())
 }
 

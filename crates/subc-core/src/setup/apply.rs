@@ -210,6 +210,16 @@ impl SetupBackend {
         .unwrap_or_default();
         observed.restart_required =
             config::restart_required_from_pending_keys(self.runtime_status.live, &pending_keys);
+        observed.inventory_owned_paths = [
+            "runtime-registration",
+            "runtime-definition",
+            "managed-link",
+            "managed-binary",
+            "binary-placement",
+        ]
+        .iter()
+        .map(|kind| self.inventory.paths_for_kind(kind).len())
+        .sum();
         Ok(observed)
     }
 
@@ -350,10 +360,17 @@ impl SetupBackend {
                             format!("configuration: {}", self.paths.config_path.display()),
                             format!("store: {}", self.paths.data_dir.join("stores").display()),
                         ],
+                        deferred: Vec::new(),
                     });
             println!("retained after uninstall:");
             for retained in report.retained {
                 println!("  {retained}");
+            }
+            if !report.deferred.is_empty() {
+                println!("completes after this process exits:");
+                for deferred in report.deferred {
+                    println!("  {deferred}");
+                }
             }
             return Ok(());
         }

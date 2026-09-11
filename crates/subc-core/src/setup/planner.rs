@@ -234,6 +234,17 @@ fn plan_uninstall(observed: &SetupObserved, mut plan: SetupPlan) -> SetupPlan {
             removals += 1;
         }
     }
+    // Component detection asks "is this installed"; uninstall asks "does the
+    // manifest still own anything". After a partial uninstall the answers
+    // differ: nothing detects, files remain. The removal walks every owned
+    // path whichever component it is issued for, so one is enough.
+    if removals == 0 && observed.inventory_owned_paths > 0 {
+        plan.operations
+            .push(SetupOperation::RemoveManagedComponent {
+                component: Component::Core,
+            });
+        removals += 1;
+    }
     plan.operations.push(SetupOperation::RetainUserData);
     if removals == 0 {
         plan.outcomes.push(PlanOutcome::Noop {
@@ -551,6 +562,7 @@ mod tests {
             mc_detection: None,
             detections: BTreeMap::new(),
             restart_required: Vec::new(),
+            inventory_owned_paths: 0,
         }
     }
 
@@ -649,6 +661,49 @@ mod tests {
         let report = execute_setup(&plan, ExecutionMode::Apply, &mut executor).unwrap();
         assert!(report.applied.is_empty());
         assert!(executor.applied.is_empty());
+    }
+
+    /// After an uninstall that failed partway, no component detects (the
+    /// daemon binary and config rows are gone) but the manifest still owns
+    /// files on disk. The retry must plan a removal for them, and an empty
+    /// manifest must still plan nothing.
+    #[test]
+    fn uninstall_plans_a_removal_for_manifest_residue_no_component_detects() {
+        let request = SetupRequest {
+            uninstall: true,
+            ..SetupRequest::install(Vec::new())
+        };
+        let mut residue = observed_setup();
+        for component in Component::ALL {
+            residue
+                .components
+                .insert(component, ComponentState::Missing);
+        }
+        residue.runtime = RuntimeState::Missing;
+        residue.inventory_owned_paths = 2;
+        let plan = plan_setup(&residue, &request);
+        assert!(
+            plan.operations
+                .iter()
+                .any(|op| matches!(op, SetupOperation::RemoveManagedComponent { .. })),
+            "{:?}",
+            plan.operations
+        );
+        assert!(!plan
+            .outcomes
+            .iter()
+            .any(|outcome| matches!(outcome, PlanOutcome::Noop { .. })));
+
+        residue.inventory_owned_paths = 0;
+        let plan = plan_setup(&residue, &request);
+        assert!(!plan
+            .operations
+            .iter()
+            .any(|op| matches!(op, SetupOperation::RemoveManagedComponent { .. })));
+        assert!(plan
+            .outcomes
+            .iter()
+            .any(|outcome| matches!(outcome, PlanOutcome::Noop { .. })));
     }
 
     #[test]

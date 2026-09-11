@@ -254,6 +254,11 @@ pub struct SetupObserved {
     /// the config it loaded at start for some sections; setup must restart it
     /// before a later rescan/enable can honour the new file.
     pub restart_required: Vec<String>,
+    /// Files the installer manifest still owns on this host, regardless of
+    /// whether the components they belong to detect as installed. An
+    /// uninstall that failed partway leaves exactly this: the daemon rows
+    /// gone, so no component detects, and the binaries still on disk.
+    pub inventory_owned_paths: usize,
 }
 
 impl SetupObserved {
@@ -286,6 +291,7 @@ impl SetupObserved {
             mc_detection: Some(mc_detection),
             detections,
             restart_required: Vec::new(),
+            inventory_owned_paths: 0,
         }
     }
 

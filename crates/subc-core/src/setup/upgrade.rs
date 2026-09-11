@@ -136,8 +136,7 @@ pub fn discover_managed_upgrade_targets(
     executable: &Path,
     daemon_catalog: Option<&DaemonCatalogBuild>,
 ) -> Result<Vec<ManagedUpgradeTarget>, String> {
-    let mut owned = inventory.paths_for_kind("managed-binary");
-    owned.extend(inventory.paths_for_kind("binary-placement"));
+    let owned = super::components::owned_binary_paths(inventory);
     let executable = canonical_or_original(executable);
     let mut targets = Vec::new();
     for target in upgrade_roster(installed_components(inventory)) {

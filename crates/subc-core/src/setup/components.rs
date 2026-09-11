@@ -438,9 +438,39 @@ pub fn is_installed(component: Component, binary_home: &Path, inventory: &Invent
         .all(|path| path.is_file() && inventory.owns_path("managed-binary", path))
 }
 
+/// The inventory kinds under which a managed binary is owned. Setup records
+/// `managed-binary`; the bootstrap installers and `ck upgrade` record
+/// `binary-placement`. Upgrade discovery and the roster must agree on this
+/// list or a machine upgraded once reads as having nothing installed — which
+/// is what the macOS drive showed when the roster counted one kind and the
+/// owned set counted both.
+pub const OWNED_BINARY_KINDS: [&str; 2] = ["managed-binary", "binary-placement"];
+
+/// Every binary path the inventory owns under either kind.
+pub fn owned_binary_paths(inventory: &Inventory) -> Vec<PathBuf> {
+    OWNED_BINARY_KINDS
+        .iter()
+        .flat_map(|kind| inventory.paths_for_kind(kind))
+        .collect()
+}
+
+/// Whether every binary of `component` for this host is on disk under
+/// `binary_home` and inventory-owned under either kind. Distinct from
+/// `is_installed`, which setup uses to decide whether to place a component
+/// and which recognises only setup's own `managed-binary` rows.
+pub fn component_is_owned(component: Component, binary_home: &Path, inventory: &Inventory) -> bool {
+    component_binary_paths(component, binary_home)
+        .iter()
+        .all(|path| {
+            path.is_file()
+                && OWNED_BINARY_KINDS
+                    .iter()
+                    .any(|kind| inventory.owns_path(kind, path))
+        })
+}
+
 pub fn installed_components(inventory: &Inventory) -> Vec<Component> {
-    let binary_homes = inventory
-        .paths_for_kind("managed-binary")
+    let binary_homes = owned_binary_paths(inventory)
         .into_iter()
         .filter_map(|path| path.parent().map(Path::to_path_buf))
         .collect::<BTreeSet<_>>();
@@ -449,7 +479,7 @@ pub fn installed_components(inventory: &Inventory) -> Vec<Component> {
         .filter(|component| {
             binary_homes
                 .iter()
-                .any(|binary_home| is_installed(*component, binary_home, inventory))
+                .any(|binary_home| component_is_owned(*component, binary_home, inventory))
         })
         .collect()
 }
@@ -942,6 +972,24 @@ mod tests {
         }
         assert_eq!(labels.first(), Some(&"ck-subc"));
         assert_eq!(labels.last(), Some(&"ck"));
+
+        // The rows `ck upgrade` itself writes are `binary-placement`; a
+        // machine upgraded once must still read as installed, or the next
+        // upgrade sees nothing to do.
+        let root = fixture_dir("placement-rows");
+        let binary_home = root.join("bin");
+        fs::create_dir_all(&binary_home).expect("binary home");
+        let mut placed = Inventory::load(
+            root.join("installer-manifest.json"),
+            host_alpha_target().label(),
+        )
+        .expect("inventory");
+        for binary in component_binaries(Component::Core) {
+            let path = binary_home.join(platform_binary(binary));
+            fs::write(&path, binary).expect("fixture binary");
+            placed.record("binary-placement", &path, Map::new());
+        }
+        assert_eq!(installed_components(&placed), [Component::Core]);
 
         let (_root, _, core_inventory) = inventory_with("core-upgrade-roster", &[Component::Core]);
         assert_eq!(

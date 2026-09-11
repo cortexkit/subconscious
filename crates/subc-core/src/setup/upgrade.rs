@@ -94,30 +94,35 @@ fn inventory_string(inventory: &Inventory, path: &Path, key: &str) -> Option<Str
         })
 }
 
-fn load_current_inventory() -> Result<Inventory, String> {
-    let data_dir = if cfg!(windows) {
-        env::var_os("LOCALAPPDATA")
+/// The managed data directory, resolved the way setup resolves it; the
+/// inventory and the placed binaries both live under it.
+fn load_current_inventory_root() -> Result<PathBuf, String> {
+    if cfg!(windows) {
+        return env::var_os("LOCALAPPDATA")
             .filter(|value| !value.is_empty())
             .map(PathBuf::from)
             .map(|path| path.join("cortexkit"))
             .ok_or_else(|| {
                 "LOCALAPPDATA is unavailable for managed upgrade discovery".to_string()
-            })?
-    } else if let Some(data_home) = env::var_os("XDG_DATA_HOME").filter(|value| !value.is_empty()) {
-        PathBuf::from(data_home).join("cortexkit")
-    } else {
-        env::var_os("HOME")
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from)
-            .ok_or_else(|| {
-                "the user home directory is unavailable for managed upgrade discovery".to_string()
-            })?
-            .join(".local")
-            .join("share")
-            .join("cortexkit")
-    };
+            });
+    }
+    if let Some(data_home) = env::var_os("XDG_DATA_HOME").filter(|value| !value.is_empty()) {
+        return Ok(PathBuf::from(data_home).join("cortexkit"));
+    }
+    Ok(env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            "the user home directory is unavailable for managed upgrade discovery".to_string()
+        })?
+        .join(".local")
+        .join("share")
+        .join("cortexkit"))
+}
+
+fn load_current_inventory() -> Result<Inventory, String> {
     Inventory::load(
-        data_dir.join("installer-manifest.json"),
+        load_current_inventory_root()?.join("installer-manifest.json"),
         super::model::PlatformObservation::current()
             .to_string()
             .as_str(),
@@ -363,7 +368,12 @@ impl SystemUpgradeBackend {
         let module_id = target
             .module_id()
             .ok_or_else(|| format!("{target} is not a supervised module"))?;
-        let output = self.run_ck(&["--json", "module", "status", module_id])?;
+        // A module restart rides on the daemon; if the daemon itself is
+        // between incarnations when this polls, the status call fails and
+        // that is "not yet" under the completion budget, not a verdict.
+        let Ok(output) = self.run_ck(&["--json", "module", "status", module_id]) else {
+            return Ok(false);
+        };
         let value: Value = serde_json::from_str(&output)
             .map_err(|error| format!("invalid module status JSON for {target}: {error}"))?;
         let live = value
@@ -404,8 +414,14 @@ impl SystemUpgradeBackend {
                 "no daemon connection file was supplied for service verification".to_string(),
             );
         };
-        let connection = connection_file::read_for_client(subc)
-            .map_err(|error| format!("could not read daemon connection after restart: {error}"))?;
+        // Polled from the moment the service manager returns, which on macOS
+        // is before the new daemon has bound its port or rewritten the
+        // connection file. An unreadable file, a stale pid, or a refused
+        // connection are all "not yet" while the completion budget runs;
+        // only the budget turns them into the refusal.
+        let Ok(connection) = connection_file::read_for_client(subc) else {
+            return Ok(false);
+        };
         let expected = self
             .expected_versions
             .get(UpgradeTarget::Daemon.label())
@@ -414,8 +430,7 @@ impl SystemUpgradeBackend {
         if connection.pid == 0 || connection.daemon_ver != expected {
             return Ok(false);
         }
-        self.run_ck(&["daemon"])?;
-        Ok(true)
+        Ok(self.run_ck(&["daemon"]).is_ok())
     }
 
     fn module_provenance(&self, target: UpgradeTarget) -> Result<(Option<u32>, bool), String> {
@@ -642,7 +657,14 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
         &mut self,
         drain_timeout: Duration,
     ) -> Result<String, String> {
-        let detail = super::runtime::restart_via_service_manager()?;
+        let platform = super::runtime::RuntimePlatform::current();
+        let definition = super::runtime::runtime_paths(
+            platform,
+            &load_current_inventory_root()?.join("bin"),
+            &super::apply::user_home()?,
+        )
+        .definition;
+        let detail = super::runtime::restart_via_service_manager(&definition)?;
         Ok(format!(
             "{detail}; drain budget={}s",
             drain_timeout.as_secs()

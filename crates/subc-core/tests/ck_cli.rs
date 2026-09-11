@@ -1393,20 +1393,25 @@ fn daemon_lint_uses_its_explicit_config_without_a_daemon_connection() {
 // it, and the copy would do the same: each level waits out the two-second
 // probe deadline and leaves orphans that keep spawning. Two properties keep
 // that impossible, each proven here against real copies of ck rather than
-// scripts, and measured by counting the ck processes a command starts (the
-// test build logs every invocation), because a timing bound cannot tell a
-// probe deadline from a loaded host: ck refuses `--ck-domain` before any
-// discovery, so the probe starts no process at all; and a ck copy is never
-// listed as a domain by `--help`, which probes each copy exactly once.
+// scripts, and measured by counting the probes a command launches (the
+// test build logs each one as the parent spawns it), because a timing bound
+// cannot tell a probe deadline from a loaded host: ck refuses `--ck-domain`
+// before any discovery, so the probe launches nothing; and a ck copy is
+// never listed as a domain by `--help`, which probes each copy exactly once
+// and, since each copy refuses without probing, launches nothing further.
 #[test]
 fn a_copy_of_ck_on_path_is_neither_probed_recursively_nor_listed() {
     let temp = TempDir::new("ck-twin-on-path");
     let bin = temp.path().join("bin");
     fs::create_dir_all(&bin).expect("create fake PATH");
-    let invocations = temp.path().join("invocations.log");
-    let count_invocations = || {
+    let invocations = temp.path().join("probes.log");
+    let count_probes = || {
         fs::read_to_string(&invocations)
-            .map(|log| log.lines().count())
+            .map(|log| {
+                log.lines()
+                    .filter(|line| line.starts_with("probe "))
+                    .count()
+            })
             .unwrap_or(0)
     };
     // Two copies, because a ck never probes its own executable: the CI shape
@@ -1424,8 +1429,8 @@ fn a_copy_of_ck_on_path_is_neither_probed_recursively_nor_listed() {
     )
     .expect("fixture PATH");
 
-    // The probe itself: ck must answer without discovering anything, so the
-    // only ck process in the log is the one this test started.
+    // The probe itself: ck must answer without discovering anything, so it
+    // launches no probe of its own.
     let probed = ck_command()
         .arg("--ck-domain")
         .env("PATH", &path)
@@ -1433,9 +1438,9 @@ fn a_copy_of_ck_on_path_is_neither_probed_recursively_nor_listed() {
         .output()
         .expect("probe ck itself");
     assert_eq!(
-        count_invocations(),
-        1,
-        "ck --ck-domain started other ck processes:\n{}",
+        count_probes(),
+        0,
+        "ck --ck-domain launched probes:\n{}",
         fs::read_to_string(&invocations).unwrap_or_default()
     );
     assert_exit(&probed, 2);
@@ -1450,8 +1455,9 @@ fn a_copy_of_ck_on_path_is_neither_probed_recursively_nor_listed() {
         text(&probed.stderr)
     );
 
-    // Help discovers: each copy is probed exactly once (the copies refuse
-    // without probing anything themselves), and neither is listed.
+    // Help discovers: each copy is probed exactly once, the copies launch
+    // no probes of their own (they inherit the log and would show here),
+    // and neither is listed.
     fs::remove_file(&invocations).ok();
     let help = ck_command()
         .arg("--help")
@@ -1461,9 +1467,9 @@ fn a_copy_of_ck_on_path_is_neither_probed_recursively_nor_listed() {
         .expect("run help with a ck copy on PATH");
     assert_exit(&help, 0);
     assert_eq!(
-        count_invocations(),
-        3,
-        "help must probe each of the two copies exactly once:\n{}",
+        count_probes(),
+        2,
+        "help must probe each of the two copies exactly once and nothing else:\n{}",
         fs::read_to_string(&invocations).unwrap_or_default()
     );
     let help_text = text(&help.stdout);
@@ -1514,22 +1520,25 @@ fn external_domains_opt_in_dispatch_and_cache_their_probe() {
     write_program("ck-aft", "exit 1");
     write_program("ck-mc", "exit 1");
 
+    // The production probe deadline is two seconds; under a full parallel
+    // suite a shell-script domain has taken longer than that just to start,
+    // and a genuine domain then read as refused. The test build accepts a
+    // wider deadline, which changes nothing about what is proven: the hang
+    // is 30 s, so returning well under that still shows the deadline fired.
+    let probe_deadline_ms = "8000";
     let started = std::time::Instant::now();
     let help = ck_command()
         .arg("--help")
         .env("PATH", &bin)
         .env("CK_DOMAIN_PROBE_COUNT", &count)
         .env("CK_UPDATE_CACHE_PATH", &cache)
+        .env("CK_TEST_DOMAIN_PROBE_TIMEOUT_MS", probe_deadline_ms)
         .output()
         .expect("run help");
     assert_exit(&help, 0);
-    // The two-second deadline plus generous headroom: a loaded host (a full
-    // workspace test run) once pushed this past a bound with one second of
-    // slack. The hang is 30s, so anything under 15s proves the deadline
-    // fired and nothing else.
     assert!(
-        started.elapsed() < Duration::from_secs(15),
-        "a hanging probe must stop at its two-second deadline (took {:?})",
+        started.elapsed() < Duration::from_secs(20),
+        "a hanging probe must stop at the probe deadline, not run to completion (took {:?})",
         started.elapsed()
     );
     let help_text = text(&help.stdout);
@@ -1556,6 +1565,7 @@ fn external_domains_opt_in_dispatch_and_cache_their_probe() {
         .env("PATH", &bin)
         .env("CK_DOMAIN_PROBE_COUNT", &count)
         .env("CK_UPDATE_CACHE_PATH", &cache)
+        .env("CK_TEST_DOMAIN_PROBE_TIMEOUT_MS", probe_deadline_ms)
         .output()
         .expect("run cached help");
     assert_exit(&second_help, 0);
@@ -1582,6 +1592,7 @@ fn external_domains_opt_in_dispatch_and_cache_their_probe() {
         .env("PATH", &bin)
         .env("CK_DOMAIN_PROBE_COUNT", &count)
         .env("CK_UPDATE_CACHE_PATH", &cache)
+        .env("CK_TEST_DOMAIN_PROBE_TIMEOUT_MS", probe_deadline_ms)
         .output()
         .expect("dispatch approved domain");
     assert_exit(&dispatched, 0);
@@ -1597,6 +1608,7 @@ fn external_domains_opt_in_dispatch_and_cache_their_probe() {
         .env("PATH", &bin)
         .env("CK_DOMAIN_PROBE_COUNT", &count)
         .env("CK_UPDATE_CACHE_PATH", &cache)
+        .env("CK_TEST_DOMAIN_PROBE_TIMEOUT_MS", probe_deadline_ms)
         .output()
         .expect("run changed help");
     assert_exit(&refreshed, 0);

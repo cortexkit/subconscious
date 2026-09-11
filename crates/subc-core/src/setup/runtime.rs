@@ -435,13 +435,23 @@ fn platform_binary(name: &str) -> String {
 /// after replacing the daemon binary; setup uses it when a live daemon must
 /// pick up a restart-required configuration change. One verb table so the two
 /// callers cannot drift.
-pub fn restart_via_service_manager() -> Result<String, String> {
-    restart_via_service_manager_on(RuntimePlatform::current())
+/// Restarts the daemon under its service manager after its binary was
+/// replaced in place. `definition` is the service definition file (the
+/// LaunchAgent plist on macOS); the other platforms restart by unit or
+/// task name and ignore it.
+pub fn restart_via_service_manager(definition: &Path) -> Result<String, String> {
+    restart_via_service_manager_on(RuntimePlatform::current(), definition)
 }
 
-fn restart_via_service_manager_on(platform: RuntimePlatform) -> Result<String, String> {
+fn restart_via_service_manager_on(
+    platform: RuntimePlatform,
+    definition: &Path,
+) -> Result<String, String> {
     let mut details = Vec::new();
-    for (index, (program, args)) in restart_commands(platform).into_iter().enumerate() {
+    for (index, (program, args)) in restart_commands(platform, definition)
+        .into_iter()
+        .enumerate()
+    {
         let output = Command::new(&program)
             .args(&args)
             .output()
@@ -450,9 +460,10 @@ fn restart_via_service_manager_on(platform: RuntimePlatform) -> Result<String, S
             details.push(format!("{program} {} completed", args.join(" ")));
             continue;
         }
-        // Windows stop is best-effort: a task that is already stopped still
-        // needs /Run, and /End failing there must not block the restart.
-        if platform == RuntimePlatform::Windows && index == 0 {
+        // The first step stops what is running and is best-effort on every
+        // platform: a Windows task that is already stopped still needs /Run,
+        // and a macOS agent that is not loaded still needs bootstrap.
+        if index == 0 && matches!(platform, RuntimePlatform::Windows | RuntimePlatform::Macos) {
             continue;
         }
         return Err(format!(
@@ -464,16 +475,34 @@ fn restart_via_service_manager_on(platform: RuntimePlatform) -> Result<String, S
     Ok(details.join("; "))
 }
 
-fn restart_commands(platform: RuntimePlatform) -> Vec<(String, Vec<String>)> {
+fn restart_commands(platform: RuntimePlatform, definition: &Path) -> Vec<(String, Vec<String>)> {
     match platform {
-        RuntimePlatform::Macos => vec![(
-            "launchctl".to_string(),
+        // Out and back in, not `kickstart -k`. Two reasons. `kickstart -k`
+        // re-executes the loaded job definition and never re-reads the
+        // plist, so a definition rewritten by setup is not picked up until
+        // the agent is bootstrapped again. And launchd can hold a code
+        // requirement for the agent's program (`launchctl print` shows
+        // `managed LWCR`); a replaced binary that no longer satisfies it is
+        // refused at launch with `last exit reason = OS_REASON_CODESIGNING`,
+        // which is how a Developer ID release refused to start after
+        // replacing a development-signed daemon under `kickstart -k`, and
+        // bootstrapping the definition again is what cleared it. Re-bootstrap
+        // makes launchd take both the plist and the requirement from what is
+        // on disk now.
+        RuntimePlatform::Macos => {
+            let domain = format!("gui/{}", current_uid());
+            let definition = definition.to_string_lossy().into_owned();
             vec![
-                "kickstart".to_string(),
-                "-k".to_string(),
-                format!("gui/{}/{}", current_uid(), platform.identifier()),
-            ],
-        )],
+                (
+                    "launchctl".to_string(),
+                    vec!["bootout".to_string(), domain.clone(), definition.clone()],
+                ),
+                (
+                    "launchctl".to_string(),
+                    vec!["bootstrap".to_string(), domain, definition],
+                ),
+            ]
+        }
         RuntimePlatform::Linux => vec![(
             "systemctl".to_string(),
             vec![
@@ -866,17 +895,27 @@ mod tests {
 
     #[test]
     fn restart_verbs_match_the_upgrade_daemon_target() {
-        let macos = restart_commands(RuntimePlatform::Macos);
+        let plist = Path::new("/Users/u/Library/LaunchAgents/cortexkit.subc.plist");
+        let macos = restart_commands(RuntimePlatform::Macos, plist);
+        // Out and back in, both against the definition file, so launchd
+        // re-derives the program's code requirement from the replaced binary.
+        assert_eq!(macos.len(), 2);
         assert_eq!(macos[0].0, "launchctl");
-        assert_eq!(macos[0].1[0], "kickstart");
-        assert_eq!(macos[0].1[1], "-k");
-        let linux = restart_commands(RuntimePlatform::Linux);
+        assert_eq!(macos[0].1[0], "bootout");
+        assert_eq!(macos[0].1[2], plist.to_string_lossy());
+        assert_eq!(macos[1].0, "launchctl");
+        assert_eq!(macos[1].1[0], "bootstrap");
+        assert_eq!(macos[1].1[2], plist.to_string_lossy());
+        assert!(!macos
+            .iter()
+            .any(|(_, args)| args.iter().any(|a| a == "kickstart")));
+        let linux = restart_commands(RuntimePlatform::Linux, plist);
         assert_eq!(linux[0].0, "systemctl");
         assert_eq!(
             linux[0].1[..2],
             ["--user".to_string(), "restart".to_string()]
         );
-        let windows = restart_commands(RuntimePlatform::Windows);
+        let windows = restart_commands(RuntimePlatform::Windows, plist);
         assert_eq!(windows[0].1[0], "/End");
         assert_eq!(windows[1].1[0], "/Run");
     }

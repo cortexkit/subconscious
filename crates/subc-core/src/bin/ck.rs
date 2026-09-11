@@ -55,6 +55,21 @@ const TOP_HELP_BASE: &str = "ck — CortexKit operator CLI\n\nusage:\n  ck [--su
 const TOP_HELP_TAIL: &str = "flags:\n  --subc <file>   use a specific connection file (default: auto-discover)\n  --json          raw JSON output instead of tables\n  --verbose       include diagnostic detail and complete metrics\n\nrun 'ck <domain>' with no verb to see that domain's commands";
 
 const DOMAIN_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Two seconds is the production deadline; it is what keeps a wedged domain
+/// binary from holding `ck --help` hostage. Test builds may widen it, because
+/// the CLI suite proves discovery with shell-script domains on a host that is
+/// also running eight hundred other tests, where a script's own startup has
+/// exceeded two seconds and a genuine domain then read as refused.
+fn domain_probe_timeout() -> Duration {
+    #[cfg(feature = "test-support")]
+    if let Some(millis) = env::var_os("CK_TEST_DOMAIN_PROBE_TIMEOUT_MS")
+        .and_then(|value| value.to_str()?.parse::<u64>().ok())
+    {
+        return Duration::from_millis(millis);
+    }
+    DOMAIN_PROBE_TIMEOUT
+}
 const DOMAIN_PROBE_CACHE_FILE: &str = "domain-probes.json";
 
 /// Names of installed module programs, derived from setup's component tables so
@@ -244,6 +259,8 @@ fn domain_probe_stamp(path: &Path) -> Option<DomainProbeCacheEntry> {
 }
 
 fn run_domain_probe(path: &Path) -> Option<String> {
+    #[cfg(feature = "test-support")]
+    record_test_probe(path);
     let mut child = process::Command::new(path)
         .arg("--ck-domain")
         .stdout(process::Stdio::piped())
@@ -256,7 +273,7 @@ fn run_domain_probe(path: &Path) -> Option<String> {
         let _ = std::io::Read::read_to_end(&mut std::io::BufReader::new(stdout), &mut bytes);
         bytes
     });
-    let deadline = Instant::now() + DOMAIN_PROBE_TIMEOUT;
+    let deadline = Instant::now() + domain_probe_timeout();
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break Some(status),
@@ -335,29 +352,26 @@ const SETUP_HELP: &str = "ck setup — plan managed CortexKit installation\n\nus
 
 const UPGRADE_HELP: &str = "ck upgrade — plan managed component upgrades\n\nusage:\n  ck upgrade [--dry-run] [--verbose]\n  ck upgrade --check [--verbose]\n\n  --check reports available updates without changing anything. --dry-run prints\n  the complete plan without changing anything. --verbose includes plan outcomes\n  and execution evidence.";
 
-/// Test builds append one line per invocation to the file named by
-/// `CK_TEST_INVOCATION_LOG`, so a test can count how many ck processes a
-/// command started — the only honest measure of "did ck probe a copy of
-/// itself", since timing bounds cannot separate a probe deadline from a
-/// loaded host. Production builds carry no such hook.
+/// Test builds append one line to the file named by `CK_TEST_INVOCATION_LOG`
+/// for every domain probe this process launches, written by the parent at
+/// the moment it spawns. A test counts those lines to measure "did ck probe
+/// a copy of itself": timing bounds cannot separate a probe deadline from a
+/// loaded host, and a line written by the child on startup can be lost when
+/// the probe deadline kills a slow-starting debug binary before it gets
+/// there. The parent's own record cannot be lost that way. Production builds
+/// carry no such hook.
 #[cfg(feature = "test-support")]
-fn record_test_invocation() {
-    if let Some(path) = env::var_os("CK_TEST_INVOCATION_LOG").filter(|value| !value.is_empty()) {
-        let line = env::args_os()
-            .map(|argument| argument.to_string_lossy().into_owned())
-            .collect::<Vec<_>>()
-            .join(" ");
-        if let Ok(mut file) = fs::OpenOptions::new().append(true).create(true).open(path) {
+fn record_test_probe(path: &Path) {
+    if let Some(log) = env::var_os("CK_TEST_INVOCATION_LOG").filter(|value| !value.is_empty()) {
+        if let Ok(mut file) = fs::OpenOptions::new().append(true).create(true).open(log) {
             use std::io::Write as _;
-            let _ = writeln!(file, "{line}");
+            let _ = writeln!(file, "probe {}", path.display());
         }
     }
 }
 
 #[tokio::main]
 async fn main() {
-    #[cfg(feature = "test-support")]
-    record_test_invocation();
     match run(env::args_os()).await {
         Ok(()) => match cleanup_replaced_windows_ck() {
             Ok(()) => process::exit(0),
@@ -5035,13 +5049,18 @@ async fn upgrade_command(
     // The daemon connection file is the daemon catalog build evidence. It is
     // optional while no inventory-owned daemon exists; discovery turns its
     // absence into a refusal only when an owned daemon actually needs a version.
-    let daemon_catalog =
-        discover_connection_file(subc)
-            .ok()
-            .map(|connection| setup::DaemonCatalogBuild {
-                pid: connection.info.pid,
-                version: connection.info.daemon_ver,
-            });
+    // The discovered path is kept for the executor: after the daemon rung
+    // restarts the service, completion is read from that same file, and the
+    // backend only knew an explicit --subc, so every discovered daemon reached
+    // the restart and then refused verification for want of a path.
+    let connection = discover_connection_file(subc).ok();
+    let connection_path = subc
+        .map(Path::to_path_buf)
+        .or_else(|| connection.as_ref().map(|found| found.path.clone()));
+    let daemon_catalog = connection.map(|found| setup::DaemonCatalogBuild {
+        pid: found.info.pid,
+        version: found.info.daemon_ver,
+    });
     let discovered = setup::discover_current_upgrade_targets(executable, daemon_catalog.as_ref())
         .map_err(CkError::Rejected)?;
     let cache = setup::UpdateCache::from_environment();
@@ -5126,13 +5145,9 @@ async fn upgrade_command(
     let index = source
         .cloned_index()
         .map_err(|error| CkError::Message(error.to_string()))?;
-    let mut backend = setup::SystemUpgradeBackend::new(
-        executable,
-        subc.map(Path::to_path_buf),
-        discovered,
-        index,
-    )
-    .map_err(CkError::Rejected)?;
+    let mut backend =
+        setup::SystemUpgradeBackend::new(executable, connection_path, discovered, index)
+            .map_err(CkError::Rejected)?;
     backend.set_supervised_modules(observed.supervised_modules.clone());
     for target in setup::UpgradeTarget::ORDERED {
         if let setup::UpgradeState::UpdateAvailable { to, .. } = observed.target_state(target) {

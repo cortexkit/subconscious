@@ -525,7 +525,7 @@ impl SetupBackend {
     }
 
     fn restart_runtime(&mut self, sections: &[String]) -> Result<(), String> {
-        runtime::restart_via_service_manager()?;
+        runtime::restart_via_service_manager(&self.paths.runtime_paths.definition)?;
         let mut validator = CkValidator {
             executable: &self.executable,
         };
@@ -776,7 +776,7 @@ fn data_directory() -> Result<PathBuf, String> {
     Ok(user_home()?.join(".local").join("share").join("cortexkit"))
 }
 
-fn user_home() -> Result<PathBuf, String> {
+pub(super) fn user_home() -> Result<PathBuf, String> {
     env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)

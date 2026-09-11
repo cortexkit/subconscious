@@ -11,8 +11,9 @@ use serde_json::Value;
 use subc_transport::connection_file;
 
 use super::{
+    components::{installed_components, upgrade_roster},
     inventory::Inventory,
-    model::{AlphaTarget, UpgradeObserved, UpgradeState, UpgradeTarget},
+    model::{AlphaTarget, UpgradeObserved, UpgradeTarget},
     release_index::ReleaseIndex,
     self_update,
     update_cache::UpdateMetadata,
@@ -58,7 +59,7 @@ pub fn discover_current_upgrade_targets(
 pub fn dashboard_installed_binaries() -> Result<BTreeMap<String, InstalledBinary>, String> {
     let inventory = load_current_inventory()?;
     let mut installed = BTreeMap::new();
-    for target in UpgradeTarget::ORDERED {
+    for target in upgrade_roster(installed_components(&inventory)) {
         let path = ["managed-binary", "binary-placement"]
             .into_iter()
             .flat_map(|kind| inventory.paths_for_kind(kind))
@@ -129,9 +130,7 @@ fn load_current_inventory() -> Result<Inventory, String> {
     )
 }
 
-/// Discover only inventory-owned targets. MC is intentionally absent because it
-/// has no alpha archive; an MC data directory or configuration never creates an
-/// upgrade target.
+/// Discover only inventory-owned binaries belonging to installed components.
 pub fn discover_managed_upgrade_targets(
     inventory: &Inventory,
     executable: &Path,
@@ -141,16 +140,17 @@ pub fn discover_managed_upgrade_targets(
     owned.extend(inventory.paths_for_kind("binary-placement"));
     let executable = canonical_or_original(executable);
     let mut targets = Vec::new();
-    for target in UpgradeTarget::ORDERED {
-        let destination = match target {
-            UpgradeTarget::Ck => owned
+    for target in upgrade_roster(installed_components(inventory)) {
+        let destination = if target.is_self_replacing() {
+            owned
                 .iter()
                 .find(|path| canonical_or_original(path) == executable)
-                .cloned(),
-            _ => owned
+                .cloned()
+        } else {
+            owned
                 .iter()
                 .find(|path| file_name_matches(path, target))
-                .cloned(),
+                .cloned()
         };
         let Some(destination) = destination else {
             continue;
@@ -161,24 +161,23 @@ pub fn discover_managed_upgrade_targets(
                 destination.display()
             ));
         }
-        let installed_version = match target {
-            UpgradeTarget::Daemon => daemon_catalog
+        let installed_version = if target.is_daemon() {
+            daemon_catalog
                 .ok_or_else(|| {
                     "refusal: daemon catalog build information is unavailable for inventory-owned ck-subc"
                         .to_string()
                 })?
                 .version
-                .clone(),
-            _ => {
-                #[cfg(feature = "test-support")]
-                if let Some(version) = test_installed_version(target) {
-                    version
-                } else {
-                    binary_version(&destination)?
-                }
-                #[cfg(not(feature = "test-support"))]
+                .clone()
+        } else {
+            #[cfg(feature = "test-support")]
+            if let Some(version) = test_installed_version(target) {
+                version
+            } else {
                 binary_version(&destination)?
             }
+            #[cfg(not(feature = "test-support"))]
+            binary_version(&destination)?
         };
         let installed_archive_sha256 = inventory_string(inventory, &destination, "archive_sha256");
         targets.push(ManagedUpgradeTarget {
@@ -193,11 +192,11 @@ pub fn discover_managed_upgrade_targets(
 
 #[cfg(feature = "test-support")]
 fn test_installed_version(target: UpgradeTarget) -> Option<String> {
-    let key = match target {
-        UpgradeTarget::SubcMcp => "CK_TEST_SUBC_MCP_VERSION",
-        UpgradeTarget::Aft => "CK_TEST_AFT_VERSION",
-        UpgradeTarget::Ck => "CK_TEST_CK_VERSION",
-        UpgradeTarget::Daemon => return None,
+    let key = match target.label() {
+        "ck-subc-mcp" => "CK_TEST_SUBC_MCP_VERSION",
+        "ck-aft" => "CK_TEST_AFT_VERSION",
+        "ck" => "CK_TEST_CK_VERSION",
+        _ => return None,
     };
     env::var_os(key).map(|version| version.to_string_lossy().into_owned())
 }
@@ -222,13 +221,6 @@ pub fn observed_upgrade_targets(
         })
         .collect::<BTreeMap<_, _>>();
     let mut observed = observed_from_metadata(metadata, &installed);
-    for target in UpgradeTarget::ORDERED {
-        if !discovered.iter().any(|item| item.target == target) {
-            observed
-                .targets
-                .insert(target.label().to_string(), UpgradeState::NotInstalled);
-        }
-    }
     match roster {
         Ok(modules) => {
             observed.supervised_modules = modules;
@@ -423,8 +415,10 @@ impl SystemUpgradeBackend {
             return Ok(false);
         };
         let expected = self
-            .expected_versions
-            .get(UpgradeTarget::Daemon.label())
+            .targets
+            .values()
+            .find(|item| item.target.is_daemon())
+            .and_then(|item| self.expected_versions.get(item.target.label()))
             .map(String::as_str)
             .unwrap_or_default();
         if connection.pid == 0 || connection.daemon_ver != expected {
@@ -549,7 +543,7 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
             .prepared
             .remove(target.label())
             .ok_or_else(|| format!("no verified candidate was prepared for {target}"))?;
-        if target == UpgradeTarget::Ck {
+        if target.is_self_replacing() {
             let result = self_update::replace_verified_candidate(
                 &destination,
                 &prepared.candidate,
@@ -686,47 +680,43 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
 
     fn post_verify(&mut self, target: UpgradeTarget) -> Result<String, String> {
         let destination = &self.target(target)?.destination;
-        let is_supervised_module = match target {
-            UpgradeTarget::SubcMcp | UpgradeTarget::Aft => self.is_module_supervised(target),
-            _ => false,
+        let is_supervised_module =
+            target.module_id().is_some() && self.is_module_supervised(target);
+        let (pid, healthy, running_image_matches_destination, version) = if is_supervised_module {
+            let (pid, running_image_matches_destination) = self.module_provenance(target)?;
+            let healthy = self.module_ready(target)?;
+            (
+                pid,
+                healthy,
+                running_image_matches_destination,
+                binary_version(destination)?,
+            )
+        } else if target.is_daemon() {
+            let subc = self.subc.as_ref().ok_or_else(|| {
+                "no daemon connection file was supplied for verification".to_string()
+            })?;
+            let info = connection_file::read_for_client(subc)
+                .map_err(|error| format!("could not read daemon connection: {error}"))?;
+            self.run_ck(&["daemon"])?;
+            (Some(info.pid), true, true, info.daemon_ver)
+        } else if target.is_self_replacing() {
+            (Some(process_id()), true, true, binary_version(destination)?)
+        } else {
+            (None, false, false, binary_version(destination)?)
         };
-        let (pid, healthy, running_image_matches_destination, version) = match target {
-            UpgradeTarget::SubcMcp | UpgradeTarget::Aft if is_supervised_module => {
-                let (pid, running_image_matches_destination) = self.module_provenance(target)?;
-                let healthy = self.module_ready(target)?;
-                (
-                    pid,
-                    healthy,
-                    running_image_matches_destination,
-                    binary_version(destination)?,
-                )
-            }
-            UpgradeTarget::SubcMcp | UpgradeTarget::Aft => {
-                (None, false, false, binary_version(destination)?)
-            }
-            UpgradeTarget::Daemon => {
-                let subc = self.subc.as_ref().ok_or_else(|| {
-                    "no daemon connection file was supplied for verification".to_string()
-                })?;
-                let info = connection_file::read_for_client(subc)
-                    .map_err(|error| format!("could not read daemon connection: {error}"))?;
-                self.run_ck(&["daemon"])?;
-                (Some(info.pid), true, true, info.daemon_ver)
-            }
-            UpgradeTarget::Ck => (Some(process_id()), true, true, binary_version(destination)?),
+        // Keep the existing reported-version exemption limited to the two
+        // legacy targets whose releases were already accepted this way.
+        let expected_version = if target.accepts_reported_version() {
+            version.clone()
+        } else {
+            self.expected_version(target)?.to_string()
         };
-        // Module sibling crates may report a version unrelated to their source
-        // release. Their digest, destination inode, liveness, and health are the
-        // proof; preserve version text as evidence without making it a gate.
-        let expected_version = match target {
-            UpgradeTarget::SubcMcp | UpgradeTarget::Aft => version.clone(),
-            UpgradeTarget::Daemon | UpgradeTarget::Ck => self.expected_version(target)?.to_string(),
-        };
+        let require_live_process = is_supervised_module || target.is_daemon();
         let expectation = expected_post_activation(
             destination,
             expected_version,
-            is_supervised_module || target == UpgradeTarget::Daemon,
-            is_supervised_module || target == UpgradeTarget::Daemon,
+            require_live_process,
+            require_live_process,
         )?;
         let evidence = VerificationEvidence {
             pid,
@@ -804,9 +794,10 @@ pub fn render_execution_report(report: &UpgradeExecutionReport) {
 }
 
 pub fn upgraded_line(target: UpgradeTarget, from: &str, to: &str) -> String {
-    let restarted = match target {
-        UpgradeTarget::SubcMcp | UpgradeTarget::Aft | UpgradeTarget::Daemon => ", restarted",
-        UpgradeTarget::Ck => "",
+    let restarted = if target.is_daemon() || target.module_id().is_some() {
+        ", restarted"
+    } else {
+        ""
     };
     format!("upgraded {target} {from} → {to}{restarted}")
 }
@@ -871,8 +862,16 @@ mod tests {
     use serde_json::{Map, Value};
 
     use super::*;
+    use crate::setup::model::Component;
     #[cfg(unix)]
     use subc_core::test_support::TestTempDir;
+
+    fn upgrade_target(binary: &str) -> UpgradeTarget {
+        upgrade_roster(Component::ALL)
+            .into_iter()
+            .find(|target| target.label() == binary)
+            .unwrap_or_else(|| panic!("missing upgrade target {binary}"))
+    }
 
     // Used only by the unix-gated tests below; gate it with them so windows
     // clippy under -D warnings does not read it as dead code.
@@ -890,7 +889,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn discovery_uses_inventory_and_version_outputs_and_excludes_mc() {
+    fn discovery_uses_inventory_and_version_outputs_for_every_installed_component() {
         let root = fixture_dir("discovery");
         let ck = root.join("ck");
         let mcp = root.join("ck-subc-mcp");
@@ -919,15 +918,18 @@ mod tests {
         )
         .expect("discover targets");
         assert_eq!(
-            targets.iter().map(|item| item.target).collect::<Vec<_>>(),
-            UpgradeTarget::ORDERED
+            targets
+                .iter()
+                .map(|item| item.target.label())
+                .collect::<Vec<_>>(),
+            ["ck-subc", "ck-subc-mcp", "ck-aft", "ck-mc", "ck"]
         );
-        // Daemon, subc-mcp, aft, ck: the daemon's version is the catalog's,
-        // the modules' and ck's are their own outputs.
+        // The daemon's version is the catalog's; siblings and ck report their own.
         assert_eq!(targets[0].installed_version, "1.3.0");
         assert_eq!(targets[1].installed_version, "1.1.0");
         assert_eq!(targets[2].installed_version, "1.2.0");
-        assert_eq!(targets[3].installed_version, "1.0.0");
+        assert_eq!(targets[3].installed_version, "99.0.0");
+        assert_eq!(targets[4].installed_version, "1.0.0");
     }
 
     #[cfg(unix)]
@@ -935,8 +937,10 @@ mod tests {
     fn discovery_reads_archive_digest_for_currency_not_binary_digest() {
         let root = fixture_dir("currency-digest");
         let ck = root.join("ck");
+        let daemon = root.join("ck-subc");
         let mcp = root.join("ck-subc-mcp");
         version_binary(&ck, "1.0.0");
+        version_binary(&daemon, "1.0.0");
         version_binary(&mcp, "0.1.0");
         let mut inventory =
             Inventory::load(root.join("installer-manifest.json"), "linux-x64").expect("inventory");
@@ -944,11 +948,20 @@ mod tests {
         fields.insert("sha256".to_string(), Value::String("ab".repeat(32)));
         fields.insert("archive_sha256".to_string(), Value::String("cd".repeat(32)));
         inventory.record("managed-binary", &mcp, fields);
+        inventory.record("managed-binary", &daemon, Map::new());
 
-        let targets = discover_managed_upgrade_targets(&inventory, &ck, None).expect("discover");
+        let targets = discover_managed_upgrade_targets(
+            &inventory,
+            &ck,
+            Some(&DaemonCatalogBuild {
+                pid: 44,
+                version: "1.0.0".to_string(),
+            }),
+        )
+        .expect("discover");
         let mcp_target = targets
             .iter()
-            .find(|item| item.target == UpgradeTarget::SubcMcp)
+            .find(|item| item.target == upgrade_target("ck-subc-mcp"))
             .expect("ck-subc-mcp");
         let archive = "cd".repeat(32);
         let binary = "ab".repeat(32);
@@ -964,8 +977,9 @@ mod tests {
 
     #[test]
     fn missing_aft_archive_is_typed_release_incomplete() {
+        let aft = upgrade_target("ck-aft");
         let target = ManagedUpgradeTarget {
-            target: UpgradeTarget::Aft,
+            target: aft,
             destination: PathBuf::from("/managed/ck-aft"),
             installed_version: "1.0.0".to_string(),
             installed_archive_sha256: Some("ab".repeat(32)),
@@ -976,7 +990,7 @@ mod tests {
             targets: BTreeMap::new(),
         };
         metadata.targets.insert(
-            UpgradeTarget::Aft.label().to_string(),
+            aft.label().to_string(),
             super::super::update_cache::CachedRelease {
                 version: "2.0.0".to_string(),
                 sha256: None,
@@ -984,7 +998,7 @@ mod tests {
         );
         let observed = observed_upgrade_targets(&metadata, &[target], Ok(BTreeSet::new()));
         assert!(matches!(
-            observed.release(UpgradeTarget::Aft),
+            observed.release(aft),
             super::super::model::ReleaseAvailability::Incomplete { .. }
         ));
     }
@@ -993,6 +1007,7 @@ mod tests {
     #[test]
     fn initiate_module_restart_uses_module_id_not_binary_label() {
         let root = fixture_dir("initiate-restart-module-id");
+        let aft = upgrade_target("ck-aft");
         let ck = root.join("ck");
         fs::write(
             &ck,
@@ -1024,9 +1039,9 @@ exit 1
         let mut backend = SystemUpgradeBackend {
             platform: AlphaTarget::LinuxX64,
             targets: [(
-                UpgradeTarget::Aft.label().to_string(),
+                aft.label().to_string(),
                 ManagedUpgradeTarget {
-                    target: UpgradeTarget::Aft,
+                    target: aft,
                     destination: aft_path,
                     installed_version: "1.0.0".to_string(),
                     installed_archive_sha256: None,
@@ -1046,13 +1061,13 @@ exit 1
             prepared: BTreeMap::new(),
             rollback_paths: BTreeMap::new(),
             rollback_archive_sha256: BTreeMap::new(),
-            expected_versions: [(UpgradeTarget::Aft.label().to_string(), "2.0.0".to_string())]
+            expected_versions: [(aft.label().to_string(), "2.0.0".to_string())]
                 .into_iter()
                 .collect(),
             supervised_modules: ["aft".to_string()].into_iter().collect(),
         };
 
-        let result = backend.initiate_module_restart(UpgradeTarget::Aft, Duration::from_secs(30));
+        let result = backend.initiate_module_restart(aft, Duration::from_secs(30));
         assert!(result.is_ok(), "initiate_module_restart failed: {result:?}");
     }
 }

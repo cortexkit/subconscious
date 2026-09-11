@@ -5065,7 +5065,11 @@ async fn upgrade_command(
         .map_err(CkError::Rejected)?;
     let cache = setup::UpdateCache::from_environment();
     let source = setup::IndexReleaseSource::from_environment(setup::TARGET_CHECK_BUDGET);
-    let metadata = match setup::check_update_metadata(&cache, &source).await {
+    let upgrade_roster = discovered
+        .iter()
+        .map(|item| item.target)
+        .collect::<Vec<setup::UpgradeTarget>>();
+    let metadata = match setup::check_update_metadata(&cache, &source, &upgrade_roster).await {
         Ok(metadata) => metadata,
         Err(error @ setup::UpdateCheckError::IndexStale { .. }) => {
             println!("{error}");
@@ -5149,7 +5153,7 @@ async fn upgrade_command(
         setup::SystemUpgradeBackend::new(executable, connection_path, discovered, index)
             .map_err(CkError::Rejected)?;
     backend.set_supervised_modules(observed.supervised_modules.clone());
-    for target in setup::UpgradeTarget::ORDERED {
+    for &target in &observed.roster {
         if let setup::UpgradeState::UpdateAvailable { to, .. } = observed.target_state(target) {
             backend.set_expected_version(target, to);
         }
@@ -5172,16 +5176,17 @@ async fn upgrade_command(
 
 fn upgrade_current_summary(discovered: &[setup::ManagedUpgradeTarget]) -> String {
     let mut components = Vec::new();
-    for target in [
-        setup::UpgradeTarget::Ck,
-        setup::UpgradeTarget::Daemon,
-        setup::UpgradeTarget::SubcMcp,
-        setup::UpgradeTarget::Aft,
-    ] {
-        let Some(item) = discovered.iter().find(|item| item.target == target) else {
-            continue;
-        };
-        if target == setup::UpgradeTarget::SubcMcp {
+    let ordered = discovered
+        .iter()
+        .filter(|item| item.target.is_self_replacing())
+        .chain(
+            discovered
+                .iter()
+                .filter(|item| !item.target.is_self_replacing()),
+        );
+    for item in ordered {
+        let target = item.target;
+        if target.label() == "ck-subc-mcp" {
             components.push(target.to_string());
         } else {
             components.push(format!("{target} {}", item.installed_version));

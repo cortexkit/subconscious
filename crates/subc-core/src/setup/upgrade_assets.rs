@@ -259,6 +259,14 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
+    use crate::setup::{components::upgrade_roster, model::Component};
+
+    fn upgrade_target(binary: &str) -> UpgradeTarget {
+        upgrade_roster(Component::ALL)
+            .into_iter()
+            .find(|target| target.label() == binary)
+            .unwrap_or_else(|| panic!("missing upgrade target {binary}"))
+    }
 
     #[derive(Default)]
     struct MemoryFetcher {
@@ -296,7 +304,7 @@ mod tests {
     #[test]
     fn asset_names_are_directly_derived_for_every_alpha_tuple() {
         for platform in AlphaTarget::ALL {
-            let names = convention_asset_names(UpgradeTarget::Aft, platform);
+            let names = convention_asset_names(upgrade_target("ck-aft"), platform);
             assert_eq!(names.archive, format!("ck-aft-{}.zip", platform.label()));
         }
     }
@@ -304,10 +312,14 @@ mod tests {
     #[test]
     fn missing_archive_is_a_typed_refusal_that_names_the_exact_asset() {
         let mut fetcher = MemoryFetcher::default();
-        let names = convention_asset_names(UpgradeTarget::Aft, AlphaTarget::LinuxX64);
+        let names = convention_asset_names(upgrade_target("ck-aft"), AlphaTarget::LinuxX64);
 
-        let error = prepare_upgrade_asset(&mut fetcher, UpgradeTarget::Aft, AlphaTarget::LinuxX64)
-            .expect_err("missing archive must refuse");
+        let error = prepare_upgrade_asset(
+            &mut fetcher,
+            upgrade_target("ck-aft"),
+            AlphaTarget::LinuxX64,
+        )
+        .expect_err("missing archive must refuse");
         assert_eq!(
             error,
             UpgradeAssetError::ReleaseIncomplete {
@@ -320,13 +332,17 @@ mod tests {
     #[test]
     fn missing_index_digest_is_a_typed_refusal_that_names_the_exact_asset() {
         let mut fetcher = MemoryFetcher::default();
-        let names = convention_asset_names(UpgradeTarget::Aft, AlphaTarget::LinuxX64);
+        let names = convention_asset_names(upgrade_target("ck-aft"), AlphaTarget::LinuxX64);
         fetcher
             .assets
             .insert(names.archive.clone(), b"archive".to_vec());
 
-        let error = prepare_upgrade_asset(&mut fetcher, UpgradeTarget::Aft, AlphaTarget::LinuxX64)
-            .expect_err("missing digest must refuse");
+        let error = prepare_upgrade_asset(
+            &mut fetcher,
+            upgrade_target("ck-aft"),
+            AlphaTarget::LinuxX64,
+        )
+        .expect_err("missing digest must refuse");
         assert_eq!(
             error,
             UpgradeAssetError::ReleaseIncomplete {
@@ -339,7 +355,7 @@ mod tests {
     #[test]
     fn corrupted_download_refuses_before_extraction() {
         let mut fetcher = MemoryFetcher::default();
-        let names = convention_asset_names(UpgradeTarget::SubcMcp, AlphaTarget::LinuxX64);
+        let names = convention_asset_names(upgrade_target("ck-subc-mcp"), AlphaTarget::LinuxX64);
         fetcher
             .assets
             .insert(names.archive.clone(), b"corrupted".to_vec());
@@ -347,9 +363,12 @@ mod tests {
             .digests
             .insert(names.archive.clone(), "0".repeat(64));
 
-        let error =
-            prepare_upgrade_asset(&mut fetcher, UpgradeTarget::SubcMcp, AlphaTarget::LinuxX64)
-                .expect_err("digest mismatch must refuse");
+        let error = prepare_upgrade_asset(
+            &mut fetcher,
+            upgrade_target("ck-subc-mcp"),
+            AlphaTarget::LinuxX64,
+        )
+        .expect_err("digest mismatch must refuse");
         assert!(matches!(error, UpgradeAssetError::DigestMismatch { .. }));
         assert_eq!(fetcher.calls, vec![names.archive]);
     }

@@ -1162,15 +1162,21 @@ impl UpgradeFixture {
         let aft = bin.join(platform_binary("ck-aft"));
         let daemon = bin.join(platform_binary("ck-subc"));
         let mcp = bin.join(platform_binary("ck-subc-mcp"));
+        let claustrum = bin.join(platform_binary("ck-claustrum"));
+        let auth = bin.join(platform_binary("ck-auth"));
         write_executable(&aft, "#!/bin/sh\necho 'ck-aft 0.55.1'\n");
         write_executable(&daemon, "#!/bin/sh\necho 'ck-subc 0.17.9'\n");
         write_executable(&mcp, "#!/bin/sh\necho 'ck-subc-mcp 0.17.9'\n");
+        write_executable(&claustrum, "#!/bin/sh\necho 'ck-claustrum 0.8.0'\n");
+        write_executable(&auth, "#!/bin/sh\necho 'ck-auth 0.8.0'\n");
         let ck = fs::canonicalize(env!("CARGO_BIN_EXE_ck-under-test")).unwrap();
         let mutations = [
             (ck, "44".repeat(32)),
             (daemon, "33".repeat(32)),
             (mcp, "11".repeat(32)),
             (aft, "22".repeat(32)),
+            (claustrum, "55".repeat(32)),
+            (auth, "66".repeat(32)),
         ]
         .into_iter()
         .map(|(path, archive_sha256)| {
@@ -1231,7 +1237,7 @@ impl UpgradeFixture {
             .env("CK_TEST_CK_VERSION", "0.17.9")
             .env("CK_TEST_SUBC_MCP_VERSION", "0.17.9")
             .env("CK_TEST_AFT_VERSION", "0.55.1")
-            .env("CK_TEST_SETUP_MODULES", "aft")
+            .env("CK_TEST_SETUP_MODULES", "aft,claustrum")
             .env(
                 "CK_UPDATE_CACHE_PATH",
                 self._root.path().join("update-metadata.json"),
@@ -1246,6 +1252,8 @@ fn upgrade_index(
     aft_digest: &str,
     ck_version: &str,
     ck_digest: &str,
+    claustrum_version: &str,
+    claustrum_digest: &str,
 ) -> (Value, BTreeMap<String, Vec<u8>>) {
     let target = host_target();
     (
@@ -1273,6 +1281,31 @@ fn upgrade_index(
                         fixture_asset(format!("{base}/aft.zip"), aft_digest.to_string(), 1, Some(aft_version)),
                     )],
                 ),
+                "claustrum": index_component(
+                    "v0.8.1",
+                    Some(claustrum_version),
+                    &target,
+                    [
+                        (
+                            "ck-claustrum",
+                            fixture_asset(
+                                format!("{base}/claustrum.zip"),
+                                claustrum_digest.to_string(),
+                                1,
+                                Some(claustrum_version),
+                            ),
+                        ),
+                        (
+                            "ck-auth",
+                            fixture_asset(
+                                format!("{base}/auth.zip"),
+                                "66".repeat(32),
+                                1,
+                                Some(claustrum_version),
+                            ),
+                        ),
+                    ],
+                ),
             },
         }),
         BTreeMap::new(),
@@ -1283,10 +1316,18 @@ fn upgrade_index(
 fn upgrade_and_check_say_everything_is_current_in_one_line() {
     let fixture = UpgradeFixture::new("ck-upgrade-current");
     let index = serve_signed_index(|base| {
-        upgrade_index(base, "0.55.1", &"22".repeat(32), "0.17.9", &"44".repeat(32))
+        upgrade_index(
+            base,
+            "0.55.1",
+            &"22".repeat(32),
+            "0.17.9",
+            &"44".repeat(32),
+            "0.8.0",
+            &"55".repeat(32),
+        )
     });
     let expected =
-        "Everything is up to date (ck 0.17.9 · ck-subc 0.17.9 · ck-subc-mcp · ck-aft 0.55.1).\n";
+        "Everything is up to date (ck 0.17.9 · ck-subc 0.17.9 · ck-subc-mcp · ck-aft 0.55.1 · ck-claustrum 0.8.0 · ck-auth 0.8.0).\n";
 
     for args in [&["upgrade"][..], &["upgrade", "--check"][..]] {
         let output = fixture.command(&index, args).output().unwrap();
@@ -1300,7 +1341,15 @@ fn upgrade_and_check_say_everything_is_current_in_one_line() {
 fn upgrade_check_names_the_one_available_update_and_command() {
     let fixture = UpgradeFixture::new("ck-upgrade-check");
     let index = serve_signed_index(|base| {
-        upgrade_index(base, "0.55.2", &"aa".repeat(32), "0.17.9", &"44".repeat(32))
+        upgrade_index(
+            base,
+            "0.55.2",
+            &"aa".repeat(32),
+            "0.17.9",
+            &"44".repeat(32),
+            "0.8.0",
+            &"55".repeat(32),
+        )
     });
     let output = fixture
         .command(&index, &["upgrade", "--check"])
@@ -1325,6 +1374,8 @@ fn upgrade_apply_reports_completed_targets_then_done() {
             &"aa".repeat(32),
             "0.17.10",
             &"bb".repeat(32),
+            "0.8.1",
+            &"cc".repeat(32),
         )
     });
     let output = fixture
@@ -1337,7 +1388,7 @@ fn upgrade_apply_reports_completed_targets_then_done() {
     assert!(output.stderr.is_empty(), "stderr: {}", text(&output.stderr));
     assert_eq!(
         text(&output.stdout),
-        "upgraded ck-aft 0.55.1 → 0.55.2, restarted\nupgraded ck 0.17.9 → 0.17.10\nDone.\n"
+        "upgraded ck-aft 0.55.1 → 0.55.2, restarted\nupgraded ck-claustrum 0.8.0 → 0.8.1, restarted\nupgraded ck 0.17.9 → 0.17.10\nDone.\n"
     );
 }
 
@@ -1345,7 +1396,15 @@ fn upgrade_apply_reports_completed_targets_then_done() {
 fn upgrade_verbose_keeps_every_preexisting_outcome_line() {
     let fixture = UpgradeFixture::new("ck-upgrade-verbose");
     let index = serve_signed_index(|base| {
-        upgrade_index(base, "0.55.1", &"22".repeat(32), "0.17.9", &"44".repeat(32))
+        upgrade_index(
+            base,
+            "0.55.1",
+            &"22".repeat(32),
+            "0.17.9",
+            &"44".repeat(32),
+            "0.8.0",
+            &"55".repeat(32),
+        )
     });
     let output = fixture
         .command(&index, &["upgrade", "--verbose"])
@@ -1357,6 +1416,8 @@ fn upgrade_verbose_keeps_every_preexisting_outcome_line() {
     for outcome in [
         "  outcome: no-op: ck-subc-mcp is already current",
         "  outcome: no-op: ck-aft is already current",
+        "  outcome: no-op: ck-claustrum is already current",
+        "  outcome: no-op: ck-auth is already current",
         "  outcome: no-op: ck-subc is already current",
         "  outcome: no-op: ck is already current",
     ] {

@@ -615,49 +615,38 @@ impl fmt::Display for SetupOperation {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum UpgradeTarget {
-    SubcMcp,
-    Aft,
-    Daemon,
-    Ck,
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct UpgradeTarget {
+    pub component: Component,
+    pub binary: &'static str,
+    pub module_id: Option<&'static str>,
 }
 
 impl UpgradeTarget {
-    /// The daemon goes first. A module built against a newer wire crate can
-    /// send a HELLO the old daemon refuses (the manifest diet dropped fields
-    /// the pre-0.17.20 daemon required), so a module replaced ahead of the
-    /// daemon would come back from its restart unable to register, and the
-    /// ladder would refuse before the daemon that accepts it was ever
-    /// touched. The other direction is safe: the daemon parses old manifests
-    /// leniently, and the catalog_update test that registers a pre-diet
-    /// manifest is the premise this order stands on. ck goes last because it
-    /// is the process running the ladder. MC is intentionally absent: alpha
-    /// wires it but has no MC release archive.
-    pub const ORDERED: [Self; 4] = [Self::Daemon, Self::SubcMcp, Self::Aft, Self::Ck];
-
     pub const fn label(self) -> &'static str {
-        match self {
-            Self::SubcMcp => "ck-subc-mcp",
-            Self::Aft => "ck-aft",
-            Self::Daemon => "ck-subc",
-            Self::Ck => "ck",
-        }
+        self.binary
     }
 
     /// Returns the module identifier used by the daemon supervisor, if this target
-    /// is supervised as a module.
-    ///
-    /// The binary label (`label()`) and supervisor name (`module_id()`) differ by
-    /// design: `label()` names the binary (`ck-aft`, `ck-subc-mcp`), while
-    /// `module_id()` names the supervisor entry (`aft`, `subc-mcp`). Restart and
-    /// verification RPCs take the latter.
+    /// is supervised as a module. Restart and verification RPCs take this id,
+    /// while `label()` names the binary shown to operators.
     pub const fn module_id(self) -> Option<&'static str> {
-        match self {
-            Self::Aft => Some("aft"),
-            Self::SubcMcp => Some("subc-mcp"),
-            Self::Daemon | Self::Ck => None,
-        }
+        self.module_id
+    }
+
+    pub fn is_daemon(self) -> bool {
+        self.component == Component::Core && self.binary == "ck-subc"
+    }
+
+    pub fn is_self_replacing(self) -> bool {
+        self.component == Component::Core && self.binary == "ck"
+    }
+
+    /// These two existing targets historically accepted their own reported
+    /// versions rather than the component release version. Keep that narrow
+    /// compatibility rule without extending it to newly discovered binaries.
+    pub fn accepts_reported_version(self) -> bool {
+        matches!(self.binary, "ck-subc-mcp" | "ck-aft")
     }
 }
 
@@ -686,6 +675,7 @@ pub enum UpgradeState {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UpgradeObserved {
     pub platform: PlatformObservation,
+    pub roster: Vec<UpgradeTarget>,
     pub targets: BTreeMap<String, UpgradeState>,
     pub releases: BTreeMap<String, ReleaseAvailability>,
     pub supervised_modules: BTreeSet<String>,
@@ -693,15 +683,16 @@ pub struct UpgradeObserved {
 }
 
 impl UpgradeObserved {
-    pub fn no_updates_on_current_host() -> Self {
+    pub fn for_roster(roster: Vec<UpgradeTarget>) -> Self {
         let mut targets = BTreeMap::new();
         let mut releases = BTreeMap::new();
-        for target in UpgradeTarget::ORDERED {
+        for target in &roster {
             targets.insert(target.label().to_string(), UpgradeState::Current);
             releases.insert(target.label().to_string(), ReleaseAvailability::Available);
         }
         Self {
             platform: PlatformObservation::current(),
+            roster,
             targets,
             releases,
             supervised_modules: BTreeSet::new(),
@@ -739,8 +730,8 @@ pub enum UpgradeOperation {
     WarmExecute { target: UpgradeTarget },
     InitiateModuleRestart { target: UpgradeTarget },
     PollModuleRestartCompletion { target: UpgradeTarget },
-    RestartDaemonViaServiceManager,
-    PollDaemonServiceReady,
+    RestartDaemonViaServiceManager { target: UpgradeTarget },
+    PollDaemonServiceReady { target: UpgradeTarget },
     PostVerify { target: UpgradeTarget },
 }
 
@@ -773,11 +764,14 @@ impl fmt::Display for UpgradeOperation {
             Self::PollModuleRestartCompletion { target } => {
                 write!(formatter, "poll supervised restart completion for {target}")
             }
-            Self::RestartDaemonViaServiceManager => {
-                formatter.write_str("restart ck-subc through the platform service manager")
+            Self::RestartDaemonViaServiceManager { target } => {
+                write!(
+                    formatter,
+                    "restart {target} through the platform service manager"
+                )
             }
-            Self::PollDaemonServiceReady => {
-                formatter.write_str("poll ck-subc service-manager completion")
+            Self::PollDaemonServiceReady { target } => {
+                write!(formatter, "poll {target} service-manager completion")
             }
             Self::PostVerify { target } => write!(formatter, "post-verify {target}"),
         }

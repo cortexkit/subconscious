@@ -202,6 +202,16 @@ current rendering are closed. Lands in the daemon cut that carries 2a–2c.
   so the drain waits for exactly the calls whose interruption is an
   `ambiguous` reconciliation. Items 3–6: no exposure.
 
+- **alfonso-ios** (CKIOS): item 1 — the phone is a pure client and never
+  sends `BindIdentity`; no consumer. Item 2a — a consumer seam, not a
+  reviewer note: whatever `Draining{reason, deadline_ms}` becomes in the
+  Swift SDK, it must not surface to the app as `FedConnectionState.disconnected`
+  or as a retryable failure; the phone renders `disconnected` as "Lost the
+  connection to your Mac", and a healthy drain rendered that way is
+  "waiting is not failing" one layer down. Invisible is acceptable; a
+  distinct state (`awaitingPeer`-shaped) is acceptable; error-shaped is
+  not. Normative for the Swift SDK arm of 2a.
+
 ## Open for review
 
 - 2b: gauge name conflicts — a module declaring `Busy` anchored to a gauge

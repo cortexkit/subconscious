@@ -143,6 +143,34 @@ binary_digest=$(shasum -a 256 "$linux_home/.local/share/cortexkit/bin/ck" | awk 
 grep -Fq "\"archive_sha256\": \"$archive_digest\"" "$linux_home/.local/share/cortexkit/installer-manifest.json" || fail 'manifest did not record the archive digest the index carried'
 grep -Fq "\"sha256\": \"$binary_digest\"" "$linux_home/.local/share/cortexkit/installer-manifest.json" || fail 'manifest did not record the placed binary digest'
 
+# A re-run onto an installed machine. Stand in for `ck setup` by extending
+# the manifest with a daemon row the way setup does (serde's own layout, so
+# the file is nothing this script wrote). The re-run must not touch that
+# file: the daemon row would be lost and `ck upgrade` would report the daemon
+# as not installed. Its rows go to the sidecar the next ck load adopts.
+linux_manifest="$linux_home/.local/share/cortexkit/installer-manifest.json"
+linux_sidecar="$linux_home/.local/share/cortexkit/installer-manifest.bootstrap.json"
+cat >"$linux_manifest" <<EOF
+{
+  "mutations": [
+    {
+      "archive_sha256": "stale-archive",
+      "kind": "binary-placement",
+      "path": "$linux_home/.local/share/cortexkit/bin/ck",
+      "sha256": "stale-binary"
+    },
+    {
+      "archive_sha256": "daemon-archive",
+      "kind": "binary-placement",
+      "path": "$linux_home/.local/share/cortexkit/bin/ck-subc",
+      "sha256": "daemon-binary"
+    }
+  ],
+  "platform": "linux-x64",
+  "schema_version": 1
+}
+EOF
+manifest_before=$(shasum -a 256 "$linux_manifest" | awk '{print $1}')
 rerun_output="$test_root/linux-rerun-output"
 run_installer "$linux_home" "$rerun_output" \
   CK_TEST_OS=Linux CK_TEST_ARCH=x86_64 CK_TEST_KERNEL=generic
@@ -150,6 +178,12 @@ grep -Fq 'already matches verified download' "$rerun_output" || fail 'identical 
 grep -Fq 'Next: ck setup' "$rerun_output" || fail 'no-op installer did not print the setup command'
 [[ ! -e "$linux_home/setup-called" ]] || fail 'no-op installer started the extracted ck process'
 [[ "$(grep -Fc '# cortexkit-managed PATH begin' "$linux_home/.bashrc")" == "1" ]] || fail 'no-op installer duplicated the PATH block'
+[[ "$(shasum -a 256 "$linux_manifest" | awk '{print $1}')" == "$manifest_before" ]] || fail 're-run rewrote an existing manifest (setup rows would be lost)'
+[[ -f "$linux_sidecar" ]] || fail 're-run did not write the bootstrap sidecar'
+grep -Fq "\"archive_sha256\": \"$archive_digest\"" "$linux_sidecar" || fail 'sidecar did not record the archive digest'
+grep -Fq "\"sha256\": \"$binary_digest\"" "$linux_sidecar" || fail 'sidecar did not record the placed binary digest'
+grep -Fq 'ck-subc' "$linux_manifest" || fail 'daemon row vanished from the manifest'
+! grep -Fq 'ck-subc' "$linux_sidecar" || fail 'sidecar carries rows that are not the bootstrap installer'"'"'s'
 
 darwin_home="$test_root/darwin-home"
 mkdir -p "$darwin_home"

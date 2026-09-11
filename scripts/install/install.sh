@@ -165,12 +165,21 @@ ensure_profile_path() {
 # the release archive the binary came from (the digest the index carries,
 # which currency checks compare against). Recording only the first made
 # every release-placed binary read as an available update forever.
+#
+# On a machine that already has a manifest, `ck setup` has extended it with
+# rows for the daemon, the modules, and the runtime definition, and this
+# script has no JSON parser to merge into that and must never run the ck
+# it just placed. Rewriting the file dropped every one of those rows, after
+# which `ck upgrade` reported the daemon as not installed. So an existing
+# manifest is left untouched and the rows go to a sidecar beside it, which
+# the next ck to load the inventory folds in and removes.
 write_manifest() {
   local manifest="$1"
   local binary="$2"
   local binary_digest="$3"
   local profile="$4"
   local archive_digest="$5"
+  local target="$manifest"
   local manifest_tmp
   local escaped_manifest
   local escaped_binary
@@ -178,8 +187,11 @@ write_manifest() {
   local escaped_archive_digest
   local escaped_profile
 
-  if ! manifest_tmp=$(mktemp "${manifest}.XXXXXX"); then
-    refuse "inventory-record-failed" "could not prepare $manifest"
+  if [[ -f "$manifest" ]]; then
+    target="${manifest%/*}/installer-manifest.bootstrap.json"
+  fi
+  if ! manifest_tmp=$(mktemp "${target}.XXXXXX"); then
+    refuse "inventory-record-failed" "could not prepare $target"
   fi
 
   escaped_manifest=$(json_escape "$manifest")
@@ -214,16 +226,16 @@ write_manifest() {
 EOF
   then
     rm -f "$manifest_tmp"
-    refuse "inventory-record-failed" "could not write $manifest"
+    refuse "inventory-record-failed" "could not write $target"
   fi
 
-  if [[ -f "$manifest" ]] && cmp -s "$manifest" "$manifest_tmp"; then
+  if [[ -f "$target" ]] && cmp -s "$target" "$manifest_tmp"; then
     rm -f "$manifest_tmp"
     return
   fi
-  if ! mv "$manifest_tmp" "$manifest"; then
+  if ! mv "$manifest_tmp" "$target"; then
     rm -f "$manifest_tmp"
-    refuse "inventory-record-failed" "could not replace $manifest"
+    refuse "inventory-record-failed" "could not replace $target"
   fi
 }
 

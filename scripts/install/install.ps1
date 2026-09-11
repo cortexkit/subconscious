@@ -127,7 +127,18 @@ function Write-InstallerManifest {
         )
     }
     $content = $manifestObject | ConvertTo-Json -Depth 5
-    $temporaryManifest = "$Manifest.tmp"
+    # On an installed machine `ck setup` has extended the manifest with rows
+    # for the daemon, the modules, and the scheduled task, and this script
+    # has no way to merge into that without running the ck it just placed.
+    # Rewriting the file dropped every one of those rows, after which
+    # `ck upgrade` reported the daemon as not installed. An existing manifest
+    # is left untouched; the rows go to a sidecar beside it that the next ck
+    # to load the inventory folds in and removes.
+    $target = $Manifest
+    if (Test-Path -LiteralPath $Manifest) {
+        $target = Join-Path (Split-Path -Parent $Manifest) 'installer-manifest.bootstrap.json'
+    }
+    $temporaryManifest = "$target.tmp"
     try {
         # Windows PowerShell 5.1's `-Encoding UTF8` writes a byte-order mark,
         # and the JSON reader in ck refuses a document that starts with one
@@ -135,17 +146,17 @@ function Write-InstallerManifest {
         # refused the inventory. Write the bytes with an explicit BOM-less
         # encoder, which behaves the same on 5.1 and on PowerShell 7.
         [System.IO.File]::WriteAllBytes($temporaryManifest, [System.Text.UTF8Encoding]::new($false).GetBytes($content))
-        if ((Test-Path -LiteralPath $Manifest) -and ([System.IO.File]::ReadAllText($Manifest) -eq [System.IO.File]::ReadAllText($temporaryManifest))) {
+        if ((Test-Path -LiteralPath $target) -and ([System.IO.File]::ReadAllText($target) -eq [System.IO.File]::ReadAllText($temporaryManifest))) {
             Remove-Item -LiteralPath $temporaryManifest -Force -ErrorAction Stop
             return
         }
-        Move-Item -LiteralPath $temporaryManifest -Destination $Manifest -Force -ErrorAction Stop
+        Move-Item -LiteralPath $temporaryManifest -Destination $target -Force -ErrorAction Stop
     }
     catch {
         if (Test-Path -LiteralPath $temporaryManifest) {
             Remove-Item -LiteralPath $temporaryManifest -Force -ErrorAction SilentlyContinue
         }
-        Refuse 'inventory-record-failed' "could not write $Manifest ($($_.Exception.Message))"
+        Refuse 'inventory-record-failed' "could not write $target ($($_.Exception.Message))"
     }
 }
 

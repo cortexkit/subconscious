@@ -116,6 +116,10 @@ Describe 'native ck installer' {
     }
 
     It 'installs the arm64 archive on Windows on ARM and records the tuple' {
+        # The arm before this one installed under the same LOCALAPPDATA; a
+        # re-run onto an existing manifest records to the sidecar and leaves
+        # the manifest's platform alone, so this arm must start from nothing.
+        Remove-Item -Recurse -Force (Join-Path $env:LOCALAPPDATA 'cortexkit') -ErrorAction SilentlyContinue
         $env:PROCESSOR_ARCHITECTURE = 'ARM64'
         $env:CK_RELEASE_INDEX_URL = 'https://release.fixture.example/releases/v1/index.json'
         $output = & $installerPath
@@ -156,5 +160,42 @@ Describe 'native ck installer' {
         $output | Should -Contain "ck already matches verified download at $(Join-Path $env:LOCALAPPDATA 'cortexkit\bin\ck.exe'); skipping placement."
         $output | Should -Contain 'Next: ck setup'
         Test-Path -LiteralPath $setupMarker | Should -BeFalse
+    }
+
+    # A re-run onto an installed machine. Stand in for `ck setup` by
+    # extending the manifest with a daemon row the way setup does. The re-run
+    # must not touch that file: the daemon row would be lost and `ck upgrade`
+    # would report the daemon as not installed. Its rows go to the sidecar
+    # that the next ck load adopts.
+    It 'leaves an existing manifest untouched and writes its rows to the bootstrap sidecar' {
+        $env:CK_RELEASE_INDEX_URL = 'https://release.fixture.example/releases/v1/index.json'
+        & $installerPath | Out-Null
+        $root = Join-Path $env:LOCALAPPDATA 'cortexkit'
+        $manifest = Join-Path $root 'installer-manifest.json'
+        $sidecar = Join-Path $root 'installer-manifest.bootstrap.json'
+        $daemon = Join-Path $root 'bin\ck-subc.exe'
+        $seeded = [ordered]@{
+            schema_version = 1
+            platform = 'windows-x64'
+            mutations = @(
+                [ordered]@{ kind = 'binary-placement'; path = (Join-Path $root 'bin\ck.exe'); sha256 = 'stale-binary'; archive_sha256 = 'stale-archive' },
+                [ordered]@{ kind = 'binary-placement'; path = $daemon; sha256 = 'daemon-binary'; archive_sha256 = 'daemon-archive' }
+            )
+        } | ConvertTo-Json -Depth 5
+        [System.IO.File]::WriteAllBytes($manifest, [System.Text.UTF8Encoding]::new($false).GetBytes($seeded))
+        $before = (Get-FileHash -LiteralPath $manifest -Algorithm SHA256).Hash
+
+        $output = & $installerPath
+
+        $output | Should -Contain 'Next: ck setup'
+        (Get-FileHash -LiteralPath $manifest -Algorithm SHA256).Hash | Should -Be $before
+        Test-Path -LiteralPath $sidecar | Should -BeTrue
+        $rows = (Get-Content -LiteralPath $sidecar -Raw | ConvertFrom-Json).mutations
+        $placement = $rows | Where-Object { $_.kind -eq 'binary-placement' }
+        @($placement).Count | Should -Be 1
+        $placement.path | Should -Be (Join-Path $root 'bin\ck.exe')
+        $placement.archive_sha256 | Should -Be $archiveDigest
+        ($rows | Where-Object { $_.path -eq $daemon }) | Should -BeNullOrEmpty
+        ([System.IO.File]::ReadAllBytes($sidecar))[0] | Should -Be 0x7B
     }
 }

@@ -620,9 +620,16 @@ impl SetupExecutor for SetupBackend {
             SetupOperation::StartRuntime => Ok(()),
             SetupOperation::DeregisterRuntime => Ok(()),
             SetupOperation::RemoveManagedComponent { .. } if self.uninstall_report.is_none() => {
+                // The daemon's own connection file names the pid to stop on a
+                // platform whose task deletion does not stop it; absent or
+                // unreadable means no daemon to stop.
+                let daemon_pid = subc_transport::connection_file::discover(None)
+                    .ok()
+                    .map(|found| found.info.pid);
                 let report = uninstall::uninstall(
                     self.platform,
                     &self.paths.runtime_paths,
+                    daemon_pid,
                     &mut self.runner,
                     &mut self.inventory,
                     &self.paths.config_path,

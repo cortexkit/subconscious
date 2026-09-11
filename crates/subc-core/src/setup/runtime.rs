@@ -122,8 +122,14 @@ pub fn desired_definition(platform: RuntimePlatform, paths: &RuntimePaths) -> St
         RuntimePlatform::Linux => format!(
             "[Unit]\nDescription=CortexKit subconscious daemon\n\n[Service]\nExecStart={daemon}\nRestart=on-failure\n\n[Install]\nWantedBy=default.target\n"
         ),
+        // The Task Scheduler schema namespace is not decoration: `schtasks
+        // /Create /XML` refuses a Task element without it ("contains an
+        // element or attribute from an unexpected namespace"), and only a
+        // real schtasks says so. The fake runner the unit tests drive accepts
+        // any bytes, which is how this shipped without it; the test on this
+        // template pins the namespace for that reason.
         RuntimePlatform::Windows => format!(
-            "<Task version=\"1.4\"><RegistrationInfo><URI>\\CortexKit\\subc-daemon</URI></RegistrationInfo><Triggers><LogonTrigger><Enabled>true</Enabled></LogonTrigger></Triggers><Principals><Principal id=\"Author\"><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals><Actions Context=\"Author\"><Exec><Command>{daemon}</Command></Exec></Actions></Task>\n"
+            "<Task version=\"1.4\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\"><RegistrationInfo><URI>\\CortexKit\\subc-daemon</URI></RegistrationInfo><Triggers><LogonTrigger><Enabled>true</Enabled></LogonTrigger></Triggers><Principals><Principal id=\"Author\"><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals><Actions Context=\"Author\"><Exec><Command>{daemon}</Command></Exec></Actions></Task>\n"
         ),
     }
 }
@@ -277,11 +283,42 @@ pub fn ensure<R: CommandRunner>(
     Ok(())
 }
 
+/// Deregisters the daemon from its service manager and leaves no daemon
+/// process behind.
+///
+/// `daemon_pid` is the pid the running daemon published in its connection
+/// file, if one is readable; it is what Windows uses to stop a daemon whose
+/// task is already gone. launchctl bootout and systemctl disable --now stop
+/// the process they deregister and ignore it.
 pub fn deregister<R: CommandRunner>(
     platform: RuntimePlatform,
     paths: &RuntimePaths,
+    daemon_pid: Option<u32>,
     runner: &mut R,
 ) -> Result<(), String> {
+    if platform == RuntimePlatform::Windows {
+        // schtasks /Delete removes the task and leaves the daemon it started
+        // running with its executable open, so the binary removal after it
+        // is refused with "Access is denied". /End stops the task's process
+        // while the task exists; the pid from the connection file covers a
+        // daemon whose task was already deleted by an uninstall that failed
+        // later. Both best-effort: a task or process that is already gone
+        // must not fail the uninstall.
+        let _ = runner.run(
+            "schtasks.exe",
+            &[
+                "/End".to_string(),
+                "/TN".to_string(),
+                platform.identifier().to_string(),
+            ],
+        );
+        if let Some(pid) = daemon_pid {
+            let _ = runner.run(
+                "taskkill.exe",
+                &["/PID".to_string(), pid.to_string(), "/F".to_string()],
+            );
+        }
+    }
     let args = match platform {
         RuntimePlatform::Macos => vec![
             "bootout".to_string(),
@@ -306,11 +343,25 @@ pub fn deregister<R: CommandRunner>(
         RuntimePlatform::Linux => "systemctl",
         RuntimePlatform::Windows => "schtasks.exe",
     };
-    if runner.run(program, &args)?.success {
-        Ok(())
-    } else {
-        Err(format!("could not deregister {}", platform.identifier()))
+    let result = runner.run(program, &args)?;
+    if result.success {
+        return Ok(());
     }
+    // A registration that is already gone is deregistered. A previous
+    // uninstall that failed after this step leaves exactly that state, and
+    // the retry must get past it rather than refuse forever.
+    if result.stderr.contains("cannot find the file specified")
+        || result.stderr.contains("Could not find")
+        || result.stderr.contains("No such file")
+    {
+        return Ok(());
+    }
+    Err(format!(
+        "could not deregister {}: `{program} {}` said: {}",
+        platform.identifier(),
+        args.join(" "),
+        result.stderr.trim()
+    ))
 }
 
 fn register<R: CommandRunner>(
@@ -891,6 +942,87 @@ mod tests {
             }
             assert!(inventory.owns_path("runtime-definition", &paths.definition));
         }
+    }
+
+    /// `schtasks /Create /XML` accepts the definition only with the Task
+    /// Scheduler namespace on the root element; a fake runner cannot tell,
+    /// so the template is pinned here. The daemon path and logon trigger
+    /// are the two facts the task exists to carry.
+    /// The Windows uninstall drive: `schtasks /Delete` left the daemon it had
+    /// started running with its executable open, and the binary removal
+    /// after it was refused. Deregistration must end the task before
+    /// deleting it, and the delete must not depend on the end succeeding.
+    #[test]
+    fn windows_deregistration_stops_the_daemon_before_deleting_the_task() {
+        let root = fixture_dir("win-deregister");
+        let paths = runtime_paths(RuntimePlatform::Windows, root.path(), root.path());
+        let mut runner = RecordingRunner {
+            // /End refuses (task not running), taskkill refuses (already
+            // exited); /Delete succeeds. Neither refusal may fail the call.
+            results: VecDeque::from([false, false, true]),
+            ..RecordingRunner::default()
+        };
+        deregister(RuntimePlatform::Windows, &paths, Some(4242), &mut runner).unwrap();
+        let calls: Vec<(&str, &str)> = runner
+            .calls
+            .iter()
+            .map(|(program, args)| (program.as_str(), args[0].as_str()))
+            .collect();
+        assert_eq!(
+            calls,
+            [
+                ("schtasks.exe", "/End"),
+                ("taskkill.exe", "/PID"),
+                ("schtasks.exe", "/Delete"),
+            ]
+        );
+        assert_eq!(runner.calls[1].1[1], "4242");
+    }
+
+    /// An uninstall that failed after deleting the task leaves the inventory
+    /// owning a registration that no longer exists; the retry must treat the
+    /// manager's "not found" as already deregistered, and any other refusal
+    /// must carry the manager's words.
+    #[test]
+    fn deregistering_an_absent_registration_is_already_done() {
+        struct NotFound;
+        impl CommandRunner for NotFound {
+            fn run(&mut self, _p: &str, _a: &[String]) -> Result<CommandResult, String> {
+                Ok(CommandResult {
+                    success: false,
+                    stdout: String::new(),
+                    stderr: "ERROR: The system cannot find the file specified.".to_string(),
+                })
+            }
+        }
+        let root = fixture_dir("deregister-absent");
+        let paths = runtime_paths(RuntimePlatform::Windows, root.path(), root.path());
+        deregister(RuntimePlatform::Windows, &paths, None, &mut NotFound).unwrap();
+        let error =
+            deregister(RuntimePlatform::Macos, &paths, None, &mut RefusingRunner).unwrap_err();
+        assert!(error.contains("Bootstrap failed: 5"), "{error}");
+        assert!(error.contains("launchctl bootout"), "{error}");
+    }
+
+    #[test]
+    fn windows_task_definition_carries_the_scheduler_namespace() {
+        let paths = runtime_paths(
+            RuntimePlatform::Windows,
+            Path::new("C:\\Users\\u\\AppData\\Local\\cortexkit\\bin"),
+            Path::new("C:\\Users\\u"),
+        );
+        let xml = desired_definition(RuntimePlatform::Windows, &paths);
+        assert!(
+            xml.starts_with(
+                "<Task version=\"1.4\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">"
+            ),
+            "{xml}"
+        );
+        assert!(xml.contains("<LogonTrigger><Enabled>true</Enabled></LogonTrigger>"));
+        // The path is rendered by the host's path joiner, so it is compared
+        // to what runtime_paths produced rather than to a literal.
+        let command = format!("<Command>{}</Command>", paths.daemon.to_string_lossy());
+        assert!(xml.contains(&command), "{xml}");
     }
 
     #[test]

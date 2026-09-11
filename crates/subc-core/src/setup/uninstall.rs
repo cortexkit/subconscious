@@ -20,6 +20,7 @@ pub struct UninstallReport {
 pub fn uninstall<R: CommandRunner>(
     platform: RuntimePlatform,
     runtime_paths: &RuntimePaths,
+    daemon_pid: Option<u32>,
     runner: &mut R,
     inventory: &mut Inventory,
     config_path: &Path,
@@ -27,7 +28,7 @@ pub fn uninstall<R: CommandRunner>(
 ) -> Result<UninstallReport, String> {
     let mut report = UninstallReport::default();
     if inventory.owns_path("runtime-registration", &runtime_paths.definition) {
-        runtime::deregister(platform, runtime_paths, runner)?;
+        runtime::deregister(platform, runtime_paths, daemon_pid, runner)?;
         inventory.remove_owned_path("runtime-registration", &runtime_paths.definition);
     }
     remove_owned_path(
@@ -83,7 +84,7 @@ fn remove_owned_path(
                 path.display()
             ));
         }
-        fs::remove_file(path).map_err(|error| {
+        remove_file_when_released(path).map_err(|error| {
             format!(
                 "could not remove inventory-owned {}: {error}",
                 path.display()
@@ -93,6 +94,28 @@ fn remove_owned_path(
     }
     inventory.remove_owned_path(kind, path);
     Ok(())
+}
+
+/// Removes a file, waiting out a process that is still releasing it. On
+/// Windows an executable stays undeletable ("Access is denied") until the
+/// process running it has fully exited, and the daemon was asked to stop
+/// only moments earlier by `deregister`; the wait is bounded so a daemon
+/// that never exits still produces the refusal, with the OS's words.
+fn remove_file_when_released(path: &Path) -> std::io::Result<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match fs::remove_file(path) {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if cfg!(windows)
+                    && error.kind() == std::io::ErrorKind::PermissionDenied
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -149,6 +172,7 @@ mod tests {
         let report = uninstall(
             RuntimePlatform::Linux,
             &runtime_paths,
+            None,
             &mut SuccessfulRunner,
             &mut inventory,
             &config,
@@ -192,6 +216,7 @@ mod tests {
         let report = uninstall(
             RuntimePlatform::Linux,
             &runtime_paths,
+            None,
             &mut SuccessfulRunner,
             &mut inventory,
             &root.join("subc.jsonc"),

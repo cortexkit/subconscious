@@ -10,8 +10,10 @@ use std::{
 use tokio::time;
 
 use super::{
+    components::upgrade_roster,
     model::{
-        PlatformObservation, ReleaseAvailability, UpgradeObserved, UpgradeState, UpgradeTarget,
+        Component, PlatformObservation, ReleaseAvailability, UpgradeObserved, UpgradeState,
+        UpgradeTarget,
     },
     release_index::{self, IndexRefusal, ReleaseIndex},
     update_cache::{CacheRead, CachedRelease, UpdateCache, UpdateMetadata},
@@ -220,12 +222,7 @@ fn evidence_from_index(
 }
 
 pub(super) fn upgrade_target_index_path(target: UpgradeTarget) -> (&'static str, &'static str) {
-    match target {
-        UpgradeTarget::Ck => ("core", "ck"),
-        UpgradeTarget::Daemon => ("core", "ck-subc"),
-        UpgradeTarget::SubcMcp => ("core", "ck-subc-mcp"),
-        UpgradeTarget::Aft => ("aft", "ck-aft"),
-    }
+    (target.component.label(), target.label())
 }
 
 /// The state shown by bare `ck`. A failed refresh deliberately does not turn a
@@ -337,7 +334,9 @@ pub async fn dashboard_update_at<S: ReleaseSource>(
         }
     }
 
-    let refreshed = time::timeout(budget, refresh_all(source, now_unix_secs)).await;
+    let refresh_roster = upgrade_roster(Component::ALL);
+    let refreshed =
+        time::timeout(budget, refresh_all(source, &refresh_roster, now_unix_secs)).await;
     match refreshed {
         Ok(Ok(metadata)) => {
             if cache.write(&metadata).is_err() {
@@ -355,16 +354,17 @@ pub async fn dashboard_update_at<S: ReleaseSource>(
     }
 }
 
-/// Refreshes every target using a separate ten-second deadline. This is only
-/// called by `ck upgrade --check`; bare `ck` instead uses the shared 800 ms
+/// Refreshes each installed roster target using a separate ten-second deadline.
+/// This is only called by `ck upgrade --check`; bare `ck` instead uses the shared 800 ms
 /// deadline above and never acquires a per-target wait.
 pub async fn check_update_metadata<S: ReleaseSource>(
     cache: &UpdateCache,
     source: &S,
+    roster: &[UpgradeTarget],
 ) -> Result<UpdateMetadata, UpdateCheckError> {
     let now_unix_secs = unix_now_secs();
     let mut targets = BTreeMap::new();
-    for target in UpgradeTarget::ORDERED {
+    for &target in roster {
         let evidence = match time::timeout(TARGET_CHECK_BUDGET, source.fetch(target)).await {
             Ok(Ok(evidence)) => evidence,
             Ok(Err(ReleaseSourceError::IndexStale { url })) => {
@@ -401,9 +401,9 @@ pub fn observed_from_metadata(
     metadata: &UpdateMetadata,
     installed: &BTreeMap<String, InstalledBinary>,
 ) -> UpgradeObserved {
-    let mut observed = UpgradeObserved::no_updates_on_current_host();
+    let mut observed = UpgradeObserved::for_roster(roster_for_installed(installed));
     let platform = observed.platform.clone();
-    for target in UpgradeTarget::ORDERED {
+    for target in observed.roster.clone() {
         let Some(release) = metadata.targets.get(target.label()) else {
             continue;
         };
@@ -445,10 +445,11 @@ pub fn observed_from_metadata(
 
 async fn refresh_all<S: ReleaseSource>(
     source: &S,
+    roster: &[UpgradeTarget],
     now_unix_secs: u64,
 ) -> Result<UpdateMetadata, ReleaseSourceError> {
     let mut targets = BTreeMap::new();
-    for target in UpgradeTarget::ORDERED {
+    for &target in roster {
         let evidence = source.fetch(target).await?;
         targets.insert(
             target.label().to_string(),
@@ -470,7 +471,7 @@ fn dashboard_state(
     installed: &BTreeMap<String, InstalledBinary>,
     now_unix_secs: u64,
 ) -> DashboardUpdate {
-    let updates = UpgradeTarget::ORDERED
+    let updates = roster_for_installed(installed)
         .into_iter()
         .filter_map(|target| {
             let release = metadata.targets.get(target.label())?;
@@ -499,6 +500,13 @@ fn dashboard_state(
     } else {
         DashboardUpdate::Available { updates, cache_age }
     }
+}
+
+fn roster_for_installed(installed: &BTreeMap<String, InstalledBinary>) -> Vec<UpgradeTarget> {
+    upgrade_roster(Component::ALL)
+        .into_iter()
+        .filter(|target| installed.contains_key(target.label()))
+        .collect()
 }
 
 fn expected_asset_name(target: UpgradeTarget, platform: &PlatformObservation) -> Option<String> {
@@ -539,6 +547,13 @@ mod tests {
     use super::*;
     use subc_core::test_support::TestTempDir;
 
+    fn upgrade_target(binary: &str) -> UpgradeTarget {
+        upgrade_roster(Component::ALL)
+            .into_iter()
+            .find(|target| target.label() == binary)
+            .unwrap_or_else(|| panic!("missing upgrade target {binary}"))
+    }
+
     #[derive(Clone)]
     struct StaticSource {
         results: Arc<Vec<(UpgradeTarget, Result<ReleaseEvidence, ReleaseSourceError>)>>,
@@ -547,7 +562,7 @@ mod tests {
 
     impl StaticSource {
         fn successful(version: &str) -> Self {
-            let results = UpgradeTarget::ORDERED
+            let results = upgrade_roster(Component::ALL)
                 .into_iter()
                 .map(|target| {
                     (
@@ -566,7 +581,7 @@ mod tests {
         }
 
         fn failing(error: ReleaseSourceError) -> Self {
-            let results = UpgradeTarget::ORDERED
+            let results = upgrade_roster(Component::ALL)
                 .into_iter()
                 .map(|target| (target, Err(error.clone())))
                 .collect();
@@ -626,7 +641,7 @@ mod tests {
         UpdateMetadata {
             format_version: super::super::update_cache::UPDATE_CACHE_FORMAT_VERSION,
             checked_at_unix_secs,
-            targets: UpgradeTarget::ORDERED
+            targets: upgrade_roster(Component::ALL)
                 .into_iter()
                 .map(|target| {
                     (
@@ -648,7 +663,7 @@ mod tests {
     }
 
     fn installed(version: &str) -> BTreeMap<String, InstalledBinary> {
-        UpgradeTarget::ORDERED
+        upgrade_roster(Component::ALL)
             .into_iter()
             .map(|target| {
                 (
@@ -704,10 +719,11 @@ mod tests {
         .await;
 
         assert!(
-            matches!(update, DashboardUpdate::Available { ref updates, cache_age } if updates.len() == 4 && cache_age.is_zero())
+            matches!(update, DashboardUpdate::Available { ref updates, cache_age }
+                if updates.len() == upgrade_roster(Component::ALL).len() && cache_age.is_zero())
         );
         assert_eq!(cache.load(), CacheRead::Present(metadata(now, "0.13.0")));
-        assert_eq!(source.calls(), UpgradeTarget::ORDERED.to_vec());
+        assert_eq!(source.calls(), upgrade_roster(Component::ALL).to_vec());
     }
 
     #[tokio::test]
@@ -800,7 +816,7 @@ mod tests {
         let (_dir, cache) = cache("hanging-bare");
         cache.write(&metadata(100, "0.13.0")).unwrap();
         let source = HangingSource {
-            immediate_before: UpgradeTarget::ORDERED[0],
+            immediate_before: upgrade_roster(Component::ALL)[0],
         };
         let now = 100 + super::super::update_cache::UPDATE_CACHE_TTL.as_secs();
         let budget = Duration::from_millis(20);
@@ -825,11 +841,13 @@ mod tests {
         let (_dir, cache) = cache("check-timeout");
         // The first target on the ladder answers at once; the second hangs,
         // and it is the second that must be named, not the first.
+        let roster = upgrade_roster(Component::ALL);
         let source = HangingSource {
-            immediate_before: UpgradeTarget::ORDERED[0],
+            immediate_before: roster[0],
         };
-        let hanging = UpgradeTarget::ORDERED[1];
-        let task = tokio::spawn(async move { check_update_metadata(&cache, &source).await });
+        let hanging = roster[1];
+        let task =
+            tokio::spawn(async move { check_update_metadata(&cache, &source, &roster).await });
         tokio::task::yield_now().await;
         time::advance(Duration::from_secs(10)).await;
 
@@ -843,24 +861,24 @@ mod tests {
         let mut metadata = metadata(100, "0.13.0");
         metadata
             .targets
-            .get_mut(UpgradeTarget::Aft.label())
+            .get_mut(upgrade_target("ck-aft").label())
             .unwrap()
             .sha256 = None;
         let observed = observed_from_metadata(&metadata, &installed("0.12.0"));
 
         assert!(matches!(
-            observed.target_state(UpgradeTarget::Ck),
+            observed.target_state(upgrade_target("ck")),
             UpgradeState::UpdateAvailable { ref from, ref to, .. } if from == "0.12.0" && to == "0.13.0"
         ));
         assert!(matches!(
-            observed.release(UpgradeTarget::Aft),
+            observed.release(upgrade_target("ck-aft")),
             ReleaseAvailability::Incomplete { .. }
         ));
     }
 
     #[test]
     fn release_placed_binary_is_current_when_archive_digest_matches_index() {
-        let target = UpgradeTarget::SubcMcp;
+        let target = upgrade_target("ck-subc-mcp");
         let binary_digest = "ab".repeat(32);
         let archive_digest = "cd".repeat(32);
         assert_ne!(
@@ -888,7 +906,7 @@ mod tests {
 
     #[test]
     fn changed_sibling_digest_plans_a_replacement() {
-        let target = UpgradeTarget::SubcMcp;
+        let target = upgrade_target("ck-subc-mcp");
         let mut metadata = metadata(100, "0.16.2");
         metadata.targets.get_mut(target.label()).unwrap().sha256 = Some("ab".repeat(32));
         let installed = BTreeMap::from([(
@@ -910,7 +928,7 @@ mod tests {
 
     #[test]
     fn sibling_without_a_recorded_digest_plans_one_replacement_to_establish_it() {
-        let target = UpgradeTarget::SubcMcp;
+        let target = upgrade_target("ck-subc-mcp");
         let mut metadata = metadata(100, "0.16.2");
         metadata.targets.get_mut(target.label()).unwrap().sha256 = Some("ab".repeat(32));
         let installed = BTreeMap::from([(
@@ -979,7 +997,10 @@ mod tests {
         };
         let (_dir, cache) = cache("from-index");
         let source = IndexReleaseSource::from_index(index);
-        let metadata = check_update_metadata(&cache, &source).await.unwrap();
+        let roster = upgrade_roster([Component::Core, Component::Aft]);
+        let metadata = check_update_metadata(&cache, &source, &roster)
+            .await
+            .unwrap();
         assert_eq!(
             metadata.format_version,
             super::super::update_cache::UPDATE_CACHE_FORMAT_VERSION

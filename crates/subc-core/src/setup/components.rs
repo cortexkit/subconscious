@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
     process::{self, Command},
@@ -361,6 +362,25 @@ pub fn module_program(component: Component) -> Option<&'static str> {
     }
 }
 
+const SUPERVISED_MODULE_IDS: [(&str, &str); 6] = [
+    // Core owns the daemon and MCP bridge, but only the bridge is a supervised
+    // module program; Core itself remains outside the setup module lifecycle.
+    ("ck-subc-mcp", "subc-mcp"),
+    ("ck-aft", "aft"),
+    ("ck-mc", "magic-context"),
+    ("ck-insula", "insula"),
+    ("ck-claustrum", "claustrum"),
+    ("ck-synapse", "synapse"),
+];
+
+/// Maps managed program binaries to daemon supervisor ids. Sidecar binaries
+/// deliberately have no row and therefore never trigger a module restart.
+pub fn supervised_module_id(binary: &str) -> Option<&'static str> {
+    SUPERVISED_MODULE_IDS
+        .iter()
+        .find_map(|(program, module_id)| (*program == binary).then_some(*module_id))
+}
+
 /// Release asset sets are data, not filesystem discovery, so setup never loses
 /// a synapse worker merely because a different worker happens to be installed.
 pub fn component_binaries_for_target(
@@ -416,6 +436,80 @@ pub fn is_installed(component: Component, binary_home: &Path, inventory: &Invent
     component_binary_paths(component, binary_home)
         .iter()
         .all(|path| path.is_file() && inventory.owns_path("managed-binary", path))
+}
+
+pub fn installed_components(inventory: &Inventory) -> Vec<Component> {
+    let binary_homes = inventory
+        .paths_for_kind("managed-binary")
+        .into_iter()
+        .filter_map(|path| path.parent().map(Path::to_path_buf))
+        .collect::<BTreeSet<_>>();
+    Component::ALL
+        .into_iter()
+        .filter(|component| {
+            binary_homes
+                .iter()
+                .any(|binary_home| is_installed(*component, binary_home, inventory))
+        })
+        .collect()
+}
+
+/// Builds the upgrade ladder directly from installed components and their
+/// host-target binary sets.
+pub fn upgrade_roster(
+    installed: impl IntoIterator<Item = Component>,
+) -> Vec<super::model::UpgradeTarget> {
+    use super::model::UpgradeTarget;
+
+    let installed = installed.into_iter().collect::<BTreeSet<_>>();
+    let mut roster = Vec::new();
+
+    // The daemon goes first. A module built against a newer wire crate can
+    // send a HELLO the old daemon refuses (the manifest diet dropped fields
+    // the pre-0.17.20 daemon required), so a module replaced ahead of the
+    // daemon would come back from its restart unable to register, and the
+    // ladder would refuse before the daemon that accepts it was ever
+    // touched. The other direction is safe: the daemon parses old manifests
+    // leniently, and the catalog_update test that registers a pre-diet
+    // manifest is the premise this order stands on. ck goes last because it
+    // is the process running the ladder.
+    if installed.contains(&Component::Core) {
+        let daemon = component_binaries(Component::Core)
+            .iter()
+            .copied()
+            .find(|binary| *binary == "ck-subc")
+            .expect("Core's binary table must contain ck-subc");
+        roster.push(UpgradeTarget {
+            component: Component::Core,
+            binary: daemon,
+            module_id: supervised_module_id(daemon),
+        });
+    }
+
+    for component in Component::ALL {
+        if !installed.contains(&component) {
+            continue;
+        }
+        for binary in component_binaries(component) {
+            if component == Component::Core && *binary == "ck-subc" {
+                continue;
+            }
+            roster.push(UpgradeTarget {
+                component,
+                binary,
+                module_id: supervised_module_id(binary),
+            });
+        }
+    }
+
+    if installed.contains(&Component::Core) {
+        roster.push(UpgradeTarget {
+            component: Component::Core,
+            binary: "ck",
+            module_id: None,
+        });
+    }
+    roster
 }
 
 pub fn install_component<S: ArtifactSource>(
@@ -785,6 +879,107 @@ mod tests {
         // must still resolve there: the config is target-independent.
         assert!(component_binaries_for_target(Component::Mc, AlphaTarget::WindowsX64).is_empty());
         assert_eq!(module_program(Component::Mc), Some("ck-mc"));
+    }
+
+    #[test]
+    fn upgrade_roster_follows_installed_component_binary_tables() {
+        fn inventory_with(
+            name: &str,
+            components: &[Component],
+        ) -> (TestTempDir, PathBuf, Inventory) {
+            let root = fixture_dir(name);
+            let binary_home = root.join("bin");
+            fs::create_dir_all(&binary_home).expect("binary home");
+            let mut inventory = Inventory::load(
+                root.join("installer-manifest.json"),
+                host_alpha_target().label(),
+            )
+            .expect("inventory");
+            for component in components {
+                for binary in component_binaries(*component) {
+                    let path = binary_home.join(platform_binary(binary));
+                    fs::write(&path, binary).expect("fixture binary");
+                    inventory.record("managed-binary", &path, Map::new());
+                }
+            }
+            (root, binary_home, inventory)
+        }
+
+        let (_root, binary_home, inventory) = inventory_with(
+            "upgrade-roster",
+            &[Component::Core, Component::Claustrum, Component::Synapse],
+        );
+        let installed = installed_components(&inventory);
+        assert_eq!(
+            installed,
+            [Component::Core, Component::Claustrum, Component::Synapse]
+        );
+        assert!(installed.iter().all(|component| is_installed(
+            *component,
+            &binary_home,
+            &inventory
+        )));
+
+        let roster = upgrade_roster(installed);
+        let labels = roster
+            .iter()
+            .map(|target| target.label())
+            .collect::<Vec<_>>();
+        let mut expected = vec!["ck-subc"];
+        expected.extend(
+            component_binaries(Component::Core)
+                .iter()
+                .copied()
+                .filter(|binary| *binary != "ck-subc"),
+        );
+        expected.extend(component_binaries(Component::Claustrum).iter().copied());
+        expected.extend(component_binaries(Component::Synapse).iter().copied());
+        expected.push("ck");
+        assert_eq!(labels, expected);
+        assert!(labels.contains(&"ck-claustrum"));
+        for binary in component_binaries(Component::Synapse) {
+            assert!(labels.contains(binary), "missing synapse binary {binary}");
+        }
+        assert_eq!(labels.first(), Some(&"ck-subc"));
+        assert_eq!(labels.last(), Some(&"ck"));
+
+        let (_root, _, core_inventory) = inventory_with("core-upgrade-roster", &[Component::Core]);
+        assert_eq!(
+            upgrade_roster(installed_components(&core_inventory))
+                .into_iter()
+                .map(|target| target.label())
+                .collect::<Vec<_>>(),
+            ["ck-subc", "ck-subc-mcp", "ck"]
+        );
+    }
+
+    #[test]
+    fn roster_restart_targets_are_bound_to_component_programs_and_module_ids() {
+        let roster = upgrade_roster(Component::ALL);
+        for component in Component::ALL {
+            let Some(module_id) = component.module_id() else {
+                continue;
+            };
+            let program = module_program(component).expect("module component has a program");
+            assert_eq!(supervised_module_id(program), Some(module_id));
+            let restart_target = roster
+                .iter()
+                .find(|target| target.component == component && target.module_id().is_some())
+                .unwrap_or_else(|| panic!("{component} has no restart target"));
+            assert_eq!(restart_target.binary, program);
+            assert_eq!(restart_target.module_id(), Some(module_id));
+        }
+
+        for (binary, module_id) in SUPERVISED_MODULE_IDS {
+            assert!(
+                Component::ALL.into_iter().any(|component| {
+                    AlphaTarget::ALL.into_iter().any(|target| {
+                        component_binaries_for_target(component, target).contains(&binary)
+                    })
+                }),
+                "supervisor row {binary} -> {module_id} has no managed binary"
+            );
+        }
     }
 
     #[test]

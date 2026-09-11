@@ -131,13 +131,13 @@ pub fn execute_upgrade<B: UpgradeExecutionBackend>(
                 "restart-completion",
                 backend.poll_module_restart_completion(*target, RESTART_COMPLETION_TIMEOUT),
             ),
-            UpgradeOperation::RestartDaemonViaServiceManager => (
-                UpgradeTarget::Daemon,
+            UpgradeOperation::RestartDaemonViaServiceManager { target } => (
+                *target,
                 "service-manager-restart",
                 backend.restart_daemon_via_service_manager(DRAIN_TIMEOUT),
             ),
-            UpgradeOperation::PollDaemonServiceReady => (
-                UpgradeTarget::Daemon,
+            UpgradeOperation::PollDaemonServiceReady { target } => (
+                *target,
                 "service-manager-completion",
                 backend.poll_daemon_service_ready(RESTART_COMPLETION_TIMEOUT),
             ),
@@ -201,7 +201,18 @@ pub fn execute_upgrade<B: UpgradeExecutionBackend>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::setup::{model::UpgradeObserved, planner::plan_upgrade};
+    use crate::setup::{
+        components::upgrade_roster,
+        model::{Component, UpgradeObserved},
+        planner::plan_upgrade,
+    };
+
+    fn upgrade_target(binary: &str) -> UpgradeTarget {
+        upgrade_roster(Component::ALL)
+            .into_iter()
+            .find(|target| target.label() == binary)
+            .unwrap_or_else(|| panic!("missing upgrade target {binary}"))
+    }
 
     #[derive(Default)]
     struct RecordingBackend {
@@ -299,10 +310,11 @@ mod tests {
     }
 
     fn update_plan() -> UpgradePlan {
-        let mut observed = UpgradeObserved::no_updates_on_current_host();
+        let mut observed =
+            UpgradeObserved::for_roster(upgrade_roster([Component::Core, Component::Aft]));
         observed.supervised_modules.insert("subc-mcp".to_string());
         observed.supervised_modules.insert("aft".to_string());
-        for target in UpgradeTarget::ORDERED {
+        for target in observed.roster.clone() {
             observed.targets.insert(
                 target.label().to_string(),
                 super::super::model::UpgradeState::UpdateAvailable {
@@ -324,7 +336,7 @@ mod tests {
         let failure = execute_upgrade(&update_plan(), &mut backend).expect_err("warm failure");
         // The daemon is the first target on the ladder, so its warm failure
         // stops everything before any module is touched.
-        assert_eq!(failure.target, UpgradeTarget::Daemon);
+        assert_eq!(failure.target, upgrade_target("ck-subc"));
         assert_eq!(backend.calls, ["download", "copy", "replace", "warm"]);
         assert!(failure
             .report
@@ -345,7 +357,7 @@ mod tests {
         // the first module rung, whose activation is what fails here; the
         // calls that must be absent are that module's own poll and verify.
         assert_eq!(failure.stage, "restart-initiation");
-        assert_eq!(failure.target, UpgradeTarget::SubcMcp);
+        assert_eq!(failure.target, upgrade_target("ck-subc-mcp"));
         let daemon_verified = backend
             .calls
             .iter()
@@ -364,9 +376,10 @@ mod tests {
 
     #[test]
     fn a_successful_target_is_announced_after_post_verification() {
-        let mut observed = UpgradeObserved::no_updates_on_current_host();
+        let ck = upgrade_target("ck");
+        let mut observed = UpgradeObserved::for_roster(vec![ck]);
         observed.targets.insert(
-            UpgradeTarget::Ck.label().to_string(),
+            ck.label().to_string(),
             super::super::model::UpgradeState::UpdateAvailable {
                 from: "1.0.0".to_string(),
                 to: "2.0.0".to_string(),
@@ -385,9 +398,10 @@ mod tests {
 
     #[test]
     fn accepted_rollback_reports_the_restored_prior_inode() {
-        let mut observed = UpgradeObserved::no_updates_on_current_host();
+        let ck = upgrade_target("ck");
+        let mut observed = UpgradeObserved::for_roster(vec![ck]);
         observed.targets.insert(
-            UpgradeTarget::Ck.label().to_string(),
+            ck.label().to_string(),
             super::super::model::UpgradeState::UpdateAvailable {
                 from: "1.0.0".to_string(),
                 to: "2.0.0".to_string(),
@@ -411,9 +425,11 @@ mod tests {
     #[test]
     fn roster_lacking_subc_mcp_and_having_aft_plans_no_subc_mcp_restart_and_executes_to_completion()
     {
-        let mut observed = UpgradeObserved::no_updates_on_current_host();
+        let subc_mcp = upgrade_target("ck-subc-mcp");
+        let aft = upgrade_target("ck-aft");
+        let mut observed = UpgradeObserved::for_roster(vec![subc_mcp, aft]);
         observed.supervised_modules.insert("aft".to_string());
-        for target in [UpgradeTarget::SubcMcp, UpgradeTarget::Aft] {
+        for target in [subc_mcp, aft] {
             observed.targets.insert(
                 target.label().to_string(),
                 super::super::model::UpgradeState::UpdateAvailable {
@@ -425,25 +441,19 @@ mod tests {
         }
         let plan = plan_upgrade(&observed);
 
-        assert!(!plan.operations.iter().any(|op| matches!(
-            op,
-            UpgradeOperation::InitiateModuleRestart {
-                target: UpgradeTarget::SubcMcp
-            } | UpgradeOperation::PollModuleRestartCompletion {
-                target: UpgradeTarget::SubcMcp
-            }
+        assert!(!plan.operations.iter().any(|operation| matches!(
+            operation,
+            UpgradeOperation::InitiateModuleRestart { target }
+                | UpgradeOperation::PollModuleRestartCompletion { target }
+                if *target == subc_mcp
         )));
-        assert!(plan.operations.iter().any(|op| matches!(
-            op,
-            UpgradeOperation::InitiateModuleRestart {
-                target: UpgradeTarget::Aft
-            }
+        assert!(plan.operations.iter().any(|operation| matches!(
+            operation,
+            UpgradeOperation::InitiateModuleRestart { target } if *target == aft
         )));
-        assert!(plan.operations.iter().any(|op| matches!(
-            op,
-            UpgradeOperation::PollModuleRestartCompletion {
-                target: UpgradeTarget::Aft
-            }
+        assert!(plan.operations.iter().any(|operation| matches!(
+            operation,
+            UpgradeOperation::PollModuleRestartCompletion { target } if *target == aft
         )));
 
         let mut backend = RecordingBackend::default();
@@ -470,19 +480,21 @@ mod tests {
         assert!(report
             .evidence
             .iter()
-            .any(|e| e.target == UpgradeTarget::SubcMcp && e.stage == "post-verification"));
+            .any(|e| e.target == subc_mcp && e.stage == "post-verification"));
         assert!(report
             .evidence
             .iter()
-            .any(|e| e.target == UpgradeTarget::Aft && e.stage == "restart-completion"));
+            .any(|e| e.target == aft && e.stage == "restart-completion"));
     }
 
     #[test]
     fn roster_having_both_subc_mcp_and_aft_plans_both_restart_pairs() {
-        let mut observed = UpgradeObserved::no_updates_on_current_host();
+        let subc_mcp = upgrade_target("ck-subc-mcp");
+        let aft = upgrade_target("ck-aft");
+        let mut observed = UpgradeObserved::for_roster(vec![subc_mcp, aft]);
         observed.supervised_modules.insert("subc-mcp".to_string());
         observed.supervised_modules.insert("aft".to_string());
-        for target in [UpgradeTarget::SubcMcp, UpgradeTarget::Aft] {
+        for target in [subc_mcp, aft] {
             observed.targets.insert(
                 target.label().to_string(),
                 super::super::model::UpgradeState::UpdateAvailable {
@@ -494,29 +506,17 @@ mod tests {
         }
         let plan = plan_upgrade(&observed);
 
-        assert!(plan.operations.iter().any(|op| matches!(
-            op,
-            UpgradeOperation::InitiateModuleRestart {
-                target: UpgradeTarget::SubcMcp
-            }
-        )));
-        assert!(plan.operations.iter().any(|op| matches!(
-            op,
-            UpgradeOperation::PollModuleRestartCompletion {
-                target: UpgradeTarget::SubcMcp
-            }
-        )));
-        assert!(plan.operations.iter().any(|op| matches!(
-            op,
-            UpgradeOperation::InitiateModuleRestart {
-                target: UpgradeTarget::Aft
-            }
-        )));
-        assert!(plan.operations.iter().any(|op| matches!(
-            op,
-            UpgradeOperation::PollModuleRestartCompletion {
-                target: UpgradeTarget::Aft
-            }
-        )));
+        for target in [subc_mcp, aft] {
+            assert!(plan.operations.iter().any(|operation| matches!(
+                operation,
+                UpgradeOperation::InitiateModuleRestart { target: candidate }
+                    if *candidate == target
+            )));
+            assert!(plan.operations.iter().any(|operation| matches!(
+                operation,
+                UpgradeOperation::PollModuleRestartCompletion { target: candidate }
+                    if *candidate == target
+            )));
+        }
     }
 }

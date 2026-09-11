@@ -136,10 +136,12 @@ pub fn expected_post_activation(
 }
 
 pub fn target_verification_label(target: UpgradeTarget) -> &'static str {
-    match target {
-        UpgradeTarget::SubcMcp | UpgradeTarget::Aft => "module provenance and health",
-        UpgradeTarget::Daemon => "service-manager process and daemon health",
-        UpgradeTarget::Ck => "replacement binary invocation",
+    if target.module_id().is_some() {
+        "module provenance and health"
+    } else if target.is_daemon() {
+        "service-manager process and daemon health"
+    } else {
+        "replacement binary invocation"
     }
 }
 

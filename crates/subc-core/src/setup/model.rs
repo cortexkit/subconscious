@@ -618,8 +618,17 @@ pub enum UpgradeTarget {
 }
 
 impl UpgradeTarget {
-    /// MC is intentionally absent: alpha wires it but has no MC release archive.
-    pub const ORDERED: [Self; 4] = [Self::SubcMcp, Self::Aft, Self::Daemon, Self::Ck];
+    /// The daemon goes first. A module built against a newer wire crate can
+    /// send a HELLO the old daemon refuses (the manifest diet dropped fields
+    /// the pre-0.17.20 daemon required), so a module replaced ahead of the
+    /// daemon would come back from its restart unable to register, and the
+    /// ladder would refuse before the daemon that accepts it was ever
+    /// touched. The other direction is safe: the daemon parses old manifests
+    /// leniently, and the catalog_update test that registers a pre-diet
+    /// manifest is the premise this order stands on. ck goes last because it
+    /// is the process running the ladder. MC is intentionally absent: alpha
+    /// wires it but has no MC release archive.
+    pub const ORDERED: [Self; 4] = [Self::Daemon, Self::SubcMcp, Self::Aft, Self::Ck];
 
     pub const fn label(self) -> &'static str {
         match self {

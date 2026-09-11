@@ -7,6 +7,14 @@ use super::{
 
 pub const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long a restart is given to come back live and healthy. A restart is
+/// the drain (up to `DRAIN_TIMEOUT`, spent in full whenever a consumer holds
+/// a route open) followed by the module's own startup; aft answers `ok` only
+/// after warming its roots, which took 75 s on a loaded host and longer on
+/// a cold VM. Polling for only the drain budget refused a restart that
+/// succeeded thirty seconds later and stopped the ladder before the daemon.
+pub const RESTART_COMPLETION_TIMEOUT: Duration = Duration::from_secs(180);
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UpgradeEvidence {
     pub target: UpgradeTarget,
@@ -48,13 +56,14 @@ pub trait UpgradeExecutionBackend {
     fn poll_module_restart_completion(
         &mut self,
         target: UpgradeTarget,
-        drain_timeout: Duration,
+        completion_timeout: Duration,
     ) -> Result<String, String>;
     fn restart_daemon_via_service_manager(
         &mut self,
         drain_timeout: Duration,
     ) -> Result<String, String>;
-    fn poll_daemon_service_ready(&mut self, drain_timeout: Duration) -> Result<String, String>;
+    fn poll_daemon_service_ready(&mut self, completion_timeout: Duration)
+        -> Result<String, String>;
     fn post_verify(&mut self, target: UpgradeTarget) -> Result<String, String>;
 
     fn completed(&mut self, _target: UpgradeTarget) {}
@@ -120,7 +129,7 @@ pub fn execute_upgrade<B: UpgradeExecutionBackend>(
             UpgradeOperation::PollModuleRestartCompletion { target } => (
                 *target,
                 "restart-completion",
-                backend.poll_module_restart_completion(*target, DRAIN_TIMEOUT),
+                backend.poll_module_restart_completion(*target, RESTART_COMPLETION_TIMEOUT),
             ),
             UpgradeOperation::RestartDaemonViaServiceManager => (
                 UpgradeTarget::Daemon,
@@ -130,7 +139,7 @@ pub fn execute_upgrade<B: UpgradeExecutionBackend>(
             UpgradeOperation::PollDaemonServiceReady => (
                 UpgradeTarget::Daemon,
                 "service-manager-completion",
-                backend.poll_daemon_service_ready(DRAIN_TIMEOUT),
+                backend.poll_daemon_service_ready(RESTART_COMPLETION_TIMEOUT),
             ),
             UpgradeOperation::PostVerify { target } => {
                 let result = backend.post_verify(*target);
@@ -240,9 +249,12 @@ mod tests {
         fn poll_module_restart_completion(
             &mut self,
             _target: UpgradeTarget,
-            drain_timeout: Duration,
+            completion_timeout: Duration,
         ) -> Result<String, String> {
-            assert_eq!(drain_timeout, DRAIN_TIMEOUT);
+            // The completion budget must exceed the drain: a restart is the
+            // drain plus the module's own startup.
+            assert_eq!(completion_timeout, RESTART_COMPLETION_TIMEOUT);
+            assert!(completion_timeout > DRAIN_TIMEOUT);
             self.calls.push("poll");
             Ok("healthy".to_string())
         }
@@ -254,8 +266,11 @@ mod tests {
             self.calls.push("service-restart");
             Ok("requested".to_string())
         }
-        fn poll_daemon_service_ready(&mut self, drain_timeout: Duration) -> Result<String, String> {
-            assert_eq!(drain_timeout, DRAIN_TIMEOUT);
+        fn poll_daemon_service_ready(
+            &mut self,
+            completion_timeout: Duration,
+        ) -> Result<String, String> {
+            assert_eq!(completion_timeout, RESTART_COMPLETION_TIMEOUT);
             self.calls.push("service-poll");
             Ok("healthy".to_string())
         }
@@ -307,7 +322,9 @@ mod tests {
             ..Default::default()
         };
         let failure = execute_upgrade(&update_plan(), &mut backend).expect_err("warm failure");
-        assert_eq!(failure.target, UpgradeTarget::SubcMcp);
+        // The daemon is the first target on the ladder, so its warm failure
+        // stops everything before any module is touched.
+        assert_eq!(failure.target, UpgradeTarget::Daemon);
         assert_eq!(backend.calls, ["download", "copy", "replace", "warm"]);
         assert!(failure
             .report
@@ -324,10 +341,25 @@ mod tests {
         };
         let failure =
             execute_upgrade(&update_plan(), &mut backend).expect_err("activation failure");
+        // The daemon rung (service restart, poll, verify) completes ahead of
+        // the first module rung, whose activation is what fails here; the
+        // calls that must be absent are that module's own poll and verify.
         assert_eq!(failure.stage, "restart-initiation");
-        assert!(!backend.calls.contains(&"poll"));
-        assert!(!backend.calls.contains(&"verify"));
-        assert!(!backend.calls.contains(&"completed"));
+        assert_eq!(failure.target, UpgradeTarget::SubcMcp);
+        let daemon_verified = backend
+            .calls
+            .iter()
+            .position(|call| *call == "verify")
+            .expect("daemon rung verified before the module rung");
+        let module_activation = backend
+            .calls
+            .iter()
+            .rposition(|call| *call == "initiate")
+            .expect("module activation attempted");
+        assert!(daemon_verified < module_activation);
+        assert!(!backend.calls[module_activation..].contains(&"poll"));
+        assert!(!backend.calls[module_activation..].contains(&"verify"));
+        assert!(!backend.calls[module_activation..].contains(&"completed"));
     }
 
     #[test]

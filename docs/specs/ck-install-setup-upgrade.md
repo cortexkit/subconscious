@@ -26,7 +26,7 @@ not conflict with this amendment.
 | **Settled by operator**, item 2, “the standalone-conversion offer is the same code path as a later add” | Accepted conversion still uses the normal component-add path, but [AFT conversion](#aft-conversion) permits AFT conversion only through the explicit confirmed verb during alpha. |
 | **ck upgrade**, “Check” bullet, including comparison against releases for “subc / aft / mc” | [Update checks](#update-checks) and [Upgrade ordering and target restarts](#upgrade-ordering-and-target-restarts) exclude MC from alpha upgrades and define the interactive check deadlines. |
 | **ck upgrade**, “Upgrade” bullet, including a single `supervisor.restart` path | [Upgrade ordering and target restarts](#upgrade-ordering-and-target-restarts) separates module, daemon, and self-update restart behavior. |
-| **ck upgrade**, “Ordering” bullet | [Upgrade ordering and target restarts](#upgrade-ordering-and-target-restarts) retains modules before daemon and makes `ck` self-update the final target. |
+| **ck upgrade**, “Ordering” bullet | [Upgrade ordering and target restarts](#upgrade-ordering-and-target-restarts) places the daemon before the modules and makes `ck` self-update the final target. |
 | **ck upgrade**, “Channels” bullet | [Alpha support and release inventory](#alpha-support-and-release-inventory) and [Release lanes](#release-lanes) define the supported inventory gate and AFT’s cross-repository release dependency. |
 
 ## Flow
@@ -390,16 +390,31 @@ warm-executes the destination inode, and post-verifies PID, destination inode,
 health, and version. Failed post-verification offers rollback; accepting it
 restores the prior inode. The command prints evidence for each completed stage.
 
+The ladder runs the daemon first, then the modules, then `ck`. A module built
+against a newer wire crate can send a HELLO that an older daemon refuses (the
+manifest diet dropped fields a pre-0.17.20 daemon required), so a module
+replaced ahead of the daemon would restart into a registration refusal and the
+ladder would stop before the daemon that accepts it was touched. The reverse
+is safe because the daemon parses older manifests leniently; that premise is
+pinned by a test that registers a pre-diet manifest against the current daemon,
+so the ordering fails loudly if the premise ever moves.
+
 Restart semantics are target-specific:
 
-- Managed modules restart through `supervisor.restart`, with initiation
-  acknowledgement and completion polling; their clients absorb the transition
-  through retry patience.
 - The daemon restarts through its platform service manager, with a 30-second
   drain and service-manager initiation acknowledgement. It does not use the
   module restart path.
+- Managed modules restart through `supervisor.restart`, with initiation
+  acknowledgement and completion polling; their clients absorb the transition
+  through retry patience.
+- Completion polling waits up to 180 seconds for a restarted target to be live
+  and healthy: the drain may spend its full 30 seconds whenever a consumer holds
+  a route open, and a module's own startup follows it (`aft` reports healthy
+  only after warming its roots, which has taken over a minute on a loaded
+  host). A budget equal to the drain alone refused restarts that succeeded
+  seconds later.
 - `ck` self-update has no runtime restart. It is always the final selected
-  target, after all modules and the daemon have completed, so its failure
+  target, after the daemon and all modules have completed, so its failure
   cannot undo or strand their completed sequence.
 
 On Unix, self-update verifies a temporary replacement and atomically renames it

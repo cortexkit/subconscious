@@ -1063,7 +1063,7 @@ mod tests {
     }
 
     #[test]
-    fn upgrade_orders_module_ack_poll_then_daemon_service_then_ck_without_mc() {
+    fn upgrade_orders_daemon_service_then_module_ack_poll_then_ck_without_mc() {
         let mut targets = BTreeMap::new();
         let mut releases = BTreeMap::new();
         for target in UpgradeTarget::ORDERED {
@@ -1121,8 +1121,10 @@ mod tests {
                 )
             })
             .unwrap();
-        assert!(aft_poll < daemon_restart);
-        assert!(daemon_restart < ck_replace);
+        // Daemon before modules: a module rebuilt against a newer wire crate
+        // must restart into a daemon that already accepts its HELLO.
+        assert!(daemon_restart < aft_poll);
+        assert!(aft_poll < ck_replace);
         assert!(!operations.iter().any(|operation| matches!(
             operation,
             UpgradeOperation::InitiateModuleRestart {

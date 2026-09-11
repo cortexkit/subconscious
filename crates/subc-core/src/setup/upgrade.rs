@@ -627,12 +627,14 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
     fn poll_module_restart_completion(
         &mut self,
         target: UpgradeTarget,
-        drain_timeout: Duration,
+        completion_timeout: Duration,
     ) -> Result<String, String> {
-        self.wait_until(drain_timeout, || self.module_ready(target))?;
+        let started = Instant::now();
+        self.wait_until(completion_timeout, || self.module_ready(target))?;
         Ok(format!(
-            "module is live and healthy after {}s drain",
-            drain_timeout.as_secs()
+            "module is live and healthy {:.0}s after restart (budget {}s)",
+            started.elapsed().as_secs_f64(),
+            completion_timeout.as_secs()
         ))
     }
 
@@ -647,11 +649,16 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
         ))
     }
 
-    fn poll_daemon_service_ready(&mut self, drain_timeout: Duration) -> Result<String, String> {
-        self.wait_until(drain_timeout, || self.daemon_ready())?;
+    fn poll_daemon_service_ready(
+        &mut self,
+        completion_timeout: Duration,
+    ) -> Result<String, String> {
+        let started = Instant::now();
+        self.wait_until(completion_timeout, || self.daemon_ready())?;
         Ok(format!(
-            "daemon service is live and healthy after {}s drain",
-            drain_timeout.as_secs()
+            "daemon service is live and healthy {:.0}s after restart (budget {}s)",
+            started.elapsed().as_secs_f64(),
+            completion_timeout.as_secs()
         ))
     }
 
@@ -893,9 +900,11 @@ mod tests {
             targets.iter().map(|item| item.target).collect::<Vec<_>>(),
             UpgradeTarget::ORDERED
         );
-        assert_eq!(targets[0].installed_version, "1.1.0");
-        assert_eq!(targets[1].installed_version, "1.2.0");
-        assert_eq!(targets[2].installed_version, "1.3.0");
+        // Daemon, subc-mcp, aft, ck: the daemon's version is the catalog's,
+        // the modules' and ck's are their own outputs.
+        assert_eq!(targets[0].installed_version, "1.3.0");
+        assert_eq!(targets[1].installed_version, "1.1.0");
+        assert_eq!(targets[2].installed_version, "1.2.0");
         assert_eq!(targets[3].installed_version, "1.0.0");
     }
 

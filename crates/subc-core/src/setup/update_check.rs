@@ -800,7 +800,7 @@ mod tests {
         let (_dir, cache) = cache("hanging-bare");
         cache.write(&metadata(100, "0.13.0")).unwrap();
         let source = HangingSource {
-            immediate_before: UpgradeTarget::SubcMcp,
+            immediate_before: UpgradeTarget::ORDERED[0],
         };
         let now = 100 + super::super::update_cache::UPDATE_CACHE_TTL.as_secs();
         let budget = Duration::from_millis(20);
@@ -823,21 +823,19 @@ mod tests {
     async fn explicit_check_times_out_each_target_independently_and_names_the_expired_target() {
         assert_eq!(TARGET_CHECK_BUDGET, Duration::from_secs(10));
         let (_dir, cache) = cache("check-timeout");
+        // The first target on the ladder answers at once; the second hangs,
+        // and it is the second that must be named, not the first.
         let source = HangingSource {
-            immediate_before: UpgradeTarget::SubcMcp,
+            immediate_before: UpgradeTarget::ORDERED[0],
         };
+        let hanging = UpgradeTarget::ORDERED[1];
         let task = tokio::spawn(async move { check_update_metadata(&cache, &source).await });
         tokio::task::yield_now().await;
         time::advance(Duration::from_secs(10)).await;
 
         let error = task.await.unwrap().unwrap_err();
-        assert_eq!(
-            error,
-            UpdateCheckError::ExpiredTarget {
-                target: UpgradeTarget::Aft,
-            }
-        );
-        assert!(error.to_string().contains("ck-aft"));
+        assert_eq!(error, UpdateCheckError::ExpiredTarget { target: hanging });
+        assert!(error.to_string().contains(hanging.label()));
     }
 
     #[test]

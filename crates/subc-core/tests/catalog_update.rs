@@ -329,6 +329,71 @@ async fn hello_with_fields_absent_manifest_registers_and_serves_catalog_list() {
     assert_tool_names(&modules[0], &["test_tool"]);
 }
 
+// The premise `ck upgrade` rests on when it restarts the daemon before the
+// modules: a new daemon must register a module built before the manifest
+// diet, whose HELLO still carries `trust_tier`, `consumes` and `bindings`
+// with values. The bytes here are what subc-protocol 0.18 serialised, kept
+// as a literal so no builder in this tree can quietly modernise them. If
+// this ever reddens, daemon-first ordering strands every not-yet-upgraded
+// module at registration, and the failure would otherwise be read as the
+// ordering being wrong rather than the premise having moved.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_new_daemon_registers_a_pre_diet_manifest_with_its_fields_present() {
+    let server = TestServer::start().await;
+    let module_id = "pre-diet-provider";
+    let mut module = connect_endpoint(&server, "module").await;
+
+    // Taken from the module_hello_body golden that pinned the 0.18 wire,
+    // with the module id and tool name changed and `consumes` present as
+    // the empty list every pre-diet builder emitted.
+    let body = format!(
+        r#"{{"manifest":{{"bindings":{{"identity":{{"optional":["session"],"requires":["project"]}},"storage":{{"kind":"sqlite","owns_schema":true,"scope":"project"}},"vault_grants":[]}},"consumes":[],"module_id":"{module_id}","module_version":"0.9.0","protocol_ver":{PROTOCOL_VERSION},"provides":[{{"concurrency":"module_managed","emits_push":true,"identity_scope":["project","session"],"role":"tool_provider","sub_supervises":true,"tools":[{{"execution_mode":"pure","name":"legacy_tool","schema":{{"required":["id"],"type":"object"}}}}]}}],"trust_tier":"first_party"}},"protocol_ver":{PROTOCOL_VERSION}}}"#
+    );
+    // The literal must actually carry the fields, or the test proves nothing.
+    let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+    for field in ["trust_tier", "consumes", "bindings"] {
+        assert!(
+            parsed["manifest"].get(field).is_some(),
+            "fixture lost the pre-diet field {field}"
+        );
+    }
+
+    let corr = 111;
+    module
+        .send(
+            &Frame::build(
+                FrameType::Hello,
+                control_flags(),
+                0,
+                0,
+                corr,
+                body.into_bytes(),
+            )
+            .unwrap(),
+        )
+        .await;
+    let ack_frame = module
+        .inbox
+        .wait_for(SETUP_TIMEOUT, "HELLO_ACK", |frame| {
+            frame.header.channel == 0
+                && frame.header.corr == corr
+                && matches!(frame.header.ty, FrameType::HelloAck | FrameType::Error)
+        })
+        .await;
+    assert_eq!(
+        ack_frame.header.ty,
+        FrameType::HelloAck,
+        "a pre-diet HELLO must register on a new daemon; got {}",
+        String::from_utf8_lossy(&ack_frame.body)
+    );
+    let ack: ModuleHelloAckBody = serde_json::from_slice(&ack_frame.body).unwrap();
+    assert_eq!(ack.negotiated_ver, PROTOCOL_VERSION);
+
+    let (_generation, modules) = catalog_list(&server, Some(module_id), 211).await;
+    assert_eq!(modules.len(), 1);
+    assert_tool_names(&modules[0], &["legacy_tool"]);
+}
+
 async fn register_module(
     server: &TestServer,
     module: &mut Endpoint,

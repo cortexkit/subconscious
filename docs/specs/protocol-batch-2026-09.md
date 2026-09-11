@@ -113,7 +113,11 @@ opened after the notice are not excluded (they should not exist; 2a asked
 the module to stop admitting). Excluded streams still receive their route
 GOODBYE at drain end as today.
 
-The 30 s ceiling is never extended by any of the three.
+The 30 s ceiling is never extended by any of the three. Consequently `Busy`
+changes **when** the kill lands inside the ceiling, never **whether**: a
+module whose gauge is still non-zero at 30 s is killed as today. A module
+declares `Busy` to protect work that settles inside its own deadline
+contract, not to hold the daemon.
 
 Seal rules a module's stop hook must satisfy, cited from BROCA's design:
 interrupted work is `Interrupted`, never `Cancelled`; a seal that drops the
@@ -185,6 +189,18 @@ current rendering are closed. Lands in the daemon cut that carries 2a–2c.
    consumer runs.
 3. Producers move: prefrontal/plugins send `project_id`; broca and aft wire
    `Draining` into their stop hooks; MC adopts `call_with_streamed_body`.
+
+## Consumer ledger (one line per seat, added as reviews arrive)
+
+- **callosum** (CALLO): item 1 — one production construction site
+  (`runtime.rs:11837`) plus eight test literals, all migrate to `::new`;
+  as a producer on the serving-side `route.open` its `project_id` is always
+  absent (no entorhinal resolution on that path), so consistency holds by
+  construction. Item 2 — consumer of both 2a and 2b; 2a lets it refuse
+  inbound admission at drain start (origin classifies `not_sent`, retries
+  elsewhere) and 2b will anchor `Busy` to a new `ledgered_in_flight` gauge
+  so the drain waits for exactly the calls whose interruption is an
+  `ambiguous` reconciliation. Items 3–6: no exposure.
 
 ## Open for review
 

@@ -47,6 +47,19 @@ pub trait ArtifactSource {
     fn verify(&mut self, destination: &Path, acceptance: &Acceptance) -> Result<(), String> {
         verify_acceptance(destination, acceptance)
     }
+
+    /// A binary already at `destination` that no inventory row owns: are its
+    /// bytes exactly the release's? `Some(digests)` adopts it without writing;
+    /// `None` leaves the refusal in place. The default adopts nothing, so a
+    /// source that cannot compare (a test fake) keeps today's refusal.
+    fn adopt_if_identical(
+        &mut self,
+        _component: Component,
+        _binary: &str,
+        _destination: &Path,
+    ) -> Result<Option<PlacementDigests>, String> {
+        Ok(None)
+    }
 }
 
 /// Downloads archives named by the signed release index and verifies each
@@ -227,13 +240,26 @@ impl ReleaseArtifactSource {
     }
 }
 
-impl ArtifactSource for ReleaseArtifactSource {
-    fn install(
+/// A release asset downloaded, digest-verified, and extracted into a temp dir
+/// that is removed on drop. `candidate` is the binary at the archive root.
+struct FetchedCandidate {
+    temp: PathBuf,
+    candidate: PathBuf,
+    archive_sha256: String,
+}
+
+impl Drop for FetchedCandidate {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.temp);
+    }
+}
+
+impl ReleaseArtifactSource {
+    fn fetch_candidate(
         &mut self,
         component: Component,
         binary: &str,
-        destination: &Path,
-    ) -> Result<PlacementDigests, String> {
+    ) -> Result<FetchedCandidate, String> {
         let binary_name = platform_binary(binary);
         let archive_name = format!("{}-{}.zip", binary, self.target.label());
         let asset = self.lookup_asset(component, binary)?;
@@ -276,6 +302,24 @@ impl ArtifactSource for ReleaseArtifactSource {
                 "{archive_name} did not contain {binary_name} at its archive root"
             ));
         }
+        Ok(FetchedCandidate {
+            temp,
+            candidate,
+            archive_sha256: expected,
+        })
+    }
+}
+
+impl ArtifactSource for ReleaseArtifactSource {
+    fn install(
+        &mut self,
+        component: Component,
+        binary: &str,
+        destination: &Path,
+    ) -> Result<PlacementDigests, String> {
+        let binary_name = platform_binary(binary);
+        let fetched = self.fetch_candidate(component, binary)?;
+        let candidate = fetched.candidate.clone();
         let parent = destination.parent().ok_or_else(|| {
             format!(
                 "managed binary destination {} has no parent",
@@ -314,11 +358,32 @@ impl ArtifactSource for ReleaseArtifactSource {
             )
         })?;
         let binary_sha256 = digest_file(destination)?;
-        let _ = fs::remove_dir_all(temp);
         Ok(PlacementDigests {
             binary_sha256,
-            archive_sha256: expected,
+            archive_sha256: fetched.archive_sha256.clone(),
         })
+    }
+
+    /// The ownership record can be lost while the binary stays: a bootstrap
+    /// re-run before 0.17.25 rewrote the manifest wholesale. Bytes are the
+    /// only proof left, so the release is fetched and compared byte for byte
+    /// with what is on disk; identical adopts, anything else keeps the refusal
+    /// because a binary that is not the release's cannot be called managed.
+    fn adopt_if_identical(
+        &mut self,
+        component: Component,
+        binary: &str,
+        destination: &Path,
+    ) -> Result<Option<PlacementDigests>, String> {
+        let fetched = self.fetch_candidate(component, binary)?;
+        let on_disk = digest_file(destination)?;
+        if digest_file(&fetched.candidate)? != on_disk {
+            return Ok(None);
+        }
+        Ok(Some(PlacementDigests {
+            binary_sha256: on_disk,
+            archive_sha256: fetched.archive_sha256.clone(),
+        }))
     }
 
     fn acceptance(&mut self, component: Component, binary: &str) -> Result<Acceptance, String> {
@@ -432,10 +497,13 @@ pub fn component_binary_paths(component: Component, binary_home: &Path) -> Vec<s
         .collect()
 }
 
+/// Whether setup considers `component` installed: every binary on disk and
+/// owned by the inventory under either kind. A binary `ck upgrade` placed
+/// (`binary-placement`) is as installed as one setup placed; the two writers
+/// disagreeing here made `ck setup claustrum` on an upgraded machine plan a
+/// core reinstall it then refused.
 pub fn is_installed(component: Component, binary_home: &Path, inventory: &Inventory) -> bool {
-    component_binary_paths(component, binary_home)
-        .iter()
-        .all(|path| path.is_file() && inventory.owns_path("managed-binary", path))
+    component_is_owned(component, binary_home, inventory)
 }
 
 /// The inventory kinds under which a managed binary is owned. Setup records
@@ -455,9 +523,7 @@ pub fn owned_binary_paths(inventory: &Inventory) -> Vec<PathBuf> {
 }
 
 /// Whether every binary of `component` for this host is on disk under
-/// `binary_home` and inventory-owned under either kind. Distinct from
-/// `is_installed`, which setup uses to decide whether to place a component
-/// and which recognises only setup's own `managed-binary` rows.
+/// `binary_home` and inventory-owned under either kind.
 pub fn component_is_owned(component: Component, binary_home: &Path, inventory: &Inventory) -> bool {
     let paths = component_binary_paths(component, binary_home);
     // A component with no binaries on this target (MC on Windows) has nothing
@@ -552,14 +618,31 @@ pub fn install_component<S: ArtifactSource>(
 ) -> Result<(), String> {
     for binary in component_binaries(component) {
         let destination = binary_home.join(platform_binary(binary));
-        if inventory.owns_path("managed-binary", &destination) && destination.is_file() {
+        if destination.is_file()
+            && OWNED_BINARY_KINDS
+                .iter()
+                .any(|kind| inventory.owns_path(kind, &destination))
+        {
             continue;
         }
         if destination.exists() {
-            return Err(format!(
-                "refusal: managed binary destination {} exists without inventory ownership",
-                destination.display()
-            ));
+            match source.adopt_if_identical(component, binary, &destination)? {
+                Some(digests) => {
+                    record_placement(component, &destination, digests, inventory)?;
+                    println!(
+                        "  adopted {} (byte-identical to the release)",
+                        display_home_path(&destination)
+                    );
+                    continue;
+                }
+                None => {
+                    return Err(format!(
+                        "refusal: {} exists without inventory ownership and is not the release's bytes; \
+                         if it is yours, move it aside and run ck setup again",
+                        display_home_path(&destination)
+                    ));
+                }
+            }
         }
         let digests = source.install(component, binary, &destination)?;
         // Acceptance runs between placement and the inventory record. If it
@@ -581,39 +664,48 @@ pub fn install_component<S: ArtifactSource>(
                 }
             }
         }
-        let mut fields = Map::new();
-        fields.insert(
-            "component".to_string(),
-            Value::String(component.label().to_string()),
-        );
-        fields.insert("sha256".to_string(), Value::String(digests.binary_sha256));
-        fields.insert(
-            "archive_sha256".to_string(),
-            Value::String(digests.archive_sha256),
-        );
-        // Version text helps operators identify an update, but currency compares
-        // the archive digest to the index asset. The extracted-binary digest is
-        // a different file and is kept as the ownership proof for uninstall.
-        if let Ok(version) = super::upgrade::binary_version(&destination) {
-            fields.insert("version".to_string(), Value::String(version));
-        }
-        inventory.record("managed-binary", &destination, fields);
-        // The ownership record must be durable the moment the binary it
-        // describes is. Deferring the save to the end of the whole plan meant
-        // a refusal anywhere later left every already-accepted binary on disk
-        // with its record lost — and the next `ck setup` refused them as
-        // foreign files at managed destinations. A binary placed, accepted,
-        // and recorded is a completed mutation regardless of what the plan
-        // does next.
-        inventory.save().map_err(|error| {
-            format!(
-                "placed and accepted {} but could not record ownership: {error}",
-                destination.display()
-            )
-        })?;
+        record_placement(component, &destination, digests, inventory)?;
         println!("  placed {}", display_home_path(&destination));
     }
     Ok(())
+}
+
+fn record_placement(
+    component: Component,
+    destination: &Path,
+    digests: PlacementDigests,
+    inventory: &mut Inventory,
+) -> Result<(), String> {
+    let mut fields = Map::new();
+    fields.insert(
+        "component".to_string(),
+        Value::String(component.label().to_string()),
+    );
+    fields.insert("sha256".to_string(), Value::String(digests.binary_sha256));
+    fields.insert(
+        "archive_sha256".to_string(),
+        Value::String(digests.archive_sha256),
+    );
+    // Version text helps operators identify an update, but currency compares
+    // the archive digest to the index asset. The extracted-binary digest is
+    // a different file and is kept as the ownership proof for uninstall.
+    if let Ok(version) = super::upgrade::binary_version(destination) {
+        fields.insert("version".to_string(), Value::String(version));
+    }
+    inventory.record("managed-binary", destination, fields);
+    // The ownership record must be durable the moment the binary it
+    // describes is. Deferring the save to the end of the whole plan meant
+    // a refusal anywhere later left every already-accepted binary on disk
+    // with its record lost — and the next `ck setup` refused them as
+    // foreign files at managed destinations. A binary placed, accepted,
+    // and recorded is a completed mutation regardless of what the plan
+    // does next.
+    inventory.save().map_err(|error| {
+        format!(
+            "placed and accepted {} but could not record ownership: {error}",
+            destination.display()
+        )
+    })
 }
 
 pub fn configure_component(
@@ -1081,6 +1173,154 @@ mod tests {
             "archive digest currency compares to the index"
         );
         assert_ne!(binary, archive, "the two hashes are of two different files");
+    }
+
+    /// A source that knows the release's bytes and can say whether a file
+    /// already on disk is them, the way the release source compares an
+    /// extracted candidate with the destination.
+    struct ComparingSource {
+        release_bytes: Vec<u8>,
+        fetches: usize,
+    }
+
+    impl ArtifactSource for ComparingSource {
+        fn install(
+            &mut self,
+            _component: Component,
+            _binary: &str,
+            destination: &Path,
+        ) -> Result<PlacementDigests, String> {
+            fs::write(destination, &self.release_bytes).map_err(|e| e.to_string())?;
+            fake_placement_digests(destination)
+        }
+
+        fn acceptance(
+            &mut self,
+            _component: Component,
+            _binary: &str,
+        ) -> Result<Acceptance, String> {
+            Ok(Acceptance::RunsAndReports)
+        }
+
+        fn verify(&mut self, _destination: &Path, _acceptance: &Acceptance) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn adopt_if_identical(
+            &mut self,
+            _component: Component,
+            _binary: &str,
+            destination: &Path,
+        ) -> Result<Option<PlacementDigests>, String> {
+            self.fetches += 1;
+            let on_disk = fs::read(destination).map_err(|e| e.to_string())?;
+            if on_disk != self.release_bytes {
+                return Ok(None);
+            }
+            fake_placement_digests(destination).map(Some)
+        }
+    }
+
+    /// A machine whose manifest lost its rows (a bootstrap re-run before
+    /// 0.17.25 rewrote it wholesale) still has the release's binaries on
+    /// disk. Setup must adopt a binary whose bytes are the release's and
+    /// keep refusing one whose bytes are not, naming why.
+    #[test]
+    fn unowned_binary_at_a_managed_destination_is_adopted_only_when_byte_identical() {
+        let root = fixture_dir("adopt-identical");
+        let binary_home = root.join("bin");
+        fs::create_dir_all(&binary_home).expect("binary home");
+        let release = b"the release's exact bytes".to_vec();
+        for binary in component_binaries(Component::Claustrum) {
+            fs::write(binary_home.join(platform_binary(binary)), &release).unwrap();
+        }
+        let mut inventory =
+            Inventory::load(root.join("installer-manifest.json"), "linux-x64").expect("inventory");
+        assert!(!is_installed(
+            Component::Claustrum,
+            &binary_home,
+            &inventory
+        ));
+
+        let mut source = ComparingSource {
+            release_bytes: release.clone(),
+            fetches: 0,
+        };
+        install_component(
+            Component::Claustrum,
+            &binary_home,
+            &mut inventory,
+            &mut source,
+        )
+        .expect("adopt identical binaries");
+        assert_eq!(
+            source.fetches,
+            component_binaries(Component::Claustrum).len()
+        );
+        assert!(is_installed(Component::Claustrum, &binary_home, &inventory));
+        for binary in component_binaries(Component::Claustrum) {
+            let path = binary_home.join(platform_binary(binary));
+            assert_eq!(
+                fs::read(&path).unwrap(),
+                release,
+                "adoption must not rewrite the file"
+            );
+            assert!(inventory.owns_path("managed-binary", &path));
+        }
+
+        // The same shape with foreign bytes on disk: refused, and the reason
+        // says the bytes are not the release's rather than only "unowned".
+        let root = fixture_dir("adopt-foreign");
+        let binary_home = root.join("bin");
+        fs::create_dir_all(&binary_home).expect("binary home");
+        for binary in component_binaries(Component::Claustrum) {
+            fs::write(
+                binary_home.join(platform_binary(binary)),
+                b"somebody else's build",
+            )
+            .unwrap();
+        }
+        let mut inventory =
+            Inventory::load(root.join("installer-manifest.json"), "linux-x64").expect("inventory");
+        let mut source = ComparingSource {
+            release_bytes: release,
+            fetches: 0,
+        };
+        let error = install_component(
+            Component::Claustrum,
+            &binary_home,
+            &mut inventory,
+            &mut source,
+        )
+        .expect_err("foreign bytes must refuse");
+        assert!(error.contains("not the release's bytes"), "{error}");
+        assert!(!is_installed(
+            Component::Claustrum,
+            &binary_home,
+            &inventory
+        ));
+    }
+
+    /// Binaries `ck upgrade` placed are `binary-placement` rows; setup must
+    /// read them as installed instead of planning a reinstall it then refuses.
+    #[test]
+    fn setup_treats_upgrade_placed_binaries_as_installed() {
+        let root = fixture_dir("placement-installed");
+        let binary_home = root.join("bin");
+        fs::create_dir_all(&binary_home).expect("binary home");
+        let mut inventory =
+            Inventory::load(root.join("installer-manifest.json"), "linux-x64").expect("inventory");
+        for binary in component_binaries(Component::Core) {
+            let path = binary_home.join(platform_binary(binary));
+            fs::write(&path, binary).unwrap();
+            inventory.record("binary-placement", &path, Map::new());
+        }
+        assert!(is_installed(Component::Core, &binary_home, &inventory));
+        // And install_component leaves them alone rather than refusing them.
+        let mut source = FakeSource;
+        install_component(Component::Core, &binary_home, &mut inventory, &mut source)
+            .expect("owned under binary-placement is owned");
+        assert_eq!(inventory.paths_for_kind("managed-binary").len(), 0);
     }
 
     /// A source whose placed bytes never satisfy acceptance: the binary says

@@ -39,6 +39,9 @@ pub struct SetupBackend {
 #[derive(Default)]
 struct ComponentSteps {
     placed_binaries: Vec<PathBuf>,
+    /// Files that existed before this run and were adopted as the release's
+    /// bytes; rollback un-records them and never deletes them.
+    adopted_binaries: Vec<PathBuf>,
     configured: bool,
     configuration_inventory_created: bool,
 }
@@ -520,7 +523,42 @@ impl SetupBackend {
         Ok(())
     }
 
+    /// Whether the daemon reports the claustrum module live right now. A
+    /// live claustrum holds the vault's single-writer lease, which is also
+    /// the proof its credentials exist: bootstrap is an offline verb that
+    /// refuses under the lease, so running it here would fail a setup whose
+    /// only defect was a lost ownership record. Unreadable status is "not
+    /// live" and bootstrap proceeds as before.
+    fn claustrum_module_is_live(&self) -> bool {
+        #[cfg(feature = "test-support")]
+        if env::var_os("CK_TEST_SETUP_CONTROL_OK").is_some() {
+            return false;
+        }
+        let Ok(output) = Command::new(&self.executable)
+            .args(["--json", "module", "status", "claustrum"])
+            .output()
+        else {
+            return false;
+        };
+        if !output.status.success() {
+            return false;
+        }
+        serde_json::from_slice::<serde_json::Value>(&output.stdout)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("module")
+                    .and_then(|module| module.get("live"))
+                    .and_then(serde_json::Value::as_bool)
+            })
+            .unwrap_or(false)
+    }
+
     fn bootstrap_claustrum(&self, key_path: Option<&Path>) -> Result<(), String> {
+        if self.claustrum_module_is_live() {
+            println!("  claustrum credentials already initialized (module is running)");
+            return Ok(());
+        }
         let auth = self.paths.binary_home.join(if cfg!(windows) {
             "ck-auth.exe"
         } else {
@@ -535,6 +573,7 @@ impl SetupBackend {
             .status()
             .map_err(|error| format!("could not run ck auth bootstrap: {error}"))?;
         if status.success() {
+            println!("  initialized claustrum credentials");
             Ok(())
         } else {
             Err(format!("ck auth bootstrap failed with {status}"))
@@ -564,6 +603,13 @@ impl SetupExecutor for SetupBackend {
                     release.target
                 );
                 let paths = components::component_binary_paths(*component, &self.paths.binary_home);
+                // Rollback may delete only files this run wrote. A file that
+                // already existed and was ADOPTED (byte-identical to the
+                // release) belongs to the operator's machine before setup ran;
+                // a refusal later in the plan must un-record it, never unlink
+                // it. So the tell is "existed on disk before install", not
+                // "was owned before install".
+                let existed_before = paths.iter().map(|path| path.is_file()).collect::<Vec<_>>();
                 let owned_before = paths
                     .iter()
                     .map(|path| self.inventory.owns_path("managed-binary", path))
@@ -575,8 +621,15 @@ impl SetupExecutor for SetupBackend {
                     &mut self.artifacts,
                 )?;
                 let steps = self.component_steps.entry(*component).or_default();
-                for (path, owned_before) in paths.into_iter().zip(owned_before) {
-                    if !owned_before && self.inventory.owns_path("managed-binary", &path) {
+                for ((path, owned_before), existed_before) in
+                    paths.into_iter().zip(owned_before).zip(existed_before)
+                {
+                    if owned_before || !self.inventory.owns_path("managed-binary", &path) {
+                        continue;
+                    }
+                    if existed_before {
+                        steps.adopted_binaries.push(path);
+                    } else {
                         steps.placed_binaries.push(path);
                     }
                 }
@@ -602,9 +655,7 @@ impl SetupExecutor for SetupBackend {
                 Ok(())
             }
             SetupOperation::BootstrapClaustrum { key_path } => {
-                self.bootstrap_claustrum(key_path.as_deref())?;
-                println!("  initialized claustrum credentials");
-                Ok(())
+                self.bootstrap_claustrum(key_path.as_deref())
             }
             SetupOperation::AdoptRunningCk { path } => self.adopt_running_ck(path),
             SetupOperation::RescanComponent { .. } => self.run_ck(&["module", "rescan"]),
@@ -679,6 +730,15 @@ impl SetupExecutor for SetupBackend {
                     }
                 }
                 self.inventory.remove_owned_path("managed-binary", &path);
+            }
+        }
+        // Adopted files were on disk before this run; rolling back the run
+        // means forgetting the ownership record, not deleting the operator's
+        // binary (which may be the very image a supervised module is running).
+        for path in steps.adopted_binaries.into_iter().rev() {
+            if self.inventory.owns_path("managed-binary", &path) {
+                self.inventory.remove_owned_path("managed-binary", &path);
+                println!("rolled back ownership record: {}", path.display());
             }
         }
         if steps.configured
@@ -832,6 +892,68 @@ mod adoption_tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
     use subc_core::test_support::TestTempDir;
+
+    /// Rollback after a later refusal must delete only what this run wrote.
+    /// An adopted binary existed before the run (and may be the image a
+    /// supervised module is executing); rolling back forgets its ownership
+    /// record and leaves the file. The macOS drive lost a running claustrum's
+    /// binaries to the other behaviour.
+    #[test]
+    fn rollback_deletes_placed_binaries_but_only_unrecords_adopted_ones() {
+        let root = TestTempDir::new("setup-rollback-adopted");
+        let binary_home = root.join("bin");
+        fs::create_dir_all(&binary_home).unwrap();
+        let placed = binary_home.join("ck-claustrum");
+        let adopted = binary_home.join("ck-auth");
+        fs::write(&placed, b"written by this run").unwrap();
+        fs::write(&adopted, b"was already here").unwrap();
+        let platform = RuntimePlatform::current();
+        let mut inventory =
+            Inventory::load(root.join("installer-manifest.json"), "linux-x64").unwrap();
+        inventory.record("managed-binary", &placed, Map::new());
+        inventory.record("managed-binary", &adopted, Map::new());
+        let mut backend = SetupBackend {
+            executable: binary_home.join("ck"),
+            paths: SetupPaths {
+                data_dir: root.join("data"),
+                binary_home: binary_home.clone(),
+                config_path: root.join("subc.jsonc"),
+                claustrum_key_path: None,
+                runtime_paths: runtime::runtime_paths(platform, &binary_home, &root),
+            },
+            platform,
+            inventory,
+            runner: SystemCommandRunner,
+            artifacts: ReleaseArtifactSource::from_index(
+                super::super::release_index::ReleaseIndex {
+                    schema: 1,
+                    channel: "alpha".to_string(),
+                    generated_at_ms: 0,
+                    components: BTreeMap::new(),
+                },
+                super::super::model::AlphaTarget::LinuxX64,
+            ),
+            runtime_status: RuntimeStatus::default(),
+            uninstall_report: None,
+            component_steps: BTreeMap::new(),
+        };
+        backend.component_steps.insert(
+            Component::Claustrum,
+            ComponentSteps {
+                placed_binaries: vec![placed.clone()],
+                adopted_binaries: vec![adopted.clone()],
+                ..ComponentSteps::default()
+            },
+        );
+
+        backend.rollback_component(Component::Claustrum).unwrap();
+
+        assert!(!placed.exists(), "a binary this run placed is removed");
+        assert!(adopted.exists(), "a binary that predated the run stays");
+        assert_eq!(fs::read(&adopted).unwrap(), b"was already here");
+        assert!(!backend.inventory.owns_path("managed-binary", &placed));
+        assert!(!backend.inventory.owns_path("managed-binary", &adopted));
+    }
 
     #[test]
     fn bootstrap_placed_ck_is_adopted_as_managed_binary() {

@@ -1,0 +1,122 @@
+name: Publish wire crates on bump
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: [master]
+
+concurrency:
+  group: publish-wire-crates
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  detect:
+    name: Detect unpublished wire crates
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    outputs:
+      protocol_version: ${{ steps.versions.outputs.protocol_version }}
+      transport_version: ${{ steps.versions.outputs.transport_version }}
+      control_version: ${{ steps.versions.outputs.control_version }}
+      client_version: ${{ steps.versions.outputs.client_version }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # Publish the commit CI proved green, never a newer branch tip.
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - name: Detect versions absent from crates.io
+        id: versions
+        run: |
+          unpublished=$(bash scripts/release/unpublished-wire-crates.sh)
+          if [ -n "$unpublished" ]; then
+            printf '%s\n' "$unpublished"
+          else
+            echo "All wire crates are already published"
+          fi
+          find_version() {
+            awk -v crate="$1" '$1 == crate { print $2 }' <<<"$unpublished"
+          }
+          {
+            echo "protocol_version=$(find_version subc-protocol)"
+            echo "transport_version=$(find_version subc-transport)"
+            echo "control_version=$(find_version subc-control)"
+            echo "client_version=$(find_version subc-client-rs)"
+          } >> "$GITHUB_OUTPUT"
+
+  publish_protocol:
+    name: Publish subc-protocol
+    needs: detect
+    if: ${{ needs.detect.outputs.protocol_version != '' }}
+    permissions:
+      contents: write
+    uses: ./.github/workflows/publish-crate.yml
+    with:
+      crate: subc-protocol
+      version: ${{ needs.detect.outputs.protocol_version }}
+    secrets:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  publish_transport:
+    name: Publish subc-transport
+    needs: [detect, publish_protocol]
+    if: >-
+      ${{
+        always() &&
+        needs.detect.result == 'success' &&
+        (needs.publish_protocol.result == 'success' || needs.publish_protocol.result == 'skipped') &&
+        needs.detect.outputs.transport_version != ''
+      }}
+    permissions:
+      contents: write
+    uses: ./.github/workflows/publish-crate.yml
+    with:
+      crate: subc-transport
+      version: ${{ needs.detect.outputs.transport_version }}
+    secrets:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  publish_control:
+    name: Publish subc-control
+    needs: [detect, publish_protocol, publish_transport]
+    if: >-
+      ${{
+        always() &&
+        needs.detect.result == 'success' &&
+        (needs.publish_protocol.result == 'success' || needs.publish_protocol.result == 'skipped') &&
+        (needs.publish_transport.result == 'success' || needs.publish_transport.result == 'skipped') &&
+        needs.detect.outputs.control_version != ''
+      }}
+    permissions:
+      contents: write
+    uses: ./.github/workflows/publish-crate.yml
+    with:
+      crate: subc-control
+      version: ${{ needs.detect.outputs.control_version }}
+    secrets:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  publish_client:
+    name: Publish subc-client-rs
+    needs: [detect, publish_protocol, publish_transport, publish_control]
+    if: >-
+      ${{
+        always() &&
+        needs.detect.result == 'success' &&
+        (needs.publish_protocol.result == 'success' || needs.publish_protocol.result == 'skipped') &&
+        (needs.publish_transport.result == 'success' || needs.publish_transport.result == 'skipped') &&
+        (needs.publish_control.result == 'success' || needs.publish_control.result == 'skipped') &&
+        needs.detect.outputs.client_version != ''
+      }}
+    permissions:
+      contents: write
+    uses: ./.github/workflows/publish-crate.yml
+    with:
+      crate: subc-client-rs
+      version: ${{ needs.detect.outputs.client_version }}
+    secrets:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

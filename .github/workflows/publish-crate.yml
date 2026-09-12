@@ -1,0 +1,98 @@
+name: Publish crate
+
+on:
+  workflow_call:
+    inputs:
+      crate:
+        description: Crate package name under crates/
+        required: true
+        type: string
+      version:
+        description: Version expected in the crate manifest
+        required: true
+        type: string
+    secrets:
+      CARGO_REGISTRY_TOKEN:
+        required: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  publish:
+    name: Publish ${{ inputs.crate }} v${{ inputs.version }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # workflow_run's own SHA is the default branch tip, which may be newer
+          # than the commit whose CI result authorized this publish.
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify crate version
+        run: |
+          CRATE="${{ inputs.crate }}"
+          VERSION="${{ inputs.version }}"
+          MANIFEST="crates/${CRATE}/Cargo.toml"
+          if [ ! -f "$MANIFEST" ]; then
+            echo "::error::No crate '${CRATE}' at ${MANIFEST}"
+            exit 1
+          fi
+          CARGO_VERSION=$(grep '^version' "$MANIFEST" | head -1 | sed -E 's/version *= *"([^"]+)"/\1/')
+          if [ "$VERSION" != "$CARGO_VERSION" ]; then
+            echo "::error::Publish wants ${VERSION} but ${MANIFEST} has ${CARGO_VERSION}"
+            exit 1
+          fi
+          echo "Publishing ${CRATE} v${VERSION}"
+
+      # Idempotent: a retag or a repeated bump run treats "already exists" as
+      # success instead of failing after the registry accepted the crate.
+      #
+      # A dependent crate can race crates.io index propagation after its sibling
+      # publishes. Retry only that transient dependency-resolution error.
+      - name: Publish
+        run: |
+          CRATE="${{ inputs.crate }}"
+          for attempt in 1 2 3 4 5 6; do
+            out=$(cargo publish --package "$CRATE" 2>&1) && { echo "$out"; exit 0; }
+            echo "$out"
+            if echo "$out" | grep -q "already exists"; then
+              echo "already published; treating as success"; exit 0
+            fi
+            if echo "$out" | grep -q "failed to select a version for the requirement"; then
+              echo "dependency not yet resolvable on the index (attempt $attempt); retrying in 60s"
+              sleep 60; continue
+            fi
+            exit 1
+          done
+          echo "::error::dependency still unresolvable after retries"
+          exit 1
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+      # A bump-triggered publish records the released version at the exact commit
+      # whose successful CI run authorized it. Token-authored tags do not start
+      # the tag-triggered release workflow, so this cannot publish twice.
+      - name: Record annotated release tag
+        if: ${{ github.event_name == 'workflow_run' }}
+        env:
+          CRATE: ${{ inputs.crate }}
+          VERSION: ${{ inputs.version }}
+          TARGET_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          TAG="${CRATE}-v${VERSION}"
+          if git show-ref --verify --quiet "refs/tags/$TAG"; then
+            if [ "$(git cat-file -t "refs/tags/$TAG")" != tag ] || [ "$(git rev-list -n 1 "$TAG")" != "$TARGET_SHA" ]; then
+              echo "::error::Existing tag $TAG is not an annotated tag at $TARGET_SHA"
+              exit 1
+            fi
+            echo "$TAG already records $TARGET_SHA"
+            exit 0
+          fi
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git tag -a "$TAG" "$TARGET_SHA" -m "Release $CRATE v$VERSION"
+          git push origin "refs/tags/$TAG"

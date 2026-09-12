@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)
+detector="$repo_root/scripts/release/unpublished-wire-crates.sh"
+test_root=$(mktemp -d)
+trap 'rm -rf "$test_root"' EXIT
+passes=0
+failures=0
+
+manifest_version() {
+  awk -F'"' '/^version[[:space:]]*=/ { print $2; exit }' \
+    "$repo_root/crates/$1/Cargo.toml"
+}
+
+write_response() {
+  local dir="$1"
+  local crate="$2"
+  local version="$3"
+  cat >"$dir/$crate.json" <<JSON
+{"crate":{"max_version":"$version"},"versions":[{"num":"$version"}]}
+JSON
+}
+
+write_current_responses() {
+  local dir="$1"
+  mkdir -p "$dir"
+  local crate
+  for crate in subc-protocol subc-transport subc-control subc-client-rs; do
+    write_response "$dir" "$crate" "$(manifest_version "$crate")"
+  done
+}
+
+check_case() {
+  local name="$1"
+  local expected_output="$2"
+  local expected_status="$3"
+  shift 3
+  local stdout_file="$test_root/$name.stdout"
+  local stderr_file="$test_root/$name.stderr"
+
+  "$@" >"$stdout_file" 2>"$stderr_file"
+  local status=$?
+  local output
+  output=$(<"$stdout_file")
+  if [[ "$status" == "$expected_status" && "$output" == "$expected_output" ]]; then
+    printf 'ok: %s\n' "$name"
+    passes=$((passes + 1))
+    return
+  fi
+
+  printf 'not ok: %s (status %s, expected %s)\n' \
+    "$name" "$status" "$expected_status" >&2
+  printf 'expected stdout: <%s>\nactual stdout: <%s>\n' \
+    "$expected_output" "$output" >&2
+  if [[ -s "$stderr_file" ]]; then
+    printf '%s\n' 'stderr:' >&2
+    while IFS= read -r line; do printf '  %s\n' "$line" >&2; done <"$stderr_file"
+  fi
+  failures=$((failures + 1))
+}
+
+one_behind="$test_root/one-behind"
+write_current_responses "$one_behind"
+write_response "$one_behind" subc-protocol 0.1.0
+check_case one-behind \
+  "subc-protocol $(manifest_version subc-protocol)" 0 \
+  bash "$detector" --registry-json-dir "$one_behind"
+
+all_current="$test_root/all-current"
+write_current_responses "$all_current"
+check_case all-current '' 0 \
+  env SUBC_REGISTRY_JSON_DIR="$all_current" bash "$detector"
+
+two_behind="$test_root/two-behind"
+write_current_responses "$two_behind"
+write_response "$two_behind" subc-transport 0.1.0
+write_response "$two_behind" subc-control 0.1.0
+check_case dependency-order \
+  "subc-transport $(manifest_version subc-transport)
+subc-control $(manifest_version subc-control)" 0 \
+  bash "$detector" --registry-json-dir "$two_behind"
+
+never_published="$test_root/never-published"
+write_current_responses "$never_published"
+printf '%s\n' 404 >"$never_published/subc-control.status"
+printf '%s\n' '{"errors":[{"detail":"crate does not exist"}]}' \
+  >"$never_published/subc-control.json"
+check_case never-published-404 \
+  "subc-control $(manifest_version subc-control)" 0 \
+  bash "$detector" --registry-json-dir "$never_published"
+
+stub_dir="$test_root/stubs"
+mkdir -p "$stub_dir"
+cat >"$stub_dir/curl" <<'STUB'
+#!/usr/bin/env bash
+exit 7
+STUB
+chmod +x "$stub_dir/curl"
+check_case unreachable-registry '' 2 \
+  env PATH="$stub_dir:$PATH" SUBC_CRATES_IO_API_URL=https://unreachable.invalid \
+  bash "$detector"
+if ! grep -Fq 'refusal: registry request failed' \
+  "$test_root/unreachable-registry.stderr"; then
+  printf 'not ok: unreachable-registry omitted its refusal reason\n' >&2
+  failures=$((failures + 1))
+else
+  printf 'ok: unreachable-registry refusal reason\n'
+  passes=$((passes + 1))
+fi
+
+printf 'passes: %d failures: %d\n' "$passes" "$failures"
+if ((failures > 0)); then
+  exit 1
+fi

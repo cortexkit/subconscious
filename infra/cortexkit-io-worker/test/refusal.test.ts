@@ -7,6 +7,7 @@ const PREVIOUS: ComponentEntry = {
   published_at_ms: 1,
   version: "0.9.0",
   train: null,
+  requires_core: null,
   assets: {
     "linux-x64": {
       "ck-aft": {

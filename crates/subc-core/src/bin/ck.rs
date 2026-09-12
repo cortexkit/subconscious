@@ -5082,7 +5082,17 @@ async fn upgrade_command(
         Err(error) => return Err(CkError::UpdateCheck(error)),
     };
     let roster = fetch_supervised_roster(subc).await;
-    let observed = setup::observed_upgrade_targets(&metadata, &discovered, roster);
+    let planning_index = if check {
+        None
+    } else {
+        Some(
+            source
+                .cloned_index()
+                .map_err(|error| CkError::Message(error.to_string()))?,
+        )
+    };
+    let observed =
+        setup::observed_upgrade_targets(&metadata, &discovered, roster, planning_index.as_ref());
     let plan = setup::plan_upgrade(&observed);
     if dry_run {
         println!("{}", plan.render());
@@ -5146,9 +5156,7 @@ async fn upgrade_command(
         return Ok(());
     }
 
-    let index = source
-        .cloned_index()
-        .map_err(|error| CkError::Message(error.to_string()))?;
+    let index = planning_index.expect("non-check upgrade loaded its planning index");
     let mut backend =
         setup::SystemUpgradeBackend::new(executable, connection_path, discovered, index)
             .map_err(CkError::Rejected)?;

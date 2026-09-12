@@ -46,6 +46,8 @@ pub struct IndexComponent {
     #[serde(default)]
     pub version: Option<String>,
     #[serde(default)]
+    pub requires_core: Option<String>,
+    #[serde(default)]
     pub assets: BTreeMap<String, BTreeMap<String, IndexAsset>>,
 }
 
@@ -523,6 +525,21 @@ mod tests {
         assert_eq!(index.schema, 1);
         assert_eq!(index.channel, "alpha");
         assert!(index.components.contains_key("core"));
+    }
+
+    #[test]
+    fn index_component_without_requires_core_decodes_as_none() {
+        let key = test_signing_key();
+        let bytes = serde_json::to_vec(&core_index(fresh_ms())).unwrap();
+        let index = parse_with(
+            &bytes,
+            &sign_b64(&key, &bytes),
+            &test_pubkey(&key),
+            fresh_ms(),
+        )
+        .expect("older signed index");
+
+        assert_eq!(index.components["core"].requires_core, None);
     }
 
     #[test]

@@ -13,7 +13,7 @@ use subc_transport::connection_file;
 use super::{
     components::{installed_components, upgrade_roster},
     inventory::Inventory,
-    model::{AlphaTarget, UpgradeObserved, UpgradeTarget},
+    model::{AlphaTarget, Component, UpgradeObserved, UpgradeTarget},
     release_index::ReleaseIndex,
     self_update,
     update_cache::UpdateMetadata,
@@ -210,6 +210,7 @@ pub fn observed_upgrade_targets(
     metadata: &UpdateMetadata,
     discovered: &[ManagedUpgradeTarget],
     roster: Result<BTreeSet<String>, String>,
+    index: Option<&ReleaseIndex>,
 ) -> UpgradeObserved {
     let installed = discovered
         .iter()
@@ -225,6 +226,26 @@ pub fn observed_upgrade_targets(
         })
         .collect::<BTreeMap<_, _>>();
     let mut observed = observed_from_metadata(metadata, &installed);
+    observed.installed_core_version = discovered
+        .iter()
+        .find(|item| item.target.is_daemon())
+        .map(|item| item.installed_version.clone());
+    if let Some(index) = index {
+        observed.available_core_version = index
+            .components
+            .get(Component::Core.label())
+            .and_then(|entry| entry.version.clone());
+        observed.requires_core = Component::ALL
+            .into_iter()
+            .filter_map(|component| {
+                index
+                    .components
+                    .get(component.label())
+                    .and_then(|entry| entry.requires_core.clone())
+                    .map(|floor| (component, floor))
+            })
+            .collect();
+    }
     match roster {
         Ok(modules) => {
             observed.supervised_modules = modules;
@@ -869,7 +890,7 @@ mod tests {
     use serde_json::{Map, Value};
 
     use super::*;
-    use crate::setup::model::Component;
+    use crate::setup::{components::ReleaseArtifactSource, planner::plan_upgrade};
     #[cfg(unix)]
     use subc_core::test_support::TestTempDir;
 
@@ -1004,11 +1025,100 @@ mod tests {
                 reports_release_version: true,
             },
         );
-        let observed = observed_upgrade_targets(&metadata, &[target], Ok(BTreeSet::new()));
+        let observed = observed_upgrade_targets(&metadata, &[target], Ok(BTreeSet::new()), None);
         assert!(matches!(
             observed.release(aft),
             super::super::model::ReleaseAvailability::Incomplete { .. }
         ));
+    }
+
+    #[test]
+    fn upgrade_planner_uses_the_artifact_sources_same_signed_index_generation() {
+        let mut index_components = BTreeMap::new();
+        index_components.insert(
+            "core".to_string(),
+            super::super::release_index::IndexComponent {
+                release: "subc-core-v0.17.20".to_string(),
+                version: Some("0.17.20".to_string()),
+                requires_core: None,
+                assets: BTreeMap::new(),
+            },
+        );
+        index_components.insert(
+            "aft".to_string(),
+            super::super::release_index::IndexComponent {
+                release: "v1.0.0".to_string(),
+                version: Some("1.0.0".to_string()),
+                requires_core: Some("0.17.20".to_string()),
+                assets: BTreeMap::new(),
+            },
+        );
+        let index = ReleaseIndex {
+            schema: 1,
+            channel: "alpha".to_string(),
+            generated_at_ms: 1,
+            components: index_components,
+        };
+        let mut artifacts = ReleaseArtifactSource::from_index(index, AlphaTarget::LinuxX64);
+        artifacts.ensure_index().expect("fixture index");
+        let planning_index = artifacts.cloned_index().expect("same cached index");
+
+        let daemon = upgrade_target("ck-subc");
+        let aft = upgrade_target("ck-aft");
+        let discovered = [
+            ManagedUpgradeTarget {
+                target: daemon,
+                destination: PathBuf::from("/managed/ck-subc"),
+                installed_version: "0.17.19".to_string(),
+                installed_archive_sha256: Some("old-daemon".to_string()),
+            },
+            ManagedUpgradeTarget {
+                target: aft,
+                destination: PathBuf::from("/managed/ck-aft"),
+                installed_version: "0.9.0".to_string(),
+                installed_archive_sha256: Some("old-aft".to_string()),
+            },
+        ];
+        let mut metadata = UpdateMetadata {
+            format_version: super::super::update_cache::UPDATE_CACHE_FORMAT_VERSION,
+            checked_at_unix_secs: 1,
+            targets: BTreeMap::new(),
+        };
+        for (target, version, digest) in
+            [(daemon, "0.17.20", "new-daemon"), (aft, "1.0.0", "new-aft")]
+        {
+            metadata.targets.insert(
+                target.label().to_string(),
+                super::super::update_cache::CachedRelease {
+                    version: version.to_string(),
+                    sha256: Some(digest.to_string()),
+                    reports_release_version: true,
+                },
+            );
+        }
+        let observed = observed_upgrade_targets(
+            &metadata,
+            &discovered,
+            Ok(BTreeSet::from(["aft".to_string()])),
+            Some(&planning_index),
+        );
+        let plan = plan_upgrade(&observed);
+
+        assert_eq!(
+            observed
+                .requires_core
+                .get(&Component::Aft)
+                .map(String::as_str),
+            Some("0.17.20")
+        );
+        assert!(plan.operations.iter().any(|operation| matches!(
+            operation,
+            super::super::model::UpgradeOperation::DownloadAndVerify { target } if *target == aft
+        )));
+        assert!(!plan.outcomes.iter().any(|outcome| matches!(
+            outcome,
+            super::super::model::PlanOutcome::TargetRefused { reason, .. } if reason.contains("aft")
+        )));
     }
 
     #[cfg(unix)]

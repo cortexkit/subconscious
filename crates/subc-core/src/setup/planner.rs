@@ -1,7 +1,7 @@
 use super::{
     conversion::{explicit_conversion_requires_confirmation, selected_components},
     model::{
-        Component, ComponentState, ConfigurationState, DetectionOutcome, PlanOutcome,
+        Component, ComponentState, ConfigurationState, CoreVersion, DetectionOutcome, PlanOutcome,
         PlatformObservation, ReleaseAvailability, RuntimeState, SetupObserved, SetupOperation,
         SetupRequest, UpgradeObserved, UpgradeOperation, UpgradeState, UpgradeTarget,
     },
@@ -86,6 +86,7 @@ pub fn plan_setup(observed: &SetupObserved, request: &SetupRequest) -> SetupPlan
     }
 
     let mut newly_configured_modules = Vec::new();
+    let mut core_is_being_installed = false;
     for component in selected {
         if let Some(message) = component.unavailable_message(*target) {
             plan.outcomes.push(PlanOutcome::DeclaredUnavailable {
@@ -122,13 +123,27 @@ pub fn plan_setup(observed: &SetupObserved, request: &SetupRequest) -> SetupPlan
             ReleaseAvailability::Available | ReleaseAvailability::NotRequired => {}
         }
 
-        match observed.component_state(component) {
+        let component_state = observed.component_state(component);
+        if component.module_id().is_some() && component_state == ComponentState::Missing {
+            if let Some(reason) =
+                setup_core_floor_refusal(observed, component, core_is_being_installed)
+            {
+                plan.outcomes
+                    .push(PlanOutcome::TargetRefused { component, reason });
+                continue;
+            }
+        }
+
+        match component_state {
             ComponentState::Correct => plan.outcomes.push(PlanOutcome::Noop {
                 scope: format!("{component} is already correct"),
             }),
             ComponentState::Missing => {
                 plan.operations
                     .push(SetupOperation::InstallComponent { component });
+                if component == Component::Core {
+                    core_is_being_installed = true;
+                }
                 plan.operations
                     .push(SetupOperation::ConfigureComponent { component });
                 if component == Component::Claustrum {
@@ -198,6 +213,40 @@ pub fn plan_setup(observed: &SetupObserved, request: &SetupRequest) -> SetupPlan
         },
     ]);
     plan
+}
+
+fn setup_core_floor_refusal(
+    observed: &SetupObserved,
+    component: Component,
+    core_is_being_installed: bool,
+) -> Option<String> {
+    let floor = observed.requires_core.get(&component)?;
+    let required = match floor.parse::<CoreVersion>() {
+        Ok(required) => required,
+        Err(()) => {
+            return Some(format!(
+                "{component} declares malformed requires_core `{floor}`"
+            ));
+        }
+    };
+    if core_is_being_installed {
+        return None;
+    }
+    let Some(installed_text) = observed.installed_core_version.as_deref() else {
+        return Some(format!(
+            "{component} requires core ≥ {floor}, but the installed core version could not be read"
+        ));
+    };
+    let Ok(installed) = installed_text.parse::<CoreVersion>() else {
+        return Some(format!(
+            "{component} requires core ≥ {floor}, but the installed core version could not be read (`{installed_text}`)"
+        ));
+    };
+    (installed < required).then(|| {
+        format!(
+            "{component} requires core ≥ {floor}, installed {installed_text}; run `ck upgrade` first"
+        )
+    })
 }
 
 fn record_detection_outcomes(observed: &SetupObserved, plan: &mut SetupPlan) {
@@ -426,13 +475,23 @@ pub fn plan_upgrade(observed: &UpgradeObserved) -> UpgradePlan {
                 scope: format!("{target} is already current"),
             }),
             UpgradeState::UpdateAvailable { from, to, reason } => {
+                let release = observed.release(target);
+                if release == ReleaseAvailability::Available {
+                    if let Some(reason) = upgrade_core_floor_refusal(observed, target) {
+                        plan.outcomes.push(PlanOutcome::TargetRefused {
+                            component: target.component,
+                            reason,
+                        });
+                        continue;
+                    }
+                }
                 plan.outcomes.push(PlanOutcome::UpgradeAvailable {
                     target,
                     from,
                     to,
                     reason,
                 });
-                match observed.release(target) {
+                match release {
                     ReleaseAvailability::Incomplete { missing_asset } => {
                         plan.outcomes.push(PlanOutcome::ReleaseIncomplete {
                             component: target.component,
@@ -481,6 +540,50 @@ pub fn plan_upgrade(observed: &UpgradeObserved) -> UpgradePlan {
         }
     }
     plan
+}
+
+fn upgrade_core_floor_refusal(observed: &UpgradeObserved, target: UpgradeTarget) -> Option<String> {
+    let floor = observed.requires_core.get(&target.component)?;
+    let required = match floor.parse::<CoreVersion>() {
+        Ok(required) => required,
+        Err(()) => {
+            return Some(format!(
+                "{} declares malformed requires_core `{floor}`",
+                target.component
+            ));
+        }
+    };
+    let daemon_is_updating = observed.roster.iter().copied().any(|candidate| {
+        candidate.is_daemon()
+            && observed.release(candidate) == ReleaseAvailability::Available
+            && matches!(
+                observed.target_state(candidate),
+                UpgradeState::UpdateAvailable { .. }
+            )
+    });
+    let core_text = if daemon_is_updating {
+        observed.available_core_version.as_deref()
+    } else {
+        observed.installed_core_version.as_deref()
+    };
+    let Some(core_text) = core_text else {
+        return Some(format!(
+            "{} requires core ≥ {floor}, but the core version the plan will leave running could not be read",
+            target.component
+        ));
+    };
+    let Ok(core_version) = core_text.parse::<CoreVersion>() else {
+        return Some(format!(
+            "{} requires core ≥ {floor}, but core version `{core_text}` could not be read",
+            target.component
+        ));
+    };
+    (core_version < required).then(|| {
+        format!(
+            "{} requires core ≥ {floor}, but the plan leaves core {core_text}",
+            target.component
+        )
+    })
 }
 
 fn plan_upgrade_target(plan: &mut UpgradePlan, target: UpgradeTarget, observed: &UpgradeObserved) {
@@ -554,6 +657,8 @@ mod tests {
             platform: PlatformObservation::Supported(AlphaTarget::LinuxX64),
             components,
             releases,
+            requires_core: BTreeMap::new(),
+            installed_core_version: None,
             runtime: RuntimeState::Missing,
             configuration: ConfigurationState::Additive,
             running_ck_adoption: None,
@@ -564,9 +669,81 @@ mod tests {
         }
     }
 
+    fn installed_core_setup(installed_version: Option<&str>) -> SetupObserved {
+        let mut observed = observed_setup();
+        observed
+            .components
+            .insert(Component::Core, ComponentState::Correct);
+        observed
+            .components
+            .insert(Component::Aft, ComponentState::Missing);
+        observed
+            .requires_core
+            .insert(Component::Aft, "0.17.20".to_string());
+        observed.installed_core_version = installed_version.map(ToOwned::to_owned);
+        observed.runtime = RuntimeState::Correct;
+        observed
+    }
+
+    fn updates_target(plan: &UpgradePlan, target: UpgradeTarget) -> bool {
+        plan.operations.iter().any(|operation| {
+            matches!(
+                operation,
+                UpgradeOperation::DownloadAndVerify { target: planned } if *planned == target
+            )
+        })
+    }
+
+    fn floor_upgrade_observed(
+        floor: &str,
+        planned_core: Option<&str>,
+        installed_core: Option<&str>,
+    ) -> UpgradeObserved {
+        let mut observed = UpgradeObserved::for_roster(upgrade_roster([
+            Component::Core,
+            Component::Aft,
+            Component::Insula,
+        ]));
+        observed.platform = PlatformObservation::Supported(AlphaTarget::LinuxX64);
+        observed
+            .requires_core
+            .insert(Component::Aft, floor.to_string());
+        observed.available_core_version = planned_core.map(ToOwned::to_owned);
+        observed.installed_core_version = installed_core.map(ToOwned::to_owned);
+        observed.supervised_modules.extend([
+            "aft".to_string(),
+            "insula".to_string(),
+            "subc-mcp".to_string(),
+        ]);
+        for binary in ["ck-aft", "ck-insula"] {
+            observed.targets.insert(
+                binary.to_string(),
+                UpgradeState::UpdateAvailable {
+                    from: "0.17.0".to_string(),
+                    to: "0.18.0".to_string(),
+                    reason: None,
+                },
+            );
+        }
+        if let Some(version) = planned_core {
+            observed.targets.insert(
+                "ck-subc".to_string(),
+                UpgradeState::UpdateAvailable {
+                    from: installed_core.unwrap_or("0.17.0").to_string(),
+                    to: version.to_string(),
+                    reason: None,
+                },
+            );
+        }
+        observed
+    }
+
     #[test]
     fn dry_run_and_apply_use_the_same_plan_but_only_apply_mutations() {
-        let observed = observed_setup();
+        let mut observed = observed_setup();
+        observed
+            .requires_core
+            .insert(Component::Mc, "0.17.20".to_string());
         let request = SetupRequest::install(vec![Component::Mc]);
         let preview_plan = plan_setup(&observed, &request);
         let execution_plan = plan_setup(&observed, &request);
@@ -592,6 +769,111 @@ mod tests {
         assert_eq!(applied.planned, preview.planned);
         assert_eq!(applied.applied, expected_mutations);
         assert_eq!(apply_executor.applied, expected_mutations);
+    }
+
+    #[test]
+    fn setup_refuses_a_module_below_its_floor_and_dry_run_matches_apply() {
+        let observed = installed_core_setup(Some("0.17.19"));
+        let request = SetupRequest::install(vec![Component::Aft]);
+        let preview_plan = plan_setup(&observed, &request);
+        let execution_plan = plan_setup(&observed, &request);
+
+        assert_eq!(preview_plan, execution_plan);
+        assert!(preview_plan.is_authorized());
+        assert!(!preview_plan.operations.iter().any(|operation| matches!(
+            operation,
+            SetupOperation::InstallComponent {
+                component: Component::Aft
+            }
+        )));
+        assert!(preview_plan.outcomes.iter().any(|outcome| {
+            outcome.to_string()
+                == "refusal: aft requires core ≥ 0.17.20, installed 0.17.19; run `ck upgrade` first"
+        }));
+
+        let mut preview_executor = RecordingExecutor::default();
+        let preview =
+            execute_setup(&preview_plan, ExecutionMode::DryRun, &mut preview_executor).unwrap();
+        let mut apply_executor = RecordingExecutor::default();
+        let applied =
+            execute_setup(&execution_plan, ExecutionMode::Apply, &mut apply_executor).unwrap();
+        assert_eq!(preview.planned, applied.planned);
+        assert!(preview.applied.is_empty());
+        assert!(applied.applied.is_empty());
+        assert!(apply_executor.applied.is_empty());
+    }
+
+    #[test]
+    fn setup_installs_a_module_when_installed_core_meets_its_floor() {
+        for installed in ["0.17.20", "0.18.0"] {
+            let observed = installed_core_setup(Some(installed));
+            let plan = plan_setup(&observed, &SetupRequest::install(vec![Component::Aft]));
+            assert!(plan.is_authorized(), "{installed}: {:?}", plan.outcomes);
+            assert!(plan.operations.iter().any(|operation| matches!(
+                operation,
+                SetupOperation::InstallComponent {
+                    component: Component::Aft
+                }
+            )));
+        }
+    }
+
+    #[test]
+    fn fresh_setup_installs_core_before_a_floored_module_without_a_refusal() {
+        let mut observed = observed_setup();
+        observed
+            .components
+            .insert(Component::Aft, ComponentState::Missing);
+        observed
+            .requires_core
+            .insert(Component::Aft, "0.17.20".to_string());
+        let plan = plan_setup(&observed, &SetupRequest::install(vec![Component::Aft]));
+        let core = plan
+            .operations
+            .iter()
+            .position(|operation| {
+                matches!(
+                    operation,
+                    SetupOperation::InstallComponent {
+                        component: Component::Core
+                    }
+                )
+            })
+            .expect("core install");
+        let aft = plan
+            .operations
+            .iter()
+            .position(|operation| {
+                matches!(
+                    operation,
+                    SetupOperation::InstallComponent {
+                        component: Component::Aft
+                    }
+                )
+            })
+            .expect("aft install");
+        assert!(core < aft);
+        assert!(!plan.outcomes.iter().any(|outcome| matches!(
+            outcome,
+            PlanOutcome::Refusal { .. } | PlanOutcome::TargetRefused { .. }
+        )));
+    }
+
+    #[test]
+    fn setup_refuses_a_floored_module_when_daemon_version_is_unreadable() {
+        let observed = installed_core_setup(None);
+        let plan = plan_setup(&observed, &SetupRequest::install(vec![Component::Aft]));
+        assert!(!plan.operations.iter().any(|operation| matches!(
+            operation,
+            SetupOperation::InstallComponent {
+                component: Component::Aft
+            }
+        )));
+        assert!(plan.outcomes.iter().any(|outcome| {
+            outcome.to_string().contains(
+                "aft requires core ≥ 0.17.20, but the installed core version could not be read",
+            )
+        }));
     }
 
     #[test]
@@ -1116,6 +1398,90 @@ mod tests {
     }
 
     #[test]
+    fn upgrade_allows_a_floored_module_when_planned_core_meets_the_floor() {
+        let observed = floor_upgrade_observed("0.17.20", Some("0.17.20"), Some("0.17.19"));
+        let plan = plan_upgrade(&observed);
+        assert!(updates_target(&plan, upgrade_target("ck-subc")));
+        assert!(updates_target(&plan, upgrade_target("ck-aft")));
+        assert!(!plan.outcomes.iter().any(|outcome| matches!(
+            outcome,
+            PlanOutcome::TargetRefused { reason, .. } if reason.contains("aft")
+        )));
+    }
+
+    #[test]
+    fn upgrade_refuses_only_the_module_above_the_planned_core_floor() {
+        let observed = floor_upgrade_observed("0.18.0", Some("0.17.34"), Some("0.17.20"));
+        let plan = plan_upgrade(&observed);
+        assert!(updates_target(&plan, upgrade_target("ck-subc")));
+        assert!(updates_target(&plan, upgrade_target("ck-insula")));
+        assert!(!updates_target(&plan, upgrade_target("ck-aft")));
+        assert!(plan.is_authorized(), "other targets must remain executable");
+        assert!(plan.outcomes.iter().any(|outcome| {
+            outcome.to_string()
+                == "refusal: aft requires core ≥ 0.18.0, but the plan leaves core 0.17.34"
+        }));
+    }
+
+    #[test]
+    fn release_incomplete_still_blocks_beside_a_floor_refused_module() {
+        let mut observed = floor_upgrade_observed("0.18.0", Some("0.17.34"), Some("0.17.20"));
+        observed.releases.insert(
+            "ck-insula".to_string(),
+            ReleaseAvailability::Incomplete {
+                missing_asset: "ck-insula-linux-x64.zip".to_string(),
+            },
+        );
+        let plan = plan_upgrade(&observed);
+
+        assert!(plan.outcomes.iter().any(|outcome| matches!(
+            outcome,
+            PlanOutcome::TargetRefused {
+                component: Component::Aft,
+                ..
+            }
+        )));
+        assert!(plan.outcomes.iter().any(|outcome| matches!(
+            outcome,
+            PlanOutcome::ReleaseIncomplete {
+                component: Component::Insula,
+                ..
+            }
+        )));
+        assert!(!plan.is_authorized());
+    }
+
+    #[test]
+    fn upgrade_without_a_core_update_uses_the_installed_daemon_version() {
+        let below = floor_upgrade_observed("0.17.20", None, Some("0.17.19"));
+        let below_plan = plan_upgrade(&below);
+        assert!(!updates_target(&below_plan, upgrade_target("ck-aft")));
+        assert!(below_plan.outcomes.iter().any(|outcome| {
+            outcome
+                .to_string()
+                .contains("aft requires core ≥ 0.17.20, but the plan leaves core 0.17.19")
+        }));
+
+        let meeting = floor_upgrade_observed("0.17.20", None, Some("0.17.20"));
+        let meeting_plan = plan_upgrade(&meeting);
+        assert!(updates_target(&meeting_plan, upgrade_target("ck-aft")));
+        assert!(!meeting_plan.outcomes.iter().any(|outcome| matches!(
+            outcome,
+            PlanOutcome::TargetRefused { reason, .. } if reason.contains("aft")
+        )));
+    }
+
+    #[test]
+    fn upgrade_refuses_a_malformed_module_floor_and_names_its_value() {
+        let observed = floor_upgrade_observed("v0.17.20", Some("0.18.0"), Some("0.17.20"));
+        let plan = plan_upgrade(&observed);
+        assert!(!updates_target(&plan, upgrade_target("ck-aft")));
+        assert!(plan.outcomes.iter().any(|outcome| {
+            outcome.to_string() == "refusal: aft declares malformed requires_core `v0.17.20`"
+        }));
+    }
+
+    #[test]
     fn upgrade_orders_daemon_service_then_module_ack_poll_then_ck_without_mc() {
         let roster = upgrade_roster([Component::Core, Component::Aft]);
         let mut targets = BTreeMap::new();
@@ -1139,6 +1505,9 @@ mod tests {
             roster,
             targets,
             releases,
+            requires_core: BTreeMap::new(),
+            available_core_version: None,
+            installed_core_version: Some("1.0.0".to_string()),
             supervised_modules,
             daemon_unreachable_reason: None,
         });

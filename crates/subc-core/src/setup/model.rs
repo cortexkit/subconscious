@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
+    str::FromStr,
 };
 
 use super::{
@@ -77,6 +78,30 @@ impl Component {
 impl fmt::Display for Component {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.label())
+    }
+}
+
+/// A daemon version used only for module compatibility-floor comparisons.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct CoreVersion(u64, u64, u64);
+
+impl FromStr for CoreVersion {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let mut parts = value.split('.');
+        let mut number = || {
+            let part = parts.next().ok_or(())?;
+            if part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(());
+            }
+            part.parse::<u64>().map_err(|_| ())
+        };
+        let version = Self(number()?, number()?, number()?);
+        if parts.next().is_some() {
+            return Err(());
+        }
+        Ok(version)
     }
 }
 
@@ -240,6 +265,11 @@ pub struct SetupObserved {
     pub platform: PlatformObservation,
     pub components: BTreeMap<Component, ComponentState>,
     pub releases: BTreeMap<Component, ReleaseAvailability>,
+    /// Module daemon floors copied from the signed release index.
+    pub requires_core: BTreeMap<Component, String>,
+    /// The installed daemon version, absent when neither live catalog nor binary
+    /// version evidence could be read.
+    pub installed_core_version: Option<String>,
     pub runtime: RuntimeState,
     pub configuration: ConfigurationState,
     /// The bootstrap installer owns the running `ck` placement but setup has
@@ -285,6 +315,8 @@ impl SetupObserved {
             platform: PlatformObservation::current(),
             components,
             releases,
+            requires_core: BTreeMap::new(),
+            installed_core_version: None,
             runtime: RuntimeState::Missing,
             configuration: ConfigurationState::Additive,
             running_ck_adoption: None,
@@ -360,6 +392,12 @@ pub enum PlanOutcome {
     Refusal {
         reason: String,
     },
+    /// A target the planner omits while compatible siblings proceed. This is
+    /// non-blocking because the refused target has no executable operations.
+    TargetRefused {
+        component: Component,
+        reason: String,
+    },
     Noop {
         scope: String,
     },
@@ -427,7 +465,9 @@ impl fmt::Display for PlanOutcome {
                 "{component}: could not resolve the release: {reason} — retry later; nothing was installed"
             ),
             Self::DeclaredUnavailable { message, .. } => formatter.write_str(message),
-            Self::Refusal { reason } => write!(formatter, "refusal: {reason}"),
+            Self::Refusal { reason } | Self::TargetRefused { reason, .. } => {
+                write!(formatter, "refusal: {reason}")
+            }
             Self::Noop { scope } => write!(formatter, "no-op: {scope}"),
             Self::ConfiguredNotRegistered { component } => {
                 write!(formatter, "{component}: configured but not registered; registering")
@@ -678,6 +718,12 @@ pub struct UpgradeObserved {
     pub roster: Vec<UpgradeTarget>,
     pub targets: BTreeMap<String, UpgradeState>,
     pub releases: BTreeMap<String, ReleaseAvailability>,
+    /// Module daemon floors copied from the signed release index.
+    pub requires_core: BTreeMap<Component, String>,
+    /// Core version in the signed index, used only when the daemon is upgraded.
+    pub available_core_version: Option<String>,
+    /// Daemon version observed from the live catalog before planning.
+    pub installed_core_version: Option<String>,
     pub supervised_modules: BTreeSet<String>,
     pub daemon_unreachable_reason: Option<String>,
 }
@@ -695,6 +741,9 @@ impl UpgradeObserved {
             roster,
             targets,
             releases,
+            requires_core: BTreeMap::new(),
+            available_core_version: None,
+            installed_core_version: None,
             supervised_modules: BTreeSet::new(),
             daemon_unreachable_reason: None,
         }
@@ -787,5 +836,19 @@ pub fn version_transition(target: &str, from: &str, to: &str) -> String {
         format!("{target} → release {to}")
     } else {
         format!("{target} {from} → {to}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CoreVersion;
+
+    #[test]
+    fn core_version_orders_numeric_triplets_and_rejects_other_spellings() {
+        let versions = ["0.17.20", "0.17.34", "0.18.0", "1.0.0"]
+            .map(|version| version.parse::<CoreVersion>().expect("numeric triplet"));
+        assert!(versions.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!("0.17".parse::<CoreVersion>().is_err());
+        assert!("v0.17.20".parse::<CoreVersion>().is_err());
     }
 }

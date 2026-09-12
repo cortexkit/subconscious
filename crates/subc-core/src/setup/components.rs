@@ -116,6 +116,13 @@ impl ReleaseArtifactSource {
         self.loaded_index().map(|_| ())
     }
 
+    /// Returns the same signed index generation used for artifact planning.
+    /// Fetching again could compare a floor from generation N+1 with assets
+    /// already selected from generation N.
+    pub(super) fn cloned_index(&mut self) -> Result<ReleaseIndex, String> {
+        self.loaded_index().cloned()
+    }
+
     pub fn release_availability(
         &mut self,
         component: Component,
@@ -1515,6 +1522,7 @@ mod tests {
             super::super::release_index::IndexComponent {
                 release: "subc-core-v0.16.0".to_string(),
                 version: Some("0.16.0".to_string()),
+                requires_core: None,
                 assets: targets,
             },
         );

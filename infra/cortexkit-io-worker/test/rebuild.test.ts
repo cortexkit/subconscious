@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import type { Env } from "../src/env";
 import { canonicalize } from "../src/canonicalize";
 import type { ComponentEntry } from "../src/components";
-import { resetInstallationTokenCache } from "../src/github";
+import { resetInstallationTokenCache, type GitHubRelease } from "../src/github";
 import { KV_BUNDLE, KV_REFUSALS, parseIndexBundle, rebuild, type Refusal } from "../src/rebuild";
 import { verifyIndex } from "../src/sign";
 import worker from "../src/worker";
@@ -20,6 +20,7 @@ const PREVIOUS_AFT: ComponentEntry = {
   published_at_ms: 1_111,
   version: "0.9.0",
   train: null,
+  requires_core: null,
   assets: {
     "linux-x64": {
       "ck-aft": {
@@ -34,6 +35,53 @@ const PREVIOUS_AFT: ComponentEntry = {
 
 function testEnv(): Env {
   return env as unknown as Env;
+}
+
+interface ReleaseFixture {
+  repository: string;
+  tag: string;
+  binary: string;
+  manifest?: unknown;
+}
+
+async function rebuildFixtures(fixtures: ReleaseFixture[]) {
+  const e = testEnv();
+  const blobs: Record<string, string> = {};
+  const repos: Record<string, GitHubRelease[]> = {};
+  for (const fixture of fixtures) {
+    const zipName = `${fixture.binary}-linux-x64.zip`;
+    const assets = [
+      zipAsset(fixture.repository, fixture.tag, zipName, 0),
+      zipAsset(fixture.repository, fixture.tag, `${zipName}.sha256`, 80),
+    ];
+    blobs[downloadUrl(fixture.repository, fixture.tag, zipName)] = "";
+    blobs[downloadUrl(fixture.repository, fixture.tag, `${zipName}.sha256`)] = `${EMPTY_SHA256}  ${zipName}\n`;
+    if (fixture.manifest !== undefined) {
+      assets.push(zipAsset(fixture.repository, fixture.tag, "release-manifest.json", 80));
+      blobs[downloadUrl(fixture.repository, fixture.tag, "release-manifest.json")] = JSON.stringify(
+        fixture.manifest,
+      );
+    }
+    repos[fixture.repository] = [
+      {
+        tag_name: fixture.tag,
+        draft: false,
+        prerelease: false,
+        created_at: "2026-04-01T00:00:00Z",
+        published_at: "2026-04-02T00:00:00Z",
+        assets,
+      },
+    ];
+  }
+  const result = await rebuild(
+    e,
+    fakeGitHub({ capture: { apiAuth: [] }, blobs, repos }),
+  );
+  expect(result).toEqual({ ok: true });
+  const bundle = parseIndexBundle((await e.RELEASE_INDEX.get(KV_BUNDLE))!);
+  const doc = JSON.parse(bundle!.body) as { components: Record<string, ComponentEntry> };
+  const refusals = JSON.parse((await e.RELEASE_INDEX.get(KV_REFUSALS)) ?? "[]") as Refusal[];
+  return { doc, refusals };
 }
 
 describe("rebuild", () => {
@@ -91,6 +139,7 @@ describe("rebuild", () => {
       },
     ];
     blobs[downloadUrl("cortexkit/subconscious", coreTag, "release-manifest.json")] = JSON.stringify({
+      requires_core: "not-a-version",
       binaries: { "ck-subc-mcp": { reports: "mcp-from-manifest" } },
     });
     blobs[downloadUrl("cortexkit/subconscious", coreTag, "NOTES.md")] = "ignore me";
@@ -188,6 +237,7 @@ describe("rebuild", () => {
     expect(core.release).toBe(coreTag);
     expect(core.version).toBe("0.14.1");
     expect(core.train).toBeNull();
+    expect(core.requires_core).toBeNull();
     expect(core.published_at_ms).toBe(Date.parse("2026-01-02T00:00:00Z"));
     const darwin = core.assets["darwin-arm64"];
     expect(darwin["ck-subc"]).toEqual({
@@ -213,6 +263,47 @@ describe("rebuild", () => {
     expect(aftRefusal?.asset).toBe("ck-aft-linux-x64.zip");
     expect(await e.RELEASE_INDEX.get("index.json")).toBeNull();
     expect(await e.RELEASE_INDEX.get("index.json.sig")).toBeNull();
+  });
+
+  it("copies a valid module requires_core and writes null when it is absent", async () => {
+    const { doc, refusals } = await rebuildFixtures([
+      {
+        repository: "cortexkit/aft",
+        tag: "v1.0.0",
+        binary: "ck-aft",
+        manifest: { requires_core: "0.17.20" },
+      },
+      {
+        repository: "cortexkit/synapse",
+        tag: "v1.0.0",
+        binary: "ck-synapse",
+      },
+    ]);
+
+    expect(doc.components.aft.requires_core).toBe("0.17.20");
+    expect(doc.components.synapse.requires_core).toBeNull();
+    expect(refusals).toEqual([]);
+  });
+
+  it("refuses a malformed module requires_core by manifest name and reason", async () => {
+    const { doc, refusals } = await rebuildFixtures([
+      {
+        repository: "cortexkit/aft",
+        tag: "v1.0.0",
+        binary: "ck-aft",
+        manifest: { requires_core: "v0.17.20" },
+      },
+    ]);
+
+    expect(doc.components.aft).toBeUndefined();
+    expect(refusals).toEqual([
+      expect.objectContaining({
+        component: "aft",
+        tag: "v1.0.0",
+        asset: "release-manifest.json",
+        reason: "requires_core_malformed",
+      }),
+    ]);
   });
 
   it("serves 503 index_inconsistent when the bundle signature does not verify the body", async () => {

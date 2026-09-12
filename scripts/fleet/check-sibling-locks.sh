@@ -21,15 +21,40 @@
 #                          unlocked command already repaired the working tree
 #                          — the committed lock is almost certainly stale).
 #
-# Exit: 0 all clean locks resolve; 1 stale or dirty found; 2 vacuity floor.
+# Upstream arm: a version bump WRITTEN to a path-dep crate's Cargo.toml is
+# fleet-visible the moment it is on disk — every consumer's cargo call records
+# the working-tree version, which resolves locally and fails their CI (the
+# committed ref does not have it). So an uncommitted bump in an upstream tree
+# is itself a fleet exposure, reported here so the bump's author sees the
+# window they are holding open. Absent at the committed ref means: commit and
+# push it now, or revert it.
+#
+# Exit: 0 all clean locks resolve and no uncommitted upstream bumps; 1 stale,
+# dirty, or uncommitted bump found; 2 vacuity floor.
 
 set -uo pipefail
 
 ROOT="${CK_PROJECTS_ROOT:-$HOME/Work/Projects/CortexKit}"
 REPOS=(engram synapse plexus claustrum astrocyte fusiform entorhinal wernicke cerebellum insula broca prefrontal thalamus callosum aft magic-context)
+UPSTREAMS=(subconscious commons)
 
 examined=0
 bad=0
+
+for name in "${UPSTREAMS[@]}"; do
+  repo="$ROOT/$name"
+  [ -d "$repo/.git" ] || continue
+  for manifest in "$repo"/crates/*/Cargo.toml "$repo"/cortexkit-release/Cargo.toml; do
+    [ -f "$manifest" ] || continue
+    rel="${manifest#"$repo"/}"
+    tree=$(sed -nE 's/^version *= *"([^"]+)".*/\1/p' "$manifest" | head -1)
+    head=$(git -C "$repo" show "HEAD:$rel" 2>/dev/null | sed -nE 's/^version *= *"([^"]+)".*/\1/p' | head -1)
+    if [ -n "$tree" ] && [ -n "$head" ] && [ "$tree" != "$head" ]; then
+      echo "UNCOMMITTED-BUMP $name/$rel — working tree $tree, HEAD $head; every path consumer's next cargo call records $tree and its CI cannot resolve it (author: commit and push now, or revert)"
+      bad=$((bad + 1))
+    fi
+  done
+done
 for name in "${REPOS[@]}"; do
   repo="$ROOT/$name"
   [ -f "$repo/Cargo.lock" ] || continue

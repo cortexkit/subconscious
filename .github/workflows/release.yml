@@ -279,22 +279,18 @@ jobs:
           echo "inventory complete: ${expected} assets"
           gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false
 
-  publish:
-    name: Publish to crates.io
+  resolve-publish-tag:
+    name: Resolve crate publish tag
     # subc-core tags cut binary releases (above), never a crates.io publish.
     if: ${{ !startsWith(github.ref_name, 'subc-core-v') }}
-    # Blacksmith runner (not GitHub-hosted): the owning org is on the free plan,
-    # where GitHub blocks private-repo Actions jobs at the zero spending limit.
-    # See ci.yml for the full rationale.
-    runs-on: ubuntu-latest
     needs: verify
+    runs-on: ubuntu-latest
+    outputs:
+      crate: ${{ steps.tag.outputs.crate }}
+      version: ${{ steps.tag.outputs.version }}
     steps:
-      - uses: actions/checkout@v5
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      # Parse `<crate>-v<version>` from the tag and assert the crate's
-      # Cargo.toml version matches — guards against tagging a stale version.
+      # Parse `<crate>-v<version>` here so the reusable workflow has the same
+      # explicit crate and version inputs as the publish-on-bump path.
       - name: Resolve crate + version from tag
         id: tag
         run: |
@@ -303,46 +299,15 @@ jobs:
             echo "::error::Tag '$TAG' must be '<crate>-v<version>', e.g. subc-transport-v0.1.0"
             exit 1
           fi
-          CRATE="${BASH_REMATCH[1]}"
-          VERSION="${BASH_REMATCH[2]}"
-          MANIFEST="crates/${CRATE}/Cargo.toml"
-          if [ ! -f "$MANIFEST" ]; then
-            echo "::error::No crate '${CRATE}' at ${MANIFEST}"
-            exit 1
-          fi
-          CARGO_VERSION=$(grep '^version' "$MANIFEST" | head -1 | sed -E 's/version *= *"([^"]+)"/\1/')
-          if [ "$VERSION" != "$CARGO_VERSION" ]; then
-            echo "::error::Tag wants ${VERSION} but ${MANIFEST} has ${CARGO_VERSION}"
-            exit 1
-          fi
-          echo "crate=$CRATE" >> "$GITHUB_OUTPUT"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "Publishing ${CRATE} v${VERSION}"
+          echo "crate=${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
+          echo "version=${BASH_REMATCH[2]}" >> "$GITHUB_OUTPUT"
 
-      # Idempotent: a retag of the same version (recovery re-run) treats
-      # "already exists" as success instead of failing the release.
-      #
-      # Paired-release race: subc-transport depends on subc-protocol, so when both
-      # tags are pushed together, transport's publish can run before the freshly
-      # published protocol version is resolvable on the index ("failed to select a
-      # version for the requirement"). That is transient index propagation, not a
-      # real failure — retry with a delay before giving up.
-      - name: Publish
-        run: |
-          CRATE="${{ steps.tag.outputs.crate }}"
-          for attempt in 1 2 3 4 5 6; do
-            out=$(cargo publish --package "$CRATE" 2>&1) && { echo "$out"; exit 0; }
-            echo "$out"
-            if echo "$out" | grep -q "already exists"; then
-              echo "already published; treating as success"; exit 0
-            fi
-            if echo "$out" | grep -q "failed to select a version for the requirement"; then
-              echo "dependency not yet resolvable on the index (attempt $attempt); retrying in 60s"
-              sleep 60; continue
-            fi
-            exit 1
-          done
-          echo "::error::dependency still unresolvable after retries"
-          exit 1
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+  publish:
+    name: Publish to crates.io
+    needs: resolve-publish-tag
+    uses: ./.github/workflows/publish-crate.yml
+    with:
+      crate: ${{ needs.resolve-publish-tag.outputs.crate }}
+      version: ${{ needs.resolve-publish-tag.outputs.version }}
+    secrets:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

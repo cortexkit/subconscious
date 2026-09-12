@@ -6,6 +6,7 @@ use std::{
 };
 
 use serde_json::{Map, Value};
+use subc_transport::connection_file;
 
 use super::{
     components::{self, ReleaseArtifactSource},
@@ -19,6 +20,7 @@ use super::{
     planner::{execute_setup, ExecutionMode, SetupExecutor, SetupPlan},
     runtime::{self, RuntimePlatform, RuntimeStatus, SystemCommandRunner},
     uninstall,
+    upgrade::{binary_version, DaemonCatalogBuild},
     validation::{self, Validator},
 };
 
@@ -125,6 +127,17 @@ impl SetupBackend {
         // A failed index is about the document, not a single component: setup
         // must not plan any installation from it.
         self.artifacts.ensure_index()?;
+        let release_index = self.artifacts.cloned_index()?;
+        let requires_core = Component::ALL
+            .into_iter()
+            .filter_map(|component| {
+                release_index
+                    .components
+                    .get(component.label())
+                    .and_then(|entry| entry.requires_core.clone())
+                    .map(|floor| (component, floor))
+            })
+            .collect::<BTreeMap<_, _>>();
         for component in Component::ALL {
             if matches!(
                 PlatformObservation::current(),
@@ -185,6 +198,16 @@ impl SetupBackend {
         let mut observed = SetupObserved::unconfigured_current_host();
         observed.components = components;
         observed.releases = releases;
+        observed.requires_core = requires_core;
+        if observed.component_state(Component::Core) != ComponentState::Missing
+            && selected.iter().any(|component| {
+                component.module_id().is_some()
+                    && observed.requires_core.contains_key(component)
+                    && observed.component_state(*component) == ComponentState::Missing
+            })
+        {
+            observed.installed_core_version = self.observed_daemon_version();
+        }
         observed.runtime = if self.runtime_status.registered
             && self.runtime_status.live
             && self
@@ -422,6 +445,19 @@ impl SetupBackend {
             } else {
                 format!("ck {} failed: {detail}", args.join(" "))
             })
+        }
+    }
+
+    fn observed_daemon_version(&self) -> Option<String> {
+        if self.runtime_status.live {
+            let discovered = connection_file::discover(None).ok()?;
+            let catalog = DaemonCatalogBuild {
+                pid: discovered.info.pid,
+                version: discovered.info.daemon_ver,
+            };
+            Some(catalog.version)
+        } else {
+            binary_version(&self.paths.runtime_paths.daemon).ok()
         }
     }
 

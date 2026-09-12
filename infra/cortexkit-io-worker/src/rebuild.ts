@@ -147,6 +147,7 @@ async function ingestComponent(
 }
 
 interface ManifestFile {
+  requires_core?: string | null;
   binaries?: Record<string, { reports?: string | null }>;
 }
 
@@ -177,6 +178,15 @@ async function buildEntry(
       refuse(refusals, spec.id, release.tag_name, "release-manifest.json", "manifest_unparseable");
       return null;
     }
+  }
+
+  let requiresCore: string | null = null;
+  if (spec.id !== "core" && manifest?.requires_core != null) {
+    if (typeof manifest.requires_core !== "string" || !/^\d+\.\d+\.\d+$/.test(manifest.requires_core)) {
+      refuse(refusals, spec.id, release.tag_name, "release-manifest.json", "requires_core_malformed");
+      return null;
+    }
+    requiresCore = manifest.requires_core;
   }
 
   const assets: ComponentEntry["assets"] = {};
@@ -231,6 +241,7 @@ async function buildEntry(
     published_at_ms: Date.parse(publishedAt),
     version: fields.version,
     train: fields.train,
+    requires_core: requiresCore,
     assets,
   };
 }

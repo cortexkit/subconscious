@@ -35,6 +35,7 @@ export interface ComponentEntry {
   published_at_ms: number;
   version: string | null;
   train: string | null;
+  requires_core: string | null;
   assets: Record<string, Record<string, AssetEntry>>;
 }
 

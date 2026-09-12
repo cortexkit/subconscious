@@ -1060,6 +1060,7 @@ mod tests {
             super::super::release_index::IndexComponent {
                 release: "subc-core-v0.99.0".to_string(),
                 version: Some("0.99.0".to_string()),
+                requires_core: None,
                 assets: core_targets,
             },
         );
@@ -1068,6 +1069,7 @@ mod tests {
             super::super::release_index::IndexComponent {
                 release: "v0.99.0".to_string(),
                 version: Some("0.99.0".to_string()),
+                requires_core: None,
                 assets: aft_targets,
             },
         );

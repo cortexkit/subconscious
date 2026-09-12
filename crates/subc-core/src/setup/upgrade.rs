@@ -274,6 +274,11 @@ pub struct SystemUpgradeBackend {
     rollback_paths: BTreeMap<String, PathBuf>,
     rollback_archive_sha256: BTreeMap<String, Option<String>>,
     expected_versions: BTreeMap<String, String>,
+    /// The planner's `from` per target, empty for a binary that prints its own
+    /// crate version (see `version_transition`). The completion line renders
+    /// this rather than the binary's self-report so the plan and the result
+    /// spell the same transition.
+    planned_from: BTreeMap<String, String>,
     supervised_modules: BTreeSet<String>,
 }
 
@@ -318,6 +323,7 @@ impl SystemUpgradeBackend {
             rollback_paths: BTreeMap::new(),
             rollback_archive_sha256: BTreeMap::new(),
             expected_versions,
+            planned_from: BTreeMap::new(),
             supervised_modules: BTreeSet::new(),
         })
     }
@@ -335,6 +341,29 @@ impl SystemUpgradeBackend {
     pub fn set_expected_version(&mut self, target: UpgradeTarget, version: String) {
         self.expected_versions
             .insert(target.label().to_string(), version);
+    }
+
+    pub fn set_planned_from(&mut self, target: UpgradeTarget, from: String) {
+        self.planned_from.insert(target.label().to_string(), from);
+    }
+
+    fn completion_line(&self, target: UpgradeTarget) -> String {
+        let from = self
+            .planned_from
+            .get(target.label())
+            .cloned()
+            .unwrap_or_else(|| {
+                self.targets
+                    .get(target.label())
+                    .expect("a completed upgrade has a discovered target")
+                    .installed_version
+                    .clone()
+            });
+        let to = self
+            .expected_versions
+            .get(target.label())
+            .expect("a completed upgrade has an expected version");
+        upgraded_line(target, &from, to)
     }
 
     fn target(&self, target: UpgradeTarget) -> Result<&ManagedUpgradeTarget, String> {
@@ -766,16 +795,7 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
     }
 
     fn completed(&mut self, target: UpgradeTarget) {
-        let from = &self
-            .targets
-            .get(target.label())
-            .expect("a completed upgrade has a discovered target")
-            .installed_version;
-        let to = self
-            .expected_versions
-            .get(target.label())
-            .expect("a completed upgrade has an expected version");
-        println!("{}", upgraded_line(target, from, to));
+        println!("{}", self.completion_line(target));
     }
 
     fn rollback_decision(&mut self, _target: UpgradeTarget) -> RollbackDecision {
@@ -1182,10 +1202,67 @@ exit 1
             expected_versions: [(aft.label().to_string(), "2.0.0".to_string())]
                 .into_iter()
                 .collect(),
+            planned_from: BTreeMap::new(),
             supervised_modules: ["aft".to_string()].into_iter().collect(),
         };
 
         let result = backend.initiate_module_restart(aft, Duration::from_secs(30));
         assert!(result.is_ok(), "initiate_module_restart failed: {result:?}");
+    }
+
+    /// The completion line is the planner's transition, not the binary's
+    /// self-report: ck-subc-mcp prints its crate version 0.1.0, the planner
+    /// leaves `from` empty for it, and the line must say "→ release", exactly
+    /// as the dry-run did. The two lines are rendered by different code
+    /// paths, so agreement between them is a test, not a consequence.
+    #[cfg(unix)]
+    #[test]
+    fn completion_line_follows_the_planned_from_not_the_self_report() {
+        let mcp = upgrade_target("ck-subc-mcp");
+        let root = TestTempDir::new("completion-line");
+        let inventory =
+            Inventory::load(root.join("installer-manifest.json"), "linux-x64").expect("inventory");
+        let mut backend = SystemUpgradeBackend {
+            platform: AlphaTarget::LinuxX64,
+            targets: [(
+                mcp.label().to_string(),
+                ManagedUpgradeTarget {
+                    target: mcp,
+                    destination: root.join("ck-subc-mcp"),
+                    installed_version: "0.1.0".to_string(),
+                    installed_archive_sha256: None,
+                },
+            )]
+            .into_iter()
+            .collect(),
+            executable: root.join("ck"),
+            subc: None,
+            assets: ReleaseUpgradeAssetFetcher::from_index(ReleaseIndex {
+                schema: 1,
+                channel: "alpha".to_string(),
+                generated_at_ms: 0,
+                components: BTreeMap::new(),
+            }),
+            inventory,
+            prepared: BTreeMap::new(),
+            rollback_paths: BTreeMap::new(),
+            rollback_archive_sha256: BTreeMap::new(),
+            expected_versions: [(mcp.label().to_string(), "0.17.36".to_string())]
+                .into_iter()
+                .collect(),
+            planned_from: BTreeMap::new(),
+            supervised_modules: BTreeSet::new(),
+        };
+
+        // Without the planner's word, the line falls back to the self-report.
+        assert_eq!(
+            backend.completion_line(mcp),
+            "upgraded ck-subc-mcp 0.1.0 → 0.17.36, restarted"
+        );
+        backend.set_planned_from(mcp, String::new());
+        assert_eq!(
+            backend.completion_line(mcp),
+            "upgraded ck-subc-mcp → release 0.17.36, restarted"
+        );
     }
 }

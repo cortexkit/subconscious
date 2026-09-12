@@ -5,6 +5,8 @@ use std::{
 
 use serde_json::{json, Map, Value};
 
+use super::components::OWNED_BINARY_KINDS;
+
 const SCHEMA_VERSION: u64 = 1;
 
 /// Written by the bootstrap installer beside the manifest when a manifest
@@ -112,6 +114,10 @@ impl Inventory {
             };
             let (kind, path) = (kind.to_string(), PathBuf::from(path));
             self.remove_owned_path(&kind, &path);
+            // The bootstrap installer just replaced the bytes at this path, so
+            // a row another binary-ownership kind wrote for it describes a
+            // file that no longer exists.
+            self.transfer_binary_ownership(&kind, &path);
             self.mutations_mut().push(row.clone());
             self.changed = true;
         }
@@ -146,10 +152,22 @@ impl Inventory {
         })
     }
 
+    /// Records a row for `path`. Among the binary-ownership kinds a path has
+    /// ONE owner: recording setup's `managed-binary` over the bootstrap
+    /// installer's `binary-placement` (or the reverse) transfers ownership
+    /// rather than adding a sibling, because both rows answer the same
+    /// question — who placed these bytes — and disagree the moment one
+    /// writer replaces the file: the other row keeps a stale digest and
+    /// version, and whichever reader finds it first believes it. Kinds that
+    /// answer different questions about one path (`runtime-definition` and
+    /// `runtime-registration` on the unit file) coexist. Re-recording under
+    /// the same kind is a no-op so callers passing empty fields do not erase
+    /// digests written by `update_owned_string`.
     pub fn record(&mut self, kind: &str, path: &Path, fields: Map<String, Value>) {
         if self.owns_path(kind, path) {
             return;
         }
+        self.transfer_binary_ownership(kind, path);
         let mut entry = fields;
         entry.insert("kind".to_string(), Value::String(kind.to_string()));
         entry.insert(
@@ -158,6 +176,20 @@ impl Inventory {
         );
         self.mutations_mut().push(Value::Object(entry));
         self.changed = true;
+    }
+
+    /// When `kind` is a binary-ownership kind, drops the rows the OTHER
+    /// binary-ownership kinds hold for `path`. See `record`.
+    fn transfer_binary_ownership(&mut self, kind: &str, path: &Path) {
+        if !OWNED_BINARY_KINDS.contains(&kind) {
+            return;
+        }
+        for other in OWNED_BINARY_KINDS
+            .into_iter()
+            .filter(|other| *other != kind)
+        {
+            self.remove_owned_path(other, path);
+        }
     }
 
     pub fn remove_owned_path(&mut self, kind: &str, path: &Path) {
@@ -313,6 +345,91 @@ mod tests {
                 .and_then(Value::as_str),
             Some("after")
         );
+    }
+
+    // A machine where `ck setup` once recorded ck as `managed-binary` and a
+    // later bootstrap re-run wrote a `binary-placement` row for the same
+    // path. Adoption must leave ONE row for the path, the sidecar's, or the
+    // stale managed-binary digest is what `ck upgrade` reads first and ck
+    // re-places itself on every run.
+    #[test]
+    fn a_bootstrap_sidecar_replaces_a_row_of_another_kind_at_the_same_path() {
+        let root = fixture_path("bootstrap-sidecar-mixed-kind");
+        let manifest = root.join("installer-manifest.json");
+        fs::write(
+            &manifest,
+            r#"{"schema_version":1,"platform":"linux-x64","mutations":[
+              {"kind":"managed-binary","path":"/managed/ck","version":"0.17.33","sha256":"old-ck","archive_sha256":"old-archive"},
+              {"kind":"managed-binary","path":"/managed/ck-subc","sha256":"daemon","archive_sha256":"daemon-archive"}
+            ]}"#,
+        )
+        .expect("installed manifest");
+        fs::write(
+            root.join(BOOTSTRAP_SIDECAR),
+            r#"{"schema_version":1,"installer":"ck","platform":"linux-x64","mutations":[
+              {"kind":"binary-placement","path":"/managed/ck","sha256":"new-ck","archive_sha256":"new-archive"}
+            ]}"#,
+        )
+        .expect("bootstrap sidecar");
+
+        let inventory = Inventory::load(&manifest, "linux-x64").expect("load adopts");
+        let rows_for_ck = inventory
+            .mutations()
+            .filter(|entry| entry.get("path").and_then(Value::as_str) == Some("/managed/ck"))
+            .count();
+        assert_eq!(rows_for_ck, 1, "one owner row per path");
+        assert!(
+            !inventory.owns_path("managed-binary", Path::new("/managed/ck")),
+            "the stale managed-binary row is gone"
+        );
+        assert_eq!(
+            inventory
+                .entry_for_path("binary-placement", Path::new("/managed/ck"))
+                .and_then(|entry| entry.get("archive_sha256"))
+                .and_then(Value::as_str),
+            Some("new-archive")
+        );
+        assert!(
+            inventory.owns_path("managed-binary", Path::new("/managed/ck-subc")),
+            "other paths' rows are untouched"
+        );
+    }
+
+    // Same rule for a live writer: setup recording a path the bootstrap
+    // installer owns takes the row over instead of adding a second one.
+    #[test]
+    fn recording_a_path_under_another_kind_transfers_ownership() {
+        let root = fixture_path("record-transfers-ownership");
+        let manifest = root.join("installer-manifest.json");
+        let mut inventory = Inventory::load(&manifest, "linux-x64").expect("fresh");
+        let ck = Path::new("/managed/ck");
+        let mut fields = Map::new();
+        fields.insert("archive_sha256".to_string(), Value::String("boot".into()));
+        inventory.record("binary-placement", ck, fields);
+        let mut fields = Map::new();
+        fields.insert("archive_sha256".to_string(), Value::String("setup".into()));
+        inventory.record("managed-binary", ck, fields);
+
+        let rows_for_ck = inventory
+            .mutations()
+            .filter(|entry| entry.get("path").and_then(Value::as_str) == Some("/managed/ck"))
+            .count();
+        assert_eq!(rows_for_ck, 1);
+        assert!(!inventory.owns_path("binary-placement", ck));
+        assert_eq!(
+            inventory
+                .entry_for_path("managed-binary", ck)
+                .and_then(|entry| entry.get("archive_sha256"))
+                .and_then(Value::as_str),
+            Some("setup")
+        );
+
+        // Kinds that answer different questions about one path still coexist.
+        let unit = Path::new("/units/cortexkit-subc.service");
+        inventory.record("runtime-definition", unit, Map::new());
+        inventory.record("runtime-registration", unit, Map::new());
+        assert!(inventory.owns_path("runtime-definition", unit));
+        assert!(inventory.owns_path("runtime-registration", unit));
     }
 
     // A bootstrap re-run onto an installed machine: the manifest carries the

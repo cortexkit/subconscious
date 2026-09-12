@@ -5162,7 +5162,9 @@ async fn upgrade_command(
             .map_err(CkError::Rejected)?;
     backend.set_supervised_modules(observed.supervised_modules.clone());
     for &target in &observed.roster {
-        if let setup::UpgradeState::UpdateAvailable { to, .. } = observed.target_state(target) {
+        if let setup::UpgradeState::UpdateAvailable { from, to, .. } = observed.target_state(target)
+        {
+            backend.set_planned_from(target, from);
             backend.set_expected_version(target, to);
         }
     }

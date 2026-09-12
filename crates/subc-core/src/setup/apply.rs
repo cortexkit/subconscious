@@ -1033,7 +1033,10 @@ mod adoption_tests {
         backend.adopt_running_ck(&executable).unwrap();
 
         assert!(backend.inventory.owns_path("managed-binary", &executable));
-        assert!(backend.inventory.owns_path("binary-placement", &executable));
+        assert!(
+            !backend.inventory.owns_path("binary-placement", &executable),
+            "adoption transfers the row; two ownership rows for one path let a stale digest win later"
+        );
         assert_eq!(
             backend
                 .inventory

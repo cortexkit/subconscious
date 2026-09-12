@@ -803,7 +803,10 @@ pub fn upgraded_line(target: UpgradeTarget, from: &str, to: &str) -> String {
     } else {
         ""
     };
-    format!("upgraded {target} {from} → {to}{restarted}")
+    format!(
+        "upgraded {}{restarted}",
+        super::model::version_transition(&target.to_string(), from, to)
+    )
 }
 
 pub fn binary_version(path: &Path) -> Result<String, String> {
@@ -998,6 +1001,7 @@ mod tests {
             super::super::update_cache::CachedRelease {
                 version: "2.0.0".to_string(),
                 sha256: None,
+                reports_release_version: true,
             },
         );
         let observed = observed_upgrade_targets(&metadata, &[target], Ok(BTreeSet::new()));

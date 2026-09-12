@@ -438,7 +438,7 @@ impl fmt::Display for PlanOutcome {
                 to,
                 reason,
             } => {
-                write!(formatter, "{target} {from} → {to}")?;
+                formatter.write_str(&version_transition(&target.to_string(), from, to))?;
                 if let Some(reason) = reason {
                     write!(formatter, "; {reason}")?;
                 }
@@ -775,5 +775,17 @@ impl fmt::Display for UpgradeOperation {
             }
             Self::PostVerify { target } => write!(formatter, "post-verify {target}"),
         }
+    }
+}
+
+/// One spelling for "this binary moves to that release". With a known
+/// installed version: `ck-subc 0.17.33 → 0.17.34`. Without one — the binary
+/// prints its own crate version, so the release axis has no `from` — the
+/// release is named alone: `ck-subc-mcp → release 0.17.34`.
+pub fn version_transition(target: &str, from: &str, to: &str) -> String {
+    if from.is_empty() {
+        format!("{target} → release {to}")
+    } else {
+        format!("{target} {from} → {to}")
     }
 }

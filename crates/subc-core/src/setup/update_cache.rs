@@ -17,6 +17,17 @@ pub struct CachedRelease {
     /// Digest of this binary's asset for the invoking host, or `None` when the
     /// signed index has no matching asset for that target.
     pub sha256: Option<String>,
+    /// Whether this binary's `--version` line is the release version. The
+    /// index says so per asset (`reports`); a sibling such as ck-subc-mcp
+    /// prints its own crate version, so an "installed → release" arrow
+    /// would compare two different numbering schemes. Absent on caches
+    /// written before this field existed, and then assumed true.
+    #[serde(default = "default_true")]
+    pub reports_release_version: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// The on-disk, user-owned update metadata cache. Daemon code does not import
@@ -166,6 +177,7 @@ mod tests {
                 CachedRelease {
                     version: "0.13.0".to_string(),
                     sha256: Some("ab".repeat(32)),
+                    reports_release_version: true,
                 },
             )]),
         }

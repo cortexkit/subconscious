@@ -32,6 +32,10 @@ pub struct ReleaseEvidence {
     /// Display-only release text. It is intentionally not part of currency.
     pub version: String,
     pub sha256: Option<String>,
+    /// Whether the binary's own `--version` is the release version (the
+    /// index asset's `reports` is set). False for siblings that print their
+    /// crate version; the plan then names the release without an arrow.
+    pub reports_release_version: bool,
 }
 
 /// State read from one inventory-owned binary. Currency compares
@@ -205,18 +209,24 @@ fn evidence_from_index(
                 return Ok(ReleaseEvidence {
                     version: String::new(),
                     sha256: None,
+                    reports_release_version: true,
                 });
             };
             let version = entry.version.clone().unwrap_or_default();
-            let sha256 = match PlatformObservation::current() {
+            let asset = match PlatformObservation::current() {
                 PlatformObservation::Supported(platform) => entry
                     .assets
                     .get(platform.label())
-                    .and_then(|binaries| binaries.get(binary))
-                    .map(|asset| asset.sha256.clone()),
+                    .and_then(|binaries| binaries.get(binary)),
                 PlatformObservation::Unsupported(_) => None,
             };
-            Ok(ReleaseEvidence { version, sha256 })
+            Ok(ReleaseEvidence {
+                version,
+                sha256: asset.map(|asset| asset.sha256.clone()),
+                // An asset with `reports: null` is the index saying the
+                // binary does not print the release version.
+                reports_release_version: asset.is_none_or(|asset| asset.reports.is_some()),
+            })
         }
     }
 }
@@ -265,7 +275,11 @@ impl DashboardUpdate {
                     .iter()
                     .map(|update| match &update.reason {
                         Some(reason) => format!("{} {reason}", update.target),
-                        None => format!("{} {} → {}", update.target, update.from, update.to),
+                        None => super::model::version_transition(
+                            &update.target.to_string(),
+                            &update.from,
+                            &update.to,
+                        ),
                     })
                     .collect::<Vec<_>>()
                     .join(", ");
@@ -381,6 +395,7 @@ pub async fn check_update_metadata<S: ReleaseSource>(
             CachedRelease {
                 version: evidence.version,
                 sha256: evidence.sha256,
+                reports_release_version: evidence.reports_release_version,
             },
         );
     }
@@ -430,10 +445,19 @@ pub fn observed_from_metadata(
             ),
         };
         if needs_replacement {
+            // A binary that prints its own crate version cannot be placed on
+            // the release axis: "0.1.0 → 0.17.34" would compare two numbering
+            // schemes. Leave `from` empty and the renderers name the release
+            // it moves to without an arrow.
+            let from = if release.reports_release_version {
+                installed.version.clone()
+            } else {
+                String::new()
+            };
             observed.targets.insert(
                 target.label().to_string(),
                 UpgradeState::UpdateAvailable {
-                    from: installed.version.clone(),
+                    from,
                     to: release.version.clone(),
                     reason,
                 },
@@ -456,6 +480,7 @@ async fn refresh_all<S: ReleaseSource>(
             CachedRelease {
                 version: evidence.version,
                 sha256: evidence.sha256,
+                reports_release_version: evidence.reports_release_version,
             },
         );
     }
@@ -570,6 +595,7 @@ mod tests {
                         Ok(ReleaseEvidence {
                             version: version.to_string(),
                             sha256: Some(digest(target, version)),
+                            reports_release_version: true,
                         }),
                     )
                 })
@@ -624,6 +650,7 @@ mod tests {
                     Ok(ReleaseEvidence {
                         version: "0.12.0".to_string(),
                         sha256: Some(digest(target, "0.12.0")),
+                        reports_release_version: true,
                     })
                 })
             } else {
@@ -649,6 +676,7 @@ mod tests {
                         CachedRelease {
                             version: version.to_string(),
                             sha256: Some(digest(target, version)),
+                            reports_release_version: true,
                         },
                     )
                 })
@@ -874,6 +902,60 @@ mod tests {
             observed.release(upgrade_target("ck-aft")),
             ReleaseAvailability::Incomplete { .. }
         ));
+    }
+
+    /// ck-subc-mcp prints its own crate version (0.1.0) while the release is
+    /// 0.17.x; the index marks its asset `reports: null`. An update for it
+    /// must not render "0.1.0 → 0.17.34" — two numbering schemes on one
+    /// arrow — and a binary the index says DOES report keeps the arrow.
+    #[test]
+    fn version_exempt_binary_names_the_release_without_an_installed_from() {
+        let exempt = upgrade_target("ck-subc-mcp");
+        let reporting = upgrade_target("ck-subc");
+        let mut metadata = metadata(100, "0.17.34");
+        for (target, reports) in [(exempt, false), (reporting, true)] {
+            let release = metadata.targets.get_mut(target.label()).unwrap();
+            release.sha256 = Some("ee".repeat(32));
+            release.reports_release_version = reports;
+        }
+        let installed = BTreeMap::from([
+            (
+                exempt.label().to_string(),
+                InstalledBinary {
+                    version: "0.1.0".to_string(),
+                    sha256: Some("11".repeat(32)),
+                    archive_sha256: Some("22".repeat(32)),
+                },
+            ),
+            (
+                reporting.label().to_string(),
+                InstalledBinary {
+                    version: "0.17.33".to_string(),
+                    sha256: Some("33".repeat(32)),
+                    archive_sha256: Some("44".repeat(32)),
+                },
+            ),
+        ]);
+
+        let observed = observed_from_metadata(&metadata, &installed);
+
+        let UpgradeState::UpdateAvailable { from, to, .. } = observed.target_state(exempt) else {
+            panic!("exempt binary must still be an update");
+        };
+        assert_eq!(from, "", "no installed version on the release axis");
+        assert_eq!(to, "0.17.34");
+        assert_eq!(
+            super::super::model::version_transition("ck-subc-mcp", &from, &to),
+            "ck-subc-mcp → release 0.17.34"
+        );
+        let UpgradeState::UpdateAvailable { from, to, .. } = observed.target_state(reporting)
+        else {
+            panic!("reporting binary must be an update");
+        };
+        assert_eq!(
+            super::super::model::version_transition("ck-subc", &from, &to),
+            "ck-subc 0.17.33 → 0.17.34"
+        );
     }
 
     #[test]

@@ -3219,8 +3219,9 @@ fn print_quota_table(
         );
 
         // A shared label template across the provider's accounts keeps window
-        // rows aligned and makes a window one account reports and another
-        // doesn't visible as an explicit "not reported" row.
+        // rows aligned; a window one account reports and a DEGRADED sibling
+        // lacks renders as an explicit "not reported" row (see
+        // quota_window_lines_for_entry for why a clean sibling omits it).
         let templates = quota_window_templates(group);
         let label_width = templates
             .iter()
@@ -3411,29 +3412,51 @@ fn print_quota_account(
         }
         return;
     }
+    for line in quota_window_lines_for_entry(entry, &rows, templates, label_width, color_enabled) {
+        println!("{line}");
+    }
+}
+
+/// One line per template label. A label another account of the provider
+/// reports but this entry lacks renders as `not reported` ONLY when the entry
+/// is degraded (carries an `error`): then the absence is genuinely unknown. On
+/// a clean entry the producer's contract (insula `docs/consumer-contract.md`,
+/// "a window set carries no completeness claim") is that the windows present
+/// are all of them — a free-tier account simply has no five-hour pool — so a
+/// gap row there would claim ignorance where the entry states a positive fact.
+/// The union still sizes the label column so aligned rows survive the omission.
+fn quota_window_lines_for_entry(
+    entry: &Value,
+    rows: &[(String, Value)],
+    templates: &[String],
+    label_width: usize,
+    color_enabled: bool,
+) -> Vec<String> {
     let by_label: HashMap<&str, &Value> = rows
         .iter()
         .map(|(label, window)| (label.as_str(), window))
         .collect();
+    let degraded = entry_error_detail(entry).is_some();
+    let mut lines = Vec::new();
     for template in templates {
         match by_label.get(template.as_str()) {
-            Some(window) => {
-                println!(
-                    "{}",
-                    format_quota_window_line(template, window, label_width, color_enabled)
-                );
-            }
-            None => {
-                println!(
-                    "      {} {:<label_width$}  {}  {}",
-                    dim_text("○", color_enabled),
-                    template,
-                    dim_text(&"·".repeat(QUOTA_PROGRESS_BAR_WIDTH), color_enabled),
-                    dim_text("not reported", color_enabled)
-                );
-            }
+            Some(window) => lines.push(format_quota_window_line(
+                template,
+                window,
+                label_width,
+                color_enabled,
+            )),
+            None if degraded => lines.push(format!(
+                "      {} {:<label_width$}  {}  {}",
+                dim_text("○", color_enabled),
+                template,
+                dim_text(&"·".repeat(QUOTA_PROGRESS_BAR_WIDTH), color_enabled),
+                dim_text("not reported", color_enabled)
+            )),
+            None => {}
         }
     }
+    lines
 }
 
 fn format_quota_window_line(
@@ -6510,6 +6533,60 @@ mod tests {
         assert_eq!(
             shorten_uuid_label("not-a-uuid-e29b-41d4-a716-446655440000"),
             "not-a-uuid-e29b-41d4-a716-446655440000"
+        );
+    }
+
+    /// Two antigravity accounts: the paid one meters four windows, the
+    /// free-tier one two. Upstream meters nothing else for the free account,
+    /// and its entry is clean, so no gap row may claim otherwise. Put an
+    /// `error` on the same entry and the gap rows appear, because then the
+    /// absence really is unknown.
+    #[test]
+    fn a_clean_entry_omits_gap_rows_and_a_degraded_one_shows_them() {
+        // Real antigravity shape: extra rate windows keyed by title.
+        let extra =
+            |title: &str| json!({ "id": title, "title": title, "window": { "usedPercent": 10.0 } });
+        let two_windows = json!({
+            "usage": { "extraRateWindows": [extra("Gemini Weekly"), extra("3P Weekly")] }
+        });
+        let templates: Vec<String> = [
+            "Gemini Weekly",
+            "Gemini Five Hour",
+            "3P Weekly",
+            "3P Five Hour",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let rows = quota_window_rows_for_entry(&two_windows);
+        assert_eq!(rows.len(), 2, "fixture must actually lack two of the four");
+        assert!(
+            templates
+                .iter()
+                .filter(|t| rows.iter().any(|(l, _)| l == *t))
+                .count()
+                == 2,
+            "fixture labels must be the template's labels: {rows:?}"
+        );
+
+        let clean = quota_window_lines_for_entry(&two_windows, &rows, &templates, 12, false);
+        assert_eq!(clean.len(), 2, "clean entry renders only what it reports");
+        assert!(
+            clean.iter().all(|line| !line.contains("not reported")),
+            "{clean:?}"
+        );
+
+        let mut degraded = two_windows.clone();
+        degraded["error"] = json!("one probe arm failed");
+        let rows = quota_window_rows_for_entry(&degraded);
+        let lines = quota_window_lines_for_entry(&degraded, &rows, &templates, 12, false);
+        assert_eq!(lines.len(), 4, "degraded entry renders the union");
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.contains("not reported"))
+                .count(),
+            2
         );
     }
 

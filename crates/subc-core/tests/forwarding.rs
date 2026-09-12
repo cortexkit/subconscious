@@ -3860,7 +3860,14 @@ async fn same_channel_responses_return_out_of_order_by_corr() {
 
     const CA: u64 = 632;
     const CB: u64 = 633;
-    let payload_a = br#"{"delay_ms":300,"jsonrpc":"2.0","id":"req-a"}"#;
+    // A's delay is the whole margin of this test: B can only lose the race if
+    // its arrival at the stub lags A's by more than this. The stub appends a
+    // request-received event to disk before dispatching each frame, and a
+    // hosted Windows runner has stalled that append past 300 ms (release
+    // verify, 2026-09-12: A answered first). Three seconds is beyond any
+    // scheduler or disk stall a runner shows while still failing fast if B
+    // were truly serialized behind A.
+    let payload_a = br#"{"delay_ms":3000,"jsonrpc":"2.0","id":"req-a"}"#;
     let payload_b = br#"{"delay_ms":0,"jsonrpc":"2.0","id":"req-b"}"#;
 
     write_frame(
@@ -3880,7 +3887,8 @@ async fn same_channel_responses_return_out_of_order_by_corr() {
 
     let first_response = read_frame_timeout(&mut client).await;
     let first_received_at = Instant::now();
-    let second_response = read_frame_timeout(&mut client).await;
+    // A is the 3 s request; the default 2 s read budget would time out on it.
+    let second_response = read_frame_timeout_for(&mut client, Duration::from_secs(10)).await;
     let second_received_at = Instant::now();
 
     assert_response(&first_response, ack.route_channel, CB, payload_b);
@@ -3892,8 +3900,8 @@ async fn same_channel_responses_return_out_of_order_by_corr() {
         "same-channel out-of-order latencies: B(corr={CB})={b_latency:?}, A(corr={CA})={a_latency:?}"
     );
     // Out-of-order completion is proven structurally: B (corr=CB, sent second,
-    // 0ms delay) arrives BEFORE A (corr=CA, sent first, ~300ms delay), and A
-    // still takes its full >=250ms. If B were serialized behind A it would arrive
+    // 0ms delay) arrives BEFORE A (corr=CA, sent first, 3 s delay), and A
+    // still takes its full delay. If B were serialized behind A it would arrive
     // after it (failing the ordering assert). The absolute b_latency<80ms bound
     // was a perf claim that flaked on slow CI runners — removed; latencies logged.
     assert!(
@@ -3901,8 +3909,8 @@ async fn same_channel_responses_return_out_of_order_by_corr() {
         "B should arrive before A: b_latency={b_latency:?}, a_latency={a_latency:?}"
     );
     assert!(
-        a_latency >= Duration::from_millis(250),
-        "slow request A should reflect ~300ms delay: a_latency={a_latency:?}"
+        a_latency >= Duration::from_millis(2500),
+        "slow request A should reflect its 3 s delay: a_latency={a_latency:?}"
     );
 
     let events = stub_events(&events_path);

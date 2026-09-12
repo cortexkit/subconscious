@@ -135,6 +135,7 @@ vault and deployed to the index worker as a secret; rotation ships a new
       "published_at_ms": 1788400000000,
       "version": "0.14.1",                  // present when the tag carries one
       "train": null,                         // present for train-tagged components (mc): the tag's build sha id
+      "requires_core": null,                 // modules: the oldest core (ck-subc) this release registers against; null = no declared floor
       "assets": {
         "darwin-arm64": {
           "ck-subc": { "url": "https://github.com/cortexkit/subconscious/releases/download/subc-core-v0.14.1/ck-subc-darwin-arm64.zip",
@@ -169,6 +170,17 @@ Rules:
   `<crate>-v<ver>` → the version for the tag-named binary only; a train tag
   → the full build sha for every binary) and prefers an owner-published
   `release-manifest.json` asset when present (`{"binaries": {"<name>": {"reports": "…"}}}`).
+- **`requires_core`** is a module release's declared daemon floor: the
+  oldest `ck-subc` version whose HELLO parser accepts this release's
+  manifest, as a plain `MAJOR.MINOR.PATCH`. The owner publishes it in
+  `release-manifest.json` (`{"requires_core": "0.17.20", "binaries": {…}}`)
+  and the ingester copies it verbatim; absent means null, and null means
+  no declared floor (today's behaviour). The ingester refuses a release
+  whose `requires_core` is present but not `MAJOR.MINOR.PATCH`, and
+  ignores the key on `core` itself. Why it exists: a module built against
+  subc-protocol ≥ 0.19 sends a HELLO that ck-subc < 0.17.20 refuses
+  ("missing field `consumes`"), so placing such a module beside an old
+  daemon fails at registration — a fact no release stated until now.
 - **Digests are verified at ingest.** The ingester downloads every listed
   archive once, computes sha256, and compares it to the sidecar; a mismatch
   refuses the whole release. `ck` still verifies the sidecar-equal digest
@@ -398,6 +410,28 @@ ladder would stop before the daemon that accepts it was touched. The reverse
 is safe because the daemon parses older manifests leniently; that premise is
 pinned by a test that registers a pre-diet manifest against the current daemon,
 so the ordering fails loudly if the premise ever moves.
+
+The floor a module declares (`requires_core`) is enforced by the planner,
+never by the executor:
+
+- `ck upgrade` compares each module's `requires_core` with the **core
+  version the plan will leave running** — the index's core release when
+  core is in the plan, the installed daemon otherwise. A module whose
+  floor is above that is not upgraded; the plan carries a `Refusal` naming
+  the module, its floor, and the core version that falls short, and every
+  other target proceeds. Daemon-first ordering already covers the common
+  case (core and the module bump together); the check exists for the case
+  the order cannot fix, an index whose core is behind a module's floor.
+- `ck setup <module>` compares `requires_core` with the **installed** daemon
+  version (`ck-subc --version`; the catalog build when the daemon is live).
+  Below the floor it refuses before downloading anything — "requires core
+  ≥ X, installed Y; run `ck upgrade` first" — because setup must not
+  silently replace the daemon to satisfy a module. A fresh `ck setup`
+  installs core from the same index first, so the floor holds by
+  construction there.
+- Comparison is numeric on `MAJOR.MINOR.PATCH`; a `requires_core` that does
+  not parse is a refusal of that module naming the malformed value (the
+  ingester should have refused it; `ck` does not guess).
 
 Restart semantics are target-specific:
 

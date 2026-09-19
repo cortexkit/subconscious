@@ -701,6 +701,8 @@ struct SupervisorRuntimeConfig {
     /// exactly when it is asked for.
     stderr_ring: Arc<Mutex<StderrRing>>,
     terminal_ring: Arc<Mutex<TerminalRing>>,
+    #[cfg(target_os = "linux")]
+    cgroup_placement: Option<subc_cgroup::Placement>,
     #[cfg(test)]
     test_seed_stale_facts_before_enable_spawn: bool,
 }
@@ -1077,6 +1079,8 @@ pub struct Supervisor {
     daemon_started_at_ms: u64,
     terminal_journal: Option<Arc<crate::terminal_journal::TerminalJournal>>,
     provenance_probe: ExecutableIdentityProbe,
+    #[cfg(target_os = "linux")]
+    cgroup_placement: Option<subc_cgroup::Placement>,
 }
 
 impl Supervisor {
@@ -1202,6 +1206,8 @@ impl Supervisor {
             daemon_started_at_ms: unix_ms_now(),
             terminal_journal: None,
             provenance_probe: ExecutableIdentityProbe::default(),
+            #[cfg(target_os = "linux")]
+            cgroup_placement: None,
         }
     }
 
@@ -1256,6 +1262,15 @@ impl Supervisor {
         self
     }
 
+    #[cfg(target_os = "linux")]
+    pub fn with_cgroup_placement(
+        mut self,
+        cgroup_placement: Option<subc_cgroup::Placement>,
+    ) -> Self {
+        self.cgroup_placement = cgroup_placement;
+        self
+    }
+
     /// Spawn `spec.program` and start monitoring it.
     ///
     /// The child is expected to parse `--subc <connection-file-path>`, read the
@@ -1272,6 +1287,8 @@ impl Supervisor {
             self.supervisor_handle.as_ref(),
             &runtime.stderr_ring,
             runtime.capture_logs_dir.as_deref(),
+            #[cfg(target_os = "linux")]
+            runtime.cgroup_placement.as_ref(),
         )?;
         set_running(&snapshot, &child)?;
         self.process_liveness
@@ -1305,6 +1322,8 @@ impl Supervisor {
             self.supervisor_handle.as_ref(),
             &runtime.stderr_ring,
             runtime.capture_logs_dir.as_deref(),
+            #[cfg(target_os = "linux")]
+            runtime.cgroup_placement.as_ref(),
         ) {
             Ok(child) => {
                 set_running(&snapshot, &child)?;
@@ -1362,6 +1381,8 @@ impl Supervisor {
             self.supervisor_handle.as_ref(),
             &runtime.stderr_ring,
             runtime.capture_logs_dir.as_deref(),
+            #[cfg(target_os = "linux")]
+            runtime.cgroup_placement.as_ref(),
         ) {
             Ok(child) => {
                 set_running(&snapshot, &child)?;
@@ -1407,6 +1428,8 @@ impl Supervisor {
                 TerminalRing::new(TerminalRingConfig::default(), self.daemon_started_at_ms)
                     .with_journal(self.terminal_journal.clone()),
             )),
+            #[cfg(target_os = "linux")]
+            cgroup_placement: self.cgroup_placement.clone(),
             #[cfg(test)]
             test_seed_stale_facts_before_enable_spawn: false,
         }
@@ -1932,6 +1955,11 @@ pub enum SuperviseError {
     Spawn {
         program: PathBuf,
         source: io::Error,
+        cgroup_path: Option<PathBuf>,
+    },
+    Cgroup {
+        module_id: String,
+        source: io::Error,
     },
     /// CSPRNG failure generating a reserved module's launch nonce. Fail loud rather
     /// than spawn a reserved module without its identity binding.
@@ -1979,11 +2007,29 @@ impl fmt::Display for SuperviseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidSpec { reason } => write!(f, "invalid module spec: {reason}"),
-            Self::Spawn { program, source } => {
+            Self::Spawn {
+                program,
+                source,
+                cgroup_path: Some(cgroup_path),
+            } => write!(
+                f,
+                "failed to place module in cgroup '{}' while spawning '{}': {source}",
+                cgroup_path.display(),
+                program.display()
+            ),
+            Self::Spawn {
+                program,
+                source,
+                cgroup_path: None,
+            } => write!(
+                f,
+                "failed to spawn module '{}': {source}",
+                program.display()
+            ),
+            Self::Cgroup { module_id, source } => {
                 write!(
                     f,
-                    "failed to spawn module '{}': {source}",
-                    program.display()
+                    "failed to prepare cgroup for module '{module_id}': {source}"
                 )
             }
             Self::LaunchNonce { reason } => {
@@ -2035,9 +2081,10 @@ impl fmt::Display for SuperviseError {
 impl Error for SuperviseError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::Spawn { source, .. } | Self::Wait { source, .. } | Self::Kill { source, .. } => {
-                Some(source)
-            }
+            Self::Spawn { source, .. }
+            | Self::Cgroup { source, .. }
+            | Self::Wait { source, .. }
+            | Self::Kill { source, .. } => Some(source),
             Self::Forwarding(err) => Some(err),
             Self::Registry(err) => Some(err),
             Self::LaunchNonce { .. }
@@ -3897,6 +3944,7 @@ fn spawn_child(
     handle: Option<&SupervisorHandle>,
     ring: &Arc<Mutex<StderrRing>>,
     capture_logs_dir: Option<&std::path::Path>,
+    #[cfg(target_os = "linux")] cgroup_placement: Option<&subc_cgroup::Placement>,
 ) -> Result<SupervisedChild, SuperviseError> {
     let mut command = Command::new(&spec.program);
     command.args(&spec.args);
@@ -3947,6 +3995,21 @@ fn spawn_child(
     }
     command.env(SUBC_LAUNCH_NONCE_ENV, nonce);
 
+    #[cfg(target_os = "linux")]
+    let cgroup_path = cgroup_placement
+        .map(|placement| placement.module_path(&spec.module_id))
+        .transpose()
+        .map_err(|source| SuperviseError::Cgroup {
+            module_id: spec.module_id.clone(),
+            source,
+        })?;
+    #[cfg(not(target_os = "linux"))]
+    let cgroup_path: Option<PathBuf> = None;
+    #[cfg(target_os = "linux")]
+    if let Some(path) = &cgroup_path {
+        apply_cgroup_placement(&mut command, spec, path)?;
+    }
+
     let output_sink = if let Some(logs_dir) = capture_logs_dir {
         let path = logs_dir.join(format!("{}.stderr.log", spec.module_id));
         match ChildOutputSink::open(&path, capture_retention(spec)) {
@@ -3971,6 +4034,7 @@ fn spawn_child(
     let mut child = command.spawn().map_err(|source| SuperviseError::Spawn {
         program: spec.program.clone(),
         source,
+        cgroup_path,
     })?;
     let spawned_at_ms = unix_ms_now();
     let spawned_from = spec.program.clone();
@@ -4027,6 +4091,18 @@ fn spawn_child(
         spawned_file_identity,
         process_start_time,
         process_identity,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn apply_cgroup_placement(
+    command: &mut Command,
+    spec: &ModuleSpec,
+    path: &std::path::Path,
+) -> Result<(), SuperviseError> {
+    subc_cgroup::apply(command, path).map_err(|source| SuperviseError::Cgroup {
+        module_id: spec.module_id.clone(),
+        source,
     })
 }
 
@@ -4090,6 +4166,8 @@ fn spawn_and_mark_running(
         runtime.supervisor_handle.as_ref(),
         &runtime.stderr_ring,
         runtime.capture_logs_dir.as_deref(),
+        #[cfg(target_os = "linux")]
+        runtime.cgroup_placement.as_ref(),
     )?;
     set_running(snapshot, &child)?;
     Ok(child)
@@ -5387,6 +5465,26 @@ mod terminal_history_tests {
         module
     }
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn no_cgroup_placement_does_not_block_fake_aft_stub_spawn() {
+        let supervisor = Supervisor::new(Arc::new(Registry::default()), RestartPolicy::default())
+            .with_cgroup_placement(None);
+        let result = supervisor.spawn(ModuleSpec {
+            module_id: "no-cgroup-placement".to_string(),
+            program: fake_aft_stub_path(),
+            args: Vec::new(),
+            env: Vec::new(),
+            reserved: false,
+            reserved_prefixes: Vec::new(),
+        });
+
+        assert!(
+            result.is_ok(),
+            "no delegation must not turn an otherwise valid spawn into a failure: {result:?}"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn undecided_snapshot_uses_shared_restart_predicate() {
         assert!(module_with_recovery_snapshot(ModuleState::Running, true, 2)
@@ -6543,6 +6641,61 @@ mod jitter_tests {
         assert_eq!(
             jittered_health_delay("aft", 0, Duration::ZERO),
             Duration::ZERO
+        );
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod cgroup_placement_tests {
+    use super::{apply_cgroup_placement, ModuleSpec, SuperviseError};
+    use std::{
+        io,
+        path::{Path, PathBuf},
+    };
+    use tokio::process::Command;
+
+    #[test]
+    fn failed_parent_cgroup_open_is_a_cgroup_supervision_error() {
+        let path = Path::new("/definitely-missing-subc-cgroup");
+        let mut command = Command::new("true");
+        let error = apply_cgroup_placement(
+            &mut command,
+            &ModuleSpec {
+                module_id: "broken-cgroup".to_string(),
+                program: PathBuf::from("true"),
+                args: Vec::new(),
+                env: Vec::new(),
+                reserved: false,
+                reserved_prefixes: Vec::new(),
+            },
+            path,
+        )
+        .expect_err("a parent cgroup open failure must reject the supervised spawn");
+        let reason = error.to_string();
+
+        assert!(
+            matches!(error, SuperviseError::Cgroup { .. }),
+            "parent cgroup open must be reported as a cgroup supervision error: {reason}"
+        );
+        assert!(
+            reason.contains("/definitely-missing-subc-cgroup/cgroup.procs"),
+            "parent cgroup open failure must name cgroup.procs: {reason}"
+        );
+    }
+
+    #[test]
+    fn cgroup_pre_exec_spawn_failure_names_the_cgroup_path() {
+        let cgroup_path = PathBuf::from("/sys/fs/cgroup/subc-modules/broken-module");
+        let reason = SuperviseError::Spawn {
+            program: PathBuf::from("/bin/true"),
+            source: io::Error::from_raw_os_error(13),
+            cgroup_path: Some(cgroup_path.clone()),
+        }
+        .to_string();
+
+        assert!(
+            reason.contains(&cgroup_path.display().to_string()),
+            "a pre_exec spawn failure must name the cgroup path: {reason}"
         );
     }
 }

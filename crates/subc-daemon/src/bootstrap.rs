@@ -412,6 +412,23 @@ pub async fn run_with_config(config: BootstrapConfig) -> Result<(), BootstrapErr
             Ok(())
         }
         Outcome::Bound(bound) => {
+            #[cfg(target_os = "linux")]
+            let cgroup_placement = match subc_cgroup::prepare_current() {
+                Ok(Some(placement)) => Some(placement),
+                Ok(None) => {
+                    warn!(
+                        "module cgroup placement is disabled: daemon cgroup is not delegated; set Delegate=yes"
+                    );
+                    None
+                }
+                Err(error) => {
+                    warn!(
+                        error = %error,
+                        "module cgroup placement is disabled by an unexpected cgroup probe error"
+                    );
+                    None
+                }
+            };
             serve_bound_daemon(
                 bound,
                 configured_modules,
@@ -424,6 +441,8 @@ pub async fn run_with_config(config: BootstrapConfig) -> Result<(), BootstrapErr
                 watchdog_config,
                 capture_logs_dir,
                 terminal_journal_path,
+                #[cfg(target_os = "linux")]
+                cgroup_placement,
             )
             .await
         }
@@ -518,6 +537,7 @@ async fn serve_bound_daemon(
     watchdog_config: DaemonSelfWatchdogConfig,
     capture_logs_dir: Option<PathBuf>,
     terminal_journal_path: Option<PathBuf>,
+    #[cfg(target_os = "linux")] cgroup_placement: Option<subc_cgroup::Placement>,
 ) -> Result<(), BootstrapError> {
     #[cfg(unix)]
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
@@ -583,6 +603,8 @@ async fn serve_bound_daemon(
         Some(dir) => supervisor.with_capture_logs_dir(dir),
         None => supervisor,
     };
+    #[cfg(target_os = "linux")]
+    let supervisor = supervisor.with_cgroup_placement(cgroup_placement);
     // Collect per-module route.bind relay overrides BEFORE handing the
     // `configured_modules` vector to the supervisor (which only needs each
     // module's `drain_timeout_ms`). Each entry was filled in by parse-time

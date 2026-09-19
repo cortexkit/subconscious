@@ -1,6 +1,6 @@
 [package]
 name = "subc-core"
-version = "0.18.17"
+version = "0.18.18"
 edition = "2021"
 license = "MIT"
 publish = false
@@ -43,7 +43,7 @@ harness = false
 required-features = ["bench-harness"]
 
 [dependencies]
-subc-daemon = { path = "../subc-daemon", version = "0.18.15" }
+subc-daemon = { path = "../subc-daemon", version = "0.18.16" }
 cortexkit-log = { version = "0.2.0", git = "https://github.com/cortexkit/commons.git", rev = "99736150c6d0c769c1c7479894fba7f07c322a5f" }
 cortexkit-paths = "0.1.1"
 base64 = "0.22"
@@ -66,9 +66,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Already in the tree via fs4; safe getuid without an unsafe block.
 rustix = { version = "1", default-features = false, features = ["process"] }
 
+
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
-subc-daemon = { path = "../subc-daemon", version = "0.18.15", features = ["test-support"] }
+subc-daemon = { path = "../subc-daemon", version = "0.18.16", features = ["test-support"] }
 # Keep required-feature CLI fixture targets enabled for integration tests.
 subc-core = { path = ".", features = ["test-support"] }
 

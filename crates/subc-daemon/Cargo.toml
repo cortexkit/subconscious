@@ -1,6 +1,6 @@
 [package]
 name = "subc-daemon"
-version = "0.18.15"
+version = "0.18.16"
 edition = "2021"
 publish = true
 description = "Embeddable subc daemon: bootstrap, module supervision, and opaque-byte splice routing."
@@ -27,6 +27,9 @@ subc-protocol = { path = "../subc-protocol", version = "0.21.0" }
 subc-transport = { path = "../subc-transport", version = "0.7.0" }
 tokio = { version = "1", features = ["net", "rt-multi-thread", "macros", "io-util", "sync", "time", "process", "signal"] }
 tracing = "0.1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+subc-cgroup = { path = "../subc-cgroup" }
 
 [dev-dependencies]
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

@@ -1,0 +1,13 @@
+[package]
+name = "subc-cgroup"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Linux cgroup placement for supervised subc module children."
+
+[dependencies]
+tokio = { version = "1", features = ["macros", "process", "rt-multi-thread", "time"] }
+
+[lints.rust]
+unsafe_code = "deny"

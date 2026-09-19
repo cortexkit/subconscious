@@ -6,6 +6,7 @@ members = [
     "crates/subc-transport",
     "crates/subc-client-rs",
     "crates/subc-jsonc",
+    "crates/subc-cgroup",
     "crates/subc-core",
     "crates/subc-daemon",
     "crates/subc-daemon/tests/consumer",

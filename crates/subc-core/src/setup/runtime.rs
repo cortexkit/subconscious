@@ -120,7 +120,7 @@ pub fn desired_definition(platform: RuntimePlatform, paths: &RuntimePaths) -> St
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict><key>Label</key><string>cortexkit.subc</string><key>ProgramArguments</key><array><string>{daemon}</string></array><key>RunAtLoad</key><true/></dict></plist>\n"
         ),
         RuntimePlatform::Linux => format!(
-            "[Unit]\nDescription=CortexKit subconscious daemon\n\n[Service]\nExecStart={daemon}\nRestart=on-failure\n\n[Install]\nWantedBy=default.target\n"
+            "[Unit]\nDescription=CortexKit subconscious daemon\n\n[Service]\nExecStart={daemon}\nRestart=on-failure\nDelegate=yes\nDelegateSubgroup=daemon\n\n[Install]\nWantedBy=default.target\n"
         ),
         // The Task Scheduler schema namespace is not decoration: `schtasks
         // /Create /XML` refuses a Task element without it ("contains an
@@ -942,6 +942,21 @@ mod tests {
             }
             assert!(inventory.owns_path("runtime-definition", &paths.definition));
         }
+    }
+
+    #[test]
+    fn linux_runtime_delegates_a_daemon_subgroup_for_module_cgroups() {
+        let paths = runtime_paths(
+            RuntimePlatform::Linux,
+            Path::new("/home/test/bin"),
+            Path::new("/home/test"),
+        );
+        let definition = desired_definition(RuntimePlatform::Linux, &paths);
+
+        assert!(
+            definition.contains("Delegate=yes\nDelegateSubgroup=daemon\n"),
+            "the systemd unit must delegate the daemon's cgroup subtree: {definition}"
+        );
     }
 
     /// `schtasks /Create /XML` accepts the definition only with the Task

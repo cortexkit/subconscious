@@ -24,4 +24,4 @@ tokio = { version = "1", features = ["net", "rt-multi-thread", "macros", "io-uti
 
 [dev-dependencies]
 rmcp = { version = "1.7", default-features = false, features = ["client", "transport-async-rw"] }
-subc-daemon = { path = "../subc-daemon", version = "0.18.15" }
+subc-daemon = { path = "../subc-daemon", version = "0.18.16" }

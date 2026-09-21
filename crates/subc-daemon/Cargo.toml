@@ -34,6 +34,11 @@ tracing = "0.1"
 [target.'cfg(target_os = "linux")'.dependencies]
 subc-cgroup = { path = "../subc-cgroup", version = "0.1.1" }
 
+[target.'cfg(windows)'.dependencies]
+# Job-object containment for module grandchildren (issue #109). A leaf crate
+# because this crate forbids unsafe code and the Win32 calls need it.
+subc-jobobject = { path = "../subc-jobobject" }
+
 [target.'cfg(unix)'.dependencies]
 # SIGTERM for `protocol: "none"` teardown. This crate forbids unsafe code, so
 # `libc::kill` is not reachable from here; rustix wraps the same syscall safely

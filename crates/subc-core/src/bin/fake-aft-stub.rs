@@ -136,6 +136,20 @@ const FAKE_AFT_ORPHAN_WRITER_MODE_ENV: &str = "FAKE_AFT_ORPHAN_WRITER_MODE";
 /// cannot be asked what it did with a signal, and what it does with a signal is
 /// the other half of what these tests need to observe.
 const FAKE_AFT_NEVER_CONNECT_ENV: &str = "FAKE_AFT_NEVER_CONNECT";
+/// Presence marks a GRANDCHILD: park forever, touch nothing else.
+///
+/// The child→grandchild shape a teardown test needs, because a supervision test
+/// that only ever observes the direct child cannot tell a reaped tree from a
+/// leaked helper. Checked before every other arm, since the grandchild must not
+/// dial subc, exit on its own, or register a signal handler.
+const FAKE_AFT_GRANDCHILD_MODE_ENV: &str = "FAKE_AFT_GRANDCHILD_MODE";
+/// Where a parent stub records the pid of the grandchild it spawned.
+///
+/// The PARENT writes this, from the `Child` handle it already holds, rather than
+/// the grandchild reporting itself: a self-report would need the grandchild to
+/// reach a point where it can write, which is a race against the teardown the
+/// test is about to perform.
+const FAKE_AFT_GRANDCHILD_PID_FILE_ENV: &str = "FAKE_AFT_GRANDCHILD_PID_FILE";
 /// Where to write a marker file when SIGTERM arrives, just before exiting 0.
 ///
 /// The marker is the witness that the supervisor ASKED before it forced: the
@@ -255,6 +269,12 @@ async fn main() -> Result<(), StubError> {
     // never dialled subc either. Checking first also means a connect/HELLO
     // failure can never land its own noise in the very stderr ring this knob
     // is configured to control.
+    if env_flag(FAKE_AFT_GRANDCHILD_MODE_ENV) {
+        // A grandchild does nothing but exist: no subc dial, no exit, no signal
+        // handler. Its whole purpose is to be a process the teardown must reach.
+        std::future::pending::<()>().await;
+        unreachable!("a pending future never resolves");
+    }
     if env_flag(FAKE_AFT_ORPHAN_WRITER_MODE_ENV) {
         return run_detached_orphan_writer().await;
     }
@@ -310,6 +330,7 @@ async fn run_never_connect() -> Result<(), StubError> {
     }
 
     announce_never_connect_ready()?;
+    spawn_grandchild_if_requested()?;
 
     // Park. The supervisor's teardown -- signal, or the kill behind it -- is what
     // ends this process; nothing here decides to stop on its own, because a test
@@ -333,6 +354,30 @@ fn write_pid_file(path: &Path) -> io::Result<()> {
     let temporary = PathBuf::from(temporary);
     fs::write(&temporary, pid.to_string())?;
     fs::rename(&temporary, path)
+}
+
+/// Spawn a grandchild and record its pid, when the run asks for one.
+///
+/// The pid is written from HERE, out of the `Child` handle, so the test can
+/// address the grandchild without racing its startup. The `Child` is
+/// deliberately dropped rather than kept: `std::process::Child` closes its handle
+/// on drop and does not wait, so the grandchild keeps running while the parent
+/// holds nothing that would keep the process object alive past its death.
+fn spawn_grandchild_if_requested() -> Result<(), StubError> {
+    let Ok(pid_file) = env::var(FAKE_AFT_GRANDCHILD_PID_FILE_ENV) else {
+        return Ok(());
+    };
+    let exe = env::current_exe().map_err(StubError::Io)?;
+    let grandchild = Command::new(exe)
+        .env(FAKE_AFT_GRANDCHILD_MODE_ENV, "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(StubError::Io)?;
+    fs::write(&pid_file, grandchild.id().to_string()).map_err(StubError::Io)?;
+    drop(grandchild);
+    Ok(())
 }
 
 fn announce_never_connect_ready() -> Result<(), StubError> {

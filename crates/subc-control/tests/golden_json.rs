@@ -5,8 +5,9 @@ use serde_json::Value;
 use subc_control::{
     CatalogEntry, ClientControlPush, ClientControlRequest, ClientControlResponse, ConsumerIdentity,
     DaemonBuildProvenance, DaemonObservedProcess, LiveSpawn, ModuleDeclaredProvenance,
-    ModuleProtocol, NotReadyReason, PollKind, RouteCloseReason, RunningImageAgreement,
-    RunningImageEvidence, SpawnCursor, SpawnEvent, SpawnEventKind, SpawnSnapshot,
+    ModuleProtocol, NotReadyReason, PendingReloadVerdict, PollKind, ReloadPathAgreement,
+    ReloadPathUnavailableReason, RouteCloseReason, RunningImageAgreement, RunningImageEvidence,
+    RunningImageUnavailableReason, SpawnCursor, SpawnEvent, SpawnEventKind, SpawnSnapshot,
     StderrCaptureState, StderrTail, StderrTailEntry, SupervisorDaemonProvenance, SupervisorEntry,
     SupervisorHealthEntry, SupervisorHealthStatus, SupervisorModuleProvenance,
     SupervisorObservedProcess, SupervisorRescanResult, SupervisorRoute, SupervisorRouteConsumer,
@@ -74,6 +75,51 @@ fn control_wire_shapes_match_golden_json_and_round_trip() {
         },
     );
     assert_golden("supervisor_entry", &supervisor_entry());
+    let evidence = |digest: &str| RunningImageEvidence::LinuxProcSha256 {
+        digest: digest.to_string(),
+    };
+    let verdicts = [
+        PendingReloadVerdict {
+            path: ReloadPathAgreement::Mismatch {
+                configured: "/bin/new".into(),
+                spawned_from: "/bin/old".into(),
+            },
+            image: RunningImageAgreement::Match {
+                evidence: evidence("old"),
+            },
+        },
+        PendingReloadVerdict {
+            path: ReloadPathAgreement::Match,
+            image: RunningImageAgreement::Mismatch {
+                running: evidence("old"),
+                disk: evidence("new"),
+            },
+        },
+        PendingReloadVerdict {
+            path: ReloadPathAgreement::Unavailable {
+                reason: ReloadPathUnavailableReason::NotRunning,
+            },
+            image: RunningImageAgreement::Unavailable {
+                reason: RunningImageUnavailableReason::NotRunning,
+            },
+        },
+        PendingReloadVerdict {
+            path: ReloadPathAgreement::Match,
+            image: RunningImageAgreement::Match {
+                evidence: evidence("same"),
+            },
+        },
+    ];
+    assert_golden(
+        "supervisor_entry_reload_verdict_states",
+        &verdicts
+            .into_iter()
+            .map(|verdict| SupervisorEntry {
+                pending_reload: Some(verdict),
+                ..supervisor_entry()
+            })
+            .collect::<Vec<_>>(),
+    );
     assert_golden(
         "supervisor_spawn_event",
         &SpawnEvent {
@@ -891,6 +937,7 @@ fn supervisor_entry() -> SupervisorEntry {
         live: true,
         protocol: ModuleProtocol::Subc,
         health: SupervisorHealthStatus::Degraded,
+        pending_reload: None,
         last_probe_ms: Some(1_700_000_000_000),
         last_exit_code: None,
         last_exit_signal: None,
@@ -911,6 +958,31 @@ fn supervisor_entry() -> SupervisorEntry {
         restart_backoff_ms: None,
         restart_max_backoff_ms: None,
     }
+}
+
+#[test]
+fn supervisor_entry_without_reload_verdict_is_unknown_not_clear() {
+    let entry: SupervisorEntry = serde_json::from_str(
+        r#"{"module_id":"legacy","state":"running","enabled":true,"live":true,"health":"unknown"}"#,
+    )
+    .expect("old daemon supervisor entry decodes");
+    assert_eq!(entry.pending_reload, None);
+}
+
+#[test]
+fn reload_path_unknown_variant_and_reason_preserve_forward_wire() {
+    let future = serde_json::json!({
+        "path": {"status": "future_path", "detail": {"x": 1}},
+        "image": {"status": "unavailable", "reason": "future_probe"}
+    });
+    let decoded: PendingReloadVerdict = serde_json::from_value(future.clone()).unwrap();
+    assert!(
+        matches!(decoded.path, ReloadPathAgreement::Unknown { ref tag, .. } if tag == "future_path")
+    );
+    assert!(
+        matches!(decoded.image, RunningImageAgreement::Unavailable { reason: RunningImageUnavailableReason::Unknown(ref reason) } if reason == "future_probe")
+    );
+    assert_eq!(serde_json::to_value(decoded).unwrap(), future);
 }
 
 /// The windowed budget on the wire: the same count and cap, plus the span they

@@ -1,0 +1,102 @@
+[
+  {
+    "enabled": true,
+    "health": "degraded",
+    "last_exit_ms": 1700000000123,
+    "last_probe_ms": 1700000000000,
+    "live": true,
+    "max_restarts": 3,
+    "module_id": "aft-tools",
+    "pending_reload": {
+      "image": {
+        "evidence": {
+          "digest": "old",
+          "method": "linux_proc_sha256"
+        },
+        "status": "match"
+      },
+      "path": {
+        "configured": "/bin/new",
+        "spawned_from": "/bin/old",
+        "status": "mismatch"
+      }
+    },
+    "protocol": "subc",
+    "restart_count": 2,
+    "state": "running"
+  },
+  {
+    "enabled": true,
+    "health": "degraded",
+    "last_exit_ms": 1700000000123,
+    "last_probe_ms": 1700000000000,
+    "live": true,
+    "max_restarts": 3,
+    "module_id": "aft-tools",
+    "pending_reload": {
+      "image": {
+        "disk": {
+          "digest": "new",
+          "method": "linux_proc_sha256"
+        },
+        "running": {
+          "digest": "old",
+          "method": "linux_proc_sha256"
+        },
+        "status": "mismatch"
+      },
+      "path": {
+        "status": "match"
+      }
+    },
+    "protocol": "subc",
+    "restart_count": 2,
+    "state": "running"
+  },
+  {
+    "enabled": true,
+    "health": "degraded",
+    "last_exit_ms": 1700000000123,
+    "last_probe_ms": 1700000000000,
+    "live": true,
+    "max_restarts": 3,
+    "module_id": "aft-tools",
+    "pending_reload": {
+      "image": {
+        "reason": "not_running",
+        "status": "unavailable"
+      },
+      "path": {
+        "reason": "not_running",
+        "status": "unavailable"
+      }
+    },
+    "protocol": "subc",
+    "restart_count": 2,
+    "state": "running"
+  },
+  {
+    "enabled": true,
+    "health": "degraded",
+    "last_exit_ms": 1700000000123,
+    "last_probe_ms": 1700000000000,
+    "live": true,
+    "max_restarts": 3,
+    "module_id": "aft-tools",
+    "pending_reload": {
+      "image": {
+        "evidence": {
+          "digest": "same",
+          "method": "linux_proc_sha256"
+        },
+        "status": "match"
+      },
+      "path": {
+        "status": "match"
+      }
+    },
+    "protocol": "subc",
+    "restart_count": 2,
+    "state": "running"
+  }
+]

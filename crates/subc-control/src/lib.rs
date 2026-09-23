@@ -609,6 +609,39 @@ pub struct SupervisorObservedProcess {
     pub running_image: RunningImageAgreement,
 }
 
+/// Independent comparisons of configured path and running image at list time.
+/// An absent verdict means the daemon predates this field, not agreement.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PendingReloadVerdict {
+    pub path: ReloadPathAgreement,
+    pub image: RunningImageAgreement,
+}
+
+/// Whether the running process was spawned from the currently configured program.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ReloadPathAgreement {
+    Match,
+    Mismatch {
+        configured: PathBuf,
+        spawned_from: PathBuf,
+    },
+    Unavailable {
+        reason: ReloadPathUnavailableReason,
+    },
+    Unknown {
+        tag: String,
+        body: OrderedJsonObject,
+    },
+}
+
+open_string_enum! {
+    /// Why configured and spawned paths cannot be compared.
+    ReloadPathUnavailableReason {
+        NotRunning => "not_running",
+        SpawnedPathUnavailable => "spawned_path_unavailable",
+    }
+}
+
 /// Daemon provenance paired with its runtime process observation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SupervisorDaemonProvenance {
@@ -776,6 +809,19 @@ enum RunningImageAgreementWire {
     },
     Unavailable {
         reason: RunningImageUnavailableReason,
+    },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum ReloadPathAgreementWire {
+    Match,
+    Mismatch {
+        configured: PathBuf,
+        spawned_from: PathBuf,
+    },
+    Unavailable {
+        reason: ReloadPathUnavailableReason,
     },
 }
 
@@ -1181,6 +1227,61 @@ impl Serialize for RunningImageAgreement {
             }
             .serialize(serializer),
             Self::Unknown { body, .. } => body.serialize(serializer),
+        }
+    }
+}
+
+impl Serialize for ReloadPathAgreement {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Match => ReloadPathAgreementWire::Match.serialize(serializer),
+            Self::Mismatch {
+                configured,
+                spawned_from,
+            } => ReloadPathAgreementWire::Mismatch {
+                configured: configured.clone(),
+                spawned_from: spawned_from.clone(),
+            }
+            .serialize(serializer),
+            Self::Unavailable { reason } => ReloadPathAgreementWire::Unavailable {
+                reason: reason.clone(),
+            }
+            .serialize(serializer),
+            Self::Unknown { body, .. } => body.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ReloadPathAgreement {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let (tag, body) = read_tagged(deserializer, "status")?;
+        match tag.as_str() {
+            "match" => Ok(Self::Match),
+            "mismatch" => {
+                match serde_json::from_value(body.into_value()).map_err(D::Error::custom)? {
+                    ReloadPathAgreementWire::Mismatch {
+                        configured,
+                        spawned_from,
+                    } => Ok(Self::Mismatch {
+                        configured,
+                        spawned_from,
+                    }),
+                    _ => unreachable!(),
+                }
+            }
+            "unavailable" => match serde_json::from_value(body.into_value())
+                .map_err(D::Error::custom)?
+            {
+                ReloadPathAgreementWire::Unavailable { reason } => Ok(Self::Unavailable { reason }),
+                _ => unreachable!(),
+            },
+            _ => Ok(Self::Unknown { tag, body }),
         }
     }
 }
@@ -1708,7 +1809,7 @@ pub enum ModuleProtocol {
     None,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SupervisorEntry {
     pub module_id: String,
     pub state: String,
@@ -1729,6 +1830,10 @@ pub struct SupervisorEntry {
     #[serde(default)]
     pub protocol: ModuleProtocol,
     pub health: SupervisorHealthStatus,
+    /// Computed from the stored launch spec and observed process at list time;
+    /// None means an older daemon did not report this comparison.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_reload: Option<PendingReloadVerdict>,
     /// When the daemon last collected this module's health, as unix
     /// milliseconds. Absent means NEVER PROBED (a module inside its first probe
     /// window, whose `health` is therefore `Unknown` rather than good), not

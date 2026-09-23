@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fmt,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, Instant as StdInstant},
 };
@@ -10,9 +10,10 @@ use serde::{Deserialize, Serialize};
 use subc_control::{
     ops, CapabilityRequirementStatus, CatalogEntry, ClientControlPush, ClientControlRequest,
     ClientControlResponse, ConsumerIdentity, DaemonBuildProvenance, DaemonObservedProcess,
-    ModuleDeclaredProvenance, ModuleProtocol, NotReadyReason, PollKind, RouteCloseReason,
-    SpawnCursor, StderrCaptureState, StderrTail, StderrTailEntry, SupervisorDaemonProvenance,
-    SupervisorEntry, SupervisorHealthEntry, SupervisorModuleProvenance, SupervisorObservedProcess,
+    ModuleDeclaredProvenance, ModuleProtocol, NotReadyReason, PendingReloadVerdict, PollKind,
+    ReloadPathAgreement, ReloadPathUnavailableReason, RouteCloseReason, SpawnCursor,
+    StderrCaptureState, StderrTail, StderrTailEntry, SupervisorDaemonProvenance, SupervisorEntry,
+    SupervisorHealthEntry, SupervisorModuleProvenance, SupervisorObservedProcess,
     SupervisorRescanResult, SupervisorRoute, SupervisorRouteConsumer, SupervisorRouteModule,
 };
 use subc_protocol::{
@@ -150,6 +151,33 @@ pub const DEFAULT_ROUTE_BIND_BREAKER_COOLDOWN: Duration = Duration::from_secs(20
 
 const DEFAULT_HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const SLOW_CONTROL_DISPATCH_THRESHOLD: Duration = Duration::from_secs(1);
+
+fn reload_verdict(
+    configured: &Path,
+    spawned_from: Option<&Path>,
+    image: subc_control::RunningImageAgreement,
+) -> PendingReloadVerdict {
+    let path = match spawned_from {
+        Some(spawned_from) if configured == spawned_from => ReloadPathAgreement::Match,
+        Some(spawned_from) => ReloadPathAgreement::Mismatch {
+            configured: configured.to_path_buf(),
+            spawned_from: spawned_from.to_path_buf(),
+        },
+        None => ReloadPathAgreement::Unavailable {
+            reason: if matches!(
+                image,
+                subc_control::RunningImageAgreement::Unavailable {
+                    reason: subc_control::RunningImageUnavailableReason::NotRunning
+                }
+            ) {
+                ReloadPathUnavailableReason::NotRunning
+            } else {
+                ReloadPathUnavailableReason::SpawnedPathUnavailable
+            },
+        },
+    };
+    PendingReloadVerdict { path, image }
+}
 
 #[derive(Clone)]
 struct DaemonProvenanceFacts {
@@ -2017,7 +2045,7 @@ impl ControlHandler {
                 route_epoch,
                 kind,
             } => self.handle_route_poll(ctx, frame, route_channel, route_epoch, kind),
-            ClientControlRequest::SupervisorList {} => self.handle_supervisor_list(frame),
+            ClientControlRequest::SupervisorList {} => self.handle_supervisor_list(frame).await,
             ClientControlRequest::SupervisorSpawnSnapshot {} => {
                 self.handle_supervisor_spawn_snapshot(frame)
             }
@@ -3198,46 +3226,57 @@ impl ControlHandler {
         }
     }
 
-    fn handle_supervisor_list(&self, frame: Frame) -> Result<Vec<Frame>, RouterError> {
+    async fn handle_supervisor_list(&self, frame: Frame) -> Result<Vec<Frame>, RouterError> {
         let generation = self
             .registry
             .generation()
             .map_err(|err| RouterError::backend(0, frame.header.corr, err.to_string()))?;
-        let modules = self
-            .supervisor
-            .list()
-            .into_iter()
-            .map(|module| {
-                let status = module.status_for_control("list").map_err(|err| {
-                    RouterError::backend(
-                        0,
-                        frame.header.corr,
-                        format!("failed to read supervisor status: {err}"),
-                    )
-                })?;
-                Ok(SupervisorEntry {
-                    module_id: status.module_id,
-                    state: status.state.to_string(),
-                    enabled: status.enabled,
-                    live: status.live,
-                    protocol: status.protocol,
-                    health: status.health.status,
-                    last_probe_ms: status.health.last_probe_ms,
-                    last_exit_code: status.last_exit.as_ref().and_then(|e| e.code),
-                    last_exit_signal: status.last_exit.as_ref().and_then(|e| e.signal),
-                    last_exit_ms: status.last_exit.as_ref().map(|e| e.at_ms),
-                    last_exit_kind: status.last_exit.as_ref().map(|e| e.kind.into()),
-                    restart_count: Some(status.restart_count),
-                    max_restarts: Some(status.max_restarts),
-                    lifetime_restarts: Some(status.lifetime_restarts),
-                    spawn_generation: Some(status.spawn_generation),
-                    restart_window_secs: Some(status.restart_window.as_secs()),
-                    drain_timeout_ms: Some(status.drain_timeout.as_millis() as u64),
-                    restart_backoff_ms: Some(status.restart_backoff.as_millis() as u64),
-                    restart_max_backoff_ms: Some(status.restart_max_backoff.as_millis() as u64),
-                })
-            })
-            .collect::<Result<Vec<_>, RouterError>>()?;
+        let mut modules = Vec::new();
+        for module in self.supervisor.list() {
+            let status = module.status_for_control("list").map_err(|err| {
+                RouterError::backend(
+                    0,
+                    frame.header.corr,
+                    format!("failed to read supervisor status: {err}"),
+                )
+            })?;
+            let (configured, _) = module.configuration().map_err(|err| {
+                RouterError::backend(
+                    0,
+                    frame.header.corr,
+                    format!("failed to read module configuration: {err}"),
+                )
+            })?;
+            // Status and configuration snapshots release their locks before the image probe awaits.
+            let image = module.running_image_agreement().await;
+            let pending_reload = Some(reload_verdict(
+                &configured.program,
+                status.spawned_from.as_deref(),
+                image,
+            ));
+            modules.push(SupervisorEntry {
+                module_id: status.module_id,
+                state: status.state.to_string(),
+                enabled: status.enabled,
+                live: status.live,
+                protocol: status.protocol,
+                health: status.health.status,
+                pending_reload,
+                last_probe_ms: status.health.last_probe_ms,
+                last_exit_code: status.last_exit.as_ref().and_then(|e| e.code),
+                last_exit_signal: status.last_exit.as_ref().and_then(|e| e.signal),
+                last_exit_ms: status.last_exit.as_ref().map(|e| e.at_ms),
+                last_exit_kind: status.last_exit.as_ref().map(|e| e.kind.into()),
+                restart_count: Some(status.restart_count),
+                max_restarts: Some(status.max_restarts),
+                lifetime_restarts: Some(status.lifetime_restarts),
+                spawn_generation: Some(status.spawn_generation),
+                restart_window_secs: Some(status.restart_window.as_secs()),
+                drain_timeout_ms: Some(status.drain_timeout.as_millis() as u64),
+                restart_backoff_ms: Some(status.restart_backoff.as_millis() as u64),
+                restart_max_backoff_ms: Some(status.restart_max_backoff.as_millis() as u64),
+            });
+        }
         let response = ClientControlResponse::SupervisorList {
             generation,
             modules,
@@ -9334,6 +9373,94 @@ mod tests {
         };
         let handler = ControlHandler::default().with_provenance_probe_result(expected.clone());
         assert_eq!(handler.provenance_probe_override, Some(expected));
+    }
+
+    #[test]
+    fn reload_verdict_detects_configured_program_different_from_spawned_path() {
+        let verdict = reload_verdict(
+            std::path::Path::new("/bin/new"),
+            Some(std::path::Path::new("/bin/old")),
+            subc_control::RunningImageAgreement::Unavailable {
+                reason: subc_control::RunningImageUnavailableReason::HashFailed,
+            },
+        );
+        assert!(matches!(
+            verdict.path,
+            subc_control::ReloadPathAgreement::Mismatch { configured, spawned_from }
+                if configured == std::path::Path::new("/bin/new")
+                    && spawned_from == std::path::Path::new("/bin/old")
+        ));
+    }
+
+    #[test]
+    fn reload_verdict_detects_replaced_image_at_same_path() {
+        let image = subc_control::RunningImageAgreement::Mismatch {
+            running: subc_control::RunningImageEvidence::LinuxProcSha256 {
+                digest: "old".into(),
+            },
+            disk: subc_control::RunningImageEvidence::LinuxProcSha256 {
+                digest: "new".into(),
+            },
+        };
+        let verdict = reload_verdict(
+            std::path::Path::new("/bin/same"),
+            Some(std::path::Path::new("/bin/same")),
+            image.clone(),
+        );
+        assert_eq!(verdict.path, subc_control::ReloadPathAgreement::Match);
+        assert_eq!(verdict.image, image);
+    }
+
+    #[test]
+    fn reload_verdict_preserves_stopped_and_unavailable_reasons() {
+        let image = subc_control::RunningImageAgreement::Unavailable {
+            reason: subc_control::RunningImageUnavailableReason::NotRunning,
+        };
+        let verdict = reload_verdict(std::path::Path::new("/bin/same"), None, image.clone());
+        assert_eq!(
+            verdict.path,
+            subc_control::ReloadPathAgreement::Unavailable {
+                reason: subc_control::ReloadPathUnavailableReason::NotRunning,
+            }
+        );
+        assert_eq!(verdict.image, image);
+
+        let unconfirmed = subc_control::RunningImageAgreement::Unavailable {
+            reason: subc_control::RunningImageUnavailableReason::ProcessIdentityUnconfirmed,
+        };
+        let verdict = reload_verdict(
+            std::path::Path::new("/bin/same"),
+            Some(std::path::Path::new("/bin/same")),
+            unconfirmed.clone(),
+        );
+        assert_eq!(verdict.path, subc_control::ReloadPathAgreement::Match);
+        assert_eq!(verdict.image, unconfirmed);
+    }
+
+    #[test]
+    fn reload_verdict_preserves_each_image_unavailability_reason() {
+        use subc_control::RunningImageUnavailableReason as Reason;
+
+        for reason in [
+            Reason::NotRunning,
+            Reason::UnsupportedPlatform,
+            Reason::RunningExecutableUnreadable,
+            Reason::SpawnedPathUnreadable,
+            Reason::HashFailed,
+            Reason::ProcessIdentityUnconfirmed,
+            Reason::Unknown("future_probe_reason".to_string()),
+        ] {
+            let image = subc_control::RunningImageAgreement::Unavailable {
+                reason: reason.clone(),
+            };
+            let verdict = reload_verdict(
+                std::path::Path::new("/bin/same"),
+                Some(std::path::Path::new("/bin/same")),
+                image.clone(),
+            );
+            assert_eq!(verdict.path, subc_control::ReloadPathAgreement::Match);
+            assert_eq!(verdict.image, image, "{reason:?}");
+        }
     }
 
     #[tokio::test]

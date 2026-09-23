@@ -5608,15 +5608,19 @@ fn print_module_table(modules: &[Value], verbose: bool) {
             .iter()
             .map(|module| {
                 vec![
-                    display_field(module, "module_id"),
-                    display_field(module, "state"),
+                    terminal_safe_string(&display_field(module, "module_id")),
+                    terminal_safe_string(&display_field(module, "state")),
                     enabled_word(module.get("enabled").and_then(Value::as_bool)),
                     live_word(module),
-                    human_health_status(&display_field(module, "health")),
+                    terminal_safe_string(&human_health_status(&display_field(module, "health"))),
+                    reload_list_marker(module).to_string(),
                 ]
             })
             .collect::<Vec<_>>();
-        print_table(&["module", "state", "enabled", "live", "health"], rows);
+        print_table(
+            &["module", "state", "enabled", "live", "health", "reload"],
+            rows,
+        );
         return;
     }
 
@@ -5624,13 +5628,105 @@ fn print_module_table(modules: &[Value], verbose: bool) {
         .iter()
         .map(|module| {
             vec![
-                display_field(module, "module_id"),
-                module_status_text(module),
-                human_health_status(&display_field(module, "health")),
+                terminal_safe_string(&display_field(module, "module_id")),
+                terminal_safe_string(&module_status_text(module)),
+                terminal_safe_string(&human_health_status(&display_field(module, "health"))),
+                reload_list_marker(module).to_string(),
             ]
         })
         .collect::<Vec<_>>();
-    print_table(&["module", "status", "health"], rows);
+    print_table(&["module", "status", "health", "reload"], rows);
+}
+
+fn reload_list_marker(module: &Value) -> &'static str {
+    let Some(verdict) = module.get("pending_reload") else {
+        return "unknown";
+    };
+    let path = verdict.pointer("/path/status").and_then(Value::as_str);
+    let image = verdict.pointer("/image/status").and_then(Value::as_str);
+    let image_reason = verdict.pointer("/image/reason").and_then(Value::as_str);
+    match (path, image, image_reason) {
+        (Some("mismatch"), Some("mismatch"), _) => "pending (path+image)",
+        (Some("mismatch"), _, _) => "pending (path)",
+        (Some("match"), Some("mismatch"), _) => "pending (image)",
+        (Some("match"), Some("match"), _) => "nothing",
+        (Some("match"), Some("unavailable"), Some("unsupported_platform")) => "nothing (image n/a)",
+        _ => "unknown",
+    }
+}
+
+fn print_reload_verdict(module: &Value) {
+    let Some(verdict) = module.get("pending_reload") else {
+        println!("  pending reload: unknown (daemon did not report a verdict)");
+        return;
+    };
+    let path = verdict.get("path");
+    let path_status = path
+        .and_then(|value| value.get("status"))
+        .and_then(Value::as_str);
+    match path_status {
+        Some("mismatch") => println!(
+            "  configured program: pending reload (configured {}, running from {})",
+            path.and_then(|value| value.get("configured"))
+                .and_then(Value::as_str)
+                .map(terminal_safe_string)
+                .unwrap_or_else(|| "unknown".into()),
+            path.and_then(|value| value.get("spawned_from"))
+                .and_then(Value::as_str)
+                .map(terminal_safe_string)
+                .unwrap_or_else(|| "unknown".into()),
+        ),
+        Some("match") => println!("  configured program: matches running process"),
+        Some("unavailable") => println!(
+            "  configured program: unknown ({})",
+            path.and_then(|value| value.get("reason"))
+                .and_then(Value::as_str)
+                .map(terminal_safe_string)
+                .unwrap_or_else(|| "reason unavailable".into()),
+        ),
+        _ => println!(
+            "  configured program: unknown ({})",
+            terminal_safe_string(path_status.unwrap_or("missing status"))
+        ),
+    }
+    println!(
+        "  running image: {}",
+        image_reload_sentence(verdict.get("image"))
+    );
+}
+
+fn image_reload_sentence(image: Option<&Value>) -> String {
+    let image_status = image
+        .and_then(|value| value.get("status"))
+        .and_then(Value::as_str);
+    match image_status {
+        Some("mismatch") => "pending reload (file at spawned path changed since spawn)".to_string(),
+        Some("match") => "matches file at spawned path".to_string(),
+        Some("unavailable")
+            if image
+                .and_then(|value| value.get("reason"))
+                .and_then(Value::as_str)
+                == Some("unsupported_platform") =>
+        {
+            "not checked on this platform (unsupported_platform)".to_string()
+        }
+        Some("unavailable") => format!(
+            "unknown ({})",
+            image
+                .and_then(|value| value.get("reason"))
+                .and_then(Value::as_str)
+                .map(terminal_safe_string)
+                .unwrap_or_else(|| "reason unavailable".into()),
+        ),
+        _ => format!(
+            "unknown ({})",
+            terminal_safe_string(image_status.unwrap_or("missing status"))
+        ),
+    }
+}
+
+fn preview_rescan_changed_label() -> &'static str {
+    "would change (pending reload)"
 }
 
 fn print_rescan_table(result: &Value) {
@@ -5650,6 +5746,7 @@ fn print_rescan_table(result: &Value) {
             .map(|ids| {
                 ids.iter()
                     .filter_map(Value::as_str)
+                    .map(terminal_safe_string)
                     .collect::<Vec<_>>()
                     .join(", ")
             })
@@ -5663,7 +5760,13 @@ fn print_rescan_table(result: &Value) {
     let warnings = result
         .get("capability_warnings")
         .and_then(Value::as_array)
-        .map(|items| items.iter().filter_map(Value::as_str).collect::<Vec<_>>())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(terminal_safe_string)
+                .collect::<Vec<_>>()
+        })
         .unwrap_or_default();
 
     if added.is_none()
@@ -5688,14 +5791,7 @@ fn print_rescan_table(result: &Value) {
         );
     }
     if let Some(ids) = changed {
-        println!(
-            "{}: {ids}",
-            if preview {
-                "would restart"
-            } else {
-                "restarted"
-            }
-        );
+        println!("{}: {ids}", preview_rescan_changed_label());
     }
     if let Some(ids) = enabled {
         println!(
@@ -5724,6 +5820,7 @@ fn print_applied_rescan_table(result: &Value) {
             .map(|ids| {
                 ids.iter()
                     .filter_map(Value::as_str)
+                    .map(terminal_safe_string)
                     .collect::<Vec<_>>()
                     .join(", ")
             })
@@ -5748,9 +5845,19 @@ fn print_applied_rescan_table(result: &Value) {
         ],
     ];
     print_table(&["change", "modules / count"], rows);
+    if let Some(changed) = result
+        .get("changed_pending_reload")
+        .and_then(Value::as_array)
+    {
+        if !changed.is_empty() {
+            println!(
+                "restart deferred; apply with `ck module restart <id>` for each changed module"
+            );
+        }
+    }
     if let Some(warnings) = result.get("capability_warnings").and_then(Value::as_array) {
         for warning in warnings.iter().filter_map(Value::as_str) {
-            println!("warning: {warning}");
+            println!("warning: {}", terminal_safe_string(warning));
         }
     }
     let restart_required = module_ids("restart_required");
@@ -5767,15 +5874,15 @@ fn print_status_table(
     observed: Option<&Value>,
     verbose: bool,
 ) {
-    let module_id = display_field(module, "module_id");
+    let module_id = terminal_safe_string(&display_field(module, "module_id"));
     let health_status = health
         .map(|entry| display_field(entry, "status"))
         .filter(|value| value != "-")
         .unwrap_or_else(|| display_field(module, "health"));
     println!(
         "{module_id} — {}, {}",
-        module_status_text(module),
-        health_sentence_status(&health_status)
+        terminal_safe_string(&module_status_text(module)),
+        terminal_safe_string(&health_sentence_status(&health_status))
     );
 
     let pid = observed
@@ -5806,13 +5913,14 @@ fn print_status_table(
     let binary = observed
         .and_then(|value| value.get("spawned_from"))
         .and_then(Value::as_str)
-        .map(|path| display_home_path(Path::new(path)))
+        .map(|path| terminal_safe_string(&display_home_path(Path::new(path))))
         .unwrap_or_else(|| "none".to_string());
     let image = observed
         .and_then(|value| value.get("running_image"))
         .map(running_image_clause)
         .unwrap_or_else(|| "running image status unknown".to_string());
     println!("  binary: {binary} ({image})");
+    print_reload_verdict(module);
     if health_status != "ok" {
         if let Some(detail) = health.and_then(health_operator_detail) {
             println!("  health: {detail}");
@@ -7577,6 +7685,106 @@ mod tests {
             super::terminal_disposition_label(&serde_json::json!({})),
             "unknown"
         );
+    }
+
+    #[test]
+    fn rescan_preview_changed_label_pairs_with_deferred_apply_label() {
+        let preview = preview_rescan_changed_label();
+        assert_eq!(preview, "would change (pending reload)");
+        assert!(!preview.contains("restart"));
+        let applied = "changed-pending-reload";
+        assert!(applied.contains("pending-reload"));
+    }
+
+    #[test]
+    fn reload_list_marker_distinguishes_path_image_unknown_and_clear() {
+        let path = serde_json::json!({"pending_reload": {"path": {"status":"mismatch", "configured":"/new", "spawned_from":"/old"}, "image": {"status":"unavailable", "reason":"hash_failed"}}});
+        assert_eq!(reload_list_marker(&path), "pending (path)");
+        let image = serde_json::json!({"pending_reload": {"path": {"status":"match"}, "image": {"status":"mismatch"}}});
+        assert_eq!(reload_list_marker(&image), "pending (image)");
+        let unknown = serde_json::json!({"pending_reload": {"path": {"status":"unavailable", "reason":"not_running"}, "image": {"status":"unavailable", "reason":"not_running"}}});
+        assert_eq!(reload_list_marker(&unknown), "unknown");
+        assert_eq!(reload_list_marker(&serde_json::json!({})), "unknown");
+        let clear = serde_json::json!({"pending_reload": {"path": {"status":"match"}, "image": {"status":"match"}}});
+        assert_eq!(reload_list_marker(&clear), "nothing");
+    }
+
+    #[test]
+    fn reload_list_marker_keeps_every_unavailable_image_unknown() {
+        for reason in [
+            "not_running",
+            "running_executable_unreadable",
+            "spawned_path_unreadable",
+            "hash_failed",
+            "process_identity_unconfirmed",
+            "unsupported_platform_next",
+            "future_probe_reason",
+        ] {
+            let module = serde_json::json!({"pending_reload": {
+                "path": {"status": "match"},
+                "image": {"status": "unavailable", "reason": reason},
+            }});
+            assert_eq!(reload_list_marker(&module), "unknown", "{reason}");
+            let sentence = image_reload_sentence(module.pointer("/pending_reload/image"));
+            assert_eq!(sentence, format!("unknown ({reason})"));
+        }
+    }
+
+    #[test]
+    fn reload_list_marker_keeps_future_image_unavailability_unknown() {
+        let module = serde_json::json!({"pending_reload": {
+            "path": {"status": "match"},
+            "image": {"status": "unavailable", "reason": "future_probe_reason"},
+        }});
+        assert_eq!(reload_list_marker(&module), "unknown");
+        assert_eq!(
+            image_reload_sentence(module.pointer("/pending_reload/image")),
+            "unknown (future_probe_reason)"
+        );
+    }
+
+    #[test]
+    fn reload_list_marker_keeps_pending_path_when_image_unavailable() {
+        let module = serde_json::json!({"pending_reload": {
+            "path": {"status": "mismatch", "configured": "/new", "spawned_from": "/old"},
+            "image": {"status": "unavailable", "reason": "unsupported_platform"},
+        }});
+        assert_eq!(reload_list_marker(&module), "pending (path)");
+        assert_eq!(
+            image_reload_sentence(module.pointer("/pending_reload/image")),
+            "not checked on this platform (unsupported_platform)"
+        );
+    }
+
+    #[test]
+    fn reload_list_marker_reports_image_not_supported_when_path_matches() {
+        let module = serde_json::json!({"pending_reload": {
+            "path": {"status": "match"},
+            "image": {"status": "unavailable", "reason": "unsupported_platform"},
+        }});
+        assert_eq!(reload_list_marker(&module), "nothing (image n/a)");
+        assert_eq!(
+            image_reload_sentence(module.pointer("/pending_reload/image")),
+            "not checked on this platform (unsupported_platform)"
+        );
+    }
+
+    #[test]
+    fn reload_list_marker_keeps_unknown_path_when_image_not_supported() {
+        let module = serde_json::json!({"pending_reload": {
+            "path": {"status": "unavailable", "reason": "not_running"},
+            "image": {"status": "unavailable", "reason": "unsupported_platform"},
+        }});
+        assert_eq!(reload_list_marker(&module), "unknown");
+        assert_eq!(
+            image_reload_sentence(module.pointer("/pending_reload/image")),
+            "not checked on this platform (unsupported_platform)"
+        );
+        let image_mismatch = serde_json::json!({"pending_reload": {
+            "path": {"status": "unavailable", "reason": "spawned_path_unavailable"},
+            "image": {"status": "mismatch"},
+        }});
+        assert_eq!(reload_list_marker(&image_mismatch), "unknown");
     }
 
     /// A module keeps its pre-adoption r1 history beside its r2 segments, so the

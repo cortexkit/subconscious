@@ -8,8 +8,8 @@ use std::{
 
 use serde_json::{json, Value};
 use subc_control::{
-    ClientControlRequest, ClientControlResponse, ConsumerIdentity, SupervisorEntry,
-    SupervisorRescanResult,
+    ClientControlRequest, ClientControlResponse, ConsumerIdentity, ReloadPathAgreement,
+    SupervisorEntry, SupervisorRescanResult,
 };
 use subc_daemon::{
     bootstrap::{run_with_config, run_with_daemon_config_path, BootstrapConfig},
@@ -554,14 +554,109 @@ async fn rescan_changed_spec_is_pending_until_reload_uses_it() {
     let old_route = open_route(&mut old_client, module_id, 501).await;
     let before_pid = call_tool(&mut old_client, old_route, 502, "_test.pid").await;
 
-    let changed = stub_module(
+    let mut changed = stub_module(
         module_id,
         true,
         [("FAKE_AFT_TOOLCALL_RESULT", "after-reload")],
     );
+    let replacement = daemon.temp_dir.join("replacement-fake-aft-stub");
+    fs::copy(env!("CARGO_BIN_EXE_fake-aft-stub"), &replacement).unwrap();
+    changed["program"] = json!(replacement.to_string_lossy());
     fs::write(&daemon.config_path, config_doc([changed])).unwrap();
-    let result = supervisor_rescan(&daemon.connection_file_path, 503).await;
-    assert_eq!(result.changed_pending_reload, [module_id]);
+    let preview = ck_under_test_command()
+        .args(["module", "rescan", "--dry-run", "--subc"])
+        .arg(&daemon.connection_file_path)
+        .output()
+        .unwrap();
+    assert!(
+        preview.status.success(),
+        "{}",
+        String::from_utf8_lossy(&preview.stderr)
+    );
+    let preview_text = String::from_utf8(preview.stdout).unwrap();
+    assert!(
+        preview_text.contains("would change (pending reload)"),
+        "{preview_text}"
+    );
+    assert!(!preview_text.contains("would restart"), "{preview_text}");
+    let applied = ck_under_test_command()
+        .args(["module", "rescan", "--subc"])
+        .arg(&daemon.connection_file_path)
+        .output()
+        .unwrap();
+    assert!(
+        applied.status.success(),
+        "{}",
+        String::from_utf8_lossy(&applied.stderr)
+    );
+    let applied_text = String::from_utf8(applied.stdout).unwrap();
+    assert!(
+        applied_text.contains("changed-pending-reload"),
+        "{applied_text}"
+    );
+    assert!(applied_text.contains(module_id), "{applied_text}");
+    assert!(
+        applied_text.contains("ck module restart <id>"),
+        "{applied_text}"
+    );
+    let pending = wait_for_supervisor_entry(
+        &daemon.connection_file_path,
+        module_id,
+        |entry| {
+            matches!(
+                entry.pending_reload.as_ref().map(|verdict| &verdict.path),
+                Some(ReloadPathAgreement::Mismatch { .. })
+            )
+        },
+        STATE_TIMEOUT,
+    )
+    .await;
+    assert!(
+        matches!(pending.pending_reload.unwrap().path, ReloadPathAgreement::Mismatch { configured, .. } if configured == replacement)
+    );
+    let again = supervisor_rescan(&daemon.connection_file_path, 510).await;
+    assert!(again.changed_pending_reload.is_empty());
+    let still_pending = supervisor_modules(&daemon.connection_file_path, 511).await;
+    assert!(matches!(
+        still_pending
+            .iter()
+            .find(|entry| entry.module_id == module_id)
+            .and_then(|entry| entry.pending_reload.as_ref())
+            .map(|verdict| &verdict.path),
+        Some(ReloadPathAgreement::Mismatch { .. })
+    ));
+    let list = ck_under_test_command()
+        .args(["module", "list", "--subc"])
+        .arg(&daemon.connection_file_path)
+        .output()
+        .unwrap();
+    assert!(
+        list.status.success(),
+        "{}",
+        String::from_utf8_lossy(&list.stderr)
+    );
+    assert!(String::from_utf8(list.stdout)
+        .unwrap()
+        .contains("pending (path)"));
+    let status = ck_under_test_command()
+        .args(["module", "status", module_id, "--subc"])
+        .arg(&daemon.connection_file_path)
+        .output()
+        .unwrap();
+    assert!(
+        status.status.success(),
+        "{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let status_text = String::from_utf8(status.stdout).unwrap();
+    assert!(
+        status_text.contains("configured program: pending reload"),
+        "{status_text}"
+    );
+    assert!(
+        status_text.contains(&replacement.display().to_string()),
+        "{status_text}"
+    );
     assert_eq!(
         call_tool(&mut old_client, old_route, 504, "_test.pid").await,
         before_pid
@@ -584,6 +679,18 @@ async fn rescan_changed_spec_is_pending_until_reload_uses_it() {
         response,
         ClientControlResponse::SupervisorAck { applied: true, .. }
     ));
+    wait_for_supervisor_entry(
+        &daemon.connection_file_path,
+        module_id,
+        |entry| {
+            matches!(
+                entry.pending_reload.as_ref().map(|verdict| &verdict.path),
+                Some(ReloadPathAgreement::Match)
+            )
+        },
+        STATE_TIMEOUT,
+    )
+    .await;
 
     let mut new_client = wait_for_client(&daemon.connection_file_path, START_TIMEOUT).await;
     let new_route = open_route(&mut new_client, module_id, 507).await;

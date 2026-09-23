@@ -1948,10 +1948,12 @@ async fn module_list_json_uses_subc_override_and_shows_stub() {
     let text_output = ck_with_subc(&server.connection_file_path, ["module", "list"]);
     assert_exit(&text_output, 0);
     let text_stdout = text(&text_output.stdout);
-    assert_eq!(
-        text_stdout,
-        "module        status   health \nck-list-stub  running  unknown\n"
-    );
+    let expected_list = if cfg!(any(target_os = "linux", target_os = "macos")) {
+        "module        status   health   reload \nck-list-stub  running  unknown  nothing\n"
+    } else {
+        "module        status   health   reload             \nck-list-stub  running  unknown  nothing (image n/a)\n"
+    };
+    assert_eq!(text_stdout, expected_list);
     assert!(
         !json_stdout.contains("next:"),
         "JSON output must not gain human footer: {json_stdout}"
@@ -1983,12 +1985,63 @@ async fn module_list_renders_status_words_not_wire_booleans() {
 
     let output = ck_with_subc(&server.connection_file_path, ["module", "list"]);
     assert_exit(&output, 0);
-    assert_eq!(
-        text(&output.stdout),
-        "module  status   health  \ninsula  running  degraded\n"
-    );
+    let expected_list = if cfg!(any(target_os = "linux", target_os = "macos")) {
+        "module  status   health    reload \ninsula  running  degraded  nothing\n"
+    } else {
+        "module  status   health    reload             \ninsula  running  degraded  nothing (image n/a)\n"
+    };
+    assert_eq!(text(&output.stdout), expected_list);
     assert!(!text(&output.stdout).contains("true"));
     assert!(!text(&output.stdout).contains("false"));
+
+    module.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn module_list_keeps_configured_path_mismatch_pending_on_every_platform() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor(&server);
+    let module_id = "path-mismatch";
+    let module = spawn_stub(&server, &supervisor, module_id).await;
+    let replacement_home = TempDir::new("ck-list-replacement");
+    let replacement = replacement_home.path().join(
+        Path::new(env!("CARGO_BIN_EXE_fake-aft-stub"))
+            .file_name()
+            .unwrap(),
+    );
+    fs::copy(env!("CARGO_BIN_EXE_fake-aft-stub"), &replacement).unwrap();
+    let mut configured = stub_spec(module_id);
+    configured.program = replacement.clone();
+    module.update_spec_for_test(configured).await.unwrap();
+
+    let json = assert_json_success(ck_with_subc(
+        &server.connection_file_path,
+        ["module", "list", "--json"],
+    ));
+    let entry = &json["modules"][0];
+    assert_eq!(entry["module_id"], module_id);
+    assert_eq!(entry["pending_reload"]["path"]["status"], "mismatch");
+    assert_eq!(
+        entry["pending_reload"]["path"]["configured"],
+        json!(replacement)
+    );
+    if !cfg!(any(target_os = "linux", target_os = "macos")) {
+        assert_eq!(entry["pending_reload"]["image"]["status"], "unavailable");
+        assert_eq!(
+            entry["pending_reload"]["image"]["reason"],
+            "unsupported_platform"
+        );
+    }
+
+    let output = ck_with_subc(&server.connection_file_path, ["module", "list"]);
+    assert_exit(&output, 0);
+    let stdout = text(&output.stdout);
+    assert!(
+        stdout.lines().any(|line| {
+            line.starts_with(module_id) && line.trim_end().ends_with("pending (path)")
+        }),
+        "{stdout}"
+    );
 
     module.stop().await.unwrap();
 }
@@ -2127,12 +2180,17 @@ async fn module_status_renders_key_value_block_byte_for_byte() {
         "start age renders as an age: {rendered_age:?} vs {started:?}"
     );
     assert_eq!(before, format!("aft — running, degraded\n  pid {pid}"));
+    let image_verdict = if cfg!(any(target_os = "linux", target_os = "macos")) {
+        "matches file at spawned path"
+    } else {
+        "not checked on this platform (unsupported_platform)"
+    };
     // The budget renders with the window it is counted over (`in 10m`), because
     // the count alone reads as a lifetime total and stopped being one.
     assert_eq!(
         rest,
         format!(
-            "0 of 1 in 10m · drain 25 ms · restart backoff 10 ms to 30s\n  last exit: none\n  drain gauges: 0 drains with undeclared gauge\n  binary: {binary} ({image})\nmetrics: run `ck health aft`\n"
+            "0 of 1 in 10m · drain 25 ms · restart backoff 10 ms to 30s\n  last exit: none\n  drain gauges: 0 drains with undeclared gauge\n  binary: {binary} ({image})\n  configured program: matches running process\n  running image: {image_verdict}\nmetrics: run `ck health aft`\n"
         )
     );
 
@@ -3205,6 +3263,7 @@ fn scripted_supervisor_entry(module_id: &str, drain_timeout_ms: Option<u64>) -> 
         live: true,
         protocol: ModuleProtocol::Subc,
         health: SupervisorHealthStatus::Ok,
+        pending_reload: None,
         last_probe_ms: None,
         last_exit_code: None,
         last_exit_signal: None,

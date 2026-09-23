@@ -123,6 +123,22 @@ struct SupervisedChild {
     /// Dropping this handle is what reaps a surviving tree when no supervisor
     /// code runs — a daemon crash — because the job carries
     /// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`.
+    ///
+    /// That limit is not crash-only, and the difference is worth knowing: a
+    /// Windows daemon *stop* is `taskkill` or the scheduler's `/End` — the
+    /// SIGTERM handler is `#[cfg(unix)]` — so the daemon dies with no stop
+    /// notice and the kernel closes the job handle, `TerminateProcess`ing every
+    /// module at once. Before this change they survived that, saw EOF on the
+    /// control socket, and ran their own teardown; Unix keeps that path
+    /// deliberately, so a module can seal a WAL or close a capture rather than
+    /// be killed mid-write. So this trades graceful teardown on every Windows
+    /// daemon stop for containment on a crash, which is the right way round
+    /// today: orphaned GPU workers are a reported, recurring problem, and the
+    /// modules that write most heavily do not run on Windows.
+    ///
+    /// The fix is a real Windows stop path — the daemon draining before it
+    /// exits, the twin of the Unix SIGTERM handler. Once it exists, this limit
+    /// reaches only what the drain left behind, which is what it should reach.
     #[cfg(windows)]
     job: Option<subc_jobobject::JobObject>,
     stdout_pump: Option<JoinHandle<()>>,

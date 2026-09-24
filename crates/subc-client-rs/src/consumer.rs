@@ -805,6 +805,7 @@ impl SubcConsumer {
         } else {
             None
         };
+        let target_label = route_target_label(&target);
         let body = serde_json::to_vec(&ClientControlRequest::RouteOpen {
             target,
             identity,
@@ -818,13 +819,22 @@ impl SubcConsumer {
             .shared
             .control_call(body, deadline, true, reverse_requests.clone())
             .await?;
-        let TerminalFrame::Response {
-            generation, body, ..
-        } = terminal
-        else {
-            return Err(CallError::not_sent(
-                "route.open returned a non-response frame",
-            ));
+        let (generation, body) = match terminal {
+            TerminalFrame::Response {
+                generation, body, ..
+            } => (generation, body),
+            // The daemon refused the open. Keep its code and detail, as the
+            // plain route.open does, so a caller can tell "retry shortly"
+            // (module_warming) from "this configuration will never work"
+            // (admission_facts_not_permitted).
+            TerminalFrame::Error { body, .. } => {
+                return Err(CallError::route_open_refused(target_label, body));
+            }
+            _ => {
+                return Err(CallError::not_sent(
+                    "route.open returned a non-response frame",
+                ));
+            }
         };
         let ClientControlResponse::RouteOpen {
             route_channel,
@@ -1623,6 +1633,19 @@ impl fmt::Display for RouteOpenRefused {
 }
 
 impl Error for RouteOpenRefused {}
+
+/// The label a route.open refusal names its target by, the same spelling the
+/// managed route cache uses.
+fn route_target_label(target: &RouteTarget) -> String {
+    match target {
+        RouteTarget::ToolProvider { module_id } => format!("tool_provider:{module_id}"),
+        RouteTarget::ManagementSurface { module_id } => format!("management_surface:{module_id}"),
+        RouteTarget::InternalService {
+            module_id,
+            service_id,
+        } => format!("internal_service:{module_id}:{service_id}"),
+    }
+}
 
 impl CallError {
     fn route_open_refused(target: String, body: ErrorBody) -> Self {
@@ -6107,6 +6130,79 @@ mod tests {
             .expect("admitted route.open resolves")
             .unwrap();
         (shared, consumer, request, result, rx)
+    }
+
+    #[tokio::test]
+    async fn admitted_route_open_refusal_keeps_the_daemon_code_and_detail() {
+        let shared = writer_test_shared();
+        let (writer, mut rx) = mpsc::channel(8);
+        let generation = {
+            let mut inner = shared.lock_inner();
+            inner.writer = Some(writer);
+            inner.generation
+        };
+        let consumer = SubcConsumer {
+            shared: Arc::clone(&shared),
+        };
+        let task = tokio::spawn(async move {
+            let result = consumer
+                .open_route_with_admission_facts(
+                    RouteTarget::ToolProvider {
+                        module_id: "cerebellum".to_string(),
+                    },
+                    BindIdentity::new(
+                        PathBuf::from("/tmp/project"),
+                        "test".to_string(),
+                        "admitted".to_string(),
+                    ),
+                    serde_json::json!({"schema": 1, "verified_class": "member"}),
+                )
+                .await;
+            (consumer, result)
+        });
+        let command = rx.recv().await.expect("one route.open must be queued");
+        let refusal = ErrorBody {
+            code: "module_warming".to_string(),
+            message: "cerebellum is not ready".to_string(),
+            detail: Some(serde_json::json!({"reason": "declared_not_ready"})),
+        };
+        assert!(
+            dispatch_frame(
+                &shared,
+                generation,
+                Frame::build(
+                    FrameType::Error,
+                    Flags::new(false, Priority::Interactive, false),
+                    0,
+                    0,
+                    command.frame.header.corr,
+                    serde_json::to_vec(&refusal).unwrap(),
+                )
+                .unwrap(),
+            )
+            .await
+        );
+        let (_consumer, result) = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("admitted route.open resolves")
+            .unwrap();
+        let error = result.expect_err("a refused open is an error");
+        assert!(
+            error.is_not_sent(),
+            "a refused open never reached the module: {error}"
+        );
+        let body = error
+            .route_open_refusal()
+            .unwrap_or_else(|| panic!("the refusal's code must survive: {error}"));
+        assert_eq!(body.code, "module_warming");
+        assert_eq!(
+            body.detail,
+            Some(serde_json::json!({"reason": "declared_not_ready"}))
+        );
+        assert!(
+            error.to_string().contains("tool_provider:cerebellum"),
+            "the error names its target: {error}"
+        );
     }
 
     #[tokio::test]

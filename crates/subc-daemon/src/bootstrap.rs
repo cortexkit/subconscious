@@ -814,6 +814,10 @@ async fn serve_bound_daemon(
         // respawned. Also before allowing a second signal to cut the bounded
         // wait short, so the journal marker is always written.
         supervisor.begin_daemon_shutdown();
+        // Stop the self-watchdog before closing the listener. Its next tick would
+        // connect to that listener, fail, and log an ERROR indistinguishable from
+        // a wedged daemon, once for every interval a planned stop lasts.
+        drop(_watchdog_task);
         // Dropping the listener stops new accepts, not established connections:
         // their detached tasks must remain live throughout notice and drain.
         drop(serve_task);

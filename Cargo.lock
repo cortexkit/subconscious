@@ -362,7 +362,7 @@ dependencies = [
 [[package]]
 name = "cortexkit-bus-naming"
 version = "0.1.0"
-source = "git+https://github.com/cortexkit/commons.git?rev=ce77ea9555d01133763966e3249339d8a3b17467#ce77ea9555d01133763966e3249339d8a3b17467"
+source = "git+https://github.com/cortexkit/commons.git?rev=e14a671bd7926d80fb84b4cb887c2657e1f08861#e14a671bd7926d80fb84b4cb887c2657e1f08861"
 
 [[package]]
 name = "cortexkit-bus-nats"

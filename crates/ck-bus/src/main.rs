@@ -15,6 +15,11 @@ mod credentials;
 mod bootstrap;
 // The offline `install-plan` and `install-apply` commands `ck setup` drives.
 mod install;
+// `ckbus.credential` and `ckbus.nonce_sign`: participant credentials, the census write
+// and the epoch high-water mark. The superseded-user queue and the census reader wait for
+// the revocation area.
+#[allow(dead_code)]
+mod issuance;
 
 use std::{
     env,
@@ -88,7 +93,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let incarnation = process_incarnation();
     let bootstrap = bootstrap::Bootstrap::new(
         bootstrap::BootDeps {
-            credentials,
+            credentials: credentials.clone(),
             grants: runtime.grants.clone(),
             store: bootstrap::store::Store::new(runtime.store_root().clone()),
             incarnation: incarnation.clone(),
@@ -107,8 +112,15 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         })
     );
 
-    let manifest = ModuleManifest::builder(&module_id, env!("CARGO_PKG_VERSION")).build();
-    bootstrap.serve(manifest, BusHandler { runtime }).await?;
+    let store_root = runtime.store_root().clone();
+    let wired = issuance::handler::wire(
+        ModuleManifest::builder(&module_id, env!("CARGO_PKG_VERSION")),
+        BusHandler { runtime },
+        credentials,
+        &store_root,
+        bootstrap.ready(),
+    )?;
+    bootstrap.serve(wired.manifest, wired.handler).await?;
     Ok(())
 }
 

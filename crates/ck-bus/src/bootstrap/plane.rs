@@ -65,6 +65,27 @@ pub trait BoxPlane: Send + Sync {
     async fn ensure_census(&self, account: &AccountNames) -> Result<(), PlaneError>;
     async fn ensure_stream(&self, spec: &StreamSpec) -> Result<(), PlaneError>;
     async fn publish(&self, subject: &str, payload: Vec<u8>) -> Result<(), PlaneError>;
+    /// Writes one census record: a JetStream publish on the census key's KV subject
+    /// (`AccountNames::census_subject`), answered only once the census stream has stored
+    /// it. The bucket keeps one value per key, so this overwrites the module's entry.
+    async fn census_put(&self, subject: &str, value: Vec<u8>) -> Result<(), PlaneError>;
+    /// Creates a participant's durable pull consumer, or updates it to `durable`'s
+    /// configuration when it already exists.
+    async fn ensure_durable(&self, durable: &DurableConsumer) -> Result<(), PlaneError>;
+}
+
+/// One participant durable consumer, with every limit stated rather than left to a
+/// server default. The foundation fixes pull, explicit ack, ack wait 30 s, max-deliver 5
+/// on the effect stream and unlimited (`-1`) elsewhere; it names no ack-pending cap, so
+/// the caller sets one explicitly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DurableConsumer {
+    pub stream: String,
+    pub durable: String,
+    pub filter_subjects: Vec<String>,
+    pub ack_wait: Duration,
+    pub max_deliver: i64,
+    pub max_ack_pending: i64,
 }
 
 /// Connects ck-bus's own users. Each connection answers the server's nonce with the
@@ -347,6 +368,39 @@ impl BoxPlane for NatsBox {
             .flush()
             .await
             .map_err(|error| PlaneError::new(format!("flush after {subject}: {error}")))
+    }
+
+    async fn census_put(&self, subject: &str, value: Vec<u8>) -> Result<(), PlaneError> {
+        let ack = self
+            .jetstream
+            .publish(subject.to_string(), value.into())
+            .await
+            .map_err(|error| PlaneError::new(format!("census put {subject}: {error}")))?;
+        ack.await
+            .map(|_| ())
+            .map_err(|error| PlaneError::new(format!("census put {subject} not stored: {error}")))
+    }
+
+    async fn ensure_durable(&self, durable: &DurableConsumer) -> Result<(), PlaneError> {
+        let config = jetstream::consumer::pull::Config {
+            durable_name: Some(durable.durable.clone()),
+            ack_policy: jetstream::consumer::AckPolicy::Explicit,
+            ack_wait: durable.ack_wait,
+            max_deliver: durable.max_deliver,
+            max_ack_pending: durable.max_ack_pending,
+            filter_subjects: durable.filter_subjects.clone(),
+            ..Default::default()
+        };
+        self.jetstream
+            .create_consumer_on_stream(config, durable.stream.as_str())
+            .await
+            .map(|_| ())
+            .map_err(|error| {
+                PlaneError::new(format!(
+                    "create durable {} on {}: {error}",
+                    durable.durable, durable.stream
+                ))
+            })
     }
 }
 

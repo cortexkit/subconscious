@@ -3,6 +3,7 @@ pub mod config;
 pub mod control;
 pub mod daemon;
 pub mod data_home;
+pub mod issuance;
 pub mod report;
 pub mod signer;
 pub mod stubs;

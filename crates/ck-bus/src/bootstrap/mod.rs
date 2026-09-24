@@ -632,6 +632,9 @@ pub struct Bootstrap {
     deps: BootDeps,
     period: Duration,
     health: BootstrapHealth,
+    /// The finished bootstrap, published once so later areas (issuance) can use ck-bus's
+    /// box-account connection and account record. `None` until bootstrap succeeds.
+    ready: tokio::sync::watch::Sender<Option<Arc<Ready>>>,
 }
 
 impl Bootstrap {
@@ -642,7 +645,14 @@ impl Bootstrap {
             health: BootstrapHealth {
                 state: Arc::new(Mutex::new(BootState::Starting)),
             },
+            ready: tokio::sync::watch::Sender::new(None),
         }
+    }
+
+    /// Watches for the finished bootstrap. It holds `None` until a boot attempt
+    /// succeeds, then the `Ready` this process serves with.
+    pub fn ready(&self) -> tokio::sync::watch::Receiver<Option<Arc<Ready>>> {
+        self.ready.subscribe()
     }
 
     pub fn health(&self) -> Arc<dyn SentinelHealth> {
@@ -705,6 +715,8 @@ impl Bootstrap {
                         account_public: ready.account.account_public.clone(),
                     });
                     // The connections stay open for as long as the process serves.
+                    let ready = Arc::new(ready);
+                    self.ready.send_replace(Some(ready.clone()));
                     let _held = ready;
                     std::future::pending::<()>().await;
                 }

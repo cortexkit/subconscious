@@ -349,7 +349,7 @@ fn vendored_foundation_and_golden_match_their_source_record() {
     // so it moves with the pin in Cargo.toml.
     assert_eq!(
         field("golden_commit"),
-        "ce77ea9555d01133763966e3249339d8a3b17467"
+        "e14a671bd7926d80fb84b4cb887c2657e1f08861"
     );
     for (file, digest_field) in [
         ("nats-message-plane-foundation.md", "source_sha256"),

@@ -89,8 +89,8 @@ pub mod cause {
     /// ck-bus's own census key could not be written: its spawn generation could not be
     /// read, or the census write failed.
     pub const OWN_CENSUS_UNWRITTEN: &str = "own-census-unwritten";
-    /// Bootstrap finished; the sentinel, which alone may report the bus up, has not
-    /// landed yet.
+    /// Bootstrap finished. Only the sentinel may report the bus up, so bootstrap's own
+    /// answer names this cause; the sentinel's verdict replaces it once it runs.
     pub const SENTINEL_NOT_LANDED: &str = "sentinel-not-landed";
 }
 
@@ -665,8 +665,9 @@ enum BootState {
     },
 }
 
-/// The health answer. Until the sentinel lands, bootstrap alone never reports the bus
-/// up: a finished bootstrap still answers down, naming `sentinel-not-landed`.
+/// Bootstrap's health answer. Bootstrap alone never reports the bus up: while it isn't
+/// ready its answer names the cause, and once ready it answers down with
+/// `sentinel-not-landed`, which the sentinel's own verdict replaces.
 #[derive(Clone)]
 pub struct BootstrapHealth {
     state: Arc<Mutex<BootState>>,

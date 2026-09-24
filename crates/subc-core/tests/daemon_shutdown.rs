@@ -749,6 +749,53 @@ async fn open_route(fixture: &Fixture) -> (tokio::net::TcpStream, u16, u32) {
     )
 }
 
+async fn route_closed(stream: &mut tokio::net::TcpStream) -> Value {
+    tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            let frame = read_frame(stream)
+                .await
+                .unwrap()
+                .expect("client disconnected before route.closed");
+            if let Ok(body) = serde_json::from_slice::<Value>(&frame.body) {
+                if body["op"] == "route.closed" {
+                    assert_eq!(frame.header.channel, 0);
+                    return body;
+                }
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for route.closed")
+}
+
+#[tokio::test]
+async fn route_closed_during_daemon_shutdown_reports_restart() {
+    let mut fixture = Fixture::boot(true);
+    let (mut stream, _, _) = open_route(&fixture).await;
+    let observer = fixture.pid_of("observer.pid");
+    fixture.term();
+    fixture.wait_event("draining");
+    signal_pid(observer, rustix::process::Signal::TERM);
+    let closed = route_closed(&mut stream).await;
+    assert_eq!(closed["module_id"], "shutdown-observer");
+    assert_eq!(closed["reason"], "restart");
+    assert_eq!(closed["terminal"], false);
+    fixture.wait_exit(Duration::from_secs(8));
+}
+
+#[tokio::test]
+async fn route_closed_after_unexpected_module_loss_reports_crash() {
+    let fixture = Fixture::boot(false);
+    let (mut stream, _, _) = open_route(&fixture).await;
+    signal_pid(
+        fixture.pid_of("observer.pid"),
+        rustix::process::Signal::TERM,
+    );
+    let closed = route_closed(&mut stream).await;
+    assert_eq!(closed["module_id"], "shutdown-observer");
+    assert_eq!(closed["reason"], "crash");
+}
+
 #[tokio::test]
 async fn consumer_observes_route_closing_on_channel_zero_before_eof() {
     let mut fixture = Fixture::boot(false);

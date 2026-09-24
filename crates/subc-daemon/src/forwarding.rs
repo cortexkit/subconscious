@@ -1869,6 +1869,11 @@ impl ForwardingTable {
             .any(|key| key.channel == route_channel))
     }
 
+    /// Whether daemon-wide shutdown has begun draining all providers.
+    pub(crate) fn is_daemon_draining(&self) -> Result<bool, ForwardingError> {
+        Ok(self.read_inner()?.daemon_draining)
+    }
+
     /// Gate every provider atomically, including registrations racing shutdown.
     /// No supervisor lock is held while taking the forwarding lock.
     #[cfg(unix)]

@@ -1421,12 +1421,23 @@ impl ControlHandler {
                     }
                 },
             };
+            // The forwarding table gates all providers at the start of daemon
+            // shutdown, before their connections are closed. An ordinary
+            // module disconnect still reports crash if that gate is not set.
+            let reason = match self.forwarding.is_daemon_draining() {
+                Ok(true) => RouteCloseReason::Restart,
+                Ok(false) => RouteCloseReason::Crash,
+                Err(err) => {
+                    warn!(error = %err, "failed to read daemon drain state; reporting crash conservatively");
+                    RouteCloseReason::Crash
+                }
+            };
             send_route_control_pushes(
                 &self.forwarding,
                 routes,
                 ClientControlPush::RouteClosed {
                     module_id,
-                    reason: RouteCloseReason::Crash,
+                    reason,
                     drained: false,
                     abandoned: 0,
                     excluded_subscriptions: 0,

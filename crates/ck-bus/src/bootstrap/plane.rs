@@ -141,9 +141,23 @@ pub trait BoxPlane: Send + Sync {
         key: &str,
         revision: u64,
     ) -> Result<(), PlaneError>;
-    /// Creates a participant's durable pull consumer, or updates it to `durable`'s
-    /// configuration when it already exists.
-    async fn ensure_durable(&self, durable: &DurableConsumer) -> Result<(), PlaneError>;
+    /// Creates an agent's durable pull consumer. Create only: an existing consumer of the
+    /// same name with a different configuration is refused by the server and left as it
+    /// is, never updated. An identical one is the server's idempotent success.
+    async fn create_durable(&self, durable: &DurableConsumer) -> Result<(), PlaneError>;
+    /// One consumer's configuration and counters. `Ok(None)` is the server's own answer
+    /// that the stream holds no consumer of that name; a read that fails is an `Err`.
+    async fn consumer_state(
+        &self,
+        stream: &str,
+        durable: &str,
+    ) -> Result<Option<ConsumerState>, PlaneError>;
+    /// Deletes one consumer. `Ok(false)` when the server answers that it did not exist.
+    async fn delete_durable(&self, stream: &str, durable: &str) -> Result<bool, PlaneError>;
+    /// Removes every message on `stream` matching `filter_subject`, returning how many.
+    async fn purge_subject(&self, stream: &str, filter_subject: &str) -> Result<u64, PlaneError>;
+    /// The name of every consumer on `stream`.
+    async fn consumer_names(&self, stream: &str) -> Result<Vec<String>, PlaneError>;
     /// The connection itself, for the sentinel probe's request and responder. A plane
     /// with no real connection (a test double) has none, and the sentinel reports that
     /// it cannot probe.
@@ -176,6 +190,21 @@ pub struct DurableConsumer {
     pub ack_wait: Duration,
     pub max_deliver: i64,
     pub max_ack_pending: i64,
+}
+
+/// A consumer as the server reports it: the configuration ck-bus compares against what it
+/// would create, and the two counters the agent-durable ops report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConsumerState {
+    pub config: DurableConsumer,
+    /// The server's names for the ack and deliver policies (`explicit`, `all`, ...).
+    pub ack_policy: String,
+    pub deliver_policy: String,
+    /// Messages matching the filter that the consumer has not delivered yet.
+    pub num_pending: u64,
+    /// Messages delivered and not yet acknowledged, which the server will redeliver
+    /// unless they are acked, terminated or exhaust `max_deliver`.
+    pub num_ack_pending: u64,
 }
 
 /// Connects ck-bus's own users. Each connection answers the server's nonce with the
@@ -631,10 +660,11 @@ impl BoxPlane for NatsBox {
         Some(self.link.clone())
     }
 
-    async fn ensure_durable(&self, durable: &DurableConsumer) -> Result<(), PlaneError> {
+    async fn create_durable(&self, durable: &DurableConsumer) -> Result<(), PlaneError> {
         let config = jetstream::consumer::pull::Config {
             durable_name: Some(durable.durable.clone()),
             ack_policy: jetstream::consumer::AckPolicy::Explicit,
+            deliver_policy: jetstream::consumer::DeliverPolicy::All,
             ack_wait: durable.ack_wait,
             max_deliver: durable.max_deliver,
             max_ack_pending: durable.max_ack_pending,
@@ -642,7 +672,7 @@ impl BoxPlane for NatsBox {
             ..Default::default()
         };
         self.jetstream
-            .create_consumer_on_stream(config, durable.stream.as_str())
+            .create_consumer_strict_on_stream(config, durable.stream.as_str())
             .await
             .map(|_| ())
             .map_err(|error| {
@@ -652,6 +682,126 @@ impl BoxPlane for NatsBox {
                 ))
             })
     }
+
+    async fn consumer_state(
+        &self,
+        stream: &str,
+        durable: &str,
+    ) -> Result<Option<ConsumerState>, PlaneError> {
+        let what = format!("consumer info {durable} on {stream}");
+        let reply = self
+            .api(format!("CONSUMER.INFO.{stream}.{durable}"), json!({}), &what)
+            .await?;
+        if api_error_code(&reply) == Some(CONSUMER_NOT_FOUND) {
+            return Ok(None);
+        }
+        api_refusal(&reply, &what)?;
+        parse_consumer_state(&reply)
+            .map(Some)
+            .ok_or_else(|| PlaneError::new(format!("{what}: unreadable reply {reply}")))
+    }
+
+    async fn delete_durable(&self, stream: &str, durable: &str) -> Result<bool, PlaneError> {
+        let what = format!("delete consumer {durable} on {stream}");
+        let reply = self
+            .api(format!("CONSUMER.DELETE.{stream}.{durable}"), json!({}), &what)
+            .await?;
+        if api_error_code(&reply) == Some(CONSUMER_NOT_FOUND) {
+            return Ok(false);
+        }
+        api_refusal(&reply, &what)?;
+        Ok(true)
+    }
+
+    async fn purge_subject(&self, stream: &str, filter_subject: &str) -> Result<u64, PlaneError> {
+        let what = format!("purge {filter_subject} from {stream}");
+        let reply = self
+            .api(
+                format!("STREAM.PURGE.{stream}"),
+                json!({ "filter": filter_subject }),
+                &what,
+            )
+            .await?;
+        api_refusal(&reply, &what)?;
+        reply["purged"]
+            .as_u64()
+            .ok_or_else(|| PlaneError::new(format!("{what}: reply names no purged count: {reply}")))
+    }
+
+    async fn consumer_names(&self, stream: &str) -> Result<Vec<String>, PlaneError> {
+        let what = format!("consumer names on {stream}");
+        let mut names = Vec::new();
+        // The server pages its answer; `total` says when every page has been read.
+        loop {
+            let reply = self
+                .api(
+                    format!("CONSUMER.NAMES.{stream}"),
+                    json!({ "offset": names.len() }),
+                    &what,
+                )
+                .await?;
+            api_refusal(&reply, &what)?;
+            let page = reply["consumers"].as_array().cloned().unwrap_or_default();
+            let total = reply["total"].as_u64().unwrap_or_default() as usize;
+            for name in &page {
+                names.push(
+                    name.as_str()
+                        .ok_or_else(|| PlaneError::new(format!("{what}: a non-string name")))?
+                        .to_string(),
+                );
+            }
+            if page.is_empty() || names.len() >= total {
+                return Ok(names);
+            }
+        }
+    }
+}
+
+/// The JetStream API's error code for a consumer the stream does not have.
+const CONSUMER_NOT_FOUND: u64 = 10014;
+
+fn api_error_code(reply: &Value) -> Option<u64> {
+    reply.get("error")?.get("err_code")?.as_u64()
+}
+
+/// An `error` member in a JetStream API reply, as a plane error naming the request.
+fn api_refusal(reply: &Value, what: &str) -> Result<(), PlaneError> {
+    match reply.get("error") {
+        Some(error) => Err(PlaneError::new(format!("{what} refused: {error}"))),
+        None => Ok(()),
+    }
+}
+
+/// Reads the fields of a `CONSUMER.INFO` reply that the agent-durable ops compare and
+/// report. Durations arrive in nanoseconds.
+pub fn parse_consumer_state(reply: &Value) -> Option<ConsumerState> {
+    let config = &reply["config"];
+    let filter_subjects = match config.get("filter_subjects").and_then(Value::as_array) {
+        Some(subjects) => subjects
+            .iter()
+            .map(|subject| subject.as_str().map(str::to_string))
+            .collect::<Option<Vec<_>>>()?,
+        None => config
+            .get("filter_subject")
+            .and_then(Value::as_str)
+            .filter(|subject| !subject.is_empty())
+            .map(|subject| vec![subject.to_string()])
+            .unwrap_or_default(),
+    };
+    Some(ConsumerState {
+        config: DurableConsumer {
+            stream: reply["stream_name"].as_str()?.to_string(),
+            durable: config["durable_name"].as_str()?.to_string(),
+            filter_subjects,
+            ack_wait: Duration::from_nanos(config["ack_wait"].as_u64()?),
+            max_deliver: config["max_deliver"].as_i64()?,
+            max_ack_pending: config["max_ack_pending"].as_i64()?,
+        },
+        ack_policy: config["ack_policy"].as_str()?.to_string(),
+        deliver_policy: config["deliver_policy"].as_str()?.to_string(),
+        num_pending: reply["num_pending"].as_u64()?,
+        num_ack_pending: reply["num_ack_pending"].as_u64()?,
+    })
 }
 
 impl NatsBox {
@@ -663,6 +813,15 @@ impl NatsBox {
             .get_key_value(bucket.clone())
             .await
             .map_err(|error| PlaneError::new(format!("census bucket {bucket}: {error}")))
+    }
+
+    /// One JetStream API request (`subject` is relative to `$JS.API.`), its reply as
+    /// JSON. An `error` member is left for the caller, which knows which codes it expects.
+    async fn api(&self, subject: String, body: Value, what: &str) -> Result<Value, PlaneError> {
+        tokio::time::timeout(REQUEST_TIMEOUT, self.jetstream.request(subject, &body))
+            .await
+            .map_err(|_| PlaneError::new(format!("{what}: no reply within {REQUEST_TIMEOUT:?}")))?
+            .map_err(|error| PlaneError::new(format!("{what}: {error}")))
     }
 
     /// `STREAM.CREATE` is idempotent for an identical configuration, so creating on

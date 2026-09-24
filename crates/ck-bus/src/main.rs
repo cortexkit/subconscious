@@ -19,6 +19,9 @@ mod install;
 // and the epoch high-water mark.
 #[allow(dead_code)]
 mod issuance;
+// Agent durables: prefrontal's bind, delete, list and effect-pending read (R15).
+#[allow(dead_code)]
+mod membership;
 // Revocation: the operator-signed revocation list, the census delete and the kick, with
 // durable progress; superseded users are found from the census.
 #[allow(dead_code)]

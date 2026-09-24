@@ -1418,38 +1418,81 @@ SECTION governs.
   (ALF), with 15 minutes proposed by SUBC. Both gate slice 6 only.
 - R15 (operator, 2026-09-24): agent bus access is account-scoped. A participant's
   credential names no agents, and its grant may pull from any agent's durable in its box
-  account (`$JS.API.CONSUMER.MSG.NEXT.<inbox stream>.c_*`). The operator accepts that any
-  bus module on the machine can read any agent's queue, as within the machine's existing
-  trust boundary: every participant is a daemon-attested module running as the same
-  user. The rejected alternative listed each process's agents in its credential and
-  reissued it, with a reconnect, on every residence change.
-  Prefrontal owns residence. It creates, removes and merges each agent's durable through
-  three ops on ck-bus's ManagementSurface, accepted only from `reserved:prefrontal-core`
-  (anything else is refused with `ckbus_caller_not_permitted`), with every name taken
-  from the naming crate:
-  - `ckbus.agent_durable_bind {agent_id}` creates `consumer_name(agent_id)` on the inbox
-    stream, filtered to that agent's subject, with every limit explicit, and replies
-    `{durable, stream, filter_subject, created}`. It is idempotent: an existing durable
-    with the same configuration replies `created: false`, and one with a different
-    configuration is refused by name, never replaced.
-  - `ckbus.agent_durable_delete {agent_id}` deletes the durable and its undelivered
-    messages. Deleting an absent durable succeeds.
-  - `ckbus.agent_durable_merge {from, into}` binds `into` if absent, republishes every
-    message still queued for `from` to `into`'s subject, then deletes `from`. Messages
-    accepted before a merge are never lost: today's delivery refuses a merged agent and
-    points senders at the survivor. Merge is retry-safe rather than atomic. It reads
-    `from`'s high-water mark first, republishes each message up to it with
-    `Nats-Msg-Id: merge:<from>:<stream_seq>` so a retry inside the stream's duplicate
-    window is dropped by JetStream, and keeps every original header, including
-    prefrontal's delivery id. It deletes `from` only after every message up to the mark
-    is copied, and replies `merged` only after the delete. A retry that finds `from`
-    absent and `into` present succeeds. The end-to-end guarantee is prefrontal's delivery
-    id, deduplicated at delivery: a duplicate that outlives the window after a long crash
-    is dropped there.
-  - `ckbus.agent_durables_list` replies `[{agent_id, durable, pending, filter_subject}]`
-    (`pending` is the undelivered count). Prefrontal reconciles against it at boot and
-    on a slow cadence: it binds durables its registry says should exist, and deletes a
-    durable only once that agent's registry row is terminal, never on absence alone.
+  account. The operator accepts that any bus module on the machine can read any agent's
+  queue, as within the machine's existing trust boundary: every participant is a
+  daemon-attested module running as the same user. The rejected alternative listed each
+  process's agents in its credential and reissued it, with a reconnect, on every
+  residence change.
+  Agent streams and the whole-token grant. An agent has one durable,
+  `consumer_name(agent_id)` (`c_{agent_id}`), on each of the three agent streams:
+  `CK_{ACCT}_WAKE` (filter `wake_fire(agent)`), `CK_{ACCT}_PEER` (`peer_filter(agent)`)
+  and `CK_{ACCT}_EFFECT` (`effect_filter(agent)`). ROOM and EFFECT_DEAD are not agent
+  streams. NATS wildcards are whole-token only, so the grant cannot say `c_*`: it is a
+  whole-token `*` in the consumer position on each agent stream
+  (`$JS.API.CONSUMER.MSG.NEXT.<S>.*`, `$JS.API.CONSUMER.INFO.<S>.*`, `$JS.ACK.<S>.*.>`,
+  plus `$JS.API.STREAM.INFO.<S>`). That grant also reaches any other consumer on those
+  streams, so ck-bus never creates a non-agent durable on WAKE, PEER or EFFECT (its own
+  `c_ckbus_dead` is on EFFECT_DEAD). The membership row asserts this against
+  bootstrap's stream set and against the live server's consumers.
+  Two grants, chosen by the attested principal at issuance, neither naming an agent:
+  - participant (every module except prefrontal-core): its own `_INBOX`, pull, ack and
+    info on any agent durable as above, the `effect_dead` publish and census read. No
+    workload publish at all.
+  - delivery authority (only `reserved:prefrontal-core`): the participant set plus
+    publish on `ck.{acct}.wake.*.fire`, `ck.{acct}.peer.*.*.deliver` and
+    `ck.{acct}.effect.*.*.intent` for every agent.
+  The naming crate owns both constructors (`participant_permissions(account,
+  credential_public, bound_rooms)` and `delivery_authority_permissions(..)` with a
+  `delivery-authority` principal) and the bus-grant additions below (commons
+  `f884fabe`). Nothing in the participant grant depends on agents, so a participant is
+  never reissued when agents come or go: a credential issued before a bind pulls from
+  the durable bound afterwards.
+  Prefrontal owns residence. It creates, removes and reads each agent's durables through
+  ops on ck-bus's ManagementSurface, accepted only from `reserved:prefrontal-core`
+  (anything else, `Direct` included, is refused with `ckbus_caller_not_permitted`), with
+  every name taken from the naming crate:
+  - `ckbus.agent_durable_bind {agent_id}` creates the three durables (pull, explicit
+    ack, deliver all, ack wait 30 s, max-deliver 5 on EFFECT and -1 elsewhere, max ack
+    pending 1000) and replies `{agent_id, durables: [{stream, durable, filter_subject,
+    created}]}`. It is idempotent: an existing durable with the same configuration is
+    `created: false`, and one with a different configuration is refused
+    (`ckbus_agent_durable_conflict`, naming the stream and each differing field), never
+    replaced. A refusal on one stream leaves the others as they are; a retry converges.
+  - `ckbus.agent_durable_delete {agent_id}` deletes the three durables, then purges the
+    agent's filter subject from each stream, so its undelivered messages are gone and a
+    later bind does not deliver them again. It replies `{agent_id, deleted: [stream..],
+    purged: {stream: count}}`. Deleting an absent durable succeeds. The purge needs
+    `$JS.API.STREAM.PURGE.<S>` in the bus grant; the filter travels in the request body,
+    which permissions cannot see, so ck-bus's code restricts each purge to one agent's
+    filter.
+  - `ckbus.agent_durables_list` replies one row per consumer on an agent stream,
+    `[{agent_id, stream, durable, pending, filter_subject}]`, where `pending` is the
+    durable's undelivered count (`num_pending`). A consumer that is not an agent durable
+    is listed with `agent_id: null`. It needs `$JS.API.CONSUMER.NAMES.<S>` in the bus
+    grant.
+  - `ckbus.agent_effects_pending {agent_id}` replies `{agent_id, stream, durable, bound,
+    undelivered, in_flight, pending}` for the agent's EFFECT durable: `pending` is its
+    still-deliverable intents, undelivered plus delivered-and-unacked. An intent that
+    exhausted max-deliver (and went to the dead-letter subject) counts as neither, so a
+    poisoned intent never blocks a merge.
+  Merge is prefrontal's, not a ck-bus op: copying is a workload publish, and ck-bus holds
+  none (line 609 stands; ck-bus holds signing power and must not also inject messages).
+  Prefrontal, holding the delivery-authority grant, merges `from` into `into` in this
+  order: (1) `ckbus.agent_effects_pending {from}`; while `pending` is non-zero it
+  refuses with `ckbus_merge_effects_pending`, naming the count, and retries later
+  (retryable); (2) binds `into` if absent; (3) records the high-water mark, then copies
+  every message still queued for `from` on PEER and then WAKE to `into`'s subject
+  (rewriting the agent token, keeping the session token and every original header, with
+  `Nats-Msg-Id: merge:<from>:<stream_seq>` so a recopy inside the duplicate window is
+  dropped); (4) deletes `from` through `ckbus.agent_durable_delete` only after the copy,
+  and reports merged only after the delete. The merge reply says which parts completed,
+  e.g. `{merged: false, effect: {pending: N}, peer: "not_started", wake: "not_started"}`
+  on the effect refusal and `{merged: false, effect: {pending: 0}, peer: "copied", wake:
+  "failed"}` on a copy failure, so a rerun resumes rather than guessing (the
+  `Nats-Msg-Id` dedupe makes a recopy inside the window harmless, but the reply still
+  says what happened). A retry finding `from` absent and `into` present
+  succeeds. Messages accepted before a merge are never lost: today's delivery refuses a
+  merged agent and points senders at the survivor.
   Issuance step 4 no longer creates `c_{agent_id}` durables; prefrontal's bind does. The
   membership row keeps rooms only, still gated on `membership-contract-unpinned`.
 - R16 (ALF, 2026-09-24; discharges `user-jwt-ttl-unpinned`): every user JWT ck-bus

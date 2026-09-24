@@ -247,7 +247,7 @@ async fn control_faulty_signers_diverge_from_the_golden_and_are_refused_by_ck_bu
     let account = grants::derive_account("box_goldenfixture").unwrap();
     let custody = KeyCustody::new();
     let user = custody.generate_user();
-    let grant = grants::participant_grant(&account, &user, &["agent_gold_a"], &[]).unwrap();
+    let grant = grants::participant_grant(&account, &user, &[]).unwrap();
 
     for fault in [
         SignerFault::Faithful,

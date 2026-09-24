@@ -83,7 +83,7 @@ behaviour. A vault-authorization row counts only when it ran against the real bi
 | `health-class-carrier-unpinned` (C) | the byte-exact class written at `metrics.class` in `health.check` returned byte-exact by `supervisor.health_probe` in the same run | subconscious seat; a SUBC daemon change outside this work if a leg cannot carry it | the health and sentinel rows |
 | `naming-constructor-absent` (C) | `cortexkit-bus-naming` at the pinned sha constructing every name this work introduces; commons branch filed for SUBC to merge, re-pin | commons; ALF authors, SUBC merges | the rows that emit the missing name |
 | `claustrum-binary-absent` (C) | a claustrum binary found through `CK_CLAUSTRUM_BIN` (and a `ck` through `CK_CK_BIN`) at fire time, versions recorded | SUBC | the vault-authorization and signer-shape-against-real rows; a skip here is LOUD and never a pass |
-| `user-jwt-ttl-unpinned` (S) | the foundation naming the per-process user JWT lifetime | ALF (foundation); unagreed, no value proposed by any party | the expiry arm of the signer-outage row only |
+| `user-jwt-ttl-unpinned` (S) | the foundation naming the per-process user JWT lifetime | DISCHARGED by R16 (15 min, renewed at 10 min) | none; the expiry arm now runs |
 | `nats-federation-rig` (S, per behaviour) | the federation rig reporting the named stock-`nats-server` behaviour measured, with the server version | SUBC (rig task in flight) | each federation row naming a behaviour it depends on |
 | `fed-foundation-amendment-unlanded` (S) | a foundation amendment pinning the federation account subject grammar, the cross-machine participant publish grant, the federation stream limits and the re-sync bound | ALF; agreed in principle in nats-federation r3, not written | every federation row that emits a federation name or stream |
 | `kemkey-open-unlanded` (S) | `credential.open` and `ck auth mint-kem-key` in claustrum's served vocabulary with store migration 11, per CKCRED's contract (claustrum campaign `ct_00000000-0000-4006-98d8-bc6a13f46a50`, fired, not landed) | CKCRED | the real-binary half of the open rows, and deployment of inbound federation |
@@ -257,8 +257,7 @@ Durability and damage.
   process's start state.
 - `own_users.json` damaged: left untouched, path named in the report and start-up
   log. The previous incarnation's users are then not revoked by name; they die by
-  expiry once `user-jwt-ttl-unpinned` is discharged, and until then the report names
-  the residual. Nothing guesses a key.
+  expiry (R16: at most 15 minutes). Nothing guesses a key.
 - `account.json` damaged: fails closed. The module refuses to create streams or issue
   credentials, answers health down with class `Unavailable` naming the file, and never
   rewrites it. A wrong `{acct}` would build a second plane silently.
@@ -525,11 +524,10 @@ Credentials (design D; foundation amendment `48c83a68e`, `0eb12229f`, `b9e827c69
   `$SYS` disconnect event for the target in the run's capture. Replays are required to
   be no-ops: re-adding a present revocation leaves the claims equal, and a repeated kick
   of a gone client emits no new event. The arms assert this, and nothing assumes it.
-- JWT expiry is the foundation's second revocation half. Its lifetime is unset
-  (`user-jwt-ttl-unpinned`, owner ALF, unagreed). Until it is pinned, ck-bus issues
-  user JWTs with no `exp`, revocation alone enforces, and the report names the residual:
-  a user whose revocation was lost to damage stays valid. When pinned, ck-bus re-issues
-  before expiry at the next epoch and revokes the superseded user.
+- JWT expiry is the foundation's second revocation half, with the lifetime R16 pins:
+  every user JWT carries `exp` 15 minutes after issue, and ck-bus re-issues at the next
+  epoch about 10 minutes in and revokes the superseded user. A user whose revocation was
+  lost to damage stays valid for at most 15 minutes.
 - ck-bus restart and in-memory keys. Measured by ALF on nats-server 2.15.0 with the full
   resolver, per the foundation amendment's measured basis: while ck-bus is down, open
   connections keep working and new connects and reconnects fail, because nobody can sign
@@ -1209,8 +1207,9 @@ Row contents.
     disconnected and stays so until ck-bus returns, which is the accepted failure mode
     and the reason the lifetimes must stay independent. ck-bus is never the parent of
     nats-server.
-  - Expiry arm, once `user-jwt-ttl-unpinned` is discharged: a JWT is re-issued before its
-    `exp`, and an unrefreshed one is refused after it.
+  - Expiry arm (R16): a JWT is re-issued before its `exp`, and an unrefreshed one is
+    refused after it. A renewal across an in-flight pull acks nothing twice and loses
+    nothing.
 - Federation account and isolation (`nats-federation-rig`: local subjects off the leaf;
   account routing). ck-bus's federation user can publish to another machine's inbox and
   subscribe to its own. It cannot publish in the box account, and it never carries an
@@ -1453,3 +1452,11 @@ SECTION governs.
     durable only once that agent's registry row is terminal, never on absence alone.
   Issuance step 4 no longer creates `c_{agent_id}` durables; prefrontal's bind does. The
   membership row keeps rooms only, still gated on `membership-contract-unpinned`.
+- R16 (ALF, 2026-09-24; discharges `user-jwt-ttl-unpinned`): every user JWT ck-bus
+  issues carries `exp` 15 minutes after issue. ck-bus renews at 10 minutes, with a few
+  seconds of per-process jitter so processes don't renew in step, by handing the new JWT
+  to the client's auth callback before `exp`, so the reconnect nats-server forces at
+  expiry uses it. Renewal must lose no work: the test renews across an in-flight pull
+  and asserts nothing is acked twice and nothing is lost. If async-nats does not
+  reconnect seamlessly, that is reported to ALF before any longer lifetime is chosen;
+  15 minutes holds while revocation stays the primary control.

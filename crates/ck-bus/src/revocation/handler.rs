@@ -196,8 +196,9 @@ impl<H> RevocationHandler<H> {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// The revocation area, so the spawn-stream consumer revokes through the same
-    /// `Revoker` (one serial step (1), one progress store) as the superseded path.
+    /// The shared revocation state, so the spawn-stream consumer revokes through the
+    /// same `Revoker` as the superseded-credential path: account JWT updates stay
+    /// serialized in one place and every revocation keeps one durable progress record.
     pub fn area(&self) -> &Arc<Area> {
         &self.area
     }

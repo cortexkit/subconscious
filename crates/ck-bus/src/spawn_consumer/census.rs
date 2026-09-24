@@ -1,7 +1,7 @@
 //! The census side of the spawn consumer: listing the census and revoking an entry,
-//! through the revocation area's `Revoker` (the same one the superseded-credential path
-//! uses, so every step (1) is serialized in one place and every revocation has one
-//! durable progress record).
+//! through the same `Revoker` the superseded-credential path uses, so every account JWT
+//! update (the revocation list push) is serialized in one place and every revocation
+//! has one durable progress record.
 
 use std::sync::Arc;
 
@@ -104,7 +104,8 @@ impl Census for RevokerCensus {
             Ok(_) => Ok(RevokeOutcome::Revoked {
                 entry_generation: value.spawn_generation,
             }),
-            // The record is durable; the revocation area retries it every period.
+            // A step could not complete, but the revocation's progress record is on disk;
+            // the revocation task resumes it on its next pass (every sentinel period).
             Err(error @ RevocationError::Deferred { .. }) => Ok(RevokeOutcome::Deferred {
                 entry_generation: value.spawn_generation,
                 reason: error.to_string(),

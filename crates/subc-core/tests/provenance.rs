@@ -207,7 +207,10 @@ async fn supervisor_provenance_detects_replaced_executable_image() {
         .with_connection_file_path(daemon.connection_file_path.clone());
     let temp_dir = unique_temp_dir("provenance-replacement");
     let copied_stub = temp_dir.join("fake-aft-stub");
-    fs::copy(env!("CARGO_BIN_EXE_fake-aft-stub"), &copied_stub).unwrap();
+    common::copy_executable(
+        std::path::Path::new(env!("CARGO_BIN_EXE_fake-aft-stub")),
+        &copied_stub,
+    );
     let module = supervisor
         .spawn(ModuleSpec {
             module_id: "provenance-replacement".to_string(),

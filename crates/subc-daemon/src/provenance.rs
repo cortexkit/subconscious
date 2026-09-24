@@ -337,30 +337,18 @@ mod tests {
     /// A live child running a copy of `sleep` that the test owns, returned
     /// once its exe link names that copy.
     ///
-    /// The spawn retries on `ETXTBSY`. Tests run in parallel threads, and a
-    /// `Command::spawn` on another thread forks while this thread's
-    /// `fs::copy` still holds the file open for write; the forked child
-    /// carries that descriptor until its own exec, and during that window
-    /// the kernel refuses to execute the file (6 in 80 runs on a two-core
-    /// VM). Then the wait: `spawn()` can return while the child's exe link
-    /// still names this test binary (see `exe_link_names_spawned_path`), so
-    /// the probe is only run once the link has moved. Both bounded, so a
-    /// child that never gets there fails the test rather than hanging it.
+    /// A child owns the copy's writable descriptor so other test threads cannot
+    /// inherit it while forking. The probe waits for the child's exe link to
+    /// change because `spawn()` can return before the exec completes.
     #[cfg(target_os = "linux")]
     async fn spawn_owned_sleep(dir: &Path) -> (tokio::process::Child, PathBuf) {
         let executable = dir.join("sleep");
-        fs::copy("/bin/sleep", &executable).unwrap();
-        let mut attempts = 0;
-        let child = loop {
-            match Command::new(&executable).arg("60").spawn() {
-                Ok(child) => break child,
-                Err(err) if err.kind() == io::ErrorKind::ExecutableFileBusy && attempts < 50 => {
-                    attempts += 1;
-                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                }
-                Err(err) => panic!("spawn {}: {err}", executable.display()),
-            }
-        };
+        assert!(std::process::Command::new("cp")
+            .args([std::ffi::OsStr::new("/bin/sleep"), executable.as_os_str()])
+            .status()
+            .expect("copy sleep fixture")
+            .success());
+        let child = Command::new(&executable).arg("60").spawn().unwrap();
         let pid = child.id().unwrap();
         let canonical = fs::canonicalize(&executable).unwrap();
         for _ in 0..200 {

@@ -79,6 +79,7 @@ impl Home {
 
     fn spawn_daemon(&self) -> Child {
         let mut command = Command::new(env!("CARGO_BIN_EXE_ck-subc"));
+        command.env("SUBC_CGROUP_PLACEMENT", "disabled");
         self.isolate(&mut command)
             .stdin(Stdio::null())
             .stdout(Stdio::null())

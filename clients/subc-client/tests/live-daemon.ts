@@ -75,6 +75,7 @@ export async function startLiveDaemon(
         XDG_CONFIG_HOME: configDir,
         XDG_DATA_HOME: dataDir,
         SUBC_PORT: "0",
+        SUBC_CGROUP_PLACEMENT: "disabled",
       },
       stdio: ["ignore", "ignore", "pipe"],
     });

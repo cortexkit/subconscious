@@ -63,6 +63,15 @@ async fn main() {
         return;
     }
 
+    // Refuse an invalid placement override before logging or bootstrap can write state.
+    let placement = match cgroup_placement(std::env::var_os("SUBC_CGROUP_PLACEMENT").as_deref()) {
+        Ok(placement) => placement,
+        Err(error) => {
+            eprintln!("ck-subc: refusing to start: {error}");
+            process::exit(1);
+        }
+    };
+
     // Resolve the run directory before anything writes into it. A relative data
     // home would otherwise put the daemon's logs, journal and connection state
     // under whatever directory it was started from, so the daemon refuses to
@@ -83,7 +92,7 @@ async fn main() {
 
     let daemon = async {
         let config = subc_daemon::bootstrap::BootstrapConfig::from_env_for_daemon_binary()?
-            .with_cgroup_placement(subc_daemon::bootstrap::CgroupPlacementConfig::Current);
+            .with_cgroup_placement(placement);
         subc_daemon::bootstrap::run_with_config(config).await
     };
     if let Err(err) = daemon.await {
@@ -98,6 +107,22 @@ async fn main() {
     // kill_on_drop, so a destructor would be a second, unbounded-order kill
     // path next to the deliberate one. Process exit closes the descriptors.
     process::exit(0);
+}
+
+/// The binary uses the caller's cgroup in production; test harnesses can opt out
+/// without changing the default for installed daemons.
+fn cgroup_placement(
+    value: Option<&std::ffi::OsStr>,
+) -> Result<subc_daemon::bootstrap::CgroupPlacementConfig, String> {
+    use subc_daemon::bootstrap::CgroupPlacementConfig;
+    match value {
+        None => Ok(CgroupPlacementConfig::Current),
+        Some(value) if value == "disabled" => Ok(CgroupPlacementConfig::Disabled),
+        Some(value) => Err(format!(
+            "SUBC_CGROUP_PLACEMENT must be 'disabled' when set (got {:?})",
+            value
+        )),
+    }
 }
 
 fn init_tracing(run_dir: &std::path::Path) -> Result<(), cortexkit_log::InitError> {
@@ -176,6 +201,19 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn cgroup_placement_override_requires_exact_disabled_value() {
+        use subc_daemon::bootstrap::CgroupPlacementConfig;
+        assert_eq!(cgroup_placement(None), Ok(CgroupPlacementConfig::Current));
+        assert_eq!(
+            cgroup_placement(Some(std::ffi::OsStr::new("disabled"))),
+            Ok(CgroupPlacementConfig::Disabled)
+        );
+        let error = cgroup_placement(Some(std::ffi::OsStr::new("current"))).unwrap_err();
+        assert!(error.contains("SUBC_CGROUP_PLACEMENT"), "{error}");
+        assert!(cgroup_placement(Some(std::ffi::OsStr::new(""))).is_err());
+    }
 
     #[test]
     fn daemon_log_line_matches_the_authority_fixture_byte_for_byte_without_ansi() {

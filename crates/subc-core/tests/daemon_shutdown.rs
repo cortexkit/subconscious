@@ -83,6 +83,7 @@ impl Fixture {
             .env("XDG_CONFIG_HOME", root.join("config"))
             .env("XDG_RUNTIME_DIR", root.join("runtime"))
             .env("SUBC_PORT", "0")
+            .env("SUBC_CGROUP_PLACEMENT", "disabled")
             .env_remove("CK_LOG")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -852,4 +853,98 @@ async fn in_flight_reply_can_finish_during_the_shutdown_drain() {
     .unwrap();
     assert_eq!(sequence, ["reply", "eof"]);
     fixture.wait_exit(Duration::from_secs(1));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn binary_disabled_placement_leaves_callers_cgroup_untouched() {
+    let root = fresh_dir("binary-cgroup-disabled");
+    for dir in ["config/cortexkit", "runtime", "data"] {
+        fs::create_dir_all(root.join(dir)).unwrap();
+    }
+    let module_id = format!("cgroup-binary-probe-{}", std::process::id());
+    let pid_file = root.join("module.pid");
+    fs::write(
+        root.join("config/cortexkit/subc.jsonc"),
+        serde_json::to_vec(&json!({"version": 1, "modules": {
+            (module_id.clone()): {"program": env!("CARGO_BIN_EXE_fake-aft-stub"),
+                "env": {"FAKE_AFT_MODULE_ID": &module_id,
+                        "FAKE_AFT_PID_PATH": &pid_file}}
+        }}))
+        .unwrap(),
+    )
+    .unwrap();
+    let relative = fs::read_to_string("/proc/self/cgroup")
+        .unwrap()
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))
+        .expect("cgroup v2 hierarchy")
+        .trim_start_matches('/')
+        .to_string();
+    let modules = PathBuf::from("/sys/fs/cgroup")
+        .join(relative)
+        .join("subc-modules");
+    let parent_existed = modules.exists();
+    assert!(
+        !modules.join(&module_id).exists(),
+        "probe cgroup predates test"
+    );
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ck-subc"))
+        .env("XDG_CONFIG_HOME", root.join("config"))
+        .env("XDG_RUNTIME_DIR", root.join("runtime"))
+        .env("XDG_DATA_HOME", root.join("data"))
+        .env("SUBC_PORT", "0")
+        .env("SUBC_CGROUP_PLACEMENT", "disabled")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !pid_file.exists() {
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "daemon exited before module launch"
+        );
+        assert!(Instant::now() < deadline, "fixture module never launched");
+        thread::sleep(Duration::from_millis(10));
+    }
+    let created_parent = !parent_existed && modules.exists();
+    let created_module = modules.join(&module_id).exists();
+    child.kill().unwrap();
+    child.wait().unwrap();
+    if let Ok(pid) = fs::read_to_string(&pid_file) {
+        if let Ok(pid) = pid.trim().parse::<i32>() {
+            if let Some(pid) = rustix::process::Pid::from_raw(pid) {
+                let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+            }
+        }
+    }
+    assert!(
+        !created_parent,
+        "daemon created subc-modules in caller's cgroup"
+    );
+    assert!(
+        !created_module,
+        "daemon placed fixture under caller's cgroup"
+    );
+}
+
+#[test]
+fn binary_rejects_invalid_cgroup_override_before_writing_state() {
+    let root = fresh_dir("binary-cgroup-invalid");
+    let output = Command::new(env!("CARGO_BIN_EXE_ck-subc"))
+        .env("SUBC_CGROUP_PLACEMENT", "current")
+        .env("XDG_DATA_HOME", root.join("data"))
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("SUBC_CGROUP_PLACEMENT"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !root.join("data").exists(),
+        "startup wrote state before refusing"
+    );
 }

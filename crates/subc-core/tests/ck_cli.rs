@@ -822,6 +822,24 @@ fn push_u32(output: &mut Vec<u8>, value: u32) {
 }
 
 fn write_executable(path: &Path, contents: &str) {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        let mut child = Command::new("sh")
+            .args(["-c", "cat > \"$1\"", "write_executable"])
+            .arg(path)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .expect("start executable fixture writer");
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(contents.as_bytes())
+            .unwrap();
+        assert!(child.wait().unwrap().success());
+    }
+    #[cfg(not(unix))]
     fs::write(path, contents).unwrap();
     #[cfg(unix)]
     {
@@ -1484,11 +1502,10 @@ fn a_copy_of_ck_on_path_is_neither_probed_recursively_nor_listed() {
     // has many builds of ck side by side, and the recursion runs between
     // them, each copy probing the other.
     for name in ["ck-twin", "ck-twin-two"] {
-        fs::copy(
-            env!("CARGO_BIN_EXE_ck-under-test"),
-            bin.join(platform_binary(name)),
-        )
-        .expect("copy ck as a domain");
+        common::copy_executable(
+            Path::new(env!("CARGO_BIN_EXE_ck-under-test")),
+            &bin.join(platform_binary(name)),
+        );
     }
     let path = std::env::join_paths(
         std::iter::once(bin.clone()).chain(std::env::split_paths(&system_path_only())),

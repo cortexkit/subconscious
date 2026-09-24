@@ -560,7 +560,7 @@ async fn rescan_changed_spec_is_pending_until_reload_uses_it() {
         [("FAKE_AFT_TOOLCALL_RESULT", "after-reload")],
     );
     let replacement = daemon.temp_dir.join("replacement-fake-aft-stub");
-    fs::copy(env!("CARGO_BIN_EXE_fake-aft-stub"), &replacement).unwrap();
+    common::copy_executable(Path::new(env!("CARGO_BIN_EXE_fake-aft-stub")), &replacement);
     changed["program"] = json!(replacement.to_string_lossy());
     fs::write(&daemon.config_path, config_doc([changed])).unwrap();
     let preview = ck_under_test_command()

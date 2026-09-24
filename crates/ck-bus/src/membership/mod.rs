@@ -17,9 +17,11 @@
 //! - `ckbus.agent_durables_list` reports one row per durable on an agent stream, with
 //!   `pending` the server's count of messages the durable has not delivered yet.
 //! - `ckbus.agent_effects_pending {agent_id}` reports the agent's EFFECT durable's
-//!   still-deliverable intents: undelivered plus delivered-and-unacked. An intent that
-//!   exhausted `max_deliver` (and went to the dead-letter subject) is neither, so it
-//!   never holds a merge back. Prefrontal reads this before a merge.
+//!   intents not yet delivered as `pending`, and the delivered-and-unacked ones
+//!   separately as `in_flight`. In-flight intents are not counted: the server keeps an
+//!   intent that exhausted `max_deliver` (and went to the dead-letter subject) in flight
+//!   until its ack wait passes, so counting them would let a poisoned intent hold a
+//!   merge back. Prefrontal reads this before a merge.
 //!
 //! Merge is not a ck-bus op: copying messages is a workload publish, which ck-bus never
 //! holds. Prefrontal performs it with the delivery-authority grant (R15).
@@ -89,15 +91,19 @@ pub const AGENT_STREAM_KINDS: [StreamKind; 3] =
 pub const CKBUS_OWNED_DURABLES: [(StreamKind, &str); 1] =
     [(StreamKind::EffectDead, "c_ckbus_dead")];
 
-/// The literal names of the agent streams, in `AGENT_STREAM_KINDS` order.
+/// The literal names of the agent streams, as the naming crate lists them (the list its
+/// whole-token `*` grants are written against).
 pub fn agent_streams(names: &AccountNames) -> Vec<String> {
-    AGENT_STREAM_KINDS
+    names
+        .streams()
+        .agent_streams()
         .iter()
-        .map(|kind| stream_name(names, *kind))
+        .map(|stream| stream.to_string())
         .collect()
 }
 
-fn stream_name(names: &AccountNames, kind: StreamKind) -> String {
+/// The literal name of the stream of `kind`.
+pub fn stream_name(names: &AccountNames, kind: StreamKind) -> String {
     let streams = names.streams();
     match kind {
         StreamKind::Room => streams.room.clone(),
@@ -371,6 +377,6 @@ pub async fn effects_pending(
         "bound": bound,
         "undelivered": undelivered,
         "in_flight": in_flight,
-        "pending": undelivered + in_flight,
+        "pending": undelivered,
     }))
 }

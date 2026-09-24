@@ -17,11 +17,13 @@
 //! - `ckbus.agent_durables_list` reports one row per durable on an agent stream, with
 //!   `pending` the server's count of messages the durable has not delivered yet.
 //! - `ckbus.agent_effects_pending {agent_id}` reports the agent's EFFECT durable's
-//!   intents not yet delivered as `pending`, and the delivered-and-unacked ones
-//!   separately as `in_flight`. In-flight intents are not counted: the server keeps an
-//!   intent that exhausted `max_deliver` (and went to the dead-letter subject) in flight
-//!   until its ack wait passes, so counting them would let a poisoned intent hold a
-//!   merge back. Prefrontal reads this before a merge.
+//!   `undelivered` and delivered-but-unacked (`in_flight`) intents, and `pending` as
+//!   their sum. In-flight intents count because a merge deletes the durable and purges
+//!   its subject, so an intent mid-claim whose claimant then naks would be lost. The
+//!   server keeps an intent that exhausted `max_deliver` in flight until it is termed
+//!   or acked, or until the durable delivers another message, so an exhausted intent
+//!   its claimant never termed holds a merge back until then or until an operator
+//!   acts. Prefrontal reads this before a merge.
 //!
 //! Merge is not a ck-bus op: copying messages is a workload publish, which ck-bus never
 //! holds. Prefrontal performs it with the delivery-authority grant (R15).
@@ -419,6 +421,6 @@ pub async fn effects_pending(
         "bound": bound,
         "undelivered": undelivered,
         "in_flight": in_flight,
-        "pending": undelivered,
+        "pending": undelivered + in_flight,
     }))
 }

@@ -1474,13 +1474,21 @@ SECTION governs.
     durables its registry says should exist, and deletes a durable only once that
     agent's registry row is terminal, never on absence alone.
   - `ckbus.agent_effects_pending {agent_id}` replies `{agent_id, stream, durable, bound,
-    undelivered, in_flight, pending}` for the agent's EFFECT durable: `pending` equals
-    `undelivered`, the intents the durable has not delivered yet. Delivered-and-unacked
-    intents are reported as `in_flight` and not counted, because nats-server (v2.15.0,
-    measured by the membership row) keeps an intent that exhausted max-deliver (and went
-    to the dead-letter subject) in flight until its ack wait passes; counting them would
-    let a poisoned intent block a merge. An intent in flight when a merge deletes `from`
-    is the claimant's to finish: its ack to the deleted durable fails harmlessly.
+    undelivered, in_flight, pending}` for the agent's EFFECT durable: `pending` is
+    `undelivered + in_flight`, each also reported on its own. In-flight
+    (delivered-and-unacked) intents count because a merge deletes `from` and purges its
+    subjects, so an intent mid-claim whose claimant then naks would be lost. Losing an
+    intent silently is worse than a merge that waits for an operator. nats-server
+    (v2.15.0, measured by the membership row) keeps an intent that exhausted
+    max-deliver in flight until it is termed or acked, or until the durable delivers
+    another message; neither the ack wait nor repeated naks release it, and a term
+    releases it at once. The claimant (commons
+    `dad55b95`) writes the dead-letter record on the next-to-last delivery and terms on
+    the last, so an intent stays stuck only if its claimant dies on both of those
+    deliveries, and in the usual case its record was already written on the first. ck-bus
+    holds no ack grant on agent durables and cannot release it. Prefrontal escalates to
+    the operator when `pending == in_flight` (non-zero) persists past
+    `max_deliver x ack_wait` (5 x 30 s on a bound durable).
   Merge is prefrontal's, not a ck-bus op: copying is a workload publish, and ck-bus holds
   none (line 609 stands; ck-bus holds signing power and must not also inject messages).
   Prefrontal, holding the delivery-authority grant, merges `from` into `into` in this

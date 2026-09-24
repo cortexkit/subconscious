@@ -70,6 +70,9 @@ use subc_client_rs::consumer::SpawnCursor;
 use subc_control::{ClientControlRequest, ClientControlResponse};
 
 const BOOT_LIMIT: Duration = Duration::from_secs(60);
+/// How long an exit may take to revoke its credential: a third of the reconciliation
+/// period, so a pass cannot come from the periodic reconciliation instead.
+const EXIT_LIMIT: Duration = Duration::from_secs(20);
 
 /// Runs only when the daemon starts this executable as the participant.
 #[test]
@@ -138,7 +141,11 @@ impl Run {
     }
 
     async fn wait_revoked(&self, user: &str) {
-        let deadline = Instant::now() + BOOT_LIMIT;
+        self.wait_revoked_within(user, BOOT_LIMIT).await;
+    }
+
+    async fn wait_revoked_within(&self, user: &str, limit: Duration) {
+        let deadline = Instant::now() + limit;
         while !self.revocations().await.contains_key(user) {
             assert!(
                 Instant::now() < deadline,
@@ -315,7 +322,22 @@ async fn an_exit_revokes_its_generation_and_the_respawn_is_issued_on_its_first_f
 
     let respawned = rows::respawn_participant(&run.run).await;
     assert!(respawned > generation);
-    run.wait_revoked(&first_key).await;
+    // Well inside the 60 s reconciliation period, so it is the exit that revoked it,
+    // which the consumer's own line for that event confirms.
+    run.wait_revoked_within(&first_key, EXIT_LIMIT).await;
+    let handled = bus::events(&run.root(), "ckbus.spawn.event")
+        .into_iter()
+        .find(|line| {
+            line["kind"] == "exited"
+                && line["module_id"] == PARTICIPANT
+                && line["spawn_generation"] == json!(generation)
+        })
+        .expect("the consumer handled the exit");
+    assert_eq!(
+        handled["action"],
+        json!({ "revoked": { "entry_generation": generation } }),
+        "the exit's own fact revoked the credential"
+    );
     assert_eq!(
         run.census_value(PARTICIPANT).await,
         None,

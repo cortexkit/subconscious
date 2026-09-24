@@ -2,6 +2,8 @@ source_repository: cortexkit/prefrontal
 source_commit: b9e827c69d98fb0c1241925961ebb5184752a25a
 source_path: docs/specs/nats-message-plane-foundation.md
 source_sha256: bc306d7478134fb02b3ac5c5cc8271e52b34cbeffd95fb1a999ed5d6916ef657
-golden_path: tests/grants/permission_golden.txt
-golden_sha256: d680d894b3814f6d246105805ea18d68a6469ca5bf90b4b5c897a31eac3d786e
+golden_repository: cortexkit/commons
+golden_commit: ce77ea9555d01133763966e3249339d8a3b17467
+golden_path: crates/cortexkit-bus-naming/tests/grants/permission_golden.txt
+golden_sha256: 8a22e8c273fb8dd2a9dbee71764817e9afd932d8ed6ec3d01fe8b0a0f1c53dfd
 recorded_at: 2026-09-24

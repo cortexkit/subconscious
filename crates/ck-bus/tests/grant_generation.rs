@@ -3,8 +3,8 @@
 //!
 //! The generator in `src/grants`, fed the fixed fixture identities the foundation pins
 //! (`PINNED_GOLDEN_FIXTURE`), emits the participant, bus-module and system-account
-//! permission sets. Rendered as a document, they must equal prefrontal's committed
-//! reference document `permission_golden.txt` (vendored under
+//! permission sets. Rendered as a document, they must equal the naming crate's committed
+//! reference document `permission_golden.txt` (commons, vendored under
 //! `tests/fixtures/foundation/`) except for the header line and the subjects named in
 //! `ADDED_SUBJECTS`. The controls show that a partial-token wildcard, a `deny` entry and
 //! an out-of-lexicon account are each refused.
@@ -180,7 +180,8 @@ fn grant_generation_emits_each_role_set_from_the_pinned_literals() {
     )
     .expect("participant grant");
     let bus = grants::bus_module_grant(&account, fixture.module_id).expect("bus-module grant");
-    let system = grants::system_account_grant(&account).expect("system-account grant");
+    let system = grants::system_account_grant(&account, fixture.system_credential)
+        .expect("system-account grant");
 
     for grant in [&participant, &bus, &system] {
         let principal = grant.role().principal();
@@ -344,6 +345,12 @@ fn vendored_foundation_and_golden_match_their_source_record() {
         field("source_commit"),
         "b9e827c69d98fb0c1241925961ebb5184752a25a"
     );
+    // The golden is the naming crate's own reference at the pinned commons revision,
+    // so it moves with the pin in Cargo.toml.
+    assert_eq!(
+        field("golden_commit"),
+        "ce77ea9555d01133763966e3249339d8a3b17467"
+    );
     for (file, digest_field) in [
         ("nats-message-plane-foundation.md", "source_sha256"),
         ("permission_golden.txt", "golden_sha256"),
@@ -444,10 +451,46 @@ fn disposition_mapping_covers_every_foundation_row() {
 }
 
 #[test]
-fn wired_grant_seam_refuses_by_name_until_bootstrap_supplies_the_account() {
-    use runtime::GrantGeneration;
-    let refusal = grants::GrantSeam
-        .generated_subjects()
-        .expect_err("the wired grant seam has no account before bootstrap and must refuse");
-    assert_eq!(refusal.area(), grants::GRANT_SEAM_UNBOUND);
+fn wired_grant_seam_generates_own_user_grants_for_the_given_account_and_key() {
+    use runtime::{GrantGeneration, OwnUser};
+    let fixture = PINNED_GOLDEN_FIXTURE;
+    let account = grants::derive_account(fixture.account).expect("pinned account derives");
+    let golden = vendored_golden();
+    let bus = grants::GrantSeam
+        .own_user_grant(OwnUser::BusModule, &account, fixture.module_id)
+        .expect("the wired seam generates the bus-module grant");
+    assert_eq!(
+        bus.publish,
+        golden_allows(&golden, Principal::Bus, Operation::Publish)
+    );
+    assert_eq!(
+        bus.subscribe,
+        golden_allows(&golden, Principal::Bus, Operation::Subscribe)
+    );
+    let system = grants::GrantSeam
+        .own_user_grant(OwnUser::SystemAccount, &account, fixture.system_credential)
+        .expect("the wired seam generates the system-account grant");
+    assert_eq!(
+        system.publish,
+        golden_allows(&golden, Principal::System, Operation::Publish)
+    );
+    assert_eq!(
+        system.subscribe,
+        golden_allows(&golden, Principal::System, Operation::Subscribe)
+    );
+    // The user key names the inbox, so a different key yields a different grant: the
+    // seam really takes it as an argument.
+    let other = grants::GrantSeam
+        .own_user_grant(OwnUser::SystemAccount, &account, "cksysother")
+        .expect("another system user key");
+    assert!(other.subscribe.contains("_INBOX.cksysother.>"));
+    assert_ne!(other, system);
+    // A key outside the credential lexicon is refused by name, never issued.
+    let refused = grants::GrantSeam
+        .own_user_grant(OwnUser::BusModule, &account, "bad.key")
+        .expect_err("a dotted user key must be refused");
+    assert!(
+        matches!(refused, runtime::GrantSeamError::Refused(_)),
+        "{refused:?}"
+    );
 }

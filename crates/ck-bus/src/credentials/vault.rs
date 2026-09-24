@@ -200,7 +200,8 @@ fn classify_call_error(error: CallError) -> VaultError {
     }
 }
 
-fn subc_arg(args: impl IntoIterator<Item = OsString>) -> Option<PathBuf> {
+/// The daemon connection file from `--subc <path>` or `--subc=<path>`.
+pub fn subc_arg(args: impl IntoIterator<Item = OsString>) -> Option<PathBuf> {
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         if arg == "--subc" {

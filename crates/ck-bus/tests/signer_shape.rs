@@ -319,13 +319,22 @@ fn fixtures_carry_no_production_root() {
             "the golden pair must not carry production material {production}"
         );
     }
-    let refused = std::panic::catch_unwind(|| {
-        signer::assert_not_production(signer::PRODUCTION_CREDENTIAL_ID, "00", "00")
-    });
-    assert!(
-        refused.is_err(),
-        "the guard must fail a fixture using the production id"
-    );
+    // The guard is on key material: a supervised ck-bus asks for its roots by their
+    // production credential ids, so the harness signer answers under those ids, but
+    // only ever with throwaway keys.
+    for (public_key_hex, key_id) in [
+        (signer::PRODUCTION_PUBLIC_KEY_HEX, "00"),
+        ("00", signer::PRODUCTION_KEY_ID),
+    ] {
+        let refused = std::panic::catch_unwind(|| {
+            signer::assert_not_production(signer::PRODUCTION_CREDENTIAL_ID, public_key_hex, key_id)
+        });
+        assert!(
+            refused.is_err(),
+            "the guard must fail a fixture holding the production root's key material"
+        );
+    }
+    signer::assert_not_production(signer::PRODUCTION_CREDENTIAL_ID, "00", "00");
 }
 
 /// The production binary carries no signer. Three reads, each with a positive control

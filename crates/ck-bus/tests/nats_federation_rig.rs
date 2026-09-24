@@ -721,13 +721,23 @@ async fn publish_until_received(
 /// connection and receiving it back proves the SUB is in place. The marker is consumed
 /// here and never reaches the caller.
 async fn subscribe_confirmed(client: &async_nats::Client, subject: &str) -> async_nats::Subscriber {
+    subscribe_confirmed_via(client, subject, subject).await
+}
+
+/// `subscribe_confirmed` for a wildcard subscription, which cannot be published to:
+/// the marker goes to `marker_subject`, a literal subject the wildcard covers.
+async fn subscribe_confirmed_via(
+    client: &async_nats::Client,
+    subject: &str,
+    marker_subject: &str,
+) -> async_nats::Subscriber {
     let mut sub = client
         .subscribe(subject.to_string())
         .await
         .expect("subscribe");
     let marker = format!("subscription-registered-{}", client.new_inbox());
     client
-        .publish(subject.to_string(), marker.clone().into())
+        .publish(marker_subject.to_string(), marker.clone().into())
         .await
         .expect("publish subscription marker");
     client.flush().await.expect("flush");
@@ -886,13 +896,12 @@ async fn rig2_local_subjects_stay_off_the_leaf() {
     let b_fed = connect(&rig.b.url(), &rig.b_fed).await;
     let b_local = connect(&rig.b.url(), &rig.b_local).await;
 
-    // The widest possible hub-side interest in the user account.
-    let mut hub_all = hub.subscribe(">").await.expect("hub >");
-    let mut b_fed_all = b_fed.subscribe(">").await.expect("b fed >");
-    let mut b_local_all = b_local.subscribe(">").await.expect("b local >");
-    hub.flush().await.expect("flush");
-    b_fed.flush().await.expect("flush");
-    b_local.flush().await.expect("flush");
+    // The widest possible hub-side interest in the user account. Each `>` is confirmed
+    // registered before anything is published, so an empty drain below means nothing
+    // arrived, not that the subscription was not yet in place.
+    let mut hub_all = subscribe_confirmed_via(&hub, ">", "rig.marker.hub").await;
+    let mut b_fed_all = subscribe_confirmed_via(&b_fed, ">", "rig.marker.b_fed").await;
+    let mut b_local_all = subscribe_confirmed_via(&b_local, ">", "rig.marker.b_local").await;
 
     // Positive control: the hub's `>` really does pull A's FED traffic across, so a
     // silent hub subscription below means the subject stayed home, not a dead probe.
@@ -958,9 +967,8 @@ async fn rig2_local_subjects_stay_off_the_leaf() {
     assert_eq!(leaked(&b_local_seen), 0, "A LOCAL traffic reached B LOCAL");
 
     // Reverse direction: a hub publish on a subject A's LOCAL account listens to.
-    let mut a_local_all = a_local.subscribe(">").await.expect("a local >");
+    let mut a_local_all = subscribe_confirmed_via(&a_local, ">", "rig.marker.a_local").await;
     let mut a_fed_peer = a_fed.subscribe("ck.a.peer.>").await.expect("a fed sub");
-    a_local.flush().await.expect("flush");
     a_fed.flush().await.expect("flush");
     let attempts = publish_until_received(
         &hub,

@@ -1,3 +1,4 @@
+pub mod bus;
 pub mod config;
 pub mod control;
 pub mod daemon;

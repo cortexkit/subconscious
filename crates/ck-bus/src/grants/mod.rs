@@ -215,17 +215,24 @@ pub fn bus_module_grant(
     Grant::from_entries(GrantRole::BusModule, account, entries)
 }
 
-/// ck-bus's system-account grant: the kick, the claims update and the connect and
-/// disconnect events, as the naming crate enumerates them.
-pub fn system_account_grant(account: &AccountNames) -> Result<Grant, GrantRefusal> {
-    Grant::from_entries(GrantRole::SystemAccount, account, system_permissions())
+/// ck-bus's system-account grant: the claims update, the claims list and per-account
+/// lookup, the kick, the connect and disconnect events, and the user's own inbox
+/// (`_INBOX.<credential_public>.>`) for the replies, as the naming crate enumerates
+/// them.
+pub fn system_account_grant(
+    account: &AccountNames,
+    credential_public: &str,
+) -> Result<Grant, GrantRefusal> {
+    let entries = system_permissions(credential_public)?;
+    Grant::from_entries(GrantRole::SystemAccount, account, entries)
 }
 
 /// Renders the permission document for a golden fixture from the three role grants.
 ///
 /// The fixture has no real user key, so its module id stands in where a credential
 /// public key goes: the participant's and bus module's inbox subjects read
-/// `_INBOX.<module id>.>`, exactly as in the committed reference document. The
+/// `_INBOX.<module id>.>`, and the system user's reads `_INBOX.<system_credential>.>`,
+/// exactly as in the committed reference document. The
 /// `expect-refused` lines are the naming crate's own expectations for the same fixture;
 /// ck-bus adds none and drops none. The result is checked with the same validator the
 /// naming crate applies to its golden, so a partial-token wildcard or a `deny` line
@@ -240,7 +247,7 @@ pub fn render_fixture_document(fixture: GoldenFixture) -> Result<String, GrantRe
             &[fixture.bound_room],
         )?,
         bus_module_grant(&account, fixture.module_id)?,
-        system_account_grant(&account)?,
+        system_account_grant(&account, fixture.system_credential)?,
     ];
     let expectations = generate_permission_golden(fixture)?;
 
@@ -312,20 +319,61 @@ fn validate_role_entries(
     }
 }
 
-/// The runtime's grant-generation seam as wired at start.
-///
-/// Every grant is derived for the box account `{acct}`, which comes from the machine id
-/// the daemon sends in HELLO_ACK, and reading that id belongs to the bootstrap area. Until
-/// bootstrap supplies the account, this seam answers with a named refusal rather than a
-/// grant for a guessed account. Bootstrap is expected to reshape the seam so it takes the
-/// account names and the user key as arguments.
+impl Grant {
+    /// The generated grant as the runtime seam carries it.
+    pub fn generated(&self) -> crate::runtime::GeneratedGrant {
+        crate::runtime::GeneratedGrant {
+            publish: self.publish.clone(),
+            subscribe: self.subscribe.clone(),
+        }
+    }
+
+    /// Rebuilds a grant from what the runtime seam returned, re-checking every entry
+    /// exactly as a freshly generated grant is checked.
+    pub fn from_generated(
+        role: GrantRole,
+        account: &AccountNames,
+        generated: &crate::runtime::GeneratedGrant,
+    ) -> Result<Self, GrantRefusal> {
+        let principal = role.principal();
+        let entries = generated
+            .publish
+            .iter()
+            .map(|subject| (Operation::Publish, subject))
+            .chain(
+                generated
+                    .subscribe
+                    .iter()
+                    .map(|subject| (Operation::Subscribe, subject)),
+            )
+            .map(|(operation, subject)| AllowEntry {
+                principal,
+                operation,
+                subject: subject.clone(),
+            })
+            .collect();
+        Self::from_entries(role, account, entries)
+    }
+}
+
+/// The runtime's grant-generation seam as wired at start. Bootstrap passes the box
+/// account (derived from the HELLO_ACK machine id) and the user's public key, and gets
+/// back the grant the naming crate generates for that user.
 pub struct GrantSeam;
 
-/// The refusal `GrantSeam` answers with until bootstrap supplies the account.
-pub const GRANT_SEAM_UNBOUND: &str = "grant-generation: account unbound until bootstrap";
-
 impl crate::runtime::GrantGeneration for GrantSeam {
-    fn generated_subjects(&self) -> crate::runtime::SeamResult<BTreeSet<String>> {
-        Err(crate::runtime::AreaNotLanded::new(GRANT_SEAM_UNBOUND))
+    fn own_user_grant(
+        &self,
+        user: crate::runtime::OwnUser,
+        account: &AccountNames,
+        user_public: &str,
+    ) -> Result<crate::runtime::GeneratedGrant, crate::runtime::GrantSeamError> {
+        let grant = match user {
+            crate::runtime::OwnUser::BusModule => bus_module_grant(account, user_public),
+            crate::runtime::OwnUser::SystemAccount => system_account_grant(account, user_public),
+        };
+        grant
+            .map(|grant| grant.generated())
+            .map_err(|refusal| crate::runtime::GrantSeamError::Refused(refusal.to_string()))
     }
 }

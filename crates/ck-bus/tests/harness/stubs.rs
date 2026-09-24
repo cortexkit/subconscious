@@ -7,7 +7,10 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use subc_client_rs::{BindDecision, HandlerOutcome, ModuleHandler, RequestCtx, RouteBindRequest};
 use subc_protocol::{
-    manifest::{Concurrency, ExecutionMode, ModuleManifest, ProviderRole, Tool},
+    manifest::{
+        Concurrency, ExecutionMode, ManagementOperation, ManagementOperationKind, ModuleManifest,
+        ProviderRole, Tool,
+    },
     Principal,
 };
 
@@ -67,6 +70,30 @@ impl StubRecorder {
     }
 
     pub fn manifest(&self) -> ModuleManifest {
+        if self.module_id == "claustrum" {
+            // Claustrum registers its read surface as a management surface
+            // (`credentials-module/src/main.rs::manifest` at 57a501b), not a tool
+            // provider, and the daemon routes by role, so the stub standing in for it
+            // registers the same way.
+            let operations = self
+                .operations
+                .iter()
+                .map(|name| ManagementOperation {
+                    name: name.clone(),
+                    kind: ManagementOperationKind::Query,
+                    description: Some("acceptance harness shape stub".to_string()),
+                })
+                .collect();
+            return ModuleManifest::builder(self.module_id, "0.0.0-harness-stub")
+                .provides(vec![ProviderRole::ManagementSurface {
+                    operations,
+                    config_schema: json!({}),
+                    observability: vec![],
+                    identity_scope: vec![],
+                    concurrency: Concurrency::ModuleManaged,
+                }])
+                .build();
+        }
         let tools = self
             .operations
             .iter()
@@ -107,9 +134,17 @@ impl StubRecorder {
 #[async_trait]
 impl ModuleHandler for StubRecorder {
     async fn handle(&self, _ctx: RequestCtx, body: Vec<u8>) -> HandlerOutcome {
+        // Claustrum's read surface names the operation in `method`; the older stub
+        // requests name it in `op`.
         let operation = serde_json::from_slice::<Value>(&body)
             .ok()
-            .and_then(|value| value.get("op").and_then(Value::as_str).map(str::to_string));
+            .and_then(|value| {
+                value
+                    .get("method")
+                    .or_else(|| value.get("op"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            });
         let Some(operation) = operation else {
             return HandlerOutcome::Error {
                 code: "stub_request_missing_op".to_string(),
@@ -166,6 +201,10 @@ pub fn operation_names(entry: &subc_control::CatalogEntry) -> BTreeSet<String> {
             ProviderRole::ToolProvider { tools, .. } => tools
                 .iter()
                 .map(|tool| tool.name.clone())
+                .collect::<Vec<_>>(),
+            ProviderRole::ManagementSurface { operations, .. } => operations
+                .iter()
+                .map(|operation| operation.name.clone())
                 .collect::<Vec<_>>(),
             _ => Vec::new(),
         })

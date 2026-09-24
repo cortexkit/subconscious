@@ -1,4 +1,7 @@
 mod harness;
+// Only the refusing defaults are exercised here; the seam types the grant and bootstrap
+// areas use are compiled but not constructed.
+#[allow(dead_code)]
 #[path = "../src/runtime/seams.rs"]
 mod runtime_seams;
 
@@ -251,14 +254,19 @@ async fn runtime_defaults_refuse_by_area_name() {
         "revocation",
         "observable revocation refusal must name its area"
     );
-    assert_eq!(
-        runtime_seams::refusing_grant_generation()
-            .generated_subjects()
-            .expect_err("observable grant default must refuse")
-            .area(),
-        "grant-generation",
-        "observable grant refusal must name its area"
-    );
+    let account = cortexkit_bus_naming::AccountNames::derive("box_declaration")
+        .expect("an in-lexicon account derives");
+    match runtime_seams::refusing_grant_generation()
+        .own_user_grant(runtime_seams::OwnUser::BusModule, &account, "ckbus")
+        .expect_err("observable grant default must refuse")
+    {
+        runtime_seams::GrantSeamError::NotLanded(refusal) => assert_eq!(
+            refusal.area(),
+            "grant-generation",
+            "observable grant refusal must name its area"
+        ),
+        other => panic!("the grant default must refuse as not landed, got {other:?}"),
+    }
     assert_eq!(
         runtime_seams::refusing_spawn_stream()
             .consume_spawn_stream()
@@ -373,7 +381,9 @@ async fn assert_stub_catalog(run: &AcceptanceRun, module_id: &str, expected: &[&
 
 async fn assert_stub_principal_controls(run: &AcceptanceRun) {
     let request = |consumer_identity| ClientControlRequest::RouteOpen {
-        target: RouteTarget::ToolProvider {
+        // Claustrum registers its read surface as a management surface, and so does
+        // the stub standing in for it.
+        target: RouteTarget::ManagementSurface {
             module_id: "claustrum".to_string(),
         },
         identity: BindIdentity::new(&*run.root, "ck-bus-acceptance", "principal-control"),

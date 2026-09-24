@@ -25,12 +25,14 @@ use super::{claustrum::RealClaustrum, HarnessSigner};
 use crate::harness::{
     config::{self, SentinelTiming},
     control, data_home,
-    stubs::{StubRecorder, CALLOSUM_OPERATIONS},
+    stubs::{StubRecorder, CALLOSUM_OPERATIONS, CLAUSTRUM_OPERATIONS},
 };
 
 /// What answers `claustrum` in a run.
 pub enum ClaustrumSide<'a> {
     Signer(HarnessSigner),
+    /// The slice-0 shape stub, which answers no signature: the refusing-signer control.
+    Stub,
     /// A real claustrum, with a vault the ceremony already prepared at
     /// `RealClaustrum::vault_dir` under this run's data home.
     Binary(&'a RealClaustrum),
@@ -65,6 +67,17 @@ impl SignerRun {
     }
 
     pub async fn start(root: TestTempDir, ck_bus: &Path, side: ClaustrumSide<'_>) -> Self {
+        Self::start_with(root, ck_bus, side, RunOptions::default()).await
+    }
+
+    /// `start`, with extra `ckbus` environment and, when given, a machine id the daemon
+    /// serves on HELLO_ACK from a file inside the run's tree.
+    pub async fn start_with(
+        root: TestTempDir,
+        ck_bus: &Path,
+        side: ClaustrumSide<'_>,
+        options: RunOptions,
+    ) -> Self {
         let operator_dir = data_home::operator_module_dir();
         if let Some(dir) = &operator_dir {
             // Evidence only while the operator directory lies outside the fixture tree.
@@ -79,10 +92,22 @@ impl SignerRun {
         if let ClaustrumSide::Binary(real) = &side {
             register_claustrum_binary(&config_file, &Self::data_home(&root), real);
         }
+        if !options.ckbus_env.is_empty() {
+            add_ckbus_env(&config_file, &options.ckbus_env);
+        }
         let connection_file = root.join("run/subc-connection.json");
-        let bootstrap = BootstrapConfig::new(&connection_file, 0)
+        // A second daemon on the same tree must not be mistaken for the first one's
+        // connection file.
+        let _ = fs::remove_file(&connection_file);
+        let mut bootstrap = BootstrapConfig::new(&connection_file, 0)
             .with_terminal_journal_path(root.join("run/terminals.jsonl"))
-            .with_capture_logs_dir(root.join("run/logs"))
+            .with_capture_logs_dir(root.join("run/logs"));
+        if let Some(machine_id) = &options.machine_id {
+            let path = root.join("run/machine-id");
+            fs::write(&path, format!("{machine_id}\n")).expect("fixture machine id must write");
+            bootstrap = bootstrap.with_machine_id_path(path);
+        }
+        let bootstrap = bootstrap
             .with_daemon_config_path(&config_file)
             .expect("fixture daemon config must load");
         let daemon = tokio::spawn(run_with_config(bootstrap));
@@ -95,8 +120,15 @@ impl SignerRun {
             callosum.manifest(),
             callosum.clone(),
         )];
-        if let ClaustrumSide::Signer(signer) = side {
-            module_tasks.push(spawn_module(&connection_file, signer.manifest(), signer));
+        match side {
+            ClaustrumSide::Signer(signer) => {
+                module_tasks.push(spawn_module(&connection_file, signer.manifest(), signer));
+            }
+            ClaustrumSide::Stub => {
+                let stub = StubRecorder::refusing("claustrum", CLAUSTRUM_OPERATIONS);
+                module_tasks.push(spawn_module(&connection_file, stub.manifest(), stub));
+            }
+            ClaustrumSide::Binary(_) => {}
         }
         let run = Self {
             root,
@@ -188,6 +220,27 @@ impl SignerRun {
         );
         self.root
     }
+}
+
+/// Options for `SignerRun::start_with`.
+#[derive(Debug, Clone, Default)]
+pub struct RunOptions {
+    pub ckbus_env: Vec<(String, String)>,
+    pub machine_id: Option<String>,
+}
+
+fn add_ckbus_env(config_file: &Path, env: &[(String, String)]) {
+    let mut value: Value =
+        serde_json::from_slice(&fs::read(config_file).expect("rendered config must be readable"))
+            .expect("rendered config must be JSON");
+    for (key, entry) in env {
+        value["modules"]["ckbus"]["env"][key] = Value::String(entry.clone());
+    }
+    fs::write(
+        config_file,
+        serde_json::to_vec_pretty(&value).expect("config encodes"),
+    )
+    .expect("rendered config must be writable");
 }
 
 fn spawn_module<H>(

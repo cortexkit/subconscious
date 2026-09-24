@@ -3,11 +3,11 @@ mod store;
 
 use std::{path::PathBuf, sync::Arc};
 
-pub use seams::{AreaNotLanded, SeamResult};
 pub use seams::{
     Census, CredentialMinting, GrantGeneration, LeafConfiguration, Revocation, SentinelHealth,
     SpawnStream,
 };
+pub use seams::{GeneratedGrant, GrantSeamError, OwnUser, SeamResult};
 pub use store::resolve_store_root;
 
 /// One implementation per runtime capability, each initially an explicit not-implemented placeholder.

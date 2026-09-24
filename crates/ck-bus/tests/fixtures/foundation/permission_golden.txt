@@ -96,10 +96,13 @@ allow bus publish ck.box_goldenfixture.sentinel.ping
 allow bus subscribe $KV.CK_BOX_GOLDENFIXTURE_CENSUS.>
 allow bus subscribe _INBOX.ckbus.>
 allow bus subscribe ck.box_goldenfixture.sentinel.ping
+allow system publish $SYS.REQ.ACCOUNT.*.CLAIMS.LOOKUP
+allow system publish $SYS.REQ.CLAIMS.LIST
 allow system publish $SYS.REQ.CLAIMS.UPDATE
 allow system publish $SYS.REQ.SERVER.*.KICK
 allow system subscribe $SYS.ACCOUNT.*.CONNECT
 allow system subscribe $SYS.ACCOUNT.*.DISCONNECT
+allow system subscribe _INBOX.cksys.>
 
 expect-refused participant publish $JS.ACK.CK_BOX_GOLDENFIXTURE_PEER.c_agent_gold_b.> foreign-consumer
 expect-refused participant publish $JS.API.CONSUMER.CREATE.CK_BOX_GOLDENFIXTURE_EFFECT.c_agent_gold_a consumer-create

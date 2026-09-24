@@ -1,14 +1,18 @@
 // Each runtime capability is installed independently; until then its placeholder returns an explicit not-implemented error.
 #[allow(dead_code)]
 mod runtime;
-// Generated grants. Nothing in the runtime calls them yet; credential issuance, when it
-// lands, is expected to be the first caller.
+// Generated grants. Bootstrap asks the grant seam for ck-bus's own users; the
+// participant grant waits for issuance.
 #[allow(dead_code)]
 mod grants;
-// Vault roots, in-memory user keys and user JWTs. Bootstrap and issuance, when they land,
-// are its callers; until then it is constructed and held but not called.
+// Vault roots, in-memory user keys and user JWTs. Bootstrap signs ck-bus's own users and
+// the box account through it; issuance, when it lands, is the next caller.
 #[allow(dead_code)]
 mod credentials;
+// The machine id, the box account, ck-bus's own users, the census bucket and the five
+// streams.
+#[allow(dead_code)]
+mod bootstrap;
 
 use std::{
     env,
@@ -63,15 +67,24 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let module_id = env::var(SUBC_MODULE_ID_ENV)
         .map_err(|_| format!("{SUBC_MODULE_ID_ENV} is required; ck-bus only runs supervised"))?;
     let store_root = runtime::resolve_store_root()?;
-    let runtime = Arc::new(
-        runtime::Runtime::refusing_defaults(store_root).with_grants(Arc::new(grants::GrantSeam)),
-    );
+    let runtime =
+        runtime::Runtime::refusing_defaults(store_root).with_grants(Arc::new(grants::GrantSeam));
 
-    let _credentials = credentials::Credentials::supervised()?;
+    let credentials = Arc::new(credentials::Credentials::supervised()?);
 
     let sentinel_period_ms = positive_env_ms("CKBUS_SENTINEL_PERIOD_MS", SENTINEL_PERIOD_MS)?;
     let sentinel_timeout_ms = positive_env_ms("CKBUS_SENTINEL_TIMEOUT_MS", SENTINEL_TIMEOUT_MS)?;
     let incarnation = process_incarnation();
+    let bootstrap = bootstrap::Bootstrap::new(
+        bootstrap::BootDeps {
+            credentials,
+            grants: runtime.grants.clone(),
+            store: bootstrap::store::Store::new(runtime.store_root().clone()),
+            incarnation: incarnation.clone(),
+        },
+        std::time::Duration::from_millis(sentinel_period_ms),
+    );
+    let runtime = Arc::new(runtime.with_sentinel_health(bootstrap.health()));
     eprintln!(
         "{}",
         json!({
@@ -84,7 +97,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     );
 
     let manifest = ModuleManifest::builder(&module_id, env!("CARGO_PKG_VERSION")).build();
-    subc_client_rs::serve(manifest, BusHandler { runtime }).await?;
+    bootstrap.serve(manifest, BusHandler { runtime }).await?;
     Ok(())
 }
 

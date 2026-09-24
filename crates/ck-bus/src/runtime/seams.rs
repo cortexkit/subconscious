@@ -45,8 +45,49 @@ pub trait Revocation: Send + Sync {
     async fn resume_revocations(&self) -> SeamResult<()>;
 }
 
+/// Which of ck-bus's own users a grant is generated for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwnUser {
+    /// ck-bus's user in the box account.
+    BusModule,
+    /// ck-bus's user in the system account.
+    SystemAccount,
+}
+
+/// A generated permission set: the allow lists a user JWT carries. There is no deny
+/// list; absence from the allow lists is the denial.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GeneratedGrant {
+    pub publish: BTreeSet<String>,
+    pub subscribe: BTreeSet<String>,
+}
+
+/// Why the grant seam produced no grant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GrantSeamError {
+    NotLanded(AreaNotLanded),
+    /// The generator refused an input or its own output; the message names why.
+    Refused(String),
+}
+
+impl fmt::Display for GrantSeamError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotLanded(area) => area.fmt(f),
+            Self::Refused(reason) => write!(f, "grant refused: {reason}"),
+        }
+    }
+}
+
+/// Generates the grant for one of ck-bus's own users, for the box account `account`
+/// and the user's public key `user_public` (which names its inbox).
 pub trait GrantGeneration: Send + Sync {
-    fn generated_subjects(&self) -> SeamResult<BTreeSet<String>>;
+    fn own_user_grant(
+        &self,
+        user: OwnUser,
+        account: &cortexkit_bus_naming::AccountNames,
+        user_public: &str,
+    ) -> Result<GeneratedGrant, GrantSeamError>;
 }
 
 #[async_trait]
@@ -105,8 +146,13 @@ impl Revocation for RefusingArea {
 }
 
 impl GrantGeneration for RefusingArea {
-    fn generated_subjects(&self) -> SeamResult<BTreeSet<String>> {
-        Err(self.refusal())
+    fn own_user_grant(
+        &self,
+        _user: OwnUser,
+        _account: &cortexkit_bus_naming::AccountNames,
+        _user_public: &str,
+    ) -> Result<GeneratedGrant, GrantSeamError> {
+        Err(GrantSeamError::NotLanded(self.refusal()))
     }
 }
 

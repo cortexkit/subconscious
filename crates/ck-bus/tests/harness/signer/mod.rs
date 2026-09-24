@@ -41,8 +41,10 @@ use subc_protocol::{
 /// The signer's whole vocabulary.
 pub const SIGNER_OPERATIONS: &[&str] = &["credential.sign", "credential.public_key"];
 
-/// The operator's real box-account root. A fixture that carries any of these is using
-/// production material, and the harness fails the run.
+/// The operator's real box-account root. A fixture holding its public key or `key_id`
+/// is using production material, and the harness fails the run. The credential id alone
+/// is not material: a supervised ck-bus asks for its roots by their production ids, and
+/// the signer answers under them with throwaway keys.
 pub const PRODUCTION_CREDENTIAL_ID: &str = "signing:ck-bus-account:1";
 pub const PRODUCTION_PUBLIC_KEY_HEX: &str =
     "c73fe2b0df0d9921f4531bf1277404839a6d630be49ed77dbd29848f3e1bfcfa";
@@ -115,6 +117,16 @@ impl HarnessSigner {
         let pair = KeyPair::new_from_raw(KeyPairType::Account, secret)
             .expect("any 32 bytes are an Ed25519 seed");
         Self::from_roots([(credential_id.to_string(), FixtureRoot::from_pair(pair))])
+    }
+
+    /// A signer holding the given key pairs as roots. The pair's type decides only how
+    /// `FixtureRoot::account_public` spells the key; the signature is the same.
+    pub fn from_pairs(roots: impl IntoIterator<Item = (String, KeyPair)>) -> Self {
+        Self::from_roots(
+            roots
+                .into_iter()
+                .map(|(id, pair)| (id, FixtureRoot::from_pair(pair))),
+        )
     }
 
     fn from_roots(roots: impl IntoIterator<Item = (String, FixtureRoot)>) -> Self {
@@ -269,10 +281,7 @@ impl ModuleHandler for HarnessSigner {
 
 /// Fails the run when fixture material is the operator's production root.
 pub fn assert_not_production(credential_id: &str, public_key_hex: &str, key_id: &str) {
-    assert_ne!(
-        credential_id, PRODUCTION_CREDENTIAL_ID,
-        "a harness fixture must never use the production root's credential id"
-    );
+    let _ = credential_id;
     assert_ne!(
         public_key_hex, PRODUCTION_PUBLIC_KEY_HEX,
         "a harness fixture must never hold the production root's public key"

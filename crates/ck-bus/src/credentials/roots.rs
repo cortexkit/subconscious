@@ -1,18 +1,24 @@
 //! The vault root keys ck-bus signs with, and how it notices one rotated.
 //!
 //! Root keys are created once by an operator ceremony (`ck auth mint-signing-key`) and
-//! reached by credential id. Every credential-id name must come from
-//! `cortexkit-bus-naming`, and at the pinned commons revision that crate has no
-//! constructor for root credential ids, so resolving a root refuses with
-//! `naming-constructor-absent` naming the missing constructor. ck-bus never writes the id
-//! as a literal of its own. Callers that already hold an id (the acceptance harness's
-//! fixture roots) pass it in directly.
+//! reached by credential id. Every credential id comes from `cortexkit-bus-naming`'s
+//! `root_credential_id`; ck-bus writes only the provider token and generation, never
+//! the id as a literal.
+//!
+//! The operator has two keys (`docs/designs/nats-install-trust-chain.md`, sections 1
+//! and 7). The ROOT is the operator identity: it self-signs the operator JWT and signs
+//! the system account JWT, once, by ceremony at install, and ck-bus never uses it. The
+//! SIGNER is listed in the operator JWT's `signing_keys` and signs the box account JWT,
+//! including every revocation update; ck-bus holds `sign` and `read` on it.
 
 use std::{
     collections::HashMap,
     fmt,
+    num::NonZeroU32,
     sync::{Mutex, MutexGuard},
 };
+
+use cortexkit_bus_naming::{root_credential_id, NamingError, RootCredentialKind};
 
 /// The recorded condition name for a name the naming crate cannot construct yet.
 pub const NAMING_CONSTRUCTOR_ABSENT: &str = "naming-constructor-absent";
@@ -24,39 +30,67 @@ pub enum RootCredential {
     BoxAccount,
     /// Signs ck-bus's system-account user JWT.
     SystemAccount,
-    /// The box-local operator signing key: signs the two account JWTs, including every
-    /// revocation claims update.
-    Operator,
+    /// The operator identity. Signs only the operator JWT and the system account JWT,
+    /// by ceremony at install. ck-bus has no use for it and never asks the vault for it.
+    OperatorRoot,
+    /// The operator signing key: signs the box account JWT, including every revocation
+    /// claims update.
+    OperatorSigner,
     /// Signs ck-bus's federation-account user JWT.
     FederationAccount,
     /// Signs per-message sender signatures for cross-machine deliveries.
     MessageSigning,
 }
 
-/// The naming crate cannot construct this root's credential id yet.
+/// Why ck-bus has no credential id to call the vault with for a root.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NamingConstructorAbsent {
-    pub root: RootCredential,
-    pub constructor: &'static str,
+pub enum RootIdRefusal {
+    /// The root is used only by the install ceremony, never by ck-bus.
+    NoCkBusUse { root: RootCredential },
+    /// The naming crate refused the provider token.
+    Naming(NamingError),
 }
 
-impl fmt::Display for NamingConstructorAbsent {
+impl fmt::Display for RootIdRefusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{NAMING_CONSTRUCTOR_ABSENT}: cortexkit-bus-naming has no {} for the {:?} root",
-            self.constructor, self.root
-        )
+        match self {
+            Self::NoCkBusUse { root } => write!(
+                f,
+                "the {root:?} key signs only by operator ceremony; ck-bus never uses it"
+            ),
+            Self::Naming(error) => write!(f, "{NAMING_CONSTRUCTOR_ABSENT}: {error}"),
+        }
     }
 }
 
 impl RootCredential {
-    /// The credential id to call the vault with.
-    pub fn credential_id(self) -> Result<String, NamingConstructorAbsent> {
-        Err(NamingConstructorAbsent {
-            root: self,
-            constructor: "root credential id constructor (signing:<provider>:<generation>)",
-        })
+    /// The provider token and generation the operator minted this root under
+    /// (`ck auth mint-signing-key --id signing:<provider>[:<generation>]`).
+    pub const fn provider(self) -> (&'static str, Option<u32>) {
+        match self {
+            Self::BoxAccount => ("ck-bus-account", Some(1)),
+            Self::SystemAccount => ("ck-bus-sysaccount", Some(1)),
+            Self::OperatorRoot => ("ck-bus-operator-root", Some(1)),
+            Self::OperatorSigner => ("ck-bus-operator-signer", Some(1)),
+            Self::FederationAccount => ("ck-bus-fedaccount", Some(1)),
+            // CKCRED's latest note names it without a generation.
+            Self::MessageSigning => ("msgsig", None),
+        }
+    }
+
+    /// The credential id to call the vault with. The operator root refuses: ck-bus
+    /// never signs with it.
+    pub fn credential_id(self) -> Result<String, RootIdRefusal> {
+        if self == Self::OperatorRoot {
+            return Err(RootIdRefusal::NoCkBusUse { root: self });
+        }
+        let (provider, generation) = self.provider();
+        root_credential_id(
+            RootCredentialKind::Signing,
+            provider,
+            generation.and_then(NonZeroU32::new),
+        )
+        .map_err(RootIdRefusal::Naming)
     }
 }
 

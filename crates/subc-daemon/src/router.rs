@@ -9,7 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use subc_protocol::{ErrorBody, Flags, FrameType, Priority};
+use subc_protocol::{error_codes, ErrorBody, Flags, FrameType, Priority};
 use tokio::sync::{mpsc, Notify};
 use tracing::debug;
 
@@ -1256,7 +1256,7 @@ impl RouterError {
                 *channel,
                 *epoch,
                 *corr,
-                "unknown_channel",
+                error_codes::UNKNOWN_CHANNEL,
                 format!("unknown channel {channel}"),
             ),
             Self::StaleRouteEpoch {
@@ -1267,7 +1267,7 @@ impl RouterError {
                 *channel,
                 *epoch,
                 *corr,
-                "stale_route_epoch",
+                error_codes::STALE_ROUTE_EPOCH,
                 format!("stale route epoch for channel {channel}"),
             ),
             Self::Backend {

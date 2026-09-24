@@ -335,6 +335,16 @@ pub(crate) struct ForwardingCutover {
     pub incumbent: Option<ModuleEndpointId>,
 }
 
+/// What tearing down one connection released.
+#[derive(Debug)]
+pub(crate) struct ConnectionCleanup {
+    /// Routes whose other end must be sent GOODBYE.
+    pub released: Vec<GoodbyeTarget>,
+    /// Pending route.bind relays to the closed module that were aborted: opens
+    /// that had not been bound yet. Zero when a client connection closed.
+    pub abandoned_relays: u32,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct PendingRelayCompletion {
     pub settled: bool,
@@ -2264,12 +2274,27 @@ impl ForwardingTable {
         &self,
         connection_id: ConnectionId,
     ) -> Result<Vec<GoodbyeTarget>, ForwardingError> {
+        self.cleanup_connection_counted(connection_id)
+            .map(|cleanup| cleanup.released)
+    }
+
+    /// [`Self::cleanup_connection`], also reporting how many pending
+    /// route.bind relays to the closed module were aborted. That count is the
+    /// `abandoned` figure of the `route.closed` push sent for a lost module
+    /// connection; it is always zero for a client connection.
+    pub(crate) fn cleanup_connection_counted(
+        &self,
+        connection_id: ConnectionId,
+    ) -> Result<ConnectionCleanup, ForwardingError> {
         let mut inner = self.write_inner()?;
         inner.closing_connections.insert(connection_id);
-        let released = if let Some(endpoint) = inner.endpoint_by_connection.remove(&connection_id) {
+        let cleanup = if let Some(endpoint) = inner.endpoint_by_connection.remove(&connection_id) {
             remove_module_connection_locked(&mut inner, endpoint)
         } else {
-            Self::cleanup_client_connection_locked(&mut inner, connection_id)
+            ConnectionCleanup {
+                released: Self::cleanup_client_connection_locked(&mut inner, connection_id),
+                abandoned_relays: 0,
+            }
         };
         // The closing mark refuses new work for a connection whose teardown is
         // still pending. This is the latest point at which lifting it is safe:
@@ -2280,7 +2305,7 @@ impl ForwardingTable {
         // mark past this point only grew the set by one entry per connection
         // for the life of the daemon.
         inner.closing_connections.remove(&connection_id);
-        Ok(released)
+        Ok(cleanup)
     }
 
     fn cleanup_client_connection_locked(
@@ -2811,7 +2836,7 @@ fn enqueue_hello_ack_locked(
 fn remove_module_connection_locked(
     inner: &mut ForwardingInner,
     endpoint: ModuleEndpointId,
-) -> Vec<GoodbyeTarget> {
+) -> ConnectionCleanup {
     inner.draining_endpoints.remove(&endpoint);
     let module_id = inner.module_id_by_endpoint.remove(&endpoint);
     if let Some(module_id) = module_id.as_ref() {
@@ -2862,6 +2887,7 @@ fn remove_module_connection_locked(
         .into_iter()
         .filter_map(|key| inner.pending_relays.remove(&key))
         .collect();
+    let abandoned_relays = u32::try_from(pending.len()).unwrap_or(u32::MAX);
     for pending in pending {
         let module_label = module_id.as_deref().unwrap_or("unknown");
         let _ = pending
@@ -2903,7 +2929,10 @@ fn remove_module_connection_locked(
             released.push(target);
         }
     }
-    released
+    ConnectionCleanup {
+        released,
+        abandoned_relays,
+    }
 }
 
 #[derive(Debug, Clone, Copy)]

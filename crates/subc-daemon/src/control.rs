@@ -1406,7 +1406,7 @@ impl ControlHandler {
                     .and_then(|endpoint| self.forwarding.endpoint_routes(endpoint).ok())
                     .map(|routes| (registration.manifest.module_id, routes))
             });
-        if let Some((module_id, routes)) = crash_closed {
+        let crash_closed = crash_closed.map(|(module_id, routes)| {
             let terminal = match self.supervisor.get(&module_id) {
                 None => false,
                 Some(module) => match module.will_recover_after_connection_loss() {
@@ -1432,6 +1432,18 @@ impl ControlHandler {
                     RouteCloseReason::Crash
                 }
             };
+            (module_id, routes, reason, terminal)
+        });
+        let registrations = self.deregister_connection(connection_id);
+        let cleanup = self.forwarding.cleanup_connection_counted(connection_id);
+        // The route.closed push waits for forwarding teardown because only
+        // teardown knows how many pending route.bind relays it aborted. It still
+        // goes out before the GOODBYEs for the released routes, and its targets
+        // were captured above, before teardown removed those routes.
+        if let Some((module_id, routes, reason, terminal)) = crash_closed {
+            let abandoned = cleanup
+                .as_ref()
+                .map_or(0, |cleanup| cleanup.abandoned_relays);
             send_route_control_pushes(
                 &self.forwarding,
                 routes,
@@ -1439,15 +1451,14 @@ impl ControlHandler {
                     module_id,
                     reason,
                     drained: false,
-                    abandoned: 0,
+                    abandoned,
                     excluded_subscriptions: 0,
                     terminal: Some(terminal),
                 },
             );
         }
-        let registrations = self.deregister_connection(connection_id);
-        if let Ok(released_routes) = self.forwarding.cleanup_connection(connection_id) {
-            self.emit_route_goodbyes(released_routes);
+        if let Ok(cleanup) = cleanup {
+            self.emit_route_goodbyes(cleanup.released);
         }
         // Signal the registration-release watch only now that BOTH registry and
         // forwarding teardown are done, so a supervisor waiting to spawn a

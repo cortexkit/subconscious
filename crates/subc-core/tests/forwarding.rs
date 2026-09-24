@@ -3189,6 +3189,108 @@ async fn quiesced_drain_reports_abandoned_bindings_without_claiming_they_drained
     module.stop().await.unwrap();
 }
 
+/// A module connection lost while a route.open to it is still waiting on the
+/// module's bind reply reports that open in `abandoned`, the same as a drain
+/// does, instead of a constant zero.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn module_connection_loss_reports_pending_route_open_as_abandoned() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor(&server, 1, Duration::from_millis(10));
+    let module_id = "fake-aft-crash-abandoned";
+    // The stub answers the first bind and never answers any later one, so the
+    // second client's route.open stays pending until the module goes away.
+    let (module, events_path) = spawn_stub_with_events(
+        &server,
+        &supervisor,
+        module_id,
+        "crash-abandoned",
+        [("FAKE_AFT_BIND_NEVER_REPLY_AFTER", "1")],
+    )
+    .await;
+
+    let project = TestProject::new();
+    let mut live_client = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    let live_ack = attach_on_stream(
+        &mut live_client,
+        &project,
+        441,
+        "ses-crash-abandoned-live",
+        module_id,
+    )
+    .await;
+
+    let mut pending_client = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    write_frame(
+        &mut pending_client,
+        &attach_frame(
+            442,
+            attach_request(&project, "ses-crash-abandoned-pending", module_id),
+        ),
+    )
+    .await
+    .unwrap();
+    pending_client.flush().await.unwrap();
+    wait_for_stub_event_count(
+        &events_path,
+        SETUP_TIMEOUT,
+        |event| event["kind"] == "attach",
+        2,
+    )
+    .await;
+
+    module.stop().await.unwrap();
+
+    let closed = read_frame_timeout(&mut live_client).await;
+    assert_route_lifecycle_push(
+        &closed,
+        "route.closed",
+        module_id,
+        "crash",
+        Some(false),
+        Some(1),
+        Some(false),
+    );
+    let goodbye = read_frame_timeout(&mut live_client).await;
+    assert_eq!(goodbye.header.ty, FrameType::Goodbye);
+    assert_eq!(goodbye.header.channel, live_ack.route_channel);
+    let pending_error = read_frame_timeout(&mut pending_client).await;
+    assert_eq!(pending_error.header.ty, FrameType::Error);
+    assert_eq!(pending_error.header.corr, 442);
+}
+
+/// The zero arm of the test above: a lost module connection with no route.open
+/// pending reports `abandoned: 0`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn module_connection_loss_without_pending_route_open_reports_zero_abandoned() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor(&server, 1, Duration::from_millis(10));
+    let module_id = "fake-aft-crash-none-abandoned";
+    let module = spawn_stub(&server, &supervisor, module_id).await;
+
+    let project = TestProject::new();
+    let (mut client, ack) = attach_client(&server, &project, 451, "ses-crash-none-abandoned").await;
+
+    module.stop().await.unwrap();
+
+    let closed = read_frame_timeout(&mut client).await;
+    assert_route_lifecycle_push(
+        &closed,
+        "route.closed",
+        module_id,
+        "crash",
+        Some(false),
+        Some(0),
+        Some(false),
+    );
+    let goodbye = read_frame_timeout(&mut client).await;
+    assert_eq!(goodbye.header.ty, FrameType::Goodbye);
+    assert_eq!(goodbye.header.channel, ack.route_channel);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn supervisor_reload_new_binary_failure_returns_reload_failed_and_counts_crash_cap() {
     let server = TestServer::start().await;

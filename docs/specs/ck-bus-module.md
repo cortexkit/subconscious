@@ -1438,6 +1438,18 @@ SECTION governs.
   - `ckbus.agent_durable_merge {from, into}` binds `into` if absent, republishes every
     message still queued for `from` to `into`'s subject, then deletes `from`. Messages
     accepted before a merge are never lost: today's delivery refuses a merged agent and
-    points senders at the survivor.
+    points senders at the survivor. Merge is retry-safe rather than atomic. It reads
+    `from`'s high-water mark first, republishes each message up to it with
+    `Nats-Msg-Id: merge:<from>:<stream_seq>` so a retry inside the stream's duplicate
+    window is dropped by JetStream, and keeps every original header, including
+    prefrontal's delivery id. It deletes `from` only after every message up to the mark
+    is copied, and replies `merged` only after the delete. A retry that finds `from`
+    absent and `into` present succeeds. The end-to-end guarantee is prefrontal's delivery
+    id, deduplicated at delivery: a duplicate that outlives the window after a long crash
+    is dropped there.
+  - `ckbus.agent_durables_list` replies `[{agent_id, durable, pending, filter_subject}]`
+    (`pending` is the undelivered count). Prefrontal reconciles against it at boot and
+    on a slow cadence: it binds durables its registry says should exist, and deletes a
+    durable only once that agent's registry row is terminal, never on absence alone.
   Issuance step 4 no longer creates `c_{agent_id}` durables; prefrontal's bind does. The
   membership row keeps rooms only, still gated on `membership-contract-unpinned`.

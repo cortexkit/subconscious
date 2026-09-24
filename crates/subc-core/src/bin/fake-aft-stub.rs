@@ -239,7 +239,7 @@ async fn main() -> Result<(), StubError> {
     // path and not only to the exit-only shapes.
     echo_requested_env();
     if let Ok(path) = env::var(FAKE_AFT_PID_PATH_ENV) {
-        fs::write(path, std::process::id().to_string()).map_err(StubError::Io)?;
+        write_pid_file(Path::new(&path)).map_err(StubError::Io)?;
     }
 
     if let Some(fixture) = fixture_from_sidecar()? {
@@ -317,6 +317,22 @@ async fn run_never_connect() -> Result<(), StubError> {
     // rather than the supervisor's teardown.
     std::future::pending::<()>().await;
     unreachable!("a pending future never resolves");
+}
+
+/// Publishes this process's pid at `path` by writing a sibling temp file and
+/// renaming it into place. A respawned stub overwrites its predecessor's pid
+/// file while tests poll it; a plain `fs::write` truncates first, so a reader
+/// could see an empty file between the truncate and the write. The rename
+/// replaces the file whole, so a reader sees either the old pid or the new one.
+/// The temp name carries this pid, so two stubs writing the same path never
+/// share a temp file.
+fn write_pid_file(path: &Path) -> io::Result<()> {
+    let pid = std::process::id();
+    let mut temporary = path.as_os_str().to_owned();
+    temporary.push(format!(".{pid}.tmp"));
+    let temporary = PathBuf::from(temporary);
+    fs::write(&temporary, pid.to_string())?;
+    fs::rename(&temporary, path)
 }
 
 fn announce_never_connect_ready() -> Result<(), StubError> {

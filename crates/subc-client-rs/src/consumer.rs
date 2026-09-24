@@ -1160,7 +1160,9 @@ impl SubcConsumer {
         let deadline = Instant::now() + self.shared.opts.call_timeout;
         let body = serde_json::to_vec(&ClientControlRequest::SupervisorSpawnSubscribe { since })
             .map_err(|err| {
-                CallError::not_sent(format!("failed to encode supervisor.spawn_subscribe: {err}"))
+                CallError::not_sent(format!(
+                    "failed to encode supervisor.spawn_subscribe: {err}"
+                ))
             })?;
         loop {
             self.shared.ensure_connected_for_call(deadline).await?;
@@ -7081,8 +7083,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn spawn_subscribe_sends_its_cursor_on_channel_zero_and_yields_events_until_stream_end()
-    {
+    async fn spawn_subscribe_sends_its_cursor_on_channel_zero_and_yields_events_until_stream_end() {
         let (shared, _rx, mut subscription, request) =
             spawn_subscribed(Some(spawn_cursor(7))).await;
         assert_eq!(request.header.channel, 0);
@@ -7104,8 +7105,12 @@ mod tests {
         for event in &events {
             let body = serde_json::to_vec(event).unwrap();
             assert!(
-                dispatch_frame(&shared, 1, channel_zero_frame(FrameType::StreamData, corr, body))
-                    .await
+                dispatch_frame(
+                    &shared,
+                    1,
+                    channel_zero_frame(FrameType::StreamData, corr, body)
+                )
+                .await
             );
         }
         assert!(

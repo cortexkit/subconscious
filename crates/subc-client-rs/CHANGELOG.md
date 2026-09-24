@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.19.4 — 2026-09-24
+
+- `SpawnStreamError`'s three coded variants carry `body: Box<ErrorBody>` instead of an inline
+  `ErrorBody`, so the error stays small when workspace features enlarge `ErrorBody`. Reading
+  `body.code` or `body.detail` is unchanged. 0.19.3 was never published.
+
 ## 0.19.3 — 2026-09-24
 
 - Add `SubcConsumer::spawn_subscribe`, the typed `supervisor.spawn_subscribe` call on channel 0:

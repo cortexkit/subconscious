@@ -9904,6 +9904,9 @@ mod job_containment_tests {
             drain_child_to_state(
                 &self.module_id,
                 ModuleProtocol::Subc,
+                // No forwarding table in this fixture, so nothing reaches the
+                // child over a connection.
+                StopNotice::NotSent,
                 &self.registry,
                 &self.snapshot,
                 &self.terminal_ring,

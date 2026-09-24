@@ -71,8 +71,7 @@ fn run_console_report() {
 
 #[cfg(windows)]
 fn has_console() -> bool {
-    // SAFETY: GetConsoleWindow takes no arguments and only reads process state.
-    !unsafe { windows_sys::Win32::System::Console::GetConsoleWindow() }.is_null()
+    subc_jobobject::has_console_window()
 }
 
 #[cfg(not(windows))]

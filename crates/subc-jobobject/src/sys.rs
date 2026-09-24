@@ -224,6 +224,14 @@ pub fn set_suspended_creation_flags_async(command: &mut tokio::process::Command)
     command.creation_flags(CONTAINMENT_CREATION_FLAGS);
 }
 
+/// Whether this process has a console window.
+///
+/// Safety: `GetConsoleWindow` takes no arguments, only reads this process's
+/// console attachment, and returns null when there is none.
+pub fn has_console_window() -> bool {
+    !unsafe { windows_sys::Win32::System::Console::GetConsoleWindow() }.is_null()
+}
+
 /// Find the primary thread of `pid` and open it with resume rights.
 ///
 /// A suspended process has exactly one thread, so the first match is the one to

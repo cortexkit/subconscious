@@ -175,6 +175,12 @@ pub fn process_exists(pid: u32) -> bool {
     sys::process_exists(pid)
 }
 
+/// Whether this process has a console window. A contained child should not:
+/// see [`CONTAINMENT_CREATION_FLAGS`].
+pub fn has_console_window() -> bool {
+    sys::has_console_window()
+}
+
 /// A child and the job that contains it, held together.
 ///
 /// The daemon spawns, assigns, and resumes in sequence; keeping the job beside

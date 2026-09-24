@@ -1,4 +1,4 @@
-//! The subc side of issuance: the two issuance ops and the membership area's agent-durable
+//! The subc side of issuance: the three issuance ops and the membership area's agent-durable
 //! ops advertised on ck-bus's management surface, the principal each route was bound
 //! with, and the wiring `main.rs` calls.
 //!
@@ -56,6 +56,7 @@ pub fn advertise(builder: ModuleManifestBuilder) -> ModuleManifest {
     let issuance = [
         (super::CREDENTIAL_OP, ManagementOperationKind::Mutate),
         (super::NONCE_SIGN_OP, ManagementOperationKind::Query),
+        (super::CREDENTIAL_RENEW_OP, ManagementOperationKind::Mutate),
     ]
     .into_iter()
     .map(|(name, kind)| (name, kind, "ck-bus participant credential issuance"));
@@ -126,7 +127,13 @@ impl<H> IssuanceHandler<H> {
         if let Some(outcome) = self.membership.answer(principal, method, &params).await {
             return Some(frame(outcome));
         }
-        if method != super::CREDENTIAL_OP && method != super::NONCE_SIGN_OP {
+        if ![
+            super::CREDENTIAL_OP,
+            super::NONCE_SIGN_OP,
+            super::CREDENTIAL_RENEW_OP,
+        ]
+        .contains(&method)
+        {
             return None;
         }
         // Recorded so the log shows a claimed id was seen and not used.
@@ -149,6 +156,20 @@ impl<H> IssuanceHandler<H> {
                 .issue(&module_id)
                 .await
                 .map(|answer| answer.to_json()),
+            Ok(module_id) if method == super::CREDENTIAL_RENEW_OP => {
+                match params.get("credential_public").and_then(Value::as_str) {
+                    Some(credential_public) => self
+                        .issuance
+                        .renew(&module_id, credential_public)
+                        .await
+                        .map(|answer| answer.to_json()),
+                    None => Err(Refusal::new(
+                        code::BAD_REQUEST,
+                        "ckbus.credential_renew requires params.credential_public, the key \
+                         being renewed",
+                    )),
+                }
+            }
             Ok(module_id) => match params
                 .get("nonce_b64")
                 .and_then(Value::as_str)

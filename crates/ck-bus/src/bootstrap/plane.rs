@@ -15,7 +15,7 @@ use std::{fmt, sync::Arc, time::Duration};
 
 use async_nats::jetstream::{self, kv, stream};
 use async_trait::async_trait;
-use cortexkit_bus_naming::{AccountNames, DiscardPolicy, StreamSpec, MIB};
+use cortexkit_bus_naming::{AccountNames, DiscardPolicy, StreamKind, StreamSpec, MIB};
 use futures_util::StreamExt;
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, mpsc};
@@ -42,6 +42,89 @@ const SERVER_ERROR_BACKLOG: usize = 64;
 /// that does not fit is refused, and issuance fails loudly, instead of the server
 /// evicting a live process's entry, which would read as that process being revoked.
 pub const CENSUS_MAX_BYTES: i64 = 16 * MIB as i64;
+
+/// Every stream's duplicate window is stated rather than left to the server default.
+///
+/// The four workload streams (room, wake, peer, effect): a publisher that lost the ack
+/// of a publish (a timeout, a reconnect) retries within seconds, and prefrontal's merge
+/// reruns a recopy (`Nats-Msg-Id: merge:<from>:<seq>`) soon after a failure, so two
+/// minutes covers both with a wide margin. A longer window costs server memory for
+/// every message id published within it, and a duplicate that outlives the window is
+/// still dropped end to end by prefrontal's delivery id.
+pub const WORKLOAD_DUPLICATE_WINDOW: Duration = Duration::from_secs(2 * 60);
+/// The dead-letter stream: a claimant that dies between storing its record and
+/// terminating the item has its record republished, under the same message id, on the
+/// spare delivery, which the server makes no sooner than one effect-durable ack wait
+/// (30 s) later. The window must cover that wait plus the claim and the republish; two
+/// minutes is four ack waits. A republish later than that (no claimant was pulling) is
+/// stored again, and ck-bus's dead-letter consumer still records it once per message
+/// id.
+pub const DEAD_LETTER_DUPLICATE_WINDOW: Duration = Duration::from_secs(2 * 60);
+/// The census bucket: KV puts carry no message id, so the window deduplicates nothing
+/// there; it is stated at the value nats-server gives a KV bucket without a TTL.
+pub const CENSUS_DUPLICATE_WINDOW: Duration = Duration::from_secs(2 * 60);
+
+/// The duplicate window of the shipped stream of `kind`.
+pub fn duplicate_window(kind: StreamKind) -> Duration {
+    match kind {
+        StreamKind::EffectDead => DEAD_LETTER_DUPLICATE_WINDOW,
+        StreamKind::Room | StreamKind::Wake | StreamKind::Peer | StreamKind::Effect => {
+            WORKLOAD_DUPLICATE_WINDOW
+        }
+    }
+}
+
+/// The census bucket's backing stream as ck-bus creates it.
+pub fn census_config(account: &AccountNames) -> stream::Config {
+    let buckets = account.buckets();
+    // The census is a KV bucket: history 1, no TTL. It is created as its backing
+    // stream directly, because the client library's bucket helper first reads the
+    // account's JetStream info, which ck-bus's grant does not allow.
+    // Every limit is stated: history 1 and no TTL (a zero max age) are the
+    // foundation's; the size cap is `CENSUS_MAX_BYTES`; message and consumer counts
+    // are unlimited (-1) because history 1 bounds the first and every participant's
+    // census watch is a consumer.
+    stream::Config {
+        name: buckets.census_stream.clone(),
+        subjects: vec![format!("$KV.{}.>", buckets.census)],
+        max_messages_per_subject: 1,
+        max_bytes: CENSUS_MAX_BYTES,
+        max_messages: -1,
+        max_consumers: -1,
+        max_age: Duration::ZERO,
+        duplicate_window: CENSUS_DUPLICATE_WINDOW,
+        allow_rollup: true,
+        deny_delete: true,
+        allow_direct: true,
+        discard: stream::DiscardPolicy::New,
+        storage: stream::StorageType::File,
+        num_replicas: 1,
+        ..Default::default()
+    }
+}
+
+/// A shipped stream as ck-bus creates it, every limit stated.
+pub fn stream_config(spec: &StreamSpec) -> stream::Config {
+    stream::Config {
+        name: spec.name.clone(),
+        subjects: spec.subjects.clone(),
+        max_age: spec.max_age,
+        duplicate_window: duplicate_window(spec.kind),
+        max_bytes: i64::try_from(spec.max_bytes).unwrap_or(i64::MAX),
+        discard: match spec.discard {
+            DiscardPolicy::Old => stream::DiscardPolicy::Old,
+            DiscardPolicy::New => stream::DiscardPolicy::New,
+        },
+        retention: if spec.work_queue {
+            stream::RetentionPolicy::WorkQueue
+        } else {
+            stream::RetentionPolicy::Limits
+        },
+        storage: stream::StorageType::File,
+        num_replicas: 1,
+        ..Default::default()
+    }
+}
 
 /// One stored census value and the KV revision it is stored at. The revision is what a
 /// compare-and-delete names, so a value overwritten since it was read is never deleted.
@@ -301,14 +384,23 @@ impl NatsBroker {
     ) -> Result<async_nats::Client, PlaneError> {
         let credentials = self.credentials.clone();
         let user = user_public.to_string();
-        async_nats::ConnectOptions::with_jwt(jwt.to_string(), move |nonce| {
+        // Every connect, reconnects included, presents the user's current JWT: the
+        // renewal task replaces it before `exp`, so the reconnect nats-server forces at
+        // expiry uses the renewed one (R16).
+        credentials.own_jwts.set(user_public, jwt);
+        async_nats::ConnectOptions::with_auth_callback(move |nonce| {
             let credentials = credentials.clone();
             let user = user.clone();
             async move {
-                credentials
-                    .custody
-                    .sign_nonce(&user, &nonce)
-                    .map_err(|superseded| async_nats::AuthError::new(superseded.to_string()))
+                let mut auth = async_nats::Auth::new();
+                auth.jwt = credentials.own_jwts.get(&user);
+                auth.signature = Some(
+                    credentials
+                        .custody
+                        .sign_nonce(&user, &nonce)
+                        .map_err(|superseded| async_nats::AuthError::new(superseded.to_string()))?,
+                );
+                Ok(auth)
             }
         })
         // Replies come back on the user's own inbox, the only inbox its grant allows.
@@ -527,30 +619,7 @@ pub struct NatsBox {
 #[async_trait]
 impl BoxPlane for NatsBox {
     async fn ensure_census(&self, account: &AccountNames) -> Result<(), PlaneError> {
-        let buckets = account.buckets();
-        // The census is a KV bucket: history 1, no TTL. It is created as its backing
-        // stream directly, because the client library's bucket helper first reads the
-        // account's JetStream info, which ck-bus's grant does not allow.
-        // Every limit is stated: history 1 and no TTL (a zero max age) are the
-        // foundation's; the size cap is `CENSUS_MAX_BYTES`; message and consumer counts
-        // are unlimited (-1) because history 1 bounds the first and every participant's
-        // census watch is a consumer.
-        let config = stream::Config {
-            name: buckets.census_stream.clone(),
-            subjects: vec![format!("$KV.{}.>", buckets.census)],
-            max_messages_per_subject: 1,
-            max_bytes: CENSUS_MAX_BYTES,
-            max_messages: -1,
-            max_consumers: -1,
-            max_age: Duration::ZERO,
-            allow_rollup: true,
-            deny_delete: true,
-            allow_direct: true,
-            discard: stream::DiscardPolicy::New,
-            storage: stream::StorageType::File,
-            num_replicas: 1,
-            ..Default::default()
-        };
+        let config = census_config(account);
         // Update first, create when absent: a census stream an earlier ck-bus created
         // without the size cap is brought to it rather than refused as a configuration
         // mismatch, and its values are kept.
@@ -563,25 +632,7 @@ impl BoxPlane for NatsBox {
     }
 
     async fn ensure_stream(&self, spec: &StreamSpec) -> Result<(), PlaneError> {
-        let config = stream::Config {
-            name: spec.name.clone(),
-            subjects: spec.subjects.clone(),
-            max_age: spec.max_age,
-            max_bytes: i64::try_from(spec.max_bytes).unwrap_or(i64::MAX),
-            discard: match spec.discard {
-                DiscardPolicy::Old => stream::DiscardPolicy::Old,
-                DiscardPolicy::New => stream::DiscardPolicy::New,
-            },
-            retention: if spec.work_queue {
-                stream::RetentionPolicy::WorkQueue
-            } else {
-                stream::RetentionPolicy::Limits
-            },
-            storage: stream::StorageType::File,
-            num_replicas: 1,
-            ..Default::default()
-        };
-        self.create(config).await
+        self.create(stream_config(spec)).await
     }
 
     async fn publish(&self, subject: &str, payload: Vec<u8>) -> Result<(), PlaneError> {

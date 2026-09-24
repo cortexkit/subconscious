@@ -21,6 +21,8 @@ pub struct UserJwtRequest<'a> {
     pub issuer_account: Option<&'a str>,
     pub name: &'a str,
     pub issued_at: i64,
+    /// The `exp` claim; production callers take it from `lifetime::JwtLifetime`.
+    pub expires_at: i64,
     pub grant: &'a Grant,
 }
 
@@ -29,6 +31,8 @@ pub struct SignedUserJwt {
     pub jwt: String,
     /// The census's `user_jwt_id`.
     pub jti: String,
+    /// The token's `exp` claim, as requested.
+    pub exp: i64,
     /// The root's public nkey, which the token names as issuer.
     pub issuer: String,
     pub root_key_id: String,
@@ -107,6 +111,7 @@ pub async fn sign_user_jwt(
             issuer_account: request.issuer_account,
             name: request.name,
             issued_at: request.issued_at,
+            expires_at: request.expires_at,
             grant: request.grant,
         }
         .unsigned();
@@ -128,6 +133,7 @@ pub async fn sign_user_jwt(
         return Ok(SignedUserJwt {
             jwt: unsigned.assemble(&signature.signature),
             jti: unsigned.jti().to_string(),
+            exp: request.expires_at,
             issuer,
             root_key_id: root.key_id,
             rotated_from,

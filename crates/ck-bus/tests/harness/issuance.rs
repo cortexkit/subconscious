@@ -379,6 +379,45 @@ impl VerdictClient {
         Ok(Self { client, events })
     }
 
+    /// Connects presenting whatever `jwt` holds at each connect, reconnects included, so
+    /// a holder that renews its JWT (R16) replaces it there before the old one's `exp`.
+    pub async fn connect_renewable(
+        url: &str,
+        jwt: Arc<Mutex<String>>,
+        sign: NonceSigner,
+        inbox_prefix: String,
+    ) -> Result<Self, async_nats::ConnectError> {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let recorded = events.clone();
+        let client = async_nats::ConnectOptions::with_auth_callback(move |nonce| {
+            let presented = jwt.lock().unwrap().clone();
+            // As in `connect`: the signing runs as its own task, only its handle is awaited.
+            let signing = tokio::spawn(sign(nonce));
+            async move {
+                let signature = signing
+                    .await
+                    .map_err(|error| async_nats::AuthError::new(error.to_string()))?
+                    .map_err(async_nats::AuthError::new)?;
+                let mut auth = async_nats::Auth::new();
+                auth.jwt = Some(presented);
+                auth.signature = Some(signature);
+                Ok(auth)
+            }
+        })
+        .event_callback(move |event| {
+            let recorded = recorded.clone();
+            async move {
+                recorded.lock().unwrap().push(event.to_string());
+            }
+        })
+        .connection_timeout(Duration::from_secs(5))
+        .request_timeout(Some(Duration::from_secs(3)))
+        .custom_inbox_prefix(inbox_prefix)
+        .connect(url)
+        .await?;
+        Ok(Self { client, events })
+    }
+
     /// Every event the connection reported, in order.
     pub fn events(&self) -> Vec<String> {
         self.events.lock().unwrap().clone()

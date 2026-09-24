@@ -11,8 +11,9 @@
 //!   the dead-letter record and is SIGKILLed before `term()`: the claimant waits on its
 //!   stdin between the two calls, so the kill lands exactly there. At the kill the
 //!   record is stored and the item is not terminated. ck-bus records the message id
-//!   once. The item comes back after its ack wait, a second claimant publishes the same
-//!   record again and terms it, and ck-bus still holds one record for the id.
+//!   once. The item comes back after its ack wait on the delivery after the cap (the
+//!   durable's last, kept spare for exactly this), a second claimant publishes the same
+//!   record again and terms it there, and ck-bus still holds one record for the id.
 //! - One record per message id, across a ck-bus restart. A record republished with a
 //!   different `Nats-Msg-Id` (what a republish after the stream's duplicate window
 //!   looks like) is a duplicate of the first, naming its sequence; another message id is
@@ -24,9 +25,11 @@
 //!   records it. A record recorded and not settled is recorded again by the next
 //!   process with the same sequence, never as a second record for its id.
 //!
-//! The claimant's cap is one below the effect durable's max-deliver of 5. With the two
-//! equal, the server would never offer the killed claimant's last delivery again, and
-//! the crash could not leave the item redeliverable as the foundation states.
+//! The claimant's cap is not set here: the commons work queue derives it from the
+//! durable's own `max_deliver`, one below it, so the effect durable's 5 gives 4. The
+//! delivery after the cap is the spare the server still offers, and that is where a
+//! claimant killed between the record and `term()` gets its work finished. The claimant
+//! reports the cap it derived and the arm checks it is 4.
 
 #[allow(dead_code)]
 #[path = "../src/bootstrap/mod.rs"]
@@ -96,8 +99,10 @@ const BOOT_LIMIT: Duration = Duration::from_secs(60);
 const RECORD_LIMIT: Duration = Duration::from_secs(20);
 const AGENT: &str = "agent_dead_a";
 const SESSION: &str = "sess_dead_1";
-/// One below `issuance::EFFECT_MAX_DELIVER` (see the module comment).
-const CLAIMANT_CAP: u32 = 4;
+/// The cap the claimant must derive from the effect durable's shipped max-deliver of 5:
+/// one below it, leaving the last delivery spare. Written out rather than computed, so
+/// a derivation that drifts shows up here.
+const DERIVED_CAP: u64 = 4;
 /// Names the claimant child's configuration; set only when this executable runs as it.
 const CLAIMANT_ENV: &str = "CKBUS_DEAD_LETTER_CLAIMANT";
 /// The claimant child's protocol lines start with this, apart from libtest's own output.
@@ -188,6 +193,8 @@ impl Run {
                 issuer_account: Some(&self.account_public()),
                 name,
                 issued_at: unix_now() - 60,
+                expires_at: unix_now() - 60
+                    + credentials::lifetime::USER_JWT_LIFETIME.as_secs() as i64,
                 grant,
             },
         )
@@ -446,10 +453,10 @@ async fn claimant_main(config: Value) {
         .work_queue(
             config["stream"].as_str().unwrap(),
             config["durable"].as_str().unwrap(),
-            config["cap"].as_u64().unwrap() as u32,
         )
         .await
         .expect("the claimant binds its work queue");
+    say(&format!("cap {}", queue.max_deliveries()));
     let deadline = Instant::now() + Duration::from_secs(90);
     let exhausted = loop {
         match queue.claim().await.expect("claim") {
@@ -482,10 +489,9 @@ async fn claimant_main(config: Value) {
         ack.stream_seq, exhausted.item.delivery_count
     ));
     if read_stdin_line().await == "term" {
+        // `term()` returns once the server has confirmed it, so no flush is needed
+        // before the parent ends this process.
         queue.term(exhausted.item.token).await.expect("term");
-        // `term()` only queues the ack; the flush is what puts it on the wire before
-        // the parent ends this process.
-        connection.client().flush().await.expect("flush the term");
         say("termed");
     }
 }
@@ -504,7 +510,6 @@ impl Claimant {
             "url": run.server.url,
             "stream": names.streams().effect,
             "durable": AccountNames::consumer_name(AGENT).unwrap(),
-            "cap": CLAIMANT_CAP,
             "dead_stream": names.streams().effect_dead,
             "dead_subject": names.effect_dead(),
         });
@@ -566,6 +571,15 @@ impl Claimant {
         }
     }
 
+    /// The cap the claimant's work queue derived from its durable.
+    async fn cap(&mut self) -> u64 {
+        self.expect("cap ", Duration::from_secs(20))
+            .await
+            .trim()
+            .parse()
+            .unwrap()
+    }
+
     /// The stored sequence from a `published <seq> delivery <n>` line.
     async fn published(&mut self, limit: Duration) -> (u64, u64) {
         let rest = self.expect("published ", limit).await;
@@ -612,8 +626,9 @@ async fn a_claimant_killed_between_the_record_and_term_leaves_one_record() {
 
     // The first claimant exhausts its cap, stores the record and is killed before term.
     let mut first = Claimant::spawn(&run).await;
+    assert_eq!(first.cap().await, DERIVED_CAP);
     let (record_sequence, delivery) = first.published(Duration::from_secs(60)).await;
-    assert_eq!(delivery, u64::from(CLAIMANT_CAP));
+    assert_eq!(delivery, DERIVED_CAP);
     first.kill().await;
     assert_eq!(
         stored(&observer, &names.streams().effect_dead).await,
@@ -632,11 +647,18 @@ async fn a_claimant_killed_between_the_record_and_term_leaves_one_record() {
         names.effect_intent(AGENT, SESSION).unwrap()
     );
 
-    // The item comes back once its ack wait runs out. The second claimant publishes the
-    // same record again (the stream keeps the one it has) and terms the item.
+    // The item comes back once its ack wait runs out, on the spare delivery. The second
+    // claimant publishes the same record again (the stream keeps the one it has) and
+    // terms the item on that delivery.
     let mut second = Claimant::spawn(&run).await;
+    assert_eq!(second.cap().await, DERIVED_CAP);
     let (again, delivery) = second.published(Duration::from_secs(80)).await;
-    assert_eq!(delivery, u64::from(CLAIMANT_CAP) + 1);
+    assert_eq!(
+        delivery,
+        DERIVED_CAP + 1,
+        "the item is terminated on the spare delivery, the durable's last"
+    );
+    assert_eq!(delivery, membership::EFFECT_MAX_DELIVER as u64);
     assert_eq!(again, record_sequence, "the republish is the stored record");
     second.send("term").await;
     second.expect("termed", Duration::from_secs(20)).await;

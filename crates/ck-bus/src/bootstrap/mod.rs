@@ -20,6 +20,10 @@
 //!    single census entry ck-bus writes for itself), and publishes on its sentinel
 //!    subject.
 //!
+//! Both users' JWTs expire 15 minutes after issue (R16); a renewal task per user
+//! (`credentials::renewal`) re-signs the same key before then, and each connection
+//! presents the renewed JWT when nats-server makes it reconnect at the old one's `exp`.
+//!
 //! Later boots re-sign the account JWT for the same id and never re-key: the account id
 //! owns the account's JetStream data. A different machine id while a box account for
 //! the old one exists is refused, never answered with a second account; the operator
@@ -58,6 +62,7 @@ use crate::{
     credentials::{
         issue::{sign_user_jwt, UserJwtRequest},
         nkey::{encode_public, NkeyRole},
+        renewal::{self, OwnRenewal, RenewalTask},
         roots::RootCredential,
         vault::VaultError,
         Credentials,
@@ -128,6 +133,9 @@ pub struct Ready {
     pub box_user: String,
     pub system: Arc<dyn SystemPlane>,
     pub box_plane: Arc<dyn BoxPlane>,
+    /// The tasks renewing the system-account and box-account users' JWTs (R16); dropping
+    /// this aborts them.
+    pub renewals: Vec<RenewalTask>,
 }
 
 /// Everything a boot attempt needs besides the broker.
@@ -312,6 +320,8 @@ pub async fn boot(
     let system_user = custody.generate_user();
     let system_grant = own_grant(deps, OwnUser::SystemAccount, &names, &system_user)
         .map_err(|error| Failure::stop(cause::SYSACCOUNT_ABSENT, error))?;
+    let lifetime = deps.credentials.lifetime;
+    let system_issued_at = unix_now();
     let system_jwt = sign_user_jwt(
         vault,
         &deps.credentials.key_ids,
@@ -320,7 +330,8 @@ pub async fn boot(
             user_public: &system_user,
             issuer_account: Some(&config.system_account),
             name: "ckbus-system",
-            issued_at: unix_now(),
+            issued_at: system_issued_at,
+            expires_at: lifetime.expires_at(system_issued_at),
             grant: &system_grant,
         },
     )
@@ -371,6 +382,17 @@ pub async fn boot(
         .connect_system(&system_jwt.jwt, &system_user)
         .await
         .map_err(|error| Failure::retry(cause::SYSACCOUNT_ABSENT, error.to_string()))?;
+    let mut renewals = vec![renewal::spawn(
+        deps.credentials.clone(),
+        OwnRenewal {
+            root_credential_id: system_root_id.clone(),
+            user_public: system_user.clone(),
+            issuer_account: config.system_account.clone(),
+            name: "ckbus-system".to_string(),
+            grant: system_grant,
+        },
+        system_issued_at,
+    )];
 
     let (account, existing) =
         resolve_account(system.as_ref(), recorded, machine_id, &names, config, deps).await?;
@@ -412,6 +434,7 @@ pub async fn boot(
     let box_user = custody.generate_user();
     let box_grant = own_grant(deps, OwnUser::BusModule, &names, &box_user)
         .map_err(|error| Failure::stop(cause::BOX_USER_UNISSUABLE, error))?;
+    let box_issued_at = unix_now();
     let box_jwt = sign_user_jwt(
         vault,
         &deps.credentials.key_ids,
@@ -420,7 +443,8 @@ pub async fn boot(
             user_public: &box_user,
             issuer_account: Some(&account.account_public),
             name: "ckbus-box",
-            issued_at: unix_now(),
+            issued_at: box_issued_at,
+            expires_at: lifetime.expires_at(box_issued_at),
             grant: &box_grant,
         },
     )
@@ -437,6 +461,17 @@ pub async fn boot(
         .connect_box(&box_jwt.jwt, &box_user)
         .await
         .map_err(|error| Failure::retry(cause::BOX_USER_UNISSUABLE, error.to_string()))?;
+    renewals.push(renewal::spawn(
+        deps.credentials.clone(),
+        OwnRenewal {
+            root_credential_id: box_root_id.clone(),
+            user_public: box_user.clone(),
+            issuer_account: account.account_public.clone(),
+            name: "ckbus-box".to_string(),
+            grant: box_grant,
+        },
+        box_issued_at,
+    ));
 
     let streams = shipped_streams(&names);
     validate_streams(&streams)
@@ -499,6 +534,7 @@ pub async fn boot(
         box_user,
         system,
         box_plane,
+        renewals,
     })
 }
 

@@ -1,7 +1,8 @@
 //! Issuance: a supervised participant asks ck-bus for its bus credential.
 //!
-//! ck-bus serves two ops over the subc wire, `ckbus.credential` and `ckbus.nonce_sign`.
-//! Both authorize by the principal the daemon stamped on the caller's route at bind time
+//! ck-bus serves three ops over the subc wire, `ckbus.credential`, `ckbus.nonce_sign` and
+//! `ckbus.credential_renew` (R16: the same key re-signed with a fresh `exp`). All three
+//! authorize by the principal the daemon stamped on the caller's route at bind time
 //! and by nothing the caller writes in its request: `Principal::Reserved { module_id }`
 //! (the caller presented its launch nonce) binds the answer to that module id and to the
 //! live spawn generation the supervisor's spawn snapshot shows for it. A body field
@@ -62,12 +63,16 @@ use high_water::{HighWater, HighWaterRefusal};
 pub const CREDENTIAL_OP: &str = "ckbus.credential";
 /// The op a participant calls to have its connect nonce signed.
 pub const NONCE_SIGN_OP: &str = "ckbus.nonce_sign";
+/// The op a participant calls to renew its JWT before `exp` (R16): the same key and
+/// epoch, re-signed with a fresh `iat` and `exp`.
+pub const CREDENTIAL_RENEW_OP: &str = "ckbus.credential_renew";
 
 /// Refusal codes, each an Error frame code on the caller's request.
 pub mod code {
     pub const PRINCIPAL_DIRECT: &str = "ckbus_principal_direct";
     pub const GENERATION_NOT_LIVE: &str = "ckbus_generation_not_live";
     pub const CREDENTIAL_SUPERSEDED: &str = super::CREDENTIAL_SUPERSEDED;
+    pub const CREDENTIAL_REVOKED: &str = crate::credentials::custody::CREDENTIAL_REVOKED;
     /// Bootstrap has not finished: no box account connection to issue under yet.
     pub const NOT_READY: &str = "ckbus_not_ready";
     /// The supervisor's spawn snapshot could not be read, so nothing is fenced and
@@ -142,6 +147,8 @@ pub struct Issued {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CredentialAnswer {
     pub jwt: String,
+    /// The JWT's `exp` claim, so the holder schedules its renewal without decoding it.
+    pub exp: i64,
     pub acct: String,
     pub account_public: String,
     pub inbox_prefix: String,
@@ -153,12 +160,37 @@ impl CredentialAnswer {
     pub fn to_json(&self) -> Value {
         json!({
             "jwt": self.jwt,
+            "exp": self.exp,
             "acct": self.acct,
             "account_public": self.account_public,
             "inbox_prefix": self.inbox_prefix,
             "server_url": self.server_url,
             "credential_public": self.issued.credential_public,
             "user_jwt_id": self.issued.user_jwt_id,
+            "spawn_generation": self.issued.spawn_generation,
+            "credential_epoch": self.issued.credential_epoch,
+        })
+    }
+}
+
+/// The answer to `ckbus.credential_renew`: the renewed JWT and its `exp`, and the
+/// credential it renews, so a renewal that raced a supersede is recognisable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenewAnswer {
+    pub jwt: String,
+    pub exp: i64,
+    /// The renewed token's own `jti`. The census keeps the `user_jwt_id` of the issue.
+    pub user_jwt_id: String,
+    pub issued: Issued,
+}
+
+impl RenewAnswer {
+    pub fn to_json(&self) -> Value {
+        json!({
+            "jwt": self.jwt,
+            "exp": self.exp,
+            "user_jwt_id": self.user_jwt_id,
+            "credential_public": self.issued.credential_public,
             "spawn_generation": self.issued.spawn_generation,
             "credential_epoch": self.issued.credential_epoch,
         })
@@ -379,6 +411,7 @@ impl Issuance {
         // 6. The answer.
         Ok(CredentialAnswer {
             jwt: signed.jwt,
+            exp: signed.exp,
             acct: plane.names.account().to_string(),
             account_public: plane.account_public.clone(),
             inbox_prefix: format!("_INBOX.{user_public}"),
@@ -400,6 +433,7 @@ impl Issuance {
         let root_id = RootCredential::BoxAccount
             .credential_id()
             .map_err(|error| Refusal::new(code::NAME_REFUSED, error.to_string()))?;
+        let issued_at = unix_now();
         sign_user_jwt(
             self.credentials.vault.as_ref(),
             &self.credentials.key_ids,
@@ -408,12 +442,103 @@ impl Issuance {
                 user_public,
                 issuer_account: Some(&plane.account_public),
                 name: module_id,
-                issued_at: unix_now(),
+                issued_at,
+                expires_at: self.credentials.lifetime.expires_at(issued_at),
                 grant: &grant,
             },
         )
         .await
         .map_err(|error| Refusal::new(code::SIGNING_FAILED, error.to_string()))
+    }
+
+    /// `ckbus.credential_renew` for the attested `module_id` (R16): re-signs the key the
+    /// caller names with a fresh `iat` and `exp`, at the same generation and epoch. The
+    /// census is not rewritten and nothing is revoked: the caller's connection runs on
+    /// its old JWT until nats-server ends it at that JWT's `exp`, and the reconnect uses
+    /// the renewed one.
+    ///
+    /// Refused, by name, so the caller fetches a new credential with `ckbus.credential`
+    /// instead: `ckbus_credential_revoked` when this process has recorded the key's
+    /// revocation (a revoked key's replacement is always a fresh key), and
+    /// `ckbus_credential_superseded` when the key is not the module's current one
+    /// (replaced by a later issue, or issued by an earlier ck-bus process).
+    pub async fn renew(
+        &self,
+        module_id: &str,
+        credential_public: &str,
+    ) -> Result<RenewAnswer, Refusal> {
+        let _serialized = self.module_lock(module_id).lock_owned().await;
+        let generation = self.live_generation(module_id).await?;
+        let revoked = || {
+            Refusal::new(
+                code::CREDENTIAL_REVOKED,
+                format!(
+                    "{}: {credential_public} is revoked; fetch a fresh credential with \
+                     {CREDENTIAL_OP}",
+                    code::CREDENTIAL_REVOKED
+                ),
+            )
+        };
+        if self.credentials.custody.is_revoked(credential_public) {
+            return Err(revoked());
+        }
+        let current = self
+            .current(module_id)
+            .filter(|current| current.credential_public == credential_public)
+            .filter(|current| self.credentials.custody.holds(&current.credential_public))
+            .ok_or_else(|| {
+                Refusal::new(
+                    code::CREDENTIAL_SUPERSEDED,
+                    format!(
+                        "{CREDENTIAL_SUPERSEDED}: {credential_public} is not {module_id}'s \
+                         current credential; fetch a fresh one with {CREDENTIAL_OP}"
+                    ),
+                )
+            })?;
+        if current.spawn_generation != generation {
+            return Err(Refusal::new(
+                code::GENERATION_NOT_LIVE,
+                format!(
+                    "the held credential for {module_id} is for generation {}, the live \
+                     generation is {generation}",
+                    current.spawn_generation
+                ),
+            ));
+        }
+        let plane = self.plane.current().ok_or_else(|| {
+            Refusal::new(
+                code::NOT_READY,
+                "bootstrap has not finished; no box account connection yet",
+            )
+        })?;
+        let rooms: Vec<String> = Vec::new();
+        let signed = self
+            .sign(&plane, module_id, credential_public, &rooms)
+            .await?;
+        // Checked again after signing: a revocation recorded while the vault signed has
+        // a timestamp no earlier than this JWT's `iat`, so the server would refuse the
+        // token anyway, and answering it would only send the caller a dead credential.
+        if self.credentials.custody.is_revoked(credential_public) {
+            return Err(revoked());
+        }
+        log_event(
+            "ckbus.issuance.renewed",
+            json!({
+                "module_id": module_id,
+                "credential_public": credential_public,
+                "user_jwt_id": signed.jti,
+                "census_user_jwt_id": current.user_jwt_id,
+                "spawn_generation": current.spawn_generation,
+                "credential_epoch": current.credential_epoch,
+                "exp": signed.exp,
+            }),
+        );
+        Ok(RenewAnswer {
+            jwt: signed.jwt,
+            exp: signed.exp,
+            user_jwt_id: signed.jti,
+            issued: current,
+        })
     }
 
     /// Drops a superseded key from memory. Nothing is queued: the revocation area finds

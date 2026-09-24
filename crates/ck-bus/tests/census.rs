@@ -500,6 +500,7 @@ async fn bus_module_plane(run: &Run) -> Plane {
             issuer_account: Some(&account_public),
             name: "census-row-bus-module",
             issued_at: unix_now() - 60,
+            expires_at: unix_now() - 60 + credentials::lifetime::USER_JWT_LIFETIME.as_secs() as i64,
             grant: &grant,
         },
     )
@@ -721,11 +722,15 @@ async fn a_long_lived_participant_keeps_its_key_under_an_advanced_clock() {
         })),
     );
     let issued = issuing.issue(PARTICIPANT).await.expect("issues");
+    // R16 pinned the lifetime: the JWT expires 15 minutes after issue. The key does not:
+    // it outlives any one JWT, which renewal re-signs.
     let claims = bus::claims(&issued.jwt);
-    assert!(
-        claims.get("exp").is_none(),
-        "no expiry is issued while the TTL is unpinned"
+    assert_eq!(
+        claims["exp"].as_i64().unwrap(),
+        claims["iat"].as_i64().unwrap() + 15 * 60,
+        "{claims}"
     );
+    assert_eq!(claims["exp"].as_i64(), Some(issued.exp));
     for _ in 0..24 {
         tokio::time::advance(Duration::from_secs(3600)).await;
     }
@@ -742,6 +747,80 @@ async fn a_long_lived_participant_keeps_its_key_under_an_advanced_clock() {
         recording.census.lock().unwrap().len(),
         1,
         "no rewrite, no removal"
+    );
+    passed_in_process();
+}
+
+#[tokio::test]
+async fn a_renewal_re_signs_the_same_key_and_a_replaced_or_revoked_key_is_refused_by_name() {
+    let signer = HarnessSigner::generated(&[&bus::box_root_id()]);
+    let credentials = Arc::new(Credentials::new(Arc::new(InProcessSigner(signer))));
+    let recording = Arc::new(RecordingPlane::default());
+    let store = tempfile::tempdir().unwrap();
+    let issuing = Issuance::new(
+        credentials.clone(),
+        store.path(),
+        Arc::new(FixedGeneration(1)),
+        Arc::new(FixedPlane(Plane {
+            names: grants::derive_account("box_renewal").unwrap(),
+            account_public: nkeys::KeyPair::new_account().public_key(),
+            server_url: "nats://127.0.0.1:4222".to_string(),
+            box_plane: recording.clone(),
+        })),
+    );
+    let first = issuing.issue(PARTICIPANT).await.expect("issues");
+    let census_before = recording.census.lock().unwrap().clone();
+
+    // Renewed: the same key, generation and epoch, with a fresh exp; the census is not
+    // rewritten and the key still signs.
+    let renewed = issuing
+        .renew(PARTICIPANT, &first.issued.credential_public)
+        .await
+        .expect("the current key renews");
+    assert_eq!(renewed.issued, first.issued);
+    let claims = bus::claims(&renewed.jwt);
+    assert_eq!(claims["sub"], first.issued.credential_public.as_str());
+    assert_eq!(claims["exp"].as_i64(), Some(renewed.exp));
+    assert_eq!(renewed.exp, claims["iat"].as_i64().unwrap() + 15 * 60);
+    assert!(renewed.exp >= first.exp);
+    let reply = renewed.to_json();
+    assert_eq!(reply["exp"], renewed.exp);
+    assert_eq!(reply["spawn_generation"], first.issued.spawn_generation);
+    assert_eq!(reply["credential_epoch"], first.issued.credential_epoch);
+    assert_eq!(*recording.census.lock().unwrap(), census_before);
+    issuing
+        .sign_nonce(PARTICIPANT, Some(&first.issued.credential_public), b"n")
+        .await
+        .expect("the renewed key still signs its nonce");
+
+    // Replaced by a later issue: superseded.
+    let second = issuing.issue(PARTICIPANT).await.expect("issues again");
+    assert_eq!(
+        second.issued.credential_epoch,
+        first.issued.credential_epoch + 1
+    );
+    let refused = issuing
+        .renew(PARTICIPANT, &first.issued.credential_public)
+        .await
+        .expect_err("a replaced key is not renewed");
+    assert_eq!(
+        refused.code,
+        issuance::code::CREDENTIAL_SUPERSEDED,
+        "{refused}"
+    );
+
+    // Revoked, as the revocation area records it before its first step: revoked.
+    credentials
+        .custody
+        .mark_revoked(&second.issued.credential_public);
+    let refused = issuing
+        .renew(PARTICIPANT, &second.issued.credential_public)
+        .await
+        .expect_err("a revoked key is not renewed");
+    assert_eq!(
+        refused.code,
+        issuance::code::CREDENTIAL_REVOKED,
+        "{refused}"
     );
     passed_in_process();
 }

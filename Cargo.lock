@@ -254,7 +254,7 @@ dependencies = [
 
 [[package]]
 name = "ck-bus"
-version = "0.1.19"
+version = "0.1.20"
 dependencies = [
  "async-nats",
  "async-trait",
@@ -352,7 +352,7 @@ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 [[package]]
 name = "cortexkit-bus-inmemory"
 version = "0.1.0"
-source = "git+https://github.com/cortexkit/commons.git?rev=4f09c7c7c7f86394d21abde6ed3f97b582ee4d28#4f09c7c7c7f86394d21abde6ed3f97b582ee4d28"
+source = "git+https://github.com/cortexkit/commons.git?rev=dad55b9578bd272c72dcd5c7ac991793feeb33fb#dad55b9578bd272c72dcd5c7ac991793feeb33fb"
 dependencies = [
  "async-trait",
  "cortexkit-bus-trait",
@@ -362,12 +362,12 @@ dependencies = [
 [[package]]
 name = "cortexkit-bus-naming"
 version = "0.1.0"
-source = "git+https://github.com/cortexkit/commons.git?rev=f884fabeb198949eedec035ac465c1cfb30e9835#f884fabeb198949eedec035ac465c1cfb30e9835"
+source = "git+https://github.com/cortexkit/commons.git?rev=dad55b9578bd272c72dcd5c7ac991793feeb33fb#dad55b9578bd272c72dcd5c7ac991793feeb33fb"
 
 [[package]]
 name = "cortexkit-bus-nats"
 version = "0.1.0"
-source = "git+https://github.com/cortexkit/commons.git?rev=4f09c7c7c7f86394d21abde6ed3f97b582ee4d28#4f09c7c7c7f86394d21abde6ed3f97b582ee4d28"
+source = "git+https://github.com/cortexkit/commons.git?rev=dad55b9578bd272c72dcd5c7ac991793feeb33fb#dad55b9578bd272c72dcd5c7ac991793feeb33fb"
 dependencies = [
  "async-nats",
  "async-trait",
@@ -380,7 +380,7 @@ dependencies = [
 [[package]]
 name = "cortexkit-bus-trait"
 version = "0.1.0"
-source = "git+https://github.com/cortexkit/commons.git?rev=4f09c7c7c7f86394d21abde6ed3f97b582ee4d28#4f09c7c7c7f86394d21abde6ed3f97b582ee4d28"
+source = "git+https://github.com/cortexkit/commons.git?rev=dad55b9578bd272c72dcd5c7ac991793feeb33fb#dad55b9578bd272c72dcd5c7ac991793feeb33fb"
 dependencies = [
  "async-trait",
  "sha2",

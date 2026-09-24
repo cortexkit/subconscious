@@ -24,8 +24,15 @@
 //! - Control: with ck-bus down and nats-server restarted, every participant is
 //!   disconnected and stays so until ck-bus returns (and then reconnects only after a
 //!   refetch). nats-server's parent is the daemon's process, never ck-bus.
-//! - The expiry arm records `user-jwt-ttl-unpinned`, naming the observed JWT without
-//!   `exp`.
+//! - Expiry (R16), under a shortened test lifetime (see `SHORT_LIFETIME`): a holder that
+//!   renews through `ckbus.credential_renew` before `exp` is carried past it (nats-server
+//!   ends its connection at the old JWT's `exp`, and the reconnect presents the renewed
+//!   one), while a holder that never renews is refused after its `exp`. ck-bus's own
+//!   users renew too, and ck-bus keeps issuing and revoking across their expiries. The
+//!   restart arm checks the production lifetime (15 minutes) on a real JWT, and that
+//!   renewing a key the new process never held is refused as superseded and renewing a
+//!   revoked one as revoked.
+//! - A renewal across an in-flight pull acks nothing twice and loses nothing.
 //!
 //! One arm beyond the row's text: the VAULT (Claustrum, the signer ck-bus itself signs
 //! through) refusing and then answering again. The sentinel, health and bootstrap rows
@@ -835,6 +842,14 @@ fn parent_pid(pid: u32) -> u32 {
 /// participants registered and neither holding a credential. `ckbus_backoff_ms` is
 /// ck-bus's crash-restart backoff; `None` keeps the supervisor's default.
 async fn start(ckbus_backoff_ms: Option<u64>) -> Option<Plane> {
+    start_with(ckbus_backoff_ms, Vec::new()).await
+}
+
+/// `start`, with `ckbus_env` added to ck-bus's environment.
+async fn start_with(
+    ckbus_backoff_ms: Option<u64>,
+    ckbus_env: Vec<(String, String)>,
+) -> Option<Plane> {
     let bin = match nats_server_bin() {
         Ok((bin, _)) => bin,
         Err((gate, observation)) => {
@@ -852,7 +867,8 @@ async fn start(ckbus_backoff_ms: Option<u64>) -> Option<Plane> {
     let url = server.url.clone();
     let server_log = server.log.clone();
     let conf = server.dir.join("server.conf");
-    let env = server.ckbus_env();
+    let mut env = server.ckbus_env();
+    env.extend(ckbus_env);
     server.stop().await;
     let guard = ServerGuard { conf: conf.clone() };
 
@@ -1082,6 +1098,22 @@ async fn a_restarted_ckbus_keeps_established_connections_and_supersedes_only_a_f
     }
     assert_eq!(plane.pid("nats-server").await, server_pid);
 
+    // A renewal of the key from before the restart: the new process never held it and
+    // has recorded no revocation of it, so it is superseded.
+    let refused = plane
+        .relay(
+            PARTICIPANT,
+            issuance::CREDENTIAL_RENEW_OP,
+            json!({"credential_public": forced.public()}),
+        )
+        .await
+        .expect_err("a key the restarted ck-bus never held is not renewed");
+    assert_eq!(
+        refused.0,
+        issuance::code::CREDENTIAL_SUPERSEDED,
+        "{refused:?}"
+    );
+
     // Forced to reconnect: the restarted ck-bus holds no seed for its key.
     let forced_ms = now_ms();
     forced
@@ -1128,21 +1160,42 @@ async fn a_restarted_ckbus_keeps_established_connections_and_supersedes_only_a_f
     assert_eq!(untouched.disconnects(), 0);
     plane.exchange(&mut untouched, "after the refetch").await;
 
-    // The expiry arm: no JWT lifetime is pinned, and ck-bus issues none.
+    // R16's production lifetime on the refetched JWT: `exp` 15 minutes after `iat`, and
+    // named in the answer.
     let claims = bus::claims(refetched.answer["jwt"].as_str().unwrap());
-    assert!(claims.get("exp").is_none(), "{claims}");
-    RowReport::skipped(
-        Row::SignerOutage,
-        "user-jwt-ttl-unpinned",
-        format!(
-            "expiry arm: ck-bus issued the epoch-{} user JWT {} with no exp claim; the \
-             foundation names no per-process user JWT lifetime",
-            refetched.epoch(),
-            claims["jti"].as_str().unwrap_or_default()
-        ),
-    )
-    .served_by(ServedBy::HarnessSigner)
-    .emit(&vocabulary());
+    assert_eq!(
+        claims["exp"].as_i64(),
+        claims["iat"].as_i64().map(|iat| iat + 15 * 60),
+        "{claims}"
+    );
+    assert_eq!(refetched.answer["exp"], claims["exp"]);
+
+    // Renewal after the restart. The superseded key is revoked by now (its revocation
+    // was recorded when the refetch was answered), so renewing it is refused as revoked;
+    // the refetched key renews at its own epoch.
+    let refused = plane
+        .relay(
+            PARTICIPANT,
+            issuance::CREDENTIAL_RENEW_OP,
+            json!({"credential_public": forced.public()}),
+        )
+        .await
+        .expect_err("a revoked key is not renewed");
+    assert_eq!(refused.0, issuance::code::CREDENTIAL_REVOKED, "{refused:?}");
+    let renewed = plane
+        .relay(
+            PARTICIPANT,
+            issuance::CREDENTIAL_RENEW_OP,
+            json!({"credential_public": refetched.public()}),
+        )
+        .await
+        .expect("the refetched key renews");
+    assert_eq!(renewed["credential_public"], refetched.public().as_str());
+    assert_eq!(renewed["credential_epoch"], refetched.epoch());
+    assert_eq!(
+        renewed["spawn_generation"],
+        refetched.answer["spawn_generation"]
+    );
 
     passed();
     plane.finish(vec![forced, refetched, untouched]).await;
@@ -1424,4 +1477,551 @@ async fn rows_wait_up(connection_file: &Path, run_root: &Path, ready: &Value, pe
         Duration::from_millis(took) <= period * 2,
         "bus.health.up within two periods of the recovered bootstrap: {took} ms"
     );
+}
+
+// ---- Expiry and renewal (R16) ----
+
+/// The shortened lifetime the expiry arms give ck-bus through the environment variables
+/// a debug build reads for tests (`credentials::lifetime`). The shipped values are 15 minutes and 10 minutes;
+/// these keep the same shape (renewal at half the gap left before `exp`) at a scale a
+/// test can wait for.
+const SHORT_LIFETIME: Duration = Duration::from_secs(8);
+const SHORT_RENEW_AFTER: Duration = Duration::from_secs(4);
+/// How long after a JWT's `exp` a refused reconnect is looked for: the client's
+/// reconnect backoff plus one round trip through ck-bus's nonce signing.
+const AFTER_EXP: Duration = Duration::from_secs(4);
+
+fn short_lifetime_env() -> Vec<(String, String)> {
+    vec![
+        (
+            credentials::lifetime::TEST_LIFETIME_ENV.to_string(),
+            SHORT_LIFETIME.as_millis().to_string(),
+        ),
+        (
+            credentials::lifetime::TEST_RENEW_AFTER_ENV.to_string(),
+            SHORT_RENEW_AFTER.as_millis().to_string(),
+        ),
+    ]
+}
+
+/// A JWT answer's `exp`, in milliseconds since the epoch.
+fn exp_ms(answer: &Value) -> u64 {
+    answer["exp"].as_u64().expect("the answer names exp") * 1000
+}
+
+async fn sleep_until_ms(at_ms: u64) {
+    tokio::time::sleep(Duration::from_millis(at_ms.saturating_sub(now_ms()))).await;
+}
+
+/// One renewal the harness participant asked for: when it was answered, and how.
+#[derive(Debug, Clone)]
+struct Renewed {
+    at_ms: u64,
+    outcome: rows::CkbusReply,
+}
+
+/// Aborts a task when dropped.
+struct TaskGuard(JoinHandle<()>);
+
+impl Drop for TaskGuard {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// A participant that renews its JWT the way R16 describes: `SHORT_RENEW_AFTER` after
+/// each issue it asks `ckbus.credential_renew` for the same key's next JWT and puts it
+/// where its connection's auth callback reads it.
+struct Renewing {
+    participant: Participant,
+    renewals: Arc<Mutex<Vec<Renewed>>>,
+    _task: TaskGuard,
+}
+
+impl Renewing {
+    fn renewals(&self) -> Vec<Renewed> {
+        self.renewals.lock().unwrap().clone()
+    }
+
+    /// The successful renewals' answers.
+    fn renewed(&self) -> Vec<(u64, Value)> {
+        self.renewals()
+            .into_iter()
+            .filter_map(|renewed| renewed.outcome.ok().map(|answer| (renewed.at_ms, answer)))
+            .collect()
+    }
+}
+
+async fn renew_loop(
+    connection_file: PathBuf,
+    module_id: &'static str,
+    public: String,
+    mut exp: u64,
+    jwt: Arc<Mutex<String>>,
+    log: Arc<Mutex<Vec<Renewed>>>,
+) {
+    let early = (SHORT_LIFETIME - SHORT_RENEW_AFTER).as_millis() as u64;
+    loop {
+        sleep_until_ms((exp * 1000).saturating_sub(early)).await;
+        let outcome = relay_to(
+            &connection_file,
+            module_id,
+            issuance::CREDENTIAL_RENEW_OP,
+            json!({"credential_public": public}),
+        )
+        .await
+        .unwrap_or_else(|relay| Err(("relay_failed".to_string(), relay)));
+        if let Ok(answer) = &outcome {
+            *jwt.lock().unwrap() = answer["jwt"].as_str().unwrap().to_string();
+            exp = answer["exp"].as_u64().unwrap();
+        }
+        let failed = outcome.is_err();
+        log.lock().unwrap().push(Renewed {
+            at_ms: now_ms(),
+            outcome,
+        });
+        if failed {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+}
+
+impl Plane {
+    /// `connect`, with a connection that presents its current JWT at every connect and a
+    /// task that keeps that JWT renewed.
+    async fn connect_renewing(&self, module_id: &'static str) -> Result<Renewing, String> {
+        let answer = self
+            .relay(module_id, issuance::CREDENTIAL_OP, json!({}))
+            .await
+            .map_err(|(code, message)| format!("ckbus.credential: {code}: {message}"))?;
+        let public = answer["credential_public"].as_str().unwrap().to_string();
+        let jwt = Arc::new(Mutex::new(answer["jwt"].as_str().unwrap().to_string()));
+        let signs = SignLog::default();
+        let client = VerdictClient::connect_renewable(
+            &self.url,
+            jwt.clone(),
+            recording_signer(
+                self.run.connection_file.clone(),
+                module_id,
+                public.clone(),
+                signs.clone(),
+            ),
+            format!("_INBOX.{public}"),
+        )
+        .await
+        .map_err(|error| format!("connect: {error}"))?;
+        let inbox = client
+            .client
+            .subscribe(format!("_INBOX.{public}.{INBOX_LEAF}"))
+            .await
+            .map_err(|error| format!("subscribe: {error}"))?;
+        client
+            .client
+            .flush()
+            .await
+            .map_err(|error| error.to_string())?;
+        let renewals = Arc::new(Mutex::new(Vec::new()));
+        let task = tokio::spawn(renew_loop(
+            self.run.connection_file.clone(),
+            module_id,
+            public,
+            answer["exp"]
+                .as_u64()
+                .expect("the credential answer names exp"),
+            jwt,
+            renewals.clone(),
+        ));
+        Ok(Renewing {
+            participant: Participant {
+                module_id,
+                answer,
+                client,
+                inbox,
+                signs,
+            },
+            renewals,
+            _task: TaskGuard(task),
+        })
+    }
+}
+
+/// Every issued JWT carries `exp` = `iat` + the lifetime ck-bus runs with, and the answer
+/// names the same `exp`.
+fn assert_short_exp(answer: &Value) {
+    let claims = bus::claims(answer["jwt"].as_str().unwrap());
+    assert_eq!(
+        claims["exp"].as_i64(),
+        claims["iat"]
+            .as_i64()
+            .map(|iat| iat + SHORT_LIFETIME.as_secs() as i64),
+        "{claims}"
+    );
+    assert_eq!(answer["exp"], claims["exp"]);
+}
+
+/// Each successful renewal kept the key, generation and epoch it renewed, pushed `exp`
+/// forward, and the first came before the issued JWT's `exp`.
+fn assert_renewals(renewing: &Renewing) {
+    let answer = &renewing.participant.answer;
+    let renewed = renewing.renewed();
+    assert!(
+        !renewed.is_empty(),
+        "no renewal answered: {:?}",
+        renewing.renewals()
+    );
+    assert!(
+        renewed[0].0 < exp_ms(answer),
+        "the first renewal was answered before the issued JWT's exp: {renewed:?}"
+    );
+    let mut previous_exp = answer["exp"].as_u64().unwrap();
+    for (_, renewal) in &renewed {
+        assert_short_exp(renewal);
+        assert_eq!(renewal["credential_public"], answer["credential_public"]);
+        assert_eq!(renewal["spawn_generation"], answer["spawn_generation"]);
+        assert_eq!(renewal["credential_epoch"], answer["credential_epoch"]);
+        let exp = renewal["exp"].as_u64().unwrap();
+        assert!(exp >= previous_exp, "{renewed:?}");
+        previous_exp = exp;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_renewed_jwt_carries_its_holder_past_exp_and_an_unrefreshed_one_is_refused_after_it() {
+    let _gate = harness::acceptance_gate().await;
+    harness::install_tracing();
+    let Some(plane) = start_with(None, short_lifetime_env()).await else {
+        return;
+    };
+    let mut renewing = plane
+        .connect_renewing(PARTICIPANT)
+        .await
+        .expect("the renewing participant connects");
+    let mut stale = plane
+        .connect(BYSTANDER)
+        .await
+        .expect("the unrefreshed participant connects");
+    assert_short_exp(&renewing.participant.answer);
+    assert_short_exp(&stale.answer);
+    plane
+        .exchange(&mut renewing.participant, "before exp")
+        .await;
+    plane.exchange(&mut stale, "before exp").await;
+
+    // The unrefreshed holder: still connected a second before its exp, disconnected
+    // after it, and refused on the reconnects that follow even though ck-bus signs
+    // their nonces, so it is the server that refuses the expired JWT. nats-server
+    // (2.15) completes the CONNECT of an expired JWT and ends it at once with `User
+    // Authentication Expired`, so the refusal is seen as a connect that is closed as
+    // expired every time, never as a failed CONNECT.
+    let stale_exp_ms = exp_ms(&stale.answer);
+    sleep_until_ms(stale_exp_ms - 1000).await;
+    assert!(stale.connected(), "{:?}", stale.client.events());
+    assert_eq!(stale.disconnects(), 0, "{:?}", stale.client.events());
+    let deadline = Instant::now() + AFTER_EXP + EXCHANGE_LIMIT;
+    while !(stale.disconnects() >= 1 && stale.signatures_since(stale_exp_ms) >= 1) {
+        assert!(
+            Instant::now() < deadline,
+            "the unrefreshed participant was not disconnected and refused after its exp: \
+             events {:?}, refusals {:?}",
+            stale.client.events(),
+            stale.refusals_since(stale_exp_ms)
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    sleep_until_ms(stale_exp_ms + AFTER_EXP.as_millis() as u64).await;
+    let events = stale.client.events();
+    let count = |what: &str| events.iter().filter(|event| event.contains(what)).count();
+    let (connects, expired) = (
+        count("connected") - count("disconnected"),
+        count("User Authentication Expired"),
+    );
+    eprintln!("unrefreshed participant: {connects} connect(s), {expired} expired: {events:?}");
+    assert!(
+        expired >= 2,
+        "its connection was ended at exp and at least one reconnect after it: {events:?}"
+    );
+    assert!(
+        connects <= expired + 1,
+        "every connect after exp was ended as expired (the last may still be closing): \
+         {events:?}"
+    );
+
+    // The renewing holder: across at least two of its JWTs' expiries it is disconnected
+    // by the server and reconnects on the renewed JWT each time, never refused.
+    // Each renewal comes `SHORT_LIFETIME - SHORT_RENEW_AFTER` (4 s) before the current
+    // JWT's exp, so the JWTs expire 4 s apart, and the second renewal lands at the
+    // first JWT's exp, the moment of the reconnect. That reconnect presents the second
+    // JWT or the third, whichever the race gives it, so by the check, made 1.5 s after
+    // the second JWT's exp and well clear of the third's, the server has ended the
+    // connection once or twice. Either way every reconnect presented a JWT that had not
+    // expired, so none was ended at once: one more connect than expiries.
+    let first_exp_ms = exp_ms(&renewing.participant.answer);
+    sleep_until_ms(first_exp_ms).await;
+    assert_renewals(&renewing);
+    let second_exp_ms = exp_ms(&renewing.renewed()[0].1);
+    sleep_until_ms(second_exp_ms + 1500).await;
+    let count = || {
+        let events = renewing.participant.client.events();
+        let expired = events
+            .iter()
+            .filter(|event| event.contains("User Authentication Expired"))
+            .count();
+        let connects = events.iter().filter(|event| *event == "connected").count();
+        (expired, connects, events)
+    };
+    let deadline = Instant::now() + Duration::from_secs(1);
+    // Event callbacks run a moment after the state they report, so the counts are
+    // allowed that moment to settle; a reconnect ended as expired would add a third
+    // expiry instead.
+    let settled = || {
+        let (expired, connects, _) = count();
+        renewing.participant.connected() && connects == expired + 1
+    };
+    while !settled() && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let (expired, connects, events) = count();
+    assert!(
+        renewing.participant.connected() && (1..=2).contains(&expired) && connects == expired + 1,
+        "each expiry followed by a lasting reconnect: {events:?}"
+    );
+    assert_renewals(&renewing);
+    assert!(renewing.renewed().len() >= 2, "{:?}", renewing.renewals());
+    assert!(
+        renewing.participant.signatures_since(first_exp_ms) >= 1,
+        "the reconnect after exp re-signed its nonce"
+    );
+    assert_eq!(
+        renewing.participant.refusals_since(0),
+        Vec::<String>::new(),
+        "no nonce signature was refused"
+    );
+    plane
+        .exchange(&mut renewing.participant, "after two expiries")
+        .await;
+
+    // ck-bus's own users renewed as well, and its connections still work past their
+    // expiries: it issues (a census write on its box user) and revokes (an account
+    // update over its system user).
+    for name in ["ckbus-system", "ckbus-box"] {
+        let renewed = bus::events(&plane.root(), "ckbus.credentials.own_renewed")
+            .into_iter()
+            .filter(|line| line["name"] == name)
+            .count();
+        assert!(renewed >= 2, "{name} renewed {renewed} time(s)");
+    }
+    assert!(bus::events(&plane.root(), "ckbus.credentials.own_renewal_failed").is_empty());
+    let mut refetched = plane
+        .connect(BYSTANDER)
+        .await
+        .expect("ck-bus issues after its own users' expiries");
+    assert_eq!(refetched.epoch(), stale.epoch() + 1);
+    plane.exchange(&mut refetched, "after the refetch").await;
+    plane.wait_revoked(&stale.public()).await;
+    assert!(!plane
+        .revocations()
+        .await
+        .contains_key(&renewing.participant.public()));
+
+    passed();
+    plane
+        .finish(vec![renewing.participant, stale, refetched])
+        .await;
+}
+
+/// The agent whose peer durable the in-flight pull arm reads.
+const PULL_AGENT: &str = "agent_renewal";
+const PULL_SESSION: &str = "sess_renewal";
+/// Messages published across the renewal, one every `PUBLISH_EVERY`, so the run spans
+/// the first JWT's `exp`.
+const PULL_MESSAGES: usize = 48;
+const PUBLISH_EVERY: Duration = Duration::from_millis(250);
+/// How long the claimant holds each message before acking it, so a delivery is usually
+/// in flight when the server ends the connection.
+const HOLD: Duration = Duration::from_millis(100);
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_renewal_across_an_in_flight_pull_acks_nothing_twice_and_loses_nothing() {
+    use async_nats::jetstream::{self, consumer::pull};
+
+    let _gate = harness::acceptance_gate().await;
+    harness::install_tracing();
+    let Some(plane) = start_with(None, short_lifetime_env()).await else {
+        return;
+    };
+    let names = plane.names();
+    // The agent's peer durable, created by the harness observer with exactly the
+    // configuration prefrontal's bind creates.
+    let durable = membership::agent_durables(&names, PULL_AGENT)
+        .unwrap()
+        .into_iter()
+        .find(|durable| durable.stream == names.streams().peer)
+        .expect("bind plans a peer durable");
+    let observer = jetstream::new(plane.observer.clone());
+    observer
+        .create_consumer_on_stream(
+            pull::Config {
+                durable_name: Some(durable.durable.clone()),
+                filter_subjects: durable.filter_subjects.clone(),
+                ack_policy: jetstream::consumer::AckPolicy::Explicit,
+                deliver_policy: jetstream::consumer::DeliverPolicy::All,
+                ack_wait: durable.ack_wait,
+                max_deliver: durable.max_deliver,
+                max_ack_pending: durable.max_ack_pending,
+                ..Default::default()
+            },
+            durable.stream.clone(),
+        )
+        .await
+        .expect("the peer durable is created");
+
+    let renewing = plane
+        .connect_renewing(PARTICIPANT)
+        .await
+        .expect("the renewing participant connects");
+    let first_exp_ms = exp_ms(&renewing.participant.answer);
+    let claimant = jetstream::new(renewing.participant.client.client.clone());
+    let consumer = claimant
+        .get_consumer_from_stream::<pull::Config, _, _>(&durable.durable, &durable.stream)
+        .await
+        .expect("the participant reads its agent's durable");
+
+    // The publisher: each message stored (its publish ack awaited) before the next.
+    let subject = names.peer_delivery(PULL_AGENT, PULL_SESSION).unwrap();
+    let publisher = {
+        let observer = observer.clone();
+        tokio::spawn(async move {
+            let mut stored = Vec::new();
+            for index in 0..PULL_MESSAGES {
+                let id = format!("renewal-{index}");
+                let mut headers = async_nats::HeaderMap::new();
+                headers.insert("Nats-Msg-Id", id.as_str());
+                let ack = observer
+                    .publish_with_headers(subject.clone(), headers, id.clone().into())
+                    .await
+                    .expect("publish")
+                    .await
+                    .expect("stored");
+                stored.push((id, ack.sequence, now_ms()));
+                tokio::time::sleep(PUBLISH_EVERY).await;
+            }
+            stored
+        })
+    };
+
+    // The claimant: one message per pull, held for `HOLD`, then acked with the server's
+    // confirmation. A message delivered again after a confirmed ack would be acked twice.
+    let loop_started_ms = now_ms();
+    let mut confirmed: std::collections::BTreeMap<String, u32> = Default::default();
+    let mut delivered_after_ack: Vec<String> = Vec::new();
+    let mut unconfirmed_acks: Vec<(String, String)> = Vec::new();
+    let mut pull_errors: Vec<String> = Vec::new();
+    let mut deliveries = 0usize;
+    // Unacked messages come back after the durable's ack wait, so the loop allows it.
+    let deadline = Instant::now() + durable.ack_wait + Duration::from_secs(40);
+    while confirmed.len() < PULL_MESSAGES {
+        assert!(
+            Instant::now() < deadline,
+            "not every message was acked: confirmed {}, unconfirmed {unconfirmed_acks:?}, \
+             pull errors {pull_errors:?}, events {:?}",
+            confirmed.len(),
+            renewing.participant.client.events()
+        );
+        let batch = consumer
+            .fetch()
+            .max_messages(1)
+            .expires(Duration::from_secs(1))
+            .messages()
+            .await;
+        let mut batch = match batch {
+            Ok(batch) => batch,
+            Err(error) => {
+                pull_errors.push(error.to_string());
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
+        while let Some(message) = batch.next().await {
+            let message = match message {
+                Ok(message) => message,
+                Err(error) => {
+                    pull_errors.push(error.to_string());
+                    break;
+                }
+            };
+            deliveries += 1;
+            let id = message
+                .headers
+                .as_ref()
+                .and_then(|headers| headers.get("Nats-Msg-Id"))
+                .map(|id| id.as_str().to_string())
+                .expect("every message carries its id");
+            if confirmed.contains_key(&id) {
+                delivered_after_ack.push(id.clone());
+            }
+            tokio::time::sleep(HOLD).await;
+            match message.double_ack().await {
+                Ok(()) => *confirmed.entry(id).or_default() += 1,
+                Err(error) => unconfirmed_acks.push((id, error.to_string())),
+            }
+        }
+    }
+    let loop_ended_ms = now_ms();
+    let stored = publisher.await.expect("the publisher finished");
+
+    eprintln!(
+        "deliveries {deliveries}, unconfirmed acks {unconfirmed_acks:?}, pull errors \
+         {pull_errors:?}, events {:?}, renewals {:?}, first exp {first_exp_ms}, loop \
+         {loop_started_ms}..{loop_ended_ms}",
+        renewing.participant.client.events(),
+        renewing.renewals()
+    );
+    // The renewal came, and the server-forced reconnect at the old JWT's exp happened,
+    // while the claimant was pulling and messages were still being published.
+    assert_renewals(&renewing);
+    assert!(loop_started_ms < first_exp_ms && first_exp_ms < loop_ended_ms);
+    assert!(stored.iter().any(|(_, _, at)| *at < first_exp_ms));
+    assert!(stored.iter().any(|(_, _, at)| *at > first_exp_ms));
+    assert!(
+        renewing.participant.disconnects() >= 1,
+        "the server ended the connection at exp: {:?}",
+        renewing.participant.client.events()
+    );
+    assert!(renewing.participant.connected());
+
+    // Nothing acked twice, nothing lost.
+    assert_eq!(delivered_after_ack, Vec::<String>::new(), "acked twice");
+    let expected: std::collections::BTreeSet<String> =
+        stored.iter().map(|(id, _, _)| id.clone()).collect();
+    assert_eq!(
+        confirmed
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>(),
+        expected,
+        "every message acked"
+    );
+    assert!(
+        confirmed.values().all(|acks| *acks == 1),
+        "each message acked once: {confirmed:?}"
+    );
+    let last = stored
+        .iter()
+        .map(|(_, sequence, _)| *sequence)
+        .max()
+        .unwrap();
+    let info = observer
+        .get_consumer_from_stream::<pull::Config, _, _>(&durable.durable, &durable.stream)
+        .await
+        .unwrap()
+        .info()
+        .await
+        .unwrap()
+        .clone();
+    assert_eq!(info.num_pending, 0, "{info:?}");
+    assert_eq!(info.num_ack_pending, 0, "{info:?}");
+    assert_eq!(info.ack_floor.stream_sequence, last, "{info:?}");
+
+    passed();
+    plane.finish(vec![renewing.participant]).await;
 }

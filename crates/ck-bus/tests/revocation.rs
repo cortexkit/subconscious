@@ -347,6 +347,7 @@ async fn plane_with(
             issuer_account: Some(&run.trust.system_account),
             name: "revocation-row-system",
             issued_at: unix_now() - 60,
+            expires_at: unix_now() - 60 + credentials::lifetime::USER_JWT_LIFETIME.as_secs() as i64,
             grant: &grants::system_account_grant(&names, &system_user).unwrap(),
         },
     )
@@ -367,6 +368,7 @@ async fn plane_with(
             issuer_account: Some(&account_public),
             name: "revocation-row-bus-module",
             issued_at: unix_now() - 60,
+            expires_at: unix_now() - 60 + credentials::lifetime::USER_JWT_LIFETIME.as_secs() as i64,
             grant: &box_grant(&names, &box_user),
         },
     )

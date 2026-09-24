@@ -5,8 +5,8 @@
 //! ck-bus sends exactly those ASCII bytes to `credential.sign` and re-encodes the standard
 //! base64 signature it gets back as unpadded base64url.
 //!
-//! No `exp` is written: the per-process user lifetime is not pinned yet, so until it is,
-//! revocation alone ends a user.
+//! Every token carries `exp` (R16: 15 minutes after `iat`, see `lifetime`), so a user
+//! whose revocation was lost still stops working once its last JWT expires.
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use data_encoding::BASE32_NOPAD;
@@ -33,6 +33,8 @@ pub struct UserClaims<'a> {
     pub name: &'a str,
     /// Seconds since the Unix epoch.
     pub issued_at: i64,
+    /// The `exp` claim, seconds since the Unix epoch.
+    pub expires_at: i64,
     /// The generated permission set; only its allow lists are written.
     pub grant: &'a Grant,
 }
@@ -62,6 +64,7 @@ impl UserClaims<'_> {
         let mut claims = json!({
             "jti": "",
             "iat": self.issued_at,
+            "exp": self.expires_at,
             "iss": self.issuer,
             "name": self.name,
             "sub": self.user_public,

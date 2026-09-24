@@ -158,6 +158,7 @@ async fn mint(
             issuer_account: Some(issuer_account),
             name: "grant-conformance",
             issued_at: unix_now() - 60,
+            expires_at: unix_now() - 60 + credentials::lifetime::USER_JWT_LIFETIME.as_secs() as i64,
             grant: &grant,
         },
     )

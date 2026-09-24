@@ -272,24 +272,44 @@ async fn first_boot_builds_the_plane_and_a_restart_revokes_the_previous_box_user
     let account = first["account_public"].as_str().unwrap().to_string();
     let client = bus::box_client(&plane.trust, &plane.server, &account).await;
     let js = jetstream::new(client.clone());
-    let mut expected: Vec<(String, Vec<String>)> = shipped_streams(&names)
+    // Each stream's duplicate window is stated explicitly (see `plane.rs`): two minutes
+    // on every stream. The dead-letter stream's must cover at least one effect-durable
+    // ack wait (30 s), because the spare delivery's republish of a record reuses the
+    // record's message id. The values are written out here rather than read from the
+    // constants, so a change to either shows up.
+    let two_minutes = Duration::from_secs(120);
+    let mut expected: Vec<(String, Vec<String>, Duration)> = shipped_streams(&names)
         .into_iter()
-        .map(|spec| (spec.name, spec.subjects))
+        .map(|spec| (spec.name, spec.subjects, two_minutes))
         .collect();
     expected.push((
         names.buckets().census_stream.clone(),
         vec![format!("$KV.{}.>", names.buckets().census)],
+        two_minutes,
     ));
-    for (name, subjects) in &expected {
+    assert!(
+        expected
+            .iter()
+            .any(|(name, _, _)| name == &names.streams().effect_dead),
+        "the dead-letter stream is among those checked"
+    );
+    for (name, subjects, window) in &expected {
         let mut stream = js
             .get_stream(name)
             .await
             .unwrap_or_else(|error| panic!("{name} must exist: {error}"));
+        let config = stream.info().await.unwrap().config.clone();
         assert_eq!(
-            &stream.info().await.unwrap().config.subjects,
-            subjects,
+            &config.subjects, subjects,
             "{name} carries its literal binding"
         );
+        assert_eq!(
+            config.duplicate_window, *window,
+            "{name}'s duplicate window is the stated one"
+        );
+        if name == &names.streams().effect_dead {
+            assert!(config.duplicate_window >= Duration::from_secs(30));
+        }
     }
     let first_generation = own_census(&js, &names, plane.run.root.path(), &first).await;
     assert!(
@@ -439,6 +459,7 @@ async fn system_user_kicks_a_harness_client() {
             issuer_account: Some(&plane.trust.system_account),
             name: "ckbus-system",
             issued_at: unix_now() - 60,
+            expires_at: unix_now() - 60 + credentials::lifetime::USER_JWT_LIFETIME.as_secs() as i64,
             grant: &grant,
         },
     )
@@ -586,4 +607,21 @@ async fn local_listener_refuses_a_connect_from_a_non_loopback_address() {
     RowReport::passed(Row::InstallBootstrap)
         .served_by(ServedBy::None)
         .emit(&BTreeSet::new());
+}
+
+/// The stream configurations ck-bus sends state every duplicate window. The install arm
+/// above reads the windows back from a real server, but the server's own default is also
+/// two minutes, so only this check fails when a window is left to that default.
+#[test]
+fn every_stream_config_states_its_duplicate_window() {
+    let names = AccountNames::derive("box_duplicatewindow").unwrap();
+    let two_minutes = Duration::from_secs(120);
+    for spec in shipped_streams(&names) {
+        let config = bootstrap::plane::stream_config(&spec);
+        assert_eq!(config.duplicate_window, two_minutes, "{}", spec.name);
+    }
+    assert_eq!(
+        bootstrap::plane::census_config(&names).duplicate_window,
+        two_minutes
+    );
 }

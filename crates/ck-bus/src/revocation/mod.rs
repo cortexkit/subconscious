@@ -35,9 +35,9 @@
 //! module has no live process in the supervisor's spawn snapshot (the process exited),
 //! belongs to ck-bus's spawn-stream consumer, which calls `Revoker::revoke_module`.
 //!
-//! JWT expiry is the other half of revocation. Its lifetime is not yet pinned
-//! (`user-jwt-ttl-unpinned`), so until it is, a credential whose revocation was lost to
-//! damage stays valid.
+//! JWT expiry is the other half of revocation (R16): every user JWT expires 15 minutes
+//! after issue, and a key whose revocation is recorded is never renewed, so a
+//! credential whose revocation was lost to damage stays valid for at most 15 minutes.
 
 pub mod connections;
 pub mod handler;
@@ -275,6 +275,9 @@ impl Revoker {
     /// that it survives a restart. A record already in progress for the same identity
     /// is kept, never set back.
     pub fn begin(&self, target: &Target) -> Result<(), RevocationError> {
+        // Before anything is pushed, so no renewal of this key can outlive its
+        // revocation (see `KeyCustody::mark_revoked`).
+        self.credentials.custody.mark_revoked(&target.user_public);
         if let Some(Entry::Present(_)) = self.progress.read(&target.identity) {
             return Ok(());
         }

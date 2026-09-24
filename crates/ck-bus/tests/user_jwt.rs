@@ -123,6 +123,7 @@ async fn issue(
             issuer_account: Some(issuer_account),
             name: "user-jwt-row",
             issued_at: unix_now() - 60,
+            expires_at: unix_now() - 60 + credentials::lifetime::USER_JWT_LIFETIME.as_secs() as i64,
             grant,
         },
     )

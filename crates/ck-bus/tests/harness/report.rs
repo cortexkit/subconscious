@@ -244,6 +244,7 @@ fn allowed_gates(row: Row) -> &'static [&'static str] {
         | Row::ModuleHealth
         | Row::Sentinel
         | Row::DeadLetter
+        | Row::SignerOutage
         | Row::Leaf => &[],
         Row::SupervisedServer | Row::SupervisedServerArgv => &["a1-signal-unix-only"],
         Row::SignerShape | Row::VaultAuthorization => &["claustrum-binary-absent"],
@@ -252,7 +253,6 @@ fn allowed_gates(row: Row) -> &'static [&'static str] {
         }
         Row::GrantConformance => &["prefrontal-seat-unnamed"],
         Row::Membership => &["membership-contract-unpinned"],
-        Row::SignerOutage => &["user-jwt-ttl-unpinned"],
         Row::FedAccount | Row::FedSplit => {
             &["fed-foundation-amendment-unlanded", "nats-federation-rig"]
         }

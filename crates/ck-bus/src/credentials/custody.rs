@@ -18,6 +18,8 @@ use nkeys::KeyPair;
 /// The refusal a caller gets when asking to sign for a key ck-bus does not hold: the key
 /// was issued by an earlier ck-bus process (whose memory died with it) or was dropped.
 pub const CREDENTIAL_SUPERSEDED: &str = "ckbus_credential_superseded";
+/// The refusal a renewal gets when this process has recorded the key's revocation.
+pub const CREDENTIAL_REVOKED: &str = "ckbus_credential_revoked";
 
 /// Signing for a key this process does not hold.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,6 +41,10 @@ impl fmt::Display for Superseded {
 #[derive(Default)]
 pub struct KeyCustody {
     keys: Mutex<HashMap<String, KeyPair>>,
+    /// Every key whose revocation this process has recorded. Its key pair is dropped at
+    /// the same moment, so nothing signs for it again. The set lives as long as the
+    /// process: a later process knows none of them, and answers them as superseded.
+    revoked: Mutex<std::collections::HashSet<String>>,
 }
 
 impl fmt::Debug for KeyCustody {
@@ -83,6 +89,25 @@ impl KeyCustody {
 
     pub fn holds(&self, user_public: &str) -> bool {
         self.lock().contains_key(user_public)
+    }
+
+    /// Records that `user_public` is being revoked and drops its key. Called before the
+    /// revocation's first step, so a renewal that checks `is_revoked` after signing
+    /// either sees the mark or signed with an `iat` no later than the revocation's
+    /// timestamp, which nats-server's revocation list then covers.
+    pub fn mark_revoked(&self, user_public: &str) {
+        self.revoked
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(user_public.to_string());
+        self.forget(user_public);
+    }
+
+    pub fn is_revoked(&self, user_public: &str) -> bool {
+        self.revoked
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(user_public)
     }
 
     fn lock(&self) -> MutexGuard<'_, HashMap<String, KeyPair>> {

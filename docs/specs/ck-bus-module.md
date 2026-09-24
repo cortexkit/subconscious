@@ -493,6 +493,8 @@ Credentials (design D; foundation amendment `48c83a68e`, `0eb12229f`, `b9e827c69
   - `ckbus.credential` returns the caller's user JWT, its `{acct}`, its inbox prefix
     `_INBOX.{credential_public}`, and the server URL.
   - `ckbus.nonce_sign` signs the given nonce with the caller's current seed.
+  - `ckbus.credential_renew` (R16) re-signs the caller's current key with a fresh `exp`;
+    it follows the same principal rules.
   - Both authorize by the stamped principal alone. `Principal::Reserved { module_id }`
     binds the answer to that `module_id` and to the live generation the spawn stream
     shows for it. A body field claiming another id is ignored. A `Direct` caller gets
@@ -525,9 +527,10 @@ Credentials (design D; foundation amendment `48c83a68e`, `0eb12229f`, `b9e827c69
   be no-ops: re-adding a present revocation leaves the claims equal, and a repeated kick
   of a gone client emits no new event. The arms assert this, and nothing assumes it.
 - JWT expiry is the foundation's second revocation half, with the lifetime R16 pins:
-  every user JWT carries `exp` 15 minutes after issue, and ck-bus re-issues at the next
-  epoch about 10 minutes in and revokes the superseded user. A user whose revocation was
-  lost to damage stays valid for at most 15 minutes.
+  every user JWT carries `exp` 15 minutes after issue, and about 10 minutes in its
+  holder renews it through `ckbus.credential_renew`, a same-key re-sign at the same
+  epoch (R16). A key whose revocation ck-bus has recorded is never renewed, so a user
+  whose revocation was lost to damage stays valid for at most 15 minutes.
 - ck-bus restart and in-memory keys. Measured by ALF on nats-server 2.15.0 with the full
   resolver, per the foundation amendment's measured basis: while ck-bus is down, open
   connections keep working and new connects and reconnects fail, because nobody can sign
@@ -938,7 +941,7 @@ records it.
 | A8 sentinel probe | own box user; probe; `supervisor.health_probe` | harness-signer; harness-stub for the refusing-signer control | none row-specific | gates now |
 | Dead-letter | own user and a claimant user; `c_ckbus_dead` | harness-signer | none row-specific | gates now |
 | Membership lifecycle | the foundation's membership contract from the vendored copy; re-issue; revocation | harness-signer | `membership-contract-unpinned` (D, and S if the foundation names no op) | skipped until quoted |
-| Signer outage and restart | supervised ck-bus and nats-server; issuance; revocation | harness-signer | `user-jwt-ttl-unpinned` (S, the expiry arm only) | gates now except the expiry arm |
+| Signer outage and restart | supervised ck-bus and nats-server; issuance; revocation; renewal (R16) | harness-signer | none row-specific (`user-jwt-ttl-unpinned` discharged by R16) | gates now, the expiry arm included |
 | Federation account and isolation | federation account JWT and user; local-subject isolation; local delivery path | harness-signer | `fed-foundation-amendment-unlanded` (S); `nats-federation-rig` (S: local subjects off the leaf; account routing) | skipped |
 | Leaf configuration | `callosum.hub_read` | harness-stub | none row-specific | gates now against the stub's recorded shape |
 | Leaf link, labelled | hub server in the harness; leaf credential; the chosen or labelled shape | harness-signer | `leaf-credential-ceremony-unlanded` (S); `nats-federation-rig` (S: account routing; `SignatureCB` for shape 3) | skipped; runs labelled once the rig reports |
@@ -1519,3 +1522,21 @@ SECTION governs.
   and asserts nothing is acked twice and nothing is lost. If async-nats does not
   reconnect seamlessly, that is reported to ALF before any longer lifetime is chosen;
   15 minutes holds while revocation stays the primary control.
+  Renewal is a same-key re-sign (ALF, 2026-09-24), never a new epoch: epoch changes and
+  revocation stay reserved for rotation and supersede, as before. A participant renews
+  through `ckbus.credential_renew {credential_public}`, accepted under
+  `ckbus.credential`'s principal rules from the attested caller whose live generation
+  holds that key. It returns a JWT for the same user key with a fresh `iat` and `exp`,
+  and replies `{jwt, exp, user_jwt_id, credential_public, spawn_generation,
+  credential_epoch}`, `exp` in seconds since the epoch as in the claim, so the holder
+  schedules its next renewal without decoding the token and a renewal that raced a
+  supersede is recognisable. No epoch change, no census rewrite (the census keeps the
+  issue's `user_jwt_id`), no revocation and no kick: the old JWT expires, nats-server's
+  disconnect at its `exp` is the one reconnect, and that reconnect presents the renewed
+  JWT. Refusals are named so the holder re-issues through `ckbus.credential` instead:
+  `ckbus_credential_revoked` when ck-bus has recorded the key's revocation,
+  `ckbus_credential_superseded` when the key is not the module's current one (replaced,
+  or issued by an earlier ck-bus process), and `ckbus_generation_not_live` as for
+  `ckbus.credential`. ck-bus renews its own users' JWTs the same way, handing each to its
+  own connection's auth callback. Jitter is per process only (a few seconds); reconnects
+  are already spread by each connection's own issue time.

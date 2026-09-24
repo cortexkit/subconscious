@@ -295,6 +295,7 @@ async fn probe_with(
             issuer_account: Some(account_public),
             name: "sentinel-row-bus-module",
             issued_at: unix_now() - 60,
+            expires_at: unix_now() - 60 + credentials::lifetime::USER_JWT_LIFETIME.as_secs() as i64,
             grant: &grant(&names, &user),
         },
     )

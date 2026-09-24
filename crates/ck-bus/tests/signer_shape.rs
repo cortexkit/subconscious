@@ -268,6 +268,7 @@ async fn control_faulty_signers_diverge_from_the_golden_and_are_refused_by_ck_bu
                 issuer_account: None,
                 name: "signer-shape-control",
                 issued_at: 1_790_000_000,
+                expires_at: 1_790_000_000 + 900,
                 grant: &grant,
             },
         )

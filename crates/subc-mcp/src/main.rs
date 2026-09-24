@@ -88,6 +88,14 @@ const PENDING_FRAME_BUFFER: usize = 64;
 /// than `PENDING_FRAME_BUFFER` frames behind. The provider is sent a Cancel
 /// for the same request.
 const REPLY_QUEUE_OVERFLOW_CODE: &str = "subc_reply_queue_overflow";
+/// Code of the terminal Error a request receives when the daemon connection it
+/// was sent on ends before it is answered. The request may have executed.
+const SUBC_CONNECTION_LOST_CODE: &str = "subc_connection_lost";
+/// Code carried by an MCP error for a request refused before it was sent
+/// because no daemon connection was available for it.
+const SUBC_CONNECTION_UNAVAILABLE_CODE: &str = "subc_connection_unavailable";
+const SUBC_RECONNECT_BACKOFF_INITIAL: Duration = Duration::from_millis(50);
+const SUBC_RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(2);
 const SUBC_EVENT_BUFFER: usize = 64;
 const CATALOG_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const SUPERVISION_HELLO_CORR: u64 = 1;
@@ -121,8 +129,15 @@ struct RouteHandle {
 
 #[derive(Debug, Clone)]
 enum SubcEvent {
-    RouteGoodbye { handle: RouteHandle },
-    CatalogChanged { generation: u64 },
+    RouteGoodbye {
+        handle: RouteHandle,
+    },
+    CatalogChanged {
+        generation: u64,
+    },
+    /// The relay connection was replaced; every route handle minted on an
+    /// earlier connection is dead.
+    Reconnected,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -378,6 +393,23 @@ impl ReverseRelay {
             ack_only_acks: Arc::new(AckOnlyAckMetrics::default()),
             ttl: reverse_relay_ttl_from_env(),
             max_pending_per_session: REVERSE_RELAY_PENDING_PER_SESSION,
+        }
+    }
+
+    /// A relay for the connection replacing this one's. Routes and pending
+    /// host prompts belong to a connection and start empty; the counters are
+    /// shared so health metrics and ack-only bindings carry over.
+    fn successor(&self, tx: mpsc::Sender<SubcFrame>, connection_token: u64) -> Self {
+        Self {
+            tx,
+            connection_token,
+            routes: Arc::new(Mutex::new(HashMap::new())),
+            live_epochs: Arc::new(Mutex::new(HashMap::new())),
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            stale_epoch_drops: Arc::clone(&self.stale_epoch_drops),
+            ack_only_acks: Arc::clone(&self.ack_only_acks),
+            ttl: self.ttl,
+            max_pending_per_session: self.max_pending_per_session,
         }
     }
 
@@ -1301,49 +1333,215 @@ enum MaybeSet<T> {
     Value(T),
 }
 
-#[derive(Clone)]
-struct SubcClient {
+/// One authenticated daemon connection carrying tool calls, route opens and
+/// reverse requests. Everything that only means something on this socket lives
+/// here: the frame queue, the forward requests awaiting an answer, and the
+/// reverse relay whose routes and pending host prompts are keyed by the
+/// (channel, epoch) pairs this connection's daemon session handed out.
+struct SubcConnection {
     tx: mpsc::Sender<SubcFrame>,
     pending: Arc<Mutex<HashMap<PendingKey, PendingRequest>>>,
-    events: broadcast::Sender<SubcEvent>,
+    /// Set by the reader, while holding the `pending` lock, when the
+    /// connection ends. A request registers under that same lock and is
+    /// refused once this is set, so nothing can be registered after the
+    /// reader has settled everything outstanding and be left waiting forever.
+    closed: Arc<AtomicBool>,
     relay: Arc<ReverseRelay>,
     connection_token: u64,
-    last_corr: Arc<AtomicU64>,
     writer_shutdown: watch::Sender<bool>,
-    catalog_poller_started: Arc<AtomicBool>,
 }
 
-impl SubcClient {
-    fn start(stream: TcpStream) -> Self {
+impl SubcConnection {
+    /// Starts the reader and writer tasks for `stream`. `predecessor` is the
+    /// relay of the connection this one replaces, whose counters the new relay
+    /// keeps so health metrics and ack-only bindings survive a reconnect.
+    fn start(
+        stream: TcpStream,
+        events: broadcast::Sender<SubcEvent>,
+        predecessor: Option<&ReverseRelay>,
+    ) -> (Arc<Self>, JoinHandle<()>) {
         let (read_half, write_half) = stream.into_split();
         let (tx, rx) = mpsc::channel(128);
         let pending = Arc::new(Mutex::new(HashMap::new()));
-        let (events, _events_rx) = broadcast::channel(SUBC_EVENT_BUFFER);
+        let closed = Arc::new(AtomicBool::new(false));
         let connection_token = NEXT_CONNECTION_TOKEN
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |token| {
                 token.checked_add(1)
             })
             .expect("subc connection token space exhausted");
-        let relay = Arc::new(ReverseRelay::new(tx.clone(), connection_token));
+        let relay = Arc::new(match predecessor {
+            Some(previous) => previous.successor(tx.clone(), connection_token),
+            None => ReverseRelay::new(tx.clone(), connection_token),
+        });
         let (writer_shutdown, writer_shutdown_rx) = watch::channel(false);
 
-        tokio::spawn(subc_reader_loop(
+        let reader = tokio::spawn(subc_reader_loop_until_closed(
             read_half,
             Arc::clone(&pending),
-            events.clone(),
+            Arc::clone(&closed),
+            events,
             Arc::clone(&relay),
         ));
         tokio::spawn(subc_writer_loop(write_half, rx, writer_shutdown_rx));
 
+        (
+            Arc::new(Self {
+                tx,
+                pending,
+                closed,
+                relay,
+                connection_token,
+                writer_shutdown,
+            }),
+            reader,
+        )
+    }
+
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
+    /// Registers `frame`'s reply queue and queues the frame for the writer.
+    ///
+    /// Fails with [`RelayNotSent`] when this connection has already ended or
+    /// its writer is gone: in both cases the frame never left this process.
+    async fn register_and_send(
+        &self,
+        frame: SubcFrame,
+        route_session: Option<Arc<RelaySession>>,
+    ) -> Result<mpsc::Receiver<SubcFrame>> {
+        let key = (frame.header.channel, frame.header.epoch, frame.header.corr);
+        let (reply_tx, reply_rx) = mpsc::channel(PENDING_FRAME_BUFFER + 1);
+        let pending_request = PendingRequest {
+            reply: reply_tx,
+            route_session,
+        };
+        {
+            let mut pending = self.pending.lock().await;
+            if self.is_closed() {
+                return Err(Box::new(RelayNotSent(
+                    "the subc connection closed before the request was sent".to_owned(),
+                )));
+            }
+            if pending.insert(key, pending_request).is_some() {
+                return Err(other_error(format!(
+                    "duplicate pending subc request for handle ({}, {}) corr {}",
+                    key.0, key.1, key.2
+                )));
+            }
+        }
+
+        if let Err(err) = self.tx.send(frame).await {
+            self.pending.lock().await.remove(&key);
+            return Err(Box::new(RelayNotSent(format!(
+                "subc writer is closed: {err}"
+            ))));
+        }
+
+        Ok(reply_rx)
+    }
+}
+
+/// A request that never left this process because the daemon connection it
+/// was meant for had ended. Repeating it cannot repeat a side effect.
+#[derive(Debug)]
+struct RelayNotSent(String);
+
+impl std::fmt::Display for RelayNotSent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "subc request not sent: {}", self.0)
+    }
+}
+
+impl std::error::Error for RelayNotSent {}
+
+/// The module's tool-call relay to the daemon.
+///
+/// The daemon may close this connection while the module keeps running (an
+/// in-place daemon upgrade keeps module processes and their supervision
+/// connections but closes every other connection). A module started with
+/// [`SubcClient::connect`] therefore replaces the connection when it ends:
+/// requests outstanding on the dead connection are settled as outcome unknown,
+/// requests that could not be sent are refused as not sent, and every route
+/// handle minted on the dead connection stops validating, so sessions reopen
+/// their provider routes on the new one. Correlation ids come from one counter
+/// shared by every connection, and each connection has its own pending table
+/// and connection token, so an answer arriving on the new connection can never
+/// settle a request made on the old one.
+#[derive(Clone)]
+struct SubcClient {
+    current: Arc<watch::Sender<Arc<SubcConnection>>>,
+    events: broadcast::Sender<SubcEvent>,
+    last_corr: Arc<AtomicU64>,
+    catalog_poller_started: Arc<AtomicBool>,
+}
+
+impl SubcClient {
+    /// Starts a relay on one already-authenticated stream that is not
+    /// replaced when it ends.
+    #[cfg(test)]
+    fn start(stream: TcpStream) -> Self {
+        let (events, _events_rx) = broadcast::channel(SUBC_EVENT_BUFFER);
+        let (connection, _reader) = SubcConnection::start(stream, events.clone(), None);
+        Self::with_connection(connection, events)
+    }
+
+    /// Connects to the daemon named by `connection_file_path` and keeps the
+    /// relay connected: whenever the connection ends it reconnects, with
+    /// backoff, re-reading the connection file on every attempt so a daemon
+    /// that rewrote it is found. The module's lifetime is owned by its
+    /// supervision connection, not by this one.
+    async fn connect(connection_file_path: &Path) -> Result<Self> {
+        let stream = connect_authenticated(connection_file_path).await?;
+        let (events, _events_rx) = broadcast::channel(SUBC_EVENT_BUFFER);
+        let (connection, reader) = SubcConnection::start(stream, events.clone(), None);
+        let client = Self::with_connection(connection, events);
+        tokio::spawn(maintain_subc_connection(
+            client.clone(),
+            connection_file_path.to_owned(),
+            reader,
+        ));
+        Ok(client)
+    }
+
+    fn with_connection(
+        connection: Arc<SubcConnection>,
+        events: broadcast::Sender<SubcEvent>,
+    ) -> Self {
         Self {
-            tx,
-            pending,
+            current: Arc::new(watch::Sender::new(connection)),
             events,
-            relay,
-            connection_token,
             last_corr: Arc::new(AtomicU64::new(0)),
-            writer_shutdown,
             catalog_poller_started: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn connection(&self) -> Arc<SubcConnection> {
+        Arc::clone(&self.current.borrow())
+    }
+
+    fn connection_token(&self) -> u64 {
+        self.current.borrow().connection_token
+    }
+
+    /// The current connection once it is open, waiting up to
+    /// `SUBC_RESPONSE_TIMEOUT` for a replacement while it is down.
+    async fn live_connection(&self) -> Result<Arc<SubcConnection>> {
+        let mut updates = self.current.subscribe();
+        let deadline = time::Instant::now() + SUBC_RESPONSE_TIMEOUT;
+        loop {
+            let connection = Arc::clone(&updates.borrow_and_update());
+            if !connection.is_closed() {
+                return Ok(connection);
+            }
+            match time::timeout_at(deadline, updates.changed()).await {
+                Ok(Ok(())) => continue,
+                Ok(Err(_)) | Err(_) => {
+                    return Err(Box::new(RelayNotSent(format!(
+                        "the subc connection is down and was not replaced within {SUBC_RESPONSE_TIMEOUT:?}"
+                    ))))
+                }
+            }
         }
     }
 
@@ -1351,7 +1549,7 @@ impl SubcClient {
         match allocate_corr(&self.last_corr) {
             Some(corr) => Ok(corr),
             None => {
-                let _ = self.writer_shutdown.send(true);
+                let _ = self.connection().writer_shutdown.send(true);
                 Err(other_error(
                     "subc correlation space exhausted; connection was closed before reuse",
                 ))
@@ -1359,21 +1557,30 @@ impl SubcClient {
         }
     }
 
+    #[cfg(test)]
     fn route_handle(&self, channel: u16, epoch: u32) -> RouteHandle {
         RouteHandle {
             channel,
             epoch,
-            connection_token: self.connection_token,
+            connection_token: self.connection_token(),
         }
     }
 
     fn validate_handle(&self, handle: RouteHandle) -> Result<()> {
-        if handle.connection_token != self.connection_token {
-            return Err(other_error(
-                "route handle belongs to a stale subc connection",
-            ));
+        self.connection_for_route(handle).map(|_| ())
+    }
+
+    /// The current connection if `handle` was minted on it. A handle from an
+    /// earlier connection names a route the daemon closed with that
+    /// connection; a frame for it is refused as not sent.
+    fn connection_for_route(&self, handle: RouteHandle) -> Result<Arc<SubcConnection>> {
+        let connection = self.connection();
+        if handle.connection_token != connection.connection_token {
+            return Err(Box::new(RelayNotSent(
+                "route handle belongs to a stale subc connection".to_owned(),
+            )));
         }
-        Ok(())
+        Ok(connection)
     }
 
     fn build_route_frame(
@@ -1389,11 +1596,15 @@ impl SubcClient {
     }
 
     async fn send_route_frame(&self, handle: RouteHandle, frame: SubcFrame) -> Result<()> {
-        self.validate_handle(handle)?;
+        let connection = self.connection_for_route(handle)?;
         if frame.header.channel != handle.channel || frame.header.epoch != handle.epoch {
             return Err(other_error("route frame does not match its route handle"));
         }
-        self.send(frame).await
+        connection
+            .tx
+            .send(frame)
+            .await
+            .map_err(|err| other_error(format!("subc writer is closed: {err}")))
     }
 
     fn subscribe_events(&self) -> broadcast::Receiver<SubcEvent> {
@@ -1401,7 +1612,7 @@ impl SubcClient {
     }
 
     fn relay(&self) -> Arc<ReverseRelay> {
-        Arc::clone(&self.relay)
+        Arc::clone(&self.connection().relay)
     }
 
     fn ensure_catalog_poller(&self) {
@@ -1436,105 +1647,136 @@ impl SubcClient {
         });
     }
 
-    async fn send(&self, frame: SubcFrame) -> Result<()> {
-        self.tx
-            .send(frame)
-            .await
-            .map_err(|err| other_error(format!("subc writer is closed: {err}")))
-    }
-
-    async fn request_frames(&self, frame: SubcFrame) -> Result<mpsc::Receiver<SubcFrame>> {
-        self.request_frames_for_route_open(frame, None).await
-    }
-
-    async fn request_frames_for_route_open(
+    /// Sends a request on `handle`'s route, which must belong to the current
+    /// connection.
+    async fn request_route_frames(
         &self,
+        handle: RouteHandle,
         frame: SubcFrame,
-        route_session: Option<Arc<RelaySession>>,
     ) -> Result<mpsc::Receiver<SubcFrame>> {
-        let key = (frame.header.channel, frame.header.epoch, frame.header.corr);
-        let (reply_tx, reply_rx) = mpsc::channel(PENDING_FRAME_BUFFER + 1);
-        let pending_request = PendingRequest {
-            reply: reply_tx,
-            route_session,
-        };
-        {
-            let mut pending = self.pending.lock().await;
-            if pending.insert(key, pending_request).is_some() {
-                return Err(other_error(format!(
-                    "duplicate pending subc request for handle ({}, {}) corr {}",
-                    key.0, key.1, key.2
-                )));
-            }
+        if frame.header.channel != handle.channel || frame.header.epoch != handle.epoch {
+            return Err(other_error("route frame does not match its route handle"));
         }
-
-        if let Err(err) = self.tx.send(frame).await {
-            self.pending.lock().await.remove(&key);
-            return Err(other_error(format!("subc writer is closed: {err}")));
-        }
-
-        Ok(reply_rx)
+        self.connection_for_route(handle)?
+            .register_and_send(frame, None)
+            .await
     }
 
     async fn abandon_request(&self, handle: RouteHandle, corr: u64) {
-        self.pending
+        let Ok(connection) = self.connection_for_route(handle) else {
+            return;
+        };
+        connection
+            .pending
             .lock()
             .await
             .remove(&(handle.channel, handle.epoch, corr));
     }
 
     async fn request(&self, frame: SubcFrame, wait: Duration) -> Result<SubcFrame> {
-        self.request_with_route_session(frame, wait, None).await
+        let connection = self.live_connection().await?;
+        await_terminal(&connection, frame, wait, None).await
     }
 
+    async fn request_on_route(
+        &self,
+        handle: RouteHandle,
+        frame: SubcFrame,
+        wait: Duration,
+    ) -> Result<SubcFrame> {
+        if frame.header.channel != handle.channel || frame.header.epoch != handle.epoch {
+            return Err(other_error("route frame does not match its route handle"));
+        }
+        let connection = self.connection_for_route(handle)?;
+        await_terminal(&connection, frame, wait, None).await
+    }
+
+    /// Sends route.open on the live connection. Returns the answer with the
+    /// token of the connection that carried it: the route it opens exists
+    /// only on that connection.
     async fn request_route_open(
         &self,
         frame: SubcFrame,
         wait: Duration,
         route_session: Arc<RelaySession>,
-    ) -> Result<SubcFrame> {
-        self.request_with_route_session(frame, wait, Some(route_session))
-            .await
+    ) -> Result<(SubcFrame, u64)> {
+        let connection = self.live_connection().await?;
+        let response = await_terminal(&connection, frame, wait, Some(route_session)).await?;
+        Ok((response, connection.connection_token))
     }
+}
 
-    async fn request_with_route_session(
-        &self,
-        frame: SubcFrame,
-        wait: Duration,
-        route_session: Option<Arc<RelaySession>>,
-    ) -> Result<SubcFrame> {
-        let key = (frame.header.channel, frame.header.epoch, frame.header.corr);
-        let retain_late_route_open = route_session.is_some();
-        let mut reply_rx = self
-            .request_frames_for_route_open(frame, route_session)
-            .await?;
+async fn await_terminal(
+    connection: &SubcConnection,
+    frame: SubcFrame,
+    wait: Duration,
+    route_session: Option<Arc<RelaySession>>,
+) -> Result<SubcFrame> {
+    let key = (frame.header.channel, frame.header.epoch, frame.header.corr);
+    let retain_late_route_open = route_session.is_some();
+    let mut reply_rx = connection.register_and_send(frame, route_session).await?;
 
-        match time::timeout(wait, async {
-            loop {
-                let Some(frame) = reply_rx.recv().await else {
-                    return Err(other_error(format!(
-                        "subc connection closed before response for handle ({}, {}) corr {}",
-                        key.0, key.1, key.2
-                    )));
-                };
-                if is_terminal_frame_type(frame.header.ty) {
-                    return Ok(frame);
-                }
-            }
-        })
-        .await
-        {
-            Ok(result) => result,
-            Err(_elapsed) => {
-                if !retain_late_route_open {
-                    self.pending.lock().await.remove(&key);
-                }
-                Err(other_error(format!(
-                    "timed out waiting {wait:?} for subc response on handle ({}, {}) corr {}",
+    match time::timeout(wait, async {
+        loop {
+            let Some(frame) = reply_rx.recv().await else {
+                return Err(other_error(format!(
+                    "subc connection closed before response for handle ({}, {}) corr {}",
                     key.0, key.1, key.2
-                )))
+                )));
+            };
+            if is_terminal_frame_type(frame.header.ty) {
+                return Ok(frame);
             }
         }
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_elapsed) => {
+            if !retain_late_route_open {
+                connection.pending.lock().await.remove(&key);
+            }
+            Err(other_error(format!(
+                "timed out waiting {wait:?} for subc response on handle ({}, {}) corr {}",
+                key.0, key.1, key.2
+            )))
+        }
+    }
+}
+
+/// Keeps the module's relay connected for the life of the process. Each time
+/// the current connection's reader ends, the dead connection's writer is
+/// stopped, a new connection is authenticated with capped exponential
+/// backoff, and sessions are told through [`SubcEvent::Reconnected`] so they
+/// reopen their provider routes.
+async fn maintain_subc_connection(
+    client: SubcClient,
+    connection_file_path: PathBuf,
+    mut reader: JoinHandle<()>,
+) {
+    loop {
+        let _ = (&mut reader).await;
+        let dead = client.connection();
+        let _ = dead.writer_shutdown.send(true);
+        tracing::warn!("subc relay connection ended; reconnecting");
+
+        let mut backoff = SUBC_RECONNECT_BACKOFF_INITIAL;
+        let stream = loop {
+            match connect_authenticated(&connection_file_path).await {
+                Ok(stream) => break stream,
+                Err(error) => {
+                    tracing::warn!("subc relay reconnect failed, retrying in {backoff:?}: {error}");
+                    time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(SUBC_RECONNECT_BACKOFF_MAX);
+                }
+            }
+        };
+        let (connection, next_reader) =
+            SubcConnection::start(stream, client.events.clone(), Some(&dead.relay));
+        client.current.send_replace(connection);
+        tracing::info!("subc relay connection re-established");
+        let _ = client.events.send(SubcEvent::Reconnected);
+        reader = next_reader;
     }
 }
 
@@ -1665,10 +1907,9 @@ async fn run_shim(args: ShimArgs) -> Result<()> {
 }
 
 async fn run_module(args: ModuleArgs) -> Result<()> {
-    let subc_stream = connect_authenticated(&args.subc_connection_file).await?;
-    let subc = SubcClient::start(subc_stream);
+    let subc = SubcClient::connect(&args.subc_connection_file).await?;
     let mut supervision_task =
-        start_supervision_connection_if_configured(&args.subc_connection_file, subc.relay())
+        start_supervision_connection_if_configured(&args.subc_connection_file, subc.clone())
             .await?;
 
     let listener = TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
@@ -1726,7 +1967,7 @@ async fn supervision_ended(task: &mut Option<JoinHandle<()>>) {
 
 async fn start_supervision_connection_if_configured(
     connection_file_path: &Path,
-    relay: Arc<ReverseRelay>,
+    subc: SubcClient,
 ) -> Result<Option<JoinHandle<()>>> {
     let module_id = match env::var(SUBC_MODULE_ID_ENV) {
         Ok(module_id) if !module_id.trim().is_empty() => module_id,
@@ -1748,7 +1989,7 @@ async fn start_supervision_connection_if_configured(
     send_supervision_hello(&mut stream, &module_id).await?;
     let task_module_id = module_id.clone();
     let task = tokio::spawn(async move {
-        if let Err(error) = supervision_control_loop(stream, relay, task_module_id).await {
+        if let Err(error) = supervision_control_loop(stream, subc, task_module_id).await {
             tracing::error!("supervision control loop failed: {error}");
         }
     });
@@ -1840,7 +2081,7 @@ async fn send_supervision_hello(stream: &mut TcpStream, module_id: &str) -> Resu
 /// loop is alive instead of only proving that some unrelated writer task runs.
 async fn supervision_control_loop(
     mut stream: TcpStream,
-    relay: Arc<ReverseRelay>,
+    subc: SubcClient,
     module_id: String,
 ) -> Result<()> {
     loop {
@@ -1854,6 +2095,9 @@ async fn supervision_control_loop(
             return Ok(());
         };
 
+        // The relay connection may have been replaced since the last frame;
+        // health metrics come from whichever relay is current.
+        let relay = subc.relay();
         let Some(reply) = handle_supervision_control_frame(&frame, &relay).await? else {
             return Ok(());
         };
@@ -2321,7 +2565,7 @@ async fn open_route(
     let body = serde_json::to_vec(&request)?;
     let corr = subc.next_corr()?;
     let frame = build_frame(FrameType::Request, control_flags(), 0, 0, corr, body)?;
-    let response = subc
+    let (response, connection_token) = subc
         .request_route_open(frame, SUBC_RESPONSE_TIMEOUT, route_session)
         .await?;
 
@@ -2331,7 +2575,11 @@ async fn open_route(
                 ClientControlResponse::RouteOpen {
                     route_channel,
                     route_epoch,
-                } => Ok(subc.route_handle(route_channel, route_epoch)),
+                } => Ok(RouteHandle {
+                    channel: route_channel,
+                    epoch: route_epoch,
+                    connection_token,
+                }),
                 other => Err(other_error(format!(
                     "unexpected route.open response body: {other:?}"
                 ))),
@@ -3511,7 +3759,16 @@ async fn reconcile_session_from_catalog(
     config: &GatewayConfig,
 ) -> Result<bool> {
     let desired = desired_session_from_catalog(config, &catalog.modules)?;
-    let existing_routes = state.route_snapshot();
+    // A route minted on an earlier relay connection died with it (the daemon
+    // closes a connection's routes when the connection ends), so it is treated
+    // as absent: its provider gets a fresh route, and no GOODBYE is sent for
+    // it on a connection that never knew it.
+    let live_token = subc.connection_token();
+    let existing_routes = state
+        .route_snapshot()
+        .into_iter()
+        .filter(|(_, handle)| handle.connection_token == live_token)
+        .collect::<HashMap<_, _>>();
     let desired_modules = desired
         .providers
         .iter()
@@ -3590,6 +3847,27 @@ async fn reconcile_session_from_catalog(
         let _ = send_route_goodbyes(subc, removed_routes).await;
     }
     Ok(changed)
+}
+
+/// Reopens the session's provider routes when any of them was minted on a
+/// relay connection that has since been replaced. The caller holds the
+/// session's reconcile gate. Returns whether the advertised tools changed.
+async fn reopen_stale_routes(
+    subc: &SubcClient,
+    state: &SessionState,
+    relay_session: &Arc<RelaySession>,
+) -> Result<bool> {
+    let live_token = subc.live_connection().await?.connection_token;
+    if state
+        .route_handles()
+        .iter()
+        .all(|handle| handle.connection_token == live_token)
+    {
+        return Ok(false);
+    }
+    let catalog = catalog_list(subc).await?;
+    let config = state.config_snapshot();
+    reconcile_session_from_catalog(subc, state, relay_session, catalog, &config.effective).await
 }
 
 async fn refresh_policy_if_changed(
@@ -3675,6 +3953,27 @@ async fn session_lifecycle(
                     Ok(SubcEvent::RouteGoodbye { handle }) => {
                         if state.remove_route(handle) && !notify_tool_list_changed(&peer).await {
                             break;
+                        }
+                    }
+                    Ok(SubcEvent::Reconnected) => {
+                        let reopened = {
+                            let _reconcile_guard = reconcile_gate.lock().await;
+                            if *shutdown.borrow() {
+                                break;
+                            }
+                            reopen_stale_routes(&subc, &state, &relay_session).await
+                        };
+                        match reopened {
+                            Ok(true) => {
+                                if !notify_tool_list_changed(&peer).await {
+                                    break;
+                                }
+                            }
+                            Ok(false) => {}
+                            // The next tool call retries the reopen.
+                            Err(error) => {
+                                tracing::error!(target: "catalog", "failed to reopen provider routes after the subc connection was replaced: {error}");
+                            }
                         }
                     }
                     Ok(SubcEvent::CatalogChanged { generation }) => {
@@ -3935,7 +4234,7 @@ impl SubcPromptRouteClient {
                 })?;
             let frame = self
                 .subc
-                .request(frame, SUBC_RESPONSE_TIMEOUT)
+                .request_on_route(route, frame, SUBC_RESPONSE_TIMEOUT)
                 .await
                 .map_err(|error| {
                     tracing::debug!(target: "prompt", "route request failed: {error}");
@@ -4356,6 +4655,7 @@ impl ServerHandler for SubcMcpServer {
         context: RequestContext<RoleServer>,
     ) -> std::result::Result<CallToolResult, ErrorData> {
         self.refresh_policy_if_needed(&context.peer).await?;
+        self.reopen_stale_routes_if_needed(&context.peer).await?;
         match self.state.surface_mode() {
             SurfaceMode::Full => self.call_tool_over_route(request, context).await,
             SurfaceMode::Search => self.call_search_mode_tool(request, context).await,
@@ -4434,6 +4734,41 @@ impl SubcMcpServer {
         if !notify_policy_refresh(peer, changes).await {
             return Err(ErrorData::internal_error(
                 "failed to notify MCP list change after immediate policy refresh",
+                None,
+            ));
+        }
+        Ok(())
+    }
+
+    /// Makes sure the call below resolves its binding against routes on the
+    /// current relay connection. The session lifecycle reopens routes when it
+    /// sees the connection replaced; doing it here as well means a call that
+    /// races that event still goes out instead of failing on a dead route.
+    async fn reopen_stale_routes_if_needed(
+        &self,
+        peer: &Peer<RoleServer>,
+    ) -> std::result::Result<(), ErrorData> {
+        // Fast path without the gate, which a policy refresh may hold across
+        // daemon round trips: the connection is up and every route is on it.
+        let connection = self.subc.connection();
+        if !connection.is_closed()
+            && self
+                .state
+                .route_handles()
+                .iter()
+                .all(|handle| handle.connection_token == connection.connection_token)
+        {
+            return Ok(());
+        }
+        let changed = {
+            let _reconcile_guard = self.reconcile_gate.lock().await;
+            reopen_stale_routes(&self.subc, &self.state, &self.relay_session)
+                .await
+                .map_err(relay_error_to_mcp)?
+        };
+        if changed && !notify_tool_list_changed(peer).await {
+            return Err(ErrorData::internal_error(
+                "failed to notify MCP list change after reopening provider routes",
                 None,
             ));
         }
@@ -4554,12 +4889,12 @@ impl SubcMcpServer {
         let frame = self
             .subc
             .build_route_frame(FrameType::Request, data_flags(), route, corr, body)
-            .map_err(mcp_internal_error)?;
+            .map_err(relay_error_to_mcp)?;
         let mut frames = self
             .subc
-            .request_frames(frame)
+            .request_route_frames(route, frame)
             .await
-            .map_err(mcp_internal_error)?;
+            .map_err(relay_error_to_mcp)?;
 
         loop {
             tokio::select! {
@@ -4785,10 +5120,24 @@ fn route_closed_error(route: RouteHandle, corr: u64) -> ErrorData {
 
 fn subc_error_to_mcp(prefix: &str, body: &[u8]) -> ErrorData {
     match serde_json::from_slice::<ErrorBody>(body) {
-        Ok(error) => ErrorData::internal_error(
-            format!("{prefix}: {}: {}", error.code, error.message),
-            Some(serde_json::json!({ "subc_code": error.code })),
-        ),
+        Ok(error) => {
+            let mut data = serde_json::json!({ "subc_code": error.code });
+            // A send outcome in the detail (set when the connection carrying
+            // the request was lost) tells the host whether a retry is safe.
+            if let Some(outcome) = error
+                .detail
+                .as_ref()
+                .and_then(|detail| detail.get("send_outcome"))
+                .and_then(serde_json::Value::as_str)
+            {
+                data["send_outcome"] = serde_json::Value::String(outcome.to_owned());
+                data["request_dispatched"] = serde_json::Value::Bool(outcome != "not_sent");
+            }
+            ErrorData::internal_error(
+                format!("{prefix}: {}: {}", error.code, error.message),
+                Some(data),
+            )
+        }
         Err(source) => ErrorData::internal_error(
             format!(
                 "{prefix}: invalid error body ({} bytes): {source}",
@@ -4797,6 +5146,22 @@ fn subc_error_to_mcp(prefix: &str, body: &[u8]) -> ErrorData {
             None,
         ),
     }
+}
+
+/// Maps a relay failure to an MCP error, marking a request that never left
+/// this process as not sent so the host knows a retry cannot repeat it.
+fn relay_error_to_mcp(error: BoxError) -> ErrorData {
+    if error.is::<RelayNotSent>() {
+        return ErrorData::internal_error(
+            format!("{error}; repeating it is safe"),
+            Some(serde_json::json!({
+                "subc_code": SUBC_CONNECTION_UNAVAILABLE_CODE,
+                "send_outcome": "not_sent",
+                "request_dispatched": false,
+            })),
+        );
+    }
+    mcp_internal_error(error)
 }
 
 fn mcp_internal_error(error: impl std::fmt::Display) -> ErrorData {
@@ -4829,9 +5194,29 @@ async fn send_route_goodbyes(subc: &SubcClient, routes: Vec<RouteHandle>) -> Res
     }
 }
 
+#[cfg(test)]
 async fn subc_reader_loop<R>(
+    read_half: R,
+    pending: Arc<Mutex<HashMap<PendingKey, PendingRequest>>>,
+    events: broadcast::Sender<SubcEvent>,
+    relay: Arc<ReverseRelay>,
+) where
+    R: AsyncRead + Unpin,
+{
+    subc_reader_loop_until_closed(
+        read_half,
+        pending,
+        Arc::new(AtomicBool::new(false)),
+        events,
+        relay,
+    )
+    .await;
+}
+
+async fn subc_reader_loop_until_closed<R>(
     mut read_half: R,
     pending: Arc<Mutex<HashMap<PendingKey, PendingRequest>>>,
+    closed: Arc<AtomicBool>,
     events: broadcast::Sender<SubcEvent>,
     relay: Arc<ReverseRelay>,
 ) where
@@ -4956,8 +5341,40 @@ async fn subc_reader_loop<R>(
         }
     }
 
-    pending.lock().await.clear();
+    // Every request still pending was handed to the writer and may have
+    // reached the daemon, so its outcome is unknown. Marking the connection
+    // closed under the same lock that registration takes means no request can
+    // slip in after this drain and wait for an answer that cannot come.
+    let outstanding = {
+        let mut pending = pending.lock().await;
+        closed.store(true, Ordering::Release);
+        pending.drain().collect::<Vec<_>>()
+    };
+    for ((channel, epoch, corr), request) in outstanding {
+        settle_connection_lost(&request.reply, channel, epoch, corr);
+    }
     relay.clear_all().await;
+}
+
+/// Queues the terminal Error a request receives when the daemon connection it
+/// was sent on ended before its answer arrived.
+fn settle_connection_lost(reply: &PendingTx, channel: u16, epoch: u32, corr: u64) {
+    let body = serde_json::to_vec(&ErrorBody {
+        code: SUBC_CONNECTION_LOST_CODE.to_owned(),
+        message: "the subc connection closed after the request was sent; it may have been executed"
+            .to_owned(),
+        detail: Some(serde_json::json!({ "send_outcome": "outcome_unknown" })),
+    })
+    .unwrap_or_default();
+    match build_frame(FrameType::Error, data_flags(), channel, epoch, corr, body) {
+        // Terminal, so it may take the queue's reserved slot; never waits.
+        Ok(frame) => {
+            let _ = deliver_reply(reply, frame, true);
+        }
+        Err(error) => {
+            tracing::error!("failed to build subc connection-lost error: {error}");
+        }
+    }
 }
 
 async fn fail_pending_on_route(
@@ -7156,6 +7573,116 @@ mod tests {
         reader.await.unwrap();
     }
 
+    /// When the daemon closes the relay connection, a request already handed
+    /// to it is settled as outcome unknown (it may have run), and a request
+    /// made on the dead connection afterwards is refused as not sent, never
+    /// registered to wait for an answer that cannot come.
+    #[tokio::test]
+    async fn connection_loss_settles_sent_requests_as_unknown_and_refuses_later_ones() {
+        let (client_stream, server_stream) = connected_tcp_stream_pair().await;
+        let (mut server_read, server_write) = server_stream.into_split();
+        let subc = SubcClient::start(client_stream);
+        let route = subc.route_handle(7, 1);
+        subc.relay()
+            .install_route(route, Arc::new(RelaySession::new("session".to_owned())))
+            .await
+            .unwrap();
+
+        let corr = subc.next_corr().unwrap();
+        let request = subc
+            .build_route_frame(
+                FrameType::Request,
+                data_flags(),
+                route,
+                corr,
+                b"{}".to_vec(),
+            )
+            .unwrap();
+        let mut in_flight = subc.request_route_frames(route, request).await.unwrap();
+        let sent = read_frame(&mut server_read).await.unwrap().unwrap();
+        assert_eq!(sent.header.corr, corr);
+
+        drop(server_read);
+        drop(server_write);
+        let settled = time::timeout(Duration::from_secs(2), in_flight.recv())
+            .await
+            .expect("the in-flight request was left hanging after the connection closed")
+            .expect("the in-flight request gets a terminal frame before its queue closes");
+        assert_eq!(settled.header.ty, FrameType::Error);
+        assert_eq!(settled.header.corr, corr);
+        let error: ErrorBody = serde_json::from_slice(&settled.body).unwrap();
+        assert_eq!(error.code, SUBC_CONNECTION_LOST_CODE);
+        assert_eq!(
+            error.detail,
+            Some(serde_json::json!({ "send_outcome": "outcome_unknown" }))
+        );
+        let mcp_error = subc_error_to_mcp("subc route tool call failed", &settled.body);
+        assert_eq!(
+            mcp_error.data,
+            Some(serde_json::json!({
+                "subc_code": SUBC_CONNECTION_LOST_CODE,
+                "send_outcome": "outcome_unknown",
+                "request_dispatched": true,
+            }))
+        );
+        assert!(subc.connection().is_closed());
+
+        let late_corr = subc.next_corr().unwrap();
+        let late = subc
+            .build_route_frame(
+                FrameType::Request,
+                data_flags(),
+                route,
+                late_corr,
+                b"{}".to_vec(),
+            )
+            .unwrap();
+        let refused = subc
+            .request_route_frames(route, late)
+            .await
+            .expect_err("a request on a closed connection must be refused");
+        assert!(refused.is::<RelayNotSent>(), "{refused}");
+        assert_eq!(
+            relay_error_to_mcp(refused).data.unwrap()["send_outcome"],
+            "not_sent"
+        );
+        assert!(subc.connection().pending.lock().await.is_empty());
+    }
+
+    /// A route handle minted on a replaced connection is refused as not sent
+    /// rather than put on the new connection, where its (channel, epoch) may
+    /// name some other route.
+    #[tokio::test]
+    async fn route_handle_from_a_replaced_connection_is_refused() {
+        let (first_client, _first_server) = connected_tcp_stream_pair().await;
+        let subc = SubcClient::start(first_client);
+        let old_route = subc.route_handle(7, 1);
+
+        let (second_client, _second_server) = connected_tcp_stream_pair().await;
+        let dead = subc.connection();
+        let (replacement, _reader) =
+            SubcConnection::start(second_client, subc.events.clone(), Some(&dead.relay));
+        subc.current.send_replace(replacement);
+        assert_ne!(subc.connection_token(), old_route.connection_token);
+
+        let corr = subc.next_corr().unwrap();
+        let frame = build_frame(
+            FrameType::Request,
+            data_flags(),
+            old_route.channel,
+            old_route.epoch,
+            corr,
+            b"{}".to_vec(),
+        )
+        .unwrap();
+        let refused = subc
+            .request_route_frames(old_route, frame)
+            .await
+            .expect_err("a stale route handle must not reach the new connection");
+        assert!(refused.is::<RelayNotSent>(), "{refused}");
+        assert!(subc.connection().pending.lock().await.is_empty());
+    }
+
     /// One MCP host that never drains a call's progress must cost only that
     /// call. The reader loop serves every route and call on the module's
     /// connection, so it must not wait on one call's reply queue.
@@ -7184,7 +7711,10 @@ mod tests {
             )
             .unwrap();
         // Held, never read: this call's MCP host is not taking its progress.
-        let mut stalled = subc.request_frames(stalled_request).await.unwrap();
+        let mut stalled = subc
+            .request_route_frames(stalled_route, stalled_request)
+            .await
+            .unwrap();
         let prompt_corr = subc.next_corr().unwrap();
         let prompt_request = subc
             .build_route_frame(
@@ -7195,7 +7725,10 @@ mod tests {
                 b"{}".to_vec(),
             )
             .unwrap();
-        let mut prompt = subc.request_frames(prompt_request).await.unwrap();
+        let mut prompt = subc
+            .request_route_frames(prompt_route, prompt_request)
+            .await
+            .unwrap();
         for _ in 0..2 {
             let request = read_frame(&mut server_read).await.unwrap().unwrap();
             assert_eq!(request.header.ty, FrameType::Request);

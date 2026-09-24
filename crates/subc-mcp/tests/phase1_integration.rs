@@ -1342,7 +1342,85 @@ async fn mcp_reverse_elicitation_ttl_expires_one_pending_without_disturbing_anot
     harness.shutdown().await;
 }
 
+/// A byte-level TCP forwarder between the subc-mcp module and the test
+/// daemon. The authentication handshake passes through unchanged, so the
+/// module is talking to the real daemon; the test can cut one proxied
+/// connection to reproduce the daemon closing it while every other connection
+/// (including the module's supervision connection) stays up.
+struct RelayProxy {
+    connection_file_path: PathBuf,
+    connections: Arc<std::sync::Mutex<Vec<JoinHandle<()>>>>,
+    accept_task: JoinHandle<()>,
+}
+
+impl RelayProxy {
+    async fn start(daemon_connection_file: &Path, temp_dir: &Path, label: &str) -> Self {
+        let mut info = subc_transport::read_for_client(daemon_connection_file).unwrap();
+        let daemon_port = info.endpoints[0].port;
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        info.endpoints[0].port = listener.local_addr().unwrap().port();
+        let connection_file_path = temp_dir.join(format!("{label}-proxied-subc.json"));
+        write_atomic(&connection_file_path, &info).unwrap();
+
+        let connections = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let accepted = Arc::clone(&connections);
+        let accept_task = tokio::spawn(async move {
+            loop {
+                let Ok((mut inbound, _)) = listener.accept().await else {
+                    return;
+                };
+                let pump = tokio::spawn(async move {
+                    let Ok(mut outbound) =
+                        TcpStream::connect((Ipv4Addr::LOCALHOST, daemon_port)).await
+                    else {
+                        return;
+                    };
+                    let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+                });
+                accepted.lock().unwrap().push(pump);
+            }
+        });
+        Self {
+            connection_file_path,
+            connections,
+            accept_task,
+        }
+    }
+
+    fn connection_count(&self) -> usize {
+        self.connections.lock().unwrap().len()
+    }
+
+    /// Closes the `index`th proxied connection (in accept order) on both
+    /// sides, as a daemon closing that connection would look to each peer.
+    fn cut(&self, index: usize) {
+        self.connections.lock().unwrap()[index].abort();
+    }
+
+    async fn wait_for_connection_count(&self, expected: usize, label: &str) {
+        let deadline = Instant::now() + READ_TIMEOUT;
+        while self.connection_count() < expected {
+            assert!(
+                Instant::now() < deadline,
+                "{label}: saw {} proxied connections, expected {expected}",
+                self.connection_count()
+            );
+            sleep(Duration::from_millis(10)).await;
+        }
+    }
+}
+
+impl Drop for RelayProxy {
+    fn drop(&mut self) {
+        self.accept_task.abort();
+        for connection in self.connections.lock().unwrap().iter() {
+            connection.abort();
+        }
+    }
+}
+
 struct McpHarness {
+    proxy: Option<RelayProxy>,
     server: TestServer,
     _project: TestProject,
     providers: BTreeMap<String, SupervisedModule>,
@@ -1370,6 +1448,28 @@ impl McpHarness {
         provider_specs: Vec<StubProvider<'_>>,
         user_config: Option<&str>,
         project_config: Option<&str>,
+    ) -> Self {
+        Self::start_inner(label, provider_specs, user_config, project_config, false).await
+    }
+
+    /// Starts the harness with the module's daemon connections running
+    /// through a [`RelayProxy`].
+    async fn start_proxied(label: &str, provider_specs: Vec<StubProvider<'_>>) -> Self {
+        Self::start_inner(label, provider_specs, None, None, true).await
+    }
+
+    fn proxy(&self) -> &RelayProxy {
+        self.proxy
+            .as_ref()
+            .expect("harness was started without a relay proxy")
+    }
+
+    async fn start_inner(
+        label: &str,
+        provider_specs: Vec<StubProvider<'_>>,
+        user_config: Option<&str>,
+        project_config: Option<&str>,
+        proxied: bool,
     ) -> Self {
         let server = TestServer::start().await;
         let mut providers = BTreeMap::new();
@@ -1407,8 +1507,25 @@ impl McpHarness {
             .daemon
             .temp_dir
             .join(format!("{label}-subc-mcp.json"));
+        let proxy = if proxied {
+            Some(
+                RelayProxy::start(
+                    &server.daemon.connection_file_path,
+                    &server.daemon.temp_dir,
+                    label,
+                )
+                .await,
+            )
+        } else {
+            None
+        };
+        let subc_connection_file = proxy
+            .as_ref()
+            .map_or(server.daemon.connection_file_path.as_path(), |proxy| {
+                proxy.connection_file_path.as_path()
+            });
         let mut module = spawn_module(
-            &server.daemon.connection_file_path,
+            subc_connection_file,
             &module_connection_file,
             &user_config_home,
         );
@@ -1429,6 +1546,7 @@ impl McpHarness {
             .expect("test harness should have at least one provider");
 
         Self {
+            proxy,
             server,
             _project: project,
             providers,
@@ -2853,6 +2971,107 @@ async fn mcp_provider_goodbye_removes_tools_notifies_and_fails_inflight_call() {
     harness.shutdown().await;
 }
 
+/// The module opens its tool-call relay connection first, then its
+/// supervision connection, so the relay is the proxy's first connection and
+/// its replacement is the third.
+const PROXIED_RELAY_CONNECTION: usize = 0;
+const PROXIED_CONNECTIONS_AFTER_RELAY_RECONNECT: usize = 3;
+
+/// The daemon closing only the module's relay connection (as an in-place
+/// daemon upgrade does, keeping the module and its supervision connection)
+/// must not leave the module deaf: it reconnects, and the MCP session's next
+/// tool call goes out on the new connection over a reopened route.
+#[tokio::test]
+async fn mcp_relay_connection_closed_by_daemon_reconnects_and_serves_next_call() {
+    let mut harness = McpHarness::start_proxied(
+        "mcp-relay-reconnect",
+        vec![StubProvider::new("fake-aft", &[])],
+    )
+    .await;
+    let call = || {
+        let mut args = JsonObject::new();
+        args.insert("value".to_owned(), json!("hello"));
+        CallToolRequestParams::new("fake-aft_fake_read").with_arguments(args)
+    };
+    let before = harness.client.peer().call_tool(call()).await.unwrap();
+    assert_eq!(before.is_error, Some(false));
+
+    harness.proxy().cut(PROXIED_RELAY_CONNECTION);
+    harness
+        .proxy()
+        .wait_for_connection_count(
+            PROXIED_CONNECTIONS_AFTER_RELAY_RECONNECT,
+            "subc-mcp never reconnected its relay after the daemon closed it",
+        )
+        .await;
+
+    let after = timeout(READ_TIMEOUT, harness.client.peer().call_tool(call()))
+        .await
+        .expect("tool call after the relay reconnect hung")
+        .unwrap();
+    assert_eq!(after.is_error, Some(false));
+    assert_eq!(
+        result_text(&after),
+        "fake-aft tool fake_read called with {\"value\":\"hello\"}"
+    );
+    assert!(
+        harness.module.try_wait().unwrap().is_none(),
+        "subc-mcp must keep running across a relay reconnect"
+    );
+
+    harness.shutdown().await;
+}
+
+/// A tool call already sent when the relay connection drops is settled at
+/// once as outcome unknown (the provider may have run it), not left waiting on
+/// a connection that can no longer answer, and not blamed on the provider.
+#[tokio::test]
+async fn mcp_relay_connection_loss_settles_inflight_call_as_outcome_unknown() {
+    let harness = McpHarness::start_proxied(
+        "mcp-relay-inflight",
+        vec![StubProvider::new(
+            "mc",
+            &[
+                ("FAKE_AFT_TOOLS", "memory"),
+                ("FAKE_AFT_TOOLCALL_DELAY_MS", "30000"),
+            ],
+        )],
+    )
+    .await;
+
+    let peer = harness.client.peer().clone();
+    let call = tokio::spawn(async move {
+        peer.call_tool(CallToolRequestParams::new("mc_memory"))
+            .await
+    });
+    let _event = wait_for_stub_event(harness.provider_events_path("mc"), READ_TIMEOUT, |event| {
+        event.get("kind") == Some(&Value::String("request_received".to_owned()))
+            && event.pointer("/body_json/name") == Some(&Value::String("memory".to_owned()))
+    })
+    .await;
+
+    harness.proxy().cut(PROXIED_RELAY_CONNECTION);
+    let err = timeout(READ_TIMEOUT, call)
+        .await
+        .expect("in-flight call was left hanging after the relay connection closed")
+        .unwrap()
+        .unwrap_err();
+    let ServiceError::McpError(error) = err else {
+        panic!("expected an MCP error for the lost connection, got {err:?}");
+    };
+    assert_eq!(
+        error.data,
+        Some(json!({
+            "subc_code": "subc_connection_lost",
+            "send_outcome": "outcome_unknown",
+            "request_dispatched": true,
+        })),
+        "in-flight call must settle as outcome unknown for the lost connection, got {error:?}"
+    );
+
+    harness.shutdown().await;
+}
+
 #[tokio::test]
 async fn mcp_catalog_poller_adds_new_provider_and_notifies() {
     let mut harness = McpHarness::start_configured(
@@ -3338,6 +3557,7 @@ async fn mcp_catalog_reconciliation_failure_preserves_previous_snapshot_and_clea
     let client_handler = TestMcpClient::new();
     let client = shim.serve_mcp_client(client_handler.clone()).await;
     let harness = McpHarness {
+        proxy: None,
         server,
         _project: project,
         providers,

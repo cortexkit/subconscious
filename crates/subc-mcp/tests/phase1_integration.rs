@@ -3733,7 +3733,13 @@ async fn supervised_mcp_module_exits_on_its_own_when_stopped() {
     let xdg_config_home = server.daemon.temp_dir.join("exit-mcp-xdg-config");
     fs::create_dir_all(&xdg_config_home).unwrap();
     let module_connection_file = server.daemon.temp_dir.join("exit-mcp-module.json");
+    // The shared supervisor's 25 ms drain budget is a race this test cannot
+    // referee: under a loaded machine the module reads the GOODBYE, reaches its
+    // exit path and is still SIGKILLed mid-exit because 25 ms have passed. A
+    // budget of seconds leaves exiting on its own and being killed at the
+    // deadline far apart, so signal 9 still means the module never noticed.
     let mcp = supervisor(&server)
+        .with_drain_timeout(Duration::from_secs(5))
         .spawn(mcp_module_spec(
             "mcp",
             &module_connection_file,

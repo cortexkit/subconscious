@@ -309,10 +309,7 @@ pub async fn boot(
         .await
         .map_err(|error| vault_failure(cause::ROOT_KEY_UNREACHABLE, &error))?;
     let now = unix_now();
-    let mut revoked = existing
-        .as_ref()
-        .map(revocations)
-        .unwrap_or_default();
+    let mut revoked = existing.as_ref().map(revocations).unwrap_or_default();
     for user in &to_revoke {
         revoked.entry(user.clone()).or_insert(now);
     }

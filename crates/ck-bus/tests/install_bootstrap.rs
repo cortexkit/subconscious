@@ -349,7 +349,9 @@ async fn system_user_kicks_a_harness_client() {
     let first = ready(&plane, 1).await;
     let account = first["account_public"].as_str().unwrap().to_string();
 
-    // ck-bus's system plane, driven in this process against the same signer.
+    // ck-bus's system-account connection code (`NatsBroker::connect_system` and its
+    // kick), run in this process with a system user signed by the same harness signer
+    // the supervised ck-bus uses.
     let credentials = Arc::new(Credentials::new(Arc::new(ClaustrumRoute::new(
         plane.run.connection_file.clone(),
         None,

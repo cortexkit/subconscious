@@ -83,7 +83,10 @@ struct AdmissionFactsConfig {
 ///
 /// In-process daemons default to [`Self::Disabled`] so they never derive a
 /// production location from the host process. The shipped daemon explicitly uses
-/// [`Self::Current`]. Tests that exercise placement can own an [`Self::Root`].
+/// [`Self::Current`]. The `ck-subc` binary accepts
+/// `SUBC_CGROUP_PLACEMENT=disabled` for isolated test processes; an unset
+/// variable retains `Current`, and every other value is rejected at startup.
+/// Tests that exercise placement can own a [`Self::Root`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum CgroupPlacementConfig {
     #[default]

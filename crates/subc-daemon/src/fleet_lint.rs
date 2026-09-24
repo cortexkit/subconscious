@@ -592,6 +592,16 @@ mod tests {
             name.to_string()
         };
         let path = temp.path().join(filename);
+        // A child owns the writable descriptor so other test threads cannot
+        // fork while this process holds the executable open for writing.
+        #[cfg(unix)]
+        assert!(Command::new("cp")
+            .arg(fake_aft_stub_path())
+            .arg(&path)
+            .status()
+            .expect("copy executable fixture")
+            .success());
+        #[cfg(not(unix))]
         fs::copy(fake_aft_stub_path(), &path).unwrap();
 
         // Per-temp-dir sidecars keep parallel tests isolated without environment

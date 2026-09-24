@@ -379,7 +379,7 @@ async fn health_restart_spawn_failure_marks_failed_and_start_recovers() {
     let module_id = "fake-aft-health-respawn-fails";
     let program = server.temp_dir.join("health-respawn-program");
     let real_program = Path::new(env!("CARGO_BIN_EXE_fake-aft-stub"));
-    fs::copy(real_program, &program).unwrap();
+    common::copy_executable(real_program, &program);
     fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
 
     let mut spec = stub_spec_with_env(
@@ -412,7 +412,7 @@ async fn health_restart_spawn_failure_marks_failed_and_start_recovers() {
         "failed health respawn must be removed from process-liveness tracking"
     );
 
-    fs::copy(real_program, &program).unwrap();
+    common::copy_executable(real_program, &program);
     fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
     assert!(module.set_enabled(true).await.unwrap());
     wait_for_status(&module, SETUP_TIMEOUT, |status| {

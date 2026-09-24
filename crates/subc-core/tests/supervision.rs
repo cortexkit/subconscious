@@ -401,7 +401,10 @@ async fn operator_restart_spawn_failure_lands_failed_not_restarting() {
     // The guard owns the parent dir; the stub copy is a file inside it.
     let _dir = TestTempDir::new("fake-aft-stub-copy");
     let stub_copy = _dir.path().join("fake-aft-stub");
-    std::fs::copy(env!("CARGO_BIN_EXE_fake-aft-stub"), &stub_copy).unwrap();
+    common::copy_executable(
+        std::path::Path::new(env!("CARGO_BIN_EXE_fake-aft-stub")),
+        &stub_copy,
+    );
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -443,7 +446,10 @@ async fn operator_restart_spawn_failure_lands_failed_not_restarting() {
 
     // And Failed is the revivable state: restoring the program and re-enabling
     // heals it, which is the property Restarting-stranding denied the operator.
-    std::fs::copy(env!("CARGO_BIN_EXE_fake-aft-stub"), &stub_copy).unwrap();
+    common::copy_executable(
+        std::path::Path::new(env!("CARGO_BIN_EXE_fake-aft-stub")),
+        &stub_copy,
+    );
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

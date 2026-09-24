@@ -25,6 +25,20 @@ use tokio::{
     task::JoinHandle,
 };
 
+/// Copy an executable via a child: the test process must not hold its writable
+/// descriptor while another test thread forks to run it.
+pub fn copy_executable(src: &Path, dst: &Path) {
+    #[cfg(unix)]
+    assert!(Command::new("cp")
+        .arg(src)
+        .arg(dst)
+        .status()
+        .expect("copy executable fixture")
+        .success());
+    #[cfg(not(unix))]
+    std::fs::copy(src, dst).expect("copy executable fixture");
+}
+
 const TEST_DAEMON_VER: &str = "test-subc";
 const TEST_AUTH_DEADLINE: Duration = Duration::from_secs(2);
 

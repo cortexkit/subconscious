@@ -690,7 +690,11 @@ impl BoxPlane for NatsBox {
     ) -> Result<Option<ConsumerState>, PlaneError> {
         let what = format!("consumer info {durable} on {stream}");
         let reply = self
-            .api(format!("CONSUMER.INFO.{stream}.{durable}"), json!({}), &what)
+            .api(
+                format!("CONSUMER.INFO.{stream}.{durable}"),
+                json!({}),
+                &what,
+            )
             .await?;
         if api_error_code(&reply) == Some(CONSUMER_NOT_FOUND) {
             return Ok(None);
@@ -704,7 +708,11 @@ impl BoxPlane for NatsBox {
     async fn delete_durable(&self, stream: &str, durable: &str) -> Result<bool, PlaneError> {
         let what = format!("delete consumer {durable} on {stream}");
         let reply = self
-            .api(format!("CONSUMER.DELETE.{stream}.{durable}"), json!({}), &what)
+            .api(
+                format!("CONSUMER.DELETE.{stream}.{durable}"),
+                json!({}),
+                &what,
+            )
             .await?;
         if api_error_code(&reply) == Some(CONSUMER_NOT_FOUND) {
             return Ok(false);

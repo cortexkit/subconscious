@@ -672,23 +672,33 @@ impl BoxPlane for RecordingPlane {
         ))
     }
     async fn create_durable(&self, _durable: &DurableConsumer) -> Result<(), PlaneError> {
-        Err(PlaneError::new("the census row's RecordingPlane serves no durable create"))
+        Err(PlaneError::new(
+            "the census row's RecordingPlane serves no durable create",
+        ))
     }
     async fn consumer_state(
         &self,
         _stream: &str,
         _durable: &str,
     ) -> Result<Option<bootstrap::plane::ConsumerState>, PlaneError> {
-        Err(PlaneError::new("the census row's RecordingPlane serves no consumer read"))
+        Err(PlaneError::new(
+            "the census row's RecordingPlane serves no consumer read",
+        ))
     }
     async fn delete_durable(&self, _stream: &str, _durable: &str) -> Result<bool, PlaneError> {
-        Err(PlaneError::new("the census row's RecordingPlane serves no durable delete"))
+        Err(PlaneError::new(
+            "the census row's RecordingPlane serves no durable delete",
+        ))
     }
     async fn purge_subject(&self, _stream: &str, _filter_subject: &str) -> Result<u64, PlaneError> {
-        Err(PlaneError::new("the census row's RecordingPlane serves no purge"))
+        Err(PlaneError::new(
+            "the census row's RecordingPlane serves no purge",
+        ))
     }
     async fn consumer_names(&self, _stream: &str) -> Result<Vec<String>, PlaneError> {
-        Err(PlaneError::new("the census row's RecordingPlane serves no consumer listing"))
+        Err(PlaneError::new(
+            "the census row's RecordingPlane serves no consumer listing",
+        ))
     }
 }
 

@@ -16,8 +16,8 @@ use std::{collections::BTreeSet, error::Error, fmt};
 
 use cortexkit_bus_naming::{
     bus_permissions, delivery_authority_permissions, generate_permission_golden,
-    participant_permissions, system_permissions, validate_permission_file, AccountNames, AllowEntry, GoldenFixture, GrantError, NamingError,
-    Operation, Principal,
+    participant_permissions, system_permissions, validate_permission_file, AccountNames,
+    AllowEntry, GoldenFixture, GrantError, NamingError, Operation, Principal,
 };
 use serde_json::{json, Value};
 

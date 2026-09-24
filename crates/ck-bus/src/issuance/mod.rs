@@ -310,8 +310,7 @@ impl Issuance {
         let user_public = custody.generate_user();
         let identities: Vec<String> = Vec::new();
         let rooms: Vec<String> = Vec::new();
-        let signed = match self.sign(&plane, module_id, &user_public, &rooms).await
-        {
+        let signed = match self.sign(&plane, module_id, &user_public, &rooms).await {
             Ok(signed) => signed,
             Err(refusal) => {
                 custody.forget(&user_public);
@@ -396,9 +395,8 @@ impl Issuance {
         rooms: &[String],
     ) -> Result<SignedUserJwt, Refusal> {
         let bound_rooms: Vec<&str> = rooms.iter().map(String::as_str).collect();
-        let grant: Grant =
-            grants::issued_grant(&plane.names, module_id, user_public, &bound_rooms)
-                .map_err(|refusal| Refusal::new(code::GRANT_REFUSED, refusal.to_string()))?;
+        let grant: Grant = grants::issued_grant(&plane.names, module_id, user_public, &bound_rooms)
+            .map_err(|refusal| Refusal::new(code::GRANT_REFUSED, refusal.to_string()))?;
         let root_id = RootCredential::BoxAccount
             .credential_id()
             .map_err(|error| Refusal::new(code::NAME_REFUSED, error.to_string()))?;

@@ -127,7 +127,10 @@ fn ckbus_owned_durables_stay_off_the_agent_streams() {
         .iter()
         .map(|kind| membership::stream_name(&names, *kind))
         .collect();
-    assert_eq!(kinds, agent_streams, "the kinds name the naming crate's list");
+    assert_eq!(
+        kinds, agent_streams,
+        "the kinds name the naming crate's list"
+    );
 
     // Bootstrap creates the shipped streams; every agent stream is one of them.
     let bootstrap: BTreeSet<String> = shipped_streams(&names)
@@ -135,12 +138,18 @@ fn ckbus_owned_durables_stay_off_the_agent_streams() {
         .map(|spec| spec.name)
         .collect();
     for stream in &agent_streams {
-        assert!(bootstrap.contains(stream), "{stream} is created by bootstrap");
+        assert!(
+            bootstrap.contains(stream),
+            "{stream} is created by bootstrap"
+        );
     }
 
     for (kind, durable) in membership::CKBUS_OWNED_DURABLES {
         let stream = membership::stream_name(&names, kind);
-        assert!(bootstrap.contains(&stream), "{durable} sits on a bootstrap stream");
+        assert!(
+            bootstrap.contains(&stream),
+            "{durable} sits on a bootstrap stream"
+        );
         assert!(
             !agent_streams.contains(&stream),
             "ck-bus-owned durable {durable} is on agent stream {stream}, which every \
@@ -150,7 +159,10 @@ fn ckbus_owned_durables_stay_off_the_agent_streams() {
 
     let planned = membership::agent_durables(&names, "agent_invariant").unwrap();
     assert_eq!(
-        planned.iter().map(|durable| durable.stream.clone()).collect::<Vec<_>>(),
+        planned
+            .iter()
+            .map(|durable| durable.stream.clone())
+            .collect::<Vec<_>>(),
         agent_streams
     );
     for durable in &planned {
@@ -348,7 +360,10 @@ async fn register_module(run: &SignerRun, module_id: &str) {
     )
     .await
     {
-        panic!("supervisor.rescan refused: {} {}", error.code, error.message);
+        panic!(
+            "supervisor.rescan refused: {} {}",
+            error.code, error.message
+        );
     }
     run.wait_for_catalog_id(module_id).await;
     // The catalog can list the module before it serves; a relay answer proves it does.
@@ -392,7 +407,11 @@ async fn relay_as(
     ))
 }
 
-async fn relay_raw(connection_file: &Path, module_id: &str, params: Value) -> Result<Value, String> {
+async fn relay_raw(
+    connection_file: &Path,
+    module_id: &str,
+    params: Value,
+) -> Result<Value, String> {
     let consumer = SubcConsumer::connect(connection_file, ConsumerOptions::default())
         .await
         .map_err(|error| error.to_string())?;
@@ -459,7 +478,12 @@ async fn consumers_on(observer: &jetstream::Context, stream: &str) -> BTreeSet<S
 }
 
 /// Polls `read` until `done` holds, failing with the last value after `limit`.
-async fn wait_for<F, Fut>(what: &str, limit: Duration, mut read: F, done: impl Fn(&Value) -> bool) -> Value
+async fn wait_for<F, Fut>(
+    what: &str,
+    limit: Duration,
+    mut read: F,
+    done: impl Fn(&Value) -> bool,
+) -> Value
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Value>,
@@ -470,7 +494,10 @@ where
         if done(&value) {
             return value;
         }
-        assert!(Instant::now() < deadline, "{what} never held; last: {value}");
+        assert!(
+            Instant::now() < deadline,
+            "{what} never held; last: {value}"
+        );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
@@ -482,7 +509,11 @@ async fn callers_other_than_prefrontal_core_are_refused_through_the_daemon() {
     let Some(live) = start(&[PARTICIPANT, PREFRONTAL]).await else {
         return;
     };
-    let cases = [(PARTICIPANT, true), (PARTICIPANT, false), (PREFRONTAL, false)];
+    let cases = [
+        (PARTICIPANT, true),
+        (PARTICIPANT, false),
+        (PREFRONTAL, false),
+    ];
     for (op, _) in membership::OPERATIONS {
         for (module, attest) in cases {
             let (code, message) = relay_as(
@@ -504,7 +535,10 @@ async fn callers_other_than_prefrontal_core_are_refused_through_the_daemon() {
     // Nothing was bound on the way.
     let observer = live.observer().await;
     for stream in membership::agent_streams(&live.names) {
-        assert!(consumers_on(&observer, &stream).await.is_empty(), "{stream}");
+        assert!(
+            consumers_on(&observer, &stream).await.is_empty(),
+            "{stream}"
+        );
     }
     // ck-bus's log names the principal it observed for each refusal.
     let answers = bus::events(live.run.root.path(), "ckbus.membership.answer");
@@ -529,8 +563,12 @@ async fn bind_is_idempotent_and_a_different_configuration_is_refused_and_kept() 
     let observer = live.observer().await;
     let agent = "agent_bind_a";
 
-    let first = live.prefrontal(membership::BIND_OP, json!({"agent_id": agent})).await;
-    let second = live.prefrontal(membership::BIND_OP, json!({"agent_id": agent})).await;
+    let first = live
+        .prefrontal(membership::BIND_OP, json!({"agent_id": agent}))
+        .await;
+    let second = live
+        .prefrontal(membership::BIND_OP, json!({"agent_id": agent}))
+        .await;
     let planned = membership::agent_durables(&live.names, agent).unwrap();
     for (reply, created) in [(&first, true), (&second, false)] {
         assert_eq!(reply["agent_id"], agent);
@@ -593,7 +631,10 @@ async fn bind_is_idempotent_and_a_different_configuration_is_refused_and_kept() 
     assert!(message.contains(&peer_plan.stream), "{message}");
     assert!(message.contains("max_deliver is 3"), "{message}");
     let kept = consumer_info(&observer, &peer_plan.stream, &peer_plan.durable).await;
-    assert_eq!(kept.config.max_deliver, 3, "the differing durable was not replaced");
+    assert_eq!(
+        kept.config.max_deliver, 3,
+        "the differing durable was not replaced"
+    );
 
     // Only agent durables sit on the agent streams.
     for stream in membership::agent_streams(&live.names) {
@@ -620,7 +661,8 @@ async fn delete_drops_undelivered_messages_and_an_absent_durable_succeeds() {
     let agent = "agent_delete_a";
     let bystander = "agent_delete_b";
     for bound in [agent, bystander] {
-        live.prefrontal(membership::BIND_OP, json!({"agent_id": bound})).await;
+        live.prefrontal(membership::BIND_OP, json!({"agent_id": bound}))
+            .await;
     }
     for _ in 0..2 {
         stored_publish(&observer, live.names.wake_fire(agent).unwrap(), b"wake").await;
@@ -634,9 +676,16 @@ async fn delete_drops_undelivered_messages_and_an_absent_durable_succeeds() {
     stored_publish(&observer, live.names.wake_fire(bystander).unwrap(), b"kept").await;
     let streams = live.names.streams().clone();
     let durable = AccountNames::consumer_name(agent).unwrap();
-    assert_eq!(consumer_info(&observer, &streams.wake, &durable).await.num_pending, 2);
+    assert_eq!(
+        consumer_info(&observer, &streams.wake, &durable)
+            .await
+            .num_pending,
+        2
+    );
 
-    let deleted = live.prefrontal(membership::DELETE_OP, json!({"agent_id": agent})).await;
+    let deleted = live
+        .prefrontal(membership::DELETE_OP, json!({"agent_id": agent}))
+        .await;
     assert_eq!(
         deleted["deleted"],
         json!(membership::agent_streams(&live.names)),
@@ -651,20 +700,30 @@ async fn delete_drops_undelivered_messages_and_an_absent_durable_succeeds() {
 
     // Rebound, the agent's durable starts empty: the purge dropped the messages rather
     // than leaving them for the next bind to deliver.
-    live.prefrontal(membership::BIND_OP, json!({"agent_id": agent})).await;
+    live.prefrontal(membership::BIND_OP, json!({"agent_id": agent}))
+        .await;
     for stream in [&streams.wake, &streams.peer] {
-        assert_eq!(consumer_info(&observer, stream, &durable).await.num_pending, 0, "{stream}");
+        assert_eq!(
+            consumer_info(&observer, stream, &durable).await.num_pending,
+            0,
+            "{stream}"
+        );
     }
     // The purge was the agent's subject only.
     let bystander_durable = AccountNames::consumer_name(bystander).unwrap();
     assert_eq!(
-        consumer_info(&observer, &streams.wake, &bystander_durable).await.num_pending,
+        consumer_info(&observer, &streams.wake, &bystander_durable)
+            .await
+            .num_pending,
         1
     );
 
     // Deleting a durable that does not exist succeeds and reports nothing deleted.
     let absent = live
-        .prefrontal(membership::DELETE_OP, json!({"agent_id": "agent_never_bound"}))
+        .prefrontal(
+            membership::DELETE_OP,
+            json!({"agent_id": "agent_never_bound"}),
+        )
         .await;
     assert_eq!(absent["deleted"], json!([]), "{absent}");
     passed();
@@ -681,7 +740,8 @@ async fn the_list_reports_each_durables_undelivered_count() {
     let observer = live.observer().await;
     let (a, b) = ("agent_list_a", "agent_list_b");
     for bound in [a, b] {
-        live.prefrontal(membership::BIND_OP, json!({"agent_id": bound})).await;
+        live.prefrontal(membership::BIND_OP, json!({"agent_id": bound}))
+            .await;
     }
     for _ in 0..3 {
         stored_publish(&observer, live.names.wake_fire(a).unwrap(), b"wake").await;
@@ -703,7 +763,9 @@ async fn the_list_reports_each_durables_undelivered_count() {
     let rows = live.prefrontal(membership::LIST_OP, json!({})).await;
     assert_eq!(rows.as_array().map(Vec::len), Some(6), "{rows}");
     for row in rows.as_array().unwrap() {
-        let agent = row["agent_id"].as_str().expect("every row is an agent durable");
+        let agent = row["agent_id"]
+            .as_str()
+            .expect("every row is an agent durable");
         let plan = membership::agent_durables(&live.names, agent)
             .unwrap()
             .into_iter()
@@ -719,7 +781,10 @@ async fn the_list_reports_each_durables_undelivered_count() {
 
     // A delivery (unacked) leaves the undelivered count, so pending falls to 2.
     let consumer: jetstream::consumer::Consumer<pull::Config> = observer
-        .get_consumer_from_stream(AccountNames::consumer_name(a).unwrap(), streams.wake.clone())
+        .get_consumer_from_stream(
+            AccountNames::consumer_name(a).unwrap(),
+            streams.wake.clone(),
+        )
         .await
         .unwrap();
     let _held = consumer
@@ -756,7 +821,9 @@ async fn a_dead_lettered_intent_is_not_counted_as_effects_pending() {
     let agent = "agent_effect_a";
     let params = json!({"agent_id": agent});
 
-    let unbound = live.prefrontal(membership::EFFECTS_PENDING_OP, params.clone()).await;
+    let unbound = live
+        .prefrontal(membership::EFFECTS_PENDING_OP, params.clone())
+        .await;
     assert_eq!(unbound["bound"], false, "{unbound}");
     assert_eq!(unbound["pending"], 0, "{unbound}");
 
@@ -767,9 +834,14 @@ async fn a_dead_lettered_intent_is_not_counted_as_effects_pending() {
         b"poisoned",
     )
     .await;
-    let queued = live.prefrontal(membership::EFFECTS_PENDING_OP, params.clone()).await;
+    let queued = live
+        .prefrontal(membership::EFFECTS_PENDING_OP, params.clone())
+        .await;
     assert_eq!(queued["undelivered"], 1, "{queued}");
-    assert_eq!(queued["pending"], 1, "the counter sees a deliverable intent: {queued}");
+    assert_eq!(
+        queued["pending"], 1,
+        "the counter sees a deliverable intent: {queued}"
+    );
 
     // The intent is refused on every delivery until max_deliver (5) is exhausted.
     let consumer: jetstream::consumer::Consumer<pull::Config> = observer
@@ -794,18 +866,28 @@ async fn a_dead_lettered_intent_is_not_counted_as_effects_pending() {
         assert_eq!(message.info().unwrap().delivered, delivery);
         if delivery == 1 {
             // Delivered and unacked: reported in flight, and no longer undelivered.
-            let in_flight = live.prefrontal(membership::EFFECTS_PENDING_OP, params.clone()).await;
+            let in_flight = live
+                .prefrontal(membership::EFFECTS_PENDING_OP, params.clone())
+                .await;
             assert_eq!(in_flight["in_flight"], 1, "{in_flight}");
             assert_eq!(in_flight["undelivered"], 0, "{in_flight}");
         }
-        message.ack_with(AckKind::Nak(None)).await.expect("nak sent");
+        message
+            .ack_with(AckKind::Nak(None))
+            .await
+            .expect("nak sent");
     }
     // The server keeps an exhausted intent among the delivered-and-unacked (in flight)
     // until its ack wait passes, so the read must not count in-flight intents: this one
     // would otherwise hold a merge back for as long as it sits there.
-    let exhausted = live.prefrontal(membership::EFFECTS_PENDING_OP, params.clone()).await;
+    let exhausted = live
+        .prefrontal(membership::EFFECTS_PENDING_OP, params.clone())
+        .await;
     assert_eq!(exhausted["undelivered"], 0, "{exhausted}");
-    assert_eq!(exhausted["pending"], 0, "a dead-lettered intent is not pending: {exhausted}");
+    assert_eq!(
+        exhausted["pending"], 0,
+        "a dead-lettered intent is not pending: {exhausted}"
+    );
     let redelivered = consumer
         .fetch()
         .max_messages(1)
@@ -815,7 +897,10 @@ async fn a_dead_lettered_intent_is_not_counted_as_effects_pending() {
         .unwrap()
         .next()
         .await;
-    assert!(redelivered.is_none(), "the exhausted intent is never delivered again");
+    assert!(
+        redelivered.is_none(),
+        "the exhausted intent is never delivered again"
+    );
 
     // A new intent is counted again: the read is live, not stuck at zero.
     stored_publish(
@@ -824,7 +909,9 @@ async fn a_dead_lettered_intent_is_not_counted_as_effects_pending() {
         b"fresh",
     )
     .await;
-    let fresh = live.prefrontal(membership::EFFECTS_PENDING_OP, params).await;
+    let fresh = live
+        .prefrontal(membership::EFFECTS_PENDING_OP, params)
+        .await;
     assert_eq!(fresh["pending"], 1, "{fresh}");
     passed();
     live.stop().await;
@@ -878,13 +965,28 @@ async fn a_credential_issued_before_a_bind_pulls_from_the_durable_bound_after() 
     assert_eq!(code, issuance::code::PRINCIPAL_DIRECT, "{message}");
 
     // Both credentials are issued before any agent is bound.
-    let participant = relay_as(&connection_file, PARTICIPANT, true, issuance::CREDENTIAL_OP, json!({}))
-        .await
-        .unwrap_or_else(|(code, message)| panic!("participant credential: {code} {message}"));
-    let authority = relay_as(&connection_file, PREFRONTAL, true, issuance::CREDENTIAL_OP, json!({}))
-        .await
-        .unwrap_or_else(|(code, message)| panic!("prefrontal-core credential: {code} {message}"));
-    let participant_public = participant["credential_public"].as_str().unwrap().to_string();
+    let participant = relay_as(
+        &connection_file,
+        PARTICIPANT,
+        true,
+        issuance::CREDENTIAL_OP,
+        json!({}),
+    )
+    .await
+    .unwrap_or_else(|(code, message)| panic!("participant credential: {code} {message}"));
+    let authority = relay_as(
+        &connection_file,
+        PREFRONTAL,
+        true,
+        issuance::CREDENTIAL_OP,
+        json!({}),
+    )
+    .await
+    .unwrap_or_else(|(code, message)| panic!("prefrontal-core credential: {code} {message}"));
+    let participant_public = participant["credential_public"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let authority_public = authority["credential_public"].as_str().unwrap().to_string();
     let participant_claims = bus::claims(participant["jwt"].as_str().unwrap());
     let authority_claims = bus::claims(authority["jwt"].as_str().unwrap());
@@ -902,7 +1004,11 @@ async fn a_credential_issued_before_a_bind_pulls_from_the_durable_bound_after() 
     let participant_client = VerdictClient::connect(
         &live.server.url,
         participant["jwt"].as_str().unwrap(),
-        relayed_signer(connection_file.clone(), PARTICIPANT, participant_public.clone()),
+        relayed_signer(
+            connection_file.clone(),
+            PARTICIPANT,
+            participant_public.clone(),
+        ),
         Some(format!("_INBOX.{participant_public}")),
     )
     .await
@@ -910,15 +1016,25 @@ async fn a_credential_issued_before_a_bind_pulls_from_the_durable_bound_after() 
     let authority_client = VerdictClient::connect(
         &live.server.url,
         authority["jwt"].as_str().unwrap(),
-        relayed_signer(connection_file.clone(), PREFRONTAL, authority_public.clone()),
+        relayed_signer(
+            connection_file.clone(),
+            PREFRONTAL,
+            authority_public.clone(),
+        ),
         Some(format!("_INBOX.{authority_public}")),
     )
     .await
-    .unwrap_or_else(|error| panic!("prefrontal-core connect: {error}\n{}", live.server.log_text()));
+    .unwrap_or_else(|error| {
+        panic!(
+            "prefrontal-core connect: {error}\n{}",
+            live.server.log_text()
+        )
+    });
 
     // Now prefrontal binds an agent and delivers it a wake under its own credential.
     let agent = "agent_after_issue";
-    live.prefrontal(membership::BIND_OP, json!({"agent_id": agent})).await;
+    live.prefrontal(membership::BIND_OP, json!({"agent_id": agent}))
+        .await;
     let fire = live.names.wake_fire(agent).unwrap();
     authority_client.publish(&fire, b"after issue").await;
     authority_client.expect_allowed(&fire).await;
@@ -959,14 +1075,20 @@ async fn a_credential_issued_before_a_bind_pulls_from_the_durable_bound_after() 
     }
     let observer = live.observer().await;
     assert_eq!(
-        consumer_info(&observer, &wake, &durable).await.ack_floor.stream_sequence,
+        consumer_info(&observer, &wake, &durable)
+            .await
+            .ack_floor
+            .stream_sequence,
         1,
         "the participant's ack was applied"
     );
     // Still the credential issued before the bind: no reissue happened.
     let issued = bus::events(live.run.root.path(), "ckbus.issuance.issued");
     assert_eq!(
-        issued.iter().filter(|event| event["module_id"] == PARTICIPANT).count(),
+        issued
+            .iter()
+            .filter(|event| event["module_id"] == PARTICIPANT)
+            .count(),
         1,
         "{issued:?}"
     );

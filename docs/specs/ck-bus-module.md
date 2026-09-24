@@ -1469,7 +1469,9 @@ SECTION governs.
     `[{agent_id, stream, durable, pending, filter_subject}]`, where `pending` is the
     durable's undelivered count (`num_pending`). A consumer that is not an agent durable
     is listed with `agent_id: null`. It needs `$JS.API.CONSUMER.NAMES.<S>` in the bus
-    grant.
+    grant. Prefrontal reconciles against it at boot and on a slow cadence: it binds
+    durables its registry says should exist, and deletes a durable only once that
+    agent's registry row is terminal, never on absence alone.
   - `ckbus.agent_effects_pending {agent_id}` replies `{agent_id, stream, durable, bound,
     undelivered, in_flight, pending}` for the agent's EFFECT durable: `pending` equals
     `undelivered`, the intents the durable has not delivered yet. Delivered-and-unacked
@@ -1494,8 +1496,11 @@ SECTION governs.
   "failed"}` on a copy failure, so a rerun resumes rather than guessing (the
   `Nats-Msg-Id` dedupe makes a recopy inside the window harmless, but the reply still
   says what happened). A retry finding `from` absent and `into` present
-  succeeds. Messages accepted before a merge are never lost: today's delivery refuses a
-  merged agent and points senders at the survivor.
+  succeeds. The original headers kept include prefrontal's delivery id, which is the
+  end-to-end guarantee: prefrontal deduplicates on it at delivery, so a duplicate that
+  outlives the stream's duplicate window after a long crash is dropped there. Merge is
+  retry-safe rather than atomic. Messages accepted before a merge are never lost:
+  today's delivery refuses a merged agent and points senders at the survivor.
   Issuance step 4 no longer creates `c_{agent_id}` durables; prefrontal's bind does. The
   membership row keeps rooms only, still gated on `membership-contract-unpinned`.
 - R16 (ALF, 2026-09-24; discharges `user-jwt-ttl-unpinned`): every user JWT ck-bus

@@ -284,13 +284,23 @@ async fn generated_grants_hold_on_a_live_server() {
         .expect("the delivery-authority user connects");
     // Allowed: a workload message for each agent stream, each checked by its storage.
     for (stream, subject) in [
-        (&streams.peer, names.peer_delivery(AGENT, "sess_conf").unwrap()),
-        (&streams.effect, names.effect_intent(AGENT, "sess_conf").unwrap()),
+        (
+            &streams.peer,
+            names.peer_delivery(AGENT, "sess_conf").unwrap(),
+        ),
+        (
+            &streams.effect,
+            names.effect_intent(AGENT, "sess_conf").unwrap(),
+        ),
     ] {
         let before = stored(&observer, stream).await;
         a.publish(&subject, b"delivered").await;
         a.expect_allowed(&subject).await;
-        assert_eq!(stored(&observer, stream).await, before + 1, "{subject} stored");
+        assert_eq!(
+            stored(&observer, stream).await,
+            before + 1,
+            "{subject} stored"
+        );
     }
     // Refused: it creates no consumer, writes no census key and reaches no `$SYS`.
     let mut authority_refused = vec![
@@ -437,7 +447,11 @@ async fn generated_grants_hold_on_a_live_server() {
         .expect("the foreign wake arrives")
         .expect("a delivered message");
     assert_eq!(foreign_message.payload.as_ref(), b"foreign wake");
-    let foreign_ack = foreign_message.reply.clone().expect("an ack subject").to_string();
+    let foreign_ack = foreign_message
+        .reply
+        .clone()
+        .expect("an ack subject")
+        .to_string();
     foreign_message.ack().await.expect("ack sent");
     for subject in [
         foreign_ack,

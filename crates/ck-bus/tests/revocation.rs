@@ -889,7 +889,9 @@ impl BoxPlane for UnreadableCensus {
         Err(PlaneError::new("UnreadableCensus serves no purge"))
     }
     async fn consumer_names(&self, _stream: &str) -> Result<Vec<String>, PlaneError> {
-        Err(PlaneError::new("UnreadableCensus serves no consumer listing"))
+        Err(PlaneError::new(
+            "UnreadableCensus serves no consumer listing",
+        ))
     }
 }
 

@@ -116,14 +116,29 @@ pub fn stream_name(names: &AccountNames, kind: StreamKind) -> String {
 
 /// The three durables bind creates for `agent_id`, each filter checked against its
 /// stream's binding.
-pub fn agent_durables(names: &AccountNames, agent_id: &str) -> Result<Vec<DurableConsumer>, Refusal> {
+pub fn agent_durables(
+    names: &AccountNames,
+    agent_id: &str,
+) -> Result<Vec<DurableConsumer>, Refusal> {
     let naming = |error: NamingError| Refusal::new(issuance_code::NAME_REFUSED, error.to_string());
     let durable = AccountNames::consumer_name(agent_id).map_err(naming)?;
     let streams = names.streams();
     let planned = [
-        (streams.wake.clone(), names.wake_fire(agent_id).map_err(naming)?, UNLIMITED_MAX_DELIVER),
-        (streams.peer.clone(), names.peer_filter(agent_id).map_err(naming)?, UNLIMITED_MAX_DELIVER),
-        (streams.effect.clone(), names.effect_filter(agent_id).map_err(naming)?, EFFECT_MAX_DELIVER),
+        (
+            streams.wake.clone(),
+            names.wake_fire(agent_id).map_err(naming)?,
+            UNLIMITED_MAX_DELIVER,
+        ),
+        (
+            streams.peer.clone(),
+            names.peer_filter(agent_id).map_err(naming)?,
+            UNLIMITED_MAX_DELIVER,
+        ),
+        (
+            streams.effect.clone(),
+            names.effect_filter(agent_id).map_err(naming)?,
+            EFFECT_MAX_DELIVER,
+        ),
     ];
     let shipped = shipped_streams(names);
     planned
@@ -158,12 +173,36 @@ pub fn config_differences(existing: &ConsumerState, wanted: &DurableConsumer) ->
             differences.push(format!("{field} is {found}, bind creates {wanted}"));
         }
     };
-    compare("filter_subjects", format!("{:?}", found.filter_subjects), format!("{:?}", wanted.filter_subjects));
-    compare("ack_wait", format!("{:?}", found.ack_wait), format!("{:?}", wanted.ack_wait));
-    compare("max_deliver", found.max_deliver.to_string(), wanted.max_deliver.to_string());
-    compare("max_ack_pending", found.max_ack_pending.to_string(), wanted.max_ack_pending.to_string());
-    compare("ack_policy", existing.ack_policy.clone(), ACK_POLICY.to_string());
-    compare("deliver_policy", existing.deliver_policy.clone(), DELIVER_POLICY.to_string());
+    compare(
+        "filter_subjects",
+        format!("{:?}", found.filter_subjects),
+        format!("{:?}", wanted.filter_subjects),
+    );
+    compare(
+        "ack_wait",
+        format!("{:?}", found.ack_wait),
+        format!("{:?}", wanted.ack_wait),
+    );
+    compare(
+        "max_deliver",
+        found.max_deliver.to_string(),
+        wanted.max_deliver.to_string(),
+    );
+    compare(
+        "max_ack_pending",
+        found.max_ack_pending.to_string(),
+        wanted.max_ack_pending.to_string(),
+    );
+    compare(
+        "ack_policy",
+        existing.ack_policy.clone(),
+        ACK_POLICY.to_string(),
+    );
+    compare(
+        "deliver_policy",
+        existing.deliver_policy.clone(),
+        DELIVER_POLICY.to_string(),
+    );
     differences
 }
 
@@ -216,12 +255,15 @@ impl Membership {
         match method {
             LIST_OP => list(&plane.names, box_plane).await,
             _ => {
-                let agent_id = params.get("agent_id").and_then(Value::as_str).ok_or_else(|| {
-                    Refusal::new(
-                        issuance_code::BAD_REQUEST,
-                        format!("{method} requires params.agent_id"),
-                    )
-                })?;
+                let agent_id = params
+                    .get("agent_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        Refusal::new(
+                            issuance_code::BAD_REQUEST,
+                            format!("{method} requires params.agent_id"),
+                        )
+                    })?;
                 match method {
                     BIND_OP => bind(&plane.names, box_plane, agent_id).await,
                     DELETE_OP => delete(&plane.names, box_plane, agent_id).await,
@@ -338,9 +380,9 @@ pub async fn list(names: &AccountNames, plane: &dyn BoxPlane) -> Result<Value, R
             else {
                 continue;
             };
-            let agent_id = durable
-                .strip_prefix("c_")
-                .filter(|agent| AccountNames::consumer_name(agent).as_deref() == Ok(durable.as_str()));
+            let agent_id = durable.strip_prefix("c_").filter(|agent| {
+                AccountNames::consumer_name(agent).as_deref() == Ok(durable.as_str())
+            });
             rows.push(json!({
                 "agent_id": agent_id,
                 "stream": stream,

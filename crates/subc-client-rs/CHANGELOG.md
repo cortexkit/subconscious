@@ -15,6 +15,11 @@
 - Dropping or unsubscribing a channel-0 subscription now sends its Cancel frame, so the daemon
   releases the spawn subscriber. Before, a Cancel was sent only for a subscription on a route.
 
+## 0.19.2 — 2026-09-24
+
+- No library change. The real-daemon tests now start the daemon binary with
+  `SUBC_CGROUP_PLACEMENT=disabled`, so they no longer leave cgroups under the caller's own.
+
 ## 0.19.1 — 2026-09-24
 
 - Add `SubcConsumer::spawn_snapshot`, the typed `supervisor.spawn_snapshot` call: it returns the

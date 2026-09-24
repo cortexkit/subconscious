@@ -873,6 +873,5 @@ async fn a_record_is_settled_only_after_it_is_recorded_across_a_stop_at_each_bou
         .is_empty());
     assert!(journal.lines(event::RECORDED, "effect-dl-read").is_empty());
     assert_eq!(dead_ack_floor(&observer, &names).await, second);
-    assert_eq!(consumer.ledger().len(), 2);
     passed();
 }

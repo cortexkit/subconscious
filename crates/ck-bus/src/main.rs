@@ -31,6 +31,9 @@ mod spawn_consumer;
 // the verdict of a real round trip through the server.
 #[allow(dead_code)]
 mod sentinel;
+// The dead-letter consumer: `c_ckbus_dead`, one record per message id.
+#[allow(dead_code)]
+mod dead_letter;
 
 use std::{
     env,
@@ -149,6 +152,10 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         wired,
         credentials,
         &store_root,
+        bootstrap.ready(),
+        std::time::Duration::from_millis(sentinel_period_ms),
+    );
+    dead_letter::consumer::wire(
         bootstrap.ready(),
         std::time::Duration::from_millis(sentinel_period_ms),
     );

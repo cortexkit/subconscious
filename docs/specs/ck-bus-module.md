@@ -1472,10 +1472,13 @@ SECTION governs.
     is listed with `agent_id: null`. It needs `$JS.API.CONSUMER.NAMES.<S>` in the bus
     grant.
   - `ckbus.agent_effects_pending {agent_id}` replies `{agent_id, stream, durable, bound,
-    undelivered, in_flight, pending}` for the agent's EFFECT durable: `pending` is its
-    still-deliverable intents, undelivered plus delivered-and-unacked. An intent that
-    exhausted max-deliver (and went to the dead-letter subject) counts as neither, so a
-    poisoned intent never blocks a merge.
+    undelivered, in_flight, pending}` for the agent's EFFECT durable: `pending` equals
+    `undelivered`, the intents the durable has not delivered yet. Delivered-and-unacked
+    intents are reported as `in_flight` and not counted, because nats-server (v2.15.0,
+    measured by the membership row) keeps an intent that exhausted max-deliver (and went
+    to the dead-letter subject) in flight until its ack wait passes; counting them would
+    let a poisoned intent block a merge. An intent in flight when a merge deletes `from`
+    is the claimant's to finish: its ack to the deleted durable fails harmlessly.
   Merge is prefrontal's, not a ck-bus op: copying is a workload publish, and ck-bus holds
   none (line 609 stands; ck-bus holds signing power and must not also inject messages).
   Prefrontal, holding the delivery-authority grant, merges `from` into `into` in this

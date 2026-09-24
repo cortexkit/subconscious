@@ -172,18 +172,16 @@ fn grant_generation_emits_each_role_set_from_the_pinned_literals() {
     let fixture = PINNED_GOLDEN_FIXTURE;
     let golden = vendored_golden();
     let account = grants::derive_account(fixture.account).expect("pinned account derives");
-    let participant = grants::participant_grant(
-        &account,
-        fixture.module_id,
-        &[fixture.bound_agent],
-        &[fixture.bound_room],
-    )
-    .expect("participant grant");
+    let participant = grants::participant_grant(&account, fixture.module_id, &[fixture.bound_room])
+        .expect("participant grant");
+    let delivery =
+        grants::delivery_authority_grant(&account, fixture.module_id, &[fixture.bound_room])
+            .expect("delivery-authority grant");
     let bus = grants::bus_module_grant(&account, fixture.module_id).expect("bus-module grant");
     let system = grants::system_account_grant(&account, fixture.system_credential)
         .expect("system-account grant");
 
-    for grant in [&participant, &bus, &system] {
+    for grant in [&participant, &delivery, &bus, &system] {
         let principal = grant.role().principal();
         assert_eq!(
             grant.publish_allow(),
@@ -239,6 +237,7 @@ fn grant_generation_emits_each_role_set_from_the_pinned_literals() {
     // principal, so the grants cannot pass a refused act the live-server arm checks.
     let by_role = [
         (Principal::Participant, &participant),
+        (Principal::DeliveryAuthority, &delivery),
         (Principal::Bus, &bus),
         (Principal::System, &system),
     ];
@@ -273,7 +272,7 @@ fn grant_generation_emits_each_role_set_from_the_pinned_literals() {
     );
     report(
         "passed",
-        "participant, bus-module and system-account sets equal the golden's lines",
+        "participant, delivery-authority, bus-module and system-account sets equal the golden's lines",
     );
 }
 
@@ -349,7 +348,7 @@ fn vendored_foundation_and_golden_match_their_source_record() {
     // so it moves with the pin in Cargo.toml.
     assert_eq!(
         field("golden_commit"),
-        "e14a671bd7926d80fb84b4cb887c2657e1f08861"
+        "f884fabeb198949eedec035ac465c1cfb30e9835"
     );
     for (file, digest_field) in [
         ("nats-message-plane-foundation.md", "source_sha256"),

@@ -35,6 +35,9 @@ mod harness;
 #[path = "../src/issuance/mod.rs"]
 mod issuance;
 #[allow(dead_code)]
+#[path = "../src/membership/mod.rs"]
+mod membership;
+#[allow(dead_code)]
 #[path = "../src/revocation/mod.rs"]
 mod revocation;
 #[allow(dead_code)]

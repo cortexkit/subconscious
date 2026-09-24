@@ -254,7 +254,7 @@ dependencies = [
 
 [[package]]
 name = "ck-bus"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "async-nats",
  "async-trait",
@@ -362,7 +362,7 @@ dependencies = [
 [[package]]
 name = "cortexkit-bus-naming"
 version = "0.1.0"
-source = "git+https://github.com/cortexkit/commons.git?rev=e14a671bd7926d80fb84b4cb887c2657e1f08861#e14a671bd7926d80fb84b4cb887c2657e1f08861"
+source = "git+https://github.com/cortexkit/commons.git?rev=f884fabeb198949eedec035ac465c1cfb30e9835#f884fabeb198949eedec035ac465c1cfb30e9835"
 
 [[package]]
 name = "cortexkit-bus-nats"

@@ -13,7 +13,8 @@
 //! 1. fence against the spawn snapshot's generation;
 //! 2. advance and fsync the generation's entry in `epoch_high_water.json`;
 //! 3. generate the user key in memory and have the box account root sign its JWT;
-//! 4. create the participant's `c_{agent_id}` durables if absent;
+//! 4. (retired by R15: agent durables are created by prefrontal through
+//!    `ckbus.agent_durable_bind`, in the membership area, never at issuance);
 //! 5. write the census key;
 //! 6. answer.
 //!
@@ -24,9 +25,10 @@
 //! revocation is the revocation area's: it reads the census entry just before each issue,
 //! so the superseded key is found there, whichever ck-bus process issued it.
 //!
-//! The grant is the naming crate's participant grant. Which agent ids and rooms a module
-//! is bound to has no named source yet, so every participant is issued with none: its
-//! inbox, the dead-letter publish and census read. Step 4 then creates no durable.
+//! The grant names no agent (R15: agent access is account-scoped). `grants::issued_grant`
+//! picks it from the attested module id: the delivery-authority grant for
+//! `reserved:prefrontal-core`, the participant grant for every other module. Rooms have
+//! no named source yet, so every module is issued with none.
 
 pub mod census;
 pub mod handler;
@@ -36,15 +38,15 @@ use std::{
     collections::HashMap,
     fmt,
     sync::{Arc, Mutex},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use async_trait::async_trait;
-use cortexkit_bus_naming::{shipped_streams, validate_consumer, AccountNames, ConsumerSpec};
+use cortexkit_bus_naming::AccountNames;
 use serde_json::{json, Value};
 
 use crate::{
-    bootstrap::plane::{BoxPlane, DurableConsumer},
+    bootstrap::plane::BoxPlane,
     credentials::{
         custody::CREDENTIAL_SUPERSEDED,
         issue::{sign_user_jwt, SignedUserJwt, UserJwtRequest},
@@ -75,22 +77,10 @@ pub mod code {
     pub const EPOCH_HIGH_WATER_UNWRITABLE: &str = "ckbus_epoch_high_water_unwritable";
     pub const SIGNING_FAILED: &str = "ckbus_signing_failed";
     pub const GRANT_REFUSED: &str = "ckbus_grant_refused";
-    pub const DURABLE_CREATE_FAILED: &str = "ckbus_durable_create_failed";
     pub const CENSUS_WRITE_FAILED: &str = "ckbus_census_write_failed";
     pub const NAME_REFUSED: &str = "naming-constructor-absent";
     pub const BAD_REQUEST: &str = "ckbus_bad_request";
 }
-
-/// The shipped durable workload consumer configuration (foundation, Constants): pull,
-/// explicit ack, ack wait 30 s, max-deliver 5 on the effect stream and unlimited
-/// elsewhere.
-pub const DURABLE_ACK_WAIT: Duration = Duration::from_secs(30);
-pub const EFFECT_MAX_DELIVER: i64 = 5;
-pub const UNLIMITED_MAX_DELIVER: i64 = -1;
-/// The foundation names no ack-pending cap. It is set explicitly to the value
-/// nats-server applies when none is given, so the limit is visible here rather than
-/// inherited silently.
-pub const DURABLE_MAX_ACK_PENDING: i64 = 1_000;
 
 /// A refused request: the Error frame code and a message naming the cause.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -223,6 +213,11 @@ impl Issuance {
         }
     }
 
+    /// Where the finished bootstrap's plane is read from, shared with the membership ops.
+    pub fn plane_source(&self) -> Arc<dyn PlaneSource> {
+        self.plane.clone()
+    }
+
     /// The credential currently held for a module, if any.
     pub fn current(&self, module_id: &str) -> Option<Issued> {
         lock(&self.current).get(module_id).cloned()
@@ -315,10 +310,7 @@ impl Issuance {
         let user_public = custody.generate_user();
         let identities: Vec<String> = Vec::new();
         let rooms: Vec<String> = Vec::new();
-        let signed = match self
-            .sign(&plane, module_id, &user_public, &identities, &rooms)
-            .await
-        {
+        let signed = match self.sign(&plane, module_id, &user_public, &rooms).await {
             Ok(signed) => signed,
             Err(refusal) => {
                 custody.forget(&user_public);
@@ -331,12 +323,7 @@ impl Issuance {
             return Err(Refusal::new("test_crash", "stopped after signing"));
         }
 
-        // 4. Durables for every bound agent id, created by ck-bus, never by the
-        // participant.
-        if let Err(refusal) = ensure_durables(&plane, &identities, &rooms).await {
-            custody.forget(&user_public);
-            return Err(refusal);
-        }
+        // 4. Retired: agent durables are prefrontal's, bound through the membership ops.
 
         // 5. The census key, overwritten with this (generation, epoch).
         let value = CensusValue {
@@ -405,14 +392,11 @@ impl Issuance {
         plane: &Plane,
         module_id: &str,
         user_public: &str,
-        identities: &[String],
         rooms: &[String],
     ) -> Result<SignedUserJwt, Refusal> {
-        let agents: Vec<&str> = identities.iter().map(String::as_str).collect();
         let bound_rooms: Vec<&str> = rooms.iter().map(String::as_str).collect();
-        let grant: Grant =
-            grants::participant_grant(&plane.names, user_public, &agents, &bound_rooms)
-                .map_err(|error| Refusal::new(code::GRANT_REFUSED, error.to_string()))?;
+        let grant: Grant = grants::issued_grant(&plane.names, module_id, user_public, &bound_rooms)
+            .map_err(|refusal| Refusal::new(code::GRANT_REFUSED, refusal.to_string()))?;
         let root_id = RootCredential::BoxAccount
             .credential_id()
             .map_err(|error| Refusal::new(code::NAME_REFUSED, error.to_string()))?;
@@ -495,71 +479,6 @@ impl Issuance {
             .sign_nonce(&current.credential_public, nonce)
             .map_err(|superseded| Refusal::new(code::CREDENTIAL_SUPERSEDED, superseded.to_string()))
     }
-}
-
-/// The durables for the bound agent ids: `c_{agent_id}` on the wake, peer and effect
-/// streams, and on the room stream when the module is bound to a room. Each filter is
-/// checked against its stream's binding before anything is created.
-pub async fn ensure_durables(
-    plane: &Plane,
-    identities: &[String],
-    rooms: &[String],
-) -> Result<(), Refusal> {
-    let names = &plane.names;
-    let streams = shipped_streams(names);
-    let naming = |error: cortexkit_bus_naming::NamingError| {
-        Refusal::new(code::NAME_REFUSED, error.to_string())
-    };
-    for agent_id in identities {
-        let durable = AccountNames::consumer_name(agent_id).map_err(naming)?;
-        let mut planned = vec![
-            (
-                names.streams().wake.clone(),
-                vec![names.wake_fire(agent_id).map_err(naming)?],
-                UNLIMITED_MAX_DELIVER,
-            ),
-            (
-                names.streams().peer.clone(),
-                vec![names.peer_filter(agent_id).map_err(naming)?],
-                UNLIMITED_MAX_DELIVER,
-            ),
-            (
-                names.streams().effect.clone(),
-                vec![names.effect_filter(agent_id).map_err(naming)?],
-                EFFECT_MAX_DELIVER,
-            ),
-        ];
-        if !rooms.is_empty() {
-            let filters = rooms
-                .iter()
-                .map(|room| names.room_post(room))
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(naming)?;
-            planned.push((names.streams().room.clone(), filters, UNLIMITED_MAX_DELIVER));
-        }
-        for (stream, filter_subjects, max_deliver) in planned {
-            let spec = ConsumerSpec {
-                durable: durable.clone(),
-                stream: stream.clone(),
-                filter_subjects: filter_subjects.clone(),
-            };
-            validate_consumer(&spec, &streams)
-                .map_err(|error| Refusal::new(code::DURABLE_CREATE_FAILED, error.to_string()))?;
-            plane
-                .box_plane
-                .ensure_durable(&DurableConsumer {
-                    stream,
-                    durable: durable.clone(),
-                    filter_subjects,
-                    ack_wait: DURABLE_ACK_WAIT,
-                    max_deliver,
-                    max_ack_pending: DURABLE_MAX_ACK_PENDING,
-                })
-                .await
-                .map_err(|error| Refusal::new(code::DURABLE_CREATE_FAILED, error.message))?;
-        }
-    }
-    Ok(())
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {

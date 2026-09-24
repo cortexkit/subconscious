@@ -45,6 +45,10 @@ mod harness;
 #[allow(dead_code)]
 #[path = "../src/issuance/mod.rs"]
 mod issuance;
+
+#[allow(dead_code)]
+#[path = "../src/membership/mod.rs"]
+mod membership;
 #[allow(dead_code)]
 #[path = "../src/runtime/seams.rs"]
 mod runtime;
@@ -207,7 +211,7 @@ impl Run {
     /// the trait layer.
     async fn claimant(&self) -> NatsConnection {
         let user = self.credentials.custody.generate_user();
-        let grant = grants::participant_grant(&self.names(), &user, &[AGENT], &[]).unwrap();
+        let grant = grants::participant_grant(&self.names(), &user, &[]).unwrap();
         let jwt = self
             .user_jwt(&user, "dead-letter-row-claimant", &grant)
             .await;
@@ -242,7 +246,7 @@ impl Run {
             server_url: self.server.url.clone(),
             box_plane: self.bus_plane().await,
         };
-        issuance::ensure_durables(&plane, &[AGENT.to_string()], &[])
+        membership::bind(&plane.names, plane.box_plane.as_ref(), AGENT)
             .await
             .unwrap_or_else(|refusal| panic!("durables for {AGENT}: {refusal}"));
     }
@@ -526,7 +530,7 @@ impl Claimant {
             lines,
         };
         let public = claimant.expect("public ", Duration::from_secs(20)).await;
-        let grant = grants::participant_grant(&names, &public, &[AGENT], &[]).unwrap();
+        let grant = grants::participant_grant(&names, &public, &[]).unwrap();
         let jwt = run
             .user_jwt(&public, "dead-letter-row-claimant", &grant)
             .await;

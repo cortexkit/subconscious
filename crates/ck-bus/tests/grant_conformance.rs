@@ -5,21 +5,25 @@
 //! ck-bus created.
 //!
 //! Under generated grants on the live server:
-//! - the per-process (participant) user may pull and ack its own consumers, get and
-//!   watch the census (the watch's ordered-consumer create, and a consumer delete, under
-//!   `KV_CK_{ACCT}_CENSUS`), and publish to `ck.{acct}.effect.dead` and a bound room;
-//!   it is refused server-side on another identity's ack, pull and info, on a consumer
-//!   create on each of the four workload streams, on a census write, on an unbound room,
-//!   and on `$SYS` and sentinel subjects;
+//! - the per-process (participant) user, whose grant names no agent (spec ruling R15),
+//!   may pull and ack any agent's durable on the agent streams, get and watch the census
+//!   (the watch's ordered-consumer create, and a consumer delete, under
+//!   `KV_CK_{ACCT}_CENSUS`), and publish to `ck.{acct}.effect.dead` and a bound room; it
+//!   is refused server-side on every workload publish (wake, peer delivery, effect
+//!   intent), on a consumer create on each of the four workload streams, on a census
+//!   write, on an unbound room, and on `$SYS` and sentinel subjects;
+//! - the delivery-authority user (prefrontal-core's grant) may publish wakes, peer
+//!   deliveries and effect intents for any agent, and is refused a consumer create, a
+//!   census write and `$SYS`;
 //! - the bus-module user may get, watch, put and delete the census and manage the five
 //!   streams, and is refused every workload publish;
 //! - the system user may send the kick, the claims update and the claims lookup (the
 //!   subjects the vendored golden records), and nothing else;
 //! - a client using the library's default `_INBOX` connects and is refused at subscribe.
 //!
-//! The participant is bound to a fixture agent and room here, through the grant
-//! generator directly: issuance binds no agent or room yet, because no contract names
-//! where a module's bindings come from. A refusal is observed as the server's
+//! The participant is bound to a fixture room here, through the grant generator
+//! directly: issuance binds no room yet, because no contract names where a module's
+//! room bindings come from. A refusal is observed as the server's
 //! permissions violation for the exact subject, never as a silent drop, and every
 //! allowed act is checked by its effect as well as by the absence of a violation.
 //!
@@ -40,6 +44,9 @@ mod harness;
 #[allow(dead_code)]
 #[path = "../src/issuance/mod.rs"]
 mod issuance;
+#[allow(dead_code)]
+#[path = "../src/membership/mod.rs"]
+mod membership;
 #[allow(dead_code)]
 #[path = "../src/runtime/seams.rs"]
 mod runtime;
@@ -235,7 +242,8 @@ async fn generated_grants_hold_on_a_live_server() {
     let observer = jetstream::new(bus::box_client(&trust, &server, &account_public).await);
 
     // The bus-module user, through ck-bus's broker code, creates the participant's and
-    // a foreign identity's durables exactly as issuance does.
+    // a foreign identity's durables exactly as prefrontal's `ckbus.agent_durable_bind`
+    // does (R15 moved agent durables out of issuance).
     let bus_user = mint(&trust, &bus::box_root_id(), &account_public, |user| {
         grants::bus_module_grant(&names, user).unwrap()
     })
@@ -251,14 +259,14 @@ async fn generated_grants_hold_on_a_live_server() {
         box_plane: bus_plane,
     };
     for agent in [AGENT, FOREIGN_AGENT] {
-        issuance::ensure_durables(&plane, &[agent.to_string()], &[ROOM.to_string()])
+        membership::bind(&names, plane.box_plane.as_ref(), agent)
             .await
             .unwrap_or_else(|refusal| panic!("durables for {agent}: {refusal}"));
     }
 
     // ---- The per-process user ----
     let participant = mint(&trust, &bus::box_root_id(), &account_public, |user| {
-        grants::participant_grant(&names, user, &[AGENT], &[ROOM]).unwrap()
+        grants::participant_grant(&names, user, &[ROOM]).unwrap()
     })
     .await;
     let p = connect(&server, &participant, true)
@@ -266,10 +274,55 @@ async fn generated_grants_hold_on_a_live_server() {
         .expect("the participant connects");
     let pjs = jetstream::new(p.client.clone());
 
-    // Allowed: its own wake subject, then pull and ack on its own consumer.
+    // ---- The delivery-authority user ----
+    let authority = mint(&trust, &bus::box_root_id(), &account_public, |user| {
+        grants::delivery_authority_grant(&names, user, &[ROOM]).unwrap()
+    })
+    .await;
+    let a = connect(&server, &authority, true)
+        .await
+        .expect("the delivery-authority user connects");
+    // Allowed: a workload message for each agent stream, each checked by its storage.
+    for (stream, subject) in [
+        (
+            &streams.peer,
+            names.peer_delivery(AGENT, "sess_conf").unwrap(),
+        ),
+        (
+            &streams.effect,
+            names.effect_intent(AGENT, "sess_conf").unwrap(),
+        ),
+    ] {
+        let before = stored(&observer, stream).await;
+        a.publish(&subject, b"delivered").await;
+        a.expect_allowed(&subject).await;
+        assert_eq!(
+            stored(&observer, stream).await,
+            before + 1,
+            "{subject} stored"
+        );
+    }
+    // Refused: it creates no consumer, writes no census key and reaches no `$SYS`.
+    let mut authority_refused = vec![
+        format!("$KV.{census_bucket}.authority_probe"),
+        "$SYS.REQ.CLAIMS.UPDATE".to_string(),
+    ];
+    for stream in [&streams.room, &streams.wake, &streams.peer, &streams.effect] {
+        authority_refused.push(format!(
+            "$JS.API.CONSUMER.CREATE.{stream}.{}",
+            AccountNames::consumer_name(AGENT).unwrap()
+        ));
+    }
+    for subject in &authority_refused {
+        a.publish(subject, b"{}").await;
+        a.expect_denied(subject).await;
+    }
+
+    // Allowed: the delivery authority's wake, then the participant's pull and ack on
+    // the agent's durable. The grant names no agent, so this is any agent's durable.
     let fire = names.wake_fire(AGENT).unwrap();
-    p.publish(&fire, b"wake").await;
-    p.expect_allowed(&fire).await;
+    a.publish(&fire, b"wake").await;
+    a.expect_allowed(&fire).await;
     let own = AccountNames::consumer_name(AGENT).unwrap();
     let consumer: jetstream::consumer::Consumer<pull::Config> = pjs
         .get_consumer_from_stream(own.clone(), streams.wake.clone())
@@ -373,12 +426,46 @@ async fn generated_grants_hold_on_a_live_server() {
     );
     assert_eq!(stored(&observer, &streams.room).await, room_before + 1);
 
-    // Refused, server-side.
+    // Allowed: another agent's durable too, with no reissue (R15).
+    let foreign_fire = names.wake_fire(FOREIGN_AGENT).unwrap();
+    a.publish(&foreign_fire, b"foreign wake").await;
+    a.expect_allowed(&foreign_fire).await;
     let foreign = AccountNames::consumer_name(FOREIGN_AGENT).unwrap();
-    let mut refused = vec![
-        format!("$JS.ACK.{}.{foreign}.1.1.1.1.1.0", streams.wake),
+    let foreign_consumer: jetstream::consumer::Consumer<pull::Config> = pjs
+        .get_consumer_from_stream(foreign.clone(), streams.wake.clone())
+        .await
+        .expect("info on another agent's durable");
+    let foreign_message = foreign_consumer
+        .fetch()
+        .max_messages(1)
+        .expires(Duration::from_secs(3))
+        .messages()
+        .await
+        .expect("pull on another agent's durable")
+        .next()
+        .await
+        .expect("the foreign wake arrives")
+        .expect("a delivered message");
+    assert_eq!(foreign_message.payload.as_ref(), b"foreign wake");
+    let foreign_ack = foreign_message
+        .reply
+        .clone()
+        .expect("an ack subject")
+        .to_string();
+    foreign_message.ack().await.expect("ack sent");
+    for subject in [
+        foreign_ack,
         format!("$JS.API.CONSUMER.MSG.NEXT.{}.{foreign}", streams.wake),
         format!("$JS.API.CONSUMER.INFO.{}.{foreign}", streams.wake),
+    ] {
+        p.expect_allowed(&subject).await;
+    }
+
+    // Refused, server-side: every workload publish, its own agent's included.
+    let mut refused = vec![
+        names.wake_fire(AGENT).unwrap(),
+        names.peer_delivery(AGENT, "sess_conf").unwrap(),
+        names.effect_intent(AGENT, "sess_conf").unwrap(),
         format!("$KV.{census_bucket}.{census_key}"),
         names.room_post(UNBOUND_ROOM).unwrap(),
         "$SYS.REQ.CLAIMS.UPDATE".to_string(),
@@ -448,7 +535,7 @@ async fn generated_grants_hold_on_a_live_server() {
                 durable_name: Some("c_conformance_probe".to_string()),
                 filter_subject: filter,
                 ack_policy: jetstream::consumer::AckPolicy::Explicit,
-                max_ack_pending: issuance::DURABLE_MAX_ACK_PENDING,
+                max_ack_pending: membership::DURABLE_MAX_ACK_PENDING,
                 ..Default::default()
             },
             stream.clone(),
@@ -547,7 +634,7 @@ async fn generated_grants_hold_on_a_live_server() {
 
     // ---- The default-inbox client ----
     let default_inbox = mint(&trust, &bus::box_root_id(), &account_public, |user| {
-        grants::participant_grant(&names, user, &[AGENT], &[ROOM]).unwrap()
+        grants::participant_grant(&names, user, &[ROOM]).unwrap()
     })
     .await;
     let d = connect(&server, &default_inbox, false)
@@ -567,7 +654,7 @@ async fn generated_grants_hold_on_a_live_server() {
         .reached("credential.sign")
         .reached("credential.public_key")
         .emit(&vocabulary());
-    drop((p, b, s, d, kicked));
+    drop((p, a, b, s, d, kicked));
     server.stop().await;
     run.shutdown().await;
 }

@@ -57,6 +57,9 @@ mod harness;
 #[path = "../src/issuance/mod.rs"]
 mod issuance;
 #[allow(dead_code)]
+#[path = "../src/membership/mod.rs"]
+mod membership;
+#[allow(dead_code)]
 #[path = "../src/revocation/mod.rs"]
 mod revocation;
 #[allow(dead_code)]
@@ -869,8 +872,26 @@ impl BoxPlane for UnreadableCensus {
     ) -> Result<(), PlaneError> {
         self.0.census_delete(account, key, revision).await
     }
-    async fn ensure_durable(&self, durable: &DurableConsumer) -> Result<(), PlaneError> {
-        self.0.ensure_durable(durable).await
+    async fn create_durable(&self, _durable: &DurableConsumer) -> Result<(), PlaneError> {
+        Err(PlaneError::new("UnreadableCensus serves no durable create"))
+    }
+    async fn consumer_state(
+        &self,
+        _stream: &str,
+        _durable: &str,
+    ) -> Result<Option<bootstrap::plane::ConsumerState>, PlaneError> {
+        Err(PlaneError::new("UnreadableCensus serves no consumer read"))
+    }
+    async fn delete_durable(&self, _stream: &str, _durable: &str) -> Result<bool, PlaneError> {
+        Err(PlaneError::new("UnreadableCensus serves no durable delete"))
+    }
+    async fn purge_subject(&self, _stream: &str, _filter_subject: &str) -> Result<u64, PlaneError> {
+        Err(PlaneError::new("UnreadableCensus serves no purge"))
+    }
+    async fn consumer_names(&self, _stream: &str) -> Result<Vec<String>, PlaneError> {
+        Err(PlaneError::new(
+            "UnreadableCensus serves no consumer listing",
+        ))
     }
 }
 
@@ -1406,8 +1427,24 @@ impl BoxPlane for EmptyCensus {
     ) -> Result<(), PlaneError> {
         Err(PlaneError::new("EmptyCensus deletes nothing"))
     }
-    async fn ensure_durable(&self, _durable: &DurableConsumer) -> Result<(), PlaneError> {
-        Err(PlaneError::new("EmptyCensus creates nothing"))
+    async fn create_durable(&self, _durable: &DurableConsumer) -> Result<(), PlaneError> {
+        Err(PlaneError::new("EmptyCensus serves no durable create"))
+    }
+    async fn consumer_state(
+        &self,
+        _stream: &str,
+        _durable: &str,
+    ) -> Result<Option<bootstrap::plane::ConsumerState>, PlaneError> {
+        Err(PlaneError::new("EmptyCensus serves no consumer read"))
+    }
+    async fn delete_durable(&self, _stream: &str, _durable: &str) -> Result<bool, PlaneError> {
+        Err(PlaneError::new("EmptyCensus serves no durable delete"))
+    }
+    async fn purge_subject(&self, _stream: &str, _filter_subject: &str) -> Result<u64, PlaneError> {
+        Err(PlaneError::new("EmptyCensus serves no purge"))
+    }
+    async fn consumer_names(&self, _stream: &str) -> Result<Vec<String>, PlaneError> {
+        Err(PlaneError::new("EmptyCensus serves no consumer listing"))
     }
 }
 

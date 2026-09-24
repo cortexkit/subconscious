@@ -141,6 +141,18 @@ impl HarnessSigner {
         }
     }
 
+    /// The same signer without the root `credential_id`, which it then answers
+    /// `not_found` for, like a vault missing the key or ck-bus's grant on it.
+    pub fn without(&self, credential_id: &str) -> Self {
+        let mut roots = self.roots.as_ref().clone();
+        roots.remove(credential_id);
+        Self {
+            roots: Arc::new(roots),
+            fault: self.fault,
+            principals: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
     pub fn with_fault(mut self, fault: SignerFault) -> Self {
         self.fault = fault;
         self

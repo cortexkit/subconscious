@@ -163,9 +163,20 @@ impl TrustChain {
         user: &KeyPair,
         iat: i64,
     ) -> String {
+        self.user_jwt_for_subject(root_id, account_public, &user.public_key(), iat)
+    }
+
+    /// `user_jwt` for a user key given by its public half only.
+    pub fn user_jwt_for_subject(
+        &self,
+        root_id: &str,
+        account_public: &str,
+        subject: &str,
+        iat: i64,
+    ) -> String {
         encode_jwt(
             &self.signer.root(root_id).pair,
-            &user.public_key(),
+            subject,
             "harness-user",
             iat,
             json!({
@@ -266,10 +277,13 @@ impl BusServer {
         // loopback address explicitly; it never binds the wildcard address.
         // `max_control_line` is raised because a user JWT carrying ck-bus's box grant
         // makes a CONNECT line longer than the server's 4 KiB default, which the server
-        // refuses as "maximum control line exceeded".
+        // refuses as "maximum control line exceeded". `debug` makes the log name why a
+        // connect was refused (revoked versus a bad signature) and why a client closed.
+        // The debug log shows public keys and JWTs, never a seed.
         let conf = format!(
             "listen: \"{listen_host}:{port}\"\n\
              max_control_line: 65536\n\
+             debug: true\n\
              http: \"127.0.0.1:{http_port}\"\n\
              log_file: \"{log}\"\n\
              jetstream {{ store_dir: \"{js}\" }}\n\

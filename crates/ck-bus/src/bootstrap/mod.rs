@@ -311,7 +311,7 @@ pub async fn boot(
     let now = unix_now();
     let mut revoked = existing
         .as_ref()
-        .map(|claims| revocations(claims))
+        .map(revocations)
         .unwrap_or_default();
     for user in &to_revoke {
         revoked.entry(user.clone()).or_insert(now);
@@ -551,8 +551,14 @@ async fn resolve_account(
     Ok((record, existing))
 }
 
+/// One structured stderr line. `at_ms` lets a reader measure the retry period from the
+/// log alone.
 fn log_event(event: &str, fields: Value) {
-    let mut line = json!({ "event": event });
+    let at_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or_default();
+    let mut line = json!({ "event": event, "at_ms": at_ms });
     if let (Some(line), Value::Object(fields)) = (line.as_object_mut(), fields) {
         line.extend(fields);
     }

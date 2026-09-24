@@ -109,27 +109,17 @@ async fn a1_supervised_server_lifecycle() {
         let terminal = support::new_terminal(&run, id, prior).await;
         let elapsed = support::elapsed(&terminal, start);
         eprintln!("A1 {id} teardown elapsed={elapsed}ms budget={budget}ms record={terminal:?}");
-        if expected == ModuleProtocol::None {
-            assert!(
-                elapsed < budget,
-                "standin-none SIGTERM must finish inside budget"
-            );
-            assert!(
-                terminal.exit_code == Some(0) || terminal.exit_signal == Some(15),
-                "standin-none must stop cleanly: {terminal:?}"
-            );
-            assert_ne!(terminal.exit_signal, Some(9));
-        } else {
-            assert!(
-                elapsed >= budget,
-                "unregistered subc stand-in must wait out budget"
-            );
-            assert_eq!(
-                terminal.exit_signal,
-                Some(9),
-                "unregistered subc stand-in must be killed after drain"
-            );
-        }
+        // Both stand-ins end the same way. Neither has a registered connection
+        // for the drain to tell it over, so the supervisor asks by SIGTERM
+        // whatever the declared protocol: a subc module that has not (or never)
+        // registered was told nothing either, and waiting out the budget for it
+        // only put a SIGKILL behind a delay.
+        assert!(elapsed < budget, "{id} SIGTERM must finish inside budget");
+        assert!(
+            terminal.exit_code == Some(0) || terminal.exit_signal == Some(15),
+            "{id} must stop cleanly: {terminal:?}"
+        );
+        assert_ne!(terminal.exit_signal, Some(9), "{id} must not be SIGKILLed");
     }
     run.shutdown().await;
     assert_eq!(

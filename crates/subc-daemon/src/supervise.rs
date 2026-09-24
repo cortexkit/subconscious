@@ -142,12 +142,14 @@ impl SupervisedChild {
     }
 
     async fn wait(&mut self) -> io::Result<ExitStatus> {
+        // The roster entry is NOT released here. A daemon shutdown waits for the
+        // roster to empty and then exits the process, so releasing at the reap
+        // let it exit before the exit handler wrote this child's terminal record
+        // (the stderr drain and snapshot update sit in between), and the
+        // shutdown's own `daemon_shutdown` record was intermittently lost. The
+        // caller releases it after recording the exit (`release_roster`), and
+        // dropping the handle releases it too.
         let result = self.child.wait().await;
-        if result.is_ok() {
-            // Reaped: the pid is free for reuse, so shutdown must stop
-            // seeing it as one of ours.
-            self.roster_guard = None;
-        }
         #[cfg(target_os = "linux")]
         if result.is_ok() {
             if let Some(placement) = self.cgroup_placement.take() {
@@ -155,6 +157,13 @@ impl SupervisedChild {
             }
         }
         result
+    }
+
+    /// Releases this child's daemon-shutdown roster entry once its exit has
+    /// been recorded. The pid is already reaped and free for reuse, so the
+    /// entry must not outlive the record any longer than that.
+    fn release_roster(&mut self) {
+        self.roster_guard = None;
     }
 
     fn start_kill(&mut self) -> io::Result<()> {
@@ -2805,6 +2814,7 @@ impl SupervisedModule {
             .send(SupervisorCommand::Restart {
                 drain_timeout_ms,
                 received_at_generation,
+                queued_at: Instant::now(),
                 reply: reply_tx,
             })
             .await
@@ -2988,6 +2998,9 @@ enum SupervisorCommand {
         /// it waited in the command queue. A queued restart whose module has
         /// since spawned a newer process is already satisfied (see the handler).
         received_at_generation: u64,
+        /// When the request entered the command queue, so the handler can log
+        /// how long it waited behind the loop's other work.
+        queued_at: Instant,
         reply: oneshot::Sender<Result<(), SuperviseError>>,
     },
     Reload {
@@ -4416,7 +4429,7 @@ async fn supervise_loop(
                     };
                     active_child.drain_stderr(&spec.module_id).await;
 
-                    match on_child_exit(
+                    let next = on_child_exit(
                         &spec,
                         runtime.restart_policy,
                         &registry,
@@ -4425,7 +4438,11 @@ async fn supervise_loop(
                         &runtime.spawn_events,
                         &runtime.child_roster,
                         exit_report,
-                    ).await {
+                    ).await;
+                    // The exit is recorded, so a daemon shutdown may stop
+                    // waiting for this child (see `SupervisedChild::wait`).
+                    active_child.release_roster();
+                    match next {
                         NextAction::Stop { registration_released } => {
                             if registration_released {
                                 process_liveness.untrack_if_current(&spec.module_id, &snapshot);
@@ -4682,8 +4699,17 @@ async fn handle_supervisor_command(
         SupervisorCommand::Restart {
             drain_timeout_ms,
             received_at_generation,
+            queued_at,
             reply,
         } => {
+            // Without this line a restart that waited in the queue (behind a
+            // health probe cycle or another command) was invisible: the log
+            // showed only the drain timing out, minutes after the operator's call.
+            info!(
+                module_id = %spec.module_id,
+                queued_ms = u64::try_from(queued_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+                "restart command dequeued"
+            );
             // ACK AT INITIATION, not completion. The blocking form deadlocked any
             // caller whose own request lane rides the module being restarted: the
             // caller's in-flight request keeps the drain from quiescing, the drain
@@ -6424,11 +6450,23 @@ async fn begin_forwarding_drain_with(
 
     // Admission gate first: route.open/commit and route REQUEST admission are closed
     // before the first quiescence check, so the outstanding count can only fall.
+    let gate_started = Instant::now();
     let drain_target = match scope {
         DrainScope::Active => forwarding.begin_module_drain(&spec.module_id, reason),
         DrainScope::Endpoint(endpoint) => forwarding.begin_endpoint_drain(endpoint, reason),
     }
     .map_err(SuperviseError::Forwarding)?;
+    // The instant admission closed, and how long taking the forwarding write
+    // lock to close it took. The timeout line reports only the quiescence
+    // wait, so without this a drain that started late looked like one that
+    // started on time.
+    info!(
+        module_id = %spec.module_id,
+        ?reason,
+        gate_ms = u64::try_from(gate_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        connected = drain_target.is_some(),
+        "module drain began; route admission closed"
+    );
     if scope == DrainScope::Active {
         update_snapshot(snapshot, Some(&spec.module_id), |state| {
             state.state = ModuleState::Draining;

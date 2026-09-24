@@ -690,18 +690,18 @@ pub enum SpawnStreamError {
     /// so every event since it is unknowable from this daemon.
     CursorIncarnationMismatch {
         current_daemon_incarnation: String,
-        body: ErrorBody,
+        body: Box<ErrorBody>,
     },
     /// `spawn_cursor_too_old`: events after the cursor have left the daemon's ring.
     CursorTooOld {
         oldest_retained_cursor: SpawnCursor,
-        body: ErrorBody,
+        body: Box<ErrorBody>,
     },
     /// `spawn_subscriber_lagged`: the daemon dropped this subscriber for falling behind,
     /// after delivering every event it had queued for it.
     SubscriberLagged {
         first_undelivered_cursor: SpawnCursor,
-        body: ErrorBody,
+        body: Box<ErrorBody>,
     },
     /// Any other end: another daemon error (one of the codes above with a detail that
     /// does not parse included, so its code is still readable), connection loss, or
@@ -725,7 +725,7 @@ impl SpawnStreamError {
                 match detail("current_daemon_incarnation").and_then(|value| value.as_str()) {
                     Some(current) => Self::CursorIncarnationMismatch {
                         current_daemon_incarnation: current.to_string(),
-                        body,
+                        body: Box::new(body),
                     },
                     None => Self::Call(CallError::Module(body)),
                 }
@@ -733,14 +733,14 @@ impl SpawnStreamError {
             SPAWN_CURSOR_TOO_OLD => match cursor("oldest_retained_cursor") {
                 Some(oldest_retained_cursor) => Self::CursorTooOld {
                     oldest_retained_cursor,
-                    body,
+                    body: Box::new(body),
                 },
                 None => Self::Call(CallError::Module(body)),
             },
             SPAWN_SUBSCRIBER_LAGGED => match cursor("first_undelivered_cursor") {
                 Some(first_undelivered_cursor) => Self::SubscriberLagged {
                     first_undelivered_cursor,
-                    body,
+                    body: Box::new(body),
                 },
                 None => Self::Call(CallError::Module(body)),
             },

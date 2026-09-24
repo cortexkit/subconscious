@@ -230,6 +230,67 @@ async fn start(with_participant: bool) -> Option<Run> {
     })
 }
 
+/// Disables the supervised ck-bus once it has booted the box account, and waits until
+/// its process is gone. The arms that call this plant census entries for modules that
+/// have no live process and revoke them with a `Revoker` in this process. A running
+/// ck-bus reconciles its census against the spawn snapshot and would revoke those
+/// entries first, so the test's revoker must be the only one.
+async fn retire_supervised_ckbus(run: &Run) {
+    let pid = run.run.supervised_pid("ckbus").await;
+    let reply = harness::control::rpc(
+        &run.run.connection_file,
+        subc_control::ClientControlRequest::SupervisorSetEnabled {
+            module_id: "ckbus".to_string(),
+            enabled: false,
+        },
+    )
+    .await;
+    if let harness::control::ControlReply::Error(error) = reply {
+        panic!(
+            "supervisor.set_enabled ckbus false refused: {} {}",
+            error.code, error.message
+        );
+    }
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let response = harness::control::response(
+            &run.run.connection_file,
+            subc_control::ClientControlRequest::SupervisorList {},
+        )
+        .await;
+        let subc_control::ClientControlResponse::SupervisorList { modules, .. } = response else {
+            panic!("supervisor.list must return its matching response variant");
+        };
+        let entry = modules
+            .iter()
+            .find(|module| module.module_id == "ckbus")
+            .expect("supervisor.list lists ckbus");
+        let exited = !entry.live && entry.state != "running" && !process_exists(pid);
+        if !entry.enabled && exited {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the supervised ck-bus (pid {pid}) did not stop: {entry:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Whether a process with `pid` still exists (`kill -0` succeeds). Off unix the
+/// supervisor's report alone is used.
+fn process_exists(pid: u32) -> bool {
+    if !cfg!(unix) {
+        return false;
+    }
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
 /// The harness signer answered in-process through ck-bus's own vault wire.
 struct InProcessSigner(HarnessSigner);
 
@@ -605,6 +666,9 @@ async fn the_three_steps_sever_refuse_and_survive_a_server_restart() {
     let Some(run) = start(false).await else {
         return;
     };
+    // This arm's census entries name modules with no live process; the supervised
+    // ck-bus would revoke them by reconciliation before this arm's own revoker could.
+    retire_supervised_ckbus(&run).await;
     let plane = plane(&run).await;
     let store = tempfile::tempdir().unwrap();
     let revoker = process(&plane, run.trust.signer.clone(), store.path()).await;
@@ -699,6 +763,9 @@ async fn a_stop_at_every_boundary_ends_with_one_revocation_and_one_disconnect() 
     let Some(run) = start(false).await else {
         return;
     };
+    // This arm's census entries name modules with no live process; the supervised
+    // ck-bus would revoke them by reconciliation before this arm's own revoker could.
+    retire_supervised_ckbus(&run).await;
     let plane = plane(&run).await;
     let disconnects = Disconnects::watch(&run).await;
     for (index, boundary) in [
@@ -836,6 +903,9 @@ async fn a_damaged_record_is_recovered_from_the_census_or_deferred() {
     let Some(run) = start(false).await else {
         return;
     };
+    // This arm's census entries name modules with no live process; the supervised
+    // ck-bus would revoke them by reconciliation before this arm's own revoker could.
+    retire_supervised_ckbus(&run).await;
     let plane = plane(&run).await;
     let disconnects = Disconnects::watch(&run).await;
 
@@ -927,6 +997,9 @@ async fn refusals_defer_their_step_and_a_kick_alone_revokes_nothing() {
     let Some(run) = start(false).await else {
         return;
     };
+    // This arm's census entries name modules with no live process; the supervised
+    // ck-bus would revoke them by reconciliation before this arm's own revoker could.
+    retire_supervised_ckbus(&run).await;
     let plane = plane(&run).await;
 
     // A refused operator-key signature: step (1) fails, nothing is pushed, and the

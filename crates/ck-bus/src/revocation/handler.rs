@@ -195,6 +195,12 @@ impl<H> RevocationHandler<H> {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
+
+    /// The revocation area, so the spawn-stream consumer revokes through the same
+    /// `Revoker` (one serial step (1), one progress store) as the superseded path.
+    pub fn area(&self) -> &Arc<Area> {
+        &self.area
+    }
 }
 
 /// Whether `body` asks for a credential. Every other request passes straight through.

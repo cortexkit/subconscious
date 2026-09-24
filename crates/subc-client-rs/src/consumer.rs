@@ -19,7 +19,7 @@ use subc_control::{
 };
 /// The spawn snapshot types, re-exported so a caller of
 /// [`SubcConsumer::spawn_snapshot`] needs no direct `subc-control` dependency.
-pub use subc_control::{LiveSpawn, SpawnCursor, SpawnSnapshot};
+pub use subc_control::{LiveSpawn, SpawnCursor, SpawnEvent, SpawnEventKind, SpawnSnapshot};
 use subc_protocol::{
     error_codes, manifest::is_valid_capability_identifier, AdmissionClass, BindIdentity, ErrorBody,
     Flags, Frame, FrameBuildError, FrameType, Priority, RouteTarget, SUBC_LAUNCH_NONCE_ENV,
@@ -55,6 +55,18 @@ const DEFAULT_ROUTE_WINDOW: usize = 1024;
 const DEFAULT_SUBSCRIPTION_EVENT_BUFFER: usize = 128;
 const DEFAULT_PUSH_EVENT_BUFFER: usize = 128;
 const REVERSE_REQUEST_UNHANDLED: &str = "reverse_request_unhandled";
+/// The spawn stream's event buffer. A subscription from an old cursor receives the
+/// daemon's whole retained ring at once (4096 events in the current daemon); a smaller
+/// buffer would drop the stream on its own replay. Twice that leaves room for live
+/// events arriving while the replay is being read.
+const SPAWN_EVENT_BUFFER: usize = 8192;
+
+/// `supervisor.spawn_subscribe` refused a cursor from another daemon incarnation.
+pub const SPAWN_CURSOR_INCARNATION_MISMATCH: &str = "spawn_cursor_incarnation_mismatch";
+/// `supervisor.spawn_subscribe` refused a cursor older than the daemon's retained ring.
+pub const SPAWN_CURSOR_TOO_OLD: &str = "spawn_cursor_too_old";
+/// The daemon dropped a spawn subscriber that fell too far behind.
+pub const SPAWN_SUBSCRIBER_LAGGED: &str = "spawn_subscriber_lagged";
 
 type ReverseRequestFuture =
     Pin<Box<dyn Future<Output = Result<Vec<u8>, ReverseRequestError>> + Send + 'static>>;
@@ -626,6 +638,163 @@ impl Drop for Subscription {
     }
 }
 
+/// A held `supervisor.spawn_subscribe` request: the daemon's spawn events, in cursor
+/// order, until the stream ends. Dropping it cancels the request.
+pub struct SpawnSubscription {
+    inner: Subscription,
+    finished: bool,
+}
+
+impl SpawnSubscription {
+    /// The next event. `Ok(None)` is a clean end (the daemon ended the stream, or it was
+    /// unsubscribed); every later call returns it too.
+    ///
+    /// Every event the daemon queued before a terminal error is yielded first, so the
+    /// last event received is the cursor to resume from. A refused cursor or a dropped
+    /// subscriber comes back as the matching [`SpawnStreamError`] variant; anything else
+    /// that ends the stream (connection loss, local backpressure, an event that does not
+    /// decode) is [`SpawnStreamError::Call`] or [`SpawnStreamError::Decode`].
+    pub async fn next(&mut self) -> Result<Option<SpawnEvent>, SpawnStreamError> {
+        if self.finished {
+            return Ok(None);
+        }
+        if let Some(body) = self.inner.events().recv().await {
+            return serde_json::from_slice::<SpawnEvent>(&body)
+                .map(Some)
+                .map_err(|err| {
+                    self.finished = true;
+                    let _ = self.inner.unsubscribe();
+                    SpawnStreamError::Decode(err.to_string())
+                });
+        }
+        // Marked finished only once the terminal has been read: a caller that drops this
+        // future mid-await (a `select!` arm) still gets the terminal on its next call.
+        let terminal = self.inner.closed().await;
+        self.finished = true;
+        match terminal {
+            Ok(()) => Ok(None),
+            Err(err) => Err(SpawnStreamError::from_call_error(err)),
+        }
+    }
+
+    /// Cancel the held request; the daemon releases the subscriber.
+    pub fn unsubscribe(&self) -> Result<(), CallError> {
+        self.inner.unsubscribe()
+    }
+}
+
+/// Why a spawn stream ended with an error, by the daemon's code where it sent one.
+#[derive(Debug)]
+pub enum SpawnStreamError {
+    /// `spawn_cursor_incarnation_mismatch`: the cursor names another daemon incarnation,
+    /// so every event since it is unknowable from this daemon.
+    CursorIncarnationMismatch {
+        current_daemon_incarnation: String,
+        body: ErrorBody,
+    },
+    /// `spawn_cursor_too_old`: events after the cursor have left the daemon's ring.
+    CursorTooOld {
+        oldest_retained_cursor: SpawnCursor,
+        body: ErrorBody,
+    },
+    /// `spawn_subscriber_lagged`: the daemon dropped this subscriber for falling behind,
+    /// after delivering every event it had queued for it.
+    SubscriberLagged {
+        first_undelivered_cursor: SpawnCursor,
+        body: ErrorBody,
+    },
+    /// Any other end: another daemon error (one of the codes above with a detail that
+    /// does not parse included, so its code is still readable), connection loss, or
+    /// local backpressure.
+    Call(CallError),
+    /// An event body that is not a `SpawnEvent`.
+    Decode(String),
+}
+
+impl SpawnStreamError {
+    fn from_call_error(err: CallError) -> Self {
+        let CallError::Module(body) = err else {
+            return Self::Call(err);
+        };
+        let detail = |key: &str| body.detail.as_ref().and_then(|detail| detail.get(key));
+        let cursor = |key: &str| {
+            detail(key).and_then(|value| serde_json::from_value::<SpawnCursor>(value.clone()).ok())
+        };
+        match body.code.as_str() {
+            SPAWN_CURSOR_INCARNATION_MISMATCH => {
+                match detail("current_daemon_incarnation").and_then(|value| value.as_str()) {
+                    Some(current) => Self::CursorIncarnationMismatch {
+                        current_daemon_incarnation: current.to_string(),
+                        body,
+                    },
+                    None => Self::Call(CallError::Module(body)),
+                }
+            }
+            SPAWN_CURSOR_TOO_OLD => match cursor("oldest_retained_cursor") {
+                Some(oldest_retained_cursor) => Self::CursorTooOld {
+                    oldest_retained_cursor,
+                    body,
+                },
+                None => Self::Call(CallError::Module(body)),
+            },
+            SPAWN_SUBSCRIBER_LAGGED => match cursor("first_undelivered_cursor") {
+                Some(first_undelivered_cursor) => Self::SubscriberLagged {
+                    first_undelivered_cursor,
+                    body,
+                },
+                None => Self::Call(CallError::Module(body)),
+            },
+            _ => Self::Call(CallError::Module(body)),
+        }
+    }
+
+    /// The daemon's error code, when the stream ended with one.
+    pub fn code(&self) -> Option<&str> {
+        match self {
+            Self::CursorIncarnationMismatch { .. } => Some(SPAWN_CURSOR_INCARNATION_MISMATCH),
+            Self::CursorTooOld { .. } => Some(SPAWN_CURSOR_TOO_OLD),
+            Self::SubscriberLagged { .. } => Some(SPAWN_SUBSCRIBER_LAGGED),
+            Self::Call(err) => err.code(),
+            Self::Decode(_) => None,
+        }
+    }
+}
+
+impl fmt::Display for SpawnStreamError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CursorIncarnationMismatch {
+                current_daemon_incarnation,
+                ..
+            } => write!(
+                f,
+                "{SPAWN_CURSOR_INCARNATION_MISMATCH}: the daemon is incarnation \
+                 {current_daemon_incarnation}"
+            ),
+            Self::CursorTooOld {
+                oldest_retained_cursor,
+                ..
+            } => write!(
+                f,
+                "{SPAWN_CURSOR_TOO_OLD}: the oldest retained event is seq {}",
+                oldest_retained_cursor.seq
+            ),
+            Self::SubscriberLagged {
+                first_undelivered_cursor,
+                ..
+            } => write!(
+                f,
+                "{SPAWN_SUBSCRIBER_LAGGED}: the first undelivered event is seq {}",
+                first_undelivered_cursor.seq
+            ),
+            Self::Call(err) => write!(f, "spawn stream ended: {err}"),
+            Self::Decode(message) => write!(f, "spawn event did not decode: {message}"),
+        }
+    }
+}
+
+impl Error for SpawnStreamError {}
+
 /// Future returned by [`Subscription::closed`].
 pub struct SubscriptionClosed {
     rx: oneshot::Receiver<Result<(), CallError>>,
@@ -969,6 +1138,60 @@ impl SubcConsumer {
                 {
                     continue;
                 }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
+    /// Follow the supervisor's spawn event stream (`supervisor.spawn_subscribe`) over
+    /// channel 0, from just after `since` (a cursor copied from a snapshot or an event),
+    /// or from now when `since` is `None`.
+    ///
+    /// The request is held open: the returned [`SpawnSubscription`] yields each event
+    /// until the stream ends. A cursor the daemon refuses, and the daemon dropping a
+    /// subscriber that fell behind, arrive as the stream's terminal error (see
+    /// [`SpawnStreamError`]). A reconnect ends the stream; the caller resubscribes from
+    /// the last cursor it received. Sending is retried until the consumer's call
+    /// deadline, as for [`SubcConsumer::spawn_snapshot`].
+    pub async fn spawn_subscribe(
+        &self,
+        since: Option<SpawnCursor>,
+    ) -> Result<SpawnSubscription, CallError> {
+        let deadline = Instant::now() + self.shared.opts.call_timeout;
+        let body = serde_json::to_vec(&ClientControlRequest::SupervisorSpawnSubscribe { since })
+            .map_err(|err| {
+                CallError::not_sent(format!("failed to encode supervisor.spawn_subscribe: {err}"))
+            })?;
+        loop {
+            self.shared.ensure_connected_for_call(deadline).await?;
+            // Channel 0 has no route flow-control window; the subscription holds a
+            // permit of its own so it is shaped like a route subscription.
+            let permit = Arc::new(Semaphore::new(1))
+                .acquire_owned()
+                .await
+                .map_err(|_| CallError::not_sent("spawn subscription permit closed"))?;
+            match self
+                .shared
+                .send_subscription(SubscriptionSend {
+                    expected_handle: None,
+                    channel: 0,
+                    epoch: 0,
+                    body: body.clone(),
+                    priority: Priority::Interactive,
+                    admission_class: AdmissionClass::Normal,
+                    event_buffer: SPAWN_EVENT_BUFFER,
+                    deadline,
+                    permit,
+                })
+                .await
+            {
+                Ok(inner) => {
+                    return Ok(SpawnSubscription {
+                        inner,
+                        finished: false,
+                    })
+                }
+                Err(err) if err.is_not_sent() && Instant::now() < deadline => continue,
                 Err(err) => return Err(err),
             }
         }
@@ -3056,7 +3279,7 @@ impl Shared {
             let inner = self.lock_inner();
             if inner.closed
                 || inner.generation != handle.connection_token()
-                || inner.route_epochs.get(&handle.channel) != Some(&handle)
+                || !route_is_installed(&inner, handle)
             {
                 return;
             }
@@ -3201,7 +3424,7 @@ impl Shared {
         if inner.closed
             || inner.generation != handle.connection_token()
             || inner.writer.is_none()
-            || inner.route_epochs.get(&handle.channel) != Some(&handle)
+            || !route_is_installed(&inner, handle)
         {
             Err(CallError::StaleRouteHandle(handle))
         } else {
@@ -4618,6 +4841,14 @@ fn emit_callbacks(callbacks: Vec<Callback>, state: ConnectionState) {
 /// so consumers with their own connection layer share it rather than copy it.
 pub fn is_retryable_route_open_code(code: &str) -> bool {
     error_codes::is_retryable_route_open(code)
+}
+
+/// Whether `handle` names a route installed on the current connection. Channel 0 is the
+/// connection's own control channel: it is never installed as a route and is current for
+/// as long as the connection is, so a held channel-0 request (the spawn stream) can be
+/// cancelled like a route subscription.
+fn route_is_installed(inner: &Inner, handle: RouteHandle) -> bool {
+    handle.channel == 0 || inner.route_epochs.get(&handle.channel) == Some(&handle)
 }
 
 fn is_retryable_catalog_transport_error(err: &CallError) -> bool {
@@ -6775,6 +7006,228 @@ mod tests {
         assert!(dispatch_frame(&shared, 1, frame).await);
         let error = request.await.unwrap().unwrap_err();
         assert_eq!(error.code(), Some("op_not_permitted"));
+    }
+
+    fn spawn_cursor(seq: u64) -> SpawnCursor {
+        SpawnCursor {
+            daemon_incarnation: "incarnation-a".to_string(),
+            seq,
+        }
+    }
+
+    fn spawn_event(seq: u64, kind: SpawnEventKind, generation: u64) -> SpawnEvent {
+        SpawnEvent {
+            cursor: spawn_cursor(seq),
+            kind,
+            module_id: "participant".to_string(),
+            spawn_generation: generation,
+            pid: 4242,
+            exit_code: (kind == SpawnEventKind::Exited).then_some(0),
+            exit_signal: None,
+        }
+    }
+
+    fn channel_zero_frame(ty: FrameType, corr: u64, body: Vec<u8>) -> Frame {
+        Frame::build(
+            ty,
+            Flags::new(false, Priority::Interactive, false),
+            0,
+            0,
+            corr,
+            body,
+        )
+        .unwrap()
+    }
+
+    fn spawn_error_frame(corr: u64, code: &str, detail: serde_json::Value) -> Frame {
+        channel_zero_frame(
+            FrameType::Error,
+            corr,
+            serde_json::to_vec(&ErrorBody {
+                code: code.to_string(),
+                message: "sent by the test".to_string(),
+                detail: Some(detail),
+            })
+            .unwrap(),
+        )
+    }
+
+    /// A consumer over the writer-test harness, subscribed from `since`, with the
+    /// request frame it queued.
+    async fn spawn_subscribed(
+        since: Option<SpawnCursor>,
+    ) -> (
+        Arc<Shared>,
+        mpsc::Receiver<WriteCommand>,
+        SpawnSubscription,
+        Frame,
+    ) {
+        let shared = writer_test_shared();
+        let (writer, mut rx) = mpsc::channel(8);
+        shared.lock_inner().writer = Some(writer);
+        let consumer = SubcConsumer {
+            shared: Arc::clone(&shared),
+        };
+        let subscription = consumer
+            .spawn_subscribe(since)
+            .await
+            .expect("supervisor.spawn_subscribe must be sent");
+        std::mem::forget(consumer);
+        let command = rx
+            .recv()
+            .await
+            .expect("supervisor.spawn_subscribe must queue a channel-0 request");
+        (shared, rx, subscription, command.frame)
+    }
+
+    #[tokio::test]
+    async fn spawn_subscribe_sends_its_cursor_on_channel_zero_and_yields_events_until_stream_end()
+    {
+        let (shared, _rx, mut subscription, request) =
+            spawn_subscribed(Some(spawn_cursor(7))).await;
+        assert_eq!(request.header.channel, 0);
+        assert_eq!(request.header.ty, FrameType::Request);
+        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "op": "supervisor.spawn_subscribe",
+                "since": {"daemon_incarnation": "incarnation-a", "seq": 7},
+            })
+        );
+
+        let corr = request.header.corr;
+        let events = [
+            spawn_event(8, SpawnEventKind::Exited, 3),
+            spawn_event(9, SpawnEventKind::Spawned, 4),
+        ];
+        for event in &events {
+            let body = serde_json::to_vec(event).unwrap();
+            assert!(
+                dispatch_frame(&shared, 1, channel_zero_frame(FrameType::StreamData, corr, body))
+                    .await
+            );
+        }
+        assert!(
+            dispatch_frame(
+                &shared,
+                1,
+                channel_zero_frame(FrameType::StreamEnd, corr, Vec::new())
+            )
+            .await
+        );
+        assert_eq!(subscription.next().await.unwrap(), Some(events[0].clone()));
+        assert_eq!(subscription.next().await.unwrap(), Some(events[1].clone()));
+        assert_eq!(subscription.next().await.unwrap(), None);
+        assert_eq!(
+            subscription.next().await.unwrap(),
+            None,
+            "a finished stream stays finished"
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_subscribe_without_a_cursor_omits_since() {
+        let (_shared, _rx, _subscription, request) = spawn_subscribed(None).await;
+        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({"op": "supervisor.spawn_subscribe"})
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_cursor_refusals_surface_as_coded_errors_with_their_detail() {
+        let (shared, _rx, mut subscription, request) =
+            spawn_subscribed(Some(spawn_cursor(7))).await;
+        let frame = spawn_error_frame(
+            request.header.corr,
+            "spawn_cursor_incarnation_mismatch",
+            serde_json::json!({"current_daemon_incarnation": "incarnation-b"}),
+        );
+        assert!(dispatch_frame(&shared, 1, frame).await);
+        let error = subscription.next().await.unwrap_err();
+        assert_eq!(error.code(), Some("spawn_cursor_incarnation_mismatch"));
+        let SpawnStreamError::CursorIncarnationMismatch {
+            current_daemon_incarnation,
+            body,
+        } = &error
+        else {
+            panic!("expected the incarnation refusal, got {error:?}");
+        };
+        assert_eq!(current_daemon_incarnation, "incarnation-b");
+        assert_eq!(body.code, "spawn_cursor_incarnation_mismatch");
+        assert_eq!(subscription.next().await.unwrap(), None);
+
+        let (shared, _rx, mut subscription, request) =
+            spawn_subscribed(Some(spawn_cursor(1))).await;
+        let frame = spawn_error_frame(
+            request.header.corr,
+            "spawn_cursor_too_old",
+            serde_json::json!({"oldest_retained_cursor": spawn_cursor(90)}),
+        );
+        assert!(dispatch_frame(&shared, 1, frame).await);
+        let error = subscription.next().await.unwrap_err();
+        assert_eq!(error.code(), Some("spawn_cursor_too_old"));
+        let SpawnStreamError::CursorTooOld {
+            oldest_retained_cursor,
+            ..
+        } = &error
+        else {
+            panic!("expected the too-old refusal, got {error:?}");
+        };
+        assert_eq!(oldest_retained_cursor, &spawn_cursor(90));
+    }
+
+    #[tokio::test]
+    async fn a_lagged_spawn_stream_yields_its_queued_events_then_the_lag_error() {
+        let (shared, _rx, mut subscription, request) =
+            spawn_subscribed(Some(spawn_cursor(7))).await;
+        let corr = request.header.corr;
+        let queued = spawn_event(8, SpawnEventKind::Exited, 3);
+        assert!(
+            dispatch_frame(
+                &shared,
+                1,
+                channel_zero_frame(
+                    FrameType::StreamData,
+                    corr,
+                    serde_json::to_vec(&queued).unwrap()
+                ),
+            )
+            .await
+        );
+        let frame = spawn_error_frame(
+            corr,
+            "spawn_subscriber_lagged",
+            serde_json::json!({"first_undelivered_cursor": spawn_cursor(9)}),
+        );
+        assert!(dispatch_frame(&shared, 1, frame).await);
+        assert_eq!(subscription.next().await.unwrap(), Some(queued));
+        let error = subscription.next().await.unwrap_err();
+        assert_eq!(error.code(), Some("spawn_subscriber_lagged"));
+        let SpawnStreamError::SubscriberLagged {
+            first_undelivered_cursor,
+            ..
+        } = &error
+        else {
+            panic!("expected the lag error, got {error:?}");
+        };
+        assert_eq!(first_undelivered_cursor, &spawn_cursor(9));
+    }
+
+    #[tokio::test]
+    async fn dropping_a_spawn_subscription_sends_a_channel_zero_cancel_for_its_corr() {
+        let (_shared, mut rx, subscription, request) =
+            spawn_subscribed(Some(spawn_cursor(7))).await;
+        drop(subscription);
+        let cancel = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("dropping the subscription must queue a Cancel")
+            .expect("the writer stays open");
+        assert_eq!(cancel.frame.header.ty, FrameType::Cancel);
+        assert_eq!(cancel.frame.header.channel, 0);
+        assert_eq!(cancel.frame.header.corr, request.header.corr);
     }
 
     #[tokio::test]

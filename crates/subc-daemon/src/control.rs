@@ -2730,12 +2730,25 @@ impl ControlHandler {
             )?]);
         }
 
-        if self
-            .process_liveness
-            .as_ref()
-            .and_then(|process_liveness| process_liveness.process_live(&target_module_id))
-            == Some(false)
-        {
+        if let Some(process_liveness) = self.process_liveness.as_ref().filter(|process_liveness| {
+            process_liveness.process_live(&target_module_id) == Some(false)
+        }) {
+            // A module the supervisor is restarting or reloading can still hold
+            // a registration: the old process before its connection closes, or
+            // a new one that registered while the supervisor was draining. The
+            // forwarding table does not see that as draining, but the consumer
+            // should still be told to retry soon, exactly as for the drain
+            // above, rather than that the target is unavailable.
+            if process_liveness.process_replacing(&target_module_id) {
+                return Ok(vec![self.route_open_refusal_frame(
+                    ctx,
+                    &frame,
+                    &target_module_id,
+                    "reloading",
+                    "module_reloading",
+                    format!("module_id '{target_module_id}' is reloading"),
+                )?]);
+            }
             return Ok(vec![self.route_open_refusal_frame(
                 ctx,
                 &frame,

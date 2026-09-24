@@ -797,6 +797,13 @@ async fn retire_incumbent(
     let status = match timeout(runtime.drain_timeout, incumbent.wait()).await {
         Ok(status) => status,
         Err(_) => {
+            warn!(
+                module_id,
+                pid = incumbent.pid,
+                budget_ms = u64::try_from(runtime.drain_timeout.as_millis()).unwrap_or(u64::MAX),
+                reason = "swapped-out incumbent",
+                "drain budget expired before the module exited; killing it"
+            );
             if let Err(err) = incumbent.start_kill() {
                 debug!(module_id, error = %err, "swapped-out incumbent kill failed; it may already have exited");
             }

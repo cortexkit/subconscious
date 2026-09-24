@@ -194,6 +194,14 @@ const FAKE_AFT_EOF_EXIT_CODE_ENV: &str = "FAKE_AFT_EOF_EXIT_CODE";
 /// and when the daemon signalled it, and a later SIGKILL is still what ends it.
 #[cfg(unix)]
 const FAKE_AFT_RECORD_SIGTERM_ENV: &str = "FAKE_AFT_RECORD_SIGTERM";
+/// Milliseconds a subc-mode stub waits after starting (and after installing any
+/// SIGTERM handler) before it dials subc and sends HELLO.
+///
+/// Holds the child in the window between spawn and registration, where the
+/// supervisor has a process but the module has no connection to be told
+/// anything over. A real module passes through that window on every start; this
+/// makes it long enough for a test to act inside it.
+const FAKE_AFT_HELLO_DELAY_MS_ENV: &str = "FAKE_AFT_HELLO_DELAY_MS";
 /// Id used when `FAKE_AFT_MODULE_ID` is absent.
 ///
 /// TESTS THAT ASSERT A MODULE APPEARS IN THE CATALOG MUST CONFIGURE AN ID THAT
@@ -414,6 +422,17 @@ async fn run(config: StubConfig) -> Result<(), StubError> {
                 let _ = record_event(&sigterm_config, json!({"kind": "sigterm", "at_ms": at_ms}));
             }
         });
+    }
+
+    if let Some(delay) = env::var(FAKE_AFT_HELLO_DELAY_MS_ENV)
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+    {
+        // Recorded after any SIGTERM handler above is installed, so a test that
+        // waits for this event and then signals cannot race the default
+        // disposition.
+        record_event(&config, json!({"kind": "hello_delay_started"}))?;
+        sleep(Duration::from_millis(delay)).await;
     }
 
     let stream = connect_to_subc(&config.connection_file_path).await?;

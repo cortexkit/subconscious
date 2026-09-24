@@ -719,6 +719,19 @@ struct SupervisorSnapshot {
     /// the other one, so the two processes of a swap never share a cgroup. A
     /// plain spawn always uses the primary cgroup.
     in_alternate_slot: bool,
+    /// Whether the current `Draining` state ends in a replacement process
+    /// (restart, reload, health restart) rather than a stop. Only meaningful
+    /// while `state` is `Draining`; every entry into that state rewrites it.
+    /// It is what lets route.open answer the retryable `module_reloading` to a
+    /// consumer that reaches a still-registered process mid-restart, instead of
+    /// the `supervisor_not_live` a stop or disable deserves.
+    draining_to_replace: bool,
+    /// Whether a configuration update has been applied since the current
+    /// process was spawned, so that process runs an older spec than the one
+    /// the supervisor now holds. A queued restart is only coalesced into a
+    /// fresher process when this is false: a restart requested to pick up a
+    /// new configuration must not be satisfied by a process that predates it.
+    configuration_updated_since_spawn: bool,
 }
 
 impl SupervisorSnapshot {
@@ -805,6 +818,8 @@ impl SupervisorSnapshot {
             last_exit: None,
             health: ModuleHealthStatus::default(),
             in_alternate_slot: false,
+            draining_to_replace: false,
+            configuration_updated_since_spawn: false,
         }
     }
 }
@@ -1193,6 +1208,15 @@ fn spawn_subscriber_lagged_frame(
 
 pub trait ModuleProcessLiveness: Send + Sync {
     fn process_live(&self, module_id: &str) -> Option<bool>;
+
+    /// Whether the supervisor is replacing this module's process right now: an
+    /// operator restart or reload, a health restart, or a crash respawn whose
+    /// backoff is running. A module in that state is not live, but a consumer
+    /// refused now should retry shortly rather than treat the target as gone.
+    /// Stopped, failed, and disabled modules are not replacing.
+    fn process_replacing(&self, _module_id: &str) -> bool {
+        false
+    }
 }
 
 /// Shared process-liveness registry keyed by supervised `module_id`.
@@ -1242,6 +1266,32 @@ impl ModuleProcessLiveness for SupervisorProcessLiveness {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         Some(snapshot.state == ModuleState::Running && snapshot.process_alive)
+    }
+
+    fn process_replacing(&self, module_id: &str) -> bool {
+        let Some(snapshot) = self
+            .snapshots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(module_id)
+            .cloned()
+        else {
+            return false;
+        };
+        let snapshot = snapshot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        snapshot.enabled
+            && match snapshot.state {
+                ModuleState::Restarting => true,
+                ModuleState::Draining => snapshot.draining_to_replace,
+                ModuleState::Starting
+                | ModuleState::Running
+                | ModuleState::Unresponsive
+                | ModuleState::Stopped
+                | ModuleState::Failed
+                | ModuleState::Disabled => false,
+            }
     }
 }
 
@@ -2748,11 +2798,13 @@ impl SupervisedModule {
     }
 
     pub async fn restart(&self, drain_timeout_ms: Option<u64>) -> Result<(), SuperviseError> {
+        let received_at_generation = lock_snapshot(&self.inner.snapshot)?.spawn_generation;
         let (reply_tx, reply_rx) = oneshot::channel();
         self.inner
             .commands
             .send(SupervisorCommand::Restart {
                 drain_timeout_ms,
+                received_at_generation,
                 reply: reply_tx,
             })
             .await
@@ -2932,6 +2984,10 @@ enum SupervisorCommand {
         /// immediately (wedge bounce: a stuck request never settles, so
         /// waiting only delays recovery).
         drain_timeout_ms: Option<u64>,
+        /// The module's `spawn_generation` when the request was received, before
+        /// it waited in the command queue. A queued restart whose module has
+        /// since spawned a newer process is already satisfied (see the handler).
+        received_at_generation: u64,
         reply: oneshot::Sender<Result<(), SuperviseError>>,
     },
     Reload {
@@ -3895,7 +3951,7 @@ async fn health_restart_child(
             window_secs = runtime.restart_policy.window.as_secs(),
             "health restart budget exhausted; disabling module"
         );
-        begin_forwarding_drain_if_configured(
+        let stop_notice = begin_forwarding_drain_if_configured(
             spec,
             runtime,
             registry,
@@ -3907,6 +3963,7 @@ async fn health_restart_child(
         drain_optional_child(
             &spec.module_id,
             spec.protocol,
+            stop_notice,
             registry,
             snapshot,
             &runtime.terminal_ring,
@@ -3940,7 +3997,7 @@ async fn health_restart_child(
         "health-triggered module restart"
     );
 
-    begin_forwarding_drain_if_configured(
+    let stop_notice = begin_forwarding_drain_if_configured(
         spec,
         runtime,
         registry,
@@ -3952,6 +4009,7 @@ async fn health_restart_child(
     drain_optional_child(
         &spec.module_id,
         spec.protocol,
+        stop_notice,
         registry,
         snapshot,
         &runtime.terminal_ring,
@@ -4564,9 +4622,12 @@ async fn handle_supervisor_command(
 ) -> bool {
     match command {
         SupervisorCommand::Drain { reply } => {
+            // A plain stop runs no forwarding drain, so nothing reaches the
+            // module over its connection before the wait: ask by signal.
             let result = drain_optional_child(
                 &spec.module_id,
                 spec.protocol,
+                StopNotice::NotSent,
                 registry,
                 snapshot,
                 &runtime.terminal_ring,
@@ -4586,7 +4647,7 @@ async fn handle_supervisor_command(
         }
         SupervisorCommand::Retire { reply } => {
             let result = async {
-                begin_forwarding_drain_if_configured(
+                let stop_notice = begin_forwarding_drain_if_configured(
                     spec,
                     runtime,
                     registry,
@@ -4598,6 +4659,7 @@ async fn handle_supervisor_command(
                 drain_optional_child(
                     &spec.module_id,
                     spec.protocol,
+                    stop_notice,
                     registry,
                     snapshot,
                     &runtime.terminal_ring,
@@ -4619,6 +4681,7 @@ async fn handle_supervisor_command(
         }
         SupervisorCommand::Restart {
             drain_timeout_ms,
+            received_at_generation,
             reply,
         } => {
             // ACK AT INITIATION, not completion. The blocking form deadlocked any
@@ -4641,7 +4704,32 @@ async fn handle_supervisor_command(
             };
             let initiated = validation.is_ok();
             let _ = reply.send(validation);
-            if initiated {
+            // A restart asks for a fresh process. Commands run one at a time,
+            // so a restart queued behind another restart (two operator calls
+            // in quick succession) is dequeued the moment the first one has
+            // spawned its replacement -- before that process has sent HELLO.
+            // Running it would drain and kill the process the first restart
+            // just produced, which is the opposite of what both callers asked
+            // for. If a process spawned after this request was received is
+            // still supervised, the request is already satisfied. Not when the
+            // configuration changed since that spawn: then the newer process
+            // predates the spec this restart may exist to apply.
+            let satisfied_by_generation = if initiated && child.is_some() {
+                lock_snapshot(snapshot).ok().and_then(|state| {
+                    (state.spawn_generation > received_at_generation
+                        && !state.configuration_updated_since_spawn)
+                        .then_some(state.spawn_generation)
+                })
+            } else {
+                None
+            };
+            if let Some(generation) = satisfied_by_generation {
+                info!(
+                    module_id = %spec.module_id,
+                    received_at_generation,
+                    "restart already satisfied by generation {generation}; not restarting again"
+                );
+            } else if initiated {
                 // Precedence: this restart's operator override, else the module's
                 // configured budget (already resolved into the runtime).
                 let drain_timeout = drain_timeout_ms
@@ -4701,6 +4789,9 @@ async fn handle_supervisor_command(
                 handle.apply_identity_configuration(&next_spec);
             }
             *spec = next_spec;
+            let _ = update_snapshot(snapshot, Some(&spec.module_id), |state| {
+                state.configuration_updated_since_spawn = true;
+            });
             runtime.health = health;
             runtime.drain_timeout = drain_timeout_ms
                 .map(Duration::from_millis)
@@ -4749,7 +4840,7 @@ async fn restart_child(
             module_id: spec.module_id.clone(),
         });
     }
-    begin_forwarding_drain_with_timeout(
+    let stop_notice = begin_forwarding_drain_with_timeout(
         spec,
         runtime,
         registry,
@@ -4764,6 +4855,7 @@ async fn restart_child(
         drain_optional_child(
             &spec.module_id,
             spec.protocol,
+            stop_notice,
             registry,
             snapshot,
             &runtime.terminal_ring,
@@ -4826,7 +4918,7 @@ async fn reload_child(
             module_id: spec.module_id.clone(),
         });
     }
-    begin_forwarding_drain(
+    let stop_notice = begin_forwarding_drain(
         spec,
         runtime,
         registry,
@@ -4840,6 +4932,7 @@ async fn reload_child(
         drain_optional_child(
             &spec.module_id,
             spec.protocol,
+            stop_notice,
             registry,
             snapshot,
             &runtime.terminal_ring,
@@ -5029,7 +5122,7 @@ async fn set_child_enabled(
         debug!(module_id = %spec.module_id, "supervised module enabled");
         Ok(true)
     } else {
-        begin_forwarding_drain_if_configured(
+        let stop_notice = begin_forwarding_drain_if_configured(
             spec,
             runtime,
             registry,
@@ -5041,6 +5134,7 @@ async fn set_child_enabled(
         drain_optional_child(
             &spec.module_id,
             spec.protocol,
+            stop_notice,
             registry,
             snapshot,
             &runtime.terminal_ring,
@@ -6196,6 +6290,28 @@ enum DrainScope {
     Endpoint(crate::ModuleEndpointId),
 }
 
+/// Whether a child being drained has already been asked to stop by the time
+/// its drain wait starts.
+///
+/// The drain wait is the same budget whatever this says. What it decides is
+/// whether the supervisor must ask by signal before that wait begins: a child
+/// that nobody asked will sit out the whole budget and then be SIGKILLed,
+/// healthy or not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StopNotice {
+    /// The module was sent `module.draining` and a module GOODBYE over its own
+    /// registered connection, and stops itself.
+    SentOverConnection,
+    /// The forwarding drain found no registered connection for the module: a
+    /// subc child spawned moments ago that has not sent HELLO yet, or a
+    /// `protocol: "none"` child, which never registers.
+    NoConnection,
+    /// This path sends nothing over the module's connection: the supervisor has
+    /// no forwarding table, or the caller stops the child without a forwarding
+    /// drain.
+    NotSent,
+}
+
 async fn begin_forwarding_drain(
     spec: &ModuleSpec,
     runtime: &SupervisorRuntimeConfig,
@@ -6203,7 +6319,7 @@ async fn begin_forwarding_drain(
     snapshot: &SharedSnapshot,
     enabled: Option<bool>,
     reason: RouteCloseReason,
-) -> Result<(), SuperviseError> {
+) -> Result<StopNotice, SuperviseError> {
     let Some(forwarding) = runtime.forwarding.as_ref() else {
         return Err(SuperviseError::ReloadUnavailable {
             module_id: spec.module_id.clone(),
@@ -6234,7 +6350,7 @@ async fn begin_forwarding_drain_if_configured(
     snapshot: &SharedSnapshot,
     enabled: Option<bool>,
     reason: RouteCloseReason,
-) -> Result<(), SuperviseError> {
+) -> Result<StopNotice, SuperviseError> {
     begin_forwarding_drain_with_timeout(
         spec,
         runtime,
@@ -6258,9 +6374,9 @@ async fn begin_forwarding_drain_with_timeout(
     enabled: Option<bool>,
     reason: RouteCloseReason,
     drain_timeout: Duration,
-) -> Result<(), SuperviseError> {
+) -> Result<StopNotice, SuperviseError> {
     let Some(forwarding) = runtime.forwarding.as_ref() else {
-        return Ok(());
+        return Ok(StopNotice::NotSent);
     };
 
     begin_forwarding_drain_with(
@@ -6286,7 +6402,7 @@ async fn begin_forwarding_drain_with(
     enabled: Option<bool>,
     reason: RouteCloseReason,
     drain_timeout: Duration,
-) -> Result<(), SuperviseError> {
+) -> Result<StopNotice, SuperviseError> {
     let ForwardingDrainContext {
         spec,
         runtime,
@@ -6316,13 +6432,21 @@ async fn begin_forwarding_drain_with(
     if scope == DrainScope::Active {
         update_snapshot(snapshot, Some(&spec.module_id), |state| {
             state.state = ModuleState::Draining;
+            state.draining_to_replace =
+                matches!(reason, RouteCloseReason::Restart | RouteCloseReason::Reload);
             if let Some(enabled) = enabled {
                 state.enabled = enabled;
             }
         })?;
     }
 
-    if let Some(target) = drain_target.as_ref() {
+    let Some(target) = drain_target.as_ref() else {
+        // Nothing was sent: the module has no registered connection to carry
+        // `module.draining` or a GOODBYE. The caller must not assume the child
+        // was asked to stop.
+        return Ok(StopNotice::NoConnection);
+    };
+    {
         send_module_draining(&spec.module_id, reason, deadline_ms, target);
         let routes = forwarding
             .endpoint_routes(target.endpoint)
@@ -6442,7 +6566,7 @@ async fn begin_forwarding_drain_with(
         );
     }
 
-    Ok(())
+    Ok(StopNotice::SentOverConnection)
 }
 
 /// Wait for the freshly spawned child to take the ACTIVE slot for `module_id`,
@@ -6669,6 +6793,7 @@ fn control_flags() -> Flags {
 async fn drain_optional_child(
     module_id: &str,
     protocol: ModuleProtocol,
+    stop_notice: StopNotice,
     registry: &Registry,
     snapshot: &SharedSnapshot,
     terminal_ring: &Arc<Mutex<TerminalRing>>,
@@ -6682,6 +6807,7 @@ async fn drain_optional_child(
         drain_child_to_state(
             module_id,
             protocol,
+            stop_notice,
             registry,
             snapshot,
             terminal_ring,
@@ -6708,6 +6834,7 @@ async fn drain_optional_child(
 async fn drain_child_to_state(
     module_id: &str,
     protocol: ModuleProtocol,
+    stop_notice: StopNotice,
     registry: &Registry,
     snapshot: &SharedSnapshot,
     terminal_ring: &Arc<Mutex<TerminalRing>>,
@@ -6719,17 +6846,31 @@ async fn drain_child_to_state(
 ) -> Result<(), SuperviseError> {
     update_snapshot(snapshot, Some(module_id), |state| {
         state.state = ModuleState::Draining;
+        state.draining_to_replace = final_state == ModuleState::Restarting;
         if let Some(enabled) = enabled {
             state.enabled = enabled;
         }
     })?;
 
-    // The wait below is the same budget for both protocols; what differs is
-    // whether anything has ASKED the child to stop before it starts. A subc
-    // module was told over its own connection before reaching here. A module
-    // that speaks no subc wire was told nothing, so without this the budget is
-    // only a delay in front of SIGKILL.
-    if protocol == ModuleProtocol::None {
+    // The wait below is the same budget in every case; what differs is
+    // whether anything has ASKED the child to stop before it starts. Only a
+    // forwarding drain that reached the module's registered connection has
+    // (`module.draining`, then a module GOODBYE). Every other child was told
+    // nothing: a `protocol: "none"` module, which never registers; a subc
+    // module spawned moments ago that has not sent HELLO yet; or a stop that
+    // runs no forwarding drain. Without a signal the budget is only a delay
+    // in front of SIGKILL -- and the not-yet-registered child is the worst
+    // case, because it registers into a module that is already draining,
+    // is never told, and is killed while healthy.
+    if stop_notice != StopNotice::SentOverConnection {
+        if protocol == ModuleProtocol::Subc && stop_notice == StopNotice::NoConnection {
+            info!(
+                module_id,
+                pid = child.pid,
+                budget_ms = u64::try_from(drain_timeout.as_millis()).unwrap_or(u64::MAX),
+                "module has no connection yet; requesting stop by signal"
+            );
+        }
         request_graceful_stop(module_id, &child);
     }
 
@@ -6751,6 +6892,18 @@ async fn drain_child_to_state(
             // revivable. Trigger is an ESRCH race (process exits between the
             // drain timeout firing and the kill) or a post-kill wait failure
             // (issue #34).
+            //
+            // Logged because the kill is otherwise visible only as signal 9 in
+            // the terminal ring, and the budget it follows can be long enough
+            // that consumers see a stretch of refusals with no stated cause.
+            warn!(
+                module_id,
+                pid = child.pid,
+                budget_ms = u64::try_from(drain_timeout.as_millis()).unwrap_or(u64::MAX),
+                reason = ?final_state,
+                ?stop_notice,
+                "drain budget expired before the module exited; killing it"
+            );
             child.start_kill().map_err(|source| {
                 fail_snapshot(snapshot, Some(module_id), None);
                 SuperviseError::Kill {
@@ -6792,20 +6945,20 @@ async fn drain_child_to_state(
     wait_for_registration_release(registry, module_id, REGISTRY_RELEASE_TIMEOUT).await
 }
 
-/// Ask a `protocol: "none"` child to stop, the only way such a child can be
-/// asked.
+/// Ask a child that nothing else has asked to stop, by signal.
 ///
-/// A subc module is asked over its own connection: the drain sends
+/// A registered subc module is asked over its own connection: the drain sends
 /// `route.closing`/`route.closed` to its consumers, a GOODBYE per route, then a
 /// module GOODBYE, and the module stops itself. A module that speaks no subc
-/// wire receives none of that, so before this the drain budget was pure delay in
-/// front of a SIGKILL -- and for a process with a store to flush (JetStream is
-/// the reason this mode exists) a SIGKILL turns every ordinary teardown into a
-/// recovery on the next start.
+/// wire receives none of that, and neither does a subc module that has not
+/// registered yet, so for them the drain budget would be pure delay in front of
+/// a SIGKILL -- and for a process with a store to flush (JetStream is the
+/// reason `protocol: "none"` exists) a SIGKILL turns every ordinary teardown
+/// into a recovery on the next start.
 ///
-/// NEVER CALLED FOR A SUBC MODULE, and that is a rule rather than an
-/// optimisation: a subc module's graceful stop is already running by the time a
-/// child is drained, and a signal would race it.
+/// NEVER CALLED FOR A MODULE THAT WAS TOLD OVER ITS CONNECTION, and that is a
+/// rule rather than an optimisation: that module's graceful stop is already
+/// running by the time its child is drained, and a signal would race it.
 ///
 /// Best-effort by construction. A child that has already exited is the ordinary
 /// case rather than an error (the kill lands on a reaped or exiting pid), so a
@@ -6820,16 +6973,19 @@ fn request_graceful_stop(module_id: &str, child: &SupervisedChild) {
     else {
         debug!(
             module_id,
-            "no pid to signal for protocol: none teardown; falling through to the drain wait"
+            "no pid to signal for teardown; falling through to the drain wait"
         );
         return;
     };
     match rustix::process::kill_process(pid, rustix::process::Signal::TERM) {
-        Ok(()) => debug!(module_id, "sent SIGTERM to protocol: none module"),
+        Ok(()) => debug!(
+            module_id,
+            "sent SIGTERM to a module nothing else asked to stop"
+        ),
         Err(err) => debug!(
             module_id,
             error = %err,
-            "SIGTERM to protocol: none module failed; the drain wait and kill still apply"
+            "SIGTERM to module failed; the drain wait and kill still apply"
         ),
     }
 }
@@ -6845,7 +7001,7 @@ fn request_graceful_stop(module_id: &str, child: &SupervisedChild) {
 fn request_graceful_stop(module_id: &str, _child: &SupervisedChild) {
     debug!(
         module_id,
-        "no graceful stop signal exists on this platform; protocol: none teardown waits, then kills"
+        "no graceful stop signal exists on this platform; teardown of a module nothing asked to stop waits, then kills"
     );
 }
 
@@ -7089,6 +7245,7 @@ fn set_running(
     // Every caller of this is a plain spawn, which always uses the primary key;
     // a promoted swap candidate sets the flag itself after this returns.
     state.in_alternate_slot = false;
+    state.configuration_updated_since_spawn = false;
     state.state = ModuleState::Running;
     state.enabled = true;
     state.process_alive = true;
@@ -7215,7 +7372,7 @@ mod terminal_history_tests {
         lock_snapshot, on_child_exit, record_deliberate_severance, record_wait_error_terminal,
         reset_restart_count, spawn_and_mark_running, update_snapshot, wait_error_exit_report,
         ExitKind, ExitReport, ModuleProtocol, ModuleSpec, ModuleState, NextAction, ProcessIdentity,
-        RestartPolicy, SpawnEventKind, SuperviseError, SupervisedModule, Supervisor,
+        RestartPolicy, SpawnEventKind, StopNotice, SuperviseError, SupervisedModule, Supervisor,
         SupervisorHandle, SupervisorHealthStatus, SupervisorSnapshot,
     };
     // The supervisor's clock, distinct from the `std::time::Instant` these tests
@@ -8166,6 +8323,9 @@ mod terminal_history_tests {
         drain_child_to_state(
             &spec.module_id,
             spec.protocol,
+            // The child exits on its own; no signal may change the exit this
+            // test classifies.
+            StopNotice::SentOverConnection,
             &registry,
             &snapshot,
             &runtime.terminal_ring,
@@ -8217,6 +8377,9 @@ mod terminal_history_tests {
         drain_child_to_state(
             &spec.module_id,
             spec.protocol,
+            // The child exits on its own; no signal may change the exit this
+            // test classifies.
+            StopNotice::SentOverConnection,
             &registry,
             &snapshot,
             &runtime.terminal_ring,

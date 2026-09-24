@@ -13,6 +13,8 @@ mod credentials;
 // streams.
 #[allow(dead_code)]
 mod bootstrap;
+// The offline `install-plan` and `install-apply` commands `ck setup` drives.
+mod install;
 
 use std::{
     env,
@@ -64,6 +66,15 @@ impl ModuleHandler for BusHandler {
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
+    // The install commands are offline: evaluated before anything supervised, they need
+    // no SUBC_MODULE_ID and reach neither the daemon nor the vault.
+    let args: Vec<String> = env::args_os()
+        .skip(1)
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    if let Some(status) = install::run(&args) {
+        std::process::exit(status);
+    }
     let module_id = env::var(SUBC_MODULE_ID_ENV)
         .map_err(|_| format!("{SUBC_MODULE_ID_ENV} is required; ck-bus only runs supervised"))?;
     let store_root = runtime::resolve_store_root()?;

@@ -1066,6 +1066,12 @@ async fn stderr_from_before_a_restart_survives_with_a_marked_boundary() {
 /// process's boundary, never after it. The orphan writes 3s after its parent
 /// exits, far past the supervisor's wait, so a restart observed before the
 /// orphan's line is a restart the held pipe did not delay.
+///
+/// Not on Windows: there each module runs in a job object that is closed when
+/// the module's handle is released, and closing it kills every process the
+/// module started. The descendant holding the pipe dies with its parent, so the
+/// pipe closes at once and a held pipe cannot happen.
+#[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_held_stderr_pipe_marks_the_tail_incomplete_and_its_late_output_stays_with_its_process() {
     let server = TestServer::start().await;

@@ -14,15 +14,20 @@ const MODE_ENV: &str = "SUBC_JOBOBJECT_FIXTURE_MODE";
 /// Where the grandchild writes its own pid, so the test can address it.
 const GRANDCHILD_PID_ENV: &str = "SUBC_JOBOBJECT_GRANDCHILD_PID_FILE";
 
+/// Where the console mode writes whether it was given a console.
+const CONSOLE_REPORT_ENV: &str = "SUBC_JOBOBJECT_CONSOLE_REPORT";
+
 const PARENT: &str = "parent";
 const GRANDCHILD: &str = "grandchild";
+const CONSOLE: &str = "console";
 
 fn main() {
     match env::var(MODE_ENV).as_deref() {
         Ok(PARENT) => run_parent(),
         Ok(GRANDCHILD) => run_grandchild(),
+        Ok(CONSOLE) => run_console_report(),
         _ => {
-            eprintln!("fixture: set {MODE_ENV} to '{PARENT}' or '{GRANDCHILD}'");
+            eprintln!("fixture: set {MODE_ENV} to '{PARENT}', '{GRANDCHILD}' or '{CONSOLE}'");
             std::process::exit(2);
         }
     }
@@ -46,6 +51,33 @@ fn run_parent() {
     // Windows dropping a Child neither kills it nor reaps it.
     std::mem::forget(grandchild);
     park_forever();
+}
+
+/// Report whether this process has a console window, then exit.
+///
+/// Writes `has-console` or `no-console`. The report goes to a temp file renamed
+/// into place, so the test never reads a file that exists but is still empty.
+fn run_console_report() {
+    let path = env::var(CONSOLE_REPORT_ENV).expect("console report file");
+    let report = if has_console() {
+        "has-console"
+    } else {
+        "no-console"
+    };
+    let temporary = format!("{path}.tmp");
+    fs::write(&temporary, report).expect("write console report");
+    fs::rename(&temporary, &path).expect("publish console report");
+}
+
+#[cfg(windows)]
+fn has_console() -> bool {
+    // SAFETY: GetConsoleWindow takes no arguments and only reads process state.
+    !unsafe { windows_sys::Win32::System::Console::GetConsoleWindow() }.is_null()
+}
+
+#[cfg(not(windows))]
+fn has_console() -> bool {
+    false
 }
 
 /// Publish this process's pid and park.

@@ -61,7 +61,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub use sys::{JobObject, CREATE_SUSPENDED_FLAG};
+pub use sys::{JobObject, CONTAINMENT_CREATION_FLAGS, CREATE_SUSPENDED_FLAG};
 
 /// A process handle suitable for [`JobObject::assign`].
 ///
@@ -109,11 +109,13 @@ pub fn process_handle<C: ProcessHandle>(child: &C) -> Option<*mut std::ffi::c_vo
 /// wait: the ordinary case finds the thread on the first attempt.
 const RESUME_DISCOVERY_TIMEOUT: Duration = Duration::from_millis(500);
 
-/// Mark `command` so the child is created suspended.
+/// Mark `command` so the child is created suspended and without a console window.
 ///
 /// The child must not run a single instruction before [`JobObject::assign`], or
 /// it could spawn a grandchild that escapes containment. Call
-/// [`resume_main_thread`] once the child is assigned.
+/// [`resume_main_thread`] once the child is assigned. This sets the command's
+/// whole creation-flag mask ([`CONTAINMENT_CREATION_FLAGS`]); setting creation
+/// flags on the command again afterwards would replace it.
 pub fn suspend_on_create(command: &mut std::process::Command) {
     sys::set_suspended_creation_flags(command);
 }

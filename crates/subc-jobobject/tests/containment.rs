@@ -296,3 +296,35 @@ fn a_suspended_child_is_assigned_before_it_runs() {
     let mut child = child;
     let _ = child.wait();
 }
+
+/// A contained child gets no console window (#131).
+///
+/// Without `CREATE_NO_WINDOW` a console-subsystem child either opens its own
+/// console (under a daemon with none) or attaches to its parent's (under this
+/// test runner). Either way it has a console window, and closing it ends the
+/// child with `STATUS_CONTROL_C_EXIT`. So "has no console at all" is the
+/// assertion that holds only when the flag is set.
+#[test]
+fn a_contained_child_has_no_console_window() {
+    let dir = TempDir::new("console");
+    let report = dir.join("console.report");
+    let mut command = Command::new(fixture_path());
+    command
+        .env("SUBC_JOBOBJECT_FIXTURE_MODE", "console")
+        .env("SUBC_JOBOBJECT_CONSOLE_REPORT", &report)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut contained = subc_jobobject::spawn_contained(&mut command).expect("spawn fixture");
+    let status = contained
+        .child
+        .wait()
+        .expect("wait for the console fixture");
+    assert!(status.success(), "console fixture failed: {status:?}");
+    let reported = std::fs::read_to_string(&report)
+        .unwrap_or_else(|error| panic!("console report missing at {report:?}: {error}"));
+    assert_eq!(
+        reported, "no-console",
+        "a contained child must be created with CREATE_NO_WINDOW"
+    );
+}

@@ -27,6 +27,7 @@ jobs:
       cgroup_version: ${{ steps.versions.outputs.cgroup_version }}
       uptime_version: ${{ steps.versions.outputs.uptime_version }}
       os_version: ${{ steps.versions.outputs.os_version }}
+      jobobject_version: ${{ steps.versions.outputs.jobobject_version }}
       daemon_version: ${{ steps.versions.outputs.daemon_version }}
     steps:
       - uses: actions/checkout@v5
@@ -55,6 +56,7 @@ jobs:
             echo "cgroup_version=$(find_version subc-cgroup)"
             echo "uptime_version=$(find_version subc-uptime)"
             echo "os_version=$(find_version subc-os)"
+            echo "jobobject_version=$(find_version subc-jobobject)"
             echo "daemon_version=$(find_version subc-daemon)"
           } >> "$GITHUB_OUTPUT"
 
@@ -183,11 +185,24 @@ jobs:
     secrets:
       CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
+  publish_jobobject:
+    name: Publish subc-jobobject
+    needs: detect
+    if: ${{ needs.detect.outputs.jobobject_version != '' }}
+    permissions:
+      contents: write
+    uses: ./.github/workflows/publish-crate.yml
+    with:
+      crate: subc-jobobject
+      version: ${{ needs.detect.outputs.jobobject_version }}
+    secrets:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
   # The daemon depends on every crate above except subc-client-rs, so it runs
   # only after each of them either published or had nothing to publish.
   publish_daemon:
     name: Publish subc-daemon
-    needs: [detect, publish_protocol, publish_transport, publish_control, publish_jsonc, publish_cgroup, publish_uptime, publish_os]
+    needs: [detect, publish_protocol, publish_transport, publish_control, publish_jsonc, publish_cgroup, publish_uptime, publish_os, publish_jobobject]
     if: >-
       ${{
         always() &&
@@ -199,6 +214,7 @@ jobs:
         (needs.publish_cgroup.result == 'success' || needs.publish_cgroup.result == 'skipped') &&
         (needs.publish_uptime.result == 'success' || needs.publish_uptime.result == 'skipped') &&
         (needs.publish_os.result == 'success' || needs.publish_os.result == 'skipped') &&
+        (needs.publish_jobobject.result == 'success' || needs.publish_jobobject.result == 'skipped') &&
         needs.detect.outputs.daemon_version != ''
       }}
     permissions:

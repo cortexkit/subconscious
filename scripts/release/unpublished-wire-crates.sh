@@ -47,6 +47,7 @@ wire_crates=(
   subc-cgroup
   subc-uptime
   subc-os
+  subc-jobobject
   subc-daemon
 )
 unpublished=()

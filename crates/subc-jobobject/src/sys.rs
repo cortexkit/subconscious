@@ -24,14 +24,28 @@ use windows_sys::Win32::{
             JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
         },
         Threading::{
-            OpenProcess, OpenThread, ResumeThread, WaitForSingleObject, CREATE_SUSPENDED,
-            PROCESS_SYNCHRONIZE, THREAD_SUSPEND_RESUME,
+            OpenProcess, OpenThread, ResumeThread, WaitForSingleObject, CREATE_NO_WINDOW,
+            CREATE_SUSPENDED, PROCESS_SYNCHRONIZE, THREAD_SUSPEND_RESUME,
         },
     },
 };
 
 /// Preceded by `CREATE_SUSPENDED` so a child cannot run before it is contained.
 pub const CREATE_SUSPENDED_FLAG: u32 = CREATE_SUSPENDED;
+
+/// Every creation flag a contained child is spawned with, as one mask.
+///
+/// `CommandExt::creation_flags` replaces the whole mask rather than adding to
+/// it, so the flags must be set together in one call: a second call for either
+/// flag would silently drop the other.
+///
+/// - `CREATE_SUSPENDED`: the child must not run before it is in its job, or it
+///   could start a grandchild that escapes containment.
+/// - `CREATE_NO_WINDOW`: a supervised module is a background process. Without
+///   this flag a console-subsystem child gets its own console window, and
+///   closing that window ends the module with `STATUS_CONTROL_C_EXIT`
+///   (0xC000013A), which the supervisor then restarts.
+pub const CONTAINMENT_CREATION_FLAGS: u32 = CREATE_SUSPENDED | CREATE_NO_WINDOW;
 
 /// `ERROR_NO_MORE_FILES`. The toolhelp thread walk reports ordinary exhaustion
 /// through this code, so it is the one value that separates "finished
@@ -200,14 +214,14 @@ impl Default for PidList {
     }
 }
 
-/// Mark `command` to create its child suspended.
+/// Mark `command` to create its child suspended and without a console window.
 pub fn set_suspended_creation_flags(command: &mut Command) {
-    command.creation_flags(CREATE_SUSPENDED_FLAG);
+    command.creation_flags(CONTAINMENT_CREATION_FLAGS);
 }
 
 /// The same, for the async command the supervisor's spawn path uses.
 pub fn set_suspended_creation_flags_async(command: &mut tokio::process::Command) {
-    command.creation_flags(CREATE_SUSPENDED_FLAG);
+    command.creation_flags(CONTAINMENT_CREATION_FLAGS);
 }
 
 /// Find the primary thread of `pid` and open it with resume rights.

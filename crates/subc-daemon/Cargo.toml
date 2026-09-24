@@ -1,6 +1,6 @@
 [package]
 name = "subc-daemon"
-version = "0.21.10"
+version = "0.21.11"
 edition = "2021"
 publish = true
 description = "Embeddable subc daemon: bootstrap, module supervision, and opaque-byte splice routing."
@@ -37,7 +37,7 @@ subc-cgroup = { path = "../subc-cgroup", version = "0.1.1" }
 [target.'cfg(windows)'.dependencies]
 # Job-object containment for module grandchildren (issue #109). A leaf crate
 # because this crate forbids unsafe code and the Win32 calls need it.
-subc-jobobject = { path = "../subc-jobobject" }
+subc-jobobject = { path = "../subc-jobobject", version = "0.1.0" }
 
 [target.'cfg(unix)'.dependencies]
 # SIGTERM for `protocol: "none"` teardown. This crate forbids unsafe code, so

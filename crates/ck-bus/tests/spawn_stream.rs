@@ -160,7 +160,10 @@ impl Census for RecordingCensus {
             .unwrap()
             .push((module_id.to_string(), fence));
         let mut entries = self.entries.lock().unwrap();
-        let Some(index) = entries.iter().position(|entry| entry.module_id == module_id) else {
+        let Some(index) = entries
+            .iter()
+            .position(|entry| entry.module_id == module_id)
+        else {
             return Ok(Revoked::NoEntry);
         };
         let entry_generation = entries[index].spawn_generation;
@@ -509,10 +512,7 @@ async fn every_exit_is_revoked_by_fact_and_a_restarted_consumer_resumes_from_its
         "the restarted consumer resumes from the recorded cursor"
     );
     assert!(
-        census
-            .revokes()
-            .iter()
-            .all(|(module, _)| module == standin),
+        census.revokes().iter().all(|(module, _)| module == standin),
         "a spawn asks for nothing: {:?}",
         census.revokes()
     );
@@ -525,8 +525,7 @@ async fn every_exit_is_revoked_by_fact_and_a_restarted_consumer_resumes_from_its
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_foreign_incarnation_is_refused_byte_exact_and_the_consumer_reconciles_from_a_snapshot()
-{
+async fn a_foreign_incarnation_is_refused_byte_exact_and_the_consumer_reconciles_from_a_snapshot() {
     let _gate = harness::acceptance_gate().await;
     harness::install_tracing();
     let run = AcceptanceRun::start(Path::new(env!("CARGO_BIN_EXE_ck-bus"))).await;
@@ -670,7 +669,10 @@ async fn a_lagged_stream_reconciles_and_resubscribes_from_its_last_cursor() {
             snapshot(cursor("inc-a", 9000), &[]),
         ],
         vec![
-            vec![Ok(exited(cursor("inc-a", 6), "worker", 2)), Err(FeedEnd::Lagged)],
+            vec![
+                Ok(exited(cursor("inc-a", 6), "worker", 2)),
+                Err(FeedEnd::Lagged),
+            ],
             // The last cursor is gone from the ring by the time of the resubscription.
             vec![Err(FeedEnd::CursorRefused {
                 code: "spawn_cursor_too_old".to_string(),

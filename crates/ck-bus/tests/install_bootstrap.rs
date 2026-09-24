@@ -47,7 +47,7 @@ use std::{
 use async_nats::{jetstream, ConnectErrorKind};
 use bootstrap::{
     cause,
-    plane::{Broker, NatsBroker},
+    plane::{Broker, NatsBroker, CENSUS_MAX_BYTES},
 };
 use cortexkit_bus_naming::{shipped_streams, AccountNames};
 use credentials::{
@@ -296,6 +296,28 @@ async fn first_boot_builds_the_plane_and_a_restart_revokes_the_previous_box_user
         bus::events(plane.run.root.path(), "ckbus.bootstrap.census_key_skipped").is_empty(),
         "the census key is written, never skipped"
     );
+    // The census stream's limits are stated, the size cap among them.
+    let census_stream = names.buckets().census_stream.clone();
+    let census_config = js
+        .get_stream(&census_stream)
+        .await
+        .unwrap()
+        .info()
+        .await
+        .unwrap()
+        .config
+        .clone();
+    assert_eq!(census_config.max_bytes, CENSUS_MAX_BYTES);
+    assert_eq!(census_config.max_age, Duration::ZERO, "no TTL");
+    assert_eq!(census_config.max_messages_per_subject, 1, "history 1");
+    // A census stream an earlier ck-bus created without the cap is brought to it on the
+    // next boot, its values kept.
+    js.update_stream(jetstream::stream::Config {
+        max_bytes: -1,
+        ..census_config
+    })
+    .await
+    .expect("the harness removes the cap, as an earlier ck-bus left it");
 
     // The sentinel publish of the next boot is observed on a confirmed subscription.
     let mut sentinel = subscribe_confirmed(&client, &names.sentinel_ping()).await;
@@ -309,6 +331,16 @@ async fn first_boot_builds_the_plane_and_a_restart_revokes_the_previous_box_user
     assert_eq!(body["incarnation"], second["incarnation"]);
     // The restarted process overwrites its own key at its own, higher generation.
     assert!(own_census(&js, &names, plane.run.root.path(), &second).await > first_generation);
+    let recapped = js
+        .get_stream(&census_stream)
+        .await
+        .unwrap()
+        .info()
+        .await
+        .unwrap()
+        .config
+        .max_bytes;
+    assert_eq!(recapped, CENSUS_MAX_BYTES, "the restart restored the cap");
 
     let (box_users, system_users, pending) = own_users(&plane);
     assert_eq!(

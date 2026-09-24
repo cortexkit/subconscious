@@ -53,7 +53,6 @@ use nkeys::KeyPair;
 const ROOT_ID: &str = "signing:harness-box-account:1";
 const UNTRUSTED_ROOT_ID: &str = "signing:harness-untrusted-account:1";
 const ACCOUNT: &str = "box_harnessjwt";
-const AGENT: &str = "agent_jwt_a";
 
 fn signer_vocabulary() -> BTreeSet<String> {
     SIGNER_OPERATIONS
@@ -165,7 +164,7 @@ async fn user_jwt_built_by_ck_bus_is_accepted_by_a_real_server_and_no_seed_leaks
     let custody = Arc::new(KeyCustody::new());
     let user = custody.generate_user();
     let account = grants::derive_account(ACCOUNT).unwrap();
-    let grant = grants::participant_grant(&account, &user, &[AGENT], &[]).unwrap();
+    let grant = grants::participant_grant(&account, &user, &[]).unwrap();
     let issued = issue(&route, ROOT_ID, &user, &nats.account_public, &grant).await;
     assert_eq!(issued.issuer, signer.root(ROOT_ID).account_public());
 

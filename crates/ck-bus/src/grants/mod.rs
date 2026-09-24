@@ -15,8 +15,8 @@
 use std::{collections::BTreeSet, error::Error, fmt};
 
 use cortexkit_bus_naming::{
-    bus_permissions, generate_permission_golden, participant_permissions, system_permissions,
-    validate_permission_file, AccountNames, AllowEntry, GoldenFixture, GrantError, NamingError,
+    bus_permissions, delivery_authority_permissions, generate_permission_golden,
+    participant_permissions, system_permissions, validate_permission_file, AccountNames, AllowEntry, GoldenFixture, GrantError, NamingError,
     Operation, Principal,
 };
 use serde_json::{json, Value};
@@ -32,6 +32,9 @@ pub const GENERATOR_HEADER: &str =
 pub enum GrantRole {
     /// A supervised participant's per-process user in the box account.
     Participant,
+    /// prefrontal-core's per-process user: the participant set plus publish on every
+    /// agent stream's binding (R15).
+    DeliveryAuthority,
     /// ck-bus's own user in the box account.
     BusModule,
     /// ck-bus's own user in the system account.
@@ -42,6 +45,7 @@ impl GrantRole {
     pub const fn principal(self) -> Principal {
         match self {
             Self::Participant => Principal::Participant,
+            Self::DeliveryAuthority => Principal::DeliveryAuthority,
             Self::BusModule => Principal::Bus,
             Self::SystemAccount => Principal::System,
         }
@@ -193,16 +197,51 @@ pub fn derive_account(account: &str) -> Result<AccountNames, GrantRefusal> {
     Ok(AccountNames::derive(account)?)
 }
 
-/// The per-process grant for a participant bound to `bound_agents` and `bound_rooms`.
-/// `credential_public` is the user's public key, which names its inbox prefix.
+/// The per-process grant for a participant bound to `bound_rooms`. It names no agent:
+/// it may pull, inspect and ack any agent's durable on the agent streams, and publishes
+/// no workload subject. `credential_public` is the user's public key, which names its
+/// inbox prefix.
 pub fn participant_grant(
     account: &AccountNames,
     credential_public: &str,
-    bound_agents: &[&str],
     bound_rooms: &[&str],
 ) -> Result<Grant, GrantRefusal> {
-    let entries = participant_permissions(account, credential_public, bound_agents, bound_rooms)?;
+    let entries = participant_permissions(account, credential_public, bound_rooms)?;
     Grant::from_entries(GrantRole::Participant, account, entries)
+}
+
+/// prefrontal-core's per-process grant: the participant set plus publish on each agent
+/// stream's own binding, since it is the only producer of wakes, peer deliveries and
+/// effect intents.
+pub fn delivery_authority_grant(
+    account: &AccountNames,
+    credential_public: &str,
+    bound_rooms: &[&str],
+) -> Result<Grant, GrantRefusal> {
+    let entries = delivery_authority_permissions(account, credential_public, bound_rooms)?;
+    Grant::from_entries(GrantRole::DeliveryAuthority, account, entries)
+}
+
+/// The module whose attested credential carries the delivery-authority grant (R15):
+/// prefrontal publishes to every agent and copies a merged agent's messages.
+pub const DELIVERY_AUTHORITY_MODULE: &str = "prefrontal-core";
+
+/// The grant issuance signs for the attested `module_id`. Neither form names an agent:
+/// R15 makes agent access account-scoped, so a module's residence can change without a
+/// reissue.
+///
+/// `prefrontal-core` gets the delivery-authority grant; every other module gets the
+/// participant grant.
+pub fn issued_grant(
+    account: &AccountNames,
+    module_id: &str,
+    credential_public: &str,
+    bound_rooms: &[&str],
+) -> Result<Grant, GrantRefusal> {
+    if module_id == DELIVERY_AUTHORITY_MODULE {
+        return delivery_authority_grant(account, credential_public, bound_rooms);
+    }
+    participant_grant(account, credential_public, bound_rooms)
 }
 
 /// ck-bus's own box-account grant: census read and write, management of the five
@@ -227,10 +266,11 @@ pub fn system_account_grant(
     Grant::from_entries(GrantRole::SystemAccount, account, entries)
 }
 
-/// Renders the permission document for a golden fixture from the three role grants.
+/// Renders the permission document for a golden fixture from the four role grants.
 ///
 /// The fixture has no real user key, so its module id stands in where a credential
-/// public key goes: the participant's and bus module's inbox subjects read
+/// public key goes: the participant's, delivery authority's and bus module's inbox
+/// subjects read
 /// `_INBOX.<module id>.>`, and the system user's reads `_INBOX.<system_credential>.>`,
 /// exactly as in the committed reference document. The
 /// `expect-refused` lines are the naming crate's own expectations for the same fixture;
@@ -240,12 +280,8 @@ pub fn system_account_grant(
 pub fn render_fixture_document(fixture: GoldenFixture) -> Result<String, GrantRefusal> {
     let account = derive_account(fixture.account)?;
     let grants = [
-        participant_grant(
-            &account,
-            fixture.module_id,
-            &[fixture.bound_agent],
-            &[fixture.bound_room],
-        )?,
+        participant_grant(&account, fixture.module_id, &[fixture.bound_room])?,
+        delivery_authority_grant(&account, fixture.module_id, &[fixture.bound_room])?,
         bus_module_grant(&account, fixture.module_id)?,
         system_account_grant(&account, fixture.system_credential)?,
     ];

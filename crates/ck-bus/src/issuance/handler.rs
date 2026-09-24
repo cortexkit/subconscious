@@ -1,5 +1,6 @@
-//! The subc side of issuance: the two ops advertised on ck-bus's management surface, the
-//! principal each route was bound with, and the wiring `main.rs` calls.
+//! The subc side of issuance: the two issuance ops and the membership area's agent-durable
+//! ops advertised on ck-bus's management surface, the principal each route was bound
+//! with, and the wiring `main.rs` calls.
 //!
 //! The daemon stamps a route's principal once, in `route.bind`, never per request, so
 //! the handler records it by route in `on_bind` and looks it up for every request on
@@ -35,6 +36,7 @@ use crate::{
     bootstrap::{config::BrokerConfig, Ready},
     credentials::Credentials,
     grants,
+    membership::{self, Membership},
 };
 
 /// Health `metrics.cause` while a high-water entry is damaged.
@@ -48,20 +50,34 @@ fn route_key(handle: &RouteHandle) -> RouteKey {
     (handle.channel, handle.epoch)
 }
 
-/// Adds the two issuance ops to the module's manifest as a management surface, which is
-/// how a participant's `route.open` reaches ck-bus.
+/// Adds the issuance and agent-durable ops to the module's manifest as a management
+/// surface, which is how a participant's (or prefrontal's) `route.open` reaches ck-bus.
 pub fn advertise(builder: ModuleManifestBuilder) -> ModuleManifest {
-    let operations = [
+    let issuance = [
         (super::CREDENTIAL_OP, ManagementOperationKind::Mutate),
         (super::NONCE_SIGN_OP, ManagementOperationKind::Query),
     ]
     .into_iter()
-    .map(|(name, kind)| ManagementOperation {
-        name: name.to_string(),
-        kind,
-        description: Some("ck-bus participant credential issuance".to_string()),
-    })
-    .collect();
+    .map(|(name, kind)| (name, kind, "ck-bus participant credential issuance"));
+    let agent_durables = membership::OPERATIONS.into_iter().map(|(name, mutates)| {
+        (
+            name,
+            if mutates {
+                ManagementOperationKind::Mutate
+            } else {
+                ManagementOperationKind::Query
+            },
+            "agent durables, for reserved:prefrontal-core only",
+        )
+    });
+    let operations = issuance
+        .chain(agent_durables)
+        .map(|(name, kind, description)| ManagementOperation {
+            name: name.to_string(),
+            kind,
+            description: Some(description.to_string()),
+        })
+        .collect();
     builder
         .provides(vec![ProviderRole::ManagementSurface {
             operations,
@@ -73,10 +89,11 @@ pub fn advertise(builder: ModuleManifestBuilder) -> ModuleManifest {
         .build()
 }
 
-/// Wraps the module's handler with the issuance ops.
+/// Wraps the module's handler with the issuance and agent-durable ops.
 pub struct IssuanceHandler<H> {
     inner: H,
     issuance: Arc<Issuance>,
+    membership: Membership,
     principals: Mutex<HashMap<RouteKey, Option<Principal>>>,
 }
 
@@ -84,6 +101,7 @@ impl<H> IssuanceHandler<H> {
     pub fn new(inner: H, issuance: Arc<Issuance>) -> Self {
         Self {
             inner,
+            membership: Membership::new(issuance.plane_source()),
             issuance,
             principals: Mutex::new(HashMap::new()),
         }
@@ -104,10 +122,13 @@ impl<H> IssuanceHandler<H> {
     ) -> Option<HandlerOutcome> {
         let request: Value = serde_json::from_slice(body).ok()?;
         let method = request.get("method").and_then(Value::as_str)?;
+        let params = request.get("params").cloned().unwrap_or(Value::Null);
+        if let Some(outcome) = self.membership.answer(principal, method, &params).await {
+            return Some(frame(outcome));
+        }
         if method != super::CREDENTIAL_OP && method != super::NONCE_SIGN_OP {
             return None;
         }
-        let params = request.get("params").cloned().unwrap_or(Value::Null);
         // Recorded so the log shows a claimed id was seen and not used.
         let claimed = params.get("module_id").and_then(Value::as_str);
         let attested = match principal {
@@ -160,15 +181,20 @@ impl<H> IssuanceHandler<H> {
                 },
             }),
         );
-        Some(match outcome {
-            Ok(result) => HandlerOutcome::Response(
-                serde_json::to_vec(&json!({ "result": result })).expect("an answer encodes"),
-            ),
-            Err(refusal) => HandlerOutcome::Error {
-                code: refusal.code.to_string(),
-                message: refusal.message,
-            },
-        })
+        Some(frame(outcome))
+    }
+}
+
+/// An answer as its frame: `{"result": ...}` or an Error frame carrying the refusal.
+fn frame(outcome: Result<Value, Refusal>) -> HandlerOutcome {
+    match outcome {
+        Ok(result) => HandlerOutcome::Response(
+            serde_json::to_vec(&json!({ "result": result })).expect("an answer encodes"),
+        ),
+        Err(refusal) => HandlerOutcome::Error {
+            code: refusal.code.to_string(),
+            message: refusal.message,
+        },
     }
 }
 

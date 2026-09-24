@@ -18,7 +18,7 @@ async-trait = "0.1"
 base64 = "0.22"
 cortexkit-bus-trait = { version = "0.1.0", git = "https://github.com/cortexkit/commons.git", rev = "4f09c7c7c7f86394d21abde6ed3f97b582ee4d28" }
 cortexkit-bus-inmemory = { version = "0.1.0", git = "https://github.com/cortexkit/commons.git", rev = "4f09c7c7c7f86394d21abde6ed3f97b582ee4d28" }
-cortexkit-bus-naming = { version = "0.1.0", git = "https://github.com/cortexkit/commons.git", rev = "e14a671bd7926d80fb84b4cb887c2657e1f08861" }
+cortexkit-bus-naming = { version = "0.1.0", git = "https://github.com/cortexkit/commons.git", rev = "f884fabeb198949eedec035ac465c1cfb30e9835" }
 cortexkit-bus-nats = { version = "0.1.0", git = "https://github.com/cortexkit/commons.git", rev = "4f09c7c7c7f86394d21abde6ed3f97b582ee4d28" }
 cortexkit-store-types = "0.2.2"
 # Base32 for the nkey encoding ck-bus builds from a vault public key (role prefix, base32,

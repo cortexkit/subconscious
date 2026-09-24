@@ -933,10 +933,9 @@ impl SubcConsumer {
     /// consumer's call deadline, as for [`SubcConsumer::catalog_list`].
     pub async fn spawn_snapshot(&self) -> Result<SpawnSnapshot, CallError> {
         let deadline = Instant::now() + self.shared.opts.call_timeout;
-        let body = serde_json::to_vec(&ClientControlRequest::SupervisorSpawnSnapshot {})
-            .map_err(|err| {
-                CallError::not_sent(format!("failed to encode supervisor.spawn_snapshot: {err}"))
-            })?;
+        let body = serde_json::to_vec(&ClientControlRequest::SupervisorSpawnSnapshot {}).map_err(
+            |err| CallError::not_sent(format!("failed to encode supervisor.spawn_snapshot: {err}")),
+        )?;
 
         loop {
             match self

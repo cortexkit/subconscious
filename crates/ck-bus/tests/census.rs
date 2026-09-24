@@ -69,7 +69,7 @@ use harness::{
         HarnessSigner, SIGNER_OPERATIONS,
     },
 };
-use issuance::{census::CensusValue, Boundary, Issuance, LiveGenerations, Plane, PlaneSource};
+use issuance::{census::CensusValue, Issuance, LiveGenerations, Plane, PlaneSource, StopAfter};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use subc_client_rs::HandlerOutcome;
@@ -545,7 +545,7 @@ async fn a_crash_at_each_issuance_boundary_leaves_nothing_to_roll_back() {
 
     // (i) After the high-water fsync, before signing.
     let (first, memory) = process(&run, store.path(), &plane, GENERATION);
-    *first.crash_after.lock().unwrap() = Some(Boundary::AfterHighWater);
+    *first.crash_after.lock().unwrap() = Some(StopAfter::HighWater);
     first
         .issue(MODULE)
         .await
@@ -559,7 +559,7 @@ async fn a_crash_at_each_issuance_boundary_leaves_nothing_to_roll_back() {
 
     // (ii) After signing, before the census write.
     let (second, memory) = process(&run, store.path(), &plane, GENERATION);
-    *second.crash_after.lock().unwrap() = Some(Boundary::AfterSigning);
+    *second.crash_after.lock().unwrap() = Some(StopAfter::Signing);
     second
         .issue(MODULE)
         .await
@@ -581,7 +581,7 @@ async fn a_crash_at_each_issuance_boundary_leaves_nothing_to_roll_back() {
     assert_eq!(run.census_value(MODULE).await.unwrap().credential_epoch, 2);
 
     // (iii) After the census write, before the answer.
-    *third.crash_after.lock().unwrap() = Some(Boundary::AfterCensus);
+    *third.crash_after.lock().unwrap() = Some(StopAfter::Census);
     third
         .issue(MODULE)
         .await

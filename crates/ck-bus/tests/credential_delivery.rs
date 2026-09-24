@@ -123,11 +123,7 @@ async fn start() -> Option<Plane> {
 fn relayed_signer(
     connection_file: std::path::PathBuf,
     credential_public: String,
-) -> Arc<
-    dyn Fn(Vec<u8>) -> futures_util::future::BoxFuture<'static, Result<Vec<u8>, String>>
-        + Send
-        + Sync,
-> {
+) -> rows::NonceSigner {
     Arc::new(move |nonce: Vec<u8>| {
         let connection_file = connection_file.clone();
         let credential_public = credential_public.clone();

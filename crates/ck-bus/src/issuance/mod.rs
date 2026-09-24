@@ -189,10 +189,10 @@ impl CredentialAnswer {
 /// after a step, exactly as a process death there would leave it.
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Boundary {
-    AfterHighWater,
-    AfterSigning,
-    AfterCensus,
+pub enum StopAfter {
+    HighWater,
+    Signing,
+    Census,
 }
 
 pub struct Issuance {
@@ -209,7 +209,7 @@ pub struct Issuance {
     /// repairs the file.
     damage: Mutex<Option<HighWaterRefusal>>,
     #[cfg(test)]
-    pub crash_after: Mutex<Option<Boundary>>,
+    pub crash_after: Mutex<Option<StopAfter>>,
 }
 
 impl Issuance {
@@ -251,7 +251,7 @@ impl Issuance {
     }
 
     #[cfg(test)]
-    fn crashed_at(&self, boundary: Boundary) -> bool {
+    fn crashed_at(&self, boundary: StopAfter) -> bool {
         *lock(&self.crash_after) == Some(boundary)
     }
 
@@ -320,7 +320,7 @@ impl Issuance {
             }
         };
         #[cfg(test)]
-        if self.crashed_at(Boundary::AfterHighWater) {
+        if self.crashed_at(StopAfter::HighWater) {
             return Err(Refusal::new(
                 "test_crash",
                 "stopped after the high-water fsync",
@@ -343,7 +343,7 @@ impl Issuance {
             }
         };
         #[cfg(test)]
-        if self.crashed_at(Boundary::AfterSigning) {
+        if self.crashed_at(StopAfter::Signing) {
             custody.forget(&user_public);
             return Err(Refusal::new("test_crash", "stopped after signing"));
         }
@@ -373,7 +373,7 @@ impl Issuance {
             return Err(Refusal::new(code::CENSUS_WRITE_FAILED, error.message));
         }
         #[cfg(test)]
-        if self.crashed_at(Boundary::AfterCensus) {
+        if self.crashed_at(StopAfter::Census) {
             custody.forget(&user_public);
             return Err(Refusal::new("test_crash", "stopped after the census write"));
         }

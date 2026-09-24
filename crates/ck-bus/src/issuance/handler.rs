@@ -319,7 +319,7 @@ pub fn wire<H: ModuleHandler>(
     ready: watch::Receiver<Option<Arc<Ready>>>,
 ) -> Result<Wired<H>, String> {
     let connection_file = crate::credentials::vault::subc_arg(std::env::args_os())
-        .ok_or_else(|| "ck-bus needs --subc <connection file> to read the spawn snapshot")?;
+        .ok_or("ck-bus needs --subc <connection file> to read the spawn snapshot")?;
     let issuance = Arc::new(Issuance::new(
         credentials,
         store_root,

@@ -13,6 +13,9 @@
 //! `attest: true` opens its route with `ConsumerIdentity`, and one with `attest: false`
 //! opens it with none, so the same child reaches ck-bus once attested and once as
 //! `Direct`.
+//!
+//! Every row file compiles this whole module and uses only part of it.
+#![allow(dead_code)]
 
 use std::{
     fs,
@@ -325,6 +328,13 @@ impl ModuleHandler for Relay {
     }
 }
 
+/// Signs one connect nonce: the raw nonce bytes in, the raw signature out.
+pub type NonceSigner = Arc<
+    dyn Fn(Vec<u8>) -> futures_util::future::BoxFuture<'static, Result<Vec<u8>, String>>
+        + Send
+        + Sync,
+>;
+
 /// A broker client whose server-reported errors (a permissions violation above all) are
 /// recorded, so an arm can tell a server-side `Denied` from a silent drop.
 pub struct VerdictClient {
@@ -338,11 +348,7 @@ impl VerdictClient {
     pub async fn connect(
         url: &str,
         jwt: &str,
-        sign: Arc<
-            dyn Fn(Vec<u8>) -> futures_util::future::BoxFuture<'static, Result<Vec<u8>, String>>
-                + Send
-                + Sync,
-        >,
+        sign: NonceSigner,
         inbox_prefix: Option<String>,
     ) -> Result<Self, async_nats::ConnectError> {
         let events = Arc::new(Mutex::new(Vec::new()));

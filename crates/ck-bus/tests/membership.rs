@@ -12,7 +12,8 @@
 //! - delete purges the agent's undelivered messages, and deleting an absent durable
 //!   succeeds;
 //! - the list reports each durable's undelivered count;
-//! - the effect-pending read counts deliverable intents and not a dead-lettered one;
+//! - the effect-pending read counts undelivered intents, so a dead-lettered one (kept
+//!   in flight by the server) never holds a merge back;
 //! - a participant credential issued before any bind pulls from a durable bound
 //!   afterwards, with no reissue, while a `Direct` principal still gets no credential.
 //!

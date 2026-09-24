@@ -47,6 +47,10 @@ pub mod tool_call;
 /// Error frames remain extensible strings, but these daemon-owned route-open
 /// outcomes need identical spelling across the daemon and SDK retry policies.
 pub mod error_codes {
+    use crate::Flags;
+
+    pub const UNKNOWN_CHANNEL: &str = "unknown_channel";
+    pub const STALE_ROUTE_EPOCH: &str = "stale_route_epoch";
     pub const UNKNOWN_MODULE: &str = "unknown_module";
     pub const MODULE_REMOVED: &str = "module_removed";
     /// The target module's endpoint is draining for a reload, restart or disable.
@@ -103,6 +107,25 @@ pub mod error_codes {
             code,
             MODULE_RELOADING | MODULE_WARMING | TARGET_UNAVAILABLE | MODULE_TIMEOUT
         )
+    }
+
+    /// Whether the caller should evict this established route, reopen it, and
+    /// resend the request once. Consumers mapping route death to their own
+    /// custody, provider, or suspect verdict keep their own named code lists;
+    /// sharing this predicate for those meanings can change a verdict on a
+    /// protocol bump (prefrontal#59).
+    ///
+    /// Takes envelope flags so the daemon-origin check can be enabled here in
+    /// one place. Phase 2 requires first that every daemon a consumer can meet
+    /// sets DAEMON_ORIGIN on these error frames, both landed and deployed;
+    /// only then may this predicate require the bit. Requiring it sooner makes
+    /// a new SDK against an older daemon stop evicting on a genuine
+    /// `stale_route_epoch` — the failure this predicate is meant to prevent.
+    ///
+    /// The daemon emits these codes in `RouterError::to_error_frame` at
+    /// `crates/subc-daemon/src/router.rs` (UnknownChannel and StaleRouteEpoch).
+    pub fn is_established_route_dead(_flags: Flags, code: &str) -> bool {
+        matches!(code, UNKNOWN_CHANNEL | STALE_ROUTE_EPOCH)
     }
 }
 

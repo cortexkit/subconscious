@@ -5,6 +5,7 @@ import { join } from "node:path";
 import {
   classifyRouteCloseReason,
   DEFAULT_REQUEST_TIMEOUT_MS,
+  isEstablishedRouteDead,
   isRetryableRouteOpenCode,
   LIVENESS_PROBE_WINDOW_MS,
   ROUTE_OPEN_RETRY_DEADLINE_MS,
@@ -20,6 +21,7 @@ import {
   HEADER_LEN,
   MAX_FRAME_BODY_LEN,
   PROTOCOL_VERSION,
+  DAEMON_ORIGIN_FLAG,
   SUBSCRIPTION_FLAG,
 } from "../src/envelope";
 import { machineIdFromHelloAck, type ModuleHelloAckBody } from "../src/provider";
@@ -429,6 +431,25 @@ describe("Rust golden fixtures", () => {
     for (const [code, expectedVerdict] of entries) {
       const actualVerdict = isRetryableRouteOpenCode(code) ? "retryable" : "terminal";
       expect(actualVerdict).toBe(expectedVerdict);
+    }
+  });
+
+  test("execute established_route_dead decision table over every row", () => {
+    const tables = loadGolden<{
+      established_route_dead: {
+        daemon_origin: string;
+        phase_2_order: string;
+        rows: { code: string; daemon_origin: boolean; route_dead: boolean }[];
+      };
+    }>("decision_tables");
+    expect(tables.established_route_dead.daemon_origin).toBe("recorded_not_enforced");
+    expect(tables.established_route_dead.phase_2_order).toBe(
+      "all_compatible_daemons_landed_and_deployed_before_origin_enforced",
+    );
+    expect(tables.established_route_dead.rows.length).toBeGreaterThanOrEqual(14);
+    for (const row of tables.established_route_dead.rows) {
+      const flags = row.daemon_origin ? DAEMON_ORIGIN_FLAG : 0;
+      expect(isEstablishedRouteDead(flags, row.code)).toBe(row.route_dead);
     }
   });
 

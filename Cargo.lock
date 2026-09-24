@@ -1807,7 +1807,7 @@ dependencies = [
 
 [[package]]
 name = "subc-client-rs"
-version = "0.18.4"
+version = "0.18.5"
 dependencies = [
  "async-trait",
  "serde",
@@ -1918,7 +1918,7 @@ dependencies = [
 
 [[package]]
 name = "subc-protocol"
-version = "0.25.1"
+version = "0.25.2"
 dependencies = [
  "serde",
  "serde_json",

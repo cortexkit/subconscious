@@ -553,6 +553,35 @@ fn route_open_retry_predicate_matches_the_decision_table() {
     ));
 }
 
+#[test]
+fn established_route_dead_predicate_matches_the_decision_table() {
+    let table: Value =
+        serde_json::from_str(&fs::read_to_string(golden_path("decision_tables")).unwrap()).unwrap();
+    let route_death = &table["established_route_dead"];
+    assert_eq!(route_death["daemon_origin"], "recorded_not_enforced");
+    assert_eq!(
+        route_death["phase_2_order"],
+        "all_compatible_daemons_landed_and_deployed_before_origin_enforced"
+    );
+    let rows = route_death["rows"].as_array().expect("route death rows");
+    assert!(rows.len() >= 14);
+    for row in rows {
+        let origin = row["daemon_origin"].as_bool().expect("origin bit");
+        let flags = if origin {
+            subc_protocol::Flags::new(false, subc_protocol::Priority::Passive, false)
+                .with_daemon_origin()
+        } else {
+            subc_protocol::Flags::new(false, subc_protocol::Priority::Passive, false)
+        };
+        let code = row["code"].as_str().expect("code");
+        assert_eq!(
+            error_codes::is_established_route_dead(flags, code),
+            row["route_dead"].as_bool().expect("route dead verdict"),
+            "code={code} daemon_origin={origin}"
+        );
+    }
+}
+
 fn assert_golden<T>(name: &str, value: &T)
 where
     T: Serialize + DeserializeOwned + PartialEq + Debug,

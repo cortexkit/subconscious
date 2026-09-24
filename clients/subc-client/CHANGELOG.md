@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.16.1 — 2026-09-24
+
+- Export `UNKNOWN_CHANNEL`, `STALE_ROUTE_EPOCH`, and `isEstablishedRouteDead(flags, code)` for evict/reopen/resend-once decisions. The managed consumer and provider use the shared predicate without changing their current retry or `not_sent` behavior. The golden table records daemon-origin flags but does not enforce them until all compatible daemons emit the bit.
+
 ## 0.16.0 — 2026-09-24
 
 - Make `SubcProvider.closed` public: a `Promise<void>` that resolves once, when the provider will serve no more. That happens after a channel-0 GOODBYE from the daemon (supervisor restart or stop, daemon shutdown), after `close()`, or after a connection loss the provider will not recover from. It never rejects. A supervised module should `await provider.closed` and then exit (`process.exit(0)`), so a restart no longer waits for the daemon to SIGTERM it at the drain deadline. The SDK itself never exits the process.

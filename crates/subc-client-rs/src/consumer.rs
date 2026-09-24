@@ -897,7 +897,7 @@ impl SubcConsumer {
                         subc_ops,
                     });
                 }
-                Ok(TerminalFrame::Error { body }) => return Err(CallError::Module(body)),
+                Ok(TerminalFrame::Error { body, .. }) => return Err(CallError::Module(body)),
                 Ok(TerminalFrame::StreamEnd) => {
                     return Err(CallError::not_sent("catalog.list returned StreamEnd"));
                 }
@@ -977,7 +977,7 @@ impl SubcConsumer {
         match result? {
             TerminalFrame::Response { body, .. } => Ok(body),
             TerminalFrame::StreamEnd => Ok(Vec::new()),
-            TerminalFrame::Error { body } => Err(CallError::Module(body)),
+            TerminalFrame::Error { body, .. } => Err(CallError::Module(body)),
         }
     }
 
@@ -1222,8 +1222,8 @@ impl SubcConsumer {
                 // contract is NOT-FORWARDED (dropped before delivery), so the retry
                 // is safe by construction; the remedy is identical.
                 // Parity with the TS client's retry-once in call().
-                Ok(TerminalFrame::Error { body, .. })
-                    if (body.code == "unknown_channel" || body.code == "stale_route_epoch")
+                Ok(TerminalFrame::Error { body, flags })
+                    if error_codes::is_established_route_dead(flags, &body.code)
                         && !retried_unknown_channel
                         && Instant::now() < call_deadline =>
                 {
@@ -3800,7 +3800,7 @@ impl PendingEntry {
             PendingCompletion::Subscription { closed, .. } => {
                 let result = match terminal {
                     PendingTerminal::Response { .. } | PendingTerminal::StreamEnd => Ok(()),
-                    PendingTerminal::Error { body } => Err(CallError::Module(body)),
+                    PendingTerminal::Error { body, .. } => Err(CallError::Module(body)),
                 };
                 let _ = closed.send(result);
             }
@@ -3901,7 +3901,7 @@ impl PendingResult {
 
 enum PendingTerminal {
     Response { generation: u64, body: Vec<u8> },
-    Error { body: ErrorBody },
+    Error { body: ErrorBody, flags: Flags },
     StreamEnd,
 }
 
@@ -3909,7 +3909,7 @@ impl PendingTerminal {
     fn into_terminal_frame(self) -> TerminalFrame {
         match self {
             Self::Response { generation, body } => TerminalFrame::Response { generation, body },
-            Self::Error { body } => TerminalFrame::Error { body },
+            Self::Error { body, flags } => TerminalFrame::Error { body, flags },
             Self::StreamEnd => TerminalFrame::StreamEnd,
         }
     }
@@ -3918,7 +3918,7 @@ impl PendingTerminal {
 #[derive(Debug)]
 enum TerminalFrame {
     Response { generation: u64, body: Vec<u8> },
-    Error { body: ErrorBody },
+    Error { body: ErrorBody, flags: Flags },
     StreamEnd,
 }
 
@@ -4175,7 +4175,13 @@ async fn dispatch_frame(shared: &Arc<Shared>, generation: u64, frame: Frame) -> 
                     message: err.to_string(),
                     detail: None,
                 });
-            shared.settle_pending(key, PendingTerminal::Error { body });
+            shared.settle_pending(
+                key,
+                PendingTerminal::Error {
+                    body,
+                    flags: frame.header.flags,
+                },
+            );
         }
         FrameType::StreamEnd => shared.settle_pending(key, PendingTerminal::StreamEnd),
         FrameType::StreamData => shared.route_stream_data(key, frame.body),

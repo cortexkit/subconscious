@@ -499,8 +499,14 @@ async fn refusing_signer_keeps_ckbus_running_unrestarted_and_unavailable() {
     let (_, _, metrics, _) = rows::wait_health(
         &plane.run.connection_file,
         Duration::from_secs(10),
-        "down/Unavailable",
-        |status, _, metrics| status == "Failing" && metrics["class"] == "Unavailable",
+        "down/Unavailable with bootstrap down",
+        // `bootstrap: starting` is also Failing/Unavailable, with no cause yet, so
+        // waiting on the class alone can return before the refusing signer is reached.
+        |status, _, metrics| {
+            status == "Failing"
+                && metrics["class"] == "Unavailable"
+                && metrics["bootstrap"] == "down"
+        },
     )
     .await;
     assert_eq!(metrics["cause"], bootstrap::cause::ROOT_KEY_UNREACHABLE);

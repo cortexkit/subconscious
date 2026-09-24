@@ -18,6 +18,21 @@ struct BudgetRow {
 struct DecisionTables {
     route_open_retryable: std::collections::BTreeMap<String, String>,
     route_close_disposition: std::collections::BTreeMap<String, String>,
+    established_route_dead: RouteDeathTable,
+}
+
+#[derive(Debug, Deserialize)]
+struct RouteDeathTable {
+    daemon_origin: String,
+    phase_2_order: String,
+    rows: Vec<RouteDeathRow>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RouteDeathRow {
+    code: String,
+    daemon_origin: bool,
+    route_dead: bool,
 }
 
 fn golden_path(name: &str) -> PathBuf {
@@ -145,6 +160,37 @@ fn execute_route_open_retryable_decision_table() {
         assert_eq!(
             actual_verdict, expected_verdict,
             "route_open_retryable mismatch for code '{code}': expected {expected_verdict}, classifier produced {actual_verdict}"
+        );
+    }
+}
+
+#[test]
+fn execute_established_route_dead_decision_table() {
+    let content =
+        std::fs::read_to_string(golden_path("decision_tables")).expect("read decision tables");
+    let tables: DecisionTables = serde_json::from_str(&content).expect("parse decision tables");
+    assert_eq!(
+        tables.established_route_dead.daemon_origin,
+        "recorded_not_enforced"
+    );
+    assert_eq!(
+        tables.established_route_dead.phase_2_order,
+        "all_compatible_daemons_landed_and_deployed_before_origin_enforced"
+    );
+    assert!(tables.established_route_dead.rows.len() >= 14);
+    for row in &tables.established_route_dead.rows {
+        let flags = if row.daemon_origin {
+            subc_protocol::Flags::new(false, subc_protocol::Priority::Passive, false)
+                .with_daemon_origin()
+        } else {
+            subc_protocol::Flags::new(false, subc_protocol::Priority::Passive, false)
+        };
+        assert_eq!(
+            subc_protocol::error_codes::is_established_route_dead(flags, &row.code),
+            row.route_dead,
+            "code={} daemon_origin={}",
+            row.code,
+            row.daemon_origin
         );
     }
 }

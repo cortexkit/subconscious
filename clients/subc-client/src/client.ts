@@ -320,6 +320,10 @@ export class SubcError extends Error {
   }
 }
 
+// The wire flags belong to the frame, not the public error API. Keep them with
+// that error across managed-call wrapping so Phase 2 can enforce origin here.
+const errorFrameFlags = new WeakMap<SubcError, number>();
+
 function requireBinaryBody(body: unknown): Uint8Array {
   if (body instanceof Uint8Array) return body;
   const type = body === null ? "null" : Array.isArray(body) ? "array" : typeof body;
@@ -692,7 +696,10 @@ export class SubcClient {
         // request was in flight. The daemon's contract for the code is
         // NOT-FORWARDED — dropped before delivery — so the retry is safe by
         // construction, and the remedy is identical: evict, re-open, resend once.
-        const deadBindCode = err.code === "unknown_channel" || err.code === "stale_route_epoch";
+        const deadBindCode = isEstablishedRouteDead(
+          err.cause instanceof SubcError ? (errorFrameFlags.get(err.cause) ?? 0) : 0,
+          err.code,
+        );
         if (deadBindCode && !retriedUnknownChannel && !this.closeStarted) {
           retriedUnknownChannel = true;
           this.evictRouteHandle(routeHandle);
@@ -1776,7 +1783,9 @@ export class SubcClient {
         message?: string;
         detail?: unknown;
       };
-      return new SubcError(parsed.message ?? "subc error", parsed.code, parsed.detail);
+      const error = new SubcError(parsed.message ?? "subc error", parsed.code, parsed.detail);
+      errorFrameFlags.set(error, frame.header.flags);
+      return error;
     } catch {
       return new SubcError(Buffer.from(frame.body).toString("utf8") || "subc error");
     }
@@ -1938,6 +1947,20 @@ export function isRetryableRouteOpenCode(code: string | undefined): boolean {
     code === "target_unavailable" ||
     code === "module_timeout"
   );
+}
+
+export const UNKNOWN_CHANNEL = "unknown_channel";
+export const STALE_ROUTE_EPOCH = "stale_route_epoch";
+
+/** Whether to evict this route, reopen it, and resend once. A consumer deriving
+ * custody, provider, or suspect verdicts from route death owns its own code list.
+ * Kept byte-identical to subc-protocol error_codes::is_established_route_dead.
+ * The origin bit is recorded but not enforced until every daemon consumers can
+ * meet sets it on these frames (landed and deployed); requiring it sooner would
+ * stop a new SDK from evicting genuine stale routes on older daemons.
+ */
+export function isEstablishedRouteDead(_flags: number, code: string | undefined): boolean {
+  return code === UNKNOWN_CHANNEL || code === STALE_ROUTE_EPOCH;
 }
 
 export async function connectionFileExists(path: string): Promise<boolean> {

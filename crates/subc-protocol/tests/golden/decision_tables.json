@@ -16,6 +16,26 @@
     "target_unavailable": "retryable",
     "unknown_module": "terminal"
   },
+  "established_route_dead": {
+    "daemon_origin": "recorded_not_enforced",
+    "phase_2_order": "all_compatible_daemons_landed_and_deployed_before_origin_enforced",
+    "rows": [
+      { "code": "unknown_channel", "daemon_origin": false, "route_dead": true },
+      { "code": "unknown_channel", "daemon_origin": true, "route_dead": true },
+      { "code": "stale_route_epoch", "daemon_origin": false, "route_dead": true },
+      { "code": "stale_route_epoch", "daemon_origin": true, "route_dead": true },
+      { "code": "module_reloading", "daemon_origin": false, "route_dead": false },
+      { "code": "module_reloading", "daemon_origin": true, "route_dead": false },
+      { "code": "unknown_module", "daemon_origin": false, "route_dead": false },
+      { "code": "unknown_module", "daemon_origin": true, "route_dead": false },
+      { "code": "target_unavailable", "daemon_origin": false, "route_dead": false },
+      { "code": "target_unavailable", "daemon_origin": true, "route_dead": false },
+      { "code": "module_warming", "daemon_origin": false, "route_dead": false },
+      { "code": "module_warming", "daemon_origin": true, "route_dead": false },
+      { "code": "handler_failed", "daemon_origin": false, "route_dead": false },
+      { "code": "handler_failed", "daemon_origin": true, "route_dead": false }
+    ]
+  },
   "route_close_disposition": {
     "capability_denied": "must_not_reopen",
     "crash": "must_not_reopen",

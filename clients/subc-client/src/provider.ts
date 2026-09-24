@@ -3,6 +3,7 @@ import { Buffer } from "node:buffer";
 import { AuthError, authenticateClient } from "./auth.js";
 import {
   DEFAULT_RECONNECT_BACKOFF,
+  isEstablishedRouteDead,
   SUBC_LAUNCH_NONCE_ENV,
   SUBC_MODULE_ID_ENV,
   type BindIdentity,
@@ -1325,7 +1326,7 @@ function providerErrorFromFrame(frame: Frame): SubcProviderError {
     return new SubcProviderError(
       body.message ?? "subc error",
       body.code,
-      body.code === "stale_route_epoch" || body.code === "unknown_channel" ? "not_sent" : "terminal",
+      isEstablishedRouteDead(frame.header.flags, body.code) ? "not_sent" : "terminal",
       body.detail,
     );
   } catch {

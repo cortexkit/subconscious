@@ -576,8 +576,8 @@ Ownership of acts.
   1. Fence against the spawn snapshot's generation.
   2. Advance and fsync `epoch_high_water`.
   3. Generate the nkey in memory and sign the JWT.
-  4. Create the participant's `c_{agent_id}` durables with the foundation's
-     configuration, if absent.
+  4. (Retired by R15: agent durables are created by prefrontal through
+     `ckbus.agent_durable_bind`, not at issuance.)
   5. Write the census key.
   6. Answer `ckbus.credential`.
 
@@ -1417,3 +1417,27 @@ SECTION governs.
   key id and the expiry value are unagreed: the key needs CKCRED and the operator (a
   ceremony like `signing:ck-bus-account:1`), and the expiry is `user-jwt-ttl-unpinned`
   (ALF), with 15 minutes proposed by SUBC. Both gate slice 6 only.
+- R15 (operator, 2026-09-24): agent bus access is account-scoped. A participant's
+  credential names no agents, and its grant may pull from any agent's durable in its box
+  account (`$JS.API.CONSUMER.MSG.NEXT.<inbox stream>.c_*`). The operator accepts that any
+  bus module on the machine can read any agent's queue, as within the machine's existing
+  trust boundary: every participant is a daemon-attested module running as the same
+  user. The rejected alternative listed each process's agents in its credential and
+  reissued it, with a reconnect, on every residence change.
+  Prefrontal owns residence. It creates, removes and merges each agent's durable through
+  three ops on ck-bus's ManagementSurface, accepted only from `reserved:prefrontal-core`
+  (anything else is refused with `ckbus_caller_not_permitted`), with every name taken
+  from the naming crate:
+  - `ckbus.agent_durable_bind {agent_id}` creates `consumer_name(agent_id)` on the inbox
+    stream, filtered to that agent's subject, with every limit explicit, and replies
+    `{durable, stream, filter_subject, created}`. It is idempotent: an existing durable
+    with the same configuration replies `created: false`, and one with a different
+    configuration is refused by name, never replaced.
+  - `ckbus.agent_durable_delete {agent_id}` deletes the durable and its undelivered
+    messages. Deleting an absent durable succeeds.
+  - `ckbus.agent_durable_merge {from, into}` binds `into` if absent, republishes every
+    message still queued for `from` to `into`'s subject, then deletes `from`. Messages
+    accepted before a merge are never lost: today's delivery refuses a merged agent and
+    points senders at the survivor.
+  Issuance step 4 no longer creates `c_{agent_id}` durables; prefrontal's bind does. The
+  membership row keeps rooms only, still gated on `membership-contract-unpinned`.

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.19.1 — 2026-09-24
+
+- Add `SubcConsumer::spawn_snapshot`, the typed `supervisor.spawn_snapshot` call: it returns the
+  daemon's `SpawnSnapshot` (live processes with their spawn generations, and the cursor), and a
+  daemon refusal as `CallError::Module` with its code. `SpawnSnapshot`, `LiveSpawn` and
+  `SpawnCursor` are re-exported from `subc_client_rs::consumer`, so a caller needs no direct
+  `subc-control` dependency.
+
 ## 0.18.7 — 2026-09-24
 
 - Require subc-protocol 0.25.2. Since 0.18.5 this crate calls

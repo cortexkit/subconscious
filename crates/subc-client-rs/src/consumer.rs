@@ -17,6 +17,9 @@ use std::{
 use subc_control::{
     CatalogEntry, ClientControlRequest, ClientControlResponse, ConsumerIdentity, PollKind,
 };
+/// The spawn snapshot types, re-exported so a caller of
+/// [`SubcConsumer::spawn_snapshot`] needs no direct `subc-control` dependency.
+pub use subc_control::{LiveSpawn, SpawnCursor, SpawnSnapshot};
 use subc_protocol::{
     error_codes, manifest::is_valid_capability_identifier, AdmissionClass, BindIdentity, ErrorBody,
     Flags, Frame, FrameBuildError, FrameType, Priority, RouteTarget, SUBC_LAUNCH_NONCE_ENV,
@@ -910,6 +913,57 @@ impl SubcConsumer {
                 Ok(TerminalFrame::Error { body, .. }) => return Err(CallError::Module(body)),
                 Ok(TerminalFrame::StreamEnd) => {
                     return Err(CallError::not_sent("catalog.list returned StreamEnd"));
+                }
+                Err(err)
+                    if is_retryable_catalog_transport_error(&err) && Instant::now() < deadline =>
+                {
+                    continue;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
+    /// Fetch the supervisor's atomic spawn snapshot (`supervisor.spawn_snapshot`)
+    /// over channel 0: the live processes with their spawn generations, and the
+    /// cursor at which they were observed.
+    ///
+    /// A daemon refusal comes back as [`CallError::Module`], so its code is readable
+    /// through [`CallError::code`]. Transport failures are retried until the
+    /// consumer's call deadline, as for [`SubcConsumer::catalog_list`].
+    pub async fn spawn_snapshot(&self) -> Result<SpawnSnapshot, CallError> {
+        let deadline = Instant::now() + self.shared.opts.call_timeout;
+        let body = serde_json::to_vec(&ClientControlRequest::SupervisorSpawnSnapshot {})
+            .map_err(|err| {
+                CallError::not_sent(format!("failed to encode supervisor.spawn_snapshot: {err}"))
+            })?;
+
+        loop {
+            match self
+                .shared
+                .control_call(body.clone(), deadline, false, None)
+                .await
+            {
+                Ok(TerminalFrame::Response { body, .. }) => {
+                    let response =
+                        serde_json::from_slice::<ClientControlResponse>(&body).map_err(|err| {
+                            CallError::not_sent(format!(
+                                "failed to decode supervisor.spawn_snapshot response: {err}"
+                            ))
+                        })?;
+                    let ClientControlResponse::SupervisorSpawnSnapshot { snapshot } = response
+                    else {
+                        return Err(CallError::not_sent(
+                            "supervisor.spawn_snapshot returned an unexpected control response",
+                        ));
+                    };
+                    return Ok(snapshot);
+                }
+                Ok(TerminalFrame::Error { body, .. }) => return Err(CallError::Module(body)),
+                Ok(TerminalFrame::StreamEnd) => {
+                    return Err(CallError::not_sent(
+                        "supervisor.spawn_snapshot returned StreamEnd",
+                    ));
                 }
                 Err(err)
                     if is_retryable_catalog_transport_error(&err) && Instant::now() < deadline =>
@@ -6636,6 +6690,92 @@ mod tests {
         let catalog = request.await.unwrap().unwrap();
         assert_eq!(catalog.generation, 9);
         assert!(catalog.modules.is_empty());
+    }
+
+    #[tokio::test]
+    async fn spawn_snapshot_sends_a_channel_zero_request_and_returns_the_snapshot() {
+        let shared = Arc::new(Shared::new(
+            PathBuf::from("/tmp/does-not-exist"),
+            ConsumerOptions::default(),
+        ));
+        let (writer, mut rx) = mpsc::channel(1);
+        shared.lock_inner().writer = Some(writer);
+
+        let consumer = SubcConsumer {
+            shared: Arc::clone(&shared),
+        };
+        let request = tokio::spawn(async move { consumer.spawn_snapshot().await });
+        let command = rx
+            .recv()
+            .await
+            .expect("supervisor.spawn_snapshot must queue a channel-0 request");
+        assert_eq!(command.frame.header.channel, 0);
+        let body: serde_json::Value = serde_json::from_slice(&command.frame.body).unwrap();
+        assert_eq!(body["op"], "supervisor.spawn_snapshot");
+
+        let snapshot = SpawnSnapshot {
+            cursor: SpawnCursor {
+                daemon_incarnation: "incarnation-a".to_string(),
+                seq: 41,
+            },
+            ring_bound: 256,
+            live: vec![LiveSpawn {
+                module_id: "participant".to_string(),
+                spawn_generation: 3,
+                pid: 4242,
+                spawned_at_ms: 1_700_000_000_000,
+            }],
+        };
+        let response = serde_json::to_vec(&ClientControlResponse::SupervisorSpawnSnapshot {
+            snapshot: snapshot.clone(),
+        })
+        .unwrap();
+        assert!(
+            dispatch_frame(
+                &shared,
+                1,
+                response_frame(0, 0, command.frame.header.corr, response),
+            )
+            .await
+        );
+        assert_eq!(request.await.unwrap().unwrap(), snapshot);
+    }
+
+    #[tokio::test]
+    async fn spawn_snapshot_refusal_keeps_the_daemon_code() {
+        let shared = Arc::new(Shared::new(
+            PathBuf::from("/tmp/does-not-exist"),
+            ConsumerOptions::default(),
+        ));
+        let (writer, mut rx) = mpsc::channel(1);
+        shared.lock_inner().writer = Some(writer);
+
+        let consumer = SubcConsumer {
+            shared: Arc::clone(&shared),
+        };
+        let request = tokio::spawn(async move { consumer.spawn_snapshot().await });
+        let command = rx
+            .recv()
+            .await
+            .expect("supervisor.spawn_snapshot must queue a channel-0 request");
+        let refusal = serde_json::to_vec(&ErrorBody {
+            code: "op_not_permitted".to_string(),
+            message: "refused by the test".to_string(),
+            detail: None,
+        })
+        .unwrap();
+        let frame = Frame::build(
+            FrameType::Error,
+            Flags::new(false, Priority::Interactive, false),
+            0,
+            0,
+            command.frame.header.corr,
+            refusal,
+        )
+        .unwrap();
+        assert!(dispatch_frame(&shared, 1, frame).await);
+        let error = request.await.unwrap().unwrap_err();
+        assert_eq!(error.code(), Some("op_not_permitted"));
     }
 
     #[tokio::test]

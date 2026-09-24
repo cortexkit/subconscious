@@ -1189,14 +1189,36 @@ impl ControlHandler {
         ctx: &RouteCtx,
         frame: &Frame,
         target_module_id: &str,
+        in_flight: usize,
         limit: usize,
     ) -> Result<Frame, RouterError> {
         self.route_open_admission_refusal_frame(
             ctx,
             frame,
             target_module_id,
+            "open_admission_full",
+            (in_flight, limit),
             format!(
-                "connection already has {limit} route.open binds in flight; retry after one settles"
+                "connection already has {in_flight} route.open binds in flight (limit {limit}); retry after one settles"
+            ),
+        )
+    }
+
+    fn route_open_target_capacity_refusal(
+        &self,
+        ctx: &RouteCtx,
+        frame: &Frame,
+        target_module_id: &str,
+        in_flight: usize,
+    ) -> Result<Frame, RouterError> {
+        self.route_open_admission_refusal_frame(
+            ctx,
+            frame,
+            target_module_id,
+            "target_binds_full",
+            (in_flight, MAX_PENDING_ROUTE_BINDS_PER_TARGET),
+            format!(
+                "module_id '{target_module_id}' already has {in_flight} route.bind relays in flight; retry after one settles"
             ),
         )
     }
@@ -1213,16 +1235,23 @@ impl ControlHandler {
         ctx: &RouteCtx,
         frame: &Frame,
         target_module_id: &str,
+        reason: &'static str,
+        (in_flight, limit): (usize, usize),
         message: impl Into<String>,
     ) -> Result<Frame, RouterError> {
-        self.route_open_refusal_frame(
-            ctx,
-            frame,
-            target_module_id,
-            "open_admission_full",
-            error_codes::TARGET_UNAVAILABLE,
-            message,
-        )
+        let code = error_codes::TARGET_UNAVAILABLE;
+        self.counters.increment_route_open_refused(code);
+        info!(
+            target: "control",
+            code,
+            reason,
+            module_id = ?target_module_id,
+            connection_id = ctx.connection_id.get(),
+            in_flight,
+            limit,
+            "route.open refused"
+        );
+        control_error_frame(frame, code, message.into())
     }
 
     /// Test-only compatibility entry point for unit control handling that does not have a socket sink.
@@ -2354,7 +2383,8 @@ impl ControlHandler {
         )?))
     }
 
-    /// Every refusal of a `route.open` goes through here so the daemon can
+    /// Ordinary `route.open` refusals go through here; admission and breaker
+    /// refusals log separately with their capacity or breaker state. The daemon can
     /// attest which code it sent: without the event, a client's "the daemon
     /// refused me" and the daemon's own view could only be reconciled by
     /// argument. Malformed input (`invalid_project_root`) does not come here;
@@ -2944,13 +2974,11 @@ impl ControlHandler {
         {
             Ok(guard) => guard,
             Err(in_flight) => {
-                return Ok(vec![self.route_open_admission_refusal_frame(
+                return Ok(vec![self.route_open_target_capacity_refusal(
                     ctx,
                     &frame,
                     &target_module_id,
-                    format!(
-                        "module_id '{target_module_id}' already has {in_flight} route.bind relays in flight; retry after one settles"
-                    ),
+                    in_flight,
                 )?]);
             }
         };
@@ -8563,9 +8591,82 @@ mod tests {
             .contains("state=running, enabled=true, live=false"));
     }
 
+    #[test]
+    fn route_open_connection_cap_logs_admission_reason_and_capacity() {
+        let handler = ControlHandler::new(Arc::new(Registry::default()));
+        let capture = EventCapture::default();
+        let _subscriber =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(capture.clone()));
+        let (ctx, _rx) = route_ctx(ConnectionId::new(96));
+        let limit = crate::server::MAX_PENDING_ROUTE_OPENS_PER_CONNECTION;
+        let pending = (0..limit).collect::<Vec<_>>();
+        let response = handler
+            .route_open_capacity_refusal(
+                &ctx,
+                &route_open_frame(396, "busy", unique_project_root("connection-cap")),
+                "busy",
+                pending.len(),
+                limit,
+            )
+            .unwrap();
+        assert_eq!(parse_error(&response)["code"], "target_unavailable");
+        let event = capture
+            .events()
+            .into_iter()
+            .find(|event| {
+                event.target == "control"
+                    && event.fields.get("reason") == Some(&"\"open_admission_full\"".to_string())
+            })
+            .expect("connection admission refusal event");
+        assert_eq!(event.fields.get("in_flight"), Some(&limit.to_string()));
+        assert_eq!(event.fields.get("limit"), Some(&limit.to_string()));
+    }
+
+    #[test]
+    fn route_open_target_cap_logs_admission_reason_and_capacity() {
+        let handler = ControlHandler::new(Arc::new(Registry::default()));
+        let capture = EventCapture::default();
+        let _subscriber =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(capture.clone()));
+        let (ctx, _rx) = route_ctx(ConnectionId::new(97));
+        let limit = MAX_PENDING_ROUTE_BINDS_PER_TARGET;
+        let guards = (0..limit)
+            .map(|_| {
+                handler
+                    .route_bind_concurrency
+                    .try_admit("busy", limit)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let in_flight = match handler.route_bind_concurrency.try_admit("busy", limit) {
+            Err(in_flight) => in_flight,
+            Ok(_) => panic!("target cap must refuse after {limit} admissions"),
+        };
+        let response = handler
+            .route_open_target_capacity_refusal(
+                &ctx,
+                &route_open_frame(397, "busy", unique_project_root("target-cap")),
+                "busy",
+                in_flight,
+            )
+            .unwrap();
+        assert_eq!(parse_error(&response)["code"], "target_unavailable");
+        let event = capture
+            .events()
+            .into_iter()
+            .find(|event| {
+                event.target == "control"
+                    && event.fields.get("reason") == Some(&"\"target_binds_full\"".to_string())
+            })
+            .expect("target admission refusal event");
+        assert_eq!(event.fields.get("in_flight"), Some(&limit.to_string()));
+        assert_eq!(event.fields.get("limit"), Some(&limit.to_string()));
+        drop(guards);
+    }
+
     /// One wire code has several senders, so the refusal line names the check
-    /// that refused. This drives the shared refusal path (every non-supervised
-    /// refusal goes through `route_open_refusal_frame`) with an unregistered
+    /// that refused. This drives the shared refusal path for ordinary refusals
+    /// with an unregistered
     /// target and requires the branch label on the event.
     #[tokio::test]
     async fn route_open_refusal_names_the_check_that_refused() {

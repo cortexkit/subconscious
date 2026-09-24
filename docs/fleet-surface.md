@@ -58,6 +58,9 @@ The bound exists because declared values are module-controlled and reach operato
 terminals, so the daemon limits their size and character set at its boundary.
 `supervisor.provenance {}` reads the whole box;
 `supervisor.provenance { module_id }` reads one module.
+A consumer's own documentation about which subc version it runs is not provenance;
+the `supervisor.provenance` declaration is. See rows 557 and 558 of
+`docs/hunting-loop-briefing.md` on present-tense claims about path dependencies.
 
 On Linux, running-image evidence is SHA-256 over open handles for `/proc/<pid>/exe`
 and the captured spawn path. On macOS it is a spawn-inode comparison only, weaker

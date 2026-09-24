@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.18.7 — 2026-09-24
+
+- Require subc-protocol 0.25.2. Since 0.18.5 this crate calls
+  `error_codes::is_established_route_dead`, which first appears in 0.25.2, but it still accepted
+  0.25.0, so a consumer locked at 0.25.0 or 0.25.1 got a compile error instead of an upgrade.
+
 ## 0.18.6 — 2026-09-24
 
 - `open_route_with_admission_facts` (and its `_and_options` form) now keeps the daemon's refusal

@@ -94,6 +94,9 @@ const SUBC_CONNECTION_LOST_CODE: &str = "subc_connection_lost";
 /// Code carried by an MCP error for a request refused before it was sent
 /// because no daemon connection was available for it.
 const SUBC_CONNECTION_UNAVAILABLE_CODE: &str = "subc_connection_unavailable";
+/// Reason health.check gives, in its detail and metrics, while the module has
+/// no live relay connection.
+const RELAY_DISCONNECTED_REASON: &str = "relay_disconnected";
 const SUBC_RECONNECT_BACKOFF_INITIAL: Duration = Duration::from_millis(50);
 const SUBC_RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(2);
 const SUBC_EVENT_BUFFER: usize = 64;
@@ -1442,6 +1445,15 @@ impl SubcConnection {
     }
 }
 
+/// The current relay outage, for health reporting: when the connection ended
+/// and how many reconnects have been tried since. Reset once a replacement
+/// connection is live.
+#[derive(Debug, Default)]
+struct RelayOutage {
+    down_since: Option<time::Instant>,
+    reconnect_attempts: u64,
+}
+
 /// A request that never left this process because the daemon connection it
 /// was meant for had ended. Repeating it cannot repeat a side effect.
 #[derive(Debug)]
@@ -1471,6 +1483,7 @@ impl std::error::Error for RelayNotSent {}
 #[derive(Clone)]
 struct SubcClient {
     current: Arc<watch::Sender<Arc<SubcConnection>>>,
+    outage: Arc<std::sync::Mutex<RelayOutage>>,
     events: broadcast::Sender<SubcEvent>,
     last_corr: Arc<AtomicU64>,
     catalog_poller_started: Arc<AtomicBool>,
@@ -1510,6 +1523,7 @@ impl SubcClient {
     ) -> Self {
         Self {
             current: Arc::new(watch::Sender::new(connection)),
+            outage: Arc::new(std::sync::Mutex::new(RelayOutage::default())),
             events,
             last_corr: Arc::new(AtomicU64::new(0)),
             catalog_poller_started: Arc::new(AtomicBool::new(false)),
@@ -1518,6 +1532,54 @@ impl SubcClient {
 
     fn connection(&self) -> Arc<SubcConnection> {
         Arc::clone(&self.current.borrow())
+    }
+
+    fn outage(&self) -> std::sync::MutexGuard<'_, RelayOutage> {
+        self.outage.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("recovering from poisoned relay outage lock");
+            poisoned.into_inner()
+        })
+    }
+
+    /// The module's answer to the supervisor's health.check.
+    ///
+    /// While there is no live relay connection the module cannot relay a
+    /// single tool call, so it must not report itself healthy. It reports
+    /// degraded rather than failing: the process is fine and is reconnecting.
+    async fn health_report(&self) -> HealthReport {
+        let connection = self.connection();
+        let mut metrics = connection.relay.health_metrics().await;
+        let (down_for, attempts) = {
+            let outage = self.outage();
+            (
+                outage.down_since.map(|since| since.elapsed()),
+                outage.reconnect_attempts,
+            )
+        };
+        let connected = !connection.is_closed();
+        metrics["relay_connected"] = serde_json::Value::Bool(connected);
+        if connected {
+            return HealthReport {
+                status: HealthStatus::Ok,
+                detail: None,
+                metrics: Some(metrics),
+            };
+        }
+        // The reader marks the connection closed an instant before the
+        // reconnect task records the outage, so a missing start reads as zero.
+        let down_ms = down_for.map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+        });
+        metrics["degraded_reason"] = serde_json::Value::from(RELAY_DISCONNECTED_REASON);
+        metrics["relay_down_ms"] = serde_json::Value::from(down_ms);
+        metrics["relay_reconnect_attempts"] = serde_json::Value::from(attempts);
+        HealthReport {
+            status: HealthStatus::Degraded,
+            detail: Some(format!(
+                "{RELAY_DISCONNECTED_REASON}: the tool-call relay connection to the daemon has been down for {down_ms} ms ({attempts} reconnect attempts so far); no tool call can be relayed until it reconnects"
+            )),
+            metrics: Some(metrics),
+        }
     }
 
     fn connection_token(&self) -> u64 {
@@ -1759,9 +1821,14 @@ async fn maintain_subc_connection(
         let dead = client.connection();
         let _ = dead.writer_shutdown.send(true);
         tracing::warn!("subc relay connection ended; reconnecting");
+        *client.outage() = RelayOutage {
+            down_since: Some(time::Instant::now()),
+            reconnect_attempts: 0,
+        };
 
         let mut backoff = SUBC_RECONNECT_BACKOFF_INITIAL;
         let stream = loop {
+            client.outage().reconnect_attempts += 1;
             match connect_authenticated(&connection_file_path).await {
                 Ok(stream) => break stream,
                 Err(error) => {
@@ -1774,6 +1841,7 @@ async fn maintain_subc_connection(
         let (connection, next_reader) =
             SubcConnection::start(stream, client.events.clone(), Some(&dead.relay));
         client.current.send_replace(connection);
+        *client.outage() = RelayOutage::default();
         tracing::info!("subc relay connection re-established");
         let _ = client.events.send(SubcEvent::Reconnected);
         reader = next_reader;
@@ -2095,10 +2163,7 @@ async fn supervision_control_loop(
             return Ok(());
         };
 
-        // The relay connection may have been replaced since the last frame;
-        // health metrics come from whichever relay is current.
-        let relay = subc.relay();
-        let Some(reply) = handle_supervision_control_frame(&frame, &relay).await? else {
+        let Some(reply) = handle_supervision_control_frame(&frame, &subc).await? else {
             return Ok(());
         };
         write_frame(&mut stream, &reply).await.map_err(|source| {
@@ -2116,7 +2181,7 @@ async fn supervision_control_loop(
 
 async fn handle_supervision_control_frame(
     frame: &SubcFrame,
-    relay: &ReverseRelay,
+    subc: &SubcClient,
 ) -> Result<Option<SubcFrame>> {
     if frame.header.ty == FrameType::Goodbye && frame.header.channel == 0 {
         return Ok(None);
@@ -2144,11 +2209,7 @@ async fn handle_supervision_control_frame(
 
     match request {
         ModuleControlRequest::HealthCheck {} => {
-            let report = HealthReport {
-                status: HealthStatus::Ok,
-                detail: None,
-                metrics: Some(relay.health_metrics().await),
-            };
+            let report = subc.health_report().await;
             let body =
                 serde_json::to_vec(&ModuleControlResponse::from(report)).map_err(|source| {
                     other_error(format!("failed to encode health.check response: {source}"))

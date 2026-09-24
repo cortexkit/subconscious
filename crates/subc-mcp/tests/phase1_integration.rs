@@ -1350,6 +1350,10 @@ async fn mcp_reverse_elicitation_ttl_expires_one_pending_without_disturbing_anot
 struct RelayProxy {
     connection_file_path: PathBuf,
     connections: Arc<std::sync::Mutex<Vec<JoinHandle<()>>>>,
+    /// While set, new connections are accepted and closed at once, so the
+    /// module's reconnect attempts fail as they would against a daemon that
+    /// is not back yet.
+    refusing: Arc<std::sync::atomic::AtomicBool>,
     accept_task: JoinHandle<()>,
 }
 
@@ -1364,11 +1368,17 @@ impl RelayProxy {
 
         let connections = Arc::new(std::sync::Mutex::new(Vec::new()));
         let accepted = Arc::clone(&connections);
+        let refusing = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let refuse = Arc::clone(&refusing);
         let accept_task = tokio::spawn(async move {
             loop {
                 let Ok((mut inbound, _)) = listener.accept().await else {
                     return;
                 };
+                if refuse.load(Ordering::SeqCst) {
+                    drop(inbound);
+                    continue;
+                }
                 let pump = tokio::spawn(async move {
                     let Ok(mut outbound) =
                         TcpStream::connect((Ipv4Addr::LOCALHOST, daemon_port)).await
@@ -1383,8 +1393,13 @@ impl RelayProxy {
         Self {
             connection_file_path,
             connections,
+            refusing,
             accept_task,
         }
+    }
+
+    fn set_refusing(&self, refusing: bool) {
+        self.refusing.store(refusing, Ordering::SeqCst);
     }
 
     fn connection_count(&self) -> usize {
@@ -3018,6 +3033,89 @@ async fn mcp_relay_connection_closed_by_daemon_reconnects_and_serves_next_call()
         harness.module.try_wait().unwrap().is_none(),
         "subc-mcp must keep running across a relay reconnect"
     );
+
+    harness.shutdown().await;
+}
+
+/// Asks the daemon to health-probe the harness's subc-mcp module over its
+/// supervision connection.
+async fn probe_mcp_module_health(
+    harness: &McpHarness,
+    corr: u64,
+) -> (ControlHealthStatus, Option<String>, Value) {
+    let mut client =
+        wait_for_control_client(&harness.server.daemon.connection_file_path, SETUP_TIMEOUT).await;
+    match control_rpc_on_stream(
+        &mut client,
+        corr,
+        ClientControlRequest::SupervisorHealthProbe {
+            module_id: TEST_MCP_MODULE_ID.to_owned(),
+        },
+    )
+    .await
+    {
+        ClientControlResponse::SupervisorHealthProbe {
+            status,
+            detail,
+            metrics,
+            ..
+        } => (status, detail, metrics.unwrap_or(Value::Null)),
+        other => panic!("unexpected supervisor.health_probe response: {other:?}"),
+    }
+}
+
+/// A module with no live relay connection cannot relay a single tool call, so
+/// health.check must not call it healthy: it reports degraded (the process is
+/// fine and reconnecting) with the reason, how long the relay has been down
+/// and how many reconnects were tried, and reports Ok again once reconnected.
+#[tokio::test]
+async fn mcp_health_is_degraded_while_the_relay_is_down_and_ok_once_reconnected() {
+    let harness =
+        McpHarness::start_proxied("mcp-relay-health", vec![StubProvider::new("fake-aft", &[])])
+            .await;
+    let (status, _, metrics) = probe_mcp_module_health(&harness, 5_001).await;
+    assert_eq!(status, ControlHealthStatus::Ok, "{metrics:?}");
+
+    harness.proxy().set_refusing(true);
+    harness.proxy().cut(PROXIED_RELAY_CONNECTION);
+    let deadline = Instant::now() + READ_TIMEOUT;
+    let mut corr = 5_002;
+    let (detail, metrics) = loop {
+        let (status, detail, metrics) = probe_mcp_module_health(&harness, corr).await;
+        corr += 1;
+        let attempts = metrics["relay_reconnect_attempts"].as_u64().unwrap_or(0);
+        if status == ControlHealthStatus::Degraded && attempts >= 2 {
+            break (detail, metrics);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "health never reported the relay outage: status={status:?} detail={detail:?} metrics={metrics:?}"
+        );
+        sleep(Duration::from_millis(50)).await;
+    };
+    let detail = detail.expect("degraded health must say why");
+    assert!(detail.contains("relay_disconnected"), "{detail}");
+    assert_eq!(metrics["degraded_reason"], json!("relay_disconnected"));
+    assert_eq!(metrics["relay_connected"], json!(false));
+    assert!(metrics["relay_down_ms"].as_u64().is_some(), "{metrics:?}");
+
+    harness.proxy().set_refusing(false);
+    let deadline = Instant::now() + READ_TIMEOUT;
+    loop {
+        let (status, detail, metrics) = probe_mcp_module_health(&harness, corr).await;
+        corr += 1;
+        if status == ControlHealthStatus::Ok {
+            assert_eq!(detail, None);
+            assert_eq!(metrics["relay_connected"], json!(true));
+            assert!(metrics.get("degraded_reason").is_none(), "{metrics:?}");
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "health stayed {status:?} after the relay could reconnect: {detail:?}"
+        );
+        sleep(Duration::from_millis(50)).await;
+    }
 
     harness.shutdown().await;
 }

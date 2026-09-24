@@ -74,9 +74,22 @@ async fn a1_supervised_server_lifecycle() {
     let terminal = support::new_terminal(&run, support::SERVER, prior + 1).await;
     clean_inside(&terminal, before_teardown, budget, "teardown");
 
-    for (id, expected) in [
-        ("standin-none", ModuleProtocol::None),
-        ("standin-default-protocol", ModuleProtocol::Subc),
+    // Three stand-ins, none of which ever registers, so no drain can reach any
+    // of them over a connection and the supervisor asks each by SIGTERM:
+    //
+    // * `standin-none` and `standin-default-protocol` are one script that exits
+    //   0 on SIGTERM, declared `protocol: "none"` and subc-by-omission. Both
+    //   must stop cleanly inside the budget: a subc module that has not (or
+    //   never) registered was told nothing either, and waiting out the budget
+    //   for it would only put a SIGKILL behind a delay.
+    // * `standin-ignores-term` ignores SIGTERM. It is the negative control: it
+    //   must be SIGKILLed at or after its budget. The two clean arms can only
+    //   catch a daemon that kills at the deadline if the harness can see such
+    //   a kill at all; this arm proves that it can.
+    for (id, expected, clean) in [
+        ("standin-none", ModuleProtocol::None, true),
+        ("standin-default-protocol", ModuleProtocol::Subc, true),
+        ("standin-ignores-term", ModuleProtocol::None, false),
     ] {
         support::enable(&run, id).await;
         let entry = support::wait_running(&run, id).await;
@@ -86,6 +99,12 @@ async fn a1_supervised_server_lifecycle() {
                 !entry.live && entry.last_probe_ms.is_none(),
                 "unregistered stand-in must run without registration or probe: {entry:?}"
             );
+        }
+        if !clean {
+            // The control's SIGTERM trap must be in place before teardown, or
+            // the signal's default disposition ends it and the kill this arm
+            // exists to observe never happens.
+            support::wait_for_file(&run.root.join(format!("run/{id}.ready"))).await;
         }
         let budget = support::budget(&entry);
         let prior = support::terminals(&run, id).await.len();
@@ -109,17 +128,24 @@ async fn a1_supervised_server_lifecycle() {
         let terminal = support::new_terminal(&run, id, prior).await;
         let elapsed = support::elapsed(&terminal, start);
         eprintln!("A1 {id} teardown elapsed={elapsed}ms budget={budget}ms record={terminal:?}");
-        // Both stand-ins end the same way. Neither has a registered connection
-        // for the drain to tell it over, so the supervisor asks by SIGTERM
-        // whatever the declared protocol: a subc module that has not (or never)
-        // registered was told nothing either, and waiting out the budget for it
-        // only put a SIGKILL behind a delay.
-        assert!(elapsed < budget, "{id} SIGTERM must finish inside budget");
-        assert!(
-            terminal.exit_code == Some(0) || terminal.exit_signal == Some(15),
-            "{id} must stop cleanly: {terminal:?}"
-        );
-        assert_ne!(terminal.exit_signal, Some(9), "{id} must not be SIGKILLed");
+        if clean {
+            assert!(elapsed < budget, "{id} SIGTERM must finish inside budget");
+            assert!(
+                terminal.exit_code == Some(0) || terminal.exit_signal == Some(15),
+                "{id} must stop cleanly: {terminal:?}"
+            );
+            assert_ne!(terminal.exit_signal, Some(9), "{id} must not be SIGKILLed");
+        } else {
+            assert!(
+                elapsed >= budget,
+                "{id} ignores SIGTERM, so it must outlive its budget"
+            );
+            assert_eq!(
+                terminal.exit_signal,
+                Some(9),
+                "{id} must be SIGKILLed once its budget runs out: {terminal:?}"
+            );
+        }
     }
     run.shutdown().await;
     assert_eq!(

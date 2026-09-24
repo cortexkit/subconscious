@@ -37,6 +37,14 @@
       "enabled": false,
       "drain_timeout_ms": 2000
     },
+    // Negative control: ignores SIGTERM, so it must be killed at its (short) budget.
+    "standin-ignores-term": {
+      "program": "crates/ck-bus/tests/support/standin_ignores_term.sh",
+      "args": ["standin-ignores-term-final-argument"],
+      "enabled": false,
+      "protocol": "none",
+      "drain_timeout_ms": 500
+    },
     "claustrum": {
       "program": "__CK_BUS_BIN__",
       "args": [],

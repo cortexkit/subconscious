@@ -55,22 +55,46 @@ pub fn declared_args(id: &str) -> Vec<String> {
     args
 }
 
+/// Every stand-in A1 tears down. The first two share one script under two
+/// declarations; the third is the negative control that ignores SIGTERM.
+pub const STANDINS: [&str; 3] = [
+    "standin-none",
+    "standin-default-protocol",
+    "standin-ignores-term",
+];
+
 pub fn standin_preconditions() {
     use std::os::unix::fs::PermissionsExt;
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/support/standin_child.sh");
-    assert!(
-        path.is_file(),
-        "stand-in script must exist: {}",
-        path.display()
-    );
-    assert_ne!(
-        fs::metadata(path).unwrap().permissions().mode() & 0o111,
-        0,
-        "stand-in must be executable"
-    );
-    for id in ["standin-none", "standin-default-protocol"] {
+    for id in STANDINS {
+        let path = standin_program(id);
+        assert!(
+            path.is_file(),
+            "stand-in script for {id} must exist: {}",
+            path.display()
+        );
+        assert_ne!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o111,
+            0,
+            "stand-in for {id} must be executable"
+        );
         declared_args(id);
     }
+}
+
+/// The stand-in script a fixture block declares, resolved under this crate's
+/// `tests/support`. The fixture names it relative to the workspace root, which
+/// is not the directory the in-process daemon runs from.
+fn standin_program(id: &str) -> std::path::PathBuf {
+    let value = crate::harness::config::template_value();
+    let declared = value["modules"][id]["program"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{id} must declare a program"));
+    let file_name = Path::new(declared)
+        .file_name()
+        .unwrap_or_else(|| panic!("{id} program {declared} has no file name"));
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/support")
+        .join(file_name)
 }
 
 pub async fn enable(run: &AcceptanceRun, id: &str) {
@@ -95,11 +119,7 @@ pub async fn enable(run: &AcceptanceRun, id: &str) {
             .expect("nats-server path must be UTF-8")
             .into();
     } else {
-        block["program"] = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/support/standin_child.sh")
-            .to_str()
-            .unwrap()
-            .into();
+        block["program"] = standin_program(id).to_str().unwrap().into();
     }
     block["enabled"] = true.into();
     // The acceptance daemon is in-process; child-specific homes belong on its module declaration.
@@ -233,6 +253,20 @@ pub async fn new_terminal(run: &AcceptanceRun, id: &str, prior: usize) -> Termin
             return records[prior].clone();
         }
         assert!(Instant::now() < deadline, "no terminal record for {id}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Wait for a stand-in's readiness file, written once its signal handling is
+/// installed.
+pub async fn wait_for_file(path: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !path.is_file() {
+        assert!(
+            Instant::now() < deadline,
+            "{} never appeared",
+            path.display()
+        );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }

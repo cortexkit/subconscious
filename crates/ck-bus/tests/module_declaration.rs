@@ -136,6 +136,7 @@ fn fixture_declares_all_slice_owned_module_blocks_and_no_shipped_sentinel_overri
         "nats-server",
         "standin-none",
         "standin-default-protocol",
+        "standin-ignores-term",
         "claustrum",
         "callosum",
     ] {
@@ -151,6 +152,15 @@ fn fixture_declares_all_slice_owned_module_blocks_and_no_shipped_sentinel_overri
     assert_eq!(
         modules["standin-none"]["protocol"], "none",
         "observable explicit stand-in protocol must be none"
+    );
+    assert_eq!(
+        modules["standin-ignores-term"]["protocol"], "none",
+        "observable SIGTERM-ignoring control stand-in protocol must be none"
+    );
+    assert_eq!(
+        modules["standin-ignores-term"]["program"],
+        "crates/ck-bus/tests/support/standin_ignores_term.sh",
+        "observable control stand-in program path must name its support script"
     );
     assert!(
         modules["standin-default-protocol"]

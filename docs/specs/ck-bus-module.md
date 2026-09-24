@@ -979,12 +979,18 @@ Row contents.
   - On teardown and restart the server records one terminal record strictly inside the
     budget, with a clean stop (`exit_code == Some(0)` or `exit_signal == Some(15)`),
     never `Some(9)` and never at or past the budget.
-  - Controls (R8) use the one argv-ignoring, never-registering stand-in at
-    `tests/support/standin_child.sh`, under both declaration states. (a) With
-    `protocol: "none"`, SIGTERM arrives at drain start and the record lands inside the
-    budget. (b) With the key omitted, the stand-in is a Subc module handed `--subc` it
-    ignores. Nothing asks it to stop, so the record is `exit_signal == Some(9)` at or
-    past the budget, with `supervisor.list` showing running and `live: false` first.
+  - Controls (R8) are three argv-ignoring, never-registering stand-ins under
+    `tests/support/`. None registers, so the supervisor asks each by SIGTERM at drain
+    start whatever its declared protocol (#125). (a) `standin-none`
+    (`standin_child.sh`, `protocol: "none"`): a clean stop strictly inside the budget.
+    (b) `standin-default-protocol` (the same script with the key omitted, so a Subc
+    module handed `--subc` it ignores, shown running and `live: false` first): the same
+    clean stop, proving an unregistered subc module is signalled rather than killed at
+    the deadline. (c) `standin-ignores-term` (`standin_ignores_term.sh`, `protocol:
+    "none"`, a short budget, torn down only after its ready file shows the trap is
+    installed): the negative control, `exit_signal == Some(9)` at or past its budget,
+    proving the harness can see a kill at the deadline. Each stand-in's elapsed time is
+    printed beside its budget.
   - No real `nats-server` is declared with the key removed; that would measure the
     unknown-flag error. Off unix the row records `a1-signal-unix-only` and asserts
     nothing.
@@ -1352,8 +1358,10 @@ SECTION governs.
   `daemon_observed.pid`, by the three-outcome rule.
 - R7: the argv read is `ps -ww -o args= -p <pid>`. Unix scope is Linux and macOS, and
   `a1-signal-unix-only` records Windows.
-- R8: the A1 control is the argv-ignoring, never-registering stand-in under both
-  declaration states.
+- R8: the A1 controls are three argv-ignoring, never-registering stand-ins: under
+  `protocol: "none"`, under the default protocol, and a SIGTERM-ignoring one as the
+  negative control (amended for #125, when an unregistered subc module began being
+  signalled at drain start).
 - R9: WITHDRAWN in r2. The root-record lookup and mint-on-absence rule has no subject
   under design D, because roots are ceremony keys and ck-bus mints nothing in the vault.
 - R10: the route targets in acceptance are the real ids `claustrum` and `callosum`,

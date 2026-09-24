@@ -73,7 +73,10 @@ use std::{
 use async_nats::ConnectErrorKind;
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use bootstrap::plane::{BoxPlane, Broker, CensusRecord, DurableConsumer, NatsBroker, PlaneError};
+use bootstrap::plane::{
+    BoxPlane, Broker, CensusRecord, ConnectionEvent, DurableConsumer, NatsBroker, PlaneError,
+    SystemPlane,
+};
 use cortexkit_bus_naming::{AccountNames, Operation, StreamSpec};
 use credentials::{
     issue::{sign_user_jwt, UserJwtRequest},
@@ -1265,6 +1268,186 @@ async fn a_killed_ckbus_restarts_and_revokes_the_superseded_user_it_finds_in_the
     passed();
     run.server.stop().await;
     run.run.shutdown().await;
+}
+
+/// A system plane holding one stored account JWT, recording every update. Nothing in
+/// the foreign-claim arm lists accounts, kicks or watches, so those calls fail loudly.
+struct StoredAccount {
+    jwt: Mutex<String>,
+    updates: Mutex<Vec<String>>,
+}
+
+#[async_trait]
+impl SystemPlane for StoredAccount {
+    async fn list_accounts(&self) -> Result<Vec<String>, PlaneError> {
+        Err(PlaneError::new("StoredAccount serves no claims list"))
+    }
+    async fn lookup(&self, _account_public: &str) -> Result<Option<String>, PlaneError> {
+        Ok(Some(self.jwt.lock().unwrap().clone()))
+    }
+    async fn update(&self, jwt: &str) -> Result<(), PlaneError> {
+        self.updates.lock().unwrap().push(jwt.to_string());
+        *self.jwt.lock().unwrap() = jwt.to_string();
+        Ok(())
+    }
+    async fn kick(&self, _server_id: &str, _client_id: u64) -> Result<(), PlaneError> {
+        Err(PlaneError::new("StoredAccount serves no kick"))
+    }
+    async fn watch_connections(
+        &self,
+        _account_public: &str,
+    ) -> Result<tokio::sync::mpsc::UnboundedReceiver<ConnectionEvent>, PlaneError> {
+        Err(PlaneError::new("StoredAccount serves no connection events"))
+    }
+}
+
+/// A box plane whose census holds nothing; every other call fails loudly.
+struct EmptyCensus;
+
+#[async_trait]
+impl BoxPlane for EmptyCensus {
+    async fn ensure_census(&self, _account: &AccountNames) -> Result<(), PlaneError> {
+        Err(PlaneError::new("EmptyCensus creates nothing"))
+    }
+    async fn ensure_stream(&self, _spec: &StreamSpec) -> Result<(), PlaneError> {
+        Err(PlaneError::new("EmptyCensus creates nothing"))
+    }
+    async fn publish(&self, _subject: &str, _payload: Vec<u8>) -> Result<(), PlaneError> {
+        Err(PlaneError::new("EmptyCensus publishes nothing"))
+    }
+    async fn census_put(&self, _subject: &str, _value: Vec<u8>) -> Result<(), PlaneError> {
+        Err(PlaneError::new("EmptyCensus writes nothing"))
+    }
+    async fn census_get(
+        &self,
+        _account: &AccountNames,
+        _key: &str,
+    ) -> Result<Option<CensusRecord>, PlaneError> {
+        Ok(None)
+    }
+    async fn census_delete(
+        &self,
+        _account: &AccountNames,
+        _key: &str,
+        _revision: u64,
+    ) -> Result<(), PlaneError> {
+        Err(PlaneError::new("EmptyCensus deletes nothing"))
+    }
+    async fn ensure_durable(&self, _durable: &DurableConsumer) -> Result<(), PlaneError> {
+        Err(PlaneError::new("EmptyCensus creates nothing"))
+    }
+}
+
+/// `jwt` with its claims replaced by `claims`; the signature is kept, since step (1)
+/// reads the looked-up claims without checking it.
+fn with_claims(jwt: &str, claims: &Value) -> String {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let parts: Vec<&str> = jwt.split('.').collect();
+    format!(
+        "{}.{}.{}",
+        parts[0],
+        URL_SAFE_NO_PAD.encode(claims.to_string().as_bytes()),
+        parts[2]
+    )
+}
+
+#[tokio::test]
+async fn a_claim_ck_bus_did_not_write_refuses_the_push_and_is_named() {
+    use bootstrap::account_jwt::{sign_account_jwt, AccountClaims};
+
+    let trust = TrustChain::generate();
+    let credentials = credentials_over(trust.signer.clone());
+    let account_public = KeyPair::new_account().public_key();
+    let written = AccountClaims {
+        account_public: account_public.clone(),
+        name: "box_foreignclaim".to_string(),
+        signing_keys: vec![trust.box_root_public()],
+        revocations: Default::default(),
+        issued_at: unix_now() - 60,
+    };
+    let own_jwt = sign_account_jwt(
+        credentials.vault.as_ref(),
+        &credentials.key_ids,
+        &bus::signer_root_id(),
+        &written,
+    )
+    .await
+    .expect("the operator signer signs the account JWT");
+    let mut foreign = bus::claims(&own_jwt);
+    foreign["nats"]["imports"] = json!([{
+        "name": "planted",
+        "subject": "planted.>",
+        "account": KeyPair::new_account().public_key(),
+        "type": "stream",
+    }]);
+    let target = |module: &str| Target {
+        identity: Identity {
+            module_id: module.to_string(),
+            spawn_generation: 1,
+            credential_epoch: 0,
+        },
+        user_public: KeyPair::new_user().public_key(),
+        user_jwt_id: "JTI".to_string(),
+    };
+    let revoke = |stored: Arc<StoredAccount>, module: &'static str| {
+        let credentials = credentials.clone();
+        let account_public = account_public.clone();
+        async move {
+            let store = tempfile::tempdir().unwrap();
+            let plane = RevocationPlane {
+                names: grants::derive_account("box_foreignclaim").unwrap(),
+                account_public,
+                system: stored,
+                box_plane: Arc::new(EmptyCensus),
+            };
+            Revoker::new(credentials, store.path(), Arc::new(Connections::default()))
+                .revoke(&plane, target(module))
+                .await
+        }
+    };
+
+    // Control: the account JWT as ck-bus wrote it is updated.
+    let own = Arc::new(StoredAccount {
+        jwt: Mutex::new(own_jwt.clone()),
+        updates: Mutex::new(Vec::new()),
+    });
+    revoke(own.clone(), "ownclaims")
+        .await
+        .expect("an account JWT with only ck-bus's own claims is updated");
+    assert_eq!(own.updates.lock().unwrap().len(), 1);
+
+    // A claim ck-bus did not write: nothing is pushed, and the claim is named.
+    let planted = Arc::new(StoredAccount {
+        jwt: Mutex::new(with_claims(&own_jwt, &foreign)),
+        updates: Mutex::new(Vec::new()),
+    });
+    let refused = revoke(planted.clone(), "foreignclaims")
+        .await
+        .expect_err("a foreign claim refuses the push");
+    let RevocationError::Deferred {
+        completed_step,
+        cause: why,
+        message,
+    } = &refused
+    else {
+        panic!("expected a deferral, got {refused:?}");
+    };
+    assert_eq!(
+        (*completed_step, *why),
+        (0, cause::ACCOUNT_JWT_FOREIGN_CLAIM)
+    );
+    assert!(message.contains("nats.imports"), "{message}");
+    assert!(
+        planted.updates.lock().unwrap().is_empty(),
+        "nothing was pushed"
+    );
+    passed_in_process();
+}
+
+fn passed_in_process() {
+    RowReport::passed(Row::Revocation)
+        .served_by(ServedBy::HarnessSigner)
+        .emit(&vocabulary());
 }
 
 /// ck-bus's own census entry is written by bootstrap, which cannot name issuance's type;

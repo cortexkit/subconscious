@@ -77,6 +77,9 @@ pub mod cause {
     pub const CLAIMS_READBACK_MISMATCH: &str = "claims-readback-mismatch";
     pub const OPERATOR_SIGNATURE_REFUSED: &str = "operator-signature-refused";
     pub const ACCOUNT_JWT_UNUSABLE: &str = "account-jwt-unusable";
+    /// The looked-up account JWT carries a claim ck-bus does not write, so another writer
+    /// exists and a rebuilt update would drop that claim.
+    pub const ACCOUNT_JWT_FOREIGN_CLAIM: &str = "account-jwt-foreign-claim";
     pub const KICK_FAILED: &str = "kick-failed";
     pub const PROGRESS_UNWRITABLE: &str = "progress-unwritable";
 }
@@ -542,14 +545,39 @@ impl Revoker {
                      only plain keys",
                 )
             })?;
+        let name = claims["name"].as_str().unwrap_or_default().to_string();
+        let previous_iat = claims["iat"].as_i64().unwrap_or_default();
+        // The update below is rebuilt from ck-bus's own claim layout (`AccountClaims`), not
+        // edited in place, so it drops any claim ck-bus does not write itself. That is safe
+        // only while ck-bus is the account's single writer. So the looked-up claims must be
+        // exactly what ck-bus would have written for them; a claim it did not write means
+        // another writer, and the push is refused naming that claim rather than dropping
+        // it silently.
+        let as_written = AccountClaims {
+            account_public: plane.account_public.clone(),
+            name: name.clone(),
+            signing_keys: signing_keys.clone(),
+            revocations: revoked.clone(),
+            issued_at: previous_iat,
+        }
+        .claims(claims["iss"].as_str().unwrap_or_default());
+        if let Some(claim) = foreign_claim(&claims, &as_written, "") {
+            return Err(deferred(
+                0,
+                cause::ACCOUNT_JWT_FOREIGN_CLAIM,
+                format!(
+                    "the box account JWT carries `{claim}`, which ck-bus does not write; \
+                     rebuilding it for the revocation would drop it, so nothing is pushed"
+                ),
+            ));
+        }
         let now = unix_now();
         revoked.insert(record.user_public.clone(), now);
         // The server keeps the newer of two account JWTs by `iat`, so an update in the
         // same second as the one it replaces is dated one second later.
-        let previous_iat = claims["iat"].as_i64().unwrap_or_default();
         let updated = AccountClaims {
             account_public: plane.account_public.clone(),
-            name: claims["name"].as_str().unwrap_or_default().to_string(),
+            name,
             signing_keys,
             revocations: revoked,
             issued_at: now.max(previous_iat + 1),
@@ -628,6 +656,45 @@ impl Revoker {
             }
         }
         Ok(kicked)
+    }
+}
+
+/// The first claim, as a dotted path, where `found` differs from `written` (what ck-bus
+/// would have written for the same account): a member only one side has, or a differing
+/// value. The top-level `jti` is skipped: ck-bus derives it from the other claims, and a
+/// JWT signed by anyone else carries its own. `None` when they agree.
+fn foreign_claim(found: &Value, written: &Value, path: &str) -> Option<String> {
+    let join = |key: &str| {
+        if path.is_empty() {
+            key.to_string()
+        } else {
+            format!("{path}.{key}")
+        }
+    };
+    match (found, written) {
+        (Value::Object(found), Value::Object(written)) => {
+            let skip = |key: &str| path.is_empty() && key == "jti";
+            for (key, value) in found.iter().filter(|(key, _)| !skip(key)) {
+                match written.get(key) {
+                    None => return Some(join(key)),
+                    Some(ours) => {
+                        if let Some(claim) = foreign_claim(value, ours, &join(key)) {
+                            return Some(claim);
+                        }
+                    }
+                }
+            }
+            written
+                .keys()
+                .find(|key| !skip(key) && !found.contains_key(*key))
+                .map(|key| join(key))
+        }
+        _ if found == written => None,
+        _ => Some(if path.is_empty() {
+            "(the claims object)".to_string()
+        } else {
+            path.to_string()
+        }),
     }
 }
 
@@ -712,7 +779,34 @@ pub(crate) fn log_event(event: &str, fields: Value) {
 
 #[cfg(test)]
 mod tests {
-    use super::kick_target_gone;
+    use super::{foreign_claim, kick_target_gone};
+    use serde_json::json;
+
+    #[test]
+    fn a_claim_ck_bus_does_not_write_is_named_by_its_path() {
+        let written = json!({"jti": "A", "iat": 1, "nats": {"limits": {"conn": -1}}});
+        assert_eq!(foreign_claim(&written, &written, ""), None);
+        let mut found = written.clone();
+        found["jti"] = json!("B");
+        assert_eq!(foreign_claim(&found, &written, ""), None, "jti is derived");
+        found["nats"]["imports"] = json!([]);
+        assert_eq!(
+            foreign_claim(&found, &written, "").as_deref(),
+            Some("nats.imports")
+        );
+        let mut changed = written.clone();
+        changed["nats"]["limits"]["conn"] = json!(5);
+        assert_eq!(
+            foreign_claim(&changed, &written, "").as_deref(),
+            Some("nats.limits.conn")
+        );
+        let mut missing = written.clone();
+        missing["nats"]["limits"] = json!({});
+        assert_eq!(
+            foreign_claim(&missing, &written, "").as_deref(),
+            Some("nats.limits.conn")
+        );
+    }
 
     #[test]
     fn only_the_servers_exact_no_such_client_answer_reads_as_gone() {

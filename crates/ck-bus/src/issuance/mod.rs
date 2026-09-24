@@ -20,8 +20,9 @@
 //! A failure (or a crash) before step 5 leaves a signed JWT whose seed is dropped and no
 //! census entry, so there is nothing to roll back; the next request issues at a higher
 //! epoch. Once an issue completes, the module's previous user is superseded: its key is
-//! dropped from memory (so a reconnect under it gets `ckbus_credential_superseded`) and
-//! it is queued for revocation, which the revocation area executes.
+//! dropped from memory (so a reconnect under it gets `ckbus_credential_superseded`). Its
+//! revocation is the revocation area's: it reads the census entry just before each issue,
+//! so the superseded key is found there, whichever ck-bus process issued it.
 //!
 //! The grant is the naming crate's participant grant. Which agent ids and rooms a module
 //! is bound to has no named source yet, so every participant is issued with none: its
@@ -147,17 +148,6 @@ pub struct Issued {
     pub credential_epoch: u64,
 }
 
-/// A user whose credential was superseded by a later issue for the same module, queued
-/// for the revocation area. Its key has already been dropped from memory.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Superseded {
-    pub module_id: String,
-    pub user_public: String,
-    pub user_jwt_id: String,
-    pub spawn_generation: u64,
-    pub credential_epoch: u64,
-}
-
 /// The answer to `ckbus.credential`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CredentialAnswer {
@@ -201,7 +191,6 @@ pub struct Issuance {
     spawn: Arc<dyn LiveGenerations>,
     plane: Arc<dyn PlaneSource>,
     current: Mutex<HashMap<String, Issued>>,
-    superseded: Mutex<Vec<Superseded>>,
     /// Per-module serialization, so two concurrent requests for one module never pick
     /// the same epoch or race their census writes.
     module_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
@@ -227,7 +216,6 @@ impl Issuance {
             spawn,
             plane,
             current: Mutex::new(HashMap::new()),
-            superseded: Mutex::new(Vec::new()),
             module_locks: Mutex::new(HashMap::new()),
             damage: Mutex::new(None),
             #[cfg(test)]
@@ -238,11 +226,6 @@ impl Issuance {
     /// The credential currently held for a module, if any.
     pub fn current(&self, module_id: &str) -> Option<Issued> {
         lock(&self.current).get(module_id).cloned()
-    }
-
-    /// Superseded users waiting for revocation.
-    pub fn superseded(&self) -> Vec<Superseded> {
-        lock(&self.superseded).clone()
     }
 
     /// The high-water damage that holds health down, if any.
@@ -449,27 +432,20 @@ impl Issuance {
         .map_err(|error| Refusal::new(code::SIGNING_FAILED, error.to_string()))
     }
 
+    /// Drops a superseded key from memory. Nothing is queued: the revocation area finds
+    /// the superseded user in the census entry it read before this issue.
     fn supersede(&self, previous: Issued) {
         self.credentials.custody.forget(&previous.credential_public);
-        let superseded = Superseded {
-            module_id: previous.module_id,
-            user_public: previous.credential_public,
-            user_jwt_id: previous.user_jwt_id,
-            spawn_generation: previous.spawn_generation,
-            credential_epoch: previous.credential_epoch,
-        };
         log_event(
             "ckbus.issuance.superseded",
             json!({
-                "module_id": superseded.module_id,
-                "user_public": superseded.user_public,
-                "user_jwt_id": superseded.user_jwt_id,
-                "spawn_generation": superseded.spawn_generation,
-                "credential_epoch": superseded.credential_epoch,
-                "revocation": "queued for the revocation area",
+                "module_id": previous.module_id,
+                "user_public": previous.credential_public,
+                "user_jwt_id": previous.user_jwt_id,
+                "spawn_generation": previous.spawn_generation,
+                "credential_epoch": previous.credential_epoch,
             }),
         );
-        lock(&self.superseded).push(superseded);
     }
 
     /// `ckbus.nonce_sign` for the attested `module_id`: signs with the module's current

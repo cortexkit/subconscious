@@ -37,7 +37,8 @@ pub struct AccountClaims {
 }
 
 impl AccountClaims {
-    fn claims(&self, issuer: &str) -> Value {
+    /// The claims as signed, naming `issuer` as `iss`.
+    pub fn claims(&self, issuer: &str) -> Value {
         let mut nats = json!({
             "type": "account",
             "version": 2,

@@ -227,11 +227,15 @@ Durable store: eight shapes and nothing else, under the store root below.
 - `spawn_cursor.json`: last processed spawn cursor.
 - `epoch_high_water.json`: the highest (generation, epoch) issued per module.
 - `sentinel_verdict.json`: the last verdict plus the incarnation id that wrote it.
-- `account.json`: the machine id and `{acct}` this store last served, plus every
-  earlier `{acct}` a machine-id change left behind (Credentials).
+- `account.json`: the machine id and `{acct}` this store last served, and the box
+  account's identity public key (`account_public`, the account id), which ck-bus
+  generated once in memory at first boot. The seed is never kept. Absent, it is not
+  a reason to create: boot lists the resolver's accounts and adopts one named
+  `{acct}` before it creates anything.
 - `own_users.json`: the public keys of this incarnation's box-account, system-account
-  and, once federation lands, federation-account users. Written before each first
-  connect so the next incarnation can revoke them.
+  and, once federation lands, federation-account users, plus the earlier box users
+  still pending revocation. Written before each first connect so the next
+  incarnation can revoke its box users.
 - `revocation_progress/{module_id}.g{generation}.e{epoch}.json`, one file per
   in-flight revocation. It carries that identity, `highest_completed_step` (inclusive
   domain 0..=3), the user public key, the `user_jwt_id`, and the kick target.
@@ -437,16 +441,18 @@ Credentials (design D; foundation amendment `48c83a68e`, `0eb12229f`, `b9e827c69
   | Root | Credential id | Signs | Agreed |
   | --- | --- | --- | --- |
   | box account signing key | `signing:ck-bus-account:1` | participant and ck-bus box-account user JWTs | EXISTS: minted with the operator's approval (CKCRED, 2026-09-24), `record_version` 1, public key hex `c73fe2b0df0d9921f4531bf1277404839a6d630be49ed77dbd29848f3e1bfcfa`, `key_id` `0253fac9609168a5`, exact `sign` and `read` grants to `reserved:ckbus` |
-  | system account signing key | by analogy, `signing:ck-bus-sysaccount:1` | the system-account user JWT | the key is foundation-required; the id is unagreed |
-  | box-local operator key | by analogy, `signing:ck-bus-operator:1` | the two account JWTs, including every revocation claims update | the key is foundation-required; the id and ck-bus's sign grant on it are unagreed |
+  | system account signing key | `signing:ck-bus-sysaccount:1` | the system-account user JWT | proposed to CKCRED with exact `sign` and `read` to `reserved:ckbus` (install trust chain design, 6.3); acceptance uses a fixture key |
+  | operator root | `signing:ck-bus-operator-root:1` | the operator JWT (self-signed) and the system account JWT, once, by ceremony at install | EXISTS with zero grants; ck-bus has no use for it and never calls the vault for it (`RootCredential::OperatorRoot` refuses a credential id) |
+  | operator signer | `signing:ck-bus-operator-signer:1` | the box account JWT, at first boot and in every revocation claims update | EXISTS with `sign` to `reserved:ckbus` (R14); `read` requested from CKCRED (design 6.2), which ck-bus needs to name the signer as the JWT's issuer |
   | federation account signing key | by analogy, `signing:ck-bus-fedaccount:1` | ck-bus's federation-account user JWT | required by nats-federation r3; unagreed |
   | message-signing key | `signing:msgsig:<host>:1` (CKCRED's earlier form; its 2026-09-24 note says `signing:msgsig`) | per-message sender signatures | works today by the same mechanism; awaiting the operator: `sign` to `reserved:ckbus` and `read` to `reserved:callosum`, which publishes the public half in its key record; `<host>` is unspecified, and this spec reads it as the machine id |
 
   The ids are credential ids, not the foundation's `nats.*.{acct}` record-name grammar,
   which described vault records ck-bus would have minted (Open questions). ck-bus
-  resolves them through `cortexkit-bus-naming`. The operator key needs a ck-bus grant
-  because a revocation is an account JWT re-signed by the operator key: without it,
-  step (1) is unexecutable. That grant is foundation-implied and unagreed with CKCRED.
+  resolves them through `cortexkit-bus-naming::root_credential_id` (commons
+  `ce77ea9`). Slice 4 replaced r2's single operator row with the two above, per
+  `docs/designs/nats-install-trust-chain.md` (section 7, 6.1), which governs keys,
+  which JWTs exist, who signs them and first boot wherever it differs from this text.
 - `root-ceremony-unrun` (deployment gate; owner the operator, with CKCRED; no build
   work). It is tracked per root. DISCHARGED for the box account key on the operator's
   machine, with the facts in the table above. Standing for the system-account and
@@ -546,11 +552,13 @@ Credentials (design D; foundation amendment `48c83a68e`, `0eb12229f`, `b9e827c69
     never a reason to mint. ck-bus creates nothing, issues nothing, and answers
     `machine-id-absent`. This is a deployment gate: the acceptance daemon at
     `cac1e9bd`+ serves the id, so no row carries it.
-  - An id that differs from `account.json`'s (a `ck machine adopt` between runs) starts
-    a new account, the rule the machine-id design asks ck-bus to state. ck-bus appends
-    the old `{acct}` to `account.json`, creates the bucket and streams under the new
-    one, and names the old account's streams and bucket as orphans in its report,
-    start-up log and health `detail`. It deletes nothing (Non-goals).
+  - An id that differs from `account.json`'s (a `ck machine adopt` between runs), or a
+    box account for another machine id found on the server when `account.json` is
+    absent, is REFUSED (ALF, amending the r2 rule and the trust-chain design's section
+    5): ck-bus creates no second box account while one exists under the old id. It
+    answers health down/`Unavailable` with cause `machine-id-changed`, naming both
+    ids, creates and deletes nothing, and leaves `account.json` as it is. The operator
+    decides the migration.
   - This spec does not make root keys per `{acct}`, since the credential ids carry no
     token. Whether a new `{acct}` needs new account keys is an Open question.
 - Server configuration. The local server needs its operator JWT, system account, the
@@ -580,10 +588,25 @@ Ownership of acts.
 - Census writes use ck-bus's own box-account user. ck-bus's own census key is
   self-written, the single named exception, and its authority rests on the box account
   grant. A participant never holds write on its own entry.
-- Bootstrap: on start, after the machine id and roots resolve, ck-bus issues its own
-  box-account and system-account users and connects. It then creates the census bucket
-  and all five streams with their literal bindings if absent, and revokes the previous
-  incarnation's own users. It never publishes a workload message and holds no workload
+- Bootstrap: on start, after the machine id and roots resolve, ck-bus signs its
+  system-account user with the system account key and connects to `$SYS`, finds or
+  (only if none exists) creates the box account, re-signs its JWT for the same id with
+  the operator signer, carrying earlier revocations and adding the previous
+  incarnation's box users, pushes it, and reads it back through the claims lookup
+  before treating it as applied (a claims update is saved without a trust or `iat`
+  check). It then issues its box-account user, connects, and creates the census bucket
+  and all five streams with their literal bindings if absent. It does NOT revoke the
+  previous incarnation's system-account users (trust-chain design 6.7): their seeds
+  died with that process, so they cannot answer a nonce, and revoking them would
+  re-sign the root-signed system account. Only ck-bus's system user holds the
+  claims-update permission. ck-bus reads its broker inputs from its supervised
+  environment: `CKBUS_NATS_URL` (a loopback `nats://` URL; the listener has no TLS),
+  `CKBUS_OPERATOR_JWT` (the operator JWT's path) and `CKBUS_SYSTEM_ACCOUNT` (which must
+  equal the operator JWT's `system_account`); the operator signer must be listed in the
+  operator JWT's `signing_keys`, or ck-bus refuses with `operator-jwt-mismatch`. The
+  local listener binds a loopback address explicitly, never `0.0.0.0`, and needs
+  `max_control_line` above the 4 KiB default: a CONNECT carrying ck-bus's box grant is
+  longer (a setup obligation, measured in slice 4). It never publishes a workload message and holds no workload
   publish grant in the box account. If the system-account user cannot be issued, the
   module serves nothing and answers `sysaccount-absent`, per the foundation: revocation
   is never left silently unenforced.
@@ -1026,9 +1049,12 @@ Row contents.
   string matching `S[UAOCN][A-Z2-7]{54}`. Control: a harness-planted seed in the store
   is found by the same scan.
 - Machine id and account. `{acct}` is `box_` plus the HELLO_ACK machine id, and the
-  bucket and streams carry it. Restarting against a fixture store whose `account.json`
-  names another id creates the new account's bucket and streams. The old names are
-  reported as orphans, and nothing is deleted. A damaged `account.json` fails closed
+  bucket and streams carry it. A supervised restart keeps the account id, so a durable
+  consumer resumes at its cursor. With `account.json` deleted, boot adopts the account
+  found by name, with no second account. Booting with another machine id while the old
+  box account exists is refused, health down naming both ids, with no second account
+  (slice 4, amending r2's new-account rule). A claims update whose read-back differs
+  from the push is not applied and is reported (unit level). A damaged `account.json` fails closed
   with health down naming it. Absence of the field is not drivable against the
   acceptance daemon and is asserted at unit level against the seam: nothing is created,
   and the answer is `machine-id-absent`.
@@ -1037,9 +1063,12 @@ Row contents.
   bucket and the five streams with their literal bindings, writes its own census key,
   publishes on its sentinel subject, and performs a successful `$SYS` kick of a harness
   client. No fleet operator key is present anywhere.
-  - A restart writes a new `own_users.json` and revokes the previous incarnation's users:
-    the claims read back contain their keys, and a harness client presenting the old
-    ck-bus user JWT is refused.
+  - A restart writes a new `own_users.json` and revokes the previous incarnation's box
+    users (not its system users): the claims read back contain their keys, and a
+    client presenting a revoked user's JWT is refused as revoked. The old ck-bus user's
+    own JWT cannot be presented at all (its seed died, and the server verifies the
+    nonce before it checks revocation), so the arm also records a harness-held key as
+    a previous box user and presents that one.
   - With the signer refusing (`harness-stub` control), ck-bus creates nothing, deletes
     nothing, and retries once per sentinel period, read from its own log line. Its
     health half is asserted by the health row.
@@ -1270,7 +1299,8 @@ what it did and who can overturn it.
    machine-id design. The foundation text should be amended (ALF).
 8. `{acct}` stability versus machine-id change. The foundation fixes `{acct}` for the life
    of the box, and the machine-id design lets `adopt` change it at the next daemon
-   start, asking ck-bus to start a new account. This spec does that and deletes nothing.
+   start, asking ck-bus to start a new account. Slice 4 (ALF) refuses instead while
+   the old box account exists, and the operator decides the migration.
    Whether the new account needs new root keys is open, since the credential ids carry
    no account token (CKCRED, operator).
 9. Local delivery of opened federation frames. nats-federation r3 says "B's ck-bus opens

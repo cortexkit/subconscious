@@ -36,7 +36,7 @@
 //! The kill arms need a window in which ck-bus is dead and not yet replaced. The
 //! supervisor replaces a crashed module after its restart backoff, so this row declares
 //! ck-bus's backoff as `CKBUS_BACKOFF_MS`, and every "during the outage" observation is
-//! checked against the replacement process's own start line.
+//! checked against the daemon's record of when it spawned the replacement.
 
 #[allow(dead_code)]
 #[path = "../src/bootstrap/mod.rs"]
@@ -112,7 +112,7 @@ const BOOT_LIMIT: Duration = Duration::from_secs(60);
 /// which is 15 s in the harness participant's relay. The outage must outlast that, or a
 /// connect begun during it would simply wait for the replacement and succeed, and the
 /// arm could not show a refused connect. The arm checks the outage it got against the
-/// replacement's own start line rather than trusting this number.
+/// daemon's record of when it spawned the replacement rather than trusting this number.
 const CKBUS_BACKOFF_MS: u64 = 20_000;
 /// The second participant module: the "new" participant of the kill arm, and the one
 /// never forced to reconnect in the restart arm.
@@ -1270,8 +1270,9 @@ impl ModuleHandler for SwitchableVault {
 
 /// How long a successful bootstrap attempt may take after its period's sleep: it signs
 /// three JWTs through the vault route, pushes and reads back the account JWT and
-/// creates the bucket and streams on a fresh server. Measured here at well under a
-/// second; the slack absorbs a loaded CI machine without admitting a second period.
+/// creates the bucket and streams on a fresh server. Measured at 70 to 120 ms on a
+/// developer machine; the slack absorbs a loaded CI machine while staying under a
+/// second period, so a recovery that took one more retry still fails.
 const BOOT_ATTEMPT_SLACK: Duration = Duration::from_millis(900);
 
 /// Beyond the row's text (see the module comment): the vault refuses, then answers,

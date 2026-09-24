@@ -555,6 +555,7 @@ where
                         &ctx,
                         &frame,
                         &target_module_id,
+                        route_open_tasks.len(),
                         MAX_PENDING_ROUTE_OPENS_PER_CONNECTION,
                     )
                     .map_err(ConnectionError::Router)?;

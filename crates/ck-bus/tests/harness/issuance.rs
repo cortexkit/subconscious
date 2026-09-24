@@ -373,6 +373,11 @@ impl VerdictClient {
         Ok(Self { client, events })
     }
 
+    /// Every event the connection reported, in order.
+    pub fn events(&self) -> Vec<String> {
+        self.events.lock().unwrap().clone()
+    }
+
     /// Every server-reported permissions violation naming `subject`.
     pub fn violations_for(&self, subject: &str) -> Vec<String> {
         self.events

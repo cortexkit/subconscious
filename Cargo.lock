@@ -254,7 +254,7 @@ dependencies = [
 
 [[package]]
 name = "ck-bus"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "async-nats",
  "async-trait",

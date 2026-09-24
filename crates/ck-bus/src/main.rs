@@ -27,6 +27,10 @@ mod revocation;
 // reconciles the census against the supervisor's spawn snapshot.
 #[allow(dead_code)]
 mod spawn_consumer;
+// The sentinel probe and the health answer: bootstrap's cause until it is ready, then
+// the verdict of a real round trip through the server.
+#[allow(dead_code)]
+mod sentinel;
 
 use std::{
     env,
@@ -111,7 +115,18 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         },
         std::time::Duration::from_millis(sentinel_period_ms),
     );
-    let runtime = Arc::new(runtime.with_sentinel_health(bootstrap.health()));
+    let store_root = runtime.store_root().clone();
+    let runtime = Arc::new(runtime.with_sentinel_health(sentinel::wire(
+        bootstrap.health(),
+        bootstrap.ready(),
+        &store_root,
+        module_id.clone(),
+        incarnation.clone(),
+        sentinel::Timing {
+            period: std::time::Duration::from_millis(sentinel_period_ms),
+            timeout: std::time::Duration::from_millis(sentinel_timeout_ms),
+        },
+    )));
     eprintln!(
         "{}",
         json!({
@@ -123,7 +138,6 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         })
     );
 
-    let store_root = runtime.store_root().clone();
     let wired = issuance::handler::wire(
         ModuleManifest::builder(&module_id, env!("CARGO_PKG_VERSION")),
         BusHandler { runtime },

@@ -18,7 +18,7 @@ use async_trait::async_trait;
 use cortexkit_bus_naming::{AccountNames, DiscardPolicy, StreamSpec, MIB};
 use futures_util::StreamExt;
 use serde_json::{json, Value};
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 
 use crate::credentials::Credentials;
 
@@ -28,6 +28,11 @@ const CLAIMS_UPDATE: &str = "$SYS.REQ.CLAIMS.UPDATE";
 const CLAIMS_LIST: &str = "$SYS.REQ.CLAIMS.LIST";
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How many server error lines a slow reader of `SentinelLink::server_errors` may fall
+/// behind by before the oldest are dropped. A probe reads them within one round, and a
+/// round sees at most a handful.
+const SERVER_ERROR_BACKLOG: usize = 64;
 
 /// The census bucket's size cap. The foundation fixes history 1 and no TTL but names no
 /// size, and a stream with no stated size is unbounded, so ck-bus states one. One value
@@ -139,6 +144,24 @@ pub trait BoxPlane: Send + Sync {
     /// Creates a participant's durable pull consumer, or updates it to `durable`'s
     /// configuration when it already exists.
     async fn ensure_durable(&self, durable: &DurableConsumer) -> Result<(), PlaneError>;
+    /// The connection itself, for the sentinel probe's request and responder. A plane
+    /// with no real connection (a test double) has none, and the sentinel reports that
+    /// it cannot probe.
+    fn sentinel_link(&self) -> Option<SentinelLink> {
+        None
+    }
+}
+
+/// ck-bus's box-account connection as the sentinel probe uses it. The server reports a
+/// permissions violation only as an error line on the connection, never to the request
+/// that caused it, so every such line is forwarded on `server_errors` for the probe to
+/// read.
+#[derive(Clone)]
+pub struct SentinelLink {
+    pub client: async_nats::Client,
+    /// The connection's user, which names its inbox prefix `_INBOX.<user_public>`.
+    pub user_public: String,
+    pub server_errors: broadcast::Sender<String>,
 }
 
 /// One participant durable consumer, with every limit stated rather than left to a
@@ -245,6 +268,7 @@ impl NatsBroker {
         jwt: &str,
         user_public: &str,
         name: &str,
+        server_errors: broadcast::Sender<String>,
     ) -> Result<async_nats::Client, PlaneError> {
         let credentials = self.credentials.clone();
         let user = user_public.to_string();
@@ -260,6 +284,16 @@ impl NatsBroker {
         })
         // Replies come back on the user's own inbox, the only inbox its grant allows.
         .custom_inbox_prefix(format!("_INBOX.{user_public}"))
+        .event_callback(move |event| {
+            let server_errors = server_errors.clone();
+            async move {
+                if let async_nats::Event::ServerError(async_nats::ServerError::Other(line)) = event
+                {
+                    // Nobody listening is normal; the line is only for a probe in flight.
+                    let _ = server_errors.send(line);
+                }
+            }
+        })
         .name(name)
         .connection_timeout(REQUEST_TIMEOUT)
         .connect(&self.url)
@@ -275,7 +309,10 @@ impl Broker for NatsBroker {
         jwt: &str,
         user_public: &str,
     ) -> Result<Arc<dyn SystemPlane>, PlaneError> {
-        let client = self.connect(jwt, user_public, "ckbus-system").await?;
+        let (server_errors, _) = broadcast::channel(SERVER_ERROR_BACKLOG);
+        let client = self
+            .connect(jwt, user_public, "ckbus-system", server_errors)
+            .await?;
         Ok(Arc::new(NatsSystem { client }))
     }
 
@@ -284,9 +321,21 @@ impl Broker for NatsBroker {
         jwt: &str,
         user_public: &str,
     ) -> Result<Arc<dyn BoxPlane>, PlaneError> {
-        let client = self.connect(jwt, user_public, "ckbus-box").await?;
+        let (server_errors, _) = broadcast::channel(SERVER_ERROR_BACKLOG);
+        let client = self
+            .connect(jwt, user_public, "ckbus-box", server_errors.clone())
+            .await?;
         let jetstream = jetstream::new(client.clone());
-        Ok(Arc::new(NatsBox { client, jetstream }))
+        let link = SentinelLink {
+            client: client.clone(),
+            user_public: user_public.to_string(),
+            server_errors,
+        };
+        Ok(Arc::new(NatsBox {
+            client,
+            jetstream,
+            link,
+        }))
     }
 }
 
@@ -443,6 +492,7 @@ pub fn parse_connection_event(payload: &[u8]) -> Option<ConnectionEvent> {
 pub struct NatsBox {
     client: async_nats::Client,
     jetstream: jetstream::Context,
+    link: SentinelLink,
 }
 
 #[async_trait]
@@ -575,6 +625,10 @@ impl BoxPlane for NatsBox {
                     "census delete {key} at revision {revision}: {error}"
                 ))
             })
+    }
+
+    fn sentinel_link(&self) -> Option<SentinelLink> {
+        Some(self.link.clone())
     }
 
     async fn ensure_durable(&self, durable: &DurableConsumer) -> Result<(), PlaneError> {

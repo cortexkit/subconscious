@@ -20,7 +20,8 @@
 //! settled unrecorded.
 //!
 //! Which record is first is a function of the stream alone, so the answer survives a
-//! restart without a store file of its own (the durable store's shapes are closed). At
+//! restart without a file of its own; `docs/specs/ck-bus-module.md` lists every shape
+//! ck-bus's durable store may hold, and none is for dead letters. At
 //! every start ck-bus reads how far the previous `c_ckbus_dead` had settled (its ack
 //! floor), deletes it and creates it again from the first retained record. Replaying the
 //! stream rebuilds the ledger of first sequences; records at or below the old ack floor
@@ -29,7 +30,8 @@
 //! (same message id, same sequence) again after the restart: a repeat of one record,
 //! never a second record for the id.
 //!
-//! The spec gives dead-letter state no place in the health answer, so none is added.
+//! The module spec's health answer names no dead-letter state, so this consumer adds
+//! nothing to `health.check`; its failures are `ckbus.dead_letter.down` lines.
 
 pub mod consumer;
 

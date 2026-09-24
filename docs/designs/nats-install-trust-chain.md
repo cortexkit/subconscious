@@ -298,3 +298,20 @@ once `user-jwt-ttl-unpinned` is pinned. This differs from the spec (6.7).
 - N5 is a security fact the slices must carry: a claims update is saved without a trust or
   `iat` check. So only ck-bus's system user may hold the claims-update permission, and every
   push is read back through the lookup before ck-bus treats it as applied.
+
+## 8. As installed on the first box (2026-09-24)
+
+The root ceremony ran once, as section 3 describes: two approvals (one over each payload's
+sha256), one handle, two signatures, then revocation. `ck-bus install-plan` built the operator
+JWT and the system account JWT; `ck-bus install-apply` verified both signatures against the
+pinned root before writing `operator.jwt` and `server.conf`. A second `install-plan` reports "no
+ceremony needed".
+
+The system account's own identity key is not a vault key. `install-plan` generates it in memory,
+keeps only the public half (`<nats dir>/system_account` and the JWTs), and drops the seed, so
+nobody holds the private half. An account identity key only ever signs its account's own claims,
+and here the root signs those, so the seed has no job. Users are signed by the sysaccount signing
+key in the vault. Re-keying the system account means a new root ceremony, which is intended.
+
+`install-apply` defaults the local listener to port 14222. That avoids a developer's own
+nats-server on the stock 4222 and stays below every common ephemeral port range.

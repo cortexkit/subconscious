@@ -121,6 +121,13 @@ pub trait BoxPlane: Send + Sync {
         account: &AccountNames,
         key: &str,
     ) -> Result<Option<CensusRecord>, PlaneError>;
+    /// Every census key that holds a value now (a deleted key is not listed). A listing
+    /// that fails is an `Err`, never an empty list. A plane that cannot list (a test
+    /// double that wraps only the calls it records) answers `Err` by default, which
+    /// the spawn consumer's reconciliation reads as "unknown" and defers on.
+    async fn census_keys(&self, _account: &AccountNames) -> Result<Vec<String>, PlaneError> {
+        Err(PlaneError::new("this census plane cannot list keys"))
+    }
     /// Deletes one census key only while it is still at `revision`. A key written again
     /// since that revision is left as it is and the call fails.
     async fn census_delete(
@@ -537,6 +544,20 @@ impl BoxPlane for NatsBox {
                 value: entry.value.to_vec(),
                 revision: entry.revision,
             }))
+    }
+
+    async fn census_keys(&self, account: &AccountNames) -> Result<Vec<String>, PlaneError> {
+        let mut keys = self
+            .census_store(account)
+            .await?
+            .keys()
+            .await
+            .map_err(|error| PlaneError::new(format!("census keys: {error}")))?;
+        let mut listed = Vec::new();
+        while let Some(key) = keys.next().await {
+            listed.push(key.map_err(|error| PlaneError::new(format!("census keys: {error}")))?);
+        }
+        Ok(listed)
     }
 
     async fn census_delete(

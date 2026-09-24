@@ -1,6 +1,6 @@
 [package]
 name = "ck-bus"
-version = "0.1.15"
+version = "0.1.16"
 edition = "2021"
 publish = false
 description = "Supervised owner of the CortexKit NATS message plane."

@@ -115,7 +115,7 @@ impl Fence {
 
 /// What one revocation request did.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Revoked {
+pub enum RevokeOutcome {
     NoEntry,
     /// The entry names a generation the fence does not admit.
     Fenced {
@@ -138,7 +138,7 @@ pub trait Census: Send + Sync {
     async fn entries(&self) -> Result<Vec<CensusEntry>, String>;
     /// Revokes the module's current entry when `fence` admits its generation. An `Err`
     /// means the entry could not be read, so nothing was concluded.
-    async fn revoke(&self, module_id: &str, fence: Fence) -> Result<Revoked, String>;
+    async fn revoke(&self, module_id: &str, fence: Fence) -> Result<RevokeOutcome, String>;
 }
 
 /// What the consumer has observed, for its log and its tests.
@@ -461,16 +461,16 @@ impl SpawnConsumer {
     }
 }
 
-fn revoked_json(outcome: &Revoked) -> Value {
+fn revoked_json(outcome: &RevokeOutcome) -> Value {
     match outcome {
-        Revoked::NoEntry => json!("no census entry"),
-        Revoked::Fenced { entry_generation } => {
+        RevokeOutcome::NoEntry => json!("no census entry"),
+        RevokeOutcome::Fenced { entry_generation } => {
             json!({ "fenced": { "entry_generation": entry_generation } })
         }
-        Revoked::Revoked { entry_generation } => {
+        RevokeOutcome::Revoked { entry_generation } => {
             json!({ "revoked": { "entry_generation": entry_generation } })
         }
-        Revoked::Deferred {
+        RevokeOutcome::Deferred {
             entry_generation,
             reason,
         } => json!({ "revocation_deferred": {

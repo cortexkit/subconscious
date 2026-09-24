@@ -10,7 +10,7 @@ use cortexkit_bus_naming::AccountNames;
 use serde_json::json;
 use tokio::sync::watch;
 
-use super::{log_event, Census, CensusEntry, Fence, Revoked};
+use super::{log_event, Census, CensusEntry, Fence, RevokeOutcome};
 use crate::{
     bootstrap::Ready,
     issuance::census::CensusValue,
@@ -78,7 +78,7 @@ impl Census for RevokerCensus {
         Ok(entries)
     }
 
-    async fn revoke(&self, module_id: &str, fence: Fence) -> Result<Revoked, String> {
+    async fn revoke(&self, module_id: &str, fence: Fence) -> Result<RevokeOutcome, String> {
         let plane = self.plane()?;
         let key = AccountNames::census_key(module_id).map_err(|error| error.to_string())?;
         let Some(record) = plane
@@ -87,12 +87,12 @@ impl Census for RevokerCensus {
             .await
             .map_err(|error| error.message)?
         else {
-            return Ok(Revoked::NoEntry);
+            return Ok(RevokeOutcome::NoEntry);
         };
         let value = CensusValue::parse(&record.value)
             .map_err(|reason| format!("the census value for {key} is damaged: {reason}"))?;
         if !fence.admits(value.spawn_generation) {
-            return Ok(Revoked::Fenced {
+            return Ok(RevokeOutcome::Fenced {
                 entry_generation: value.spawn_generation,
             });
         }
@@ -101,11 +101,11 @@ impl Census for RevokerCensus {
             .revoke(&plane, Target::from_census(module_id, &value))
             .await
         {
-            Ok(_) => Ok(Revoked::Revoked {
+            Ok(_) => Ok(RevokeOutcome::Revoked {
                 entry_generation: value.spawn_generation,
             }),
             // The record is durable; the revocation area retries it every period.
-            Err(error @ RevocationError::Deferred { .. }) => Ok(Revoked::Deferred {
+            Err(error @ RevocationError::Deferred { .. }) => Ok(RevokeOutcome::Deferred {
                 entry_generation: value.spawn_generation,
                 reason: error.to_string(),
             }),

@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.19.3 — 2026-09-24
+
+- Add `SubcConsumer::spawn_subscribe`, the typed `supervisor.spawn_subscribe` call on channel 0:
+  it takes an optional `SpawnCursor` and returns a `SpawnSubscription` whose `next()` yields each
+  `SpawnEvent` until the stream ends. The daemon's two cursor refusals and the terminal it sends a
+  subscriber that fell behind come back as `SpawnStreamError::CursorIncarnationMismatch`
+  (`spawn_cursor_incarnation_mismatch`, with `current_daemon_incarnation`),
+  `SpawnStreamError::CursorTooOld` (`spawn_cursor_too_old`, with `oldest_retained_cursor`) and
+  `SpawnStreamError::SubscriberLagged` (`spawn_subscriber_lagged`, with
+  `first_undelivered_cursor`), each after every event the daemon queued before it;
+  `SpawnStreamError::code()` reads the code. The three codes are exported as constants, and
+  `SpawnEvent` and `SpawnEventKind` are re-exported from `subc_client_rs::consumer`.
+- Dropping or unsubscribing a channel-0 subscription now sends its Cancel frame, so the daemon
+  releases the spawn subscriber. Before, a Cancel was sent only for a subscription on a route.
+
 ## 0.19.1 — 2026-09-24
 
 - Add `SubcConsumer::spawn_snapshot`, the typed `supervisor.spawn_snapshot` call: it returns the

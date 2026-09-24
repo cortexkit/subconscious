@@ -450,7 +450,7 @@ Credentials (design D; foundation amendment `48c83a68e`, `0eb12229f`, `b9e827c69
   The ids are credential ids, not the foundation's `nats.*.{acct}` record-name grammar,
   which described vault records ck-bus would have minted (Open questions). ck-bus
   resolves them through `cortexkit-bus-naming::root_credential_id` (commons
-  `ce77ea9`). Slice 4 replaced r2's single operator row with the two above, per
+  `e14a671bd`, the pin ck-bus builds against). Slice 4 replaced r2's single operator row with the two above, per
   `docs/designs/nats-install-trust-chain.md` (section 7, 6.1), which governs keys,
   which JWTs exist, who signs them and first boot wherever it differs from this text.
 - `root-ceremony-unrun` (deployment gate; owner the operator, with CKCRED; no build
@@ -1123,8 +1123,14 @@ Row contents.
   `prefrontal-seat-unnamed`. The subconscious slice fails its own arm if it writes
   outside its worktree.
 - A3 revocation. The three steps produce the foundation's observables: `Unavailable` on
-  the severed socket, the `$SYS` disconnect event with the kick reason, and `Denied` on
-  an explicit reconnect within 5 s. A second reconnect after a server restart is still
+  the severed socket, exactly one `$SYS` disconnect event, and `Denied` on an explicit
+  reconnect within 5 s. The push in step (1) severs the connection itself, and the
+  event's reason is `Credentials Revoked`, not the kick's (slice 6, measured against
+  nats-server v2.15.0 in `tests/revocation.rs`). The kick in step (3) is a backstop for
+  a connection the push did not sever, and it normally finds nothing: the server
+  answers `no such client or leafnode id`, which counts as already gone, and any other
+  kick refusal fails the step. Revoking before kicking is the safe order: a kick alone
+  lets the client reconnect at once with the same JWT (the control below). A second reconnect after a server restart is still
   refused, proving the claims update persisted. Exactly-once is asserted on the defined
   observables.
   - (i) A kill between any two steps, or after a step and before its progress update,

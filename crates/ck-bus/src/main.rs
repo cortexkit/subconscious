@@ -16,10 +16,13 @@ mod bootstrap;
 // The offline `install-plan` and `install-apply` commands `ck setup` drives.
 mod install;
 // `ckbus.credential` and `ckbus.nonce_sign`: participant credentials, the census write
-// and the epoch high-water mark. The superseded-user queue and the census reader wait for
-// the revocation area.
+// and the epoch high-water mark.
 #[allow(dead_code)]
 mod issuance;
+// Revocation: the operator-signed revocation list, the census delete and the kick, with
+// durable progress; superseded users are found from the census.
+#[allow(dead_code)]
+mod revocation;
 
 use std::{
     env,
@@ -97,6 +100,10 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             grants: runtime.grants.clone(),
             store: bootstrap::store::Store::new(runtime.store_root().clone()),
             incarnation: incarnation.clone(),
+            own_spawn: Arc::new(bootstrap::SnapshotOwnSpawn {
+                connection_file: credentials::vault::subc_arg(env::args_os()).unwrap_or_default(),
+                module_id: module_id.clone(),
+            }),
         },
         std::time::Duration::from_millis(sentinel_period_ms),
     );
@@ -116,10 +123,17 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let wired = issuance::handler::wire(
         ModuleManifest::builder(&module_id, env!("CARGO_PKG_VERSION")),
         BusHandler { runtime },
-        credentials,
+        credentials.clone(),
         &store_root,
         bootstrap.ready(),
     )?;
+    let wired = revocation::handler::wire(
+        wired,
+        credentials,
+        &store_root,
+        bootstrap.ready(),
+        std::time::Duration::from_millis(sentinel_period_ms),
+    );
     bootstrap.serve(wired.manifest, wired.handler).await?;
     Ok(())
 }

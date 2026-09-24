@@ -17,8 +17,9 @@
 //! refusing, it answers `sysaccount-absent` and builds no plane; and the local listener
 //! refuses a connect from a non-loopback address.
 //!
-//! ck-bus's own census key needs the census key grammar, which the naming crate does not
-//! construct at the pinned revision: that arm records `naming-constructor-absent`.
+//! ck-bus writes its own census key at boot, under its own box user: the value names
+//! that user, its JWT id and ck-bus's spawn generation from the supervisor, and a
+//! restart overwrites it at the new generation.
 
 #[allow(dead_code)]
 #[path = "../src/bootstrap/mod.rs"]
@@ -182,6 +183,39 @@ fn own_users(plane: &Plane) -> (Vec<String>, Vec<String>, Vec<String>) {
     (list("box"), list("system"), list("pending_revocation"))
 }
 
+/// Reads ck-bus's own census entry and checks it names the box user of the boot whose
+/// ready line is `ready`; returns its spawn generation.
+async fn own_census(
+    js: &jetstream::Context,
+    names: &AccountNames,
+    run_root: &Path,
+    ready: &Value,
+) -> u64 {
+    let census = js
+        .get_key_value(names.buckets().census.clone())
+        .await
+        .expect("the census bucket exists");
+    let value: Value = serde_json::from_slice(
+        &census
+            .get("ckbus")
+            .await
+            .unwrap()
+            .expect("ck-bus wrote its own census key"),
+    )
+    .unwrap();
+    assert_eq!(value["credential_public"], ready["box_user"]);
+    assert_eq!(value["credential_epoch"], 0);
+    assert_eq!(value["schema_versions"]["census"], 1);
+    assert!(!value["user_jwt_id"].as_str().unwrap().is_empty());
+    let written = bus::events(run_root, "ckbus.bootstrap.census_written");
+    let written = written
+        .iter()
+        .find(|event| event["credential_public"] == ready["box_user"])
+        .expect("the census write is logged");
+    assert_eq!(value["spawn_generation"], written["spawn_generation"]);
+    value["spawn_generation"].as_u64().unwrap()
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn first_boot_builds_the_plane_and_a_restart_revokes_the_previous_box_user() {
     let _gate = harness::acceptance_gate().await;
@@ -257,8 +291,11 @@ async fn first_boot_builds_the_plane_and_a_restart_revokes_the_previous_box_user
             "{name} carries its literal binding"
         );
     }
-    let skipped = bus::events(plane.run.root.path(), "ckbus.bootstrap.census_key_skipped");
-    assert_eq!(skipped.last().unwrap()["gate"], "naming-constructor-absent");
+    let first_generation = own_census(&js, &names, plane.run.root.path(), &first).await;
+    assert!(
+        bus::events(plane.run.root.path(), "ckbus.bootstrap.census_key_skipped").is_empty(),
+        "the census key is written, never skipped"
+    );
 
     // The sentinel publish of the next boot is observed on a confirmed subscription.
     let mut sentinel = subscribe_confirmed(&client, &names.sentinel_ping()).await;
@@ -270,6 +307,8 @@ async fn first_boot_builds_the_plane_and_a_restart_revokes_the_previous_box_user
         .unwrap();
     let body: Value = serde_json::from_slice(&published.payload).unwrap();
     assert_eq!(body["incarnation"], second["incarnation"]);
+    // The restarted process overwrites its own key at its own, higher generation.
+    assert!(own_census(&js, &names, plane.run.root.path(), &second).await > first_generation);
 
     let (box_users, system_users, pending) = own_users(&plane);
     assert_eq!(

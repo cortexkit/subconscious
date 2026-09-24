@@ -150,6 +150,7 @@ impl Run {
         while let Some(key) = keys.next().await {
             found.push(key.expect("census key"));
         }
+        found.sort();
         found
     }
 }
@@ -197,6 +198,12 @@ async fn credential(run: &SignerRun) -> Result<Value, (String, String)> {
         json!({}),
     )
     .await
+}
+
+/// One census key per live process: ck-bus's own, which bootstrap writes, and the
+/// participant's, in key order.
+fn live_census_keys() -> Vec<String> {
+    vec!["ckbus".to_string(), PARTICIPANT.to_string()]
 }
 
 fn high_water(run: &Run) -> Value {
@@ -255,7 +262,7 @@ async fn one_census_key_per_live_process_overwritten_by_refetch_and_respawn() {
             "the census value lacks {field}: {raw}"
         );
     }
-    assert_eq!(run.census_keys().await, vec![PARTICIPANT.to_string()]);
+    assert_eq!(run.census_keys().await, live_census_keys());
 
     // Refetch: same generation, next epoch, same key overwritten.
     let second = credential(&run.run).await.expect("refetch");
@@ -265,7 +272,7 @@ async fn one_census_key_per_live_process_overwritten_by_refetch_and_respawn() {
     assert_eq!(entry.credential_epoch, 1);
     assert_eq!(entry.spawn_generation, first_generation);
     assert_eq!(entry.credential_public, second["credential_public"]);
-    assert_eq!(run.census_keys().await, vec![PARTICIPANT.to_string()]);
+    assert_eq!(run.census_keys().await, live_census_keys());
     // The superseded key is no longer signed for.
     let superseded = rows::relay(
         &run.run.connection_file,
@@ -292,7 +299,7 @@ async fn one_census_key_per_live_process_overwritten_by_refetch_and_respawn() {
     assert_eq!(entry.spawn_generation, second_generation);
     assert_eq!(entry.credential_epoch, 0);
     assert_eq!(entry.credential_public, third["credential_public"]);
-    assert_eq!(run.census_keys().await, vec![PARTICIPANT.to_string()]);
+    assert_eq!(run.census_keys().await, live_census_keys());
 
     let recorded = high_water(&run);
     assert_eq!(
@@ -640,6 +647,26 @@ impl BoxPlane for RecordingPlane {
             .unwrap()
             .push((subject.to_string(), value));
         Ok(())
+    }
+    async fn census_get(
+        &self,
+        _account: &AccountNames,
+        _key: &str,
+    ) -> Result<Option<bootstrap::plane::CensusRecord>, PlaneError> {
+        // Issuance never reads the census; a call here is a bug the arm must see.
+        Err(PlaneError::new(
+            "the census row's RecordingPlane serves no census read",
+        ))
+    }
+    async fn census_delete(
+        &self,
+        _account: &AccountNames,
+        _key: &str,
+        _revision: u64,
+    ) -> Result<(), PlaneError> {
+        Err(PlaneError::new(
+            "the census row's RecordingPlane serves no census delete",
+        ))
     }
     async fn ensure_durable(&self, _durable: &DurableConsumer) -> Result<(), PlaneError> {
         Ok(())

@@ -16,7 +16,8 @@
 //!    incarnation's box users added), has the operator signer sign it, pushes it, and
 //!    reads it back through the claims lookup before treating it as applied;
 //! 4. signs its box-account user with the box account root, connects, creates the
-//!    census bucket and the five streams if absent, and publishes on its sentinel
+//!    census bucket and the five streams if absent, writes its own census key (the
+//!    single census entry ck-bus writes for itself), and publishes on its sentinel
 //!    subject.
 //!
 //! Later boots re-sign the account JWT for the same id and never re-key: the account id
@@ -85,6 +86,9 @@ pub mod cause {
     pub const CLAIMS_READBACK_MISMATCH: &str = "claims-readback-mismatch";
     pub const BOX_USER_UNISSUABLE: &str = "box-user-unissuable";
     pub const STREAMS_UNAVAILABLE: &str = "streams-unavailable";
+    /// ck-bus's own census key could not be written: its spawn generation could not be
+    /// read, or the census write failed.
+    pub const OWN_CENSUS_UNWRITTEN: &str = "own-census-unwritten";
     /// Bootstrap finished; the sentinel, which alone may report the bus up, has not
     /// landed yet.
     pub const SENTINEL_NOT_LANDED: &str = "sentinel-not-landed";
@@ -132,6 +136,73 @@ pub struct BootDeps {
     pub grants: Arc<dyn GrantGeneration>,
     pub store: Store,
     pub incarnation: String,
+    /// ck-bus's own module id and spawn generation, for its own census key.
+    pub own_spawn: Arc<dyn OwnSpawn>,
+}
+
+/// ck-bus's own process as the supervisor sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnProcess {
+    pub module_id: String,
+    pub spawn_generation: u64,
+}
+
+/// Where ck-bus learns its own spawn generation. The generation is the supervisor's,
+/// never counted by ck-bus.
+#[async_trait]
+pub trait OwnSpawn: Send + Sync {
+    async fn own_process(&self) -> Result<OwnProcess, String>;
+}
+
+/// `OwnSpawn` from `supervisor.spawn_snapshot`: the live entry for ck-bus's module id
+/// whose pid is this process.
+pub struct SnapshotOwnSpawn {
+    pub connection_file: std::path::PathBuf,
+    pub module_id: String,
+}
+
+#[async_trait]
+impl OwnSpawn for SnapshotOwnSpawn {
+    async fn own_process(&self) -> Result<OwnProcess, String> {
+        use subc_client_rs::consumer::{ConsumerOptions, SubcConsumer};
+        let consumer = SubcConsumer::connect(&self.connection_file, ConsumerOptions::default())
+            .await
+            .map_err(|error| format!("cannot reach the daemon: {error}"))?;
+        let snapshot = consumer.spawn_snapshot().await;
+        consumer.close().await;
+        let snapshot = snapshot.map_err(|error| format!("supervisor.spawn_snapshot: {error}"))?;
+        let pid = std::process::id();
+        snapshot
+            .live
+            .iter()
+            .find(|spawn| spawn.module_id == self.module_id && spawn.pid == pid)
+            .map(|spawn| OwnProcess {
+                module_id: self.module_id.clone(),
+                spawn_generation: spawn.spawn_generation,
+            })
+            .ok_or_else(|| {
+                format!(
+                    "the spawn snapshot lists no live {} process with pid {pid}",
+                    self.module_id
+                )
+            })
+    }
+}
+
+/// ck-bus's own census value, in the census layout issuance writes for participants
+/// (`issuance::census::CensusValue`, layout version 1). Its user is ck-bus's box-account
+/// user; ck-bus issues itself one user per process, so the epoch is always 0, and it is
+/// bound to no agent id or room.
+pub fn own_census_value(box_user: &str, user_jwt_id: &str, spawn_generation: u64) -> Value {
+    json!({
+        "credential_public": box_user,
+        "user_jwt_id": user_jwt_id,
+        "spawn_generation": spawn_generation,
+        "credential_epoch": 0,
+        "schema_versions": { "census": 1 },
+        "identities": [],
+        "rooms": [],
+    })
 }
 
 /// The broker inputs: the environment as read, and the broker built from it.
@@ -380,13 +451,34 @@ pub async fn boot(
             .await
             .map_err(|error| Failure::retry(cause::STREAMS_UNAVAILABLE, error.message))?;
     }
-    // ck-bus's own census key needs the census key grammar, which the naming crate
-    // does not construct at the pinned revision; the key is not written until it does.
+    // ck-bus's own census key: self-written, under its own box-account user, like every
+    // participant's entry and before its first publish.
+    let own = deps
+        .own_spawn
+        .own_process()
+        .await
+        .map_err(|error| Failure::retry(cause::OWN_CENSUS_UNWRITTEN, error))?;
+    let own_subject = names
+        .census_subject(&own.module_id)
+        .map_err(|error| Failure::stop(cause::NAMING_CONSTRUCTOR_ABSENT, error.to_string()))?;
+    box_plane
+        .census_put(
+            &own_subject,
+            serde_json::to_vec(&own_census_value(
+                &box_user,
+                &box_jwt.jti,
+                own.spawn_generation,
+            ))
+            .unwrap_or_default(),
+        )
+        .await
+        .map_err(|error| Failure::retry(cause::OWN_CENSUS_UNWRITTEN, error.message))?;
     log_event(
-        "ckbus.bootstrap.census_key_skipped",
+        "ckbus.bootstrap.census_written",
         json!({
-            "gate": cause::NAMING_CONSTRUCTOR_ABSENT,
-            "constructor": "census key grammar",
+            "module_id": own.module_id,
+            "spawn_generation": own.spawn_generation,
+            "credential_public": box_user,
         }),
     );
     box_plane

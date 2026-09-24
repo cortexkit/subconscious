@@ -46,9 +46,11 @@ use async_nats::jetstream::{self, consumer::pull};
 use async_trait::async_trait;
 use bootstrap::{
     boot, cause,
-    plane::{apply_account_jwt, ApplyError, BoxPlane, Broker, PlaneError, SystemPlane},
+    plane::{
+        apply_account_jwt, ApplyError, BoxPlane, Broker, ConnectionEvent, PlaneError, SystemPlane,
+    },
     store::Store,
-    BootDeps, BrokerInputs,
+    BootDeps, BrokerInputs, OwnProcess, OwnSpawn,
 };
 use cortexkit_bus_naming::{shipped_streams, AccountNames, StreamSpec};
 use credentials::{
@@ -542,6 +544,32 @@ impl SystemPlane for FakeBroker {
         self.calls.lock().unwrap().push("kick".to_string());
         Ok(())
     }
+
+    async fn watch_connections(
+        &self,
+        _account_public: &str,
+    ) -> Result<tokio::sync::mpsc::UnboundedReceiver<ConnectionEvent>, PlaneError> {
+        // Bootstrap never watches connections; a call here is a bug the test must see.
+        self.calls
+            .lock()
+            .unwrap()
+            .push("watch_connections".to_string());
+        Err(PlaneError::new(
+            "the account-identity FakeBroker does not serve connection events",
+        ))
+    }
+}
+
+/// Bootstrap's own-spawn source for the in-process boot tests in this file. They all
+/// stop before bootstrap writes ck-bus's own census key, so any call returns an error
+/// naming this fake.
+struct NoOwnSpawn;
+
+#[async_trait]
+impl OwnSpawn for NoOwnSpawn {
+    async fn own_process(&self) -> Result<OwnProcess, String> {
+        Err("the account-identity unit arms serve no spawn snapshot".to_string())
+    }
 }
 
 fn unit_deps(trust: &TrustChain, store: &Path, calls: Arc<Mutex<Vec<String>>>) -> BootDeps {
@@ -553,6 +581,7 @@ fn unit_deps(trust: &TrustChain, store: &Path, calls: Arc<Mutex<Vec<String>>>) -
         grants: Arc::new(grants::GrantSeam),
         store: Store::new(store.to_path_buf()),
         incarnation: "unit".to_string(),
+        own_spawn: Arc::new(NoOwnSpawn),
     }
 }
 

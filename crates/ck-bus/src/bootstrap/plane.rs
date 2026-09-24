@@ -2,8 +2,9 @@
 //! driven against a recording fake as well as a real `nats-server`.
 //!
 //! `SystemPlane` is ck-bus's system-account user: the claims list, lookup and update
-//! served by the server's full (directory) resolver, and the kick. `BoxPlane` is ck-bus's
-//! box-account user: stream creation and the sentinel subject.
+//! served by the server's full (directory) resolver, the kick, and the connect and
+//! disconnect events the kick targets are learned from. `BoxPlane` is ck-bus's
+//! box-account user: stream creation, the sentinel subject and the census bucket.
 //!
 //! A claims update is saved by the server without checking that its issuer is trusted
 //! or that its `iat` is newer, so the update's own reply proves nothing about the
@@ -12,10 +13,12 @@
 
 use std::{fmt, sync::Arc, time::Duration};
 
-use async_nats::jetstream::{self, stream};
+use async_nats::jetstream::{self, kv, stream};
 use async_trait::async_trait;
-use cortexkit_bus_naming::{AccountNames, DiscardPolicy, StreamSpec};
+use cortexkit_bus_naming::{AccountNames, DiscardPolicy, StreamSpec, MIB};
+use futures_util::StreamExt;
 use serde_json::{json, Value};
+use tokio::sync::mpsc;
 
 use crate::credentials::Credentials;
 
@@ -25,6 +28,40 @@ const CLAIMS_UPDATE: &str = "$SYS.REQ.CLAIMS.UPDATE";
 const CLAIMS_LIST: &str = "$SYS.REQ.CLAIMS.LIST";
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The census bucket's size cap. The foundation fixes history 1 and no TTL but names no
+/// size, and a stream with no stated size is unbounded, so ck-bus states one. One value
+/// per live module process, each well under 1 KiB (two keys, a jti, two counters and
+/// the bound agent and room lists), so 16 MiB holds tens of thousands of live processes,
+/// far past one machine's supervisor. The stream discards NEW when full: a census write
+/// that does not fit is refused, and issuance fails loudly, instead of the server
+/// evicting a live process's entry, which would read as that process being revoked.
+pub const CENSUS_MAX_BYTES: i64 = 16 * MIB as i64;
+
+/// One stored census value and the KV revision it is stored at. The revision is what a
+/// compare-and-delete names, so a value overwritten since it was read is never deleted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CensusRecord {
+    pub value: Vec<u8>,
+    pub revision: u64,
+}
+
+/// One client connect or disconnect in the box account, from the server's `$SYS`
+/// account events. `user` is the connecting user's public key (`U...`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConnectionEvent {
+    Connected {
+        server_id: String,
+        client_id: u64,
+        user: String,
+    },
+    Disconnected {
+        server_id: String,
+        client_id: u64,
+        user: String,
+        reason: String,
+    },
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlaneError {
@@ -56,12 +93,19 @@ pub trait SystemPlane: Send + Sync {
     async fn update(&self, jwt: &str) -> Result<(), PlaneError>;
     /// Disconnects one client connection on one server.
     async fn kick(&self, server_id: &str, client_id: u64) -> Result<(), PlaneError>;
+    /// Subscribes to the connect and disconnect events of `account_public`'s clients.
+    /// Only connections made while the subscription is open are seen: a client that
+    /// connected earlier appears first in its disconnect event.
+    async fn watch_connections(
+        &self,
+        account_public: &str,
+    ) -> Result<mpsc::UnboundedReceiver<ConnectionEvent>, PlaneError>;
 }
 
 #[async_trait]
 pub trait BoxPlane: Send + Sync {
-    /// Creates the census bucket's backing stream if absent; an existing one with the
-    /// same configuration is left as it is.
+    /// Creates the census bucket's backing stream if absent, and brings an existing one
+    /// to the configuration below (its messages are kept).
     async fn ensure_census(&self, account: &AccountNames) -> Result<(), PlaneError>;
     async fn ensure_stream(&self, spec: &StreamSpec) -> Result<(), PlaneError>;
     async fn publish(&self, subject: &str, payload: Vec<u8>) -> Result<(), PlaneError>;
@@ -69,6 +113,22 @@ pub trait BoxPlane: Send + Sync {
     /// (`AccountNames::census_subject`), answered only once the census stream has stored
     /// it. The bucket keeps one value per key, so this overwrites the module's entry.
     async fn census_put(&self, subject: &str, value: Vec<u8>) -> Result<(), PlaneError>;
+    /// Reads one census key (`AccountNames::census_key`). `Ok(None)` is the bucket's own
+    /// answer that the key holds no value (never written, or deleted); a read that fails
+    /// is an `Err`, never `None`.
+    async fn census_get(
+        &self,
+        account: &AccountNames,
+        key: &str,
+    ) -> Result<Option<CensusRecord>, PlaneError>;
+    /// Deletes one census key only while it is still at `revision`. A key written again
+    /// since that revision is left as it is and the call fails.
+    async fn census_delete(
+        &self,
+        account: &AccountNames,
+        key: &str,
+        revision: u64,
+    ) -> Result<(), PlaneError>;
     /// Creates a participant's durable pull consumer, or updates it to `durable`'s
     /// configuration when it already exists.
     async fn ensure_durable(&self, durable: &DurableConsumer) -> Result<(), PlaneError>;
@@ -308,6 +368,69 @@ impl SystemPlane for NatsSystem {
             None => Ok(()),
         }
     }
+
+    async fn watch_connections(
+        &self,
+        account_public: &str,
+    ) -> Result<mpsc::UnboundedReceiver<ConnectionEvent>, PlaneError> {
+        let mut subscriptions = Vec::new();
+        for kind in ["CONNECT", "DISCONNECT"] {
+            let subject = format!("$SYS.ACCOUNT.{account_public}.{kind}");
+            subscriptions.push(
+                self.client
+                    .subscribe(subject.clone())
+                    .await
+                    .map_err(|error| PlaneError::new(format!("subscribe {subject}: {error}")))?,
+            );
+        }
+        // The subscriptions are registered with the server once this flush returns, so
+        // every connect after it is seen.
+        self.client
+            .flush()
+            .await
+            .map_err(|error| PlaneError::new(format!("flush connection watch: {error}")))?;
+        let (sender, receiver) = mpsc::unbounded_channel();
+        let mut merged = futures_util::stream::select_all(subscriptions);
+        tokio::spawn(async move {
+            while let Some(message) = merged.next().await {
+                if let Some(event) = parse_connection_event(&message.payload) {
+                    if sender.send(event).is_err() {
+                        return;
+                    }
+                }
+            }
+        });
+        Ok(receiver)
+    }
+}
+
+/// Reads one `$SYS` account connect or disconnect event. The server names the connection
+/// by its server id and client id (`cid`), which is what a kick addresses, and the user
+/// by the public key it authenticated with.
+pub fn parse_connection_event(payload: &[u8]) -> Option<ConnectionEvent> {
+    let value: Value = serde_json::from_slice(payload).ok()?;
+    let server_id = value["server"]["id"].as_str()?.to_string();
+    let client = &value["client"];
+    let client_id = client["id"].as_u64()?;
+    let user = client["user"]
+        .as_str()
+        .filter(|user| user.starts_with('U'))
+        .or_else(|| client["nkey"].as_str())?
+        .to_string();
+    match value["type"].as_str()? {
+        "io.nats.server.advisory.v1.client_connect" => Some(ConnectionEvent::Connected {
+            server_id,
+            client_id,
+            user,
+        }),
+        "io.nats.server.advisory.v1.client_disconnect" => Some(ConnectionEvent::Disconnected {
+            server_id,
+            client_id,
+            user,
+            reason: value["reason"].as_str().unwrap_or_default().to_string(),
+        }),
+        _ => None,
+    }
 }
 
 pub struct NatsBox {
@@ -322,10 +445,18 @@ impl BoxPlane for NatsBox {
         // The census is a KV bucket: history 1, no TTL. It is created as its backing
         // stream directly, because the client library's bucket helper first reads the
         // account's JetStream info, which ck-bus's grant does not allow.
+        // Every limit is stated: history 1 and no TTL (a zero max age) are the
+        // foundation's; the size cap is `CENSUS_MAX_BYTES`; message and consumer counts
+        // are unlimited (-1) because history 1 bounds the first and every participant's
+        // census watch is a consumer.
         let config = stream::Config {
             name: buckets.census_stream.clone(),
             subjects: vec![format!("$KV.{}.>", buckets.census)],
             max_messages_per_subject: 1,
+            max_bytes: CENSUS_MAX_BYTES,
+            max_messages: -1,
+            max_consumers: -1,
+            max_age: Duration::ZERO,
             allow_rollup: true,
             deny_delete: true,
             allow_direct: true,
@@ -334,7 +465,15 @@ impl BoxPlane for NatsBox {
             num_replicas: 1,
             ..Default::default()
         };
-        self.create(config).await
+        // Update first, create when absent: a census stream an earlier ck-bus created
+        // without the size cap is brought to it rather than refused as a configuration
+        // mismatch, and its values are kept.
+        let name = config.name.clone();
+        self.jetstream
+            .create_or_update_stream(config)
+            .await
+            .map(|_| ())
+            .map_err(|error| PlaneError::new(format!("create or update stream {name}: {error}")))
     }
 
     async fn ensure_stream(&self, spec: &StreamSpec) -> Result<(), PlaneError> {
@@ -381,6 +520,42 @@ impl BoxPlane for NatsBox {
             .map_err(|error| PlaneError::new(format!("census put {subject} not stored: {error}")))
     }
 
+    async fn census_get(
+        &self,
+        account: &AccountNames,
+        key: &str,
+    ) -> Result<Option<CensusRecord>, PlaneError> {
+        let entry = self
+            .census_store(account)
+            .await?
+            .entry(key)
+            .await
+            .map_err(|error| PlaneError::new(format!("census get {key}: {error}")))?;
+        Ok(entry
+            .filter(|entry| entry.operation == kv::Operation::Put)
+            .map(|entry| CensusRecord {
+                value: entry.value.to_vec(),
+                revision: entry.revision,
+            }))
+    }
+
+    async fn census_delete(
+        &self,
+        account: &AccountNames,
+        key: &str,
+        revision: u64,
+    ) -> Result<(), PlaneError> {
+        self.census_store(account)
+            .await?
+            .delete_expect_revision(key, Some(revision))
+            .await
+            .map_err(|error| {
+                PlaneError::new(format!(
+                    "census delete {key} at revision {revision}: {error}"
+                ))
+            })
+    }
+
     async fn ensure_durable(&self, durable: &DurableConsumer) -> Result<(), PlaneError> {
         let config = jetstream::consumer::pull::Config {
             durable_name: Some(durable.durable.clone()),
@@ -405,6 +580,16 @@ impl BoxPlane for NatsBox {
 }
 
 impl NatsBox {
+    /// The census bucket. Binding to it reads the census stream's info, which the
+    /// bus-module grant allows; the bucket itself is created by `ensure_census`.
+    async fn census_store(&self, account: &AccountNames) -> Result<kv::Store, PlaneError> {
+        let bucket = account.buckets().census.clone();
+        self.jetstream
+            .get_key_value(bucket.clone())
+            .await
+            .map_err(|error| PlaneError::new(format!("census bucket {bucket}: {error}")))
+    }
+
     /// `STREAM.CREATE` is idempotent for an identical configuration, so creating on
     /// every boot is "create if absent" and never touches the stream's messages.
     async fn create(&self, config: stream::Config) -> Result<(), PlaneError> {

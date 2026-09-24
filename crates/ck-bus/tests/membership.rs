@@ -12,8 +12,9 @@
 //! - delete purges the agent's undelivered messages, and deleting an absent durable
 //!   succeeds;
 //! - the list reports each durable's undelivered count;
-//! - the effect-pending read counts undelivered intents, so a dead-lettered one (kept
-//!   in flight by the server) never holds a merge back;
+//! - the effect-pending read counts undelivered and in-flight intents: an exhausted
+//!   intent keeps counting until the next delivery on its durable releases it, and one
+//!   its claimant terms stops at once;
 //! - a participant credential issued before any bind pulls from a durable bound
 //!   afterwards, with no reissue, while a `Direct` principal still gets no credential.
 //!
@@ -811,109 +812,176 @@ async fn the_list_reports_each_durables_undelivered_count() {
     live.stop().await;
 }
 
+/// The ack wait of the effect durable this arm creates itself. Bind creates 30 s; the
+/// arm uses a short one so that "several ack waits later" is quick to reach.
+const POISON_ACK_WAIT: Duration = Duration::from_secs(1);
+
+/// Pulls the next delivery from `consumer`, failing if none arrives.
+async fn next_delivery(
+    consumer: &jetstream::consumer::Consumer<pull::Config>,
+    what: &str,
+) -> jetstream::Message {
+    consumer
+        .fetch()
+        .max_messages(1)
+        .expires(Duration::from_secs(5))
+        .messages()
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap_or_else(|| panic!("{what} arrives"))
+        .expect("a delivered message")
+}
+
+/// Creates `agent`'s effect durable as bind plans it, but with `POISON_ACK_WAIT`.
+async fn short_wait_effect_durable(
+    live: &Live,
+    observer: &jetstream::Context,
+    agent: &str,
+) -> jetstream::consumer::Consumer<pull::Config> {
+    let plan = membership::agent_durables(&live.names, agent)
+        .unwrap()
+        .into_iter()
+        .find(|plan| plan.stream == live.names.streams().effect)
+        .unwrap();
+    observer
+        .create_consumer_on_stream(
+            pull::Config {
+                durable_name: Some(plan.durable.clone()),
+                filter_subject: plan.filter_subjects[0].clone(),
+                ack_policy: jetstream::consumer::AckPolicy::Explicit,
+                ack_wait: POISON_ACK_WAIT,
+                max_deliver: plan.max_deliver,
+                max_ack_pending: plan.max_ack_pending,
+                ..Default::default()
+            },
+            plan.stream.clone(),
+        )
+        .await
+        .expect("the harness creates the effect durable")
+}
+
+/// Delivers the next intent `max_deliver` times, answering each delivery with a nak, or
+/// with a term on the last one when `term_last` is set.
+async fn exhaust(
+    consumer: &jetstream::consumer::Consumer<pull::Config>,
+    payload: &[u8],
+    term_last: bool,
+) {
+    for delivery in 1..=membership::EFFECT_MAX_DELIVER {
+        let message = next_delivery(consumer, "an intent delivery").await;
+        assert_eq!(message.payload.as_ref(), payload);
+        assert_eq!(message.info().unwrap().delivered, delivery);
+        let kind = if term_last && delivery == membership::EFFECT_MAX_DELIVER {
+            AckKind::Term
+        } else {
+            AckKind::Nak(None)
+        };
+        message.ack_with(kind).await.expect("reply sent");
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_dead_lettered_intent_is_not_counted_as_effects_pending() {
+async fn an_exhausted_intent_keeps_counting_as_effects_pending_until_termed() {
     let _gate = harness::acceptance_gate().await;
     harness::install_tracing();
     let Some(live) = start(&[PREFRONTAL]).await else {
         return;
     };
     let observer = live.observer().await;
-    let agent = "agent_effect_a";
-    let params = json!({"agent_id": agent});
+    let (poisoned, termed) = ("agent_effect_poisoned", "agent_effect_termed");
+    let read = |agent: &'static str| {
+        live.prefrontal(membership::EFFECTS_PENDING_OP, json!({"agent_id": agent}))
+    };
 
-    let unbound = live
-        .prefrontal(membership::EFFECTS_PENDING_OP, params.clone())
-        .await;
+    let unbound = read(poisoned).await;
     assert_eq!(unbound["bound"], false, "{unbound}");
     assert_eq!(unbound["pending"], 0, "{unbound}");
 
-    live.prefrontal(membership::BIND_OP, params.clone()).await;
+    // An intent refused (nak) on every delivery until max_deliver is exhausted.
+    let consumer = short_wait_effect_durable(&live, &observer, poisoned).await;
     stored_publish(
         &observer,
-        live.names.effect_intent(agent, "sess_poison").unwrap(),
+        live.names.effect_intent(poisoned, "sess_poison").unwrap(),
         b"poisoned",
     )
     .await;
-    let queued = live
-        .prefrontal(membership::EFFECTS_PENDING_OP, params.clone())
-        .await;
+    let queued = read(poisoned).await;
     assert_eq!(queued["undelivered"], 1, "{queued}");
+    assert_eq!(queued["pending"], 1, "{queued}");
+    let first = next_delivery(&consumer, "the first delivery").await;
+    let in_flight = read(poisoned).await;
+    assert_eq!(in_flight["undelivered"], 0, "{in_flight}");
+    assert_eq!(in_flight["in_flight"], 1, "{in_flight}");
     assert_eq!(
-        queued["pending"], 1,
-        "the counter sees a deliverable intent: {queued}"
+        in_flight["pending"], 1,
+        "delivered and unacked still counts"
     );
-
-    // The intent is refused on every delivery until max_deliver (5) is exhausted.
-    let consumer: jetstream::consumer::Consumer<pull::Config> = observer
-        .get_consumer_from_stream(
-            AccountNames::consumer_name(agent).unwrap(),
-            live.names.streams().effect.clone(),
-        )
-        .await
-        .unwrap();
-    for delivery in 1..=membership::EFFECT_MAX_DELIVER {
-        let message = consumer
-            .fetch()
-            .max_messages(1)
-            .expires(Duration::from_secs(5))
-            .messages()
+    first.ack_with(AckKind::Nak(None)).await.expect("nak sent");
+    for _ in 2..=membership::EFFECT_MAX_DELIVER {
+        next_delivery(&consumer, "a poisoned delivery")
             .await
-            .unwrap()
-            .next()
-            .await
-            .unwrap_or_else(|| panic!("delivery {delivery} arrives"))
-            .expect("a delivered message");
-        assert_eq!(message.info().unwrap().delivered, delivery);
-        if delivery == 1 {
-            // Delivered and unacked: reported in flight, and no longer undelivered.
-            let in_flight = live
-                .prefrontal(membership::EFFECTS_PENDING_OP, params.clone())
-                .await;
-            assert_eq!(in_flight["in_flight"], 1, "{in_flight}");
-            assert_eq!(in_flight["undelivered"], 0, "{in_flight}");
-        }
-        message
             .ack_with(AckKind::Nak(None))
             .await
             .expect("nak sent");
     }
-    // The server keeps an exhausted intent among the delivered-and-unacked (in flight)
-    // until its ack wait passes, so the read must not count in-flight intents: this one
-    // would otherwise hold a merge back for as long as it sits there.
-    let exhausted = live
-        .prefrontal(membership::EFFECTS_PENDING_OP, params.clone())
-        .await;
-    assert_eq!(exhausted["undelivered"], 0, "{exhausted}");
-    assert_eq!(
-        exhausted["pending"], 0,
-        "a dead-lettered intent is not pending: {exhausted}"
-    );
-    let redelivered = consumer
-        .fetch()
-        .max_messages(1)
-        .expires(Duration::from_secs(2))
-        .messages()
-        .await
-        .unwrap()
-        .next()
-        .await;
-    assert!(
-        redelivered.is_none(),
-        "the exhausted intent is never delivered again"
-    );
 
-    // A new intent is counted again: the read is live, not stuck at zero.
+    // Exhausted and never delivered again, yet the server keeps it in flight: it still
+    // counts several ack waits later, so a merge waits for it rather than purging it.
+    tokio::time::sleep(POISON_ACK_WAIT * 3).await;
+    let exhausted = read(poisoned).await;
+    assert_eq!(exhausted["undelivered"], 0, "{exhausted}");
+    assert_eq!(exhausted["in_flight"], 1, "{exhausted}");
+    assert_eq!(exhausted["pending"], 1, "{exhausted}");
+
+    // The next delivery on the same durable releases it: once a new intent is
+    // delivered, only that one is in flight.
     stored_publish(
         &observer,
-        live.names.effect_intent(agent, "sess_fresh").unwrap(),
-        b"fresh",
+        live.names.effect_intent(poisoned, "sess_next").unwrap(),
+        b"next",
     )
     .await;
-    let fresh = live
-        .prefrontal(membership::EFFECTS_PENDING_OP, params)
-        .await;
-    assert_eq!(fresh["pending"], 1, "{fresh}");
+    let next = next_delivery(&consumer, "the next intent").await;
+    assert_eq!(
+        next.payload.as_ref(),
+        b"next",
+        "the exhausted intent is never redelivered"
+    );
+    let released = read(poisoned).await;
+    assert_eq!(
+        released["in_flight"], 1,
+        "only the new intent is in flight: {released}"
+    );
+    assert_eq!(released["pending"], 1, "{released}");
+
+    // On another agent's durable, an intent its claimant terms on the last delivery
+    // (dead-letter record written, then term) stops counting at once.
+    let consumer = short_wait_effect_durable(&live, &observer, termed).await;
+    stored_publish(
+        &observer,
+        live.names.effect_intent(termed, "sess_termed").unwrap(),
+        b"termed",
+    )
+    .await;
+    exhaust(&consumer, b"termed", true).await;
+    let termed_at = Instant::now();
+    // Before the server applies the term, pending reads 1; waiting for 0 cannot pass
+    // on that earlier state.
+    let after_term = wait_for(
+        "a termed intent stops counting",
+        POISON_ACK_WAIT,
+        || read(termed),
+        |reply| reply["pending"] == 0,
+    )
+    .await;
+    assert!(
+        termed_at.elapsed() < POISON_ACK_WAIT,
+        "the term took effect only after {:?}",
+        termed_at.elapsed()
+    );
+    assert_eq!(after_term["in_flight"], 0, "{after_term}");
     passed();
     live.stop().await;
 }

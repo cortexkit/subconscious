@@ -74,7 +74,8 @@ use harness::{
     report::{Row, RowReport, ServedBy},
 };
 use spawn_consumer::{
-    Census, CensusEntry, FeedEnd, Fence, Revoked, SpawnConsumer, SpawnFeed, SpawnSource, Status,
+    Census, CensusEntry, FeedEnd, Fence, RevokeOutcome, SpawnConsumer, SpawnFeed, SpawnSource,
+    Status,
 };
 use subc_client_rs::consumer::{
     CallError, SpawnCursor, SpawnEvent, SpawnEventKind, SpawnSnapshot, SpawnStreamError,
@@ -142,6 +143,7 @@ impl RecordingCensus {
         self.revokes.lock().unwrap().clone()
     }
 
+    #[cfg_attr(not(unix), allow(dead_code))]
     fn listings(&self) -> usize {
         *self.listings.lock().unwrap()
     }
@@ -154,7 +156,7 @@ impl Census for RecordingCensus {
         Ok(self.entries.lock().unwrap().clone())
     }
 
-    async fn revoke(&self, module_id: &str, fence: Fence) -> Result<Revoked, String> {
+    async fn revoke(&self, module_id: &str, fence: Fence) -> Result<RevokeOutcome, String> {
         self.revokes
             .lock()
             .unwrap()
@@ -164,14 +166,14 @@ impl Census for RecordingCensus {
             .iter()
             .position(|entry| entry.module_id == module_id)
         else {
-            return Ok(Revoked::NoEntry);
+            return Ok(RevokeOutcome::NoEntry);
         };
         let entry_generation = entries[index].spawn_generation;
         if !fence.admits(entry_generation) {
-            return Ok(Revoked::Fenced { entry_generation });
+            return Ok(RevokeOutcome::Fenced { entry_generation });
         }
         entries.remove(index);
-        Ok(Revoked::Revoked { entry_generation })
+        Ok(RevokeOutcome::Revoked { entry_generation })
     }
 }
 
@@ -325,6 +327,7 @@ fn stored_cursor(store: &Path) -> SpawnCursor {
         .expect("spawn_cursor.json holds a cursor")
 }
 
+#[cfg_attr(not(unix), allow(dead_code))]
 async fn daemon_snapshot(connection_file: &Path) -> SpawnSnapshot {
     let response = control::response(
         connection_file,

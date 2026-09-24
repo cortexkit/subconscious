@@ -478,8 +478,7 @@ async fn the_cursor_reads_back_from_the_store_and_a_damaged_one_yields_a_fresh_s
     // The reconciliation just before that subscription is the restarted process's own.
     let fresh = bus::events(&run.root(), "ckbus.spawn.reconciled")
         .into_iter()
-        .filter(|line| line["at_ms"].as_u64() <= subscribed["at_ms"].as_u64())
-        .last()
+        .rfind(|line| line["at_ms"].as_u64() <= subscribed["at_ms"].as_u64())
         .expect("the restarted ck-bus reconciled");
     assert_eq!(fresh["reason"], "start");
     assert_eq!(

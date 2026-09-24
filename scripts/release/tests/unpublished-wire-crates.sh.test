@@ -27,7 +27,7 @@ write_current_responses() {
   mkdir -p "$dir"
   local crate
   for crate in subc-protocol subc-transport subc-control subc-client-rs \
-    subc-jsonc subc-cgroup subc-uptime subc-daemon; do
+    subc-jsonc subc-cgroup subc-uptime subc-os subc-daemon; do
     write_response "$dir" "$crate" "$(manifest_version "$crate")"
   done
 }
@@ -84,7 +84,7 @@ subc-control $(manifest_version subc-control)" 0 \
 
 daemon_and_leaves="$test_root/daemon-and-leaves"
 write_current_responses "$daemon_and_leaves"
-for crate in subc-jsonc subc-cgroup subc-uptime subc-daemon; do
+for crate in subc-jsonc subc-cgroup subc-uptime subc-os subc-daemon; do
   printf '%s\n' 404 >"$daemon_and_leaves/$crate.status"
   printf '%s\n' '{"errors":[{"detail":"crate does not exist"}]}' \
     >"$daemon_and_leaves/$crate.json"
@@ -93,6 +93,7 @@ check_case daemon-after-its-leaves \
   "subc-jsonc $(manifest_version subc-jsonc)
 subc-cgroup $(manifest_version subc-cgroup)
 subc-uptime $(manifest_version subc-uptime)
+subc-os $(manifest_version subc-os)
 subc-daemon $(manifest_version subc-daemon)" 0 \
   bash "$detector" --registry-json-dir "$daemon_and_leaves"
 

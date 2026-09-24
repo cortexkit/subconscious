@@ -17,6 +17,7 @@ pub(crate) mod dispatch_spike;
 pub mod fleet_lint;
 pub mod forwarding;
 pub mod identity;
+mod live_children;
 pub mod machine_id;
 pub mod observability;
 #[allow(dead_code)]

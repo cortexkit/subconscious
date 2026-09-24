@@ -1831,7 +1831,7 @@ dependencies = [
 
 [[package]]
 name = "subc-core"
-version = "0.20.28"
+version = "0.20.29"
 dependencies = [
  "base64",
  "cortexkit-log",
@@ -1857,7 +1857,7 @@ dependencies = [
 
 [[package]]
 name = "subc-daemon"
-version = "0.21.9"
+version = "0.21.10"
 dependencies = [
  "cortexkit-log",
  "cortexkit-paths",
@@ -1873,6 +1873,7 @@ dependencies = [
  "subc-cgroup",
  "subc-control",
  "subc-jsonc",
+ "subc-os",
  "subc-protocol",
  "subc-transport",
  "subc-uptime",
@@ -1914,6 +1915,14 @@ dependencies = [
  "subc-transport",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "subc-os"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "rustix",
 ]
 
 [[package]]

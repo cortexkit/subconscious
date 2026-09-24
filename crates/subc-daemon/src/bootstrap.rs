@@ -133,6 +133,14 @@ pub struct BootstrapConfig {
     /// derive the operator's real data home and mint into it. The shipped binary
     /// supplies `<data home>/cortexkit/machine-id` explicitly.
     machine_id_path: Option<PathBuf>,
+    /// The live-children record: every supervised process this daemon has
+    /// running, kept so the next daemon can end the ones a crash left behind.
+    /// At startup, before any module is spawned, the previous daemon's record
+    /// here is swept. `None` keeps no record and sweeps nothing, for the same
+    /// reason as `capture_logs_dir`: an in-process daemon booted by a test
+    /// must never signal processes listed in the operator's real run
+    /// directory. The shipped binary supplies `<run dir>/live-children.json`.
+    live_children_path: Option<PathBuf>,
 }
 
 impl BootstrapConfig {
@@ -154,7 +162,16 @@ impl BootstrapConfig {
             capture_logs_dir: None,
             terminal_journal_path: None,
             machine_id_path: None,
+            live_children_path: None,
         }
+    }
+
+    /// Keep the live-children record at `path`, and at startup end the
+    /// processes a previous daemon recorded there that are still running.
+    /// Embedding daemons and tests pass a path inside their own fixture tree.
+    pub fn with_live_children_record(mut self, path: impl Into<PathBuf>) -> Self {
+        self.live_children_path = Some(path.into());
+        self
     }
 
     /// Serve the machine id stored at `path`, minting it there at startup when
@@ -205,6 +222,7 @@ impl BootstrapConfig {
         Ok(Self::from_env()?
             .with_capture_logs_dir(run_dir.join("logs"))
             .with_terminal_journal_path(run_dir.join("terminals.jsonl"))
+            .with_live_children_record(crate::live_children::record_path(&run_dir))
             .with_machine_id_path(machine_id_path))
     }
 
@@ -466,6 +484,7 @@ pub async fn run_with_config(config: BootstrapConfig) -> Result<(), BootstrapErr
     let cgroup_placement_config = config.cgroup_placement.clone();
     let capture_logs_dir = config.capture_logs_dir.clone();
     let terminal_journal_path = config.terminal_journal_path.clone();
+    let live_children_path = config.live_children_path.clone();
     match ensure_singleton_with_config(config).await? {
         Outcome::AlreadyRunning => {
             info!("subc daemon already running");
@@ -488,6 +507,7 @@ pub async fn run_with_config(config: BootstrapConfig) -> Result<(), BootstrapErr
                 watchdog_config,
                 capture_logs_dir,
                 terminal_journal_path,
+                live_children_path,
                 #[cfg(target_os = "linux")]
                 cgroup_placement,
             )
@@ -612,6 +632,7 @@ async fn serve_bound_daemon(
     watchdog_config: DaemonSelfWatchdogConfig,
     capture_logs_dir: Option<PathBuf>,
     terminal_journal_path: Option<PathBuf>,
+    live_children_path: Option<PathBuf>,
     #[cfg(target_os = "linux")] cgroup_placement: Option<subc_cgroup::Placement>,
 ) -> Result<(), BootstrapError> {
     #[cfg(unix)]
@@ -630,6 +651,21 @@ async fn serve_bound_daemon(
         machine_id = bound.machine_id.as_ref().map(|id| id.as_str()).unwrap_or("none"),
         "subc daemon starting"
     );
+
+    // Before anything can spawn a module (the configured modules below, or a
+    // client's start request once the listeners are served): a previous daemon
+    // that died without its shutdown stop may have left children running, and
+    // a fresh copy beside one would fight it for its port and stores. This
+    // daemon has already claimed the singleton (a live one would have made it
+    // exit as already running), so the record is not a running daemon's.
+    if let Some(path) = &live_children_path {
+        crate::live_children::sweep_orphans(
+            path,
+            &crate::live_children::AdoptedPids::none(),
+            crate::live_children::SweepBounds::default(),
+        )
+        .await;
+    }
 
     let registry = Arc::new(Registry::default());
     let process_liveness = Arc::new(SupervisorProcessLiveness::new());
@@ -688,6 +724,10 @@ async fn serve_bound_daemon(
     };
     let supervisor = match capture_logs_dir {
         Some(dir) => supervisor.with_capture_logs_dir(dir),
+        None => supervisor,
+    };
+    let supervisor = match live_children_path {
+        Some(path) => supervisor.with_live_children_record(path),
         None => supervisor,
     };
     #[cfg(target_os = "linux")]

@@ -73,27 +73,33 @@ impl Fixture {
             serde_json::to_vec(&json!({ "version": 1, "modules": modules })).unwrap(),
         )
         .unwrap();
-        // The daemon leads its own process group, as it does under launchd
-        // (which starts each job in a new session). That is what lets a test
-        // compare a module's group against the daemon's, and reproduce the
-        // service manager's kill of that group after the daemon exits.
-        let child = Command::new(env!("CARGO_BIN_EXE_ck-subc"))
-            .process_group(0)
-            .env("XDG_DATA_HOME", root.join("data"))
-            .env("XDG_CONFIG_HOME", root.join("config"))
-            .env("XDG_RUNTIME_DIR", root.join("runtime"))
-            .env("SUBC_PORT", "0")
-            .env("SUBC_CGROUP_PLACEMENT", "disabled")
-            .env_remove("CK_LOG")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
+        let child = spawn_daemon(&root);
         let mut fixture = Self {
             root,
             child,
             _permit: permit,
         };
+        fixture.wait_ready(none_module.is_some());
+        fixture
+    }
+
+    /// Start another daemon over the same directories, after the previous one
+    /// has exited, and wait for it the way `boot_with` does.
+    fn restart_daemon(&mut self, none_module: bool) {
+        assert!(
+            self.child.try_wait().unwrap().is_some(),
+            "the previous daemon must have exited first"
+        );
+        // Fresh markers, so the waits below see the new daemon's children.
+        for file in ["observer.pid", "wire-less.pid", "wire-less.ready"] {
+            let _ = fs::remove_file(self.root.join(file));
+        }
+        self.child = spawn_daemon(&self.root);
+        self.wait_ready(none_module);
+    }
+
+    fn wait_ready(&mut self, none_module: bool) {
+        let fixture = self;
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             assert!(
@@ -116,7 +122,7 @@ impl Fixture {
             assert!(Instant::now() < deadline, "module did not register");
             thread::sleep(Duration::from_millis(10));
         }
-        if none_module.is_some() {
+        if none_module {
             // The ready file is written only after the stub's SIGTERM handler
             // is installed; signalling earlier would meet the default
             // disposition and say nothing about the daemon.
@@ -128,7 +134,6 @@ impl Fixture {
                 thread::sleep(Duration::from_millis(10));
             }
         }
-        fixture
     }
 
     fn pid_of(&self, file: &str) -> i32 {
@@ -224,6 +229,27 @@ impl Drop for Fixture {
             }
         }
     }
+}
+
+/// Start the shipped daemon binary with every per-user location inside `root`.
+///
+/// The daemon leads its own process group, as it does under launchd (which
+/// starts each job in a new session). That is what lets a test compare a
+/// module's group against the daemon's, and reproduce the service manager's
+/// kill of that group after the daemon exits.
+fn spawn_daemon(root: &TestTempDir) -> Child {
+    Command::new(env!("CARGO_BIN_EXE_ck-subc"))
+        .process_group(0)
+        .env("XDG_DATA_HOME", root.join("data"))
+        .env("XDG_CONFIG_HOME", root.join("config"))
+        .env("XDG_RUNTIME_DIR", root.join("runtime"))
+        .env("SUBC_PORT", "0")
+        .env("SUBC_CGROUP_PLACEMENT", "disabled")
+        .env_remove("CK_LOG")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap()
 }
 
 /// Merges `extra` into a module's config: `env` entries into its environment,
@@ -461,6 +487,61 @@ fn child_ignoring_sigterm_is_killed_within_the_shutdown_bound() {
     assert!(
         !process_alive(wire_less),
         "a child ignoring SIGTERM must still not outlive the daemon"
+    );
+}
+
+/// A daemon killed outright runs no shutdown stop, and modules lead their own
+/// process groups, so its `protocol: "none"` child outlives it. The next daemon
+/// must end that orphan, from the live-children record the first one kept,
+/// before it spawns the module again: two copies would fight over one port.
+#[test]
+fn orphan_of_a_killed_daemon_is_ended_by_the_next_daemon_before_it_respawns() {
+    let marker = fresh_dir("orphan-marker");
+    let marker_path = marker.join("sigterm");
+    let mut fixture = Fixture::boot_with(
+        false,
+        json!({}),
+        Some(json!({ "env": { "FAKE_AFT_SIGTERM_MARKER_PATH": marker_path } })),
+    );
+    let orphan = fixture.pid_of("wire-less.pid");
+    fixture.kill_daemon_group();
+    fixture.child.wait().unwrap();
+    assert!(
+        process_alive(orphan),
+        "precondition: a protocol none child outlives a SIGKILLed daemon"
+    );
+    assert!(
+        !marker_path.exists(),
+        "nothing has signalled the orphan yet"
+    );
+
+    fixture.restart_daemon(true);
+    let replacement = fixture.pid_of("wire-less.pid");
+    assert_ne!(replacement, orphan, "the module was spawned again");
+    assert!(
+        !process_alive(orphan),
+        "the next daemon must end the previous daemon's orphan"
+    );
+    assert_eq!(
+        fs::read_to_string(&marker_path).ok().as_deref(),
+        Some("sigterm\n"),
+        "the orphan must be asked to stop with SIGTERM first"
+    );
+    // Both daemons log into the same file; look only at the second one's lines.
+    let log = daemon_log(&fixture);
+    let second_boot = log
+        .rfind("subc daemon starting")
+        .expect("the second daemon logged its start");
+    let log = &log[second_boot..];
+    let swept = log
+        .find("orphan sweep: previous daemon's child exited after SIGTERM")
+        .unwrap_or_else(|| panic!("no sweep decision in the second daemon's log:\n{log}"));
+    let supervised = log
+        .find("configured module supervised")
+        .expect("the second daemon supervised its modules");
+    assert!(
+        swept < supervised,
+        "the orphan must be gone before any module is spawned again:\n{log}"
     );
 }
 

@@ -2233,6 +2233,14 @@ impl Supervisor {
         self
     }
 
+    /// Keeps a record of every live child at `path`, rewritten on each spawn and
+    /// reap, for the orphan sweep a later daemon runs at boot. Without it no
+    /// record is kept.
+    pub fn with_live_children_record(self, path: impl Into<PathBuf>) -> Self {
+        self.child_roster.record_to(path.into());
+        self
+    }
+
     #[cfg(target_os = "linux")]
     pub fn with_cgroup_placement(
         mut self,
@@ -5791,11 +5799,28 @@ fn spawn_child_in_slot(
     })?;
     let process_start_time = crate::provenance::process_start_time(pid);
     let process_identity = process_start_time.map(|start_time| ProcessIdentity { pid, start_time });
+    // The executable identity is the spawned path's, read above, not the
+    // running image's: right after spawn the child may not have finished its
+    // exec yet and would still report this daemon's own image.
+    #[cfg(target_os = "linux")]
+    let recorded_cgroup_name = cgroup_path.as_ref().map(|_| cgroup_name.clone());
+    #[cfg(not(target_os = "linux"))]
+    let recorded_cgroup_name = None;
     let roster_guard = roster.admit(
         spec.module_id.clone(),
         pid,
         spec.protocol,
         process_start_time,
+        crate::child_roster::RecordedIdentity {
+            start_time: subc_os::start_time(pid),
+            executable: spawned_file_identity.map(|identity| {
+                crate::live_children::ExecutableIdentity {
+                    device: identity.device,
+                    inode: identity.inode,
+                }
+            }),
+            cgroup_name: recorded_cgroup_name,
+        },
     );
     // The check at the top of this function can pass just before daemon
     // shutdown begins, and the process is only in the roster from here on.

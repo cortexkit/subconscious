@@ -14,19 +14,23 @@
 
 use std::{
     collections::HashMap,
+    path::PathBuf,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc, Mutex, MutexGuard,
+        Arc, Mutex, MutexGuard, OnceLock,
     },
     time::Duration,
 };
 
 use subc_control::ModuleProtocol;
+use tracing::warn;
+
+use crate::live_children::{ExecutableIdentity, LiveChild};
 
 /// One live supervised process.
 ///
-/// Read only by the Unix shutdown stop; Windows child lifetime is a job-object
-/// concern, so there the entry is recorded and never consulted.
+/// Signalled only by the Unix shutdown stop; Windows child lifetime is a
+/// job-object concern, so there the entry only feeds the live-children record.
 #[cfg_attr(not(unix), allow(dead_code))]
 #[derive(Debug, Clone)]
 pub(crate) struct RosterEntry {
@@ -36,9 +40,21 @@ pub(crate) struct RosterEntry {
     /// Kernel start time where the platform exposes one, used to refuse a
     /// signal to a different process that has reused a reaped child's pid.
     pub(crate) start_time: Option<u64>,
+    /// What the live-children record says about this process, for the next
+    /// daemon's orphan sweep if this one dies without stopping it.
+    recorded: RecordedIdentity,
     /// The module's resolved drain budget, shared with its supervisor so a
     /// configuration rescan that changes it is seen at shutdown.
     drain_budget: Arc<Mutex<Duration>>,
+}
+
+/// The identity facts the live-children record keeps for one process beyond
+/// its module id, pid and protocol. See `live_children::LiveChild`.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RecordedIdentity {
+    pub(crate) start_time: Option<u64>,
+    pub(crate) executable: Option<ExecutableIdentity>,
+    pub(crate) cgroup_name: Option<String>,
 }
 
 /// Set once, when the daemon begins its announced shutdown, and never cleared.
@@ -66,6 +82,40 @@ struct RosterInner {
     next_key: AtomicU64,
     closed: DaemonShutdownFlag,
     live: Mutex<HashMap<u64, RosterEntry>>,
+    /// Where the live-children record is written; unset means no record, the
+    /// default for an in-process daemon (see `BootstrapConfig`).
+    record_path: OnceLock<PathBuf>,
+}
+
+impl RosterInner {
+    /// Rewrite the record from `live`. Called with the `live` lock held, so
+    /// concurrent admits and releases write their snapshots in the order they
+    /// changed the roster and the last write on disk is the current roster.
+    fn write_record(&self, live: &HashMap<u64, RosterEntry>) {
+        let Some(path) = self.record_path.get() else {
+            return;
+        };
+        let mut entries: Vec<(&u64, &RosterEntry)> = live.iter().collect();
+        entries.sort_by_key(|(key, _)| **key);
+        let children: Vec<LiveChild> = entries
+            .into_iter()
+            .map(|(_, entry)| LiveChild {
+                module_id: entry.module_id.clone(),
+                pid: entry.pid,
+                protocol: entry.protocol,
+                start_time: entry.recorded.start_time,
+                executable: entry.recorded.executable,
+                cgroup_name: entry.recorded.cgroup_name.clone(),
+            })
+            .collect();
+        if let Err(error) = crate::live_children::write_record(path, &children) {
+            warn!(
+                path = %path.display(),
+                %error,
+                "could not rewrite the live-children record; a crash now could leave orphans the next boot cannot find"
+            );
+        }
+    }
 }
 
 /// Shared by every clone of one `Supervisor` and every module task it starts.
@@ -96,7 +146,10 @@ pub(crate) struct RosterGuard {
 
 impl Drop for RosterGuard {
     fn drop(&mut self) {
-        lock(&self.inner.live).remove(&self.key);
+        let mut live = lock(&self.inner.live);
+        if live.remove(&self.key).is_some() {
+            self.inner.write_record(&live);
+        }
     }
 }
 
@@ -122,24 +175,35 @@ impl ChildRoster {
         self.inner.closed.clone()
     }
 
+    /// Keep the live-children record at `path` from now on. Set once, before
+    /// anything is admitted; a second call is ignored.
+    pub(crate) fn record_to(&self, path: PathBuf) {
+        let _ = self.inner.record_path.set(path);
+    }
+
     pub(crate) fn admit(
         &self,
         module_id: String,
         pid: u32,
         protocol: ModuleProtocol,
         start_time: Option<u64>,
+        recorded: RecordedIdentity,
     ) -> RosterGuard {
         let key = self.inner.next_key.fetch_add(1, Ordering::Relaxed);
-        lock(&self.inner.live).insert(
+        let mut live = lock(&self.inner.live);
+        live.insert(
             key,
             RosterEntry {
                 module_id,
                 pid,
                 protocol,
                 start_time,
+                recorded,
                 drain_budget: Arc::clone(&self.drain_budget),
             },
         );
+        self.inner.write_record(&live);
+        drop(live);
         RosterGuard {
             inner: Arc::clone(&self.inner),
             key,

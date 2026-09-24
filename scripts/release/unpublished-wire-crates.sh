@@ -46,6 +46,7 @@ wire_crates=(
   subc-jsonc
   subc-cgroup
   subc-uptime
+  subc-os
   subc-daemon
 )
 unpublished=()

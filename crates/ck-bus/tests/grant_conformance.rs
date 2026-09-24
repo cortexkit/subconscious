@@ -572,8 +572,9 @@ async fn generated_grants_hold_on_a_live_server() {
     run.shutdown().await;
 }
 
-/// The golden-commit half: regenerating prefrontal's committed golden from this
-/// generator is a prefrontal commit, which no subconscious slice makes.
+/// The golden-commit half: the committed permission golden lives in the prefrontal
+/// repository, so regenerating it from this generator is a change there, which this
+/// repository's tests never make.
 #[test]
 fn the_golden_commit_half_waits_for_the_prefrontal_seat() {
     RowReport::skipped(

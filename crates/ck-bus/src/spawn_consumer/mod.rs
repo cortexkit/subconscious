@@ -33,7 +33,7 @@
 //! own module is skipped: its previous box users are revoked by bootstrap, by name.
 //!
 //! Absence is neutral: a census or snapshot read that fails concludes nothing and is
-//! retried after `retry`.
+//! retried after the consumer's `retry` interval (the sentinel period in production).
 
 pub mod census;
 pub mod cursor;
@@ -481,8 +481,9 @@ fn revoked_json(outcome: &RevokeOutcome) -> Value {
 }
 
 /// The one wiring call: the consumer over ck-bus's daemon connection file and the
-/// revocation area's `Revoker`, started as a task. `retry` is the sentinel period, the
-/// retry interval of every deferral.
+/// shared `Revoker`, started as a task. `retry` is how long the consumer waits before
+/// retrying a census or snapshot read that failed; `main` passes the sentinel period,
+/// which every other ck-bus retry uses too.
 pub fn wire(
     connection_file: PathBuf,
     revoker: Arc<Revoker>,

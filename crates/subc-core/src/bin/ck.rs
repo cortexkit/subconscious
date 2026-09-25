@@ -4320,7 +4320,13 @@ async fn quota(
         print_quota_table(&providers, provider_filter, verbose, redact, subc);
         let project_root = env::current_dir()
             .map_err(|source| CkError::Message(format!("current directory: {source}")))?;
-        for line in subscription_value_lines(client, project_root, provider_filter, verbose).await {
+        let value_lines =
+            subscription_value_lines(client, project_root, provider_filter, verbose).await;
+        if !value_lines.is_empty() {
+            // A blank line sets the section apart from the quota table's last row.
+            println!();
+        }
+        for line in value_lines {
             println!("{line}");
         }
     }

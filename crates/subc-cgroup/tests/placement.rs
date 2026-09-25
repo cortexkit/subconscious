@@ -1,9 +1,6 @@
 #![cfg(target_os = "linux")]
 
-use std::{
-    fs, io,
-    path::{Path, PathBuf},
-};
+use std::{fs, io, path::Path};
 use subc_test_support::TestTempDir;
 
 use subc_cgroup::{apply, prepare_at};

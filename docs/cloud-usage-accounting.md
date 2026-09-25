@@ -1,6 +1,6 @@
 # Cloud Usage Accounting: the CloudUsageFact contract
 
-Status: DRAFT r4 (r3 + the first-producer rulings [#21][#22]: byte_hours arithmetic, conflict events never settle, deny-unknown-fields enforced per fact, DO-SQL rows counted, class A retry undercount; ASTRO seat review pending) — custody SUBC, seats ASTRO (domain owner) / ENGRAM (first
+Status: DRAFT r5 (r4 + `metered_since`, the lower bound on a service's metering [#27]; r4 = the first-producer rulings [#21][#22]: byte_hours arithmetic, conflict events never settle, deny-unknown-fields enforced per fact, DO-SQL rows counted, class A retry undercount; ASTRO seat review pending) — custody SUBC, seats ASTRO (domain owner) / ENGRAM (first
 producer) / CKCRED (cloud infra custody). Ufuk directive 2026-07-20: build the non-politic
 half of cloud cost accounting first — per-account metering, spend visibility, and
 user-set limits. Invoice/billing folds are OUT OF SCOPE here (a later doc consumes this
@@ -77,6 +77,17 @@ Field rules:
 - **Late facts are legal** (a worker may fold an hour late); consumers read
   watermark-style (facts through hour H complete when the service's emission watermark
   passes H). Each service publishes its watermark as part of emission.
+- **(r5) The watermark is only an upper bound.** "Complete through H" cannot say when
+  metering began, so on its own a reader takes every hour before a service started
+  metering as complete with zero usage, which is false: those hours were not measured.
+  Each service therefore also publishes `metered_since`, the UTC instant its current
+  metering began for that account, beside the watermark. Readers render hours that end
+  at or before `metered_since` as "not metered", never as zero, and the hour containing
+  it as partial for every meter, not only storage. `metered_since` is set once, when an
+  account's metering first begins, and never moves later: it describes where the
+  record starts, not gaps inside it, and a producer that loses metering state mid-record
+  is a correctness incident handled by restatement (above). The ledger cannot tell "no
+  usage" from "not measured" by itself; this field is how it learns.
 
 ## 3. Meter classes (how quantities are obtained)
 
@@ -144,8 +155,9 @@ Three classes, declared per resource in the registry:
   truthful by construction.
 - **Read path**: account-authenticated self-read (verified by the same account-JWT
   verification the org endpoints use) and org-admin rollups later via the org layer.
-  Responses carry per-service emission WATERMARKS so consumers render "complete through
-  hour H" honestly rather than implying a live total. ASTRO pulls through the same read
+  Responses carry per-service emission WATERMARKS and (r5) `metered_since` so consumers
+  render "complete through hour H" and "not metered before T" honestly rather than
+  implying a live total or a zero history. ASTRO pulls through the same read
   path.
 
 ## 5. Closed registries

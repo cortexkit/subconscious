@@ -1,6 +1,6 @@
 # Cloud Usage Accounting: the CloudUsageFact contract
 
-Status: DRAFT r7 (r6 + the `metered_since` wire as shipped [#30][#33]; r6 = the producer half of `metered_since` [#29]: durable start, folds begin there, partial-hour reason; r5 = `metered_since`, the lower bound on a service's metering [#27]; r4 = the first-producer rulings [#21][#22]: byte_hours arithmetic, conflict events never settle, deny-unknown-fields enforced per fact, DO-SQL rows counted, class A retry undercount; ASTRO seat review pending) — custody SUBC, seats ASTRO (domain owner) / ENGRAM (first
+Status: DRAFT r8 (r7 + batch-level fields are acknowledged in the reply [#37]; r7 = the `metered_since` wire as shipped [#30][#33]; r6 = the producer half of `metered_since` [#29]: durable start, folds begin there, partial-hour reason; r5 = `metered_since`, the lower bound on a service's metering [#27]; r4 = the first-producer rulings [#21][#22]: byte_hours arithmetic, conflict events never settle, deny-unknown-fields enforced per fact, DO-SQL rows counted, class A retry undercount; ASTRO seat review pending) — custody SUBC, seats ASTRO (domain owner) / ENGRAM (first
 producer) / CKCRED (cloud infra custody). Ufuk directive 2026-07-20: build the non-politic
 half of cloud cost accounting first — per-account metering, spend visibility, and
 user-set limits. Invoice/billing folds are OUT OF SCOPE here (a later doc consumes this
@@ -113,6 +113,13 @@ Field rules:
   did not record the exact first-request instant (engram's first account, metered from
   the deploy of the metering Worker), it publishes the earliest instant counting could
   have begun, which is an honest lower bound.
+- **(r8) Batch-level fields are acknowledged, not refused.** Deny-unknown-fields applies to
+  each fact, not to the batch envelope: refusing a whole batch over an envelope field
+  would hold valid facts back. Instead, every batch-level field the ledger applies is
+  acknowledged in the reply (as `meteredSince` is), so a producer tells "applied" from
+  "ignored by a ledger that predates the field" by the acknowledgement's presence, and
+  keeps re-sending an idempotent field until it is acknowledged. A new batch-level field
+  must therefore be idempotent and must come with its acknowledgement.
 
 ## 3. Meter classes (how quantities are obtained)
 

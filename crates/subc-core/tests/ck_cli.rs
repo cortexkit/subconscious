@@ -83,18 +83,18 @@ async fn daemon_reports_and_renders_route_counters() {
     assert_eq!(response["counters"]["module_frames_dropped_no_route"], 0);
     assert_eq!(response["counters"]["route_release_stale_skipped"], 0);
 
+    let uptime_before = connection_file_elapsed(&server.connection_file_path);
     let output = ck_with_subc(&server.connection_file_path, ["daemon"]);
     assert_exit(&output, 0);
-    let uptime = connection_file_elapsed(&server.connection_file_path);
-    assert_eq!(
-        text(&output.stdout),
+    let uptime_after = connection_file_elapsed(&server.connection_file_path);
+    assert_rendered_with_uptime(&output, &uptime_before, &uptime_after, |uptime| {
         format!(
             // The in-process test daemon is built without a machine id, so the
             // line says the id is not reported rather than omitting it.
             "daemon test-subc · pid {} · up {uptime} · 1 clients · no frame drops in the last 10 minutes\nmachine id: not reported by this daemon\n",
             std::process::id()
         )
-    );
+    });
 
     let verbose = ck_with_subc(&server.connection_file_path, ["daemon", "--verbose"]);
     assert_exit(&verbose, 0);
@@ -179,6 +179,7 @@ async fn bare_ck_renders_degraded_module_and_no_updates_byte_for_byte() {
         ),
     )
     .unwrap();
+    let uptime_before = connection_file_elapsed(&server.connection_file_path);
     let output = ck_command()
         .args(["--subc"])
         .arg(&server.connection_file_path)
@@ -186,15 +187,14 @@ async fn bare_ck_renders_degraded_module_and_no_updates_byte_for_byte() {
         .output()
         .unwrap();
     assert_exit(&output, 0);
-    let uptime = connection_file_elapsed(&server.connection_file_path);
-    assert_eq!(
-        text(&output.stdout),
+    let uptime_after = connection_file_elapsed(&server.connection_file_path);
+    assert_rendered_with_uptime(&output, &uptime_before, &uptime_after, |uptime| {
         format!(
             "ck {} · daemon running (pid {}, up {uptime}, 2 clients)\nmodules: insula degraded (1 provider failing)\nupdates: none\n\ncommands: setup · upgrade · module · health · routes · quota · daemon\nrun `ck <command>` for its verbs, `ck --help` for everything\n",
             env!("CARGO_PKG_VERSION"),
             std::process::id()
         )
-    );
+    });
 
     module.stop().await.unwrap();
 }
@@ -919,6 +919,23 @@ fn home_relative(path: &str) -> String {
                 .map(|tail| format!("~{tail}"))
         })
         .unwrap_or_else(|| path.to_string())
+}
+
+/// Asserts `output` renders the daemon uptime taken at some instant while the
+/// command ran. The CLI reads the uptime mid-run, so a test that samples it
+/// once, before or after, fails whenever a whole second ticks over in
+/// between. Sampling both sides bounds the value the CLI can have printed.
+fn assert_rendered_with_uptime(
+    output: &Output,
+    before: &str,
+    after: &str,
+    render: impl Fn(&str) -> String,
+) {
+    let actual = text(&output.stdout);
+    assert!(
+        actual == render(before) || actual == render(after),
+        "rendered output matched neither uptime sample ({before}, {after}):\n{actual}"
+    );
 }
 
 fn connection_file_elapsed(path: &Path) -> String {

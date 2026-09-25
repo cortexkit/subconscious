@@ -17,14 +17,14 @@ use subc_control::{
     ClientControlRequest, ClientControlResponse, ModuleDeclaredProvenance, ModuleProtocol,
     RunningImageAgreement,
 };
-#[cfg(target_os = "linux")]
-use subc_daemon::test_support::TestTempDir;
 use subc_daemon::{
     read_frame, write_frame, Frame, ModuleSpec, RestartPolicy, Supervisor, SupervisorHandle,
     SupervisorProcessLiveness,
 };
 use subc_protocol::manifest::ManifestProvenance;
 use subc_protocol::{Flags, FrameType, Priority};
+#[cfg(target_os = "linux")]
+use subc_test_support::TestTempDir;
 use tokio::{
     io::AsyncWriteExt,
     time::{sleep, timeout, Instant},

@@ -16,7 +16,7 @@ use std::{
 };
 
 use serde_json::Value;
-use subc_daemon::test_support::TestTempDir;
+use subc_test_support::TestTempDir;
 
 mod common;
 

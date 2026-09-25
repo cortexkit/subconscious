@@ -1,10 +1,11 @@
 use std::{
     error::Error,
-    fs, io,
+    io,
     path::{Path, PathBuf},
     process,
     time::Duration,
 };
+use subc_test_support::TestTempDir;
 
 use serde::{de::DeserializeOwned, Serialize};
 use subc_transport::{
@@ -484,38 +485,16 @@ async fn assert_no_client_auth(stream: &mut TcpStream) -> NoClientAuthObserved {
 }
 
 struct TestDir {
-    path: PathBuf,
+    path: TestTempDir,
 }
 
 impl TestDir {
     fn new(name: &str) -> TestResult<Self> {
-        let suffix = generate_daemon_id()?;
-        let path = std::env::temp_dir().join(format!(
-            "subc-auth-handshake-{name}-{}-{}",
-            process::id(),
-            hex(&suffix)
-        ));
-        fs::create_dir(&path)?;
+        let path = TestTempDir::new(&format!("subc-auth-handshake-{name}"));
         Ok(Self { path })
     }
 
     fn path(&self) -> &Path {
         &self.path
     }
-}
-
-impl Drop for TestDir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
-    }
-}
-
-fn hex(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push(HEX[(byte >> 4) as usize] as char);
-        out.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    out
 }

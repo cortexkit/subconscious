@@ -9275,15 +9275,13 @@ mod cgroup_placement_tests {
         apply_cgroup_placement, remove_module_cgroup, ModuleProtocol, ModuleSpec, SuperviseError,
         SupervisedChild,
     };
-    use crate::{
-        stderr_tail::{StderrRing, StderrTailConfig},
-        test_support::TestTempDir,
-    };
+    use crate::stderr_tail::{StderrRing, StderrTailConfig};
     use std::{
         fs, io,
         path::{Path, PathBuf},
         sync::{Arc, Mutex},
     };
+    use subc_test_support::TestTempDir;
     use tokio::process::Command;
 
     #[test]
@@ -9477,8 +9475,9 @@ mod spawn_subscriber_lag_tests {
 #[cfg(test)]
 mod terminal_history_read_concurrency_tests {
     use super::*;
-    use crate::{terminal_journal::read_pause, test_support::TestTempDir};
+    use crate::terminal_journal::read_pause;
     use std::sync::mpsc as std_mpsc;
+    use subc_test_support::TestTempDir;
 
     fn journaled_ring(
         journal: &Arc<crate::terminal_journal::TerminalJournal>,
@@ -9794,12 +9793,12 @@ mod stderr_settle_tests {
 #[cfg(all(test, windows))]
 mod job_containment_tests {
     use super::*;
-    use crate::test_support::TestTempDir;
     use std::{
         path::{Path, PathBuf},
         sync::{Arc, Mutex},
         time::{Duration, Instant},
     };
+    use subc_test_support::TestTempDir;
 
     /// The stub, expected beside this test executable.
     ///

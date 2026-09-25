@@ -9,9 +9,10 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+use subc_test_support::TestTempDir;
 
 use serde_json::{json, Value};
-use subc_daemon::{read_frame, test_support::TestTempDir, write_frame, Frame};
+use subc_daemon::{read_frame, write_frame, Frame};
 use subc_protocol::{Flags, FrameType, Priority};
 
 mod common;
@@ -268,7 +269,7 @@ fn merge_module(module: &mut Value, extra: &Value) {
 
 /// A scratch directory no other test, and no earlier run, can share.
 ///
-/// `TestTempDir` names a directory `<label>-<pid>-<counter>`, which is unique
+/// `subc_test_support::TestTempDir` names a directory `<label>-<pid>-<counter>`, which is unique
 /// among live test processes, but it keeps a failed test's directory on disk
 /// and `create_dir_all` accepts an existing one. A later run whose pid and
 /// counter repeat would then read a stale `events.jsonl`, and a leftover

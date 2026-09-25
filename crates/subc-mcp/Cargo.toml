@@ -25,5 +25,6 @@ subc-transport = { path = "../subc-transport" }
 tokio = { version = "1", features = ["net", "rt-multi-thread", "macros", "io-util", "io-std", "sync", "time", "process"] }
 
 [dev-dependencies]
+subc-test-support = { path = "../subc-test-support" }
 rmcp = { version = "1.7", default-features = false, features = ["client", "transport-async-rw"] }
 subc-daemon = { path = "../subc-daemon", version = "0.21.0" }

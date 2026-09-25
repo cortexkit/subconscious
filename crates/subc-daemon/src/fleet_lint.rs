@@ -511,7 +511,7 @@ mod tests {
     use subc_protocol::PROTOCOL_VERSION;
 
     use super::{lint_with_timeout, LintOutcome, LintReport, OperationalClass, MANIFEST_TIMEOUT};
-    use crate::test_support::TestTempDir as TempDir;
+    use subc_test_support::TestTempDir as TempDir;
 
     #[derive(serde::Serialize)]
     struct FixtureSpec {

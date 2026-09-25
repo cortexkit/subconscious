@@ -30,8 +30,6 @@ pub mod supervise;
 mod systemd_kill_mode;
 mod terminal_journal;
 pub mod terminal_ring;
-#[cfg(any(test, feature = "test-support"))]
-pub mod test_support;
 pub mod watchdog;
 
 #[cfg(feature = "bench-harness")]

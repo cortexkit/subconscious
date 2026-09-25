@@ -1,10 +1,4 @@
-//! Test-only RAII temp-dir guard shared by the crate's unit tests and its
-//! integration tests.
-//!
-//! The module is compiled into the library only when the `test-support` feature
-//! is enabled (consumers' integration tests) or under
-//! `#[cfg(test)]` (the crate's own unit tests). It is never part of a
-//! production build.
+//! RAII temp-dir guard for workspace tests. This crate is used only as a dev-dependency.
 
 use std::{
     fs,
@@ -51,6 +45,12 @@ impl TestTempDir {
     pub fn keep(mut self) -> PathBuf {
         self.kept = true;
         self.path.clone()
+    }
+}
+
+impl AsRef<Path> for TestTempDir {
+    fn as_ref(&self) -> &Path {
+        &self.path
     }
 }
 

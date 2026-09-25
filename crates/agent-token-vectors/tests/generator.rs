@@ -1,11 +1,11 @@
 use std::{fs, process::Command};
+use subc_test_support::TestTempDir;
 
 #[test]
 fn generator_is_byte_identical_across_two_runs() {
-    let temp = std::env::temp_dir().join(format!("agent-token-vectors-{}", std::process::id()));
+    let temp = TestTempDir::new("agent-token-vectors");
     let first = temp.join("first.json");
     let second = temp.join("second.json");
-    fs::create_dir_all(&temp).expect("create temporary output directory");
 
     for output in [&first, &second] {
         let status = Command::new(env!("CARGO_BIN_EXE_generate"))
@@ -19,5 +19,4 @@ fn generator_is_byte_identical_across_two_runs() {
         fs::read(first).expect("first output"),
         fs::read(second).expect("second output")
     );
-    fs::remove_dir_all(temp).expect("remove temporary output directory");
 }

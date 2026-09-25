@@ -1,8 +1,5 @@
-use std::{
-    fs,
-    process::Command,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::{fs, process::Command};
+use subc_test_support::TestTempDir;
 
 #[test]
 fn manifest_is_emitted_offline_before_startup_attestation() {
@@ -50,16 +47,9 @@ fn unattested_binary_exits_before_any_startup_connection_work() {
 
 #[test]
 fn adapter_startup_writes_dated_r2_segment() {
-    let home = std::env::temp_dir().join(format!(
-        "mcp-adapter-log-{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let home = TestTempDir::new("mcp-adapter-log");
     let output = Command::new(env!("CARGO_BIN_EXE_ck-mcp-stdio-adapter"))
-        .env("XDG_DATA_HOME", &home)
+        .env("XDG_DATA_HOME", home.path())
         .env("CK_LOG", "info")
         .env("SUBC_MODULE_ID", "mcp-stdio-adapter")
         .env("SUBC_LAUNCH_NONCE", "test-nonce")
@@ -103,5 +93,4 @@ fn adapter_startup_writes_dated_r2_segment() {
             .all(|line| line.contains('T') && line.contains('Z')),
         "{line}"
     );
-    fs::remove_dir_all(home).unwrap();
 }

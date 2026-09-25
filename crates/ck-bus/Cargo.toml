@@ -35,6 +35,7 @@ subc-protocol = { path = "../subc-protocol", version = "0.25.0" }
 tokio = { version = "1", features = ["macros", "process", "rt-multi-thread", "sync", "time"] }
 
 [dev-dependencies]
+subc-test-support = { path = "../subc-test-support" }
 tempfile = "3"
 tokio = { version = "1", features = ["io-util", "net"] }
 subc-control = { path = "../subc-control", version = "0.20" }

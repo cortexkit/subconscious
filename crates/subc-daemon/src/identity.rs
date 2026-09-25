@@ -90,7 +90,7 @@ mod tests {
     use std::{collections::HashMap, fs};
 
     use super::*;
-    use crate::test_support::TestTempDir as TestDir;
+    use subc_test_support::TestTempDir as TestDir;
 
     #[test]
     fn request_identity_is_hashable_as_hash_map_key() {

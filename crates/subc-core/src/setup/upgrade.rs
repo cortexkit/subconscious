@@ -975,7 +975,7 @@ mod tests {
     use crate::setup::test_exec::{copy_executable, write_executable};
     use crate::setup::{components::ReleaseArtifactSource, planner::plan_upgrade};
     #[cfg(unix)]
-    use subc_daemon::test_support::TestTempDir;
+    use subc_test_support::TestTempDir;
 
     fn upgrade_target(binary: &str) -> UpgradeTarget {
         upgrade_roster(Component::ALL)

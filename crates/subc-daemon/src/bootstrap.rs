@@ -1351,12 +1351,12 @@ impl Error for BootstrapError {
 mod tests {
     use super::*;
     use crate::server::ServerAuth;
-    use crate::test_support::TestTempDir;
     #[cfg(target_os = "linux")]
     use std::collections::BTreeSet;
     use std::sync::Mutex;
     #[cfg(target_os = "linux")]
     use subc_control::ModuleProtocol;
+    use subc_test_support::TestTempDir;
     use subc_transport::MIN_KEY_LEN;
     use tokio::io::AsyncReadExt;
     use tokio::task::JoinHandle;

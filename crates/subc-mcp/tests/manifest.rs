@@ -1,8 +1,5 @@
-use std::{
-    fs,
-    process::Command,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::{fs, process::Command};
+use subc_test_support::TestTempDir;
 
 #[test]
 fn manifest_is_emitted_offline_without_module_setup() {
@@ -39,16 +36,9 @@ fn manifest_is_emitted_offline_without_module_setup() {
 
 #[test]
 fn module_startup_writes_dated_r2_segment() {
-    let home = std::env::temp_dir().join(format!(
-        "subc-mcp-log-{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let home = TestTempDir::new("subc-mcp-log");
     let output = Command::new(env!("CARGO_BIN_EXE_ck-subc-mcp"))
-        .env("XDG_DATA_HOME", &home)
+        .env("XDG_DATA_HOME", home.path())
         .env("CK_LOG", "info")
         .env("SUBC_MODULE_ID", "ck-subc-mcp")
         .env("SUBC_LAUNCH_NONCE", "test-nonce")
@@ -92,22 +82,14 @@ fn module_startup_writes_dated_r2_segment() {
             .all(|line| line.contains('T') && line.contains('Z')),
         "{line}"
     );
-    fs::remove_dir_all(home).unwrap();
 }
 
 #[test]
 fn shim_logs_without_daemon_environment_or_protocol_stdout() {
-    let home = std::env::temp_dir().join(format!(
-        "subc-mcp-shim-log-{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let home = TestTempDir::new("subc-mcp-shim-log");
     let output = Command::new(env!("CARGO_BIN_EXE_ck-subc-mcp"))
         .env_remove("SUBC_MODULE_ID")
-        .env("XDG_DATA_HOME", &home)
+        .env("XDG_DATA_HOME", home.path())
         .env("CK_LOG", "info")
         .args(["shim", "--module-connection-file"])
         .arg(home.join("missing-connection.json"))
@@ -127,5 +109,4 @@ fn shim_logs_without_daemon_environment_or_protocol_stdout() {
     assert!(fs::read_to_string(&entries[0])
         .unwrap()
         .contains("ck-subc-mcp.shim: [harness=mcp:generic] shim starting"));
-    fs::remove_dir_all(home).unwrap();
 }

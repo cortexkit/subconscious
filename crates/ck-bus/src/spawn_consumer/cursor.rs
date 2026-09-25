@@ -116,12 +116,7 @@ mod tests {
 
     #[test]
     fn a_written_cursor_reads_back_and_damage_reads_as_damaged() {
-        let dir = std::env::temp_dir().join(format!(
-            "ckbus-spawn-cursor-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = subc_test_support::TestTempDir::new("ckbus-spawn-cursor");
         let store = CursorStore::new(&dir);
         let _ = std::fs::remove_file(store.path());
         assert_eq!(store.read(), CursorRead::Absent);
@@ -133,6 +128,5 @@ mod tests {
         assert_eq!(store.read(), CursorRead::Present(cursor));
         std::fs::write(store.path(), b"{\"daemon_incarn").unwrap();
         assert!(matches!(store.read(), CursorRead::Damaged { .. }));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -22,8 +22,6 @@ use std::{
 };
 
 use subc_control::{ClientControlRequest, ModuleProtocol};
-#[cfg(unix)]
-use subc_daemon::test_support::TestTempDir;
 use subc_daemon::{
     read_frame, write_frame, Frame, ModuleSpec, ModuleState, ModuleStatus, RestartPolicy,
     SupervisedModule, Supervisor, SupervisorHandle, SupervisorProcessLiveness,
@@ -31,6 +29,8 @@ use subc_daemon::{
 #[cfg(unix)]
 use subc_protocol::{BindIdentity, ErrorBody, RouteTarget};
 use subc_protocol::{Flags, FrameType, Priority};
+#[cfg(unix)]
+use subc_test_support::TestTempDir;
 use tokio::{
     io::AsyncWriteExt,
     time::{sleep, timeout, Instant},

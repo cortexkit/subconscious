@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::{
-    fs, io,
+    io,
     path::PathBuf,
     process,
     sync::{
@@ -10,6 +10,7 @@ use std::{
     },
     time::Duration,
 };
+use subc_test_support::TestTempDir;
 
 use subc_client_rs::{CallError, CallOptions, ConsumerOptions, RetryBackoff, SubcConsumer};
 use subc_control::{ClientControlRequest, ClientControlResponse};
@@ -27,7 +28,6 @@ use tokio::{
 
 const AUTH_DEADLINE: Duration = Duration::from_secs(2);
 const PROBE_WINDOW: Duration = Duration::from_millis(75);
-static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy)]
 enum DataMode {
@@ -39,7 +39,7 @@ struct FakeDaemon {
     connection_file: PathBuf,
     connections: Arc<AtomicU64>,
     server_task: JoinHandle<()>,
-    temp_dir: PathBuf,
+    _temp_dir: TestTempDir,
 }
 
 impl FakeDaemon {
@@ -51,7 +51,6 @@ impl FakeDaemon {
 impl Drop for FakeDaemon {
     fn drop(&mut self) {
         self.server_task.abort();
-        let _ = fs::remove_dir_all(&self.temp_dir);
     }
 }
 
@@ -238,7 +237,6 @@ fn identity() -> BindIdentity {
 
 async fn start_fake_daemon(mode: DataMode) -> FakeDaemon {
     let temp_dir = unique_temp_dir("subc-client-rs-liveness-probe");
-    fs::create_dir_all(&temp_dir).expect("create fake daemon directory");
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind fake daemon listener");
@@ -278,7 +276,7 @@ async fn start_fake_daemon(mode: DataMode) -> FakeDaemon {
         connection_file,
         connections,
         server_task,
-        temp_dir,
+        _temp_dir: temp_dir,
     }
 }
 
@@ -385,7 +383,6 @@ async fn send_frame(stream: &mut TcpStream, frame: Frame) -> io::Result<()> {
     stream.flush().await
 }
 
-fn unique_temp_dir(name: &str) -> PathBuf {
-    let nonce = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("{name}-{}-{nonce}", process::id()))
+fn unique_temp_dir(name: &str) -> TestTempDir {
+    TestTempDir::new(name)
 }

@@ -7,6 +7,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
+use subc_test_support::TestTempDir as TempDir;
 
 use base64::Engine;
 use ed25519_dalek::{Signer, SigningKey};
@@ -17,8 +18,8 @@ use subc_control::{
     SupervisorHealthStatus,
 };
 use subc_daemon::{
-    read_frame, test_support::TestTempDir as TempDir, write_frame, Frame, HealthConfig, ModuleSpec,
-    RestartPolicy, SupervisedModule, Supervisor, SupervisorHandle, SupervisorProcessLiveness,
+    read_frame, write_frame, Frame, HealthConfig, ModuleSpec, RestartPolicy, SupervisedModule,
+    Supervisor, SupervisorHandle, SupervisorProcessLiveness,
 };
 use subc_protocol::{BindIdentity, Flags, FrameType, Priority, RouteTarget, PROTOCOL_VERSION};
 use subc_transport::{

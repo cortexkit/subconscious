@@ -317,7 +317,7 @@ impl Inventory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use subc_daemon::test_support::TestTempDir;
+    use subc_test_support::TestTempDir;
 
     fn fixture_path(name: &str) -> TestTempDir {
         TestTempDir::new(name)

@@ -3,36 +3,23 @@
 use std::{
     fs, io,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
 };
+use subc_test_support::TestTempDir;
 
 use subc_cgroup::{apply, prepare_at};
 use tokio::process::Command;
 
-static SCRATCH_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-
-struct ScratchRoot(PathBuf);
+struct ScratchRoot(TestTempDir);
 
 impl ScratchRoot {
     fn new(name: &str) -> io::Result<Self> {
-        let path = std::env::temp_dir().join(format!(
-            "subc-cgroup-{name}-{}-{}",
-            std::process::id(),
-            SCRATCH_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir(&path)?;
+        let path = TestTempDir::new(&format!("subc-cgroup-{name}"));
         fs::write(path.join("cgroup.procs"), b"")?;
         Ok(Self(path))
     }
 
     fn path(&self) -> &Path {
         &self.0
-    }
-}
-
-impl Drop for ScratchRoot {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
     }
 }
 

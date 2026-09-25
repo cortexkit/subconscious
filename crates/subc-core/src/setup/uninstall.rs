@@ -194,7 +194,7 @@ mod tests {
     use serde_json::Map;
 
     use super::*;
-    use subc_daemon::test_support::TestTempDir;
+    use subc_test_support::TestTempDir;
 
     #[derive(Default)]
     struct SuccessfulRunner;

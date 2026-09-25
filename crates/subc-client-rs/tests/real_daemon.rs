@@ -6,10 +6,13 @@ use std::{
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::atomic::{AtomicU64, Ordering},
-    sync::{Arc, Mutex, OnceLock},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex, OnceLock,
+    },
     time::Duration,
 };
+use subc_test_support::TestTempDir;
 
 use serde_json::{json, Value};
 use subc_client_rs::{
@@ -34,8 +37,6 @@ use tokio::{
     net::TcpStream,
     time::{sleep, timeout, Instant},
 };
-
-static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 const MODULE_ID: &str = "subc-client-rs-echo";
 const READ_TIMEOUT: Duration = Duration::from_secs(3);
@@ -70,8 +71,6 @@ impl Drop for LiveDaemon {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = fs::remove_dir_all(&self.runtime_dir);
-        let _ = fs::remove_dir_all(&self.config_dir);
     }
 }
 
@@ -1977,8 +1976,7 @@ fn fast_subscribe_options() -> SubscribeOptions {
 
 fn consumer_identity(session: &str) -> BindIdentity {
     let project_root = unique_temp_dir("subc-client-rs-consumer-project");
-    fs::create_dir_all(&project_root).unwrap();
-    BindIdentity::new(project_root, "subc-client-rs-consumer-test", session)
+    BindIdentity::new(project_root.keep(), "subc-client-rs-consumer-test", session)
 }
 
 fn tool_target(module_id: &str) -> RouteTarget {
@@ -2006,6 +2004,7 @@ async fn wait_for_module_route(handler: &PushModuleHandler, channel: u16) -> Rou
 
 struct PolicyHarness {
     daemon: LiveDaemon,
+    _temp_dir: TestTempDir,
     module: ModuleHandle,
     serve_task: tokio::task::JoinHandle<Result<(), SubcModuleError>>,
     handler: PolicyModuleHandler,
@@ -2048,6 +2047,7 @@ async fn start_policy_harness(scripts: impl IntoIterator<Item = PolicyScript>) -
 
     PolicyHarness {
         daemon,
+        _temp_dir: temp_dir,
         module,
         serve_task,
         handler,
@@ -2065,10 +2065,10 @@ fn policy_resolver(consumer: SubcConsumer, hard_timeout: Duration) -> PolicyReso
     )
 }
 
-fn policy_project_root() -> String {
+fn policy_project_root() -> (TestTempDir, String) {
     let root = unique_temp_dir("subc-client-rs-policy-project");
-    fs::create_dir_all(&root).unwrap();
-    root.to_string_lossy().into_owned()
+    let path = root.to_string_lossy().into_owned();
+    (root, path)
 }
 
 async fn wait_for_module_route_gone(handler: &PushModuleHandler, channel: u16) {
@@ -2178,7 +2178,6 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let project_root = unique_temp_dir("subc-client-rs-project");
-    fs::create_dir_all(&project_root).unwrap();
     let response = control_rpc_on_stream(
         stream,
         corr,
@@ -2187,7 +2186,7 @@ where
             "target": RouteTarget::ToolProvider {
                 module_id: module_id.to_string(),
             },
-            "identity": BindIdentity::new(project_root, "subc-client-rs-test", "clean-api"),
+            "identity": BindIdentity::new(project_root.keep(), "subc-client-rs-test", "clean-api"),
         }),
     )
     .await;
@@ -2342,9 +2341,8 @@ fn example_path(workspace: &Path, name: &str) -> PathBuf {
         .join(format!("{name}{}", std::env::consts::EXE_SUFFIX))
 }
 
-fn unique_temp_dir(name: &str) -> PathBuf {
-    let nonce = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("{name}-{}-{nonce}", std::process::id()))
+fn unique_temp_dir(name: &str) -> TestTempDir {
+    TestTempDir::new(name)
 }
 
 /// Issue #35: the #31 push family must be OBSERVABLE by a Rust consumer. The
@@ -2664,7 +2662,7 @@ async fn policy_resolver_uses_a_live_ttl_cache_entry_without_a_second_wire_call(
         .await
         .unwrap();
     let resolver = policy_resolver(consumer, Duration::from_secs(1));
-    let project_root = policy_project_root();
+    let (_project_guard, project_root) = policy_project_root();
     let subject = Subject::AgentId("agent-cache".to_string());
 
     let first = resolver
@@ -2718,7 +2716,7 @@ async fn policy_resolver_reply_revision_invalidates_every_older_cache_entry() {
         .await
         .unwrap();
     let resolver = policy_resolver(consumer, Duration::from_secs(1));
-    let project_root = policy_project_root();
+    let (_project_guard, project_root) = policy_project_root();
     let subject = Subject::AgentId("agent-revision".to_string());
 
     assert_eq!(
@@ -2779,7 +2777,7 @@ async fn policy_resolver_releases_expired_subjects_entries_routes_and_tasks() {
         .await
         .unwrap();
     let resolver = policy_resolver(consumer, Duration::from_secs(1));
-    let project_root = policy_project_root();
+    let (_project_guard, project_root) = policy_project_root();
     let resolve = |subject: String| {
         resolver.resolve(
             "approval",
@@ -2880,7 +2878,7 @@ async fn policy_resolver_refetches_after_ttl_expiry() {
         .await
         .unwrap();
     let resolver = policy_resolver(consumer, Duration::from_secs(1));
-    let project_root = policy_project_root();
+    let (_project_guard, project_root) = policy_project_root();
     let subject = Subject::AgentId("agent-ttl".to_string());
 
     assert_eq!(
@@ -2921,7 +2919,7 @@ async fn policy_resolver_hard_timeout_is_a_fault_before_the_provider_stall_finis
         .await
         .unwrap();
     let resolver = policy_resolver(consumer, Duration::from_millis(200));
-    let project_root = policy_project_root();
+    let (_project_guard, project_root) = policy_project_root();
 
     let started = Instant::now();
     let result = resolver
@@ -2971,7 +2969,7 @@ async fn policy_resolver_keeps_denied_decisions_distinct_from_faults() {
         .await
         .unwrap();
     let resolver = policy_resolver(consumer, Duration::from_millis(200));
-    let project_root = policy_project_root();
+    let (_project_guard, project_root) = policy_project_root();
 
     let denied = resolver
         .resolve(
@@ -3026,7 +3024,7 @@ async fn policy_revision_push_invalidates_but_never_satisfies_a_resolve() {
         .await
         .unwrap();
     let resolver = policy_resolver(consumer, Duration::from_secs(1));
-    let project_root = policy_project_root();
+    let (_project_guard, project_root) = policy_project_root();
     let subject = Subject::SessionToResolve("session-push".to_string());
 
     assert_eq!(

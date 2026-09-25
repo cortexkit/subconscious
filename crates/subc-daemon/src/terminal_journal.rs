@@ -367,12 +367,10 @@ fn wire_entry(entry: TerminalRecord, incarnation: Option<&str>) -> TerminalEntry
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        terminal_ring::{TerminalRing, TerminalRingConfig},
-        test_support::TestTempDir,
-    };
+    use crate::terminal_ring::{TerminalRing, TerminalRingConfig};
     use std::sync::Arc;
     use subc_control::{TerminalDisposition, TerminalExitKind};
+    use subc_test_support::TestTempDir;
 
     fn record(at_ms: u64) -> TerminalRecord {
         TerminalRecord {

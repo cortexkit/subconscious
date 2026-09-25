@@ -5518,6 +5518,7 @@ mod tests {
         sync::{Arc, Mutex},
         time::Duration,
     };
+    use subc_test_support::TestTempDir;
 
     use serde_json::{json, Value};
     use subc_protocol::{
@@ -5536,7 +5537,6 @@ mod tests {
         router::FrameSink,
         stderr_tail::DEFAULT_MAX_LINE_BYTES,
         supervise::{ModuleSpec, ModuleState, RestartPolicy, Supervisor, SupervisorHandle},
-        test_support::TestTempDir,
         RouteCtx, Router,
     };
     use tokio::{

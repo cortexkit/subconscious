@@ -197,7 +197,7 @@ mod tests {
     use std::{
         fs,
         sync::Arc,
-        time::{Duration, SystemTime, UNIX_EPOCH},
+        time::{Duration, UNIX_EPOCH},
     };
 
     use super::*;
@@ -217,12 +217,8 @@ mod tests {
 
     #[test]
     fn daemon_log_line_matches_the_authority_fixture_byte_for_byte_without_ansi() {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let logs_dir =
-            std::env::temp_dir().join(format!("subc-daemon-log-format-{}-{unique}", process::id()));
+        let temp = subc_test_support::TestTempDir::new("subc-daemon-log-format");
+        let logs_dir = temp.path().to_path_buf();
         let mut config = daemon_logger_config(logs_dir.clone(), None);
         config.module_id = "fusiform".to_string();
         config.clock = Some(Arc::new(|| {

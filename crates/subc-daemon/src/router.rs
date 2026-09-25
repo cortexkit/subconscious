@@ -755,10 +755,11 @@ impl Router {
         ctx: &RouteCtx,
         frame: &Frame,
         target_module_id: &str,
+        in_flight: usize,
         limit: usize,
     ) -> Result<Frame, RouterError> {
         self.control
-            .route_open_capacity_refusal(ctx, frame, target_module_id, limit)
+            .route_open_capacity_refusal(ctx, frame, target_module_id, in_flight, limit)
     }
 
     pub async fn route_for_connection(

@@ -1,6 +1,6 @@
 # Cloud Usage Accounting: the CloudUsageFact contract
 
-Status: DRAFT r6 (r5 + the producer half of `metered_since` [#29]: durable start, folds begin there, partial-hour reason; r5 = `metered_since`, the lower bound on a service's metering [#27]; r4 = the first-producer rulings [#21][#22]: byte_hours arithmetic, conflict events never settle, deny-unknown-fields enforced per fact, DO-SQL rows counted, class A retry undercount; ASTRO seat review pending) — custody SUBC, seats ASTRO (domain owner) / ENGRAM (first
+Status: DRAFT r7 (r6 + the `metered_since` wire as shipped [#30][#33]; r6 = the producer half of `metered_since` [#29]: durable start, folds begin there, partial-hour reason; r5 = `metered_since`, the lower bound on a service's metering [#27]; r4 = the first-producer rulings [#21][#22]: byte_hours arithmetic, conflict events never settle, deny-unknown-fields enforced per fact, DO-SQL rows counted, class A retry undercount; ASTRO seat review pending) — custody SUBC, seats ASTRO (domain owner) / ENGRAM (first
 producer) / CKCRED (cloud infra custody). Ufuk directive 2026-07-20: build the non-politic
 half of cloud cost accounting first — per-account metering, spend visibility, and
 user-set limits. Invoice/billing folds are OUT OF SCOPE here (a later doc consumes this
@@ -98,6 +98,21 @@ Field rules:
   late fact only when its state provably did not change in that gap (for engram's
   storage, no used_bytes mutation recorded between the two instants); otherwise the
   gap stays partial and says so.
+- **(r7) The `metered_since` wire.** A batch may carry `meteredSince` beside
+  `watermarkThroughHour`: a UTC instant at second precision (`2026-09-25T02:27:16Z`),
+  not required to fall on an hour boundary. The ledger keeps one value per
+  (service, account), set once: the first value is recorded, the same value again is a
+  no-op, and a different value, earlier or later, is not applied. When the batch
+  carried the field, the reply adds
+  `meteredSince: {outcome: recorded | unchanged | refused, stored: <instant>}` beside
+  the per-fact `outcomes`. A refusal never touches the per-fact outcomes, so the facts
+  still land. A refusal always means the producer lost its own metering state or has a
+  bug: the producer surfaces it as an incident, the same way it treats a flagged fact,
+  and never re-sends a new value. The read path returns `metered_since` on each
+  service's watermark row, null when the service never published one. Where a producer
+  did not record the exact first-request instant (engram's first account, metered from
+  the deploy of the metering Worker), it publishes the earliest instant counting could
+  have begun, which is an honest lower bound.
 
 ## 3. Meter classes (how quantities are obtained)
 

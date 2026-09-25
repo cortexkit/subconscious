@@ -5234,48 +5234,68 @@ fn color_text(text: &str, code: &str, color_enabled: bool) -> String {
 
 /// Render an entry's `spend` pools as display lines, one per pool.
 ///
-/// `spend` is money, not a rate window: a balance has no period, so pools
-/// render as separate lines rather than progress bars (a bar implies a
-/// window that resets; prepaid credit does not). Three wire states are
-/// deliberately distinct and must stay so:
+/// `spend` is a pool balance or allowance, not a rate window: render each
+/// pool as a labeled amount (remaining of total when stated, or just its
+/// limit), followed by any stated reset, stopped state and funding. Three wire
+/// states are deliberately distinct and must stay so:
 /// - `spend` ABSENT: the producer has nothing to say -> no lines.
 /// - `spend: []`: the producer asked and the provider has no credit
 ///   product on this account -> no lines (NOT "0 credit").
-/// - `spend: [...]`: one line per pool.
+/// - `spend: [...]`: one line per pool with an amount.
 ///
 /// Pools are account-scoped; callers must never sum them across sibling
-/// accounts of a provider (credit is bought per account, so a cross-account
-/// total is a figure no credential can draw on). `unit` is a free string,
-/// not necessarily a currency code (MiniMax reports "credit"), so it is
-/// rendered verbatim after the amount.
+/// accounts of a provider. `unit` is a free string, not necessarily a
+/// currency code (MiniMax reports "credit"), so render it verbatim.
 fn quota_spend_lines_for_entry(entry: &Value) -> Vec<String> {
     let mut lines = Vec::new();
     let Some(pools) = entry.get("spend").and_then(Value::as_array) else {
         return lines;
     };
     for pool in pools {
-        let Some(remaining) = pool.get("remaining").and_then(Value::as_object) else {
-            continue;
+        let amount = |key| {
+            let value = pool.get(key)?;
+            let minor = value.get("minor")?.as_i64()?;
+            let exponent = value.get("exponent")?.as_i64()?;
+            let unit = value.get("unit").and_then(Value::as_str).unwrap_or("");
+            Some((format_minor_amount(minor, exponent), unit))
         };
-        let (Some(minor), Some(exponent)) = (
-            remaining.get("minor").and_then(Value::as_i64),
-            remaining.get("exponent").and_then(Value::as_i64),
-        ) else {
-            continue;
+        let remaining = amount("remaining");
+        let total = amount("total");
+        let detail = match (remaining, total) {
+            (Some((left, unit)), Some((cap, cap_unit))) if unit == cap_unit => {
+                format!("{left} of {cap} {unit} left")
+            }
+            (Some((left, unit)), Some((cap, cap_unit))) => {
+                format!("{left} {unit} of {cap} {cap_unit} left")
+            }
+            (Some((left, unit)), None) => format!("{left} {unit} left"),
+            (None, Some((cap, unit))) => format!("limit {cap} {unit}"),
+            (None, None) => continue,
         };
-        let unit = remaining.get("unit").and_then(Value::as_str).unwrap_or("");
-        let amount = format_minor_amount(minor, exponent);
         let label = pool
-            .get("funding")
+            .get("label")
             .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .map(|funding| format!(" ({funding})"))
-            .unwrap_or_default();
-        lines.push(
-            format!("credit {amount} {unit}{label}")
-                .trim_end()
-                .to_string(),
-        );
+            .filter(|label| !label.is_empty())
+            .unwrap_or("credit");
+        let mut line = format!("{label}  {detail}");
+        if let Some(raw) = pool.get("resetsAt").and_then(Value::as_str) {
+            let date = if parse_rfc3339_to_utc_secs(raw).is_some() {
+                raw.get(..10).unwrap_or(raw)
+            } else {
+                raw
+            };
+            line.push_str(&format!(" resets {date}"));
+        }
+        if pool.get("spendable").and_then(Value::as_bool) == Some(false) {
+            line.push_str(" stopped");
+        }
+        match pool.get("funding").and_then(Value::as_str) {
+            Some("granted") => line.push_str(" provider grant"),
+            Some("purchased") => line.push_str(" bought credit"),
+            Some("subscription") => line.push_str(" included in subscription"),
+            _ => {} // Unknown funding cannot justify a claim about who pays.
+        }
+        lines.push(line);
     }
     lines
 }
@@ -8623,7 +8643,10 @@ mod tests {
         let lines = quota_spend_lines_for_entry(&with_pools);
         assert_eq!(
             lines,
-            vec!["credit 0.00 CNY (granted)", "credit 24.02 CNY (purchased)"],
+            vec![
+                "credit  0.00 CNY left provider grant",
+                "credit  24.02 CNY left bought credit"
+            ],
             "each pool renders its own line with minor/10^exponent and verbatim unit"
         );
 
@@ -8644,7 +8667,102 @@ mod tests {
         });
         assert_eq!(
             quota_spend_lines_for_entry(&free_unit),
-            vec!["credit 5 credit (granted)"]
+            vec!["credit  5 credit left provider grant"]
+        );
+    }
+
+    #[test]
+    fn spend_repro_extra_usage_shows_label_and_same_unit_total() {
+        let entry = json!({ "spend": [{
+            "id": "extra_usage", "label": "Extra usage", "funding": "unknown",
+            "basis": "derived", "spendable": true,
+            "total": { "minor": 10000, "exponent": 2, "unit": "USD" },
+            "remaining": { "minor": 7500, "exponent": 2, "unit": "USD" }
+        }] });
+        assert_eq!(
+            quota_spend_lines_for_entry(&entry),
+            vec!["Extra usage  75.00 of 100.00 USD left"]
+        );
+    }
+
+    #[test]
+    fn spend_empty_or_absent_label_falls_back_to_credit() {
+        for label in [None, Some("")] {
+            let mut pool = json!({ "remaining": { "minor": 7, "exponent": 0, "unit": "points" } });
+            if let Some(label) = label {
+                pool["label"] = json!(label);
+            }
+            assert_eq!(
+                quota_spend_lines_for_entry(&json!({"spend": [pool]})),
+                vec!["credit  7 points left"]
+            );
+        }
+    }
+
+    #[test]
+    fn spend_total_without_remaining_shows_stated_limit() {
+        let entry = json!({"spend": [{"label": "Allowance", "total": {"minor": 500, "exponent": 2, "unit": "USD"}}]});
+        assert_eq!(
+            quota_spend_lines_for_entry(&entry),
+            vec!["Allowance  limit 5.00 USD"]
+        );
+    }
+
+    #[test]
+    fn spend_reset_shows_date_and_absence_claims_nothing() {
+        let entry = json!({"spend": [
+            {"label": "Monthly", "remaining": {"minor": 1, "exponent": 0, "unit": "USD"}, "resetsAt": "2026-10-01T00:00:00Z"},
+            {"label": "No date", "remaining": {"minor": 1, "exponent": 0, "unit": "USD"}},
+            {"label": "Unparsed", "remaining": {"minor": 1, "exponent": 0, "unit": "USD"}, "resetsAt": "next billing cycle"}
+        ]});
+        assert_eq!(
+            quota_spend_lines_for_entry(&entry),
+            vec![
+                "Monthly  1 USD left resets 2026-10-01",
+                "No date  1 USD left",
+                "Unparsed  1 USD left resets next billing cycle"
+            ]
+        );
+    }
+
+    #[test]
+    fn spend_false_is_stopped_but_absent_spendable_is_unstated() {
+        let entry = json!({"spend": [
+            {"remaining": {"minor": 1, "exponent": 0, "unit": "USD"}, "spendable": false},
+            {"remaining": {"minor": 1, "exponent": 0, "unit": "USD"}}
+        ]});
+        assert_eq!(
+            quota_spend_lines_for_entry(&entry),
+            vec!["credit  1 USD left stopped", "credit  1 USD left"]
+        );
+    }
+
+    #[test]
+    fn spend_unknown_or_new_funding_is_omitted_but_known_funding_describes_cost() {
+        let entry = json!({"spend": [
+            {"funding": "unknown", "remaining": {"minor": 1, "exponent": 0, "unit": "USD"}},
+            {"funding": "future_kind", "remaining": {"minor": 1, "exponent": 0, "unit": "USD"}},
+            {"funding": "subscription", "remaining": {"minor": 1, "exponent": 0, "unit": "USD"}}
+        ]});
+        assert_eq!(
+            quota_spend_lines_for_entry(&entry),
+            vec![
+                "credit  1 USD left",
+                "credit  1 USD left",
+                "credit  1 USD left included in subscription"
+            ]
+        );
+    }
+
+    #[test]
+    fn spend_mismatched_units_show_each_amounts_own_unit() {
+        let entry = json!({"spend": [{
+            "remaining": {"minor": 150, "exponent": 2, "unit": "USD"},
+            "total": {"minor": 20, "exponent": 0, "unit": "credit"}
+        }]});
+        assert_eq!(
+            quota_spend_lines_for_entry(&entry),
+            vec!["credit  1.50 USD of 20 credit left"]
         );
     }
 

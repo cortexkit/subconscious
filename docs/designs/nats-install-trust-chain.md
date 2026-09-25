@@ -265,6 +265,13 @@ once `user-jwt-ttl-unpinned` is pinned. This differs from the spec (6.7).
 
 ## 7. SUBC's decisions on section 6 (2026-09-24)
 
+Outcome, read from the vault by CKCRED on 2026-09-25: 6.2 and 6.3 were granted as proposed
+on 2026-09-24 (`reserved:ckbus` holds exact `sign` and `read` on
+`signing:ck-bus-operator-signer:1` and on `signing:ck-bus-sysaccount:1`), and the ceremony
+for the operator and system-account roots ran the same day in one session with one handle
+and two approvals (vault seq 18413-18416). No further ceremony is needed unless the
+operator or system-account record changes.
+
 - 6.1: the spec's Credentials table and `RootCredential` get two operator rows, root and
   signer, and the root gets no ck-bus row. That lands with slice 4.
 - 6.2: ask CKCRED for an exact `read` grant on the signer to `reserved:ckbus`. Matching

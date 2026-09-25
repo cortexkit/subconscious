@@ -95,10 +95,16 @@ The markers are S (standing, discharged only when an external dependency lands),
 (dischargeable by the slice itself by citing or quoting) and C (conditional: recorded
 only when the named condition is observed at fire time). This is the only such list.
 Four deployment gates, defined under Credentials, block no acceptance row, only the
-operator placing `ckbus` on a real machine: `root-ceremony-unrun` (operator with
-CKCRED), `server-config-writer-unnamed` (SUBC with the operator), `machine-id-absent`
-(SUBC: a daemon at `cac1e9bd` or later deployed) and `ckbus-client-ops-unagreed` (SUBC
-for subc-client-rs, ALF for prefrontal-core). Two names are row-level conditions, not gates:
+operator placing `ckbus` on a real machine. As of 2026-09-25 three are discharged:
+`root-ceremony-unrun` (run for the operator and system-account roots on 2026-09-24, one
+session, one handle, two approvals, vault seq 18413-18416, read from the store by CKCRED;
+the box account root was discharged earlier; the signer and sysaccount grants to
+`reserved:ckbus` were granted the same day), `machine-id-absent` (the running daemon is
+past `cac1e9bd`) and `ckbus-client-ops-unagreed` (names frozen as built with ALF: the
+three ops under Delivery and attestation plus the three agent-queue ops in R15, and the
+refusal codes `ckbus_credential_superseded` and `ckbus_credential_revoked`). The one
+left is `server-config-writer-unnamed` (SUBC with the operator): `ck setup` driving
+`ck-bus install-plan` and `install-apply` on the operator's machine. Two names are row-level conditions, not gates:
 `a1-signal-unix-only`, the single platform skip, and `stub-reply-shape-unrecorded`.
 
 Discharged and carrying no row: `route-target-ids-unnamed` (R10, R12),
@@ -486,10 +492,9 @@ Credentials (design D; foundation amendment `48c83a68e`, `0eb12229f`, `b9e827c69
   caller that reaches ck-bus as that module.
 - Delivery and attestation. ck-bus serves two ops to supervised children over the subc
   wire. Their working names are `ckbus.credential` and `ckbus.nonce_sign`. The final
-  spellings are this spec's to fix with the client owners, and they are unagreed with the client owners
-  (subc-client-rs: SUBC; prefrontal-core: ALF), recorded as the deployment gate
-  `ckbus-client-ops-unagreed`, which blocks no row because the harness drives both ops
-  directly.
+  spellings were fixed with the client owners (subc-client-rs: SUBC; prefrontal-core:
+  ALF) on 2026-09-25 as built: `ckbus.credential`, `ckbus.credential_renew` and
+  `ckbus.nonce_sign`, which discharged the gate `ckbus-client-ops-unagreed`.
   - `ckbus.credential` returns the caller's user JWT, its `{acct}`, its inbox prefix
     `_INBOX.{credential_public}`, and the server URL.
   - `ckbus.nonce_sign` signs the given nonce with the caller's current seed.

@@ -624,9 +624,15 @@ mod tests {
         let long: Vec<LiveChild> = (0..200).map(|pid| child("module", pid)).collect();
         write_record(&path, &short).unwrap();
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let rounds = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let writer = {
-            let (path, stop, short, long) =
-                (path.clone(), stop.clone(), short.clone(), long.clone());
+            let (path, stop, rounds, short, long) = (
+                path.clone(),
+                stop.clone(),
+                rounds.clone(),
+                short.clone(),
+                long.clone(),
+            );
             std::thread::spawn(move || {
                 let mut round = 0usize;
                 while !stop.load(Ordering::Relaxed) {
@@ -637,16 +643,33 @@ mod tests {
                     };
                     write_record(&path, children).unwrap();
                     round += 1;
+                    rounds.store(round, Ordering::Relaxed);
                 }
-                round
             })
         };
-        for _ in 0..2_000 {
+        // Keep reading until the writer has really overlapped the reads. A
+        // fixed number of reads can finish before a busy machine schedules the
+        // writer at all, which proves nothing about torn records and used to
+        // fail the "writer ran" check instead.
+        const MIN_READS: usize = 2_000;
+        const MIN_WRITER_ROUNDS: usize = 50;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let mut reads = 0usize;
+        while reads < MIN_READS || rounds.load(Ordering::Relaxed) < MIN_WRITER_ROUNDS {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "writer completed only {} rounds in 60 s",
+                rounds.load(Ordering::Relaxed)
+            );
             let read = read_record(&path).expect("every read sees a complete record");
-            assert!(read == short || read == long);
+            assert!(
+                read == short || read == long,
+                "read a torn record: {read:?}"
+            );
+            reads += 1;
         }
         stop.store(true, Ordering::Relaxed);
-        assert!(writer.join().unwrap() > 1, "the writer ran concurrently");
+        writer.join().unwrap();
     }
 
     #[test]

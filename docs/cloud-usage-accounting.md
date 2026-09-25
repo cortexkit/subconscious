@@ -1,6 +1,6 @@
 # Cloud Usage Accounting: the CloudUsageFact contract
 
-Status: DRAFT r3 (r2 + the crossed seam pins [#10][#11]: batch outcome vector, `derived` meter class, correction-aware buffer schema; ASTRO seat review pending) — custody SUBC, seats ASTRO (domain owner) / ENGRAM (first
+Status: DRAFT r4 (r3 + the first-producer rulings [#21][#22]: byte_hours arithmetic, conflict events never settle, deny-unknown-fields enforced per fact, DO-SQL rows counted, class A retry undercount; ASTRO seat review pending) — custody SUBC, seats ASTRO (domain owner) / ENGRAM (first
 producer) / CKCRED (cloud infra custody). Ufuk directive 2026-07-20: build the non-politic
 half of cloud cost accounting first — per-account metering, spend visibility, and
 user-set limits. Invoice/billing folds are OUT OF SCOPE here (a later doc consumes this
@@ -51,6 +51,9 @@ Field rules:
   discipline; half-even rounding only at display/pricing boundaries, never in facts).
 - deny-unknown-fields; unknown `service`/`resource`/`unit` values REJECT at ingest
   (closed registries, §5) — a typo'd resource must fail loud, not mint a new meter.
+  (r4) Ingest enforces this per fact: a fact carrying a field it does not know is
+  rejected with a named reason, never accepted with the field dropped, so a producer
+  that drifts ahead of the ledger learns it from its first batch.
 - `meterVersion` makes calibration drift diagnosable after the fact (which build
   measured this hour?).
 
@@ -83,8 +86,9 @@ Three classes, declared per resource in the registry:
   chunks stored). Exact by construction.
 - **derived** (r3): exact-by-construction FOLD over transactional state — the state
   changes only under recorded mutations, so past-period quantities derive exactly and
-  retroactively (engram's R2 gauge × 3600 per completed hour, folded lazily at next
-  wake as late facts). Distinct from sampled: no cadence bound, exactness inherited
+  retroactively (engram's R2 gauge in bytes × 1 hour per completed hour, which is the
+  byte_hours unit; r3 said "× 3600", which would be byte-seconds. Folded lazily at
+  next wake as late facts). Distinct from sampled: no cadence bound, exactness inherited
   from the state's transactionality.
 - **sampled**: point-in-time gauge folded over the hour (R2 bytes stored -> byte_hours).
   Exactness bounded by sample cadence; cadence declared in the registry.
@@ -132,7 +136,9 @@ Three classes, declared per resource in the registry:
   batch-level status. The producer's emitted-watermark advances past a fact ONLY on
   accepted|duplicate (both mean the ledger durably holds the event); conflict|rejected
   facts stay buffered, flagged for inspection, never silently retried into the same
-  conflict. Partial success is normal (one malformed fact never wedges a batch). The
+  conflict. (r4) The ledger chains a `conflict` event as an audit record that a
+  conflict happened, never as settled usage: the projection keeps the first write, and
+  limits and the read path count only projected quantities. Partial success is normal (one malformed fact never wedges a batch). The
   ingest applies the whole batch in ONE guarded write (log appends + projection upserts
   + chain head) so a mid-ingest crash is all-or-nothing and the outcome vector is
   truthful by construction.
@@ -157,10 +163,10 @@ dishonesty this doc exists to prevent):
 | resource | unit | class | notes |
 |---|---|---|---|
 | `r2_storage_byte_hours` | byte_hours | derived | the DO's transactional used_bytes gauge changes only at reserve/finalize/expire/GC; byte_hours for completed hours derive exactly at next wake (late facts) — no hourly DO wakes, idle accounts fold lazily |
-| `r2_class_a_ops` | count | counted | writes/lists |
+| `r2_class_a_ops` | count | counted | writes/lists; (r4) engram counts Upload claims at the DO, so a retried object PUT the DO never sees is a known undercount, stated in the meter notes |
 | `r2_class_b_ops` | count | counted | reads |
-| `do_sql_rows_written` | count | approximated | proxy from drain plans; provider analytics calibrate |
-| `do_sql_rows_read` | count | approximated | |
+| `do_sql_rows_written` | count | counted | (r4) from SQLite's own per-cursor row counters on every request; r3 had a drain-plan proxy |
+| `do_sql_rows_read` | count | counted | (r4) as above |
 | `do_storage_byte_hours` | byte_hours | sampled | DO SQL state size |
 | `do_compute_gb_s` | gb_seconds | approximated | wall-clock active duration proxy |
 | `do_requests` | count | counted | |

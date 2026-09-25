@@ -62,11 +62,12 @@ fn reading(usage: subc_os::ResourceUsage) -> ChildResourceReading {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use super::*;
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn usage() -> subc_os::ResourceUsage {
+        use std::time::Duration;
+
         subc_os::ResourceUsage {
             memory_bytes: 7 * 1024 * 1024,
             memory_kind: subc_os::MemoryKind::ResidentSet,

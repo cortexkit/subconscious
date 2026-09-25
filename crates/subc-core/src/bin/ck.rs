@@ -5277,25 +5277,27 @@ fn quota_spend_lines_for_entry(entry: &Value) -> Vec<String> {
             .and_then(Value::as_str)
             .filter(|label| !label.is_empty())
             .unwrap_or("credit");
-        let mut line = format!("{label}  {detail}");
+        // Each stated fact after the amount is its own clause, so none of them
+        // reads as a qualifier on the number (the defect behind issue #132).
+        let mut clauses = vec![format!("{label}  {detail}")];
         if let Some(raw) = pool.get("resetsAt").and_then(Value::as_str) {
             let date = if parse_rfc3339_to_utc_secs(raw).is_some() {
                 raw.get(..10).unwrap_or(raw)
             } else {
                 raw
             };
-            line.push_str(&format!(" resets {date}"));
+            clauses.push(format!("resets {date}"));
         }
         if pool.get("spendable").and_then(Value::as_bool) == Some(false) {
-            line.push_str(" stopped");
+            clauses.push("stopped".to_string());
         }
         match pool.get("funding").and_then(Value::as_str) {
-            Some("granted") => line.push_str(" provider grant"),
-            Some("purchased") => line.push_str(" bought credit"),
-            Some("subscription") => line.push_str(" included in subscription"),
+            Some("granted") => clauses.push("provider grant".to_string()),
+            Some("purchased") => clauses.push("bought credit".to_string()),
+            Some("subscription") => clauses.push("included in subscription".to_string()),
             _ => {} // Unknown funding cannot justify a claim about who pays.
         }
-        lines.push(line);
+        lines.push(clauses.join(" · "));
     }
     lines
 }
@@ -8644,8 +8646,8 @@ mod tests {
         assert_eq!(
             lines,
             vec![
-                "credit  0.00 CNY left provider grant",
-                "credit  24.02 CNY left bought credit"
+                "credit  0.00 CNY left · provider grant",
+                "credit  24.02 CNY left · bought credit"
             ],
             "each pool renders its own line with minor/10^exponent and verbatim unit"
         );
@@ -8667,7 +8669,7 @@ mod tests {
         });
         assert_eq!(
             quota_spend_lines_for_entry(&free_unit),
-            vec!["credit  5 credit left provider grant"]
+            vec!["credit  5 credit left · provider grant"]
         );
     }
 
@@ -8718,9 +8720,9 @@ mod tests {
         assert_eq!(
             quota_spend_lines_for_entry(&entry),
             vec![
-                "Monthly  1 USD left resets 2026-10-01",
+                "Monthly  1 USD left · resets 2026-10-01",
                 "No date  1 USD left",
-                "Unparsed  1 USD left resets next billing cycle"
+                "Unparsed  1 USD left · resets next billing cycle"
             ]
         );
     }
@@ -8733,7 +8735,7 @@ mod tests {
         ]});
         assert_eq!(
             quota_spend_lines_for_entry(&entry),
-            vec!["credit  1 USD left stopped", "credit  1 USD left"]
+            vec!["credit  1 USD left · stopped", "credit  1 USD left"]
         );
     }
 
@@ -8749,7 +8751,7 @@ mod tests {
             vec![
                 "credit  1 USD left",
                 "credit  1 USD left",
-                "credit  1 USD left included in subscription"
+                "credit  1 USD left · included in subscription"
             ]
         );
     }

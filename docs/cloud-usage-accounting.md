@@ -1,6 +1,6 @@
 # Cloud Usage Accounting: the CloudUsageFact contract
 
-Status: DRAFT r5 (r4 + `metered_since`, the lower bound on a service's metering [#27]; r4 = the first-producer rulings [#21][#22]: byte_hours arithmetic, conflict events never settle, deny-unknown-fields enforced per fact, DO-SQL rows counted, class A retry undercount; ASTRO seat review pending) — custody SUBC, seats ASTRO (domain owner) / ENGRAM (first
+Status: DRAFT r6 (r5 + the producer half of `metered_since` [#29]: durable start, folds begin there, partial-hour reason; r5 = `metered_since`, the lower bound on a service's metering [#27]; r4 = the first-producer rulings [#21][#22]: byte_hours arithmetic, conflict events never settle, deny-unknown-fields enforced per fact, DO-SQL rows counted, class A retry undercount; ASTRO seat review pending) — custody SUBC, seats ASTRO (domain owner) / ENGRAM (first
 producer) / CKCRED (cloud infra custody). Ufuk directive 2026-07-20: build the non-politic
 half of cloud cost accounting first — per-account metering, spend visibility, and
 user-set limits. Invoice/billing folds are OUT OF SCOPE here (a later doc consumes this
@@ -88,6 +88,16 @@ Field rules:
   record starts, not gaps inside it, and a producer that loses metering state mid-record
   is a correctness incident handled by restatement (above). The ledger cannot tell "no
   usage" from "not measured" by itself; this field is how it learns.
+- **(r6) Producer obligations for `metered_since`.** The producer records the instant
+  durably when an account's metering first begins, before serving the request that
+  starts it, and every meter counts from that instant: a fold (derived or sampled)
+  starts at `metered_since`, never at its own first call, because a fold that starts
+  late silently shortens its first hour. A fact for the hour containing `metered_since`
+  carries a `reason` naming the instant, so the fact itself says it is partial. A
+  derived meter may backfill the gap between `metered_since` and its first fold as a
+  late fact only when its state provably did not change in that gap (for engram's
+  storage, no used_bytes mutation recorded between the two instants); otherwise the
+  gap stays partial and says so.
 
 ## 3. Meter classes (how quantities are obtained)
 

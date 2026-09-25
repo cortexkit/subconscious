@@ -4320,7 +4320,7 @@ async fn quota(
         print_quota_table(&providers, provider_filter, verbose, redact, subc);
         let project_root = env::current_dir()
             .map_err(|source| CkError::Message(format!("current directory: {source}")))?;
-        for line in subscription_value_lines(client, project_root, provider_filter).await {
+        for line in subscription_value_lines(client, project_root, provider_filter, verbose).await {
             println!("{line}");
         }
     }
@@ -4351,6 +4351,7 @@ async fn subscription_value_lines(
     client: &mut CkClient,
     project_root: PathBuf,
     provider_filter: Option<&str>,
+    verbose: bool,
 ) -> Vec<String> {
     let fetch = time::timeout(
         SUBSCRIPTION_VALUE_TIMEOUT,
@@ -4364,7 +4365,9 @@ async fn subscription_value_lines(
             vec![format!("value vs API list price: unavailable ({reason})")]
         }
         SubscriptionValueFetch::Report(report) => match report.get("latest") {
-            Some(Value::Array(latest)) => subscription_value_render(latest, provider_filter),
+            Some(Value::Array(latest)) => {
+                subscription_value_render(latest, provider_filter, verbose)
+            }
             _ => vec!["value vs API list price: unavailable (unexpected reply)".to_string()],
         },
     }
@@ -4433,7 +4436,11 @@ fn subscription_value_error(error: &CkError) -> String {
 ///
 /// Account identities are deliberately not read (only the count), so this
 /// section has nothing for `--redact` to hide.
-fn subscription_value_render(latest: &[Value], provider_filter: Option<&str>) -> Vec<String> {
+fn subscription_value_render(
+    latest: &[Value],
+    provider_filter: Option<&str>,
+    verbose: bool,
+) -> Vec<String> {
     let rows: Vec<&Value> = latest
         .iter()
         .filter(|row| {
@@ -4478,18 +4485,71 @@ fn subscription_value_render(latest: &[Value], provider_filter: Option<&str>) ->
         if row.get("low_resolution").and_then(Value::as_bool) == Some(true) {
             segments.push("low resolution".to_string());
         }
-        // Unpriced tokens are left out of the API value, so the figure leaves
-        // that usage uncounted; say so without claiming how large the gap is.
-        if row
-            .get("unpriced_tokens")
-            .and_then(Value::as_array)
-            .is_some_and(|entries| !entries.is_empty())
-        {
-            segments.push("some usage not priced".to_string());
+        let reasons = subscription_value_approximation_reasons(row);
+        if !reasons.is_empty() {
+            segments.push(if verbose {
+                format!("approximate ({})", reasons.join(", "))
+            } else {
+                "approximate".to_string()
+            });
         }
         lines.push(format!("  {name:<width$}  {}", segments.join(" · ")));
     }
     lines
+}
+
+/// Why a row's figure is only approximate, empty when it is exact as far as
+/// the row can tell. The error runs BOTH ways, so no direction is claimed:
+/// unpriced tokens and tokens priced at the base rate (their long-context
+/// tier was never tested) make it read low, while usage from accounts left
+/// out of the fee still counts toward the API value and makes it read high.
+///
+/// `error_deflating`/`error_inflating` on the row are deliberately not used:
+/// they describe the quota-consumed multiplier, not the fee multiplier shown.
+fn subscription_value_approximation_reasons(row: &Value) -> Vec<String> {
+    let mut reasons = Vec::new();
+    if row
+        .get("unpriced_tokens")
+        .and_then(Value::as_array)
+        .is_some_and(|entries| !entries.is_empty())
+    {
+        reasons.push("some usage not priced".to_string());
+    }
+    let excluded = row
+        .get("accounts_excluded")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    if excluded > 0 {
+        let noun = if excluded == 1 { "account" } else { "accounts" };
+        reasons.push(format!("{excluded} {noun} not in the fee"));
+    }
+    let base_rate = row
+        .get("base_rate_tier_untested_tokens")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    if base_rate > 0 {
+        reasons.push(format!(
+            "{} tokens priced at base rate",
+            compact_token_count(base_rate)
+        ));
+    }
+    reasons
+}
+
+/// `263M`-style token count: whole units, or one decimal below 10 of a unit.
+fn compact_token_count(tokens: i64) -> String {
+    let value = tokens as f64;
+    for (scale, suffix) in [(1e9, "B"), (1e6, "M"), (1e3, "K")] {
+        if value >= scale {
+            let scaled = value / scale;
+            return if scaled < 10.0 {
+                format!("{scaled:.1}{suffix}")
+            } else {
+                format!("{scaled:.0}{suffix}")
+            };
+        }
+    }
+    tokens.to_string()
 }
 
 async fn ensure_quota_module_registered(client: &mut CkClient) -> Result<(), CkError> {
@@ -9583,8 +9643,11 @@ mod tests {
         let mut codex = multiplier_observation_fixture("codex");
         codex["fee_multiplier"] = json!(53.84);
         codex["accounts_included"] = json!([{"account": "c1"}, {"account": "c2"}]);
-        let lines =
-            subscription_value_render(&[multiplier_observation_fixture("claude"), codex], None);
+        let lines = subscription_value_render(
+            &[multiplier_observation_fixture("claude"), codex],
+            None,
+            false,
+        );
         assert_eq!(
             lines,
             vec![
@@ -9606,7 +9669,7 @@ mod tests {
         row["fee_multiplier"] = Value::Null;
         row["multiplier"] = Value::Null;
         assert_eq!(
-            subscription_value_render(&[row], None),
+            subscription_value_render(&[row], None, false),
             vec![
                 "value vs API list price (last 7 days)",
                 "  claude  not enough usage yet",
@@ -9619,13 +9682,13 @@ mod tests {
         let mut row = multiplier_observation_fixture("claude");
         row["low_resolution"] = json!(true);
         assert_eq!(
-            subscription_value_render(&[row], None)[1],
+            subscription_value_render(&[row], None, false)[1],
             "  claude  89.8x the fee · 5 accounts · 2026-09-25 · low resolution"
         );
     }
 
     #[test]
-    fn subscription_value_marks_unpriced_tokens() {
+    fn subscription_value_unpriced_tokens_make_the_figure_approximate() {
         let mut row = multiplier_observation_fixture("claude");
         row["unpriced_tokens"] = json!([{
             "reason": "no_rate",
@@ -9635,9 +9698,69 @@ mod tests {
             "measurements": 3
         }]);
         assert_eq!(
-            subscription_value_render(&[row], None)[1],
-            "  claude  89.8x the fee · 5 accounts · 2026-09-25 · some usage not priced"
+            subscription_value_render(std::slice::from_ref(&row), None, false)[1],
+            "  claude  89.8x the fee · 5 accounts · 2026-09-25 · approximate"
         );
+        assert_eq!(
+            subscription_value_render(&[row], None, true)[1],
+            "  claude  89.8x the fee · 5 accounts · 2026-09-25 · approximate (some usage not priced)"
+        );
+    }
+
+    #[test]
+    fn subscription_value_excluded_accounts_make_the_figure_approximate() {
+        let mut row = multiplier_observation_fixture("claude");
+        row["accounts_excluded"] = json!([{"account": "x1"}, {"account": "x2"}]);
+        assert_eq!(
+            subscription_value_render(std::slice::from_ref(&row), None, false)[1],
+            "  claude  89.8x the fee · 5 accounts · 2026-09-25 · approximate"
+        );
+        assert_eq!(
+            subscription_value_render(&[row], None, true)[1],
+            "  claude  89.8x the fee · 5 accounts · 2026-09-25 · approximate (2 accounts not in the fee)"
+        );
+    }
+
+    #[test]
+    fn subscription_value_base_rate_tokens_make_the_figure_approximate() {
+        let mut row = multiplier_observation_fixture("claude");
+        row["base_rate_tier_untested_tokens"] = json!(263_400_000_i64);
+        assert_eq!(
+            subscription_value_render(std::slice::from_ref(&row), None, false)[1],
+            "  claude  89.8x the fee · 5 accounts · 2026-09-25 · approximate"
+        );
+        assert_eq!(
+            subscription_value_render(&[row], None, true)[1],
+            "  claude  89.8x the fee · 5 accounts · 2026-09-25 · approximate (263M tokens priced at base rate)"
+        );
+    }
+
+    /// All three triggers at once: one `approximate` clause, never repeated,
+    /// with every reason listed under --verbose; the rows' error-band strings
+    /// (written for the other multiplier) never appear.
+    #[test]
+    fn subscription_value_verbose_lists_every_approximation_reason_in_one_clause() {
+        let mut row = multiplier_observation_fixture("claude");
+        row["unpriced_tokens"] = json!([{
+            "reason": "no_rate", "model": "m", "role": "input", "tokens": 1, "measurements": 1
+        }]);
+        row["accounts_excluded"] = json!([{"account": "x1"}]);
+        row["base_rate_tier_untested_tokens"] = json!(263_000_000_i64);
+        row["error_deflating"] = json!("DEFLATING-BAND");
+        row["error_inflating"] = json!("INFLATING-BAND");
+        let quiet = subscription_value_render(std::slice::from_ref(&row), None, false);
+        let verbose = subscription_value_render(&[row], None, true);
+        assert_eq!(
+            quiet[1],
+            "  claude  89.8x the fee · 5 accounts · 2026-09-25 · approximate"
+        );
+        assert_eq!(
+            verbose[1],
+            "  claude  89.8x the fee · 5 accounts · 2026-09-25 · approximate (some usage not priced, 1 account not in the fee, 263M tokens priced at base rate)"
+        );
+        for line in quiet.iter().chain(&verbose) {
+            assert!(!line.contains("BAND"), "error band rendered: {line}");
+        }
     }
 
     #[test]
@@ -9647,18 +9770,18 @@ mod tests {
             multiplier_observation_fixture("codex"),
         ];
         assert_eq!(
-            subscription_value_render(&rows, Some("codex")),
+            subscription_value_render(&rows, Some("codex"), false),
             vec![
                 "value vs API list price (last 7 days)",
                 "  codex  89.8x the fee · 5 accounts · 2026-09-25",
             ]
         );
-        assert!(subscription_value_render(&rows, Some("gemini")).is_empty());
+        assert!(subscription_value_render(&rows, Some("gemini"), false).is_empty());
     }
 
     #[test]
     fn subscription_value_empty_latest_prints_no_heading() {
-        assert!(subscription_value_render(&[], None).is_empty());
+        assert!(subscription_value_render(&[], None, false).is_empty());
     }
 
     #[test]

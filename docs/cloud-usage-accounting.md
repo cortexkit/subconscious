@@ -1,6 +1,6 @@
 # Cloud Usage Accounting: the CloudUsageFact contract
 
-Status: DRAFT r11 (r10 + a batch may carry no facts, and a reply without an outcome vector is a failed ingest [#58]; r10 = r9 corrected: a duplicate is chained but never re-applied, keyed by the correction's own id [#44]; r9 = a re-sent correction is a duplicate [#41]; r8 = batch-level fields are acknowledged in the reply [#37]; r7 = the `metered_since` wire as shipped [#30][#33]; r6 = the producer half of `metered_since` [#29]: durable start, folds begin there, partial-hour reason; r5 = `metered_since`, the lower bound on a service's metering [#27]; r4 = the first-producer rulings [#21][#22]: byte_hours arithmetic, conflict events never settle, deny-unknown-fields enforced per fact, DO-SQL rows counted, class A retry undercount; ASTRO seat review pending) — custody SUBC, seats ASTRO (domain owner) / ENGRAM (first
+Status: DRAFT r12 (r11 + top-level accountId, the `not_applied` watermark outcome, and readers-before-writers for new wire values [#63][#64]; r11 = a batch may carry no facts, and a reply without an outcome vector is a failed ingest [#58]; r10 = r9 corrected: a duplicate is chained but never re-applied, keyed by the correction's own id [#44]; r9 = a re-sent correction is a duplicate [#41]; r8 = batch-level fields are acknowledged in the reply [#37]; r7 = the `metered_since` wire as shipped [#30][#33]; r6 = the producer half of `metered_since` [#29]: durable start, folds begin there, partial-hour reason; r5 = `metered_since`, the lower bound on a service's metering [#27]; r4 = the first-producer rulings [#21][#22]: byte_hours arithmetic, conflict events never settle, deny-unknown-fields enforced per fact, DO-SQL rows counted, class A retry undercount; ASTRO seat review pending) — custody SUBC, seats ASTRO (domain owner) / ENGRAM (first
 producer) / CKCRED (cloud infra custody). Ufuk directive 2026-07-20: build the non-politic
 half of cloud cost accounting first — per-account metering, spend visibility, and
 user-set limits. Invoice/billing folds are OUT OF SCOPE here (a later doc consumes this
@@ -138,6 +138,21 @@ Field rules:
   error body, a non-2xx status) is a failed ingest, never an empty success: the
   producer does not advance its watermark, does not mark anything settled, and retries
   the batch.
+- **(r12) Wire additions for zero-fact batches.** A batch carries a top-level
+  `accountId`: required when it has no facts (there is no fact to name the account),
+  optional otherwise, and when present it must match every fact's `accountId` or the
+  batch is refused as mixed. The watermark acknowledgement has a third outcome,
+  `not_applied`: every fact in the batch was rejected, so the watermark was left alone,
+  since the hours it would cover hold facts the ledger refused. A producer surfaces it
+  as an incident, like `refused`. In either acknowledgement, `stored` is never omitted,
+  and `null` means the ledger has never held a value.
+- **(r12) Readers before writers, for values as well as fields.** A field that has only
+  ever carried one kind of value has no tested reader for a new one, however many
+  readers compile against it: `stored` had only ever been a string, and a decoder
+  typed for a string fails the whole reply on its first `null`, turning an accepted
+  batch into a failed one that is re-sent forever. So a new value (a `null`, a new enum
+  member) ships only after every reader handles it: the producer's decoder is deployed
+  first, and the ledger that emits the value second.
 
 ## 3. Meter classes (how quantities are obtained)
 

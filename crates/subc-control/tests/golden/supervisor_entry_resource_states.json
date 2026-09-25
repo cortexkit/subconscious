@@ -1,0 +1,57 @@
+[
+  {
+    "enabled": true,
+    "health": "degraded",
+    "last_exit_ms": 1700000000123,
+    "last_probe_ms": 1700000000000,
+    "live": true,
+    "max_restarts": 3,
+    "module_id": "aft-tools",
+    "protocol": "subc",
+    "resources": {
+      "cpu_system_ms": 12905,
+      "cpu_user_ms": 83417,
+      "memory_bytes": 431222784,
+      "memory_kind": "phys_footprint",
+      "status": "measured"
+    },
+    "restart_count": 2,
+    "state": "running"
+  },
+  {
+    "enabled": true,
+    "health": "degraded",
+    "last_exit_ms": 1700000000123,
+    "last_probe_ms": 1700000000000,
+    "live": true,
+    "max_restarts": 3,
+    "module_id": "aft-tools",
+    "protocol": "subc",
+    "resources": {
+      "cpu_system_ms": 310,
+      "cpu_user_ms": 1250,
+      "memory_bytes": 212992000,
+      "memory_kind": "resident_set",
+      "status": "measured",
+      "swap_bytes": 4096
+    },
+    "restart_count": 2,
+    "state": "running"
+  },
+  {
+    "enabled": true,
+    "health": "degraded",
+    "last_exit_ms": 1700000000123,
+    "last_probe_ms": 1700000000000,
+    "live": true,
+    "max_restarts": 3,
+    "module_id": "aft-tools",
+    "protocol": "subc",
+    "resources": {
+      "reason": "not_running",
+      "status": "unavailable"
+    },
+    "restart_count": 2,
+    "state": "running"
+  }
+]

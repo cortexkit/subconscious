@@ -8,6 +8,7 @@
 
 pub mod bootstrap;
 pub(crate) mod capability_requirements;
+mod child_resources;
 mod child_roster;
 mod clock;
 pub mod control;

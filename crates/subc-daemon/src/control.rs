@@ -3312,6 +3312,9 @@ impl ControlHandler {
             })?;
             // Status and configuration snapshots release their locks before the image probe awaits.
             let image = module.running_image_agreement().await;
+            // Read per request so the figure is current when the operator asks;
+            // the daemon samples nothing in between.
+            let resources = Some(module.child_resource_usage());
             let pending_reload = Some(reload_verdict(
                 &configured.program,
                 status.spawned_from.as_deref(),
@@ -3338,6 +3341,7 @@ impl ControlHandler {
                 drain_timeout_ms: Some(status.drain_timeout.as_millis() as u64),
                 restart_backoff_ms: Some(status.restart_backoff.as_millis() as u64),
                 restart_max_backoff_ms: Some(status.restart_max_backoff.as_millis() as u64),
+                resources,
             });
         }
         let response = ClientControlResponse::SupervisorList {

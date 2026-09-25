@@ -2203,6 +2203,24 @@ async fn module_status_renders_key_value_block_byte_for_byte() {
     } else {
         "not checked on this platform (unsupported_platform)"
     };
+    // The resources line carries live memory and CPU figures that change from
+    // read to read, so it too is checked for form and cut out before the
+    // byte comparison of everything around it.
+    let (policy, rest) = rest
+        .split_once("\n  resources: ")
+        .expect("status carries a resources line after the policy line");
+    let (resources, rest) = rest
+        .split_once('\n')
+        .expect("resources line is followed by more status");
+    if cfg!(any(target_os = "linux", target_os = "macos")) {
+        assert!(
+            resources.starts_with("memory ") && resources.contains(" · cpu "),
+            "a running module renders its memory and cpu: {resources:?}"
+        );
+    } else {
+        assert_eq!(resources, "unavailable (unsupported platform)");
+    }
+    let rest = format!("{policy}\n{rest}");
     // The budget renders with the window it is counted over (`in 10m`), because
     // the count alone reads as a lifetime total and stopped being one.
     assert_eq!(
@@ -3295,6 +3313,7 @@ fn scripted_supervisor_entry(module_id: &str, drain_timeout_ms: Option<u64>) -> 
         drain_timeout_ms,
         restart_backoff_ms: Some(100),
         restart_max_backoff_ms: Some(30_000),
+        resources: None,
     }
 }
 

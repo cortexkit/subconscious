@@ -1,8 +1,9 @@
 use std::{ops::Deref, path::PathBuf, sync::Arc, time::Duration};
 
 use subc_control::{
-    ClientControlRequest, ClientControlResponse, ModuleProtocol, SpawnCursor, SpawnEvent,
-    SpawnEventKind, SpawnSnapshot, TerminalDisposition,
+    ChildMemoryKind, ChildResourceUnavailableReason, ChildResourceUsage, ClientControlRequest,
+    ClientControlResponse, ModuleProtocol, SpawnCursor, SpawnEvent, SpawnEventKind, SpawnSnapshot,
+    SupervisorEntry, TerminalDisposition,
 };
 use subc_daemon::{
     stderr_tail::{CaptureState, StderrTailSnapshot, TailEntry},
@@ -1484,6 +1485,70 @@ async fn spawn_snapshot_then_subscribe_has_no_overlap_or_gap() {
 
     after.stop().await.unwrap();
     before.stop().await.unwrap();
+}
+
+async fn list_modules(client: &mut TcpStream, corr: u64) -> Vec<SupervisorEntry> {
+    send_spawn_request(client, corr, ClientControlRequest::SupervisorList {}).await;
+    let frame = timeout(Duration::from_secs(5), read_frame(client))
+        .await
+        .expect("supervisor.list response timed out")
+        .unwrap()
+        .expect("connection closed before supervisor.list response");
+    match serde_json::from_slice(&frame.body).unwrap() {
+        ClientControlResponse::SupervisorList { modules, .. } => modules,
+        other => panic!("unexpected supervisor.list response: {other:?}"),
+    }
+}
+
+/// `supervisor.list` reports the running stub's own memory and CPU time, and
+/// once the module is stopped says there is no process to read rather than
+/// reporting zeros.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn supervisor_list_reports_a_running_childs_resources() {
+    let harness = SpawnEventHarness::start("list-resources", None).await;
+    let module = harness.spawn("list-resources-stub").await;
+    let mut client = harness.client().await;
+
+    let modules = list_modules(&mut client, 90).await;
+    let entry = modules
+        .iter()
+        .find(|entry| entry.module_id == "list-resources-stub")
+        .expect("stub is listed");
+    if cfg!(any(target_os = "linux", target_os = "macos")) {
+        let Some(ChildResourceUsage::Measured(reading)) = &entry.resources else {
+            panic!("running stub was not measured: {:?}", entry.resources);
+        };
+        assert!(
+            reading.memory_bytes > 0,
+            "a live process uses memory: {reading:?}"
+        );
+        let expected_kind = if cfg!(target_os = "macos") {
+            ChildMemoryKind::PhysFootprint
+        } else {
+            ChildMemoryKind::ResidentSet
+        };
+        assert_eq!(reading.memory_kind, expected_kind);
+    } else {
+        assert_eq!(
+            entry.resources,
+            Some(ChildResourceUsage::Unavailable {
+                reason: ChildResourceUnavailableReason::UnsupportedPlatform
+            })
+        );
+    }
+
+    module.stop().await.unwrap();
+    let modules = list_modules(&mut client, 91).await;
+    let entry = modules
+        .iter()
+        .find(|entry| entry.module_id == "list-resources-stub")
+        .expect("stopped stub is still listed");
+    assert_eq!(
+        entry.resources,
+        Some(ChildResourceUsage::Unavailable {
+            reason: ChildResourceUnavailableReason::NotRunning
+        })
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -2767,6 +2767,20 @@ impl SupervisedModule {
             .await
     }
 
+    /// Memory and CPU time of the module's current process, read now. Only the
+    /// process the supervisor spawned is read, not processes it has started.
+    pub(crate) fn child_resource_usage(&self) -> subc_control::ChildResourceUsage {
+        let (pid, start_time) = match lock_snapshot(&self.inner.snapshot) {
+            Ok(snapshot) => (snapshot.pid, snapshot.process_start_time),
+            Err(_) => {
+                return subc_control::ChildResourceUsage::Unavailable {
+                    reason: subc_control::ChildResourceUnavailableReason::Unreadable,
+                }
+            }
+        };
+        crate::child_resources::read(pid, start_time)
+    }
+
     pub(crate) fn will_recover_after_connection_loss(&self) -> Result<bool, SuperviseError> {
         let mut snapshot = lock_snapshot(&self.inner.snapshot)?;
         Ok(match snapshot.state {

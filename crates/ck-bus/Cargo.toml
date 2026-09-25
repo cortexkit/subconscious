@@ -1,6 +1,6 @@
 [package]
 name = "ck-bus"
-version = "0.1.21"
+version = "0.1.22"
 edition = "2021"
 publish = false
 description = "Supervised owner of the CortexKit NATS message plane."
@@ -30,7 +30,7 @@ futures-util = "0.3"
 nkeys = "=0.4.5"
 serde_json = "1"
 sha2 = "0.10"
-subc-client-rs = { path = "../subc-client-rs", version = "0.19" }
+subc-client-rs = { path = "../subc-client-rs", version = "0.20" }
 subc-protocol = { path = "../subc-protocol", version = "0.25.0" }
 tokio = { version = "1", features = ["macros", "process", "rt-multi-thread", "sync", "time"] }
 
@@ -38,7 +38,7 @@ tokio = { version = "1", features = ["macros", "process", "rt-multi-thread", "sy
 subc-test-support = { path = "../subc-test-support" }
 tempfile = "3"
 tokio = { version = "1", features = ["io-util", "net"] }
-subc-control = { path = "../subc-control", version = "0.20" }
+subc-control = { path = "../subc-control", version = "0.21" }
 subc-daemon = { path = "../subc-daemon", version = "0.21.0", features = ["test-support"] }
 subc-jsonc = { path = "../subc-jsonc", version = "0.1.0" }
 subc-transport = { path = "../subc-transport", version = "0.7.0" }

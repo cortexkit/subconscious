@@ -848,6 +848,15 @@ enum StderrCaptureStateWire {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum ChildResourceUsageWire {
+    Measured(ChildResourceReading),
+    Unavailable {
+        reason: ChildResourceUnavailableReason,
+    },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum StderrTailEntryWire {
     Line {
@@ -1325,6 +1334,44 @@ impl<'de> Deserialize<'de> for RunningImageAgreement {
                 .map_err(D::Error::custom)?,
             }),
             _ => Ok(Self::Unknown { tag, body: value }),
+        }
+    }
+}
+
+impl Serialize for ChildResourceUsage {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Measured(reading) => {
+                ChildResourceUsageWire::Measured(reading.clone()).serialize(serializer)
+            }
+            Self::Unavailable { reason } => ChildResourceUsageWire::Unavailable {
+                reason: reason.clone(),
+            }
+            .serialize(serializer),
+            Self::Unknown { body, .. } => body.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ChildResourceUsage {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let (tag, body) = read_tagged(deserializer, "status")?;
+        match tag.as_str() {
+            "measured" | "unavailable" => {
+                match serde_json::from_value(body.into_value()).map_err(D::Error::custom)? {
+                    ChildResourceUsageWire::Measured(reading) => Ok(Self::Measured(reading)),
+                    ChildResourceUsageWire::Unavailable { reason } => {
+                        Ok(Self::Unavailable { reason })
+                    }
+                }
+            }
+            _ => Ok(Self::Unknown { tag, body }),
         }
     }
 }
@@ -1915,6 +1962,85 @@ pub struct SupervisorEntry {
     /// on older daemons.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restart_max_backoff_ms: Option<u64>,
+    /// Memory and cumulative CPU time of the module's process, read when this
+    /// list was answered. Report only: the daemon keeps no history and acts on
+    /// none of it.
+    ///
+    /// It describes the one process the supervisor spawned (its `pid`), not
+    /// processes that one has started in turn, so a module that forks workers
+    /// reports only its own share.
+    ///
+    /// Absent means the daemon predates the field. A daemon that has the field
+    /// but could not read the process (not running, unsupported platform, read
+    /// failed) says so with `Unavailable` and a reason, so neither case can be
+    /// mistaken for a process using nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resources: Option<ChildResourceUsage>,
+}
+
+/// A module process's memory and CPU time as read at list time, or why none
+/// could be read.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ChildResourceUsage {
+    Measured(ChildResourceReading),
+    Unavailable {
+        reason: ChildResourceUnavailableReason,
+    },
+    /// Future discriminator. `body` retains the complete ordered object; `tag`
+    /// is its decoded discriminator projection.
+    Unknown {
+        tag: String,
+        body: OrderedJsonObject,
+    },
+}
+
+/// One reading of a module process's memory and CPU time.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChildResourceReading {
+    /// Memory in bytes, measured as `memory_kind` says. The figures differ
+    /// by platform and are not comparable across kinds.
+    pub memory_bytes: u64,
+    pub memory_kind: ChildMemoryKind,
+    /// Bytes swapped out, where the platform reports it per process (Linux).
+    /// Absent means not reported, not zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub swap_bytes: Option<u64>,
+    /// CPU time spent in user mode since the process started, in
+    /// milliseconds. Cumulative, not a rate: a percentage needs two readings
+    /// and the elapsed time between them.
+    pub cpu_user_ms: u64,
+    /// CPU time spent in the kernel on the process's behalf since it started,
+    /// in milliseconds.
+    pub cpu_system_ms: u64,
+}
+
+open_string_enum! {
+    /// What `ChildResourceReading::memory_bytes` measures.
+    ChildMemoryKind {
+        /// macOS `phys_footprint`: memory the kernel charges to the process,
+        /// the figure jetsam acts on. Unlike resident size it does not count
+        /// pages an allocator has already released with `MADV_FREE`.
+        PhysFootprint => "phys_footprint",
+        /// Linux `VmRSS`: pages resident in RAM, shared file-backed pages
+        /// included and swapped-out pages excluded.
+        ResidentSet => "resident_set",
+    }
+}
+
+open_string_enum! {
+    /// Why a module process's resources could not be read.
+    ChildResourceUnavailableReason {
+        /// The module has no running process.
+        NotRunning => "not_running",
+        /// The daemon's platform has no per-process source.
+        UnsupportedPlatform => "unsupported_platform",
+        /// The process could not be read, typically because it exited while
+        /// the list was being answered.
+        Unreadable => "unreadable",
+        /// The pid no longer names the process the supervisor spawned, so a
+        /// reading would describe some other process.
+        ProcessIdentityUnconfirmed => "process_identity_unconfirmed",
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -2340,6 +2466,51 @@ mod tests {
             StderrTailEntry,
             "kind",
             serde_json::json!({"kind": "future", "text": "line"})
+        );
+        assert_unknown_round_trip!(
+            ChildResourceUsage,
+            "status",
+            serde_json::json!({"status": "future", "memory_bytes": 1})
+        );
+    }
+
+    #[test]
+    fn child_resource_usage_round_trips_both_known_states() {
+        let measured = ChildResourceUsage::Measured(ChildResourceReading {
+            memory_bytes: 0,
+            memory_kind: ChildMemoryKind::ResidentSet,
+            swap_bytes: Some(0),
+            cpu_user_ms: 0,
+            cpu_system_ms: 0,
+        });
+        let wire = serde_json::to_value(&measured).unwrap();
+        assert_eq!(
+            wire,
+            serde_json::json!({
+                "status": "measured",
+                "memory_bytes": 0,
+                "memory_kind": "resident_set",
+                "swap_bytes": 0,
+                "cpu_user_ms": 0,
+                "cpu_system_ms": 0
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<ChildResourceUsage>(wire).unwrap(),
+            measured
+        );
+
+        let unavailable = ChildResourceUsage::Unavailable {
+            reason: ChildResourceUnavailableReason::NotRunning,
+        };
+        let wire = serde_json::to_value(&unavailable).unwrap();
+        assert_eq!(
+            wire,
+            serde_json::json!({"status": "unavailable", "reason": "not_running"})
+        );
+        assert_eq!(
+            serde_json::from_value::<ChildResourceUsage>(wire).unwrap(),
+            unavailable
         );
     }
 

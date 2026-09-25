@@ -1,10 +1,13 @@
-//! macOS process identity through `sysctl(KERN_PROC_PID)` and `proc_pidpath`.
-//! These two foreign calls are this crate's only unsafe code.
+//! macOS process identity through `sysctl(KERN_PROC_PID)` and `proc_pidpath`,
+//! and resource usage through `proc_pid_rusage` and `mach_timebase_info`.
+//! These four foreign calls are this crate's only unsafe code.
 
 use std::{
     ffi::{c_int, c_void, OsStr},
     os::unix::ffi::OsStrExt,
     path::Path,
+    sync::OnceLock,
+    time::Duration,
 };
 
 use rustix::{
@@ -12,7 +15,7 @@ use rustix::{
     process::{kill_process, Pid},
 };
 
-use crate::{FileIdentity, Signal};
+use crate::{FileIdentity, MemoryKind, ResourceUsage, Signal};
 
 /// `sizeof(struct kinfo_proc)` on 64-bit macOS (arm64 and x86_64). The libc
 /// crate does not define the struct, so it is read as bytes at the offsets
@@ -110,6 +113,98 @@ pub(crate) fn executable_identity(pid: u32) -> Option<FileIdentity> {
     let written = usize::try_from(written).ok().filter(|&n| n > 0)?;
     buffer.truncate(written.min(buffer.len()));
     crate::file_identity(Path::new(OsStr::from_bytes(&buffer)))
+}
+
+/// Memory and CPU time of `pid` from `proc_pid_rusage(RUSAGE_INFO_V2)`, or
+/// `None` if there is no such process, it is a zombie, or the call fails.
+///
+/// Memory is `ri_phys_footprint`, the figure Activity Monitor and jetsam use,
+/// rather than `ri_resident_size`: resident size keeps counting pages an
+/// allocator has released with `MADV_FREE` until the kernel reclaims them, so
+/// it overstates a long-lived process that allocates and frees heavily.
+pub(crate) fn resource_usage(pid: u32) -> Option<ResourceUsage> {
+    let raw_pid = c_int::try_from(pid).ok()?;
+    let mut info = libc::rusage_info_v2 {
+        ri_uuid: [0; 16],
+        ri_user_time: 0,
+        ri_system_time: 0,
+        ri_pkg_idle_wkups: 0,
+        ri_interrupt_wkups: 0,
+        ri_pageins: 0,
+        ri_wired_size: 0,
+        ri_resident_size: 0,
+        ri_phys_footprint: 0,
+        ri_proc_start_abstime: 0,
+        ri_proc_exit_abstime: 0,
+        ri_child_user_time: 0,
+        ri_child_system_time: 0,
+        ri_child_pkg_idle_wkups: 0,
+        ri_child_interrupt_wkups: 0,
+        ri_child_pageins: 0,
+        ri_child_elapsed_abstime: 0,
+        ri_diskio_bytesread: 0,
+        ri_diskio_byteswritten: 0,
+    };
+    // SAFETY: `info` is a live, writable `rusage_info_v2`, which is exactly
+    // what the `RUSAGE_INFO_V2` flavor tells the kernel to write. The
+    // parameter is declared as `rusage_info_t *` (a pointer to a void
+    // pointer) for historical reasons, but the kernel treats it as the
+    // address of the struct, so the cast is the documented usage. The call
+    // returns 0 on success and -1 (with errno) otherwise.
+    #[allow(unsafe_code)]
+    let result = unsafe {
+        libc::proc_pid_rusage(
+            raw_pid,
+            libc::RUSAGE_INFO_V2,
+            (&mut info as *mut libc::rusage_info_v2).cast::<libc::rusage_info_t>(),
+        )
+    };
+    if result != 0 {
+        return None;
+    }
+    // A zombie still answers with the usage it had when it exited. Checked
+    // after the read so a process that exits in between is not reported as
+    // running.
+    start_time(pid)?;
+    Some(ResourceUsage {
+        memory_bytes: info.ri_phys_footprint,
+        memory_kind: MemoryKind::PhysFootprint,
+        swap_bytes: None,
+        cpu_user: mach_ticks_to_duration(info.ri_user_time),
+        cpu_system: mach_ticks_to_duration(info.ri_system_time),
+    })
+}
+
+/// `ri_user_time` and `ri_system_time` count Mach absolute-time ticks, not
+/// nanoseconds. The two are the same on Intel Macs, but on Apple silicon a
+/// tick is 125/3 ns, so an unconverted value would read about 24 times low.
+fn mach_ticks_to_duration(ticks: u64) -> Duration {
+    let (numer, denom) = mach_timebase();
+    let nanos = u128::from(ticks) * u128::from(numer) / u128::from(denom.max(1));
+    Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX))
+}
+
+/// The tick-to-nanosecond ratio, fixed for the life of the system, so it is
+/// read once. If the call fails the ratio falls back to 1/1, the Intel value.
+///
+/// libc marks its Mach bindings deprecated in favour of the `mach2` crate;
+/// this one struct and function do not justify a new dependency.
+#[allow(deprecated)]
+fn mach_timebase() -> (u32, u32) {
+    static TIMEBASE: OnceLock<(u32, u32)> = OnceLock::new();
+    *TIMEBASE.get_or_init(|| {
+        let mut info = libc::mach_timebase_info { numer: 0, denom: 0 };
+        // SAFETY: `info` is a live, writable `mach_timebase_info` struct, the
+        // only thing the call writes to. It returns KERN_SUCCESS (0) on
+        // success.
+        #[allow(unsafe_code)]
+        let result = unsafe { libc::mach_timebase_info(&mut info) };
+        if result == 0 && info.numer != 0 && info.denom != 0 {
+            (info.numer, info.denom)
+        } else {
+            (1, 1)
+        }
+    })
 }
 
 pub(crate) fn signal(pid: u32, signal: Signal) -> Result<(), Errno> {

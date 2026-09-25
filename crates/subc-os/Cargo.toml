@@ -1,14 +1,14 @@
 [package]
 name = "subc-os"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "MIT"
 publish = true
 repository = "https://github.com/cortexkit/subconscious"
-description = "Operating-system primitives for the subc daemon that need unsafe code, behind a safe API: per-process identity and signalling."
+description = "Operating-system primitives for the subc daemon that need unsafe code, behind a safe API: per-process identity, signalling, and memory and CPU usage."
 
 [target.'cfg(target_os = "linux")'.dependencies]
-rustix = { version = "1", default-features = false, features = ["event", "process", "std"] }
+rustix = { version = "1", default-features = false, features = ["event", "param", "process", "std"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"

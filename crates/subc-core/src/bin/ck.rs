@@ -5636,11 +5636,15 @@ fn print_module_table(modules: &[Value], verbose: bool) {
                     live_word(module),
                     terminal_safe_string(&human_health_status(&display_field(module, "health"))),
                     reload_list_marker(module).to_string(),
+                    child_memory_cell(module),
+                    child_cpu_cell(module),
                 ]
             })
             .collect::<Vec<_>>();
         print_table(
-            &["module", "state", "enabled", "live", "health", "reload"],
+            &[
+                "module", "state", "enabled", "live", "health", "reload", "memory", "cpu",
+            ],
             rows,
         );
         return;
@@ -5926,6 +5930,7 @@ fn print_status_table(
     if declares_no_protocol(module) {
         println!("  protocol: none");
     }
+    println!("  resources: {}", format_child_resources(module));
     println!("  last exit: {}", format_last_exit(module));
     println!(
         "  {}",
@@ -6173,6 +6178,109 @@ fn format_effective_policy(module: &Value) -> String {
         duration("restart_backoff_ms"),
         duration("restart_max_backoff_ms")
     )
+}
+
+/// The module process's memory and CPU time as one clause, for example
+/// `memory 412.3 MiB phys footprint · cpu 1m23s (user 1m10s, system 13.0s)`.
+///
+/// The three non-readings stay distinct: a daemon that predates the field
+/// (no key), one that could not read the process (a reason), and one that
+/// sends a status this build does not know. None of them renders as zero.
+fn format_child_resources(module: &Value) -> String {
+    let Some(resources) = module.get("resources") else {
+        return "not reported by this daemon".to_string();
+    };
+    match resources.get("status").and_then(Value::as_str) {
+        Some("measured") => {
+            let memory = resources
+                .get("memory_bytes")
+                .and_then(Value::as_u64)
+                .map(format_bytes)
+                .unwrap_or_else(|| "unknown".to_string());
+            let kind = resources
+                .get("memory_kind")
+                .and_then(Value::as_str)
+                .map(|kind| format!(" {}", terminal_safe_string(&humanize_identifier(kind))))
+                .unwrap_or_default();
+            let swap = resources
+                .get("swap_bytes")
+                .and_then(Value::as_u64)
+                .map(|bytes| format!(", swap {}", format_bytes(bytes)))
+                .unwrap_or_default();
+            let user = resources.get("cpu_user_ms").and_then(Value::as_u64);
+            let system = resources.get("cpu_system_ms").and_then(Value::as_u64);
+            let cpu = match (user, system) {
+                (Some(user), Some(system)) => format!(
+                    "{} (user {}, system {})",
+                    format_cpu_time(user.saturating_add(system)),
+                    format_cpu_time(user),
+                    format_cpu_time(system)
+                ),
+                _ => "unknown".to_string(),
+            };
+            format!("memory {memory}{kind}{swap} · cpu {cpu}")
+        }
+        Some("unavailable") => format!(
+            "unavailable ({})",
+            resources
+                .get("reason")
+                .and_then(Value::as_str)
+                .map(|reason| terminal_safe_string(&humanize_identifier(reason)))
+                .unwrap_or_else(|| "reason unavailable".to_string())
+        ),
+        Some(other) => format!("unknown ({})", terminal_safe_string(other)),
+        None => "unknown (missing status)".to_string(),
+    }
+}
+
+/// The memory column of `ck module list --verbose`: the figure alone, `n/a`
+/// when the daemon could not read the process, `-` when it did not report.
+fn child_memory_cell(module: &Value) -> String {
+    let Some(resources) = module.get("resources") else {
+        return "-".to_string();
+    };
+    match resources.get("status").and_then(Value::as_str) {
+        Some("measured") => resources
+            .get("memory_bytes")
+            .and_then(Value::as_u64)
+            .map(format_bytes)
+            .unwrap_or_else(|| "?".to_string()),
+        Some("unavailable") => "n/a".to_string(),
+        _ => "?".to_string(),
+    }
+}
+
+/// The cpu column of `ck module list --verbose`: user plus system time since
+/// the process started, with the same placeholders as the memory column.
+fn child_cpu_cell(module: &Value) -> String {
+    let Some(resources) = module.get("resources") else {
+        return "-".to_string();
+    };
+    match resources.get("status").and_then(Value::as_str) {
+        Some("measured") => match (
+            resources.get("cpu_user_ms").and_then(Value::as_u64),
+            resources.get("cpu_system_ms").and_then(Value::as_u64),
+        ) {
+            (Some(user), Some(system)) => format_cpu_time(user.saturating_add(system)),
+            _ => "?".to_string(),
+        },
+        Some("unavailable") => "n/a".to_string(),
+        _ => "?".to_string(),
+    }
+}
+
+/// Cumulative CPU time: `310 ms`, `12.4s`, `1m23s`, `2h05m`.
+fn format_cpu_time(milliseconds: u64) -> String {
+    let secs = milliseconds / 1_000;
+    if milliseconds < 1_000 {
+        format!("{milliseconds} ms")
+    } else if secs < 60 {
+        format!("{:.1}s", milliseconds as f64 / 1_000.0)
+    } else if secs < 3_600 {
+        format!("{}m{:02}s", secs / 60, secs % 60)
+    } else {
+        format!("{}h{:02}m", secs / 3_600, (secs % 3_600) / 60)
+    }
 }
 
 fn format_last_exit(module: &Value) -> String {
@@ -8125,6 +8233,79 @@ mod tests {
         assert!(rendered.contains(r#"\u001b"#));
         assert!(rendered.contains(r#"\u0007"#));
         assert!(!rendered.bytes().any(|byte| byte < 0x20));
+    }
+
+    #[test]
+    fn child_resources_render_a_measured_reading() {
+        let module = serde_json::json!({
+            "resources": {
+                "status": "measured",
+                "memory_bytes": 431_222_784u64,
+                "memory_kind": "phys_footprint",
+                "cpu_user_ms": 70_400,
+                "cpu_system_ms": 13_000,
+            }
+        });
+        assert_eq!(
+            format_child_resources(&module),
+            "memory 411.2 MiB phys footprint · cpu 1m23s (user 1m10s, system 13.0s)"
+        );
+        assert_eq!(child_memory_cell(&module), "411.2 MiB");
+        assert_eq!(child_cpu_cell(&module), "1m23s");
+
+        let linux = serde_json::json!({
+            "resources": {
+                "status": "measured",
+                "memory_bytes": 2_097_152,
+                "memory_kind": "resident_set",
+                "swap_bytes": 4096,
+                "cpu_user_ms": 250,
+                "cpu_system_ms": 40,
+            }
+        });
+        assert_eq!(
+            format_child_resources(&linux),
+            "memory 2.0 MiB resident set, swap 4.0 KiB · cpu 290 ms (user 250 ms, system 40 ms)"
+        );
+    }
+
+    /// A daemon that predates the field, one that could not read the process,
+    /// and a real zero reading must render as three different things.
+    #[test]
+    fn child_resources_keep_absent_unavailable_and_zero_apart() {
+        let absent = serde_json::json!({});
+        let unavailable = serde_json::json!({
+            "resources": {"status": "unavailable", "reason": "not_running"}
+        });
+        let zero = serde_json::json!({
+            "resources": {
+                "status": "measured",
+                "memory_bytes": 0,
+                "memory_kind": "resident_set",
+                "cpu_user_ms": 0,
+                "cpu_system_ms": 0,
+            }
+        });
+        assert_eq!(
+            format_child_resources(&absent),
+            "not reported by this daemon"
+        );
+        assert_eq!(
+            format_child_resources(&unavailable),
+            "unavailable (not running)"
+        );
+        assert_eq!(
+            format_child_resources(&zero),
+            "memory 0 B resident set · cpu 0 ms (user 0 ms, system 0 ms)"
+        );
+        assert_eq!(
+            [&absent, &unavailable, &zero].map(child_memory_cell),
+            ["-", "n/a", "0 B"]
+        );
+        assert_eq!(
+            [&absent, &unavailable, &zero].map(child_cpu_cell),
+            ["-", "n/a", "0 ms"]
+        );
     }
 
     #[test]

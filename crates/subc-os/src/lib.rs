@@ -27,6 +27,11 @@
 //!   the crate's only unsafe code. macOS has no pidfd, so a signal is a plain
 //!   `kill` sent right after the checks; see [`Process::signal`].
 //! - Anywhere else: [`Process::open`] reports [`std::io::ErrorKind::Unsupported`].
+//!
+//! It also reads how much memory and CPU time one process is using, for
+//! reporting only; see [`resource_usage`]. On Linux that is procfs again; on
+//! macOS it is `proc_pid_rusage`, plus `mach_timebase_info` to convert its CPU
+//! times to nanoseconds, the other two unsafe calls in the crate.
 
 #![deny(unsafe_code)]
 
@@ -100,6 +105,66 @@ pub fn start_time(pid: u32) -> Option<u64> {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         platform::start_time(pid)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+/// True where [`resource_usage`] can read a live process. Elsewhere it always
+/// answers `None`, and a caller can use this to say "not supported here"
+/// rather than "could not read".
+pub const RESOURCE_USAGE_SUPPORTED: bool = cfg!(any(target_os = "linux", target_os = "macos"));
+
+/// What [`ResourceUsage::memory_bytes`] measures. The platforms offer
+/// different figures, and they are not interchangeable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryKind {
+    /// macOS `phys_footprint`: the memory the kernel charges to the process
+    /// (dirty and compressed pages, among others), which is also what jetsam
+    /// acts on. Pages an allocator has released with `MADV_FREE` do not count.
+    PhysFootprint,
+    /// Linux `VmRSS`: pages of the process resident in RAM, including shared
+    /// file-backed pages. Swapped-out pages are not included; see
+    /// [`ResourceUsage::swap_bytes`].
+    ResidentSet,
+}
+
+/// One reading of a process's memory and cumulative CPU time.
+///
+/// It covers the process named by the pid alone: its threads are included,
+/// processes it has started are not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResourceUsage {
+    /// Memory in bytes, measured as [`Self::memory_kind`] says.
+    pub memory_bytes: u64,
+    pub memory_kind: MemoryKind,
+    /// Bytes swapped out (Linux `VmSwap`). `None` where the platform does not
+    /// report it for a single process, which is not the same as zero.
+    pub swap_bytes: Option<u64>,
+    /// CPU time spent in user mode since the process started.
+    pub cpu_user: std::time::Duration,
+    /// CPU time spent in the kernel on the process's behalf since it started.
+    pub cpu_system: std::time::Duration,
+}
+
+/// Memory and cumulative CPU time of the process holding `pid`, read now.
+///
+/// `None` when there is no such process, it has exited (a zombie awaiting its
+/// reap counts as exited), it cannot be read (for example, another user's
+/// process on macOS), or the platform has no source
+/// (see [`RESOURCE_USAGE_SUPPORTED`]). Never a reading of zeros in place of
+/// one of those.
+///
+/// Like any pid-based read, this describes whatever process holds `pid` now;
+/// a caller that needs it to be a particular process should confirm that
+/// process's [`start_time`] around the call.
+pub fn resource_usage(pid: u32) -> Option<ResourceUsage> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        platform::resource_usage(pid)
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
@@ -326,6 +391,111 @@ mod tests {
             now - started < 3_600 * 1_000_000,
             "start time {started} is more than an hour before now {now}"
         );
+    }
+
+    /// Keeps one core busy for at least `wall` of wall-clock time.
+    fn burn_cpu(wall: Duration) {
+        let deadline = Instant::now() + wall;
+        let mut value = 0u64;
+        while Instant::now() < deadline {
+            for step in 0..10_000u64 {
+                value = std::hint::black_box(value.wrapping_mul(31).wrapping_add(step));
+            }
+        }
+        std::hint::black_box(value);
+    }
+
+    #[test]
+    fn own_resource_usage_is_present_and_plausible() {
+        let usage = resource_usage(std::process::id()).expect("own process is readable");
+        // A running test binary maps well over a megabyte; zero or a handful
+        // of bytes would mean the wrong field or unit was read.
+        assert!(
+            usage.memory_bytes > 1024 * 1024,
+            "memory {} bytes is implausibly small",
+            usage.memory_bytes
+        );
+        assert!(
+            usage.memory_bytes < 64 * 1024 * 1024 * 1024,
+            "memory {} bytes is implausibly large",
+            usage.memory_bytes
+        );
+        #[cfg(target_os = "macos")]
+        assert_eq!(usage.memory_kind, MemoryKind::PhysFootprint);
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(usage.memory_kind, MemoryKind::ResidentSet);
+            assert!(usage.swap_bytes.is_some(), "Linux reports VmSwap");
+        }
+    }
+
+    /// CPU time must grow with busy work, and by roughly the amount of work
+    /// done: a reading in the wrong unit (for example Mach ticks taken as
+    /// nanoseconds on Apple silicon, about 24 times too small) grows too, but
+    /// not by enough.
+    #[test]
+    fn own_cpu_time_grows_by_about_the_busy_work_done() {
+        let pid = std::process::id();
+        let total = |usage: ResourceUsage| usage.cpu_user + usage.cpu_system;
+        let before = total(resource_usage(pid).unwrap());
+        let busy = Duration::from_millis(400);
+        burn_cpu(busy);
+        let after = total(resource_usage(pid).unwrap());
+        let grown = after.saturating_sub(before);
+        // Other tests run in parallel threads of this process, so the growth
+        // may exceed the busy time; it cannot fall far below it unless this
+        // thread was starved, which a 50% floor tolerates.
+        assert!(
+            grown >= busy / 2,
+            "cpu time grew by {grown:?} over {busy:?} of busy work"
+        );
+    }
+
+    #[test]
+    fn a_child_reads_its_own_usage_not_ours() {
+        let mut child = spawn_sleep();
+        let process = Process::open(child.id()).unwrap().unwrap();
+        wait_for_executable(&process, sleep_identity());
+        let ours = resource_usage(std::process::id()).unwrap();
+        let usage = resource_usage(child.id()).expect("live child is readable");
+        assert!(usage.memory_bytes > 0);
+        assert!(
+            usage.memory_bytes < ours.memory_bytes,
+            "a sleeping child ({} bytes) should be smaller than the test binary ({} bytes)",
+            usage.memory_bytes,
+            ours.memory_bytes
+        );
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    #[test]
+    fn an_exited_child_reads_as_unavailable_not_zero() {
+        let mut child = spawn_sleep();
+        let pid = child.id();
+        child.kill().unwrap();
+        // Killed but not reaped: a zombie, which still has a pid.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while start_time(pid).is_some() {
+            assert!(Instant::now() < deadline, "child still observed as alive");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(resource_usage(pid), None, "a zombie reads as unavailable");
+        child.wait().unwrap();
+        // Reaped: the pid names nothing (barring reuse, which would be some
+        // other live process and so still not a reading of zeros).
+        if let Some(usage) = resource_usage(pid) {
+            assert!(usage.memory_bytes > 0, "a reused pid is some live process");
+        }
+    }
+
+    #[test]
+    fn a_pid_with_no_process_reads_as_unavailable() {
+        // Above both kernels' pid limits (Linux caps pid_max at 2^22, macOS at
+        // 99998), so nothing can hold it.
+        assert_eq!(resource_usage(i32::MAX as u32), None);
+        // Not a representable pid at all.
+        assert_eq!(resource_usage(u32::MAX), None);
     }
 
     #[cfg(target_os = "linux")]

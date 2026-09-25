@@ -3,13 +3,14 @@ use std::{fmt::Debug, fs, path::PathBuf};
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
 use subc_control::{
-    CatalogEntry, ClientControlPush, ClientControlRequest, ClientControlResponse, ConsumerIdentity,
-    DaemonBuildProvenance, DaemonObservedProcess, LiveSpawn, ModuleDeclaredProvenance,
-    ModuleProtocol, NotReadyReason, PendingReloadVerdict, PollKind, ReloadPathAgreement,
-    ReloadPathUnavailableReason, RouteCloseReason, RunningImageAgreement, RunningImageEvidence,
-    RunningImageUnavailableReason, SpawnCursor, SpawnEvent, SpawnEventKind, SpawnSnapshot,
-    StderrCaptureState, StderrTail, StderrTailEntry, SupervisorDaemonProvenance, SupervisorEntry,
-    SupervisorHealthEntry, SupervisorHealthStatus, SupervisorModuleProvenance,
+    CatalogEntry, ChildMemoryKind, ChildResourceReading, ChildResourceUnavailableReason,
+    ChildResourceUsage, ClientControlPush, ClientControlRequest, ClientControlResponse,
+    ConsumerIdentity, DaemonBuildProvenance, DaemonObservedProcess, LiveSpawn,
+    ModuleDeclaredProvenance, ModuleProtocol, NotReadyReason, PendingReloadVerdict, PollKind,
+    ReloadPathAgreement, ReloadPathUnavailableReason, RouteCloseReason, RunningImageAgreement,
+    RunningImageEvidence, RunningImageUnavailableReason, SpawnCursor, SpawnEvent, SpawnEventKind,
+    SpawnSnapshot, StderrCaptureState, StderrTail, StderrTailEntry, SupervisorDaemonProvenance,
+    SupervisorEntry, SupervisorHealthEntry, SupervisorHealthStatus, SupervisorModuleProvenance,
     SupervisorObservedProcess, SupervisorRescanResult, SupervisorRoute, SupervisorRouteConsumer,
     SupervisorRouteModule,
 };
@@ -135,6 +136,34 @@ fn control_wire_shapes_match_golden_json_and_round_trip() {
     assert_golden(
         "supervisor_entry_with_restart_window",
         &supervisor_entry_with_restart_window(),
+    );
+    assert_golden(
+        "supervisor_entry_resource_states",
+        &[
+            ChildResourceUsage::Measured(ChildResourceReading {
+                memory_bytes: 431_222_784,
+                memory_kind: ChildMemoryKind::PhysFootprint,
+                swap_bytes: None,
+                cpu_user_ms: 83_417,
+                cpu_system_ms: 12_905,
+            }),
+            ChildResourceUsage::Measured(ChildResourceReading {
+                memory_bytes: 212_992_000,
+                memory_kind: ChildMemoryKind::ResidentSet,
+                swap_bytes: Some(4_096),
+                cpu_user_ms: 1_250,
+                cpu_system_ms: 310,
+            }),
+            ChildResourceUsage::Unavailable {
+                reason: ChildResourceUnavailableReason::NotRunning,
+            },
+        ]
+        .into_iter()
+        .map(|resources| SupervisorEntry {
+            resources: Some(resources),
+            ..supervisor_entry()
+        })
+        .collect::<Vec<_>>(),
     );
     assert_golden("poll_kind_status", &PollKind::Status);
     assert_golden("poll_kind_liveness", &PollKind::Liveness);
@@ -957,6 +986,7 @@ fn supervisor_entry() -> SupervisorEntry {
         drain_timeout_ms: None,
         restart_backoff_ms: None,
         restart_max_backoff_ms: None,
+        resources: None,
     }
 }
 
@@ -1118,6 +1148,34 @@ fn supervisor_entry_restart_window_round_trips_and_old_wire_stays_unknown() {
     );
     let decoded: SupervisorEntry = serde_json::from_value(windowless).expect("old shape decodes");
     assert_eq!(decoded.restart_window_secs, None);
+}
+
+/// Resource readings are additive: a daemon that predates them sends no key,
+/// and that must decode as "not reported", never as a reading of zero bytes
+/// and zero CPU time, which would claim an idle module.
+#[test]
+fn supervisor_entry_without_resources_decodes_as_absent_not_zero() {
+    let old_wire = serde_json::to_value(supervisor_entry()).expect("old wire serializes");
+    assert!(
+        old_wire.get("resources").is_none(),
+        "older-daemon shape must omit resources: {old_wire}"
+    );
+    let decoded: SupervisorEntry = serde_json::from_value(old_wire).expect("old wire decodes");
+    assert_eq!(decoded.resources, None);
+
+    let unavailable = SupervisorEntry {
+        resources: Some(ChildResourceUsage::Unavailable {
+            reason: ChildResourceUnavailableReason::Unreadable,
+        }),
+        ..supervisor_entry()
+    };
+    let encoded = serde_json::to_value(&unavailable).expect("entry serializes");
+    assert_eq!(
+        encoded["resources"],
+        serde_json::json!({"status": "unavailable", "reason": "unreadable"})
+    );
+    let decoded: SupervisorEntry = serde_json::from_value(encoded).expect("round trip decodes");
+    assert_eq!(decoded.resources, unavailable.resources);
 }
 
 fn supervisor_health_entry() -> SupervisorHealthEntry {

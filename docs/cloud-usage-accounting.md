@@ -1,6 +1,6 @@
 # Cloud Usage Accounting: the CloudUsageFact contract
 
-Status: DRAFT r10 (r9 corrected: a duplicate is chained but never re-applied, keyed by the correction's own id [#44]; r9 = a re-sent correction is a duplicate [#41]; r8 = batch-level fields are acknowledged in the reply [#37]; r7 = the `metered_since` wire as shipped [#30][#33]; r6 = the producer half of `metered_since` [#29]: durable start, folds begin there, partial-hour reason; r5 = `metered_since`, the lower bound on a service's metering [#27]; r4 = the first-producer rulings [#21][#22]: byte_hours arithmetic, conflict events never settle, deny-unknown-fields enforced per fact, DO-SQL rows counted, class A retry undercount; ASTRO seat review pending) — custody SUBC, seats ASTRO (domain owner) / ENGRAM (first
+Status: DRAFT r11 (r10 + a batch may carry no facts, and a reply without an outcome vector is a failed ingest [#58]; r10 = r9 corrected: a duplicate is chained but never re-applied, keyed by the correction's own id [#44]; r9 = a re-sent correction is a duplicate [#41]; r8 = batch-level fields are acknowledged in the reply [#37]; r7 = the `metered_since` wire as shipped [#30][#33]; r6 = the producer half of `metered_since` [#29]: durable start, folds begin there, partial-hour reason; r5 = `metered_since`, the lower bound on a service's metering [#27]; r4 = the first-producer rulings [#21][#22]: byte_hours arithmetic, conflict events never settle, deny-unknown-fields enforced per fact, DO-SQL rows counted, class A retry undercount; ASTRO seat review pending) — custody SUBC, seats ASTRO (domain owner) / ENGRAM (first
 producer) / CKCRED (cloud infra custody). Ufuk directive 2026-07-20: build the non-politic
 half of cloud cost accounting first — per-account metering, spend visibility, and
 user-set limits. Invoice/billing folds are OUT OF SCOPE here (a later doc consumes this
@@ -129,6 +129,15 @@ Field rules:
   "ignored by a ledger that predates the field" by the acknowledgement's presence, and
   keeps re-sending an idempotent field until it is acknowledged. A new batch-level field
   must therefore be idempotent and must come with its acknowledgement.
+- **(r11) A batch may carry no facts.** An hour with no usage still has to move the
+  watermark, or a reader cannot tell "nothing happened" from "not reported yet". So
+  ingest accepts a batch with zero facts when it carries a batch-level field
+  (`watermarkThroughHour`, `meteredSince`), acknowledges those fields as usual, and
+  returns an empty outcome vector. A batch with no facts and no batch-level fields is
+  still refused. On the producer side, a reply that carries no outcome vector at all (an
+  error body, a non-2xx status) is a failed ingest, never an empty success: the
+  producer does not advance its watermark, does not mark anything settled, and retries
+  the batch.
 
 ## 3. Meter classes (how quantities are obtained)
 

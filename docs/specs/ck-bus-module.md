@@ -701,6 +701,18 @@ Federation state is reported separately under `detail` keys prefixed `fed.`.
   `fed-foundation-amendment-unlanded`. ck-bus consumes from a durable, acks the local
   original only after the sealed frame's publish ack, and never uses a core-NATS
   subscription as the outbound path.
+- Requirements from prefrontal's cross-machine design (prefrontal
+  `docs/designs/prefrontal-cross-machine.md`, reviewed with ALF on 2026-09-25). Four cross-machine
+  families, not three: ROOM, WAKE, PEER and SYNC (`ck.{dst}.sync.{src_machine_id}.state`: directory
+  rows, ask copies, write outcomes, snapshots, presence), added to the federation account's inbox and
+  outbox families and the leaf publish grant. Stream settings are per family, not one shared stream:
+  WAKE max-age 24 h (a day-old wake is noise), ROOM, PEER and SYNC 7 d, all discard-new; presence is a
+  last-value subject (`max_msgs_per_subject: 1`, one subject per sender), never store-and-forward.
+  ck-bus reports a per-destination forward backlog (frames accepted from the box-account hand-off but
+  not yet accepted by the federation outbox or the hub) under `fed.` health detail, because the
+  hand-off ack is the last thing prefrontal can observe, so a full hub stream is otherwise invisible to
+  it. Dedupe and gap-skipping (`outbox.skip` for a write past its deadline) are prefrontal's, above
+  the bus.
 - Leaf configuration. ck-bus reads `callosum.hub_read` every 60 s and on every
   reconnect. Exactly one hub is accepted; two are refused. The SPKI SHA-256 pin from the
   roster column is the authority and candidate addresses are advisory: a dial whose

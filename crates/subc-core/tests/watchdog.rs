@@ -10,12 +10,11 @@ use std::{
 use subc_control::ClientControlRequest;
 use subc_daemon::{
     bootstrap::{run_with_config, BootstrapConfig, BootstrapError},
-    read_frame, serve_listener,
-    test_support::TestTempDir,
-    write_frame, ControlHandler, DaemonSelfWatchdog, DaemonSelfWatchdogConfig, Frame, Registry,
-    Router, ServerAuth,
+    read_frame, serve_listener, write_frame, ControlHandler, DaemonSelfWatchdog,
+    DaemonSelfWatchdogConfig, Frame, Registry, Router, ServerAuth,
 };
 use subc_protocol::{Flags, FrameType, Priority, PROTOCOL_VERSION};
+use subc_test_support::TestTempDir;
 use subc_transport::{
     generate_daemon_id, generate_key, read_for_client as read_connection_file, write_atomic,
     ConnectionInfo, Endpoint, SCHEMA_VERSION,
@@ -256,7 +255,7 @@ impl RunningDaemon {
 impl Drop for RunningDaemon {
     fn drop(&mut self) {
         self.task.abort();
-        // The temp dir is owned by the `TestTempDir` guard, whose `Drop` removes
+        // The temp dir is owned by the `subc_test_support::TestTempDir` guard, whose `Drop` removes
         // the tree (or preserves it on panic).
     }
 }

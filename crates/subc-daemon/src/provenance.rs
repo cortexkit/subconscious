@@ -314,6 +314,7 @@ impl ImageDigestCache {
 
 #[cfg(test)]
 mod tests {
+    use subc_test_support::TestTempDir;
     // Only the linux sha256 tests open files directly, and only non-linux
     // platforms assert the unavailable arm; each import gates with its users
     // so the other platforms' clippy does not fail them as unused.
@@ -325,7 +326,6 @@ mod tests {
     use tokio::process::Command;
 
     use super::*;
-    use crate::test_support::TestTempDir;
     use subc_control::RunningImageAgreement;
     #[cfg(target_os = "linux")]
     use subc_control::RunningImageUnavailableReason;
@@ -641,7 +641,7 @@ mod tests {
             1,
             "the 65th identity clears the 64-entry cache"
         );
-        // No manual cleanup: the TestTempDir guard removes the tree on drop and
+        // No manual cleanup: the subc_test_support::TestTempDir guard removes the tree on drop and
         // deliberately preserves it when the test panics.
     }
 

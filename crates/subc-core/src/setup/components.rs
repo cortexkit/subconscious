@@ -922,7 +922,7 @@ fn platform_binary(binary: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use subc_daemon::test_support::TestTempDir;
+    use subc_test_support::TestTempDir;
 
     /// On unix the fake is a real shell script and the default `--version`
     /// execution runs unchanged, so the install path is exercised end to end.

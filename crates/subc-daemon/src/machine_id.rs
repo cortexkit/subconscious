@@ -201,16 +201,8 @@ impl Error for MachineIdFileError {
 mod tests {
     use super::*;
 
-    fn temp_dir(name: &str) -> PathBuf {
-        let mut suffix = [0u8; 8];
-        getrandom::getrandom(&mut suffix).unwrap();
-        let dir = std::env::temp_dir().join(format!(
-            "subc-machine-id-{name}-{}-{:016x}",
-            std::process::id(),
-            u64::from_be_bytes(suffix)
-        ));
-        fs::create_dir_all(&dir).unwrap();
-        dir
+    fn temp_dir(name: &str) -> subc_test_support::TestTempDir {
+        subc_test_support::TestTempDir::new(&format!("subc-machine-id-{name}"))
     }
 
     #[test]
@@ -230,7 +222,6 @@ mod tests {
             entries,
             vec![std::ffi::OsString::from(MACHINE_ID_FILE_NAME)]
         );
-        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -249,7 +240,6 @@ mod tests {
             );
             assert_eq!(fs::read_to_string(&path).unwrap(), content);
         }
-        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -278,7 +268,6 @@ mod tests {
             Err(MachineIdFileError::Corrupt { .. })
         ));
         assert_eq!(fs::read(&path).unwrap(), vec![0xff, 0xfe]);
-        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -290,6 +279,5 @@ mod tests {
         write(&path, &adopted).unwrap();
         assert_ne!(first, adopted);
         assert_eq!(read(&path).unwrap(), Some(adopted));
-        let _ = fs::remove_dir_all(dir);
     }
 }

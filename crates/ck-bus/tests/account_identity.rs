@@ -41,6 +41,7 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
+use subc_test_support::TestTempDir;
 
 use async_nats::jetstream::{self, consumer::pull};
 use async_trait::async_trait;
@@ -122,7 +123,7 @@ async fn start(machine_id: &str) -> Option<Plane> {
 }
 
 async fn start_run(
-    root: subc_daemon::test_support::TestTempDir,
+    root: TestTempDir,
     trust: &TrustChain,
     server: &BusServer,
     machine_id: &str,

@@ -9,11 +9,12 @@ use std::{
     path::{Path, PathBuf},
     process,
     sync::{
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicUsize, Ordering},
         Arc,
     },
     time::Duration,
 };
+use subc_test_support::TestTempDir;
 
 use rmcp::{
     model::{
@@ -58,7 +59,6 @@ use tokio::{
     time::{sleep, timeout, Instant},
 };
 
-static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 const TEST_DAEMON_VER: &str = "test-subc-mcp";
 // The module refuses to serve without daemon spawn attestation (SUBC_MODULE_ID +
 // SUBC_LAUNCH_NONCE), so the tests spawn it exactly as the daemon would: env
@@ -99,14 +99,13 @@ struct TestDaemon {
     registry: Arc<Registry>,
     forwarding: Arc<ForwardingTable>,
     connection_file_path: PathBuf,
-    temp_dir: PathBuf,
+    temp_dir: TestTempDir,
     task: JoinHandle<Result<(), subc_daemon::ServerError>>,
 }
 
 impl Drop for TestDaemon {
     fn drop(&mut self) {
         self.task.abort();
-        let _ = fs::remove_dir_all(&self.temp_dir);
     }
 }
 
@@ -138,20 +137,13 @@ impl TestServer {
 }
 
 struct TestProject {
-    path: PathBuf,
+    path: TestTempDir,
 }
 
 impl TestProject {
     fn new(label: &str) -> Self {
         let path = unique_temp_dir(label);
-        fs::create_dir_all(&path).unwrap();
         Self { path }
-    }
-}
-
-impl Drop for TestProject {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
     }
 }
 
@@ -4079,7 +4071,7 @@ async fn mcp_module_rejects_unsupported_shim_hello_schema_without_opening_routes
         &mut stream,
         &json!({
             "schema": bad_schema,
-            "project_root": project.path,
+            "project_root": project.path.path(),
             "harness": "subc-mcp-test",
             "shim_session_id": "shim-bad-schema"
         }),
@@ -4225,7 +4217,6 @@ async fn start_test_daemon_with_process_liveness_and_supervisor(
     supervisor_handle: SupervisorHandle,
 ) -> TestDaemon {
     let temp_dir = unique_temp_dir(name);
-    fs::create_dir_all(&temp_dir).unwrap();
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let connection_file_path = temp_dir.join("subc-conn.json");
@@ -4705,8 +4696,11 @@ where
 
 fn route_identity(label: &str, corr: u64) -> BindIdentity {
     let project_root = unique_temp_dir(&format!("mcp-route-{label}-{corr}"));
-    fs::create_dir_all(&project_root).unwrap();
-    BindIdentity::new(project_root, "subc-mcp-test", format!("session-{corr}"))
+    BindIdentity::new(
+        project_root.keep(),
+        "subc-mcp-test",
+        format!("session-{corr}"),
+    )
 }
 
 async fn wait_for_stub_event<F>(path: &Path, wait: Duration, matches: F) -> Value
@@ -5095,7 +5089,6 @@ fn assert_unknown_tool_error(error: ServiceError, name: &str) {
     }
 }
 
-fn unique_temp_dir(label: &str) -> PathBuf {
-    let nonce = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    env::temp_dir().join(format!("sc-{label}-{}-{nonce}", process::id()))
+fn unique_temp_dir(label: &str) -> TestTempDir {
+    TestTempDir::new(label)
 }

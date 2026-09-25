@@ -15,10 +15,9 @@ use subc_control::{
 };
 use subc_daemon::{
     read_frame, server::MAX_PENDING_ROUTE_OPENS_PER_CONNECTION, stderr_tail::TailEntry,
-    test_support::TestTempDir, write_frame, ExitKind, ForwardingTable, Frame, HealthAction,
-    HealthConfig, ModuleOverlap, ModuleSpec, ModuleState, ModuleStatus, Registry, RestartPolicy,
-    SuperviseError, SupervisedModule, Supervisor, SupervisorHandle, SupervisorProcessLiveness,
-    SwapFailureArm,
+    write_frame, ExitKind, ForwardingTable, Frame, HealthAction, HealthConfig, ModuleOverlap,
+    ModuleSpec, ModuleState, ModuleStatus, Registry, RestartPolicy, SuperviseError,
+    SupervisedModule, Supervisor, SupervisorHandle, SupervisorProcessLiveness, SwapFailureArm,
 };
 use subc_protocol::{
     error_codes,
@@ -27,6 +26,7 @@ use subc_protocol::{
     BindIdentity, ErrorBody, Flags, FrameType, ModuleHelloAckBody, ModuleHelloBody, Priority,
     RouteTarget, FLAG_SUBSCRIPTION, PROTOCOL_VERSION,
 };
+use subc_test_support::TestTempDir;
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt},
     net::TcpStream,

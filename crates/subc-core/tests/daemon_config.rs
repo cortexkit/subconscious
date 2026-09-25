@@ -13,14 +13,13 @@ use subc_control::{
 };
 use subc_daemon::{
     bootstrap::{run_with_config, run_with_daemon_config_path, BootstrapConfig},
-    daemon_config, read_frame,
-    test_support::TestTempDir,
-    write_frame, Frame, Registry, RestartPolicy, Supervisor,
+    daemon_config, read_frame, write_frame, Frame, Registry, RestartPolicy, Supervisor,
 };
 use subc_protocol::{
     manifest::ModuleManifest, BindIdentity, ErrorBody, Flags, FrameType, ModuleHelloBody, Priority,
     RouteTarget, PROTOCOL_VERSION,
 };
+use subc_test_support::TestTempDir;
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt},
     net::TcpStream,
@@ -96,7 +95,7 @@ impl RunningDaemon {
 impl Drop for RunningDaemon {
     fn drop(&mut self) {
         self.task.abort();
-        // The temp dir is owned by the `TestTempDir` guard, whose `Drop` removes
+        // The temp dir is owned by the `subc_test_support::TestTempDir` guard, whose `Drop` removes
         // the tree (or preserves it on panic).
     }
 }

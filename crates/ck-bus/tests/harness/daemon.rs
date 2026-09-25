@@ -5,10 +5,8 @@ use std::{
 };
 
 use subc_control::{ClientControlRequest, ClientControlResponse};
-use subc_daemon::{
-    bootstrap::{run_with_config, BootstrapConfig},
-    test_support::TestTempDir,
-};
+use subc_daemon::bootstrap::{run_with_config, BootstrapConfig};
+use subc_test_support::TestTempDir;
 use tokio::task::JoinHandle;
 
 use super::{

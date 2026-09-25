@@ -10,10 +10,11 @@ use std::{
     sync::{Arc, Once},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+use subc_test_support::TestTempDir;
 
 use subc_daemon::{
-    serve_listener, test_support::TestTempDir, ConnectedClients, ControlHandler, ForwardingTable,
-    ModuleProcessLiveness, Registry, Router, ServerAuth, SupervisorHandle,
+    serve_listener, ConnectedClients, ControlHandler, ForwardingTable, ModuleProcessLiveness,
+    Registry, Router, ServerAuth, SupervisorHandle,
 };
 use subc_protocol::PROTOCOL_VERSION;
 use subc_transport::{
@@ -87,7 +88,7 @@ impl TestDaemon {
 impl Drop for TestDaemon {
     fn drop(&mut self) {
         self.task.abort();
-        // The temp dir is owned by the `TestTempDir` guard, whose `Drop` removes
+        // The temp dir is owned by the `subc_test_support::TestTempDir` guard, whose `Drop` removes
         // the tree (or preserves it on panic).
     }
 }

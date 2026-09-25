@@ -6,11 +6,11 @@ use subc_control::{
 };
 use subc_daemon::{
     stderr_tail::{CaptureState, StderrTailSnapshot, TailEntry},
-    test_support::TestTempDir,
     ModuleSpec, ModuleState, ModuleStatus, Registry, RestartPolicy, SuperviseError,
     SupervisedModule, Supervisor, SupervisorHandle, SupervisorProcessLiveness,
 };
 use subc_protocol::{ErrorBody, Flags, FrameType, Priority};
+use subc_test_support::TestTempDir;
 use subc_transport::{read_frame, write_frame};
 use tokio::{
     io::AsyncWriteExt,

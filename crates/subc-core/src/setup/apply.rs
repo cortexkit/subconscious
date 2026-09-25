@@ -923,7 +923,7 @@ mod tests {
 mod adoption_tests {
     use super::*;
     use crate::setup::test_exec::write_executable;
-    use subc_daemon::test_support::TestTempDir;
+    use subc_test_support::TestTempDir;
 
     /// Rollback after a later refusal must delete only what this run wrote.
     /// An adopted binary existed before the run (and may be the image a

@@ -107,7 +107,7 @@ mod tests {
 
     use super::*;
     use crate::setup::{inventory::Inventory, self_update, test_exec::copy_executable};
-    use subc_daemon::test_support::TestTempDir;
+    use subc_test_support::TestTempDir;
 
     const TEST_NAME: &str =
         "setup::self_update_unix::tests::unix_self_update_keeps_running_process_on_original_inode";

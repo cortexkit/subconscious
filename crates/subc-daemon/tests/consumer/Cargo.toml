@@ -5,6 +5,7 @@ edition = "2021"
 publish = false
 
 [dev-dependencies]
+subc-test-support = { path = "../../../subc-test-support" }
 subc-daemon = { path = "../..", features = ["test-support"] }
 subc-protocol = { path = "../../../subc-protocol" }
 subc-transport = { path = "../../../subc-transport" }

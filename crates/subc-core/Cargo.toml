@@ -68,6 +68,7 @@ rustix = { version = "1", default-features = false, features = ["process"] }
 
 
 [dev-dependencies]
+subc-test-support = { path = "../subc-test-support" }
 tokio = { version = "1", features = ["test-util"] }
 subc-daemon = { path = "../subc-daemon", version = "0.21.0", features = ["test-support"] }
 # Keep required-feature CLI fixture targets enabled for integration tests.

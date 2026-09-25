@@ -8037,7 +8037,7 @@ mod tests {
 
     use super::*;
     use subc_control::{StderrCaptureState, StderrTail, StderrTailEntry};
-    use subc_daemon::test_support::TestTempDir;
+    use subc_test_support::TestTempDir;
 
     #[test]
     fn provenance_value_escapes_terminal_controls() {

@@ -159,7 +159,7 @@ mod tests {
     use serde_json::Map;
 
     use super::*;
-    use subc_daemon::test_support::TestTempDir;
+    use subc_test_support::TestTempDir;
 
     const TEST_NAME: &str =
         "setup::self_update_windows::tests::replacement_preserves_old_until_a_successful_next_invocation_cleans_it";

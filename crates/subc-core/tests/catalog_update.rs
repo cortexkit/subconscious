@@ -6,11 +6,12 @@ use std::{
     sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
+use subc_test_support::TestTempDir;
 
 use subc_control::{CatalogEntry, ClientControlRequest, ClientControlResponse};
 use subc_daemon::{
-    read_frame, test_support::TestTempDir, write_frame, Frame, ModuleSpec, RestartPolicy,
-    SupervisedModule, Supervisor, SupervisorHandle, SupervisorProcessLiveness,
+    read_frame, write_frame, Frame, ModuleSpec, RestartPolicy, SupervisedModule, Supervisor,
+    SupervisorHandle, SupervisorProcessLiveness,
 };
 use subc_protocol::{
     manifest::{

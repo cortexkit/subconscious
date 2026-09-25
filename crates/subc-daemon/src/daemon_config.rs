@@ -1367,8 +1367,7 @@ impl Error for DaemonConfigError {
 mod run_dir_privacy_tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
-
-    use crate::test_support::TestTempDir;
+    use subc_test_support::TestTempDir;
 
     /// Both arms of the thing that actually bit: a directory this code CREATES,
     /// and one it INHERITS from another creator. The second is the real case --

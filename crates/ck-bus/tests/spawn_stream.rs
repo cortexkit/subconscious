@@ -65,10 +65,11 @@ mod support;
 
 use std::{
     collections::{BTreeSet, VecDeque},
-    path::{Path, PathBuf},
+    path::Path,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
+use subc_test_support::TestTempDir;
 
 use async_trait::async_trait;
 use harness::{
@@ -102,17 +103,8 @@ fn cursor(incarnation: &str, seq: u64) -> SpawnCursor {
     }
 }
 
-fn store_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "ckbus-spawn-stream-{name}-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+fn store_dir(name: &str) -> TestTempDir {
+    TestTempDir::new(&format!("ckbus-spawn-stream-{name}"))
 }
 
 async fn until<T>(what: &str, mut probe: impl FnMut() -> Option<T>) -> T {
@@ -525,7 +517,6 @@ async fn every_exit_is_revoked_by_fact_and_a_restarted_consumer_resumes_from_its
     task.abort();
     let _ = task.await;
     run.shutdown().await;
-    let _ = std::fs::remove_dir_all(&store);
     passed();
 }
 
@@ -599,7 +590,6 @@ async fn a_foreign_incarnation_is_refused_byte_exact_and_the_consumer_reconciles
     task.abort();
     let _ = task.await;
     run.shutdown().await;
-    let _ = std::fs::remove_dir_all(&store);
     passed();
 }
 
@@ -656,7 +646,6 @@ async fn a_cursor_older_than_the_ring_falls_back_to_a_snapshot_and_reconciles() 
     assert_eq!(stored_cursor(&store), cursor("inc-a", 5003));
     task.abort();
     let _ = task.await;
-    let _ = std::fs::remove_dir_all(&store);
     passed();
 }
 
@@ -718,6 +707,5 @@ async fn a_lagged_stream_reconciles_and_resubscribes_from_its_last_cursor() {
     );
     task.abort();
     let _ = task.await;
-    let _ = std::fs::remove_dir_all(&store);
     passed();
 }

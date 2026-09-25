@@ -533,7 +533,7 @@ pub(crate) fn record_path(run_dir: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::TestTempDir;
+    use subc_test_support::TestTempDir;
 
     fn child(module_id: &str, pid: u32) -> LiveChild {
         LiveChild {

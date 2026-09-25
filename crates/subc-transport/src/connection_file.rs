@@ -738,6 +738,7 @@ impl Error for ConnectionFileError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use subc_test_support::TestTempDir;
 
     fn sample_info() -> ConnectionInfo {
         ConnectionInfo {
@@ -765,10 +766,8 @@ mod tests {
         std::env::temp_dir().join(name)
     }
 
-    fn unique_temp_dir(label: &str) -> PathBuf {
-        let path = unique_temp_path().with_extension(label);
-        fs::create_dir_all(&path).expect("create test directory");
-        path
+    fn unique_temp_dir(label: &str) -> TestTempDir {
+        TestTempDir::new(label)
     }
 
     /// A GROUP-writable ancestor must refuse, and the passing control on the same
@@ -919,7 +918,7 @@ mod tests {
             error.to_string().contains(&named.display().to_string()),
             "the failure must name the operator-selected rig path"
         );
-        fs::remove_dir_all(root).expect("remove test directory");
+        drop(root);
     }
 
     #[test]
@@ -962,7 +961,7 @@ mod tests {
             "every fallback candidate must be absolute: {with_empty_named_override:?} {with_empty_runtime:?}"
         );
 
-        fs::remove_dir_all(root).expect("remove test directory");
+        drop(root);
     }
 
     #[test]
@@ -1006,7 +1005,7 @@ mod tests {
             ],
             "one path reached through two rungs must only be tried once"
         );
-        fs::remove_dir_all(root).expect("remove test directory");
+        drop(root);
     }
 
     #[test]
@@ -1052,13 +1051,12 @@ mod tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-        fs::remove_dir_all(root).expect("remove test directory");
+        drop(root);
     }
 
     #[test]
     fn write_atomic_sweeps_stale_temps_and_spares_recent_and_unrelated_files() {
-        let dir = std::env::temp_dir().join(format!("subc-sweep-{}", process::id()));
-        fs::create_dir_all(&dir).expect("create dir");
+        let dir = TestTempDir::new("subc-sweep");
         let target = dir.join("subc-connection.json");
 
         // A temp stranded by a dead writer: correct shape, old enough to sweep.
@@ -1099,8 +1097,6 @@ mod tests {
             "age alone must not condemn a file that is not one of our temps"
         );
         assert!(target.exists(), "the publish itself must still land");
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

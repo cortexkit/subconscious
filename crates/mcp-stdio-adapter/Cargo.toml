@@ -20,3 +20,6 @@ subc-jsonc = { path = "../subc-jsonc" }
 subc-protocol = { path = "../subc-protocol" }
 tokio = { version = "1", features = ["io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
 tokio-util = "0.7"
+
+[dev-dependencies]
+subc-test-support = { path = "../subc-test-support" }

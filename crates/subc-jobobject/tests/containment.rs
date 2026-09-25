@@ -16,6 +16,7 @@ use std::{
     process::{Command, Stdio},
     time::Duration,
 };
+use subc_test_support::TestTempDir;
 
 use subc_jobobject::{process_exists, wait_for_process_exit, JobObject};
 
@@ -55,33 +56,16 @@ struct Fixture {
     _dir: TempDir,
 }
 
-/// Minimal RAII temp dir, matching the daemon's `TestTempDir` convention of
-/// keeping orphans attributable rather than hand-assembled.
-struct TempDir(PathBuf);
+/// Wraps the workspace test guard with the fixture's existing `join` API.
+struct TempDir(TestTempDir);
 
 impl TempDir {
     fn new(label: &str) -> Self {
-        let path = std::env::temp_dir()
-            .join("subc-jobobject-tests")
-            .join(format!("{label}-{}", std::process::id()));
-        std::fs::create_dir_all(&path).expect("create test temp dir");
-        Self(path)
+        Self(TestTempDir::new(label))
     }
 
     fn join(&self, name: &str) -> PathBuf {
         self.0.join(name)
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        // A panicking test's evidence must outlive it, so the tree is kept and
-        // its path printed rather than silently removed.
-        if std::thread::panicking() {
-            eprintln!("fixture temp dir kept for inspection: {}", self.0.display());
-            return;
-        }
-        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 

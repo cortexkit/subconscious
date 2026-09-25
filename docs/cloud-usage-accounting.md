@@ -1,6 +1,6 @@
 # Cloud Usage Accounting: the CloudUsageFact contract
 
-Status: DRAFT r8 (r7 + batch-level fields are acknowledged in the reply [#37]; r7 = the `metered_since` wire as shipped [#30][#33]; r6 = the producer half of `metered_since` [#29]: durable start, folds begin there, partial-hour reason; r5 = `metered_since`, the lower bound on a service's metering [#27]; r4 = the first-producer rulings [#21][#22]: byte_hours arithmetic, conflict events never settle, deny-unknown-fields enforced per fact, DO-SQL rows counted, class A retry undercount; ASTRO seat review pending) — custody SUBC, seats ASTRO (domain owner) / ENGRAM (first
+Status: DRAFT r9 (r8 + a re-sent correction is a duplicate [#41]; r8 = batch-level fields are acknowledged in the reply [#37]; r7 = the `metered_since` wire as shipped [#30][#33]; r6 = the producer half of `metered_since` [#29]: durable start, folds begin there, partial-hour reason; r5 = `metered_since`, the lower bound on a service's metering [#27]; r4 = the first-producer rulings [#21][#22]: byte_hours arithmetic, conflict events never settle, deny-unknown-fields enforced per fact, DO-SQL rows counted, class A retry undercount; ASTRO seat review pending) — custody SUBC, seats ASTRO (domain owner) / ENGRAM (first
 producer) / CKCRED (cloud infra custody). Ufuk directive 2026-07-20: build the non-politic
 half of cloud cost accounting first — per-account metering, spend visibility, and
 user-set limits. Invoice/billing folds are OUT OF SCOPE here (a later doc consumes this
@@ -74,6 +74,12 @@ Field rules:
   render "restated"), the log keeps original + correction forever, and corrections are
   themselves conflict-checked (correcting a correction chains explicitly). History is
   never edited; known-wrong facts are never left uncorrected.
+  (r9) A correction is idempotent the same way an emission is: a correction identical
+  to the fact's latest restatement (same quantity, same provenance) is answered
+  `duplicate` and not chained again, so a producer re-sending after a lost reply does
+  not leave a duplicate restatement in the chain. Facts already emitted before
+  `metered_since` existed are not restated just to add a partial-hour reason: the read
+  path derives "partial" from `metered_since` itself.
 - **Late facts are legal** (a worker may fold an hour late); consumers read
   watermark-style (facts through hour H complete when the service's emission watermark
   passes H). Each service publishes its watermark as part of emission.

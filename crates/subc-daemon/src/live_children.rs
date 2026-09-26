@@ -36,6 +36,8 @@ use serde::{Deserialize, Serialize};
 use subc_control::ModuleProtocol;
 use tracing::{info, warn};
 
+use crate::run_dir_lock::RunDirLock;
+
 /// The record's file name inside the daemon run directory.
 pub(crate) const LIVE_CHILDREN_FILE_NAME: &str = "live-children.json";
 
@@ -315,16 +317,21 @@ impl Default for SweepBounds {
 #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 const POLL: Duration = Duration::from_millis(20);
 
-/// End every process the previous daemon's record at `path` lists that is
-/// still exactly the process recorded, except those in `adopted`, then
-/// replace the record with an empty one. Runs before any module is spawned.
+/// End every process the previous daemon's record lists that is still
+/// exactly the process recorded, except those in `adopted`, then replace the
+/// record with an empty one. Runs before any module is spawned.
+///
+/// The record is the one in the run directory `owner` locks. Requiring the
+/// lock means the record cannot belong to a daemon that is still running:
+/// such a daemon would hold the lock itself.
 ///
 /// Every entry is logged with its decision. Returns the decisions for tests.
 pub(crate) async fn sweep_orphans(
-    path: &Path,
+    owner: &RunDirLock,
     adopted: &AdoptedPids,
     bounds: SweepBounds,
 ) -> Vec<(LiveChild, SweepDecision)> {
+    let path = owner.live_children_record();
     let entries = match read_record(path) {
         Ok(entries) => entries,
         Err(error) => {
@@ -861,7 +868,12 @@ mod tests {
             let (mut child, entry) = spawn_recorded(&executable("sleep"), &["60"]);
             write_record(&path, std::slice::from_ref(&entry)).unwrap();
 
-            let decisions = sweep_orphans(&path, &AdoptedPids::none(), quick()).await;
+            let decisions = sweep_orphans(
+                &RunDirLock::acquire(&path).unwrap(),
+                &AdoptedPids::none(),
+                quick(),
+            )
+            .await;
 
             assert_eq!(decisions, vec![(entry, SweepDecision::Terminated)]);
             let status = child.wait().unwrap();
@@ -893,7 +905,12 @@ mod tests {
             write_record(&path, std::slice::from_ref(&entry)).unwrap();
 
             let started = Instant::now();
-            let decisions = sweep_orphans(&path, &AdoptedPids::none(), quick()).await;
+            let decisions = sweep_orphans(
+                &RunDirLock::acquire(&path).unwrap(),
+                &AdoptedPids::none(),
+                quick(),
+            )
+            .await;
 
             assert_eq!(decisions, vec![(entry, SweepDecision::Killed)]);
             assert!(started.elapsed() >= quick().term_grace);
@@ -912,7 +929,12 @@ mod tests {
             reused.start_time = reused.start_time.map(|start| start + 1);
             write_record(&path, std::slice::from_ref(&reused)).unwrap();
 
-            let decisions = sweep_orphans(&path, &AdoptedPids::none(), quick()).await;
+            let decisions = sweep_orphans(
+                &RunDirLock::acquire(&path).unwrap(),
+                &AdoptedPids::none(),
+                quick(),
+            )
+            .await;
 
             assert_eq!(
                 decisions,
@@ -939,7 +961,12 @@ mod tests {
                 .map(ExecutableIdentity::from);
             write_record(&path, std::slice::from_ref(&other)).unwrap();
 
-            let decisions = sweep_orphans(&path, &AdoptedPids::none(), quick()).await;
+            let decisions = sweep_orphans(
+                &RunDirLock::acquire(&path).unwrap(),
+                &AdoptedPids::none(),
+                quick(),
+            )
+            .await;
 
             assert_eq!(
                 decisions,
@@ -965,7 +992,12 @@ mod tests {
             child.wait().unwrap();
             write_record(&path, std::slice::from_ref(&entry)).unwrap();
 
-            let decisions = sweep_orphans(&path, &AdoptedPids::none(), quick()).await;
+            let decisions = sweep_orphans(
+                &RunDirLock::acquire(&path).unwrap(),
+                &AdoptedPids::none(),
+                quick(),
+            )
+            .await;
 
             assert_eq!(decisions, vec![(entry, SweepDecision::Gone)]);
             assert_eq!(read_record(&path).unwrap(), Vec::new());
@@ -978,7 +1010,12 @@ mod tests {
             let (mut child, entry) = spawn_recorded(&executable("sleep"), &["60"]);
             write_record(&path, std::slice::from_ref(&entry)).unwrap();
 
-            let decisions = sweep_orphans(&path, &AdoptedPids::of([entry.pid]), quick()).await;
+            let decisions = sweep_orphans(
+                &RunDirLock::acquire(&path).unwrap(),
+                &AdoptedPids::of([entry.pid]),
+                quick(),
+            )
+            .await;
 
             assert_eq!(decisions, vec![(entry, SweepDecision::Adopted)]);
             assert!(still_running(&mut child), "an adopted child was signalled");

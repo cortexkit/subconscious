@@ -388,6 +388,9 @@ impl BootstrapConfig {
 }
 
 /// Result of singleton discovery.
+// Built once per daemon start and immediately matched, so the size gap between
+// the variants costs nothing worth a box on the public shape.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum Outcome {
     /// A live daemon authenticated from the connection file; this invocation should exit 0.
@@ -406,6 +409,10 @@ pub struct BoundDaemon {
     /// The machine id this daemon serves, established before any connection is
     /// accepted. `None` when the config named no machine id path.
     pub machine_id: Option<crate::machine_id::MachineId>,
+    /// Ownership of the run directory, held until the daemon exits so no other
+    /// daemon sweeps or writes this one's run state. `None` when the config
+    /// keeps no live-children record, and so has no run directory to own.
+    run_dir_lock: Option<crate::run_dir_lock::RunDirLock>,
 }
 
 /// Resolve subc's per-user TCP connection-file path.
@@ -655,12 +662,17 @@ async fn serve_bound_daemon(
     // Before anything can spawn a module (the configured modules below, or a
     // client's start request once the listeners are served): a previous daemon
     // that died without its shutdown stop may have left children running, and
-    // a fresh copy beside one would fight it for its port and stores. This
-    // daemon has already claimed the singleton (a live one would have made it
-    // exit as already running), so the record is not a running daemon's.
-    if let Some(path) = &live_children_path {
+    // a fresh copy beside one would fight it for its port and stores. The
+    // record is not a running daemon's because this daemon holds the lock on
+    // the run directory the record lives in, and a running daemon holds that
+    // lock for its whole life. (Claiming the singleton is not enough: it is
+    // keyed on the connection file, which can live in a different runtime
+    // directory from the run directory.) The lock stays held until this
+    // function returns, which is when the daemon exits.
+    let run_dir_lock = bound.run_dir_lock;
+    if let Some(owner) = &run_dir_lock {
         crate::live_children::sweep_orphans(
-            path,
+            owner,
             &crate::live_children::AdoptedPids::none(),
             crate::live_children::SweepBounds::default(),
         )
@@ -937,11 +949,22 @@ pub async fn ensure_singleton_with_config(
         return Ok(Outcome::AlreadyRunning);
     }
 
+    // The start lock and the probe above only rule out a daemon using this
+    // connection file. A daemon started with another runtime directory but
+    // the same data home shares the run directory while passing both, so the
+    // run directory needs its own owner: refuse at once if a live daemon holds
+    // it, before anything below reads or writes run or data-home state.
+    let run_dir_lock = config
+        .live_children_path
+        .as_deref()
+        .map(crate::run_dir_lock::RunDirLock::acquire)
+        .transpose()?;
+
     remove_stale_connection_file_if_present(&path)?;
 
-    // Established under the start lock and before binding, so a corrupt file
-    // stops boot before anything is published, and two daemons racing to start
-    // cannot both mint.
+    // Established under the start lock, and under the run-directory lock when
+    // there is one, and before binding: a corrupt file stops boot before
+    // anything is published, and two daemons racing to start cannot both mint.
     let machine_id = config
         .machine_id_path
         .as_deref()
@@ -971,6 +994,7 @@ pub async fn ensure_singleton_with_config(
         connection_file_path: path,
         connection_file_source: config.connection_file_source,
         machine_id,
+        run_dir_lock,
     }))
 }
 
@@ -1181,7 +1205,7 @@ impl StartLock {
     }
 }
 
-fn open_owner_only_lock(path: &Path) -> io::Result<fs::File> {
+pub(crate) fn open_owner_only_lock(path: &Path) -> io::Result<fs::File> {
     let mut options = fs::OpenOptions::new();
     options.read(true).write(true).create(true);
     #[cfg(unix)]
@@ -1241,6 +1265,19 @@ pub enum BootstrapError {
         path: PathBuf,
         attempts: usize,
     },
+    /// The run-directory lock file could not be created, opened or locked.
+    RunDirLockCreate {
+        path: PathBuf,
+        source: io::Error,
+    },
+    /// Another live process, almost certainly a daemon started with a
+    /// different runtime directory over the same data home, owns the run
+    /// directory. The daemon does not start. `holder_pid` is read from the
+    /// lock file when possible and is informational only.
+    RunDirBusy {
+        path: PathBuf,
+        holder_pid: Option<u32>,
+    },
     RemoveStale {
         path: PathBuf,
         source: io::Error,
@@ -1298,6 +1335,25 @@ impl fmt::Display for BootstrapError {
                 "start lock {} remained busy after {attempts} attempts",
                 path.display()
             ),
+            Self::RunDirLockCreate { path, source } => write!(
+                f,
+                "refusing to start: failed to lock run directory via {}: {source}",
+                path.display()
+            ),
+            Self::RunDirBusy { path, holder_pid } => {
+                write!(
+                    f,
+                    "refusing to start: run directory lock {} is held by another daemon",
+                    path.display()
+                )?;
+                if let Some(pid) = holder_pid {
+                    write!(f, " (pid {pid})")?;
+                }
+                write!(
+                    f,
+                    "; a live daemon owns this data home's run state (typically one started with a different XDG_RUNTIME_DIR)"
+                )
+            }
             Self::RemoveStale { path, source } => write!(
                 f,
                 "failed to remove stale connection file {}: {source}",
@@ -1334,6 +1390,7 @@ impl Error for BootstrapError {
             | Self::ConnectionFileWrite { source, .. }
             | Self::GenerateConnectionFile(source) => Some(source),
             Self::StartLockCreate { source, .. }
+            | Self::RunDirLockCreate { source, .. }
             | Self::RemoveStale { source, .. }
             | Self::Bind { source, .. }
             | Self::LocalAddr { source, .. } => Some(source),
@@ -1342,7 +1399,7 @@ impl Error for BootstrapError {
             Self::RunDir(err) => Some(err),
             Self::Serve(err) => Some(err),
             Self::ServeJoin(err) => Some(err),
-            Self::StartLockBusy { .. } => None,
+            Self::StartLockBusy { .. } | Self::RunDirBusy { .. } => None,
         }
     }
 }

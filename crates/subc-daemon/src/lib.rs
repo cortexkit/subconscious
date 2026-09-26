@@ -26,6 +26,7 @@ mod provenance;
 pub mod registry;
 mod route_outage;
 pub mod router;
+mod run_dir_lock;
 pub mod server;
 pub mod stderr_tail;
 pub mod supervise;

@@ -271,7 +271,8 @@ pub struct ControlHandler {
     route_bind_concurrency: RouteBindConcurrency,
     /// Start and end of each module's not-serving period as seen by
     /// `route.open`, so an outage gets one line at each edge instead of only
-    /// the per-refusal INFO lines. Shared by every clone of this handler.
+    /// the per-refusal INFO lines. Taken from the forwarding table, so every
+    /// handler built over one table shares it.
     route_outages: Arc<crate::route_outage::RouteOutageTracker>,
     /// Consecutive relay timeouts that open a module's breaker.
     route_bind_breaker_threshold: u32,
@@ -713,6 +714,7 @@ impl ControlHandler {
         // registration resets, however many handlers are built over one table.
         let route_bind_breakers = forwarding.route_bind_breakers();
         let route_bind_concurrency = forwarding.route_bind_concurrency();
+        let route_outages = forwarding.route_outages();
         Self {
             registry,
             forwarding,
@@ -729,7 +731,7 @@ impl ControlHandler {
             route_bind_relay_timeouts: BTreeMap::new(),
             route_bind_breakers,
             route_bind_concurrency,
-            route_outages: Arc::new(crate::route_outage::RouteOutageTracker::new()),
+            route_outages,
             route_bind_breaker_threshold: DEFAULT_ROUTE_BIND_BREAKER_THRESHOLD,
             route_bind_breaker_cooldown: DEFAULT_ROUTE_BIND_BREAKER_COOLDOWN,
             health_probe_timeout: DEFAULT_HEALTH_PROBE_TIMEOUT,
@@ -3774,6 +3776,11 @@ impl ControlHandler {
             };
             return Ok(vec![control_error_body_frame(&frame, error)?]);
         }
+        // A completed swap kept the incumbent serving until cutover, so it
+        // usually opened no outage; a mark left behind would make the next,
+        // unrelated outage read as requested.
+        self.route_outages
+            .operator_action_ended_unrefused(&module_id);
 
         let response = ClientControlResponse::SupervisorAck {
             module_id,
@@ -8898,6 +8905,18 @@ mod tests {
         })
         .unwrap();
         Frame::build(FrameType::Request, control_flags(), 0, 0, corr, body).unwrap()
+    }
+
+    /// Two handlers built over one forwarding table must share one outage
+    /// tracker; separate trackers would each log their own opening line for
+    /// the same outage.
+    #[test]
+    fn handlers_over_one_forwarding_table_share_the_outage_tracker() {
+        let registry = Arc::new(Registry::default());
+        let forwarding = Arc::new(ForwardingTable::default());
+        let first = ControlHandler::with_forwarding(Arc::clone(&registry), Arc::clone(&forwarding));
+        let second = ControlHandler::with_forwarding(registry, forwarding);
+        assert!(Arc::ptr_eq(&first.route_outages, &second.route_outages));
     }
 
     /// A client can name any module id it likes. Refusing an unknown one,

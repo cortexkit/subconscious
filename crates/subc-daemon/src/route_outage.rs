@@ -90,10 +90,6 @@ pub(crate) struct RouteOutageTracker {
 }
 
 impl RouteOutageTracker {
-    pub(crate) fn new() -> Self {
-        Self::default()
-    }
-
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
         self.state
             .lock()
@@ -307,7 +303,7 @@ mod tests {
         let capture = Capture::default();
         let dispatch = dispatch(&capture);
         let _guard = tracing::dispatcher::set_default(&dispatch);
-        let tracker = Arc::new(RouteOutageTracker::new());
+        let tracker = Arc::new(RouteOutageTracker::default());
         tracker.record_accepted("m");
 
         let barrier = Arc::new(Barrier::new(REFUSALS));
@@ -355,7 +351,7 @@ mod tests {
     fn outage_level_depends_on_who_began_it() {
         let capture = Capture::default();
         let _guard = tracing::dispatcher::set_default(&dispatch(&capture));
-        let tracker = RouteOutageTracker::new();
+        let tracker = RouteOutageTracker::default();
 
         // Never accepted yet: still coming up with the daemon.
         tracker.record_not_serving("booting", "supervised_not_registered");
@@ -392,7 +388,7 @@ mod tests {
     fn failed_operator_action_leaves_no_mark_behind() {
         let capture = Capture::default();
         let _guard = tracing::dispatcher::set_default(&dispatch(&capture));
-        let tracker = RouteOutageTracker::new();
+        let tracker = RouteOutageTracker::default();
         tracker.record_accepted("m");
 
         tracker.mark_operator_action("m");
@@ -414,7 +410,7 @@ mod tests {
 
     #[test]
     fn forget_drops_every_record_of_a_removed_module() {
-        let tracker = RouteOutageTracker::new();
+        let tracker = RouteOutageTracker::default();
         tracker.record_accepted("gone");
         tracker.mark_operator_action("gone");
         tracker.record_not_serving("gone", "supervisor_not_live");

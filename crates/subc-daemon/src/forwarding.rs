@@ -533,6 +533,10 @@ pub struct ForwardingTable {
     /// Current route.bind relays keyed by target module. Admission is shared
     /// across every client connection that points at the same endpoint.
     route_bind_concurrency: RouteBindConcurrency,
+    /// Start and end of each module's `route.open` outage. Held here for the
+    /// same reason as the breakers: every handler built over this table must
+    /// see one outage per module, or each would log its own opening line.
+    route_outages: Arc<crate::route_outage::RouteOutageTracker>,
 }
 
 impl ForwardingTable {
@@ -546,6 +550,10 @@ impl ForwardingTable {
 
     pub(crate) fn route_bind_concurrency(&self) -> RouteBindConcurrency {
         self.route_bind_concurrency.clone()
+    }
+
+    pub(crate) fn route_outages(&self) -> Arc<crate::route_outage::RouteOutageTracker> {
+        Arc::clone(&self.route_outages)
     }
 
     pub(crate) fn register_connection_close(

@@ -24,6 +24,7 @@ pub mod observability;
 #[allow(dead_code)]
 mod provenance;
 pub mod registry;
+mod route_outage;
 pub mod router;
 pub mod server;
 pub mod stderr_tail;

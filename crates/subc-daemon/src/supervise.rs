@@ -2206,8 +2206,9 @@ impl Supervisor {
             let closed = forwarding.close_all_connections(&reason);
             debug!(closed, "closed established connections for daemon shutdown");
         }
-        // A second SIGTERM already seen here has resolved `escalate`; it must
-        // not be polled again, so the roster gets a future that never fires.
+        // If the second SIGTERM arrived during GOODBYE delivery, `escalate` has
+        // already completed and must not be polled again; the child shutdown
+        // wait is told it is escalated and gets a future that never fires.
         let escalated_here = escalated && !already_escalated;
         let remaining_escalate = async move {
             if escalated_here {

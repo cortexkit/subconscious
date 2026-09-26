@@ -219,6 +219,34 @@ struct SupervisorRescanContext {
     admission_facts_targets: Option<Vec<String>>,
 }
 
+/// Refusal labels passed to `observe_route_open_refusal` that mean the target
+/// module is not serving right now, and so open or extend an outage in the
+/// route outage tracker. Every one of them is only reachable after the target
+/// was found in the registry, which is what keeps an arbitrary client-chosen
+/// id from ever creating tracker state.
+///
+/// Deliberately absent: `not_registered` and `removed` (the id may be
+/// anything a client sent, and a removed module is gone on purpose),
+/// `protocol_none` (such a module never serves routes, so nothing is out),
+/// `role_not_provided`, `op_not_allowed`, `bad_consumer_identity`, the
+/// capability and admission-facts refusals (they refuse the caller, not a
+/// module outage), and `relay_reservation_failed` (its code ranges over
+/// capacity limits as well as a vanished connection). Capacity, breaker,
+/// relay-timeout and module-rejection refusals do not pass through that
+/// function at all; the breaker logs its own transitions.
+///
+/// The two not-serving refusals that bypass that function record themselves
+/// at their own sites: `supervised_not_registered` and `declared_not_ready`.
+/// `required_capability_unprovided` is not tracked: the module itself is up,
+/// and the outage belongs to the missing provider.
+const ROUTE_OPEN_NOT_SERVING_REASONS: &[&str] = &[
+    "reloading",
+    "supervisor_not_live",
+    "registration_not_active",
+    "no_forwarding_connection",
+    "relay_send_failed",
+];
+
 /// Real channel-0 control handler for subc itself.
 #[derive(Clone)]
 pub struct ControlHandler {
@@ -241,6 +269,10 @@ pub struct ControlHandler {
     /// Live relay admissions keyed by target module. Shared through the
     /// forwarding table so cloned or separately built handlers enforce one cap.
     route_bind_concurrency: RouteBindConcurrency,
+    /// Start and end of each module's not-serving period as seen by
+    /// `route.open`, so an outage gets one line at each edge instead of only
+    /// the per-refusal INFO lines. Shared by every clone of this handler.
+    route_outages: Arc<crate::route_outage::RouteOutageTracker>,
     /// Consecutive relay timeouts that open a module's breaker.
     route_bind_breaker_threshold: u32,
     /// How long a breaker stays open before one probe is admitted.
@@ -697,6 +729,7 @@ impl ControlHandler {
             route_bind_relay_timeouts: BTreeMap::new(),
             route_bind_breakers,
             route_bind_concurrency,
+            route_outages: Arc::new(crate::route_outage::RouteOutageTracker::new()),
             route_bind_breaker_threshold: DEFAULT_ROUTE_BIND_BREAKER_THRESHOLD,
             route_bind_breaker_cooldown: DEFAULT_ROUTE_BIND_BREAKER_COOLDOWN,
             health_probe_timeout: DEFAULT_HEALTH_PROBE_TIMEOUT,
@@ -2483,6 +2516,9 @@ impl ControlHandler {
             connection_id = ctx.connection_id.get(),
             "route.open refused"
         );
+        if ROUTE_OPEN_NOT_SERVING_REASONS.contains(&reason) {
+            self.route_outages.record_not_serving(module_id, reason);
+        }
     }
 
     /// Record an ACCEPTED route.open.
@@ -2530,6 +2566,7 @@ impl ControlHandler {
     /// "is anyone else holding this secret" rather than "is this the right
     /// process".
     fn observe_route_open_accept(&self, ctx: &RouteCtx, module_id: &str, principal: &str) {
+        self.route_outages.record_accepted(module_id);
         self.counters.increment_route_open_accepted(principal);
         info!(
             target: "control",
@@ -2560,6 +2597,11 @@ impl ControlHandler {
             live = status.live,
             "route.open refused"
         );
+        // A supervised module whose process has not registered is not
+        // serving, whatever the reason; the supervisor knows this id, so it is
+        // safe to track.
+        self.route_outages
+            .record_not_serving(module_id, "supervised_not_registered");
         control_error_frame(
             frame,
             code,
@@ -2685,6 +2727,10 @@ impl ControlHandler {
                 reason = "declared_not_ready",
                 "route.open refused"
             );
+            // The module is registered but says it cannot take work, which is
+            // an outage from the caller's side even though its process is up.
+            self.route_outages
+                .record_not_serving(&target_module_id, "declared_not_ready");
             return Ok(vec![control_error_body_frame(
                 &frame,
                 ErrorBody {
@@ -3634,7 +3680,10 @@ impl ControlHandler {
             )?]);
         };
 
+        self.route_outages.mark_operator_action(&module_id);
         if let Err(err) = module.restart(drain_timeout_ms).await {
+            self.route_outages
+                .operator_action_ended_unrefused(&module_id);
             let (code, message) = match err {
                 crate::supervise::SuperviseError::Disabled { .. } => {
                     ("module_disabled", err.to_string())
@@ -3689,10 +3738,13 @@ impl ControlHandler {
             )?]);
         };
 
+        self.route_outages.mark_operator_action(&module_id);
         if let Err(err) = module
             .swap(ready_timeout_ms.map(Duration::from_millis))
             .await
         {
+            self.route_outages
+                .operator_action_ended_unrefused(&module_id);
             use crate::supervise::SuperviseError;
             let message = err.to_string();
             let error = match err {
@@ -3749,7 +3801,10 @@ impl ControlHandler {
             )?]);
         };
 
+        self.route_outages.mark_operator_action(&module_id);
         if let Err(err) = module.reload().await {
+            self.route_outages
+                .operator_action_ended_unrefused(&module_id);
             let (code, message) = match err {
                 crate::supervise::SuperviseError::Disabled { .. } => {
                     ("module_disabled", err.to_string())
@@ -4140,6 +4195,7 @@ impl ControlHandler {
             // benign: retryable where terminal was intended, never the reverse.
             self.supervisor.record_rescan_removal(module_id);
             self.supervisor.retire(module_id);
+            self.route_outages.forget(module_id);
         }
 
         for module_id in configured.keys() {
@@ -4164,10 +4220,14 @@ impl ControlHandler {
                     })?;
             }
             if enabled_changes.contains(module_id) {
+                // A rescan that starts or stops a module applies an operator's
+                // edit to the config, so the resulting outage was asked for.
+                self.route_outages.mark_operator_action(module_id);
                 module
                     .set_enabled(configured_module.enabled)
                     .await
                     .map_err(|err| {
+                        self.route_outages.operator_action_ended_unrefused(module_id);
                         format!(
                             "failed to apply module_id '{module_id}' enabled={} during rescan: {err}",
                             configured_module.enabled
@@ -4223,16 +4283,27 @@ impl ControlHandler {
             )?]);
         };
 
+        // Enabling counts as well as disabling: a module an operator starts
+        // is refused until it registers, and that wait was asked for.
+        self.route_outages.mark_operator_action(&module_id);
         let applied = match module.set_enabled(enabled).await {
             Ok(applied) => applied,
             Err(err) => {
+                self.route_outages
+                    .operator_action_ended_unrefused(&module_id);
                 return Ok(vec![control_error_frame(
                     &frame,
                     "target_unavailable",
                     format!("failed to set module_id '{module_id}' enabled={enabled}: {err}"),
-                )?])
+                )?]);
             }
         };
+        if !applied {
+            // Already in the requested state: nothing was made unavailable,
+            // so the mark must not outlive this request.
+            self.route_outages
+                .operator_action_ended_unrefused(&module_id);
+        }
 
         self.capability_evaluator.wake_deadline_loop();
         self.refresh_capability_requirements();
@@ -6006,6 +6077,7 @@ mod tests {
     #[derive(Clone, Debug)]
     struct CapturedEvent {
         target: String,
+        level: tracing::Level,
         fields: BTreeMap<String, String>,
     }
 
@@ -6024,6 +6096,7 @@ mod tests {
             event.record(&mut visitor);
             self.events.lock().unwrap().push(CapturedEvent {
                 target: event.metadata().target().to_string(),
+                level: *event.metadata().level(),
                 fields: visitor.fields,
             });
         }
@@ -8774,6 +8847,179 @@ mod tests {
             handler.counters().snapshot()["route_open_refused_by_code"],
             json!({ "module_warming": 1 })
         );
+    }
+
+    const OUTAGE_START: &str = "route.open refusing module: not serving";
+    const OUTAGE_RECOVERED: &str = "route.open accepted again after module outage";
+
+    fn outage_lines(capture: &EventCapture, message: &str) -> Vec<CapturedEvent> {
+        capture
+            .events()
+            .into_iter()
+            .filter(|event| event.fields.get("message").map(String::as_str) == Some(message))
+            .collect()
+    }
+
+    fn supervise_stub(
+        registry: &Arc<Registry>,
+        module_id: &str,
+        enabled: bool,
+    ) -> (SupervisorHandle, crate::supervise::SupervisedModule) {
+        let supervisor_handle = SupervisorHandle::new();
+        let supervisor =
+            Supervisor::new(Arc::clone(registry), RestartPolicy::new(0, Duration::ZERO))
+                .with_handle(supervisor_handle.clone())
+                .with_connection_file_path(std::env::temp_dir().join(format!(
+                    "subc-route-outage-{module_id}-{}",
+                    std::process::id()
+                )));
+        let module = supervisor
+            .supervise_configured(
+                ModuleSpec {
+                    module_id: module_id.to_string(),
+                    program: fake_aft_stub_path(),
+                    args: Vec::new(),
+                    env: Vec::new(),
+                    reserved: false,
+                    reserved_prefixes: Vec::new(),
+                    protocol: ModuleProtocol::Subc,
+                    overlap: Default::default(),
+                },
+                enabled,
+            )
+            .unwrap();
+        (supervisor_handle, module)
+    }
+
+    fn supervisor_restart_frame(corr: u64, module_id: &str) -> Frame {
+        let body = serde_json::to_vec(&ClientControlRequest::SupervisorRestart {
+            module_id: module_id.to_string(),
+            drain_timeout_ms: Some(50),
+        })
+        .unwrap();
+        Frame::build(FrameType::Request, control_flags(), 0, 0, corr, body).unwrap()
+    }
+
+    /// A client can name any module id it likes. Refusing an unknown one,
+    /// however often, must not create outage state or outage lines, or the
+    /// tracker would be a memory sink any client could fill.
+    #[tokio::test(flavor = "current_thread")]
+    async fn route_open_unknown_module_refusals_add_no_outage_state() {
+        let handler = ControlHandler::new(Arc::new(Registry::default()));
+        let capture = EventCapture::default();
+        let _subscriber =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(capture.clone()));
+        let (ctx, _rx) = route_ctx(ConnectionId::new(90));
+        for corr in 0..8 {
+            let response = handler
+                .handle_control_frame(
+                    &ctx,
+                    route_open_frame(
+                        380 + corr,
+                        &format!("nobody-{corr}"),
+                        unique_project_root("outage-unknown"),
+                    ),
+                )
+                .await
+                .unwrap();
+            assert_eq!(parse_error(&response[0])["code"], "unknown_module");
+        }
+
+        assert_eq!(handler.route_outages.tracked_module_count(), 0);
+        assert!(outage_lines(&capture, OUTAGE_START).is_empty());
+        assert!(outage_lines(&capture, OUTAGE_RECOVERED).is_empty());
+    }
+
+    /// Drives the refusal path end to end: a supervised module that served
+    /// before and stopped being registered with no instruction to stop is a
+    /// WARN, and the same module refused after an operator `supervisor.restart`
+    /// is an INFO.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn route_open_outage_level_separates_operator_restart_from_unexplained() {
+        let registry = Arc::new(Registry::default());
+        let (supervisor_handle, module) = supervise_stub(&registry, "outage-restart", true);
+        let handler = ControlHandler::new(Arc::clone(&registry)).with_supervisor(supervisor_handle);
+        let capture = EventCapture::default();
+        let _subscriber =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(capture.clone()));
+        let (ctx, _rx) = route_ctx(ConnectionId::new(91));
+        // The stub never registers, so pretend it served once: otherwise every
+        // refusal would fall in its startup window.
+        handler.route_outages.record_accepted("outage-restart");
+
+        let response = handler
+            .handle_control_frame(
+                &ctx,
+                route_open_frame(391, "outage-restart", unique_project_root("outage-a")),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response[0].header.ty, FrameType::Error);
+        let starts = outage_lines(&capture, OUTAGE_START);
+        assert_eq!(starts.len(), 1, "{starts:?}");
+        assert_eq!(starts[0].level, tracing::Level::WARN);
+        assert_eq!(starts[0].fields["initiated_by"], "\"unexplained\"");
+        assert_eq!(starts[0].fields["reason"], "\"supervised_not_registered\"");
+        assert_eq!(starts[0].fields["module_id"], "\"outage-restart\"");
+        handler.route_outages.record_accepted("outage-restart");
+        assert_eq!(outage_lines(&capture, OUTAGE_RECOVERED).len(), 1);
+
+        let restart = handler
+            .handle_control_frame(&ctx, supervisor_restart_frame(392, "outage-restart"))
+            .await
+            .unwrap();
+        assert_eq!(
+            restart[0].header.ty,
+            FrameType::Response,
+            "{:?}",
+            parse_error(&restart[0])
+        );
+        handler
+            .handle_control_frame(
+                &ctx,
+                route_open_frame(393, "outage-restart", unique_project_root("outage-b")),
+            )
+            .await
+            .unwrap();
+        module.stop().await.unwrap();
+
+        let starts = outage_lines(&capture, OUTAGE_START);
+        assert_eq!(starts.len(), 2, "{starts:?}");
+        assert_eq!(starts[1].level, tracing::Level::INFO);
+        assert_eq!(starts[1].fields["initiated_by"], "\"operator\"");
+    }
+
+    /// A restart refused before it touched the module (here: the module is
+    /// disabled) must clear its operator mark, so the next real outage is
+    /// still reported as a warning.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_operator_restart_leaves_no_operator_mark() {
+        let registry = Arc::new(Registry::default());
+        let (supervisor_handle, _module) = supervise_stub(&registry, "outage-disabled", false);
+        let handler = ControlHandler::new(Arc::clone(&registry)).with_supervisor(supervisor_handle);
+        let capture = EventCapture::default();
+        let _subscriber =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(capture.clone()));
+        let (ctx, _rx) = route_ctx(ConnectionId::new(92));
+        handler.route_outages.record_accepted("outage-disabled");
+
+        let restart = handler
+            .handle_control_frame(&ctx, supervisor_restart_frame(394, "outage-disabled"))
+            .await
+            .unwrap();
+        assert_eq!(parse_error(&restart[0])["code"], "module_disabled");
+        assert!(!handler.route_outages.has_operator_mark("outage-disabled"));
+
+        handler
+            .handle_control_frame(
+                &ctx,
+                route_open_frame(395, "outage-disabled", unique_project_root("outage-c")),
+            )
+            .await
+            .unwrap();
+        let starts = outage_lines(&capture, OUTAGE_START);
+        assert_eq!(starts.len(), 1, "{starts:?}");
+        assert_eq!(starts[0].level, tracing::Level::WARN);
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -2166,8 +2166,10 @@ impl Supervisor {
     }
 
     /// The last step of an announced daemon shutdown, after the notice and the
-    /// drain: close every connection so each subc module sees EOF and starts
-    /// its own teardown, then end every supervised child that has not exited
+    /// drain: send every registered module a module GOODBYE, the same planned
+    /// stop signal `ck module stop` gives, then close every connection so each
+    /// subc module sees EOF and starts its own teardown, then end every
+    /// supervised child that has not exited
     /// by its own deadline (its drain budget, capped). Modules lead their own
     /// process groups, so a
     /// service manager's group kill no longer reaches them; without this a
@@ -2180,17 +2182,44 @@ impl Supervisor {
         already_escalated: bool,
         escalate: impl std::future::Future<Output = ()>,
     ) {
+        tokio::pin!(escalate);
+        let mut escalated = already_escalated;
         if let Some(forwarding) = &self.forwarding {
-            let closed = forwarding.close_all_connections(&CloseReason::new(
+            let reason = CloseReason::new(
                 "daemon_shutdown",
                 "the daemon is exiting after its shutdown notice and drain",
-            ));
+            );
+            if escalated {
+                // The operator asked to stop waiting: queue the GOODBYEs but
+                // do not wait for them to be written.
+                send_module_goodbyes_for_daemon_shutdown(forwarding, &reason, false).await;
+            } else {
+                tokio::select! {
+                    biased;
+                    _ = escalate.as_mut() => {
+                        info!("second SIGTERM: abandoning module GOODBYE delivery");
+                        escalated = true;
+                    }
+                    _ = send_module_goodbyes_for_daemon_shutdown(forwarding, &reason, true) => {}
+                }
+            }
+            let closed = forwarding.close_all_connections(&reason);
             debug!(closed, "closed established connections for daemon shutdown");
         }
+        // A second SIGTERM already seen here has resolved `escalate`; it must
+        // not be polled again, so the roster gets a future that never fires.
+        let escalated_here = escalated && !already_escalated;
+        let remaining_escalate = async move {
+            if escalated_here {
+                std::future::pending::<()>().await;
+            } else {
+                escalate.await;
+            }
+        };
         crate::child_roster::end_children_for_daemon_shutdown(
             &self.child_roster,
-            already_escalated,
-            escalate,
+            escalated,
+            remaining_escalate,
         )
         .await;
     }
@@ -6439,9 +6468,10 @@ fn send_module_draining(
     }
 }
 
-fn send_module_goodbye(module_id: &str, forwarding: &ForwardingTable, target: &ModuleDrainTarget) {
-    let frame = match Frame::build_with_version(
-        target.negotiated_ver,
+/// The channel-0 GOODBYE that tells a module its stop is planned.
+fn module_goodbye_frame(module_id: &str, negotiated_ver: u8) -> Option<Frame> {
+    match Frame::build_with_version(
+        negotiated_ver,
         FrameType::Goodbye,
         control_flags(),
         0,
@@ -6449,15 +6479,87 @@ fn send_module_goodbye(module_id: &str, forwarding: &ForwardingTable, target: &M
         0,
         Vec::new(),
     ) {
-        Ok(frame) => frame,
+        Ok(frame) => Some(frame),
         Err(err) => {
             warn!(
                 module_id,
                 error = %err,
-                "failed to build supervisor drain module GOODBYE frame"
+                "failed to build module GOODBYE frame"
             );
+            None
+        }
+    }
+}
+
+/// Send every registered module connection its module GOODBYE at daemon
+/// shutdown, then request that connection's close.
+///
+/// A module tells a planned stop from a lost daemon by whether a GOODBYE came
+/// before EOF, so the GOODBYE must reach the socket before the close. A close
+/// request does not wait for the connection's queued frames: its writer gets a
+/// bounded grace after the close, is aborted if it overruns it, and the daemon
+/// process may exit before that grace ends. So with `wait_for_flush`, each
+/// connection is closed only after its writer has acknowledged writing the
+/// GOODBYE, or once a short shared budget runs out, so one module that is not
+/// reading cannot hold up the others or the shutdown. Without it the GOODBYEs
+/// are only queued, for a shutdown the operator has told to stop waiting.
+/// A connection that is already gone is skipped.
+#[cfg(unix)]
+async fn send_module_goodbyes_for_daemon_shutdown(
+    forwarding: &Arc<ForwardingTable>,
+    reason: &CloseReason,
+    wait_for_flush: bool,
+) {
+    const GOODBYE_BUDGET: Duration = Duration::from_millis(500);
+    let targets = match forwarding.module_connections() {
+        Ok(targets) => targets,
+        Err(err) => {
+            warn!(error = %err, "could not list module connections for shutdown GOODBYE");
             return;
         }
+    };
+    let deadline = Instant::now() + GOODBYE_BUDGET;
+    let mut sends = tokio::task::JoinSet::new();
+    for target in targets {
+        let Some(frame) = module_goodbye_frame(&target.module_id, target.negotiated_ver) else {
+            continue;
+        };
+        if !wait_for_flush {
+            if let Err(err) = target.sink.try_send(frame) {
+                debug!(
+                    module_id = %target.module_id,
+                    error = %err,
+                    "shutdown module GOODBYE was not queued"
+                );
+            }
+            continue;
+        }
+        let forwarding = Arc::clone(forwarding);
+        let reason = reason.clone();
+        sends.spawn(async move {
+            match timeout_at(deadline, target.sink.send_flushed(frame)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => debug!(
+                    module_id = %target.module_id,
+                    error = %err,
+                    "module connection closed before its shutdown GOODBYE was written"
+                ),
+                Err(_) => warn!(
+                    module_id = %target.module_id,
+                    budget = ?GOODBYE_BUDGET,
+                    "shutdown module GOODBYE was not written within its budget; closing anyway"
+                ),
+            }
+            forwarding.request_connection_close(target.endpoint.connection_id, reason);
+        });
+    }
+    // Every task ends by the shared deadline, so this wait is bounded too.
+    while sends.join_next().await.is_some() {}
+}
+
+fn send_module_goodbye(module_id: &str, forwarding: &ForwardingTable, target: &ModuleDrainTarget) {
+    let Some(frame) = module_goodbye_frame(module_id, target.negotiated_ver) else {
+        return;
     };
     if let Err(err) = target.sink.try_send(frame) {
         warn!(

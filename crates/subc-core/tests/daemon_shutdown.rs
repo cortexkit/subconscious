@@ -565,6 +565,28 @@ fn provider_observes_draining_before_its_own_eof() {
     );
 }
 
+/// A module treats EOF with no GOODBYE before it as the daemon going away
+/// unannounced, so a planned daemon shutdown must send exactly one module
+/// GOODBYE, and it must arrive before the connection closes.
+#[test]
+fn provider_observes_module_goodbye_before_its_eof_at_daemon_shutdown() {
+    let mut fixture = Fixture::boot(false);
+    fixture.term();
+    fixture.wait_exit(Duration::from_secs(4));
+    fixture.wait_event("eof");
+    let sequence: Vec<_> = fixture
+        .events()
+        .into_iter()
+        .filter_map(|e| e["kind"].as_str().map(str::to_owned))
+        .filter(|kind| kind == "draining" || kind == "goodbye" || kind == "eof")
+        .collect();
+    assert_eq!(
+        sequence,
+        ["draining", "goodbye", "eof"],
+        "module must get one GOODBYE after the drain notice and before EOF"
+    );
+}
+
 #[test]
 fn shutdown_marker_is_durable_and_precedes_provider_notice() {
     let mut fixture = Fixture::boot(false);

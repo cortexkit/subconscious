@@ -810,6 +810,13 @@ async fn handle_frame(
             send_outbound(writer, pong).await?;
             Ok(true)
         }
+        // With `FAKE_AFT_RECORD_EOF`, a module GOODBYE is recorded and the
+        // stub keeps reading, so a test sees whether GOODBYE came before the
+        // EOF and the EOF behaviours above still run after it.
+        FrameType::Goodbye if frame.header.channel == 0 && env_flag("FAKE_AFT_RECORD_EOF") => {
+            record_event(config, json!({"kind": "goodbye"}))?;
+            Ok(true)
+        }
         FrameType::Goodbye if frame.header.channel == 0 => Ok(false),
         FrameType::Goodbye => {
             handle_route_goodbye(frame, config, state, writer).await?;

@@ -394,10 +394,27 @@ mod tests {
     }
 
     /// Keeps one core busy for at least `wall` of wall-clock time.
-    fn burn_cpu(wall: Duration) {
-        let deadline = Instant::now() + wall;
+    /// This thread's CPU time, from the thread CPU clock rather than the
+    /// process-usage API under test.
+    fn thread_cpu_time() -> Duration {
+        let now = rustix::time::clock_gettime(rustix::time::ClockId::ThreadCPUTime);
+        Duration::new(now.tv_sec as u64, now.tv_nsec as u32)
+    }
+
+    /// Spend `cpu` of this thread's CPU time. Measured on CPU time, not wall
+    /// time: on a loaded machine the thread is descheduled for part of any
+    /// wall interval, so a wall-timed loop can do far less work than its
+    /// duration suggests. A generous wall cap keeps a stalled clock from
+    /// hanging the test.
+    fn burn_cpu(cpu: Duration) {
+        let start = thread_cpu_time();
+        let give_up = Instant::now() + Duration::from_secs(60);
         let mut value = 0u64;
-        while Instant::now() < deadline {
+        while thread_cpu_time().saturating_sub(start) < cpu {
+            assert!(
+                Instant::now() < give_up,
+                "thread CPU clock stopped advancing"
+            );
             for step in 0..10_000u64 {
                 value = std::hint::black_box(value.wrapping_mul(31).wrapping_add(step));
             }
@@ -442,11 +459,12 @@ mod tests {
         burn_cpu(busy);
         let after = total(resource_usage(pid).unwrap());
         let grown = after.saturating_sub(before);
-        // Other tests run in parallel threads of this process, so the growth
-        // may exceed the busy time; it cannot fall far below it unless this
-        // thread was starved, which a 50% floor tolerates.
+        // This thread alone spent `busy` of CPU time, so the process total
+        // grew by at least that much; other tests' threads only add to it.
+        // The 10% allowance covers tick rounding in the reading, and is far
+        // tighter than the ~24x a unit error would cause.
         assert!(
-            grown >= busy / 2,
+            grown >= busy * 9 / 10,
             "cpu time grew by {grown:?} over {busy:?} of busy work"
         );
     }

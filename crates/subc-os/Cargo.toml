@@ -1,6 +1,6 @@
 [package]
 name = "subc-os"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 license = "MIT"
 publish = true
@@ -13,6 +13,11 @@ rustix = { version = "1", default-features = false, features = ["event", "param"
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"
 rustix = { version = "1", default-features = false, features = ["process", "std"] }
+
+# Tests measure busy work on the thread's own CPU clock, a reading independent
+# of the process-usage API they check.
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dev-dependencies]
+rustix = { version = "1", default-features = false, features = ["std", "time"] }
 
 [lints.rust]
 unsafe_code = "deny"

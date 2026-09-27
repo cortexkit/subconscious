@@ -4506,9 +4506,11 @@ fn subscription_value_render(
 
 /// Why a row's figure is only approximate, empty when it is exact as far as
 /// the row can tell. The error runs BOTH ways, so no direction is claimed:
-/// unpriced tokens and tokens priced at the base rate (their long-context
-/// tier was never tested) make it read low, while usage from accounts left
-/// out of the fee still counts toward the API value and makes it read high.
+/// unpriced tokens, tokens priced at the base rate (their long-context tier
+/// was never tested) and tokens whose request recorded no speed mode (priced
+/// at the standard rate on a model that also charges more for a fast mode)
+/// make it read low, while usage from accounts left out of the fee still
+/// counts toward the API value and makes it read high.
 ///
 /// `error_deflating`/`error_inflating` on the row are deliberately not used:
 /// they describe the quota-consumed multiplier, not the fee multiplier shown.
@@ -4537,6 +4539,24 @@ fn subscription_value_approximation_reasons(row: &Value) -> Vec<String> {
         reasons.push(format!(
             "{} tokens priced at base rate",
             compact_token_count(base_rate)
+        ));
+    }
+    // The count of tokens with no recorded speed mode is stored on each model
+    // line, not on the row, so sum the per-model counts here.
+    let mode_unrecorded: i64 = row
+        .get("api_nanos_by_model")
+        .and_then(Value::as_array)
+        .map(|lines| {
+            lines
+                .iter()
+                .filter_map(|line| line.get("mode_unrecorded_tokens").and_then(Value::as_i64))
+                .sum()
+        })
+        .unwrap_or(0);
+    if mode_unrecorded > 0 {
+        reasons.push(format!(
+            "{} tokens with no recorded speed mode",
+            compact_token_count(mode_unrecorded)
         ));
     }
     reasons
@@ -9738,6 +9758,39 @@ mod tests {
         assert_eq!(
             subscription_value_render(&[row], None, true)[1],
             "  claude  89.8x the fee · 5 accounts · 2026-09-25 · approximate (263M tokens priced at base rate)"
+        );
+    }
+
+    /// Requests that recorded no speed mode are priced at the standard rate, so
+    /// the figure reads low wherever the model also charges more for a fast
+    /// mode. The count is stored on each model line, so the reason sums them.
+    #[test]
+    fn subscription_value_mode_unrecorded_tokens_make_the_figure_approximate() {
+        let mut row = multiplier_observation_fixture("codex");
+        row["api_nanos_by_model"] = json!([
+            {"model": "openai/gpt-5.6", "mode_unrecorded_tokens": 4_000_000_000_i64},
+            {"model": "openai/gpt-5.6-mini", "mode_unrecorded_tokens": 1_100_000_000_i64},
+            {"model": "openai/o5", "mode_unrecorded_tokens": 0}
+        ]);
+        assert_eq!(
+            subscription_value_render(std::slice::from_ref(&row), None, false)[1],
+            "  codex  89.8x the fee · 5 accounts · 2026-09-25 · approximate"
+        );
+        assert_eq!(
+            subscription_value_render(&[row], None, true)[1],
+            "  codex  89.8x the fee · 5 accounts · 2026-09-25 · approximate (5.1B tokens with no recorded speed mode)"
+        );
+    }
+
+    /// Model lines written before speed-mode tracking existed have no count,
+    /// so they add nothing and do not make the figure approximate.
+    #[test]
+    fn subscription_value_model_lines_without_a_mode_count_are_not_approximate() {
+        let mut row = multiplier_observation_fixture("claude");
+        row["api_nanos_by_model"] = json!([{"model": "anthropic/opus-5.5"}]);
+        assert_eq!(
+            subscription_value_render(&[row], None, true)[1],
+            "  claude  89.8x the fee · 5 accounts · 2026-09-25"
         );
     }
 

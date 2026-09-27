@@ -73,6 +73,21 @@ on:
     # the declared time changed, so every per-repo term cancels. Constant
     # offset predicts the new series reproduces ~+4h19m.
     #
+    # RESULT (read 2026-09-27, seven mornings 09-21..09-27): constant offset is
+    # FALSIFIED. From `17 3` this repo delivered at mean +5h34m (min +5h17m,
+    # max +6h05m) against +4h19m from `0 6`. Against fusiform's unmoved `0 6`
+    # on the same mornings, the difference-in-differences is +55m (se 6m):
+    # declaring 163m earlier bought only ~108m earlier delivery. Any timezone
+    # reading shifts both periods equally, so it cannot absorb this; the delay
+    # itself depends on WHEN the job fires, longer for an earlier fire. Rough
+    # slope over this range: ~20m of extra delay per hour earlier.
+    #
+    # Consequence for the boundary below: the one-hour separation assumes each
+    # repo's residual is constant across the transition. With a fire-time
+    # dependent delay, a fire that moves an hour later also waits ~20m less,
+    # so expect nearer 40m of separation than 60m. The slope is measured over
+    # 03:17-06:00 only, so treat 40m as an estimate, not a prediction.
+    #
     # READING THE BOUNDARY. Transition instant is 2026-11-01T06:00:00Z, located
     # by binary search against the tz database rather than by the
     # first-Sunday rule (a daily 00:00Z sample cannot locate an instant inside

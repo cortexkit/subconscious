@@ -1853,6 +1853,13 @@ pub enum ModuleProtocol {
     #[default]
     Subc,
     /// The module speaks no subc wire. It is supervised as a process only.
+    ///
+    /// A clean exit (status 0) that the daemon did not request is restarted as
+    /// a crash, counting against the restart budget, instead of being recorded
+    /// as a stop. Such a module is usually a stock program that exits 0 on
+    /// SIGTERM, so a stray outside signal would otherwise leave it down for
+    /// good; a subc-wire module re-raises SIGTERM instead, so this rule is not
+    /// needed for it.
     None,
 }
 

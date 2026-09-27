@@ -330,10 +330,13 @@ pub struct ModuleSpec {
     pub reserved_prefixes: Vec<String>,
     /// The wire protocol this module speaks, as DECLARED in daemon config.
     ///
-    /// [`ModuleProtocol::None`] changes four things and nothing else: health
+    /// [`ModuleProtocol::None`] changes five things and nothing else: health
     /// probing is suppressed, teardown sends SIGTERM before waiting,
-    /// `route.open` is refused, and the spawn passes NO `--subc <path>` argument
-    /// and NO launch nonce. `SUBC_MODULE_ID` still goes into the environment,
+    /// `route.open` is refused, the spawn passes NO `--subc <path>` argument
+    /// and NO launch nonce, and a clean exit the daemon did not request is
+    /// restarted as a crash rather than recorded as a stop (see `on_child_exit`:
+    /// a stock program exits 0 on a stray SIGTERM, and a stop would leave it
+    /// down for good). `SUBC_MODULE_ID` still goes into the environment,
     /// because a process ignores an environment variable it does not read.
     ///
     /// The argument is the part that cannot be "harmless to a process that
@@ -5299,8 +5302,24 @@ async fn on_child_exit(
         )
         .await;
     }
+    // Every stop the supervisor itself asks for (operator stop, disable,
+    // restart, reload, swap, a health restart, a drain that runs out of budget)
+    // takes the child out of the supervise loop and reaps it in
+    // `drain_child_to_state`, and daemon shutdown is handled above. So an exit
+    // that reaches this point was not requested by the daemon.
+    //
+    // For a subc-wire module a clean exit is still a stop: those modules are
+    // written to re-raise SIGTERM, so a stray outside signal already reads as a
+    // crash, and exiting 0 is a deliberate choice the module made. A
+    // `protocol: "none"` module is a stock program we cannot change, and many
+    // of them (nats-server among them) exit 0 on SIGTERM. Treating that as a
+    // stop would leave the module down for good after any stray signal, so it
+    // goes through the crash path instead: it spends restart budget, respawns
+    // with the crash backoff, and ends `failed` when the budget runs out.
+    let unrequested_clean_exit_of_protocol_none =
+        exit_report.kind == ExitKind::Clean && spec.protocol == ModuleProtocol::None;
     match exit_report.kind {
-        ExitKind::Clean => {
+        ExitKind::Clean if !unrequested_clean_exit_of_protocol_none => {
             info!(
                 module_id = %spec.module_id,
                 exit_code = ?exit_report.code,
@@ -5338,13 +5357,22 @@ async fn on_child_exit(
                 registration_released,
             }
         }
-        ExitKind::Crash => {
-            warn!(
-                module_id = %spec.module_id,
-                exit_code = ?exit_report.code,
-                exit_signal = ?exit_report.signal,
-                "supervised module exited abnormally (crash)"
-            );
+        ExitKind::Clean | ExitKind::Crash => {
+            if unrequested_clean_exit_of_protocol_none {
+                warn!(
+                    module_id = %spec.module_id,
+                    exit_code = ?exit_report.code,
+                    exit_signal = ?exit_report.signal,
+                    "protocol-none module exited cleanly without a stop request; handling it as a crash"
+                );
+            } else {
+                warn!(
+                    module_id = %spec.module_id,
+                    exit_code = ?exit_report.code,
+                    exit_signal = ?exit_report.signal,
+                    "supervised module exited abnormally (crash)"
+                );
+            }
             let mut restart_schedule = None;
             let mut disposition = TerminalDisposition::Disabled;
             // Set only when the budget is what stopped the module, so the
@@ -8145,6 +8173,258 @@ mod terminal_history_tests {
             status.spawn_generation, 1,
             "module respawned after the operator disabled it"
         );
+    }
+
+    /// A `protocol: "none"` child that stays parked and exits 0 on SIGTERM:
+    /// the shape of nats-server, the program this rule exists for.
+    #[cfg(unix)]
+    fn protocol_none_sigterm_exits_clean_spec(
+        module_id: &str,
+        dir: &std::path::Path,
+    ) -> (ModuleSpec, PathBuf, PathBuf) {
+        let ready = dir.join("ready");
+        let marker = dir.join("sigterm");
+        let spec = ModuleSpec {
+            module_id: module_id.to_string(),
+            program: fake_aft_stub_path(),
+            args: Vec::new(),
+            env: vec![
+                ("FAKE_AFT_NEVER_CONNECT".to_string(), "1".to_string()),
+                (
+                    "FAKE_AFT_SIGTERM_MARKER_PATH".to_string(),
+                    marker.display().to_string(),
+                ),
+                (
+                    "FAKE_AFT_NEVER_CONNECT_READY_PATH".to_string(),
+                    ready.display().to_string(),
+                ),
+            ],
+            reserved: false,
+            reserved_prefixes: Vec::new(),
+            protocol: ModuleProtocol::None,
+            overlap: Default::default(),
+        };
+        (spec, ready, marker)
+    }
+
+    /// Wait for a file the child writes, so a signal is never sent before the
+    /// child's SIGTERM handler is installed (the default disposition would
+    /// kill it by signal and the exit would not be clean).
+    #[cfg(unix)]
+    async fn wait_for_file(path: &std::path::Path) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !path.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "{} never appeared",
+                path.display()
+            );
+            sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// A protocol-none module that exits 0 because something OUTSIDE the
+    /// supervisor sent it SIGTERM is respawned, and the terminal record carries
+    /// the crash-path disposition rather than `stopped`.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn protocol_none_unrequested_clean_exit_restarts_as_a_crash() {
+        let dir = subc_test_support::TestTempDir::new("none-unrequested-clean-exit");
+        let (spec, ready, marker) =
+            protocol_none_sigterm_exits_clean_spec("none-unrequested-clean-exit", dir.path());
+        let supervisor = Supervisor::new(
+            Arc::new(Registry::default()),
+            RestartPolicy::new(3, Duration::ZERO),
+        );
+        let module = supervisor.spawn(spec).unwrap();
+        wait_for_file(&ready).await;
+        let first_pid = module
+            .status()
+            .unwrap()
+            .pid
+            .expect("a running module reports its pid");
+
+        rustix::process::kill_process(
+            rustix::process::Pid::from_raw(i32::try_from(first_pid).unwrap()).unwrap(),
+            rustix::process::Signal::TERM,
+        )
+        .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let respawned = loop {
+            let status = module.status().unwrap();
+            if status.state == ModuleState::Running
+                && status.pid.is_some_and(|pid| pid != first_pid)
+            {
+                break status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "protocol-none module was not respawned after an unrequested clean exit: {status:?}"
+            );
+            sleep(Duration::from_millis(10)).await;
+        };
+        assert_eq!(respawned.spawn_generation, 2);
+        assert!(
+            marker.exists(),
+            "the child must have exited through its SIGTERM handler (exit 0), or this proves nothing about clean exits"
+        );
+
+        let history = module.terminal_history();
+        assert_eq!(history.entries.len(), 1, "{history:?}");
+        let entry = &history.entries[0];
+        assert_eq!(entry.exit_code, Some(0));
+        assert_eq!(entry.exit_kind, subc_control::TerminalExitKind::Clean);
+        assert_eq!(entry.disposition, TerminalDisposition::Restarting);
+
+        module.stop().await.unwrap();
+    }
+
+    /// Repeated unrequested clean exits of a protocol-none module spend the
+    /// restart budget exactly as crashes do, and the module ends `failed` with
+    /// the budget named.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn protocol_none_repeated_clean_exits_exhaust_the_restart_budget() {
+        let supervisor = Supervisor::new(
+            Arc::new(Registry::default()),
+            RestartPolicy::new(1, Duration::ZERO),
+        );
+        let module = supervisor
+            .spawn(ModuleSpec {
+                module_id: "none-clean-exit-budget".to_string(),
+                program: fake_aft_stub_path(),
+                args: Vec::new(),
+                env: vec![("FAKE_AFT_EXIT_CODE".to_string(), "0".to_string())],
+                reserved: false,
+                reserved_prefixes: Vec::new(),
+                protocol: ModuleProtocol::None,
+                overlap: Default::default(),
+            })
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let status = module.status().unwrap();
+            if status.state == ModuleState::Failed {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "module never exhausted its budget: {status:?} {:?}",
+                module.terminal_history()
+            );
+            sleep(Duration::from_millis(10)).await;
+        }
+        let history = module.terminal_history();
+        assert_eq!(
+            history
+                .entries
+                .iter()
+                .map(|entry| (entry.exit_code, entry.disposition.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                (Some(0), TerminalDisposition::Restarting),
+                (Some(0), TerminalDisposition::Failed),
+            ]
+        );
+        let detail = history.entries[1]
+            .disposition_detail
+            .as_deref()
+            .expect("a budget failure names the budget");
+        assert!(detail.contains("max_restarts=1"), "{detail}");
+        assert_eq!(module.status().unwrap().spawn_generation, 2);
+    }
+
+    /// A stop the supervisor itself requests still stops a protocol-none
+    /// module, even though the child answers the SIGTERM with exit 0.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn protocol_none_requested_stop_and_disable_do_not_respawn() {
+        for disable in [false, true] {
+            let label = if disable {
+                "none-requested-disable"
+            } else {
+                "none-requested-stop"
+            };
+            let dir = subc_test_support::TestTempDir::new(label);
+            let (spec, ready, marker) = protocol_none_sigterm_exits_clean_spec(label, dir.path());
+            let supervisor = Supervisor::new(
+                Arc::new(Registry::default()),
+                RestartPolicy::new(3, Duration::ZERO),
+            );
+            let module = supervisor.spawn(spec).unwrap();
+            wait_for_file(&ready).await;
+
+            if disable {
+                module.set_enabled(false).await.unwrap();
+            } else {
+                module.stop().await.unwrap();
+            }
+            assert!(
+                marker.exists(),
+                "{label}: the child must have left through its SIGTERM handler with exit 0"
+            );
+
+            // Long enough for a zero-backoff respawn to have happened if the
+            // exit had been treated as a crash.
+            sleep(Duration::from_millis(500)).await;
+            let status = module.status().unwrap();
+            let expected = if disable {
+                ModuleState::Disabled
+            } else {
+                ModuleState::Stopped
+            };
+            assert_eq!(status.state, expected, "{label}");
+            assert_eq!(
+                status.spawn_generation, 1,
+                "{label}: respawned after a requested stop"
+            );
+            let history = module.terminal_history();
+            assert_eq!(history.entries.len(), 1, "{label}: {history:?}");
+            assert_eq!(history.entries[0].exit_code, Some(0), "{label}");
+            assert_ne!(
+                history.entries[0].disposition,
+                TerminalDisposition::Restarting,
+                "{label}"
+            );
+        }
+    }
+
+    /// A subc-wire module that exits 0 on its own is still a stop: the
+    /// protocol-none rule must not reach it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn subc_wire_clean_exit_is_still_a_stop() {
+        let supervisor = Supervisor::new(
+            Arc::new(Registry::default()),
+            RestartPolicy::new(3, Duration::ZERO),
+        );
+        let module = supervisor
+            .spawn(ModuleSpec {
+                module_id: "wire-clean-exit".to_string(),
+                program: fake_aft_stub_path(),
+                args: Vec::new(),
+                env: vec![("FAKE_AFT_EXIT_CODE".to_string(), "0".to_string())],
+                reserved: false,
+                reserved_prefixes: Vec::new(),
+                protocol: ModuleProtocol::Subc,
+                overlap: Default::default(),
+            })
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while module.terminal_history().entries.is_empty() {
+            assert!(Instant::now() < deadline, "module never exited");
+            sleep(Duration::from_millis(10)).await;
+        }
+        // Long enough for a zero-backoff respawn to have happened.
+        sleep(Duration::from_millis(500)).await;
+        let status = module.status().unwrap();
+        assert_eq!(status.state, ModuleState::Stopped);
+        assert_eq!(status.spawn_generation, 1);
+        let history = module.terminal_history();
+        assert_eq!(history.entries.len(), 1, "{history:?}");
+        assert_eq!(history.entries[0].exit_code, Some(0));
+        assert_eq!(history.entries[0].disposition, TerminalDisposition::Stopped);
     }
 
     /// Each restart-producing arm has its own state transition. Keeping their

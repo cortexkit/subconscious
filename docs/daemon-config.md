@@ -129,6 +129,15 @@ What changes for a `"none"` module:
 | `live` | enabled, running, process alive, AND registered | enabled, running, process alive. `ck` renders it as `n/a (no protocol)` rather than a liveness word, because the daemon is asserting less. |
 | Teardown | route drain, `route.closed` pushes, per-route GOODBYEs, module GOODBYE, then the drain budget | `SIGTERM`, then the same drain budget, then `SIGKILL`. Read the result in `ck module terminals <id>`: `exit 0` or `exit_signal: 15` is a clean stop, `exit_signal: 9` means the child ignored the signal and the budget ran out. On Windows there is no graceful signal, so teardown is the wait and then the kill. |
 | `route.open` | ordinary routing | refused with `module_no_protocol`, which every SDK classifies as terminal rather than retrying |
+| Exit 0 the daemon did not ask for | a stop: recorded `stopped`, not restarted | a crash: spends restart budget, respawns with the crash backoff, and ends `failed` (budget named) when the budget runs out |
+
+The last row exists because a stock program usually exits 0 on `SIGTERM`
+(nats-server does). A subc-wire module is required to re-raise `SIGTERM`, so a
+stray outside signal already reads as a crash; a `"none"` module cannot be made
+to, and treating its exit 0 as a stop would leave it down until someone started
+it by hand. Exits the daemon itself asked for — `ck module stop`, disable,
+restart, reload, swap, a health restart, a drain that ran out of budget, and
+daemon shutdown — keep their ordinary handling for both protocols.
 
 The teardown wait is `drain_timeout_ms` — the same key, the same default, and
 the same per-restart `--now`/`--drain-ms` overrides. A module with a store to

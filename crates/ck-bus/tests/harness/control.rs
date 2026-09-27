@@ -9,6 +9,17 @@ use subc_protocol::{ErrorBody, Flags, Frame, FrameType, Priority};
 use subc_transport::{authenticate_client, connection_file, read_frame, write_frame};
 use tokio::{io::AsyncWriteExt, net::TcpStream, time::sleep};
 
+/// How long to wait for the daemon's reply to one control request.
+///
+/// It must exceed the daemon's own health-probe deadline (5 s,
+/// `DEFAULT_HEALTH_PROBE_TIMEOUT` in subc-daemon's control.rs). A health read
+/// against a module that is restarting waits out that deadline before the
+/// daemon answers, so a client deadline of exactly 5 s raced the answer and
+/// failed under load (the daemon logged the dispatch at 5001 ms). The daemon
+/// always answers within its deadline plus dispatch time, so the margin only
+/// decides how long a truly dead daemon takes to fail the test.
+const CONTROL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
+
 static NEXT_CORRELATION: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug)]
@@ -61,7 +72,7 @@ pub async fn rpc(path: &Path, request: ClientControlRequest) -> ControlReply {
         .flush()
         .await
         .expect("observable control request must flush");
-    let response = tokio::time::timeout(Duration::from_secs(5), read_frame(&mut stream))
+    let response = tokio::time::timeout(CONTROL_RESPONSE_TIMEOUT, read_frame(&mut stream))
         .await
         .expect("observable control response timed out")
         .expect("observable control response must decode")

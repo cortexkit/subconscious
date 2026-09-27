@@ -240,7 +240,7 @@ async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), ProbeError>
     // 5. Tool call on the route channel.
     eprintln!("[probe] tools/call '{tool}' args={}", args.args);
     let result = tool_call(&mut stream, route, &tool, &args.args).await?;
-    println!("{}", serde_json::to_string_pretty(&result)?);
+    println!("{}", render_tool_response(&result));
     Ok(())
 }
 
@@ -355,7 +355,7 @@ async fn tool_call(
     route: RouteHandle,
     tool: &str,
     arguments: &Value,
-) -> Result<Value, ProbeError> {
+) -> Result<Vec<u8>, ProbeError> {
     let corr = 1u64;
     let body = serde_json::to_vec(&json!({ "name": tool, "arguments": arguments }))?;
     let request = Frame::build(
@@ -382,16 +382,26 @@ async fn tool_call(
                     String::from_utf8_lossy(&frame.body)
                 );
             }
-            FrameType::Response => {
-                return Ok(serde_json::from_slice(&frame.body)
-                    .unwrap_or_else(|_| json!({ "raw": String::from_utf8_lossy(&frame.body) })));
-            }
+            FrameType::Response => return Ok(frame.body.to_vec()),
             FrameType::Error => return Err(ProbeError::Rejected(decode_error_body(&frame.body))),
             ty => {
                 eprintln!("[probe]   (ignoring non-terminal frame {ty:?})");
             }
         }
     }
+}
+
+/// The module's tool response exactly as it arrived.
+///
+/// Printed verbatim rather than parsed and pretty-printed, because parsing
+/// changes the bytes: serde_json without its `float_roundtrip` feature can land
+/// one ULP off on some floats (search scores that are exact f32 values, for
+/// example), so a probe that re-encoded the reply reported differences the
+/// module never produced. Enabling that feature here is not the fix either: in a
+/// workspace build it would switch float parsing for every crate that shares
+/// serde_json.
+fn render_tool_response(body: &[u8]) -> String {
+    String::from_utf8_lossy(body).into_owned()
 }
 
 /// Send a channel-0 control request and read until its channel-0 reply,
@@ -625,5 +635,45 @@ impl Error for ProbeError {}
 impl From<serde_json::Error> for ProbeError {
     fn from(err: serde_json::Error) -> Self {
         Self::Json(err)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::render_tool_response;
+
+    /// A float whose default serde_json parse differs from the exact one, found
+    /// among f32 values widened to f64 (the shape of a search score). Found at
+    /// run time so the test cannot pass vacuously on a value that parses fine.
+    fn lossy_float_literal() -> String {
+        (0x3c00_0000u32..0x4300_0000)
+            .step_by(997)
+            .map(|bits| f64::from(f32::from_bits(bits)))
+            .map(|value| value.to_string())
+            .find(|text| {
+                let exact: f64 = text.parse().unwrap();
+                let default: f64 = serde_json::from_str(text).unwrap();
+                exact.to_bits() != default.to_bits()
+            })
+            .expect("some f32-exact value parses inexactly without float_roundtrip")
+    }
+
+    #[test]
+    fn a_tool_response_is_printed_byte_for_byte() {
+        let literal = lossy_float_literal();
+        let body = format!(r#"{{"results":[{{"score":{literal}}}]}}"#);
+        let reencoded =
+            serde_json::to_string(&serde_json::from_str::<serde_json::Value>(&body).unwrap())
+                .unwrap();
+        assert_ne!(
+            reencoded, body,
+            "the witness must be one that parsing changes, or this test proves nothing"
+        );
+        assert_eq!(render_tool_response(body.as_bytes()), body);
+    }
+
+    #[test]
+    fn a_non_json_response_is_printed_as_text() {
+        assert_eq!(render_tool_response(b"not json"), "not json");
     }
 }

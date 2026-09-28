@@ -87,6 +87,11 @@ on:
     # dependent delay, a fire that moves an hour later also waits ~20m less,
     # so expect nearer 40m of separation than 60m. The slope is measured over
     # 03:17-06:00 only, so treat 40m as an estimate, not a prediction.
+    # The day-to-day noise that pairs cancel also decays with the distance
+    # between declared times (FUSI's seven-day read: this repo and fusiform,
+    # now 163 min apart, went from paired sd 2.8m to 15.5m, while a pair whose
+    # gap did not change held steady). So on 11-02 compare each arm against a
+    # partner at a matched gap, never against a pooled set of repos.
     #
     # READING THE BOUNDARY. Transition instant is 2026-11-01T06:00:00Z, located
     # by binary search against the tz database rather than by the

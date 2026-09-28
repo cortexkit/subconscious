@@ -205,6 +205,18 @@ undeclared name), which is one of the three doors the operator confirmed.
 ~/.local/share/cortexkit/run/logs/<module_id>.stderr.log daemon capture of stray stderr/stdout
 ```
 
+- **Capture lines carry the daemon's capture time.** Each line of
+  `<module_id>.stderr.log` is `2026-09-19T07:04:00.685Z ` (RFC 3339 UTC,
+  milliseconds, `Z`, one space; 25 bytes) followed by the module's bytes
+  verbatim. The stamp is taken when the daemon frames the line off the pipe,
+  the same instant `supervisor.stderr_tail` reports as `at_ms`, and has the
+  form the daemon's own log lines begin with. A line the module wrote in
+  several pieces is reassembled first and carries one stamp; a line longer
+  than the reader's 1 MiB reassembly ceiling is split into file lines, and
+  each of those starts with its own stamp. Lines written by a daemon from
+  before this carry no stamp, and a reader must leave them undated rather than
+  assign one: `ck module logs` shows them after every dated line.
+
 - **One file per module per day.** r1 split plugin lanes into
   `<module>.<harness>.log` because a plugin runs inside the harness process and
   cannot share a file handle across a rename-based rotation. r2 has no rename

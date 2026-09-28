@@ -1,6 +1,6 @@
 [package]
 name = "subc-mcp"
-version = "0.1.11"
+version = "0.1.12"
 edition = "2021"
 license = "MIT"
 publish = false
@@ -27,4 +27,4 @@ tokio = { version = "1", features = ["net", "rt-multi-thread", "macros", "io-uti
 [dev-dependencies]
 subc-test-support = { path = "../subc-test-support" }
 rmcp = { version = "1.7", default-features = false, features = ["client", "transport-async-rw"] }
-subc-daemon = { path = "../subc-daemon", version = "0.22.0" }
+subc-daemon = { path = "../subc-daemon", version = "0.23.0" }

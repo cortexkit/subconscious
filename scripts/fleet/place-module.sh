@@ -673,7 +673,9 @@ fi
 
 if [ -n "$MIGRATES" ]; then
   [ -f "$MIGRATES" ] || refuse "--migrates named $MIGRATES, which is not a file; nothing has been placed"
-  store_rb="$STAGING/$(basename "$MIGRATES").rollback-$(date -u +%Y%m%dT%H%M%SZ)"
+  # Named for the module as well as the store file: several modules keep a
+  # store.db, and snapshots sharing a name could not be pruned per module.
+  store_rb="$STAGING/$MODULE.$(basename "$MIGRATES").rollback-$(date -u +%Y%m%dT%H%M%SZ)"
   # sqlite3 .backup, NOT cp: the module holds the store open with a live -wal,
   # and cp captures a torn .db beside a WAL it does not include -- a snapshot
   # that restores to a state which never existed. .backup is the online backup
@@ -758,6 +760,16 @@ staged_digest=$(shasum -a 256 "$STAGED" | awk '{print $1}')
   || refuse "placed bytes differ from the staged bytes (staged $staged_digest, placed $placed_digest); the destination now holds an unverified binary"
 say "placed sha ${placed_digest%"${placed_digest#????????}"} (equals staged)"
 say "warm-exec at destination: $("$DEST" --version 2>&1 | head -1)"
+
+# Rollback retention: the newest three per binary (and per module store) are
+# kept, which always includes the one taken above. Without it every placement
+# left a full copy behind for good; staging had grown to 16 GB of them.
+prune="$(dirname "$0")/prune-rollbacks.sh"
+prune_names=("$(basename "$DEST")")
+[ -n "$MIGRATES" ] && prune_names+=("$MODULE.$(basename "$MIGRATES")")
+if ! CK_STAGING="$STAGING" "$prune" --keep 3 --apply "${prune_names[@]}"; then
+  say "WARNING: rollback prune failed; the placement itself succeeded and older rollbacks were kept"
+fi
 
 # PATH face: the operator may invoke this by name, and that resolution is what decides
 # which bytes run — not the path we just wrote.

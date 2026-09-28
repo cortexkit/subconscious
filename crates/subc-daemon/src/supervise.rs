@@ -10000,8 +10000,7 @@ mod stderr_settle_tests {
 
     use super::{settle_stderr_pump, StderrPump};
     use crate::stderr_tail::{
-        pump_stderr_to, untimed, CaptureState, OutputSink, StderrRing, StderrTailConfig,
-        TailEntry,
+        pump_stderr_to, untimed, CaptureState, OutputSink, StderrRing, StderrTailConfig, TailEntry,
     };
 
     const BOUND: Duration = Duration::from_millis(250);

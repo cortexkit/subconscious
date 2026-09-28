@@ -21,11 +21,11 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
 };
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::io::AsyncReadExt;
 
@@ -1059,7 +1059,10 @@ mod tests {
             TailEntry::Line { text, truncated: false, .. }
                 if text == "context line that must survive"
         ));
-        let TailEntry::Line { text, truncated, .. } = &kept[1] else {
+        let TailEntry::Line {
+            text, truncated, ..
+        } = &kept[1]
+        else {
             panic!("expected a truncated line");
         };
         assert_eq!(text, &"x".repeat(64));
@@ -1092,7 +1095,10 @@ mod tests {
         ring.mark_captured();
         ring.push_line("aa€€€€");
         let snapshot = ring.snapshot(None, None);
-        let TailEntry::Line { text, truncated, .. } = &snapshot.entries[0] else {
+        let TailEntry::Line {
+            text, truncated, ..
+        } = &snapshot.entries[0]
+        else {
             panic!("expected a line");
         };
         assert!(truncated);
@@ -1764,10 +1770,12 @@ mod tests {
         // The second line begins with a stamp of its own (a module that logs
         // in the fleet format to stderr). Its bytes must survive untouched:
         // the capture stamp goes in front, nothing is parsed or replaced.
-        let module_lines = ["plain line", "2020-01-01T00:00:00.000Z INFO  mymod: own stamp"];
+        let module_lines = [
+            "plain line",
+            "2020-01-01T00:00:00.000Z INFO  mymod: own stamp",
+        ];
         let input = format!("{}\n{}\n", module_lines[0], module_lines[1]);
-        let (contents, before, after) =
-            capture_through_file_sink(vec![input.into_bytes()]).await;
+        let (contents, before, after) = capture_through_file_sink(vec![input.into_bytes()]).await;
 
         assert!(contents.ends_with('\n'));
         let lines: Vec<&str> = contents.lines().collect();

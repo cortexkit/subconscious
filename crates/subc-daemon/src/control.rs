@@ -6308,7 +6308,8 @@ mod tests {
                     ..
                 }
             )
-        }) else {
+        })
+        else {
             panic!("the control response lost the truncated line");
         };
         assert_eq!(text, &source_line[..DEFAULT_MAX_LINE_BYTES]);

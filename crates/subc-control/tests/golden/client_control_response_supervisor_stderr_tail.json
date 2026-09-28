@@ -12,6 +12,7 @@
       "kind": "process_start"
     },
     {
+      "at_ms": 1789801440685,
       "kind": "line",
       "text": "config error: missing top-level `stor",
       "truncated": true

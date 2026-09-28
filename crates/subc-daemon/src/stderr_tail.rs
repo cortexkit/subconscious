@@ -21,6 +21,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
@@ -78,6 +79,10 @@ pub enum TailEntry {
         text: String,
         /// This line was cut at the per-line cap.
         truncated: bool,
+        /// Wall-clock Unix milliseconds at which the reader framed this line,
+        /// the same instant stamped on its capture-file line. `None` for a line
+        /// admitted without one (see [`StderrRing::push_line`]).
+        at_ms: Option<u64>,
     },
     /// The supervisor spawned a new process for this module. Lines after this
     /// entry come from the new one.
@@ -99,8 +104,14 @@ impl TailEntry {
 /// boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Slot {
-    Line { text: String, truncated: bool },
-    ProcessStart { generation: u64 },
+    Line {
+        text: String,
+        truncated: bool,
+        at_ms: Option<u64>,
+    },
+    ProcessStart {
+        generation: u64,
+    },
 }
 
 impl Slot {
@@ -324,20 +335,35 @@ impl StderrRing {
     /// Admit one complete line, truncating it if it exceeds the per-line cap.
     ///
     /// `line` must not contain a trailing newline; the reader strips it so the
-    /// stored text and the byte accounting agree.
+    /// stored text and the byte accounting agree. The line carries no capture
+    /// time: only the pipe reader knows when a line arrived, and it records
+    /// that through [`Self::push_line_from_at`].
     pub fn push_line(&mut self, line: &str) {
         self.push_line_from(self.generation, line);
     }
 
     /// [`Self::push_line`] for a line read from `generation`'s pipe.
-    ///
+    pub(crate) fn push_line_from(&mut self, generation: u64, line: &str) {
+        self.admit_line(generation, line, None);
+    }
+
+    /// [`Self::push_line_from`] for a line the reader framed at `at_ms`
+    /// (wall-clock Unix milliseconds).
+    pub(crate) fn push_line_from_at(&mut self, generation: u64, line: &str, at_ms: u64) {
+        self.admit_line(generation, line, Some(at_ms));
+    }
+
     /// A line from a retired process that arrives after a newer process started
     /// goes in front of the first boundary newer than its own generation. Lines
     /// from a process the supervisor has not retired (the incumbent during a
     /// swap's overlap) go at the end, as they arrive.
-    pub(crate) fn push_line_from(&mut self, generation: u64, line: &str) {
+    fn admit_line(&mut self, generation: u64, line: &str, at_ms: Option<u64>) {
         let (text, truncated) = truncate_line(line, self.config.max_line_bytes);
-        let slot = Slot::Line { text, truncated };
+        let slot = Slot::Line {
+            text,
+            truncated,
+            at_ms,
+        };
         let retired = matches!(
             self.pumps.get(&generation),
             Some(PumpPhase::Retired | PumpPhase::Late { .. })
@@ -412,10 +438,15 @@ impl StderrRing {
         let mut output_before = self.dropped_lines > 0;
         for slot in &self.entries {
             match slot {
-                Slot::Line { text, truncated } => {
+                Slot::Line {
+                    text,
+                    truncated,
+                    at_ms,
+                } => {
                     visible.push(TailEntry::Line {
                         text: text.clone(),
                         truncated: *truncated,
+                        at_ms: *at_ms,
                     });
                     output_before = true;
                 }
@@ -530,6 +561,18 @@ impl ChildOutputSink {
 /// and so production can serialize the two child pipes through one file sink.
 pub trait OutputSink {
     fn write_line(&mut self, line: &[u8]);
+
+    /// Whether each write should begin with its capture time (see
+    /// [`format_capture_stamp`]).
+    ///
+    /// Only a sink that ends every write with a newline may say yes: then each
+    /// write is a whole line of its own, and a stamp at the front of the write
+    /// is at the front of a line. A sink that passes an unterminated piece
+    /// through as-is would have the next piece continue the same line, and a
+    /// stamp there would land in the middle of it.
+    fn stamps_lines(&self) -> bool {
+        false
+    }
 }
 
 struct StderrSink;
@@ -566,6 +609,16 @@ impl OutputSink for ChildOutputSink {
             }
             Self::Stderr => StderrSink.write_line(line),
         }
+    }
+
+    // The capture file is read long after it was written, often next to the
+    // daemon's own log, whose lines carry a time. `LineSink::write_line`
+    // appends a newline to any write that lacks one, so every write here is a
+    // whole line and may carry the stamp. The daemon's inherited stderr gets
+    // the module's bytes unchanged: an unterminated piece is continued there by
+    // the next one, and whatever collects that stream stamps it itself.
+    fn stamps_lines(&self) -> bool {
+        matches!(self, Self::File { .. })
     }
 }
 
@@ -704,20 +757,178 @@ fn emit_line<S: OutputSink>(
     raw: &[u8],
     terminated: bool,
 ) {
+    // One instant for both destinations, taken where the line boundary is
+    // known. Nothing downstream can recover it: the ring and the file keep
+    // only bytes, and a time assigned when they are read would look recorded
+    // while being wrong by however long the line sat there.
+    let at_ms = unix_ms(SystemTime::now());
     if let Some((ring, generation)) = ring {
-        lock_ring(ring).push_line_from(generation, &String::from_utf8_lossy(raw));
+        lock_ring(ring).push_line_from_at(generation, &String::from_utf8_lossy(raw), at_ms);
     }
 
-    // Framed and written in ONE call. Two writes would let the other pipe land
-    // between the body and newline.
-    if terminated {
-        let mut framed = Vec::with_capacity(raw.len() + 1);
-        framed.extend_from_slice(raw);
-        framed.push(b'\n');
-        sink.write_line(&framed);
-    } else {
+    // Framed and written in ONE call, stamp included. Two writes would let the
+    // other pipe land between the pieces.
+    let stamp = sink.stamps_lines().then(|| format_capture_stamp(at_ms));
+    if stamp.is_none() && !terminated {
         sink.write_line(raw);
+        return;
     }
+    let mut framed = Vec::with_capacity(CAPTURE_STAMP_PREFIX_LEN + raw.len() + 1);
+    if let Some(stamp) = stamp {
+        framed.extend_from_slice(stamp.as_bytes());
+        framed.push(b' ');
+    }
+    framed.extend_from_slice(raw);
+    if terminated {
+        framed.push(b'\n');
+    }
+    sink.write_line(&framed);
+}
+
+fn unix_ms(at: SystemTime) -> u64 {
+    // A clock set before 1970 is already wrong about every time it reports;
+    // saturating keeps the stamp well-formed rather than failing the write.
+    at.duration_since(UNIX_EPOCH)
+        .map(|since| u64::try_from(since.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
+/// Length of a capture stamp, `2026-09-19T07:04:00.685Z`.
+pub const CAPTURE_STAMP_LEN: usize = 24;
+
+/// Length of the prefix on a capture-file line: the stamp and one space.
+pub const CAPTURE_STAMP_PREFIX_LEN: usize = CAPTURE_STAMP_LEN + 1;
+
+/// `at_ms` (Unix milliseconds) as RFC 3339 UTC with milliseconds and `Z`,
+/// the form the daemon's own log lines begin with, so one parser reads the
+/// time of a line in either file. Always [`CAPTURE_STAMP_LEN`] bytes for any
+/// time before the year 10000.
+pub fn format_capture_stamp(at_ms: u64) -> String {
+    let seconds = at_ms / 1000;
+    let millis = at_ms % 1000;
+    let days = seconds / 86_400;
+    let of_day = seconds % 86_400;
+    let (year, month, day) = civil_from_days(days);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{millis:03}Z",
+        of_day / 3600,
+        (of_day % 3600) / 60,
+        of_day % 60,
+    )
+}
+
+/// Split a capture-file line into the time its stamp records (Unix
+/// milliseconds) and the module's bytes after the stamp's space.
+///
+/// `None` when the line does not begin with a well-formed stamp and one space:
+/// a line written before capture lines were stamped has no recorded time, and
+/// the caller must leave it undated rather than guess one.
+pub fn split_capture_stamp(line: &str) -> Option<(u64, &str)> {
+    let bytes = line.as_bytes();
+    if bytes.len() < CAPTURE_STAMP_PREFIX_LEN || bytes[CAPTURE_STAMP_LEN] != b' ' {
+        return None;
+    }
+    let stamp = &bytes[..CAPTURE_STAMP_LEN];
+    for (index, expected) in [
+        (4, b'-'),
+        (7, b'-'),
+        (10, b'T'),
+        (13, b':'),
+        (16, b':'),
+        (19, b'.'),
+        (23, b'Z'),
+    ] {
+        if stamp[index] != expected {
+            return None;
+        }
+    }
+    let number = |from: usize, to: usize| -> Option<u64> {
+        let digits = &stamp[from..to];
+        if !digits.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        Some(
+            digits
+                .iter()
+                .fold(0u64, |total, digit| total * 10 + u64::from(digit - b'0')),
+        )
+    };
+    let year = number(0, 4)?;
+    let month = number(5, 7)?;
+    let day = number(8, 10)?;
+    let hour = number(11, 13)?;
+    let minute = number(14, 16)?;
+    let second = number(17, 19)?;
+    let millis = number(20, 23)?;
+    if year < 1970
+        || !(1..=12).contains(&month)
+        || day == 0
+        || day > days_in_month(year, month)
+        || hour > 23
+        || minute > 59
+        || second > 59
+    {
+        return None;
+    }
+    let days = days_from_civil(year, month, day);
+    let seconds = days * 86_400 + hour * 3600 + minute * 60 + second;
+    // Index 25 follows an ASCII space, so it is a char boundary.
+    Some((seconds * 1000 + millis, &line[CAPTURE_STAMP_PREFIX_LEN..]))
+}
+
+fn days_in_month(year: u64, month: u64) -> u64 {
+    match month {
+        2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    }
+}
+
+// Days since 1970-01-01 to a proleptic Gregorian date and back, after Howard
+// Hinnant's `civil_from_days`/`days_from_civil`, restricted to dates from 1970
+// on so the arithmetic stays unsigned.
+fn civil_from_days(days: u64) -> (u64, u64, u64) {
+    let z = days + 719_468;
+    let era = z / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + u64::from(month <= 2);
+    (year, month, day)
+}
+
+fn days_from_civil(year: u64, month: u64, day: u64) -> u64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = year / 400;
+    let yoe = year - era * 400;
+    let shifted_month = if month > 2 { month - 3 } else { month + 9 };
+    let doy = (153 * shifted_month + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// `entries` with every capture time removed, for tests that compare what a
+/// pump stored against expected text: the times are whatever the clock read,
+/// and the tests that check them do so on their own.
+#[cfg(test)]
+pub(crate) fn untimed(entries: Vec<TailEntry>) -> Vec<TailEntry> {
+    entries
+        .into_iter()
+        .map(|entry| match entry {
+            TailEntry::Line {
+                text, truncated, ..
+            } => TailEntry::Line {
+                text,
+                truncated,
+                at_ms: None,
+            },
+            TailEntry::ProcessStart => TailEntry::ProcessStart,
+        })
+        .collect()
 }
 
 fn lock_ring(ring: &Arc<Mutex<StderrRing>>) -> std::sync::MutexGuard<'_, StderrRing> {
@@ -845,10 +1056,10 @@ mod tests {
         let kept = &snapshot.entries;
         assert!(matches!(
             &kept[0],
-            TailEntry::Line { text, truncated: false }
+            TailEntry::Line { text, truncated: false, .. }
                 if text == "context line that must survive"
         ));
-        let TailEntry::Line { text, truncated } = &kept[1] else {
+        let TailEntry::Line { text, truncated, .. } = &kept[1] else {
             panic!("expected a truncated line");
         };
         assert_eq!(text, &"x".repeat(64));
@@ -881,7 +1092,7 @@ mod tests {
         ring.mark_captured();
         ring.push_line("aa€€€€");
         let snapshot = ring.snapshot(None, None);
-        let TailEntry::Line { text, truncated } = &snapshot.entries[0] else {
+        let TailEntry::Line { text, truncated, .. } = &snapshot.entries[0] else {
             panic!("expected a line");
         };
         assert!(truncated);
@@ -902,12 +1113,14 @@ mod tests {
             vec![
                 TailEntry::Line {
                     text: "before the crash".to_string(),
-                    truncated: false
+                    truncated: false,
+                    at_ms: None,
                 },
                 TailEntry::ProcessStart,
                 TailEntry::Line {
                     text: "after the respawn".to_string(),
-                    truncated: false
+                    truncated: false,
+                    at_ms: None,
                 },
             ]
         );
@@ -953,6 +1166,7 @@ mod tests {
                 TailEntry::Line {
                     text: "after restart".to_string(),
                     truncated: false,
+                    at_ms: None,
                 },
             ]
         );
@@ -971,6 +1185,7 @@ mod tests {
             vec![TailEntry::Line {
                 text: "before restart".to_string(),
                 truncated: false,
+                at_ms: None,
             }]
         );
     }
@@ -1150,12 +1365,14 @@ mod tests {
             vec![
                 TailEntry::Line {
                     text: "first process said this".to_string(),
-                    truncated: false
+                    truncated: false,
+                    at_ms: None,
                 },
                 TailEntry::ProcessStart,
                 TailEntry::Line {
                     text: "second process said this".to_string(),
-                    truncated: false
+                    truncated: false,
+                    at_ms: None,
                 },
             ],
             "only the boundary with output before it may be shown"
@@ -1184,7 +1401,8 @@ mod tests {
                 TailEntry::ProcessStart,
                 TailEntry::Line {
                     text: "survivor".to_string(),
-                    truncated: false
+                    truncated: false,
+                    at_ms: None,
                 },
             ]
         );
@@ -1194,6 +1412,7 @@ mod tests {
         TailEntry::Line {
             text: text.to_string(),
             truncated: false,
+            at_ms: None,
         }
     }
 
@@ -1387,38 +1606,45 @@ mod tests {
         let snapshot = lock_ring(&ring).snapshot(None, None);
         assert_eq!(snapshot.capture, CaptureState::Captured);
         assert_eq!(
-            snapshot.entries,
+            untimed(snapshot.entries),
             vec![
                 TailEntry::Line {
                     text: "first".to_string(),
-                    truncated: false
+                    truncated: false,
+                    at_ms: None,
                 },
                 TailEntry::Line {
                     text: "second".to_string(),
-                    truncated: false
+                    truncated: false,
+                    at_ms: None,
                 },
                 // The pump delimits on '\n' alone; a CR belongs to the line body.
                 TailEntry::Line {
                     text: "carry\r".to_string(),
-                    truncated: false
+                    truncated: false,
+                    at_ms: None,
                 },
                 TailEntry::Line {
                     text: "over".to_string(),
-                    truncated: false
+                    truncated: false,
+                    at_ms: None,
                 },
                 // Exactly at the per-line cap: kept whole.
                 TailEntry::Line {
                     text: "12345678".to_string(),
-                    truncated: false
+                    truncated: false,
+                    at_ms: None,
                 },
                 // One byte past the cap: cut, and marked as cut.
                 TailEntry::Line {
                     text: "12345678".to_string(),
-                    truncated: true
+                    truncated: true,
+                    at_ms: None,
                 },
                 TailEntry::Line {
                     text: "tail".to_string(),
-                    truncated: false
+                    truncated: false,
+                    at_ms: None,
                 },
             ]
         );
@@ -1460,6 +1686,196 @@ mod tests {
         );
     }
 
+    fn now_ms() -> u64 {
+        unix_ms(SystemTime::now())
+    }
+
+    #[tokio::test]
+    async fn a_captured_line_carries_the_time_the_reader_framed_it() {
+        // The ring is read after the fact (`ck module stderr`), and without a
+        // time a reader cannot tell a crash's last words from a line written
+        // hours before it.
+        let ring = shared(10, 10_000, 128);
+        let before = now_ms();
+        let source = std::io::Cursor::new(b"first\nsecond".to_vec());
+        pump_stderr_into(source, Arc::clone(&ring), &mut RecordingSink::default()).await;
+        let after = now_ms();
+
+        let entries = lock_ring(&ring).snapshot(None, None).entries;
+        assert_eq!(entries.len(), 2);
+        for entry in entries {
+            let TailEntry::Line { text, at_ms, .. } = entry else {
+                panic!("expected only lines, got {entry:?}");
+            };
+            let at_ms = at_ms.unwrap_or_else(|| panic!("line {text:?} has no capture time"));
+            assert!(
+                (before..=after).contains(&at_ms),
+                "line {text:?} stamped {at_ms}, outside the pump's run {before}..={after}"
+            );
+        }
+    }
+
+    /// Reads a capture file written through the production sink.
+    async fn capture_through_file_sink(chunks: Vec<Vec<u8>>) -> (String, u64, u64) {
+        let temp = subc_test_support::TestTempDir::new("stderr-capture-stamp");
+        let path = temp.path().join("stamped.stderr.log");
+        let sink = ChildOutputSink::open(&path, cortexkit_log::Retention::default()).unwrap();
+        let ring = shared(10, 10_000, 128);
+        let generation = lock_ring(&ring).begin_process();
+        let before = now_ms();
+        pump_stderr_to(
+            ChunkedReader {
+                chunks: chunks.into_iter().collect(),
+            },
+            ring,
+            generation,
+            sink,
+        )
+        .await;
+        let after = now_ms();
+        (std::fs::read_to_string(&path).unwrap(), before, after)
+    }
+
+    /// Checks the prefix's shape by position, independently of
+    /// [`split_capture_stamp`], so a parser that accepted a malformed stamp
+    /// could not vouch for the writer that produced it.
+    fn assert_stamp_shape(line: &str) {
+        let bytes = line.as_bytes();
+        assert!(bytes.len() > 25, "line too short for a stamp: {line:?}");
+        for (index, byte) in bytes[..25].iter().enumerate() {
+            let expected_separator = match index {
+                4 | 7 => Some(b'-'),
+                10 => Some(b'T'),
+                13 | 16 => Some(b':'),
+                19 => Some(b'.'),
+                23 => Some(b'Z'),
+                24 => Some(b' '),
+                _ => None,
+            };
+            match expected_separator {
+                Some(separator) => assert_eq!(*byte, separator, "byte {index} of {line:?}"),
+                None => assert!(byte.is_ascii_digit(), "byte {index} of {line:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_capture_file_stamps_each_line_and_keeps_the_module_bytes_verbatim() {
+        // The second line begins with a stamp of its own (a module that logs
+        // in the fleet format to stderr). Its bytes must survive untouched:
+        // the capture stamp goes in front, nothing is parsed or replaced.
+        let module_lines = ["plain line", "2020-01-01T00:00:00.000Z INFO  mymod: own stamp"];
+        let input = format!("{}\n{}\n", module_lines[0], module_lines[1]);
+        let (contents, before, after) =
+            capture_through_file_sink(vec![input.into_bytes()]).await;
+
+        assert!(contents.ends_with('\n'));
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(lines.len(), 2, "capture file: {contents:?}");
+        for (line, module_line) in lines.iter().zip(module_lines) {
+            assert_stamp_shape(line);
+            assert_eq!(&line[25..], module_line, "module bytes changed");
+            let (at_ms, rest) = split_capture_stamp(line).unwrap();
+            assert_eq!(rest, module_line);
+            // Millisecond stamps round the pump's own bounds down.
+            assert!(
+                (before..=after).contains(&at_ms),
+                "stamped {at_ms}, outside the pump's run {before}..={after}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_line_split_across_several_writes_is_stamped_once() {
+        // A module that writes one line in pieces, and a pipe that delivers it
+        // in pieces, must still produce one stamp at the front of the line and
+        // none in its middle.
+        let (contents, _, _) = capture_through_file_sink(vec![
+            b"par".to_vec(),
+            b"tial li".to_vec(),
+            b"ne\nwhole\n".to_vec(),
+        ])
+        .await;
+
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(lines.len(), 2, "capture file: {contents:?}");
+        for (line, module_line) in lines.iter().zip(["partial line", "whole"]) {
+            assert_stamp_shape(line);
+            assert_eq!(&line[25..], module_line, "capture file: {contents:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_line_flushed_at_the_ceiling_is_stamped_only_at_the_start_of_each_file_line() {
+        // Past the reassembly ceiling the pending bytes go out without their
+        // newline. The file sink ends every write with one, so the rest of
+        // the line starts a new file line, and that is where its stamp goes;
+        // a stamp anywhere else would sit in the middle of module bytes.
+        let mut long = vec![b'x'; MAX_PENDING_LINE_BYTES + 100];
+        long.push(b'\n');
+        // The reader's buffer holds 8 KiB, so feed it reads no larger than that.
+        let chunks = long.chunks(8192).map(<[u8]>::to_vec).collect();
+        let (contents, _, _) = capture_through_file_sink(chunks).await;
+
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(lines.len(), 2, "expected the flushed piece and the rest");
+        for line in &lines {
+            assert_stamp_shape(line);
+            assert!(
+                line[25..].bytes().all(|byte| byte == b'x'),
+                "a stamp landed inside module bytes"
+            );
+        }
+        let module_bytes: usize = lines.iter().map(|line| line.len() - 25).sum();
+        assert_eq!(module_bytes, MAX_PENDING_LINE_BYTES + 100);
+    }
+
+    #[test]
+    fn the_capture_stamp_is_the_daemon_log_timestamp_form() {
+        for (at_ms, text) in [
+            (0, "1970-01-01T00:00:00.000Z"),
+            (951_868_799_999, "2000-02-29T23:59:59.999Z"),
+            (1_789_801_440_685, "2026-09-19T07:04:00.685Z"),
+            (4_107_542_400_001, "2100-03-01T00:00:00.001Z"),
+        ] {
+            let stamp = format_capture_stamp(at_ms);
+            assert_eq!(stamp, text);
+            assert_eq!(stamp.len(), CAPTURE_STAMP_LEN);
+            // The daemon's own log parser reads the same instant from it, so
+            // one parser serves both files.
+            let daemon_line = format!("{stamp} INFO  subc: probe");
+            let parsed = cortexkit_log::parse_line(&daemon_line).unwrap();
+            assert_eq!(
+                parsed.timestamp,
+                UNIX_EPOCH + std::time::Duration::from_millis(at_ms)
+            );
+            assert_eq!(
+                split_capture_stamp(&format!("{stamp} body")),
+                Some((at_ms, "body"))
+            );
+        }
+    }
+
+    #[test]
+    fn a_line_without_a_well_formed_stamp_has_no_capture_time() {
+        for line in [
+            "",
+            "plain module output",
+            "2026-09-19T07:04:00.685Z",
+            "2026-09-19T07:04:00.685Zbody",
+            "2026-09-19T07:04:00.685z body",
+            "2026-09-19 07:04:00.685Z body",
+            "2026-09-19T07:04:00Z body",
+            "2026-02-30T07:04:00.685Z body",
+            "2026-13-19T07:04:00.685Z body",
+            "2026-09-19T24:04:00.685Z body",
+            "2026-09-19T07:04:00.6a5Z body",
+            "1969-12-31T23:59:59.999Z body",
+        ] {
+            assert_eq!(split_capture_stamp(line), None, "{line:?}");
+        }
+    }
+
     #[test]
     fn a_byte_limit_smaller_than_one_line_still_returns_that_line() {
         // Returning nothing would be indistinguishable from a quiet module, which
@@ -1488,6 +1904,7 @@ mod tests {
                 TailEntry::Line {
                     text: "new proces".to_string(),
                     truncated: true,
+                    at_ms: None,
                 },
             ]
         );

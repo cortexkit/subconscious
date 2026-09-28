@@ -677,14 +677,18 @@ fn client_control_responses() -> Vec<(&'static str, ClientControlResponse)> {
                 tail: StderrTail {
                     capture: StderrCaptureState::Captured,
                     entries: vec![
+                        // One line without a capture time, as an older daemon
+                        // sends it, and one with, so both shapes stay pinned.
                         StderrTailEntry::Line {
                             text: "config error: missing top-level `storage`".to_string(),
                             truncated: false,
+                            at_ms: None,
                         },
                         StderrTailEntry::ProcessStart,
                         StderrTailEntry::Line {
                             text: "config error: missing top-level `stor".to_string(),
                             truncated: true,
+                            at_ms: Some(1_789_801_440_685),
                         },
                     ],
                     dropped_lines: 12,
@@ -718,6 +722,7 @@ fn client_control_responses() -> Vec<(&'static str, ClientControlResponse)> {
                     entries: vec![StderrTailEntry::Line {
                         text: "config error: missing top-level `storage`".to_string(),
                         truncated: false,
+                        at_ms: None,
                     }],
                     dropped_lines: 0,
                 },

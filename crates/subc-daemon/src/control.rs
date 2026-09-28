@@ -3439,9 +3439,15 @@ impl ControlHandler {
                     .entries
                     .into_iter()
                     .map(|entry| match entry {
-                        TailEntry::Line { text, truncated } => {
-                            StderrTailEntry::Line { text, truncated }
-                        }
+                        TailEntry::Line {
+                            text,
+                            truncated,
+                            at_ms,
+                        } => StderrTailEntry::Line {
+                            text,
+                            truncated,
+                            at_ms,
+                        },
                         TailEntry::ProcessStart => StderrTailEntry::ProcessStart,
                     })
                     .collect(),
@@ -6290,7 +6296,11 @@ mod tests {
                 .any(|entry| matches!(entry, StderrTailEntry::ProcessStart)),
             "the control response lost the restart boundary"
         );
-        let Some(StderrTailEntry::Line { text, truncated }) = tail.entries.iter().find(|entry| {
+        let Some(StderrTailEntry::Line {
+            text,
+            truncated,
+            at_ms,
+        }) = tail.entries.iter().find(|entry| {
             matches!(
                 entry,
                 StderrTailEntry::Line {
@@ -6303,6 +6313,10 @@ mod tests {
         };
         assert_eq!(text, &source_line[..DEFAULT_MAX_LINE_BYTES]);
         assert!(*truncated);
+        assert!(
+            at_ms.is_some(),
+            "the control response lost the line's capture time"
+        );
     }
 
     /// `supervisor.terminals` reads journal files. On a single-worker runtime a

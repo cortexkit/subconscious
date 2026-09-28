@@ -10000,7 +10000,8 @@ mod stderr_settle_tests {
 
     use super::{settle_stderr_pump, StderrPump};
     use crate::stderr_tail::{
-        pump_stderr_to, CaptureState, OutputSink, StderrRing, StderrTailConfig, TailEntry,
+        pump_stderr_to, untimed, CaptureState, OutputSink, StderrRing, StderrTailConfig,
+        TailEntry,
     };
 
     const BOUND: Duration = Duration::from_millis(250);
@@ -10044,6 +10045,7 @@ mod stderr_settle_tests {
         TailEntry::Line {
             text: text.to_string(),
             truncated: false,
+            at_ms: None,
         }
     }
 
@@ -10111,7 +10113,7 @@ mod stderr_settle_tests {
         .await;
 
         assert_eq!(
-            lock(&ring).snapshot(None, None).entries,
+            untimed(lock(&ring).snapshot(None, None).entries),
             vec![
                 line("booting"),
                 line("config error: missing storage"),
@@ -10151,7 +10153,7 @@ mod stderr_settle_tests {
             other => panic!("expected Incomplete while the pipe is held open, got {other:?}"),
         }
         assert_eq!(
-            snapshot.entries,
+            untimed(snapshot.entries),
             vec![
                 line("parent exiting"),
                 TailEntry::ProcessStart,
@@ -10170,7 +10172,7 @@ mod stderr_settle_tests {
 
         let snapshot = lock(&ring).snapshot(None, None);
         assert_eq!(snapshot.capture, CaptureState::Captured);
-        assert_eq!(snapshot.entries, vec![line("one"), line("two")]);
+        assert_eq!(untimed(snapshot.entries), vec![line("one"), line("two")]);
     }
 }
 

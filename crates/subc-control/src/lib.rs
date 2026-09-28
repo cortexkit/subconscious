@@ -776,6 +776,10 @@ pub enum StderrTailEntry {
         /// Carried as a field rather than left to a marker in `text` so a
         /// consumer can branch on it without string matching.
         truncated: bool,
+        /// Wall-clock Unix milliseconds at which the daemon read this line off
+        /// the module's pipe. `None` from a daemon that predates the field; a
+        /// reader must then show no time rather than make one up.
+        at_ms: Option<u64>,
     },
     /// The supervisor spawned a new process. Entries after this came from it.
     ///
@@ -863,6 +867,10 @@ enum StderrTailEntryWire {
         text: String,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         truncated: bool,
+        // Omitted when absent so a reply without it is byte-identical to what
+        // an older daemon sends. Older decoders ignore the member when present.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        at_ms: Option<u64>,
     },
     ProcessStart,
 }
@@ -1527,9 +1535,14 @@ impl Serialize for StderrTailEntry {
         S: Serializer,
     {
         match self {
-            Self::Line { text, truncated } => StderrTailEntryWire::Line {
+            Self::Line {
+                text,
+                truncated,
+                at_ms,
+            } => StderrTailEntryWire::Line {
                 text: text.clone(),
                 truncated: *truncated,
+                at_ms: *at_ms,
             }
             .serialize(serializer),
             Self::ProcessStart => StderrTailEntryWire::ProcessStart.serialize(serializer),
@@ -1546,7 +1559,15 @@ impl<'de> Deserialize<'de> for StderrTailEntry {
         let (tag, value) = read_tagged(deserializer, "kind")?;
         match tag.as_str() {
             "line" => match serde_json::from_value(value.into_value()).map_err(D::Error::custom)? {
-                StderrTailEntryWire::Line { text, truncated } => Ok(Self::Line { text, truncated }),
+                StderrTailEntryWire::Line {
+                    text,
+                    truncated,
+                    at_ms,
+                } => Ok(Self::Line {
+                    text,
+                    truncated,
+                    at_ms,
+                }),
                 _ => unreachable!(),
             },
             "process_start" => {
@@ -2518,6 +2539,45 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<ChildResourceUsage>(wire).unwrap(),
             unavailable
+        );
+    }
+
+    #[test]
+    fn a_stderr_line_decodes_with_and_without_its_capture_time() {
+        // A current daemon stamps each line; an older one sends no `at_ms`.
+        // Both must decode, and the absent case must stay absent rather than
+        // turn into a time nobody recorded.
+        let stamped: StderrTailEntry = serde_json::from_str(
+            r#"{"kind":"line","text":"boom","truncated":true,"at_ms":1789801440685}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            stamped,
+            StderrTailEntry::Line {
+                text: "boom".to_string(),
+                truncated: true,
+                at_ms: Some(1_789_801_440_685),
+            }
+        );
+        let unstamped: StderrTailEntry =
+            serde_json::from_str(r#"{"kind":"line","text":"boom"}"#).unwrap();
+        assert_eq!(
+            unstamped,
+            StderrTailEntry::Line {
+                text: "boom".to_string(),
+                truncated: false,
+                at_ms: None,
+            }
+        );
+        // Absent stays absent on the way out, so a reply without stamps is
+        // exactly what an older daemon would have sent.
+        assert_eq!(
+            serde_json::to_string(&unstamped).unwrap(),
+            r#"{"kind":"line","text":"boom"}"#
+        );
+        assert_eq!(
+            serde_json::to_value(&stamped).unwrap()["at_ms"],
+            serde_json::json!(1_789_801_440_685u64)
         );
     }
 

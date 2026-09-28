@@ -74,20 +74,53 @@ jobs:
         include:
           - runner: ubuntu-latest
             arch: x64
+            target: x86_64-unknown-linux-gnu
           - runner: ubuntu-24.04-arm
             arch: arm64
+            target: aarch64-unknown-linux-gnu
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
 
-      - name: Build release binaries
-        run: cargo build --release --locked -p subc-core -p subc-mcp --bin ck --bin ck-subc --bin ck-subc-mcp
+      - name: Install pinned Linux cross-linker
+        run: |
+          python -m venv "$RUNNER_TEMP/zigbuild"
+          "$RUNNER_TEMP/zigbuild/bin/pip" install cargo-zigbuild==0.23.4 ziglang==0.16.0
+          # Expose the pinned Zig, rather than any newer runner-provided linker.
+          ZIG_PATH=$("$RUNNER_TEMP/zigbuild/bin/python" -c 'import pathlib, ziglang; print(pathlib.Path(ziglang.__file__).parent / "zig")')
+          ln -s "$ZIG_PATH" "$RUNNER_TEMP/zigbuild/bin/zig"
+          echo "$RUNNER_TEMP/zigbuild/bin" >> "$GITHUB_PATH"
+          sudo apt-get update
+          sudo apt-get install -y binutils
+
+      - name: Build release binaries for glibc 2.28
+        run: cargo zigbuild --release --locked --target ${{ matrix.target }}.2.28 -p subc-core -p subc-mcp --bin ck --bin ck-subc --bin ck-subc-mcp
+
+      - name: Enforce glibc 2.28 ceiling
+        run: bash scripts/release/check-glibc.sh target/${{ matrix.target }}/release
+
+      - name: Smoke version probes on Debian 10
+        run: |
+          # Native runners exercise each architecture's loader and shared libraries.
+          # A timeout also refuses a version probe that accidentally starts a daemon.
+          docker run --rm --network none \
+            -v "$PWD/target/${{ matrix.target }}/release:/binaries:ro" \
+            debian:10 sh -ec '
+              for binary in ck ck-subc ck-subc-mcp; do
+                timeout 15s "/binaries/$binary" --version
+              done
+            '
 
       - name: Package convention-named archives and digest sidecars
-        run: bash scripts/release/package-unix-archives.sh linux ${{ matrix.arch }} target/release dist
+        run: bash scripts/release/package-unix-archives.sh linux ${{ matrix.arch }} target/${{ matrix.target }}/release dist
 
       - name: Upload release archives
         env:

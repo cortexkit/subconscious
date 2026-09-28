@@ -617,6 +617,16 @@ if [ -n "$GONE" ]; then
     || refuse "\"$GONE\" is absent from the RUNNING image in both tables, so its absence from the staged one proves nothing (no positive control)"
 fi
 
+# FORMAT FLOORS: an image must read every on-disk format its module has already
+# rolled forward to. The module records the floors in its data tree and each card
+# declares what it reads beside it; check-format-floors.sh compares them. This is
+# the arm that stops a binary-only rollback onto data only newer builds can read,
+# and it runs for rollback images too, whose maps are carried below.
+floor_check="$(dirname "$0")/check-format-floors.sh"
+if ! "$floor_check" "$MODULE" "$STAGED"; then
+  exit 2
+fi
+
 # A GATE WITH SIDE EFFECTS MUST BE EXERCISABLE WITHOUT THEM. Every arm above is a
 # read; everything below mutates. Without this split the only way to test a new arm
 # is to place a binary -- which is how 0.3.92 reached production outside its quiet
@@ -653,6 +663,13 @@ rb_digest=$(shasum -a 256 "$rb" | awk '{print $1}')
   || refuse "rollback snapshot does not match the live binary it was copied from (live $live_digest, snapshot $rb_digest); nothing has been placed"
 (cd "$STAGING" && shasum -a 256 "$(basename "$rb")" > "$(basename "$rb").sha256")
 say "rollback $(basename "$rb") matches live (${live_digest%"${live_digest#????????}"}), holds: $("$rb" --version 2>&1 | head -1)"
+# The rollback image keeps the format-versions map of the build it snapshots, so
+# re-placing it later is checked against the floors like any card. An image
+# placed before maps existed has none, and the floor check refuses it once
+# floors exist, naming how to write one by hand.
+if [ -f "$DEST.format-versions.json" ]; then
+  cp "$DEST.format-versions.json" "$rb.format-versions.json"
+fi
 
 if [ -n "$MIGRATES" ]; then
   [ -f "$MIGRATES" ] || refuse "--migrates named $MIGRATES, which is not a file; nothing has been placed"
@@ -712,6 +729,19 @@ fi
 
 say "=== place"
 cp "$STAGED" "$DEST.tmp" && mv "$DEST.tmp" "$DEST"
+# The live binary's map travels with it, so the next rollback snapshot can carry
+# it. A map left over from the previous binary would describe the wrong build,
+# so it is removed when the new card has none.
+staged_map=""
+for m in "$STAGED.format-versions.json" \
+         "$(dirname "$STAGED")/$(basename "$STAGED" | sed 's/^SIGNED\.//').format-versions.json"; do
+  if [ -f "$m" ]; then staged_map="$m"; break; fi
+done
+if [ -n "$staged_map" ]; then
+  cp "$staged_map" "$DEST.format-versions.json.tmp" && mv "$DEST.format-versions.json.tmp" "$DEST.format-versions.json"
+else
+  rm -f "$DEST.format-versions.json"
+fi
 # THE PLACED BYTES MUST EQUAL THE STAGED BYTES, and this printed a sha without
 # comparing it until 2026-09-18. Found by grepping this file for the shape of
 # the rollback defect fixed forty lines up rather than by anything failing --

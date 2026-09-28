@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use subc_control::{CatalogEntry, ClientControlRequest, ClientControlResponse, NotReadyReason};
+use subc_daemon::stderr_tail::{format_capture_stamp, split_capture_stamp, CAPTURE_STAMP_LEN};
 use subc_daemon::{fleet_lint, machine_id, read_frame, write_frame, Frame, DEFAULT_DRAIN_TIMEOUT};
 use subc_protocol::{BindIdentity, Flags, FrameType, Priority, RouteTarget};
 use subc_transport::{
@@ -1463,6 +1464,10 @@ struct LogSource {
     lane: String,
     path: PathBuf,
     daemon: bool,
+    /// The daemon's capture of the module's stdout/stderr, whose lines begin
+    /// with the daemon's capture stamp (or, if written before the daemon
+    /// stamped them, with nothing the daemon put there).
+    capture: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -1521,8 +1526,8 @@ async fn module_logs(
     Ok(())
 }
 
-/// Undated lines (the stderr capture is raw child bytes and need not carry a
-/// fleet timestamp) sort AFTER every dated line: `Option`'s natural order puts
+/// Undated lines (capture-file lines written before the daemon stamped them,
+/// whose raw child bytes need not carry a time) sort AFTER every dated line: `Option`'s natural order puts
 /// `None` first, which would render a module's crash stderr above yesterday's
 /// daemon lines. Within the undated tail, source order holds.
 fn sort_log_entries(entries: &mut [LogEntry]) {
@@ -1553,7 +1558,7 @@ fn module_log_census(modules: &[Value], json_output: bool) -> Result<(), CkError
                 "lane": source.lane,
                 "path": source.path.display().to_string(),
                 "size": metadata.len(),
-                "last_timestamp": last_log_timestamp(&source.path),
+                "last_timestamp": last_log_timestamp(&source),
             }));
         }
     }
@@ -1575,11 +1580,14 @@ fn module_log_census(modules: &[Value], json_output: bool) -> Result<(), CkError
     Ok(())
 }
 
-fn last_log_timestamp(path: &Path) -> String {
-    fs::read_to_string(path)
+fn last_log_timestamp(source: &LogSource) -> String {
+    fs::read_to_string(&source.path)
         .ok()
         .and_then(|contents| {
             contents.lines().rev().find_map(|line| {
+                if source.capture && split_capture_stamp(line).is_some() {
+                    return Some(line[..CAPTURE_STAMP_LEN].to_string());
+                }
                 line_facts(line).map(|facts| {
                     line.split_once(' ')
                         .map(|(timestamp, _)| timestamp.to_string())
@@ -1667,10 +1675,12 @@ fn collect_sources_in_dir(
         // log is `subc.<date>.log` in the run directory. The r1 shapes
         // (`<id>.log`, `<id>.<harness>.log`, `subc.log`) stay readable so a
         // host mid-migration does not lose its history from this verb.
+        let mut capture = false;
         let (lane, daemon) =
             if daemon_directory && (base == "subc.log" || segment_day("subc", base).is_some()) {
                 ("daemon".to_string(), true)
             } else if daemon_directory && base == format!("{module_id}.stderr.log") {
+                capture = true;
                 ("stderr".to_string(), false)
             } else if !daemon_directory
                 && (base == format!("{module_id}.log") || segment_day(module_id, base).is_some())
@@ -1691,7 +1701,12 @@ fn collect_sources_in_dir(
             } else {
                 continue;
             };
-        output.push(LogSource { lane, path, daemon });
+        output.push(LogSource {
+            lane,
+            path,
+            daemon,
+            capture,
+        });
     }
     Ok(())
 }
@@ -1742,7 +1757,12 @@ fn collect_log_text(
         .and_then(|duration| SystemTime::now().checked_sub(duration));
     for line in contents.lines() {
         counts.total += 1;
-        let parsed = line_facts(line);
+        let (timestamp, parsed) = if source.capture {
+            capture_line_facts(line)
+        } else {
+            let parsed = line_facts(line);
+            (parsed.as_ref().map(|parsed| parsed.timestamp), parsed)
+        };
         if source.daemon
             && parsed
                 .as_ref()
@@ -1779,17 +1799,20 @@ fn collect_log_text(
                 counts.wrong_tag += 1;
                 continue;
             }
-            if since.is_some_and(|since| parsed.timestamp < since) {
-                counts.before_since += 1;
-                continue;
-            }
-        } else {
+        }
+        // A stamped capture line has a time even when the module's bytes are
+        // not a log line, so `--since` applies to it as well.
+        if since.is_some_and(|since| timestamp.is_some_and(|timestamp| timestamp < since)) {
+            counts.before_since += 1;
+            continue;
+        }
+        if parsed.is_none() {
             counts.unparsed += 1;
         }
         output.push(LogEntry {
             lane: source.lane.clone(),
             line: line.to_string(),
-            timestamp: parsed.as_ref().map(|parsed| parsed.timestamp),
+            timestamp,
             level: parsed.as_ref().map(|parsed| parsed.level),
             tag: parsed.and_then(|parsed| parsed.component.map(str::to_string)),
             source_order: *source_order,
@@ -1812,6 +1835,33 @@ struct LineFacts<'a> {
     /// the same intent under each grammar, so `--tag perf` matches both.
     component: Option<&'a str>,
     body: &'a str,
+}
+
+/// The time and facts of one line of the daemon's capture file.
+///
+/// The daemon stamps each capture line with the moment it read it, so a
+/// stamped line's time is that stamp whatever the module wrote after it. When
+/// the module's own bytes are a fleet log line, its level and component still
+/// drive `--level` and `--tag`. A line written before the daemon stamped
+/// capture lines is read exactly as it was then: dated only if the module's
+/// bytes carry a time of their own, and otherwise left undated.
+fn capture_line_facts(line: &str) -> (Option<SystemTime>, Option<LineFacts<'_>>) {
+    let Some((at_ms, module_bytes)) = split_capture_stamp(line) else {
+        let parsed = line_facts(line);
+        return (parsed.as_ref().map(|parsed| parsed.timestamp), parsed);
+    };
+    let at = UNIX_EPOCH + Duration::from_millis(at_ms);
+    // The whole line is tried second: an old unstamped fleet line starts with
+    // a stamp of the same shape, and so does a new line whose module bytes
+    // are a log line without its own time. Either way the leading stamp is
+    // the time.
+    let parsed = line_facts(module_bytes)
+        .or_else(|| line_facts(line))
+        .map(|parsed| LineFacts {
+            timestamp: at,
+            ..parsed
+        });
+    (Some(at), parsed)
 }
 
 fn line_facts(line: &str) -> Option<LineFacts<'_>> {
@@ -2455,21 +2505,7 @@ async fn module_stderr_tail(
         for entry in entries {
             match entry.get("kind").and_then(Value::as_str) {
                 Some("process_start") => println!("--- process start ---"),
-                _ => {
-                    let text = entry
-                        .get("text")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default();
-                    let truncated = entry
-                        .get("truncated")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false);
-                    if truncated {
-                        println!("{text} [truncated]");
-                    } else {
-                        println!("{text}");
-                    }
-                }
+                _ => println!("{}", stderr_entry_line(&entry)),
             }
         }
     }
@@ -2480,6 +2516,29 @@ async fn module_stderr_tail(
         println!("{hint}");
     }
     Ok(())
+}
+
+/// One `supervisor.stderr_tail` line as printed: the daemon's capture time
+/// first, in the form its own log lines begin with, when the reply carries one.
+/// A daemon from before the field sends none, and the line is printed bare
+/// rather than under a time this process would have had to make up.
+fn stderr_entry_line(entry: &Value) -> String {
+    let text = entry
+        .get("text")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let truncated = entry
+        .get("truncated")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let mut rendered = match entry.get("at_ms").and_then(Value::as_u64) {
+        Some(at_ms) => format!("{} {text}", format_capture_stamp(at_ms)),
+        None => text.to_string(),
+    };
+    if truncated {
+        rendered.push_str(" [truncated]");
+    }
+    rendered
 }
 
 fn stderr_truncation_hint(response: &Value) -> Option<String> {
@@ -8184,11 +8243,13 @@ mod tests {
             lane: "mod".to_string(),
             path: PathBuf::from("synapse.log"),
             daemon: false,
+            capture: false,
         };
         let r2 = LogSource {
             lane: "mod".to_string(),
             path: PathBuf::from("synapse.2026-09-22.log"),
             daemon: false,
+            capture: false,
         };
         let r1_text = "2026-09-18T19:00:01.008Z INFO  synapse tag=admission job admitted job_id=a\n\
                        2026-09-18T19:00:18.670Z INFO  synapse tag=perf job done job_id=a wall_ms=21693\n\
@@ -8271,6 +8332,117 @@ mod tests {
         assert!(entries
             .iter()
             .all(|entry| entry.tag.as_deref() == Some("admission")));
+    }
+
+    /// The daemon now stamps every capture line, so the stderr lane merges
+    /// with the daemon's and the module's own lines by time. A capture file
+    /// begun before that holds unstamped lines, which must still be shown and
+    /// must stay undated: the reader has no record of when they were written.
+    #[test]
+    fn capture_lines_merge_by_their_stamp_and_unstamped_ones_stay_undated() {
+        let capture = LogSource {
+            lane: "stderr".to_string(),
+            path: PathBuf::from("engram.stderr.log"),
+            daemon: false,
+            capture: true,
+        };
+        let daemon = LogSource {
+            lane: "daemon".to_string(),
+            path: PathBuf::from("subc.2026-09-19.log"),
+            daemon: true,
+            capture: false,
+        };
+        let capture_text = "thread 'main' panicked at src/main.rs:1:1: before stamping\n\
+                            2026-09-19T07:04:02.000Z booting\n\
+                            2026-09-19T07:04:04.000Z 2026-09-19T07:04:03.999Z WARN  engram.store: own line\n";
+        let daemon_text = "2026-09-19T07:04:01.000Z INFO  subc: spawned module_id=engram\n\
+                           2026-09-19T07:04:03.000Z WARN  subc: slow module_id=engram\n";
+        let options = ModuleLogsOptions {
+            lines: 100,
+            follow: false,
+            since: None,
+            tag: None,
+            level: None,
+            lane: None,
+        };
+        let mut counts = LogFilterCounts::default();
+        let mut entries = Vec::new();
+        let mut order = 0;
+        // Capture first, so only the stamps can put the lines in order.
+        collect_log_text(
+            "engram",
+            &capture,
+            capture_text,
+            &options,
+            &mut counts,
+            &mut entries,
+            &mut order,
+        );
+        collect_log_text(
+            "engram",
+            &daemon,
+            daemon_text,
+            &options,
+            &mut counts,
+            &mut entries,
+            &mut order,
+        );
+        sort_log_entries(&mut entries);
+
+        let lines: Vec<&str> = entries.iter().map(|entry| entry.line.as_str()).collect();
+        assert_eq!(
+            lines,
+            vec![
+                "2026-09-19T07:04:01.000Z INFO  subc: spawned module_id=engram",
+                "2026-09-19T07:04:02.000Z booting",
+                "2026-09-19T07:04:03.000Z WARN  subc: slow module_id=engram",
+                "2026-09-19T07:04:04.000Z 2026-09-19T07:04:03.999Z WARN  engram.store: own line",
+                "thread 'main' panicked at src/main.rs:1:1: before stamping",
+            ]
+        );
+        let timestamps: Vec<Option<String>> = entries
+            .iter()
+            .map(|entry| entry.timestamp.map(format_system_time))
+            .collect();
+        assert_eq!(
+            timestamps,
+            vec![
+                Some("1789801441.000Z".to_string()),
+                Some("1789801442.000Z".to_string()),
+                Some("1789801443.000Z".to_string()),
+                // The capture stamp, not the module's own claim a millisecond
+                // earlier.
+                Some("1789801444.000Z".to_string()),
+                None,
+            ],
+            "a stamped line is dated by its stamp; an unstamped one gets no time"
+        );
+        // The module's own fleet line after the stamp still carries its level
+        // and component for `--level` and `--tag`.
+        assert_eq!(entries[3].level, Some(ParsedLevel::Warn));
+        assert_eq!(entries[3].tag.as_deref(), Some("store"));
+        assert_eq!(counts.unparsed, 2, "the plain capture lines have no level");
+    }
+
+    #[test]
+    fn stderr_tail_lines_show_the_capture_time_only_when_the_daemon_sent_one() {
+        assert_eq!(
+            stderr_entry_line(&serde_json::json!({
+                "kind": "line", "text": "boom", "at_ms": 1_789_801_440_685u64
+            })),
+            "2026-09-19T07:04:00.685Z boom"
+        );
+        assert_eq!(
+            stderr_entry_line(&serde_json::json!({
+                "kind": "line", "text": "boo", "truncated": true, "at_ms": 1_789_801_440_685u64
+            })),
+            "2026-09-19T07:04:00.685Z boo [truncated]"
+        );
+        // An older daemon sends no time; none is supplied in its place.
+        assert_eq!(
+            stderr_entry_line(&serde_json::json!({"kind": "line", "text": "boom"})),
+            "boom"
+        );
     }
 
     /// An r2 line the r2 parser refused (here: an ANSI escape, which r2
@@ -9892,11 +10064,13 @@ mod tests {
                 StderrTailEntry::Line {
                     text: "first".to_string(),
                     truncated: false,
+                    at_ms: None,
                 },
                 StderrTailEntry::ProcessStart,
                 StderrTailEntry::Line {
                     text: "last".to_string(),
                     truncated: false,
+                    at_ms: Some(1_789_801_440_685),
                 },
             ],
             dropped_lines: 3,

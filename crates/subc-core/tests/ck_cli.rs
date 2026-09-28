@@ -1900,6 +1900,77 @@ async fn module_logs_merges_sources_by_timestamp_and_reports_real_filter_counts(
     );
 }
 
+/// The daemon stamps each capture line with the moment it read it, so the
+/// stderr lane interleaves with the daemon's and the module's own lines by
+/// time. A capture file begun before that has unstamped lines at its top;
+/// they are still shown, and still undated, rather than given a time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn module_logs_orders_stamped_capture_lines_by_stamp_and_keeps_unstamped_ones() {
+    let module_id = "stamped-capture";
+    let data_home = unique_temp_dir("ck-module-logs-stamped-data");
+    let runtime_dir = unique_temp_dir("ck-module-logs-stamped-runtime");
+    let config_home = unique_temp_dir("ck-module-logs-stamped-config");
+    let module_logs = data_home.join("cortexkit").join(module_id).join("logs");
+    let run_logs = data_home.join("cortexkit").join("run").join("logs");
+    fs::create_dir_all(&module_logs).unwrap();
+    fs::create_dir_all(&run_logs).unwrap();
+    fs::write(
+        module_logs.join(format!("{module_id}.2026-09-19.log")),
+        format!("2026-09-19T07:04:03.000Z INFO  {module_id}: module line\n"),
+    )
+    .unwrap();
+    fs::write(
+        run_logs.join(format!("{module_id}.stderr.log")),
+        concat!(
+            // Written by a daemon that did not stamp capture lines yet.
+            "old unstamped line\n",
+            "2026-09-19T07:04:02.000Z first stamped line\n",
+            "2026-09-19T07:04:05.000Z second stamped line\n",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        run_logs.join("subc.2026-09-19.log"),
+        format!(
+            "2026-09-19T07:04:01.000Z INFO  subc: spawned module_id={module_id}\n\
+             2026-09-19T07:04:04.000Z WARN  subc: slow module_id={module_id}\n"
+        ),
+    )
+    .unwrap();
+    let daemon = ScriptedDaemon::start(
+        "ck-module-logs-stamped",
+        vec![ScriptedControlStep {
+            expected: ClientControlRequest::SupervisorList {},
+            action: ScriptedControlAction::Reply(Box::new(ClientControlResponse::SupervisorList {
+                generation: 1,
+                modules: vec![scripted_supervisor_entry(module_id, None)],
+            })),
+        }],
+    )
+    .await;
+
+    let output = ck_command()
+        .args(["module", "logs", module_id, "-n", "20", "--subc"])
+        .arg(&daemon.connection_file_path)
+        .env("XDG_DATA_HOME", &*data_home)
+        .env("XDG_RUNTIME_DIR", &*runtime_dir)
+        .env("XDG_CONFIG_HOME", &*config_home)
+        .output()
+        .unwrap();
+    assert_exit(&output, 0);
+    assert_eq!(
+        text(&output.stdout),
+        concat!(
+            "daemon       2026-09-19T07:04:01.000Z INFO  subc: spawned module_id=stamped-capture\n",
+            "stderr       2026-09-19T07:04:02.000Z first stamped line\n",
+            "mod          2026-09-19T07:04:03.000Z INFO  stamped-capture: module line\n",
+            "daemon       2026-09-19T07:04:04.000Z WARN  subc: slow module_id=stamped-capture\n",
+            "stderr       2026-09-19T07:04:05.000Z second stamped line\n",
+            "stderr       old unstamped line\n",
+        )
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn module_logs_empty_states_are_verbatim() {
     let data_home = unique_temp_dir("ck-module-logs-empty");

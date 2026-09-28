@@ -6,7 +6,7 @@ use subc_control::{
     SupervisorEntry, TerminalDisposition,
 };
 use subc_daemon::{
-    stderr_tail::{CaptureState, StderrTailSnapshot, TailEntry},
+    stderr_tail::{split_capture_stamp, CaptureState, StderrTailSnapshot, TailEntry},
     ModuleSpec, ModuleState, ModuleStatus, Registry, RestartPolicy, SuperviseError,
     SupervisedModule, Supervisor, SupervisorHandle, SupervisorProcessLiveness,
 };
@@ -1212,8 +1212,17 @@ async fn child_stdout_and_stderr_reach_the_capture_file_while_only_stderr_reache
         );
         sleep(Duration::from_millis(10)).await;
     };
+    // Each file line is the capture stamp, one space, then the module's line.
+    let module_lines = contents
+        .lines()
+        .map(|line| {
+            split_capture_stamp(line)
+                .unwrap_or_else(|| panic!("capture line without a stamp: {line:?}"))
+                .1
+        })
+        .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(
-        contents.lines().collect::<std::collections::BTreeSet<_>>(),
+        module_lines,
         std::collections::BTreeSet::from(["stderr-complete-line", "stdout-complete-line"]),
         "each complete source line must remain intact"
     );
@@ -1270,6 +1279,9 @@ async fn concurrent_child_pipes_never_tear_a_line_in_the_capture_file() {
     };
 
     for line in contents.lines() {
+        let Some((_, line)) = split_capture_stamp(line) else {
+            panic!("capture line without a stamp: {line:?}");
+        };
         // A whole line is `<lane>-<4 digits>-` followed by 64 identical
         // padding characters; any split leaves a short line or two prefixes in
         // one. Checked structurally rather than by counting characters, since

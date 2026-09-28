@@ -42,12 +42,21 @@ use tokio_util::sync::CancellationToken;
 
 const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
 pub const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(30);
-// Sized against the daemon's route.bind relay timeout (12s default): one
-// load-stalled bind relay burns ~12s before the daemon rejects with
-// module_timeout, so a 10s budget could be exhausted by a SINGLE slow bind.
-// 30s leaves room for ~2 full relay waits plus backoff (still clamped by the
-// overall call timeout below).
-pub const DEFAULT_ROUTE_RETRY_DEADLINE: Duration = Duration::from_secs(30);
+// Sized against a real module restart, not a single bind: the daemon drains the
+// module's routes (up to 30s), waits for the old process to stop (up to its stop
+// budget, 25s by default), then boots the new one. A measured prefrontal-core
+// restart kept route.open refused for 62.5s end to end, which a 30s budget gave
+// up on halfway through. 90s covers that window with room for a slow boot. The
+// retries still end at the call's own deadline (`CallOptions::timeout`) when
+// that comes first, so a caller that wants to ride out a restart raises both.
+pub const DEFAULT_ROUTE_RETRY_DEADLINE: Duration = Duration::from_secs(90);
+/// The most route.open requests a consumer keeps outstanding on its connection.
+/// Mirrors the daemon's `MAX_PENDING_ROUTE_OPENS_PER_CONNECTION`
+/// (`crates/subc-daemon/src/server.rs`): the daemon refuses every open beyond
+/// that many with a retryable `target_unavailable`, so sending more at once only
+/// manufactures refusals. Extra opens wait here, first come first served, and the
+/// wait counts against the same deadline as retrying refusals.
+pub const MAX_ROUTE_OPENS_IN_FLIGHT: usize = 8;
 const DEFAULT_RESTORED_DEBOUNCE: Duration = Duration::from_millis(250);
 pub const DEFAULT_LIVENESS_PROBE_WINDOW: Duration = Duration::from_secs(2);
 const EGRESS_BUFFER: usize = 128;
@@ -321,6 +330,8 @@ fn release_reverse_request_registry(handle: RouteHandle) {
 }
 
 /// Capped exponential backoff used for reconnects and transient route-open retry.
+/// Each delay is jittered before it is slept: half of it is kept and the other
+/// half is random.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetryBackoff {
     pub base: Duration,
@@ -989,7 +1000,7 @@ impl SubcConsumer {
 
         let terminal = self
             .shared
-            .control_call(body, deadline, true, reverse_requests.clone())
+            .paced_route_open(body, deadline, reverse_requests.clone())
             .await?;
         let (generation, body) = match terminal {
             TerminalFrame::Response {
@@ -1828,9 +1839,12 @@ impl CallError {
     /// `detail.reason = "required_capability_unprovided"`.
     ///
     /// When retryable refusals ran out the route-retry deadline, this is the
-    /// LAST refusal seen, so a caller can tell "the target stayed warming for
-    /// the whole window" from "the connection failed". The failure is still
-    /// `NotSent`: a refused route.open never delivered the request.
+    /// most informative refusal seen during the retries, so a caller can tell
+    /// "the module was reloading" from "the connection failed". Refusals rank:
+    /// `module_reloading` / `module_warming`, then `delegation_not_registered`,
+    /// then admission pressure (too many binds in flight), then anything else;
+    /// at equal rank the later one wins. The failure is still `NotSent`: a
+    /// refused route.open never delivered the request.
     pub fn route_open_refusal(&self) -> Option<&ErrorBody> {
         match self {
             Self::NotSent(err) => err
@@ -1894,23 +1908,125 @@ impl Error for CallError {
 /// A route.open the daemon refused, kept typed inside [`CallError::NotSent`]
 /// so the refusal's code and `detail` survive. Read it through
 /// [`CallError::route_open_refusal`].
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct RouteOpenRefused {
     target: String,
     body: ErrorBody,
+    /// The last refusal of a retry loop, when it is not `body`: kept so the
+    /// message still says what the daemon answered most recently.
+    most_recent: Option<ErrorBody>,
 }
 
 impl fmt::Display for RouteOpenRefused {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "route.open failed for target {}: {} ({})",
-            self.target, self.body.code, self.body.message
-        )
+            "route.open failed for target {}: {}",
+            self.target,
+            DescribeRefusal(&self.body)
+        )?;
+        if let Some(most_recent) = &self.most_recent {
+            write!(
+                f,
+                "; the most recent refusal was {}",
+                DescribeRefusal(most_recent)
+            )?;
+        }
+        Ok(())
     }
 }
 
 impl Error for RouteOpenRefused {}
+
+/// A refusal as `code (reason r) (message)`, the reason read from
+/// `detail.reason` and omitted when the daemon sent none.
+struct DescribeRefusal<'a>(&'a ErrorBody);
+
+impl fmt::Display for DescribeRefusal<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0.code)?;
+        if let Some(reason) = refusal_reason(self.0) {
+            write!(f, " (reason {reason})")?;
+        }
+        write!(f, " ({})", self.0.message)
+    }
+}
+
+fn refusal_reason(body: &ErrorBody) -> Option<&str> {
+    body.detail.as_ref()?.get("reason")?.as_str()
+}
+
+/// The daemon's reasons for refusing a route.open because too many binds are
+/// already in flight, on the consumer's connection or towards the target module
+/// (`crates/subc-daemon/src/control.rs`, `route_open_capacity_refusal` and
+/// `route_open_target_capacity_refusal`). Both are sent as `target_unavailable`.
+const ADMISSION_PRESSURE_REASONS: [&str; 2] = ["open_admission_full", "target_binds_full"];
+/// Markers in the messages of those same admission-pressure refusals. The
+/// daemon currently logs the reason but leaves it out of the refusal's detail,
+/// so the message is the only way to recognise them.
+const ADMISSION_PRESSURE_MESSAGES: [&str; 2] =
+    ["route.open binds in flight", "route.bind relays in flight"];
+
+/// How much a route.open refusal says about why the target was unreachable,
+/// highest first: the module was changing state (reloading or warming); a
+/// delegation was not registered; admission pressure; anything else.
+fn route_open_refusal_rank(body: &ErrorBody) -> u8 {
+    if body.code == error_codes::MODULE_RELOADING || body.code == error_codes::MODULE_WARMING {
+        return 3;
+    }
+    let reason = refusal_reason(body);
+    if body.code == "delegation_not_registered" || reason == Some("delegation_not_registered") {
+        return 2;
+    }
+    if body.code == error_codes::TARGET_UNAVAILABLE {
+        let admission_pressure = match reason {
+            Some(reason) => ADMISSION_PRESSURE_REASONS.contains(&reason),
+            None => ADMISSION_PRESSURE_MESSAGES
+                .iter()
+                .any(|marker| body.message.contains(marker)),
+        };
+        if admission_pressure {
+            return 1;
+        }
+    }
+    0
+}
+
+/// The route.open refusals one retry loop has seen. When the deadline runs out,
+/// the error is built from the best-ranked one: after a module restart the most
+/// recent refusal is often admission pressure ("8 binds in flight"), which
+/// points a reader at the consumer's concurrency when the module was simply down.
+#[derive(Default)]
+struct RouteOpenRefusals {
+    best: Option<ErrorBody>,
+    /// Set only while the latest refusal ranked below `best`.
+    most_recent: Option<ErrorBody>,
+}
+
+impl RouteOpenRefusals {
+    fn record(&mut self, body: ErrorBody) {
+        // At equal rank the newer refusal wins: it describes the target's latest state.
+        let outranks = self
+            .best
+            .as_ref()
+            .is_none_or(|best| route_open_refusal_rank(&body) >= route_open_refusal_rank(best));
+        if outranks {
+            self.best = Some(body);
+            self.most_recent = None;
+        } else {
+            self.most_recent = Some(body);
+        }
+    }
+
+    fn into_error(self, target: String) -> Option<CallError> {
+        let body = self.best?;
+        Some(CallError::NotSent(Box::new(RouteOpenRefused {
+            target,
+            body,
+            most_recent: self.most_recent,
+        })))
+    }
+}
 
 /// The label a route.open refusal names its target by, the same spelling the
 /// managed route cache uses.
@@ -1927,7 +2043,11 @@ fn route_target_label(target: &RouteTarget) -> String {
 
 impl CallError {
     fn route_open_refused(target: String, body: ErrorBody) -> Self {
-        Self::NotSent(Box::new(RouteOpenRefused { target, body }))
+        Self::NotSent(Box::new(RouteOpenRefused {
+            target,
+            body,
+            most_recent: None,
+        }))
     }
 }
 
@@ -1981,6 +2101,15 @@ struct Shared {
     /// operator remedies differ: full means the consumer is too slow (widen the
     /// buffer or drain faster), no-receiver means it never subscribed.
     pushes_dropped_receiver_full: AtomicU64,
+    /// Random source in [0, 1) for retry jitter. Tests replace it with a seeded
+    /// one so jittered delays are reproducible.
+    random_unit: Box<dyn Fn() -> f64 + Send + Sync>,
+    /// One permit per route.open the consumer may have outstanding; see
+    /// [`MAX_ROUTE_OPENS_IN_FLIGHT`]. tokio's semaphore grants permits in
+    /// request order, which makes the wait first come first served. The consumer
+    /// holds one connection at a time and a dropped connection fails every open
+    /// in flight on it, so one semaphore is a per-connection limit.
+    route_open_slots: Semaphore,
 }
 
 struct Inner {
@@ -2109,7 +2238,45 @@ impl Shared {
             pushes_dropped_no_receiver: AtomicU64::new(0),
             control_pushes_dropped: AtomicU64::new(0),
             pushes_dropped_receiver_full: AtomicU64::new(0),
+            random_unit: Box::new(default_random_unit),
+            route_open_slots: Semaphore::new(MAX_ROUTE_OPENS_IN_FLIGHT),
         }
+    }
+
+    /// "Equal jitter": keep half of `delay` and randomize the other half. Every
+    /// route on a connection is closed together when its module drains, so
+    /// without jitter they all retry in lock step and reach the daemon as one
+    /// burst each round; reconnects after a daemon restart herd the same way.
+    fn jittered(&self, delay: Duration) -> Duration {
+        let unit = (self.random_unit)();
+        let unit = if unit.is_finite() {
+            unit.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let half = delay / 2;
+        half + half.mul_f64(unit)
+    }
+
+    /// One route.open exchange, paced by [`MAX_ROUTE_OPENS_IN_FLIGHT`]. The
+    /// wait for a free slot ends at `deadline` like the exchange itself.
+    async fn paced_route_open(
+        self: &Arc<Self>,
+        body: Vec<u8>,
+        deadline: Instant,
+        reverse_requests: Option<ReverseRequestRegistry>,
+    ) -> Result<TerminalFrame, CallError> {
+        let _slot = match timeout_at(deadline, self.route_open_slots.acquire()).await {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_)) => return Err(CallError::not_sent("consumer closed")),
+            Err(_) => {
+                return Err(CallError::not_sent(format!(
+                    "deadline elapsed waiting for one of {MAX_ROUTE_OPENS_IN_FLIGHT} route.open slots"
+                )));
+            }
+        };
+        self.control_call(body, deadline, true, reverse_requests)
+            .await
     }
 
     fn lock_inner(&self) -> MutexGuard<'_, Inner> {
@@ -2363,7 +2530,9 @@ impl Shared {
                     if !transient || attempt >= self.opts.reconnect_backoff.max_attempts {
                         break;
                     }
-                    let delay = self.opts.reconnect_backoff.delay_after_attempt(attempt);
+                    // Jittered like the route.open retries, which share this backoff.
+                    let delay =
+                        self.jittered(self.opts.reconnect_backoff.delay_after_attempt(attempt));
                     tokio::select! {
                         () = self.close_token.cancelled() => return Err(ConsumerError::Closed),
                         () = sleep(delay) => {}
@@ -2548,18 +2717,19 @@ impl Shared {
     ) -> Result<RouteState, CallError> {
         let route_deadline = (Instant::now() + opts.route_retry_deadline).min(call_deadline);
         let mut attempt = 0usize;
-        // The most recent retryable refusal. When the deadline ends the retries,
-        // the caller gets this refusal rather than a bare "deadline elapsed", so
-        // "the target stayed warming the whole time" stays distinguishable from
-        // "the connection failed".
-        let mut last_refusal: Option<ErrorBody> = None;
-        let expired =
-            |err: CallError, last_refusal: &mut Option<ErrorBody>| match last_refusal.take() {
-                Some(body) if err.is_not_sent() && Instant::now() >= route_deadline => {
-                    CallError::route_open_refused(key.target_label(), body)
+        // The retryable refusals seen so far. When the deadline ends the retries,
+        // the caller gets the most informative of them rather than a bare
+        // "deadline elapsed", so "the module was reloading" stays
+        // distinguishable from "the connection failed".
+        let mut refusals = RouteOpenRefusals::default();
+        let expired = |err: CallError, refusals: &mut RouteOpenRefusals| {
+            if err.is_not_sent() && Instant::now() >= route_deadline {
+                if let Some(refused) = std::mem::take(refusals).into_error(key.target_label()) {
+                    return refused;
                 }
-                _ => err,
-            };
+            }
+            err
+        };
         loop {
             attempt = attempt.saturating_add(1);
             let body = serde_json::to_vec(&ClientControlRequest::RouteOpen {
@@ -2571,10 +2741,9 @@ impl Shared {
             })
             .map_err(|err| CallError::not_sent(format!("failed to encode route.open: {err}")))?;
             match self
-                .control_call(
+                .paced_route_open(
                     body,
                     route_deadline,
-                    true,
                     Some(route_open.reverse_requests.clone()),
                 )
                 .await
@@ -2648,7 +2817,7 @@ impl Shared {
                             // Stale generation / writer gone: fall through to retry.
                         }
                     }
-                    self.sleep_until_retry(route_deadline, opts.route_retry.base)
+                    self.sleep_until_retry(route_deadline, self.jittered(opts.route_retry.base))
                         .await?;
                 }
                 Ok(TerminalFrame::Error { body, .. }) => {
@@ -2657,29 +2826,37 @@ impl Shared {
                     // the capped backoff sums to seconds it strictly dominated
                     // the deadline — the advertised reload patience was never
                     // delivered, and module restarts whose reload exceeded a
-                    // few seconds failed every managed caller. Reloads
-                    // legitimately take tens of seconds (drain alone defaults
-                    // to 30s); capped per-attempt backoff bounds pressure.
-                    if is_retryable_route_open_code(&body.code) && Instant::now() < route_deadline {
-                        let delay = opts.route_retry.delay_after_attempt(attempt);
-                        last_refusal = Some(body);
-                        if let Err(err) = self.sleep_until_retry(route_deadline, delay).await {
-                            return Err(expired(err, &mut last_refusal));
-                        }
-                        continue;
+                    // few seconds failed every managed caller. A restart
+                    // legitimately keeps routes refused for about a minute;
+                    // capped per-attempt backoff bounds pressure.
+                    if !is_retryable_route_open_code(&body.code) {
+                        return Err(CallError::route_open_refused(key.target_label(), body));
                     }
-                    return Err(CallError::route_open_refused(key.target_label(), body));
+                    refusals.record(body);
+                    if Instant::now() >= route_deadline {
+                        // A refusal was just recorded, so the fallback is unreachable.
+                        return Err(std::mem::take(&mut refusals)
+                            .into_error(key.target_label())
+                            .unwrap_or_else(|| {
+                                CallError::not_sent("route.open retry deadline elapsed")
+                            }));
+                    }
+                    let delay = self.jittered(opts.route_retry.delay_after_attempt(attempt));
+                    if let Err(err) = self.sleep_until_retry(route_deadline, delay).await {
+                        return Err(expired(err, &mut refusals));
+                    }
+                    continue;
                 }
                 Ok(TerminalFrame::StreamEnd) => {
                     return Err(CallError::not_sent("route.open returned StreamEnd"));
                 }
                 Err(err) if err.is_not_sent() && Instant::now() < route_deadline => {
-                    let delay = opts.route_retry.delay_after_attempt(attempt);
+                    let delay = self.jittered(opts.route_retry.delay_after_attempt(attempt));
                     if let Err(err) = self.sleep_until_retry(route_deadline, delay).await {
-                        return Err(expired(err, &mut last_refusal));
+                        return Err(expired(err, &mut refusals));
                     }
                 }
-                Err(err) => return Err(expired(err, &mut last_refusal)),
+                Err(err) => return Err(expired(err, &mut refusals)),
             }
         }
 
@@ -3924,7 +4101,7 @@ struct SharedCallFailure {
     /// A route.open refusal travels typed, so every caller sharing this
     /// failure (the single-flight leader and its waiters) still gets
     /// `CallError::route_open_refusal`, not just the message text.
-    refusal: Option<(String, ErrorBody)>,
+    refusal: Option<RouteOpenRefused>,
 }
 
 impl SharedCallFailure {
@@ -3938,9 +4115,7 @@ impl SharedCallFailure {
 
     fn into_call_error(self) -> CallError {
         match (self.kind, self.refusal) {
-            (FailureKind::NotSent, Some((target, body))) => {
-                CallError::route_open_refused(target, body)
-            }
+            (FailureKind::NotSent, Some(refused)) => CallError::NotSent(Box::new(refused)),
             (FailureKind::NotSent, None) => CallError::not_sent(self.message),
             (FailureKind::OutcomeUnknown, _) => CallError::outcome_unknown(self.message),
         }
@@ -3953,9 +4128,7 @@ impl From<CallError> for SharedCallFailure {
             CallError::NotSent(err) => Self {
                 kind: FailureKind::NotSent,
                 message: err.to_string(),
-                refusal: err
-                    .downcast_ref::<RouteOpenRefused>()
-                    .map(|refused| (refused.target.clone(), refused.body.clone())),
+                refusal: err.downcast_ref::<RouteOpenRefused>().cloned(),
             },
             CallError::OutcomeUnknown(err) => Self {
                 kind: FailureKind::OutcomeUnknown,
@@ -4759,6 +4932,17 @@ fn epoch_millis() -> u64 {
 /// have run. A route.open reply that arrives after its waiter gave up is still
 /// cleaned up: `settle_pending` sends that channel a GOODBYE instead of caching
 /// it, so reporting `NotSent` here leaves no route open behind.
+/// A uniform value in [0, 1) for retry jitter. Jitter needs spread, not
+/// unpredictability, so this hashes a counter with std's randomly keyed hasher
+/// instead of taking a dependency on a random-number crate.
+fn default_random_unit() -> f64 {
+    use std::hash::{BuildHasher, RandomState};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let bits = RandomState::new().hash_one(COUNTER.fetch_add(1, Ordering::Relaxed));
+    // The top 53 bits fill an f64 mantissa exactly.
+    (bits >> 11) as f64 / (1u64 << 53) as f64
+}
+
 fn request_not_sent_after_route_open_failure(err: CallError) -> CallError {
     match err {
         CallError::OutcomeUnknown(source) => CallError::not_sent(format!(
@@ -5636,6 +5820,308 @@ mod tests {
         assert_eq!(
             removed_attempts, 1,
             "terminal codes settle on the first answer"
+        );
+    }
+
+    /// splitmix64 over a counter: a seeded stand-in for the consumer's random
+    /// source, so jittered delays are reproducible.
+    fn seeded_random(seed: u64) -> Box<dyn Fn() -> f64 + Send + Sync> {
+        let state = AtomicU64::new(seed);
+        Box::new(move || {
+            let mut z = state
+                .fetch_add(0x9E37_79B9_7F4A_7C15, Ordering::Relaxed)
+                .wrapping_add(0x9E37_79B9_7F4A_7C15);
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^= z >> 31;
+            (z >> 11) as f64 / (1u64 << 53) as f64
+        })
+    }
+
+    /// A consumer wired to an in-memory writer, standing in for a daemon that
+    /// the test answers by hand.
+    fn route_open_stand_in(
+        random_unit: Box<dyn Fn() -> f64 + Send + Sync>,
+    ) -> (Arc<Shared>, Arc<SubcConsumer>, mpsc::Receiver<WriteCommand>) {
+        let mut shared = Shared::new(
+            PathBuf::from("/tmp/does-not-exist"),
+            ConsumerOptions::default(),
+        );
+        shared.random_unit = random_unit;
+        let shared = Arc::new(shared);
+        let (writer, receiver) = mpsc::channel(64);
+        shared.lock_inner().writer = Some(writer);
+        let consumer = Arc::new(SubcConsumer {
+            shared: Arc::clone(&shared),
+        });
+        (shared, consumer, receiver)
+    }
+
+    fn restart_target(module_id: &str) -> RouteTarget {
+        RouteTarget::ToolProvider {
+            module_id: module_id.to_string(),
+        }
+    }
+
+    fn restart_identity() -> BindIdentity {
+        BindIdentity::new(
+            PathBuf::from("/tmp/project"),
+            "test".to_string(),
+            "restart".to_string(),
+        )
+    }
+
+    /// The daemon's answer to one route.open: accept it on `channel`, or refuse
+    /// it with `refusal`.
+    fn route_open_answer(corr: u64, channel: u16, refusal: Option<ErrorBody>) -> Frame {
+        match refusal {
+            None => response_frame(
+                0,
+                0,
+                corr,
+                serde_json::to_vec(&ClientControlResponse::RouteOpen {
+                    route_channel: channel,
+                    route_epoch: 1,
+                })
+                .unwrap(),
+            ),
+            Some(body) => Frame::build(
+                FrameType::Error,
+                Flags::new(false, Priority::Interactive, false),
+                0,
+                0,
+                corr,
+                serde_json::to_vec(&body).unwrap(),
+            )
+            .unwrap(),
+        }
+    }
+
+    /// Answer every route.open the consumer writes, as `answer` decides from the
+    /// open's target module, until `task` finishes.
+    async fn answer_route_opens<T>(
+        shared: &Arc<Shared>,
+        receiver: &mut mpsc::Receiver<WriteCommand>,
+        task: &mut JoinHandle<T>,
+        mut answer: impl FnMut(&str) -> Option<ErrorBody>,
+    ) -> T {
+        let mut next_channel = 40u16;
+        loop {
+            tokio::select! {
+                command = receiver.recv() => {
+                    let Some(command) = command else {
+                        return (&mut *task).await.unwrap();
+                    };
+                    let request: serde_json::Value =
+                        serde_json::from_slice(&command.frame.body).unwrap();
+                    let module_id = request["target"]["module_id"].as_str().unwrap().to_string();
+                    next_channel += 1;
+                    let frame = route_open_answer(
+                        command.frame.header.corr,
+                        next_channel,
+                        answer(&module_id),
+                    );
+                    assert!(dispatch_frame(shared, 1, frame).await);
+                }
+                joined = &mut *task => return joined.unwrap(),
+            }
+        }
+    }
+
+    fn reloading() -> ErrorBody {
+        ErrorBody::new(error_codes::MODULE_RELOADING, "module is reloading")
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_default_retry_deadline_outlasts_a_60s_restart_and_the_open_succeeds() {
+        let (shared, consumer, mut receiver) = route_open_stand_in(seeded_random(1));
+        let started = Instant::now();
+        // A call deadline past the retry deadline, so the retry deadline is
+        // the one under test.
+        let options = CallOptions {
+            timeout: Duration::from_secs(120),
+            ..CallOptions::default()
+        };
+        let mut task = tokio::spawn(async move {
+            consumer
+                .open_route(restart_target("restarting"), restart_identity(), options)
+                .await
+        });
+        let opened = answer_route_opens(&shared, &mut receiver, &mut task, |_| {
+            (started.elapsed() < Duration::from_secs(60)).then(reloading)
+        })
+        .await;
+        let handle =
+            opened.unwrap_or_else(|err| panic!("the open must survive the restart: {err}"));
+        assert!(handle.channel > 40);
+        assert!(started.elapsed() >= Duration::from_secs(60));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_call_timeout_shorter_than_the_retry_deadline_ends_the_retries_at_the_call_timeout() {
+        let (shared, consumer, mut receiver) = route_open_stand_in(seeded_random(2));
+        let started = Instant::now();
+        let options = CallOptions {
+            timeout: Duration::from_secs(10),
+            ..CallOptions::default()
+        };
+        let mut task = tokio::spawn(async move {
+            consumer
+                .open_route(restart_target("restarting"), restart_identity(), options)
+                .await
+        });
+        let err = answer_route_opens(&shared, &mut receiver, &mut task, |_| {
+            (started.elapsed() < Duration::from_secs(60)).then(reloading)
+        })
+        .await
+        .expect_err("the call timeout must end the retries before the module is back");
+        let elapsed = started.elapsed();
+        assert!(matches!(err, CallError::NotSent(_)), "got {err:?}");
+        assert!(
+            elapsed >= Duration::from_secs(9) && elapsed <= Duration::from_secs(10),
+            "the retries must stop at the 10s call timeout, stopped after {elapsed:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn two_routes_refused_together_retry_at_different_jittered_times() {
+        let (shared, consumer, mut receiver) = route_open_stand_in(seeded_random(42));
+        let started = Instant::now();
+        let mut task = tokio::spawn(async move {
+            let alpha = consumer.open_route(
+                restart_target("alpha"),
+                restart_identity(),
+                CallOptions::default(),
+            );
+            let beta = consumer.open_route(
+                restart_target("beta"),
+                restart_identity(),
+                CallOptions::default(),
+            );
+            let (alpha, beta) = tokio::join!(alpha, beta);
+            (alpha.is_ok(), beta.is_ok())
+        });
+        let mut first_open = HashMap::<String, Duration>::new();
+        let mut retried_at = HashMap::<String, Duration>::new();
+        let opened = answer_route_opens(&shared, &mut receiver, &mut task, |module_id| {
+            let at = started.elapsed();
+            if first_open.contains_key(module_id) {
+                retried_at.insert(module_id.to_string(), at);
+                None
+            } else {
+                first_open.insert(module_id.to_string(), at);
+                Some(reloading())
+            }
+        })
+        .await;
+        assert_eq!(opened, (true, true));
+        assert_eq!(first_open["alpha"], first_open["beta"], "refused together");
+        // Equal jitter keeps half of the 100ms base delay and randomizes the rest.
+        for at in retried_at.values() {
+            assert!(
+                *at >= Duration::from_millis(50) && *at <= Duration::from_millis(100),
+                "retry at {at:?} is outside the jitter window"
+            );
+        }
+        assert_ne!(
+            retried_at["alpha"], retried_at["beta"],
+            "routes refused together must not retry in lock step"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn twenty_concurrent_opens_never_have_more_than_eight_outstanding_at_the_daemon() {
+        let (shared, consumer, mut receiver) = route_open_stand_in(seeded_random(3));
+        let mut task = tokio::spawn(async move {
+            let mut opens = tokio::task::JoinSet::new();
+            for i in 0..20 {
+                let consumer = Arc::clone(&consumer);
+                opens.spawn(async move {
+                    consumer
+                        .open_route(
+                            restart_target(&format!("module-{i}")),
+                            restart_identity(),
+                            CallOptions::default(),
+                        )
+                        .await
+                });
+            }
+            let mut opened = 0usize;
+            while let Some(result) = opens.join_next().await {
+                result.unwrap().unwrap();
+                opened += 1;
+            }
+            opened
+        });
+        // Hold every open until the consumer has gone quiet, so everything it
+        // is willing to send at once is outstanding together; then answer them.
+        let mut held = Vec::new();
+        let mut max_outstanding = 0usize;
+        let mut next_channel = 40u16;
+        let opened = loop {
+            tokio::select! {
+                command = receiver.recv() => {
+                    // The writer closes when the last consumer handle drops,
+                    // which means every open has settled.
+                    let Some(command) = command else {
+                        break (&mut task).await.unwrap();
+                    };
+                    held.push(command.frame.header.corr);
+                    max_outstanding = max_outstanding.max(held.len());
+                }
+                () = sleep(Duration::from_millis(25)), if !held.is_empty() => {
+                    for corr in held.drain(..) {
+                        next_channel += 1;
+                        assert!(dispatch_frame(&shared, 1, route_open_answer(corr, next_channel, None)).await);
+                    }
+                }
+                joined = &mut task => break joined.unwrap(),
+            }
+        };
+        assert_eq!(opened, 20);
+        assert_eq!(max_outstanding, MAX_ROUTE_OPENS_IN_FLIGHT);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_exhausted_deadline_names_module_reloading_not_the_later_admission_pressure() {
+        let (shared, consumer, mut receiver) = route_open_stand_in(seeded_random(4));
+        let options = CallOptions {
+            route_retry_deadline: Duration::from_secs(5),
+            ..CallOptions::default()
+        };
+        let mut task = tokio::spawn(async move {
+            consumer
+                .open_route(restart_target("restarting"), restart_identity(), options)
+                .await
+        });
+        let mut opens = 0usize;
+        let err = answer_route_opens(&shared, &mut receiver, &mut task, |_| {
+            opens += 1;
+            Some(if opens <= 2 {
+                reloading().with_detail(serde_json::json!({ "reason": "restart" }))
+            } else {
+                ErrorBody::new(
+                    error_codes::TARGET_UNAVAILABLE,
+                    "connection already has 8 route.open binds in flight (limit 8); retry after one settles",
+                )
+            })
+        })
+        .await
+        .expect_err("the module never comes back");
+        assert!(opens > 2);
+        assert!(matches!(err, CallError::NotSent(_)), "got {err:?}");
+        assert_eq!(
+            err.route_open_refusal().map(|body| body.code.as_str()),
+            Some(error_codes::MODULE_RELOADING)
+        );
+        let message = err.to_string();
+        assert!(
+            message.starts_with(
+                "request not sent: route.open failed for target tool_provider:restarting: \
+                 module_reloading (reason restart) (module is reloading); \
+                 the most recent refusal was target_unavailable"
+            ),
+            "got {message}"
         );
     }
 

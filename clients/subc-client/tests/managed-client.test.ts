@@ -1368,8 +1368,8 @@ describe("managed route.open across a module restart", () => {
     try {
       const error = await client.call("restarting", "echo", {}).catch((err: unknown) => err);
       expect(opens).toBeGreaterThan(2);
-      // The code and class still come from the most recent refusal; only the
-      // description changes.
+      // The error's kind and code still come from the most recent refusal;
+      // only the description changes.
       expect(error).toMatchObject({ kind: "not_sent", code: "target_unavailable" });
       expect((error as Error).message).toStartWith(
         "route.open failed for module restarting: module_reloading (reason restart): module is reloading",

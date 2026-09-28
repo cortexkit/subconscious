@@ -2155,8 +2155,9 @@ function equalJitter(delayMs: number, random: () => number): number {
 // (crates/subc-daemon/src/control.rs, route_open_capacity_refusal and
 // route_open_target_capacity_refusal). Both are sent as target_unavailable.
 const ROUTE_OPEN_ADMISSION_PRESSURE_REASONS = new Set(["open_admission_full", "target_binds_full"]);
-// The same refusals as their messages read. The daemon currently logs the reason
-// but does not put it in the refusal's detail, so the message is the only mark.
+// Matches the messages of those same admission-pressure refusals. The daemon
+// currently logs the reason but leaves it out of the refusal's detail, so the
+// message is the only way to recognise them.
 const ROUTE_OPEN_ADMISSION_PRESSURE_MESSAGE = /route\.open binds in flight|route\.bind relays in flight/;
 
 function refusalReason(refusal: SubcError): string | undefined {

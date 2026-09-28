@@ -42,9 +42,11 @@ inside the caller's window, and that caller owns its own retry.
 
 Everything else (`bad_consumer_identity`, `invalid_project_root`, …) is
 permanent and fails immediately. Retries stop at a deadline — TS
-`ROUTE_OPEN_RETRY_DEADLINE_MS` = 30s inside managed `call()`; Rust's
-`route_retry_deadline` defaults to 30s and is configurable per call, with an
-optional `max_attempts` that can stop earlier. Scope note: the retry loop
+`ROUTE_OPEN_RETRY_DEADLINE_MS` = 90s inside managed `call()`, or the call's
+`timeoutMs` when that comes first; Rust's `route_retry_deadline` defaults to
+90s and is configurable per call, and the call's own `timeout` ends the retries
+when it comes first. 90s covers a whole module restart (drain, stop, boot; one
+was measured at 62.5s). Scope note: the retry loop
 lives in the MANAGED call path in both SDKs; TS `routeOpen()` called directly
 performs one RPC and does not retry.
 

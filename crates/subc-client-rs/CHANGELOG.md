@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.22.0 — 2026-09-28
+
+- `DEFAULT_ROUTE_RETRY_DEADLINE` is 90s instead of 30s. A module restart drains its routes (up to
+  30s), waits for the old process to stop, then boots the new one; one measured restart kept
+  routes refused for 62.5s. The retries still end at `CallOptions::timeout` when that comes
+  first, and its default is still 30s, so a caller that wants to ride out a restart raises both.
+- Retry delays are jittered ("equal jitter": half of each delay is kept, half is random), so
+  routes refused together no longer retry in lock step. `RetryBackoff` is shared by route.open
+  retries and reconnects, so reconnect delays are jittered too.
+- At most `MAX_ROUTE_OPENS_IN_FLIGHT` (8) route.open requests are outstanding per consumer
+  connection, matching the daemon's per-connection limit. Further opens, managed and admitted,
+  wait their turn in order, and the wait counts against the same deadline as the open.
+- When the retry deadline runs out, `CallError::route_open_refusal()` is the most informative
+  refusal seen during the retries instead of the last one: `module_reloading` / `module_warming`
+  first, then `delegation_not_registered`, then admission pressure (too many binds in flight),
+  then anything else. The error stays `NotSent`. Its message names the refusal's `detail.reason`
+  when present, and the most recent refusal after it when that differs.
+
 ## 0.19.4 — 2026-09-24
 
 - `SpawnStreamError`'s three coded variants carry `body: Box<ErrorBody>` instead of an inline

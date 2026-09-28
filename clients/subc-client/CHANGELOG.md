@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.17.0 — 2026-09-28
+
+- Managed calls now keep retrying a retryable `route.open` refusal for up to 90s instead of 30s (`ROUTE_OPEN_RETRY_DEADLINE_MS`). A module restart drains its routes (up to 30s), waits for the old process to stop, then boots the new one; one measured restart kept routes refused for 62.5s, which the old deadline gave up on. A call that passes `timeoutMs` stops retrying at that timeout when it comes first, and a call waiting on another call's in-flight open of the same route also stops at its own `timeoutMs`.
+- Retry delays between refused `route.open` attempts are jittered ("equal jitter": half the delay is kept, half is random), so routes refused together no longer retry in lock step. The new `random` connect option injects the random source and `now` injects the clock for tests. Reconnect backoff is unchanged.
+- At most `MAX_ROUTE_OPENS_IN_FLIGHT` (8) `route.open` requests are outstanding per connection, matching the daemon's per-connection limit. Further opens wait their turn in order, and a managed open's wait counts against its retry deadline. Before, a burst of opens after a restart exceeded the limit and the daemon refused the excess.
+- When the retry deadline runs out, the error message now describes the most informative refusal seen during the retries (`module_reloading` / `module_warming` first, then `delegation_not_registered`, then admission pressure such as "8 binds in flight", then anything else), including its `detail.reason`, and names the most recent refusal after it when that differs. The error's `kind` (`not_sent`), `code` and `cause` are still those of the most recent refusal.
+- Export `isRetryableRouteOpenCode` from the package entry, so consumers with their own retry loop share the classification instead of copying it.
+
 ## 0.16.1 — 2026-09-24
 
 - Export `UNKNOWN_CHANNEL`, `STALE_ROUTE_EPOCH`, and `isEstablishedRouteDead(flags, code)` for evict/reopen/resend-once decisions. The managed consumer and provider use the shared predicate without changing their current retry or `not_sent` behavior. The golden table records daemon-origin flags but does not enforce them until all compatible daemons emit the bit.

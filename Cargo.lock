@@ -255,7 +255,7 @@ dependencies = [
 
 [[package]]
 name = "ck-bus"
-version = "0.1.24"
+version = "0.1.25"
 dependencies = [
  "async-nats",
  "async-trait",
@@ -1811,7 +1811,7 @@ dependencies = [
 
 [[package]]
 name = "subc-client-rs"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "async-trait",
  "serde",

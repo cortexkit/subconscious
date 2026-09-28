@@ -65,6 +65,48 @@ final class SubcFedClientCallRaceTests: XCTestCase {
         XCTAssertEqual(body, Data("{\"ok\":true}".utf8))
     }
 
+    /// A slow call must be attributable. Time that passes while the request is
+    /// on the wire, and before the reply's bytes arrive, is the network's (and the
+    /// peer's) share; it must land in `roundTripMs` and nowhere else, and the
+    /// timings must be filed under the call's kind. The phone uses exactly this
+    /// split to tell "the reply was late" from "we were slow handling it".
+    func testCallTimingsAttributeWireTimeToTheRoundTrip() async throws {
+        let clock = FedFakeClock(nowNanoseconds: 1_000_000_000)
+        let transport = GatedMgmtTransport()
+        let engine = try makeEngine(transport: transport)
+        let client = try await makeReadyClient(transport: transport, engine: engine, clock: clock)
+        defer { Task { await client.disconnect() } }
+        await transport.armGate()
+        let target = try FedManagementTarget(moduleID: "prefrontal-core")
+
+        let mutation = Task {
+            try await client.callManagement(
+                target: target,
+                method: "ask.persist_answer",
+                params: FedJSONObject(["answer": .string("yes")])
+            )
+        }
+        try await waitForCondition { await transport.requestSent }
+        clock.advance(byMilliseconds: 7_000)
+        await transport.enqueueInbound(try await terminalResponseBytes(
+            transport: transport, body: Data("{\"ok\":true}".utf8)
+        ))
+        try await waitForCondition { await transport.deliveredCount >= 1 }
+        await transport.releaseGate()
+        _ = try await withTimeout(3_000_000_000) { try await mutation.value }
+
+        let timings = await client.lastMutationTimings
+        XCTAssertEqual(timings?.method, "ask.persist_answer")
+        XCTAssertEqual(timings?.isMutation, true)
+        XCTAssertEqual(timings?.roundTripMs, 7_000, "wire time belongs to the round trip")
+        XCTAssertEqual(timings?.admitMs, 0)
+        XCTAssertEqual(timings?.queuedMs, 0)
+        XCTAssertEqual(timings?.terminalMs, 0)
+        XCTAssertEqual(timings?.totalMs, 7_000)
+        let pureBefore = await client.lastPureCallTimings
+        XCTAssertNil(pureBefore, "a mutation is not filed as a pure call")
+    }
+
     func testFastResponseBeforeRegisterIsMatchedNotDiscarded() async throws {
         let transport = GatedMgmtTransport()
         let engine = try makeEngine(transport: transport)
@@ -482,7 +524,8 @@ final class SubcFedClientCallRaceTests: XCTestCase {
     /// hello/catalog handshake to ready via a concurrent peer simulator.
     private func makeReadyClient(
         transport: GatedMgmtTransport,
-        engine: FedSessionEngine
+        engine: FedSessionEngine,
+        clock: any FedMonotonicClock = SystemFedMonotonicClock()
     ) async throws -> SubcFedClient {
         let profile = try FedPublicTestSupport.humanProfile()
         let factory = RecordingDialFactory { _, _ in
@@ -499,6 +542,7 @@ final class SubcFedClientCallRaceTests: XCTestCase {
             keyStore: try FedPublicTestSupport.keyStore(),
             stateStore: FedMemoryStateStore(),
             observedNetwork: { try! FedPublicTestSupport.observedHomeLAN() },
+            clock: clock,
             dialFactory: factory
         )
         try await withTimeout(5_000_000_000) { try await client.connect() }

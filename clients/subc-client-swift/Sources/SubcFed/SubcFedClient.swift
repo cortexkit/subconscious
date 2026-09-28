@@ -118,12 +118,24 @@ public actor SubcFedClient {
     /// Last minted attempt identifier, if any. Pre-carrier refusals leave this nil
     /// for the refused cycle.
     public private(set) var lastAttemptID: String?
+    /// Where the time went in the most recent mutating management call that
+    /// completed (success or failure). Nil until one has.
+    ///
+    /// It exists to split a slow call into "waiting on the peer" and "working
+    /// locally" from the device itself, which no Mac-side log can see.
+    public private(set) var lastMutationTimings: FedCallTimings?
+    /// The same split for the most recent completed pure (read-only) call.
+    public private(set) var lastPureCallTimings: FedCallTimings?
 
     private struct PendingCall {
         let effect: FedEffectID
         let isMutation: Bool
         let permit: FedAdmissionPermit
         let continuation: CheckedContinuation<Data, Error>
+        let method: String
+        let startedAtNs: UInt64
+        let admittedAtNs: UInt64
+        let dispatchStartedAtNs: UInt64
     }
 
     var pendingCallCount: Int { pendingCalls.count }
@@ -274,12 +286,14 @@ public actor SubcFedClient {
         // do NOT write it to the wire yet. On admission failure this throws and
         // the engine has already released/retained the permit, so nothing leaks
         // and no continuation is created.
+        let startedAtNs = clock.nowNanoseconds()
         let prepared = try await session.engine.prepareManagementCall(
             moduleID: target.moduleID,
             method: method,
             params: params,
             policy: policy
         )
+        let admittedAtNs = clock.nowNanoseconds()
 
         // Then register the response continuation under the actor's isolation
         // BEFORE the first network write, and dispatch. Registering first is what
@@ -297,7 +311,11 @@ public actor SubcFedClient {
                         effect: prepared.effect,
                         isMutation: prepared.isMutation,
                         permit: prepared.permit,
-                        continuation: continuation
+                        continuation: continuation,
+                        method: method,
+                        startedAtNs: startedAtNs,
+                        admittedAtNs: admittedAtNs,
+                        dispatchStartedAtNs: clock.nowNanoseconds()
                     )
                     Task { [weak self] in
                         do {
@@ -664,8 +682,11 @@ public actor SubcFedClient {
             while !Task.isCancelled {
                 do {
                     let chunk = try await session.transport.receive()
+                    // Stamped as soon as the bytes arrive, before decoding, so a
+                    // slow call's time splits into the network's share and ours.
+                    let receivedAtNs = await self.clock.nowNanoseconds()
                     let frames = try await session.engine.processInboundBytes(chunk)
-                    await self.handleInboundFrames(frames, session: session)
+                    await self.handleInboundFrames(frames, session: session, receivedAtNs: receivedAtNs)
                 } catch {
                     await self.handleSessionLoss(error)
                     return
@@ -674,7 +695,11 @@ public actor SubcFedClient {
         }
     }
 
-    private func handleInboundFrames(_ frames: [FedFrame], session: FedDialedSession) async {
+    private func handleInboundFrames(
+        _ frames: [FedFrame],
+        session: FedDialedSession,
+        receivedAtNs: UInt64
+    ) async {
         for frame in frames {
             guard frame.knownType == .callFrame else { continue }
             guard let effectValue = frame.header["effect"],
@@ -707,6 +732,15 @@ public actor SubcFedClient {
             let message = frame.terminalMessage
             let hostRefusal = frame.terminalHostRefusal
             await resolvePendingCall(seq: effect.seq) { pending in
+                let handlingStartedAtNs = self.clock.nowNanoseconds()
+                defer {
+                    self.recordTimings(
+                        pending,
+                        receivedAtNs: receivedAtNs,
+                        handlingStartedAtNs: handlingStartedAtNs,
+                        handledAtNs: self.clock.nowNanoseconds()
+                    )
+                }
                 do {
                     let body = try await session.engine.handleInboundTerminal(
                         effect: effect,
@@ -724,6 +758,29 @@ public actor SubcFedClient {
                     return .failure(error)
                 }
             }
+        }
+    }
+
+    private func recordTimings(
+        _ pending: PendingCall,
+        receivedAtNs: UInt64,
+        handlingStartedAtNs: UInt64,
+        handledAtNs: UInt64
+    ) {
+        func ms(_ from: UInt64, _ to: UInt64) -> UInt64 { to >= from ? (to - from) / 1_000_000 : 0 }
+        let timings = FedCallTimings(
+            method: pending.method,
+            isMutation: pending.isMutation,
+            admitMs: ms(pending.startedAtNs, pending.admittedAtNs),
+            roundTripMs: ms(pending.dispatchStartedAtNs, receivedAtNs),
+            queuedMs: ms(receivedAtNs, handlingStartedAtNs),
+            terminalMs: ms(handlingStartedAtNs, handledAtNs),
+            totalMs: ms(pending.startedAtNs, handledAtNs)
+        )
+        if pending.isMutation {
+            lastMutationTimings = timings
+        } else {
+            lastPureCallTimings = timings
         }
     }
 

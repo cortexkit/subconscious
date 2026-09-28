@@ -77,6 +77,9 @@ const CATALOG_UPDATE_TIMEOUT: Duration = Duration::from_secs(10);
 const EGRESS_BUFFER: usize = 64;
 const HANDLER_TASK_CAPACITY: usize = 64;
 const HELLO_CORR: u64 = 1;
+/// How long a closing module waits for its writer to flush the frames still
+/// queued before aborting it; see the serve future in `serve_with_handle`.
+const WRITER_DRAIN_LIMIT: Duration = Duration::from_secs(2);
 static NEXT_MODULE_CONNECTION_TOKEN: AtomicU64 = AtomicU64::new(1);
 
 type RequestKey = (u16, u32, u64);
@@ -213,6 +216,25 @@ impl RequestDispatcher {
             permits: Arc::new(Semaphore::new(HANDLER_TASK_CAPACITY)),
         }
     }
+
+    /// Cancel every request still in flight and refuse ones still waiting for a
+    /// handler slot, as a route's GOODBYE does for that route's requests. Run
+    /// when the connection ends: each request task holds a sender to the egress
+    /// channel, so until they finish the writer never sees the channel close.
+    fn cancel_all(&self) {
+        self.permits.close();
+        let cancelled = match self.in_flight.lock() {
+            Ok(mut guard) => guard.drain().map(|(_, token)| token).collect::<Vec<_>>(),
+            Err(poisoned) => poisoned
+                .into_inner()
+                .drain()
+                .map(|(_, token)| token)
+                .collect(),
+        };
+        for cancellation in cancelled {
+            cancellation.cancel();
+        }
+    }
 }
 
 /// Cloneable handle for module-originated control RPCs on channel 0.
@@ -283,6 +305,18 @@ impl ModuleHandle {
     /// a substitute. The id is a name, never an authority: see [`MachineId`].
     pub fn machine_id(&self) -> Option<&MachineId> {
         self.shared.machine_id.as_ref()
+    }
+
+    /// Resolves once this module's connection to the daemon has closed: after a
+    /// channel-0 GOODBYE, EOF, or a connection error. A module ends its own
+    /// background work on it, so nothing outlives the connection.
+    pub fn closed(&self) -> impl Future<Output = ()> + Send + 'static {
+        self.shared.close_token.clone().cancelled_owned()
+    }
+
+    /// Whether this module's connection to the daemon has closed.
+    pub fn is_closed(&self) -> bool {
+        self.shared.close_token.is_cancelled()
     }
 
     /// Ask the daemon to replace this module's advertised provider roles in place.
@@ -947,7 +981,20 @@ where
             module_loop(read_half, tx, Arc::clone(&handler), serve_handle.clone()).await;
         serve_handle.close_connection();
 
-        let writer_result = writer.await.map_err(SubcModuleError::WriterTask);
+        // module_loop cancelled every request in flight, so a handler that
+        // honours cancellation lets the writer drain and finish. One that
+        // ignores it keeps an egress sender alive, and the writer would wait on
+        // it forever. It must not keep the process alive past its stop: the
+        // daemon gives a module only its stop budget before killing it. So the
+        // writer gets a bounded drain, then is aborted with whatever it holds.
+        let mut writer = writer;
+        let writer_result = match timeout(WRITER_DRAIN_LIMIT, &mut writer).await {
+            Ok(joined) => joined.map_err(SubcModuleError::WriterTask),
+            Err(_) => {
+                writer.abort();
+                Ok(Ok(()))
+            }
+        };
         match (loop_result, writer_result) {
             (Err(loop_err), _) => Err(loop_err),
             (Ok(()), Ok(Ok(()))) => Ok(()),
@@ -983,10 +1030,26 @@ where
     H: ModuleHandler,
 {
     let dispatcher = RequestDispatcher::new();
+    let result = serve_frames(&mut reader, &egress, &handler, &module_handle, &dispatcher).await;
+    dispatcher.cancel_all();
+    result
+}
+
+async fn serve_frames<R, H>(
+    reader: &mut R,
+    egress: &mpsc::Sender<Frame>,
+    handler: &Arc<H>,
+    module_handle: &ModuleHandle,
+    dispatcher: &RequestDispatcher,
+) -> Result<(), SubcModuleError>
+where
+    R: AsyncRead + Unpin,
+    H: ModuleHandler,
+{
     loop {
         let read = tokio::select! {
             () = module_handle.shared.close_token.cancelled() => return Ok(()),
-            read = read_frame(&mut reader) => read,
+            read = read_frame(reader) => read,
         };
         let frame = match read {
             Ok(Some(frame)) => frame,
@@ -1010,8 +1073,8 @@ where
         };
         if !handle_frame(
             frame,
-            &egress,
-            Arc::clone(&handler),
+            egress,
+            Arc::clone(handler),
             dispatcher.clone(),
             module_handle.clone(),
         )
@@ -2403,6 +2466,279 @@ mod tests {
         inner.next_corr = Some(u64::MAX);
         assert_eq!(next_module_control_corr(&mut inner), Some(u64::MAX));
         assert_eq!(next_module_control_corr(&mut inner), None);
+    }
+}
+
+/// How a served module ends when its connection closes, driven against a stand-in
+/// daemon on a real socket so the writer task and its drain are the real ones.
+#[cfg(test)]
+mod module_close_tests {
+    use std::time::Instant;
+
+    use subc_protocol::manifest::ModuleManifest;
+    use subc_test_support::TestTempDir;
+    use subc_transport::{
+        authenticate_server, generate_daemon_id, generate_key, write_atomic, ConnectionInfo,
+        Endpoint, SCHEMA_VERSION,
+    };
+    use tokio::{net::TcpListener, sync::Notify, task::JoinHandle};
+
+    use super::*;
+
+    /// How the test handler treats the one request it is given.
+    #[derive(Clone, Copy)]
+    enum Hold {
+        /// Hold the request open until it is cancelled, then answer.
+        UntilCancelled,
+        /// Hold the request open forever, whatever happens.
+        IgnoringCancellation,
+    }
+
+    struct HoldingHandler {
+        hold: Hold,
+        entered: Arc<Notify>,
+        token: Arc<Mutex<Option<CancellationToken>>>,
+    }
+
+    #[async_trait]
+    impl ModuleHandler for HoldingHandler {
+        async fn handle(&self, ctx: RequestCtx, _body: Vec<u8>) -> HandlerOutcome {
+            *self.token.lock().unwrap() = Some(ctx.cancellation_token());
+            self.entered.notify_one();
+            match self.hold {
+                Hold::UntilCancelled => {
+                    ctx.cancelled().await;
+                    HandlerOutcome::Error {
+                        code: "cancelled".to_string(),
+                        message: "request cancelled".to_string(),
+                    }
+                }
+                Hold::IgnoringCancellation => std::future::pending().await,
+            }
+        }
+    }
+
+    struct Served {
+        daemon: TcpStream,
+        handle: ModuleHandle,
+        serve: JoinHandle<Result<(), SubcModuleError>>,
+        _dir: TestTempDir,
+    }
+
+    /// Serve `handler` against a stand-in daemon that authenticates the module
+    /// and acknowledges its HELLO, then hands the daemon's socket to the test.
+    async fn serve_against_stand_in<H: ModuleHandler>(handler: H) -> Served {
+        let dir = TestTempDir::new("subc-client-rs-module-close");
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let connection = ConnectionInfo {
+            schema: SCHEMA_VERSION,
+            wire_version: None,
+            endpoints: vec![Endpoint {
+                host: "127.0.0.1".to_string(),
+                port: listener.local_addr().unwrap().port(),
+            }],
+            key: generate_key().unwrap(),
+            daemon_id: generate_daemon_id().unwrap(),
+            pid: std::process::id(),
+            daemon_ver: "subc-client-rs-module-close".to_string(),
+        };
+        let path = dir.join("subc-conn.json");
+        write_atomic(&path, &connection).unwrap();
+
+        let manifest = ModuleManifest::builder("close-test", env!("CARGO_PKG_VERSION")).build();
+        let serving =
+            tokio::spawn(async move { serve_with_handle(&path, manifest, handler).await });
+        let (mut daemon, _) = listener.accept().await.unwrap();
+        authenticate_server(
+            &mut daemon,
+            &connection.key,
+            &connection.daemon_id,
+            &connection.daemon_ver,
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        let hello = read_frame(&mut daemon).await.unwrap().unwrap();
+        assert_eq!(hello.header.ty, FrameType::Hello);
+        let ack = ModuleHelloAckBody {
+            negotiated_ver: PROTOCOL_VERSION,
+            subc_ops: Vec::new(),
+            subc_capabilities: Vec::new(),
+            storage: None,
+            machine_id: None,
+        };
+        send(
+            &mut daemon,
+            Frame::build(
+                FrameType::HelloAck,
+                control_flags(),
+                0,
+                0,
+                HELLO_CORR,
+                serde_json::to_vec(&ack).unwrap(),
+            )
+            .unwrap(),
+        )
+        .await;
+        let (handle, serve_future) = serving.await.unwrap().unwrap();
+        Served {
+            daemon,
+            handle,
+            serve: tokio::spawn(serve_future),
+            _dir: dir,
+        }
+    }
+
+    async fn send(daemon: &mut TcpStream, frame: Frame) {
+        write_frame(daemon, &frame).await.unwrap();
+        daemon.flush().await.unwrap();
+    }
+
+    /// Bind route 7/1 and send one data request on it, returning once the
+    /// handler holds it.
+    async fn hold_one_request(served: &mut Served, entered: &Notify) {
+        let bind = serde_json::to_vec(&ModuleControlRequest::RouteBind {
+            route_channel: 7,
+            epoch: 1,
+            target: RouteTarget::ToolProvider {
+                module_id: "close-test".to_string(),
+            },
+            identity: BindIdentity::new(
+                PathBuf::from("/tmp/project"),
+                "test".to_string(),
+                "close".to_string(),
+            ),
+            principal: None,
+            consumer_capabilities: None,
+            admission_facts: None,
+        })
+        .unwrap();
+        send(
+            &mut served.daemon,
+            Frame::build(FrameType::Request, control_flags(), 0, 0, 2, bind).unwrap(),
+        )
+        .await;
+        loop {
+            let frame = read_frame(&mut served.daemon).await.unwrap().unwrap();
+            if frame.header.channel == 0 && frame.header.corr == 2 {
+                assert_eq!(
+                    frame.header.ty,
+                    FrameType::Response,
+                    "route.bind must be acked"
+                );
+                break;
+            }
+        }
+        send(
+            &mut served.daemon,
+            Frame::build(FrameType::Request, data_flags(), 7, 1, 10, b"hold".to_vec()).unwrap(),
+        )
+        .await;
+        timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .expect("the handler must receive the request");
+    }
+
+    fn goodbye() -> Frame {
+        Frame::build(FrameType::Goodbye, control_flags(), 0, 0, 0, Vec::new()).unwrap()
+    }
+
+    fn holding(
+        hold: Hold,
+    ) -> (
+        HoldingHandler,
+        Arc<Notify>,
+        Arc<Mutex<Option<CancellationToken>>>,
+    ) {
+        let entered = Arc::new(Notify::new());
+        let token = Arc::new(Mutex::new(None));
+        let handler = HoldingHandler {
+            hold,
+            entered: Arc::clone(&entered),
+            token: Arc::clone(&token),
+        };
+        (handler, entered, token)
+    }
+
+    #[tokio::test]
+    async fn goodbye_cancels_an_open_request_and_the_serve_future_completes() {
+        let (handler, entered, token) = holding(Hold::UntilCancelled);
+        let mut served = serve_against_stand_in(handler).await;
+        hold_one_request(&mut served, &entered).await;
+
+        let started = Instant::now();
+        send(&mut served.daemon, goodbye()).await;
+        let result = timeout(Duration::from_secs(5), &mut served.serve)
+            .await
+            .expect("a held request must not keep the serve future alive after GOODBYE");
+        result.unwrap().unwrap();
+        assert!(
+            token.lock().unwrap().as_ref().unwrap().is_cancelled(),
+            "GOODBYE must cancel the request's token"
+        );
+        // Well inside the writer's drain limit: the handler answered its
+        // cancellation, so nothing had to be aborted.
+        assert!(
+            started.elapsed() < WRITER_DRAIN_LIMIT,
+            "closing took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_handler_ignoring_cancellation_cannot_keep_the_serve_future_alive() {
+        let (handler, entered, _token) = holding(Hold::IgnoringCancellation);
+        let mut served = serve_against_stand_in(handler).await;
+        hold_one_request(&mut served, &entered).await;
+
+        let started = Instant::now();
+        send(&mut served.daemon, goodbye()).await;
+        let result = timeout(
+            WRITER_DRAIN_LIMIT + Duration::from_secs(3),
+            &mut served.serve,
+        )
+        .await
+        .expect("the writer drain must be bounded");
+        result.unwrap().unwrap();
+        assert!(started.elapsed() >= WRITER_DRAIN_LIMIT);
+    }
+
+    #[tokio::test]
+    async fn closed_resolves_after_goodbye() {
+        let served = serve_against_stand_in(EchoHandler).await;
+        let mut served = served;
+        assert!(!served.handle.is_closed());
+        let closed = served.handle.closed();
+        send(&mut served.daemon, goodbye()).await;
+        timeout(Duration::from_secs(2), closed)
+            .await
+            .expect("closed() must resolve after GOODBYE");
+        assert!(served.handle.is_closed());
+    }
+
+    #[tokio::test]
+    async fn closed_resolves_after_eof() {
+        let Served {
+            daemon,
+            handle,
+            serve: _serve,
+            _dir,
+        } = serve_against_stand_in(EchoHandler).await;
+        assert!(!handle.is_closed());
+        drop(daemon);
+        timeout(Duration::from_secs(2), handle.closed())
+            .await
+            .expect("closed() must resolve after EOF");
+        assert!(handle.is_closed());
+    }
+
+    struct EchoHandler;
+
+    #[async_trait]
+    impl ModuleHandler for EchoHandler {
+        async fn handle(&self, _ctx: RequestCtx, body: Vec<u8>) -> HandlerOutcome {
+            HandlerOutcome::Response(body)
+        }
     }
 }
 

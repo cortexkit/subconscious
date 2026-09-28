@@ -17,6 +17,15 @@
   first, then `delegation_not_registered`, then admission pressure (too many binds in flight),
   then anything else. The error stays `NotSent`. Its message names the refusal's `detail.reason`
   when present, and the most recent refusal after it when that differs.
+- Fix a served module that never exited after a channel-0 GOODBYE (for example on
+  `supervisor.restart`) until the daemon's stop budget killed it. Requests still in flight held
+  the writer open. When the connection ends for any reason (GOODBYE, EOF, reset, close), every
+  in-flight request's cancellation token is now cancelled, and requests still waiting for a
+  handler slot are dropped.
+- The serve future now waits at most 2s for the writer to flush after the connection ends, then
+  aborts it, so a handler that ignores cancellation cannot keep the process alive past its stop.
+- Add `ModuleHandle::closed()`, a future that resolves once the module's connection has closed,
+  so a module can end its own background work, and `ModuleHandle::is_closed()`.
 
 ## 0.19.4 — 2026-09-24
 

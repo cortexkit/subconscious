@@ -757,10 +757,11 @@ fn emit_line<S: OutputSink>(
     raw: &[u8],
     terminated: bool,
 ) {
-    // One instant for both destinations, taken where the line boundary is
-    // known. Nothing downstream can recover it: the ring and the file keep
-    // only bytes, and a time assigned when they are read would look recorded
-    // while being wrong by however long the line sat there.
+    // One instant for both destinations, taken here because this is where the
+    // line is complete. The module's bytes do not say when the line arrived,
+    // so the time is stored beside it: as `at_ms` in the ring and as the stamp
+    // in the file. A time assigned later, when either is read, would look
+    // recorded while being off by however long the line sat there.
     let at_ms = unix_ms(SystemTime::now());
     if let Some((ring, generation)) = ring {
         lock_ring(ring).push_line_from_at(generation, &String::from_utf8_lossy(raw), at_ms);

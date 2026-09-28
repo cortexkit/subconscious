@@ -19,9 +19,9 @@
   },
   {
     "name": "route_open_retry_deadline",
-    "ms": 30000,
+    "ms": 90000,
     "owner": "sdk",
-    "note": "SDK retry deadline for retryable route.open rejections; coupled to daemon drain ceiling (route_open_retry_deadline >= drain_timeout)"
+    "note": "SDK retry deadline for retryable route.open rejections; covers a whole module restart (drain, stop, boot; 62.5s measured), so it is well above the daemon drain ceiling (route_open_retry_deadline >= drain_timeout)"
   },
   {
     "name": "liveness_probe_window",

@@ -75,14 +75,22 @@ const DEADLINE_NO_DROP_CODE = "deadline_exceeded_no_drop_observed";
 // A retryable route.open rejection (target booting / reloading / momentarily
 // absent) is retried in-place against the same connection up to this deadline
 // before it is surfaced as not_sent. Mirrors subc-client-rs
-// DEFAULT_ROUTE_RETRY_DEADLINE so a target that is briefly unavailable at daemon
-// restart recovers without a misleading terminal error.
-// Sized against the daemon's route.bind relay timeout (12s default): a single
-// load-stalled bind relay consumes ~12s of this budget before the daemon even
-// rejects with module_timeout, so the deadline must leave room for MULTIPLE
-// full relay waits or one slow bind exhausts the whole retry clock. 30s allows
-// ~2 full relay timeouts plus backoff before surfacing not_sent.
-export const ROUTE_OPEN_RETRY_DEADLINE_MS = 30_000;
+// DEFAULT_ROUTE_RETRY_DEADLINE so a target that is unavailable while it restarts
+// recovers without a misleading terminal error.
+// Sized against a real module restart, not a single bind: the daemon drains the
+// module's routes (up to 30s), waits for the old process to stop (up to its stop
+// budget, 25s by default), then boots the new one. A measured prefrontal-core
+// restart kept route.open refused for 62.5s end to end, which a 30s budget gave
+// up on halfway through. 90s covers that window with room for a slow boot. A
+// call that sets its own timeoutMs still stops retrying at that timeout.
+export const ROUTE_OPEN_RETRY_DEADLINE_MS = 90_000;
+// The most route.open requests this client keeps outstanding on one connection.
+// Mirrors the daemon's MAX_PENDING_ROUTE_OPENS_PER_CONNECTION
+// (crates/subc-daemon/src/server.rs): the daemon refuses every open beyond that
+// many with a retryable target_unavailable, so sending more at once only
+// manufactures refusals. Extra opens wait here, first come first served, and the
+// wait counts against the same retry deadline as the refusals do.
+export const MAX_ROUTE_OPENS_IN_FLIGHT = 8;
 // Once a header arrives, its body must follow promptly; bound it so a truncated
 // frame cannot wedge the read loop forever.
 const BODY_READ_TIMEOUT_MS = 30_000;
@@ -359,11 +367,22 @@ export interface ConnectOptions {
   /** Injectable sleep for timer-free reconnect tests. */
   sleep?: (ms: number) => Promise<void>;
   /**
+   * Injectable clock (milliseconds) for the route.open retry deadline. Tests pair
+   * it with `sleep` so a minute-long module restart runs in fake time.
+   */
+  now?: () => number;
+  /**
+   * Injectable random source in [0, 1) for route.open retry jitter, so tests can
+   * seed it. Defaults to Math.random.
+   */
+  random?: () => number;
+  /**
    * How long managed calls keep retrying route.open in-place on retryable
    * refusals (module_reloading, module_warming, target_unavailable, …) before
-   * settling not_sent. This deadline is the ONLY binder on those retries —
-   * module reloads legitimately take tens of seconds (the daemon's drain alone
-   * defaults to 30s), so the default matches the daemon's drain ceiling.
+   * settling not_sent. This deadline and the call's own timeoutMs (when set) are
+   * the only binders on those retries: a module restart legitimately keeps its
+   * routes refused for about a minute (drain, stop, boot), so the default is
+   * ROUTE_OPEN_RETRY_DEADLINE_MS.
    */
   routeOpenRetryDeadlineMs?: number;
   /**
@@ -465,6 +484,8 @@ interface NormalizedConnectOptions {
   targetKind: ManagedRouteKind;
   reconnectBackoff: ReconnectBackoff;
   sleep: (ms: number) => Promise<void>;
+  now: () => number;
+  random: () => number;
   routeOpenRetryDeadlineMs: number;
   timeoutArbitrationGraceMs: number;
   livenessProbeWindowMs: number;
@@ -474,6 +495,82 @@ interface NormalizedConnectOptions {
 interface OpenedConnection {
   sock: SubcSocket;
   conn: ConnectionInfo;
+}
+
+/**
+ * First-come-first-served limit on the route.open requests one client has
+ * outstanding. A slot is held from just before the open is written until its
+ * answer, or its failure, settles. The client holds one connection at a time,
+ * and replacing it fails every open still in flight on the old one, so one gate
+ * per client is a per-connection limit.
+ */
+class RouteOpenGate {
+  private inFlight = 0;
+  private readonly waiters: Array<(release: () => void) => void> = [];
+
+  constructor(private readonly limit: number) {}
+
+  /**
+   * Resolve with a release function once a slot is free, or with null when
+   * `timeoutMs` passes first. Without a timeout the caller waits until a slot
+   * frees, which happens as each open in flight settles.
+   */
+  acquire(timeoutMs?: number): Promise<(() => void) | null> {
+    if (this.inFlight < this.limit && this.waiters.length === 0) {
+      this.inFlight += 1;
+      return Promise.resolve(this.releaser());
+    }
+    if (timeoutMs !== undefined && timeoutMs <= 0) return Promise.resolve(null);
+    return new Promise((resolve) => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const waiter = (release: () => void): void => {
+        if (timer !== undefined) clearTimeout(timer);
+        resolve(release);
+      };
+      this.waiters.push(waiter);
+      if (timeoutMs !== undefined) {
+        timer = setTimeout(() => {
+          const index = this.waiters.indexOf(waiter);
+          if (index === -1) return;
+          this.waiters.splice(index, 1);
+          resolve(null);
+        }, timeoutMs);
+      }
+    });
+  }
+
+  private releaser(): () => void {
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      // Hand the slot straight to the oldest waiter, so a newcomer cannot take
+      // it between this release and that waiter resuming.
+      const next = this.waiters.shift();
+      if (next) next(this.releaser());
+      else this.inFlight -= 1;
+    };
+  }
+}
+
+/**
+ * The route.open refusals one retry loop has seen: the most recent one, and the
+ * one that best explains why the target was unreachable. When the deadline runs
+ * out, the error describes the best one. After a module restart the most recent
+ * refusal is often admission pressure ("8 binds in flight"), which points a
+ * reader at the client's concurrency when the module was simply down.
+ */
+class RouteOpenRefusals {
+  best: SubcError | undefined;
+  last: SubcError | undefined;
+
+  record(refusal: SubcError): void {
+    this.last = refusal;
+    // At equal rank the newer refusal wins: it describes the target's latest state.
+    if (!this.best || routeOpenRefusalRank(refusal) >= routeOpenRefusalRank(this.best)) {
+      this.best = refusal;
+    }
+  }
 }
 
 interface CachedRoute {
@@ -508,6 +605,7 @@ export class SubcClient {
   private closeStarted = false;
   private reconnecting: Promise<void> | null = null;
   private generation = 1;
+  private routeOpenGateInstance: RouteOpenGate | undefined;
   // True while the read loop is actively reading/dispatching a frame off the
   // current socket (between reading a header and finishing its dispatch). The
   // timeout arbitration reads it to decide whether a just-fired timeout should
@@ -524,6 +622,12 @@ export class SubcClient {
 
   get conn(): ConnectionInfo {
     return this.currentConn;
+  }
+
+  // Created on first use, so a client assembled without running its constructor
+  // (as the unit tests do) still paces its route.opens.
+  private get routeOpenGate(): RouteOpenGate {
+    return (this.routeOpenGateInstance ??= new RouteOpenGate(MAX_ROUTE_OPENS_IN_FLIGHT));
   }
 
   /** Read the connection file, connect, authenticate, and start the read loop. */
@@ -578,8 +682,27 @@ export class SubcClient {
       .sort();
   }
 
-  /** Open a route and return its connection-bound immutable handle. */
+  /**
+   * Open a route and return its connection-bound immutable handle. At most
+   * MAX_ROUTE_OPENS_IN_FLIGHT opens are outstanding at once; further calls wait
+   * their turn.
+   */
   async routeOpen(target: RouteTarget, identity: BindIdentity, opts: RouteOpenOptions = {}): Promise<RouteHandle> {
+    // Without a timeout the gate always grants a slot eventually.
+    const release = (await this.routeOpenGate.acquire())!;
+    try {
+      return await this.sendRouteOpen(target, identity, opts);
+    } finally {
+      release();
+    }
+  }
+
+  /** One route.open exchange. The caller holds a route-open gate slot. */
+  private async sendRouteOpen(
+    target: RouteTarget,
+    identity: BindIdentity,
+    opts: RouteOpenOptions = {},
+  ): Promise<RouteHandle> {
     const consumerIdentity = routeOpenConsumerIdentity(opts);
     const reverseRequests = opts.reverseRequests ?? new ReverseRequestRegistry();
     reverseRequests.seal();
@@ -1210,18 +1333,48 @@ export class SubcClient {
       this.routes.set(key, cached);
     }
     if (cached.handle && this.isLiveHandle(cached.handle)) return cached.handle;
+    // The retries end at the retry deadline or at the call's own timeoutMs,
+    // whichever comes first. Without timeoutMs the call has no overall deadline
+    // here: the default request timeout bounds only the response wait.
+    const startedAt = this.opts.now();
+    const callDeadline = opts.timeoutMs === undefined ? undefined : startedAt + opts.timeoutMs;
     if (!cached.opening) {
-      cached.opening = this.openCachedRoute(cached).finally(() => {
+      const retryDeadline = startedAt + this.opts.routeOpenRetryDeadlineMs;
+      const deadline = callDeadline === undefined ? retryDeadline : Math.min(retryDeadline, callDeadline);
+      cached.opening = this.openCachedRoute(cached, deadline).finally(() => {
         cached.opening = null;
       });
+      return cached.opening;
     }
-    return cached.opening;
+    // Another call is already opening this route, on its own deadline. Share its
+    // result, but never wait past this call's own timeout for it.
+    if (callDeadline === undefined) return cached.opening;
+    return this.awaitOpeningUntil(cached.opening, callDeadline);
   }
 
-  private async openCachedRoute(cached: CachedRoute): Promise<RouteHandle> {
-    const routeRetryDeadline = Date.now() + this.opts.routeOpenRetryDeadlineMs;
+  private awaitOpeningUntil(opening: Promise<RouteHandle>, deadline: number): Promise<RouteHandle> {
+    return new Promise<RouteHandle>((resolve, reject) => {
+      const timer = setTimeout(
+        () => reject(this.notSentCallError("call deadline elapsed waiting for another call's route.open")),
+        Math.max(0, deadline - this.opts.now()),
+      );
+      opening.then(
+        (handle) => {
+          clearTimeout(timer);
+          resolve(handle);
+        },
+        (error: unknown) => {
+          clearTimeout(timer);
+          reject(error);
+        },
+      );
+    });
+  }
+
+  private async openCachedRoute(cached: CachedRoute, deadline: number): Promise<RouteHandle> {
     let routeRetryDelay = this.opts.reconnectBackoff.baseMs;
     let routeRetryAttempt = 0;
+    const refusals = new RouteOpenRefusals();
     for (;;) {
       if (cached.closed) throw this.routeClosedDuringOpen();
       try {
@@ -1231,11 +1384,25 @@ export class SubcClient {
       }
       if (cached.handle && this.isLiveHandle(cached.handle)) return cached.handle;
 
+      // Waiting for a free slot spends the same deadline as retrying refusals.
+      const release = await this.routeOpenGate.acquire(Math.max(0, deadline - this.opts.now()));
+      if (!release) throw this.routeOpenRetryExhausted(cached.moduleId, routeRetryAttempt, refusals);
+      let outcome: { handle: RouteHandle } | { error: unknown };
       try {
-        const handle = await this.routeOpen(cached.target, cached.identity, {
-          consumerIdentity: cached.consumerIdentity ?? null,
-          reverseRequests: cached.reverseRequests,
-        });
+        outcome = {
+          handle: await this.sendRouteOpen(cached.target, cached.identity, {
+            consumerIdentity: cached.consumerIdentity ?? null,
+            reverseRequests: cached.reverseRequests,
+          }),
+        };
+      } catch (error) {
+        outcome = { error };
+      } finally {
+        release();
+      }
+
+      if ("handle" in outcome) {
+        const { handle } = outcome;
         if (cached.closed) {
           this.liveRoutes.delete(handle.channel);
           this.sendRouteGoodbye(handle);
@@ -1243,38 +1410,63 @@ export class SubcClient {
         }
         cached.handle = handle;
         return handle;
-      } catch (error) {
-        if (error instanceof SubcCallError && error.code === "route_closed") throw error;
-        if (!this.closeStarted && isConsumerReconnectTransient(error)) {
-          try {
-            await this.reconnectAfterDrop(error);
-          } catch (reconnectError) {
-            throw this.notSentRecoveryError("route.open was not sent and reconnect failed", reconnectError);
-          }
+      }
+
+      const { error } = outcome;
+      if (error instanceof SubcCallError && error.code === "route_closed") throw error;
+      if (!this.closeStarted && isConsumerReconnectTransient(error)) {
+        try {
+          await this.reconnectAfterDrop(error);
+        } catch (reconnectError) {
+          throw this.notSentRecoveryError("route.open was not sent and reconnect failed", reconnectError);
+        }
+        continue;
+      }
+      if (!this.closeStarted && error instanceof SubcError && isRetryableRouteOpenCode(error.code)) {
+        // The deadline is the ONLY binder here. An attempt cap used to share
+        // this condition, and because the capped backoff sums to ~3.1s it
+        // strictly dominated the deadline — the advertised reload patience was
+        // never delivered, so every module restart whose reload exceeded ~3s
+        // failed managed callers with module_reloading. A restart legitimately
+        // keeps routes refused for about a minute; the backoff cap below bounds
+        // retry pressure instead.
+        routeRetryAttempt += 1;
+        refusals.record(error);
+        const remaining = deadline - this.opts.now();
+        if (remaining > 0) {
+          // Every route on a connection is closed together when its module
+          // drains, so without jitter they all retry in lock step and arrive at
+          // the daemon as one burst each round.
+          await this.opts.sleep(Math.min(equalJitter(routeRetryDelay, this.opts.random), remaining));
+          routeRetryDelay = Math.min(routeRetryDelay * 2, this.opts.reconnectBackoff.capMs);
           continue;
         }
-        if (!this.closeStarted && error instanceof SubcError && isRetryableRouteOpenCode(error.code)) {
-          // The deadline is the ONLY binder here. An attempt cap used to share
-          // this condition, and because the capped backoff sums to ~3.1s it
-          // strictly dominated the 30s deadline — the advertised reload
-          // patience was never delivered, so every module restart whose reload
-          // exceeded ~3s failed managed callers with module_reloading. Module
-          // reloads legitimately take tens of seconds (drain alone defaults to
-          // 30s); the backoff cap below bounds retry pressure instead.
-          routeRetryAttempt += 1;
-          if (Date.now() < routeRetryDeadline) {
-            await this.opts.sleep(routeRetryDelay);
-            routeRetryDelay = Math.min(routeRetryDelay * 2, this.opts.reconnectBackoff.capMs);
-            continue;
-          }
-          throw this.notSentCallError(
-            `route.open failed for module ${cached.moduleId}: ${error.code} (retry deadline exhausted after ${routeRetryAttempt} attempts)`,
-            error,
-          );
-        }
-        throw this.terminalCallError(`route.open failed for module ${cached.moduleId}`, error);
+        throw this.routeOpenRetryExhausted(cached.moduleId, routeRetryAttempt, refusals);
       }
+      throw this.terminalCallError(`route.open failed for module ${cached.moduleId}`, error);
     }
+  }
+
+  /**
+   * The not_sent error for a route.open whose retry deadline ran out. Its code
+   * and cause are the most recent refusal, as they always were; its message
+   * describes the most informative refusal seen, so a module that was reloading
+   * is not reported as admission pressure on the client's own connection.
+   */
+  private routeOpenRetryExhausted(moduleId: string, attempts: number, refusals: RouteOpenRefusals): SubcCallError {
+    const { best, last } = refusals;
+    if (!best || !last) {
+      return this.notSentCallError(
+        `route.open for module ${moduleId} waited until its deadline for one of ${MAX_ROUTE_OPENS_IN_FLIGHT} route.open slots on this connection`,
+      );
+    }
+    const recent = last === best ? "" : `; the most recent refusal was ${describeRouteOpenRefusal(last)}`;
+    return new SubcCallError(
+      "not_sent",
+      `route.open failed for module ${moduleId}: ${describeRouteOpenRefusal(best)} (retry deadline exhausted after ${attempts} attempts${recent})`,
+      last.code,
+      last,
+    );
   }
 
   // Stamped by dispatch() on every inbound frame; read by the liveness probe.
@@ -1949,6 +2141,56 @@ export function isRetryableRouteOpenCode(code: string | undefined): boolean {
   );
 }
 
+/**
+ * "Equal jitter": half the delay is kept and the other half is random, so
+ * retries spread out while still backing off. `random` returns a value in [0, 1).
+ */
+function equalJitter(delayMs: number, random: () => number): number {
+  const half = delayMs / 2;
+  return half + random() * half;
+}
+
+// The daemon's reasons for refusing a route.open because too many binds are
+// already in flight: on the client's connection, or towards the target module
+// (crates/subc-daemon/src/control.rs, route_open_capacity_refusal and
+// route_open_target_capacity_refusal). Both are sent as target_unavailable.
+const ROUTE_OPEN_ADMISSION_PRESSURE_REASONS = new Set(["open_admission_full", "target_binds_full"]);
+// The same refusals as their messages read. The daemon currently logs the reason
+// but does not put it in the refusal's detail, so the message is the only mark.
+const ROUTE_OPEN_ADMISSION_PRESSURE_MESSAGE = /route\.open binds in flight|route\.bind relays in flight/;
+
+function refusalReason(refusal: SubcError): string | undefined {
+  const detail = refusal.detail;
+  if (typeof detail !== "object" || detail === null || !("reason" in detail)) return undefined;
+  const reason = (detail as { reason?: unknown }).reason;
+  return typeof reason === "string" ? reason : undefined;
+}
+
+/**
+ * How much a route.open refusal says about why the target was unreachable,
+ * highest first: the module was changing state (reloading or warming); a
+ * delegation was not registered; the daemon was refusing for admission pressure
+ * (too many binds in flight); anything else.
+ */
+function routeOpenRefusalRank(refusal: SubcError): number {
+  if (refusal.code === "module_reloading" || refusal.code === "module_warming") return 3;
+  const reason = refusalReason(refusal);
+  if (refusal.code === "delegation_not_registered" || reason === "delegation_not_registered") return 2;
+  if (refusal.code === "target_unavailable") {
+    const admissionPressure =
+      reason === undefined
+        ? ROUTE_OPEN_ADMISSION_PRESSURE_MESSAGE.test(refusal.message)
+        : ROUTE_OPEN_ADMISSION_PRESSURE_REASONS.has(reason);
+    if (admissionPressure) return 1;
+  }
+  return 0;
+}
+
+function describeRouteOpenRefusal(refusal: SubcError): string {
+  const reason = refusalReason(refusal);
+  return `${refusal.code ?? "refused"}${reason === undefined ? "" : ` (reason ${reason})`}: ${refusal.message}`;
+}
+
 export const UNKNOWN_CHANNEL = "unknown_channel";
 export const STALE_ROUTE_EPOCH = "stale_route_epoch";
 
@@ -1980,6 +2222,8 @@ function normalizeConnectOptions(opts: ConnectOptions): NormalizedConnectOptions
     targetKind: opts.targetKind ?? DEFAULT_MANAGED_TARGET_KIND,
     reconnectBackoff: opts.reconnectBackoff ?? DEFAULT_RECONNECT_BACKOFF,
     sleep: opts.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms))),
+    now: opts.now ?? Date.now,
+    random: opts.random ?? Math.random,
     routeOpenRetryDeadlineMs: opts.routeOpenRetryDeadlineMs ?? ROUTE_OPEN_RETRY_DEADLINE_MS,
     timeoutArbitrationGraceMs: opts.timeoutArbitrationGraceMs ?? TIMEOUT_ARBITRATION_GRACE_MS,
     livenessProbeWindowMs: opts.livenessProbeWindowMs ?? LIVENESS_PROBE_WINDOW_MS,

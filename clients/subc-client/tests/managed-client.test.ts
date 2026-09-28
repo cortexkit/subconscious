@@ -85,6 +85,14 @@ interface FakeDaemonOptions {
   // Reject the first N route.open requests with this code (a booting-target
   // simulation), then serve subsequent ones normally.
   routeOpenFailFirst?: { count: number; code: string; message: string };
+  // Take over every route.open answer. The hook is not awaited: it answers
+  // through `answer` whenever it likes (no argument accepts the open, an error
+  // body refuses it), so a test can hold opens outstanding or script refusals
+  // against a fake clock.
+  onRouteOpen?: (
+    moduleId: string | undefined,
+    answer: (error?: { code: string; message: string; detail?: unknown }) => Promise<void>,
+  ) => void;
   closeAfterDataResponses?: number;
   // Before answering catalog.list, emit daemon-originated channel-0 control
   // pushes: first a well-formed route.closing, then one with an UNPARSEABLE
@@ -1184,6 +1192,194 @@ describe("SubcClient managed call", () => {
   });
 });
 
+describe("managed route.open across a module restart", () => {
+  // A clock that only moves when the client sleeps, so a minute of module
+  // restart runs in milliseconds and the deadline arithmetic is exact.
+  function fakeClock(): { now: () => number; sleep: (ms: number) => Promise<void>; sleeps: number[] } {
+    let t = 0;
+    const sleeps: number[] = [];
+    return {
+      now: () => t,
+      sleep: async (ms) => {
+        sleeps.push(ms);
+        t += ms;
+      },
+      sleeps,
+    };
+  }
+
+  // A stand-in for a module that restarts: every route.open is refused with
+  // module_reloading until the fake clock reaches `backAtMs`.
+  async function restartingDaemon(clock: { now: () => number }, backAtMs: number): Promise<string> {
+    const { connFile } = tempConnectionFile();
+    const daemon = await startFakeDaemon({
+      stats: newStats(),
+      onRouteOpen: (_moduleId, answer) => {
+        void answer(clock.now() < backAtMs ? { code: "module_reloading", message: "module is reloading" } : undefined);
+      },
+    });
+    writeConnectionFile(connFile, daemon.port);
+    return connFile;
+  }
+
+  // mulberry32: a small seeded generator, so jittered delays are reproducible.
+  function seededRandom(seed: number): () => number {
+    let state = seed >>> 0;
+    return () => {
+      state = (state + 0x6d2b79f5) >>> 0;
+      let x = state;
+      x = Math.imul(x ^ (x >>> 15), x | 1);
+      x ^= x + Math.imul(x ^ (x >>> 7), x | 61);
+      return ((x ^ (x >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  test("the default retry deadline outlasts a 60s restart and the call succeeds", async () => {
+    const clock = fakeClock();
+    const connFile = await restartingDaemon(clock, 60_000);
+    const client = await SubcClient.connect({ connectionFile: connFile, identity: IDENTITY, now: clock.now, sleep: clock.sleep });
+    try {
+      await expect(client.call("restarting", "echo", { n: 1 })).resolves.toEqual({ method: "echo", params: { n: 1 } });
+      expect(clock.now()).toBeGreaterThanOrEqual(60_000);
+    } finally {
+      client.close();
+    }
+  });
+
+  test("a call timeout shorter than the retry deadline ends the retries at the call timeout", async () => {
+    const clock = fakeClock();
+    const connFile = await restartingDaemon(clock, 60_000);
+    const client = await SubcClient.connect({ connectionFile: connFile, identity: IDENTITY, now: clock.now, sleep: clock.sleep });
+    try {
+      await expect(client.call("restarting", "echo", { n: 1 }, { timeoutMs: 10_000 })).rejects.toMatchObject({
+        kind: "not_sent",
+        code: "module_reloading",
+      });
+      // Retry sleeps are cut to the time left, so the loop stops at 10s exactly.
+      expect(clock.now()).toBeGreaterThanOrEqual(9_999);
+      expect(clock.now()).toBeLessThanOrEqual(10_001);
+    } finally {
+      client.close();
+    }
+  });
+
+  test("two routes refused together retry after different jittered delays", async () => {
+    const { connFile } = tempConnectionFile();
+    const refusedOnce = new Set<string | undefined>();
+    const daemon = await startFakeDaemon({
+      stats: newStats(),
+      onRouteOpen: (moduleId, answer) => {
+        if (refusedOnce.has(moduleId)) {
+          void answer();
+          return;
+        }
+        refusedOnce.add(moduleId);
+        void answer({ code: "module_reloading", message: "module is reloading" });
+      },
+    });
+    writeConnectionFile(connFile, daemon.port);
+    const sleeps: number[] = [];
+    const client = await SubcClient.connect({
+      connectionFile: connFile,
+      identity: IDENTITY,
+      random: seededRandom(42),
+      sleep: async (ms) => {
+        sleeps.push(ms);
+      },
+    });
+    try {
+      await Promise.all([client.call("alpha", "echo", {}), client.call("beta", "echo", {})]);
+      expect(sleeps.length).toBe(2);
+      // Equal jitter keeps half of the 100ms base delay and randomizes the rest.
+      for (const ms of sleeps) {
+        expect(ms).toBeGreaterThanOrEqual(50);
+        expect(ms).toBeLessThan(100);
+      }
+      expect(sleeps[0]).not.toBe(sleeps[1]);
+    } finally {
+      client.close();
+    }
+  });
+
+  test("twenty concurrent opens never have more than eight outstanding at the daemon", async () => {
+    const { connFile } = tempConnectionFile();
+    let outstanding = 0;
+    let maxOutstanding = 0;
+    const held: (() => Promise<void>)[] = [];
+    let flushTimer: ReturnType<typeof setTimeout> | undefined;
+    // Answer the held opens only once no new open has arrived for a while, so
+    // every open the client can send at once is outstanding together first.
+    const scheduleFlush = (): void => {
+      if (flushTimer !== undefined) clearTimeout(flushTimer);
+      flushTimer = setTimeout(() => {
+        for (const answer of held.splice(0)) {
+          outstanding -= 1;
+          void answer();
+        }
+      }, 25);
+    };
+    const daemon = await startFakeDaemon({
+      stats: newStats(),
+      onRouteOpen: (_moduleId, answer) => {
+        outstanding += 1;
+        maxOutstanding = Math.max(maxOutstanding, outstanding);
+        held.push(() => answer());
+        scheduleFlush();
+      },
+    });
+    writeConnectionFile(connFile, daemon.port);
+    const client = await SubcClient.connect({ connectionFile: connFile, identity: IDENTITY });
+    try {
+      const calls = Array.from({ length: 20 }, (_, i) => client.call(`module-${i}`, "echo", { i }));
+      const replies = await Promise.all(calls);
+      expect(replies).toHaveLength(20);
+      expect(maxOutstanding).toBe(8);
+    } finally {
+      client.close();
+    }
+  });
+
+  test("an exhausted deadline names the module_reloading refusal, not the later admission pressure", async () => {
+    const clock = fakeClock();
+    const { connFile } = tempConnectionFile();
+    let opens = 0;
+    const daemon = await startFakeDaemon({
+      stats: newStats(),
+      onRouteOpen: (_moduleId, answer) => {
+        opens += 1;
+        void answer(
+          opens <= 2
+            ? { code: "module_reloading", message: "module is reloading", detail: { reason: "restart" } }
+            : {
+                code: "target_unavailable",
+                message: "connection already has 8 route.open binds in flight (limit 8); retry after one settles",
+              },
+        );
+      },
+    });
+    writeConnectionFile(connFile, daemon.port);
+    const client = await SubcClient.connect({
+      connectionFile: connFile,
+      identity: IDENTITY,
+      now: clock.now,
+      sleep: clock.sleep,
+      routeOpenRetryDeadlineMs: 5_000,
+    });
+    try {
+      const error = await client.call("restarting", "echo", {}).catch((err: unknown) => err);
+      expect(opens).toBeGreaterThan(2);
+      // The code and class still come from the most recent refusal; only the
+      // description changes.
+      expect(error).toMatchObject({ kind: "not_sent", code: "target_unavailable" });
+      expect((error as Error).message).toStartWith(
+        "route.open failed for module restarting: module_reloading (reason restart): module is reloading",
+      );
+    } finally {
+      client.close();
+    }
+  });
+});
+
 async function startFakeDaemon(options: FakeDaemonOptions): Promise<FakeDaemon> {
   const sockets = new Set<Socket>();
   const server = createServer((socket) => {
@@ -1278,6 +1474,18 @@ async function handleFakeConnection(socket: Socket, options: FakeDaemonOptions):
           (request as { consumer_identity?: unknown }).consumer_identity,
         );
         const moduleId = request.target?.module_id;
+        if (options.onRouteOpen) {
+          options.onRouteOpen(moduleId, (error) =>
+            writeFrame(
+              socket,
+              error
+                ? errorFrame(frame, error)
+                : responseFrame(frame, { op: "route.open", route_channel: routeChannel++, route_epoch: 1 }),
+              Date.now() + 5_000,
+            ),
+          );
+          continue;
+        }
         const dropModule = options.routeOpenDropModule;
         if (
           dropModule &&

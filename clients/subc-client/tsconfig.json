@@ -10,7 +10,9 @@
     "noEmit": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
-    "forceConsistentCasingInFileNames": true
+    "forceConsistentCasingInFileNames": true,
+    // Lets tests import the package by its published name without a build.
+    "paths": { "@cortexkit/subc-client": ["./src/index.ts"] }
   },
   "include": ["src"]
 }

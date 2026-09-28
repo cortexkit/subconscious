@@ -2768,6 +2768,16 @@ async fn concurrent_supervisor_ops_remain_coherent() {
             }
             FrameType::Error => {
                 assert_ne!(corr, 434, "disable must not fail: {frame:?}");
+                // The losing reload or restart must fail because the disable
+                // won. Print the daemon's message with the code: on a slow
+                // host another step of the race can lose instead, and the
+                // code alone doesn't say which.
+                let body: ErrorBody = serde_json::from_slice(&frame.body).unwrap();
+                assert_eq!(
+                    body.code, "module_disabled",
+                    "corr {corr} lost the supervisor race for another reason: {} ({:?})",
+                    body.message, body.detail
+                );
                 assert_error(&frame, 0, corr, "module_disabled");
             }
             other => panic!("unexpected supervisor control frame type: {other:?}"),

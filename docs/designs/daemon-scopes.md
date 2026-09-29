@@ -1,8 +1,9 @@
 # Scopes: owned identity records in the daemon
 
-Status: design r6. Nothing here is built. r3 answered an Athena review of r2 (five seats, a
+Status: design r7. Nothing here is built. r3 answered an Athena review of r2 (five seats, a
 unanimous "do not implement as written"); r4 added the room's review of r3, r5 added targeted
-carriers, and r6 answers the Athena review of extensibility r7. `scope.subscribe` and
+carriers, r6 answered the Athena review of extensibility r7, and r7 answers the Athena review of
+extensibility r7.2 (rows T2-T22, T85, T87 of its triage table). `scope.subscribe` and
 `scope.patch` are specified here but deferred to stage 7; until then providers read `describe`. Section 10 lists
 what changed and why. The
 extensibility design (magic-context `.cortexkit/alfonso/plans/ck-extensibility-r6-7-amendments.md`,
@@ -26,14 +27,14 @@ Identity comes from the connection, never the request. `route_open_principal`
 supervised launch, refuses `bad_consumer_identity` otherwise, and makes it `direct` when it
 presents no identity. Every rule below uses that principal.
 
-**What that does and does not protect against.** The launch nonce is a bearer value delivered in
-the module's environment, and any connection presenting it is admitted as `reserved:<id>`: that
-is how a module's own helper processes connect. A same-user process can read another process's
-initial environment (`ps eww` on macOS shows it). So scopes protect against agents, bugs and
-accidents, not against deliberate local code running as the user, which can act as `direct` and,
-by reading a module's environment, as that module. Modules must strip `SUBC_LAUNCH_NONCE` from
-anything they spawn for an agent (AFT does, in `agent_child_env.rs`). A stronger handoff, the nonce
-over an inherited pipe read once at startup, is future work with a readers-first rollout.
+**What that does and does not protect against.** The launch nonce is a bearer value, and any
+connection presenting it is admitted as `reserved:<id>`. Today it is delivered in the module's
+environment, which a same-user process can read (`ps eww`), so today scopes protect against bugs
+and accidents, not against local code running as the user, a prompt-injected agent's shell
+included. `docs/designs/launch-nonce-descriptor.md` is the stage-2 track that closes it: the nonce
+over an inherited pipe, and every module and ck-subc signed with hardened runtime so no same-user
+process can attach and read it. It makes no boundary claim until its last step, which ships in
+stage 7.
 
 ## 2. The record
 
@@ -54,10 +55,15 @@ A scope is identified by `(owner, ref)`:
   It is how a bind notices a change between admission and commit (section 4).
 
 Fields:
-- `kind`: a closed enum, `head | worker | ephemeral`.
+- `kind`: a closed enum, `head | worker | ephemeral`, fixed for the life of an epoch. A sync that
+  changes it at the same epoch refuses that record `scope_kind_changed`; the owner uses a higher
+  epoch, which ends the old scope.
 - `parent`: optional `(owner, ref, scope_epoch)` of another scope. The epoch pins the parent
-  session: if the parent's live epoch differs, the child reads as `parent_ended`, so a new session
-  under the parent's ref never adopts the old session's children or their asks.
+  session. The stamp reports the link as `parent_state`: `linked` (the parent is live at that
+  epoch), `pending` (the parent's owner has not synced in this incarnation yet, so the link is
+  unverified and grants nothing), or `ended` (the parent's live epoch differs, the parent is gone,
+  or the link was refused when verified). A new session under the parent's ref never adopts the old
+  session's children or their asks.
 - `child_owners`: the principals, other than this scope's owner, allowed to register child scopes
   under it (for example Magic Context's historian under a head). Parenting is a separate right from
   carrying: a carrier gets none by being listed.
@@ -81,9 +87,11 @@ Fields:
 **Authority gate.** `agent_id` and `delegates` may be set only by an owner listed
 in the daemon config key `scope_authority_owners` (today `["prefrontal-core"]`, the same module
 as `admission_facts_carrier_module_id`). A scope from any other owner may carry `kind`,
-`parent` and `carriers` only; a sync that sets a gated attribute from an unlisted owner is
-refused by name (`scope_attribute_not_permitted`). Providers still check the stamped `owner`
-against their own expectation before honouring `delegates` (section 7).
+`parent`, `child_owners` and `carriers` only; a sync that sets a gated attribute from an unlisted
+owner is refused by name (`scope_attribute_not_permitted`). `scope_authority_owners` is a
+restart-required key: a change takes effect only on a daemon restart, which closes every route, so
+no live route keeps an `owner_authorized` stamp its owner has lost. Providers rely on the stamp's
+`owner_authorized` alone and keep no copy of the list (section 7).
 
 Bounds: at most 10,000 live scopes per owner and 4 KiB of attributes per scope; past either the
 sync is refused by name and nothing is applied. Tombstones (section 6) are capped at 1,000 per
@@ -103,8 +111,12 @@ subagent scope on the machine) can then register one new scope without re-sendin
 accepted: its authority. The first connection of an owner to sync becomes the authority. A
 sync from any other connection of the same owner is refused `scope_sync_not_authority`, with one
 exception: a connection presenting the owner's current launch nonce takes authority from one
-presenting an older launch's nonce. So a restarted owner process is never locked out by its
-predecessor's connection that is wedged but still open. That
+presenting an older launch's nonce. "Current" is the supervisor's active launch for that module
+id, the one whose nonce it records as the module's spawn nonce, never merely the newest spawn: a
+blue/green candidate is recorded as the swap's candidate token until promotion, so it is not
+current and cannot take authority, and a candidate that fails and is rolled back never had it. So
+a restarted owner process is never locked out by its predecessor's connection that is wedged but
+still open. That
 covers a blue/green swap, where the owner briefly has two connections: the candidate is refused
 until cutover, and at cutover authority moves to the promoted connection in the same step as
 the forwarding switch, without touching the set. The superseded connection's syncs are refused
@@ -120,24 +132,37 @@ restart, is never locked out, and a stale connection can never overwrite a newer
 **Effect of a sync.**
 - A scope present before and absent now is ended: tombstoned, and every route under it drained
   with reason `scope_ended`.
+- **An ended scope cannot come back.** Within an incarnation, a record naming a tombstoned
+  `(owner, ref, scope_epoch)` is refused `scope_epoch_ended`; the owner must use a higher epoch.
+  Across a daemon restart the tombstones are gone, so owners persist a removal, with its epoch,
+  before syncing it away, and never re-send a removed epoch.
 - A stamp is a snapshot taken at bind, so revoking authority ends the routes that carry the old
   stamp, each with its own reason so a carrier can tell them apart:
   - `scope_carrier_removed`: the opener is no longer a listed carrier, or the route's target is
     no longer in its entry's `targets` (widening a list changes nothing live);
-  - `scope_delegation_changed`: `delegates` went from true to false;
+  - `scope_delegation_changed`: `delegates` went from true to false, or `agent_id` changed;
   - `scope_ended`: the scope is gone, or replaced by a higher epoch.
+  - `scope_parent_ended`: the scope's parent ended (section 3).
   These are new `route.closed` reasons. Older SDKs map an unknown close reason to "do not
   reopen", which is right for the first and third; only carriers that use scopes, which are new
   code, receive any of them.
 - A sync that gives a live `(owner, ref)` a higher `scope_epoch` ends the old scope (tombstone,
   drain with `scope_ended`) and creates the new one. A new session never inherits a live route,
   stamp or approval of the old one.
-- `parent` is accepted only when the syncing owner is the parent's owner or is listed in the
-  parent's `child_owners`, at the time of the sync, and names the parent's live epoch. A cycle is
-  refused.
-- When a parent ends, its children stay and later stamps carry `parent_ended: true`;
-  `scope.subscribe` reports the change (section 5). One owner's removal never tears down another
-  owner's routes.
+- `parent` is checked against the parent's owner's synced set. When that owner has synced in this
+  incarnation, the edge is accepted only if the syncing owner is the parent's owner or is listed in
+  the parent's `child_owners` and the named epoch is the parent's live one; otherwise the record is
+  refused `scope_parent_not_permitted`. When the parent's owner has not synced yet, which happens
+  when owners re-sync in any order after a daemon restart, the child is accepted with
+  `parent_state: pending` and the edge is checked when the parent's owner syncs: it becomes
+  `linked` if it passes, or `ended` if the parent is absent, at another epoch, or the edge is not
+  permitted. A child is never refused, and nothing bound to it deleted, only because the parent's
+  owner synced later. A cycle is refused.
+- When a parent ends, its children stay and their state becomes `parent_state: ended`. That
+  change drains the children's live routes with reason `scope_parent_ended`, so no live route keeps
+  a stamp saying the parent is live; a carrier re-opens and gets the current stamp. The change
+  from `pending` to `linked` drains nothing. One owner's removal never tears down another owner's
+  routes.
 - `scope.sync` from `direct` is refused by name.
 - **A refused record does not block the rest.** A record refused on its own merits (for example
   `scope_epoch_regressed`, a forged parent, a gated attribute) keeps its previous state and is
@@ -146,12 +171,12 @@ restart, is never locked out, and a stale connection can never overwrite a newer
 
 ## 4. Opening a route under a scope
 
-`route.open` gains `scope: {owner, ref, scope_epoch?}`. Every opener other than the owner must
-send `scope_epoch`, so a carrier's open can never be admitted into a newer session that reused the
-ref. Only the owner, opening for its current session, may omit it. The daemon admits the open
-only when the opener is the owner or a listed carrier, and otherwise refuses by name (the full
-set is in section 5a):
-- `scope_epoch_required`: a non-owner opener sent no epoch. Terminal.
+`route.open` gains `scope: {owner, ref, scope_epoch}`. Every opener sends `scope_epoch`, the owner
+included: an owner forwarding a call names the epoch of the call it serves, so an old inbound call
+can never be carried into a newer session that reused the ref. The daemon admits the open only
+when the opener is the owner or a listed carrier, and otherwise refuses by name (the full set is
+in section 5a):
+- `scope_epoch_required`: the open named no epoch. Terminal.
 - `scope_not_synced`: the owner has not synced since this incarnation started and is configured.
   Retryable: after a daemon restart a carrier's open can arrive before the owner re-syncs, and
   the carrier waits within its own bound.
@@ -165,7 +190,7 @@ There is no relay class: a module that must present a scope onward is listed as 
 route lives until the carrier closes it or the scope ends or changes as in section 3.
 
 On admission the daemon captures `(scope_epoch, version)` into the pending bind and stamps the
-bind with `scope {owner, ref, scope_epoch, kind, parent, parent_ended, attributes}`, next to the
+bind with `scope {owner, ref, scope_epoch, kind, parent, parent_state, attributes}`, next to the
 principal it already stamps. The immediate opener stays in the principal field. The stamp also
 carries `owner_authorized`, computed by the daemon: true when the owner is listed in
 `scope_authority_owners`. Providers check that flag rather than keeping their own copy of the
@@ -198,19 +223,28 @@ How a reader holding something bound to `(owner, ref, scope_epoch)` decides, in 
 1. `live` with the same `scope_epoch`: use it.
 2. `live` with a different `scope_epoch`: a new session under a reused ref. Refuse by name; the
    old binding is dead.
-3. `ended`, or `not_live` with `owner_synced: true`: refuse by name. An evicted tombstone reads
-   as `not_live`, which refuses too.
+3. `ended`, or `not_live` with `owner_synced: true`: refuse by name, and the binding is dead. An
+   owner's first sync of an incarnation is its full set, so a ref missing from it is ended even if
+   its tombstone was lost to a restart or evicted.
 4. `not_live` with `owner_synced: false` and `owner_configured: true`: not re-synced yet. Hold,
    and refuse as `scope_unverifiable` past the reader's own bound.
 5. `not_live` with `owner_configured: false`: the owner will never sync. Refuse the action.
-Refusing an action never deletes what the reader stores; only an `ended` answer or event does.
+In cases 2 and 3 the reader may delete what it stores for that binding. In cases 4 and 5 it keeps
+it. As a backstop against an owner that never returns, every stored binding also has its own
+expiry.
+
+**Two different holds.** A live call that meets case 4 waits within its caller's deadline and at
+most 45 s, then refuses `scope_unverifiable`. A stored approval is different: it is kept, not
+refused, for as long as its own expiry allows, and it executes only after a later read answers
+case 1. The 45 s bound applies to a call waiting now, never to a stored approval.
 
 `scope.subscribe` (deferred to stage 7) is a held request shaped like
 `supervisor.spawn_subscribe`, with the same `{daemon_incarnation, seq}` cursor and too-old-cursor
 refusal. It sends a snapshot of live scopes, then events:
 - `{owner, ref, scope_epoch, created}` when a scope is created;
 - `{owner, ref, scope_epoch, ended}` when a scope ends;
-- `{owner, ref, scope_epoch, changed}` when its carriers, `delegates` or `parent_ended` change;
+- `{owner, ref, scope_epoch, changed}` when its carriers, `delegates`, `agent_id` or `parent_state`
+  change;
 - `{owner, synced, scopes: [...]}` when an owner's first sync of this incarnation is accepted,
   carrying that owner's full live set.
 A scope of that owner the reader holds and not in the `synced` set is ended. Before the owner's
@@ -227,17 +261,19 @@ caller may re-open within its own deadline.
 | `scope_changed` | `route.open` commit | the record changed between admission and commit | yes |
 | `scope_not_live` | `route.open` | the owner synced and the ref is not in its set, or the owner is not configured | no |
 | `scope_ended` | `route.open`, admission or commit | the named epoch is not the live one, or the scope ended | no |
-| `scope_epoch_required` | `route.open` | a non-owner opener named no epoch | no |
+| `scope_epoch_required` | `route.open` | the open named no epoch | no |
 | `scope_not_carrier` | `route.open` | the opener is not the owner or a carrier, or not targeted at this module | no |
 | `scope_unsupported` | carrier, before opening | the daemon does not advertise `scopes/v1` | no |
 | `scope_sync_not_authority` | `scope.sync` | the connection is not the owner's sync authority | no |
 | `scope_sync_stale` | `scope.sync` | the generation is not larger than the last accepted | no |
 | `scope_epoch_regressed` | per record in a sync | the epoch is lower than the one held | no |
 | `scope_attribute_not_permitted` | per record in a sync | a gated attribute from an owner not in `scope_authority_owners` | no |
-| `scope_parent_not_permitted` | per record in a sync | the syncing owner is not the parent's owner or in its `child_owners`, or the parent epoch is not live | no |
+| `scope_parent_not_permitted` | per record in a sync | the parent's owner has synced, and the syncing owner is not the parent's owner or in its `child_owners`, or the parent epoch is not live | no |
+| `scope_kind_changed` | per record in a sync | `kind` differs from the held record at the same epoch | no |
+| `scope_epoch_ended` | per record in a sync | the `(owner, ref, scope_epoch)` was ended in this incarnation | no |
 
-A hold for `scope_not_synced` is bounded by the opener's own deadline and, for a stored action,
-by the reader's hold bound (section 5, case 4). There is no separate daemon-side hold.
+A hold for `scope_not_synced` is bounded by the opener's own deadline and at most 45 s; a stored
+approval is kept, not held, as in section 5. There is no separate daemon-side hold.
 
 Which live routes a record change drains:
 
@@ -248,7 +284,8 @@ Which live routes a record change drains:
 | a module removed from a carrier's `targets` | that carrier's routes to that module | `scope_carrier_removed` |
 | `delegates` true to false | every route under it | `scope_delegation_changed` |
 | `agent_id` changed | every route under it | `scope_delegation_changed` |
-| anything else (`kind`, `child_owners`, a carrier or target added, an unchanged record) | none | |
+| `parent_state` becomes `ended` | every route under it | `scope_parent_ended` |
+| anything else (`child_owners`, a carrier or target added, `parent_state` from `pending` to `linked`, an unchanged record) | none | |
 
 A route whose stamp names an older `version` but is not in a drained row stays up: its stamp
 still grants no more than the current record does.
@@ -265,10 +302,12 @@ Lock order is scope table, then forwarding table, always. Commit already holds t
 write lock and never takes the scope lock: it compares the pending bind's captured tag with the
 record's current `(scope_epoch, version)`, which a sync publishes into the forwarding table in the
 same step that changes the record. Ending or changing a scope: take the scope write lock, update
-the record, then take the forwarding write lock, publish the new `(scope_epoch, version)`, and
-remove every route and pending bind tagged with the old one on every endpoint, including
-superseded endpoints of a swap. A commit before that step is collected by it; a commit after it
-sees the new version and refuses.
+the record, then take the forwarding write lock and publish the new `(scope_epoch, version)`. Every
+pending bind tagged with the old version is then refused at commit (`scope_changed`, or
+`scope_ended` if the scope ended). Live routes are drained only as the table in section 5a says, on
+every endpoint including superseded endpoints of a swap: a change in the "none" row, such as adding
+a carrier, leaves every live route and its in-flight calls alone. A commit before the publish is
+covered by the drain rule; a commit after it sees the new version and refuses.
 
 **Restarts and upgrades are the same case for scopes.** The table starts empty, every
 `owner_synced` is false, `daemon_incarnation` is new, and readers hold as in section 5. The
@@ -288,7 +327,14 @@ when a new session reuses the ref.
 - Bind stored approvals and grants to `(owner, ref, scope_epoch)`, and decide on them as in
   section 5.
 - Treat the route's stamp as fixed for the route's life. A change that revokes authority drains
-  the route (section 3), so a provider need not re-check per call.
+  the route (section 3), so no new call arrives on it.
+- **A drain does not stop a call already delivered.** The daemon never reads request bodies and
+  cannot recall a frame it has forwarded; a drained route's in-flight call may still run in the
+  module. Whether a provider must re-check the scope (`scope.describe`) before an irreversible or
+  delegated action it received before a revocation is an open decision for the operator (triage
+  row T19). Until it is ruled, a provider that holds a call past its own reply (an approval, a
+  deferred execution) re-checks at the point of execution, which Plexus and Cerebellum already
+  do.
 
 ## 8. Rollout
 
@@ -308,6 +354,17 @@ Readers first, then writers:
 
 Each fails by name when its rule is removed:
 - only the owner or a listed carrier is admitted; `direct` can neither sync nor own;
+- an open without `scope_epoch`, the owner's included, is refused `scope_epoch_required`;
+- a change of `kind` at the same epoch is refused `scope_kind_changed`; re-sending a tombstoned
+  epoch is refused `scope_epoch_ended`;
+- a child synced before its parent's owner is accepted as `pending`, becomes `linked` or `ended`
+  when the parent's owner syncs, and is never refused for the order; every restart ordering of
+  parent and child owners is tested;
+- a parent ending drains its children's live routes with `scope_parent_ended`;
+- adding a carrier leaves another carrier's in-flight call intact, and a stale pending bind is
+  refused at commit;
+- a swap candidate never takes sync authority, including one that fails and is rolled back, and
+  the serving owner's syncs are accepted throughout;
 - an open naming a `scope_epoch` other than the live one is refused `scope_ended`; an open before
   the owner's first sync of this incarnation is refused `scope_not_synced` (retryable), and after
   it, for a ref not in the set, `scope_not_live`;
@@ -325,8 +382,7 @@ Each fails by name when its rule is removed:
   is refused without changing anything;
 - a parent is accepted only from its owner or a principal in its `child_owners`, and only at its
   live epoch; a carrier of the parent is refused; a cycle is refused; a new session under the
-  parent's ref makes existing children read `parent_ended`;
-- a non-owner open without `scope_epoch` is refused `scope_epoch_required`;
+  parent's ref makes existing children read `parent_state: ended`;
 - re-sending an unchanged record does not move its `version` or drain anything;
 - a record refused in a sync keeps its previous state while the rest applies;
 - a connection with the owner's current launch nonce takes sync authority from an older launch's;
@@ -349,8 +405,9 @@ From the Athena review of r2 (five seats):
    owner could set them, so any supervised module could claim a user's agent.
 3. The relay admission class is deleted. In r2 any module a session called could present its
    full stamp, `delegates` included, to any target.
-4. A parent is accepted only from the parent's owner or carrier; r2's "serving it" clause let
-   any callee forge a parent link.
+4. A parent is accepted only from the parent's owner (and, since r6, a principal in its
+   `child_owners`); r2's "serving it" clause let any callee forge a parent link. An earlier wording
+   of this item also allowed the parent's carrier, which r6 removed.
 5. The commit re-check is a settled rejection arm, not an `Err` that closes the module
    connection, and it reads a tag in the forwarding table instead of taking the scope lock.
 6. Stamps are snapshots: removing a carrier or turning off `delegates` drains routes, and a
@@ -384,3 +441,17 @@ From the Athena review of extensibility r7:
 17. One refusal table and one drain table (section 5a).
 18. `hook_order` left the daemon for `session.plan`; `scope.subscribe` and `scope.patch` are
     deferred to stage 7, and `subscribe` gains `created` events and a full set on `synced`.
+
+From the Athena review of extensibility r7.2:
+19. `kind` is fixed per epoch and an ended epoch cannot be re-created (T8, T13).
+20. Parent links are verified against the parent's owner's synced set, with a `pending` state for
+    any restart ordering, and a parent ending drains its children's routes (T11, T12).
+21. Every open names the epoch, the owner's included (T21); `owner_authorized` is the only rule
+    and its key is restart-required (T14, T22).
+22. "Current launch" means the supervisor's active launch, so a swap candidate never takes sync
+    authority (T7).
+23. Stored approvals are kept under their own expiry and a live call waits at most 45 s; a full-set
+    miss is definitive and may be deleted (T10, T18).
+24. The locking prose drains per the table, not every route (T15); the drain-reason prose matches
+    the table (T16); section 1 points at the launch-nonce track (T17); the non-authority field list
+    includes `child_owners` (T9); a drain does not recall a delivered call (T19, open).

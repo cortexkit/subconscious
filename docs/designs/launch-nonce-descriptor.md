@@ -1,7 +1,7 @@
 # Launch nonce over an inherited descriptor
 
-Status: design r5 (r4 plus the Athena review of extensibility r7.2 and the operator's ruling on
-the Thalamus gateway). r4 added each seat's signing measurements. r3 added the throwaway spike
+Status: design r6 (r5 plus rows T4 and T6 of the Athena review of extensibility r7.2). r5 added
+the review's roster and staging and the operator's ruling on the Thalamus gateway. r4 added each seat's signing measurements. r3 added the throwaway spike
 recorded in `launch-nonce-spike-results.md`. Nothing here is built; the extensibility design (magic-context
 `ck-extensibility-design-r7.2.md`, sections 4.9 and 18) makes it a stage-2 prerequisite, and it
 waits on the operator's approval of that design as a whole.
@@ -143,8 +143,10 @@ plus SDK routes, Prefrontal has six direct readers). The module's test opens a r
 has read from the descriptor. Because the accessor never clears the environment, a missed reader
 still works until step 4; `ck fleet lint` and the census are what find it before then.
 
-Helper processes a module starts that must connect as the module (not agent children) are given
-the nonce explicitly by the module, never through an inherited environment.
+Helper processes a module starts that must connect as the module (not agent children) get the
+nonce the same way the module did: over a one-read pipe the module creates and hands to the helper,
+read by the same accessor. Never in argv, never in the environment, never in a file, because all
+three are readable by a same-user process. `subc-os` exposes the handoff for modules to use.
 
 ## 4. Census
 
@@ -197,13 +199,19 @@ Until step 4, widening operations behave as they do today, and the note makes no
 2. The daemon starts passing the descriptor as well as the environment variable.
 3. Every module adopts the accessor, is signed with hardened runtime, and is redeployed; so is
    `ck-subc`. The census reads `fd` and hardened for all of them.
-4. The daemon stops setting `SUBC_LAUNCH_NONCE`. A module that still reads only the environment
-   now fails its HELLO with a named refusal and does not start, which is the intended fail-closed
-   result, and the census before this step is what makes it not happen.
+4. The daemon stops setting `SUBC_LAUNCH_NONCE`, then relaunches every module once. A nonce
+   rotates on every respawn, so the relaunch makes every nonce ever delivered in an environment
+   dead: a process still holding one (a module started before the switch, or a helper it spawned)
+   can no longer present it. The final census then reads, for every running spawned process, that
+   its HELLO says `fd` and that `SUBC_LAUNCH_NONCE` is absent from its initial environment
+   (`KERN_PROCARGS2`). A module that still reads only the environment fails its HELLO with a named
+   refusal and does not start, the intended fail-closed result, and the census before this step is
+   what makes it not happen.
 5. The operator-authority rule goes into force.
 
 Step 4 is a daemon config switch first (`launch_nonce_env: false`), so it can be turned back on
-without a rebuild if a module was missed.
+without a rebuild if a module was missed. Turning it back on voids the operator-authority claim:
+the rule is out of force until step 4 is redone, relaunch and final census included.
 
 ## 6. Tests
 

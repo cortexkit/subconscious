@@ -53,7 +53,13 @@ final class FedStoreFlushBenchmarkTests: XCTestCase {
             try await seedSettledDocument(in: dir, records: 540)
             let seededSize = try documentSize(in: dir)
 
+            // For the SQLite store the first open imports the seeded 3 MB
+            // document (build, verify, rename), which is what a phone upgrading
+            // from the file store pays once, on its first dial.
+            let openStarted = DispatchTime.now().uptimeNanoseconds
             let store = try await open(kind, in: dir)
+            let openMs = Double(DispatchTime.now().uptimeNanoseconds - openStarted) / 1_000_000
+            print(String(format: "FED_STORE_BENCH store=%@ seeded=540 first_open_ms=%.2f", kind.rawValue, openMs))
             let log = FedOriginEffectLog(store: store, responderStaticPublicKey: responder)
 
             let changes = 20

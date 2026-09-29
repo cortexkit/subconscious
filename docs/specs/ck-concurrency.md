@@ -160,11 +160,10 @@ how they nest inside section 2.
 - **Callosum (CALLO):** `callosum/docs/concurrency-limits.md` (callosum master, 37267f1),
   including the federation rate buckets (32/s, burst 32, 16 concurrent) and the ledger grace.
 
-### 3.2 Pending
-
-- Magic Context (MC).
-- Thalamus (THALAMUS): its limits are in the room thread; its section-0 cases are folded into
-  rules 2, 3 and 6 and into section 2.
+- **Magic Context (MC):** `magic-context/docs/architecture/concurrency-limits.md` (magic-context
+  master, 5cbcbb7f).
+- **Thalamus (THALAMUS):** `thalamus/docs/concurrency-limits.md` (thalamus master, f82a9cc). Its
+  section-0 cases are folded into rules 2, 3 and 6 and into section 2.
 
 ### 3.3 AFT (inlined from AFT, not published elsewhere)
 

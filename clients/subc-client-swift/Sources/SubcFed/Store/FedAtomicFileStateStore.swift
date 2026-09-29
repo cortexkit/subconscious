@@ -472,25 +472,10 @@ public actor FedAtomicFileStateStore: FedStateStore {
         // honest epoch (poison is keyed per epoch, not per peer).
         guard destination.poisonedLedgerEpochs.isEmpty else { return }
         let incarnation = doc.global.localIncarnation
-        let settledSeqs = destination.unresolvedEffects
-            .filter { $0.effect.incarnation == incarnation && $0.isSettled }
-            .map(\.effect.seq)
-        guard let maxSettled = settledSeqs.max(), maxSettled > 0 else { return }
-        var watermarkSeq: UInt64 = 0
-        for seq in 1...maxSettled {
-            let matches = destination.unresolvedEffects.filter {
-                $0.effect.incarnation == incarnation && $0.effect.seq == seq
-            }
-            if matches.isEmpty {
-                watermarkSeq = seq
-                continue
-            }
-            if matches.allSatisfy(\.isSettled) {
-                watermarkSeq = seq
-            } else {
-                break
-            }
-        }
+        let watermarkSeq = FedWatermark.contiguousSettledPrefix(
+            of: destination.unresolvedEffects,
+            incarnation: incarnation
+        )
         guard watermarkSeq > 0 else { return }
         let candidate = FedConfirmedWatermark(incarnation: incarnation, seq: watermarkSeq)
         if let existing = destination.confirmedWatermark,

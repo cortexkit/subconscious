@@ -241,27 +241,10 @@ public actor FedMemoryStateStore: FedStateStore {
         // honest epoch (poison is keyed per epoch, not per peer).
         guard destination.poisonedLedgerEpochs.isEmpty else { return }
         let incarnation = doc.global.localIncarnation
-        let settled = destination.unresolvedEffects
-            .filter { $0.effect.incarnation == incarnation && $0.isSettled }
-            .map(\.effect.seq)
-        guard let maxSettled = settled.max() else { return }
-        // Contiguous prefix from 1: watermark covers every settled seq with no gap of unsettled.
-        var watermarkSeq: UInt64 = 0
-        for seq in 1...maxSettled {
-            let matches = destination.unresolvedEffects.filter {
-                $0.effect.incarnation == incarnation && $0.effect.seq == seq
-            }
-            if matches.isEmpty {
-                // Gaps belonging to other destinations are vacuous for this peer.
-                watermarkSeq = seq
-                continue
-            }
-            if matches.allSatisfy(\.isSettled) {
-                watermarkSeq = seq
-            } else {
-                break
-            }
-        }
+        let watermarkSeq = FedWatermark.contiguousSettledPrefix(
+            of: destination.unresolvedEffects,
+            incarnation: incarnation
+        )
         if watermarkSeq > 0 {
             let candidate = FedConfirmedWatermark(incarnation: incarnation, seq: watermarkSeq)
             if let existing = destination.confirmedWatermark,

@@ -1,6 +1,7 @@
 # Launch nonce over an inherited descriptor
 
-Status: design r2 (r1 plus the room's review). Nothing here is built; the extensibility design (magic-context
+Status: design r3 (r2 plus a throwaway spike on this Mac, recorded in
+`launch-nonce-spike-results.md`). Nothing here is built; the extensibility design (magic-context
 `ck-extensibility-design-r7.2.md`, sections 4.9 and 18) makes it a stage-2 prerequisite, and it
 waits on the operator's approval of that design as a whole.
 
@@ -16,9 +17,24 @@ profile does not stop that read from an agent shell, even with `process-info*` a
 and act as that module, including `reserved:callosum`, which is what the operator-authority rule
 rests on.
 
-A pipe's contents are not readable by another process without debugger rights, which hardened
-runtime and SIP block. Handing the nonce over an inherited descriptor, read once at startup, closes
-that path.
+**The descriptor alone is not the boundary; debuggability is.** The spike measured it: with
+Developer Mode on, `lldb -p <module pid>` from another same-user shell attached with no prompt and
+`read(3, ...)` returned the exact nonce before the module had read it. After the module reads it,
+the nonce sits in its memory for the life of the process, where a debugger reads it just as easily.
+A copy of the same binary signed with hardened runtime refused the attach. No installed fleet
+binary is hardened today (all are `adhoc`, `adhoc,linker-signed` or unsigned), and `ck-subc` itself,
+which holds every module's nonce, is signed without hardened runtime.
+
+So the boundary needs both halves:
+1. **The nonce is never in the environment,** which is readable without any debugger rights. That
+   is this note's descriptor handoff.
+2. **Every module binary and `ck-subc` are signed with hardened runtime and without
+   `com.apple.security.get-task-allow`,** so no same-user process can attach and read the pipe or
+   the process memory. That is a signing requirement in every module's release pipeline, checked
+   by the census (section 4) and by the placement gate.
+
+Neither half alone does anything against a same-user process. Whether an agent's Seatbelt profile
+blocks attach on its own was not tested; it is not relied on.
 
 What it does not close: `direct` (any same-user process holding the connection file) and keys
 stored in same-user files (the iOS simulator keys CALLO found). Those are separate decisions.
@@ -26,16 +42,34 @@ stored in same-user files (the iOS simulator keys CALLO found). Those are separa
 ## 2. Daemon
 
 For each subc-wire spawn, in `apply_wire_spawn_args_for_role`:
-1. Create a pipe. Write the nonce to it and close the write end in the daemon. The nonce is 32
-   bytes of hex, well under the pipe buffer, so the write never blocks.
-2. Hand the read end to the child as descriptor 3 on Unix, and set `SUBC_LAUNCH_NONCE_FD=3`. On
-   Windows, make the read handle inheritable and set `SUBC_LAUNCH_NONCE_FD` to its value.
+1. Create a pipe (`std::io::pipe()`, both ends close-on-exec). Write the nonce (32 random bytes
+   as 64 hex characters, well under the pipe buffer, so the write never blocks) and drop the write
+   end in the daemon.
+2. Hand the read end to the child as descriptor 3 and set `SUBC_LAUNCH_NONCE_FD=3:<pipe inode>`.
+   The inode names the pipe, so an accessor can tell it from an unrelated descriptor that happens
+   to have number 3 (section 3).
 3. During the rollout (section 5) also keep setting `SUBC_LAUNCH_NONCE`; stop at step 4.
 
-The descriptor setup needs `dup2` between fork and exec. That goes in `subc-os`, the crate that
-already holds the daemon's unsafe OS calls, with the existing rule for pre-exec code in a
-multi-threaded runtime: no allocation, only async-signal-safe calls, everything prepared before
-the fork.
+The handoff is one `pre_exec` step registered through `tokio::process::Command::as_std_mut()`, so
+`subc-os` needs no tokio. It calls only `dup2(src, 3)`, or, when the read end already has number 3,
+`fcntl` to clear `FD_CLOEXEC` (a `dup2(3, 3)` does nothing and would leave the descriptor to close at
+exec). Three rules the spike found:
+- **It is the last `pre_exec` step registered,** after cgroup placement: `dup2` closes whatever the
+  child held at 3, and the Linux cgroup step writes through a captured descriptor. So
+  `apply_wire_spawn_args_for_role` returns the prepared handoff and the spawn installs it just
+  before `spawn()`.
+- It follows the existing rule for pre-exec code in a multi-threaded runtime: no allocation, only
+  async-signal-safe calls, everything prepared before the fork. A counting-allocator test proves
+  zero allocations on the dup2 path, the already-at-3 path and the error path.
+- Any `pre_exec` step makes Rust's std fork and exec instead of using `posix_spawn` on macOS. Every
+  module spawn takes that path.
+
+**Windows** keeps the nonce in the environment in v1, and the note says so. An inheritable handle
+leaks to every process any thread creates concurrently, because std's `CreateProcessW` always
+inherits handles and its lock covers only its own stdio. Restricting inheritance needs
+`PROC_THREAD_ATTRIBUTE_HANDLE_LIST` through a direct `CreateProcessW` (std's attribute API is
+unstable and cannot name its own stdio handles), which is its own slice. The operator-authority
+rule's claim is therefore macOS and Linux only until that lands.
 
 `protocol: "none"` children get neither the pipe nor the variable, as today they get no nonce.
 
@@ -44,18 +78,28 @@ the fork.
 `subc_os::launch_nonce() -> Result<Option<LaunchNonce>, LaunchNonceError>`, exported for every
 module whatever its connection layer (subc-client-rs, or its own frame loop as in Broca, AFT and
 Cerebellum; Thalamus and Plexus use both):
-- On first call, if `SUBC_LAUNCH_NONCE_FD` is set, read the descriptor to end of file and close
-  it. Otherwise read `SUBC_LAUNCH_NONCE` (the rollout fallback).
+- On first call, if `SUBC_LAUNCH_NONCE_FD` is set, `fstat` the named descriptor and take it only
+  if it is a FIFO with the named inode; then read it to end of file and close it. A descriptor that
+  is not open, not a pipe, or a different pipe is refused by name (`NotOpen`, `NotAPipe`,
+  `WrongPipe`) and left untouched. Otherwise read `SUBC_LAUNCH_NONCE` (the rollout fallback).
 - Cache the value and its source (`fd` or `env`) for the process's life, and return the cached
   value on every later call. **Every reader in a process must go through this one accessor**,
-  including the SDK's route-open path: a second, independent read of the descriptor would find it
-  already closed.
+  including the SDK's route-open path. A second, independent read would not just find the
+  descriptor closed: numbers are reused lowest-first, so after the close the next socket or file
+  the process opens is usually descriptor 3, and an unchecked reader would read and close it.
 - **It never modifies the process environment.** Removing variables would break any reader still
   on the environment during the rollout (a module whose HELLO moved to the accessor while six
   other readers had not would open those routes without identity), and changing the environment
-  of a multi-threaded process is unsound in Rust anyway. The descriptor never reaches a child: it
-  is close-on-exec from the start and closed on first read. The environment copy disappears for
+  of a multi-threaded process is unsound in Rust anyway. The environment copy disappears for
   everyone at rollout step 4, when the daemon stops setting it.
+- **Call it first.** In the module, descriptor 3 is inheritable until the first read (it cannot be
+  close-on-exec, or exec would have closed it), and std does not close inherited descriptors, so a
+  child spawned before the first read inherits the pipe. The module calls the accessor before it
+  spawns anything: first thing in `main`, or in the SDK's init path. Lint checks it.
+- **A grandchild gets nothing.** A process the module spawns inherits `SUBC_LAUNCH_NONCE_FD` (the
+  accessor never clears the environment) but not the pipe, so its accessor answers `NotOpen` or
+  `WrongPipe`. That is the intended isolation, and a behaviour change: today a tool a module runs
+  (for example `ck`) inherits `SUBC_LAUNCH_NONCE` and silently acts as the module.
 - A descriptor that is named but unreadable or empty is an error with its own message, never a
   silent fallback to the environment.
 - `subc-os` stays light: the accessor pulls nothing heavier than `subc-protocol` does, and no
@@ -96,8 +140,16 @@ daemon records it, and `ck --json provenance <id>` reports it per running module
 the running images, never the locks: a module counts as done only when its live HELLO says `fd`.
 A module declaring no provenance counts as not done.
 
-`ck fleet lint` flags any direct read of `SUBC_LAUNCH_NONCE` in module source, so a module with
-its own frame loop cannot skip the accessor unnoticed.
+The census also reads each running binary's code-signing flags: a module counts as done only when
+its HELLO says `fd` AND its running image is signed with hardened runtime and without
+`get-task-allow`, and `ck-subc` must meet the same signing rule. The placement gate refuses to
+replace a hardened module with an unhardened build.
+
+`ck fleet lint` flags any direct read or removal of `SUBC_LAUNCH_NONCE` in module source, so a
+module with its own frame loop cannot skip the accessor unnoticed. Readers already known in this
+repo: subc-client-rs (HELLO, `lib.rs`; route open, `consumer.rs`), subc-mcp (three sites),
+`ck-bus` (`credentials/vault.rs`), `mcp-stdio-adapter` (`attestation.rs`, which calls
+`env::remove_var` on it today and must stop), and `fake-aft-stub`.
 
 ## 5. Rollout
 
@@ -105,7 +157,8 @@ Readers first; the boundary exists only after the last step.
 1. Publish the accessor (`subc-os`, subc-client-rs, `@cortexkit/subc-client`), with patch
    releases on lines modules are pinned to (the Thalamus gateway pins subc-client-rs 0.18.4).
 2. The daemon starts passing the descriptor as well as the environment variable.
-3. Every module adopts the accessor and is redeployed. The census reads `fd` for all of them.
+3. Every module adopts the accessor, is signed with hardened runtime, and is redeployed; so is
+   `ck-subc`. The census reads `fd` and hardened for all of them.
 4. The daemon stops setting `SUBC_LAUNCH_NONCE`. A module that still reads only the environment
    now fails its HELLO with a named refusal and does not start, which is the intended fail-closed
    result, and the census before this step is what makes it not happen.
@@ -122,7 +175,19 @@ without a rebuild if a module was missed.
   touches the descriptor.
 - The accessor leaves the process environment unchanged.
 - `ps eww` on a spawned child shows no `SUBC_LAUNCH_NONCE` once step 4 is on.
-- The descriptor is not inherited by a grandchild the module spawns.
-- A named but empty descriptor fails with its own message, never falls back.
+- A grandchild spawned after the module's first read gets no descriptor, and its accessor refuses
+  by name; the spawn-before-read case is covered by the "call it first" lint.
+- A named but empty descriptor, a closed one, a non-pipe and a different pipe each fail with their
+  own error, never fall back, and leave the descriptor untouched.
+- The handoff installed after the cgroup step survives a colliding descriptor 3; the read end
+  already at 3 still reaches the child.
+- The pre-exec step allocates nothing (counting allocator on its thread).
 - Provenance reports `fd` or `env` correctly, and an older daemon ignores the field.
-- The pre-exec path allocates nothing (the existing pre-exec test pattern).
+- A same-user `lldb -p` on a module signed per section 1 is refused.
+
+## 7. Separate defect found by the spike
+
+The daemon passes to modules every descriptor it inherited without close-on-exec (the spike's probe
+received the tool runner's descriptors 4 and 5). Under launchd the daemon inherits only 0 to 2, so
+production is likely unaffected, but a daemon started from a shell leaks whatever that shell held.
+The spawn should close every descriptor above 2 other than the handoff; that is a separate fix.

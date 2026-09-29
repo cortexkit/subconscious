@@ -1,7 +1,7 @@
 # Launch nonce over an inherited descriptor
 
-Status: design r3 (r2 plus a throwaway spike on this Mac, recorded in
-`launch-nonce-spike-results.md`). Nothing here is built; the extensibility design (magic-context
+Status: design r4 (r3 plus each seat's signing measurements). r3 added the throwaway spike
+recorded in `launch-nonce-spike-results.md`. Nothing here is built; the extensibility design (magic-context
 `ck-extensibility-design-r7.2.md`, sections 4.9 and 18) makes it a stage-2 prerequisite, and it
 waits on the operator's approval of that design as a whole.
 
@@ -35,6 +35,25 @@ So the boundary needs both halves:
 
 Neither half alone does anything against a same-user process. Whether an agent's Seatbelt profile
 blocks attach on its own was not tested; it is not relied on.
+
+**What the signing rule is, precisely** (measured by each seat on copies of its own binary):
+- **The boundary is `runtime` present and `com.apple.security.get-task-allow` absent.** Other
+  hardened-runtime exceptions do not reopen attach: a copy with `cs.allow-jit` and
+  `cs.allow-unsigned-executable-memory` still refused `lldb`.
+- **Plain Rust binaries linking only system libraries need nothing else:** ck-subc, broca,
+  Magic Context, Thalamus, callosum, prefrontal-core and prefrontal-routing all ran normally with
+  `-o runtime` alone.
+- **JIT runtimes (a `bun build --compile` or node binary) need `cs.allow-jit` and
+  `cs.allow-unsigned-executable-memory`.** Without them nothing fails: `--version` works and the
+  engine silently runs without its JIT, 14x slower in a measured loop (condition-runner). So the
+  placement gate and census check those two entitlements are present on any binary that embeds a
+  JIT, and a module of that kind runs a startup self-test that its JIT is live.
+- **A module that loads a dylib not signed by its own team needs
+  `cs.disable-library-validation`, and that opens a third path**: the dylib is code running inside
+  the module, where the nonce is. AFT loads ONNX Runtime from a user-writable directory. Such a
+  module must verify the dylib's sha256 against a pinned list before loading it, and accept any
+  other path only from an operator setting fixed at spawn, so a running module cannot be
+  redirected. The same rule applies to any future module with a plugin or dylib load.
 
 What it does not close: `direct` (any same-user process holding the connection file) and keys
 stored in same-user files (the iOS simulator keys CALLO found). Those are separate decisions.
@@ -140,10 +159,11 @@ daemon records it, and `ck --json provenance <id>` reports it per running module
 the running images, never the locks: a module counts as done only when its live HELLO says `fd`.
 A module declaring no provenance counts as not done.
 
-The census also reads each running binary's code-signing flags: a module counts as done only when
-its HELLO says `fd` AND its running image is signed with hardened runtime and without
-`get-task-allow`, and `ck-subc` must meet the same signing rule. The placement gate refuses to
-replace a hardened module with an unhardened build.
+The census also reads each running binary's code signature: a module counts as done only when its
+HELLO says `fd` AND its running image has the `runtime` flag and no `get-task-allow`, plus the two
+JIT entitlements if it embeds a JIT, and a module with `disable-library-validation` has a recorded
+dylib pin. `ck-subc` meets the same rule. The placement gate refuses a staged build that fails
+it, and refuses to replace a hardened module with an unhardened build.
 
 `ck fleet lint` flags any direct read or removal of `SUBC_LAUNCH_NONCE` in module source, so a
 module with its own frame loop cannot skip the accessor unnoticed. Readers already known in this
@@ -184,6 +204,8 @@ without a rebuild if a module was missed.
 - The pre-exec step allocates nothing (counting allocator on its thread).
 - Provenance reports `fd` or `env` correctly, and an older daemon ignores the field.
 - A same-user `lldb -p` on a module signed per section 1 is refused.
+- A JIT-embedding module signed without the JIT entitlements fails its startup self-test by name.
+- A module with a dylib pin refuses a replaced dylib.
 
 ## 7. Separate defect found by the spike
 

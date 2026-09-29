@@ -41,7 +41,11 @@ use common::{
     start_test_daemon_with_route_bind_relay_overrides, TestDaemon,
 };
 
-const READ_TIMEOUT: Duration = Duration::from_secs(2);
+// How long a test waits for a frame it expects before failing. It is a guard against a hang,
+// never the property under test: no test in this file waits on it expecting silence, so a
+// larger value only lengthens a failure. 2 s timed out on a loaded Windows runner with two
+// tests stalling at the same instant, so it is sized for CI rather than for this machine.
+const READ_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long supervisor_reload_rejects_new_work_during_drain's in-flight
 /// request holds the drain open. Every assertion in that test runs while the
 /// module is draining, so this must outlast the observe-then-act window; any

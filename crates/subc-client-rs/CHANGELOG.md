@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.22.1 — 2026-09-29
+
+- `ModuleHandler::on_connection_end(end)` reports how a served module's daemon connection ended:
+  `ConnectionEnd::Goodbye` (a channel-0 GOODBYE, a planned stop), `Eof` (closed without one),
+  `Reset`, or `Closed` (the module closed it through its `ModuleHandle`). `serve` still returns
+  `Ok(())` for all four; the hook is called once, after in-flight requests are cancelled, and
+  not when serving ends with an error. It has a no-op default, so existing handlers are
+  unaffected.
+
 ## 0.22.0 — 2026-09-28
 
 - `DEFAULT_ROUTE_RETRY_DEADLINE` is 90s instead of 30s. A module restart drains its routes (up to

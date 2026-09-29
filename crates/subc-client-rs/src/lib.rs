@@ -770,6 +770,49 @@ pub trait ModuleHandler: Send + Sync + 'static {
 
     /// A route was torn down, rejected, or abandoned before its bind ACK was queued.
     async fn on_route_gone(&self, _handle: &RouteHandle) {}
+
+    /// The daemon connection ended without a protocol error, and serving is
+    /// about to return `Ok(())`. `end` says how: a daemon GOODBYE is a planned
+    /// stop, a clean EOF or a reset means the daemon went away without one.
+    /// Called once, after every in-flight request has been cancelled. Not
+    /// called when serving returns an error.
+    async fn on_connection_end(&self, _end: ConnectionEnd) {}
+}
+
+/// How a module's daemon connection ended, when it ended without a protocol
+/// error. `serve` returns `Ok(())` for all of these; a module that wants to
+/// log or act on the difference reads it in
+/// [`ModuleHandler::on_connection_end`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ConnectionEnd {
+    /// The daemon sent GOODBYE on channel 0: a planned stop.
+    Goodbye,
+    /// The daemon closed the connection without GOODBYE.
+    Eof,
+    /// The connection was reset or aborted (how a killed daemon's socket ends
+    /// on Windows).
+    Reset,
+    /// The module closed the connection itself through its [`ModuleHandle`].
+    Closed,
+}
+
+impl ConnectionEnd {
+    /// Stable lower-case name for logs: `goodbye`, `eof`, `reset`, `closed`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Goodbye => "goodbye",
+            Self::Eof => "eof",
+            Self::Reset => "reset",
+            Self::Closed => "closed",
+        }
+    }
+}
+
+impl std::fmt::Display for ConnectionEnd {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// The terminal result of a module request handler.
@@ -919,7 +962,8 @@ enum BindDecisionKind {
 /// Run a module to completion. Reads `--subc <connection-file>` from args, uses
 /// `SUBC_MODULE_ID` when set by the process that launched the module, connects,
 /// authenticates, sends HELLO, waits for HELLO_ACK, then serves frames until
-/// GOODBYE or clean EOF.
+/// GOODBYE or clean EOF. Which of those ended it is passed to
+/// [`ModuleHandler::on_connection_end`].
 pub async fn serve<H>(mut manifest: ModuleManifest, handler: H) -> Result<(), SubcModuleError>
 where
     H: ModuleHandler,
@@ -980,6 +1024,13 @@ where
         let loop_result =
             module_loop(read_half, tx, Arc::clone(&handler), serve_handle.clone()).await;
         serve_handle.close_connection();
+        let loop_result = match loop_result {
+            Ok(end) => {
+                handler.on_connection_end(end).await;
+                Ok(())
+            }
+            Err(error) => Err(error),
+        };
 
         // module_loop cancelled every request in flight, so a handler that
         // honours cancellation lets the writer drain and finish. One that
@@ -1024,7 +1075,7 @@ async fn module_loop<R, H>(
     egress: mpsc::Sender<Frame>,
     handler: Arc<H>,
     module_handle: ModuleHandle,
-) -> Result<(), SubcModuleError>
+) -> Result<ConnectionEnd, SubcModuleError>
 where
     R: AsyncRead + Unpin,
     H: ModuleHandler,
@@ -1041,20 +1092,20 @@ async fn serve_frames<R, H>(
     handler: &Arc<H>,
     module_handle: &ModuleHandle,
     dispatcher: &RequestDispatcher,
-) -> Result<(), SubcModuleError>
+) -> Result<ConnectionEnd, SubcModuleError>
 where
     R: AsyncRead + Unpin,
     H: ModuleHandler,
 {
     loop {
         let read = tokio::select! {
-            () = module_handle.shared.close_token.cancelled() => return Ok(()),
+            () = module_handle.shared.close_token.cancelled() => return Ok(ConnectionEnd::Closed),
             read = read_frame(reader) => read,
         };
         let frame = match read {
             Ok(Some(frame)) => frame,
             // Clean EOF: the daemon closed the connection.
-            Ok(None) => return Ok(()),
+            Ok(None) => return Ok(ConnectionEnd::Eof),
             // A reset/abort on the read path also means the daemon is gone. On
             // Unix a killed daemon closes the socket with FIN (clean EOF above),
             // but Windows sends RST on process death, surfacing here as
@@ -1067,7 +1118,7 @@ where
                     std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
                 ) =>
             {
-                return Ok(());
+                return Ok(ConnectionEnd::Reset);
             }
             Err(err) => return Err(SubcModuleError::FrameIo(err)),
         };
@@ -1080,7 +1131,8 @@ where
         )
         .await?
         {
-            return Ok(());
+            // handle_frame returns false only for a channel-0 GOODBYE.
+            return Ok(ConnectionEnd::Goodbye);
         }
     }
 }
@@ -2739,6 +2791,63 @@ mod module_close_tests {
         async fn handle(&self, _ctx: RequestCtx, body: Vec<u8>) -> HandlerOutcome {
             HandlerOutcome::Response(body)
         }
+    }
+
+    /// Records every `on_connection_end` call, so a test can assert both the
+    /// cause and that it was reported exactly once.
+    #[derive(Clone, Default)]
+    struct EndRecorder(Arc<Mutex<Vec<ConnectionEnd>>>);
+
+    #[async_trait]
+    impl ModuleHandler for EndRecorder {
+        async fn handle(&self, _ctx: RequestCtx, body: Vec<u8>) -> HandlerOutcome {
+            HandlerOutcome::Response(body)
+        }
+        async fn on_connection_end(&self, end: ConnectionEnd) {
+            self.0.lock().unwrap().push(end);
+        }
+    }
+
+    async fn reported_end(recorder: &EndRecorder, served: &mut Served) -> Vec<ConnectionEnd> {
+        timeout(Duration::from_secs(5), &mut served.serve)
+            .await
+            .expect("serving must end")
+            .unwrap()
+            .unwrap();
+        recorder.0.lock().unwrap().clone()
+    }
+
+    #[tokio::test]
+    async fn a_daemon_goodbye_is_reported_as_goodbye() {
+        let recorder = EndRecorder::default();
+        let mut served = serve_against_stand_in(recorder.clone()).await;
+        send(&mut served.daemon, goodbye()).await;
+        assert_eq!(
+            reported_end(&recorder, &mut served).await,
+            vec![ConnectionEnd::Goodbye]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_daemon_closing_without_goodbye_is_reported_as_eof() {
+        let recorder = EndRecorder::default();
+        let mut served = serve_against_stand_in(recorder.clone()).await;
+        served.daemon.shutdown().await.unwrap();
+        assert_eq!(
+            reported_end(&recorder, &mut served).await,
+            vec![ConnectionEnd::Eof]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_module_closing_its_own_connection_is_reported_as_closed() {
+        let recorder = EndRecorder::default();
+        let mut served = serve_against_stand_in(recorder.clone()).await;
+        served.handle.close_connection();
+        assert_eq!(
+            reported_end(&recorder, &mut served).await,
+            vec![ConnectionEnd::Closed]
+        );
     }
 }
 

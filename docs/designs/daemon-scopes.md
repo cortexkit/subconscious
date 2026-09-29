@@ -1,9 +1,10 @@
 # Scopes: owned identity records in the daemon
 
-Status: design r7. Nothing here is built. r3 answered an Athena review of r2 (five seats, a
+Status: design r8. Nothing here is built. r3 answered an Athena review of r2 (five seats, a
 unanimous "do not implement as written"); r4 added the room's review of r3, r5 added targeted
 carriers, r6 answered the Athena review of extensibility r7, and r7 answers the Athena review of
-extensibility r7.2 (rows T2-T22, T85, T87 of its triage table). `scope.subscribe` and
+extensibility r7.2 (rows T2-T22, T85, T87 of its triage table); r8 records the operator's
+ruling on T19. `scope.subscribe` and
 `scope.patch` are specified here but deferred to stage 7; until then providers read `describe`. Section 10 lists
 what changed and why. The
 extensibility design (magic-context `.cortexkit/alfonso/plans/ck-extensibility-r6-7-amendments.md`,
@@ -330,11 +331,17 @@ when a new session reuses the ref.
   the route (section 3), so no new call arrives on it.
 - **A drain does not stop a call already delivered.** The daemon never reads request bodies and
   cannot recall a frame it has forwarded; a drained route's in-flight call may still run in the
-  module. Whether a provider must re-check the scope (`scope.describe`) before an irreversible or
-  delegated action it received before a revocation is an open decision for the operator (triage
-  row T19). Until it is ruled, a provider that holds a call past its own reply (an approval, a
-  deferred execution) re-checks at the point of execution, which Plexus and Cerebellum already
-  do.
+  module. So stopping work is the provider's job. The operator ruled (triage row T19) that a
+  revocation stops running work, not only new calls:
+  - a provider that holds a call past its own reply (an approval, a deferred execution) re-checks
+    the scope at the point of execution;
+  - a provider running work under a scope that outlives the call (AFT's foreground and background
+    commands, Cerebellum's open browser, a Broca run) ends it when the scope is revoked, and
+    reports it by name (`killed (scope revoked)`, `closed (scope revoked)`, the run sealed
+    Interrupted);
+  - the trigger is the route GOODBYE that the scope's drain sends on every route under it, wherever
+    the provider still holds one; work with no open route under the scope checks
+    `scope.describe` once per running task per interval until `scope.subscribe` ships in stage 7.
 
 ## 8. Rollout
 
@@ -455,3 +462,6 @@ From the Athena review of extensibility r7.2:
 24. The locking prose drains per the table, not every route (T15); the drain-reason prose matches
     the table (T16); section 1 points at the launch-nonce track (T17); the non-authority field list
     includes `child_owners` (T9); a drain does not recall a delivered call (T19, open).
+
+From the operator:
+25. T19 decided: revocation stops running work under the scope (section 7), not only new calls.

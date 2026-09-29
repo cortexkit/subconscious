@@ -164,7 +164,8 @@ A module's build provenance gains one field, with this exact shape:
   one breaks code that builds it as a struct literal; the builders are the supported path, and
   the patch on the 0.18 line of subc-client-rs carries the builder change so the Thalamus gateway
   can report `fd` without the newer manifest API.
-- A module that sends no provenance today (Broca) adds the block in its switch release. The
+- A module whose provenance is only sent on some builds adds the field there: Broca adds
+  `launch_nonce_source` to its existing stamped-build provenance block. The
 daemon records it, and `ck --json provenance <id>` reports it per running module. The census reads
 the running images, never the locks: a module counts as done only when its live HELLO says `fd`.
 A module declaring no provenance counts as not done.

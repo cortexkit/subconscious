@@ -1,7 +1,8 @@
 # Scopes: owned identity records in the daemon
 
-Status: design r4. Nothing here is built. r3 answered an Athena review of r2 (five seats, a
-unanimous "do not implement as written"); r4 adds the room's review of r3. Section 10 lists
+Status: design r5. Nothing here is built. r3 answered an Athena review of r2 (five seats, a
+unanimous "do not implement as written"); r4 added the room's review of r3, and r5 adds
+targeted carriers. Section 10 lists
 what changed and why. The
 extensibility design (magic-context `.cortexkit/alfonso/plans/ck-extensibility-r6-7-amendments.md`,
 section K2) relies on sections 2 to 6.
@@ -44,7 +45,17 @@ A scope is identified by `(owner, ref)`:
 Fields:
 - `kind`: a closed enum, `head | worker | ephemeral`.
 - `parent`: optional `(owner, ref)` of another scope.
-- `carriers`: the principals, other than the owner, that may open routes under the scope.
+- `carriers`: who, other than the owner, may open routes under the scope. Each entry is either
+  a bare principal, which may open to any module, or `{principal, targets: [module_id, ...]}`,
+  which may open only to the listed modules. Targets are module ids, because `route.open` names
+  a target module; the principal half is the principal the opener is stamped as. A targeted
+  entry holds 1 to 16 targets; an empty list is refused by name. Bare entries are for runners
+  that carry a whole session to arbitrary tools (Broca, `subc-mcp`); every other carrier should
+  be targeted. For example AFT on a delegating head is `{principal: "reserved:aft", targets:
+  ["plexus", "prefrontal-core"]}`, and a provider that only files asks with Prefrontal is
+  targeted at `prefrontal-core`. A module whose questions travel back on the route it was called
+  on (Cerebellum) is not listed at all. Being a carrier grants nothing on the provider side:
+  what a provider does for the session is still decided by the stamp on its own inbound route.
 - `attributes`, settable only by the owner, anything else refused by name:
   - `agent_id` (string): the head's agent, on every head scope. It is identity, and the value
     today's `agentProjectId` admission fact already carries.
@@ -93,7 +104,8 @@ restart, is never locked out, and a stale connection can never overwrite a newer
   with reason `scope_ended`.
 - A stamp is a snapshot taken at bind, so revoking authority ends the routes that carry the old
   stamp, each with its own reason so a carrier can tell them apart:
-  - `scope_carrier_removed`: the opener is no longer a listed carrier;
+  - `scope_carrier_removed`: the opener is no longer a listed carrier, or the route's target is
+    no longer in its entry's `targets` (widening a list changes nothing live);
   - `scope_delegation_changed`: `delegates` went from true to false;
   - `scope_ended`: the scope is gone, or replaced by a higher epoch.
   These are new `route.closed` reasons. Older SDKs map an unknown close reason to "do not
@@ -122,7 +134,8 @@ refuses by name:
 - `scope_not_live`: the owner has synced and the ref is not in its set, or the owner is not a
   configured module. Terminal.
 - `scope_ended`: the named `scope_epoch` does not match the live record. Terminal.
-- `scope_not_carrier`: the opener is neither the owner nor a listed carrier. Terminal.
+- `scope_not_carrier`: the opener is neither the owner nor a listed carrier, or it is a targeted
+  carrier and the target module is not in its list. Terminal.
 
 There is no relay class: a module that must present a scope onward is listed as a carrier. A carrier
 route lives until the carrier closes it or the scope ends or changes as in section 3.
@@ -252,6 +265,8 @@ Each fails by name when its rule is removed:
   same one re-synced after a daemon restart reads as the same session; `describe` separates the
   five reader cases;
 - each revocation drains with its own reason; `owner_authorized` is true only for listed owners;
+- a targeted carrier is admitted only to its listed modules, an empty target list is refused,
+  and removing a live route's target from the list drains it with `scope_carrier_removed`;
 - `subscribe` emits `ended`, `changed` and `synced`, and resumes from a snapshot after a
   too-old cursor;
 - the tombstone bound evicts and never refuses; the live-scope and attribute bounds refuse.
@@ -284,3 +299,8 @@ From the room's review of r3:
 11. `scope_not_synced` (retryable) is split from `scope_not_live` (terminal), so a carrier's opens
     during the post-restart re-sync window wait instead of failing.
 12. `scope.patch` lets a large owner register or remove one scope without re-sending its set.
+
+From the room, after r4:
+13. Carrier entries can name their target modules, so a provider listed to file asks under a
+    session's scope cannot open to any other module as that session. Without it, removing the
+    relay class had only moved the widening from per call to per scope.

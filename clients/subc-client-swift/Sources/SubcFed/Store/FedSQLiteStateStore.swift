@@ -44,6 +44,11 @@ public actor FedSQLiteStateStore: FedStateStore {
     /// `SQLITE_OPEN_CREATE`: a database that has gone missing must never be
     /// replaced by an empty one here.
     static let openFlags: Int32 = SQLITE_OPEN_READWRITE | SQLITE_OPEN_NOMUTEX | fileProtectionFlag
+    /// The size SQLite truncates the kept `-wal` back to after a checkpoint.
+    static let writeAheadLogSizeLimitBytes = 256 * 1024
+    /// Pages in the `-wal` after which a commit checkpoints it: the size
+    /// limit above in the default 4 KiB pages.
+    static let writeAheadLogCheckpointPages = 64
     /// How long a write waits for another connection's transaction to finish.
     static let busyTimeoutMilliseconds: Int32 = 5_000
 
@@ -117,11 +122,14 @@ public actor FedSQLiteStateStore: FedStateStore {
     /// returns with this false.
     var hasOpenTransaction: Bool { connection?.isInsideTransaction ?? false }
 
-    /// The durability settings of the live connection, as SQLite reports them.
+    /// The durability and size settings of the live connection, as SQLite reports them.
     func durabilitySettings() throws -> [String: String] {
         let db = try requireConnection()
         var settings: [String: String] = [:]
-        for name in ["journal_mode", "synchronous", "fullfsync", "checkpoint_fullfsync"] {
+        for name in [
+            "journal_mode", "synchronous", "fullfsync", "checkpoint_fullfsync",
+            "auto_vacuum", "journal_size_limit", "wal_autocheckpoint",
+        ] {
             settings[name] = try db.pragmaText(name)
         }
         return settings
@@ -230,7 +238,11 @@ public actor FedSQLiteStateStore: FedStateStore {
                 path: buildingURL.path,
                 flags: Self.openFlags | SQLITE_OPEN_CREATE
             )
-            try builder.execute("PRAGMA synchronous=FULL; PRAGMA fullfsync=ON;")
+            // auto_vacuum can only be chosen before the first table exists.
+            // INCREMENTAL keeps freed pages on a list that `prune` hands back
+            // to the file system, so the file shrinks once pruning deletes
+            // records (see `prune`).
+            try builder.execute("PRAGMA auto_vacuum=INCREMENTAL; PRAGMA synchronous=FULL; PRAGMA fullfsync=ON;")
             try builder.execute("BEGIN IMMEDIATE")
             do {
                 try builder.execute(FedSQLiteStoreRows.schema)
@@ -271,6 +283,19 @@ public actor FedSQLiteStateStore: FedStateStore {
                 throw FedFailure.storeUnavailable
             }
             try db.execute("PRAGMA synchronous=FULL; PRAGMA fullfsync=ON; PRAGMA checkpoint_fullfsync=ON;")
+            // The `-wal` is kept between opens (see keepWriteAheadLogFiles),
+            // and a kept log otherwise stays at the largest size it ever
+            // reached. With the size limit, SQLite cuts it back each time it
+            // starts the log over after a checkpoint. The checkpoint threshold
+            // is lowered to the same size (SQLite's default is 1000 pages,
+            // about 4 MB) for two reasons: the log never grows much past the
+            // limit between checkpoints, and a database that incremental
+            // vacuum shrank is only truncated on disk when a checkpoint copies
+            // that commit into it.
+            try db.execute("""
+                PRAGMA journal_size_limit=\(Self.writeAheadLogSizeLimitBytes);
+                PRAGMA wal_autocheckpoint=\(Self.writeAheadLogCheckpointPages);
+                """)
             try db.keepWriteAheadLogFiles()
             return db
         } catch {
@@ -532,6 +557,10 @@ public actor FedSQLiteStateStore: FedStateStore {
     /// Deletes the rows `FedSettledRecordPruning` drops from `view`. The
     /// selection, including the regression sentinel kept for every epoch, is
     /// that function's; this only turns its answer into deletes.
+    ///
+    /// The pages the deletes free are handed back to the file system in the
+    /// same transaction, so the database file shrinks with the send log
+    /// instead of staying at the largest size it ever reached.
     private static func prune(
         _ view: FedDestinationState,
         fp: String,
@@ -541,8 +570,13 @@ public actor FedSQLiteStateStore: FedStateStore {
         var kept = view
         FedSettledRecordPruning.prune(&kept, localIncarnation: localIncarnation)
         let keptIDs = Set(kept.unresolvedEffects.map(\.effect))
+        var deleted = false
         for record in view.unresolvedEffects where !keptIDs.contains(record.effect) {
             try FedSQLiteStoreRows.deleteEffect(record.effect, fp: fp, in: db)
+            deleted = true
+        }
+        if deleted {
+            try db.execute("PRAGMA incremental_vacuum")
         }
     }
 

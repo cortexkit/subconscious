@@ -66,14 +66,15 @@ final class FedStoreFlushBenchmarkTests: XCTestCase {
             let count = await durableCount(store) - countBefore
 
             print(String(
-                format: "FED_STORE_BENCH store=%@ seeded=540 changes=%d %@_per_change=%.2f ms_per_change=%.2f size_before=%d size_after=%d",
+                format: "FED_STORE_BENCH store=%@ seeded=540 changes=%d %@_per_change=%.2f ms_per_change=%.2f size_before=%d size_after=%d%@",
                 kind.rawValue,
                 changes,
                 countLabel(kind),
                 Double(count) / Double(changes),
                 Double(elapsed) / Double(changes) / 1_000_000,
                 seededSize,
-                try storedSize(kind, in: dir)
+                try storedSize(kind, in: dir),
+                try sizeBreakdown(kind, in: dir)
             ))
         }
     }
@@ -99,13 +100,14 @@ final class FedStoreFlushBenchmarkTests: XCTestCase {
                 .unresolvedEffects.count ?? 0
 
             print(String(
-                format: "FED_STORE_BENCH store=%@ fresh changes=%d %@_per_change=%.2f ms_per_change=%.2f size_after=%d records_after=%d",
+                format: "FED_STORE_BENCH store=%@ fresh changes=%d %@_per_change=%.2f ms_per_change=%.2f size_after=%d%@ records_after=%d",
                 kind.rawValue,
                 changes,
                 countLabel(kind),
                 Double(count) / Double(changes),
                 Double(elapsed) / Double(changes) / 1_000_000,
                 try storedSize(kind, in: dir),
+                try sizeBreakdown(kind, in: dir),
                 records
             ))
         }
@@ -200,6 +202,19 @@ final class FedStoreFlushBenchmarkTests: XCTestCase {
                 return total + ((attributes[.size] as? NSNumber)?.intValue ?? 0)
             }
         }
+    }
+
+    /// For the SQLite store, the database and the `-wal` separately, since
+    /// they shrink by different mechanisms (incremental vacuum and the
+    /// journal size limit). Empty for the file store.
+    private func sizeBreakdown(_ kind: Store, in dir: URL) throws -> String {
+        guard kind == .sqlite else { return "" }
+        let database = dir.appendingPathComponent(FedSQLiteStateStore.databaseFileName).path
+        let sizes = try [database, database + "-wal"].map { path -> Int in
+            let attributes = try FileManager.default.attributesOfItem(atPath: path)
+            return (attributes[.size] as? NSNumber)?.intValue ?? 0
+        }
+        return " (db=\(sizes[0]) wal=\(sizes[1]))"
     }
 
     private func documentSize(in dir: URL) throws -> Int {

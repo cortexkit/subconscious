@@ -171,6 +171,9 @@ final class FedSQLiteStateStoreTests: XCTestCase {
         XCTAssertEqual(settings["synchronous"], "2", "synchronous=FULL")
         XCTAssertEqual(settings["fullfsync"], "1")
         XCTAssertEqual(settings["checkpoint_fullfsync"], "1")
+        XCTAssertEqual(settings["auto_vacuum"], "2", "auto_vacuum=INCREMENTAL")
+        XCTAssertEqual(settings["journal_size_limit"], "262144")
+        XCTAssertEqual(settings["wal_autocheckpoint"], "64")
     }
 
     /// The protection class is set through SQLite's open flag, which SQLite
@@ -201,6 +204,92 @@ final class FedSQLiteStateStoreTests: XCTestCase {
             let values = try url.resourceValues(forKeys: [.isExcludedFromBackupKey])
             XCTAssertEqual(values.isExcludedFromBackup, true, "\(url.lastPathComponent) is backed up")
         }
+    }
+
+    // MARK: - Stored size
+
+    /// The database and `-wal` together after 540 changes with 4 KiB replies.
+    /// Measured at about 330 KB (database 48 KB, `-wal` about 290 KB). Without
+    /// incremental vacuum, the journal size limit and the lowered checkpoint
+    /// threshold it was 2.1 MB, the size of the log at its largest. The bound
+    /// sits well clear of both, so page-size noise cannot trip it.
+    func testStoredSizeStaysSmallAfter540Changes() async throws {
+        let (store, dir) = try await openStore()
+        let log = FedOriginEffectLog(store: store, responderStaticPublicKey: responder)
+        for _ in 0..<540 {
+            try await runRecordedChange(log: log, body: Data(repeating: 0x61, count: 4_096))
+        }
+        let size = try storedBytes(dir)
+        XCTAssertLessThan(size, Self.storedSizeBound, "database plus -wal: \(size) bytes")
+    }
+
+    /// A phone migrating from the file store imports its whole history, about
+    /// 3 MB. Once the first settled change prunes it, the file must shrink
+    /// back rather than keep the imported size. Measured at about 310 KB after
+    /// 20 changes; without the fix it was 3.8 MB.
+    func testStoredSizeShrinksOnceAnImportedHistoryIsPruned() async throws {
+        let dir = try FedStoreUnderTest.temporaryDirectory(removedAfter: self)
+        let body = Data(repeating: 0x61, count: 4_096)
+        try await seedSettledJSONDocument(in: dir, records: 540, body: body)
+        let store = FedSQLiteStateStore(directoryURL: dir)
+        _ = try await store.open(localPublicKey: localKey)
+        let imported = try storedBytes(dir)
+        XCTAssertGreaterThan(imported, 2_000_000, "control: the import holds the whole history")
+
+        let log = FedOriginEffectLog(store: store, responderStaticPublicKey: responder)
+        for _ in 0..<20 {
+            try await runRecordedChange(log: log, body: body)
+        }
+        let size = try storedBytes(dir)
+        XCTAssertLessThan(size, Self.storedSizeBound, "database plus -wal: \(size) bytes")
+    }
+
+    private static let storedSizeBound = 1_048_576
+
+    private func runRecordedChange(log: FedOriginEffectLog, body: Data) async throws {
+        let effect = try await log.beginMutation(peerIncarnation: "peer", peerLedgerEpoch: epoch)
+        try await log.markSent(effect)
+        _ = try await log.applyTerminalFrame(
+            effect: effect, kind: "response", body: body, bodyOmitted: false, errorCode: nil
+        )
+    }
+
+    private func storedBytes(_ dir: URL) throws -> Int {
+        try storeFiles(dir).prefix(2).reduce(0) { total, url in
+            let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+            return total + ((attributes[.size] as? NSNumber)?.intValue ?? 0)
+        }
+    }
+
+    /// Writes a file-store JSON document holding `records` recorded, settled
+    /// changes of the local incarnation, as a phone with that much history has.
+    private func seedSettledJSONDocument(in dir: URL, records: UInt64, body: Data) async throws {
+        let bootstrap = FedAtomicFileStateStore(directoryURL: dir)
+        var document = try await bootstrap.open(localPublicKey: localKey).document
+        let incarnation = document.global.localIncarnation
+        var destination = FedDestinationState(
+            responderStaticPublicKey: responder,
+            confirmedWatermark: FedConfirmedWatermark(incarnation: incarnation, seq: records)
+        )
+        for seq in 1...records {
+            destination.unresolvedEffects.append(FedUnresolvedEffectRecord(
+                effect: FedEffectID(incarnation: incarnation, seq: seq),
+                responderStaticPublicKey: responder,
+                phase: .terminal,
+                disposition: .recorded,
+                peerLedgerEpoch: epoch,
+                terminalBody: body,
+                terminalKind: "response"
+            ))
+        }
+        document.destinations[FedStateDocument.destinationKey(forResponderPublicKey: responder)] = destination
+        document.global.nextEffectSequence = records + 1
+        document.global.effectSequenceHighWater = records + FedGlobalReservationState.reservationBlockSize
+        document.revision += 1
+        try JSONEncoder().encode(document).write(
+            to: dir.appendingPathComponent(FedAtomicFileStateStore.documentFileName),
+            options: .atomic
+        )
     }
 
     // MARK: - A failed open

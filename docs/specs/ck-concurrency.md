@@ -10,18 +10,25 @@ difference from this page.
 
 1. **No retry outlives its caller.** Every retry loop stops at the earlier of its own deadline
    and the deadline of the call that started it. A retry that would end after the caller gave up
-   does work nobody is waiting for.
-2. **Refused means not sent.** A retryable refusal is only ever issued before the request reached
-   the module, so retrying it cannot run anything twice. A refusal that could follow a partial
-   send is not retryable.
-3. **An unknown refusal code is never treated as retryable.** The call is not retried
-   immediately or on a backoff, and a mutation is never re-sent because of it, so a newer
-   producer cannot turn an old reader into a retry loop. A periodic read may keep its own fixed
-   schedule after an unknown refusal, since the refusal causes no extra or faster attempts.
+   does work nobody is waiting for. Owned background work is a separate class (rule 6).
+2. **Retryable means no effect.** A retryable refusal is only issued when the request had no
+   effect: it never reached the module, or it was rejected before doing anything (for example an
+   upstream 400 or 422 on a rewritten body). So retrying it cannot run anything twice. A refusal
+   that could follow a partial effect is not retryable.
+3. **An unknown refusal code is never treated as retryable.** The component that received it
+   does not retry the call, immediately or on a backoff, and never re-sends a mutation because of
+   it, so a newer producer cannot turn an old reader into a retry loop. The refusal ends that
+   attempt. A later attempt the caller makes on its own (a harness re-sending a turn, a periodic
+   read on its fixed schedule) is not a retry by the component and is allowed, as long as the
+   refusal itself causes no extra or faster attempts.
 4. **Limits are per connection or per target, never global,** so one busy client or one slow
    module cannot starve the rest.
 5. **Every refusal names its reason.** A caller, a log reader and an operator must be able to
    tell "at capacity" from "restarting" from "not allowed" without reading source.
+6. **Owned background work has its own bound.** Work a module starts for itself after answering a
+   request (delivering a deferred command, a reduce, a late result) may outlive that request by
+   design. It must be durable or deduplicated so a repeat does nothing twice, bounded by a stated
+   budget, and listed in the module's section 3 with that budget.
 
 ## 1. Daemon (subc) and SDKs
 
@@ -110,6 +117,12 @@ at an outer layer repeats work an inner layer is still doing:
   15 s, polls every 5 s in the foreground and 30 s after two minutes idle, each awaiting its own
   calls so none stack, and busy-session reads every 350 ms (transcript) and 300 ms (display)
   that stop once the session is idle
+- Claude Code (outermost, through the Thalamus gateway): retries a 503 about 12 times over
+  about 180 s (measured); its own per-request timeout is unmeasured beyond tolerating a 125 s
+  stall. The gateway's worst case to first byte is 30 s body read + 120 s transform + 120 s
+  upstream headers = 270 s, or 1,650 s with the 1,500 s emergency transform budget. Open: if
+  Claude Code gives up before that, the transform keeps running for nobody. THALAMUS is
+  measuring Claude Code's timeout.
 - caller's call timeout
   - SDK route-open retry deadline (capped by the caller's timeout)
     - daemon bind relay timeout (12 s)

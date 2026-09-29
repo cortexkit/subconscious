@@ -30,12 +30,13 @@ A scope is identified by `(owner, ref)`:
   own a scope.
 - `ref`: an opaque string chosen by the owner, unique within that owner only, so no module can
   squat or block another owner's ref.
-- `instance`: an opaque string the owner chooses when it creates the scope (at least 16 random
-  bytes). The owner re-sends the same `instance` for the same session after any restart, its own
-  or the daemon's, and must choose a new one when it reuses a ref for a new session. Anything
-  that must not carry over to a new session (a stored approval, a conversation grant) binds to
-  `(owner, ref, instance)`. Because the owner keeps it, it survives daemon restarts and
-  upgrades, which a daemon-assigned counter would not.
+- `scope_epoch`: an unsigned integer the owner supplies and persists with its own record of
+  the session. The owner re-sends the same value for the same session after any restart, its
+  own or the daemon's, and uses a higher one when it reuses a ref for a new session. The daemon
+  refuses a sync that lowers the epoch of a ref it holds (`scope_epoch_regressed`). Anything
+  that must not carry over to a new session (a stored approval, a conversation grant, a frozen
+  runner session, a background task) binds to `(owner, ref, scope_epoch)`. Because the owner
+  keeps it, it survives daemon restarts and upgrades, which a daemon counter would not.
 - `version`: a daemon counter increased on every change to the record within one incarnation.
   It is how a bind notices a change between admission and commit (section 4).
 
@@ -83,10 +84,15 @@ restart, is never locked out, and a stale connection can never overwrite a newer
 **Effect of a sync.**
 - A scope present before and absent now is ended: tombstoned, and every route under it drained
   with reason `scope_ended`.
-- A scope whose carriers lost the opener of a live route, or whose `delegates` went from true to
-  false, has those routes drained with reason `scope_changed`: a stamp is a snapshot taken at
-  bind, so revoking authority has to end the routes that carry the old stamp.
-- A sync that gives a live `(owner, ref)` a different `instance` ends the old scope (tombstone,
+- A stamp is a snapshot taken at bind, so revoking authority ends the routes that carry the old
+  stamp, each with its own reason so a carrier can tell them apart:
+  - `scope_carrier_removed`: the opener is no longer a listed carrier;
+  - `scope_delegation_changed`: `delegates` went from true to false;
+  - `scope_ended`: the scope is gone, or replaced by a higher epoch.
+  These are new `route.closed` reasons. Older SDKs map an unknown close reason to "do not
+  reopen", which is right for the first and third; only carriers that use scopes, which are new
+  code, receive any of them.
+- A sync that gives a live `(owner, ref)` a higher `scope_epoch` ends the old scope (tombstone,
   drain with `scope_ended`) and creates the new one. A new session never inherits a live route,
   stamp or approval of the old one.
 - `parent` is accepted only when the syncing owner is the parent's owner or a listed carrier of
@@ -103,13 +109,17 @@ owner or a listed carrier, and refuses otherwise (`scope_not_live`, `scope_not_c
 is no relay class: a module that must present a scope onward is listed as a carrier. A carrier
 route lives until the carrier closes it or the scope ends or changes as in section 3.
 
-On admission the daemon captures `(instance, version)` into the pending bind and stamps the
-bind with `scope {owner, ref, instance, kind, parent, parent_ended, attributes}`, next to the
-principal it already stamps. The immediate opener stays in the principal field.
+On admission the daemon captures `(scope_epoch, version)` into the pending bind and stamps the
+bind with `scope {owner, ref, scope_epoch, kind, parent, parent_ended, attributes}`, next to the
+principal it already stamps. The immediate opener stays in the principal field. The stamp also
+carries `owner_authorized`, computed by the daemon: true when the owner is listed in
+`scope_authority_owners`. Providers check that flag rather than keeping their own copy of the
+list.
 
-**Commit.** When the module acks the bind, the daemon checks the captured `(instance,
+**Commit.** When the module acks the bind, the daemon checks the captured `(scope_epoch,
 version)` against the current record before the route becomes routable. If the scope ended or
-changed, the open is refused as `scope_ended` or `scope_changed`. That refusal is a settled
+changed, the open is refused as `scope_ended` (terminal) or `scope_changed` (retryable: nothing
+was sent, and the caller re-opens against the current record). That refusal is a settled
 rejection, handled beside the existing superseded-endpoint arm in `complete_pending_relay`: it
 releases the reserved route pair, sends the module a channel-scoped GOODBYE for the binding it
 just created, and answers the waiting `route.open` with the named refusal. It is never an `Err`
@@ -123,15 +133,15 @@ commit, and commit can still refuse it.
 
 `scope.describe {owner, ref}` answers:
 - `status`: `live`, `ended` (tombstoned since this daemon incarnation) or `not_live`;
-- `instance` for `live` and `ended`;
+- `scope_epoch` for `live` and `ended`;
 - `daemon_incarnation`;
 - `owner_synced`: whether this owner has synced since this incarnation started;
 - `owner_configured`: whether the owner is a module in the supervisor's roster;
 - for `live`, the same fields as the stamp.
 
-How a reader holding something bound to `(owner, ref, instance)` decides, in this order:
-1. `live` with the same `instance`: use it.
-2. `live` with a different `instance`: a new session under a reused ref. Refuse by name; the
+How a reader holding something bound to `(owner, ref, scope_epoch)` decides, in this order:
+1. `live` with the same `scope_epoch`: use it.
+2. `live` with a different `scope_epoch`: a new session under a reused ref. Refuse by name; the
    old binding is dead.
 3. `ended`, or `not_live` with `owner_synced: true`: refuse by name. An evicted tombstone reads
    as `not_live`, which refuses too.
@@ -143,8 +153,8 @@ Refusing an action never deletes what the reader stores; only an `ended` answer 
 `scope.subscribe` is a held request shaped like `supervisor.spawn_subscribe`, with the same
 `{daemon_incarnation, seq}` cursor and too-old-cursor refusal. It sends a snapshot of live
 scopes, then events:
-- `{owner, ref, instance, ended}` when a scope ends;
-- `{owner, ref, instance, changed}` when its carriers, `delegates` or `parent_ended` change;
+- `{owner, ref, scope_epoch, ended}` when a scope ends;
+- `{owner, ref, scope_epoch, changed}` when its carriers, `delegates` or `parent_ended` change;
 - `{owner, synced}` when an owner's first sync of this incarnation is accepted.
 After an owner's `synced` event, any scope of that owner the reader holds that is not in the
 live set is ended. Before it, a scope merely missing is held, never treated as ended.
@@ -155,13 +165,13 @@ State, all in memory:
 - in the scope table: records keyed `(owner, ref)`, per-owner authority connection, generation,
   `owner_synced` and the tombstones since this incarnation;
 - in the forwarding table: each pending bind's and each route's scope tag `(owner, ref,
-  instance, version)`, and the index from a scope to its routes.
+  scope_epoch, version)`, and the index from a scope to its routes.
 
 Lock order is scope table, then forwarding table, always. Commit already holds the forwarding
 write lock and never takes the scope lock: it compares the pending bind's captured tag with the
-record's current `(instance, version)`, which a sync publishes into the forwarding table in the
+record's current `(scope_epoch, version)`, which a sync publishes into the forwarding table in the
 same step that changes the record. Ending or changing a scope: take the scope write lock, update
-the record, then take the forwarding write lock, publish the new `(instance, version)`, and
+the record, then take the forwarding write lock, publish the new `(scope_epoch, version)`, and
 remove every route and pending bind tagged with the old one on every endpoint, including
 superseded endpoints of a swap. A commit before that step is collected by it; a commit after it
 sees the new version and refuses.
@@ -171,17 +181,17 @@ sees the new version and refuses.
 in-place upgrade (`docs/designs/daemon-in-place-upgrade.md`) does not carry routes or pending
 binds and gives the new process a new daemon id, so it does not hand over scope state: owners
 re-sync and subscribers take a new snapshot, exactly as after a restart. `version` restarts, which
-is safe because it is only ever compared within one incarnation. `instance` does not: the owner
+is safe because it is only ever compared within one incarnation. `scope_epoch` does not: the owner
 re-sends it, so a stored approval survives a restart when the same session comes back, and dies
 when a new session reuses the ref.
 
 ## 7. What providers must do
 
 - Read identity only from the bind stamp, never from a request payload.
-- Act as an agent only when `delegates` is true, `agent_id` matches, and the stamped `owner` is
-  the owner the provider expects (today `prefrontal-core`). `agent_id` alone is identity, never
+- Act as an agent only when `delegates` is true, `agent_id` matches, and `owner_authorized` is
+  true. `agent_id` alone is identity, never
   permission to act.
-- Bind stored approvals and grants to `(owner, ref, instance)`, and decide on them as in
+- Bind stored approvals and grants to `(owner, ref, scope_epoch)`, and decide on them as in
   section 5.
 - Treat the route's stamp as fixed for the route's life. A change that revokes authority drains
   the route (section 3), so a provider need not re-check per call.
@@ -193,7 +203,9 @@ Readers first, then writers:
    `route.open` request fields, so a carrier naming a scope on an old daemon gets an unstamped
    route, which the provider's refusal makes fail closed.
 2. The daemon ships `scope.sync`, `scope.describe`, `scope.subscribe`, the stamp and
-   `scope_authority_owners`, advertised in `server.describe` as capability `scopes/v1`.
+   `scope_authority_owners`, advertised in `server.describe` as capability `scopes/v1`, and
+   `scope_changed` joins subc-protocol's retryable `route.open` set in the same release. An older
+   SDK treats it as terminal, which is safe.
 3. Owners and carriers use scopes only when the capability is advertised. A carrier that cannot
    open a scoped route fails the call (`scope_unsupported`) instead of opening an unscoped one.
 
@@ -212,8 +224,10 @@ Each fails by name when its rule is removed:
 - a restarted owner's first sync replaces at any generation, and an equal or smaller later one
   is refused without changing anything;
 - a forged parent (neither owner nor carrier of the parent) is refused, and so is a cycle;
-- a changed `instance` for a live ref ends the old scope first; the same `instance` re-synced
-  after a daemon restart reads as the same session; `describe` separates the five reader cases;
+- a higher `scope_epoch` for a live ref ends the old scope first, a lower one is refused, and the
+  same one re-synced after a daemon restart reads as the same session; `describe` separates the
+  five reader cases;
+- each revocation drains with its own reason; `owner_authorized` is true only for listed owners;
 - `subscribe` emits `ended`, `changed` and `synced`, and resumes from a snapshot after a
   too-old cursor;
 - the tombstone bound evicts and never refuses; the live-scope and attribute bounds refuse.
@@ -235,7 +249,7 @@ From the Athena review of r2 (five seats):
    change between admission and commit refuses the open.
 7. One sync authority per owner, moved at cutover; r2's per-connection first sync let a swap
    candidate wipe the live set.
-8. An owner-chosen `instance` stops a reused ref carrying old approvals and, unlike a daemon
-   counter, survives restarts; `subscribe` reports owner sync, so a reader knows when a missing
+8. An owner-supplied `scope_epoch`, refused if it goes down, stops a reused ref carrying old
+   approvals and, unlike a daemon counter, survives restarts; `subscribe` reports owner sync, so a reader knows when a missing
    scope means ended.
 9. The tombstone bound evicts and never refuses; r2 read both ways.

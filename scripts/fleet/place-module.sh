@@ -407,20 +407,64 @@ signing_posture() {
     | grep -vE '^Authority=Apple (Worldwide|Root)' \
     | sort | tr '\n' ' ' || true
 }
+# The hardened-runtime flag (CodeDirectory 0x10000) is the one signing-posture
+# change a placement may make, and only from off to on. Each module holds a launch
+# nonce that admits any connection presenting it as that module; hardened runtime
+# is what stops another process of the same user attaching a debugger and reading
+# it (docs/designs/launch-nonce-descriptor.md). Modules gain the flag one placement
+# at a time, so an exact match on it would refuse every module's first hardened
+# build. Removing it is refused, because that lets same-user processes attach again.
+cd_flags() {
+  codesign -dvv "$1" 2>&1 | sed -n -E 's/^CodeDirectory .*flags=(0x[0-9a-fA-F]+).*/\1/p' | head -1
+}
+has_runtime() {
+  local f; f=$(cd_flags "$1")
+  [ -n "$f" ] && [ $(( f & 0x10000 )) -ne 0 ]
+}
+# The posture with the flags reduced to everything except the runtime bit, so the
+# exact-match rule still covers ad-hoc-ness and every other flag.
+posture_without_runtime() {
+  local f bare
+  f=$(cd_flags "$1")
+  bare=$(signing_posture "$1" | sed -E 's/flags=[^ ]+ //')
+  if [ -n "$f" ]; then printf '%sflags-sans-runtime=0x%x ' "$bare" $(( f & ~0x10000 )); else printf '%s' "$bare"; fi
+}
 if command -v codesign >/dev/null; then
   staged_sig=$(signing_posture "$STAGED")
   live_sig=$(signing_posture "$DEST")
+  staged_sig_cmp=$(posture_without_runtime "$STAGED")
+  live_sig_cmp=$(posture_without_runtime "$DEST")
   if [ -n "$NEW_REQUIREMENT" ]; then
     # A requested requirement change may rename the identifier; every other
-    # posture field (signer, team, ad-hoc-ness, hardened runtime) must still match.
-    staged_sig_cmp=$(signing_posture "$STAGED" | sed -E 's/Identifier=[^ ]+ //')
-    live_sig_cmp=$(signing_posture "$DEST" | sed -E 's/Identifier=[^ ]+ //')
-  else
-    staged_sig_cmp=$staged_sig
-    live_sig_cmp=$live_sig
+    # posture field (signer, team, ad-hoc-ness, flags) must still match.
+    staged_sig_cmp=$(printf '%s' "$staged_sig_cmp" | sed -E 's/Identifier=[^ ]+ //')
+    live_sig_cmp=$(printf '%s' "$live_sig_cmp" | sed -E 's/Identifier=[^ ]+ //')
   fi
   [ "$staged_sig_cmp" = "$live_sig_cmp" ] || refuse "signing posture differs: staged [$staged_sig] vs running [$live_sig]"
-  say "signing posture: $staged_sig(matches running)"
+  if has_runtime "$DEST" && ! has_runtime "$STAGED"; then
+    refuse "hardened runtime would be REMOVED: the running binary has it and the staged one does not, which lets any same-user process attach and read the module's launch nonce (staged [$staged_sig] vs running [$live_sig])"
+  fi
+  if has_runtime "$STAGED" && ! has_runtime "$DEST"; then
+    say "signing posture: $staged_sig(matches running except hardened runtime, which this placement ADDS)"
+  else
+    say "signing posture: $staged_sig(matches running)"
+  fi
+  # get-task-allow lets any same-user process attach whatever the runtime flag
+  # says, so nothing in the fleet may ship it. The other hardened-runtime
+  # exceptions (JIT, unsigned executable memory, library validation) do not reopen
+  # attach, but a binary missing one it needs fails only when that code path runs
+  # (a JIT that silently falls back, a Wasm guest killed on first execution). They
+  # are printed so the placement card's smoke test can be checked to exercise each.
+  ents=$(codesign -d --entitlements - "$STAGED" 2>/dev/null || true)
+  if [ "$(printf '%s' "$ents" | grep -c 'get-task-allow')" -gt 0 ]; then
+    refuse "staged binary carries com.apple.security.get-task-allow, which lets any same-user process attach and read its launch nonce"
+  fi
+  exceptions=$(printf '%s' "$ents" | grep -oE 'com\.apple\.security\.cs\.[a-z-]+' | sort -u | paste -sd ' ' - || true)
+  if has_runtime "$STAGED"; then
+    say "hardened runtime: yes; exceptions: ${exceptions:-none} (each needs the card's smoke test to exercise it)"
+  else
+    say "hardened runtime: NO (the launch-nonce boundary needs it before stage 7)"
+  fi
 
   # TCC's own test, not an approximation of it: a macOS privacy grant is stored
   # against the designated requirement of the binary it was granted to, and a new
@@ -759,6 +803,10 @@ staged_digest=$(shasum -a 256 "$STAGED" | awk '{print $1}')
 [ -n "$placed_digest" ] && [ "$placed_digest" = "$staged_digest" ] \
   || refuse "placed bytes differ from the staged bytes (staged $staged_digest, placed $placed_digest); the destination now holds an unverified binary"
 say "placed sha ${placed_digest%"${placed_digest#????????}"} (equals staged)"
+# Equal bytes mean equal signature, so the placed binary carries exactly the
+# flags and entitlements checked above: this placement never re-signs. A
+# placement path that runs `codesign --force` after staging would strip
+# hardened runtime and its exceptions, and needs its own check of the placed file.
 say "warm-exec at destination: $("$DEST" --version 2>&1 | head -1)"
 
 # Rollback retention: the newest three per binary (and per module store) are

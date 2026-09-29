@@ -12,10 +12,12 @@
 /// watermark; the part the watermark passes is dropped, because the watermark
 /// already says the same thing.
 ///
-/// Ranges coalesce only across strictly adjacent sequence numbers. Sequence
-/// numbers are allocated for the whole phone (other destinations and pure
-/// queries take them too), so a gap may be an effect this destination settled
-/// `ambiguous`, which a wider range would wrongly confirm.
+/// Stored ranges coalesce only across strictly adjacent sequence numbers.
+/// Sequence numbers are allocated for the whole phone (other destinations and
+/// pure queries take them too), so a gap may be an effect this destination
+/// settled `ambiguous` or has not settled yet, which a wider range would wrongly
+/// confirm. The ranges a frame carries are coalesced further when the frame is
+/// built; see `frameRanges`.
 ///
 /// While any ledger epoch of the destination is poisoned nothing is added,
 /// the watermark stays where it is and nothing is pruned: the records are the
@@ -73,8 +75,31 @@ enum FedSettlementRules {
         FedSettledRecordPruning.prune(&destination, localIncarnation: localIncarnation)
     }
 
-    /// The ranges one frame carries: the lowest `maximumConfirmedRangesPerFrame`
-    /// ranges of the local incarnation above the watermark.
+    /// The ranges one frame carries: the stored ranges of the local incarnation
+    /// above the watermark, coalesced across every gap that holds no blocking
+    /// sequence number, and then the lowest `maximumConfirmedRangesPerFrame` of
+    /// those.
+    ///
+    /// Why a gap can be covered. Callosum applies a range to the rows it has and
+    /// absorbs the sequence numbers it has no row for; it does not split a range
+    /// around them. A sequence number the phone gave to a pure query or to
+    /// another destination never reached this peer, so it has no row there and
+    /// covering it confirms nothing. The phone never asks this peer about such a
+    /// number, so the peer answering `confirmed` for it is never read.
+    ///
+    /// What must stay uncovered: a sequence number this destination was sent
+    /// whose outcome the phone does not hold, i.e. a record of the local
+    /// incarnation above the watermark that is still open or was settled
+    /// `ambiguous`. Confirming it would let the peer forget an outcome the phone
+    /// still needs. Every such record is still in `unresolvedEffects`: above the
+    /// watermark only records settled `recorded` or `not_sent` are pruned, and
+    /// those are already inside the stored ranges.
+    ///
+    /// The top of the highest range stays the highest confirmed sequence number.
+    /// Coalescing only fills gaps between stored ranges, so it never reaches past
+    /// a number this destination was actually sent, and the store keeps no
+    /// per-destination record of the highest number sent that would allow
+    /// extending it further.
     static func frameRanges(
         of destination: FedDestinationState,
         localIncarnation: String
@@ -82,12 +107,42 @@ enum FedSettlementRules {
         let floor: UInt64 = destination.confirmedWatermark.flatMap {
             $0.incarnation == localIncarnation ? $0.seq : nil
         } ?? 0
-        return Array(
-            destination.confirmedEffectRanges
-                .filter { $0.incarnation == localIncarnation && $0.from > floor }
-                .sorted { $0.from < $1.from }
-                .prefix(maximumConfirmedRangesPerFrame)
-        )
+        let stored = destination.confirmedEffectRanges
+            .filter { $0.incarnation == localIncarnation && $0.from > floor }
+            .sorted { $0.from < $1.from }
+        let blocking = destination.unresolvedEffects
+            .filter { record in
+                record.effect.incarnation == localIncarnation
+                    && record.effect.seq > floor
+                    && !holdsOutcome(record.disposition)
+            }
+            .map(\.effect.seq)
+            .sorted()
+
+        var coalesced: [FedConfirmedEffectRange] = []
+        var nextBlocking = 0
+        for range in stored {
+            guard let last = coalesced.last else {
+                coalesced.append(range)
+                continue
+            }
+            // Skip the blocking numbers at or below the end of the range built
+            // so far; the first one left is the lowest that could sit in the gap.
+            while nextBlocking < blocking.count, blocking[nextBlocking] <= last.to {
+                nextBlocking += 1
+            }
+            let gapIsBlocked = nextBlocking < blocking.count && blocking[nextBlocking] < range.from
+            if gapIsBlocked {
+                coalesced.append(range)
+            } else {
+                coalesced[coalesced.count - 1] = FedConfirmedEffectRange(
+                    incarnation: localIncarnation,
+                    from: last.from,
+                    to: max(last.to, range.to)
+                )
+            }
+        }
+        return Array(coalesced.prefix(maximumConfirmedRangesPerFrame))
     }
 
     /// Adds `seq` to `ranges`, merging with a range that ends just below it or

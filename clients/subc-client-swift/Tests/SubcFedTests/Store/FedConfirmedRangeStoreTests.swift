@@ -12,6 +12,7 @@ class FedConfirmedRangeStoreTests: XCTestCase {
 
     private let localKey = Data(repeating: 0x11, count: 32)
     private let responder = Data(repeating: 0x22, count: 32)
+    private let otherResponder = Data(repeating: 0x33, count: 32)
     private let epoch = "epoch-a"
 
     private func stores(in dir: URL) -> [(String, () -> any FedStateStore)] {
@@ -122,6 +123,122 @@ class FedConfirmedRangeStoreTests: XCTestCase {
         XCTAssertEqual(report.ranges.first?.from, e[1].seq)
     }
 
+    // MARK: - Coalescing when a frame is built
+
+    /// Sequence numbers between two confirmed effects that went to another
+    /// destination never reached this peer, which absorbs numbers it has no row
+    /// for, so the frame covers both effects with one range. Storage still keeps
+    /// them apart.
+    func testConfirmedEffectsSeparatedOnlyBySeqsNeverSentHereGoOutAsOneRange() async throws {
+        let dir = try FedStoreUnderTest.temporaryDirectory(removedAfter: self)
+        for (label, make) in stores(in: dir) {
+            let store = make()
+            _ = try await store.open(localPublicKey: localKey)
+            let stuck = try await intent(in: store)
+            let first = try await intent(in: store)
+            _ = try await intent(in: store, responder: otherResponder)
+            _ = try await store.reserveEffectSequence()
+            let second = try await intent(in: store)
+            try await settle(first, .recorded, in: store)
+            try await settle(second, .notSent, in: store)
+
+            let stored = try await store.destination(forResponderPublicKey: responder)?.confirmedEffectRanges
+            XCTAssertEqual(stored?.count, 2, "\(label): storage keeps only adjacent numbers together")
+            let report = try await FedOriginEffectLog(store: store, responderStaticPublicKey: responder)
+                .durableConfirmations(localIncarnation: stuck.incarnation)
+            XCTAssertNil(report.watermark, "\(label): the stuck effect holds the watermark")
+            XCTAssertEqual(report.ranges, [
+                FedConfirmedEffectRange(incarnation: stuck.incarnation, from: first.seq, to: second.seq),
+            ], label)
+        }
+    }
+
+    /// An open effect of this destination between two confirmed ones keeps
+    /// them in separate ranges: the peer holds a row for it and must not
+    /// forget it.
+    func testAnOpenEffectBetweenConfirmedEffectsSplitsTheFrameRange() async throws {
+        let dir = try FedStoreUnderTest.temporaryDirectory(removedAfter: self)
+        for (label, make) in stores(in: dir) {
+            let store = make()
+            _ = try await store.open(localPublicKey: localKey)
+            let stuck = try await intent(in: store)
+            let first = try await intent(in: store)
+            _ = try await intent(in: store, responder: otherResponder)
+            let open = try await intent(in: store)
+            _ = try await intent(in: store, responder: otherResponder)
+            let second = try await intent(in: store)
+            try await settle(first, .recorded, in: store)
+            try await settle(second, .recorded, in: store)
+
+            let report = try await FedOriginEffectLog(store: store, responderStaticPublicKey: responder)
+                .durableConfirmations(localIncarnation: stuck.incarnation)
+            XCTAssertEqual(report.ranges, [
+                FedConfirmedEffectRange(incarnation: stuck.incarnation, from: first.seq, to: first.seq),
+                FedConfirmedEffectRange(incarnation: stuck.incarnation, from: second.seq, to: second.seq),
+            ], "\(label): open effect \(open.seq) must stay uncovered")
+        }
+    }
+
+    /// An effect of this destination settled ambiguous between two confirmed
+    /// ones keeps them in separate ranges: the phone does not hold its outcome,
+    /// so it is never confirmed.
+    func testAnAmbiguousEffectBetweenConfirmedEffectsSplitsTheFrameRange() async throws {
+        let dir = try FedStoreUnderTest.temporaryDirectory(removedAfter: self)
+        for (label, make) in stores(in: dir) {
+            let store = make()
+            _ = try await store.open(localPublicKey: localKey)
+            let stuck = try await intent(in: store)
+            let first = try await intent(in: store)
+            _ = try await intent(in: store, responder: otherResponder)
+            let ambiguous = try await intent(in: store)
+            _ = try await store.reserveEffectSequence()
+            let second = try await intent(in: store)
+            try await settle(first, .notSent, in: store)
+            try await settle(ambiguous, .ambiguous, in: store)
+            try await settle(second, .recorded, in: store)
+
+            let report = try await FedOriginEffectLog(store: store, responderStaticPublicKey: responder)
+                .durableConfirmations(localIncarnation: stuck.incarnation)
+            XCTAssertEqual(report.ranges, [
+                FedConfirmedEffectRange(incarnation: stuck.incarnation, from: first.seq, to: first.seq),
+                FedConfirmedEffectRange(incarnation: stuck.incarnation, from: second.seq, to: second.seq),
+            ], "\(label): ambiguous effect \(ambiguous.seq) must stay uncovered")
+        }
+    }
+
+    /// Above one stuck effect, 100 confirmed effects interleaved with another
+    /// destination's effects are stored as 100 ranges but go out as one, so
+    /// the 64-range cap no longer limits early confirmation to 64 effects.
+    func testOneHundredInterleavedConfirmedEffectsGoOutAsOneRange() async throws {
+        let dir = try FedStoreUnderTest.temporaryDirectory(removedAfter: self)
+        for (label, make) in stores(in: dir) {
+            let store = make()
+            _ = try await store.open(localPublicKey: localKey)
+            let stuck = try await intent(in: store)
+            var confirmed: [FedEffectID] = []
+            for _ in 0..<100 {
+                confirmed.append(try await intent(in: store))
+                _ = try await intent(in: store, responder: otherResponder)
+            }
+            for (index, effect) in confirmed.enumerated() {
+                try await settle(effect, index.isMultiple(of: 2) ? .recorded : .notSent, in: store)
+            }
+
+            let stored = try await store.destination(forResponderPublicKey: responder)?.confirmedEffectRanges
+            XCTAssertEqual(stored?.count, 100, label)
+            let report = try await FedOriginEffectLog(store: store, responderStaticPublicKey: responder)
+                .durableConfirmations(localIncarnation: stuck.incarnation)
+            XCTAssertNil(report.watermark, label)
+            XCTAssertEqual(report.ranges, [
+                FedConfirmedEffectRange(
+                    incarnation: stuck.incarnation,
+                    from: confirmed[0].seq,
+                    to: confirmed[99].seq
+                ),
+            ], label)
+        }
+    }
+
     func testNothingIsConfirmedWhileAnEpochIsPoisoned() async throws {
         let store = try Self.storeUnderTest.scratchStore(for: self)
         _ = try await store.open(localPublicKey: localKey)
@@ -187,13 +304,13 @@ class FedConfirmedRangeStoreTests: XCTestCase {
 
     // MARK: - Helpers
 
-    private func intent(in store: any FedStateStore) async throws -> FedEffectID {
+    private func intent(in store: any FedStateStore, responder: Data? = nil) async throws -> FedEffectID {
         let reservation = try await store.reserveEffectSequence()
         let incarnation = try await store.snapshot().global.localIncarnation
         let effect = FedEffectID(incarnation: incarnation, seq: reservation.value)
         try await store.commitIntent(FedUnresolvedEffectRecord(
             effect: effect,
-            responderStaticPublicKey: responder,
+            responderStaticPublicKey: responder ?? self.responder,
             peerLedgerEpoch: epoch
         ))
         return effect

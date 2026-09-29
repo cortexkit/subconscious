@@ -370,7 +370,8 @@ public actor FedOriginEffectLog {
     }
 
     /// What a `call` or `keepalive` tells an effects-v2 peer about settlement:
-    /// the durable watermark and the lowest confirmed ranges above it, at most
+    /// the durable watermark and the lowest confirmed ranges above it, coalesced
+    /// as `FedSettlementRules.frameRanges` describes, at most
     /// `FedEffectsV2Codec.maximumConfirmedRangesPerFrame` of them. Nothing is
     /// confirmed while a ledger epoch of the peer is poisoned.
     public func durableConfirmations(localIncarnation: String) async throws -> (

@@ -14,8 +14,10 @@ difference from this page.
 2. **Refused means not sent.** A retryable refusal is only ever issued before the request reached
    the module, so retrying it cannot run anything twice. A refusal that could follow a partial
    send is not retryable.
-3. **Unknown codes are terminal.** A reader that meets a refusal code it doesn't know treats it
-   as terminal, never as "retry": a newer producer cannot turn an old reader into a retry loop.
+3. **An unknown refusal code is never treated as retryable.** The call is not retried
+   immediately or on a backoff, and a mutation is never re-sent because of it, so a newer
+   producer cannot turn an old reader into a retry loop. A periodic read may keep its own fixed
+   schedule after an unknown refusal, since the refusal causes no extra or faster attempts.
 4. **Limits are per connection or per target, never global,** so one busy client or one slow
    module cannot starve the rest.
 5. **Every refusal names its reason.** A caller, a log reader and an operator must be able to
@@ -82,24 +84,32 @@ What a module must do:
 |---|---|---|
 | Route-open retry deadline | 90 s, `DEFAULT_ROUTE_RETRY_DEADLINE`, consumer.rs:52 | 90 s, `ROUTE_OPEN_RETRY_DEADLINE_MS`, client.ts:86 |
 | Opens in flight per connection | 8, `MAX_ROUTE_OPENS_IN_FLIGHT`, consumer.rs:59 | 8, `MAX_ROUTE_OPENS_IN_FLIGHT`, client.ts:93 |
-| Default call timeout | 30 s, `DEFAULT_CALL_TIMEOUT`, consumer.rs:44 | (to confirm) |
+| Default call timeout | 30 s, `DEFAULT_CALL_TIMEOUT`, consumer.rs:44 | 30 s, `DEFAULT_REQUEST_TIMEOUT_MS`, client.ts:51, for the response wait only |
 
 The 90 s retry deadline covers a full module restart (drain up to 30 s, stop, start, register),
-which was measured at 62.5 s once. The Rust SDK's 0.22.0 changelog states that
-the retries still end at the call's own timeout when that comes first (rule 0.1), so the 30 s
-default call timeout caps them and a caller that wants to ride out a restart raises both. That
-is recorded from the changelog, not yet re-read in code. Retry delays are jittered so routes
+which was measured at 62.5 s once. Both SDKs stop route-open retries at the call's own
+deadline when it comes first (rule 0.1). Rust takes `(now + route_retry_deadline).min(call_deadline)`
+(consumer.rs:2718), pinned by
+`a_call_timeout_shorter_than_the_retry_deadline_ends_the_retries_at_the_call_timeout`. So its
+30 s default call timeout caps the retries, and a caller that wants to ride out a restart raises
+both. TypeScript takes the minimum of the retry deadline and `timeoutMs` when the call sets one
+(client.ts:1339-1343). A call without `timeoutMs` has no overall deadline: it may retry the open
+for the full 90 s, and the 30 s default then bounds only the wait for the response. That is
+consistent with rule 0.1, since the caller set no deadline, but it differs from Rust. A TypeScript
+caller that needs a bound sets `timeoutMs`. Retry delays are jittered so routes
 refused together do not retry in step. The in-flight limit matches the daemon's per-connection
 limit, so the SDK queues opens locally instead of having the daemon refuse them.
 
-Open for this section: confirm in code, for both SDKs, the default call timeout and that
-route-open retries stop at the caller's deadline.
 
 ## 2. Where timeouts must nest
 
 From the outside in, each layer's limit must be larger than the one it waits on, or a retry
 at an outer layer repeats work an inner layer is still doing:
 
+- the phone (outermost client, alfonso-ios): SubcFed call deadline 300 s, relay authentication
+  15 s, polls every 5 s in the foreground and 30 s after two minutes idle, each awaiting its own
+  calls so none stack, and busy-session reads every 350 ms (transcript) and 300 ms (display)
+  that stop once the session is idle
 - caller's call timeout
   - SDK route-open retry deadline (capped by the caller's timeout)
     - daemon bind relay timeout (12 s)

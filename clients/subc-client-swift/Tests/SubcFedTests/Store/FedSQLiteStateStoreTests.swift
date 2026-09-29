@@ -226,7 +226,7 @@ final class FedSQLiteStateStoreTests: XCTestCase {
     /// A phone migrating from the file store imports its whole history, about
     /// 3 MB. Once the first settled change prunes it, the file must shrink
     /// back rather than keep the imported size. Measured at about 310 KB after
-    /// 20 changes; without the fix it was 3.8 MB.
+    /// 20 changes; without incremental vacuum and the -wal size limit it was 3.8 MB.
     func testStoredSizeShrinksOnceAnImportedHistoryIsPruned() async throws {
         let dir = try FedStoreUnderTest.temporaryDirectory(removedAfter: self)
         let body = Data(repeating: 0x61, count: 4_096)

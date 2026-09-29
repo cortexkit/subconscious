@@ -184,26 +184,13 @@ public actor FedOriginEffectLog {
                 throw FedFailure.indeterminateMutation
             }
 
-            let reservation = try await store.reserveEffectSequence()
-            let snapshot = try await store.snapshot()
-            let effect = FedEffectID(
-                incarnation: snapshot.global.localIncarnation,
-                seq: reservation.value
-            )
-            let record = FedUnresolvedEffectRecord(
-                effect: effect,
+            // One call, so a store that can reserve and commit the intent in
+            // a single durable write does (the SQLite store does).
+            let effect = try await store.reserveEffectSequenceAndCommitIntent(
                 responderStaticPublicKey: responderStaticPublicKey,
-                phase: .intent,
-                disposition: .unknown,
                 peerLedgerEpoch: peerLedgerEpoch,
                 peerIncarnation: peerIncarnation
             )
-            do {
-                try await store.commitIntent(record)
-            } catch {
-                releaseLane()
-                throw FedFailure.reservationFailed
-            }
             openMutatingSequences.insert(effect.seq)
             return FedMutationSendCapability(effect: effect)
         } catch {

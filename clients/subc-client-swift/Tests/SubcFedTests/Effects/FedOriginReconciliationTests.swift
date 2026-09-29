@@ -7,7 +7,13 @@ import XCTest
 /// unsettled effect and settle from the peer's authoritative answer before
 /// admitting new mutating calls. These tests exercise the COMPOSED behavior
 /// (engine + effect log + store), not the isolated pieces.
-final class FedOriginReconciliationTests: XCTestCase {
+///
+/// Runs against the memory and file stores as written;
+/// `FedOriginReconciliationSQLiteTests` at the end of this file reruns every
+/// test against the SQLite store.
+class FedOriginReconciliationTests: XCTestCase {
+    class var storeUnderTest: FedStoreUnderTest { .asWritten }
+
     private let localKey = Data(repeating: 0x11, count: 32)
     private let responderKey = Data(repeating: 0x22, count: 32)
     private let peerIncarnation = "00000000-0000-4000-8000-0000000000aa"
@@ -29,7 +35,7 @@ final class FedOriginReconciliationTests: XCTestCase {
     /// but nothing ever composed them, so no query was ever sent. This asserts at
     /// the composition point (the session engine's reconnect path).
     func testReconnectWithUnsettledRowEmitsEffectStatusQueryOnTheWire() async throws {
-        let store = FedMemoryStateStore()
+        let store = try Self.storeUnderTest.scratchStore(for: self)
         _ = try await store.open(localPublicKey: localKey)
         let seeded = try await seedUnsettledMutation(in: store, epoch: liveEpoch)
 
@@ -52,7 +58,7 @@ final class FedOriginReconciliationTests: XCTestCase {
     // MARK: - 2. Recorded reconciles to the recorded terminal WITH the body
 
     func testInterruptedMutateThePeerRecordedReconcilesToRecordedWithBody() async throws {
-        let store = FedMemoryStateStore()
+        let store = try Self.storeUnderTest.scratchStore(for: self)
         _ = try await store.open(localPublicKey: localKey)
         let seeded = try await seedUnsettledMutation(in: store, epoch: liveEpoch)
 
@@ -81,7 +87,7 @@ final class FedOriginReconciliationTests: XCTestCase {
     // MARK: - 3. not_found + complete + three-way epoch agreement → not_sent
 
     func testNotFoundCompleteWithThreeWayEpochAgreementSettlesNotSent() async throws {
-        let store = FedTerminalCommitRecorder(wrapping: FedMemoryStateStore())
+        let store = FedTerminalCommitRecorder(wrapping: try Self.storeUnderTest.scratchStore(for: self))
         _ = try await store.open(localPublicKey: localKey)
         // Persisted intent epoch == live HELLO epoch (seeded at liveEpoch).
         let seeded = try await seedUnsettledMutation(in: store, epoch: liveEpoch)
@@ -107,7 +113,7 @@ final class FedOriginReconciliationTests: XCTestCase {
     /// not_sent. A peer reporting ledger_complete:false CANNOT KNOW whether the
     /// mutation executed, so the disposition must be ambiguous, never not_sent.
     func testNotFoundWithIncompleteLedgerSettlesAmbiguousNotNotSent() async throws {
-        let store = FedTerminalCommitRecorder(wrapping: FedMemoryStateStore())
+        let store = FedTerminalCommitRecorder(wrapping: try Self.storeUnderTest.scratchStore(for: self))
         _ = try await store.open(localPublicKey: localKey)
         let seeded = try await seedUnsettledMutation(in: store, epoch: liveEpoch)
 
@@ -154,7 +160,7 @@ final class FedOriginReconciliationTests: XCTestCase {
 
     func testFencedAndOutcomeExpiredSettleAmbiguous() async throws {
         for status in ["fed_seq_fenced", "fed_outcome_expired"] {
-            let store = FedTerminalCommitRecorder(wrapping: FedMemoryStateStore())
+            let store = FedTerminalCommitRecorder(wrapping: try Self.storeUnderTest.scratchStore(for: self))
             _ = try await store.open(localPublicKey: localKey)
             let seeded = try await seedUnsettledMutation(in: store, epoch: liveEpoch)
 
@@ -184,7 +190,7 @@ final class FedOriginReconciliationTests: XCTestCase {
     func testRegressionTripwirePoisonsEpochDurablyAndFreezesWatermark() async throws {
         let dir = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: dir) }
-        let store = FedAtomicFileStateStore(directoryURL: dir)
+        let store = Self.storeUnderTest.durableStore(in: dir)
         _ = try await store.open(localPublicKey: localKey)
 
         // Sentinel: a mutation durably recorded as settled at the live epoch.
@@ -239,7 +245,7 @@ final class FedOriginReconciliationTests: XCTestCase {
 
         // Poison survives a restart: a fresh store instance over the same durable
         // file still carries it, and a subsequent miss at that epoch is ambiguous.
-        let reopened = FedAtomicFileStateStore(directoryURL: dir)
+        let reopened = Self.storeUnderTest.durableStore(in: dir)
         _ = try await reopened.open(localPublicKey: localKey)
         let reopenedDest = try await reopened.destination(forResponderPublicKey: responderKey)
         XCTAssertTrue(
@@ -269,7 +275,7 @@ final class FedOriginReconciliationTests: XCTestCase {
     // MARK: - 8. Ordering: pure proceeds, new mutating waits
 
     func testDuringReconciliationPureProceedsWhileNewMutatingWaits() async throws {
-        let store = FedMemoryStateStore()
+        let store = try Self.storeUnderTest.scratchStore(for: self)
         _ = try await store.open(localPublicKey: localKey)
         _ = try await seedUnsettledMutation(in: store, epoch: liveEpoch)
 
@@ -353,7 +359,7 @@ final class FedOriginReconciliationTests: XCTestCase {
     func testReconnectAfterPruningStillPoisonsOnSentinelRegression() async throws {
         let dir = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: dir) }
-        let store = FedAtomicFileStateStore(directoryURL: dir)
+        let store = Self.storeUnderTest.durableStore(in: dir)
         _ = try await store.open(localPublicKey: localKey)
         let seeder = FedOriginEffectLog(store: store, responderStaticPublicKey: responderKey)
         var completed: [FedEffectID] = []
@@ -403,7 +409,7 @@ final class FedOriginReconciliationTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: dir) }
         var inFlight: FedEffectID
         do {
-            let store = FedAtomicFileStateStore(directoryURL: dir)
+            let store = Self.storeUnderTest.durableStore(in: dir)
             _ = try await store.open(localPublicKey: localKey)
             let log = FedOriginEffectLog(store: store, responderStaticPublicKey: responderKey)
             for _ in 0..<3 {
@@ -414,7 +420,7 @@ final class FedOriginReconciliationTests: XCTestCase {
             // The process dies here: nothing else of this instance survives.
         }
 
-        let reopened = FedAtomicFileStateStore(directoryURL: dir)
+        let reopened = Self.storeUnderTest.durableStore(in: dir)
         _ = try await reopened.open(localPublicKey: localKey)
         let unsettled = try await reopened.unsettledEffects(forResponderPublicKey: responderKey)
         XCTAssertEqual(unsettled.map(\.effect), [inFlight])
@@ -474,7 +480,7 @@ final class FedOriginReconciliationTests: XCTestCase {
     }
 
     private func assertAmbiguous(seededEpoch: String?, answerEpoch: String, label: String) async throws {
-        let store = FedTerminalCommitRecorder(wrapping: FedMemoryStateStore())
+        let store = FedTerminalCommitRecorder(wrapping: try Self.storeUnderTest.scratchStore(for: self))
         _ = try await store.open(localPublicKey: localKey)
         let seeded = try await seedUnsettledMutation(in: store, epoch: seededEpoch)
 
@@ -494,7 +500,7 @@ final class FedOriginReconciliationTests: XCTestCase {
     }
 
     private func assertWatermarkAdvances(status: String, ledgerComplete: Bool, label: String) async throws {
-        let store = FedMemoryStateStore()
+        let store = try Self.storeUnderTest.scratchStore(for: self)
         _ = try await store.open(localPublicKey: localKey)
         let seeded = try await seedUnsettledMutation(in: store, epoch: liveEpoch)
         let before = try await store.destination(forResponderPublicKey: responderKey)?.confirmedWatermark
@@ -637,4 +643,8 @@ final class FedOriginReconciliationTests: XCTestCase {
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         return url
     }
+}
+
+final class FedOriginReconciliationSQLiteTests: FedOriginReconciliationTests {
+    override class var storeUnderTest: FedStoreUnderTest { .sqlite }
 }

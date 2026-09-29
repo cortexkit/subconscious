@@ -4,8 +4,14 @@ import XCTest
 
 /// Settled send-log records at or below the confirmed watermark are deleted in
 /// the write that advances the watermark, except regression sentinels, and
-/// never while a ledger epoch is poisoned. Both stores must apply the same rule.
-final class FedSettledRecordPruningTests: XCTestCase {
+/// never while a ledger epoch is poisoned. Every store must apply the same rule.
+///
+/// The durable store here is the JSON file store; `FedSettledRecordPruningSQLiteTests`
+/// at the end of this file reruns every test with the SQLite store in its place.
+/// The memory store stays the reference in both runs.
+class FedSettledRecordPruningTests: XCTestCase {
+    class var storeUnderTest: FedStoreUnderTest { .asWritten }
+
     private let localKey = Data(repeating: 0x11, count: 32)
     private let responder = Data(repeating: 0x22, count: 32)
     private let epochA = "epoch-a"
@@ -79,16 +85,16 @@ final class FedSettledRecordPruningTests: XCTestCase {
 
     // MARK: - Through the stores
 
-    func testWatermarkAdvancePrunesInTheSameWriteInTheFileStore() async throws {
+    func testWatermarkAdvancePrunesInTheSameWriteInTheDurableStore() async throws {
         let dir = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: dir) }
-        let store = FedAtomicFileStateStore(directoryURL: dir)
+        let store = Self.storeUnderTest.durableStore(in: dir)
         _ = try await store.open(localPublicKey: localKey)
         let trace = try await runPruningScenario(on: store)
         assertScenarioTrace(trace)
 
         // What was pruned is gone from disk too, not just from memory.
-        let reopened = FedAtomicFileStateStore(directoryURL: dir)
+        let reopened = Self.storeUnderTest.durableStore(in: dir)
         _ = try await reopened.open(localPublicKey: localKey)
         let onDisk = try await reopened.destination(forResponderPublicKey: responder)
         XCTAssertEqual(onDisk?.unresolvedEffects.map(\.effect.seq), trace.last?.seqs)
@@ -100,28 +106,28 @@ final class FedSettledRecordPruningTests: XCTestCase {
         assertScenarioTrace(try await runPruningScenario(on: store))
     }
 
-    func testFileAndMemoryStoresPruneIdentically() async throws {
+    func testDurableAndMemoryStoresPruneIdentically() async throws {
         let dir = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: dir) }
-        let file = FedAtomicFileStateStore(directoryURL: dir)
-        _ = try await file.open(localPublicKey: localKey)
+        let durable = Self.storeUnderTest.durableStore(in: dir)
+        _ = try await durable.open(localPublicKey: localKey)
         let memory = FedMemoryStateStore()
         _ = try await memory.open(localPublicKey: localKey)
 
-        let fileTrace = try await runPruningScenario(on: file)
+        let durableTrace = try await runPruningScenario(on: durable)
         let memoryTrace = try await runPruningScenario(on: memory)
-        XCTAssertEqual(fileTrace, memoryTrace)
+        XCTAssertEqual(durableTrace, memoryTrace)
     }
 
     func testStoresDoNotPruneWhileAnEpochIsPoisoned() async throws {
         let dir = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: dir) }
-        let file = FedAtomicFileStateStore(directoryURL: dir)
-        _ = try await file.open(localPublicKey: localKey)
+        let durable = Self.storeUnderTest.durableStore(in: dir)
+        _ = try await durable.open(localPublicKey: localKey)
         let memory = FedMemoryStateStore()
         _ = try await memory.open(localPublicKey: localKey)
 
-        for store in [file, memory] as [any FedStateStore] {
+        for store in [durable, memory] as [any FedStateStore] {
             let first = try await intent(in: store, epoch: epochA)
             try await settle(first, in: store, disposition: .notSent)
             let pruned = try await store.destination(forResponderPublicKey: responder)
@@ -247,4 +253,8 @@ final class FedSettledRecordPruningTests: XCTestCase {
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         return url
     }
+}
+
+final class FedSettledRecordPruningSQLiteTests: FedSettledRecordPruningTests {
+    override class var storeUnderTest: FedStoreUnderTest { .sqlite }
 }

@@ -34,6 +34,18 @@ public protocol FedStateStore: Sendable {
     /// Commits an intent row before the first network write of a mutation.
     func commitIntent(_ record: FedUnresolvedEffectRecord) async throws
 
+    /// Reserves the next effect sequence and commits the intent row for it,
+    /// before the first network write of a mutation. Returns the effect id.
+    ///
+    /// A store may do both in one durable write; the default implementation
+    /// below makes the two separate calls. Fails with `reservationFailed`
+    /// when the intent cannot be committed.
+    func reserveEffectSequenceAndCommitIntent(
+        responderStaticPublicKey: Data,
+        peerLedgerEpoch: String?,
+        peerIncarnation: String?
+    ) async throws -> FedEffectID
+
     /// Marks an intent as sent after the first network write succeeds.
     func markSent(effect: FedEffectID, responderStaticPublicKey: Data) async throws
 
@@ -74,6 +86,36 @@ public protocol FedStateStore: Sendable {
 
     /// Unsettled ledgered effects for one destination.
     func unsettledEffects(forResponderPublicKey publicKey: Data) async throws -> [FedUnresolvedEffectRecord]
+}
+
+extension FedStateStore {
+    /// Reserves with `reserveEffectSequence`, then commits the intent with
+    /// `commitIntent`: two durable writes, for stores that cannot join them.
+    public func reserveEffectSequenceAndCommitIntent(
+        responderStaticPublicKey: Data,
+        peerLedgerEpoch: String?,
+        peerIncarnation: String?
+    ) async throws -> FedEffectID {
+        let reservation = try await reserveEffectSequence()
+        let snapshot = try await snapshot()
+        let effect = FedEffectID(
+            incarnation: snapshot.global.localIncarnation,
+            seq: reservation.value
+        )
+        do {
+            try await commitIntent(FedUnresolvedEffectRecord(
+                effect: effect,
+                responderStaticPublicKey: responderStaticPublicKey,
+                phase: .intent,
+                disposition: .unknown,
+                peerLedgerEpoch: peerLedgerEpoch,
+                peerIncarnation: peerIncarnation
+            ))
+        } catch {
+            throw FedFailure.reservationFailed
+        }
+        return effect
+    }
 }
 
 /// Test double that can fail specific transaction kinds without touching disk.

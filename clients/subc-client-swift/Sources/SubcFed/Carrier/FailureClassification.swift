@@ -174,6 +174,15 @@ public enum FedFailure: Error, Codable, Sendable, Equatable {
     case storeCorrupt
     case storeUnavailable
     case storeMigrationFailed
+    /// The existing state database could not be opened or read, as before the
+    /// device's first unlock after a restart. The database may be intact;
+    /// retry later. Never a sign that there is no stored state.
+    case storeLocked
+    /// Moving the saved send log from the JSON document into the database
+    /// failed its check, so the move was abandoned and both files were left
+    /// as they were. Distinct so an app can explain it rather than showing a
+    /// connection error.
+    case storeMigrationVerificationFailed
     case reservationFailed
     case persistenceFailed
     case cancelled
@@ -207,7 +216,7 @@ public enum FedFailure: Error, Codable, Sendable, Equatable {
              accountKeyMismatch, noiseAuthenticationFailed, framingViolation,
              protocolViolation, catalogTargetUnavailable, fedBodyTooLarge,
              fedEffectsUnsupported, storeCorrupt, storeUnavailable, storeMigrationFailed,
-             reservationFailed, persistenceFailed, cancelled, suspended, disconnected,
+             storeLocked, storeMigrationVerificationFailed, reservationFailed, persistenceFailed, cancelled, suspended, disconnected,
              moduleError, indeterminateMutation, admissionQueueFull, admissionQueueTimedOut,
              noEligibleCandidates, allCandidatesFailed
     }
@@ -233,6 +242,8 @@ public enum FedFailure: Error, Codable, Sendable, Equatable {
         case .storeCorrupt: self = .storeCorrupt
         case .storeUnavailable: self = .storeUnavailable
         case .storeMigrationFailed: self = .storeMigrationFailed
+        case .storeLocked: self = .storeLocked
+        case .storeMigrationVerificationFailed: self = .storeMigrationVerificationFailed
         case .reservationFailed: self = .reservationFailed
         case .persistenceFailed: self = .persistenceFailed
         case .cancelled: self = .cancelled
@@ -279,6 +290,8 @@ public enum FedFailure: Error, Codable, Sendable, Equatable {
         case .storeCorrupt: try c.encode(Kind.storeCorrupt, forKey: .kind)
         case .storeUnavailable: try c.encode(Kind.storeUnavailable, forKey: .kind)
         case .storeMigrationFailed: try c.encode(Kind.storeMigrationFailed, forKey: .kind)
+        case .storeLocked: try c.encode(Kind.storeLocked, forKey: .kind)
+        case .storeMigrationVerificationFailed: try c.encode(Kind.storeMigrationVerificationFailed, forKey: .kind)
         case .reservationFailed: try c.encode(Kind.reservationFailed, forKey: .kind)
         case .persistenceFailed: try c.encode(Kind.persistenceFailed, forKey: .kind)
         case .cancelled: try c.encode(Kind.cancelled, forKey: .kind)
@@ -303,7 +316,13 @@ public enum FedFailure: Error, Codable, Sendable, Equatable {
         switch self {
         case .notDialOwner, .unsupportedEnrollmentClass, .storeLossReenrollmentRequired, .invalidProfile, .accountKeyMismatch,
              .protocolViolation, .storeCorrupt, .storeUnavailable, .storeMigrationFailed,
-             .reservationFailed, .persistenceFailed, .cancelled, .suspended:
+             .storeMigrationVerificationFailed, .reservationFailed, .persistenceFailed, .cancelled, .suspended:
+            return true
+        case .storeLocked:
+            // No candidate can get past a store that cannot be read, so this
+            // ends the dial attempt like the other store failures. It is
+            // retryable one level up: the client has not recorded an opened
+            // store, so its next connect opens the store again.
             return true
         default:
             return false
@@ -431,6 +450,10 @@ extension FedFailure: CustomStringConvertible {
             return "Local storage could not be opened."
         case .storeMigrationFailed:
             return "Local stored data could not be upgraded to the current format."
+        case .storeLocked:
+            return "Local stored data cannot be read until this device has been unlocked once since it started. Try again after unlocking."
+        case .storeMigrationVerificationFailed:
+            return "Saved send history could not be moved to the new storage format, so it was left unchanged."
         case .reservationFailed:
             return "Could not reserve capacity to send this request."
         case .persistenceFailed:

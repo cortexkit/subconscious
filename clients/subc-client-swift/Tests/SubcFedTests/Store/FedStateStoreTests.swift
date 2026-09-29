@@ -2,7 +2,11 @@ import Foundation
 import XCTest
 @testable import SubcFed
 
-final class FedStateStoreTests: XCTestCase {
+/// Runs against the file and memory stores as written; `FedStateStoreSQLiteTests`
+/// at the end of this file reruns every test against the SQLite store.
+class FedStateStoreTests: XCTestCase {
+    class var storeUnderTest: FedStoreUnderTest { .asWritten }
+
     private let localKey = Data(repeating: 0x11, count: 32)
     private let responderA = Data(repeating: 0xAA, count: 32)
     private let responderB = Data(repeating: 0xBB, count: 32)
@@ -128,14 +132,14 @@ final class FedStateStoreTests: XCTestCase {
         let dir = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: dir) }
 
-        let store1 = FedAtomicFileStateStore(directoryURL: dir)
+        let store1 = Self.storeUnderTest.durableStore(in: dir)
         let first = try await store1.open(localPublicKey: localKey)
         XCTAssertTrue(first.created)
         let incarnation = first.document.global.localIncarnation
         let epoch = first.document.global.localLedgerEpoch
         let reserved = try await store1.reserveEffectSequence()
 
-        let store2 = FedAtomicFileStateStore(directoryURL: dir)
+        let store2 = Self.storeUnderTest.durableStore(in: dir)
         let second = try await store2.open(localPublicKey: localKey)
         XCTAssertFalse(second.created)
         XCTAssertEqual(second.document.global.localIncarnation, incarnation)
@@ -148,10 +152,10 @@ final class FedStateStoreTests: XCTestCase {
     func testIdentityMismatchIsCorrupt() async throws {
         let dir = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: dir) }
-        let store1 = FedAtomicFileStateStore(directoryURL: dir)
+        let store1 = Self.storeUnderTest.durableStore(in: dir)
         _ = try await store1.open(localPublicKey: localKey)
 
-        let store2 = FedAtomicFileStateStore(directoryURL: dir)
+        let store2 = Self.storeUnderTest.durableStore(in: dir)
         do {
             _ = try await store2.open(localPublicKey: Data(repeating: 0x22, count: 32))
             XCTFail("expected identity mismatch")
@@ -161,7 +165,7 @@ final class FedStateStoreTests: XCTestCase {
     }
 
     func testDestinationStateIsResponderKeyed() async throws {
-        let store = FedMemoryStateStore()
+        let store = try Self.storeUnderTest.scratchStore(for: self)
         _ = try await store.open(localPublicKey: localKey)
         let seq = try await store.reserveEffectSequence()
         let snapshot = try await store.snapshot()
@@ -192,7 +196,7 @@ final class FedStateStoreTests: XCTestCase {
     }
 
     func testPureQueryAndArgumentsAreNotPersisted() async throws {
-        let store = FedMemoryStateStore()
+        let store = try Self.storeUnderTest.scratchStore(for: self)
         _ = try await store.open(localPublicKey: localKey)
         // Pure queries never call commitIntent. Prove the store has no rows.
         let unsettled = try await store.unsettledEffects(forResponderPublicKey: responderA)
@@ -213,7 +217,7 @@ final class FedStateStoreTests: XCTestCase {
     }
 
     func testConfirmedWatermarkRequiresSettledPrefix() async throws {
-        let store = FedMemoryStateStore()
+        let store = try Self.storeUnderTest.scratchStore(for: self)
         _ = try await store.open(localPublicKey: localKey)
         let snapshot = try await store.snapshot()
         let seq1 = try await store.reserveEffectSequence()
@@ -249,7 +253,7 @@ final class FedStateStoreTests: XCTestCase {
     }
 
     func testFaultInjectedReservationPreventsEmission() async throws {
-        let inner = FedMemoryStateStore()
+        let inner = try Self.storeUnderTest.scratchStore(for: self)
         _ = try await inner.open(localPublicKey: localKey)
         let store = FedFaultInjectingStateStore(wrapping: inner)
         await store.fail(.reserveEffect)
@@ -262,15 +266,19 @@ final class FedStateStoreTests: XCTestCase {
     }
 
     func testStaleTemporaryFilesAreIgnoredOnReopen() async throws {
+        try XCTSkipIf(
+            Self.storeUnderTest == .sqlite,
+            "the file store's temp files; the SQLite store's leftover build file is covered by FedSQLiteStateStoreTests"
+        )
         let dir = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: dir) }
-        let store1 = FedAtomicFileStateStore(directoryURL: dir)
+        let store1 = Self.storeUnderTest.durableStore(in: dir)
         let first = try await store1.open(localPublicKey: localKey)
         // Leave an incomplete temp file that must never be treated as committed.
         let temp = dir.appendingPathComponent("fed-state.incomplete.tmp")
         try Data(#"{"corrupt":true}"#.utf8).write(to: temp)
 
-        let store2 = FedAtomicFileStateStore(directoryURL: dir)
+        let store2 = Self.storeUnderTest.durableStore(in: dir)
         let second = try await store2.open(localPublicKey: localKey)
         XCTAssertEqual(second.document.global.localIncarnation, first.document.global.localIncarnation)
         XCTAssertFalse(FileManager.default.fileExists(atPath: temp.path))
@@ -280,9 +288,9 @@ final class FedStateStoreTests: XCTestCase {
         let dir = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: dir) }
 
-        let writerA = FedAtomicFileStateStore(directoryURL: dir)
+        let writerA = Self.storeUnderTest.durableStore(in: dir)
         _ = try await writerA.open(localPublicKey: localKey)
-        let writerB = FedAtomicFileStateStore(directoryURL: dir)
+        let writerB = Self.storeUnderTest.durableStore(in: dir)
         _ = try await writerB.open(localPublicKey: localKey)
 
         // Exclusive lock reloads on-disk state per mutation, so both writers
@@ -292,7 +300,7 @@ final class FedStateStoreTests: XCTestCase {
         XCTAssertNotEqual(a.value, b.value)
         XCTAssertEqual(Set([a.value, b.value]).count, 2)
 
-        let writerB2 = FedAtomicFileStateStore(directoryURL: dir)
+        let writerB2 = Self.storeUnderTest.durableStore(in: dir)
         _ = try await writerB2.open(localPublicKey: localKey)
         let next = try await writerB2.reserveEffectSequence()
         XCTAssertGreaterThan(next.value, max(a.value, b.value))
@@ -301,10 +309,10 @@ final class FedStateStoreTests: XCTestCase {
     func testCatalogGenerationMonotonicAcrossRestart() async throws {
         let dir = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: dir) }
-        let store1 = FedAtomicFileStateStore(directoryURL: dir)
+        let store1 = Self.storeUnderTest.durableStore(in: dir)
         _ = try await store1.open(localPublicKey: localKey)
         let g1 = try await store1.reserveCatalogGeneration()
-        let store2 = FedAtomicFileStateStore(directoryURL: dir)
+        let store2 = Self.storeUnderTest.durableStore(in: dir)
         _ = try await store2.open(localPublicKey: localKey)
         let g2 = try await store2.reserveCatalogGeneration()
         XCTAssertGreaterThan(g2.value, g1.value)
@@ -316,4 +324,8 @@ final class FedStateStoreTests: XCTestCase {
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         return url
     }
+}
+
+final class FedStateStoreSQLiteTests: FedStateStoreTests {
+    override class var storeUnderTest: FedStoreUnderTest { .sqlite }
 }

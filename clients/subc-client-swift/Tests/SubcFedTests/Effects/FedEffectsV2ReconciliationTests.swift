@@ -51,6 +51,23 @@ class FedEffectsV2ReconciliationTests: XCTestCase {
         XCTAssertEqual(Set(queries.flatMap(\.effects)), Set(open + [sentinel]))
     }
 
+    /// The engine reports which features the hellos settled on, so the device
+    /// can tell a v2 session from a v1 one; neither side's log records it.
+    func testNegotiatedFeaturesReportWhetherTheSessionUsesEffectsV2() async throws {
+        for (peer, expectV2) in [(Self.v1, false), (Self.v2, true)] {
+            let store = try Self.storeUnderTest.scratchStore(for: self)
+            _ = try await store.open(localPublicKey: localKey)
+            let transport = FedLoopbackByteTransport()
+            let engine = makeEngine(transport: transport, store: store)
+            let before = await engine.negotiatedFeatures
+            XCTAssertEqual(before, [], "nothing is negotiated before the hello exchange")
+            try await establishReady(engine, transport, peer: peer)
+            let features = await engine.negotiatedFeatures
+            XCTAssertEqual(features.contains(FedEffectsV2Codec.feature), expectV2, "negotiated \(features) with a peer offering \(peer.sorted())")
+            XCTAssertEqual(features, features.sorted())
+        }
+    }
+
     func testReconnectToAV1PeerKeepsSingleIdQueries() async throws {
         let store = try Self.storeUnderTest.scratchStore(for: self)
         _ = try await store.open(localPublicKey: localKey)

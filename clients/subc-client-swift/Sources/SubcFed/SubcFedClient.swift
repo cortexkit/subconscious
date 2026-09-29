@@ -126,6 +126,11 @@ public actor SubcFedClient {
     public private(set) var lastMutationTimings: FedCallTimings?
     /// The same split for the most recent completed pure (read-only) call.
     public private(set) var lastPureCallTimings: FedCallTimings?
+    /// The hello features the current session negotiated, sorted, for example
+    /// `["effects-v1", "effects-v2", "mgmt-v1"]`. Empty while no session is
+    /// ready. It is the only place the device can see which effect wire a
+    /// session uses; the Mac-side log does not record it either.
+    public private(set) var negotiatedFeatures: [String] = []
 
     private struct PendingCall {
         let effect: FedEffectID
@@ -599,6 +604,7 @@ public actor SubcFedClient {
                     throw FedFailure.cancelled
                 }
                 activeSession = dialed
+                negotiatedFeatures = await dialed.engine.negotiatedFeatures
                 startReceiveLoop(session: dialed)
                 planner.resetBackoff()
                 publish(.ready(sessionID: await dialed.engine.sessionID))
@@ -963,6 +969,7 @@ public actor SubcFedClient {
             await session.transport.close()
         }
         activeSession = nil
+        negotiatedFeatures = []
     }
 
     private func cancelBackgroundWork() {

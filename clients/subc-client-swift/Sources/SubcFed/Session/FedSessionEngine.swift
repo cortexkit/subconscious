@@ -236,6 +236,11 @@ public actor FedSessionEngine {
 
     public var currentPhase: Phase { phase }
     public var sessionID: String { deps.sessionID }
+
+    /// The features both hellos agreed on, sorted; empty until the hello
+    /// exchange completes. Whether `effects-v2` is in it decides which effect
+    /// wire this session uses, and nothing else on the device records that.
+    public var negotiatedFeatures: [String] { (negotiation?.features ?? []).sorted() }
     public var negotiated: FedNegotiatedSession? { negotiation }
     public var remoteCatalog: FedRemoteCatalog? { catalogTracker.applied }
     public var isCancelled: Bool { cancelledActivities }

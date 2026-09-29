@@ -1,6 +1,6 @@
 # Scopes: owned identity records in the daemon
 
-Status: design r1. Nothing here is built. The extensibility design (magic-context
+Status: design r2 (declared attribute set, from the room's review of r1). Nothing here is built. The extensibility design (magic-context
 `.cortexkit/alfonso/plans/ck-extensibility-r6-7-amendments.md`, section K2) relies on the
 contract in sections 2 to 6; this note is where the daemon side is specified and reviewed.
 Settled in the extensibility room ([#416] to [#447]) and ruled by the operator.
@@ -32,9 +32,20 @@ Fields:
   from other fields.
 - `parent`: optional `(owner, ref)` of another scope.
 - `carriers`: the principals, other than the owner, that may open routes under the scope.
-- `attributes`: a small typed set, settable only by the owner. The daemon enforces `agent_id`
-  (a head's delegated agent) and passes the rest through unread. A key outside the declared set
-  is refused by name, so a typo cannot pass silently to providers.
+- `attributes`: a small typed set, settable only by the owner. Carriers and relays set nothing.
+  A key outside the declared set is refused by name, so a typo cannot pass silently to
+  providers. The declared set:
+  - `agent_id` (string): the head's agent, on every head scope, delegating or not. It is
+    identity: Cerebellum keys durable browser profiles and remembered app grants on it. It is
+    the value today's `agentProjectId` admission fact already carries, so nothing re-keys.
+  - `delegates` (bool, default false): true means a provider may act as that agent (Plexus bot
+    writes). The daemon refuses `delegates: true` on a scope without `agent_id`. A provider
+    acts as the agent only when `delegates` is true and `agent_id` matches; `agent_id` alone is
+    never permission to act.
+  - `hook_order` (closed enum, today only `exclusive`): the launch turned off the user's own
+    hook settings, so the CK plugin is the only hook on a call. Absent means no guarantee.
+  Per-provider policy, such as which browser controls a session may use, is not an attribute:
+  the provider keys it on `kind`.
 
 Bounds: at most 10,000 live scopes and 1,000 tombstones per owner, and 4 KiB of attributes per
 scope. Past a bound the request is refused by name; the daemon never evicts a live scope.

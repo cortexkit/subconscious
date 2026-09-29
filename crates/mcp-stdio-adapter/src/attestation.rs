@@ -1,8 +1,10 @@
 use std::{env, fmt};
 
+use subc_client_rs::launch_nonce::LaunchNonceError;
 use subc_protocol::{SUBC_LAUNCH_NONCE_ENV, SUBC_MODULE_ID_ENV};
 
-/// Startup-only daemon attestation retained after its environment carrier is scrubbed.
+/// The daemon attestation this adapter starts with: its module id and the
+/// launch nonce read through the process's one launch-nonce accessor.
 #[derive(Clone, PartialEq, Eq)]
 pub struct StartupAttestation {
     module_id: String,
@@ -26,16 +28,32 @@ impl fmt::Debug for StartupAttestation {
 }
 
 impl StartupAttestation {
-    /// Require daemon injection before any connection is opened, then remove the
-    /// nonce from the process environment so it cannot reach future child setup.
-    pub fn require_and_scrub() -> Result<Self, AttestationError> {
-        let module_id = required_environment_value(SUBC_MODULE_ID_ENV)
-            .ok_or(AttestationError::MissingModuleId)?;
-        let launch_nonce = required_environment_value(SUBC_LAUNCH_NONCE_ENV)
+    /// Require daemon injection before any connection is opened or any child is
+    /// spawned: reading the nonce first is what closes the inherited nonce
+    /// descriptor before a child could inherit it.
+    ///
+    /// The environment is left as it is. The accessor caches the nonce for
+    /// every later reader in this process (the SDK's HELLO among them), and
+    /// removing the variable from a multi-threaded process is unsound. Child
+    /// servers do not see it anyway: they are spawned with a cleared
+    /// environment.
+    pub fn require() -> Result<Self, AttestationError> {
+        Self::from_parts(
+            required_environment_value(SUBC_MODULE_ID_ENV),
+            subc_client_rs::launch_nonce(),
+        )
+    }
+
+    fn from_parts(
+        module_id: Option<String>,
+        launch_nonce: Result<Option<subc_client_rs::launch_nonce::LaunchNonce>, LaunchNonceError>,
+    ) -> Result<Self, AttestationError> {
+        let module_id = module_id.ok_or(AttestationError::MissingModuleId)?;
+        let launch_nonce = launch_nonce
+            .map_err(AttestationError::LaunchNonce)?
+            .map(|nonce| nonce.value().to_string())
+            .filter(|value| !value.trim().is_empty())
             .ok_or(AttestationError::MissingLaunchNonce)?;
-
-        env::remove_var(SUBC_LAUNCH_NONCE_ENV);
-
         Ok(Self {
             module_id,
             launch_nonce,
@@ -59,6 +77,8 @@ fn required_environment_value(name: &str) -> Option<String> {
 pub enum AttestationError {
     MissingModuleId,
     MissingLaunchNonce,
+    /// The nonce descriptor was named but could not be read.
+    LaunchNonce(LaunchNonceError),
 }
 
 impl fmt::Display for AttestationError {
@@ -74,6 +94,9 @@ impl fmt::Display for AttestationError {
                     "startup attestation requires {SUBC_LAUNCH_NONCE_ENV}"
                 )
             }
+            Self::LaunchNonce(error) => {
+                write!(formatter, "startup attestation: {error}")
+            }
         }
     }
 }
@@ -88,6 +111,7 @@ mod tests {
         sync::{Mutex, OnceLock},
     };
 
+    use subc_client_rs::launch_nonce::{LaunchNonceError, LAUNCH_NONCE_FD_ENV};
     use subc_protocol::{SUBC_LAUNCH_NONCE_ENV, SUBC_MODULE_ID_ENV};
 
     use super::{AttestationError, StartupAttestation};
@@ -96,35 +120,51 @@ mod tests {
 
     #[test]
     fn missing_module_id_has_a_specific_refusal() {
-        let _guard = environment_lock();
-        let module_id = env::var_os(SUBC_MODULE_ID_ENV);
-        let nonce = env::var_os(SUBC_LAUNCH_NONCE_ENV);
-        env::remove_var(SUBC_MODULE_ID_ENV);
-        env::remove_var(SUBC_LAUNCH_NONCE_ENV);
-
-        let result = StartupAttestation::require_and_scrub();
-
-        restore_environment(SUBC_MODULE_ID_ENV, module_id);
-        restore_environment(SUBC_LAUNCH_NONCE_ENV, nonce);
+        let result = StartupAttestation::from_parts(None, Ok(None));
         assert_eq!(result, Err(AttestationError::MissingModuleId));
     }
 
     #[test]
-    fn startup_scrubs_process_nonce_and_retains_the_memory_copy() {
+    fn missing_nonce_has_a_specific_refusal() {
+        let result = StartupAttestation::from_parts(Some("mcp-stdio-adapter".to_string()), Ok(None));
+        assert_eq!(result, Err(AttestationError::MissingLaunchNonce));
+    }
+
+    #[test]
+    fn an_unreadable_nonce_descriptor_is_refused_by_name() {
+        let error = LaunchNonceError::NotOpen { fd: 3, errno: 9 };
+        let result = StartupAttestation::from_parts(
+            Some("mcp-stdio-adapter".to_string()),
+            Err(error.clone()),
+        );
+        assert_eq!(result, Err(AttestationError::LaunchNonce(error)));
+    }
+
+    /// The adapter used to remove the nonce from its environment after reading
+    /// it. It no longer does: the accessor caches the value, and removing the
+    /// variable would break any other reader still on the environment copy.
+    /// This is the only test in this binary that reaches the process-wide
+    /// accessor, which reads once and caches.
+    #[test]
+    fn startup_leaves_the_launch_nonce_in_the_environment() {
         let _guard = environment_lock();
         let module_id = env::var_os(SUBC_MODULE_ID_ENV);
         let nonce = env::var_os(SUBC_LAUNCH_NONCE_ENV);
+        let nonce_fd = env::var_os(LAUNCH_NONCE_FD_ENV);
         env::set_var(SUBC_MODULE_ID_ENV, "mcp-stdio-adapter");
         env::set_var(SUBC_LAUNCH_NONCE_ENV, "nonce-kept-in-memory");
+        env::remove_var(LAUNCH_NONCE_FD_ENV);
 
-        let attestation = StartupAttestation::require_and_scrub().unwrap();
-
-        assert_eq!(attestation.module_id(), "mcp-stdio-adapter");
-        assert_eq!(attestation.launch_nonce(), "nonce-kept-in-memory");
-        assert!(env::var_os(SUBC_LAUNCH_NONCE_ENV).is_none());
+        let attestation = StartupAttestation::require();
+        let left = env::var_os(SUBC_LAUNCH_NONCE_ENV);
 
         restore_environment(SUBC_MODULE_ID_ENV, module_id);
         restore_environment(SUBC_LAUNCH_NONCE_ENV, nonce);
+        restore_environment(LAUNCH_NONCE_FD_ENV, nonce_fd);
+        let attestation = attestation.unwrap();
+        assert_eq!(attestation.module_id(), "mcp-stdio-adapter");
+        assert_eq!(attestation.launch_nonce(), "nonce-kept-in-memory");
+        assert_eq!(left.as_deref(), Some("nonce-kept-in-memory".as_ref()));
     }
 
     fn environment_lock() -> std::sync::MutexGuard<'static, ()> {

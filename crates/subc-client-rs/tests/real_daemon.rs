@@ -760,6 +760,87 @@ async fn clean_subc_client_rs_serves_through_real_daemon() {
     let _ = daemon.child.kill();
 }
 
+/// The daemon hands a spawned module its launch nonce on descriptor 3, the
+/// module's SDK reads it there, and its HELLO carries it: the module is
+/// declared `reserved`, so the daemon admits it only with its exact spawn
+/// nonce, and its provenance reports that the nonce came from `fd`. The
+/// daemon still sets the environment copy too, which is why the source is
+/// what tells the two apart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_supervised_module_reads_its_launch_nonce_from_the_descriptor_and_hello_carries_it() {
+    let workspace = workspace_root();
+    let daemon_bin = ensure_binary(
+        &workspace,
+        binary_path(&workspace, "ck-subc"),
+        &["build", "-p", "subc-core", "--bins"],
+    );
+    let module_bin = ensure_binary(
+        &workspace,
+        example_path(&workspace, "echo-module"),
+        &["build", "-p", "subc-client-rs", "--example", "echo-module"],
+    );
+
+    let temp_dir = unique_temp_dir("subc-client-rs-launch-nonce-fd");
+    let runtime_dir = temp_dir.join("runtime");
+    let config_dir = temp_dir.join("config");
+    let events_path = temp_dir.join("events.jsonl");
+    fs::create_dir_all(&runtime_dir).unwrap();
+    fs::create_dir_all(config_dir.join("cortexkit")).unwrap();
+    let env = BTreeMap::from([
+        (
+            "SUBC_MODULE_ECHO_EVENTS".to_string(),
+            events_path.to_string_lossy().into_owned(),
+        ),
+        ("SUBC_MODULE_ECHO_PROVENANCE".to_string(), "1".to_string()),
+    ]);
+    fs::write(
+        config_dir.join("cortexkit").join("subc.jsonc"),
+        serde_json::to_string_pretty(&json!({
+            "version": 1,
+            "modules": {
+                MODULE_ID: {
+                    "program": module_bin.to_string_lossy(),
+                    "args": [],
+                    "env": env,
+                    "enabled": true,
+                    "reserved": true,
+                }
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let daemon = spawn_daemon(&daemon_bin, &runtime_dir, &config_dir);
+    wait_for_connection_file(&daemon.connection_file, START_TIMEOUT).await;
+    let expected_source = if cfg!(unix) { "fd" } else { "env" };
+    let started = wait_for_event(&events_path, START_TIMEOUT, |event| {
+        event["kind"] == "launch_nonce"
+    })
+    .await;
+    assert_eq!(started["source"], expected_source, "{started}");
+    wait_for_catalog_module(&daemon.connection_file, MODULE_ID, START_TIMEOUT).await;
+
+    let mut client = connect_authed_client(&daemon.connection_file)
+        .await
+        .unwrap();
+    let response = control_rpc_on_stream(
+        &mut client,
+        7,
+        serde_json::to_value(ClientControlRequest::SupervisorProvenance {
+            module_id: Some(MODULE_ID.to_string()),
+        })
+        .unwrap(),
+    )
+    .await;
+    let modules = &response["modules"];
+    assert_eq!(
+        modules[0]["module_declared"]["build"]["launch_nonce_source"],
+        expected_source,
+        "{response}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn module_handle_catalog_update_refreshes_catalog_without_dropping_open_routes() {
     let workspace = workspace_root();
@@ -1837,6 +1918,7 @@ fn spawn_daemon_child(daemon_bin: &Path, runtime_dir: &Path, config_dir: &Path) 
     Command::new(daemon_bin)
         .env_remove(subc_protocol::SUBC_MODULE_ID_ENV)
         .env_remove(subc_protocol::SUBC_LAUNCH_NONCE_ENV)
+        .env_remove(subc_client_rs::launch_nonce::LAUNCH_NONCE_FD_ENV)
         .env("XDG_RUNTIME_DIR", runtime_dir)
         .env("XDG_CONFIG_HOME", config_dir)
         .env("XDG_DATA_HOME", &data_dir)

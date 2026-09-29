@@ -17,15 +17,33 @@ use tokio::time::{sleep, Duration};
 
 const DEFAULT_MODULE_ID: &str = "subc-client-rs-echo";
 const EVENTS_ENV: &str = "SUBC_MODULE_ECHO_EVENTS";
+/// When set, the module declares provenance, which the SDK completes with
+/// where the launch nonce was read from.
+const PROVENANCE_ENV: &str = "SUBC_MODULE_ECHO_PROVENANCE";
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
+    // First, before anything could spawn a child that would inherit the
+    // still-unread nonce descriptor.
+    let launch_nonce = subc_client_rs::launch_nonce();
     let module_id = std::env::var(subc_protocol::SUBC_MODULE_ID_ENV)
         .ok()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| DEFAULT_MODULE_ID.to_string());
     let events_path = std::env::var_os(EVENTS_ENV).map(PathBuf::from);
-    subc_client_rs::serve(manifest(&module_id), EchoHandler { events_path }).await?;
+    if let Some(path) = &events_path {
+        let source = match &launch_nonce {
+            Ok(Some(nonce)) => nonce.source().as_str().to_string(),
+            Ok(None) => "none".to_string(),
+            Err(error) => format!("error: {error}"),
+        };
+        let _ = append_json_line(path, json!({"kind": "launch_nonce", "source": source}));
+    }
+    let mut manifest = manifest(&module_id);
+    if std::env::var_os(PROVENANCE_ENV).is_some() {
+        manifest.provenance = Some(subc_client_rs::build_provenance(None, None, None)?);
+    }
+    subc_client_rs::serve(manifest, EchoHandler { events_path }).await?;
     Ok(())
 }
 

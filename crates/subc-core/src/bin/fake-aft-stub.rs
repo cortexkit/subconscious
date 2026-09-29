@@ -20,7 +20,8 @@ use subc_daemon::{read_frame, write_frame, Frame};
 use subc_protocol::{
     manifest::{
         CapabilityDeclarations, Concurrency, ExecutionMode, IdentityScope, InternalTransport,
-        ManagementOperation, ManagementOperationKind, ManifestProvenance, ObservabilityKind,
+        LaunchNonceSource, ManagementOperation, ManagementOperationKind, ManifestProvenance,
+        ObservabilityKind,
         ObservabilitySurface, PipelineAppliesTo, PipelineStageKind, ProviderRole,
         SelfSignalDeclaration, SelfSignalEffect, SelfSignalKind, SignalAnchor, Tool,
     },
@@ -1756,14 +1757,23 @@ fn manifest_provenance() -> Option<ManifestProvenance> {
     {
         return None;
     }
-    Some(ManifestProvenance {
-        build_git_sha: build_commit,
-        build_git_sha_absence_reason: None,
-        build_lock_digest,
-        wire_crate_version: wire_crate_version
-            .or_else(|| Some(SUBC_PROTOCOL_CRATE_VERSION.to_string())),
-        store_schema_version,
-    })
+    Some(
+        ManifestProvenance::new()
+            .with_build_git_sha(build_commit)
+            .with_build_lock_digest(build_lock_digest)
+            .with_wire_crate_version(
+                wire_crate_version.or_else(|| Some(SUBC_PROTOCOL_CRATE_VERSION.to_string())),
+            )
+            .with_store_schema_version(store_schema_version)
+            // Where this process read its launch nonce, as a module on the SDK
+            // reports it; the accessor has already read it by now.
+            .with_launch_nonce_source(
+                subc_os::launch_nonce()
+                    .ok()
+                    .flatten()
+                    .map(|nonce| LaunchNonceSource::from_wire_name(nonce.source().as_str())),
+            ),
+    )
 }
 
 fn provider_role(role: StubRole, concurrency: Concurrency, tools: &[String]) -> ProviderRole {
@@ -1897,8 +1907,8 @@ struct StubConfig {
     health_detail: Option<String>,
     health_metrics: Option<Value>,
     busy_gauges: Vec<String>,
-    /// The launch nonce subc injected for spawn attestation and reserved HELLOs.
-    /// A real supervised module reads this from the SUBC_LAUNCH_NONCE env var.
+    /// The launch nonce subc handed over for spawn attestation and reserved
+    /// HELLOs, read through `subc_os::launch_nonce` like a real module's.
     launch_nonce: Option<String>,
 }
 
@@ -2054,9 +2064,9 @@ impl StubConfig {
                         .collect()
                 })
                 .unwrap_or_default(),
-            launch_nonce: env::var(subc_protocol::SUBC_LAUNCH_NONCE_ENV)
-                .ok()
-                .filter(|value| !value.is_empty()),
+            launch_nonce: subc_os::launch_nonce()
+                .map_err(StubError::LaunchNonce)?
+                .map(|nonce| nonce.value().to_string()),
         })
     }
 }
@@ -2266,6 +2276,7 @@ enum StubError {
     HelloRejected {
         body: ErrorBody,
     },
+    LaunchNonce(subc_os::LaunchNonceError),
 }
 
 impl fmt::Display for StubError {
@@ -2355,6 +2366,7 @@ impl fmt::Display for StubError {
                 "HELLO rejected by subc: {} ({})",
                 body.code, body.message
             ),
+            Self::LaunchNonce(error) => write!(f, "launch nonce unavailable: {error}"),
         }
     }
 }
@@ -2376,6 +2388,7 @@ impl Error for StubError {
             Self::FrameBuild(err) => Some(err),
             Self::Json(err) => Some(err),
             Self::WriterTask(err) => Some(err),
+            Self::LaunchNonce(err) => Some(err),
             Self::MissingSubcArg
             | Self::MissingSubcValue
             | Self::UnexpectedArg { .. }

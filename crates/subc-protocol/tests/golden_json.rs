@@ -59,6 +59,7 @@ fn protocol_wire_shapes_match_golden_json_and_round_trip() {
             arguments: serde_json::json!({ "path": "a.rs" }),
             tool_call_id: Some("wal-intent-42".to_string()),
             progress_token: None,
+            call_key: None,
         },
     );
     assert_golden(
@@ -68,6 +69,7 @@ fn protocol_wire_shapes_match_golden_json_and_round_trip() {
             arguments: serde_json::json!({ "path": "a.rs" }),
             tool_call_id: Some("wal-intent-42".to_string()),
             progress_token: Some(serde_json::json!("pt-7")),
+            call_key: None,
         },
     );
     assert_golden("error_body", &error_body());
@@ -356,13 +358,11 @@ fn manifest_provenance_omits_each_unavailable_fact_independently() {
         "wire_crate_version",
         "store_schema_version",
     ] {
-        let mut provenance = ManifestProvenance {
-            build_git_sha: Some("commit".to_string()),
-            build_git_sha_absence_reason: None,
-            build_lock_digest: Some("lock".to_string()),
-            wire_crate_version: Some("wire".to_string()),
-            store_schema_version: Some("schema".to_string()),
-        };
+        let mut provenance = ManifestProvenance::new()
+            .with_build_git_sha(Some("commit".to_string()))
+            .with_build_lock_digest(Some("lock".to_string()))
+            .with_wire_crate_version(Some("wire".to_string()))
+            .with_store_schema_version(Some("schema".to_string()));
         match field {
             "build_git_sha" => provenance.build_git_sha = None,
             "build_lock_digest" => provenance.build_lock_digest = None,
@@ -704,15 +704,17 @@ fn module_hello_body() -> ModuleHelloBody {
 fn module_hello_body_with_provenance() -> ModuleHelloBody {
     let mut hello = module_hello_body();
     hello.manifest.ready = Some(false);
-    hello.manifest.provenance = Some(ManifestProvenance {
-        build_git_sha: Some("0123456789abcdef0123456789abcdef01234567-dirty".to_string()),
-        build_git_sha_absence_reason: None,
-        build_lock_digest: Some(
-            "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789".to_string(),
-        ),
-        wire_crate_version: Some("0.13.0".to_string()),
-        store_schema_version: Some("42".to_string()),
-    });
+    hello.manifest.provenance = Some(
+        ManifestProvenance::new()
+            .with_build_git_sha(Some(
+                "0123456789abcdef0123456789abcdef01234567-dirty".to_string(),
+            ))
+            .with_build_lock_digest(Some(
+                "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789".to_string(),
+            ))
+            .with_wire_crate_version(Some("0.13.0".to_string()))
+            .with_store_schema_version(Some("42".to_string())),
+    );
     hello
 }
 

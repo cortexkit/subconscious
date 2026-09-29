@@ -562,7 +562,13 @@ pub enum SignalCadence {
 ///   Record that at the construction site: injection-wiring sweeps grep for
 ///   `provenance:` and the obvious action at a re-export site is the wrong
 ///   one.
-#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
+///
+/// `#[non_exhaustive]`: a new provenance fact must not break the modules that
+/// build this block, so construct it with [`ManifestProvenance::new`] and the
+/// `with_*` setters (or the `build_provenance*` helpers), never a struct
+/// literal.
+#[derive(Serialize, Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ManifestProvenance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_git_sha: Option<String>,
@@ -585,6 +591,67 @@ pub struct ManifestProvenance {
     pub wire_crate_version: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub store_schema_version: Option<String>,
+    /// Where the running module read its launch nonce from: `fd` (the pipe
+    /// the daemon hands over as descriptor 3) or `env` (the environment
+    /// variable kept while modules move to the pipe). Absent means the module
+    /// did not say. This is a fact about the running process, not the build.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_nonce_source: Option<LaunchNonceSource>,
+}
+
+/// Where a module read its launch nonce from, as reported in
+/// [`ManifestProvenance::launch_nonce_source`].
+///
+/// An open string enum, like [`BuildGitShaAbsenceReason`]: a value this crate
+/// does not know decodes as `ForwardCompatibleUnknown` instead of making the
+/// whole provenance block, and with it the module's HELLO, fail to decode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum LaunchNonceSource {
+    /// Read from the inherited descriptor the daemon passes.
+    Fd,
+    /// Read from the `SUBC_LAUNCH_NONCE` environment variable.
+    Env,
+    ForwardCompatibleUnknown(String),
+}
+
+impl LaunchNonceSource {
+    /// The value as it appears on the wire.
+    pub fn wire_name(&self) -> &str {
+        match self {
+            Self::Fd => "fd",
+            Self::Env => "env",
+            Self::ForwardCompatibleUnknown(value) => value,
+        }
+    }
+
+    /// The source a wire value names; unknown values are kept as they are.
+    pub fn from_wire_name(value: &str) -> Self {
+        match value {
+            "fd" => Self::Fd,
+            "env" => Self::Env,
+            _ => Self::ForwardCompatibleUnknown(value.to_string()),
+        }
+    }
+}
+
+impl Serialize for LaunchNonceSource {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.wire_name())
+    }
+}
+
+impl<'de> Deserialize<'de> for LaunchNonceSource {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Ok(Self::from_wire_name(&value))
+    }
 }
 
 /// A build pipeline's reason for omitting `build_git_sha`.
@@ -681,6 +748,8 @@ struct ManifestProvenanceWire {
     wire_crate_version: Option<String>,
     #[serde(default)]
     store_schema_version: Option<String>,
+    #[serde(default)]
+    launch_nonce_source: Option<LaunchNonceSource>,
 }
 
 impl<'de> Deserialize<'de> for ManifestProvenance {
@@ -695,6 +764,7 @@ impl<'de> Deserialize<'de> for ManifestProvenance {
             build_lock_digest: wire.build_lock_digest,
             wire_crate_version: wire.wire_crate_version,
             store_schema_version: wire.store_schema_version,
+            launch_nonce_source: wire.launch_nonce_source,
         };
         provenance.validate().map_err(D::Error::custom)?;
         Ok(provenance)
@@ -780,6 +850,47 @@ impl fmt::Display for ManifestProvenanceError {
 impl std::error::Error for ManifestProvenanceError {}
 
 impl ManifestProvenance {
+    /// A block declaring nothing; add facts with the `with_*` setters.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_build_git_sha(mut self, value: Option<String>) -> Self {
+        self.build_git_sha = value;
+        self
+    }
+
+    pub fn with_build_git_sha_absence_reason(
+        mut self,
+        value: Option<BuildGitShaAbsenceReason>,
+    ) -> Self {
+        self.build_git_sha_absence_reason = value;
+        self
+    }
+
+    pub fn with_build_lock_digest(mut self, value: Option<String>) -> Self {
+        self.build_lock_digest = value;
+        self
+    }
+
+    pub fn with_wire_crate_version(mut self, value: Option<String>) -> Self {
+        self.wire_crate_version = value;
+        self
+    }
+
+    pub fn with_store_schema_version(mut self, value: Option<String>) -> Self {
+        self.store_schema_version = value;
+        self
+    }
+
+    /// Report where this process read its launch nonce from. A module takes
+    /// it from its nonce accessor's cached source, so the census can tell a
+    /// module reading the pipe from one still reading the environment.
+    pub fn with_launch_nonce_source(mut self, value: Option<LaunchNonceSource>) -> Self {
+        self.launch_nonce_source = value;
+        self
+    }
+
     pub fn validate(&self) -> Result<(), ManifestProvenanceError> {
         if let (Some(_), Some(reason)) = (
             self.build_git_sha.as_ref(),
@@ -802,6 +913,12 @@ impl ManifestProvenance {
             ("build_lock_digest", self.build_lock_digest.as_deref()),
             ("wire_crate_version", self.wire_crate_version.as_deref()),
             ("store_schema_version", self.store_schema_version.as_deref()),
+            (
+                "launch_nonce_source",
+                self.launch_nonce_source
+                    .as_ref()
+                    .map(|source| source.wire_name()),
+            ),
         ] {
             let Some(value) = value else { continue };
             if value.is_empty() {
@@ -941,6 +1058,7 @@ fn build_provenance_with_build_git_sha(
         build_lock_digest,
         wire_crate_version: Some(crate::SUBC_PROTOCOL_CRATE_VERSION.to_string()),
         store_schema_version: normalize_provenance_fact(store_schema_version),
+        launch_nonce_source: None,
     })
 }
 
@@ -1781,6 +1899,7 @@ mod tests {
                 ),
                 wire_crate_version: Some("0.16.0".to_string()),
                 store_schema_version: Some("42".to_string()),
+                launch_nonce_source: None,
             }))
             .build();
 
@@ -2031,6 +2150,7 @@ mod tests {
                 ),
                 wire_crate_version: Some(crate::SUBC_PROTOCOL_CRATE_VERSION.to_string()),
                 store_schema_version: Some("schema-v3".to_string()),
+                launch_nonce_source: None,
             }
         );
     }

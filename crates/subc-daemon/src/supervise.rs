@@ -5646,7 +5646,7 @@ fn apply_wire_spawn_args(
     spec: &ModuleSpec,
     connection_file_path: Option<&std::path::Path>,
     handle: Option<&SupervisorHandle>,
-) -> Result<(), SuperviseError> {
+) -> Result<Option<NonceHandoff>, SuperviseError> {
     apply_wire_spawn_args_for_role(
         command,
         spec,
@@ -5656,6 +5656,15 @@ fn apply_wire_spawn_args(
     )
 }
 
+/// The read end of a spawn's launch-nonce pipe, prepared by
+/// [`apply_wire_spawn_args_for_role`] and installed as the child's descriptor 3
+/// by the last pre-exec step, just before `spawn()`. Windows has no descriptor
+/// handoff and keeps only the environment copy.
+#[cfg(unix)]
+type NonceHandoff = subc_os::LaunchNonceHandoff;
+#[cfg(not(unix))]
+type NonceHandoff = std::convert::Infallible;
+
 /// [`apply_wire_spawn_args`] for either slot.
 ///
 /// A plain spawn's nonce replaces the module's recorded spawn (and reserved)
@@ -5664,16 +5673,30 @@ fn apply_wire_spawn_args(
 /// attest with its nonce; it is recorded as the open swap's candidate token
 /// instead, and the recording happens before the process exists so its HELLO
 /// can never arrive ahead of it.
+///
+/// The nonce goes to the child two ways. On macOS and Linux it is written into
+/// a pipe whose read end the child gets as descriptor 3, named by
+/// `SUBC_LAUNCH_NONCE_FD=3:<pipe inode>`: unlike the environment, another
+/// process of the same user cannot read it with `ps eww`. That handoff is
+/// returned rather than installed here, because installing it replaces
+/// whatever the child has at descriptor 3 and so must be the last pre-exec
+/// step, after the Linux cgroup placement that the caller registers later.
+/// The environment copy `SUBC_LAUNCH_NONCE` is still set as well, for modules
+/// that have not moved to the descriptor yet.
 fn apply_wire_spawn_args_for_role(
     command: &mut Command,
     spec: &ModuleSpec,
     connection_file_path: Option<&std::path::Path>,
     handle: Option<&SupervisorHandle>,
     role: SpawnRole,
-) -> Result<(), SuperviseError> {
+) -> Result<Option<NonceHandoff>, SuperviseError> {
     command.env(SUBC_MODULE_ID_ENV, &spec.module_id);
+    // Removed on every path: a daemon started from a module's process tree
+    // inherits this variable, and passing it on would point the child at a
+    // descriptor it does not have.
+    command.env_remove(subc_os::LAUNCH_NONCE_FD_ENV);
     if spec.protocol == ModuleProtocol::None {
-        return Ok(());
+        return Ok(None);
     }
     if let Some(connection_file_path) = connection_file_path {
         command.arg(SUBC_ARG).arg(connection_file_path);
@@ -5694,8 +5717,21 @@ fn apply_wire_spawn_args_for_role(
             SpawnRole::SwapCandidate => handle.open_swap(&spec.module_id, nonce.clone()),
         }
     }
+    #[cfg(unix)]
+    let handoff = {
+        let handoff =
+            subc_os::LaunchNonceHandoff::new(&nonce).map_err(|source| SuperviseError::Spawn {
+                program: spec.program.clone(),
+                source,
+                cgroup_path: None,
+            })?;
+        command.env(subc_os::LAUNCH_NONCE_FD_ENV, handoff.fd_env_value());
+        Some(handoff)
+    };
+    #[cfg(not(unix))]
+    let handoff = None;
     command.env(SUBC_LAUNCH_NONCE_ENV, nonce);
-    Ok(())
+    Ok(handoff)
 }
 
 fn apply_child_env(command: &mut Command, spec: &ModuleSpec) {
@@ -5829,7 +5865,8 @@ fn spawn_child_in_slot(
     // wins over anything ambient.
     apply_child_env(&mut command, spec);
     apply_spawn_role(&mut command, role);
-    apply_wire_spawn_args_for_role(&mut command, spec, connection_file_path, handle, role)?;
+    let nonce_handoff =
+        apply_wire_spawn_args_for_role(&mut command, spec, connection_file_path, handle, role)?;
 
     #[cfg(target_os = "linux")]
     let cgroup_path = cgroup_placement
@@ -5891,6 +5928,15 @@ fn spawn_child_in_slot(
     #[cfg(unix)]
     command.process_group(0);
     command.stdin(Stdio::null());
+    // The LAST pre-exec step, after the cgroup placement above: installing the
+    // nonce at descriptor 3 replaces whatever the child had there, which could
+    // be the descriptor an earlier step writes through.
+    #[cfg(unix)]
+    if let Some(handoff) = nonce_handoff {
+        handoff.install_last(command.as_std_mut());
+    }
+    #[cfg(not(unix))]
+    let _ = nonce_handoff;
 
     // Containment, step 1 of 3 (issue #109): create the child suspended so it
     // cannot run a single instruction -- and therefore cannot spawn a
@@ -9436,8 +9482,19 @@ mod child_env_tests {
         let mut none_spec = spec(Vec::new());
         none_spec.protocol = ModuleProtocol::None;
         let mut none = Command::new("/nonexistent");
-        apply_wire_spawn_args(&mut none, &none_spec, Some(connection_file), Some(&handle))
-            .expect("protocol-none spawn args apply");
+        let none_handoff =
+            apply_wire_spawn_args(&mut none, &none_spec, Some(connection_file), Some(&handle))
+                .expect("protocol-none spawn args apply");
+        assert!(
+            none_handoff.is_none(),
+            "protocol:none spawn must not receive a nonce descriptor"
+        );
+        assert!(
+            !none.as_std().get_envs().any(|(key, value)| key
+                == OsStr::new(subc_os::LAUNCH_NONCE_FD_ENV)
+                && value.is_some()),
+            "protocol:none spawn must not name a nonce descriptor"
+        );
         let none_args: Vec<String> = none
             .as_std()
             .get_args()
@@ -9471,8 +9528,22 @@ mod child_env_tests {
         // Control: the subc-wire path is unchanged by the branch above.
         let wire_spec = spec(Vec::new());
         let mut wire = Command::new("/nonexistent");
-        apply_wire_spawn_args(&mut wire, &wire_spec, Some(connection_file), Some(&handle))
-            .expect("subc-wire spawn args apply");
+        let wire_handoff =
+            apply_wire_spawn_args(&mut wire, &wire_spec, Some(connection_file), Some(&handle))
+                .expect("subc-wire spawn args apply");
+        let wire_fd_env = wire
+            .as_std()
+            .get_envs()
+            .find(|(key, _)| *key == OsStr::new(subc_os::LAUNCH_NONCE_FD_ENV))
+            .and_then(|(_, value)| value.map(|v| v.to_string_lossy().into_owned()));
+        #[cfg(unix)]
+        assert_eq!(
+            wire_fd_env,
+            Some(wire_handoff.expect("a descriptor handoff").fd_env_value()),
+            "a subc-wire spawn names the pipe it will receive at descriptor 3"
+        );
+        #[cfg(not(unix))]
+        assert!(wire_handoff.is_none() && wire_fd_env.is_none());
         let wire_args: Vec<String> = wire
             .as_std()
             .get_args()
@@ -10423,5 +10494,87 @@ mod job_containment_tests {
             subc_jobobject::wait_for_process_exit(pid, Duration::from_secs(10)),
             "could not clean up grandchild {pid}"
         );
+    }
+}
+
+/// The daemon's real spawn path hands a subc-wire child its launch nonce on
+/// descriptor 3, as well as in the environment. The child here is a shell that
+/// copies what it finds at descriptor 3 into a file, so the test sees exactly
+/// what arrived through exec.
+#[cfg(all(test, unix))]
+mod launch_nonce_descriptor_tests {
+    use super::{spawn_child, ChildRoster, ModuleProtocol, ModuleSpec, SupervisorHandle};
+    use crate::stderr_tail::{StderrRing, StderrTailConfig};
+    use std::{
+        path::PathBuf,
+        sync::{Arc, Mutex},
+        time::{Duration, Instant},
+    };
+    use subc_test_support::TestTempDir;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_spawned_module_receives_its_nonce_on_descriptor_3_and_in_the_environment() {
+        let scratch = TestTempDir::new("launch-nonce-descriptor");
+        let fd_copy = scratch.join("from-descriptor");
+        let env_copy = scratch.join("from-environment");
+        let script = format!(
+            "cat <&3 > '{fd}.tmp' && mv '{fd}.tmp' '{fd}'; \
+             printf %s \"$SUBC_LAUNCH_NONCE\" > '{env}.tmp' && mv '{env}.tmp' '{env}'; \
+             sleep 30",
+            fd = fd_copy.display(),
+            env = env_copy.display(),
+        );
+        let xdg = |name: &str| (name.to_string(), scratch.join(name).display().to_string());
+        let spec = ModuleSpec {
+            module_id: "nonce-descriptor-probe".to_string(),
+            program: PathBuf::from("/bin/sh"),
+            args: vec!["-c".to_string(), script],
+            env: vec![
+                xdg("XDG_DATA_HOME"),
+                xdg("XDG_RUNTIME_DIR"),
+                xdg("XDG_CONFIG_HOME"),
+            ],
+            reserved: true,
+            reserved_prefixes: Vec::new(),
+            protocol: ModuleProtocol::Subc,
+            overlap: Default::default(),
+        };
+        let handle = SupervisorHandle::new();
+        let ring = Arc::new(Mutex::new(StderrRing::new(StderrTailConfig::default())));
+        let roster = ChildRoster::default();
+        let child = spawn_child(
+            &spec,
+            None,
+            Some(&handle),
+            &ring,
+            None,
+            &roster,
+            #[cfg(target_os = "linux")]
+            None,
+        )
+        .expect("spawn the probe");
+        let expected = handle
+            .spawn_nonce("nonce-descriptor-probe")
+            .expect("a recorded spawn nonce");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !(fd_copy.exists() && env_copy.exists()) {
+            assert!(
+                Instant::now() < deadline,
+                "the probe never wrote its copies"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            std::fs::read_to_string(&fd_copy).unwrap(),
+            expected,
+            "descriptor 3 must hold the spawn nonce"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&env_copy).unwrap(),
+            expected,
+            "the environment copy is still set during the rollout"
+        );
+        drop(child);
     }
 }

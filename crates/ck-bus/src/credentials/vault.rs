@@ -20,8 +20,6 @@ pub const CLAUSTRUM_MODULE_ID: &str = "claustrum";
 /// The recorded condition name for a root the vault answers `not_found` for.
 pub const ROOT_KEY_UNREACHABLE: &str = "root-key-unreachable";
 
-const LAUNCH_NONCE_ENV: &str = "SUBC_LAUNCH_NONCE";
-
 /// Whether a failed call is worth retrying on the next sentinel period.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Retry {
@@ -126,20 +124,22 @@ impl ClaustrumRoute {
     }
 
     /// The route a supervised ck-bus uses: the daemon's connection file from `--subc`,
-    /// and the identity from `SUBC_MODULE_ID` and `SUBC_LAUNCH_NONCE` exactly as the
-    /// daemon injected them. A missing nonce is not synthesised; the route then carries
-    /// no identity and the vault's `not_found` names that cause.
+    /// and the identity from `SUBC_MODULE_ID` and the launch nonce the daemon handed
+    /// over, read through the process's one launch-nonce accessor. A missing nonce is
+    /// not synthesised; the route then carries no identity and the vault's `not_found`
+    /// names that cause. A nonce descriptor that is named but unreadable is an error,
+    /// never a fallback to the environment copy.
     pub fn supervised() -> Result<Self, String> {
         let connection_file = subc_arg(env::args_os()).ok_or_else(|| {
             "ck-bus needs --subc <connection file> to reach the vault".to_string()
         })?;
-        let identity = match (env::var(SUBC_MODULE_ID_ENV), env::var(LAUNCH_NONCE_ENV)) {
-            (Ok(module_id), Ok(launch_nonce))
-                if !module_id.is_empty() && !launch_nonce.is_empty() =>
-            {
+        let launch_nonce = subc_client_rs::launch_nonce()
+            .map_err(|error| format!("ck-bus cannot read its launch nonce: {error}"))?;
+        let identity = match (env::var(SUBC_MODULE_ID_ENV), launch_nonce) {
+            (Ok(module_id), Some(launch_nonce)) if !module_id.is_empty() => {
                 Some(ConsumerIdentity {
                     module_id,
-                    launch_nonce,
+                    launch_nonce: launch_nonce.value().to_string(),
                 })
             }
             _ => None,

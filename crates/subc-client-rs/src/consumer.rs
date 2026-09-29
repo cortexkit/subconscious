@@ -22,8 +22,7 @@ use subc_control::{
 pub use subc_control::{LiveSpawn, SpawnCursor, SpawnEvent, SpawnEventKind, SpawnSnapshot};
 use subc_protocol::{
     error_codes, manifest::is_valid_capability_identifier, AdmissionClass, BindIdentity, ErrorBody,
-    Flags, Frame, FrameBuildError, FrameType, Priority, RouteTarget, SUBC_LAUNCH_NONCE_ENV,
-    SUBC_MODULE_ID_ENV,
+    Flags, Frame, FrameBuildError, FrameType, Priority, RouteTarget, SUBC_MODULE_ID_ENV,
 };
 
 use crate::RouteHandle;
@@ -4873,9 +4872,16 @@ fn consumer_identity_from_env() -> Option<ConsumerIdentity> {
     let module_id = std::env::var(SUBC_MODULE_ID_ENV)
         .ok()
         .filter(|value| !value.is_empty())?;
-    let launch_nonce = std::env::var(SUBC_LAUNCH_NONCE_ENV)
+    // Through the process's one cached accessor, never a second read of the
+    // descriptor. An accessor error (for example a process a module spawned,
+    // which inherits the descriptor variable but not the pipe) opens the
+    // route without identity: it never falls back to the environment copy,
+    // because presenting the module's nonce is exactly what such a process
+    // must no longer be able to do.
+    let launch_nonce = crate::launch_nonce()
         .ok()
-        .filter(|value| !value.is_empty())?;
+        .flatten()
+        .map(|nonce| nonce.value().to_string())?;
     Some(ConsumerIdentity {
         module_id,
         launch_nonce,

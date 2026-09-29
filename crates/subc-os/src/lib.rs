@@ -32,8 +32,22 @@
 //! reporting only; see [`resource_usage`]. On Linux that is procfs again; on
 //! macOS it is `proc_pid_rusage`, plus `mach_timebase_info` to convert its CPU
 //! times to nanoseconds, the other two unsafe calls in the crate.
+//!
+//! And it carries the launch nonce from the daemon to each module it spawns
+//! over an inherited pipe instead of the environment: [`launch_nonce`] is the
+//! one reader every module uses, and [`LaunchNonceHandoff`] the daemon's half.
+//! That module's unsafe code is `dup2`, `fcntl`, `fstat` and `ioctl` on
+//! descriptors, each with its preconditions stated beside it.
 
 #![deny(unsafe_code)]
+
+pub mod launch_nonce;
+#[cfg(unix)]
+pub use launch_nonce::LaunchNonceHandoff;
+pub use launch_nonce::{
+    launch_nonce, LaunchNonce, LaunchNonceError, LaunchNonceSource, LAUNCH_NONCE_ENV,
+    LAUNCH_NONCE_FD, LAUNCH_NONCE_FD_ENV,
+};
 
 #[cfg(target_os = "linux")]
 mod linux;

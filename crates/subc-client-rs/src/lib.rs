@@ -44,14 +44,18 @@ use subc_protocol::{
         MODULE_TO_SUBC_OP_CATALOG_UPDATE,
     },
     BindIdentity, ErrorBody, Flags, Frame, FrameBuildError, FrameType, ModuleHelloAckBody,
-    ModuleHelloBody, Principal, Priority, RouteTarget, PROTOCOL_VERSION, SUBC_LAUNCH_NONCE_ENV,
-    SUBC_MODULE_ID_ENV,
+    ModuleHelloBody, Principal, Priority, RouteTarget, PROTOCOL_VERSION, SUBC_MODULE_ID_ENV,
 };
+/// The one launch-nonce reader for a module process: `launch_nonce()` reads
+/// the descriptor (or, during the rollout, the environment copy) once and
+/// caches it. The SDK's HELLO and route opens go through it too; a module's
+/// own readers must as well, and it should call it before spawning anything.
+pub use subc_os::launch_nonce;
 pub use subc_protocol::{
     manifest::{
         build_provenance, CapabilityDeclarations, CapabilityNeed, CapabilityRequirement,
-        ExecutionMode, ManifestProvenance, ProvenanceFormError, ProviderRole, Tool,
-        PROVENANCE_SENTINELS,
+        ExecutionMode, LaunchNonceSource, ManifestProvenance, ProvenanceFormError, ProviderRole,
+        Tool, PROVENANCE_SENTINELS,
     },
     session::{HealthReport, HealthStatus},
     AdmissionClass, MachineId, SUBC_PROTOCOL_CRATE_VERSION,
@@ -1505,17 +1509,20 @@ where
 
 async fn send_hello(
     egress: &mpsc::Sender<Frame>,
-    manifest: ModuleManifest,
+    mut manifest: ModuleManifest,
 ) -> Result<(), SubcModuleError> {
+    let launch_nonce = match retained_launch_nonce() {
+        Some(retained) => Some(retained),
+        None => launch_nonce()
+            .map_err(SubcModuleError::LaunchNonce)?
+            .map(|nonce| nonce.value().to_string()),
+    };
+    stamp_launch_nonce_source(&mut manifest, launch_nonce.as_deref());
     let body = serde_json::to_vec(&ModuleHelloBody {
         manifest,
         protocol_ver: PROTOCOL_VERSION,
         control_ops: Some(vec![MODULE_CONTROL_OP_HEALTH_CHECK.to_string()]),
-        launch_nonce: retained_launch_nonce().or_else(|| {
-            env::var(SUBC_LAUNCH_NONCE_ENV)
-                .ok()
-                .filter(|value| !value.is_empty())
-        }),
+        launch_nonce,
     })
     .map_err(SubcModuleError::Json)?;
     let frame = Frame::build(FrameType::Hello, control_flags(), 0, 0, HELLO_CORR, body)
@@ -1689,6 +1696,9 @@ pub enum SubcModuleError {
     HelloRejected {
         body: ErrorBody,
     },
+    /// The descriptor named for the launch nonce could not be read. HELLO is
+    /// not sent without it, and the environment copy is not tried instead.
+    LaunchNonce(launch_nonce::LaunchNonceError),
 }
 
 impl fmt::Display for SubcModuleError {
@@ -1745,6 +1755,7 @@ impl fmt::Display for SubcModuleError {
                 "HELLO rejected by subc: {} ({})",
                 body.code, body.message
             ),
+            Self::LaunchNonce(err) => write!(f, "launch nonce unavailable: {err}"),
         }
     }
 }
@@ -1758,6 +1769,7 @@ impl Error for SubcModuleError {
             Self::FrameIo(err) => Some(err),
             Self::FrameBuild(err) => Some(err),
             Self::Json(err) => Some(err),
+            Self::LaunchNonce(err) => Some(err),
             Self::WriterTask(err) => Some(err),
             Self::MissingSubcArg
             | Self::MissingSubcValue
@@ -2900,4 +2912,37 @@ pub fn retain_launch_nonce_for_hello(launch_nonce: String) -> Result<(), String>
 
 fn retained_launch_nonce() -> Option<String> {
     RETAINED_LAUNCH_NONCE.get().cloned()
+}
+
+/// Where this process read its launch nonce, in the form module provenance
+/// reports it (`fd` or `env`), or `None` when it has none or could not read
+/// it. For a module that builds its provenance block itself:
+/// `.with_launch_nonce_source(subc_client_rs::launch_nonce_source())`.
+pub fn launch_nonce_source() -> Option<LaunchNonceSource> {
+    launch_nonce()
+        .ok()
+        .flatten()
+        .map(|nonce| LaunchNonceSource::from_wire_name(nonce.source().as_str()))
+}
+
+/// Fill in `launch_nonce_source` on a module's declared provenance, so the
+/// census can tell a module reading the pipe from one still reading the
+/// environment. Only when the module declared provenance and left the field
+/// unset, and only when the nonce HELLO carries is the one the accessor read:
+/// a nonce retained by the module itself came from somewhere this SDK cannot
+/// vouch for.
+fn stamp_launch_nonce_source(manifest: &mut ModuleManifest, sent: Option<&str>) {
+    let Some(provenance) = manifest.provenance.as_mut() else {
+        return;
+    };
+    if provenance.launch_nonce_source.is_some() {
+        return;
+    }
+    if let Ok(Some(nonce)) = launch_nonce() {
+        if sent == Some(nonce.value()) {
+            provenance.launch_nonce_source = Some(LaunchNonceSource::from_wire_name(
+                nonce.source().as_str(),
+            ));
+        }
+    }
 }

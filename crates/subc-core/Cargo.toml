@@ -1,6 +1,6 @@
 [package]
 name = "subc-core"
-version = "0.20.41"
+version = "0.20.42"
 edition = "2021"
 license = "MIT"
 publish = false
@@ -43,7 +43,7 @@ harness = false
 required-features = ["bench-harness"]
 
 [dependencies]
-subc-daemon = { path = "../subc-daemon", version = "0.23.0" }
+subc-daemon = { path = "../subc-daemon", version = "0.24.0" }
 cortexkit-log = { version = "0.3.3" }
 cortexkit-paths = "0.1.1"
 base64 = "0.22"
@@ -56,6 +56,7 @@ sha2 = "0.10"
 subc-control = { path = "../subc-control" }
 subc-jsonc = { path = "../subc-jsonc" }
 terminal_size = "0.4"
+subc-os = { path = "../subc-os" }
 subc-protocol = { path = "../subc-protocol" }
 subc-transport = { path = "../subc-transport" }
 tokio = { version = "1", features = ["net", "rt-multi-thread", "macros", "io-util", "sync", "time", "process", "signal"] }
@@ -70,7 +71,7 @@ rustix = { version = "1", default-features = false, features = ["process"] }
 [dev-dependencies]
 subc-test-support = { path = "../subc-test-support" }
 tokio = { version = "1", features = ["test-util"] }
-subc-daemon = { path = "../subc-daemon", version = "0.23.0", features = ["test-support"] }
+subc-daemon = { path = "../subc-daemon", version = "0.24.0", features = ["test-support"] }
 # Keep required-feature CLI fixture targets enabled for integration tests.
 subc-core = { path = ".", features = ["test-support"] }
 

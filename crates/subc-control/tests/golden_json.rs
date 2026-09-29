@@ -549,18 +549,16 @@ fn client_control_responses() -> Vec<(&'static str, ClientControlResponse)> {
                 modules: vec![SupervisorModuleProvenance {
                     module_id: "aft".to_string(),
                     module_declared: ModuleDeclaredProvenance::Reported {
-                        build: ManifestProvenance {
-                            build_git_sha: Some(
+                        build: ManifestProvenance::new()
+                            .with_build_git_sha(Some(
                                 "0123456789abcdef0123456789abcdef01234567".to_string(),
-                            ),
-                            build_git_sha_absence_reason: None,
-                            build_lock_digest: Some(
+                            ))
+                            .with_build_lock_digest(Some(
                                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                                     .to_string(),
-                            ),
-                            wire_crate_version: Some("0.13.0".to_string()),
-                            store_schema_version: Some("2".to_string()),
-                        },
+                            ))
+                            .with_wire_crate_version(Some("0.13.0".to_string()))
+                            .with_store_schema_version(Some("2".to_string())),
                     },
                     daemon_observed: SupervisorObservedProcess {
                         pid: Some(4201),
@@ -639,18 +637,16 @@ fn client_control_responses() -> Vec<(&'static str, ClientControlResponse)> {
                 modules: vec![SupervisorModuleProvenance {
                     module_id: "mcp".to_string(),
                     module_declared: ModuleDeclaredProvenance::Reported {
-                        build: ManifestProvenance {
-                            build_git_sha: Some(
+                        build: ManifestProvenance::new()
+                            .with_build_git_sha(Some(
                                 "fedcba9876543210fedcba9876543210fedcba98-dirty".to_string(),
-                            ),
-                            build_git_sha_absence_reason: None,
-                            build_lock_digest: Some(
+                            ))
+                            .with_build_lock_digest(Some(
                                 "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
                                     .to_string(),
-                            ),
-                            wire_crate_version: Some("0.13.0".to_string()),
-                            store_schema_version: Some("3".to_string()),
-                        },
+                            ))
+                            .with_wire_crate_version(Some("0.13.0".to_string()))
+                            .with_store_schema_version(Some("3".to_string())),
                     },
                     daemon_observed: SupervisorObservedProcess {
                         pid: Some(4401),

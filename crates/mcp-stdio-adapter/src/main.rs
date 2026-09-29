@@ -58,12 +58,12 @@ async fn run() -> Result<()> {
 
     // This is intentionally first: no config read or daemon connection may occur
     // before a hand-launched process is refused.
-    let attestation = StartupAttestation::require_and_scrub()?;
+    // It also reads the launch nonce, which the SDK's HELLO later takes from
+    // the same cached accessor.
+    let attestation = StartupAttestation::require()?;
     let _logger = cortexkit_log::init_from_env()?;
     LOGGER_INSTALLED.store(true, std::sync::atomic::Ordering::Relaxed);
     tracing::info!("adapter starting");
-    subc_client_rs::retain_launch_nonce_for_hello(attestation.launch_nonce().to_string())
-        .map_err(std::io::Error::other)?;
 
     let args = StartupArgs::parse(env::args_os().skip(1))?;
     let config_path = args.config.unwrap_or(default_config_path()?);

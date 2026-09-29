@@ -21,7 +21,7 @@ use subc_daemon::{
     read_frame, write_frame, Frame, ModuleSpec, RestartPolicy, Supervisor, SupervisorHandle,
     SupervisorProcessLiveness,
 };
-use subc_protocol::manifest::ManifestProvenance;
+use subc_protocol::manifest::LaunchNonceSource;
 use subc_protocol::{Flags, FrameType, Priority};
 #[cfg(target_os = "linux")]
 use subc_test_support::TestTempDir;
@@ -131,30 +131,82 @@ async fn supervisor_provenance_reports_declared_and_observed_module_facts() {
     assert!(observed.daemon_observed.spawned_at_ms.unwrap_or_default() > 0);
     assert_running_image_matches(&observed.daemon_observed.running_image);
     let rendered = serde_json::to_string(&observed_daemon).unwrap();
-    // Destructured rather than field-accessed so that adding a field to
-    // ManifestProvenance fails to compile here instead of silently escaping the
-    // leakage sweep below.
-    let ManifestProvenance {
-        build_git_sha,
-        build_git_sha_absence_reason: _,
-        build_lock_digest,
-        wire_crate_version,
-        store_schema_version,
-    } = build;
-    for declared in [
-        build_git_sha.as_deref(),
-        build_lock_digest.as_deref(),
-        wire_crate_version.as_deref(),
-        store_schema_version.as_deref(),
-    ]
-    .into_iter()
-    .flatten()
-    {
+    // Every declared value, read from the serialized block rather than named
+    // field by field, so a field added to ManifestProvenance joins the
+    // leakage sweep below without anyone having to remember it. (The struct is
+    // non_exhaustive, so a destructuring pattern can no longer force that.)
+    let declared_values: Vec<String> = serde_json::to_value(build)
+        .unwrap()
+        .as_object()
+        .unwrap()
+        .iter()
+        // The absence reason and the nonce source are fixed vocabulary, not
+        // module-chosen values, so a daemon fact may legitimately contain them.
+        .filter(|(key, _)| {
+            !matches!(
+                key.as_str(),
+                "build_git_sha_absence_reason" | "launch_nonce_source"
+            )
+        })
+        .filter_map(|(_, value)| value.as_str().map(str::to_string))
+        .collect();
+    assert_eq!(declared_values.len(), 4, "{declared_values:?}");
+    for declared in &declared_values {
         assert!(
             !rendered.contains(declared),
             "daemon facts must not contain declared provenance value {declared:?}"
         );
     }
+    module.stop().await.unwrap();
+}
+
+/// A reserved module the supervisor spawns reads its launch nonce from the
+/// descriptor the spawn hands it: it is admitted, which a reserved module is
+/// only with its exact spawn nonce in HELLO, and its declared provenance says
+/// the nonce came from `fd` even though the environment copy is set too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn supervisor_provenance_reports_a_reserved_module_reading_its_nonce_from_the_descriptor() {
+    let process_liveness = Arc::new(SupervisorProcessLiveness::new());
+    let supervisor_handle = SupervisorHandle::new();
+    let daemon = start_test_daemon_with_process_liveness_and_supervisor(
+        "provenance-nonce-source",
+        process_liveness.clone(),
+        supervisor_handle.clone(),
+    )
+    .await;
+    let supervisor = Supervisor::new(Arc::clone(&daemon.registry), RestartPolicy::default())
+        .with_process_liveness(process_liveness)
+        .with_handle(supervisor_handle)
+        .with_drain_timeout(Duration::from_millis(25))
+        .with_connection_file_path(daemon.connection_file_path.clone());
+    let scratch = subc_test_support::TestTempDir::new("provenance-nonce-source");
+    let xdg = |name: &str| (name.to_string(), scratch.join(name).display().to_string());
+    let mut spec = stub_spec(
+        "provenance-nonce-source",
+        vec![("FAKE_AFT_WIRE_CRATE_VERSION", "0.0.0-test")],
+    );
+    spec.reserved = true;
+    spec.env.extend([
+        xdg("XDG_DATA_HOME"),
+        xdg("XDG_RUNTIME_DIR"),
+        xdg("XDG_CONFIG_HOME"),
+    ]);
+    let module = supervisor.spawn(spec).unwrap();
+    wait_for_registration(&daemon, "provenance-nonce-source").await;
+
+    let response = provenance_request(&daemon, 4, Some("provenance-nonce-source")).await;
+    let ClientControlResponse::SupervisorProvenance { modules, .. } = response else {
+        panic!("supervisor.provenance must return a provenance response");
+    };
+    let ModuleDeclaredProvenance::Reported { build } = &modules[0].module_declared else {
+        panic!("the stub declares provenance");
+    };
+    let expected = if cfg!(unix) {
+        LaunchNonceSource::Fd
+    } else {
+        LaunchNonceSource::Env
+    };
+    assert_eq!(build.launch_nonce_source, Some(expected));
     module.stop().await.unwrap();
 }
 

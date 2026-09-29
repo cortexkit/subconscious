@@ -81,7 +81,7 @@ final class FedOriginReconciliationTests: XCTestCase {
     // MARK: - 3. not_found + complete + three-way epoch agreement → not_sent
 
     func testNotFoundCompleteWithThreeWayEpochAgreementSettlesNotSent() async throws {
-        let store = FedMemoryStateStore()
+        let store = FedTerminalCommitRecorder(wrapping: FedMemoryStateStore())
         _ = try await store.open(localPublicKey: localKey)
         // Persisted intent epoch == live HELLO epoch (seeded at liveEpoch).
         let seeded = try await seedUnsettledMutation(in: store, epoch: liveEpoch)
@@ -97,7 +97,7 @@ final class FedOriginReconciliationTests: XCTestCase {
             ledgerEpoch: liveEpoch
         ))
 
-        let row = try await row(for: seeded, in: store)
+        let row = await store.committedTerminal(for: seeded)
         XCTAssertEqual(row?.disposition, .notSent, "three-way epoch agreement + complete ledger proves non-execution")
     }
 
@@ -107,7 +107,7 @@ final class FedOriginReconciliationTests: XCTestCase {
     /// not_sent. A peer reporting ledger_complete:false CANNOT KNOW whether the
     /// mutation executed, so the disposition must be ambiguous, never not_sent.
     func testNotFoundWithIncompleteLedgerSettlesAmbiguousNotNotSent() async throws {
-        let store = FedMemoryStateStore()
+        let store = FedTerminalCommitRecorder(wrapping: FedMemoryStateStore())
         _ = try await store.open(localPublicKey: localKey)
         let seeded = try await seedUnsettledMutation(in: store, epoch: liveEpoch)
 
@@ -122,7 +122,7 @@ final class FedOriginReconciliationTests: XCTestCase {
             ledgerEpoch: liveEpoch
         ))
 
-        let row = try await row(for: seeded, in: store)
+        let row = await store.committedTerminal(for: seeded)
         XCTAssertEqual(row?.disposition, .ambiguous, "ledger_complete:false means the peer cannot know → ambiguous")
         XCTAssertNotEqual(row?.disposition, .notSent, "an incomplete ledger must never be classified retry-safe")
     }
@@ -154,7 +154,7 @@ final class FedOriginReconciliationTests: XCTestCase {
 
     func testFencedAndOutcomeExpiredSettleAmbiguous() async throws {
         for status in ["fed_seq_fenced", "fed_outcome_expired"] {
-            let store = FedMemoryStateStore()
+            let store = FedTerminalCommitRecorder(wrapping: FedMemoryStateStore())
             _ = try await store.open(localPublicKey: localKey)
             let seeded = try await seedUnsettledMutation(in: store, epoch: liveEpoch)
 
@@ -169,7 +169,7 @@ final class FedOriginReconciliationTests: XCTestCase {
                 ledgerEpoch: liveEpoch
             ))
 
-            let row = try await row(for: seeded, in: store)
+            let row = await store.committedTerminal(for: seeded)
             XCTAssertEqual(row?.disposition, .ambiguous, "\(status) never proves non-execution → ambiguous")
         }
     }
@@ -345,7 +345,123 @@ final class FedOriginReconciliationTests: XCTestCase {
         try await assertWatermarkAdvances(status: "expired", ledgerComplete: true, label: "ambiguous")
     }
 
+    // MARK: - 10. Pruning keeps what reconnect needs
+
+    /// Settled records are pruned as the watermark advances, keeping only the
+    /// regression sentinel. After three completed mutations the document holds
+    /// just the last one; the tripwire must still fire from it on reconnect.
+    func testReconnectAfterPruningStillPoisonsOnSentinelRegression() async throws {
+        let dir = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let store = FedAtomicFileStateStore(directoryURL: dir)
+        _ = try await store.open(localPublicKey: localKey)
+        let seeder = FedOriginEffectLog(store: store, responderStaticPublicKey: responderKey)
+        var completed: [FedEffectID] = []
+        for _ in 0..<3 {
+            completed.append(try await completeRecordedMutation(log: seeder))
+        }
+        let miss = try await seeder.beginMutation(peerIncarnation: peerIncarnation, peerLedgerEpoch: liveEpoch)
+        try await seeder.markSent(miss)
+        await seeder.noteIndeterminateLoss(miss)
+
+        let pruned = try await store.destination(forResponderPublicKey: responderKey)
+        XCTAssertEqual(
+            pruned?.unresolvedEffects.map(\.effect),
+            [completed[2], miss],
+            "the earlier settled records are pruned and the sentinel is kept"
+        )
+        let sentinel = try await seeder.regressionSentinel(liveEpoch: liveEpoch)
+        XCTAssertEqual(sentinel, completed[2])
+
+        let transport = FedLoopbackByteTransport()
+        let engine = try makeEngine(transport: transport, store: store)
+        try await establishReady(engine: engine, transport: transport, modulesJSON: mutateCatalog)
+        let queried = try await transport.sentFrames(negotiationComplete: true, features: ["mgmt-v1", "effects-v1"])
+            .filter { $0.knownType == .effectStatus }
+            .compactMap { $0.header["effect"].flatMap(FedEffectID.fromJSON) }
+        XCTAssertEqual(Set(queried), [miss, completed[2]], "the miss and the sentinel are both queried")
+
+        try await deliver(engine, statusResultFrame(
+            effect: completed[2], status: "not_found", ledgerComplete: true, ledgerEpoch: liveEpoch
+        ))
+        try await deliver(engine, statusResultFrame(
+            effect: miss, status: "not_found", ledgerComplete: true, ledgerEpoch: liveEpoch
+        ))
+
+        let after = try await store.destination(forResponderPublicKey: responderKey)
+        XCTAssertTrue(after?.poisonedLedgerEpochs.contains(liveEpoch) ?? false, "regression must poison the epoch")
+        let missRow = try await row(for: miss, in: store)
+        XCTAssertEqual(missRow?.disposition, .ambiguous, "a miss at a poisoned epoch is never not_sent")
+    }
+
+    /// The phone dies after the call went out and before its outcome was
+    /// committed. markSent no longer writes, so the reopened document says
+    /// intent rather than sent; recovery must treat it the same way: query the
+    /// serving ledger and settle with the recorded outcome, body intact.
+    func testCrashAfterSendRecoversTheRecordedOutcomeFromAReopenedPrunedDocument() async throws {
+        let dir = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        var inFlight: FedEffectID
+        do {
+            let store = FedAtomicFileStateStore(directoryURL: dir)
+            _ = try await store.open(localPublicKey: localKey)
+            let log = FedOriginEffectLog(store: store, responderStaticPublicKey: responderKey)
+            for _ in 0..<3 {
+                _ = try await completeRecordedMutation(log: log)
+            }
+            inFlight = try await log.beginMutation(peerIncarnation: peerIncarnation, peerLedgerEpoch: liveEpoch)
+            try await log.markSent(inFlight)
+            // The process dies here: nothing else of this instance survives.
+        }
+
+        let reopened = FedAtomicFileStateStore(directoryURL: dir)
+        _ = try await reopened.open(localPublicKey: localKey)
+        let unsettled = try await reopened.unsettledEffects(forResponderPublicKey: responderKey)
+        XCTAssertEqual(unsettled.map(\.effect), [inFlight])
+        XCTAssertEqual(unsettled.map(\.phase), [.intent], "the sent phase was not durable")
+
+        let recorder = FedTerminalCommitRecorder(wrapping: reopened)
+        let transport = FedLoopbackByteTransport()
+        let engine = try makeEngine(transport: transport, store: recorder)
+        try await establishReady(engine: engine, transport: transport, modulesJSON: mutateCatalog)
+        let queried = try await transport.sentFrames(negotiationComplete: true, features: ["mgmt-v1", "effects-v1"])
+            .filter { $0.knownType == .effectStatus }
+            .compactMap { $0.header["effect"].flatMap(FedEffectID.fromJSON) }
+        XCTAssertTrue(queried.contains(inFlight), "recovery must query the serving ledger for the in-flight effect")
+
+        let sentinel = try XCTUnwrap(queried.first { $0 != inFlight })
+        try await deliver(engine, statusResultFrame(
+            effect: sentinel, status: "recorded", ledgerComplete: true, ledgerEpoch: liveEpoch,
+            kind: "response", body: Data("{}".utf8)
+        ))
+        let recoveredBody = Data(#"{"answered":true}"#.utf8)
+        try await deliver(engine, statusResultFrame(
+            effect: inFlight, status: "recorded", ledgerComplete: true, ledgerEpoch: liveEpoch,
+            kind: "response", body: recoveredBody
+        ))
+
+        let settled = await recorder.committedTerminal(for: inFlight)
+        XCTAssertEqual(settled?.disposition, .recorded)
+        XCTAssertEqual(settled?.body, recoveredBody)
+        let remaining = try await reopened.unsettledEffects(forResponderPublicKey: responderKey)
+        XCTAssertTrue(remaining.isEmpty)
+    }
+
     // MARK: - Helpers
+
+    /// Runs one mutation to a recorded outcome at the live epoch.
+    private func completeRecordedMutation(log: FedOriginEffectLog) async throws -> FedEffectID {
+        let effect = try await log.beginMutation(peerIncarnation: peerIncarnation, peerLedgerEpoch: liveEpoch)
+        try await log.markSent(effect)
+        _ = try await log.applyTerminalFrame(
+            effect: effect,
+            kind: "response",
+            body: Data(#"{"ok":1}"#.utf8),
+            bodyOmitted: false,
+            errorCode: nil
+        )
+        return effect
+    }
 
     /// Seeds one interrupted (unsettled) mutation for the peer at the given epoch
     /// and returns its effect identity.
@@ -358,7 +474,7 @@ final class FedOriginReconciliationTests: XCTestCase {
     }
 
     private func assertAmbiguous(seededEpoch: String?, answerEpoch: String, label: String) async throws {
-        let store = FedMemoryStateStore()
+        let store = FedTerminalCommitRecorder(wrapping: FedMemoryStateStore())
         _ = try await store.open(localPublicKey: localKey)
         let seeded = try await seedUnsettledMutation(in: store, epoch: seededEpoch)
 
@@ -373,7 +489,7 @@ final class FedOriginReconciliationTests: XCTestCase {
             ledgerEpoch: answerEpoch
         ))
 
-        let row = try await row(for: seeded, in: store)
+        let row = await store.committedTerminal(for: seeded)
         XCTAssertEqual(row?.disposition, .ambiguous, "epoch disagreement (\(label)) must settle ambiguous")
     }
 

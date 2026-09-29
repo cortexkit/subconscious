@@ -145,6 +145,7 @@ public actor FedMemoryStateStore: FedStateStore {
             throw FedFailure.persistenceFailed
         }
         destination.confirmedWatermark = watermark
+        FedSettledRecordPruning.prune(&destination, localIncarnation: doc.global.localIncarnation)
         doc.destinations[key] = destination
         doc.revision += 1
         document = doc
@@ -254,6 +255,7 @@ public actor FedMemoryStateStore: FedStateStore {
                 return
             }
             destination.confirmedWatermark = candidate
+            FedSettledRecordPruning.prune(&destination, localIncarnation: incarnation)
             doc.destinations[key] = destination
             doc.revision += 1
             document = doc

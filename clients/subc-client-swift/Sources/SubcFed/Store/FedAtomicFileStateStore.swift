@@ -27,6 +27,21 @@ public actor FedAtomicFileStateStore: FedStateStore {
     private let fileManager: FileManager
     /// Optional barrier for kill-window tests. Throws abort the commit as failed.
     private var commitBarrier: (@Sendable (CommitBarrier) throws -> Void)?
+    /// Number of file and directory flushes (`F_FULLFSYNC`, or `fsync` when that
+    /// is unsupported) this instance has issued. Flushes dominate the cost of a
+    /// change on a phone, so tests assert this count per operation instead of
+    /// timing it.
+    private(set) var durableFlushCount = 0
+    /// Effects this instance marked sent that no durable write has carried yet,
+    /// mapped to their destination key.
+    ///
+    /// `markSent` does not write the document. After a crash a durable `.sent`
+    /// and a durable `.intent` are handled identically: both are unsettled, so
+    /// reconnect queries the serving ledger for either and settles from its
+    /// answer, and no reader distinguishes the two phases. Flushing the phase
+    /// would buy nothing, so it is kept here, shown in every read from this
+    /// instance, and folded into the next write this instance makes.
+    private var sentNotYetDurable: [FedEffectID: String] = [:]
 
     /// Derives the store directory from an Application Support base URL and a
     /// stable identity namespace dedicated to one local X25519 public key.
@@ -140,15 +155,22 @@ public actor FedAtomicFileStateStore: FedStateStore {
         }
     }
 
+    /// Records the phase in memory only; see `sentNotYetDurable` for why no
+    /// durable write is needed. The record is still checked against the
+    /// committed document, so marking a missing or settled effect fails as before.
     public func markSent(effect: FedEffectID, responderStaticPublicKey: Data) async throws {
-        _ = try mutate { doc -> UInt64 in
+        try withExclusiveLock {
+            var doc = try currentDocumentUnlocked()
             try Self.mutateEffect(in: &doc, effect: effect, responder: responderStaticPublicKey) { record in
                 guard record.phase == .intent || record.phase == .sent else {
                     throw FedFailure.persistenceFailed
                 }
                 record.phase = .sent
             }
-            return 0
+            sentNotYetDurable[effect] = FedStateDocument.destinationKey(
+                forResponderPublicKey: responderStaticPublicKey
+            )
+            document = doc
         }
     }
 
@@ -201,6 +223,7 @@ public actor FedAtomicFileStateStore: FedStateStore {
                 throw FedFailure.persistenceFailed
             }
             destination.confirmedWatermark = watermark
+            FedSettledRecordPruning.prune(&destination, localIncarnation: doc.global.localIncarnation)
             doc.destinations[key] = destination
             return 0
         }
@@ -246,13 +269,9 @@ public actor FedAtomicFileStateStore: FedStateStore {
 
     public func snapshot() async throws -> FedStateDocument {
         try withExclusiveLock {
-            if fileManager.fileExists(atPath: documentURL.path) {
-                let onDisk = try loadCommittedDocument()
-                document = onDisk
-                return onDisk
-            }
-            guard let document else { throw FedFailure.storeUnavailable }
-            return document
+            let current = try currentDocumentUnlocked()
+            document = current
+            return current
         }
     }
 
@@ -291,23 +310,49 @@ public actor FedAtomicFileStateStore: FedStateStore {
 
     private func mutate(_ body: (inout FedStateDocument) throws -> UInt64) throws -> FedReservation {
         try withExclusiveLock {
-            // Authoritative state is always the on-disk document under the lock.
-            var doc: FedStateDocument
-            if fileManager.fileExists(atPath: documentURL.path) {
-                doc = try loadCommittedDocument()
-            } else if let memory = document {
-                doc = memory
-            } else {
-                throw FedFailure.storeUnavailable
-            }
+            var doc = try currentDocumentUnlocked()
             let value = try body(&doc)
             doc.revision += 1
             try commitDocumentUnlocked(doc)
+            // The committed document carries every pending sent phase now.
+            sentNotYetDurable.removeAll()
             document = doc
             return FedReservation(value: value, revision: doc.revision)
         }
     }
 
+    /// The on-disk document (authoritative under the lock) with this instance's
+    /// not-yet-durable sent phases applied. Caller must hold the lock.
+    private func currentDocumentUnlocked() throws -> FedStateDocument {
+        var doc: FedStateDocument
+        if fileManager.fileExists(atPath: documentURL.path) {
+            doc = try loadCommittedDocument()
+        } else if let memory = document {
+            doc = memory
+        } else {
+            throw FedFailure.storeUnavailable
+        }
+        for (effect, key) in sentNotYetDurable {
+            guard var destination = doc.destinations[key],
+                  let index = destination.unresolvedEffects.firstIndex(where: { $0.effect == effect }),
+                  destination.unresolvedEffects[index].phase == .intent
+            else { continue }
+            destination.unresolvedEffects[index].phase = .sent
+            doc.destinations[key] = destination
+        }
+        return doc
+    }
+
+    /// Commits `document` with exactly two full flushes: the temp file before the
+    /// rename, and the directory after it.
+    ///
+    /// There is deliberately no flush of the document after the rename. The
+    /// rename moves the already-flushed temp inode into place without touching
+    /// its bytes, so flushing it again writes nothing new; what the rename does
+    /// change is the directory entry, and the directory flush is what makes that
+    /// durable. A crash before the directory flush leaves either the old document
+    /// or the new one, both complete, which is what the kill-window tests in
+    /// `FedStoreConcurrencyAndKillWindowTests` exercise.
     private func commitDocumentUnlocked(_ document: FedStateDocument) throws {
         try ensureDirectory()
         let encoder = JSONEncoder()
@@ -333,7 +378,6 @@ public actor FedAtomicFileStateStore: FedStateStore {
                 try fileManager.moveItem(at: tempURL, to: documentURL)
             }
             try commitBarrier?(.afterRename)
-            try fsyncFile(at: documentURL)
             try commitBarrier?(.beforeDirSync)
             try fsyncDirectory(at: directoryURL)
         } catch let failure as FedFailure {
@@ -424,6 +468,7 @@ public actor FedAtomicFileStateStore: FedStateStore {
         let fd = Darwin.open(url.path, O_RDONLY)
         guard fd >= 0 else { throw FedFailure.persistenceFailed }
         defer { Darwin.close(fd) }
+        durableFlushCount += 1
         if fcntl(fd, F_FULLFSYNC) == -1 {
             if Darwin.fsync(fd) == -1 {
                 throw FedFailure.persistenceFailed
@@ -435,6 +480,7 @@ public actor FedAtomicFileStateStore: FedStateStore {
         let fd = Darwin.open(url.path, O_RDONLY)
         guard fd >= 0 else { throw FedFailure.persistenceFailed }
         defer { Darwin.close(fd) }
+        durableFlushCount += 1
         if fcntl(fd, F_FULLFSYNC) == -1 {
             // Directory-entry durability is part of the commit contract. A failed
             // fallback fsync must not report success.
@@ -485,6 +531,7 @@ public actor FedAtomicFileStateStore: FedStateStore {
             return
         }
         destination.confirmedWatermark = candidate
+        FedSettledRecordPruning.prune(&destination, localIncarnation: incarnation)
         doc.destinations[key] = destination
     }
 }

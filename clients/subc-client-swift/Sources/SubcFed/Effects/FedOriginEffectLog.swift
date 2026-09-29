@@ -430,12 +430,15 @@ public actor FedOriginEffectLog {
     /// sentinel. If the peer reports this already-settled effect as not_found with
     /// a complete ledger at the same epoch, the serving ledger has regressed and
     /// the epoch must be poisoned. Returns nil when no recorded row matches.
+    ///
+    /// The selection lives in `FedSettledRecordPruning` because the stores
+    /// must never prune the record it picks; sharing it keeps the two in step.
     public func regressionSentinel(liveEpoch: String) async throws -> FedEffectID? {
         let destination = try await store.destination(forResponderPublicKey: responderStaticPublicKey)
-        let candidates = destination?.unresolvedEffects.filter {
-            $0.disposition == .recorded && $0.peerLedgerEpoch == liveEpoch
-        } ?? []
-        return candidates.max(by: { $0.effect.seq < $1.effect.seq })?.effect
+        return FedSettledRecordPruning.regressionSentinel(
+            in: destination?.unresolvedEffects ?? [],
+            liveEpoch: liveEpoch
+        )?.effect
     }
 
     /// Reconciles one effect_status_result without ever blind-replaying a call.

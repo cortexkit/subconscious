@@ -2,9 +2,11 @@ import Foundation
 import XCTest
 @testable import SubcFed
 
-/// Settled send-log records at or below the confirmed watermark are deleted in
-/// the write that advances the watermark, except regression sentinels, and
-/// never while a ledger epoch is poisoned. Every store must apply the same rule.
+/// Settled send-log records are deleted in the write that settles them or
+/// advances the watermark: a record whose outcome the phone holds (recorded or
+/// not_sent) at once, an ambiguous one once the watermark covers it. Regression
+/// sentinels are always kept, and nothing is deleted while a ledger epoch is
+/// poisoned. Every store must apply the same rule.
 ///
 /// The durable store here is the JSON file store; `FedSettledRecordPruningSQLiteTests`
 /// at the end of this file reruns every test with the SQLite store in its place.
@@ -19,14 +21,17 @@ class FedSettledRecordPruningTests: XCTestCase {
 
     // MARK: - The rule itself
 
-    func testPruneKeepsSettledRecordsAboveTheWatermark() {
+    /// Above the watermark, a record with an outcome goes and an ambiguous one
+    /// stays until the watermark covers it.
+    func testPruneDropsOutcomesAboveTheWatermarkButKeepsAmbiguousOnesAboveIt() {
         var destination = FedDestinationState(
             responderStaticPublicKey: responder,
             confirmedWatermark: FedConfirmedWatermark(incarnation: "inc", seq: 3),
-            unresolvedEffects: (1...5).map { record(seq: $0, disposition: .notSent) }
+            unresolvedEffects: (1...4).map { record(seq: $0, disposition: .notSent) }
+                + [record(seq: 5, disposition: .ambiguous)]
         )
         FedSettledRecordPruning.prune(&destination, localIncarnation: "inc")
-        XCTAssertEqual(destination.unresolvedEffects.map(\.effect.seq), [4, 5])
+        XCTAssertEqual(destination.unresolvedEffects.map(\.effect.seq), [5])
     }
 
     func testPruneKeepsUnsettledRecordsAndOtherIncarnations() {
@@ -85,7 +90,7 @@ class FedSettledRecordPruningTests: XCTestCase {
 
     // MARK: - Through the stores
 
-    func testWatermarkAdvancePrunesInTheSameWriteInTheDurableStore() async throws {
+    func testSettlePrunesOutcomesAtOnceAndAmbiguousOnesBelowTheWatermarkInTheDurableStore() async throws {
         let dir = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: dir) }
         let store = Self.storeUnderTest.durableStore(in: dir)
@@ -100,7 +105,7 @@ class FedSettledRecordPruningTests: XCTestCase {
         XCTAssertEqual(onDisk?.unresolvedEffects.map(\.effect.seq), trace.last?.seqs)
     }
 
-    func testWatermarkAdvancePrunesInTheSameWriteInTheMemoryStore() async throws {
+    func testSettlePrunesOutcomesAtOnceAndAmbiguousOnesBelowTheWatermarkInTheMemoryStore() async throws {
         let store = FedMemoryStateStore()
         _ = try await store.open(localPublicKey: localKey)
         assertScenarioTrace(try await runPruningScenario(on: store))
@@ -194,9 +199,13 @@ class FedSettledRecordPruningTests: XCTestCase {
             Step(watermark: 1, seqs: [1, 2, 3, 4, 5, 6]),
             // 2 settles not_sent: watermark 2, 2 is pruned, sentinel 1 stays.
             Step(watermark: 2, seqs: [1, 3, 4, 5, 6]),
-            // 4 settles above the unsettled 3: no advance, nothing pruned.
-            Step(watermark: 2, seqs: [1, 3, 4, 5, 6]),
-            Step(watermark: 2, seqs: [1, 3, 4, 5, 6]),
+            // 4 settles recorded above the unsettled 3: the watermark stays at 2.
+            // 4 has an outcome but is now the highest recorded record at the
+            // epoch, so it is the sentinel and stays; 1 no longer is, and goes.
+            Step(watermark: 2, seqs: [3, 4, 5, 6]),
+            // 5 settles ambiguous above the watermark: it stays until the
+            // watermark covers it; 3 is still open.
+            Step(watermark: 2, seqs: [3, 4, 5, 6]),
             // 3 settles: watermark jumps to 5; 4 is now the highest recorded at
             // the epoch, so it is the sentinel; 1, 3 and 5 go; unsettled 6 stays.
             Step(watermark: 5, seqs: [4, 6]),

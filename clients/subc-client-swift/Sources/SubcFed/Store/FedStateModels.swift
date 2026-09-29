@@ -54,6 +54,41 @@ public struct FedConfirmedWatermark: Sendable, Equatable, Hashable, Codable {
     }
 }
 
+/// An inclusive run of effect sequence numbers of one local incarnation whose
+/// outcome the phone holds (settled `recorded` or `not_sent`) and that sit above
+/// the confirmed watermark. Sent to an effects-v2 peer as `confirmed_effects`
+/// (`{"incarnation", "from", "to"}`), so one stuck effect below them no longer
+/// holds back the peer's cleanup of everything after it.
+public struct FedConfirmedEffectRange: Sendable, Equatable, Hashable, Codable {
+    public let incarnation: String
+    public let from: UInt64
+    public let to: UInt64
+
+    public init(incarnation: String, from: UInt64, to: UInt64) {
+        self.incarnation = incarnation
+        self.from = from
+        self.to = to
+    }
+
+    public var asJSONObject: FedJSONObject {
+        FedJSONObject([
+            "incarnation": .string(incarnation),
+            "from": .integer(from),
+            "to": .integer(to),
+        ])
+    }
+
+    public static func fromJSON(_ value: FedJSONValue) -> FedConfirmedEffectRange? {
+        guard case .object(let object) = value,
+              case .string(let incarnation) = object["incarnation"],
+              case .integer(let from) = object["from"],
+              case .integer(let to) = object["to"],
+              from <= to
+        else { return nil }
+        return FedConfirmedEffectRange(incarnation: incarnation, from: from, to: to)
+    }
+}
+
 /// Durable classification of a ledgered mutating effect on the origin side.
 public enum FedEffectDisposition: String, Sendable, Equatable, Codable {
     /// Terminal body is known and may be surfaced.
@@ -127,6 +162,12 @@ public struct FedDestinationState: Sendable, Equatable, Codable {
     public var unresolvedEffects: [FedUnresolvedEffectRecord]
     /// Poisoned serving ledger epochs that must never classify misses as not_sent.
     public var poisonedLedgerEpochs: [String]
+    /// Effects above the confirmed watermark whose outcome the phone holds, as
+    /// coalesced ranges in ascending order. Kept apart from the records because
+    /// those records are pruned as soon as their outcome is committed; see
+    /// `FedSettlementRules`. Documents written before this field existed decode
+    /// with an empty list.
+    public var confirmedEffectRanges: [FedConfirmedEffectRange]
 
     // NOTE: a `reconciliationComplete` flag lived here and was REMOVED.
     //
@@ -156,7 +197,8 @@ public struct FedDestinationState: Sendable, Equatable, Codable {
         observedPeerLedgerEpoch: String? = nil,
         confirmedWatermark: FedConfirmedWatermark? = nil,
         unresolvedEffects: [FedUnresolvedEffectRecord] = [],
-        poisonedLedgerEpochs: [String] = []
+        poisonedLedgerEpochs: [String] = [],
+        confirmedEffectRanges: [FedConfirmedEffectRange] = []
     ) {
         self.responderStaticPublicKey = responderStaticPublicKey
         self.observedPeerIncarnation = observedPeerIncarnation
@@ -164,6 +206,33 @@ public struct FedDestinationState: Sendable, Equatable, Codable {
         self.confirmedWatermark = confirmedWatermark
         self.unresolvedEffects = unresolvedEffects
         self.poisonedLedgerEpochs = poisonedLedgerEpochs
+        self.confirmedEffectRanges = confirmedEffectRanges
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case responderStaticPublicKey
+        case observedPeerIncarnation
+        case observedPeerLedgerEpoch
+        case confirmedWatermark
+        case unresolvedEffects
+        case poisonedLedgerEpochs
+        case confirmedEffectRanges
+    }
+
+    /// Decodes documents written before `confirmedEffectRanges` existed: a
+    /// device can sit on an old file across app updates.
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        responderStaticPublicKey = try container.decode(Data.self, forKey: .responderStaticPublicKey)
+        observedPeerIncarnation = try container.decodeIfPresent(String.self, forKey: .observedPeerIncarnation)
+        observedPeerLedgerEpoch = try container.decodeIfPresent(String.self, forKey: .observedPeerLedgerEpoch)
+        confirmedWatermark = try container.decodeIfPresent(FedConfirmedWatermark.self, forKey: .confirmedWatermark)
+        unresolvedEffects = try container.decode([FedUnresolvedEffectRecord].self, forKey: .unresolvedEffects)
+        poisonedLedgerEpochs = try container.decode([String].self, forKey: .poisonedLedgerEpochs)
+        confirmedEffectRanges = try container.decodeIfPresent(
+            [FedConfirmedEffectRange].self,
+            forKey: .confirmedEffectRanges
+        ) ?? []
     }
 
     public var hasLiveUnresolvedEffects: Bool {

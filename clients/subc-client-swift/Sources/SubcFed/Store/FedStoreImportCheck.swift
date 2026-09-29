@@ -49,6 +49,9 @@ enum FedStoreImportCheck {
             if before?.poisonedLedgerEpochs != after?.poisonedLedgerEpochs {
                 found.append("poisoned epochs \(key)")
             }
+            if before?.confirmedEffectRanges != after?.confirmedEffectRanges {
+                found.append("confirmed ranges \(key)")
+            }
         }
         if found.isEmpty && expected != imported {
             found.append("document")

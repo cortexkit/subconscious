@@ -6,6 +6,13 @@
 /// to other destinations, and never hold the watermark back. The watermark
 /// never goes past the highest settled sequence number.
 ///
+/// Records whose outcome the phone holds are pruned as soon as they settle, so
+/// the settled sequence numbers above the watermark are also read from the
+/// destination's confirmed ranges. Every pruned record is either at or below
+/// the stored watermark or inside a confirmed range, so the result is the same
+/// as over the unpruned records; open records are never pruned, so it never
+/// passes one.
+///
 /// This is computed from the lowest unsettled sequence number in one pass over
 /// the records, so it costs O(records). It must not walk the sequence numbers
 /// themselves: those are allocated for the whole phone, not per destination,
@@ -15,9 +22,13 @@ enum FedWatermark {
     /// Returns 0 when nothing can be confirmed.
     static func contiguousSettledPrefix(
         of records: [FedUnresolvedEffectRecord],
+        confirmedRanges: [FedConfirmedEffectRange] = [],
         incarnation: String
     ) -> UInt64 {
         var maxSettled: UInt64 = 0
+        for range in confirmedRanges where range.incarnation == incarnation {
+            maxSettled = max(maxSettled, range.to)
+        }
         var minUnsettled: UInt64?
         for record in records where record.effect.incarnation == incarnation {
             let seq = record.effect.seq

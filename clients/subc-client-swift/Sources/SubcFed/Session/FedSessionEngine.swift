@@ -89,6 +89,40 @@ public actor FedLoopbackByteTransport: FedSessionByteTransport {
     }
 }
 
+/// Header fields of an outbound `call`. `mutating` is nil when effects-v1 is
+/// not negotiated, and `confirmedEffects` is non-empty only toward an
+/// effects-v2 peer; an empty list adds no field.
+enum FedCallHeader {
+    static func fields(
+        effect: FedEffectID,
+        module: String,
+        surface: String?,
+        deadlineMs: UInt64,
+        mutating: Bool?,
+        confirmedWatermark: FedConfirmedWatermark?,
+        confirmedEffects: [FedConfirmedEffectRange]
+    ) -> [String: FedJSONValue] {
+        var fields: [String: FedJSONValue] = [
+            "effect": .object(effect.asJSONObject),
+            "module": .string(module),
+            "deadline_ms": .integer(deadlineMs),
+        ]
+        if let surface {
+            fields["surface"] = .string(surface)
+        }
+        if let mutating {
+            fields["mutating"] = .boolean(mutating)
+        }
+        if let confirmedWatermark {
+            fields["confirmed_watermark"] = .object(confirmedWatermark.asJSONObject)
+        }
+        if !confirmedEffects.isEmpty {
+            fields["confirmed_effects"] = FedEffectsV2Codec.confirmedEffectsValue(confirmedEffects)
+        }
+        return fields
+    }
+}
+
 /// An admitted management call whose request frame is encoded but not yet
 /// written to the wire. The caller registers its response continuation under
 /// `effect.seq` BEFORE dispatching so a fast response can never be processed
@@ -180,6 +214,19 @@ public actor FedSessionEngine {
     /// In-flight origin-side reconciliation for this reconnect, if any. Present
     /// between sending the effect_status queries and collecting every answer.
     private var reconciliation: FedPendingReconciliation?
+    /// Local incarnation read when the session was established.
+    private var localIncarnation: String?
+    /// Next effects-v2 list `query_id` of this session. Starts at 1, only
+    /// grows, and never passes `FedEffectsV2Codec.maximumSafeInteger`.
+    private var nextListQueryID: UInt64 = 1
+    /// List queries on the wire and not yet answered, keyed by `query_id`,
+    /// with the ids each asked about.
+    private var outstandingListQueries: [UInt64: [FedEffectID]] = [:]
+    /// Effects a list reply marked `body_deferred`, asked about again on their own.
+    private var deferredStatusQueries: Set<FedEffectID> = []
+    /// Delay before re-sending a list the peer answered `busy`.
+    private var listBusyBackoff = FedReconnectBackoff()
+    private var listBusyRetryTasks: [Task<Void, Never>] = []
     public private(set) var lastFailure: FedFailure?
     public private(set) var emittedFrames: [FedFrame] = []
 
@@ -196,10 +243,18 @@ public actor FedSessionEngine {
     public var admissionController: FedAdmissionController? { admission }
     public var originEffectLog: FedOriginEffectLog? { effectLog }
 
+    /// Whether both hellos carried `effects-v2` (on top of `effects-v1`). Every
+    /// v2 frame and field is sent only when this is true.
+    var effectsV2Enabled: Bool {
+        guard let negotiation else { return false }
+        return negotiation.effectsEnabled && negotiation.features.contains(FedEffectsV2Codec.feature)
+    }
+
     /// Runs hello exchange and initial catalog exchange until ready or failure.
     public func establish() async throws {
         _ = try await deps.store.open(localPublicKey: deps.localPublicKey)
         let snapshot = try await deps.store.snapshot()
+        localIncarnation = snapshot.global.localIncarnation
         let hasUnresolved = try await deps.store
             .unsettledEffects(forResponderPublicKey: deps.responderStaticPublicKey)
             .isEmpty == false
@@ -392,18 +447,20 @@ public actor FedSessionEngine {
             }
             effectID = effect
 
-            var fields: [String: FedJSONValue] = [
-                "effect": .object(effect.asJSONObject),
-                "module": .string(moduleID),
-                "surface": .string("management"),
-                "deadline_ms": .integer(permit.deadlineMs),
-            ]
+            var watermark: FedConfirmedWatermark?
+            var confirmedRanges: [FedConfirmedEffectRange] = []
             if negotiation.effectsEnabled {
-                fields["mutating"] = .boolean(classification.isMutation)
-                if let watermark = try await effectLog.durableConfirmedWatermark() {
-                    fields["confirmed_watermark"] = .object(watermark.asJSONObject)
-                }
+                (watermark, confirmedRanges) = try await settlementReport(effectLog)
             }
+            let fields = FedCallHeader.fields(
+                effect: effect,
+                module: moduleID,
+                surface: "management",
+                deadlineMs: permit.deadlineMs,
+                mutating: negotiation.effectsEnabled ? classification.isMutation : nil,
+                confirmedWatermark: watermark,
+                confirmedEffects: confirmedRanges
+            )
             let body = try FedManagementCallBody(method: method, params: params).jsonData()
             let frame = FedFrame(type: FedFrameType.call.rawValue, fields: fields, body: body)
             // Intent is durable for mutations; the first network write happens in
@@ -529,6 +586,11 @@ public actor FedSessionEngine {
     /// regression sentinel. Answers are collected via ``handleInboundStatusResult``
     /// and settlement is finalized once every query is answered. Pure calls are
     /// never gated; only new mutating admissions wait on the barrier.
+    ///
+    /// With effects-v2 the same ids go out as list queries of at most
+    /// `FedEffectsV2Codec.maximumEffectsPerList` ids each, all on the wire at
+    /// once, and every per-item answer is settled by the same code the
+    /// single-id path uses.
     private func startReconciliation() async throws {
         guard let effectLog, let negotiation else { return }
         let unsettled = try await effectLog.unsettled()
@@ -540,21 +602,124 @@ public actor FedSessionEngine {
         // races the reconnect waits for settlement rather than slipping through.
         await effectLog.beginReconciliationBarrier()
 
-        let pending = FedPendingReconciliation(
+        // A peer that answers nothing leaves the barrier up until the session is
+        // torn down by staleness; record the pending state before the first
+        // query so inbound results can finalize settlement.
+        reconciliation = FedPendingReconciliation(
             liveEpoch: liveEpoch,
             unsettled: unsettled,
             sentinel: sentinel
         )
-        for record in unsettled {
-            try await sendFrame(FedEffectStatusCodec.statusQuery(effect: record.effect))
+        var effects = unsettled.map(\.effect)
+        if let sentinel, !effects.contains(sentinel) {
+            effects.append(sentinel)
         }
-        if let sentinel {
-            try await sendFrame(FedEffectStatusCodec.statusQuery(effect: sentinel))
+        if effectsV2Enabled {
+            let size = FedEffectsV2Codec.maximumEffectsPerList
+            for start in stride(from: 0, to: effects.count, by: size) {
+                try await sendListQuery(Array(effects[start..<min(start + size, effects.count)]))
+            }
+            return
         }
-        // A peer that answers nothing leaves the barrier up until the session is
-        // torn down by staleness; record the pending state so inbound results can
-        // finalize settlement.
+        for effect in effects {
+            try await sendFrame(FedEffectStatusCodec.statusQuery(effect: effect))
+        }
+    }
+
+    /// Puts one list query on the wire under a fresh `query_id`.
+    private func sendListQuery(_ effects: [FedEffectID]) async throws {
+        guard nextListQueryID <= FedEffectsV2Codec.maximumSafeInteger else {
+            // Unreachable in practice (2^53 queries in one session); failing
+            // is still better than reusing an id or sending one a JSON decoder
+            // would round.
+            throw FedFailure.protocolViolation(byeCode: "fed_bad_frame")
+        }
+        let queryID = nextListQueryID
+        nextListQueryID += 1
+        outstandingListQueries[queryID] = effects
+        try await sendFrame(FedEffectsV2Codec.listQuery(queryID: queryID, effects: effects))
+    }
+
+    /// Collects one `effect_status_list_result`. A reply must echo a `query_id`
+    /// that is on the wire and answer exactly the ids that query asked about;
+    /// anything else is a protocol violation that ends the session. `busy`
+    /// covers the whole reply: the same ids are asked again under a new
+    /// `query_id` after a backoff. An item whose body did not fit
+    /// (`body_deferred`) is asked about again on its own; one whose body is
+    /// over the cap (`body_omitted`) is settled as the single-id path settles it.
+    private func handleInboundListResult(_ frame: FedFrame) async throws {
+        guard let result = FedEffectsV2Codec.parseListResult(frame),
+              let asked = outstandingListQueries.removeValue(forKey: result.queryID)
+        else {
+            throw FedFailure.protocolViolation(byeCode: "fed_bad_frame")
+        }
+        if result.busy {
+            scheduleListRetryAfterBusy(asked)
+            return
+        }
+        let answered = result.items.map(\.effect)
+        guard answered.count == asked.count, Set(answered) == Set(asked) else {
+            throw FedFailure.protocolViolation(byeCode: "fed_bad_frame")
+        }
+        listBusyBackoff.reset()
+        guard var pending = reconciliation else { return }
+        var deferred: [FedEffectID] = []
+        for item in result.items {
+            if item.bodyDeferred {
+                deferred.append(item.effect)
+                continue
+            }
+            pending.record(FedEffectStatusAnswer(
+                effect: item.effect,
+                status: item.status,
+                ledgerComplete: item.ledgerComplete,
+                ledgerEpoch: result.ledgerEpoch,
+                kind: item.kind,
+                body: item.body,
+                bodyOmitted: item.bodyOmitted
+            ))
+        }
         reconciliation = pending
+        for effect in deferred {
+            deferredStatusQueries.insert(effect)
+            try await sendFrame(FedEffectStatusCodec.statusQuery(effect: effect))
+        }
+        try await finalizeReconciliationIfComplete()
+    }
+
+    /// Re-sends a list the peer answered `busy`, under a new `query_id`, after
+    /// the reconnect backoff's next delay.
+    private func scheduleListRetryAfterBusy(_ effects: [FedEffectID]) {
+        let delay = listBusyBackoff.nextDelayNanoseconds(jitterUnit: Double.random(in: 0...1))
+        let due = deps.clock.nowNanoseconds() &+ delay
+        let clock = deps.clock
+        listBusyRetryTasks.append(Task { [weak self] in
+            do {
+                try await clock.sleep(untilNanoseconds: due)
+            } catch {
+                return
+            }
+            await self?.resendListAfterBusy(effects)
+        })
+    }
+
+    private func resendListAfterBusy(_ effects: [FedEffectID]) async {
+        guard !cancelledActivities, reconciliation != nil else { return }
+        // A failed send means the session is going away; its teardown owns the
+        // failure, and the next session reconciles from the store again.
+        try? await sendListQuery(effects)
+    }
+
+    /// The watermark and, with effects-v2, the confirmed ranges a `call` or
+    /// `keepalive` carries. An effects-v1 peer gets the watermark alone.
+    private func settlementReport(
+        _ effectLog: FedOriginEffectLog
+    ) async throws -> (FedConfirmedWatermark?, [FedConfirmedEffectRange]) {
+        guard effectsV2Enabled, let localIncarnation else {
+            return (try await effectLog.durableConfirmedWatermark(), [])
+        }
+        let report = try await effectLog.durableConfirmations(localIncarnation: localIncarnation)
+        return (report.watermark, report.ranges)
     }
 
     /// Collects one inbound `effect_status_result` answer. When every outstanding
@@ -563,11 +728,24 @@ public actor FedSessionEngine {
     /// settled through the effect log's existing guards, and the mutating-admission
     /// barrier is released.
     private func handleInboundStatusResult(_ frame: FedFrame) async throws {
+        if effectsV2Enabled {
+            // With effects-v2 a single-id reply only ever answers a deferred body.
+            guard let effectValue = frame.header["effect"],
+                  let effect = FedEffectID.fromJSON(effectValue),
+                  deferredStatusQueries.remove(effect) != nil
+            else {
+                throw FedFailure.protocolViolation(byeCode: "fed_bad_frame")
+            }
+        }
         guard var pending = reconciliation else { return }
         guard let answer = FedEffectStatusAnswer(frame: frame) else { return }
         pending.record(answer)
         reconciliation = pending
-        guard pending.isComplete else { return }
+        try await finalizeReconciliationIfComplete()
+    }
+
+    private func finalizeReconciliationIfComplete() async throws {
+        guard let pending = reconciliation, pending.isComplete else { return }
         reconciliation = nil
         try await finalizeReconciliation(pending)
     }
@@ -655,6 +833,10 @@ public actor FedSessionEngine {
         timerTask?.cancel()
         receiveTask = nil
         timerTask = nil
+        for task in listBusyRetryTasks {
+            task.cancel()
+        }
+        listBusyRetryTasks.removeAll()
         // Peer-scoped admission: tear down session permits without dropping
         // ledgered recovery ownership. Full shutdown only if we own the controller.
         if ownsAdmission {
@@ -704,13 +886,15 @@ public actor FedSessionEngine {
             return bye
         }
         if keepalive.needsKeepalive(at: now) {
-            let watermark: FedConfirmedWatermark?
+            var watermark: FedConfirmedWatermark?
+            var confirmedRanges: [FedConfirmedEffectRange] = []
             if let effectLog {
-                watermark = try await effectLog.durableConfirmedWatermark()
-            } else {
-                watermark = nil
+                (watermark, confirmedRanges) = try await settlementReport(effectLog)
             }
-            let frame = keepalive.makeKeepalive(confirmedWatermark: watermark)
+            let frame = keepalive.makeKeepalive(
+                confirmedWatermark: watermark,
+                confirmedEffects: confirmedRanges
+            )
             try await sendFrame(frame)
             return frame
         }
@@ -767,6 +951,9 @@ public actor FedSessionEngine {
         case .effectStatusResult:
             try await handleInboundStatusResult(frame)
         default:
+            if frame.typeName == FedEffectsV2Codec.listResultType {
+                try await handleInboundListResult(frame)
+            }
             return
         }
     }

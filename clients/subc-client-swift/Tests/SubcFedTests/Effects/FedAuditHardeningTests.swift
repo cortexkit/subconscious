@@ -515,8 +515,10 @@ final class FedAuditHardeningTests: XCTestCase {
         }
         try await feed(
             transport,
+            // The scripted peer is an effects-v1 callosum: without effects-v2 in
+            // its hello the session keeps the v1 wire these tests pin.
             frame: FedHelloCodec.buildLocalHello(
-                policy: try FedHelloPolicy(),
+                policy: try FedHelloPolicy(features: ["mgmt-v1", "effects-v1"]),
                 incarnation: peerIncarnation,
                 ledgerEpoch: peerLedgerEpoch,
                 connectionAttemptID: String(repeating: "d", count: 32)

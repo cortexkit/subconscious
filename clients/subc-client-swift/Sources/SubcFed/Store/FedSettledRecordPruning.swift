@@ -1,10 +1,20 @@
 /// Which settled send-log records the phone may delete, shared by the file and
 /// memory stores so the two stay equivalent.
 ///
-/// A settled record of the local incarnation at or below the confirmed
-/// watermark has done its job: its outcome was committed before the caller saw
-/// it, and the watermark tells the serving side it may forget the effect. It is
-/// deleted, with two exceptions:
+/// A settled record of the local incarnation is deleted once it has done its
+/// job:
+///
+/// - A record settled `recorded` or `not_sent` goes as soon as it settles,
+///   above the watermark too. Its outcome was committed before the caller saw
+///   it, the phone never asks the peer about it again, a re-send of its
+///   sequence number is refused `fed_seq_fenced`, and its sequence number stays
+///   in the destination's confirmed ranges until the watermark passes it. This
+///   holds for effects-v1 sessions as well; nothing on the v1 wire reads the
+///   record either.
+/// - A record settled `ambiguous` goes only once it is at or below the
+///   confirmed watermark, as before.
+///
+/// with two exceptions:
 ///
 /// - Records of the regression sentinel are kept. On reconnect the origin asks
 ///   the peer about the highest recorded effect at the live ledger epoch; a
@@ -33,21 +43,22 @@ enum FedSettledRecordPruning {
             .max(by: { $0.effect.seq < $1.effect.seq })
     }
 
-    /// Deletes the settled records the confirmed watermark covers, keeping every
-    /// regression sentinel. Call it in the same write that sets the watermark.
+    /// Deletes the settled records the rule above drops, keeping every
+    /// regression sentinel. Call it in the same write that settles an effect or
+    /// sets the watermark.
     static func prune(_ destination: inout FedDestinationState, localIncarnation: String) {
-        guard destination.poisonedLedgerEpochs.isEmpty,
-              let watermark = destination.confirmedWatermark,
-              watermark.incarnation == localIncarnation
-        else { return }
+        guard destination.poisonedLedgerEpochs.isEmpty else { return }
+        let watermarkSeq: UInt64? = destination.confirmedWatermark.flatMap {
+            $0.incarnation == localIncarnation ? $0.seq : nil
+        }
         let records = destination.unresolvedEffects
         let epochs = Set(records.compactMap(\.peerLedgerEpoch))
         let sentinels = Set(epochs.compactMap { regressionSentinel(in: records, liveEpoch: $0)?.effect })
         destination.unresolvedEffects = records.filter { record in
-            let covered = record.effect.incarnation == localIncarnation
-                && record.effect.seq <= watermark.seq
-                && record.isSettled
-            return !covered || sentinels.contains(record.effect)
+            guard record.effect.incarnation == localIncarnation, record.isSettled else { return true }
+            let belowWatermark = watermarkSeq.map { record.effect.seq <= $0 } ?? false
+            let prunable = belowWatermark || FedSettlementRules.holdsOutcome(record.disposition)
+            return !prunable || sentinels.contains(record.effect)
         }
     }
 }

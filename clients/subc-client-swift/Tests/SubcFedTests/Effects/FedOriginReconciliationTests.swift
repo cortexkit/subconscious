@@ -582,8 +582,11 @@ class FedOriginReconciliationTests: XCTestCase {
         }
         try await feed(
             transport,
+            // The scripted peer is an effects-v1 callosum: without effects-v2 in
+            // its hello the session keeps the single-id wire these tests pin.
+            // `FedEffectsV2ReconciliationTests` covers the list form.
             frame: FedHelloCodec.buildLocalHello(
-                policy: try FedHelloPolicy(),
+                policy: try FedHelloPolicy(features: ["mgmt-v1", "effects-v1"]),
                 incarnation: peerIncarnation,
                 ledgerEpoch: liveEpoch,
                 connectionAttemptID: String(repeating: "d", count: 32)

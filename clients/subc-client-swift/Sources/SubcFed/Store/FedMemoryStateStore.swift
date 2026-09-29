@@ -118,7 +118,11 @@ public actor FedMemoryStateStore: FedStateStore {
             }
             record.terminalCode = terminalCode
         }
-        try await advanceWatermarkIfPossible(responderStaticPublicKey: responderStaticPublicKey)
+        applySettlementRules(
+            responderStaticPublicKey: responderStaticPublicKey,
+            effect: effect,
+            disposition: disposition
+        )
     }
 
     public func commitConfirmedWatermark(
@@ -145,7 +149,7 @@ public actor FedMemoryStateStore: FedStateStore {
             throw FedFailure.persistenceFailed
         }
         destination.confirmedWatermark = watermark
-        FedSettledRecordPruning.prune(&destination, localIncarnation: doc.global.localIncarnation)
+        FedSettlementRules.afterWatermark(&destination, localIncarnation: doc.global.localIncarnation)
         doc.destinations[key] = destination
         doc.revision += 1
         document = doc
@@ -231,34 +235,26 @@ public actor FedMemoryStateStore: FedStateStore {
         document = doc
     }
 
-    private func advanceWatermarkIfPossible(responderStaticPublicKey: Data) async throws {
-        var doc = try requireDocument()
+    /// Confirmation, watermark advance and pruning after a settle; the rules,
+    /// including the freeze while an epoch is poisoned, are `FedSettlementRules`.
+    private func applySettlementRules(
+        responderStaticPublicKey: Data,
+        effect: FedEffectID,
+        disposition: FedEffectDisposition
+    ) {
+        guard var doc = document else { return }
         let key = FedStateDocument.destinationKey(forResponderPublicKey: responderStaticPublicKey)
-        guard var destination = doc.destinations[key] else { return }
-        // A poisoned serving ledger epoch is proof of regression or corruption at
-        // that epoch. Never advance the watermark past the contradiction: freezing
-        // the watermark keeps the serving ledger from pruning evidence the origin
-        // can no longer trust. The freeze lifts only when the peer presents a new,
-        // honest epoch (poison is keyed per epoch, not per peer).
-        guard destination.poisonedLedgerEpochs.isEmpty else { return }
-        let incarnation = doc.global.localIncarnation
-        let watermarkSeq = FedWatermark.contiguousSettledPrefix(
-            of: destination.unresolvedEffects,
-            incarnation: incarnation
+        guard let before = doc.destinations[key] else { return }
+        var destination = before
+        FedSettlementRules.afterTerminal(
+            &destination,
+            effect: effect,
+            disposition: disposition,
+            localIncarnation: doc.global.localIncarnation
         )
-        if watermarkSeq > 0 {
-            let candidate = FedConfirmedWatermark(incarnation: incarnation, seq: watermarkSeq)
-            if let existing = destination.confirmedWatermark,
-               existing.incarnation == candidate.incarnation,
-               candidate.seq <= existing.seq
-            {
-                return
-            }
-            destination.confirmedWatermark = candidate
-            FedSettledRecordPruning.prune(&destination, localIncarnation: incarnation)
-            doc.destinations[key] = destination
-            doc.revision += 1
-            document = doc
-        }
+        guard destination != before else { return }
+        doc.destinations[key] = destination
+        doc.revision += 1
+        document = doc
     }
 }

@@ -38,7 +38,12 @@ final class FedSessionEngineTests: XCTestCase {
 
         let localHello = try await transport.sentFrames(negotiationComplete: false).first { $0.knownType == .hello }!
         XCTAssertEqual(localHello.header["versions"], .array([.integer(1)]))
-        XCTAssertEqual(localHello.header["features"], .array([.string("mgmt-v1"), .string("effects-v1")]))
+        // effects-v2 is advertised by default: callosum turns it on only when
+        // both hellos carry it, and a v1 peer ignores a feature it lacks.
+        XCTAssertEqual(
+            localHello.header["features"],
+            .array([.string("mgmt-v1"), .string("effects-v1"), .string("effects-v2")])
+        )
         XCTAssertEqual(localHello.header["max_body_bytes"], .integer(16_777_216))
         XCTAssertEqual(localHello.header["max_in_flight"], .integer(64))
         XCTAssertEqual(localHello.header["keepalive_interval_ms"], .integer(15_000))

@@ -297,6 +297,7 @@ public actor FedSQLiteStateStore: FedStateStore {
                 PRAGMA wal_autocheckpoint=\(Self.writeAheadLogCheckpointPages);
                 """)
             try db.keepWriteAheadLogFiles()
+            try db.execute(FedSQLiteStoreRows.confirmedRangeSchema)
             return db
         } catch {
             throw Self.openFailure(error)
@@ -420,7 +421,14 @@ public actor FedSQLiteStateStore: FedStateStore {
                 ]
             )
             guard db.changes > 0 else { throw FedFailure.persistenceFailed }
-            try Self.advanceWatermark(fp: fp, in: db)
+            try Self.applySettlementRules(fp: fp, in: db) { view, localIncarnation in
+                FedSettlementRules.afterTerminal(
+                    &view,
+                    effect: effect,
+                    disposition: disposition,
+                    localIncarnation: localIncarnation
+                )
+            }
         }
     }
 
@@ -430,7 +438,7 @@ public actor FedSQLiteStateStore: FedStateStore {
     ) async throws {
         let fp = FedStateDocument.destinationKey(forResponderPublicKey: responderStaticPublicKey)
         _ = try write { db in
-            guard var view = try FedSQLiteStoreRows.settlementView(fp: fp, in: db) else {
+            guard let view = try FedSQLiteStoreRows.settlementView(fp: fp, in: db) else {
                 throw FedFailure.persistenceFailed
             }
             if let existing = view.confirmedWatermark,
@@ -445,9 +453,10 @@ public actor FedSQLiteStateStore: FedStateStore {
             guard covered.allSatisfy(\.isSettled) else {
                 throw FedFailure.persistenceFailed
             }
-            try FedSQLiteStoreRows.setConfirmedWatermark(watermark, fp: fp, in: db)
-            view.confirmedWatermark = watermark
-            try Self.prune(view, fp: fp, localIncarnation: FedSQLiteStoreRows.localIncarnation(in: db), in: db)
+            try Self.applySettlementRules(fp: fp, in: db) { view, localIncarnation in
+                view.confirmedWatermark = watermark
+                FedSettlementRules.afterWatermark(&view, localIncarnation: localIncarnation)
+            }
         }
     }
 
@@ -528,48 +537,30 @@ public actor FedSQLiteStateStore: FedStateStore {
         try FedSQLiteStoreRows.insertEffect(stored, fp: fp, in: db)
     }
 
-    /// Moves the confirmed watermark up to the settled prefix and prunes, in
-    /// the transaction that settled an effect. The rules are
-    /// `FedWatermark.contiguousSettledPrefix` and `FedSettledRecordPruning`,
-    /// the same functions the file store runs, applied to the destination's
-    /// rows read inside this transaction.
-    private static func advanceWatermark(fp: String, in db: FedSQLiteConnection) throws {
-        guard var view = try FedSQLiteStoreRows.settlementView(fp: fp, in: db) else { return }
-        // A poisoned serving ledger epoch is proof the Mac's ledger lost rows.
-        // The watermark then stays where it is, so the Mac is never told it may
-        // prune records the phone can no longer vouch for.
-        guard view.poisonedLedgerEpochs.isEmpty else { return }
-        let incarnation = try FedSQLiteStoreRows.localIncarnation(in: db)
-        let watermarkSeq = FedWatermark.contiguousSettledPrefix(of: view.unresolvedEffects, incarnation: incarnation)
-        guard watermarkSeq > 0 else { return }
-        let candidate = FedConfirmedWatermark(incarnation: incarnation, seq: watermarkSeq)
-        if let existing = view.confirmedWatermark,
-           existing.incarnation == candidate.incarnation,
-           candidate.seq <= existing.seq
-        {
-            return
-        }
-        try FedSQLiteStoreRows.setConfirmedWatermark(candidate, fp: fp, in: db)
-        view.confirmedWatermark = candidate
-        try prune(view, fp: fp, localIncarnation: incarnation, in: db)
-    }
-
-    /// Deletes the rows `FedSettledRecordPruning` drops from `view`. The
-    /// selection, including the regression sentinel kept for every epoch, is
-    /// that function's; this only turns its answer into deletes.
+    /// Runs one of the `FedSettlementRules` (confirmation, watermark advance,
+    /// pruning), the same functions the file and memory stores run, over the
+    /// destination's rows read inside this transaction, and writes back what
+    /// it changed: the watermark, the confirmed ranges and the deleted rows.
     ///
     /// The pages the deletes free are handed back to the file system in the
     /// same transaction, so the database file shrinks with the send log
     /// instead of staying at the largest size it ever reached.
-    private static func prune(
-        _ view: FedDestinationState,
+    private static func applySettlementRules(
         fp: String,
-        localIncarnation: String,
-        in db: FedSQLiteConnection
+        in db: FedSQLiteConnection,
+        _ rule: (inout FedDestinationState, String) -> Void
     ) throws {
-        var kept = view
-        FedSettledRecordPruning.prune(&kept, localIncarnation: localIncarnation)
-        let keptIDs = Set(kept.unresolvedEffects.map(\.effect))
+        guard let view = try FedSQLiteStoreRows.settlementView(fp: fp, in: db) else { return }
+        let localIncarnation = try FedSQLiteStoreRows.localIncarnation(in: db)
+        var after = view
+        rule(&after, localIncarnation)
+        if let watermark = after.confirmedWatermark, watermark != view.confirmedWatermark {
+            try FedSQLiteStoreRows.setConfirmedWatermark(watermark, fp: fp, in: db)
+        }
+        if after.confirmedEffectRanges != view.confirmedEffectRanges {
+            try FedSQLiteStoreRows.replaceConfirmedRanges(after.confirmedEffectRanges, fp: fp, in: db)
+        }
+        let keptIDs = Set(after.unresolvedEffects.map(\.effect))
         var deleted = false
         for record in view.unresolvedEffects where !keptIDs.contains(record.effect) {
             try FedSQLiteStoreRows.deleteEffect(record.effect, fp: fp, in: db)

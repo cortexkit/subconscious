@@ -43,6 +43,23 @@ enum FedSQLiteStoreRows {
         epoch TEXT NOT NULL,
         PRIMARY KEY (responder_fp, epoch)
     );
+    \(confirmedRangeSchema)
+    """
+
+    /// The confirmed ranges of `FedDestinationState.confirmedEffectRanges`.
+    ///
+    /// Added after layout version 1 shipped, without a version bump: the table
+    /// is only ever added, and a database without it has no ranges. `open`
+    /// runs this statement on every existing database, so one built before the
+    /// table existed gains it; a build that predates the table ignores it.
+    static let confirmedRangeSchema = """
+    CREATE TABLE IF NOT EXISTS confirmed_range(
+        responder_fp TEXT NOT NULL,
+        incarnation TEXT NOT NULL,
+        from_seq INTEGER NOT NULL,
+        to_seq INTEGER NOT NULL,
+        PRIMARY KEY (responder_fp, incarnation, from_seq)
+    );
     """
 
     // Effect and poisoned-epoch rows are always read in rowid order, which is
@@ -105,6 +122,7 @@ enum FedSQLiteStoreRows {
                     [.text(fp), .text(epoch)]
                 )
             }
+            try replaceConfirmedRanges(destination.confirmedEffectRanges, fp: fp, in: db)
         }
     }
 
@@ -153,6 +171,10 @@ enum FedSQLiteStoreRows {
             }
             destination.poisonedLedgerEpochs.append(epoch)
             destinations[fp] = destination
+        }
+
+        for fp in destinations.keys {
+            destinations[fp]?.confirmedEffectRanges = try confirmedRanges(fp: fp, in: db)
         }
 
         return FedStateDocument(
@@ -242,6 +264,7 @@ enum FedSQLiteStoreRows {
             destination.unresolvedEffects.append(try effectRecord(from: effects, responderKey: key))
         }
         destination.poisonedLedgerEpochs = try poisonedEpochs(fp: fp, in: db)
+        destination.confirmedEffectRanges = try confirmedRanges(fp: fp, in: db)
         return destination
     }
 
@@ -287,7 +310,40 @@ enum FedSQLiteStoreRows {
             destination.unresolvedEffects.append(try effectRecord(from: effects, responderKey: key))
         }
         destination.poisonedLedgerEpochs = try poisonedEpochs(fp: fp, in: db)
+        destination.confirmedEffectRanges = try confirmedRanges(fp: fp, in: db)
         return destination
+    }
+
+    /// Replaces the destination's confirmed ranges with `ranges`.
+    static func replaceConfirmedRanges(
+        _ ranges: [FedConfirmedEffectRange],
+        fp: String,
+        in db: FedSQLiteConnection
+    ) throws {
+        try db.run("DELETE FROM confirmed_range WHERE responder_fp = ?", [.text(fp)])
+        for range in ranges {
+            try db.run(
+                "INSERT INTO confirmed_range(responder_fp, incarnation, from_seq, to_seq) VALUES (?, ?, ?, ?)",
+                [.text(fp), .text(range.incarnation), .unsigned(range.from), .unsigned(range.to)]
+            )
+        }
+    }
+
+    /// The destination's confirmed ranges, in the order the stores keep them
+    /// (by incarnation, then by first sequence number).
+    static func confirmedRanges(fp: String, in db: FedSQLiteConnection) throws -> [FedConfirmedEffectRange] {
+        let rows = try db.prepare(
+            "SELECT incarnation, from_seq, to_seq FROM confirmed_range WHERE responder_fp = ? ORDER BY incarnation, from_seq"
+        )
+        try rows.bind([.text(fp)])
+        var ranges: [FedConfirmedEffectRange] = []
+        while try rows.step() {
+            guard let incarnation = rows.text(0), let from = rows.unsigned(1), let to = rows.unsigned(2), from <= to else {
+                throw FedFailure.storeCorrupt
+            }
+            ranges.append(FedConfirmedEffectRange(incarnation: incarnation, from: from, to: to))
+        }
+        return ranges
     }
 
     static func responderKey(fp: String, in db: FedSQLiteConnection) throws -> Data? {

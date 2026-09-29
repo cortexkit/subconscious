@@ -76,10 +76,18 @@ public struct FedKeepaliveController: Sendable {
 
     /// Builds a keepalive. confirmed_watermark is included only when effects-v1
     /// is negotiated and the watermark is already durably committed.
-    public func makeKeepalive(confirmedWatermark: FedConfirmedWatermark?) -> FedFrame {
+    /// `confirmedEffects` is included when effects-v1 is negotiated and it is
+    /// not empty; the caller passes it only to an effects-v2 peer.
+    public func makeKeepalive(
+        confirmedWatermark: FedConfirmedWatermark?,
+        confirmedEffects: [FedConfirmedEffectRange] = []
+    ) -> FedFrame {
         var fields: [String: FedJSONValue] = [:]
         if effectsEnabled, let watermark = confirmedWatermark {
             fields["confirmed_watermark"] = .object(watermark.asJSONObject)
+        }
+        if effectsEnabled, !confirmedEffects.isEmpty {
+            fields["confirmed_effects"] = FedEffectsV2Codec.confirmedEffectsValue(confirmedEffects)
         }
         return FedFrame(type: FedFrameType.keepalive.rawValue, fields: fields)
     }

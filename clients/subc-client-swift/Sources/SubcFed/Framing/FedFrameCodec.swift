@@ -386,6 +386,15 @@ public enum FedFrameCodec {
         negotiatedFeatures: Set<String>
     ) throws {
         guard let knownType = FedFrameType(rawValue: type) else {
+            if FedEffectsV2Codec.frameTypes.contains(type) {
+                try FedEffectsV2Codec.validateListHeader(
+                    header,
+                    type: type,
+                    negotiationComplete: negotiationComplete,
+                    negotiatedFeatures: negotiatedFeatures
+                )
+                return
+            }
             if !negotiationComplete { throw FedFrameError.unknownTypeBeforeNegotiation(type) }
             return
         }
@@ -436,6 +445,12 @@ public enum FedFrameCodec {
                 }
                 try validateWatermark(watermark, type: type, field: "confirmed_watermark")
             }
+            try FedEffectsV2Codec.validateConfirmedEffects(
+                header,
+                type: type,
+                negotiationComplete: negotiationComplete,
+                negotiatedFeatures: negotiatedFeatures
+            )
         case .catalog:
             _ = try requireInteger(header, key: "generation", type: type)
         case .call:
@@ -471,6 +486,12 @@ public enum FedFrameCodec {
                 }
                 try validateWatermark(watermark, type: type, field: "confirmed_watermark")
             }
+            try FedEffectsV2Codec.validateConfirmedEffects(
+                header,
+                type: type,
+                negotiationComplete: negotiationComplete,
+                negotiatedFeatures: negotiatedFeatures
+            )
             try validateDeadline(header, type: type)
         case .callFrame:
             try validateEffect(header, type: type)
@@ -500,10 +521,24 @@ public enum FedFrameCodec {
             // ledger-answer statuses; fed_seq_fenced and fed_outcome_expired are
             // served when the queried sequence was fenced or its retained outcome
             // expired. Both reconcile to ambiguous (never not_sent), so admitting
-            // them here carries no double-execution risk.
+            // them here carries no double-execution risk. `confirmed` exists only
+            // under effects-v2: the id is one this phone confirmed earlier, which
+            // needs a complete ledger and carries no terminal kind.
+            var statuses: Set<String> = ["recorded", "not_found", "expired", "fed_seq_fenced", "fed_outcome_expired"]
+            if negotiatedFeatures.contains(FedEffectsV2Codec.feature) {
+                statuses.insert("confirmed")
+            }
             guard let status = header["status"], case .string(let status) = status,
-                  ["recorded", "not_found", "expired", "fed_seq_fenced", "fed_outcome_expired"].contains(status)
+                  statuses.contains(status)
             else { throw FedFrameError.invalidHeaderField(type: type, field: "status") }
+            if status == "confirmed" {
+                guard case .boolean(true) = header["ledger_complete"] else {
+                    throw FedFrameError.invalidHeaderField(type: type, field: "ledger_complete")
+                }
+                if header["k"] != nil {
+                    throw FedFrameError.invalidHeaderField(type: type, field: "k")
+                }
+            }
             if let omitted = header["body_omitted"] {
                 guard case .boolean = omitted else {
                     throw FedFrameError.invalidHeaderField(type: type, field: "body_omitted")
@@ -519,6 +554,7 @@ public enum FedFrameCodec {
             FedFrameType.keepalive.rawValue,
             FedFrameType.callCancel.rawValue,
             FedFrameType.effectStatus.rawValue,
+            FedEffectsV2Codec.listQueryType,
         ]
         if bodyless.contains(type), !body.isEmpty {
             throw FedFrameError.bodylessFrame(type: type, declared: UInt32(body.count))
@@ -560,6 +596,11 @@ public enum FedFrameCodec {
             if status != "recorded" || omitted, !body.isEmpty {
                 throw FedFrameError.effectResultBodyNotAllowed
             }
+        }
+        if type == FedEffectsV2Codec.listResultType,
+           FedEffectsV2Codec.declaredBodyLength(of: header) != UInt64(body.count)
+        {
+            throw FedFrameError.effectResultBodyNotAllowed
         }
     }
 
@@ -772,6 +813,7 @@ public struct FedFrameStreamDecoder: Sendable {
                         FedFrameType.keepalive.rawValue,
                         FedFrameType.callCancel.rawValue,
                         FedFrameType.effectStatus.rawValue,
+                        FedEffectsV2Codec.listQueryType,
                     ]
                     if bodyless.contains(type), declared != 0 {
                         throw FedFrameError.bodylessFrame(type: type, declared: declared)
@@ -779,6 +821,7 @@ public struct FedFrameStreamDecoder: Sendable {
                     try validateDeclaredBody(declared, type: type, header: header)
                     bodyLength = Int(declared)
                     discardBody = FedFrameType(rawValue: type) == nil
+                        && !FedEffectsV2Codec.frameTypes.contains(type)
                     bodyBuffer = discardBody ? Data() : Data(capacity: bodyLength)
                     if bodyLength == 0 {
                         try completeBody(&frames)
@@ -845,6 +888,11 @@ public struct FedFrameStreamDecoder: Sendable {
             if status != "recorded" || omitted, declared != 0 {
                 throw FedFrameError.effectResultBodyNotAllowed
             }
+        }
+        if type == FedEffectsV2Codec.listResultType,
+           FedEffectsV2Codec.declaredBodyLength(of: header) != UInt64(declared)
+        {
+            throw FedFrameError.effectResultBodyNotAllowed
         }
     }
 

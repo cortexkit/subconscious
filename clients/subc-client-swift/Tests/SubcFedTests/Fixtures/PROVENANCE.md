@@ -105,6 +105,29 @@ criteria, each encoded as `u32 LE header_len || header || u32 LE body_len
 - `effect_status_result` (body_omitted) — `status:"recorded"`,
   `body_omitted:true`, empty body.
 
+### fed-wire effects-v2 vectors (`fed-wire/effects-v2.jsonl`)
+
+Copied byte for byte from callosum, not generated here. They are produced by
+callosum's own effects-v2 frame builders and are the authority for the list
+`effect_status` query and reply, the whole-reply `busy`, the single-id
+`confirmed` status, and `confirmed_effects` on `call` and `keepalive`.
+
+- Source: callosum tag `fed-wire-vectors/effects-v2-r1`, commit
+  `35f14532b42865d87d694236a90b4b93762d0263`, path
+  `test-vectors/fed-wire/effects-v2.jsonl` (7 lines: one comment line, then
+  six vectors).
+- SHA-256: `a1f9cd06ab7e1bf8524277ad26c834df441802e70bec5666a2cdec3ae7880da8`.
+- Copied with
+  `git -C <callosum> show fed-wire-vectors/effects-v2-r1:test-vectors/fed-wire/effects-v2.jsonl`,
+  never from a callosum working tree.
+
+`FedEffectsV2VectorTests` pins that digest (written in the test, not computed
+from the file), decodes every vector through the frame codec, and re-encodes
+the phone-originated ones (the list query, `call` and `keepalive` carrying
+`confirmed_effects`) from the production builders to the same JSON value.
+The directory is `-text` in `.gitattributes`, so checkout never rewrites the
+line endings the digest covers.
+
 ### rdv-wire vectors
 
 The rdv-wire golden vectors ARE copied into `Fixtures/rdv-wire/`, and the

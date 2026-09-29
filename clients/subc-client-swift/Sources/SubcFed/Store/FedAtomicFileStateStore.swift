@@ -1,7 +1,11 @@
 import Foundation
 
-/// Default durable store: one identity-bound document under Application Support,
-/// committed via temp-write + fsync + atomic rename + directory sync.
+/// The previous durable store: one identity-bound document under Application
+/// Support, committed via temp-write + fsync + atomic rename + directory sync.
+///
+/// `FedSQLiteStateStore` is the default now. It reads this store's document
+/// once, on its first open, to migrate it, which is why this type and its
+/// format stay.
 ///
 /// Every mutation holds an exclusive advisory lock for the full
 /// load → validate → temp-write → rename → directory-sync window so concurrent

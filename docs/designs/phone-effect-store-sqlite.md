@@ -35,7 +35,8 @@ Tables:
 
 Durability: WAL mode, `synchronous=FULL`, `fullfsync=ON` and `checkpoint_fullfsync=ON`
 (Darwin SQLite otherwise uses plain fsync, weaker than today's F_FULLFSYNC). One commit
-is one full flush.
+is one full flush of the WAL; a checkpoint, every thousand or so pages, adds flushes of
+its own.
 
 Transactions per change:
 1. Reserve the seq and insert the intent row in one `BEGIN IMMEDIATE` transaction.
@@ -46,7 +47,8 @@ Transactions per change:
 3. Outcome, watermark advance and pruning in one transaction. Durable before the caller
    sees the reply. (1 flush)
 
-So a change costs 2 full flushes, against about 9-12 today.
+So a change costs 2 full flushes, against 6 in the JSON file store after d8d0b9a8 (about
+9-12 before it).
 
 Queries that replace hand-written loops:
 - Open changes: `SELECT ... WHERE responder_fp=? AND disposition='unknown'`.
@@ -81,9 +83,12 @@ File protection and backup:
 Migration: on first open, if `fed-state.json` exists and the database file does not
 exist, import it in one transaction. "Does not exist" is a file-existence check, never an
 open failure: a locked phone that cannot open an existing database must not re-import
-the JSON over it. Then check that the imported document and the database give the same
-open changes, watermark, sentinel per epoch and poisoned epochs, and only then rename the
-JSON to `fed-state.json.migrated`. Keep that file for one release. If the check fails,
+the JSON over it. For that check to be sound the database file must never exist
+half-built: a new database (imported or fresh) is built under a temporary name and
+renamed into place once complete, so a crash during the import leaves no database and
+the next open imports again. Then check that the imported document and the database
+give the same open changes, watermark, sentinel per epoch, poisoned epochs, reservation
+state and incarnation, and only then rename the JSON to `fed-state.json.migrated`. Keep that file for one release. If the check fails,
 refuse to open with a distinct `FedFailure` case of its own (the app shows a specific
 notice for it, not "can't reach your Mac") and leave both files untouched.
 

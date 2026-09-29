@@ -256,7 +256,8 @@ final class FedStoreConcurrencyAndKillWindowSQLiteTests: FedStoreConcurrencyAndK
     }
 
     /// Killed while the outcome transaction is still uncommitted: the intent
-    /// is still there, unsettled, so the next launch asks the Mac about it.
+    /// is still there, unsettled, so the next launch asks the serving peer's
+    /// ledger about it.
     func testKillBeforeTheTerminalCommitLeavesTheIntentToReconcile() async throws {
         let dir = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: dir) }

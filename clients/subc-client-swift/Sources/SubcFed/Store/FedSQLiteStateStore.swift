@@ -510,8 +510,9 @@ public actor FedSQLiteStateStore: FedStateStore {
     /// rows read inside this transaction.
     private static func advanceWatermark(fp: String, in db: FedSQLiteConnection) throws {
         guard var view = try FedSQLiteStoreRows.settlementView(fp: fp, in: db) else { return }
-        // A poisoned serving ledger epoch freezes the watermark; see the file
-        // store's `advanceWatermark` for why.
+        // A poisoned serving ledger epoch is proof the Mac's ledger lost rows.
+        // The watermark then stays where it is, so the Mac is never told it may
+        // prune records the phone can no longer vouch for.
         guard view.poisonedLedgerEpochs.isEmpty else { return }
         let incarnation = try FedSQLiteStoreRows.localIncarnation(in: db)
         let watermarkSeq = FedWatermark.contiguousSettledPrefix(of: view.unresolvedEffects, incarnation: incarnation)

@@ -1,172 +1,241 @@
 # Scopes: owned identity records in the daemon
 
-Status: design r2 (declared attribute set, from the room's review of r1). Nothing here is built. The extensibility design (magic-context
-`.cortexkit/alfonso/plans/ck-extensibility-r6-7-amendments.md`, section K2) relies on the
-contract in sections 2 to 6; this note is where the daemon side is specified and reviewed.
-Settled in the extensibility room ([#416] to [#447]) and ruled by the operator.
+Status: design r3. Nothing here is built. r3 answers an Athena review of r2 (five seats, a
+unanimous "do not implement as written"); section 10 lists what changed and why. The
+extensibility design (magic-context `.cortexkit/alfonso/plans/ck-extensibility-r6-7-amendments.md`,
+section K2) relies on sections 2 to 6.
 
 ## 1. Why
 
 Several modules act on behalf of a session they did not start: Broca runs a head that
-Prefrontal owns, AFT relays that head's GitHub writes to Plexus, and Cerebellum holds grants
-"for this conversation". Each of those needs to know, from something it can trust, which
-session a route belongs to, who owns it, and which agent it acts for. Until now each need had
-its own mechanism: a self-asserted `session_ref`, a `parent_session_ref`, an `owner` label
-trusted from any module declaring `llm-runner/v1`, and a separate delegation registry. An
-Athena review showed that each one could be claimed by a caller that did not own it.
+Prefrontal owns, AFT carries that head's GitHub writes to Plexus, and Cerebellum holds grants
+"for this conversation". Each needs to know, from something it can trust, which session a route
+belongs to, who owns it, and which agent it acts for. A scope is one record the daemon holds and
+stamps on the bind, in place of the self-asserted `session_ref`, `parent_session_ref`, runner
+`owner` label and separate delegation registry.
 
-A scope replaces all of them with one record the daemon holds and stamps. It generalises what
-the daemon already does for admission facts (`control.rs:2937-2974`): only a configured carrier
-may attach them, and the daemon stamps them on the bind without reading them.
+It follows the admission-facts check (`control.rs:2937-2974`) and keeps both of its gates: only
+configured principals may set the fields that grant authority, and the daemon stamps the record
+without interpreting the rest.
+
+Identity comes from the connection, never the request. `route_open_principal`
+(`control.rs:2393`) makes an opener `reserved:<id>` only when its launch nonce matches a live
+supervised launch, refuses `bad_consumer_identity` otherwise, and makes it `direct` when it
+presents no identity. Every rule below uses that principal.
 
 ## 2. The record
 
-A scope is identified by the pair `(owner, ref)`:
-- `owner`: the principal that registered it, taken from the registering connection's stamp,
-  never from the request. `direct` cannot own a scope (section 3).
-- `ref`: an opaque string chosen by the owner, unique within that owner only. Two owners may
-  use the same ref without colliding, and no module can squat or block another owner's ref.
+A scope is identified by `(owner, ref)`:
+- `owner`: the principal that registered it, from the registering connection. `direct` cannot
+  own a scope.
+- `ref`: an opaque string chosen by the owner, unique within that owner only, so no module can
+  squat or block another owner's ref.
+- `instance`: an opaque string the owner chooses when it creates the scope (at least 16 random
+  bytes). The owner re-sends the same `instance` for the same session after any restart, its own
+  or the daemon's, and must choose a new one when it reuses a ref for a new session. Anything
+  that must not carry over to a new session (a stored approval, a conversation grant) binds to
+  `(owner, ref, instance)`. Because the owner keeps it, it survives daemon restarts and
+  upgrades, which a daemon-assigned counter would not.
+- `version`: a daemon counter increased on every change to the record within one incarnation.
+  It is how a bind notices a change between admission and commit (section 4).
 
 Fields:
-- `kind`: a closed enum, `head | worker | ephemeral`. Providers read it; they never derive it
-  from other fields.
+- `kind`: a closed enum, `head | worker | ephemeral`.
 - `parent`: optional `(owner, ref)` of another scope.
 - `carriers`: the principals, other than the owner, that may open routes under the scope.
-- `attributes`: a small typed set, settable only by the owner. Carriers and relays set nothing.
-  A key outside the declared set is refused by name, so a typo cannot pass silently to
-  providers. The declared set:
-  - `agent_id` (string): the head's agent, on every head scope, delegating or not. It is
-    identity: Cerebellum keys durable browser profiles and remembered app grants on it. It is
-    the value today's `agentProjectId` admission fact already carries, so nothing re-keys.
-  - `delegates` (bool, default false): true means a provider may act as that agent (Plexus bot
-    writes). The daemon refuses `delegates: true` on a scope without `agent_id`. A provider
-    acts as the agent only when `delegates` is true and `agent_id` matches; `agent_id` alone is
-    never permission to act.
-  - `hook_order` (closed enum, today only `exclusive`): the launch turned off the user's own
-    hook settings, so the CK plugin is the only hook on a call. Absent means no guarantee.
-  Per-provider policy, such as which browser controls a session may use, is not an attribute:
-  the provider keys it on `kind`.
+- `attributes`, settable only by the owner, anything else refused by name:
+  - `agent_id` (string): the head's agent, on every head scope. It is identity, and the value
+    today's `agentProjectId` admission fact already carries.
+  - `delegates` (bool, default false): true lets a provider act as that agent. Refused without
+    `agent_id`.
+  - `hook_order` (closed enum, today only `exclusive`).
 
-Bounds: at most 10,000 live scopes and 1,000 tombstones per owner, and 4 KiB of attributes per
-scope. Past a bound the request is refused by name; the daemon never evicts a live scope.
+**Authority gate.** `agent_id`, `delegates` and `hook_order` may be set only by an owner listed
+in the daemon config key `scope_authority_owners` (today `["prefrontal-core"]`, the same module
+as `admission_facts_carrier_module_id`). A scope from any other owner may carry `kind`,
+`parent` and `carriers` only; a sync that sets a gated attribute from an unlisted owner is
+refused by name (`scope_attribute_not_permitted`). Providers still check the stamped `owner`
+against their own expectation before honouring `delegates` (section 7).
+
+Bounds: at most 10,000 live scopes per owner and 4 KiB of attributes per scope; past either the
+sync is refused by name and nothing is applied. Tombstones (section 6) are capped at 1,000 per
+owner and evicted oldest first; that bound never refuses.
 
 ## 3. Registering: `scope.sync`
 
 An owner sends its full set: `scope.sync {generation, scopes: [...]}`.
-- The first sync on a connection is always a full replace, whatever its generation. Later syncs
-  on the same connection must carry a larger generation, and a smaller one is refused as stale.
-  So an owner that restarts, or a daemon that restarts, can never lock a head out: nothing about
-  the generation needs to survive either.
-- A scope present before and absent now is ended: it is tombstoned (section 6) and every route
-  under it is drained with reason `scope_ended`.
-- `parent` is admitted only if the owner is at that moment the owner of the parent, a carrier
-  of it, or serving it through a live route (section 4). So a parent link cannot be forged.
-- When a parent ends, its children stay. Their stamp carries `parent_ended: true`. Cascading
-  would let one owner's removal tear down another owner's routes.
-- When the owner's connection closes, its scopes stay live until the owner's next first sync
-  replaces them. A Prefrontal restart therefore does not cut off running Broca sessions.
-- `scope.sync` from `direct` is refused by name. `direct` is one principal shared by every
-  harness plugin, `ck`, and any local process holding the connection file, so owning a scope
-  would prove nothing. Standalone hosts (OpenCode or Pi without Prefrontal) run without scopes.
 
-`delegation.sync` from the earlier design is not built; delegation is the `agent_id` attribute
-of a head scope.
+**One sync authority per owner.** Each owner has exactly one connection whose syncs are
+accepted: its authority. The first connection of an owner to sync becomes the authority. A
+sync from any other connection of the same owner is refused `scope_sync_not_authority`. That
+covers a blue/green swap, where the owner briefly has two connections: the candidate is refused
+until cutover, and at cutover authority moves to the promoted connection in the same step as
+the forwarding switch, without touching the set. The superseded connection's syncs are refused
+from then on. When the authority connection closes, authority is free, and the next connection
+of that owner to sync takes it.
+
+**Generations.** A sync from the authority must carry a generation larger than the last one it
+accepted; an equal or smaller one is refused as stale, and a refused sync changes nothing. The
+first sync from a connection that has just taken authority is a full replace at any generation,
+and its generation becomes the new baseline. So a restarted owner, or an owner after a daemon
+restart, is never locked out, and a stale connection can never overwrite a newer one.
+
+**Effect of a sync.**
+- A scope present before and absent now is ended: tombstoned, and every route under it drained
+  with reason `scope_ended`.
+- A scope whose carriers lost the opener of a live route, or whose `delegates` went from true to
+  false, has those routes drained with reason `scope_changed`: a stamp is a snapshot taken at
+  bind, so revoking authority has to end the routes that carry the old stamp.
+- A sync that gives a live `(owner, ref)` a different `instance` ends the old scope (tombstone,
+  drain with `scope_ended`) and creates the new one. A new session never inherits a live route,
+  stamp or approval of the old one.
+- `parent` is accepted only when the syncing owner is the parent's owner or a listed carrier of
+  the parent, at the time of the sync. A cycle is refused.
+- When a parent ends, its children stay and later stamps carry `parent_ended: true`;
+  `scope.subscribe` reports the change (section 5). One owner's removal never tears down another
+  owner's routes.
+- `scope.sync` from `direct` is refused by name.
 
 ## 4. Opening a route under a scope
 
-`route.open` gains `scope: {owner, ref}`. The daemon admits it when the opener is:
-- the owner;
-- a listed carrier; or
-- a relay: a module that has a live inbound route under the same scope at that moment.
+`route.open` gains `scope: {owner, ref}`. The daemon admits it only when the opener is the
+owner or a listed carrier, and refuses otherwise (`scope_not_live`, `scope_not_carrier`). There
+is no relay class: a module that must present a scope onward is listed as a carrier. A carrier
+route lives until the carrier closes it or the scope ends or changes as in section 3.
 
-Otherwise it refuses by name (`scope_not_live`, `scope_not_carrier`). A carrier route lives
-until the carrier closes it or the scope ends. A relay route is tied to the inbound route that
-admitted it (its basis): when the basis closes, the relay route is drained with reason
-`scope_basis_ended`. The basis is a route, never a call, since the daemon does not read calls.
+On admission the daemon captures `(instance, version)` into the pending bind and stamps the
+bind with `scope {owner, ref, instance, kind, parent, parent_ended, attributes}`, next to the
+principal it already stamps. The immediate opener stays in the principal field.
 
-On admission the daemon stamps the bind with `scope {owner, ref, kind, parent, parent_ended,
-attributes, chain}`, next to the principal it already stamps. `chain` lists the relays between
-the owner or carrier and this route. The immediate opener stays in the principal field, so a
-provider's own first-party checks are unchanged. Providers read identity only from the stamp.
+**Commit.** When the module acks the bind, the daemon checks the captured `(instance,
+version)` against the current record before the route becomes routable. If the scope ended or
+changed, the open is refused as `scope_ended` or `scope_changed`. That refusal is a settled
+rejection, handled beside the existing superseded-endpoint arm in `complete_pending_relay`: it
+releases the reserved route pair, sends the module a channel-scoped GOODBYE for the binding it
+just created, and answers the waiting `route.open` with the named refusal. It is never an `Err`
+from `commit_route_locked`, which would close the module's whole connection and every other
+client's routes to it.
+
+A provider must not take irreversible action inside `on_bind`: the route is not live until
+commit, and commit can still refuse it.
 
 ## 5. Reading: `scope.describe` and `scope.subscribe`
 
 `scope.describe {owner, ref}` answers:
 - `status`: `live`, `ended` (tombstoned since this daemon incarnation) or `not_live`;
+- `instance` for `live` and `ended`;
 - `daemon_incarnation`;
-- `owner_synced`: whether this owner has sent a sync since this incarnation started;
+- `owner_synced`: whether this owner has synced since this incarnation started;
 - `owner_configured`: whether the owner is a module in the supervisor's roster;
 - for `live`, the same fields as the stamp.
 
-That lets a reader act safely after a restart:
-- `live`: use it.
-- `ended`, or `not_live` with `owner_synced: true`: refuse by name. A tombstone evicted by the
-  bound reads as `not_live`, which also refuses.
-- `not_live` with `owner_synced: false`: not re-synced yet. Hold, and refuse as
-  `scope_unverifiable` past the reader's own bound.
-- `owner_configured: false`: the owner will never sync; refuse at once.
+How a reader holding something bound to `(owner, ref, instance)` decides, in this order:
+1. `live` with the same `instance`: use it.
+2. `live` with a different `instance`: a new session under a reused ref. Refuse by name; the
+   old binding is dead.
+3. `ended`, or `not_live` with `owner_synced: true`: refuse by name. An evicted tombstone reads
+   as `not_live`, which refuses too.
+4. `not_live` with `owner_synced: false` and `owner_configured: true`: not re-synced yet. Hold,
+   and refuse as `scope_unverifiable` past the reader's own bound.
+5. `not_live` with `owner_configured: false`: the owner will never sync. Refuse the action.
+Refusing an action never deletes what the reader stores; only an `ended` answer or event does.
 
-`scope.subscribe` is a held request shaped like `supervisor.spawn_subscribe`: a snapshot of live
-scopes with `owner_synced` per owner, then events `{owner, ref, ended}` carrying the
-`{daemon_incarnation, seq}` cursor, and the existing too-old-cursor refusal that sends the
-reader back to a snapshot. A provider holding state that outlives routes (Cerebellum's
-conversation grants) drops it only on an explicit `ended` event. A scope merely absent from a
-snapshot before its owner re-syncs is held, never treated as ended. It needs no bus.
+`scope.subscribe` is a held request shaped like `supervisor.spawn_subscribe`, with the same
+`{daemon_incarnation, seq}` cursor and too-old-cursor refusal. It sends a snapshot of live
+scopes, then events:
+- `{owner, ref, instance, ended}` when a scope ends;
+- `{owner, ref, instance, changed}` when its carriers, `delegates` or `parent_ended` change;
+- `{owner, synced}` when an owner's first sync of this incarnation is accepted.
+After an owner's `synced` event, any scope of that owner the reader holds that is not in the
+live set is ended. Before it, a scope merely missing is held, never treated as ended.
 
-## 6. State, locking and restarts
+## 6. State, locking, restarts and upgrades
 
-All state is in memory:
-- the scope table, keyed `(owner, ref)`;
-- per-owner sync state: the connection of the last sync, its generation, and `owner_synced`;
-- tombstones since this incarnation, per owner, oldest evicted first;
-- an index from scope to the live routes under it, and from route to the relay routes it is
-  the basis of.
+State, all in memory:
+- in the scope table: records keyed `(owner, ref)`, per-owner authority connection, generation,
+  `owner_synced` and the tombstones since this incarnation;
+- in the forwarding table: each pending bind's and each route's scope tag `(owner, ref,
+  instance, version)`, and the index from a scope to its routes.
 
-Lock order is scope table first, then the forwarding table. Admission checks the scope under
-the scope-table read lock, and the bind commit re-checks it (and, for a relay, its basis) under
-the forwarding write lock before the route becomes routable. So a scope ended, or a basis
-closed, between the check and the commit refuses the open instead of leaving a route under a
-dead scope. Ending a scope flips its state under the scope-table write lock, then collects its
-routes under the forwarding lock and drains them.
+Lock order is scope table, then forwarding table, always. Commit already holds the forwarding
+write lock and never takes the scope lock: it compares the pending bind's captured tag with the
+record's current `(instance, version)`, which a sync publishes into the forwarding table in the
+same step that changes the record. Ending or changing a scope: take the scope write lock, update
+the record, then take the forwarding write lock, publish the new `(instance, version)`, and
+remove every route and pending bind tagged with the old one on every endpoint, including
+superseded endpoints of a swap. A commit before that step is collected by it; a commit after it
+sees the new version and refuses.
 
-A daemon restart ends every route anyway, so nothing needs a scope from before it: the table
-starts empty, `owner_synced` is false for everyone, and readers hold as in section 5. The
-in-place upgrade (`docs/designs/daemon-in-place-upgrade.md`) keeps routes across the exec, so
-the scope table, tombstones, sync state and `daemon_incarnation` join the state handed to the
-new process. An upgrade then does not look like a restart to readers.
+**Restarts and upgrades are the same case for scopes.** The table starts empty, every
+`owner_synced` is false, `daemon_incarnation` is new, and readers hold as in section 5. The
+in-place upgrade (`docs/designs/daemon-in-place-upgrade.md`) does not carry routes or pending
+binds and gives the new process a new daemon id, so it does not hand over scope state: owners
+re-sync and subscribers take a new snapshot, exactly as after a restart. `version` restarts, which
+is safe because it is only ever compared within one incarnation. `instance` does not: the owner
+re-sends it, so a stored approval survives a restart when the same session comes back, and dies
+when a new session reuses the ref.
 
-## 7. Rollout
+## 7. What providers must do
+
+- Read identity only from the bind stamp, never from a request payload.
+- Act as an agent only when `delegates` is true, `agent_id` matches, and the stamped `owner` is
+  the owner the provider expects (today `prefrontal-core`). `agent_id` alone is identity, never
+  permission to act.
+- Bind stored approvals and grants to `(owner, ref, instance)`, and decide on them as in
+  section 5.
+- Treat the route's stamp as fixed for the route's life. A change that revokes authority drains
+  the route (section 3), so a provider need not re-check per call.
+
+## 8. Rollout
 
 Readers first, then writers:
 1. Providers that need a scope refuse a bind without a stamp. Today's daemon drops unknown
-   fields in a `route.open` request, so a carrier naming a scope on an old daemon gets a route
-   with no stamp; the provider's refusal makes that fail closed.
-2. The daemon ships `scope.sync`, `scope.describe`, `scope.subscribe` and the stamp, advertised
-   in `server.describe` as capability `scopes/v1`.
+   `route.open` request fields, so a carrier naming a scope on an old daemon gets an unstamped
+   route, which the provider's refusal makes fail closed.
+2. The daemon ships `scope.sync`, `scope.describe`, `scope.subscribe`, the stamp and
+   `scope_authority_owners`, advertised in `server.describe` as capability `scopes/v1`.
 3. Owners and carriers use scopes only when the capability is advertised. A carrier that cannot
    open a scoped route fails the call (`scope_unsupported`) instead of opening an unscoped one.
 
-## 8. Tests the daemon change must carry
+## 9. Tests the daemon change must carry
 
 Each fails by name when its rule is removed:
-- an opener that is neither owner, carrier nor relay is refused; each of the three is admitted;
-- `direct` cannot sync;
+- only the owner or a listed carrier is admitted; `direct` can neither sync nor own;
 - the same ref under two owners is two scopes;
-- a relay route drains when its basis closes, and a carrier route does not;
-- ending a scope drains every route under it; an open racing the end is refused at commit;
-- a forged parent is refused; a parent's end leaves children with `parent_ended`;
-- a restarted owner's first sync replaces its set at any generation; a stale later sync is
-  refused;
-- `describe` distinguishes `live`, `ended` and `not_live`, with correct `owner_synced` and
-  `owner_configured`, across a daemon restart;
-- `subscribe` delivers `ended` events and resumes from a snapshot after a too-old cursor;
-- an attribute outside the declared set and each bound are refused by name.
+- a gated attribute from an owner not in `scope_authority_owners` is refused;
+- a scope ended, or changed, between admission and commit refuses the open, the module's other
+  routes stay up, and the reserved pair is released;
+- removing a carrier and turning off `delegates` each drain the affected routes;
+- ending a scope drains its routes on every endpoint, including a superseded one;
+- a swap candidate's sync is refused, authority moves at cutover without changing the set, and
+  the superseded connection's sync is refused afterwards;
+- a restarted owner's first sync replaces at any generation, and an equal or smaller later one
+  is refused without changing anything;
+- a forged parent (neither owner nor carrier of the parent) is refused, and so is a cycle;
+- a changed `instance` for a live ref ends the old scope first; the same `instance` re-synced
+  after a daemon restart reads as the same session; `describe` separates the five reader cases;
+- `subscribe` emits `ended`, `changed` and `synced`, and resumes from a snapshot after a
+  too-old cursor;
+- the tombstone bound evicts and never refuses; the live-scope and attribute bounds refuse.
 
-## 9. Not in this note
+## 10. Changes from r2
 
-- Which sessions get scopes, and the carrier sets per harness: Prefrontal's rules, in K2.
-- Owner-scoped data (late results, persona text): providers store it with the owner and serve
-  it only to that verified principal; the daemon only supplies the verified identity.
-- A per-process carrier token was considered and not built: a same-user process can read
-  another's environment, so it would narrow mistakes without adding a boundary. For local
-  processes a scope proves ownership and delegation, not which process is calling.
+From the Athena review of r2 (five seats):
+1. The in-place upgrade does not carry routes or the incarnation. r2 said it did; it treated an
+   upgrade as invisible. An upgrade is now handled exactly like a restart (section 6).
+2. `agent_id`, `delegates` and `hook_order` are gated to `scope_authority_owners`. In r2 any
+   owner could set them, so any supervised module could claim a user's agent.
+3. The relay admission class is deleted. In r2 any module a session called could present its
+   full stamp, `delegates` included, to any target.
+4. A parent is accepted only from the parent's owner or carrier; r2's "serving it" clause let
+   any callee forge a parent link.
+5. The commit re-check is a settled rejection arm, not an `Err` that closes the module
+   connection, and it reads a tag in the forwarding table instead of taking the scope lock.
+6. Stamps are snapshots: removing a carrier or turning off `delegates` drains routes, and a
+   change between admission and commit refuses the open.
+7. One sync authority per owner, moved at cutover; r2's per-connection first sync let a swap
+   candidate wipe the live set.
+8. An owner-chosen `instance` stops a reused ref carrying old approvals and, unlike a daemon
+   counter, survives restarts; `subscribe` reports owner sync, so a reader knows when a missing
+   scope means ended.
+9. The tombstone bound evicts and never refuses; r2 read both ways.

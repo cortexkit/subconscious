@@ -339,9 +339,15 @@ when a new session reuses the ref.
     commands, Cerebellum's open browser, a Broca run) ends it when the scope is revoked, and
     reports it by name (`killed (scope revoked)`, `closed (scope revoked)`, the run sealed
     Interrupted);
-  - the trigger is the route GOODBYE that the scope's drain sends on every route under it, wherever
-    the provider still holds one; work with no open route under the scope checks
-    `scope.describe` once per running task per interval until `scope.subscribe` ships in stage 7.
+  - **the trigger is a route close followed by `scope.describe`, never the close alone.** The
+    route GOODBYE a module receives has an empty body and carries no reason, and routes close for
+    ordinary reasons too (a module restart, a daemon upgrade, a client reconnect), on which work
+    must survive. So when a route stamped with a scope closes, the provider asks `scope.describe`
+    for that scope and ends the work only on a definitive answer (section 5, cases 2 and 3). A
+    `not_synced` answer, as after a daemon restart, holds and ends nothing. A carrier removed or
+    `delegates` turned off leaves the scope live, so its work is not ended by this rule. Work with
+    no open route under the scope checks `scope.describe` once per running task per interval
+    until `scope.subscribe` ships in stage 7.
 
 ## 8. Rollout
 

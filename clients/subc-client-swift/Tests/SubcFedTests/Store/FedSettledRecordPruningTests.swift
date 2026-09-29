@@ -182,7 +182,9 @@ final class FedSettledRecordPruningTests: XCTestCase {
 
     private func assertScenarioTrace(_ trace: [Step], file: StaticString = #filePath, line: UInt = #line) {
         XCTAssertEqual(trace, [
-            // 1 settles recorded: watermark 1, but 1 is the sentinel, so it stays.
+            // 1 settles recorded: the watermark reaches 1, but 1 is the regression
+            // sentinel (the highest recorded record at the epoch, which pruning
+            // always keeps), so it stays.
             Step(watermark: 1, seqs: [1, 2, 3, 4, 5, 6]),
             // 2 settles not_sent: watermark 2, 2 is pruned, sentinel 1 stays.
             Step(watermark: 2, seqs: [1, 3, 4, 5, 6]),

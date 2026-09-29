@@ -88,8 +88,10 @@ final class FedStoreFlushCountTests: XCTestCase {
             XCTAssertEqual(error, .persistenceFailed)
         }
 
-        // A settled record kept as the regression sentinel is still present, so
-        // this reaches the phase check rather than the missing-record check.
+        // Pruning keeps the regression sentinel (the highest recorded record at
+        // the epoch, which reconnect uses to detect a serving ledger that lost
+        // rows), so this settled record is still present and the call reaches
+        // the phase check rather than the missing-record check.
         let settled = FedEffectID(incarnation: incarnation, seq: try await store.reserveEffectSequence().value)
         try await store.commitIntent(FedUnresolvedEffectRecord(
             effect: settled,

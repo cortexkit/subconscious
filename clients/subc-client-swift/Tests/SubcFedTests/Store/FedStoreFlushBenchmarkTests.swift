@@ -20,8 +20,9 @@ final class FedStoreFlushBenchmarkTests: XCTestCase {
     private let responder = Data(repeating: 0x22, count: 32)
     private let peerIncarnation = "00000000-0000-4000-8000-0000000000aa"
     private let peerEpoch = "00000000-0000-4000-8000-0000000000bb"
-    /// Roughly the size of one recorded reply on the operator's phone: its 3 MB
-    /// document held about 540 records.
+    /// About 4 KB per recorded reply, so that 540 recorded records make a
+    /// document of roughly 3 MB: the size a phone reached when settled records
+    /// were never pruned.
     private let responseBody = Data(repeating: 0x61, count: 4_096)
 
     private func requireBenchmarkEnabled() throws {

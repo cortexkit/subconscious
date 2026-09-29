@@ -1,6 +1,7 @@
 # Launch nonce over an inherited descriptor
 
-Status: design r4 (r3 plus each seat's signing measurements). r3 added the throwaway spike
+Status: design r5 (r4 plus the Athena review of extensibility r7.2 and the operator's ruling on
+the Thalamus gateway). r4 added each seat's signing measurements. r3 added the throwaway spike
 recorded in `launch-nonce-spike-results.md`. Nothing here is built; the extensibility design (magic-context
 `ck-extensibility-design-r7.2.md`, sections 4.9 and 18) makes it a stage-2 prerequisite, and it
 waits on the operator's approval of that design as a whole.
@@ -45,9 +46,16 @@ blocks attach on its own was not tested; it is not relied on.
   `-o runtime` alone.
 - **JIT runtimes (a `bun build --compile` or node binary) need `cs.allow-jit` and
   `cs.allow-unsigned-executable-memory`.** Without them nothing fails: `--version` works and the
-  engine silently runs without its JIT, 14x slower in a measured loop (condition-runner). So the
-  placement gate and census check those two entitlements are present on any binary that embeds a
-  JIT, and a module of that kind runs a startup self-test that its JIT is live.
+  engine silently runs without its JIT, 14x slower in a measured loop (condition-runner).
+- **Code generators that don't use `MAP_JIT` need `cs.allow-unsigned-executable-memory`, or an
+  interpreter.** Plexus links Wasmtime, whose Cranelift output is killed (SIGKILL) at the first guest
+  execution under hardened runtime with `allow-jit` alone. Plexus prefers Wasmtime's Pulley
+  interpreter, so it needs no entitlement.
+- **A flags check is not enough.** Every one of these failures passes `--version`, and Plexus's
+  appears only the first time a probe runs. So the placement gate runs a smoke test that exercises
+  each capability that needs an exception: one guest execution for Plexus, a JIT-bound hot loop for
+  a Bun or node module, an ONNX Runtime load for AFT, and the computer and browser desk checks for
+  Cerebellum. A binary with no exceptions gets its normal startup smoke.
 - **A module that loads a dylib not signed by its own team needs
   `cs.disable-library-validation`, and that opens a third path**: the dylib is code running inside
   the module, where the nonce is. AFT loads ONNX Runtime from a user-writable directory. Such a
@@ -174,6 +182,16 @@ repo: subc-client-rs (HELLO, `lib.rs`; route open, `consumer.rs`), subc-mcp (thr
 ## 5. Rollout
 
 Readers first; the boundary exists only after the last step.
+
+**Roster.** The census covers every process the daemon spawns, read from the daemon's own spawn
+list (`subc.jsonc` and the live supervisor), never from a list written here. That includes
+ck-subc-mcp, ck-bus, condition-runner, Engram, Entorhinal, Claustrum and Cerebellum, and ck-subc
+itself for the signing half. A module added later joins the census by being spawned.
+
+**Staging, per the operator's ruling.** Steps 1 to 3 are the stage-2 track. Step 4 and the
+operator-authority rule move to stage 7, because the Thalamus gateway stays held until then on an
+SDK line that cannot read the pipe; the gateway's pipe switch and signing ride its stage-7 deploy.
+Until step 4, widening operations behave as they do today, and the note makes no boundary claim.
 1. Publish the accessor (`subc-os`, subc-client-rs, `@cortexkit/subc-client`), with patch
    releases on lines modules are pinned to (the Thalamus gateway pins subc-client-rs 0.18.4).
 2. The daemon starts passing the descriptor as well as the environment variable.

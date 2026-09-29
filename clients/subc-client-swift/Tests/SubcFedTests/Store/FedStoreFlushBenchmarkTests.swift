@@ -2,8 +2,14 @@ import Foundation
 import XCTest
 @testable import SubcFed
 
-/// Prints what one mutating change costs in the durable file store: how many
-/// full flushes it issues, how long it takes, and how large the document grows.
+/// Prints what one mutating change costs in each durable store, the JSON file
+/// store and the SQLite store, one line each so the numbers sit side by side:
+/// how many flushes (file store) or commits (SQLite store) it issues, how long
+/// it takes, and how large the stored state grows.
+///
+/// The SQLite store is counted in commits because SQLite issues its flushes
+/// itself; with WAL, `synchronous=FULL` and `fullfsync=ON` each commit is one
+/// full flush of the log, plus a checkpoint's flushes now and then.
 ///
 /// It prints and never asserts a time, because wall time depends on the disk.
 /// It runs only when `SUBCFED_STORE_BENCH=1` is set, since the growth run makes
@@ -25,71 +31,84 @@ final class FedStoreFlushBenchmarkTests: XCTestCase {
     /// were never pruned.
     private let responseBody = Data(repeating: 0x61, count: 4_096)
 
+    private enum Store: String, CaseIterable {
+        case file
+        case sqlite
+    }
+
     private func requireBenchmarkEnabled() throws {
         guard ProcessInfo.processInfo.environment["SUBCFED_STORE_BENCH"] == "1" else {
             throw XCTSkip("set SUBCFED_STORE_BENCH=1 to run the store benchmark")
         }
     }
 
-    /// Twenty changes against a document that starts with 540 settled records.
+    /// Twenty changes against a store that starts with 540 settled records.
+    /// The SQLite store gets its records by importing the same seeded JSON
+    /// document on open, as a phone upgrading from the file store does.
     func testBenchmarkChangesAgainstA540RecordDocument() async throws {
         try requireBenchmarkEnabled()
-        let dir = try temporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: dir) }
-        try await seedSettledDocument(in: dir, records: 540)
-        let seededSize = try documentSize(in: dir)
+        for kind in Store.allCases {
+            let dir = try temporaryDirectory()
+            defer { try? FileManager.default.removeItem(at: dir) }
+            try await seedSettledDocument(in: dir, records: 540)
+            let seededSize = try documentSize(in: dir)
 
-        let store = FedAtomicFileStateStore(directoryURL: dir)
-        _ = try await store.open(localPublicKey: localKey)
-        let log = FedOriginEffectLog(store: store, responderStaticPublicKey: responder)
+            let store = try await open(kind, in: dir)
+            let log = FedOriginEffectLog(store: store, responderStaticPublicKey: responder)
 
-        let changes = 20
-        let flushesBefore = await store.durableFlushCount
-        let started = DispatchTime.now().uptimeNanoseconds
-        for _ in 0..<changes {
-            try await runOneChange(log: log)
+            let changes = 20
+            let countBefore = await durableCount(store)
+            let started = DispatchTime.now().uptimeNanoseconds
+            for _ in 0..<changes {
+                try await runOneChange(log: log)
+            }
+            let elapsed = DispatchTime.now().uptimeNanoseconds - started
+            let count = await durableCount(store) - countBefore
+
+            print(String(
+                format: "FED_STORE_BENCH store=%@ seeded=540 changes=%d %@_per_change=%.2f ms_per_change=%.2f size_before=%d size_after=%d",
+                kind.rawValue,
+                changes,
+                countLabel(kind),
+                Double(count) / Double(changes),
+                Double(elapsed) / Double(changes) / 1_000_000,
+                seededSize,
+                try storedSize(kind, in: dir)
+            ))
         }
-        let elapsed = DispatchTime.now().uptimeNanoseconds - started
-        let flushes = await store.durableFlushCount - flushesBefore
-
-        print(String(
-            format: "FED_STORE_BENCH seeded=540 changes=%d flushes_per_change=%.2f ms_per_change=%.2f size_before=%d size_after=%d",
-            changes,
-            Double(flushes) / Double(changes),
-            Double(elapsed) / Double(changes) / 1_000_000,
-            seededSize,
-            try documentSize(in: dir)
-        ))
     }
 
-    /// 540 changes from an empty store, reporting how large the document gets.
+    /// 540 changes from an empty store, reporting how large the state gets.
     func testBenchmarkDocumentSizeAfter540Changes() async throws {
         try requireBenchmarkEnabled()
-        let dir = try temporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: dir) }
-        let store = FedAtomicFileStateStore(directoryURL: dir)
-        _ = try await store.open(localPublicKey: localKey)
-        let log = FedOriginEffectLog(store: store, responderStaticPublicKey: responder)
+        for kind in Store.allCases {
+            let dir = try temporaryDirectory()
+            defer { try? FileManager.default.removeItem(at: dir) }
+            let store = try await open(kind, in: dir)
+            let log = FedOriginEffectLog(store: store, responderStaticPublicKey: responder)
 
-        let changes = 540
-        let flushesBefore = await store.durableFlushCount
-        let started = DispatchTime.now().uptimeNanoseconds
-        for _ in 0..<changes {
-            try await runOneChange(log: log)
+            let changes = 540
+            let countBefore = await durableCount(store)
+            let started = DispatchTime.now().uptimeNanoseconds
+            for _ in 0..<changes {
+                try await runOneChange(log: log)
+            }
+            let elapsed = DispatchTime.now().uptimeNanoseconds - started
+            let count = await durableCount(store) - countBefore
+            let records = try await store.destination(forResponderPublicKey: responder)?
+                .unresolvedEffects.count ?? 0
+
+            print(String(
+                format: "FED_STORE_BENCH store=%@ fresh changes=%d %@_per_change=%.2f ms_per_change=%.2f size_after=%d records_after=%d",
+                kind.rawValue,
+                changes,
+                countLabel(kind),
+                Double(count) / Double(changes),
+                Double(elapsed) / Double(changes) / 1_000_000,
+                try storedSize(kind, in: dir),
+                records
+            ))
         }
-        let elapsed = DispatchTime.now().uptimeNanoseconds - started
-        let flushes = await store.durableFlushCount - flushesBefore
-        let records = try await store.destination(forResponderPublicKey: responder)?
-            .unresolvedEffects.count ?? 0
-
-        print(String(
-            format: "FED_STORE_BENCH fresh changes=%d flushes_per_change=%.2f ms_per_change=%.2f size_after=%d records_after=%d",
-            changes,
-            Double(flushes) / Double(changes),
-            Double(elapsed) / Double(changes) / 1_000_000,
-            try documentSize(in: dir),
-            records
-        ))
     }
 
     // MARK: - Helpers
@@ -145,6 +164,42 @@ final class FedStoreFlushBenchmarkTests: XCTestCase {
             to: dir.appendingPathComponent(FedAtomicFileStateStore.documentFileName),
             options: .atomic
         )
+    }
+
+    private func open(_ kind: Store, in dir: URL) async throws -> any FedStateStore {
+        let store: any FedStateStore
+        switch kind {
+        case .file: store = FedAtomicFileStateStore(directoryURL: dir)
+        case .sqlite: store = FedSQLiteStateStore(directoryURL: dir)
+        }
+        _ = try await store.open(localPublicKey: localKey)
+        return store
+    }
+
+    /// Full flushes for the file store, committed write transactions for the
+    /// SQLite store (see the class comment).
+    private func durableCount(_ store: any FedStateStore) async -> Int {
+        if let file = store as? FedAtomicFileStateStore { return await file.durableFlushCount }
+        if let sqlite = store as? FedSQLiteStateStore { return await sqlite.durableCommitCount }
+        return 0
+    }
+
+    private func countLabel(_ kind: Store) -> String {
+        kind == .file ? "flushes" : "commits"
+    }
+
+    /// Bytes on disk: the JSON document, or the database plus its `-wal`.
+    private func storedSize(_ kind: Store, in dir: URL) throws -> Int {
+        switch kind {
+        case .file:
+            return try documentSize(in: dir)
+        case .sqlite:
+            let database = dir.appendingPathComponent(FedSQLiteStateStore.databaseFileName).path
+            return try [database, database + "-wal"].reduce(0) { total, path in
+                let attributes = try FileManager.default.attributesOfItem(atPath: path)
+                return total + ((attributes[.size] as? NSNumber)?.intValue ?? 0)
+            }
+        }
     }
 
     private func documentSize(in dir: URL) throws -> Int {

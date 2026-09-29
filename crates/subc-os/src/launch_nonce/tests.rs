@@ -201,16 +201,21 @@ mod unix_tests {
     #[test]
     fn a_descriptor_that_is_not_a_pipe_is_left_open() {
         let _serial = serial();
-        let file = File::open("/dev/null").unwrap();
-        let fd = file.as_raw_fd();
+        // Held as a raw number until the checks pass: had the accessor closed
+        // it, dropping an owner would close it twice and abort the test binary
+        // instead of failing this test by name.
+        let fd = File::open("/dev/null").unwrap().into_raw_fd();
         let cell = LaunchNonceCell::new();
         let got = cell.get(naming(format!("{fd}:1")));
-        assert_eq!(got, Err(LaunchNonceError::NotAPipe { fd }));
         assert!(
             fd_is_open(fd),
             "the accessor must not close a file it does not own"
         );
+        assert_eq!(got, Err(LaunchNonceError::NotAPipe { fd }));
         assert_eq!(cell.descriptor_reads(), 0);
+        // SAFETY: still open, and owned by this test.
+        #[allow(unsafe_code)]
+        drop(unsafe { OwnedFd::from_raw_fd(fd) });
     }
 
     #[test]
@@ -219,9 +224,14 @@ mod unix_tests {
         let (_ours, expected) = sealed_pipe(NONCE.as_bytes());
         let (theirs, found) = sealed_pipe(b"someone else's");
         assert_ne!(expected, found, "pipes need distinct inodes for this test");
-        let fd = theirs.as_raw_fd();
+        // Raw until checked, for the reason given in the non-pipe test.
+        let fd = theirs.into_raw_fd();
         let cell = LaunchNonceCell::new();
         let got = cell.get(naming(format!("{fd}:{expected}")));
+        assert!(fd_is_open(fd), "the accessor must not close another pipe");
+        // SAFETY: still open, and owned by this test.
+        #[allow(unsafe_code)]
+        let theirs = unsafe { OwnedFd::from_raw_fd(fd) };
         assert_eq!(
             got,
             Err(LaunchNonceError::WrongPipe {
@@ -240,12 +250,16 @@ mod unix_tests {
     fn an_empty_pipe_is_its_own_error_and_is_left_open() {
         let _serial = serial();
         let (empty, inode) = sealed_pipe(b"");
-        let fd = empty.as_raw_fd();
+        // Raw until checked, for the reason given in the non-pipe test.
+        let fd = empty.into_raw_fd();
         let cell = LaunchNonceCell::new();
         let got = cell.get(naming(format!("{fd}:{inode}")));
+        assert!(fd_is_open(fd), "an empty pipe is refused, not consumed");
         assert_eq!(got, Err(LaunchNonceError::Empty { fd }));
         assert_eq!(cell.descriptor_reads(), 0);
-        assert!(fd_is_open(fd), "an empty pipe is refused, not consumed");
+        // SAFETY: still open, and owned by this test.
+        #[allow(unsafe_code)]
+        drop(unsafe { OwnedFd::from_raw_fd(fd) });
     }
 
     #[test]

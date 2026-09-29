@@ -137,7 +137,11 @@ states how they nest inside section 2. Open slots:
 - llm-runner (BROCA): run admission, concurrent sessions, model request timeouts and retries.
 - Prefrontal (ALF): wake and effect dispatch, relay limits, `delegation_not_registered` wait.
 - AFT: tool call admission, bash and background task limits, drain behaviour.
-- Plexus (PLEX): vendor call rate limits and retry, stored approval execution window.
+- Plexus (PLEX): written in `plexus/docs/design/concurrency.md`, with each value's constant and
+  source. Note from it: on EOF plexus finishes its current sequential poll pass, measured at up
+  to 31 s in steady state and 99.6 s during a backfill, so it can outlast the 30 s drain and be
+  killed mid-pass. That is safe because each poll commits in one transaction; a kill only delays
+  wakes.
 - Cerebellum (CEREB): consent waits, takeover grants, input dispatch.
 - Callosum (CALLO): federation rate buckets (32/s, burst 32, 16 concurrent), ledger grace.
 - Magic Context (MC), Thalamus (THALAMUS), and any other module that admits work.

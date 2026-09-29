@@ -1,7 +1,8 @@
 # Scopes: owned identity records in the daemon
 
-Status: design r3. Nothing here is built. r3 answers an Athena review of r2 (five seats, a
-unanimous "do not implement as written"); section 10 lists what changed and why. The
+Status: design r4. Nothing here is built. r3 answered an Athena review of r2 (five seats, a
+unanimous "do not implement as written"); r4 adds the room's review of r3. Section 10 lists
+what changed and why. The
 extensibility design (magic-context `.cortexkit/alfonso/plans/ck-extensibility-r6-7-amendments.md`,
 section K2) relies on sections 2 to 6.
 
@@ -64,7 +65,13 @@ owner and evicted oldest first; that bound never refuses.
 
 ## 3. Registering: `scope.sync`
 
-An owner sends its full set: `scope.sync {generation, scopes: [...]}`.
+An owner sends its full set: `scope.sync {generation, scopes: [...]}`. Once it has done that
+on its current authority connection, it may send changes instead:
+`scope.patch {generation, upsert: [...], remove: [...]}`. A patch changes only the named refs,
+applies every per-record check a full sync applies, and follows the same generation rule. The
+first sync after taking authority must be a full `scope.sync`; a patch before it is refused
+`scope_patch_before_sync`. An owner with a large set (the Thalamus gateway owns every Claude Code
+subagent scope on the machine) can then register one new scope without re-sending thousands.
 
 **One sync authority per owner.** Each owner has exactly one connection whose syncs are
 accepted: its authority. The first connection of an owner to sync becomes the authority. A
@@ -104,9 +111,20 @@ restart, is never locked out, and a stale connection can never overwrite a newer
 
 ## 4. Opening a route under a scope
 
-`route.open` gains `scope: {owner, ref}`. The daemon admits it only when the opener is the
-owner or a listed carrier, and refuses otherwise (`scope_not_live`, `scope_not_carrier`). There
-is no relay class: a module that must present a scope onward is listed as a carrier. A carrier
+`route.open` gains `scope: {owner, ref, scope_epoch?}`. A carrier that froze an epoch (a runner's
+session, a background task) always sends it, so a later lazy open can never be admitted against
+a newer session that reused the ref. An owner opening for its current session may omit it. The
+daemon admits the open only when the opener is the owner or a listed carrier, and otherwise
+refuses by name:
+- `scope_not_synced`: the owner has not synced since this incarnation started and is configured.
+  Retryable: after a daemon restart a carrier's open can arrive before the owner re-syncs, and
+  the carrier waits within its own bound.
+- `scope_not_live`: the owner has synced and the ref is not in its set, or the owner is not a
+  configured module. Terminal.
+- `scope_ended`: the named `scope_epoch` does not match the live record. Terminal.
+- `scope_not_carrier`: the opener is neither the owner nor a listed carrier. Terminal.
+
+There is no relay class: a module that must present a scope onward is listed as a carrier. A carrier
 route lives until the carrier closes it or the scope ends or changes as in section 3.
 
 On admission the daemon captures `(scope_epoch, version)` into the pending bind and stamps the
@@ -204,7 +222,8 @@ Readers first, then writers:
    route, which the provider's refusal makes fail closed.
 2. The daemon ships `scope.sync`, `scope.describe`, `scope.subscribe`, the stamp and
    `scope_authority_owners`, advertised in `server.describe` as capability `scopes/v1`, and
-   `scope_changed` joins subc-protocol's retryable `route.open` set in the same release. An older
+   `scope_changed` and `scope_not_synced` join subc-protocol's retryable `route.open` set in the
+   same release. An older
    SDK treats it as terminal, which is safe.
 3. Owners and carriers use scopes only when the capability is advertised. A carrier that cannot
    open a scoped route fails the call (`scope_unsupported`) instead of opening an unscoped one.
@@ -213,6 +232,11 @@ Readers first, then writers:
 
 Each fails by name when its rule is removed:
 - only the owner or a listed carrier is admitted; `direct` can neither sync nor own;
+- an open naming a `scope_epoch` other than the live one is refused `scope_ended`; an open before
+  the owner's first sync of this incarnation is refused `scope_not_synced` (retryable), and after
+  it, for a ref not in the set, `scope_not_live`;
+- a patch changes only its named refs, is refused before a full sync, and obeys the same
+  generation and per-record checks;
 - the same ref under two owners is two scopes;
 - a gated attribute from an owner not in `scope_authority_owners` is refused;
 - a scope ended, or changed, between admission and commit refuses the open, the module's other
@@ -253,3 +277,10 @@ From the Athena review of r2 (five seats):
    approvals and, unlike a daemon counter, survives restarts; `subscribe` reports owner sync, so a reader knows when a missing
    scope means ended.
 9. The tombstone bound evicts and never refuses; r2 read both ways.
+
+From the room's review of r3:
+10. `route.open` can name the `scope_epoch`, so a carrier's lazy open can't be admitted into a
+    newer session under a reused ref.
+11. `scope_not_synced` (retryable) is split from `scope_not_live` (terminal), so a carrier's opens
+    during the post-restart re-sync window wait instead of failing.
+12. `scope.patch` lets a large owner register or remove one scope without re-sending its set.

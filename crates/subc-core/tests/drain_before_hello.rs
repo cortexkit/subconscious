@@ -92,6 +92,7 @@ impl Harness {
         );
         self.supervisor
             .spawn(ModuleSpec {
+                launch_nonce_env: true,
                 module_id: module_id.to_string(),
                 program: PathBuf::from(env!("CARGO_BIN_EXE_fake-aft-stub")),
                 args: Vec::new(),

@@ -1518,6 +1518,7 @@ mod tests {
         );
         let capture = temp.join("logs").join(format!("{module_id}.stderr.log"));
         let module = ConfiguredModule {
+            launch_nonce_env: true,
             module_id,
             program: PathBuf::from("sh"),
             args: vec!["-c".to_string(), "sleep 30".to_string()],

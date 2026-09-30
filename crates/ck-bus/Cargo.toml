@@ -41,8 +41,8 @@ sha2 = "0.10"
 subc-test-support = { path = "../subc-test-support" }
 tempfile = "3"
 tokio = { version = "1", features = ["io-util", "net"] }
-subc-control = { path = "../subc-control", version = "0.24" }
-subc-daemon = { path = "../subc-daemon", version = "0.25.0", features = ["test-support"] }
+subc-control = { path = "../subc-control", version = "0.25" }
+subc-daemon = { path = "../subc-daemon", version = "0.26.0", features = ["test-support"] }
 subc-jsonc = { path = "../subc-jsonc", version = "0.1.0" }
 subc-transport = { path = "../subc-transport", version = "0.8.0" }
 tracing = "0.1"

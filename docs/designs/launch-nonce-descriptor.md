@@ -200,6 +200,22 @@ every wire module from step 2, so a module's own children inherit the variable:
 
 Readers first; the boundary exists only after the last step.
 
+Owners can rehearse withholding the environment copy one module at a time by setting
+`"launch_nonce_env": false` in that module's `subc.jsonc` entry. The default is `true`;
+there is no global default switch. On Unix the pipe and `SUBC_LAUNCH_NONCE_FD` remain,
+including for swap candidates, while `SUBC_LAUNCH_NONCE` is absent even if inherited or
+configured in `env`. Modules with `protocol: "none"` receive neither nonce variable.
+On Windows there is no pipe handover, so the environment copy stays enabled and config
+load warns that `false` is ignored.
+
+The setting applies at the next spawn. `ck module rescan` compares it as part of the
+module's launch spec and reports the module as pending reload, just like other changed
+spawn-environment fields; it does not restart the current process. Restart or swap the
+module to exercise the new policy, and set the key back to `true` to restore the copy
+on a later spawn. `ck module status <id>` reports `launch_nonce_env` as the effective
+policy for the next spawn (always `false` for `protocol: "none"`, always `true` for wire
+modules on Windows), not a measurement of the already-running process's environment.
+
 **Roster.** The census covers every process the daemon spawns, read from the daemon's own spawn
 list (`subc.jsonc` and the live supervisor), never from a list written here. That includes
 ck-subc-mcp, ck-bus, condition-runner, Engram, Entorhinal, Claustrum and Cerebellum, and ck-subc

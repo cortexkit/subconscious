@@ -31,4 +31,4 @@ sha2 = "0.10"
 [dev-dependencies]
 subc-test-support = { path = "../subc-test-support" }
 rmcp = { version = "1.7", default-features = false, features = ["client", "transport-async-rw"] }
-subc-daemon = { path = "../subc-daemon", version = "0.25.0" }
+subc-daemon = { path = "../subc-daemon", version = "0.26.0" }

@@ -116,6 +116,7 @@ fn control_wire_shapes_match_golden_json_and_round_trip() {
         &verdicts
             .into_iter()
             .map(|verdict| SupervisorEntry {
+                launch_nonce_env: None,
                 pending_reload: Some(verdict),
                 ..supervisor_entry()
             })
@@ -160,6 +161,7 @@ fn control_wire_shapes_match_golden_json_and_round_trip() {
         ]
         .into_iter()
         .map(|resources| SupervisorEntry {
+            launch_nonce_env: None,
             resources: Some(resources),
             ..supervisor_entry()
         })
@@ -985,6 +987,7 @@ fn spawn_cursor(seq: u64) -> SpawnCursor {
 
 fn supervisor_entry() -> SupervisorEntry {
     SupervisorEntry {
+        launch_nonce_env: None,
         module_id: "aft-tools".to_string(),
         state: "running".to_string(),
         enabled: true,
@@ -1047,6 +1050,7 @@ fn reload_path_unknown_variant_and_reason_preserve_forward_wire() {
 /// recovered module as a nearly-dead one.
 fn supervisor_entry_with_restart_window() -> SupervisorEntry {
     SupervisorEntry {
+        launch_nonce_env: None,
         restart_window_secs: Some(600),
         // Deliberately unlike the built-in 30_000/100/30_000 policy so this
         // golden cannot be satisfied by reporting defaults instead of the
@@ -1143,6 +1147,7 @@ fn supervisor_entry_carries_the_declared_protocol_verbatim() {
     assert_eq!(subc["protocol"], "subc");
 
     let none_entry = SupervisorEntry {
+        launch_nonce_env: None,
         protocol: ModuleProtocol::None,
         ..supervisor_entry()
     };
@@ -1189,6 +1194,7 @@ fn supervisor_entry_without_resources_decodes_as_absent_not_zero() {
     assert_eq!(decoded.resources, None);
 
     let unavailable = SupervisorEntry {
+        launch_nonce_env: None,
         resources: Some(ChildResourceUsage::Unavailable {
             reason: ChildResourceUnavailableReason::Unreadable,
         }),

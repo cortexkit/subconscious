@@ -256,6 +256,8 @@ pub struct ConfiguredModule {
     /// the credential vault) from being impersonated by another key-holder while the
     /// real process is down or restarting. Defaults to false.
     pub reserved: bool,
+    /// Whether to include SUBC_LAUNCH_NONCE for readers that still use the environment.
+    pub launch_nonce_env: bool,
     /// Namespace prefixes owned by this reserved, supervised module. A HELLO for a
     /// module id under one of these prefixes must echo this owner module's current
     /// spawn nonce.
@@ -329,6 +331,7 @@ impl ConfiguredModule {
             args: self.args.clone(),
             env,
             reserved: self.reserved,
+            launch_nonce_env: self.launch_nonce_env,
             reserved_prefixes: self.reserved_prefixes.clone(),
             protocol: self.protocol,
             overlap: self.overlap,
@@ -396,6 +399,10 @@ enum RawStorageConfig {
     },
 }
 
+fn default_launch_nonce_env() -> serde_json::Value {
+    serde_json::Value::Bool(true)
+}
+
 #[derive(Debug, Deserialize)]
 struct RawModuleConfig {
     program: PathBuf,
@@ -409,6 +416,8 @@ struct RawModuleConfig {
     enabled: bool,
     #[serde(default)]
     reserved: bool,
+    #[serde(default = "default_launch_nonce_env")]
+    launch_nonce_env: serde_json::Value,
     #[serde(default)]
     reserved_prefixes: Vec<String>,
     /// Read as a raw string rather than a serde enum so an unusable value is
@@ -767,6 +776,17 @@ fn parse_doc(doc: &str, path: &Path) -> Result<DaemonConfig, DaemonConfigError> 
                 Some(value) => Some(value),
                 None => default_route_bind_relay_timeout_ms,
             };
+            let launch_nonce_env = match module.launch_nonce_env {
+                serde_json::Value::Bool(value) => value,
+                _ => return Err(DaemonConfigError::InvalidValue {
+                    path: path.to_path_buf(),
+                    message: format!("module '{}' launch_nonce_env must be a boolean", module_id.escape_debug()),
+                }),
+            };
+            #[cfg(not(unix))]
+            if !launch_nonce_env {
+                eprintln!("module '{}': launch_nonce_env is ignored because this platform has no nonce pipe handover", module_id.escape_debug());
+            }
             let protocol = parse_module_protocol(module.protocol.as_deref(), path, &module_id)?;
             let overlap = parse_module_overlap(module.overlap.as_deref(), path, &module_id)?;
             // The spawn role is set by the supervisor on a swap candidate and
@@ -812,6 +832,7 @@ fn parse_doc(doc: &str, path: &Path) -> Result<DaemonConfig, DaemonConfigError> 
                 log,
                 enabled: module.enabled,
                 reserved: module.reserved,
+                launch_nonce_env,
                 reserved_prefixes: module.reserved_prefixes,
                 protocol,
                 overlap,
@@ -2267,11 +2288,43 @@ mod tests {
         assert!(error.to_string().contains("reserved_capabilities key"));
     }
 
-    /// The three accepted shapes, and the one that matters is that two of them
-    /// are THE SAME ANSWER. A config written before this key existed and a
-    /// config that spells out `"subc"` must produce an identical module, or the
-    /// key would have quietly introduced a third state for every module in every
-    /// deployed config file.
+    #[test]
+    fn launch_nonce_env_accepts_booleans_and_defaults_to_true() {
+        let parse = |field: &str| {
+            parse_doc(
+                &format!(r#"{{"version":1,"modules":{{"probe":{{"program":"probe"{field}}}}}}}"#),
+                Path::new("subc.jsonc"),
+            )
+            .unwrap()
+            .modules
+            .remove(0)
+            .module_spec()
+        };
+        assert!(parse("").launch_nonce_env);
+        assert!(parse(",\"launch_nonce_env\":true").launch_nonce_env);
+        assert!(!parse(",\"launch_nonce_env\":false").launch_nonce_env);
+        assert_ne!(
+            parse(""),
+            parse(",\"launch_nonce_env\":false"),
+            "rescan compares ModuleSpec to report restart-needed changes"
+        );
+    }
+
+    #[test]
+    fn launch_nonce_env_refuses_non_boolean_by_name() {
+        for value in ["null", "0", "\"false\"", "[]", "{}"] {
+            let error = parse_doc(&format!(r#"{{"version":1,"modules":{{"probe":{{"program":"probe","launch_nonce_env":{value}}}}}}}"#), Path::new("subc.jsonc")).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("module 'probe' launch_nonce_env must be a boolean"),
+                "{error}"
+            );
+        }
+    }
+
+    /// An old config and an explicit `subc` declaration must normalize identically
+    /// so adding the protocol key does not silently change existing modules.
     #[test]
     fn an_absent_protocol_key_and_an_explicit_subc_are_the_same_module() {
         let parse = |module_body: &str| {

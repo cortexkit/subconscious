@@ -1552,6 +1552,7 @@ mod tests {
         let module = supervisor
             .supervise_configured(
                 ModuleSpec {
+                    launch_nonce_env: true,
                     module_id: "held-module".to_string(),
                     program: "test-module".into(),
                     args: Vec::new(),

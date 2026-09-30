@@ -323,6 +323,8 @@ pub struct ModuleSpec {
     /// process can register this module_id (a security-boundary module like the
     /// credential vault must not be impersonable while it is down/restarting).
     pub reserved: bool,
+    /// Include SUBC_LAUNCH_NONCE for older readers; Unix can pass the nonce only by pipe.
+    pub launch_nonce_env: bool,
     /// Module-id prefixes this supervised module owns for reserved HELLO checks.
     /// Prefixes come from daemon config and must end in `:` before they reach the
     /// supervisor; the owner module's current spawn nonce authorizes claims under
@@ -4257,6 +4259,7 @@ mod tests {
         assert!(handle.removal_tombstone_age_ms(module_id).is_some());
 
         handle.apply_identity_configuration(&ModuleSpec {
+            launch_nonce_env: true,
             module_id: module_id.to_string(),
             program: PathBuf::from("/test/module"),
             args: Vec::new(),
@@ -4306,6 +4309,7 @@ mod tests {
         let snapshot = stale_process_snapshot(ModuleState::Disabled, false);
         let mut child = None;
         let spec = ModuleSpec {
+            launch_nonce_env: true,
             module_id: "failed-enable-clears-facts".to_string(),
             program: PathBuf::from("/definitely/missing/failed-enable-module"),
             args: Vec::new(),
@@ -4340,6 +4344,7 @@ mod tests {
         let snapshot = stale_process_snapshot(ModuleState::Running, true);
         let mut child = None;
         let spec = ModuleSpec {
+            launch_nonce_env: true,
             module_id: "failed-reload-clears-facts".to_string(),
             program: PathBuf::from("/unused/failed-reload-module"),
             args: Vec::new(),
@@ -4371,6 +4376,7 @@ mod tests {
         let snapshot = stale_process_snapshot(ModuleState::Running, true);
         let module = supervisor.supervised_module(
             ModuleSpec {
+                launch_nonce_env: true,
                 module_id: "drop-clears-facts".to_string(),
                 program: PathBuf::from("/unused/drop-module"),
                 args: Vec::new(),
@@ -4407,6 +4413,7 @@ mod tests {
         let supervisor = Supervisor::default();
         let snapshot = stale_process_snapshot(ModuleState::Running, true);
         let initial = ModuleSpec {
+            launch_nonce_env: true,
             module_id: "rescan-preserves-spawn-facts".to_string(),
             program: PathBuf::from("/spawned/module"),
             args: Vec::new(),
@@ -5681,8 +5688,8 @@ type NonceHandoff = std::convert::Infallible;
 /// returned rather than installed here, because installing it replaces
 /// whatever the child has at descriptor 3 and so must be the last pre-exec
 /// step, after the Linux cgroup placement that the caller registers later.
-/// The environment copy `SUBC_LAUNCH_NONCE` is still set as well, for modules
-/// that have not moved to the descriptor yet.
+/// The environment copy `SUBC_LAUNCH_NONCE` is also set by default for older
+/// readers. A module can withhold it on Unix with `launch_nonce_env: false`.
 fn apply_wire_spawn_args_for_role(
     command: &mut Command,
     spec: &ModuleSpec,
@@ -5696,6 +5703,8 @@ fn apply_wire_spawn_args_for_role(
     // and passing it on would point the child at a descriptor it does not
     // have.
     command.env_remove(subc_os::LAUNCH_NONCE_FD_ENV);
+    // Remove inherited or configured copies too: withholding must mean absent.
+    command.env_remove(SUBC_LAUNCH_NONCE_ENV);
     if spec.protocol == ModuleProtocol::None {
         return Ok(None);
     }
@@ -5731,7 +5740,9 @@ fn apply_wire_spawn_args_for_role(
     };
     #[cfg(not(unix))]
     let handoff = None;
-    command.env(SUBC_LAUNCH_NONCE_ENV, nonce);
+    if !cfg!(unix) || spec.launch_nonce_env {
+        command.env(SUBC_LAUNCH_NONCE_ENV, nonce);
+    }
     Ok(handoff)
 }
 
@@ -7814,6 +7825,7 @@ mod terminal_history_tests {
         // holder and refuses all comers.
         let supervisor = SupervisorHandle::default();
         supervisor.apply_identity_configuration(&ModuleSpec {
+            launch_nonce_env: true,
             module_id: "never-spawned".to_string(),
             program: PathBuf::from("/usr/bin/false"),
             args: Vec::new(),
@@ -7838,6 +7850,7 @@ mod terminal_history_tests {
         // And a real spawn nonce minted later admits exactly that nonce.
         supervisor.set_spawn_nonce("never-spawned", "minted".to_string());
         supervisor.apply_identity_configuration(&ModuleSpec {
+            launch_nonce_env: true,
             module_id: "never-spawned".to_string(),
             program: PathBuf::from("/usr/bin/false"),
             args: Vec::new(),
@@ -8015,6 +8028,7 @@ mod terminal_history_tests {
             Supervisor::new(Arc::clone(&registry), RestartPolicy::new(3, Duration::ZERO));
         let module = supervisor
             .spawn(ModuleSpec {
+                launch_nonce_env: true,
                 module_id: "recovery-snapshot".to_string(),
                 program: fake_aft_stub_path(),
                 args: Vec::new(),
@@ -8044,6 +8058,7 @@ mod terminal_history_tests {
         let supervisor = Supervisor::new(Arc::new(Registry::default()), RestartPolicy::default())
             .with_cgroup_placement(None);
         let result = supervisor.spawn(ModuleSpec {
+            launch_nonce_env: true,
             module_id: "no-cgroup-placement".to_string(),
             program: fake_aft_stub_path(),
             args: Vec::new(),
@@ -8130,6 +8145,7 @@ mod terminal_history_tests {
             Supervisor::new(Arc::clone(&registry), RestartPolicy::new(1, Duration::ZERO));
         let module = supervisor
             .spawn(ModuleSpec {
+                launch_nonce_env: true,
                 module_id: "terminal-history".to_string(),
                 program: fake_aft_stub_path(),
                 args: Vec::new(),
@@ -8178,6 +8194,7 @@ mod terminal_history_tests {
         );
         let module = supervisor
             .spawn(ModuleSpec {
+                launch_nonce_env: true,
                 module_id: "disable-during-backoff".to_string(),
                 program: fake_aft_stub_path(),
                 args: Vec::new(),
@@ -8232,6 +8249,7 @@ mod terminal_history_tests {
         let ready = dir.join("ready");
         let marker = dir.join("sigterm");
         let spec = ModuleSpec {
+            launch_nonce_env: true,
             module_id: module_id.to_string(),
             program: fake_aft_stub_path(),
             args: Vec::new(),
@@ -8338,6 +8356,7 @@ mod terminal_history_tests {
         );
         let module = supervisor
             .spawn(ModuleSpec {
+                launch_nonce_env: true,
                 module_id: "none-clean-exit-budget".to_string(),
                 program: fake_aft_stub_path(),
                 args: Vec::new(),
@@ -8447,6 +8466,7 @@ mod terminal_history_tests {
         );
         let module = supervisor
             .spawn(ModuleSpec {
+                launch_nonce_env: true,
                 module_id: "wire-clean-exit".to_string(),
                 program: fake_aft_stub_path(),
                 args: Vec::new(),
@@ -8485,6 +8505,7 @@ mod terminal_history_tests {
         );
         let runtime = supervisor.runtime_config();
         let spec = ModuleSpec {
+            launch_nonce_env: true,
             module_id: "lifetime-increment-path".to_string(),
             program: PathBuf::from("/unused/lifetime-increment-path"),
             args: Vec::new(),
@@ -8576,6 +8597,7 @@ mod terminal_history_tests {
         );
         let runtime = supervisor.runtime_config();
         let spec = ModuleSpec {
+            launch_nonce_env: true,
             module_id: "deliberately-severed".to_string(),
             program: PathBuf::from("/unused/deliberately-severed"),
             args: Vec::new(),
@@ -8630,6 +8652,7 @@ mod terminal_history_tests {
         );
         let runtime = supervisor.runtime_config();
         let spec = ModuleSpec {
+            launch_nonce_env: true,
             module_id: "genuine-crash".to_string(),
             program: PathBuf::from("/unused/genuine-crash"),
             args: Vec::new(),
@@ -8676,6 +8699,7 @@ mod terminal_history_tests {
 
     fn windowed_crash_spec(module_id: &str) -> ModuleSpec {
         ModuleSpec {
+            launch_nonce_env: true,
             module_id: module_id.to_string(),
             program: PathBuf::from("/unused").join(module_id),
             args: Vec::new(),
@@ -8947,6 +8971,7 @@ mod terminal_history_tests {
         let runtime = supervisor.runtime_config();
         let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
         let spec = ModuleSpec {
+            launch_nonce_env: true,
             module_id: "drain-deliberate-severance".to_string(),
             program: fake_aft_stub_path(),
             args: Vec::new(),
@@ -9012,6 +9037,7 @@ mod terminal_history_tests {
         let runtime = supervisor.runtime_config();
         let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
         let spec = ModuleSpec {
+            launch_nonce_env: true,
             module_id: "ordinary-drain".to_string(),
             program: fake_aft_stub_path(),
             args: Vec::new(),
@@ -9235,6 +9261,7 @@ mod health_tombstone_tests {
             .with_handle(supervisor_handle.clone())
             .with_health_config(health);
         let spec = ModuleSpec {
+            launch_nonce_env: true,
             module_id: "late-health-module".to_string(),
             program: PathBuf::from("disabled-module"),
             args: Vec::new(),
@@ -9412,6 +9439,7 @@ mod child_env_tests {
 
     fn spec(env: Vec<(String, String)>) -> ModuleSpec {
         ModuleSpec {
+            launch_nonce_env: true,
             module_id: "env-plan".to_string(),
             program: PathBuf::from("/nonexistent"),
             args: Vec::new(),
@@ -9760,6 +9788,7 @@ mod cgroup_placement_tests {
         let error = apply_cgroup_placement(
             &mut command,
             &ModuleSpec {
+                launch_nonce_env: true,
                 module_id: "broken-cgroup".to_string(),
                 program: PathBuf::from("true"),
                 args: Vec::new(),
@@ -10330,6 +10359,7 @@ mod job_containment_tests {
         let runtime = supervisor.runtime_config();
         let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
         let spec = ModuleSpec {
+            launch_nonce_env: true,
             module_id: module_id.to_string(),
             program: stub_path(),
             // Zero args deliberately: a `--subc` argument would make the stub dial
@@ -10499,12 +10529,11 @@ mod job_containment_tests {
 }
 
 /// The daemon's real spawn path hands a subc-wire child its launch nonce on
-/// descriptor 3, as well as in the environment. The child here is a shell that
-/// copies what it finds at descriptor 3 into a file, so the test sees exactly
-/// what arrived through exec.
+/// descriptor 3, with an optional environment copy. The shell records the nonce
+/// and its environment after exec so these tests observe the real handover.
 #[cfg(all(test, unix))]
 mod launch_nonce_descriptor_tests {
-    use super::{spawn_child, ChildRoster, ModuleProtocol, ModuleSpec, SupervisorHandle};
+    use super::{ChildRoster, ModuleProtocol, ModuleSpec, SupervisorHandle};
     use crate::stderr_tail::{StderrRing, StderrTailConfig};
     use std::{
         path::PathBuf,
@@ -10513,20 +10542,17 @@ mod launch_nonce_descriptor_tests {
     };
     use subc_test_support::TestTempDir;
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_spawned_module_receives_its_nonce_on_descriptor_3_and_in_the_environment() {
+    async fn probe(launch_nonce_env: bool, role: super::SpawnRole) {
         let scratch = TestTempDir::new("launch-nonce-descriptor");
         let fd_copy = scratch.join("from-descriptor");
-        let env_copy = scratch.join("from-environment");
+        let env_copy = scratch.join("environment");
         let script = format!(
-            "cat <&3 > '{fd}.tmp' && mv '{fd}.tmp' '{fd}'; \
-             printf %s \"$SUBC_LAUNCH_NONCE\" > '{env}.tmp' && mv '{env}.tmp' '{env}'; \
-             sleep 30",
-            fd = fd_copy.display(),
-            env = env_copy.display(),
+            "env > '{env}.tmp' && mv '{env}.tmp' '{env}'; cat <&3 > '{fd}.tmp' && mv '{fd}.tmp' '{fd}'; sleep 30",
+            fd = fd_copy.display(), env = env_copy.display(),
         );
         let xdg = |name: &str| (name.to_string(), scratch.join(name).display().to_string());
         let spec = ModuleSpec {
+            launch_nonce_env,
             module_id: "nonce-descriptor-probe".to_string(),
             program: PathBuf::from("/bin/sh"),
             args: vec!["-c".to_string(), script],
@@ -10534,6 +10560,7 @@ mod launch_nonce_descriptor_tests {
                 xdg("XDG_DATA_HOME"),
                 xdg("XDG_RUNTIME_DIR"),
                 xdg("XDG_CONFIG_HOME"),
+                ("SUBC_LAUNCH_NONCE".to_string(), "must-not-leak".to_string()),
             ],
             reserved: true,
             reserved_prefixes: Vec::new(),
@@ -10543,7 +10570,7 @@ mod launch_nonce_descriptor_tests {
         let handle = SupervisorHandle::new();
         let ring = Arc::new(Mutex::new(StderrRing::new(StderrTailConfig::default())));
         let roster = ChildRoster::default();
-        let child = spawn_child(
+        let child = super::spawn_child_in_slot(
             &spec,
             None,
             Some(&handle),
@@ -10552,30 +10579,50 @@ mod launch_nonce_descriptor_tests {
             &roster,
             #[cfg(target_os = "linux")]
             None,
+            role,
+            matches!(role, super::SpawnRole::SwapCandidate),
         )
-        .expect("spawn the probe");
-        let expected = handle
-            .spawn_nonce("nonce-descriptor-probe")
-            .expect("a recorded spawn nonce");
-
+        .expect("spawn probe");
         let deadline = Instant::now() + Duration::from_secs(10);
         while !(fd_copy.exists() && env_copy.exists()) {
-            assert!(
-                Instant::now() < deadline,
-                "the probe never wrote its copies"
-            );
+            assert!(Instant::now() < deadline, "probe never wrote its copies");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+        let nonce = std::fs::read_to_string(fd_copy).unwrap();
+        assert!(!nonce.is_empty());
+        let environment = std::fs::read_to_string(env_copy).unwrap();
+        assert!(environment
+            .lines()
+            .any(|line| line.starts_with("SUBC_LAUNCH_NONCE_FD=3:")));
+        let copy = environment
+            .lines()
+            .find_map(|line| line.strip_prefix("SUBC_LAUNCH_NONCE="));
         assert_eq!(
-            std::fs::read_to_string(&fd_copy).unwrap(),
-            expected,
-            "descriptor 3 must hold the spawn nonce"
+            copy,
+            launch_nonce_env.then_some(nonce.as_str()),
+            "child environment must follow launch_nonce_env"
         );
-        assert_eq!(
-            std::fs::read_to_string(&env_copy).unwrap(),
-            expected,
-            "the environment copy is still set during the rollout"
-        );
+        if matches!(role, super::SpawnRole::Plain) {
+            assert_eq!(
+                handle.spawn_nonce(&spec.module_id).as_deref(),
+                Some(nonce.as_str())
+            );
+        }
         drop(child);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_spawned_module_receives_its_nonce_on_descriptor_3_and_in_the_environment() {
+        probe(true, super::SpawnRole::Plain).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn launch_nonce_env_false_withholds_environment_from_real_child() {
+        probe(false, super::SpawnRole::Plain).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn launch_nonce_env_false_withholds_environment_from_swap_candidate() {
+        probe(false, super::SpawnRole::SwapCandidate).await;
     }
 }

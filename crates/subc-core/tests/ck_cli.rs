@@ -2211,7 +2211,38 @@ async fn module_status_names_the_protocol_and_refuses_to_render_live_as_a_boolea
     ));
     assert_eq!(status_json["module"]["protocol"], "none");
     assert_eq!(status_json["module"]["live"], true);
+    assert_eq!(status_json["module"]["launch_nonce_env"], false);
 
+    module.stop().await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn module_status_reports_launch_nonce_env_false() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor(&server);
+    let module_id = "nonce-policy-status";
+    let mut spec = stub_spec(module_id);
+    spec.launch_nonce_env = false;
+    for name in ["XDG_DATA_HOME", "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME"] {
+        spec.env.push((
+            name.to_string(),
+            server.temp_dir.join(name).display().to_string(),
+        ));
+    }
+    let module = supervisor.spawn(spec).unwrap();
+    wait_for_supervisor_entry(&server.connection_file_path, module_id, |entry| entry.live).await;
+    let output = ck_with_subc(
+        &server.connection_file_path,
+        ["module", "status", module_id],
+    );
+    assert_exit(&output, 0);
+    assert!(text(&output.stdout).contains("\n  launch_nonce_env: false\n"));
+    let status = assert_json_success(ck_with_subc(
+        &server.connection_file_path,
+        ["module", "status", module_id, "--json"],
+    ));
+    assert_eq!(status["module"]["launch_nonce_env"], false);
     module.stop().await.unwrap();
 }
 
@@ -2314,7 +2345,7 @@ async fn module_status_renders_key_value_block_byte_for_byte() {
     assert_eq!(
         rest,
         format!(
-            "0 of 1 in 10m · drain 25 ms · restart backoff 10 ms to 30s\n  last exit: none\n  drain gauges: 0 drains with undeclared gauge\n  binary: {binary} ({image})\n  configured program: matches running process\n  running image: {image_verdict}\nmetrics: run `ck health aft`\n"
+            "0 of 1 in 10m · drain 25 ms · restart backoff 10 ms to 30s\n  launch_nonce_env: true\n  last exit: none\n  drain gauges: 0 drains with undeclared gauge\n  binary: {binary} ({image})\n  configured program: matches running process\n  running image: {image_verdict}\nmetrics: run `ck health aft`\n"
         )
     );
 
@@ -3283,6 +3314,7 @@ fn stub_spec(module_id: &str) -> ModuleSpec {
 
 fn stub_spec_with_env(module_id: &str, env: Vec<(&str, &str)>) -> ModuleSpec {
     ModuleSpec {
+        launch_nonce_env: true,
         module_id: module_id.to_string(),
         program: PathBuf::from(env!("CARGO_BIN_EXE_fake-aft-stub")),
         args: Vec::new(),
@@ -3382,6 +3414,7 @@ async fn wait_for_stub_request(path: &Path, channel: u16, corr: u64) {
 
 fn scripted_supervisor_entry(module_id: &str, drain_timeout_ms: Option<u64>) -> SupervisorEntry {
     SupervisorEntry {
+        launch_nonce_env: None,
         module_id: module_id.to_string(),
         state: "running".to_string(),
         enabled: true,
@@ -3464,6 +3497,7 @@ async fn spawn_quota_stub(
     let fixture_json = serde_json::to_string(fixture).unwrap();
     let module = supervisor
         .spawn(ModuleSpec {
+            launch_nonce_env: true,
             module_id: module_id.to_string(),
             program: PathBuf::from(env!("CARGO_BIN_EXE_fake-aft-stub")),
             args: Vec::new(),

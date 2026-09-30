@@ -6246,6 +6246,9 @@ fn print_status_table(
     if declares_no_protocol(module) {
         println!("  protocol: none");
     }
+    if let Some(value) = module.get("launch_nonce_env").and_then(Value::as_bool) {
+        println!("  launch_nonce_env: {value}");
+    }
     println!("  resources: {}", format_child_resources(module));
     println!("  last exit: {}", format_last_exit(module));
     println!(

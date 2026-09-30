@@ -399,6 +399,7 @@ async fn declared_not_ready_and_supervised_absence_are_observably_distinct() {
     let absent_ready = server.temp_dir.join("supervised-absent-ready");
     let absent = supervisor
         .spawn(ModuleSpec {
+            launch_nonce_env: true,
             module_id: absent_id.to_string(),
             program: PathBuf::from(env!("CARGO_BIN_EXE_fake-aft-stub")),
             args: Vec::new(),
@@ -1310,6 +1311,7 @@ async fn spawn_ready_stub(
     }
     let module = supervisor
         .spawn(ModuleSpec {
+            launch_nonce_env: true,
             module_id: module_id.to_string(),
             program: PathBuf::from(env!("CARGO_BIN_EXE_fake-aft-stub")),
             args: Vec::new(),

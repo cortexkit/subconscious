@@ -2023,3 +2023,38 @@ async fn a_renewal_across_an_in_flight_pull_acks_nothing_twice_and_loses_nothing
     passed();
     plane.finish(vec![renewing.participant]).await;
 }
+
+/// The operator-data guard compares everything a test could wrongly write, but
+/// not the files the operator's running ckbus rewrites in place while serving,
+/// which change whenever any module restarts during a run.
+#[test]
+fn the_operator_data_guard_ignores_live_rewrites_and_catches_anything_else() {
+    let root = TestTempDir::new("ckbus-fingerprint");
+    let dir = root.path();
+    std::fs::write(dir.join("account.json"), b"{\"account\":1}").unwrap();
+    std::fs::write(dir.join("spawn_cursor.json"), b"{\"seq\":1}").unwrap();
+    let before = harness::data_home::fingerprint(Some(dir));
+
+    std::fs::write(dir.join("spawn_cursor.json"), b"{\"seq\":2}").unwrap();
+    std::fs::write(dir.join("sentinel_verdict.json"), b"{}").unwrap();
+    std::fs::remove_file(dir.join("sentinel_verdict.json")).unwrap();
+    assert_eq!(
+        harness::data_home::fingerprint(Some(dir)),
+        before,
+        "the live module rewriting its cursor is not a change by the test"
+    );
+
+    std::fs::write(dir.join("account.json"), b"{\"account\":2}").unwrap();
+    assert_ne!(
+        harness::data_home::fingerprint(Some(dir)),
+        before,
+        "a changed machine account must still be caught"
+    );
+    std::fs::write(dir.join("account.json"), b"{\"account\":1}").unwrap();
+    std::fs::write(dir.join("server.conf"), b"listen").unwrap();
+    assert_ne!(
+        harness::data_home::fingerprint(Some(dir)),
+        before,
+        "a file a test created must still be caught"
+    );
+}

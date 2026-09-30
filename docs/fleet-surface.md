@@ -108,9 +108,11 @@ Durable-WAL model execution substrate.
 - `session.retract` [m]: retract session content.
 - `run.cancel` [m] / `run.status` [q]: cancel / inspect an in-flight or recorded run.
 - `session.read` [q]: page a session transcript (serves `mid` identity + lineage state).
-- `usage.export` [q]: token/cost usage records for consumers (astrocyte).
 - `cap.install` [m]: install a spend cap.
 - `spend.delta` [m]: record a spend delta against a cap.
+- `vault.audit`: in broca's live catalog; see broca's own docs for its contract.
+
+Usage records have no op: metering consumers read `export_facts` in broca's `run-index.db` directly (opened `mode=ro`). `usage.export` was removed in broca 0.3.156.
 
 ## callosum — federation (2 ops + fed: namespace)
 

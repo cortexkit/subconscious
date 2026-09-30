@@ -5145,7 +5145,18 @@ async fn real_mcp_hello_declares_build_provenance() {
     assert_eq!(build.build_lock_digest.as_ref().unwrap().len(), 64);
     assert_eq!(
         build.launch_nonce_source,
-        Some(subc_protocol::manifest::LaunchNonceSource::Fd)
+        Some(expected_launch_nonce_source())
     );
     module.stop().await.unwrap();
+}
+
+/// Where a supervised module gets its launch nonce on this platform: the daemon
+/// hands it over on a pipe on Unix, and only in the environment on Windows,
+/// which has no pipe handover yet.
+fn expected_launch_nonce_source() -> subc_protocol::manifest::LaunchNonceSource {
+    if cfg!(windows) {
+        subc_protocol::manifest::LaunchNonceSource::Env
+    } else {
+        subc_protocol::manifest::LaunchNonceSource::Fd
+    }
 }

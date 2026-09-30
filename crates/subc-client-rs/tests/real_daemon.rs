@@ -3780,3 +3780,286 @@ fn terminal_absence_options_as(identity: &ConsumerIdentity) -> CallOptions {
         ..terminal_absence_options()
     }
 }
+
+// `module.draining` reaching a module built on `serve`, against a real daemon.
+//
+// Both tests supervise the `echo-module` example, which records each
+// `on_draining` call, each `health` answer (when it declares a busy gauge) and
+// its `on_connection_end` in an events file, every line stamped with its pid.
+// `supervisor.restart` replaces the process, and the replacement writes to the
+// same file, so the assertions read only the drained process's lines.
+
+const DRAIN_MODULE_ID: &str = "subc-client-rs-drain";
+
+/// A daemon supervising `echo-module` as [`DRAIN_MODULE_ID`] with the given
+/// extra environment and module settings.
+async fn start_drain_harness(
+    name: &str,
+    extra_env: &[(&str, &str)],
+    module_settings: Value,
+) -> (TestTempDir, LiveDaemon, PathBuf) {
+    let workspace = workspace_root();
+    let daemon_bin = ensure_binary(
+        &workspace,
+        binary_path(&workspace, "ck-subc"),
+        &["build", "-p", "subc-core", "--bins"],
+    );
+    let module_bin = ensure_binary(
+        &workspace,
+        example_path(&workspace, "echo-module"),
+        &["build", "-p", "subc-client-rs", "--example", "echo-module"],
+    );
+    let temp_dir = unique_temp_dir(name);
+    let runtime_dir = temp_dir.join("runtime");
+    let config_dir = temp_dir.join("config");
+    let events_path = temp_dir.join("events.jsonl");
+    fs::create_dir_all(&runtime_dir).unwrap();
+    fs::create_dir_all(config_dir.join("cortexkit")).unwrap();
+    let mut env = BTreeMap::from([(
+        "SUBC_MODULE_ECHO_EVENTS".to_string(),
+        events_path.to_string_lossy().into_owned(),
+    )]);
+    for (key, value) in extra_env {
+        env.insert((*key).to_string(), (*value).to_string());
+    }
+    let mut module = json!({
+        "program": module_bin.to_string_lossy(),
+        "args": [],
+        "env": env,
+        "enabled": true,
+    });
+    if let (Some(module), Some(settings)) = (module.as_object_mut(), module_settings.as_object()) {
+        module.extend(settings.clone());
+    }
+    fs::write(
+        config_dir.join("cortexkit").join("subc.jsonc"),
+        serde_json::to_string_pretty(&json!({
+            "version": 1,
+            "modules": { DRAIN_MODULE_ID: module },
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let daemon = spawn_daemon(&daemon_bin, &runtime_dir, &config_dir);
+    wait_for_connection_file(&daemon.connection_file, START_TIMEOUT).await;
+    wait_for_catalog_module(&daemon.connection_file, DRAIN_MODULE_ID, START_TIMEOUT).await;
+    (temp_dir, daemon, events_path)
+}
+
+/// Run `supervisor.restart` on [`DRAIN_MODULE_ID`] and require its ACK. The
+/// ACK can come before the drain has finished, so callers wait for the
+/// drained process's `connection_end` event to know it is over.
+async fn restart_drain_module(connection_file: &Path) {
+    let mut client = connect_authed_client(connection_file).await.unwrap();
+    let body = serde_json::to_vec(&ClientControlRequest::SupervisorRestart {
+        module_id: DRAIN_MODULE_ID.to_string(),
+        drain_timeout_ms: None,
+    })
+    .unwrap();
+    write_frame(&mut client, &control_request_frame(77, body))
+        .await
+        .unwrap();
+    client.flush().await.unwrap();
+    let response = timeout(Duration::from_secs(30), read_frame(&mut client))
+        .await
+        .expect("supervisor.restart must be answered")
+        .unwrap()
+        .expect("daemon closed the control connection");
+    assert_eq!(
+        response.header.ty,
+        FrameType::Response,
+        "supervisor.restart failed: {}",
+        String::from_utf8_lossy(&response.body)
+    );
+}
+
+/// The pid of the process that registered first: its `hello_ack` line.
+async fn first_module_pid(events_path: &Path) -> u64 {
+    wait_for_event(events_path, EVENT_TIMEOUT, |event| {
+        event["kind"] == "hello_ack"
+    })
+    .await["pid"]
+        .as_u64()
+        .expect("the module must stamp its events with its pid")
+}
+
+/// Every event `pid` recorded, in order.
+fn events_of(events_path: &Path, pid: u64) -> Vec<Value> {
+    read_events(events_path)
+        .into_iter()
+        .filter(|event| event["pid"].as_u64() == Some(pid))
+        .collect()
+}
+
+fn position_of(events: &[Value], what: &str, predicate: impl Fn(&Value) -> bool) -> usize {
+    events
+        .iter()
+        .position(predicate)
+        .unwrap_or_else(|| panic!("no {what} event; events: {events:#?}"))
+}
+
+fn unix_ms_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+
+/// `supervisor.restart` drains the module before stopping it. The daemon
+/// tells the module so with `module.draining`, and a module built on `serve`
+/// must hear it through `on_draining`: reason `restart`, a deadline still in
+/// the future and inside the configured drain budget, and before the GOODBYE
+/// that ends the drain (seen as `on_connection_end(goodbye)`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn supervisor_restart_calls_on_draining_with_restart_and_a_future_deadline_before_goodbye() {
+    const DRAIN_BUDGET_MS: u64 = 10_000;
+    let (_temp_dir, mut daemon, events_path) = start_drain_harness(
+        "subc-client-rs-drain-notice",
+        &[],
+        json!({ "drain_timeout_ms": DRAIN_BUDGET_MS }),
+    )
+    .await;
+    let drained_pid = first_module_pid(&events_path).await;
+
+    let restart_sent_ms = unix_ms_now();
+    restart_drain_module(&daemon.connection_file).await;
+    wait_for_event(&events_path, EVENT_TIMEOUT, |event| {
+        event["pid"].as_u64() == Some(drained_pid) && event["kind"] == "connection_end"
+    })
+    .await;
+
+    let events = events_of(&events_path, drained_pid);
+    let draining_at = position_of(&events, "draining", |event| event["kind"] == "draining");
+    let end_at = position_of(&events, "connection_end", |event| {
+        event["kind"] == "connection_end"
+    });
+    let draining = &events[draining_at];
+    assert_eq!(draining["reason"], "Restart", "{draining}");
+    let deadline_ms = draining["deadline_ms"].as_u64().unwrap();
+    let now_ms = draining["at_ms"].as_u64().unwrap();
+    assert!(
+        deadline_ms > now_ms,
+        "the drain deadline must still be ahead when the hook runs: {draining}"
+    );
+    assert!(
+        deadline_ms <= restart_sent_ms + DRAIN_BUDGET_MS + 1_000,
+        "the deadline must come from the configured drain budget: {draining}"
+    );
+    assert_eq!(events[end_at]["end"], "goodbye", "{:#?}", events);
+    assert!(
+        draining_at < end_at,
+        "on_draining must be called before the GOODBYE that ends the drain: {events:#?}"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["kind"] == "draining")
+            .count(),
+        1,
+        "one drain notice, one call: {events:#?}"
+    );
+    daemon.kill_and_wait();
+}
+
+/// A module that declares a `Busy` health gauge holds its drain open until the
+/// gauge reads 0. Here the gauge reads 1 until `on_draining` has run plus a
+/// delay, so the drain can only finish early if the hook ran and the daemon's
+/// drain probe read the gauge falling:
+///
+/// - the module is not torn down (GOODBYE, `on_connection_end`) until after
+///   it answered a health probe with the gauge at 0;
+/// - the drain (from the hook's call to the module's GOODBYE) lasts at least
+///   the delay and ends well before the drain budget, so it was the gauge, not
+///   the deadline, that ended the wait;
+/// - the route the test holds is closed with `drained: true`, which the daemon
+///   reports only when its drain wait saw every declared gauge at zero.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_busy_gauge_released_after_on_draining_holds_the_restart_drain_until_it_reads_zero() {
+    const BUSY_AFTER_DRAIN_MS: u64 = 1_500;
+    const DRAIN_BUDGET_MS: u64 = 8_000;
+    let busy_after_drain = BUSY_AFTER_DRAIN_MS.to_string();
+    let (_temp_dir, mut daemon, events_path) = start_drain_harness(
+        "subc-client-rs-drain-busy",
+        &[("SUBC_MODULE_ECHO_BUSY_AFTER_DRAIN_MS", &busy_after_drain)],
+        json!({
+            "drain_timeout_ms": DRAIN_BUDGET_MS,
+            // The drain re-probes on the health cadence; keep it short so the
+            // wait ends soon after the gauge falls.
+            "health": { "cadence_ms": 200, "deadline_ms": 150 },
+        }),
+    )
+    .await;
+    let drained_pid = first_module_pid(&events_path).await;
+
+    let consumer = SubcConsumer::connect(&daemon.connection_file, fast_consumer_options())
+        .await
+        .unwrap();
+    consumer
+        .open_route(
+            tool_target(DRAIN_MODULE_ID),
+            consumer_identity("drain-busy"),
+            fast_call_options(),
+        )
+        .await
+        .unwrap();
+    let mut control = consumer.control_pushes(8);
+
+    restart_drain_module(&daemon.connection_file).await;
+    wait_for_event(&events_path, EVENT_TIMEOUT, |event| {
+        event["pid"].as_u64() == Some(drained_pid) && event["kind"] == "connection_end"
+    })
+    .await;
+
+    let events = events_of(&events_path, drained_pid);
+    let draining_at = position_of(&events, "draining", |event| event["kind"] == "draining");
+    let busy_done_at = position_of(&events, "busy_done", |event| event["kind"] == "busy_done");
+    let end_at = position_of(&events, "connection_end", |event| {
+        event["kind"] == "connection_end"
+    });
+    assert_eq!(events[end_at]["end"], "goodbye", "{events:#?}");
+    assert!(draining_at < busy_done_at && busy_done_at < end_at, "{events:#?}");
+    assert!(
+        events[draining_at..busy_done_at]
+            .iter()
+            .any(|event| event["kind"] == "health" && event["drain_work"] == 1),
+        "the drain must have probed the gauge while it was still 1: {events:#?}"
+    );
+    assert!(
+        events[busy_done_at..end_at]
+            .iter()
+            .any(|event| event["kind"] == "health" && event["drain_work"] == 0),
+        "the module must be probed and read 0 before it is torn down: {events:#?}"
+    );
+    let drain_ms = events[end_at]["at_ms"].as_u64().unwrap()
+        - events[draining_at]["at_ms"].as_u64().unwrap();
+    assert!(
+        drain_ms >= BUSY_AFTER_DRAIN_MS,
+        "the drain ended before the gauge could fall: {drain_ms}ms"
+    );
+    assert!(
+        drain_ms < DRAIN_BUDGET_MS - 2_000,
+        "the drain ran to its deadline instead of ending on the gauge: {drain_ms}ms"
+    );
+
+    let closed = timeout(EVENT_TIMEOUT, async {
+        loop {
+            let push = control
+                .recv()
+                .await
+                .expect("control push receiver should remain open");
+            if push.op == "route.closed" {
+                return push;
+            }
+        }
+    })
+    .await
+    .expect("route.closed should arrive after the drain");
+    assert_eq!(closed.body["reason"], "restart", "{:?}", closed.body);
+    assert_eq!(
+        closed.body["drained"], true,
+        "the daemon's drain wait must have seen the gauge at zero: {:?}",
+        closed.body
+    );
+    daemon.kill_and_wait();
+}

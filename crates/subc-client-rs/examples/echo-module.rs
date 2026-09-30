@@ -208,8 +208,8 @@ impl ModuleHandler for EchoHandler {
             "reason": format!("{reason:?}"),
             "deadline_ms": unix_ms(deadline),
         }));
-        // Stand for in-flight work that takes a while to finish once the
-        // module stops taking new work.
+        // Simulate in-flight work that keeps running for a while after the
+        // module stops taking new work; the busy gauge covers it.
         if let Some(delay) = self.busy_after_drain {
             sleep(delay).await;
             self.busy.store(0, Ordering::SeqCst);

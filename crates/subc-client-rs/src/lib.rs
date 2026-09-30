@@ -84,11 +84,13 @@ const HELLO_CORR: u64 = 1;
 /// How long a closing module waits for its writer to flush the frames still
 /// queued before aborting it; see the serve future in `serve_with_handle`.
 const WRITER_DRAIN_LIMIT: Duration = Duration::from_secs(2);
-/// How long a closing connection waits for each `on_draining` hook it already
-/// spawned to start running before it acts on the close. The wait is only for
-/// the hook's first step, which is normally immediate; the bound keeps a hook
-/// that blocks its thread from holding the close up past the daemon's stop
-/// budget.
+/// When a module's daemon connection ends (GOODBYE, EOF, or the module closing
+/// it), how long the serve loop waits for each `on_draining` hook it already
+/// spawned to start running before it cancels requests and calls
+/// `on_connection_end`. The wait is only for the hook's first step, which is
+/// normally immediate; the bound matters because the daemon kills a module
+/// that has not exited within its stop timeout after GOODBYE, and a hook that
+/// blocks its thread must not hold the shutdown up that long.
 const DRAINING_HOOK_START_LIMIT: Duration = Duration::from_secs(2);
 static NEXT_MODULE_CONNECTION_TOKEN: AtomicU64 = AtomicU64::new(1);
 
@@ -760,8 +762,10 @@ impl Error for CatalogUpdateError {}
 ///
 /// Requests the daemon forwarded are counted by the daemon itself. Work it
 /// cannot see (a job a request started in the background, a batch being
-/// flushed) holds the drain open only if the module says so: declare a `Busy`
-/// self-signal anchored to health gauges in the manifest, and report those
+/// flushed) holds the drain open only if the module says so. The module does
+/// that with a counter it reports in its health answer (a "health gauge"),
+/// and a manifest entry telling the daemon that the counter means "busy": a
+/// `Busy` self-signal anchored to those health gauges. Declare it, and report those
 /// gauges in [`ModuleHandler::health`]'s `metrics` above zero until the work
 /// has finished. During a drain the daemon probes `health` and waits until
 /// every declared gauge reads 0 (or the deadline passes); a declared gauge
@@ -1185,8 +1189,9 @@ where
     let dispatcher = RequestDispatcher::new();
     let result = serve_frames(&mut reader, &egress, &handler, &module_handle, &dispatcher).await;
     // A drain notice is followed shortly by the daemon's GOODBYE, and the two
-    // can arrive in one read. Let every drain hook start before the end is
-    // acted on, so a module always hears about its drain first.
+    // can arrive in one read. Let every drain hook start before the
+    // connection's end (GOODBYE or otherwise) is acted on, so a module always
+    // hears about its drain before it hears that the connection is over.
     dispatcher.wait_for_draining_hooks_to_start().await;
     dispatcher.cancel_all();
     result
@@ -3124,7 +3129,9 @@ mod module_close_tests {
     async fn a_drain_notice_calls_on_draining_before_the_goodbye_that_follows_it() {
         let recorder = DrainRecorder::default();
         let mut served = serve_against_stand_in(recorder.clone()).await;
-        let deadline_ms = 4_102_444_800_000; // 2100-01-01T00:00:00Z
+        // Any fixed value works; this one (2100-01-01T00:00:00Z) is far enough
+        // ahead to be plainly a future deadline.
+        let deadline_ms = 4_102_444_800_000;
         write_frame(
             &mut served.daemon,
             &draining_push(subc_protocol::RouteCloseReason::Restart, deadline_ms),

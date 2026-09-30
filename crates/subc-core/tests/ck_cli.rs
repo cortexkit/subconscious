@@ -2737,6 +2737,21 @@ async fn provenance_human_output_keeps_declared_values_under_the_declared_label(
             "declared value {declared:?} leaked into module-level observed section:\n{module_observed}"
         );
     }
+    // The launch nonce source is shown under the declared section with the same
+    // value the JSON form carries, so an owner can read it without `--json`.
+    let json_output = ck_with_subc(
+        &server.connection_file_path,
+        ["--json", "provenance", "aft"],
+    );
+    assert_exit(&json_output, 0);
+    let json: Value = serde_json::from_slice(&json_output.stdout).unwrap();
+    let source = json["modules"][0]["module_declared"]["build"]["launch_nonce_source"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the stub declares a nonce source: {json}"));
+    assert!(
+        module_declared.contains(&format!("launch nonce source: {source}")),
+        "stdout:\n{stdout}"
+    );
     assert!(stdout.contains("Daemon build"), "stdout:\n{stdout}");
     assert_eq!(
         stdout.matches("Daemon build").count(),

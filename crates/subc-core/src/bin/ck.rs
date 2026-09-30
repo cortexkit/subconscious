@@ -3031,6 +3031,13 @@ async fn provenance(
                 "  store schema version: {}",
                 provenance_value(build.get("store_schema_version"))
             );
+            // Whether this module read its launch nonce from the daemon's pipe
+            // (`fd`) or from the environment copy (`env`). Owners check it before
+            // the environment copy is withdrawn.
+            println!(
+                "  launch nonce source: {}",
+                provenance_value(build.get("launch_nonce_source"))
+            );
         }
         _ => println!("  unverifiable"),
     }

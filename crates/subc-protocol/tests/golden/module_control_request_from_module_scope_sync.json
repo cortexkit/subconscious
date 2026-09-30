@@ -1,0 +1,52 @@
+{
+  "generation": 7,
+  "op": "scope.sync",
+  "scopes": [
+    {
+      "attributes": {
+        "agent_id": "agent-7",
+        "delegates": true
+      },
+      "carriers": [
+        {
+          "principal": {
+            "kind": "reserved",
+            "module_id": "broca"
+          }
+        },
+        {
+          "principal": {
+            "kind": "reserved",
+            "module_id": "aft"
+          },
+          "targets": [
+            "plexus",
+            "prefrontal-core"
+          ]
+        }
+      ],
+      "child_owners": [
+        {
+          "kind": "reserved",
+          "module_id": "magic-context"
+        }
+      ],
+      "kind": "head",
+      "ref": "head-1",
+      "scope_epoch": 3
+    },
+    {
+      "kind": "worker",
+      "parent": {
+        "owner": {
+          "kind": "reserved",
+          "module_id": "subc-mcp"
+        },
+        "ref": "head-1",
+        "scope_epoch": 3
+      },
+      "ref": "worker-1",
+      "scope_epoch": 1
+    }
+  ]
+}

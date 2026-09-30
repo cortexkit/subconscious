@@ -10,6 +10,10 @@ use subc_protocol::{
         ModuleManifest, ObservabilityKind, ObservabilitySurface, ProviderRole, SelfSignalEffect,
         SelfSignalKind, SignalAnchor, StorageBinding, StorageKind, StorageScope, Tool, TrustTier,
     },
+    scope::{
+        ParentState, ScopeAttributes, ScopeCarrier, ScopeEnded, ScopeKind, ScopeParent,
+        ScopeRecord, ScopeRecordOutcome, ScopeRecordResult, ScopeStamp, ScopeStatus,
+    },
     session::{
         HealthStatus, ModuleControlCommand, ModuleControlPush, ModuleControlRequest,
         ModuleControlRequestFromModule, ModuleControlResponse, ModuleControlResponseToModule,
@@ -173,6 +177,84 @@ fn protocol_wire_shapes_match_golden_json_and_round_trip() {
         },
     );
     assert_golden(
+        "module_control_request_from_module_scope_sync",
+        &ModuleControlRequestFromModule::ScopeSync {
+            generation: 7,
+            scopes: vec![scope_head_record(), scope_worker_record()],
+        },
+    );
+    assert_golden(
+        "module_control_response_to_module_scope_sync",
+        &ModuleControlResponseToModule::ScopeSync {
+            generation: 7,
+            results: vec![
+                ScopeRecordResult {
+                    scope_ref: "head-1".to_string(),
+                    scope_epoch: 3,
+                    outcome: ScopeRecordOutcome::Created,
+                    code: None,
+                    message: None,
+                    version: Some(1),
+                    parent_state: None,
+                },
+                ScopeRecordResult {
+                    scope_ref: "worker-1".to_string(),
+                    scope_epoch: 1,
+                    outcome: ScopeRecordOutcome::Refused,
+                    code: Some(error_codes::SCOPE_EPOCH_REGRESSED.to_string()),
+                    message: Some("scope_epoch 1 is lower than the live epoch 2".to_string()),
+                    version: Some(4),
+                    parent_state: Some(ParentState::Pending),
+                },
+            ],
+            ended: vec![ScopeEnded {
+                scope_ref: "head-0".to_string(),
+                scope_epoch: 9,
+            }],
+        },
+    );
+    assert_golden(
+        "module_control_request_from_module_scope_describe",
+        &ModuleControlRequestFromModule::ScopeDescribe {
+            owner: principal_reserved(),
+            scope_ref: "head-1".to_string(),
+        },
+    );
+    assert_golden(
+        "module_control_response_to_module_scope_describe_live",
+        &ModuleControlResponseToModule::ScopeDescribe {
+            status: ScopeStatus::Live,
+            scope_epoch: Some(3),
+            daemon_incarnation: "0123456789abcdef0123456789abcdef".to_string(),
+            owner_synced: true,
+            owner_configured: true,
+            scope: Some(ScopeStamp {
+                owner: principal_reserved(),
+                scope_ref: "head-1".to_string(),
+                scope_epoch: 3,
+                kind: ScopeKind::Head,
+                parent: None,
+                parent_state: None,
+                attributes: ScopeAttributes {
+                    agent_id: Some("agent-7".to_string()),
+                    delegates: true,
+                },
+                owner_authorized: true,
+            }),
+        },
+    );
+    assert_golden(
+        "module_control_response_to_module_scope_describe_not_live",
+        &ModuleControlResponseToModule::ScopeDescribe {
+            status: ScopeStatus::NotLive,
+            scope_epoch: None,
+            daemon_incarnation: "0123456789abcdef0123456789abcdef".to_string(),
+            owner_synced: false,
+            owner_configured: true,
+            scope: None,
+        },
+    );
+    assert_golden(
         "tool_with_description",
         &Tool {
             name: "memory.write".to_string(),
@@ -202,6 +284,97 @@ fn protocol_wire_shapes_match_golden_json_and_round_trip() {
     assert_golden(
         "module_manifest_diet",
         &ModuleManifest::builder("diet-module", "1.0.0").build(),
+    );
+}
+
+fn scope_head_record() -> ScopeRecord {
+    ScopeRecord {
+        scope_ref: "head-1".to_string(),
+        scope_epoch: 3,
+        kind: ScopeKind::Head,
+        parent: None,
+        child_owners: vec![Principal::Reserved {
+            module_id: "magic-context".to_string(),
+        }],
+        carriers: vec![
+            ScopeCarrier {
+                principal: Principal::Reserved {
+                    module_id: "broca".to_string(),
+                },
+                targets: None,
+            },
+            ScopeCarrier {
+                principal: Principal::Reserved {
+                    module_id: "aft".to_string(),
+                },
+                targets: Some(vec!["plexus".to_string(), "prefrontal-core".to_string()]),
+            },
+        ],
+        attributes: ScopeAttributes {
+            agent_id: Some("agent-7".to_string()),
+            delegates: true,
+        },
+    }
+}
+
+fn scope_worker_record() -> ScopeRecord {
+    ScopeRecord {
+        scope_ref: "worker-1".to_string(),
+        scope_epoch: 1,
+        kind: ScopeKind::Worker,
+        parent: Some(ScopeParent {
+            owner: principal_reserved(),
+            scope_ref: "head-1".to_string(),
+            scope_epoch: 3,
+        }),
+        child_owners: Vec::new(),
+        carriers: Vec::new(),
+        attributes: ScopeAttributes::default(),
+    }
+}
+
+/// A scope record field this version does not know may be one that narrows
+/// what the scope grants, so dropping it silently would widen the grant. The
+/// record types refuse unknown fields instead, at every level an owner writes.
+#[test]
+fn scope_records_refuse_unknown_fields_at_every_level() {
+    let base = serde_json::to_value(scope_head_record()).unwrap();
+    for (label, mutate) in [
+        (
+            "record",
+            Box::new(|v: &mut Value| v["hook_order"] = 1.into()) as Box<dyn Fn(&mut Value)>,
+        ),
+        (
+            "attributes",
+            Box::new(|v: &mut Value| v["attributes"]["role"] = "x".into()),
+        ),
+        (
+            "carrier",
+            Box::new(|v: &mut Value| v["carriers"][0]["scope"] = "x".into()),
+        ),
+        (
+            "parent",
+            Box::new(|v: &mut Value| {
+                v["parent"] = serde_json::json!({
+                    "owner": {"kind": "direct"}, "ref": "p", "scope_epoch": 1, "extra": true
+                })
+            }),
+        ),
+    ] {
+        let mut value = base.clone();
+        mutate(&mut value);
+        let error = serde_json::from_value::<ScopeRecord>(value)
+            .expect_err(&format!("an unknown {label} field must refuse the record"));
+        assert!(
+            error.to_string().contains("unknown field"),
+            "{label}: {error}"
+        );
+    }
+    // Control: the unmutated record decodes, so the refusals above are about the
+    // added field and not a record that never decoded.
+    assert_eq!(
+        serde_json::from_value::<ScopeRecord>(base).unwrap(),
+        scope_head_record()
     );
 }
 

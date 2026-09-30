@@ -1,0 +1,7 @@
+{
+  "daemon_incarnation": "0123456789abcdef0123456789abcdef",
+  "op": "scope.describe",
+  "owner_configured": true,
+  "owner_synced": false,
+  "status": "not_live"
+}

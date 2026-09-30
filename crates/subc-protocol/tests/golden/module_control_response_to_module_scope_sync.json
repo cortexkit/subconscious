@@ -1,0 +1,27 @@
+{
+  "ended": [
+    {
+      "ref": "head-0",
+      "scope_epoch": 9
+    }
+  ],
+  "generation": 7,
+  "op": "scope.sync",
+  "results": [
+    {
+      "outcome": "created",
+      "ref": "head-1",
+      "scope_epoch": 3,
+      "version": 1
+    },
+    {
+      "code": "scope_epoch_regressed",
+      "message": "scope_epoch 1 is lower than the live epoch 2",
+      "outcome": "refused",
+      "parent_state": "pending",
+      "ref": "worker-1",
+      "scope_epoch": 1,
+      "version": 4
+    }
+  ]
+}

@@ -39,6 +39,7 @@ pub use machine_id::{MachineId, MachineIdError};
 pub mod frame;
 pub mod machine_id;
 pub mod manifest;
+pub mod scope;
 pub mod session;
 pub mod tool_call;
 
@@ -83,6 +84,56 @@ pub mod error_codes {
     /// this answer, and a caller cannot wait that out.
     pub const MODULE_NO_PROTOCOL: &str = "module_no_protocol";
 
+    /// A `route.open` named a scope whose owner is configured but has not
+    /// synced since this daemon incarnation started. RETRYABLE: after a daemon
+    /// restart a carrier's open can arrive before the owner re-syncs, and the
+    /// carrier waits within its own deadline. See `docs/designs/daemon-scopes.md`.
+    pub const SCOPE_NOT_SYNCED: &str = "scope_not_synced";
+    /// A scoped `route.open` was admitted, but the scope record changed before
+    /// the module's bind committed. Nothing was sent on the route, so the caller
+    /// may re-open against the current record: RETRYABLE.
+    pub const SCOPE_CHANGED: &str = "scope_changed";
+
+    /// `scope.sync` came from a connection that is not the owner's sync
+    /// authority: another connection of the same launch holds it, or this
+    /// connection's launch is no longer the owner's current one (a blue/green
+    /// swap candidate before cutover, or an incumbent after it).
+    pub const SCOPE_SYNC_NOT_AUTHORITY: &str = "scope_sync_not_authority";
+    /// `scope.sync` carried a generation no larger than the last one the
+    /// authority had accepted. The whole sync is refused and nothing changes.
+    pub const SCOPE_SYNC_STALE: &str = "scope_sync_stale";
+    /// `scope.sync` named more live scopes than one owner may hold. The whole
+    /// sync is refused and nothing changes.
+    pub const SCOPE_LIVE_LIMIT_EXCEEDED: &str = "scope_live_limit_exceeded";
+    /// One record in a `scope.sync` carried more attribute bytes than a scope may
+    /// hold. The whole sync is refused and nothing changes.
+    pub const SCOPE_ATTRIBUTES_TOO_LARGE: &str = "scope_attributes_too_large";
+
+    // Per-record refusals: each is reported against one record in the
+    // `scope.sync` reply, that record keeps its previous state, and the rest
+    // of the sync applies.
+
+    /// The record lowers the `scope_epoch` the daemon holds for its ref.
+    pub const SCOPE_EPOCH_REGRESSED: &str = "scope_epoch_regressed";
+    /// The record names an `(owner, ref, scope_epoch)` that already ended in
+    /// this daemon incarnation; an ended session cannot come back.
+    pub const SCOPE_EPOCH_ENDED: &str = "scope_epoch_ended";
+    /// The record changes `kind` at the same `scope_epoch`.
+    pub const SCOPE_KIND_CHANGED: &str = "scope_kind_changed";
+    /// The record sets `agent_id` or `delegates` and its owner is not listed in
+    /// the daemon's `scope_authority_owners`.
+    pub const SCOPE_ATTRIBUTE_NOT_PERMITTED: &str = "scope_attribute_not_permitted";
+    /// The record's parent link is not permitted: the parent's owner has synced
+    /// and the parent is not live at the named epoch, the syncing owner is
+    /// neither the parent's owner nor in its `child_owners`, or the link would
+    /// close a cycle.
+    pub const SCOPE_PARENT_NOT_PERMITTED: &str = "scope_parent_not_permitted";
+    /// A targeted carrier entry lists no target modules, or more than
+    /// `scope::MAX_CARRIER_TARGETS`.
+    pub const SCOPE_CARRIER_TARGETS_INVALID: &str = "scope_carrier_targets_invalid";
+    /// The record sets `delegates` without an `agent_id` to delegate.
+    pub const SCOPE_DELEGATES_WITHOUT_AGENT: &str = "scope_delegates_without_agent";
+
     /// Whether a `route.open` refusal carrying `code` may be retried in place
     /// within the caller's deadline, or is terminal for the target as named.
     ///
@@ -105,7 +156,12 @@ pub mod error_codes {
     pub fn is_retryable_route_open(code: &str) -> bool {
         matches!(
             code,
-            MODULE_RELOADING | MODULE_WARMING | TARGET_UNAVAILABLE | MODULE_TIMEOUT
+            MODULE_RELOADING
+                | MODULE_WARMING
+                | TARGET_UNAVAILABLE
+                | MODULE_TIMEOUT
+                | SCOPE_NOT_SYNCED
+                | SCOPE_CHANGED
         )
     }
 

@@ -1,0 +1,8 @@
+{
+  "op": "scope.describe",
+  "owner": {
+    "kind": "reserved",
+    "module_id": "subc-mcp"
+  },
+  "ref": "head-1"
+}

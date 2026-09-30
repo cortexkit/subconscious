@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.18.1 — 2026-09-30
+
+- `isRetryableRouteOpenCode` treats `scope_not_synced` and `scope_changed` as retryable, following the shared `decision_tables.json` record. The daemon returns them for scoped `route.open` requests: the first when the scope's owner has not re-synced since a daemon restart, the second when the scope changed between admission and commit. In both cases nothing was sent. Daemons that do not support scopes never return either code.
+
 ## 0.18.0 — 2026-09-30
 
 - Add `launchNonce()`, the one reader of the launch nonce, matching `subc_os::launch_nonce` in Rust. When `SUBC_LAUNCH_NONCE_FD=<fd>:<inode>` is set (not on Windows) it takes the named descriptor only if it is a pipe with that inode holding bytes, reads it to end of file and closes it; a closed descriptor, a non-pipe, a different pipe, an empty pipe or a malformed value throws `LaunchNonceError` (`kind` `NotOpen`, `NotAPipe`, `WrongPipe`, `Empty`, `Malformed`; also `Unreadable`, `NotUtf8`), leaves the descriptor untouched and never falls back to `SUBC_LAUNCH_NONCE`. Without the variable it reads `SUBC_LAUNCH_NONCE`. The answer and its source (`fd` or `env`) are cached for the process, shared by every copy of the package in the same realm, and `process.env` is never changed. Also exported: `launchNonceOrUndefined`, `isLaunchNonceError`, `SUBC_LAUNCH_NONCE_FD_ENV`, `LAUNCH_NONCE_FD` and the `LaunchNonce`, `LaunchNonceSource`, `LaunchNonceErrorKind` types.

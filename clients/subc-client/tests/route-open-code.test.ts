@@ -15,3 +15,9 @@ test("unknown_module is terminal; only late-target codes stay retryable", () => 
   expect(isRetryableRouteOpenCode("target_unavailable")).toBe(true);
   expect(isRetryableRouteOpenCode("module_timeout")).toBe(true);
 });
+
+test("a scoped open refused before the owner re-synced or after the scope changed is retryable", () => {
+  expect(isRetryableRouteOpenCode("scope_not_synced")).toBe(true);
+  expect(isRetryableRouteOpenCode("scope_changed")).toBe(true);
+  expect(isRetryableRouteOpenCode("scope_sync_not_authority")).toBe(false);
+});

@@ -1,0 +1,208 @@
+//! Scope records: owned identity records the daemon holds for sessions.
+//!
+//! A scope is identified by `(owner, ref)`. The owner is the module whose own
+//! registered connection synced it, never a value in the request, and the
+//! `ref` is an opaque string unique within that owner only. The design is
+//! `docs/designs/daemon-scopes.md`; the wire shapes here are the owner-facing
+//! half of it (`scope.sync`, `scope.describe`).
+//!
+//! Every record type refuses unknown fields. A field this daemon does not know
+//! may be one that narrows authority in a later version (a carrier's target
+//! list, say), and silently dropping it would widen what the scope grants, so
+//! an owner sending one is told its body is malformed instead.
+
+use serde::{Deserialize, Serialize};
+
+use crate::Principal;
+
+/// Module-to-subc op that registers an owner's full scope set.
+pub const SCOPE_SYNC_OP: &str = "scope.sync";
+/// Module-to-subc op that reads one scope's current state.
+pub const SCOPE_DESCRIBE_OP: &str = "scope.describe";
+
+/// Most live scopes one owner may hold. A sync naming more is refused whole.
+pub const MAX_LIVE_SCOPES_PER_OWNER: usize = 10_000;
+/// Most bytes one scope's `attributes` may take, measured as compact JSON. A
+/// sync carrying a larger record is refused whole.
+pub const MAX_SCOPE_ATTRIBUTE_BYTES: usize = 4 * 1024;
+/// Most ended scopes the daemon remembers per owner. The oldest is forgotten
+/// first, and reaching the bound never refuses a sync.
+pub const MAX_SCOPE_TOMBSTONES_PER_OWNER: usize = 1_000;
+/// Most modules one targeted carrier entry may list.
+pub const MAX_CARRIER_TARGETS: usize = 16;
+
+/// What a scope stands for. Closed, and fixed for the life of one
+/// `scope_epoch`: a different kind needs a new epoch, which ends the old scope.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum ScopeKind {
+    Head,
+    Worker,
+    Ephemeral,
+}
+
+/// A link from a scope to another scope, pinned to that scope's session by its
+/// epoch.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ScopeParent {
+    pub owner: Principal,
+    #[serde(rename = "ref")]
+    pub scope_ref: String,
+    pub scope_epoch: u64,
+}
+
+/// Who, besides the owner, may open routes under a scope.
+///
+/// `targets` absent means the carrier may open to any module. Present, it
+/// names the only module ids the carrier may open to, and must hold between 1
+/// and [`MAX_CARRIER_TARGETS`] entries: an empty list is refused rather than
+/// read as either "none" or "all".
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ScopeCarrier {
+    pub principal: Principal,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub targets: Option<Vec<String>>,
+}
+
+/// The attributes the daemon stamps without interpreting. Both grant authority,
+/// so only an owner listed in the daemon's `scope_authority_owners` may set
+/// either.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ScopeAttributes {
+    /// The agent the scope's session belongs to. Identity, never permission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    /// Whether a provider may act as `agent_id`. Refused without `agent_id`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub delegates: bool,
+}
+
+impl ScopeAttributes {
+    pub fn is_empty(&self) -> bool {
+        self.agent_id.is_none() && !self.delegates
+    }
+}
+
+/// One scope as its owner registers it in `scope.sync`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ScopeRecord {
+    #[serde(rename = "ref")]
+    pub scope_ref: String,
+    /// Owner-supplied session number. The owner keeps it with its own record of
+    /// the session, re-sends the same value for the same session after any
+    /// restart, and uses a higher one when it reuses the ref for a new session.
+    pub scope_epoch: u64,
+    pub kind: ScopeKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<ScopeParent>,
+    /// Principals, other than the owner, allowed to register child scopes under
+    /// this one. Listing a principal here grants it nothing else.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub child_owners: Vec<Principal>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub carriers: Vec<ScopeCarrier>,
+    #[serde(default, skip_serializing_if = "ScopeAttributes::is_empty")]
+    pub attributes: ScopeAttributes,
+}
+
+/// The state of a scope's parent link.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum ParentState {
+    /// The parent is live at the named epoch and the link was permitted.
+    Linked,
+    /// The parent's owner has not synced in this daemon incarnation, so the
+    /// link is unverified and grants nothing yet.
+    Pending,
+    /// The parent is gone or live at another epoch, or the link was refused
+    /// when the parent's owner synced. Final for this link.
+    Ended,
+}
+
+/// What a `scope.sync` did with one record.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ScopeRecordOutcome {
+    /// The ref was not live before; the scope was created.
+    Created,
+    /// The ref was live at a lower epoch; that scope ended and this one began.
+    Replaced,
+    /// The ref was live at this epoch and its content changed.
+    Updated,
+    /// The ref was live at this epoch with identical content; its `version`
+    /// did not move.
+    Unchanged,
+    /// The record was refused on its own merits (`code` says why) and the ref
+    /// keeps whatever state it had before this sync.
+    Refused,
+}
+
+/// The per-record result in a `scope.sync` reply, in request order.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScopeRecordResult {
+    #[serde(rename = "ref")]
+    pub scope_ref: String,
+    /// The epoch the record named, which for a refusal may differ from the
+    /// epoch still held.
+    pub scope_epoch: u64,
+    pub outcome: ScopeRecordOutcome,
+    /// The refusal code when `outcome` is `refused`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    /// The daemon's content counter for the scope held under this ref after
+    /// the sync; absent when no scope is live under it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<u64>,
+    /// The parent link's state after the sync, for a scope with a parent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_state: Option<ParentState>,
+}
+
+/// A scope of the syncing owner that the sync ended, by removal or by a
+/// higher epoch for the same ref.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScopeEnded {
+    #[serde(rename = "ref")]
+    pub scope_ref: String,
+    pub scope_epoch: u64,
+}
+
+/// `scope.describe`'s answer about one `(owner, ref)`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ScopeStatus {
+    Live,
+    /// Ended in this daemon incarnation, and still remembered.
+    Ended,
+    /// Neither live nor remembered as ended. With `owner_synced` true the scope
+    /// is gone: an owner's first sync of an incarnation is its full set. With
+    /// `owner_synced` false and `owner_configured` true the owner has not
+    /// re-synced since a daemon restart, so a reader waits. With
+    /// `owner_configured` false the owner will never sync.
+    NotLive,
+}
+
+/// The fields the daemon stamps for a live scope.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScopeStamp {
+    pub owner: Principal,
+    #[serde(rename = "ref")]
+    pub scope_ref: String,
+    pub scope_epoch: u64,
+    pub kind: ScopeKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<ScopeParent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_state: Option<ParentState>,
+    #[serde(default, skip_serializing_if = "ScopeAttributes::is_empty")]
+    pub attributes: ScopeAttributes,
+    /// Whether the owner is listed in the daemon's `scope_authority_owners`.
+    /// Providers decide on this flag and keep no copy of the list.
+    pub owner_authorized: bool,
+}

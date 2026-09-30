@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fmt,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, RwLock},
     time::{Duration, Instant as StdInstant},
 };
 
@@ -23,6 +23,7 @@ use subc_protocol::{
         CapabilityDeclarations, CapabilityNeed, Concurrency, ManifestProvenance, ModuleManifest,
         ProviderRole,
     },
+    scope::{ScopeRecord, SCOPE_DESCRIBE_OP, SCOPE_SYNC_OP},
     session::{
         HealthReport, ModuleControlPush, ModuleControlRequest, ModuleControlRequestFromModule,
         ModuleControlResponse, ModuleControlResponseToModule, MODULE_CONTROL_OP_HEALTH_CHECK,
@@ -54,6 +55,7 @@ use crate::{
     },
     registry::{ChannelState, ConnectionId, Registry, RegistryError},
     router::{RouteCtx, RouterError},
+    scopes::{HelloLaunchNonces, ScopeTable},
     server::MAX_PENDING_ROUTE_BINDS_PER_TARGET,
     stderr_tail::{CaptureState, TailEntry},
     supervise::{
@@ -102,6 +104,12 @@ const SUBC_CONTROL_OPS: &[&str] = &[
 
 const MODULE_TO_SUBC_CONTROL_OPS: &[&str] =
     &[MODULE_TO_SUBC_OP_CATALOG_UPDATE, "supervisor.live_roots"];
+
+/// Module-originated ops the daemon answers but does not yet advertise in
+/// `HELLO_ACK`. Scope sync and describe are served ahead of route admission
+/// under scopes; advertising them before that exists would tell an owner or
+/// carrier that scoped routes work when they do not.
+const MODULE_TO_SUBC_UNADVERTISED_OPS: &[&str] = &[SCOPE_SYNC_OP, SCOPE_DESCRIBE_OP];
 
 const MODULE_BASELINE_CONTROL_OPS: &[&str] = &["route.bind", "route.status"];
 
@@ -217,6 +225,7 @@ struct SupervisorRescanContext {
     storage_config: Option<crate::daemon_config::StorageConfig>,
     admission_facts_carrier_module_id: Option<String>,
     admission_facts_targets: Option<Vec<String>>,
+    scope_authority_owners: Vec<String>,
 }
 
 /// Refusal labels passed to `observe_route_open_refusal` that mean the target
@@ -288,6 +297,16 @@ pub struct ControlHandler {
     machine_id: Option<crate::machine_id::MachineId>,
     admission_facts_carrier_module_id: Option<String>,
     admission_facts_targets: Option<Vec<String>>,
+    /// Scope records with their sync authorities and tombstones; see
+    /// `crate::scopes`. Shared by clones of this handler, so every connection
+    /// reads and writes one table.
+    scopes: Arc<RwLock<ScopeTable>>,
+    /// The configured `scope_authority_owners`, kept so a rescan can report a
+    /// changed value as needing a daemon restart; rescan never applies it.
+    scope_authority_owners: Vec<String>,
+    /// The launch nonce each module connection presented at HELLO, which is how
+    /// a `scope.sync` is matched to the owner's current launch.
+    hello_launch_nonces: Arc<Mutex<HelloLaunchNonces>>,
     rescan: Option<SupervisorRescanContext>,
     connected_clients: ConnectedClients,
     counters: DaemonCounters,
@@ -739,6 +758,11 @@ impl ControlHandler {
             machine_id: None,
             admission_facts_carrier_module_id: None,
             admission_facts_targets: None,
+            scopes: Arc::new(RwLock::new(ScopeTable::new(
+                crate::daemon_config::default_scope_authority_owners(),
+            ))),
+            scope_authority_owners: crate::daemon_config::default_scope_authority_owners(),
+            hello_launch_nonces: Arc::new(Mutex::new(HelloLaunchNonces::default())),
             rescan: None,
             connected_clients: ConnectedClients::new(),
             counters,
@@ -778,6 +802,15 @@ impl ControlHandler {
     ) -> Self {
         self.admission_facts_carrier_module_id = carrier_module_id;
         self.admission_facts_targets = targets;
+        self
+    }
+
+    /// Set the module ids whose scopes may carry `agent_id` and `delegates`.
+    /// Replaces the scope table with an empty one under the new list, so call it
+    /// while building the handler, before any module can sync.
+    pub fn with_scope_authority_owners(mut self, owners: Vec<String>) -> Self {
+        self.scopes = Arc::new(RwLock::new(ScopeTable::new(owners.iter().cloned())));
+        self.scope_authority_owners = owners;
         self
     }
 
@@ -914,6 +947,7 @@ impl ControlHandler {
             storage_config: self.storage_config.clone(),
             admission_facts_carrier_module_id: self.admission_facts_carrier_module_id.clone(),
             admission_facts_targets: self.admission_facts_targets.clone(),
+            scope_authority_owners: self.scope_authority_owners.clone(),
         });
         self
     }
@@ -1533,6 +1567,16 @@ impl ControlHandler {
             self.refresh_capability_requirements();
         }
         self.supervisor.remove_spawn_subscribers(connection_id);
+        // Sync authority dies with its connection, so the owner's next
+        // connection can take it; the owner's scopes stay as they are.
+        self.hello_launch_nonces
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .forget(connection_id);
+        self.scopes
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .release_connection(connection_id);
         registrations
     }
 
@@ -1849,6 +1893,14 @@ impl ControlHandler {
             )?]);
         }
 
+        // Kept for scope sync authority, which goes only to the connection that
+        // presented the module's current launch nonce. Recorded before the
+        // registration is attempted: a connection whose registration then fails
+        // has no registration, so it cannot sync anyway, and cleanup forgets it.
+        self.hello_launch_nonces
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .record(connection_id, hello.launch_nonce.as_deref());
         let control_ops = effective_module_control_ops(hello.control_ops);
         // Built before anything is registered so an encoding failure leaves no
         // registry or forwarding state behind.
@@ -2217,7 +2269,128 @@ impl ControlHandler {
                     "ModuleControlResponseToModule::LiveRoots",
                 )?])
             }
+            ModuleControlRequestFromModule::ScopeSync { generation, scopes } => {
+                self.handle_scope_sync(connection_id, frame, generation, scopes)
+            }
+            ModuleControlRequestFromModule::ScopeDescribe { owner, scope_ref } => {
+                self.handle_scope_describe(connection_id, frame, owner, scope_ref)
+            }
         }
+    }
+
+    /// `scope.sync`: the owner is the module registered on this connection.
+    /// A connection with no registration (every client connection, `direct`
+    /// included) is refused `not_registered` before the table is consulted.
+    fn handle_scope_sync(
+        &self,
+        connection_id: ConnectionId,
+        frame: Frame,
+        generation: u64,
+        scopes: Vec<ScopeRecord>,
+    ) -> Result<Vec<Frame>, RouterError> {
+        let Some(registration) = self
+            .registry
+            .get_module_by_connection(connection_id)
+            .map_err(|err| RouterError::backend(0, frame.header.corr, err.to_string()))?
+        else {
+            return Ok(vec![control_error_frame(
+                &frame,
+                "not_registered",
+                "scope.sync requires an active module registration owned by this connection",
+            )?]);
+        };
+        let owner = registration.manifest.module_id;
+        let current_nonce = self.supervisor.spawn_launch_nonce_for(&owner);
+        let is_current_launch = |connection: ConnectionId| {
+            self.hello_launch_nonces
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .presented(connection, current_nonce.as_deref())
+        };
+        let outcome = self
+            .scopes
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .sync(&owner, connection_id, is_current_launch, generation, scopes);
+        match outcome {
+            Ok(applied) => {
+                info!(
+                    owner = %owner,
+                    generation,
+                    records = applied.results.len(),
+                    ended = applied.ended.len(),
+                    tag_changes = applied.tag_changes.len(),
+                    "scope sync accepted"
+                );
+                let response = ModuleControlResponseToModule::ScopeSync {
+                    generation,
+                    results: applied.results,
+                    ended: applied.ended,
+                };
+                Ok(vec![control_response_body_frame(
+                    &frame,
+                    &response,
+                    "ModuleControlResponseToModule::ScopeSync",
+                )?])
+            }
+            Err(refusal) => {
+                info!(
+                    owner = %owner,
+                    generation,
+                    code = refusal.code,
+                    "scope sync refused"
+                );
+                Ok(vec![control_error_frame(
+                    &frame,
+                    refusal.code,
+                    refusal.message,
+                )?])
+            }
+        }
+    }
+
+    /// `scope.describe`: any registered module may read any scope, because a
+    /// provider must read the scope a route it serves is stamped with.
+    fn handle_scope_describe(
+        &self,
+        connection_id: ConnectionId,
+        frame: Frame,
+        owner: Principal,
+        scope_ref: String,
+    ) -> Result<Vec<Frame>, RouterError> {
+        let registered = self
+            .registry
+            .get_module_by_connection(connection_id)
+            .map_err(|err| RouterError::backend(0, frame.header.corr, err.to_string()))?;
+        if registered.is_none() {
+            return Ok(vec![control_error_frame(
+                &frame,
+                "not_registered",
+                "scope.describe requires an active module registration owned by this connection",
+            )?]);
+        }
+        let description = self
+            .scopes
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .describe(&owner, &scope_ref);
+        let owner_configured = match &owner {
+            Principal::Reserved { module_id } => self.supervisor.get(module_id).is_some(),
+            _ => false,
+        };
+        let response = ModuleControlResponseToModule::ScopeDescribe {
+            status: description.status,
+            scope_epoch: description.scope_epoch,
+            daemon_incarnation: self.supervisor.spawn_snapshot().cursor.daemon_incarnation,
+            owner_synced: description.owner_synced,
+            owner_configured,
+            scope: description.stamp,
+        };
+        Ok(vec![control_response_body_frame(
+            &frame,
+            &response,
+            "ModuleControlResponseToModule::ScopeDescribe",
+        )?])
     }
 
     fn handle_catalog_update(
@@ -3892,6 +4065,7 @@ impl ControlHandler {
             storage_config,
             admission_facts_carrier_module_id,
             admission_facts_targets,
+            scope_authority_owners,
             modules,
             reserved_capabilities,
         ) = (
@@ -3899,6 +4073,7 @@ impl ControlHandler {
             config.storage,
             config.admission_facts_carrier_module_id,
             config.admission_facts_targets,
+            config.scope_authority_owners,
             config.modules,
             config.reserved_capabilities,
         );
@@ -3921,6 +4096,9 @@ impl ControlHandler {
                 }
                 RestartRequiredSection::AdmissionFactsTargets => {
                     admission_facts_targets != context.admission_facts_targets
+                }
+                RestartRequiredSection::ScopeAuthorityOwners => {
+                    scope_authority_owners != context.scope_authority_owners
                 }
             };
             if changed {
@@ -5093,8 +5271,12 @@ fn is_known_module_push_op(body: &[u8]) -> bool {
 
 fn is_known_module_request_op(body: &[u8]) -> bool {
     serde_json::from_slice::<ControlOpProbe>(body)
-        .map(|probe| MODULE_TO_SUBC_CONTROL_OPS.contains(&probe.op.as_str()))
+        .map(|probe| is_module_to_subc_op(&probe.op))
         .unwrap_or(false)
+}
+
+fn is_module_to_subc_op(op: &str) -> bool {
+    MODULE_TO_SUBC_CONTROL_OPS.contains(&op) || MODULE_TO_SUBC_UNADVERTISED_OPS.contains(&op)
 }
 
 fn log_control_dispatch_arrival(op: &'static str, connection_id: ConnectionId, corr: u64) {
@@ -5155,6 +5337,8 @@ fn module_control_request_op(request: &ModuleControlRequestFromModule) -> &'stat
     match request {
         ModuleControlRequestFromModule::CatalogUpdate { .. } => MODULE_TO_SUBC_OP_CATALOG_UPDATE,
         ModuleControlRequestFromModule::LiveRoots {} => "supervisor.live_roots",
+        ModuleControlRequestFromModule::ScopeSync { .. } => SCOPE_SYNC_OP,
+        ModuleControlRequestFromModule::ScopeDescribe { .. } => SCOPE_DESCRIBE_OP,
     }
 }
 
@@ -5178,9 +5362,7 @@ fn parse_module_control_request_from_module(
 ) -> Result<ModuleControlRequestFromModule, (serde_json::Error, ControlRequestBodyError)> {
     serde_json::from_slice::<ModuleControlRequestFromModule>(body).map_err(|err| {
         let classification = match serde_json::from_slice::<ControlOpProbe>(body) {
-            Ok(probe) if MODULE_TO_SUBC_CONTROL_OPS.contains(&probe.op.as_str()) => {
-                ControlRequestBodyError::InvalidBody
-            }
+            Ok(probe) if is_module_to_subc_op(&probe.op) => ControlRequestBodyError::InvalidBody,
             Ok(_) => ControlRequestBodyError::UnknownOp,
             Err(_) => ControlRequestBodyError::InvalidBody,
         };
@@ -10954,6 +11136,352 @@ mod tests {
                 .unwrap();
             assert_eq!(parse_error(&duplicate[0])["code"], "duplicate_module_id");
             assert!(registry.get_candidate("vault").unwrap().is_none());
+        }
+    }
+
+    /// `scope.sync` and `scope.describe` through the real control handler: who
+    /// may sync is decided by the registration and launch nonce of the module
+    /// connection, never by the request body.
+    mod scopes {
+        use subc_protocol::scope::{ScopeKind, ScopeRecordOutcome, ScopeStatus};
+
+        use super::*;
+
+        const OWNER: &str = "prefrontal-core";
+
+        fn head(scope_ref: &str, scope_epoch: u64) -> ScopeRecord {
+            ScopeRecord {
+                scope_ref: scope_ref.to_string(),
+                scope_epoch,
+                kind: ScopeKind::Head,
+                parent: None,
+                child_owners: Vec::new(),
+                carriers: Vec::new(),
+                attributes: Default::default(),
+            }
+        }
+
+        async fn call(
+            handler: &ControlHandler,
+            ctx: &RouteCtx,
+            request: &ModuleControlRequestFromModule,
+        ) -> Frame {
+            let body = serde_json::to_vec(request).unwrap();
+            let frame = Frame::build(FrameType::Request, control_flags(), 0, 0, 77, body).unwrap();
+            let mut replies = handler.handle_control_frame(ctx, frame).await.unwrap();
+            assert_eq!(replies.len(), 1, "{replies:?}");
+            replies.pop().unwrap()
+        }
+
+        async fn sync(
+            handler: &ControlHandler,
+            ctx: &RouteCtx,
+            generation: u64,
+            scopes: Vec<ScopeRecord>,
+        ) -> Result<ModuleControlResponseToModule, String> {
+            let reply = call(
+                handler,
+                ctx,
+                &ModuleControlRequestFromModule::ScopeSync { generation, scopes },
+            )
+            .await;
+            match reply.header.ty {
+                FrameType::Response => Ok(serde_json::from_slice(&reply.body).unwrap()),
+                _ => Err(parse_error(&reply)["code"].as_str().unwrap().to_string()),
+            }
+        }
+
+        async fn describe(
+            handler: &ControlHandler,
+            ctx: &RouteCtx,
+            owner: &str,
+            scope_ref: &str,
+        ) -> ModuleControlResponseToModule {
+            let reply = call(
+                handler,
+                ctx,
+                &ModuleControlRequestFromModule::ScopeDescribe {
+                    owner: Principal::Reserved {
+                        module_id: owner.to_string(),
+                    },
+                    scope_ref: scope_ref.to_string(),
+                },
+            )
+            .await;
+            assert_eq!(
+                reply.header.ty,
+                FrameType::Response,
+                "{:?}",
+                parse_error(&reply)
+            );
+            serde_json::from_slice(&reply.body).unwrap()
+        }
+
+        /// Register `module_id` on `connection` with `nonce`, returning its ctx.
+        async fn module(
+            handler: &ControlHandler,
+            connection: u64,
+            module_id: &str,
+            nonce: Option<&str>,
+        ) -> (RouteCtx, mpsc::Receiver<crate::router::OutboundFrame>) {
+            let (ctx, mut rx) = route_ctx(ConnectionId::new(connection));
+            hello_via_sink(
+                handler,
+                &ctx,
+                &mut rx,
+                hello_frame_with_nonce(module_id, PROTOCOL_VERSION, connection, nonce),
+            )
+            .await;
+            (ctx, rx)
+        }
+
+        /// `direct` and every other client connection has no registration, so
+        /// it can neither sync nor own a scope.
+        #[tokio::test]
+        async fn a_client_connection_cannot_sync_or_describe() {
+            let handler = ControlHandler::new(Arc::new(Registry::default()));
+            let (ctx, _rx) = route_ctx(ConnectionId::new(9));
+            for request in [
+                ModuleControlRequestFromModule::ScopeSync {
+                    generation: 1,
+                    scopes: vec![head("s", 1)],
+                },
+                ModuleControlRequestFromModule::ScopeDescribe {
+                    owner: Principal::Direct,
+                    scope_ref: "s".to_string(),
+                },
+            ] {
+                let reply = call(&handler, &ctx, &request).await;
+                assert_eq!(parse_error(&reply)["code"], "not_registered", "{request:?}");
+            }
+            assert!(
+                !handler
+                    .scopes
+                    .read()
+                    .unwrap()
+                    .describe(
+                        &Principal::Reserved {
+                            module_id: OWNER.to_string()
+                        },
+                        "s"
+                    )
+                    .owner_synced
+            );
+        }
+
+        /// A module the supervisor did not spawn registers without a launch
+        /// nonce, so it is never an owner's current launch.
+        #[tokio::test]
+        async fn a_module_without_a_supervised_launch_cannot_sync() {
+            let handler = ControlHandler::new(Arc::new(Registry::default()));
+            let (ctx, _rx) = module(&handler, 1, OWNER, None).await;
+            assert_eq!(
+                sync(&handler, &ctx, 1, vec![head("s", 1)]).await,
+                Err(error_codes::SCOPE_SYNC_NOT_AUTHORITY.to_string())
+            );
+        }
+
+        #[tokio::test]
+        async fn sync_authority_follows_the_supervisors_recorded_spawn_nonce_across_a_swap() {
+            let supervisor = SupervisorHandle::new();
+            supervisor.set_spawn_nonce(OWNER, "n1".to_string());
+            let handler = ControlHandler::new(Arc::new(Registry::default()))
+                .with_supervisor(supervisor.clone());
+            let (incumbent, _incumbent_rx) = module(&handler, 1, OWNER, Some("n1")).await;
+            sync(&handler, &incumbent, 1, vec![head("s", 1)])
+                .await
+                .expect("the current launch syncs");
+
+            // A swap candidate registers with the swap token and is refused
+            // while the incumbent keeps syncing.
+            supervisor.open_swap(OWNER, "n2".to_string());
+            let (candidate, _candidate_rx) = module(&handler, 2, OWNER, Some("n2")).await;
+            assert_eq!(
+                sync(&handler, &candidate, 1, vec![head("x", 1)]).await,
+                Err(error_codes::SCOPE_SYNC_NOT_AUTHORITY.to_string())
+            );
+            sync(&handler, &incumbent, 2, vec![head("s", 1)])
+                .await
+                .expect("the serving owner syncs during the swap");
+
+            // The swap fails and is rolled back. The candidate never held sync
+            // authority, and still cannot sync.
+            supervisor.close_swap(OWNER);
+            assert_eq!(
+                sync(&handler, &candidate, 1, vec![head("x", 1)]).await,
+                Err(error_codes::SCOPE_SYNC_NOT_AUTHORITY.to_string())
+            );
+            sync(&handler, &incumbent, 3, vec![head("s", 1)])
+                .await
+                .expect("the serving owner syncs after the rollback");
+            handler.cleanup_connection(candidate.connection_id).unwrap();
+
+            // A swap that cuts over. Promotion records the candidate's nonce as
+            // the module's spawn nonce, which is what `set_spawn_nonce` does
+            // here; the promoted connection then takes authority at any
+            // generation and the superseded incumbent is refused.
+            supervisor.open_swap(OWNER, "n3".to_string());
+            let (promoted, _promoted_rx) = module(&handler, 3, OWNER, Some("n3")).await;
+            supervisor.set_spawn_nonce(OWNER, "n3".to_string());
+            let reply = sync(&handler, &promoted, 1, vec![head("s", 1)])
+                .await
+                .expect("the promoted launch takes authority");
+            let ModuleControlResponseToModule::ScopeSync { results, .. } = reply else {
+                panic!("unexpected reply {reply:?}");
+            };
+            assert_eq!(results[0].outcome, ScopeRecordOutcome::Unchanged);
+            assert_eq!(
+                sync(&handler, &incumbent, 4, Vec::new()).await,
+                Err(error_codes::SCOPE_SYNC_NOT_AUTHORITY.to_string())
+            );
+        }
+
+        /// Authority dies with its connection: the cleanup path releases it,
+        /// so the owner's next connection takes it at any generation.
+        #[tokio::test]
+        async fn closing_the_authority_connection_frees_sync_authority() {
+            let supervisor = SupervisorHandle::new();
+            supervisor.set_spawn_nonce(OWNER, "n1".to_string());
+            let handler = ControlHandler::new(Arc::new(Registry::default()))
+                .with_supervisor(supervisor.clone());
+            let (first, _first_rx) = module(&handler, 1, OWNER, Some("n1")).await;
+            sync(&handler, &first, 10, vec![head("s", 1)])
+                .await
+                .unwrap();
+            handler.cleanup_connection(first.connection_id).unwrap();
+
+            let (second, _second_rx) = module(&handler, 2, OWNER, Some("n1")).await;
+            sync(&handler, &second, 1, vec![head("s", 1)])
+                .await
+                .expect("the next connection takes the released authority");
+        }
+
+        #[tokio::test]
+        async fn describe_reports_the_incarnation_and_whether_the_owner_is_configured() {
+            let registry = Arc::new(Registry::default());
+            let supervisor_handle = SupervisorHandle::new();
+            let supervisor = Supervisor::new(Arc::clone(&registry), RestartPolicy::default())
+                .with_handle(supervisor_handle.clone())
+                .with_daemon_incarnation("incarnation-7".to_string());
+            // Configured with enabled: false, so the supervisor lists the
+            // module without spawning a process for it.
+            supervisor
+                .supervise_configured(
+                    ModuleSpec {
+                        module_id: OWNER.to_string(),
+                        program: PathBuf::from("/nonexistent/prefrontal-core"),
+                        args: Vec::new(),
+                        env: Vec::new(),
+                        reserved: false,
+                        reserved_prefixes: Vec::new(),
+                        protocol: ModuleProtocol::Subc,
+                        overlap: Default::default(),
+                    },
+                    false,
+                )
+                .unwrap();
+            supervisor_handle.set_spawn_nonce(OWNER, "n1".to_string());
+            let handler =
+                ControlHandler::new(Arc::clone(&registry)).with_supervisor(supervisor_handle);
+            let (reader, _reader_rx) = module(&handler, 5, "reader", None).await;
+
+            // Configured but not yet synced: a reader waits for the owner.
+            let ModuleControlResponseToModule::ScopeDescribe {
+                status,
+                daemon_incarnation,
+                owner_synced,
+                owner_configured,
+                scope,
+                ..
+            } = describe(&handler, &reader, OWNER, "s").await
+            else {
+                panic!("not a describe reply");
+            };
+            assert_eq!(status, ScopeStatus::NotLive);
+            assert_eq!(daemon_incarnation, "incarnation-7");
+            assert!(!owner_synced);
+            assert!(owner_configured);
+            assert!(scope.is_none());
+
+            // Not a supervised module: the owner will never sync, and a reader
+            // refuses rather than waits.
+            let ModuleControlResponseToModule::ScopeDescribe {
+                status,
+                owner_configured,
+                ..
+            } = describe(&handler, &reader, "ghost", "s").await
+            else {
+                panic!("not a describe reply");
+            };
+            assert_eq!(status, ScopeStatus::NotLive);
+            assert!(!owner_configured);
+
+            // Live, with the stamp fields and the computed owner_authorized.
+            let (owner, _owner_rx) = module(&handler, 6, OWNER, Some("n1")).await;
+            sync(&handler, &owner, 1, vec![head("s", 4)]).await.unwrap();
+            let ModuleControlResponseToModule::ScopeDescribe {
+                status,
+                scope_epoch,
+                owner_synced,
+                scope,
+                ..
+            } = describe(&handler, &reader, OWNER, "s").await
+            else {
+                panic!("not a describe reply");
+            };
+            assert_eq!(status, ScopeStatus::Live);
+            assert_eq!(scope_epoch, Some(4));
+            assert!(owner_synced);
+            let stamp = scope.expect("a live scope carries its stamp");
+            assert!(
+                stamp.owner_authorized,
+                "prefrontal-core is the default authority"
+            );
+            assert_eq!(stamp.kind, ScopeKind::Head);
+        }
+
+        #[tokio::test]
+        async fn scope_authority_owners_decides_owner_authorized() {
+            let supervisor = SupervisorHandle::new();
+            supervisor.set_spawn_nonce("broca", "b1".to_string());
+            let handler = ControlHandler::new(Arc::new(Registry::default()))
+                .with_supervisor(supervisor)
+                .with_scope_authority_owners(vec!["broca".to_string()]);
+            let (broca, _rx) = module(&handler, 1, "broca", Some("b1")).await;
+            let mut gated = head("s", 1);
+            gated.attributes.agent_id = Some("agent".to_string());
+            sync(&handler, &broca, 1, vec![gated]).await.unwrap();
+            let ModuleControlResponseToModule::ScopeDescribe { scope, .. } =
+                describe(&handler, &broca, "broca", "s").await
+            else {
+                panic!("not a describe reply");
+            };
+            assert!(scope.unwrap().owner_authorized);
+        }
+
+        /// Scoped routes do not exist yet, so nothing may tell a module they
+        /// do: the ops are served but not advertised.
+        #[tokio::test]
+        async fn scope_ops_are_not_advertised() {
+            let handler = ControlHandler::new(Arc::new(Registry::default()));
+            let (ctx, mut rx) = route_ctx(ConnectionId::new(1));
+            let ack = hello_via_sink(
+                &handler,
+                &ctx,
+                &mut rx,
+                hello_frame("m", PROTOCOL_VERSION, 1),
+            )
+            .await;
+            let ack = parse_ack(&ack);
+            assert!(
+                ack.subc_ops.iter().all(|op| !op.starts_with("scope.")),
+                "{:?}",
+                ack.subc_ops
+            );
+            assert!(
+                ack.subc_ops.iter().any(|op| op == "supervisor.live_roots"),
+                "control: the list read is the one that advertises module ops"
+            );
         }
     }
 }

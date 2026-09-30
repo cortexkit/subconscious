@@ -2138,7 +2138,12 @@ export function isRetryableRouteOpenCode(code: string | undefined): boolean {
     code === "module_reloading" ||
     code === "module_warming" ||
     code === "target_unavailable" ||
-    code === "module_timeout"
+    code === "module_timeout" ||
+    // A scoped open refused before the scope's owner re-synced, or because the
+    // scope changed between admission and commit: nothing was sent, and a
+    // re-open can succeed.
+    code === "scope_not_synced" ||
+    code === "scope_changed"
   );
 }
 

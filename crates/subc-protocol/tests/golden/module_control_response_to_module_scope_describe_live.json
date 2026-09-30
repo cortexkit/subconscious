@@ -1,0 +1,22 @@
+{
+  "daemon_incarnation": "0123456789abcdef0123456789abcdef",
+  "op": "scope.describe",
+  "owner_configured": true,
+  "owner_synced": true,
+  "scope": {
+    "attributes": {
+      "agent_id": "agent-7",
+      "delegates": true
+    },
+    "kind": "head",
+    "owner": {
+      "kind": "reserved",
+      "module_id": "subc-mcp"
+    },
+    "owner_authorized": true,
+    "ref": "head-1",
+    "scope_epoch": 3
+  },
+  "scope_epoch": 3,
+  "status": "live"
+}

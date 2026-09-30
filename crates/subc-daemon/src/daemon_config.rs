@@ -43,14 +43,16 @@ pub enum RestartRequiredSection {
     Storage,
     AdmissionFactsCarrierModuleId,
     AdmissionFactsTargets,
+    ScopeAuthorityOwners,
 }
 
 impl RestartRequiredSection {
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
         Self::Port,
         Self::Storage,
         Self::AdmissionFactsCarrierModuleId,
         Self::AdmissionFactsTargets,
+        Self::ScopeAuthorityOwners,
     ];
 
     pub const fn label(self) -> &'static str {
@@ -59,8 +61,15 @@ impl RestartRequiredSection {
             Self::Storage => "storage",
             Self::AdmissionFactsCarrierModuleId => "admission_facts_carrier_module_id",
             Self::AdmissionFactsTargets => "admission_facts_targets",
+            Self::ScopeAuthorityOwners => "scope_authority_owners",
         }
     }
+}
+
+/// `scope_authority_owners` when the config does not set it: the session
+/// runtime, the same module that carries admission facts today.
+pub fn default_scope_authority_owners() -> Vec<String> {
+    vec!["prefrontal-core".to_string()]
 }
 
 /// Refused at parse time by both layers (daemon-wide and per-module) — `0`
@@ -156,6 +165,12 @@ pub struct DaemonConfig {
     pub admission_facts_carrier_module_id: Option<String>,
     /// Exact target module ids that may receive facts from the configured carrier.
     pub admission_facts_targets: Option<Vec<String>>,
+    /// Module ids whose scopes may set the attributes that grant authority
+    /// (`agent_id`, `delegates`), and whose scopes are stamped
+    /// `owner_authorized`. Restart-required: a change reaching a running daemon
+    /// would leave live routes holding an `owner_authorized` stamp the owner no
+    /// longer has, and a restart closes every route.
+    pub scope_authority_owners: Vec<String>,
     /// Capability names reserved to one module id. The binding may name a module
     /// that is not configured yet so an operator can reserve an interface before
     /// installing its provider.
@@ -364,6 +379,8 @@ struct RawDaemonConfig {
     admission_facts_carrier_module_id: Option<String>,
     #[serde(default)]
     admission_facts_targets: Option<Vec<String>>,
+    #[serde(default)]
+    scope_authority_owners: Option<Vec<String>>,
     #[serde(default)]
     reserved_capabilities: BTreeMap<String, String>,
 }
@@ -820,6 +837,15 @@ fn parse_doc(doc: &str, path: &Path) -> Result<DaemonConfig, DaemonConfigError> 
         raw.admission_facts_targets.as_deref(),
         path,
     )?;
+    let scope_authority_owners = raw
+        .scope_authority_owners
+        .unwrap_or_else(default_scope_authority_owners);
+    if scope_authority_owners.iter().any(|owner| owner.is_empty()) {
+        return Err(DaemonConfigError::InvalidValue {
+            path: path.to_path_buf(),
+            message: "scope_authority_owners must not contain empty module ids".to_string(),
+        });
+    }
 
     let storage = raw
         .storage
@@ -862,6 +888,7 @@ fn parse_doc(doc: &str, path: &Path) -> Result<DaemonConfig, DaemonConfigError> 
         storage,
         admission_facts_carrier_module_id: raw.admission_facts_carrier_module_id,
         admission_facts_targets: raw.admission_facts_targets,
+        scope_authority_owners,
         reserved_capabilities: raw.reserved_capabilities,
     })
 }
@@ -1636,7 +1663,41 @@ mod tests {
                 "storage",
                 "admission_facts_carrier_module_id",
                 "admission_facts_targets",
+                "scope_authority_owners",
             ]
+        );
+    }
+
+    #[test]
+    fn scope_authority_owners_defaults_to_the_session_runtime() {
+        let config = parse_doc(r#"{ "version": 1 }"#, Path::new("/tmp/subc.jsonc")).unwrap();
+        assert_eq!(config.scope_authority_owners, vec!["prefrontal-core"]);
+    }
+
+    #[test]
+    fn scope_authority_owners_is_read_when_set_and_refuses_an_empty_id() {
+        let config = parse_doc(
+            r#"{ "version": 1, "scope_authority_owners": ["a", "b"] }"#,
+            Path::new("/tmp/subc.jsonc"),
+        )
+        .unwrap();
+        assert_eq!(config.scope_authority_owners, vec!["a", "b"]);
+        // An explicit empty list is a real posture (no owner may set gated
+        // attributes), distinct from an absent key.
+        let config = parse_doc(
+            r#"{ "version": 1, "scope_authority_owners": [] }"#,
+            Path::new("/tmp/subc.jsonc"),
+        )
+        .unwrap();
+        assert!(config.scope_authority_owners.is_empty());
+        let error = parse_doc(
+            r#"{ "version": 1, "scope_authority_owners": [""] }"#,
+            Path::new("/tmp/subc.jsonc"),
+        )
+        .expect_err("an empty module id is refused");
+        assert!(
+            error.to_string().contains("scope_authority_owners"),
+            "{error}"
         );
     }
 

@@ -13,6 +13,8 @@
     "module_warming": "retryable",
     "op_not_allowed": "terminal",
     "route_limit": "terminal",
+    "scope_changed": "retryable",
+    "scope_not_synced": "retryable",
     "target_unavailable": "retryable",
     "unknown_module": "terminal"
   },

@@ -45,8 +45,7 @@ use subc_protocol::{
     manifest::ModuleManifest,
     session::{
         ModuleControlCommand, ModuleControlRequest, ModuleControlRequestFromModule,
-        ModuleControlResponse,
-        ModuleControlResponseToModule, MODULE_CONTROL_OP_HEALTH_CHECK,
+        ModuleControlResponse, ModuleControlResponseToModule, MODULE_CONTROL_OP_HEALTH_CHECK,
         MODULE_TO_SUBC_OP_CATALOG_UPDATE,
     },
     BindIdentity, ErrorBody, Flags, Frame, FrameBuildError, FrameType, ModuleHelloAckBody,

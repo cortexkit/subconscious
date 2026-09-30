@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.23.4 — 2026-09-30
+
+- `ModuleHandler::on_draining(reason, deadline)` delivers the daemon's `module.draining` notice,
+  which it sends before stopping a module (restart, reload, disable, swap, daemon shutdown). Until
+  now the SDK dropped it. The hook runs on its own task, so pings and GOODBYE keep flowing while it
+  works, and it is always called before the GOODBYE that ends the drain is handled. `deadline` is
+  a wall-clock "no later than", never a grant. It has a no-op default, so existing handlers are
+  unaffected. The trait docs describe how to hold a drain open until background work finishes (a
+  `Busy` self-signal anchored to health gauges); the `echo-module` example declares one.
+- A channel-0 push the SDK cannot decode is ignored, and the first on each connection is logged at
+  warn through `tracing` (a new dependency); the connection stays up.
+
 ## 0.23.2 — 2026-09-30
 
 - Add `SubcConsumer::open_route_scoped(target, identity, scope, opts)`, which opens (or reuses) a

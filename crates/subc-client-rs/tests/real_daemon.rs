@@ -4006,9 +4006,13 @@ async fn a_busy_gauge_released_after_on_draining_holds_the_restart_drain_until_i
     let mut control = consumer.control_pushes(8);
 
     restart_drain_module(&daemon.connection_file).await;
-    wait_for_event(&events_path, EVENT_TIMEOUT, |event| {
-        event["pid"].as_u64() == Some(drained_pid) && event["kind"] == "connection_end"
-    })
+    // Wait out the whole budget: a drain that is never released ends at its
+    // deadline, and the assertions below should say so rather than this wait.
+    wait_for_event(
+        &events_path,
+        Duration::from_millis(DRAIN_BUDGET_MS) + EVENT_TIMEOUT,
+        |event| event["pid"].as_u64() == Some(drained_pid) && event["kind"] == "connection_end",
+    )
     .await;
 
     let events = events_of(&events_path, drained_pid);
@@ -4018,7 +4022,10 @@ async fn a_busy_gauge_released_after_on_draining_holds_the_restart_drain_until_i
         event["kind"] == "connection_end"
     });
     assert_eq!(events[end_at]["end"], "goodbye", "{events:#?}");
-    assert!(draining_at < busy_done_at && busy_done_at < end_at, "{events:#?}");
+    assert!(
+        draining_at < busy_done_at && busy_done_at < end_at,
+        "{events:#?}"
+    );
     assert!(
         events[draining_at..busy_done_at]
             .iter()
@@ -4031,8 +4038,8 @@ async fn a_busy_gauge_released_after_on_draining_holds_the_restart_drain_until_i
             .any(|event| event["kind"] == "health" && event["drain_work"] == 0),
         "the module must be probed and read 0 before it is torn down: {events:#?}"
     );
-    let drain_ms = events[end_at]["at_ms"].as_u64().unwrap()
-        - events[draining_at]["at_ms"].as_u64().unwrap();
+    let drain_ms =
+        events[end_at]["at_ms"].as_u64().unwrap() - events[draining_at]["at_ms"].as_u64().unwrap();
     assert!(
         drain_ms >= BUSY_AFTER_DRAIN_MS,
         "the drain ended before the gauge could fall: {drain_ms}ms"

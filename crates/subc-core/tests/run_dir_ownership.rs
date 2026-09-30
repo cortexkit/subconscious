@@ -362,3 +362,57 @@ fn a_killed_daemons_lock_does_not_block_the_next_daemon_and_its_orphan_is_swept(
         "the next daemon's sweep did not run"
     );
 }
+
+#[test]
+fn scope_sync_stub_exits_when_daemon_is_sigkilled() {
+    let mut tree = Tree::new("scope-sync-daemon-eof");
+    let scopes = tree.root.join("scopes.json");
+    let events = tree.root.join("events.jsonl");
+    let nonce = tree.root.join("nonce");
+    fs::write(&scopes, "[]").unwrap();
+    fs::write(
+        tree.root.join("config/cortexkit/subc.jsonc"),
+        serde_json::to_vec(&json!({ "version": 1, "modules": { "aft": {
+            "program": env!("CARGO_BIN_EXE_fake-aft-stub"),
+            "env": {
+                "FAKE_AFT_PID_PATH": tree.root.join("module.pid"),
+                "FAKE_AFT_SCOPE_SYNC_PATH": scopes,
+                "FAKE_AFT_LAUNCH_NONCE_PATH": nonce,
+                "FAKE_AFT_EVENTS_PATH": events,
+                // The readiness watcher waits for a file that never appears,
+                // so EOF must stop it without waiting for its sender to drop.
+                "FAKE_AFT_READY_UPDATE_PATH": tree.root.join("never-ready"),
+            },
+        }}}))
+        .unwrap(),
+    )
+    .unwrap();
+    let daemon = tree.spawn_daemon("runtime");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let pid = loop {
+        assert!(
+            tree.daemons[daemon].try_wait().unwrap().is_none(),
+            "daemon exited during startup"
+        );
+        let sent = fs::read_to_string(&events)
+            .unwrap_or_default()
+            .contains("scope_sync_sent");
+        if sent && nonce.exists() {
+            if let Some(pid) = tree.module_pid() {
+                assert!(process_alive(pid), "stub exited before daemon kill");
+                break pid;
+            }
+        }
+        assert!(Instant::now() < deadline, "stub never sent scope sync");
+        thread::sleep(Duration::from_millis(10));
+    };
+    tree.kill_daemon(daemon);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while process_alive(pid) {
+        assert!(
+            Instant::now() < deadline,
+            "scope-sync stub {pid} survived daemon SIGKILL"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}

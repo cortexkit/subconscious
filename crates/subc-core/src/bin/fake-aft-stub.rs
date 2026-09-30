@@ -529,7 +529,16 @@ async fn run(config: StubConfig) -> Result<(), StubError> {
     let loop_result = module_loop(&mut read_half, tx.clone(), config).await;
     drop(tx);
 
-    let writer_result = writer.await.map_err(StubError::WriterTask);
+    // File watchers and delayed requests hold sender clones. Waiting for all
+    // senders to disappear would keep the process alive after the daemon has
+    // closed its connection, even when no more frames are being produced.
+    // There is no peer left to drain to; cancel the writer and let returning
+    // from run shut down the runtime and its background tasks.
+    writer.abort();
+    let writer_result = match writer.await {
+        Err(err) if err.is_cancelled() => Ok(Ok(())),
+        result => result.map_err(StubError::WriterTask),
+    };
     match (loop_result, writer_result) {
         (Err(loop_err), _) => Err(loop_err),
         (Ok(()), Ok(Ok(()))) => Ok(()),

@@ -20,6 +20,9 @@ use subc_control::{
 /// The spawn snapshot types, re-exported so a caller of
 /// [`SubcConsumer::spawn_snapshot`] needs no direct `subc-control` dependency.
 pub use subc_control::{LiveSpawn, SpawnCursor, SpawnEvent, SpawnEventKind, SpawnSnapshot};
+/// The scope a route is opened under, re-exported so a caller of
+/// [`SubcConsumer::open_route_scoped`] can name the type from this crate.
+pub use subc_protocol::scope::ScopeSelector;
 use subc_protocol::{
     error_codes, manifest::is_valid_capability_identifier, AdmissionClass, BindIdentity, ErrorBody,
     Flags, Frame, FrameBuildError, FrameType, Priority, RouteTarget, SUBC_MODULE_ID_ENV,
@@ -902,6 +905,69 @@ impl SubcConsumer {
             consumer_identity: &consumer_identity,
             consumer_capabilities: &consumer_capabilities,
             reverse_requests: &opts.reverse_requests,
+            scope: None,
+        };
+        self.shared
+            .ensure_route(&key, &params, &opts, deadline)
+            .await
+            .map(|route| route.handle)
+    }
+
+    /// Open or reuse a managed route admitted under `scope`, and return its
+    /// connection-fenced handle.
+    ///
+    /// This is how a carrier opens its onward route for a session. The daemon
+    /// admits the open only when the opener (the consumer identity in `opts`,
+    /// or the supervised module's own identity from the environment) is the
+    /// scope's owner or one of its listed carriers, and it stamps the
+    /// provider's bind with the scope. `scope.scope_epoch` must be set: the
+    /// daemon refuses an open without it (`scope_epoch_required`).
+    ///
+    /// The route is cached under the whole selector (owner, ref and epoch) as
+    /// well as the target and identities, so a route opened under one scope or
+    /// epoch is never returned to a caller asking for another, and a scoped
+    /// route is never returned by [`Self::open_route`] (nor an unscoped one
+    /// here). Once the route closes, the next call with the same selector opens
+    /// a fresh route under that selector. Close it early with
+    /// [`Self::close_handle`].
+    ///
+    /// Refusals: `scope_not_synced` (the owner has not synced since the daemon
+    /// started) and `scope_changed` (the scope changed while the bind was in
+    /// flight) are retried within the call's deadline, like a module reload.
+    /// `scope_ended`, `scope_not_live`, `scope_epoch_required` and
+    /// `scope_not_carrier` end the call at once as [`CallError::NotSent`], with
+    /// the daemon's code in [`CallError::route_open_refusal`].
+    ///
+    /// When the daemon later closes the route because its scope ended or the
+    /// opener's authority under it was revoked, [`Self::control_pushes`]
+    /// delivers `route.closed` with a `scope_*` reason. Its
+    /// [`RouteCloseReason::disposition`] is
+    /// [`RouteCloseDisposition::MustNotReopen`]: the session the route served is
+    /// over, so do not open it again under the same selector.
+    pub async fn open_route_scoped(
+        &self,
+        target: RouteTarget,
+        identity: BindIdentity,
+        scope: ScopeSelector,
+        opts: CallOptions,
+    ) -> Result<RouteHandle, CallError> {
+        let deadline = Instant::now() + opts.timeout;
+        let consumer_identity = route_open_consumer_identity(&opts);
+        let consumer_capabilities = route_open_consumer_capabilities(&opts);
+        let key = RouteKey::new(
+            &target,
+            &identity,
+            consumer_identity.as_ref(),
+            consumer_capabilities.as_deref(),
+        )
+        .with_scope(Some(&scope));
+        let params = RouteOpenParams {
+            target: &target,
+            identity: &identity,
+            consumer_identity: &consumer_identity,
+            consumer_capabilities: &consumer_capabilities,
+            reverse_requests: &opts.reverse_requests,
+            scope: Some(&scope),
         };
         self.shared
             .ensure_route(&key, &params, &opts, deadline)
@@ -1463,6 +1529,7 @@ impl SubcConsumer {
             consumer_identity: &consumer_identity,
             consumer_capabilities: &consumer_capabilities,
             reverse_requests: &opts.reverse_requests,
+            scope: None,
         };
 
         loop {
@@ -1583,6 +1650,7 @@ impl SubcConsumer {
             consumer_identity: &consumer_identity,
             consumer_capabilities: &consumer_capabilities,
             reverse_requests: &opts.reverse_requests,
+            scope: None,
         };
 
         loop {
@@ -2738,7 +2806,7 @@ impl Shared {
                 consumer_identity: route_open.consumer_identity.clone(),
                 consumer_capabilities: route_open.consumer_capabilities.clone(),
                 admission_facts: None,
-                scope: None,
+                scope: route_open.scope.cloned(),
             })
             .map_err(|err| CallError::not_sent(format!("failed to encode route.open: {err}")))?;
             match self
@@ -3880,6 +3948,9 @@ struct RouteOpenParams<'a> {
     consumer_identity: &'a Option<ConsumerIdentity>,
     consumer_capabilities: &'a Option<Vec<String>>,
     reverse_requests: &'a ReverseRequestRegistry,
+    /// The scope every route.open for this key asks to be admitted under, so a
+    /// reopen after the route drops carries the same selector as the first open.
+    scope: Option<&'a ScopeSelector>,
 }
 
 struct RequestSend {
@@ -3983,6 +4054,10 @@ struct RouteKey {
     session: String,
     consumer_identity: Option<ConsumerIdentityKey>,
     consumer_capabilities: Option<ConsumerCapabilitiesKey>,
+    /// The scope the route was admitted under; `None` for an unscoped route.
+    /// Part of the key so a route bound to one session's scope (or one epoch
+    /// of it) is never reused for another, nor for an unscoped caller.
+    scope: Option<ScopeKey>,
 }
 
 impl RouteKey {
@@ -3999,7 +4074,13 @@ impl RouteKey {
             session: identity.session.clone(),
             consumer_identity: consumer_identity.map(ConsumerIdentityKey::from),
             consumer_capabilities: consumer_capabilities.map(ConsumerCapabilitiesKey::from_slice),
+            scope: None,
         }
+    }
+
+    fn with_scope(mut self, scope: Option<&ScopeSelector>) -> Self {
+        self.scope = scope.map(ScopeKey::from);
+        self
     }
 
     fn target_label(&self) -> String {
@@ -4043,6 +4124,28 @@ impl From<&ConsumerIdentity> for ConsumerIdentityKey {
         Self {
             module_id: value.module_id.clone(),
             launch_nonce: value.launch_nonce.clone(),
+        }
+    }
+}
+
+/// Every field of a [`ScopeSelector`], in hashable form.
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+struct ScopeKey {
+    /// The owner principal as its JSON encoding. `Principal` is not `Hash`,
+    /// and matching on its variants here would stop compiling when the
+    /// protocol crate adds one; the tagged encoding is unique per principal.
+    owner: String,
+    scope_ref: String,
+    scope_epoch: Option<u64>,
+}
+
+impl From<&ScopeSelector> for ScopeKey {
+    fn from(value: &ScopeSelector) -> Self {
+        Self {
+            owner: serde_json::to_string(&value.owner)
+                .unwrap_or_else(|_| format!("{:?}", value.owner)),
+            scope_ref: value.scope_ref.clone(),
+            scope_epoch: value.scope_epoch,
         }
     }
 }
@@ -6334,6 +6437,306 @@ mod tests {
             ]),
         );
         assert_eq!(left, right);
+    }
+
+    fn scope_selector(owner: &str, scope_ref: &str, scope_epoch: u64) -> ScopeSelector {
+        ScopeSelector {
+            owner: subc_protocol::Principal::Reserved {
+                module_id: owner.to_string(),
+            },
+            scope_ref: scope_ref.to_string(),
+            scope_epoch: Some(scope_epoch),
+        }
+    }
+
+    #[test]
+    fn route_key_separates_scopes_by_owner_ref_and_epoch_and_from_unscoped() {
+        let target = RouteTarget::ToolProvider {
+            module_id: "plexus".into(),
+        };
+        let identity = BindIdentity::new(PathBuf::from("/tmp/project"), "h", "s");
+        let key = |scope: Option<ScopeSelector>| {
+            RouteKey::new(&target, &identity, None, None).with_scope(scope.as_ref())
+        };
+        let base = key(Some(scope_selector("owner", "session-a", 1)));
+        assert_eq!(base, key(Some(scope_selector("owner", "session-a", 1))));
+        for (label, other) in [
+            ("epoch", key(Some(scope_selector("owner", "session-a", 2)))),
+            ("ref", key(Some(scope_selector("owner", "session-b", 1)))),
+            ("owner", key(Some(scope_selector("other", "session-a", 1)))),
+            ("unscoped", key(None)),
+        ] {
+            assert_ne!(base, other, "a different {label} must be a different route");
+        }
+        let mut no_epoch = scope_selector("owner", "session-a", 1);
+        no_epoch.scope_epoch = None;
+        assert_ne!(base, key(Some(no_epoch)));
+    }
+
+    /// The next route.open the consumer writes, skipping any other frame
+    /// (a GOODBYE, a cancel). Fails the test by name if none arrives, which is
+    /// what a cache hit that should have been a miss looks like.
+    async fn next_route_open(
+        receiver: &mut mpsc::Receiver<WriteCommand>,
+        why: &str,
+    ) -> (u64, serde_json::Value) {
+        loop {
+            let command = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+                .await
+                .unwrap_or_else(|_| panic!("no route.open was sent: {why}"))
+                .expect("writer channel open");
+            if command.frame.header.channel != 0 || command.frame.header.ty != FrameType::Request {
+                continue;
+            }
+            let request: serde_json::Value = serde_json::from_slice(&command.frame.body).unwrap();
+            if request["op"] == "route.open" {
+                return (command.frame.header.corr, request);
+            }
+        }
+    }
+
+    /// Open a route (scoped when `scope` is set) through the stand-in daemon,
+    /// accept its route.open on `channel`, and return the open's body and handle.
+    async fn open_answered(
+        shared: &Arc<Shared>,
+        consumer: &Arc<SubcConsumer>,
+        receiver: &mut mpsc::Receiver<WriteCommand>,
+        scope: Option<ScopeSelector>,
+        channel: u16,
+        why: &str,
+    ) -> (serde_json::Value, RouteHandle) {
+        let consumer = Arc::clone(consumer);
+        let task = tokio::spawn(async move {
+            match scope {
+                Some(scope) => {
+                    consumer
+                        .open_route_scoped(
+                            restart_target("plexus"),
+                            restart_identity(),
+                            scope,
+                            CallOptions::default(),
+                        )
+                        .await
+                }
+                None => {
+                    consumer
+                        .open_route(
+                            restart_target("plexus"),
+                            restart_identity(),
+                            CallOptions::default(),
+                        )
+                        .await
+                }
+            }
+        });
+        let (corr, request) = next_route_open(receiver, why).await;
+        assert!(dispatch_frame(shared, 1, route_open_answer(corr, channel, None)).await);
+        let handle = task.await.unwrap().expect("the stand-in accepted the open");
+        (request, handle)
+    }
+
+    #[tokio::test]
+    async fn scoped_routes_are_cached_per_owner_ref_and_epoch_and_apart_from_unscoped() {
+        let (shared, consumer, mut receiver) = route_open_stand_in(seeded_random(8));
+        let selector = scope_selector("owner", "session-a", 1);
+        let (request, first) = open_answered(
+            &shared,
+            &consumer,
+            &mut receiver,
+            Some(selector.clone()),
+            61,
+            "first scoped open",
+        )
+        .await;
+        assert_eq!(request["scope"], serde_json::to_value(&selector).unwrap());
+
+        // The same selector again is a cache hit: no route.open, same handle.
+        let again = consumer
+            .open_route_scoped(
+                restart_target("plexus"),
+                restart_identity(),
+                selector,
+                CallOptions::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(again, first);
+        assert!(
+            receiver.try_recv().is_err(),
+            "a cache hit must not send a route.open"
+        );
+
+        let mut handles = vec![first];
+        for (channel, scope, why) in [
+            (
+                62,
+                Some(scope_selector("owner", "session-a", 2)),
+                "another epoch of the same scope must open its own route",
+            ),
+            (
+                63,
+                Some(scope_selector("owner", "session-b", 1)),
+                "another scope ref must open its own route",
+            ),
+            (
+                64,
+                Some(scope_selector("other-owner", "session-a", 1)),
+                "another owner's scope must open its own route",
+            ),
+            (65, None, "an unscoped open must not reuse a scoped route"),
+        ] {
+            let expected_scope = scope
+                .as_ref()
+                .map(|scope| serde_json::to_value(scope).unwrap());
+            let (request, handle) =
+                open_answered(&shared, &consumer, &mut receiver, scope, channel, why).await;
+            assert_eq!(
+                request.get("scope").cloned(),
+                expected_scope,
+                "the route.open must carry exactly the requested scope: {why}"
+            );
+            assert!(!handles.contains(&handle), "{why}");
+            handles.push(handle);
+        }
+        shared.close_sync("test complete");
+    }
+
+    #[tokio::test]
+    async fn a_dropped_scoped_route_reopens_with_the_same_selector() {
+        let (shared, consumer, mut receiver) = route_open_stand_in(seeded_random(7));
+        let selector = scope_selector("owner", "session-a", 3);
+        let (first_request, first) = open_answered(
+            &shared,
+            &consumer,
+            &mut receiver,
+            Some(selector.clone()),
+            51,
+            "first scoped open",
+        )
+        .await;
+
+        // The daemon ends the route, as it does when the provider restarts.
+        let goodbye = Frame::build(
+            FrameType::Goodbye,
+            Flags::new(false, Priority::Interactive, false),
+            first.channel,
+            first.epoch,
+            0,
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(dispatch_frame(&shared, 1, goodbye).await);
+        assert!(matches!(
+            shared.route_state(first),
+            Err(CallError::StaleRouteHandle(_))
+        ));
+
+        let (second_request, second) = open_answered(
+            &shared,
+            &consumer,
+            &mut receiver,
+            Some(selector.clone()),
+            52,
+            "the reopen after the route dropped",
+        )
+        .await;
+        assert_eq!(first_request["scope"], serde_json::to_value(&selector).unwrap());
+        assert_eq!(second_request["scope"], first_request["scope"]);
+        assert_ne!(second, first);
+        shared.close_sync("test complete");
+    }
+
+    /// Refuse every scoped route.open with `code` until the open settles, and
+    /// return how many attempts were served and the error the caller got.
+    async fn refuse_scoped_opens(code: &str) -> (usize, CallError) {
+        let (shared, consumer, mut receiver) = route_open_stand_in(seeded_random(9));
+        let options = CallOptions {
+            timeout: Duration::from_secs(2),
+            route_retry: RetryBackoff {
+                base: Duration::ZERO,
+                cap: Duration::ZERO,
+                max_attempts: 2,
+            },
+            route_retry_deadline: Duration::from_millis(150),
+            ..CallOptions::default()
+        };
+        let mut task = tokio::spawn(async move {
+            consumer
+                .open_route_scoped(
+                    restart_target("plexus"),
+                    restart_identity(),
+                    scope_selector("owner", "session-a", 1),
+                    options,
+                )
+                .await
+        });
+        let mut attempts = 0usize;
+        let err = loop {
+            tokio::select! {
+                command = receiver.recv() => {
+                    let Some(command) = command else {
+                        break task.await.unwrap().expect_err("route.open must be refused");
+                    };
+                    attempts += 1;
+                    let frame = route_open_answer(
+                        command.frame.header.corr,
+                        0,
+                        Some(ErrorBody::new(code, "test refusal")),
+                    );
+                    assert!(dispatch_frame(&shared, 1, frame).await);
+                }
+                joined = &mut task => {
+                    break joined.unwrap().expect_err("route.open must be refused");
+                }
+            }
+        };
+        shared.close_sync("test complete");
+        (attempts, err)
+    }
+
+    #[tokio::test]
+    async fn scoped_open_retries_not_synced_and_changed_and_ends_on_the_terminal_scope_codes() {
+        for code in [error_codes::SCOPE_NOT_SYNCED, error_codes::SCOPE_CHANGED] {
+            let (attempts, err) = refuse_scoped_opens(code).await;
+            assert!(attempts > 1, "{code} must be retried, served {attempts}");
+            assert_eq!(
+                err.route_open_refusal().map(|body| body.code.as_str()),
+                Some(code)
+            );
+        }
+        for code in [
+            error_codes::SCOPE_ENDED,
+            error_codes::SCOPE_NOT_LIVE,
+            error_codes::SCOPE_EPOCH_REQUIRED,
+            error_codes::SCOPE_NOT_CARRIER,
+        ] {
+            let (attempts, err) = refuse_scoped_opens(code).await;
+            assert_eq!(attempts, 1, "{code} is terminal and must not be retried");
+            assert!(matches!(err, CallError::NotSent(_)));
+            assert_eq!(
+                err.route_open_refusal().map(|body| body.code.as_str()),
+                Some(code)
+            );
+        }
+    }
+
+    #[test]
+    fn every_scope_close_reason_must_not_reopen() {
+        for reason in [
+            subc_protocol::RouteCloseReason::ScopeEnded,
+            subc_protocol::RouteCloseReason::ScopeCarrierRemoved,
+            subc_protocol::RouteCloseReason::ScopeDelegationChanged,
+            subc_protocol::RouteCloseReason::ScopeParentEnded,
+        ] {
+            let wire = serde_json::to_value(reason).unwrap();
+            let wire = wire.as_str().expect("a close reason is a string");
+            assert!(wire.starts_with("scope_"), "{wire}");
+            assert_eq!(
+                RouteCloseReason::from_wire(wire).disposition(),
+                RouteCloseDisposition::MustNotReopen,
+                "a route closed for {wire} must not be reopened"
+            );
+        }
     }
 
     #[test]

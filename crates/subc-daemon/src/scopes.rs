@@ -118,9 +118,13 @@ pub(crate) struct ScopeTagChange {
     pub(crate) drain: ScopeDrain,
 }
 
-/// Which live routes a change to one scope closes, per the design note's
-/// drain table. A route stamped with an older version but not selected here
-/// stays up: its stamp grants no more than the current record does.
+/// Which live routes a change to one scope closes (the drain table in
+/// `docs/designs/daemon-scopes.md`). Only changes that take authority away
+/// close anything: the scope ending, a carrier or one of its target modules
+/// removed, `delegates` turned off or `agent_id` changed, or the parent
+/// ending. Any other change leaves routes up even though their stamp now
+/// carries an older version, because that stamp grants nothing the current
+/// record no longer grants.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ScopeDrain {
     /// Nothing: a carrier or target added, `child_owners` changed, a parent
@@ -136,9 +140,11 @@ pub(crate) enum ScopeDrain {
 }
 
 impl ScopeDrain {
-    /// Rank for combining two drains of one scope: the wider one wins, and
-    /// between reasons that close every route, the note's order (ended, then
-    /// parent ended, then delegation changed).
+    /// Rank for combining two drains of one scope in the same sync: closing
+    /// every route beats closing some carriers' routes, and among reasons
+    /// that close every route the most final is reported (the scope ended,
+    /// then its parent ended, then its delegation changed), so a client is
+    /// told the reason that also explains why reopening will not work.
     fn rank(&self) -> u8 {
         match self {
             Self::Nothing => 0,
@@ -1031,8 +1037,12 @@ impl ScopeTable {
     /// `opener` is the route's attested principal, never anything from the
     /// request body; `target_module` is the module the route is opened to;
     /// `owner_configured` is whether the owner is in the supervisor's roster.
-    /// The checks run in the design note's order: epoch named, owner synced,
-    /// ref live, epoch live, opener permitted.
+    /// The checks run in this order, each refusing with its own code: an epoch
+    /// is named, the owner has synced since this daemon started, the ref is
+    /// live, the named epoch is the live one, and the opener is the owner or a
+    /// carrier permitted to reach `target_module`. Earlier checks come first
+    /// so that a retryable refusal (owner not synced yet) is never masked by a
+    /// terminal one that would only be true until the owner re-syncs.
     pub(crate) fn admit(
         &self,
         opener: &Principal,

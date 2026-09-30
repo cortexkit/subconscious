@@ -2548,7 +2548,9 @@ impl ForwardingTable {
     /// new tag and is refused.
     ///
     /// Every client route index entry is scanned, which includes routes on a
-    /// swap's superseded endpoint: those stay indexed until drained.
+    /// swap's superseded endpoint (the old process of a module being replaced
+    /// blue/green, which keeps its existing routes until they drain): those
+    /// stay indexed until drained, so ending a scope reaches them too.
     pub(crate) fn publish_scope_changes(
         &self,
         changes: &[ScopeTagChange],

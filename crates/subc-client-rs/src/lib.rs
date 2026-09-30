@@ -1399,9 +1399,9 @@ where
             principal,
             consumer_capabilities,
             admission_facts,
-            // Not surfaced to handlers yet: the scope stamp reaches providers
-            // through this SDK in a later change. Ignoring it here is what an
-            // older build of this SDK does too.
+            // This SDK does not pass the scope stamp to handlers, so a provider
+            // built on it cannot act on it; ignoring the field is also exactly
+            // what builds that predate the field do.
             scope: _,
         } => {
             // Implicit-replace rule (wire spec 3.3.0): the daemon never rebinds a live

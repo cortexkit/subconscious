@@ -46,7 +46,13 @@ if [ -n "$pushed" ]; then
     # verdict is reported about a different file. Same shape as the
     # gate-rewrites-its-own-inputs rule: tree clean after the gate is what makes
     # the verdict be about the commit.
-    if [ -f Cargo.lock ] && ! cmp -s "$tmp/Cargo.lock" Cargo.lock; then
+    # Only when the pushed commit IS the checkout's HEAD: the working tree is
+    # what was gated only then. Pushing a tag on an older commit, or any ref
+    # that is not HEAD, compares that commit's lock with a newer working tree
+    # and refused every such push, a correct one included.
+    pushed_commit=$(git rev-parse --verify --quiet "$pushed^{commit}" || :)
+    if [ "$pushed_commit" = "$(git rev-parse HEAD)" ] && [ -f Cargo.lock ] \
+      && ! cmp -s "$tmp/Cargo.lock" Cargo.lock; then
       echo "pre-push: the working-tree Cargo.lock differs from the commit being pushed --" >&2
       echo "          your local gates verified a file that is not going to origin." >&2
       echo "          git diff HEAD -- Cargo.lock, then commit it or restore it." >&2

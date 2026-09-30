@@ -28,6 +28,7 @@ import {
   type ManifestInput,
   type ManifestProvenance,
   type ProviderConnectionState,
+  type SubcProviderConnectOptions,
 } from "../src/index.js";
 import { LaunchNonceError, resetLaunchNonceForTests } from "../src/launch-nonce.js";
 import { createRouteHandle, newConnectionToken, type RouteHandle } from "../src/route-handle.js";
@@ -96,6 +97,74 @@ describe("managementSurfaceManifest", () => {
         identity: { requires: [], optional: [] },
       },
     });
+  });
+});
+
+describe("SubcProvider draining", () => {
+  test("calls draining with reason and deadline before same-write GOODBYE", async () => {
+    const seen: Array<[string, number]> = [];
+    const deadline = Date.now() + 30_000;
+    await withDrainPeer((reason, date) => { seen.push([reason, date.getTime()]); }, async (provider, socket) => {
+      await writeAll(socket, Buffer.concat([
+        encodeFrame(drainPush("reload", deadline)),
+        encodeFrame(buildFrame(FrameType.Goodbye, CONTROL_FLAGS, 0, 0, 0n, new Uint8Array(0))),
+      ]), Date.now() + 1_000);
+      await provider.closed;
+      expect(seen).toEqual([["reload", deadline]]);
+    });
+  });
+
+  test("a never-settling draining hook does not stop PING being answered", async () => {
+    let calls = 0;
+    await withDrainPeer(() => { calls += 1; return new Promise<void>(() => undefined); }, async (provider, socket, reader) => {
+      await writeFrame(socket, drainPush("restart", Date.now() + 30_000), Date.now() + 1_000);
+      await expectDrainPong(socket, reader);
+      expect(calls).toBe(1);
+      await writeFrame(socket, buildFrame(FrameType.Goodbye, CONTROL_FLAGS, 0, 0, 0n, new Uint8Array(0)), Date.now() + 1_000);
+      await provider.closed;
+    });
+  });
+
+  test("undecodable Push is ignored once per connection and leaves it up", async () => {
+    const warnings: unknown[][] = [];
+    const originalWarn = console.warn;
+    console.warn = (...args) => { warnings.push(args); };
+    const seen: string[] = [];
+    try {
+      await withDrainPeer((reason) => { seen.push(reason); }, async (_provider, socket, reader) => {
+        for (const body of ["{", JSON.stringify({ op: "module.draining", reason: "reload" }), JSON.stringify({ op: "future.command" })]) {
+          await writeFrame(socket, buildFrame(FrameType.Push, CONTROL_FLAGS, 0, 0, 0n, Buffer.from(body)), Date.now() + 1_000);
+        }
+        await writeFrame(socket, buildFrame(FrameType.Push, CONTROL_FLAGS, 9, 1, 0n, encodeJson({ op: "module.draining", reason: "reload", deadline_ms: 123 })), Date.now() + 1_000);
+        await expectDrainPong(socket, reader);
+        expect(seen).toEqual([]);
+        expect(warnings.length).toBe(1);
+        await writeFrame(socket, drainPush("future_reason", 123), Date.now() + 1_000);
+        await expectDrainPong(socket, reader);
+        expect(seen).toEqual(["unknown"]);
+      });
+    } finally { console.warn = originalWarn; }
+  });
+
+  test("throwing or rejecting draining hooks do not end the connection", async () => {
+    const warnings: unknown[][] = [];
+    const originalWarn = console.warn;
+    console.warn = (...args) => { warnings.push(args); };
+    let calls = 0;
+    try {
+      await withDrainPeer(() => {
+        calls += 1;
+        if (calls === 1) throw new Error("sync drain failure");
+        return Promise.reject(new Error("async drain failure"));
+      }, async (_provider, socket, reader) => {
+        await writeFrame(socket, drainPush("disable", 123), Date.now() + 1_000);
+        await expectDrainPong(socket, reader);
+        await writeFrame(socket, drainPush("disable", 123), Date.now() + 1_000);
+        await expectDrainPong(socket, reader);
+        expect(calls).toBe(2);
+        expect(warnings.length).toBe(2);
+      });
+    } finally { console.warn = originalWarn; }
   });
 });
 
@@ -1792,4 +1861,57 @@ async function waitForCondition(predicate: () => boolean, label: string, timeout
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
   throw new Error(`timed out waiting for ${label}`);
+}
+
+function drainPush(reason: string, deadline_ms: number): Frame {
+  return buildFrame(FrameType.Push, CONTROL_FLAGS, 0, 0, 0n, encodeJson({ op: "module.draining", reason, deadline_ms }));
+}
+
+async function expectDrainPong(socket: Socket, reader: SocketReader): Promise<void> {
+  const deadline = Date.now() + 1_000;
+  await writeFrame(socket, buildFrame(FrameType.Ping, CONTROL_FLAGS, 0, 0, 77n, new Uint8Array(0)), deadline);
+  const pong = await readFrame(reader, deadline);
+  expect(pong.header.ty).toBe(FrameType.Pong);
+  expect(pong.header.corr).toBe(77n);
+}
+
+async function withDrainPeer(
+  onDraining: NonNullable<SubcProviderConnectOptions["onDraining"]>,
+  run: (provider: SubcProvider, socket: Socket, reader: SocketReader) => Promise<void>,
+): Promise<void> {
+  const server = await listenFakeServer();
+  const dir = trackedTempDir("subc-provider-drain-");
+  let socket: Socket | undefined;
+  const peer = new Promise<SocketReader>((resolve, reject) => {
+    server.server.once("connection", (connected) => {
+      socket = connected;
+      const reader = new SocketReader(connected);
+      void (async () => {
+        const deadline = Date.now() + 1_000;
+        await authenticateFakeServer(reader, connected, deadline);
+        const hello = await readFrame(reader, deadline);
+        await writeFrame(connected, buildFrame(FrameType.HelloAck, CONTROL_FLAGS, 0, 0, hello.header.corr, encodeJson({
+          negotiated_ver: PROTOCOL_VERSION, subc_ops: [], subc_capabilities: [],
+        })), deadline);
+        resolve(reader);
+      })().catch(reject);
+    });
+  });
+  let provider: SubcProvider | undefined;
+  try {
+    const [connected, reader] = await Promise.all([
+      SubcProvider.connect({
+        connectionFile: writeConnectionFile(dir, server.port),
+        manifest: managementSurfaceManifest({ moduleId: "drain-provider", operations: ["echo"] }),
+        handler: (_handle, body) => body, onDraining, launchNonce: "", reconnectOnDrop: false,
+      }),
+      peer,
+    ]);
+    provider = connected;
+    await run(provider, socket!, reader);
+  } finally {
+    await provider?.close();
+    socket?.destroy();
+    server.server.close();
+  }
 }

@@ -4,6 +4,8 @@ import { AuthError, authenticateClient } from "./auth.js";
 import {
   DEFAULT_RECONNECT_BACKOFF,
   isEstablishedRouteDead,
+  parseRouteCloseReason,
+  type RouteCloseReason,
   SUBC_MODULE_ID_ENV,
   type BindIdentity,
   type ReconnectBackoff,
@@ -51,6 +53,7 @@ const BODY_READ_TIMEOUT_MS = 30_000;
 const WRITE_TIMEOUT_MS = 30_000;
 const DEFAULT_RESTORED_DEBOUNCE_MS = 250;
 const DEFAULT_PROVIDER_HANDLER_CAPACITY = 64;
+const DRAINING_HOOK_START_LIMIT_MS = 2_000;
 const HEALTH_CHECK_OP = "health.check";
 export const HELLO_CORR = 1n;
 
@@ -287,6 +290,22 @@ export interface SubcProviderConnectOptions {
   /** Runs only after an accepted bind ack is queued and the handle is installed. */
   onBound?: (handle: RouteHandle) => void | Promise<void>;
   onRouteGone?: (handle: RouteHandle) => void | Promise<void>;
+  /**
+   * The daemon has stopped admitting routes and is draining the module. Stop
+   * taking new work and finish or hand off work in flight. Called once per
+   * notice, independently of the frame reader; throws and rejections are contained.
+   * GOODBYE and connection-end reporting wait at most 2 s for hooks to start,
+   * not for them to finish. Hooks may still be running after serving ends.
+   * The wall-clock deadline is "no later than", never a grant of time: the
+   * daemon enforces its own monotonic ceiling, which can expire earlier.
+   *
+   * Background work the daemon cannot see holds a drain open only when the
+   * manifest declares a Busy self-signal anchored to health gauges. Report
+   * those gauges above zero in health metrics until that work finishes. During
+   * draining the daemon waits for every declared gauge to reach zero (a missing
+   * gauge counts as busy), or for its deadline. A pending hook alone is not busy.
+   */
+  onDraining?: (reason: RouteCloseReason, deadline: Date) => void | Promise<void>;
   /** Backoff for provider reconnect after an unexpected socket drop. */
   reconnectBackoff?: ReconnectBackoff;
   /** Injectable sleep for timer-free reconnect and debounce tests. */
@@ -328,6 +347,7 @@ interface NormalizedSubcProviderConnectOptions {
   /** Runs only after an accepted bind ack is queued and the handle is installed. */
   onBound?: (handle: RouteHandle) => void | Promise<void>;
   onRouteGone?: (handle: RouteHandle) => void | Promise<void>;
+  onDraining?: (reason: RouteCloseReason, deadline: Date) => void | Promise<void>;
   reconnectBackoff: ReconnectBackoff;
   sleep: (ms: number) => Promise<void>;
   restoredDebounceMs: number;
@@ -335,6 +355,11 @@ interface NormalizedSubcProviderConnectOptions {
   /** The launch nonce to echo in HELLO, already resolved against the environment. */
   launchNonce?: string;
   reconnectOnDrop: boolean;
+}
+
+interface ControlPushState {
+  undecodablePushLogged: boolean;
+  drainingHooks: Set<Promise<void>>;
 }
 
 interface OpenedProviderConnection {
@@ -691,16 +716,18 @@ export class SubcProvider {
   }
 
   private async readLoop(sock: SubcSocket, generation: number): Promise<void> {
+    const control: ControlPushState = { undecodablePushLogged: false, drainingHooks: new Set() };
     try {
       for (;;) {
         const frame = await sock.readFrame(Number.POSITIVE_INFINITY, { afterHeaderMs: BODY_READ_TIMEOUT_MS });
-        const keepGoing = await this.dispatch(frame, sock, generation);
+        const keepGoing = await this.dispatch(frame, sock, generation, control);
         if (!keepGoing) {
           if (this.sock === sock && this.generation === generation) this.closeStarted = true;
           break;
         }
       }
     } catch (error) {
+      await this.waitForDrainingHooksToStart(control);
       if (this.sock === sock && this.generation === generation && !this.closeStarted) {
         this.handleUnexpectedDrop(sock, generation, error instanceof Error ? error : new SubcProviderError(String(error)));
         return;
@@ -713,7 +740,7 @@ export class SubcProvider {
     }
   }
 
-  private async dispatch(frame: Frame, sock: SubcSocket, generation: number): Promise<boolean> {
+  private async dispatch(frame: Frame, sock: SubcSocket, generation: number, control: ControlPushState = { undecodablePushLogged: false, drainingHooks: new Set() }): Promise<boolean> {
     let handle: RouteHandle | null = null;
     if (frame.header.channel !== 0) {
       handle = this.liveRoutes.get(frame.header.channel) ?? null;
@@ -761,7 +788,11 @@ export class SubcProvider {
           );
         }
         return true;
+      case FrameType.Push:
+        if (frame.header.channel === 0) this.handleControlPush(frame, control);
+        return true;
       case FrameType.Goodbye:
+        await this.waitForDrainingHooksToStart(control);
         if (!handle) return false;
         this.liveRoutes.delete(handle.channel);
         this.abortHandle(handle);
@@ -786,21 +817,58 @@ export class SubcProvider {
     }
   }
 
-  /**
-   * Invoke the consumer's route-gone callback without letting it break the
-   * read loop. Every call site is awaited on the read loop's path, so a throw
-   * escaping from it is read as an unexpected connection drop and tears down
-   * every route on the connection; report and absorb it here instead, the same
-   * way a failing request handler is reported.
-   */
-  /**
-   * Invoke the consumer's bound callback without letting it break the read
-   * loop. By the time it runs the bind is acknowledged and the route installed,
-   * so a throw here is a failure of the consumer's setup for THIS route, and
-   * letting it escape would be read as an unexpected connection drop and tear
-   * down every other route on the connection. The route stays bound: the
-   * daemon already considers it live, and the consumer can close it.
-   */
+  private handleControlPush(frame: Frame, control: ControlPushState): void {
+    let body: { op?: unknown; reason?: unknown; deadline_ms?: unknown };
+    try {
+      body = JSON.parse(Buffer.from(frame.body).toString("utf8"));
+      if (body === null || body.op !== "module.draining" || typeof body.reason !== "string" ||
+          typeof body.deadline_ms !== "number" || !Number.isInteger(body.deadline_ms) || body.deadline_ms < 0) {
+        throw new Error("invalid module control command");
+      }
+    } catch (error) {
+      if (!control.undecodablePushLogged) {
+        control.undecodablePushLogged = true;
+        console.warn("SubcProvider ignoring undecodable channel-0 Push; further warnings suppressed on this connection", error);
+      }
+      return;
+    }
+    const deadline = new Date(body.deadline_ms as number);
+    // Out-of-range wall clocks expire now rather than granting extra drain time.
+    if (Number.isNaN(deadline.getTime())) deadline.setTime(Date.now());
+    let markStarted!: () => void;
+    const started = new Promise<void>((resolve) => { markStarted = resolve; });
+    control.drainingHooks.add(started);
+    // A separate microtask runs the hook through its first await, without waiting
+    // for its completion on the reader. JavaScript hooks must not block synchronously.
+    void Promise.resolve().then(() => {
+      try {
+        const result = this.opts.onDraining?.(parseRouteCloseReason(body.reason), deadline);
+        void Promise.resolve(result).catch((error) => {
+          console.warn("SubcProvider draining callback failed", error);
+        });
+      } catch (error) {
+        console.warn("SubcProvider draining callback failed", error);
+      } finally {
+        markStarted();
+        control.drainingHooks.delete(started);
+      }
+    });
+  }
+
+  private async waitForDrainingHooksToStart(control: ControlPushState): Promise<void> {
+    if (control.drainingHooks.size === 0) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        Promise.all(control.drainingHooks),
+        new Promise<void>((resolve) => { timer = setTimeout(resolve, DRAINING_HOOK_START_LIMIT_MS); }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /** Contain callback failures so consumer setup cannot tear down unrelated routes. */
   private async reportRouteBound(handle: RouteHandle): Promise<void> {
     if (!this.opts.onBound) return;
     try {
@@ -810,6 +878,7 @@ export class SubcProvider {
     }
   }
 
+  /** Contain callback failures so route teardown cannot end the frame reader. */
   private async reportRouteGone(handle: RouteHandle): Promise<void> {
     if (!this.opts.onRouteGone) return;
     try {
@@ -1408,6 +1477,7 @@ function normalizeProviderConnectOptions(opts: SubcProviderConnectOptions): Norm
     onBind: opts.onBind,
     onBound: opts.onBound,
     onRouteGone: opts.onRouteGone,
+    onDraining: opts.onDraining,
     reconnectBackoff: opts.reconnectBackoff ?? DEFAULT_RECONNECT_BACKOFF,
     sleep: opts.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms))),
     restoredDebounceMs: opts.restoredDebounceMs ?? DEFAULT_RESTORED_DEBOUNCE_MS,

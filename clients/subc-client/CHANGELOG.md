@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.19.0 — 2026-09-30
+
+- Add optional `onDraining(reason: RouteCloseReason, deadline: Date)` to `SubcProviderConnectOptions`. Channel-0 `module.draining` Push notices start the callback without waiting for completion, so PING and GOODBYE keep flowing. GOODBYE and connection-end reporting wait at most 2 seconds for hooks to start. Throws and rejections are contained; unknown reasons arrive as `unknown`. Undecodable channel-0 Push frames are ignored with one warning per connection.
+- Document the wall-clock deadline as a no-later-than bound. To keep draining open for background work, declare a Busy self-signal in the manifest that names health gauges (work counters), and report them above zero in health metrics until work finishes; the daemon waits for those counters to reach zero or for its deadline.
+
 ## 0.18.1 — 2026-09-30
 
 - `isRetryableRouteOpenCode` treats `scope_not_synced` and `scope_changed` as retryable, following the shared `decision_tables.json` record. The daemon returns them for scoped `route.open` requests: the first when the scope's owner has not re-synced since a daemon restart, the second when the scope changed between admission and commit. In both cases nothing was sent. Daemons that do not support scopes never return either code.

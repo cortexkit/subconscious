@@ -25,6 +25,7 @@ import {
   SUBSCRIPTION_FLAG,
   type Frame,
 } from "./envelope.js";
+import { launchNonceOrUndefined } from "./launch-nonce.js";
 import {
   belongsToConnection,
   createRouteHandle,
@@ -97,7 +98,7 @@ const BODY_READ_TIMEOUT_MS = 30_000;
 const EMPTY_BODY = new Uint8Array(0);
 const DEFAULT_MANAGED_TARGET_KIND: ManagedRouteKind = "management_surface";
 export const SUBC_MODULE_ID_ENV = "SUBC_MODULE_ID";
-export const SUBC_LAUNCH_NONCE_ENV = "SUBC_LAUNCH_NONCE";
+export { SUBC_LAUNCH_NONCE_ENV } from "./launch-nonce.js";
 
 export interface BindIdentity {
   project_root: string;
@@ -118,7 +119,7 @@ export interface ConsumerIdentity {
 }
 
 export interface RouteOpenOptions {
-  /** Optional override for the consumer identity; by default the SUBC_MODULE_ID and SUBC_LAUNCH_NONCE environment variables are used when both are non-empty. Set null to send route.open without consumer_identity. */
+  /** Optional override for the consumer identity; by default the SUBC_MODULE_ID environment variable and the process's launch nonce (see `launchNonce`) are used when both are non-empty; a refused launch-nonce descriptor counts as no nonce. Set null to send route.open without consumer_identity. */
   consumerIdentity?: ConsumerIdentity | null;
   /**
    * Handlers prepared before route.open. The client derives consumer_capabilities
@@ -205,7 +206,7 @@ export interface ManagedCallOptions extends RequestOptions {
   identity?: BindIdentity;
   /** Defaults to management_surface, matching the store/host management APIs. */
   targetKind?: ManagedRouteKind;
-  /** Optional override for the consumer identity; by default the SUBC_MODULE_ID and SUBC_LAUNCH_NONCE environment variables are used when both are non-empty. Set null to send route.open without consumer_identity. */
+  /** Optional override for the consumer identity; by default the SUBC_MODULE_ID environment variable and the process's launch nonce (see `launchNonce`) are used when both are non-empty; a refused launch-nonce descriptor counts as no nonce. Set null to send route.open without consumer_identity. */
   consumerIdentity?: ConsumerIdentity | null;
   /** Reverse-request handlers used by the managed route and all of its reconnect reopens. */
   reverseRequests?: ReverseRequestRegistry;
@@ -2263,7 +2264,12 @@ function routeCacheKey(
 function routeOpenConsumerIdentity(opts: RouteOpenOptions = {}): ConsumerIdentity | undefined {
   if (opts.consumerIdentity !== undefined) return opts.consumerIdentity ?? undefined;
   const moduleId = process.env[SUBC_MODULE_ID_ENV];
-  const launchNonce = process.env[SUBC_LAUNCH_NONCE_ENV];
+  // The nonce comes from the one process-wide accessor, never straight from the
+  // environment: the module's HELLO may already have read and closed the
+  // descriptor, and a second reader would find some other file at its number.
+  // A refused descriptor means this process has no identity to present, so the
+  // route opens without one, as the Rust consumer does.
+  const launchNonce = launchNonceOrUndefined()?.value;
   if (!moduleId || !launchNonce) return undefined;
   return { module_id: moduleId, launch_nonce: launchNonce };
 }

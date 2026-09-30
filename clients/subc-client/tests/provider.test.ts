@@ -1,8 +1,9 @@
 import { createServer, type AddressInfo, type Server, type Socket } from "node:net";
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { chmodSync, closeSync, constants, fstatSync, mkdtempSync, openSync, rmSync, writeFileSync, writeSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 
 import {
   CLIENT_AUTH_DOMAIN,
@@ -22,10 +23,13 @@ import {
   Priority,
   PROTOCOL_VERSION,
   SubcProvider,
+  SubcProviderError,
   type Frame,
   type ManifestInput,
+  type ManifestProvenance,
   type ProviderConnectionState,
 } from "../src/index.js";
+import { LaunchNonceError, resetLaunchNonceForTests } from "../src/launch-nonce.js";
 import { createRouteHandle, newConnectionToken, type RouteHandle } from "../src/route-handle.js";
 
 const KEY = Uint8Array.from(Array(32).fill(0x4b));
@@ -47,9 +51,16 @@ function reconnectInternals(provider: SubcProvider): ProviderReconnectInternals 
 const tempDirs: string[] = [];
 const scriptedDaemons: ScriptedProviderDaemon[] = [];
 
+// The launch nonce is read once per process and cached; these tests change the
+// environment between cases, so each starts from an unread accessor.
+beforeEach(() => {
+  resetLaunchNonceForTests();
+});
+
 afterEach(async () => {
   for (const daemon of scriptedDaemons.splice(0)) await daemon.stop();
   for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+  resetLaunchNonceForTests();
 });
 
 describe("managementSurfaceManifest", () => {
@@ -1056,6 +1067,116 @@ describe("SubcProvider closed", () => {
   });
 });
 
+describe("SubcProvider launch nonce", () => {
+  const PROVENANCE: ManifestProvenance = { build_git_sha: "0123456789abcdef0123456789abcdef01234567", wire_crate_version: "0.16.0" };
+  const NO_NONCE_ENV = { SUBC_MODULE_ID: undefined, SUBC_LAUNCH_NONCE: undefined, SUBC_LAUNCH_NONCE_FD: undefined };
+
+  async function helloFor(
+    env: Record<string, string | undefined>,
+    opts: { provenance?: ManifestProvenance; launchNonce?: string } = {},
+  ): Promise<Record<string, unknown>> {
+    const daemon = await ScriptedProviderDaemon.start();
+    const connFile = writeConnectionFile(trackedTempDir("subc-provider-nonce-"), daemon.port);
+    const manifest = managementSurfaceManifest({ moduleId: "nonce-provider", operations: ["echo"] });
+    const provider = await withEnv({ ...NO_NONCE_ENV, ...env }, () =>
+      SubcProvider.connect({
+        connectionFile: connFile,
+        manifest: opts.provenance === undefined ? manifest : { ...manifest, provenance: opts.provenance },
+        handler: async (_routeChannel, body) => body,
+        ...(opts.launchNonce === undefined ? {} : { launchNonce: opts.launchNonce }),
+      }),
+    );
+    await provider.close();
+    expect(daemon.hellos).toHaveLength(1);
+    return daemon.hellos[0]!;
+  }
+
+  function provenanceOf(hello: Record<string, unknown>): unknown {
+    return (hello.manifest as Record<string, unknown>).provenance;
+  }
+
+  /** A FIFO holding `nonce`, returned as the daemon's `<fd>:<inode>` value for it. */
+  function daemonPipe(nonce: string): string {
+    const path = join(trackedTempDir("subc-provider-fifo-"), "nonce");
+    execFileSync("mkfifo", [path]);
+    const fd = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK);
+    const writer = openSync(path, constants.O_WRONLY);
+    writeSync(writer, nonce);
+    closeSync(writer);
+    return `${fd}:${BigInt.asUintN(64, fstatSync(fd, { bigint: true }).ino)}`;
+  }
+
+  test("HELLO carries the nonce read from the descriptor and provenance reports fd", async () => {
+    const fdValue = daemonPipe("nonce-from-the-pipe");
+    const hello = await helloFor(
+      { SUBC_LAUNCH_NONCE_FD: fdValue, SUBC_LAUNCH_NONCE: "nonce-from-the-environment" },
+      { provenance: PROVENANCE },
+    );
+    expect(hello.launch_nonce).toBe("nonce-from-the-pipe");
+    expect(provenanceOf(hello)).toEqual({ ...PROVENANCE, launch_nonce_source: "fd" });
+  });
+
+  test("HELLO carries the environment copy when no descriptor is named and provenance reports env", async () => {
+    const hello = await helloFor({ SUBC_LAUNCH_NONCE: "nonce-from-the-environment" }, { provenance: PROVENANCE });
+    expect(hello.launch_nonce).toBe("nonce-from-the-environment");
+    expect(provenanceOf(hello)).toEqual({ ...PROVENANCE, launch_nonce_source: "env" });
+  });
+
+  test("provenance is sent only when declared, and a declared source is kept", async () => {
+    const undeclared = await helloFor({ SUBC_LAUNCH_NONCE: "n1" });
+    expect("provenance" in (undeclared.manifest as Record<string, unknown>)).toBe(false);
+
+    resetLaunchNonceForTests();
+    const declared = await helloFor({ SUBC_LAUNCH_NONCE: "n2" }, { provenance: { launch_nonce_source: "fd" } });
+    expect(provenanceOf(declared)).toEqual({ launch_nonce_source: "fd" });
+  });
+
+  test("no source is reported without a nonce, or for a nonce the caller supplied", async () => {
+    const none = await helloFor({}, { provenance: PROVENANCE });
+    expect("launch_nonce" in none).toBe(false);
+    expect(provenanceOf(none)).toEqual(PROVENANCE);
+
+    resetLaunchNonceForTests();
+    const supplied = await helloFor(
+      { SUBC_LAUNCH_NONCE: "nonce-from-the-environment" },
+      { provenance: PROVENANCE, launchNonce: "handed-over-by-a-parent" },
+    );
+    expect(supplied.launch_nonce).toBe("handed-over-by-a-parent");
+    expect(provenanceOf(supplied)).toEqual(PROVENANCE);
+  });
+
+  test("a refused descriptor fails connect with a typed error before HELLO, never the environment copy", async () => {
+    const daemon = await ScriptedProviderDaemon.start();
+    const connFile = writeConnectionFile(trackedTempDir("subc-provider-nonce-"), daemon.port);
+    const attempt = withEnv(
+      { SUBC_MODULE_ID: "nonce-provider", SUBC_LAUNCH_NONCE_FD: "not-a-descriptor", SUBC_LAUNCH_NONCE: "nonce-from-the-environment" },
+      () =>
+        SubcProvider.connect({
+          connectionFile: connFile,
+          manifest: managementSurfaceManifest({ moduleId: "nonce-provider", operations: ["echo"] }),
+          handler: async (_routeChannel, body) => body,
+        }),
+    );
+
+    const error = await attempt.then(
+      () => {
+        throw new Error("connect should have refused");
+      },
+      (caught: unknown) => caught,
+    );
+    expect(error).toBeInstanceOf(SubcProviderError);
+    const providerError = error as SubcProviderError;
+    expect(providerError.code).toBe("launch_nonce_unavailable");
+    expect(providerError.detail).toEqual({ kind: "Malformed" });
+    expect(providerError.cause).toBeInstanceOf(LaunchNonceError);
+    expect(providerError.message).toBe(
+      'launch nonce unavailable: SUBC_LAUNCH_NONCE_FD="not-a-descriptor" is not <fd>:<inode>',
+    );
+    expect(daemon.helloCount).toBe(0);
+    expect(daemon.hellos).toHaveLength(0);
+  });
+});
+
 /** Runs `fn` with the given variables set (or unset when undefined), then restores them. */
 async function withEnv<T>(vars: Record<string, string | undefined>, fn: () => Promise<T>): Promise<T> {
   const saved = new Map<string, string | undefined>();
@@ -1349,6 +1470,8 @@ type HelloResult = "ack" | "drop" | { code: string; message: string };
 class ScriptedProviderDaemon {
   readonly sockets = new Set<Socket>();
   helloCount = 0;
+  /** Every HELLO body received, parsed, in arrival order. */
+  readonly hellos: Array<Record<string, unknown>> = [];
   private readonly waiters: Array<{ count: number; resolve: () => void }> = [];
   private stopped = false;
 
@@ -1413,6 +1536,7 @@ class ScriptedProviderDaemon {
     expect(hello.header.ty).toBe(FrameType.Hello);
     expect(hello.header.channel).toBe(0);
     expect(hello.header.corr).toBe(HELLO_CORR);
+    this.hellos.push(JSON.parse(Buffer.from(hello.body).toString("utf8")) as Record<string, unknown>);
 
     const result = this.helloResults.shift() ?? "ack";
     if (result === "ack") {

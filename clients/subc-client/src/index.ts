@@ -85,6 +85,17 @@ export {
 } from "./auth.js";
 export { SubcSocket, SocketClosedError, SocketTimeoutError } from "./socket.js";
 export {
+  launchNonce,
+  launchNonceOrUndefined,
+  isLaunchNonceError,
+  LaunchNonceError,
+  LAUNCH_NONCE_FD,
+  SUBC_LAUNCH_NONCE_FD_ENV,
+  type LaunchNonce,
+  type LaunchNonceErrorKind,
+  type LaunchNonceSource,
+} from "./launch-nonce.js";
+export {
   SubcProvider,
   SubcProviderError,
   HELLO_CORR,
@@ -105,6 +116,7 @@ export {
   type ManagementOperationKind,
   type ManagementSurfaceManifestOptions,
   type ManifestInput,
+  type ManifestProvenance,
   machineIdFromHelloAck,
   type ModuleHelloAckBody,
   type ObservabilityKind,

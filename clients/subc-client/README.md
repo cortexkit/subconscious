@@ -78,6 +78,40 @@ fails loud with an `AuthError` rather than connecting insecurely.
 - **Connection-file security.** On unix the file must be owner-only (`0600`); a
   group/world-readable file is rejected, because the key has effectively leaked.
 
+### Launch nonce
+
+A module the daemon spawns proves who it is with a launch nonce. On macOS and
+Linux the daemon hands it over as a pipe at descriptor 3, named by
+`SUBC_LAUNCH_NONCE_FD=3:<inode>`, and during the rollout also as
+`SUBC_LAUNCH_NONCE` (which any same-user process can read with `ps eww`).
+`launchNonce()` is the one reader: it takes the descriptor only when it is a
+pipe with the named inode that holds bytes, reads it to end of file, closes it,
+and caches the value and its source (`fd` or `env`) for the life of the
+process. A named descriptor that is closed, not a pipe, a different pipe, empty
+or malformed throws a `LaunchNonceError` (`NotOpen`, `NotAPipe`, `WrongPipe`,
+`Empty`, `Malformed`), leaves the descriptor as it was, and never falls back to
+the environment copy. The environment copy is read only when
+`SUBC_LAUNCH_NONCE_FD` is absent. `process.env` is never modified.
+
+- `SubcProvider.connect()` sends the nonce in HELLO and rejects with a
+  `SubcProviderError` coded `launch_nonce_unavailable` on a refusal. A declared
+  `manifest.provenance` gets `launch_nonce_source` filled in when unset.
+- `route.open` presents the nonce as consumer identity; a refusal means no
+  identity.
+- Call `launchNonce()` (or connect the provider) before spawning anything: until
+  the first read, descriptor 3 is inheritable. A process spawned afterwards
+  inherits the variable but not the pipe, and its accessor refuses by name.
+- Every copy of this package in a JavaScript realm shares the cache. A worker
+  thread is a separate realm, so read the nonce on the main thread.
+- It relies on the write end of the pipe being closed before the module
+  starts, as the daemon's handoff does. Node and Bun cannot count the bytes
+  waiting in a pipe without reading them, so emptiness is checked with a first
+  read, which returns nothing and consumes nothing at end of file; if a writer
+  still held the pipe open, that read would block instead of reporting
+  `Empty`. (fstat's size is no substitute: macOS reports the waiting bytes for
+  an anonymous pipe, but 0 for a mkfifo pipe, and Linux reports 0 for every
+  pipe.)
+
 ## Testing
 
 ```sh
@@ -100,4 +134,5 @@ package builds the `ck-subc` executable).
 | `src/auth.ts` | HMAC-SHA256 handshake (`computeProof`, constant-time verify) |
 | `src/route-handle.ts` | immutable connection-bound `(channel, epoch)` route identity |
 | `src/client.ts` | `SubcClient`: route handles, channel-0 RPCs, epoch-aware corr-mux |
+| `src/launch-nonce.ts` | the one launch-nonce reader: descriptor 3 or the environment copy, cached |
 | `src/provider.ts` | provider bind publication, epoch validation, and routed serving |

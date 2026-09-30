@@ -24,7 +24,13 @@ import {
   DAEMON_ORIGIN_FLAG,
   SUBSCRIPTION_FLAG,
 } from "../src/envelope";
-import { machineIdFromHelloAck, type ModuleHelloAckBody } from "../src/provider";
+import {
+  machineIdFromHelloAck,
+  managementSurfaceManifest,
+  normalizeManifest,
+  type ManifestProvenance,
+  type ModuleHelloAckBody,
+} from "../src/provider";
 
 // The Rust golden fixtures are canonical serializations of the wire shapes both
 // languages speak. Their README has always said the TypeScript client consumes
@@ -123,6 +129,7 @@ describe("Rust golden fixtures", () => {
       "error_body_module_removed",
       "module_hello_ack_body",
       "module_hello_ack_body_with_machine_id",
+      "module_hello_body_with_provenance",
       "module_control_request_route_bind",
       "module_control_request_route_bind_without_consumer_capabilities",
       "module_control_request_health_check",
@@ -170,6 +177,28 @@ describe("Rust golden fixtures", () => {
     // The scan reads this file, so it must at minimum find the names above. A
     // read that returned nothing would report perfect coverage.
     expect(source.length).toBeGreaterThan(0);
+  });
+
+  test("a declared provenance block reaches HELLO field for field", () => {
+    // The provider copies provenance field by field, so a field Rust sends and
+    // the TypeScript type does not declare would be silently dropped here.
+    const hello = loadGolden<{ manifest: { provenance: ManifestProvenance } }>(
+      "module_hello_body_with_provenance",
+    );
+    const provenance = hello.manifest.provenance;
+    expect(Object.keys(provenance).length).toBeGreaterThan(0);
+    const manifest = {
+      ...managementSurfaceManifest({ moduleId: "golden", operations: ["echo"] }),
+      provenance,
+    };
+
+    // No nonce sent: nothing is added, so the block is the fixture's exactly.
+    expect(normalizeManifest(manifest, undefined).provenance).toEqual(provenance);
+    // A declared source is sent as it is.
+    expect(
+      normalizeManifest({ ...manifest, provenance: { ...provenance, launch_nonce_source: "fd" } }, undefined)
+        .provenance,
+    ).toEqual({ ...provenance, launch_nonce_source: "fd" });
   });
 
   test("error bodies carry the fields the client reads off a failed frame", () => {

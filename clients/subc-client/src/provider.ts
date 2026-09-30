@@ -4,7 +4,6 @@ import { AuthError, authenticateClient } from "./auth.js";
 import {
   DEFAULT_RECONNECT_BACKOFF,
   isEstablishedRouteDead,
-  SUBC_LAUNCH_NONCE_ENV,
   SUBC_MODULE_ID_ENV,
   type BindIdentity,
   type ReconnectBackoff,
@@ -24,6 +23,13 @@ import {
   PROTOCOL_VERSION,
   type Frame,
 } from "./envelope.js";
+import {
+  isLaunchNonceError,
+  launchNonce as processLaunchNonce,
+  launchNonceOrUndefined,
+  type LaunchNonceError,
+  type LaunchNonceSource,
+} from "./launch-nonce.js";
 import {
   belongsToConnection,
   createRouteHandle,
@@ -74,6 +80,35 @@ export interface ManifestInput {
   provides: ProviderRoleInput[];
   consumes: ConsumerRoleInput[];
   bindings: BindingsInput;
+  /**
+   * Facts about the running build, sent in HELLO only when declared. When it is
+   * declared without `launch_nonce_source`, the provider fills that field in
+   * from the launch nonce it sends.
+   */
+  provenance?: ManifestProvenance;
+}
+
+/**
+ * Build provenance a module declares in its manifest; mirrors
+ * `ManifestProvenance` in subc-protocol. Every field is optional and is left
+ * off the wire when unset. Omit a field you cannot know rather than sending a
+ * placeholder such as "unknown".
+ */
+export interface ManifestProvenance {
+  build_git_sha?: string;
+  /** Why `build_git_sha` is unavailable; an open set of reasons. */
+  build_git_sha_absence_reason?: string;
+  build_lock_digest?: string;
+  /** The subc-protocol crate version this module's wire vocabulary matches. */
+  wire_crate_version?: string;
+  store_schema_version?: string;
+  /**
+   * Where the running module read its launch nonce from: `fd` (the pipe the
+   * daemon hands over as descriptor 3) or `env` (the environment variable kept
+   * while modules move to the pipe). A fact about the running process, not
+   * the build. Filled in by the provider when left unset.
+   */
+  launch_nonce_source?: LaunchNonceSource;
 }
 
 export type ProviderRoleInput =
@@ -262,16 +297,19 @@ export interface SubcProviderConnectOptions {
   onConnectionState?: (event: ProviderConnectionState) => void | Promise<void>;
   /**
    * The one-time launch nonce to echo in HELLO for a reserved module. Defaults to
-   * the `SUBC_LAUNCH_NONCE` environment variable subc injects on spawn; pass
-   * explicitly to override. Omitted from the wire when empty (non-reserved modules).
+   * the process's launch nonce (see `launchNonce`: the descriptor subc hands
+   * over, or the `SUBC_LAUNCH_NONCE` environment copy), and `connect()` rejects
+   * with code `launch_nonce_unavailable` when a named descriptor is refused.
+   * Pass explicitly to override. Omitted from the wire when empty
+   * (non-reserved modules).
    */
   launchNonce?: string;
   /**
    * Whether an unexpected connection drop starts a reconnect-and-re-register
    * cycle (`true`) or ends serving and resolves {@link SubcProvider.closed}
    * (`false`). Defaults to `false` when the process runs under the daemon's
-   * supervision (both `SUBC_MODULE_ID` and `SUBC_LAUNCH_NONCE` are set and
-   * non-empty in its environment, the pair the daemon injects at spawn), since
+   * supervision (`SUBC_MODULE_ID` is set and the process has a launch nonce,
+   * the pair the daemon injects at spawn), since
    * the daemon owns a supervised module's restarts and waits for it to exit;
    * `true` otherwise, so plugins and other self-connecting providers keep
    * reconnecting. A daemon GOODBYE and `close()` end serving regardless.
@@ -1343,7 +1381,22 @@ function normalizeProviderConnectOptions(opts: SubcProviderConnectOptions): Norm
   // spawns a module; together they mark the process as supervised, and the nonce
   // is also what HELLO echoes for a reserved module_id.
   const envModuleId = nonEmpty(process.env[SUBC_MODULE_ID_ENV]);
-  const envLaunchNonce = nonEmpty(process.env[SUBC_LAUNCH_NONCE_ENV]);
+  // The nonce comes from the process-wide accessor, which reads the daemon's
+  // descriptor at most once. A refused descriptor fails the connect, unless the
+  // caller supplied the nonce itself, in which case it only means "not
+  // supervised".
+  let processNonce: string | undefined;
+  if (opts.launchNonce === undefined) {
+    try {
+      processNonce = processLaunchNonce()?.value;
+    } catch (error) {
+      if (isLaunchNonceError(error)) throw launchNonceUnavailable(error);
+      throw error;
+    }
+  } else {
+    processNonce = launchNonceOrUndefined()?.value;
+  }
+  const envLaunchNonce = nonEmpty(processNonce);
   const supervised = envModuleId !== undefined && envLaunchNonce !== undefined;
   return {
     connectionFile: opts.connectionFile,
@@ -1371,6 +1424,22 @@ function normalizedControlOps(controlOps: string[] | null | undefined): string[]
   return [...merged];
 }
 
+/**
+ * The typed HELLO failure for a refused launch-nonce descriptor. The message
+ * matches the Rust SDK's `SubcModuleError::LaunchNonce`; `detail.kind` and
+ * `cause` carry the accessor's error.
+ */
+function launchNonceUnavailable(error: LaunchNonceError): SubcProviderError {
+  const wrapped = new SubcProviderError(
+    `launch nonce unavailable: ${error.message}`,
+    "launch_nonce_unavailable",
+    "terminal",
+    { kind: error.kind },
+  );
+  wrapped.cause = error;
+  return wrapped;
+}
+
 function buildHelloFrame(opts: NormalizedSubcProviderConnectOptions): Frame {
   const nonce = opts.launchNonce;
   return buildFrame(
@@ -1380,7 +1449,7 @@ function buildHelloFrame(opts: NormalizedSubcProviderConnectOptions): Frame {
     0,
     HELLO_CORR,
     encodeJson({
-      manifest: normalizeManifest(opts.manifest),
+      manifest: normalizeManifest(opts.manifest, nonce),
       protocol_ver: PROTOCOL_VERSION,
       control_ops: normalizedControlOps(opts.controlOps),
       // Echo the one-time launch nonce subc injects for a reserved module
@@ -1481,7 +1550,11 @@ function bindRejection(decision: BindDecision | undefined): { code: string; mess
   };
 }
 
-function normalizeManifest(manifest: ManifestInput): ManifestInput {
+/**
+ * The manifest exactly as HELLO sends it. Exported for the conformance tests,
+ * not from the package entry.
+ */
+export function normalizeManifest(manifest: ManifestInput, sentNonce: string | undefined): ManifestInput {
   return {
     module_id: manifest.module_id,
     module_version: manifest.module_version,
@@ -1504,7 +1577,35 @@ function normalizeManifest(manifest: ManifestInput): ManifestInput {
         optional: [...manifest.bindings.identity.optional],
       },
     },
+    ...(manifest.provenance === undefined
+      ? {}
+      : { provenance: normalizeProvenance(manifest.provenance, sentNonce) }),
   };
+}
+
+function normalizeProvenance(provenance: ManifestProvenance, sentNonce: string | undefined): ManifestProvenance {
+  const out: ManifestProvenance = {};
+  if (provenance.build_git_sha !== undefined) out.build_git_sha = provenance.build_git_sha;
+  if (provenance.build_git_sha_absence_reason !== undefined) {
+    out.build_git_sha_absence_reason = provenance.build_git_sha_absence_reason;
+  }
+  if (provenance.build_lock_digest !== undefined) out.build_lock_digest = provenance.build_lock_digest;
+  if (provenance.wire_crate_version !== undefined) out.wire_crate_version = provenance.wire_crate_version;
+  if (provenance.store_schema_version !== undefined) out.store_schema_version = provenance.store_schema_version;
+  const source = provenance.launch_nonce_source ?? launchNonceSourceOf(sentNonce);
+  if (source !== undefined) out.launch_nonce_source = source;
+  return out;
+}
+
+/**
+ * Where the nonce HELLO sends came from, as the Rust SDK reports it: the
+ * accessor's source when the accessor holds that same nonce, and nothing when
+ * HELLO sends none or the caller supplied a different one.
+ */
+function launchNonceSourceOf(sentNonce: string | undefined): LaunchNonceSource | undefined {
+  if (sentNonce === undefined) return undefined;
+  const nonce = launchNonceOrUndefined();
+  return nonce !== undefined && nonce.value === sentNonce ? nonce.source : undefined;
 }
 
 function normalizeProviderRole(role: ProviderRoleInput): ProviderRoleInput {

@@ -17,9 +17,10 @@ use subc_test_support::TestTempDir;
 use serde_json::{json, Value};
 use subc_client_rs::{
     async_trait, serve_with_handle, CallError, CallOptions, CatalogUpdateError, CloseRouteOptions,
-    ConsumerOptions, HandlerOutcome, ModuleHandle, ModuleHandler, PolicyResolveError,
-    PolicyResolver, PolicyResolverConfig, PolicyVerdict, ProjectRef, RequestCtx, RetryBackoff,
-    RouteHandle, SubcConsumer, SubcModuleError, Subject, SubscribeOptions,
+    ConsumerIdentity, ConsumerOptions, HandlerOutcome, ModuleHandle, ModuleHandler,
+    PolicyResolveError, PolicyResolver, PolicyResolverConfig, PolicyVerdict, ProjectRef,
+    RequestCtx, RetryBackoff, RouteCloseDisposition, RouteHandle, ScopeSelector, SubcConsumer,
+    SubcModuleError, Subject, SubscribeOptions,
 };
 use subc_control::{ClientControlRequest, ClientControlResponse};
 use subc_protocol::{
@@ -29,7 +30,7 @@ use subc_protocol::{
         Tool,
     },
     session::HealthStatus,
-    BindIdentity, ErrorBody, Flags, Frame, FrameType, Priority, RouteTarget,
+    BindIdentity, ErrorBody, Flags, Frame, FrameType, Principal, Priority, RouteTarget,
 };
 use subc_transport::{authenticate_client, read_frame, write_frame};
 use tokio::{
@@ -3227,4 +3228,548 @@ async fn serve_returns_when_the_daemon_connection_closes_rather_than_reconnectin
         joined.expect("serve task panicked").is_ok(),
         "serve() must return Ok on a clean connection close, not an error"
     );
+}
+
+// Scoped route.open against a real daemon.
+//
+// Four fake-aft-stub modules, all supervised by the daemon under test:
+// - the scope OWNER, which syncs whatever scopes the test writes to its sync
+//   file (writing the file is "the owner synced");
+// - the CARRIER, listed as a carrier on every scope the tests sync;
+// - a STRANGER, supervised like the carrier but never listed;
+// - the PROVIDER the routes open to, which records each bind and its stamp.
+// The carrier and stranger write their launch nonces out, so a consumer in this
+// process can present them and be attested as that module. The owner, carrier
+// and stranger are reserved because a scope's owner and carriers are named as
+// reserved principals.
+
+const SCOPE_OWNER: &str = "subc-client-rs-scope-owner";
+const SCOPE_CARRIER: &str = "subc-client-rs-scope-carrier";
+const SCOPE_STRANGER: &str = "subc-client-rs-scope-stranger";
+const SCOPE_PROVIDER: &str = "subc-client-rs-scope-provider";
+/// Matches the stub's `SCOPE_SYNC_CORR_BASE`: sync generation `n` is sent with
+/// corr `SCOPE_SYNC_CORR_BASE + n`, and the daemon's reply echoes it.
+const SCOPE_SYNC_CORR_BASE: u64 = 1_000_000;
+
+struct ScopeHarness {
+    daemon: LiveDaemon,
+    _temp_dir: TestTempDir,
+    sync_path: PathBuf,
+    owner_events: PathBuf,
+    provider_events: PathBuf,
+    carrier: ConsumerIdentity,
+    stranger: ConsumerIdentity,
+    syncs: u64,
+}
+
+impl ScopeHarness {
+    fn options_as(&self, identity: &ConsumerIdentity) -> CallOptions {
+        CallOptions {
+            consumer_identity: Some(identity.clone()),
+            ..fast_call_options()
+        }
+    }
+
+    fn carrier_options(&self) -> CallOptions {
+        self.options_as(&self.carrier)
+    }
+
+    /// Have the owner sync `scopes` (a JSON array of scope records) and wait
+    /// for the daemon to accept every record.
+    async fn sync(&mut self, scopes: Value) {
+        self.syncs += 1;
+        let corr = SCOPE_SYNC_CORR_BASE + self.syncs;
+        let staging = self.sync_path.with_extension("staging");
+        fs::write(&staging, serde_json::to_vec(&scopes).unwrap()).unwrap();
+        fs::rename(&staging, &self.sync_path).unwrap();
+        let reply = wait_for_event(&self.owner_events, EVENT_TIMEOUT, |event| {
+            event["corr"] == corr
+                && (event["kind"] == "scope_sync_response" || event["kind"] == "error")
+        })
+        .await;
+        assert_eq!(
+            reply["kind"], "scope_sync_response",
+            "the daemon refused scope.sync: {reply}"
+        );
+        for result in reply["body_json"]["results"].as_array().unwrap() {
+            assert_ne!(
+                result["outcome"], "refused",
+                "a scope record was refused: {result}"
+            );
+        }
+    }
+
+    fn provider_attaches(&self) -> Vec<Value> {
+        read_events(&self.provider_events)
+            .into_iter()
+            .filter(|event| event["kind"] == "attach")
+            .collect()
+    }
+
+    async fn connect(&self) -> SubcConsumer {
+        SubcConsumer::connect(&self.daemon.connection_file, fast_consumer_options())
+            .await
+            .unwrap()
+    }
+
+    fn stop(mut self) {
+        self.daemon.kill_and_wait();
+    }
+}
+
+async fn start_scope_harness() -> ScopeHarness {
+    let workspace = workspace_root();
+    let daemon_bin = ensure_binary(
+        &workspace,
+        binary_path(&workspace, "ck-subc"),
+        &["build", "-p", "subc-core", "--bins"],
+    );
+    let stub_bin = binary_path(&workspace, "fake-aft-stub");
+    assert!(stub_bin.exists(), "expected {}", stub_bin.display());
+
+    let temp_dir = unique_temp_dir("subc-client-rs-scopes");
+    let runtime_dir = temp_dir.join("runtime");
+    let config_dir = temp_dir.join("config");
+    fs::create_dir_all(&runtime_dir).unwrap();
+    fs::create_dir_all(config_dir.join("cortexkit")).unwrap();
+    let sync_path = temp_dir.join("owner-scopes.json");
+    let owner_events = temp_dir.join("owner-events.jsonl");
+    let provider_events = temp_dir.join("provider-events.jsonl");
+    let carrier_nonce = temp_dir.join("carrier.nonce");
+    let stranger_nonce = temp_dir.join("stranger.nonce");
+
+    let module = |module_id: &str, reserved: bool, extra: &[(&str, &Path)]| {
+        let mut env = BTreeMap::from([("FAKE_AFT_MODULE_ID".to_string(), module_id.to_string())]);
+        for (key, path) in extra {
+            env.insert((*key).to_string(), path.to_string_lossy().into_owned());
+        }
+        json!({
+            "program": stub_bin.to_string_lossy(),
+            "args": [],
+            "env": env,
+            "enabled": true,
+            "reserved": reserved,
+        })
+    };
+    let config = json!({
+        "version": 1,
+        "modules": {
+            SCOPE_OWNER: module(SCOPE_OWNER, true, &[
+                ("FAKE_AFT_SCOPE_SYNC_PATH", &sync_path),
+                ("FAKE_AFT_EVENTS_PATH", &owner_events),
+            ]),
+            SCOPE_CARRIER: module(SCOPE_CARRIER, true, &[
+                ("FAKE_AFT_LAUNCH_NONCE_PATH", &carrier_nonce),
+            ]),
+            SCOPE_STRANGER: module(SCOPE_STRANGER, true, &[
+                ("FAKE_AFT_LAUNCH_NONCE_PATH", &stranger_nonce),
+            ]),
+            SCOPE_PROVIDER: module(SCOPE_PROVIDER, false, &[
+                ("FAKE_AFT_EVENTS_PATH", &provider_events),
+            ]),
+        }
+    });
+    fs::write(
+        config_dir.join("cortexkit").join("subc.jsonc"),
+        serde_json::to_string_pretty(&config).unwrap(),
+    )
+    .unwrap();
+
+    let daemon = spawn_daemon(&daemon_bin, &runtime_dir, &config_dir);
+    wait_for_connection_file(&daemon.connection_file, START_TIMEOUT).await;
+    for module_id in [SCOPE_OWNER, SCOPE_CARRIER, SCOPE_STRANGER, SCOPE_PROVIDER] {
+        wait_for_catalog_module(&daemon.connection_file, module_id, START_TIMEOUT).await;
+    }
+    let carrier = ConsumerIdentity {
+        module_id: SCOPE_CARRIER.to_string(),
+        launch_nonce: wait_for_file(&carrier_nonce).await,
+    };
+    let stranger = ConsumerIdentity {
+        module_id: SCOPE_STRANGER.to_string(),
+        launch_nonce: wait_for_file(&stranger_nonce).await,
+    };
+    ScopeHarness {
+        daemon,
+        _temp_dir: temp_dir,
+        sync_path,
+        owner_events,
+        provider_events,
+        carrier,
+        stranger,
+        syncs: 0,
+    }
+}
+
+async fn wait_for_file(path: &Path) -> String {
+    let deadline = Instant::now() + START_TIMEOUT;
+    loop {
+        if let Ok(raw) = fs::read_to_string(path) {
+            return raw;
+        }
+        if Instant::now() >= deadline {
+            panic!("{} did not appear within {START_TIMEOUT:?}", path.display());
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// A head scope with the carrier module listed as a carrier for any target.
+fn scope_record(scope_ref: &str, scope_epoch: u64) -> Value {
+    json!({
+        "ref": scope_ref,
+        "scope_epoch": scope_epoch,
+        "kind": "head",
+        "carriers": [
+            { "principal": { "kind": "reserved", "module_id": SCOPE_CARRIER } }
+        ],
+    })
+}
+
+fn scope_selector(scope_ref: &str, scope_epoch: u64) -> ScopeSelector {
+    ScopeSelector {
+        owner: Principal::Reserved {
+            module_id: SCOPE_OWNER.to_string(),
+        },
+        scope_ref: scope_ref.to_string(),
+        scope_epoch: Some(scope_epoch),
+    }
+}
+
+fn refusal_code(err: &CallError) -> Option<&str> {
+    err.route_open_refusal().map(|body| body.code.as_str())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_carriers_scoped_open_is_admitted_and_the_provider_bind_carries_the_scope() {
+    let mut harness = start_scope_harness().await;
+    harness.sync(json!([scope_record("session-a", 1)])).await;
+    let consumer = harness.connect().await;
+
+    consumer
+        .open_route_scoped(
+            tool_target(SCOPE_PROVIDER),
+            consumer_identity("scoped-admitted"),
+            scope_selector("session-a", 1),
+            harness.carrier_options(),
+        )
+        .await
+        .unwrap_or_else(|err| panic!("the carrier's scoped open must be admitted: {err}"));
+
+    let attach = wait_for_event(&harness.provider_events, EVENT_TIMEOUT, |event| {
+        event["kind"] == "attach"
+    })
+    .await;
+    assert_eq!(
+        attach["scope"]["owner"],
+        json!({ "kind": "reserved", "module_id": SCOPE_OWNER })
+    );
+    assert_eq!(attach["scope"]["ref"], "session-a");
+    assert_eq!(attach["scope"]["scope_epoch"], 1);
+    assert_eq!(
+        attach["principal"],
+        json!({ "kind": "reserved", "module_id": SCOPE_CARRIER }),
+        "the bind names the carrier as the opener"
+    );
+
+    consumer.close().await;
+    harness.stop();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_scoped_open_before_the_owners_first_sync_retries_until_the_owner_syncs() {
+    let mut harness = start_scope_harness().await;
+    let consumer = Arc::new(harness.connect().await);
+    let identity = consumer_identity("scoped-before-sync");
+
+    // Control: with a short retry budget the open runs out on scope_not_synced,
+    // so the daemon really is refusing with it while the owner has not synced.
+    let short = CallOptions {
+        timeout: Duration::from_secs(2),
+        route_retry_deadline: Duration::from_millis(300),
+        ..harness.carrier_options()
+    };
+    let err = consumer
+        .open_route_scoped(
+            tool_target(SCOPE_PROVIDER),
+            identity.clone(),
+            scope_selector("session-a", 1),
+            short,
+        )
+        .await
+        .expect_err("no scope is live before the owner syncs");
+    assert_eq!(refusal_code(&err), Some("scope_not_synced"), "{err}");
+
+    let patient = CallOptions {
+        timeout: Duration::from_secs(10),
+        route_retry_deadline: Duration::from_secs(10),
+        ..harness.carrier_options()
+    };
+    let opener = Arc::clone(&consumer);
+    let open = tokio::spawn(async move {
+        opener
+            .open_route_scoped(
+                tool_target(SCOPE_PROVIDER),
+                identity,
+                scope_selector("session-a", 1),
+                patient,
+            )
+            .await
+    });
+    sleep(Duration::from_millis(500)).await;
+    assert!(
+        !open.is_finished(),
+        "the open must still be retrying scope_not_synced, not settled"
+    );
+
+    harness.sync(json!([scope_record("session-a", 1)])).await;
+    timeout(Duration::from_secs(10), open)
+        .await
+        .expect("the open must settle within its deadline")
+        .unwrap()
+        .unwrap_or_else(|err| panic!("the open must succeed once the owner syncs: {err}"));
+    let attach = wait_for_event(&harness.provider_events, EVENT_TIMEOUT, |event| {
+        event["kind"] == "attach"
+    })
+    .await;
+    assert_eq!(attach["scope"]["ref"], "session-a");
+
+    consumer.close().await;
+    harness.stop();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scope_not_carrier_and_scope_ended_are_terminal_refusals_with_their_codes() {
+    let mut harness = start_scope_harness().await;
+    harness.sync(json!([scope_record("session-a", 2)])).await;
+    let consumer = harness.connect().await;
+    let identity = consumer_identity("scoped-refusals");
+
+    let mut no_epoch = scope_selector("session-a", 2);
+    no_epoch.scope_epoch = None;
+    let cases = [
+        (
+            "a supervised module that is not a listed carrier",
+            harness.stranger.clone(),
+            scope_selector("session-a", 2),
+            "scope_not_carrier",
+        ),
+        (
+            "an epoch the scope has moved past",
+            harness.carrier.clone(),
+            scope_selector("session-a", 1),
+            "scope_ended",
+        ),
+        (
+            "a ref the owner holds no live scope for",
+            harness.carrier.clone(),
+            scope_selector("session-unknown", 1),
+            "scope_not_live",
+        ),
+        (
+            "a selector without an epoch",
+            harness.carrier.clone(),
+            no_epoch,
+            "scope_epoch_required",
+        ),
+    ];
+    for (label, opener, selector, code) in cases {
+        // A two-second first backoff: any in-place retry of a terminal code
+        // sleeps at least half of it before the second attempt.
+        let options = CallOptions {
+            consumer_identity: Some(opener),
+            ..terminal_absence_options()
+        };
+        let started = Instant::now();
+        let err = consumer
+            .open_route_scoped(
+                tool_target(SCOPE_PROVIDER),
+                identity.clone(),
+                selector,
+                options,
+            )
+            .await
+            .expect_err(label);
+        let elapsed = started.elapsed();
+        assert!(matches!(err, CallError::NotSent(_)), "{label}: {err}");
+        assert_eq!(refusal_code(&err), Some(code), "{label}: {err}");
+        assert!(
+            elapsed < Duration::from_millis(900),
+            "{label}: {code} is terminal and must not be retried (took {elapsed:?})"
+        );
+    }
+    assert!(
+        harness.provider_attaches().is_empty(),
+        "no refused open may reach the provider"
+    );
+
+    consumer.close().await;
+    harness.stop();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scoped_opens_under_other_refs_or_epochs_and_unscoped_opens_get_their_own_routes() {
+    let mut harness = start_scope_harness().await;
+    harness
+        .sync(json!([
+            scope_record("session-a", 1),
+            scope_record("session-b", 1)
+        ]))
+        .await;
+    let consumer = harness.connect().await;
+    let identity = consumer_identity("scoped-cache");
+    let carrier_options = harness.carrier_options();
+    let open = |selector: ScopeSelector| {
+        consumer.open_route_scoped(
+            tool_target(SCOPE_PROVIDER),
+            identity.clone(),
+            selector,
+            carrier_options.clone(),
+        )
+    };
+
+    let session_a = open(scope_selector("session-a", 1)).await.unwrap();
+    let session_a_again = open(scope_selector("session-a", 1)).await.unwrap();
+    assert_eq!(
+        session_a_again, session_a,
+        "the same selector reuses the cached route"
+    );
+    let session_b = open(scope_selector("session-b", 1)).await.unwrap();
+    assert_ne!(session_b, session_a, "another scope ref gets its own route");
+    let unscoped = consumer
+        .open_route(
+            tool_target(SCOPE_PROVIDER),
+            identity.clone(),
+            carrier_options.clone(),
+        )
+        .await
+        .unwrap();
+    assert_ne!(unscoped, session_a, "an unscoped open gets its own route");
+    assert_ne!(unscoped, session_b, "an unscoped open gets its own route");
+
+    // An epoch the owner has not synced is refused by the daemon, so it must
+    // reach the daemon: the session-a route cached under epoch 1 must not be
+    // handed to a caller asking for epoch 2.
+    let err = open(scope_selector("session-a", 2))
+        .await
+        .expect_err("epoch 2 of session-a is not live");
+    assert_eq!(refusal_code(&err), Some("scope_ended"), "{err}");
+
+    let mut scopes = harness
+        .provider_attaches()
+        .into_iter()
+        .map(|attach| attach["scope"]["ref"].as_str().map(str::to_string))
+        .collect::<Vec<_>>();
+    scopes.sort();
+    assert_eq!(
+        scopes,
+        vec![None, Some("session-a".into()), Some("session-b".into())],
+        "three binds: one per scope and one unscoped"
+    );
+
+    // Once the owner moves session-a to epoch 2, an open under epoch 2 is a
+    // second route for session-a, distinct from the one epoch 1 had.
+    harness
+        .sync(json!([
+            scope_record("session-a", 2),
+            scope_record("session-b", 1)
+        ]))
+        .await;
+    let session_a_epoch_2 = open(scope_selector("session-a", 2)).await.unwrap();
+    assert_ne!(session_a_epoch_2, session_a);
+    wait_for_event(&harness.provider_events, EVENT_TIMEOUT, |event| {
+        event["kind"] == "attach" && event["scope"]["scope_epoch"] == 2
+    })
+    .await;
+
+    consumer.close().await;
+    harness.stop();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ending_the_scope_closes_the_route_with_scope_ended_and_it_is_not_reopened() {
+    let mut harness = start_scope_harness().await;
+    harness.sync(json!([scope_record("session-a", 1)])).await;
+    let consumer = harness.connect().await;
+    let mut pushes = consumer.control_pushes(16);
+    let identity = consumer_identity("scoped-ended");
+
+    let handle = consumer
+        .open_route_scoped(
+            tool_target(SCOPE_PROVIDER),
+            identity.clone(),
+            scope_selector("session-a", 1),
+            harness.carrier_options(),
+        )
+        .await
+        .unwrap();
+    wait_for_event(&harness.provider_events, EVENT_TIMEOUT, |event| {
+        event["kind"] == "attach"
+    })
+    .await;
+
+    // The owner syncs an empty set: session-a has ended.
+    harness.sync(json!([])).await;
+
+    let closed = loop {
+        let push = timeout(EVENT_TIMEOUT, pushes.recv())
+            .await
+            .expect("route.closed must arrive after the scope ends")
+            .expect("control push receiver open");
+        if push.op == "route.closed" {
+            break push;
+        }
+    };
+    assert_eq!(closed.body["reason"], "scope_ended", "{}", closed.body);
+    let reason = closed
+        .route_close_reason()
+        .expect("route.closed carries a reason");
+    assert_eq!(
+        reason.disposition(),
+        RouteCloseDisposition::MustNotReopen,
+        "a route whose scope ended must not be reopened"
+    );
+
+    // The route's GOODBYE drops it from the managed cache.
+    let deadline = Instant::now() + EVENT_TIMEOUT;
+    loop {
+        match consumer
+            .request(&handle, b"{}".to_vec(), fast_call_options())
+            .await
+        {
+            Err(CallError::StaleRouteHandle(_)) => break,
+            other if Instant::now() >= deadline => {
+                panic!("the ended route's handle is still live: {other:?}")
+            }
+            _ => sleep(Duration::from_millis(20)).await,
+        }
+    }
+
+    // Asking again under the ended selector reaches the daemon and is refused;
+    // nothing reopens the route behind the caller's back.
+    let err = consumer
+        .open_route_scoped(
+            tool_target(SCOPE_PROVIDER),
+            identity,
+            scope_selector("session-a", 1),
+            terminal_absence_options_as(&harness.carrier),
+        )
+        .await
+        .expect_err("an ended scope admits no new route");
+    assert_eq!(refusal_code(&err), Some("scope_not_live"), "{err}");
+    sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        harness.provider_attaches().len(),
+        1,
+        "the provider saw exactly the one bind made before the scope ended"
+    );
+
+    consumer.close().await;
+    harness.stop();
+}
+
+fn terminal_absence_options_as(identity: &ConsumerIdentity) -> CallOptions {
+    CallOptions {
+        consumer_identity: Some(identity.clone()),
+        ..terminal_absence_options()
+    }
 }

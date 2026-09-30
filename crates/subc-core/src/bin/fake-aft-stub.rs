@@ -24,6 +24,7 @@ use subc_protocol::{
         ObservabilityKind, ObservabilitySurface, PipelineAppliesTo, PipelineStageKind,
         ProviderRole, SelfSignalDeclaration, SelfSignalEffect, SelfSignalKind, SignalAnchor, Tool,
     },
+    scope::ScopeRecord,
     session::{
         HealthStatus, ModuleControlCommand, ModuleControlPush, ModuleControlRequest,
         ModuleControlRequestFromModule, ModuleControlResponse, MODULE_CONTROL_OP_HEALTH_CHECK,
@@ -216,6 +217,25 @@ const FAKE_AFT_RECORD_SIGTERM_ENV: &str = "FAKE_AFT_RECORD_SIGTERM";
 /// anything over. A real module passes through that window on every start; this
 /// makes it long enough for a test to act inside it.
 const FAKE_AFT_HELLO_DELAY_MS_ENV: &str = "FAKE_AFT_HELLO_DELAY_MS";
+/// A file holding a JSON array of `ScopeRecord`s. After registering, the stub
+/// polls it and sends `scope.sync` with the file's scopes each time its content
+/// changes, with a generation that counts up from 1. The daemon's reply is
+/// recorded as a `scope_sync_response` event (a refusal as an `error` event
+/// with the same corr).
+///
+/// This makes the stub a scope owner a test can drive from outside: writing
+/// the file is "the owner synced", and an empty array ends every scope. A
+/// test that needs a window before the owner's first sync simply writes the
+/// file later.
+const FAKE_AFT_SCOPE_SYNC_PATH_ENV: &str = "FAKE_AFT_SCOPE_SYNC_PATH";
+/// Where to write this process's launch nonce once it has registered.
+///
+/// A test process cannot attest as a supervised module without that module's
+/// nonce, and the nonce only ever reaches the child. Writing it out lets a
+/// consumer in the test present `{module_id, launch_nonce}` and be admitted as
+/// this module, which is how a carrier (or a module that is not one) opens a
+/// scoped route in a real-daemon test.
+const FAKE_AFT_LAUNCH_NONCE_PATH_ENV: &str = "FAKE_AFT_LAUNCH_NONCE_PATH";
 /// Id used when `FAKE_AFT_MODULE_ID` is absent.
 ///
 /// TESTS THAT ASSERT A MODULE APPEARS IN THE CATALOG MUST CONFIGURE AN ID THAT
@@ -233,6 +253,9 @@ const FAKE_AFT_HELLO_DELAY_MS_ENV: &str = "FAKE_AFT_HELLO_DELAY_MS";
 const DEFAULT_MODULE_ID: &str = "fake-aft";
 const HELLO_CORR: u64 = 1;
 const READY_UPDATE_CORR: u64 = 2;
+/// `scope.sync` generation `n` goes out with corr `SCOPE_SYNC_CORR_BASE + n`,
+/// clear of the fixed HELLO and ready-update corrs.
+const SCOPE_SYNC_CORR_BASE: u64 = 1_000_000;
 const STUB_EGRESS_BUFFER: usize = 64;
 const FAKE_AFT_FIXTURE_SUFFIX: &str = ".fixture.json";
 
@@ -618,6 +641,13 @@ where
     send_hello(&writer, &config).await?;
     expect_hello_ack(read_half).await?;
 
+    if let Some(path) = config.launch_nonce_path.clone() {
+        write_launch_nonce(&path, config.launch_nonce.as_deref())?;
+    }
+    if let Some(path) = config.scope_sync_path.clone() {
+        spawn_scope_sync_watcher(path, writer.clone(), config.clone());
+    }
+
     if let Some(path) = config.ready_update_path.clone() {
         let update_writer = writer.clone();
         let update_config = config.clone();
@@ -741,6 +771,77 @@ async fn send_ready_update(
     record_event(config, json!({"kind": "catalog_ready_update_sent"}))
 }
 
+/// Write the nonce through a temporary file and a rename, so a test polling for
+/// the file never reads it half-written.
+fn write_launch_nonce(path: &Path, nonce: Option<&str>) -> Result<(), StubError> {
+    let Some(nonce) = nonce else {
+        return Err(StubError::Io(io::Error::new(
+            io::ErrorKind::NotFound,
+            "FAKE_AFT_LAUNCH_NONCE_PATH is set but this process was given no launch nonce",
+        )));
+    };
+    let staging = path.with_extension("staging");
+    fs::write(&staging, nonce)?;
+    fs::rename(&staging, path)?;
+    Ok(())
+}
+
+fn spawn_scope_sync_watcher(path: PathBuf, writer: mpsc::Sender<Frame>, config: StubConfig) {
+    tokio::spawn(async move {
+        let mut last_sent: Option<String> = None;
+        let mut generation = 0u64;
+        loop {
+            if let Ok(raw) = fs::read_to_string(&path) {
+                if last_sent.as_deref() != Some(raw.as_str()) {
+                    last_sent = Some(raw.clone());
+                    match serde_json::from_str::<Vec<ScopeRecord>>(&raw) {
+                        Ok(scopes) => {
+                            generation += 1;
+                            if send_scope_sync(&writer, generation, scopes).await.is_err() {
+                                return;
+                            }
+                            let _ = record_event(
+                                &config,
+                                json!({"kind": "scope_sync_sent", "generation": generation}),
+                            );
+                        }
+                        Err(err) => {
+                            let _ = record_event(
+                                &config,
+                                json!({"kind": "scope_sync_file_invalid", "error": err.to_string()}),
+                            );
+                        }
+                    }
+                }
+            }
+            if writer.is_closed() {
+                return;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    });
+}
+
+async fn send_scope_sync(
+    writer: &mpsc::Sender<Frame>,
+    generation: u64,
+    scopes: Vec<ScopeRecord>,
+) -> Result<(), StubError> {
+    let body =
+        serde_json::to_vec(&ModuleControlRequestFromModule::ScopeSync { generation, scopes })
+            .map_err(StubError::Json)?;
+    let frame = Frame::build(
+        FrameType::Request,
+        control_flags(),
+        0,
+        0,
+        SCOPE_SYNC_CORR_BASE + generation,
+        body,
+    )
+    .map_err(StubError::FrameBuild)?;
+    send_outbound(writer, frame).await
+}
+
 async fn expect_hello_ack<R>(reader: &mut R) -> Result<ModuleHelloAckBody, StubError>
 where
     R: AsyncRead + Unpin,
@@ -854,6 +955,19 @@ async fn handle_frame(
             if frame.header.channel == 0 && frame.header.corr == READY_UPDATE_CORR =>
         {
             record_event(config, json!({"kind": "catalog_ready_update_ack"}))?;
+            Ok(true)
+        }
+        FrameType::Response
+            if frame.header.channel == 0 && frame.header.corr > SCOPE_SYNC_CORR_BASE =>
+        {
+            record_event(
+                config,
+                json!({
+                    "kind": "scope_sync_response",
+                    "corr": frame.header.corr,
+                    "body_json": serde_json::from_slice::<Value>(&frame.body).ok(),
+                }),
+            )?;
             Ok(true)
         }
         FrameType::Error => {
@@ -1230,7 +1344,7 @@ async fn handle_control_request(
             principal,
             consumer_capabilities,
             admission_facts,
-            scope: _,
+            scope,
         } => {
             state.tentative_channels.insert(route_channel, epoch);
             record_event(
@@ -1245,6 +1359,7 @@ async fn handle_control_request(
                     "principal": principal,
                     "consumer_capabilities": consumer_capabilities,
                     "admission_facts": admission_facts,
+                    "scope": scope,
                 }),
             )?;
             state.route_bind_count += 1;
@@ -1910,6 +2025,8 @@ struct StubConfig {
     /// The launch nonce subc handed over for spawn attestation and reserved
     /// HELLOs, read through `subc_os::launch_nonce` like a real module's.
     launch_nonce: Option<String>,
+    scope_sync_path: Option<PathBuf>,
+    launch_nonce_path: Option<PathBuf>,
 }
 
 struct StubState {
@@ -2067,6 +2184,8 @@ impl StubConfig {
             launch_nonce: subc_os::launch_nonce()
                 .map_err(StubError::LaunchNonce)?
                 .map(|nonce| nonce.value().to_string()),
+            scope_sync_path: env::var_os(FAKE_AFT_SCOPE_SYNC_PATH_ENV).map(PathBuf::from),
+            launch_nonce_path: env::var_os(FAKE_AFT_LAUNCH_NONCE_PATH_ENV).map(PathBuf::from),
         })
     }
 }

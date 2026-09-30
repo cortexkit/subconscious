@@ -7,8 +7,8 @@ pub use consumer::{
     ConnectionState, ConsumerError, ConsumerOptions, ControlPush, PushEvent, RetryBackoff,
     ReverseRequestContext, ReverseRequestError, ReverseRequestRegistrationError,
     ReverseRequestRegistry, RouteCloseDisposition, RouteCloseReason, RoutePollResult,
-    ScopeSelector, SpawnStreamError, SpawnSubscription, SubcConsumer, SubscribeOptions, Subscription,
-    SubscriptionClosed, DEFAULT_CALL_TIMEOUT, DEFAULT_LIVENESS_PROBE_WINDOW,
+    ScopeSelector, SpawnStreamError, SpawnSubscription, SubcConsumer, SubscribeOptions,
+    Subscription, SubscriptionClosed, DEFAULT_CALL_TIMEOUT, DEFAULT_LIVENESS_PROBE_WINDOW,
     DEFAULT_ROUTE_RETRY_DEADLINE, SPAWN_CURSOR_INCARNATION_MISMATCH, SPAWN_CURSOR_TOO_OLD,
     SPAWN_SUBSCRIBER_LAGGED,
 };

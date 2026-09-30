@@ -6640,7 +6640,10 @@ mod tests {
             "the reopen after the route dropped",
         )
         .await;
-        assert_eq!(first_request["scope"], serde_json::to_value(&selector).unwrap());
+        assert_eq!(
+            first_request["scope"],
+            serde_json::to_value(&selector).unwrap()
+        );
         assert_eq!(second_request["scope"], first_request["scope"]);
         assert_ne!(second, first);
         shared.close_sync("test complete");

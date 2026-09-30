@@ -1,6 +1,8 @@
 # Scopes: owned identity records in the daemon
 
-Status: design r8. Nothing here is built. r3 answered an Athena review of r2 (five seats, a
+Status: design r9. Stage 1 is built (subc-protocol 0.27.0, subc-daemon 0.25.0, master 103aa551):
+the table, `scope.sync`, `scope.describe`, route admission, the bind stamp, the commit re-check and
+the drains. Section 11 records what the build settled where this note was silent. r3 answered an Athena review of r2 (five seats, a
 unanimous "do not implement as written"); r4 added the room's review of r3, r5 added targeted
 carriers, r6 answered the Athena review of extensibility r7, and r7 answers the Athena review of
 extensibility r7.2 (rows T2-T22, T85, T87 of its triage table); r8 records the operator's
@@ -471,3 +473,54 @@ From the Athena review of extensibility r7.2:
 
 From the operator:
 25. T19 decided: revocation stops running work under the scope (section 7), not only new calls.
+
+## 11. Settled by the stage 1 build (r9)
+
+The build had to decide these where the sections above were silent or loose. Each is now the
+contract; where it differs from the wording above, this section wins.
+
+- **Where sync and describe run.** `scope.sync` and `scope.describe` are module control requests,
+  sent on the sender's own registered module connection. The owner is that registration's
+  `module_id`; nothing in the request body names it. A connection without a registration (`direct`
+  and every client connection) is refused `not_registered`, which is how "`direct` cannot own
+  scopes" is enforced. `scope.describe` is readable by any registered module, since every provider
+  reads it.
+- **Authority across a swap is lazy.** Nothing in the table changes at cutover. A connection may
+  sync only while the launch nonce it presented at HELLO is the supervisor's recorded spawn nonce
+  for its module, compared in constant time. So a swap candidate before cutover, the superseded
+  incumbent after it, and a module the supervisor did not spawn are all refused
+  `scope_sync_not_authority`. The promoted process's first sync takes authority and replaces the
+  set at any generation. The effect a caller sees is the same as the "at cutover" wording in
+  section 3.
+- **Advertising.** `scopes/v1` appears in both `server.describe` and HELLO_ACK, and HELLO_ACK lists
+  `scope.sync` and `scope.describe` among the module ops.
+- **Codes this note did not list.** `scope_live_limit_exceeded` and `scope_attributes_too_large`
+  refuse the whole sync. `scope_carrier_targets_invalid` (an empty target list, or more than 16) and
+  `scope_delegates_without_agent` refuse one record. A duplicate or empty ref in one sync refuses
+  the whole sync as `invalid_control_body`. On `route.open`, `scope_epoch` is optional on the wire
+  so that leaving it out is refused by name (`scope_epoch_required`), not as a malformed body.
+- **Wire shapes.** Principals use subc-protocol's `Principal` object (`{kind, module_id}`), not
+  the `reserved:aft` string used in examples above. A carrier is `{principal, targets?}`, with
+  `targets` absent meaning any module. Attributes are the closed struct `{agent_id?, delegates}`.
+  Record types refuse unknown fields.
+- **Parent links.** A link is checked only when it is new: a new record, a new epoch or a changed
+  parent. An unchanged re-sent link keeps its state. A pending link settling to `linked` or `ended`
+  bumps the child's `version`, so a bind in flight on the child is refused `scope_changed`; live
+  routes still drain only when the link ends.
+- **Narrowing a carrier.** Changing a carrier from any module to a target list drains that
+  carrier's routes to modules outside the new list. It counts as removing the implicit any-module
+  grant, alongside the rows in section 5a.
+- **One reason per route.** When one sync changes a scope in several ways, the drains combine and
+  each closed route gets one reason. Closing every route beats closing some carriers' routes, and
+  among the reasons that close every route the order is: scope ended, then parent ended, then
+  delegation changed.
+- **Removing a child owner.** Taking an owner out of `child_owners` does not end a child already
+  linked under it.
+- **Configured owner** means present in the supervisor's module map.
+- **Old modules.** A stamped `route.bind` decodes in modules built before scopes, because
+  `RouteBind` does not refuse unknown fields. A test decodes the golden stamped bind with the 0.26
+  shape, and the TypeScript provider accepts it.
+- **Close reasons in older SDKs.** Both SDKs map an unknown `route.closed` reason to
+  must-not-reopen (`subc-client-rs` `RouteCloseReason::from_wire`, TypeScript
+  `parseRouteCloseReason`), which is right for the four new scope reasons. The Swift client has no
+  close-reason decoder.

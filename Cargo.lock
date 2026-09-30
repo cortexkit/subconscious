@@ -255,7 +255,7 @@ dependencies = [
 
 [[package]]
 name = "ck-bus"
-version = "0.1.28"
+version = "0.1.29"
 dependencies = [
  "async-nats",
  "async-trait",
@@ -1922,7 +1922,7 @@ dependencies = [
 
 [[package]]
 name = "subc-mcp"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "cortexkit-log",
  "rmcp",

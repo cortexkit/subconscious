@@ -4572,6 +4572,9 @@ fn route_tool_call_request(
         // would be its own invention, which it cannot keep stable across
         // reconnects (the same reason it mints no tool_call_id).
         call_key: None,
+        // Nor a schema pin: the gateway does not know which schema version
+        // the host built the arguments against.
+        schema_pin: None,
     })
 }
 

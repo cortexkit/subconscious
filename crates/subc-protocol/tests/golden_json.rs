@@ -64,6 +64,7 @@ fn protocol_wire_shapes_match_golden_json_and_round_trip() {
             tool_call_id: Some("wal-intent-42".to_string()),
             progress_token: None,
             call_key: None,
+            schema_pin: None,
         },
     );
     assert_golden(
@@ -74,6 +75,7 @@ fn protocol_wire_shapes_match_golden_json_and_round_trip() {
             tool_call_id: Some("wal-intent-42".to_string()),
             progress_token: Some(serde_json::json!("pt-7")),
             call_key: None,
+            schema_pin: None,
         },
     );
     assert_golden("error_body", &error_body());

@@ -58,11 +58,19 @@ pub struct ToolCallRequest {
     /// new field here is meant to stop its struct literal compiling.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub call_key: Option<String>,
+    /// Which version of the tool's schema the consumer built its arguments
+    /// against, so a provider can tell a call made against a schema it no
+    /// longer serves. Opaque here: the tool-provider role defines what it
+    /// holds. A provider checks only its shape, with [`validate_schema_pin`],
+    /// and answers a malformed one with `invalid_request` naming the field
+    /// [`SCHEMA_PIN_FIELD`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_pin: Option<String>,
 }
 
 impl ToolCallRequest {
-    /// A call with no consumer id, no progress token and no call key — the
-    /// shape older two-field consumers send.
+    /// A call with no consumer id, no progress token, no call key and no
+    /// schema pin — the shape older two-field consumers send.
     pub fn new(name: impl Into<String>, arguments: Value) -> Self {
         Self {
             name: name.into(),
@@ -70,6 +78,7 @@ impl ToolCallRequest {
             tool_call_id: None,
             progress_token: None,
             call_key: None,
+            schema_pin: None,
         }
     }
 }
@@ -78,66 +87,106 @@ impl ToolCallRequest {
 /// `invalid_request` error a provider returns when the key is malformed.
 pub const CALL_KEY_FIELD: &str = "call_key";
 
-/// The longest `call_key` accepted, in bytes (every accepted byte is one
-/// ASCII character).
-pub const CALL_KEY_MAX_LEN: usize = 256;
+/// The wire name of [`ToolCallRequest::schema_pin`], for the `field` of the
+/// `invalid_request` error a provider returns when the pin is malformed.
+pub const SCHEMA_PIN_FIELD: &str = "schema_pin";
 
-/// Why a `call_key` was refused.
+/// The longest opaque token field accepted, in bytes (every accepted byte is
+/// one ASCII character). Shared by `call_key` and `schema_pin`.
+pub const OPAQUE_FIELD_MAX_LEN: usize = 256;
+
+/// The longest `call_key` accepted.
+pub const CALL_KEY_MAX_LEN: usize = OPAQUE_FIELD_MAX_LEN;
+
+/// The longest `schema_pin` accepted.
+pub const SCHEMA_PIN_MAX_LEN: usize = OPAQUE_FIELD_MAX_LEN;
+
+/// Why an opaque token field (`call_key`, `schema_pin`) was refused. Every
+/// variant names the request field it is about, so a provider can put it in
+/// its `invalid_request` error without tracking which check ran.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum CallKeyError {
-    /// The key was the empty string. An absent key is `None`, never `""`.
-    Empty,
-    /// The key was longer than [`CALL_KEY_MAX_LEN`] bytes.
-    TooLong { length: usize },
+pub enum OpaqueFieldError {
+    /// The value was the empty string. An absent value is `None`, never `""`.
+    Empty { field: &'static str },
+    /// The value was longer than [`OPAQUE_FIELD_MAX_LEN`] bytes.
+    TooLong { field: &'static str, length: usize },
     /// The byte at `index` is not printable, non-space ASCII.
-    InvalidCharacter { index: usize },
+    InvalidCharacter { field: &'static str, index: usize },
 }
 
-impl CallKeyError {
-    /// The request field the error is about, always [`CALL_KEY_FIELD`].
+/// The error [`validate_call_key`] returns. Kept as a name so code that only
+/// formats the error or reads [`OpaqueFieldError::field`] keeps compiling.
+pub type CallKeyError = OpaqueFieldError;
+
+impl OpaqueFieldError {
+    /// The request field the error is about.
     pub fn field(&self) -> &'static str {
-        CALL_KEY_FIELD
+        match self {
+            Self::Empty { field }
+            | Self::TooLong { field, .. }
+            | Self::InvalidCharacter { field, .. } => field,
+        }
     }
 }
 
-impl std::fmt::Display for CallKeyError {
+impl std::fmt::Display for OpaqueFieldError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Empty => write!(f, "{CALL_KEY_FIELD} must not be empty"),
-            Self::TooLong { length } => write!(
+            Self::Empty { field } => write!(f, "{field} must not be empty"),
+            Self::TooLong { field, length } => write!(
                 f,
-                "{CALL_KEY_FIELD} is {length} bytes; at most {CALL_KEY_MAX_LEN} are allowed"
+                "{field} is {length} bytes; at most {OPAQUE_FIELD_MAX_LEN} are allowed"
             ),
-            Self::InvalidCharacter { index } => write!(
+            Self::InvalidCharacter { field, index } => write!(
                 f,
-                "{CALL_KEY_FIELD} has a character at byte {index} outside printable ASCII \
+                "{field} has a character at byte {index} outside printable ASCII \
                  (0x21 to 0x7E; space is not allowed)"
             ),
         }
     }
 }
 
-impl std::error::Error for CallKeyError {}
+impl std::error::Error for OpaqueFieldError {}
 
-/// Check a `call_key`: 1 to [`CALL_KEY_MAX_LEN`] characters, each printable
-/// ASCII from 0x21 to 0x7E.
+/// Check an opaque token field: 1 to [`OPAQUE_FIELD_MAX_LEN`] characters, each
+/// printable ASCII from 0x21 to 0x7E. `field` is the wire name the error
+/// reports.
 ///
-/// Space (0x20) is refused. Providers compare keys byte for byte and write
-/// them into logs and ledgers, where a leading or trailing space is invisible:
-/// two keys that differ only by one would read as the same key and act as
-/// different ones. Every other printable character is allowed, so a consumer
-/// can use its existing ids (UUIDs, `prefix:id` forms, base64) unchanged.
-pub fn validate_call_key(key: &str) -> Result<(), CallKeyError> {
-    if key.is_empty() {
-        return Err(CallKeyError::Empty);
+/// Space (0x20) is refused. Providers compare these values byte for byte and
+/// write them into logs and ledgers, where a leading or trailing space is
+/// invisible: two values that differ only by one would read as the same value
+/// and act as different ones. Every other printable character is allowed, so
+/// a consumer can use its existing ids (UUIDs, `prefix:id` forms, base64,
+/// digests) unchanged.
+fn validate_opaque_field(field: &'static str, value: &str) -> Result<(), OpaqueFieldError> {
+    if value.is_empty() {
+        return Err(OpaqueFieldError::Empty { field });
     }
-    if key.len() > CALL_KEY_MAX_LEN {
-        return Err(CallKeyError::TooLong { length: key.len() });
+    if value.len() > OPAQUE_FIELD_MAX_LEN {
+        return Err(OpaqueFieldError::TooLong {
+            field,
+            length: value.len(),
+        });
     }
-    if let Some(index) = key.bytes().position(|byte| !(0x21..=0x7e).contains(&byte)) {
-        return Err(CallKeyError::InvalidCharacter { index });
+    if let Some(index) = value
+        .bytes()
+        .position(|byte| !(0x21..=0x7e).contains(&byte))
+    {
+        return Err(OpaqueFieldError::InvalidCharacter { field, index });
     }
     Ok(())
+}
+
+/// Check a `call_key` with the shared opaque-field rule; errors name
+/// [`CALL_KEY_FIELD`].
+pub fn validate_call_key(key: &str) -> Result<(), CallKeyError> {
+    validate_opaque_field(CALL_KEY_FIELD, key)
+}
+
+/// Check a `schema_pin` with the shared opaque-field rule; errors name
+/// [`SCHEMA_PIN_FIELD`].
+pub fn validate_schema_pin(pin: &str) -> Result<(), OpaqueFieldError> {
+    validate_opaque_field(SCHEMA_PIN_FIELD, pin)
 }
 
 #[cfg(test)]
@@ -153,6 +202,7 @@ mod tests {
         assert_eq!(request.tool_call_id, None);
         assert_eq!(request.progress_token, None);
         assert_eq!(request.call_key, None);
+        assert_eq!(request.schema_pin, None);
     }
 
     #[test]
@@ -163,6 +213,7 @@ mod tests {
             tool_call_id: None,
             progress_token: None,
             call_key: Some("run-7:call-3".to_string()),
+            schema_pin: None,
         };
         let encoded = serde_json::to_value(&request).expect("encode");
         assert_eq!(
@@ -183,33 +234,60 @@ mod tests {
         assert_eq!(decoded, request);
     }
 
+    /// The same bounds for both fields, with each refusal naming its own
+    /// field: one validator, two names.
     #[test]
-    fn call_key_bounds_are_one_to_256_printable_non_space_ascii() {
-        assert_eq!(validate_call_key(""), Err(CallKeyError::Empty));
-        assert_eq!(validate_call_key("k"), Ok(()));
-        assert_eq!(validate_call_key(&"k".repeat(256)), Ok(()));
+    fn opaque_field_bounds_are_one_to_256_printable_non_space_ascii() {
+        type Validate = fn(&str) -> Result<(), OpaqueFieldError>;
+        let validators: [(&str, Validate); 2] = [
+            (CALL_KEY_FIELD, validate_call_key),
+            (SCHEMA_PIN_FIELD, validate_schema_pin),
+        ];
+        for (field, validate) in validators {
+            assert_eq!(validate(""), Err(OpaqueFieldError::Empty { field }));
+            assert_eq!(validate("k"), Ok(()));
+            assert_eq!(validate(&"k".repeat(256)), Ok(()));
+            assert_eq!(
+                validate(&"k".repeat(257)),
+                Err(OpaqueFieldError::TooLong { field, length: 257 })
+            );
+            assert_eq!(validate("!~"), Ok(()), "both ends of 0x21..=0x7E");
+            for bad in ["ké", "a\tb", "a\u{7f}", "a b"] {
+                assert_eq!(
+                    validate(bad),
+                    Err(OpaqueFieldError::InvalidCharacter { field, index: 1 }),
+                    "{field}: {bad:?}"
+                );
+            }
+            let error = validate("").unwrap_err();
+            assert_eq!(error.field(), field);
+            assert!(error.to_string().starts_with(field), "{error}");
+        }
+    }
+
+    #[test]
+    fn schema_pin_round_trips_as_a_top_level_member() {
+        let request = ToolCallRequest {
+            schema_pin: Some("sha256:0f1e2d".to_string()),
+            ..ToolCallRequest::new("grep", json!({ "q": "x" }))
+        };
+        let encoded = serde_json::to_value(&request).expect("encode");
         assert_eq!(
-            validate_call_key(&"k".repeat(257)),
-            Err(CallKeyError::TooLong { length: 257 })
+            encoded,
+            json!({ "name": "grep", "arguments": { "q": "x" }, "schema_pin": "sha256:0f1e2d" })
         );
-        assert_eq!(validate_call_key("!~"), Ok(()), "both ends of 0x21..=0x7E");
-        assert_eq!(
-            validate_call_key("ké"),
-            Err(CallKeyError::InvalidCharacter { index: 1 })
-        );
-        assert_eq!(
-            validate_call_key("a\tb"),
-            Err(CallKeyError::InvalidCharacter { index: 1 })
-        );
-        assert_eq!(
-            validate_call_key("a\u{7f}"),
-            Err(CallKeyError::InvalidCharacter { index: 1 })
-        );
-        assert_eq!(
-            validate_call_key("a b"),
-            Err(CallKeyError::InvalidCharacter { index: 1 })
-        );
-        assert_eq!(CallKeyError::Empty.field(), "call_key");
+        let decoded: ToolCallRequest = serde_json::from_value(encoded).expect("decode");
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn a_request_without_a_schema_pin_omits_the_member_and_round_trips() {
+        let request = ToolCallRequest::new("grep", json!({}));
+        let encoded = serde_json::to_value(&request).expect("encode");
+        assert!(encoded.get("schema_pin").is_none(), "{encoded}");
+        let decoded: ToolCallRequest = serde_json::from_value(encoded).expect("decode");
+        assert_eq!(decoded.schema_pin, None);
+        assert_eq!(decoded, request);
     }
 
     #[test]
@@ -230,6 +308,7 @@ mod tests {
             tool_call_id: Some("wal-intent-42".to_string()),
             progress_token: None,
             call_key: None,
+            schema_pin: None,
         };
         let encoded = serde_json::to_value(&request).expect("encode");
         assert_eq!(encoded["tool_call_id"], json!("wal-intent-42"));

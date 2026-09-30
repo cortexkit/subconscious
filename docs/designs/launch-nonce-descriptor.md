@@ -1,6 +1,7 @@
 # Launch nonce over an inherited descriptor
 
-Status: design r6 (r5 plus rows T4 and T6 of the Athena review of extensibility r7.2). r5 added
+Status: design r7, steps 1 and 2 built (subc-protocol 0.26.0, subc-os 0.1.3). r6 added rows T4
+and T6 of the Athena review of extensibility r7.2. r5 added
 the review's roster and staging and the operator's ruling on the Thalamus gateway. r4 added each seat's signing measurements. r3 added the throwaway spike
 recorded in `launch-nonce-spike-results.md`. Nothing here is built; the extensibility design (magic-context
 `ck-extensibility-design-r7.2.md`, sections 4.9 and 18) makes it a stage-2 prerequisite, and it
@@ -183,6 +184,19 @@ repo: subc-client-rs (HELLO, `lib.rs`; route open, `consumer.rs`), subc-mcp (thr
 `env::remove_var` on it today and must stop), and `fake-aft-stub`.
 
 ## 5. Rollout
+
+**What a process a module spawns sees, from step 2.** The daemon sets `SUBC_LAUNCH_NONCE_FD` for
+every wire module from step 2, so a module's own children inherit the variable:
+- **A module that reads through the accessor** reads and closes the pipe, so a process it spawns
+  inherits the variable without the pipe. That process's accessor refuses (`NotOpen` or
+  `WrongPipe`), so its route opens carry no identity (they are `direct`) and a `serve()` in it fails
+  HELLO with `LaunchNonce(NotOpen)`. It never falls back to the environment copy. That is the
+  intended end state of section 3, and it arrives with each module's own switch release, not with
+  the daemon. A helper that must act as the module gets the nonce through the handoff. `ck`, or a
+  test, run in a shell a module spawned without stripping `SUBC_*` is affected the same way.
+- **A module that has not switched yet** never reads descriptor 3, so its children inherit the
+  unread pipe along with the environment copy they already inherit today. That adds no exposure the
+  environment copy does not already have, and it ends when the module switches.
 
 Readers first; the boundary exists only after the last step.
 

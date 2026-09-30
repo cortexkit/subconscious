@@ -328,14 +328,24 @@ async fn an_exit_revokes_its_generation_and_the_respawn_is_issued_on_its_first_f
     // Well inside the 60 s reconciliation period, so it is the exit that revoked it,
     // which the consumer's own line for that event confirms.
     run.wait_revoked_within(&first_key, EXIT_LIMIT).await;
-    let handled = bus::events(&run.root(), "ckbus.spawn.event")
-        .into_iter()
-        .find(|line| {
-            line["kind"] == "exited"
-                && line["module_id"] == PARTICIPANT
-                && line["spawn_generation"] == json!(generation)
-        })
-        .expect("the consumer handled the exit");
+    // The consumer logs its line after the revocation returns, so the
+    // revocation can be visible to this test a moment before the line is
+    // written. Wait for the line rather than reading the log once.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let handled = loop {
+        let found = bus::events(&run.root(), "ckbus.spawn.event")
+            .into_iter()
+            .find(|line| {
+                line["kind"] == "exited"
+                    && line["module_id"] == PARTICIPANT
+                    && line["spawn_generation"] == json!(generation)
+            });
+        if let Some(line) = found {
+            break line;
+        }
+        assert!(Instant::now() < deadline, "the consumer handled the exit");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
     assert_eq!(
         handled["action"],
         json!({ "revoked": { "entry_generation": generation } }),

@@ -3232,7 +3232,9 @@ async fn serve_returns_when_the_daemon_connection_closes_rather_than_reconnectin
 
 // Scoped route.open against a real daemon.
 //
-// Four fake-aft-stub modules, all supervised by the daemon under test:
+// Four copies of fake-aft-stub (crates/subc-core/src/bin/fake-aft-stub.rs, a
+// raw-protocol module whose behaviour is chosen by FAKE_AFT_* environment
+// variables), all supervised by the daemon under test:
 // - the scope OWNER, which syncs whatever scopes the test writes to its sync
 //   file (writing the file is "the owner synced");
 // - the CARRIER, listed as a carrier on every scope the tests sync;
@@ -3247,8 +3249,10 @@ const SCOPE_OWNER: &str = "subc-client-rs-scope-owner";
 const SCOPE_CARRIER: &str = "subc-client-rs-scope-carrier";
 const SCOPE_STRANGER: &str = "subc-client-rs-scope-stranger";
 const SCOPE_PROVIDER: &str = "subc-client-rs-scope-provider";
-/// Matches the stub's `SCOPE_SYNC_CORR_BASE`: sync generation `n` is sent with
-/// corr `SCOPE_SYNC_CORR_BASE + n`, and the daemon's reply echoes it.
+/// Must equal `SCOPE_SYNC_CORR_BASE` in crates/subc-core/src/bin/fake-aft-stub.rs:
+/// the stub sends its `n`th scope.sync with corr `SCOPE_SYNC_CORR_BASE + n` and
+/// records the daemon's reply under that corr, which is how `sync` below finds
+/// the reply to the sync it asked for.
 const SCOPE_SYNC_CORR_BASE: u64 = 1_000_000;
 
 struct ScopeHarness {
@@ -3573,8 +3577,9 @@ async fn scope_not_carrier_and_scope_ended_are_terminal_refusals_with_their_code
         ),
     ];
     for (label, opener, selector, code) in cases {
-        // A two-second first backoff: any in-place retry of a terminal code
-        // sleeps at least half of it before the second attempt.
+        // terminal_absence_options sets a two-second route-retry backoff, and
+        // jitter keeps at least half of it, so if the SDK wrongly retried a
+        // terminal code the call would take a second or more.
         let options = CallOptions {
             consumer_identity: Some(opener),
             ..terminal_absence_options()
@@ -3729,7 +3734,9 @@ async fn ending_the_scope_closes_the_route_with_scope_ended_and_it_is_not_reopen
         "a route whose scope ended must not be reopened"
     );
 
-    // The route's GOODBYE drops it from the managed cache.
+    // The daemon also sends a GOODBYE on the route's channel, and the SDK drops
+    // a route from its managed cache when that arrives, so the handle goes
+    // stale. The GOODBYE and the push travel separately, hence the poll.
     let deadline = Instant::now() + EVENT_TIMEOUT;
     loop {
         match consumer

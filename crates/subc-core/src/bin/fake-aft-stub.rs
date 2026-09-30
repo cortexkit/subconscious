@@ -253,8 +253,10 @@ const FAKE_AFT_LAUNCH_NONCE_PATH_ENV: &str = "FAKE_AFT_LAUNCH_NONCE_PATH";
 const DEFAULT_MODULE_ID: &str = "fake-aft";
 const HELLO_CORR: u64 = 1;
 const READY_UPDATE_CORR: u64 = 2;
-/// `scope.sync` generation `n` goes out with corr `SCOPE_SYNC_CORR_BASE + n`,
-/// clear of the fixed HELLO and ready-update corrs.
+/// The stub's `n`th `scope.sync` goes out with corr `SCOPE_SYNC_CORR_BASE + n`,
+/// far above the fixed HELLO (1) and ready-update (2) corrs so the replies
+/// never collide. Tests that match a sync reply by corr use the same value
+/// (crates/subc-client-rs/tests/real_daemon.rs).
 const SCOPE_SYNC_CORR_BASE: u64 = 1_000_000;
 const STUB_EGRESS_BUFFER: usize = 64;
 const FAKE_AFT_FIXTURE_SUFFIX: &str = ".fixture.json";

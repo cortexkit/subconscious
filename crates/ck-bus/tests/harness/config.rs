@@ -33,6 +33,12 @@ pub fn render(fixture_root: &Path, ck_bus_binary: &Path, timing: SentinelTiming)
         "XDG_DATA_HOME".to_string(),
         Value::String(fixture_root.join("data").display().to_string()),
     );
+    for (name, directory) in [("XDG_RUNTIME_DIR", "run"), ("XDG_CONFIG_HOME", "config")] {
+        env.insert(
+            name.to_string(),
+            Value::String(fixture_root.join(directory).display().to_string()),
+        );
+    }
     if let Some(period_ms) = timing.period_ms {
         env.insert(
             "CKBUS_SENTINEL_PERIOD_MS".to_string(),

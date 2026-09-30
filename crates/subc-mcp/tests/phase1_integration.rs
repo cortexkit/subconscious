@@ -4305,10 +4305,10 @@ fn mcp_module_spec(
             "--connection-file".to_string(),
             module_connection_file.display().to_string(),
         ],
-        env: vec![(
-            "XDG_CONFIG_HOME".to_string(),
-            xdg_config_home.display().to_string(),
-        )],
+        env: ["XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_RUNTIME_DIR"]
+            .into_iter()
+            .map(|name| (name.to_string(), xdg_config_home.display().to_string()))
+            .collect(),
         reserved: false,
         reserved_prefixes: Vec::new(),
         protocol: ModuleProtocol::Subc,
@@ -4409,6 +4409,7 @@ fn module_command(
         .arg(module_connection_file)
         .env("XDG_CONFIG_HOME", xdg_config_home)
         .env("XDG_DATA_HOME", xdg_config_home)
+        .env("XDG_RUNTIME_DIR", xdg_config_home)
         .env(subc_protocol::SUBC_MODULE_ID_ENV, TEST_MCP_MODULE_ID)
         .env(subc_protocol::SUBC_LAUNCH_NONCE_ENV, TEST_MCP_LAUNCH_NONCE)
         .kill_on_drop(true);
@@ -5093,4 +5094,56 @@ fn assert_unknown_tool_error(error: ServiceError, name: &str) {
 
 fn unique_temp_dir(label: &str) -> TestTempDir {
     TestTempDir::new(label)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_mcp_hello_declares_build_provenance() {
+    let server = TestServer::start().await;
+    let home = server.daemon.temp_dir.join("provenance-xdg");
+    fs::create_dir_all(&home).unwrap();
+    let module_connection_file = server.daemon.temp_dir.join("provenance-module.json");
+    let module = supervisor(&server)
+        .spawn(mcp_module_spec("mcp", &module_connection_file, &home))
+        .unwrap();
+    wait_for_supervisor_entry(
+        &server.daemon.connection_file_path,
+        "mcp",
+        |entry| entry.live,
+        SETUP_TIMEOUT,
+    )
+    .await;
+    let mut client =
+        wait_for_control_client(&server.daemon.connection_file_path, SETUP_TIMEOUT).await;
+    let response = control_rpc_on_stream(
+        &mut client,
+        9_001,
+        ClientControlRequest::SupervisorProvenance {
+            module_id: Some("mcp".to_owned()),
+        },
+    )
+    .await;
+    let ClientControlResponse::SupervisorProvenance { modules, .. } = response else {
+        panic!("expected supervisor provenance response");
+    };
+    assert_eq!(modules.len(), 1);
+    let subc_control::ModuleDeclaredProvenance::Reported { build } = &modules[0].module_declared
+    else {
+        panic!("real MCP HELLO omitted build provenance");
+    };
+    assert_eq!(
+        build.wire_crate_version.as_deref(),
+        Some(subc_protocol::SUBC_PROTOCOL_CRATE_VERSION)
+    );
+    let sha = build
+        .build_git_sha
+        .as_deref()
+        .expect("real HELLO must carry build git SHA");
+    assert_eq!(sha.len(), 40);
+    assert!(sha.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    assert_eq!(build.build_lock_digest.as_ref().unwrap().len(), 64);
+    assert_eq!(
+        build.launch_nonce_source,
+        Some(subc_protocol::manifest::LaunchNonceSource::Fd)
+    );
+    module.stop().await.unwrap();
 }

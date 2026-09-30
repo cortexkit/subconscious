@@ -2065,15 +2065,23 @@ async fn start_supervision_connection_if_configured(
 }
 
 async fn send_supervision_hello(stream: &mut TcpStream, module_id: &str) -> Result<()> {
+    let nonce = subc_os::launch_nonce()
+        .map_err(|error| other_error(format!("launch nonce unavailable: {error}")))?;
+    let mut manifest = supervision_manifest(module_id.to_owned());
+    // Unlike SDK-managed HELLOs, this message is built here, so report the source
+    // from the same launch_nonce() result whose value is sent to the daemon.
+    if let Some(provenance) = manifest.provenance.as_mut() {
+        provenance.launch_nonce_source = nonce.as_ref().map(|nonce| {
+            subc_protocol::manifest::LaunchNonceSource::from_wire_name(nonce.source().as_str())
+        });
+    }
     let body = serde_json::to_vec(&ModuleHelloBody {
-        manifest: supervision_manifest(module_id.to_owned()),
+        manifest,
         protocol_ver: PROTOCOL_VERSION,
         control_ops: Some(vec![MODULE_CONTROL_OP_HEALTH_CHECK.to_owned()]),
         // Echo the one-time launch nonce subc injects for a reserved module; absent
         // (None) when this module is not reserved.
-        launch_nonce: subc_os::launch_nonce()
-            .map_err(|error| other_error(format!("launch nonce unavailable: {error}")))?
-            .map(|nonce| nonce.value().to_owned()),
+        launch_nonce: nonce.map(|nonce| nonce.value().to_owned()),
     })
     .map_err(|source| {
         other_error(format!(
@@ -2336,6 +2344,14 @@ fn manifest_output_keeps_provenance_in_the_static_manifest_object() {
 
 fn supervision_manifest(module_id: String) -> ModuleManifest {
     ModuleManifest::builder(module_id, env!("CARGO_PKG_VERSION"))
+        .provenance(Some(
+            subc_protocol::manifest::build_provenance(
+                option_env!("CK_BUILD_REV"),
+                option_env!("CK_BUILD_LOCK_DIGEST"),
+                None,
+            )
+            .expect("build provenance must be canonical"),
+        ))
         .consumes(vec![ConsumerRole::ToolClient { of: Vec::new() }])
         .build()
 }

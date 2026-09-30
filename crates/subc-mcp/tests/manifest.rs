@@ -17,7 +17,12 @@ fn manifest_is_emitted_offline_without_module_setup() {
     let manifest: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("manifest JSON");
     assert_eq!(manifest["runtime_computed"], serde_json::json!([]));
-    assert!(manifest.get("provenance").is_none());
+    assert_eq!(
+        manifest["provenance"]["wire_crate_version"],
+        subc_protocol::SUBC_PROTOCOL_CRATE_VERSION
+    );
+    assert!(manifest["provenance"]["build_git_sha"].as_str().is_some());
+    assert!(manifest["provenance"].get("launch_nonce_source").is_none());
     assert_eq!(manifest["module_id"], "ck-subc-mcp");
     // The version is the crate's own, so a release bump never needs this test
     // edited; everything else is compared whole against the captured
@@ -27,6 +32,7 @@ fn manifest_is_emitted_offline_without_module_setup() {
     assert_eq!(manifest["module_version"], env!("CARGO_PKG_VERSION"));
     let mut rest = manifest.clone();
     rest.as_object_mut().unwrap().remove("module_version");
+    rest.as_object_mut().unwrap().remove("provenance");
     let baseline = "{\"consumes\":[{\"of\":[],\"role\":\"tool_client\"}],\"module_id\":\"ck-subc-mcp\",\"protocol_ver\":2,\"provides\":[],\"runtime_computed\":[]}";
     assert_eq!(
         rest,

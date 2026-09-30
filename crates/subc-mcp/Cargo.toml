@@ -1,6 +1,6 @@
 [package]
 name = "subc-mcp"
-version = "0.1.14"
+version = "0.1.15"
 edition = "2021"
 license = "MIT"
 publish = false
@@ -24,6 +24,9 @@ subc-os = { path = "../subc-os" }
 subc-protocol = { path = "../subc-protocol" }
 subc-transport = { path = "../subc-transport" }
 tokio = { version = "1", features = ["net", "rt-multi-thread", "macros", "io-util", "io-std", "sync", "time", "process"] }
+
+[build-dependencies]
+sha2 = "0.10"
 
 [dev-dependencies]
 subc-test-support = { path = "../subc-test-support" }

@@ -145,7 +145,13 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     );
 
     let wired = issuance::handler::wire(
-        ModuleManifest::builder(&module_id, env!("CARGO_PKG_VERSION")),
+        ModuleManifest::builder(&module_id, env!("CARGO_PKG_VERSION")).provenance(Some(
+            subc_protocol::manifest::build_provenance(
+                option_env!("CK_BUILD_REV"),
+                option_env!("CK_BUILD_LOCK_DIGEST"),
+                None,
+            )?,
+        )),
         BusHandler { runtime },
         credentials.clone(),
         &store_root,

@@ -494,3 +494,42 @@ async fn record_server_describe(run: &AcceptanceRun) {
     };
     eprintln!("fire-time server.describe build_git_sha={build_git_sha:?}");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn real_ckbus_hello_declares_build_provenance() {
+    let _gate = harness::acceptance_gate().await;
+    harness::install_tracing();
+    let run = AcceptanceRun::start(Path::new(env!("CARGO_BIN_EXE_ck-bus"))).await;
+    run.wait_for_catalog_id(MODULE_ID).await;
+    let response = control::response(
+        &run.connection_file,
+        ClientControlRequest::SupervisorProvenance {
+            module_id: Some(MODULE_ID.to_string()),
+        },
+    )
+    .await;
+    let ClientControlResponse::SupervisorProvenance { modules, .. } = response else {
+        panic!("expected supervisor provenance response");
+    };
+    assert_eq!(modules.len(), 1);
+    let subc_control::ModuleDeclaredProvenance::Reported { build } = &modules[0].module_declared
+    else {
+        panic!("real ckbus HELLO omitted build provenance");
+    };
+    assert_eq!(
+        build.wire_crate_version.as_deref(),
+        Some(subc_protocol::SUBC_PROTOCOL_CRATE_VERSION)
+    );
+    let sha = build
+        .build_git_sha
+        .as_deref()
+        .expect("real HELLO must carry build git SHA");
+    assert_eq!(sha.len(), 40);
+    assert!(sha.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    assert_eq!(build.build_lock_digest.as_ref().unwrap().len(), 64);
+    assert_eq!(
+        build.launch_nonce_source,
+        Some(subc_protocol::manifest::LaunchNonceSource::Fd)
+    );
+    run.shutdown().await;
+}

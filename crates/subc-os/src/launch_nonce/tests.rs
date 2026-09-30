@@ -90,6 +90,22 @@ mod unix_tests {
         }
     }
 
+    /// Whether `fd` still names the pipe with `inode`. After the accessor
+    /// closes a descriptor, other tests running in parallel in this binary can
+    /// open something that reuses the number at once, so "was it closed" is
+    /// asked as "does the number still name that pipe", never as "is the
+    /// number free".
+    fn fd_names_pipe(fd: RawFd, inode: u64) -> bool {
+        // SAFETY: fstat writes only into the zeroed struct passed to it.
+        #[allow(unsafe_code)]
+        unsafe {
+            let mut stat: libc::stat = std::mem::zeroed();
+            libc::fstat(fd, &mut stat) == 0
+                && (stat.st_mode & libc::S_IFMT) == libc::S_IFIFO
+                && stat.st_ino as u64 == inode
+        }
+    }
+
     /// A pipe holding `bytes` with its write end closed, and its inode.
     fn sealed_pipe(bytes: &[u8]) -> (OwnedFd, u64) {
         let handoff = LaunchNonceHandoff::new(std::str::from_utf8(bytes).unwrap()).unwrap();
@@ -135,7 +151,10 @@ mod unix_tests {
             assert_eq!(got.source(), LaunchNonceSource::Fd);
         }
         assert_eq!(cell.descriptor_reads(), 1);
-        assert!(!fd_is_open(fd), "the first read closes the descriptor");
+        assert!(
+            !fd_names_pipe(fd, inode),
+            "the first read closes the descriptor"
+        );
 
         // Put a different pipe at the same number and name it, inode and
         // all, the way a second independent reader would find it. A reader
@@ -272,7 +291,7 @@ mod unix_tests {
             .unwrap()
             .unwrap();
         assert_eq!((got.value(), got.source()), (NONCE, LaunchNonceSource::Fd));
-        assert!(!fd_is_open(fd));
+        assert!(!fd_names_pipe(fd, inode), "the read closes the descriptor");
     }
 
     #[test]

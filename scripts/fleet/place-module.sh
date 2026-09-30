@@ -98,7 +98,7 @@ set -euo pipefail
 
 STAGING="${CK_STAGING:-$HOME/.local/share/cortexkit/staging}"
 BIN_DIR="${CK_BIN_DIR:-$HOME/.local/share/cortexkit/bin}"
-MODULE=""; STAGED=""; DEST=""; PATH_FACE=""; MARKER=""; CONTROL=""; OLD_CONTROL=""; GONE=""; RESTART=1; PLACE=0; OLDER=0; MIGRATES=""; NEW_REQUIREMENT=""
+MODULE=""; STAGED=""; DEST=""; PATH_FACE=""; MARKER=""; CONTROL=""; OLD_CONTROL=""; GONE=""; RESTART=1; PLACE=0; OLDER=0; MIGRATES=""; NEW_REQUIREMENT=""; ALLOW_UNHARDENED=0
 
 while (($# > 0)); do
   case "$1" in
@@ -113,6 +113,11 @@ while (($# > 0)); do
     --place) PLACE=1; shift ;;
     --older) OLDER=1; shift ;;
     --new-requirement) NEW_REQUIREMENT="$2"; shift 2 ;;
+    # Rolling a hardened module back to a build from before its hardening is the
+    # one legitimate removal of the runtime flag, and it must be possible in an
+    # incident. It is an explicit flag, never a default, and the output says what
+    # it reopens.
+    --allow-unhardened) ALLOW_UNHARDENED=1; shift ;;
     --before) BEFORE_CMD="$2"; shift 2 ;;
     # A card that MIGRATES THE STORE cannot be rolled back by binary alone: the
     # old binary meets a newer schema and refuses on store_ahead, which is the
@@ -441,8 +446,10 @@ if command -v codesign >/dev/null; then
     live_sig_cmp=$(printf '%s' "$live_sig_cmp" | sed -E 's/Identifier=[^ ]+ //')
   fi
   [ "$staged_sig_cmp" = "$live_sig_cmp" ] || refuse "signing posture differs: staged [$staged_sig] vs running [$live_sig]"
-  if has_runtime "$DEST" && ! has_runtime "$STAGED"; then
-    refuse "hardened runtime would be REMOVED: the running binary has it and the staged one does not, which lets any same-user process attach and read the module's launch nonce (staged [$staged_sig] vs running [$live_sig])"
+  if has_runtime "$DEST" && ! has_runtime "$STAGED" && [ "$ALLOW_UNHARDENED" -eq 1 ]; then
+    say "hardened runtime: REMOVED BY REQUEST (--allow-unhardened): after this placement any same-user process can attach to this module and read its launch nonce, until a hardened build is placed again"
+  elif has_runtime "$DEST" && ! has_runtime "$STAGED"; then
+    refuse "hardened runtime would be REMOVED (pass --allow-unhardened to roll back to a pre-hardening build on purpose): the running binary has it and the staged one does not, which lets any same-user process attach and read the module's launch nonce (staged [$staged_sig] vs running [$live_sig])"
   fi
   if has_runtime "$STAGED" && ! has_runtime "$DEST"; then
     say "signing posture: $staged_sig(matches running except hardened runtime, which this placement ADDS)"

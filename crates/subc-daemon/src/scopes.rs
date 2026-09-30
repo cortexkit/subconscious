@@ -39,9 +39,21 @@ const INVALID_CONTROL_BODY: &str = "invalid_control_body";
 /// scope table can tell whether a connection belongs to its module's current
 /// launch. The registry keeps no nonce, and the supervisor's record says only
 /// which nonce is current, not which connection holds it.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub(crate) struct HelloLaunchNonces {
     by_connection: HashMap<ConnectionId, String>,
+}
+
+// Hand-written so no launch nonce is ever printed. Each nonce is the credential
+// that attributes a connection to a supervised module, and a derived Debug
+// would write every module's nonce into any log line or panic message that
+// formats the handler or this map. Same reasoning as ConsumerIdentity's Debug.
+impl std::fmt::Debug for HelloLaunchNonces {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HelloLaunchNonces")
+            .field("connections", &self.by_connection.len())
+            .finish()
+    }
 }
 
 impl HelloLaunchNonces {
@@ -1005,6 +1017,19 @@ mod tests {
 
     fn version(table: &ScopeTable, owner: &str, scope_ref: &str) -> u64 {
         table.owners[owner].live[scope_ref].version
+    }
+
+    #[test]
+    fn hello_launch_nonces_debug_prints_no_nonce() {
+        let mut nonces = HelloLaunchNonces::default();
+        nonces.record(conn(1), Some("secret-nonce-one"));
+        nonces.record(conn(2), Some("secret-nonce-two"));
+        let printed = format!("{nonces:?}");
+        assert!(!printed.contains("secret-nonce"), "{printed}");
+        // Control: the instance is populated, so an empty map is not why no
+        // nonce was printed.
+        assert!(printed.contains('2'), "{printed}");
+        assert!(nonces.presented(conn(1), Some("secret-nonce-one")));
     }
 
     // ---- ownership -------------------------------------------------------

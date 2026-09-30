@@ -1399,6 +1399,10 @@ where
             principal,
             consumer_capabilities,
             admission_facts,
+            // Not surfaced to handlers yet: the scope stamp reaches providers
+            // through this SDK in a later change. Ignoring it here is what an
+            // older build of this SDK does too.
+            scope: _,
         } => {
             // Implicit-replace rule (wire spec 3.3.0): the daemon never rebinds a live
             // channel, but its route-gone GOODBYE to modules is best-effort, so a bind
@@ -2305,6 +2309,7 @@ mod tests {
             principal: None,
             consumer_capabilities: None,
             admission_facts: None,
+            scope: None,
         })
         .unwrap();
         Frame::build(FrameType::Request, control_flags(), 0, 0, corr, body).unwrap()
@@ -2675,6 +2680,7 @@ mod module_close_tests {
             principal: None,
             consumer_capabilities: None,
             admission_facts: None,
+            scope: None,
         })
         .unwrap();
         send(

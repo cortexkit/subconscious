@@ -130,6 +130,12 @@ fn daemon_route_open_error_codes_are_complete_in_decision_tables() {
         "module_warming",
         "op_not_allowed",
         "route_limit",
+        "scope_changed",
+        "scope_ended",
+        "scope_epoch_required",
+        "scope_not_carrier",
+        "scope_not_live",
+        "scope_not_synced",
         "target_unavailable",
         "unknown_module",
     ];

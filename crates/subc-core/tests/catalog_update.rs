@@ -960,6 +960,7 @@ fn route_open_frame(project: &TestProject, module_id: &str, corr: u64) -> Frame 
             consumer_identity: None,
             consumer_capabilities: None,
             admission_facts: None,
+            scope: None,
         },
     )
 }
@@ -1130,6 +1131,7 @@ async fn open_route(
                 consumer_capabilities: None,
 
                 admission_facts: None,
+                scope: None,
             },
         ))
         .await;
@@ -1343,6 +1345,7 @@ async fn route_open_terminal(
                 consumer_identity: None,
                 consumer_capabilities: None,
                 admission_facts: None,
+                scope: None,
             },
         ))
         .await;

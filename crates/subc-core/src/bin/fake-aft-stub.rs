@@ -1230,6 +1230,7 @@ async fn handle_control_request(
             principal,
             consumer_capabilities,
             admission_facts,
+            scope: _,
         } => {
             state.tentative_channels.insert(route_channel, epoch);
             record_event(

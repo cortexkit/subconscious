@@ -994,6 +994,7 @@ impl SubcConsumer {
             consumer_identity: route_open_consumer_identity(opts),
             consumer_capabilities,
             admission_facts: Some(facts),
+            scope: None,
         })
         .map_err(|err| CallError::not_sent(format!("failed to encode route.open: {err}")))?;
 
@@ -2737,6 +2738,7 @@ impl Shared {
                 consumer_identity: route_open.consumer_identity.clone(),
                 consumer_capabilities: route_open.consumer_capabilities.clone(),
                 admission_facts: None,
+                scope: None,
             })
             .map_err(|err| CallError::not_sent(format!("failed to encode route.open: {err}")))?;
             match self

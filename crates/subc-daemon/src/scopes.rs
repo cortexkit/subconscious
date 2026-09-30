@@ -11,11 +11,13 @@
 //! is and whether its connection belongs to the owner's current launch, and
 //! passes both in, so every rule below can be exercised without a socket.
 //!
-//! Route admission, bind stamps, commit checks and drains read this table but
-//! are not implemented here. A sync reports each scope whose `(scope_epoch,
-//! version)` it changed ([`ScopeTagChange`]) so the caller can publish those
-//! into the forwarding table in the same step: a bind commit compares its
-//! captured tag against the published one and must never take the scope lock.
+//! Route admission ([`ScopeTable::admit`]) reads the table and returns the stamp
+//! for the bind and the tag it was taken at. A sync reports each scope whose
+//! `(scope_epoch, version)` it changed ([`ScopeTagChange`]), with which live
+//! routes the change closes ([`ScopeDrain`]), so the caller publishes the tags
+//! into the forwarding table and closes those routes in the same step: a bind
+//! commit compares its captured tag against the published one and must never
+//! take the scope lock.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
@@ -23,10 +25,10 @@ use subc_protocol::{
     error_codes,
     scope::{
         ParentState, ScopeEnded, ScopeParent, ScopeRecord, ScopeRecordOutcome, ScopeRecordResult,
-        ScopeStamp, ScopeStatus, MAX_CARRIER_TARGETS, MAX_LIVE_SCOPES_PER_OWNER,
+        ScopeSelector, ScopeStamp, ScopeStatus, MAX_CARRIER_TARGETS, MAX_LIVE_SCOPES_PER_OWNER,
         MAX_SCOPE_ATTRIBUTE_BYTES, MAX_SCOPE_TOMBSTONES_PER_OWNER,
     },
-    Principal,
+    Principal, RouteCloseReason,
 };
 
 use crate::registry::ConnectionId;
@@ -112,6 +114,135 @@ pub(crate) struct ScopeTagChange {
     pub(crate) scope_ref: String,
     pub(crate) before: Option<ScopeTag>,
     pub(crate) after: Option<ScopeTag>,
+    /// Which live routes under the scope's `before` epoch the change closes.
+    pub(crate) drain: ScopeDrain,
+}
+
+/// Which live routes a change to one scope closes, per the design note's
+/// drain table. A route stamped with an older version but not selected here
+/// stays up: its stamp grants no more than the current record does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ScopeDrain {
+    /// Nothing: a carrier or target added, `child_owners` changed, a parent
+    /// link going from pending to linked, or any other change that narrows
+    /// no one's authority.
+    Nothing,
+    /// Every route under the scope, with this reason.
+    All(RouteCloseReason),
+    /// Only routes opened by these carriers: every such route when the
+    /// allowance is `None` (the carrier entry was removed), or those whose
+    /// target module is outside the allowance (targets were removed).
+    Carriers(Vec<(Principal, Option<BTreeSet<String>>)>),
+}
+
+impl ScopeDrain {
+    /// Rank for combining two drains of one scope: the wider one wins, and
+    /// between reasons that close every route, the note's order (ended, then
+    /// parent ended, then delegation changed).
+    fn rank(&self) -> u8 {
+        match self {
+            Self::Nothing => 0,
+            Self::Carriers(_) => 1,
+            Self::All(RouteCloseReason::ScopeDelegationChanged) => 2,
+            Self::All(RouteCloseReason::ScopeParentEnded) => 3,
+            Self::All(_) => 4,
+        }
+    }
+
+    fn widen(self, other: ScopeDrain) -> ScopeDrain {
+        if other.rank() > self.rank() {
+            other
+        } else {
+            self
+        }
+    }
+}
+
+/// The modules one principal may open to under a record: `None` if it may not
+/// open at all, `Some(None)` for any module, `Some(Some(set))` for those only.
+/// The owner is not a carrier and is not answered here.
+fn carrier_allowance(
+    record: &ScopeRecord,
+    principal: &Principal,
+) -> Option<Option<BTreeSet<String>>> {
+    let mut allowance: Option<Option<BTreeSet<String>>> = None;
+    for carrier in record.carriers.iter().filter(|c| &c.principal == principal) {
+        allowance = Some(match (allowance, &carrier.targets) {
+            (Some(None), _) | (_, None) => None,
+            (Some(Some(mut set)), Some(targets)) => {
+                set.extend(targets.iter().cloned());
+                Some(set)
+            }
+            (None, Some(targets)) => Some(targets.iter().cloned().collect()),
+        });
+    }
+    allowance
+}
+
+/// Which routes of the same scope a content change at one epoch closes.
+fn drain_for_change(before: &LiveScope, after: &LiveScope) -> ScopeDrain {
+    let mut drain = ScopeDrain::Nothing;
+    let mut narrowed = Vec::new();
+    let mut principals: Vec<&Principal> = Vec::new();
+    for carrier in &before.record.carriers {
+        if !principals.contains(&&carrier.principal) {
+            principals.push(&carrier.principal);
+        }
+    }
+    for principal in principals {
+        let was = carrier_allowance(&before.record, principal);
+        let now = carrier_allowance(&after.record, principal);
+        match (was, now) {
+            (Some(_), None) => narrowed.push((principal.clone(), None)),
+            (Some(None), Some(Some(set))) => narrowed.push((principal.clone(), Some(set))),
+            (Some(Some(old)), Some(Some(set))) if !old.is_subset(&set) => {
+                narrowed.push((principal.clone(), Some(set)))
+            }
+            _ => {}
+        }
+    }
+    if !narrowed.is_empty() {
+        drain = ScopeDrain::Carriers(narrowed);
+    }
+    let before_attributes = &before.record.attributes;
+    let after_attributes = &after.record.attributes;
+    if (before_attributes.delegates && !after_attributes.delegates)
+        || before_attributes.agent_id != after_attributes.agent_id
+    {
+        drain = drain.widen(ScopeDrain::All(RouteCloseReason::ScopeDelegationChanged));
+    }
+    if after.parent_state == Some(ParentState::Ended)
+        && before.parent_state != Some(ParentState::Ended)
+    {
+        drain = drain.widen(ScopeDrain::All(RouteCloseReason::ScopeParentEnded));
+    }
+    drain
+}
+
+/// The scope a pending bind or a live route was admitted under, as the
+/// forwarding table keeps it: enough to compare against the published tag at
+/// commit and to find the route when the scope changes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BoundScope {
+    pub(crate) owner: String,
+    pub(crate) scope_ref: String,
+    pub(crate) tag: ScopeTag,
+}
+
+/// An admitted scoped open: what the bind is stamped with, and the tag the
+/// commit compares against the published one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ScopeAdmission {
+    pub(crate) owner: String,
+    pub(crate) stamp: ScopeStamp,
+    pub(crate) tag: ScopeTag,
+}
+
+/// A refused scoped open: a code from `error_codes` and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ScopeAdmissionRefusal {
+    pub(crate) code: &'static str,
+    pub(crate) message: String,
 }
 
 /// An accepted sync: the reply's contents plus the tag changes to publish.
@@ -483,14 +614,28 @@ impl ScopeTable {
         let mut tag_changes = Vec::new();
         let refs: BTreeSet<&String> = old.keys().chain(state.live.keys()).collect();
         for scope_ref in refs {
-            let before = old.get(scope_ref).map(LiveScope::tag);
-            let after = state.live.get(scope_ref).map(LiveScope::tag);
+            let old_scope = old.get(scope_ref);
+            let new_scope = state.live.get(scope_ref);
+            let before = old_scope.map(LiveScope::tag);
+            let after = new_scope.map(LiveScope::tag);
             if before != after {
+                let drain = match (old_scope, new_scope) {
+                    (Some(old_scope), Some(new_scope))
+                        if old_scope.record.scope_epoch == new_scope.record.scope_epoch =>
+                    {
+                        drain_for_change(old_scope, new_scope)
+                    }
+                    // Removed, or replaced by a higher epoch: a new session never
+                    // inherits a live route of the old one.
+                    (Some(_), _) => ScopeDrain::All(RouteCloseReason::ScopeEnded),
+                    (None, _) => ScopeDrain::Nothing,
+                };
                 tag_changes.push(ScopeTagChange {
                     owner: owner.to_string(),
                     scope_ref: scope_ref.clone(),
                     before,
                     after,
+                    drain,
                 });
             }
         }
@@ -853,6 +998,13 @@ impl ScopeTable {
             scope.parent_state = Some(settled);
             scope.version = version;
             let after = scope.tag();
+            // A link settling to linked narrows nothing; one ending means no
+            // live route may keep a stamp saying the parent is live.
+            let drain = if settled == ParentState::Ended {
+                ScopeDrain::All(RouteCloseReason::ScopeParentEnded)
+            } else {
+                ScopeDrain::Nothing
+            };
             // The syncing owner's own scopes are already in its change list
             // with their pre-sync tag; keep that entry and move its `after`.
             if let Some(change) = tag_changes
@@ -860,15 +1012,107 @@ impl ScopeTable {
                 .find(|change| change.owner == child_owner && change.scope_ref == child_ref)
             {
                 change.after = Some(after);
+                let current = std::mem::replace(&mut change.drain, ScopeDrain::Nothing);
+                change.drain = current.widen(drain);
             } else {
                 tag_changes.push(ScopeTagChange {
                     owner: child_owner,
                     scope_ref: child_ref,
                     before: Some(before),
                     after: Some(after),
+                    drain,
                 });
             }
         }
+    }
+
+    /// Admit a `route.open` naming a scope, or refuse it by name.
+    ///
+    /// `opener` is the route's attested principal, never anything from the
+    /// request body; `target_module` is the module the route is opened to;
+    /// `owner_configured` is whether the owner is in the supervisor's roster.
+    /// The checks run in the design note's order: epoch named, owner synced,
+    /// ref live, epoch live, opener permitted.
+    pub(crate) fn admit(
+        &self,
+        opener: &Principal,
+        target_module: &str,
+        selector: &ScopeSelector,
+        owner_configured: bool,
+    ) -> Result<ScopeAdmission, ScopeAdmissionRefusal> {
+        let refuse = |code: &'static str, message: String| ScopeAdmissionRefusal { code, message };
+        let Some(scope_epoch) = selector.scope_epoch else {
+            return Err(refuse(
+                error_codes::SCOPE_EPOCH_REQUIRED,
+                "a scoped route.open must name the scope_epoch it serves".to_string(),
+            ));
+        };
+        let scope_ref = &selector.scope_ref;
+        let Some(owner) = reserved_module_id(&selector.owner) else {
+            return Err(refuse(
+                error_codes::SCOPE_NOT_LIVE,
+                "a scope's owner is always a supervised module".to_string(),
+            ));
+        };
+        let state = self.owners.get(owner).filter(|state| state.synced);
+        let Some(state) = state else {
+            return Err(if owner_configured {
+                refuse(
+                    error_codes::SCOPE_NOT_SYNCED,
+                    format!("{owner} has not synced its scopes since this daemon started"),
+                )
+            } else {
+                refuse(
+                    error_codes::SCOPE_NOT_LIVE,
+                    format!("{owner} is not a configured module and will never sync"),
+                )
+            });
+        };
+        let Some(scope) = state.live.get(scope_ref) else {
+            return Err(refuse(
+                error_codes::SCOPE_NOT_LIVE,
+                format!("{owner} holds no live scope '{scope_ref}'"),
+            ));
+        };
+        if scope.record.scope_epoch != scope_epoch {
+            return Err(refuse(
+                error_codes::SCOPE_ENDED,
+                format!(
+                    "scope '{scope_ref}' of {owner} is live at scope_epoch {}, not {scope_epoch}",
+                    scope.record.scope_epoch
+                ),
+            ));
+        }
+        if reserved_module_id(opener) != Some(owner) {
+            let permitted = match carrier_allowance(&scope.record, opener) {
+                None => false,
+                Some(None) => true,
+                Some(Some(targets)) => targets.contains(target_module),
+            };
+            if !permitted {
+                return Err(refuse(
+                    error_codes::SCOPE_NOT_CARRIER,
+                    format!(
+                        "the opener is not the owner or a carrier of scope '{scope_ref}' of \
+                         {owner} permitted to open to '{target_module}'"
+                    ),
+                ));
+            }
+        }
+        Ok(ScopeAdmission {
+            owner: owner.to_string(),
+            stamp: ScopeStamp {
+                owner: selector.owner.clone(),
+                scope_ref: scope_ref.clone(),
+                scope_epoch,
+                kind: scope.record.kind,
+                parent: scope.record.parent.clone(),
+                parent_state: scope.parent_state,
+                attributes: scope.record.attributes.clone(),
+                owner_authorized: self.owner_authorized(owner),
+            },
+            tag: scope.tag(),
+        })
     }
 
     /// The table's answer about one `(owner, ref)`.
@@ -1360,6 +1604,7 @@ mod tests {
                     scope_epoch: 6,
                     version: version(&table, PREFRONTAL, "s")
                 }),
+                drain: ScopeDrain::All(RouteCloseReason::ScopeEnded),
             }]
         );
 

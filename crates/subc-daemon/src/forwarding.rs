@@ -21,6 +21,7 @@ use crate::{
     observability::DaemonCounters,
     registry::ConnectionId,
     router::FrameSink,
+    scopes::{BoundScope, ScopeDrain, ScopeTag, ScopeTagChange},
     Frame, ProjectRootId,
 };
 
@@ -76,6 +77,9 @@ pub(crate) struct RouteBinding {
     pub project_root: Option<ProjectRootId>,
     pub bound_at: Instant,
     pub flow: Arc<ChannelFlow>,
+    /// The scope the route was admitted under, with the tag its bind was
+    /// stamped at. A scope change finds the routes to close by it.
+    pub scope: Option<BoundScope>,
 }
 
 #[derive(Debug, Clone)]
@@ -296,6 +300,16 @@ pub(crate) struct EndpointRoute {
     pub drain_reason: Option<RouteCloseReason>,
 }
 
+/// One live route a scope change closed: both ends to send GOODBYE to, and the
+/// reason for the client's `route.closed`.
+#[derive(Debug, Clone)]
+pub(crate) struct ScopeDrainedRoute {
+    pub reason: RouteCloseReason,
+    pub module_id: String,
+    pub client: GoodbyeTarget,
+    pub module: GoodbyeTarget,
+}
+
 #[derive(Debug)]
 pub(crate) struct PendingRouteBindRelay {
     pub endpoint: ModuleEndpointId,
@@ -424,6 +438,9 @@ struct PendingRouteBindRelayEntry {
     client_permit: crate::router::EgressPermit,
     route_open_frame: Frame,
     principal: Principal,
+    /// The scope admitted at `route.open`, with the tag captured then. Commit
+    /// compares it with the published tag.
+    scope: Option<BoundScope>,
     deadline: Instant,
     relay_enqueued: bool,
     sender: oneshot::Sender<RouteBindRelayOutcome>,
@@ -491,6 +508,11 @@ struct ForwardingInner {
     module_to_client: HashMap<ModuleRouteKey, Arc<RouteBinding>>,
     status: HashMap<(ClientRouteKey, u32), String>,
     pending_relays: HashMap<(ModuleEndpointId, u64), PendingRouteBindRelayEntry>,
+    /// Each scope's current `(scope_epoch, version)`, keyed `(owner, ref)`,
+    /// published by a scope sync in the same step that changes the record. A
+    /// bind commit reads it here so it never takes the scope table's lock
+    /// while holding this one. Absent means the scope is not live.
+    scope_tags: HashMap<(String, String), ScopeTag>,
     next_control_corr: HashMap<ModuleEndpointId, u64>,
     pending_control_rpcs: HashMap<(ModuleEndpointId, u64), PendingModuleControlRpcEntry>,
     health_probe_tombstones: HashMap<(ModuleEndpointId, u64), HealthProbeTombstone>,
@@ -937,6 +959,7 @@ impl ForwardingTable {
         client_corr: u64,
         module_id: &str,
         principal: Principal,
+        scope: Option<BoundScope>,
         project_root: Option<ProjectRootId>,
         deadline: Instant,
     ) -> Result<PendingRouteBindRelay, ForwardingError> {
@@ -957,6 +980,7 @@ impl ForwardingTable {
             client_corr,
             module_id,
             principal,
+            scope,
             project_root,
             deadline,
             client_permit,
@@ -984,6 +1008,7 @@ impl ForwardingTable {
             client_corr,
             module_id,
             Principal::Direct,
+            None,
             None,
             Instant::now() + std::time::Duration::from_secs(60),
             permit,
@@ -1167,6 +1192,7 @@ impl ForwardingTable {
         client_corr: u64,
         expected_module_id: &str,
         principal: Principal,
+        scope: Option<BoundScope>,
         project_root: Option<ProjectRootId>,
         deadline: Instant,
         client_permit: crate::router::EgressPermit,
@@ -1254,6 +1280,7 @@ impl ForwardingTable {
                 client_permit,
                 route_open_frame,
                 principal,
+                scope,
                 deadline,
                 relay_enqueued: false,
                 sender,
@@ -1550,6 +1577,39 @@ impl ForwardingTable {
                         "module_reloading",
                         format!("module_id '{module_id}' is reloading"),
                     )));
+                return Ok(PendingRelayCompletion {
+                    settled: true,
+                    abandoned,
+                });
+            }
+            // The scope the open was admitted under ended or changed after
+            // admission. The module bound a route under a stamp that is no
+            // longer true, so it must not become routable. Settled here like
+            // the superseded arm above, never as an error from
+            // `commit_route_locked`, which would close the module's whole
+            // connection and every other client's routes to it: release the
+            // pair, answer the waiting route.open by name, and hand back the
+            // module-side channel for one channel-scoped GOODBYE.
+            RouteBindRelayOutcome::Accepted
+                if pending
+                    .scope
+                    .as_ref()
+                    .is_some_and(|scope| scope_refusal_locked(&inner, scope).is_some()) =>
+            {
+                let refusal = pending
+                    .scope
+                    .as_ref()
+                    .and_then(|scope| scope_refusal_locked(&inner, scope))
+                    .expect("guard matched a refusal under the same lock");
+                release_reserved_route_locked(
+                    &mut inner,
+                    pending.reservation.client_key,
+                    pending.reservation.module_key,
+                );
+                let abandoned = abandoned_route_target(&inner, &pending.reservation);
+                let _ = pending
+                    .sender
+                    .send(RouteBindRelayOutcome::Rejected(refusal));
                 return Ok(PendingRelayCompletion {
                     settled: true,
                     abandoned,
@@ -2478,6 +2538,106 @@ impl ForwardingTable {
         Ok(true)
     }
 
+    /// Publish the tags a scope sync changed and close the live routes its
+    /// drain table selects, in one critical section.
+    ///
+    /// The caller holds the scope table's write lock (scope table, then this
+    /// table, always). Publishing and selecting under one lock is what closes
+    /// the race with a bind commit: a commit before this sees the old tag and
+    /// its route is selected here like any other; a commit after it sees the
+    /// new tag and is refused.
+    ///
+    /// Every client route index entry is scanned, which includes routes on a
+    /// swap's superseded endpoint: those stay indexed until drained.
+    pub(crate) fn publish_scope_changes(
+        &self,
+        changes: &[ScopeTagChange],
+    ) -> Result<Vec<ScopeDrainedRoute>, ForwardingError> {
+        let mut inner = self.write_inner()?;
+        let mut by_scope: HashMap<(&str, &str), &ScopeTagChange> = HashMap::new();
+        for change in changes {
+            let key = (change.owner.clone(), change.scope_ref.clone());
+            match change.after {
+                Some(tag) => {
+                    inner.scope_tags.insert(key, tag);
+                }
+                None => {
+                    inner.scope_tags.remove(&key);
+                }
+            }
+            by_scope.insert((change.owner.as_str(), change.scope_ref.as_str()), change);
+        }
+        let mut selected = Vec::new();
+        for (client_key, route) in &inner.client_to_module {
+            let Some(scope) = &route.scope else {
+                continue;
+            };
+            let Some(change) = by_scope.get(&(scope.owner.as_str(), scope.scope_ref.as_str()))
+            else {
+                continue;
+            };
+            if change.before.map(|tag| tag.scope_epoch) != Some(scope.tag.scope_epoch) {
+                continue;
+            }
+            let reason = match &change.drain {
+                ScopeDrain::Nothing => continue,
+                ScopeDrain::All(reason) => *reason,
+                ScopeDrain::Carriers(narrowed) => {
+                    let owner = Principal::Reserved {
+                        module_id: scope.owner.clone(),
+                    };
+                    let hit = route.principal != owner
+                        && narrowed.iter().any(|(principal, allowed)| {
+                            *principal == route.principal
+                                && allowed
+                                    .as_ref()
+                                    .is_none_or(|targets| !targets.contains(&route.module_id))
+                        });
+                    if !hit {
+                        continue;
+                    }
+                    RouteCloseReason::ScopeCarrierRemoved
+                }
+            };
+            selected.push((*client_key, route.client_epoch, reason));
+        }
+        let mut drained = Vec::new();
+        for (client_key, client_epoch, reason) in selected {
+            let Some(route) = inner.client_to_module.get(&client_key).cloned() else {
+                continue;
+            };
+            let release = release_client_route_locked(&mut inner, client_key, client_epoch);
+            self.record_route_release(&release);
+            if let RouteRelease::Removed(module) = release {
+                drained.push(ScopeDrainedRoute {
+                    reason,
+                    module_id: route.module_id.clone(),
+                    client: GoodbyeTarget {
+                        connection_id: route.client_connection_id,
+                        sink: route.client_sink.clone(),
+                        negotiated_ver: route.client_negotiated_ver,
+                        channel: route.client_channel,
+                        epoch: route.client_epoch,
+                        kind: GoodbyeTargetKind::Client,
+                        module_id: Some(route.module_id.clone()),
+                    },
+                    module,
+                });
+            }
+        }
+        Ok(drained)
+    }
+
+    /// The published tag of one scope, for tests of the commit re-check.
+    #[cfg(test)]
+    pub(crate) fn published_scope_tag(&self, owner: &str, scope_ref: &str) -> Option<ScopeTag> {
+        self.read_inner()
+            .ok()?
+            .scope_tags
+            .get(&(owner.to_string(), scope_ref.to_string()))
+            .copied()
+    }
+
     fn record_route_release(&self, release: &RouteRelease) {
         match release {
             RouteRelease::Removed(_) => self.counters.increment_route_released_epoch_fenced(),
@@ -2642,6 +2802,30 @@ fn endpoint_routes_locked(
     routes
 }
 
+/// Why a bind admitted under `scope` may no longer commit, read from the
+/// published tags: `scope_ended` when the scope is gone or at another epoch,
+/// `scope_changed` (retryable) when only its content moved.
+fn scope_refusal_locked(inner: &ForwardingInner, scope: &BoundScope) -> Option<ErrorBody> {
+    let key = (scope.owner.clone(), scope.scope_ref.clone());
+    match inner.scope_tags.get(&key) {
+        Some(current) if *current == scope.tag => None,
+        Some(current) if current.scope_epoch == scope.tag.scope_epoch => Some(ErrorBody::new(
+            subc_protocol::error_codes::SCOPE_CHANGED,
+            format!(
+                "scope '{}' of {} changed while the route was being bound; re-open it",
+                scope.scope_ref, scope.owner
+            ),
+        )),
+        _ => Some(ErrorBody::new(
+            subc_protocol::error_codes::SCOPE_ENDED,
+            format!(
+                "scope '{}' of {} at scope_epoch {} ended while the route was being bound",
+                scope.scope_ref, scope.owner, scope.tag.scope_epoch
+            ),
+        )),
+    }
+}
+
 fn release_reserved_route_locked(
     inner: &mut ForwardingInner,
     client_key: ClientRouteKey,
@@ -2775,6 +2959,7 @@ fn commit_route_locked(
         project_root: reservation.project_root.clone(),
         bound_at: Instant::now(),
         flow: Arc::new(ChannelFlow::new(window_for(&module.concurrency))),
+        scope: pending.scope,
     });
     inner
         .client_to_module
@@ -3758,6 +3943,7 @@ mod tests {
                 4_242,
                 "open-behind-data",
                 Principal::Direct,
+                None,
                 None,
                 Instant::now() + Duration::from_secs(60),
             ),

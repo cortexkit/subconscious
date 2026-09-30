@@ -15,6 +15,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::Principal;
 
+/// The `server.describe` capability a daemon advertises when it admits routes
+/// under scopes. A carrier that needs a scoped route and does not see it fails
+/// the call (`scope_unsupported`) instead of opening an unscoped route.
+pub const CAP_SCOPES_V1: &str = "scopes/v1";
+
 /// Module-to-subc op that registers an owner's full scope set.
 pub const SCOPE_SYNC_OP: &str = "scope.sync";
 /// Module-to-subc op that reads one scope's current state.
@@ -107,6 +112,21 @@ pub struct ScopeRecord {
     pub carriers: Vec<ScopeCarrier>,
     #[serde(default, skip_serializing_if = "ScopeAttributes::is_empty")]
     pub attributes: ScopeAttributes,
+}
+
+/// The scope a `route.open` asks to be admitted under.
+///
+/// `scope_epoch` is optional on the wire only so that leaving it out is
+/// refused by name (`scope_epoch_required`) rather than as a malformed body:
+/// every opener must name it, the owner included.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ScopeSelector {
+    pub owner: Principal,
+    #[serde(rename = "ref")]
+    pub scope_ref: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope_epoch: Option<u64>,
 }
 
 /// The state of a scope's parent link.

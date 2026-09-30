@@ -159,6 +159,7 @@ pub async fn build_bench_forwarding_setup(
                     &module_id,
                     Principal::Direct,
                     None,
+                    None,
                     tokio::time::Instant::now() + std::time::Duration::from_secs(30),
                 )
                 .await

@@ -1,6 +1,6 @@
 import { createServer, type AddressInfo, type Server, type Socket } from "node:net";
 import { execFileSync } from "node:child_process";
-import { chmodSync, closeSync, constants, fstatSync, mkdtempSync, openSync, rmSync, writeFileSync, writeSync } from "node:fs";
+import { chmodSync, closeSync, constants, fstatSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync, writeSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
@@ -509,6 +509,66 @@ describe("SubcProvider serve loop", () => {
       { channel: 8, epoch: 5 },
     ]);
     expect(provider.liveRoutes.get(8)?.epoch).toBe(5);
+  });
+
+  // A daemon that admits routes under scopes stamps the bind with a `scope`
+  // object this SDK does not know. The provider reads only the fields it knows,
+  // so a module built on this SDK must still accept the bind. The body is the
+  // Rust golden vector, so a change to the stamped shape is checked here too.
+  test("accepts a route.bind stamped with a scope it does not read", async () => {
+    const stamped = JSON.parse(
+      readFileSync(
+        join(
+          import.meta.dir,
+          "../../../crates/subc-protocol/tests/golden/module_control_request_route_bind_with_scope.json",
+        ),
+        "utf8",
+      ),
+    ) as Record<string, unknown>;
+    expect(stamped.scope).toBeDefined();
+
+    const writes: Frame[] = [];
+    const sock = fakeWritableSocket(writes);
+    const bound: { channel: number; epoch: number }[] = [];
+    const provider = Object.create(SubcProvider.prototype) as {
+      sock: unknown;
+      generation: number;
+      closeStarted: boolean;
+      closedErr: Error | null;
+      inflight: Map<string, AbortController>;
+      pending: Map<string, unknown>;
+      liveRoutes: Map<number, RouteHandle>;
+      connectionToken: object;
+      opts: { handler: () => Uint8Array; onBound: (handle: RouteHandle) => void };
+      handleControlRequest(frame: Frame, sock: unknown, generation: number): Promise<void>;
+    };
+    provider.sock = sock;
+    provider.generation = 1;
+    provider.closeStarted = false;
+    provider.closedErr = null;
+    provider.inflight = new Map();
+    provider.pending = new Map();
+    provider.liveRoutes = new Map();
+    provider.connectionToken = newConnectionToken();
+    provider.opts = {
+      handler: () => new Uint8Array(0),
+      onBound: (handle) => bound.push({ channel: handle.channel, epoch: handle.epoch }),
+    };
+
+    const frame = buildFrameWithVersion(
+      PROTOCOL_VERSION,
+      FrameType.Request,
+      CONTROL_FLAGS,
+      0,
+      0,
+      44n,
+      encodeJson(stamped),
+    );
+    await provider.handleControlRequest(frame, sock, 1);
+    expect(writes.at(-1)?.header.ty).toBe(FrameType.Response);
+    expect(bound).toEqual([
+      { channel: stamped.route_channel as number, epoch: stamped.epoch as number },
+    ]);
   });
 
   // onRouteGone is consumer code awaited inside the read loop. A throw from it

@@ -93,6 +93,24 @@ pub mod error_codes {
     /// the module's bind committed. Nothing was sent on the route, so the caller
     /// may re-open against the current record: RETRYABLE.
     pub const SCOPE_CHANGED: &str = "scope_changed";
+    /// A scoped `route.open` named no `scope_epoch`. Every opener names one,
+    /// the owner included, so an old call can never be carried into a newer
+    /// session that reused the ref. TERMINAL.
+    pub const SCOPE_EPOCH_REQUIRED: &str = "scope_epoch_required";
+    /// A scoped `route.open` named a ref the owner's synced set does not hold,
+    /// or an owner that is not a configured module. TERMINAL.
+    pub const SCOPE_NOT_LIVE: &str = "scope_not_live";
+    /// A scoped `route.open` named a `scope_epoch` that is not the live one, or
+    /// the scope ended between admission and commit. TERMINAL.
+    pub const SCOPE_ENDED: &str = "scope_ended";
+    /// The opener of a scoped `route.open` is neither the scope's owner nor a
+    /// listed carrier, or it is a targeted carrier and the target module is not
+    /// in its list. TERMINAL.
+    pub const SCOPE_NOT_CARRIER: &str = "scope_not_carrier";
+    /// Raised by a carrier, never by the daemon: the daemon does not advertise
+    /// `scopes/v1`, so the carrier fails the call instead of opening an
+    /// unscoped route.
+    pub const SCOPE_UNSUPPORTED: &str = "scope_unsupported";
 
     /// `scope.sync` came from a connection that is not the owner's sync
     /// authority: another connection of the same launch holds it, or this
@@ -198,6 +216,17 @@ pub enum RouteCloseReason {
     /// A live route became forbidden because newly attested capability metadata
     /// matched its supervised opening module's deny edge.
     CapabilityDenied,
+    /// The route's scope ended: its owner removed it, or replaced it with a
+    /// higher `scope_epoch` (a new session under the same ref).
+    ScopeEnded,
+    /// The route's opener is no longer a listed carrier of its scope, or the
+    /// route's target was removed from that carrier's target list.
+    ScopeCarrierRemoved,
+    /// The scope's `delegates` went from true to false, or its `agent_id`
+    /// changed.
+    ScopeDelegationChanged,
+    /// The scope's parent ended, so its stamp no longer names a live parent.
+    ScopeParentEnded,
 }
 
 /// Per-route bind identity shared by client-facing and module-facing control.

@@ -116,6 +116,10 @@ fn protocol_wire_shapes_match_golden_json_and_round_trip() {
         &module_control_request(None, None),
     );
     assert_golden(
+        "module_control_request_route_bind_with_scope",
+        &module_control_request_with_scope(),
+    );
+    assert_golden(
         "module_control_response_route_bind_ack",
         &ModuleControlResponse::RouteBindAck {},
     );
@@ -923,6 +927,57 @@ fn module_control_request(
         principal: Some(Principal::Direct),
         consumer_capabilities,
         admission_facts,
+        scope: None,
+    }
+}
+
+/// A bind stamped with a scope: the shape a provider receives for a route
+/// opened under one. The TypeScript provider decodes this vector to prove a
+/// module built before scopes accepts it.
+fn module_control_request_with_scope() -> ModuleControlRequest {
+    let ModuleControlRequest::RouteBind {
+        route_channel,
+        epoch,
+        target,
+        identity,
+        consumer_capabilities,
+        admission_facts,
+        ..
+    } = module_control_request(None, None)
+    else {
+        unreachable!("the helper builds a route.bind");
+    };
+    ModuleControlRequest::RouteBind {
+        route_channel,
+        epoch,
+        target,
+        identity,
+        principal: Some(Principal::Reserved {
+            module_id: "broca".to_string(),
+        }),
+        consumer_capabilities,
+        admission_facts,
+        scope: Some(ScopeStamp {
+            owner: Principal::Reserved {
+                module_id: "prefrontal-core".to_string(),
+            },
+            scope_ref: "head-1".to_string(),
+            scope_epoch: 3,
+            kind: ScopeKind::Worker,
+            parent: Some(ScopeParent {
+                owner: Principal::Reserved {
+                    module_id: "prefrontal-core".to_string(),
+                },
+                scope_ref: "head-0".to_string(),
+                scope_epoch: 2,
+            }),
+            parent_state: Some(ParentState::Linked),
+            attributes: ScopeAttributes {
+                agent_id: Some("agent-7".to_string()),
+                delegates: true,
+            },
+            owner_authorized: true,
+        }),
     }
 }
 
@@ -990,4 +1045,43 @@ fn provider_roles() -> Vec<ProviderRole> {
         emits_push: true,
         sub_supervises: true,
     }]
+}
+
+/// A module built before scopes decodes `route.bind` with the enum below: the
+/// 0.26 shape, field for field, with no `scope` and, as then, no
+/// `deny_unknown_fields`. It must accept a bind stamped with a scope, or a
+/// daemon that stamps would break every provider not yet rebuilt.
+#[test]
+fn a_module_built_before_scopes_accepts_a_stamped_bind() {
+    #[derive(Deserialize)]
+    #[serde(tag = "op")]
+    #[allow(dead_code, clippy::large_enum_variant)]
+    enum PreScopeModuleControlRequest {
+        #[serde(rename = "route.bind")]
+        RouteBind {
+            route_channel: u16,
+            epoch: u32,
+            target: RouteTarget,
+            identity: BindIdentity,
+            #[serde(default)]
+            principal: Option<Principal>,
+            #[serde(default)]
+            consumer_capabilities: Option<Vec<String>>,
+            #[serde(default)]
+            admission_facts: Option<Value>,
+        },
+        #[serde(rename = "health.check")]
+        HealthCheck {},
+    }
+    let stamped = fs::read(golden_path("module_control_request_route_bind_with_scope")).unwrap();
+    assert!(
+        serde_json::from_slice::<Value>(&stamped).unwrap()["scope"].is_object(),
+        "the vector carries a stamp"
+    );
+    let decoded: PreScopeModuleControlRequest =
+        serde_json::from_slice(&stamped).expect("a pre-scope module decodes a stamped bind");
+    let PreScopeModuleControlRequest::RouteBind { route_channel, .. } = decoded else {
+        panic!("decoded as a route.bind");
+    };
+    assert_eq!(route_channel, 42);
 }

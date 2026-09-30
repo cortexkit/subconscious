@@ -1,0 +1,24 @@
+{
+  "consumer_identity": {
+    "launch_nonce": "0123456789abcdef",
+    "module_id": "aft"
+  },
+  "identity": {
+    "harness": "opencode",
+    "project_root": "/tmp/subc/project",
+    "session": "session-0001"
+  },
+  "op": "route.open",
+  "scope": {
+    "owner": {
+      "kind": "reserved",
+      "module_id": "prefrontal-core"
+    },
+    "ref": "head-1",
+    "scope_epoch": 3
+  },
+  "target": {
+    "kind": "tool_provider",
+    "module_id": "plexus"
+  }
+}

@@ -545,6 +545,7 @@ where
         consumer_identity: None,
         consumer_capabilities: None,
         admission_facts: None,
+        scope: None,
     };
     write_frame(client, &control_request_frame(corr, request))
         .await

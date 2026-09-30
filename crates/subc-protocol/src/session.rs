@@ -84,6 +84,17 @@ pub enum ModuleControlRequest {
         /// Opaque admission facts supplied by the configured carrier module.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         admission_facts: Option<Value>,
+        /// The daemon's stamp of the scope the route was admitted under, taken
+        /// from the owner's synced record at admission. Like `principal`, it is
+        /// the daemon's, never the opener's: a provider may act on it (on
+        /// `owner_authorized`, `delegates` and `agent_id` together), and must
+        /// treat it as fixed for the route's life, because a change that
+        /// revokes authority closes the route.
+        ///
+        /// Absent means the route was opened without a scope, or by a daemon
+        /// that predates scopes. A provider that needs a scope refuses the bind.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scope: Option<ScopeStamp>,
     },
     #[serde(rename = "health.check")]
     HealthCheck {},

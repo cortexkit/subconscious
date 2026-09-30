@@ -14,6 +14,10 @@
     "op_not_allowed": "terminal",
     "route_limit": "terminal",
     "scope_changed": "retryable",
+    "scope_ended": "terminal",
+    "scope_epoch_required": "terminal",
+    "scope_not_carrier": "terminal",
+    "scope_not_live": "terminal",
     "scope_not_synced": "retryable",
     "target_unavailable": "retryable",
     "unknown_module": "terminal"
@@ -44,6 +48,10 @@
     "disable": "must_not_reopen",
     "reload": "may_reopen",
     "restart": "may_reopen",
+    "scope_carrier_removed": "must_not_reopen",
+    "scope_delegation_changed": "must_not_reopen",
+    "scope_ended": "must_not_reopen",
+    "scope_parent_ended": "must_not_reopen",
     "unknown": "must_not_reopen"
   }
 }

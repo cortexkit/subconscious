@@ -860,6 +860,7 @@ async fn open_route(
                 consumer_capabilities: None,
 
                 admission_facts: None,
+                scope: None,
             },
         ))
         .await;

@@ -3836,6 +3836,7 @@ async fn supervised_mcp_module_reports_live_non_routable_and_preserves_provider_
             consumer_identity: None,
             consumer_capabilities: None,
             admission_facts: None,
+            scope: None,
         },
     )
     .await;
@@ -4584,6 +4585,7 @@ where
             consumer_identity: None,
             consumer_capabilities: None,
             admission_facts: None,
+            scope: None,
         },
     )
     .await

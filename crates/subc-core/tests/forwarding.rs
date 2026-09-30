@@ -3827,6 +3827,7 @@ async fn route_open_vanished_project_root_attaches_under_its_recorded_identity()
         consumer_identity: None,
         consumer_capabilities: None,
         admission_facts: None,
+        scope: None,
     };
     write_frame(&mut client, &control_request_frame(481, request))
         .await
@@ -3886,6 +3887,7 @@ async fn route_open_unreconstructable_project_root_returns_error_without_provide
         consumer_identity: None,
         consumer_capabilities: None,
         admission_facts: None,
+        scope: None,
     };
     write_frame(&mut client, &control_request_frame(481, request))
         .await
@@ -7163,6 +7165,7 @@ fn attach_request_with_consumer_identity(
         consumer_identity,
         consumer_capabilities: None,
         admission_facts: None,
+        scope: None,
     }
 }
 

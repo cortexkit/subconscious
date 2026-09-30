@@ -400,6 +400,7 @@ async fn assert_stub_principal_controls(run: &AcceptanceRun) {
         consumer_identity,
         consumer_capabilities: None,
         admission_facts: None,
+        scope: None,
     };
 
     let direct = control::rpc(&run.connection_file, request(None)).await;

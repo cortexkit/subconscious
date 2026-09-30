@@ -230,6 +230,7 @@ fn client_control_requests() -> Vec<(&'static str, ClientControlRequest)> {
                 admission_facts: Some(
                     serde_json::json!({"schema": 1, "verified_class": "service"}),
                 ),
+                scope: None,
             },
         ),
         (
@@ -246,6 +247,29 @@ fn client_control_requests() -> Vec<(&'static str, ClientControlRequest)> {
                 }),
                 consumer_capabilities: None,
                 admission_facts: None,
+                scope: None,
+            },
+        ),
+        (
+            "client_control_request_route_open_with_scope",
+            ClientControlRequest::RouteOpen {
+                target: RouteTarget::ToolProvider {
+                    module_id: "plexus".to_string(),
+                },
+                identity: bind_identity(),
+                consumer_identity: Some(ConsumerIdentity {
+                    module_id: "aft".to_string(),
+                    launch_nonce: "0123456789abcdef".to_string(),
+                }),
+                consumer_capabilities: None,
+                admission_facts: None,
+                scope: Some(subc_protocol::scope::ScopeSelector {
+                    owner: subc_protocol::Principal::Reserved {
+                        module_id: "prefrontal-core".to_string(),
+                    },
+                    scope_ref: "head-1".to_string(),
+                    scope_epoch: Some(3),
+                }),
             },
         ),
         (

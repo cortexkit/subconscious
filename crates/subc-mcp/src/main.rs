@@ -2620,6 +2620,7 @@ async fn open_route(
         consumer_identity: consumer_identity_from_env(),
         consumer_capabilities,
         admission_facts: None,
+        scope: None,
     };
     let body = serde_json::to_vec(&request)?;
     let corr = subc.next_corr()?;

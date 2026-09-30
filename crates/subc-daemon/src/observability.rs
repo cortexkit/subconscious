@@ -38,6 +38,12 @@ const ROUTE_OPEN_REFUSAL_COUNTER_CODES: &[&str] = &[
     "module_timeout",
     ROUTE_OPEN_REFUSED_BREAKER_OPEN,
     "module_rejected",
+    subc_protocol::error_codes::SCOPE_EPOCH_REQUIRED,
+    subc_protocol::error_codes::SCOPE_NOT_SYNCED,
+    subc_protocol::error_codes::SCOPE_NOT_LIVE,
+    subc_protocol::error_codes::SCOPE_ENDED,
+    subc_protocol::error_codes::SCOPE_NOT_CARRIER,
+    subc_protocol::error_codes::SCOPE_CHANGED,
 ];
 
 /// Counter key for a `route.open` refused by the per-module bind-relay breaker

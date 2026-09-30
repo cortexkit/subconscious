@@ -1,0 +1,41 @@
+{
+  "epoch": 7,
+  "identity": {
+    "harness": "opencode",
+    "project_root": "/tmp/subc/project",
+    "session": "session-0001"
+  },
+  "op": "route.bind",
+  "principal": {
+    "kind": "reserved",
+    "module_id": "broca"
+  },
+  "route_channel": 42,
+  "scope": {
+    "attributes": {
+      "agent_id": "agent-7",
+      "delegates": true
+    },
+    "kind": "worker",
+    "owner": {
+      "kind": "reserved",
+      "module_id": "prefrontal-core"
+    },
+    "owner_authorized": true,
+    "parent": {
+      "owner": {
+        "kind": "reserved",
+        "module_id": "prefrontal-core"
+      },
+      "ref": "head-0",
+      "scope_epoch": 2
+    },
+    "parent_state": "linked",
+    "ref": "head-1",
+    "scope_epoch": 3
+  },
+  "target": {
+    "kind": "tool_provider",
+    "module_id": "aft-tools"
+  }
+}

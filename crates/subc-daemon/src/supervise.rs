@@ -5691,9 +5691,10 @@ fn apply_wire_spawn_args_for_role(
     role: SpawnRole,
 ) -> Result<Option<NonceHandoff>, SuperviseError> {
     command.env(SUBC_MODULE_ID_ENV, &spec.module_id);
-    // Removed on every path: a daemon started from a module's process tree
-    // inherits this variable, and passing it on would point the child at a
-    // descriptor it does not have.
+    // SUBC_LAUNCH_NONCE_FD is removed for every child, `protocol: "none"`
+    // included: a daemon started from a module's process tree inherits it,
+    // and passing it on would point the child at a descriptor it does not
+    // have.
     command.env_remove(subc_os::LAUNCH_NONCE_FD_ENV);
     if spec.protocol == ModuleProtocol::None {
         return Ok(None);

@@ -21,9 +21,8 @@ use subc_protocol::{
     manifest::{
         CapabilityDeclarations, Concurrency, ExecutionMode, IdentityScope, InternalTransport,
         LaunchNonceSource, ManagementOperation, ManagementOperationKind, ManifestProvenance,
-        ObservabilityKind,
-        ObservabilitySurface, PipelineAppliesTo, PipelineStageKind, ProviderRole,
-        SelfSignalDeclaration, SelfSignalEffect, SelfSignalKind, SignalAnchor, Tool,
+        ObservabilityKind, ObservabilitySurface, PipelineAppliesTo, PipelineStageKind,
+        ProviderRole, SelfSignalDeclaration, SelfSignalEffect, SelfSignalKind, SignalAnchor, Tool,
     },
     session::{
         HealthStatus, ModuleControlCommand, ModuleControlPush, ModuleControlRequest,

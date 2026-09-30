@@ -271,10 +271,7 @@ mod unix_tests {
             .get(naming(format!("{fd}:{inode}")))
             .unwrap()
             .unwrap();
-        assert_eq!(
-            (got.value(), got.source()),
-            (NONCE, LaunchNonceSource::Fd)
-        );
+        assert_eq!((got.value(), got.source()), (NONCE, LaunchNonceSource::Fd));
         assert!(!fd_is_open(fd));
     }
 
@@ -309,7 +306,8 @@ mod unix_tests {
         }
         unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
             let _ = ALLOCATIONS.try_with(|count| count.set(count.get() + 1));
-            // SAFETY: as for `alloc` and `dealloc`.
+            // SAFETY: `ptr` came from `alloc` above with `layout`, and the
+            // caller guarantees `new_size` is valid for it.
             unsafe { System.realloc(ptr, layout, new_size) }
         }
     }
@@ -349,8 +347,16 @@ mod unix_tests {
                 libc::fcntl(in_place_number, libc::F_GETFD),
             )
         };
-        assert_eq!(moved_flags & libc::FD_CLOEXEC, 0, "the copy must survive exec");
-        assert_eq!(in_place_flags & libc::FD_CLOEXEC, 0, "the flag must be cleared in place");
+        assert_eq!(
+            moved_flags & libc::FD_CLOEXEC,
+            0,
+            "the copy must survive exec"
+        );
+        assert_eq!(
+            in_place_flags & libc::FD_CLOEXEC,
+            0,
+            "the flag must be cleared in place"
+        );
         // SAFETY: closes the copy this test made at 250.
         #[allow(unsafe_code)]
         unsafe {
@@ -366,10 +372,7 @@ mod unix_tests {
         #[allow(unsafe_code)]
         let flags = unsafe { libc::fcntl(handoff.read_end_fd(), libc::F_GETFD) };
         assert_ne!(flags & libc::FD_CLOEXEC, 0);
-        assert_eq!(
-            handoff.fd_env_value(),
-            format!("3:{}", handoff.inode())
-        );
+        assert_eq!(handoff.fd_env_value(), format!("3:{}", handoff.inode()));
     }
 
     // ---- Spawned processes -------------------------------------------------

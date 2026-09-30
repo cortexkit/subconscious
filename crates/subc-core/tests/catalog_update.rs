@@ -167,9 +167,7 @@ async fn catalog_update_refreshes_catalog_without_disrupting_bound_routes() {
     let module_id = "catalog-update-provider";
     let mut module = connect_endpoint(&server, "module").await;
     let provenance = ManifestProvenance::new()
-        .with_build_git_sha(Some(
-            "0123456789abcdef0123456789abcdef01234567".to_string(),
-        ))
+        .with_build_git_sha(Some("0123456789abcdef0123456789abcdef01234567".to_string()))
         .with_build_lock_digest(Some("lock-digest".to_string()))
         .with_wire_crate_version(Some("0.13.0".to_string()))
         .with_store_schema_version(Some("3".to_string()));

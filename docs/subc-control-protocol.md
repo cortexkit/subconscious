@@ -171,6 +171,8 @@ pub struct ManifestProvenance {
     pub build_lock_digest: Option<String>,
     pub wire_crate_version: Option<String>,
     pub store_schema_version: Option<String>,
+    // "fd" or "env": where the running module read its launch nonce.
+    pub launch_nonce_source: Option<LaunchNonceSource>,
 }
 ```
 

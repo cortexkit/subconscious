@@ -126,7 +126,8 @@ mod tests {
 
     #[test]
     fn missing_nonce_has_a_specific_refusal() {
-        let result = StartupAttestation::from_parts(Some("mcp-stdio-adapter".to_string()), Ok(None));
+        let result =
+            StartupAttestation::from_parts(Some("mcp-stdio-adapter".to_string()), Ok(None));
         assert_eq!(result, Err(AttestationError::MissingLaunchNonce));
     }
 

@@ -18,10 +18,7 @@
 use std::{
     ffi::OsString,
     fmt,
-    sync::{
-        atomic::AtomicUsize,
-        OnceLock,
-    },
+    sync::{atomic::AtomicUsize, OnceLock},
 };
 
 /// The descriptor number the pipe's read end has in the child.
@@ -189,7 +186,7 @@ impl LaunchNonceCell {
     }
 
     /// How many times this cell has taken a descriptor. At most one.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn descriptor_reads(&self) -> usize {
         self.descriptor_reads
             .load(std::sync::atomic::Ordering::SeqCst)

@@ -2319,9 +2319,7 @@ fn manifest_output_keeps_provenance_in_the_static_manifest_object() {
     let mut manifest = supervision_manifest(MANIFEST_MODULE_ID.to_string());
     manifest.provenance = Some(
         subc_protocol::manifest::ManifestProvenance::new()
-            .with_build_git_sha(Some(
-                "0123456789abcdef0123456789abcdef01234567".to_string(),
-            ))
+            .with_build_git_sha(Some("0123456789abcdef0123456789abcdef01234567".to_string()))
             .with_wire_crate_version(Some("0.13.0".to_string())),
     );
 
@@ -4570,8 +4568,9 @@ fn route_tool_call_request(
         arguments: serde_json::Value::Object(arguments),
         tool_call_id: None,
         progress_token,
-        // The gateway has no key of its own for a host's call, for the same
-        // reason it mints no tool_call_id above.
+        // The gateway sends no call key: any key it minted for a host's call
+        // would be its own invention, which it cannot keep stable across
+        // reconnects (the same reason it mints no tool_call_id).
         call_key: None,
     })
 }

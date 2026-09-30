@@ -835,8 +835,7 @@ async fn a_supervised_module_reads_its_launch_nonce_from_the_descriptor_and_hell
     .await;
     let modules = &response["modules"];
     assert_eq!(
-        modules[0]["module_declared"]["build"]["launch_nonce_source"],
-        expected_source,
+        modules[0]["module_declared"]["build"]["launch_nonce_source"], expected_source,
         "{response}"
     );
 }

@@ -884,8 +884,9 @@ impl ManifestProvenance {
     }
 
     /// Report where this process read its launch nonce from. A module takes
-    /// it from its nonce accessor's cached source, so the census can tell a
-    /// module reading the pipe from one still reading the environment.
+    /// it from its nonce accessor's cached source, so whoever reads the fleet's
+    /// provenance (`ck provenance`) can tell a module reading the pipe from
+    /// one still reading the environment variable.
     pub fn with_launch_nonce_source(mut self, value: Option<LaunchNonceSource>) -> Self {
         self.launch_nonce_source = value;
         self

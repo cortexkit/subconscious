@@ -36,6 +36,11 @@ use std::{
 
 pub use async_trait::async_trait;
 pub use subc_control::{CatalogEntry, ConsumerIdentity};
+/// The one launch-nonce reader for a module process: `launch_nonce()` reads
+/// the inherited descriptor (or, while the daemon still sets it, the
+/// `SUBC_LAUNCH_NONCE` environment copy) once and caches it. The SDK's HELLO and route opens go through it too; a module's
+/// own readers must as well, and it should call it before spawning anything.
+pub use subc_os::launch_nonce;
 use subc_protocol::{
     manifest::ModuleManifest,
     session::{
@@ -46,11 +51,6 @@ use subc_protocol::{
     BindIdentity, ErrorBody, Flags, Frame, FrameBuildError, FrameType, ModuleHelloAckBody,
     ModuleHelloBody, Principal, Priority, RouteTarget, PROTOCOL_VERSION, SUBC_MODULE_ID_ENV,
 };
-/// The one launch-nonce reader for a module process: `launch_nonce()` reads
-/// the descriptor (or, during the rollout, the environment copy) once and
-/// caches it. The SDK's HELLO and route opens go through it too; a module's
-/// own readers must as well, and it should call it before spawning anything.
-pub use subc_os::launch_nonce;
 pub use subc_protocol::{
     manifest::{
         build_provenance, CapabilityDeclarations, CapabilityNeed, CapabilityRequirement,
@@ -2925,9 +2925,9 @@ pub fn launch_nonce_source() -> Option<LaunchNonceSource> {
         .map(|nonce| LaunchNonceSource::from_wire_name(nonce.source().as_str()))
 }
 
-/// Fill in `launch_nonce_source` on a module's declared provenance, so the
-/// census can tell a module reading the pipe from one still reading the
-/// environment. Only when the module declared provenance and left the field
+/// Fill in `launch_nonce_source` on a module's declared provenance, so
+/// `ck provenance` can tell a module reading the pipe from one still reading
+/// the environment variable. Only when the module declared provenance and left the field
 /// unset, and only when the nonce HELLO carries is the one the accessor read:
 /// a nonce retained by the module itself came from somewhere this SDK cannot
 /// vouch for.
@@ -2940,9 +2940,8 @@ fn stamp_launch_nonce_source(manifest: &mut ModuleManifest, sent: Option<&str>) 
     }
     if let Ok(Some(nonce)) = launch_nonce() {
         if sent == Some(nonce.value()) {
-            provenance.launch_nonce_source = Some(LaunchNonceSource::from_wire_name(
-                nonce.source().as_str(),
-            ));
+            provenance.launch_nonce_source =
+                Some(LaunchNonceSource::from_wire_name(nonce.source().as_str()));
         }
     }
 }

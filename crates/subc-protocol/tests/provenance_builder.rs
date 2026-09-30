@@ -43,7 +43,10 @@ fn every_provenance_field_is_settable_through_the_public_api() {
 
 #[test]
 fn launch_nonce_source_round_trips_fd_and_env() {
-    for (source, wire) in [(LaunchNonceSource::Fd, "fd"), (LaunchNonceSource::Env, "env")] {
+    for (source, wire) in [
+        (LaunchNonceSource::Fd, "fd"),
+        (LaunchNonceSource::Env, "env"),
+    ] {
         let provenance = ManifestProvenance::new().with_launch_nonce_source(Some(source.clone()));
         let encoded = serde_json::to_value(&provenance).unwrap();
         assert_eq!(encoded, json!({ "launch_nonce_source": wire }));

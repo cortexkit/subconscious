@@ -1,6 +1,6 @@
 {
   "name": "@cortexkit/log",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Canonical fleet logging for CortexKit TypeScript clients",
   "type": "module",
   "exports": {

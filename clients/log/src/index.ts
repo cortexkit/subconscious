@@ -633,9 +633,10 @@ function defaultRedactor(line: string): string {
     // a generic `key=value` rule reads `https:` as the key and misses
     // `?access_token=`. The value consumes backslash escape pairs so an escaped
     // quote inside a quoted field value is redacted rather than split, which
-    // would unbalance the field's quoting.
+    // would unbalance the field's quoting. Parentheses and brackets end the
+    // value so URL wrappers do not swallow the diagnostic text after them.
     .replace(
-      /([?&](?:access_token|token|api_key|apikey|password|secret|client_secret)=)(?:\\.|[^&#\s"\\])+/gi,
+      /([?&](?:access_token|token|api_key|apikey|password|secret|client_secret)=)(?:\\.|[^&#\s"\\)\]])+/gi,
       `$1${REDACTED}`,
     );
 }

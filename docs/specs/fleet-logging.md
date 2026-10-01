@@ -339,7 +339,11 @@ write. The fleet default redacts, and both twins pin it with the fixture's
 - credential query parameters (`access_token`, `token`, `api_key`, `apikey`,
   `password`, `secret`, `client_secret`) after `?` or `&`, value only. A generic
   `key=value` rule misses `?access_token=` inside a URL because `https:` matches
-  as the key, which is why the query rule is its own pattern.
+  as the key, which is why the query rule is its own pattern. The value ends at
+  `&`, `#`, whitespace, `"`, `\`, `)`, or `]` (backslash escape pairs are consumed
+  within a rendered quoted value). Stopping at `)` and `]` preserves the text
+  after a value written inside parentheses or brackets, as in reqwest's
+  `for url (…)`.
 
 A module composes its own on top (MC's sanitizer; claustrum's hand-written redacting
 `Debug` impls remain the first line of defence). A module MUST NOT log prompt

@@ -152,6 +152,8 @@
       { "name": "url-userinfo-password", "input": "clone https://user:hunter2@example.com/org/repo", "output": "clone https://[REDACTED]@example.com/org/repo" },
       { "name": "url-userinfo-token-only", "input": "clone https://x-access-token@github.com/o/r", "output": "clone https://[REDACTED]@github.com/o/r" },
       { "name": "url-query-access-token", "input": "GET https://api.example.com/v1?access_token=abc123&page=2", "output": "GET https://api.example.com/v1?access_token=[REDACTED]&page=2", "note": "a generic key=value rule misses this because https: matches as the key" },
+      { "name": "url-query-token-in-parens", "input": "request failed for url (https://api.example.com/v1?token=abc123): connection refused", "output": "request failed for url (https://api.example.com/v1?token=[REDACTED]): connection refused", "note": "the value stops at ')', so the cause after the URL survives" },
+      { "name": "url-query-api-key-in-brackets", "input": "retrying [https://api.example.com/v1?api_key=k9] in 2s", "output": "retrying [https://api.example.com/v1?api_key=[REDACTED]] in 2s", "note": "the value stops at ']'" },
       { "name": "quoted-url-query-api-key", "input": "url=\"https://h.example/p?x=1&api_key=Z9y8\"", "output": "url=\"https://h.example/p?x=1&api_key=[REDACTED]\"" },
       { "name": "query-value-with-escaped-quote-stays-balanced", "input": "url=\"https://h.example/p?token=ab\\\"cd&x=1\"", "output": "url=\"https://h.example/p?token=[REDACTED]&x=1\"", "note": "inside a quoted field a quote in the value is written \\\"; the value consumes backslash pairs, so the field's closing quote is never left unbalanced" },
       { "name": "authorization-bearer", "input": "Authorization: Bearer abc.def", "output": "Authorization: [REDACTED]" },

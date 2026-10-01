@@ -15,9 +15,10 @@
 use std::{collections::BTreeSet, error::Error, fmt};
 
 use cortexkit_bus_naming::{
-    bus_permissions, delivery_authority_permissions, generate_permission_golden,
-    participant_permissions, system_permissions, validate_permission_file, AccountNames,
-    AllowEntry, GoldenFixture, GrantError, NamingError, Operation, Principal,
+    bus_permissions, delivery_authority_permissions, flow_engine_permissions,
+    generate_permission_golden, participant_permissions, system_permissions,
+    validate_permission_file, AccountNames, AllowEntry, GoldenFixture, GrantError, NamingError,
+    Operation, Principal,
 };
 use serde_json::{json, Value};
 
@@ -33,8 +34,12 @@ pub enum GrantRole {
     /// A supervised participant's per-process user in the box account.
     Participant,
     /// prefrontal-core's per-process user: the participant set plus publish on every
-    /// agent stream's binding (R15).
+    /// agent stream's binding and on the ROOM binding, and its one ROOM durable (R15).
     DeliveryAuthority,
+    /// The flow engine's (basal's) per-process user: its own durable on the event
+    /// stream, ephemeral ordered consumers there for dry-run replay, census read and the
+    /// dead-letter publish. No workload publish and no agent durable.
+    FlowEngine,
     /// ck-bus's own user in the box account.
     BusModule,
     /// ck-bus's own user in the system account.
@@ -46,6 +51,7 @@ impl GrantRole {
         match self {
             Self::Participant => Principal::Participant,
             Self::DeliveryAuthority => Principal::DeliveryAuthority,
+            Self::FlowEngine => Principal::FlowEngine,
             Self::BusModule => Principal::Bus,
             Self::SystemAccount => Principal::System,
         }
@@ -197,55 +203,84 @@ pub fn derive_account(account: &str) -> Result<AccountNames, GrantRefusal> {
     Ok(AccountNames::derive(account)?)
 }
 
-/// The per-process grant for a participant bound to `bound_rooms`. It names no agent:
-/// it may pull, inspect and ack any agent's durable on the agent streams, and publishes
-/// no workload subject. `credential_public` is the user's public key, which names its
-/// inbox prefix.
+/// The per-process grant for participant `module_id` bound to `bound_rooms`. It names
+/// no agent: it may pull, inspect and ack any agent's durable on the agent streams, and
+/// publishes no workload subject. It publishes module events on its own event subjects
+/// (`ck.{acct}.event.{module_id}.>`) and on no other module's. `credential_public` is
+/// the user's public key, which names its inbox prefix.
 pub fn participant_grant(
     account: &AccountNames,
     credential_public: &str,
+    module_id: &str,
     bound_rooms: &[&str],
 ) -> Result<Grant, GrantRefusal> {
-    let entries = participant_permissions(account, credential_public, bound_rooms)?;
+    let entries = participant_permissions(account, credential_public, module_id, bound_rooms)?;
     Grant::from_entries(GrantRole::Participant, account, entries)
 }
 
 /// prefrontal-core's per-process grant: the participant set plus publish on each agent
-/// stream's own binding, since it is the only producer of wakes, peer deliveries and
-/// effect intents.
+/// stream's own binding and on the ROOM binding, since it is the only producer of wakes,
+/// peer deliveries, effect intents and room posts, and pull, ack and info on its one
+/// ROOM durable `m_{module_id}`, which bootstrap creates.
 pub fn delivery_authority_grant(
     account: &AccountNames,
     credential_public: &str,
+    module_id: &str,
     bound_rooms: &[&str],
 ) -> Result<Grant, GrantRefusal> {
-    let entries = delivery_authority_permissions(account, credential_public, bound_rooms)?;
+    let entries =
+        delivery_authority_permissions(account, credential_public, module_id, bound_rooms)?;
     Grant::from_entries(GrantRole::DeliveryAuthority, account, entries)
 }
 
+/// The flow engine's per-process grant: pull, ack and info on its own durable
+/// `m_{module_id}` on the event stream (which bootstrap creates), unnamed consumer create,
+/// consumer info and flow control on that stream for its dry-run replays, census read and
+/// the dead-letter publish. It publishes no workload subject and reads no agent durable.
+pub fn flow_engine_grant(
+    account: &AccountNames,
+    credential_public: &str,
+    module_id: &str,
+) -> Result<Grant, GrantRefusal> {
+    let entries = flow_engine_permissions(account, credential_public, module_id)?;
+    Grant::from_entries(GrantRole::FlowEngine, account, entries)
+}
+
 /// The module whose attested credential carries the delivery-authority grant (R15):
-/// prefrontal publishes to every agent and copies a merged agent's messages.
+/// prefrontal publishes to every agent and to every room, and reads room posts through
+/// its ROOM durable.
 pub const DELIVERY_AUTHORITY_MODULE: &str = "prefrontal-core";
 
-/// The grant issuance signs for the attested `module_id`. Neither form names an agent:
-/// R15 makes agent access account-scoped, so a module's residence can change without a
+/// The module whose attested credential carries the flow-engine grant: basal runs flows
+/// and reads every module event through its event-stream durable.
+pub const FLOW_ENGINE_MODULE: &str = "basal";
+
+/// The grant issuance signs for the attested `module_id`. No form names an agent: R15
+/// makes agent access account-scoped, so a module's residence can change without a
 /// reissue.
 ///
-/// `prefrontal-core` gets the delivery-authority grant; every other module gets the
-/// participant grant.
+/// `prefrontal-core` gets the delivery-authority grant, `basal` the flow-engine grant,
+/// and every other module the participant grant. `module_id` is the daemon-attested
+/// route principal, never a request field: it also decides which event subjects the
+/// credential may publish on.
 pub fn issued_grant(
     account: &AccountNames,
     module_id: &str,
     credential_public: &str,
     bound_rooms: &[&str],
 ) -> Result<Grant, GrantRefusal> {
-    if module_id == DELIVERY_AUTHORITY_MODULE {
-        return delivery_authority_grant(account, credential_public, bound_rooms);
+    match module_id {
+        DELIVERY_AUTHORITY_MODULE => {
+            delivery_authority_grant(account, credential_public, module_id, bound_rooms)
+        }
+        FLOW_ENGINE_MODULE => flow_engine_grant(account, credential_public, module_id),
+        _ => participant_grant(account, credential_public, module_id, bound_rooms),
     }
-    participant_grant(account, credential_public, bound_rooms)
 }
 
-/// ck-bus's own box-account grant: census read and write, management of the five
-/// streams, the dead-letter durable, and the sentinel subjects. No workload publish.
+/// ck-bus's own box-account grant: census read and write, management of the six
+/// streams and their consumers (the dead-letter durable and the module durables among
+/// them), and the sentinel subjects. No workload publish.
 pub fn bus_module_grant(
     account: &AccountNames,
     credential_public: &str,
@@ -266,13 +301,13 @@ pub fn system_account_grant(
     Grant::from_entries(GrantRole::SystemAccount, account, entries)
 }
 
-/// Renders the permission document for a golden fixture from the four role grants.
+/// Renders the permission document for a golden fixture from the five role grants.
 ///
-/// The fixture has no real user key, so its module id stands in where a credential
-/// public key goes: the participant's, delivery authority's and bus module's inbox
-/// subjects read
-/// `_INBOX.<module id>.>`, and the system user's reads `_INBOX.<system_credential>.>`,
-/// exactly as in the committed reference document. The
+/// The fixture has no real user key, so each role's module id stands in where a
+/// credential public key goes: the participant's and bus module's inbox subjects read
+/// `_INBOX.<module id>.>`, the delivery authority's `_INBOX.<delivery_authority_module>.>`,
+/// the flow engine's `_INBOX.<flow_engine_module>.>`, and the system user's
+/// `_INBOX.<system_credential>.>`, exactly as in the committed reference document. The
 /// `expect-refused` lines are the naming crate's own expectations for the same fixture;
 /// ck-bus adds none and drops none. The result is checked with the same validator the
 /// naming crate applies to its golden, so a partial-token wildcard or a `deny` line
@@ -280,10 +315,25 @@ pub fn system_account_grant(
 pub fn render_fixture_document(fixture: GoldenFixture) -> Result<String, GrantRefusal> {
     let account = derive_account(fixture.account)?;
     let grants = [
-        participant_grant(&account, fixture.module_id, &[fixture.bound_room])?,
-        delivery_authority_grant(&account, fixture.module_id, &[fixture.bound_room])?,
+        participant_grant(
+            &account,
+            fixture.module_id,
+            fixture.module_id,
+            &[fixture.bound_room],
+        )?,
+        delivery_authority_grant(
+            &account,
+            fixture.delivery_authority_module,
+            fixture.delivery_authority_module,
+            &[fixture.bound_room],
+        )?,
         bus_module_grant(&account, fixture.module_id)?,
         system_account_grant(&account, fixture.system_credential)?,
+        flow_engine_grant(
+            &account,
+            fixture.flow_engine_module,
+            fixture.flow_engine_module,
+        )?,
     ];
     let expectations = generate_permission_golden(fixture)?;
 
@@ -300,6 +350,12 @@ pub fn render_fixture_document(fixture: GoldenFixture) -> Result<String, GrantRe
         ("foreign-agent", fixture.foreign_agent),
         ("bound-room", fixture.bound_room),
         ("unbound-room", fixture.unbound_room),
+        ("flow-engine-module", fixture.flow_engine_module),
+        ("foreign-module", fixture.foreign_module),
+        (
+            "delivery-authority-module",
+            fixture.delivery_authority_module,
+        ),
     ] {
         output.push_str(&format!("fixture {name} {value}\n"));
     }
@@ -327,13 +383,13 @@ pub fn render_fixture_document(fixture: GoldenFixture) -> Result<String, GrantRe
 }
 
 /// Checks a whole permission document: allow-only, whole-token wildcards, and every one
-/// of the account's five literal stream names expanded somewhere.
+/// of the account's six literal stream names expanded somewhere.
 pub fn validate_document(contents: &str, account: &AccountNames) -> Result<(), GrantRefusal> {
     Ok(validate_permission_file(contents, account)?)
 }
 
 /// Checks one role's entries with the naming crate's permission-file validator. A single
-/// role legitimately does not expand all five streams (a participant never names the
+/// role legitimately does not expand all six streams (a participant never names the
 /// dead-letter stream), so only the stream-expansion finding is waived here; the whole
 /// document is held to it by `validate_document`.
 fn validate_role_entries(

@@ -5,7 +5,7 @@
 //! A supervised ck-bus boots against a real `nats-server` configured the way `ck setup`
 //! configures it (operator and system account JWTs from fixture roots, full resolver,
 //! no box account). ck-bus names the box account `box_<HELLO_ACK machine id>`, creates it
-//! through the operator signer, and creates the census bucket and the five streams in
+//! through the operator signer, and creates the census bucket and the six streams in
 //! it. The arms:
 //!
 //! - the account, bucket and streams carry the machine id;

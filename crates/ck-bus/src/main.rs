@@ -9,7 +9,7 @@ mod grants;
 // the box account through it; issuance, when it lands, is the next caller.
 #[allow(dead_code)]
 mod credentials;
-// The machine id, the box account, ck-bus's own users, the census bucket and the five
+// The machine id, the box account, ck-bus's own users, the census bucket and the six
 // streams.
 #[allow(dead_code)]
 mod bootstrap;

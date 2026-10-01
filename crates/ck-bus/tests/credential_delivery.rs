@@ -202,7 +202,7 @@ async fn an_attested_participant_gets_its_credential_and_connects_through_nonce_
         "the harness signer's box account root signed it"
     );
     let names = grants::derive_account(plane.ready["acct"].as_str().unwrap()).unwrap();
-    let expected = grants::participant_grant(&names, &credential_public, &[])
+    let expected = grants::participant_grant(&names, &credential_public, PARTICIPANT, &[])
         .unwrap()
         .jwt_permissions();
     assert_eq!(claims["nats"]["pub"], expected["pub"], "publish grant");

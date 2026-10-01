@@ -25,8 +25,9 @@
 //!   its claimant never termed holds a merge back until then or until an operator
 //!   acts. Prefrontal reads this before a merge.
 //!
-//! Merge is not a ck-bus op: copying messages is a workload publish, which ck-bus never
-//! holds. Prefrontal performs it with the delivery-authority grant (R15).
+//! Merge is not a ck-bus op, and no stream-to-stream copy runs anywhere: prefrontal
+//! decides a merge in its own store, where the message bodies live, and then calls
+//! `ckbus.agent_durable_delete` for the source agent. Nothing in ck-bus assumes a copy.
 //!
 //! The pull grant on any agent durable is a whole-token `*` in the consumer position on
 //! the three agent streams, so no consumer other than an agent's `c_{agent_id}` may ever
@@ -88,10 +89,14 @@ pub const DELIVER_POLICY: &str = "all";
 pub const AGENT_STREAM_KINDS: [StreamKind; 3] =
     [StreamKind::Wake, StreamKind::Peer, StreamKind::Effect];
 
-/// Consumers ck-bus creates for itself, by stream kind and name. None may sit on an agent
-/// stream: the participant grant pulls any consumer there.
-pub const CKBUS_OWNED_DURABLES: [(StreamKind, &str); 1] =
-    [(StreamKind::EffectDead, "c_ckbus_dead")];
+/// Consumers ck-bus creates, other than agent durables, by stream kind and name: its own
+/// dead-letter consumer and the module durables bootstrap creates. None may sit on an
+/// agent stream: the participant grant pulls any consumer there.
+pub const CKBUS_OWNED_DURABLES: [(StreamKind, &str); 3] = [
+    (StreamKind::EffectDead, "c_ckbus_dead"),
+    (StreamKind::Event, "m_basal"),
+    (StreamKind::Room, "m_prefrontal-core"),
+];
 
 /// The literal names of the agent streams, as the naming crate lists them (the list its
 /// whole-token `*` grants are written against).
@@ -113,6 +118,7 @@ pub fn stream_name(names: &AccountNames, kind: StreamKind) -> String {
         StreamKind::Peer => streams.peer.clone(),
         StreamKind::Effect => streams.effect.clone(),
         StreamKind::EffectDead => streams.effect_dead.clone(),
+        StreamKind::Event => streams.event.clone(),
     }
 }
 

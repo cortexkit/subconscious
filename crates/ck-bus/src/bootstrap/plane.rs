@@ -46,9 +46,8 @@ pub const CENSUS_MAX_BYTES: i64 = 16 * MIB as i64;
 /// Every stream's duplicate window is stated rather than left to the server default.
 ///
 /// The four workload streams (room, wake, peer, effect): a publisher that lost the ack
-/// of a publish (a timeout, a reconnect) retries within seconds, and prefrontal's merge
-/// reruns a recopy (`Nats-Msg-Id: merge:<from>:<seq>`) soon after a failure, so two
-/// minutes covers both with a wide margin. A longer window costs server memory for
+/// of a publish (a timeout, a reconnect) retries within seconds, so two minutes covers
+/// the retry with a wide margin. A longer window costs server memory for
 /// every message id published within it, and a duplicate that outlives the window is
 /// still dropped end to end by prefrontal's delivery id.
 pub const WORKLOAD_DUPLICATE_WINDOW: Duration = Duration::from_secs(2 * 60);
@@ -63,11 +62,17 @@ pub const DEAD_LETTER_DUPLICATE_WINDOW: Duration = Duration::from_secs(2 * 60);
 /// The census bucket: KV puts carry no message id, so the window deduplicates nothing
 /// there; it is stated at the value nats-server gives a KV bucket without a TTL.
 pub const CENSUS_DUPLICATE_WINDOW: Duration = Duration::from_secs(2 * 60);
+/// The module event stream: a module that lost the ack of an event publish retries
+/// within seconds, under the same message id, so two minutes covers the retry as it does
+/// on the workload streams. A duplicate that outlives the window is still dropped by the
+/// flow engine, which deduplicates on the event id.
+pub const EVENT_DUPLICATE_WINDOW: Duration = Duration::from_secs(2 * 60);
 
 /// The duplicate window of the shipped stream of `kind`.
 pub fn duplicate_window(kind: StreamKind) -> Duration {
     match kind {
         StreamKind::EffectDead => DEAD_LETTER_DUPLICATE_WINDOW,
+        StreamKind::Event => EVENT_DUPLICATE_WINDOW,
         StreamKind::Room | StreamKind::Wake | StreamKind::Peer | StreamKind::Effect => {
             WORKLOAD_DUPLICATE_WINDOW
         }
@@ -104,8 +109,14 @@ pub fn census_config(account: &AccountNames) -> stream::Config {
 }
 
 /// A shipped stream as ck-bus creates it, every limit stated.
+///
+/// The per-subject message cap is set only when the spec names one (only the event
+/// stream does). Otherwise it is left at the client's default, so the five streams that
+/// predate the event stream are sent exactly the configuration they were created with:
+/// the server compares a create against the stored stream and refuses any difference,
+/// so a changed field there would stop an upgraded ck-bus from booting.
 pub fn stream_config(spec: &StreamSpec) -> stream::Config {
-    stream::Config {
+    let mut config = stream::Config {
         name: spec.name.clone(),
         subjects: spec.subjects.clone(),
         max_age: spec.max_age,
@@ -123,7 +134,11 @@ pub fn stream_config(spec: &StreamSpec) -> stream::Config {
         storage: stream::StorageType::File,
         num_replicas: 1,
         ..Default::default()
+    };
+    if let Some(cap) = spec.max_msgs_per_subject {
+        config.max_messages_per_subject = cap;
     }
+    config
 }
 
 /// One stored census value and the KV revision it is stored at. The revision is what a

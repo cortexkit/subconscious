@@ -1,7 +1,7 @@
 //! Ladder row "A9 grant conformance" (slice 5 of `docs/specs/ck-bus-module.md`),
 //! live-server half. served-by: harness-signer (every user JWT here is built by ck-bus's
 //! own code with the generated grant and signed by the harness signer's roots), against
-//! a real nats-server whose box account, census bucket and five streams a supervised
+//! a real nats-server whose box account, census bucket and six streams a supervised
 //! ck-bus created.
 //!
 //! Under generated grants on the live server:
@@ -15,7 +15,7 @@
 //! - the delivery-authority user (prefrontal-core's grant) may publish wakes, peer
 //!   deliveries and effect intents for any agent, and is refused a consumer create, a
 //!   census write and `$SYS`;
-//! - the bus-module user may get, watch, put and delete the census and manage the five
+//! - the bus-module user may get, watch, put and delete the census and manage the six
 //!   streams, and is refused every workload publish;
 //! - the system user may send the kick, the claims update and the claims lookup (the
 //!   subjects the vendored golden records), and nothing else;
@@ -83,6 +83,9 @@ const AGENT: &str = "agent_conf_a";
 const FOREIGN_AGENT: &str = "agent_conf_b";
 const ROOM: &str = "room_conf_bound";
 const UNBOUND_ROOM: &str = "room_conf_unbound";
+/// The module id the participant's grant is generated for; it names the only event
+/// subjects that participant may publish on.
+const PARTICIPANT_MODULE: &str = "conf-participant";
 
 fn vocabulary() -> BTreeSet<String> {
     SIGNER_OPERATIONS
@@ -267,7 +270,7 @@ async fn generated_grants_hold_on_a_live_server() {
 
     // ---- The per-process user ----
     let participant = mint(&trust, &bus::box_root_id(), &account_public, |user| {
-        grants::participant_grant(&names, user, &[ROOM]).unwrap()
+        grants::participant_grant(&names, user, PARTICIPANT_MODULE, &[ROOM]).unwrap()
     })
     .await;
     let p = connect(&server, &participant, true)
@@ -277,7 +280,8 @@ async fn generated_grants_hold_on_a_live_server() {
 
     // ---- The delivery-authority user ----
     let authority = mint(&trust, &bus::box_root_id(), &account_public, |user| {
-        grants::delivery_authority_grant(&names, user, &[ROOM]).unwrap()
+        grants::delivery_authority_grant(&names, user, grants::DELIVERY_AUTHORITY_MODULE, &[ROOM])
+            .unwrap()
     })
     .await;
     let a = connect(&server, &authority, true)
@@ -427,6 +431,15 @@ async fn generated_grants_hold_on_a_live_server() {
     );
     assert_eq!(stored(&observer, &streams.room).await, room_before + 1);
 
+    // Allowed: its own module events, stored on the event stream ck-bus created.
+    let own_event = names
+        .event_subject(PARTICIPANT_MODULE, "conformance_probe", 1)
+        .unwrap();
+    let event_before = stored(&observer, &streams.event).await;
+    p.publish(&own_event, b"{}").await;
+    p.expect_allowed(&own_event).await;
+    assert_eq!(stored(&observer, &streams.event).await, event_before + 1);
+
     // Allowed: another agent's durable too, with no reissue (R15).
     let foreign_fire = names.wake_fire(FOREIGN_AGENT).unwrap();
     a.publish(&foreign_fire, b"foreign wake").await;
@@ -469,6 +482,17 @@ async fn generated_grants_hold_on_a_live_server() {
         names.effect_intent(AGENT, "sess_conf").unwrap(),
         format!("$KV.{census_bucket}.{census_key}"),
         names.room_post(UNBOUND_ROOM).unwrap(),
+        // Another module's events, the flow engine's and the delivery authority's
+        // included: a participant publishes only on its own event subjects.
+        names
+            .event_subject("conf-other", "conformance_probe", 1)
+            .unwrap(),
+        names
+            .event_subject(grants::FLOW_ENGINE_MODULE, "conformance_probe", 1)
+            .unwrap(),
+        names
+            .event_subject(grants::DELIVERY_AUTHORITY_MODULE, "conformance_probe", 1)
+            .unwrap(),
         "$SYS.REQ.CLAIMS.UPDATE".to_string(),
         names.sentinel_ping(),
     ];
@@ -635,7 +659,7 @@ async fn generated_grants_hold_on_a_live_server() {
 
     // ---- The default-inbox client ----
     let default_inbox = mint(&trust, &bus::box_root_id(), &account_public, |user| {
-        grants::participant_grant(&names, user, &[ROOM]).unwrap()
+        grants::participant_grant(&names, user, PARTICIPANT_MODULE, &[ROOM]).unwrap()
     })
     .await;
     let d = connect(&server, &default_inbox, false)

@@ -98,6 +98,9 @@ const BOOT_LIMIT: Duration = Duration::from_secs(60);
 /// How long ck-bus may take to write a line for a stored record.
 const RECORD_LIMIT: Duration = Duration::from_secs(20);
 const AGENT: &str = "agent_dead_a";
+/// The module id the claimant's participant grant is generated for; it names the only
+/// event subjects that grant may publish on.
+const CLAIMANT_MODULE: &str = "dead-letter-row-claimant";
 const SESSION: &str = "sess_dead_1";
 /// The cap the claimant must derive from the effect durable's shipped max-deliver of 5:
 /// one below it, leaving the last delivery spare. Written out rather than computed, so
@@ -218,7 +221,7 @@ impl Run {
     /// the trait layer.
     async fn claimant(&self) -> NatsConnection {
         let user = self.credentials.custody.generate_user();
-        let grant = grants::participant_grant(&self.names(), &user, &[]).unwrap();
+        let grant = grants::participant_grant(&self.names(), &user, CLAIMANT_MODULE, &[]).unwrap();
         let jwt = self
             .user_jwt(&user, "dead-letter-row-claimant", &grant)
             .await;
@@ -535,7 +538,7 @@ impl Claimant {
             lines,
         };
         let public = claimant.expect("public ", Duration::from_secs(20)).await;
-        let grant = grants::participant_grant(&names, &public, &[]).unwrap();
+        let grant = grants::participant_grant(&names, &public, CLAIMANT_MODULE, &[]).unwrap();
         let jwt = run
             .user_jwt(&public, "dead-letter-row-claimant", &grant)
             .await;

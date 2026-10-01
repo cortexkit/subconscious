@@ -255,7 +255,7 @@ dependencies = [
 
 [[package]]
 name = "ck-bus"
-version = "0.1.29"
+version = "0.2.0"
 dependencies = [
  "async-nats",
  "async-trait",
@@ -353,27 +353,29 @@ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
 name = "cortexkit-bus-inmemory"
-version = "0.1.0"
-source = "git+https://github.com/cortexkit/commons.git?rev=dad55b9578bd272c72dcd5c7ac991793feeb33fb#dad55b9578bd272c72dcd5c7ac991793feeb33fb"
+version = "0.2.0"
+source = "git+https://github.com/cortexkit/commons.git?rev=e4fb106f581c4d208a81e924a6329cfb20de616d#e4fb106f581c4d208a81e924a6329cfb20de616d"
 dependencies = [
  "async-trait",
+ "cortexkit-bus-naming",
  "cortexkit-bus-trait",
  "tokio",
 ]
 
 [[package]]
 name = "cortexkit-bus-naming"
-version = "0.1.0"
-source = "git+https://github.com/cortexkit/commons.git?rev=dad55b9578bd272c72dcd5c7ac991793feeb33fb#dad55b9578bd272c72dcd5c7ac991793feeb33fb"
+version = "0.2.0"
+source = "git+https://github.com/cortexkit/commons.git?rev=e4fb106f581c4d208a81e924a6329cfb20de616d#e4fb106f581c4d208a81e924a6329cfb20de616d"
 
 [[package]]
 name = "cortexkit-bus-nats"
-version = "0.1.0"
-source = "git+https://github.com/cortexkit/commons.git?rev=dad55b9578bd272c72dcd5c7ac991793feeb33fb#dad55b9578bd272c72dcd5c7ac991793feeb33fb"
+version = "0.2.0"
+source = "git+https://github.com/cortexkit/commons.git?rev=e4fb106f581c4d208a81e924a6329cfb20de616d#e4fb106f581c4d208a81e924a6329cfb20de616d"
 dependencies = [
  "async-nats",
  "async-trait",
  "bytes",
+ "cortexkit-bus-naming",
  "cortexkit-bus-trait",
  "futures-util",
  "tokio",
@@ -381,8 +383,8 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-bus-trait"
-version = "0.1.0"
-source = "git+https://github.com/cortexkit/commons.git?rev=dad55b9578bd272c72dcd5c7ac991793feeb33fb#dad55b9578bd272c72dcd5c7ac991793feeb33fb"
+version = "0.2.0"
+source = "git+https://github.com/cortexkit/commons.git?rev=e4fb106f581c4d208a81e924a6329cfb20de616d#e4fb106f581c4d208a81e924a6329cfb20de616d"
 dependencies = [
  "async-trait",
  "sha2",

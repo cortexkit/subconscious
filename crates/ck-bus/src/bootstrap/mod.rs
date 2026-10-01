@@ -1,5 +1,5 @@
-//! Bootstrap: the machine id and the box account, ck-bus's own users, the census bucket
-//! and the five streams.
+//! Bootstrap: the machine id and the box account, ck-bus's own users, the census bucket,
+//! the six streams and the two module durables.
 //!
 //! Keys and signatures follow `docs/designs/nats-install-trust-chain.md` (sections 1, 3
 //! and 7). The operator root signed the operator JWT and the system account JWT at
@@ -16,9 +16,14 @@
 //!    incarnation's box users added), has the operator signer sign it, pushes it, and
 //!    reads it back through the claims lookup before treating it as applied;
 //! 4. signs its box-account user with the box account root, connects, creates the
-//!    census bucket and the five streams if absent, writes its own census key (the
-//!    single census entry ck-bus writes for itself), and publishes on its sentinel
+//!    census bucket and the six streams if absent, then the module durables `m_basal`
+//!    (event stream) and `m_prefrontal-core` (ROOM) if absent, writes its own census key
+//!    (the single census entry ck-bus writes for itself), and publishes on its sentinel
 //!    subject.
+//!
+//! A plane an earlier ck-bus built with five streams is upgraded in place: the five are
+//! sent exactly the configuration they were created with, which the server accepts as
+//! the existing stream, and only the event stream and the module durables are new.
 //!
 //! Both users' JWTs expire 15 minutes after issue (R16); a renewal task per user
 //! (`credentials::renewal`) re-signs the same key before then, and each connection
@@ -38,6 +43,7 @@
 
 pub mod account_jwt;
 pub mod config;
+pub mod module_durables;
 pub mod plane;
 pub mod store;
 
@@ -91,6 +97,10 @@ pub mod cause {
     pub const CLAIMS_READBACK_MISMATCH: &str = "claims-readback-mismatch";
     pub const BOX_USER_UNISSUABLE: &str = "box-user-unissuable";
     pub const STREAMS_UNAVAILABLE: &str = "streams-unavailable";
+    /// A module durable (`m_basal`, `m_prefrontal-core`) could not be planned or
+    /// created; one that exists with a different configuration is refused by the server
+    /// and left as it is.
+    pub const MODULE_DURABLES_UNAVAILABLE: &str = "module-durables-unavailable";
     /// ck-bus's own census key could not be written: its spawn generation could not be
     /// read, or the census write failed.
     pub const OWN_CENSUS_UNWRITTEN: &str = "own-census-unwritten";
@@ -485,6 +495,18 @@ pub async fn boot(
             .ensure_stream(spec)
             .await
             .map_err(|error| Failure::retry(cause::STREAMS_UNAVAILABLE, error.message))?;
+    }
+    // The module durables exist from the first boot on, before either module asks for a
+    // credential, so nothing published before it first connects is lost to it. Create
+    // is strict: an identical durable is the server's idempotent success, and one with a
+    // different configuration is refused and never replaced.
+    let durables = module_durables::planned(&names)
+        .map_err(|error| Failure::stop(cause::MODULE_DURABLES_UNAVAILABLE, error))?;
+    for durable in &durables {
+        box_plane
+            .create_durable(durable)
+            .await
+            .map_err(|error| Failure::retry(cause::MODULE_DURABLES_UNAVAILABLE, error.message))?;
     }
     // ck-bus's own census key: self-written, under its own box-account user, like every
     // participant's entry and before its first publish.

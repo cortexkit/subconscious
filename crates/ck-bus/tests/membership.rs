@@ -159,6 +159,20 @@ fn ckbus_owned_durables_stay_off_the_agent_streams() {
         );
     }
 
+    // The module durables bootstrap creates are listed as ck-bus-owned, by their own
+    // stream, so the check above covers them.
+    for durable in bootstrap::module_durables::planned(&names).unwrap() {
+        assert!(
+            membership::CKBUS_OWNED_DURABLES
+                .iter()
+                .any(|(kind, name)| *name == durable.durable
+                    && membership::stream_name(&names, *kind) == durable.stream),
+            "{} on {} is listed as ck-bus-owned",
+            durable.durable,
+            durable.stream
+        );
+    }
+
     let planned = membership::agent_durables(&names, "agent_invariant").unwrap();
     assert_eq!(
         planned
@@ -239,7 +253,7 @@ fn issuance_picks_the_grant_by_attested_module() {
     assert_eq!(participant.role(), grants::GrantRole::Participant);
     assert_eq!(
         participant,
-        grants::participant_grant(&names, &user, &[]).unwrap()
+        grants::participant_grant(&names, &user, PARTICIPANT, &[]).unwrap()
     );
     for stream in names.streams().agent_streams() {
         assert!(participant
@@ -247,6 +261,144 @@ fn issuance_picks_the_grant_by_attested_module() {
             .contains(&format!("$JS.API.CONSUMER.MSG.NEXT.{stream}.*")));
     }
     assert!(!participant.publish_allow().contains(&names.wake_binding()));
+}
+
+/// Every subject `pattern` covers, with NATS whole-token wildcards: `*` one token, a
+/// final `>` one or more.
+fn covers(pattern: &str, subject: &str) -> bool {
+    let pattern = pattern.split('.').collect::<Vec<_>>();
+    let subject = subject.split('.').collect::<Vec<_>>();
+    for (index, token) in pattern.iter().enumerate() {
+        if *token == ">" {
+            return subject.len() > index;
+        }
+        match subject.get(index) {
+            Some(value) if *token == "*" || token == value => {}
+            _ => return false,
+        }
+    }
+    pattern.len() == subject.len()
+}
+
+fn publishes(grant: &grants::Grant, subject: &str) -> bool {
+    grant
+        .publish_allow()
+        .iter()
+        .any(|pattern| covers(pattern, subject))
+}
+
+/// The attested `reserved:basal` gets the flow-engine grant: its own event-stream durable
+/// and nothing that produces a workload message or reads an agent's queue.
+#[test]
+fn basal_is_issued_the_flow_engine_grant_and_no_workload_publish() {
+    let names = grants::derive_account("box_membershipflow").unwrap();
+    let user = nkeys::KeyPair::new_user().public_key();
+    let basal = grants::issued_grant(&names, grants::FLOW_ENGINE_MODULE, &user, &[]).unwrap();
+    assert_eq!(grants::FLOW_ENGINE_MODULE, "basal");
+    assert_eq!(basal.role(), grants::GrantRole::FlowEngine);
+    assert_eq!(
+        basal,
+        grants::flow_engine_grant(&names, &user, "basal").unwrap()
+    );
+    let event = &names.streams().event;
+    assert!(basal
+        .publish_allow()
+        .contains(&format!("$JS.API.CONSUMER.MSG.NEXT.{event}.m_basal")));
+    for subject in [
+        names.wake_fire("agent_flow").unwrap(),
+        names.peer_delivery("agent_flow", "sess_flow").unwrap(),
+        names.effect_intent("agent_flow", "sess_flow").unwrap(),
+        names.room_binding().replace('*', "room_flow"),
+        names.event_subject("basal", "flow_ran", 1).unwrap(),
+        names.event_subject("other", "flow_ran", 1).unwrap(),
+    ] {
+        assert!(
+            !publishes(&basal, &subject),
+            "basal must not publish {subject}"
+        );
+    }
+    for stream in names.streams().agent_streams() {
+        assert!(
+            !publishes(
+                &basal,
+                &format!("$JS.API.CONSUMER.MSG.NEXT.{stream}.c_agent_flow")
+            ),
+            "basal must not pull an agent durable on {stream}"
+        );
+    }
+}
+
+/// A participant's credential publishes module events on its own subjects only. The id
+/// is the attested module id issuance passes, so another module's events are refused.
+#[test]
+fn a_participant_publishes_only_its_own_module_events() {
+    let names = grants::derive_account("box_membershipevents").unwrap();
+    let user = nkeys::KeyPair::new_user().public_key();
+    let participant = grants::issued_grant(&names, PARTICIPANT, &user, &[]).unwrap();
+    assert!(participant
+        .publish_allow()
+        .contains(&names.event_publish_grant(PARTICIPANT).unwrap()));
+    assert!(publishes(
+        &participant,
+        &names.event_subject(PARTICIPANT, "thing_done", 1).unwrap()
+    ));
+    for other in ["basal", PREFRONTAL, "participant2"] {
+        assert!(
+            !publishes(
+                &participant,
+                &names.event_subject(other, "thing_done", 1).unwrap()
+            ),
+            "{PARTICIPANT} must not publish {other}'s events"
+        );
+    }
+    let event_grants = participant
+        .publish_allow()
+        .iter()
+        .filter(|subject| subject.starts_with(&format!("ck.{}.event.", names.account())))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        event_grants,
+        [&names.event_publish_grant(PARTICIPANT).unwrap()],
+        "exactly one event publish entry, its own"
+    );
+}
+
+/// prefrontal-core's grant publishes on the ROOM binding and reads its one ROOM durable,
+/// the one bootstrap creates, and no other consumer on ROOM.
+#[test]
+fn prefrontal_core_grant_carries_the_room_binding_and_its_room_durable() {
+    let names = grants::derive_account("box_membershiproom").unwrap();
+    let user = nkeys::KeyPair::new_user().public_key();
+    let authority = grants::issued_grant(&names, PREFRONTAL, &user, &[]).unwrap();
+    let room = &names.streams().room;
+    for subject in [
+        names.room_binding(),
+        format!("$JS.API.CONSUMER.MSG.NEXT.{room}.m_prefrontal-core"),
+        format!("$JS.API.CONSUMER.INFO.{room}.m_prefrontal-core"),
+        format!("$JS.ACK.{room}.m_prefrontal-core.>"),
+        names.event_publish_grant(PREFRONTAL).unwrap(),
+    ] {
+        assert!(
+            authority.publish_allow().contains(&subject),
+            "prefrontal-core's grant must carry {subject}"
+        );
+    }
+    assert!(!publishes(
+        &authority,
+        &format!("$JS.API.CONSUMER.MSG.NEXT.{room}.m_other")
+    ));
+    assert!(!publishes(
+        &authority,
+        &format!("$JS.API.CONSUMER.DURABLE.CREATE.{room}.m_prefrontal-core")
+    ));
+    // The durable bootstrap creates is the one the grant names.
+    let planned = bootstrap::module_durables::planned(&names).unwrap();
+    let on_room = planned
+        .iter()
+        .find(|durable| &durable.stream == room)
+        .expect("bootstrap plans a ROOM durable");
+    assert_eq!(on_room.durable, "m_prefrontal-core");
+    assert_eq!(on_room.filter_subjects, vec![names.room_binding()]);
 }
 
 /// Rooms stay behind the foundation's membership contract.
@@ -1059,14 +1211,15 @@ async fn a_credential_issued_before_a_bind_pulls_from_the_durable_bound_after() 
     let authority_public = authority["credential_public"].as_str().unwrap().to_string();
     let participant_claims = bus::claims(participant["jwt"].as_str().unwrap());
     let authority_claims = bus::claims(authority["jwt"].as_str().unwrap());
-    let expected = grants::participant_grant(&live.names, &participant_public, &[])
+    let expected = grants::participant_grant(&live.names, &participant_public, PARTICIPANT, &[])
         .unwrap()
         .jwt_permissions();
     assert_eq!(participant_claims["nats"]["pub"], expected["pub"]);
     assert_eq!(participant_claims["nats"]["sub"], expected["sub"]);
-    let expected = grants::delivery_authority_grant(&live.names, &authority_public, &[])
-        .unwrap()
-        .jwt_permissions();
+    let expected =
+        grants::delivery_authority_grant(&live.names, &authority_public, PREFRONTAL, &[])
+            .unwrap()
+            .jwt_permissions();
     assert_eq!(authority_claims["nats"]["pub"], expected["pub"]);
     assert_eq!(authority_claims["nats"]["sub"], expected["sub"]);
 

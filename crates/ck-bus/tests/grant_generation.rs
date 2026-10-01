@@ -172,16 +172,31 @@ fn grant_generation_emits_each_role_set_from_the_pinned_literals() {
     let fixture = PINNED_GOLDEN_FIXTURE;
     let golden = vendored_golden();
     let account = grants::derive_account(fixture.account).expect("pinned account derives");
-    let participant = grants::participant_grant(&account, fixture.module_id, &[fixture.bound_room])
-        .expect("participant grant");
-    let delivery =
-        grants::delivery_authority_grant(&account, fixture.module_id, &[fixture.bound_room])
-            .expect("delivery-authority grant");
+    let participant = grants::participant_grant(
+        &account,
+        fixture.module_id,
+        fixture.module_id,
+        &[fixture.bound_room],
+    )
+    .expect("participant grant");
+    let delivery = grants::delivery_authority_grant(
+        &account,
+        fixture.delivery_authority_module,
+        fixture.delivery_authority_module,
+        &[fixture.bound_room],
+    )
+    .expect("delivery-authority grant");
     let bus = grants::bus_module_grant(&account, fixture.module_id).expect("bus-module grant");
     let system = grants::system_account_grant(&account, fixture.system_credential)
         .expect("system-account grant");
+    let flow_engine = grants::flow_engine_grant(
+        &account,
+        fixture.flow_engine_module,
+        fixture.flow_engine_module,
+    )
+    .expect("flow-engine grant");
 
-    for grant in [&participant, &delivery, &bus, &system] {
+    for grant in [&participant, &delivery, &bus, &system, &flow_engine] {
         let principal = grant.role().principal();
         assert_eq!(
             grant.publish_allow(),
@@ -240,6 +255,7 @@ fn grant_generation_emits_each_role_set_from_the_pinned_literals() {
         (Principal::DeliveryAuthority, &delivery),
         (Principal::Bus, &bus),
         (Principal::System, &system),
+        (Principal::FlowEngine, &flow_engine),
     ];
     let mut expectations = 0;
     for line in golden.lines() {
@@ -272,7 +288,7 @@ fn grant_generation_emits_each_role_set_from_the_pinned_literals() {
     );
     report(
         "passed",
-        "participant, delivery-authority, bus-module and system-account sets equal the golden's lines",
+        "participant, delivery-authority, bus-module, system-account and flow-engine sets equal the golden's lines",
     );
 }
 
@@ -348,7 +364,7 @@ fn vendored_foundation_and_golden_match_their_source_record() {
     // so it moves with the pin in Cargo.toml.
     assert_eq!(
         field("golden_commit"),
-        "f884fabeb198949eedec035ac465c1cfb30e9835"
+        "e4fb106f581c4d208a81e924a6329cfb20de616d"
     );
     for (file, digest_field) in [
         ("nats-message-plane-foundation.md", "source_sha256"),

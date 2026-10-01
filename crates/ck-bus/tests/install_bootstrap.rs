@@ -7,7 +7,7 @@
 //! none (it opens no Claustrum or Callosum route).
 //!
 //! From an empty broker store and a vault holding only the roots, a supervised ck-bus
-//! issues its own system and box users, creates the census bucket and the five streams
+//! issues its own system and box users, creates the census bucket and the six streams
 //! with their literal bindings, and publishes on its sentinel subject. A restart writes
 //! a new `own_users.json` and revokes the previous incarnation's box user: the claims
 //! read back carry its key, and a client presenting a JWT for it is refused as revoked.

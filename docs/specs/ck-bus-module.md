@@ -103,8 +103,11 @@ the box account root was discharged earlier; the signer and sysaccount grants to
 past `cac1e9bd`) and `ckbus-client-ops-unagreed` (names frozen as built with ALF: the
 three ops under Delivery and attestation plus the three agent-queue ops in R15, and the
 refusal codes `ckbus_credential_superseded` and `ckbus_credential_revoked`). The one
-left is `server-config-writer-unnamed` (SUBC with the operator): `ck setup` driving
-`ck-bus install-plan` and `install-apply` on the operator's machine. Two names are row-level conditions, not gates:
+left is `server-config-writer-unnamed` (owner SUBC), and only its production half is
+open. On this machine nats-server and `ckbus` were placed by SUBC on 2026-09-25 with
+ck-bus's own install tooling (`ck-bus install-plan` and `install-apply`). What remains
+is the production writer: a `ck setup` bus step that runs that tooling on an operator's
+machine. Two names are row-level conditions, not gates:
 `a1-signal-unix-only`, the single platform skip, and `stub-reply-shape-unrecorded`.
 
 Discharged and carrying no row: `route-target-ids-unnamed` (R10, R12),
@@ -197,7 +200,11 @@ Repository and dependencies.
   `ModuleHelloAckBody.machine_id`.
 - Bus primitives come from cortexkit/commons in the three-field form
   `{ version, git, rev }`, never a branch (SUBC, 2026-09-20), pinned at
-  `4f09c7c7c7f86394d21abde6ed3f97b582ee4d28`. `cortexkit-store-types` 0.2.2 is added the
+  `4f09c7c7c7f86394d21abde6ed3f97b582ee4d28` at r2 and now at
+  `e4fb106f581c4d208a81e924a6329cfb20de616d` (commons master: the four bus crates at
+  0.2.0, with the event stream family, the flow-engine grant, the delivery authority's
+  ROOM binding and ROOM durable, and the cursor's delivery count, `term` and
+  `in_progress`). `cortexkit-store-types` 0.2.2 is added the
   same way. Commons changes are authored by ALF and merged by SUBC. A slice that needs
   one files it as a branch and re-pins to the merged sha, and the gate it carried flips on
   the new pin. `091bd1fc0` is the prefrontal commit at which the rig last regenerated
@@ -567,13 +574,22 @@ Credentials (design D; foundation amendment `48c83a68e`, `0eb12229f`, `b9e827c69
     decides the migration.
   - This spec does not make root keys per `{acct}`, since the credential ids carry no
     token. Whether a new `{acct}` needs new account keys is an Open question.
-- Server configuration. The local server needs its operator JWT, system account, the
-  directory resolver and TLS material before it starts. It is a sibling started
-  concurrently, so ck-bus cannot write that config in time. The writer is
-  unnamed in production (`server-config-writer-unnamed`, deployment gate, owner SUBC
-  with the operator; the foundation named "SUBC's installer calling CKCRED", which the
-  amendment's ceremony does not cover). In acceptance the harness writes it from the
-  fixture roots. The resolver runs with deletion disabled, per the foundation.
+- Server configuration. The local server needs its operator JWT, system account and
+  the directory resolver before it starts. It is a sibling started concurrently, so
+  ck-bus cannot write that config in time. ck-bus's install tooling (`ck-bus
+  install-plan` and `install-apply`) writes it, and SUBC placed nats-server and `ckbus`
+  on this machine with that tooling on 2026-09-25. The production writer, a `ck setup`
+  bus step that runs the tooling on an operator's machine, is not built
+  (`server-config-writer-unnamed`, deployment gate, owner SUBC; the foundation named
+  "SUBC's installer calling CKCRED", which the amendment's ceremony does not cover). In
+  acceptance the harness writes the config from the fixture roots. The resolver runs
+  with deletion disabled, per the foundation.
+- The local listener is plaintext `nats://` on `127.0.0.1`, with no certificate and no
+  pin. A client authenticates with its vault-signed user JWT and its signature over the
+  server's connect nonce, which ck-bus makes for it. TLS on loopback would add nothing
+  against the only party that can reach the listener: a process on this machine, which
+  is already inside the trust boundary every participant shares (R15). The server needs
+  no TLS material for it. Hub links leave the machine and carry TLS.
 - `server-config-writer-unnamed` and `root-ceremony-unrun` block placement, not rows.
 
 Ownership of acts.
@@ -601,12 +617,14 @@ Ownership of acts.
   incarnation's box users, pushes it, and reads it back through the claims lookup
   before treating it as applied (a claims update is saved without a trust or `iat`
   check). It then issues its box-account user, connects, and creates the census bucket
-  and all five streams with their literal bindings if absent. It does NOT revoke the
+  and all six streams with their literal bindings if absent, then the two module
+  durables (Module streams and durables, below). It does NOT revoke the
   previous incarnation's system-account users (trust-chain design 6.7): their seeds
   died with that process, so they cannot answer a nonce, and revoking them would
   re-sign the root-signed system account. Only ck-bus's system user holds the
   claims-update permission. ck-bus reads its broker inputs from its supervised
-  environment: `CKBUS_NATS_URL` (a loopback `nats://` URL; the listener has no TLS),
+  environment: `CKBUS_NATS_URL` (a loopback `nats://` URL; the listener is plaintext by
+  design, see the local listener above),
   `CKBUS_OPERATOR_JWT` (the operator JWT's path) and `CKBUS_SYSTEM_ACCOUNT` (which must
   equal the operator JWT's `system_account`); the operator signer must be listed in the
   operator JWT's `signing_keys`, or ck-bus refuses with `operator-jwt-mismatch`. The
@@ -632,6 +650,31 @@ Ownership of acts.
   spawning.
 - Dead-letter consumer: `c_ckbus_dead` on `CK_{ACCT}_EFFECT_DEAD`, deduplicating on
   message id, because the claimant publishes the record before `term()`.
+- Module streams and durables. Bootstrap creates the six streams of
+  `shipped_streams`: ROOM, WAKE, PEER, EFFECT, EFFECT_DEAD and EVENT. EVENT
+  (`CK_{ACCT}_EVENT`, binding `ck.{acct}.event.>`, subjects
+  `ck.{acct}.event.{module_id}.{event}.v{version}`) holds module events: 7 days, 1 GiB,
+  discard old, limits retention (not a work queue), and at most 10,000 messages per
+  subject (`max_msgs_per_subject`), so one noisy event cannot evict every other
+  subject's history. Only EVENT sets a per-subject cap; the other five are sent exactly
+  the configuration the five-stream ck-bus sent, so a plane built by it is upgraded in
+  place: the server accepts each create as the existing stream, and only EVENT and the
+  durables below are new. Bootstrap then creates two module durables, named
+  `module_consumer_name(module_id)` (`m_{module_id}`), on every boot and before either
+  module's first credential, so events and posts made before the module first connects
+  are kept for it:
+  - `m_basal` on `CK_{ACCT}_EVENT`, filtered on `ck.{acct}.event.>`: the flow engine
+    reads every module event through it;
+  - `m_prefrontal-core` on `CK_{ACCT}_ROOM`, filtered on the ROOM binding
+    `ck.{acct}.room.*.post`: prefrontal-core is the only consumer of room posts.
+
+  Both carry the shipped durable configuration (pull, explicit ack, deliver all, ack
+  wait 30 s, max-deliver unlimited, max ack pending 1000), each filter checked with
+  `validate_consumer` against its stream's binding. Creation is strict: an identical
+  durable is the server's idempotent success, and one with a different configuration
+  is refused, never replaced, and boot reports `module-durables-unavailable`. Neither
+  module may create, delete or replace its durable; each holds pull, ack and info on its
+  own durable by name.
 - Membership: re-issue at the next epoch of the same generation, overwrite the census
   key, adjust the room consumer's `filter_subjects`, and revoke the superseded epoch,
   within the foundation's 10 s bound. The client reconnects by refetching.
@@ -665,7 +708,7 @@ Standing rules carried from the foundation.
 - Spawn generation is SUBC's. Credential epoch is ck-bus's and starts at 0 per
   generation.
 - Permission files are allow-only, wildcards are whole-token, and every stream-bearing
-  subject is emitted with the five literal stream names expanded per account.
+  subject is emitted with the six literal stream names expanded per account.
 - Inbox prefix is `_INBOX.{credential_public}` on every client the module runs or
   issues for, set before connecting.
 - No constant from an unverified citation is hard-coded in a control. The drain
@@ -947,7 +990,7 @@ records it.
 | Vault authorization | real claustrum + `ck auth` ceremony in a fixture vault; `route.open` with and without `ConsumerIdentity` | claustrum-binary | `claustrum-binary-absent` (C) | gates when the binaries are present; loud skip otherwise |
 | User JWT and seed absence | `credential.sign` for JWT signatures; real `nats-server` with harness-written operator and account JWTs | harness-signer | none row-specific | gates now |
 | Machine id and account | `ModuleHelloAckBody.machine_id`; `account.json`; bucket and stream creation | harness-signer | none row-specific | gates now |
-| Install bootstrap and own users | own box and system users; census bucket, five streams; `$SYS` kick; `own_users.json` | harness-signer | none row-specific | gates now |
+| Install bootstrap and own users | own box and system users; census bucket, six streams, the two module durables, in-place upgrade of a five-stream plane; `$SYS` kick; `own_users.json` | harness-signer | none row-specific | gates now |
 | Credential delivery and attestation | `ckbus.credential`, `ckbus.nonce_sign` over subc; stamped principal; spawn snapshot for the live generation | harness-signer | `spawn-stream-unlanded` (C) | gates now |
 | A3 census write and issuance recovery | issuance order; census key grammar; `epoch_high_water.json` | harness-signer | `naming-constructor-absent` for the census key until commons constructs it | skipped until the census key constructor lands |
 | A9 grant conformance | participant, bus-module and system users on a live server; prefrontal seat for the golden | harness-signer | `prefrontal-seat-unnamed` (S, the golden-commit half only) | live-server half gates now |
@@ -1084,9 +1127,17 @@ Row contents.
   and the answer is `machine-id-absent`.
 - Install bootstrap and own users. From an empty broker store and a fixture vault
   holding only the roots, ck-bus issues its own box and system users, creates the census
-  bucket and the five streams with their literal bindings, writes its own census key,
-  publishes on its sentinel subject, and performs a successful `$SYS` kick of a harness
-  client. No fleet operator key is present anywhere.
+  bucket and the six streams with their literal bindings and the two module durables,
+  writes its own census key, publishes on its sentinel subject, and performs a
+  successful `$SYS` kick of a harness client. No fleet operator key is present anywhere.
+  - Upgrade in place (`tests/stream_upgrade.rs`): a plane built the way the five-stream
+    ck-bus built it, with one message stored on each stream, is booted by the current
+    ck-bus. The five streams keep their configuration as the server reports it, their
+    creation time and their messages; the event stream and both module durables exist,
+    and a room post made before `m_prefrontal-core` existed is pending on it. A further
+    boot changes nothing. The configuration ck-bus emits for the five is asserted
+    byte-for-byte against what the five-stream build emitted, since the server refuses a
+    create that differs from the stored stream.
   - A restart writes a new `own_users.json` and revokes the previous incarnation's box
     users (not its system users): the claims read back contain their keys, and a
     client presenting a revoked user's JWT is refused as revoked. The old ck-bus user's
@@ -1130,7 +1181,7 @@ Row contents.
   - It is refused (server-side `Denied`) on another identity's ack, pull or info, on a
     consumer create on the four workload streams, on a census write, on an unbound room,
     and on any `$SYS` or sentinel subject.
-  - The bus-module user may get, watch, put and delete the census and manage the five
+  - The bus-module user may get, watch, put and delete the census and manage the six
     streams, and is refused every workload publish.
   - The system user may send the kick, the claims update and the claims lookup, and
     nothing else. These subject strings are what the golden records.
@@ -1312,7 +1363,10 @@ what it did and who can overturn it.
    unagreed too.
 3. Who writes the server's static configuration (`server-config-writer-unnamed`). The
    foundation gave install step (4) to "SUBC's installer calling CKCRED". The amendment
-   replaced steps (1) to (3) with the ceremony and said nothing about step (4).
+   replaced steps (1) to (3) with the ceremony and said nothing about step (4). ck-bus's
+   install tooling writes it, and SUBC placed nats-server and `ckbus` on this machine
+   with it on 2026-09-25. Open: the production writer, a `ck setup` bus step (owner
+   SUBC).
 4. Restart and in-memory seeds. The amendment says a reconnect "succeeds once the
    signer returns". That was measured with a signer that kept its key. A restarted
    ck-bus has lost every seed, so reconnects succeed only after a credential refetch,
@@ -1446,27 +1500,40 @@ SECTION governs.
   Agent streams and the whole-token grant. An agent has one durable,
   `consumer_name(agent_id)` (`c_{agent_id}`), on each of the three agent streams:
   `CK_{ACCT}_WAKE` (filter `wake_fire(agent)`), `CK_{ACCT}_PEER` (`peer_filter(agent)`)
-  and `CK_{ACCT}_EFFECT` (`effect_filter(agent)`). ROOM and EFFECT_DEAD are not agent
-  streams. NATS wildcards are whole-token only, so the grant cannot say `c_*`: it is a
+  and `CK_{ACCT}_EFFECT` (`effect_filter(agent)`). ROOM, EFFECT_DEAD and EVENT are not
+  agent streams. NATS wildcards are whole-token only, so the grant cannot say `c_*`: it is a
   whole-token `*` in the consumer position on each agent stream
   (`$JS.API.CONSUMER.MSG.NEXT.<S>.*`, `$JS.API.CONSUMER.INFO.<S>.*`, `$JS.ACK.<S>.*.>`,
   plus `$JS.API.STREAM.INFO.<S>`). That grant also reaches any other consumer on those
   streams, so ck-bus never creates a non-agent durable on WAKE, PEER or EFFECT (its own
-  `c_ckbus_dead` is on EFFECT_DEAD). The membership row asserts this against
+  `c_ckbus_dead` is on EFFECT_DEAD, and the module durables `m_basal` and
+  `m_prefrontal-core` are on EVENT and ROOM). The membership row asserts this against
   bootstrap's stream set and against the live server's consumers.
-  Two grants, chosen by the attested principal at issuance, neither naming an agent:
-  - participant (every module except prefrontal-core): its own `_INBOX`, pull, ack and
-    info on any agent durable as above, the `effect_dead` publish and census read. No
-    workload publish at all.
+  Three grants, chosen by the attested principal at issuance, none naming an agent. The
+  module id each is generated for is the daemon-stamped route principal, never a
+  request field:
+  - participant (every module except prefrontal-core and basal): its own `_INBOX`,
+    pull, ack and info on any agent durable as above, the `effect_dead` publish, census
+    read, and publish on its own module events, `ck.{acct}.event.{module_id}.>`, and on
+    no other module's. No workload publish at all.
   - delivery authority (only `reserved:prefrontal-core`): the participant set plus
-    publish on `ck.{acct}.wake.*.fire`, `ck.{acct}.peer.*.*.deliver` and
-    `ck.{acct}.effect.*.*.intent` for every agent.
-  The naming crate owns both constructors (`participant_permissions(account,
-  credential_public, bound_rooms)` and `delivery_authority_permissions(..)` with a
-  `delivery-authority` principal) and the bus-grant additions below (commons
-  `f884fabe`). Nothing in the participant grant depends on agents, so a participant is
-  never reissued when agents come or go: a credential issued before a bind pulls from
-  the durable bound afterwards.
+    publish on `ck.{acct}.wake.*.fire`, `ck.{acct}.peer.*.*.deliver`,
+    `ck.{acct}.effect.*.*.intent` for every agent, and the ROOM binding
+    `ck.{acct}.room.*.post` for every room, and pull, ack and info on its one ROOM
+    durable `m_prefrontal-core` by name (no consumer create or delete on ROOM).
+  - flow engine (only `reserved:basal`, `FLOW_ENGINE_MODULE`): its own `_INBOX`, census
+    read, the `effect_dead` publish, pull, ack and info on its own durable `m_basal` on
+    EVENT, and for dry-run replay unnamed consumer create, consumer info and flow control
+    (`$JS.FC.<EVENT>.>`) on EVENT. No workload publish, no event publish and no agent
+    durable.
+  The naming crate owns the three constructors (`participant_permissions(account,
+  credential_public, module_id, bound_rooms)`, `delivery_authority_permissions(..)` with
+  a `delivery-authority` principal, and `flow_engine_permissions(account,
+  credential_public, module_id)` with a `flow-engine` principal) and the bus-grant
+  additions below (commons `f884fabe`, then `e4fb106f` for the event stream, the
+  flow-engine grant and the ROOM durable). Nothing in the participant grant depends on
+  agents, so a participant is never reissued when agents come or go: a credential
+  issued before a bind pulls from the durable bound afterwards.
   Prefrontal owns residence. It creates, removes and reads each agent's durables through
   ops on ck-bus's ManagementSurface, accepted only from `reserved:prefrontal-core`
   (anything else, `Direct` included, is refused with `ckbus_caller_not_permitted`), with
@@ -1508,27 +1575,16 @@ SECTION governs.
     holds no ack grant on agent durables and cannot release it. Prefrontal escalates to
     the operator when `pending == in_flight` (non-zero) persists past
     `max_deliver x ack_wait` (5 x 30 s on a bound durable).
-  Merge is prefrontal's, not a ck-bus op: copying is a workload publish, and ck-bus holds
-  none (line 609 stands; ck-bus holds signing power and must not also inject messages).
-  Prefrontal, holding the delivery-authority grant, merges `from` into `into` in this
-  order: (1) `ckbus.agent_effects_pending {from}`; while `pending` is non-zero it
-  refuses with `ckbus_merge_effects_pending`, naming the count, and retries later
-  (retryable); (2) binds `into` if absent; (3) records the high-water mark, then copies
-  every message still queued for `from` on PEER and then WAKE to `into`'s subject
-  (rewriting the agent token, keeping the session token and every original header, with
-  `Nats-Msg-Id: merge:<from>:<stream_seq>` so a recopy inside the duplicate window is
-  dropped); (4) deletes `from` through `ckbus.agent_durable_delete` only after the copy,
-  and reports merged only after the delete. The merge reply says which parts completed,
-  e.g. `{merged: false, effect: {pending: N}, peer: "not_started", wake: "not_started"}`
-  on the effect refusal and `{merged: false, effect: {pending: 0}, peer: "copied", wake:
-  "failed"}` on a copy failure, so a rerun resumes rather than guessing (the
-  `Nats-Msg-Id` dedupe makes a recopy inside the window harmless, but the reply still
-  says what happened). A retry finding `from` absent and `into` present
-  succeeds. The original headers kept include prefrontal's delivery id, which is the
-  end-to-end guarantee: prefrontal deduplicates on it at delivery, so a duplicate that
-  outlives the stream's duplicate window after a long crash is dropped there. Merge is
-  retry-safe rather than atomic. Messages accepted before a merge are never lost:
-  today's delivery refuses a merged agent and points senders at the survivor.
+  Merge is prefrontal's, not a ck-bus op, and no stream-to-stream copy runs (prefrontal,
+  2026-10-01, superseding the copy order r2 recorded here). A merge is decided core-side,
+  in prefrontal's store, where the message bodies live: it terminalizes the source agent,
+  supersedes its fires and bounces its queued deliveries, so copying their announcements
+  to the survivor would deliver nothing. Prefrontal then calls
+  `ckbus.agent_durable_delete {from}`, which deletes the source's durables and purges its
+  subjects. ck-bus holds no workload publish either way (line 609 stands; ck-bus holds
+  signing power and must not also inject messages), and nothing in ck-bus assumes a
+  copy runs: its behaviour is unchanged. Prefrontal still reads
+  `ckbus.agent_effects_pending {from}` before the delete, for the reason given above.
   Issuance step 4 no longer creates `c_{agent_id}` durables; prefrontal's bind does. The
   membership row keeps rooms only, still gated on `membership-contract-unpinned`.
 - R16 (ALF, 2026-09-24; discharges `user-jwt-ttl-unpinned`): every user JWT ck-bus

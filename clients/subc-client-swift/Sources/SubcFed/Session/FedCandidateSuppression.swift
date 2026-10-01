@@ -119,10 +119,14 @@ public struct FedCandidateSuppressionTable: Sendable {
         }
     }
 
-    /// A changed observed-network snapshot re-enables only affected LAN records.
+    /// A changed observed-network snapshot re-enables only affected direct
+    /// (LAN-direct and public-direct) records; relay records do not depend on
+    /// the local network.
     public mutating func applyNetworkSnapshotChange(newDigest: Data) {
         for (id, record) in records {
-            guard record.candidateClass == .lanDirect else { continue }
+            guard record.candidateClass == .lanDirect || record.candidateClass == .publicDirect else {
+                continue
+            }
             if record.facts.networkSnapshotDigest != newDigest {
                 records.removeValue(forKey: id)
             }

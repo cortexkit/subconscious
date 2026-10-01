@@ -63,6 +63,8 @@ final class FedPublicDirectCandidateTests: XCTestCase {
             ("ff0e::1", "ff00::/8 multicast"),
             ("2001:db8::1", "2001:db8::/32 documentation"),
             ("2001:db8:ffff::1", "2001:db8::/32 documentation"),
+            ("fec0::1", "fec0::/10 site-local"),
+            ("feff:ffff::1", "fec0::/10 site-local"),
         ]
         for (host, range) in refused {
             XCTAssertEqual(
@@ -92,6 +94,79 @@ final class FedPublicDirectCandidateTests: XCTestCase {
         }
         // A mapped GLOBAL IPv4 address is held to the same rules and so accepted.
         XCTAssertNil(FedPublicCandidateHygiene.classify(host: "::ffff:79.152.99.84", peerVerified: true))
+    }
+
+    /// 64:ff9b::a.b.c.d (the NAT64 well-known prefix) reaches a.b.c.d through
+    /// the network's NAT64 gateway, so it is judged by the IPv4 table.
+    func testPublicHygieneJudgesNAT64WellKnownPrefixByIPv4Table() {
+        for host in ["64:ff9b::a00:1", "64:ff9b::10.0.0.1", "64:ff9b::7f00:1",
+                     "64:ff9b::c0a8:10a", "64:ff9b::a9fe:101", "64:ff9b::"] {
+            XCTAssertEqual(
+                FedPublicCandidateHygiene.classify(host: host, peerVerified: true),
+                .addressClassNotAllowed,
+                "\(host) reaches a refused IPv4 address through NAT64"
+            )
+        }
+        // 64:ff9b::4f98:6354 is 79.152.99.84, a global address.
+        XCTAssertNil(FedPublicCandidateHygiene.classify(host: "64:ff9b::4f98:6354", peerVerified: true))
+        XCTAssertNil(FedPublicCandidateHygiene.classify(host: "64:ff9b::79.152.99.84", peerVerified: true))
+    }
+
+    /// The NAT64 local-use prefix's embedding layout is chosen per network, so
+    /// it is refused outright, even when it seems to carry a global address.
+    func testPublicHygieneRefusesNAT64LocalUsePrefix() {
+        for host in ["64:ff9b:1::4f98:6354", "64:ff9b:1:ffff::1", "64:ff9b:1::a00:1"] {
+            XCTAssertEqual(
+                FedPublicCandidateHygiene.classify(host: host, peerVerified: true),
+                .addressClassNotAllowed,
+                "\(host) is in 64:ff9b:1::/48"
+            )
+        }
+    }
+
+    /// 6to4 (2002::/16) is deprecated and can embed any IPv4 address, so it is
+    /// refused outright, whatever it embeds.
+    func testPublicHygieneRefuses6to4() {
+        for host in ["2002:a00:1::1", "2002:7f00:1::1", "2002:4f98:6354::1", "2002::1"] {
+            XCTAssertEqual(
+                FedPublicCandidateHygiene.classify(host: host, peerVerified: true),
+                .addressClassNotAllowed,
+                "\(host) is in 2002::/16"
+            )
+        }
+    }
+
+    /// The deprecated IPv4-compatible form ::a.b.c.d is refused outright.
+    func testPublicHygieneRefusesIPv4CompatibleForm() {
+        for host in ["::8.8.8.8", "::4f98:6354", "::10.0.0.1", "::2"] {
+            XCTAssertEqual(
+                FedPublicCandidateHygiene.classify(host: host, peerVerified: true),
+                .addressClassNotAllowed,
+                "\(host) is an IPv4-compatible address"
+            )
+        }
+    }
+
+    /// Network's IPv4 parser accepts legacy shorthand ("1.2.3" parses as
+    /// 1.2.0.3, "0x7f.1" as 127.0.0.1, "01.2.3.4" as 1.2.3.4). None of it is a
+    /// public-direct host: only plain four-part decimal is accepted, so the
+    /// string dialed can only mean the address that was classified.
+    func testPublicHygieneRefusesNonCanonicalIPv4Literals() {
+        for host in ["1.2.3", "01.2.3.4", "1.2.3.4.5", "0x7f.1", "127.1", "010.0.0.1",
+                     "79.152.25428", "079.152.99.84", "256.1.1.1", "79.152.99.84.", ".79.152.99.84",
+                     "79..99.84", "7 9.152.99.84"] {
+            XCTAssertEqual(
+                FedPublicCandidateHygiene.classify(host: host, peerVerified: true),
+                .invalidAddress,
+                "\(host) is not a plain dotted-quad literal"
+            )
+        }
+        // The plain form of the same addresses is still judged normally.
+        XCTAssertNil(FedPublicCandidateHygiene.classify(host: "1.2.0.3", peerVerified: true))
+        XCTAssertEqual(
+            FedPublicCandidateHygiene.classify(host: "127.0.0.1", peerVerified: true),
+            .addressClassNotAllowed
+        )
     }
 
     // MARK: - Hygiene: accepted addresses
@@ -290,6 +365,53 @@ final class FedPublicDirectCandidateTests: XCTestCase {
         }
     }
 
+    /// Public-direct reachability depends on the network the device is on, so a
+    /// suppressed failure holds while the network is unchanged and is lifted as
+    /// soon as the observed network changes.
+    func testPublicDirectSuppressionIsLiftedByNetworkChange() async throws {
+        let dials = PublicDirectDialLog()
+        let factory = RecordingDialFactory { candidate, _ in
+            await dials.record(candidate.candidateID)
+            // A timeout is a suppressing failure (only transport failures are not).
+            throw FedFailure.candidateTimedOut(stage: .carrierConnect)
+        }
+        let network = ObservedNetworkBox(try FedPublicTestSupport.observedHomeLAN())
+        let client = SubcFedClient(
+            profile: try FedPublicTestSupport.humanProfile(candidates: [
+                .publicDirect(try FedPublicDirectCandidate(candidateID: "pub-1", host: "79.152.99.84", port: 7841)),
+            ]),
+            keyStore: try FedPublicTestSupport.keyStore(),
+            stateStore: FedMemoryStateStore(),
+            observedNetwork: { network.current },
+            dialFactory: factory
+        )
+
+        _ = try? await client.connect()
+        var dialed = await dials.ids
+        XCTAssertEqual(dialed, ["pub-1"], "first connect dials the candidate")
+
+        // Same network: the timed-out candidate stays suppressed.
+        do {
+            try await client.connect()
+            XCTFail("expected noEligibleCandidates while suppressed")
+        } catch let failure as FedFailure {
+            guard case .noEligibleCandidates(let retained) = failure else {
+                return XCTFail("unexpected \(failure)")
+            }
+            XCTAssertEqual(retained.first?.reason, .timedOut(.carrierConnect))
+        }
+        dialed = await dials.ids
+        XCTAssertEqual(dialed, ["pub-1"], "no redial on the same network")
+
+        // New network: suppression is lifted and the candidate is dialed again.
+        network.current = FedObservedNetworkSnapshot(subnets: [
+            try FedObservedPrivateSubnet(ipv4: IPv4Address("10.20.0.0")!, prefixLength: 16),
+        ])
+        _ = try? await client.connect()
+        dialed = await dials.ids
+        XCTAssertEqual(dialed, ["pub-1", "pub-1"], "a network change lifts the suppression")
+    }
+
     /// When this side does not own direct dialing, a public-direct candidate is
     /// withheld before any attempt or carrier, exactly like LAN-direct.
     func testPublicDirectRespectsSingleDialerRule() async throws {
@@ -326,6 +448,18 @@ final class FedPublicDirectCandidateTests: XCTestCase {
         let dialed = await dials.ids
         XCTAssertEqual(carriers, 0)
         XCTAssertEqual(dialed, [])
+    }
+}
+
+private final class ObservedNetworkBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var snapshot: FedObservedNetworkSnapshot
+
+    init(_ snapshot: FedObservedNetworkSnapshot) { self.snapshot = snapshot }
+
+    var current: FedObservedNetworkSnapshot {
+        get { lock.lock(); defer { lock.unlock() }; return snapshot }
+        set { lock.lock(); defer { lock.unlock() }; snapshot = newValue }
     }
 }
 

@@ -685,13 +685,32 @@ public enum FedPublicCandidateHygiene {
         // which are refused anyway; refusing it outright keeps the string that
         // reaches the socket identical to the address that was classified.
         guard !host.contains("%") else { return .invalidAddress }
-        if let ipv4 = IPv4Address(host) {
-            return addressRejection(address: ipv4)
-        }
-        if let ipv6 = IPv6Address(host) {
+        if host.contains(":") {
+            guard let ipv6 = IPv6Address(host) else { return .invalidAddress }
             return addressRejection(address: ipv6)
         }
-        return .invalidAddress
+        // Network's IPv4 parser also accepts legacy shorthand ("1.2.3" reads as
+        // 1.2.0.3, "0x7f.1" as 127.0.0.1). Only the plain four-part decimal form
+        // is allowed, so the string handed to the socket can only mean the one
+        // address that was classified here.
+        guard isPlainDottedQuad(host), let ipv4 = IPv4Address(host) else {
+            return .invalidAddress
+        }
+        return addressRejection(address: ipv4)
+    }
+
+    /// True for exactly four decimal parts, each 0-255 with no leading zero.
+    private static func isPlainDottedQuad(_ host: String) -> Bool {
+        let parts = host.split(separator: ".", omittingEmptySubsequences: false)
+        guard parts.count == 4 else { return false }
+        return parts.allSatisfy { part in
+            let digits = Array(part.utf8)
+            guard (1...3).contains(digits.count),
+                  digits.allSatisfy({ (UInt8(ascii: "0")...UInt8(ascii: "9")).contains($0) })
+            else { return false }
+            if digits.count > 1 && digits[0] == UInt8(ascii: "0") { return false }
+            return Int(part).map { $0 <= 255 } ?? false
+        }
     }
 
     static func addressRejection(address: IPAddress) -> CandidateRejectionReason? {
@@ -730,16 +749,36 @@ public enum FedPublicCandidateHygiene {
         let bytes = Array(address.rawValue)
         guard bytes.count == 16 else { return .invalidAddress }
 
-        // ::ffff:a.b.c.d reaches the IPv4 host a.b.c.d, so it is held to the
-        // IPv4 rules; otherwise ::ffff:10.0.0.1 would bypass them.
+        // Forms that reach an IPv4 host are judged by the IPv4 table, or refused
+        // outright when the embedded host cannot be pinned down; otherwise an
+        // IPv6 spelling would be a way around the IPv4 rules.
+
+        // ::ffff:a.b.c.d (IPv4-mapped) reaches a.b.c.d.
         if bytes.prefix(10).allSatisfy({ $0 == 0 }) && bytes[10] == 0xFF && bytes[11] == 0xFF {
             return ipv4Rejection(Array(bytes[12..<16]))
         }
+        // 64:ff9b::a.b.c.d (NAT64 well-known prefix) reaches a.b.c.d through the
+        // network's NAT64 gateway.
+        if bytes[0] == 0x00 && bytes[1] == 0x64 && bytes[2] == 0xFF && bytes[3] == 0x9B
+            && bytes[4..<12].allSatisfy({ $0 == 0 }) {
+            return ipv4Rejection(Array(bytes[12..<16]))
+        }
+        // 64:ff9b:1::/48 (NAT64 local-use prefix): the embedding layout is chosen
+        // by each network, so the IPv4 host cannot be read back reliably.
+        if bytes[0] == 0x00 && bytes[1] == 0x64 && bytes[2] == 0xFF && bytes[3] == 0x9B
+            && bytes[4] == 0x00 && bytes[5] == 0x01 {
+            return .addressClassNotAllowed
+        }
+        // 2002::/16 (6to4, deprecated) can embed any IPv4 address.
+        if bytes[0] == 0x20 && bytes[1] == 0x02 { return .addressClassNotAllowed }
         if bytes.allSatisfy({ $0 == 0 }) { return .addressClassNotAllowed }            // ::
         if bytes.prefix(15).allSatisfy({ $0 == 0 }) && bytes[15] == 1 {               // ::1
             return .addressClassNotAllowed
         }
+        // ::a.b.c.d (deprecated IPv4-compatible form).
+        if bytes.prefix(12).allSatisfy({ $0 == 0 }) { return .addressClassNotAllowed }
         if bytes[0] == 0xFE && (bytes[1] & 0xC0) == 0x80 { return .addressClassNotAllowed } // fe80::/10
+        if bytes[0] == 0xFE && (bytes[1] & 0xC0) == 0xC0 { return .addressClassNotAllowed } // fec0::/10 site-local
         if (bytes[0] & 0xFE) == 0xFC { return .addressClassNotAllowed }               // fc00::/7
         if bytes[0] == 0xFF { return .addressClassNotAllowed }                         // ff00::/8
         if bytes[0] == 0x20 && bytes[1] == 0x01 && bytes[2] == 0x0D && bytes[3] == 0xB8 {

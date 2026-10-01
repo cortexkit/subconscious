@@ -1036,8 +1036,10 @@ public actor SubcFedClient {
                 networkSnapshotDigest: snapshot.digest
             )
         case .publicDirect(let publicDirect):
-            // Public-direct eligibility does not depend on the observed local
-            // subnets, so a network change alone does not lift its suppression.
+            // Whether a public address is reachable depends on the network the
+            // device is on (the embedding probes it per path), so the snapshot
+            // digest is part of the facts: a failure suppressed on one network
+            // is lifted when the device moves to another.
             var material = Data(publicDirect.host.utf8)
             material.append(contentsOf: withUnsafeBytes(of: publicDirect.port.bigEndian) { Data($0) })
             material.append(profile.isVerified ? 1 : 0)
@@ -1046,7 +1048,7 @@ public actor SubcFedClient {
                 endpointDigest: FedSuppressionFactDigest.digest(
                     string: "\(publicDirect.host):\(publicDirect.port)"),
                 materialDigest: FedSuppressionFactDigest.digest(material),
-                networkSnapshotDigest: nil
+                networkSnapshotDigest: snapshot.digest
             )
         case .relay(let relay):
             var material = Data(relay.relayURL.absoluteString.utf8)

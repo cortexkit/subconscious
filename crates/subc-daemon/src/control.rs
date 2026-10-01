@@ -23,7 +23,10 @@ use subc_protocol::{
         CapabilityDeclarations, CapabilityNeed, Concurrency, ManifestProvenance, ModuleManifest,
         ProviderRole,
     },
-    scope::{ScopeRecord, ScopeSelector, CAP_SCOPES_V1, SCOPE_DESCRIBE_OP, SCOPE_SYNC_OP},
+    scope::{
+        ScopeRecord, ScopeRecordOutcome, ScopeRecordResult, ScopeSelector, CAP_SCOPES_V1,
+        SCOPE_DESCRIBE_OP, SCOPE_SYNC_OP,
+    },
     session::{
         HealthReport, ModuleControlPush, ModuleControlRequest, ModuleControlRequestFromModule,
         ModuleControlResponse, ModuleControlResponseToModule, MODULE_CONTROL_OP_HEALTH_CHECK,
@@ -2333,15 +2336,41 @@ impl ControlHandler {
         drop(table);
         match outcome {
             Ok(applied) => {
+                let counts = ScopeOutcomeCounts::of(&applied.results);
                 info!(
                     owner = %owner,
                     generation,
                     records = applied.results.len(),
+                    created = counts.created,
+                    replaced = counts.replaced,
+                    updated = counts.updated,
+                    unchanged = counts.unchanged,
+                    refused = counts.refused,
                     ended = applied.ended.len(),
                     tag_changes = applied.tag_changes.len(),
                     routes_closed = drained.len(),
                     "scope sync accepted"
                 );
+                // An accepted sync can still refuse individual records, and the
+                // owner is the only party that sees the reply. Name them here so
+                // an operator can tell a refused session from a missing one
+                // without the owner's logs. Capped so a sync that refuses
+                // thousands cannot flood the log; the count above is complete.
+                for refused in applied
+                    .results
+                    .iter()
+                    .filter(|result| result.outcome == ScopeRecordOutcome::Refused)
+                    .take(MAX_LOGGED_REFUSED_SCOPE_RECORDS)
+                {
+                    warn!(
+                        owner = %owner,
+                        generation,
+                        scope_ref = %refused.scope_ref,
+                        scope_epoch = refused.scope_epoch,
+                        code = refused.code.as_deref().unwrap_or(""),
+                        "scope record refused"
+                    );
+                }
                 self.close_scope_drained_routes(drained);
                 let response = ModuleControlResponseToModule::ScopeSync {
                     generation,
@@ -5525,6 +5554,80 @@ fn provider_role_kind(role: &ProviderRole) -> ProviderRoleKind {
 
 fn provider_role_kind_set(roles: &[ProviderRole]) -> BTreeSet<ProviderRoleKind> {
     roles.iter().map(provider_role_kind).collect()
+}
+
+/// Most refused scope records named individually in the log per sync; the
+/// `refused` count on the accepted line is always complete.
+const MAX_LOGGED_REFUSED_SCOPE_RECORDS: usize = 8;
+
+/// Per-outcome counts of one accepted `scope.sync`, for its log line.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ScopeOutcomeCounts {
+    created: usize,
+    replaced: usize,
+    updated: usize,
+    unchanged: usize,
+    refused: usize,
+}
+
+impl ScopeOutcomeCounts {
+    fn of(results: &[ScopeRecordResult]) -> Self {
+        let mut counts = Self::default();
+        for result in results {
+            let slot = match result.outcome {
+                ScopeRecordOutcome::Created => &mut counts.created,
+                ScopeRecordOutcome::Replaced => &mut counts.replaced,
+                ScopeRecordOutcome::Updated => &mut counts.updated,
+                ScopeRecordOutcome::Unchanged => &mut counts.unchanged,
+                ScopeRecordOutcome::Refused => &mut counts.refused,
+            };
+            *slot += 1;
+        }
+        counts
+    }
+}
+
+#[cfg(test)]
+mod scope_outcome_count_tests {
+    use super::*;
+
+    fn result(outcome: ScopeRecordOutcome) -> ScopeRecordResult {
+        ScopeRecordResult {
+            scope_ref: "r".to_string(),
+            scope_epoch: 1,
+            outcome,
+            code: None,
+            message: None,
+            version: None,
+            parent_state: None,
+        }
+    }
+
+    /// Each outcome lands in its own count, so a refused record can never be
+    /// hidden inside the total the log already printed.
+    #[test]
+    fn every_outcome_is_counted_in_its_own_field() {
+        let results = [
+            result(ScopeRecordOutcome::Created),
+            result(ScopeRecordOutcome::Created),
+            result(ScopeRecordOutcome::Replaced),
+            result(ScopeRecordOutcome::Updated),
+            result(ScopeRecordOutcome::Unchanged),
+            result(ScopeRecordOutcome::Refused),
+            result(ScopeRecordOutcome::Refused),
+            result(ScopeRecordOutcome::Refused),
+        ];
+        assert_eq!(
+            ScopeOutcomeCounts::of(&results),
+            ScopeOutcomeCounts {
+                created: 2,
+                replaced: 1,
+                updated: 1,
+                unchanged: 1,
+                refused: 3,
+            }
+        );
+    }
 }
 
 /// Return whether a catalog change can create a newly violating live route.

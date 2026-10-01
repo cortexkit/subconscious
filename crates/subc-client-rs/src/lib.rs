@@ -914,7 +914,12 @@ impl Error for CatalogUpdateError {}
 
 /// Errors returned by [`ModuleHandle::scope_sync`] and
 /// [`ModuleHandle::scope_describe`].
+///
+/// Non-exhaustive so a later failure kind can be added without breaking
+/// callers' matches; match the variants you handle and treat the rest as an
+/// unverifiable answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ScopeCallError {
     /// The daemon's HELLO_ACK did not list `op` in `subc_ops`, so nothing was
     /// sent.

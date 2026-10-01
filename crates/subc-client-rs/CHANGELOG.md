@@ -13,7 +13,7 @@
 - New `ScopeCallError`. A daemon refusal is `Refused { code, message }` with the code exactly as
   sent, so callers match it against `subc_protocol::error_codes` (`SCOPE_SYNC_STALE`,
   `SCOPE_SYNC_NOT_AUTHORITY`, ...); `ScopeCallError::code()` returns it. A reply for a different
-  op is `Protocol`.
+  op is `Protocol`. `ScopeCallError` is `#[non_exhaustive]`, so a later failure kind is additive.
 - New `scope-owner` example: a supervised module that runs scope syncs and describes from a
   script, used by the real-daemon tests because only a daemon-launched module holds sync
   authority.

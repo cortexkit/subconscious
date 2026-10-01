@@ -1367,10 +1367,7 @@ impl SubcConnection {
         let (tx, rx) = mpsc::channel(128);
         let pending = Arc::new(Mutex::new(HashMap::new()));
         let closed = Arc::new(AtomicBool::new(false));
-        let connection_token = NEXT_CONNECTION_TOKEN
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |token| {
-                token.checked_add(1)
-            })
+        let connection_token = checked_increment(&NEXT_CONNECTION_TOKEN)
             .expect("subc connection token space exhausted");
         let relay = Arc::new(match predecessor {
             Some(previous) => previous.successor(tx.clone(), connection_token),
@@ -5909,13 +5906,23 @@ fn hex(bytes: &[u8]) -> String {
     out
 }
 
+/// Adds one to `counter` and returns the value it held before, or `None` once
+/// the counter is at `u64::MAX`. Written as a compare-exchange loop rather than
+/// with `fetch_update` (deprecated in Rust 1.99) or its replacement
+/// `try_update` (absent before 1.99), so it builds on both toolchains.
+fn checked_increment(counter: &AtomicU64) -> Option<u64> {
+    let mut current = counter.load(Ordering::Relaxed);
+    loop {
+        let next = current.checked_add(1)?;
+        match counter.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(previous) => return Some(previous),
+            Err(actual) => current = actual,
+        }
+    }
+}
+
 fn allocate_corr(last_corr: &AtomicU64) -> Option<u64> {
-    last_corr
-        .try_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
-            last.checked_add(1)
-        })
-        .ok()
-        .map(|last| last + 1)
+    checked_increment(last_corr).map(|last| last + 1)
 }
 
 fn build_frame(

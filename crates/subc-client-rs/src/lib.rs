@@ -1259,6 +1259,21 @@ impl RequestCtx {
     }
 }
 
+/// Adds one to `counter` and returns the value it held before, or `None` once
+/// the counter is at `u64::MAX`. Written as a compare-exchange loop rather than
+/// with `fetch_update` (deprecated in Rust 1.99) or its replacement
+/// `try_update` (absent before 1.99), so it builds on both toolchains.
+fn checked_increment(counter: &AtomicU64) -> Option<u64> {
+    let mut current = counter.load(Ordering::Relaxed);
+    loop {
+        let next = current.checked_add(1)?;
+        match counter.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(previous) => return Some(previous),
+            Err(actual) => current = actual,
+        }
+    }
+}
+
 /// Route-bind request delivered on channel 0.
 #[derive(Debug, Clone)]
 pub struct RouteBindRequest {
@@ -1356,11 +1371,8 @@ where
     let ack = expect_hello_ack(&mut read_half).await?;
     handler.on_hello_ack(&ack).await;
 
-    let connection_token = NEXT_MODULE_CONNECTION_TOKEN
-        .try_update(Ordering::Relaxed, Ordering::Relaxed, |token| {
-            token.checked_add(1)
-        })
-        .map_err(|_| SubcModuleError::ConnectionTokenExhausted)?;
+    let connection_token = checked_increment(&NEXT_MODULE_CONNECTION_TOKEN)
+        .ok_or(SubcModuleError::ConnectionTokenExhausted)?;
     let close_token = CancellationToken::new();
     let handle = ModuleHandle::new(&ack, tx.clone(), connection_token, close_token);
     let serve_handle = handle.clone();
@@ -3687,5 +3699,26 @@ fn stamp_launch_nonce_source(manifest: &mut ModuleManifest, sent: Option<&str>) 
             provenance.launch_nonce_source =
                 Some(LaunchNonceSource::from_wire_name(nonce.source().as_str()));
         }
+    }
+}
+
+#[cfg(test)]
+mod checked_increment_tests {
+    use super::checked_increment;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn returns_the_previous_value_and_stops_at_the_maximum() {
+        let counter = AtomicU64::new(7);
+        assert_eq!(checked_increment(&counter), Some(7));
+        assert_eq!(counter.load(Ordering::Relaxed), 8);
+
+        let full = AtomicU64::new(u64::MAX);
+        assert_eq!(checked_increment(&full), None);
+        assert_eq!(
+            full.load(Ordering::Relaxed),
+            u64::MAX,
+            "an exhausted counter is left unchanged"
+        );
     }
 }

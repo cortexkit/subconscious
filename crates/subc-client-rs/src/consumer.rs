@@ -297,8 +297,7 @@ fn reverse_request_registries() -> &'static Mutex<HashMap<u64, ReverseRequestReg
 }
 
 pub(crate) fn install_reverse_request_registry(registry: ReverseRequestRegistry) -> u64 {
-    let id = NEXT_REVERSE_REQUEST_REGISTRY_ID
-        .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+    let id = crate::checked_increment(&NEXT_REVERSE_REQUEST_REGISTRY_ID)
         .expect("reverse-request route registry id exhausted");
     reverse_request_registries()
         .lock()

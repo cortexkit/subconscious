@@ -42,48 +42,6 @@ final class FedStoreFlushBenchmarkTests: XCTestCase {
         }
     }
 
-    /// Twenty changes against a store that starts with 540 settled records.
-    /// The SQLite store gets its records by importing the same seeded JSON
-    /// document on open, as a phone upgrading from the file store does.
-    func testBenchmarkChangesAgainstA540RecordDocument() async throws {
-        try requireBenchmarkEnabled()
-        for kind in Store.allCases {
-            let dir = try temporaryDirectory()
-            defer { try? FileManager.default.removeItem(at: dir) }
-            try await seedSettledDocument(in: dir, records: 540)
-            let seededSize = try documentSize(in: dir)
-
-            // For the SQLite store the first open imports the seeded 3 MB
-            // document (build, verify, rename), which is what a phone upgrading
-            // from the file store pays once, on its first dial.
-            let openStarted = DispatchTime.now().uptimeNanoseconds
-            let store = try await open(kind, in: dir)
-            let openMs = Double(DispatchTime.now().uptimeNanoseconds - openStarted) / 1_000_000
-            print(String(format: "FED_STORE_BENCH store=%@ seeded=540 first_open_ms=%.2f", kind.rawValue, openMs))
-            let log = FedOriginEffectLog(store: store, responderStaticPublicKey: responder)
-
-            let changes = 20
-            let countBefore = await durableCount(store)
-            let started = DispatchTime.now().uptimeNanoseconds
-            for _ in 0..<changes {
-                try await runOneChange(log: log)
-            }
-            let elapsed = DispatchTime.now().uptimeNanoseconds - started
-            let count = await durableCount(store) - countBefore
-
-            print(String(
-                format: "FED_STORE_BENCH store=%@ seeded=540 changes=%d %@_per_change=%.2f ms_per_change=%.2f size_before=%d size_after=%d%@",
-                kind.rawValue,
-                changes,
-                countLabel(kind),
-                Double(count) / Double(changes),
-                Double(elapsed) / Double(changes) / 1_000_000,
-                seededSize,
-                try storedSize(kind, in: dir),
-                try sizeBreakdown(kind, in: dir)
-            ))
-        }
-    }
 
     /// 540 changes from an empty store, reporting how large the state gets.
     func testBenchmarkDocumentSizeAfter540Changes() async throws {
@@ -138,41 +96,6 @@ final class FedStoreFlushBenchmarkTests: XCTestCase {
         XCTAssertEqual(applied?.disposition, .recorded)
     }
 
-    /// Writes a committed document holding `records` recorded, settled effects of
-    /// the local incarnation, as a phone that has made that many changes has.
-    private func seedSettledDocument(in dir: URL, records: UInt64) async throws {
-        let bootstrap = FedAtomicFileStateStore(directoryURL: dir)
-        var document = try await bootstrap.open(localPublicKey: localKey).document
-        let incarnation = document.global.localIncarnation
-        var destination = FedDestinationState(
-            responderStaticPublicKey: responder,
-            observedPeerIncarnation: peerIncarnation,
-            observedPeerLedgerEpoch: peerEpoch,
-            confirmedWatermark: FedConfirmedWatermark(incarnation: incarnation, seq: records)
-        )
-        for seq in 1...records {
-            destination.unresolvedEffects.append(FedUnresolvedEffectRecord(
-                effect: FedEffectID(incarnation: incarnation, seq: seq),
-                responderStaticPublicKey: responder,
-                phase: .terminal,
-                disposition: .recorded,
-                peerLedgerEpoch: peerEpoch,
-                peerIncarnation: peerIncarnation,
-                terminalBody: responseBody,
-                terminalKind: "response"
-            ))
-        }
-        document.destinations[FedStateDocument.destinationKey(forResponderPublicKey: responder)] = destination
-        document.global.nextEffectSequence = records + 1
-        document.global.effectSequenceHighWater = records + FedGlobalReservationState.reservationBlockSize
-        document.revision += 1
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.sortedKeys]
-        try encoder.encode(document).write(
-            to: dir.appendingPathComponent(FedAtomicFileStateStore.documentFileName),
-            options: .atomic
-        )
-    }
 
     private func open(_ kind: Store, in dir: URL) async throws -> any FedStateStore {
         let store: any FedStateStore

@@ -52,7 +52,6 @@ final class FedFailureDescriptionTests: XCTestCase {
             .storeUnavailable,
             .storeMigrationFailed,
             .storeLocked,
-            .storeMigrationVerificationFailed,
             .reservationFailed,
             .persistenceFailed,
             .cancelled,
@@ -93,21 +92,17 @@ final class FedFailureDescriptionTests: XCTestCase {
         XCTAssertNotEqual(text, FedFailure.storeUnavailable.description)
     }
 
-    /// Both store failures added with the SQLite store survive encoding and
-    /// read differently from every other store failure, because the app shows
-    /// each its own notice.
-    func testStoreLockedAndMigrationVerificationFailuresRoundTripAndReadDistinctly() throws {
+    /// Locked storage has a retry notice distinct from permanent store failures.
+    func testStoreLockedFailureRoundTripsAndReadsDistinctly() throws {
         let others: [FedFailure] = [.storeCorrupt, .storeUnavailable, .storeMigrationFailed, .persistenceFailed]
-        for failure in [FedFailure.storeLocked, .storeMigrationVerificationFailed] {
+        for failure in [FedFailure.storeLocked] {
             let encoded = try JSONEncoder().encode(failure)
             XCTAssertEqual(try JSONDecoder().decode(FedFailure.self, from: encoded), failure)
             for other in others {
                 XCTAssertNotEqual(failure.description, other.description)
             }
         }
-        XCTAssertNotEqual(FedFailure.storeLocked.description, FedFailure.storeMigrationVerificationFailed.description)
         XCTAssertTrue(FedFailure.storeLocked.description.contains("unlocked"))
-        XCTAssertTrue(FedFailure.storeMigrationVerificationFailed.description.contains("left unchanged"))
     }
 
     /// The two authority bye codes have OPPOSITE subjects: `fed_tombstoned`

@@ -26,7 +26,6 @@ final class SubcFedClientPublicAPITests: XCTestCase {
             .storeUnavailable,
             .storeMigrationFailed,
             .storeLocked,
-            .storeMigrationVerificationFailed,
             .reservationFailed,
             .persistenceFailed,
             .cancelled,
@@ -38,7 +37,7 @@ final class SubcFedClientPublicAPITests: XCTestCase {
             .noEligibleCandidates([]),
             .allCandidatesFailed([]),
         ]
-        XCTAssertEqual(failures.count, 30)
+        XCTAssertEqual(failures.count, 29)
         XCTAssertEqual(Self.candidateStages.count, 5)
         XCTAssertEqual(Self.rejectionReasons.count, 6)
     }

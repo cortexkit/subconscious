@@ -223,18 +223,16 @@ final class FedSQLiteStateStoreTests: XCTestCase {
         XCTAssertLessThan(size, Self.storedSizeBound, "database plus -wal: \(size) bytes")
     }
 
-    /// A phone migrating from the file store imports its whole history, about
-    /// 3 MB. Once the first settled change prunes it, the file must shrink
-    /// back rather than keep the imported size. Measured at about 310 KB after
-    /// 20 changes; without incremental vacuum and the -wal size limit it was 3.8 MB.
-    func testStoredSizeShrinksOnceAnImportedHistoryIsPruned() async throws {
+    /// A large settled history must shrink after pruning rather than keeping
+    /// its peak size. The fixture bypasses normal pruning to represent old history.
+    func testStoredSizeShrinksOnceALargeHistoryIsPruned() async throws {
         let dir = try FedStoreUnderTest.temporaryDirectory(removedAfter: self)
         let body = Data(repeating: 0x61, count: 4_096)
-        try await seedSettledJSONDocument(in: dir, records: 540, body: body)
+        try await seedSettledSQLiteDocument(in: dir, records: 540, body: body)
         let store = FedSQLiteStateStore(directoryURL: dir)
         _ = try await store.open(localPublicKey: localKey)
-        let imported = try storedBytes(dir)
-        XCTAssertGreaterThan(imported, 2_000_000, "control: the import holds the whole history")
+        let seeded = try storedBytes(dir)
+        XCTAssertGreaterThan(seeded, 2_000_000, "control: the database holds the whole history")
 
         let log = FedOriginEffectLog(store: store, responderStaticPublicKey: responder)
         for _ in 0..<20 {
@@ -261,11 +259,14 @@ final class FedSQLiteStateStoreTests: XCTestCase {
         }
     }
 
-    /// Writes a file-store JSON document holding `records` recorded, settled
-    /// changes of the local incarnation, as a phone with that much history has.
-    private func seedSettledJSONDocument(in dir: URL, records: UInt64, body: Data) async throws {
-        let bootstrap = FedAtomicFileStateStore(directoryURL: dir)
-        var document = try await bootstrap.open(localPublicKey: localKey).document
+    /// Seeds a database with `records` settled changes.
+    private func seedSettledSQLiteDocument(in dir: URL, records: UInt64, body: Data) async throws {
+        var document = FedStateDocument(
+            localIdentityDigest: FedStateDocument.identityDigest(forPublicKey: localKey),
+            localPublicKey: localKey,
+            revision: 1,
+            global: .mintFresh()
+        )
         let incarnation = document.global.localIncarnation
         var destination = FedDestinationState(
             responderStaticPublicKey: responder,
@@ -286,10 +287,7 @@ final class FedSQLiteStateStoreTests: XCTestCase {
         document.global.nextEffectSequence = records + 1
         document.global.effectSequenceHighWater = records + FedGlobalReservationState.reservationBlockSize
         document.revision += 1
-        try JSONEncoder().encode(document).write(
-            to: dir.appendingPathComponent(FedAtomicFileStateStore.documentFileName),
-            options: .atomic
-        )
+        try FedSQLiteTestSeed.write(document, in: dir)
     }
 
     // MARK: - A failed open
@@ -336,9 +334,9 @@ final class FedSQLiteStateStoreTests: XCTestCase {
     // MARK: - Same behaviour as the file store
 
     /// Random operation sequences give the same documents, and the same
-    /// failures, in the SQLite store as in the file store. Both start from one
-    /// document: the SQLite store imports the file store's fresh JSON, so the
-    /// incarnation and every counter agree from the first step.
+    /// failures, in the SQLite store as in the file store. The file store's
+    /// initial snapshot is seeded directly into SQLite, so the incarnation
+    /// and every counter agree from the first step.
     func testAgreesWithTheFileStoreOnRandomOperationSequences() async throws {
         for seed: UInt64 in [1, 2, 3, 4, 5] {
             try await compareStores(seed: seed, steps: 60)
@@ -350,10 +348,7 @@ final class FedSQLiteStateStoreTests: XCTestCase {
         let sqliteDir = try FedStoreUnderTest.temporaryDirectory(removedAfter: self)
         let file = FedAtomicFileStateStore(directoryURL: fileDir)
         _ = try await file.open(localPublicKey: localKey)
-        try FileManager.default.copyItem(
-            at: fileDir.appendingPathComponent(FedAtomicFileStateStore.documentFileName),
-            to: sqliteDir.appendingPathComponent(FedAtomicFileStateStore.documentFileName)
-        )
+        try FedSQLiteTestSeed.write(try await file.snapshot(), in: sqliteDir)
         let sqlite = FedSQLiteStateStore(directoryURL: sqliteDir)
         _ = try await sqlite.open(localPublicKey: localKey)
         let fileStart = try await file.snapshot()

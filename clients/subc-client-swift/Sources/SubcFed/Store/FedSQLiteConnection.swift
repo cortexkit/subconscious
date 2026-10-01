@@ -35,7 +35,6 @@ struct FedSQLiteError: Error, CustomStringConvertible {
         primaryCode == SQLITE_CORRUPT || primaryCode == SQLITE_NOTADB
     }
 
-    var isConstraintViolation: Bool { primaryCode == SQLITE_CONSTRAINT }
 }
 
 /// SQLite copies text and blob arguments when given this destructor, so the

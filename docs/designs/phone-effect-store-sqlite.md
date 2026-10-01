@@ -80,17 +80,12 @@ File protection and backup:
   it no longer has, and could carry an old incarnation. A fresh store mints a fresh
   incarnation, which is what section 6.1 relies on.
 
-Migration: on first open, if `fed-state.json` exists and the database file does not
-exist, import it in one transaction. "Does not exist" is a file-existence check, never an
-open failure: a locked phone that cannot open an existing database must not re-import
-the JSON over it. For that check to be sound the database file must never exist
-half-built: a new database (imported or fresh) is built under a temporary name and
-renamed into place once complete, so a crash during the import leaves no database and
-the next open imports again. Then check that the imported document and the database
-give the same open changes, watermark, sentinel per epoch, poisoned epochs, reservation
-state and incarnation, and only then rename the JSON to `fed-state.json.migrated`. Keep that file for one release. If the check fails,
-refuse to open with a distinct `FedFailure` case of its own (the app shows a specific
-notice for it, not "can't reach your Mac") and leave both files untouched.
+Legacy cleanup: on open, discard `fed-state.json` and `fed-state.json.migrated`
+from the store directory, logging any deletion failure without failing the open.
+JSON is no longer imported; an absent database starts a fresh send log. Database
+existence, never an open failure, decides whether to create: a locked phone must
+not replace an intact database. New databases are built under a temporary name
+and renamed into place once complete, so interrupted builds are never used.
 
 ## 2. Wire: ask about many changes at once, and confirm by id
 

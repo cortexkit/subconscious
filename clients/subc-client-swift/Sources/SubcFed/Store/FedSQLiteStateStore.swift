@@ -1,4 +1,5 @@
 import Foundation
+import OSLog
 import SQLite3
 
 /// Default durable store: the send log in a SQLite database under Application
@@ -10,8 +11,8 @@ import SQLite3
 /// `fsync`, which the drive may still hold in its cache. A mutating change is
 /// two commits: the sequence reservation and the intent row together, before
 /// the first network write, and the outcome with the watermark advance and
-/// pruning, before the caller sees the reply. Marking the call sent is not
-/// written at all (see `sentNotYetDurable`).
+/// pruning, before the caller sees the reply. Marking a mutation's effect
+/// record sent is not written at all (see `sentNotYetDurable`).
 ///
 /// Transactions. Every transaction is opened and finished inside one
 /// synchronous function; the closures passed to `write` and `read` cannot
@@ -22,13 +23,11 @@ import SQLite3
 /// Files. The database, `-wal` and `-shm` are created with the default
 /// protection class (complete until first user authentication) through
 /// SQLite's open flag, which applies one class to all three, and they are
-/// excluded from backup: the device key never leaves the device, so a
-/// restored send log would belong to an identity the phone no longer has.
+/// excluded from backup: the device key is not backed up, so a restored
+/// phone has a new identity that does not own the restored send log.
 ///
-/// Migration. When the database does not exist and the JSON document of
-/// `FedAtomicFileStateStore` does, `open` imports the document, checks the
-/// import against it, and only then renames the JSON to
-/// `fed-state.json.migrated`.
+/// Legacy JSON files are discarded on open. Only the SQLite database carries
+/// saved state; a missing database starts a fresh send log.
 public actor FedSQLiteStateStore: FedStateStore {
     public static let databaseFileName = "fed-state.sqlite"
     public static let migratedDocumentFileName = "fed-state.json.migrated"
@@ -70,6 +69,14 @@ public actor FedSQLiteStateStore: FedStateStore {
     private let migratedDocumentURL: URL
     private let lockURL: URL
     private let fileManager: FileManager
+    private let log = Logger(subsystem: "io.cortexkit.subcfed", category: "store")
+    private var legacyFileRemover: @Sendable (URL) throws -> Void = { url in
+        // unlink removes only this directory entry, never a directory tree or
+        // a symlink's target.
+        guard Darwin.unlink(url.path) == 0 else {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+        }
+    }
     private var connection: FedSQLiteConnection?
     private var commitBarrier: (@Sendable (CommitBarrier) throws -> Void)?
 
@@ -90,9 +97,8 @@ public actor FedSQLiteStateStore: FedStateStore {
     private var sentNotYetDurable: [FedEffectID: String] = [:]
 
     /// Derives the store directory from an Application Support base URL and a
-    /// stable identity namespace dedicated to one local X25519 public key. The
-    /// folder is the one `FedAtomicFileStateStore` uses, so its document is
-    /// found and migrated.
+    /// stable identity namespace dedicated to one local X25519 public key.
+    /// Uses the same per-identity folder as `FedAtomicFileStateStore`.
     public init(applicationSupportBaseURL: URL, identityNamespace: String) throws {
         let trimmed = identityNamespace.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { throw FedFailure.storeUnavailable }
@@ -112,6 +118,10 @@ public actor FedSQLiteStateStore: FedStateStore {
         self.migratedDocumentURL = directoryURL.appendingPathComponent(Self.migratedDocumentFileName)
         self.lockURL = directoryURL.appendingPathComponent(FedAtomicFileStateStore.lockFileName)
         self.fileManager = .default
+    }
+
+    func setLegacyFileRemover(_ remover: @escaping @Sendable (URL) throws -> Void) {
+        legacyFileRemover = remover
     }
 
     func setCommitBarrier(_ barrier: (@Sendable (CommitBarrier) throws -> Void)?) {
@@ -135,26 +145,21 @@ public actor FedSQLiteStateStore: FedStateStore {
         return settings
     }
 
-    // MARK: - Open and migration
+    // MARK: - Open
 
     public func open(localPublicKey: Data) async throws -> FedStateOpenResult {
         try withOpenLock {
             try ensureDirectory()
+            removeLegacyFiles()
             removeBuildingFiles()
             var created = false
             if connection == nil {
-                // Whether to import or create is decided by the database file
-                // existing, never by an open failing. Before the first unlock
-                // an existing database cannot be opened; treating that as "no
-                // database" would import an old JSON document, or mint a new
-                // incarnation, over the real send log.
+                // Creation is decided by file existence, never by an open
+                // failing: before first unlock an intact database is unreadable
+                // and must not be replaced with a fresh incarnation.
                 if !fileManager.fileExists(atPath: databaseURL.path) {
-                    if fileManager.fileExists(atPath: documentURL.path) {
-                        try importDocument(localPublicKey: localPublicKey)
-                    } else {
-                        try createDatabase(localPublicKey: localPublicKey)
-                        created = true
-                    }
+                    try createDatabase(localPublicKey: localPublicKey)
+                    created = true
                 }
                 connection = try openExistingDatabase()
             }
@@ -177,47 +182,6 @@ public actor FedSQLiteStateStore: FedStateStore {
         }
     }
 
-    /// Imports the JSON document into a new database, checks the import, and
-    /// renames the JSON aside. Refuses with `storeMigrationVerificationFailed`
-    /// when the document cannot be read as a send log or the check finds a
-    /// difference; the JSON is then untouched and no database is left behind.
-    private func importDocument(localPublicKey: Data) throws {
-        let data: Data
-        do {
-            data = try Data(contentsOf: documentURL)
-        } catch {
-            // The file exists but cannot be read, which before the first
-            // unlock is expected. Retry later; never import from a guess.
-            throw FedFailure.storeLocked
-        }
-        var document: FedStateDocument
-        do {
-            document = try JSONDecoder().decode(FedStateDocument.self, from: data)
-        } catch {
-            throw FedFailure.storeMigrationVerificationFailed
-        }
-        // The same checks the file store makes when it opens its document.
-        guard document.localIdentityDigest == FedStateDocument.identityDigest(forPublicKey: localPublicKey) else {
-            throw FedFailure.storeCorrupt
-        }
-        guard document.schemaVersion == FedStateDocument.currentSchemaVersion else {
-            throw FedFailure.storeMigrationFailed
-        }
-        if document.localPublicKey == nil {
-            // The file store records the key on its next open and bumps the
-            // revision for it; the import does the same so both agree.
-            document.localPublicKey = localPublicKey
-            document.revision += 1
-        }
-        try buildDatabase(from: document, verifyingImport: true)
-        // The database is in place and durable. A failure to rename the JSON
-        // leaves it where it is; it is never read again while the database
-        // exists, so the open still succeeds.
-        if Darwin.rename(documentURL.path, migratedDocumentURL.path) == 0 {
-            try? fsyncDirectory()
-        }
-    }
-
     private func createDatabase(localPublicKey: Data) throws {
         let document = FedStateDocument(
             localIdentityDigest: FedStateDocument.identityDigest(forPublicKey: localPublicKey),
@@ -225,13 +189,13 @@ public actor FedSQLiteStateStore: FedStateStore {
             revision: 1,
             global: .mintFresh()
         )
-        try buildDatabase(from: document, verifyingImport: false)
+        try buildDatabase(from: document)
     }
 
     /// Builds a complete database holding `document` under a temporary name,
     /// then renames it into place and flushes the directory. A crash at any
     /// point leaves either no database or a complete one.
-    private func buildDatabase(from document: FedStateDocument, verifyingImport: Bool) throws {
+    private func buildDatabase(from document: FedStateDocument) throws {
         removeBuildingFiles()
         do {
             let builder = try FedSQLiteConnection.open(
@@ -254,24 +218,13 @@ public actor FedSQLiteStateStore: FedStateStore {
             }
             try builder.close()
 
-            if verifyingImport {
-                // Read back through a new connection, so the check sees what
-                // reached the file rather than what one connection cached.
-                let checker = try FedSQLiteConnection.open(path: buildingURL.path, flags: Self.openFlags)
-                let imported = try FedSQLiteStoreRows.readDocument(from: checker)
-                try checker.close()
-                guard FedStoreImportCheck.mismatches(expected: document, imported: imported).isEmpty else {
-                    throw FedFailure.storeMigrationVerificationFailed
-                }
-            }
-
             guard Darwin.rename(buildingURL.path, databaseURL.path) == 0 else {
                 throw FedFailure.storeUnavailable
             }
             try fsyncDirectory()
         } catch {
             removeBuildingFiles()
-            throw Self.buildFailure(error, importing: verifyingImport)
+            throw Self.buildFailure(error)
         }
     }
 
@@ -681,27 +634,18 @@ public actor FedSQLiteStateStore: FedStateStore {
         return .storeUnavailable
     }
 
-    /// Maps a failure to build a new database. For an import, anything the
-    /// document itself causes (a row the schema refuses, a difference found
-    /// by the check) is `storeMigrationVerificationFailed`; a file that cannot
-    /// be reached is `storeLocked`.
-    private static func buildFailure(_ error: Error, importing: Bool) -> FedFailure {
-        if let failure = error as? FedFailure {
-            if importing && failure == .storeCorrupt { return .storeMigrationVerificationFailed }
-            return failure
-        }
-        if let sqlite = error as? FedSQLiteError {
-            if importing && sqlite.isConstraintViolation { return .storeMigrationVerificationFailed }
-            if sqlite.isUnreachable { return .storeLocked }
-        }
+    /// Maps a failure to build a new database. SQLite access and I/O failures
+    /// report `storeLocked` so callers can retry when storage becomes accessible.
+    private static func buildFailure(_ error: Error) -> FedFailure {
+        if let failure = error as? FedFailure { return failure }
+        if let sqlite = error as? FedSQLiteError, sqlite.isUnreachable { return .storeLocked }
         return .storeUnavailable
     }
 
     // MARK: - Files
 
-    /// Serialises `open` across store instances with the advisory lock the
-    /// file store uses, so two opens cannot both build or import a database,
-    /// and a file store instance cannot rewrite the JSON during an import.
+    /// Serialises `open` across store instances so two opens cannot both
+    /// build a database. Uses the same lock file as `FedAtomicFileStateStore`.
     private func withOpenLock<T>(_ body: () throws -> T) throws -> T {
         try ensureDirectory()
         let fd = Darwin.open(lockURL.path, O_RDWR | O_CREAT, 0o600)
@@ -718,6 +662,21 @@ public actor FedSQLiteStateStore: FedStateStore {
             try fileManager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directoryURL.path)
         } catch {
             throw FedFailure.storeUnavailable
+        }
+    }
+
+    /// Discards obsolete JSON entries without following symlinks or removing
+    /// directory trees. Cleanup is best effort and never changes the open result.
+    private func removeLegacyFiles() {
+        for url in [documentURL, migratedDocumentURL] {
+            var entry = stat()
+            // Inspect the entry itself so dangling symlinks are discarded too.
+            if Darwin.lstat(url.path, &entry) != 0 && errno == ENOENT { continue }
+            do {
+                try legacyFileRemover(url)
+            } catch {
+                log.warning("Could not remove legacy state \(url.lastPathComponent, privacy: .public): \(String(describing: error), privacy: .public)")
+            }
         }
     }
 

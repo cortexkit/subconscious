@@ -2294,7 +2294,15 @@ where
         .unwrap();
     stream.flush().await.unwrap();
     let response = read_frame_timeout(stream).await;
-    assert_eq!(response.header.ty, FrameType::Response);
+    // Show the daemon's error body on a mismatch: a bare "left: Error, right:
+    // Response" says a control call failed but not which check refused it.
+    assert_eq!(
+        response.header.ty,
+        FrameType::Response,
+        "control request {request} answered {:?}: {}",
+        response.header.ty,
+        String::from_utf8_lossy(&response.body)
+    );
     assert_eq!(response.header.channel, 0);
     assert_eq!(response.header.corr, corr);
     serde_json::from_slice(&response.body).unwrap()

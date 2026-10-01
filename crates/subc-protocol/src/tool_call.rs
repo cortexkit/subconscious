@@ -18,6 +18,41 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::Principal;
+
+/// Who really asked for a call that another module relays.
+///
+/// When a module forwards a tool call on behalf of a different caller, the
+/// provider sees the forwarding module as the route's principal and the
+/// forwarder's own `call_key`. This records the caller behind it, so the
+/// provider can attribute the call in its logs and ledgers.
+///
+/// It is a claim made by the forwarding module, not something the daemon
+/// checks: a provider may record it but must never grant or refuse anything
+/// because of it. Authority stays with the route's own principal.
+///
+/// `#[non_exhaustive]` so a later member is an additive change; build it with
+/// [`CallOrigin::new`].
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
+pub struct CallOrigin {
+    /// The original caller, in the same form the daemon stamps on a route.
+    pub carrier: Principal,
+    /// The original caller's key for the call, with the same bounds as
+    /// [`ToolCallRequest::call_key`]; check it with [`validate_call_origin`].
+    pub call_key: String,
+}
+
+impl CallOrigin {
+    /// An origin naming `carrier` as the caller and `call_key` as its key.
+    pub fn new(carrier: Principal, call_key: impl Into<String>) -> Self {
+        Self {
+            carrier,
+            call_key: call_key.into(),
+        }
+    }
+}
+
 /// A tool invocation as carried on a route `REQUEST` frame.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 pub struct ToolCallRequest {
@@ -66,11 +101,17 @@ pub struct ToolCallRequest {
     /// [`SCHEMA_PIN_FIELD`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema_pin: Option<String>,
+    /// The caller behind this call when the consumer is relaying it for
+    /// someone else; `None` when the consumer is the caller. For attribution
+    /// only, never authority: see [`CallOrigin`]. A provider checks it with
+    /// [`validate_call_origin`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<CallOrigin>,
 }
 
 impl ToolCallRequest {
-    /// A call with no consumer id, no progress token, no call key and no
-    /// schema pin — the shape older two-field consumers send.
+    /// A call with no consumer id, no progress token, no call key, no schema
+    /// pin and no origin — the shape older two-field consumers send.
     pub fn new(name: impl Into<String>, arguments: Value) -> Self {
         Self {
             name: name.into(),
@@ -79,6 +120,7 @@ impl ToolCallRequest {
             progress_token: None,
             call_key: None,
             schema_pin: None,
+            origin: None,
         }
     }
 }
@@ -90,6 +132,10 @@ pub const CALL_KEY_FIELD: &str = "call_key";
 /// The wire name of [`ToolCallRequest::schema_pin`], for the `field` of the
 /// `invalid_request` error a provider returns when the pin is malformed.
 pub const SCHEMA_PIN_FIELD: &str = "schema_pin";
+
+/// The wire path of [`CallOrigin::call_key`] inside a request, for the `field`
+/// of the `invalid_request` error a provider returns when it is malformed.
+pub const ORIGIN_CALL_KEY_FIELD: &str = "origin.call_key";
 
 /// The longest opaque token field accepted, in bytes (every accepted byte is
 /// one ASCII character). Shared by `call_key` and `schema_pin`.
@@ -189,6 +235,13 @@ pub fn validate_schema_pin(pin: &str) -> Result<(), OpaqueFieldError> {
     validate_opaque_field(SCHEMA_PIN_FIELD, pin)
 }
 
+/// Check a [`CallOrigin`]: its `call_key` must pass the shared opaque-field
+/// rule, and errors name [`ORIGIN_CALL_KEY_FIELD`]. Every [`Principal`] is
+/// accepted as the carrier.
+pub fn validate_call_origin(origin: &CallOrigin) -> Result<(), OpaqueFieldError> {
+    validate_opaque_field(ORIGIN_CALL_KEY_FIELD, &origin.call_key)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -203,6 +256,7 @@ mod tests {
         assert_eq!(request.progress_token, None);
         assert_eq!(request.call_key, None);
         assert_eq!(request.schema_pin, None);
+        assert_eq!(request.origin, None);
     }
 
     #[test]
@@ -214,6 +268,7 @@ mod tests {
             progress_token: None,
             call_key: Some("run-7:call-3".to_string()),
             schema_pin: None,
+            origin: None,
         };
         let encoded = serde_json::to_value(&request).expect("encode");
         assert_eq!(
@@ -309,6 +364,7 @@ mod tests {
             progress_token: None,
             call_key: None,
             schema_pin: None,
+            origin: None,
         };
         let encoded = serde_json::to_value(&request).expect("encode");
         assert_eq!(encoded["tool_call_id"], json!("wal-intent-42"));
@@ -327,5 +383,111 @@ mod tests {
         }))
         .expect("unknown members are tolerated");
         assert_eq!(request.name, "grep");
+    }
+
+    fn relayed_origin() -> CallOrigin {
+        CallOrigin::new(
+            Principal::Reserved {
+                module_id: "broca".to_string(),
+            },
+            "broca:run-7/call-3",
+        )
+    }
+
+    /// The carrier travels as the tagged `Principal` object the daemon stamps
+    /// on a route, never as a bare string.
+    #[test]
+    fn origin_round_trips_as_a_top_level_member_with_a_tagged_carrier() {
+        let request = ToolCallRequest {
+            call_key: Some("pf:relay/991".to_string()),
+            origin: Some(relayed_origin()),
+            ..ToolCallRequest::new("grep", json!({ "q": "x" }))
+        };
+        let encoded = serde_json::to_value(&request).expect("encode");
+        assert_eq!(
+            encoded,
+            json!({
+                "name": "grep",
+                "arguments": { "q": "x" },
+                "call_key": "pf:relay/991",
+                "origin": {
+                    "carrier": { "kind": "reserved", "module_id": "broca" },
+                    "call_key": "broca:run-7/call-3"
+                }
+            })
+        );
+        let decoded: ToolCallRequest = serde_json::from_value(encoded).expect("decode");
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn a_request_without_an_origin_omits_the_member_and_decodes_as_none() {
+        let request = ToolCallRequest::new("grep", json!({}));
+        let encoded = serde_json::to_value(&request).expect("encode");
+        assert!(encoded.get("origin").is_none(), "{encoded}");
+        let decoded: ToolCallRequest = serde_json::from_value(encoded).expect("decode");
+        assert_eq!(decoded.origin, None);
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn a_request_with_an_origin_and_an_unknown_member_still_decodes() {
+        let request: ToolCallRequest = serde_json::from_value(json!({
+            "name": "grep",
+            "arguments": {},
+            "origin": {
+                "carrier": { "kind": "direct" },
+                "call_key": "k",
+                "some_future_origin_key": 1
+            },
+            "some_future_key": { "nested": true }
+        }))
+        .expect("unknown members are tolerated");
+        assert_eq!(
+            request.origin,
+            Some(CallOrigin::new(Principal::Direct, "k"))
+        );
+    }
+
+    #[test]
+    fn call_origin_key_refusals_name_the_origin_call_key_field() {
+        let carrier = Principal::Direct;
+        let field = ORIGIN_CALL_KEY_FIELD;
+        assert_eq!(field, "origin.call_key");
+        let cases = [
+            (String::new(), OpaqueFieldError::Empty { field }),
+            (
+                "k".repeat(257),
+                OpaqueFieldError::TooLong { field, length: 257 },
+            ),
+            (
+                "pf:relay 991".to_string(),
+                OpaqueFieldError::InvalidCharacter { field, index: 8 },
+            ),
+        ];
+        for (key, expected) in cases {
+            let error = validate_call_origin(&CallOrigin::new(carrier.clone(), key.clone()))
+                .expect_err("malformed origin key is refused");
+            assert_eq!(error, expected, "{key:?}");
+            assert_eq!(error.field(), "origin.call_key", "{key:?}");
+        }
+    }
+
+    #[test]
+    fn call_origin_accepts_every_carrier_kind() {
+        let carriers = [
+            Principal::Reserved {
+                module_id: "prefrontal-core".to_string(),
+            },
+            Principal::Direct,
+            Principal::Unverified,
+        ];
+        for carrier in carriers {
+            assert_eq!(
+                validate_call_origin(&CallOrigin::new(carrier.clone(), "pf:relay/991")),
+                Ok(()),
+                "{carrier:?}"
+            );
+        }
     }
 }

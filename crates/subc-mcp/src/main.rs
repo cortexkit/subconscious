@@ -4589,6 +4589,9 @@ fn route_tool_call_request(
         // Nor a schema pin: the gateway does not know which schema version
         // the host built the arguments against.
         schema_pin: None,
+        // Nor an origin: the gateway is not relaying for another caller; the
+        // host it serves is the caller.
+        origin: None,
     })
 }
 

@@ -65,6 +65,7 @@ fn protocol_wire_shapes_match_golden_json_and_round_trip() {
             progress_token: None,
             call_key: None,
             schema_pin: None,
+            origin: None,
         },
     );
     assert_golden(
@@ -76,7 +77,24 @@ fn protocol_wire_shapes_match_golden_json_and_round_trip() {
             progress_token: Some(serde_json::json!("pt-7")),
             call_key: None,
             schema_pin: None,
+            origin: None,
         },
+    );
+    // A call relayed for another caller: the relay's own key, and the caller
+    // behind it with the carrier as a tagged principal object.
+    assert_golden("tool_call_request_with_origin", &relayed_tool_call(true));
+    // The same call with no origin: the member must be absent, not null.
+    assert_golden(
+        "tool_call_request_without_origin",
+        &relayed_tool_call(false),
+    );
+    let without_origin: Value = serde_json::from_str(
+        &fs::read_to_string(golden_path("tool_call_request_without_origin")).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        without_origin.get("origin").is_none(),
+        "an absent origin is omitted: {without_origin}"
     );
     assert_golden("error_body", &error_body());
     assert_golden("error_body_with_detail", &error_body_with_detail());
@@ -860,6 +878,25 @@ fn error_body_capability_forbidden() -> ErrorBody {
         "capability_forbidden",
         "module_id 'runner' must never reach capability 'credentials-provider/v1' provided by 'vault'",
     )
+}
+
+fn relayed_tool_call(with_origin: bool) -> subc_protocol::tool_call::ToolCallRequest {
+    subc_protocol::tool_call::ToolCallRequest {
+        name: "edit".to_string(),
+        arguments: serde_json::json!({ "path": "a.rs" }),
+        tool_call_id: None,
+        progress_token: None,
+        call_key: Some("pf:relay/991".to_string()),
+        schema_pin: None,
+        origin: with_origin.then(|| {
+            subc_protocol::tool_call::CallOrigin::new(
+                Principal::Reserved {
+                    module_id: "broca".to_string(),
+                },
+                "broca:run-7/call-3",
+            )
+        }),
+    }
 }
 
 fn principal_reserved() -> Principal {

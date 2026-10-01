@@ -1,0 +1,14 @@
+{
+  "arguments": {
+    "path": "a.rs"
+  },
+  "call_key": "pf:relay/991",
+  "name": "edit",
+  "origin": {
+    "call_key": "broca:run-7/call-3",
+    "carrier": {
+      "kind": "reserved",
+      "module_id": "broca"
+    }
+  }
+}

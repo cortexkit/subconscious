@@ -475,26 +475,36 @@ public actor SubcFedClient {
             var ownershipBlocked = false
             for id in ids {
                 guard let candidate = profile.candidate(id: id) else { continue }
-                if case .lanDirect(let lan) = candidate {
-                    if let reason = FedLANCandidateHygiene.classifyIPv4String(
+                let hygieneRejection: CandidateRejectionReason?
+                switch candidate {
+                case .lanDirect(let lan):
+                    hygieneRejection = FedLANCandidateHygiene.classifyIPv4String(
                         lan.host,
                         peerVerified: profile.isVerified,
                         snapshot: snapshot
-                    ) {
-                        let failure = CandidateFailure(
-                            candidateID: id,
-                            stage: .carrierConnect,
-                            reason: .rejected(reason)
-                        )
-                        hygieneFailures.append(failure)
-                        planner.noteFailure(
-                            candidateID: id,
-                            candidateClass: .lanDirect,
-                            failure: failure,
-                            facts: suppressionFacts(for: candidate, snapshot: snapshot, profile: profile)
-                        )
-                        continue
-                    }
+                    )
+                case .publicDirect(let publicDirect):
+                    hygieneRejection = FedPublicCandidateHygiene.classify(
+                        host: publicDirect.host,
+                        peerVerified: profile.isVerified
+                    )
+                case .relay:
+                    hygieneRejection = nil
+                }
+                if let reason = hygieneRejection {
+                    let failure = CandidateFailure(
+                        candidateID: id,
+                        stage: .carrierConnect,
+                        reason: .rejected(reason)
+                    )
+                    hygieneFailures.append(failure)
+                    planner.noteFailure(
+                        candidateID: id,
+                        candidateClass: candidate.candidateClass,
+                        failure: failure,
+                        facts: suppressionFacts(for: candidate, snapshot: snapshot, profile: profile)
+                    )
+                    continue
                 }
                 let role = FedDialOwnership.initiationRole(
                     for: candidate.candidateClass,
@@ -510,7 +520,8 @@ public actor SubcFedClient {
                     actionable = true
                 case (.responder, .relay):
                     actionable = true
-                case (.responder, .lanDirect):
+                case (.responder, .lanDirect), (.responder, .publicDirect):
+                    // Direct candidates keep the single-dialer rule.
                     actionable = false
                 }
                 if !actionable {
@@ -1023,6 +1034,19 @@ public actor SubcFedClient {
                 endpointDigest: FedSuppressionFactDigest.digest(string: "\(lan.host):\(lan.port)"),
                 materialDigest: FedSuppressionFactDigest.digest(material),
                 networkSnapshotDigest: snapshot.digest
+            )
+        case .publicDirect(let publicDirect):
+            // Public-direct eligibility does not depend on the observed local
+            // subnets, so a network change alone does not lift its suppression.
+            var material = Data(publicDirect.host.utf8)
+            material.append(contentsOf: withUnsafeBytes(of: publicDirect.port.bigEndian) { Data($0) })
+            material.append(profile.isVerified ? 1 : 0)
+            return FedSuppressionFactDigest(
+                candidateClass: .publicDirect,
+                endpointDigest: FedSuppressionFactDigest.digest(
+                    string: "\(publicDirect.host):\(publicDirect.port)"),
+                materialDigest: FedSuppressionFactDigest.digest(material),
+                networkSnapshotDigest: nil
             )
         case .relay(let relay):
             var material = Data(relay.relayURL.absoluteString.utf8)

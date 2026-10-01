@@ -12,6 +12,9 @@ public enum FedCandidateStage: String, Codable, Sendable, Equatable {
 }
 
 public enum CandidateRejectionReason: String, Codable, Sendable, Equatable {
+    /// A direct candidate (LAN-direct or public-direct) was offered for a peer
+    /// whose profile is not verified. The name predates public-direct; it is
+    /// kept so embeddings that switch over this enum need no new case.
     case unverifiedPeerLAN
     case missingObservedPrivateSubnet
     case invalidAddress

@@ -194,6 +194,68 @@ final class NetworkDialFactoryTests: XCTestCase {
         XCTAssertEqual(endpoint?.port, 4433)
     }
 
+    // MARK: - Public-direct
+
+    func testPublicDirectNonGlobalHostIsRefusedWithoutConnecting() async throws {
+        let connectCount = CallCounter()
+        let factory = FedNetworkDialFactory(connect: { _, _ in
+            await connectCount.increment()
+            throw FedFailure.disconnected
+        })
+        let cases: [(String, CandidateRejectionReason)] = [
+            ("10.0.0.1", .addressClassNotAllowed),
+            ("::ffff:127.0.0.1", .addressClassNotAllowed),
+            ("example.com", .invalidAddress),
+        ]
+        for (host, expected) in cases {
+            let candidate = FedPeerCandidate.publicDirect(
+                try FedPublicDirectCandidate(candidateID: "pub-1", host: host, port: 7841)
+            )
+            do {
+                _ = try await factory.dial(candidate: candidate, context: try makeContext(role: .initiator))
+                XCTFail("\(host) must be refused before connecting")
+            } catch let failure as FedFailure {
+                XCTAssertEqual(failure, .candidateRejected(reason: expected), host)
+            }
+        }
+        let calls = await connectCount.count
+        XCTAssertEqual(calls, 0, "a refused public-direct host must never open a socket")
+    }
+
+    func testPublicDirectResponderRoleIsRefusedWithoutConnecting() async throws {
+        let connectCount = CallCounter()
+        let factory = FedNetworkDialFactory(connect: { _, _ in
+            await connectCount.increment()
+            throw FedFailure.disconnected
+        })
+        let candidate = FedPeerCandidate.publicDirect(
+            try FedPublicDirectCandidate(candidateID: "pub-1", host: "79.152.99.84", port: 7841)
+        )
+        do {
+            _ = try await factory.dial(candidate: candidate, context: try makeContext(role: .responder))
+            XCTFail("a direct candidate this side does not initiate must be refused")
+        } catch let failure as FedFailure {
+            XCTAssertEqual(failure, .notDialOwner)
+        }
+        let calls = await connectCount.count
+        XCTAssertEqual(calls, 0)
+    }
+
+    func testPublicDirectGlobalHostTakesTheDirectConnectPath() async throws {
+        let recorded = EndpointRecorder()
+        let factory = FedNetworkDialFactory(connect: { host, port in
+            await recorded.record(host: host, port: port)
+            throw FedFailure.disconnected
+        })
+        let candidate = FedPeerCandidate.publicDirect(
+            try FedPublicDirectCandidate(candidateID: "pub-1", host: "79.152.99.84", port: 7841)
+        )
+        _ = try? await factory.dial(candidate: candidate, context: try makeContext(role: .initiator))
+        let endpoint = await recorded.endpoint
+        XCTAssertEqual(endpoint?.host, "79.152.99.84")
+        XCTAssertEqual(endpoint?.port, 7841)
+    }
+
     // MARK: - Responder daemon
 
     /// Speaks the daemon side of the protocol over one accepted connection:

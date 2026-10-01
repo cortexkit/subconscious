@@ -3,8 +3,8 @@ import Foundation
 import FoundationNetworking
 #endif
 
-/// Production dial factory for the direct TCP rungs (LAN-direct) and the relay
-/// pipe rung.
+/// Production dial factory for the direct TCP rungs (LAN-direct and
+/// public-direct) and the relay pipe rung.
 ///
 /// Wiring per candidate: open the carrier (TCP byte stream for direct; the relay
 /// pipe WebSocket for relay, bounded by the carrierConnect / webSocketUpgrade
@@ -80,6 +80,20 @@ public struct FedNetworkDialFactory: FedCandidateDialFactory {
                 throw FedFailure.notDialOwner
             }
             return try await dialDirect(host: lanCandidate.host, port: lanCandidate.port, context: context)
+        case .publicDirect(let publicCandidate):
+            // Same single-dialer rule as LAN-direct.
+            guard context.initiationRole == .initiator else {
+                throw FedFailure.notDialOwner
+            }
+            // The client already ran the full public-direct hygiene (including
+            // peer verification) before choosing this candidate. The address
+            // check is repeated here because this factory is public and can be
+            // driven directly: a non-global or non-literal host must never reach
+            // the socket.
+            if let reason = FedPublicCandidateHygiene.addressRejection(host: publicCandidate.host) {
+                throw FedFailure.candidateRejected(reason: reason)
+            }
+            return try await dialDirect(host: publicCandidate.host, port: publicCandidate.port, context: context)
         case .relay(let relayCandidate):
             // Both initiator (opened) and responder (redeemed) dial the granted
             // pipe; the carrier PoP authenticates this side either way.

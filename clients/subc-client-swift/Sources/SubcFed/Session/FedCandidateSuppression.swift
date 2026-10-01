@@ -3,7 +3,20 @@ import CryptoKit
 
 public enum FedCandidateClass: String, Sendable, Equatable, Codable {
     case lanDirect
+    /// Direct TCP to a globally routable IP literal the embedding supplies
+    /// (for example a UPnP-published address it has already probed).
+    case publicDirect
     case relay
+
+    /// The dial-ladder rung a session connected through a candidate of this
+    /// class is reported on.
+    public var connectedRung: FedConnectedRung {
+        switch self {
+        case .lanDirect: return .lanDirect
+        case .publicDirect: return .publicDirect
+        case .relay: return .relay
+        }
+    }
 }
 
 /// Digest of only the facts relevant to a suppression decision. Secret bytes are

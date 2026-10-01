@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.23.5 — 2026-10-01
+
+- `ModuleHandle::scope_sync(generation, scopes)` registers the module's full scope set
+  (`scope.sync`) and returns a `ScopeSyncReply` (`generation`, per-record `results` in request
+  order, `ended`). `ModuleHandle::scope_describe(owner, scope_ref)` reads one scope's state
+  (`scope.describe`) and returns a `ScopeDescribeReply` with every field of the daemon's answer
+  (`status`, `scope_epoch`, `daemon_incarnation`, `owner_synced`, `owner_configured`, `scope`).
+  Both reply structs are `#[non_exhaustive]`. Each call is gated on its own op in the
+  HELLO_ACK's `subc_ops` and fails with `ScopeCallError::NotSupported` without sending anything
+  when the daemon does not list it.
+- New `ScopeCallError`. A daemon refusal is `Refused { code, message }` with the code exactly as
+  sent, so callers match it against `subc_protocol::error_codes` (`SCOPE_SYNC_STALE`,
+  `SCOPE_SYNC_NOT_AUTHORITY`, ...); `ScopeCallError::code()` returns it. A reply for a different
+  op is `Protocol`.
+- New `scope-owner` example: a supervised module that runs scope syncs and describes from a
+  script, used by the real-daemon tests because only a daemon-launched module holds sync
+  authority.
+
 ## 0.23.4 — 2026-09-30
 
 - `ModuleHandler::on_draining(reason, deadline)` delivers the daemon's `module.draining` notice,

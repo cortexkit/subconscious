@@ -19,8 +19,8 @@ use subc_client_rs::{
     async_trait, serve_with_handle, CallError, CallOptions, CatalogUpdateError, CloseRouteOptions,
     ConsumerIdentity, ConsumerOptions, HandlerOutcome, ModuleHandle, ModuleHandler,
     PolicyResolveError, PolicyResolver, PolicyResolverConfig, PolicyVerdict, ProjectRef,
-    RequestCtx, RetryBackoff, RouteCloseDisposition, RouteHandle, ScopeSelector, SubcConsumer,
-    SubcModuleError, Subject, SubscribeOptions,
+    RequestCtx, RetryBackoff, RouteCloseDisposition, RouteHandle, ScopeCallError,
+    ScopeDescribeReply, ScopeSelector, SubcConsumer, SubcModuleError, Subject, SubscribeOptions,
 };
 use subc_control::{ClientControlRequest, ClientControlResponse};
 use subc_protocol::{
@@ -29,6 +29,7 @@ use subc_protocol::{
         IdentityScope, ManagementOperation, ManagementOperationKind, ModuleManifest, ProviderRole,
         Tool,
     },
+    scope::ScopeStatus,
     session::HealthStatus,
     BindIdentity, ErrorBody, Flags, Frame, FrameType, Principal, Priority, RouteTarget,
 };
@@ -4069,4 +4070,289 @@ async fn a_busy_gauge_released_after_on_draining_holds_the_restart_drain_until_i
         closed.body
     );
     daemon.kill_and_wait();
+}
+
+// scope.sync and scope.describe through the SDK's ModuleHandle, against a
+// real daemon.
+//
+// The daemon gives sync authority only to a module it launched itself, so the
+// owner is the `scope-owner` example (crates/subc-client-rs/examples), run
+// under the daemon's supervision: it calls `ModuleHandle::scope_sync` and
+// `scope_describe` for each step of a script and records each reply, or the
+// daemon's refusal code read from `ScopeCallError::Refused`, as a JSON line.
+// The second module, which reads the owner's scopes, is served from this
+// process, so its replies are checked here as typed values.
+
+const SDK_SCOPE_OWNER: &str = "subc-client-rs-sdk-scope-owner";
+const SDK_SCOPE_READER: &str = "subc-client-rs-sdk-scope-reader";
+
+struct ScopeOwnerRun {
+    daemon: LiveDaemon,
+    _temp_dir: TestTempDir,
+    /// One entry per script step, in order: `{"ok": reply}`,
+    /// `{"refused": {"code", "message"}}`, or `{"other": error}`.
+    results: Vec<Value>,
+}
+
+impl ScopeOwnerRun {
+    /// A module served from this test process, which never holds sync
+    /// authority.
+    async fn reader(
+        &self,
+    ) -> (
+        ModuleHandle,
+        tokio::task::JoinHandle<Result<(), SubcModuleError>>,
+    ) {
+        let reader = spawn_inline_module(
+            &self.daemon.connection_file,
+            inline_module_manifest(SDK_SCOPE_READER, &["a"]),
+        )
+        .await;
+        wait_for_catalog_module(
+            &self.daemon.connection_file,
+            SDK_SCOPE_READER,
+            START_TIMEOUT,
+        )
+        .await;
+        reader
+    }
+}
+
+/// Start a daemon that supervises the `scope-owner` example with `steps` as
+/// its script, and wait until it has run every step.
+async fn run_scope_owner(steps: Value) -> ScopeOwnerRun {
+    let workspace = workspace_root();
+    let daemon_bin = ensure_binary(
+        &workspace,
+        binary_path(&workspace, "ck-subc"),
+        &["build", "-p", "subc-core", "--bins"],
+    );
+    let owner_bin = ensure_binary(
+        &workspace,
+        example_path(&workspace, "scope-owner"),
+        &["build", "-p", "subc-client-rs", "--example", "scope-owner"],
+    );
+
+    let temp_dir = unique_temp_dir("subc-client-rs-sdk-scopes");
+    let runtime_dir = temp_dir.join("runtime");
+    let config_dir = temp_dir.join("config");
+    let script_path = temp_dir.join("owner-script.json");
+    let results_path = temp_dir.join("owner-results.jsonl");
+    fs::create_dir_all(&runtime_dir).unwrap();
+    fs::create_dir_all(config_dir.join("cortexkit")).unwrap();
+    fs::write(&script_path, serde_json::to_vec(&steps).unwrap()).unwrap();
+    let env = BTreeMap::from([
+        (
+            "SUBC_SCOPE_OWNER_SCRIPT".to_string(),
+            script_path.to_string_lossy().into_owned(),
+        ),
+        (
+            "SUBC_SCOPE_OWNER_RESULTS".to_string(),
+            results_path.to_string_lossy().into_owned(),
+        ),
+    ]);
+    fs::write(
+        config_dir.join("cortexkit").join("subc.jsonc"),
+        serde_json::to_string_pretty(&json!({
+            "version": 1,
+            "modules": {
+                SDK_SCOPE_OWNER: {
+                    "program": owner_bin.to_string_lossy(),
+                    "args": [],
+                    "env": env,
+                    "enabled": true,
+                    "reserved": true,
+                }
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let daemon = spawn_daemon(&daemon_bin, &runtime_dir, &config_dir);
+    wait_for_connection_file(&daemon.connection_file, START_TIMEOUT).await;
+    wait_for_event(&results_path, START_TIMEOUT, |event| event["done"] == true).await;
+    let mut results = vec![Value::Null; steps.as_array().unwrap().len()];
+    for event in read_events(&results_path) {
+        if let Some(step) = event["step"].as_u64() {
+            let slot = &mut results[usize::try_from(step).unwrap()];
+            // The first run of the script is the one that counts; a restarted
+            // owner would run it again under a new connection.
+            if slot.is_null() {
+                *slot = event["result"].clone();
+            }
+        }
+    }
+    ScopeOwnerRun {
+        daemon,
+        _temp_dir: temp_dir,
+        results,
+    }
+}
+
+fn sdk_scope_owner() -> Principal {
+    Principal::Reserved {
+        module_id: SDK_SCOPE_OWNER.to_string(),
+    }
+}
+
+fn sync_step(generation: u64, scopes: Value) -> Value {
+    json!({ "op": "sync", "generation": generation, "scopes": scopes })
+}
+
+fn describe_step(owner: &Principal, scope_ref: &str) -> Value {
+    json!({ "op": "describe", "owner": owner, "ref": scope_ref })
+}
+
+fn head_scope(scope_ref: &str, scope_epoch: u64) -> Value {
+    json!({ "ref": scope_ref, "scope_epoch": scope_epoch, "kind": "head" })
+}
+
+/// The JSON the `scope-owner` example records for a describe reply, so a
+/// reply read here can be compared with one the owner read.
+fn describe_reply_json(reply: &ScopeDescribeReply) -> Value {
+    json!({
+        "status": reply.status,
+        "scope_epoch": reply.scope_epoch,
+        "daemon_incarnation": reply.daemon_incarnation,
+        "owner_synced": reply.owner_synced,
+        "owner_configured": reply.owner_configured,
+        "scope": reply.scope,
+    })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_owner_syncs_a_scope_and_both_it_and_another_module_describe_it_live() {
+    let mut run = run_scope_owner(json!([
+        sync_step(1, json!([head_scope("session-a", 3)])),
+        describe_step(&sdk_scope_owner(), "session-a"),
+    ]))
+    .await;
+
+    let sync = &run.results[0]["ok"];
+    assert_eq!(sync["generation"], 1, "{:?}", run.results);
+    assert_eq!(sync["results"].as_array().unwrap().len(), 1, "{sync}");
+    assert_eq!(sync["results"][0]["ref"], "session-a");
+    assert_eq!(sync["results"][0]["scope_epoch"], 3);
+    assert_eq!(sync["results"][0]["outcome"], "created");
+    assert_eq!(sync["ended"], json!([]));
+
+    let owner_view = &run.results[1]["ok"];
+    assert_eq!(owner_view["status"], "live", "{:?}", run.results);
+    assert_eq!(owner_view["scope_epoch"], 3);
+    assert_eq!(owner_view["owner_synced"], true);
+    assert_eq!(owner_view["owner_configured"], true);
+    assert_eq!(owner_view["scope"]["owner"], json!(sdk_scope_owner()));
+    assert_eq!(owner_view["scope"]["ref"], "session-a");
+    assert_eq!(owner_view["scope"]["scope_epoch"], 3);
+    assert_eq!(owner_view["scope"]["kind"], "head");
+
+    let (reader, serve_task) = run.reader().await;
+    let reader_view = reader
+        .scope_describe(sdk_scope_owner(), "session-a".to_string())
+        .await
+        .unwrap();
+    assert_eq!(reader_view.status, ScopeStatus::Live);
+    assert_eq!(reader_view.scope_epoch, Some(3));
+    assert_eq!(
+        reader_view.scope.as_ref().map(|stamp| stamp.scope_epoch),
+        Some(3)
+    );
+    assert_eq!(
+        &describe_reply_json(&reader_view),
+        owner_view,
+        "a module that is not the owner reads the same answer"
+    );
+
+    run.daemon.kill_and_wait();
+    assert!(serve_task.await.unwrap().is_ok());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refused_scope_sync_carries_the_daemons_typed_code() {
+    let mut run = run_scope_owner(json!([
+        sync_step(5, json!([head_scope("session-a", 1)])),
+        // Generation 5 again, not larger than the last accepted one: refused.
+        sync_step(5, json!([head_scope("session-a", 2)])),
+        // Generation 4 is smaller still. Had it applied, its empty set would
+        // have ended session-a.
+        sync_step(4, json!([])),
+        describe_step(&sdk_scope_owner(), "session-a"),
+    ]))
+    .await;
+
+    assert_eq!(run.results[0]["ok"]["generation"], 5, "{:?}", run.results);
+    for step in [1, 2] {
+        assert_eq!(
+            run.results[step]["refused"]["code"],
+            subc_protocol::error_codes::SCOPE_SYNC_STALE,
+            "step {step}: {:?}",
+            run.results
+        );
+    }
+    let after = &run.results[3]["ok"];
+    assert_eq!(after["status"], "live", "a refused sync changes nothing");
+    assert_eq!(after["scope_epoch"], 1);
+
+    // A module the daemon did not launch has no sync authority; the refusal
+    // reaches this caller with the code as the typed value.
+    let (reader, serve_task) = run.reader().await;
+    let error = reader
+        .scope_sync(1, vec![serde_json::from_value(head_scope("x", 1)).unwrap()])
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            ScopeCallError::Refused { code, .. }
+                if code == subc_protocol::error_codes::SCOPE_SYNC_NOT_AUTHORITY
+        ),
+        "{error:?}"
+    );
+    assert_eq!(
+        error.code(),
+        Some(subc_protocol::error_codes::SCOPE_SYNC_NOT_AUTHORITY)
+    );
+
+    run.daemon.kill_and_wait();
+    assert!(serve_task.await.unwrap().is_ok());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn describing_an_unknown_ref_answers_not_live_with_the_owners_state() {
+    let mut run = run_scope_owner(json!([
+        sync_step(1, json!([head_scope("session-a", 1)])),
+        describe_step(&sdk_scope_owner(), "never-synced"),
+    ]))
+    .await;
+
+    // The owner has synced in this daemon incarnation and is configured, so a
+    // ref it never synced is `not_live` with both flags set: a reader treats it
+    // as gone, not as waiting for the owner to re-sync after a restart.
+    let owner_view = &run.results[1]["ok"];
+    assert_eq!(owner_view["status"], "not_live", "{:?}", run.results);
+    assert_eq!(owner_view["scope_epoch"], Value::Null);
+    assert_eq!(owner_view["owner_synced"], true);
+    assert_eq!(owner_view["owner_configured"], true);
+    assert_eq!(owner_view["scope"], Value::Null);
+
+    // An owner the daemon does not supervise has neither synced nor ever will.
+    let (reader, serve_task) = run.reader().await;
+    let unknown_owner = reader
+        .scope_describe(
+            Principal::Reserved {
+                module_id: "subc-client-rs-no-such-owner".to_string(),
+            },
+            "session-a".to_string(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unknown_owner.status, ScopeStatus::NotLive);
+    assert_eq!(unknown_owner.scope_epoch, None);
+    assert!(!unknown_owner.owner_synced);
+    assert!(!unknown_owner.owner_configured);
+    assert_eq!(unknown_owner.scope, None);
+
+    run.daemon.kill_and_wait();
+    assert!(serve_task.await.unwrap().is_ok());
 }

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.23.6 — 2026-10-01
+
+- Builds warning-free on Rust 1.99, where `AtomicU64::fetch_update` is deprecated. The two
+  counters now use `try_update`, which takes the same arguments, so a consumer running clippy with
+  `-D warnings` on Rust 1.99 no longer gets a deprecation error from this crate. The crate
+  therefore needs Rust 1.99 or newer, declared as `rust-version`.
+
 ## 0.23.5 — 2026-10-01
 
 - `ModuleHandle::scope_sync(generation, scopes)` registers the module's full scope set

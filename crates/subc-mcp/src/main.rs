@@ -1368,7 +1368,7 @@ impl SubcConnection {
         let pending = Arc::new(Mutex::new(HashMap::new()));
         let closed = Arc::new(AtomicBool::new(false));
         let connection_token = NEXT_CONNECTION_TOKEN
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |token| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |token| {
                 token.checked_add(1)
             })
             .expect("subc connection token space exhausted");
@@ -5911,7 +5911,7 @@ fn hex(bytes: &[u8]) -> String {
 
 fn allocate_corr(last_corr: &AtomicU64) -> Option<u64> {
     last_corr
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
             last.checked_add(1)
         })
         .ok()

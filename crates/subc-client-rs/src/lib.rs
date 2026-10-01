@@ -1357,7 +1357,7 @@ where
     handler.on_hello_ack(&ack).await;
 
     let connection_token = NEXT_MODULE_CONNECTION_TOKEN
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |token| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |token| {
             token.checked_add(1)
         })
         .map_err(|_| SubcModuleError::ConnectionTokenExhausted)?;

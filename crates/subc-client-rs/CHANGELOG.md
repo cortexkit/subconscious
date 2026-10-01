@@ -1,11 +1,17 @@
 # Changelog
 
+## 0.23.7 — 2026-10-01
+
+- Builds again on toolchains older than Rust 1.99. 0.23.6 replaced the deprecated
+  `AtomicU64::fetch_update` with `try_update` and declared `rust-version = "1.99"`, because
+  `try_update` does not exist before 1.99. The two counters now use a compare-exchange loop, which
+  builds on every toolchain and is warning-free on 1.99, and the `rust-version` declaration is gone.
+
 ## 0.23.6 — 2026-10-01
 
-- Builds warning-free on Rust 1.99, where `AtomicU64::fetch_update` is deprecated. The two
-  counters now use a compare-exchange loop instead, because the replacement `try_update` does not
-  exist before 1.99; the crate still builds on older toolchains. A consumer running clippy with
-  `-D warnings` on Rust 1.99 no longer gets a deprecation error from this crate.
+- Builds warning-free on Rust 1.99, where `AtomicU64::fetch_update` is deprecated: the two counters
+  use `try_update` instead. This release requires Rust 1.99 (`rust-version = "1.99"`); 0.23.7 lifts
+  that requirement.
 
 ## 0.23.5 — 2026-10-01
 

@@ -1811,7 +1811,7 @@ dependencies = [
 
 [[package]]
 name = "subc-client-rs"
-version = "0.23.6"
+version = "0.23.7"
 dependencies = [
  "async-trait",
  "serde",
@@ -1923,7 +1923,7 @@ dependencies = [
 
 [[package]]
 name = "subc-mcp"
-version = "0.1.17"
+version = "0.1.18"
 dependencies = [
  "cortexkit-log",
  "rmcp",

@@ -265,24 +265,6 @@ class FedStateStoreTests: XCTestCase {
         }
     }
 
-    func testStaleTemporaryFilesAreIgnoredOnReopen() async throws {
-        try XCTSkipIf(
-            Self.storeUnderTest == .sqlite,
-            "the file store's temp files; the SQLite store's leftover build file is covered by FedSQLiteStateStoreTests"
-        )
-        let dir = try temporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: dir) }
-        let store1 = Self.storeUnderTest.durableStore(in: dir)
-        let first = try await store1.open(localPublicKey: localKey)
-        // Leave an incomplete temp file that must never be treated as committed.
-        let temp = dir.appendingPathComponent("fed-state.incomplete.tmp")
-        try Data(#"{"corrupt":true}"#.utf8).write(to: temp)
-
-        let store2 = Self.storeUnderTest.durableStore(in: dir)
-        let second = try await store2.open(localPublicKey: localKey)
-        XCTAssertEqual(second.document.global.localIncarnation, first.document.global.localIncarnation)
-        XCTAssertFalse(FileManager.default.fileExists(atPath: temp.path))
-    }
 
     func testConcurrentWriterLockSerializesWithoutDuplicateSeq() async throws {
         let dir = try temporaryDirectory()
@@ -293,8 +275,8 @@ class FedStateStoreTests: XCTestCase {
         let writerB = Self.storeUnderTest.durableStore(in: dir)
         _ = try await writerB.open(localPublicKey: localKey)
 
-        // Exclusive lock reloads on-disk state per mutation, so both writers
-        // succeed serially with distinct sequences (never the same seq twice).
+        // SQLite serializes reservation transactions across connections, so
+        // successful reservations never hand out the same sequence.
         let a = try await writerA.reserveEffectSequence()
         let b = try await writerB.reserveEffectSequence()
         XCTAssertNotEqual(a.value, b.value)

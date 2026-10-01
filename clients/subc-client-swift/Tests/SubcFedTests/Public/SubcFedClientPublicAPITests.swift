@@ -196,7 +196,7 @@ final class SubcFedClientPublicAPITests: XCTestCase {
         let directory = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
         let localPublicKey = try FedPublicTestSupport.localPublicKey()
-        let stateStore = FedAtomicFileStateStore(directoryURL: directory)
+        let stateStore = FedSQLiteStateStore(directoryURL: directory)
         let dialCounter = DialCounter()
         let client = SubcFedClient(
             profile: try FedPublicTestSupport.humanProfile(),
@@ -214,7 +214,7 @@ final class SubcFedClientPublicAPITests: XCTestCase {
 
         try await client.acknowledgeReenrollment(enrollmentID: "enroll-2026-08")
 
-        let reopened = FedAtomicFileStateStore(directoryURL: directory)
+        let reopened = FedSQLiteStateStore(directoryURL: directory)
         let reopenedDocument = try await reopened.open(localPublicKey: localPublicKey).document
         let marker = try XCTUnwrap(reopenedDocument.reenrollmentAcknowledgment)
         XCTAssertEqual(marker.enrollmentID, "enroll-2026-08")

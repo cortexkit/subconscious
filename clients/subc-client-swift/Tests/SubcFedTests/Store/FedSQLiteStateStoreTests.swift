@@ -331,34 +331,34 @@ final class FedSQLiteStateStoreTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: leftover.path))
     }
 
-    // MARK: - Same behaviour as the file store
+    // MARK: - Memory oracle
 
-    /// Random operation sequences give the same documents, and the same
-    /// failures, in the SQLite store as in the file store. The file store's
-    /// initial snapshot is seeded directly into SQLite, so the incarnation
-    /// and every counter agree from the first step.
-    func testAgreesWithTheFileStoreOnRandomOperationSequences() async throws {
+    /// The memory store's initial snapshot is seeded into SQLite so both
+    /// execute identical operations with the same incarnation and counters.
+    /// Compare all state except revision: memory bumps it on sent/settlement
+    /// updates, while SQLite bumps it once per committed write. SQLite's own
+    /// revision progression is asserted separately.
+    func testAgreesWithTheMemoryStoreOnRandomOperationSequences() async throws {
         for seed: UInt64 in [1, 2, 3, 4, 5] {
             try await compareStores(seed: seed, steps: 60)
         }
     }
 
     private func compareStores(seed: UInt64, steps: Int) async throws {
-        let fileDir = try FedStoreUnderTest.temporaryDirectory(removedAfter: self)
         let sqliteDir = try FedStoreUnderTest.temporaryDirectory(removedAfter: self)
-        let file = FedAtomicFileStateStore(directoryURL: fileDir)
-        _ = try await file.open(localPublicKey: localKey)
-        try FedSQLiteTestSeed.write(try await file.snapshot(), in: sqliteDir)
+        let memory = FedMemoryStateStore()
+        _ = try await memory.open(localPublicKey: localKey)
+        try FedSQLiteTestSeed.write(try await memory.snapshot(), in: sqliteDir)
         let sqlite = FedSQLiteStateStore(directoryURL: sqliteDir)
         _ = try await sqlite.open(localPublicKey: localKey)
-        let fileStart = try await file.snapshot()
+        let memoryStart = try await memory.snapshot()
         let sqliteStart = try await sqlite.snapshot()
-        XCTAssertEqual(sqliteStart, fileStart, "seed \(seed): stores start apart")
+        XCTAssertEqual(sqliteStart, memoryStart, "seed \(seed): stores start apart")
 
         var random = SplitMix64(seed: seed)
         let responders = [responder, Data(repeating: 0x33, count: 32)]
         let epochs = ["epoch-a", "epoch-b"]
-        let incarnation = fileStart.global.localIncarnation
+        let incarnation = memoryStart.global.localIncarnation
         var minted: [(FedEffectID, Data)] = []
 
         for step in 0..<steps {
@@ -424,17 +424,28 @@ final class FedSQLiteStateStoreTests: XCTestCase {
                 }
             }
 
-            let fileOutcome = await outcome(of: operation, on: file)
+            let revisionBefore = try await sqlite.snapshot().revision
+            let memoryOutcome = await outcome(of: operation, on: memory)
             let sqliteOutcome = await outcome(of: operation, on: sqlite)
-            XCTAssertEqual(sqliteOutcome, fileOutcome, "seed \(seed) step \(step)")
-            if case .success(let label) = fileOutcome, label.hasPrefix("intent ") {
+            XCTAssertEqual(sqliteOutcome, memoryOutcome, "seed \(seed) step \(step)")
+            if case .success(let label) = memoryOutcome, label.hasPrefix("intent ") {
                 let seq = UInt64(label.dropFirst("intent ".count))!
                 minted.append((FedEffectID(incarnation: incarnation, seq: seq), target))
             }
-            let fileDocument = try await file.snapshot()
+            var memoryDocument = try await memory.snapshot()
             let sqliteDocument = try await sqlite.snapshot()
-            XCTAssertEqual(sqliteDocument, fileDocument, "seed \(seed) step \(step): \(fileOutcome)")
-            if sqliteDocument != fileDocument { return }
+            let committedWrites: UInt64
+            if case .success(let label) = sqliteOutcome {
+                // This oracle test uses separate reservation and intent calls,
+                // rather than the production combined transaction.
+                committedWrites = label.hasPrefix("intent ") ? 2 : (label == "no effect" || label.hasPrefix("sent ") ? 0 : 1)
+            } else {
+                committedWrites = 0
+            }
+            XCTAssertEqual(sqliteDocument.revision, revisionBefore + committedWrites, "seed \(seed) step \(step): revision")
+            memoryDocument.revision = sqliteDocument.revision
+            XCTAssertEqual(sqliteDocument, memoryDocument, "seed \(seed) step \(step): \(memoryOutcome)")
+            if sqliteDocument != memoryDocument { return }
         }
         XCTAssertGreaterThan(minted.count, 3, "seed \(seed): the sequence minted too few effects to compare")
     }

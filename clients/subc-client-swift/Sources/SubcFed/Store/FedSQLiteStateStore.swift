@@ -30,7 +30,9 @@ import SQLite3
 /// saved state; a missing database starts a fresh send log.
 public actor FedSQLiteStateStore: FedStateStore {
     public static let databaseFileName = "fed-state.sqlite"
-    public static let migratedDocumentFileName = "fed-state.json.migrated"
+    private static let documentFileName = "fed-state.json"
+    private static let migratedDocumentFileName = "fed-state.json.migrated"
+    private static let lockFileName = "fed-state.lock"
     /// A new database is built under this name and renamed into place only
     /// once it is complete, so `databaseFileName` existing always means a
     /// fully initialised database.
@@ -92,13 +94,11 @@ public actor FedSQLiteStateStore: FedStateStore {
     /// durable `sent` are handled identically: both are unsettled, reconnect
     /// asks the serving ledger about either and settles from its answer, and no
     /// reader tells the two phases apart. So the phase is kept here, shown in
-    /// every read from this instance, and folded into its next commit, exactly
-    /// as `FedAtomicFileStateStore` does.
+    /// every read from this instance, and folded into its next commit.
     private var sentNotYetDurable: [FedEffectID: String] = [:]
 
     /// Derives the store directory from an Application Support base URL and a
     /// stable identity namespace dedicated to one local X25519 public key.
-    /// Uses the same per-identity folder as `FedAtomicFileStateStore`.
     public init(applicationSupportBaseURL: URL, identityNamespace: String) throws {
         let trimmed = identityNamespace.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { throw FedFailure.storeUnavailable }
@@ -114,9 +114,9 @@ public actor FedSQLiteStateStore: FedStateStore {
         self.directoryURL = directoryURL
         self.databaseURL = directoryURL.appendingPathComponent(Self.databaseFileName)
         self.buildingURL = directoryURL.appendingPathComponent(Self.buildingFileName)
-        self.documentURL = directoryURL.appendingPathComponent(FedAtomicFileStateStore.documentFileName)
+        self.documentURL = directoryURL.appendingPathComponent(Self.documentFileName)
         self.migratedDocumentURL = directoryURL.appendingPathComponent(Self.migratedDocumentFileName)
-        self.lockURL = directoryURL.appendingPathComponent(FedAtomicFileStateStore.lockFileName)
+        self.lockURL = directoryURL.appendingPathComponent(Self.lockFileName)
         self.fileManager = .default
     }
 
@@ -335,7 +335,7 @@ public actor FedSQLiteStateStore: FedStateStore {
 
     /// Records the phase in memory only; see `sentNotYetDurable`. The effect is
     /// still checked against the database, so marking a missing or settled
-    /// effect fails as it does in the file store.
+    /// effect fails.
     public func markSent(effect: FedEffectID, responderStaticPublicKey: Data) async throws {
         let fp = FedStateDocument.destinationKey(forResponderPublicKey: responderStaticPublicKey)
         let stored = try read { db in try FedSQLiteStoreRows.phase(of: effect, fp: fp, in: db) }
@@ -456,7 +456,7 @@ public actor FedSQLiteStateStore: FedStateStore {
         return records
     }
 
-    // MARK: - Rules shared with the file store
+    // MARK: - Reservation and settlement rules
 
     private static func reserveEffectSequence(in db: FedSQLiteConnection) throws -> FedEffectID {
         var global = try FedSQLiteStoreRows.readGlobal(from: db)
@@ -473,10 +473,9 @@ public actor FedSQLiteStateStore: FedStateStore {
     /// Inserts `record` as a fresh intent. Pure-query and argument bodies are
     /// never accepted into the send log, so any body is dropped.
     ///
-    /// An existing row with the same id is refused. The file store refuses an
-    /// unsettled duplicate and would append a second record next to a settled
-    /// one; the table's primary key cannot hold two rows with one id, so both
-    /// are refused here. Sequence numbers only grow, so neither happens in use.
+    /// An existing row with the same id is refused: the table's primary key
+    /// cannot hold two rows with one id. Sequence numbers only grow, so a
+    /// correctly reserved sequence never duplicates an existing row.
     private static func insertIntent(_ record: FedUnresolvedEffectRecord, in db: FedSQLiteConnection) throws {
         let fp = FedStateDocument.destinationKey(forResponderPublicKey: record.responderStaticPublicKey)
         try FedSQLiteStoreRows.ensureDestination(fp: fp, responderKey: record.responderStaticPublicKey, in: db)
@@ -529,7 +528,7 @@ public actor FedSQLiteStateStore: FedStateStore {
     /// Runs `body` in one write transaction and commits it. `body` is
     /// synchronous, so the transaction cannot outlive this call or span an
     /// await. Every write also carries the pending sent phases and bumps the
-    /// revision, as every file store write does.
+    /// revision.
     private func write<T>(_ body: (FedSQLiteConnection) throws -> T) throws -> (value: T, revision: UInt64) {
         let db = try requireConnection()
         do {
@@ -590,8 +589,8 @@ public actor FedSQLiteStateStore: FedStateStore {
         }
     }
 
-    /// The open connection, or one opened now when the database exists. Like
-    /// the file store, an instance can read a store another instance opened.
+    /// The open connection, or one opened now when the database exists.
+    /// An instance can read a store another instance opened.
     private func requireConnection() throws -> FedSQLiteConnection {
         if let connection { return connection }
         guard fileManager.fileExists(atPath: databaseURL.path) else {
@@ -645,7 +644,7 @@ public actor FedSQLiteStateStore: FedStateStore {
     // MARK: - Files
 
     /// Serialises `open` across store instances so two opens cannot both
-    /// build a database. Uses the same lock file as `FedAtomicFileStateStore`.
+    /// build a database.
     private func withOpenLock<T>(_ body: () throws -> T) throws -> T {
         try ensureDirectory()
         let fd = Darwin.open(lockURL.path, O_RDWR | O_CREAT, 0o600)

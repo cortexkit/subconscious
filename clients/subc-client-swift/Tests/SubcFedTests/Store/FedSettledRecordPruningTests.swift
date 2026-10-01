@@ -8,9 +8,8 @@ import XCTest
 /// sentinels are always kept, and nothing is deleted while a ledger epoch is
 /// poisoned. Every store must apply the same rule.
 ///
-/// The durable store here is the JSON file store; `FedSettledRecordPruningSQLiteTests`
-/// at the end of this file reruns every test with the SQLite store in its place.
-/// The memory store stays the reference in both runs.
+/// Uses SQLite for persistence and memory for scratch state; the SQLite
+/// subclass also runs scratch-state tests on disk. Memory remains the oracle.
 class FedSettledRecordPruningTests: XCTestCase {
     class var storeUnderTest: FedStoreUnderTest { .asWritten }
 

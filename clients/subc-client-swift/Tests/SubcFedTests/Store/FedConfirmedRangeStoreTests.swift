@@ -5,8 +5,8 @@ import XCTest
 /// Confirmed ranges, immediate pruning of records with an outcome, and the
 /// watermark computed over pruned records, through every store.
 ///
-/// The durable store is the JSON file store; `FedConfirmedRangeStoreSQLiteTests`
-/// at the end of this file reruns every test with the SQLite store in its place.
+/// Uses memory for scratch state and SQLite for persistence; the SQLite
+/// subclass also runs scratch-state tests on disk.
 class FedConfirmedRangeStoreTests: XCTestCase {
     class var storeUnderTest: FedStoreUnderTest { .asWritten }
 

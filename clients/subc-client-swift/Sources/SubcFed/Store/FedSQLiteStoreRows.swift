@@ -8,7 +8,7 @@ import Foundation
 enum FedSQLiteStoreRows {
     /// Version of the table layout below, kept in `meta` under `schema_version`.
     /// It is independent of `FedStateDocument.currentSchemaVersion`, which
-    /// versions the JSON document of the file store.
+    /// versions the state document exposed by the store API.
     static let schemaVersion: Int64 = 1
 
     static let schema = """
@@ -62,11 +62,10 @@ enum FedSQLiteStoreRows {
     );
     """
 
-    // Effect and poisoned-epoch rows are always read in rowid order, which is
-    // the order they were inserted in. The file store keeps both as arrays in
-    // append order, and `FedSettledRecordPruning.regressionSentinel` breaks a
-    // tie between equal sequence numbers (possible across incarnations) by
-    // taking the first, so the order is part of the behaviour, not cosmetics.
+    // Effect and poisoned-epoch rows are read in insertion order. The retained
+    // recorded reply used to detect ledger regression is selected by
+    // FedSettledRecordPruning.regressionSentinel; ties in sequence numbers across
+    // incarnations choose the first row, so reordering can change that selection.
 
     private enum MetaKey {
         static let schemaVersion = "schema_version"
@@ -230,8 +229,7 @@ enum FedSQLiteStoreRows {
     }
 
     /// Increments the revision and returns the new value. Every write
-    /// transaction calls this once, as every file store write bumps the
-    /// document revision once.
+    /// transaction calls this once.
     static func bumpRevision(in db: FedSQLiteConnection) throws -> UInt64 {
         let statement = try db.prepare("SELECT value FROM meta WHERE key = ?")
         try statement.bind([.text(MetaKey.revision)])
@@ -380,8 +378,7 @@ enum FedSQLiteStoreRows {
     }
 
     static func addPoisonedEpoch(_ epoch: String, fp: String, in db: FedSQLiteConnection) throws {
-        // OR IGNORE keeps an epoch already present at its original position,
-        // as the file store leaves an existing array entry where it is.
+        // OR IGNORE keeps an epoch already present at its original position.
         try db.run(
             "INSERT OR IGNORE INTO poisoned_epoch(responder_fp, epoch) VALUES (?, ?)",
             [.text(fp), .text(epoch)]

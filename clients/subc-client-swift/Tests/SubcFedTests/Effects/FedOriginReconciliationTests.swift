@@ -8,7 +8,7 @@ import XCTest
 /// admitting new mutating calls. These tests exercise the COMPOSED behavior
 /// (engine + effect log + store), not the isolated pieces.
 ///
-/// Runs against the memory and file stores as written;
+/// Uses memory for scratch state and SQLite for persistence;
 /// `FedOriginReconciliationSQLiteTests` at the end of this file reruns every
 /// test against the SQLite store.
 class FedOriginReconciliationTests: XCTestCase {

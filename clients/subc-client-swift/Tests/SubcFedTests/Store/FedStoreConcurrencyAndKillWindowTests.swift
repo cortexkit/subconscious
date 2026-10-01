@@ -2,21 +2,12 @@ import Foundation
 import XCTest
 @testable import SubcFed
 
-/// Runs against the file store as written; `FedStoreConcurrencyAndKillWindowSQLiteTests`
-/// below reruns the concurrency test against the SQLite store and adds the
-/// SQLite kill windows. The file store's own kill windows sit inside its
-/// temp-write/rename sequence, which the SQLite store does not have.
+/// SQLite writer serialization; the subclass adds transaction kill windows.
 class FedStoreConcurrencyAndKillWindowTests: XCTestCase {
     class var storeUnderTest: FedStoreUnderTest { .asWritten }
 
     fileprivate let localKey = Data(repeating: 0x11, count: 32)
 
-    fileprivate func skipUnlessFileStore() throws {
-        try XCTSkipIf(
-            Self.storeUnderTest == .sqlite,
-            "kill window inside the file store's rename sequence; the SQLite kill windows are the tests of this subclass"
-        )
-    }
 
     func testSimultaneousTwoWritersExactlyOneSeqWins() async throws {
         let dir = try temporaryDirectory()
@@ -52,8 +43,7 @@ class FedStoreConcurrencyAndKillWindowTests: XCTestCase {
 
         let results = await [a, b]
         let successes = results.compactMap { try? $0.get() }
-        // Under exclusive lock both may succeed serially with distinct seqs, or
-        // one may fail if it raced a stale in-memory view — never the same seq.
+        // Concurrent reservations must never hand out the same sequence.
         XCTAssertFalse(successes.isEmpty)
         XCTAssertEqual(Set(successes).count, successes.count, "duplicate reserved seq")
 
@@ -66,101 +56,6 @@ class FedStoreConcurrencyAndKillWindowTests: XCTestCase {
         }
     }
 
-    func testKillWindowAfterTempWriteLeavesNoTornCommittedState() async throws {
-        try skipUnlessFileStore()
-        let dir = try temporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: dir) }
-        let store = FedAtomicFileStateStore(directoryURL: dir)
-        _ = try await store.open(localPublicKey: localKey)
-        let first = try await store.reserveEffectSequence()
-
-        await store.setCommitBarrier { barrier in
-            if barrier == .afterTempWrite {
-                throw FedFailure.persistenceFailed
-            }
-        }
-        do {
-            _ = try await store.reserveEffectSequence()
-            XCTFail("barrier should abort commit")
-        } catch let error as FedFailure {
-            XCTAssertEqual(error, .persistenceFailed)
-        }
-
-        await store.setCommitBarrier(nil)
-        let reopened = FedAtomicFileStateStore(directoryURL: dir)
-        let doc = try await reopened.open(localPublicKey: localKey)
-        // Committed first reservation survives; aborted second does not advance.
-        let next = try await reopened.reserveEffectSequence()
-        XCTAssertGreaterThan(next.value, first.value)
-        XCTAssertEqual(doc.document.global.localIncarnation.isEmpty, false)
-    }
-
-    func testKillWindowAfterTempFsyncAndAfterRename() async throws {
-        try skipUnlessFileStore()
-        for barrierPoint in [
-            FedAtomicFileStateStore.CommitBarrier.afterTempFsync,
-            .beforeDirSync,
-        ] {
-            let dir = try temporaryDirectory()
-            defer { try? FileManager.default.removeItem(at: dir) }
-            let store = FedAtomicFileStateStore(directoryURL: dir)
-            _ = try await store.open(localPublicKey: localKey)
-            let first = try await store.reserveEffectSequence()
-
-            await store.setCommitBarrier { point in
-                if point == barrierPoint {
-                    throw FedFailure.persistenceFailed
-                }
-            }
-            do {
-                _ = try await store.reserveEffectSequence()
-                // afterRename still completes rename before barrier; beforeDirSync
-                // fails after rename so on-disk may have advanced — reopen must
-                // never reuse a seq.
-            } catch {
-                // expected for afterTempFsync
-            }
-
-            await store.setCommitBarrier(nil)
-            let reopened = FedAtomicFileStateStore(directoryURL: dir)
-            _ = try await reopened.open(localPublicKey: localKey)
-            let next = try await reopened.reserveEffectSequence()
-            XCTAssertGreaterThan(next.value, first.value, "barrier \(barrierPoint)")
-        }
-    }
-
-    func testKillWindowAfterRenameDoesNotDuplicateSeq() async throws {
-        try skipUnlessFileStore()
-        let dir = try temporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: dir) }
-        let store = FedAtomicFileStateStore(directoryURL: dir)
-        _ = try await store.open(localPublicKey: localKey)
-
-        await store.setCommitBarrier { point in
-            if point == .afterRename {
-                throw FedFailure.persistenceFailed
-            }
-        }
-        // Rename already happened; commit reports failure but bytes are durable.
-        var renamedSeq: UInt64?
-        do {
-            renamedSeq = try await store.reserveEffectSequence().value
-            XCTFail("expected post-rename barrier failure")
-        } catch {
-            // failure reported
-        }
-
-        await store.setCommitBarrier(nil)
-        let reopened = FedAtomicFileStateStore(directoryURL: dir)
-        _ = try await reopened.open(localPublicKey: localKey)
-        let next = try await reopened.reserveEffectSequence()
-        if let renamedSeq {
-            XCTAssertGreaterThan(next.value, renamedSeq)
-        } else {
-            // If the barrier fired, on-disk still advanced under lock.
-            XCTAssertGreaterThanOrEqual(next.value, 1)
-        }
-    }
 
     fileprivate func temporaryDirectory() throws -> URL {
         let url = FileManager.default.temporaryDirectory

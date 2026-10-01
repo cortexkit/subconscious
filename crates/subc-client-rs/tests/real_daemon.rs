@@ -16,11 +16,12 @@ use subc_test_support::TestTempDir;
 
 use serde_json::{json, Value};
 use subc_client_rs::{
-    async_trait, serve_with_handle, CallError, CallOptions, CatalogUpdateError, CloseRouteOptions,
-    ConsumerIdentity, ConsumerOptions, HandlerOutcome, ModuleHandle, ModuleHandler,
-    PolicyResolveError, PolicyResolver, PolicyResolverConfig, PolicyVerdict, ProjectRef,
-    RequestCtx, RetryBackoff, RouteCloseDisposition, RouteHandle, ScopeCallError,
-    ScopeDescribeReply, ScopeSelector, SubcConsumer, SubcModuleError, Subject, SubscribeOptions,
+    async_trait, serve_with_handle, BindDecision, CallError, CallOptions, CatalogUpdateError,
+    CloseRouteOptions, ConsumerIdentity, ConsumerOptions, HandlerOutcome, ModuleHandle,
+    ModuleHandler, PolicyResolveError, PolicyResolver, PolicyResolverConfig, PolicyVerdict,
+    ProjectRef, RequestCtx, RetryBackoff, RouteBindRequest, RouteCloseDisposition, RouteHandle,
+    ScopeCallError, ScopeDescribeReply, ScopeSelector, SubcConsumer, SubcModuleError, Subject,
+    SubscribeOptions,
 };
 use subc_control::{ClientControlRequest, ClientControlResponse};
 use subc_protocol::{
@@ -29,7 +30,7 @@ use subc_protocol::{
         IdentityScope, ManagementOperation, ManagementOperationKind, ModuleManifest, ProviderRole,
         Tool,
     },
-    scope::ScopeStatus,
+    scope::{ScopeKind, ScopeStamp, ScopeStatus},
     session::HealthStatus,
     BindIdentity, ErrorBody, Flags, Frame, FrameType, Principal, Priority, RouteTarget,
 };
@@ -4129,6 +4130,12 @@ impl ScopeOwnerRun {
 /// Start a daemon that supervises the `scope-owner` example with `steps` as
 /// its script, and wait until it has run every step.
 async fn run_scope_owner(steps: Value) -> ScopeOwnerRun {
+    run_scope_owner_with_config(steps, json!({})).await
+}
+
+/// [`run_scope_owner`], with the top-level members of `extra_config` added to
+/// the daemon's `subc.jsonc`.
+async fn run_scope_owner_with_config(steps: Value, extra_config: Value) -> ScopeOwnerRun {
     let workspace = workspace_root();
     let daemon_bin = ensure_binary(
         &workspace,
@@ -4159,21 +4166,24 @@ async fn run_scope_owner(steps: Value) -> ScopeOwnerRun {
             results_path.to_string_lossy().into_owned(),
         ),
     ]);
+    let mut config = json!({
+        "version": 1,
+        "modules": {
+            SDK_SCOPE_OWNER: {
+                "program": owner_bin.to_string_lossy(),
+                "args": [],
+                "env": env,
+                "enabled": true,
+                "reserved": true,
+            }
+        }
+    });
+    for (key, value) in extra_config.as_object().unwrap() {
+        config[key] = value.clone();
+    }
     fs::write(
         config_dir.join("cortexkit").join("subc.jsonc"),
-        serde_json::to_string_pretty(&json!({
-            "version": 1,
-            "modules": {
-                SDK_SCOPE_OWNER: {
-                    "program": owner_bin.to_string_lossy(),
-                    "args": [],
-                    "env": env,
-                    "enabled": true,
-                    "reserved": true,
-                }
-            }
-        }))
-        .unwrap(),
+        serde_json::to_string_pretty(&config).unwrap(),
     )
     .unwrap();
 
@@ -4322,6 +4332,143 @@ async fn a_refused_scope_sync_carries_the_daemons_typed_code() {
         Some(subc_protocol::error_codes::SCOPE_SYNC_NOT_AUTHORITY)
     );
 
+    run.daemon.kill_and_wait();
+    assert!(serve_task.await.unwrap().is_ok());
+}
+
+const SDK_SCOPE_PROVIDER: &str = "subc-client-rs-sdk-scope-provider";
+
+/// One bind's session and the scope stamp it carried.
+type RecordedBind = (String, Option<ScopeStamp>);
+
+/// Records the scope stamp each bind carried, keyed by the bind's session.
+#[derive(Clone, Default)]
+struct ScopeRecordingHandler {
+    binds: Arc<Mutex<Vec<RecordedBind>>>,
+}
+
+impl ScopeRecordingHandler {
+    fn stamp_for(&self, session: &str) -> Option<Option<ScopeStamp>> {
+        self.binds
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .find(|(bound_session, _)| bound_session == session)
+            .map(|(_, stamp)| stamp.clone())
+    }
+}
+
+#[async_trait]
+impl ModuleHandler for ScopeRecordingHandler {
+    async fn handle(&self, _ctx: RequestCtx, body: Vec<u8>) -> HandlerOutcome {
+        HandlerOutcome::Response(body)
+    }
+
+    async fn on_bind(&self, req: &RouteBindRequest) -> BindDecision {
+        self.binds
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push((req.identity.session.clone(), req.scope.clone()));
+        BindDecision::accept()
+    }
+}
+
+/// A module served through the SDK sees the daemon's scope stamp in `on_bind`,
+/// exactly as the daemon stamped it, and sees none on an unscoped route.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_served_modules_on_bind_receives_the_daemons_scope_stamp() {
+    // The owner sets `agent_id`, which the daemon accepts only from an owner
+    // listed in its `scope_authority_owners` config, hence the extra config.
+    // It lists the `direct` principal as a carrier: this test process connects
+    // with the daemon's key and no launch nonce, so the daemon stamps it
+    // `direct`, and only the owner or a listed carrier may open a scoped route.
+    let mut run = run_scope_owner_with_config(
+        json!([
+            sync_step(
+                1,
+                json!([{
+                    "ref": "session-a",
+                    "scope_epoch": 3,
+                    "kind": "head",
+                    "carriers": [{ "principal": { "kind": "direct" } }],
+                    "attributes": { "agent_id": "agent-7" },
+                }])
+            ),
+            describe_step(&sdk_scope_owner(), "session-a"),
+        ]),
+        json!({ "scope_authority_owners": [SDK_SCOPE_OWNER] }),
+    )
+    .await;
+    assert_eq!(
+        run.results[0]["ok"]["results"][0]["outcome"], "created",
+        "{:?}",
+        run.results
+    );
+    let described: ScopeStamp =
+        serde_json::from_value(run.results[1]["ok"]["scope"].clone()).unwrap();
+
+    let handler = ScopeRecordingHandler::default();
+    let (_provider, serve_task) = spawn_inline_module_with_handler(
+        &run.daemon.connection_file,
+        inline_module_manifest(SDK_SCOPE_PROVIDER, &["a"]),
+        handler.clone(),
+    )
+    .await;
+    wait_for_catalog_module(
+        &run.daemon.connection_file,
+        SDK_SCOPE_PROVIDER,
+        START_TIMEOUT,
+    )
+    .await;
+
+    let consumer = SubcConsumer::connect(&run.daemon.connection_file, fast_consumer_options())
+        .await
+        .unwrap();
+    let target = RouteTarget::ToolProvider {
+        module_id: SDK_SCOPE_PROVIDER.to_string(),
+    };
+    let identity =
+        |session: &str| BindIdentity::new(run._temp_dir.join("project"), "test", session);
+    fs::create_dir_all(run._temp_dir.join("project")).unwrap();
+    consumer
+        .open_route_scoped(
+            target.clone(),
+            identity("scoped"),
+            ScopeSelector {
+                owner: sdk_scope_owner(),
+                scope_ref: "session-a".to_string(),
+                scope_epoch: Some(3),
+            },
+            fast_call_options(),
+        )
+        .await
+        .unwrap();
+    consumer
+        .open_route(target, identity("unscoped"), fast_call_options())
+        .await
+        .unwrap();
+
+    let stamp = handler
+        .stamp_for("scoped")
+        .expect("the scoped route was bound")
+        .expect("on_bind must receive the daemon's scope stamp");
+    assert_eq!(stamp.owner, sdk_scope_owner());
+    assert_eq!(stamp.scope_ref, "session-a");
+    assert_eq!(stamp.scope_epoch, 3);
+    assert_eq!(stamp.kind, ScopeKind::Head);
+    assert_eq!(stamp.attributes.agent_id.as_deref(), Some("agent-7"));
+    assert!(stamp.owner_authorized);
+    assert_eq!(
+        stamp, described,
+        "the bind carries the daemon's stamp unchanged"
+    );
+    assert_eq!(
+        handler.stamp_for("unscoped"),
+        Some(None),
+        "an unscoped route is bound with no stamp"
+    );
+
+    drop(consumer);
     run.daemon.kill_and_wait();
     assert!(serve_task.await.unwrap().is_ok());
 }

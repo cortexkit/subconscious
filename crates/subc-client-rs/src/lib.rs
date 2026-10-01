@@ -1275,7 +1275,12 @@ fn checked_increment(counter: &AtomicU64) -> Option<u64> {
 }
 
 /// Route-bind request delivered on channel 0.
+///
+/// `#[non_exhaustive]`: only the SDK builds this, from the daemon's bind, so
+/// it can gain fields in a later release without breaking the handlers that
+/// read it.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct RouteBindRequest {
     pub handle: RouteHandle,
     pub target: RouteTarget,
@@ -1295,6 +1300,13 @@ pub struct RouteBindRequest {
     pub role_versions: Option<std::collections::BTreeMap<String, String>>,
     /// Opaque admission facts relayed by subc from its configured carrier.
     pub admission_facts: Option<serde_json::Value>,
+    /// The daemon's stamp of the scope the route was admitted under (owner,
+    /// ref, epoch, kind, attributes), copied from the bind unchanged. It is
+    /// the daemon's, never the opener's, so a provider may act on it, and it
+    /// is fixed for the route's life: a change that revokes authority closes
+    /// the route. `None` means the route was opened without a scope, or by a
+    /// daemon that predates scopes.
+    pub scope: Option<ScopeStamp>,
 }
 
 /// Decision returned by [`ModuleHandler::on_bind`].
@@ -1860,10 +1872,7 @@ where
             consumer_capabilities,
             role_versions,
             admission_facts,
-            // This SDK does not pass the scope stamp to handlers, so a provider
-            // built on it cannot act on it; ignoring the field is also exactly
-            // what builds that predate the field do.
-            scope: _,
+            scope,
         } => {
             // Implicit-replace rule (wire spec 3.3.0): the daemon never rebinds a live
             // channel, but its route-gone GOODBYE to modules is best-effort, so a bind
@@ -1908,6 +1917,7 @@ where
                 consumer_capabilities,
                 role_versions,
                 admission_facts,
+                scope,
             };
             let decision = handler.on_bind(&req).await;
             match decision.kind {

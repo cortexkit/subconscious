@@ -97,6 +97,10 @@ const WRITER_DRAIN_LIMIT: Duration = Duration::from_secs(2);
 /// blocks its thread must not hold the shutdown up that long.
 const DRAINING_HOOK_START_LIMIT: Duration = Duration::from_secs(2);
 static NEXT_MODULE_CONNECTION_TOKEN: AtomicU64 = AtomicU64::new(1);
+/// The connection token of a [`RouteHandle::detached`] handle. Module
+/// connection tokens start at 1 (above) and a consumer's generation starts at
+/// 1 and only grows, so no live connection ever has this token.
+const DETACHED_CONNECTION_TOKEN: u64 = 0;
 
 type RequestKey = (u16, u32, u64);
 type InFlight = Arc<Mutex<HashMap<RequestKey, CancellationToken>>>;
@@ -115,6 +119,23 @@ pub struct RouteHandle {
 }
 
 impl RouteHandle {
+    /// A handle for `channel` and `epoch` that belongs to no connection, for
+    /// building values in tests, such as a [`RouteBindRequest`] passed to a
+    /// module's own `on_bind`. It is never bound to a connection and cannot
+    /// become one.
+    ///
+    /// Every operation that would reach a connection fails with the error
+    /// it returns for a closed or stale route, and sends nothing:
+    /// [`ModuleHandle::push`] returns [`SubcModuleError::StaleRouteHandle`];
+    /// [`SubcConsumer::request`], [`SubcConsumer::subscribe_route`],
+    /// [`SubcConsumer::poll_route`], [`SubcConsumer::push_events`] and
+    /// [`SubcConsumer::close_handle`] return [`CallError::StaleRouteHandle`];
+    /// [`Self::on_request`] and [`Self::on_request_fallible`] return
+    /// [`ReverseRequestRegistrationError::NotConsumerRoute`].
+    pub fn detached(channel: u16, epoch: u32) -> Self {
+        Self::new(channel, epoch, DETACHED_CONNECTION_TOKEN)
+    }
+
     pub(crate) fn new(channel: u16, epoch: u32, connection_token: u64) -> Self {
         Self {
             channel,
@@ -1276,9 +1297,10 @@ fn checked_increment(counter: &AtomicU64) -> Option<u64> {
 
 /// Route-bind request delivered on channel 0.
 ///
-/// `#[non_exhaustive]`: only the SDK builds this, from the daemon's bind, so
-/// it can gain fields in a later release without breaking the handlers that
-/// read it.
+/// `#[non_exhaustive]` so it can gain fields in a later release without
+/// breaking the handlers that read it. The SDK builds it from the daemon's
+/// bind; code outside this crate (a module's own tests of its `on_bind`)
+/// builds one with [`RouteBindRequest::new`] and the `with_*` setters.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct RouteBindRequest {
@@ -1307,6 +1329,57 @@ pub struct RouteBindRequest {
     /// the route. `None` means the route was opened without a scope, or by a
     /// daemon that predates scopes.
     pub scope: Option<ScopeStamp>,
+}
+
+impl RouteBindRequest {
+    /// A bind with the members every bind has and every optional one absent:
+    /// no principal, no consumer capabilities, no role versions, no admission
+    /// facts and no scope. Set those with the `with_*` methods.
+    pub fn new(handle: RouteHandle, target: RouteTarget, identity: BindIdentity) -> Self {
+        Self {
+            handle,
+            target,
+            identity,
+            principal: None,
+            consumer_capabilities: None,
+            role_versions: None,
+            admission_facts: None,
+            scope: None,
+        }
+    }
+
+    /// Set [`Self::principal`].
+    pub fn with_principal(mut self, principal: Principal) -> Self {
+        self.principal = Some(principal);
+        self
+    }
+
+    /// Set [`Self::consumer_capabilities`].
+    pub fn with_consumer_capabilities(mut self, consumer_capabilities: Vec<String>) -> Self {
+        self.consumer_capabilities = Some(consumer_capabilities);
+        self
+    }
+
+    /// Set [`Self::role_versions`].
+    pub fn with_role_versions(
+        mut self,
+        role_versions: std::collections::BTreeMap<String, String>,
+    ) -> Self {
+        self.role_versions = Some(role_versions);
+        self
+    }
+
+    /// Set [`Self::admission_facts`].
+    pub fn with_admission_facts(mut self, admission_facts: serde_json::Value) -> Self {
+        self.admission_facts = Some(admission_facts);
+        self
+    }
+
+    /// Set [`Self::scope`].
+    pub fn with_scope(mut self, scope: ScopeStamp) -> Self {
+        self.scope = Some(scope);
+        self
+    }
 }
 
 /// Decision returned by [`ModuleHandler::on_bind`].

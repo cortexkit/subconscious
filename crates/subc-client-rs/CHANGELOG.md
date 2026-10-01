@@ -6,7 +6,8 @@
 - Breaking: `CallOptions`, `SubscribeOptions` and `CloseRouteOptions` gain `role_versions: Option<BTreeMap<String, String>>` (default `None`), sent on `route.open`, including admitted routes opened with options. It is part of the route cache key, so a legacy route and a versioned one to the same target are never shared. An empty map is treated as `None`. A daemon without `route-role-versions/v1` drops the field, and a malformed map fails the call as not sent with `invalid_request`.
 - Breaking: `RouteBindRequest` gains `role_versions`, so a module built on this SDK sees the consumer's declaration in `on_bind`.
 - Breaking: `RouteBindRequest` gains `scope: Option<ScopeStamp>`, the daemon's scope stamp copied from the bind unchanged, so a module served through `serve` can tell which session a route belongs to. Until now the SDK dropped it. `None` means an unscoped route or a daemon that predates scopes.
-- Breaking: `RouteBindRequest` is now `#[non_exhaustive]`, so a later field is additive. Code outside this crate can no longer build it with a struct literal; the SDK is the only producer.
+- Breaking: `RouteBindRequest` is now `#[non_exhaustive]`, so a later field is additive. Code outside this crate builds one with `RouteBindRequest::new(handle, target, identity)` and the `with_principal`, `with_consumer_capabilities`, `with_role_versions`, `with_admission_facts` and `with_scope` setters.
+- New `RouteHandle::detached(channel, epoch)`: a handle that belongs to no connection, for building a `RouteBindRequest` in a module's own tests. Every operation on it that would reach a connection fails with the stale-route error (`SubcModuleError::StaleRouteHandle`, `CallError::StaleRouteHandle`, or `ReverseRequestRegistrationError::NotConsumerRoute`) and sends nothing.
 
 ## 0.23.7 — 2026-10-01
 

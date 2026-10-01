@@ -19,11 +19,11 @@ use subc_client_rs::{
     async_trait, serve_with_handle, BindDecision, CallError, CallOptions, CatalogUpdateError,
     CloseRouteOptions, ConsumerIdentity, ConsumerOptions, HandlerOutcome, ModuleHandle,
     ModuleHandler, PolicyResolveError, PolicyResolver, PolicyResolverConfig, PolicyVerdict,
-    ProjectRef, RequestCtx, RetryBackoff, RouteBindRequest, RouteCloseDisposition, RouteHandle,
-    ScopeCallError, ScopeDescribeReply, ScopeSelector, SubcConsumer, SubcModuleError, Subject,
-    SubscribeOptions,
+    ProjectRef, RequestCtx, RetryBackoff, ReverseRequestRegistrationError, RouteBindRequest,
+    RouteCloseDisposition, RouteHandle, ScopeCallError, ScopeDescribeReply, ScopeSelector,
+    SubcConsumer, SubcModuleError, Subject, SubscribeOptions,
 };
-use subc_control::{ClientControlRequest, ClientControlResponse};
+use subc_control::{ClientControlRequest, ClientControlResponse, PollKind};
 use subc_protocol::{
     manifest::{
         CapabilityDeclarations, CapabilityNeed, CapabilityRequirement, Concurrency, ExecutionMode,
@@ -4337,6 +4337,175 @@ async fn a_refused_scope_sync_carries_the_daemons_typed_code() {
 }
 
 const SDK_SCOPE_PROVIDER: &str = "subc-client-rs-sdk-scope-provider";
+
+/// A module's own tests build the `RouteBindRequest` its `on_bind` receives
+/// through the public constructor and setters, from outside this crate.
+#[test]
+fn a_route_bind_request_is_built_through_its_constructor_and_setters() {
+    let handle = RouteHandle::detached(7, 2);
+    let target = RouteTarget::ToolProvider {
+        module_id: "aft".to_string(),
+    };
+    let identity = BindIdentity::new("/tmp/project", "opencode", "session-1");
+
+    let bare = RouteBindRequest::new(handle, target.clone(), identity.clone());
+    assert_eq!(bare.handle, handle);
+    assert_eq!((bare.handle.channel, bare.handle.epoch), (7, 2));
+    assert_eq!(bare.target, target);
+    assert_eq!(bare.identity, identity);
+    assert_eq!(bare.principal, None);
+    assert_eq!(bare.consumer_capabilities, None);
+    assert_eq!(bare.role_versions, None);
+    assert_eq!(bare.admission_facts, None);
+    assert_eq!(bare.scope, None);
+
+    let stamp: ScopeStamp = serde_json::from_value(json!({
+        "owner": { "kind": "reserved", "module_id": "prefrontal-core" },
+        "ref": "session-a",
+        "scope_epoch": 3,
+        "kind": "head",
+        "attributes": { "agent_id": "agent-7" },
+        "owner_authorized": true,
+    }))
+    .unwrap();
+    let principal = Principal::Reserved {
+        module_id: "broca".to_string(),
+    };
+    let role_versions = BTreeMap::from([("tool-provider".to_string(), "v1".to_string())]);
+    let full = RouteBindRequest::new(handle, target, identity)
+        .with_principal(principal.clone())
+        .with_consumer_capabilities(vec!["elicitation".to_string()])
+        .with_role_versions(role_versions.clone())
+        .with_admission_facts(json!({ "schema": 1 }))
+        .with_scope(stamp.clone());
+    assert_eq!(full.principal, Some(principal));
+    assert_eq!(
+        full.consumer_capabilities,
+        Some(vec!["elicitation".to_string()])
+    );
+    assert_eq!(full.role_versions, Some(role_versions));
+    assert_eq!(full.admission_facts, Some(json!({ "schema": 1 })));
+    assert_eq!(full.scope, Some(stamp));
+}
+
+/// A detached handle belongs to no connection: every operation that would
+/// reach one fails with the stale-route error and sends nothing, even against
+/// a live daemon with a live module and consumer on the other end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_operation_on_a_detached_route_handle_fails_as_a_stale_route() {
+    let workspace = workspace_root();
+    let daemon_bin = ensure_binary(
+        &workspace,
+        binary_path(&workspace, "ck-subc"),
+        &["build", "-p", "subc-core", "--bins"],
+    );
+    let temp_dir = unique_temp_dir("subc-client-rs-detached-handle");
+    let runtime_dir = temp_dir.join("runtime");
+    let config_dir = temp_dir.join("config");
+    fs::create_dir_all(&runtime_dir).unwrap();
+    write_empty_config(&config_dir);
+    let mut daemon = spawn_daemon(&daemon_bin, &runtime_dir, &config_dir);
+    wait_for_connection_file(&daemon.connection_file, START_TIMEOUT).await;
+
+    let module_id = "subc-client-rs-detached-handle";
+    let (module, serve_task) = spawn_inline_module(
+        &daemon.connection_file,
+        inline_module_manifest(module_id, &["a"]),
+    )
+    .await;
+    wait_for_catalog_module(&daemon.connection_file, module_id, START_TIMEOUT).await;
+    let consumer = SubcConsumer::connect(&daemon.connection_file, fast_consumer_options())
+        .await
+        .unwrap();
+
+    // Channel 1, epoch 1 is the first route either side would be given, so a
+    // check that compared only the wire pair could mistake this for a live one.
+    let detached = RouteHandle::detached(1, 1);
+    // A real route on the same consumer, so the connection under test is live.
+    let live = consumer
+        .open_route(
+            RouteTarget::ToolProvider {
+                module_id: module_id.to_string(),
+            },
+            BindIdentity::new(temp_dir.join("project"), "test", "detached"),
+            fast_call_options(),
+        )
+        .await
+        .unwrap();
+    assert_ne!(live, detached);
+
+    let stale = |label: &str, error: CallError| {
+        assert!(
+            matches!(error, CallError::StaleRouteHandle(handle) if handle == detached),
+            "{label}: {error:?}"
+        );
+    };
+    stale(
+        "request",
+        consumer
+            .request(&detached, b"{}".to_vec(), fast_call_options())
+            .await
+            .unwrap_err(),
+    );
+    stale(
+        "subscribe_route",
+        consumer
+            .subscribe_route(&detached, b"{}".to_vec(), SubscribeOptions::default())
+            .await
+            .err()
+            .expect("subscribe_route on a detached handle fails"),
+    );
+    stale(
+        "poll_route",
+        consumer
+            .poll_route(&detached, PollKind::Status, Duration::from_secs(2))
+            .await
+            .unwrap_err(),
+    );
+    stale(
+        "push_events",
+        consumer
+            .push_events(&detached)
+            .expect_err("push_events on a detached handle fails"),
+    );
+    stale(
+        "close_handle",
+        consumer
+            .close_handle(&detached, CloseRouteOptions::default())
+            .await
+            .unwrap_err(),
+    );
+
+    let push = module
+        .push(&detached, b"{}".to_vec(), None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(push, SubcModuleError::StaleRouteHandle(handle) if handle == detached),
+        "push: {push:?}"
+    );
+
+    assert!(matches!(
+        detached.on_request("elicitation", |_body, _ctx| async { Vec::new() }),
+        Err(ReverseRequestRegistrationError::NotConsumerRoute)
+    ));
+    assert!(matches!(
+        detached.on_request_fallible("elicitation", |_body, _ctx| async { Ok(Vec::new()) }),
+        Err(ReverseRequestRegistrationError::NotConsumerRoute)
+    ));
+
+    // The live route still works, so the refusals above were about the
+    // handle, not a dead connection.
+    let echoed = consumer
+        .request(&live, b"still-live".to_vec(), fast_call_options())
+        .await
+        .unwrap();
+    assert_eq!(echoed, b"still-live");
+
+    drop(consumer);
+    daemon.kill_and_wait();
+    assert!(serve_task.await.unwrap().is_ok());
+}
 
 /// One bind's session and the scope stamp it carried.
 type RecordedBind = (String, Option<ScopeStamp>);

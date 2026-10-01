@@ -20,6 +20,12 @@ use crate::Principal;
 /// the call (`scope_unsupported`) instead of opening an unscoped route.
 pub const CAP_SCOPES_V1: &str = "scopes/v1";
 
+/// The `server.describe` capability a daemon advertises when it checks a
+/// `route.open`'s `role_versions` and forwards them on the module's bind. A
+/// daemon without it drops the field silently, so a consumer that relies on
+/// the provider seeing its role versions checks for this first.
+pub const CAP_ROUTE_ROLE_VERSIONS_V1: &str = "route-role-versions/v1";
+
 /// Module-to-subc op that registers an owner's full scope set.
 pub const SCOPE_SYNC_OP: &str = "scope.sync";
 /// Module-to-subc op that reads one scope's current state.

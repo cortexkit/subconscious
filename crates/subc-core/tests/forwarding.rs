@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs,
     net::Shutdown,
     ops::Deref,
@@ -982,6 +982,171 @@ async fn route_open_round_trip_via_tagged_shape_forwards_through_stub() {
     assert_eq!(response.header.channel, ack.route_channel);
     assert_eq!(response.header.corr, 202);
     assert_eq!(response.body, payload);
+
+    module.stop().await.unwrap();
+}
+
+fn role_versions_open(
+    project: &TestProject,
+    session: &str,
+    module_id: &str,
+    role_versions: Option<BTreeMap<String, String>>,
+) -> ClientControlRequest {
+    let ClientControlRequest::RouteOpen {
+        target,
+        identity,
+        consumer_identity,
+        consumer_capabilities,
+        admission_facts,
+        scope,
+        ..
+    } = attach_request(project, session, module_id)
+    else {
+        unreachable!("attach_request builds a route.open");
+    };
+    ClientControlRequest::RouteOpen {
+        target,
+        identity,
+        consumer_identity,
+        consumer_capabilities,
+        role_versions,
+        admission_facts,
+        scope,
+    }
+}
+
+fn role_versions_map(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
+    entries
+        .iter()
+        .map(|(role, version)| (role.to_string(), version.to_string()))
+        .collect()
+}
+
+/// The daemon advertises the field and forwards a consumer's role versions to
+/// the module's bind unchanged, as the module itself records them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn route_open_role_versions_reach_the_module_bind_verbatim() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor(&server, 1, Duration::from_millis(10));
+    let module_id = "fake-aft-role-versions";
+    let (module, events_path) =
+        spawn_stub_with_events_path(&server, &supervisor, module_id, "role-versions").await;
+    let mut client = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+
+    write_frame(
+        &mut client,
+        &control_request_frame(511, ClientControlRequest::ServerDescribe {}),
+    )
+    .await
+    .unwrap();
+    client.flush().await.unwrap();
+    let described = read_frame_timeout(&mut client).await;
+    let ClientControlResponse::ServerDescribe { capabilities, .. } =
+        serde_json::from_slice(&described.body).unwrap()
+    else {
+        panic!("not a server.describe reply");
+    };
+    assert!(
+        capabilities
+            .iter()
+            .any(|capability| capability == "route-role-versions/v1"),
+        "{capabilities:?}"
+    );
+
+    let project = TestProject::new();
+    let sent = role_versions_map(&[("tool-provider", "v1"), ("management-surface", "v3")]);
+    write_frame(
+        &mut client,
+        &control_request_frame(
+            512,
+            role_versions_open(&project, "ses-role-versions", module_id, Some(sent.clone())),
+        ),
+    )
+    .await
+    .unwrap();
+    client.flush().await.unwrap();
+    let ack = read_frame_timeout(&mut client).await;
+    assert_eq!(ack.header.ty, FrameType::Response, "{ack:?}");
+    assert_eq!(ack.header.corr, 512);
+
+    let attach_event = wait_for_stub_event(&events_path, SETUP_TIMEOUT, |event| {
+        event["kind"] == "attach"
+    })
+    .await;
+    assert_eq!(
+        attach_event["role_versions"],
+        serde_json::to_value(&sent).unwrap(),
+        "{attach_event}"
+    );
+
+    module.stop().await.unwrap();
+}
+
+/// A malformed declaration is refused as a terminal `invalid_request` naming
+/// `role_versions`, before the module is asked to bind anything.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn route_open_malformed_role_versions_are_refused_without_a_bind() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor(&server, 1, Duration::from_millis(10));
+    let module_id = "fake-aft-role-versions-malformed";
+    let (module, events_path) =
+        spawn_stub_with_events_path(&server, &supervisor, module_id, "role-versions-malformed")
+            .await;
+    let mut client = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    let project = TestProject::new();
+
+    let nine: BTreeMap<String, String> = (0..9)
+        .map(|index| (format!("role-{index}"), "v1".to_string()))
+        .collect();
+    for (corr, label, malformed) in [
+        (
+            521,
+            "invalid role name",
+            role_versions_map(&[("tool provider", "v1")]),
+        ),
+        (
+            522,
+            "invalid version",
+            role_versions_map(&[("tool-provider", "1")]),
+        ),
+        (523, "nine entries", nine),
+    ] {
+        write_frame(
+            &mut client,
+            &control_request_frame(
+                corr,
+                role_versions_open(&project, "ses-malformed", module_id, Some(malformed)),
+            ),
+        )
+        .await
+        .unwrap();
+        client.flush().await.unwrap();
+        let error = read_control_error_on_stream(&mut client, corr, "invalid_request").await;
+        assert_eq!(
+            error.detail,
+            Some(serde_json::json!({ "field": "role_versions" })),
+            "{label}: {error:?}"
+        );
+    }
+    assert_eq!(server.forwarding.active_binding_count().unwrap(), 0);
+    let events = stub_events(&events_path);
+    assert!(
+        events.iter().all(|event| event["kind"] != "attach"),
+        "a malformed role_versions must be refused before route.bind; events: {events:?}"
+    );
+
+    // CONTROL: the same module records a bind for a well-formed open, so the
+    // absence above is the refusal, not a stub that records nothing.
+    let ack = attach_on_stream(&mut client, &project, 524, "ses-well-formed", module_id).await;
+    assert!(ack.route_channel > 0);
+    wait_for_stub_event(&events_path, SETUP_TIMEOUT, |event| {
+        event["kind"] == "attach"
+    })
+    .await;
 
     module.stop().await.unwrap();
 }
@@ -3826,6 +3991,7 @@ async fn route_open_vanished_project_root_attaches_under_its_recorded_identity()
         ),
         consumer_identity: None,
         consumer_capabilities: None,
+        role_versions: None,
         admission_facts: None,
         scope: None,
     };
@@ -3886,6 +4052,7 @@ async fn route_open_unreconstructable_project_root_returns_error_without_provide
         ),
         consumer_identity: None,
         consumer_capabilities: None,
+        role_versions: None,
         admission_facts: None,
         scope: None,
     };
@@ -7164,6 +7331,7 @@ fn attach_request_with_consumer_identity(
         ),
         consumer_identity,
         consumer_capabilities: None,
+        role_versions: None,
         admission_facts: None,
         scope: None,
     }

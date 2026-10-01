@@ -2632,6 +2632,7 @@ async fn open_route(
         identity: identity.clone(),
         consumer_identity: consumer_identity_from_env(),
         consumer_capabilities,
+        role_versions: None,
         admission_facts: None,
         scope: None,
     };

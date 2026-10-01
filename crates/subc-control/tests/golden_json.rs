@@ -204,6 +204,24 @@ fn golden_path(name: &str) -> PathBuf {
         .join(format!("{name}.json"))
 }
 
+fn route_open_role_versions(with_role_versions: bool) -> ClientControlRequest {
+    ClientControlRequest::RouteOpen {
+        target: RouteTarget::ToolProvider {
+            module_id: "aft".to_string(),
+        },
+        identity: bind_identity(),
+        consumer_identity: None,
+        consumer_capabilities: None,
+        role_versions: with_role_versions.then(|| {
+            [("tool-provider".to_string(), "v1".to_string())]
+                .into_iter()
+                .collect()
+        }),
+        admission_facts: None,
+        scope: None,
+    }
+}
+
 fn client_control_requests() -> Vec<(&'static str, ClientControlRequest)> {
     vec![
         (
@@ -229,6 +247,7 @@ fn client_control_requests() -> Vec<(&'static str, ClientControlRequest)> {
                     launch_nonce: "0123456789abcdef".to_string(),
                 }),
                 consumer_capabilities: Some(vec!["elicitation".to_string(), "roots".to_string()]),
+                role_versions: None,
                 admission_facts: Some(
                     serde_json::json!({"schema": 1, "verified_class": "service"}),
                 ),
@@ -248,9 +267,21 @@ fn client_control_requests() -> Vec<(&'static str, ClientControlRequest)> {
                     launch_nonce: "0123456789abcdef".to_string(),
                 }),
                 consumer_capabilities: None,
+                role_versions: None,
                 admission_facts: None,
                 scope: None,
             },
+        ),
+        // A consumer declaring the role versions it speaks, and the same open
+        // without them: the member is a plain object of strings when present
+        // and absent, not null, otherwise.
+        (
+            "client_control_request_route_open_with_role_versions",
+            route_open_role_versions(true),
+        ),
+        (
+            "client_control_request_route_open_without_role_versions",
+            route_open_role_versions(false),
         ),
         (
             "client_control_request_route_open_with_scope",
@@ -264,6 +295,7 @@ fn client_control_requests() -> Vec<(&'static str, ClientControlRequest)> {
                     launch_nonce: "0123456789abcdef".to_string(),
                 }),
                 consumer_capabilities: None,
+                role_versions: None,
                 admission_facts: None,
                 scope: Some(subc_protocol::scope::ScopeSelector {
                     owner: subc_protocol::Principal::Reserved {

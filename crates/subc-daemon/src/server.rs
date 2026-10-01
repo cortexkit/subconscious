@@ -1413,6 +1413,7 @@ mod tests {
                 identity: BindIdentity::new(std::env::current_dir().unwrap(), "unit", "session"),
                 consumer_identity: None,
                 consumer_capabilities: None,
+                role_versions: None,
                 admission_facts: None,
                 scope: None,
             })

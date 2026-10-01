@@ -44,6 +44,7 @@ const ROUTE_OPEN_REFUSAL_COUNTER_CODES: &[&str] = &[
     subc_protocol::error_codes::SCOPE_ENDED,
     subc_protocol::error_codes::SCOPE_NOT_CARRIER,
     subc_protocol::error_codes::SCOPE_CHANGED,
+    subc_protocol::error_codes::INVALID_REQUEST,
 ];
 
 /// Counter key for a `route.open` refused by the per-module bind-relay breaker

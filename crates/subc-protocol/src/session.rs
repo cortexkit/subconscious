@@ -5,6 +5,8 @@
 //! liveness. Route bind is the client-to-subc-to-module request/response
 //! handshake that binds one client route to a module route channel.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -81,6 +83,16 @@ pub enum ModuleControlRequest {
         /// "roots".
         #[serde(default, skip_serializing_if = "Option::is_none")]
         consumer_capabilities: Option<Vec<String>>,
+        /// The versions of provider roles the consumer speaks on this route,
+        /// role name to version (`{"tool-provider": "v1"}`), copied from the
+        /// consumer's `route.open` unchanged. Like `consumer_capabilities` it
+        /// is the consumer's unverified declaration and grants nothing; a
+        /// provider uses it to choose which version of a role's wire shape to
+        /// speak. The daemon has checked it with [`validate_role_versions`] and
+        /// never sends an empty map. Absent means the consumer declared none:
+        /// a legacy consumer, or a daemon that predates the field.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        role_versions: Option<BTreeMap<String, String>>,
         /// Opaque admission facts supplied by the configured carrier module.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         admission_facts: Option<Value>,
@@ -268,4 +280,224 @@ pub enum ModuleControlPush {
         route_epoch: u32,
         status: String,
     },
+}
+
+/// The wire name of the `role_versions` field on `route.open` and
+/// `route.bind`, for the `detail.field` of the `invalid_request` error that
+/// refuses a malformed one.
+pub const ROLE_VERSIONS_FIELD: &str = "role_versions";
+
+/// Most entries a `role_versions` map may hold.
+pub const MAX_ROLE_VERSIONS: usize = 8;
+
+/// The longest role name accepted in `role_versions`, in bytes.
+pub const MAX_ROLE_NAME_LEN: usize = 64;
+
+/// Why a `role_versions` map was refused.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RoleVersionsError {
+    /// The map has more than [`MAX_ROLE_VERSIONS`] entries.
+    TooMany { count: usize },
+    /// A role name is not lowercase ASCII letters and digits in words joined
+    /// by single hyphens (`tool-provider`), or is longer than
+    /// [`MAX_ROLE_NAME_LEN`] bytes.
+    InvalidRole { role: String },
+    /// A version is not `v` followed by a positive integer without leading
+    /// zeros (`v1`, `v12`).
+    InvalidVersion { role: String, version: String },
+}
+
+impl RoleVersionsError {
+    /// The request field the error is about: always [`ROLE_VERSIONS_FIELD`].
+    pub fn field(&self) -> &'static str {
+        ROLE_VERSIONS_FIELD
+    }
+}
+
+impl std::fmt::Display for RoleVersionsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooMany { count } => write!(
+                f,
+                "{ROLE_VERSIONS_FIELD} has {count} entries; at most {MAX_ROLE_VERSIONS} are allowed"
+            ),
+            Self::InvalidRole { role } => write!(
+                f,
+                "{ROLE_VERSIONS_FIELD} names role {role:?}, which is not lowercase letters and \
+                 digits in words joined by '-', at most {MAX_ROLE_NAME_LEN} bytes"
+            ),
+            Self::InvalidVersion { role, version } => write!(
+                f,
+                "{ROLE_VERSIONS_FIELD} gives role {role:?} version {version:?}, which is not 'v' \
+                 followed by a positive integer without leading zeros"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RoleVersionsError {}
+
+/// Check a `role_versions` map: at most [`MAX_ROLE_VERSIONS`] entries, each
+/// role name matching `^[a-z0-9]+(-[a-z0-9]+)*$` in at most
+/// [`MAX_ROLE_NAME_LEN`] bytes, and each version matching `^v[1-9][0-9]*$`.
+///
+/// The daemon refuses a `route.open` that fails this, so a consumer can run
+/// the same check before sending. An empty map passes; the daemon treats it
+/// as no declaration at all.
+pub fn validate_role_versions(
+    role_versions: &BTreeMap<String, String>,
+) -> Result<(), RoleVersionsError> {
+    if role_versions.len() > MAX_ROLE_VERSIONS {
+        return Err(RoleVersionsError::TooMany {
+            count: role_versions.len(),
+        });
+    }
+    for (role, version) in role_versions {
+        if !is_role_name(role) {
+            return Err(RoleVersionsError::InvalidRole { role: role.clone() });
+        }
+        if !is_role_version(version) {
+            return Err(RoleVersionsError::InvalidVersion {
+                role: role.clone(),
+                version: version.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn is_role_name(role: &str) -> bool {
+    !role.is_empty()
+        && role.len() <= MAX_ROLE_NAME_LEN
+        && role.split('-').all(|word| {
+            !word.is_empty()
+                && word
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        })
+}
+
+fn is_role_version(version: &str) -> bool {
+    let bytes = version.as_bytes();
+    bytes.len() >= 2
+        && bytes[0] == b'v'
+        && (b'1'..=b'9').contains(&bytes[1])
+        && bytes[2..].iter().all(u8::is_ascii_digit)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn map(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
+        entries
+            .iter()
+            .map(|(role, version)| (role.to_string(), version.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn role_versions_accept_role_names_and_positive_versions() {
+        for entries in [
+            vec![],
+            vec![("tool-provider", "v1")],
+            vec![("a", "v9"), ("b2", "v10"), ("x-1-y", "v1203")],
+        ] {
+            assert_eq!(
+                validate_role_versions(&map(&entries)),
+                Ok(()),
+                "{entries:?}"
+            );
+        }
+        let longest = "a".repeat(MAX_ROLE_NAME_LEN);
+        assert_eq!(validate_role_versions(&map(&[(&longest, "v1")])), Ok(()));
+        let full: BTreeMap<String, String> = (0..MAX_ROLE_VERSIONS)
+            .map(|index| (format!("role-{index}"), "v1".to_string()))
+            .collect();
+        assert_eq!(validate_role_versions(&full), Ok(()));
+    }
+
+    #[test]
+    fn role_versions_refuse_malformed_role_names() {
+        let too_long = "a".repeat(MAX_ROLE_NAME_LEN + 1);
+        for role in [
+            "",
+            "Tool-provider",
+            "tool_provider",
+            "tool provider",
+            "-tool",
+            "tool-",
+            "tool--provider",
+            "tool.provider",
+            "outil-é",
+            too_long.as_str(),
+        ] {
+            let error = validate_role_versions(&map(&[(role, "v1")])).unwrap_err();
+            assert_eq!(
+                error,
+                RoleVersionsError::InvalidRole {
+                    role: role.to_string()
+                },
+                "{role:?}"
+            );
+            assert_eq!(error.field(), "role_versions");
+        }
+    }
+
+    #[test]
+    fn role_versions_refuse_malformed_versions() {
+        for version in [
+            "", "v", "v0", "v01", "1", "V1", "v1.0", "v-1", "v1 ", " v1", "vx",
+        ] {
+            let error = validate_role_versions(&map(&[("tool-provider", version)])).unwrap_err();
+            assert_eq!(
+                error,
+                RoleVersionsError::InvalidVersion {
+                    role: "tool-provider".to_string(),
+                    version: version.to_string(),
+                },
+                "{version:?}"
+            );
+            assert_eq!(error.field(), "role_versions");
+        }
+    }
+
+    #[test]
+    fn role_versions_refuse_more_than_eight_entries() {
+        let nine: BTreeMap<String, String> = (0..=MAX_ROLE_VERSIONS)
+            .map(|index| (format!("role-{index}"), "v1".to_string()))
+            .collect();
+        let error = validate_role_versions(&nine).unwrap_err();
+        assert_eq!(error, RoleVersionsError::TooMany { count: 9 });
+        assert_eq!(error.field(), "role_versions");
+        assert!(error.to_string().starts_with("role_versions"), "{error}");
+    }
+
+    #[test]
+    fn route_bind_omits_absent_role_versions_and_carries_present_ones_verbatim() {
+        let bind = |role_versions| ModuleControlRequest::RouteBind {
+            route_channel: 1,
+            epoch: 1,
+            target: crate::RouteTarget::ToolProvider {
+                module_id: "aft".to_string(),
+            },
+            identity: crate::BindIdentity::new("/tmp/p", "h", "s"),
+            principal: None,
+            consumer_capabilities: None,
+            role_versions,
+            admission_facts: None,
+            scope: None,
+        };
+        let absent = serde_json::to_value(bind(None)).unwrap();
+        assert!(absent.get("role_versions").is_none(), "{absent}");
+        let present = bind(Some(map(&[("tool-provider", "v1")])));
+        let encoded = serde_json::to_value(&present).unwrap();
+        assert_eq!(
+            encoded["role_versions"],
+            serde_json::json!({ "tool-provider": "v1" })
+        );
+        let decoded: ModuleControlRequest = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded, present);
+    }
 }

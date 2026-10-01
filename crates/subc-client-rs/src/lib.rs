@@ -1286,6 +1286,13 @@ pub struct RouteBindRequest {
     /// no reverse-request capability. Known MCP method-family values today are
     /// "elicitation", "sampling", and "roots".
     pub consumer_capabilities: Option<Vec<String>>,
+    /// The versions of provider roles the consumer declared it speaks on this
+    /// route, role name to version (`{"tool-provider": "v1"}`), as the daemon
+    /// forwarded them. A declaration, not a verified privilege: use it to pick
+    /// which version of a role's wire shape to speak. `None` means the consumer
+    /// declared none (a legacy consumer, or a daemon that predates the field);
+    /// it is never an empty map.
+    pub role_versions: Option<std::collections::BTreeMap<String, String>>,
     /// Opaque admission facts relayed by subc from its configured carrier.
     pub admission_facts: Option<serde_json::Value>,
 }
@@ -1851,6 +1858,7 @@ where
             identity,
             principal,
             consumer_capabilities,
+            role_versions,
             admission_facts,
             // This SDK does not pass the scope stamp to handlers, so a provider
             // built on it cannot act on it; ignoring the field is also exactly
@@ -1898,6 +1906,7 @@ where
                 identity,
                 principal,
                 consumer_capabilities,
+                role_versions,
                 admission_facts,
             };
             let decision = handler.on_bind(&req).await;
@@ -2905,6 +2914,7 @@ mod tests {
             ),
             principal: None,
             consumer_capabilities: None,
+            role_versions: None,
             admission_facts: None,
             scope: None,
         })
@@ -3276,6 +3286,7 @@ mod module_close_tests {
             ),
             principal: None,
             consumer_capabilities: None,
+            role_versions: None,
             admission_facts: None,
             scope: None,
         })

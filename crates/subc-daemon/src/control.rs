@@ -24,13 +24,13 @@ use subc_protocol::{
         ProviderRole,
     },
     scope::{
-        ScopeRecord, ScopeRecordOutcome, ScopeRecordResult, ScopeSelector, CAP_SCOPES_V1,
-        SCOPE_DESCRIBE_OP, SCOPE_SYNC_OP,
+        ScopeRecord, ScopeRecordOutcome, ScopeRecordResult, ScopeSelector,
+        CAP_ROUTE_ROLE_VERSIONS_V1, CAP_SCOPES_V1, SCOPE_DESCRIBE_OP, SCOPE_SYNC_OP,
     },
     session::{
-        HealthReport, ModuleControlPush, ModuleControlRequest, ModuleControlRequestFromModule,
-        ModuleControlResponse, ModuleControlResponseToModule, MODULE_CONTROL_OP_HEALTH_CHECK,
-        MODULE_TO_SUBC_OP_CATALOG_UPDATE,
+        validate_role_versions, HealthReport, ModuleControlPush, ModuleControlRequest,
+        ModuleControlRequestFromModule, ModuleControlResponse, ModuleControlResponseToModule,
+        MODULE_CONTROL_OP_HEALTH_CHECK, MODULE_TO_SUBC_OP_CATALOG_UPDATE, ROLE_VERSIONS_FIELD,
     },
     BindIdentity, ErrorBody, Flags, FrameType, ModuleHelloAckBody, ModuleHelloBody, Principal,
     Priority, RouteTarget, PROTOCOL_VERSION,
@@ -341,6 +341,7 @@ struct RouteOpenRequest {
     identity: BindIdentity,
     consumer_identity: Option<ConsumerIdentity>,
     consumer_capabilities: Option<Vec<String>>,
+    role_versions: Option<BTreeMap<String, String>>,
     admission_facts: Option<serde_json::Value>,
     scope: Option<ScopeSelector>,
 }
@@ -753,6 +754,7 @@ impl ControlHandler {
                 CAP_SESSION_ATTACH.to_string(),
                 CAP_ADMISSION_FACTS_RELAY.to_string(),
                 CAP_SCOPES_V1.to_string(),
+                CAP_ROUTE_ROLE_VERSIONS_V1.to_string(),
             ]),
             route_bind_relay_timeout: DEFAULT_ROUTE_BIND_RELAY_TIMEOUT,
             route_bind_relay_timeouts: BTreeMap::new(),
@@ -2171,6 +2173,7 @@ impl ControlHandler {
                 identity,
                 consumer_identity,
                 consumer_capabilities,
+                role_versions,
                 admission_facts,
                 scope,
             } => {
@@ -2182,6 +2185,7 @@ impl ControlHandler {
                         identity,
                         consumer_identity,
                         consumer_capabilities,
+                        role_versions,
                         admission_facts,
                         scope,
                     },
@@ -2899,6 +2903,7 @@ impl ControlHandler {
             mut identity,
             consumer_identity,
             consumer_capabilities,
+            role_versions,
             admission_facts,
             scope,
         } = request;
@@ -2909,6 +2914,29 @@ impl ControlHandler {
             module_id = %target_module_id,
             "handling route.open"
         );
+
+        // A malformed declaration is refused first, before anything about the
+        // target is looked up: the same body would be refused against any
+        // module, so the caller learns nothing by retrying or waiting. An empty
+        // map declares nothing and travels as no field at all, so a provider
+        // only ever sees a missing field or a non-empty one.
+        let role_versions = role_versions.filter(|role_versions| !role_versions.is_empty());
+        if let Some(Err(error)) = role_versions.as_ref().map(validate_role_versions) {
+            self.observe_route_open_refusal(
+                ctx,
+                &target_module_id,
+                "invalid_role_versions",
+                error_codes::INVALID_REQUEST,
+            );
+            return Ok(vec![control_error_body_frame(
+                &frame,
+                ErrorBody {
+                    code: error_codes::INVALID_REQUEST.to_string(),
+                    message: error.to_string(),
+                    detail: Some(serde_json::json!({ "field": ROLE_VERSIONS_FIELD })),
+                },
+            )?]);
+        }
 
         // WHY THESE REPLIES DISCRIMINATE FREELY, since the usual rule is the
         // opposite. Below, a caller learns whether a module is unregistered,
@@ -3444,6 +3472,7 @@ impl ControlHandler {
             identity,
             principal: Some(principal),
             consumer_capabilities,
+            role_versions,
             admission_facts,
             scope: scope_stamp,
         };
@@ -6473,11 +6502,44 @@ mod tests {
             ),
             consumer_identity: None,
             consumer_capabilities,
+            role_versions: None,
             admission_facts: None,
             scope: None,
         })
         .unwrap();
         Frame::build(FrameType::Request, control_flags(), 0, 0, corr, body).unwrap()
+    }
+
+    fn route_open_frame_with_role_versions(
+        corr: u64,
+        module_id: &str,
+        project_root: TestTempDir,
+        role_versions: Option<BTreeMap<String, String>>,
+    ) -> Frame {
+        let body = serde_json::to_vec(&ClientControlRequest::RouteOpen {
+            target: RouteTarget::ToolProvider {
+                module_id: module_id.to_string(),
+            },
+            identity: BindIdentity::new(
+                project_root.path().to_path_buf(),
+                "unit".to_string(),
+                format!("session-{corr}"),
+            ),
+            consumer_identity: None,
+            consumer_capabilities: None,
+            role_versions,
+            admission_facts: None,
+            scope: None,
+        })
+        .unwrap();
+        Frame::build(FrameType::Request, control_flags(), 0, 0, corr, body).unwrap()
+    }
+
+    fn role_versions(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
+        entries
+            .iter()
+            .map(|(role, version)| (role.to_string(), version.to_string()))
+            .collect()
     }
 
     fn route_open_frame_with_admission_facts(
@@ -6498,6 +6560,7 @@ mod tests {
             ),
             consumer_identity,
             consumer_capabilities: None,
+            role_versions: None,
             admission_facts: facts,
             scope: None,
         })
@@ -8949,6 +9012,182 @@ mod tests {
             serde_json::from_slice::<ClientControlResponse>(&published.body).unwrap(),
             ClientControlResponse::RouteOpen { .. }
         ));
+    }
+
+    /// Opens a route to a freshly registered `aft` with `sent` as the
+    /// route.open's role_versions, acks the bind, and returns the role_versions
+    /// the module's bind carried.
+    async fn bind_role_versions_for(
+        sent: Option<BTreeMap<String, String>>,
+        connection: u64,
+    ) -> Option<BTreeMap<String, String>> {
+        let registry = Arc::new(Registry::default());
+        let forwarding = Arc::new(ForwardingTable::default());
+        let handler =
+            ControlHandler::with_forwarding(Arc::clone(&registry), Arc::clone(&forwarding));
+        let (module_ctx, mut module_rx) = route_ctx(ConnectionId::new(connection));
+        hello_via_sink(
+            &handler,
+            &module_ctx,
+            &mut module_rx,
+            hello_frame("aft", PROTOCOL_VERSION, 7),
+        )
+        .await;
+        let project_root = unique_project_root("role-versions");
+        let (client_ctx, mut client_rx) = route_ctx(ConnectionId::new(connection + 1));
+        let route_handler = handler.clone();
+        let route_task = tokio::spawn(async move {
+            route_handler
+                .handle_control_frame(
+                    &client_ctx,
+                    route_open_frame_with_role_versions(403, "aft", project_root, sent),
+                )
+                .await
+                .unwrap()
+        });
+        let bind_frame = tokio::time::timeout(Duration::from_secs(1), module_rx.recv())
+            .await
+            .expect("a well-formed route.open reaches the module as a bind")
+            .unwrap();
+        let bind: ModuleControlRequest = serde_json::from_slice(&bind_frame.body).unwrap();
+        let ModuleControlRequest::RouteBind { role_versions, .. } = bind else {
+            panic!("expected route.bind request, got {bind:?}");
+        };
+        handler
+            .handle_control_frame(&module_ctx, route_bind_ack(bind_frame.header.corr))
+            .await
+            .unwrap();
+        assert!(route_task.await.unwrap().is_empty());
+        let published = client_rx.recv().await.unwrap();
+        assert!(matches!(
+            serde_json::from_slice::<ClientControlResponse>(&published.body).unwrap(),
+            ClientControlResponse::RouteOpen { .. }
+        ));
+        role_versions
+    }
+
+    #[tokio::test]
+    async fn route_open_relays_role_versions_verbatim() {
+        let sent = role_versions(&[("tool-provider", "v1"), ("management-surface", "v12")]);
+        assert_eq!(
+            bind_role_versions_for(Some(sent.clone()), 141).await,
+            Some(sent)
+        );
+    }
+
+    /// An empty map declares nothing, so the provider sees no field rather
+    /// than an empty object it would have to treat as a second "none".
+    #[tokio::test]
+    async fn route_open_with_empty_or_absent_role_versions_relays_none() {
+        assert_eq!(bind_role_versions_for(None, 143).await, None);
+        assert_eq!(
+            bind_role_versions_for(Some(BTreeMap::new()), 145).await,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn route_open_refuses_malformed_role_versions_before_any_bind() {
+        let registry = Arc::new(Registry::default());
+        let forwarding = Arc::new(ForwardingTable::default());
+        let handler =
+            ControlHandler::with_forwarding(Arc::clone(&registry), Arc::clone(&forwarding));
+        let (module_ctx, mut module_rx) = route_ctx(ConnectionId::new(147));
+        hello_via_sink(
+            &handler,
+            &module_ctx,
+            &mut module_rx,
+            hello_frame("aft", PROTOCOL_VERSION, 7),
+        )
+        .await;
+
+        let nine: BTreeMap<String, String> = (0..9)
+            .map(|index| (format!("role-{index}"), "v1".to_string()))
+            .collect();
+        for (label, malformed) in [
+            (
+                "invalid role name",
+                role_versions(&[("Tool_Provider", "v1")]),
+            ),
+            ("invalid version", role_versions(&[("tool-provider", "v0")])),
+            ("nine entries", nine),
+        ] {
+            // A refused open answers at once; one that reached the module
+            // would wait for its bind ack and trip this timeout.
+            let responses = tokio::time::timeout(
+                Duration::from_secs(1),
+                handler.handle_control_frame(
+                    &route_ctx(ConnectionId::new(148)).0,
+                    route_open_frame_with_role_versions(
+                        404,
+                        "aft",
+                        unique_project_root("role-versions-malformed"),
+                        Some(malformed),
+                    ),
+                ),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{label}: the open was relayed instead of refused"))
+            .unwrap();
+            assert_eq!(responses.len(), 1, "{label}");
+            assert_eq!(responses[0].header.ty, FrameType::Error, "{label}");
+            let error = parse_error(&responses[0]);
+            assert_eq!(error["code"], "invalid_request", "{label}: {error}");
+            assert_eq!(
+                error["detail"]["field"], "role_versions",
+                "{label}: {error}"
+            );
+            assert!(
+                !error_codes::is_retryable_route_open(error["code"].as_str().unwrap()),
+                "{label}: a malformed declaration is terminal"
+            );
+            assert!(
+                module_rx.try_recv().is_err(),
+                "{label}: the module must never see a bind"
+            );
+        }
+    }
+
+    /// `route-role-versions/v1` is in HELLO_ACK and `server.describe`, so a
+    /// consumer can tell this daemon forwards the field from one that would
+    /// drop it.
+    #[tokio::test]
+    async fn route_role_versions_capability_is_advertised() {
+        let handler = ControlHandler::new(Arc::new(Registry::default()));
+        let (ctx, mut rx) = route_ctx(ConnectionId::new(149));
+        let ack = hello_via_sink(
+            &handler,
+            &ctx,
+            &mut rx,
+            hello_frame("m", PROTOCOL_VERSION, 1),
+        )
+        .await;
+        let ack = parse_ack(&ack);
+        assert!(
+            ack.subc_capabilities
+                .iter()
+                .any(|c| c == "route-role-versions/v1"),
+            "{:?}",
+            ack.subc_capabilities
+        );
+
+        let body = serde_json::to_vec(&ClientControlRequest::ServerDescribe {}).unwrap();
+        let frame = Frame::build(FrameType::Request, control_flags(), 0, 0, 5, body).unwrap();
+        let reply = handler
+            .handle_control_frame(&route_ctx(ConnectionId::new(150)).0, frame)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let ClientControlResponse::ServerDescribe { capabilities, .. } =
+            serde_json::from_slice(&reply.body).unwrap()
+        else {
+            panic!("not a server.describe reply");
+        };
+        assert!(
+            capabilities.iter().any(|c| c == CAP_ROUTE_ROLE_VERSIONS_V1),
+            "{capabilities:?}"
+        );
     }
 
     #[tokio::test]
@@ -11913,6 +12152,7 @@ mod tests {
                         launch_nonce: nonce(module_id),
                     }),
                     consumer_capabilities: None,
+                    role_versions: None,
                     admission_facts: None,
                     scope,
                 })

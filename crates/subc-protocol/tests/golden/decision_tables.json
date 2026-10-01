@@ -6,6 +6,7 @@
     "capability_forbidden": "terminal",
     "forwarding_error": "terminal",
     "invalid_project_root": "terminal",
+    "invalid_request": "terminal",
     "module_reloading": "retryable",
     "module_no_protocol": "terminal",
     "module_removed": "terminal",

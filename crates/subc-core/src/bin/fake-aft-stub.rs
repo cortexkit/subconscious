@@ -1354,6 +1354,7 @@ async fn handle_control_request(
             identity,
             principal,
             consumer_capabilities,
+            role_versions,
             admission_facts,
             scope,
         } => {
@@ -1369,6 +1370,7 @@ async fn handle_control_request(
                     "identity": identity,
                     "principal": principal,
                     "consumer_capabilities": consumer_capabilities,
+                    "role_versions": role_versions,
                     "admission_facts": admission_facts,
                     "scope": scope,
                 }),

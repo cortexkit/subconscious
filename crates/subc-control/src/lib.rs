@@ -7,7 +7,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::path::PathBuf;
+use std::{collections::BTreeMap, path::PathBuf};
 
 use serde::{
     de::{Error as _, MapAccess, SeqAccess, Visitor},
@@ -174,6 +174,18 @@ pub enum ClientControlRequest {
         /// "roots".
         #[serde(default, skip_serializing_if = "Option::is_none")]
         consumer_capabilities: Option<Vec<String>>,
+        /// The versions of provider roles this consumer speaks on the route,
+        /// role name to version (`{"tool-provider": "v1"}`). Like
+        /// `consumer_capabilities` it is an unverified declaration that grants
+        /// nothing: the daemon checks its shape
+        /// (`subc_protocol::session::validate_role_versions`), refuses a
+        /// malformed one as `invalid_request` naming `role_versions`, and
+        /// copies it unchanged onto the module's bind. An empty map means the
+        /// same as an absent one. Send it only to a daemon advertising
+        /// `route-role-versions/v1`: an older daemon drops unknown fields, so
+        /// the provider would never see it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        role_versions: Option<BTreeMap<String, String>>,
         /// Opaque admission facts supplied by the configured carrier module.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         admission_facts: Option<serde_json::Value>,
@@ -2229,6 +2241,7 @@ mod tests {
             identity: BindIdentity::new("/tmp/project", "opencode", "session-1"),
             consumer_identity: None,
             consumer_capabilities: None,
+            role_versions: None,
             admission_facts: None,
             scope: None,
         };
@@ -2238,6 +2251,7 @@ mod tests {
         assert_eq!(body["target"]["kind"], "tool_provider");
         assert!(body.get("consumer_identity").is_none());
         assert!(body.get("consumer_capabilities").is_none());
+        assert!(body.get("role_versions").is_none());
     }
 
     #[test]
@@ -2256,6 +2270,7 @@ mod tests {
         let ClientControlRequest::RouteOpen {
             consumer_identity,
             consumer_capabilities,
+            role_versions,
             admission_facts,
             ..
         } = decoded
@@ -2264,6 +2279,7 @@ mod tests {
         };
         assert_eq!(consumer_identity, None);
         assert_eq!(consumer_capabilities, None);
+        assert_eq!(role_versions, None);
         assert_eq!(admission_facts, None);
     }
 
@@ -2773,6 +2789,7 @@ mod launch_nonce_redaction_tests {
             ),
             consumer_identity: Some(identity()),
             consumer_capabilities: None,
+            role_versions: None,
             admission_facts: None,
             scope: None,
         };

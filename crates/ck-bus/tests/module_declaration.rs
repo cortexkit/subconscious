@@ -399,6 +399,7 @@ async fn assert_stub_principal_controls(run: &AcceptanceRun) {
         identity: BindIdentity::new(&*run.root, "ck-bus-acceptance", "principal-control"),
         consumer_identity,
         consumer_capabilities: None,
+        role_versions: None,
         admission_facts: None,
         scope: None,
     };

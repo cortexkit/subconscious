@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     error::Error,
     fmt,
     future::Future,
@@ -401,6 +401,9 @@ pub struct CloseRouteOptions {
     pub consumer_identity: Option<ConsumerIdentity>,
     /// The registry whose derived capability set identifies the route being closed.
     pub reverse_requests: ReverseRequestRegistry,
+    /// The role versions the route being closed was opened with (see
+    /// [`CallOptions::role_versions`]); part of the route's identity.
+    pub role_versions: Option<BTreeMap<String, String>>,
 }
 
 impl Default for CloseRouteOptions {
@@ -410,6 +413,7 @@ impl Default for CloseRouteOptions {
             drain_timeout: DEFAULT_CALL_TIMEOUT,
             consumer_identity: None,
             reverse_requests: ReverseRequestRegistry::new(),
+            role_versions: None,
         }
     }
 }
@@ -430,6 +434,20 @@ pub struct CallOptions {
     /// Reverse-request handlers for this route. consumer_capabilities is derived
     /// from the registered method families and omitted when this registry is empty.
     pub reverse_requests: ReverseRequestRegistry,
+    /// The versions of provider roles this consumer speaks on the route, role
+    /// name to version (`{"tool-provider": "v1"}`), sent on `route.open` and
+    /// forwarded by the daemon to the provider's bind. An unverified
+    /// declaration that grants nothing. Routes that differ only here are
+    /// separate routes, so a legacy route and a versioned one to the same
+    /// target are never shared; an empty map is the same as `None`.
+    ///
+    /// A daemon that does not advertise `route-role-versions/v1`
+    /// ([`subc_protocol::scope::CAP_ROUTE_ROLE_VERSIONS_V1`]) drops the field
+    /// without telling the provider, so check the capability before relying
+    /// on it. A malformed map (see
+    /// [`subc_protocol::session::validate_role_versions`]) is refused by the
+    /// daemon as `invalid_request` and the call fails as not sent.
+    pub role_versions: Option<BTreeMap<String, String>>,
 }
 
 impl Default for CallOptions {
@@ -442,6 +460,7 @@ impl Default for CallOptions {
             route_retry_deadline: DEFAULT_ROUTE_RETRY_DEADLINE,
             consumer_identity: None,
             reverse_requests: ReverseRequestRegistry::new(),
+            role_versions: None,
         }
     }
 }
@@ -467,6 +486,9 @@ pub struct SubscribeOptions {
     /// Reverse-request handlers for this route. consumer_capabilities is derived
     /// from the registered method families and omitted when this registry is empty.
     pub reverse_requests: ReverseRequestRegistry,
+    /// The role versions declared on the subscription's route; see
+    /// [`CallOptions::role_versions`].
+    pub role_versions: Option<BTreeMap<String, String>>,
 }
 
 impl Default for SubscribeOptions {
@@ -480,6 +502,7 @@ impl Default for SubscribeOptions {
             route_open_timeout: DEFAULT_CALL_TIMEOUT,
             consumer_identity: None,
             reverse_requests: ReverseRequestRegistry::new(),
+            role_versions: None,
         }
     }
 }
@@ -892,17 +915,20 @@ impl SubcConsumer {
         let deadline = Instant::now() + opts.timeout;
         let consumer_identity = route_open_consumer_identity(&opts);
         let consumer_capabilities = route_open_consumer_capabilities(&opts);
+        let role_versions = route_open_role_versions(opts.role_versions.as_ref());
         let key = RouteKey::new(
             &target,
             &identity,
             consumer_identity.as_ref(),
             consumer_capabilities.as_deref(),
-        );
+        )
+        .with_role_versions(role_versions.as_ref());
         let params = RouteOpenParams {
             target: &target,
             identity: &identity,
             consumer_identity: &consumer_identity,
             consumer_capabilities: &consumer_capabilities,
+            role_versions: &role_versions,
             reverse_requests: &opts.reverse_requests,
             scope: None,
         };
@@ -953,18 +979,21 @@ impl SubcConsumer {
         let deadline = Instant::now() + opts.timeout;
         let consumer_identity = route_open_consumer_identity(&opts);
         let consumer_capabilities = route_open_consumer_capabilities(&opts);
+        let role_versions = route_open_role_versions(opts.role_versions.as_ref());
         let key = RouteKey::new(
             &target,
             &identity,
             consumer_identity.as_ref(),
             consumer_capabilities.as_deref(),
         )
+        .with_role_versions(role_versions.as_ref())
         .with_scope(Some(&scope));
         let params = RouteOpenParams {
             target: &target,
             identity: &identity,
             consumer_identity: &consumer_identity,
             consumer_capabilities: &consumer_capabilities,
+            role_versions: &role_versions,
             reverse_requests: &opts.reverse_requests,
             scope: Some(&scope),
         };
@@ -1058,6 +1087,7 @@ impl SubcConsumer {
             identity,
             consumer_identity: route_open_consumer_identity(opts),
             consumer_capabilities,
+            role_versions: route_open_role_versions(opts.role_versions.as_ref()),
             admission_facts: Some(facts),
             scope: None,
         })
@@ -1515,18 +1545,21 @@ impl SubcConsumer {
         let mut retried_unknown_channel = false;
         let consumer_identity = route_open_consumer_identity(&opts);
         let consumer_capabilities = route_open_consumer_capabilities(&opts);
+        let role_versions = route_open_role_versions(opts.role_versions.as_ref());
         let route_key = RouteKey::new(
             &target,
             &identity,
             consumer_identity.as_ref(),
             consumer_capabilities.as_deref(),
-        );
+        )
+        .with_role_versions(role_versions.as_ref());
 
         let route_open = RouteOpenParams {
             target: &target,
             identity: &identity,
             consumer_identity: &consumer_identity,
             consumer_capabilities: &consumer_capabilities,
+            role_versions: &role_versions,
             reverse_requests: &opts.reverse_requests,
             scope: None,
         };
@@ -1609,7 +1642,7 @@ impl SubcConsumer {
 
     /// Open a held-open subscription on a managed route.
     ///
-    /// This opens or reuses the same `(target, identity, consumer_identity, consumer_capabilities)` route as
+    /// This opens or reuses the same `(target, identity, consumer_identity, consumer_capabilities, role_versions)` route as
     /// [`SubcConsumer::call`], sends one Request that the provider keeps open, and
     /// returns a [`Subscription`] whose event receiver yields each matching
     /// `StreamData` payload. The request holds one route flow-control permit until
@@ -1633,21 +1666,25 @@ impl SubcConsumer {
             route_retry_deadline: opts.route_retry_deadline,
             consumer_identity: opts.consumer_identity.clone(),
             reverse_requests: opts.reverse_requests.clone(),
+            role_versions: opts.role_versions.clone(),
         };
         let consumer_identity = route_open_consumer_identity(&route_opts);
         let consumer_capabilities = route_open_consumer_capabilities(&route_opts);
+        let role_versions = route_open_role_versions(route_opts.role_versions.as_ref());
         let route_key = RouteKey::new(
             &target,
             &identity,
             consumer_identity.as_ref(),
             consumer_capabilities.as_deref(),
-        );
+        )
+        .with_role_versions(role_versions.as_ref());
 
         let route_open = RouteOpenParams {
             target: &target,
             identity: &identity,
             consumer_identity: &consumer_identity,
             consumer_capabilities: &consumer_capabilities,
+            role_versions: &role_versions,
             reverse_requests: &opts.reverse_requests,
             scope: None,
         };
@@ -1729,7 +1766,8 @@ impl SubcConsumer {
             &identity,
             consumer_identity.as_ref(),
             consumer_capabilities.as_deref(),
-        );
+        )
+        .with_role_versions(route_open_role_versions(opts.role_versions.as_ref()).as_ref());
         self.shared.close_route(&key, &opts).await;
     }
 
@@ -2804,6 +2842,7 @@ impl Shared {
                 identity: route_open.identity.clone(),
                 consumer_identity: route_open.consumer_identity.clone(),
                 consumer_capabilities: route_open.consumer_capabilities.clone(),
+                role_versions: route_open.role_versions.clone(),
                 admission_facts: None,
                 scope: route_open.scope.cloned(),
             })
@@ -3946,6 +3985,8 @@ struct RouteOpenParams<'a> {
     identity: &'a BindIdentity,
     consumer_identity: &'a Option<ConsumerIdentity>,
     consumer_capabilities: &'a Option<Vec<String>>,
+    /// Already normalized: an empty map is `None` here, as in the route key.
+    role_versions: &'a Option<BTreeMap<String, String>>,
     reverse_requests: &'a ReverseRequestRegistry,
     /// The scope every route.open for this key asks to be admitted under, so a
     /// reopen after the route drops carries the same selector as the first open.
@@ -4053,6 +4094,11 @@ struct RouteKey {
     session: String,
     consumer_identity: Option<ConsumerIdentityKey>,
     consumer_capabilities: Option<ConsumerCapabilitiesKey>,
+    /// The role versions the route was opened with; `None` for a route that
+    /// declared none. Part of the key so a legacy route and a versioned one to
+    /// the same target are never shared: the provider chose its wire shape
+    /// from these at bind. A `BTreeMap` is already in canonical order.
+    role_versions: Option<BTreeMap<String, String>>,
     /// The scope the route was admitted under; `None` for an unscoped route.
     /// Part of the key so a route bound to one session's scope (or one epoch
     /// of it) is never reused for another, nor for an unscoped caller.
@@ -4073,8 +4119,14 @@ impl RouteKey {
             session: identity.session.clone(),
             consumer_identity: consumer_identity.map(ConsumerIdentityKey::from),
             consumer_capabilities: consumer_capabilities.map(ConsumerCapabilitiesKey::from_slice),
+            role_versions: None,
             scope: None,
         }
+    }
+
+    fn with_role_versions(mut self, role_versions: Option<&BTreeMap<String, String>>) -> Self {
+        self.role_versions = role_versions.cloned();
+        self
     }
 
     fn with_scope(mut self, scope: Option<&ScopeSelector>) -> Self {
@@ -4964,6 +5016,18 @@ fn route_open_consumer_capabilities(opts: &CallOptions) -> Option<Vec<String>> {
     opts.reverse_requests.seal();
     let capabilities = opts.reverse_requests.capabilities();
     (!capabilities.is_empty()).then_some(capabilities)
+}
+
+/// The role versions a route is opened and keyed with. An empty map declares
+/// nothing, and the daemon forwards it as no field at all, so it is folded
+/// into `None` here: otherwise `Some({})` and `None` would key two routes the
+/// provider cannot tell apart.
+fn route_open_role_versions(
+    role_versions: Option<&BTreeMap<String, String>>,
+) -> Option<BTreeMap<String, String>> {
+    role_versions
+        .filter(|role_versions| !role_versions.is_empty())
+        .cloned()
 }
 
 fn close_route_consumer_capabilities(opts: &CloseRouteOptions) -> Option<Vec<String>> {
@@ -6532,6 +6596,122 @@ mod tests {
         assert!(dispatch_frame(shared, 1, route_open_answer(corr, channel, None)).await);
         let handle = task.await.unwrap().expect("the stand-in accepted the open");
         (request, handle)
+    }
+
+    /// Open an unscoped `plexus` route with `opts` through the stand-in
+    /// daemon, accept its route.open on `channel`, and return the open's body
+    /// and handle.
+    async fn open_answered_with(
+        shared: &Arc<Shared>,
+        consumer: &Arc<SubcConsumer>,
+        receiver: &mut mpsc::Receiver<WriteCommand>,
+        opts: CallOptions,
+        channel: u16,
+        why: &str,
+    ) -> (serde_json::Value, RouteHandle) {
+        let consumer = Arc::clone(consumer);
+        let task = tokio::spawn(async move {
+            consumer
+                .open_route(restart_target("plexus"), restart_identity(), opts)
+                .await
+        });
+        let (corr, request) = next_route_open(receiver, why).await;
+        assert!(dispatch_frame(shared, 1, route_open_answer(corr, channel, None)).await);
+        let handle = task.await.unwrap().expect("the stand-in accepted the open");
+        (request, handle)
+    }
+
+    fn with_role_versions(entries: &[(&str, &str)]) -> CallOptions {
+        CallOptions {
+            role_versions: Some(
+                entries
+                    .iter()
+                    .map(|(role, version)| (role.to_string(), version.to_string()))
+                    .collect(),
+            ),
+            ..CallOptions::default()
+        }
+    }
+
+    /// A provider picks its wire shape from the role versions at bind, so a
+    /// legacy route and a versioned one to the same target must never be
+    /// shared, while the same declaration again (and an empty map, which
+    /// declares nothing) reuses the route it matches.
+    #[tokio::test]
+    async fn routes_differing_only_in_role_versions_are_kept_apart() {
+        let (shared, consumer, mut receiver) = route_open_stand_in(seeded_random(9));
+        let (legacy_request, legacy) = open_answered_with(
+            &shared,
+            &consumer,
+            &mut receiver,
+            CallOptions::default(),
+            71,
+            "first, legacy open",
+        )
+        .await;
+        assert!(
+            legacy_request.get("role_versions").is_none(),
+            "{legacy_request}"
+        );
+
+        let (v1_request, v1) = open_answered_with(
+            &shared,
+            &consumer,
+            &mut receiver,
+            with_role_versions(&[("tool-provider", "v1")]),
+            72,
+            "a v1 open must not reuse the legacy route",
+        )
+        .await;
+        assert_eq!(
+            v1_request["role_versions"],
+            serde_json::json!({ "tool-provider": "v1" })
+        );
+        assert_ne!(legacy, v1);
+
+        let (v2_request, v2) = open_answered_with(
+            &shared,
+            &consumer,
+            &mut receiver,
+            with_role_versions(&[("tool-provider", "v2")]),
+            73,
+            "a v2 open must not reuse the v1 route",
+        )
+        .await;
+        assert_eq!(
+            v2_request["role_versions"],
+            serde_json::json!({ "tool-provider": "v2" })
+        );
+        assert!(![legacy, v1].contains(&v2));
+
+        let open = |opts: CallOptions| {
+            let consumer = Arc::clone(&consumer);
+            async move {
+                consumer
+                    .open_route(restart_target("plexus"), restart_identity(), opts)
+                    .await
+                    .unwrap()
+            }
+        };
+        assert_eq!(
+            open(with_role_versions(&[("tool-provider", "v1")])).await,
+            v1
+        );
+        assert_eq!(open(CallOptions::default()).await, legacy);
+        assert_eq!(
+            open(CallOptions {
+                role_versions: Some(BTreeMap::new()),
+                ..CallOptions::default()
+            })
+            .await,
+            legacy,
+            "an empty map declares nothing and reuses the legacy route"
+        );
+        assert!(
+            receiver.try_recv().is_err(),
+            "a cache hit must not send a route.open"
+        );
+        shared.close_sync("test complete");
     }
 
     #[tokio::test]

@@ -3370,6 +3370,7 @@ where
             ),
             consumer_identity: None,
             consumer_capabilities: None,
+            role_versions: None,
             admission_facts: None,
             scope: None,
         },

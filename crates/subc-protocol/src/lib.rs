@@ -83,6 +83,10 @@ pub mod error_codes {
     /// running, and supervised. Only an edit to its configuration can change
     /// this answer, and a caller cannot wait that out.
     pub const MODULE_NO_PROTOCOL: &str = "module_no_protocol";
+    /// A request field is malformed. The error's `detail.field` names the field
+    /// (for a `route.open`, `role_versions`). TERMINAL: the same request will be
+    /// refused the same way every time, so only a corrected request can succeed.
+    pub const INVALID_REQUEST: &str = "invalid_request";
 
     /// A `route.open` named a scope whose owner is configured but has not
     /// synced since this daemon incarnation started. RETRYABLE: after a daemon

@@ -138,6 +138,14 @@ fn protocol_wire_shapes_match_golden_json_and_round_trip() {
         &module_control_request_with_scope(),
     );
     assert_golden(
+        "module_control_request_route_bind_with_role_versions",
+        &module_control_request_role_versions(true),
+    );
+    assert_golden(
+        "module_control_request_route_bind_without_role_versions",
+        &module_control_request_role_versions(false),
+    );
+    assert_golden(
         "module_control_response_route_bind_ack",
         &ModuleControlResponse::RouteBindAck {},
     );
@@ -963,7 +971,40 @@ fn module_control_request(
         identity: bind_identity(),
         principal: Some(Principal::Direct),
         consumer_capabilities,
+        role_versions: None,
         admission_facts,
+        scope: None,
+    }
+}
+
+/// A bind for a consumer that declared role versions, or the same bind
+/// without them. The pair pins that the member travels as a plain object of
+/// strings when present and is absent, not null, otherwise.
+fn module_control_request_role_versions(with_role_versions: bool) -> ModuleControlRequest {
+    let ModuleControlRequest::RouteBind {
+        route_channel,
+        epoch,
+        target,
+        identity,
+        principal,
+        ..
+    } = module_control_request(None, None)
+    else {
+        unreachable!("the helper builds a route.bind");
+    };
+    ModuleControlRequest::RouteBind {
+        route_channel,
+        epoch,
+        target,
+        identity,
+        principal,
+        consumer_capabilities: Some(vec!["elicitation".to_string()]),
+        role_versions: with_role_versions.then(|| {
+            [("tool-provider".to_string(), "v1".to_string())]
+                .into_iter()
+                .collect()
+        }),
+        admission_facts: None,
         scope: None,
     }
 }
@@ -993,6 +1034,7 @@ fn module_control_request_with_scope() -> ModuleControlRequest {
             module_id: "broca".to_string(),
         }),
         consumer_capabilities,
+        role_versions: None,
         admission_facts,
         scope: Some(ScopeStamp {
             owner: Principal::Reserved {

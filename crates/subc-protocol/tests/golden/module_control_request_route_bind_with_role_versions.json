@@ -1,0 +1,23 @@
+{
+  "consumer_capabilities": [
+    "elicitation"
+  ],
+  "epoch": 7,
+  "identity": {
+    "harness": "opencode",
+    "project_root": "/tmp/subc/project",
+    "session": "session-0001"
+  },
+  "op": "route.bind",
+  "principal": {
+    "kind": "direct"
+  },
+  "role_versions": {
+    "tool-provider": "v1"
+  },
+  "route_channel": 42,
+  "target": {
+    "kind": "tool_provider",
+    "module_id": "aft-tools"
+  }
+}

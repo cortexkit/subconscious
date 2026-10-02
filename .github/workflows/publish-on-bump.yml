@@ -16,7 +16,18 @@ permissions:
 jobs:
   detect:
     name: Detect unpublished wire crates
-    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    # `branches: [master]` above matches the triggering run's HEAD BRANCH NAME,
+    # and CI also runs on pull_request, including from forks. A fork PR from a
+    # branch named master would otherwise start this workflow in the base repo,
+    # check out the fork's code and run it with the publish token. Only a push
+    # to this repository's own master may publish.
+    if: >-
+      ${{
+        github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.event == 'push' &&
+        github.event.workflow_run.head_branch == 'master' &&
+        github.event.workflow_run.head_repository.full_name == github.repository
+      }}
     runs-on: ubuntu-latest
     outputs:
       protocol_version: ${{ steps.versions.outputs.protocol_version }}

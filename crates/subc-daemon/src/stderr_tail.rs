@@ -215,6 +215,9 @@ pub struct StderrRing {
     bytes: usize,
     dropped_lines: u64,
     capture: CaptureState,
+    /// Read failures belong to retained process sections, not every later
+    /// process that reuses this ring. Eviction removes their missing-data claim.
+    incomplete: BTreeMap<u64, String>,
     /// Generation of the newest process boundary; 0 before the first.
     generation: u64,
     /// Readers that have not reached EOF yet, by the generation they read for.
@@ -240,6 +243,7 @@ impl StderrRing {
             },
             generation: 0,
             pumps: BTreeMap::new(),
+            incomplete: BTreeMap::new(),
             evicted_through: 0,
         }
     }
@@ -256,9 +260,19 @@ impl StderrRing {
     }
 
     pub fn mark_incomplete(&mut self, reason: impl Into<String>) {
-        self.capture = CaptureState::Incomplete {
-            reason: reason.into(),
+        self.mark_captured();
+        self.mark_incomplete_from(self.generation, reason);
+    }
+
+    pub(crate) fn mark_incomplete_from(&mut self, generation: u64, reason: impl Into<String>) {
+        let oldest_retained = match self.entries.front() {
+            Some(Slot::ProcessStart { generation }) => *generation,
+            Some(Slot::Line { .. }) => self.evicted_through,
+            None => self.generation,
         };
+        if generation >= oldest_retained {
+            self.incomplete.insert(generation, reason.into());
+        }
     }
 
     pub fn mark_not_captured(&mut self, reason: impl Into<String>) {
@@ -418,6 +432,13 @@ impl StderrRing {
                 }
             }
         }
+        let oldest_retained = match self.entries.front() {
+            Some(Slot::ProcessStart { generation }) => *generation,
+            Some(Slot::Line { .. }) => self.evicted_through,
+            None => self.generation,
+        };
+        self.incomplete
+            .retain(|generation, _| *generation >= oldest_retained);
     }
 
     /// The most recent entries, oldest first, bounded by the caller's limits.
@@ -488,12 +509,14 @@ impl StderrRing {
         // A retired process whose pipe the supervisor stopped waiting for may
         // still be writing; until its reader reaches EOF the tail cannot claim
         // to hold everything. A permanent state (a read failure, no pipe at
-        // all) is the more specific fact and is reported as is.
+        // all) is the more specific fact and is reported as is. A read failure
+        // no longer taints the tail after the affected section is evicted.
         let late = self.pumps.values().find_map(|phase| match phase {
             PumpPhase::Late { reason } => Some(reason),
             _ => None,
         });
-        let capture = match (&self.capture, late) {
+        let incomplete = self.incomplete.values().next().or(late);
+        let capture = match (&self.capture, incomplete) {
             (CaptureState::Captured, Some(reason)) => CaptureState::Incomplete {
                 reason: reason.clone(),
             },
@@ -684,7 +707,10 @@ async fn pump_lines_into<R, S>(
             Err(error) => {
                 if let Some((ring, generation)) = ring {
                     let mut ring = lock_ring(ring);
-                    ring.mark_incomplete(format!("{stream_name} read failed: {error}"));
+                    ring.mark_incomplete_from(
+                        generation,
+                        format!("{stream_name} read failed: {error}"),
+                    );
                     ring.finish_pump(generation);
                 } else {
                     tracing::warn!(stream = stream_name, error = %error, "child output capture read failed");
@@ -988,6 +1014,26 @@ mod tests {
         let snapshot = ring.snapshot(None, None);
         assert!(matches!(snapshot.capture, CaptureState::NotCaptured { .. }));
         assert!(snapshot.entries.is_empty());
+    }
+
+    #[test]
+    fn read_failure_does_not_taint_generations_after_its_section_is_evicted() {
+        let mut ring = StderrRing::new(StderrTailConfig {
+            max_lines: 1,
+            ..Default::default()
+        });
+        ring.begin_process();
+        ring.mark_captured();
+        ring.push_line("old output");
+        ring.mark_incomplete("read failed");
+        assert!(matches!(
+            ring.snapshot(None, None).capture,
+            CaptureState::Incomplete { .. }
+        ));
+        ring.begin_process();
+        ring.mark_captured();
+        ring.push_line("new output");
+        assert_eq!(ring.snapshot(None, None).capture, CaptureState::Captured);
     }
 
     #[test]

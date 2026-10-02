@@ -321,7 +321,7 @@ async fn health_prober_restarts_unresponsive_module_and_recovers_ok() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn health_prober_failing_restart_exhausts_budget_to_disabled() {
+async fn health_prober_failing_restart_exhausts_budget_to_failed() {
     let server = TestServer::start().await;
     let supervisor =
         supervisor(&server, 1, Duration::from_millis(10)).with_health_config(health_config(
@@ -345,22 +345,27 @@ async fn health_prober_failing_restart_exhausts_budget_to_disabled() {
     )
     .await;
 
-    // Health fields ride the same poll predicate: Disabled and the health
+    // Health fields ride the same poll predicate: Failed and the health
     // stamp are separate writes, so asserting them after a state-only wait
     // reads a mid-transition snapshot (flaked once in CI on ubuntu).
+    //
+    // Exhaustion leaves the module Failed and still enabled, not Disabled: the
+    // operator did not stop it, so `ck module start` must be able to revive it
+    // and the configured `enabled` must keep saying what the operator chose.
     //
     // The terminal health status is deliberately NOT pinned to Failing: with the
     // injected 20ms probe deadline, a loaded runner can time the probe out before
     // even this always-failing stub replies, so the budget-exhausting probe may
     // classify as Unresponsive instead of the domain-reported Failing. Both are
     // failing-class triggers; the mechanism under test is budget exhaustion to
-    // Disabled, not which trigger class fired last.
+    // Failed, not which trigger class fired last.
     wait_for_status(&module, SETUP_TIMEOUT, |status| {
-        status.state == ModuleState::Disabled
+        status.state == ModuleState::Failed
+            && status.enabled
             && status.restart_count == 1
             && !status.live
             && status.health.status != SupervisorHealthStatus::Ok
-            && status.health.last_action.as_deref() == Some("disabled")
+            && status.health.last_action.as_deref() == Some("failed")
     })
     .await;
 }

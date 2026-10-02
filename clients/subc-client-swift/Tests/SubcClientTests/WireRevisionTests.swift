@@ -236,6 +236,75 @@ final class EnvelopeRevisionTests: XCTestCase {
         let header = try decodeHeader(Data(encoded.prefix(HEADER_LEN)))
         XCTAssertEqual(header.len, UInt32(MAX_FRAME_BODY_LEN))
     }
+
+    // Production writers call `transport.writeAll(try encodeFrame(...))`, so a
+    // refusal from encodeFrame means the transport never sees a byte. Each case
+    // pairs the refused frame with a control that differs only in the offending
+    // field, so the refusal is pinned to that one decode rule.
+    private func assertEncodeRefusedBeforeWrite(
+        ty: FrameType,
+        flags: UInt8 = 0,
+        channel: UInt16,
+        epoch: UInt32,
+        body: Data,
+        expected: DecodeError,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        let transport = ScriptedTransport()
+        XCTAssertThrowsError(try transport.writeAll(try encodeFrame(
+            ty: ty,
+            flags: flags,
+            channel: channel,
+            epoch: epoch,
+            corr: 1,
+            body: body
+        )), file: file, line: line) { error in
+            XCTAssertEqual(error as? DecodeError, expected, file: file, line: line)
+        }
+        XCTAssertTrue(transport.writes.isEmpty, "a refused frame must write nothing", file: file, line: line)
+    }
+
+    func testEncodeRefusesPureHeaderTypeWithBody() throws {
+        assertEncodeRefusedBeforeWrite(
+            ty: .ping, channel: 0, epoch: 0, body: Data([1]),
+            expected: .pureHeaderFrameWithBody(ty: .ping, len: 1)
+        )
+        XCTAssertNoThrow(try encodeFrame(ty: .request, flags: 0, channel: 0, epoch: 0, corr: 1, body: Data([1])))
+    }
+
+    func testEncodeRefusesNonzeroEpochOnControlChannel() throws {
+        assertEncodeRefusedBeforeWrite(
+            ty: .request, channel: 0, epoch: 1, body: Data(),
+            expected: .nonzeroEpochOnControlChannel(epoch: 1)
+        )
+        XCTAssertNoThrow(try encodeFrame(ty: .request, flags: 0, channel: 7, epoch: 1, corr: 1, body: Data()))
+    }
+
+    func testEncodeRefusesSheddableAdmissionOnRequest() throws {
+        let sheddable = buildFlags(binary: false, priority: .background, last: false, admissionClass: .sheddable)
+        assertEncodeRefusedBeforeWrite(
+            ty: .request, flags: sheddable, channel: 7, epoch: 1, body: Data(),
+            expected: .sheddableIllegalFrameType(ty: .request, flags: sheddable)
+        )
+        XCTAssertNoThrow(try encodeFrame(ty: .push, flags: sheddable, channel: 7, epoch: 1, corr: 1, body: Data()))
+    }
+
+    func testOversizedBodyIsRefusedBeforeWrite() {
+        let transport = ScriptedTransport()
+        let bodyLength = MAX_FRAME_BODY_LEN + 1
+        XCTAssertThrowsError(try transport.writeAll(try encodeFrame(
+            ty: .request,
+            flags: 0,
+            channel: 1,
+            epoch: 1,
+            corr: 1,
+            body: Data(count: bodyLength)
+        ))) { error in
+            XCTAssertEqual(error as? FrameEncodeError, .bodyTooLarge(len: bodyLength, max: MAX_FRAME_BODY_LEN))
+        }
+        XCTAssertTrue(transport.writes.isEmpty, "a refused frame must write nothing")
+    }
 }
 
 final class ClientWireRevisionTests: XCTestCase {

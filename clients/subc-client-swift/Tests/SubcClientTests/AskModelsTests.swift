@@ -360,6 +360,58 @@ extension AskModelsTests {
             let ask = try JSONDecoder().decode(AskRequest.self, from: data)
             XCTAssertEqual(ask.attachments?.first?.artifactID, "art_abc", "spelling \(spelling) must decode")
         }
+    }
+
+    /// A link pointer has no bytes behind it: fetching it is refused, so the client
+    /// must be able to tell it from a file and open its URL instead. Both shapes on
+    /// one ask, as the producer emits them.
+    func testDecodesLinkAndFilePointerKinds() throws {
+        let data = try JSONSerialization.data(withJSONObject: [
+            "requestID": "ask_kinds", "question": "Merge PR #284 into main?", "askedAt": 1_700_000_000_000,
+            "attachments": [
+                ["artifactID": "art_e14", "title": "284", "mime": "text/uri-list", "kind": "link",
+                 "url": "https://github.com/cortexkit/anthropic-auth/pull/284", "sealed": true],
+                ["artifactID": "art_f22", "title": "diff.patch", "mime": "text/x-patch", "kind": "file", "byteCount": 512],
+            ],
+        ])
+        let ask = try JSONDecoder().decode(AskRequest.self, from: data)
+        let link = try XCTUnwrap(ask.attachments?[0])
+        XCTAssertEqual(link.kind, AskAttachment.linkKind)
+        XCTAssertEqual(link.url, "https://github.com/cortexkit/anthropic-auth/pull/284")
+        XCTAssertTrue(link.isLink)
+        let file = try XCTUnwrap(ask.attachments?[1])
+        XCTAssertEqual(file.kind, AskAttachment.fileKind)
+        XCTAssertNil(file.url)
+        XCTAssertFalse(file.isLink)
+    }
+
+    /// `kind` is an open string: an unknown kind decodes and is not a link, and a
+    /// pointer with no `kind` (every producer before this field) is not a link
+    /// either, so it keeps today's fetch. A link with no `url` cannot be opened.
+    func testUnknownOrAbsentKindIsNotALink() throws {
+        let data = try JSONSerialization.data(withJSONObject: [
+            "requestID": "ask_open_kind", "question": "q", "askedAt": 1,
+            "attachments": [
+                ["artifactID": "art_1", "title": "a", "mime": "text/plain", "kind": "stream"],
+                ["artifactID": "art_2", "title": "b", "mime": "text/plain"],
+                ["artifactID": "art_3", "title": "c", "mime": "text/uri-list", "kind": "link"],
+            ],
+        ])
+        let attachments = try XCTUnwrap(try JSONDecoder().decode(AskRequest.self, from: data).attachments)
+        XCTAssertEqual(attachments[0].kind, "stream")
+        XCTAssertFalse(attachments[0].isLink)
+        XCTAssertNil(attachments[1].kind)
+        XCTAssertFalse(attachments[1].isLink)
+        XCTAssertFalse(attachments[2].isLink, "a link without a url is not openable")
+    }
+
+    /// The new fields survive an encode/decode round trip, so a client that caches
+    /// asks does not lose a link's URL.
+    func testLinkPointerRoundTrips() throws {
+        let original = AskAttachment(artifactID: "art_9", title: "284", mime: "text/uri-list",
+                                     kind: AskAttachment.linkKind, url: "https://example.com/pr/284")
+        let decoded = try JSONDecoder().decode(AskAttachment.self, from: JSONEncoder().encode(original))
+        XCTAssertEqual(decoded, original)
     }// `who` is an open string by producer contract. A speaker value no current
     /// client knows must decode, not throw — an enum here would take the whole
     /// ask down with the first new speaker kind.

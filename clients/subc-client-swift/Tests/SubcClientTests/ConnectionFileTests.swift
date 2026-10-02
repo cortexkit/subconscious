@@ -98,6 +98,29 @@ final class ConnectionFileTests: XCTestCase {
         assertConnectionFileError(try readConnectionFile(path), containing: "connection file JSON decode failed")
     }
 
+    // The arms share one 0600 file and differ only in the uid the reader
+    // expects, so the refusal can come from nothing but the ownership check.
+    func testRejectsOwnerOnlyFileOwnedByAnotherUID() throws {
+        let path = try connectionFile()
+        var info = stat()
+        XCTAssertEqual(stat(path, &info), 0)
+        let owner = info.st_uid
+        XCTAssertNoThrow(try readConnectionFile(path, expectedOwner: owner))
+
+        let foreign: uid_t = owner == 0 ? 1 : 0
+        assertConnectionFileError(
+            try readConnectionFile(path, expectedOwner: foreign),
+            containing: "is owned by uid \(owner), expected effective uid \(foreign)"
+        )
+    }
+
+    func testRejectsGroupReadableFile() throws {
+        let path = try connectionFile()
+        try FileManager.default.setAttributes([.posixPermissions: NSNumber(value: 0o640)], ofItemAtPath: path)
+
+        assertConnectionFileError(try readConnectionFile(path), containing: "insecure permissions 0o640")
+    }
+
     func testRejectsMismatchedWireVersionWithUpgradeGuidance() throws {
         let wireVersion = Int(PROTOCOL_VERSION) + 1
         let path = try connectionFile(["wire_version": wireVersion])

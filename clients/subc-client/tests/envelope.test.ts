@@ -18,6 +18,7 @@ import {
   Priority,
   SUBSCRIPTION_FLAG,
   type EnvelopeHeader,
+  type DecodeErrorCode,
   type Frame,
 } from "../src/envelope.js";
 
@@ -322,5 +323,58 @@ describe("21-byte envelope header", () => {
       const legacy = buildOutcome(() => legacyBuildFrameWithVersion(input), compareWire);
       expect(current, scenario.name).toEqual(legacy);
     }
+  });
+});
+
+// encodeFrame is the last step before every socket write, so a frame it refuses
+// never produces a byte. Each case pairs the refused frame with a control that
+// differs only in the offending field, so the refusal is pinned to that rule.
+describe("encodeFrame refuses frames the decoder would reject", () => {
+  function writeThroughEncoder(frame: Frame): Uint8Array[] {
+    const written: Uint8Array[] = [];
+    try {
+      written.push(encodeFrame(frame));
+    } catch (error) {
+      expect(written).toHaveLength(0);
+      throw error;
+    }
+    return written;
+  }
+
+  function expectRefused(frame: Frame, code: DecodeErrorCode): void {
+    let caught: unknown;
+    try {
+      writeThroughEncoder(frame);
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(DecodeError);
+    expect((caught as DecodeError).code).toBe(code);
+  }
+
+  test("a pure-header type carrying a body", () => {
+    const body = new Uint8Array([1]);
+    expectRefused({ header: header(1, FrameType.Ping, 0, 0, 0, 1n), body }, "pure_header_frame_with_body");
+    expect(writeThroughEncoder({ header: header(1, FrameType.Request, 0, 0, 0, 1n), body })).toHaveLength(1);
+  });
+
+  test("channel 0 with a non-zero epoch", () => {
+    const body = new Uint8Array(0);
+    expectRefused({ header: header(0, FrameType.Request, 0, 0, 1, 1n), body }, "nonzero_epoch_on_control_channel");
+    expect(writeThroughEncoder({ header: header(0, FrameType.Request, 0, 7, 1, 1n), body })).toHaveLength(1);
+  });
+
+  test("sheddable admission on a request", () => {
+    const sheddable = buildFlags(false, Priority.Background, false, AdmissionClass.Sheddable);
+    const body = new Uint8Array(0);
+    expectRefused({ header: header(0, FrameType.Request, sheddable, 7, 1, 1n), body }, "sheddable_illegal_frame_type");
+    expect(writeThroughEncoder({ header: header(0, FrameType.Push, sheddable, 7, 1, 1n), body })).toHaveLength(1);
+  });
+
+  test("a body over MAX_FRAME_BODY_LEN", () => {
+    const over = new Uint8Array(MAX_FRAME_BODY_LEN + 1);
+    expectRefused({ header: header(over.length, FrameType.Request, 0, 7, 1, 1n), body: over }, "frame_body_too_large");
+    const atCap = over.subarray(0, MAX_FRAME_BODY_LEN);
+    expect(writeThroughEncoder({ header: header(atCap.length, FrameType.Request, 0, 7, 1, 1n), body: atCap })).toHaveLength(1);
   });
 });

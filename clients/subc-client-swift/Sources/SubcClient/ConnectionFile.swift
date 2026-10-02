@@ -1,10 +1,15 @@
 import Foundation
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
 
 // Port of subc-transport's connection_file.rs reader (and the TS mirror in
 // connection-file.ts). The connection file is the daemon's published rendezvous
 // record; its `key` is the shared transport secret. We refuse to trust a key
-// from a file other local users can read (owner-only 0600), so a leaked key is a
-// loud failure rather than a silent downgrade.
+// from a file another local user owns or can read (owner-only 0600), so a
+// substituted or leaked key is a loud failure rather than a silent downgrade.
 
 public let SCHEMA_VERSION = 1
 public let MIN_KEY_LEN = 32
@@ -27,9 +32,13 @@ public struct ConnectionInfo {
 public struct ConnectionFileError: Error { public let message: String }
 
 public func readConnectionFile(_ path: String) throws -> ConnectionInfo {
-    try verifyOwnerOnly(path)
+    try readConnectionFile(path, expectedOwner: geteuid())
+}
 
-    let raw = try Data(contentsOf: URL(fileURLWithPath: path))
+/// `readConnectionFile` with the expected owner uid supplied by the caller, so
+/// tests can present a foreign owner without changing the process uid.
+func readConnectionFile(_ path: String, expectedOwner: uid_t) throws -> ConnectionInfo {
+    let raw = try readOwnerOnly(path, expectedOwner: expectedOwner)
     let decoded: Any
     do {
         decoded = try JSONSerialization.jsonObject(with: raw)
@@ -103,12 +112,30 @@ private func bytes(_ value: Any?, _ field: String) throws -> Data {
     })
 }
 
-/// On unix, reject any group/other permission bit: the key is published
-/// owner-only (0600), so a wider mode means the secret has leaked.
-private func verifyOwnerOnly(_ path: String) throws {
-    let attrs = try FileManager.default.attributesOfItem(atPath: path)
-    guard let perm = (attrs[.posixPermissions] as? NSNumber)?.intValue else { return }
+/// Open the file once, verify the opened file, and read it through the same
+/// handle. Checking the opened file rather than a second lookup of the path
+/// means replacing the path between the check and the read cannot let an
+/// unchecked key through.
+///
+/// Refuse a file owned by anyone but `expectedOwner`: even at 0600, its owner
+/// could have written their own endpoint and key, and this client would then
+/// authenticate to them. Then refuse any group/other permission bit: the key is
+/// published owner-only (0600), so a wider mode means the secret has leaked.
+private func readOwnerOnly(_ path: String, expectedOwner: uid_t) throws -> Data {
+    let handle = try FileHandle(forReadingFrom: URL(fileURLWithPath: path))
+    defer { try? handle.close() }
+
+    var info = stat()
+    guard fstat(handle.fileDescriptor, &info) == 0 else {
+        let code = errno
+        throw ConnectionFileError(message: "connection file \(path) could not be checked: fstat failed: \(String(cString: strerror(code)))")
+    }
+    guard info.st_uid == expectedOwner else {
+        throw ConnectionFileError(message: "connection file \(path) is owned by uid \(info.st_uid), expected effective uid \(expectedOwner)")
+    }
+    let perm = Int(info.st_mode) & 0o777
     if (perm & 0o077) != 0 {
         throw ConnectionFileError(message: "connection file \(path) has insecure permissions 0o\(String(perm, radix: 8)); expected owner-only 0600")
     }
+    return try handle.readToEnd() ?? Data()
 }

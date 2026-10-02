@@ -2856,6 +2856,16 @@ fn desired_session_from_catalog(
             }
 
             let exposed_name = format!("{namespace}_{}", tool.name);
+            // Hosts apply their limit to the advertised name, including the
+            // namespace separator, not independently to its two components.
+            if exposed_name.len() > 64 {
+                tracing::debug!(
+                    "skipping tool '{}.{}': exposed MCP name exceeds 64 characters",
+                    entry.module_id,
+                    tool.name
+                );
+                continue;
+            }
             if is_reserved_meta_tool_name(&exposed_name) {
                 tracing::debug!(
                     "skipping tool '{}.{}': exposed name '{exposed_name}' collides with a reserved meta-tool",

@@ -266,8 +266,17 @@ impl AdapterHandler {
             .into_handler_outcome();
         }
 
+        // Pagination cursors select different results. Keep their captures separate
+        // so following nextCursor cannot return an earlier page indefinitely.
+        let cache_key = (
+            request.server.clone(),
+            request
+                .payload
+                .pointer("/params/cursor")
+                .map(Value::to_string),
+        );
         if request.op == Operation::ToolsList && config.cache_tools_list {
-            if let Some(cached) = self.lifecycle.cached_tools(&request.server) {
+            if let Some(cached) = self.lifecycle.cached_tools(&cache_key) {
                 self.metrics
                     .cache_served_total
                     .fetch_add(1, Ordering::Relaxed);
@@ -290,7 +299,7 @@ impl AdapterHandler {
             Ok(forwarded) => {
                 if request.op == Operation::ToolsList && forwarded.cacheable {
                     self.lifecycle.cache_tools(
-                        &request.server,
+                        cache_key,
                         CachedTools {
                             payload: forwarded.payload.clone(),
                             observed_at_ms: forwarded.observed_at_ms,
@@ -332,7 +341,7 @@ struct ChildLifecycle {
     resolver: Arc<dyn CredentialResolver>,
     settings: LifecycleSettings,
     slots: Mutex<BTreeMap<String, Arc<ServerSlot>>>,
-    cached_tools: Mutex<BTreeMap<String, CachedTools>>,
+    cached_tools: Mutex<BTreeMap<(String, Option<String>), CachedTools>>,
 }
 
 impl ChildLifecycle {
@@ -362,19 +371,19 @@ impl ChildLifecycle {
         )
     }
 
-    fn cached_tools(&self, server: &str) -> Option<CachedTools> {
+    fn cached_tools(&self, key: &(String, Option<String>)) -> Option<CachedTools> {
         self.cached_tools
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(server)
+            .get(key)
             .cloned()
     }
 
-    fn cache_tools(&self, server: &str, cached: CachedTools) {
+    fn cache_tools(&self, key: (String, Option<String>), cached: CachedTools) {
         self.cached_tools
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(server.to_string(), cached);
+            .insert(key, cached);
     }
 
     async fn forward(
@@ -882,7 +891,7 @@ async fn initialize_child(
     let response = timeout(budget, read_response(session, 0, ceiling_bytes))
         .await
         .map_err(|_| FrameReadError::TimedOut)??;
-    if child_payload(response).is_none() {
+    if !response.get("result").is_some_and(Value::is_object) || response.get("error").is_some() {
         return Err(FrameReadError::Framing { observed_bytes: 0 });
     }
     write_json_line(
@@ -913,6 +922,21 @@ async fn read_response(
             serde_json::from_slice(&frame).map_err(|_| FrameReadError::Framing {
                 observed_bytes: frame.len() as u64,
             })?;
+        // JSON-RPC requests and responses have independent id spaces. A server's
+        // ping can reuse our call id without becoming the call's terminal reply.
+        if let Some(method) = parsed.get("method") {
+            if let Some(id) = parsed.get("id") {
+                let reply = if method.as_str() == Some("ping") {
+                    json!({"jsonrpc":"2.0", "id":id, "result":{}})
+                } else {
+                    json!({"jsonrpc":"2.0", "id":id, "error":{"code":-32601, "message":"client method not supported"}})
+                };
+                write_json_line(session.stdin.as_mut(), &reply)
+                    .await
+                    .map_err(|_| FrameReadError::Io)?;
+            }
+            continue;
+        }
         if parsed.get("id").and_then(Value::as_u64) == Some(expected_id) {
             return Ok(parsed);
         }

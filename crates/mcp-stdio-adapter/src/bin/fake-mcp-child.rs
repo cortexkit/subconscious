@@ -18,6 +18,9 @@ fn main() {
             continue;
         };
         let method = request.get("method").and_then(Value::as_str);
+        if method.is_none() {
+            continue;
+        }
         if method == Some("notifications/initialized") {
             continue;
         }

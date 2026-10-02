@@ -5000,6 +5000,18 @@ async fn bind_relay_breaker_opens_at_the_threshold_and_refuses_before_relaying()
     )
     .await;
     assert_eq!(refused.code, "module_timeout");
+    // The caller is told the module is slow, not down: a worker that reads
+    // only a count of failed relays concludes the module has died.
+    assert!(
+        refused
+            .message
+            .contains("is slow to accept new routes (3 timed out in a row)")
+            && refused
+                .message
+                .contains("its established routes are unaffected"),
+        "{}",
+        refused.message
+    );
 
     // Wait out more than a whole budget: a relay, had one been sent, would
     // have reached the stub and been recorded long before this returns.

@@ -2812,17 +2812,21 @@ impl ControlHandler {
             probe_in_flight,
             "route.open refused by open bind-relay breaker"
         );
+        // Say what a caller can act on. The module is running and its
+        // established routes keep working; only new routes are being held off
+        // while it is slow to accept them. A message that only counts failed
+        // relays reads as "the module is down" to a worker that sees it.
         let detail = if probe_in_flight {
-            "one probe bind is already in flight; retry once it settles".to_string()
+            "one test route is already being tried; retry once it settles".to_string()
         } else {
-            format!("not relaying for another {retry_in:?}")
+            format!("retrying new routes in {}s", retry_in.as_secs().max(1))
         };
         control_error_frame(
             frame,
             "module_timeout",
             format!(
-                "module_id '{module_id}' failed {consecutive_timeouts} consecutive route.bind \
-                 relays; {detail}"
+                "module '{module_id}' is slow to accept new routes ({consecutive_timeouts} \
+                 timed out in a row); {detail}; its established routes are unaffected"
             ),
         )
     }

@@ -1186,6 +1186,7 @@ impl SubcConsumer {
     }
 
     /// Fetch the daemon's module catalog over channel 0.
+    /// Transport retries use the consumer's reconnect backoff and call deadline.
     pub async fn catalog_list(&self) -> Result<CatalogList, CallError> {
         let deadline = Instant::now() + self.shared.opts.call_timeout;
         let body = serde_json::to_vec(&serde_json::json!({
@@ -1193,7 +1194,9 @@ impl SubcConsumer {
         }))
         .map_err(|err| CallError::not_sent(format!("failed to encode catalog.list: {err}")))?;
 
+        let mut attempt = 0usize;
         loop {
+            attempt = attempt.saturating_add(1);
             match self
                 .shared
                 .control_call(body.clone(), deadline, false, None)
@@ -1229,6 +1232,16 @@ impl SubcConsumer {
                 Err(err)
                     if is_retryable_catalog_transport_error(&err) && Instant::now() < deadline =>
                 {
+                    // Connection-file and discovery failures can complete without
+                    // yielding. Pace the outer retry as well as reconnect itself,
+                    // so repeated immediate failures cannot monopolize the executor.
+                    let delay = self.shared.jittered(
+                        self.shared
+                            .opts
+                            .reconnect_backoff
+                            .delay_after_attempt(attempt),
+                    );
+                    self.shared.sleep_until_retry(deadline, delay).await?;
                     continue;
                 }
                 Err(err) => return Err(err),
@@ -1242,14 +1255,17 @@ impl SubcConsumer {
     ///
     /// A daemon refusal comes back as [`CallError::Module`], so its code is readable
     /// through [`CallError::code`]. Transport failures are retried until the
-    /// consumer's call deadline, as for [`SubcConsumer::catalog_list`].
+    /// consumer's call deadline with its reconnect backoff, as for
+    /// [`SubcConsumer::catalog_list`].
     pub async fn spawn_snapshot(&self) -> Result<SpawnSnapshot, CallError> {
         let deadline = Instant::now() + self.shared.opts.call_timeout;
         let body = serde_json::to_vec(&ClientControlRequest::SupervisorSpawnSnapshot {}).map_err(
             |err| CallError::not_sent(format!("failed to encode supervisor.spawn_snapshot: {err}")),
         )?;
 
+        let mut attempt = 0usize;
         loop {
+            attempt = attempt.saturating_add(1);
             match self
                 .shared
                 .control_call(body.clone(), deadline, false, None)
@@ -1279,6 +1295,13 @@ impl SubcConsumer {
                 Err(err)
                     if is_retryable_catalog_transport_error(&err) && Instant::now() < deadline =>
                 {
+                    let delay = self.shared.jittered(
+                        self.shared
+                            .opts
+                            .reconnect_backoff
+                            .delay_after_attempt(attempt),
+                    );
+                    self.shared.sleep_until_retry(deadline, delay).await?;
                     continue;
                 }
                 Err(err) => return Err(err),
@@ -9057,6 +9080,56 @@ mod tests {
             .expect("catalog.list must finish at its configured deadline")
             .unwrap_err();
         assert!(matches!(result, CallError::NotSent(_)));
+    }
+
+    fn consumer_with_malformed_connection_file() -> (subc_test_support::TestTempDir, SubcConsumer) {
+        let temp = subc_test_support::TestTempDir::new("consumer-malformed-connection");
+        let path = temp.path().join("connection.json");
+        std::fs::write(&path, b"not JSON").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let shared = Arc::new(Shared::new(
+            path,
+            ConsumerOptions {
+                call_timeout: Duration::from_millis(100),
+                reconnect_backoff: RetryBackoff {
+                    base: Duration::from_millis(20),
+                    cap: Duration::from_millis(40),
+                    max_attempts: 6,
+                },
+                ..ConsumerOptions::default()
+            },
+        ));
+        (temp, SubcConsumer { shared })
+    }
+
+    // A malformed file fails synchronously. Keep the clock running so an unpaced
+    // retry loop reaches its deadline instead of hanging a paused-time runtime.
+    #[tokio::test]
+    async fn catalog_list_backs_off_after_malformed_connection_file_and_close_cancels_it() {
+        let (_temp, consumer) = consumer_with_malformed_connection_file();
+        let call = consumer.catalog_list();
+        tokio::pin!(call);
+        assert_pending(call.as_mut()).await;
+        consumer.close().await;
+        let err = call.await.unwrap_err();
+        assert!(matches!(err, CallError::NotSent(_)));
+        assert!(err.to_string().contains("consumer closed"));
+    }
+
+    #[tokio::test]
+    async fn spawn_snapshot_backs_off_after_malformed_connection_file_and_close_cancels_it() {
+        let (_temp, consumer) = consumer_with_malformed_connection_file();
+        let call = consumer.spawn_snapshot();
+        tokio::pin!(call);
+        assert_pending(call.as_mut()).await;
+        consumer.close().await;
+        let err = call.await.unwrap_err();
+        assert!(matches!(err, CallError::NotSent(_)));
+        assert!(err.to_string().contains("consumer closed"));
     }
 }
 

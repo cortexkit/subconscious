@@ -361,7 +361,13 @@ pub async fn dashboard_update_at<S: ReleaseSource>(
         CacheRead::Absent | CacheRead::Malformed | CacheRead::Unreadable(_) => None,
     };
     if let Some(metadata) = &cached {
-        if metadata.is_fresh_at(now_unix_secs) {
+        // An explicit check may have cached only the then-installed roster.
+        // Freshness alone cannot establish currency for a later installation.
+        if metadata.is_fresh_at(now_unix_secs)
+            && roster_for_installed(installed)
+                .iter()
+                .all(|target| metadata.targets.contains_key(target.label()))
+        {
             return dashboard_state(metadata, installed, now_unix_secs);
         }
     }
@@ -722,6 +728,42 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    #[tokio::test]
+    async fn a_fresh_cache_without_a_newly_installed_target_is_refreshed() {
+        let (_dir, cache) = cache("partial-roster");
+        let mut partial = metadata(10_000, "0.12.0");
+        partial.targets.remove("ck-aft");
+        cache.write(&partial).unwrap();
+        let source = StaticSource::successful("0.13.0");
+        let update = dashboard_update_at(
+            &cache,
+            &source,
+            &installed("0.12.0"),
+            10_030,
+            Duration::from_millis(100),
+        )
+        .await;
+        assert!(
+            matches!(update, DashboardUpdate::Available { ref updates, .. } if updates.iter().any(|delta| delta.target.label() == "ck-aft")),
+            "{update:?}"
+        );
+        assert!(!source.calls().is_empty());
+        cache.write(&partial).unwrap();
+        let offline = StaticSource::failing(ReleaseSourceError::Offline("offline".into()));
+        let update = dashboard_update_at(
+            &cache,
+            &offline,
+            &installed("0.12.0"),
+            10_030,
+            Duration::from_millis(100),
+        )
+        .await;
+        assert!(
+            matches!(update, DashboardUpdate::NotChecked { .. }),
+            "{update:?}"
+        );
     }
 
     #[tokio::test]

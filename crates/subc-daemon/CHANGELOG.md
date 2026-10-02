@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.29.2
+
+- Refuse a second HELLO on a registered module connection without changing its identity, launch nonce, or existing routes.
+
 ## 0.29.1 — 2026-10-02
 
 - Linux module teardown atomically kills the contained process tree with `cgroup.kill` after waiting for graceful module shutdown. If cgroup delegation or kernel support is unavailable, teardown kills only the direct child as before. I/O failures produce a warning but do not change the teardown result.

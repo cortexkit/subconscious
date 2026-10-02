@@ -278,7 +278,17 @@ export function buildFrameWithVersion(
   return { header, body };
 }
 
-/** Encode a frame to wire bytes: header followed by exactly `len` body bytes. */
+/**
+ * Encode a frame to wire bytes: header followed by exactly `len` body bytes.
+ *
+ * Refuses, before producing any bytes, a frame the peer's decoder would reject:
+ * a header that fails any wire decode rule, or a body over MAX_FRAME_BODY_LEN.
+ * A `Frame` can be assembled by hand without going through `buildFrame`, and
+ * once a rejected header is on the socket the peer tears the whole connection
+ * down, so the refusal has to happen here rather than on the far side. The
+ * header check runs the encoded bytes through `decodeHeader` itself, so the
+ * writer cannot drift from the reader's rules.
+ */
 export function encodeFrame(frame: Frame): Uint8Array {
   if (frame.header.len !== frame.body.length) {
     throw new DecodeError(
@@ -286,7 +296,14 @@ export function encodeFrame(frame: Frame): Uint8Array {
       "frame_length_mismatch",
     );
   }
+  if (frame.body.length > MAX_FRAME_BODY_LEN) {
+    throw new DecodeError(
+      `frame body ${frame.body.length} exceeds max ${MAX_FRAME_BODY_LEN}`,
+      "frame_body_too_large",
+    );
+  }
   const header = encodeHeader(frame.header);
+  decodeHeader(header);
   const output = new Uint8Array(header.length + frame.body.length);
   output.set(header, 0);
   output.set(frame.body, header.length);

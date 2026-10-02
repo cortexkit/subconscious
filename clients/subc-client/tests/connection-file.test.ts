@@ -1,9 +1,9 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { ConnectionFileError, readConnectionFile } from "../src/connection-file.js";
+import { ConnectionFileError, readConnectionFile, readConnectionFileForUid } from "../src/connection-file.js";
 import { PROTOCOL_VERSION } from "../src/envelope.js";
 
 const dirs: string[] = [];
@@ -61,6 +61,18 @@ describe("connection file reader", () => {
   test.if(process.platform !== "win32")("rejects a group/world-readable file", async () => {
     const path = tempFile(validInfo(), 0o644);
     await expect(readConnectionFile(path)).rejects.toThrow(/insecure permissions/);
+  });
+
+  // The arms share one 0600 file and differ only in the uid the reader expects,
+  // so the refusal can come from nothing but the ownership check.
+  test.if(process.platform !== "win32")("rejects an owner-only file owned by another uid", async () => {
+    const path = tempFile(validInfo(), 0o600);
+    const owner = statSync(path).uid;
+    await expect(readConnectionFileForUid(path, owner)).resolves.toMatchObject({ schema: 1 });
+    const foreign = owner === 0 ? 1 : 0;
+    const refusal = readConnectionFileForUid(path, foreign);
+    await expect(refusal).rejects.toBeInstanceOf(ConnectionFileError);
+    await expect(refusal).rejects.toThrow(`is owned by uid ${owner}, expected effective uid ${foreign}`);
   });
 
   test("rejects an unsupported schema", async () => {

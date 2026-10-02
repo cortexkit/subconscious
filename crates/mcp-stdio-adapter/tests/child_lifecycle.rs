@@ -390,10 +390,30 @@ fn mode_handler(mode: &str) -> AdapterHandler {
 
 #[tokio::test]
 async fn initialize_error_is_refused_before_tool_dispatch() {
-    let handler = mode_handler("initialize-error");
+    let home = subc_test_support::TestTempDir::new("initialize-error-frames");
+    let events = home.join("frames.jsonl");
+    let handler = AdapterHandler::with_resolver(
+        registry(
+            json!({"fixture":server(json!({"FIXTURE_MODE":{"value":"initialize-error"},
+            "FIXTURE_EVENTS_PATH":{"value":events.to_string_lossy()}}))}),
+        ),
+        Arc::new(MissingResolver),
+        test_settings(),
+    );
     let (code, _) = refusal(&handler, "fixture", "tools/call").await;
     assert_eq!(code, "initialize_failed");
     assert_eq!(handler.metrics().snapshot()["children_live"], 0);
+    let frames: Vec<Value> = std::fs::read_to_string(events)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(
+        frames.len(),
+        1,
+        "initialize refusal must not write initialized or a tool request"
+    );
+    assert_eq!(frames[0]["method"], "initialize");
 }
 
 #[tokio::test]

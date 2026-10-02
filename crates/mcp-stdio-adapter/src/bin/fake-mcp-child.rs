@@ -17,6 +17,14 @@ fn main() {
         let Ok(request) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
+        if let Ok(path) = std::env::var("FIXTURE_EVENTS_PATH") {
+            let mut events = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .unwrap();
+            writeln!(events, "{request}").unwrap();
+        }
         let method = request.get("method").and_then(Value::as_str);
         if method.is_none() {
             continue;

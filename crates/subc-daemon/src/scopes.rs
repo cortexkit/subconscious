@@ -397,6 +397,15 @@ type RecordRefusal = (&'static str, String);
 /// The owner whose sync is in progress, and its set as it will stand.
 type Overlay<'a> = Option<(&'a str, &'a BTreeMap<String, ScopeRecord>)>;
 
+type ScopeLinkKey<'a> = (&'a str, &'a str, u64);
+
+#[derive(Default)]
+struct LinkCycleCache<'a> {
+    acyclic: HashSet<ScopeLinkKey<'a>>,
+    cycles: HashMap<ScopeLinkKey<'a>, usize>,
+    members: Vec<HashSet<(&'a str, &'a str)>>,
+}
+
 impl ScopeTable {
     pub(crate) fn new(authority_owners: impl IntoIterator<Item = String>) -> Self {
         Self {
@@ -571,10 +580,10 @@ impl ScopeTable {
                 }
             }
             if rejected.is_none() {
-                // Memoize acyclic ancestry only for this stable overlay. A
+                // Memoize ancestry only for this stable overlay. A
                 // refused cyclic link can restore an older record, so any
                 // topology change discards the cache before checking again.
-                let mut acyclic = HashSet::new();
+                let mut cache = LinkCycleCache::default();
                 for (index, record) in scopes.iter().enumerate() {
                     if new_link_states.get(&record.scope_ref) == Some(&ParentState::Linked)
                         && self.link_closes_cycle_cached(
@@ -582,7 +591,7 @@ impl ScopeTable {
                             owner,
                             &record.scope_ref,
                             record.parent.as_ref().unwrap(),
-                            &mut acyclic,
+                            &mut cache,
                         )
                     {
                         rejected = Some((index, "the parent link would close a cycle".to_string()));
@@ -958,30 +967,51 @@ impl ScopeTable {
         Ok(ParentState::Linked)
     }
 
-    /// Cache paths known to terminate, sharing the work across siblings and
-    /// long chains. References avoid cloning a parent record at every hop.
+    /// Cache both terminating paths and cycle membership, sharing the work
+    /// across children of the same ancestry. An unrelated cycle does not make
+    /// a child cyclic, but its members must still be refused when examined.
     fn link_closes_cycle_cached<'a>(
         &'a self,
         overlay: Overlay<'a>,
         child_owner: &str,
         child_ref: &str,
         parent: &'a ScopeParent,
-        acyclic: &mut HashSet<(&'a str, &'a str, u64)>,
+        cache: &mut LinkCycleCache<'a>,
     ) -> bool {
-        let mut visited = HashSet::new();
+        let mut visited = HashMap::new();
+        let mut path: Vec<ScopeLinkKey<'a>> = Vec::new();
         let mut link = parent;
         while let Some(owner) = reserved_module_id(&link.owner) {
             let key = (owner, link.scope_ref.as_str(), link.scope_epoch);
             if owner == child_owner && link.scope_ref == child_ref {
                 return true;
             }
-            if acyclic.contains(&key) {
+            if cache.acyclic.contains(&key) {
                 break;
             }
-            if !visited.insert(key) {
-                // An unrelated cycle is not evidence this link closes one.
+            if let Some(&cycle) = cache.cycles.get(&key) {
+                let closes_cycle = cache.members[cycle].contains(&(child_owner, child_ref));
+                if !closes_cycle {
+                    cache.acyclic.extend(path);
+                }
+                return closes_cycle;
+            }
+            if let Some(&start) = visited.get(&key) {
+                let cycle = cache.members.len();
+                cache.members.push(
+                    path[start..]
+                        .iter()
+                        .map(|&(owner, scope_ref, _)| (owner, scope_ref))
+                        .collect(),
+                );
+                for &member in &path[start..] {
+                    cache.cycles.insert(member, cycle);
+                }
+                cache.acyclic.extend(path[..start].iter().copied());
                 return false;
             }
+            visited.insert(key, path.len());
+            path.push(key);
             let Some(record) = self.lookup(overlay, owner, &link.scope_ref) else {
                 break;
             };
@@ -993,7 +1023,7 @@ impl ScopeTable {
             };
             link = up;
         }
-        acyclic.extend(visited);
+        cache.acyclic.extend(path);
         false
     }
 
@@ -2023,6 +2053,52 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn shared_cyclic_ancestry_is_walked_once_per_overlay() {
+        let table = table();
+        let size = 100;
+        let next = (0..size)
+            .map(|index| {
+                let record = child_of(
+                    &index.to_string(),
+                    PREFRONTAL,
+                    &((index + 1) % size).to_string(),
+                    1,
+                );
+                (record.scope_ref.clone(), record)
+            })
+            .collect::<BTreeMap<_, _>>();
+        let parent = ScopeParent {
+            owner: reserved(PREFRONTAL),
+            scope_ref: "0".to_string(),
+            scope_epoch: 1,
+        };
+        let mut cache = Default::default();
+        for index in 0..size {
+            assert!(!table.link_closes_cycle_cached(
+                Some((PREFRONTAL, &next)),
+                PREFRONTAL,
+                &format!("leaf-{index}"),
+                &parent,
+                &mut cache
+            ));
+        }
+        let lookups = table
+            .link_lookups
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert!(lookups <= size * 2, "shared cycle needed {lookups} lookups");
+        assert!(
+            table.link_closes_cycle_cached(
+                Some((PREFRONTAL, &next)),
+                PREFRONTAL,
+                "50",
+                &parent,
+                &mut cache
+            ),
+            "memoization must still refuse a member of the cycle"
+        );
     }
 
     /// Every order in which a parent's owner and a child's owner can sync after

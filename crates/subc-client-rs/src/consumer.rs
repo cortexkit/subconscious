@@ -1446,6 +1446,7 @@ impl SubcConsumer {
     }
 
     /// Poll status or liveness for exactly this route handle.
+    /// A daemon refusal is returned as [`CallError::Module`] with its original body.
     pub async fn poll_route(
         &self,
         handle: &RouteHandle,
@@ -1473,10 +1474,14 @@ impl SubcConsumer {
                 route_open_reverse_requests: None,
             })
             .await?;
-        let TerminalFrame::Response { body, .. } = terminal else {
-            return Err(CallError::not_sent(
-                "route.poll returned a non-response frame",
-            ));
+        let body = match terminal {
+            TerminalFrame::Response { body, .. } => body,
+            TerminalFrame::Error { body, .. } => return Err(CallError::Module(body)),
+            TerminalFrame::StreamEnd => {
+                return Err(CallError::not_sent(
+                    "route.poll returned a non-response frame",
+                ));
+            }
         };
         let ClientControlResponse::RoutePoll {
             route_channel,
@@ -7768,6 +7773,45 @@ mod tests {
             rx.try_recv().is_err(),
             "stale operations must not queue frames"
         );
+    }
+
+    #[tokio::test]
+    async fn route_poll_refusal_preserves_daemon_code_message_and_detail() {
+        let (shared, consumer, mut receiver) = route_open_stand_in(Box::new(|| 0.5));
+        let handle = RouteHandle::new(3, 9, 1);
+        shared
+            .lock_inner()
+            .route_epochs
+            .insert(handle.channel, handle);
+        let poll = consumer.poll_route(&handle, PollKind::Liveness, Duration::from_secs(1));
+        tokio::pin!(poll);
+        assert_pending(poll.as_mut()).await;
+        let request = receiver.try_recv().unwrap();
+        let refusal = ErrorBody {
+            code: "unknown_route".into(),
+            message: "the route is no longer present".into(),
+            detail: Some(serde_json::json!({ "route_channel": 3, "route_epoch": 9 })),
+        };
+        assert!(
+            dispatch_frame(
+                &shared,
+                1,
+                channel_zero_frame(
+                    FrameType::Error,
+                    request.frame.header.corr,
+                    serde_json::to_vec(&refusal).unwrap(),
+                ),
+            )
+            .await
+        );
+        let err = poll.await.unwrap_err();
+        assert_eq!(err.code(), Some("unknown_route"));
+        let CallError::Module(body) = err else {
+            panic!("a delivered refusal must not be classified as a send failure");
+        };
+        assert_eq!(body.code, refusal.code);
+        assert_eq!(body.message, refusal.message);
+        assert_eq!(body.detail, refusal.detail);
     }
 
     #[tokio::test]

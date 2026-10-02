@@ -294,7 +294,7 @@ describe("21-byte envelope header", () => {
         input: { ...base, flags: 0b0010_0000, channel: 0, epoch: 1 },
       },
       {
-        name: "channel wins before pure-header length",
+        name: "pure-header length wins before control epoch",
         input: { ...base, ty: FrameType.Cancel, channel: 0, epoch: 1, body: new Uint8Array(1) },
       },
       {

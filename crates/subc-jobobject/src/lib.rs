@@ -51,6 +51,7 @@
 #![cfg(windows)]
 #![deny(unsafe_code)]
 
+mod cleanup;
 mod sys;
 
 use std::{
@@ -72,6 +73,25 @@ pub use sys::{JobObject, CONTAINMENT_CREATION_FLAGS, CREATE_SUSPENDED_FLAG};
 pub trait ProcessHandle {
     /// The process handle, or `None` if the process has already been reaped.
     fn handle(&self) -> Option<*mut std::ffi::c_void>;
+}
+
+/// An owned child that can be terminated if suspended containment fails.
+/// A raw process handle alone cannot provide this ownership/cleanup guarantee.
+pub trait SuspendedChild: ProcessHandle {
+    fn terminate_suspended(&mut self) -> io::Result<()>;
+}
+
+impl SuspendedChild for Child {
+    fn terminate_suspended(&mut self) -> io::Result<()> {
+        self.kill()?;
+        self.wait().map(|_| ())
+    }
+}
+
+impl SuspendedChild for tokio::process::Child {
+    fn terminate_suspended(&mut self) -> io::Result<()> {
+        self.start_kill()
+    }
 }
 
 /// A raw handle wrapper, so `JobObject::assign` can take an already-resolved
@@ -194,21 +214,24 @@ pub struct ContainedChild<C> {
     pub job: JobObject,
 }
 
-impl<C: ProcessHandle> ContainedChild<C> {
+impl<C: SuspendedChild> ContainedChild<C> {
     /// Contain `child` and start it.
     ///
     /// The one call that gets the order right: assign while suspended, then
-    /// resume. A failure to resume kills the child, because a suspended process
+    /// resume. Every setup failure kills the child, because a suspended process
     /// holding a pid with no way to start is a leak rather than a failed spawn.
     pub fn contain(child: C, job: JobObject, pid: u32) -> io::Result<Self> {
-        let handle = child
-            .handle()
-            .ok_or_else(|| io::Error::other("child was reaped before it could be contained"))?;
-        job.assign(&RawProcessHandle(handle))?;
-        if let Err(error) = resume_main_thread(pid) {
-            let _ = job.terminate();
-            return Err(error);
-        }
+        let child = cleanup::start(
+            child,
+            |child| {
+                let handle = child.handle().ok_or_else(|| {
+                    io::Error::other("child was reaped before it could be contained")
+                })?;
+                job.assign(&RawProcessHandle(handle))?;
+                resume_main_thread(pid)
+            },
+            SuspendedChild::terminate_suspended,
+        )?;
         Ok(Self { child, job })
     }
 }
@@ -219,8 +242,10 @@ impl<C: ProcessHandle> ContainedChild<C> {
 /// the ordering cannot be got wrong at a call site.
 pub fn spawn_contained(command: &mut std::process::Command) -> io::Result<ContainedChild<Child>> {
     suspend_on_create(command);
+    // Create the job before any child exists, so job-creation failure cannot leak
+    // a process that has already been spawned suspended.
+    let job = JobObject::new()?;
     let child = command.spawn()?;
     let pid = child.id();
-    let job = JobObject::new()?;
     ContainedChild::contain(child, job, pid)
 }

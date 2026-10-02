@@ -385,6 +385,24 @@ fn scope_records_refuse_unknown_fields_at_every_level() {
             Box::new(|v: &mut Value| v["carriers"][0]["scope"] = "x".into()),
         ),
         (
+            "carrier principal",
+            Box::new(|v: &mut Value| {
+                v["carriers"][0]["principal"]["targets"] = serde_json::json!(["only-this"])
+            }),
+        ),
+        (
+            "child owner",
+            Box::new(|v: &mut Value| v["child_owners"][0]["extra"] = true.into()),
+        ),
+        (
+            "parent owner",
+            Box::new(|v: &mut Value| {
+                v["parent"] = serde_json::json!({
+                    "owner": {"kind": "direct", "extra": true}, "ref": "p", "scope_epoch": 1
+                })
+            }),
+        ),
+        (
             "parent",
             Box::new(|v: &mut Value| {
                 v["parent"] = serde_json::json!({
@@ -407,6 +425,40 @@ fn scope_records_refuse_unknown_fields_at_every_level() {
     assert_eq!(
         serde_json::from_value::<ScopeRecord>(base).unwrap(),
         scope_head_record()
+    );
+}
+
+#[test]
+fn scope_selector_refuses_unknown_principal_fields() {
+    for kind in ["reserved", "direct", "unverified"] {
+        let mut owner = serde_json::json!({"kind": kind});
+        if kind == "reserved" {
+            owner["module_id"] = "aft".into();
+        }
+        let mut selector = serde_json::json!({"owner": owner, "ref": "head", "scope_epoch": 1});
+        assert!(
+            serde_json::from_value::<subc_protocol::scope::ScopeSelector>(selector.clone()).is_ok()
+        );
+        selector["owner"]["extra"] = true.into();
+        let error =
+            serde_json::from_value::<subc_protocol::scope::ScopeSelector>(selector).unwrap_err();
+        assert!(
+            error.to_string().contains("unknown field"),
+            "{kind}: {error}"
+        );
+    }
+}
+
+#[test]
+fn principal_outside_scope_records_remains_forward_compatible() {
+    assert_eq!(
+        serde_json::from_value::<Principal>(serde_json::json!({
+            "kind": "reserved", "module_id": "aft", "future_fact": true
+        }))
+        .unwrap(),
+        Principal::Reserved {
+            module_id: "aft".into()
+        }
     );
 }
 

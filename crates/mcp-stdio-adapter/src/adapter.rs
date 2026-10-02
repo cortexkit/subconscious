@@ -467,7 +467,7 @@ impl ChildLifecycle {
             .await
             .is_err()
         {
-            self.record_early_exit(&mut state);
+            self.record_child_exit(&mut state);
             self.remove_session(&mut state).await;
             return Err(LifecycleError::CallOutcomeUnknown);
         }
@@ -499,7 +499,7 @@ impl ChildLifecycle {
                 return Err(LifecycleError::ChildUnresponsive);
             }
             Err(FrameReadError::Closed | FrameReadError::Io) => {
-                self.record_early_exit(&mut state);
+                self.record_child_exit(&mut state);
                 self.remove_session(&mut state).await;
                 return Err(LifecycleError::CallOutcomeUnknown);
             }
@@ -537,7 +537,7 @@ impl ChildLifecycle {
         if let Some(session) = state.session.as_mut() {
             match session.child.try_wait() {
                 Ok(Some(_)) | Err(_) => {
-                    self.record_early_exit(state);
+                    self.record_child_exit(state);
                     self.remove_session(state).await;
                 }
                 Ok(None) if session.initialized_at.is_some() => {
@@ -708,14 +708,22 @@ impl ChildLifecycle {
         }
     }
 
-    fn record_early_exit(&self, state: &mut SlotState) {
-        if state
+    fn record_child_exit(&self, state: &mut SlotState) {
+        let Some(initialized_at) = state
             .session
             .as_ref()
             .and_then(|session| session.initialized_at)
-            .is_some_and(|started| started.elapsed() < Duration::from_millis(CHILD_EARLY_EXIT_MS))
-        {
+        else {
+            return;
+        };
+        if initialized_at.elapsed() < Duration::from_millis(CHILD_EARLY_EXIT_MS) {
             self.record_failed_attempt(state, SpawnFailureCause::EarlyExit);
+        } else {
+            // An exit observed after the healthy window establishes recovery,
+            // even if no later call observed the replacement while it was alive.
+            state.consecutive_failures = 0;
+            state.last_failure_cause = None;
+            state.cooldown_until = None;
         }
     }
 

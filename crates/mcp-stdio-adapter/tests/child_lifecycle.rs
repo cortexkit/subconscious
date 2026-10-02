@@ -511,6 +511,46 @@ async fn early_child_exits_exhaust_spawn_budget() {
 }
 
 #[tokio::test]
+async fn child_exit_after_healthy_window_resets_earlier_failure_streak() {
+    let home = subc_test_support::TestTempDir::new("early-exit-recovery");
+    let generations = home.join("generations");
+    std::fs::write(&generations, "0").unwrap();
+    let handler = AdapterHandler::with_resolver(
+        registry(json!({"fixture":server(json!({
+            "FIXTURE_MODE":{"value":"early-exit-recovery"},
+            "FIXTURE_GENERATION_PATH":{"value":generations.to_string_lossy()},
+        }))})),
+        Arc::new(MissingResolver),
+        LifecycleSettings {
+            idle_ttl_override: None,
+            ..test_settings()
+        },
+    );
+
+    // Two early failures precede a replacement that survives the window and
+    // exits during its first call. No subsequent call observes it still alive.
+    // Recovery must leave a fresh budget for three more early failures.
+    for generation in 1..=6 {
+        let (code, _) = refusal(&handler, "fixture", "tools/call").await;
+        assert_eq!(
+            code, "call_outcome_unknown",
+            "generation {generation} must be admitted"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&generations).unwrap(),
+            generation.to_string()
+        );
+    }
+    let (code, detail) = refusal(&handler, "fixture", "tools/call").await;
+    assert_eq!(code, "spawn_failed");
+    assert_eq!(detail["cause"], "early_exit");
+    assert!(detail["retry_after_ms"].as_u64().unwrap() > 0);
+    assert_eq!(handler.metrics().snapshot()["spawns_total"], 6);
+    assert_eq!(handler.metrics().snapshot()["spawn_failures_total"], 5);
+    assert_eq!(handler.metrics().snapshot()["children_live"], 0);
+}
+
+#[tokio::test]
 async fn idle_children_are_evicted_at_global_capacity() {
     let servers: serde_json::Map<String, Value> = (0..9)
         .map(|i| (format!("s{i}"), server(json!({}))))

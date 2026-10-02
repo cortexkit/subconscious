@@ -7,6 +7,19 @@ use serde_json::{json, Value};
 
 fn main() {
     let mode = std::env::var("FIXTURE_MODE").unwrap_or_else(|_| "normal".to_string());
+    let generation = if mode == "early-exit-recovery" {
+        let path = std::env::var("FIXTURE_GENERATION_PATH").unwrap();
+        let generation = std::fs::read_to_string(&path)
+            .unwrap()
+            .trim()
+            .parse::<u64>()
+            .unwrap()
+            + 1;
+        std::fs::write(path, generation.to_string()).unwrap();
+        generation
+    } else {
+        0
+    };
     let stdin = io::stdin();
     let mut stdout = io::stdout().lock();
 
@@ -54,6 +67,14 @@ fn main() {
             continue;
         }
         if mode == "early-exit" {
+            return;
+        }
+        if mode == "early-exit-recovery" {
+            if generation == 3 {
+                // Keep this replacement alive past the production ten-second
+                // early-exit window, then close without answering the call.
+                std::thread::sleep(std::time::Duration::from_millis(10_100));
+            }
             return;
         }
         if mode == "slow" {

@@ -3820,7 +3820,7 @@ impl Shared {
         reason: String,
         cause: OutcomeUnknownCause,
     ) {
-        let (should_emit, pending, openings, callbacks) = {
+        let (should_emit, pending, callbacks) = {
             let mut inner = self.lock_inner();
             if inner.closed || inner.generation != generation || inner.writer.is_none() {
                 return;
@@ -3833,9 +3833,12 @@ impl Shared {
             inner.route_end_reasons.clear();
             inner.legacy_channel_reasons.clear();
             let pending = drain_pending_generation(&mut inner.pending, generation);
-            let openings = drain_openings(&mut inner.openings);
+            // An opening belongs to its lead caller, not to a socket generation:
+            // the caller may still be retrying after this transport is replaced.
+            // Keep its waiters and close flag until its OpeningGuard finishes, so
+            // a new caller cannot start a competing open for the same key.
             let callbacks = inner.callbacks.clone();
-            (true, pending, openings, callbacks)
+            (true, pending, callbacks)
         };
 
         if should_emit {
@@ -3845,7 +3848,6 @@ impl Shared {
                 RouteEndReason::ConnectionLost,
                 cause,
             );
-            fail_openings(openings, SharedCallFailure::not_sent(reason.clone()));
             emit_callbacks(callbacks, ConnectionState::Dropped);
             self.notify.notify_waiters();
             let _ = self.spawn_reconnect(generation);
@@ -5507,13 +5509,6 @@ fn drain_pending_handle(
         .collect()
 }
 
-fn drain_openings(openings: &mut HashMap<RouteKey, Opening>) -> Vec<Vec<OpeningWaiter>> {
-    openings
-        .drain()
-        .map(|(_, opening)| opening.waiters)
-        .collect()
-}
-
 fn fail_openings(openings: Vec<Vec<OpeningWaiter>>, failure: SharedCallFailure) {
     for waiters in openings {
         for waiter in waiters {
@@ -6888,6 +6883,135 @@ mod tests {
         let key = RouteKey::new(&target, &identity, None, None);
         assert_eq!(key.project_root, PathBuf::from("/tmp/project"));
         assert!(matches!(key.target, RouteTargetKey::InternalService { .. }));
+    }
+
+    async fn assert_pending(mut future: Pin<&mut impl Future>) {
+        assert!(
+            std::future::poll_fn(|cx| Poll::Ready(future.as_mut().poll(cx).is_pending())).await
+        );
+    }
+
+    /// Replace only the transport, leaving the actual generation-drop cleanup in use.
+    fn drop_and_replace_test_transport(shared: &Arc<Shared>) -> mpsc::Receiver<WriteCommand> {
+        let generation = shared.lock_inner().generation;
+        // Keep the background supervisor from touching a real connection file.
+        shared.lock_inner().reconnect = ReconnectState::Inline { generation };
+        shared.handle_generation_drop(generation, "test connection drop".into());
+        let (writer, receiver) = mpsc::channel(64);
+        let mut inner = shared.lock_inner();
+        inner.generation += 1;
+        inner.epoch += 1;
+        inner.next_corr = Some(1);
+        inner.writer = Some(writer);
+        inner.reconnect = ReconnectState::Idle;
+        receiver
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn route_open_single_flight_survives_generation_drop_during_backoff() {
+        let (shared, consumer, mut receiver) = route_open_stand_in(Box::new(|| 0.5));
+        let opts = CallOptions::default();
+        let opener = consumer.open_route(restart_target("m"), restart_identity(), opts.clone());
+        tokio::pin!(opener);
+        assert_pending(opener.as_mut()).await;
+        let first = receiver.try_recv().unwrap();
+        assert!(
+            dispatch_frame(
+                &shared,
+                1,
+                route_open_answer(first.frame.header.corr, 0, Some(reloading())),
+            )
+            .await
+        );
+        assert_pending(opener.as_mut()).await;
+
+        // A caller already waiting and one arriving after the drop must both stay
+        // behind the same lead opener, including its unfinished retry backoff.
+        let waiting = consumer.open_route(restart_target("m"), restart_identity(), opts.clone());
+        tokio::pin!(waiting);
+        assert_pending(waiting.as_mut()).await;
+        let mut receiver = drop_and_replace_test_transport(&shared);
+        assert_pending(waiting.as_mut()).await;
+        let arriving = consumer.open_route(restart_target("m"), restart_identity(), opts.clone());
+        tokio::pin!(arriving);
+        assert_pending(arriving.as_mut()).await;
+        assert!(
+            receiver.try_recv().is_err(),
+            "a second opener bypassed the backoff"
+        );
+
+        tokio::time::advance(opts.route_retry.base).await;
+        assert_pending(opener.as_mut()).await;
+        let retry = receiver.try_recv().unwrap();
+        assert!(
+            dispatch_frame(
+                &shared,
+                2,
+                route_open_answer(retry.frame.header.corr, 42, None),
+            )
+            .await
+        );
+        let handle = opener.await.unwrap();
+        assert_eq!(waiting.await.unwrap(), handle);
+        assert_eq!(arriving.await.unwrap(), handle);
+        assert!(
+            receiver.try_recv().is_err(),
+            "more than one retry was emitted"
+        );
+        let inner = shared.lock_inner();
+        assert!(inner.openings.is_empty());
+        assert_eq!(inner.routes.len(), 1);
+        assert_eq!(inner.route_epochs.len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn close_route_during_backoff_survives_generation_drop() {
+        let (shared, consumer, mut receiver) = route_open_stand_in(Box::new(|| 0.5));
+        let opts = CallOptions::default();
+        let opener = consumer.open_route(restart_target("m"), restart_identity(), opts.clone());
+        tokio::pin!(opener);
+        assert_pending(opener.as_mut()).await;
+        let first = receiver.try_recv().unwrap();
+        assert!(
+            dispatch_frame(
+                &shared,
+                1,
+                route_open_answer(first.frame.header.corr, 0, Some(reloading())),
+            )
+            .await
+        );
+        assert_pending(opener.as_mut()).await;
+        consumer
+            .close_route(
+                restart_target("m"),
+                restart_identity(),
+                CloseRouteOptions::default(),
+            )
+            .await;
+        let mut receiver = drop_and_replace_test_transport(&shared);
+        tokio::time::advance(opts.route_retry.base).await;
+        assert_pending(opener.as_mut()).await;
+        let retry = receiver.try_recv().unwrap();
+        assert!(
+            dispatch_frame(
+                &shared,
+                2,
+                route_open_answer(retry.frame.header.corr, 42, None),
+            )
+            .await
+        );
+        let err = opener.await.expect_err("close must win over the retry");
+        assert!(matches!(err, CallError::NotSent(_)));
+        let goodbye = receiver
+            .try_recv()
+            .expect("discarded route must get GOODBYE");
+        assert_eq!(goodbye.frame.header.ty, FrameType::Goodbye);
+        assert_eq!(goodbye.frame.header.channel, 42);
+        assert!(receiver.try_recv().is_err());
+        let inner = shared.lock_inner();
+        assert!(inner.routes.is_empty());
+        assert!(inner.route_epochs.is_empty());
+        assert!(inner.openings.is_empty());
     }
 
     #[tokio::test]

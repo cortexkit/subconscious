@@ -1966,9 +1966,18 @@ fn spawn_provider(
     module_id: &str,
     events_path: &Path,
 ) -> ProviderProcess {
+    let runtime_dir = connection_file
+        .parent()
+        .expect("connection file is inside the test runtime directory");
+    let temp_dir = runtime_dir
+        .parent()
+        .expect("runtime directory is inside the test temp tree");
     let child = Command::new(module_bin)
         .arg("--subc")
         .arg(connection_file)
+        .env("XDG_RUNTIME_DIR", runtime_dir)
+        .env("XDG_CONFIG_HOME", temp_dir.join("config"))
+        .env("XDG_DATA_HOME", temp_dir.join("data"))
         .env(subc_protocol::SUBC_MODULE_ID_ENV, module_id)
         .env("SUBC_MODULE_ECHO_EVENTS", events_path)
         .stdin(Stdio::null())

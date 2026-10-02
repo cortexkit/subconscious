@@ -283,6 +283,66 @@ fn snapshot(at: SpawnCursor, live: &[(&str, u64)]) -> SpawnSnapshot {
     }
 }
 
+#[tokio::test]
+async fn every_immediate_spawn_stream_end_yields_before_resubscribing() {
+    struct EndFeed;
+    #[async_trait]
+    impl SpawnFeed for EndFeed {
+        async fn next(&mut self) -> Result<Option<SpawnEvent>, FeedEnd> {
+            Ok(None)
+        }
+    }
+    struct EndingSource {
+        attempts: Mutex<usize>,
+        refused: bool,
+    }
+    #[async_trait]
+    impl SpawnSource for EndingSource {
+        async fn snapshot(&self) -> Result<SpawnSnapshot, String> {
+            Ok(snapshot(cursor("ending", 1), &[]))
+        }
+        async fn subscribe(&self, _: SpawnCursor) -> Result<Box<dyn SpawnFeed>, FeedEnd> {
+            let attempt = {
+                let mut n = self.attempts.lock().unwrap();
+                *n += 1;
+                *n
+            };
+            if attempt > 1 {
+                return std::future::pending().await;
+            }
+            if self.refused {
+                Err(FeedEnd::CursorRefused {
+                    code: "spawn_cursor_too_old".into(),
+                })
+            } else {
+                Ok(Box::new(EndFeed))
+            }
+        }
+    }
+    for refused in [false, true] {
+        let source = Arc::new(EndingSource {
+            attempts: Mutex::new(0),
+            refused,
+        });
+        let store = store_dir("ending-backoff");
+        let consumer = SpawnConsumer::new(
+            source.clone(),
+            RecordingCensus::with(vec![]),
+            &store,
+            OWN.into(),
+            Duration::from_secs(60),
+            Duration::from_secs(1),
+        );
+        let mut running = Box::pin(consumer.run());
+        assert!(futures_util::poll!(running.as_mut()).is_pending());
+        assert_eq!(
+            *source.attempts.lock().unwrap(),
+            1,
+            "the retry timer must yield before another subscription; refused={refused}"
+        );
+    }
+}
+
 fn exited(at: SpawnCursor, module_id: &str, generation: u64) -> SpawnEvent {
     SpawnEvent {
         cursor: at,

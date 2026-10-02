@@ -112,8 +112,10 @@ pub(crate) const SPAWN_SUBSCRIBER_LAGGED_CODE: &str = "spawn_subscriber_lagged";
 
 struct SupervisedChild {
     child: Child,
-    /// The name of this process's cgroup: the module id, or for a swap
-    /// candidate the alternate name (see `swap::cgroup_name`).
+    /// Protocol used to launch this process, not a later pending-reload spec.
+    protocol: ModuleProtocol,
+    /// This process's cgroup name: a bounded module/slot label followed by a
+    /// unique spawn suffix, so a retired slot cannot share a later kill domain.
     #[cfg(target_os = "linux")]
     module_id: String,
     #[cfg(target_os = "linux")]
@@ -175,8 +177,11 @@ impl SupervisedChild {
         let result = self.child.wait().await;
         #[cfg(target_os = "linux")]
         if result.is_ok() {
-            if let Some(placement) = self.cgroup_placement.take() {
-                remove_module_cgroup(&placement, &self.module_id);
+            if let Some(placement) = self.cgroup_placement.as_ref() {
+                cleanup_reaped_cgroup(placement, &self.module_id).await;
+                // Keep ownership while awaiting kernel population changes: a
+                // drain timeout may cancel this wait and then escalate/reap.
+                self.cgroup_placement = None;
             }
         }
         result
@@ -275,7 +280,7 @@ async fn settle_stderr_pump(
         Ok(Ok(())) => {}
         Ok(Err(err)) => {
             let mut ring = lock();
-            ring.mark_incomplete(format!("stderr pump ended unexpectedly: {err}"));
+            ring.mark_incomplete_from(generation, format!("stderr pump ended unexpectedly: {err}"));
             ring.finish_pump(generation);
             warn!(module_id, error = %err, "stderr pump ended before clean EOF");
         }
@@ -332,8 +337,8 @@ pub struct ModuleSpec {
     pub reserved_prefixes: Vec<String>,
     /// The wire protocol this module speaks, as DECLARED in daemon config.
     ///
-    /// [`ModuleProtocol::None`] changes five things and nothing else: health
-    /// probing is suppressed, teardown sends SIGTERM before waiting,
+    /// [`ModuleProtocol::None`] changes five things and nothing else: wire health
+    /// probing is suppressed (an optional HTTP probe can replace it), teardown sends SIGTERM before waiting,
     /// `route.open` is refused, the spawn passes NO `--subc <path>` argument
     /// and NO launch nonce, and a clean exit the daemon did not request is
     /// restarted as a crash rather than recorded as a stop (see `on_child_exit`:
@@ -550,8 +555,12 @@ impl fmt::Display for HealthAction {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HealthConfig {
+    /// Optional loopback HTTP endpoint for a managed non-wire process.
+    /// Changing it applies live on rescan; the process protocol changes only
+    /// at its next spawn.
+    pub http: Option<String>,
     pub cadence: Duration,
     pub deadline: Duration,
     pub failure_threshold: u32,
@@ -563,6 +572,7 @@ pub struct HealthConfig {
 impl Default for HealthConfig {
     fn default() -> Self {
         Self {
+            http: None,
             cadence: DEFAULT_HEALTH_CADENCE,
             deadline: DEFAULT_HEALTH_DEADLINE,
             failure_threshold: DEFAULT_HEALTH_FAILURE_THRESHOLD,
@@ -699,6 +709,8 @@ pub struct ModuleStatus {
     pub registration_active: bool,
     /// The module's declared wire protocol, carried beside `live` because it is
     /// what makes `live` readable: the two fields answer one question together.
+    /// While a process is alive this is its launch declaration, not a later
+    /// pending-reload edit. When down it is the configured next launch protocol.
     pub protocol: ModuleProtocol,
     /// Whether the module is serving, under the strongest definition the daemon
     /// can assert for its protocol.
@@ -748,6 +760,7 @@ struct SupervisorSnapshot {
     state: ModuleState,
     enabled: bool,
     process_alive: bool,
+    spawned_protocol: Option<ModuleProtocol>,
     /// When each crash restart was spent, oldest first. This IS the crash
     /// budget: its in-window length is the count an operator sees and the count
     /// the restart decision is made against, so there is no second counter that
@@ -864,6 +877,7 @@ impl SupervisorSnapshot {
             state,
             enabled,
             process_alive: false,
+            spawned_protocol: None,
             crash_restarts: VecDeque::new(),
             lifetime_restarts: 0,
             spawn_generation: 0,
@@ -2432,7 +2446,7 @@ impl Supervisor {
         validate_spec(&spec)?;
 
         let mut runtime = self.runtime_config();
-        runtime.health = health;
+        runtime.health = health.clone();
         runtime.restart_policy = restart_policy;
         if let Some(ms) = drain_timeout_ms {
             runtime.drain_timeout = Duration::from_millis(ms);
@@ -2497,7 +2511,7 @@ impl Supervisor {
                 .for_module(Arc::clone(&effective_drain_timeout)),
             effective_drain_timeout,
             default_drain_timeout: self.drain_timeout,
-            health: self.health,
+            health: self.health.clone(),
             connection_file_path: self.connection_file_path.clone(),
             capture_logs_dir: self.capture_logs_dir.clone(),
             forwarding: self.forwarding.clone(),
@@ -2529,7 +2543,7 @@ impl Supervisor {
     ) -> SupervisedModule {
         let configuration = Arc::new(Mutex::new(SupervisedConfiguration {
             spec: spec.clone(),
-            health: runtime.health,
+            health: runtime.health.clone(),
         }));
         let stderr_ring = Arc::clone(&runtime.stderr_ring);
         let terminal_ring = Arc::clone(&runtime.terminal_ring);
@@ -2740,7 +2754,9 @@ impl SupervisedModule {
             .get_module(&self.inner.module_id)
             .map_err(SuperviseError::Registry)?
             .is_some();
-        let protocol = self.declared_protocol()?;
+        let protocol = snapshot
+            .spawned_protocol
+            .unwrap_or(self.declared_protocol()?);
         let running_process =
             snapshot.enabled && snapshot.state == ModuleState::Running && snapshot.process_alive;
         // Registration is the difference between the two protocols and the only
@@ -2991,12 +3007,11 @@ impl SupervisedModule {
         })?
     }
 
-    /// This module's declared protocol, read from the same stored configuration
-    /// the rescan diff compares and `update_configuration` rewrites, so a status
-    /// read and the supervise loop can never disagree about which protocol is in
-    /// force.
+    /// The current process's protocol, or the configured protocol when down.
+    /// A rescan stores the next launch spec without changing how an existing
+    /// process registers, serves routes, is probed, or exits.
     pub(crate) fn declared_protocol(&self) -> Result<ModuleProtocol, SuperviseError> {
-        Ok(self
+        let configured = self
             .inner
             .configuration
             .lock()
@@ -3004,7 +3019,9 @@ impl SupervisedModule {
                 module_id: Some(self.inner.module_id.clone()),
             })?
             .spec
-            .protocol)
+            .protocol;
+        let state = lock_snapshot(&self.inner.snapshot)?;
+        Ok(state.spawned_protocol.unwrap_or(configured))
     }
 
     pub(crate) fn configuration(&self) -> Result<(ModuleSpec, HealthConfig), SuperviseError> {
@@ -3015,7 +3032,7 @@ impl SupervisedModule {
                 .map_err(|_| SuperviseError::StatePoisoned {
                     module_id: Some(self.inner.module_id.clone()),
                 })?;
-        Ok((configuration.spec.clone(), configuration.health))
+        Ok((configuration.spec.clone(), configuration.health.clone()))
     }
 
     /// Replace this module's launch spec, keeping its health and drain policy,
@@ -3053,7 +3070,7 @@ impl SupervisedModule {
             .commands
             .send(SupervisorCommand::UpdateConfiguration {
                 spec: spec.clone(),
-                health,
+                health: health.clone(),
                 drain_timeout_ms,
                 reply: reply_tx,
             })
@@ -3433,10 +3450,18 @@ pub(crate) fn validate_spec(spec: &ModuleSpec) -> Result<(), SuperviseError> {
 
 #[derive(Debug, Default)]
 struct HealthProbeRuntime {
+    configured_health: Option<HealthConfig>,
     registered_connection: Option<crate::ConnectionId>,
     advertised: bool,
     next_probe_at: Option<Instant>,
     probe_index: u64,
+}
+
+fn running_protocol(spec: &ModuleSpec, snapshot: &SharedSnapshot) -> ModuleProtocol {
+    lock_snapshot(snapshot)
+        .ok()
+        .and_then(|state| state.spawned_protocol)
+        .unwrap_or(spec.protocol)
 }
 
 impl HealthProbeRuntime {
@@ -3447,21 +3472,29 @@ impl HealthProbeRuntime {
         registry: &Registry,
         snapshot: &SharedSnapshot,
     ) {
-        // THE PROBE GATE FOR A MODULE THAT SPEAKS NO SUBC WIRE, placed here
-        // because this is the only place that ever arms a probe: leaving
-        // `advertised` false and `next_probe_at` empty makes `due()` false
-        // forever, so `run_health_probe_cycle` -- and with it every arm of
-        // `probe_module_health`, including the one that reads an absent
-        // registration as proof the module is gone and escalates to a restart --
-        // is unreachable for this module.
-        //
-        // That arm is right for a subc module and is exactly wrong here: a
-        // `protocol: "none"` module never registers by declaration, so the
-        // absence it would classify is the module working as configured.
-        if spec.protocol == ModuleProtocol::None {
-            self.registered_connection = None;
-            self.advertised = false;
+        if self.configured_health.as_ref() != Some(&runtime.health) {
+            self.configured_health = Some(runtime.health.clone());
             self.next_probe_at = None;
+            self.registered_connection = None;
+            self.probe_index = 0;
+        }
+        // A non-wire process never registers. Only an explicitly configured
+        // HTTP endpoint can arm its health probe; an absent HELLO is not a
+        // health failure for that kind of process.
+        if running_protocol(spec, snapshot) == ModuleProtocol::None {
+            self.registered_connection = None;
+            self.advertised = runtime.health.http.is_some();
+            if !self.advertised {
+                self.next_probe_at = None;
+                let _ = update_snapshot(snapshot, Some(&spec.module_id), |state| {
+                    state.health = ModuleHealthStatus::default();
+                });
+            } else if self.next_probe_at.is_none() {
+                self.next_probe_at = Some(
+                    Instant::now()
+                        + jittered_health_delay(&spec.module_id, 0, runtime.health.cadence),
+                );
+            }
             return;
         }
 
@@ -3667,7 +3700,14 @@ async fn run_health_probe_cycle(
     child: &mut Option<SupervisedChild>,
 ) {
     let now_ms = unix_ms_now();
-    match probe_module_health(&spec.module_id, runtime, None).await {
+    let http = (running_protocol(spec, snapshot) == ModuleProtocol::None)
+        .then_some(runtime.health.http.as_deref())
+        .flatten();
+    let result = match http {
+        Some(url) => probe_http_health(url, runtime.health.deadline).await,
+        None => probe_module_health(&spec.module_id, runtime, None).await,
+    };
+    match result {
         Ok(report) => {
             handle_health_report(
                 spec,
@@ -3682,6 +3722,11 @@ async fn run_health_probe_cycle(
             .await;
         }
         Err(err) => {
+            if http.is_some() {
+                let _ = update_snapshot(snapshot, Some(&spec.module_id), |state| {
+                    state.health.status = SupervisorHealthStatus::Failing;
+                });
+            }
             handle_health_probe_failure(
                 spec,
                 runtime,
@@ -3695,6 +3740,205 @@ async fn run_health_probe_cycle(
             .await;
         }
     }
+}
+
+pub(crate) struct HttpProbeTarget<'a> {
+    address: std::net::SocketAddr,
+    localhost: bool,
+    authority: &'a str,
+    path: String,
+}
+
+/// Resolve only literal loopback endpoints, without DNS, redirects, proxies,
+/// or TLS. A URL cannot turn a local health check into an outbound connection.
+pub(crate) fn parse_http_probe_url(url: &str) -> Result<HttpProbeTarget<'_>, String> {
+    if url.bytes().any(|b| b <= b' ' || b == 127) || url.contains('#') {
+        return Err("must not contain whitespace, controls, or a fragment".into());
+    }
+    let rest = url
+        .strip_prefix("http://")
+        .ok_or("must use plain http://")?;
+    let split = rest.find(['/', '?']).unwrap_or(rest.len());
+    let (authority, suffix) = rest.split_at(split);
+    let (host, port) = if let Some(rest) = authority.strip_prefix("[::1]") {
+        ("::1", rest)
+    } else {
+        let split = authority.find(':').unwrap_or(authority.len());
+        authority.split_at(split)
+    };
+    let ip: std::net::IpAddr = match host {
+        "127.0.0.1" | "localhost" => std::net::Ipv4Addr::LOCALHOST.into(),
+        "::1" => std::net::Ipv6Addr::LOCALHOST.into(),
+        _ => return Err("host must be 127.0.0.1, [::1], or localhost".into()),
+    };
+    let port = if port.is_empty() {
+        80
+    } else {
+        port.strip_prefix(':')
+            .and_then(|p| p.parse::<u16>().ok())
+            .filter(|p| *p > 0)
+            .ok_or("must have a valid nonzero TCP port")?
+    };
+    let path = if suffix.is_empty() {
+        "/".into()
+    } else if suffix.starts_with('?') {
+        format!("/{suffix}")
+    } else {
+        suffix.into()
+    };
+    Ok(HttpProbeTarget {
+        address: std::net::SocketAddr::new(ip, port),
+        localhost: host == "localhost",
+        authority,
+        path,
+    })
+}
+
+async fn probe_http_health(
+    url: &str,
+    deadline: Duration,
+) -> Result<HealthReport, HealthProbeError> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
+    let target = parse_http_probe_url(url).map_err(HealthProbeError::misconfigured)?;
+    // Keep partial diagnostics outside the timed future so cancellation does
+    // not discard a status line or body bytes already received.
+    let mut response_status = String::new();
+    let mut body = Vec::new();
+    let probe = async {
+        // Resolve localhost ourselves so a hosts-file override cannot turn
+        // this into an outbound request, while IPv6-only local servers work.
+        let connection = match tokio::net::TcpStream::connect(target.address).await {
+            Err(_) if target.localhost => {
+                tokio::net::TcpStream::connect((
+                    std::net::Ipv6Addr::LOCALHOST,
+                    target.address.port(),
+                ))
+                .await
+            }
+            result => result,
+        };
+        let mut stream = connection.map_err(|error| {
+            HealthProbeError::no_answer(format!("HTTP connect failed: {error}"))
+        })?;
+        stream.write_all(format!("GET {} HTTP/1.1\r\nHost: {}\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n", target.path, target.authority).as_bytes()).await
+            .map_err(|error| HealthProbeError::no_answer(format!("HTTP write failed: {error}")))?;
+        let mut reader = BufReader::new(stream);
+        let mut budget = 16 * 1024;
+        let status = http_line(&mut reader, &mut budget).await?;
+        let mut words = status.split_ascii_whitespace();
+        let version = words.next();
+        let code = words
+            .next()
+            .filter(|word| word.len() == 3)
+            .and_then(|word| word.parse::<u16>().ok());
+        if !matches!(version, Some("HTTP/1.1" | "HTTP/1.0"))
+            || !code.is_some_and(|code| (100..600).contains(&code))
+        {
+            return Err(HealthProbeError::bad_answer(format!(
+                "invalid HTTP status: {status}"
+            )));
+        }
+        let code = code.expect("validated status code");
+        response_status = status.clone();
+        let mut length = None;
+        let mut chunked = false;
+        loop {
+            let line = http_line(&mut reader, &mut budget).await?;
+            if line.is_empty() {
+                break;
+            }
+            if let Some((name, value)) = line.split_once(':') {
+                if name.eq_ignore_ascii_case("content-length") {
+                    length = Some(value.trim().parse::<u64>().map_err(|_| {
+                        HealthProbeError::bad_answer("invalid HTTP Content-Length")
+                    })?);
+                } else if name.eq_ignore_ascii_case("transfer-encoding") {
+                    chunked = value.trim().eq_ignore_ascii_case("chunked");
+                }
+            }
+        }
+        if chunked {
+            while body.len() < 200 {
+                let line = http_line(&mut reader, &mut budget).await?;
+                let size = u64::from_str_radix(line.split(';').next().unwrap_or("").trim(), 16)
+                    .map_err(|_| HealthProbeError::bad_answer("invalid HTTP chunk size"))?;
+                if size == 0 {
+                    break;
+                }
+                let count = size.min((200 - body.len()) as u64) as usize;
+                let start = body.len();
+                (&mut reader)
+                    .take(count as u64)
+                    .read_to_end(&mut body)
+                    .await
+                    .map_err(|error| {
+                        HealthProbeError::no_answer(format!("HTTP body read failed: {error}"))
+                    })?;
+                if body.len() - start != count {
+                    return Err(HealthProbeError::bad_answer("truncated HTTP chunk"));
+                }
+                if size > count as u64 || body.len() == 200 {
+                    break;
+                }
+                if !http_line(&mut reader, &mut budget).await?.is_empty() {
+                    return Err(HealthProbeError::bad_answer("invalid HTTP chunk delimiter"));
+                }
+            }
+        } else {
+            reader
+                .take(length.unwrap_or(200).min(200))
+                .read_to_end(&mut body)
+                .await
+                .map_err(|error| {
+                    HealthProbeError::no_answer(format!("HTTP body read failed: {error}"))
+                })?;
+        }
+        if (200..300).contains(&code) {
+            Ok(HealthReport::ok())
+        } else {
+            Err(HealthProbeError::bad_answer(
+                "HTTP health endpoint returned non-2xx",
+            ))
+        }
+    };
+    let mut result = timeout(deadline, probe).await.unwrap_or_else(|_| {
+        Err(HealthProbeError::no_answer(format!(
+            "HTTP probe timed out after {deadline:?}"
+        )))
+    });
+    if let Err(error) = &mut result {
+        if !response_status.is_empty() {
+            error.message = format!(
+                "{}; {response_status}: {}",
+                error.message,
+                String::from_utf8_lossy(&body)
+            );
+        }
+    }
+    result
+}
+
+async fn http_line(
+    reader: &mut tokio::io::BufReader<tokio::net::TcpStream>,
+    remaining: &mut usize,
+) -> Result<String, HealthProbeError> {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt};
+    let mut line = Vec::new();
+    (&mut *reader)
+        .take(*remaining as u64)
+        .read_until(b'\n', &mut line)
+        .await
+        .map_err(|error| {
+            HealthProbeError::no_answer(format!("HTTP header read failed: {error}"))
+        })?;
+    *remaining -= line.len();
+    if !line.ends_with(b"\r\n") {
+        return Err(HealthProbeError::bad_answer(
+            "HTTP headers are incomplete or exceed 16 KiB",
+        ));
+    }
+    line.truncate(line.len() - 2);
+    String::from_utf8(line).map_err(|_| HealthProbeError::bad_answer("HTTP header is not UTF-8"))
 }
 
 async fn probe_module_health(
@@ -4416,6 +4660,413 @@ mod tests {
         assert_snapshot_process_facts_cleared(&snapshot);
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rescan_preserves_running_protocol_until_respawn() {
+        let dir = std::env::temp_dir().join(format!(
+            "rescan-protocol-{}",
+            generate_launch_nonce().unwrap()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let initial = ModuleSpec {
+            module_id: "rescan-protocol".into(),
+            program: PathBuf::from("/bin/sleep"),
+            args: vec!["60".into()],
+            env: ["XDG_DATA_HOME", "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME"]
+                .into_iter()
+                .map(|key| (key.into(), dir.to_string_lossy().into_owned()))
+                .collect(),
+            reserved: false,
+            reserved_prefixes: vec![],
+            protocol: ModuleProtocol::None,
+            overlap: Default::default(),
+        };
+        let supervisor = Supervisor::default();
+        let module = supervisor.spawn(initial.clone()).unwrap();
+        assert!(module.status().unwrap().live);
+        let mut next = initial;
+        next.protocol = ModuleProtocol::Subc;
+        module
+            .update_configuration(next.clone(), HealthConfig::default(), None)
+            .await
+            .unwrap();
+        assert!(
+            module.status().unwrap().live,
+            "rescan must not require HELLO from the old non-wire process"
+        );
+        let runtime = supervisor.runtime_config();
+        let action = on_child_exit(
+            &next,
+            RestartPolicy::default(),
+            &supervisor.registry,
+            &module.inner.snapshot,
+            &runtime.terminal_ring,
+            &runtime.spawn_events,
+            &runtime.child_roster,
+            ExitReport {
+                kind: ExitKind::Clean,
+                code: Some(0),
+                signal: None,
+                at_ms: unix_ms_now(),
+            },
+        )
+        .await;
+        assert!(
+            matches!(action, NextAction::Restart { .. }),
+            "the old non-wire process's clean exit must restart"
+        );
+        module.drain().await.unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn orphan_identity_matches_path_names_and_shebang_interpreters() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = subc_test_support::TestTempDir::new("spawn-image-identity");
+        let script = dir.join("module.sh");
+        std::fs::write(&script, "#!/bin/sh\nwhile :; do sleep 0.1; done\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let record_path = dir.join("live-children.json");
+        let supervisor = Supervisor::default().with_live_children_record(&record_path);
+        for (program, args) in [
+            (PathBuf::from("sleep"), vec!["60".into()]),
+            (script, vec![]),
+        ] {
+            let spec = ModuleSpec {
+                module_id: "image-identity".into(),
+                program,
+                args,
+                env: ["XDG_DATA_HOME", "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME"]
+                    .into_iter()
+                    .map(|key| (key.into(), dir.to_string_lossy().into_owned()))
+                    .collect(),
+                reserved: false,
+                reserved_prefixes: vec![],
+                protocol: ModuleProtocol::None,
+                overlap: Default::default(),
+            };
+            let module = supervisor.spawn(spec).unwrap();
+            let entry = crate::live_children::read_record(&record_path)
+                .unwrap()
+                .pop()
+                .unwrap();
+            let observed = subc_os::Process::open(entry.pid)
+                .unwrap()
+                .unwrap()
+                .observe()
+                .unwrap();
+            let verdict = crate::live_children::identity_verdict(&entry, entry.pid, &observed);
+            module.drain().await.unwrap();
+            assert_eq!(verdict, crate::live_children::IdentityVerdict::Matches);
+        }
+    }
+
+    #[cfg(unix)]
+    fn http_fixture(
+        dir: &std::path::Path,
+        url: &str,
+        threshold: u32,
+    ) -> crate::daemon_config::ConfiguredModule {
+        let path = dir.join("subc.jsonc");
+        std::fs::write(&path, serde_json::json!({"version": 1, "modules": {"http-process": {
+            "program": "/bin/sleep", "args": ["60"], "protocol": "none",
+            "env": {"XDG_DATA_HOME":dir,"XDG_RUNTIME_DIR":dir,"XDG_CONFIG_HOME":dir},
+            "health": {"http":url,"cadence_ms":20,"deadline_ms":200,"failure_threshold":threshold},
+            "restart": {"backoff_ms":1,"max_backoff_ms":1}, "drain_timeout_ms":10
+        }}}).to_string()).unwrap();
+        crate::daemon_config::load(&path)
+            .unwrap()
+            .unwrap()
+            .modules
+            .pop()
+            .unwrap()
+    }
+
+    #[cfg(unix)]
+    async fn wait_http_health(module: &SupervisedModule, status: SupervisorHealthStatus) {
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if module.status().unwrap().health.status == status {
+                    break;
+                }
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "expected {status:?}, got {:?}",
+                module.status().unwrap().health
+            )
+        });
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn http_health_status_flips_ok_failing_ok() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = subc_test_support::TestTempDir::new("http-status-flips");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let status = Arc::new(std::sync::atomic::AtomicU16::new(200));
+        let serving_status = status.clone();
+        let url = format!("http://{}/healthz", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0u8; 2048];
+                let count = stream.read(&mut request).await.unwrap();
+                assert!(count > 0, "a probe must send an HTTP request");
+                let code = serving_status.load(std::sync::atomic::Ordering::SeqCst);
+                let body = if code == 200 {
+                    "ready"
+                } else {
+                    "{\"status\":\"unavailable\",\"error\":\"scratch failure\"}"
+                };
+                let response = format!("HTTP/1.1 {code} scratch\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+        let configured = http_fixture(&dir, &url, 1000);
+        let module = Supervisor::default()
+            .supervise_configured_with_health(
+                configured.module_spec(),
+                true,
+                configured.health,
+                configured.drain_timeout_ms,
+                configured.restart,
+            )
+            .unwrap();
+        wait_http_health(&module, SupervisorHealthStatus::Ok).await;
+        status.store(503, std::sync::atomic::Ordering::SeqCst);
+        wait_http_health(&module, SupervisorHealthStatus::Failing).await;
+        assert!(module
+            .status()
+            .unwrap()
+            .health
+            .detail
+            .unwrap()
+            .contains("scratch failure"));
+        status.store(200, std::sync::atomic::Ordering::SeqCst);
+        wait_http_health(&module, SupervisorHealthStatus::Ok).await;
+        assert_eq!(module.status().unwrap().health.consecutive_failures, 0);
+        let before = module.status().unwrap();
+        let (spec, mut health) = module.configuration().unwrap();
+        health.http = None;
+        module
+            .update_configuration(spec.clone(), health.clone(), Some(10))
+            .await
+            .unwrap();
+        wait_http_health(&module, SupervisorHealthStatus::Unknown).await;
+        health.http = Some(url);
+        module
+            .update_configuration(spec, health, Some(10))
+            .await
+            .unwrap();
+        wait_http_health(&module, SupervisorHealthStatus::Ok).await;
+        assert_eq!(
+            module.status().unwrap().pid,
+            before.pid,
+            "changing a probe must apply live, not restart its process"
+        );
+        let (spec, mut health) = module.configuration().unwrap();
+        health.failure_threshold = 2;
+        module
+            .update_configuration(spec, health, Some(10))
+            .await
+            .unwrap();
+        status.store(503, std::sync::atomic::Ordering::SeqCst);
+        timeout(Duration::from_secs(5), async {
+            while module.status().unwrap().spawn_generation == before.spawn_generation {
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("sustained HTTP 503 responses must trigger the health restart policy");
+        module.drain().await.unwrap();
+        server.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn http_health_no_listener_restarts_after_consecutive_failures() {
+        let dir = subc_test_support::TestTempDir::new("http-refused");
+        let unused = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/healthz", unused.local_addr().unwrap());
+        drop(unused);
+        let configured = http_fixture(&dir, &url, 2);
+        let module = Supervisor::default()
+            .supervise_configured_with_health(
+                configured.module_spec(),
+                true,
+                configured.health,
+                configured.drain_timeout_ms,
+                configured.restart,
+            )
+            .unwrap();
+        let before = module.status().unwrap().spawn_generation;
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let status = module.status().unwrap();
+                if status.spawn_generation > before {
+                    assert!(status.lifetime_restarts > 0);
+                    break;
+                }
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("sustained HTTP refusal must trigger the health restart policy");
+        module.drain().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn http_health_timeout_honours_deadline() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/healthz", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let _held = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let error = timeout(
+            Duration::from_secs(1),
+            probe_http_health(&url, Duration::from_millis(10)),
+        )
+        .await
+        .expect("the probe must enforce its own deadline")
+        .unwrap_err();
+        server.abort();
+        assert!(error.to_string().contains("timed out"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn http_health_localhost_reaches_an_ipv6_only_listener() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("[::1]:0").await.unwrap();
+        let url = format!(
+            "http://localhost:{}/healthz",
+            listener.local_addr().unwrap().port()
+        );
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 2048];
+            assert!(stream.read(&mut request).await.unwrap() > 0);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .await
+                .unwrap();
+        });
+        assert_eq!(
+            probe_http_health(&url, Duration::from_secs(1))
+                .await
+                .unwrap()
+                .status,
+            HealthStatus::Ok
+        );
+        server.await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn http_health_timeout_keeps_partial_status_and_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/healthz", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 2048];
+            assert!(stream.read(&mut request).await.unwrap() > 0);
+            stream
+                .write_all(
+                    b"HTTP/1.1 503 Unavailable\r\nContent-Length: 100\r\n\r\npartial diagnostic",
+                )
+                .await
+                .unwrap();
+            std::future::pending::<()>().await;
+        });
+        let error = probe_http_health(&url, Duration::from_secs(1))
+            .await
+            .unwrap_err()
+            .to_string();
+        server.abort();
+        assert!(
+            error.contains("timed out")
+                && error.contains("503 Unavailable")
+                && error.contains("partial diagnostic"),
+            "{error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn http_health_diagnostic_body_is_bounded_to_200_bytes() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/healthz", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 2048];
+            assert!(stream.read(&mut request).await.unwrap() > 0);
+            let body = format!("{}not-in-diagnostic", "x".repeat(400));
+            let response = format!(
+                "HTTP/1.1 503 Unavailable\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        let error = probe_http_health(&url, Duration::from_secs(1))
+            .await
+            .unwrap_err()
+            .to_string();
+        server.await.unwrap();
+        assert!(error.ends_with(&"x".repeat(200)), "{error}");
+        assert_eq!(error.split(": ").last().unwrap().len(), 200);
+        assert!(!error.contains("not-in-diagnostic"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn http_health_real_nats_server_monitoring() {
+        if std::process::Command::new("nats-server")
+            .arg("--version")
+            .env("XDG_DATA_HOME", std::env::temp_dir())
+            .env("XDG_RUNTIME_DIR", std::env::temp_dir())
+            .env("XDG_CONFIG_HOME", std::env::temp_dir())
+            .output()
+            .is_err()
+        {
+            eprintln!(
+                "skipped: http_health_real_nats_server_monitoring (nats-server is not on PATH)"
+            );
+            return;
+        }
+        let dir = subc_test_support::TestTempDir::new("nats-http-monitoring");
+        let monitor = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = monitor.local_addr().unwrap().port();
+        let client = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client_port = client.local_addr().unwrap().port();
+        let config = dir.join("server.conf");
+        std::fs::write(&config, format!("listen: 127.0.0.1:{client_port}\nhttp: 127.0.0.1:{port}\njetstream {{ store_dir: \"{}\" }}\n", dir.join("jetstream").display())).unwrap();
+        let mut configured = http_fixture(&dir, &format!("http://127.0.0.1:{port}/healthz"), 1000);
+        configured.program = PathBuf::from("nats-server");
+        configured.args = vec!["-c".into(), config.to_string_lossy().into_owned()];
+        drop(monitor);
+        drop(client);
+        let module = Supervisor::default()
+            .supervise_configured_with_health(
+                configured.module_spec(),
+                true,
+                configured.health,
+                configured.drain_timeout_ms,
+                configured.restart,
+            )
+            .unwrap();
+        wait_http_health(&module, SupervisorHealthStatus::Ok).await;
+        module.drain().await.unwrap();
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn configuration_update_does_not_replace_captured_running_process_facts() {
         let supervisor = Supervisor::default();
@@ -4743,7 +5394,7 @@ async fn handle_supervisor_command(
     command: SupervisorCommand,
     spec: &mut ModuleSpec,
     runtime: &mut SupervisorRuntimeConfig,
-    registry: &Registry,
+    registry: &Arc<Registry>,
     process_liveness: &SupervisorProcessLiveness,
     snapshot: &SharedSnapshot,
     child: &mut Option<SupervisedChild>,
@@ -4931,7 +5582,15 @@ async fn handle_supervisor_command(
             let _ = update_snapshot(snapshot, Some(&spec.module_id), |state| {
                 state.configuration_updated_since_spawn = true;
             });
+            let health_changed = runtime.health != health;
             runtime.health = health;
+            // Reset the cadence and old endpoint's failure streak on a live
+            // health-policy change rather than waiting for its old deadline.
+            if health_changed {
+                let _ = update_snapshot(snapshot, Some(&spec.module_id), |state| {
+                    state.health = ModuleHealthStatus::default();
+                });
+            }
             runtime.drain_timeout = drain_timeout_ms
                 .map(Duration::from_millis)
                 .unwrap_or(runtime.default_drain_timeout);
@@ -5330,8 +5989,8 @@ async fn on_child_exit(
     // stop would leave the module down for good after any stray signal, so it
     // goes through the crash path instead: it spends restart budget, respawns
     // with the crash backoff, and ends `failed` when the budget runs out.
-    let unrequested_clean_exit_of_protocol_none =
-        exit_report.kind == ExitKind::Clean && spec.protocol == ModuleProtocol::None;
+    let unrequested_clean_exit_of_protocol_none = exit_report.kind == ExitKind::Clean
+        && running_protocol(spec, snapshot) == ModuleProtocol::None;
     match exit_report.kind {
         ExitKind::Clean if !unrequested_clean_exit_of_protocol_none => {
             info!(
@@ -5817,7 +6476,7 @@ fn spawn_child(
 
 /// Spawn one process of `spec` into a slot.
 ///
-/// `alternate_slot` picks the process's cgroup name (see `swap::cgroup_name`).
+/// `alternate_slot` picks the process's cgroup label on Linux (see `swap::cgroup_name`).
 /// A swap candidate needs a different cgroup from the process it is replacing,
 /// which is still alive: in the same cgroup the two would be one kill domain,
 /// and killing a failed candidate could take the incumbent with it.
@@ -5847,7 +6506,28 @@ fn spawn_child_in_slot(
         });
     }
     #[cfg(target_os = "linux")]
-    let cgroup_name = swap::cgroup_name(&spec.module_id, alternate_slot);
+    let cgroup_name = {
+        // Slot names alone are not kill domains: a retired incumbent may still
+        // be draining when a later enable/restart spawns into the same slot.
+        // Decimal entropy keeps the suffix unambiguous; Placement performs
+        // the module-id escaping and constructs the filesystem path.
+        if cgroup_placement.is_none() {
+            swap::cgroup_name(&spec.module_id, alternate_slot)
+        } else {
+            let nonce = generate_launch_nonce()?;
+            let suffix = u128::from_str_radix(&nonce[..32], 16).expect("hex launch nonce");
+            // Leave room for byte escaping and the suffix under NAME_MAX. The
+            // label is only for humans; the nonce identifies the kill domain.
+            let mut end = spec.module_id.len().min(64);
+            while !spec.module_id.is_char_boundary(end) {
+                end -= 1;
+            }
+            format!(
+                "{}_{suffix}",
+                swap::cgroup_name(&spec.module_id[..end], alternate_slot)
+            )
+        }
+    };
     #[cfg(not(target_os = "linux"))]
     let _ = alternate_slot;
     let mut command = Command::new(&spec.program);
@@ -5990,9 +6670,15 @@ fn spawn_child_in_slot(
     })?;
     let process_start_time = crate::provenance::process_start_time(pid);
     let process_identity = process_start_time.map(|start_time| ProcessIdentity { pid, start_time });
-    // The executable identity is the spawned path's, read above, not the
-    // running image's: right after spawn the child may not have finished its
-    // exec yet and would still report this daemon's own image.
+    // Unix spawn returns after exec's error pipe closes. The kernel image is
+    // therefore the executable to compare during a future orphan sweep: PATH
+    // lookup and shebang interpretation may select a different file from the
+    // configured program. Keep the literal program's identity for provenance,
+    // but never use it as proof that a recorded pid may be signalled.
+    let recorded_image = subc_os::Process::open(pid)
+        .ok()
+        .flatten()
+        .and_then(|process| process.observe());
     #[cfg(target_os = "linux")]
     let recorded_cgroup_name = cgroup_path.as_ref().map(|_| cgroup_name.clone());
     #[cfg(not(target_os = "linux"))]
@@ -6003,13 +6689,10 @@ fn spawn_child_in_slot(
         spec.protocol,
         process_start_time,
         crate::child_roster::RecordedIdentity {
-            start_time: subc_os::start_time(pid),
-            executable: spawned_file_identity.map(|identity| {
-                crate::live_children::ExecutableIdentity {
-                    device: identity.device,
-                    inode: identity.inode,
-                }
-            }),
+            start_time: recorded_image.map(|image| image.start_time),
+            executable: recorded_image
+                .and_then(|image| image.executable)
+                .map(crate::live_children::ExecutableIdentity::from),
             cgroup_name: recorded_cgroup_name,
             #[cfg(target_os = "linux")]
             cgroup_placement: cgroup_placement.cloned(),
@@ -6029,6 +6712,29 @@ fn spawn_child_in_slot(
         kill_module_cgroup(cgroup_placement, &cgroup_name);
         if let Err(error) = child.start_kill() {
             debug!(module_id = %spec.module_id, pid, %error, "kill of a process spawned during daemon shutdown failed; it may already have exited");
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(placement) = cgroup_placement {
+            // This spawn was never admitted, so shutdown has no roster entry
+            // to await. Do not detach its cleanup: the runtime could exit
+            // before that task reaps the rejected child and removes its group.
+            while matches!(child.try_wait(), Ok(None)) {
+                std::thread::yield_now();
+            }
+            if matches!(
+                subc_cgroup::kill_module(Some(placement), &cgroup_name),
+                subc_cgroup::KillOutcome::Killed
+            ) {
+                if let Ok(path) = placement.module_path(&cgroup_name) {
+                    while std::fs::read_to_string(path.join("cgroup.events"))
+                        .ok()
+                        .is_some_and(|events| events.lines().any(|line| line == "populated 1"))
+                    {
+                        std::thread::yield_now();
+                    }
+                }
+            }
+            remove_module_cgroup(placement, &cgroup_name);
         }
         drop(roster_guard);
         return Err(SuperviseError::Spawn {
@@ -6083,6 +6789,7 @@ fn spawn_child_in_slot(
 
     Ok(SupervisedChild {
         child,
+        protocol: spec.protocol,
         #[cfg(target_os = "linux")]
         module_id: cgroup_name,
         #[cfg(target_os = "linux")]
@@ -6214,6 +6921,27 @@ fn remove_module_cgroup(placement: &subc_cgroup::Placement, module_id: &str) {
             "could not remove module cgroup after process exit; continuing teardown"
         ),
     }
+}
+
+#[cfg(target_os = "linux")]
+async fn cleanup_reaped_cgroup(placement: &subc_cgroup::Placement, module_id: &str) {
+    // Reaping the direct child is not proof its descendants exited. End the
+    // residual tree and wait for the kernel's population fact before rmdir;
+    // otherwise a successful parent wait leaks a directory on each restart.
+    if matches!(
+        subc_cgroup::kill_module(Some(placement), module_id),
+        subc_cgroup::KillOutcome::Killed
+    ) {
+        if let Ok(path) = placement.module_path(module_id) {
+            while std::fs::read_to_string(path.join("cgroup.events"))
+                .ok()
+                .is_some_and(|events| events.lines().any(|line| line == "populated 1"))
+            {
+                sleep(Duration::from_millis(1)).await;
+            }
+        }
+    }
+    remove_module_cgroup(placement, module_id);
 }
 
 #[cfg(target_os = "linux")]
@@ -7271,7 +7999,7 @@ async fn drain_optional_child(
 #[allow(clippy::too_many_arguments)]
 async fn drain_child_to_state(
     module_id: &str,
-    protocol: ModuleProtocol,
+    _protocol: ModuleProtocol,
     stop_notice: StopNotice,
     registry: &Registry,
     snapshot: &SharedSnapshot,
@@ -7282,6 +8010,7 @@ async fn drain_child_to_state(
     final_state: ModuleState,
     enabled: Option<bool>,
 ) -> Result<(), SuperviseError> {
+    let protocol = child.protocol;
     update_snapshot(snapshot, Some(module_id), |state| {
         state.state = ModuleState::Draining;
         state.draining_to_replace = final_state == ModuleState::Restarting;
@@ -7684,6 +8413,7 @@ fn set_running(
     // a promoted swap candidate sets the flag itself after this returns.
     state.in_alternate_slot = false;
     state.configuration_updated_since_spawn = false;
+    state.spawned_protocol = Some(child.protocol);
     state.state = ModuleState::Running;
     state.enabled = true;
     state.process_alive = true;
@@ -7697,6 +8427,7 @@ fn set_running(
 
 fn clear_current_process_facts(state: &mut SupervisorSnapshot) {
     state.process_alive = false;
+    state.spawned_protocol = None;
     state.pid = None;
     state.spawned_at_ms = None;
     state.spawned_from = None;
@@ -9264,6 +9995,7 @@ mod health_tombstone_tests {
         let forwarding = Arc::new(ForwardingTable::default());
         let supervisor_handle = super::SupervisorHandle::new();
         let health = HealthConfig {
+            http: None,
             cadence: Duration::from_secs(30),
             deadline: Duration::from_secs(5),
             failure_threshold: 3,
@@ -9797,6 +10529,123 @@ mod cgroup_placement_tests {
     use subc_test_support::TestTempDir;
     use tokio::process::Command;
 
+    #[tokio::test]
+    async fn unique_spawn_cgroups_clean_up_across_restarts_and_shutdown() {
+        use super::*;
+        let dir = TestTempDir::new("unique-spawn-cgroups");
+        let root = PathBuf::from(format!(
+            "/sys/fs/cgroup/subc-unique-test-{}-{}",
+            std::process::id(),
+            unix_ms_now()
+        ));
+        if let Err(error) = fs::create_dir(&root) {
+            assert!(
+                std::env::var_os("SUBC_REQUIRE_CGROUP_TEST").is_none(),
+                "required cgroup test cannot execute: {error}"
+            );
+            eprintln!("SKIP unique_spawn_cgroups_clean_up_across_restarts_and_shutdown: {error}");
+            return;
+        }
+        let placement = subc_cgroup::prepare_at(&root).unwrap().unwrap();
+        let group_count = || {
+            fs::read_dir(root.join("subc-modules"))
+                .unwrap()
+                .map(|entry| entry.unwrap().file_type().unwrap())
+                .filter(|kind| kind.is_dir())
+                .count()
+        };
+        let supervisor = Supervisor::default().with_cgroup_placement(Some(placement.clone()));
+        let runtime = supervisor.runtime_config();
+        let mut spec = ModuleSpec {
+            module_id: "unique-spawn".into(),
+            program: PathBuf::from("/bin/sleep"),
+            args: vec!["60".into()],
+            env: ["XDG_DATA_HOME", "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME"]
+                .into_iter()
+                .map(|key| (key.into(), dir.to_string_lossy().into_owned()))
+                .collect(),
+            reserved: false,
+            reserved_prefixes: vec![],
+            protocol: ModuleProtocol::None,
+            overlap: Default::default(),
+        };
+        let spawn = |spec: &ModuleSpec| {
+            spawn_child(
+                spec,
+                None,
+                None,
+                &runtime.stderr_ring,
+                None,
+                &runtime.child_roster,
+                Some(&placement),
+            )
+            .unwrap()
+        };
+        let mut live = spawn(&spec);
+        for _ in 0..3 {
+            // A new process can enter the old slot while retirement is pending.
+            let next = spawn(&spec);
+            assert_ne!(live.module_id, next.module_id);
+            live.start_kill().unwrap();
+            live.wait().await.unwrap();
+            live = next;
+            assert!(
+                live.child.try_wait().unwrap().is_none(),
+                "retiring the old slot must not kill the replacement"
+            );
+            assert_eq!(
+                group_count(),
+                1,
+                "only the live spawn's cgroup should remain"
+            );
+        }
+        supervisor.begin_daemon_shutdown();
+        let reap = tokio::spawn(async move {
+            live.wait().await.unwrap();
+        });
+        supervisor
+            .end_children_for_daemon_shutdown(false, std::future::pending())
+            .await;
+        reap.await.unwrap();
+        assert_eq!(group_count(), 0);
+        // A normal exit uses the same tree-cleanup path as a killed spawn.
+        spec.program = PathBuf::from("/bin/true");
+        spec.args.clear();
+        let fresh_roster = ChildRoster::default();
+        let mut short = spawn_child(
+            &spec,
+            None,
+            None,
+            &runtime.stderr_ring,
+            None,
+            &fresh_roster,
+            Some(&placement),
+        )
+        .unwrap();
+        short.wait().await.unwrap();
+        assert_eq!(group_count(), 0);
+        spec.module_id = "_".repeat(255);
+        let mut long_id = spawn_child(
+            &spec,
+            None,
+            None,
+            &runtime.stderr_ring,
+            None,
+            &fresh_roster,
+            Some(&placement),
+        )
+        .unwrap();
+        long_id.wait().await.unwrap();
+        assert_eq!(
+            group_count(),
+            0,
+            "valid long module IDs must not exceed cgroup NAME_MAX"
+        );
+        fs::remove_dir(root.join("subc-modules")).unwrap();
+        fs::remove_dir(root).unwrap();
+        eprintln!("EXECUTED unique_spawn_cgroups_clean_up_across_restarts_and_shutdown");
+    }
+
     #[test]
     fn failed_parent_cgroup_open_is_a_cgroup_supervision_error() {
         let path = Path::new("/definitely-missing-subc-cgroup");
@@ -9840,11 +10689,15 @@ mod cgroup_placement_tests {
             .module_path(module_id)
             .expect("create scratch module cgroup");
         let child = Command::new("true")
+            .env("XDG_DATA_HOME", root.path())
+            .env("XDG_RUNTIME_DIR", root.path())
+            .env("XDG_CONFIG_HOME", root.path())
             .spawn()
             .expect("spawn short-lived child");
         let pid = child.id().expect("spawned child has pid");
         let mut child = SupervisedChild {
             child,
+            protocol: ModuleProtocol::Subc,
             module_id: module_id.to_string(),
             cgroup_placement: Some(placement),
             stdout_pump: None,

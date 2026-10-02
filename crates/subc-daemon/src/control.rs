@@ -4559,11 +4559,17 @@ impl ControlHandler {
             else {
                 continue;
             };
-            let configuration_changed = *current_spec != configured_module.module_spec()
-                || *current_health != configured_module.health;
+            // Compare the whole launch spec so a future launch field cannot
+            // accidentally become a live-only policy change. Health is stored
+            // separately and applies live without replacing the process.
+            let launch_changed = *current_spec != configured_module.module_spec();
+            let configuration_changed =
+                launch_changed || *current_health != configured_module.health;
             let enabled_changed = *current_enabled != configured_module.enabled;
             if configuration_changed {
                 configuration_changes.insert(module_id.clone());
+            }
+            if launch_changed {
                 changed_pending_reload.push(module_id.clone());
             }
             if enabled_changed {
@@ -4652,7 +4658,7 @@ impl ControlHandler {
                 module
                     .update_configuration(
                         configured_module.module_spec(),
-                        configured_module.health,
+                        configured_module.health.clone(),
                         configured_module.drain_timeout_ms,
                     )
                     .await
@@ -4687,7 +4693,7 @@ impl ControlHandler {
                 .supervise_configured_with_health(
                     configured_module.module_spec(),
                     configured_module.enabled,
-                    configured_module.health,
+                    configured_module.health.clone(),
                     configured_module.drain_timeout_ms,
                     configured_module.restart,
                 )
@@ -6114,6 +6120,64 @@ pub(crate) fn send_route_control_pushes(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rescan_health_only_is_live_but_launch_edits_need_reload() {
+        let dir = subc_test_support::TestTempDir::new("rescan-live-health");
+        let path = dir.join("subc.jsonc");
+        std::fs::write(&path, serde_json::json!({"version":1,"modules":{"stock":{
+            "program":"/bin/sleep","args":["60"],"protocol":"none",
+            "env":{"XDG_DATA_HOME":dir.path(),"XDG_RUNTIME_DIR":dir.path(),"XDG_CONFIG_HOME":dir.path()}
+        }}}).to_string()).unwrap();
+        let mut configured = crate::daemon_config::load(&path)
+            .unwrap()
+            .unwrap()
+            .modules
+            .pop()
+            .unwrap();
+        let registry = std::sync::Arc::new(crate::Registry::default());
+        let handle = crate::SupervisorHandle::new();
+        let supervisor = crate::Supervisor::new(registry.clone(), crate::RestartPolicy::default())
+            .with_handle(handle.clone());
+        let module = supervisor
+            .supervise_configured_with_health(
+                configured.module_spec(),
+                true,
+                configured.health.clone(),
+                None,
+                configured.restart,
+            )
+            .unwrap();
+        let handler = super::ControlHandler::new(registry).with_supervisor(handle);
+        let before = module.status().unwrap().pid;
+        configured.health.http = Some("http://127.0.0.1:1/healthz".into());
+        configured.health.cadence = std::time::Duration::from_secs(3600);
+        let health_only = handler
+            .reconcile_supervised_modules(&supervisor, vec![configured.clone()], false)
+            .await
+            .unwrap();
+        assert!(
+            health_only.changed_pending_reload.is_empty(),
+            "health policy is already applied live"
+        );
+        assert_eq!(module.status().unwrap().pid, before);
+        assert_eq!(
+            module.configuration().unwrap().1.http,
+            configured.health.http
+        );
+        configured.args = vec!["61".into()];
+        let launch = handler
+            .reconcile_supervised_modules(&supervisor, vec![configured], false)
+            .await
+            .unwrap();
+        assert_eq!(launch.changed_pending_reload, ["stock"]);
+        assert_eq!(
+            module.status().unwrap().pid,
+            before,
+            "a launch edit is stored until reload"
+        );
+        module.drain().await.unwrap();
+    }
     use std::{
         collections::BTreeMap,
         fmt,

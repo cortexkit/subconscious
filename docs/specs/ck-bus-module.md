@@ -1583,8 +1583,10 @@ SECTION governs.
   `ckbus.agent_durable_delete {from}`, which deletes the source's durables and purges its
   subjects. ck-bus holds no workload publish either way (line 609 stands; ck-bus holds
   signing power and must not also inject messages), and nothing in ck-bus assumes a
-  copy runs: its behaviour is unchanged. Prefrontal still reads
-  `ckbus.agent_effects_pending {from}` before the delete, for the reason given above.
+  copy runs: its behaviour is unchanged. Merge and dispose both terminalize the agent,
+  then delete its durables only once `ckbus.agent_effects_pending` reports `pending ==
+  0`, for the reason given above. A non-zero answer, or a failed call, means no delete:
+  prefrontal leaves the durables in place and retries on its slow reconcile cadence.
   Issuance step 4 no longer creates `c_{agent_id}` durables; prefrontal's bind does. The
   membership row keeps rooms only, still gated on `membership-contract-unpinned`.
 - R16 (ALF, 2026-09-24; discharges `user-jwt-ttl-unpinned`): every user JWT ck-bus

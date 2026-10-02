@@ -2008,7 +2008,11 @@ impl ControlHandler {
                 }
                 return Ok(vec![control_error_frame(
                     &frame,
-                    forwarding_error_code(&err),
+                    if matches!(err, ForwardingError::ConnectionRoleConflict { .. }) {
+                        "invalid_hello"
+                    } else {
+                        forwarding_error_code(&err)
+                    },
                     err.to_string(),
                 )?]);
             }
@@ -2926,6 +2930,18 @@ impl ControlHandler {
             scope,
         } = request;
         let target_module_id = target_module_id(&target).to_string();
+        if self
+            .registry
+            .get_module_by_connection(ctx.connection_id)
+            .map_err(|err| RouterError::backend(0, frame.header.corr, err.to_string()))?
+            .is_some()
+        {
+            return Ok(vec![control_error_frame(
+                &frame,
+                "invalid_request",
+                "module connections cannot open client routes",
+            )?]);
+        }
         debug!(
             connection_id = ctx.connection_id.get(),
             corr = frame.header.corr,
@@ -5929,6 +5945,7 @@ fn control_response_body_frame<T: Serialize>(
 /// Pin identity here the moment a consumer branches on a specific code.
 fn forwarding_error_code(err: &ForwardingError) -> &'static str {
     match err {
+        ForwardingError::ConnectionRoleConflict { .. } => "invalid_request",
         ForwardingError::NoModuleConnection => "target_unavailable",
         ForwardingError::ModuleReloading { .. } => "module_reloading",
         ForwardingError::ClientRouteChannelExhausted { .. }
@@ -6209,6 +6226,9 @@ mod tests {
         // recover at all — the worst thing to advertise as retryable, since every
         // client would storm a daemon that will never answer.
         let permanent = [
+            ForwardingError::ConnectionRoleConflict {
+                connection_id: ConnectionId::new(1),
+            },
             ForwardingError::ClientRouteChannelExhausted {
                 connection_id: ConnectionId::new(1),
             },

@@ -735,12 +735,10 @@ impl ForwardingTable {
         if inner.daemon_draining || inner.closing_connections.contains(&connection_id) {
             return Err(ForwardingError::ConnectionClosing { connection_id });
         }
+        check_module_connection_role_locked(&inner, connection_id)?;
         // Every refusal check has passed and nothing has been mutated yet, so
         // a failed enqueue leaves the table exactly as it was.
         enqueue_hello_ack_locked(&sink, connection_id, hello_ack)?;
-        if let Some(old_endpoint) = inner.endpoint_by_connection.remove(&connection_id) {
-            let _ = remove_module_connection_locked(&mut inner, old_endpoint);
-        }
 
         inner.next_generation = inner.next_generation.checked_add(1).unwrap_or(1);
         let endpoint = ModuleEndpointId {
@@ -859,15 +857,13 @@ impl ForwardingTable {
         if inner.daemon_draining || inner.closing_connections.contains(&connection_id) {
             return Err(ForwardingError::ConnectionClosing { connection_id });
         }
+        check_module_connection_role_locked(&inner, connection_id)?;
         if inner.candidates_by_id.contains_key(&module_id) {
             return Err(ForwardingError::CandidateSlotOccupied { module_id });
         }
         // As in `register_module_connection_inner`: after every refusal check,
         // before any mutation.
         enqueue_hello_ack_locked(&sink, connection_id, hello_ack)?;
-        if let Some(old_endpoint) = inner.endpoint_by_connection.remove(&connection_id) {
-            let _ = remove_module_connection_locked(&mut inner, old_endpoint);
-        }
 
         inner.next_generation = inner.next_generation.checked_add(1).unwrap_or(1);
         let endpoint = ModuleEndpointId {
@@ -1198,6 +1194,17 @@ impl ForwardingTable {
         client_permit: crate::router::EgressPermit,
     ) -> Result<PendingRouteBindRelay, ForwardingError> {
         let mut inner = self.write_inner()?;
+        // HELLO and route.open can run on different tasks. Decide the role under
+        // the same lock that installs endpoints and reserves client channels so
+        // neither task can turn one connection into both kinds of owner.
+        if inner
+            .endpoint_by_connection
+            .contains_key(&client_connection_id)
+        {
+            return Err(ForwardingError::ConnectionRoleConflict {
+                connection_id: client_connection_id,
+            });
+        }
         if inner.closing_connections.contains(&client_connection_id) {
             return Err(ForwardingError::ConnectionClosing {
                 connection_id: client_connection_id,
@@ -2369,15 +2376,7 @@ impl ForwardingTable {
         connection_id: ConnectionId,
     ) -> Result<bool, ForwardingError> {
         let inner = self.read_inner()?;
-        let has = inner
-            .client_to_module
-            .keys()
-            .any(|key| key.connection_id == connection_id)
-            || inner
-                .reserved_client
-                .keys()
-                .any(|key| key.connection_id == connection_id);
-        Ok(has)
+        Ok(connection_has_client_routes_locked(&inner, connection_id))
     }
 
     pub(crate) fn cleanup_connection(
@@ -2757,6 +2756,32 @@ impl ForwardingInner {
         );
         Ok(candidate)
     }
+}
+
+fn connection_has_client_routes_locked(
+    inner: &ForwardingInner,
+    connection_id: ConnectionId,
+) -> bool {
+    inner
+        .client_to_module
+        .keys()
+        .any(|key| key.connection_id == connection_id)
+        || inner
+            .reserved_client
+            .keys()
+            .any(|key| key.connection_id == connection_id)
+}
+
+fn check_module_connection_role_locked(
+    inner: &ForwardingInner,
+    connection_id: ConnectionId,
+) -> Result<(), ForwardingError> {
+    if inner.endpoint_by_connection.contains_key(&connection_id)
+        || connection_has_client_routes_locked(inner, connection_id)
+    {
+        return Err(ForwardingError::ConnectionRoleConflict { connection_id });
+    }
+    Ok(())
 }
 
 fn next_channel(channel: u16) -> u16 {
@@ -3389,6 +3414,11 @@ fn window_for(concurrency: &Concurrency) -> usize {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ForwardingError {
+    /// A connection cannot hold both client routes and a module endpoint, or
+    /// replace a module identity while that endpoint is still registered.
+    ConnectionRoleConflict {
+        connection_id: ConnectionId,
+    },
     NoModuleConnection,
     ModuleReloading {
         module_id: String,
@@ -3427,6 +3457,7 @@ pub enum ForwardingError {
 impl fmt::Display for ForwardingError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::ConnectionRoleConflict { connection_id } => write!(f, "connection {} already holds an incompatible role", connection_id.get()),
             Self::NoModuleConnection => write!(f, "no module connection is registered"),
             Self::ModuleReloading { module_id } => {
                 write!(f, "module_id '{module_id}' is reloading")
@@ -3901,6 +3932,76 @@ mod tests {
         forwarding
             .begin_route_bind_relay_for_test(client_connection, client_sink, corr, module_id)
             .unwrap()
+    }
+
+    #[test]
+    fn module_registration_and_client_reservation_are_mutually_exclusive_in_both_orders() {
+        for candidate in [false, true] {
+            for register_first in [false, true] {
+                let (forwarding, module_connection, _, client_connection, sink, _rx) =
+                    route_fixture("target");
+                let register = || {
+                    if candidate {
+                        forwarding.register_candidate_module_connection(
+                            client_connection,
+                            "source".into(),
+                            2,
+                            Concurrency::ModuleManaged,
+                            sink.clone(),
+                        )
+                    } else {
+                        forwarding.register_module_connection(
+                            client_connection,
+                            "source".into(),
+                            2,
+                            Concurrency::ModuleManaged,
+                            sink.clone(),
+                        )
+                    }
+                };
+                if register_first {
+                    register().unwrap();
+                    assert!(
+                        forwarding
+                            .begin_route_bind_relay_for_test(
+                                client_connection,
+                                sink.clone(),
+                                1,
+                                "target",
+                            )
+                            .is_err(),
+                        "a deferred route.open cannot reserve after HELLO"
+                    );
+                    assert!(forwarding
+                        .cleanup_connection(client_connection)
+                        .unwrap()
+                        .is_empty());
+                } else {
+                    let pending =
+                        begin_test_route(&forwarding, client_connection, sink.clone(), 1, "target");
+                    assert!(
+                        register().is_err(),
+                        "HELLO cannot register after a route reservation"
+                    );
+                    forwarding
+                        .complete_pending_relay(
+                            module_connection,
+                            pending.corr,
+                            RouteBindRelayOutcome::Accepted,
+                        )
+                        .unwrap();
+                    assert_eq!(
+                        forwarding
+                            .cleanup_connection(client_connection)
+                            .unwrap()
+                            .len(),
+                        1
+                    );
+                }
+                assert_eq!(forwarding.reserved_route_count().unwrap(), (0, 0));
+                assert_eq!(forwarding.active_binding_count().unwrap(), 0);
+            }
+        }
     }
 
     /// A pending route.open reserves its queue slot with `reserve_owned` and

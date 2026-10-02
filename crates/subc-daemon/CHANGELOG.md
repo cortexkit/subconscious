@@ -3,6 +3,7 @@
 ## 0.29.2
 
 - Refuse a second HELLO on a registered module connection without changing its identity, launch nonce, or existing routes.
+- Serialize module registration and client-route reservation admission, refusing mixed roles with terminal `invalid_hello` or `invalid_request` rather than allowing unusable, leaked routes.
 
 ## 0.29.1 — 2026-10-02
 

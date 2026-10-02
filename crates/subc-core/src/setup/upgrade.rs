@@ -954,7 +954,13 @@ fn version_from_output(output: &[u8]) -> Result<String, String> {
     output
         .split_whitespace()
         .map(|token| token.trim_start_matches('v'))
-        .find(|token| super::model::CoreVersion::from_release(token).is_ok())
+        .find(|token| {
+            super::model::CoreVersion::from_release(token).is_ok()
+                // MC's owner publishes build trains rather than numeric
+                // releases, and its --version line prints that train tag.
+                || token.strip_prefix("ck-mc-").is_some_and(|train| !train.is_empty()
+                    && train.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-')))
+        })
         .map(ToOwned::to_owned)
         .ok_or_else(|| format!("refusal: --version output had no semantic version: {output:?}"))
 }
@@ -1045,6 +1051,19 @@ mod tests {
             planned_from: BTreeMap::new(),
             supervised_modules: BTreeSet::new(),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn train_version_output_is_discovered_and_post_verified() {
+        let root = TestTempDir::new("train-version-output");
+        let target = upgrade_target("ck-mc");
+        let version = "ck-mc-alpha.22464bf2";
+        version_binary(&root.join("ck-mc"), version);
+        assert_eq!(binary_version(&root.join("ck-mc")).unwrap(), version);
+        let mut backend = isolated_backend(&root, target);
+        backend.set_expected_version(target, version.into());
+        assert!(backend.post_verify(target).is_ok());
     }
 
     #[cfg(unix)]

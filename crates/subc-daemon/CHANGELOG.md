@@ -3,6 +3,7 @@
 ## 0.29.2
 
 - Reject reserved capability claims in `catalog.update` before changing active or swap-candidate registrations, using the same `reserved_capability` error as HELLO.
+- Module GOODBYE now performs disconnect teardown immediately, including requirement recomputation, route-closed client pushes and scope-sync authority release, without waiting for the socket to close.
 
 ## 0.29.1 — 2026-10-02
 

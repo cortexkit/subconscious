@@ -5334,18 +5334,11 @@ impl ControlHandler {
 
     fn handle_goodbye(&self, connection_id: ConnectionId) -> Result<Vec<Frame>, RouterError> {
         debug!(connection_id = connection_id.get(), "handling GOODBYE");
-        let registrations = self
-            .deregister_connection(connection_id)
+        // GOODBYE ends the connection's logical session even when its socket
+        // stays open. Use disconnect teardown so verdicts, client notices and
+        // scope authority are released at the same lifecycle boundary.
+        self.cleanup_connection(connection_id)
             .map_err(|err| RouterError::backend(0, 0, err.to_string()))?;
-        let released_routes = self
-            .forwarding
-            .cleanup_connection(connection_id)
-            .map_err(RouterError::Forwarding)?;
-        self.emit_route_goodbyes(released_routes);
-        // Notify only after forwarding teardown completes (see cleanup_connection).
-        if !registrations.is_empty() {
-            crate::supervise::notify_registration_release();
-        }
         Ok(Vec::new())
     }
 }
@@ -10709,6 +10702,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn module_goodbye_refreshes_requirements_and_pushes_route_closed() {
+        let registry = Arc::new(Registry::default());
+        let handler = ControlHandler::new(registry).with_capability_config(
+            [("prov".to_string(), true), ("cons".to_string(), true)],
+            BTreeMap::new(),
+        );
+        let (provider_ctx, mut provider_rx) = route_ctx(ConnectionId::new(701));
+        register_capability_manifest(
+            &handler,
+            &provider_ctx,
+            &mut provider_rx,
+            capability_manifest("prov", &["thing/v1"], &[]),
+            1,
+        )
+        .await;
+        let mut consumer = capability_manifest("cons", &[], &[]);
+        consumer.capabilities.as_mut().unwrap().requires.push(
+            subc_protocol::manifest::CapabilityRequirement {
+                capability: "thing/v1".to_string(),
+                need: subc_protocol::manifest::CapabilityNeed::Required,
+            },
+        );
+        let (consumer_ctx, mut consumer_rx) = route_ctx(ConnectionId::new(702));
+        register_capability_manifest(&handler, &consumer_ctx, &mut consumer_rx, consumer, 2).await;
+        assert_eq!(
+            handler.capability_evaluator.verdict("cons", "thing/v1"),
+            Some(CapabilityVerdict::Provided)
+        );
+        let (mut client_rx, _) = open_route_for_capability_test(
+            &handler,
+            &provider_ctx,
+            &mut provider_rx,
+            703,
+            3,
+            "prov",
+            None,
+        )
+        .await;
+        let goodbye =
+            Frame::build(FrameType::Goodbye, control_flags(), 0, 0, 4, Vec::new()).unwrap();
+        handler
+            .handle_control_frame(&provider_ctx, goodbye)
+            .await
+            .unwrap();
+        assert_eq!(
+            handler.capability_evaluator.verdict("cons", "thing/v1"),
+            Some(CapabilityVerdict::NeverProvided)
+        );
+        let closed = client_rx
+            .try_recv()
+            .expect("GOODBYE pushes route.closed before route GOODBYE");
+        assert!(
+            matches!(serde_json::from_slice::<ClientControlPush>(&closed.body).unwrap(),
+            ClientControlPush::RouteClosed { module_id, channels, .. } if module_id == "prov" && channels.len() == 1)
+        );
+        assert_eq!(client_rx.try_recv().unwrap().header.ty, FrameType::Goodbye);
+        assert_eq!(handler.forwarding.active_binding_count().unwrap(), 0);
+    }
+
+    #[tokio::test]
     async fn dropping_router_connection_releases_registration() {
         let registry = Arc::new(Registry::default());
         let control = Arc::new(ControlHandler::new(Arc::clone(&registry)));
@@ -11944,6 +11997,29 @@ mod tests {
             sync(&handler, &second, 1, vec![head("s", 1)])
                 .await
                 .expect("the next connection takes the released authority");
+        }
+
+        #[tokio::test]
+        async fn module_goodbye_releases_scope_sync_authority_without_socket_close() {
+            let supervisor = SupervisorHandle::new();
+            supervisor.set_spawn_nonce(OWNER, "n1".to_string());
+            let handler =
+                ControlHandler::new(Arc::new(Registry::default())).with_supervisor(supervisor);
+            let (first, _rx) = module(&handler, 1, OWNER, Some("n1")).await;
+            sync(&handler, &first, 10, vec![head("s", 1)])
+                .await
+                .unwrap();
+            handler
+                .handle_control_frame(
+                    &first,
+                    Frame::build(FrameType::Goodbye, control_flags(), 0, 0, 4, Vec::new()).unwrap(),
+                )
+                .await
+                .unwrap();
+            let (second, _rx) = module(&handler, 2, OWNER, Some("n1")).await;
+            sync(&handler, &second, 1, vec![head("s", 1)])
+                .await
+                .expect("GOODBYE releases authority even if the old socket remains open");
         }
 
         #[tokio::test]

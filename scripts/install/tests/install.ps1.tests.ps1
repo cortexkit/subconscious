@@ -17,7 +17,9 @@ Describe 'native ck installer' {
         $originalLocalAppData = $env:LOCALAPPDATA
         $originalArchitecture = $env:PROCESSOR_ARCHITECTURE
         $originalWowArchitecture = $env:PROCESSOR_ARCHITEW6432
+        $originalUserProfile = $env:USERPROFILE
         $env:LOCALAPPDATA = Join-Path $TestDrive 'local-app-data'
+        $env:USERPROFILE = Join-Path $TestDrive 'profile-home'
         $env:PROCESSOR_ARCHITECTURE = 'AMD64'
         Remove-Item Env:PROCESSOR_ARCHITEW6432 -ErrorAction SilentlyContinue
 
@@ -93,6 +95,12 @@ Describe 'native ck installer' {
     AfterEach {
         $env:LOCALAPPDATA = $originalLocalAppData
         $env:PROCESSOR_ARCHITECTURE = $originalArchitecture
+        if ($null -eq $originalUserProfile) {
+            Remove-Item Env:USERPROFILE -ErrorAction SilentlyContinue
+        }
+        else {
+            $env:USERPROFILE = $originalUserProfile
+        }
         if ($null -eq $originalWowArchitecture) {
             Remove-Item Env:PROCESSOR_ARCHITEW6432 -ErrorAction SilentlyContinue
         }

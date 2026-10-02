@@ -24,7 +24,8 @@ pub enum PhaseClass {
     RefusalCapable,
     /// A phase that performs one or more irreversible public effects.
     Irreversible,
-    /// A phase allowed after publication because it only performs admitted work or bookkeeping.
+    /// Observational follow-up or bookkeeping that may run after publication.
+    /// Failure stops progress but does not revoke an already admitted public effect.
     PostBoundary,
 }
 
@@ -41,7 +42,6 @@ impl PhaseRegistry {
             | "ci_watch"
             | "build"
             | "stamp"
-            | "verify_readback"
             | crate::phases::precheck::FORMAT_DIRTY
             | crate::phases::precheck::STALE_RESIDUE
             | crate::phases::precheck::SIBLING_DRIFT
@@ -49,7 +49,7 @@ impl PhaseRegistry {
             | crate::phases::precheck::TOOL_PINNING
             | crate::phases::precheck::RESIDUE_SWEEP => Some(PhaseClass::RefusalCapable),
             "tag" | "publish" | "assets" => Some(PhaseClass::Irreversible),
-            "stage" | "notify" => Some(PhaseClass::PostBoundary),
+            "verify_readback" | "stage" | "notify" => Some(PhaseClass::PostBoundary),
             _ => None,
         }
     }

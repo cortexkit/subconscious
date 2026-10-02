@@ -67,6 +67,11 @@ instead of reporting a successful gate or fabricating evidence. The synthetic
 provider demonstrates public-effect replay, not real CI, builds, readback, or
 staging; the walkthrough below describes the intended complete pipeline.
 
+`verify_readback` is observational and may follow an irreversible phase.
+`ci_watch` remains a pre-publication gate even if its selector names a tag;
+post-boundary CI observation requires a separate watcher role, which is not yet
+defined. Ordinary release gates cannot first execute after publication.
+
 ## Acceptance-baseline walkthrough mapping
 
 The normative acceptance baseline records one manual sequence: publish an

@@ -548,7 +548,7 @@ fn irreversible_public(phase_type: &str) -> bool {
 fn refusal_capable(phase_type: &str) -> bool {
     !matches!(
         phase_type,
-        "tag" | "publish" | "assets" | "stage" | "notify"
+        "tag" | "publish" | "assets" | "verify_readback" | "stage" | "notify"
     )
 }
 

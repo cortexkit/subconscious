@@ -127,6 +127,24 @@ test("the fixture this suite pins to is the r2 schema", () => {
   check("fixture schema", fixture.schema, 2);
 });
 
+test("free-text message quotes do not open field values", () => {
+  for (const message of ['he said "hi', 'he said "hi there"', 'he said "hi \\n']) {
+    const event: LogEvent = { at_ms: FIXED_MS, level: "info", logger: "module", message, fields: [["count", 2]] };
+    const parsed = parseLine(formatLine(event));
+    expect(parsed).toMatchObject({ message, fields: [["count", "2"]] });
+  }
+});
+
+test("a plain bracket in message text is not misplaced bound context", () => {
+  const event: LogEvent = { at_ms: FIXED_MS, level: "info", logger: "module", message: "msg [x]", fields: [] };
+  expect(parseLine(formatLine(event))).toMatchObject({ message: "msg [x]", fields: [] });
+});
+
+test("a trailing key=value in free text uses the documented field ambiguity", () => {
+  const event: LogEvent = { at_ms: FIXED_MS, level: "info", logger: "module", message: "ends in a=b", fields: [] };
+  expect(parseLine(formatLine(event))).toMatchObject({ message: "ends in", fields: [["a", "b"]] });
+});
+
 describe("golden line format", () => {
   for (const golden of fixture.cases) {
     test(`renders ${golden.name}`, () => {

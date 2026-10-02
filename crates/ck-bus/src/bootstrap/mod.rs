@@ -413,6 +413,7 @@ pub async fn boot(
         .map_err(|error| vault_failure(cause::ROOT_KEY_UNREACHABLE, &error))?;
     let now = unix_now();
     let mut revoked = existing.as_ref().map(revocations).unwrap_or_default();
+    account_jwt::prune_revocations(&mut revoked, now, lifetime);
     for user in &to_revoke {
         revoked.entry(user.clone()).or_insert(now);
     }

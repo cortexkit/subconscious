@@ -568,6 +568,11 @@ impl Revoker {
             ));
         }
         let now = unix_now();
+        crate::bootstrap::account_jwt::prune_revocations(
+            &mut revoked,
+            now,
+            self.credentials.lifetime,
+        );
         revoked.insert(record.user_public.clone(), now);
         // The server keeps the newer of two account JWTs by `iat`, so an update in the
         // same second as the one it replaces is dated one second later.

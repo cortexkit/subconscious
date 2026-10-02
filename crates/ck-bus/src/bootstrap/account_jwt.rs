@@ -16,6 +16,7 @@ use sha2::{Digest, Sha256};
 
 use crate::credentials::{
     jwt::JWT_HEADER,
+    lifetime::{JwtLifetime, USER_JWT_LIFETIME},
     nkey::{encode_public, NkeyRole},
     roots::KeyIdLedger,
     vault::{VaultError, VaultSigning},
@@ -108,6 +109,20 @@ pub fn revocations(claims: &Value) -> BTreeMap<String, i64> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// A revoked key is never renewed. After the longest user lifetime has elapsed
+/// since its cutoff, every token covered by that cutoff has expired as well.
+pub fn prune_revocations(revoked: &mut BTreeMap<String, i64>, now: i64, lifetime: JwtLifetime) {
+    let duration = lifetime.lifetime.max(USER_JWT_LIFETIME);
+    let seconds = duration
+        .as_secs()
+        .saturating_add(u64::from(duration.subsec_nanos() != 0));
+    let horizon = i64::try_from(seconds).unwrap_or(i64::MAX);
+    let oldest = now.saturating_sub(horizon);
+    // Preserve wildcard/foreign entries: only ck-bus's per-process user keys have
+    // the no-renewal-after-revocation guarantee.
+    revoked.retain(|key, at| !key.starts_with('U') || *at >= oldest);
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

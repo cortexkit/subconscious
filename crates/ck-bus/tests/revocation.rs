@@ -920,6 +920,55 @@ async fn stop_and_damage(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn revocation_prunes_expired_user_cutoffs_but_keeps_live_cutoffs() {
+    let _gate = harness::acceptance_gate().await;
+    let run = start(false).await.expect("nats-server is required");
+    retire_supervised_ckbus(&run).await;
+    let plane = plane(&run).await;
+    let expired = KeyPair::new_user().public_key();
+    let recent = KeyPair::new_user().public_key();
+    let current = bootstrap::account_jwt::decode_claims(&run.account_jwt().await).unwrap();
+    let now = unix_now();
+    let claims = bootstrap::account_jwt::AccountClaims {
+        account_public: plane.account_public.clone(),
+        name: current["name"].as_str().unwrap().into(),
+        signing_keys: current["nats"]["signing_keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().into())
+            .collect(),
+        revocations: [(expired.clone(), now - 901), (recent.clone(), now)].into(),
+        issued_at: now.max(current["iat"].as_i64().unwrap() + 1),
+    };
+    let signer = InProcessSigner(run.trust.signer.clone());
+    let jwt = bootstrap::account_jwt::sign_account_jwt(
+        &signer,
+        &Default::default(),
+        &bus::signer_root_id(),
+        &claims,
+    )
+    .await
+    .unwrap();
+    bootstrap::plane::apply_account_jwt(plane.system.as_ref(), &plane.account_public, &jwt)
+        .await
+        .unwrap();
+    let store = tempfile::tempdir().unwrap();
+    let victim = Victim::enter(&run, &plane, "pruneprobe", 2).await;
+    let revoker = process(&plane, run.trust.signer.clone(), store.path()).await;
+    revoker.revoke_module(&plane, &victim.module).await.unwrap();
+    let revoked = run.revocations().await;
+    assert!(
+        !revoked.contains_key(&expired),
+        "expired JWT cutoffs must not accumulate"
+    );
+    assert!(revoked.contains_key(&recent));
+    revoked_once(&revoked, &victim.public);
+    run.server.stop().await;
+    run.run.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn census_replacement_records_predecessor_before_the_crash_boundary() {
     struct Live;
     #[async_trait]

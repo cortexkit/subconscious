@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.25.2 — 2026-10-02
+
+- Every module using the SDK's serve helper now answers `health.check` independently of data-request slots, even under request saturation. When all 64 slots are in use and the oldest queued request has waited more than two seconds, the helper reports at least `Degraded`, including the slot count and wait age. A module's own `Failing` status is preserved, its detail is appended, and its metrics are unchanged. With free slots, its report passes through unchanged.
+
 ## 0.25.1 — 2026-10-02
 
 - Add non-exhaustive `OutcomeUnknownCause` and `CallError::outcome_cause()` through typed error sources. Reply deadlines, writer failures, consumer closure, connection loss, route ends, and internal completion failures can be distinguished without matching `OutcomeUnknown` error message text. Existing error variants, message text, retry classes, and route-end reasons are preserved.

@@ -838,6 +838,45 @@ async fn drain(consumer: &mut DeadLetter) -> Result<(), dead_letter::consumer::D
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_consumer_recreation_preserves_the_settled_floor() {
+    let _gate = harness::acceptance_gate().await;
+    let run = start().await.expect("nats-server is required");
+    retire_supervised_ckbus(&run).await;
+    let names = run.names();
+    let plane = run.bus_plane().await;
+    let claimant = run.claimant().await;
+    publish_record(&claimant, &names, "recreate-settled", "recreate-settled").await;
+    let (mut consumer, journal) = open(&plane, &names, None).await;
+    drain(&mut consumer).await.unwrap();
+    assert_eq!(journal.lines(event::RECORDED, "recreate-settled").len(), 1);
+    drop(consumer);
+    let stopped = DeadLetter::stop_before_create(
+        plane.sentinel_link().unwrap().client,
+        &names,
+        Arc::new(Collected::default()),
+    )
+    .await;
+    assert!(stopped.is_err());
+    let (mut consumer, journal) = open(&plane, &names, None).await;
+    drain(&mut consumer).await.unwrap();
+    assert!(
+        journal
+            .lines(event::RECORDED, "recreate-settled")
+            .is_empty(),
+        "a failed create must not erase the prior ack floor"
+    );
+    publish_record(&claimant, &names, "recreate-settled", "recreate-duplicate").await;
+    drain(&mut consumer).await.unwrap();
+    assert_eq!(
+        journal.lines(event::DUPLICATE, "recreate-settled").len(),
+        1,
+        "replay must still rebuild the ledger"
+    );
+    run.server.stop().await;
+    run.run.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_record_is_settled_only_after_it_is_recorded_across_a_stop_at_each_boundary() {
     let _gate = harness::acceptance_gate().await;
     harness::install_tracing();

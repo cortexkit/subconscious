@@ -23,7 +23,9 @@
 //! restart without a file of its own; `docs/specs/ck-bus-module.md` lists every shape
 //! ck-bus's durable store may hold, and none is for dead letters. At
 //! every start ck-bus reads how far the previous `c_ckbus_dead` had settled (its ack
-//! floor), deletes it and creates it again from the first retained record. Replaying the
+//! floor), saves that floor in `c_ckbus_dead_checkpoint`'s metadata, then deletes and
+//! recreates the consuming durable from the first retained record. The checkpoint is
+//! never deleted, so an interrupted recreation retains the settled floor. Replaying the
 //! stream rebuilds the ledger of first sequences; records at or below the old ack floor
 //! were recorded by an earlier process and are settled again without a line. A process
 //! that dies after writing a line and before settling the record writes the same line

@@ -19,6 +19,64 @@ use tokio::process::Command;
 const MODULE_ID: &str = "ckbus";
 const DECLARED_DRAIN_TIMEOUT_MS: u64 = 2_000;
 
+/// The operator data-home guard compares the live module's files by presence
+/// or by content according to `data_home`'s lists. A state file ck-bus starts
+/// writing that is in neither list would be compared by content, so the live
+/// module rewriting it during a run would fail an unrelated test. This reads
+/// every `pub const *_FILE` / `*_DIR` string in ck-bus's own source and
+/// requires each to be classified.
+#[test]
+fn every_ckbus_state_file_is_classified() {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut found = BTreeSet::new();
+    let mut stack = vec![src];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+                continue;
+            }
+            for line in std::fs::read_to_string(&path).unwrap().lines() {
+                let line = line.trim();
+                let Some(rest) = line.strip_prefix("pub const ") else {
+                    continue;
+                };
+                let Some((name, value)) = rest.split_once(": &str = \"") else {
+                    continue;
+                };
+                if !(name.ends_with("_FILE") || name.ends_with("_DIR")) {
+                    continue;
+                }
+                let value = value.trim_end_matches("\";");
+                found.insert((value.to_string(), format!("{}:{name}", path.display())));
+            }
+        }
+    }
+    assert!(
+        !found.is_empty(),
+        "the scan found no state-file constants, so it is reading the wrong place"
+    );
+    let classified: BTreeSet<&str> = data_home::LIVE_REWRITTEN
+        .iter()
+        .chain(data_home::LIVE_SUBTREES.iter())
+        .chain(data_home::CONTENT_COMPARED.iter())
+        .copied()
+        .collect();
+    let unclassified: Vec<_> = found
+        .iter()
+        .filter(|(value, _)| !classified.contains(value.as_str()))
+        .collect();
+    assert!(
+        unclassified.is_empty(),
+        "ck-bus state files missing from the operator data-home guard's lists in \
+         tests/harness/data_home.rs: {unclassified:?}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn module_declaration_and_registration_names_every_observable() {
     let _gate = harness::acceptance_gate().await;

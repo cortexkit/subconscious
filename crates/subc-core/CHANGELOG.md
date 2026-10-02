@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.20.51 — 2026-10-02
+
+- Add an inherited-daemon-socket fixture and real-process health restart regression, plus coverage for cancelling every restart backoff and recovering from exhausted health restart budgets. Supervision and daemon shutdown fixtures isolate all three XDG directories.
+
 ## 0.20.48 — 2026-10-01
 
 - Takes `subc-daemon` 0.27.0, a minor release that follows `subc-protocol` 0.28.0 (its `ToolCallRequest` gains an `origin` field).

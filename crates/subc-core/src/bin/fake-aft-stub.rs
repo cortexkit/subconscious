@@ -300,6 +300,13 @@ async fn main() -> Result<(), StubError> {
         std::future::pending::<()>().await;
         unreachable!("a pending future never resolves");
     }
+    #[cfg(unix)]
+    if env_flag("FAKE_AFT_SOCKET_HOLDER_MODE") {
+        // stdin owns the inherited daemon socket. Keep it open past the
+        // supervised parent's exit, but bound the fixture's lifetime on failure.
+        sleep(Duration::from_secs(15)).await;
+        return Ok(());
+    }
     if env_flag(FAKE_AFT_ORPHAN_WRITER_MODE_ENV) {
         return run_detached_orphan_writer().await;
     }
@@ -522,6 +529,31 @@ async fn run(config: StubConfig) -> Result<(), StubError> {
     }
 
     let stream = connect_to_subc(&config.connection_file_path).await?;
+    #[cfg(unix)]
+    let stream = if let Some(path) =
+        env::var_os("FAKE_AFT_SOCKET_HOLDER_FIRST_PATH").map(PathBuf::from)
+    {
+        if !path.exists() {
+            let socket = stream.into_std().map_err(StubError::Io)?;
+            let inherited: std::os::fd::OwnedFd = socket.try_clone().map_err(StubError::Io)?.into();
+            // Command installs this duplicate as stdin, clearing CLOEXEC for
+            // that descriptor without unsafe fork code inside a Tokio runtime.
+            let holder = Command::new(env::current_exe().map_err(StubError::Io)?)
+                .env("FAKE_AFT_SOCKET_HOLDER_MODE", "1")
+                .env_remove(FAKE_AFT_PID_PATH_ENV)
+                .stdin(Stdio::from(inherited))
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .map_err(StubError::Io)?;
+            fs::write(path, holder.id().to_string()).map_err(StubError::Io)?;
+            TcpStream::from_std(socket).map_err(StubError::Io)?
+        } else {
+            stream
+        }
+    } else {
+        stream
+    };
     let (mut read_half, write_half) = tokio::io::split(stream);
     let (tx, rx) = mpsc::channel::<Frame>(STUB_EGRESS_BUFFER);
     let writer = tokio::spawn(drain_writer(write_half, rx));

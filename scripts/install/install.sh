@@ -311,7 +311,7 @@ fi
 
 index_url="${CK_RELEASE_INDEX_URL:-$INDEX_URL_DEFAULT}"
 archive_name="ck-${os}-${arch}.zip"
-data_dir="$HOME/.local/share/cortexkit"
+data_dir="${XDG_DATA_HOME:-$HOME/.local/share}/cortexkit"
 bin_dir="$data_dir/bin"
 destination="$bin_dir/ck"
 manifest="$data_dir/installer-manifest.json"
@@ -432,13 +432,19 @@ else
 fi
 
 select_profile
+# Quote the resolved installation path, rather than assuming the default data
+# home. Shell metacharacters in a user-selected directory must remain literal.
+profile_bin_dir=${bin_dir//\\/\\\\}
+profile_bin_dir=${profile_bin_dir//\"/\\\"}
+profile_bin_dir=${profile_bin_dir//\$/\\\$}
 if [[ "$profile_kind" == "fish" ]]; then
   path_block="$PATH_BLOCK_BEGIN
-set -gx PATH \"\$HOME/.local/share/cortexkit/bin\" \$PATH
+set -gx PATH \"$profile_bin_dir\" \$PATH
 $PATH_BLOCK_END"
 else
+  profile_bin_dir=${profile_bin_dir//\`/\\\`}
   path_block="$PATH_BLOCK_BEGIN
-export PATH=\"\$HOME/.local/share/cortexkit/bin:\$PATH\"
+export PATH=\"$profile_bin_dir:\$PATH\"
 $PATH_BLOCK_END"
 fi
 ensure_profile_path "$profile_path" "$path_block"

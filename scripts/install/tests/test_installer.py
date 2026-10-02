@@ -74,6 +74,34 @@ class InstallerTests(unittest.TestCase):
         self.install()
         self.assertEqual(stat.S_IMODE(profile.stat().st_mode), 0o644)
 
+    def test_bootstrap_uses_xdg_data_home_for_inventory_and_shell_path(self):
+        data = self.scratch / 'data with $literal "quotes" `ticks`\\backslash'
+        self.env["XDG_DATA_HOME"] = str(data)
+        self.install()
+        binary = data / "cortexkit/bin/ck"
+        manifest = data / "cortexkit/installer-manifest.json"
+        self.assertTrue(binary.is_file(), "binary was not placed in XDG_DATA_HOME")
+        inventory = json.loads(manifest.read_text())
+        self.assertEqual(inventory["mutations"][0]["path"], str(binary))
+        self.assertEqual(inventory["mutations"][2]["path"], str(manifest))
+        self.assertFalse((self.home / ".local/share/cortexkit").exists())
+        result = subprocess.run(["bash", "-c", '. "$HOME/.zshrc"; printf "%s" "$PATH"'],
+                                env=dict(self.env, PATH="/usr/bin:/bin"), cwd=self.scratch,
+                                text=True, capture_output=True, check=True)
+        self.assertEqual(result.stdout, str(binary.parent) + ":/usr/bin:/bin")
+        # Reinstall must put its sidecar beside the XDG inventory as well.
+        self.install()
+        self.assertTrue((data / "cortexkit/installer-manifest.bootstrap.json").is_file())
+        self.env["SHELL"] = "/usr/bin/fish"
+        self.install()
+        fish_profile = Path(self.env["XDG_CONFIG_HOME"]) / "fish/config.fish"
+        result = subprocess.run(["fish", "--no-config", "-c",
+                                 'source "$XDG_CONFIG_HOME/fish/config.fish"; printf "%s" $PATH[1]'],
+                                env=self.env, cwd=self.scratch,
+                                text=True, capture_output=True, check=True)
+        self.assertTrue(fish_profile.is_file())
+        self.assertEqual(result.stdout, str(binary.parent))
+
 
 if __name__ == "__main__":
     unittest.main()

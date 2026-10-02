@@ -36,17 +36,25 @@ pub const LIVE_REWRITTEN: [&str; 4] = [
     "epoch_high_water.json", // issuance::high_water::HIGH_WATER_FILE
 ];
 
-/// Directories the live module fills and empties while it serves (a revocation
-/// in progress writes a record there and removes it when done). Only the
-/// directory's presence is compared; its children are not recorded.
-pub const LIVE_SUBTREES: [&str; 1] = [
+/// Directories the live module or its supervised broker fills and empties while
+/// serving. Revocation progress, resolver JWTs and JetStream data can change
+/// during a run. Only the directory's presence is compared; its children are
+/// not recorded.
+pub const LIVE_SUBTREES: [&str; 3] = [
     "revocation_progress", // revocation::progress::PROGRESS_DIR
+    "jwt",                 // install::JWT_DIR (live broker resolver)
+    "js",                  // install::JS_DIR (live broker JetStream store)
 ];
 
-/// State files the live module writes once and never rewrites, so any change
-/// to their content during a run is evidence against the test.
-pub const CONTENT_COMPARED: [&str; 1] = [
-    "account.json", // bootstrap::store::ACCOUNT_FILE
+/// State files and trees not rewritten while serving, so any change to their
+/// content during a run is evidence against the test. Install artifacts are
+/// written only by the offline install commands, not by the live module.
+pub const CONTENT_COMPARED: [&str; 5] = [
+    "account.json",   // bootstrap::store::ACCOUNT_FILE
+    "system_account", // install::SYSTEM_ACCOUNT_FILE
+    "operator.jwt",   // install::OPERATOR_JWT_FILE
+    "server.conf",    // install::SERVER_CONF_FILE
+    "ceremony",       // install::CEREMONY_DIR
 ];
 
 pub fn fingerprint(root: Option<&Path>) -> TreeFingerprint {

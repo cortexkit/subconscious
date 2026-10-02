@@ -14,16 +14,100 @@ use std::{
 use harness::{control, daemon::AcceptanceRun, data_home, stubs};
 use subc_control::{ClientControlRequest, ClientControlResponse, ConsumerIdentity, ModuleProtocol};
 use subc_protocol::{BindIdentity, Principal, RouteTarget};
+use syn::{visit::Visit, Expr, ImplItemConst, ItemConst, Lit, TraitItemConst, Type};
 use tokio::process::Command;
 
 const MODULE_ID: &str = "ckbus";
 const DECLARED_DRAIN_TIMEOUT_MS: u64 = 2_000;
 
+fn state_constants(source: &str) -> Vec<(String, String)> {
+    #[derive(Default)]
+    struct StateConstants(Vec<(String, String)>);
+
+    impl StateConstants {
+        fn record(&mut self, ident: &syn::Ident, ty: &Type, expr: &Expr) {
+            let name = ident.to_string();
+            let is_str = matches!(ty, Type::Reference(reference)
+                if reference.mutability.is_none()
+                && matches!(reference.elem.as_ref(), Type::Path(ty) if ty.path.is_ident("str")));
+            if is_str && (name.ends_with("_FILE") || name.ends_with("_DIR")) {
+                if let Expr::Lit(literal) = expr {
+                    if let Lit::Str(value) = &literal.lit {
+                        self.0.push((name, value.value()));
+                    }
+                }
+            }
+        }
+    }
+
+    impl<'ast> Visit<'ast> for StateConstants {
+        fn visit_item_const(&mut self, node: &'ast ItemConst) {
+            self.record(&node.ident, &node.ty, &node.expr);
+            syn::visit::visit_item_const(self, node);
+        }
+
+        fn visit_impl_item_const(&mut self, node: &'ast ImplItemConst) {
+            self.record(&node.ident, &node.ty, &node.expr);
+            syn::visit::visit_impl_item_const(self, node);
+        }
+
+        fn visit_trait_item_const(&mut self, node: &'ast TraitItemConst) {
+            if let Some((_, expr)) = &node.default {
+                self.record(&node.ident, &node.ty, expr);
+            }
+            syn::visit::visit_trait_item_const(self, node);
+        }
+    }
+
+    // Parse declarations rather than lines so visibility and rustfmt's line
+    // wrapping cannot hide a state-file constant from the classification guard.
+    let parsed = syn::parse_file(source).expect("ck-bus source must parse");
+    let mut constants = StateConstants::default();
+    constants.visit_file(&parsed);
+    constants.0
+}
+
+#[test]
+fn state_constants_positive_control_recognizes_declaration_spellings() {
+    let source = r#"
+        pub const PUBLIC_FILE: &str = "public.json";
+        pub(crate) const CRATE_DIR: &str = "crate";
+        const PRIVATE_FILE: &str = "private.json";
+        pub const MULTILINE_FILE: &str =
+            "multiline.json";
+        mod nested {
+            pub(super) const SUPER_DIR: &'static str = r"nested";
+        }
+        impl State {
+            pub const ASSOCIATED_FILE: &str = "associated.json";
+        }
+        trait Defaults {
+            const DEFAULT_DIR: &str = "defaults";
+        }
+        pub const X_PATH: &str = "not-a-state-file";
+        pub const NUMBER_FILE: u64 = 1;
+        const BYTES_DIR: &[u8] = b"not-a-string";
+    "#;
+    assert_eq!(
+        state_constants(source),
+        vec![
+            ("PUBLIC_FILE".into(), "public.json".into()),
+            ("CRATE_DIR".into(), "crate".into()),
+            ("PRIVATE_FILE".into(), "private.json".into()),
+            ("MULTILINE_FILE".into(), "multiline.json".into()),
+            ("SUPER_DIR".into(), "nested".into()),
+            ("ASSOCIATED_FILE".into(), "associated.json".into()),
+            ("DEFAULT_DIR".into(), "defaults".into()),
+        ],
+        "the state-file scan must recognize every planted spelling and exclude non-state constants"
+    );
+}
+
 /// The operator data-home guard compares the live module's files by presence
 /// or by content according to `data_home`'s lists. A state file ck-bus starts
 /// writing that is in neither list would be compared by content, so the live
 /// module rewriting it during a run would fail an unrelated test. This reads
-/// every `pub const *_FILE` / `*_DIR` string in ck-bus's own source and
+/// every `const *_FILE` / `*_DIR` string in ck-bus's own source and
 /// requires each to be classified.
 #[test]
 fn every_ckbus_state_file_is_classified() {
@@ -40,19 +124,8 @@ fn every_ckbus_state_file_is_classified() {
             if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
                 continue;
             }
-            for line in std::fs::read_to_string(&path).unwrap().lines() {
-                let line = line.trim();
-                let Some(rest) = line.strip_prefix("pub const ") else {
-                    continue;
-                };
-                let Some((name, value)) = rest.split_once(": &str = \"") else {
-                    continue;
-                };
-                if !(name.ends_with("_FILE") || name.ends_with("_DIR")) {
-                    continue;
-                }
-                let value = value.trim_end_matches("\";");
-                found.insert((value.to_string(), format!("{}:{name}", path.display())));
+            for (name, value) in state_constants(&std::fs::read_to_string(&path).unwrap()) {
+                found.insert((value, format!("{}:{name}", path.display())));
             }
         }
     }
@@ -60,6 +133,7 @@ fn every_ckbus_state_file_is_classified() {
         !found.is_empty(),
         "the scan found no state-file constants, so it is reading the wrong place"
     );
+    eprintln!("ck-bus state-file inventory: {} constants", found.len());
     let classified: BTreeSet<&str> = data_home::LIVE_REWRITTEN
         .iter()
         .chain(data_home::LIVE_SUBTREES.iter())

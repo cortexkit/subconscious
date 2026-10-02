@@ -166,6 +166,7 @@ describe("SubcClient route.open consumer identity", () => {
 function routeOpenHarness(): { client: SubcClient; captured: () => unknown } {
   let captured: unknown;
   const client = Object.create(SubcClient.prototype) as SubcClient;
+  Object.assign(client, { routeModules: new Map() });
   // Patch the private collaborators through an `unknown` cast: intersecting
   // SubcClient with a public re-declaration of these (private) members reduces
   // to `never` under tsc, so reach them via a separate structural view instead.

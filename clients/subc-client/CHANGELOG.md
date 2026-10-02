@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.20.0 — 2026-10-02
+
+- Export `RouteEndReason` and expose `closeReason` on `SubcError` and `SubcCallError`. Named channel reasons take precedence over legacy module-only pushes; caller closes and connection losses report SDK-side reasons. Channel reuse clears history and call retry kinds are unchanged.
+- Decode all four scope close reasons as known, non-reopenable causes.
+
 ## 0.19.0 — 2026-09-30
 
 - Add optional `onDraining(reason: RouteCloseReason, deadline: Date)` to `SubcProviderConnectOptions`. Channel-0 `module.draining` Push notices start the callback without waiting for completion, so PING and GOODBYE keep flowing. GOODBYE and connection-end reporting wait at most 2 seconds for hooks to start. Throws and rejections are contained; unknown reasons arrive as `unknown`. Undecodable channel-0 Push frames are ignored with one warning per connection.

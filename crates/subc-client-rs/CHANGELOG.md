@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.25.0 — 2026-10-02
+
+- Add non-exhaustive `RouteEndReason` and `CallError::close_reason()` without changing existing error variants or retry classes. Reasons follow named channels, with module fallback only for legacy pushes lacking channels; reused channels clear their history.
+- Breaking: `RouteCloseReason` gains the four scope variants, and the public control dependency moves to 0.27. Exhaustive reason matches must be updated. The error getter itself is additive.
+
 ## 0.24.0 — 2026-10-01
 
 - Minor bump because this crate's public types come from `subc-protocol`, which moves to 0.28.0 (its `ToolCallRequest` gains an `origin` field; see that crate's changelog). A consumer that also depends on `subc-protocol` directly must move both together, or two incompatible copies of the protocol types would meet. Also takes `subc-control` 0.26 and `subc-transport` 0.9, which moved for the same reason.

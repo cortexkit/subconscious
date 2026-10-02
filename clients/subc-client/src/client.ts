@@ -297,6 +297,12 @@ export class SubcCallError extends Error {
   get detail(): unknown {
     return this.cause instanceof SubcError ? this.cause.detail : undefined;
   }
+
+  /** Why the route ended. A reason never makes an in-flight call safe to resend. */
+  get closeReason(): RouteEndReason | undefined {
+    return this.cause instanceof SubcError || this.cause instanceof SubcCallError
+      ? this.cause.closeReason : undefined;
+  }
 }
 
 /**
@@ -324,6 +330,7 @@ export class SubcError extends Error {
      * those reasons at the transport boundary.
      */
     readonly detail?: unknown,
+    readonly closeReason?: RouteEndReason,
   ) {
     super(message);
   }
@@ -404,15 +411,11 @@ export interface ConnectOptions {
    */
   timeoutArbitrationGraceMs?: number;
   /**
-   * Observer for daemon-originated channel-0 control pushes (`route.closing`,
-   * `route.closed`, and any op added later). Purely advisory: the daemon's
-   * load-bearing route-death signal remains the GOODBYE frame, and nothing in
-   * the client's own route lifecycle consumes these. The contract is the wire
-   * contract verbatim -- unrecognized ops still arrive here (callers ignore
-   * what they don't know, per the MUST-ignore clause), a push that fails to
-   * parse as JSON is dropped without surfacing, and an observer throw is
-   * swallowed like every other caller callback so it cannot fail the read loop
-   * or unrelated requests.
+   * Observer for parsed daemon control pushes, including unrecognized ops which
+   * callers should ignore. Malformed JSON is dropped and observer exceptions are
+   * swallowed so they cannot fail unrelated requests. The client records route
+   * reasons before notifying the observer, but closes routes only on the separate
+   * GOODBYE frame, never on a control push.
    */
   onControlPush?: (push: ControlPush) => void;
 }
@@ -431,10 +434,17 @@ export type KnownRouteCloseReason =
   | "restart"
   | "disable"
   | "crash"
-  | "capability_denied";
+  | "capability_denied"
+  | "scope_ended"
+  | "scope_carrier_removed"
+  | "scope_delegation_changed"
+  | "scope_parent_ended";
 
 /** A route-close reason decoded from a daemon control push. */
 export type RouteCloseReason = KnownRouteCloseReason | "unknown";
+
+/** Why a route ended. Even a planned closure can leave a call's outcome unknown. */
+export type RouteEndReason = RouteCloseReason | "closed_by_caller" | "connection_lost";
 
 /** Whether the close reason alone permits reopening a route automatically. */
 export type RouteCloseDisposition = "may_reopen" | "must_not_reopen";
@@ -452,6 +462,10 @@ export function parseRouteCloseReason(reason: unknown): RouteCloseReason {
     case "disable":
     case "crash":
     case "capability_denied":
+    case "scope_ended":
+    case "scope_carrier_removed":
+    case "scope_delegation_changed":
+    case "scope_parent_ended":
       return reason;
     default:
       return "unknown";
@@ -467,6 +481,10 @@ export function classifyRouteCloseReason(reason: unknown): RouteCloseDisposition
     case "disable":
     case "crash":
     case "capability_denied":
+    case "scope_ended":
+    case "scope_carrier_removed":
+    case "scope_delegation_changed":
+    case "scope_parent_ended":
     case "unknown":
       return "must_not_reopen";
   }
@@ -600,6 +618,9 @@ export class SubcClient {
   private readonly lateResponses = new Map<string, (frame: Frame) => void>();
   private readonly routes = new Map<string, CachedRoute>();
   private readonly liveRoutes = new Map<number, RouteHandle>();
+  private readonly routeModules = new Map<number, string>();
+  private readonly routeEndReasons = new Map<number, { reason: RouteCloseReason; final: boolean }>();
+  private readonly legacyChannelReasons = new Map<number, RouteCloseReason>();
   private connectionToken = newConnectionToken();
   private ingressEpochDropCount = 0;
   private closedErr: Error | null = null;
@@ -724,6 +745,7 @@ export class SubcClient {
         throw new SubcError(`route.open returned no route handle: ${JSON.stringify(parsed)}`);
       }
       installed = this.installRoute(parsed.route_channel, parsed.route_epoch, reverseRequests);
+      this.routeModules.set(parsed.route_channel, target.module_id);
       return true;
     };
     const closeLateRoute = (frame: Frame): void => {
@@ -732,7 +754,7 @@ export class SubcClient {
         const parsed = this.parseJson(frame) as { route_channel?: number; route_epoch?: number };
         if (typeof parsed.route_channel !== "number" || typeof parsed.route_epoch !== "number") return;
         const lateHandle = this.installRoute(parsed.route_channel, parsed.route_epoch);
-        this.failHandle(lateHandle, new SubcError("late route.open was closed", "route_closed"));
+        this.failHandle(lateHandle, new SubcError("late route.open was closed", "route_closed", undefined, "closed_by_caller"));
         this.liveRoutes.delete(lateHandle.channel);
         this.sendRouteGoodbye(lateHandle, true);
       } catch {
@@ -1018,7 +1040,7 @@ export class SubcClient {
       }
     }
     if (opts.drain) await this.drainUnaryOnHandle(handle);
-    this.failHandle(handle, new SubcError("route closed by closeRoute", "route_closed"));
+    this.failHandle(handle, new SubcError("route closed by closeRoute", "route_closed", undefined, "closed_by_caller"));
     if (this.liveRoutes.get(handle.channel) === handle) this.liveRoutes.delete(handle.channel);
     this.sendRouteGoodbye(handle);
   }
@@ -1683,7 +1705,8 @@ export class SubcClient {
   }
 
   private routeClosedDuringOpen(): SubcCallError {
-    return new SubcCallError("not_sent", "route was closed before route.open completed", "route_closed");
+    const cause = new SubcError("route was closed before route.open completed", "route_closed", undefined, "closed_by_caller");
+    return new SubcCallError("not_sent", cause.message, cause.code, cause);
   }
 
   private async readLoop(sock: SubcSocket, generation: number): Promise<void> {
@@ -1726,12 +1749,12 @@ export class SubcClient {
     if (frame.header.channel === 0 && frame.header.ty === FrameType.Push) {
       // Daemon-originated control push (route.closing / route.closed / future
       // ops). Never matches a pending (corr is daemon-chosen), never an error
-      // path: unparseable bodies and absent observers both drop silently per
-      // the wire contract's MUST-ignore clause, and an observer throw is
+      // path: unparseable bodies drop silently. Reasons are recorded even without
+      // an observer, and an observer throw is
       // swallowed for the same reason as onProgress below -- a caller callback
       // must not fail the read loop.
       const observer = this.opts.onControlPush;
-      if (observer) {
+      {
         let parsed: ControlPush | null = null;
         try {
           const body = this.parseJson(frame) as Record<string, unknown>;
@@ -1740,8 +1763,9 @@ export class SubcClient {
           // Unparseable control push: ignored by contract.
         }
         if (parsed) {
+          this.recordRouteEnd(parsed);
           try {
-            observer(parsed);
+            observer?.(parsed);
           } catch {
             // Observer's own throw, on its own stack; the stream must survive.
           }
@@ -1823,7 +1847,7 @@ export class SubcClient {
       // so it stays kind=outcome_unknown -- the same class as a mid-flight socket
       // drop, and never the not_sent/unknown_channel class that call() retries.
       // The code says WHICH route ended, not that it is safe to send again.
-      this.failHandle(handle, new SubcError("route closed by subc (GOODBYE)", "route_closed"));
+      this.failHandle(handle, new SubcError("route closed by subc (GOODBYE)", "route_closed", undefined, this.routeEndReason(handle.channel)));
       if (this.liveRoutes.get(handle.channel) === handle) this.liveRoutes.delete(handle.channel);
       this.evictRouteHandle(handle);
       return;
@@ -1990,6 +2014,32 @@ export class SubcClient {
     }
   }
 
+  private recordRouteEnd(push: ControlPush): void {
+    const reason = routeCloseReason(push);
+    if (reason === undefined) return;
+    if ("channels" in push.body) {
+      if (Array.isArray(push.body.channels)) {
+        for (const channel of push.body.channels) {
+          if (typeof channel !== "number" || !Number.isInteger(channel) || channel < 0 || channel > 65535) continue;
+          const final = push.op === "route.closed";
+          if (final || !this.routeEndReasons.get(channel)?.final) {
+            this.routeEndReasons.set(channel, { reason, final });
+          }
+        }
+      }
+    } else if (typeof push.body.module_id === "string") {
+      for (const [channel, module] of this.routeModules) {
+        if (module === push.body.module_id) this.legacyChannelReasons.set(channel, reason);
+      }
+    }
+  }
+
+  private routeEndReason(channel: number): RouteEndReason {
+    const specific = this.routeEndReasons.get(channel);
+    if (specific) return specific.reason;
+    return this.legacyChannelReasons.get(channel) ?? "unknown";
+  }
+
   private failHandle(handle: RouteHandle, error: Error): void {
     for (const [key, pending] of this.pending) {
       if (pending.handle && sameRouteHandle(pending.handle, handle)) this.rejectPending(key, pending, error);
@@ -1997,9 +2047,15 @@ export class SubcClient {
   }
 
   private fail(err: Error): void {
+    const routeError = err instanceof SubcError && err.closeReason ? err
+      : new SubcError(err.message, errorCode(err), undefined,
+        this.closeStarted ? "closed_by_caller" : "connection_lost");
     if (!this.closedErr) this.closedErr = err;
+    this.routeEndReasons.clear();
+    this.legacyChannelReasons.clear();
+    this.routeModules.clear();
     for (const [key, pending] of this.pending) {
-      this.rejectPending(key, pending, err);
+      this.rejectPending(key, pending, pending.handle ? routeError : err);
     }
   }
 
@@ -2033,6 +2089,9 @@ export class SubcClient {
     reverseRequests = new ReverseRequestRegistry(),
   ): RouteHandle {
     const handle = createRouteHandle(channel, epoch, this.connectionToken, reverseRequests);
+    this.routeEndReasons.delete(channel);
+    this.legacyChannelReasons.delete(channel);
+    this.routeModules.delete(channel);
     this.liveRoutes.set(channel, handle);
     return handle;
   }

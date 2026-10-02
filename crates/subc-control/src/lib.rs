@@ -475,11 +475,19 @@ pub enum ClientControlPush {
     #[serde(rename = "route.closing")]
     RouteClosing {
         module_id: String,
+        /// Channel numbers identifying affected routes on this client's connection.
+        /// Channels used by other clients or by the provider are not included.
+        #[serde(default)]
+        channels: Vec<u16>,
         reason: RouteCloseReason,
     },
     #[serde(rename = "route.closed")]
     RouteClosed {
         module_id: String,
+        /// Channel numbers identifying affected routes on this client's connection.
+        /// Channels used by other clients or by the provider are not included.
+        #[serde(default)]
+        channels: Vec<u16>,
         reason: RouteCloseReason,
         /// The exact result of the forwarding-quiescence wait for live routes.
         drained: bool,

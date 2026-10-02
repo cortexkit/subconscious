@@ -4,6 +4,7 @@ import {
   managementSurfaceManifest,
   SubcClient,
   SubcProvider,
+  SubcError,
   type ProviderRequestContext,
 } from "../src/index.js";
 import { startLiveDaemon, type LiveDaemon } from "./live-daemon.js";
@@ -33,6 +34,41 @@ describe.skipIf(!LIVE)("SubcProvider streaming subscription against real subc-co
 
   afterAll(() => {
     live?.stop();
+  });
+
+  test("provider crash names both routes and attaches crash to in-flight failures", async () => {
+    let started = 0;
+    const moduleId = "close-reason-live-provider";
+    const provider = await SubcProvider.connect({
+      connectionFile: live.connFile,
+      manifest: managementSurfaceManifest({ moduleId, operations: ["hold"] }),
+      handler: async (_channel, _body, ctx) => {
+        started++;
+        await new Promise<void>((resolve) => {
+          if (ctx.signal.aborted) resolve();
+          else ctx.signal.addEventListener("abort", () => resolve(), { once: true });
+        });
+      },
+    });
+    const pushes: Array<Record<string, unknown>> = [];
+    const client = await SubcClient.connect({ connectionFile: live.connFile, onControlPush: (push) => pushes.push(push.body) });
+    try {
+      const target = { kind: "management_surface", module_id: moduleId } as const;
+      const identity = { project_root: live.configDir, harness: "bun", session: "close-reason" };
+      const first = await client.routeOpen(target, identity);
+      const second = await client.routeOpen(target, identity);
+      const a = client.request(first, { method: "hold" }).catch((err: unknown) => err);
+      const b = client.request(second, { method: "hold" }).catch((err: unknown) => err);
+      await waitFor(() => started === 2);
+      // Drop the socket without a graceful GOODBYE so the daemon observes a crash.
+      (provider as unknown as { sock: { close(): void } }).sock.close();
+      for (const err of [await a, await b]) {
+        expect(err).toBeInstanceOf(SubcError);
+        expect(err).toMatchObject({ code: "route_closed", closeReason: "crash" });
+      }
+      const closed = pushes.find((push) => push.op === "route.closed");
+      expect(closed?.channels).toEqual([first.channel, second.channel].sort((a, b) => a - b));
+    } finally { client.close(); await provider.close(); }
   });
 
   test("a held-open subscription streams events, then unsubscribe ends with StreamEnd", async () => {

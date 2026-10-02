@@ -75,6 +75,11 @@ function loadControlGolden(name: string): Record<string, unknown> {
 }
 
 describe("Rust golden fixtures", () => {
+  test("legacy route pushes omit channels while current pushes name them", () => {
+    expect(loadControlGolden("client_control_push_route_closing_legacy").channels).toBeUndefined();
+    expect(loadControlGolden("client_control_push_route_closed_legacy").channels).toBeUndefined();
+    expect(loadControlGolden("client_control_push_route_closing").channels).toEqual([7, 9]);
+  });
   test("route.closed fixtures carry reachable terminal verdicts", () => {
     const fixtures = {
       drained: loadControlGolden("client_control_push_route_closed_drained"),

@@ -39,6 +39,25 @@ fn control_wire_shapes_match_golden_json_and_round_trip() {
     for (name, push) in client_control_pushes() {
         assert_golden(name, &push);
     }
+    for name in [
+        "client_control_push_route_closing_legacy",
+        "client_control_push_route_closed_legacy",
+    ] {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/golden")
+            .join(format!("{name}.json"));
+        let wire: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert!(wire.get("channels").is_none());
+        let decoded: ClientControlPush = serde_json::from_value(wire).unwrap();
+        match &decoded {
+            ClientControlPush::RouteClosing { channels, .. }
+            | ClientControlPush::RouteClosed { channels, .. } => assert!(channels.is_empty()),
+        }
+        assert_eq!(
+            serde_json::to_value(decoded).unwrap()["channels"],
+            serde_json::json!([])
+        );
+    }
     assert_golden("catalog_entry", &catalog_entry());
     assert_golden(
         "catalog_entry_with_self_signals",
@@ -791,6 +810,7 @@ fn client_control_pushes() -> Vec<(&'static str, ClientControlPush)> {
             "client_control_push_route_closing",
             ClientControlPush::RouteClosing {
                 module_id: "aft-tools".to_string(),
+                channels: vec![7, 9],
                 reason: RouteCloseReason::Reload,
             },
         ),
@@ -800,6 +820,7 @@ fn client_control_pushes() -> Vec<(&'static str, ClientControlPush)> {
             "client_control_push_route_closing_disable",
             ClientControlPush::RouteClosing {
                 module_id: "aft-tools".to_string(),
+                channels: vec![7, 9],
                 reason: RouteCloseReason::Disable,
             },
         ),
@@ -807,6 +828,7 @@ fn client_control_pushes() -> Vec<(&'static str, ClientControlPush)> {
             "client_control_push_route_closed_drained",
             ClientControlPush::RouteClosed {
                 module_id: "aft-tools".to_string(),
+                channels: vec![7, 9],
                 reason: RouteCloseReason::Restart,
                 drained: true,
                 abandoned: 0,
@@ -822,6 +844,7 @@ fn client_control_pushes() -> Vec<(&'static str, ClientControlPush)> {
             "client_control_push_route_closed_abandoned",
             ClientControlPush::RouteClosed {
                 module_id: "aft-tools".to_string(),
+                channels: vec![7, 9],
                 reason: RouteCloseReason::Reload,
                 drained: false,
                 abandoned: 3,
@@ -835,6 +858,7 @@ fn client_control_pushes() -> Vec<(&'static str, ClientControlPush)> {
             "client_control_push_route_closed_disable",
             ClientControlPush::RouteClosed {
                 module_id: "aft-tools".to_string(),
+                channels: vec![7, 9],
                 reason: RouteCloseReason::Disable,
                 drained: true,
                 abandoned: 0,
@@ -848,6 +872,7 @@ fn client_control_pushes() -> Vec<(&'static str, ClientControlPush)> {
             "client_control_push_route_closed_capability_denied",
             ClientControlPush::RouteClosed {
                 module_id: "credentials-provider".to_string(),
+                channels: vec![7],
                 reason: RouteCloseReason::CapabilityDenied,
                 drained: false,
                 abandoned: 0,
@@ -862,6 +887,7 @@ fn client_control_pushes() -> Vec<(&'static str, ClientControlPush)> {
             "client_control_push_route_closed_crash",
             ClientControlPush::RouteClosed {
                 module_id: "aft-tools".to_string(),
+                channels: vec![7, 9],
                 reason: RouteCloseReason::Crash,
                 drained: false,
                 abandoned: 0,
@@ -875,6 +901,7 @@ fn client_control_pushes() -> Vec<(&'static str, ClientControlPush)> {
             "client_control_push_route_closed_crash_terminal",
             ClientControlPush::RouteClosed {
                 module_id: "aft-tools".to_string(),
+                channels: vec![7, 9],
                 reason: RouteCloseReason::Crash,
                 drained: false,
                 abandoned: 0,

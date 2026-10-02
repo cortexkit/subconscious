@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.27.0 — 2026-10-02
+
+- Breaking Rust API: `RouteClosing` and `RouteClosed` gain `channels: Vec<u16>`, naming the receiving connection's affected routes. Struct literals and exhaustive patterns must include the field. Older wire pushes decode with an empty list; current serialization always emits the `channels` field.
+
 ## 0.26.0 — 2026-10-01
 
 - Minor bump because this crate's public types come from `subc-protocol`, which moves to 0.28.0 (its `ToolCallRequest` gains an `origin` field; see that crate's changelog). A consumer that also depends on `subc-protocol` directly must move both together, or two incompatible copies of the protocol types would meet.

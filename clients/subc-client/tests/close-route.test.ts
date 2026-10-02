@@ -15,6 +15,8 @@ import {
   HEADER_LEN,
   Priority,
   SubcClient,
+  SubcCallError,
+  SubcError,
   SERVER_PROOF_DOMAIN,
   type BindIdentity,
   type Frame,
@@ -57,17 +59,102 @@ interface FakeState {
   routeOpenGate?: Promise<void>;
   /** When set, data-request handling awaits this before replying (drain control). */
   dataGate?: Promise<void>;
+  holdRequests?: boolean;
+  dataRequests?: number;
+  nextChannel?: number;
 }
 
 interface FakeDaemon {
   port: number;
   state: FakeState;
   stop(): Promise<void>;
+  send(frame: Frame): Promise<void>;
 }
 
 afterEach(async () => {
   for (const daemon of daemons.splice(0)) await daemon.stop();
   for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+});
+
+function lifecyclePush(reason: string, channels?: number[]): Frame {
+  return buildFrame(FrameType.Push, buildFlags(false, Priority.Interactive, false), 0, 0, 0n,
+    encodeJson({ op: "route.closed", module_id: "aft", reason, ...(channels === undefined ? {} : { channels }) }));
+}
+function goodbye(channel: number): Frame {
+  return buildFrame(FrameType.Goodbye, buildFlags(false, Priority.Interactive, false), channel, 1, 0n, new Uint8Array());
+}
+
+test("two routes to one module retain distinct reasons without changing retry kind", async () => {
+  const { client, daemon } = await connectClient();
+  try {
+    daemon.state.holdRequests = true;
+    const a = client.call("aft", "hold", {}, { identity: IDENTITY }).catch((err: unknown) => err);
+    const b = client.call("aft", "hold", {}, { identity: { ...IDENTITY, session: "s2" } }).catch((err: unknown) => err);
+    await waitFor(() => daemon.state.dataRequests === 2, "both requests received");
+    const first = { channel: daemon.state.openedChannels[0]! };
+    const second = { channel: daemon.state.openedChannels[1]! };
+    await daemon.send(lifecyclePush("scope_ended", [first.channel]));
+    await daemon.send(lifecyclePush("restart", [second.channel]));
+    await daemon.send(goodbye(first.channel));
+    await daemon.send(goodbye(second.channel));
+    expect(await a).toMatchObject({ code: "route_closed", closeReason: "scope_ended" });
+    expect(await b).toMatchObject({ code: "route_closed", closeReason: "restart" });
+    expect(await a).toBeInstanceOf(SubcCallError);
+    expect(await a).toMatchObject({ kind: "outcome_unknown" });
+    expect(await b).toMatchObject({ kind: "outcome_unknown" });
+  } finally { client.close(); }
+});
+
+test("legacy channel-less pushes fall back by module but explicit empty channels do not", async () => {
+  const { client, daemon } = await connectClient();
+  try {
+    for (const legacy of [false, true]) {
+      const handle = await client.routeOpen(TOOL_TARGET, IDENTITY);
+      daemon.state.holdRequests = true;
+      const before = daemon.state.dataRequests ?? 0;
+      const pending = client.request(handle, {}).catch((err: unknown) => err);
+      await waitFor(() => daemon.state.dataRequests === before + 1, "request received");
+      await daemon.send(lifecyclePush("crash", legacy ? undefined : []));
+      await daemon.send(goodbye(handle.channel));
+      expect(await pending).toMatchObject({ closeReason: legacy ? "crash" : "unknown" });
+    }
+  } finally { client.close(); }
+});
+
+test("reused channel does not inherit its previous close reason", async () => {
+  const { client, daemon } = await connectClient();
+  try {
+    const handle = await client.routeOpen(TOOL_TARGET, IDENTITY);
+    daemon.state.holdRequests = true;
+    const first = client.request(handle, {}).catch((err: unknown) => err);
+    await waitFor(() => daemon.state.dataRequests === 1, "first request received");
+    await daemon.send(lifecyclePush("scope_ended", [handle.channel]));
+    await daemon.send(goodbye(handle.channel));
+    expect(await first).toMatchObject({ closeReason: "scope_ended" });
+    daemon.state.nextChannel = handle.channel;
+    const reused = await client.routeOpen(TOOL_TARGET, IDENTITY);
+    expect(reused.channel).toBe(handle.channel);
+    const second = client.request(reused, {}).catch((err: unknown) => err);
+    await waitFor(() => daemon.state.dataRequests === 2, "second request received");
+    await daemon.send(goodbye(reused.channel));
+    expect(await second).toMatchObject({ closeReason: "unknown" });
+  } finally { client.close(); }
+});
+
+test("caller close and connection loss have SDK-side close reasons", async () => {
+  for (const local of [true, false]) {
+    const { client, daemon } = await connectClient();
+    try {
+      const handle = await client.routeOpen(TOOL_TARGET, IDENTITY);
+      daemon.state.holdRequests = true;
+      const pending = client.request(handle, {}).catch((err: unknown) => err);
+      await waitFor(() => daemon.state.dataRequests === 1, "request received");
+      if (local) await client.closeRoute(handle); else await daemon.stop();
+      const err = await pending;
+      expect(err).toBeInstanceOf(SubcError);
+      expect(err).toMatchObject({ closeReason: local ? "closed_by_caller" : "connection_lost" });
+    } finally { client.close(); }
+  }
 });
 
 describe("SubcClient.closeRoute", () => {
@@ -196,6 +283,9 @@ async function startFakeDaemon(): Promise<FakeDaemon> {
   const daemon: FakeDaemon = {
     port,
     state,
+    send: async (frame) => {
+      for (const socket of sockets) await writeFrame(socket, frame, Date.now() + 2_000);
+    },
     stop: async () => {
       if (stopped) return;
       stopped = true;
@@ -211,7 +301,7 @@ async function handleConnection(socket: Socket, state: FakeState): Promise<void>
   const reader = new SocketReader(socket);
   const deadline = Date.now() + 5_000;
   await authenticate(reader, socket, deadline);
-  let nextChannel = 41;
+  state.nextChannel = 41;
 
   for (;;) {
     const frame = await readFrame(reader, deadline);
@@ -225,7 +315,7 @@ async function handleConnection(socket: Socket, state: FakeState): Promise<void>
       const request = parseJson(frame.body) as { op?: string };
       if (request.op === "route.open") {
         state.routeOpens += 1;
-        const channel = nextChannel++;
+        const channel = state.nextChannel!++;
         state.openedChannels.push(channel);
         if (state.routeOpenGate) await state.routeOpenGate;
         await writeFrame(socket, responseFrame(frame, { op: "route.open", route_channel: channel, route_epoch: 1 }), deadline);
@@ -233,6 +323,8 @@ async function handleConnection(socket: Socket, state: FakeState): Promise<void>
       continue;
     }
 
+    state.dataRequests = (state.dataRequests ?? 0) + 1;
+    if (state.holdRequests) continue;
     // Data request on a route channel: echo it back (after the optional drain gate).
     if (state.dataGate) await state.dataGate;
     await writeFrame(socket, responseFrame(frame, parseJson(frame.body)), deadline);

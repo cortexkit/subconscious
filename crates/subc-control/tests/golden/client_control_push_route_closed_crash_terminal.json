@@ -1,5 +1,9 @@
 {
   "abandoned": 0,
+  "channels": [
+    7,
+    9
+  ],
   "drained": false,
   "excluded_subscriptions": 0,
   "module_id": "aft-tools",

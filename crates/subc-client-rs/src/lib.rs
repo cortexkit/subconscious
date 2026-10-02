@@ -6,11 +6,11 @@ pub use consumer::{
     is_retryable_route_open_code, CallError, CallOptions, CatalogList, CloseRouteOptions,
     ConnectionState, ConsumerError, ConsumerOptions, ControlPush, PushEvent, RetryBackoff,
     ReverseRequestContext, ReverseRequestError, ReverseRequestRegistrationError,
-    ReverseRequestRegistry, RouteCloseDisposition, RouteCloseReason, RoutePollResult,
-    ScopeSelector, SpawnStreamError, SpawnSubscription, SubcConsumer, SubscribeOptions,
-    Subscription, SubscriptionClosed, DEFAULT_CALL_TIMEOUT, DEFAULT_LIVENESS_PROBE_WINDOW,
-    DEFAULT_ROUTE_RETRY_DEADLINE, SPAWN_CURSOR_INCARNATION_MISMATCH, SPAWN_CURSOR_TOO_OLD,
-    SPAWN_SUBSCRIBER_LAGGED,
+    ReverseRequestRegistry, RouteCloseDisposition, RouteCloseReason, RouteEndReason,
+    RoutePollResult, ScopeSelector, SpawnStreamError, SpawnSubscription, SubcConsumer,
+    SubscribeOptions, Subscription, SubscriptionClosed, DEFAULT_CALL_TIMEOUT,
+    DEFAULT_LIVENESS_PROBE_WINDOW, DEFAULT_ROUTE_RETRY_DEADLINE, SPAWN_CURSOR_INCARNATION_MISMATCH,
+    SPAWN_CURSOR_TOO_OLD, SPAWN_SUBSCRIBER_LAGGED,
 };
 pub use policy_cache::{
     PolicyResolveError, PolicyResolver, PolicyResolverConfig, PolicyResolverFootprint,

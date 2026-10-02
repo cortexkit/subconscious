@@ -1151,6 +1151,7 @@ impl ControlHandler {
                 closed_routes,
                 ClientControlPush::RouteClosed {
                     module_id: target_module_id,
+                    channels: Vec::new(),
                     reason: RouteCloseReason::CapabilityDenied,
                     drained: false,
                     abandoned: 0,
@@ -1557,6 +1558,7 @@ impl ControlHandler {
                 routes,
                 ClientControlPush::RouteClosed {
                     module_id,
+                    channels: Vec::new(),
                     reason,
                     drained: false,
                     abandoned,
@@ -2443,6 +2445,7 @@ impl ControlHandler {
                 routes,
                 ClientControlPush::RouteClosed {
                     module_id,
+                    channels: Vec::new(),
                     reason,
                     drained: false,
                     abandoned: 0,
@@ -5975,29 +5978,43 @@ pub(crate) fn send_route_control_pushes(
     routes: Vec<EndpointRoute>,
     push: ClientControlPush,
 ) {
-    let body = match serde_json::to_vec(&push) {
-        Ok(body) => body,
-        Err(err) => {
-            warn!(error = %err, "failed to serialize route lifecycle control PUSH");
-            return;
-        }
-    };
-    let mut targets = Vec::new();
+    let mut targets: Vec<(GoodbyeTarget, Vec<u16>)> = Vec::new();
     for route in routes {
         let target = route.goodbye_target;
-        if let Some(existing) = targets
-            .iter()
-            .find(|existing: &&GoodbyeTarget| existing.connection_id == target.connection_id)
+        if let Some((existing, channels)) = targets
+            .iter_mut()
+            .find(|(existing, _)| existing.connection_id == target.connection_id)
         {
             debug_assert_eq!(
                 existing.negotiated_ver, target.negotiated_ver,
                 "one connection cannot negotiate multiple frame versions"
             );
+            if !channels.contains(&target.channel) {
+                channels.push(target.channel);
+            }
             continue;
         }
-        targets.push(target);
+        let channel = target.channel;
+        targets.push((target, vec![channel]));
     }
-    for target in targets {
+    for (target, mut channels) in targets {
+        channels.sort_unstable();
+        let mut push = push.clone();
+        match &mut push {
+            ClientControlPush::RouteClosing {
+                channels: covered, ..
+            }
+            | ClientControlPush::RouteClosed {
+                channels: covered, ..
+            } => *covered = channels,
+        }
+        let body = match serde_json::to_vec(&push) {
+            Ok(body) => body,
+            Err(err) => {
+                warn!(error = %err, "failed to serialize route lifecycle control PUSH");
+                continue;
+            }
+        };
         let frame = match Frame::build_with_version(
             target.negotiated_ver,
             FrameType::Push,
@@ -10753,11 +10770,18 @@ mod tests {
     fn assert_capability_denied_push(frame: Frame, target_module_id: &str) {
         assert_eq!(frame.header.ty, FrameType::Push);
         assert_eq!(frame.header.channel, 0);
+        let push = serde_json::from_slice::<ClientControlPush>(&frame.body)
+            .expect("route.closed control push decodes");
+        let ClientControlPush::RouteClosed { channels, .. } = &push else {
+            panic!("expected route.closed");
+        };
+        assert_eq!(channels.len(), 1, "exactly one violating route closed");
+        let channels = channels.clone();
         assert_eq!(
-            serde_json::from_slice::<ClientControlPush>(&frame.body)
-                .expect("route.closed control push decodes"),
+            push,
             ClientControlPush::RouteClosed {
                 module_id: target_module_id.to_string(),
+                channels,
                 reason: RouteCloseReason::CapabilityDenied,
                 drained: false,
                 abandoned: 0,

@@ -29,6 +29,7 @@ export {
   type ControlPush,
   type KnownRouteCloseReason,
   type RouteCloseReason,
+  type RouteEndReason,
   type RouteCloseDisposition,
   type ReconnectBackoff,
   type SubcCallErrorKind,

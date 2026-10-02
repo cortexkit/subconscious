@@ -2101,18 +2101,30 @@ impl Supervisor {
                 deadline_ms,
             })
             .expect("module draining serializes");
-            let closing = serde_json::to_vec(&ClientControlPush::RouteClosing {
-                module_id: module_id.clone(),
-                reason: RouteCloseReason::Restart,
-            })
-            .expect("route closing serializes");
             let mut recipients = vec![(target.sink.clone(), target.negotiated_ver, command)];
-            let mut seen = std::collections::HashSet::new();
+            let mut clients: Vec<(crate::forwarding::GoodbyeTarget, Vec<u16>)> = Vec::new();
             for route in routes {
                 let client = route.goodbye_target;
-                if seen.insert(client.connection_id) {
-                    recipients.push((client.sink, client.negotiated_ver, closing.clone()));
+                if let Some((_, channels)) = clients
+                    .iter_mut()
+                    .find(|(existing, _)| existing.connection_id == client.connection_id)
+                {
+                    channels.push(client.channel);
+                } else {
+                    let channel = client.channel;
+                    clients.push((client, vec![channel]));
                 }
+            }
+            for (client, mut channels) in clients {
+                channels.sort_unstable();
+                channels.dedup();
+                let closing = serde_json::to_vec(&ClientControlPush::RouteClosing {
+                    module_id: module_id.clone(),
+                    channels,
+                    reason: RouteCloseReason::Restart,
+                })
+                .expect("route closing serializes");
+                recipients.push((client.sink, client.negotiated_ver, closing));
             }
             for (sink, version, body) in recipients {
                 notices.spawn(async move {
@@ -6857,6 +6869,7 @@ async fn begin_forwarding_drain_with(
             routes.clone(),
             ClientControlPush::RouteClosing {
                 module_id: spec.module_id.clone(),
+                channels: Vec::new(),
                 reason,
             },
         );
@@ -6918,6 +6931,7 @@ async fn begin_forwarding_drain_with(
             routes,
             ClientControlPush::RouteClosed {
                 module_id: spec.module_id.clone(),
+                channels: Vec::new(),
                 reason,
                 drained,
                 abandoned: target.abandoned_bindings.len() as u32,

@@ -20,8 +20,8 @@ use subc_client_rs::{
     CloseRouteOptions, ConsumerIdentity, ConsumerOptions, HandlerOutcome, ModuleHandle,
     ModuleHandler, PolicyResolveError, PolicyResolver, PolicyResolverConfig, PolicyVerdict,
     ProjectRef, RequestCtx, RetryBackoff, ReverseRequestRegistrationError, RouteBindRequest,
-    RouteCloseDisposition, RouteHandle, ScopeCallError, ScopeDescribeReply, ScopeSelector,
-    SubcConsumer, SubcModuleError, Subject, SubscribeOptions,
+    RouteCloseDisposition, RouteCloseReason, RouteEndReason, RouteHandle, ScopeCallError,
+    ScopeDescribeReply, ScopeSelector, SubcConsumer, SubcModuleError, Subject, SubscribeOptions,
 };
 use subc_control::{ClientControlRequest, ClientControlResponse, PollKind};
 use subc_protocol::{
@@ -3722,6 +3722,120 @@ async fn scoped_opens_under_other_refs_or_epochs_and_unscoped_opens_get_their_ow
     })
     .await;
 
+    consumer.close().await;
+    harness.stop();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scoped_route_close_names_only_its_channel_and_restart_names_all_remaining_routes() {
+    let mut harness = start_scope_harness().await;
+    harness.sync(json!([scope_record("session-a", 1)])).await;
+    let consumer = Arc::new(harness.connect().await);
+    let mut pushes = consumer.control_pushes(16);
+    let identity = consumer_identity("two-route-reasons");
+    let scoped = consumer
+        .open_route_scoped(
+            tool_target(SCOPE_PROVIDER),
+            identity.clone(),
+            scope_selector("session-a", 1),
+            harness.carrier_options(),
+        )
+        .await
+        .unwrap();
+    let unscoped = consumer
+        .open_route(
+            tool_target(SCOPE_PROVIDER),
+            identity.clone(),
+            harness.carrier_options(),
+        )
+        .await
+        .unwrap();
+    let pending = {
+        let consumer = Arc::clone(&consumer);
+        tokio::spawn(async move {
+            consumer
+                .request(
+                    &scoped,
+                    serde_json::to_vec(&json!({"name":"hold", "arguments":{"delay_ms":30_000}}))
+                        .unwrap(),
+                    CallOptions {
+                        timeout: Duration::from_secs(60),
+                        ..fast_call_options()
+                    },
+                )
+                .await
+        })
+    };
+    wait_for_event(&harness.provider_events, EVENT_TIMEOUT, |event| {
+        event["kind"] == "request_received" && event["body_json"]["name"] == "hold"
+    })
+    .await;
+    harness.sync(json!([])).await;
+    let closed = loop {
+        let push = timeout(EVENT_TIMEOUT, pushes.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        if push.op == "route.closed" {
+            break push;
+        }
+    };
+    assert_eq!(closed.body["channels"], json!([scoped.channel]));
+    assert_eq!(closed.body["reason"], "scope_ended");
+    let err = timeout(EVENT_TIMEOUT, pending)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert!(matches!(err, CallError::OutcomeUnknown(_)), "{err}");
+    assert_eq!(
+        err.close_reason(),
+        Some(&RouteEndReason::Daemon(RouteCloseReason::ScopeEnded))
+    );
+    consumer
+        .request(&unscoped, b"{}".to_vec(), fast_call_options())
+        .await
+        .expect("the unscoped route remains usable");
+
+    let other = consumer
+        .open_route(
+            tool_target(SCOPE_PROVIDER),
+            consumer_identity("restart-second-route"),
+            harness.carrier_options(),
+        )
+        .await
+        .unwrap();
+    let mut client = connect_authed_client(&harness.daemon.connection_file)
+        .await
+        .unwrap();
+    let body = serde_json::to_vec(&ClientControlRequest::SupervisorRestart {
+        module_id: SCOPE_PROVIDER.to_string(),
+        drain_timeout_ms: Some(100),
+    })
+    .unwrap();
+    write_frame(&mut client, &control_request_frame(77, body))
+        .await
+        .unwrap();
+    client.flush().await.unwrap();
+    let response = timeout(EVENT_TIMEOUT, read_frame(&mut client))
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(response.header.ty, FrameType::Response);
+    let closed = loop {
+        let push = timeout(EVENT_TIMEOUT, pushes.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        if push.op == "route.closed" {
+            break push;
+        }
+    };
+    let mut expected = vec![unscoped.channel, other.channel];
+    expected.sort_unstable();
+    assert_eq!(closed.body["channels"], json!(expected));
+    assert_eq!(closed.body["reason"], "restart");
     consumer.close().await;
     harness.stop();
 }

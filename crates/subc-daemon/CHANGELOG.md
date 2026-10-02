@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.28.2 — 2026-10-02
+
+- Lifecycle control pushes name exactly the client-side channels covered on each receiving connection, including scope revocations, module drains and daemon shutdown. Route GOODBYE still carries no body; the reason is conveyed only by the control push. Update the control dependency to 0.27.
+
 ## 0.28.1 — 2026-10-02
 
 - The warning for a retired `launch_nonce_env` key now goes to the daemon's log (`run/logs/subc.<date>.log`) with the module named, not to stderr. Under launchd and systemd the daemon's stderr is usually discarded, so in 0.28.0 the warning reached no operator.

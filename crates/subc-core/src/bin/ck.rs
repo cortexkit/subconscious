@@ -5792,24 +5792,25 @@ fn format_resets_at_rate_window(window: &Value) -> String {
 fn format_reset_timestamp(raw: &str) -> Option<String> {
     let secs = parse_rfc3339_to_utc_secs(raw)?;
     let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
-    let local = utc_parts_from_epoch_secs(secs);
-    let now_local = utc_parts_from_epoch_secs(now);
-    if local.year == now_local.year && local.month == now_local.month && local.day == now_local.day
-    {
-        Some(format!("{:02}:{:02}", local.hour, local.minute))
+    let utc = utc_parts_from_epoch_secs(secs);
+    let now_utc = utc_parts_from_epoch_secs(now);
+    if utc.year == now_utc.year && utc.month == now_utc.month && utc.day == now_utc.day {
+        Some(format!("{:02}:{:02} UTC", utc.hour, utc.minute))
     } else {
         Some(format!(
-            "{} {:02} {:02}:{:02}",
-            month_abbr(local.month),
-            local.day,
-            local.hour,
-            local.minute
+            "{} {:02} {:02}:{:02} UTC",
+            month_abbr(utc.month),
+            utc.day,
+            utc.hour,
+            utc.minute
         ))
     }
 }
 
 fn parse_rfc3339_to_utc_secs(raw: &str) -> Option<u64> {
-    if raw.len() < 19 {
+    // RFC 3339 uses ASCII. Establish this before fixed byte slices, including
+    // the offset, so malformed provider text cannot split a UTF-8 character.
+    if raw.len() < 19 || !raw.is_ascii() {
         return None;
     }
     let bytes = raw.as_bytes();
@@ -5897,7 +5898,7 @@ fn civil_to_days(year: i32, month: u32, day: u32) -> Option<i32> {
     Some(era * 146097 + doy - 719468)
 }
 
-struct LocalTimeParts {
+struct UtcTimeParts {
     year: i32,
     month: u32,
     day: u32,
@@ -5905,13 +5906,13 @@ struct LocalTimeParts {
     minute: u32,
 }
 
-fn utc_parts_from_epoch_secs(secs: u64) -> LocalTimeParts {
+fn utc_parts_from_epoch_secs(secs: u64) -> UtcTimeParts {
     let days = (secs / 86_400) as i32;
     let rem = (secs % 86_400) as u32;
     let hour = rem / 3600;
     let minute = (rem % 3600) / 60;
     let (year, month, day) = civil_from_days(days);
-    LocalTimeParts {
+    UtcTimeParts {
         year,
         month,
         day,
@@ -8143,6 +8144,29 @@ impl From<serde_json::Error> for CkError {
     fn from(source: serde_json::Error) -> Self {
         Self::Json(source)
     }
+}
+
+#[cfg(test)]
+#[test]
+fn malformed_unicode_reset_timestamps_are_refused_without_panicking() {
+    for raw in [
+        "2026-01-01T00:00:0é",
+        "2026-01-01T00:00:00+0é00",
+        "202é-01-01T00:00:00Z",
+    ] {
+        assert_eq!(parse_rfc3339_to_utc_secs(raw), None, "{raw}");
+    }
+    assert_eq!(
+        parse_rfc3339_to_utc_secs("2026-01-01T03:00:00+03:00"),
+        parse_rfc3339_to_utc_secs("2026-01-01T00:00:00Z")
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn reset_timestamp_display_labels_its_utc_timezone() {
+    let formatted = format_reset_timestamp("2026-01-01T03:00:00+03:00").unwrap();
+    assert!(formatted.ends_with("00:00 UTC"), "{formatted}");
 }
 
 #[cfg(test)]

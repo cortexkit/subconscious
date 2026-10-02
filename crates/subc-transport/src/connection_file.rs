@@ -168,11 +168,6 @@ pub enum ConnectionFileError {
         path: PathBuf,
         mode: u32,
     },
-    UnexpectedOwner {
-        path: PathBuf,
-        owner_uid: u32,
-        expected_uid: u32,
-    },
     InsecureParentDirectory {
         component: PathBuf,
         mode: u32,
@@ -313,10 +308,11 @@ fn refuse_writable_ancestor_for_uid(parent: &Path, uid: u32) -> Result<(), Conne
         // fail-open is the one a later reader tightens into a refusal.
         if let Ok(metadata) = fs::metadata(component) {
             if metadata.uid() != uid && metadata.uid() != 0 {
-                return Err(ConnectionFileError::UnexpectedOwner {
-                    path: component.to_path_buf(),
-                    owner_uid: metadata.uid(),
-                    expected_uid: uid,
+                return Err(ConnectionFileError::Invalid {
+                    reason: format!(
+                        "connection-file ancestor {} is owned by uid {}, expected effective uid {uid} or root",
+                        component.display(), metadata.uid()
+                    ),
                 });
             }
             let mode = metadata.permissions().mode();
@@ -586,10 +582,12 @@ fn verify_owner_only_for_uid(
     // A foreign owner can substitute their own endpoint and key even at 0600.
     // This also refuses a foreign-owned file readable through an ACL or by root.
     if meta.uid() != uid {
-        return Err(ConnectionFileError::UnexpectedOwner {
-            path: path.to_path_buf(),
-            owner_uid: meta.uid(),
-            expected_uid: uid,
+        return Err(ConnectionFileError::Invalid {
+            reason: format!(
+                "connection file {} is owned by uid {}, expected effective uid {uid}",
+                path.display(),
+                meta.uid()
+            ),
         });
     }
     let mode = meta.permissions().mode();
@@ -751,11 +749,6 @@ impl fmt::Display for ConnectionFileError {
                 "connection file {} has insecure permissions {mode:#o}; expected owner-only 0600",
                 path.display()
             ),
-            Self::UnexpectedOwner { path, owner_uid, expected_uid } => write!(
-                f,
-                "untrusted owner uid {owner_uid} for connection-file path {} (effective uid {expected_uid})",
-                path.display()
-            ),
             Self::InsecureParentDirectory { component, mode } => write!(
                 f,
                 "refusing to publish the connection file: ancestor {} is mode {mode:#o}, \
@@ -776,7 +769,6 @@ impl Error for ConnectionFileError {
             Self::MissingParent { .. }
             | Self::MissingFileName { .. }
             | Self::InsecureParentDirectory { .. }
-            | Self::UnexpectedOwner { .. }
             | Self::UnsupportedSchema { .. }
             | Self::WireVersionMismatch { .. }
             | Self::Invalid { .. }
@@ -867,7 +859,7 @@ mod tests {
         assert!(
             matches!(
                 verify_owner_only_for_uid(&path, &meta, different_uid),
-                Err(ConnectionFileError::UnexpectedOwner { .. })
+                Err(ConnectionFileError::Invalid { .. })
             ),
             "0600 is not proof that the file belongs to the reader"
         );

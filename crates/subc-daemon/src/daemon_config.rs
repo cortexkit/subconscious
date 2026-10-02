@@ -771,8 +771,15 @@ fn parse_doc(doc: &str, path: &Path) -> Result<DaemonConfig, DaemonConfigError> 
                 Some(value) => Some(value),
                 None => default_route_bind_relay_timeout_ms,
             };
+            // Through the daemon's log, not stderr: under launchd or systemd the
+            // daemon's stderr is usually discarded, so a warning written there is
+            // one no operator reads. The daemon installs its logger before it
+            // loads the full config, so this lands in run/logs/subc.<date>.log.
             if module.ignored.contains_key("launch_nonce_env") {
-                eprintln!("module '{}': launch_nonce_env is deprecated and ignored; nonce delivery is determined by the platform", module_id.escape_debug());
+                tracing::warn!(
+                    module_id = %module_id.escape_debug(),
+                    "launch_nonce_env is deprecated and ignored; nonce delivery is determined by the platform"
+                );
             }
             let protocol = parse_module_protocol(module.protocol.as_deref(), path, &module_id)?;
             let overlap = parse_module_overlap(module.overlap.as_deref(), path, &module_id)?;

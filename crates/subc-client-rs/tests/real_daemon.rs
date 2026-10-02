@@ -845,13 +845,27 @@ async fn a_supervised_module_reads_its_launch_nonce_from_the_descriptor_and_hell
         "{response}"
     );
     daemon.kill_and_wait();
-    let mut stderr = String::new();
-    std::io::Read::read_to_string(&mut daemon.child.stderr.take().unwrap(), &mut stderr).unwrap();
+    // The warning goes to the daemon's own log (the file an operator reads), not
+    // to stderr, which launchd and systemd usually discard. spawn_daemon_child
+    // puts the data home at <temp>/data, so the log is under its run/logs.
+    let logs_dir = temp_dir
+        .join("data")
+        .join("cortexkit")
+        .join("run")
+        .join("logs");
+    let log = fs::read_dir(&logs_dir)
+        .unwrap_or_else(|error| panic!("read {}: {error}", logs_dir.display()))
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("subc."))
+        .map(|entry| fs::read_to_string(entry.path()).unwrap_or_default())
+        .collect::<String>();
     assert!(
-        stderr.contains(&format!(
-            "module '{MODULE_ID}': launch_nonce_env is deprecated and ignored"
-        )),
-        "missing module-named deprecation warning: {stderr}"
+        log.lines().any(
+            |line| line.contains("launch_nonce_env is deprecated and ignored")
+                && line.contains(MODULE_ID)
+        ),
+        "missing module-named deprecation warning in {}: {log}",
+        logs_dir.display()
     );
 }
 

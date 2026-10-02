@@ -601,10 +601,12 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
             .remove(target.label())
             .ok_or_else(|| format!("no verified candidate was prepared for {target}"))?;
         if target.is_self_replacing() {
+            let version = self.expected_version(target)?.to_string();
             let result = self_update::replace_verified_candidate(
                 &destination,
                 &prepared.candidate,
                 &prepared.archive_sha256,
+                &version,
                 &mut self.inventory,
             );
             prepared.cleanup();

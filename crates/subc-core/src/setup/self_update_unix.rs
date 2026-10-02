@@ -250,6 +250,7 @@ mod tests {
             &destination,
             &candidate,
             &"aa".repeat(32),
+            "1.0.0",
             &mut inventory,
         )
         .expect("atomic self-update");

@@ -33,6 +33,7 @@ pub(crate) fn replace_verified_candidate(
     destination: &Path,
     candidate: &Path,
     archive_sha256: &str,
+    version: &str,
     inventory: &mut Inventory,
 ) -> Result<SelfUpdateEvidence, String> {
     if !candidate.is_file() {
@@ -80,6 +81,7 @@ pub(crate) fn replace_verified_candidate(
         )
     })?;
     for kind in owned_kinds {
+        inventory.update_owned_string(kind, destination, "version", version.to_string())?;
         inventory
             .update_owned_string(kind, destination, "sha256", digest.clone())
             .map_err(|error| {
@@ -144,6 +146,37 @@ mod tests {
     }
 
     #[test]
+    fn self_update_reconciles_the_inventory_version() {
+        let root = fixture_dir("manifest-version");
+        let destination = root.join(if cfg!(windows) { "ck.exe" } else { "ck" });
+        let candidate = root.join("candidate");
+        let manifest = root.join("installer-manifest.json");
+        fs::write(&destination, "previous").unwrap();
+        fs::write(&candidate, "replacement").unwrap();
+        let mut inventory = Inventory::load(&manifest, "test").unwrap();
+        let mut fields = Map::new();
+        fields.insert("version".into(), Value::String("0.20.50".into()));
+        inventory.record("managed-binary", &destination, fields);
+        replace_verified_candidate(
+            &destination,
+            &candidate,
+            &"aa".repeat(32),
+            "0.20.51",
+            &mut inventory,
+        )
+        .unwrap();
+        let reloaded = Inventory::load(&manifest, "test").unwrap();
+        assert_eq!(
+            reloaded
+                .entry_for_path("managed-binary", &destination)
+                .unwrap()
+                .get("version")
+                .and_then(Value::as_str),
+            Some("0.20.51")
+        );
+    }
+
+    #[test]
     fn refuses_to_replace_an_unowned_destination() {
         let root = fixture_dir("unowned");
         let destination = root.join(if cfg!(windows) { "ck.exe" } else { "ck" });
@@ -153,9 +186,14 @@ mod tests {
         fs::write(&candidate, "replacement").expect("candidate");
         let mut inventory = Inventory::load(&manifest, "linux-x64").expect("inventory");
 
-        let error =
-            replace_verified_candidate(&destination, &candidate, &"aa".repeat(32), &mut inventory)
-                .expect_err("unowned destination must refuse");
+        let error = replace_verified_candidate(
+            &destination,
+            &candidate,
+            &"aa".repeat(32),
+            "1.0.0",
+            &mut inventory,
+        )
+        .expect_err("unowned destination must refuse");
 
         assert!(error.contains("installer-manifest.json does not own"));
         assert_eq!(
@@ -184,9 +222,14 @@ mod tests {
         inventory.save().expect("save inventory");
 
         let archive_digest = "cd".repeat(32);
-        let evidence =
-            replace_verified_candidate(&destination, &candidate, &archive_digest, &mut inventory)
-                .expect("owned replacement");
+        let evidence = replace_verified_candidate(
+            &destination,
+            &candidate,
+            &archive_digest,
+            "1.0.0",
+            &mut inventory,
+        )
+        .expect("owned replacement");
         assert!(evidence.to_string().contains("SHA-256 reconciled"));
         assert_eq!(
             fs::read_to_string(&destination).expect("destination bytes"),

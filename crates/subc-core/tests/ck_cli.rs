@@ -1270,7 +1270,9 @@ impl UpgradeFixture {
             .env("HOME", &self.home)
             .env("USERPROFILE", &self.home)
             .env("LOCALAPPDATA", self.home.join(".local/share"))
-            .env_remove("XDG_DATA_HOME")
+            .env("XDG_DATA_HOME", self.home.join(".local/share"))
+            .env("XDG_RUNTIME_DIR", self._root.path().join("runtime"))
+            .env("XDG_CONFIG_HOME", self.home.join(".config"))
             .env("CK_RELEASE_INDEX_URL", &index.url)
             .env("CK_TEST_RELEASE_INDEX_PUBKEY", &index.public_key)
             .env("CK_TEST_CK_VERSION", "0.17.9")
@@ -1376,6 +1378,55 @@ fn upgrade_and_check_say_everything_is_current_in_one_line() {
         assert!(output.stderr.is_empty(), "stderr: {}", text(&output.stderr));
         assert_eq!(text(&output.stdout), expected);
     }
+}
+
+#[test]
+fn upgrade_check_reports_updates_when_the_daemon_is_down() {
+    let fixture = UpgradeFixture::new("ck-upgrade-check-down");
+    let index = serve_signed_index(|base| {
+        upgrade_index(
+            base,
+            "0.55.2",
+            &"aa".repeat(32),
+            "0.17.9",
+            &"44".repeat(32),
+            "0.8.0",
+            &"55".repeat(32),
+        )
+    });
+    let output = fixture
+        .command(&index, &["upgrade", "--check"])
+        .env("CK_TEST_DAEMON_UNREACHABLE", "daemon is down")
+        .output()
+        .unwrap();
+    assert_exit(&output, 0);
+    assert_eq!(
+        text(&output.stdout),
+        "ck-aft 0.55.1 → 0.55.2. Run ck upgrade.\n"
+    );
+}
+
+#[test]
+fn upgrade_dry_run_exits_nonzero_when_activation_is_refused() {
+    let fixture = UpgradeFixture::new("ck-upgrade-preview-down");
+    let index = serve_signed_index(|base| {
+        upgrade_index(
+            base,
+            "0.55.2",
+            &"aa".repeat(32),
+            "0.17.9",
+            &"44".repeat(32),
+            "0.8.0",
+            &"55".repeat(32),
+        )
+    });
+    let output = fixture
+        .command(&index, &["upgrade", "--dry-run"])
+        .env("CK_TEST_DAEMON_UNREACHABLE", "daemon is down")
+        .output()
+        .unwrap();
+    assert_exit(&output, 1);
+    assert!(text(&output.stdout).contains("daemon is unreachable: daemon is down"));
 }
 
 #[test]

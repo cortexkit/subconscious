@@ -7199,7 +7199,13 @@ async fn upgrade_command(
         }
         Err(error) => return Err(CkError::UpdateCheck(error)),
     };
-    let roster = fetch_supervised_roster(subc).await;
+    // Availability is a signed-index observation, not an activation attempt.
+    // A stopped daemon must not prevent a read-only update check.
+    let roster = if check {
+        Ok(BTreeSet::new())
+    } else {
+        fetch_supervised_roster(subc).await
+    };
     let planning_index = if check {
         None
     } else {
@@ -7214,7 +7220,11 @@ async fn upgrade_command(
     let plan = setup::plan_upgrade(&observed);
     if dry_run {
         println!("{}", plan.render());
-        return Ok(());
+        return if plan.is_authorized() {
+            Ok(())
+        } else {
+            Err(CkError::RenderedExit { exit_code: 1 })
+        };
     }
     if !plan.is_authorized() {
         let message = plan

@@ -1233,7 +1233,11 @@ fn fresh_setup_prints_the_pasteable_claude_code_command() {
             assets,
         )
     });
-    let output = fixture.command(&index, &["setup"]).output().unwrap();
+    let output = fixture
+        .command(&index, &["setup"])
+        .env("CK_TEST_SETUP_RUNTIME_MISSING", "1")
+        .output()
+        .unwrap();
 
     assert_exit(&output, 0);
     let stdout = text(&output.stdout);

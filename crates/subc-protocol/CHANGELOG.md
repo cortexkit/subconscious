@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.28.1
+
+- Validate frame headers with the wire decoder at construction, refusing pure-header bodies, invalid channel epochs and illegal flag combinations locally rather than disconnecting a peer.
+
+- Refuse unknown fields inside scope principals, including parent owners, child owners, carriers, and selectors, as required for authority-bearing scope input. Principal decoding outside scopes remains forward-compatible.
+
 ## 0.28.0 — 2026-10-01
 
 - Breaking: `ToolCallRequest` gains `origin: Option<CallOrigin>`, so a struct literal must now set it (`ToolCallRequest::new` sets `None`). The member is omitted on the wire when `None` and decodes as `None` when absent, so bodies without it are unchanged in both directions.

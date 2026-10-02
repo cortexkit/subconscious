@@ -1835,7 +1835,7 @@ dependencies = [
 
 [[package]]
 name = "subc-control"
-version = "0.27.0"
+version = "0.27.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -1922,7 +1922,7 @@ dependencies = [
 
 [[package]]
 name = "subc-jsonc"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "serde_json",
 ]
@@ -1949,7 +1949,7 @@ dependencies = [
 
 [[package]]
 name = "subc-os"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "libc",
  "rustix",
@@ -1957,7 +1957,7 @@ dependencies = [
 
 [[package]]
 name = "subc-protocol"
-version = "0.28.0"
+version = "0.28.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -1972,7 +1972,7 @@ dependencies = [
 
 [[package]]
 name = "subc-transport"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "getrandom 0.2.17",
  "hmac",

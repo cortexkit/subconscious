@@ -483,6 +483,28 @@ mod unix_tests {
         };
         let out = PathBuf::from(std::env::var_os(OUT_ENV).unwrap());
         let mut report = String::new();
+        if let Some(fd) = role.strip_prefix("closed-stdio:") {
+            let fd: RawFd = fd.parse().unwrap();
+            // Only this isolated subprocess loses a standard descriptor. Closing
+            // it before making the pipe reproduces a daemon launched that way.
+            #[allow(unsafe_code)]
+            unsafe {
+                libc::close(fd);
+            }
+            let handoff = LaunchNonceHandoff::new(NONCE).unwrap();
+            let module_out = out.with_extension("module");
+            let mut module = probe_command(&module_out, "module");
+            module
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            module.env(LAUNCH_NONCE_FD_ENV, handoff.fd_env_value());
+            module.env(LAUNCH_NONCE_ENV, "not-the-pipe-nonce");
+            handoff.install_last(&mut module);
+            let report = run(module, &module_out);
+            fs::write(&out, report).unwrap();
+            return;
+        }
         if let Some(fd) = role.strip_prefix("cat-fd:") {
             // Read a descriptor raw, to show what the step left at a number.
             let fd: RawFd = fd.parse().unwrap();
@@ -535,6 +557,21 @@ mod unix_tests {
         assert_eq!(report_line(&report, "result"), format!("fd:{NONCE}"));
         assert_eq!(report_line(&report, "second_equal"), "true");
         assert_eq!(report_line(&report, "env_unchanged"), "true");
+    }
+
+    #[test]
+    fn handoff_survives_each_closed_standard_descriptor() {
+        let _serial = serial();
+        let scratch = Scratch::new("closed-stdio");
+        for fd in 0..=2 {
+            let out = scratch.0.join(format!("report-{fd}"));
+            let report = run(probe_command(&out, &format!("closed-stdio:{fd}")), &out);
+            assert_eq!(
+                report_line(&report, "result"),
+                format!("fd:{NONCE}"),
+                "closed fd {fd}"
+            );
+        }
     }
 
     #[test]

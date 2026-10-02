@@ -4,7 +4,7 @@ use std::{
     ffi::{OsStr, OsString},
     fmt,
     fs::{self, File, OpenOptions},
-    io::{self, Write},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
     process,
     time::{Duration, SystemTime},
@@ -268,13 +268,23 @@ fn ensure_parent_directory(parent: &Path) -> Result<(), ConnectionFileError> {
 /// the one we write through: a symlink component pointing somewhere permissive
 /// defeats the walk while every individual `stat` passes.
 ///
-/// STICKY EXEMPTS. `/tmp` and `/Users/Shared` are 1777 by design; without the
+/// Only the effective user and root are trusted directory owners: even a 0755
+/// directory can be renamed or have its permissions changed by its owner. Root
+/// is trusted because the transport does not defend against root processes.
+///
+/// STICKY EXEMPTS WRITABLE BITS, NOT OWNERSHIP. `/tmp` and `/Users/Shared` are
+/// 1777 by design; without the
 /// exemption this fires on correctly-configured systems, and a check that
 /// refuses healthy configuration gets disabled — after which it protects nothing
 /// at all.
 #[cfg(unix)]
 fn refuse_writable_ancestor(parent: &Path) -> Result<(), ConnectionFileError> {
-    use std::os::unix::fs::PermissionsExt;
+    refuse_writable_ancestor_for_uid(parent, rustix::process::geteuid().as_raw())
+}
+
+#[cfg(unix)]
+fn refuse_writable_ancestor_for_uid(parent: &Path, uid: u32) -> Result<(), ConnectionFileError> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     const GROUP_OR_WORLD_WRITABLE: u32 = 0o022;
     const STICKY: u32 = 0o1000;
@@ -297,6 +307,14 @@ fn refuse_writable_ancestor(parent: &Path) -> Result<(), ConnectionFileError> {
         // canonicalise arm declines. Argued at the site because an UNARGUED
         // fail-open is the one a later reader tightens into a refusal.
         if let Ok(metadata) = fs::metadata(component) {
+            if metadata.uid() != uid && metadata.uid() != 0 {
+                return Err(ConnectionFileError::Invalid {
+                    reason: format!(
+                        "connection-file ancestor {} is owned by uid {}, expected effective uid {uid} or root",
+                        component.display(), metadata.uid()
+                    ),
+                });
+            }
             let mode = metadata.permissions().mode();
             if mode & GROUP_OR_WORLD_WRITABLE != 0 && mode & STICKY == 0 {
                 return Err(ConnectionFileError::InsecureParentDirectory {
@@ -357,15 +375,21 @@ fn sweep_stale_temps(parent: &Path, file_name: &std::ffi::OsStr) {
 
 pub fn read(path: impl AsRef<Path>) -> Result<ConnectionInfo, ConnectionFileError> {
     let path = path.as_ref();
-    // Refuse to trust a key from a file other local users can read. The key is
-    // published owner-only (0600); if the on-disk file is group/world-accessible
-    // the secret has leaked and the daemon it points at can't be trusted.
-    verify_owner_only(path)?;
-    let bytes = fs::read(path).map_err(|source| ConnectionFileError::Io {
-        op: "read",
+    let mut file = File::open(path).map_err(|source| ConnectionFileError::Io {
+        op: "open",
         path: path.to_path_buf(),
         source,
     })?;
+    // Verify the opened inode, not a separate path lookup: replacing the path
+    // between stat and read must not let an unverified key through.
+    verify_owner_only(path, &file)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|source| ConnectionFileError::Io {
+            op: "read",
+            path: path.to_path_buf(),
+            source,
+        })?;
     let info: ConnectionInfo =
         serde_json::from_slice(&bytes).map_err(|source| ConnectionFileError::JsonRead {
             path: path.to_path_buf(),
@@ -539,16 +563,35 @@ fn sanitize_token(raw: &str) -> String {
 }
 
 #[cfg(unix)]
-fn verify_owner_only(path: &Path) -> Result<(), ConnectionFileError> {
-    use std::os::unix::fs::PermissionsExt;
-    let meta = fs::metadata(path).map_err(|source| ConnectionFileError::Io {
-        op: "stat",
+fn verify_owner_only(path: &Path, file: &File) -> Result<(), ConnectionFileError> {
+    let meta = file.metadata().map_err(|source| ConnectionFileError::Io {
+        op: "fstat",
         path: path.to_path_buf(),
         source,
     })?;
+    verify_owner_only_for_uid(path, &meta, rustix::process::geteuid().as_raw())
+}
+
+#[cfg(unix)]
+fn verify_owner_only_for_uid(
+    path: &Path,
+    meta: &fs::Metadata,
+    uid: u32,
+) -> Result<(), ConnectionFileError> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    // A foreign owner can substitute their own endpoint and key even at 0600.
+    // This also refuses a foreign-owned file readable through an ACL or by root.
+    if meta.uid() != uid {
+        return Err(ConnectionFileError::Invalid {
+            reason: format!(
+                "connection file {} is owned by uid {}, expected effective uid {uid}",
+                path.display(),
+                meta.uid()
+            ),
+        });
+    }
     let mode = meta.permissions().mode();
     // Any group or other permission bit means the key is exposed beyond the owner.
-    // A file owned by a different user that we can still read implies the same.
     if mode & 0o077 != 0 {
         return Err(ConnectionFileError::InsecurePermissions {
             path: path.to_path_buf(),
@@ -559,7 +602,7 @@ fn verify_owner_only(path: &Path) -> Result<(), ConnectionFileError> {
 }
 
 #[cfg(not(unix))]
-fn verify_owner_only(_path: &Path) -> Result<(), ConnectionFileError> {
+fn verify_owner_only(_path: &Path, _file: &File) -> Result<(), ConnectionFileError> {
     // On Windows the file inherits the per-user profile directory's ACL (owner,
     // SYSTEM, Administrators only) at create time; see open_owner_only_new. There
     // are no portable Unix mode bits to re-check on read here.
@@ -768,6 +811,59 @@ mod tests {
 
     fn unique_temp_dir(label: &str) -> TestTempDir {
         TestTempDir::new(label)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_foreign_owned_ancestor_refuses_even_with_mode_0755() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let root = unique_temp_dir("foreign-ancestor");
+        let parent = root.join("run");
+        fs::create_dir(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o755)).unwrap();
+        // Model a root writer inspecting an ordinary user's directory. The walk
+        // uses actual filesystem metadata, without changing the test process uid.
+        if fs::metadata(&parent).unwrap().uid() == 0 {
+            assert!(process::Command::new("chown")
+                .args(["65534"])
+                .arg(&parent)
+                .status()
+                .unwrap()
+                .success());
+        }
+        assert_ne!(fs::metadata(&parent).unwrap().uid(), 0);
+        assert!(
+            refuse_writable_ancestor_for_uid(&parent, 0).is_err(),
+            "0755 does not prevent its owner replacing the key"
+        );
+        if rustix::process::geteuid().as_raw() != 0 {
+            assert!(
+                refuse_writable_ancestor(&parent).is_ok(),
+                "the same directory is safe for its actual owner"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owner_only_file_validation_refuses_a_different_effective_uid() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let root = unique_temp_dir("foreign-file");
+        let path = root.join(CONNECTION_FILE_NAME);
+        write_atomic(&path, &sample_info()).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let owner = fs::metadata(&path).unwrap().uid();
+        let meta = fs::metadata(&path).unwrap();
+        assert!(verify_owner_only_for_uid(&path, &meta, owner).is_ok());
+        let different_uid = if owner == 0 { 1 } else { 0 };
+        assert!(
+            matches!(
+                verify_owner_only_for_uid(&path, &meta, different_uid),
+                Err(ConnectionFileError::Invalid { .. })
+            ),
+            "0600 is not proof that the file belongs to the reader"
+        );
+        assert_eq!(read(&path).unwrap(), sample_info());
     }
 
     /// A GROUP-writable ancestor must refuse, and the passing control on the same

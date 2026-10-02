@@ -15,6 +15,40 @@ use serde::{Deserialize, Serialize};
 
 use crate::Principal;
 
+// Scope principals are authority-bearing input: an unrecognized constraint must
+// not silently widen a grant. Principal elsewhere is a forward-compatible caller
+// fact, so keep its general decoder lenient and enforce this only on scope input.
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum ScopePrincipal {
+    Reserved { module_id: String },
+    Direct {},
+    Unverified {},
+}
+
+impl From<ScopePrincipal> for Principal {
+    fn from(value: ScopePrincipal) -> Self {
+        match value {
+            ScopePrincipal::Reserved { module_id } => Self::Reserved { module_id },
+            ScopePrincipal::Direct {} => Self::Direct,
+            ScopePrincipal::Unverified {} => Self::Unverified,
+        }
+    }
+}
+
+fn deserialize_scope_principal<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Principal, D::Error> {
+    ScopePrincipal::deserialize(deserializer).map(Into::into)
+}
+
+fn deserialize_scope_principals<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<Principal>, D::Error> {
+    Vec::<ScopePrincipal>::deserialize(deserializer)
+        .map(|principals| principals.into_iter().map(Into::into).collect())
+}
+
 /// The `server.describe` capability a daemon advertises when it admits routes
 /// under scopes. A carrier that needs a scoped route and does not see it fails
 /// the call (`scope_unsupported`) instead of opening an unscoped route.
@@ -57,6 +91,7 @@ pub enum ScopeKind {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ScopeParent {
+    #[serde(deserialize_with = "deserialize_scope_principal")]
     pub owner: Principal,
     #[serde(rename = "ref")]
     pub scope_ref: String,
@@ -72,6 +107,7 @@ pub struct ScopeParent {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ScopeCarrier {
+    #[serde(deserialize_with = "deserialize_scope_principal")]
     pub principal: Principal,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub targets: Option<Vec<String>>,
@@ -112,7 +148,11 @@ pub struct ScopeRecord {
     pub parent: Option<ScopeParent>,
     /// Principals, other than the owner, allowed to register child scopes under
     /// this one. Listing a principal here grants it nothing else.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_scope_principals"
+    )]
     pub child_owners: Vec<Principal>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub carriers: Vec<ScopeCarrier>,
@@ -128,6 +168,7 @@ pub struct ScopeRecord {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ScopeSelector {
+    #[serde(deserialize_with = "deserialize_scope_principal")]
     pub owner: Principal,
     #[serde(rename = "ref")]
     pub scope_ref: String,

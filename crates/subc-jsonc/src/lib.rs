@@ -98,7 +98,16 @@ fn remove_json_trailing_commas(input: &str) -> String {
             while matches!(lookahead.peek(), Some(next) if next.is_whitespace()) {
                 let _ = lookahead.next();
             }
-            if matches!(lookahead.peek(), Some('}' | ']')) {
+            // A trailing comma follows a value, never an opening delimiter,
+            // colon, or another comma. Leave invalid commas for the JSON reader
+            // to refuse instead of repairing an empty/missing element.
+            if matches!(lookahead.peek(), Some('}' | ']'))
+                && out
+                    .trim_end()
+                    .chars()
+                    .next_back()
+                    .is_some_and(|previous| !matches!(previous, '[' | '{' | ':' | ','))
+            {
                 continue;
             }
         }
@@ -239,7 +248,7 @@ fn tokenize(doc: &str) -> Result<Vec<Token>, String> {
                 {
                     cursor += 1;
                 }
-                if cursor + 1 == bytes.len() {
+                if cursor + 1 >= bytes.len() {
                     return Err(format!("unterminated block comment at byte {start}"));
                 }
                 cursor += 2;
@@ -705,6 +714,42 @@ mod tests {
             jsonc_to_json(r#"{ "version": 1, /*"#),
             Err("unterminated block comment".to_owned())
         );
+    }
+
+    #[test]
+    fn editor_helpers_refuse_block_comment_openers_at_eof() {
+        for doc in ["{} /*", "{} /*x", "{} /*\n", "{} /**"] {
+            assert!(jsonc_to_json(doc).is_err());
+            let error = jsonc_object_span(doc, &[]).expect_err(doc);
+            assert!(error.contains("unterminated block comment"), "{error}");
+            assert!(jsonc_member_span(doc, &["x"]).is_err());
+        }
+        assert!(jsonc_object_span("{} /**/", &[]).unwrap().is_some());
+    }
+
+    #[test]
+    fn normalization_does_not_turn_lone_commas_into_valid_json() {
+        for doc in [
+            "[,]",
+            "{,}",
+            "[/*comment*/,]",
+            "{ /*comment*/ , }",
+            "[1,,]",
+            r#"{"x":,}"#,
+        ] {
+            let normalized = jsonc_to_json(doc).unwrap();
+            assert!(
+                serde_json::from_str::<Value>(&normalized).is_err(),
+                "invalid {doc} was repaired to {normalized}"
+            );
+            assert!(jsonc_object_span(doc, &[]).is_err());
+        }
+        for doc in ["[1,]", r#"{"x": [],}"#, "[{},]", "[true,]", "[null,]"] {
+            assert!(
+                serde_json::from_str::<Value>(&jsonc_to_json(doc).unwrap()).is_ok(),
+                "{doc}"
+            );
+        }
     }
 
     #[test]

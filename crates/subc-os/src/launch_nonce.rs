@@ -297,7 +297,26 @@ mod unix {
             let (reader, mut writer) = io::pipe()?;
             writer.write_all(nonce.as_bytes())?;
             drop(writer);
-            let read_end = OwnedFd::from(reader);
+            let mut read_end = OwnedFd::from(reader);
+            // std configures the child's stdio before pre-exec callbacks. If a
+            // standard descriptor was closed in the parent, pipe() can use its
+            // number, which stdio setup would overwrite before the handoff runs.
+            // Move it out of that range now, keeping the parent copy close-on-exec.
+            if read_end.as_raw_fd() < LAUNCH_NONCE_FD {
+                // SAFETY: duplicates an owned descriptor; no memory is passed.
+                #[allow(unsafe_code)]
+                let copy = unsafe {
+                    libc::fcntl(read_end.as_raw_fd(), libc::F_DUPFD_CLOEXEC, LAUNCH_NONCE_FD)
+                };
+                if copy == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                // SAFETY: the successful fcntl returned a new descriptor owned here.
+                #[allow(unsafe_code)]
+                {
+                    read_end = unsafe { OwnedFd::from_raw_fd(copy) };
+                }
+            }
             let inode = fstat(read_end.as_raw_fd())?.st_ino as u64;
             Ok(Self {
                 read_end,

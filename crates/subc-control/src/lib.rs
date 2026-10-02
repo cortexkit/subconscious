@@ -234,8 +234,9 @@ pub enum ClientControlRequest {
         module_id: String,
         /// Optional per-restart override of the module's drain budget, in ms.
         /// Absent: the module's configured `drain_timeout_ms` (or the daemon
-        /// default) applies. `0` tears down without waiting — the wedge-bounce
-        /// escape, where a stuck in-flight request would never settle anyway.
+        /// default) applies. `0` tears down without waiting: use it to restart a
+        /// wedged module whose stuck in-flight request would never settle, so
+        /// waiting for a drain would be pointless.
         /// Additive; older daemons silently ignore this field and use their
         /// configured/default drain budget, even when the sender requests `0`.
         /// Senders that require the override must use a daemon version that

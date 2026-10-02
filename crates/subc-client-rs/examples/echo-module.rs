@@ -40,6 +40,9 @@ const BUSY_GAUGE: &str = "drain_work";
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
+    let nonce_env_present = std::env::var_os(subc_protocol::SUBC_LAUNCH_NONCE_ENV).is_some();
+    let nonce_fd_env_present =
+        std::env::var_os(subc_client_rs::launch_nonce::LAUNCH_NONCE_FD_ENV).is_some();
     // First, before anything could spawn a child that would inherit the
     // still-unread nonce descriptor.
     let launch_nonce = subc_client_rs::launch_nonce();
@@ -54,7 +57,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             Ok(None) => "none".to_string(),
             Err(error) => format!("error: {error}"),
         };
-        let _ = append_json_line(path, json!({"kind": "launch_nonce", "source": source}));
+        let _ = append_json_line(
+            path,
+            json!({"kind": "launch_nonce", "source": source,
+            "env_present": nonce_env_present, "fd_env_present": nonce_fd_env_present}),
+        );
     }
     let busy_after_drain = std::env::var(BUSY_AFTER_DRAIN_ENV)
         .ok()

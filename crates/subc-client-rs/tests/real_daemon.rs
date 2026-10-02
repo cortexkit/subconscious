@@ -807,6 +807,7 @@ async fn a_supervised_module_reads_its_launch_nonce_from_the_descriptor_and_hell
                     "env": env,
                     "enabled": true,
                     "reserved": true,
+                    "launch_nonce_env": true,
                 }
             }
         }))
@@ -814,7 +815,7 @@ async fn a_supervised_module_reads_its_launch_nonce_from_the_descriptor_and_hell
     )
     .unwrap();
 
-    let daemon = spawn_daemon(&daemon_bin, &runtime_dir, &config_dir);
+    let mut daemon = spawn_daemon(&daemon_bin, &runtime_dir, &config_dir);
     wait_for_connection_file(&daemon.connection_file, START_TIMEOUT).await;
     let expected_source = if cfg!(unix) { "fd" } else { "env" };
     let started = wait_for_event(&events_path, START_TIMEOUT, |event| {
@@ -822,6 +823,8 @@ async fn a_supervised_module_reads_its_launch_nonce_from_the_descriptor_and_hell
     })
     .await;
     assert_eq!(started["source"], expected_source, "{started}");
+    assert_eq!(started["env_present"], !cfg!(unix), "{started}");
+    assert_eq!(started["fd_env_present"], cfg!(unix), "{started}");
     wait_for_catalog_module(&daemon.connection_file, MODULE_ID, START_TIMEOUT).await;
 
     let mut client = connect_authed_client(&daemon.connection_file)
@@ -840,6 +843,15 @@ async fn a_supervised_module_reads_its_launch_nonce_from_the_descriptor_and_hell
     assert_eq!(
         modules[0]["module_declared"]["build"]["launch_nonce_source"], expected_source,
         "{response}"
+    );
+    daemon.kill_and_wait();
+    let mut stderr = String::new();
+    std::io::Read::read_to_string(&mut daemon.child.stderr.take().unwrap(), &mut stderr).unwrap();
+    assert!(
+        stderr.contains(&format!(
+            "module '{MODULE_ID}': launch_nonce_env is deprecated and ignored"
+        )),
+        "missing module-named deprecation warning: {stderr}"
     );
 }
 

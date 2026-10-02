@@ -78,13 +78,12 @@ async fn spawn_registers_stub_and_reports_running() {
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn launch_nonce_env_false_still_registers_reserved_child_from_pipe() {
+async fn reserved_child_registers_from_pipe_without_environment_nonce() {
     let server = TestServer::start().await;
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
     let module_id = "fake-aft-nonce-pipe-only";
     let mut spec = stub_spec(&server, module_id, std::iter::empty::<(&str, &str)>());
     spec.reserved = true;
-    spec.launch_nonce_env = false;
     for name in ["XDG_DATA_HOME", "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME"] {
         spec.env.push((
             name.to_string(),
@@ -244,7 +243,6 @@ async fn failed_spawn_during_enable_allows_a_later_retry() {
     let module = supervisor
         .supervise_configured(
             ModuleSpec {
-                launch_nonce_env: true,
                 module_id: "missing-enable-program".to_string(),
                 program: missing_program,
                 args: Vec::new(),
@@ -805,7 +803,6 @@ fn stub_spec<'a>(
     );
 
     ModuleSpec {
-        launch_nonce_env: true,
         module_id: module_id.to_string(),
         program: PathBuf::from(env!("CARGO_BIN_EXE_fake-aft-stub")),
         args: Vec::new(),
@@ -846,7 +843,6 @@ async fn a_dead_module_leaves_its_stderr_readable_from_the_supervisor() {
     let supervisor = supervisor(&server, 0, Duration::from_millis(10));
     let module = supervisor
         .spawn(ModuleSpec {
-            launch_nonce_env: true,
             module_id: "stderr-tail-crasher".to_string(),
             program: PathBuf::from(env!("CARGO_BIN_EXE_fake-aft-stub")),
             args: Vec::new(),
@@ -910,7 +906,6 @@ async fn a_silent_module_reports_captured_and_empty_rather_than_uncaptured() {
     let supervisor = supervisor(&server, 0, Duration::from_millis(10));
     let module = supervisor
         .spawn(ModuleSpec {
-            launch_nonce_env: true,
             module_id: "stderr-tail-silent".to_string(),
             program: PathBuf::from(env!("CARGO_BIN_EXE_fake-aft-stub")),
             args: Vec::new(),
@@ -983,7 +978,6 @@ async fn a_supervised_module_inherits_the_parent_environment() {
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
     let module = supervisor
         .spawn(ModuleSpec {
-            launch_nonce_env: true,
             module_id: "env-inherit-probe".to_string(),
             program: PathBuf::from(env!("CARGO_BIN_EXE_fake-aft-stub")),
             args: Vec::new(),
@@ -1032,7 +1026,6 @@ async fn stderr_from_before_a_restart_survives_with_a_marked_boundary() {
     let supervisor = supervisor(&server, 3, Duration::from_millis(10));
     let module = supervisor
         .spawn(ModuleSpec {
-            launch_nonce_env: true,
             module_id: "stderr-tail-looper".to_string(),
             program: PathBuf::from(env!("CARGO_BIN_EXE_fake-aft-stub")),
             args: Vec::new(),
@@ -1106,7 +1099,6 @@ async fn a_held_stderr_pipe_marks_the_tail_incomplete_and_its_late_output_stays_
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
     let module = supervisor
         .spawn(ModuleSpec {
-            launch_nonce_env: true,
             module_id: "stderr-tail-wedged-pump".to_string(),
             program: PathBuf::from(env!("CARGO_BIN_EXE_fake-aft-stub")),
             args: Vec::new(),
@@ -1197,7 +1189,6 @@ async fn child_stdout_and_stderr_reach_the_capture_file_while_only_stderr_reache
         supervisor(&server, 0, Duration::from_millis(10)).with_capture_logs_dir(&logs_dir);
     let module = supervisor
         .spawn(ModuleSpec {
-            launch_nonce_env: true,
             module_id: "two-pipe-capture".to_string(),
             program: PathBuf::from(env!("CARGO_BIN_EXE_log-child-fixture")),
             args: Vec::new(),
@@ -1280,7 +1271,6 @@ async fn concurrent_child_pipes_never_tear_a_line_in_the_capture_file() {
         supervisor(&server, 0, Duration::from_millis(10)).with_capture_logs_dir(&logs_dir);
     let module = supervisor
         .spawn(ModuleSpec {
-            launch_nonce_env: true,
             module_id: "two-pipe-burst".to_string(),
             program: PathBuf::from(env!("CARGO_BIN_EXE_log-child-fixture")),
             args: Vec::new(),

@@ -3732,10 +3732,9 @@ impl ControlHandler {
                 image,
             ));
             modules.push(SupervisorEntry {
-                launch_nonce_env: Some(
-                    configured.protocol != subc_control::ModuleProtocol::None
-                        && (!cfg!(unix) || configured.launch_nonce_env),
-                ),
+                // Keep the retired policy field on the wire for one release so
+                // existing status consumers still receive the platform policy.
+                launch_nonce_env: Some(!cfg!(unix)),
                 module_id: status.module_id,
                 state: status.state.to_string(),
                 enabled: status.enabled,
@@ -6713,7 +6712,6 @@ mod tests {
         let source_line = format!("config error: {}", "x".repeat(DEFAULT_MAX_LINE_BYTES));
         let module = supervisor
             .spawn(ModuleSpec {
-                launch_nonce_env: true,
                 module_id: "stderr-tail-wire".to_string(),
                 program: fake_aft_stub_path(),
                 args: Vec::new(),
@@ -6823,7 +6821,6 @@ mod tests {
                 .with_terminal_journal(journal_path.clone(), "off-worker-daemon".to_string());
         let module = supervisor
             .spawn(ModuleSpec {
-                launch_nonce_env: true,
                 module_id: "terminal-off-worker".to_string(),
                 program: fake_aft_stub_path(),
                 args: Vec::new(),
@@ -6895,7 +6892,6 @@ mod tests {
                 .with_handle(supervisor_handle.clone());
         let module = supervisor
             .spawn(ModuleSpec {
-                launch_nonce_env: true,
                 module_id: "terminal-golden".to_string(),
                 program: fake_aft_stub_path(),
                 args: Vec::new(),
@@ -9321,7 +9317,6 @@ mod tests {
         let module = supervisor
             .supervise_configured(
                 ModuleSpec {
-                    launch_nonce_env: true,
                     module_id: "warming".to_string(),
                     program: fake_aft_stub_path(),
                     args: Vec::new(),
@@ -9477,7 +9472,6 @@ mod tests {
         let module = supervisor
             .supervise_configured(
                 ModuleSpec {
-                    launch_nonce_env: true,
                     module_id: "warming".to_string(),
                     program: fake_aft_stub_path(),
                     args: Vec::new(),
@@ -9565,7 +9559,6 @@ mod tests {
         let module = supervisor
             .supervise_configured(
                 ModuleSpec {
-                    launch_nonce_env: true,
                     module_id: module_id.to_string(),
                     program: fake_aft_stub_path(),
                     args: Vec::new(),
@@ -9842,7 +9835,6 @@ mod tests {
         let module = supervisor
             .supervise_configured(
                 ModuleSpec {
-                    launch_nonce_env: true,
                     module_id: "failed".to_string(),
                     program: missing_program,
                     args: Vec::new(),
@@ -9944,7 +9936,6 @@ mod tests {
         let module = supervisor
             .supervise_configured(
                 crate::ModuleSpec {
-                    launch_nonce_env: true,
                     module_id: "late-health-response".to_string(),
                     program: PathBuf::from("disabled-module"),
                     args: Vec::new(),
@@ -11859,7 +11850,6 @@ mod tests {
             supervisor
                 .supervise_configured(
                     ModuleSpec {
-                        launch_nonce_env: true,
                         module_id: OWNER.to_string(),
                         program: PathBuf::from("/nonexistent/prefrontal-core"),
                         args: Vec::new(),
@@ -12037,7 +12027,6 @@ mod tests {
             supervisor
                 .supervise_configured(
                     ModuleSpec {
-                        launch_nonce_env: true,
                         module_id: OWNER.to_string(),
                         program: PathBuf::from("/nonexistent/prefrontal-core"),
                         args: Vec::new(),

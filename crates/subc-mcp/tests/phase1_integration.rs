@@ -4282,7 +4282,6 @@ fn stub_spec(module_id: &str, events_path: &Path, extra_env: &[(&str, &str)]) ->
             .map(|(key, value)| ((*key).to_owned(), (*value).to_owned())),
     );
     ModuleSpec {
-        launch_nonce_env: true,
         module_id: module_id.to_owned(),
         program,
         args,
@@ -4300,7 +4299,6 @@ fn mcp_module_spec(
     xdg_config_home: &Path,
 ) -> ModuleSpec {
     ModuleSpec {
-        launch_nonce_env: true,
         module_id: module_id.to_owned(),
         program: PathBuf::from(env!("CARGO_BIN_EXE_ck-subc-mcp")),
         args: vec![

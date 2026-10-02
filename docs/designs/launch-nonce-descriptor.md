@@ -200,21 +200,19 @@ every wire module from step 2, so a module's own children inherit the variable:
 
 Readers first; the boundary exists only after the last step.
 
-Owners can rehearse withholding the environment copy one module at a time by setting
-`"launch_nonce_env": false` in that module's `subc.jsonc` entry. The default is `true`;
-there is no global default switch. On Unix the pipe and `SUBC_LAUNCH_NONCE_FD` remain,
-including for swap candidates, while `SUBC_LAUNCH_NONCE` is absent even if inherited or
-configured in `env`. Modules with `protocol: "none"` receive neither nonce variable.
-On Windows there is no pipe handover, so the environment copy stays enabled and config
-load warns that `false` is ignored.
+**Shipped in subc-daemon 0.28.0:** Unix supervised wire modules receive the nonce only
+through the pipe and `SUBC_LAUNCH_NONCE_FD`, including swap candidates.
+`SUBC_LAUNCH_NONCE` is absent even if inherited or configured in `env`. Windows
+continues to use the environment handoff because std cannot restrict pipe-handle
+inheritance to one child. Modules with `protocol: "none"` receive neither variable.
 
-The setting applies at the next spawn. `ck module rescan` compares it as part of the
-module's launch spec and reports the module as pending reload, just like other changed
-spawn-environment fields; it does not restart the current process. Restart or swap the
-module to exercise the new policy, and set the key back to `true` to restore the copy
-on a later spawn. `ck module status <id>` reports `launch_nonce_env` as the effective
-policy for the next spawn (always `false` for `protocol: "none"`, always `true` for wire
-modules on Windows), not a measurement of the already-running process's environment.
+The per-module `launch_nonce_env` switch has been removed. Unknown module keys
+were already ignored by the config reader; for one release this retired key also
+logs a deprecation warning naming the module, regardless of its value. Existing
+entries still load, but operators should remove the key. It cannot re-enable the
+Unix environment copy and no longer makes a module pending reload. The status
+wire field remains for one release, reporting `false` on Unix and `true` on
+Windows for compatibility; it is not a measurement of the running environment.
 
 **Roster.** The census covers every process the daemon spawns, read from the daemon's own spawn
 list (`subc.jsonc` and the live supervisor), never from a list written here. That includes
@@ -240,9 +238,12 @@ Until step 4, widening operations behave as they do today, and the note makes no
    what makes it not happen.
 5. The operator-authority rule goes into force.
 
-Step 4 is a daemon config switch first (`launch_nonce_env: false`), so it can be turned back on
-without a rebuild if a module was missed. Turning it back on voids the operator-authority claim:
-the rule is out of force until step 4 is redone, relaunch and final census included.
+Step 4's Unix producer removal shipped in subc-daemon 0.28.0 after the live census
+found all 20 wire modules reading `fd` (19 using the rehearsal switch and Wernicke
+stripping the copy in its launcher). There is no longer a config rollback switch.
+Deployment must still relaunch every module and repeat the final census before
+asserting the operator-authority rule; shipping the producer change alone does
+not establish that live boundary.
 
 ## 6. Tests
 

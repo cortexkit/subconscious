@@ -1925,7 +1925,8 @@ pub struct SupervisorEntry {
     /// what those daemons meant.
     #[serde(default)]
     pub protocol: ModuleProtocol,
-    /// Whether the module's next spawn includes SUBC_LAUNCH_NONCE in its environment.
+    /// Retained for one release for older status consumers: false on Unix, true
+    /// on Windows. Non-wire modules receive no nonce on either platform.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_nonce_env: Option<bool>,
     pub health: SupervisorHealthStatus,

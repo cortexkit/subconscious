@@ -7,7 +7,10 @@
 
 use std::{error::Error, fmt};
 
-use crate::{EnvelopeHeader, Flags, FrameType, MAX_FRAME_BODY_LEN, PROTOCOL_VERSION};
+use crate::{
+    decode_header, DecodeError, EnvelopeHeader, Flags, FrameType, MAX_FRAME_BODY_LEN,
+    PROTOCOL_VERSION,
+};
 
 /// A complete wire frame: the decoded envelope header plus its opaque body.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -18,6 +21,7 @@ pub struct Frame {
 
 impl Frame {
     /// Build a current-version frame, filling `len` from the opaque body bytes.
+    /// Refuses bodies above the size cap and headers a peer cannot decode.
     pub fn build(
         ty: FrameType,
         flags: Flags,
@@ -53,18 +57,19 @@ impl Frame {
         let len = u32::try_from(body.len()).map_err(|_| FrameBuildError::BodyTooLarge {
             body_len: body.len(),
         })?;
-        Ok(Self {
-            header: EnvelopeHeader {
-                len,
-                ver,
-                ty,
-                flags,
-                channel,
-                epoch,
-                corr,
-            },
-            body,
-        })
+        let header = EnvelopeHeader {
+            len,
+            ver,
+            ty,
+            flags,
+            channel,
+            epoch,
+            corr,
+        };
+        // Use the peer's decoder so construction cannot drift from wire rules
+        // for pure-header types, channel epochs, or flag combinations.
+        decode_header(&header.encode()).map_err(FrameBuildError::InvalidHeader)?;
+        Ok(Self { header, body })
     }
 
     /// Assemble a frame from an already-decoded header and its body bytes.
@@ -80,6 +85,8 @@ impl Frame {
 /// Why a frame could not be constructed or emitted coherently.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FrameBuildError {
+    /// The header violates a wire rule and a peer would refuse it.
+    InvalidHeader(DecodeError),
     /// The opaque body cannot be represented by the envelope's `u32` length.
     BodyTooLarge { body_len: usize },
     /// The opaque body exceeds the maximum frame body the wire allows; a peer's
@@ -90,6 +97,7 @@ pub enum FrameBuildError {
 impl fmt::Display for FrameBuildError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidHeader(error) => write!(f, "invalid frame header: {error}"),
             Self::BodyTooLarge { body_len } => {
                 write!(f, "frame body is too large for u32 len: {body_len} bytes")
             }
@@ -100,11 +108,41 @@ impl fmt::Display for FrameBuildError {
     }
 }
 
-impl Error for FrameBuildError {}
+impl Error for FrameBuildError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::InvalidHeader(error) => Some(error),
+            Self::BodyTooLarge { .. } | Self::BodyExceedsMax { .. } => None,
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn build_refuses_headers_that_peers_reject() {
+        let ordinary = Flags::new(false, crate::Priority::Interactive, false);
+        let sheddable = ordinary.with_admission_class(crate::AdmissionClass::Sheddable);
+        for (ty, flags, channel, epoch, body) in [
+            (FrameType::Ping, ordinary, 0, 0, vec![1]),
+            (FrameType::Pong, ordinary, 0, 0, vec![1]),
+            (FrameType::Cancel, ordinary, 1, 1, vec![1]),
+            (FrameType::Goodbye, ordinary, 0, 0, vec![1]),
+            (FrameType::Request, ordinary, 0, 1, vec![]),
+            (FrameType::Request, sheddable, 1, 1, vec![]),
+        ] {
+            assert!(
+                Frame::build(ty, flags, channel, epoch, 0, body).is_err(),
+                "{ty:?} channel={channel} epoch={epoch} flags={flags:?}"
+            );
+        }
+        for ty in [FrameType::Push, FrameType::StreamData] {
+            let frame = Frame::build(ty, sheddable, 1, 1, 0, vec![1]).unwrap();
+            assert!(crate::decode_header(&frame.header.encode()).is_ok());
+        }
+    }
 
     #[test]
     fn build_rejects_body_over_max_frame_len() {

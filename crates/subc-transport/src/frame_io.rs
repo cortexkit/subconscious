@@ -89,8 +89,9 @@ where
 /// Write one complete frame to an async stream.
 ///
 /// The header's `len` must match the opaque body length; mismatches are reported
-/// as a typed error rather than silently rewriting the header. This function does
-/// not flush buffered writers; callers choose their own flush cadence.
+/// as a typed error rather than silently rewriting the header. Header decode
+/// rules and the body-size cap are checked before emitting bytes. This function
+/// does not flush buffered writers; callers choose their own flush cadence.
 ///
 /// HEADER AND BODY GO OUT AS ONE WRITE. Writing them separately looks harmless
 /// behind a `BufWriter` and is not: `BufWriter` passes any write at or above its
@@ -114,7 +115,16 @@ where
         });
     }
 
+    if frame.header.len > MAX_FRAME_BODY_LEN {
+        return Err(FrameIoError::BodyTooLarge {
+            len: frame.header.len,
+            max: MAX_FRAME_BODY_LEN,
+        });
+    }
     let header = frame.header.encode();
+    // Frame fields are public, so callers can bypass the constructor. Validate
+    // before the first write to avoid poisoning an otherwise healthy stream.
+    decode_header(&header).map_err(FrameIoError::DecodeHeader)?;
     if frame.body.is_empty() {
         return writer.write_all(&header).await.map_err(FrameIoError::Io);
     }
@@ -241,6 +251,42 @@ mod tests {
             body.to_vec(),
         )
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn writer_refuses_invalid_public_frames_before_emitting_bytes() {
+        let valid = test_frame(1, 1, b"x");
+        let mut pure = valid.clone();
+        pure.header.ty = FrameType::Ping;
+        let mut control = valid.clone();
+        control.header.channel = 0;
+        let mut sheddable = valid.clone();
+        sheddable.header.flags = sheddable
+            .header
+            .flags
+            .with_admission_class(subc_protocol::AdmissionClass::Sheddable);
+        for invalid in [pure, control, sheddable] {
+            let mut writer = WriteCounter::default();
+            assert!(
+                write_frame(&mut writer, &invalid).await.is_err(),
+                "{:?}",
+                invalid.header
+            );
+            assert!(writer.bytes.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn writer_refuses_oversized_public_frames_before_emitting_bytes() {
+        let mut frame = test_frame(1, 1, b"");
+        frame.body = vec![0; MAX_FRAME_BODY_LEN as usize + 1];
+        frame.header.len = MAX_FRAME_BODY_LEN + 1;
+        let mut writer = WriteCounter::default();
+        assert!(matches!(
+            write_frame(&mut writer, &frame).await,
+            Err(FrameIoError::BodyTooLarge { .. })
+        ));
+        assert!(writer.bytes.is_empty());
     }
 
     /// Counts `poll_write` calls and records what each one carried, which is the

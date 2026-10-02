@@ -2,6 +2,8 @@
 
 ## 0.28.1
 
+- Validate frame headers with the wire decoder at construction, refusing pure-header bodies, invalid channel epochs and illegal flag combinations locally rather than disconnecting a peer.
+
 - Refuse unknown fields inside scope principals, including parent owners, child owners, carriers, and selectors, as required for authority-bearing scope input. Principal decoding outside scopes remains forward-compatible.
 
 ## 0.28.0 — 2026-10-01

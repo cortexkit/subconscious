@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.1
+
+- Validate public frames before writing any bytes, including the body-size cap and all header decode rules.
+- Refuse Unix connection-file ancestors owned by users other than the effective user or root, even when their mode is not group/world writable.
+- Read Unix connection files only when owned by the effective user, checking metadata on the same opened file that supplies the key.
+
 ## 0.9.0 — 2026-10-01
 
 - Minor bump because this crate's public types come from `subc-protocol`, which moves to 0.28.0 (its `ToolCallRequest` gains an `origin` field; see that crate's changelog). A consumer that also depends on `subc-protocol` directly must move both together, or two incompatible copies of the protocol types would meet. No other change.

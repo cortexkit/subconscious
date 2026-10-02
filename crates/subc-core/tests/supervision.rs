@@ -78,6 +78,91 @@ async fn spawn_registers_stub_and_reports_running() {
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn health_restart_evicts_registration_held_by_inherited_socket() {
+    struct HolderGuard(u32);
+    impl Drop for HolderGuard {
+        fn drop(&mut self) {
+            if let Some(pid) = i32::try_from(self.0)
+                .ok()
+                .and_then(rustix::process::Pid::from_raw)
+            {
+                let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+            }
+        }
+    }
+    let server = TestServer::start().await;
+    let supervisor = supervisor(&server, 3, Duration::from_millis(10))
+        .with_forwarding(Arc::clone(&server.forwarding))
+        .with_health_config(subc_daemon::HealthConfig {
+            cadence: Duration::from_millis(50),
+            deadline: Duration::from_millis(50),
+            failure_threshold: 1,
+            ..Default::default()
+        });
+    let holder_path = server.temp_dir.join("socket-holder-pid");
+    let health_path = server.temp_dir.join("unanswered-health-first");
+    let module_id = "fake-aft-inherited-socket";
+    let module = spawn_stub_with_env(
+        &server,
+        &supervisor,
+        module_id,
+        [
+            (
+                "FAKE_AFT_SOCKET_HOLDER_FIRST_PATH",
+                holder_path.to_str().unwrap(),
+            ),
+            ("FAKE_AFT_ADVERTISE_HEALTH", "1"),
+            (
+                "FAKE_AFT_HEALTH_NEVER_REPLY_FIRST_PATH",
+                health_path.to_str().unwrap(),
+            ),
+        ],
+    )
+    .await;
+    let holder = HolderGuard(
+        std::fs::read_to_string(&holder_path)
+            .unwrap()
+            .parse()
+            .unwrap(),
+    );
+    let first = module.status().unwrap();
+    let old_connection = server
+        .registry
+        .get_module(module_id)
+        .unwrap()
+        .unwrap()
+        .connection_id;
+    // Verify the failure scenario rather than merely a slow restart:
+    // the direct child is reaped while its inherited socket is still registered.
+    wait_for_status(&module, Duration::from_secs(3), |status| {
+        !status.process_alive
+            && status.state == ModuleState::Restarting
+            && status.registration_active
+    })
+    .await;
+    let holder_pid = rustix::process::Pid::from_raw(i32::try_from(holder.0).unwrap()).unwrap();
+    rustix::process::test_kill_process(holder_pid).unwrap();
+    let recovered = wait_for_status(&module, Duration::from_secs(6), |status| {
+        status.state == ModuleState::Running
+            && status.live
+            && status.spawn_generation > first.spawn_generation
+    })
+    .await;
+    assert_ne!(recovered.pid, first.pid);
+    assert_ne!(
+        server
+            .registry
+            .get_module(module_id)
+            .unwrap()
+            .unwrap()
+            .connection_id,
+        old_connection
+    );
+    module.stop().await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reserved_child_registers_from_pipe_without_environment_nonce() {
     let server = TestServer::start().await;
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
@@ -770,7 +855,7 @@ async fn spawn_stub_with_env<'a>(
 }
 
 fn stub_spec<'a>(
-    _server: &TestServer,
+    server: &TestServer,
     module_id: &str,
     extra_env: impl IntoIterator<Item = (&'a str, &'a str)>,
 ) -> ModuleSpec {
@@ -796,6 +881,12 @@ fn stub_spec<'a>(
          one; pick a different id"
     );
     let mut env = vec![("FAKE_AFT_MODULE_ID".to_string(), module_id.to_string())];
+    for name in ["XDG_DATA_HOME", "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME"] {
+        env.push((
+            name.to_string(),
+            server.temp_dir.join(name).display().to_string(),
+        ));
+    }
     env.extend(
         extra_env
             .into_iter()

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.29.2 — 2026-10-02
+
+- Close registrations whose sockets outlive a reaped supervised process before restarting. Failed release attempts leave an operator-revivable state; start also revives Restarting modules with no child or scheduled respawn.
+
 ## 0.29.1 — 2026-10-02
 
 - Linux module teardown atomically kills the contained process tree with `cgroup.kill` after waiting for graceful module shutdown. If cgroup delegation or kernel support is unavailable, teardown kills only the direct child as before. I/O failures produce a warning but do not change the teardown result.

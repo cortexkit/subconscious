@@ -238,6 +238,14 @@ public func decodeHeader(_ bytes: Data) throws -> EnvelopeHeader {
 }
 
 /// Encode a frame to wire bytes: 21-byte header followed by `len` body bytes.
+///
+/// Refuses, before producing any bytes, a frame the peer's decoder would
+/// reject: a body over `MAX_FRAME_BODY_LEN` (`FrameEncodeError.bodyTooLarge`)
+/// or a header that fails any wire decode rule (the matching `DecodeError`).
+/// Once a rejected header is on the socket the peer tears the whole connection
+/// down, so the refusal has to happen here rather than on the far side. The
+/// header check runs the encoded bytes through `decodeHeader` itself, so the
+/// writer cannot drift from the reader's rules.
 public func encodeFrame(
     ty: FrameType,
     flags: UInt8,
@@ -262,6 +270,7 @@ public func encodeFrame(
         corr: corr
     )
     var output = encodeHeader(header)
+    _ = try decodeHeader(output)
     output.append(body)
     return output
 }

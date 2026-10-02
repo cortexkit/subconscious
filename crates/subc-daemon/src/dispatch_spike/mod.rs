@@ -63,6 +63,7 @@ pub(crate) enum SlotState {
 struct Slot {
     frame: Frame,
     state: SlotState,
+    ticket: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,8 +115,9 @@ pub(crate) struct SyntheticTerminal {
 #[derive(Debug)]
 pub(crate) struct RouteInbox {
     admission: Admission,
-    queue: VecDeque<u64>,
+    queue: VecDeque<(u64, u64)>,
     slots: HashMap<u64, Slot>,
+    next_ticket: u64,
     depth_cap: usize,
     teardown: TeardownKind,
 }
@@ -126,6 +128,7 @@ impl RouteInbox {
             admission: Admission::Open,
             queue: VecDeque::new(),
             slots: HashMap::new(),
+            next_ticket: 0,
             depth_cap,
             teardown: TeardownKind::None,
         }
@@ -141,27 +144,34 @@ impl RouteInbox {
         if self.slots.len() >= self.depth_cap {
             return PushOutcome::Backpressure;
         }
+        // A queued entry names one request incarnation, not just its reusable
+        // correlation id. Never wrap the ticket and alias an old tombstone.
+        let Some(ticket) = self.next_ticket.checked_add(1) else {
+            return PushOutcome::Backpressure;
+        };
+        self.next_ticket = ticket;
 
         self.slots.insert(
             corr,
             Slot {
                 frame,
                 state: SlotState::Queued,
+                ticket,
             },
         );
-        self.queue.push_back(corr);
+        self.queue.push_back((corr, ticket));
         PushOutcome::Admitted
     }
 
     /// Atomically removes the FIFO head and marks it Sending under the same lock.
     pub(crate) fn pop_for_dispatch(&mut self) -> Option<u64> {
-        let corr = self.queue.pop_front()?;
+        let (corr, ticket) = self.queue.pop_front()?;
         let Some(slot) = self.slots.get_mut(&corr) else {
             // A queued cancellation leaves one O(1) tombstone. The drain discards at most
             // one tombstone per call instead of scanning or indexing a missing slot.
             return None;
         };
-        if slot.state != SlotState::Queued {
+        if slot.ticket != ticket || slot.state != SlotState::Queued {
             return None;
         }
         slot.state = SlotState::Sending { cancelled: false };
@@ -236,11 +246,12 @@ impl RouteInbox {
     pub(crate) fn finish_closed(&mut self) -> Vec<u64> {
         self.admission = Admission::Closed;
         let mut queued = Vec::new();
-        while let Some(corr) = self.queue.pop_front() {
-            if matches!(
-                self.slots.get(&corr).map(|slot| slot.state),
-                Some(SlotState::Queued)
-            ) {
+        while let Some((corr, ticket)) = self.queue.pop_front() {
+            if self
+                .slots
+                .get(&corr)
+                .is_some_and(|slot| slot.ticket == ticket && slot.state == SlotState::Queued)
+            {
                 self.slots.remove(&corr);
                 queued.push(corr);
             }

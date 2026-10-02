@@ -6,6 +6,7 @@
 - Serialize module registration and client-route reservation admission, refusing mixed roles with terminal `invalid_hello` or `invalid_request` rather than allowing unusable, leaked routes.
 - Settle late accepted route binds during daemon drain with `module_reloading`, releasing both reserved channels and preserving the shared module connection for ordered shutdown.
 - Repair `bench-harness` sink receivers to consume accounting-bearing `OutboundFrame` values, restoring feature compilation.
+- Preserve FIFO order when the test-only dispatch spike reuses a cancelled correlation id by fencing queued entries with request-incarnation tickets.
 
 ## 0.29.1 — 2026-10-02
 

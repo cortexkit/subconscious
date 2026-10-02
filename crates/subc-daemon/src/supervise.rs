@@ -778,12 +778,20 @@ struct SupervisorSnapshot {
     /// when a live PID is accepted below.
     spawn_generation: u64,
     pid: Option<u32>,
+    /// Last reaped child, retained after current process facts are cleared.
+    reaped_pid: Option<u32>,
+    /// Whether the command-serving supervision loop has a scheduled respawn.
+    respawn_pending: bool,
+    /// A second restart is waiting for the replacement already scheduled.
+    coalesced_restart_pending: bool,
     spawned_at_ms: Option<u64>,
     spawned_from: Option<PathBuf>,
     spawned_file_identity: Option<SpawnedFileIdentity>,
     process_start_time: Option<u64>,
     deliberate_severance: Option<ProcessIdentity>,
     last_exit: Option<ExitReport>,
+    /// Diagnostic attached to the next drain's terminal record, if any.
+    drain_disposition_detail: Option<String>,
     health: ModuleHealthStatus,
     /// Whether the current process was started as a swap candidate and so
     /// lives in the module's alternate cgroup. The next swap's candidate takes
@@ -882,12 +890,16 @@ impl SupervisorSnapshot {
             lifetime_restarts: 0,
             spawn_generation: 0,
             pid: None,
+            reaped_pid: None,
+            respawn_pending: false,
+            coalesced_restart_pending: false,
             spawned_at_ms: None,
             spawned_from: None,
             spawned_file_identity: None,
             process_start_time: None,
             deliberate_severance: None,
             last_exit: None,
+            drain_disposition_detail: None,
             health: ModuleHealthStatus::default(),
             in_alternate_slot: false,
             draining_to_replace: false,
@@ -1367,8 +1379,33 @@ impl ModuleProcessLiveness for SupervisorProcessLiveness {
     }
 }
 
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct ReloadExitRecordGate {
+    reached: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RespawnKind {
+    Spawn,
+    Reload,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PendingRespawn {
+    deadline: Instant,
+    kind: RespawnKind,
+}
+
+type ReloadReply = oneshot::Sender<Result<(), SuperviseError>>;
+
 #[derive(Debug, Clone)]
 struct SupervisorRuntimeConfig {
+    /// Restart operations hand their backoff to the loop, which keeps serving commands.
+    scheduled_respawn: Arc<Mutex<Option<PendingRespawn>>>,
+    /// A reload acknowledges completion only after its replacement registers.
+    deferred_reload_reply: Arc<Mutex<Option<ReloadReply>>>,
     restart_policy: RestartPolicy,
     /// This module's RESOLVED drain budget: per-module config when present,
     /// else `default_drain_timeout`.
@@ -1400,6 +1437,8 @@ struct SupervisorRuntimeConfig {
     cgroup_placement: Option<subc_cgroup::Placement>,
     #[cfg(test)]
     test_seed_stale_facts_before_enable_spawn: bool,
+    #[cfg(test)]
+    test_reload_exit_record_gate: Option<Arc<ReloadExitRecordGate>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2502,6 +2541,8 @@ impl Supervisor {
     fn runtime_config(&self) -> SupervisorRuntimeConfig {
         let effective_drain_timeout = Arc::new(Mutex::new(self.drain_timeout));
         SupervisorRuntimeConfig {
+            scheduled_respawn: Arc::default(),
+            deferred_reload_reply: Arc::default(),
             restart_policy: self.restart_policy,
             drain_timeout: self.drain_timeout,
             // Shared with this module's roster copy: daemon shutdown waits on
@@ -2531,6 +2572,8 @@ impl Supervisor {
             cgroup_placement: self.cgroup_placement.clone(),
             #[cfg(test)]
             test_seed_stale_facts_before_enable_spawn: false,
+            #[cfg(test)]
+            test_reload_exit_record_gate: None,
         }
     }
 
@@ -4312,36 +4355,41 @@ async fn health_restart_child(
     }
 
     if schedule.is_none() {
-        record_health_action(snapshot, &spec.module_id, "disabled".to_string(), now_ms);
+        record_health_action(snapshot, &spec.module_id, "failed".to_string(), now_ms);
         error!(
             module_id = %spec.module_id,
             status = ?status,
             detail,
             max_restarts = runtime.restart_policy.max_restarts,
             window_secs = runtime.restart_policy.window.as_secs(),
-            "health restart budget exhausted; disabling module"
+            reason = %runtime.restart_policy.budget_exhausted_detail(),
+            "health restart budget exhausted; marking module failed"
         );
         let stop_notice = begin_forwarding_drain_if_configured(
             spec,
             runtime,
             registry,
             snapshot,
-            Some(false),
+            Some(true),
             RouteCloseReason::Disable,
         )
         .await?;
+        update_snapshot(snapshot, Some(&spec.module_id), |state| {
+            state.drain_disposition_detail = Some(runtime.restart_policy.budget_exhausted_detail());
+        })?;
         drain_optional_child(
             &spec.module_id,
             spec.protocol,
             stop_notice,
             registry,
+            runtime.forwarding.as_deref(),
             snapshot,
             &runtime.terminal_ring,
             &runtime.spawn_events,
             child,
             runtime.drain_timeout,
-            ModuleState::Disabled,
-            Some(false),
+            ModuleState::Failed,
+            Some(true),
         )
         .await?;
         process_liveness.untrack_if_current(&spec.module_id, snapshot);
@@ -4381,6 +4429,7 @@ async fn health_restart_child(
         spec.protocol,
         stop_notice,
         registry,
+        runtime.forwarding.as_deref(),
         snapshot,
         &runtime.terminal_ring,
         &runtime.spawn_events,
@@ -4390,27 +4439,48 @@ async fn health_restart_child(
         Some(true),
     )
     .await?;
-    sleep(schedule.delay).await;
-    // The backoff may have outlasted the restart it was counting down to: an
-    // operator disable or drain in between moves the snapshot out of
-    // `Restarting`, and that stop must win over this respawn.
-    if !respawn_still_pending(snapshot) {
-        process_liveness.untrack_if_current(&spec.module_id, snapshot);
-        return Ok(());
+    schedule_respawn(
+        runtime,
+        snapshot,
+        &spec.module_id,
+        schedule.delay,
+        RespawnKind::Spawn,
+    )
+}
+
+fn cancel_deferred_reload(runtime: &SupervisorRuntimeConfig, module_id: &str, reason: &str) {
+    if let Some(reply) = runtime
+        .deferred_reload_reply
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .take()
+    {
+        let _ = reply.send(Err(SuperviseError::ReloadFailed {
+            module_id: module_id.to_string(),
+            reason: reason.to_string(),
+        }));
     }
-    process_liveness.track(spec.module_id.clone(), Arc::clone(snapshot));
-    match spawn_and_mark_running(spec, runtime, snapshot) {
-        Ok(next_child) => {
-            *child = Some(next_child);
-            Ok(())
-        }
-        Err(err) => {
-            fail_snapshot(snapshot, Some(&spec.module_id), None);
-            process_liveness.untrack_if_current(&spec.module_id, snapshot);
-            *child = None;
-            Err(err)
-        }
-    }
+}
+
+fn schedule_respawn(
+    runtime: &SupervisorRuntimeConfig,
+    snapshot: &SharedSnapshot,
+    module_id: &str,
+    delay: Duration,
+    kind: RespawnKind,
+) -> Result<(), SuperviseError> {
+    cancel_deferred_reload(runtime, module_id, "respawn superseded by another restart");
+    update_snapshot(snapshot, Some(module_id), |state| {
+        state.respawn_pending = true
+    })?;
+    *runtime
+        .scheduled_respawn
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = Some(PendingRespawn {
+        deadline: Instant::now() + delay,
+        kind,
+    });
+    Ok(())
 }
 
 fn record_health_action(snapshot: &SharedSnapshot, module_id: &str, action: String, now_ms: u64) {
@@ -4588,6 +4658,59 @@ mod tests {
         assert!(matches!(result, Err(SuperviseError::Spawn { .. })));
         assert_eq!(lock_snapshot(&snapshot).unwrap().state, ModuleState::Failed);
         assert_snapshot_process_facts_cleared(&snapshot);
+    }
+
+    #[tokio::test]
+    async fn start_revives_stranded_restarting_but_not_pending_backoff() {
+        let supervisor = Supervisor::default();
+        let runtime = supervisor.runtime_config();
+        let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::new(
+            ModuleState::Restarting,
+            true,
+        )));
+        let spec = ModuleSpec {
+            module_id: "start-stranded-restarting".to_string(),
+            program: super::terminal_history_tests::fake_aft_stub_path(),
+            args: Vec::new(),
+            env: vec![("FAKE_AFT_NEVER_CONNECT".to_string(), "1".to_string())],
+            reserved: false,
+            reserved_prefixes: Vec::new(),
+            protocol: ModuleProtocol::None,
+            overlap: Default::default(),
+        };
+        let mut child = None;
+        lock_snapshot(&snapshot).unwrap().respawn_pending = true;
+        assert!(!super::set_child_enabled(
+            &spec,
+            &runtime,
+            &Registry::default(),
+            &supervisor.process_liveness,
+            &snapshot,
+            &mut child,
+            true
+        )
+        .await
+        .unwrap());
+        assert!(child.is_none());
+        lock_snapshot(&snapshot).unwrap().respawn_pending = false;
+        assert!(super::set_child_enabled(
+            &spec,
+            &runtime,
+            &Registry::default(),
+            &supervisor.process_liveness,
+            &snapshot,
+            &mut child,
+            true
+        )
+        .await
+        .unwrap());
+        assert_eq!(
+            lock_snapshot(&snapshot).unwrap().state,
+            ModuleState::Running
+        );
+        let mut child = child.unwrap();
+        child.start_kill().unwrap();
+        child.wait().await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -5121,14 +5244,53 @@ async fn supervise_loop(
     mut commands: mpsc::Receiver<SupervisorCommand>,
 ) {
     let mut health_probe = HealthProbeRuntime::default();
-    // Deadline of the crash respawn whose backoff is currently elapsing. While
-    // it is set the loop serves commands instead of sleeping inside the exit
-    // arm, so a disable or drain lands immediately and cancels the respawn.
-    let mut pending_respawn: Option<Instant> = None;
+    // All restart backoffs run here, including health and operator requests.
+    // While one is pending the loop serves commands, so disable or drain can
+    // cancel the replacement without spawning a process just to stop it.
+    let mut pending_respawn: Option<PendingRespawn> = None;
     // Commands a swap handed back to run next (see `swap::SwapEnd`). Served
     // before anything else so a stop that interrupted a swap runs at once.
     let mut requeued: VecDeque<SupervisorCommand> = VecDeque::new();
     loop {
+        if let Some(scheduled) = runtime
+            .scheduled_respawn
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+        {
+            pending_respawn = Some(scheduled);
+        }
+        if pending_respawn.is_some() && (child.is_some() || !respawn_still_pending(&snapshot)) {
+            pending_respawn = None;
+            cancel_deferred_reload(
+                &runtime,
+                &spec.module_id,
+                "respawn cancelled by a supervisor command",
+            );
+        }
+        if child.is_none() && pending_respawn.is_none() {
+            cancel_deferred_reload(
+                &runtime,
+                &spec.module_id,
+                "respawn cancelled before a replacement was spawned",
+            );
+            let _ = update_snapshot(&snapshot, Some(&spec.module_id), |state| {
+                state.respawn_pending = false;
+                state.coalesced_restart_pending = false;
+                if matches!(
+                    state.state,
+                    ModuleState::Restarting
+                        | ModuleState::Starting
+                        | ModuleState::Draining
+                        | ModuleState::Unresponsive
+                ) {
+                    error!(module_id = %spec.module_id, state = ?state.state,
+                        "supervision operation ended without a child or pending respawn; marking failed so start can retry");
+                    state.state = ModuleState::Failed;
+                    clear_current_process_facts(state);
+                }
+            });
+        }
         if let Some(command) = requeued.pop_front() {
             if !handle_supervisor_command(
                 command,
@@ -5147,6 +5309,9 @@ async fn supervise_loop(
             }
             if child.is_some() || !respawn_still_pending(&snapshot) {
                 pending_respawn = None;
+                let _ = update_snapshot(&snapshot, Some(&spec.module_id), |state| {
+                    state.respawn_pending = false
+                });
             }
             continue;
         }
@@ -5229,7 +5394,8 @@ async fn supervise_loop(
                             // arrives during the backoff must cancel the pending
                             // respawn instead of waiting for it to spawn first.
                             child = None;
-                            pending_respawn = Some(Instant::now() + delay);
+                            pending_respawn = Some(PendingRespawn { deadline: Instant::now() + delay, kind: RespawnKind::Spawn });
+                             let _ = update_snapshot(&snapshot, Some(&spec.module_id), |state| state.respawn_pending = true);
                         }
                     }
                 }
@@ -5267,10 +5433,11 @@ async fn supervise_loop(
                     }
                 }
             }
-        } else if let Some(deadline) = pending_respawn {
+        } else if let Some(pending) = pending_respawn {
             tokio::select! {
-                _ = sleep_until(deadline) => {
+                _ = sleep_until(pending.deadline) => {
                     pending_respawn = None;
+                let _ = update_snapshot(&snapshot, Some(&spec.module_id), |state| state.respawn_pending = false);
                     // A command handled below while the backoff elapsed may
                     // have stopped the module; never respawn past an operator's
                     // disable or drain.
@@ -5288,16 +5455,24 @@ async fn supervise_loop(
                         debug!(module_id = %spec.module_id, "crash respawn cancelled by daemon shutdown");
                         continue;
                     }
-                    if let Err(err) = wait_for_registration_release(
+                    if let Err(err) = release_dead_registration(
                         &registry,
+                        runtime.forwarding.as_deref(),
+                        &snapshot,
                         &spec.module_id,
-                        REGISTRY_RELEASE_TIMEOUT,
                     ).await {
                         fail_snapshot(&snapshot, Some(&spec.module_id), None);
                         error!(module_id = %spec.module_id, error = %err, "registration did not release before restart");
                         continue;
                     }
 
+                    if matches!(pending.kind, RespawnKind::Reload) {
+                        let reply = runtime.deferred_reload_reply.lock().unwrap_or_else(|p| p.into_inner()).take();
+                        let result = finish_reload_child(&spec, &runtime, &registry, &process_liveness, &snapshot, &mut child).await;
+                        if let Some(reply) = reply { let _ = reply.send(result); }
+                        continue;
+                    }
+                    process_liveness.track(spec.module_id.clone(), Arc::clone(&snapshot));
                     match spawn_and_mark_running(&spec, &runtime, &snapshot) {
                         Ok(next_child) => {
                             child = Some(next_child);
@@ -5328,11 +5503,12 @@ async fn supervise_loop(
                         return;
                     }
                     // Reconcile the pending respawn with what the command did:
-                    // a restart or reload has already spawned a fresh child,
+                    // a start may already have spawned a fresh child,
                     // while a disable or drain moved the snapshot out of the
                     // state the respawn was counting down from.
                     if child.is_some() || !respawn_still_pending(&snapshot) {
                         pending_respawn = None;
+                let _ = update_snapshot(&snapshot, Some(&spec.module_id), |state| state.respawn_pending = false);
                     }
                 }
             }
@@ -5410,6 +5586,7 @@ async fn handle_supervisor_command(
                 spec.protocol,
                 StopNotice::NotSent,
                 registry,
+                runtime.forwarding.as_deref(),
                 snapshot,
                 &runtime.terminal_ring,
                 &runtime.spawn_events,
@@ -5442,6 +5619,7 @@ async fn handle_supervisor_command(
                     spec.protocol,
                     stop_notice,
                     registry,
+                    runtime.forwarding.as_deref(),
                     snapshot,
                     &runtime.terminal_ring,
                     &runtime.spawn_events,
@@ -5513,7 +5691,18 @@ async fn handle_supervisor_command(
             } else {
                 None
             };
-            if let Some(generation) = satisfied_by_generation {
+            let satisfied_by_pending = initiated
+                && child.is_none()
+                && lock_snapshot(snapshot).ok().is_some_and(|mut state| {
+                    let pending = state.respawn_pending && !state.configuration_updated_since_spawn;
+                    if pending {
+                        state.coalesced_restart_pending = true;
+                    }
+                    pending
+                });
+            if satisfied_by_pending {
+                debug!(module_id = %spec.module_id, "restart coalesced into the pending replacement");
+            } else if let Some(generation) = satisfied_by_generation {
                 info!(
                     module_id = %spec.module_id,
                     received_at_generation,
@@ -5552,7 +5741,21 @@ async fn handle_supervisor_command(
         SupervisorCommand::Reload { reply } => {
             let result =
                 reload_child(spec, runtime, registry, process_liveness, snapshot, child).await;
-            let _ = reply.send(result);
+            if result.is_ok()
+                && runtime
+                    .scheduled_respawn
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .as_ref()
+                    .is_some_and(|pending| matches!(pending.kind, RespawnKind::Reload))
+            {
+                *runtime
+                    .deferred_reload_reply
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner()) = Some(reply);
+            } else {
+                let _ = reply.send(result);
+            }
             true
         }
         SupervisorCommand::SetEnabled { enabled, reply } => {
@@ -5655,6 +5858,7 @@ async fn restart_child(
             spec.protocol,
             stop_notice,
             registry,
+            runtime.forwarding.as_deref(),
             snapshot,
             &runtime.terminal_ring,
             &runtime.spawn_events,
@@ -5670,36 +5874,24 @@ async fn restart_child(
             state.state = ModuleState::Restarting;
             clear_current_process_facts(state);
         })?;
-        wait_for_registration_release(registry, &spec.module_id, REGISTRY_RELEASE_TIMEOUT).await?;
+        release_dead_registration(
+            registry,
+            runtime.forwarding.as_deref(),
+            snapshot,
+            &spec.module_id,
+        )
+        .await?;
     }
 
     reset_restart_count(snapshot, &spec.module_id)?;
-    sleep(runtime.restart_policy.backoff).await;
-    // A disable or drain that landed during the backoff cancels this respawn:
-    // the operator's stop must win over the restart the sleep counted down to.
-    if !respawn_still_pending(snapshot) {
-        process_liveness.untrack_if_current(&spec.module_id, snapshot);
-        return Ok(());
-    }
     process_liveness.track(spec.module_id.clone(), Arc::clone(snapshot));
-    // Mirror health_restart_child's spawn-failure handling: of the four
-    // spawn-failure sites this was the only one that propagated with the
-    // snapshot still reading `Restarting` -- neither running nor failed, and
-    // unrevivable by `set_enabled(true)` (issue #34). `Failed` is the state the
-    // operator can see and heal.
-    match spawn_and_mark_running(spec, runtime, snapshot) {
-        Ok(next_child) => {
-            *child = Some(next_child);
-            debug!(module_id = %spec.module_id, "supervised module restarted by operator request");
-            Ok(())
-        }
-        Err(err) => {
-            fail_snapshot(snapshot, Some(&spec.module_id), None);
-            process_liveness.untrack_if_current(&spec.module_id, snapshot);
-            *child = None;
-            Err(err)
-        }
-    }
+    schedule_respawn(
+        runtime,
+        snapshot,
+        &spec.module_id,
+        runtime.restart_policy.backoff,
+        RespawnKind::Spawn,
+    )
 }
 
 async fn reload_child(
@@ -5732,6 +5924,7 @@ async fn reload_child(
             spec.protocol,
             stop_notice,
             registry,
+            runtime.forwarding.as_deref(),
             snapshot,
             &runtime.terminal_ring,
             &runtime.spawn_events,
@@ -5747,17 +5940,34 @@ async fn reload_child(
             state.state = ModuleState::Restarting;
             clear_current_process_facts(state);
         })?;
-        wait_for_registration_release(registry, &spec.module_id, REGISTRY_RELEASE_TIMEOUT).await?;
+        release_dead_registration(
+            registry,
+            runtime.forwarding.as_deref(),
+            snapshot,
+            &spec.module_id,
+        )
+        .await?;
     }
 
     reset_restart_count(snapshot, &spec.module_id)?;
-    sleep(runtime.restart_policy.backoff).await;
-    // A disable or drain that landed during the backoff cancels this respawn:
-    // the operator's stop must win over the restart the sleep counted down to.
-    if !respawn_still_pending(snapshot) {
-        process_liveness.untrack_if_current(&spec.module_id, snapshot);
-        return Ok(());
-    }
+    process_liveness.track(spec.module_id.clone(), Arc::clone(snapshot));
+    schedule_respawn(
+        runtime,
+        snapshot,
+        &spec.module_id,
+        runtime.restart_policy.backoff,
+        RespawnKind::Reload,
+    )
+}
+
+async fn finish_reload_child(
+    spec: &ModuleSpec,
+    runtime: &SupervisorRuntimeConfig,
+    registry: &Registry,
+    process_liveness: &SupervisorProcessLiveness,
+    snapshot: &SharedSnapshot,
+    child: &mut Option<SupervisedChild>,
+) -> Result<(), SuperviseError> {
     process_liveness.track(spec.module_id.clone(), Arc::clone(snapshot));
     let next_child = match spawn_and_mark_running(spec, runtime, snapshot) {
         Ok(next_child) => next_child,
@@ -5796,8 +6006,15 @@ async fn reload_child(
             if let Some(active_child) = child.as_mut() {
                 active_child.drain_stderr(&spec.module_id).await;
             }
-            *child = None;
-            handle_reload_child_registration_failure(
+            // Keep the reaped child's roster guard until its terminal is written.
+            // Shutdown waits on that guard, not on the child Option used for respawn.
+            let mut exited_child = child.take().expect("exited reload child is still stored");
+            #[cfg(test)]
+            if let Some(gate) = &runtime.test_reload_exit_record_gate {
+                gate.reached.notify_one();
+                gate.resume.notified().await;
+            }
+            let result = handle_reload_child_registration_failure(
                 spec,
                 runtime,
                 registry,
@@ -5809,7 +6026,9 @@ async fn reload_child(
                     reason: "new child exited before registering".to_string(),
                 },
             )
-            .await
+            .await;
+            exited_child.release_roster();
+            result
         }
         RegistrationWaitOutcome::TimedOut => {
             let mut timed_out_child = child
@@ -5862,9 +6081,9 @@ async fn set_child_enabled(
     child: &mut Option<SupervisedChild>,
     enabled: bool,
 ) -> Result<bool, SuperviseError> {
-    let (current_enabled, current_state) = {
+    let (current_enabled, current_state, respawn_pending) = {
         let state = lock_snapshot(snapshot)?;
-        (state.enabled, state.state)
+        (state.enabled, state.state, state.respawn_pending)
     };
     // `start` (enable on an already-enabled module) heals TERMINAL states instead
     // of no-op'ing: a module whose restart budget exhausted (Failed) or that exited
@@ -5876,7 +6095,8 @@ async fn set_child_enabled(
     let revive_terminal = enabled
         && current_enabled
         && child.is_none()
-        && matches!(current_state, ModuleState::Failed | ModuleState::Stopped);
+        && (matches!(current_state, ModuleState::Failed | ModuleState::Stopped)
+            || (current_state == ModuleState::Restarting && !respawn_pending));
     if current_enabled == enabled && !revive_terminal {
         return Ok(false);
     }
@@ -5900,7 +6120,13 @@ async fn set_child_enabled(
                 });
             })?;
         }
-        wait_for_registration_release(registry, &spec.module_id, REGISTRY_RELEASE_TIMEOUT).await?;
+        release_dead_registration(
+            registry,
+            runtime.forwarding.as_deref(),
+            snapshot,
+            &spec.module_id,
+        )
+        .await?;
         reset_restart_count(snapshot, &spec.module_id)?;
         process_liveness.track(spec.module_id.clone(), Arc::clone(snapshot));
         let next_child = match spawn_and_mark_running(spec, runtime, snapshot) {
@@ -5934,6 +6160,7 @@ async fn set_child_enabled(
             spec.protocol,
             stop_notice,
             registry,
+            runtime.forwarding.as_deref(),
             snapshot,
             &runtime.terminal_ring,
             &runtime.spawn_events,
@@ -7819,7 +8046,7 @@ async fn handle_reload_child_registration_failure(
     registry: &Registry,
     process_liveness: &SupervisorProcessLiveness,
     snapshot: &SharedSnapshot,
-    child: &mut Option<SupervisedChild>,
+    _child: &mut Option<SupervisedChild>,
     failure: ReloadRegistrationFailure,
 ) -> Result<(), SuperviseError> {
     let ReloadRegistrationFailure {
@@ -7852,45 +8079,15 @@ async fn handle_reload_child_registration_failure(
             if let Some(schedule) = schedule {
                 log_crash_respawn(&spec.module_id, schedule);
             }
-            sleep(delay).await;
-            // A disable or drain that landed during the backoff cancels this
-            // policy retry: the operator's stop must win over the respawn the
-            // sleep counted down to.
-            if respawn_still_pending(snapshot) {
-                if let Err(err) = wait_for_registration_release(
-                    registry,
-                    &spec.module_id,
-                    REGISTRY_RELEASE_TIMEOUT,
-                )
-                .await
-                {
-                    fail_snapshot(snapshot, Some(&spec.module_id), None);
-                    process_liveness.untrack_if_current(&spec.module_id, snapshot);
-                    return Err(SuperviseError::ReloadFailed {
-                        module_id: spec.module_id.clone(),
-                        reason: format!(
-                            "{reason}; registration did not release before policy retry: {err}"
-                        ),
-                    });
-                }
-                process_liveness.track(spec.module_id.clone(), Arc::clone(snapshot));
-                match spawn_and_mark_running(spec, runtime, snapshot) {
-                    Ok(next_child) => {
-                        *child = Some(next_child);
-                    }
-                    Err(err) => {
-                        fail_snapshot(snapshot, Some(&spec.module_id), None);
-                        process_liveness.untrack_if_current(&spec.module_id, snapshot);
-                        return Err(SuperviseError::ReloadFailed {
-                            module_id: spec.module_id.clone(),
-                            reason: format!("{reason}; policy retry spawn failed: {err}"),
-                        });
-                    }
-                }
-            }
+            schedule_respawn(
+                runtime,
+                snapshot,
+                &spec.module_id,
+                delay,
+                RespawnKind::Spawn,
+            )?;
         }
     }
-
     Err(SuperviseError::ReloadFailed {
         module_id: spec.module_id.clone(),
         reason,
@@ -7902,49 +8099,35 @@ async fn handle_reload_spawn_failure(
     runtime: &SupervisorRuntimeConfig,
     process_liveness: &SupervisorProcessLiveness,
     snapshot: &SharedSnapshot,
-    child: &mut Option<SupervisedChild>,
+    _child: &mut Option<SupervisedChild>,
     reason: String,
 ) -> Result<(), SuperviseError> {
-    let mut should_retry = false;
     let now = Instant::now();
+    let mut schedule = None;
     update_snapshot(snapshot, Some(&spec.module_id), |state| {
         clear_current_process_facts(state);
-        if daemon_will_restart(state, &runtime.restart_policy, now) {
-            state.record_crash_restart(&runtime.restart_policy, now);
-            state.state = ModuleState::Restarting;
-            should_retry = true;
-        } else if state.enabled {
-            state.state = ModuleState::Failed;
+        if state.enabled {
+            schedule = state.next_crash_restart(&runtime.restart_policy, now);
+            state.state = if schedule.is_some() {
+                ModuleState::Restarting
+            } else {
+                ModuleState::Failed
+            };
         } else {
             state.state = ModuleState::Disabled;
         }
     })?;
-
-    if should_retry {
-        sleep(runtime.restart_policy.backoff).await;
-        // A disable or drain that landed during the backoff cancels this
-        // policy retry: the operator's stop must win over the respawn the
-        // sleep counted down to.
-        if respawn_still_pending(snapshot) {
-            process_liveness.track(spec.module_id.clone(), Arc::clone(snapshot));
-            match spawn_and_mark_running(spec, runtime, snapshot) {
-                Ok(next_child) => {
-                    *child = Some(next_child);
-                }
-                Err(err) => {
-                    fail_snapshot(snapshot, Some(&spec.module_id), None);
-                    process_liveness.untrack_if_current(&spec.module_id, snapshot);
-                    return Err(SuperviseError::ReloadFailed {
-                        module_id: spec.module_id.clone(),
-                        reason: format!("{reason}; policy retry spawn failed: {err}"),
-                    });
-                }
-            }
-        }
+    if let Some(schedule) = schedule {
+        schedule_respawn(
+            runtime,
+            snapshot,
+            &spec.module_id,
+            schedule.delay,
+            RespawnKind::Spawn,
+        )?;
     } else {
         process_liveness.untrack_if_current(&spec.module_id, snapshot);
     }
-
     Err(SuperviseError::ReloadFailed {
         module_id: spec.module_id.clone(),
         reason,
@@ -7961,6 +8144,7 @@ async fn drain_optional_child(
     protocol: ModuleProtocol,
     stop_notice: StopNotice,
     registry: &Registry,
+    forwarding: Option<&ForwardingTable>,
     snapshot: &SharedSnapshot,
     terminal_ring: &Arc<Mutex<TerminalRing>>,
     spawn_events: &SpawnEventFeed,
@@ -7975,6 +8159,7 @@ async fn drain_optional_child(
             protocol,
             stop_notice,
             registry,
+            forwarding,
             snapshot,
             terminal_ring,
             spawn_events,
@@ -7992,7 +8177,7 @@ async fn drain_optional_child(
             }
             clear_current_process_facts(state);
         })?;
-        wait_for_registration_release(registry, module_id, REGISTRY_RELEASE_TIMEOUT).await
+        release_dead_registration(registry, forwarding, snapshot, module_id).await
     }
 }
 
@@ -8002,6 +8187,7 @@ async fn drain_child_to_state(
     _protocol: ModuleProtocol,
     stop_notice: StopNotice,
     registry: &Registry,
+    forwarding: Option<&ForwardingTable>,
     snapshot: &SharedSnapshot,
     terminal_ring: &Arc<Mutex<TerminalRing>>,
     spawn_events: &SpawnEventFeed,
@@ -8100,16 +8286,18 @@ async fn drain_child_to_state(
             state.lifetime_restarts += 1;
         }
     })?;
-    record_terminal(
+    let detail = lock_snapshot(snapshot)?.drain_disposition_detail.take();
+    record_terminal_with_detail(
         module_id,
         terminal_ring,
         spawn_events,
         &exit_report,
         terminal_disposition(final_state),
+        detail,
     );
     child.drain_stderr(module_id).await;
 
-    wait_for_registration_release(registry, module_id, REGISTRY_RELEASE_TIMEOUT).await
+    release_dead_registration(registry, forwarding, snapshot, module_id).await
 }
 
 /// Ask a child that nothing else has asked to stop, by signal.
@@ -8187,6 +8375,60 @@ fn terminal_disposition(final_state: ModuleState) -> TerminalDisposition {
     }
 }
 
+/// Release a reaped child's registration before allowing another spawn.
+///
+/// EOF is not a process-lifetime signal: an inherited socket can stay open
+/// indefinitely, and serial frame dispatch can be waiting on egress instead of
+/// reading EOF. After the normal release grace, request connection close (which
+/// cancels both reads and dispatch), then allow one more release grace for the
+/// connection guard's forwarding cleanup. Never evict a different connection.
+async fn release_dead_registration(
+    registry: &Registry,
+    forwarding: Option<&ForwardingTable>,
+    snapshot: &SharedSnapshot,
+    module_id: &str,
+) -> Result<(), SuperviseError> {
+    let result = async {
+        let registration = registry
+            .get_module(module_id)
+            .map_err(SuperviseError::Registry)?;
+        match wait_for_registration_release(registry, module_id, REGISTRY_RELEASE_TIMEOUT).await {
+            Ok(()) => return Ok(()),
+            Err(SuperviseError::RegistrationStillActive { .. }) => {}
+            Err(err) => return Err(err),
+        }
+        let pid = lock_snapshot(snapshot)?.reaped_pid;
+        if let (Some(registration), Some(forwarding), Some(pid)) = (registration, forwarding, pid) {
+            warn!(
+                module_id,
+                pid,
+                connection_id = registration.connection_id.get(),
+                "reaped module registration outlived release grace; closing dead connection"
+            );
+            forwarding.request_connection_close(
+                registration.connection_id,
+                CloseReason::new(
+                    "supervised_process_reaped",
+                    format!("module '{module_id}' pid {pid} exited"),
+                ),
+            );
+            wait_for_slot_registration_release(
+                registry,
+                crate::registry::RegistrationSlot::Connection(registration.connection_id),
+                REGISTRY_RELEASE_TIMEOUT,
+            )
+            .await?;
+        }
+        wait_for_registration_release(registry, module_id, Duration::ZERO).await
+    }
+    .await;
+    if let Err(err) = &result {
+        fail_snapshot(snapshot, Some(module_id), None);
+        error!(module_id, error = %err, "registration release failed after child exit; module is failed and start can retry");
+    }
+    result
+}
+
 /// Wait for the ACTIVE registration of `module_id` to go away, which is what a
 /// plain stop or restart waits for before it spawns a replacement.
 async fn wait_for_registration_release(
@@ -8249,6 +8491,68 @@ mod slot_registration_wait_tests {
     use super::*;
     use crate::registry::{ConnectionId, RegistrationSlot};
     use subc_protocol::manifest::ModuleManifest;
+
+    #[tokio::test]
+    async fn enable_release_failure_is_failed_and_a_second_enable_retries() {
+        let registry = Arc::new(Registry::default());
+        let supervisor = Supervisor::new(Arc::clone(&registry), RestartPolicy::default());
+        let runtime = supervisor.runtime_config();
+        let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::disabled()));
+        let spec = ModuleSpec {
+            module_id: "enable-stale-registration".to_string(),
+            program: PathBuf::from("/missing/enable-retry-test"),
+            args: Vec::new(),
+            env: Vec::new(),
+            reserved: false,
+            reserved_prefixes: Vec::new(),
+            protocol: ModuleProtocol::Subc,
+            overlap: Default::default(),
+        };
+        let connection = ConnectionId::new(90);
+        registry
+            .register_with_control_ops(
+                ModuleManifest::builder(&spec.module_id, "0.1.0").build(),
+                1,
+                connection,
+                Vec::new(),
+            )
+            .unwrap();
+        let mut child = None;
+        let err = set_child_enabled(
+            &spec,
+            &runtime,
+            &registry,
+            &supervisor.process_liveness,
+            &snapshot,
+            &mut child,
+            true,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            SuperviseError::RegistrationStillActive { .. }
+        ));
+        assert_eq!(lock_snapshot(&snapshot).unwrap().state, ModuleState::Failed);
+        assert!(child.is_none());
+        registry.deregister_connection(connection).unwrap();
+        let err = set_child_enabled(
+            &spec,
+            &runtime,
+            &registry,
+            &supervisor.process_liveness,
+            &snapshot,
+            &mut child,
+            true,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, SuperviseError::Spawn { .. }),
+            "second enable must attempt a spawn: {err}"
+        );
+        assert_eq!(lock_snapshot(&snapshot).unwrap().state, ModuleState::Failed);
+    }
 
     const INCUMBENT: u64 = 1;
     const CANDIDATE: u64 = 2;
@@ -8409,6 +8713,11 @@ fn set_running(
         module_id: Some(module_id.to_string()),
     })?;
     state.spawn_generation = spawn_events.emit_spawned(module_id, child.pid, child.spawned_at_ms);
+    if std::mem::take(&mut state.coalesced_restart_pending) {
+        let generation = state.spawn_generation;
+        info!(module_id, "restart already satisfied by generation {generation}; coalesced pending request completed");
+    }
+    state.drain_disposition_detail = None;
     // Every caller of this is a plain spawn, which always uses the primary key;
     // a promoted swap candidate sets the flag itself after this returns.
     state.in_alternate_slot = false;
@@ -8465,6 +8774,7 @@ fn classify_reaped_child_exit(
     child: &SupervisedChild,
     status: &ExitStatus,
 ) -> ExitReport {
+    let _ = update_snapshot(snapshot, None, |state| state.reaped_pid = Some(child.pid));
     apply_deliberate_severance_marker(snapshot, child.process_identity(), classify_exit(status))
 }
 
@@ -8560,7 +8870,7 @@ mod terminal_history_tests {
     /// `current_exe()` and why the existence check is here: `--lib` alone does
     /// not build `[[bin]]` targets, and a bare spawn then fails with a raw
     /// `NotFound` that reads as a broken test rather than an unbuilt dependency.
-    fn fake_aft_stub_path() -> PathBuf {
+    pub(super) fn fake_aft_stub_path() -> PathBuf {
         let mut path = std::env::current_exe().expect("current_exe available in tests");
         path.pop();
         path.pop();
@@ -9246,6 +9556,70 @@ mod terminal_history_tests {
         assert_eq!(history.entries[0].disposition, TerminalDisposition::Stopped);
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reload_exit_keeps_roster_until_terminal_is_recorded_during_shutdown() {
+        let dir = subc_test_support::TestTempDir::new("reload-roster-terminal-order");
+        let record = dir.join("live-children.json");
+        let supervisor = Supervisor::new(
+            Arc::new(Registry::default()),
+            RestartPolicy::new(0, Duration::ZERO),
+        );
+        let mut runtime = supervisor.runtime_config();
+        runtime.child_roster.record_to(record.clone());
+        let gate = Arc::new(super::ReloadExitRecordGate::default());
+        runtime.test_reload_exit_record_gate = Some(Arc::clone(&gate));
+        let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
+        let spec = ModuleSpec {
+            module_id: "reload-exit-roster".into(),
+            program: fake_aft_stub_path(),
+            args: Vec::new(),
+            env: vec![("FAKE_AFT_EXIT_CODE".into(), "23".into())],
+            reserved: false,
+            reserved_prefixes: Vec::new(),
+            protocol: ModuleProtocol::Subc,
+            overlap: Default::default(),
+        };
+        let mut child = None;
+        let reload = super::finish_reload_child(
+            &spec,
+            &runtime,
+            &supervisor.registry,
+            &supervisor.process_liveness,
+            &snapshot,
+            &mut child,
+        );
+        tokio::pin!(reload);
+        tokio::select! {
+            result = &mut reload => panic!("reload missed the before-record gate: {result:?}"),
+            _ = gate.reached.notified() => {}
+        }
+        assert!(runtime
+            .terminal_ring
+            .lock()
+            .unwrap()
+            .snapshot()
+            .entries
+            .is_empty());
+        assert_eq!(
+            crate::live_children::read_record(&record).unwrap().len(),
+            1,
+            "shutdown must still wait for the reaped child until its terminal record exists"
+        );
+        runtime.child_roster.close();
+        gate.resume.notify_one();
+        assert!(reload.await.is_err());
+        assert!(crate::live_children::read_record(&record)
+            .unwrap()
+            .is_empty());
+        let history = runtime.terminal_ring.lock().unwrap().snapshot();
+        assert_eq!(history.entries.len(), 1);
+        assert_eq!(
+            history.entries[0].disposition,
+            TerminalDisposition::DaemonShutdown
+        );
+    }
+
     /// Each restart-producing arm has its own state transition. Keeping their
     /// lifetime count assertions adjacent prevents a later new arm from silently
     /// spending budget without recording the historical restart.
@@ -9309,8 +9683,11 @@ mod terminal_history_tests {
                 2,
             )
             .await,
-            Err(SuperviseError::Spawn { .. })
+            Ok(())
         ));
+        assert!(health_child.is_none());
+        assert!(lock_snapshot(&health_snapshot).unwrap().respawn_pending);
+        assert!(runtime.scheduled_respawn.lock().unwrap().take().is_some());
         let (health_restarts, health_lifetime) = {
             let state = lock_snapshot(&health_snapshot).unwrap();
             (state.crash_restarts.len(), state.lifetime_restarts)
@@ -9748,6 +10125,7 @@ mod terminal_history_tests {
             // test classifies.
             StopNotice::SentOverConnection,
             &registry,
+            None,
             &snapshot,
             &runtime.terminal_ring,
             &runtime.spawn_events,
@@ -9802,6 +10180,7 @@ mod terminal_history_tests {
             // test classifies.
             StopNotice::SentOverConnection,
             &registry,
+            None,
             &snapshot,
             &runtime.terminal_ring,
             &runtime.spawn_events,
@@ -11274,6 +11653,7 @@ mod job_containment_tests {
                 // child over a connection.
                 StopNotice::NotSent,
                 &self.registry,
+                None,
                 &self.snapshot,
                 &self.terminal_ring,
                 &self.spawn_events,
@@ -11612,6 +11992,7 @@ mod cgroup_containment_tests {
                 ModuleProtocol::None,
                 StopNotice::NotSent,
                 &Registry::default(),
+                None,
                 &snapshot,
                 &runtime.terminal_ring,
                 &SpawnEventFeed::default(),

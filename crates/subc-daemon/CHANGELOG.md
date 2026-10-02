@@ -17,6 +17,9 @@
 - Orphan records identify the running executable image after PATH lookup and shebang interpretation, while provenance still records the configured program.
 - Swap retirement drains and journals the incumbent in the background, leaving the promoted process supervised and operator commands responsive. Linux kill domains are unique per spawn, and reaping cleans the process tree and its cgroup.
 - Stderr read failures stop marking the tail incomplete after their historical process section is evicted; failures in retained history remain visible.
+- Close registrations whose sockets outlive a reaped supervised process before restarting. Failed release attempts leave an operator-revivable state; start also revives Restarting modules with no child or scheduled respawn.
+- Serve supervisor commands during health, operator, and reload retry backoffs, allowing disable or drain to cancel the replacement. Reload acknowledgements still wait for registration, or report cancellation.
+- Health restart budget exhaustion leaves the module enabled and failed, with the limit and window in its terminal record. Keep a reaped reload child's roster entry until its terminal record is written so daemon shutdown cannot exit first.
 
 ## 0.29.1 — 2026-10-02
 

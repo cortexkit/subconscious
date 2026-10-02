@@ -76,6 +76,248 @@ async fn spawn_registers_stub_and_reports_running() {
     module.stop().await.unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn disable_during_operator_restart_backoff_cancels_respawn() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor(&server, 3, Duration::from_secs(2))
+        .with_forwarding(Arc::clone(&server.forwarding));
+    let module = spawn_stub(&server, &supervisor, "fake-aft-cancel-operator-backoff").await;
+    let generation = module.status().unwrap().spawn_generation;
+    module.restart(None).await.unwrap();
+    wait_for_status(&module, Duration::from_secs(3), |status| {
+        status.state == ModuleState::Restarting && !status.process_alive
+    })
+    .await;
+    timeout(Duration::from_millis(500), module.set_enabled(false))
+        .await
+        .expect("disable must be served during the backoff, not after respawn")
+        .unwrap();
+    sleep(Duration::from_millis(2200)).await;
+    let stopped = module.status().unwrap();
+    assert_eq!(stopped.state, ModuleState::Disabled);
+    assert_eq!(stopped.spawn_generation, generation);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn disable_during_health_restart_backoff_cancels_respawn() {
+    assert_disable_cancels_backoff("health").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn disable_during_reload_backoff_cancels_respawn() {
+    assert_disable_cancels_backoff("reload").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn disable_during_reload_registration_retry_backoff_cancels_respawn() {
+    assert_disable_cancels_backoff("registration-retry").await;
+}
+
+// Unix permits unlinking an executing fixture; Windows holds the executable open.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn disable_during_reload_spawn_retry_backoff_cancels_respawn() {
+    assert_disable_cancels_backoff("spawn-retry").await;
+}
+
+async fn assert_disable_cancels_backoff(kind: &str) {
+    let server = TestServer::start().await;
+    let supervisor = supervisor(&server, 3, Duration::from_secs(2))
+        .with_forwarding(Arc::clone(&server.forwarding))
+        .with_health_config(subc_daemon::HealthConfig {
+            cadence: Duration::from_millis(50),
+            deadline: Duration::from_millis(50),
+            failure_threshold: 1,
+            ..Default::default()
+        });
+    let marker = server.temp_dir.join("first-process");
+    let mut spec = stub_spec(&server, &format!("fake-aft-cancel-{kind}"), []);
+    if kind == "health" {
+        spec.env.extend([
+            ("FAKE_AFT_ADVERTISE_HEALTH".into(), "1".into()),
+            (
+                "FAKE_AFT_HEALTH_NEVER_REPLY_FIRST_PATH".into(),
+                marker.display().to_string(),
+            ),
+        ]);
+    } else if kind == "registration-retry" {
+        spec.env.push((
+            "FAKE_AFT_FAIL_REGISTRATION_AFTER_FIRST_PATH".into(),
+            marker.display().to_string(),
+        ));
+    } else if kind == "spawn-retry" {
+        let copy = server.temp_dir.join("copied-stub");
+        std::fs::copy(&spec.program, &copy).unwrap();
+        spec.program = copy;
+    }
+    let module = Arc::new(supervisor.spawn(spec.clone()).unwrap());
+    wait_for_registration(&server.registry, &spec.module_id, Duration::from_secs(10)).await;
+    let reload = if kind != "health" {
+        if kind == "spawn-retry" {
+            std::fs::remove_file(&spec.program).unwrap();
+        }
+        let module = Arc::clone(&module);
+        Some(tokio::spawn(async move { module.reload().await }))
+    } else {
+        None
+    };
+    let retry = kind.ends_with("retry");
+    let pending = wait_for_status(&module, Duration::from_secs(5), |status| {
+        status.state == ModuleState::Restarting
+            && !status.process_alive
+            && (!retry || status.restart_count > 0)
+    })
+    .await;
+    timeout(Duration::from_millis(500), module.set_enabled(false))
+        .await
+        .unwrap_or_else(|_| panic!("disable blocked by {kind} backoff"))
+        .unwrap();
+    if let Some(reload) = reload {
+        assert!(
+            timeout(Duration::from_secs(1), reload)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err(),
+            "cancelled or failed reload must not acknowledge success"
+        );
+    }
+    sleep(Duration::from_millis(2200)).await;
+    let stopped = module.status().unwrap();
+    assert_eq!(stopped.state, ModuleState::Disabled);
+    assert_eq!(
+        stopped.spawn_generation, pending.spawn_generation,
+        "{kind} respawned despite disable"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn health_budget_exhaustion_is_failed_with_budget_detail_and_start_revives() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor(&server, 0, Duration::from_millis(10))
+        .with_forwarding(Arc::clone(&server.forwarding))
+        .with_health_config(subc_daemon::HealthConfig {
+            cadence: Duration::from_millis(50),
+            deadline: Duration::from_millis(50),
+            failure_threshold: 1,
+            ..Default::default()
+        });
+    let health_path = server.temp_dir.join("health-first");
+    let module = spawn_stub_with_env(
+        &server,
+        &supervisor,
+        "fake-aft-health-budget",
+        [
+            ("FAKE_AFT_ADVERTISE_HEALTH", "1"),
+            (
+                "FAKE_AFT_HEALTH_NEVER_REPLY_FIRST_PATH",
+                health_path.to_str().unwrap(),
+            ),
+        ],
+    )
+    .await;
+    let failed = wait_for_status(&module, Duration::from_secs(3), |status| {
+        matches!(status.state, ModuleState::Failed | ModuleState::Disabled) && !status.process_alive
+    })
+    .await;
+    assert_eq!(failed.state, ModuleState::Failed);
+    assert!(failed.enabled);
+    let history = module.terminal_history();
+    assert_eq!(history.entries[0].disposition, TerminalDisposition::Failed);
+    assert_eq!(
+        history.entries[0].disposition_detail.as_deref(),
+        Some("crash budget exhausted: max_restarts=0 within window_secs=600")
+    );
+    assert!(module.set_enabled(true).await.unwrap());
+    wait_for_status(&module, Duration::from_secs(3), |status| status.live).await;
+    module.stop().await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn health_restart_evicts_registration_held_by_inherited_socket() {
+    struct HolderGuard(u32);
+    impl Drop for HolderGuard {
+        fn drop(&mut self) {
+            if let Some(pid) = i32::try_from(self.0)
+                .ok()
+                .and_then(rustix::process::Pid::from_raw)
+            {
+                let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+            }
+        }
+    }
+    let server = TestServer::start().await;
+    let supervisor = supervisor(&server, 3, Duration::from_millis(10))
+        .with_forwarding(Arc::clone(&server.forwarding))
+        .with_health_config(subc_daemon::HealthConfig {
+            cadence: Duration::from_millis(50),
+            deadline: Duration::from_millis(50),
+            failure_threshold: 1,
+            ..Default::default()
+        });
+    let holder_path = server.temp_dir.join("socket-holder-pid");
+    let health_path = server.temp_dir.join("unanswered-health-first");
+    let module_id = "fake-aft-inherited-socket";
+    let module = spawn_stub_with_env(
+        &server,
+        &supervisor,
+        module_id,
+        [
+            (
+                "FAKE_AFT_SOCKET_HOLDER_FIRST_PATH",
+                holder_path.to_str().unwrap(),
+            ),
+            ("FAKE_AFT_ADVERTISE_HEALTH", "1"),
+            (
+                "FAKE_AFT_HEALTH_NEVER_REPLY_FIRST_PATH",
+                health_path.to_str().unwrap(),
+            ),
+        ],
+    )
+    .await;
+    let holder = HolderGuard(
+        std::fs::read_to_string(&holder_path)
+            .unwrap()
+            .parse()
+            .unwrap(),
+    );
+    let first = module.status().unwrap();
+    let old_connection = server
+        .registry
+        .get_module(module_id)
+        .unwrap()
+        .unwrap()
+        .connection_id;
+    // Verify the failure scenario rather than merely a slow restart:
+    // the direct child is reaped while its inherited socket is still registered.
+    wait_for_status(&module, Duration::from_secs(3), |status| {
+        !status.process_alive
+            && status.state == ModuleState::Restarting
+            && status.registration_active
+    })
+    .await;
+    let holder_pid = rustix::process::Pid::from_raw(i32::try_from(holder.0).unwrap()).unwrap();
+    rustix::process::test_kill_process(holder_pid).unwrap();
+    let recovered = wait_for_status(&module, Duration::from_secs(6), |status| {
+        status.state == ModuleState::Running
+            && status.live
+            && status.spawn_generation > first.spawn_generation
+    })
+    .await;
+    assert_ne!(recovered.pid, first.pid);
+    assert_ne!(
+        server
+            .registry
+            .get_module(module_id)
+            .unwrap()
+            .unwrap()
+            .connection_id,
+        old_connection
+    );
+    module.stop().await.unwrap();
+}
+
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reserved_child_registers_from_pipe_without_environment_nonce() {
@@ -770,7 +1012,7 @@ async fn spawn_stub_with_env<'a>(
 }
 
 fn stub_spec<'a>(
-    _server: &TestServer,
+    server: &TestServer,
     module_id: &str,
     extra_env: impl IntoIterator<Item = (&'a str, &'a str)>,
 ) -> ModuleSpec {
@@ -796,6 +1038,12 @@ fn stub_spec<'a>(
          one; pick a different id"
     );
     let mut env = vec![("FAKE_AFT_MODULE_ID".to_string(), module_id.to_string())];
+    for name in ["XDG_DATA_HOME", "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME"] {
+        env.push((
+            name.to_string(),
+            server.temp_dir.join(name).display().to_string(),
+        ));
+    }
     env.extend(
         extra_env
             .into_iter()

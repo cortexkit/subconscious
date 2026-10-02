@@ -5546,9 +5546,13 @@ async fn fail_pending_on_route(
 
     for ((channel, epoch, corr), reply) in replies {
         let body = match serde_json::to_vec(&ErrorBody {
-            code: "target_unavailable".to_owned(),
+            // Pending requests have already been dispatched. A provider closing
+            // its route cannot establish that a mutating request never executed.
+            code: "route_closed".to_owned(),
             message: message.to_owned(),
-            detail: None,
+            detail: Some(
+                serde_json::json!({"send_outcome":"outcome_unknown", "request_dispatched":true}),
+            ),
         }) {
             Ok(body) => body,
             Err(error) => {

@@ -220,6 +220,9 @@ public final class SubcClient {
     ) throws -> [String: Any] {
         let body = try JSONSerialization.data(withJSONObject: ["method": method, "params": params])
         let reply = try routeRequest(route: route, body: body, admissionClass: admissionClass)
+        // A void handler ends the request with an empty terminal frame rather
+        // than a JSON object. There is no result payload to decode in that case.
+        if reply.isEmpty { return [:] }
         guard let obj = try JSONSerialization.jsonObject(with: reply) as? [String: Any] else {
             throw SubcError(message: "\(method) reply was not a JSON object")
         }
@@ -431,7 +434,7 @@ public final class SubcClient {
                   frame.header.corr == corr
             else { continue }
             switch frame.header.ty {
-            case .response:
+            case .response, .streamEnd:
                 return frame.body
             case .error:
                 throw remoteError(prefix: "control request rejected", body: frame.body)
@@ -473,7 +476,7 @@ public final class SubcClient {
             }
             guard frameKey == key else { continue }
             switch frame.header.ty {
-            case .response:
+            case .response, .streamEnd:
                 return frame.body
             case .error:
                 throw remoteError(

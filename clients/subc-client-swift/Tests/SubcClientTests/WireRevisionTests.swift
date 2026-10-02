@@ -239,6 +239,33 @@ final class EnvelopeRevisionTests: XCTestCase {
 }
 
 final class ClientWireRevisionTests: XCTestCase {
+    func testManagementStreamEndCompletesVoidReply() throws {
+        let transport = ScriptedTransport()
+        try transport.append(makeFrame(
+            ty: .response, channel: 0, epoch: 0, corr: 1,
+            json: ["route_channel": 12, "route_epoch": 1]
+        ))
+        // A different correlation must not complete this request.
+        try transport.append(makeFrame(ty: .streamEnd, channel: 12, epoch: 1, corr: 99))
+        try transport.append(makeFrame(ty: .streamEnd, channel: 12, epoch: 1, corr: 2))
+        let client = SubcClient(transport: transport)
+        let route = try client.routeOpenManagementSurface(
+            moduleId: "module", projectRoot: "/tmp", harness: "test", session: "session"
+        )
+        XCTAssertTrue(try client.callManagement(route: route, method: "void.operation").isEmpty)
+        XCTAssertTrue(transport.bytes.isEmpty)
+    }
+
+    func testControlStreamEndCompletesReply() throws {
+        let transport = ScriptedTransport()
+        try transport.append(makeFrame(
+            ty: .streamEnd, channel: 0, epoch: 0, corr: 1, json: ["modules": []]
+        ))
+        let client = SubcClient(transport: transport)
+        XCTAssertTrue(try client.catalogList().isEmpty)
+        XCTAssertTrue(transport.bytes.isEmpty)
+    }
+
     func testStaleEpochIngressIsDroppedWithoutSettlingCurrentRequest() throws {
         let transport = ScriptedTransport()
         try transport.append(makeFrame(

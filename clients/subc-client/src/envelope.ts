@@ -172,16 +172,17 @@ function validateHeaderFields(header: EnvelopeHeader): void {
       "sheddable_illegal_frame_type",
     );
   }
-  if (channel === 0 && epoch !== 0) {
-    throw new DecodeError(
-      `control channel carried nonzero epoch ${epoch}`,
-      "nonzero_epoch_on_control_channel",
-    );
-  }
+  // Match the wire decoder's precedence when a header violates both rules.
   if (isPureHeader(ty) && len !== 0) {
     throw new DecodeError(
       `pure-header frame ${FrameType[ty]} declared non-zero body length ${len}`,
       "pure_header_frame_with_body",
+    );
+  }
+  if (channel === 0 && epoch !== 0) {
+    throw new DecodeError(
+      `control channel carried nonzero epoch ${epoch}`,
+      "nonzero_epoch_on_control_channel",
     );
   }
 }
@@ -233,16 +234,17 @@ export function decodeHeader(bytes: Uint8Array): EnvelopeHeader {
   }
   const channel = view.getUint16(7, true);
   const epoch = view.getUint32(9, true);
-  if (channel === 0 && epoch !== 0) {
-    throw new DecodeError(
-      `control channel carried nonzero epoch ${epoch}`,
-      "nonzero_epoch_on_control_channel",
-    );
-  }
+  // Body length is checked before the control epoch in Rust and Swift too.
   if (isPureHeader(ty) && len !== 0) {
     throw new DecodeError(
       `pure-header frame ${FrameType[ty]} declared non-zero body length ${len}`,
       "pure_header_frame_with_body",
+    );
+  }
+  if (channel === 0 && epoch !== 0) {
+    throw new DecodeError(
+      `control channel carried nonzero epoch ${epoch}`,
+      "nonzero_epoch_on_control_channel",
     );
   }
   return { len, ver, ty, flags, channel, epoch, corr: view.getBigUint64(13, true) };

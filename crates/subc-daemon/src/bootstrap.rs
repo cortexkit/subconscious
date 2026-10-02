@@ -433,6 +433,8 @@ pub struct BoundDaemon {
     /// daemon sweeps or writes this one's run state. `None` when the config
     /// keeps no live-children record, and so has no run directory to own.
     run_dir_lock: Option<crate::run_dir_lock::RunDirLock>,
+    /// Unpublished daemon boots keep the singleton claim until serving is ready.
+    publication_lock: Option<StartLock>,
 }
 
 /// Resolve subc's per-user TCP connection-file path.
@@ -513,7 +515,7 @@ pub async fn run_with_config(config: BootstrapConfig) -> Result<(), BootstrapErr
     let capture_logs_dir = config.capture_logs_dir.clone();
     let terminal_journal_path = config.terminal_journal_path.clone();
     let live_children_path = config.live_children_path.clone();
-    match ensure_singleton_with_config(config).await? {
+    match ensure_singleton_inner(config, false).await? {
         Outcome::AlreadyRunning => {
             info!("subc daemon already running");
             Ok(())
@@ -587,12 +589,33 @@ const NOFILE_TARGET: u64 = 65536;
 /// under the inherited limit — modules with few roots just have less headroom.
 #[cfg(unix)]
 fn raise_nofile_limit() {
+    #[cfg(target_os = "macos")]
+    let ceiling = std::process::Command::new("/usr/sbin/sysctl")
+        .args(["-n", "kern.maxfilesperproc"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0);
+    #[cfg(not(target_os = "macos"))]
+    let ceiling = None;
+    raise_nofile_limit_with_ceiling(ceiling);
+}
+
+#[cfg(unix)]
+fn raise_nofile_limit_with_ceiling(kernel_ceiling: Option<u64>) {
     match rlimit::Resource::NOFILE.get() {
         Ok((soft, hard)) => {
-            if soft >= NOFILE_TARGET {
+            // On XNU an infinite hard limit does not remove the separate
+            // per-process kernel ceiling. Exceeding it makes setrlimit fail
+            // without raising the inherited (often 256) soft limit at all.
+            let target = NOFILE_TARGET
+                .min(hard)
+                .min(kernel_ceiling.unwrap_or(u64::MAX));
+            if soft >= target {
                 return;
             }
-            let target = NOFILE_TARGET.min(hard);
             match rlimit::Resource::NOFILE.set(target, hard) {
                 Ok(()) => info!(
                     previous_soft = soft,
@@ -693,6 +716,7 @@ async fn serve_bound_daemon(
     // directory from the run directory.) The lock stays held until this
     // function returns, which is when the daemon exits.
     let run_dir_lock = bound.run_dir_lock;
+    let publication_lock = bound.publication_lock;
     if let Some(owner) = &run_dir_lock {
         crate::live_children::sweep_orphans(
             owner,
@@ -823,7 +847,17 @@ async fn serve_bound_daemon(
 
     let mut serve_task =
         AbortOnDrop::new(tokio::spawn(serve_listeners(bound.listeners, router, auth)));
-    tokio::task::yield_now().await;
+    verify_serving(&bound.connection_info).await?;
+    // A published endpoint promises that authentication can complete now.
+    // Orphan cleanup and control-plane construction can take longer than an
+    // existing-daemon probe's deadline, so finish both before discovery.
+    write_atomic(&bound.connection_file_path, &bound.connection_info).map_err(|source| {
+        BootstrapError::ConnectionFileWrite {
+            path: bound.connection_file_path.clone(),
+            source,
+        }
+    })?;
+    drop(publication_lock);
     let _clock_step_task = AbortOnDrop::new(crate::watchdog::spawn_clock_step_monitor());
     // Off the startup path: it runs `systemctl`, and only ever logs.
     #[cfg(target_os = "linux")]
@@ -841,12 +875,12 @@ async fn serve_bound_daemon(
 
     for configured in configured_modules {
         let enabled = configured.enabled;
-        let health = configured.health;
+        let health = configured.health.clone();
         let module_id = configured.module_id.clone();
         match supervisor.supervise_configured_with_health(
             configured.module_spec(),
             enabled,
-            health,
+            health.clone(),
             configured.drain_timeout_ms,
             configured.restart,
         ) {
@@ -958,13 +992,20 @@ pub async fn ensure_singleton(
 pub async fn ensure_singleton_with_config(
     config: BootstrapConfig,
 ) -> Result<Outcome, BootstrapError> {
+    ensure_singleton_inner(config, true).await
+}
+
+async fn ensure_singleton_inner(
+    config: BootstrapConfig,
+    publish: bool,
+) -> Result<Outcome, BootstrapError> {
     let path = config.connection_file_path;
 
     if matches!(probe_existing(&path).await?, Probe::Live) {
         return Ok(Outcome::AlreadyRunning);
     }
 
-    let _lock = StartLock::acquire(&path).await?;
+    let lock = StartLock::acquire(&path).await?;
 
     // Re-probe after acquiring the start lock so a peer that won the race between
     // our first failed probe and the lock acquisition is observed instead of
@@ -1007,9 +1048,14 @@ pub async fn ensure_singleton_with_config(
         daemon_ver: config.daemon_ver,
     };
 
-    if let Err(source) = write_atomic(&path, &connection_info) {
-        drop(listeners);
-        return Err(BootstrapError::ConnectionFileWrite { path, source });
+    // The low-level binding API historically publishes for callers that serve
+    // these listeners themselves. The daemon entry point defers publication
+    // until its own authentication server is running.
+    if publish {
+        if let Err(source) = write_atomic(&path, &connection_info) {
+            drop(listeners);
+            return Err(BootstrapError::ConnectionFileWrite { path, source });
+        }
     }
 
     Ok(Outcome::Bound(BoundDaemon {
@@ -1019,6 +1065,7 @@ pub async fn ensure_singleton_with_config(
         connection_file_source: config.connection_file_source,
         machine_id,
         run_dir_lock,
+        publication_lock: (!publish).then_some(lock),
     }))
 }
 
@@ -1081,6 +1128,18 @@ async fn probe_endpoint(info: &ConnectionInfo, endpoint: &Endpoint) -> Probe {
     }
 }
 
+async fn verify_serving(info: &ConnectionInfo) -> Result<(), BootstrapError> {
+    // Scheduling a server task is not a readiness barrier. Authenticate once
+    // against the mandatory IPv4 listener before exposing discovery to peers.
+    // This uses the normal probe deadline, with no retries or widened budget.
+    if let Some(endpoint) = info.endpoints.first() {
+        if matches!(probe_endpoint(info, endpoint).await, Probe::Live) {
+            return Ok(());
+        }
+    }
+    Err(BootstrapError::StartupNotServing)
+}
+
 fn is_absent_or_stale_connection_file(err: &ConnectionFileError) -> bool {
     match err {
         ConnectionFileError::Io { source, .. } if source.kind() == io::ErrorKind::NotFound => true,
@@ -1119,6 +1178,17 @@ fn remove_stale_connection_file_if_present(path: &Path) -> Result<(), BootstrapE
 }
 
 async fn bind_loopback(port: u16) -> Result<(Vec<TcpListener>, Vec<Endpoint>), BootstrapError> {
+    bind_loopback_with(port, |port| TcpListener::bind((Ipv6Addr::LOCALHOST, port))).await
+}
+
+async fn bind_loopback_with<F, Fut>(
+    port: u16,
+    mut bind_v6: F,
+) -> Result<(Vec<TcpListener>, Vec<Endpoint>), BootstrapError>
+where
+    F: FnMut(u16) -> Fut,
+    Fut: std::future::Future<Output = io::Result<TcpListener>>,
+{
     let v4_host = Ipv4Addr::LOCALHOST;
     let v4 = TcpListener::bind((v4_host, port))
         .await
@@ -1142,7 +1212,7 @@ async fn bind_loopback(port: u16) -> Result<(Vec<TcpListener>, Vec<Endpoint>), B
     }];
 
     let v6_host = Ipv6Addr::LOCALHOST;
-    match TcpListener::bind((v6_host, actual_port)).await {
+    match bind_v6(actual_port).await {
         Ok(v6) => {
             listeners.push(v6);
             endpoints.push(Endpoint {
@@ -1150,7 +1220,10 @@ async fn bind_loopback(port: u16) -> Result<(Vec<TcpListener>, Vec<Endpoint>), B
                 port: actual_port,
             });
         }
-        Err(err) if ipv6_loopback_unavailable(&err) => {
+        Err(err)
+            if ipv6_loopback_unavailable(&err)
+                || (port == 0 && err.kind() == io::ErrorKind::AddrInUse) =>
+        {
             warn!(
                 port = actual_port,
                 error = %err,
@@ -1199,6 +1272,7 @@ impl<T> Drop for AbortOnDrop<T> {
     }
 }
 
+#[derive(Debug)]
 struct StartLock {
     // Keep the locked file handle alive for the duration of bootstrap; closing
     // it releases the advisory lock while leaving the stable path in place.
@@ -1266,6 +1340,8 @@ fn non_empty_os_var(key: &str) -> Option<OsString> {
 /// ordinary daemon-discovery races or stale filesystem state.
 #[derive(Debug)]
 pub enum BootstrapError {
+    /// The bound server could not authenticate its own readiness probe.
+    StartupNotServing,
     #[cfg(unix)]
     Signal(io::Error),
     InvalidPort {
@@ -1329,6 +1405,7 @@ pub enum BootstrapError {
 impl fmt::Display for BootstrapError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::StartupNotServing => write!(f, "bound daemon did not authenticate its readiness probe; connection file was not published"),
             #[cfg(unix)]
             Self::Signal(error) => write!(f, "failed to register SIGTERM handler: {error}"),
             Self::InvalidPort { raw, source } => {
@@ -1407,6 +1484,7 @@ impl fmt::Display for BootstrapError {
 impl Error for BootstrapError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::StartupNotServing => None,
             #[cfg(unix)]
             Self::Signal(source) => Some(source),
             Self::InvalidPort { source, .. } => Some(source),
@@ -2051,6 +2129,160 @@ mod tests {
         assert!(err.to_string().contains("set the port in config"));
 
         drop(occupied);
+    }
+
+    #[tokio::test]
+    async fn ephemeral_ipv6_collision_still_serves_ipv4() {
+        let (listeners, endpoints) = bind_loopback_with(0, |port| async move {
+            let occupied = TcpListener::bind((Ipv6Addr::LOCALHOST, port)).await?;
+            let result = TcpListener::bind((Ipv6Addr::LOCALHOST, port)).await;
+            drop(occupied);
+            result
+        })
+        .await
+        .expect("an incidental IPv6 collision must not prevent an ephemeral daemon from starting");
+        assert_eq!(endpoints.len(), 1);
+        assert_eq!(endpoints[0].host, "127.0.0.1");
+        TcpStream::connect((Ipv4Addr::LOCALHOST, endpoints[0].port))
+            .await
+            .unwrap();
+        drop(listeners);
+    }
+
+    #[tokio::test]
+    async fn unpublished_boot_holds_singleton_lock_until_publication() {
+        let dir = TestTempDir::new("unpublished-singleton-lock");
+        let path = dir.join("connection.json");
+        let bound = expect_bound(
+            ensure_singleton_inner(BootstrapConfig::new(&path, 0), false)
+                .await
+                .unwrap(),
+        );
+        assert!(!path.exists());
+        let contender = open_owner_only_lock(&start_lock_path(&path)).unwrap();
+        assert!(
+            matches!(FileExt::try_lock(&contender), Err(TryLockError::WouldBlock)),
+            "an unpublished boot must keep its singleton claim"
+        );
+        drop(bound);
+        FileExt::try_lock(&contender).unwrap();
+    }
+
+    #[tokio::test]
+    async fn readiness_probe_requires_an_authenticating_server() {
+        let dir = TestTempDir::new("unserved-readiness");
+        let bound = expect_bound(
+            ensure_singleton_inner(BootstrapConfig::new(dir.join("connection.json"), 0), false)
+                .await
+                .unwrap(),
+        );
+        assert!(matches!(
+            verify_serving(&bound.connection_info).await,
+            Err(BootstrapError::StartupNotServing)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn orphan_sweep_finishes_before_connection_file_publication() {
+        use crate::live_children::{ExecutableIdentity, LiveChild};
+        let dir = TestTempDir::new("publish-after-sweep");
+        let path = dir.join("connection.json");
+        let record = dir.join("live-children.json");
+        let ready = dir.join("ready");
+        let mut child = std::process::Command::new("/bin/sh")
+            .args([
+                "-c",
+                "trap '' TERM; : > \"$0\"; read -r _",
+                ready.to_str().unwrap(),
+            ])
+            .stdin(std::process::Stdio::piped())
+            .env("XDG_DATA_HOME", dir.path())
+            .env("XDG_RUNTIME_DIR", dir.path())
+            .env("XDG_CONFIG_HOME", dir.path())
+            .spawn()
+            .unwrap();
+        timeout(Duration::from_secs(5), async {
+            while !ready.exists() {
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let observed = subc_os::Process::open(child.id())
+            .unwrap()
+            .unwrap()
+            .observe()
+            .unwrap();
+        crate::live_children::write_record(
+            &record,
+            &[LiveChild {
+                module_id: "old-sleep".into(),
+                pid: child.id(),
+                protocol: subc_control::ModuleProtocol::None,
+                start_time: Some(observed.start_time),
+                executable: observed.executable.map(ExecutableIdentity::from),
+                cgroup_name: None,
+            }],
+        )
+        .unwrap();
+        let config = BootstrapConfig::new(&path, 0).with_live_children_record(&record);
+        let daemon = tokio::spawn(run_with_config(config));
+        timeout(Duration::from_secs(5), async {
+            while !path.exists() {
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(path.exists());
+        let ended = child.try_wait().unwrap().is_some();
+        if !ended {
+            child.kill().unwrap();
+        }
+        child.wait().unwrap();
+        if ended {
+            assert!(matches!(probe_existing(&path).await.unwrap(), Probe::Live));
+        }
+        daemon.abort();
+        let _ = daemon.await;
+        assert!(
+            ended,
+            "the published daemon must not still owe its orphan sweep"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn nofile_raise_worker() {
+        let Some(path) = std::env::var_os("SUBC_NOFILE_TEST_FILE") else {
+            return;
+        };
+        let (_, hard) = rlimit::Resource::NOFILE.get().unwrap();
+        rlimit::Resource::NOFILE.set(256, hard).unwrap();
+        raise_nofile_limit_with_ceiling(Some(10240));
+        std::fs::write(path, rlimit::Resource::NOFILE.get().unwrap().0.to_string()).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_nofile_raise_clamps_to_kernel_ceiling() {
+        let dir = TestTempDir::new("nofile-ceiling");
+        let result = dir.join("soft");
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "bootstrap::tests::nofile_raise_worker"])
+            .env("SUBC_NOFILE_TEST_FILE", &result)
+            .env("XDG_DATA_HOME", dir.path())
+            .env("XDG_RUNTIME_DIR", dir.path())
+            .env("XDG_CONFIG_HOME", dir.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let soft: u64 = std::fs::read_to_string(result).unwrap().parse().unwrap();
+        assert!(
+            soft > 256 && soft <= 10240,
+            "the inherited limit must be raised within the kernel ceiling; got {soft}"
+        );
     }
 
     #[tokio::test]

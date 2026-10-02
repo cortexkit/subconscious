@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.29.2
+
+- Reject reserved capability claims in `catalog.update` before changing active or swap-candidate registrations, using the same `reserved_capability` error as HELLO.
+- Module GOODBYE now performs disconnect teardown immediately, including requirement recomputation, route-closed client pushes and scope-sync authority release, without waiting for the socket to close.
+- Scope sync propagates parent refusals through direct dependencies and shares ancestor walks (including shared cyclic ancestry), avoiding cubic work on leaf-first scope chains.
+- Route-bind breaker probes now own a unique admission token; settling an older relay cannot release a newer probe or misreport it as a failed probe.
+- Requirement episode numbers remain monotonic for each consumer/capability pair when a consumer is disabled or a declaration disappears and later returns.
+- Runtime supervisor start/stop overrides configuration defaults when evaluating enabled capability candidates, cached consumer requirements and satisfiability; starting a config-disabled provider now gets the normal pending window.
+- Reserved-capability refusal warnings describe the current attempt only; unrelated catalog updates no longer re-log historical claimants that never registered.
+- Fleet lint still reports duplicate module IDs as operational failures but no longer labels them as modules that do not expose a manifest.
+
 ## 0.29.1 — 2026-10-02
 
 - Linux module teardown atomically kills the contained process tree with `cgroup.kill` after waiting for graceful module shutdown. If cgroup delegation or kernel support is unavailable, teardown kills only the direct child as before. I/O failures produce a warning but do not change the teardown result.

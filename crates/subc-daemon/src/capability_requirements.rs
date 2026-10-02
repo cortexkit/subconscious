@@ -110,6 +110,14 @@ struct ConfiguredCandidate {
     enabled: bool,
 }
 
+impl ConfiguredCandidate {
+    fn enabled_in(&self, runtime: Option<&RuntimeModule>) -> bool {
+        // Configuration is the startup default. Supervisor start/stop commands
+        // override it for this daemon lifetime, including before the next HELLO.
+        runtime.map_or(self.enabled, |module| module.enabled)
+    }
+}
+
 #[derive(Debug, Clone)]
 struct CachedManifest {
     declarations: CapabilityDeclarations,
@@ -138,7 +146,6 @@ struct EvaluatorState {
     process: BTreeMap<String, ProcessEvidence>,
     requirements: BTreeMap<RequirementKey, RequirementRecord>,
     statuses: BTreeMap<RequirementKey, RequirementStatus>,
-    refused_claimants: BTreeMap<String, BTreeSet<String>>,
 }
 
 /// In-memory, configuration-scoped capability requirement evaluator.
@@ -188,11 +195,6 @@ impl CapabilityRequirementEvaluator {
         state.configured = configured;
         state.reserved_capabilities = reserved_capabilities;
         let configured_ids = state.configured.keys().cloned().collect::<BTreeSet<_>>();
-        let reserved_ids = state
-            .reserved_capabilities
-            .keys()
-            .cloned()
-            .collect::<BTreeSet<_>>();
         let config_generation = state.config_generation;
         state
             .cached
@@ -203,9 +205,6 @@ impl CapabilityRequirementEvaluator {
         state
             .process
             .retain(|module_id, _| configured_ids.contains(module_id));
-        state
-            .refused_claimants
-            .retain(|capability, _| reserved_ids.contains(capability));
         for cache in state.cached.values_mut() {
             cache.config_generation = config_generation;
         }
@@ -250,8 +249,9 @@ impl CapabilityRequirementEvaluator {
     }
 
     /// Return a typed reserved-capability conflict for a claimant before it can
-    /// enter the catalog. The bound module is always first; refused claimants are
-    /// maintained in lexicographic order for deterministic operator output.
+    /// enter the catalog. The bound module is always first. A refused attempt
+    /// never becomes live catalog evidence and must not be replayed as a new
+    /// conflict when an unrelated module changes its catalog.
     pub(crate) fn reserved_hello_refusals(
         &self,
         module_id: &str,
@@ -260,7 +260,7 @@ impl CapabilityRequirementEvaluator {
         let Some(capabilities) = capabilities else {
             return Vec::new();
         };
-        let mut state = self
+        let state = self
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -272,28 +272,9 @@ impl CapabilityRequirementEvaluator {
             if bound_module == module_id {
                 continue;
             }
-            state
-                .refused_claimants
-                .entry(capability.clone())
-                .or_default()
-                .insert(module_id.to_string());
-            let mut claimants = Vec::with_capacity(
-                1 + state
-                    .refused_claimants
-                    .get(capability)
-                    .map_or(0, BTreeSet::len),
-            );
-            claimants.push(bound_module);
-            claimants.extend(
-                state
-                    .refused_claimants
-                    .get(capability)
-                    .into_iter()
-                    .flat_map(|claimants| claimants.iter().cloned()),
-            );
             events.push(DuplicateClaimEvent {
                 capability: capability.clone(),
-                claimants,
+                claimants: vec![bound_module, module_id.to_string()],
                 source: DuplicateClaimSource::Hello,
             });
         }
@@ -346,12 +327,7 @@ impl CapabilityRequirementEvaluator {
         for (module_id, configured) in &configured {
             let process = if registered.contains_key(module_id) {
                 ProcessEvidence::Registered
-            } else if !configured.enabled
-                || runtime
-                    .get(module_id)
-                    .map(|module| !module.enabled)
-                    .unwrap_or(false)
-            {
+            } else if !configured.enabled_in(runtime.get(module_id).copied()) {
                 ProcessEvidence::Absent
             } else {
                 match runtime.get(module_id).map(|module| module.state) {
@@ -385,7 +361,14 @@ impl CapabilityRequirementEvaluator {
 
         let requirements = requirement_declarations(&state, &registered, &runtime);
         let keys = requirements.keys().cloned().collect::<BTreeSet<_>>();
-        state.requirements.retain(|key, _| keys.contains(key));
+        // A removed declaration ends its active verdict, not its daemon-lifetime
+        // episode history. Reappearing requirements start a fresh transition
+        // without reusing a sequence number that log consumers already saw.
+        for (key, record) in &mut state.requirements {
+            if !keys.contains(key) {
+                record.last_verdict = None;
+            }
+        }
         state.statuses.retain(|key, _| keys.contains(key));
         let expired_detail = expired_candidate_detail(&state, now_ms);
         let mut events = Vec::new();
@@ -395,11 +378,7 @@ impl CapabilityRequirementEvaluator {
                 .values()
                 .any(|module| provides(module.capabilities.as_ref(), &key.capability));
             let config_satisfiable = state.configured.iter().any(|(module_id, configured)| {
-                configured.enabled
-                    && runtime
-                        .get(module_id)
-                        .map(|module| module.enabled)
-                        .unwrap_or(true)
+                configured.enabled_in(runtime.get(module_id).copied())
                     && (registered.get(module_id).is_some_and(|module| {
                         provides(module.capabilities.as_ref(), &key.capability)
                     }) || state
@@ -513,11 +492,6 @@ impl CapabilityRequirementEvaluator {
             .reserved_capabilities
             .iter()
             .filter_map(|(capability, bound_module)| {
-                let refused = state
-                    .refused_claimants
-                    .get(capability)
-                    .into_iter()
-                    .flat_map(|ids| ids.iter());
                 let registered_conflicts = registered
                     .iter()
                     .filter(|module| {
@@ -525,10 +499,7 @@ impl CapabilityRequirementEvaluator {
                             && provides(module.capabilities.as_ref(), capability)
                     })
                     .map(|module| &module.module_id);
-                let conflicts = refused
-                    .chain(registered_conflicts)
-                    .cloned()
-                    .collect::<BTreeSet<_>>();
+                let conflicts = registered_conflicts.cloned().collect::<BTreeSet<_>>();
                 (!conflicts.is_empty()).then(|| DuplicateClaimEvent {
                     capability: capability.clone(),
                     claimants: std::iter::once(bound_module.clone())
@@ -680,12 +651,7 @@ fn requirement_declarations(
 ) -> BTreeMap<RequirementKey, CapabilityNeed> {
     let mut declarations = BTreeMap::new();
     for (module_id, configured) in &state.configured {
-        if !configured.enabled
-            || runtime
-                .get(module_id)
-                .map(|module| !module.enabled)
-                .unwrap_or(false)
-        {
+        if !configured.enabled_in(runtime.get(module_id).copied()) {
             continue;
         }
         if let Some(cache) = state.cached.get(module_id) {
@@ -1082,6 +1048,78 @@ mod tests {
     }
 
     #[test]
+    fn runtime_enabled_provider_gets_pending_window_despite_config_default() {
+        for cached in [false, true] {
+            let evaluator = CapabilityRequirementEvaluator::new();
+            evaluator.configure(
+                [
+                    ("consumer".to_string(), true),
+                    ("provider".to_string(), false),
+                ],
+                BTreeMap::new(),
+            );
+            if cached {
+                evaluator.record_hello(&registered("provider", &["thing/v1"], &[]));
+            }
+            let consumer = registered("consumer", &[], &[("thing/v1", CapabilityNeed::Required)]);
+            let starting = [runtime("provider", ModuleState::Starting)];
+            let events = evaluator.evaluate_at_ms(0, &starting, std::slice::from_ref(&consumer));
+            assert_eq!(events[0].status.verdict, CapabilityVerdict::Pending);
+            assert_eq!(events[0].severity, RequirementSeverity::Info);
+            assert_eq!(events[0].status.config_satisfiable, cached);
+            let expired =
+                evaluator.evaluate_at_ms(deadline_ms(), &starting, std::slice::from_ref(&consumer));
+            assert_eq!(expired[0].status.verdict, CapabilityVerdict::NeverProvided);
+            let disabled = RuntimeModule {
+                module_id: "provider".to_string(),
+                state: ModuleState::Disabled,
+                enabled: false,
+            };
+            evaluator.evaluate_at_ms(
+                deadline_ms() + 1,
+                &[disabled],
+                std::slice::from_ref(&consumer),
+            );
+            assert!(!evaluator.statuses()[0].config_satisfiable);
+            let restarted = evaluator.evaluate_at_ms(deadline_ms() + 2, &starting, &[consumer]);
+            assert_eq!(restarted[0].status.verdict, CapabilityVerdict::Pending);
+        }
+    }
+
+    #[test]
+    fn requirement_episode_sequence_survives_disable_and_manifest_removal() {
+        let evaluator = CapabilityRequirementEvaluator::new();
+        evaluator.configure([("consumer".to_string(), true)], BTreeMap::new());
+        let consumer = registered("consumer", &[], &[("thing/v1", CapabilityNeed::Required)]);
+        evaluator.record_hello(&consumer);
+        assert_eq!(
+            evaluator.evaluate_at_ms(0, &[], std::slice::from_ref(&consumer))[0]
+                .status
+                .episode_seq,
+            1
+        );
+        let disabled = RuntimeModule {
+            module_id: "consumer".to_string(),
+            state: ModuleState::Disabled,
+            enabled: false,
+        };
+        evaluator.evaluate_at_ms(1, &[disabled], &[]);
+        assert!(evaluator.statuses().is_empty());
+        let next = evaluator.evaluate_at_ms(
+            2,
+            &[runtime("consumer", ModuleState::Running)],
+            std::slice::from_ref(&consumer),
+        );
+        assert_eq!(next[0].status.episode_seq, 2);
+        let without_requirement = registered("consumer", &[], &[]);
+        evaluator.record_hello(&without_requirement);
+        evaluator.evaluate_at_ms(3, &[], &[without_requirement]);
+        assert!(evaluator.statuses().is_empty());
+        let third = evaluator.evaluate_at_ms(4, &[], &[consumer]);
+        assert_eq!(third[0].status.episode_seq, 3);
+    }
+
+    #[test]
     fn duplicate_claim_event_orders_bound_then_refused_for_both_sources() {
         let evaluator = CapabilityRequirementEvaluator::new();
         evaluator.configure(
@@ -1095,9 +1133,39 @@ mod tests {
         assert_eq!(hello[0].claimants, ["vault", "zeta"]);
         let update = evaluator.duplicate_claims(
             DuplicateClaimSource::CatalogUpdate,
-            &[registered("alpha", &["credentials-provider/v1"], &[])],
+            &[
+                registered("zeta", &["credentials-provider/v1"], &[]),
+                registered("alpha", &["credentials-provider/v1"], &[]),
+            ],
         );
         assert_eq!(update[0].source, DuplicateClaimSource::CatalogUpdate);
         assert_eq!(update[0].claimants, ["vault", "alpha", "zeta"]);
+    }
+
+    #[test]
+    fn refused_claimant_is_not_relogged_on_unrelated_catalog_update() {
+        let evaluator = CapabilityRequirementEvaluator::new();
+        evaluator.configure(
+            [],
+            BTreeMap::from([("thing/v1".to_string(), "vault".to_string())]),
+        );
+        let refused =
+            evaluator.reserved_hello_refusals("squatter", Some(&declarations(&["thing/v1"], &[])));
+        assert_eq!(refused[0].claimants, ["vault", "squatter"]);
+        assert!(
+            evaluator
+                .duplicate_claims(
+                    DuplicateClaimSource::CatalogUpdate,
+                    &[registered("other", &["other/v1"], &[])]
+                )
+                .is_empty(),
+            "an unrelated update is not a new attempt by an unregistered claimant"
+        );
+        assert_eq!(
+            evaluator.reserved_hello_refusals("squatter", Some(&declarations(&["thing/v1"], &[])))
+                [0]
+            .claimants,
+            ["vault", "squatter"]
+        );
     }
 }

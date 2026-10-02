@@ -187,6 +187,7 @@ async fn lint_with_timeout(
         .count();
     let unavailable = failures
         .iter()
+        .filter(|failure| failure.class != OperationalClass::DuplicateModuleId)
         .map(|failure| failure.module.as_str())
         .collect::<BTreeSet<_>>()
         .into_iter()
@@ -414,6 +415,15 @@ async fn read_manifest(
     }
 
     let mut command = Command::new(&module.program);
+    // Test fixtures must not inherit the operator's fleet paths. Keep the
+    // environment on the child command, not the parallel test process.
+    #[cfg(test)]
+    let isolated = subc_test_support::TestTempDir::new("fleet-lint-manifest");
+    #[cfg(test)]
+    command
+        .env("XDG_DATA_HOME", isolated.path().join("data"))
+        .env("XDG_RUNTIME_DIR", isolated.path().join("runtime"))
+        .env("XDG_CONFIG_HOME", isolated.path().join("config"));
     command
         .arg("--manifest")
         .stdin(Stdio::null())
@@ -842,7 +852,11 @@ mod tests {
     #[tokio::test]
     async fn fixture_duplicate_module_id_classifies_operational_failure() {
         let temp = TempDir::new("duplicate-module-id");
-        let script = manifest_fixture(&temp, "duplicate", Value::Null);
+        let script = manifest_fixture(
+            &temp,
+            "duplicate",
+            json!({"provides": [], "requires": [], "must_never_reach": []}),
+        );
         let config = temp.path().join("subc.jsonc");
         // Hand-written JSON because serde_json cannot emit the duplicate key
         // this test exists to exercise -- but the PATH must still be a valid
@@ -861,6 +875,11 @@ mod tests {
         let report = lint_config(&config, false).await;
         assert_eq!(report.outcome, LintOutcome::OperationalFailure);
         assert_failure(&report, OperationalClass::DuplicateModuleId, "duplicate");
+        assert_eq!(
+            report.render().lines().next().unwrap(),
+            "checked 1 of 1 configured modules",
+            "a duplicate id is an operational error, not a missing manifest"
+        );
     }
 
     #[tokio::test]

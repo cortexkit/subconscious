@@ -598,15 +598,12 @@ impl ReverseRelay {
         {
             Ok(handle) => handle,
             Err(error) => {
-                let mut pending = self.pending.lock().await;
-                if pending.remove(&key).is_some() {
-                    self.send_reverse_error(
-                        route_handle,
-                        reverse_corr,
-                        service_error_to_reverse_error(error),
-                    )
-                    .await;
-                }
+                let frame = self.build_reverse_error(
+                    route_handle,
+                    reverse_corr,
+                    service_error_to_reverse_error(error),
+                );
+                self.settle_pending_frame(key, frame).await;
                 return;
             }
         };
@@ -654,20 +651,33 @@ impl ReverseRelay {
         key: PendingKey,
         result: std::result::Result<ClientResult, ServiceError>,
     ) {
-        // Keep settlement serialized with teardown until the terminal frame is
-        // queued. Removing the entry alone lets fail_session miss an answer
-        // still being sent and close its route before that answer reaches it.
-        let mut pending = self.pending.lock().await;
-        if pending.remove(&key).is_none() {
-            return;
-        }
         let handle = self.route_handle(key.0, key.1);
-        match result {
-            Ok(result) => self.send_reverse_response(handle, key.2, result).await,
+        let frame = match result {
+            Ok(result) => self.build_reverse_response(handle, key.2, result),
             Err(error) => {
-                self.send_reverse_error(handle, key.2, service_error_to_reverse_error(error))
-                    .await;
+                self.build_reverse_error(handle, key.2, service_error_to_reverse_error(error))
             }
+        };
+        self.settle_pending_frame(key, frame).await;
+    }
+
+    async fn settle_pending_frame(&self, key: PendingKey, frame: Option<SubcFrame>) {
+        let Some(frame) = frame else {
+            return;
+        };
+        // Wait for writer capacity without blocking pending-request inspection.
+        // Ownership removal and enqueue are atomic with respect to teardown:
+        // fail_session either owns the request or sees its terminal frame queued.
+        let permit = match self.tx.reserve().await {
+            Ok(permit) => permit,
+            Err(error) => {
+                tracing::error!(target: "relay", "failed to reserve reverse relay frame: {error}");
+                return;
+            }
+        };
+        let mut pending = self.pending.lock().await;
+        if pending.remove(&key).is_some() {
+            permit.send(frame);
         }
     }
 
@@ -783,32 +793,39 @@ impl ReverseRelay {
             .collect()
     }
 
-    async fn send_reverse_response(
+    fn build_reverse_response(
         &self,
         handle: RouteHandle,
         reverse_corr: u64,
         result: ClientResult,
-    ) {
+    ) -> Option<SubcFrame> {
         match serde_json::to_vec(&result) {
-            Ok(body) => {
-                self.send_reverse_frame(FrameType::Response, handle, reverse_corr, body)
-                    .await
-            }
-            Err(error) => {
-                self.send_reverse_error(
-                    handle,
-                    reverse_corr,
-                    ErrorData::internal_error(
-                        format!("failed to encode reverse MCP response: {error}"),
-                        None,
-                    ),
-                )
-                .await;
-            }
+            Ok(body) => self.build_reverse_frame(FrameType::Response, handle, reverse_corr, body),
+            Err(error) => self.build_reverse_error(
+                handle,
+                reverse_corr,
+                ErrorData::internal_error(
+                    format!("failed to encode reverse MCP response: {error}"),
+                    None,
+                ),
+            ),
         }
     }
 
     async fn send_reverse_error(&self, handle: RouteHandle, reverse_corr: u64, error: ErrorData) {
+        if let Some(frame) = self.build_reverse_error(handle, reverse_corr, error) {
+            if let Err(error) = self.tx.send(frame).await {
+                tracing::error!(target: "relay", "failed to send reverse relay frame: {error}");
+            }
+        }
+    }
+
+    fn build_reverse_error(
+        &self,
+        handle: RouteHandle,
+        reverse_corr: u64,
+        error: ErrorData,
+    ) -> Option<SubcFrame> {
         let body = match serde_json::to_vec(&error) {
             Ok(body) => body,
             Err(error) => {
@@ -816,8 +833,7 @@ impl ReverseRelay {
                 Vec::new()
             }
         };
-        self.send_reverse_frame(FrameType::Error, handle, reverse_corr, body)
-            .await;
+        self.build_reverse_frame(FrameType::Error, handle, reverse_corr, body)
     }
 
     async fn send_reverse_frame(
@@ -827,11 +843,25 @@ impl ReverseRelay {
         reverse_corr: u64,
         body: Vec<u8>,
     ) {
+        if let Some(frame) = self.build_reverse_frame(ty, handle, reverse_corr, body) {
+            if let Err(error) = self.tx.send(frame).await {
+                tracing::error!(target: "relay", "failed to send reverse relay frame: {error}");
+            }
+        }
+    }
+
+    fn build_reverse_frame(
+        &self,
+        ty: FrameType,
+        handle: RouteHandle,
+        reverse_corr: u64,
+        body: Vec<u8>,
+    ) -> Option<SubcFrame> {
         if handle.connection_token != self.connection_token {
             tracing::warn!(target: "relay", "refusing reverse reply for a stale subc connection");
-            return;
+            return None;
         }
-        let frame = match build_frame(
+        match build_frame(
             ty,
             data_flags(),
             handle.channel,
@@ -839,14 +869,11 @@ impl ReverseRelay {
             reverse_corr,
             body,
         ) {
-            Ok(frame) => frame,
+            Ok(frame) => Some(frame),
             Err(error) => {
                 tracing::error!(target: "relay", "failed to build reverse relay frame: {error}");
-                return;
+                None
             }
-        };
-        if let Err(error) = self.tx.send(frame).await {
-            tracing::error!(target: "relay", "failed to send reverse relay frame: {error}");
         }
     }
 }
@@ -6095,6 +6122,47 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn health_metrics_complete_while_reverse_settlement_waits_for_writer_capacity() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let relay = ReverseRelay::new(tx, 1);
+        let key = (7, 1, 905);
+        relay
+            .pending
+            .lock()
+            .await
+            .insert(key, PendingRelayEntry::new("host".to_owned()));
+        relay
+            .tx
+            .send(build_frame(FrameType::Response, data_flags(), 7, 1, 0, Vec::new()).unwrap())
+            .await
+            .unwrap();
+        let answer = relay.settle_host_answer(
+            key,
+            Err(ServiceError::McpError(ErrorData::internal_error(
+                "host disconnected",
+                None,
+            ))),
+        );
+        tokio::pin!(answer);
+        std::future::poll_fn(|cx| {
+            assert!(answer.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        // A blocked writer must not hide pending work from the health probe.
+        let metrics = time::timeout(Duration::from_millis(100), relay.health_metrics())
+            .await
+            .expect(
+                "health metrics must complete while reverse settlement waits for writer capacity",
+            );
+        assert_eq!(metrics["pending_reverse_requests"], 1);
+        rx.recv().await.unwrap();
+        answer.await;
+        assert_eq!(rx.recv().await.unwrap().header.ty, FrameType::Error);
+        assert_eq!(relay.health_metrics().await["pending_reverse_requests"], 0);
+    }
+
+    #[tokio::test]
     async fn session_failure_waits_for_in_flight_reverse_error_enqueue() {
         let (tx, mut rx) = mpsc::channel(1);
         let relay = ReverseRelay::new(tx, 1);
@@ -6105,8 +6173,8 @@ mod tests {
             .lock()
             .await
             .insert(key, PendingRelayEntry::new(session.id().to_owned()));
-        // Saturate the writer queue so settlement pauses after claiming the
-        // pending request but before its ERROR can enter the FIFO.
+        // Saturate the writer queue so settlement waits for a permit without
+        // claiming the request. Teardown must then settle it before returning.
         relay
             .tx
             .send(build_frame(FrameType::Response, data_flags(), 7, 1, 0, Vec::new()).unwrap())

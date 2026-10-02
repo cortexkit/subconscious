@@ -2230,12 +2230,21 @@ async fn wait_for_connection_file(path: &Path, wait: Duration) {
 async fn wait_for_catalog_module(path: &Path, module_id: &str, wait: Duration) {
     let deadline = Instant::now() + wait;
     let mut corr = 1_000;
+    let mut last_error = None;
     loop {
-        if catalog_modules(path, Some(module_id), corr).await.len() == 1 {
-            return;
+        // A daemon that has just restarted can publish its connection file before
+        // it answers the handshake promptly (a 2 s ServerProof timeout on a loaded
+        // Windows runner), so a failed connect means "not yet", like an empty
+        // catalog, until the deadline.
+        match try_catalog_modules(path, Some(module_id), corr).await {
+            Ok(modules) if modules.len() == 1 => return,
+            Ok(_) => {}
+            Err(error) => last_error = Some(error),
         }
         if Instant::now() >= deadline {
-            panic!("module {module_id} did not register in catalog within {wait:?}");
+            panic!(
+                "module {module_id} did not register in catalog within {wait:?}; last connect error: {last_error:?}"
+            );
         }
         corr += 1;
         sleep(Duration::from_millis(50)).await;
@@ -2270,7 +2279,17 @@ fn read_events(path: &Path) -> Vec<Value> {
 }
 
 async fn catalog_modules(path: &Path, module_id: Option<&str>, corr: u64) -> Vec<Value> {
-    let mut client = connect_authed_client(path).await.unwrap();
+    try_catalog_modules(path, module_id, corr).await.unwrap()
+}
+
+async fn try_catalog_modules(
+    path: &Path,
+    module_id: Option<&str>,
+    corr: u64,
+) -> Result<Vec<Value>, String> {
+    let mut client = connect_authed_client(path)
+        .await
+        .map_err(|error| error.to_string())?;
     let response = control_rpc_on_stream(
         &mut client,
         corr,
@@ -2281,7 +2300,7 @@ async fn catalog_modules(path: &Path, module_id: Option<&str>, corr: u64) -> Vec
     )
     .await;
     assert_eq!(response["op"], "catalog.list");
-    response["modules"].as_array().cloned().unwrap_or_default()
+    Ok(response["modules"].as_array().cloned().unwrap_or_default())
 }
 
 async fn open_route<S>(stream: &mut S, module_id: &str, corr: u64) -> (u16, u32)

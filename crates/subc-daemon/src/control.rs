@@ -2545,6 +2545,27 @@ impl ControlHandler {
             )?]);
         }
 
+        // Updates must honor the same reserved owner as initial registration;
+        // otherwise an empty HELLO could acquire the claim after admission.
+        let mut conflicts = self
+            .capability_evaluator
+            .reserved_hello_refusals(&candidate.module_id, candidate.capabilities.as_ref());
+        if let Some(conflict) = conflicts.first() {
+            let message = format!(
+                "capability '{}' is reserved for module_id '{}'; claimant '{}' was refused",
+                conflict.capability, conflict.claimants[0], candidate.module_id
+            );
+            for conflict in &mut conflicts {
+                conflict.source = DuplicateClaimSource::CatalogUpdate;
+            }
+            log_duplicate_claim_events(conflicts);
+            return Ok(vec![control_error_frame(
+                &frame,
+                "reserved_capability",
+                message,
+            )?]);
+        }
+
         let updated = self
             .registry
             .replace_catalog_for_connection(connection_id, provides, capabilities, ready)
@@ -7293,6 +7314,69 @@ mod tests {
             0,
             "a reserved capability refusal must not leave a catalog entry"
         );
+    }
+
+    #[tokio::test]
+    async fn catalog_update_refuses_reserved_capabilities_for_active_and_candidate() {
+        for candidate in [false, true] {
+            let registry = Arc::new(Registry::default());
+            let handler = ControlHandler::new(Arc::clone(&registry)).with_capability_config(
+                [("vault".to_string(), true), ("squatter".to_string(), true)],
+                BTreeMap::from([("credentials-provider/v1".to_string(), "vault".to_string())]),
+            );
+            let conn = ConnectionId::new(77);
+            let (ctx, mut rx) = route_ctx(conn);
+            let initial = capability_manifest("squatter", &[], &[]);
+            if candidate {
+                registry
+                    .register_candidate_with_control_ops(
+                        initial.clone(),
+                        PROTOCOL_VERSION,
+                        conn,
+                        module_baseline_control_ops(),
+                    )
+                    .unwrap();
+                handler
+                    .forwarding
+                    .register_candidate_module_connection(
+                        conn,
+                        "squatter".to_string(),
+                        PROTOCOL_VERSION,
+                        manifest_concurrency(&initial),
+                        ctx.egress.clone(),
+                    )
+                    .unwrap();
+            } else {
+                hello_via_sink(
+                    &handler,
+                    &ctx,
+                    &mut rx,
+                    hello_frame_with_manifest(initial.clone(), 1),
+                )
+                .await;
+            }
+            let response = handler
+                .handle_control_frame(
+                    &ctx,
+                    catalog_update_with_capabilities_frame(
+                        2,
+                        capability_manifest("squatter", &["credentials-provider/v1"], &[])
+                            .capabilities
+                            .unwrap(),
+                    ),
+                )
+                .await
+                .unwrap();
+            assert_eq!(parse_error(&response[0])["code"], "reserved_capability");
+            assert_eq!(
+                registry
+                    .get_module_by_connection(conn)
+                    .unwrap()
+                    .unwrap()
+                    .manifest,
+                initial
+            );
+        }
     }
 
     #[test]

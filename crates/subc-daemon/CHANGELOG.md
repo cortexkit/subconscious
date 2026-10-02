@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.29.2
+
+- Reject reserved capability claims in `catalog.update` before changing active or swap-candidate registrations, using the same `reserved_capability` error as HELLO.
+
 ## 0.29.1 — 2026-10-02
 
 - Linux module teardown atomically kills the contained process tree with `cgroup.kill` after waiting for graceful module shutdown. If cgroup delegation or kernel support is unavailable, teardown kills only the direct child as before. I/O failures produce a warning but do not change the teardown result.

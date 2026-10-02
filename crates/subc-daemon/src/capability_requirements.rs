@@ -385,7 +385,14 @@ impl CapabilityRequirementEvaluator {
 
         let requirements = requirement_declarations(&state, &registered, &runtime);
         let keys = requirements.keys().cloned().collect::<BTreeSet<_>>();
-        state.requirements.retain(|key, _| keys.contains(key));
+        // A removed declaration ends its active verdict, not its daemon-lifetime
+        // episode history. Reappearing requirements start a fresh transition
+        // without reusing a sequence number that log consumers already saw.
+        for (key, record) in &mut state.requirements {
+            if !keys.contains(key) {
+                record.last_verdict = None;
+            }
+        }
         state.statuses.retain(|key, _| keys.contains(key));
         let expired_detail = expired_candidate_detail(&state, now_ms);
         let mut events = Vec::new();
@@ -1079,6 +1086,39 @@ mod tests {
             evaluator.evaluate_at_ms(0, &[runtime("consumer", ModuleState::Running)], &[consumer]);
         assert_eq!(events[0].status.verdict, CapabilityVerdict::NeverProvided);
         assert!(!events[0].status.config_satisfiable);
+    }
+
+    #[test]
+    fn requirement_episode_sequence_survives_disable_and_manifest_removal() {
+        let evaluator = CapabilityRequirementEvaluator::new();
+        evaluator.configure([("consumer".to_string(), true)], BTreeMap::new());
+        let consumer = registered("consumer", &[], &[("thing/v1", CapabilityNeed::Required)]);
+        evaluator.record_hello(&consumer);
+        assert_eq!(
+            evaluator.evaluate_at_ms(0, &[], std::slice::from_ref(&consumer))[0]
+                .status
+                .episode_seq,
+            1
+        );
+        let disabled = RuntimeModule {
+            module_id: "consumer".to_string(),
+            state: ModuleState::Disabled,
+            enabled: false,
+        };
+        evaluator.evaluate_at_ms(1, &[disabled], &[]);
+        assert!(evaluator.statuses().is_empty());
+        let next = evaluator.evaluate_at_ms(
+            2,
+            &[runtime("consumer", ModuleState::Running)],
+            std::slice::from_ref(&consumer),
+        );
+        assert_eq!(next[0].status.episode_seq, 2);
+        let without_requirement = registered("consumer", &[], &[]);
+        evaluator.record_hello(&without_requirement);
+        evaluator.evaluate_at_ms(3, &[], &[without_requirement]);
+        assert!(evaluator.statuses().is_empty());
+        let third = evaluator.evaluate_at_ms(4, &[], &[consumer]);
+        assert_eq!(third[0].status.episode_seq, 3);
     }
 
     #[test]

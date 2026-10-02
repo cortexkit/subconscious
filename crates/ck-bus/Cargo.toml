@@ -42,7 +42,7 @@ subc-test-support = { path = "../subc-test-support" }
 tempfile = "3"
 tokio = { version = "1", features = ["io-util", "net"] }
 subc-control = { path = "../subc-control", version = "0.27" }
-subc-daemon = { path = "../subc-daemon", version = "0.28.0", features = ["test-support"] }
+subc-daemon = { path = "../subc-daemon", version = "0.29.0", features = ["test-support"] }
 subc-jsonc = { path = "../subc-jsonc", version = "0.1.0" }
 subc-transport = { path = "../subc-transport", version = "0.9" }
 tracing = "0.1"

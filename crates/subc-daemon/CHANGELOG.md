@@ -1,8 +1,9 @@
 # Changelog
 
-## 0.28.2 — 2026-10-02
+## 0.29.0 — 2026-10-02
 
-- Lifecycle control pushes name exactly the client-side channels covered on each receiving connection, including scope revocations, module drains and daemon shutdown. Route GOODBYE still carries no body; the reason is conveyed only by the control push. Update the control dependency to 0.27.
+- Lifecycle control pushes name exactly the client-side channels covered on each receiving connection, including scope revocations, module drains and daemon shutdown. Route GOODBYE still carries no body; the reason is conveyed only by the control push.
+- Minor bump because this crate's public API carries `subc-control` types and moves to `subc-control` 0.27 (`RouteClosing` and `RouteClosed` gain `channels`). A consumer that also depends on `subc-control` directly must move both together, or two incompatible copies would meet.
 
 ## 0.28.1 — 2026-10-02
 

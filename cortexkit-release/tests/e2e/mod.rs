@@ -19,9 +19,7 @@ const DECLARATION: &str = r#"{
       "identity_channel": "asset_sha256"
     }],
     "phases": [
-      {"id": "preflight", "type": "preflight"},
-      {"id": "publish-assets", "type": "assets"},
-      {"id": "stage-artifacts", "type": "stage"}
+      {"id": "publish-assets", "type": "assets"}
     ]
   }]
 }"#;
@@ -54,6 +52,22 @@ fn mint_repository() -> TempDir {
         git_config_home.path(),
         root,
         ["commit", "-m", "mint synthetic release repository"],
+    );
+    let origin = root.join(".git/synthetic-origin.git");
+    run_git(
+        git_config_home.path(),
+        root,
+        [
+            "clone",
+            "--bare",
+            root.to_str().unwrap(),
+            origin.to_str().unwrap(),
+        ],
+    );
+    run_git(
+        git_config_home.path(),
+        root,
+        ["remote", "add", "origin", origin.to_str().unwrap()],
     );
     repository
 }
@@ -246,4 +260,205 @@ fn synthetic_train_drives_cli_commands_through_interruption_and_write_ahead_repl
     )
     .unwrap();
     assert_eq!(abandoned.data["evidence_retained"], true);
+}
+
+#[test]
+fn printed_recovery_actions_are_callable_train_names() {
+    for action in ["rebind", "abandon"] {
+        let repository = mint_repository();
+        let state_root = tempfile::tempdir().unwrap();
+        let artifact = repository.path().join("archive.bin");
+        let repo = repository.path().display().to_string();
+        let mut arguments = common_arguments(repository.path(), &artifact);
+        arguments.splice(2..2, ["execute".to_owned()]);
+        arguments.extend([
+            "--synthetic-provider".to_owned(),
+            "--confirm-first-public-trigger".to_owned(),
+            "--interrupt-after-effect".to_owned(),
+        ]);
+        machine(state_root.path(), &arguments).unwrap_err();
+        fs::write(
+            repository.path().join(".cortexkit/release.jsonc"),
+            DECLARATION.replace(
+                "\"signing_profile\": \"none\"",
+                "\"signing_profile\": \"minisign\"",
+            ),
+        )
+        .unwrap();
+        let status = machine(
+            state_root.path(),
+            [
+                "ck-release",
+                "status",
+                "--repo",
+                &repo,
+                "--train",
+                "synthetic",
+            ],
+        )
+        .unwrap();
+        let printed = status.data["next_permitted_actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find_map(|value| value.as_str().filter(|value| value.starts_with(action)))
+            .unwrap();
+        let mut recovery = vec!["ck-release"];
+        recovery.extend(printed.split_whitespace());
+        recovery.extend(["--repo", &repo]);
+        let result = machine(state_root.path(), recovery);
+        assert!(
+            result.is_ok(),
+            "printed action `{printed}` failed: {result:?}"
+        );
+    }
+}
+
+#[test]
+fn pending_intent_resumes_after_confirmed_rebind() {
+    let repository = mint_repository();
+    let state_root = tempfile::tempdir().unwrap();
+    let artifact = repository.path().join("archive.bin");
+    let repo = repository.path().display().to_string();
+    let mut arguments = common_arguments(repository.path(), &artifact);
+    arguments.splice(2..2, ["execute".to_owned()]);
+    arguments.extend([
+        "--synthetic-provider".to_owned(),
+        "--confirm-first-public-trigger".to_owned(),
+        "--interrupt-after-effect".to_owned(),
+    ]);
+    let interrupted = machine(state_root.path(), &arguments).unwrap_err();
+    assert_eq!(interrupted.detail.code, "synthetic_interruption");
+    fs::write(
+        repository.path().join(".cortexkit/release.jsonc"),
+        DECLARATION.replace(
+            "\"signing_profile\": \"none\"",
+            "\"signing_profile\": \"minisign\"",
+        ),
+    )
+    .unwrap();
+    let preview = machine(
+        state_root.path(),
+        ["ck-release", "rebind", "--repo", &repo, "synthetic"],
+    )
+    .unwrap();
+    let digest = preview.data["preview"]["replacement_digest"]
+        .as_str()
+        .unwrap();
+    machine(
+        state_root.path(),
+        [
+            "ck-release",
+            "rebind",
+            "--repo",
+            &repo,
+            "synthetic",
+            "--confirm",
+            digest,
+        ],
+    )
+    .unwrap();
+    arguments[2] = "resume".to_owned();
+    arguments.retain(|arg| arg != "--interrupt-after-effect");
+    let resumed = machine(state_root.path(), &arguments).unwrap();
+    assert_eq!(resumed.data["synthetic_executor_calls"], 0);
+    assert_eq!(resumed.data["outcomes"][0], "reconciled");
+    assert_eq!(resumed.data["pending_intents"], json!([]));
+    assert_eq!(resumed.data["phase_state"][0]["state"], "completed");
+    assert!(resumed.data["placement_instructions"].is_object());
+}
+
+#[test]
+fn unwired_ci_gate_blocks_synthetic_publication() {
+    let repository = mint_repository();
+    let state_root = tempfile::tempdir().unwrap();
+    let mut declaration: Value = serde_json::from_str(DECLARATION).unwrap();
+    declaration["trains"][0]["phases"] = json!([
+        {"id":"ci","type":"ci_watch","params":{"workflow":"tests.yml","selector":"sha:abc123","rerun_budget":0}},
+        {"id":"build","type":"build"},
+        {"id":"publish-assets","type":"assets"}
+    ]);
+    fs::write(
+        repository.path().join(".cortexkit/release.jsonc"),
+        declaration.to_string(),
+    )
+    .unwrap();
+    let artifact = repository.path().join("archive.bin");
+    let mut arguments = common_arguments(repository.path(), &artifact);
+    arguments.splice(2..2, ["execute".to_owned()]);
+    arguments.extend([
+        "--synthetic-provider".to_owned(),
+        "--confirm-first-public-trigger".to_owned(),
+    ]);
+    let error = machine(state_root.path(), &arguments)
+        .expect_err("CI cannot succeed without a wired watcher");
+    assert_eq!(error.detail.code, "phase_not_implemented");
+    let repo = repository.path().display().to_string();
+    let status = machine(
+        state_root.path(),
+        [
+            "ck-release",
+            "status",
+            "--repo",
+            &repo,
+            "--train",
+            "synthetic",
+        ],
+    )
+    .unwrap();
+    assert_eq!(status.data["pending_intents"], json!([]));
+    assert_eq!(status.data["phase_state"][2]["state"], "not_started");
+    let effects = state_root
+        .path()
+        .join(status.data["repository"].as_str().unwrap())
+        .join("synthetic-provider-effects");
+    assert_eq!(fs::read_dir(effects).unwrap().count(), 0);
+}
+
+#[test]
+fn partitioned_publication_status_counts_selected_effects() {
+    let repository = mint_repository();
+    let state_root = tempfile::tempdir().unwrap();
+    let mut declaration: Value = serde_json::from_str(DECLARATION).unwrap();
+    declaration["trains"][0]["artifacts"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"id":"crate","kind":"crate","identity_channel":"registry_version"}));
+    declaration["trains"][0]["phases"] = json!([
+        {"id":"publish-crate","type":"publish","params":{"artifacts":["crate"]}},
+        {"id":"publish-assets","type":"assets","params":{"artifacts":["archive"]}}
+    ]);
+    fs::write(
+        repository.path().join(".cortexkit/release.jsonc"),
+        declaration.to_string(),
+    )
+    .unwrap();
+    let artifact = repository.path().join("archive.bin");
+    let mut arguments = common_arguments(repository.path(), &artifact);
+    arguments.splice(2..2, ["execute".to_owned()]);
+    arguments.extend([
+        "--synthetic-provider".to_owned(),
+        "--confirm-first-public-trigger".to_owned(),
+        "--artifact".to_owned(),
+        format!("crate={}", artifact.display()),
+    ]);
+    let result = machine(state_root.path(), &arguments).unwrap();
+    assert_eq!(result.data["synthetic_executor_calls"], 2);
+    let repo = repository.path().display().to_string();
+    let status = machine(
+        state_root.path(),
+        [
+            "ck-release",
+            "status",
+            "--repo",
+            &repo,
+            "--train",
+            "synthetic",
+        ],
+    )
+    .unwrap();
+    assert_eq!(
+        status.data["next_permitted_actions"],
+        json!(["follow_placement_instructions"])
+    );
 }

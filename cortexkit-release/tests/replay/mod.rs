@@ -283,6 +283,88 @@ fn interruption_after_public_effect_resumes_with_probe_without_duplicate_executi
 }
 
 #[test]
+fn rebound_intents_reconcile_without_duplicate_execution() {
+    assert_rebound_intent(true);
+}
+
+#[test]
+fn rebound_absent_intent_still_refuses_retry() {
+    assert_rebound_intent(false);
+}
+
+fn assert_rebound_intent(present: bool) {
+    let original = plan();
+    let (_root, journal, approvals) = state(&original);
+    let public_effect = effect(&original);
+    let old_subject = build_approval_subject(&original).unwrap();
+    let intent = journal
+        .append_intent(
+            &request(&original, &public_effect),
+            durable_subject(&old_subject),
+        )
+        .unwrap();
+    let replacement = parse(&DECLARATION.replace(
+        "\"signing_profile\": \"none\"",
+        "\"signing_profile\": \"minisign\"",
+    ))
+    .unwrap();
+    let preview = crate::ceremony::prepare_rebind(&journal, &replacement).unwrap();
+    crate::ceremony::confirm_rebind(
+        &journal,
+        &approvals,
+        preview,
+        crate::ceremony::RebindConfirmation::Confirmed,
+    )
+    .unwrap();
+    let rebound = build_dry_run_plan(
+        original.repository.clone(),
+        &replacement,
+        "release",
+        &[FinalizedArtifact {
+            artifact: "archive".into(),
+            identity: evidence().identity,
+            bytes: b"final archive bytes".to_vec(),
+        }],
+    )
+    .unwrap();
+    let subject = build_approval_subject(&rebound).unwrap();
+    let mut probe = ScriptedProbe::new([Ok(if present {
+        ProbeResult::Present(evidence())
+    } else {
+        ProbeResult::Absent(evidence())
+    })]);
+    let mut executor = ScriptedExecutor::new([Ok(evidence())]);
+    let result = reconcile_effect_unfenced_for_tests(
+        &rebound,
+        &journal,
+        &public_effect,
+        &mut probe,
+        &mut executor,
+        &subject,
+    );
+    if present {
+        assert!(matches!(result, Ok(EffectOutcome::Reconciled(_))));
+        assert!(
+            journal.pending_intents().unwrap().is_empty(),
+            "old digest intent remains pending"
+        );
+        assert!(journal.read_journal().unwrap().iter().any(|record| matches!(record, JournalRecord::Completion { intent: completed, .. } if completed.as_ref() == &intent)));
+    } else {
+        assert!(
+            matches!(
+                result,
+                Err(OrchestrationError::Refusal {
+                    code: OrchestrationRefusalCode::AttemptedIntentAbsent,
+                    ..
+                })
+            ),
+            "{result:?}"
+        );
+    }
+    assert_eq!(executor.calls, 0);
+}
+
+#[test]
 fn two_interruptions_do_not_append_duplicate_completion() {
     let plan = plan();
     let (_root, journal, _) = state(&plan);
@@ -764,6 +846,30 @@ fn declaration_and_registry_keep_post_tag_ci_watch_inexpressible() {
             ..
         })
     ));
+}
+
+#[test]
+fn declaration_allows_post_publication_readback() {
+    let declaration = DECLARATION.replace(
+        "{\"id\": \"stage\", \"type\": \"stage\"}",
+        "{\"id\": \"readback\", \"type\": \"verify_readback\"}, {\"id\": \"stage\", \"type\": \"stage\"}",
+    );
+    assert!(
+        parse(&declaration).is_ok(),
+        "readback observes an already published effect"
+    );
+}
+
+#[test]
+fn registry_allows_post_publication_readback() {
+    let mut plan = plan();
+    plan.phases.push(PlannedPhase {
+        instance: "readback".into(),
+        phase_type: "verify_readback".to_owned(),
+        params: serde_json::json!({}),
+        tree_mutating: false,
+    });
+    assert!(PhaseRegistry.validate_plan(&plan).is_ok());
 }
 
 #[test]

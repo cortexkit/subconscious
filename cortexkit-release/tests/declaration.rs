@@ -168,3 +168,66 @@ fn precheck_parameter_schemas_reject_unknown_fields() {
     assert_eq!(error.code, DeclarationRefusalCode::InvalidPhaseParameters);
     assert!(error.message.contains("unknown field `invented`"));
 }
+
+#[test]
+fn overlapping_publication_targets_refuse_with_artifact_and_phase_names() {
+    let declaration = r#"{"version":1,"trains":[{"id":"release","intended_commit":"a","tag":"v1","signing_profile":"none","operator_gates":["first_public_trigger"],"artifacts":[{"id":"archive","kind":"archive","identity_channel":"asset_sha256"}],"phases":[{"id":"registry-publish","type":"publish"},{"id":"release-assets","type":"assets"}]}]}"#;
+    let error =
+        parse(declaration).expect_err("overlapping publication must refuse before execution");
+    assert_eq!(error.code, DeclarationRefusalCode::InvalidPhaseParameters);
+    for name in ["archive", "registry-publish", "release-assets"] {
+        assert!(error.message.contains(name), "{}", error.message);
+    }
+}
+
+#[test]
+fn partitioned_publication_targets_plan_each_artifact_once() {
+    use cortexkit_release::plan::{build_dry_run_plan, FinalizedArtifact};
+    let source = r#"{"version":1,"trains":[{"id":"release","intended_commit":"a","tag":"v1","signing_profile":"none","operator_gates":["first_public_trigger"],"artifacts":[{"id":"crate","kind":"crate","identity_channel":"registry_version"},{"id":"archive","kind":"archive","identity_channel":"asset_sha256"}],"phases":[{"id":"registry-publish","type":"publish","params":{"artifacts":["crate"]}},{"id":"release-assets","type":"assets","params":{"artifacts":["archive"]}}]}]}"#;
+    let declaration = parse(source).unwrap();
+    let material = ["crate", "archive"].map(|id| FinalizedArtifact {
+        artifact: id.into(),
+        identity: "a".to_owned(),
+        bytes: vec![1],
+    });
+    let plan = build_dry_run_plan("scratch".into(), &declaration, "release", &material).unwrap();
+    let targets = plan
+        .public_effects
+        .iter()
+        .map(|effect| {
+            (
+                effect.phase.as_str(),
+                effect.artifact.as_ref().unwrap().as_str(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        targets,
+        [("registry-publish", "crate"), ("release-assets", "archive")]
+    );
+    assert_eq!(plan.probes.len(), 2);
+    for (effect, probe) in plan.public_effects.iter().zip(&plan.probes) {
+        assert_eq!(effect.phase, probe.phase);
+        assert_eq!(effect.artifact, probe.artifact);
+    }
+}
+
+#[test]
+fn publication_targets_must_be_nonempty_unique_declared_artifact_ids() {
+    for targets in [
+        "[]",
+        "[\"unknown\"]",
+        "[\"archive\",\"archive\"]",
+        "[7]",
+        "\"archive\"",
+    ] {
+        let source = format!(
+            r#"{{"version":1,"trains":[{{"id":"release","intended_commit":"a","tag":"v1","signing_profile":"none","operator_gates":["first_public_trigger"],"artifacts":[{{"id":"archive","kind":"archive","identity_channel":"asset_sha256"}}],"phases":[{{"id":"publish","type":"publish","params":{{"artifacts":{targets}}}}}]}}]}}"#
+        );
+        assert_eq!(
+            parse(&source).unwrap_err().code,
+            DeclarationRefusalCode::InvalidPhaseParameters,
+            "{targets}"
+        );
+    }
+}

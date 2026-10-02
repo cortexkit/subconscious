@@ -3,6 +3,7 @@
 ## 0.20.1
 
 - Queue unary and managed REQUEST frames before attaching cancellation signals so an already-aborted signal cannot send CANCEL before its REQUEST.
+- On provider close, daemon GOODBYE, or fatal disconnect, reject pending reverse requests immediately, abort handler signals, and invalidate installed routes. Explicit close rejects with `provider_closed`, daemon GOODBYE with `connection_closed`, and fatal failures retain their cause.
 
 ## 0.20.0 — 2026-10-02
 

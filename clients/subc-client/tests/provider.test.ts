@@ -169,6 +169,52 @@ describe("SubcProvider draining", () => {
 });
 
 describe("SubcProvider serve loop", () => {
+  for (const ending of ["close", "GOODBYE", "fatal drop"] as const) {
+    test(`${ending} rejects reverse requests and aborts running handlers`, async () => {
+      let handle: RouteHandle | undefined;
+      let signal: AbortSignal | undefined;
+      let startHandler!: () => void;
+      const started = new Promise<void>((resolve) => { startHandler = resolve; });
+      let releaseHandler!: () => void;
+      const release = new Promise<void>((resolve) => { releaseHandler = resolve; });
+      try {
+        await withDrainPeer(() => undefined, async (provider, socket, reader) => {
+          await writeFrame(socket, buildFrame(FrameType.Request, CONTROL_FLAGS, 0, 0, 20n, encodeJson({
+            op: "route.bind", route_channel: 8, epoch: 1,
+            target: { kind: "management_surface", module_id: "drain-provider" },
+            identity: { project_root: "/tmp", harness: "test", session: "test" },
+          })), Date.now() + 1_000);
+          expect((await readFrame(reader, Date.now() + 1_000)).header.ty).toBe(FrameType.Response);
+          await waitForCondition(() => handle !== undefined, "installed provider route");
+          await writeFrame(socket, buildFrame(FrameType.Request, CONTROL_FLAGS, 8, 1, 21n, encodeJson({ method: "echo" })), Date.now() + 1_000);
+          await started;
+          const reverse = provider.request(handle!, encodeJson({ method: "reverse" }), { timeoutMs: 1_000 })
+            .then(() => null, (error: Error) => error);
+          expect((await readFrame(reader, Date.now() + 1_000)).header.ty).toBe(FrameType.Request);
+          if (ending === "close") await provider.close();
+          else if (ending === "GOODBYE") {
+            await writeFrame(socket, buildFrame(FrameType.Goodbye, CONTROL_FLAGS, 0, 0, 0n, new Uint8Array(0)), Date.now() + 1_000);
+          } else socket.destroy();
+          await provider.closed;
+          const error = await reverse;
+          expect(error).toBeInstanceOf(Error);
+          expect(error!.message).not.toBe("reverse request timed out");
+          if (ending !== "fatal drop") expect(error).toMatchObject({ code: ending === "close" ? "provider_closed" : "connection_closed" });
+          expect(signal!.aborted).toBe(true);
+          await expect(provider.request(handle!, new Uint8Array(0))).rejects.toThrow();
+        }, {
+          onBound: (bound) => { handle = bound; },
+          handler: async (_handle, body, context) => {
+            signal = context.signal;
+            startHandler();
+            await release;
+            return body;
+          },
+        });
+      } finally { releaseHandler(); }
+    });
+  }
+
   test("replies to channel-0 Ping with Pong preserving version, flags, and corr", async () => {
     const manifest = managementSurfaceManifest({ moduleId: "ping-provider", operations: ["echo"] });
     const server = await listenFakeServer();
@@ -1878,6 +1924,7 @@ async function expectDrainPong(socket: Socket, reader: SocketReader): Promise<vo
 async function withDrainPeer(
   onDraining: NonNullable<SubcProviderConnectOptions["onDraining"]>,
   run: (provider: SubcProvider, socket: Socket, reader: SocketReader) => Promise<void>,
+  options: Partial<Pick<SubcProviderConnectOptions, "handler" | "onBound">> = {},
 ): Promise<void> {
   const server = await listenFakeServer();
   const dir = trackedTempDir("subc-provider-drain-");
@@ -1904,6 +1951,7 @@ async function withDrainPeer(
         connectionFile: writeConnectionFile(dir, server.port),
         manifest: managementSurfaceManifest({ moduleId: "drain-provider", operations: ["echo"] }),
         handler: (_handle, body) => body, onDraining, launchNonce: "", reconnectOnDrop: false,
+        ...options,
       }),
       peer,
     ]);

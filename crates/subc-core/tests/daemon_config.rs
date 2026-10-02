@@ -851,7 +851,12 @@ async fn rescan_preview_reports_the_removal_it_would_make_and_makes_none() {
     let preview = supervisor_rescan_with(&daemon.connection_file_path, 902, true).await;
 
     assert_eq!(preview.removed, vec![module_id.to_string()]);
-    assert!(preview.added.is_empty());
+    // Print the whole result on failure, so a failure names the module the
+    // supervisor reported rather than only that the list was not empty.
+    assert!(
+        preview.added.is_empty(),
+        "unexpected additions: {preview:?}"
+    );
     assert!(
         preview.preview,
         "the result must carry the preview flag, or a reader meeting this output \
@@ -932,8 +937,16 @@ async fn rescan_reports_config_sections_it_cannot_apply() {
     );
     // The module section is genuinely unchanged, so the operator would otherwise
     // read a completely quiet result for a config edit that does not take effect.
-    assert!(preview.added.is_empty());
-    assert!(preview.changed_pending_reload.is_empty());
+    // Print the whole result on failure, so a failure names the module the
+    // supervisor reported rather than only that the list was not empty.
+    assert!(
+        preview.added.is_empty(),
+        "unexpected additions: {preview:?}"
+    );
+    assert!(
+        preview.changed_pending_reload.is_empty(),
+        "unexpected pending reloads: {preview:?}"
+    );
 
     let applied = supervisor_rescan_with(&daemon.connection_file_path, 942, false).await;
     assert_eq!(
@@ -975,9 +988,17 @@ async fn rescan_preview_reports_an_enabled_flip_it_would_apply() {
         "an enabled flip must appear in the preview, or the operator is told a rescan \
          will change nothing while it is about to stop a live module"
     );
-    assert!(preview.added.is_empty());
+    // Print the whole result on failure, so a failure names the module the
+    // supervisor reported rather than only that the list was not empty.
+    assert!(
+        preview.added.is_empty(),
+        "unexpected additions: {preview:?}"
+    );
     assert!(preview.removed.is_empty());
-    assert!(preview.changed_pending_reload.is_empty());
+    assert!(
+        preview.changed_pending_reload.is_empty(),
+        "unexpected pending reloads: {preview:?}"
+    );
     assert_eq!(
         preview.added.len()
             + preview.removed.len()

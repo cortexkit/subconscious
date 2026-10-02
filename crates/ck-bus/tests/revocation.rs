@@ -920,6 +920,50 @@ async fn stop_and_damage(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn damaged_supersede_progress_never_infers_revocation_from_a_replaced_census() {
+    let _gate = harness::acceptance_gate().await;
+    let run = start(false).await.expect("nats-server is required");
+    retire_supervised_ckbus(&run).await;
+    let plane = plane(&run).await;
+    for (module, replacement) in [("damagedsupersede", true), ("damagedcensus", false)] {
+        let store = tempfile::tempdir().unwrap();
+        let (victim, path) =
+            stop_and_damage(&plane, &run, module, store.path(), Boundary::ZeroRecorded).await;
+        let key = AccountNames::census_key(module).unwrap();
+        let bytes = if replacement {
+            CensusValue {
+                credential_public: KeyPair::new_user().public_key(),
+                user_jwt_id: "successor".into(),
+                spawn_generation: victim.identity().spawn_generation,
+                credential_epoch: victim.identity().credential_epoch + 1,
+                identities: vec![],
+                rooms: vec![],
+            }
+            .to_bytes()
+        } else {
+            b"not JSON".to_vec()
+        };
+        plane
+            .box_plane
+            .census_put(&plane.names.census_subject(&key).unwrap(), bytes)
+            .await
+            .unwrap();
+        let damaged = std::fs::read(&path).unwrap();
+        let recovering = process(&plane, run.trust.signer.clone(), store.path()).await;
+        let outcomes = recovering.resume_all(&plane).await;
+        assert!(
+            matches!(outcomes[0].1, Err(RevocationError::Deferred { .. })),
+            "{outcomes:?}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), damaged);
+        assert!(!run.revocations().await.contains_key(&victim.public));
+        victim.expect_still_connected().await;
+    }
+    run.server.stop().await;
+    run.run.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_damaged_record_is_recovered_from_the_census_or_deferred() {
     let _gate = harness::acceptance_gate().await;
     harness::install_tracing();
@@ -956,7 +1000,7 @@ async fn a_damaged_record_is_recovered_from_the_census_or_deferred() {
     assert_eq!(disconnects.settled_for(&victim.public).await.len(), 1);
     progress_is_empty(store.path()).await;
 
-    // (iii) Damaged after step (2): cleared, and nothing is pushed.
+    // (iii) Even after step (2), lost inputs cannot be inferred from absence.
     let store = tempfile::tempdir().unwrap();
     let (victim, _) = stop_and_damage(
         &plane,
@@ -970,10 +1014,15 @@ async fn a_damaged_record_is_recovered_from_the_census_or_deferred() {
     let recovering = process(&plane, run.trust.signer.clone(), store.path()).await;
     let outcomes = recovering.resume_all(&plane).await;
     assert_eq!(outcomes.len(), 1, "{outcomes:?}");
-    assert_eq!(outcomes[0].1, Ok(Completed::default()));
+    assert!(matches!(
+        outcomes[0].1,
+        Err(RevocationError::Deferred { .. })
+    ));
     assert_eq!(run.account_jwt().await, jwt, "nothing was pushed");
     revoked_once(&run.revocations().await, &victim.public);
-    progress_is_empty(store.path()).await;
+    assert!(ProgressStore::new(store.path())
+        .path(&victim.identity())
+        .exists());
 
     // (iv) Damaged with the census read failing: deferred, the file left as it is.
     let store = tempfile::tempdir().unwrap();

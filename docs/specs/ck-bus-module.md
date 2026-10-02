@@ -288,11 +288,11 @@ Durability and damage.
   - The entry is at exactly the filename's (generation, epoch): re-derive the inputs
     from its `credential_public` and `user_jwt_id`, then replay from step (1). Every
     step is idempotent.
-  - The read succeeds and the entry is absent or at another pair: step (2) committed,
-    so step (1) did too. A pushed revocation disconnects the revoked user by itself (the
-    foundation amendment's measured basis: 1.44 ms and 4.85 ms). So recovery clears the
-    file, issues nothing, and names the case.
-  - The read fails: recovery defers and retries once per sentinel period.
+  - The read succeeds but the entry is absent, damaged or at another pair: the lost
+    key cannot be recovered. Issuance replaces the census independently of revocation,
+    and deleting a successor proves nothing about its predecessor. Keep the damaged
+    progress file, issue nothing, and defer pending repair; do not claim completion.
+  - The read fails: recovery keeps the file, defers and retries once per sentinel period.
 - The two federation shapes are durable before the act they cover (a reservation
   before publish, a high-water mark before ack). A damaged `fed_recv` file refuses
   delivery from that sender until repaired: it quarantines, never guesses a high-water

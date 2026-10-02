@@ -100,11 +100,7 @@ impl<'a> CommandPhaseRunner<'a> {
         let mut failures = Vec::new();
 
         for retries_used in 0..=u64::from(config.retry_budget) {
-            let attempt = retries_used + 1;
-            let output_path = self
-                .journal
-                .evidence_dir()
-                .join(format!("{}-attempt-{attempt}.log", phase.instance));
+            let (attempt, output_path, mut artifact) = self.reserve_output_artifact(phase)?;
             let output = Command::new(&config.command)
                 .args(&config.args)
                 .current_dir(&cwd)
@@ -114,7 +110,7 @@ impl<'a> CommandPhaseRunner<'a> {
             let output = match output {
                 Ok(output) => output,
                 Err(error) => {
-                    write_output_artifact(&output_path, &[], error.to_string().as_bytes())?;
+                    write_output_artifact(&mut artifact, &[], error.to_string().as_bytes())?;
                     self.append_attempt(
                         phase,
                         attempt,
@@ -131,7 +127,7 @@ impl<'a> CommandPhaseRunner<'a> {
                     .into());
                 }
             };
-            write_output_artifact(&output_path, &output.stdout, &output.stderr)?;
+            write_output_artifact(&mut artifact, &output.stdout, &output.stderr)?;
             let exit_code = output.status.code();
             self.append_attempt(
                 phase,
@@ -178,6 +174,47 @@ impl<'a> CommandPhaseRunner<'a> {
         }
 
         unreachable!("the inclusive retry loop always returns on success or exhaustion")
+    }
+
+    fn reserve_output_artifact(
+        &self,
+        phase: &PlannedPhase,
+    ) -> Result<(u64, PathBuf, fs::File), PhaseExecutionError> {
+        let evidence_dir = self.journal.evidence_dir();
+        fs::create_dir_all(&evidence_dir)
+            .map_err(|error| PhaseExecutionError::Seam(SeamError::new(error.to_string())))?;
+        let mut attempt = self
+            .journal
+            .read_journal()
+            .map_err(|error| PhaseExecutionError::Seam(SeamError::new(error.to_string())))?
+            .into_iter()
+            .filter_map(|record| match record {
+                JournalRecord::LocalCommandAttempt {
+                    phase: recorded,
+                    attempt,
+                    ..
+                } if recorded == phase.instance => Some(attempt),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0);
+        loop {
+            attempt = attempt
+                .checked_add(1)
+                .ok_or_else(|| SeamError::new("local command attempt counter exhausted"))?;
+            let path = evidence_dir.join(format!("{}-attempt-{attempt}.log", phase.instance));
+            // Reserve before spawning. A crash can leave an unjournaled artifact,
+            // which must be preserved just like evidence referenced by the journal.
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(file) => return Ok((attempt, path, file)),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(SeamError::new(error.to_string()).into()),
+            }
+        }
     }
 
     fn append_attempt(
@@ -232,17 +269,10 @@ fn require_nonempty(value: &str, field: &str) -> Result<(), String> {
 }
 
 fn write_output_artifact(
-    output_path: &Path,
+    artifact: &mut fs::File,
     stdout: &[u8],
     stderr: &[u8],
 ) -> Result<(), PhaseExecutionError> {
-    let evidence_dir = output_path
-        .parent()
-        .expect("an evidence artifact path always has a parent");
-    fs::create_dir_all(evidence_dir)
-        .map_err(|error| PhaseExecutionError::Seam(SeamError::new(error.to_string())))?;
-    let mut artifact = fs::File::create(output_path)
-        .map_err(|error| PhaseExecutionError::Seam(SeamError::new(error.to_string())))?;
     artifact
         .write_all(stdout)
         .and_then(|()| artifact.write_all(stderr))

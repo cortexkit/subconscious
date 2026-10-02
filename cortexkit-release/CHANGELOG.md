@@ -10,3 +10,5 @@
   the pre-publication-only CI gate ordering rule.
 - Print callable train names in abandonment/rebind recovery instructions and
   status actions rather than journal basenames.
+- Preserve immutable local-command output across retries, re-execution, and
+  interrupted attempts by atomically reserving monotonically numbered logs.

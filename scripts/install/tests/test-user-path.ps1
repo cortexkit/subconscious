@@ -37,7 +37,8 @@ $script:key = [pscustomobject]@{}
 $script:key | Add-Member ScriptMethod GetValue {
     param($Name, $Default, $Options)
     if ($Name -ne 'Path') { throw 'unexpected value' }
-    if ($Options -eq [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames) {
+    if ($Options -eq [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames -or
+        $script:kind -eq [Microsoft.Win32.RegistryValueKind]::String) {
         return $script:rawPath
     }
     return [Environment]::ExpandEnvironmentVariables($script:rawPath)
@@ -61,10 +62,17 @@ try {
         if ($script:writtenKind -ne $script:kind) { throw "registry kind changed: $script:writtenKind" }
         if ($script:writes -ne 1) { throw "unexpected write count: $script:writes" }
     }
+    $script:kind = [Microsoft.Win32.RegistryValueKind]::ExpandString
     $script:rawPath = '%USERPROFILE%\cortexkit\bin;C:\Other\Bin'
     $script:writes = 0
     Ensure-UserPath -BinDir 'C:\Fixture\User\cortexkit\bin'
     if ($script:writes -ne 0) { throw 'an expanded duplicate was appended' }
+    $script:kind = [Microsoft.Win32.RegistryValueKind]::String
+    $script:writtenPath = $null
+    Ensure-UserPath -BinDir 'C:\Fixture\User\cortexkit\bin'
+    if ($script:writtenPath -cne '%USERPROFILE%\cortexkit\bin;C:\Other\Bin;C:\Fixture\User\cortexkit\bin') {
+        throw 'a literal REG_SZ entry was mistaken for an expandable duplicate'
+    }
     $script:rawPath = $null
     $script:writtenPath = $null
     $script:writtenKind = $null

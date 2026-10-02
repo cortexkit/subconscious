@@ -81,7 +81,8 @@ Describe 'native ck installer' {
         }
         $registryKey | Add-Member ScriptMethod GetValue {
             param($Name, $Default, $Options)
-            if ($Options -eq [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames) {
+            if ($Options -eq [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames -or
+                $this.PathKind -eq [Microsoft.Win32.RegistryValueKind]::String) {
                 return $this.RawPath
             }
             return [Environment]::ExpandEnvironmentVariables($this.RawPath)

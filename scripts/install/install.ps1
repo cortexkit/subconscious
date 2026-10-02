@@ -84,7 +84,11 @@ function Ensure-UserPath {
     }
     $containsBinDir = $false
     foreach ($entry in $entries) {
-        if ([string]::Equals([Environment]::ExpandEnvironmentVariables($entry), $BinDir, [System.StringComparison]::OrdinalIgnoreCase)) {
+        $comparisonEntry = $entry
+        if ($pathKind -eq [Microsoft.Win32.RegistryValueKind]::ExpandString) {
+            $comparisonEntry = [Environment]::ExpandEnvironmentVariables($entry)
+        }
+        if ([string]::Equals($comparisonEntry, $BinDir, [System.StringComparison]::OrdinalIgnoreCase)) {
             $containsBinDir = $true
             break
         }

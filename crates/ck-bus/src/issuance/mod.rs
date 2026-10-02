@@ -272,7 +272,14 @@ impl Issuance {
 
     /// The high-water damage that holds health down, if any.
     pub fn damage(&self) -> Option<HighWaterRefusal> {
-        lock(&self.damage).clone()
+        let mut damage = lock(&self.damage);
+        if damage
+            .as_ref()
+            .is_some_and(|damage| self.high_water.damage_is_repaired(damage))
+        {
+            *damage = None;
+        }
+        damage.clone()
     }
 
     #[cfg(test)]

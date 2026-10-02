@@ -142,7 +142,7 @@ pub fn plan_setup(observed: &SetupObserved, request: &SetupRequest) -> SetupPlan
                 plan.operations
                     .push(SetupOperation::InstallComponent { component });
                 if component == Component::Core {
-                    core_is_being_installed = true;
+                    core_is_being_installed = !observed.core_binary_present;
                 }
                 plan.operations
                     .push(SetupOperation::ConfigureComponent { component });
@@ -659,6 +659,7 @@ mod tests {
             releases,
             requires_core: BTreeMap::new(),
             installed_core_version: None,
+            core_binary_present: false,
             runtime: RuntimeState::Missing,
             configuration: ConfigurationState::Additive,
             running_ck_adoption: None,
@@ -681,6 +682,7 @@ mod tests {
             .requires_core
             .insert(Component::Aft, "0.17.20".to_string());
         observed.installed_core_version = installed_version.map(ToOwned::to_owned);
+        observed.core_binary_present = true;
         observed.runtime = RuntimeState::Correct;
         observed
     }
@@ -769,6 +771,27 @@ mod tests {
         assert_eq!(applied.planned, preview.planned);
         assert_eq!(applied.applied, expected_mutations);
         assert_eq!(apply_executor.applied, expected_mutations);
+    }
+
+    #[test]
+    fn setup_config_drift_does_not_bypass_the_installed_core_floor() {
+        let mut observed = installed_core_setup(Some("0.17.19"));
+        observed
+            .components
+            .insert(Component::Core, ComponentState::Missing);
+        let plan = plan_setup(&observed, &SetupRequest::install(vec![Component::Aft]));
+        assert!(plan.outcomes.iter().any(|outcome| matches!(
+            outcome,
+            PlanOutcome::TargetRefused {
+                component: Component::Aft,
+                ..
+            }
+        )));
+        assert!(
+            !plan.operations.contains(&SetupOperation::InstallComponent {
+                component: Component::Aft
+            })
+        );
     }
 
     #[test]

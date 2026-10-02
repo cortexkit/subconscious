@@ -199,7 +199,9 @@ impl SetupBackend {
         observed.components = components;
         observed.releases = releases;
         observed.requires_core = requires_core;
-        if observed.component_state(Component::Core) != ComponentState::Missing
+        observed.core_binary_present =
+            self.paths.runtime_paths.daemon.is_file() || self.runtime_status.live;
+        if observed.core_binary_present
             && selected.iter().any(|component| {
                 component.module_id().is_some()
                     && observed.requires_core.contains_key(component)

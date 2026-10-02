@@ -270,6 +270,9 @@ pub struct SetupObserved {
     /// The installed daemon version, absent when neither live catalog nor binary
     /// version evidence could be read.
     pub installed_core_version: Option<String>,
+    /// A daemon binary or live daemon already exists, even if its configuration
+    /// needs repair. Setup does not replace existing managed binaries.
+    pub core_binary_present: bool,
     pub runtime: RuntimeState,
     pub configuration: ConfigurationState,
     /// The bootstrap installer owns the running `ck` placement but setup has
@@ -317,6 +320,7 @@ impl SetupObserved {
             releases,
             requires_core: BTreeMap::new(),
             installed_core_version: None,
+            core_binary_present: false,
             runtime: RuntimeState::Missing,
             configuration: ConfigurationState::Additive,
             running_ck_adoption: None,

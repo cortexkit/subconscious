@@ -758,6 +758,8 @@ mod tests {
                 inode: 2,
             }),
             cgroup_name: Some("nats-a".to_owned()),
+            #[cfg(target_os = "linux")]
+            cgroup_placement: None,
         };
         let first = roster.admit(
             "nats".to_owned(),

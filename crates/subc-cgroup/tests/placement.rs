@@ -94,3 +94,53 @@ async fn failed_parent_open_reports_the_cgroup_procs_path() {
         "parent-side cgroup open failure must name cgroup.procs: {error}"
     );
 }
+
+#[test]
+fn kill_outcomes_distinguish_placement_support_and_write() -> io::Result<()> {
+    use subc_cgroup::{kill_module, KillOutcome};
+    let root = ScratchRoot::new("kill-outcomes")?;
+    let placement = prepare_at(root.path())?.expect("scratch root marker");
+    assert!(matches!(
+        kill_module(None, "module"),
+        KillOutcome::NotPlaced
+    ));
+    assert!(matches!(
+        kill_module(Some(&placement), "module"),
+        KillOutcome::NotPlaced
+    ));
+    let module = placement.module_path("module")?;
+    assert!(matches!(
+        kill_module(Some(&placement), "module"),
+        KillOutcome::Unsupported
+    ));
+    let path = module.join("cgroup.kill");
+    fs::write(&path, b"")?;
+    assert!(matches!(
+        kill_module(Some(&placement), "module"),
+        KillOutcome::Killed
+    ));
+    assert_eq!(fs::read(&path)?, b"1");
+    fs::remove_file(&path)?;
+    fs::create_dir(&path)?;
+    match kill_module(Some(&placement), "module") {
+        KillOutcome::IoError { path: actual, .. } => assert_eq!(actual, path),
+        other => panic!("expected path-bearing write error, got {other:?}"),
+    }
+    Ok(())
+}
+
+#[test]
+fn kill_refuses_ids_that_target_the_containing_subtree() -> io::Result<()> {
+    use subc_cgroup::{kill_module, KillOutcome};
+    let root = ScratchRoot::new("kill-invalid-id")?;
+    let placement = prepare_at(root.path())?.expect("scratch root marker");
+    let parent_kill = root.path().join("cgroup.kill");
+    fs::write(&parent_kill, b"untouched")?;
+    for id in ["", ".", ".."] {
+        assert!(
+            matches!(kill_module(Some(&placement), id), KillOutcome::IoError { error, .. } if error.kind() == io::ErrorKind::InvalidInput)
+        );
+    }
+    assert_eq!(fs::read(parent_kill)?, b"untouched");
+    Ok(())
+}

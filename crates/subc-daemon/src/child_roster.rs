@@ -55,6 +55,9 @@ pub(crate) struct RecordedIdentity {
     pub(crate) start_time: Option<u64>,
     pub(crate) executable: Option<ExecutableIdentity>,
     pub(crate) cgroup_name: Option<String>,
+    /// The owning subtree for shutdown tree kills; not persisted in the record.
+    #[cfg(target_os = "linux")]
+    pub(crate) cgroup_placement: Option<subc_cgroup::Placement>,
 }
 
 /// Set once, when the daemon begins its announced shutdown, and never cleared.
@@ -341,6 +344,17 @@ mod unix_shutdown {
                         escalated,
                         "supervised child did not exit during daemon shutdown; sending SIGKILL"
                     );
+                    #[cfg(target_os = "linux")]
+                    if entry.start_time.is_none_or(|expected| {
+                        crate::provenance::process_start_time(entry.pid) == Some(expected)
+                    }) {
+                        if let Some(name) = &entry.recorded.cgroup_name {
+                            crate::supervise::kill_module_cgroup(
+                                entry.recorded.cgroup_placement.as_ref(),
+                                name,
+                            );
+                        }
+                    }
                     signal(entry, Signal::KILL);
                     killed.insert(*key);
                     last_kill = Some(now);

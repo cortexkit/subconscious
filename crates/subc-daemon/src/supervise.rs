@@ -189,7 +189,7 @@ impl SupervisedChild {
         self.roster_guard = None;
     }
 
-    /// Kill the child, and on Windows the whole tree it spawned (issue #109).
+    /// Kill the child and, where containment is available, its process tree.
     ///
     /// `Child::kill` is `TerminateProcess` scoped to one pid, so a module with a
     /// helper process leaked the helper — the Synapse embedding module's CUDA
@@ -211,6 +211,8 @@ impl SupervisedChild {
                 );
             }
         }
+        #[cfg(target_os = "linux")]
+        kill_module_cgroup(self.cgroup_placement.as_ref(), &self.module_id);
         self.child.start_kill()
     }
 
@@ -6009,6 +6011,8 @@ fn spawn_child_in_slot(
                 }
             }),
             cgroup_name: recorded_cgroup_name,
+            #[cfg(target_os = "linux")]
+            cgroup_placement: cgroup_placement.cloned(),
         },
     );
     // The check at the top of this function can pass just before daemon
@@ -6020,6 +6024,9 @@ fn spawn_child_in_slot(
     // sees the roster closed: end the process now rather than start a module
     // the daemon is about to stop.
     if roster.is_closed() {
+        // This child was never admitted, so there is no module protocol shutdown to wait for.
+        #[cfg(target_os = "linux")]
+        kill_module_cgroup(cgroup_placement, &cgroup_name);
         if let Err(error) = child.start_kill() {
             debug!(module_id = %spec.module_id, pid, %error, "kill of a process spawned during daemon shutdown failed; it may already have exited");
         }
@@ -6093,6 +6100,23 @@ fn spawn_child_in_slot(
         pid,
         roster_guard: Some(roster_guard),
     })
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn kill_module_cgroup(placement: Option<&subc_cgroup::Placement>, module_id: &str) {
+    use subc_cgroup::KillOutcome;
+    match subc_cgroup::kill_module(placement, module_id) {
+        KillOutcome::Killed => {}
+        KillOutcome::NotPlaced | KillOutcome::Unsupported => {
+            debug!(
+                module_id,
+                "cgroup tree kill unavailable; using direct-child kill"
+            );
+        }
+        KillOutcome::IoError { path, error } => {
+            warn!(module_id, path = %path.display(), %error, "cgroup tree kill failed; using direct-child kill");
+        }
+    }
 }
 
 /// Contain a freshly spawned Windows child and start it.
@@ -10607,5 +10631,165 @@ mod launch_nonce_descriptor_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn swap_candidate_receives_its_nonce_only_on_descriptor_3() {
         probe(super::SpawnRole::SwapCandidate).await;
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod cgroup_containment_tests {
+    use super::*;
+    use subc_test_support::TestTempDir;
+
+    fn running(pid: u32) -> bool {
+        // An orphan can remain a zombie until the container init reaps it.
+        std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|stat| {
+                stat.rsplit_once(") ")
+                    .map(|(_, rest)| rest.starts_with('Z'))
+            })
+            .is_some_and(|zombie| !zombie)
+    }
+
+    #[tokio::test]
+    async fn linux_teardown_reaps_the_grandchild() {
+        teardown_tree("linux_teardown_reaps_the_grandchild", false).await;
+    }
+
+    #[tokio::test]
+    async fn linux_shutdown_straggler_reaps_the_grandchild() {
+        teardown_tree("linux_shutdown_straggler_reaps_the_grandchild", true).await;
+    }
+
+    async fn teardown_tree(test_name: &str, shutdown: bool) {
+        let dir = TestTempDir::new(test_name);
+        let root = PathBuf::from(format!(
+            "/sys/fs/cgroup/subc-tree-test-{test_name}-{}-{}",
+            std::process::id(),
+            unix_ms_now()
+        ));
+        if let Err(error) = std::fs::create_dir(&root) {
+            assert!(
+                std::env::var_os("SUBC_REQUIRE_CGROUP_TEST").is_none(),
+                "required cgroup test cannot execute: {error}"
+            );
+            eprintln!(
+                "SKIP {test_name}: no writable delegated cgroup at {}: {error}",
+                root.display()
+            );
+            return;
+        }
+        let placement = subc_cgroup::prepare_at(&root)
+            .expect("prepare isolated kernel cgroup")
+            .expect("isolated cgroup is delegated");
+        let module_id = "tree-teardown";
+        let module = placement
+            .module_path(module_id)
+            .expect("create isolated module cgroup");
+        if !module.join("cgroup.kill").exists() {
+            std::fs::remove_dir(&module).unwrap();
+            std::fs::remove_dir(root.join("subc-modules")).unwrap();
+            std::fs::remove_dir(&root).unwrap();
+            assert!(
+                std::env::var_os("SUBC_REQUIRE_CGROUP_TEST").is_none(),
+                "required cgroup.kill interface unavailable"
+            );
+            eprintln!("SKIP {test_name}: cgroup.kill unavailable (kernel < 5.14)");
+            return;
+        }
+        let supervisor = Supervisor::new(
+            Arc::new(Registry::default()),
+            RestartPolicy::new(3, Duration::ZERO),
+        )
+        .with_cgroup_placement(Some(placement));
+        let mut runtime = supervisor.runtime_config();
+        runtime.child_roster = runtime
+            .child_roster
+            .for_module(Arc::new(Mutex::new(Duration::from_millis(100))));
+        let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
+        let pid_file = dir.join("grandchild.pid");
+        let spec = ModuleSpec {
+            module_id: module_id.to_string(),
+            program: PathBuf::from("/bin/sh"),
+            args: vec![
+                "-c".into(),
+                "trap '' TERM; sleep 600 & echo $! > \"$1\"; wait".into(),
+                "fixture".into(),
+                pid_file.display().to_string(),
+            ],
+            env: ["XDG_DATA_HOME", "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME"]
+                .into_iter()
+                .map(|key| (key.to_string(), dir.display().to_string()))
+                .collect(),
+            reserved: false,
+            reserved_prefixes: Vec::new(),
+            protocol: ModuleProtocol::None,
+            overlap: Default::default(),
+        };
+        let child =
+            spawn_and_mark_running(&spec, &runtime, &snapshot).expect("spawn supervised tree");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let grandchild: u32 = loop {
+            if let Ok(contents) = std::fs::read_to_string(&pid_file) {
+                if let Ok(pid) = contents.trim().parse() {
+                    break pid;
+                }
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "grandchild pid was not recorded"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert!(
+            running(grandchild),
+            "grandchild must be alive before teardown"
+        );
+        if shutdown {
+            let mut child = child;
+            crate::child_roster::end_children_for_daemon_shutdown(
+                &runtime.child_roster,
+                false,
+                std::future::pending(),
+            )
+            .await;
+            child.wait().await.expect("reap shutdown straggler");
+        } else {
+            drain_child_to_state(
+                module_id,
+                ModuleProtocol::None,
+                StopNotice::NotSent,
+                &Registry::default(),
+                &snapshot,
+                &runtime.terminal_ring,
+                &SpawnEventFeed::default(),
+                child,
+                Duration::from_millis(100),
+                ModuleState::Stopped,
+                Some(false),
+            )
+            .await
+            .expect("real supervisor teardown");
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while running(grandchild) && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let survived = running(grandchild);
+        // Kill a surviving grandchild so a failed test does not leave it behind.
+        if survived {
+            let pid = rustix::process::Pid::from_raw(grandchild as i32).unwrap();
+            let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        if module.exists() {
+            std::fs::remove_dir(&module).expect("remove empty module cgroup");
+        }
+        std::fs::remove_dir(root.join("subc-modules")).unwrap();
+        std::fs::remove_dir(&root).unwrap();
+        assert!(
+            !survived,
+            "grandchild {grandchild} outlived module teardown"
+        );
+        eprintln!("EXECUTED {test_name}: grandchild {grandchild} killed in isolated cgroup");
     }
 }

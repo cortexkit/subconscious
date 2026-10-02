@@ -21,6 +21,52 @@ pub struct Placement {
     modules: PathBuf,
 }
 
+/// Result of attempting an atomic module-tree kill.
+#[derive(Debug)]
+pub enum KillOutcome {
+    Killed,
+    NotPlaced,
+    Unsupported,
+    IoError { path: PathBuf, error: io::Error },
+}
+
+/// Kill a placed module's entire subtree without enumerating processes.
+///
+/// Opening without creating the interface preserves compatibility with kernels
+/// before 5.14, where `cgroup.kill` is absent.
+pub fn kill_module(placement: Option<&Placement>, module_id: &str) -> KillOutcome {
+    let Some(placement) = placement else {
+        return KillOutcome::NotPlaced;
+    };
+    let name = module_directory_name(module_id);
+    let path = placement.modules.join(&name).join("cgroup.kill");
+    // Dot components would target the containing subtree rather than one module.
+    if matches!(name.as_str(), "" | "." | "..") {
+        return KillOutcome::IoError {
+            path,
+            error: io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "module id must name a child cgroup",
+            ),
+        };
+    }
+    let module = placement.modules.join(name);
+    match fs::metadata(&module) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return KillOutcome::NotPlaced,
+        Err(error) => return KillOutcome::IoError { path, error },
+        Ok(_) => {}
+    }
+    let mut file = match fs::OpenOptions::new().write(true).open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return KillOutcome::Unsupported,
+        Err(error) => return KillOutcome::IoError { path, error },
+    };
+    match file.write_all(b"1") {
+        Ok(()) => KillOutcome::Killed,
+        Err(error) => KillOutcome::IoError { path, error },
+    }
+}
+
 impl Placement {
     /// Create or reopen this module's cgroup beneath the delegated subtree.
     pub fn module_path(&self, module_id: &str) -> io::Result<PathBuf> {

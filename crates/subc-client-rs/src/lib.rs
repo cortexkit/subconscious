@@ -1160,7 +1160,7 @@ pub trait ModuleHandler: Send + Sync + 'static {
     /// inherits this -- it cannot report faults beyond the serve helper's own
     /// dispatch-saturation measurement.
     ///
-    /// Per Health-Path-Rule v3 an implementation must derive its status
+    /// An implementation must derive its status
     /// mechanically from signals the dispatch path stamps (a monotonic
     /// heartbeat, oldest-queued age), never from its own opinion, and must not
     /// take a blocking lock, touch disk, or spawn a subprocess on this path.

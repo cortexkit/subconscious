@@ -561,6 +561,7 @@ impl SetupFixture {
             .env("LOCALAPPDATA", &self.data_home)
             .env("XDG_DATA_HOME", &self.data_home)
             .env("XDG_CONFIG_HOME", &self.config_home)
+            .env("XDG_RUNTIME_DIR", self._root.path().join("runtime"))
             .env("PATH", path)
             // Daemon discovery falls back to the system temp directory, which
             // is outside this fixture's HOME: without the fence a setup path
@@ -997,6 +998,65 @@ fn sha256_hex(bytes: &[u8]) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+#[test]
+#[cfg(unix)]
+fn setup_core_drift_floor_refusal_is_actionable_and_never_mutates() {
+    let fixture = SetupFixture::installed("setup-drift-floor");
+    let binary_home = fixture.data_home.join("cortexkit/bin");
+    fs::remove_file(binary_home.join("ck-aft")).unwrap();
+    write_executable(
+        &binary_home.join("ck-subc"),
+        "#!/bin/sh\necho 'ck-subc 0.17.19'\n",
+    );
+    write_executable(
+        &fixture.tools.join(service_manager_program()),
+        "#!/bin/sh\nexit 1\n",
+    );
+    let config_path = fixture.config_home.join("cortexkit/subc.jsonc");
+    let mut config: Value = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+    config.as_object_mut().unwrap().remove("storage");
+    config["modules"].as_object_mut().unwrap().remove("aft");
+    let config_bytes = serde_json::to_vec_pretty(&config).unwrap();
+    fs::write(&config_path, &config_bytes).unwrap();
+    let manifest_path = fixture.data_home.join("cortexkit/installer-manifest.json");
+    let manifest_before = fs::read(&manifest_path).unwrap();
+    let index = serve_signed_index(|base| {
+        let (mut index, assets) = setup_index(base, None);
+        let mut aft = index_component(
+            "v1.0.0",
+            Some("1.0.0"),
+            &host_target(),
+            [(
+                "ck-aft",
+                fixture_asset(
+                    format!("{base}/unused.zip"),
+                    "00".repeat(32),
+                    1,
+                    Some("1.0.0"),
+                ),
+            )],
+        );
+        aft["requires_core"] = json!("0.17.20");
+        index["components"]["aft"] = aft;
+        (index, assets)
+    });
+    for args in [&["setup", "aft", "--dry-run"][..], &["setup", "aft"][..]] {
+        let output = fixture
+            .command(&index, args)
+            .env_remove("CK_TEST_SETUP_CONTROL_OK")
+            .output()
+            .unwrap();
+        assert_exit(&output, 1);
+        assert_eq!(
+            text(&output.stdout),
+            "aft requires core ≥ 0.17.20, installed 0.17.19; run `ck upgrade` first\n"
+        );
+        assert_eq!(fs::read(&config_path).unwrap(), config_bytes);
+        assert_eq!(fs::read(&manifest_path).unwrap(), manifest_before);
+        assert!(!binary_home.join("ck-aft").exists());
+    }
 }
 
 #[test]

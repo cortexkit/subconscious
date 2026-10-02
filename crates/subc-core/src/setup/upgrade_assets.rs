@@ -32,6 +32,10 @@ pub enum UpgradeAssetError {
     ReleaseIncomplete {
         missing_asset: String,
     },
+    Download {
+        asset: String,
+        reason: String,
+    },
     DigestMismatch {
         asset: String,
         expected: String,
@@ -56,6 +60,7 @@ impl std::fmt::Display for UpgradeAssetError {
                     "release-incomplete: missing asset {missing_asset}"
                 )
             }
+            Self::Download { asset, reason } => write!(formatter, "refusal: could not download {asset}: {reason}; try `ck upgrade` again when the release host is reachable"),
             Self::DigestMismatch {
                 asset,
                 expected,
@@ -150,7 +155,12 @@ impl UpgradeAssetFetcher for ReleaseUpgradeAssetFetcher {
             .and_then(|entry| entry.assets.get(platform.label()))
             .and_then(|assets| assets.get(binary))
             .ok_or_else(missing)?;
-        release_index::download(&asset.url, destination).map_err(|_| missing())?;
+        release_index::download(&asset.url, destination).map_err(|reason| {
+            UpgradeAssetError::Download {
+                asset: format!("{}-{}.zip", binary, platform.label()),
+                reason,
+            }
+        })?;
         Ok(asset.sha256.to_ascii_lowercase())
     }
 }
@@ -311,6 +321,26 @@ fn platform_binary(binary: &str) -> String {
     } else {
         binary.to_string()
     }
+}
+
+#[cfg(test)]
+#[test]
+fn download_failure_does_not_claim_the_release_asset_is_missing() {
+    let root = subc_test_support::TestTempDir::new("upgrade-download-refusal");
+    let target = super::components::upgrade_roster([super::model::Component::Aft])[0];
+    let index: ReleaseIndex = serde_json::from_value(serde_json::json!({
+        "schema":1, "channel":"alpha", "generated_at_ms":0,
+        "components":{"aft":{"release":"v1.0.0", "version":"1.0.0",
+            "assets":{"linux-x64":{"ck-aft":{"url":"http://127.0.0.1:0/ck-aft.zip", "sha256":"00"}}}}}
+    })).unwrap();
+    let error = ReleaseUpgradeAssetFetcher::from_index(index)
+        .fetch_archive(target, AlphaTarget::LinuxX64, &root.join("archive.zip"))
+        .unwrap_err();
+    assert!(
+        !matches!(error, UpgradeAssetError::ReleaseIncomplete { .. }),
+        "{error}"
+    );
+    assert!(error.to_string().contains("download"), "{error}");
 }
 
 #[cfg(test)]

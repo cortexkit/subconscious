@@ -4415,6 +4415,10 @@ impl SubcPromptRouteClient {
         }
         .await;
 
+        // Prompt routes are one-shot. Remove local relay ownership even when
+        // the remote GOODBYE cannot be written, so the session cannot accumulate
+        // completed routes or route a later reverse request to a finished call.
+        self.subc.relay().drop_route(route).await;
         if let Err(error) = send_route_goodbye(&self.subc, route).await {
             tracing::debug!(target: "prompt", "failed to close {target_label} route: {error}");
         }

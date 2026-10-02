@@ -239,10 +239,10 @@ The frame that carries every message in §4.1–4.7 on the local subc↔module l
 
 ```
  offset  size  field     type    purpose
-   0      4    len       u32     # of BODY bytes after this header (4 GiB frame cap; large data streams via the bulk lane)
+   0      4    len       u32     # of BODY bytes after this header (64 MiB body cap; large data streams via the bulk lane)
    4      1    ver       u8      envelope version
    5      1    type      u8      REQUEST/RESPONSE/PUSH/STREAM_DATA/STREAM_END/ERROR/CANCEL/PING/PONG/HELLO/HELLO_ACK/GOODBYE
-  6      1    flags     u8      bit0 BINARY (bulk-lane raw body) · bits1-2 PRIORITY (passive/interactive/background) · bit3 LAST (stream-final) · bits4-5 ADMISSION · bit6 DAEMON_ORIGIN · bit7 reserved
+  6      1    flags     u8      bit0 BINARY (bulk-lane raw body) · bits1-2 PRIORITY (passive/interactive/background) · bit3 LAST (stream-final) · bits4-5 ADMISSION · bit6 DAEMON_ORIGIN · bit7 SUBSCRIPTION (held-open request)
     7      2    channel   u16     route handle; bound at route.open, rewritten per-hop (client-local ↔ module-local, §4.9); 0 = subc control plane
     9      4    epoch     u32     per-slot binding epoch; 0 on channel 0
    13      8    corr      u64     correlation id; CANCEL carries the target call's corr
@@ -250,6 +250,8 @@ The frame that carries every message in §4.1–4.7 on the local subc↔module l
 ```
 
 `CANCEL`/`PING`/`PONG`/`GOODBYE` are pure-header frames (`len = 0`); only `HELLO`/`HELLO_ACK` and RPC payloads carry bodies. Endianness little-endian (same-machine, native, no byte-swap on the hot path); `len` counts body bytes after the header.
+
+All eight flag bits are allocated. The header decoder accepts `DAEMON_ORIGIN` and `SUBSCRIPTION` on any frame type; their meanings are applied by the routing/admission layer, not enforced as frame-type restrictions in the codec. Reserved priority and admission-class values are refused, and `SHEDDABLE` admission is legal only on `PUSH` and `STREAM_DATA`. `DecodeError::ReservedFlagBits` remains in the public error vocabulary but is not produced by the current decoder. The `u32` length field can represent larger bodies, but readers enforce `MAX_FRAME_BODY_LEN = 64 * 1024 * 1024` before allocation.
 
 **Versioning — two mechanisms.**
 1. **HELLO negotiation (primary):** both ends agree on one envelope version per connection — no mixed-version frames. subc, being the central hot-swappable component, speaks the **superset** and negotiates **down** to each module; module version skew is the normal, handled case and subc never receives an un-negotiated version.
@@ -262,7 +264,7 @@ The frame that carries every message in §4.1–4.7 on the local subc↔module l
 So any reader of any version can always: read 5 bytes → learn `ver` → look up that version's header length → read the rest → splice `len` body bytes. Corollary: `len` stays u32 forever (large payloads stream via the bulk lane, not as one giant frame).
 
 **Two tiers of extension:**
-- **Small additions — no bump:** new `type` values (~12 of 256 used) and the allocated `DAEMON_ORIGIN` flag bit are already accommodated; bit 7 remains reserved for the next allocation.
+- **Small additions — no bump:** new `type` values (~12 of 256 used) and the allocated `DAEMON_ORIGIN` and `SUBSCRIPTION` flag bits are already accommodated. There is no unallocated flag bit remaining.
 - **Structural changes — bump `ver`:** new or resized fields (e.g. `channel` u16 → u32 = a 19-byte v2 header). Old peers negotiate down; v2-capable peers use v2.
 
 **Transport is a separate, independently swappable layer.** Moving the local leg to HTTP/2 later (or the remote leg to HTTP/TLS) is negotiated at connection setup and does not touch envelope versioning — the body is transport-agnostic. Two independent evolution axes: the envelope via `ver` + frozen-prefix, the transport via connection negotiation.

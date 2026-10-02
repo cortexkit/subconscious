@@ -76,7 +76,7 @@ use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufWriter},
     net::TcpStream,
     sync::{mpsc, oneshot, Semaphore},
-    time::timeout,
+    time::{timeout, Instant},
 };
 use tokio_util::sync::{CancellationToken, WaitForCancellationFuture};
 
@@ -84,6 +84,9 @@ const AUTH_DEADLINE: Duration = Duration::from_secs(2);
 const CATALOG_UPDATE_TIMEOUT: Duration = Duration::from_secs(10);
 const EGRESS_BUFFER: usize = 64;
 const HANDLER_TASK_CAPACITY: usize = 64;
+/// A full dispatcher is normal during a burst. Report dispatch impairment only
+/// once a data request has waited more than two seconds for a handler slot.
+const DISPATCH_SATURATION_WAIT: Duration = Duration::from_secs(2);
 const HELLO_CORR: u64 = 1;
 /// How long a closing module waits for its writer to flush the frames still
 /// queued before aborting it; see the serve future in `serve_with_handle`.
@@ -281,6 +284,10 @@ pub type ModuleServeFuture = Pin<Box<dyn Future<Output = Result<(), SubcModuleEr
 struct RequestDispatcher {
     in_flight: InFlight,
     permits: Arc<Semaphore>,
+    /// Stamped by data dispatch before spawning a task, cleared on acquisition
+    /// or task exit. This lock is never held over an await or handler work, so
+    /// health can read it without queueing behind the work it is measuring.
+    waiting: Arc<Mutex<HashMap<RequestKey, Instant>>>,
     /// One receiver per `on_draining` hook spawned on this connection, resolved
     /// once that hook has started running. The connection waits on them before
     /// acting on its end, so a hook is always called before the GOODBYE that
@@ -296,9 +303,49 @@ impl RequestDispatcher {
         Self {
             in_flight: Arc::new(Mutex::new(HashMap::new())),
             permits: Arc::new(Semaphore::new(HANDLER_TASK_CAPACITY)),
+            waiting: Arc::new(Mutex::new(HashMap::new())),
             draining_hooks: Arc::new(Mutex::new(Vec::new())),
             undecodable_push_logged: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    fn start_waiting(&self, key: RequestKey) -> PermitWait {
+        self.waiting
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(key, Instant::now());
+        PermitWait {
+            waiting: Arc::clone(&self.waiting),
+            key,
+        }
+    }
+
+    fn fold_health(&self, mut report: HealthReport) -> HealthReport {
+        let waiting = self
+            .waiting
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let available = self.permits.available_permits();
+        let oldest_wait = waiting.values().min().map(Instant::elapsed);
+        drop(waiting);
+        if let Some(age) =
+            oldest_wait.filter(|age| available == 0 && *age > DISPATCH_SATURATION_WAIT)
+        {
+            if report.status == HealthStatus::Ok {
+                report.status = HealthStatus::Degraded;
+            }
+            let saturation = format!(
+                "request dispatch saturated: {}/{} in use, oldest waiting {:.1} s",
+                HANDLER_TASK_CAPACITY - available,
+                HANDLER_TASK_CAPACITY,
+                age.as_secs_f64(),
+            );
+            report.detail = Some(match report.detail {
+                Some(detail) => format!("{saturation}; {detail}"),
+                None => saturation,
+            });
+        }
+        report
     }
 
     /// Wait, within [`DRAINING_HOOK_START_LIMIT`], until every `on_draining`
@@ -338,6 +385,21 @@ impl RequestDispatcher {
         for cancellation in cancelled {
             cancellation.cancel();
         }
+    }
+}
+
+/// Remove the stamp even if a queued task exits on connection close or panics.
+struct PermitWait {
+    waiting: Arc<Mutex<HashMap<RequestKey, Instant>>>,
+    key: RequestKey,
+}
+
+impl Drop for PermitWait {
+    fn drop(&mut self) {
+        self.waiting
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.key);
     }
 }
 
@@ -1080,6 +1142,12 @@ pub trait ModuleHandler: Send + Sync + 'static {
 
     /// Return cheap in-memory health for the module.
     ///
+    /// The serve helper calls this on a task independent of data-request slots.
+    /// Afterward it folds in its own dispatch gauges: if all 64 slots are in use
+    /// and a request has waited more than two seconds for a slot, the reply is
+    /// at least `Degraded`, with dispatch counts and wait age added to `detail`.
+    /// A module's `Failing` status, detail and metrics are never discarded.
+    ///
     /// THE DEFAULT ASSERTS HEALTH ON BEHALF OF A MODULE THAT NEVER WROTE ANY.
     /// A module that has not implemented this is indistinguishable on the wire
     /// from one that measured itself and found nothing wrong -- and the daemon
@@ -1089,7 +1157,8 @@ pub trait ModuleHandler: Send + Sync + 'static {
     /// It stays a default because health is genuinely optional: a module that
     /// advertises no health capability is never probed, so the value is unread
     /// for those. The hazard is the module that DOES advertise health and
-    /// inherits this -- it answers "ok" forever, including while wedged.
+    /// inherits this -- it cannot report faults beyond the serve helper's own
+    /// dispatch-saturation measurement.
     ///
     /// Per Health-Path-Rule v3 an implementation must derive its status
     /// mechanically from signals the dispatch path stamps (a monotonic
@@ -1779,6 +1848,7 @@ where
     let body = frame.body;
     let in_flight = Arc::clone(&dispatcher.in_flight);
     let permits = Arc::clone(&dispatcher.permits);
+    let waiting = dispatcher.start_waiting((handle.channel, handle.epoch, corr));
     tokio::spawn(async move {
         let Ok(_permit) = permits.acquire_owned().await else {
             // A closed dispatcher means connection teardown will release every route credit.
@@ -1787,6 +1857,7 @@ where
             }
             return;
         };
+        drop(waiting);
         if ctx.cancelled.is_cancelled() {
             let _ = send_handler_outcome(
                 &ctx,
@@ -1830,16 +1901,11 @@ where
     }
 
     let in_flight = Arc::clone(&dispatcher.in_flight);
-    let permits = Arc::clone(&dispatcher.permits);
     tokio::spawn(async move {
-        let Ok(_permit) = permits.acquire_owned().await else {
-            if let Ok(mut guard) = in_flight.lock() {
-                guard.remove(&(channel, epoch, corr));
-            }
-            return;
-        };
+        // Health must not queue behind the data work whose liveness it reports.
+        // Registration and cancellation still use the same in-flight registry.
         if !cancellation.is_cancelled() {
-            let report = handler.health().await;
+            let report = dispatcher.fold_health(handler.health().await);
             let response = ModuleControlResponse::from(report);
             if let Ok(body) = serde_json::to_vec(&response) {
                 if let Ok(frame) = Frame::build_with_version(
@@ -2349,7 +2415,7 @@ mod tests {
     use serde_json::json;
 
     use subc_protocol::manifest::{Concurrency, ExecutionMode, IdentityScope, Tool};
-    use tokio::{sync::Notify, time::timeout};
+    use tokio::time::{advance, timeout};
 
     use super::*;
 
@@ -2364,15 +2430,20 @@ mod tests {
 
     struct BlockingHandler {
         entered: Arc<AtomicUsize>,
-        release: Arc<Notify>,
+        release: Semaphore,
+        report: HealthReport,
     }
 
     #[async_trait]
     impl ModuleHandler for BlockingHandler {
         async fn handle(&self, _ctx: RequestCtx, _body: Vec<u8>) -> HandlerOutcome {
             self.entered.fetch_add(1, Ordering::SeqCst);
-            self.release.notified().await;
+            self.release.acquire().await.unwrap().forget();
             HandlerOutcome::Streamed
+        }
+
+        async fn health(&self) -> HealthReport {
+            self.report.clone()
         }
     }
 
@@ -2701,50 +2772,177 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn health_check_waits_behind_saturated_request_dispatcher() {
-        let (tx, mut rx) = mpsc::channel(4);
-        let entered = Arc::new(AtomicUsize::new(0));
-        let release = Arc::new(Notify::new());
-        let handler = Arc::new(BlockingHandler {
-            entered: Arc::clone(&entered),
-            release: Arc::clone(&release),
-        });
-        let dispatcher = RequestDispatcher::new();
-        let (module_handle, _unused_rx) = test_module_handle(&[]);
-        module_handle
-            .install_route(RouteHandle::new(7, 1, 1))
-            .unwrap();
+    struct DispatchHarness {
+        tx: mpsc::Sender<Frame>,
+        rx: mpsc::Receiver<Frame>,
+        handler: Arc<BlockingHandler>,
+        dispatcher: RequestDispatcher,
+        module_handle: ModuleHandle,
+    }
 
-        for corr in 0..HANDLER_TASK_CAPACITY as u64 {
+    impl DispatchHarness {
+        fn new(report: HealthReport) -> Self {
+            let (tx, rx) = mpsc::channel(HANDLER_TASK_CAPACITY + 4);
+            let (module_handle, _unused_rx) = test_module_handle(&[]);
+            module_handle
+                .install_route(RouteHandle::new(7, 1, 1))
+                .unwrap();
+            Self {
+                tx,
+                rx,
+                handler: Arc::new(BlockingHandler {
+                    entered: Arc::new(AtomicUsize::new(0)),
+                    release: Semaphore::new(0),
+                    report,
+                }),
+                dispatcher: RequestDispatcher::new(),
+                module_handle,
+            }
+        }
+
+        async fn request(&self, corr: u64) {
             handle_frame(
-                data_request(7, corr + 1),
-                &tx,
-                Arc::clone(&handler),
-                dispatcher.clone(),
-                module_handle.clone(),
+                data_request(7, corr),
+                &self.tx,
+                Arc::clone(&self.handler),
+                self.dispatcher.clone(),
+                self.module_handle.clone(),
             )
             .await
             .unwrap();
         }
 
-        timeout(Duration::from_secs(1), async {
-            while entered.load(Ordering::SeqCst) < HANDLER_TASK_CAPACITY {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
+        async fn wait_for_entered(&self, count: usize) {
+            timeout(Duration::from_secs(1), async {
+                while self.handler.entered.load(Ordering::SeqCst) != count {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("data handlers should acquire the available slots");
+        }
 
-        handle_frame(health_request(900), &tx, handler, dispatcher, module_handle)
+        async fn saturate(&self) {
+            for corr in 1..=HANDLER_TASK_CAPACITY as u64 {
+                self.request(corr).await;
+            }
+            self.wait_for_entered(HANDLER_TASK_CAPACITY).await;
+            self.request(HANDLER_TASK_CAPACITY as u64 + 1).await;
+            tokio::task::yield_now().await;
+            assert_eq!(self.dispatcher.permits.available_permits(), 0);
+            assert_eq!(self.dispatcher.waiting.lock().unwrap().len(), 1);
+            assert_eq!(
+                self.handler.entered.load(Ordering::SeqCst),
+                HANDLER_TASK_CAPACITY
+            );
+        }
+
+        async fn health(&mut self, corr: u64) -> HealthReport {
+            handle_frame(
+                health_request(corr),
+                &self.tx,
+                Arc::clone(&self.handler),
+                self.dispatcher.clone(),
+                self.module_handle.clone(),
+            )
             .await
             .unwrap();
-        assert!(
-            timeout(Duration::from_millis(75), rx.recv()).await.is_err(),
-            "health.check must share the same saturated request dispatch capacity as data requests"
+            let frame = timeout(Duration::from_millis(100), self.rx.recv())
+                .await
+                .expect("health.check must answer within 100 ms while data slots are busy")
+                .unwrap();
+            assert_eq!(frame.header.ty, FrameType::Response);
+            assert_eq!(frame.header.channel, 0);
+            assert_eq!(frame.header.corr, corr);
+            serde_json::from_slice::<ModuleControlResponse>(&frame.body)
+                .unwrap()
+                .health_report()
+                .unwrap()
+        }
+
+        async fn release(&mut self, count: usize) {
+            self.handler.release.add_permits(count);
+            for _ in 0..count {
+                let frame = timeout(Duration::from_secs(1), self.rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(frame.header.ty, FrameType::StreamEnd);
+                assert_eq!(frame.header.channel, 7);
+            }
+            assert!(self.dispatcher.waiting.lock().unwrap().is_empty());
+            assert!(self.dispatcher.in_flight.lock().unwrap().is_empty());
+            assert_eq!(
+                self.dispatcher.permits.available_permits(),
+                HANDLER_TASK_CAPACITY
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn health_check_answers_degraded_under_saturation_and_recovers() {
+        let own_report = HealthReport {
+            status: HealthStatus::Ok,
+            detail: Some("module gauges healthy".to_string()),
+            metrics: Some(json!({"transforms": 64})),
+        };
+        let mut harness = DispatchHarness::new(own_report.clone());
+        harness.saturate().await;
+        // A brief burst is not dispatch impairment, even with no slot free.
+        assert_eq!(harness.health(899).await, own_report);
+        // Advance the real dispatch stamp's monotonic clock, not a test-only
+        // health gauge. Keeping handlers blocked proves the transport isolation.
+        advance(Duration::from_millis(7300)).await;
+        let report = harness.health(900).await;
+        assert_eq!(report.status, HealthStatus::Degraded);
+        assert_eq!(report.metrics, own_report.metrics);
+        assert_eq!(
+            report.detail.as_deref(),
+            Some("request dispatch saturated: 64/64 in use, oldest waiting 7.3 s; module gauges healthy")
         );
 
-        release.notify_waiters();
+        harness.release(HANDLER_TASK_CAPACITY + 1).await;
+        assert_eq!(harness.health(901).await, own_report);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn health_check_preserves_failing_under_saturation() {
+        let mut harness = DispatchHarness::new(HealthReport {
+            status: HealthStatus::Failing,
+            detail: Some("module dispatch heartbeat stale".to_string()),
+            metrics: Some(json!({"heartbeat_age_s": 12})),
+        });
+        harness.saturate().await;
+        advance(Duration::from_millis(7300)).await;
+        let report = harness.health(900).await;
+        assert_eq!(report.status, HealthStatus::Failing);
+        assert_eq!(report.metrics, Some(json!({"heartbeat_age_s": 12})));
+        assert_eq!(
+            report.detail.as_deref(),
+            Some("request dispatch saturated: 64/64 in use, oldest waiting 7.3 s; module dispatch heartbeat stale")
+        );
+        harness.release(HANDLER_TASK_CAPACITY + 1).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn health_check_passes_module_report_through_with_free_permits() {
+        for status in [
+            HealthStatus::Ok,
+            HealthStatus::Degraded,
+            HealthStatus::Failing,
+        ] {
+            let own_report = HealthReport {
+                status,
+                detail: Some("module's own assessment".to_string()),
+                metrics: Some(json!({"gauge": 42})),
+            };
+            let mut harness = DispatchHarness::new(own_report.clone());
+            harness.request(1).await;
+            harness.wait_for_entered(1).await;
+            advance(Duration::from_millis(7300)).await;
+            assert_eq!(harness.health(900).await, own_report);
+            harness.release(1).await;
+        }
     }
 
     struct CorrBlockingHandler {
@@ -2850,6 +3048,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(*entered.lock().unwrap(), vec![1]);
+        assert!(dispatcher.waiting.lock().unwrap().is_empty());
         let response = timeout(Duration::from_secs(1), rx.recv())
             .await
             .unwrap()

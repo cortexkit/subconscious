@@ -261,6 +261,14 @@ export function decide({ pullRequest, repoFullName, issue = null, action = "open
 
   if (!linked) return fail("No linked issue", GATE_MESSAGE);
   if (!issue) return fail(`Linked issue #${linked.number} is unreadable`, GATE_MESSAGE);
+  // GitHub's issues endpoint also returns pull requests. Approval belongs to
+  // an open design issue, not to a PR or an already-completed discussion.
+  if (issue.isPullRequest) {
+    return fail(`#${issue.number} is a pull request, not a design issue`, GATE_MESSAGE);
+  }
+  if (issue.state !== "open") {
+    return fail(`Linked issue #${issue.number} is not open`, GATE_MESSAGE);
+  }
   if (!hasLabel(issue.labels, DESIGN_APPROVED_LABEL)) {
     return fail(
       `Waiting for \`${DESIGN_APPROVED_LABEL}\` on #${issue.number}`,
@@ -545,6 +553,7 @@ export function normalizeIssue(raw) {
   return {
     number: raw.number,
     state: raw.state ?? "open",
+    isPullRequest: Boolean(raw.pull_request),
     labels: (raw.labels ?? []).map((label) => (typeof label === "string" ? label : label.name)),
   };
 }

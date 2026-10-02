@@ -78,7 +78,7 @@ jobs:
       - name: Run package tests
         run: |
           DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
-            swift test --package-path clients/subc-client-swift
+            swift test
 
   # Build the SubcFed scheme for generic iOS with the package's declared iOS 16
   # deployment floor. Code signing is disabled because the CI runner has no

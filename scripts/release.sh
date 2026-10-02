@@ -105,8 +105,21 @@ fi
 # Pre-tag checks (the same gates CI will run, fail-fast locally first).
 echo "→ Pre-release checks (fmt, clippy, publish dry-run)..."
 if [[ "$NEEDS_BUMP" == "1" && "$DRY" != "--dry" ]]; then
-  sed -i.bak -E "0,/^version *= *\"[^\"]+\"/s//version = \"$VERSION\"/" "$MANIFEST"
-  rm -f "$MANIFEST.bak"
+  # POSIX awk works on both BSD and GNU hosts; sed's 0,/pattern/ address does
+  # not. Write back through the manifest so its permissions are retained.
+  bump_tmp=$(mktemp)
+  awk -v version="$VERSION" '
+    !updated && /^version *= *"[^"]+"/ {
+      sub(/"[^"]+"/, "\"" version "\"")
+      updated = 1
+    }
+    { print }
+  ' "$MANIFEST" >"$bump_tmp"
+  cat "$bump_tmp" >"$MANIFEST"
+  rm -f "$bump_tmp"
+  # Update workspace package versions without upgrading locked dependencies.
+  # The locked checks below must verify the same manifest/lock pair we tag.
+  cargo update --workspace
 fi
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
@@ -118,7 +131,7 @@ if [[ "$DRY" == "--dry" ]]; then
 fi
 
 if [[ "$NEEDS_BUMP" == "1" ]]; then
-  git add "$MANIFEST"
+  git add "$MANIFEST" Cargo.lock
   git commit -m "release: $TAG"
 fi
 

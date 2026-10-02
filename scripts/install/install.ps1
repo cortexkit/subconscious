@@ -60,11 +60,22 @@ function Ensure-UserPath {
     param([Parameter(Mandatory = $true)][string]$BinDir)
 
     $environmentKey = 'HKCU:\Environment'
+    $key = $null
+    $pathKind = [Microsoft.Win32.RegistryValueKind]::ExpandString
     try {
-        $currentPath = Get-ItemPropertyValue -Path $environmentKey -Name Path -ErrorAction SilentlyContinue
+        $key = Get-Item -LiteralPath $environmentKey -ErrorAction Stop
+        # The registry provider expands REG_EXPAND_SZ on ordinary reads. Keep
+        # the stored placeholders intact when appending our installation path.
+        $currentPath = $key.GetValue('Path', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+        if ($null -ne $currentPath) {
+            $pathKind = $key.GetValueKind('Path')
+        }
     }
     catch {
         Refuse 'path-update-failed' "could not read the user PATH registry value ($($_.Exception.Message))"
+    }
+    finally {
+        if ($null -ne $key) { $key.Dispose() }
     }
 
     $entries = @()
@@ -73,7 +84,11 @@ function Ensure-UserPath {
     }
     $containsBinDir = $false
     foreach ($entry in $entries) {
-        if ([string]::Equals($entry, $BinDir, [System.StringComparison]::OrdinalIgnoreCase)) {
+        $comparisonEntry = $entry
+        if ($pathKind -eq [Microsoft.Win32.RegistryValueKind]::ExpandString) {
+            $comparisonEntry = [Environment]::ExpandEnvironmentVariables($entry)
+        }
+        if ([string]::Equals($comparisonEntry, $BinDir, [System.StringComparison]::OrdinalIgnoreCase)) {
             $containsBinDir = $true
             break
         }
@@ -84,7 +99,7 @@ function Ensure-UserPath {
 
     $updatedPath = @($entries + $BinDir) -join ';'
     try {
-        Set-ItemProperty -Path $environmentKey -Name Path -Value $updatedPath -ErrorAction Stop
+        Set-ItemProperty -Path $environmentKey -Name Path -Value $updatedPath -Type $pathKind -ErrorAction Stop
     }
     catch {
         Refuse 'path-update-failed' "could not update HKCU\\Environment PATH ($($_.Exception.Message))"

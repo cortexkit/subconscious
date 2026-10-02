@@ -571,6 +571,38 @@ describe("contributor-facing text", () => {
 });
 
 describe("runPullRequestGate", () => {
+  for (const [name, raw] of [
+    ["rejects a closed design-approved issue", { state: "closed" }],
+    ["rejects a design-approved pull request returned by the issues API", {
+      state: "open", pull_request: { url: `https://api.github.com/repos/${REPO}/pulls/42` },
+    }],
+  ]) {
+    test(name, async () => {
+      // Drive the REST normalizer too: /issues/N can return a pull request,
+      // and a fixture that skips normalization cannot detect lost metadata.
+      const reader = createGitHubApi({
+        token: "fixture", repoFullName: REPO,
+        fetchImpl: async (url) => {
+          assert.equal(url, `https://api.github.com/repos/${REPO}/issues/42`);
+          return new Response(JSON.stringify({
+            number: 42, labels: [{ name: DESIGN_APPROVED_LABEL }], ...raw,
+          }));
+        },
+      });
+      const { api, checkApi, state } = createFixtureApi();
+      api.getIssue = reader.getIssue;
+      const result = await runPullRequestGate({
+        api, checkApi, repoFullName: REPO,
+        pullRequest: pullRequest({ body: "Refs #42" }),
+        action: "synchronize", log: silentLog,
+      });
+      assert.equal(result.conclusion, "failure");
+      assert.equal(result.linkedIssue, 42);
+      assert.equal(state.checkRuns[0].conclusion, "failure");
+      assert.equal(state.comments.length, 1);
+    });
+  }
+
   test("comments once and edits that same comment on later runs", async () => {
     const { api, checkApi, state } = createFixtureApi();
     const pr = pullRequest({ body: "No issue here" });

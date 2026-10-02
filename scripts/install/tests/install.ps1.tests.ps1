@@ -2,6 +2,14 @@
 # Run with: Invoke-Pester ./scripts/install/tests/install.ps1.tests.ps1
 BeforeAll {
     $installerPath = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\install.ps1'))
+    # The registry provider's dynamic -Type parameter does not exist on Unix.
+    # A command double gives Pester the same interface on every host and cannot
+    # write to the real registry even if a mock accidentally stops matching.
+    function Set-ItemProperty {
+        [CmdletBinding()]
+        param($Path, $Name, $Value, [Microsoft.Win32.RegistryValueKind]$Type)
+        throw 'unmocked registry write'
+    }
 }
 
 Describe 'native ck installer' {
@@ -9,7 +17,9 @@ Describe 'native ck installer' {
         $originalLocalAppData = $env:LOCALAPPDATA
         $originalArchitecture = $env:PROCESSOR_ARCHITECTURE
         $originalWowArchitecture = $env:PROCESSOR_ARCHITEW6432
+        $originalUserProfile = $env:USERPROFILE
         $env:LOCALAPPDATA = Join-Path $TestDrive 'local-app-data'
+        $env:USERPROFILE = Join-Path $TestDrive 'profile-home'
         $env:PROCESSOR_ARCHITECTURE = 'AMD64'
         Remove-Item Env:PROCESSOR_ARCHITEW6432 -ErrorAction SilentlyContinue
 
@@ -65,13 +75,33 @@ Describe 'native ck installer' {
             # tried to invoke the candidate or destination as part of setup.
             [System.IO.File]::WriteAllText((Join-Path $DestinationPath 'ck.exe'), 'not an executable')
         }
-        Mock Get-ItemPropertyValue { 'C:\Existing\Bin' }
+        $registryKey = [pscustomobject]@{
+            RawPath = 'C:\Existing\Bin'
+            PathKind = [Microsoft.Win32.RegistryValueKind]::ExpandString
+        }
+        $registryKey | Add-Member ScriptMethod GetValue {
+            param($Name, $Default, $Options)
+            if ($Options -eq [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames -or
+                $this.PathKind -eq [Microsoft.Win32.RegistryValueKind]::String) {
+                return $this.RawPath
+            }
+            return [Environment]::ExpandEnvironmentVariables($this.RawPath)
+        }
+        $registryKey | Add-Member ScriptMethod GetValueKind { param($Name) return $this.PathKind }
+        $registryKey | Add-Member ScriptMethod Dispose {}
+        Mock Get-Item { $registryKey } -ParameterFilter { $LiteralPath -eq 'HKCU:\Environment' }
         Mock Set-ItemProperty {}
     }
 
     AfterEach {
         $env:LOCALAPPDATA = $originalLocalAppData
         $env:PROCESSOR_ARCHITECTURE = $originalArchitecture
+        if ($null -eq $originalUserProfile) {
+            Remove-Item Env:USERPROFILE -ErrorAction SilentlyContinue
+        }
+        else {
+            $env:USERPROFILE = $originalUserProfile
+        }
         if ($null -eq $originalWowArchitecture) {
             Remove-Item Env:PROCESSOR_ARCHITEW6432 -ErrorAction SilentlyContinue
         }
@@ -131,6 +161,16 @@ Describe 'native ck installer' {
         $manifest = Join-Path $env:LOCALAPPDATA 'cortexkit\installer-manifest.json'
         (Get-Content -LiteralPath $manifest -Raw | ConvertFrom-Json).platform | Should -Be 'windows-arm64'
         $env:PROCESSOR_ARCHITECTURE = 'AMD64'
+    }
+
+    It 'preserves unexpanded user PATH entries and the registry value kind' {
+        $registryKey.RawPath = '%USERPROFILE%\.dotnet\tools;C:\Other\Bin'
+        $registryKey.PathKind = [Microsoft.Win32.RegistryValueKind]::ExpandString
+        & $installerPath | Out-Null
+        Should -Invoke Set-ItemProperty -Times 1 -ParameterFilter {
+            $Value -eq ('%USERPROFILE%\.dotnet\tools;C:\Other\Bin;' + (Join-Path $env:LOCALAPPDATA 'cortexkit\bin')) -and
+            $Type -eq [Microsoft.Win32.RegistryValueKind]::ExpandString
+        }
     }
 
     It 'refuses an architecture the release does not ship before any fetch' {

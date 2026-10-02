@@ -46,10 +46,26 @@ fi
 
 before=$(df -k / | awk 'NR==2 {print $4}')
 manifest="$RUN/bin-backup-sweep-$(date -u +%Y%m%dT%H%M%SZ).manifest"
+# GNU and BSD stat have incompatible formatting switches. Probe the utility,
+# not the OS: a BSD host can also have GNU coreutils on PATH.
+stat_style=bsd
+if stat --version >/dev/null 2>&1; then stat_style=gnu; fi
 {
   echo "# bin backup sweep $(date -u +%FT%TZ); keep $KEEP newest per ck-<binary>.* regardless of prefix"
   while read -r f; do
-    echo "$(shasum -a 256 "$f" | cut -d' ' -f1)  $(stat -f %z "$f")  $(stat -f %Sm -t %FT%TZ "$f")  $f"
+    digest=$(shasum -a 256 "$f" | cut -d' ' -f1)
+    if [[ "$stat_style" == "gnu" ]]; then
+      size=$(stat -c %s "$f")
+      mtime=$(TZ=UTC stat -c %y "$f")
+      mtime=${mtime/ /T}
+      mtime="${mtime%%.*}Z"
+    else
+      size=$(stat -f %z "$f")
+      mtime=$(TZ=UTC stat -f %Sm -t %FT%TZ "$f")
+    fi
+    # Standalone assignments above fail closed on a metadata error; command
+    # substitutions inside echo would report success and permit deletion.
+    printf '%s  %s  %s  %s\n' "$digest" "$size" "$mtime" "$f"
   done < "$list"
 } > "$manifest"
 echo "manifest: $manifest ($count rows)"

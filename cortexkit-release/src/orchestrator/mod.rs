@@ -114,6 +114,11 @@ impl std::fmt::Display for PrecheckRefusalCode {
 /// A typed local phase result kept distinct from an infrastructure seam failure.
 #[derive(Debug)]
 pub enum PhaseExecutionError {
+    /// A declared phase has no implementation in this runner.
+    NotImplemented {
+        phase: PhaseInstanceId,
+        phase_type: String,
+    },
     Refusal {
         code: PrecheckRefusalCode,
         phase: PhaseInstanceId,
@@ -154,6 +159,7 @@ pub enum EffectOutcome {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OrchestrationRefusalCode {
     UnknownPhase,
+    PhaseNotImplemented,
     UnsafeOrdering,
     AttemptedIntentAbsent,
     ContradictoryEvidence,
@@ -289,6 +295,11 @@ impl Orchestrator {
                     .run(phase)
                     .map(|evidence| (Vec::new(), evidence))
                     .map_err(|error| match error {
+                        PhaseExecutionError::NotImplemented { phase, phase_type } => OrchestrationError::refusal(
+                            OrchestrationRefusalCode::PhaseNotImplemented,
+                            Some(phase),
+                            format!("phase_not_implemented: phase type `{phase_type}` has no execution implementation; no completion was recorded"),
+                        ),
                         PhaseExecutionError::Refusal {
                             code,
                             phase,

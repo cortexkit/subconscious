@@ -1214,6 +1214,7 @@ fn map_orchestration_error(command: &str, error: OrchestrationError) -> CliFailu
         } => {
             let code = match code {
                 OrchestrationRefusalCode::UnknownPhase => "unknown_phase",
+                OrchestrationRefusalCode::PhaseNotImplemented => "phase_not_implemented",
                 OrchestrationRefusalCode::UnsafeOrdering => "unsafe_phase_ordering",
                 OrchestrationRefusalCode::AttemptedIntentAbsent => "attempted_intent_absent",
                 OrchestrationRefusalCode::ContradictoryEvidence => {

@@ -525,7 +525,12 @@ impl PhaseRunner for PrecheckRunner<'_> {
             CONTEXT_FITNESS => self.run_context_fitness(phase),
             TOOL_PINNING => self.run_tool_pinning(phase),
             RESIDUE_SWEEP => self.run_residue_sweep(phase),
-            _ => Ok(()),
+            // A registered name is not proof that this runner can execute it.
+            // Refuse instead of fabricating completion for an unwired gate.
+            _ => Err(PhaseExecutionError::NotImplemented {
+                phase: phase.instance.clone(),
+                phase_type: phase.phase_type.clone(),
+            }),
         }
         .map(|()| Vec::new())
     }

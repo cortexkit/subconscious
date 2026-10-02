@@ -59,6 +59,14 @@ production provider implementation. The synthetic interruption makes the fake
 effect durable, returns before the completion append, and then proves `resume`
 uses the done-probe to append completion without a second executor call.
 
+The CLI currently executes `gates_local` and the six declared precheck detectors.
+Other non-public phase names (`preflight`, `ci_watch`, `build`, `stamp`,
+`verify_readback`, `stage`, and `notify`) are valid planning vocabulary but are
+not wired to the CLI runner. Executing them refuses with `phase_not_implemented`
+instead of reporting a successful gate or fabricating evidence. The synthetic
+provider demonstrates public-effect replay, not real CI, builds, readback, or
+staging; the walkthrough below describes the intended complete pipeline.
+
 ## Acceptance-baseline walkthrough mapping
 
 The normative acceptance baseline records one manual sequence: publish an

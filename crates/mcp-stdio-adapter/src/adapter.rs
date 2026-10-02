@@ -906,7 +906,7 @@ struct ProcessTree {
 impl ProcessTree {
     fn terminate(&self) {
         #[cfg(unix)]
-        let _ = rustix::process::kill_process_group(self.group, rustix::process::Signal::Kill);
+        let _ = rustix::process::kill_process_group(self.group, rustix::process::Signal::KILL);
         #[cfg(windows)]
         let _ = self.job.terminate();
     }

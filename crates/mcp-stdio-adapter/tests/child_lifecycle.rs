@@ -534,7 +534,7 @@ async fn teardown_kills_grandchild_ignoring_sigterm() {
     .is_ok();
     // A failed regression must not leave its intentionally uncontained helper behind.
     if !gone {
-        let _ = rustix::process::kill_process(pid, rustix::process::Signal::Kill);
+        let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
     }
     assert!(
         gone,

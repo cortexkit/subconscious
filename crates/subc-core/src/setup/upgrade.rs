@@ -271,6 +271,8 @@ pub struct SystemUpgradeBackend {
     assets: ReleaseUpgradeAssetFetcher,
     inventory: Inventory,
     prepared: BTreeMap<String, PreparedUpgradeAsset>,
+    /// Identity of the verified file captured at placement, before activation.
+    activated_inodes: BTreeMap<String, String>,
     rollback_paths: BTreeMap<String, PathBuf>,
     rollback_archive_sha256: BTreeMap<String, Option<String>>,
     expected_versions: BTreeMap<String, String>,
@@ -320,6 +322,7 @@ impl SystemUpgradeBackend {
             assets: ReleaseUpgradeAssetFetcher::from_index(index),
             inventory,
             prepared: BTreeMap::new(),
+            activated_inodes: BTreeMap::new(),
             rollback_paths: BTreeMap::new(),
             rollback_archive_sha256: BTreeMap::new(),
             expected_versions,
@@ -605,7 +608,10 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
                 &mut self.inventory,
             );
             prepared.cleanup();
-            return result.map(|evidence| evidence.to_string());
+            let evidence = result?;
+            self.activated_inodes
+                .insert(target.label().into(), destination_inode(&destination)?);
+            return Ok(evidence.to_string());
         }
 
         let parent = destination.parent().ok_or_else(|| {
@@ -635,6 +641,8 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
             )
         })?;
         let archive_sha256 = prepared.archive_sha256.clone();
+        self.activated_inodes
+            .insert(target.label().into(), destination_inode(&destination)?);
         prepared.cleanup();
         self.record_replacement_digest(target, &destination, Some(&archive_sha256))?;
         Ok(format!(
@@ -769,11 +777,14 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
         };
         let require_live_process = is_supervised_module || target.is_daemon();
         let expectation = expected_post_activation(
-            destination,
+            self.activated_inodes
+                .get(target.label())
+                .ok_or_else(|| format!("no replacement identity recorded for {target}"))?
+                .clone(),
             expected_version,
             require_live_process,
             require_live_process,
-        )?;
+        );
         let evidence = VerificationEvidence {
             pid,
             inode: destination_inode(destination)?,
@@ -1004,6 +1015,12 @@ mod tests {
             }),
             inventory: Inventory::load(root.join("installer-manifest.json"), "linux-x64").unwrap(),
             prepared: BTreeMap::new(),
+            activated_inodes: [(
+                target.label().into(),
+                destination_inode(&root.join(target.label())).unwrap(),
+            )]
+            .into_iter()
+            .collect(),
             rollback_paths: BTreeMap::new(),
             rollback_archive_sha256: BTreeMap::new(),
             expected_versions: [(target.label().to_string(), "0.1.0".into())]
@@ -1012,6 +1029,36 @@ mod tests {
             planned_from: BTreeMap::new(),
             supervised_modules: BTreeSet::new(),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn post_verification_rejects_a_destination_changed_after_replacement() {
+        let root = TestTempDir::new("changed-post-inode");
+        let target = upgrade_target("ck-mc");
+        let destination = root.join("ck-mc");
+        version_binary(&destination, "0.1.0");
+        let mut backend = isolated_backend(&root, target);
+        let workspace = root.join("candidate");
+        backend
+            .inventory
+            .record("managed-binary", &destination, serde_json::Map::new());
+        fs::create_dir(&workspace).unwrap();
+        let candidate = workspace.join("ck-mc");
+        version_binary(&candidate, "0.1.0");
+        backend.prepared.insert(
+            target.label().into(),
+            PreparedUpgradeAsset::test_candidate(candidate, target),
+        );
+        backend.replace_destination(target).unwrap();
+        assert!(backend.post_verify(target).is_ok());
+        let rogue = root.join("rogue");
+        version_binary(&rogue, "0.1.0");
+        fs::rename(rogue, &destination).unwrap();
+        let error = backend
+            .post_verify(target)
+            .expect_err("changed destination must fail");
+        assert!(error.contains("destination inode mismatch"), "{error}");
     }
 
     #[cfg(unix)]
@@ -1068,6 +1115,7 @@ mod tests {
             }),
             inventory,
             prepared: BTreeMap::new(),
+            activated_inodes: BTreeMap::new(),
             rollback_paths: BTreeMap::from([(aft.label().to_string(), rollback)]),
             rollback_archive_sha256: BTreeMap::new(),
             expected_versions: BTreeMap::new(),
@@ -1396,6 +1444,7 @@ exit 1
             }),
             inventory,
             prepared: BTreeMap::new(),
+            activated_inodes: BTreeMap::new(),
             rollback_paths: BTreeMap::new(),
             rollback_archive_sha256: BTreeMap::new(),
             expected_versions: [(aft.label().to_string(), "2.0.0".to_string())]
@@ -1444,6 +1493,7 @@ exit 1
             }),
             inventory,
             prepared: BTreeMap::new(),
+            activated_inodes: BTreeMap::new(),
             rollback_paths: BTreeMap::new(),
             rollback_archive_sha256: BTreeMap::new(),
             expected_versions: [(mcp.label().to_string(), "0.17.36".to_string())]

@@ -86,6 +86,16 @@ pub struct PreparedUpgradeAsset {
 }
 
 impl PreparedUpgradeAsset {
+    #[cfg(all(test, unix))]
+    pub(super) fn test_candidate(candidate: PathBuf, target: UpgradeTarget) -> Self {
+        Self {
+            names: convention_asset_names(target, AlphaTarget::LinuxX64),
+            workspace: candidate.parent().unwrap().to_path_buf(),
+            candidate,
+            archive_sha256: "00".into(),
+        }
+    }
+
     pub fn cleanup(self) {
         let _ = fs::remove_dir_all(self.workspace);
     }

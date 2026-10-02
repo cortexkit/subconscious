@@ -180,6 +180,11 @@ extension AskRequest: Hashable {
 /// whole ask — and one ask took the entire list on the phone before this change.
 ///
 /// `byteCount` is optional because the producer's own field is nullable.
+///
+/// `kind` says what the pointer refers to: `"file"` has bytes to fetch, `"link"`
+/// names a URL in `url` and has no bytes, so fetching it is refused. It is an open
+/// string, not an enum: a kind no client knows yet must decode, and absent means
+/// the producer did not say, which callers treat as a file (today's behaviour).
 public struct AskAttachment: Codable, Equatable, Hashable {
     public var index: Int?
     public var artifactID: String?
@@ -187,6 +192,17 @@ public struct AskAttachment: Codable, Equatable, Hashable {
     public var mime: String
     public var byteCount: Int?
     public var sealed: Bool?
+    public var kind: String?
+    public var url: String?
+
+    /// The pointer's `kind` value for a URL with no bytes behind it.
+    public static let linkKind = "link"
+    /// The pointer's `kind` value for content fetched as bytes.
+    public static let fileKind = "file"
+
+    /// True when the pointer is a link with a URL to open, so it must never be
+    /// fetched as bytes. A link without a `url` is not openable and stays false.
+    public var isLink: Bool { kind == Self.linkKind && url != nil }
 
     public init(
         index: Int? = nil,
@@ -194,7 +210,9 @@ public struct AskAttachment: Codable, Equatable, Hashable {
         title: String,
         mime: String,
         byteCount: Int? = nil,
-        sealed: Bool? = nil
+        sealed: Bool? = nil,
+        kind: String? = nil,
+        url: String? = nil
     ) {
         self.index = index
         self.artifactID = artifactID
@@ -202,6 +220,8 @@ public struct AskAttachment: Codable, Equatable, Hashable {
         self.mime = mime
         self.byteCount = byteCount
         self.sealed = sealed
+        self.kind = kind
+        self.url = url
     }
 
     /// Hand-written so an element missing BOTH identities still decodes, and so the
@@ -226,6 +246,8 @@ public struct AskAttachment: Codable, Equatable, Hashable {
         byteCount = key("byteCount").flatMap { try? container.decode(Int.self, forKey: $0) }
             ?? key("byte_count").flatMap { try? container.decode(Int.self, forKey: $0) }
         sealed = key("sealed").flatMap { try? container.decode(Bool.self, forKey: $0) }
+        kind = string(["kind"])
+        url = string(["url"])
     }
 }
 

@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     error::Error,
     fmt, io,
     path::PathBuf,
@@ -1455,6 +1455,18 @@ struct SupervisedConfiguration {
 #[derive(Debug, Clone, Default)]
 pub struct SupervisorHandle {
     modules: Arc<Mutex<HashMap<String, SupervisedModule>>>,
+    /// Module ids the supervisor has taken on. An id is added BEFORE the
+    /// module's first process is spawned and removed only when the module
+    /// leaves the roster (see [`Self::retire`]), so it is always a superset of
+    /// the keys of `modules`.
+    ///
+    /// `modules` cannot answer "is this module configured?" on its own: a
+    /// [`SupervisedModule`] only exists once its process has been spawned, and
+    /// a fast child can connect, register, sync its scopes and ask about them
+    /// before the supervisor has inserted it. Answering "not configured" in that
+    /// gap makes scope admission refuse with the terminal "will never sync"
+    /// instead of the retryable "has not synced yet".
+    configured_ids: Arc<Mutex<HashSet<String>>>,
     spawn_events: SpawnEventFeed,
     /// The current expected launch nonce for each reserved module_id. Set when the
     /// supervisor spawns the reserved module; checked when a HELLO claims that id. A
@@ -1944,11 +1956,55 @@ impl SupervisorHandle {
     }
 
     pub fn insert(&self, module: SupervisedModule) -> Option<SupervisedModule> {
+        // Normally already marked before the process was spawned; marking here
+        // too keeps `configured_ids` a superset of the roster for any caller
+        // that inserts a module directly.
+        self.mark_configured(module.module_id());
         let mut modules = self
             .modules
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         modules.insert(module.module_id().to_string(), module)
+    }
+
+    /// Record that the supervisor has taken on `module_id`. Called before the
+    /// module's first process is spawned, so that by the time that process can
+    /// register, [`Self::is_configured`] already answers true.
+    fn mark_configured(&self, module_id: &str) {
+        self.configured_ids
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(module_id.to_string());
+    }
+
+    /// Undo [`Self::mark_configured`] for a module whose first spawn failed
+    /// before it was ever put on the roster. A module already on the roster
+    /// keeps its mark: only [`Self::retire`] takes a rostered module off.
+    fn unmark_configured_unless_rostered(&self, module_id: &str) {
+        let modules = self
+            .modules
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !modules.contains_key(module_id) {
+            self.configured_ids
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(module_id);
+        }
+    }
+
+    /// Whether `module_id` is a module this daemon supervises: on the roster,
+    /// or about to be (its process is being spawned right now).
+    ///
+    /// This, not `get(..).is_some()`, is what "the owner is configured" means
+    /// for scopes: a supervised module's process can register and sync before
+    /// [`Self::get`] can return it, and in that window it is still a module
+    /// that will sync, not one that never will.
+    pub(crate) fn is_configured(&self, module_id: &str) -> bool {
+        self.configured_ids
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(module_id)
     }
 
     pub fn get(&self, module_id: &str) -> Option<SupervisedModule> {
@@ -2028,10 +2084,16 @@ impl SupervisorHandle {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .retain(|_, owner| owner != module_id);
-        self.modules
+        let removed = self
+            .modules
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(module_id)
+            .remove(module_id);
+        self.configured_ids
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(module_id);
+        removed
     }
 
     /// Remember a module removed by a non-preview rescan so route.open can
@@ -2098,6 +2160,33 @@ pub struct Supervisor {
     child_roster: ChildRoster,
     #[cfg(target_os = "linux")]
     cgroup_placement: Option<subc_cgroup::Placement>,
+    #[cfg(test)]
+    test_after_first_spawn: AfterFirstSpawnHook,
+}
+
+/// Test-only hook run on the path that takes on a new module, right after its
+/// first `spawn_child` returns (the process exists and could already be
+/// registering) and before that process is handed to the module's supervise
+/// loop and put on the roster. Lets a test observe what a fast child would see
+/// in that window without racing a real one.
+#[cfg(test)]
+#[derive(Clone, Default)]
+struct AfterFirstSpawnHook(Option<Arc<dyn Fn(&str) + Send + Sync>>);
+
+#[cfg(test)]
+impl fmt::Debug for AfterFirstSpawnHook {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("AfterFirstSpawnHook")
+    }
+}
+
+#[cfg(test)]
+impl AfterFirstSpawnHook {
+    fn run(&self, module_id: &str) {
+        if let Some(hook) = &self.0 {
+            hook(module_id);
+        }
+    }
 }
 
 impl Supervisor {
@@ -2313,6 +2402,8 @@ impl Supervisor {
             child_roster: ChildRoster::default(),
             #[cfg(target_os = "linux")]
             cgroup_placement: None,
+            #[cfg(test)]
+            test_after_first_spawn: AfterFirstSpawnHook::default(),
         }
     }
 
@@ -2401,10 +2492,11 @@ impl Supervisor {
     /// register with channel-0 `HELLO` using `spec.module_id` as its manifest id.
     pub fn spawn(&self, spec: ModuleSpec) -> Result<SupervisedModule, SuperviseError> {
         validate_spec(&spec)?;
+        self.establish_identity(&spec);
 
         let runtime = self.runtime_config();
         let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
-        let child = spawn_child(
+        let spawned = spawn_child(
             &spec,
             runtime.connection_file_path.as_deref(),
             self.supervisor_handle.as_ref(),
@@ -2413,12 +2505,66 @@ impl Supervisor {
             &runtime.child_roster,
             #[cfg(target_os = "linux")]
             runtime.cgroup_placement.as_ref(),
-        )?;
-        set_running(&snapshot, &child, &spec.module_id, &runtime.spawn_events)?;
-        self.process_liveness
-            .track(spec.module_id.clone(), Arc::clone(&snapshot));
+        );
+        #[cfg(test)]
+        self.test_after_first_spawn.run(&spec.module_id);
+        let child = match spawned {
+            Ok(child) => child,
+            Err(err) => {
+                // Unlike the configured paths, a failed `spawn` leaves nothing
+                // on the roster, so the module must not stay marked configured.
+                self.abandon_unrostered(&spec.module_id);
+                return Err(err);
+            }
+        };
+        self.mark_first_process_running(&spec, &runtime, &snapshot, &child)?;
 
         Ok(self.supervised_module(spec, runtime, snapshot, Some(child)))
+    }
+
+    /// Make `spec`'s module count as configured, with its identity gates
+    /// (reserved id, reserved prefixes) in place, BEFORE any process of it
+    /// exists.
+    ///
+    /// Every path that takes on a new module calls this before `spawn_child`.
+    /// The order is the point: the child can connect, register, sync its
+    /// scopes and ask about them as soon as it is spawned, and the module is
+    /// only put on the roster after `spawn_child` returns. Were the mark set
+    /// with the roster entry, a fast child would see its own owner reported
+    /// as not configured, and a scoped `route.open` in that window would be
+    /// refused as terminal `scope_not_live` ("will never sync") instead of
+    /// retryable `scope_not_synced`.
+    fn establish_identity(&self, spec: &ModuleSpec) {
+        if let Some(supervisor_handle) = &self.supervisor_handle {
+            supervisor_handle.apply_identity_configuration(spec);
+            supervisor_handle.mark_configured(&spec.module_id);
+        }
+    }
+
+    /// Take back [`Self::establish_identity`]'s configured mark when the
+    /// module will not be put on the roster after all.
+    fn abandon_unrostered(&self, module_id: &str) {
+        if let Some(supervisor_handle) = &self.supervisor_handle {
+            supervisor_handle.unmark_configured_unless_rostered(module_id);
+        }
+    }
+
+    /// Record a freshly spawned first process as running. On failure the
+    /// module never reaches the roster, so its configured mark is taken back.
+    fn mark_first_process_running(
+        &self,
+        spec: &ModuleSpec,
+        runtime: &SupervisorRuntimeConfig,
+        snapshot: &SharedSnapshot,
+        child: &SupervisedChild,
+    ) -> Result<(), SuperviseError> {
+        if let Err(err) = set_running(snapshot, child, &spec.module_id, &runtime.spawn_events) {
+            self.abandon_unrostered(&spec.module_id);
+            return Err(err);
+        }
+        self.process_liveness
+            .track(spec.module_id.clone(), Arc::clone(snapshot));
+        Ok(())
     }
 
     /// Start supervising a module declared in daemon configuration.
@@ -2432,6 +2578,7 @@ impl Supervisor {
         enabled: bool,
     ) -> Result<SupervisedModule, SuperviseError> {
         validate_spec(&spec)?;
+        self.establish_identity(&spec);
 
         let runtime = self.runtime_config();
         if !enabled {
@@ -2440,7 +2587,7 @@ impl Supervisor {
         }
 
         let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
-        match spawn_child(
+        let spawned = spawn_child(
             &spec,
             runtime.connection_file_path.as_deref(),
             self.supervisor_handle.as_ref(),
@@ -2449,11 +2596,12 @@ impl Supervisor {
             &runtime.child_roster,
             #[cfg(target_os = "linux")]
             runtime.cgroup_placement.as_ref(),
-        ) {
+        );
+        #[cfg(test)]
+        self.test_after_first_spawn.run(&spec.module_id);
+        match spawned {
             Ok(child) => {
-                set_running(&snapshot, &child, &spec.module_id, &runtime.spawn_events)?;
-                self.process_liveness
-                    .track(spec.module_id.clone(), Arc::clone(&snapshot));
+                self.mark_first_process_running(&spec, &runtime, &snapshot, &child)?;
                 Ok(self.supervised_module(spec, runtime, snapshot, Some(child)))
             }
             Err(err) => {
@@ -2483,6 +2631,7 @@ impl Supervisor {
         restart_policy: RestartPolicy,
     ) -> Result<SupervisedModule, SuperviseError> {
         validate_spec(&spec)?;
+        self.establish_identity(&spec);
 
         let mut runtime = self.runtime_config();
         runtime.health = health.clone();
@@ -2500,7 +2649,7 @@ impl Supervisor {
         }
 
         let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
-        match spawn_child(
+        let spawned = spawn_child(
             &spec,
             runtime.connection_file_path.as_deref(),
             self.supervisor_handle.as_ref(),
@@ -2509,11 +2658,12 @@ impl Supervisor {
             &runtime.child_roster,
             #[cfg(target_os = "linux")]
             runtime.cgroup_placement.as_ref(),
-        ) {
+        );
+        #[cfg(test)]
+        self.test_after_first_spawn.run(&spec.module_id);
+        match spawned {
             Ok(child) => {
-                set_running(&snapshot, &child, &spec.module_id, &runtime.spawn_events)?;
-                self.process_liveness
-                    .track(spec.module_id.clone(), Arc::clone(&snapshot));
+                self.mark_first_process_running(&spec, &runtime, &snapshot, &child)?;
                 Ok(self.supervised_module(spec, runtime, snapshot, Some(child)))
             }
             Err(err) => {
@@ -2622,8 +2772,10 @@ impl Supervisor {
                 provenance_probe: self.provenance_probe.clone(),
             }),
         };
+        // The identity gates and the configured mark were set by
+        // `establish_identity` before any process was spawned; only the roster
+        // entry waits for the module handle, which needs the spawned child.
         if let Some(supervisor_handle) = &self.supervisor_handle {
-            supervisor_handle.apply_identity_configuration(&spec);
             supervisor_handle.insert(module.clone());
         }
         module
@@ -4599,6 +4751,155 @@ mod tests {
             handle.removal_tombstone_age_ms(module_id).is_none(),
             "a re-added module must not retain a stale removal tombstone"
         );
+    }
+
+    /// What one module's owner looked like from the control plane at the
+    /// instant after its first process was spawned.
+    #[derive(Debug, PartialEq, Eq)]
+    struct OwnerInSpawnWindow {
+        module_id: String,
+        configured: bool,
+        on_roster: bool,
+        admission_refusal: Option<&'static str>,
+    }
+
+    /// A supervised module's process can connect, register, sync its scopes
+    /// and describe them as soon as it is spawned, which is BEFORE the
+    /// supervisor puts the module on the roster. In that window the owner must
+    /// already read as configured, so a scoped `route.open` against it is
+    /// refused as retryable `scope_not_synced` and not as terminal
+    /// `scope_not_live` ("will never sync").
+    ///
+    /// The hook runs in exactly that window on every path that takes on a new
+    /// module, so no race with a real child is needed: `on_roster: false`
+    /// proves each observation was taken before the roster insert.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_new_module_is_configured_before_its_first_process_can_register() {
+        use crate::scopes::ScopeTable;
+        use subc_protocol::{error_codes, scope::ScopeSelector, Principal};
+
+        let dir = subc_test_support::TestTempDir::new("configured-before-spawn");
+        let stub = |module_id: &str, program: PathBuf| ModuleSpec {
+            module_id: module_id.to_string(),
+            program,
+            args: Vec::new(),
+            env: ["XDG_DATA_HOME", "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME"]
+                .into_iter()
+                .map(|key| (key.to_string(), dir.path().display().to_string()))
+                .chain([("FAKE_AFT_NEVER_CONNECT".to_string(), "1".to_string())])
+                .collect(),
+            reserved: false,
+            reserved_prefixes: Vec::new(),
+            protocol: ModuleProtocol::Subc,
+            overlap: Default::default(),
+        };
+        let live = super::terminal_history_tests::fake_aft_stub_path();
+        let missing = dir.path().join("definitely-missing-module");
+
+        let handle = SupervisorHandle::new();
+        let mut supervisor =
+            Supervisor::new(Arc::new(Registry::default()), RestartPolicy::default())
+                .with_handle(handle.clone());
+        let observed = Arc::new(Mutex::new(Vec::<OwnerInSpawnWindow>::new()));
+        let hook_handle = handle.clone();
+        let hook_observed = Arc::clone(&observed);
+        supervisor.test_after_first_spawn = AfterFirstSpawnHook(Some(Arc::new(move |module_id| {
+            // Exactly what the control plane computes for a scoped route.open
+            // naming this module as the owner of a scope it has not synced.
+            let configured = hook_handle.is_configured(module_id);
+            let selector = ScopeSelector {
+                owner: Principal::Reserved {
+                    module_id: module_id.to_string(),
+                },
+                scope_ref: "s".to_string(),
+                scope_epoch: Some(1),
+            };
+            let carrier = Principal::Reserved {
+                module_id: "carrier".to_string(),
+            };
+            let admission_refusal = match ScopeTable::new(Vec::<String>::new())
+                .admit(&carrier, module_id, &selector, configured)
+            {
+                Ok(_) => None,
+                Err(refusal) => Some(refusal.code),
+            };
+            hook_observed.lock().unwrap().push(OwnerInSpawnWindow {
+                module_id: module_id.to_string(),
+                configured,
+                on_roster: hook_handle.get(module_id).is_some(),
+                admission_refusal,
+            });
+        })));
+
+        let plain = supervisor.spawn(stub("plain", live.clone())).unwrap();
+        let configured = supervisor
+            .supervise_configured(stub("configured", live.clone()), true)
+            .unwrap();
+        let with_health = supervisor
+            .supervise_configured_with_health(
+                stub("with-health", live.clone()),
+                true,
+                HealthConfig::default(),
+                None,
+                RestartPolicy::default(),
+            )
+            .unwrap();
+        // The failed-spawn path still puts the module on the roster (as
+        // failed), so it is configured throughout.
+        let failed = supervisor
+            .supervise_configured_with_health(
+                stub("failed-spawn", missing.clone()),
+                true,
+                HealthConfig::default(),
+                None,
+                RestartPolicy::default(),
+            )
+            .unwrap();
+        // A failed plain `spawn` puts nothing on the roster, so its mark is
+        // taken back once the spawn has failed.
+        assert!(supervisor.spawn(stub("spawn-error", missing)).is_err());
+
+        let expected = [
+            "plain",
+            "configured",
+            "with-health",
+            "failed-spawn",
+            "spawn-error",
+        ]
+        .into_iter()
+        .map(|module_id| OwnerInSpawnWindow {
+            module_id: module_id.to_string(),
+            configured: true,
+            on_roster: false,
+            admission_refusal: Some(error_codes::SCOPE_NOT_SYNCED),
+        })
+        .collect::<Vec<_>>();
+        assert_eq!(*observed.lock().unwrap(), expected);
+
+        for module_id in ["plain", "configured", "with-health", "failed-spawn"] {
+            assert!(
+                handle.get(module_id).is_some(),
+                "{module_id} is on the roster"
+            );
+            assert!(
+                handle.is_configured(module_id),
+                "{module_id} stays configured"
+            );
+        }
+        assert!(handle.get("spawn-error").is_none());
+        assert!(
+            !handle.is_configured("spawn-error"),
+            "a plain spawn that failed must not leave its module marked configured"
+        );
+
+        // Leaving the roster clears the mark with it.
+        handle.retire("failed-spawn");
+        assert!(!handle.is_configured("failed-spawn"));
+
+        for module in [plain, configured, with_health] {
+            module.stop().await.unwrap();
+        }
+        drop(failed);
     }
 
     fn stale_process_snapshot(state: ModuleState, enabled: bool) -> SharedSnapshot {

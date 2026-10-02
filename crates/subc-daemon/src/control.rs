@@ -2518,7 +2518,9 @@ impl ControlHandler {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .describe(&owner, &scope_ref);
         let owner_configured = match &owner {
-            Principal::Reserved { module_id } => self.supervisor.get(module_id).is_some(),
+            // Not `get(..).is_some()`: a supervised module's process can
+            // register and describe before it is on the roster.
+            Principal::Reserved { module_id } => self.supervisor.is_configured(module_id),
             _ => false,
         };
         let response = ModuleControlResponseToModule::ScopeDescribe {
@@ -3344,7 +3346,10 @@ impl ControlHandler {
             None => (None, None),
             Some(selector) => {
                 let owner_configured = match &selector.owner {
-                    Principal::Reserved { module_id } => self.supervisor.get(module_id).is_some(),
+                    // See `SupervisorHandle::is_configured`: true from before
+                    // the owner's process is spawned, so an owner that has
+                    // not synced yet is refused as retryable, not terminal.
+                    Principal::Reserved { module_id } => self.supervisor.is_configured(module_id),
                     _ => false,
                 };
                 let admitted = self

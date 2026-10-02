@@ -110,6 +110,14 @@ struct ConfiguredCandidate {
     enabled: bool,
 }
 
+impl ConfiguredCandidate {
+    fn enabled_in(&self, runtime: Option<&RuntimeModule>) -> bool {
+        // Configuration is the startup default. Supervisor start/stop commands
+        // override it for this daemon lifetime, including before the next HELLO.
+        runtime.map_or(self.enabled, |module| module.enabled)
+    }
+}
+
 #[derive(Debug, Clone)]
 struct CachedManifest {
     declarations: CapabilityDeclarations,
@@ -346,12 +354,7 @@ impl CapabilityRequirementEvaluator {
         for (module_id, configured) in &configured {
             let process = if registered.contains_key(module_id) {
                 ProcessEvidence::Registered
-            } else if !configured.enabled
-                || runtime
-                    .get(module_id)
-                    .map(|module| !module.enabled)
-                    .unwrap_or(false)
-            {
+            } else if !configured.enabled_in(runtime.get(module_id).copied()) {
                 ProcessEvidence::Absent
             } else {
                 match runtime.get(module_id).map(|module| module.state) {
@@ -402,11 +405,7 @@ impl CapabilityRequirementEvaluator {
                 .values()
                 .any(|module| provides(module.capabilities.as_ref(), &key.capability));
             let config_satisfiable = state.configured.iter().any(|(module_id, configured)| {
-                configured.enabled
-                    && runtime
-                        .get(module_id)
-                        .map(|module| module.enabled)
-                        .unwrap_or(true)
+                configured.enabled_in(runtime.get(module_id).copied())
                     && (registered.get(module_id).is_some_and(|module| {
                         provides(module.capabilities.as_ref(), &key.capability)
                     }) || state
@@ -687,12 +686,7 @@ fn requirement_declarations(
 ) -> BTreeMap<RequirementKey, CapabilityNeed> {
     let mut declarations = BTreeMap::new();
     for (module_id, configured) in &state.configured {
-        if !configured.enabled
-            || runtime
-                .get(module_id)
-                .map(|module| !module.enabled)
-                .unwrap_or(false)
-        {
+        if !configured.enabled_in(runtime.get(module_id).copied()) {
             continue;
         }
         if let Some(cache) = state.cached.get(module_id) {
@@ -1086,6 +1080,45 @@ mod tests {
             evaluator.evaluate_at_ms(0, &[runtime("consumer", ModuleState::Running)], &[consumer]);
         assert_eq!(events[0].status.verdict, CapabilityVerdict::NeverProvided);
         assert!(!events[0].status.config_satisfiable);
+    }
+
+    #[test]
+    fn runtime_enabled_provider_gets_pending_window_despite_config_default() {
+        for cached in [false, true] {
+            let evaluator = CapabilityRequirementEvaluator::new();
+            evaluator.configure(
+                [
+                    ("consumer".to_string(), true),
+                    ("provider".to_string(), false),
+                ],
+                BTreeMap::new(),
+            );
+            if cached {
+                evaluator.record_hello(&registered("provider", &["thing/v1"], &[]));
+            }
+            let consumer = registered("consumer", &[], &[("thing/v1", CapabilityNeed::Required)]);
+            let starting = [runtime("provider", ModuleState::Starting)];
+            let events = evaluator.evaluate_at_ms(0, &starting, std::slice::from_ref(&consumer));
+            assert_eq!(events[0].status.verdict, CapabilityVerdict::Pending);
+            assert_eq!(events[0].severity, RequirementSeverity::Info);
+            assert_eq!(events[0].status.config_satisfiable, cached);
+            let expired =
+                evaluator.evaluate_at_ms(deadline_ms(), &starting, std::slice::from_ref(&consumer));
+            assert_eq!(expired[0].status.verdict, CapabilityVerdict::NeverProvided);
+            let disabled = RuntimeModule {
+                module_id: "provider".to_string(),
+                state: ModuleState::Disabled,
+                enabled: false,
+            };
+            evaluator.evaluate_at_ms(
+                deadline_ms() + 1,
+                &[disabled],
+                std::slice::from_ref(&consumer),
+            );
+            assert!(!evaluator.statuses()[0].config_satisfiable);
+            let restarted = evaluator.evaluate_at_ms(deadline_ms() + 2, &starting, &[consumer]);
+            assert_eq!(restarted[0].status.verdict, CapabilityVerdict::Pending);
+        }
     }
 
     #[test]

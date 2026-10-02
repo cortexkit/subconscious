@@ -7,6 +7,7 @@
 - Scope sync propagates parent refusals through direct dependencies and shares acyclic ancestor walks, avoiding cubic work on leaf-first scope chains.
 - Route-bind breaker probes now own a unique admission token; settling an older relay cannot release a newer probe or misreport it as a failed probe.
 - Requirement episode numbers remain monotonic for each consumer/capability pair when a consumer is disabled or a declaration disappears and later returns.
+- Runtime supervisor start/stop overrides configuration defaults when evaluating enabled capability candidates, cached consumer requirements and satisfiability; starting a config-disabled provider now gets the normal pending window.
 
 ## 0.29.1 — 2026-10-02
 

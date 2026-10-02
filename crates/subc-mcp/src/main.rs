@@ -2045,12 +2045,24 @@ where
     A: FnMut() -> F,
     F: std::future::Future<Output = std::io::Result<(TcpStream, SocketAddr)>>,
 {
+    let mut accept_after = time::Instant::now();
     loop {
         tokio::select! {
-            accepted = accept() => {
-                let (stream, _peer) = accepted.map_err(|source| {
-                    other_error(format!("failed to accept shim connection: {source}"))
-                })?;
+            accepted = async {
+                time::sleep_until(accept_after).await;
+                accept().await
+            } => {
+                let (stream, _peer) = match accepted {
+                    Ok(accepted) => accepted,
+                    Err(source) => {
+                        // A failed accept affects this connection attempt, not
+                        // existing sessions. Pace persistent resource failures
+                        // without preventing supervision from stopping the module.
+                        tracing::warn!(target: "shim", "failed to accept shim connection: {source}");
+                        accept_after = time::Instant::now() + Duration::from_millis(100);
+                        continue;
+                    }
+                };
                 let subc = subc.clone();
                 let key = key.clone();
                 tokio::spawn(async move {

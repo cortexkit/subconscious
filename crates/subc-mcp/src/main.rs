@@ -598,7 +598,8 @@ impl ReverseRelay {
         {
             Ok(handle) => handle,
             Err(error) => {
-                if self.remove_pending_for_current_task(key).await.is_some() {
+                let mut pending = self.pending.lock().await;
+                if pending.remove(&key).is_some() {
                     self.send_reverse_error(
                         route_handle,
                         reverse_corr,
@@ -653,7 +654,11 @@ impl ReverseRelay {
         key: PendingKey,
         result: std::result::Result<ClientResult, ServiceError>,
     ) {
-        if self.remove_pending_for_current_task(key).await.is_none() {
+        // Keep settlement serialized with teardown until the terminal frame is
+        // queued. Removing the entry alone lets fail_session miss an answer
+        // still being sent and close its route before that answer reaches it.
+        let mut pending = self.pending.lock().await;
+        if pending.remove(&key).is_none() {
             return;
         }
         let handle = self.route_handle(key.0, key.1);
@@ -6085,9 +6090,58 @@ fn other_error(message: impl Into<String>) -> BoxError {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::VecDeque, sync::Mutex as StdMutex};
+    use std::{collections::VecDeque, future::Future, sync::Mutex as StdMutex};
 
     use super::*;
+
+    #[tokio::test]
+    async fn session_failure_waits_for_in_flight_reverse_error_enqueue() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let relay = ReverseRelay::new(tx, 1);
+        let session = RelaySession::new("closing-host".to_owned());
+        let key = (7, 1, 905);
+        relay
+            .pending
+            .lock()
+            .await
+            .insert(key, PendingRelayEntry::new(session.id().to_owned()));
+        // Saturate the writer queue so settlement pauses after claiming the
+        // pending request but before its ERROR can enter the FIFO.
+        relay
+            .tx
+            .send(build_frame(FrameType::Response, data_flags(), 7, 1, 0, Vec::new()).unwrap())
+            .await
+            .unwrap();
+        let answer = relay.settle_host_answer(
+            key,
+            Err(ServiceError::McpError(ErrorData::internal_error(
+                "host disconnected",
+                None,
+            ))),
+        );
+        tokio::pin!(answer);
+        std::future::poll_fn(|cx| {
+            assert!(answer.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        let teardown = relay.fail_session(&session, "host disconnected");
+        tokio::pin!(teardown);
+        std::future::poll_fn(|cx| {
+            assert!(teardown.as_mut().poll(cx).is_pending(), "session teardown must wait for the claimed reverse ERROR to be queued before closing routes");
+            std::task::Poll::Ready(())
+        }).await;
+        rx.recv().await.unwrap();
+        answer.await;
+        teardown.await;
+        let error = rx.recv().await.unwrap();
+        assert_eq!(error.header.ty, FrameType::Error);
+        assert_eq!(error.header.corr, 905);
+        assert!(
+            rx.try_recv().is_err(),
+            "reverse request must settle exactly once"
+        );
+    }
 
     /// The reverse-request reply leg is a REBUILD, not a byte forward: the
     /// host's JSON is deserialized into rmcp's typed `ClientResult` union and

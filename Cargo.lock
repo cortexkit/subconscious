@@ -1926,7 +1926,7 @@ dependencies = [
 
 [[package]]
 name = "subc-mcp"
-version = "0.1.21"
+version = "0.1.22"
 dependencies = [
  "cortexkit-log",
  "rmcp",

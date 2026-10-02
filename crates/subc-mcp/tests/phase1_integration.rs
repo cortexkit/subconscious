@@ -1217,8 +1217,26 @@ async fn mcp_reverse_elicitation_shim_death_settles_pending_with_error() {
         .await;
     harness.client_handler.wait_for_prompts(1).await;
     harness.stop_client().await;
-    let error = harness.provider.wait_reverse_error(905).await;
+    let terminal = harness
+        .provider
+        .wait_for_event("reverse error before route goodbye", |event| {
+            matches!(
+                event,
+                ScriptedProviderEvent::ReverseError { corr: 905, .. }
+                    | ScriptedProviderEvent::RouteGoodbye
+            )
+        })
+        .await;
+    let ScriptedProviderEvent::ReverseError { body: error, .. } = terminal else {
+        panic!("route GOODBYE arrived before the pending reverse request's ERROR");
+    };
     assert_eq!(error.get("code"), Some(&json!(-32603)));
+    harness
+        .provider
+        .wait_for_event("route goodbye after reverse error", |event| {
+            matches!(event, ScriptedProviderEvent::RouteGoodbye)
+        })
+        .await;
 
     harness.shutdown().await;
 }

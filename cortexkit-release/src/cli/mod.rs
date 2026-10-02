@@ -902,7 +902,11 @@ fn planned_public_effect_count(train: &TrainDeclaration) -> usize {
         .iter()
         .map(|phase| match phase.phase_type.as_str() {
             "tag" => 1,
-            "publish" | "assets" => train.artifacts.len(),
+            "publish" | "assets" => train
+                .artifacts
+                .iter()
+                .filter(|artifact| phase.targets_artifact(&artifact.id))
+                .count(),
             _ => 0,
         })
         .sum()

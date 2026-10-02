@@ -285,6 +285,7 @@ fn resolve_public_effects(
             }],
             "publish" | "assets" => artifacts
                 .iter()
+                .filter(|artifact| phase.targets_artifact(artifact.artifact.as_str()))
                 .map(|artifact| PublicEffect {
                     phase: phase.instance_id(),
                     operation: OperationId::new(format!(
@@ -316,6 +317,10 @@ fn resolve_probes(
             }],
             "publish" | "assets" | "stage" => artifacts
                 .iter()
+                .filter(|artifact| {
+                    phase.phase_type == "stage"
+                        || phase.targets_artifact(artifact.artifact.as_str())
+                })
                 .map(|artifact| PlannedProbe {
                     phase: phase.instance_id(),
                     artifact: Some(artifact.artifact.clone()),

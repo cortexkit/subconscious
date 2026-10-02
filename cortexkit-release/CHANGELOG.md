@@ -12,3 +12,5 @@
   status actions rather than journal basenames.
 - Preserve immutable local-command output across retries, re-execution, and
   interrupted attempts by atomically reserving monotonically numbered logs.
+- Add explicit per-phase publication artifact selection and refuse overlapping
+  targets before provider access; keep the single-phase default of all artifacts.

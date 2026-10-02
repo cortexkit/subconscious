@@ -9,7 +9,11 @@ use crate::{CommitId, DeclarationDigest, PhaseInstanceId, TrainId};
 use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::{collections::HashSet, fs, path::Path};
+use std::{
+    collections::{HashMap, HashSet},
+    fs,
+    path::Path,
+};
 use thiserror::Error;
 
 const SUPPORTED_FORMAT_VERSION: u32 = 1;
@@ -157,6 +161,17 @@ pub struct PhaseDeclaration {
 impl PhaseDeclaration {
     pub fn instance_id(&self) -> PhaseInstanceId {
         PhaseInstanceId::new(&self.id)
+    }
+
+    /// Publication defaults to all artifacts; kind alone does not select a destination.
+    pub(crate) fn targets_artifact(&self, artifact: &str) -> bool {
+        self.params.get("artifacts").is_none_or(|targets| {
+            targets.as_array().is_some_and(|targets| {
+                targets
+                    .iter()
+                    .any(|target| target.as_str() == Some(artifact))
+            })
+        })
     }
 }
 
@@ -370,6 +385,7 @@ fn validate_train(train: &TrainDeclaration, source: &str) -> Result<(), Declarat
     }
 
     let mut phase_ids = HashSet::new();
+    let mut publication_owners = HashMap::new();
     let mut first_irreversible: Option<&PhaseDeclaration> = None;
     for phase in &train.phases {
         if phase.id.trim().is_empty() || !phase_ids.insert(&phase.id) {
@@ -395,6 +411,23 @@ fn validate_train(train: &TrainDeclaration, source: &str) -> Result<(), Declarat
             ));
         }
         validate_phase_parameters(phase, train, source)?;
+        if matches!(phase.phase_type.as_str(), "publish" | "assets") {
+            for artifact in train
+                .artifacts
+                .iter()
+                .filter(|artifact| phase.targets_artifact(&artifact.id))
+            {
+                if let Some(earlier) =
+                    publication_owners.insert(artifact.id.as_str(), phase.id.as_str())
+                {
+                    return Err(refusal(
+                        DeclarationRefusalCode::InvalidPhaseParameters,
+                        format!("artifact `{}` is targeted by both publication phases `{earlier}` and `{}`; declare disjoint params.artifacts lists", artifact.id, phase.id),
+                        source, "params",
+                    ));
+                }
+            }
+        }
         if let Some(earlier) = first_irreversible {
             if refusal_capable(&phase.phase_type) {
                 return Err(refusal(
@@ -512,6 +545,16 @@ fn validate_phase_parameters(
             ));
         }
     }
+    if matches!(phase.phase_type.as_str(), "publish" | "assets") {
+        validate_publication_targets(phase, train).map_err(|message| {
+            refusal(
+                DeclarationRefusalCode::InvalidPhaseParameters,
+                format!("phase `{}` has invalid parameters: {message}", phase.id),
+                source,
+                "params",
+            )
+        })?;
+    }
     if phase.phase_type == "tag"
         && train.tag.as_deref().is_none_or(str::is_empty)
         && !matches!(params.get("tag").and_then(Value::as_str), Some(value) if !value.is_empty())
@@ -522,6 +565,32 @@ fn validate_phase_parameters(
             source,
             "tag",
         ));
+    }
+    Ok(())
+}
+
+fn validate_publication_targets(
+    phase: &PhaseDeclaration,
+    train: &TrainDeclaration,
+) -> Result<(), String> {
+    let Some(targets) = phase.params.get("artifacts") else {
+        return Ok(());
+    };
+    let targets = targets
+        .as_array()
+        .filter(|targets| !targets.is_empty())
+        .ok_or_else(|| "artifacts must be a non-empty array of declared artifact ids".to_owned())?;
+    let mut seen = HashSet::new();
+    for target in targets {
+        let id = target
+            .as_str()
+            .ok_or_else(|| "artifacts entries must be strings".to_owned())?;
+        if !train.artifacts.iter().any(|artifact| artifact.id == id) {
+            return Err(format!("artifacts references unknown artifact `{id}`"));
+        }
+        if !seen.insert(id) {
+            return Err(format!("artifacts repeats artifact `{id}`"));
+        }
     }
     Ok(())
 }

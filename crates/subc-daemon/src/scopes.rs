@@ -374,6 +374,8 @@ pub(crate) struct ScopeTable {
     /// Source of every `version`. One counter for the whole table, so a version
     /// is never reused within an incarnation even across an epoch change.
     last_version: u64,
+    #[cfg(test)]
+    link_lookups: std::sync::atomic::AtomicUsize,
 }
 
 fn reserved_module_id(principal: &Principal) -> Option<&str> {
@@ -401,6 +403,8 @@ impl ScopeTable {
             authority_owners: authority_owners.into_iter().collect(),
             owners: HashMap::new(),
             last_version: 0,
+            #[cfg(test)]
+            link_lookups: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -458,16 +462,19 @@ impl ScopeTable {
         // The refresh can change parent states and versions, so the reply is
         // read from the table after it rather than before.
         let state = &self.owners[owner];
+        let moved: HashSet<_> = applied
+            .tag_changes
+            .iter()
+            .filter(|change| change.owner == owner)
+            .map(|change| change.scope_ref.as_str())
+            .collect();
         for result in &mut applied.results {
             let live = state.live.get(&result.scope_ref);
             result.version = live.map(|scope| scope.version);
             result.parent_state = live.and_then(|scope| scope.parent_state);
             // A record re-sent unchanged can still change here, when the same
             // sync ended the parent its link names.
-            let tag_moved = applied
-                .tag_changes
-                .iter()
-                .any(|change| change.owner == owner && change.scope_ref == result.scope_ref);
+            let tag_moved = moved.contains(result.scope_ref.as_str());
             if result.outcome == ScopeRecordOutcome::Unchanged && tag_moved {
                 result.outcome = ScopeRecordOutcome::Updated;
             }
@@ -518,52 +525,94 @@ impl ScopeTable {
             }
         }
 
-        // Parent links are checked against the set as it will stand, so a
-        // record refused here can invalidate a link another record depends on
-        // (a parent reverting to an older epoch, say). Repeat until no record
-        // is newly refused; each pass refuses at least one or stops.
+        // Refusing a parent only invalidates its direct children. Settle these
+        // dependencies with a queue before walking ancestry for cycles, so a
+        // leaf-first chain with a refused root does not repeatedly walk every
+        // surviving ancestor under the scope write lock.
+        let mut children: HashMap<&str, Vec<usize>> = HashMap::new();
+        let mut new_links = vec![false; scopes.len()];
+        for (index, record) in scopes.iter().enumerate() {
+            let Some(parent) = record.parent.as_ref() else {
+                continue;
+            };
+            new_links[index] = state.live.get(&record.scope_ref).is_none_or(|held| {
+                held.record.scope_epoch != record.scope_epoch
+                    || held.record.parent.as_ref() != Some(parent)
+            });
+            if reserved_module_id(&parent.owner) == Some(owner) {
+                children.entry(&parent.scope_ref).or_default().push(index);
+            }
+        }
+        let mut pending: VecDeque<usize> = (0..scopes.len()).collect();
+        let mut queued = vec![true; scopes.len()];
         let mut new_link_states: HashMap<String, ParentState> = HashMap::new();
         loop {
-            let mut refused_this_pass = false;
-            for (index, record) in scopes.iter().enumerate() {
-                if refusals.contains_key(&index) {
+            let mut rejected = None;
+            while let Some(index) = pending.pop_front() {
+                queued[index] = false;
+                if refusals.contains_key(&index) || !new_links[index] {
                     continue;
                 }
-                let Some(parent) = record.parent.as_ref() else {
-                    continue;
-                };
+                let record = &scopes[index];
+                let parent = record.parent.as_ref().expect("new link has a parent");
                 // A link the daemon already accepted is not re-checked when the
                 // owner re-sends it unchanged: its state is kept current by the
                 // parent's owner's syncs. Re-checking it would refuse the child
                 // record on every later sync once its parent ended, although
                 // the link was valid when it was made.
-                let held = state.live.get(&record.scope_ref);
-                let link_is_new = held.is_none_or(|held| {
-                    held.record.scope_epoch != record.scope_epoch
-                        || held.record.parent.as_ref() != Some(parent)
-                });
-                if !link_is_new {
-                    continue;
-                }
-                match self.check_new_link(owner, &record.scope_ref, parent, &next) {
+                match self.check_new_link(owner, parent, &next) {
                     Ok(link_state) => {
                         new_link_states.insert(record.scope_ref.clone(), link_state);
                     }
                     Err(message) => {
-                        refusals.insert(index, (error_codes::SCOPE_PARENT_NOT_PERMITTED, message));
-                        new_link_states.remove(&record.scope_ref);
-                        match held {
-                            Some(held) => {
-                                next.insert(record.scope_ref.clone(), held.record.clone())
-                            }
-                            None => next.remove(&record.scope_ref),
-                        };
-                        refused_this_pass = true;
+                        rejected = Some((index, message));
+                        break;
                     }
                 }
             }
-            if !refused_this_pass {
+            if rejected.is_none() {
+                // Memoize acyclic ancestry only for this stable overlay. A
+                // refused cyclic link can restore an older record, so any
+                // topology change discards the cache before checking again.
+                let mut acyclic = HashSet::new();
+                for (index, record) in scopes.iter().enumerate() {
+                    if new_link_states.get(&record.scope_ref) == Some(&ParentState::Linked)
+                        && self.link_closes_cycle_cached(
+                            Some((owner, &next)),
+                            owner,
+                            &record.scope_ref,
+                            record.parent.as_ref().unwrap(),
+                            &mut acyclic,
+                        )
+                    {
+                        rejected = Some((index, "the parent link would close a cycle".to_string()));
+                        break;
+                    }
+                }
+            }
+            let Some((index, message)) = rejected else {
                 break;
+            };
+            let record = &scopes[index];
+            refusals.insert(index, (error_codes::SCOPE_PARENT_NOT_PERMITTED, message));
+            new_link_states.remove(&record.scope_ref);
+            match state.live.get(&record.scope_ref) {
+                Some(held) => {
+                    next.insert(record.scope_ref.clone(), held.record.clone());
+                }
+                None => {
+                    next.remove(&record.scope_ref);
+                }
+            }
+            for &child in children
+                .get(record.scope_ref.as_str())
+                .into_iter()
+                .flatten()
+            {
+                if !queued[child] {
+                    pending.push_back(child);
+                    queued[child] = true;
+                }
             }
         }
 
@@ -849,6 +898,9 @@ impl ScopeTable {
         owner: &str,
         scope_ref: &str,
     ) -> Option<&'a ScopeRecord> {
+        #[cfg(test)]
+        self.link_lookups
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         match overlay {
             Some((syncing_owner, next)) if syncing_owner == owner => next.get(scope_ref),
             _ => self
@@ -868,7 +920,6 @@ impl ScopeTable {
     fn check_new_link(
         &self,
         owner: &str,
-        scope_ref: &str,
         parent: &ScopeParent,
         next: &BTreeMap<String, ScopeRecord>,
     ) -> Result<ParentState, String> {
@@ -904,10 +955,46 @@ impl ScopeTable {
                 parent.scope_ref
             ));
         }
-        if self.link_closes_cycle(overlay, owner, scope_ref, parent) {
-            return Err("the parent link would close a cycle".to_string());
-        }
         Ok(ParentState::Linked)
+    }
+
+    /// Cache paths known to terminate, sharing the work across siblings and
+    /// long chains. References avoid cloning a parent record at every hop.
+    fn link_closes_cycle_cached<'a>(
+        &'a self,
+        overlay: Overlay<'a>,
+        child_owner: &str,
+        child_ref: &str,
+        parent: &'a ScopeParent,
+        acyclic: &mut HashSet<(&'a str, &'a str, u64)>,
+    ) -> bool {
+        let mut visited = HashSet::new();
+        let mut link = parent;
+        while let Some(owner) = reserved_module_id(&link.owner) {
+            let key = (owner, link.scope_ref.as_str(), link.scope_epoch);
+            if owner == child_owner && link.scope_ref == child_ref {
+                return true;
+            }
+            if acyclic.contains(&key) {
+                break;
+            }
+            if !visited.insert(key) {
+                // An unrelated cycle is not evidence this link closes one.
+                return false;
+            }
+            let Some(record) = self.lookup(overlay, owner, &link.scope_ref) else {
+                break;
+            };
+            if record.scope_epoch != link.scope_epoch {
+                break;
+            }
+            let Some(up) = record.parent.as_ref() else {
+                break;
+            };
+            link = up;
+        }
+        acyclic.extend(visited);
+        false
     }
 
     /// Whether following parent links up from `parent` reaches
@@ -1902,6 +1989,40 @@ mod tests {
         );
         // p was refused, so m's parent is absent in prefrontal's synced set.
         assert_eq!(parent_state(&table, MAGIC, "m"), Some(ParentState::Ended));
+    }
+
+    #[test]
+    fn leaf_first_parent_chains_use_bounded_link_work() {
+        for size in [100, 1000] {
+            for refuse_root in [false, true] {
+                let mut table = table();
+                let mut root = head("0", 1);
+                if refuse_root {
+                    root.attributes.delegates = true;
+                }
+                let mut records = (1..size)
+                    .rev()
+                    .map(|index| {
+                        child_of(&index.to_string(), PREFRONTAL, &(index - 1).to_string(), 1)
+                    })
+                    .collect::<Vec<_>>();
+                records.push(root);
+                let applied = sync(&mut table, PREFRONTAL, conn(1), 1, records);
+                assert!(applied.results.iter().all(|result| result.outcome
+                    == if refuse_root {
+                        ScopeRecordOutcome::Refused
+                    } else {
+                        ScopeRecordOutcome::Created
+                    }));
+                let lookups = table
+                    .link_lookups
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                assert!(
+                    lookups <= size * 20,
+                    "{size} records used {lookups} parent lookups (refused root: {refuse_root})"
+                );
+            }
+        }
     }
 
     /// Every order in which a parent's owner and a child's owner can sync after

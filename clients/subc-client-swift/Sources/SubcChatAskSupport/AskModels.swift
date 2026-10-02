@@ -176,15 +176,15 @@ extension AskRequest: Hashable {
 /// would occupy the ordinal space the thread joins against, so a pointer and a later
 /// inline attachment could claim the same index and a thread entry would resolve to
 /// the wrong evidence. An element carrying neither identity still decodes: it is
-/// unfetchable, which the caller can see and report, whereas a throw here takes the
-/// whole ask — and one ask took the entire list on the phone before this change.
+/// unfetchable, which the caller can see and report, whereas a throw here would
+/// fail the whole ask, and with it any list of asks it is decoded in.
 ///
 /// `byteCount` is optional because the producer's own field is nullable.
 ///
 /// `kind` says what the pointer refers to: `"file"` has bytes to fetch, `"link"`
 /// names a URL in `url` and has no bytes, so fetching it is refused. It is an open
 /// string, not an enum: a kind no client knows yet must decode, and absent means
-/// the producer did not say, which callers treat as a file (today's behaviour).
+/// the producer did not say, which callers treat as a file.
 public struct AskAttachment: Codable, Equatable, Hashable {
     public var index: Int?
     public var artifactID: String?

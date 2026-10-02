@@ -7688,6 +7688,68 @@ mod slot_registration_wait_tests {
     use crate::registry::{ConnectionId, RegistrationSlot};
     use subc_protocol::manifest::ModuleManifest;
 
+    #[tokio::test]
+    async fn enable_release_failure_is_failed_and_a_second_enable_retries() {
+        let registry = Arc::new(Registry::default());
+        let supervisor = Supervisor::new(Arc::clone(&registry), RestartPolicy::default());
+        let runtime = supervisor.runtime_config();
+        let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::disabled()));
+        let spec = ModuleSpec {
+            module_id: "enable-stale-registration".to_string(),
+            program: PathBuf::from("/missing/enable-retry-test"),
+            args: Vec::new(),
+            env: Vec::new(),
+            reserved: false,
+            reserved_prefixes: Vec::new(),
+            protocol: ModuleProtocol::Subc,
+            overlap: Default::default(),
+        };
+        let connection = ConnectionId::new(90);
+        registry
+            .register_with_control_ops(
+                ModuleManifest::builder(&spec.module_id, "0.1.0").build(),
+                1,
+                connection,
+                Vec::new(),
+            )
+            .unwrap();
+        let mut child = None;
+        let err = set_child_enabled(
+            &spec,
+            &runtime,
+            &registry,
+            &supervisor.process_liveness,
+            &snapshot,
+            &mut child,
+            true,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            SuperviseError::RegistrationStillActive { .. }
+        ));
+        assert_eq!(lock_snapshot(&snapshot).unwrap().state, ModuleState::Failed);
+        assert!(child.is_none());
+        registry.deregister_connection(connection).unwrap();
+        let err = set_child_enabled(
+            &spec,
+            &runtime,
+            &registry,
+            &supervisor.process_liveness,
+            &snapshot,
+            &mut child,
+            true,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, SuperviseError::Spawn { .. }),
+            "second enable must attempt a spawn: {err}"
+        );
+        assert_eq!(lock_snapshot(&snapshot).unwrap().state, ModuleState::Failed);
+    }
+
     const INCUMBENT: u64 = 1;
     const CANDIDATE: u64 = 2;
 

@@ -575,7 +575,7 @@ fn status(arguments: StatusArgs, state_root: PathBuf) -> Result<MachineResponse,
         pending_intents.len(),
         public_effect_count,
         completion_count,
-        &journal.train_journal_id(),
+        &arguments.train,
     );
 
     Ok(success(
@@ -914,15 +914,15 @@ fn next_actions(
     pending_count: usize,
     public_effect_count: usize,
     completion_count: usize,
-    journal_id: &str,
+    train_name: &str,
 ) -> Vec<String> {
     if terminal {
         return Vec::new();
     }
     if declaration_matches_pin == Some(false) {
         return vec![
-            format!("abandon {journal_id}"),
-            format!("rebind {journal_id}"),
+            format!("abandon {train_name}"),
+            format!("rebind {train_name}"),
         ];
     }
     if pending_count > 0 {

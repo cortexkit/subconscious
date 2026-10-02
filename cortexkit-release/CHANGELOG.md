@@ -8,3 +8,5 @@
   losing their original intent or permitting a duplicate executor call.
 - Allow observational `verify_readback` phases after publication while retaining
   the pre-publication-only CI gate ordering rule.
+- Print callable train names in abandonment/rebind recovery instructions and
+  status actions rather than journal basenames.

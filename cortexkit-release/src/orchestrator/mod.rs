@@ -495,12 +495,12 @@ fn ensure_matching_declaration(
     match journal.ensure_declaration_digest(&plan.declaration_digest) {
         Ok(()) => Ok(()),
         Err(StateError::DeclarationDigestMismatch { pinned, active }) => {
-            let train_journal_id = journal.train_journal_id();
+            let train_name = journal.train_name();
             Err(OrchestrationError::refusal(
                 OrchestrationRefusalCode::DeclarationDigestMismatch,
                 None,
                 format!(
-                    "active declaration digest `{active}` differs from pinned digest `{pinned}`; run `ck-release abandon {train_journal_id}` or `ck-release rebind {train_journal_id}` before resuming"
+                    "active declaration digest `{active}` differs from pinned digest `{pinned}`; run `ck-release abandon {train_name}` or `ck-release rebind {train_name}` before resuming"
                 ),
             ))
         }

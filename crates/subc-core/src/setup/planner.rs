@@ -15,7 +15,15 @@ pub struct SetupPlan {
 
 impl SetupPlan {
     pub fn is_authorized(&self) -> bool {
-        !self.outcomes.iter().any(PlanOutcome::blocks_execution)
+        self.blocking_outcome().is_none()
+    }
+
+    /// An explicitly requested setup target that cannot be installed is a
+    /// failed request, not a successful partial setup followed by health waits.
+    pub fn blocking_outcome(&self) -> Option<&PlanOutcome> {
+        self.outcomes.iter().find(|outcome| {
+            outcome.blocks_execution() || matches!(outcome, PlanOutcome::TargetRefused { .. })
+        })
     }
 
     pub fn mutation_count(&self) -> usize {
@@ -804,6 +812,22 @@ mod tests {
     }
 
     #[test]
+    fn setup_floor_refusal_blocks_runtime_mutations_and_exposes_the_reason() {
+        let mut observed = installed_core_setup(Some("0.17.19"));
+        observed.runtime = RuntimeState::Missing;
+        let plan = plan_setup(&observed, &SetupRequest::install(vec![Component::Aft]));
+        assert!(!plan.is_authorized());
+        assert!(plan
+            .blocking_outcome()
+            .unwrap()
+            .to_string()
+            .contains("requires core ≥ 0.17.20, installed 0.17.19; run `ck upgrade` first"));
+        let mut executor = RecordingExecutor::default();
+        execute_setup(&plan, ExecutionMode::Apply, &mut executor).unwrap();
+        assert!(executor.applied.is_empty());
+    }
+
+    #[test]
     fn setup_refuses_a_module_below_its_floor_and_dry_run_matches_apply() {
         let observed = installed_core_setup(Some("0.17.19"));
         let request = SetupRequest::install(vec![Component::Aft]);
@@ -811,7 +835,7 @@ mod tests {
         let execution_plan = plan_setup(&observed, &request);
 
         assert_eq!(preview_plan, execution_plan);
-        assert!(preview_plan.is_authorized());
+        assert!(!preview_plan.is_authorized());
         assert!(!preview_plan.operations.iter().any(|operation| matches!(
             operation,
             SetupOperation::InstallComponent {

@@ -7000,9 +7000,7 @@ fn setup_command(program: &Path, request: &setup::SetupRequest) -> Result<(), Ck
     }
     if !plan.is_authorized() {
         let message = plan
-            .outcomes
-            .iter()
-            .find(|outcome| outcome.blocks_execution())
+            .blocking_outcome()
             .map(human_blocking_outcome)
             .unwrap_or_else(|| "setup could not continue; nothing was installed".to_string());
         println!("{message}");
@@ -7101,7 +7099,8 @@ fn setup_unavailable_message(
 
 fn human_blocking_outcome(outcome: &setup::PlanOutcome) -> String {
     match outcome {
-        setup::PlanOutcome::Refusal { reason } => reason.clone(),
+        setup::PlanOutcome::Refusal { reason }
+        | setup::PlanOutcome::TargetRefused { reason, .. } => reason.clone(),
         _ => outcome.to_string(),
     }
 }

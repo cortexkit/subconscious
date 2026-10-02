@@ -23,8 +23,9 @@
 //! census entry, so there is nothing to roll back; the next request issues at a higher
 //! epoch. Once an issue completes, the module's previous user is superseded: its key is
 //! dropped from memory (so a reconnect under it gets `ckbus_credential_superseded`). Its
-//! revocation is the revocation area's: it reads the census entry just before each issue,
-//! so the superseded key is found there, whichever ck-bus process issued it.
+//! revocation is recorded durably by the replacement guard before the census write,
+//! so a crash cannot erase the only record of the superseded key. If the census write
+//! subsequently fails, that old key remains revoked; the caller must fetch a fresh key.
 //!
 //! The grant names no agent (R15: agent access is account-scoped). `grants::issued_grant`
 //! picks it from the attested module id: the delivery-authority grant for
@@ -83,6 +84,8 @@ pub mod code {
     pub const SIGNING_FAILED: &str = "ckbus_signing_failed";
     pub const GRANT_REFUSED: &str = "ckbus_grant_refused";
     pub const CENSUS_WRITE_FAILED: &str = "ckbus_census_write_failed";
+    pub const CENSUS_UNAVAILABLE: &str = "ckbus_census_unavailable";
+    pub const REVOCATION_UNWRITABLE: &str = "ckbus_revocation_unwritable";
     pub const NAME_REFUSED: &str = "naming-constructor-absent";
     pub const BAD_REQUEST: &str = "ckbus_bad_request";
 }
@@ -131,6 +134,11 @@ pub struct Plane {
 /// Where the current `Plane` comes from: `None` until bootstrap has finished.
 pub trait PlaneSource: Send + Sync {
     fn current(&self) -> Option<Plane>;
+}
+
+/// Makes the predecessor recoverable before issuance replaces its census entry.
+pub trait CensusReplacement: Send + Sync {
+    fn prepare(&self, module_id: &str, previous: &CensusValue) -> Result<(), Refusal>;
 }
 
 /// A credential ck-bus issued and still holds the key for.
@@ -219,6 +227,7 @@ pub struct Issuance {
     /// The last high-water damage seen, which holds health down until the operator
     /// repairs the file.
     damage: Mutex<Option<HighWaterRefusal>>,
+    replacement: Mutex<Option<Arc<dyn CensusReplacement>>>,
     #[cfg(test)]
     pub crash_after: Mutex<Option<StopAfter>>,
 }
@@ -240,6 +249,7 @@ impl Issuance {
             current: Mutex::new(HashMap::new()),
             module_locks: Mutex::new(HashMap::new()),
             damage: Mutex::new(None),
+            replacement: Mutex::new(None),
             #[cfg(test)]
             crash_after: Mutex::new(None),
         }
@@ -248,6 +258,11 @@ impl Issuance {
     /// Where the finished bootstrap's plane is read from, shared with the membership ops.
     pub fn plane_source(&self) -> Arc<dyn PlaneSource> {
         self.plane.clone()
+    }
+
+    /// Installed by revocation wiring before requests are served.
+    pub fn set_replacement_guard(&self, guard: Arc<dyn CensusReplacement>) {
+        *lock(&self.replacement) = Some(guard);
     }
 
     /// The credential currently held for a module, if any.
@@ -366,6 +381,27 @@ impl Issuance {
             identities: identities.clone(),
             rooms: rooms.clone(),
         };
+        let guard = lock(&self.replacement).clone();
+        if let Some(guard) = guard {
+            let prepared = async {
+                let previous = plane
+                    .box_plane
+                    .census_get(&plane.names, &names_check)
+                    .await
+                    .map_err(|error| Refusal::new(code::CENSUS_UNAVAILABLE, error.message))?;
+                if let Some(previous) = previous {
+                    let previous = CensusValue::parse(&previous.value)
+                        .map_err(|reason| Refusal::new(code::CENSUS_UNAVAILABLE, reason))?;
+                    guard.prepare(module_id, &previous)?;
+                }
+                Ok::<_, Refusal>(())
+            }
+            .await;
+            if let Err(refusal) = prepared {
+                custody.forget(&user_public);
+                return Err(refusal);
+            }
+        }
         if let Err(error) = plane
             .box_plane
             .census_put(&census_subject, value.to_bytes())
@@ -541,8 +577,8 @@ impl Issuance {
         })
     }
 
-    /// Drops a superseded key from memory. Nothing is queued: the revocation area finds
-    /// the superseded user in the census entry it read before this issue.
+    /// Drops a superseded key from memory. The replacement guard already recorded
+    /// the predecessor before its census entry was overwritten.
     fn supersede(&self, previous: Issued) {
         self.credentials.custody.forget(&previous.credential_public);
         log_event(

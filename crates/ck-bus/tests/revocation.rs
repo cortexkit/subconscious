@@ -920,6 +920,66 @@ async fn stop_and_damage(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn census_replacement_records_predecessor_before_the_crash_boundary() {
+    struct Live;
+    #[async_trait]
+    impl issuance::LiveGenerations for Live {
+        async fn live_generation(&self, _: &str) -> Result<Option<u64>, String> {
+            Ok(Some(2))
+        }
+    }
+    struct Source(issuance::Plane);
+    impl issuance::PlaneSource for Source {
+        fn current(&self) -> Option<issuance::Plane> {
+            Some(self.0.clone())
+        }
+    }
+    let _gate = harness::acceptance_gate().await;
+    let run = start(false).await.expect("nats-server is required");
+    retire_supervised_ckbus(&run).await;
+    let plane = plane(&run).await;
+    let store = tempfile::tempdir().unwrap();
+    let victim = Victim::enter(&run, &plane, "replacecrash", 2).await;
+    let revoker = process(&plane, run.trust.signer.clone(), store.path()).await;
+    let (_, ready) = tokio::sync::watch::channel(None);
+    let area = Arc::new(revocation::handler::Area::new(revoker.clone(), ready));
+    let issuing = issuance::Issuance::new(
+        Arc::new(Credentials::new(Arc::new(InProcessSigner(
+            run.trust.signer.clone(),
+        )))),
+        store.path(),
+        Arc::new(Live),
+        Arc::new(Source(issuance::Plane {
+            names: plane.names.clone(),
+            account_public: plane.account_public.clone(),
+            server_url: run.server.url.clone(),
+            box_plane: plane.box_plane.clone(),
+        })),
+    );
+    issuing.set_replacement_guard(area);
+    *issuing.crash_after.lock().unwrap() = Some(issuance::StopAfter::Census);
+    assert_eq!(
+        issuing.issue(&victim.module).await.unwrap_err().code,
+        "test_crash"
+    );
+    let successor = run.census_value(&victim.module).await.unwrap();
+    assert_ne!(successor.credential_public, victim.public);
+    let Some(progress::Entry::Present(record)) = revoker.progress().read(&victim.identity()) else {
+        panic!("predecessor disappeared at the census-write crash boundary");
+    };
+    assert_eq!(record.user_public, victim.public);
+    // Fresh memory can now finish the predecessor's revocation without touching its successor.
+    let recovering = process(&plane, run.trust.signer.clone(), store.path()).await;
+    let outcomes = recovering.resume_all(&plane).await;
+    assert!(outcomes[0].1.is_ok(), "{outcomes:?}");
+    revoked_once(&run.revocations().await, &victim.public);
+    assert_eq!(run.census_value(&victim.module).await.unwrap(), successor);
+    victim.expect_severed().await;
+    run.server.stop().await;
+    run.run.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn damaged_supersede_progress_never_infers_revocation_from_a_replaced_census() {
     let _gate = harness::acceptance_gate().await;
     let run = start(false).await.expect("nats-server is required");

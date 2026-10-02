@@ -3,8 +3,8 @@
 //!
 //! A module's `ckbus.credential` request is served by issuance, which overwrites the
 //! module's census entry with the new credential. Just before that, this handler reads
-//! the entry: when the request is answered with a different key, the key the entry named
-//! is superseded and its revocation is recorded before the answer returns. Requests for
+//! the entry: issuance's replacement guard records the key durably after signing and
+//! before overwriting the census, not after the answer. Requests for
 //! one module are serialized here, so the entry read belongs to the issue that follows
 //! it. A census read that fails refuses the request (`ckbus_census_unavailable`), because
 //! issuing over an entry nobody could read would leave the credential it names
@@ -30,7 +30,7 @@ use tokio::sync::{watch, Notify};
 
 use super::{connections::Connections, log_event, RevocationPlane, Revoker, Target};
 use crate::{
-    bootstrap::{plane::CensusRecord, Ready},
+    bootstrap::Ready,
     credentials::Credentials,
     issuance::{self, census::CensusValue, handler::IssuanceHandler},
 };
@@ -82,53 +82,6 @@ impl Area {
             .clone()
     }
 
-    /// Records the revocation of the credential `before` named, when the issue that
-    /// followed answered a different one.
-    fn supersede(&self, module_id: &str, before: &CensusRecord, answer: &[u8]) {
-        let issued = serde_json::from_slice::<Value>(answer)
-            .ok()
-            .and_then(|reply| {
-                reply["result"]["credential_public"]
-                    .as_str()
-                    .map(str::to_string)
-            });
-        let Some(issued) = issued else {
-            return;
-        };
-        let value = match CensusValue::parse(&before.value) {
-            Ok(value) => value,
-            Err(reason) => {
-                log_event(
-                    "ckbus.revocation.superseded_unknown",
-                    json!({
-                        "module_id": module_id,
-                        "reason": reason,
-                        "residual": "the census value read before the issue is damaged, so the \
-                                     credential it named is not known and is not revoked",
-                    }),
-                );
-                return;
-            }
-        };
-        if value.credential_public == issued {
-            return;
-        }
-        let target = Target::from_census(module_id, &value);
-        if let Err(error) = self.revoker.begin(&target) {
-            log_event(
-                "ckbus.revocation.unrecorded",
-                json!({
-                    "module_id": module_id,
-                    "user_public": target.user_public,
-                    "reason": error.to_string(),
-                    "residual": "revoked in this process only; a restart before it completes \
-                                 loses it",
-                }),
-            );
-        }
-        self.wake.notify_one();
-    }
-
     /// Waits for bootstrap, starts the connection watch, then drives every recorded
     /// revocation once per period and whenever one is recorded. A deferred revocation
     /// keeps its record and is retried on the next pass.
@@ -171,6 +124,16 @@ impl Area {
                 _ = tokio::time::sleep(period) => {}
             }
         }
+    }
+}
+
+impl issuance::CensusReplacement for Area {
+    fn prepare(&self, module_id: &str, previous: &CensusValue) -> Result<(), issuance::Refusal> {
+        self.revoker
+            .begin(&Target::from_census(module_id, previous))
+            .map_err(|error| {
+                issuance::Refusal::new(issuance::code::REVOCATION_UNWRITABLE, error.to_string())
+            })
     }
 }
 
@@ -233,8 +196,8 @@ impl<H: ModuleHandler> ModuleHandler for RevocationHandler<H> {
         };
         let lock = self.area.module_lock(&module_id);
         let _serialized = lock.lock().await;
-        let before = match plane.box_plane.census_get(&plane.names, &key).await {
-            Ok(before) => before,
+        match plane.box_plane.census_get(&plane.names, &key).await {
+            Ok(_) => {}
             Err(error) => {
                 log_event(
                     "ckbus.revocation.census_unavailable",
@@ -249,11 +212,10 @@ impl<H: ModuleHandler> ModuleHandler for RevocationHandler<H> {
                     ),
                 };
             }
-        };
-        let outcome = self.inner.handle(ctx, body).await;
-        if let (Some(before), HandlerOutcome::Response(answer)) = (&before, &outcome) {
-            self.area.supersede(&module_id, before, answer);
         }
+        let outcome = self.inner.handle(ctx, body).await;
+        // Even a failed census write can have a durable predecessor revocation.
+        self.area.wake.notify_one();
         outcome
     }
 
@@ -303,6 +265,7 @@ pub fn wire<H: ModuleHandler>(
         Arc::new(Connections::default()),
     ));
     let area = Arc::new(Area::new(revoker, ready));
+    wired.handler.issuance().set_replacement_guard(area.clone());
     tokio::spawn(area.clone().run(period));
     Wired {
         manifest: wired.manifest,

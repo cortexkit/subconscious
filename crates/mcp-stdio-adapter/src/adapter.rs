@@ -1331,4 +1331,25 @@ mod tests {
         assert_eq!(metrics["children_max"], 8);
         assert_eq!(metrics["spawns_total"], 0);
     }
+
+    #[test]
+    fn oldest_flight_moves_to_surviving_call() {
+        let metrics = std::sync::Arc::new(super::HealthMetrics::default());
+        let first = super::FlightGuard::new(metrics.clone());
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let second = super::FlightGuard::new(metrics.clone());
+        drop(first);
+        assert!(metrics.snapshot()["oldest_in_flight_ms"].as_u64().unwrap() < 100);
+        drop(second);
+        assert_eq!(metrics.snapshot()["calls_in_flight"], 0);
+        assert_eq!(metrics.snapshot()["oldest_in_flight_ms"], 0);
+    }
+
+    #[test]
+    fn command_tool_arguments_follow_the_documented_spawn_field_fence() {
+        assert!(
+            matches!(parse_envelope(br#"{"server":"github","op":"tools/call","payload":{"method":"tools/call","params":{"name":"run","arguments":{"command":"ls"}}}}"#),
+            Err(EnvelopeError::SpawnShapedField { field }) if field == "command")
+        );
+    }
 }

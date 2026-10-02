@@ -1183,11 +1183,13 @@ export class SubcClient {
       };
       pending.timer = setTimeout(() => this.arbitrateTimeout(key, pending, channel, corr, ms), ms);
       this.pending.set(key, pending);
-      if (signal) this.attachCancelSignal(signal, key, handle, corr, priority);
       writeBorrowed(this.sock, encodeFrame(frame), Date.now() + ms).catch((error) => {
         const current = this.pending.get(key);
         if (current) this.rejectPending(key, current, error instanceof Error ? error : new SubcError(String(error)));
       });
+      // Queue REQUEST first: an already-aborted signal emits CANCEL immediately,
+      // and the daemon can only cancel a correlation it has already received.
+      if (signal) this.attachCancelSignal(signal, key, handle, corr, priority);
     });
   }
 
@@ -1314,13 +1316,14 @@ export class SubcClient {
       };
       pending.timer = setTimeout(() => this.arbitrateTimeout(key, pending, handle.channel, corr, ms), ms);
       this.pending.set(key, pending);
-      if (signal) this.attachCancelSignal(signal, key, handle, corr, priority);
       const write = writeTrackedBorrowed(this.sock, encodeFrame(frame), Date.now() + ms);
       handedToSocket = write.queued;
       write.completed.catch((error) => {
         const current = this.pending.get(key);
         if (current) this.rejectPending(key, current, error instanceof Error ? error : new SubcError(String(error)));
       });
+      // Preserve REQUEST/CANCEL order even when the signal was already aborted.
+      if (signal && write.queued) this.attachCancelSignal(signal, key, handle, corr, priority);
     });
   }
 

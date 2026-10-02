@@ -144,6 +144,17 @@ describe("21-byte envelope header", () => {
     expect(() => decodeHeader(encoded)).toThrow(new DecodeError("control channel carried nonzero epoch 1", "nonzero_epoch_on_control_channel"));
   });
 
+  test("decode reports pure-header body before control epoch", () => {
+    const encoded = encodeHeader(header(5, FrameType.Ping, 0, 0, 1, 1n));
+    const outcome = buildOutcome(() => ({ header: decodeHeader(encoded), body: new Uint8Array(0) }), false);
+    expect(outcome).toMatchObject({ kind: "error", code: "pure_header_frame_with_body" });
+  });
+
+  test("build reports pure-header body before control epoch", () => {
+    const outcome = buildOutcome(() => buildFrame(FrameType.Ping, 0, 0, 1, 1n, new Uint8Array(5)), false);
+    expect(outcome).toMatchObject({ kind: "error", code: "pure_header_frame_with_body" });
+  });
+
   test("rejects unsupported version before requiring the full header", () => {
     const prefix = new Uint8Array([0, 0, 0, 0, 1]);
     expect(() => decodeHeader(prefix)).toThrow(new DecodeError("unsupported envelope version 1", "unsupported_version"));
@@ -283,7 +294,7 @@ describe("21-byte envelope header", () => {
         input: { ...base, flags: 0b0010_0000, channel: 0, epoch: 1 },
       },
       {
-        name: "channel wins before pure-header length",
+        name: "pure-header length wins before control epoch",
         input: { ...base, ty: FrameType.Cancel, channel: 0, epoch: 1, body: new Uint8Array(1) },
       },
       {

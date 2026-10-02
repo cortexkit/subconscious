@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.20.1
+
+- Queue unary and managed REQUEST frames before attaching cancellation signals so an already-aborted signal cannot send CANCEL before its REQUEST.
+- On provider close, daemon GOODBYE, or fatal disconnect, reject pending reverse requests immediately, abort handler signals, and invalidate installed routes. Explicit close rejects with `provider_closed`, daemon GOODBYE with `connection_closed`, and fatal failures retain their cause.
+- Match Rust and Swift header-validation precedence: a pure-header control frame with both a body and a nonzero epoch reports `pure_header_frame_with_body` before `nonzero_epoch_on_control_channel`.
+
 ## 0.20.0 — 2026-10-02
 
 - Export `RouteEndReason` and expose `closeReason` on `SubcError` and `SubcCallError`. Named channel reasons take precedence over legacy module-only pushes; caller closes and connection losses report SDK-side reasons. Channel reuse clears history and call retry kinds are unchanged.

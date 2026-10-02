@@ -304,7 +304,7 @@ interface Token {
   start: number;
 }
 
-/** Splits on unquoted spaces, keeping each token's offset and its quoting intact. */
+/** Keeps quoted field values together without interpreting free-text quotes. */
 function tokenize(input: string): Token[] | null {
   const tokens: Token[] = [];
   let text = "";
@@ -324,7 +324,9 @@ function tokenize(input: string): Token[] | null {
       escaped = true;
       continue;
     }
-    if (char === '"') {
+    // Only key="value" has a quoting grammar. Message quotes are literal text,
+    // and may be unmatched without making the line malformed.
+    if (char === '"' && (quoted || /^[^\s=]+=$/.test(text))) {
       quoted = !quoted;
       text += char;
       continue;
@@ -480,11 +482,14 @@ export function parseLine(line: string): ParsedLine | { reject: string } {
     body = afterBracket.startsWith(" ") ? afterBracket.slice(1) : afterBracket;
   }
 
-  // A bracket AFTER the message is not context: context precedes the message so
-  // its column stays stable. Rejecting it keeps writers from putting it wherever
-  // and losing that property; a trailing bracket is an event field value.
-  if (!hadBracket && body.includes(" [") && body.endsWith("]")) {
-    return { reject: "bound_after_message" };
+  // Bound context must precede the message, but ordinary bracketed words are
+  // free text. Reject only a trailing bracket containing actual bound fields.
+  const trailingBracket = body.lastIndexOf(" [");
+  if (!hadBracket && trailingBracket >= 0 && body.endsWith("]")) {
+    const context = tokenize(body.slice(trailingBracket + 2, -1));
+    if (context && context.length > 0 && context.every((token) => decodeFieldToken(token.text) !== null)) {
+      return { reject: "bound_after_message" };
+    }
   }
 
   const tokens = tokenize(body);

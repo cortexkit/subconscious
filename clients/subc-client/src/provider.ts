@@ -680,8 +680,7 @@ export class SubcProvider {
 
   async close(): Promise<void> {
     if (!this.closeStarted) {
-      this.closeStarted = true;
-      this.cancelRestoredDebounce();
+      this.endServing(new SubcProviderError("provider closed", "provider_closed"));
       const sock = this.sock;
       try {
         await sendFrame(sock, buildFrame(FrameType.Goodbye, controlFlags(), 0, 0, 0n, new Uint8Array(0)));
@@ -722,7 +721,9 @@ export class SubcProvider {
         const frame = await sock.readFrame(Number.POSITIVE_INFINITY, { afterHeaderMs: BODY_READ_TIMEOUT_MS });
         const keepGoing = await this.dispatch(frame, sock, generation, control);
         if (!keepGoing) {
-          if (this.sock === sock && this.generation === generation) this.closeStarted = true;
+          if (this.sock === sock && this.generation === generation) {
+            this.endServing(new SubcProviderError("daemon closed provider connection", "connection_closed"));
+          }
           break;
         }
       }
@@ -903,12 +904,16 @@ export class SubcProvider {
 
   private abortGeneration(_generation: number): void {
     this.abortAllInflight();
+    this.rejectPendingRequests(new SubcProviderError("provider connection dropped", "connection_dropped"));
+    this.liveRoutes.clear();
+  }
+
+  private rejectPendingRequests(error: Error): void {
     for (const [key, pending] of this.pending) {
       this.pending.delete(key);
       clearTimeout(pending.timer);
-      pending.reject(new SubcProviderError("provider connection dropped", "connection_dropped"));
+      pending.reject(error);
     }
-    this.liveRoutes.clear();
   }
 
   private abortAllInflight(): void {
@@ -1410,12 +1415,19 @@ export class SubcProvider {
   }
 
   private failFatal(err: Error): void {
+    this.endServing(err);
+    this.sock.close();
+    this.finishClosed();
+  }
+
+  /** End work before closing the socket, which cannot settle requests on its own. */
+  private endServing(err: Error): void {
     if (!this.closedErr) this.closedErr = err;
     this.closeStarted = true;
     this.cancelRestoredDebounce();
+    this.rejectPendingRequests(this.closedErr);
     this.abortAllInflight();
-    this.sock.close();
-    this.finishClosed();
+    this.liveRoutes.clear();
   }
 
   private finishClosed(): void {

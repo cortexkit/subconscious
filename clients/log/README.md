@@ -17,6 +17,14 @@ const session = log.child("historian").withSession("pi", "01a0b7fc-bba1-7f60-aa2
 session.info("trigger fired", { reason: "force_band", usage: "93.9%" });
 ```
 
+## Installing and developing
+
+The published package contains compiled ESM and declarations for Node 18+ and
+Bun. For local development, build `../store` after installing its dependencies,
+then run `npm install --no-save --package-lock=false ../store` here when testing
+an unpublished store version. Consumers of the tarball resolve the versioned
+npm dependency.
+
 ## The line
 
 ```

@@ -775,6 +775,8 @@ struct SupervisorSnapshot {
     process_start_time: Option<u64>,
     deliberate_severance: Option<ProcessIdentity>,
     last_exit: Option<ExitReport>,
+    /// Diagnostic attached to the next drain's terminal record, if any.
+    drain_disposition_detail: Option<String>,
     health: ModuleHealthStatus,
     /// Whether the current process was started as a swap candidate and so
     /// lives in the module's alternate cgroup. The next swap's candidate takes
@@ -880,6 +882,7 @@ impl SupervisorSnapshot {
             process_start_time: None,
             deliberate_severance: None,
             last_exit: None,
+            drain_disposition_detail: None,
             health: ModuleHealthStatus::default(),
             in_alternate_slot: false,
             draining_to_replace: false,
@@ -4074,24 +4077,28 @@ async fn health_restart_child(
     }
 
     if schedule.is_none() {
-        record_health_action(snapshot, &spec.module_id, "disabled".to_string(), now_ms);
+        record_health_action(snapshot, &spec.module_id, "failed".to_string(), now_ms);
         error!(
             module_id = %spec.module_id,
             status = ?status,
             detail,
             max_restarts = runtime.restart_policy.max_restarts,
             window_secs = runtime.restart_policy.window.as_secs(),
-            "health restart budget exhausted; disabling module"
+            reason = %runtime.restart_policy.budget_exhausted_detail(),
+            "health restart budget exhausted; marking module failed"
         );
         let stop_notice = begin_forwarding_drain_if_configured(
             spec,
             runtime,
             registry,
             snapshot,
-            Some(false),
+            Some(true),
             RouteCloseReason::Disable,
         )
         .await?;
+        update_snapshot(snapshot, Some(&spec.module_id), |state| {
+            state.drain_disposition_detail = Some(runtime.restart_policy.budget_exhausted_detail());
+        })?;
         drain_optional_child(
             &spec.module_id,
             spec.protocol,
@@ -4103,8 +4110,8 @@ async fn health_restart_child(
             &runtime.spawn_events,
             child,
             runtime.drain_timeout,
-            ModuleState::Disabled,
-            Some(false),
+            ModuleState::Failed,
+            Some(true),
         )
         .await?;
         process_liveness.untrack_if_current(&spec.module_id, snapshot);
@@ -7484,12 +7491,14 @@ async fn drain_child_to_state(
             state.lifetime_restarts += 1;
         }
     })?;
-    record_terminal(
+    let detail = lock_snapshot(snapshot)?.drain_disposition_detail.take();
+    record_terminal_with_detail(
         module_id,
         terminal_ring,
         spawn_events,
         &exit_report,
         terminal_disposition(final_state),
+        detail,
     );
     child.drain_stderr(module_id).await;
 

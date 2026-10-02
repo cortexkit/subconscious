@@ -76,6 +76,48 @@ async fn spawn_registers_stub_and_reports_running() {
     module.stop().await.unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn health_budget_exhaustion_is_failed_with_budget_detail_and_start_revives() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor(&server, 0, Duration::from_millis(10))
+        .with_forwarding(Arc::clone(&server.forwarding))
+        .with_health_config(subc_daemon::HealthConfig {
+            cadence: Duration::from_millis(50),
+            deadline: Duration::from_millis(50),
+            failure_threshold: 1,
+            ..Default::default()
+        });
+    let health_path = server.temp_dir.join("health-first");
+    let module = spawn_stub_with_env(
+        &server,
+        &supervisor,
+        "fake-aft-health-budget",
+        [
+            ("FAKE_AFT_ADVERTISE_HEALTH", "1"),
+            (
+                "FAKE_AFT_HEALTH_NEVER_REPLY_FIRST_PATH",
+                health_path.to_str().unwrap(),
+            ),
+        ],
+    )
+    .await;
+    let failed = wait_for_status(&module, Duration::from_secs(3), |status| {
+        matches!(status.state, ModuleState::Failed | ModuleState::Disabled) && !status.process_alive
+    })
+    .await;
+    assert_eq!(failed.state, ModuleState::Failed);
+    assert!(failed.enabled);
+    let history = module.terminal_history();
+    assert_eq!(history.entries[0].disposition, TerminalDisposition::Failed);
+    assert_eq!(
+        history.entries[0].disposition_detail.as_deref(),
+        Some("crash budget exhausted: max_restarts=0 within window_secs=600")
+    );
+    assert!(module.set_enabled(true).await.unwrap());
+    wait_for_status(&module, Duration::from_secs(3), |status| status.live).await;
+    module.stop().await.unwrap();
+}
+
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn health_restart_evicts_registration_held_by_inherited_socket() {

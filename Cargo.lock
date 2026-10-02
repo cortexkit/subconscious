@@ -277,6 +277,7 @@ dependencies = [
  "subc-protocol",
  "subc-test-support",
  "subc-transport",
+ "syn 2.0.118",
  "tempfile",
  "tokio",
  "tracing",

@@ -70,6 +70,7 @@ The remaining reproductions, before their respective source fixes, showed:
 | `overlapping_publication_targets_refuse_with_artifact_and_phase_names` | declaration unexpectedly parsed successfully |
 | `partitioned_publication_targets_plan_each_artifact_once` | planned four artifact uploads rather than the expected two disjoint targets |
 | `publication_targets_must_be_nonempty_unique_declared_artifact_ids` | empty target list unexpectedly parsed successfully |
+| `replay::rebound_legacy_intent_resolves_even_with_a_newer_completion` | `old digest intent remains pending` when an older client had completed only a retried, rebound intent |
 
 The ordered reproduction command timed out while waiting for the declaration
 test build after these results had been collected. H1's unit and CLI regressions
@@ -119,8 +120,27 @@ design work, not an implementation change hidden in this patch.
   or ignored tests, plus successful doc-tests.
 - `cargo clippy -p cortexkit-release --all-targets --locked -j 2 -- -D warnings`
   passed.
+- After adding legacy-journal recovery, `cargo test -p cortexkit-release --locked
+  -j 1` passed all 100 tests and doc-tests, and package-scoped native clippy with
+  `-j 1 -- -D warnings` passed again. A foreground invocation hit the tool's
+  default short cap; the successful replacement ran in the background without a
+  short operational cap. It took about 84 minutes under the inherited wrapper.
 
 Compiler/build-slot contention made compilation unusually slow. No product
 timeout, retry, or sleep was changed to make the tests pass. This package's tests
 do not spawn `ck-subc` or modules; they use scratch Git repositories, shell
 commands, and in-process synthetic providers.
+
+The workspace-wide native clippy attempt timed out at the tool's 30-minute cap
+while checking unrelated dependency/workspace targets. The parent authorized
+skipping both workspace-wide clippy gates here and will run them on the
+integration branch. The inherited compiler wrapper remains enabled; no scheduling
+override was used. Package-scoped Windows clippy is the remaining cross-target
+gate for these changes.
+
+`scripts/fleet/check-wire-crate-versions.sh e56f048b` passed for the 16 crates it
+enumerates under `crates/`. That script does not enumerate `cortexkit-release`,
+so the actual release version was independently checked using the base manifest
+and locked Cargo metadata: `0.1.0 -> 0.1.1`. The root lockfile diff contains only
+that package's version line. An initial Python helper required unavailable
+`tomllib`; the successful metadata-based check has no Python package dependency.

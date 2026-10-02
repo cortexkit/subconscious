@@ -411,10 +411,14 @@ where
     match probe.probe(&request)? {
         ProbeResult::Present(evidence) => {
             ensure_matching_evidence(&request, &expected_identity, &evidence)?;
-            if !completed {
-                if let Some(intent) = attempted {
-                    journal.append_completion(&intent, evidence.clone())?;
-                }
+            // A newer completion does not resolve older pending records. Retain
+            // each original intent and reconcile every matching pending attempt.
+            for intent in journal
+                .pending_intents()?
+                .into_iter()
+                .filter(|intent| intent_matches(intent, &request))
+            {
+                journal.append_completion(&intent, evidence.clone())?;
             }
             Ok(EffectOutcome::Reconciled(evidence))
         }

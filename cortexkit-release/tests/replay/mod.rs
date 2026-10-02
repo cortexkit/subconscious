@@ -284,15 +284,20 @@ fn interruption_after_public_effect_resumes_with_probe_without_duplicate_executi
 
 #[test]
 fn rebound_intents_reconcile_without_duplicate_execution() {
-    assert_rebound_intent(true);
+    assert_rebound_intent(true, false);
 }
 
 #[test]
 fn rebound_absent_intent_still_refuses_retry() {
-    assert_rebound_intent(false);
+    assert_rebound_intent(false, false);
 }
 
-fn assert_rebound_intent(present: bool) {
+#[test]
+fn rebound_legacy_intent_resolves_even_with_a_newer_completion() {
+    assert_rebound_intent(true, true);
+}
+
+fn assert_rebound_intent(present: bool, newer_completion: bool) {
     let original = plan();
     let (_root, journal, approvals) = state(&original);
     let public_effect = effect(&original);
@@ -328,6 +333,17 @@ fn assert_rebound_intent(present: bool) {
     )
     .unwrap();
     let subject = build_approval_subject(&rebound).unwrap();
+    if newer_completion {
+        // Older clients could retry across a rebind and complete only the new
+        // intent. An upgrade must still reconcile the original pending record.
+        let newer = journal
+            .append_intent(
+                &request(&rebound, &public_effect),
+                durable_subject(&subject),
+            )
+            .unwrap();
+        journal.append_completion(&newer, evidence()).unwrap();
+    }
     let mut probe = ScriptedProbe::new([Ok(if present {
         ProbeResult::Present(evidence())
     } else {

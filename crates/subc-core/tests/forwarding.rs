@@ -2533,6 +2533,8 @@ async fn route_lifecycle_sends_one_push_per_connection_when_routes_share_client(
     let mut closing_count = 0;
     let mut closed_count = 0;
     let mut goodbye_channels = BTreeSet::new();
+    let mut expected_channels = vec![first.route_channel, second.route_channel];
+    expected_channels.sort_unstable();
     for _ in 0..4 {
         let frame = read_frame_timeout(&mut route_client).await;
         match frame.header.ty {
@@ -2548,6 +2550,10 @@ async fn route_lifecycle_sends_one_push_per_connection_when_routes_share_client(
                             None,
                             None,
                         );
+                        assert_eq!(
+                            serde_json::from_slice::<Value>(&frame.body).unwrap()["channels"],
+                            serde_json::json!(expected_channels)
+                        );
                         closing_count += 1;
                     }
                     Some("route.closed") => {
@@ -2559,6 +2565,10 @@ async fn route_lifecycle_sends_one_push_per_connection_when_routes_share_client(
                             Some(true),
                             Some(0),
                             Some(false),
+                        );
+                        assert_eq!(
+                            serde_json::from_slice::<Value>(&frame.body).unwrap()["channels"],
+                            serde_json::json!(expected_channels)
                         );
                         closed_count += 1;
                     }
@@ -3191,7 +3201,13 @@ async fn bit_set_subscription_is_excluded_and_reported_by_route_closed() {
         None,
     );
     let closed = read_frame_timeout(&mut route_client).await;
-    assert_route_closed_with_excluded_subscriptions(&closed, module_id, true, 1);
+    assert_route_closed_with_excluded_subscriptions(
+        &closed,
+        module_id,
+        &[ack.route_channel],
+        true,
+        1,
+    );
     let goodbye = read_frame_timeout(&mut route_client).await;
     assert_eq!(goodbye.header.ty, FrameType::Goodbye);
     assert_eq!(goodbye.header.channel, ack.route_channel);
@@ -7656,15 +7672,33 @@ fn assert_route_lifecycle_push(
     if let Some(terminal) = terminal {
         expected["terminal"] = Value::Bool(terminal);
     }
-    assert_eq!(
-        serde_json::from_slice::<Value>(&frame.body).unwrap(),
-        expected
+    let mut actual = serde_json::from_slice::<Value>(&frame.body).unwrap();
+    let channels = actual
+        .as_object_mut()
+        .unwrap()
+        .remove("channels")
+        .expect("lifecycle pushes always include channels");
+    let channels = channels.as_array().expect("channels is an array");
+    assert!(
+        !channels.is_empty(),
+        "a route recipient must have a covered channel"
     );
+    assert!(channels.iter().all(|channel| channel
+        .as_u64()
+        .is_some_and(|channel| channel > 0 && channel <= u16::MAX as u64)));
+    assert!(
+        channels
+            .windows(2)
+            .all(|pair| pair[0].as_u64() < pair[1].as_u64()),
+        "channels are unique and sorted"
+    );
+    assert_eq!(actual, expected);
 }
 
 fn assert_route_closed_with_excluded_subscriptions(
     frame: &Frame,
     module_id: &str,
+    channels: &[u16],
     drained: bool,
     excluded_subscriptions: u32,
 ) {
@@ -7675,6 +7709,7 @@ fn assert_route_closed_with_excluded_subscriptions(
         serde_json::json!({
             "op": "route.closed",
             "module_id": module_id,
+            "channels": channels,
             "reason": "reload",
             "drained": drained,
             "abandoned": 0,

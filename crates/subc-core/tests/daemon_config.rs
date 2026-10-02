@@ -396,7 +396,7 @@ async fn rescan_removes_module_and_leaves_other_open_route_undisturbed() {
     assert_eq!(closing.header.channel, 0);
     assert_eq!(
         serde_json::from_slice::<Value>(&closing.body).unwrap(),
-        json!({"op": "route.closing", "module_id": removed_id, "reason": "disable"})
+        json!({"op": "route.closing", "module_id": removed_id, "channels": [removed_route.channel], "reason": "disable"})
     );
     let closed = read_frame_timeout(&mut removed_client).await;
     assert_eq!(closed.header.ty, FrameType::Push);
@@ -406,6 +406,7 @@ async fn rescan_removes_module_and_leaves_other_open_route_undisturbed() {
         json!({
             "op": "route.closed",
             "module_id": removed_id,
+            "channels": [removed_route.channel],
             "reason": "disable",
             "drained": true,
             "abandoned": 0,

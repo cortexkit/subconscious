@@ -348,6 +348,12 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
+      # Log's locked local dependency exports compiled files. Build them before
+      # installing log so a fresh checkout has both JavaScript and declarations.
+      - name: Build sibling store for log
+        if: ${{ matrix.pkg == 'log' }}
+        working-directory: clients/store
+        run: bun install --frozen-lockfile && bun run build
       - name: Install
         # No fallback. --frozen-lockfile fails only when the committed lock
         # disagrees with package.json; falling back to a plain install makes CI

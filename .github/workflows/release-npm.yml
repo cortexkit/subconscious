@@ -68,6 +68,13 @@ jobs:
         with:
           bun-version: latest
 
+      # Log's locked local dependency exports compiled files. Build them before
+      # installing log so verification and prepack work on a fresh checkout.
+      - name: Build sibling store for log
+        if: ${{ steps.pkg.outputs.dir == 'clients/log' }}
+        working-directory: clients/store
+        run: bun install --frozen-lockfile && bun run build
+
       # Gate the publish on the same checks a PR runs — a release can never ship
       # code that would not pass CI.
       - name: Install dev deps + verify

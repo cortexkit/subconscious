@@ -237,7 +237,7 @@ fn setup_core_floor_refusal(
             "{component} requires core ≥ {floor}, but the installed core version could not be read"
         ));
     };
-    let Ok(installed) = installed_text.parse::<CoreVersion>() else {
+    let Ok(installed) = CoreVersion::from_release(installed_text) else {
         return Some(format!(
             "{component} requires core ≥ {floor}, but the installed core version could not be read (`{installed_text}`)"
         ));
@@ -572,7 +572,7 @@ fn upgrade_core_floor_refusal(observed: &UpgradeObserved, target: UpgradeTarget)
             target.component
         ));
     };
-    let Ok(core_version) = core_text.parse::<CoreVersion>() else {
+    let Ok(core_version) = CoreVersion::from_release(core_text) else {
         return Some(format!(
             "{} requires core ≥ {floor}, but core version `{core_text}` could not be read",
             target.component
@@ -771,6 +771,15 @@ mod tests {
         assert_eq!(applied.planned, preview.planned);
         assert_eq!(applied.applied, expected_mutations);
         assert_eq!(apply_executor.applied, expected_mutations);
+    }
+
+    #[test]
+    fn prerelease_core_can_meet_a_numeric_module_floor() {
+        let observed = floor_upgrade_observed("0.17.20", Some("0.18.0-rc.1"), Some("0.17.0"));
+        assert!(updates_target(
+            &plan_upgrade(&observed),
+            upgrade_target("ck-aft")
+        ));
     }
 
     #[test]

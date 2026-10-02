@@ -212,7 +212,10 @@ fn evidence_from_index(
                     reports_release_version: true,
                 });
             };
-            let version = entry.version.clone().unwrap_or_default();
+            let version = entry
+                .version
+                .clone()
+                .unwrap_or_else(|| entry.release.clone());
             let asset = match PlatformObservation::current() {
                 PlatformObservation::Supported(platform) => entry
                     .assets
@@ -229,6 +232,21 @@ fn evidence_from_index(
             })
         }
     }
+}
+
+#[cfg(test)]
+#[test]
+fn train_release_metadata_names_the_release_tag() {
+    let index: ReleaseIndex = serde_json::from_value(serde_json::json!({
+        "schema":1, "channel":"alpha", "generated_at_ms":0,
+        "components":{"mc":{"release":"ck-mc-deadbeef", "version":null}}
+    }))
+    .unwrap();
+    let target = super::components::upgrade_roster([super::model::Component::Mc])[0];
+    assert_eq!(
+        evidence_from_index(&Ok(index), target).unwrap().version,
+        "ck-mc-deadbeef"
+    );
 }
 
 pub(super) fn upgrade_target_index_path(target: UpgradeTarget) -> (&'static str, &'static str) {

@@ -760,7 +760,9 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
         };
         // Keep the existing reported-version exemption limited to the two
         // legacy targets whose releases were already accepted this way.
-        let expected_version = if target.accepts_reported_version() {
+        let expected_version = if target.accepts_reported_version()
+            || self.assets.accepts_reported_version(target, self.platform)
+        {
             version.clone()
         } else {
             self.expected_version(target)?.to_string()
@@ -925,31 +927,9 @@ fn version_from_output(output: &[u8]) -> Result<String, String> {
     output
         .split_whitespace()
         .map(|token| token.trim_start_matches('v'))
-        .find(|token| {
-            let mut parts = token.split('.');
-            matches!(
-                (parts.next(), parts.next(), parts.next()),
-                (Some(major), Some(minor), Some(patch))
-                    if is_ascii_digits(major)
-                        && is_ascii_digits(minor)
-                        && patch.bytes().next().is_some_and(|byte| byte.is_ascii_digit())
-            )
-        })
-        .map(|version| {
-            version
-                .chars()
-                .take_while(|character| character.is_ascii_digit() || *character == '.')
-                .collect()
-        })
-        .filter(|version: &String| !version.is_empty())
+        .find(|token| super::model::CoreVersion::from_release(token).is_ok())
+        .map(ToOwned::to_owned)
         .ok_or_else(|| format!("refusal: --version output had no semantic version: {output:?}"))
-}
-
-/// A version segment is one or more ASCII digits. `char::is_numeric` also
-/// accepts non-ASCII digits (Arabic-Indic, Devanagari, ...) and is trivially
-/// true for an empty segment, neither of which is a version component.
-fn is_ascii_digits(segment: &str) -> bool {
-    !segment.is_empty() && segment.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 fn canonical_or_original(path: &Path) -> PathBuf {
@@ -997,6 +977,57 @@ mod tests {
             path,
             format!("#!/bin/sh\necho 'binary {version}'\n").as_bytes(),
         );
+    }
+
+    #[cfg(unix)]
+    fn isolated_backend(root: &Path, target: UpgradeTarget) -> SystemUpgradeBackend {
+        SystemUpgradeBackend {
+            platform: AlphaTarget::LinuxX64,
+            targets: [(
+                target.label().to_string(),
+                ManagedUpgradeTarget {
+                    target,
+                    destination: root.join(target.label()),
+                    installed_version: "0.1.0".into(),
+                    installed_archive_sha256: None,
+                },
+            )]
+            .into_iter()
+            .collect(),
+            executable: root.join("ck"),
+            subc: None,
+            assets: ReleaseUpgradeAssetFetcher::from_index(ReleaseIndex {
+                schema: 1,
+                channel: "alpha".into(),
+                generated_at_ms: 0,
+                components: BTreeMap::new(),
+            }),
+            inventory: Inventory::load(root.join("installer-manifest.json"), "linux-x64").unwrap(),
+            prepared: BTreeMap::new(),
+            rollback_paths: BTreeMap::new(),
+            rollback_archive_sha256: BTreeMap::new(),
+            expected_versions: [(target.label().to_string(), "0.1.0".into())]
+                .into_iter()
+                .collect(),
+            planned_from: BTreeMap::new(),
+            supervised_modules: BTreeSet::new(),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn train_release_post_verifies_the_binarys_own_version() {
+        let root = TestTempDir::new("train-post-verify");
+        let target = upgrade_target("ck-mc");
+        version_binary(&root.join("ck-mc"), "0.1.0");
+        let mut backend = isolated_backend(&root, target);
+        backend.assets = ReleaseUpgradeAssetFetcher::from_index(serde_json::from_value(serde_json::json!({
+            "schema":1, "channel":"alpha", "generated_at_ms":0,
+            "components":{"mc":{"release":"ck-mc-deadbeef", "version":null,
+                "assets":{"linux-x64":{"ck-mc":{"url":"https://example.invalid/mc.zip", "sha256":"00", "reports":null}}}}}
+        })).unwrap());
+        backend.set_expected_version(target, "ck-mc-deadbeef".into());
+        assert!(backend.post_verify(target).is_ok());
     }
 
     #[cfg(unix)]
@@ -1175,6 +1206,14 @@ mod tests {
     }
 
     #[test]
+    fn release_versions_preserve_prerelease_and_build_suffixes() {
+        assert_eq!(
+            version_from_output(b"ck 0.18.0-rc.1+build.7").unwrap(),
+            "0.18.0-rc.1+build.7"
+        );
+    }
+
+    #[test]
     fn version_output_accepts_plain_and_prerelease_versions() {
         assert_eq!(
             version_from_output(b"ck 1.2.3").expect("plain version"),
@@ -1182,7 +1221,7 @@ mod tests {
         );
         assert_eq!(
             version_from_output(b"ck 1.2.3-rc.1").expect("prerelease version"),
-            "1.2.3"
+            "1.2.3-rc.1"
         );
     }
 

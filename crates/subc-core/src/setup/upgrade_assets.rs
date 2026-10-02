@@ -110,6 +110,16 @@ impl ReleaseUpgradeAssetFetcher {
     pub fn from_index(index: ReleaseIndex) -> Self {
         Self { index }
     }
+
+    pub fn accepts_reported_version(&self, target: UpgradeTarget, platform: AlphaTarget) -> bool {
+        let (component, binary) = upgrade_target_index_path(target);
+        self.index
+            .components
+            .get(component)
+            .and_then(|entry| entry.assets.get(platform.label()))
+            .and_then(|assets| assets.get(binary))
+            .is_some_and(|asset| asset.reports.is_none())
+    }
 }
 
 impl UpgradeAssetFetcher for ReleaseUpgradeAssetFetcher {

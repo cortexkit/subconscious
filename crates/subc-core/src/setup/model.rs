@@ -85,6 +85,30 @@ impl fmt::Display for Component {
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct CoreVersion(u64, u64, u64);
 
+impl CoreVersion {
+    /// Floors compare the numeric release triplet, not release-channel suffixes.
+    /// Keep the floor decoder strict while accepting suffixes on observed builds.
+    pub fn from_release(value: &str) -> Result<Self, ()> {
+        let (without_build, build) = value
+            .split_once('+')
+            .map_or((value, None), |(a, b)| (a, Some(b)));
+        let (triplet, prerelease) = without_build
+            .split_once('-')
+            .map_or((without_build, None), |(a, b)| (a, Some(b)));
+        for suffix in [build, prerelease].into_iter().flatten() {
+            if suffix.split('.').any(|part| {
+                part.is_empty()
+                    || !part
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            }) {
+                return Err(());
+            }
+        }
+        triplet.parse()
+    }
+}
+
 impl FromStr for CoreVersion {
     type Err = ();
 

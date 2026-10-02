@@ -146,7 +146,6 @@ struct EvaluatorState {
     process: BTreeMap<String, ProcessEvidence>,
     requirements: BTreeMap<RequirementKey, RequirementRecord>,
     statuses: BTreeMap<RequirementKey, RequirementStatus>,
-    refused_claimants: BTreeMap<String, BTreeSet<String>>,
 }
 
 /// In-memory, configuration-scoped capability requirement evaluator.
@@ -196,11 +195,6 @@ impl CapabilityRequirementEvaluator {
         state.configured = configured;
         state.reserved_capabilities = reserved_capabilities;
         let configured_ids = state.configured.keys().cloned().collect::<BTreeSet<_>>();
-        let reserved_ids = state
-            .reserved_capabilities
-            .keys()
-            .cloned()
-            .collect::<BTreeSet<_>>();
         let config_generation = state.config_generation;
         state
             .cached
@@ -211,9 +205,6 @@ impl CapabilityRequirementEvaluator {
         state
             .process
             .retain(|module_id, _| configured_ids.contains(module_id));
-        state
-            .refused_claimants
-            .retain(|capability, _| reserved_ids.contains(capability));
         for cache in state.cached.values_mut() {
             cache.config_generation = config_generation;
         }
@@ -258,8 +249,9 @@ impl CapabilityRequirementEvaluator {
     }
 
     /// Return a typed reserved-capability conflict for a claimant before it can
-    /// enter the catalog. The bound module is always first; refused claimants are
-    /// maintained in lexicographic order for deterministic operator output.
+    /// enter the catalog. The bound module is always first. A refused attempt
+    /// never becomes live catalog evidence and must not be replayed as a new
+    /// conflict when an unrelated module changes its catalog.
     pub(crate) fn reserved_hello_refusals(
         &self,
         module_id: &str,
@@ -268,7 +260,7 @@ impl CapabilityRequirementEvaluator {
         let Some(capabilities) = capabilities else {
             return Vec::new();
         };
-        let mut state = self
+        let state = self
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -280,28 +272,9 @@ impl CapabilityRequirementEvaluator {
             if bound_module == module_id {
                 continue;
             }
-            state
-                .refused_claimants
-                .entry(capability.clone())
-                .or_default()
-                .insert(module_id.to_string());
-            let mut claimants = Vec::with_capacity(
-                1 + state
-                    .refused_claimants
-                    .get(capability)
-                    .map_or(0, BTreeSet::len),
-            );
-            claimants.push(bound_module);
-            claimants.extend(
-                state
-                    .refused_claimants
-                    .get(capability)
-                    .into_iter()
-                    .flat_map(|claimants| claimants.iter().cloned()),
-            );
             events.push(DuplicateClaimEvent {
                 capability: capability.clone(),
-                claimants,
+                claimants: vec![bound_module, module_id.to_string()],
                 source: DuplicateClaimSource::Hello,
             });
         }
@@ -519,11 +492,6 @@ impl CapabilityRequirementEvaluator {
             .reserved_capabilities
             .iter()
             .filter_map(|(capability, bound_module)| {
-                let refused = state
-                    .refused_claimants
-                    .get(capability)
-                    .into_iter()
-                    .flat_map(|ids| ids.iter());
                 let registered_conflicts = registered
                     .iter()
                     .filter(|module| {
@@ -531,10 +499,7 @@ impl CapabilityRequirementEvaluator {
                             && provides(module.capabilities.as_ref(), capability)
                     })
                     .map(|module| &module.module_id);
-                let conflicts = refused
-                    .chain(registered_conflicts)
-                    .cloned()
-                    .collect::<BTreeSet<_>>();
+                let conflicts = registered_conflicts.cloned().collect::<BTreeSet<_>>();
                 (!conflicts.is_empty()).then(|| DuplicateClaimEvent {
                     capability: capability.clone(),
                     claimants: std::iter::once(bound_module.clone())
@@ -1168,9 +1133,39 @@ mod tests {
         assert_eq!(hello[0].claimants, ["vault", "zeta"]);
         let update = evaluator.duplicate_claims(
             DuplicateClaimSource::CatalogUpdate,
-            &[registered("alpha", &["credentials-provider/v1"], &[])],
+            &[
+                registered("zeta", &["credentials-provider/v1"], &[]),
+                registered("alpha", &["credentials-provider/v1"], &[]),
+            ],
         );
         assert_eq!(update[0].source, DuplicateClaimSource::CatalogUpdate);
         assert_eq!(update[0].claimants, ["vault", "alpha", "zeta"]);
+    }
+
+    #[test]
+    fn refused_claimant_is_not_relogged_on_unrelated_catalog_update() {
+        let evaluator = CapabilityRequirementEvaluator::new();
+        evaluator.configure(
+            [],
+            BTreeMap::from([("thing/v1".to_string(), "vault".to_string())]),
+        );
+        let refused =
+            evaluator.reserved_hello_refusals("squatter", Some(&declarations(&["thing/v1"], &[])));
+        assert_eq!(refused[0].claimants, ["vault", "squatter"]);
+        assert!(
+            evaluator
+                .duplicate_claims(
+                    DuplicateClaimSource::CatalogUpdate,
+                    &[registered("other", &["other/v1"], &[])]
+                )
+                .is_empty(),
+            "an unrelated update is not a new attempt by an unregistered claimant"
+        );
+        assert_eq!(
+            evaluator.reserved_hello_refusals("squatter", Some(&declarations(&["thing/v1"], &[])))
+                [0]
+            .claimants,
+            ["vault", "squatter"]
+        );
     }
 }

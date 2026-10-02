@@ -438,6 +438,9 @@ impl ChildLifecycle {
         let spawned_at = self
             .ensure_child(server, config, &mut state, deadline)
             .await?;
+        // Capture the handshake cost before writing the tool request. Vendor
+        // execution latency must not be attributed to the adapter's cold start.
+        let spawn_elapsed_ms = spawned_at.map(elapsed_since);
         if Instant::now() >= deadline || cancel.is_cancelled() {
             self.remove_session(&mut state).await;
             return Err(LifecycleError::ChildUnresponsive);
@@ -507,7 +510,7 @@ impl ChildLifecycle {
             payload,
             cacheable,
             observed_at_ms: epoch_millis(),
-            spawn_elapsed_ms: spawned_at.map(elapsed_since),
+            spawn_elapsed_ms,
         })
     }
 

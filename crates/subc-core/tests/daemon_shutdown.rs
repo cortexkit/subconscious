@@ -1039,6 +1039,8 @@ fn binary_rejects_invalid_cgroup_override_before_writing_state() {
     let output = Command::new(env!("CARGO_BIN_EXE_ck-subc"))
         .env("SUBC_CGROUP_PLACEMENT", "current")
         .env("XDG_DATA_HOME", root.join("data"))
+        .env("XDG_RUNTIME_DIR", root.join("runtime"))
+        .env("XDG_CONFIG_HOME", root.join("config"))
         .output()
         .unwrap();
     assert!(!output.status.success());

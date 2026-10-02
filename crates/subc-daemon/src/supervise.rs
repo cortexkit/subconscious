@@ -769,6 +769,8 @@ struct SupervisorSnapshot {
     reaped_pid: Option<u32>,
     /// Whether the command-serving supervision loop has a scheduled respawn.
     respawn_pending: bool,
+    /// A second restart is waiting for the replacement already scheduled.
+    coalesced_restart_pending: bool,
     spawned_at_ms: Option<u64>,
     spawned_from: Option<PathBuf>,
     spawned_file_identity: Option<SpawnedFileIdentity>,
@@ -876,6 +878,7 @@ impl SupervisorSnapshot {
             pid: None,
             reaped_pid: None,
             respawn_pending: false,
+            coalesced_restart_pending: false,
             spawned_at_ms: None,
             spawned_from: None,
             spawned_file_identity: None,
@@ -1381,12 +1384,14 @@ struct PendingRespawn {
     kind: RespawnKind,
 }
 
+type ReloadReply = oneshot::Sender<Result<(), SuperviseError>>;
+
 #[derive(Debug, Clone)]
 struct SupervisorRuntimeConfig {
     /// Restart operations hand their backoff to the loop, which keeps serving commands.
     scheduled_respawn: Arc<Mutex<Option<PendingRespawn>>>,
     /// A reload acknowledges completion only after its replacement registers.
-    deferred_reload_reply: Arc<Mutex<Option<oneshot::Sender<Result<(), SuperviseError>>>>>,
+    deferred_reload_reply: Arc<Mutex<Option<ReloadReply>>>,
     restart_policy: RestartPolicy,
     /// This module's RESOLVED drain budget: per-module config when present,
     /// else `default_drain_timeout`.
@@ -4620,6 +4625,7 @@ async fn supervise_loop(
             );
             let _ = update_snapshot(&snapshot, Some(&spec.module_id), |state| {
                 state.respawn_pending = false;
+                state.coalesced_restart_pending = false;
                 if matches!(
                     state.state,
                     ModuleState::Restarting
@@ -5034,7 +5040,18 @@ async fn handle_supervisor_command(
             } else {
                 None
             };
-            if let Some(generation) = satisfied_by_generation {
+            let satisfied_by_pending = initiated
+                && child.is_none()
+                && lock_snapshot(snapshot).ok().is_some_and(|mut state| {
+                    let pending = state.respawn_pending && !state.configuration_updated_since_spawn;
+                    if pending {
+                        state.coalesced_restart_pending = true;
+                    }
+                    pending
+                });
+            if satisfied_by_pending {
+                debug!(module_id = %spec.module_id, "restart coalesced into the pending replacement");
+            } else if let Some(generation) = satisfied_by_generation {
                 info!(
                     module_id = %spec.module_id,
                     received_at_generation,
@@ -7967,6 +7984,11 @@ fn set_running(
         module_id: Some(module_id.to_string()),
     })?;
     state.spawn_generation = spawn_events.emit_spawned(module_id, child.pid, child.spawned_at_ms);
+    if std::mem::take(&mut state.coalesced_restart_pending) {
+        let generation = state.spawn_generation;
+        info!(module_id, "restart already satisfied by generation {generation}; coalesced pending request completed");
+    }
+    state.drain_disposition_detail = None;
     // Every caller of this is a plain spawn, which always uses the primary key;
     // a promoted swap candidate sets the flag itself after this returns.
     state.in_alternate_slot = false;

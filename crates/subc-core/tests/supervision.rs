@@ -113,6 +113,8 @@ async fn disable_during_reload_registration_retry_backoff_cancels_respawn() {
     assert_disable_cancels_backoff("registration-retry").await;
 }
 
+// Unix permits unlinking an executing fixture; Windows holds the executable open.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn disable_during_reload_spawn_retry_backoff_cancels_respawn() {
     assert_disable_cancels_backoff("spawn-retry").await;

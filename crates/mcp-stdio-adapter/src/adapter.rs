@@ -394,6 +394,7 @@ impl ChildLifecycle {
         payload: Value,
         cancel: &CancellationToken,
     ) -> Result<ForwardedResponse, LifecycleError> {
+        let deadline = Instant::now() + Duration::from_millis(config.deadline_ms);
         let attempts = if operation == Operation::ToolsList {
             2
         } else {
@@ -401,7 +402,7 @@ impl ChildLifecycle {
         };
         for attempt in 0..attempts {
             match self
-                .forward_once(server, &config, operation, payload.clone(), cancel)
+                .forward_once(server, &config, payload.clone(), cancel, deadline)
                 .await
             {
                 // A cancelled caller is gone for good: respawning a child for a
@@ -410,6 +411,9 @@ impl ChildLifecycle {
                     if attempt + 1 < attempts && !cancel.is_cancelled() =>
                 {
                     continue
+                }
+                Err(LifecycleError::CallOutcomeUnknown) if operation == Operation::ToolsList => {
+                    return Err(LifecycleError::ChildUnresponsive);
                 }
                 result => return result,
             }
@@ -421,13 +425,23 @@ impl ChildLifecycle {
         self: &Arc<Self>,
         server: &str,
         config: &ServerConfig,
-        _operation: Operation,
         payload: Value,
         cancel: &CancellationToken,
+        deadline: Instant,
     ) -> Result<ForwardedResponse, LifecycleError> {
         let slot = self.slot(server);
-        let mut state = slot.state.lock().await;
-        let spawned_at = self.ensure_child(server, config, &mut state).await?;
+        let mut state = tokio::select! {
+            state = tokio::time::timeout_at(TokioInstant::from_std(deadline), slot.state.lock()) =>
+                state.map_err(|_| LifecycleError::ChildUnresponsive)?,
+            () = cancel.cancelled() => return Err(LifecycleError::ChildUnresponsive),
+        };
+        let spawned_at = self
+            .ensure_child(server, config, &mut state, deadline)
+            .await?;
+        if Instant::now() >= deadline || cancel.is_cancelled() {
+            self.remove_session(&mut state).await;
+            return Err(LifecycleError::ChildUnresponsive);
+        }
         let session = state
             .session
             .as_mut()
@@ -445,16 +459,12 @@ impl ChildLifecycle {
 
         // The per-server lane is held for the whole wait, so the read must be
         // bounded: a child that accepts the request and never replies would
-        // otherwise block every later call to this server (and the eviction
-        // timer) until the adapter restarts. Deadline expiry and caller
-        // cancellation both land on TimedOut, which tears the session down:
-        // the request may already be running inside the child, so its outcome
-        // is unknown and the session cannot be reused. The child is then
-        // terminated, so a late reply dies with the process instead of
-        // landing on a session nobody reads.
-        let deadline = Duration::from_millis(config.deadline_ms);
-        let read = timeout(
-            deadline,
+        // otherwise block every later call to this server. Discovery's one
+        // crash retry shares this deadline; a timeout never buys a new budget.
+        // Cancellation and deadline expiry both abandon and tear down the child,
+        // so a late reply cannot be consumed by a subsequent call.
+        let read = tokio::time::timeout_at(
+            TokioInstant::from_std(deadline),
             read_response(session, child_id, config.frame_ceiling_bytes),
         );
         let response = match tokio::select! {
@@ -469,7 +479,11 @@ impl ChildLifecycle {
                     ceiling_bytes: config.frame_ceiling_bytes,
                 });
             }
-            Err(FrameReadError::Closed | FrameReadError::TimedOut | FrameReadError::Io) => {
+            Err(FrameReadError::TimedOut) => {
+                self.remove_session(&mut state).await;
+                return Err(LifecycleError::ChildUnresponsive);
+            }
+            Err(FrameReadError::Closed | FrameReadError::Io) => {
                 self.remove_session(&mut state).await;
                 return Err(LifecycleError::CallOutcomeUnknown);
             }
@@ -502,6 +516,7 @@ impl ChildLifecycle {
         _server: &str,
         config: &ServerConfig,
         state: &mut SlotState,
+        deadline: Instant,
     ) -> Result<Option<Instant>, LifecycleError> {
         if let Some(session) = state.session.as_mut() {
             match session.child.try_wait() {
@@ -524,15 +539,21 @@ impl ChildLifecycle {
             state.cooldown_until = None;
         }
 
-        let child_env = match self.construct_environment(config).await {
-            Ok(environment) => environment,
-            Err(variable) => {
+        let child_env = match tokio::time::timeout_at(
+            TokioInstant::from_std(deadline),
+            self.construct_environment(config),
+        )
+        .await
+        {
+            Ok(Ok(environment)) => environment,
+            result => {
+                let variable = result.ok().and_then(Result::err);
                 let retry_after_ms =
                     self.record_failed_attempt(state, SpawnFailureCause::CredentialResolution);
                 return Err(LifecycleError::SpawnFailed {
                     cause: SpawnFailureCause::CredentialResolution,
                     retry_after_ms,
-                    env_var: Some(variable),
+                    env_var: variable,
                 });
             }
         };
@@ -574,7 +595,9 @@ impl ChildLifecycle {
         if let Err(_error) = initialize_child(
             &mut session,
             config.frame_ceiling_bytes,
-            self.settings.spawn_initialize_budget,
+            self.settings
+                .spawn_initialize_budget
+                .min(deadline.saturating_duration_since(Instant::now())),
         )
         .await
         {
@@ -797,6 +820,7 @@ enum LifecycleError {
         ceiling_bytes: u64,
     },
     CallOutcomeUnknown,
+    ChildUnresponsive,
 }
 
 impl LifecycleError {
@@ -838,6 +862,12 @@ impl LifecycleError {
             Self::CallOutcomeUnknown => AdapterRefusal::with_detail(
                 "call_outcome_unknown",
                 "MCP child ended after the tool request was written",
+                json!({}),
+            )
+            .into_handler_outcome(),
+            Self::ChildUnresponsive => AdapterRefusal::with_detail(
+                "child_unresponsive",
+                "MCP child did not complete before the call was abandoned",
                 json!({}),
             )
             .into_handler_outcome(),

@@ -281,9 +281,9 @@ async fn wedged_child_call_ends_at_deadline_and_later_calls_are_not_queued_behin
     );
 
     let (code, _detail) = first.expect("first call must end at the configured deadline, not hang");
-    assert_eq!(code, "call_outcome_unknown");
+    assert_eq!(code, "child_unresponsive");
     let (code, _detail) = second.expect("second call must not queue behind the wedged session");
-    assert_eq!(code, "call_outcome_unknown");
+    assert_eq!(code, "child_unresponsive");
     assert_eq!(handler.metrics().snapshot()["children_live"], 0);
 }
 
@@ -324,7 +324,7 @@ async fn cancelled_call_stops_waiting_on_a_wedged_child() {
     let HandlerOutcome::ErrorWithDetail { code, .. } = outcome else {
         panic!("cancelled call must end as a refusal: {outcome:?}");
     };
-    assert_eq!(code, "call_outcome_unknown");
+    assert_eq!(code, "child_unresponsive");
     assert_eq!(metrics.snapshot()["children_live"], 0);
 }
 

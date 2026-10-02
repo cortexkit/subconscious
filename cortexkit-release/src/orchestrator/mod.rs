@@ -591,12 +591,14 @@ fn completion_exists(
 }
 
 fn intent_matches(intent: &PendingIntent, request: &EffectRequest) -> bool {
+    // Rebinding changes the approval/declaration context, not an effect that
+    // was already attempted. Match its stable operation key so the original
+    // intent can be completed and can still prohibit an automatic retry.
     intent.train == request.train
         && intent.phase == request.phase
         && intent.artifact == request.artifact
         && intent.operation == request.operation
         && intent.intended_commit == request.intended_commit
-        && intent.declaration_digest == request.declaration_digest
 }
 
 fn ensure_matching_evidence(

@@ -1557,13 +1557,17 @@ impl ForwardingTable {
             // caller sends one channel-scoped GOODBYE for the binding the module
             // just created. Nothing here touches the module connection.
             //
-            // Only membership in `superseded_endpoints` takes this arm. An
-            // endpoint that stopped being the active one for any other reason
-            // is STALE, not superseded, and still falls through to
+            // Daemon drain also gates an endpoint before its ordered module
+            // drain settles pending relays. An ack in that gap must release its
+            // reservation and deliver a refusal, not turn admission shutdown
+            // into a fatal error on the shared module connection.
+            // An endpoint that stopped being active for any other reason is
+            // STALE and still falls through to
             // `commit_route_locked`, which refuses it with `StaleModuleEndpoint`
             // exactly as before swaps existed.
             RouteBindRelayOutcome::Accepted
-                if inner.superseded_endpoints.contains_key(&endpoint) =>
+                if inner.superseded_endpoints.contains_key(&endpoint)
+                    || inner.draining_endpoints.contains_key(&endpoint) =>
             {
                 release_reserved_route_locked(
                     &mut inner,
@@ -3908,6 +3912,52 @@ mod tests {
             ),
             Err(ForwardingError::ConnectionClosing { .. })
         ));
+    }
+
+    #[test]
+    fn late_bind_ack_during_daemon_drain_settles_without_leaking_or_closing_module() {
+        let (forwarding, module_connection, endpoint, client_connection, sink, mut rx) =
+            route_fixture("provider");
+        let mut pending =
+            begin_test_route(&forwarding, client_connection, sink.clone(), 1, "provider");
+        assert_eq!(forwarding.reserved_route_count().unwrap(), (1, 1));
+        forwarding.begin_daemon_drain().unwrap();
+        let completion = forwarding
+            .complete_pending_relay(
+                module_connection,
+                pending.corr,
+                RouteBindRelayOutcome::Accepted,
+            )
+            .expect("draining admission is not a fatal module error");
+        assert!(completion.settled);
+        let abandoned = completion
+            .abandoned
+            .expect("late accepted bind needs a route GOODBYE");
+        assert_eq!(abandoned.channel, pending.module_channel);
+        assert!(matches!(pending.receiver.try_recv().unwrap(),
+            RouteBindRelayOutcome::Rejected(error) if error.code == "module_reloading"));
+        assert_eq!(forwarding.reserved_route_count().unwrap(), (0, 0));
+        assert_eq!(forwarding.active_binding_count().unwrap(), 0);
+        assert!(
+            rx.try_recv().is_err(),
+            "no route.open may be published during drain"
+        );
+        assert_eq!(
+            forwarding
+                .module_endpoint_for_connection(module_connection)
+                .unwrap(),
+            Some(endpoint)
+        );
+        assert!(
+            !forwarding
+                .complete_pending_relay(
+                    module_connection,
+                    pending.corr,
+                    RouteBindRelayOutcome::Accepted,
+                )
+                .unwrap()
+                .settled
+        );
     }
 
     fn test_ping(corr: u64) -> Frame {

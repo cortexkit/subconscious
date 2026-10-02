@@ -407,13 +407,7 @@ fn record_test_probe(path: &Path) {
 #[tokio::main]
 async fn main() {
     match run(env::args_os()).await {
-        Ok(()) => match cleanup_replaced_windows_ck() {
-            Ok(()) => process::exit(0),
-            Err(error) => {
-                eprintln!("{error}");
-                process::exit(error.exit_code());
-            }
-        },
+        Ok(()) => process::exit(successful_command_exit(cleanup_replaced_windows_ck())),
         Err(
             CkError::FleetLintExit { exit_code }
             | CkError::TriageExit { exit_code }
@@ -424,6 +418,16 @@ async fn main() {
             process::exit(err.exit_code());
         }
     }
+}
+
+fn successful_command_exit(cleanup: Result<(), CkError>) -> i32 {
+    // Another invocation may still be running the previous Windows image.
+    // Cleanup retains its inventory row on failure so a later command can try
+    // again; housekeeping must not change the result of the user's command.
+    if let Err(error) = cleanup {
+        eprintln!("warning: self-update cleanup deferred: {error}");
+    }
+    0
 }
 
 /// A Windows self-update leaves `ck.exe.old` until a later, successful process
@@ -8136,6 +8140,17 @@ impl From<serde_json::Error> for CkError {
     fn from(source: serde_json::Error) -> Self {
         Self::Json(source)
     }
+}
+
+#[cfg(test)]
+#[test]
+fn a_successful_command_stays_successful_when_old_image_cleanup_fails() {
+    assert_eq!(
+        successful_command_exit(Err(CkError::Message(
+            "could not delete prior Windows executable: sharing violation".into()
+        ))),
+        0
+    );
 }
 
 #[cfg(test)]

@@ -519,7 +519,7 @@ struct ModuleBreakerState {
     /// what makes the probe EXACTLY ONE: the flag is set under the same lock
     /// that read the cooldown, so concurrent opens arriving at the moment the
     /// cooldown expires cannot all decide that they are the probe.
-    probe_in_flight: bool,
+    probe_in_flight: Option<Arc<()>>,
 }
 
 /// What the breaker decided for one `route.open`, before any relay work.
@@ -549,6 +549,7 @@ enum RouteBindAdmission<'a> {
 struct RouteBindBreakerGuard<'a> {
     breakers: RouteBindBreakers,
     module_id: &'a str,
+    probe_token: Option<Arc<()>>,
     settled: bool,
 }
 
@@ -565,8 +566,12 @@ impl RouteBindBreakerGuard<'_> {
     /// COUNTS TOWARD OPENING.
     fn record_timeout(&mut self, threshold: u32, cooldown: Duration) -> Option<BreakerOpened> {
         self.settled = true;
-        self.breakers
-            .record_timeout(self.module_id, threshold, cooldown)
+        self.breakers.record_timeout(
+            self.module_id,
+            self.probe_token.as_ref(),
+            threshold,
+            cooldown,
+        )
     }
 
     /// Everything else: the module REJECTED the bind, its connection went away
@@ -579,14 +584,16 @@ impl RouteBindBreakerGuard<'_> {
     /// neither increment nor reset the count -- they only release a probe slot.
     fn record_inconclusive(&mut self) {
         self.settled = true;
-        self.breakers.record_inconclusive(self.module_id);
+        self.breakers
+            .record_inconclusive(self.module_id, self.probe_token.as_ref());
     }
 }
 
 impl Drop for RouteBindBreakerGuard<'_> {
     fn drop(&mut self) {
         if !self.settled {
-            self.breakers.record_inconclusive(self.module_id);
+            self.breakers
+                .record_inconclusive(self.module_id, self.probe_token.as_ref());
         }
     }
 }
@@ -611,23 +618,24 @@ impl RouteBindBreakers {
     /// Decide whether this `route.open` may attempt its relay. Takes the map
     /// lock and nothing else, and never awaits.
     fn admit<'a>(&self, module_id: &'a str) -> RouteBindAdmission<'a> {
-        let admitted = |probe| RouteBindAdmission::Admitted {
+        let admitted = |probe_token: Option<Arc<()>>| RouteBindAdmission::Admitted {
+            probe: probe_token.is_some(),
             guard: RouteBindBreakerGuard {
                 breakers: self.clone(),
                 module_id,
+                probe_token,
                 settled: false,
             },
-            probe,
         };
 
         let mut modules = self.lock();
         let Some(state) = modules.get_mut(module_id) else {
-            return admitted(false);
+            return admitted(None);
         };
         let Some(cooldown_until) = state.cooldown_until else {
-            return admitted(false);
+            return admitted(None);
         };
-        if state.probe_in_flight {
+        if state.probe_in_flight.is_some() {
             return RouteBindAdmission::Refused {
                 consecutive_timeouts: state.consecutive_timeouts,
                 retry_in: Duration::ZERO,
@@ -642,8 +650,9 @@ impl RouteBindBreakers {
                 probe_in_flight: false,
             };
         }
-        state.probe_in_flight = true;
-        admitted(true)
+        let token = Arc::new(());
+        state.probe_in_flight = Some(Arc::clone(&token));
+        admitted(Some(token))
     }
 
     fn record_accepted(&self, module_id: &str) -> bool {
@@ -655,14 +664,17 @@ impl RouteBindBreakers {
     fn record_timeout(
         &self,
         module_id: &str,
+        probe_token: Option<&Arc<()>>,
         threshold: u32,
         cooldown: Duration,
     ) -> Option<BreakerOpened> {
         let mut modules = self.lock();
         let state = modules.entry(module_id.to_string()).or_default();
         let was_open = state.cooldown_until.is_some();
-        let was_probe = state.probe_in_flight;
-        state.probe_in_flight = false;
+        let was_probe = Self::owns_probe(state, probe_token);
+        if was_probe {
+            state.probe_in_flight = None;
+        }
         state.consecutive_timeouts = state.consecutive_timeouts.saturating_add(1);
         if state.consecutive_timeouts < threshold {
             return None;
@@ -674,9 +686,21 @@ impl RouteBindBreakers {
         })
     }
 
-    fn record_inconclusive(&self, module_id: &str) {
+    fn owns_probe(state: &ModuleBreakerState, token: Option<&Arc<()>>) -> bool {
+        // An old relay can settle after cooldown or after a reset and a new
+        // opening. Only the guard holding this probe's token may release it.
+        state
+            .probe_in_flight
+            .as_ref()
+            .zip(token)
+            .is_some_and(|(active, token)| Arc::ptr_eq(active, token))
+    }
+
+    fn record_inconclusive(&self, module_id: &str, probe_token: Option<&Arc<()>>) {
         if let Some(state) = self.lock().get_mut(module_id) {
-            state.probe_in_flight = false;
+            if Self::owns_probe(state, probe_token) {
+                state.probe_in_flight = None;
+            }
         }
     }
 
@@ -720,7 +744,7 @@ impl RouteBindBreakers {
                         "consecutive_timeouts": state.consecutive_timeouts,
                         "cooldown_remaining_ms":
                             cooldown_until.saturating_duration_since(now).as_millis() as u64,
-                        "probe_in_flight": state.probe_in_flight,
+                        "probe_in_flight": state.probe_in_flight.is_some(),
                     }),
                 ))
             })
@@ -7318,6 +7342,87 @@ mod tests {
             0,
             "a reserved capability refusal must not leave a catalog entry"
         );
+    }
+
+    #[test]
+    fn stale_relay_settlement_cannot_release_the_half_open_probe() {
+        for settlement in ["timeout", "inconclusive", "drop"] {
+            let breakers = RouteBindBreakers::default();
+            let RouteBindAdmission::Admitted {
+                guard: mut old,
+                probe: false,
+            } = breakers.admit("prov")
+            else {
+                panic!("ordinary relay admitted")
+            };
+            let RouteBindAdmission::Admitted {
+                guard: mut opener, ..
+            } = breakers.admit("prov")
+            else {
+                panic!("second relay admitted")
+            };
+            assert!(
+                !opener
+                    .record_timeout(1, Duration::ZERO)
+                    .unwrap()
+                    .reopened_after_probe
+            );
+            let RouteBindAdmission::Admitted {
+                guard: mut probe,
+                probe: true,
+            } = breakers.admit("prov")
+            else {
+                panic!("one cooldown probe admitted")
+            };
+            match settlement {
+                "timeout" => assert!(
+                    !old.record_timeout(1, Duration::ZERO)
+                        .unwrap()
+                        .reopened_after_probe
+                ),
+                "inconclusive" => old.record_inconclusive(),
+                "drop" => drop(old),
+                _ => unreachable!(),
+            }
+            assert!(
+                matches!(
+                    breakers.admit("prov"),
+                    RouteBindAdmission::Refused {
+                        probe_in_flight: true,
+                        ..
+                    }
+                ),
+                "{settlement} of a pre-open relay cannot release the real probe"
+            );
+            assert!(
+                probe
+                    .record_timeout(1, Duration::ZERO)
+                    .unwrap()
+                    .reopened_after_probe
+            );
+            assert!(matches!(
+                breakers.admit("prov"),
+                RouteBindAdmission::Admitted { probe: true, .. }
+            ));
+        }
+        let breakers = RouteBindBreakers::default();
+        let admit = || match breakers.admit("prov") {
+            RouteBindAdmission::Admitted { guard, .. } => guard,
+            _ => panic!("relay admitted"),
+        };
+        admit().record_timeout(1, Duration::ZERO);
+        let mut old_probe = admit();
+        breakers.reset_for_new_module_connection("prov");
+        admit().record_timeout(1, Duration::ZERO);
+        let _new_probe = admit();
+        old_probe.record_inconclusive();
+        assert!(matches!(
+            breakers.admit("prov"),
+            RouteBindAdmission::Refused {
+                probe_in_flight: true,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]

@@ -5,6 +5,7 @@
 - Reject reserved capability claims in `catalog.update` before changing active or swap-candidate registrations, using the same `reserved_capability` error as HELLO.
 - Module GOODBYE now performs disconnect teardown immediately, including requirement recomputation, route-closed client pushes and scope-sync authority release, without waiting for the socket to close.
 - Scope sync propagates parent refusals through direct dependencies and shares acyclic ancestor walks, avoiding cubic work on leaf-first scope chains.
+- Route-bind breaker probes now own a unique admission token; settling an older relay cannot release a newer probe or misreport it as a failed probe.
 
 ## 0.29.1 — 2026-10-02
 

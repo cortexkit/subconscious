@@ -1362,6 +1362,13 @@ impl ModuleProcessLiveness for SupervisorProcessLiveness {
     }
 }
 
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct ReloadExitRecordGate {
+    reached: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
+}
+
 #[derive(Debug, Clone, Copy)]
 enum RespawnKind {
     Spawn,
@@ -1411,6 +1418,8 @@ struct SupervisorRuntimeConfig {
     cgroup_placement: Option<subc_cgroup::Placement>,
     #[cfg(test)]
     test_seed_stale_facts_before_enable_spawn: bool,
+    #[cfg(test)]
+    test_reload_exit_record_gate: Option<Arc<ReloadExitRecordGate>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2544,6 +2553,8 @@ impl Supervisor {
             cgroup_placement: self.cgroup_placement.clone(),
             #[cfg(test)]
             test_seed_stale_facts_before_enable_spawn: false,
+            #[cfg(test)]
+            test_reload_exit_record_gate: None,
         }
     }
 
@@ -5319,8 +5330,15 @@ async fn finish_reload_child(
             if let Some(active_child) = child.as_mut() {
                 active_child.drain_stderr(&spec.module_id).await;
             }
-            *child = None;
-            handle_reload_child_registration_failure(
+            // Keep the reaped child's roster guard until its terminal is written.
+            // Shutdown waits on that guard, not on the child Option used for respawn.
+            let mut exited_child = child.take().expect("exited reload child is still stored");
+            #[cfg(test)]
+            if let Some(gate) = &runtime.test_reload_exit_record_gate {
+                gate.reached.notify_one();
+                gate.resume.notified().await;
+            }
+            let result = handle_reload_child_registration_failure(
                 spec,
                 runtime,
                 registry,
@@ -5332,7 +5350,9 @@ async fn finish_reload_child(
                     reason: "new child exited before registering".to_string(),
                 },
             )
-            .await
+            .await;
+            exited_child.release_roster();
+            result
         }
         RegistrationWaitOutcome::TimedOut => {
             let mut timed_out_child = child
@@ -8781,6 +8801,70 @@ mod terminal_history_tests {
         assert_eq!(history.entries.len(), 1, "{history:?}");
         assert_eq!(history.entries[0].exit_code, Some(0));
         assert_eq!(history.entries[0].disposition, TerminalDisposition::Stopped);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reload_exit_keeps_roster_until_terminal_is_recorded_during_shutdown() {
+        let dir = subc_test_support::TestTempDir::new("reload-roster-terminal-order");
+        let record = dir.join("live-children.json");
+        let supervisor = Supervisor::new(
+            Arc::new(Registry::default()),
+            RestartPolicy::new(0, Duration::ZERO),
+        );
+        let mut runtime = supervisor.runtime_config();
+        runtime.child_roster.record_to(record.clone());
+        let gate = Arc::new(super::ReloadExitRecordGate::default());
+        runtime.test_reload_exit_record_gate = Some(Arc::clone(&gate));
+        let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
+        let spec = ModuleSpec {
+            module_id: "reload-exit-roster".into(),
+            program: fake_aft_stub_path(),
+            args: Vec::new(),
+            env: vec![("FAKE_AFT_EXIT_CODE".into(), "23".into())],
+            reserved: false,
+            reserved_prefixes: Vec::new(),
+            protocol: ModuleProtocol::Subc,
+            overlap: Default::default(),
+        };
+        let mut child = None;
+        let reload = super::finish_reload_child(
+            &spec,
+            &runtime,
+            &supervisor.registry,
+            &supervisor.process_liveness,
+            &snapshot,
+            &mut child,
+        );
+        tokio::pin!(reload);
+        tokio::select! {
+            result = &mut reload => panic!("reload missed the before-record gate: {result:?}"),
+            _ = gate.reached.notified() => {}
+        }
+        assert!(runtime
+            .terminal_ring
+            .lock()
+            .unwrap()
+            .snapshot()
+            .entries
+            .is_empty());
+        assert_eq!(
+            crate::live_children::read_record(&record).unwrap().len(),
+            1,
+            "shutdown must still wait for the reaped child until its terminal record exists"
+        );
+        runtime.child_roster.close();
+        gate.resume.notify_one();
+        assert!(reload.await.is_err());
+        assert!(crate::live_children::read_record(&record)
+            .unwrap()
+            .is_empty());
+        let history = runtime.terminal_ring.lock().unwrap().snapshot();
+        assert_eq!(history.entries.len(), 1);
+        assert_eq!(
+            history.entries[0].disposition,
+            TerminalDisposition::DaemonShutdown
+        );
     }
 
     /// Each restart-producing arm has its own state transition. Keeping their

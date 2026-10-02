@@ -767,7 +767,7 @@ struct SupervisorSnapshot {
     pid: Option<u32>,
     /// Last reaped child, retained after current process facts are cleared.
     reaped_pid: Option<u32>,
-    /// Whether the command-serving supervision loop has a scheduled crash respawn.
+    /// Whether the command-serving supervision loop has a scheduled respawn.
     respawn_pending: bool,
     spawned_at_ms: Option<u64>,
     spawned_from: Option<PathBuf>,
@@ -1362,8 +1362,24 @@ impl ModuleProcessLiveness for SupervisorProcessLiveness {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum RespawnKind {
+    Spawn,
+    Reload,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PendingRespawn {
+    deadline: Instant,
+    kind: RespawnKind,
+}
+
 #[derive(Debug, Clone)]
 struct SupervisorRuntimeConfig {
+    /// Restart operations hand their backoff to the loop, which keeps serving commands.
+    scheduled_respawn: Arc<Mutex<Option<PendingRespawn>>>,
+    /// A reload acknowledges completion only after its replacement registers.
+    deferred_reload_reply: Arc<Mutex<Option<oneshot::Sender<Result<(), SuperviseError>>>>>,
     restart_policy: RestartPolicy,
     /// This module's RESOLVED drain budget: per-module config when present,
     /// else `default_drain_timeout`.
@@ -2497,6 +2513,8 @@ impl Supervisor {
     fn runtime_config(&self) -> SupervisorRuntimeConfig {
         let effective_drain_timeout = Arc::new(Mutex::new(self.drain_timeout));
         SupervisorRuntimeConfig {
+            scheduled_respawn: Arc::default(),
+            deferred_reload_reply: Arc::default(),
             restart_policy: self.restart_policy,
             drain_timeout: self.drain_timeout,
             // Shared with this module's roster copy: daemon shutdown waits on
@@ -4161,27 +4179,48 @@ async fn health_restart_child(
         Some(true),
     )
     .await?;
-    sleep(schedule.delay).await;
-    // The backoff may have outlasted the restart it was counting down to: an
-    // operator disable or drain in between moves the snapshot out of
-    // `Restarting`, and that stop must win over this respawn.
-    if !respawn_still_pending(snapshot) {
-        process_liveness.untrack_if_current(&spec.module_id, snapshot);
-        return Ok(());
+    schedule_respawn(
+        runtime,
+        snapshot,
+        &spec.module_id,
+        schedule.delay,
+        RespawnKind::Spawn,
+    )
+}
+
+fn cancel_deferred_reload(runtime: &SupervisorRuntimeConfig, module_id: &str, reason: &str) {
+    if let Some(reply) = runtime
+        .deferred_reload_reply
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .take()
+    {
+        let _ = reply.send(Err(SuperviseError::ReloadFailed {
+            module_id: module_id.to_string(),
+            reason: reason.to_string(),
+        }));
     }
-    process_liveness.track(spec.module_id.clone(), Arc::clone(snapshot));
-    match spawn_and_mark_running(spec, runtime, snapshot) {
-        Ok(next_child) => {
-            *child = Some(next_child);
-            Ok(())
-        }
-        Err(err) => {
-            fail_snapshot(snapshot, Some(&spec.module_id), None);
-            process_liveness.untrack_if_current(&spec.module_id, snapshot);
-            *child = None;
-            Err(err)
-        }
-    }
+}
+
+fn schedule_respawn(
+    runtime: &SupervisorRuntimeConfig,
+    snapshot: &SharedSnapshot,
+    module_id: &str,
+    delay: Duration,
+    kind: RespawnKind,
+) -> Result<(), SuperviseError> {
+    cancel_deferred_reload(runtime, module_id, "respawn superseded by another restart");
+    update_snapshot(snapshot, Some(module_id), |state| {
+        state.respawn_pending = true
+    })?;
+    *runtime
+        .scheduled_respawn
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = Some(PendingRespawn {
+        deadline: Instant::now() + delay,
+        kind,
+    });
+    Ok(())
 }
 
 fn record_health_action(snapshot: &SharedSnapshot, module_id: &str, action: String, now_ms: u64) {
@@ -4538,15 +4577,36 @@ async fn supervise_loop(
     mut commands: mpsc::Receiver<SupervisorCommand>,
 ) {
     let mut health_probe = HealthProbeRuntime::default();
-    // Deadline of the crash respawn whose backoff is currently elapsing. While
-    // it is set the loop serves commands instead of sleeping inside the exit
-    // arm, so a disable or drain lands immediately and cancels the respawn.
-    let mut pending_respawn: Option<Instant> = None;
+    // All restart backoffs run here, including health and operator requests.
+    // While one is pending the loop serves commands, so disable or drain can
+    // cancel the replacement without spawning a process just to stop it.
+    let mut pending_respawn: Option<PendingRespawn> = None;
     // Commands a swap handed back to run next (see `swap::SwapEnd`). Served
     // before anything else so a stop that interrupted a swap runs at once.
     let mut requeued: VecDeque<SupervisorCommand> = VecDeque::new();
     loop {
+        if let Some(scheduled) = runtime
+            .scheduled_respawn
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+        {
+            pending_respawn = Some(scheduled);
+        }
+        if pending_respawn.is_some() && (child.is_some() || !respawn_still_pending(&snapshot)) {
+            pending_respawn = None;
+            cancel_deferred_reload(
+                &runtime,
+                &spec.module_id,
+                "respawn cancelled by a supervisor command",
+            );
+        }
         if child.is_none() && pending_respawn.is_none() {
+            cancel_deferred_reload(
+                &runtime,
+                &spec.module_id,
+                "respawn cancelled before a replacement was spawned",
+            );
             let _ = update_snapshot(&snapshot, Some(&spec.module_id), |state| {
                 state.respawn_pending = false;
                 if matches!(
@@ -4666,7 +4726,7 @@ async fn supervise_loop(
                             // arrives during the backoff must cancel the pending
                             // respawn instead of waiting for it to spawn first.
                             child = None;
-                            pending_respawn = Some(Instant::now() + delay);
+                            pending_respawn = Some(PendingRespawn { deadline: Instant::now() + delay, kind: RespawnKind::Spawn });
                              let _ = update_snapshot(&snapshot, Some(&spec.module_id), |state| state.respawn_pending = true);
                         }
                     }
@@ -4705,9 +4765,9 @@ async fn supervise_loop(
                     }
                 }
             }
-        } else if let Some(deadline) = pending_respawn {
+        } else if let Some(pending) = pending_respawn {
             tokio::select! {
-                _ = sleep_until(deadline) => {
+                _ = sleep_until(pending.deadline) => {
                     pending_respawn = None;
                 let _ = update_snapshot(&snapshot, Some(&spec.module_id), |state| state.respawn_pending = false);
                     // A command handled below while the backoff elapsed may
@@ -4738,6 +4798,13 @@ async fn supervise_loop(
                         continue;
                     }
 
+                    if matches!(pending.kind, RespawnKind::Reload) {
+                        let reply = runtime.deferred_reload_reply.lock().unwrap_or_else(|p| p.into_inner()).take();
+                        let result = finish_reload_child(&spec, &runtime, &registry, &process_liveness, &snapshot, &mut child).await;
+                        if let Some(reply) = reply { let _ = reply.send(result); }
+                        continue;
+                    }
+                    process_liveness.track(spec.module_id.clone(), Arc::clone(&snapshot));
                     match spawn_and_mark_running(&spec, &runtime, &snapshot) {
                         Ok(next_child) => {
                             child = Some(next_child);
@@ -4768,7 +4835,7 @@ async fn supervise_loop(
                         return;
                     }
                     // Reconcile the pending respawn with what the command did:
-                    // a restart or reload has already spawned a fresh child,
+                    // a start may already have spawned a fresh child,
                     // while a disable or drain moved the snapshot out of the
                     // state the respawn was counting down from.
                     if child.is_some() || !respawn_still_pending(&snapshot) {
@@ -4995,7 +5062,21 @@ async fn handle_supervisor_command(
         SupervisorCommand::Reload { reply } => {
             let result =
                 reload_child(spec, runtime, registry, process_liveness, snapshot, child).await;
-            let _ = reply.send(result);
+            if result.is_ok()
+                && runtime
+                    .scheduled_respawn
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .as_ref()
+                    .is_some_and(|pending| matches!(pending.kind, RespawnKind::Reload))
+            {
+                *runtime
+                    .deferred_reload_reply
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner()) = Some(reply);
+            } else {
+                let _ = reply.send(result);
+            }
             true
         }
         SupervisorCommand::SetEnabled { enabled, reply } => {
@@ -5116,32 +5197,14 @@ async fn restart_child(
     }
 
     reset_restart_count(snapshot, &spec.module_id)?;
-    sleep(runtime.restart_policy.backoff).await;
-    // A disable or drain that landed during the backoff cancels this respawn:
-    // the operator's stop must win over the restart the sleep counted down to.
-    if !respawn_still_pending(snapshot) {
-        process_liveness.untrack_if_current(&spec.module_id, snapshot);
-        return Ok(());
-    }
     process_liveness.track(spec.module_id.clone(), Arc::clone(snapshot));
-    // Mirror health_restart_child's spawn-failure handling: of the four
-    // spawn-failure sites this was the only one that propagated with the
-    // snapshot still reading `Restarting` -- neither running nor failed, and
-    // unrevivable by `set_enabled(true)` (issue #34). `Failed` is the state the
-    // operator can see and heal.
-    match spawn_and_mark_running(spec, runtime, snapshot) {
-        Ok(next_child) => {
-            *child = Some(next_child);
-            debug!(module_id = %spec.module_id, "supervised module restarted by operator request");
-            Ok(())
-        }
-        Err(err) => {
-            fail_snapshot(snapshot, Some(&spec.module_id), None);
-            process_liveness.untrack_if_current(&spec.module_id, snapshot);
-            *child = None;
-            Err(err)
-        }
-    }
+    schedule_respawn(
+        runtime,
+        snapshot,
+        &spec.module_id,
+        runtime.restart_policy.backoff,
+        RespawnKind::Spawn,
+    )
 }
 
 async fn reload_child(
@@ -5200,13 +5263,24 @@ async fn reload_child(
     }
 
     reset_restart_count(snapshot, &spec.module_id)?;
-    sleep(runtime.restart_policy.backoff).await;
-    // A disable or drain that landed during the backoff cancels this respawn:
-    // the operator's stop must win over the restart the sleep counted down to.
-    if !respawn_still_pending(snapshot) {
-        process_liveness.untrack_if_current(&spec.module_id, snapshot);
-        return Ok(());
-    }
+    process_liveness.track(spec.module_id.clone(), Arc::clone(snapshot));
+    schedule_respawn(
+        runtime,
+        snapshot,
+        &spec.module_id,
+        runtime.restart_policy.backoff,
+        RespawnKind::Reload,
+    )
+}
+
+async fn finish_reload_child(
+    spec: &ModuleSpec,
+    runtime: &SupervisorRuntimeConfig,
+    registry: &Registry,
+    process_liveness: &SupervisorProcessLiveness,
+    snapshot: &SharedSnapshot,
+    child: &mut Option<SupervisedChild>,
+) -> Result<(), SuperviseError> {
     process_liveness.track(spec.module_id.clone(), Arc::clone(snapshot));
     let next_child = match spawn_and_mark_running(spec, runtime, snapshot) {
         Ok(next_child) => next_child,
@@ -7207,7 +7281,7 @@ async fn handle_reload_child_registration_failure(
     registry: &Registry,
     process_liveness: &SupervisorProcessLiveness,
     snapshot: &SharedSnapshot,
-    child: &mut Option<SupervisedChild>,
+    _child: &mut Option<SupervisedChild>,
     failure: ReloadRegistrationFailure,
 ) -> Result<(), SuperviseError> {
     let ReloadRegistrationFailure {
@@ -7240,46 +7314,15 @@ async fn handle_reload_child_registration_failure(
             if let Some(schedule) = schedule {
                 log_crash_respawn(&spec.module_id, schedule);
             }
-            sleep(delay).await;
-            // A disable or drain that landed during the backoff cancels this
-            // policy retry: the operator's stop must win over the respawn the
-            // sleep counted down to.
-            if respawn_still_pending(snapshot) {
-                if let Err(err) = release_dead_registration(
-                    registry,
-                    runtime.forwarding.as_deref(),
-                    snapshot,
-                    &spec.module_id,
-                )
-                .await
-                {
-                    fail_snapshot(snapshot, Some(&spec.module_id), None);
-                    process_liveness.untrack_if_current(&spec.module_id, snapshot);
-                    return Err(SuperviseError::ReloadFailed {
-                        module_id: spec.module_id.clone(),
-                        reason: format!(
-                            "{reason}; registration did not release before policy retry: {err}"
-                        ),
-                    });
-                }
-                process_liveness.track(spec.module_id.clone(), Arc::clone(snapshot));
-                match spawn_and_mark_running(spec, runtime, snapshot) {
-                    Ok(next_child) => {
-                        *child = Some(next_child);
-                    }
-                    Err(err) => {
-                        fail_snapshot(snapshot, Some(&spec.module_id), None);
-                        process_liveness.untrack_if_current(&spec.module_id, snapshot);
-                        return Err(SuperviseError::ReloadFailed {
-                            module_id: spec.module_id.clone(),
-                            reason: format!("{reason}; policy retry spawn failed: {err}"),
-                        });
-                    }
-                }
-            }
+            schedule_respawn(
+                runtime,
+                snapshot,
+                &spec.module_id,
+                delay,
+                RespawnKind::Spawn,
+            )?;
         }
     }
-
     Err(SuperviseError::ReloadFailed {
         module_id: spec.module_id.clone(),
         reason,
@@ -7291,49 +7334,35 @@ async fn handle_reload_spawn_failure(
     runtime: &SupervisorRuntimeConfig,
     process_liveness: &SupervisorProcessLiveness,
     snapshot: &SharedSnapshot,
-    child: &mut Option<SupervisedChild>,
+    _child: &mut Option<SupervisedChild>,
     reason: String,
 ) -> Result<(), SuperviseError> {
-    let mut should_retry = false;
     let now = Instant::now();
+    let mut schedule = None;
     update_snapshot(snapshot, Some(&spec.module_id), |state| {
         clear_current_process_facts(state);
-        if daemon_will_restart(state, &runtime.restart_policy, now) {
-            state.record_crash_restart(&runtime.restart_policy, now);
-            state.state = ModuleState::Restarting;
-            should_retry = true;
-        } else if state.enabled {
-            state.state = ModuleState::Failed;
+        if state.enabled {
+            schedule = state.next_crash_restart(&runtime.restart_policy, now);
+            state.state = if schedule.is_some() {
+                ModuleState::Restarting
+            } else {
+                ModuleState::Failed
+            };
         } else {
             state.state = ModuleState::Disabled;
         }
     })?;
-
-    if should_retry {
-        sleep(runtime.restart_policy.backoff).await;
-        // A disable or drain that landed during the backoff cancels this
-        // policy retry: the operator's stop must win over the respawn the
-        // sleep counted down to.
-        if respawn_still_pending(snapshot) {
-            process_liveness.track(spec.module_id.clone(), Arc::clone(snapshot));
-            match spawn_and_mark_running(spec, runtime, snapshot) {
-                Ok(next_child) => {
-                    *child = Some(next_child);
-                }
-                Err(err) => {
-                    fail_snapshot(snapshot, Some(&spec.module_id), None);
-                    process_liveness.untrack_if_current(&spec.module_id, snapshot);
-                    return Err(SuperviseError::ReloadFailed {
-                        module_id: spec.module_id.clone(),
-                        reason: format!("{reason}; policy retry spawn failed: {err}"),
-                    });
-                }
-            }
-        }
+    if let Some(schedule) = schedule {
+        schedule_respawn(
+            runtime,
+            snapshot,
+            &spec.module_id,
+            schedule.delay,
+            RespawnKind::Spawn,
+        )?;
     } else {
         process_liveness.untrack_if_current(&spec.module_id, snapshot);
     }
-
     Err(SuperviseError::ReloadFailed {
         module_id: spec.module_id.clone(),
         reason,
@@ -8817,8 +8846,11 @@ mod terminal_history_tests {
                 2,
             )
             .await,
-            Err(SuperviseError::Spawn { .. })
+            Ok(())
         ));
+        assert!(health_child.is_none());
+        assert!(lock_snapshot(&health_snapshot).unwrap().respawn_pending);
+        assert!(runtime.scheduled_respawn.lock().unwrap().take().is_some());
         let (health_restarts, health_lifetime) = {
             let state = lock_snapshot(&health_snapshot).unwrap();
             (state.crash_restarts.len(), state.lifetime_restarts)

@@ -77,6 +77,119 @@ async fn spawn_registers_stub_and_reports_running() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn disable_during_operator_restart_backoff_cancels_respawn() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor(&server, 3, Duration::from_secs(2))
+        .with_forwarding(Arc::clone(&server.forwarding));
+    let module = spawn_stub(&server, &supervisor, "fake-aft-cancel-operator-backoff").await;
+    let generation = module.status().unwrap().spawn_generation;
+    module.restart(None).await.unwrap();
+    wait_for_status(&module, Duration::from_secs(3), |status| {
+        status.state == ModuleState::Restarting && !status.process_alive
+    })
+    .await;
+    timeout(Duration::from_millis(500), module.set_enabled(false))
+        .await
+        .expect("disable must be served during the backoff, not after respawn")
+        .unwrap();
+    sleep(Duration::from_millis(2200)).await;
+    let stopped = module.status().unwrap();
+    assert_eq!(stopped.state, ModuleState::Disabled);
+    assert_eq!(stopped.spawn_generation, generation);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn disable_during_health_restart_backoff_cancels_respawn() {
+    assert_disable_cancels_backoff("health").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn disable_during_reload_backoff_cancels_respawn() {
+    assert_disable_cancels_backoff("reload").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn disable_during_reload_registration_retry_backoff_cancels_respawn() {
+    assert_disable_cancels_backoff("registration-retry").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn disable_during_reload_spawn_retry_backoff_cancels_respawn() {
+    assert_disable_cancels_backoff("spawn-retry").await;
+}
+
+async fn assert_disable_cancels_backoff(kind: &str) {
+    let server = TestServer::start().await;
+    let supervisor = supervisor(&server, 3, Duration::from_secs(2))
+        .with_forwarding(Arc::clone(&server.forwarding))
+        .with_health_config(subc_daemon::HealthConfig {
+            cadence: Duration::from_millis(50),
+            deadline: Duration::from_millis(50),
+            failure_threshold: 1,
+            ..Default::default()
+        });
+    let marker = server.temp_dir.join("first-process");
+    let mut spec = stub_spec(&server, &format!("fake-aft-cancel-{kind}"), []);
+    if kind == "health" {
+        spec.env.extend([
+            ("FAKE_AFT_ADVERTISE_HEALTH".into(), "1".into()),
+            (
+                "FAKE_AFT_HEALTH_NEVER_REPLY_FIRST_PATH".into(),
+                marker.display().to_string(),
+            ),
+        ]);
+    } else if kind == "registration-retry" {
+        spec.env.push((
+            "FAKE_AFT_FAIL_REGISTRATION_AFTER_FIRST_PATH".into(),
+            marker.display().to_string(),
+        ));
+    } else if kind == "spawn-retry" {
+        let copy = server.temp_dir.join("copied-stub");
+        std::fs::copy(&spec.program, &copy).unwrap();
+        spec.program = copy;
+    }
+    let module = Arc::new(supervisor.spawn(spec.clone()).unwrap());
+    wait_for_registration(&server.registry, &spec.module_id, Duration::from_secs(10)).await;
+    let reload = if kind != "health" {
+        if kind == "spawn-retry" {
+            std::fs::remove_file(&spec.program).unwrap();
+        }
+        let module = Arc::clone(&module);
+        Some(tokio::spawn(async move { module.reload().await }))
+    } else {
+        None
+    };
+    let retry = kind.ends_with("retry");
+    let pending = wait_for_status(&module, Duration::from_secs(5), |status| {
+        status.state == ModuleState::Restarting
+            && !status.process_alive
+            && (!retry || status.restart_count > 0)
+    })
+    .await;
+    timeout(Duration::from_millis(500), module.set_enabled(false))
+        .await
+        .unwrap_or_else(|_| panic!("disable blocked by {kind} backoff"))
+        .unwrap();
+    if let Some(reload) = reload {
+        assert!(
+            timeout(Duration::from_secs(1), reload)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err(),
+            "cancelled or failed reload must not acknowledge success"
+        );
+    }
+    sleep(Duration::from_millis(2200)).await;
+    let stopped = module.status().unwrap();
+    assert_eq!(stopped.state, ModuleState::Disabled);
+    assert_eq!(
+        stopped.spawn_generation, pending.spawn_generation,
+        "{kind} respawned despite disable"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn health_budget_exhaustion_is_failed_with_budget_detail_and_start_revives() {
     let server = TestServer::start().await;
     let supervisor = supervisor(&server, 0, Duration::from_millis(10))

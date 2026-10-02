@@ -4,8 +4,8 @@ pub mod consumer;
 pub mod policy_cache;
 pub use consumer::{
     is_retryable_route_open_code, CallError, CallOptions, CatalogList, CloseRouteOptions,
-    ConnectionState, ConsumerError, ConsumerOptions, ControlPush, PushEvent, RetryBackoff,
-    ReverseRequestContext, ReverseRequestError, ReverseRequestRegistrationError,
+    ConnectionState, ConsumerError, ConsumerOptions, ControlPush, OutcomeUnknownCause, PushEvent,
+    RetryBackoff, ReverseRequestContext, ReverseRequestError, ReverseRequestRegistrationError,
     ReverseRequestRegistry, RouteCloseDisposition, RouteCloseReason, RouteEndReason,
     RoutePollResult, ScopeSelector, SpawnStreamError, SpawnSubscription, SubcConsumer,
     SubscribeOptions, Subscription, SubscriptionClosed, DEFAULT_CALL_TIMEOUT,

@@ -1813,7 +1813,7 @@ dependencies = [
 
 [[package]]
 name = "subc-client-rs"
-version = "0.25.0"
+version = "0.25.1"
 dependencies = [
  "async-trait",
  "serde",
@@ -1824,6 +1824,7 @@ dependencies = [
  "subc-protocol",
  "subc-test-support",
  "subc-transport",
+ "syn 2.0.118",
  "tokio",
  "tokio-util",
  "tracing",

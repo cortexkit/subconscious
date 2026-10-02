@@ -882,6 +882,7 @@ impl Future for SubscriptionClosed {
             Poll::Ready(Ok(result)) => Poll::Ready(result),
             Poll::Ready(Err(_)) => Poll::Ready(Err(CallError::outcome_unknown(
                 "subscription closed result channel dropped",
+                OutcomeUnknownCause::CompletionFailed,
             ))),
             Poll::Pending => Poll::Pending,
         }
@@ -1919,6 +1920,38 @@ impl Error for ConsumerError {
     }
 }
 
+/// Why a sent request has no observed terminal response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum OutcomeUnknownCause {
+    /// The reply deadline elapsed after the request was sent.
+    Deadline,
+    /// The connection's writer closed or failed after send.
+    WriterClosed,
+    /// The caller closed the consumer while a request was pending.
+    ConsumerClosed,
+    /// The daemon connection failed or dropped.
+    ConnectionFailed,
+    /// The route ended; [`CallError::close_reason`] gives its reason.
+    RouteEnded,
+    /// An internal completion channel dropped or an unexpected completion arrived.
+    CompletionFailed,
+}
+
+#[derive(Debug, Clone)]
+struct OutcomeUnknownSource {
+    message: String,
+    cause: OutcomeUnknownCause,
+    route_reason: Option<RouteEndReason>,
+}
+
+impl fmt::Display for OutcomeUnknownSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+impl Error for OutcomeUnknownSource {}
+
 /// Managed call or subscription failure.
 #[derive(Debug)]
 pub enum CallError {
@@ -1954,7 +1987,24 @@ impl CallError {
         match self {
             Self::NotSent(source) | Self::OutcomeUnknown(source) => source
                 .downcast_ref::<RouteEnded>()
-                .map(|ended| &ended.reason),
+                .map(|ended| &ended.reason)
+                .or_else(|| {
+                    source
+                        .downcast_ref::<OutcomeUnknownSource>()?
+                        .route_reason
+                        .as_ref()
+                }),
+            _ => None,
+        }
+    }
+
+    /// Why the outcome is unknown, without parsing the error's message.
+    /// Errors constructed outside this crate with an untyped source return `None`.
+    pub fn outcome_cause(&self) -> Option<OutcomeUnknownCause> {
+        match self {
+            Self::OutcomeUnknown(source) => source
+                .downcast_ref::<OutcomeUnknownSource>()
+                .map(|source| source.cause),
             _ => None,
         }
     }
@@ -1977,8 +2027,16 @@ impl CallError {
         Self::NotSent(Box::new(SimpleError(reason.into())))
     }
 
-    fn outcome_unknown(reason: impl Into<String>) -> Self {
-        Self::OutcomeUnknown(Box::new(SimpleError(reason.into())))
+    fn outcome_unknown(reason: impl Into<String>, cause: OutcomeUnknownCause) -> Self {
+        Self::outcome_unknown_source(OutcomeUnknownSource {
+            message: reason.into(),
+            cause,
+            route_reason: None,
+        })
+    }
+
+    fn outcome_unknown_source(source: OutcomeUnknownSource) -> Self {
+        Self::OutcomeUnknown(Box::new(source))
     }
 
     fn is_not_sent(&self) -> bool {
@@ -3232,6 +3290,7 @@ impl Shared {
                 return Err(classify_failure(
                     accepted,
                     "writer task closed before accepting request",
+                    OutcomeUnknownCause::WriterClosed,
                 ));
             }
             Err(_) => {
@@ -3265,12 +3324,13 @@ impl Shared {
                     Err(classify_failure(
                         accepted,
                         format!("request on channel {channel} timed out at its deadline"),
+                        OutcomeUnknownCause::Deadline,
                     ))
                 }
             },
             () = self.close_token.cancelled() => {
                 let accepted = registration.remove_pending().unwrap_or(false);
-                Err(classify_failure(accepted, "consumer closed while request was pending"))
+                Err(classify_failure(accepted, "consumer closed while request was pending", OutcomeUnknownCause::ConsumerClosed))
             }
         }
     }
@@ -3499,6 +3559,7 @@ impl Shared {
                 return Err(classify_failure(
                     accepted,
                     "writer task closed before accepting subscription request",
+                    OutcomeUnknownCause::WriterClosed,
                 ));
             }
             Err(_) => {
@@ -3746,6 +3807,19 @@ impl Shared {
     }
 
     fn handle_generation_drop(self: &Arc<Self>, generation: u64, reason: String) {
+        self.handle_generation_drop_with_cause(
+            generation,
+            reason,
+            OutcomeUnknownCause::ConnectionFailed,
+        );
+    }
+
+    fn handle_generation_drop_with_cause(
+        self: &Arc<Self>,
+        generation: u64,
+        reason: String,
+        cause: OutcomeUnknownCause,
+    ) {
         let (should_emit, pending, openings, callbacks) = {
             let mut inner = self.lock_inner();
             if inner.closed || inner.generation != generation || inner.writer.is_none() {
@@ -3765,7 +3839,12 @@ impl Shared {
         };
 
         if should_emit {
-            settle_route_pending_entries(pending, reason.clone(), RouteEndReason::ConnectionLost);
+            settle_route_pending_entries_with_cause(
+                pending,
+                reason.clone(),
+                RouteEndReason::ConnectionLost,
+                cause,
+            );
             fail_openings(openings, SharedCallFailure::not_sent(reason.clone()));
             emit_callbacks(callbacks, ConnectionState::Dropped);
             self.notify.notify_waiters();
@@ -4429,7 +4508,7 @@ impl SharedCallFailure {
         match (self.kind, self.refusal) {
             (FailureKind::NotSent, Some(refused)) => CallError::NotSent(Box::new(refused)),
             (FailureKind::NotSent, None) => CallError::not_sent(self.message),
-            (FailureKind::OutcomeUnknown, _) => CallError::outcome_unknown(self.message),
+            (FailureKind::OutcomeUnknown(source), _) => CallError::outcome_unknown_source(source),
         }
     }
 }
@@ -4443,12 +4522,27 @@ impl From<CallError> for SharedCallFailure {
                 refusal: err.downcast_ref::<RouteOpenRefused>().cloned(),
             },
             CallError::OutcomeUnknown(err) => Self {
-                kind: FailureKind::OutcomeUnknown,
+                kind: FailureKind::OutcomeUnknown(
+                    err.downcast_ref::<OutcomeUnknownSource>()
+                        .cloned()
+                        .unwrap_or_else(|| OutcomeUnknownSource {
+                            message: err.to_string(),
+                            cause: OutcomeUnknownCause::CompletionFailed,
+                            route_reason: None,
+                        }),
+                ),
                 message: err.to_string(),
                 refusal: None,
             },
             CallError::Module(body) => Self {
-                kind: FailureKind::OutcomeUnknown,
+                kind: FailureKind::OutcomeUnknown(OutcomeUnknownSource {
+                    message: format!(
+                        "unexpected module error during route.open: {} ({})",
+                        body.code, body.message
+                    ),
+                    cause: OutcomeUnknownCause::CompletionFailed,
+                    route_reason: None,
+                }),
                 message: format!(
                     "unexpected module error during route.open: {} ({})",
                     body.code, body.message
@@ -4456,7 +4550,11 @@ impl From<CallError> for SharedCallFailure {
                 refusal: None,
             },
             CallError::SubscriptionBackpressure(err) => Self {
-                kind: FailureKind::OutcomeUnknown,
+                kind: FailureKind::OutcomeUnknown(OutcomeUnknownSource {
+                    message: err.to_string(),
+                    cause: OutcomeUnknownCause::CompletionFailed,
+                    route_reason: None,
+                }),
                 message: err.to_string(),
                 refusal: None,
             },
@@ -4476,10 +4574,10 @@ impl From<CallError> for SharedCallFailure {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum FailureKind {
     NotSent,
-    OutcomeUnknown,
+    OutcomeUnknown(OutcomeUnknownSource),
 }
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
@@ -4598,7 +4696,11 @@ impl PendingEntry {
 
     fn settle_failure(self, reason: String) {
         let accepted = self.accepted;
-        self.settle_call_error(classify_failure(accepted, reason));
+        self.settle_call_error(classify_failure(
+            accepted,
+            reason,
+            OutcomeUnknownCause::ConsumerClosed,
+        ));
     }
 
     fn settle_call_error(self, err: CallError) {
@@ -4682,7 +4784,11 @@ impl PendingResult {
         match self {
             Self::Terminal(terminal) => Ok(terminal.into_terminal_frame()),
             Self::CallError(err) => Err(err),
-            Self::Failure { accepted, reason } => Err(classify_failure(accepted, reason)),
+            Self::Failure { accepted, reason } => Err(classify_failure(
+                accepted,
+                reason,
+                OutcomeUnknownCause::CompletionFailed,
+            )),
         }
     }
 }
@@ -5153,7 +5259,11 @@ async fn writer_loop<W>(
             }
         }
         if let Err(err) = write_frame(&mut writer, &command.frame).await {
-            shared.handle_generation_drop(generation, err.to_string());
+            shared.handle_generation_drop_with_cause(
+                generation,
+                err.to_string(),
+                OutcomeUnknownCause::WriterClosed,
+            );
             return;
         }
         while let Ok(command) = rx.try_recv() {
@@ -5163,12 +5273,20 @@ async fn writer_loop<W>(
                 }
             }
             if let Err(err) = write_frame(&mut writer, &command.frame).await {
-                shared.handle_generation_drop(generation, err.to_string());
+                shared.handle_generation_drop_with_cause(
+                    generation,
+                    err.to_string(),
+                    OutcomeUnknownCause::WriterClosed,
+                );
                 return;
             }
         }
         if let Err(err) = writer.flush().await.map_err(FrameIoError::Io) {
-            shared.handle_generation_drop(generation, err.to_string());
+            shared.handle_generation_drop_with_cause(
+                generation,
+                err.to_string(),
+                OutcomeUnknownCause::WriterClosed,
+            );
             return;
         }
     }
@@ -5300,9 +5418,13 @@ fn request_not_sent_after_route_open_failure(err: CallError) -> CallError {
     }
 }
 
-fn classify_failure(accepted: bool, reason: impl Into<String>) -> CallError {
+fn classify_failure(
+    accepted: bool,
+    reason: impl Into<String>,
+    cause: OutcomeUnknownCause,
+) -> CallError {
     if accepted {
-        CallError::outcome_unknown(reason)
+        CallError::outcome_unknown(reason, cause)
     } else {
         CallError::not_sent(reason)
     }
@@ -5313,13 +5435,31 @@ fn settle_route_pending_entries(
     message: String,
     reason: RouteEndReason,
 ) {
+    let cause = if reason == RouteEndReason::ConnectionLost {
+        OutcomeUnknownCause::ConnectionFailed
+    } else {
+        OutcomeUnknownCause::RouteEnded
+    };
+    settle_route_pending_entries_with_cause(entries, message, reason, cause);
+}
+
+fn settle_route_pending_entries_with_cause(
+    entries: Vec<PendingEntry>,
+    message: String,
+    reason: RouteEndReason,
+    cause: OutcomeUnknownCause,
+) {
     for entry in entries {
         let source = Box::new(RouteEnded {
             message: message.clone(),
             reason: reason.clone(),
         });
         let err = if entry.accepted {
-            CallError::OutcomeUnknown(source)
+            CallError::outcome_unknown_source(OutcomeUnknownSource {
+                message: source.message.clone(),
+                cause,
+                route_reason: Some(reason.clone()),
+            })
         } else {
             CallError::NotSent(source)
         };
@@ -5970,13 +6110,62 @@ mod tests {
             .into_call_result()
             .unwrap_err();
         assert!(matches!(accepted_error, CallError::OutcomeUnknown(_)));
+        assert_eq!(
+            accepted_error.outcome_cause(),
+            Some(OutcomeUnknownCause::WriterClosed)
+        );
         let not_sent_error = not_sent_rx
             .await
             .expect("the unwritten request should be settled")
             .into_call_result()
             .unwrap_err();
         assert!(matches!(not_sent_error, CallError::NotSent(_)));
+        assert_eq!(not_sent_error.outcome_cause(), None);
         shared.close_sync("test complete");
+    }
+
+    #[tokio::test]
+    async fn consumer_close_attaches_outcome_cause_to_pending_call() {
+        let shared = writer_test_shared();
+        let (writer, _writer_rx) = mpsc::channel(1);
+        shared.lock_inner().writer = Some(writer);
+        let (tx, rx) = oneshot::channel();
+        let mut entry = PendingEntry::unary(tx, false, None, None);
+        entry.accepted = true;
+        shared.lock_inner().pending.insert(
+            PendingKey {
+                generation: 1,
+                channel: 3,
+                epoch: 1,
+                corr: 1,
+            },
+            entry,
+        );
+        let consumer = SubcConsumer { shared };
+        consumer.close().await;
+        let err = rx.await.unwrap().into_call_result().unwrap_err();
+        assert_eq!(
+            err.outcome_cause(),
+            Some(OutcomeUnknownCause::ConsumerClosed)
+        );
+        assert_eq!(err.to_string(), "request outcome unknown: consumer closed");
+        assert_eq!(err.close_reason(), None);
+    }
+
+    #[tokio::test]
+    async fn subscription_completion_drop_attaches_outcome_cause() {
+        let (tx, rx) = oneshot::channel();
+        let closed = SubscriptionClosed { rx };
+        drop(tx);
+        let err = closed.await.unwrap_err();
+        assert_eq!(
+            err.outcome_cause(),
+            Some(OutcomeUnknownCause::CompletionFailed)
+        );
+        assert_eq!(
+            err.to_string(),
+            "request outcome unknown: subscription closed result channel dropped"
+        );
     }
 
     #[test]
@@ -6160,6 +6349,16 @@ mod tests {
             }
             let err = rx.await.unwrap().into_call_result().err().unwrap();
             assert!(matches!(err, CallError::OutcomeUnknown(_)));
+            assert_eq!(
+                err.outcome_cause(),
+                Some(if local {
+                    OutcomeUnknownCause::RouteEnded
+                } else {
+                    OutcomeUnknownCause::ConnectionFailed
+                })
+            );
+            let shared_failure = SharedCallFailure::from(err);
+            let err = shared_failure.into_call_error();
             assert_eq!(
                 err.close_reason(),
                 Some(&if local {

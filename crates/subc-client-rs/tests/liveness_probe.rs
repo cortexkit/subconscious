@@ -12,7 +12,9 @@ use std::{
 };
 use subc_test_support::TestTempDir;
 
-use subc_client_rs::{CallError, CallOptions, ConsumerOptions, RetryBackoff, SubcConsumer};
+use subc_client_rs::{
+    CallError, CallOptions, ConsumerOptions, OutcomeUnknownCause, RetryBackoff, SubcConsumer,
+};
 use subc_control::{ClientControlRequest, ClientControlResponse};
 use subc_protocol::{BindIdentity, Flags, Frame, FrameType, Priority, RouteTarget};
 use subc_transport::{
@@ -73,6 +75,8 @@ async fn liveness_probe_convicts_half_open_socket_and_next_call_recovers() {
         .await
         .expect_err("the deaf connection must time out after accepting the data frame");
     assert!(matches!(first, CallError::OutcomeUnknown(_)));
+    assert_eq!(first.outcome_cause(), Some(OutcomeUnknownCause::Deadline));
+    assert_eq!(first.close_reason(), None);
 
     // The first connection remains open at the TCP layer but answers no Ping. Let the
     // probe convict it before the next call proves the regular reconnect path recovers.

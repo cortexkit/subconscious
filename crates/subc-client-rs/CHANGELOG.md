@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.25.1 — 2026-10-02
+
+- Add non-exhaustive `OutcomeUnknownCause` and `CallError::outcome_cause()` through typed error sources. Reply deadlines, writer failures, consumer closure, connection loss, route ends, and internal completion failures can be distinguished without matching `OutcomeUnknown` error message text. Existing error variants, message text, retry classes, and route-end reasons are preserved.
+
 ## 0.25.0 — 2026-10-02
 
 - Add non-exhaustive `RouteEndReason` and `CallError::close_reason()` without changing existing error variants or retry classes. Reasons follow named channels, with module fallback only for legacy pushes lacking channels; reused channels clear their history.

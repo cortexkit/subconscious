@@ -18,10 +18,11 @@ use serde_json::{json, Value};
 use subc_client_rs::{
     async_trait, serve_with_handle, BindDecision, CallError, CallOptions, CatalogUpdateError,
     CloseRouteOptions, ConsumerIdentity, ConsumerOptions, HandlerOutcome, ModuleHandle,
-    ModuleHandler, PolicyResolveError, PolicyResolver, PolicyResolverConfig, PolicyVerdict,
-    ProjectRef, RequestCtx, RetryBackoff, ReverseRequestRegistrationError, RouteBindRequest,
-    RouteCloseDisposition, RouteCloseReason, RouteEndReason, RouteHandle, ScopeCallError,
-    ScopeDescribeReply, ScopeSelector, SubcConsumer, SubcModuleError, Subject, SubscribeOptions,
+    ModuleHandler, OutcomeUnknownCause, PolicyResolveError, PolicyResolver, PolicyResolverConfig,
+    PolicyVerdict, ProjectRef, RequestCtx, RetryBackoff, ReverseRequestRegistrationError,
+    RouteBindRequest, RouteCloseDisposition, RouteCloseReason, RouteEndReason, RouteHandle,
+    ScopeCallError, ScopeDescribeReply, ScopeSelector, SubcConsumer, SubcModuleError, Subject,
+    SubscribeOptions,
 };
 use subc_control::{ClientControlRequest, ClientControlResponse, PollKind};
 use subc_protocol::{
@@ -3788,6 +3789,7 @@ async fn scoped_route_close_names_only_its_channel_and_restart_names_all_remaini
         .unwrap()
         .unwrap_err();
     assert!(matches!(err, CallError::OutcomeUnknown(_)), "{err}");
+    assert_eq!(err.outcome_cause(), Some(OutcomeUnknownCause::RouteEnded));
     assert_eq!(
         err.close_reason(),
         Some(&RouteEndReason::Daemon(RouteCloseReason::ScopeEnded))

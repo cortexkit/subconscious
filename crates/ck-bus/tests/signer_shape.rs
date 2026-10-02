@@ -519,6 +519,10 @@ fn vault_relay_child() {
     harness::issuance::participant_child_entry();
 }
 
+// Unix only: the relay is launched through `/bin/sh`, and the pipe-only launch
+// secret it proves is a Unix delivery. The other relay arms need nats-server or
+// a real claustrum and skip without them; this one needs neither.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn vault_relay_uses_its_supervised_identity_for_vault_calls() {
     let _gate = harness::acceptance_gate().await;

@@ -7253,7 +7253,10 @@ async fn upgrade_command(
             .filter_map(|outcome| match outcome {
                 setup::PlanOutcome::UpgradeAvailable {
                     target, from, to, ..
-                } => Some(format!("{target} {from} → {to}. Run ck upgrade.")),
+                } => Some(format!(
+                    "{}. Run ck upgrade.",
+                    setup::version_transition(&target.to_string(), from, to)
+                )),
                 _ => None,
             })
             .collect::<Vec<_>>();

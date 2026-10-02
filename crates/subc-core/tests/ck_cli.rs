@@ -1381,6 +1381,35 @@ fn upgrade_and_check_say_everything_is_current_in_one_line() {
 }
 
 #[test]
+fn upgrade_check_names_a_version_exempt_release_without_a_double_space() {
+    let fixture = UpgradeFixture::new("ck-upgrade-exempt-check");
+    let index = serve_signed_index(|base| {
+        let (mut index, assets) = upgrade_index(
+            base,
+            "0.55.1",
+            &"22".repeat(32),
+            "0.17.9",
+            &"44".repeat(32),
+            "0.8.0",
+            &"55".repeat(32),
+        );
+        let asset = &mut index["components"]["core"]["assets"][host_target()]["ck-subc-mcp"];
+        asset["sha256"] = json!("aa".repeat(32));
+        asset["reports"] = Value::Null;
+        (index, assets)
+    });
+    let output = fixture
+        .command(&index, &["upgrade", "--check"])
+        .output()
+        .unwrap();
+    assert_exit(&output, 0);
+    assert_eq!(
+        text(&output.stdout),
+        "ck-subc-mcp → release 0.17.9. Run ck upgrade.\n"
+    );
+}
+
+#[test]
 fn upgrade_check_reports_updates_when_the_daemon_is_down() {
     let fixture = UpgradeFixture::new("ck-upgrade-check-down");
     let index = serve_signed_index(|base| {

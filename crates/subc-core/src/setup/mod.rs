@@ -28,8 +28,8 @@ mod validation;
 pub use apply::{default_claustrum_key_path, SetupBackend};
 pub(crate) use components::{component_binaries_for_target, module_program};
 pub use model::{
-    AlphaTarget, Component, ComponentState, PlanOutcome, PlatformObservation, SetupObserved,
-    SetupRequest, UpgradeState, UpgradeTarget,
+    version_transition, AlphaTarget, Component, ComponentState, PlanOutcome, PlatformObservation,
+    SetupObserved, SetupRequest, UpgradeState, UpgradeTarget,
 };
 pub use planner::{plan_setup, plan_upgrade, SetupPlan};
 #[cfg(windows)]

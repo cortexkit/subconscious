@@ -526,17 +526,22 @@ fn dashboard_state(
             let release = metadata.targets.get(target.label())?;
             let installed = installed.get(target.label())?;
             let release_digest = release.sha256.as_deref()?;
+            let from = if release.reports_release_version {
+                installed.version.clone()
+            } else {
+                String::new()
+            };
             match installed.archive_sha256.as_deref() {
                 Some(digest) if digest == release_digest => None,
                 Some(_) => Some(DashboardDelta {
                     target,
-                    from: installed.version.clone(),
+                    from: from.clone(),
                     to: release.version.clone(),
                     reason: None,
                 }),
                 None => Some(DashboardDelta {
                     target,
-                    from: installed.version.clone(),
+                    from,
                     to: release.version.clone(),
                     reason: Some("no recorded digest; run ck upgrade to establish one".to_string()),
                 }),
@@ -968,6 +973,24 @@ mod tests {
     /// 0.17.x; the index marks its asset `reports: null`. An update for it
     /// must not render "0.1.0 → 0.17.34" — two numbering schemes on one
     /// arrow — and a binary the index says DOES report keeps the arrow.
+    #[test]
+    fn dashboard_does_not_compare_crate_versions_to_release_versions() {
+        let target = upgrade_target("ck-subc-mcp");
+        let mut metadata = metadata(100, "0.17.34");
+        metadata
+            .targets
+            .get_mut(target.label())
+            .unwrap()
+            .reports_release_version = false;
+        let mut installed = installed("0.1.0");
+        installed.retain(|key, _| key == target.label());
+        let state = dashboard_state(&metadata, &installed, 100);
+        assert_eq!(
+            state.render(),
+            "updates: ck-subc-mcp → release 0.17.34 (cache 0s old)"
+        );
+    }
+
     #[test]
     fn version_exempt_binary_names_the_release_without_an_installed_from() {
         let exempt = upgrade_target("ck-subc-mcp");

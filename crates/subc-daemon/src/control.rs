@@ -1544,7 +1544,18 @@ impl ControlHandler {
             (module_id, routes, reason, terminal)
         });
         let registrations = self.deregister_connection(connection_id);
-        let cleanup = self.forwarding.cleanup_connection_counted(connection_id);
+        let cleanup = if crash_closed.is_some() {
+            self.forwarding.cleanup_connection_counted(connection_id)
+        } else {
+            // Only module notices need the abandoned-relay count. Client
+            // teardown uses the route-only wrapper.
+            self.forwarding
+                .cleanup_connection(connection_id)
+                .map(|released| crate::forwarding::ConnectionCleanup {
+                    released,
+                    abandoned_relays: 0,
+                })
+        };
         // The route.closed push waits for forwarding teardown because only
         // teardown knows how many pending route.bind relays it aborted. It still
         // goes out before the GOODBYEs for the released routes, and its targets

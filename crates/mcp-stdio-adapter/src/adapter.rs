@@ -47,7 +47,7 @@ const SPAWN_SHAPED_FIELDS: &[&str] = &[
     "spawn_spec",
 ];
 
-/// Atomics let health checks report lifecycle state without blocking on child state.
+/// Health accounting never takes a child-state lock or waits on subprocess work.
 #[derive(Debug)]
 pub struct HealthMetrics {
     children_live: AtomicU64,
@@ -56,8 +56,8 @@ pub struct HealthMetrics {
     spawn_failures_total: AtomicU64,
     idle_evictions_total: AtomicU64,
     eviction_timers_live: AtomicU64,
-    calls_in_flight: AtomicU64,
-    oldest_in_flight_ms: AtomicU64,
+    flights: Mutex<BTreeMap<u64, Instant>>,
+    next_flight_id: AtomicU64,
     cache_served_total: AtomicU64,
 }
 
@@ -70,8 +70,8 @@ impl Default for HealthMetrics {
             spawn_failures_total: AtomicU64::new(0),
             idle_evictions_total: AtomicU64::new(0),
             eviction_timers_live: AtomicU64::new(0),
-            calls_in_flight: AtomicU64::new(0),
-            oldest_in_flight_ms: AtomicU64::new(0),
+            flights: Mutex::new(BTreeMap::new()),
+            next_flight_id: AtomicU64::new(0),
             cache_served_total: AtomicU64::new(0),
         }
     }
@@ -79,6 +79,16 @@ impl Default for HealthMetrics {
 
 impl HealthMetrics {
     pub fn snapshot(&self) -> Value {
+        let flights = self
+            .flights
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let oldest_age = flights
+            .values()
+            .min()
+            .copied()
+            .map(elapsed_since)
+            .unwrap_or(0);
         json!({
             "children_live": self.children_live.load(Ordering::Relaxed),
             "children_max": self.children_max.load(Ordering::Relaxed),
@@ -86,11 +96,8 @@ impl HealthMetrics {
             "spawn_failures_total": self.spawn_failures_total.load(Ordering::Relaxed),
             "idle_evictions_total": self.idle_evictions_total.load(Ordering::Relaxed),
             "eviction_timers_live": self.eviction_timers_live.load(Ordering::Relaxed),
-            "calls_in_flight": self.calls_in_flight.load(Ordering::Relaxed),
-            "oldest_in_flight_ms": oldest_in_flight_age_ms(
-                self.calls_in_flight.load(Ordering::Relaxed),
-                self.oldest_in_flight_ms.load(Ordering::Relaxed),
-            ),
+            "calls_in_flight": flights.len(),
+            "oldest_in_flight_ms": oldest_age,
             "cache_served_total": self.cache_served_total.load(Ordering::Relaxed),
         })
     }
@@ -326,8 +333,8 @@ impl ModuleHandler for AdapterHandler {
     }
 
     async fn health(&self) -> HealthReport {
-        // This lane reads only atomics. It neither waits on child state nor executes a
-        // subprocess, so a wedged spawn or teardown cannot delay a health response.
+        // The flight bookkeeping lock covers only timestamp insert/remove/snapshot.
+        // No child-state lock or subprocess work can delay this health lane.
         HealthReport {
             status: HealthStatus::Ok,
             detail: Some("stdio MCP child lifecycle metrics".to_string()),
@@ -1017,24 +1024,28 @@ fn child_payload(response: Value) -> Option<Value> {
 
 struct FlightGuard {
     metrics: Arc<HealthMetrics>,
+    id: u64,
 }
 
 impl FlightGuard {
     fn new(metrics: Arc<HealthMetrics>) -> Self {
-        if metrics.calls_in_flight.fetch_add(1, Ordering::Relaxed) == 0 {
-            metrics
-                .oldest_in_flight_ms
-                .store(epoch_millis(), Ordering::Relaxed);
-        }
-        Self { metrics }
+        let id = metrics.next_flight_id.fetch_add(1, Ordering::Relaxed);
+        metrics
+            .flights
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(id, Instant::now());
+        Self { metrics, id }
     }
 }
 
 impl Drop for FlightGuard {
     fn drop(&mut self) {
-        if self.metrics.calls_in_flight.fetch_sub(1, Ordering::Relaxed) == 1 {
-            self.metrics.oldest_in_flight_ms.store(0, Ordering::Relaxed);
-        }
+        self.metrics
+            .flights
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.id);
     }
 }
 
@@ -1214,14 +1225,6 @@ fn find_spawn_shaped_field(value: &Value) -> Option<String> {
         }),
         Value::Array(items) => items.iter().find_map(find_spawn_shaped_field),
         _ => None,
-    }
-}
-
-fn oldest_in_flight_age_ms(calls_in_flight: u64, started_at_ms: u64) -> u64 {
-    if calls_in_flight == 0 || started_at_ms == 0 {
-        0
-    } else {
-        epoch_millis().saturating_sub(started_at_ms)
     }
 }
 

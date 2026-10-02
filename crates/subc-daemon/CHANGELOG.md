@@ -9,6 +9,7 @@
 - Requirement episode numbers remain monotonic for each consumer/capability pair when a consumer is disabled or a declaration disappears and later returns.
 - Runtime supervisor start/stop overrides configuration defaults when evaluating enabled capability candidates, cached consumer requirements and satisfiability; starting a config-disabled provider now gets the normal pending window.
 - Reserved-capability refusal warnings describe the current attempt only; unrelated catalog updates no longer re-log historical claimants that never registered.
+- Fleet lint still reports duplicate module IDs as operational failures but no longer labels them as modules that do not expose a manifest.
 
 ## 0.29.1 — 2026-10-02
 

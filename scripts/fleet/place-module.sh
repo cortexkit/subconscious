@@ -453,6 +453,17 @@ is_linker_signed() {
   local f; f=$(cd_flags "$1")
   [ -n "$f" ] && [ $(( f & 0x20000 )) -ne 0 ]
 }
+# An ad-hoc image that a bare `codesign --force --sign -` re-signed after linking
+# has lost the linker-signed bit but keeps the linker's per-build identifier
+# (`<name>-<hex hash>`), which no later build can reproduce. Its designated
+# requirement is a cdhash, so the identifier carries no grant. Treat it like a
+# linker-signed image for the identifier only; its flags are compared normally.
+has_linker_identifier() {
+  local id
+  id=$(codesign -dvv "$1" 2>&1 | sed -n 's/^Identifier=//p' | head -1)
+  [ "$(codesign -dvv "$1" 2>&1 | grep -c '^Signature=adhoc')" -gt 0 ] \
+    && printf '%s' "$id" | grep -qE -- '-[0-9a-f]{16,}$'
+}
 posture_for_linker_signed() {
   local f bare
   f=$(cd_flags "$1")
@@ -468,6 +479,10 @@ if command -v codesign >/dev/null; then
     staged_sig_cmp=$(posture_for_linker_signed "$STAGED")
     live_sig_cmp=$(posture_for_linker_signed "$DEST")
     say "signing posture: running image is linker-signed; its per-build identifier and the linker-signed bit are not compared"
+  elif has_linker_identifier "$DEST"; then
+    staged_sig_cmp=$(printf '%s' "$staged_sig_cmp" | sed -E 's/Identifier=[^ ]+ //')
+    live_sig_cmp=$(printf '%s' "$live_sig_cmp" | sed -E 's/Identifier=[^ ]+ //')
+    say "signing posture: running image is ad-hoc with a linker per-build identifier; the identifier is not compared"
   fi
   if [ -n "$NEW_REQUIREMENT" ]; then
     # A requested requirement change may rename the identifier; every other

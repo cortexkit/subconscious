@@ -22,15 +22,15 @@ use subc_protocol::{
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStdin, ChildStdout, Command},
-    sync::{Mutex as AsyncMutex, Notify},
+    sync::{Mutex as AsyncMutex, Notify, OwnedSemaphorePermit, Semaphore},
     time::{sleep_until, timeout, Instant as TokioInstant},
 };
 use tokio_util::sync::CancellationToken;
 
 use crate::{
     constants::{
-        BASE_ENV_KEYS, DEFAULT_MAX_CHILDREN, EVICTION_GRACE_MS, SPAWN_ATTEMPT_BUDGET,
-        SPAWN_INITIALIZE_BUDGET_MS, SPAWN_RETRY_COOLDOWN_MS,
+        BASE_ENV_KEYS, CHILD_EARLY_EXIT_MS, DEFAULT_MAX_CHILDREN, EVICTION_GRACE_MS,
+        SPAWN_ATTEMPT_BUDGET, SPAWN_INITIALIZE_BUDGET_MS, SPAWN_RETRY_COOLDOWN_MS,
     },
     registry::{EnvironmentValue, ServerConfig, ServerRegistry},
 };
@@ -349,6 +349,8 @@ struct ChildLifecycle {
     settings: LifecycleSettings,
     slots: Mutex<BTreeMap<String, Arc<ServerSlot>>>,
     cached_tools: Mutex<BTreeMap<(String, Option<String>), CachedTools>>,
+    capacity: Arc<Semaphore>,
+    capacity_gate: AsyncMutex<()>,
 }
 
 impl ChildLifecycle {
@@ -363,6 +365,8 @@ impl ChildLifecycle {
             settings,
             slots: Mutex::new(BTreeMap::new()),
             cached_tools: Mutex::new(BTreeMap::new()),
+            capacity: Arc::new(Semaphore::new(DEFAULT_MAX_CHILDREN as usize)),
+            capacity_gate: AsyncMutex::new(()),
         }
     }
 
@@ -463,6 +467,7 @@ impl ChildLifecycle {
             .await
             .is_err()
         {
+            self.record_early_exit(&mut state);
             self.remove_session(&mut state).await;
             return Err(LifecycleError::CallOutcomeUnknown);
         }
@@ -494,6 +499,7 @@ impl ChildLifecycle {
                 return Err(LifecycleError::ChildUnresponsive);
             }
             Err(FrameReadError::Closed | FrameReadError::Io) => {
+                self.record_early_exit(&mut state);
                 self.remove_session(&mut state).await;
                 return Err(LifecycleError::CallOutcomeUnknown);
             }
@@ -531,9 +537,21 @@ impl ChildLifecycle {
         if let Some(session) = state.session.as_mut() {
             match session.child.try_wait() {
                 Ok(Some(_)) | Err(_) => {
+                    self.record_early_exit(state);
                     self.remove_session(state).await;
                 }
-                Ok(None) => return Ok(None),
+                Ok(None) if session.initialized_at.is_some() => {
+                    if session.initialized_at.unwrap().elapsed()
+                        >= Duration::from_millis(CHILD_EARLY_EXIT_MS)
+                    {
+                        state.consecutive_failures = 0;
+                        state.last_failure_cause = None;
+                    }
+                    return Ok(None);
+                }
+                // An aborted initialization retains its child and capacity slot
+                // until a subsequent call can tear it down and reap it.
+                Ok(None) => self.remove_session(state).await,
             }
         }
 
@@ -549,6 +567,7 @@ impl ChildLifecycle {
             state.cooldown_until = None;
         }
 
+        let capacity = self.reserve_capacity().await?;
         let child_env = match tokio::time::timeout_at(
             TokioInstant::from_std(deadline),
             self.construct_environment(config),
@@ -575,11 +594,12 @@ impl ChildLifecycle {
             .envs(child_env)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null());
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
         if let Some(cwd) = &config.cwd {
             command.current_dir(cwd);
         }
-        let mut child = match command.spawn() {
+        let (mut child, tree) = match spawn_contained(&mut command).await {
             Ok(child) => child,
             Err(_) => {
                 let retry_after_ms = self.record_failed_attempt(state, SpawnFailureCause::Exec);
@@ -594,16 +614,19 @@ impl ChildLifecycle {
         self.metrics.children_live.fetch_add(1, Ordering::Relaxed);
         let stdin = child.stdin.take().expect("piped stdin is present");
         let stdout = child.stdout.take().expect("piped stdout is present");
-        let mut session = ChildSession {
+        state.session = Some(ChildSession {
             child,
+            tree,
+            _capacity: capacity,
             stdin: Some(stdin),
             stdout: BufReader::new(stdout),
             next_id: 1,
             last_idle: Instant::now(),
-        };
+            initialized_at: None,
+        });
 
         if let Err(_error) = initialize_child(
-            &mut session,
+            state.session.as_mut().expect("spawn installed the child"),
             config.frame_ceiling_bytes,
             self.settings
                 .spawn_initialize_budget
@@ -611,15 +634,19 @@ impl ChildLifecycle {
         )
         .await
         {
-            self.terminate_session(&mut session).await;
+            self.remove_session(state).await;
             let _ = self.record_failed_attempt(state, SpawnFailureCause::InitializeTimeout);
             return Err(LifecycleError::InitializeFailed);
         }
 
-        state.consecutive_failures = 0;
+        // An initialize-then-exit loop must not reset its own failure streak.
+        // Reset that streak only after the child survives the early-exit window.
+        if !matches!(state.last_failure_cause, Some(SpawnFailureCause::EarlyExit)) {
+            state.consecutive_failures = 0;
+            state.last_failure_cause = None;
+        }
         state.cooldown_until = None;
-        state.last_failure_cause = None;
-        state.session = Some(session);
+        state.session.as_mut().unwrap().initialized_at = Some(Instant::now());
         Ok(Some(spawn_started))
     }
 
@@ -681,20 +708,82 @@ impl ChildLifecycle {
         }
     }
 
-    async fn remove_session(&self, state: &mut SlotState) {
-        if let Some(mut session) = state.session.take() {
-            self.terminate_session(&mut session).await;
+    fn record_early_exit(&self, state: &mut SlotState) {
+        if state
+            .session
+            .as_ref()
+            .and_then(|session| session.initialized_at)
+            .is_some_and(|started| started.elapsed() < Duration::from_millis(CHILD_EARLY_EXIT_MS))
+        {
+            self.record_failed_attempt(state, SpawnFailureCause::EarlyExit);
         }
     }
 
-    async fn terminate_session(&self, session: &mut ChildSession) {
-        session.stdin.take();
-        let waited = timeout(self.settings.eviction_grace, session.child.wait()).await;
-        if !matches!(waited, Ok(Ok(_))) {
-            let _ = session.child.start_kill();
-            let _ = session.child.wait().await;
+    async fn reserve_capacity(&self) -> Result<OwnedSemaphorePermit, LifecycleError> {
+        // Serialize eviction with claiming its replacement slot. Never wait for
+        // another server's state lock here: a locked lane is busy or initializing.
+        let _reservation = self.capacity_gate.lock().await;
+        if let Ok(permit) = Arc::clone(&self.capacity).try_acquire_owned() {
+            return Ok(permit);
         }
-        self.metrics.children_live.fetch_sub(1, Ordering::Relaxed);
+        let slots: Vec<_> = self
+            .slots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .cloned()
+            .collect();
+        let mut idle = Vec::new();
+        for slot in slots {
+            let last_idle = slot
+                .state
+                .try_lock()
+                .ok()
+                .and_then(|state| state.session.as_ref().map(|session| session.last_idle));
+            if let Some(last_idle) = last_idle {
+                idle.push((last_idle, slot));
+            }
+        }
+        idle.sort_by_key(|(last_idle, _)| *last_idle);
+        for (_, slot) in idle {
+            if let Ok(mut state) = slot.state.try_lock() {
+                if state.session.is_some() {
+                    self.remove_session(&mut state).await;
+                    self.metrics
+                        .idle_evictions_total
+                        .fetch_add(1, Ordering::Relaxed);
+                    break;
+                }
+            }
+        }
+        Arc::clone(&self.capacity)
+            .try_acquire_owned()
+            .map_err(|_| LifecycleError::ChildCapacity)
+    }
+
+    async fn remove_session(&self, state: &mut SlotState) {
+        if let Some(session) = state.session.take() {
+            self.terminate_session(session).await;
+        }
+    }
+
+    async fn terminate_session(&self, mut session: ChildSession) {
+        let metrics = Arc::clone(&self.metrics);
+        let grace = self.settings.eviction_grace;
+        // Teardown owns the capacity permit through reaping even if its caller
+        // disappears during grace. Cancelling the join does not cancel cleanup.
+        let cleanup = tokio::spawn(async move {
+            session.stdin.take();
+            let waited = timeout(grace, session.child.wait()).await;
+            // A normally exiting parent can still leave helpers behind.
+            session.tree.terminate();
+            if !matches!(waited, Ok(Ok(_))) {
+                let _ = session.child.start_kill();
+                let _ = session.child.wait().await;
+            }
+            metrics.children_live.fetch_sub(1, Ordering::Relaxed);
+        });
+        let _ = cleanup.await;
     }
 
     /// Re-arms the slot's single eviction timer after a successful call. The
@@ -798,10 +887,72 @@ struct SlotState {
 
 struct ChildSession {
     child: Child,
+    tree: ProcessTree,
+    _capacity: OwnedSemaphorePermit,
     stdin: Option<ChildStdin>,
     stdout: BufReader<ChildStdout>,
     next_id: u64,
     last_idle: Instant,
+    initialized_at: Option<Instant>,
+}
+
+struct ProcessTree {
+    #[cfg(unix)]
+    group: rustix::process::Pid,
+    #[cfg(windows)]
+    job: subc_jobobject::JobObject,
+}
+
+impl ProcessTree {
+    fn terminate(&self) {
+        #[cfg(unix)]
+        let _ = rustix::process::kill_process_group(self.group, rustix::process::Signal::Kill);
+        #[cfg(windows)]
+        let _ = self.job.terminate();
+    }
+}
+
+impl Drop for ProcessTree {
+    fn drop(&mut self) {
+        self.terminate();
+    }
+}
+
+async fn spawn_contained(command: &mut Command) -> std::io::Result<(Child, ProcessTree)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.as_std_mut().process_group(0);
+    }
+    #[cfg(windows)]
+    let job = {
+        let job = subc_jobobject::JobObject::new()?;
+        subc_jobobject::suspend_on_create_async(command);
+        job
+    };
+    let child = command.spawn()?;
+    #[cfg(windows)]
+    let child = {
+        let mut child = child;
+        let contained = job.assign(&child).and_then(|()| {
+            subc_jobobject::resume_main_thread(child.id().expect("new child has a pid"))
+        });
+        if let Err(error) = contained {
+            let _ = job.terminate();
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            return Err(error);
+        }
+        child
+    };
+    let tree = ProcessTree {
+        #[cfg(unix)]
+        group: rustix::process::Pid::from_raw(child.id().expect("new child has a pid") as i32)
+            .expect("child pid is positive"),
+        #[cfg(windows)]
+        job,
+    };
+    Ok((child, tree))
 }
 
 #[derive(Clone)]
@@ -831,6 +982,7 @@ enum LifecycleError {
     },
     CallOutcomeUnknown,
     ChildUnresponsive,
+    ChildCapacity,
 }
 
 impl LifecycleError {
@@ -881,6 +1033,12 @@ impl LifecycleError {
                 json!({}),
             )
             .into_handler_outcome(),
+            Self::ChildCapacity => AdapterRefusal::with_detail(
+                "child_capacity",
+                "all MCP child slots are busy",
+                json!({}),
+            )
+            .into_handler_outcome(),
         }
     }
 }
@@ -890,6 +1048,7 @@ enum SpawnFailureCause {
     Exec,
     InitializeTimeout,
     CredentialResolution,
+    EarlyExit,
 }
 
 impl SpawnFailureCause {
@@ -898,6 +1057,7 @@ impl SpawnFailureCause {
             Self::Exec => "exec",
             Self::InitializeTimeout => "initialize_timeout",
             Self::CredentialResolution => "credential_resolution",
+            Self::EarlyExit => "early_exit",
         }
     }
 }

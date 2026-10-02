@@ -407,13 +407,7 @@ fn record_test_probe(path: &Path) {
 #[tokio::main]
 async fn main() {
     match run(env::args_os()).await {
-        Ok(()) => match cleanup_replaced_windows_ck() {
-            Ok(()) => process::exit(0),
-            Err(error) => {
-                eprintln!("{error}");
-                process::exit(error.exit_code());
-            }
-        },
+        Ok(()) => process::exit(successful_command_exit(cleanup_replaced_windows_ck())),
         Err(
             CkError::FleetLintExit { exit_code }
             | CkError::TriageExit { exit_code }
@@ -424,6 +418,16 @@ async fn main() {
             process::exit(err.exit_code());
         }
     }
+}
+
+fn successful_command_exit(cleanup: Result<(), CkError>) -> i32 {
+    // Another invocation may still be running the previous Windows image.
+    // Cleanup retains its inventory row on failure so a later command can try
+    // again; housekeeping must not change the result of the user's command.
+    if let Err(error) = cleanup {
+        eprintln!("warning: self-update cleanup deferred: {error}");
+    }
+    0
 }
 
 /// A Windows self-update leaves `ck.exe.old` until a later, successful process
@@ -5788,24 +5792,25 @@ fn format_resets_at_rate_window(window: &Value) -> String {
 fn format_reset_timestamp(raw: &str) -> Option<String> {
     let secs = parse_rfc3339_to_utc_secs(raw)?;
     let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
-    let local = utc_parts_from_epoch_secs(secs);
-    let now_local = utc_parts_from_epoch_secs(now);
-    if local.year == now_local.year && local.month == now_local.month && local.day == now_local.day
-    {
-        Some(format!("{:02}:{:02}", local.hour, local.minute))
+    let utc = utc_parts_from_epoch_secs(secs);
+    let now_utc = utc_parts_from_epoch_secs(now);
+    if utc.year == now_utc.year && utc.month == now_utc.month && utc.day == now_utc.day {
+        Some(format!("{:02}:{:02} UTC", utc.hour, utc.minute))
     } else {
         Some(format!(
-            "{} {:02} {:02}:{:02}",
-            month_abbr(local.month),
-            local.day,
-            local.hour,
-            local.minute
+            "{} {:02} {:02}:{:02} UTC",
+            month_abbr(utc.month),
+            utc.day,
+            utc.hour,
+            utc.minute
         ))
     }
 }
 
 fn parse_rfc3339_to_utc_secs(raw: &str) -> Option<u64> {
-    if raw.len() < 19 {
+    // RFC 3339 uses ASCII. Establish this before fixed byte slices, including
+    // the offset, so malformed provider text cannot split a UTF-8 character.
+    if raw.len() < 19 || !raw.is_ascii() {
         return None;
     }
     let bytes = raw.as_bytes();
@@ -5893,7 +5898,7 @@ fn civil_to_days(year: i32, month: u32, day: u32) -> Option<i32> {
     Some(era * 146097 + doy - 719468)
 }
 
-struct LocalTimeParts {
+struct UtcTimeParts {
     year: i32,
     month: u32,
     day: u32,
@@ -5901,13 +5906,13 @@ struct LocalTimeParts {
     minute: u32,
 }
 
-fn utc_parts_from_epoch_secs(secs: u64) -> LocalTimeParts {
+fn utc_parts_from_epoch_secs(secs: u64) -> UtcTimeParts {
     let days = (secs / 86_400) as i32;
     let rem = (secs % 86_400) as u32;
     let hour = rem / 3600;
     let minute = (rem % 3600) / 60;
     let (year, month, day) = civil_from_days(days);
-    LocalTimeParts {
+    UtcTimeParts {
         year,
         month,
         day,
@@ -7000,9 +7005,7 @@ fn setup_command(program: &Path, request: &setup::SetupRequest) -> Result<(), Ck
     }
     if !plan.is_authorized() {
         let message = plan
-            .outcomes
-            .iter()
-            .find(|outcome| outcome.blocks_execution())
+            .blocking_outcome()
             .map(human_blocking_outcome)
             .unwrap_or_else(|| "setup could not continue; nothing was installed".to_string());
         println!("{message}");
@@ -7101,7 +7104,8 @@ fn setup_unavailable_message(
 
 fn human_blocking_outcome(outcome: &setup::PlanOutcome) -> String {
     match outcome {
-        setup::PlanOutcome::Refusal { reason } => reason.clone(),
+        setup::PlanOutcome::Refusal { reason }
+        | setup::PlanOutcome::TargetRefused { reason, .. } => reason.clone(),
         _ => outcome.to_string(),
     }
 }
@@ -7200,7 +7204,13 @@ async fn upgrade_command(
         }
         Err(error) => return Err(CkError::UpdateCheck(error)),
     };
-    let roster = fetch_supervised_roster(subc).await;
+    // Availability is a signed-index observation, not an activation attempt.
+    // A stopped daemon must not prevent a read-only update check.
+    let roster = if check {
+        Ok(BTreeSet::new())
+    } else {
+        fetch_supervised_roster(subc).await
+    };
     let planning_index = if check {
         None
     } else {
@@ -7215,7 +7225,11 @@ async fn upgrade_command(
     let plan = setup::plan_upgrade(&observed);
     if dry_run {
         println!("{}", plan.render());
-        return Ok(());
+        return if plan.is_authorized() {
+            Ok(())
+        } else {
+            Err(CkError::RenderedExit { exit_code: 1 })
+        };
     }
     if !plan.is_authorized() {
         let message = plan
@@ -7240,7 +7254,10 @@ async fn upgrade_command(
             .filter_map(|outcome| match outcome {
                 setup::PlanOutcome::UpgradeAvailable {
                     target, from, to, ..
-                } => Some(format!("{target} {from} → {to}. Run ck upgrade.")),
+                } => Some(format!(
+                    "{}. Run ck upgrade.",
+                    setup::version_transition(&target.to_string(), from, to)
+                )),
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -8127,6 +8144,40 @@ impl From<serde_json::Error> for CkError {
     fn from(source: serde_json::Error) -> Self {
         Self::Json(source)
     }
+}
+
+#[cfg(test)]
+#[test]
+fn malformed_unicode_reset_timestamps_are_refused_without_panicking() {
+    for raw in [
+        "2026-01-01T00:00:0é",
+        "2026-01-01T00:00:00+0é00",
+        "202é-01-01T00:00:00Z",
+    ] {
+        assert_eq!(parse_rfc3339_to_utc_secs(raw), None, "{raw}");
+    }
+    assert_eq!(
+        parse_rfc3339_to_utc_secs("2026-01-01T03:00:00+03:00"),
+        parse_rfc3339_to_utc_secs("2026-01-01T00:00:00Z")
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn reset_timestamp_display_labels_its_utc_timezone() {
+    let formatted = format_reset_timestamp("2026-01-01T03:00:00+03:00").unwrap();
+    assert!(formatted.ends_with("00:00 UTC"), "{formatted}");
+}
+
+#[cfg(test)]
+#[test]
+fn a_successful_command_stays_successful_when_old_image_cleanup_fails() {
+    assert_eq!(
+        successful_command_exit(Err(CkError::Message(
+            "could not delete prior Windows executable: sharing violation".into()
+        ))),
+        0
+    );
 }
 
 #[cfg(test)]

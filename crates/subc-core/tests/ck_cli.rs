@@ -561,6 +561,7 @@ impl SetupFixture {
             .env("LOCALAPPDATA", &self.data_home)
             .env("XDG_DATA_HOME", &self.data_home)
             .env("XDG_CONFIG_HOME", &self.config_home)
+            .env("XDG_RUNTIME_DIR", self._root.path().join("runtime"))
             .env("PATH", path)
             // Daemon discovery falls back to the system temp directory, which
             // is outside this fixture's HOME: without the fence a setup path
@@ -1000,6 +1001,65 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 #[test]
+#[cfg(unix)]
+fn setup_core_drift_floor_refusal_is_actionable_and_never_mutates() {
+    let fixture = SetupFixture::installed("setup-drift-floor");
+    let binary_home = fixture.data_home.join("cortexkit/bin");
+    fs::remove_file(binary_home.join("ck-aft")).unwrap();
+    write_executable(
+        &binary_home.join("ck-subc"),
+        "#!/bin/sh\necho 'ck-subc 0.17.19'\n",
+    );
+    write_executable(
+        &fixture.tools.join(service_manager_program()),
+        "#!/bin/sh\nexit 1\n",
+    );
+    let config_path = fixture.config_home.join("cortexkit/subc.jsonc");
+    let mut config: Value = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+    config.as_object_mut().unwrap().remove("storage");
+    config["modules"].as_object_mut().unwrap().remove("aft");
+    let config_bytes = serde_json::to_vec_pretty(&config).unwrap();
+    fs::write(&config_path, &config_bytes).unwrap();
+    let manifest_path = fixture.data_home.join("cortexkit/installer-manifest.json");
+    let manifest_before = fs::read(&manifest_path).unwrap();
+    let index = serve_signed_index(|base| {
+        let (mut index, assets) = setup_index(base, None);
+        let mut aft = index_component(
+            "v1.0.0",
+            Some("1.0.0"),
+            &host_target(),
+            [(
+                "ck-aft",
+                fixture_asset(
+                    format!("{base}/unused.zip"),
+                    "00".repeat(32),
+                    1,
+                    Some("1.0.0"),
+                ),
+            )],
+        );
+        aft["requires_core"] = json!("0.17.20");
+        index["components"]["aft"] = aft;
+        (index, assets)
+    });
+    for args in [&["setup", "aft", "--dry-run"][..], &["setup", "aft"][..]] {
+        let output = fixture
+            .command(&index, args)
+            .env_remove("CK_TEST_SETUP_CONTROL_OK")
+            .output()
+            .unwrap();
+        assert_exit(&output, 1);
+        assert_eq!(
+            text(&output.stdout),
+            "aft requires core ≥ 0.17.20, installed 0.17.19; run `ck upgrade` first\n"
+        );
+        assert_eq!(fs::read(&config_path).unwrap(), config_bytes);
+        assert_eq!(fs::read(&manifest_path).unwrap(), manifest_before);
+        assert!(!binary_home.join("ck-aft").exists());
+    }
+}
+
+#[test]
 fn setup_nothing_to_do_never_renders_outcome_no_op() {
     let fixture = SetupFixture::installed("ck-setup-current");
     let index = serve_signed_index(|base| setup_index(base, None));
@@ -1173,7 +1233,11 @@ fn fresh_setup_prints_the_pasteable_claude_code_command() {
             assets,
         )
     });
-    let output = fixture.command(&index, &["setup"]).output().unwrap();
+    let output = fixture
+        .command(&index, &["setup"])
+        .env("CK_TEST_SETUP_RUNTIME_MISSING", "1")
+        .output()
+        .unwrap();
 
     assert_exit(&output, 0);
     let stdout = text(&output.stdout);
@@ -1270,7 +1334,9 @@ impl UpgradeFixture {
             .env("HOME", &self.home)
             .env("USERPROFILE", &self.home)
             .env("LOCALAPPDATA", self.home.join(".local/share"))
-            .env_remove("XDG_DATA_HOME")
+            .env("XDG_DATA_HOME", self.home.join(".local/share"))
+            .env("XDG_RUNTIME_DIR", self._root.path().join("runtime"))
+            .env("XDG_CONFIG_HOME", self.home.join(".config"))
             .env("CK_RELEASE_INDEX_URL", &index.url)
             .env("CK_TEST_RELEASE_INDEX_PUBKEY", &index.public_key)
             .env("CK_TEST_CK_VERSION", "0.17.9")
@@ -1376,6 +1442,84 @@ fn upgrade_and_check_say_everything_is_current_in_one_line() {
         assert!(output.stderr.is_empty(), "stderr: {}", text(&output.stderr));
         assert_eq!(text(&output.stdout), expected);
     }
+}
+
+#[test]
+fn upgrade_check_names_a_version_exempt_release_without_a_double_space() {
+    let fixture = UpgradeFixture::new("ck-upgrade-exempt-check");
+    let index = serve_signed_index(|base| {
+        let (mut index, assets) = upgrade_index(
+            base,
+            "0.55.1",
+            &"22".repeat(32),
+            "0.17.9",
+            &"44".repeat(32),
+            "0.8.0",
+            &"55".repeat(32),
+        );
+        let asset = &mut index["components"]["core"]["assets"][host_target()]["ck-subc-mcp"];
+        asset["sha256"] = json!("aa".repeat(32));
+        asset["reports"] = Value::Null;
+        (index, assets)
+    });
+    let output = fixture
+        .command(&index, &["upgrade", "--check"])
+        .output()
+        .unwrap();
+    assert_exit(&output, 0);
+    assert_eq!(
+        text(&output.stdout),
+        "ck-subc-mcp → release 0.17.9. Run ck upgrade.\n"
+    );
+}
+
+#[test]
+fn upgrade_check_reports_updates_when_the_daemon_is_down() {
+    let fixture = UpgradeFixture::new("ck-upgrade-check-down");
+    let index = serve_signed_index(|base| {
+        upgrade_index(
+            base,
+            "0.55.2",
+            &"aa".repeat(32),
+            "0.17.9",
+            &"44".repeat(32),
+            "0.8.0",
+            &"55".repeat(32),
+        )
+    });
+    let output = fixture
+        .command(&index, &["upgrade", "--check"])
+        .env("CK_TEST_DAEMON_UNREACHABLE", "daemon is down")
+        .output()
+        .unwrap();
+    assert_exit(&output, 0);
+    assert_eq!(
+        text(&output.stdout),
+        "ck-aft 0.55.1 → 0.55.2. Run ck upgrade.\n"
+    );
+}
+
+#[test]
+fn upgrade_dry_run_exits_nonzero_when_activation_is_refused() {
+    let fixture = UpgradeFixture::new("ck-upgrade-preview-down");
+    let index = serve_signed_index(|base| {
+        upgrade_index(
+            base,
+            "0.55.2",
+            &"aa".repeat(32),
+            "0.17.9",
+            &"44".repeat(32),
+            "0.8.0",
+            &"55".repeat(32),
+        )
+    });
+    let output = fixture
+        .command(&index, &["upgrade", "--dry-run"])
+        .env("CK_TEST_DAEMON_UNREACHABLE", "daemon is down")
+        .output()
+        .unwrap();
+    assert_exit(&output, 1);
+    assert!(text(&output.stdout).contains("daemon is unreachable: daemon is down"));
 }
 
 #[test]

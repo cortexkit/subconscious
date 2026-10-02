@@ -212,7 +212,10 @@ fn evidence_from_index(
                     reports_release_version: true,
                 });
             };
-            let version = entry.version.clone().unwrap_or_default();
+            let version = entry
+                .version
+                .clone()
+                .unwrap_or_else(|| entry.release.clone());
             let asset = match PlatformObservation::current() {
                 PlatformObservation::Supported(platform) => entry
                     .assets
@@ -229,6 +232,21 @@ fn evidence_from_index(
             })
         }
     }
+}
+
+#[cfg(test)]
+#[test]
+fn train_release_metadata_names_the_release_tag() {
+    let index: ReleaseIndex = serde_json::from_value(serde_json::json!({
+        "schema":1, "channel":"alpha", "generated_at_ms":0,
+        "components":{"mc":{"release":"ck-mc-deadbeef", "version":null}}
+    }))
+    .unwrap();
+    let target = super::components::upgrade_roster([super::model::Component::Mc])[0];
+    assert_eq!(
+        evidence_from_index(&Ok(index), target).unwrap().version,
+        "ck-mc-deadbeef"
+    );
 }
 
 pub(super) fn upgrade_target_index_path(target: UpgradeTarget) -> (&'static str, &'static str) {
@@ -343,7 +361,13 @@ pub async fn dashboard_update_at<S: ReleaseSource>(
         CacheRead::Absent | CacheRead::Malformed | CacheRead::Unreadable(_) => None,
     };
     if let Some(metadata) = &cached {
-        if metadata.is_fresh_at(now_unix_secs) {
+        // An explicit check may have cached only the then-installed roster.
+        // Freshness alone cannot establish currency for a later installation.
+        if metadata.is_fresh_at(now_unix_secs)
+            && roster_for_installed(installed)
+                .iter()
+                .all(|target| metadata.targets.contains_key(target.label()))
+        {
             return dashboard_state(metadata, installed, now_unix_secs);
         }
     }
@@ -502,17 +526,22 @@ fn dashboard_state(
             let release = metadata.targets.get(target.label())?;
             let installed = installed.get(target.label())?;
             let release_digest = release.sha256.as_deref()?;
+            let from = if release.reports_release_version {
+                installed.version.clone()
+            } else {
+                String::new()
+            };
             match installed.archive_sha256.as_deref() {
                 Some(digest) if digest == release_digest => None,
                 Some(_) => Some(DashboardDelta {
                     target,
-                    from: installed.version.clone(),
+                    from: from.clone(),
                     to: release.version.clone(),
                     reason: None,
                 }),
                 None => Some(DashboardDelta {
                     target,
-                    from: installed.version.clone(),
+                    from,
                     to: release.version.clone(),
                     reason: Some("no recorded digest; run ck upgrade to establish one".to_string()),
                 }),
@@ -704,6 +733,42 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    #[tokio::test]
+    async fn a_fresh_cache_without_a_newly_installed_target_is_refreshed() {
+        let (_dir, cache) = cache("partial-roster");
+        let mut partial = metadata(10_000, "0.12.0");
+        partial.targets.remove("ck-aft");
+        cache.write(&partial).unwrap();
+        let source = StaticSource::successful("0.13.0");
+        let update = dashboard_update_at(
+            &cache,
+            &source,
+            &installed("0.12.0"),
+            10_030,
+            Duration::from_millis(100),
+        )
+        .await;
+        assert!(
+            matches!(update, DashboardUpdate::Available { ref updates, .. } if updates.iter().any(|delta| delta.target.label() == "ck-aft")),
+            "{update:?}"
+        );
+        assert!(!source.calls().is_empty());
+        cache.write(&partial).unwrap();
+        let offline = StaticSource::failing(ReleaseSourceError::Offline("offline".into()));
+        let update = dashboard_update_at(
+            &cache,
+            &offline,
+            &installed("0.12.0"),
+            10_030,
+            Duration::from_millis(100),
+        )
+        .await;
+        assert!(
+            matches!(update, DashboardUpdate::NotChecked { .. }),
+            "{update:?}"
+        );
     }
 
     #[tokio::test]
@@ -908,6 +973,24 @@ mod tests {
     /// 0.17.x; the index marks its asset `reports: null`. An update for it
     /// must not render "0.1.0 → 0.17.34" — two numbering schemes on one
     /// arrow — and a binary the index says DOES report keeps the arrow.
+    #[test]
+    fn dashboard_does_not_compare_crate_versions_to_release_versions() {
+        let target = upgrade_target("ck-subc-mcp");
+        let mut metadata = metadata(100, "0.17.34");
+        metadata
+            .targets
+            .get_mut(target.label())
+            .unwrap()
+            .reports_release_version = false;
+        let mut installed = installed("0.1.0");
+        installed.retain(|key, _| key == target.label());
+        let state = dashboard_state(&metadata, &installed, 100);
+        assert_eq!(
+            state.render(),
+            "updates: ck-subc-mcp → release 0.17.34 (cache 0s old)"
+        );
+    }
+
     #[test]
     fn version_exempt_binary_names_the_release_without_an_installed_from() {
         let exempt = upgrade_target("ck-subc-mcp");

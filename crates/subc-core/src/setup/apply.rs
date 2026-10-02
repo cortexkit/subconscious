@@ -96,9 +96,15 @@ impl SetupBackend {
     pub fn observe(&mut self, request: &SetupRequest) -> Result<SetupObserved, String> {
         #[cfg(feature = "test-support")]
         if env::var_os("CK_TEST_SETUP_CONTROL_OK").is_some() {
-            self.runtime_status = RuntimeStatus {
-                registered: true,
-                live: true,
+            // The control stub can validate a newly registered runtime without
+            // pretending it was already registered before fresh setup began.
+            self.runtime_status = if env::var_os("CK_TEST_SETUP_RUNTIME_MISSING").is_some() {
+                RuntimeStatus::default()
+            } else {
+                RuntimeStatus {
+                    registered: true,
+                    live: true,
+                }
             };
         } else {
             self.runtime_status = runtime::observe(self.platform, &mut self.runner)?;
@@ -199,7 +205,9 @@ impl SetupBackend {
         observed.components = components;
         observed.releases = releases;
         observed.requires_core = requires_core;
-        if observed.component_state(Component::Core) != ComponentState::Missing
+        observed.core_binary_present =
+            self.paths.runtime_paths.daemon.is_file() || self.runtime_status.live;
+        if observed.core_binary_present
             && selected.iter().any(|component| {
                 component.module_id().is_some()
                     && observed.requires_core.contains_key(component)

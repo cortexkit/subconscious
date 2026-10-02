@@ -128,7 +128,11 @@ pub fn runtime_paths(platform: RuntimePlatform, home: &Path, data_home: &Path) -
 pub const DAEMON_STOP_TIMEOUT_SECS: u64 = 35;
 
 pub fn desired_definition(platform: RuntimePlatform, paths: &RuntimePaths) -> String {
-    let daemon = paths.daemon.to_string_lossy();
+    let raw_daemon = paths.daemon.to_string_lossy();
+    let daemon = match platform {
+        RuntimePlatform::Linux => systemd_argument(&raw_daemon),
+        RuntimePlatform::Macos | RuntimePlatform::Windows => xml_text(&raw_daemon),
+    };
     match platform {
         // NO AbandonProcessGroup, deliberately. launchd's default kills what is
         // left in the job's process group when the daemon exits. Supervised
@@ -165,6 +169,29 @@ pub fn desired_definition(platform: RuntimePlatform, paths: &RuntimePaths) -> St
             "<Task version=\"1.4\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\"><RegistrationInfo><URI>\\CortexKit\\subc-daemon</URI></RegistrationInfo><Triggers><LogonTrigger><Enabled>true</Enabled></LogonTrigger></Triggers><Principals><Principal id=\"Author\"><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals><Actions Context=\"Author\"><Exec><Command>{daemon}</Command></Exec></Actions></Task>\n"
         ),
     }
+}
+
+fn xml_text(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+/// ExecStart is parsed by systemd, not a shell: quotes keep spaces in one
+/// argument and doubled percent/dollar signs prevent manager expansion.
+fn systemd_argument(value: &str) -> String {
+    let escaped = value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t")
+        .replace('%', "%%")
+        .replace('$', "$$");
+    format!("\"{escaped}\"")
 }
 
 /// Query persistence and current liveness independently. A registration that
@@ -262,9 +289,21 @@ pub fn ensure<R: CommandRunner>(
     inventory: &mut Inventory,
 ) -> Result<(), String> {
     let desired = desired_definition(platform, paths);
-    let needs_definition = fs::read_to_string(&paths.definition)
-        .map(|current| current != desired)
-        .unwrap_or(true);
+    let current = fs::read_to_string(&paths.definition).ok();
+    let needs_definition = current.as_deref() != Some(desired.as_str());
+    if needs_definition && platform == RuntimePlatform::Macos && status.registered && status.live {
+        let old = current.as_deref().unwrap_or("<missing definition>");
+        let (line, before, after) = first_definition_difference(old, &desired);
+        let domain = format!("gui/{}", current_uid());
+        let quoted_path = format!(
+            "'{}'",
+            paths.definition.to_string_lossy().replace('\'', "'\"'\"'")
+        );
+        return Err(format!(
+            "refusal: live launchd definition {} differs at line {line}: current {before:?}; desired {after:?}. Nothing was written. At a time you choose, stop it with `launchctl bootout {domain}/{}` and re-run `ck setup` to write and load the new definition. The manual load command is `launchctl bootstrap {domain} {quoted_path}`. Setup will not stop a running daemon.",
+            paths.definition.display(), platform.identifier()
+        ));
+    }
     if needs_definition {
         let parent = paths.definition.parent().ok_or_else(|| {
             format!(
@@ -293,6 +332,23 @@ pub fn ensure<R: CommandRunner>(
     inventory.record("runtime-definition", &paths.definition, fields);
 
     let mut live = status.live;
+    if needs_definition && status.registered {
+        if platform == RuntimePlatform::Macos {
+            let args = vec![
+                "bootout".into(),
+                format!("gui/{}/{}", current_uid(), platform.identifier()),
+            ];
+            let result = runner.run("launchctl", &args)?;
+            if !result.success {
+                return Err(format!(
+                    "could not unload stopped launchd job: {}",
+                    result.explanation()
+                ));
+            }
+        }
+        register(platform, paths, runner)?;
+        live = observe(platform, runner)?.live;
+    }
     if !status.registered {
         register(platform, paths, runner)?;
         let mut fields = Map::new();
@@ -314,6 +370,24 @@ pub fn ensure<R: CommandRunner>(
         start(platform, paths, runner)?;
     }
     Ok(())
+}
+
+fn first_definition_difference<'a>(
+    current: &'a str,
+    desired: &'a str,
+) -> (usize, &'a str, &'a str) {
+    let mut old = current.lines();
+    for (index, line) in desired.lines().enumerate() {
+        let previous = old.next().unwrap_or("<absent>");
+        if previous != line {
+            return (index + 1, previous, line);
+        }
+    }
+    (
+        desired.lines().count() + 1,
+        old.next().unwrap_or("<absent>"),
+        "<absent>",
+    )
 }
 
 /// Deregisters the daemon from its service manager and leaves no daemon
@@ -975,6 +1049,129 @@ mod tests {
             }
             assert!(inventory.owns_path("runtime-definition", &paths.definition));
         }
+    }
+
+    #[test]
+    fn changed_live_macos_definition_refuses_without_writing_or_commands() {
+        let root = fixture_dir("live-definition-drift");
+        let paths = runtime_paths(RuntimePlatform::Macos, root.path(), root.path());
+        fs::create_dir_all(paths.definition.parent().unwrap()).unwrap();
+        fs::write(&paths.definition, "old plist\n").unwrap();
+        let mut inventory =
+            Inventory::load(root.join("installer-manifest.json"), "darwin-arm64").unwrap();
+        let mut runner = RecordingRunner::default();
+        let error = ensure(
+            RuntimePlatform::Macos,
+            &paths,
+            RuntimeStatus {
+                registered: true,
+                live: true,
+            },
+            &mut runner,
+            &mut inventory,
+        )
+        .expect_err("live job must not be rewritten");
+        assert!(
+            error.contains(&paths.definition.display().to_string()),
+            "{error}"
+        );
+        assert!(
+            error.contains("launchctl bootout") && error.contains("launchctl bootstrap"),
+            "{error}"
+        );
+        assert_eq!(
+            fs::read_to_string(&paths.definition).unwrap(),
+            "old plist\n"
+        );
+        assert!(runner.calls.is_empty());
+        assert!(!inventory.owns_path("runtime-definition", &paths.definition));
+    }
+
+    #[test]
+    fn changed_registered_definitions_reload_and_unchanged_live_jobs_are_untouched() {
+        for platform in [
+            RuntimePlatform::Macos,
+            RuntimePlatform::Linux,
+            RuntimePlatform::Windows,
+        ] {
+            let root = fixture_dir("stopped-definition-drift");
+            let paths = runtime_paths(platform, root.path(), root.path());
+            fs::create_dir_all(paths.definition.parent().unwrap()).unwrap();
+            fs::write(&paths.definition, "old definition\n").unwrap();
+            let mut inventory =
+                Inventory::load(root.join("installer-manifest.json"), "test").unwrap();
+            let mut runner = RecordingRunner::default();
+            ensure(
+                platform,
+                &paths,
+                RuntimeStatus {
+                    registered: true,
+                    live: false,
+                },
+                &mut runner,
+                &mut inventory,
+            )
+            .unwrap();
+            let verbs: Vec<_> = runner
+                .calls
+                .iter()
+                .map(|(_, args)| args.iter().map(String::as_str).collect::<Vec<_>>())
+                .collect();
+            let expected = match platform {
+                RuntimePlatform::Macos => "bootstrap",
+                RuntimePlatform::Linux => "daemon-reload",
+                RuntimePlatform::Windows => "/Create",
+            };
+            assert!(
+                verbs.iter().any(|args| args.contains(&expected)),
+                "{platform:?}: {verbs:?}"
+            );
+            assert_eq!(
+                fs::read_to_string(&paths.definition).unwrap(),
+                desired_definition(platform, &paths)
+            );
+            runner.calls.clear();
+            ensure(
+                platform,
+                &paths,
+                RuntimeStatus {
+                    registered: true,
+                    live: true,
+                },
+                &mut runner,
+                &mut inventory,
+            )
+            .unwrap();
+            assert!(runner.calls.is_empty(), "{platform:?}: {:?}", runner.calls);
+        }
+    }
+
+    #[test]
+    fn service_definitions_escape_xml_path_metacharacters() {
+        let paths = RuntimePaths {
+            daemon: PathBuf::from("/Users/R&D/<user>\"'/ck-subc"),
+            definition: PathBuf::from("unused"),
+        };
+        for platform in [RuntimePlatform::Macos, RuntimePlatform::Windows] {
+            let xml = desired_definition(platform, &paths);
+            assert!(
+                xml.contains("/Users/R&amp;D/&lt;user&gt;&quot;&apos;/ck-subc"),
+                "{xml}"
+            );
+        }
+    }
+
+    #[test]
+    fn systemd_execstart_quotes_one_literal_path() {
+        let paths = RuntimePaths {
+            daemon: PathBuf::from("/home/A B/100%/a\"b\\c/$d/ck-subc"),
+            definition: PathBuf::from("unused"),
+        };
+        let unit = desired_definition(RuntimePlatform::Linux, &paths);
+        assert!(
+            unit.contains("ExecStart=\"/home/A B/100%%/a\\\"b\\\\c/$$d/ck-subc\"\n"),
+            "{unit}"
+        );
     }
 
     #[test]

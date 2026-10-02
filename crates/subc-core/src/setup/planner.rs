@@ -15,7 +15,15 @@ pub struct SetupPlan {
 
 impl SetupPlan {
     pub fn is_authorized(&self) -> bool {
-        !self.outcomes.iter().any(PlanOutcome::blocks_execution)
+        self.blocking_outcome().is_none()
+    }
+
+    /// An explicitly requested setup target that cannot be installed is a
+    /// failed request, not a successful partial setup followed by health waits.
+    pub fn blocking_outcome(&self) -> Option<&PlanOutcome> {
+        self.outcomes.iter().find(|outcome| {
+            outcome.blocks_execution() || matches!(outcome, PlanOutcome::TargetRefused { .. })
+        })
     }
 
     pub fn mutation_count(&self) -> usize {
@@ -142,7 +150,7 @@ pub fn plan_setup(observed: &SetupObserved, request: &SetupRequest) -> SetupPlan
                 plan.operations
                     .push(SetupOperation::InstallComponent { component });
                 if component == Component::Core {
-                    core_is_being_installed = true;
+                    core_is_being_installed = !observed.core_binary_present;
                 }
                 plan.operations
                     .push(SetupOperation::ConfigureComponent { component });
@@ -237,7 +245,7 @@ fn setup_core_floor_refusal(
             "{component} requires core ≥ {floor}, but the installed core version could not be read"
         ));
     };
-    let Ok(installed) = installed_text.parse::<CoreVersion>() else {
+    let Ok(installed) = CoreVersion::from_release(installed_text) else {
         return Some(format!(
             "{component} requires core ≥ {floor}, but the installed core version could not be read (`{installed_text}`)"
         ));
@@ -572,7 +580,7 @@ fn upgrade_core_floor_refusal(observed: &UpgradeObserved, target: UpgradeTarget)
             target.component
         ));
     };
-    let Ok(core_version) = core_text.parse::<CoreVersion>() else {
+    let Ok(core_version) = CoreVersion::from_release(core_text) else {
         return Some(format!(
             "{} requires core ≥ {floor}, but core version `{core_text}` could not be read",
             target.component
@@ -659,6 +667,7 @@ mod tests {
             releases,
             requires_core: BTreeMap::new(),
             installed_core_version: None,
+            core_binary_present: false,
             runtime: RuntimeState::Missing,
             configuration: ConfigurationState::Additive,
             running_ck_adoption: None,
@@ -681,6 +690,7 @@ mod tests {
             .requires_core
             .insert(Component::Aft, "0.17.20".to_string());
         observed.installed_core_version = installed_version.map(ToOwned::to_owned);
+        observed.core_binary_present = true;
         observed.runtime = RuntimeState::Correct;
         observed
     }
@@ -772,6 +782,52 @@ mod tests {
     }
 
     #[test]
+    fn prerelease_core_can_meet_a_numeric_module_floor() {
+        let observed = floor_upgrade_observed("0.17.20", Some("0.18.0-rc.1"), Some("0.17.0"));
+        assert!(updates_target(
+            &plan_upgrade(&observed),
+            upgrade_target("ck-aft")
+        ));
+    }
+
+    #[test]
+    fn setup_config_drift_does_not_bypass_the_installed_core_floor() {
+        let mut observed = installed_core_setup(Some("0.17.19"));
+        observed
+            .components
+            .insert(Component::Core, ComponentState::Missing);
+        let plan = plan_setup(&observed, &SetupRequest::install(vec![Component::Aft]));
+        assert!(plan.outcomes.iter().any(|outcome| matches!(
+            outcome,
+            PlanOutcome::TargetRefused {
+                component: Component::Aft,
+                ..
+            }
+        )));
+        assert!(
+            !plan.operations.contains(&SetupOperation::InstallComponent {
+                component: Component::Aft
+            })
+        );
+    }
+
+    #[test]
+    fn setup_floor_refusal_blocks_runtime_mutations_and_exposes_the_reason() {
+        let mut observed = installed_core_setup(Some("0.17.19"));
+        observed.runtime = RuntimeState::Missing;
+        let plan = plan_setup(&observed, &SetupRequest::install(vec![Component::Aft]));
+        assert!(!plan.is_authorized());
+        assert!(plan
+            .blocking_outcome()
+            .unwrap()
+            .to_string()
+            .contains("requires core ≥ 0.17.20, installed 0.17.19; run `ck upgrade` first"));
+        let mut executor = RecordingExecutor::default();
+        execute_setup(&plan, ExecutionMode::Apply, &mut executor).unwrap();
+        assert!(executor.applied.is_empty());
+    }
+
+    #[test]
     fn setup_refuses_a_module_below_its_floor_and_dry_run_matches_apply() {
         let observed = installed_core_setup(Some("0.17.19"));
         let request = SetupRequest::install(vec![Component::Aft]);
@@ -779,7 +835,7 @@ mod tests {
         let execution_plan = plan_setup(&observed, &request);
 
         assert_eq!(preview_plan, execution_plan);
-        assert!(preview_plan.is_authorized());
+        assert!(!preview_plan.is_authorized());
         assert!(!preview_plan.operations.iter().any(|operation| matches!(
             operation,
             SetupOperation::InstallComponent {

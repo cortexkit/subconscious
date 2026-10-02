@@ -122,17 +122,17 @@ pub fn destination_inode(path: &Path) -> Result<String, String> {
 }
 
 pub fn expected_post_activation(
-    destination: &Path,
+    expected_inode: String,
     version: impl Into<String>,
     require_pid: bool,
     require_running_image_match: bool,
-) -> Result<VerificationExpectation, String> {
-    Ok(VerificationExpectation {
-        expected_inode: destination_inode(destination)?,
+) -> VerificationExpectation {
+    VerificationExpectation {
+        expected_inode,
         expected_version: version.into(),
         require_pid,
         require_running_image_match,
-    })
+    }
 }
 
 pub fn target_verification_label(target: UpgradeTarget) -> &'static str {

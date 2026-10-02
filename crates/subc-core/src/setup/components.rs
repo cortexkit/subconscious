@@ -853,33 +853,7 @@ fn check_reported(reported: &str, acceptance: &Acceptance) -> Result<(), String>
 }
 
 fn extract(archive: &Path, destination: &Path) -> Result<(), String> {
-    let (program, args) = if cfg!(windows) {
-        (
-            "powershell.exe",
-            vec![
-                "-NoProfile".to_string(),
-                "-NonInteractive".to_string(),
-                "-Command".to_string(),
-                format!(
-                    "Expand-Archive -LiteralPath '{}' -DestinationPath '{}' -Force",
-                    archive.display(),
-                    destination.display()
-                ),
-            ],
-        )
-    } else {
-        (
-            "unzip",
-            vec![
-                "-q".to_string(),
-                archive.to_string_lossy().into_owned(),
-                "-d".to_string(),
-                destination.to_string_lossy().into_owned(),
-            ],
-        )
-    };
-    let status = Command::new(program)
-        .args(args)
+    let status = extraction_command(cfg!(windows), archive, destination)
         .status()
         .map_err(|error| format!("could not extract {}: {error}", archive.display()))?;
     if status.success() {
@@ -887,6 +861,20 @@ fn extract(archive: &Path, destination: &Path) -> Result<(), String> {
     } else {
         Err(format!("extraction failed for {}", archive.display()))
     }
+}
+
+fn extraction_command(windows: bool, archive: &Path, destination: &Path) -> Command {
+    if windows {
+        return super::upgrade_assets::windows_extract_command(archive, destination);
+    }
+    let mut command = Command::new("unzip");
+    command.args([
+        "-q".as_ref(),
+        archive.as_os_str(),
+        "-d".as_ref(),
+        destination.as_os_str(),
+    ]);
+    command
 }
 
 pub fn digest_file(path: &Path) -> Result<String, String> {
@@ -987,6 +975,32 @@ mod tests {
     /// twice; this is the binding that keeps them from drifting. Every
     /// target that carries a module at all must list its program first, and
     /// core — which the daemon does not spawn — has no program.
+    #[test]
+    fn setup_windows_extraction_does_not_interpolate_paths() {
+        let archive = Path::new("C:\\Users\\O'Neil\\archive'; Write-Output INJECTED; '.zip");
+        let destination = Path::new("C:\\Users\\O'Neil\\extracted");
+        let command = extraction_command(true, archive, destination);
+        let script = command.get_args().last().unwrap().to_string_lossy();
+        assert!(!script.contains("INJECTED"), "{script}");
+        let env: std::collections::BTreeMap<_, _> = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.unwrap().to_string_lossy().into_owned(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            env.get("CK_ARCHIVE").map(String::as_str),
+            Some(archive.to_str().unwrap())
+        );
+        assert_eq!(
+            env.get("CK_DEST").map(String::as_str),
+            Some(destination.to_str().unwrap())
+        );
+    }
+
     #[test]
     fn module_program_leads_every_target_set() {
         for component in Component::ALL {

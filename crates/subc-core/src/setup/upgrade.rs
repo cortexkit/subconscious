@@ -271,6 +271,8 @@ pub struct SystemUpgradeBackend {
     assets: ReleaseUpgradeAssetFetcher,
     inventory: Inventory,
     prepared: BTreeMap<String, PreparedUpgradeAsset>,
+    /// Identity of the verified file captured at placement, before activation.
+    activated_inodes: BTreeMap<String, String>,
     rollback_paths: BTreeMap<String, PathBuf>,
     rollback_archive_sha256: BTreeMap<String, Option<String>>,
     expected_versions: BTreeMap<String, String>,
@@ -320,6 +322,7 @@ impl SystemUpgradeBackend {
             assets: ReleaseUpgradeAssetFetcher::from_index(index),
             inventory,
             prepared: BTreeMap::new(),
+            activated_inodes: BTreeMap::new(),
             rollback_paths: BTreeMap::new(),
             rollback_archive_sha256: BTreeMap::new(),
             expected_versions,
@@ -598,14 +601,19 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
             .remove(target.label())
             .ok_or_else(|| format!("no verified candidate was prepared for {target}"))?;
         if target.is_self_replacing() {
+            let version = self.expected_version(target)?.to_string();
             let result = self_update::replace_verified_candidate(
                 &destination,
                 &prepared.candidate,
                 &prepared.archive_sha256,
+                &version,
                 &mut self.inventory,
             );
             prepared.cleanup();
-            return result.map(|evidence| evidence.to_string());
+            let evidence = result?;
+            self.activated_inodes
+                .insert(target.label().into(), destination_inode(&destination)?);
+            return Ok(evidence.to_string());
         }
 
         let parent = destination.parent().ok_or_else(|| {
@@ -635,6 +643,8 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
             )
         })?;
         let archive_sha256 = prepared.archive_sha256.clone();
+        self.activated_inodes
+            .insert(target.label().into(), destination_inode(&destination)?);
         prepared.cleanup();
         self.record_replacement_digest(target, &destination, Some(&archive_sha256))?;
         Ok(format!(
@@ -760,18 +770,23 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
         };
         // Keep the existing reported-version exemption limited to the two
         // legacy targets whose releases were already accepted this way.
-        let expected_version = if target.accepts_reported_version() {
+        let expected_version = if target.accepts_reported_version()
+            || self.assets.accepts_reported_version(target, self.platform)
+        {
             version.clone()
         } else {
             self.expected_version(target)?.to_string()
         };
         let require_live_process = is_supervised_module || target.is_daemon();
         let expectation = expected_post_activation(
-            destination,
+            self.activated_inodes
+                .get(target.label())
+                .ok_or_else(|| format!("no replacement identity recorded for {target}"))?
+                .clone(),
             expected_version,
             require_live_process,
             require_live_process,
-        )?;
+        );
         let evidence = VerificationEvidence {
             pid,
             inode: destination_inode(destination)?,
@@ -795,6 +810,20 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
     }
 
     fn completed(&mut self, target: UpgradeTarget) {
+        // Failed targets keep their recovery evidence; a verified completed
+        // replacement no longer needs a private copy of the previous image.
+        if let Some(path) = self.rollback_paths.get(target.label()) {
+            match fs::remove_file(path) {
+                Ok(()) => {
+                    self.rollback_paths.remove(target.label());
+                    self.rollback_archive_sha256.remove(target.label());
+                }
+                Err(error) => eprintln!(
+                    "warning: upgrade completed but could not remove rollback copy {}: {error}",
+                    path.display()
+                ),
+            }
+        }
         println!("{}", self.completion_line(target));
     }
 
@@ -926,30 +955,14 @@ fn version_from_output(output: &[u8]) -> Result<String, String> {
         .split_whitespace()
         .map(|token| token.trim_start_matches('v'))
         .find(|token| {
-            let mut parts = token.split('.');
-            matches!(
-                (parts.next(), parts.next(), parts.next()),
-                (Some(major), Some(minor), Some(patch))
-                    if is_ascii_digits(major)
-                        && is_ascii_digits(minor)
-                        && patch.bytes().next().is_some_and(|byte| byte.is_ascii_digit())
-            )
+            super::model::CoreVersion::from_release(token).is_ok()
+                // MC's owner publishes build trains rather than numeric
+                // releases, and its --version line prints that train tag.
+                || token.strip_prefix("ck-mc-").is_some_and(|train| !train.is_empty()
+                    && train.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-')))
         })
-        .map(|version| {
-            version
-                .chars()
-                .take_while(|character| character.is_ascii_digit() || *character == '.')
-                .collect()
-        })
-        .filter(|version: &String| !version.is_empty())
+        .map(ToOwned::to_owned)
         .ok_or_else(|| format!("refusal: --version output had no semantic version: {output:?}"))
-}
-
-/// A version segment is one or more ASCII digits. `char::is_numeric` also
-/// accepts non-ASCII digits (Arabic-Indic, Devanagari, ...) and is trivially
-/// true for an empty segment, neither of which is a version component.
-fn is_ascii_digits(segment: &str) -> bool {
-    !segment.is_empty() && segment.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 fn canonical_or_original(path: &Path) -> PathBuf {
@@ -1000,6 +1013,121 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn isolated_backend(root: &Path, target: UpgradeTarget) -> SystemUpgradeBackend {
+        SystemUpgradeBackend {
+            platform: AlphaTarget::LinuxX64,
+            targets: [(
+                target.label().to_string(),
+                ManagedUpgradeTarget {
+                    target,
+                    destination: root.join(target.label()),
+                    installed_version: "0.1.0".into(),
+                    installed_archive_sha256: None,
+                },
+            )]
+            .into_iter()
+            .collect(),
+            executable: root.join("ck"),
+            subc: None,
+            assets: ReleaseUpgradeAssetFetcher::from_index(ReleaseIndex {
+                schema: 1,
+                channel: "alpha".into(),
+                generated_at_ms: 0,
+                components: BTreeMap::new(),
+            }),
+            inventory: Inventory::load(root.join("installer-manifest.json"), "linux-x64").unwrap(),
+            prepared: BTreeMap::new(),
+            activated_inodes: [(
+                target.label().into(),
+                destination_inode(&root.join(target.label())).unwrap(),
+            )]
+            .into_iter()
+            .collect(),
+            rollback_paths: BTreeMap::new(),
+            rollback_archive_sha256: BTreeMap::new(),
+            expected_versions: [(target.label().to_string(), "0.1.0".into())]
+                .into_iter()
+                .collect(),
+            planned_from: BTreeMap::new(),
+            supervised_modules: BTreeSet::new(),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn train_version_output_is_discovered_and_post_verified() {
+        let root = TestTempDir::new("train-version-output");
+        let target = upgrade_target("ck-mc");
+        let version = "ck-mc-alpha.22464bf2";
+        version_binary(&root.join("ck-mc"), version);
+        assert_eq!(binary_version(&root.join("ck-mc")).unwrap(), version);
+        let mut backend = isolated_backend(&root, target);
+        backend.set_expected_version(target, version.into());
+        assert!(backend.post_verify(target).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn successful_upgrade_completion_removes_its_rollback_copy() {
+        let root = TestTempDir::new("upgrade-completed-rollback");
+        let target = upgrade_target("ck-mc");
+        version_binary(&root.join("ck-mc"), "0.1.0");
+        let mut backend = isolated_backend(&root, target);
+        backend.create_rollback_copy(target).unwrap();
+        let path = backend.rollback_paths.get(target.label()).unwrap().clone();
+        assert!(path.is_file());
+        backend.completed(target);
+        assert!(!path.exists(), "{}", path.display());
+        assert!(!backend.rollback_paths.contains_key(target.label()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn post_verification_rejects_a_destination_changed_after_replacement() {
+        let root = TestTempDir::new("changed-post-inode");
+        let target = upgrade_target("ck-mc");
+        let destination = root.join("ck-mc");
+        version_binary(&destination, "0.1.0");
+        let mut backend = isolated_backend(&root, target);
+        let workspace = root.join("candidate");
+        backend
+            .inventory
+            .record("managed-binary", &destination, serde_json::Map::new());
+        fs::create_dir(&workspace).unwrap();
+        let candidate = workspace.join("ck-mc");
+        version_binary(&candidate, "0.1.0");
+        backend.prepared.insert(
+            target.label().into(),
+            PreparedUpgradeAsset::test_candidate(candidate, target),
+        );
+        backend.replace_destination(target).unwrap();
+        assert!(backend.post_verify(target).is_ok());
+        let rogue = root.join("rogue");
+        version_binary(&rogue, "0.1.0");
+        fs::rename(rogue, &destination).unwrap();
+        let error = backend
+            .post_verify(target)
+            .expect_err("changed destination must fail");
+        assert!(error.contains("destination inode mismatch"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn train_release_post_verifies_the_binarys_own_version() {
+        let root = TestTempDir::new("train-post-verify");
+        let target = upgrade_target("ck-mc");
+        version_binary(&root.join("ck-mc"), "0.1.0");
+        let mut backend = isolated_backend(&root, target);
+        backend.assets = ReleaseUpgradeAssetFetcher::from_index(serde_json::from_value(serde_json::json!({
+            "schema":1, "channel":"alpha", "generated_at_ms":0,
+            "components":{"mc":{"release":"ck-mc-deadbeef", "version":null,
+                "assets":{"linux-x64":{"ck-mc":{"url":"https://example.invalid/mc.zip", "sha256":"00", "reports":null}}}}}
+        })).unwrap());
+        backend.set_expected_version(target, "ck-mc-deadbeef".into());
+        assert!(backend.post_verify(target).is_ok());
+    }
+
+    #[cfg(unix)]
     #[test]
     fn rollback_replaces_running_executable_by_rename() {
         let root = fixture_dir("rollback-running-executable");
@@ -1037,6 +1165,7 @@ mod tests {
             }),
             inventory,
             prepared: BTreeMap::new(),
+            activated_inodes: BTreeMap::new(),
             rollback_paths: BTreeMap::from([(aft.label().to_string(), rollback)]),
             rollback_archive_sha256: BTreeMap::new(),
             expected_versions: BTreeMap::new(),
@@ -1175,6 +1304,14 @@ mod tests {
     }
 
     #[test]
+    fn release_versions_preserve_prerelease_and_build_suffixes() {
+        assert_eq!(
+            version_from_output(b"ck 0.18.0-rc.1+build.7").unwrap(),
+            "0.18.0-rc.1+build.7"
+        );
+    }
+
+    #[test]
     fn version_output_accepts_plain_and_prerelease_versions() {
         assert_eq!(
             version_from_output(b"ck 1.2.3").expect("plain version"),
@@ -1182,7 +1319,7 @@ mod tests {
         );
         assert_eq!(
             version_from_output(b"ck 1.2.3-rc.1").expect("prerelease version"),
-            "1.2.3"
+            "1.2.3-rc.1"
         );
     }
 
@@ -1357,6 +1494,7 @@ exit 1
             }),
             inventory,
             prepared: BTreeMap::new(),
+            activated_inodes: BTreeMap::new(),
             rollback_paths: BTreeMap::new(),
             rollback_archive_sha256: BTreeMap::new(),
             expected_versions: [(aft.label().to_string(), "2.0.0".to_string())]
@@ -1405,6 +1543,7 @@ exit 1
             }),
             inventory,
             prepared: BTreeMap::new(),
+            activated_inodes: BTreeMap::new(),
             rollback_paths: BTreeMap::new(),
             rollback_archive_sha256: BTreeMap::new(),
             expected_versions: [(mcp.label().to_string(), "0.17.36".to_string())]

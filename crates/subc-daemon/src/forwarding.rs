@@ -3915,6 +3915,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn late_bind_ack_during_daemon_drain_settles_without_leaking_or_closing_module() {
         let (forwarding, module_connection, endpoint, client_connection, sink, mut rx) =
             route_fixture("provider");

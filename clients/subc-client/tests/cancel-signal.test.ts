@@ -59,6 +59,7 @@ interface FakeState {
   cancels: { channel: number; epoch: number; corr: bigint }[];
   /** Corr of each REQUEST seen on a route channel, in order. */
   requestCorrs: bigint[];
+  routeFrames: FrameType[];
   routeOpenGate?: Promise<void>;
   dataGate?: Promise<void>;
 }
@@ -129,11 +130,33 @@ describe("request cancellation via AbortSignal", () => {
     const controller = new AbortController();
     controller.abort();
     const reqPromise = client.request(handle, { name: "late", arguments: {} }, { signal: controller.signal });
-    await waitFor(() => daemon.state.cancels.length === 1, "CANCEL for an already-aborted signal");
+    try {
+      await waitFor(() => daemon.state.routeFrames.length === 2, "REQUEST and CANCEL for an already-aborted signal");
+      expect(daemon.state.routeFrames).toEqual([FrameType.Request, FrameType.Cancel]);
+      expect(daemon.state.cancels[0]!.corr).toBe(daemon.state.requestCorrs[0]!);
+    } finally {
+      dataGate.resolve();
+      await reqPromise;
+      client.close();
+    }
+  });
 
-    dataGate.resolve();
-    await reqPromise;
-    client.close();
+  test("an already-aborted managed signal sends REQUEST before CANCEL", async () => {
+    const { client, daemon } = await connectClient();
+    const dataGate = deferred<void>();
+    daemon.state.dataGate = dataGate.promise;
+    const controller = new AbortController();
+    controller.abort();
+    const reqPromise = client.call(TOOL_TARGET.module_id, "late", {}, { signal: controller.signal });
+    try {
+      await waitFor(() => daemon.state.routeFrames.length === 2, "managed REQUEST and CANCEL");
+      expect(daemon.state.routeFrames).toEqual([FrameType.Request, FrameType.Cancel]);
+      expect(daemon.state.cancels[0]!.corr).toBe(daemon.state.requestCorrs[0]!);
+    } finally {
+      dataGate.resolve();
+      await reqPromise;
+      client.close();
+    }
   });
 
   test("a settled request removes its abort listener from a reused signal", async () => {
@@ -191,7 +214,7 @@ async function connectClient(): Promise<{ client: SubcClient; daemon: FakeDaemon
 }
 
 async function startFakeDaemon(): Promise<FakeDaemon> {
-  const state: FakeState = { routeOpens: 0, goodbyeChannels: [], openedChannels: [], cancels: [], requestCorrs: [] };
+  const state: FakeState = { routeOpens: 0, goodbyeChannels: [], openedChannels: [], cancels: [], requestCorrs: [], routeFrames: [] };
   const sockets = new Set<Socket>();
   const server = createServer((socket) => {
     sockets.add(socket);
@@ -228,6 +251,7 @@ async function handleConnection(socket: Socket, state: FakeState): Promise<void>
     // Per-frame deadline: one connection-lifetime deadline would expire mid-test
     // and look like a client fault.
     const frame = await readFrame(reader, Date.now() + 10_000);
+    if (frame.header.channel !== 0) state.routeFrames.push(frame.header.ty);
     if (frame.header.ty === FrameType.Goodbye) {
       state.goodbyeChannels.push(frame.header.channel);
       continue;

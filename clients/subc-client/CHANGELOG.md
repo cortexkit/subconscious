@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.20.1
+
+- Queue unary and managed REQUEST frames before attaching cancellation signals so an already-aborted signal cannot send CANCEL before its REQUEST.
+
 ## 0.20.0 — 2026-10-02
 
 - Export `RouteEndReason` and expose `closeReason` on `SubcError` and `SubcCallError`. Named channel reasons take precedence over legacy module-only pushes; caller closes and connection losses report SDK-side reasons. Channel reuse clears history and call retry kinds are unchanged.

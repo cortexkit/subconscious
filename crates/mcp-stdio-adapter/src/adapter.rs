@@ -22,15 +22,15 @@ use subc_protocol::{
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStdin, ChildStdout, Command},
-    sync::{Mutex as AsyncMutex, Notify},
+    sync::{Mutex as AsyncMutex, Notify, OwnedSemaphorePermit, Semaphore},
     time::{sleep_until, timeout, Instant as TokioInstant},
 };
 use tokio_util::sync::CancellationToken;
 
 use crate::{
     constants::{
-        BASE_ENV_KEYS, DEFAULT_MAX_CHILDREN, EVICTION_GRACE_MS, SPAWN_ATTEMPT_BUDGET,
-        SPAWN_INITIALIZE_BUDGET_MS, SPAWN_RETRY_COOLDOWN_MS,
+        BASE_ENV_KEYS, CHILD_EARLY_EXIT_MS, DEFAULT_MAX_CHILDREN, EVICTION_GRACE_MS,
+        SPAWN_ATTEMPT_BUDGET, SPAWN_INITIALIZE_BUDGET_MS, SPAWN_RETRY_COOLDOWN_MS,
     },
     registry::{EnvironmentValue, ServerConfig, ServerRegistry},
 };
@@ -47,7 +47,7 @@ const SPAWN_SHAPED_FIELDS: &[&str] = &[
     "spawn_spec",
 ];
 
-/// Atomics let health checks report lifecycle state without blocking on child state.
+/// Health accounting never takes a child-state lock or waits on subprocess work.
 #[derive(Debug)]
 pub struct HealthMetrics {
     children_live: AtomicU64,
@@ -56,8 +56,8 @@ pub struct HealthMetrics {
     spawn_failures_total: AtomicU64,
     idle_evictions_total: AtomicU64,
     eviction_timers_live: AtomicU64,
-    calls_in_flight: AtomicU64,
-    oldest_in_flight_ms: AtomicU64,
+    flights: Mutex<BTreeMap<u64, Instant>>,
+    next_flight_id: AtomicU64,
     cache_served_total: AtomicU64,
 }
 
@@ -70,8 +70,8 @@ impl Default for HealthMetrics {
             spawn_failures_total: AtomicU64::new(0),
             idle_evictions_total: AtomicU64::new(0),
             eviction_timers_live: AtomicU64::new(0),
-            calls_in_flight: AtomicU64::new(0),
-            oldest_in_flight_ms: AtomicU64::new(0),
+            flights: Mutex::new(BTreeMap::new()),
+            next_flight_id: AtomicU64::new(0),
             cache_served_total: AtomicU64::new(0),
         }
     }
@@ -79,6 +79,16 @@ impl Default for HealthMetrics {
 
 impl HealthMetrics {
     pub fn snapshot(&self) -> Value {
+        let flights = self
+            .flights
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let oldest_age = flights
+            .values()
+            .min()
+            .copied()
+            .map(elapsed_since)
+            .unwrap_or(0);
         json!({
             "children_live": self.children_live.load(Ordering::Relaxed),
             "children_max": self.children_max.load(Ordering::Relaxed),
@@ -86,11 +96,8 @@ impl HealthMetrics {
             "spawn_failures_total": self.spawn_failures_total.load(Ordering::Relaxed),
             "idle_evictions_total": self.idle_evictions_total.load(Ordering::Relaxed),
             "eviction_timers_live": self.eviction_timers_live.load(Ordering::Relaxed),
-            "calls_in_flight": self.calls_in_flight.load(Ordering::Relaxed),
-            "oldest_in_flight_ms": oldest_in_flight_age_ms(
-                self.calls_in_flight.load(Ordering::Relaxed),
-                self.oldest_in_flight_ms.load(Ordering::Relaxed),
-            ),
+            "calls_in_flight": flights.len(),
+            "oldest_in_flight_ms": oldest_age,
             "cache_served_total": self.cache_served_total.load(Ordering::Relaxed),
         })
     }
@@ -266,8 +273,17 @@ impl AdapterHandler {
             .into_handler_outcome();
         }
 
+        // Pagination cursors select different results. Keep their captures separate
+        // so following nextCursor cannot return an earlier page indefinitely.
+        let cache_key = (
+            request.server.clone(),
+            request
+                .payload
+                .pointer("/params/cursor")
+                .map(Value::to_string),
+        );
         if request.op == Operation::ToolsList && config.cache_tools_list {
-            if let Some(cached) = self.lifecycle.cached_tools(&request.server) {
+            if let Some(cached) = self.lifecycle.cached_tools(&cache_key) {
                 self.metrics
                     .cache_served_total
                     .fetch_add(1, Ordering::Relaxed);
@@ -290,7 +306,7 @@ impl AdapterHandler {
             Ok(forwarded) => {
                 if request.op == Operation::ToolsList && forwarded.cacheable {
                     self.lifecycle.cache_tools(
-                        &request.server,
+                        cache_key,
                         CachedTools {
                             payload: forwarded.payload.clone(),
                             observed_at_ms: forwarded.observed_at_ms,
@@ -317,8 +333,8 @@ impl ModuleHandler for AdapterHandler {
     }
 
     async fn health(&self) -> HealthReport {
-        // This lane reads only atomics. It neither waits on child state nor executes a
-        // subprocess, so a wedged spawn or teardown cannot delay a health response.
+        // The flight bookkeeping lock covers only timestamp insert/remove/snapshot.
+        // No child-state lock or subprocess work can delay this health lane.
         HealthReport {
             status: HealthStatus::Ok,
             detail: Some("stdio MCP child lifecycle metrics".to_string()),
@@ -332,7 +348,9 @@ struct ChildLifecycle {
     resolver: Arc<dyn CredentialResolver>,
     settings: LifecycleSettings,
     slots: Mutex<BTreeMap<String, Arc<ServerSlot>>>,
-    cached_tools: Mutex<BTreeMap<String, CachedTools>>,
+    cached_tools: Mutex<BTreeMap<(String, Option<String>), CachedTools>>,
+    capacity: Arc<Semaphore>,
+    capacity_gate: AsyncMutex<()>,
 }
 
 impl ChildLifecycle {
@@ -347,6 +365,8 @@ impl ChildLifecycle {
             settings,
             slots: Mutex::new(BTreeMap::new()),
             cached_tools: Mutex::new(BTreeMap::new()),
+            capacity: Arc::new(Semaphore::new(DEFAULT_MAX_CHILDREN as usize)),
+            capacity_gate: AsyncMutex::new(()),
         }
     }
 
@@ -362,19 +382,19 @@ impl ChildLifecycle {
         )
     }
 
-    fn cached_tools(&self, server: &str) -> Option<CachedTools> {
+    fn cached_tools(&self, key: &(String, Option<String>)) -> Option<CachedTools> {
         self.cached_tools
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(server)
+            .get(key)
             .cloned()
     }
 
-    fn cache_tools(&self, server: &str, cached: CachedTools) {
+    fn cache_tools(&self, key: (String, Option<String>), cached: CachedTools) {
         self.cached_tools
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(server.to_string(), cached);
+            .insert(key, cached);
     }
 
     async fn forward(
@@ -385,6 +405,7 @@ impl ChildLifecycle {
         payload: Value,
         cancel: &CancellationToken,
     ) -> Result<ForwardedResponse, LifecycleError> {
+        let deadline = Instant::now() + Duration::from_millis(config.deadline_ms);
         let attempts = if operation == Operation::ToolsList {
             2
         } else {
@@ -392,7 +413,7 @@ impl ChildLifecycle {
         };
         for attempt in 0..attempts {
             match self
-                .forward_once(server, &config, operation, payload.clone(), cancel)
+                .forward_once(server, &config, payload.clone(), cancel, deadline)
                 .await
             {
                 // A cancelled caller is gone for good: respawning a child for a
@@ -401,6 +422,9 @@ impl ChildLifecycle {
                     if attempt + 1 < attempts && !cancel.is_cancelled() =>
                 {
                     continue
+                }
+                Err(LifecycleError::CallOutcomeUnknown) if operation == Operation::ToolsList => {
+                    return Err(LifecycleError::ChildUnresponsive);
                 }
                 result => return result,
             }
@@ -412,13 +436,26 @@ impl ChildLifecycle {
         self: &Arc<Self>,
         server: &str,
         config: &ServerConfig,
-        _operation: Operation,
         payload: Value,
         cancel: &CancellationToken,
+        deadline: Instant,
     ) -> Result<ForwardedResponse, LifecycleError> {
         let slot = self.slot(server);
-        let mut state = slot.state.lock().await;
-        let spawned_at = self.ensure_child(server, config, &mut state).await?;
+        let mut state = tokio::select! {
+            state = tokio::time::timeout_at(TokioInstant::from_std(deadline), slot.state.lock()) =>
+                state.map_err(|_| LifecycleError::ChildUnresponsive)?,
+            () = cancel.cancelled() => return Err(LifecycleError::ChildUnresponsive),
+        };
+        let spawned_at = self
+            .ensure_child(server, config, &mut state, deadline)
+            .await?;
+        // Capture the handshake cost before writing the tool request. Vendor
+        // execution latency must not be attributed to the adapter's cold start.
+        let spawn_elapsed_ms = spawned_at.map(elapsed_since);
+        if Instant::now() >= deadline || cancel.is_cancelled() {
+            self.remove_session(&mut state).await;
+            return Err(LifecycleError::ChildUnresponsive);
+        }
         let session = state
             .session
             .as_mut()
@@ -430,22 +467,19 @@ impl ChildLifecycle {
             .await
             .is_err()
         {
+            self.record_early_exit(&mut state);
             self.remove_session(&mut state).await;
             return Err(LifecycleError::CallOutcomeUnknown);
         }
 
         // The per-server lane is held for the whole wait, so the read must be
         // bounded: a child that accepts the request and never replies would
-        // otherwise block every later call to this server (and the eviction
-        // timer) until the adapter restarts. Deadline expiry and caller
-        // cancellation both land on TimedOut, which tears the session down:
-        // the request may already be running inside the child, so its outcome
-        // is unknown and the session cannot be reused. The child is then
-        // terminated, so a late reply dies with the process instead of
-        // landing on a session nobody reads.
-        let deadline = Duration::from_millis(config.deadline_ms);
-        let read = timeout(
-            deadline,
+        // otherwise block every later call to this server. Discovery's one
+        // crash retry shares this deadline; a timeout never buys a new budget.
+        // Cancellation and deadline expiry both abandon and tear down the child,
+        // so a late reply cannot be consumed by a subsequent call.
+        let read = tokio::time::timeout_at(
+            TokioInstant::from_std(deadline),
             read_response(session, child_id, config.frame_ceiling_bytes),
         );
         let response = match tokio::select! {
@@ -460,7 +494,12 @@ impl ChildLifecycle {
                     ceiling_bytes: config.frame_ceiling_bytes,
                 });
             }
-            Err(FrameReadError::Closed | FrameReadError::TimedOut | FrameReadError::Io) => {
+            Err(FrameReadError::TimedOut) => {
+                self.remove_session(&mut state).await;
+                return Err(LifecycleError::ChildUnresponsive);
+            }
+            Err(FrameReadError::Closed | FrameReadError::Io) => {
+                self.record_early_exit(&mut state);
                 self.remove_session(&mut state).await;
                 return Err(LifecycleError::CallOutcomeUnknown);
             }
@@ -484,7 +523,7 @@ impl ChildLifecycle {
             payload,
             cacheable,
             observed_at_ms: epoch_millis(),
-            spawn_elapsed_ms: spawned_at.map(elapsed_since),
+            spawn_elapsed_ms,
         })
     }
 
@@ -493,13 +532,26 @@ impl ChildLifecycle {
         _server: &str,
         config: &ServerConfig,
         state: &mut SlotState,
+        deadline: Instant,
     ) -> Result<Option<Instant>, LifecycleError> {
         if let Some(session) = state.session.as_mut() {
             match session.child.try_wait() {
                 Ok(Some(_)) | Err(_) => {
+                    self.record_early_exit(state);
                     self.remove_session(state).await;
                 }
-                Ok(None) => return Ok(None),
+                Ok(None) if session.initialized_at.is_some() => {
+                    if session.initialized_at.unwrap().elapsed()
+                        >= Duration::from_millis(CHILD_EARLY_EXIT_MS)
+                    {
+                        state.consecutive_failures = 0;
+                        state.last_failure_cause = None;
+                    }
+                    return Ok(None);
+                }
+                // An aborted initialization retains its child and capacity slot
+                // until a subsequent call can tear it down and reap it.
+                Ok(None) => self.remove_session(state).await,
             }
         }
 
@@ -515,15 +567,22 @@ impl ChildLifecycle {
             state.cooldown_until = None;
         }
 
-        let child_env = match self.construct_environment(config).await {
-            Ok(environment) => environment,
-            Err(variable) => {
+        let capacity = self.reserve_capacity().await?;
+        let child_env = match tokio::time::timeout_at(
+            TokioInstant::from_std(deadline),
+            self.construct_environment(config),
+        )
+        .await
+        {
+            Ok(Ok(environment)) => environment,
+            result => {
+                let variable = result.ok().and_then(Result::err);
                 let retry_after_ms =
                     self.record_failed_attempt(state, SpawnFailureCause::CredentialResolution);
                 return Err(LifecycleError::SpawnFailed {
                     cause: SpawnFailureCause::CredentialResolution,
                     retry_after_ms,
-                    env_var: Some(variable),
+                    env_var: variable,
                 });
             }
         };
@@ -535,11 +594,12 @@ impl ChildLifecycle {
             .envs(child_env)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null());
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
         if let Some(cwd) = &config.cwd {
             command.current_dir(cwd);
         }
-        let mut child = match command.spawn() {
+        let (mut child, tree) = match spawn_contained(&mut command).await {
             Ok(child) => child,
             Err(_) => {
                 let retry_after_ms = self.record_failed_attempt(state, SpawnFailureCause::Exec);
@@ -554,30 +614,39 @@ impl ChildLifecycle {
         self.metrics.children_live.fetch_add(1, Ordering::Relaxed);
         let stdin = child.stdin.take().expect("piped stdin is present");
         let stdout = child.stdout.take().expect("piped stdout is present");
-        let mut session = ChildSession {
+        state.session = Some(ChildSession {
             child,
+            tree,
+            _capacity: capacity,
             stdin: Some(stdin),
             stdout: BufReader::new(stdout),
             next_id: 1,
             last_idle: Instant::now(),
-        };
+            initialized_at: None,
+        });
 
         if let Err(_error) = initialize_child(
-            &mut session,
+            state.session.as_mut().expect("spawn installed the child"),
             config.frame_ceiling_bytes,
-            self.settings.spawn_initialize_budget,
+            self.settings
+                .spawn_initialize_budget
+                .min(deadline.saturating_duration_since(Instant::now())),
         )
         .await
         {
-            self.terminate_session(&mut session).await;
+            self.remove_session(state).await;
             let _ = self.record_failed_attempt(state, SpawnFailureCause::InitializeTimeout);
             return Err(LifecycleError::InitializeFailed);
         }
 
-        state.consecutive_failures = 0;
+        // An initialize-then-exit loop must not reset its own failure streak.
+        // Reset that streak only after the child survives the early-exit window.
+        if !matches!(state.last_failure_cause, Some(SpawnFailureCause::EarlyExit)) {
+            state.consecutive_failures = 0;
+            state.last_failure_cause = None;
+        }
         state.cooldown_until = None;
-        state.last_failure_cause = None;
-        state.session = Some(session);
+        state.session.as_mut().unwrap().initialized_at = Some(Instant::now());
         Ok(Some(spawn_started))
     }
 
@@ -639,20 +708,82 @@ impl ChildLifecycle {
         }
     }
 
-    async fn remove_session(&self, state: &mut SlotState) {
-        if let Some(mut session) = state.session.take() {
-            self.terminate_session(&mut session).await;
+    fn record_early_exit(&self, state: &mut SlotState) {
+        if state
+            .session
+            .as_ref()
+            .and_then(|session| session.initialized_at)
+            .is_some_and(|started| started.elapsed() < Duration::from_millis(CHILD_EARLY_EXIT_MS))
+        {
+            self.record_failed_attempt(state, SpawnFailureCause::EarlyExit);
         }
     }
 
-    async fn terminate_session(&self, session: &mut ChildSession) {
-        session.stdin.take();
-        let waited = timeout(self.settings.eviction_grace, session.child.wait()).await;
-        if !matches!(waited, Ok(Ok(_))) {
-            let _ = session.child.start_kill();
-            let _ = session.child.wait().await;
+    async fn reserve_capacity(&self) -> Result<OwnedSemaphorePermit, LifecycleError> {
+        // Serialize eviction with claiming its replacement slot. Never wait for
+        // another server's state lock here: a locked lane is busy or initializing.
+        let _reservation = self.capacity_gate.lock().await;
+        if let Ok(permit) = Arc::clone(&self.capacity).try_acquire_owned() {
+            return Ok(permit);
         }
-        self.metrics.children_live.fetch_sub(1, Ordering::Relaxed);
+        let slots: Vec<_> = self
+            .slots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .cloned()
+            .collect();
+        let mut idle = Vec::new();
+        for slot in slots {
+            let last_idle = slot
+                .state
+                .try_lock()
+                .ok()
+                .and_then(|state| state.session.as_ref().map(|session| session.last_idle));
+            if let Some(last_idle) = last_idle {
+                idle.push((last_idle, slot));
+            }
+        }
+        idle.sort_by_key(|(last_idle, _)| *last_idle);
+        for (_, slot) in idle {
+            if let Ok(mut state) = slot.state.try_lock() {
+                if state.session.is_some() {
+                    self.remove_session(&mut state).await;
+                    self.metrics
+                        .idle_evictions_total
+                        .fetch_add(1, Ordering::Relaxed);
+                    break;
+                }
+            }
+        }
+        Arc::clone(&self.capacity)
+            .try_acquire_owned()
+            .map_err(|_| LifecycleError::ChildCapacity)
+    }
+
+    async fn remove_session(&self, state: &mut SlotState) {
+        if let Some(session) = state.session.take() {
+            self.terminate_session(session).await;
+        }
+    }
+
+    async fn terminate_session(&self, mut session: ChildSession) {
+        let metrics = Arc::clone(&self.metrics);
+        let grace = self.settings.eviction_grace;
+        // Teardown owns the capacity permit through reaping even if its caller
+        // disappears during grace. Cancelling the join does not cancel cleanup.
+        let cleanup = tokio::spawn(async move {
+            session.stdin.take();
+            let waited = timeout(grace, session.child.wait()).await;
+            // A normally exiting parent can still leave helpers behind.
+            session.tree.terminate();
+            if !matches!(waited, Ok(Ok(_))) {
+                let _ = session.child.start_kill();
+                let _ = session.child.wait().await;
+            }
+            metrics.children_live.fetch_sub(1, Ordering::Relaxed);
+        });
+        let _ = cleanup.await;
     }
 
     /// Re-arms the slot's single eviction timer after a successful call. The
@@ -756,10 +887,72 @@ struct SlotState {
 
 struct ChildSession {
     child: Child,
+    tree: ProcessTree,
+    _capacity: OwnedSemaphorePermit,
     stdin: Option<ChildStdin>,
     stdout: BufReader<ChildStdout>,
     next_id: u64,
     last_idle: Instant,
+    initialized_at: Option<Instant>,
+}
+
+struct ProcessTree {
+    #[cfg(unix)]
+    group: rustix::process::Pid,
+    #[cfg(windows)]
+    job: subc_jobobject::JobObject,
+}
+
+impl ProcessTree {
+    fn terminate(&self) {
+        #[cfg(unix)]
+        let _ = rustix::process::kill_process_group(self.group, rustix::process::Signal::KILL);
+        #[cfg(windows)]
+        let _ = self.job.terminate();
+    }
+}
+
+impl Drop for ProcessTree {
+    fn drop(&mut self) {
+        self.terminate();
+    }
+}
+
+async fn spawn_contained(command: &mut Command) -> std::io::Result<(Child, ProcessTree)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.as_std_mut().process_group(0);
+    }
+    #[cfg(windows)]
+    let job = {
+        let job = subc_jobobject::JobObject::new()?;
+        subc_jobobject::suspend_on_create_async(command);
+        job
+    };
+    let child = command.spawn()?;
+    #[cfg(windows)]
+    let child = {
+        let mut child = child;
+        let contained = job.assign(&child).and_then(|()| {
+            subc_jobobject::resume_main_thread(child.id().expect("new child has a pid"))
+        });
+        if let Err(error) = contained {
+            let _ = job.terminate();
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            return Err(error);
+        }
+        child
+    };
+    let tree = ProcessTree {
+        #[cfg(unix)]
+        group: rustix::process::Pid::from_raw(child.id().expect("new child has a pid") as i32)
+            .expect("child pid is positive"),
+        #[cfg(windows)]
+        job,
+    };
+    Ok((child, tree))
 }
 
 #[derive(Clone)]
@@ -788,6 +981,8 @@ enum LifecycleError {
         ceiling_bytes: u64,
     },
     CallOutcomeUnknown,
+    ChildUnresponsive,
+    ChildCapacity,
 }
 
 impl LifecycleError {
@@ -832,6 +1027,18 @@ impl LifecycleError {
                 json!({}),
             )
             .into_handler_outcome(),
+            Self::ChildUnresponsive => AdapterRefusal::with_detail(
+                "child_unresponsive",
+                "MCP child did not complete before the call was abandoned",
+                json!({}),
+            )
+            .into_handler_outcome(),
+            Self::ChildCapacity => AdapterRefusal::with_detail(
+                "child_capacity",
+                "all MCP child slots are busy",
+                json!({}),
+            )
+            .into_handler_outcome(),
         }
     }
 }
@@ -841,6 +1048,7 @@ enum SpawnFailureCause {
     Exec,
     InitializeTimeout,
     CredentialResolution,
+    EarlyExit,
 }
 
 impl SpawnFailureCause {
@@ -849,6 +1057,7 @@ impl SpawnFailureCause {
             Self::Exec => "exec",
             Self::InitializeTimeout => "initialize_timeout",
             Self::CredentialResolution => "credential_resolution",
+            Self::EarlyExit => "early_exit",
         }
     }
 }
@@ -882,7 +1091,7 @@ async fn initialize_child(
     let response = timeout(budget, read_response(session, 0, ceiling_bytes))
         .await
         .map_err(|_| FrameReadError::TimedOut)??;
-    if child_payload(response).is_none() {
+    if !response.get("result").is_some_and(Value::is_object) || response.get("error").is_some() {
         return Err(FrameReadError::Framing { observed_bytes: 0 });
     }
     write_json_line(
@@ -913,6 +1122,21 @@ async fn read_response(
             serde_json::from_slice(&frame).map_err(|_| FrameReadError::Framing {
                 observed_bytes: frame.len() as u64,
             })?;
+        // JSON-RPC requests and responses have independent id spaces. A server's
+        // ping can reuse our call id without becoming the call's terminal reply.
+        if let Some(method) = parsed.get("method") {
+            if let Some(id) = parsed.get("id") {
+                let reply = if method.as_str() == Some("ping") {
+                    json!({"jsonrpc":"2.0", "id":id, "result":{}})
+                } else {
+                    json!({"jsonrpc":"2.0", "id":id, "error":{"code":-32601, "message":"client method not supported"}})
+                };
+                write_json_line(session.stdin.as_mut(), &reply)
+                    .await
+                    .map_err(|_| FrameReadError::Io)?;
+            }
+            continue;
+        }
         if parsed.get("id").and_then(Value::as_u64) == Some(expected_id) {
             return Ok(parsed);
         }
@@ -960,24 +1184,28 @@ fn child_payload(response: Value) -> Option<Value> {
 
 struct FlightGuard {
     metrics: Arc<HealthMetrics>,
+    id: u64,
 }
 
 impl FlightGuard {
     fn new(metrics: Arc<HealthMetrics>) -> Self {
-        if metrics.calls_in_flight.fetch_add(1, Ordering::Relaxed) == 0 {
-            metrics
-                .oldest_in_flight_ms
-                .store(epoch_millis(), Ordering::Relaxed);
-        }
-        Self { metrics }
+        let id = metrics.next_flight_id.fetch_add(1, Ordering::Relaxed);
+        metrics
+            .flights
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(id, Instant::now());
+        Self { metrics, id }
     }
 }
 
 impl Drop for FlightGuard {
     fn drop(&mut self) {
-        if self.metrics.calls_in_flight.fetch_sub(1, Ordering::Relaxed) == 1 {
-            self.metrics.oldest_in_flight_ms.store(0, Ordering::Relaxed);
-        }
+        self.metrics
+            .flights
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.id);
     }
 }
 
@@ -1160,14 +1388,6 @@ fn find_spawn_shaped_field(value: &Value) -> Option<String> {
     }
 }
 
-fn oldest_in_flight_age_ms(calls_in_flight: u64, started_at_ms: u64) -> u64 {
-    if calls_in_flight == 0 || started_at_ms == 0 {
-        0
-    } else {
-        epoch_millis().saturating_sub(started_at_ms)
-    }
-}
-
 fn epoch_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1330,5 +1550,26 @@ mod tests {
         assert_eq!(metrics["children_live"], 0);
         assert_eq!(metrics["children_max"], 8);
         assert_eq!(metrics["spawns_total"], 0);
+    }
+
+    #[test]
+    fn oldest_flight_moves_to_surviving_call() {
+        let metrics = std::sync::Arc::new(super::HealthMetrics::default());
+        let first = super::FlightGuard::new(metrics.clone());
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let second = super::FlightGuard::new(metrics.clone());
+        drop(first);
+        assert!(metrics.snapshot()["oldest_in_flight_ms"].as_u64().unwrap() < 100);
+        drop(second);
+        assert_eq!(metrics.snapshot()["calls_in_flight"], 0);
+        assert_eq!(metrics.snapshot()["oldest_in_flight_ms"], 0);
+    }
+
+    #[test]
+    fn command_tool_arguments_follow_the_documented_spawn_field_fence() {
+        assert!(
+            matches!(parse_envelope(br#"{"server":"github","op":"tools/call","payload":{"method":"tools/call","params":{"name":"run","arguments":{"command":"ls"}}}}"#),
+            Err(EnvelopeError::SpawnShapedField { field }) if field == "command")
+        );
     }
 }

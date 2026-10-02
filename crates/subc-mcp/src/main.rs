@@ -2024,12 +2024,45 @@ async fn run_module(args: ModuleArgs) -> Result<()> {
         .unwrap_or_else(default_module_connection_file_path);
     publish_module_connection_file(&connection_file_path, key.clone(), daemon_id, port)?;
 
+    serve_shim_accepts(
+        || listener.accept(),
+        subc,
+        key,
+        daemon_id,
+        &mut supervision_task,
+    )
+    .await
+}
+
+async fn serve_shim_accepts<A, F>(
+    mut accept: A,
+    subc: SubcClient,
+    key: Vec<u8>,
+    daemon_id: [u8; subc_transport::DAEMON_ID_LEN],
+    supervision_task: &mut Option<JoinHandle<()>>,
+) -> Result<()>
+where
+    A: FnMut() -> F,
+    F: std::future::Future<Output = std::io::Result<(TcpStream, SocketAddr)>>,
+{
+    let mut accept_after = time::Instant::now();
     loop {
         tokio::select! {
-            accepted = listener.accept() => {
-                let (stream, _peer) = accepted.map_err(|source| {
-                    other_error(format!("failed to accept shim connection: {source}"))
-                })?;
+            accepted = async {
+                time::sleep_until(accept_after).await;
+                accept().await
+            } => {
+                let (stream, _peer) = match accepted {
+                    Ok(accepted) => accepted,
+                    Err(source) => {
+                        // A failed accept affects this connection attempt, not
+                        // existing sessions. Pace persistent resource failures
+                        // without preventing supervision from stopping the module.
+                        tracing::warn!(target: "shim", "failed to accept shim connection: {source}");
+                        accept_after = time::Instant::now() + Duration::from_millis(100);
+                        continue;
+                    }
+                };
                 let subc = subc.clone();
                 let key = key.clone();
                 tokio::spawn(async move {
@@ -2044,7 +2077,7 @@ async fn run_module(args: ModuleArgs) -> Result<()> {
             // loop alone never ends, so without this arm every stop or restart
             // ran to that budget and ended in SIGKILL. An unsupervised run has no
             // supervision connection and keeps serving until killed.
-            _ = supervision_ended(&mut supervision_task) => {
+            _ = supervision_ended(supervision_task) => {
                 tracing::info!("supervision connection ended; exiting");
                 return Ok(());
             }
@@ -2823,6 +2856,16 @@ fn desired_session_from_catalog(
             }
 
             let exposed_name = format!("{namespace}_{}", tool.name);
+            // Hosts apply their limit to the advertised name, including the
+            // namespace separator, not independently to its two components.
+            if exposed_name.len() > 64 {
+                tracing::debug!(
+                    "skipping tool '{}.{}': exposed MCP name exceeds 64 characters",
+                    entry.module_id,
+                    tool.name
+                );
+                continue;
+            }
             if is_reserved_meta_tool_name(&exposed_name) {
                 tracing::debug!(
                     "skipping tool '{}.{}': exposed name '{exposed_name}' collides with a reserved meta-tool",
@@ -4382,6 +4425,10 @@ impl SubcPromptRouteClient {
         }
         .await;
 
+        // Prompt routes are one-shot. Remove local relay ownership even when
+        // the remote GOODBYE cannot be written, so the session cannot accumulate
+        // completed routes or route a later reverse request to a finished call.
+        self.subc.relay().drop_route(route).await;
         if let Err(error) = send_route_goodbye(&self.subc, route).await {
             tracing::debug!(target: "prompt", "failed to close {target_label} route: {error}");
         }
@@ -5525,9 +5572,13 @@ async fn fail_pending_on_route(
 
     for ((channel, epoch, corr), reply) in replies {
         let body = match serde_json::to_vec(&ErrorBody {
-            code: "target_unavailable".to_owned(),
+            // Pending requests have already been dispatched. A provider closing
+            // its route cannot establish that a mutating request never executed.
+            code: "route_closed".to_owned(),
             message: message.to_owned(),
-            detail: None,
+            detail: Some(
+                serde_json::json!({"send_outcome":"outcome_unknown", "request_dispatched":true}),
+            ),
         }) {
             Ok(body) => body,
             Err(error) => {
@@ -6378,6 +6429,43 @@ mod tests {
     }
 
     #[test]
+    fn combined_tool_names_are_limited_to_64_characters() {
+        let modules = vec![CatalogEntry {
+            module_id: "provider".to_owned(),
+            ready: true,
+            not_ready: None,
+            module_version: None,
+            control_ops: Vec::new(),
+            capabilities: None,
+            self_signals: None,
+            roles: vec![ProviderRole::ToolProvider {
+                tools: [55, 56]
+                    .into_iter()
+                    .map(|length| ManifestTool {
+                        name: "t".repeat(length),
+                        description: None,
+                        execution_mode: ExecutionMode::Pure,
+                        schema: serde_json::json!({"type":"object"}),
+                    })
+                    .collect(),
+                identity_scope: Vec::new(),
+                concurrency: subc_protocol::manifest::Concurrency::Serial,
+                emits_push: false,
+                sub_supervises: false,
+            }],
+        }];
+        let desired =
+            desired_session_from_catalog(&GatewayConfig::facade_default(), &modules).unwrap();
+        let tools: Vec<_> = desired.providers.iter().flat_map(|p| &p.tools).collect();
+        assert_eq!(
+            tools.len(),
+            1,
+            "only the overlong combined name should be omitted"
+        );
+        assert_eq!(tools[0].exposed_tool.manifest.name.len(), 64);
+    }
+
+    #[test]
     fn mutation_command_id_is_stable_per_request_and_distinct_across_sessions() {
         let number_id = RequestId::Number(5);
         let same_session_same_request = mutation_command_id("shim-aaaa", &number_id)
@@ -6876,6 +6964,143 @@ mod tests {
         let (client, server) = tokio::join!(client, server);
         let (server, _) = server.unwrap();
         (client.unwrap(), server)
+    }
+
+    #[tokio::test]
+    async fn provider_goodbye_marks_dispatched_request_outcome_unknown() {
+        let route = RouteHandle {
+            channel: 7,
+            epoch: 2,
+            connection_token: 1,
+        };
+        let (tx, mut rx) = mpsc::channel(PENDING_FRAME_BUFFER);
+        let pending = Arc::new(Mutex::new(HashMap::from([(
+            (7, 2, 44),
+            PendingRequest {
+                reply: tx,
+                route_session: None,
+            },
+        )])));
+        fail_pending_on_route(&pending, route, "provider ended").await;
+        let frame = rx.recv().await.unwrap();
+        let error = subc_error_to_mcp("provider", &frame.body);
+        let data = error.data.unwrap();
+        assert_eq!(data["subc_code"], "route_closed");
+        assert_eq!(data["send_outcome"], "outcome_unknown");
+        assert_eq!(data["request_dispatched"], true);
+        assert!(pending.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn accept_error_does_not_end_gateway_or_supervision() {
+        let (client, _server) = connected_tcp_stream_pair().await;
+        let subc = SubcClient::start(client);
+        let calls = Arc::new(AtomicU64::new(0));
+        let (done, wait) = tokio::sync::oneshot::channel();
+        let mut done = Some(done);
+        let mut supervision = Some(tokio::spawn(async move {
+            let _ = wait.await;
+        }));
+        let count = Arc::clone(&calls);
+        let accept = move || {
+            let attempt = count.fetch_add(1, Ordering::Relaxed);
+            if attempt == 1 {
+                let _ = done.take().unwrap().send(());
+            }
+            async move {
+                if attempt == 0 {
+                    Err(std::io::Error::from(std::io::ErrorKind::ConnectionAborted))
+                } else {
+                    std::future::pending().await
+                }
+            }
+        };
+        time::timeout(
+            Duration::from_secs(2),
+            serve_shim_accepts(
+                accept,
+                subc,
+                generate_key().unwrap(),
+                generate_daemon_id().unwrap(),
+                &mut supervision,
+            ),
+        )
+        .await
+        .unwrap()
+        .expect("a transient accept error must not end the gateway");
+        assert!(calls.load(Ordering::Relaxed) >= 2);
+    }
+
+    #[tokio::test]
+    async fn prompt_call_drops_relay_route_on_success_and_remote_error() {
+        for remote_error in [false, true] {
+            let (client, mut server) = connected_tcp_stream_pair().await;
+            let subc = SubcClient::start(client);
+            let (close_tx, close_rx) = tokio::sync::oneshot::channel();
+            let daemon = tokio::spawn(async move {
+                let open = read_frame(&mut server).await.unwrap().unwrap();
+                let response = build_frame(
+                    FrameType::Response,
+                    control_flags(),
+                    0,
+                    0,
+                    open.header.corr,
+                    serde_json::to_vec(&ClientControlResponse::RouteOpen {
+                        route_channel: 7,
+                        route_epoch: 1,
+                    })
+                    .unwrap(),
+                )
+                .unwrap();
+                write_frame(&mut server, &response).await.unwrap();
+                let request = read_frame(&mut server).await.unwrap().unwrap();
+                let (ty, body) = if remote_error {
+                    (
+                        FrameType::Error,
+                        serde_json::to_vec(&ErrorBody {
+                            code: "unavailable".to_owned(),
+                            message: "gone".to_owned(),
+                            detail: None,
+                        })
+                        .unwrap(),
+                    )
+                } else {
+                    (FrameType::Response, br#"{"ok":true}"#.to_vec())
+                };
+                let response =
+                    build_frame(ty, data_flags(), 7, 1, request.header.corr, body).unwrap();
+                write_frame(&mut server, &response).await.unwrap();
+                let goodbye = read_frame(&mut server).await.unwrap().unwrap();
+                assert_eq!(goodbye.header.ty, FrameType::Goodbye);
+                let _ = close_rx.await;
+            });
+            let routes = SubcPromptRouteClient::new(
+                subc.clone(),
+                BindIdentity::new(
+                    PathBuf::from("/tmp/prompt-relay"),
+                    DEFAULT_HARNESS.to_owned(),
+                    "prompt".to_owned(),
+                ),
+                Arc::new(RelaySession::new("prompt".to_owned())),
+            );
+            let result = routes
+                .call_route(
+                    PromptRouteTarget::Thalamus,
+                    None,
+                    serde_json::json!({"method":"status"}),
+                )
+                .await;
+            assert_eq!(result.is_err(), remote_error);
+            assert!(
+                subc.relay()
+                    .route_session(subc.relay().route_handle(7, 1))
+                    .await
+                    .is_none(),
+                "completed prompt route must leave the relay"
+            );
+            let _ = close_tx.send(());
+            daemon.await.unwrap();
+        }
     }
 
     async fn assert_open_provider_route_consumer_capabilities(

@@ -281,9 +281,9 @@ async fn wedged_child_call_ends_at_deadline_and_later_calls_are_not_queued_behin
     );
 
     let (code, _detail) = first.expect("first call must end at the configured deadline, not hang");
-    assert_eq!(code, "call_outcome_unknown");
+    assert_eq!(code, "child_unresponsive");
     let (code, _detail) = second.expect("second call must not queue behind the wedged session");
-    assert_eq!(code, "call_outcome_unknown");
+    assert_eq!(code, "child_unresponsive");
     assert_eq!(handler.metrics().snapshot()["children_live"], 0);
 }
 
@@ -324,7 +324,7 @@ async fn cancelled_call_stops_waiting_on_a_wedged_child() {
     let HandlerOutcome::ErrorWithDetail { code, .. } = outcome else {
         panic!("cancelled call must end as a refusal: {outcome:?}");
     };
-    assert_eq!(code, "call_outcome_unknown");
+    assert_eq!(code, "child_unresponsive");
     assert_eq!(metrics.snapshot()["children_live"], 0);
 }
 
@@ -378,4 +378,253 @@ async fn framing_kill_refusal_fence_names_the_ceiling_and_other_server_remains_l
     assert_eq!(normal["payload"]["tools"][0]["name"], "fixture");
 
     evict_after_test_ttl(&handler, 1).await;
+}
+
+fn mode_handler(mode: &str) -> AdapterHandler {
+    AdapterHandler::with_resolver(
+        registry(json!({"fixture": server(json!({"FIXTURE_MODE": {"value": mode}}))})),
+        Arc::new(MissingResolver),
+        test_settings(),
+    )
+}
+
+#[tokio::test]
+async fn initialize_error_is_refused_before_tool_dispatch() {
+    let home = subc_test_support::TestTempDir::new("initialize-error-frames");
+    let events = home.join("frames.jsonl");
+    let handler = AdapterHandler::with_resolver(
+        registry(
+            json!({"fixture":server(json!({"FIXTURE_MODE":{"value":"initialize-error"},
+            "FIXTURE_EVENTS_PATH":{"value":events.to_string_lossy()}}))}),
+        ),
+        Arc::new(MissingResolver),
+        test_settings(),
+    );
+    let (code, _) = refusal(&handler, "fixture", "tools/call").await;
+    assert_eq!(code, "initialize_failed");
+    assert_eq!(handler.metrics().snapshot()["children_live"], 0);
+    let frames: Vec<Value> = std::fs::read_to_string(events)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(
+        frames.len(),
+        1,
+        "initialize refusal must not write initialized or a tool request"
+    );
+    assert_eq!(frames[0]["method"], "initialize");
+}
+
+#[tokio::test]
+async fn tools_list_cache_preserves_cursor_pages_in_both_orders() {
+    for second_first in [false, true] {
+        let handler = mode_handler("paginated");
+        let params = if second_first {
+            json!({"cursor":"p2"})
+        } else {
+            json!({})
+        };
+        let first = call(&handler, "fixture", "tools/list", params.clone()).await;
+        assert_eq!(
+            first["payload"]["tools"][0]["name"],
+            if second_first { "second" } else { "first" }
+        );
+        let other_params = if second_first {
+            json!({})
+        } else {
+            json!({"cursor":"p2"})
+        };
+        let other = call(&handler, "fixture", "tools/list", other_params).await;
+        assert_eq!(
+            other["payload"]["tools"][0]["name"],
+            if second_first { "first" } else { "second" }
+        );
+        let cached = call(&handler, "fixture", "tools/list", params).await;
+        assert_eq!(cached["served_from"], "cache");
+        assert_eq!(cached["payload"], first["payload"]);
+    }
+}
+
+#[tokio::test]
+async fn server_request_with_call_id_is_not_a_response() {
+    let handler = mode_handler("same-id-ping");
+    let result = call(&handler, "fixture", "tools/call", json!({"name":"fixture"})).await;
+    assert_eq!(result["payload"]["echo"]["name"], "fixture");
+    evict_after_test_ttl(&handler, 1).await;
+}
+
+#[tokio::test]
+async fn discovery_deadline_is_not_retried_and_reports_child_unresponsive() {
+    let handler = AdapterHandler::with_resolver(
+        registry(
+            json!({"fixture": {"command":fixture_path(), "deadline_ms":200,
+            "env":{"FIXTURE_MODE":{"value":"hang"}}}}),
+        ),
+        Arc::new(MissingResolver),
+        test_settings(),
+    );
+    let (code, _) = refusal(&handler, "fixture", "tools/list").await;
+    assert_eq!(code, "child_unresponsive");
+    assert_eq!(
+        handler.metrics().snapshot()["spawns_total"],
+        1,
+        "deadline exhaustion cannot buy another full deadline"
+    );
+}
+
+#[tokio::test]
+async fn spawn_elapsed_excludes_slow_tool_execution() {
+    let handler = mode_handler("slow");
+    let start = std::time::Instant::now();
+    let reply = call(&handler, "fixture", "tools/call", json!({})).await;
+    let total = start.elapsed().as_millis() as u64;
+    let spawn = reply["spawn_elapsed_ms"].as_u64().unwrap();
+    assert!(
+        total.saturating_sub(spawn) >= 180,
+        "tool latency belongs outside spawn cost: total={total}, spawn={spawn}"
+    );
+    evict_after_test_ttl(&handler, 1).await;
+}
+
+#[tokio::test]
+async fn early_child_exits_exhaust_spawn_budget() {
+    let handler = AdapterHandler::with_resolver(
+        registry(json!({"fixture":server(json!({"FIXTURE_MODE":{"value":"early-exit"}}))})),
+        Arc::new(MissingResolver),
+        LifecycleSettings {
+            idle_ttl_override: None,
+            ..test_settings()
+        },
+    );
+    for _ in 0..3 {
+        assert_eq!(
+            refusal(&handler, "fixture", "tools/call").await.0,
+            "call_outcome_unknown"
+        );
+    }
+    let (code, detail) = refusal(&handler, "fixture", "tools/call").await;
+    assert_eq!(code, "spawn_failed");
+    assert_eq!(detail["cause"], "early_exit");
+    assert!(detail["retry_after_ms"].as_u64().unwrap() > 0);
+    assert_eq!(handler.metrics().snapshot()["spawns_total"], 3);
+}
+
+#[tokio::test]
+async fn idle_children_are_evicted_at_global_capacity() {
+    let servers: serde_json::Map<String, Value> = (0..9)
+        .map(|i| (format!("s{i}"), server(json!({}))))
+        .collect();
+    let handler = AdapterHandler::with_resolver(
+        registry(Value::Object(servers)),
+        Arc::new(MissingResolver),
+        LifecycleSettings {
+            idle_ttl_override: None,
+            ..test_settings()
+        },
+    );
+    for i in 0..9 {
+        call(&handler, &format!("s{i}"), "tools/call", json!({})).await;
+        assert!(
+            handler.metrics().snapshot()["children_live"]
+                .as_u64()
+                .unwrap()
+                <= 8
+        );
+    }
+    assert_eq!(handler.metrics().snapshot()["idle_evictions_total"], 1);
+    assert_eq!(handler.metrics().snapshot()["spawns_total"], 9);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn teardown_kills_grandchild_ignoring_sigterm() {
+    let handler = mode_handler("tree");
+    let reply = call(&handler, "fixture", "tools/call", json!({})).await;
+    let pid =
+        rustix::process::Pid::from_raw(reply["payload"]["grandchild_pid"].as_u64().unwrap() as i32)
+            .unwrap();
+    evict_after_test_ttl(&handler, 1).await;
+    let gone = tokio::time::timeout(Duration::from_secs(2), async {
+        while rustix::process::test_kill_process(pid).is_ok() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .is_ok();
+    // A failed regression must not leave its intentionally uncontained helper behind.
+    if !gone {
+        let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+    }
+    assert!(
+        gone,
+        "session teardown must kill descendants even when they ignore SIGTERM"
+    );
+}
+
+#[tokio::test]
+async fn busy_children_refuse_at_global_capacity() {
+    let servers: serde_json::Map<String, Value> = (0..9)
+        .map(|i| {
+            (
+                format!("s{i}"),
+                server(json!({"FIXTURE_MODE":{"value":"hang"}})),
+            )
+        })
+        .collect();
+    let handler = Arc::new(AdapterHandler::with_resolver(
+        registry(Value::Object(servers)),
+        Arc::new(MissingResolver),
+        LifecycleSettings {
+            idle_ttl_override: None,
+            ..test_settings()
+        },
+    ));
+    let token = CancellationToken::new();
+    let mut calls = Vec::new();
+    for i in 0..8 {
+        let handler = Arc::clone(&handler);
+        let token = token.clone();
+        calls.push(tokio::spawn(async move { handler.route_outcome_with_cancellation(
+            &serde_json::to_vec(&json!({"server":format!("s{i}"), "op":"tools/call", "payload":{"method":"tools/call"}})).unwrap(), token,
+        ).await }));
+    }
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while handler.metrics().snapshot()["children_live"]
+            .as_u64()
+            .unwrap()
+            < 8
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let ninth_handler = Arc::clone(&handler);
+    let ninth_token = token.clone();
+    let mut ninth_call = tokio::spawn(async move {
+        ninth_handler
+            .route_outcome_with_cancellation(
+                br#"{"server":"s8","op":"tools/call","payload":{"method":"tools/call"}}"#,
+                ninth_token,
+            )
+            .await
+    });
+    let ninth = tokio::time::timeout(Duration::from_secs(2), &mut ninth_call).await;
+    token.cancel();
+    if ninth.is_err() {
+        ninth_call.await.unwrap();
+    }
+    for call in calls {
+        call.await.unwrap();
+    }
+    let outcome = ninth
+        .expect("busy capacity must refuse instead of spawning")
+        .unwrap();
+    let HandlerOutcome::ErrorWithDetail { code, .. } = outcome else {
+        panic!("capacity must refuse: {outcome:?}");
+    };
+    assert_eq!(code, "child_capacity");
+    assert_eq!(handler.metrics().snapshot()["children_live"], 0);
+    assert_eq!(handler.metrics().snapshot()["spawns_total"], 8);
 }

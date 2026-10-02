@@ -2986,10 +2986,18 @@ async fn mcp_provider_goodbye_removes_tools_notifies_and_fails_inflight_call() {
 
     let err = call.await.unwrap().unwrap_err();
     match err {
-        ServiceError::McpError(error) => assert!(
-            error.message.contains("target_unavailable"),
-            "in-flight provider call should fail cleanly, got {error:?}"
-        ),
+        ServiceError::McpError(error) => {
+            assert!(
+                error.message.contains("route_closed"),
+                "in-flight provider call should fail cleanly, got {error:?}"
+            );
+            let data = error
+                .data
+                .expect("dispatched call must carry retry-safety metadata");
+            assert_eq!(data["subc_code"], "route_closed");
+            assert_eq!(data["send_outcome"], "outcome_unknown");
+            assert_eq!(data["request_dispatched"], true);
+        }
         other => panic!("expected MCP error for provider death, got {other:?}"),
     }
     assert_eq!(list_tool_names(&harness).await, vec!["aft_read"]);
@@ -4027,6 +4035,8 @@ async fn mcp_module_without_spawn_attestation_exits_loud_before_serving() {
         .arg("--connection-file")
         .arg(&module_connection_file)
         .env("XDG_CONFIG_HOME", &xdg_config_home)
+        .env("XDG_DATA_HOME", &xdg_config_home)
+        .env("XDG_RUNTIME_DIR", &xdg_config_home)
         .env_remove(subc_protocol::SUBC_MODULE_ID_ENV)
         .env_remove(subc_protocol::SUBC_LAUNCH_NONCE_ENV)
         .stderr(process::Stdio::piped())
@@ -4295,6 +4305,14 @@ fn stub_spec(module_id: &str, events_path: &Path, extra_env: &[(&str, &str)]) ->
             events_path.display().to_string(),
         ),
     ];
+    let home = events_path
+        .parent()
+        .expect("fixture events have an isolated parent");
+    env.extend(
+        ["XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_RUNTIME_DIR"]
+            .into_iter()
+            .map(|name| (name.to_owned(), home.display().to_string())),
+    );
     env.extend(
         extra_env
             .iter()
@@ -4470,6 +4488,7 @@ fn spawn_shim(
         .env("CLAUDE_PROJECT_DIR", project_root)
         .env("XDG_CONFIG_HOME", xdg_config_home)
         .env("XDG_DATA_HOME", xdg_config_home)
+        .env("XDG_RUNTIME_DIR", xdg_config_home)
         .env_remove(subc_protocol::SUBC_MODULE_ID_ENV)
         .stdin(process::Stdio::piped())
         .stdout(process::Stdio::piped())

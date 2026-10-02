@@ -1,6 +1,6 @@
 [package]
 name = "mcp-stdio-adapter"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2021"
 license = "MIT"
 publish = false
@@ -20,6 +20,12 @@ subc-jsonc = { path = "../subc-jsonc" }
 subc-protocol = { path = "../subc-protocol" }
 tokio = { version = "1", features = ["io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
 tokio-util = "0.7"
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", default-features = false, features = ["process", "std"] }
+
+[target.'cfg(windows)'.dependencies]
+subc-jobobject = { path = "../subc-jobobject" }
 
 [dev-dependencies]
 subc-test-support = { path = "../subc-test-support" }

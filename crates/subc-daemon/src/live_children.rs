@@ -71,7 +71,8 @@ pub(crate) struct LiveChild {
     /// `subc_os::start_time` read right after spawn. `None` where the platform
     /// has no source, and then the entry is never signalled.
     pub(crate) start_time: Option<u64>,
-    /// The spawned path's device and inode, read at spawn. `None` if the path
+    /// The running image's device and inode, read after exec at spawn. This
+    /// includes PATH resolution and a script's interpreter. `None` if the image
     /// could not be read, and then the entry is never signalled.
     pub(crate) executable: Option<ExecutableIdentity>,
     /// The child's cgroup directory name, when it was placed in one (Linux).

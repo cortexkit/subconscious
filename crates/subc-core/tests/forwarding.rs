@@ -7940,6 +7940,7 @@ fn health_config(
     critical: bool,
 ) -> HealthConfig {
     HealthConfig {
+        http: None,
         cadence,
         deadline,
         failure_threshold,

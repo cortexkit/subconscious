@@ -44,6 +44,7 @@ use crate::registry::RegistrationSlot;
 /// was used directly, and it passes `_` through, so `a_40swap` and `a@swap`
 /// (and `a` + `_40swap`) named one directory; for ids containing `_` the
 /// primary name therefore differs from what earlier daemons created.
+#[cfg(any(target_os = "linux", test))]
 pub(crate) fn cgroup_name(module_id: &str, alternate: bool) -> String {
     let mut name = String::with_capacity(module_id.len() + 5);
     for byte in module_id.bytes() {
@@ -103,12 +104,13 @@ impl CandidateFailure {
     }
 }
 
-/// Run one swap to completion. Replies on `reply` at cutover or failure.
+/// Run one swap through cutover or failure. Successful cutover starts
+/// incumbent retirement in the background and replies on `reply` immediately.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run_swap(
     spec: &ModuleSpec,
     runtime: &SupervisorRuntimeConfig,
-    registry: &Registry,
+    registry: &Arc<Registry>,
     process_liveness: &SupervisorProcessLiveness,
     snapshot: &SharedSnapshot,
     child: &mut Option<SupervisedChild>,
@@ -137,7 +139,7 @@ pub(super) async fn run_swap(
 async fn run_swap_inner(
     spec: &ModuleSpec,
     runtime: &SupervisorRuntimeConfig,
-    registry: &Registry,
+    registry: &Arc<Registry>,
     process_liveness: &SupervisorProcessLiveness,
     snapshot: &SharedSnapshot,
     child: &mut Option<SupervisedChild>,
@@ -186,10 +188,17 @@ async fn run_swap_inner(
             return;
         }
     };
+    #[cfg(target_os = "linux")]
+    let candidate_cgroup = candidate
+        .cgroup_placement
+        .as_ref()
+        .map(|_| candidate.module_id.as_str());
+    #[cfg(not(target_os = "linux"))]
+    let candidate_cgroup: Option<&str> = None;
     info!(
         module_id,
         candidate_pid = candidate.pid,
-        cgroup = %cgroup_name(module_id, candidate_alternate),
+        cgroup = ?candidate_cgroup,
         incumbent_connection_id = incumbent_connection.get(),
         ready_timeout_ms = ready_timeout.as_millis() as u64,
         "swap candidate spawned; routing stays on the incumbent until it is ready"
@@ -378,7 +387,7 @@ async fn run_swap_inner(
     );
     let _ = reply.send(Ok(()));
 
-    retire_incumbent(
+    dispatch_retirement(
         spec,
         runtime,
         registry,
@@ -390,7 +399,45 @@ async fn run_swap_inner(
         incumbent_generation,
     )
     .await;
-    handle.close_swap(module_id);
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_retirement(
+    spec: &ModuleSpec,
+    runtime: &SupervisorRuntimeConfig,
+    registry: &Arc<Registry>,
+    forwarding: &Arc<ForwardingTable>,
+    snapshot: &SharedSnapshot,
+    incumbent: Option<SupervisedChild>,
+    incumbent_endpoint: Option<crate::ModuleEndpointId>,
+    incumbent_connection: ConnectionId,
+    incumbent_generation: u64,
+) {
+    let spec = spec.clone();
+    let runtime = runtime.clone();
+    let registry = Arc::clone(registry);
+    let forwarding = Arc::clone(forwarding);
+    let snapshot = Arc::clone(snapshot);
+    // The promoted process must return to its supervision loop at cutover.
+    // Keep the swap open until the old process is reaped so another swap
+    // cannot reuse its slot or discard its consumer attestation nonce.
+    tokio::spawn(async move {
+        retire_incumbent(
+            &spec,
+            &runtime,
+            &registry,
+            &forwarding,
+            &snapshot,
+            incumbent,
+            incumbent_endpoint,
+            incumbent_connection,
+            incumbent_generation,
+        )
+        .await;
+        if let Some(handle) = &runtime.supervisor_handle {
+            handle.close_swap(&spec.module_id);
+        }
+    });
 }
 
 /// Answer one module command that arrived while the candidate warmed, or hand
@@ -845,6 +892,9 @@ async fn retire_incumbent(
     let _ = update_snapshot(snapshot, Some(module_id), |state| {
         state.last_exit = Some(exit_report.clone());
     });
+    // A shutdown waits for the roster to empty. Release only after writing
+    // the durable terminal record, never merely after wait() reaps the pid.
+    incumbent.release_roster();
     if let Err(err) = wait_for_slot_registration_release(
         registry,
         RegistrationSlot::Connection(incumbent_connection),
@@ -865,6 +915,69 @@ async fn retire_incumbent(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn retirement_returns_promptly_and_shutdown_waits_for_its_journal() {
+        let dir = subc_test_support::TestTempDir::new("background-retirement");
+        let journal = dir.join("terminals.jsonl");
+        let supervisor = Supervisor::default()
+            .with_handle(SupervisorHandle::new())
+            .with_terminal_journal(journal.clone(), "retirement-test".into());
+        let runtime = supervisor.runtime_config();
+        let spec = ModuleSpec {
+            module_id: "retiring".into(),
+            program: PathBuf::from("/bin/sleep"),
+            args: vec!["60".into()],
+            env: ["XDG_DATA_HOME", "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME"]
+                .into_iter()
+                .map(|key| (key.into(), dir.to_string_lossy().into_owned()))
+                .collect(),
+            reserved: false,
+            reserved_prefixes: vec![],
+            protocol: ModuleProtocol::None,
+            overlap: ModuleOverlap::Safe,
+        };
+        let incumbent = spawn_child(
+            &spec,
+            None,
+            runtime.supervisor_handle.as_ref(),
+            &runtime.stderr_ring,
+            None,
+            &runtime.child_roster,
+            #[cfg(target_os = "linux")]
+            None,
+        )
+        .unwrap();
+        let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
+        let forwarding = Arc::new(ForwardingTable::default());
+        timeout(
+            Duration::from_millis(100),
+            dispatch_retirement(
+                &spec,
+                &runtime,
+                &supervisor.registry,
+                &forwarding,
+                &snapshot,
+                Some(incumbent),
+                None,
+                ConnectionId::new(999),
+                1,
+            ),
+        )
+        .await
+        .expect("incumbent retirement must not block the promoted process's supervision");
+        supervisor.begin_daemon_shutdown();
+        supervisor
+            .end_children_for_daemon_shutdown(false, std::future::pending())
+            .await;
+        let records = std::fs::read_to_string(&journal).unwrap();
+        assert!(
+            records.contains("retiring"),
+            "shutdown must wait for the incumbent's terminal record: {records}"
+        );
+        assert!(records.contains("daemon_shutdown"));
+    }
 
     /// During a swap two processes of the module are alive, and consumers
     /// started by either one attest with that process's launch nonce. Both are

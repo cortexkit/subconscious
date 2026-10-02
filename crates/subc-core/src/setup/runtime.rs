@@ -128,7 +128,11 @@ pub fn runtime_paths(platform: RuntimePlatform, home: &Path, data_home: &Path) -
 pub const DAEMON_STOP_TIMEOUT_SECS: u64 = 35;
 
 pub fn desired_definition(platform: RuntimePlatform, paths: &RuntimePaths) -> String {
-    let daemon = paths.daemon.to_string_lossy();
+    let raw_daemon = paths.daemon.to_string_lossy();
+    let daemon = match platform {
+        RuntimePlatform::Linux => systemd_argument(&raw_daemon),
+        RuntimePlatform::Macos | RuntimePlatform::Windows => xml_text(&raw_daemon),
+    };
     match platform {
         // NO AbandonProcessGroup, deliberately. launchd's default kills what is
         // left in the job's process group when the daemon exits. Supervised
@@ -165,6 +169,29 @@ pub fn desired_definition(platform: RuntimePlatform, paths: &RuntimePaths) -> St
             "<Task version=\"1.4\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\"><RegistrationInfo><URI>\\CortexKit\\subc-daemon</URI></RegistrationInfo><Triggers><LogonTrigger><Enabled>true</Enabled></LogonTrigger></Triggers><Principals><Principal id=\"Author\"><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals><Actions Context=\"Author\"><Exec><Command>{daemon}</Command></Exec></Actions></Task>\n"
         ),
     }
+}
+
+fn xml_text(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+/// ExecStart is parsed by systemd, not a shell: quotes keep spaces in one
+/// argument and doubled percent/dollar signs prevent manager expansion.
+fn systemd_argument(value: &str) -> String {
+    let escaped = value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t")
+        .replace('%', "%%")
+        .replace('$', "$$");
+    format!("\"{escaped}\"")
 }
 
 /// Query persistence and current liveness independently. A registration that
@@ -975,6 +1002,34 @@ mod tests {
             }
             assert!(inventory.owns_path("runtime-definition", &paths.definition));
         }
+    }
+
+    #[test]
+    fn service_definitions_escape_xml_path_metacharacters() {
+        let paths = RuntimePaths {
+            daemon: PathBuf::from("/Users/R&D/<user>\"'/ck-subc"),
+            definition: PathBuf::from("unused"),
+        };
+        for platform in [RuntimePlatform::Macos, RuntimePlatform::Windows] {
+            let xml = desired_definition(platform, &paths);
+            assert!(
+                xml.contains("/Users/R&amp;D/&lt;user&gt;&quot;&apos;/ck-subc"),
+                "{xml}"
+            );
+        }
+    }
+
+    #[test]
+    fn systemd_execstart_quotes_one_literal_path() {
+        let paths = RuntimePaths {
+            daemon: PathBuf::from("/home/A B/100%/a\"b\\c/$d/ck-subc"),
+            definition: PathBuf::from("unused"),
+        };
+        let unit = desired_definition(RuntimePlatform::Linux, &paths);
+        assert!(
+            unit.contains("ExecStart=\"/home/A B/100%%/a\\\"b\\\\c/$$d/ck-subc\"\n"),
+            "{unit}"
+        );
     }
 
     #[test]

@@ -808,6 +808,20 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
     }
 
     fn completed(&mut self, target: UpgradeTarget) {
+        // Failed targets keep their recovery evidence; a verified completed
+        // replacement no longer needs a private copy of the previous image.
+        if let Some(path) = self.rollback_paths.get(target.label()) {
+            match fs::remove_file(path) {
+                Ok(()) => {
+                    self.rollback_paths.remove(target.label());
+                    self.rollback_archive_sha256.remove(target.label());
+                }
+                Err(error) => eprintln!(
+                    "warning: upgrade completed but could not remove rollback copy {}: {error}",
+                    path.display()
+                ),
+            }
+        }
         println!("{}", self.completion_line(target));
     }
 
@@ -1029,6 +1043,21 @@ mod tests {
             planned_from: BTreeMap::new(),
             supervised_modules: BTreeSet::new(),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn successful_upgrade_completion_removes_its_rollback_copy() {
+        let root = TestTempDir::new("upgrade-completed-rollback");
+        let target = upgrade_target("ck-mc");
+        version_binary(&root.join("ck-mc"), "0.1.0");
+        let mut backend = isolated_backend(&root, target);
+        backend.create_rollback_copy(target).unwrap();
+        let path = backend.rollback_paths.get(target.label()).unwrap().clone();
+        assert!(path.is_file());
+        backend.completed(target);
+        assert!(!path.exists(), "{}", path.display());
+        assert!(!backend.rollback_paths.contains_key(target.label()));
     }
 
     #[cfg(unix)]

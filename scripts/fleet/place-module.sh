@@ -325,6 +325,13 @@ staged_base=$(basename "$STAGED")
 if [ -n "$root_manifest" ]; then
   want_stage=$(awk -F= '$1=="stage"{print $2}' "$root_manifest")
   want_rev=$(awk -F= '$1=="revision"{print $2}' "$root_manifest")
+  # A relative `stage=` (a bare stage name, as some seats write it) names a path
+  # beside the manifest. Resolve it there; comparing it literally against an
+  # absolute path refused a correct card.
+  case "$want_stage" in
+    /*) ;;
+    *) want_stage="$(cd "$(dirname "$root_manifest")" && pwd)/$want_stage" ;;
+  esac
   # `stage` names a DIRECTORY under the per-stage layout and the ARTIFACT itself
   # under the flat one. Accept either rather than forcing a seat to restructure:
   # what the declaration is FOR is naming which thing is live, and both spellings
@@ -434,11 +441,34 @@ posture_without_runtime() {
   bare=$(signing_posture "$1" | sed -E 's/flags=[^ ]+ //')
   if [ -n "$f" ]; then printf '%sflags-sans-runtime=0x%x ' "$bare" $(( f & ~0x10000 )); else printf '%s' "$bare"; fi
 }
+# A LINKER-SIGNED running image (flag 0x20000) was signed by `ld` at link time, not
+# by codesign. Its identifier is a per-build hash (`ck_astrocyte-<16 hex>`), so it
+# differs between any two builds, and any codesign re-sign clears the 0x20000 bit,
+# which adding hardened runtime requires. Its designated requirement is a cdhash,
+# so no privacy grant can survive a rebuild of it anyway. Comparing those two
+# fields refused every first hardened build of a linker-signed module. When the
+# running image is linker-signed, drop the identifier and the linker-signed bit
+# from both sides; ad-hoc-ness, team and every other flag still have to match.
+is_linker_signed() {
+  local f; f=$(cd_flags "$1")
+  [ -n "$f" ] && [ $(( f & 0x20000 )) -ne 0 ]
+}
+posture_for_linker_signed() {
+  local f bare
+  f=$(cd_flags "$1")
+  bare=$(signing_posture "$1" | sed -E 's/flags=[^ ]+ //; s/Identifier=[^ ]+ //')
+  if [ -n "$f" ]; then printf '%sflags-sans-runtime-linker=0x%x ' "$bare" $(( f & ~0x30000 )); else printf '%s' "$bare"; fi
+}
 if command -v codesign >/dev/null; then
   staged_sig=$(signing_posture "$STAGED")
   live_sig=$(signing_posture "$DEST")
   staged_sig_cmp=$(posture_without_runtime "$STAGED")
   live_sig_cmp=$(posture_without_runtime "$DEST")
+  if is_linker_signed "$DEST"; then
+    staged_sig_cmp=$(posture_for_linker_signed "$STAGED")
+    live_sig_cmp=$(posture_for_linker_signed "$DEST")
+    say "signing posture: running image is linker-signed; its per-build identifier and the linker-signed bit are not compared"
+  fi
   if [ -n "$NEW_REQUIREMENT" ]; then
     # A requested requirement change may rename the identifier; every other
     # posture field (signer, team, ad-hoc-ness, flags) must still match.

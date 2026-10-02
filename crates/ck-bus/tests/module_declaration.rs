@@ -447,6 +447,11 @@ async fn assert_hand_started_copy_refused(run: &AcceptanceRun, binary: &Path, no
         .arg(&run.connection_file)
         .env("SUBC_MODULE_ID", MODULE_ID)
         .env("XDG_DATA_HOME", run.root.join("data"))
+        .env("XDG_RUNTIME_DIR", run.root.join("run"))
+        .env("XDG_CONFIG_HOME", run.root.join("config"))
+        // This is a manual negative control, not a supervised spawn. The SDK
+        // still accepts an environment nonce when no descriptor is named.
+        .env_remove("SUBC_LAUNCH_NONCE_FD")
         .env_remove("SUBC_LAUNCH_NONCE");
     if let Some(nonce) = nonce {
         command.env("SUBC_LAUNCH_NONCE", nonce);
@@ -544,4 +549,24 @@ fn expected_launch_nonce_source() -> subc_protocol::manifest::LaunchNonceSource 
     } else {
         subc_protocol::manifest::LaunchNonceSource::Fd
     }
+}
+
+/// Another process can see the descriptor name, but not the secret it carries.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn supervised_nonce_cannot_be_scraped_from_the_process_environment() {
+    let _gate = harness::acceptance_gate().await;
+    let run = AcceptanceRun::start(Path::new(env!("CARGO_BIN_EXE_ck-bus"))).await;
+    let pid = wait_for_narrowed_provenance_pid(&run).await;
+    let environment = harness::signer::seeds::process_environment(pid);
+    assert!(
+        harness::signer::seeds::environment_value(&environment, "SUBC_LAUNCH_NONCE_FD")
+            .is_some_and(|value| value.starts_with("3:")),
+        "missing descriptor name: {environment}"
+    );
+    assert!(
+        harness::signer::seeds::environment_value(&environment, "SUBC_LAUNCH_NONCE").is_none(),
+        "a process-environment scrape must not reveal the launch secret"
+    );
+    run.shutdown().await;
 }

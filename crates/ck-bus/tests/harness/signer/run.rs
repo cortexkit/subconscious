@@ -76,6 +76,29 @@ impl SignerRun {
         side: ClaustrumSide<'_>,
         options: RunOptions,
     ) -> Self {
+        Self::start_inner(root, ck_bus, side, options, false).await
+    }
+
+    /// Runs a supervised relay as reserved `ckbus` for vault-authorization tests.
+    /// This exercises Claustrum's grants, not the production ck-bus binary.
+    pub async fn start_vault_relay(root: TestTempDir, side: ClaustrumSide<'_>) -> Self {
+        Self::start_inner(
+            root,
+            Path::new(env!("CARGO_BIN_EXE_ck-bus")),
+            side,
+            RunOptions::default(),
+            true,
+        )
+        .await
+    }
+
+    async fn start_inner(
+        root: TestTempDir,
+        ck_bus: &Path,
+        side: ClaustrumSide<'_>,
+        options: RunOptions,
+        vault_relay: bool,
+    ) -> Self {
         let operator_dir = data_home::operator_module_dir();
         if let Some(dir) = &operator_dir {
             // Evidence only while the operator directory lies outside the fixture tree.
@@ -89,6 +112,19 @@ impl SignerRun {
         let config_file = config::render(&root, ck_bus, SentinelTiming::default());
         if let ClaustrumSide::Binary(real) = &side {
             register_claustrum_binary(&config_file, &Self::data_home(&root), real);
+        }
+        if vault_relay {
+            let mut value: Value =
+                serde_json::from_slice(&fs::read(&config_file).unwrap()).unwrap();
+            let module = &mut value["modules"]["ckbus"];
+            module["program"] = json!("/bin/sh");
+            module["args"] = json!([
+                "-c",
+                "CKBUS_PARTICIPANT_ARGV=\"$*\" exec \"$0\" --exact vault_relay_child --nocapture --test-threads=1",
+                std::env::current_exe().unwrap().display().to_string(),
+            ]);
+            module["env"]["CKBUS_RELAY_TARGET"] = json!("claustrum");
+            fs::write(&config_file, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
         }
         if !options.ckbus_env.is_empty() {
             add_ckbus_env(&config_file, &options.ckbus_env);

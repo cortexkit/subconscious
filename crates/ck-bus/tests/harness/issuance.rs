@@ -1,5 +1,5 @@
-//! The issuance rows' harness: a supervised participant, a relay to reach ck-bus AS that
-//! participant, and a broker client that records the server's permission verdicts.
+//! This harness runs a supervised participant, a relay that calls ck-bus using
+//! that participant's identity, and a broker client that records permission verdicts.
 //!
 //! The participant is this row's own test executable, declared as a subc module named
 //! `participant` through the per-run config and started by `supervisor.rescan`, so it
@@ -8,8 +8,8 @@
 //! move the daemon's appended `--subc <file>` out of the test harness's argv, which
 //! would refuse an unknown flag.
 //!
-//! Inside the child, the participant registers (HELLO with its nonce), then drops the
-//! nonce from its environment and keeps it in memory. A relayed call with
+//! Inside the child, the participant reads its nonce through the shared accessor
+//! before connecting and keeps its identity in memory. A relayed call with
 //! `attest: true` opens its route with `ConsumerIdentity`, and one with `attest: false`
 //! opens it with none, so the same child reaches ck-bus once attested and once as
 //! `Direct`.
@@ -35,7 +35,7 @@ use subc_protocol::{
     manifest::{
         Concurrency, ManagementOperation, ManagementOperationKind, ModuleManifest, ProviderRole,
     },
-    BindIdentity, RouteTarget, SUBC_LAUNCH_NONCE_ENV, SUBC_MODULE_ID_ENV,
+    BindIdentity, RouteTarget, SUBC_MODULE_ID_ENV,
 };
 
 use super::{control, signer::run::SignerRun};
@@ -178,6 +178,15 @@ pub async fn relay(
 }
 
 async fn relay_raw(connection_file: &Path, params: Value) -> Result<Value, String> {
+    relay_at(connection_file, PARTICIPANT, params).await
+}
+
+/// Calls a supervised relay without moving its secret into the test process.
+pub async fn relay_at(
+    connection_file: &Path,
+    module_id: &str,
+    params: Value,
+) -> Result<Value, String> {
     let consumer = SubcConsumer::connect(connection_file, ConsumerOptions::default())
         .await
         .map_err(|error| error.to_string())?;
@@ -185,7 +194,7 @@ async fn relay_raw(connection_file: &Path, params: Value) -> Result<Value, Strin
     let reply = consumer
         .call(
             RouteTarget::ManagementSurface {
-                module_id: PARTICIPANT.to_string(),
+                module_id: module_id.to_string(),
             },
             BindIdentity::new(
                 connection_file
@@ -225,8 +234,11 @@ pub fn participant_child_entry() {
     }
     let connection_file = connection_file.expect("the daemon passes --subc to the participant");
     let module_id = std::env::var(SUBC_MODULE_ID_ENV).expect("the daemon names the participant");
-    let launch_nonce =
-        std::env::var(SUBC_LAUNCH_NONCE_ENV).expect("the daemon gives the participant a nonce");
+    let launch_nonce = subc_client_rs::launch_nonce()
+        .expect("the daemon's nonce handoff is readable")
+        .expect("the daemon gives the participant a nonce")
+        .value()
+        .to_string();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -241,6 +253,7 @@ pub fn participant_child_entry() {
                 module_id: module_id.clone(),
                 launch_nonce,
             },
+            target: std::env::var("CKBUS_RELAY_TARGET").unwrap_or_else(|_| "ckbus".to_string()),
             bind_dir: connection_file
                 .parent()
                 .map(PathBuf::from)
@@ -253,9 +266,9 @@ pub fn participant_child_entry() {
         )
         .await
         .expect("participant registers");
-        // Registered: from here on the nonce lives only in memory, so a call without an
-        // explicit identity carries none and arrives as Direct.
-        std::env::remove_var(SUBC_LAUNCH_NONCE_ENV);
+
+        // Disable automatic consumer identity for the Direct control. Attested
+        // calls use the identity captured before registration explicitly.
         std::env::remove_var(SUBC_MODULE_ID_ENV);
         let _ = serving.await;
     });
@@ -281,6 +294,7 @@ struct Relay {
     consumer: SubcConsumer,
     identity: ConsumerIdentity,
     bind_dir: PathBuf,
+    target: String,
 }
 
 #[async_trait]
@@ -301,7 +315,7 @@ impl ModuleHandler for Relay {
             .consumer
             .call(
                 RouteTarget::ManagementSurface {
-                    module_id: "ckbus".to_string(),
+                    module_id: self.target.clone(),
                 },
                 BindIdentity::new(
                     self.bind_dir.clone(),

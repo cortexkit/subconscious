@@ -49,7 +49,7 @@ use nkeys::KeyPair;
 use serde_json::Value;
 use subc_client_rs::{
     consumer::{CallOptions, ConsumerOptions, SubcConsumer},
-    ConsumerIdentity, HandlerOutcome,
+    HandlerOutcome,
 };
 use subc_protocol::{BindIdentity, RouteTarget};
 
@@ -450,37 +450,21 @@ async fn signer_shape_real_binary_half() {
     real.grant(credential_id, "read");
     signer::assert_not_production(credential_id, &printed_public, &printed_key_id);
 
-    let binary = Path::new(env!("CARGO_BIN_EXE_ck-bus"));
-    let run = SignerRun::start(tree, binary, ClaustrumSide::Binary(&real)).await;
-    let identity = ckbus_identity(&run).await;
-    let consumer = SubcConsumer::connect(&run.connection_file, ConsumerOptions::default())
-        .await
-        .expect("connect to the fixture daemon");
+    // The relay proves Claustrum authorizes reserved:ckbus, not how the
+    // production ck-bus binary makes its own vault calls.
+    let run = SignerRun::start_vault_relay(tree, ClaustrumSide::Binary(&real)).await;
+    let relay = vault_relay::RelayVault(run.connection_file.clone());
     let mut replies = Vec::new();
     for op in ["sign", "public_key"] {
         let mut request = golden[op]["request"].clone();
         request["params"]["credential_id"] = Value::String(credential_id.to_string());
-        let reply = consumer
-            .call(
-                RouteTarget::ManagementSurface {
-                    module_id: "claustrum".to_string(),
-                },
-                BindIdentity::new(run.root.path(), "ck-bus-acceptance", "signer-shape-real"),
-                serde_json::to_vec(&request).unwrap(),
-                CallOptions {
-                    consumer_identity: Some(identity.clone()),
-                    ..CallOptions::default()
-                },
-            )
-            .await
-            .unwrap_or_else(|error| panic!("{op} against the real claustrum: {error}"));
+        let reply = relay.call(request).await;
         let reply: Value = serde_json::from_slice(&reply).expect("reply is JSON");
         if let Some(divergence) = shape_divergence(&golden[op]["reply"], &reply, false) {
             panic!("real claustrum {op} diverges from the golden shape: {divergence}: {reply}");
         }
         replies.push(reply);
     }
-    consumer.close().await;
     let public_hex = replies[1]["result"]["public_key_hex"].as_str().unwrap();
     assert_eq!(
         public_hex, printed_public,
@@ -527,15 +511,33 @@ async fn signer_shape_real_binary_half() {
         .emit(&signer_vocabulary());
 }
 
-/// ck-bus's consumer identity, read from the supervised process the daemon launched
-/// (its environment carries the launch nonce the daemon injected). The daemon, not the
-/// test, stamps the resulting principal.
-async fn ckbus_identity(run: &SignerRun) -> ConsumerIdentity {
-    let pid = run.supervised_pid("ckbus").await;
-    let environment = seeds::process_environment(pid);
-    ConsumerIdentity {
-        module_id: "ckbus".to_string(),
-        launch_nonce: seeds::environment_value(&environment, "SUBC_LAUNCH_NONCE")
-            .expect("the supervised ckbus carries SUBC_LAUNCH_NONCE"),
+#[path = "harness/signer/vault_relay.rs"]
+mod vault_relay;
+
+#[test]
+fn vault_relay_child() {
+    harness::issuance::participant_child_entry();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn vault_relay_uses_its_supervised_identity_for_vault_calls() {
+    let _gate = harness::acceptance_gate().await;
+    let golden = signer::golden();
+    let signer = golden_signer(&golden);
+    let run =
+        SignerRun::start_vault_relay(SignerRun::tree(), ClaustrumSide::Signer(signer.clone()))
+            .await;
+    let relay = vault_relay::RelayVault(run.connection_file.clone());
+    for op in ["sign", "public_key"] {
+        let reply: Value =
+            serde_json::from_slice(&relay.call(golden[op]["request"].clone()).await).unwrap();
+        assert_eq!(reply, golden[op]["reply"]);
     }
+    assert_eq!(
+        signer.observed_principals(),
+        vec![Some(subc_protocol::Principal::Reserved {
+            module_id: "ckbus".to_string()
+        })]
+    );
+    run.shutdown().await;
 }

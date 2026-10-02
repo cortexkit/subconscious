@@ -21,7 +21,7 @@ use serde_json::{json, Value};
 use subc_control::{ClientControlRequest, ClientControlResponse};
 use subc_protocol::{
     manifest::ModuleManifest, Flags, Frame, FrameType, ModuleHelloBody, Priority, PROTOCOL_VERSION,
-    SUBC_LAUNCH_NONCE_ENV, SUBC_MODULE_ID_ENV,
+    SUBC_MODULE_ID_ENV,
 };
 use subc_transport::{authenticate_client, connection_file, read_frame, write_frame};
 use tokio::io::AsyncWriteExt;
@@ -276,7 +276,13 @@ pub fn healthless_child_entry() {
     }
     let connection = connection.expect("the daemon passes --subc to the module");
     let module_id = std::env::var(SUBC_MODULE_ID_ENV).expect("the daemon names the module");
-    let launch_nonce = std::env::var(SUBC_LAUNCH_NONCE_ENV).ok();
+    let launch_nonce = Some(
+        subc_client_rs::launch_nonce()
+            .expect("the daemon's nonce handoff is readable")
+            .expect("the daemon gives the healthless module a nonce")
+            .value()
+            .to_string(),
+    );
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

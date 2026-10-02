@@ -60,9 +60,10 @@ use tokio::{
 };
 
 const TEST_DAEMON_VER: &str = "test-subc-mcp";
-// The module refuses to serve without daemon spawn attestation (SUBC_MODULE_ID +
-// SUBC_LAUNCH_NONCE), so the tests spawn it exactly as the daemon would: env
-// injected, nonce seeded into the supervisor handle for route.open verification.
+// These manual launches exercise the SDK's environment fallback (no nonce
+// descriptor is named). Record TEST_MCP_MODULE_ID and TEST_MCP_LAUNCH_NONCE in
+// the test supervisor so route.open can attest the manually launched module.
+// Unix daemon spawns instead use the pipe handoff.
 const TEST_MCP_MODULE_ID: &str = "subc-mcp";
 const TEST_MCP_LAUNCH_NONCE: &str = "test-mcp-launch-nonce";
 // 30s, raised from 10s (2026-08-14): each test in the reverse-elicitation

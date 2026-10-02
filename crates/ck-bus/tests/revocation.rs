@@ -1590,11 +1590,7 @@ async fn the_operator_signer_grant_authorizes_the_revocation_signature() {
         roots::KeyIdLedger,
         vault::ClaustrumRoute,
     };
-    use harness::signer::{
-        claustrum::{RealClaustrum, CLAUSTRUM_BINARY_ABSENT},
-        seeds,
-    };
-    use subc_client_rs::ConsumerIdentity;
+    use harness::signer::claustrum::{RealClaustrum, CLAUSTRUM_BINARY_ABSENT};
 
     let _gate = harness::acceptance_gate().await;
     harness::install_tracing();
@@ -1618,21 +1614,9 @@ async fn the_operator_signer_grant_authorizes_the_revocation_signature() {
     real.grant(&signer_id, "sign");
     real.grant(&signer_id, "read");
 
-    let run = SignerRun::start(
-        tree,
-        Path::new(env!("CARGO_BIN_EXE_ck-bus")),
-        ClaustrumSide::Binary(&real),
-    )
-    .await;
-    let pid = run.supervised_pid("ckbus").await;
-    let identity = ConsumerIdentity {
-        module_id: "ckbus".to_string(),
-        launch_nonce: seeds::environment_value(
-            &seeds::process_environment(pid),
-            "SUBC_LAUNCH_NONCE",
-        )
-        .expect("the supervised ckbus carries SUBC_LAUNCH_NONCE"),
-    };
+    // This arm proves Claustrum authorizes reserved:ckbus to use the operator
+    // signer. The relay does not exercise the production ck-bus binary's calls.
+    let run = SignerRun::start_vault_relay(tree, ClaustrumSide::Binary(&real)).await;
     let revocation_list = bootstrap::account_jwt::AccountClaims {
         account_public: KeyPair::new_account().public_key(),
         name: "box_revocationgrant".to_string(),
@@ -1645,7 +1629,7 @@ async fn the_operator_signer_grant_authorizes_the_revocation_signature() {
 
     // Reserved: ck-bus's exact grants on the operator signer sign the revocation list,
     // issued by the signer (O...), verifiable under the vault's public key.
-    let reserved = ClaustrumRoute::new(run.connection_file.clone(), Some(identity));
+    let reserved = vault_relay::RelayVault(run.connection_file.clone());
     let jwt = bootstrap::account_jwt::sign_account_jwt(
         &reserved,
         &KeyIdLedger::new(),
@@ -1690,4 +1674,12 @@ async fn the_operator_signer_grant_authorizes_the_revocation_signature() {
         .reached("credential.sign")
         .reached("credential.public_key")
         .emit(&vocabulary());
+}
+
+#[path = "harness/signer/vault_relay.rs"]
+mod vault_relay;
+
+#[test]
+fn vault_relay_child() {
+    harness::issuance::participant_child_entry();
 }

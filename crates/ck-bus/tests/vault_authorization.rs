@@ -1,17 +1,19 @@
-//! Ladder row "Vault authorization" (slice 3 of `docs/specs/ck-bus-module.md`). served-by: claustrum-binary only.
+//! Checks whether the real Claustrum grants vault operations to reserved:ckbus.
 //!
 //! The fixture vault gets the operator ceremony with the placed `ck auth`:
 //! `mint-signing-key --id signing:ck-bus-account:1`, then exact `sign` and `read` grants
 //! to `reserved:ckbus`. A second key receives only the `sign` grant.
-//! - A route whose `route.open` carries ck-bus's `ConsumerIdentity` (the supervised
-//!   ckbus's own module id and launch nonce) gets `credential.sign` and
+//! - A supervised test relay registered as `ckbus` uses its own identity, read
+//!   through the shared accessor, to get `credential.sign` and
 //!   `credential.public_key` answered.
 //! - The same open without the identity arrives `Direct` and gets `not_found` for both.
 //! - With only the `sign` grant, `credential.public_key` answers `not_found` and
 //!   `credential.sign` succeeds.
 //!
+//! This proves Claustrum's authorization of reserved:ckbus, not production
+//! ck-bus's own vault calls or key handling.
 //! No test constructs `Principal::Reserved`: the daemon stamps it from the presented
-//! identity. Without `CK_CLAUSTRUM_BIN` and `CK_CK_BIN` the row records
+//! identity. Without `CK_CLAUSTRUM_BIN` and `CK_CK_BIN` this test records
 //! `claustrum-binary-absent` loudly and reports SKIP; it never passes and never falls
 //! back to the harness signer.
 
@@ -27,7 +29,7 @@ mod harness;
 #[path = "../src/runtime/seams.rs"]
 mod runtime;
 
-use std::{collections::BTreeSet, path::Path};
+use std::collections::BTreeSet;
 
 use credentials::{
     nkey::{encode_public, NkeyRole},
@@ -39,11 +41,9 @@ use harness::{
     signer::{
         claustrum::{RealClaustrum, CLAUSTRUM_BINARY_ABSENT},
         run::{ClaustrumSide, SignerRun},
-        seeds,
     },
 };
 use nkeys::KeyPair;
-use subc_client_rs::ConsumerIdentity;
 use subc_control::{ClientControlRequest, ClientControlResponse};
 use subc_protocol::manifest::ProviderRole;
 
@@ -100,22 +100,14 @@ async fn vault_authorization_against_the_real_claustrum() {
     real.ck_auth(&["mint-signing-key", "--id", SIGN_ONLY_ROOT]);
     real.grant(SIGN_ONLY_ROOT, "sign");
 
-    let binary = Path::new(env!("CARGO_BIN_EXE_ck-bus"));
-    let run = SignerRun::start(tree, binary, ClaustrumSide::Binary(&real)).await;
+    // The relay tests Claustrum's reserved:ckbus grants, not the production
+    // ck-bus binary's own calls or key handling.
+    let run = SignerRun::start_vault_relay(tree, ClaustrumSide::Binary(&real)).await;
     let vocabulary = claustrum_vocabulary(&run).await;
-    let pid = run.supervised_pid("ckbus").await;
-    let identity = ConsumerIdentity {
-        module_id: "ckbus".to_string(),
-        launch_nonce: seeds::environment_value(
-            &seeds::process_environment(pid),
-            "SUBC_LAUNCH_NONCE",
-        )
-        .expect("the supervised ckbus carries SUBC_LAUNCH_NONCE"),
-    };
     let payload = b"vault authorization row";
 
     // Reserved: ck-bus's identity on the route.
-    let reserved = ClaustrumRoute::new(run.connection_file.clone(), Some(identity.clone()));
+    let reserved = vault_relay::RelayVault(run.connection_file.clone());
     let public = reserved
         .public_key(ACCOUNT_ROOT)
         .await
@@ -169,4 +161,12 @@ async fn vault_authorization_against_the_real_claustrum() {
         .reached("credential.sign")
         .reached("credential.public_key")
         .emit(&vocabulary);
+}
+
+#[path = "harness/signer/vault_relay.rs"]
+mod vault_relay;
+
+#[test]
+fn vault_relay_child() {
+    harness::issuance::participant_child_entry();
 }

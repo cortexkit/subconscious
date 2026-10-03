@@ -2002,8 +2002,33 @@ async fn handle_control_request<H>(
 where
     H: ModuleHandler,
 {
-    let request = serde_json::from_slice::<ModuleControlRequest>(&frame.body)
-        .map_err(SubcModuleError::Json)?;
+    // A control request this SDK cannot decode (most likely a newer daemon's
+    // field or operation) is refused on its own correlation id, and the
+    // connection stays up. Returning the decode error would end the serve loop,
+    // so one unknown field on one route.bind would stop the whole module, and
+    // the next such bind after its respawn would stop it again.
+    let request = match serde_json::from_slice::<ModuleControlRequest>(&frame.body) {
+        Ok(request) => request,
+        Err(error) => {
+            let body = serde_json::to_vec(&ErrorBody::new(
+                "invalid_request",
+                format!("control request could not be decoded by this module: {error}"),
+            ))
+            .map_err(SubcModuleError::Json)?;
+            let refusal = Frame::build_with_version(
+                frame.header.ver,
+                FrameType::Error,
+                control_flags(),
+                0,
+                0,
+                frame.header.corr,
+                body,
+            )
+            .map_err(SubcModuleError::FrameBuild)?;
+            send_outbound(egress, refusal).await?;
+            return Ok(());
+        }
+    };
     match request {
         ModuleControlRequest::RouteBind {
             route_channel,
@@ -2730,6 +2755,66 @@ mod tests {
             );
             assert_eq!(error.code(), Some(code));
         }
+    }
+
+    /// A route.bind whose scope stamp carries a field this SDK does not know
+    /// (a newer daemon's attribute) must be refused on its own correlation id,
+    /// and the module must keep serving: the next control request is answered.
+    #[tokio::test]
+    async fn an_undecodable_control_request_is_refused_and_the_module_keeps_serving() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let handler = Arc::new(EchoHandler);
+        let dispatcher = RequestDispatcher::new();
+        let (module_handle, _unused_rx) = test_module_handle(&[]);
+        let body = serde_json::to_vec(&serde_json::json!({
+            "op": "route.bind",
+            "route_channel": 9,
+            "epoch": 1,
+            "target": { "kind": "tool_provider" },
+            "identity": { "session": "s" },
+            "principal": { "kind": "direct" },
+            "scope": {
+                "owner": { "kind": "reserved", "module_id": "prefrontal-core" },
+                "ref": "s",
+                "scope_epoch": 1,
+                "kind": "head",
+                "attributes": { "a_field_from_a_newer_daemon": "x" },
+                "owner_authorized": true
+            }
+        }))
+        .unwrap();
+        let bind = Frame::build(FrameType::Request, control_flags(), 0, 0, 41, body).unwrap();
+
+        let kept_serving = handle_frame(
+            bind,
+            &tx,
+            Arc::clone(&handler),
+            dispatcher.clone(),
+            module_handle.clone(),
+        )
+        .await
+        .expect("an undecodable control request must not end the module");
+        assert!(kept_serving);
+        let refusal = timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(refusal.header.ty, FrameType::Error);
+        assert_eq!(refusal.header.corr, 41);
+        let error: ErrorBody = serde_json::from_slice(&refusal.body).unwrap();
+        assert_eq!(error.code, "invalid_request");
+
+        assert!(
+            handle_frame(health_request(42), &tx, handler, dispatcher, module_handle)
+                .await
+                .unwrap()
+        );
+        let health = timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(health.header.ty, FrameType::Response);
+        assert_eq!(health.header.corr, 42);
     }
 
     #[tokio::test]

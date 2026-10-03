@@ -313,6 +313,34 @@ extension AskModelsTests {
         XCTAssertEqual(attachment.sealed, false)
     }
 
+    /// An updated ask carries its revision, the time of the update, and the
+    /// superseded versions; an answered one also names the revision answered. The
+    /// superseded history is not modelled yet and must not stop the record decoding.
+    func testDecodesAskRevisionFields() throws {
+        let data = try JSONSerialization.data(withJSONObject: [
+            "requestID": "ask_rev", "question": "Start?", "askedAt": 1_700_000_000_000,
+            "revision": 2, "updatedAtMs": 1_700_000_060_000, "answeredRevision": 2,
+            "options": [["id": "start", "label": "I'm at the Mac, start"]],
+            "revisions": [["question": "Start?", "options": [["id": "start", "label": "Window done, I'm at the Mac, start"]]]],
+        ])
+        let ask = try JSONDecoder().decode(AskRequest.self, from: data)
+        XCTAssertEqual(ask.revision, 2)
+        XCTAssertEqual(ask.updatedAtMs, 1_700_000_060_000)
+        XCTAssertEqual(ask.answeredRevision, 2)
+        XCTAssertEqual(ask.askedAt, 1_700_000_000_000, "askedAt keeps the original time across updates")
+    }
+
+    /// A producer that predates revisions sends none of the fields.
+    func testAskWithoutRevisionFieldsDecodesToNil() throws {
+        let data = try JSONSerialization.data(withJSONObject: [
+            "requestID": "ask_old", "question": "Approve?", "askedAt": 1_700_000_000_000,
+        ])
+        let ask = try JSONDecoder().decode(AskRequest.self, from: data)
+        XCTAssertNil(ask.revision)
+        XCTAssertNil(ask.updatedAtMs)
+        XCTAssertNil(ask.answeredRevision)
+    }
+
     /// Both identities on one ask, which is the mixed state the producer can emit
     /// once inline attachments return: the inline element keeps its ordinal and the
     /// pointer keeps its id, with no collision between them.

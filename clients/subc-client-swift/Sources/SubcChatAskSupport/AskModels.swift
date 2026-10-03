@@ -129,6 +129,17 @@ public struct AskRequest: Codable, Equatable, Identifiable {
     public var attachments: [AskAttachment]?
     public var thread: [AskThreadEntry]?
 
+    // Ask revisions. An agent can update an open ask in place; each update raises
+    // `revision` (1 for the original) and stamps `updatedAtMs`, and an answer records
+    // the revision it answered as `answeredRevision`. A client merging newest-wins
+    // must order on these: `askedAt` stays the original time across updates, so a
+    // revision 2 compared by `askedAt` alone looks identical to revision 1 and is
+    // dropped, leaving the phone offering options the producer has since removed.
+    // All three are absent from producers that predate revisions.
+    public var revision: Int?
+    public var updatedAtMs: Int64?
+    public var answeredRevision: Int?
+
     public var id: String { requestID }
 
     /// Converts the wire's epoch-millisecond timestamp for SwiftUI date formatting.

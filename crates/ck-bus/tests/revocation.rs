@@ -1102,7 +1102,11 @@ async fn lose_one_census_request(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_census_read_lost_at_box_reconnect_is_replayed_within_its_original_budget() {
     let _gate = harness::acceptance_gate().await;
-    let mut run = start(false).await.expect("nats-server is required");
+    // Skip where nats-server is not installed (the Windows CI runner has
+    // none), as every other row here does.
+    let Some(mut run) = start(false).await else {
+        return;
+    };
     retire_supervised_ckbus(&run).await;
     let (url, armed, relay) = lose_one_census_request(run.server.url.clone()).await;
     run.server.url = url;
@@ -1182,7 +1186,11 @@ async fn census_replacement_refuses_unreadable_or_malformed_predecessors() {
         }
     }
     let _gate = harness::acceptance_gate().await;
-    let run = start(false).await.expect("nats-server is required");
+    // Skip where nats-server is not installed (the Windows CI runner has
+    // none), as every other row here does.
+    let Some(run) = start(false).await else {
+        return;
+    };
     retire_supervised_ckbus(&run).await;
     let plane = plane(&run).await;
     for malformed in [false, true] {

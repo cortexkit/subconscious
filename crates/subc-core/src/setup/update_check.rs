@@ -242,7 +242,14 @@ fn train_release_metadata_names_the_release_tag() {
         "components":{"mc":{"release":"ck-mc-deadbeef", "version":null}}
     }))
     .unwrap();
-    let target = super::components::upgrade_roster([super::model::Component::Mc])[0];
+    // Built directly rather than taken from `upgrade_roster`: ck-mc has no
+    // Windows binary, so the roster is empty there and this release-tag rule
+    // would go untested on that platform.
+    let target = super::model::UpgradeTarget {
+        component: super::model::Component::Mc,
+        binary: "ck-mc",
+        module_id: super::components::supervised_module_id("ck-mc"),
+    };
     assert_eq!(
         evidence_from_index(&Ok(index), target).unwrap().version,
         "ck-mc-deadbeef"

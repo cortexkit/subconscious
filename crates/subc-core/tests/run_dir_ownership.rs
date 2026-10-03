@@ -21,7 +21,7 @@ use std::{
 };
 
 use serde_json::{json, Value};
-use subc_test_support::TestTempDir;
+use subc_test_support::{process_alive, wait_until_gone, TestTempDir};
 
 // Real daemons compete with other integration binaries for spawn and
 // registration resources; serializing this file keeps the deadlines honest.
@@ -230,32 +230,6 @@ impl Drop for Tree {
     }
 }
 
-fn process_alive(pid: i32) -> bool {
-    // Signal 0 checks existence without delivering anything. It also succeeds
-    // for a zombie, which has exited but not yet been reaped by whatever
-    // adopted it (an orphan whose daemon was SIGKILLed is reaped by init, not
-    // by the test), so on Linux a zombie counts as gone.
-    rustix::process::test_kill_process(rustix::process::Pid::from_raw(pid).unwrap()).is_ok()
-        && !is_zombie(pid)
-}
-
-#[cfg(target_os = "linux")]
-fn is_zombie(pid: i32) -> bool {
-    // The state is the first field after the parenthesised command name.
-    fs::read_to_string(format!("/proc/{pid}/stat"))
-        .ok()
-        .and_then(|stat| {
-            stat.rsplit_once(')')
-                .map(|(_, rest)| rest.trim_start().starts_with('Z'))
-        })
-        .unwrap_or(false)
-}
-
-#[cfg(not(target_os = "linux"))]
-fn is_zombie(_pid: i32) -> bool {
-    false
-}
-
 fn lock_path(run_dir: &Path) -> PathBuf {
     run_dir.join("daemon.lock")
 }
@@ -360,16 +334,11 @@ fn a_killed_daemons_lock_does_not_block_the_next_daemon_and_its_orphan_is_swept(
     let replacement = tree.wait_module_ready(c);
     assert_ne!(replacement, orphan, "the module was spawned again");
     // The sweep waits for the orphan to stop matching its recorded identity
-    // before spawning; reaping it is up to whoever adopted it, so allow a
-    // short bound for that rather than asserting the same instant.
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while process_alive(orphan) {
-        assert!(
-            Instant::now() < deadline,
-            "the next daemon must end the previous daemon's orphan"
-        );
-        thread::sleep(Duration::from_millis(10));
-    }
+    // before spawning; reaping it is up to whoever adopted it.
+    assert!(
+        wait_until_gone(orphan, Duration::from_secs(5)),
+        "the next daemon must end the previous daemon's orphan"
+    );
     assert_eq!(
         fs::read_to_string(tree.root.join("module.sigterm"))
             .ok()

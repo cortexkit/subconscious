@@ -586,7 +586,7 @@ async fn teardown_kills_grandchild_ignoring_sigterm() {
             .unwrap();
     evict_after_test_ttl(&handler, 1).await;
     let gone = tokio::time::timeout(Duration::from_secs(2), async {
-        while rustix::process::test_kill_process(pid).is_ok() {
+        while subc_test_support::process_alive(pid.as_raw_nonzero().get()) {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })

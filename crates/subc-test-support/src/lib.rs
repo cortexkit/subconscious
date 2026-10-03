@@ -77,8 +77,94 @@ impl Drop for TestTempDir {
     }
 }
 
+/// Whether `pid` is a running process, for tests that assert a process has
+/// ended.
+///
+/// Signal 0 alone also succeeds for a zombie: a process that has exited but
+/// not yet been reaped. A child whose parent was killed or has exited is
+/// reaped by whatever adopted it (init on Linux), not by the test, so for a
+/// moment after it ends it is still found by signal 0. On Linux a zombie
+/// therefore counts as gone. Other Unix systems answer by signal 0 only.
+#[cfg(unix)]
+pub fn process_alive(pid: i32) -> bool {
+    let Some(target) = rustix::process::Pid::from_raw(pid) else {
+        return false;
+    };
+    rustix::process::test_kill_process(target).is_ok() && !is_zombie(pid)
+}
+
+/// Wait up to `timeout` for `pid` to end, as [`process_alive`] judges it.
+/// Returns whether it ended. Use this, not a single [`process_alive`] check,
+/// wherever a test asserts that something else has just ended a process: the
+/// reaping that makes it disappear happens on another process's schedule.
+#[cfg(unix)]
+pub fn wait_until_gone(pid: i32, timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while process_alive(pid) {
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    true
+}
+
+#[cfg(target_os = "linux")]
+fn is_zombie(pid: i32) -> bool {
+    // The state is the first field after the parenthesised command name.
+    fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|stat| {
+            stat.rsplit_once(')')
+                .map(|(_, rest)| rest.trim_start().starts_with('Z'))
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn is_zombie(_pid: i32) -> bool {
+    false
+}
+
 #[cfg(test)]
 mod tests {
+    /// A child that has exited but that nobody has reaped yet is a zombie:
+    /// signal 0 still finds it, and `process_alive` must not. The test is the
+    /// child's parent and deliberately does not wait for it until the end.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_exited_unreaped_child_is_not_alive() {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = i32::try_from(child.id()).unwrap();
+        let gone = super::wait_until_gone(pid, std::time::Duration::from_secs(5));
+        let signal_zero_still_finds_it =
+            rustix::process::test_kill_process(rustix::process::Pid::from_raw(pid).unwrap())
+                .is_ok();
+        child.wait().unwrap();
+        assert!(
+            signal_zero_still_finds_it,
+            "the child was reaped too early to test the zombie case"
+        );
+        assert!(
+            gone,
+            "an exited child awaiting its reaper must count as gone"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_running_child_is_alive() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .unwrap();
+        let pid = i32::try_from(child.id()).unwrap();
+        let alive = super::process_alive(pid);
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(alive);
+    }
+
     use super::*;
 
     #[test]

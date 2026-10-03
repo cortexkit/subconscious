@@ -9,7 +9,7 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use subc_test_support::TestTempDir;
+use subc_test_support::{process_alive, wait_until_gone, TestTempDir};
 
 use serde_json::{json, Value};
 use subc_daemon::{read_frame, write_frame, Frame};
@@ -302,11 +302,6 @@ fn unix_ms_now() -> u64 {
 /// child-exit grace.
 const OBSERVER_TEARDOWN_MS: u64 = 200;
 
-fn process_alive(pid: i32) -> bool {
-    // Signal 0 checks existence without delivering anything.
-    rustix::process::test_kill_process(rustix::process::Pid::from_raw(pid).unwrap()).is_ok()
-}
-
 #[test]
 fn module_leads_its_own_process_group_not_the_daemons() {
     let fixture = Fixture::boot(false);
@@ -387,7 +382,7 @@ fn slow_eof_teardown_within_its_drain_budget_finishes_unsignalled() {
         "the daemon waited out the deadline instead of returning when the module exited: {elapsed:?}"
     );
     assert!(
-        !process_alive(observer),
+        wait_until_gone(observer, Duration::from_secs(5)),
         "the module must have exited on its own"
     );
 }
@@ -439,7 +434,7 @@ fn eof_ignoring_module_is_sigtermed_at_its_deadline_then_killed() {
         "shutdown overran the module's bound: {elapsed:?}"
     );
     assert!(
-        !process_alive(observer),
+        wait_until_gone(observer, Duration::from_secs(5)),
         "the module must not outlive the daemon"
     );
 }
@@ -457,7 +452,7 @@ fn protocol_none_child_is_stopped_by_sigterm_not_left_running() {
     fixture.term();
     fixture.wait_exit(Duration::from_secs(5));
     assert!(
-        !process_alive(wire_less),
+        wait_until_gone(wire_less, Duration::from_secs(5)),
         "a protocol none child must not outlive the daemon"
     );
     assert_eq!(
@@ -486,7 +481,7 @@ fn child_ignoring_sigterm_is_killed_within_the_shutdown_bound() {
         "the child was given no grace before the kill"
     );
     assert!(
-        !process_alive(wire_less),
+        wait_until_gone(wire_less, Duration::from_secs(5)),
         "a child ignoring SIGTERM must still not outlive the daemon"
     );
 }
@@ -520,7 +515,7 @@ fn orphan_of_a_killed_daemon_is_ended_by_the_next_daemon_before_it_respawns() {
     let replacement = fixture.pid_of("wire-less.pid");
     assert_ne!(replacement, orphan, "the module was spawned again");
     assert!(
-        !process_alive(orphan),
+        wait_until_gone(orphan, Duration::from_secs(5)),
         "the next daemon must end the previous daemon's orphan"
     );
     assert_eq!(

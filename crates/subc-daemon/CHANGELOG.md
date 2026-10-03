@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.30.0
+
+- Breaking Rust API: `HealthConfig` owns an optional HTTP URL and is `Clone`, no longer `Copy`; `ForwardingError` gains `ConnectionRoleConflict`, so exhaustive matches must handle it. Requires subc-jobobject 0.2.0 on Windows and subc-cgroup 0.1.5 on Linux.
 
 - Reject reserved capability claims in `catalog.update` before changing active or swap-candidate registrations, using the same `reserved_capability` error as HELLO.
 - Module GOODBYE now performs disconnect teardown immediately, including requirement recomputation, route-closed client pushes and scope-sync authority release, without waiting for the socket to close.

@@ -331,14 +331,29 @@ say "staged sidecar $sidecar: OK"
 # artifact. CUR is the destination binary's name without its "ck-" prefix, so
 # for the usual single-binary module it equals --module and nothing changes.
 CUR=$(basename "$DEST"); CUR=${CUR#ck-}
+# Every plausible spelling is read, not just the first one found, because two
+# of them can exist at once (the owner writes ck-<name>.current while an older
+# <name>.current lingers). Reading only the first let a stale declaration decide
+# which stage is live. If two declarations name different stages or revisions,
+# the owner's statement is ambiguous and the gate refuses until it is resolved.
 root_manifest=""
 for cand in "$(dirname "$staged_dir")/$CUR.current" \
             "$staged_dir/$CUR.current" \
             "$(dirname "$staged_dir")/ck-$CUR.current" \
             "$staged_dir/ck-$CUR.current"; do
-  if [ -f "$cand" ] && grep -q '^stage=' "$cand" 2>/dev/null; then
+  [ -f "$cand" ] && grep -q '^stage=' "$cand" 2>/dev/null || continue
+  if [ -z "$root_manifest" ]; then
     root_manifest="$cand"
-    break
+    continue
+  fi
+  first_decl="$(awk -F= '$1=="stage"||$1=="revision"{print $2}' "$root_manifest")"
+  this_decl="$(awk -F= '$1=="stage"||$1=="revision"{print $2}' "$cand")"
+  if [ "$first_decl" != "$this_decl" ]; then
+    echo "REFUSED: two currency declarations for $CUR disagree" >&2
+    echo "         $root_manifest: $(echo $first_decl)" >&2
+    echo "         $cand: $(echo $this_decl)" >&2
+    echo "         Remove the stale one (record its content first), then retry." >&2
+    exit 2
   fi
 done
 manifest="$staged_dir/ck-$CUR.current"

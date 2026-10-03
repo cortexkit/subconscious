@@ -214,6 +214,7 @@ fn drain_for_change(before: &LiveScope, after: &LiveScope) -> ScopeDrain {
     let after_attributes = &after.record.attributes;
     if (before_attributes.delegates && !after_attributes.delegates)
         || before_attributes.agent_id != after_attributes.agent_id
+        || before_attributes.flow_id != after_attributes.flow_id
     {
         drain = drain.widen(ScopeDrain::All(RouteCloseReason::ScopeDelegationChanged));
     }
@@ -808,6 +809,12 @@ impl ScopeTable {
                     message: format!("scope ref '{}' appears more than once", record.scope_ref),
                 });
             }
+            if let Some(flow_id) = &record.attributes.flow_id {
+                subc_protocol::scope::validate_flow_id(flow_id).map_err(|error| SyncRefusal {
+                    code: INVALID_CONTROL_BODY,
+                    message: error.to_string(),
+                })?;
+            }
             let attribute_bytes = serde_json::to_vec(&record.attributes)
                 .map(|bytes| bytes.len())
                 .unwrap_or(usize::MAX);
@@ -849,7 +856,7 @@ impl ScopeTable {
         if !record.attributes.is_empty() && !owner_authorized {
             return Some((
                 error_codes::SCOPE_ATTRIBUTE_NOT_PERMITTED,
-                "agent_id and delegates may be set only by an owner listed in \
+                "agent_id, delegates and flow_id may be set only by an owner listed in \
                  scope_authority_owners"
                     .to_string(),
             ));
@@ -1445,6 +1452,7 @@ mod tests {
         gated.attributes = ScopeAttributes {
             agent_id: Some("agent".to_string()),
             delegates: false,
+            flow_id: None,
         };
         let mut delegating = head("d", 1);
         delegating.attributes.delegates = true;
@@ -1524,6 +1532,75 @@ mod tests {
             );
         }
         assert_eq!(outcome(&applied, "ok").outcome, ScopeRecordOutcome::Created);
+    }
+
+    #[test]
+    fn flow_id_from_a_non_authority_owner_is_refused_like_agent_id() {
+        let mut table = table();
+        let mut flow = head("flow", 1);
+        flow.attributes.flow_id = Some("flow:7".to_string());
+        let mut agent = head("agent", 1);
+        agent.attributes.agent_id = Some("agent-7".to_string());
+        let applied = sync(
+            &mut table,
+            BROCA,
+            conn(2),
+            1,
+            vec![flow, agent, head("plain", 1)],
+        );
+        let flow_result = outcome(&applied, "flow");
+        let agent_result = outcome(&applied, "agent");
+        assert_eq!(flow_result.outcome, ScopeRecordOutcome::Refused);
+        assert_eq!(
+            flow_result.code.as_deref(),
+            Some(error_codes::SCOPE_ATTRIBUTE_NOT_PERMITTED)
+        );
+        assert_eq!(flow_result.code, agent_result.code);
+        assert_eq!(flow_result.message, agent_result.message);
+        assert_eq!(flow_result.version, None);
+        assert_eq!(describe(&table, BROCA, "flow").status, ScopeStatus::NotLive);
+        assert_eq!(
+            outcome(&applied, "plain").outcome,
+            ScopeRecordOutcome::Created
+        );
+    }
+
+    #[test]
+    fn malformed_flow_id_refuses_sync_by_name_without_applying_it() {
+        let mut table = table();
+        sync(
+            &mut table,
+            PREFRONTAL,
+            conn(1),
+            1,
+            vec![head("original", 1)],
+        );
+        for bad in [
+            "".to_string(),
+            "f".repeat(257),
+            "flow 7".to_string(),
+            "flow\n7".to_string(),
+        ] {
+            let mut flow = head("flow", 1);
+            flow.attributes.flow_id = Some(bad);
+            let refusal = table
+                .sync(&reserved(PREFRONTAL), conn(1), 2, vec![flow], any_current)
+                .unwrap_err();
+            assert_eq!(refusal.code, INVALID_CONTROL_BODY);
+            assert!(
+                refusal.message.starts_with("flow_id"),
+                "{}",
+                refusal.message
+            );
+            assert_eq!(
+                describe(&table, PREFRONTAL, "original").status,
+                ScopeStatus::Live
+            );
+            assert_eq!(
+                describe(&table, PREFRONTAL, "flow").status,
+                ScopeStatus::NotLive
+            );
+        }
     }
 
     // ---- sync authority -----------------------------------------------------

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.20.54
+
+- Updates the daemon and wire dependency cascade for subc-protocol 0.29.0 (`ToolCallRequest.preset` and `ScopeAttributes.flow_id`), a release breaking for Rust struct literals. Absent-field wire bytes remain unchanged.
+
 ## 0.20.53
 
 - Keep module compatibility floors enforced when repairing an existing core configuration.

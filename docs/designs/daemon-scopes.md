@@ -86,8 +86,10 @@ Fields:
     today's `agentProjectId` admission fact already carries.
   - `delegates` (bool, default false): true lets a provider act as that agent. Refused without
     `agent_id`.
+  - `flow_id` (optional string): this scope belongs to the named flow (section 2's
+    flow identity subsection).
 
-**Authority gate.** `agent_id` and `delegates` may be set only by an owner listed
+**Authority gate.** `agent_id`, `delegates` and `flow_id` may be set only by an owner listed
 in the daemon config key `scope_authority_owners` (today `["prefrontal-core"]`, the same module
 as `admission_facts_carrier_module_id`). A scope from any other owner may carry `kind`,
 `parent`, `child_owners` and `carriers` only; a sync that sets a gated attribute from an unlisted
@@ -99,6 +101,27 @@ no live route keeps an `owner_authorized` stamp its owner has lost. Providers re
 Bounds: at most 10,000 live scopes per owner and 4 KiB of attributes per scope; past either the
 sync is refused by name and nothing is applied. Tombstones (section 6) are capped at 1,000 per
 owner and evicted oldest first; that bound never refuses.
+
+### Flow identity: `flow_id`
+
+The optional `attributes.flow_id` means "this scope belongs to flow X". The
+scope's owner (prefrontal), and only an owner in `scope_authority_owners`, may set
+it; an unlisted owner receives `scope_attribute_not_permitted`, just as for
+`agent_id`. The daemon stamps it verbatim in `ScopeStamp.attributes` on
+`route.bind`. Providers use it to distinguish a flow's routes from a head's,
+and treat a non-owner opener on a flow scope as the flow's carrier.
+
+It is 1–256 printable non-space ASCII bytes, checked with the shared opaque-token
+validator. A malformed value refuses the sync as `invalid_control_body`, naming
+`flow_id`. Scope refs retain their existing acceptance rule. `flow_id` alone,
+without `agent_id` and with `delegates: false`, is valid; `delegates` still requires
+`agent_id`.
+
+The bind stamp's flow identity is fixed for that route. As with `agent_id`, a
+same-epoch change (including adding or removing `flow_id`) is accepted, bumps the
+scope's content version, and drains every route under it with
+`scope_delegation_changed`. New binds carry the new value; an unchanged re-sync
+neither bumps the version nor drains routes.
 
 ## 3. Registering: `scope.sync`
 
@@ -143,7 +166,7 @@ restart, is never locked out, and a stale connection can never overwrite a newer
   stamp, each with its own reason so a carrier can tell them apart:
   - `scope_carrier_removed`: the opener is no longer a listed carrier, or the route's target is
     no longer in its entry's `targets` (widening a list changes nothing live);
-  - `scope_delegation_changed`: `delegates` went from true to false, or `agent_id` changed;
+  - `scope_delegation_changed`: `delegates` went from true to false, or `agent_id` or `flow_id` changed;
   - `scope_ended`: the scope is gone, or replaced by a higher epoch.
   - `scope_parent_ended`: the scope's parent ended (section 3).
   These are new `route.closed` reasons. Older SDKs map an unknown close reason to "do not
@@ -246,7 +269,7 @@ case 1. The 45 s bound applies to a call waiting now, never to a stored approval
 refusal. It sends a snapshot of live scopes, then events:
 - `{owner, ref, scope_epoch, created}` when a scope is created;
 - `{owner, ref, scope_epoch, ended}` when a scope ends;
-- `{owner, ref, scope_epoch, changed}` when its carriers, `delegates`, `agent_id` or `parent_state`
+- `{owner, ref, scope_epoch, changed}` when its carriers, `delegates`, `agent_id`, `flow_id` or `parent_state`
   change;
 - `{owner, synced, scopes: [...]}` when an owner's first sync of this incarnation is accepted,
   carrying that owner's full live set.
@@ -287,6 +310,7 @@ Which live routes a record change drains:
 | a module removed from a carrier's `targets` | that carrier's routes to that module | `scope_carrier_removed` |
 | `delegates` true to false | every route under it | `scope_delegation_changed` |
 | `agent_id` changed | every route under it | `scope_delegation_changed` |
+| `flow_id` changed | every route under it | `scope_delegation_changed` |
 | `parent_state` becomes `ended` | every route under it | `scope_parent_ended` |
 | anything else (`child_owners`, a carrier or target added, `parent_state` from `pending` to `linked`, an unchanged record) | none | |
 
@@ -501,7 +525,8 @@ contract; where it differs from the wording above, this section wins.
   so that leaving it out is refused by name (`scope_epoch_required`), not as a malformed body.
 - **Wire shapes.** Principals use subc-protocol's `Principal` object (`{kind, module_id}`), not
   the `reserved:aft` string used in examples above. A carrier is `{principal, targets?}`, with
-  `targets` absent meaning any module. Attributes are the closed struct `{agent_id?, delegates}`.
+  `targets` absent meaning any module. Attributes are the closed struct
+  `{agent_id?, delegates, flow_id?}` (`flow_id` since subc-protocol 0.29.0).
   Record types refuse unknown fields.
 - **Parent links.** A link is checked only when it is new: a new record, a new epoch or a changed
   parent. An unchanged re-sent link keeps its state. A pending link settling to `linked` or `ended`

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.26.0
+
+- Takes subc-protocol 0.29.0 and the matching control/transport minor releases: `ToolCallRequest.preset` and `ScopeAttributes.flow_id` are optional wire fields, but this release is breaking for Rust struct literals. Move direct protocol dependencies together with the SDK.
+
 ## 0.25.3
 
 - A caller waiting behind another caller's `route.open` for the same route keeps waiting across a reconnect instead of failing at once, so a reconnect never starts a second, competing open; a `close_route` issued during the lead caller's retry backoff still wins, and the discarded route gets GOODBYE.

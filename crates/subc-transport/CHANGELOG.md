@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.10.0
+
+- Takes subc-protocol 0.29.0: `ToolCallRequest.preset` and `ScopeAttributes.flow_id` are optional wire fields, but this release is breaking for Rust struct literals. Update protocol and transport dependencies together to avoid incompatible public protocol types.
+
 ## 0.9.1
 
 - Validate public frames before writing any bytes, including the body-size cap and all header decode rules.

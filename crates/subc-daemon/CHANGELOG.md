@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.31.0
+
+- Takes subc-protocol 0.29.0 and the matching control/transport minor releases: `ToolCallRequest.preset` and `ScopeAttributes.flow_id` are optional wire fields, but this release is breaking for Rust struct literals. Tool-call bodies, including presets, remain opaque to the daemon.
+- Only `scope_authority_owners` may sync `flow_id`, with the same refusal as unauthorized `agent_id`. Malformed flow ids refuse sync by name; valid ones are stamped verbatim on binds even without an agent. Same-epoch changes bump version and drain scoped routes with `scope_delegation_changed`.
+
 ## 0.30.0
 
 - Breaking Rust API: `HealthConfig` owns an optional HTTP URL and is `Clone`, no longer `Copy`; `ForwardingError` gains `ConnectionRoleConflict`, so exhaustive matches must handle it. Requires subc-jobobject 0.2.0 on Windows and subc-cgroup 0.1.5 on Linux.

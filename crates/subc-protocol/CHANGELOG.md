@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.29.0
+
+- Breaking for Rust struct literals: `ToolCallRequest` gains optional `preset`, and `ScopeAttributes` gains optional `flow_id`. Both are omitted when absent, leaving existing absent-field wire bytes unchanged; `ScopeAttributes` still refuses unknown fields.
+- `validate_preset` checks 1–64 characters of `[a-z0-9_-]` and names `preset` for a provider's `invalid_request` reply. An absent preset requires an explicit provider policy, never the most capable default; an unserved preset is refused by name, never silently substituted.
+- `flow_id` identifies the scope's flow, needs no agent or delegation, and is set only by an authority owner and stamped verbatim. `validate_flow_id` shares the 1–256 printable non-space ASCII token rule with call keys and schema pins. Same-epoch changes bump the content version and drain scoped routes with `scope_delegation_changed`, like `agent_id` changes.
+
 ## 0.28.1
 
 - Refuse unknown fields inside scope principals, including parent owners, child owners, carriers, and selectors, as required for authority-bearing scope input. Principal decoding outside scopes remains forward-compatible.

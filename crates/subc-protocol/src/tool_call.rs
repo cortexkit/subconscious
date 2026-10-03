@@ -11,7 +11,7 @@
 //! Decoding is deliberately tolerant of unknown members: a provider must
 //! never refuse a call because a newer consumer added a key it does not
 //! know. Omitted optionals decode as `None`; `None` optionals are omitted on
-//! the wire, so a body carrying neither optional serializes exactly as the
+//! the wire, so a body carrying no optionals serializes exactly as the
 //! two-field shape older consumers already send — this type is drop-in for
 //! them without a wire change.
 
@@ -101,6 +101,17 @@ pub struct ToolCallRequest {
     /// [`SCHEMA_PIN_FIELD`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema_pin: Option<String>,
+    /// The session's tool preset, assigned by prefrontal and forwarded by its
+    /// carrier on every call, outside the model's arguments. Opaque to the
+    /// daemon. A provider checks its shape with [`validate_preset`] and answers
+    /// a malformed value with `invalid_request` naming [`PRESET_FIELD`].
+    ///
+    /// Absent means the caller did not say: a provider must decide explicitly
+    /// what an absent preset gets, and must not default it to the most capable
+    /// preset. A provider refuses a preset it does not serve, by name, rather
+    /// than falling back to a default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preset: Option<String>,
     /// The caller behind this call when the consumer is relaying it for
     /// someone else; `None` when the consumer is the caller. For attribution
     /// only, never authority: see [`CallOrigin`]. A provider checks it with
@@ -111,7 +122,7 @@ pub struct ToolCallRequest {
 
 impl ToolCallRequest {
     /// A call with no consumer id, no progress token, no call key, no schema
-    /// pin and no origin — the shape older two-field consumers send.
+    /// pin, no preset and no origin — the shape older two-field consumers send.
     pub fn new(name: impl Into<String>, arguments: Value) -> Self {
         Self {
             name: name.into(),
@@ -120,6 +131,7 @@ impl ToolCallRequest {
             progress_token: None,
             call_key: None,
             schema_pin: None,
+            preset: None,
             origin: None,
         }
     }
@@ -133,12 +145,55 @@ pub const CALL_KEY_FIELD: &str = "call_key";
 /// `invalid_request` error a provider returns when the pin is malformed.
 pub const SCHEMA_PIN_FIELD: &str = "schema_pin";
 
+/// The wire name of [`ToolCallRequest::preset`], for a provider's
+/// `invalid_request` error's `field`.
+pub const PRESET_FIELD: &str = "preset";
+
+/// The longest preset accepted, in ASCII characters.
+pub const PRESET_MAX_LEN: usize = 64;
+
+/// Why a tool preset was refused. Each error names [`PRESET_FIELD`], so a
+/// provider can use the same `invalid_request` path as for a schema pin.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PresetError {
+    Empty,
+    TooLong { length: usize },
+    InvalidCharacter { index: usize },
+}
+
+impl PresetError {
+    pub fn field(&self) -> &'static str {
+        PRESET_FIELD
+    }
+}
+
+impl std::fmt::Display for PresetError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Empty => write!(f, "preset must not be empty"),
+            Self::TooLong { length } => write!(
+                f,
+                "preset is {length} bytes; at most {PRESET_MAX_LEN} are allowed"
+            ),
+            Self::InvalidCharacter { index } => {
+                write!(
+                    f,
+                    "preset has a character at byte {index} outside [a-z0-9_-]"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for PresetError {}
+
 /// The wire path of [`CallOrigin::call_key`] inside a request, for the `field`
 /// of the `invalid_request` error a provider returns when it is malformed.
 pub const ORIGIN_CALL_KEY_FIELD: &str = "origin.call_key";
 
 /// The longest opaque token field accepted, in bytes (every accepted byte is
-/// one ASCII character). Shared by `call_key` and `schema_pin`.
+/// one ASCII character). Shared by `call_key`, `schema_pin` and scope `flow_id`.
 pub const OPAQUE_FIELD_MAX_LEN: usize = 256;
 
 /// The longest `call_key` accepted.
@@ -147,7 +202,7 @@ pub const CALL_KEY_MAX_LEN: usize = OPAQUE_FIELD_MAX_LEN;
 /// The longest `schema_pin` accepted.
 pub const SCHEMA_PIN_MAX_LEN: usize = OPAQUE_FIELD_MAX_LEN;
 
-/// Why an opaque token field (`call_key`, `schema_pin`) was refused. Every
+/// Why an opaque token field (`call_key`, `schema_pin`, `flow_id`) was refused. Every
 /// variant names the request field it is about, so a provider can put it in
 /// its `invalid_request` error without tracking which check ran.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -204,7 +259,10 @@ impl std::error::Error for OpaqueFieldError {}
 /// and act as different ones. Every other printable character is allowed, so
 /// a consumer can use its existing ids (UUIDs, `prefix:id` forms, base64,
 /// digests) unchanged.
-fn validate_opaque_field(field: &'static str, value: &str) -> Result<(), OpaqueFieldError> {
+pub(crate) fn validate_opaque_field(
+    field: &'static str,
+    value: &str,
+) -> Result<(), OpaqueFieldError> {
     if value.is_empty() {
         return Err(OpaqueFieldError::Empty { field });
     }
@@ -235,6 +293,25 @@ pub fn validate_schema_pin(pin: &str) -> Result<(), OpaqueFieldError> {
     validate_opaque_field(SCHEMA_PIN_FIELD, pin)
 }
 
+/// Check a preset: 1 to [`PRESET_MAX_LEN`] ASCII characters in `[a-z0-9_-]`.
+/// Errors name [`PRESET_FIELD`]. An absent preset is `None`, not an empty string.
+pub fn validate_preset(preset: &str) -> Result<(), PresetError> {
+    if preset.is_empty() {
+        return Err(PresetError::Empty);
+    }
+    if preset.len() > PRESET_MAX_LEN {
+        return Err(PresetError::TooLong {
+            length: preset.len(),
+        });
+    }
+    if let Some(index) = preset.bytes().position(|byte| {
+        !(byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"_-".contains(&byte))
+    }) {
+        return Err(PresetError::InvalidCharacter { index });
+    }
+    Ok(())
+}
+
 /// Check a [`CallOrigin`]: its `call_key` must pass the shared opaque-field
 /// rule, and errors name [`ORIGIN_CALL_KEY_FIELD`]. Every [`Principal`] is
 /// accepted as the carrier.
@@ -256,6 +333,7 @@ mod tests {
         assert_eq!(request.progress_token, None);
         assert_eq!(request.call_key, None);
         assert_eq!(request.schema_pin, None);
+        assert_eq!(request.preset, None);
         assert_eq!(request.origin, None);
     }
 
@@ -268,6 +346,7 @@ mod tests {
             progress_token: None,
             call_key: Some("run-7:call-3".to_string()),
             schema_pin: None,
+            preset: None,
             origin: None,
         };
         let encoded = serde_json::to_value(&request).expect("encode");
@@ -336,6 +415,52 @@ mod tests {
     }
 
     #[test]
+    fn preset_round_trips_outside_arguments_and_absence_keeps_the_bytes() {
+        let mut request = ToolCallRequest::new("grep", json!({ "q": "x" }));
+        let absent = serde_json::to_string(&request).unwrap();
+        assert_eq!(absent, r#"{"name":"grep","arguments":{"q":"x"}}"#);
+        let decoded: ToolCallRequest = serde_json::from_str(&absent).unwrap();
+        assert_eq!(decoded, request);
+        assert_eq!(decoded.preset, None);
+
+        request.preset = Some("read_only-2".to_string());
+        let encoded = serde_json::to_value(&request).unwrap();
+        assert_eq!(
+            encoded,
+            json!({
+                "name": "grep", "arguments": { "q": "x" }, "preset": "read_only-2"
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<ToolCallRequest>(encoded).unwrap(),
+            request
+        );
+    }
+
+    #[test]
+    fn preset_bounds_are_one_to_64_lowercase_digits_underscore_or_hyphen() {
+        assert_eq!(validate_preset(""), Err(PresetError::Empty));
+        assert_eq!(validate_preset("a"), Ok(()));
+        assert_eq!(validate_preset(&"a".repeat(64)), Ok(()));
+        assert_eq!(
+            validate_preset(&"a".repeat(65)),
+            Err(PresetError::TooLong { length: 65 })
+        );
+        assert_eq!(validate_preset("a0_-z9"), Ok(()));
+        for bad in ["A", ".", "é", " "] {
+            let error = validate_preset(bad).unwrap_err();
+            assert_eq!(error, PresetError::InvalidCharacter { index: 0 });
+            assert_eq!(error.field(), "preset");
+            assert!(error.to_string().starts_with("preset"));
+            let refusal =
+                crate::ErrorBody::new(crate::error_codes::INVALID_REQUEST, error.to_string())
+                    .with_detail(json!({ "field": error.field() }));
+            assert_eq!(refusal.code, "invalid_request");
+            assert_eq!(refusal.detail.unwrap()["field"], "preset");
+        }
+    }
+
+    #[test]
     fn a_request_without_a_schema_pin_omits_the_member_and_round_trips() {
         let request = ToolCallRequest::new("grep", json!({}));
         let encoded = serde_json::to_value(&request).expect("encode");
@@ -364,6 +489,7 @@ mod tests {
             progress_token: None,
             call_key: None,
             schema_pin: None,
+            preset: None,
             origin: None,
         };
         let encoded = serde_json::to_value(&request).expect("encode");

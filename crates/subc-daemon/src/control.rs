@@ -12944,6 +12944,75 @@ mod tests {
             assert!(!route.stamp().unwrap().owner_authorized);
         }
 
+        #[tokio::test]
+        async fn an_authority_owners_flow_id_without_an_agent_is_stamped_verbatim_on_bind() {
+            let mut rig = rig().await;
+            let mut record = head("s", 1);
+            record.carriers = vec![carrier(AFT, None)];
+            let flow_id = "Flow:run-7/step_2!~";
+            record.attributes.flow_id = Some(flow_id.to_string());
+            let reply = sync(&rig.handler, &rig.owner, 1, vec![record])
+                .await
+                .unwrap();
+            let ModuleControlResponseToModule::ScopeSync { results, .. } = reply else {
+                panic!("not a sync reply");
+            };
+            assert_eq!(results[0].outcome, ScopeRecordOutcome::Created);
+            let route = rig
+                .bound(Some(AFT), PLEXUS, Some(rig_selector("s", Some(1))))
+                .await;
+            assert!(rig.live(&route), "the stamped bind committed");
+            let stamp = route.stamp().expect("a flow scope carries a stamp");
+            assert_eq!(stamp.attributes.flow_id.as_deref(), Some(flow_id));
+            assert_eq!(stamp.attributes.agent_id, None);
+            assert!(!stamp.attributes.delegates);
+            assert!(stamp.owner_authorized);
+            let unscoped = rig.bound(Some(AFT), PLEXUS, None).await;
+            assert_eq!(unscoped.stamp(), None);
+        }
+
+        #[tokio::test]
+        async fn a_same_epoch_flow_id_change_bumps_version_and_drains_all_scoped_routes() {
+            let mut rig = rig().await;
+            let mut record = session(1);
+            record.attributes.flow_id = Some("flow:7".to_string());
+            rig.sync(vec![record.clone()]).await;
+            let before = rig.forwarding.published_scope_tag(OWNER, "s");
+            let mut owner_route = rig
+                .bound(Some(OWNER), PLEXUS, Some(rig_selector("s", Some(1))))
+                .await;
+            let mut carrier_route = rig
+                .bound(Some(AFT), OTHER, Some(rig_selector("s", Some(1))))
+                .await;
+            let mut unscoped = rig.bound(Some(AFT), PLEXUS, None).await;
+            rig.sync(vec![record.clone()]).await;
+            assert_eq!(rig.forwarding.published_scope_tag(OWNER, "s"), before);
+            assert!(rig.live(&owner_route) && owner_route.untouched());
+            assert!(rig.live(&carrier_route) && carrier_route.untouched());
+
+            record.attributes.flow_id = Some("flow:8".to_string());
+            rig.sync(vec![record]).await;
+            let after = rig.forwarding.published_scope_tag(OWNER, "s").unwrap();
+            let before = before.unwrap();
+            assert_eq!(after.scope_epoch, before.scope_epoch);
+            assert!(after.version > before.version);
+            for route in [&mut owner_route, &mut carrier_route] {
+                assert!(!rig.live(route));
+                assert_eq!(
+                    route.closed_reason(),
+                    RouteCloseReason::ScopeDelegationChanged
+                );
+            }
+            assert!(rig.live(&unscoped) && unscoped.untouched());
+            let rebound = rig
+                .bound(Some(AFT), PLEXUS, Some(rig_selector("s", Some(1))))
+                .await;
+            assert_eq!(
+                rebound.stamp().unwrap().attributes.flow_id.as_deref(),
+                Some("flow:8")
+            );
+        }
+
         /// The owner's sync lands between admission and the module's ack. The
         /// open is refused by name, the module's other routes stay up, and the
         /// reserved pair is released. Changed content is retryable; an ended

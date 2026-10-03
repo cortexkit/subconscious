@@ -65,6 +65,7 @@ fn protocol_wire_shapes_match_golden_json_and_round_trip() {
             progress_token: None,
             call_key: None,
             schema_pin: None,
+            preset: None,
             origin: None,
         },
     );
@@ -77,12 +78,39 @@ fn protocol_wire_shapes_match_golden_json_and_round_trip() {
             progress_token: Some(serde_json::json!("pt-7")),
             call_key: None,
             schema_pin: None,
+            preset: None,
             origin: None,
         },
     );
     // A call relayed for another caller: the relay's own key, and the caller
     // behind it with the carrier as a tagged principal object.
     assert_golden("tool_call_request_with_origin", &relayed_tool_call(true));
+    assert_golden(
+        "tool_call_request_with_preset",
+        &subc_protocol::tool_call::ToolCallRequest {
+            preset: Some("read_only-2".to_string()),
+            ..subc_protocol::tool_call::ToolCallRequest::new(
+                "grep",
+                serde_json::json!({ "pattern": "needle" }),
+            )
+        },
+    );
+    let mut flow_bind = module_control_request_with_scope();
+    if let ModuleControlRequest::RouteBind {
+        scope: Some(stamp), ..
+    } = &mut flow_bind
+    {
+        stamp.attributes.flow_id = Some("flow:run-7/step-2".to_string());
+    } else {
+        panic!("expected a scoped bind");
+    }
+    assert_golden("module_control_request_route_bind_with_flow_id", &flow_bind);
+    let mut flow_record = scope_head_record();
+    flow_record.attributes = ScopeAttributes {
+        flow_id: Some("flow:run-7/step-2".to_string()),
+        ..ScopeAttributes::default()
+    };
+    assert_golden("scope_record_with_flow_id_without_agent", &flow_record);
     // The same call with no origin: the member must be absent, not null.
     assert_golden(
         "tool_call_request_without_origin",
@@ -270,6 +298,7 @@ fn protocol_wire_shapes_match_golden_json_and_round_trip() {
                 attributes: ScopeAttributes {
                     agent_id: Some("agent-7".to_string()),
                     delegates: true,
+                    flow_id: None,
                 },
                 owner_authorized: true,
             }),
@@ -345,6 +374,7 @@ fn scope_head_record() -> ScopeRecord {
         attributes: ScopeAttributes {
             agent_id: Some("agent-7".to_string()),
             delegates: true,
+            flow_id: None,
         },
     }
 }
@@ -948,6 +978,7 @@ fn relayed_tool_call(with_origin: bool) -> subc_protocol::tool_call::ToolCallReq
         progress_token: None,
         call_key: Some("pf:relay/991".to_string()),
         schema_pin: None,
+        preset: None,
         origin: with_origin.then(|| {
             subc_protocol::tool_call::CallOrigin::new(
                 Principal::Reserved {
@@ -1106,6 +1137,7 @@ fn module_control_request_with_scope() -> ModuleControlRequest {
             attributes: ScopeAttributes {
                 agent_id: Some("agent-7".to_string()),
                 delegates: true,
+                flow_id: None,
             },
             owner_authorized: true,
         }),

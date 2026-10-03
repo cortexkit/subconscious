@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.28.0
+
+- Takes subc-protocol 0.29.0: `ToolCallRequest.preset` and `ScopeAttributes.flow_id` are optional wire fields, but this release is breaking for Rust struct literals. Update protocol and control dependencies together to avoid incompatible public protocol types.
+
 ## 0.27.1
 
 - Correct the restart drain override documentation: older daemons ignore the unknown field and use their normal drain budget, rather than refusing the request. No wire or runtime change.

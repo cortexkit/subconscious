@@ -1,0 +1,32 @@
+{
+  "attributes": {
+    "flow_id": "flow:run-7/step-2"
+  },
+  "carriers": [
+    {
+      "principal": {
+        "kind": "reserved",
+        "module_id": "broca"
+      }
+    },
+    {
+      "principal": {
+        "kind": "reserved",
+        "module_id": "aft"
+      },
+      "targets": [
+        "plexus",
+        "prefrontal-core"
+      ]
+    }
+  ],
+  "child_owners": [
+    {
+      "kind": "reserved",
+      "module_id": "magic-context"
+    }
+  ],
+  "kind": "head",
+  "ref": "head-1",
+  "scope_epoch": 3
+}

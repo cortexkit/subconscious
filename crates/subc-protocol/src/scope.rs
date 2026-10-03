@@ -113,9 +113,9 @@ pub struct ScopeCarrier {
     pub targets: Option<Vec<String>>,
 }
 
-/// The attributes the daemon stamps without interpreting. Both grant authority,
+/// The attributes the daemon stamps without interpreting. They bear authority,
 /// so only an owner listed in the daemon's `scope_authority_owners` may set
-/// either.
+/// them.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ScopeAttributes {
@@ -125,12 +125,29 @@ pub struct ScopeAttributes {
     /// Whether a provider may act as `agent_id`. Refused without `agent_id`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub delegates: bool,
+    /// This scope belongs to the named flow. Set only by an authority owner
+    /// (prefrontal), validated with [`validate_flow_id`], and stamped verbatim.
+    /// It needs neither `agent_id` nor `delegates`. Providers treat a non-owner
+    /// opener on a flow scope as the flow's carrier.
+    ///
+    /// Like an `agent_id` change, changing this at the same epoch is accepted,
+    /// bumps the content version and drains every route under the scope with
+    /// `scope_delegation_changed`, so no live route keeps the old identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flow_id: Option<String>,
 }
 
 impl ScopeAttributes {
     pub fn is_empty(&self) -> bool {
-        self.agent_id.is_none() && !self.delegates
+        self.agent_id.is_none() && !self.delegates && self.flow_id.is_none()
     }
+}
+
+/// Check a flow id using the shared opaque-token rule: 1–256 printable,
+/// non-space ASCII bytes. Errors name `flow_id`. Scope refs remain opaque and
+/// are not subject to this token rule.
+pub fn validate_flow_id(flow_id: &str) -> Result<(), crate::tool_call::OpaqueFieldError> {
+    crate::tool_call::validate_opaque_field("flow_id", flow_id)
 }
 
 /// One scope as its owner registers it in `scope.sync`.
@@ -272,4 +289,57 @@ pub struct ScopeStamp {
     /// Whether the owner is listed in the daemon's `scope_authority_owners`.
     /// Providers decide on this flag and keep no copy of the list.
     pub owner_authorized: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tool_call::OpaqueFieldError;
+
+    #[test]
+    fn flow_id_uses_the_shared_opaque_token_bounds_and_names_its_field() {
+        let field = "flow_id";
+        assert_eq!(validate_flow_id(""), Err(OpaqueFieldError::Empty { field }));
+        assert_eq!(validate_flow_id("f"), Ok(()));
+        assert_eq!(validate_flow_id(&"f".repeat(256)), Ok(()));
+        assert_eq!(
+            validate_flow_id(&"f".repeat(257)),
+            Err(OpaqueFieldError::TooLong { field, length: 257 })
+        );
+        assert_eq!(validate_flow_id("!~Flow:7/step"), Ok(()));
+        for bad in ["f é", "f\t", "fé", "f\u{7f}"] {
+            let error = validate_flow_id(bad).unwrap_err();
+            assert_eq!(
+                error,
+                OpaqueFieldError::InvalidCharacter { field, index: 1 }
+            );
+            assert_eq!(error.field(), "flow_id");
+        }
+    }
+
+    #[test]
+    fn flow_only_attributes_round_trip_and_absence_keeps_the_bytes() {
+        let attributes = ScopeAttributes::default();
+        assert!(attributes.is_empty());
+        assert_eq!(serde_json::to_string(&attributes).unwrap(), "{}");
+        assert_eq!(
+            serde_json::from_str::<ScopeAttributes>("{}").unwrap(),
+            attributes
+        );
+        let attributes = ScopeAttributes {
+            flow_id: Some("flow:7".to_string()),
+            ..ScopeAttributes::default()
+        };
+        assert!(!attributes.is_empty());
+        let encoded = serde_json::to_string(&attributes).unwrap();
+        assert_eq!(encoded, r#"{"flow_id":"flow:7"}"#);
+        assert_eq!(
+            serde_json::from_str::<ScopeAttributes>(&encoded).unwrap(),
+            attributes
+        );
+        assert!(
+            serde_json::from_str::<ScopeAttributes>(r#"{"flow_id":"flow:7","unknown":true}"#)
+                .is_err()
+        );
+    }
 }

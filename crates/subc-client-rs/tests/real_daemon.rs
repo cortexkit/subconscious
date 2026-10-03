@@ -3552,8 +3552,11 @@ async fn a_scoped_open_before_the_owners_first_sync_retries_until_the_owner_sync
 
     // Control: with a short retry budget the open runs out on scope_not_synced,
     // so the daemon really is refusing with it while the owner has not synced.
+    // Only the retry budget is short. The call itself gets a long deadline, so
+    // a slow first round trip on a loaded runner still returns the daemon's
+    // refusal instead of timing out before any answer arrives.
     let short = CallOptions {
-        timeout: Duration::from_secs(2),
+        timeout: Duration::from_secs(10),
         route_retry_deadline: Duration::from_millis(300),
         ..harness.carrier_options()
     };

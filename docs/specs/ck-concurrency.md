@@ -84,7 +84,14 @@ What a module must do:
   signal instead of exiting 0.
 - **Answer `route.bind` within 12 s.** Slow warm-up belongs behind `ready: false`, which callers
   see as the retryable `module_warming`, not inside `on_bind`.
-- **Answer health within 5 s** without disk, locks or subprocesses on the health path.
+- **Answer health within 5 s** without disk, locks or subprocesses on the health path. That
+  includes any lock a working job can hold, and anything that signals or waits on a job (a
+  cancellation, say): read job state from atomics or a lock-free snapshot. A health path that can
+  block on a stuck job fails exactly when it is needed. On 2026-10-03 aft's health report waited on
+  a lock held by a deadlocked view job, and for eight minutes aft could not report trouble.
+- **Never block the task that reads the daemon connection on module work.** That task also
+  answers health, accepts `route.bind`, and reads the stop notice; if it blocks, the module refuses
+  every new route, ignores its own stop and is killed at the end of the drain window.
 - **Finish or give up on in-flight work within its drain window;** long work should detach or
   checkpoint rather than hold the drain.
 

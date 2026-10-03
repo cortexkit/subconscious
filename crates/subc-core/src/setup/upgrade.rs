@@ -271,7 +271,12 @@ pub struct SystemUpgradeBackend {
     assets: ReleaseUpgradeAssetFetcher,
     inventory: Inventory,
     prepared: BTreeMap<String, PreparedUpgradeAsset>,
-    /// Identity of the verified file captured at placement, before activation.
+    /// Per target, the identity of the verified file just placed at its
+    /// destination: the inode on Unix, the file's SHA-256 on Windows (see
+    /// `destination_inode`). It is captured right after placement, before
+    /// activation, so post-activation verification can check that the
+    /// destination still holds the file this upgrade verified and placed, not a
+    /// file something else put there in the meantime.
     activated_inodes: BTreeMap<String, String>,
     rollback_paths: BTreeMap<String, PathBuf>,
     rollback_archive_sha256: BTreeMap<String, Option<String>>,

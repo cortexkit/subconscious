@@ -96,8 +96,13 @@ impl SetupBackend {
     pub fn observe(&mut self, request: &SetupRequest) -> Result<SetupObserved, String> {
         #[cfg(feature = "test-support")]
         if env::var_os("CK_TEST_SETUP_CONTROL_OK").is_some() {
-            // The control stub can validate a newly registered runtime without
-            // pretending it was already registered before fresh setup began.
+            // `CK_TEST_SETUP_CONTROL_OK` is the test-support control that stubs
+            // out setup's calls to the real platform. Here it replaces observing
+            // the daemon's service registration: the runtime is reported
+            // registered and live, or, with `CK_TEST_SETUP_RUNTIME_MISSING`, not
+            // registered at all. The second state lets a test run fresh setup that
+            // registers the runtime and then validates it, without the stub
+            // claiming the runtime was registered before setup began.
             self.runtime_status = if env::var_os("CK_TEST_SETUP_RUNTIME_MISSING").is_some() {
                 RuntimeStatus::default()
             } else {

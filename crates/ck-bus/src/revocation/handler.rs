@@ -2,13 +2,21 @@
 //! the task that watches connections and drives every recorded revocation.
 //!
 //! A module's `ckbus.credential` request is served by issuance, which overwrites the
-//! module's census entry with the new credential. Just before that, this handler reads
-//! the entry: issuance's replacement guard records the key durably after signing and
-//! before overwriting the census, not after the answer. Requests for
-//! one module are serialized here, so the entry read belongs to the issue that follows
-//! it. A census read that fails refuses the request (`ckbus_census_unavailable`), because
-//! issuing over an entry nobody could read would leave the credential it names
-//! unrevoked.
+//! module's census entry (its key in the account's census bucket, naming the credential
+//! the module currently holds) with the new credential. The old credential is found
+//! only through that entry, so it has to be recorded for revocation before the entry is
+//! overwritten. That is the job of the replacement guard, which `wire` installs into
+//! issuance: after signing the new credential and before writing the census, issuance
+//! reads the entry again and the guard durably records a revocation of the credential it
+//! names. The recording happens before the overwrite, not after the answer, so a crash
+//! once the entry is overwritten still leaves a durable record of the old credential
+//! for the revocation task to resume.
+//!
+//! This handler runs first. It serializes credential requests for one module, so the
+//! entry issuance reads belongs to the issue that follows it, and it reads the census
+//! entry before handing the request on. A read that fails refuses the request
+//! (`ckbus_census_unavailable`) and nothing is issued, because issuing over an entry
+//! nobody could read would leave the credential it names unrevoked.
 
 use std::{
     collections::HashMap,

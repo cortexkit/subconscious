@@ -84,7 +84,7 @@ the list. Phases are parameterized instances, not singleton slots (AFT finding
 AFT's real pipeline, for example, has independent pre-tag and post-tag CI
 watches. The current machine supports `ci_watch` only as a pre-publication gate;
 a selector naming a tag does not permit execution after an irreversible phase.
-A separate post-boundary observational watcher role is deferred. Readback of an
+A separate observational watcher role for CI after publication is deferred. Readback of an
 already published effect is observational and may follow publication. `place`
 is deliberately not a phase; see Boundaries.
 

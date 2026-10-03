@@ -687,8 +687,9 @@ impl RouteBindBreakers {
     }
 
     fn owns_probe(state: &ModuleBreakerState, token: Option<&Arc<()>>) -> bool {
-        // An old relay can settle after cooldown or after a reset and a new
-        // opening. Only the guard holding this probe's token may release it.
+        // A relay can finish after the breaker was reset or after it opened
+        // again and started a new probe. Only the guard whose token matches the
+        // active probe may release it, so a late relay never frees a newer probe.
         state
             .probe_in_flight
             .as_ref()
@@ -1571,8 +1572,11 @@ impl ControlHandler {
         let cleanup = if crash_closed.is_some() {
             self.forwarding.cleanup_connection_counted(connection_id)
         } else {
-            // Only module notices need the abandoned-relay count. Client
-            // teardown uses the route-only wrapper.
+            // A module connection's teardown needs the count of abandoned
+            // route.bind relays for its route.closed notice below. Any other
+            // connection, such as a client's, sends no such notice and needs
+            // only its routes released, so it uses the route-only wrapper and
+            // reports zero.
             self.forwarding
                 .cleanup_connection(connection_id)
                 .map(|released| crate::forwarding::ConnectionCleanup {
@@ -2537,8 +2541,10 @@ impl ControlHandler {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .describe(&owner, &scope_ref);
         let owner_configured = match &owner {
-            // Not `get(..).is_some()`: a supervised module's process can
-            // register and describe before it is on the roster.
+            // Ask whether the owner is configured (`is_configured`), not
+            // whether it is on the roster (`get(..).is_some()`): a supervised
+            // module's process can register and describe a scope before the
+            // supervisor has put it on the roster.
             Principal::Reserved { module_id } => self.supervisor.is_configured(module_id),
             _ => false,
         };
@@ -2833,10 +2839,12 @@ impl ControlHandler {
             probe_in_flight,
             "route.open refused by open bind-relay breaker"
         );
-        // Say what a caller can act on. The module is running and its
-        // established routes keep working; only new routes are being held off
-        // while it is slow to accept them. A message that only counts failed
-        // relays reads as "the module is down" to a worker that sees it.
+        // Say what a caller can act on. An open bind-relay breaker means the
+        // module timed out accepting several new routes in a row. The module
+        // is still running and its established routes keep working; only new
+        // route.open requests are refused until the cooldown ends and one
+        // test route (the probe) gets through. A message that only counts
+        // failed relays reads as "the module is down" to a worker that sees it.
         let detail = if probe_in_flight {
             "one test route is already being tried; retry once it settles".to_string()
         } else {
@@ -3381,9 +3389,11 @@ impl ControlHandler {
             None => (None, None),
             Some(selector) => {
                 let owner_configured = match &selector.owner {
-                    // See `SupervisorHandle::is_configured`: true from before
-                    // the owner's process is spawned, so an owner that has
-                    // not synced yet is refused as retryable, not terminal.
+                    // A reserved owner counts as configured from before its
+                    // process is spawned (see `SupervisorHandle::is_configured`).
+                    // So an owner that has not synced its scopes yet is refused
+                    // as retryable (`scope_not_synced`), not as one that will
+                    // never sync.
                     Principal::Reserved { module_id } => self.supervisor.is_configured(module_id),
                     _ => false,
                 };

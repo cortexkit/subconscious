@@ -433,7 +433,11 @@ pub struct BoundDaemon {
     /// daemon sweeps or writes this one's run state. `None` when the config
     /// keeps no live-children record, and so has no run directory to own.
     run_dir_lock: Option<crate::run_dir_lock::RunDirLock>,
-    /// Unpublished daemon boots keep the singleton claim until serving is ready.
+    /// The singleton start lock, kept when binding deferred publishing the
+    /// connection file. It stays held until the daemon has verified it is serving
+    /// and written the connection file, so a second daemon starting meanwhile
+    /// cannot claim the singleton too. `None` when the connection
+    /// file was already written at bind time.
     publication_lock: Option<StartLock>,
 }
 

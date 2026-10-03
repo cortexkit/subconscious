@@ -2,7 +2,7 @@
 
 ## 0.25.2 — 2026-10-02
 
-- Every module using the SDK's serve helper now answers `health.check` independently of data-request slots, even under request saturation. When all 64 slots are in use and the oldest queued request has waited more than two seconds, the helper reports at least `Degraded`, including the slot count and wait age. A module's own `Failing` status is preserved, its detail is appended, and its metrics are unchanged. With free slots, its report passes through unchanged.
+- Every module using the SDK's serve helper now answers `health.check` independently of data-request slots, even under request saturation. When all 64 slots are in use and the oldest queued request has waited more than two seconds, the helper reports at least `Degraded` and puts the slot count and wait age at the start of the detail. A module's own `Degraded` or `Failing` status is kept, its own detail follows the saturation note, and its metrics are unchanged. With free slots, its report passes through unchanged.
 
 ## 0.25.1 — 2026-10-02
 

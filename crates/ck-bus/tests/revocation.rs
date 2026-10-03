@@ -1017,7 +1017,11 @@ async fn census_replacement_records_predecessor_before_the_crash_boundary() {
         panic!("predecessor disappeared at the census-write crash boundary");
     };
     assert_eq!(record.user_public, victim.public);
-    // Fresh memory can now finish the predecessor's revocation without touching its successor.
+    // A new revoker stands in for a restarted ck-bus: the crashed process's in-memory
+    // state (its record of issued credentials and the revoker that began the
+    // revocation) is gone, and only the durable progress record remains. Recovery
+    // resumes the recorded predecessor revocation from that record, and the census
+    // entry, which already names the successor, is left unchanged.
     let recovering = process(&plane, run.trust.signer.clone(), store.path()).await;
     let outcomes = recovering.resume_all(&plane).await;
     assert!(outcomes[0].1.is_ok(), "{outcomes:?}");
@@ -1109,7 +1113,10 @@ async fn a_damaged_record_is_recovered_from_the_census_or_deferred() {
     assert_eq!(disconnects.settled_for(&victim.public).await.len(), 1);
     progress_is_empty(store.path()).await;
 
-    // (iii) Even after step (2), lost inputs cannot be inferred from absence.
+    // (iii) Damaged after step (2), the census delete: the record's inputs (the user
+    // key, JWT id, generation and epoch) are unreadable and the census entry they were
+    // derived from is gone. An absent entry says nothing about which key it held, nor
+    // whether the revocation finished, so recovery defers and keeps the record.
     let store = tempfile::tempdir().unwrap();
     let (victim, _) = stop_and_damage(
         &plane,

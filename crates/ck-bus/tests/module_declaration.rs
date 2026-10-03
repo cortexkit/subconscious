@@ -103,12 +103,15 @@ fn state_constants_positive_control_recognizes_declaration_spellings() {
     );
 }
 
-/// The operator data-home guard compares the live module's files by presence
-/// or by content according to `data_home`'s lists. A state file ck-bus starts
-/// writing that is in neither list would be compared by content, so the live
-/// module rewriting it during a run would fail an unrelated test. This reads
-/// every `const *_FILE` / `*_DIR` string in ck-bus's own source and
-/// requires each to be classified.
+/// The acceptance tests fingerprint the operator's real ck-bus data directory
+/// (`$XDG_DATA_HOME/cortexkit/ckbus`) before and after a run and compare the two,
+/// to prove the tests never wrote to the operator's install. The operator's own
+/// ck-bus may be running meanwhile, so `data_home` lists which files it rewrites
+/// while serving (compared by presence only) and which it never touches
+/// (compared by content). A file in neither list is compared by content, so a
+/// new state file the live module rewrites during a run would fail an unrelated
+/// test. This reads every `const *_FILE` / `*_DIR` string in ck-bus's own source
+/// and requires each to be in one of the lists.
 #[test]
 fn every_ckbus_state_file_is_classified() {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");

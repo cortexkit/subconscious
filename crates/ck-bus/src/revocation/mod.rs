@@ -2,15 +2,18 @@
 //! a vault delete.
 //!
 //! Three ordered steps, each idempotent:
-//! 1. Add the user's public key to the box account JWT's `revocations`. The account JWT
-//!    is read from the server through the claims lookup immediately before the update,
-//!    never from a cache (ck-bus is its single writer). The operator signer (never the
-//!    operator root) signs the updated JWT through `credential.sign`, and it is pushed
-//!    over the system user's claims-update subject. The push counts only once the
-//!    lookup reads back exactly the pushed token: the server saves a claims update
-//!    without checking its issuer, so the update's own reply proves nothing. From then
-//!    on the server refuses the user's JWT on every connect, across a server restart,
-//!    and closes its live connections itself.
+//! 1. Add the user's public key to the `revocations` of the box account JWT (the NATS
+//!    account every participant on this box connects under). The account JWT is read
+//!    from the server through the claims lookup (the `$SYS` request that returns the
+//!    account JWT the server currently holds) immediately before the update, never from
+//!    a cache (ck-bus is its single writer). The operator signer (the operator's signing
+//!    key listed in the operator JWT, never the operator's root identity key) signs the
+//!    updated JWT through `credential.sign`, and the result is pushed over the
+//!    claims-update subject of the system user (ck-bus's user in the `$SYS` system
+//!    account). The push counts only once the lookup reads back exactly the pushed
+//!    token: the server saves a claims update without checking its issuer, so the
+//!    update's own reply proves nothing. From then on the server refuses the user's JWT
+//!    on every connect, across a server restart, and closes its live connections itself.
 //! 2. Delete the module's census key, but only while it still names this credential
 //!    (the same generation, epoch and key), as a compare-and-delete on its revision. A
 //!    superseded credential's key was already overwritten by its successor, which is
@@ -32,10 +35,12 @@
 //! credential, whether this process issued it or an earlier ck-bus process did (which is
 //! how a restart finds superseded users: the census outlives the process, the in-memory
 //! record of issued credentials does not). The other trigger, a census entry whose
-//! module has no live process in the supervisor's spawn snapshot (the process exited),
-//! belongs to ck-bus's spawn-stream consumer, which calls `Revoker::revoke_module`.
+//! module has no live process in the supervisor's spawn snapshot (the daemon's list of
+//! live module processes and their spawn generations; a missing module means its process
+//! exited), belongs to ck-bus's spawn-stream consumer, which calls
+//! `Revoker::revoke_module`.
 //!
-//! JWT expiry is the other half of revocation (R16): every user JWT expires 15 minutes
+//! JWT expiry is the other half of revocation: every user JWT expires 15 minutes
 //! after issue, and a key whose revocation is recorded is never renewed, so a
 //! credential whose revocation was lost to damage stays valid for at most 15 minutes.
 

@@ -69,8 +69,11 @@ staging; the walkthrough below describes the intended complete pipeline.
 
 `verify_readback` is observational and may follow an irreversible phase.
 `ci_watch` remains a pre-publication gate even if its selector names a tag;
-post-boundary CI observation requires a separate watcher role, which is not yet
-defined. Ordinary release gates cannot first execute after publication.
+watching CI after publication would need a separate watcher role, which is not
+yet defined. Any phase that can refuse and stop the train (a gate such as
+`ci_watch`, `build` or a precheck) must be placed before the first irreversible
+phase (`tag`, `publish` or `assets`); a plan that orders one after it is
+refused with `unsafe_phase_ordering`.
 
 `publish` and `assets` accept optional `params.artifacts` arrays of declared
 artifact IDs. Omitting the list targets all artifacts. Lists must be non-empty,

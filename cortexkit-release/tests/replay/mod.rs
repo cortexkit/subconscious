@@ -334,8 +334,11 @@ fn assert_rebound_intent(present: bool, newer_completion: bool) {
     .unwrap();
     let subject = build_approval_subject(&rebound).unwrap();
     if newer_completion {
-        // Older clients could retry across a rebind and complete only the new
-        // intent. An upgrade must still reconcile the original pending record.
+        // Older clients could retry after the train was rebound to a new
+        // declaration: the retry records and completes a new intent under the
+        // rebound plan, while the intent recorded before the rebind stays
+        // pending. This test checks that reconciling still resolves that
+        // original intent rather than treating the newer completion as enough.
         let newer = journal
             .append_intent(
                 &request(&rebound, &public_effect),

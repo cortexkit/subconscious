@@ -1,11 +1,14 @@
 //! The dead-letter consumer: ck-bus reads `CK_{ACCT}_EFFECT_DEAD` through its durable
 //! `c_ckbus_dead` and records each dead-lettered message once per message id.
 //!
-//! Terminal disposition belongs to the claimant (foundation, "Terminal disposition has a
-//! named executor"): on cap exhaustion it publishes a dead-letter record to
-//! `ck.{acct}.effect.dead` and only then calls `term()` on the original item. A crash
-//! between the two leaves the record stored and the item unterminated, and the next
-//! claimant publishes the same record again. The stream drops a republish that carries
+//! Terminal disposition is the job of the claimant: the module that pulled (claimed) an
+//! effect item from `CK_{ACCT}_EFFECT` under its own credential. JetStream's delivery cap
+//! only stops redelivery and publishes nothing, so when the claimant sees an item
+//! exhaust its deliveries it publishes a dead-letter record to `ck.{acct}.effect.dead`
+//! and only then calls `term()` on the original item. That order means a crash can
+//! produce a duplicate record but never a lost one: a crash between the two leaves the
+//! record stored and the item unterminated, and the next claimant publishes the same
+//! record again. The stream drops a republish that carries
 //! the same `Nats-Msg-Id` inside its duplicate window; a republish outside that window
 //! is stored as a second message. ck-bus therefore deduplicates here, on the record's
 //! own `message-id` field.

@@ -3,7 +3,6 @@
 ## 0.30.0
 
 - Breaking Rust API: `HealthConfig` owns an optional HTTP URL and is `Clone`, no longer `Copy`; `ForwardingError` gains `ConnectionRoleConflict`, so exhaustive matches must handle it. Requires subc-jobobject 0.2.0 on Windows and subc-cgroup 0.1.5 on Linux.
-
 - Reject reserved capability claims in `catalog.update` before changing active or swap-candidate registrations, using the same `reserved_capability` error as HELLO.
 - Module GOODBYE now performs disconnect teardown immediately, including requirement recomputation, route-closed client pushes and scope-sync authority release, without waiting for the socket to close.
 - Scope sync propagates parent refusals through direct dependencies and shares ancestor walks (including shared cyclic ancestry), avoiding cubic work on leaf-first scope chains.
@@ -19,14 +18,17 @@
 - Orphan records identify the running executable image after PATH lookup and shebang interpretation, while provenance still records the configured program.
 - Swap retirement drains and journals the incumbent in the background, leaving the promoted process supervised and operator commands responsive. Linux kill domains are unique per spawn, and reaping cleans the process tree and its cgroup.
 - Stderr read failures stop marking the tail incomplete after their historical process section is evicted; failures in retained history remain visible.
-- Close registrations whose sockets outlive a reaped supervised process before restarting. Failed release attempts leave an operator-revivable state; start also revives Restarting modules with no child or scheduled respawn.
-- Serve supervisor commands during health, operator, and reload retry backoffs, allowing disable or drain to cancel the replacement. Reload acknowledgements still wait for registration, or report cancellation.
-- Health restart budget exhaustion leaves the module enabled and failed, with the limit and window in its terminal record. Keep a reaped reload child's roster entry until its terminal record is written so daemon shutdown cannot exit first.
 - Refuse a second HELLO on a registered module connection without changing its identity, launch nonce, or existing routes.
 - Serialize module registration and client-route reservation admission, refusing mixed roles with terminal `invalid_hello` or `invalid_request` rather than allowing unusable, leaked routes.
 - Settle late accepted route binds during daemon drain with `module_reloading`, releasing both reserved channels and preserving the shared module connection for ordered shutdown.
 - Repair `bench-harness` sink receivers to consume accounting-bearing `OutboundFrame` values, restoring feature compilation.
-- Preserve FIFO order when the test-only dispatch spike reuses a cancelled correlation id by fencing queued entries with request-incarnation tickets.
+- Preserve FIFO order when the test-only dispatch prototype (`dispatch_spike`, built only for tests) reuses a cancelled correlation id, by fencing queued entries with request-incarnation tickets.
+
+## 0.29.2 — 2026-10-02
+
+- Close registrations whose sockets outlive a reaped supervised process before restarting. Failed release attempts leave an operator-revivable state; start also revives Restarting modules with no child or scheduled respawn.
+- Serve supervisor commands during health, operator, and reload retry backoffs, allowing disable or drain to cancel the replacement. Reload acknowledgements still wait for registration, or report cancellation.
+- Health restart budget exhaustion leaves the module enabled and failed, with the limit and window in its terminal record. Keep a reaped reload child's roster entry until its terminal record is written so daemon shutdown cannot exit first.
 
 ## 0.29.1 — 2026-10-02
 

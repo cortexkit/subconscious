@@ -249,34 +249,35 @@ fn ensure_parent_directory(parent: &Path) -> Result<(), ConnectionFileError> {
 
 /// Refuse to publish key material beneath a directory another user can write.
 ///
-/// A LINT AGAINST MISCONFIGURATION, NOT A SECURITY BOUNDARY. It does nothing
-/// against a same-uid adversary, who can read the finished 0600 file anyway. It
-/// catches the cross-uid case, which the same-uid concession does NOT cover: a
-/// group- or world-writable ancestor lets another user UNLINK the 0600 file and
-/// substitute their own, because directory write permission governs create and
-/// unlink rather than the target's mode. The file's own mode does not close it
-/// and neither does its ownership.
+/// This catches misconfiguration; it is not a security boundary. A process
+/// running as the same user can read the finished 0600 file anyway, so the
+/// check does nothing against one. What it catches is another user: whoever can
+/// write a directory can unlink and create entries in it, whatever the mode or
+/// owner of the file inside, so another user with write access to any ancestor
+/// could delete the 0600 file and put their own in its place.
 ///
-/// EVERY ANCESTOR, UP TO `/`. Stopping at `$HOME` or an XDG base would read the
-/// bound from the environment, so it would be attacker-influenceable and
-/// undefined when unset. It is also incorrect: an attacker who can unlink in ANY
-/// ancestor renames an intermediate directory aside and substitutes their own
-/// tree, so a 0700 leaf under a 0777 grandparent protects nothing. Every
-/// component or the guarantee does not compose.
+/// The check covers every ancestor up to `/`. Stopping at `$HOME` or an XDG
+/// base would take the bound from the environment, which an attacker can
+/// influence and which may be unset. It would also be wrong: an attacker who can
+/// unlink in any ancestor can rename an intermediate directory aside and put
+/// their own tree in its place, so a 0700 leaf under a 0777 grandparent protects
+/// nothing.
 ///
-/// CANONICALISE FIRST. An unresolved walk checks the modes of a path that is not
-/// the one we write through: a symlink component pointing somewhere permissive
-/// defeats the walk while every individual `stat` passes.
+/// The path is canonicalised first, resolving symlinks. Walking the unresolved
+/// path would check the modes of a path other than the one written through: a
+/// symlink component pointing somewhere permissive would pass every `stat`.
 ///
-/// Only the effective user and root are trusted directory owners: even a 0755
-/// directory can be renamed or have its permissions changed by its owner. Root
-/// is trusted because the transport does not defend against root processes.
+/// Each ancestor must be owned by the effective user or by root, and is refused
+/// otherwise: even a 0755 directory can be renamed or have its permissions
+/// changed by its owner. Root is trusted because the transport does not defend
+/// against root processes.
 ///
-/// STICKY EXEMPTS WRITABLE BITS, NOT OWNERSHIP. `/tmp` and `/Users/Shared` are
-/// 1777 by design; without the
-/// exemption this fires on correctly-configured systems, and a check that
-/// refuses healthy configuration gets disabled — after which it protects nothing
-/// at all.
+/// A group- or world-writable ancestor is refused unless it is sticky. The
+/// sticky bit lets only an entry's owner remove or rename it, and `/tmp` and
+/// `/Users/Shared` are 1777 by design; without this exemption the check would
+/// fire on correctly configured systems, and a check that refuses healthy
+/// configuration gets disabled, after which it protects nothing. A sticky
+/// directory must still pass the ownership check above.
 #[cfg(unix)]
 fn refuse_writable_ancestor(parent: &Path) -> Result<(), ConnectionFileError> {
     refuse_writable_ancestor_for_uid(parent, rustix::process::geteuid().as_raw())

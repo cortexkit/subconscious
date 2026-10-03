@@ -33,10 +33,14 @@ pub(crate) const CHILD_LOG_ALARM_SEGMENT_MB_ENV: &str = "CK_LOG_ALARM_SEGMENT_MB
 
 /// Top-level daemon config sections that rescan cannot apply. The daemon
 /// snapshots these sections at start and reports later rescan changes as
-/// `restart_required`. Setup intersects this set with sections core
-/// configuration would write so a dry-run can flag a restart before the
-/// config file exists on disk. Match this enum exhaustively so a new section
-/// cannot be added without a comparison.
+/// `restart_required`. Setup also uses this set, when it observes the system
+/// before writing config (a dry run included): it lists the dotted keys core
+/// setup would write, treating a missing config file as empty so every
+/// desired key counts as pending, and, when the daemon is live, flags each key
+/// whose top-level section is one of these (`restart_required_from_pending_keys`
+/// in subc-core). It cannot ask the daemon instead, because the new sections
+/// are not on disk yet. Match this enum
+/// exhaustively so a new section cannot be added without a comparison.
 /// Per-module `health` (including `health.http`, cadence and deadline) is not
 /// in this set: rescan applies it live without a module restart. Launch-spec
 /// fields such as `protocol` take effect at the next spawn instead.

@@ -1,7 +1,9 @@
 //! Issuance: a supervised participant asks ck-bus for its bus credential.
 //!
 //! ck-bus serves three ops over the subc wire, `ckbus.credential`, `ckbus.nonce_sign` and
-//! `ckbus.credential_renew` (R16: the same key re-signed with a fresh `exp`). All three
+//! `ckbus.credential_renew`. Every user JWT expires 15 minutes after it is signed;
+//! renewal re-signs the same key with a fresh `exp`, and the holder renews before the old
+//! one lapses. All three
 //! authorize by the principal the daemon stamped on the caller's route at bind time
 //! and by nothing the caller writes in its request: `Principal::Reserved { module_id }`
 //! (the caller presented its launch nonce) binds the answer to that module id and to the
@@ -10,12 +12,16 @@
 //! `ckbus_principal_direct`, and a module with no live generation
 //! `ckbus_generation_not_live`.
 //!
-//! Issuing and writing the census key are one act, in this order:
+//! The census key is the module's entry in the account's census bucket
+//! (`AccountNames::census_key`, value in `census`): it names the credential the module
+//! currently holds, and revocation reads it to find the key to revoke. Issuing and
+//! writing the census key are one act, in this order:
 //! 1. fence against the spawn snapshot's generation;
 //! 2. advance and fsync the generation's entry in `epoch_high_water.json`;
-//! 3. generate the user key in memory and have the box account root sign its JWT;
-//! 4. (retired by R15: agent durables are created by prefrontal through
-//!    `ckbus.agent_durable_bind`, in the membership area, never at issuance);
+//! 3. generate the user key in memory and have the box account root (the vault key
+//!    that signs every user JWT in the box account) sign its JWT;
+//! 4. (retired: issuance no longer creates agent durables; prefrontal creates them
+//!    through `ckbus.agent_durable_bind`, in the membership area);
 //! 5. write the census key;
 //! 6. answer.
 //!
@@ -23,14 +29,19 @@
 //! census entry, so there is nothing to roll back; the next request issues at a higher
 //! epoch. Once an issue completes, the module's previous user is superseded: its key is
 //! dropped from memory (so a reconnect under it gets `ckbus_credential_superseded`). Its
-//! revocation is recorded durably by the replacement guard before the census write,
-//! so a crash cannot erase the only record of the superseded key. If the census write
-//! subsequently fails, that old key remains revoked; the caller must fetch a fresh key.
+//! revocation is recorded durably by the replacement guard (a [`CensusReplacement`]
+//! the revocation area installs) after signing and before the census write. The census
+//! entry is the only record naming the old key, so recording it first means a crash
+//! during the overwrite cannot lose it. If the census write then fails, that old key
+//! remains revoked; the caller must fetch a fresh key.
 //!
-//! The grant names no agent (R15: agent access is account-scoped). `grants::issued_grant`
-//! picks it from the attested module id: the delivery-authority grant for
-//! `reserved:prefrontal-core`, the participant grant for every other module. Rooms have
-//! no named source yet, so every module is issued with none.
+//! The grant names no agent: agent access is account-scoped, so a credential may pull
+//! from any agent's durable in the box account and a change in where an agent resides
+//! needs no reissue. `grants::issued_grant` picks the grant from the attested module id:
+//! the delivery-authority grant for `prefrontal-core`, the flow-engine grant for
+//! `basal`, and the participant grant for every other module. A grant can also name the
+//! rooms (the `ck.{acct}.room.{room_id}` subjects) a credential is bound to, but nothing
+//! yet tells ck-bus which rooms a module belongs to, so every module is issued with none.
 
 pub mod census;
 pub mod handler;
@@ -64,8 +75,8 @@ use high_water::{HighWater, HighWaterRefusal};
 pub const CREDENTIAL_OP: &str = "ckbus.credential";
 /// The op a participant calls to have its connect nonce signed.
 pub const NONCE_SIGN_OP: &str = "ckbus.nonce_sign";
-/// The op a participant calls to renew its JWT before `exp` (R16): the same key and
-/// epoch, re-signed with a fresh `iat` and `exp`.
+/// The op a participant calls to renew its JWT before `exp` (every JWT expires 15
+/// minutes after signing): the same key and epoch, re-signed with a fresh `iat` and `exp`.
 pub const CREDENTIAL_RENEW_OP: &str = "ckbus.credential_renew";
 
 /// Refusal codes, each an Error frame code on the caller's request.
@@ -136,7 +147,10 @@ pub trait PlaneSource: Send + Sync {
     fn current(&self) -> Option<Plane>;
 }
 
-/// Makes the predecessor recoverable before issuance replaces its census entry.
+/// The replacement guard. Before issuance overwrites a module's census entry, `prepare`
+/// durably records a revocation of the credential that entry names (`previous`, the
+/// module's previous credential), so the old key can still be revoked after the entry
+/// that named it is gone, even across a crash.
 pub trait CensusReplacement: Send + Sync {
     fn prepare(&self, module_id: &str, previous: &CensusValue) -> Result<(), Refusal>;
 }
@@ -260,7 +274,10 @@ impl Issuance {
         self.plane.clone()
     }
 
-    /// Installed by revocation wiring before requests are served.
+    /// Installs the replacement guard. `revocation::handler::wire` calls this before the
+    /// module serves any request: without a guard, issuance overwrites a census entry
+    /// without recording the previous credential's revocation, and that credential
+    /// would stay usable until its JWT expired.
     pub fn set_replacement_guard(&self, guard: Arc<dyn CensusReplacement>) {
         *lock(&self.replacement) = Some(guard);
     }

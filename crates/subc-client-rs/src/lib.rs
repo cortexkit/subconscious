@@ -388,7 +388,10 @@ impl RequestDispatcher {
     }
 }
 
-/// Remove the stamp even if a queued task exits on connection close or panics.
+/// Holds this request's entry in the dispatcher's `waiting` map (when it started
+/// waiting for a handler slot, which health reports as the oldest wait) and removes
+/// it on drop, so the entry goes even if the queued task exits on connection close
+/// or panics.
 struct PermitWait {
     waiting: Arc<Mutex<HashMap<RequestKey, Instant>>>,
     key: RequestKey,
@@ -1142,38 +1145,38 @@ pub trait ModuleHandler: Send + Sync + 'static {
 
     /// Return cheap in-memory health for the module.
     ///
-    /// The serve helper calls this on a task independent of data-request slots.
-    /// Afterward it folds in its own dispatch gauges: if all 64 slots are in use
-    /// and a request has waited more than two seconds for a slot, the reply is
-    /// at least `Degraded`, with dispatch counts and wait age added to `detail`.
-    /// A module's `Failing` status, detail and metrics are never discarded.
+    /// The default reports `Ok` with the detail "no health implementation;
+    /// inherited default". The detail lets an operator reading
+    /// `ck health <module>` tell "measured, nothing wrong" from "nobody
+    /// measured", but the daemon decides on the status alone and never parses
+    /// the detail, so to the daemon the default looks like a module that checked
+    /// itself and found nothing wrong. It stays a default because health is
+    /// optional: a module that advertises no health capability is never probed,
+    /// so the value is never read. A module that does advertise health and
+    /// keeps this default can report no fault beyond the serve helper's own
+    /// saturation check.
     ///
-    /// THE DEFAULT ASSERTS HEALTH ON BEHALF OF A MODULE THAT NEVER WROTE ANY.
-    /// A module that has not implemented this is indistinguishable on the wire
-    /// from one that measured itself and found nothing wrong -- and the daemon
-    /// acts on the difference, since a healthy report suppresses escalation
-    /// while an absent implementation means nothing was ever checked.
+    /// The serve helper calls this when the daemon sends `health.check`, on a
+    /// task of its own rather than one of the 64 data-request slots, so a health
+    /// check never waits behind the requests it reports on. It then folds in
+    /// dispatch saturation: if all 64 slots are in use and a request has waited
+    /// more than two seconds for one, an `Ok` reply becomes `Degraded`, and the
+    /// slot count and oldest wait are prepended to `detail`. A `Degraded` or
+    /// `Failing` status, the module's own detail and its metrics are kept.
     ///
-    /// It stays a default because health is genuinely optional: a module that
-    /// advertises no health capability is never probed, so the value is unread
-    /// for those. The hazard is the module that DOES advertise health and
-    /// inherits this -- it cannot report faults beyond the serve helper's own
-    /// dispatch-saturation measurement.
-    ///
-    /// An implementation must derive its status
-    /// mechanically from signals the dispatch path stamps (a monotonic
-    /// heartbeat, oldest-queued age), never from its own opinion, and must not
-    /// take a blocking lock, touch disk, or spawn a subprocess on this path.
-    /// A health reply that execs queues behind the host's slowest shared
-    /// resource -- which is exactly the resource degraded under the conditions
-    /// being probed.
+    /// An implementation must not block: no blocking lock, no disk access and
+    /// no subprocess on this path. Derive the status from signals the dispatch
+    /// path already records in memory, such as a monotonic heartbeat or the age
+    /// of the oldest queued item. A health reply that waits on a slow shared
+    /// resource stalls under exactly the conditions it is meant to report,
+    /// because that resource is what degrades first.
     async fn health(&self) -> HealthReport {
-        // SAY THAT NOBODY MEASURED, rather than that everything is fine.
+        // Say that nobody measured, rather than that everything is fine.
         //
         // The status stays Ok because a module advertising no health capability
         // is never probed, and one that advertises health but has nothing to
-        // report is not unhealthy. What changes is that the report now
-        // IDENTIFIES ITSELF as the inherited default, so an operator reading
+        // report is not unhealthy. What changes is that the report identifies
+        // itself as the inherited default, so an operator reading
         // `ck health <module>` can tell "measured, nothing wrong" from "nobody
         // wrote a health path" -- which were previously the same bytes.
         //

@@ -1546,25 +1546,28 @@ impl ForwardingTable {
                     abandoned,
                 });
             }
-            // The acking endpoint was the active one when this relay was
-            // reserved, and a swap has since promoted a candidate over it. The
-            // module did nothing wrong: it bound the route it was asked to bind,
-            // and it is still carrying every other client's routes until it is
-            // drained. So this is settled here, while the pending entry still
-            // holds the client's sender and the reservation pair: release the
-            // pair, tell the waiting route.open to retry (it will reserve on the
-            // promoted endpoint), and hand back the module-side channel so the
-            // caller sends one channel-scoped GOODBYE for the binding the module
-            // just created. Nothing here touches the module connection.
+            // The endpoint that acked this bind is no longer accepting new
+            // routes, for one of two reasons. Either it was the module's active
+            // endpoint when this relay was reserved and a blue/green swap has
+            // since promoted a candidate (the replacement process registered
+            // beside it) into the active slot, superseding it; or a daemon
+            // drain has gated it, and the ack arrived before the ordered module
+            // drain settled pending relays. The module did nothing wrong: it
+            // bound the route it was asked to bind, and the endpoint still
+            // carries every other client's routes until it is drained. So the
+            // ack is settled here, while the pending entry still holds the
+            // client's sender and the reserved handle pair: release the pair,
+            // refuse the waiting route.open with `module_reloading`, which
+            // callers retry (after a swap the retry reserves on the promoted
+            // endpoint), and hand back the module-side channel so the caller
+            // sends one channel-scoped GOODBYE for the binding the module just
+            // created. Returning an error instead would end the module
+            // connection all those other routes share; nothing here touches it.
             //
-            // Daemon drain also gates an endpoint before its ordered module
-            // drain settles pending relays. An ack in that gap must release its
-            // reservation and deliver a refusal, not turn admission shutdown
-            // into a fatal error on the shared module connection.
-            // An endpoint that stopped being active for any other reason is
-            // STALE and still falls through to
-            // `commit_route_locked`, which refuses it with `StaleModuleEndpoint`
-            // exactly as before swaps existed.
+            // An endpoint that stopped being active any other way is stale
+            // (replaced, but not by a swap and not draining). It still falls
+            // through to `commit_route_locked`, which refuses it with
+            // `StaleModuleEndpoint` exactly as before swaps existed.
             RouteBindRelayOutcome::Accepted
                 if inner.superseded_endpoints.contains_key(&endpoint)
                     || inner.draining_endpoints.contains_key(&endpoint) =>

@@ -112,10 +112,16 @@ pub(crate) const SPAWN_SUBSCRIBER_LAGGED_CODE: &str = "spawn_subscriber_lagged";
 
 struct SupervisedChild {
     child: Child,
-    /// Protocol used to launch this process, not a later pending-reload spec.
+    /// The protocol this process was launched with. A reload can store a new
+    /// launch spec with a different protocol, but that takes effect only at the
+    /// next spawn, so this process keeps being handled by the protocol it
+    /// actually speaks.
     protocol: ModuleProtocol,
     /// This process's cgroup name: a bounded module/slot label followed by a
-    /// unique spawn suffix, so a retired slot cannot share a later kill domain.
+    /// spawn suffix unique to this process (when cgroup placement is on). A
+    /// retired process in a slot may still be draining when a later one is
+    /// spawned into that slot, so the suffix keeps the later process out of
+    /// the retired one's cgroup, which is the domain a kill applies to.
     #[cfg(target_os = "linux")]
     module_id: String,
     #[cfg(target_os = "linux")]

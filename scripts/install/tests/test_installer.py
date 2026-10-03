@@ -89,7 +89,10 @@ class InstallerTests(unittest.TestCase):
                                 env=dict(self.env, PATH="/usr/bin:/bin"), cwd=self.scratch,
                                 text=True, capture_output=True, check=True)
         self.assertEqual(result.stdout, str(binary.parent) + ":/usr/bin:/bin")
-        # Reinstall must put its sidecar beside the XDG inventory as well.
+        # A reinstall finds the installer manifest already present, so it leaves
+        # it alone and writes its rows to the sidecar manifest
+        # (installer-manifest.bootstrap.json), which must also land beside the
+        # manifest under XDG_DATA_HOME, not under ~/.local/share.
         self.install()
         self.assertTrue((data / "cortexkit/installer-manifest.bootstrap.json").is_file())
         self.env["SHELL"] = "/usr/bin/fish"

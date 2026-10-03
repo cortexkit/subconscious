@@ -289,9 +289,11 @@ Durability and damage.
     from its `credential_public` and `user_jwt_id`, then replay from step (1). Every
     step is idempotent.
   - The read succeeds but the entry is absent, damaged or at another pair: the lost
-    key cannot be recovered. Issuance replaces the census independently of revocation,
-    and deleting a successor proves nothing about its predecessor. Keep the damaged
-    progress file, issue nothing, and defer pending repair; do not claim completion.
+    key cannot be recovered. Issuance overwrites the census entry on its own, without
+    going through revocation, so an entry that is absent or names another pair proves
+    nothing about whether this record's credential was revoked. Recovery keeps the
+    damaged progress file, pushes nothing, and defers on every pass until the file is
+    repaired; it never claims completion.
   - The read fails: recovery keeps the file, defers and retries once per sentinel period.
 - The two federation shapes are durable before the act they cover (a reservation
   before publish, a high-water mark before ack). A damaged `fed_recv` file refuses

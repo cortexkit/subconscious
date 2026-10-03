@@ -100,9 +100,13 @@ fn inventory_source(file: &Path, source: &str, expected_spellings: usize) -> Inv
         file: file.to_path_buf(),
         ..Inventory::default()
     };
-    // syn leaves macro bodies opaque. Inventory every spelling too, so
-    // adding a constructor inside select!, matches!, or another macro
-    // cannot bypass the typed-constructor check by escaping the AST walk.
+    // syn leaves macro bodies as unparsed tokens, so the AST walk below never
+    // sees a constructor written inside select!, matches! or another macro.
+    // To close that gap, also count every `OutcomeUnknown(` in the file's raw
+    // text (whitespace removed), whether it is a construction, a match pattern
+    // or the variant declaration, and require the count to equal the number
+    // pinned for the file. Any new spelling, inside a macro or not, changes the
+    // count and fails the test until someone reviews it.
     let compact: String = source.chars().filter(|ch| !ch.is_whitespace()).collect();
     let spellings = compact.matches("OutcomeUnknown(").count();
     if spellings != expected_spellings {

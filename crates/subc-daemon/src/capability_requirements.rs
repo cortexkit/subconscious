@@ -248,10 +248,12 @@ impl CapabilityRequirementEvaluator {
         drifted
     }
 
-    /// Return a typed reserved-capability conflict for a claimant before it can
-    /// enter the catalog. The bound module is always first. A refused attempt
-    /// never becomes live catalog evidence and must not be replayed as a new
-    /// conflict when an unrelated module changes its catalog.
+    /// Before a module's HELLO lets it into the catalog, return one conflict for
+    /// each reserved capability it claims that is already bound to a different
+    /// module. Each conflict names the already-bound module first, then the
+    /// claimant. A refused attempt is not a catalog entry: it never counts as
+    /// evidence that the capability is provided, and it must not be reported
+    /// again as a new conflict when an unrelated module changes the catalog.
     pub(crate) fn reserved_hello_refusals(
         &self,
         module_id: &str,
@@ -361,9 +363,11 @@ impl CapabilityRequirementEvaluator {
 
         let requirements = requirement_declarations(&state, &registered, &runtime);
         let keys = requirements.keys().cloned().collect::<BTreeSet<_>>();
-        // A removed declaration ends its active verdict, not its daemon-lifetime
-        // episode history. Reappearing requirements start a fresh transition
-        // without reusing a sequence number that log consumers already saw.
+        // A requirement whose declaration was removed loses its current verdict
+        // but keeps its record, and with it the episode sequence counter, for
+        // this daemon's lifetime. If the requirement reappears, its next
+        // transition continues that counter, so it never reuses a sequence
+        // number already written to the log.
         for (key, record) in &mut state.requirements {
             if !keys.contains(key) {
                 record.last_verdict = None;

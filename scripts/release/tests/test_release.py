@@ -1,4 +1,9 @@
-"""Exercise the release transaction only in a scratch clone with a local origin."""
+"""Test scripts/release.sh end to end: bump a crate's version, update Cargo.lock,
+run the gates against that manifest and lock, commit both, tag, and push.
+
+The test runs in a scratch clone whose origin is a local bare repository, so it
+never touches this repository's remote or a package registry.
+"""
 
 import os
 from pathlib import Path
@@ -48,9 +53,13 @@ class ReleaseTests(unittest.TestCase):
             run("git", "remote", "set-url", "origin", str(remote), cwd=clone)
             run("git", "push", "-u", "origin", "main", cwd=clone)
 
-            # The locked gate is real Cargo resolution, not a string comparison
-            # with the manifest. Publishing and compilation are not needed to
-            # exercise the transaction, and no registry is ever contacted.
+            # Stub cargo so the gates run fast and offline. `fmt` passes. `clippy`
+            # (run by the script with --locked) becomes `cargo metadata --locked`,
+            # which still does real Cargo resolution and fails if Cargo.lock does
+            # not match the bumped manifest; that is the property under test.
+            # `publish` only checks it was asked for a dry run of this crate.
+            # Compiling and publishing are not needed to exercise the release
+            # steps, and no registry is ever contacted.
             cargo = shutil.which("cargo")
             stubs = scratch / "stubs"
             stubs.mkdir()

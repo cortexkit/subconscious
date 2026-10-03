@@ -100,7 +100,7 @@ set -euo pipefail
 
 STAGING="${CK_STAGING:-$HOME/.local/share/cortexkit/staging}"
 BIN_DIR="${CK_BIN_DIR:-$HOME/.local/share/cortexkit/bin}"
-MODULE=""; STAGED=""; DEST=""; PATH_FACE=""; MARKER=""; CONTROL=""; OLD_CONTROL=""; GONE=""; RESTART=1; PLACE=0; OLDER=0; MIGRATES=""; NEW_REQUIREMENT=""; ALLOW_UNHARDENED=0; INSTALL=0
+MODULE=""; STAGED=""; DEST=""; PATH_FACE=""; MARKER=""; CONTROL=""; OLD_CONTROL=""; GONE=""; RESTART=1; PLACE=0; OLDER=0; MIGRATES=""; NEW_REQUIREMENT=""; ALLOW_UNHARDENED=0; ALLOW_UNSTRIPPED=0; INSTALL=0
 
 while (($# > 0)); do
   case "$1" in
@@ -120,6 +120,11 @@ while (($# > 0)); do
     # incident. It is an explicit flag, never a default, and the output says what
     # it reopens.
     --allow-unhardened) ALLOW_UNHARDENED=1; shift ;;
+    # An unstripped build carries its debug map, which names every source path and
+    # symbol of the build machine and makes the binary several times larger. Cards
+    # are built stripped; this lets an incident placement of an unstripped build
+    # through on purpose.
+    --allow-unstripped) ALLOW_UNSTRIPPED=1; shift ;;
     --before) BEFORE_CMD="$2"; shift 2 ;;
     # A card that MIGRATES THE STORE cannot be rolled back by binary alone: the
     # old binary meets a newer schema and refuses on store_ahead, which is the
@@ -506,6 +511,21 @@ posture_for_linker_signed() {
   bare=$(signing_posture "$1" | sed -E 's/flags=[^ ]+ //; s/Identifier=[^ ]+ //')
   if [ -n "$f" ]; then printf '%sflags-sans-runtime-linker=0x%x ' "$bare" $(( f & ~0x30000 )); else printf '%s' "$bare"; fi
 }
+# Debug-map entries (`nm -a` type "-") are what `strip` removes; a release card
+# has none. The one exception is the linker's `OPT radr://5614542` marker, which
+# `strip` deliberately keeps and which carries no debug information. The count is
+# read to a variable rather than branched on through a pipeline, so the check
+# cannot invert under pipefail.
+if command -v nm >/dev/null; then
+  debug_entries=$(nm -a "$STAGED" 2>/dev/null | awk '$2 == "-" && $5 != "OPT"' | wc -l | tr -d ' ')
+  if [ "${debug_entries:-0}" -gt 0 ] && [ "$ALLOW_UNSTRIPPED" -eq 1 ]; then
+    say "debug map: $debug_entries entries, placed unstripped by request (--allow-unstripped)"
+  elif [ "${debug_entries:-0}" -gt 0 ]; then
+    refuse "staged binary is not stripped: $debug_entries debug-map entries (nm -a type '-'). Build the card stripped, or pass --allow-unstripped to place it on purpose"
+  else
+    say "debug map: 0 entries (stripped)"
+  fi
+fi
 if [ "$INSTALL" -eq 1 ] && command -v codesign >/dev/null; then
   # No running binary to match, so the posture is checked against fleet rules.
   staged_sig=$(signing_posture "$STAGED")

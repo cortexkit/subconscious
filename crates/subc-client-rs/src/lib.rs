@@ -2766,23 +2766,19 @@ mod tests {
         let handler = Arc::new(EchoHandler);
         let dispatcher = RequestDispatcher::new();
         let (module_handle, _unused_rx) = test_module_handle(&[]);
-        let body = serde_json::to_vec(&serde_json::json!({
-            "op": "route.bind",
-            "route_channel": 9,
-            "epoch": 1,
-            "target": { "kind": "tool_provider" },
-            "identity": { "session": "s" },
-            "principal": { "kind": "direct" },
-            "scope": {
-                "owner": { "kind": "reserved", "module_id": "prefrontal-core" },
-                "ref": "s",
-                "scope_epoch": 1,
-                "kind": "head",
-                "attributes": { "a_field_from_a_newer_daemon": "x" },
-                "owner_authorized": true
-            }
-        }))
-        .unwrap();
+        // A well-formed bind from this SDK's own types, then one scope
+        // attribute this SDK does not know, so that is the only defect.
+        let mut body: serde_json::Value =
+            serde_json::from_slice(&route_bind_frame(9, 1, 41).body).unwrap();
+        body["scope"] = serde_json::json!({
+            "owner": { "kind": "reserved", "module_id": "prefrontal-core" },
+            "ref": "s",
+            "scope_epoch": 1,
+            "kind": "head",
+            "attributes": { "a_field_from_a_newer_daemon": "x" },
+            "owner_authorized": true
+        });
+        let body = serde_json::to_vec(&body).unwrap();
         let bind = Frame::build(FrameType::Request, control_flags(), 0, 0, 41, body).unwrap();
 
         let kept_serving = handle_frame(
@@ -2803,6 +2799,13 @@ mod tests {
         assert_eq!(refusal.header.corr, 41);
         let error: ErrorBody = serde_json::from_slice(&refusal.body).unwrap();
         assert_eq!(error.code, "invalid_request");
+        // Prove the refusal is about the unknown attribute, not some other
+        // defect in this fixture.
+        assert!(
+            error.message.contains("a_field_from_a_newer_daemon"),
+            "{}",
+            error.message
+        );
 
         assert!(
             handle_frame(health_request(42), &tx, handler, dispatcher, module_handle)

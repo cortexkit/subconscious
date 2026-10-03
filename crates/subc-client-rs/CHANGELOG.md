@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.26.1
+
+- A control request the module cannot decode, such as a `route.bind` whose scope stamp carries an attribute this SDK does not know, is refused with `invalid_request` on its own correlation id, and the module keeps serving. Before, the decode error ended the module's serve loop, so one such bind stopped the whole module and every repeat after its restart stopped it again.
+
 ## 0.26.0
 
 - Takes subc-protocol 0.29.0 and the matching control/transport minor releases: `ToolCallRequest.preset` and `ScopeAttributes.flow_id` are optional wire fields, but this release is breaking for Rust struct literals. Move direct protocol dependencies together with the SDK.

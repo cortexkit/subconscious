@@ -6,7 +6,7 @@
 
 ## 0.3.2
 
-- A credential census read interrupted by a reconnect of ck-bus's own bus connection is replayed instead of timing out, within the same five-second budget. A census that is really unreadable is still refused, never read as an absent entry.
+- A credential census read interrupted by a reconnect of ck-bus's own bus connection is replayed instead of timing out, within the same five-second budget. A census that cannot be read for any other reason (its stream is missing, or the broker returns an error or no reply in time) still makes the issuance fail with `ckbus_census_unavailable`; it is never treated as an absent entry.
 
 ## 0.3.0 — 2026-10-02
 

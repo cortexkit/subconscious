@@ -3,7 +3,7 @@
 ## 0.31.0
 
 - Takes subc-protocol 0.29.0 and the matching control/transport minor releases: `ToolCallRequest.preset` and `ScopeAttributes.flow_id` are optional wire fields, but this release is breaking for Rust struct literals. Tool-call bodies, including presets, remain opaque to the daemon.
-- Only `scope_authority_owners` may sync `flow_id`, with the same refusal as unauthorized `agent_id`. Malformed flow ids refuse sync by name; valid ones are stamped verbatim on binds even without an agent. Same-epoch changes bump version and drain scoped routes with `scope_delegation_changed`.
+- Only owners listed in `scope_authority_owners` may set `flow_id` in `scope.sync`; any other owner's record is refused with the same `scope_attribute_not_permitted` as an unauthorized `agent_id`. A malformed flow id refuses the whole sync with `invalid_control_body`, and the message names `flow_id`. A valid one is copied verbatim into the scope stamp the daemon attaches when a module accepts a route (`route.bind`), even when the scope has no agent. Changing a flow id within the same scope epoch raises the scope's content version and closes every route under the scope with `scope_delegation_changed`.
 
 ## 0.30.0
 

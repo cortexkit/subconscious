@@ -3,7 +3,7 @@
 ## 0.29.0
 
 - Breaking for Rust struct literals: `ToolCallRequest` gains optional `preset`, and `ScopeAttributes` gains optional `flow_id`. Both are omitted when absent, leaving existing absent-field wire bytes unchanged; `ScopeAttributes` still refuses unknown fields.
-- `validate_preset` checks 1–64 characters of `[a-z0-9_-]` and names `preset` for a provider's `invalid_request` reply. An absent preset requires an explicit provider policy, never the most capable default; an unserved preset is refused by name, never silently substituted.
+- `validate_preset` checks 1–64 characters of `[a-z0-9_-]` and names `preset` for a provider's `invalid_request` reply. When a call carries no preset, the provider must apply a policy it chose explicitly; it must not fall back to its most permissive preset (the one offering the most tools). A preset the provider does not serve is refused, with the preset named in the refusal, never replaced by another.
 - `flow_id` identifies the scope's flow, needs no agent or delegation, and is set only by an authority owner and stamped verbatim. `validate_flow_id` shares the 1–256 printable non-space ASCII token rule with call keys and schema pins. Same-epoch changes bump the content version and drain scoped routes with `scope_delegation_changed`, like `agent_id` changes.
 
 ## 0.28.1

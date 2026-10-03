@@ -141,8 +141,8 @@ fn digest_mismatch_refuses_before_credentials_or_phases_and_names_both_ceremonie
     };
     assert_eq!(refusal.code, CeremonyRefusalCode::DeclarationDigestMismatch);
     assert_eq!(downstream_calls.get(), 0);
-    assert!(refusal.message.contains("ck-release abandon release-run-1"));
-    assert!(refusal.message.contains("ck-release rebind release-run-1"));
+    assert!(refusal.message.contains("`ck-release abandon release`"));
+    assert!(refusal.message.contains("`ck-release rebind release`"));
 }
 
 struct CountingProbe(Cell<usize>);
@@ -186,6 +186,13 @@ fn direct_reconciliation_refuses_digest_mismatch_before_any_provider_call() {
         &mut executor,
         &subject,
     );
+
+    let message = result.as_ref().unwrap_err().to_string();
+    assert!(
+        message.contains("`ck-release abandon release`"),
+        "{message}"
+    );
+    assert!(message.contains("`ck-release rebind release`"), "{message}");
 
     assert!(matches!(
         result,

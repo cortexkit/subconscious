@@ -59,6 +59,26 @@ production provider implementation. The synthetic interruption makes the fake
 effect durable, returns before the completion append, and then proves `resume`
 uses the done-probe to append completion without a second executor call.
 
+The CLI currently executes `gates_local` and the six declared precheck detectors.
+Other non-public phase names (`preflight`, `ci_watch`, `build`, `stamp`,
+`verify_readback`, `stage`, and `notify`) are valid planning vocabulary but are
+not wired to the CLI runner. Executing them refuses with `phase_not_implemented`
+instead of reporting a successful gate or fabricating evidence. The synthetic
+provider demonstrates public-effect replay, not real CI, builds, readback, or
+staging; the walkthrough below describes the intended complete pipeline.
+
+`verify_readback` is observational and may follow an irreversible phase.
+`ci_watch` remains a pre-publication gate even if its selector names a tag;
+post-boundary CI observation requires a separate watcher role, which is not yet
+defined. Ordinary release gates cannot first execute after publication.
+
+`publish` and `assets` accept optional `params.artifacts` arrays of declared
+artifact IDs. Omitting the list targets all artifacts. Lists must be non-empty,
+unique, and contain only declared IDs. Publication phases in one train must have
+disjoint targets, so a train using both phases must explicitly partition its
+artifacts. Kinds remain opaque; the planner never guesses an upload destination
+from an artifact's kind.
+
 ## Acceptance-baseline walkthrough mapping
 
 The normative acceptance baseline records one manual sequence: publish an

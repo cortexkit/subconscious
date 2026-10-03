@@ -81,8 +81,12 @@ Phase types are a closed set incorporated only by
 `docs/specs/fleet-release-machine.md@41cb2be4`; this campaign does not repeat
 the list. Phases are parameterized instances, not singleton slots (AFT finding
 1): a train may instantiate a phase more than once with distinct parameters.
-AFT's real pipeline, for example, has independent pre-tag and post-tag
-`ci_watch` instances. `place` is deliberately not a phase; see Boundaries.
+AFT's real pipeline, for example, has independent pre-tag and post-tag CI
+watches. The current machine supports `ci_watch` only as a pre-publication gate;
+a selector naming a tag does not permit execution after an irreversible phase.
+A separate post-boundary observational watcher role is deferred. Readback of an
+already published effect is observational and may follow publication. `place`
+is deliberately not a phase; see Boundaries.
 
 ### Precheck detector closed-set amendment
 

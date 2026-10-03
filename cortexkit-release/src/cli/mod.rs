@@ -575,7 +575,7 @@ fn status(arguments: StatusArgs, state_root: PathBuf) -> Result<MachineResponse,
         pending_intents.len(),
         public_effect_count,
         completion_count,
-        &journal.train_journal_id(),
+        &arguments.train,
     );
 
     Ok(success(
@@ -902,7 +902,11 @@ fn planned_public_effect_count(train: &TrainDeclaration) -> usize {
         .iter()
         .map(|phase| match phase.phase_type.as_str() {
             "tag" => 1,
-            "publish" | "assets" => train.artifacts.len(),
+            "publish" | "assets" => train
+                .artifacts
+                .iter()
+                .filter(|artifact| phase.targets_artifact(&artifact.id))
+                .count(),
             _ => 0,
         })
         .sum()
@@ -914,15 +918,15 @@ fn next_actions(
     pending_count: usize,
     public_effect_count: usize,
     completion_count: usize,
-    journal_id: &str,
+    train_name: &str,
 ) -> Vec<String> {
     if terminal {
         return Vec::new();
     }
     if declaration_matches_pin == Some(false) {
         return vec![
-            format!("abandon {journal_id}"),
-            format!("rebind {journal_id}"),
+            format!("abandon {train_name}"),
+            format!("rebind {train_name}"),
         ];
     }
     if pending_count > 0 {
@@ -1214,6 +1218,7 @@ fn map_orchestration_error(command: &str, error: OrchestrationError) -> CliFailu
         } => {
             let code = match code {
                 OrchestrationRefusalCode::UnknownPhase => "unknown_phase",
+                OrchestrationRefusalCode::PhaseNotImplemented => "phase_not_implemented",
                 OrchestrationRefusalCode::UnsafeOrdering => "unsafe_phase_ordering",
                 OrchestrationRefusalCode::AttemptedIntentAbsent => "attempted_intent_absent",
                 OrchestrationRefusalCode::ContradictoryEvidence => {

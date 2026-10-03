@@ -270,12 +270,12 @@ fn mismatch_refusal(
     pinned_digest: &DeclarationDigest,
     active_digest: &DeclarationDigest,
 ) -> CeremonyError {
-    let train_journal_id = journal.train_journal_id();
+    let train_name = journal.train_name();
     refusal(
         journal,
         CeremonyRefusalCode::DeclarationDigestMismatch,
         format!(
-            "active declaration digest `{active_digest}` differs from pinned digest `{pinned_digest}`; run `ck-release abandon {train_journal_id}` to terminalize this journal or `ck-release rebind {train_journal_id}` to display the declaration diff, confirm it, and pin the replacement digest"
+            "active declaration digest `{active_digest}` differs from pinned digest `{pinned_digest}`; run `ck-release abandon {train_name}` to terminalize this journal or `ck-release rebind {train_name}` to display the declaration diff, confirm it, and pin the replacement digest"
         ),
     )
 }

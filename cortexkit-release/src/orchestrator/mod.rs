@@ -24,7 +24,8 @@ pub enum PhaseClass {
     RefusalCapable,
     /// A phase that performs one or more irreversible public effects.
     Irreversible,
-    /// A phase allowed after publication because it only performs admitted work or bookkeeping.
+    /// Observational follow-up or bookkeeping that may run after publication.
+    /// Failure stops progress but does not revoke an already admitted public effect.
     PostBoundary,
 }
 
@@ -41,7 +42,6 @@ impl PhaseRegistry {
             | "ci_watch"
             | "build"
             | "stamp"
-            | "verify_readback"
             | crate::phases::precheck::FORMAT_DIRTY
             | crate::phases::precheck::STALE_RESIDUE
             | crate::phases::precheck::SIBLING_DRIFT
@@ -49,7 +49,7 @@ impl PhaseRegistry {
             | crate::phases::precheck::TOOL_PINNING
             | crate::phases::precheck::RESIDUE_SWEEP => Some(PhaseClass::RefusalCapable),
             "tag" | "publish" | "assets" => Some(PhaseClass::Irreversible),
-            "stage" | "notify" => Some(PhaseClass::PostBoundary),
+            "verify_readback" | "stage" | "notify" => Some(PhaseClass::PostBoundary),
             _ => None,
         }
     }
@@ -114,6 +114,11 @@ impl std::fmt::Display for PrecheckRefusalCode {
 /// A typed local phase result kept distinct from an infrastructure seam failure.
 #[derive(Debug)]
 pub enum PhaseExecutionError {
+    /// A declared phase has no implementation in this runner.
+    NotImplemented {
+        phase: PhaseInstanceId,
+        phase_type: String,
+    },
     Refusal {
         code: PrecheckRefusalCode,
         phase: PhaseInstanceId,
@@ -154,6 +159,7 @@ pub enum EffectOutcome {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OrchestrationRefusalCode {
     UnknownPhase,
+    PhaseNotImplemented,
     UnsafeOrdering,
     AttemptedIntentAbsent,
     ContradictoryEvidence,
@@ -289,6 +295,11 @@ impl Orchestrator {
                     .run(phase)
                     .map(|evidence| (Vec::new(), evidence))
                     .map_err(|error| match error {
+                        PhaseExecutionError::NotImplemented { phase, phase_type } => OrchestrationError::refusal(
+                            OrchestrationRefusalCode::PhaseNotImplemented,
+                            Some(phase),
+                            format!("phase_not_implemented: phase type `{phase_type}` has no execution implementation; no completion was recorded"),
+                        ),
                         PhaseExecutionError::Refusal {
                             code,
                             phase,
@@ -400,10 +411,14 @@ where
     match probe.probe(&request)? {
         ProbeResult::Present(evidence) => {
             ensure_matching_evidence(&request, &expected_identity, &evidence)?;
-            if !completed {
-                if let Some(intent) = attempted {
-                    journal.append_completion(&intent, evidence.clone())?;
-                }
+            // A newer completion does not resolve older pending records. Retain
+            // each original intent and reconcile every matching pending attempt.
+            for intent in journal
+                .pending_intents()?
+                .into_iter()
+                .filter(|intent| intent_matches(intent, &request))
+            {
+                journal.append_completion(&intent, evidence.clone())?;
             }
             Ok(EffectOutcome::Reconciled(evidence))
         }
@@ -484,12 +499,12 @@ fn ensure_matching_declaration(
     match journal.ensure_declaration_digest(&plan.declaration_digest) {
         Ok(()) => Ok(()),
         Err(StateError::DeclarationDigestMismatch { pinned, active }) => {
-            let train_journal_id = journal.train_journal_id();
+            let train_name = journal.train_name();
             Err(OrchestrationError::refusal(
                 OrchestrationRefusalCode::DeclarationDigestMismatch,
                 None,
                 format!(
-                    "active declaration digest `{active}` differs from pinned digest `{pinned}`; run `ck-release abandon {train_journal_id}` or `ck-release rebind {train_journal_id}` before resuming"
+                    "active declaration digest `{active}` differs from pinned digest `{pinned}`; run `ck-release abandon {train_name}` or `ck-release rebind {train_name}` before resuming"
                 ),
             ))
         }
@@ -580,12 +595,14 @@ fn completion_exists(
 }
 
 fn intent_matches(intent: &PendingIntent, request: &EffectRequest) -> bool {
+    // Rebinding changes the approval/declaration context, not an effect that
+    // was already attempted. Match its stable operation key so the original
+    // intent can be completed and can still prohibit an automatic retry.
     intent.train == request.train
         && intent.phase == request.phase
         && intent.artifact == request.artifact
         && intent.operation == request.operation
         && intent.intended_commit == request.intended_commit
-        && intent.declaration_digest == request.declaration_digest
 }
 
 fn ensure_matching_evidence(

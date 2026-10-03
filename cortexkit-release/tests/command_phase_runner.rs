@@ -7,7 +7,7 @@ use cortexkit_release::{
     approval::{ApprovalStore, ApprovalSubject},
     declaration::{parse, DeclarationRefusalCode},
     lease::LeaseStore,
-    orchestrator::{FirstPublicTriggerGate, OrchestrationError, Orchestrator},
+    orchestrator::{FirstPublicTriggerGate, OrchestrationError, Orchestrator, PhaseRunner},
     phases::command::CommandPhaseRunner,
     plan::build_dry_run_plan,
     state::{JournalRecord, JournalStore, TrainJournalIdentity},
@@ -190,6 +190,67 @@ fn gates_local_legs_execute_in_declaration_order_and_attach_output_evidence() {
         completed_output_paths,
         vec![vec![attempts[0].3.as_str()], vec![attempts[1].3.as_str()]]
     );
+}
+
+#[test]
+fn unwired_phases_refuse_without_false_completion() {
+    for phase_type in [
+        "ci_watch",
+        "build",
+        "verify_readback",
+        "preflight",
+        "stamp",
+        "stage",
+        "notify",
+    ] {
+        let phase = format!(
+            r#"{{"id":"unwired","type":"{phase_type}","params":{{"workflow":"test","selector":"sha:test","rerun_budget":0}}}}"#
+        );
+        let execution = execute(&declaration(&phase), |_| {});
+        let error = execution.result.expect_err("unwired phases must not pass");
+        assert!(
+            error.to_string().contains("phase_not_implemented"),
+            "{error}"
+        );
+        assert!(execution
+            .journal
+            .read_journal()
+            .unwrap()
+            .iter()
+            .all(|record| !matches!(record, JournalRecord::PhaseDone { .. })));
+    }
+}
+
+#[test]
+fn gates_local_reexecution_preserves_failed_output() {
+    let declaration = declaration(
+        r#"{"id":"rerun","type":"gates_local","params":{"command":"sh","args":["-c","if test -e retry-once; then printf recovered; else : > retry-once; printf failed; exit 19; fi"],"load_class":"cpu"}}"#,
+    );
+    let execution = execute(&declaration, |_| {});
+    assert!(execution.result.is_err());
+    let parsed = parse(&declaration).unwrap();
+    let plan = build_dry_run_plan(
+        RepositoryId::new("command-phase-runner"),
+        &parsed,
+        "local-gates",
+        &[],
+    )
+    .unwrap();
+    let mut runner = CommandPhaseRunner::new(execution.repository.path(), &execution.journal);
+    let orphan = execution.journal.evidence_dir().join("rerun-attempt-2.log");
+    fs::write(&orphan, "interrupted-output").unwrap();
+    assert!(runner.run(&plan.phases[0]).is_ok());
+    let attempts = command_attempts(&execution.journal.read_journal().unwrap());
+    assert_eq!(attempts.len(), 2);
+    assert_ne!(
+        attempts[0].3, attempts[1].3,
+        "re-execution must not overwrite prior evidence"
+    );
+    assert_eq!(attempts[0].1, 1);
+    assert_eq!(attempts[1].1, 3);
+    assert_eq!(fs::read_to_string(&attempts[0].3).unwrap(), "failed");
+    assert_eq!(fs::read_to_string(&attempts[1].3).unwrap(), "recovered");
+    assert_eq!(fs::read_to_string(orphan).unwrap(), "interrupted-output");
 }
 
 #[test]

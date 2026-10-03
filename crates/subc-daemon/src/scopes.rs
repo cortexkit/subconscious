@@ -1584,7 +1584,7 @@ mod tests {
             let mut flow = head("flow", 1);
             flow.attributes.flow_id = Some(bad);
             let refusal = table
-                .sync(&reserved(PREFRONTAL), conn(1), 2, vec![flow], any_current)
+                .sync(PREFRONTAL, conn(1), any_current, 2, vec![flow])
                 .unwrap_err();
             assert_eq!(refusal.code, INVALID_CONTROL_BODY);
             assert!(

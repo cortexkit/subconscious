@@ -13004,6 +13004,17 @@ mod tests {
                 );
             }
             assert!(rig.live(&unscoped) && unscoped.untouched());
+            // Each provider also receives a GOODBYE for its drained route;
+            // consume it before expecting the next route.bind on that sink.
+            for target in [PLEXUS, OTHER] {
+                let (_, module_rx) = rig.modules.get_mut(target).unwrap();
+                let goodbye = module_rx
+                    .try_recv()
+                    .expect("the provider sees the drain")
+                    .frame;
+                assert_eq!(goodbye.header.ty, FrameType::Goodbye);
+                assert!(module_rx.try_recv().is_err());
+            }
             let rebound = rig
                 .bound(Some(AFT), PLEXUS, Some(rig_selector("s", Some(1))))
                 .await;

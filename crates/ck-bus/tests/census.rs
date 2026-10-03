@@ -320,6 +320,50 @@ async fn one_census_key_per_live_process_overwritten_by_refetch_and_respawn() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn repairing_high_water_clears_damage_without_restarting_issuance() {
+    let _gate = harness::acceptance_gate().await;
+    let run = start(false).await.expect("nats-server is required");
+    let plane = bus_module_plane(&run).await;
+    for damaged in [
+        b"not JSON".as_slice(),
+        br#"{"repairprobe.g2":{"epoch":"bad"}}"#.as_slice(),
+    ] {
+        let store = tempfile::tempdir().unwrap();
+        let path = store.path().join("epoch_high_water.json");
+        let (issuing, _) = process(&run, store.path(), &plane, 2);
+        std::fs::write(&path, damaged).unwrap();
+        assert_eq!(
+            issuing.issue("repairprobe").await.unwrap_err().code,
+            issuance::code::EPOCH_HIGH_WATER_DAMAGED
+        );
+        assert!(issuing.damage().is_some());
+        if damaged.starts_with(b"{") {
+            issuing.issue("unrelatedprobe").await.unwrap();
+            assert!(
+                issuing.damage().is_some(),
+                "an unrelated advance is not a repair"
+            );
+        }
+        std::fs::write(&path, br#"{"repairprobe.g2":{"epoch":10}}"#).unwrap();
+        assert_eq!(
+            issuing
+                .issue("repairprobe")
+                .await
+                .unwrap()
+                .issued
+                .credential_epoch,
+            11
+        );
+        assert!(
+            issuing.damage().is_none(),
+            "repaired high-water must release failing health"
+        );
+    }
+    run.server.stop().await;
+    run.run.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_damaged_high_water_entry_refuses_its_generation_and_a_later_one_issues() {
     let _gate = harness::acceptance_gate().await;
     harness::install_tracing();

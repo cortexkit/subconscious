@@ -119,13 +119,39 @@ pub fn check_loopback_url(url: &str) -> Result<(), String> {
     let rest = url
         .strip_prefix("nats://")
         .ok_or_else(|| format!("{NATS_URL_ENV} {url} is not a nats:// URL"))?;
-    let authority = rest.split('/').next().unwrap_or_default();
-    let host = match authority.strip_prefix('[') {
-        Some(bracketed) => bracketed.split(']').next().unwrap_or_default(),
-        None => authority
-            .rsplit_once(':')
-            .map_or(authority, |(host, _)| host),
+    let invalid = || {
+        format!("{NATS_URL_ENV} {url} must be one loopback host with an optional numeric port, without userinfo, a server list or a path")
     };
+    // Validate the complete authority: accepting only its first bracketed host
+    // would let a server list or userinfo redirect the connection elsewhere.
+    if rest.contains([',', '@', '/', '?', '#', '\\']) || rest.chars().any(char::is_whitespace) {
+        return Err(invalid());
+    }
+    let (host, port) = match rest.strip_prefix('[') {
+        Some(bracketed) => {
+            let (host, suffix) = bracketed.split_once(']').ok_or_else(invalid)?;
+            if !matches!(host.parse::<IpAddr>(), Ok(IpAddr::V6(_))) {
+                return Err(invalid());
+            }
+            let port = if suffix.is_empty() {
+                None
+            } else {
+                Some(suffix.strip_prefix(':').ok_or_else(invalid)?)
+            };
+            (host, port)
+        }
+        None => rest
+            .split_once(':')
+            .map_or((rest, None), |(host, port)| (host, Some(port))),
+    };
+    if port.is_some_and(|port| {
+        !port.bytes().all(|byte| byte.is_ascii_digit())
+            || port.parse::<u16>().ok().filter(|port| *port != 0).is_none()
+    }) {
+        return Err(invalid());
+    }
+    url.parse::<async_nats::ServerAddr>()
+        .map_err(|_| invalid())?;
     let loopback = host == "localhost" || host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback());
     if loopback {
         Ok(())
@@ -140,6 +166,24 @@ pub fn check_loopback_url(url: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::check_loopback_url;
+
+    #[test]
+    fn loopback_validation_checks_the_entire_server_authority() {
+        for url in [
+            "nats://[::1]:4222,10.0.0.5:4222",
+            "nats://[::1]@evil:4222",
+            "nats://[::1]garbage",
+            "nats://[::1]:bad",
+            "nats://[::1]:4222/remote",
+            "nats://127.0.0.1:4222,10.0.0.5:4222",
+            "nats://localhost:4222@evil:4222",
+        ] {
+            assert!(
+                check_loopback_url(url).is_err(),
+                "unsafe authority accepted: {url}"
+            );
+        }
+    }
 
     #[test]
     fn only_loopback_hosts_are_accepted() {

@@ -90,9 +90,14 @@ impl JwtLifetime {
     }
 
     /// The `exp` claim for a JWT issued at `issued_at` (seconds since the Unix epoch).
-    /// A sub-second test lifetime still expires at least one second after issue.
+    /// Round fractional test lifetimes up: truncation could make a renewal that was
+    /// validated in milliseconds fall after the integer-second expiration claim.
     pub fn expires_at(&self, issued_at: i64) -> i64 {
-        issued_at + (self.lifetime.as_secs() as i64).max(1)
+        let seconds = self
+            .lifetime
+            .as_secs()
+            .saturating_add(u64::from(self.lifetime.subsec_nanos() != 0));
+        issued_at.saturating_add(i64::try_from(seconds).unwrap_or(i64::MAX).max(1))
     }
 
     /// How long after issue this process renews.
@@ -141,6 +146,19 @@ mod tests {
         assert_eq!(lifetime.renew_after, Duration::from_secs(600));
         assert!(lifetime.jitter < RENEW_JITTER_MAX);
         assert_eq!(lifetime.expires_at(1_000), 1_900);
+    }
+
+    #[test]
+    fn fractional_test_lifetimes_expire_after_the_validated_renewal_delay() {
+        let lifetime = JwtLifetime::with_jitter(
+            Duration::from_millis(2999),
+            Duration::from_millis(2500),
+            248,
+        );
+        assert_eq!(lifetime.expires_at(100), 103);
+        assert!(
+            lifetime.renew_delay() < Duration::from_secs((lifetime.expires_at(100) - 100) as u64)
+        );
     }
 
     #[test]

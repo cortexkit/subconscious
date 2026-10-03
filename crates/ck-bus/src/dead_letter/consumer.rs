@@ -1,4 +1,4 @@
-//! `c_ckbus_dead` on the server: set up at start (floor read, delete, create), then
+//! `c_ckbus_dead` on the server: set up at start (floor checkpoint, delete, create), then
 //! one record at a time: read, record, settle.
 
 use std::{sync::Arc, time::Duration};
@@ -103,12 +103,31 @@ impl DeadLetter {
     /// Sets `c_ckbus_dead` up for this process: reads the previous consumer's ack floor,
     /// deletes it and creates it again, so the stream is replayed from its first
     /// retained record. A consumer that is not there has a floor of 0. Any other failed
-    /// read stops here: a failed read is never taken for an absent consumer, since that
-    /// would record every retained record again.
+    /// read stops here: a failed read is never taken for an absent consumer. The floor
+    /// is saved in a separate durable's metadata before deletion, so a crash or refused
+    /// create cannot erase it. That durable is never pulled or deleted.
     pub async fn open(
         client: async_nats::Client,
         names: &AccountNames,
         journal: Arc<dyn Journal>,
+    ) -> Result<Self, Down> {
+        Self::open_inner(client, names, journal, false).await
+    }
+
+    #[cfg(test)]
+    pub async fn stop_before_create(
+        client: async_nats::Client,
+        names: &AccountNames,
+        journal: Arc<dyn Journal>,
+    ) -> Result<Self, Down> {
+        Self::open_inner(client, names, journal, true).await
+    }
+
+    async fn open_inner(
+        client: async_nats::Client,
+        names: &AccountNames,
+        journal: Arc<dyn Journal>,
+        stop_before_create: bool,
     ) -> Result<Self, Down> {
         let (stream, config) = consumer_config(names)?;
         let durable = config.durable_name.clone().unwrap_or_default();
@@ -121,13 +140,56 @@ impl DeadLetter {
             Err(error) if not_found(error.kind()) => None,
             Err(error) => return Err(unavailable(&durable, "info", error)),
         };
-        let settled_floor = previous_floor.unwrap_or_default();
+        let checkpoint = AccountNames::consumer_name("ckbus_dead_checkpoint")
+            .map_err(|error| Down::new(cause::NAMING_CONSTRUCTOR_ABSENT, error.to_string()))?;
+        let saved_floor = match js
+            .get_consumer_from_stream::<pull::Config, _, _>(&checkpoint, &stream)
+            .await
+        {
+            Ok(saved) => saved
+                .cached_info()
+                .config
+                .metadata
+                .get("settled_floor")
+                .and_then(|floor| floor.parse::<u64>().ok())
+                .ok_or_else(|| {
+                    Down::new(
+                        cause::CONSUMER_UNAVAILABLE,
+                        "dead-letter floor checkpoint is damaged",
+                    )
+                })?,
+            Err(error) if not_found(error.kind()) => 0,
+            Err(error) => return Err(unavailable(&checkpoint, "info", error)),
+        };
+        let settled_floor = previous_floor.unwrap_or_default().max(saved_floor);
+        let mut checkpoint_config = config.clone();
+        checkpoint_config.durable_name = Some(checkpoint.clone());
+        checkpoint_config.metadata =
+            [("settled_floor".to_string(), settled_floor.to_string())].into();
+        let saved = js
+            .create_consumer_on_stream(checkpoint_config, stream.as_str())
+            .await
+            .map_err(|error| unavailable(&checkpoint, "checkpoint", error))?;
+        if saved.cached_info().config.metadata.get("settled_floor")
+            != Some(&settled_floor.to_string())
+        {
+            return Err(Down::new(
+                cause::CONSUMER_UNAVAILABLE,
+                "dead-letter floor checkpoint did not read back",
+            ));
+        }
         if previous_floor.is_some() {
             match js.delete_consumer_from_stream(&durable, &stream).await {
                 Ok(_) => {}
                 Err(error) if not_found(error.kind()) => {}
                 Err(error) => return Err(unavailable(&durable, "delete", error)),
             }
+        }
+        if stop_before_create {
+            return Err(Down::new(
+                "stopped",
+                "stopped between consumer delete and create",
+            ));
         }
         let consumer = js
             .create_consumer_on_stream(config, stream.as_str())

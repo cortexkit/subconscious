@@ -99,6 +99,10 @@ pub struct IssuanceHandler<H> {
 }
 
 impl<H> IssuanceHandler<H> {
+    pub fn issuance(&self) -> &Arc<Issuance> {
+        &self.issuance
+    }
+
     pub fn new(inner: H, issuance: Arc<Issuance>) -> Self {
         Self {
             inner,

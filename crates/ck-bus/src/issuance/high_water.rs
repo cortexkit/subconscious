@@ -99,6 +99,27 @@ impl HighWater {
         &self.path
     }
 
+    /// Recheck the location that failed, not whichever generation most recently
+    /// advanced: successful issuance elsewhere does not repair a damaged entry.
+    pub fn damage_is_repaired(&self, damage: &HighWaterRefusal) -> bool {
+        let _guard = self
+            .lock
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let Ok(entries) = self.load() else {
+            return false;
+        };
+        let valid = |key: &str| {
+            self.epoch_of(&entries, key)
+                .is_ok_and(|epoch| epoch != Some(u64::MAX))
+        };
+        match damage {
+            HighWaterRefusal::EntryDamaged { key, .. } => valid(key),
+            HighWaterRefusal::FileDamaged { .. } => entries.keys().all(|key| valid(key)),
+            HighWaterRefusal::WriteFailed { .. } => false,
+        }
+    }
+
     /// The entry key for one generation of one module.
     pub fn key(module_id: &str, generation: u64) -> String {
         format!("{module_id}.g{generation}")

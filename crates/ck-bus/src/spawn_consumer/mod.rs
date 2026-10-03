@@ -252,13 +252,11 @@ impl SpawnConsumer {
                 (Gap::Resume(from), why) => {
                     resume = Some(from);
                     reason = why;
-                    if why == "stream-failed" {
-                        // A daemon that is going away fails every call at once; waiting
-                        // keeps the loop from spinning against it.
-                        tokio::time::sleep(self.retry).await;
-                    }
                 }
             }
+            // Clean EOF and cursor refusals can be immediate too. Every ended
+            // subscription waits before rebuilding the census/snapshot/subscription.
+            tokio::time::sleep(self.retry).await;
         }
     }
 

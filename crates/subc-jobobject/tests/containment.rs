@@ -27,6 +27,43 @@ use subc_jobobject::{process_exists, wait_for_process_exit, JobObject};
 /// racing the kernel.
 const EXIT_DEADLINE: Duration = Duration::from_secs(10);
 
+#[test]
+fn failed_containment_reaps_a_real_suspended_child() {
+    struct ChildWithRefusedHandle(std::process::Child, bool);
+    impl subc_jobobject::ProcessHandle for ChildWithRefusedHandle {
+        fn handle(&self) -> Option<*mut std::ffi::c_void> {
+            self.1.then_some(std::ptr::null_mut())
+        }
+    }
+    impl subc_jobobject::SuspendedChild for ChildWithRefusedHandle {
+        fn terminate_suspended(&mut self) -> std::io::Result<()> {
+            self.0.kill()?;
+            self.0.wait().map(|_| ())
+        }
+    }
+    for invalid_handle in [false, true] {
+        let mut command = Command::new(fixture_path());
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        subc_jobobject::suspend_on_create(&mut command);
+        let child = command.spawn().unwrap();
+        let pid = child.id();
+        assert!(process_exists(pid));
+        let result = subc_jobobject::ContainedChild::contain(
+            ChildWithRefusedHandle(child, invalid_handle),
+            JobObject::new().unwrap(),
+            pid,
+        );
+        assert!(result.is_err());
+        assert!(
+            wait_for_process_exit(pid, EXIT_DEADLINE),
+            "failed containment leaked pid {pid}"
+        );
+    }
+}
+
 /// How long the grandchild's pid file is given to appear.
 const GRANDCHILD_APPEARANCE_DEADLINE: Duration = Duration::from_secs(10);
 

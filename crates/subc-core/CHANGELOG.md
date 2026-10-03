@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.20.52
+## 0.20.53
 
 - Keep module compatibility floors enforced when repairing an existing core configuration.
 - Refuse incompatible setup requests with an actionable nonzero result, and let read-only upgrade checks report availability while the daemon is stopped.

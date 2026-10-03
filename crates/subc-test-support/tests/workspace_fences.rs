@@ -91,7 +91,10 @@ fn scan_tree(dir: &Path, tests: bool, offenders: &mut Vec<String>) {
         if path.is_dir() {
             scan_tree(&path, tests, offenders);
         } else if path.extension().is_some_and(|extension| extension == "rs") {
-            let source = fs::read_to_string(&path).unwrap();
+            // Normalize line endings first: a Windows checkout has CRLF, and the
+            // `#[cfg(test)]\n` markers below would otherwise miss there and pick a
+            // different (earlier) scope than on Unix.
+            let source = fs::read_to_string(&path).unwrap().replace("\r\n", "\n");
             let scope = if tests {
                 source.as_str()
             } else if let Some(pos) = source

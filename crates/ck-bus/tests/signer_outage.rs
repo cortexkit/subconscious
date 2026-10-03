@@ -1485,9 +1485,8 @@ async fn rows_wait_up(connection_file: &Path, run_root: &Path, ready: &Value, pe
 /// test can wait for.
 const SHORT_LIFETIME: Duration = Duration::from_secs(8);
 const SHORT_RENEW_AFTER: Duration = Duration::from_secs(4);
-/// How long after a JWT's `exp` a refused reconnect is looked for: the client's
-/// reconnect backoff plus one round trip through ck-bus's nonce signing.
-const AFTER_EXP: Duration = Duration::from_secs(4);
+/// async-nats 0.50's default reconnect_delay_callback caps exponential backoff at 4 s.
+const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(4);
 
 fn short_lifetime_env() -> Vec<(String, String)> {
     vec![
@@ -1695,6 +1694,8 @@ async fn a_renewed_jwt_carries_its_holder_past_exp_and_an_unrefreshed_one_is_ref
     let system = plane.system().await;
     let mut connections = system.subscribe("$SYS.ACCOUNT.*.*").await.unwrap();
     system.flush().await.unwrap();
+    let server_events = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let recorded = server_events.clone();
     let _connection_log = TaskGuard(tokio::spawn(async move {
         while let Some(message) = connections.next().await {
             eprintln!(
@@ -1702,6 +1703,9 @@ async fn a_renewed_jwt_carries_its_holder_past_exp_and_an_unrefreshed_one_is_ref
                 message.subject,
                 String::from_utf8_lossy(&message.payload)
             );
+            if let Ok(event) = serde_json::from_slice(&message.payload) {
+                recorded.lock().unwrap().push(event);
+            }
         }
     }));
     let mut renewing = plane
@@ -1721,42 +1725,22 @@ async fn a_renewed_jwt_carries_its_holder_past_exp_and_an_unrefreshed_one_is_ref
 
     // The unrefreshed holder: still connected a second before its exp, disconnected
     // after it, and refused on the reconnects that follow even though ck-bus signs
-    // their nonces, so it is the server that refuses the expired JWT. nats-server
-    // (2.15) completes the CONNECT of an expired JWT and ends it at once with `User
-    // Authentication Expired`, so the refusal is seen as a connect that is closed as
-    // expired every time, never as a failed CONNECT.
+    // their nonces, so it is the server that refuses the expired JWT. nats-server 2.15
+    // can end CONNECT before async-nats receives its PONG: that reports a client IO
+    // error, not another expiry callback. Later attempts can be authorization violations.
+    // Count the server's disconnects for this exact JWT, not one callback spelling.
     let stale_exp_ms = exp_ms(&stale.answer);
     sleep_until_ms(stale_exp_ms - 1000).await;
     assert!(stale.connected(), "{:?}", stale.client.events());
     assert_eq!(stale.disconnects(), 0, "{:?}", stale.client.events());
-    let deadline = Instant::now() + AFTER_EXP + EXCHANGE_LIMIT;
-    while !(stale.disconnects() >= 1 && stale.signatures_since(stale_exp_ms) >= 1) {
-        assert!(
-            Instant::now() < deadline,
-            "the unrefreshed participant was not disconnected and refused after its exp: \
-             events {:?}, refusals {:?}",
-            stale.client.events(),
-            stale.refusals_since(stale_exp_ms)
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    sleep_until_ms(stale_exp_ms + AFTER_EXP.as_millis() as u64).await;
-    let events = stale.client.events();
-    let count = |what: &str| events.iter().filter(|event| event.contains(what)).count();
-    let (connects, expired) = (
-        count("connected") - count("disconnected"),
-        count("User Authentication Expired"),
-    );
-    eprintln!("unrefreshed participant: {connects} connect(s), {expired} expired: {events:?}");
-    assert!(
-        expired >= 2,
-        "its connection was ended at exp and at least one reconnect after it: {events:?}"
-    );
-    assert!(
-        connects <= expired + 1,
-        "every connect after exp was ended as expired (the last may still be closing): \
-         {events:?}"
-    );
+    // Allow one capped backoff and one complete connect attempt after exp, plus the
+    // exchange budget for scheduling and delivery of the server's event. This is an
+    // event deadline, not a sleep; a healthy loopback broker must answer that attempt.
+    let stale_deadline = Instant::now()
+        + Duration::from_millis(stale_exp_ms.saturating_sub(now_ms()))
+        + RECONNECT_MAX_DELAY
+        + rows::CONNECT_TIMEOUT
+        + EXCHANGE_LIMIT;
 
     // The renewing holder: across at least two of its JWTs' expiries it is disconnected
     // by the server and reconnects on the renewed JWT each time, never refused.
@@ -1811,6 +1795,52 @@ async fn a_renewed_jwt_carries_its_holder_past_exp_and_an_unrefreshed_one_is_ref
     plane
         .exchange(&mut renewing.participant, "after two expiries")
         .await;
+
+    // Observe the renewing holder at its own expiry milestones before waiting on the
+    // stale holder: a slow refused reconnect must not push that observation into a
+    // third JWT's expiry. The server has been recording the stale events all along.
+    let stale_endings = || {
+        server_events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| {
+                event["type"] == "io.nats.server.advisory.v1.client_disconnect"
+                    && event["client"]["jwt"] == stale.answer["jwt"]
+                    && matches!(
+                        event["reason"].as_str(),
+                        Some("Authentication Expired" | "Authentication Failure")
+                    )
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    while !(stale.disconnects() >= 1
+        && stale.signatures_since(stale_exp_ms) >= 1
+        && stale_endings().len() >= 2)
+    {
+        assert!(
+            Instant::now() < stale_deadline,
+            "the unrefreshed participant was not disconnected and refused after its exp: \
+             events {:?}, server endings {:?}, nonce refusals {:?}",
+            stale.client.events(),
+            stale_endings(),
+            stale.refusals_since(stale_exp_ms)
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let events = stale.client.events();
+    let connects = events.iter().filter(|event| *event == "connected").count();
+    let expired = stale_endings().len();
+    eprintln!("unrefreshed participant: {connects} connect callback(s), {expired} server refusals: {events:?}");
+    assert!(
+        connects <= expired + 1,
+        "every connect after exp was refused (the last may still be closing): {events:?}"
+    );
+    assert!(
+        stale.refusals_since(stale_exp_ms).is_empty(),
+        "ck-bus signed the expired holder's nonces"
+    );
 
     // ck-bus's own users renewed as well, and its connections still work past their
     // expiries: it issues (a census write on its box user) and revokes (an account

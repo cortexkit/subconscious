@@ -356,6 +356,9 @@ pub struct VerdictClient {
     events: Arc<Mutex<Vec<String>>>,
 }
 
+/// Bounds a complete broker connect, including the participant's nonce-sign relay.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
 impl VerdictClient {
     /// Connects with `jwt`, answering the nonce through `sign`. `inbox_prefix` sets the
     /// client's reply inbox; `None` leaves the library's default `_INBOX`.
@@ -390,7 +393,7 @@ impl VerdictClient {
                 recorded.lock().unwrap().push(event.to_string());
             }
         })
-        .connection_timeout(Duration::from_secs(5))
+        .connection_timeout(CONNECT_TIMEOUT)
         .request_timeout(Some(Duration::from_secs(3)));
         if let Some(prefix) = inbox_prefix {
             options = options.custom_inbox_prefix(prefix);
@@ -436,7 +439,7 @@ impl VerdictClient {
                 recorded.lock().unwrap().push(event.to_string());
             }
         })
-        .connection_timeout(Duration::from_secs(5))
+        .connection_timeout(CONNECT_TIMEOUT)
         .request_timeout(Some(Duration::from_secs(3)))
         .custom_inbox_prefix(inbox_prefix)
         .connect(url)

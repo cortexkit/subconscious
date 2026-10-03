@@ -18,7 +18,7 @@ use async_trait::async_trait;
 use cortexkit_bus_naming::{AccountNames, DiscardPolicy, StreamKind, StreamSpec, MIB};
 use futures_util::StreamExt;
 use serde_json::{json, Value};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, watch};
 
 use crate::credentials::Credentials;
 
@@ -396,14 +396,15 @@ impl NatsBroker {
         user_public: &str,
         name: &str,
         server_errors: broadcast::Sender<String>,
-    ) -> Result<async_nats::Client, PlaneError> {
+    ) -> Result<(async_nats::Client, watch::Receiver<u64>), PlaneError> {
         let credentials = self.credentials.clone();
         let user = user_public.to_string();
+        let (connected, connections) = watch::channel(0_u64);
         // Every connect, reconnects included, presents the user's current JWT: the
         // renewal task replaces it before `exp`, so the reconnect nats-server forces at
         // expiry uses the renewed one (R16).
         credentials.own_jwts.set(user_public, jwt);
-        async_nats::ConnectOptions::with_auth_callback(move |nonce| {
+        let client = async_nats::ConnectOptions::with_auth_callback(move |nonce| {
             let credentials = credentials.clone();
             let user = user.clone();
             async move {
@@ -422,7 +423,11 @@ impl NatsBroker {
         .custom_inbox_prefix(format!("_INBOX.{user_public}"))
         .event_callback(move |event| {
             let server_errors = server_errors.clone();
+            let connected = connected.clone();
             async move {
+                if matches!(event, async_nats::Event::Connected) {
+                    connected.send_modify(|epoch| *epoch = epoch.wrapping_add(1));
+                }
                 if let async_nats::Event::ServerError(async_nats::ServerError::Other(line)) = event
                 {
                     // Nobody listening is normal; the line is only for a probe in flight.
@@ -434,7 +439,8 @@ impl NatsBroker {
         .connection_timeout(REQUEST_TIMEOUT)
         .connect(&self.url)
         .await
-        .map_err(|error| PlaneError::new(format!("connect as {name} to {}: {error}", self.url)))
+        .map_err(|error| PlaneError::new(format!("connect as {name} to {}: {error}", self.url)))?;
+        Ok((client, connections))
     }
 }
 
@@ -446,7 +452,7 @@ impl Broker for NatsBroker {
         user_public: &str,
     ) -> Result<Arc<dyn SystemPlane>, PlaneError> {
         let (server_errors, _) = broadcast::channel(SERVER_ERROR_BACKLOG);
-        let client = self
+        let (client, _) = self
             .connect(jwt, user_public, "ckbus-system", server_errors)
             .await?;
         Ok(Arc::new(NatsSystem { client }))
@@ -458,7 +464,7 @@ impl Broker for NatsBroker {
         user_public: &str,
     ) -> Result<Arc<dyn BoxPlane>, PlaneError> {
         let (server_errors, _) = broadcast::channel(SERVER_ERROR_BACKLOG);
-        let client = self
+        let (client, connections) = self
             .connect(jwt, user_public, "ckbus-box", server_errors.clone())
             .await?;
         let jetstream = jetstream::new(client.clone());
@@ -471,6 +477,7 @@ impl Broker for NatsBroker {
             client,
             jetstream,
             link,
+            connections,
         }))
     }
 }
@@ -629,6 +636,9 @@ pub struct NatsBox {
     client: async_nats::Client,
     jetstream: jetstream::Context,
     link: SentinelLink,
+    /// Changes on every completed connect, even if the disconnect/reconnect was too
+    /// brief to see through `Client::connection_state()`.
+    connections: watch::Receiver<u64>,
 }
 
 #[async_trait]
@@ -677,12 +687,40 @@ impl BoxPlane for NatsBox {
         account: &AccountNames,
         key: &str,
     ) -> Result<Option<CensusRecord>, PlaneError> {
-        let entry = self
-            .census_store(account)
-            .await?
-            .entry(key)
-            .await
-            .map_err(|error| PlaneError::new(format!("census get {key}: {error}")))?;
+        let mut connections = self.connections.clone();
+        connections.borrow_and_update();
+        // async-nats restores subscriptions after a reconnect, but does not replay a
+        // request already written on the old socket. At JWT expiry a healthy census
+        // can therefore time out even though the renewed box user is connected again.
+        // A completed reconnect invalidates an in-flight read; replay both metadata
+        // and entry reads, which have no side effects. Real read errors still refuse.
+        // All attempts share the plane's existing five-second broker request budget;
+        // reconnects never extend it, and a permanently unavailable census stays closed.
+        let entry = tokio::time::timeout(REQUEST_TIMEOUT, async {
+            loop {
+                let read = async {
+                    self.census_store(account)
+                        .await?
+                        .entry(key)
+                        .await
+                        .map_err(|error| PlaneError::new(format!("census get {key}: {error}")))
+                };
+                tokio::select! {
+                    biased;
+                    changed = connections.changed() => {
+                        changed.map_err(|_| PlaneError::new("census connection watch closed"))?;
+                        super::log_event("ckbus.census.read_replayed", json!({ "key": key }));
+                    }
+                    result = read => return result,
+                }
+            }
+        })
+        .await
+        .map_err(|_| {
+            PlaneError::new(format!(
+                "census get {key}: no reply within {REQUEST_TIMEOUT:?}"
+            ))
+        })??;
         Ok(entry
             .filter(|entry| entry.operation == kv::Operation::Put)
             .map(|entry| CensusRecord {

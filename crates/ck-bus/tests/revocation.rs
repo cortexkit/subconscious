@@ -1040,6 +1040,206 @@ async fn census_replacement_records_predecessor_before_the_crash_boundary() {
     run.run.shutdown().await;
 }
 
+/// A TCP relay that loses exactly one census metadata request by closing its socket.
+/// Unlike a sleeping broker or an unreadable entry, the broker remains healthy and the
+/// client's next connection can answer the same read immediately.
+async fn lose_one_census_request(
+    backend: String,
+) -> (
+    String,
+    Arc<std::sync::atomic::AtomicBool>,
+    tokio::task::JoinHandle<()>,
+) {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("nats://{}", listener.local_addr().unwrap());
+    let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let drop_request = armed.clone();
+    let task = tokio::spawn(async move {
+        while let Ok((client, _)) = listener.accept().await {
+            let backend = backend.clone();
+            let drop_request = drop_request.clone();
+            tokio::spawn(async move {
+                let server = tokio::net::TcpStream::connect(backend.trim_start_matches("nats://"))
+                    .await
+                    .unwrap();
+                eprintln!("census relay: connected to the healthy broker");
+                let (client_read, mut client_write) = client.into_split();
+                let (mut server_read, mut server_write) = server.into_split();
+                let uplink = async {
+                    let mut client_read = BufReader::new(client_read);
+                    loop {
+                        let mut header = String::new();
+                        if client_read.read_line(&mut header).await? == 0 {
+                            return Ok::<_, std::io::Error>(());
+                        }
+                        if header.starts_with("PUB $JS.API.STREAM.INFO.")
+                            && drop_request.swap(false, std::sync::atomic::Ordering::SeqCst)
+                        {
+                            eprintln!("census relay: lost {header:?}; closing the box connection");
+                            return Ok(());
+                        }
+                        server_write.write_all(header.as_bytes()).await?;
+                        if header.starts_with("PUB ") || header.starts_with("HPUB ") {
+                            let length: usize =
+                                header.split_whitespace().last().unwrap().parse().unwrap();
+                            let mut payload = vec![0; length + 2];
+                            client_read.read_exact(&mut payload).await?;
+                            server_write.write_all(&payload).await?;
+                        }
+                    }
+                };
+                tokio::select! {
+                    _ = uplink => {}
+                    _ = tokio::io::copy(&mut server_read, &mut client_write) => {}
+                }
+            });
+        }
+    });
+    (url, armed, task)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_census_read_lost_at_box_reconnect_is_replayed_within_its_original_budget() {
+    let _gate = harness::acceptance_gate().await;
+    let mut run = start(false).await.expect("nats-server is required");
+    retire_supervised_ckbus(&run).await;
+    let (url, armed, relay) = lose_one_census_request(run.server.url.clone()).await;
+    run.server.url = url;
+    let plane = plane(&run).await;
+    let module = "readreconnect";
+    let key = AccountNames::census_key(module).unwrap();
+    let value = CensusValue {
+        credential_public: KeyPair::new_user().public_key(),
+        user_jwt_id: "predecessor".into(),
+        spawn_generation: 2,
+        credential_epoch: 0,
+        identities: vec![],
+        rooms: vec![],
+    };
+    plane
+        .box_plane
+        .census_put(&plane.names.census_subject(&key).unwrap(), value.to_bytes())
+        .await
+        .unwrap();
+    armed.store(true, std::sync::atomic::Ordering::SeqCst);
+    let began = Instant::now();
+    let read = plane.box_plane.census_get(&plane.names, &key).await;
+    eprintln!(
+        "census read after {:?}, box state {:?}: {:?}",
+        began.elapsed(),
+        plane
+            .box_plane
+            .sentinel_link()
+            .unwrap()
+            .client
+            .connection_state(),
+        read.as_ref()
+            .map(|record| record.as_ref().map(|record| record.revision))
+    );
+    let record = read
+        .expect("a healthy census is readable after the box connection reconnects")
+        .expect("reconnect must not be interpreted as an absent entry");
+    assert!(
+        !armed.load(std::sync::atomic::Ordering::SeqCst),
+        "the relay must actually lose the request"
+    );
+    assert_eq!(CensusValue::parse(&record.value).unwrap(), value);
+    assert!(
+        began.elapsed() < Duration::from_secs(5),
+        "replay stays inside the existing broker request budget"
+    );
+    // A real read failure still refuses: recovery must not fabricate an absent entry.
+    async_nats::jetstream::new(
+        bus::box_client(&run.trust, &run.server, &plane.account_public).await,
+    )
+    .delete_stream(&plane.names.buckets().census_stream)
+    .await
+    .unwrap();
+    assert!(plane
+        .box_plane
+        .census_get(&plane.names, &key)
+        .await
+        .is_err());
+    relay.abort();
+    run.server.stop().await;
+    run.run.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn census_replacement_refuses_unreadable_or_malformed_predecessors() {
+    struct Live;
+    #[async_trait]
+    impl issuance::LiveGenerations for Live {
+        async fn live_generation(&self, _: &str) -> Result<Option<u64>, String> {
+            Ok(Some(2))
+        }
+    }
+    struct Source(issuance::Plane);
+    impl issuance::PlaneSource for Source {
+        fn current(&self) -> Option<issuance::Plane> {
+            Some(self.0.clone())
+        }
+    }
+    let _gate = harness::acceptance_gate().await;
+    let run = start(false).await.expect("nats-server is required");
+    retire_supervised_ckbus(&run).await;
+    let plane = plane(&run).await;
+    for malformed in [false, true] {
+        let store = tempfile::tempdir().unwrap();
+        let module = "unreadablepredecessor";
+        let key = AccountNames::census_key(module).unwrap();
+        let bytes = b"not a census value".to_vec();
+        plane
+            .box_plane
+            .census_put(&plane.names.census_subject(&key).unwrap(), bytes.clone())
+            .await
+            .unwrap();
+        let credentials = credentials_over(run.trust.signer.clone());
+        let revoker = Arc::new(Revoker::new(
+            credentials.clone(),
+            store.path(),
+            Arc::new(Connections::default()),
+        ));
+        let (_, ready) = tokio::sync::watch::channel(None);
+        let area = Arc::new(revocation::handler::Area::new(revoker, ready));
+        let issuing = issuance::Issuance::new(
+            credentials.clone(),
+            store.path(),
+            Arc::new(Live),
+            Arc::new(Source(issuance::Plane {
+                names: plane.names.clone(),
+                account_public: plane.account_public.clone(),
+                server_url: run.server.url.clone(),
+                box_plane: if malformed {
+                    plane.box_plane.clone()
+                } else {
+                    Arc::new(UnreadableCensus(plane.box_plane.clone()))
+                },
+            })),
+        );
+        issuing.set_replacement_guard(area);
+        let refusal = issuing
+            .issue(module)
+            .await
+            .expect_err("an unreadable predecessor must never be overwritten");
+        assert_eq!(refusal.code, issuance::code::CENSUS_UNAVAILABLE);
+        assert!(issuing.current(module).is_none());
+        assert_eq!(
+            plane
+                .box_plane
+                .census_get(&plane.names, &key)
+                .await
+                .unwrap()
+                .unwrap()
+                .value,
+            bytes
+        );
+    }
+    run.server.stop().await;
+    run.run.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn damaged_supersede_progress_never_infers_revocation_from_a_replaced_census() {
     let _gate = harness::acceptance_gate().await;

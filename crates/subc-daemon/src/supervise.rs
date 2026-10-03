@@ -2171,7 +2171,10 @@ pub struct Supervisor {
 /// in that window without racing a real one.
 #[cfg(test)]
 #[derive(Clone, Default)]
-struct AfterFirstSpawnHook(Option<Arc<dyn Fn(&str) + Send + Sync>>);
+struct AfterFirstSpawnHook(Option<AfterFirstSpawnFn>);
+
+#[cfg(test)]
+type AfterFirstSpawnFn = Arc<dyn Fn(&str) + Send + Sync>;
 
 #[cfg(test)]
 impl fmt::Debug for AfterFirstSpawnHook {

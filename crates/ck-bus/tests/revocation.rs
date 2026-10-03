@@ -922,7 +922,11 @@ async fn stop_and_damage(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn revocation_prunes_expired_user_cutoffs_but_keeps_live_cutoffs() {
     let _gate = harness::acceptance_gate().await;
-    let run = start(false).await.expect("nats-server is required");
+    // Skip where nats-server is not installed (the Windows CI runner has
+    // none), as every other row here does.
+    let Some(run) = start(false).await else {
+        return;
+    };
     retire_supervised_ckbus(&run).await;
     let plane = plane(&run).await;
     let expired = KeyPair::new_user().public_key();
@@ -984,7 +988,11 @@ async fn census_replacement_records_predecessor_before_the_crash_boundary() {
         }
     }
     let _gate = harness::acceptance_gate().await;
-    let run = start(false).await.expect("nats-server is required");
+    // Skip where nats-server is not installed (the Windows CI runner has
+    // none), as every other row here does.
+    let Some(run) = start(false).await else {
+        return;
+    };
     retire_supervised_ckbus(&run).await;
     let plane = plane(&run).await;
     let store = tempfile::tempdir().unwrap();
@@ -1035,7 +1043,11 @@ async fn census_replacement_records_predecessor_before_the_crash_boundary() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn damaged_supersede_progress_never_infers_revocation_from_a_replaced_census() {
     let _gate = harness::acceptance_gate().await;
-    let run = start(false).await.expect("nats-server is required");
+    // Skip where nats-server is not installed (the Windows CI runner has
+    // none), as every other row here does.
+    let Some(run) = start(false).await else {
+        return;
+    };
     retire_supervised_ckbus(&run).await;
     let plane = plane(&run).await;
     for (module, replacement) in [("damagedsupersede", true), ("damagedcensus", false)] {

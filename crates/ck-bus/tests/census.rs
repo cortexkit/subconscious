@@ -322,7 +322,11 @@ async fn one_census_key_per_live_process_overwritten_by_refetch_and_respawn() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn repairing_high_water_clears_damage_without_restarting_issuance() {
     let _gate = harness::acceptance_gate().await;
-    let run = start(false).await.expect("nats-server is required");
+    // Like every other row here, skip where nats-server is not installed (the
+    // Windows CI runner has none); `start` reports the skip by name.
+    let Some(run) = start(false).await else {
+        return;
+    };
     let plane = bus_module_plane(&run).await;
     for damaged in [
         b"not JSON".as_slice(),

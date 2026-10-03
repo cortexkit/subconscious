@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 use crate::{
     forwarding::{DataRoute, DataRouteState, RouteBindRelayOutcome},
     registry::ConnectionId,
-    router::{ForwardBackend, FrameSink, RouteCtx, RouterError},
+    router::{ForwardBackend, FrameSink, OutboundFrame, RouteCtx, RouterError},
     ForwardingTable, Frame, Registry,
 };
 
@@ -200,9 +200,10 @@ pub async fn build_bench_forwarding_setup(
 async fn bench_module_echo_drain(
     forwarding: Arc<ForwardingTable>,
     module_connection: ConnectionId,
-    mut module_rx: mpsc::Receiver<Frame>,
+    mut module_rx: mpsc::Receiver<OutboundFrame>,
 ) {
-    while let Some(frame) = module_rx.recv().await {
+    while let Some(outbound) = module_rx.recv().await {
+        let frame = outbound.frame;
         if frame.header.ty != FrameType::Request {
             continue;
         }
@@ -230,7 +231,7 @@ async fn bench_module_echo_drain(
     }
 }
 
-fn bench_route_ctx(connection_id: ConnectionId) -> (RouteCtx, mpsc::Receiver<Frame>) {
+fn bench_route_ctx(connection_id: ConnectionId) -> (RouteCtx, mpsc::Receiver<OutboundFrame>) {
     let (tx, rx) = mpsc::channel(65_536);
     (
         RouteCtx {
@@ -239,4 +240,36 @@ fn bench_route_ctx(connection_id: ConnectionId) -> (RouteCtx, mpsc::Receiver<Fra
         },
         rx,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn benchmark_echo_drain_releases_forwarded_request_credit() {
+        let setup = build_bench_forwarding_setup(1, 1).await;
+        let route = &setup.client_routes[0];
+        let DataRoute::Client(DataRouteState::Bound(binding)) = setup
+            .forwarding
+            .lookup_data_route(
+                route.connection_id,
+                route.client_channel,
+                route.client_epoch,
+            )
+            .unwrap()
+        else {
+            panic!("benchmark route is bound");
+        };
+        bench_client_forward_op(&setup.forwarding, &setup.forward_backend, route, 42)
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while binding.flow.in_flight() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("echo drain releases the request credit");
+    }
 }

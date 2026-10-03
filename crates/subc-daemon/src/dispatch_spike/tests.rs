@@ -36,6 +36,46 @@ fn cancel(corr: u64) -> Frame {
     .expect("test cancel frame must be valid")
 }
 
+#[test]
+fn cancelled_correlation_reuse_keeps_the_new_request_at_the_fifo_tail() {
+    let fixture = || {
+        let mut inbox = RouteInbox::new(4);
+        assert_eq!(
+            inbox.push_request(1, request(1, b"old")),
+            PushOutcome::Admitted
+        );
+        assert_eq!(inbox.on_cancel(1), CancelDecision::SynthesizeCancelled);
+        assert_eq!(
+            inbox.push_request(2, request(2, b"middle")),
+            PushOutcome::Admitted
+        );
+        assert_eq!(
+            inbox.push_request(1, request(1, b"new")),
+            PushOutcome::Admitted
+        );
+        inbox
+    };
+    let mut inbox = fixture();
+    assert_eq!(
+        inbox.pop_for_dispatch(),
+        None,
+        "old cancellation is a tombstone, not the reused request"
+    );
+    assert_eq!(inbox.pop_for_dispatch(), Some(2));
+    assert_eq!(inbox.pop_for_dispatch(), Some(1));
+    assert!(
+        matches!(inbox.commit_delivered(1), CommitDecision::Proceed(frame) if frame.body == b"new")
+    );
+    assert_eq!(inbox.pop_for_dispatch(), None);
+    let mut closing = fixture();
+    closing.begin_closing();
+    assert_eq!(
+        closing.finish_closed(),
+        [2, 1],
+        "teardown follows the same FIFO identities"
+    );
+}
+
 #[derive(Debug)]
 struct CountingFlow {
     cap: usize,

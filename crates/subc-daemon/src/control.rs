@@ -1769,6 +1769,21 @@ impl ControlHandler {
             corr = frame.header.corr,
             "handling HELLO"
         );
+        // A module connection has one identity for its entire lifetime. A second
+        // registration would leave the old registry owner behind while replacing
+        // its forwarding endpoint and launch nonce.
+        if self
+            .registry
+            .get_module_by_connection(connection_id)
+            .map_err(|err| RouterError::backend(0, frame.header.corr, err.to_string()))?
+            .is_some()
+        {
+            return Ok(vec![control_error_frame(
+                &frame,
+                "invalid_hello",
+                "connection is already registered as a module",
+            )?]);
+        }
         let hello_value = match serde_json::from_slice::<serde_json::Value>(&frame.body) {
             Ok(value) => value,
             Err(err) => {
@@ -2028,7 +2043,11 @@ impl ControlHandler {
                 }
                 return Ok(vec![control_error_frame(
                     &frame,
-                    forwarding_error_code(&err),
+                    if matches!(err, ForwardingError::ConnectionRoleConflict { .. }) {
+                        "invalid_hello"
+                    } else {
+                        forwarding_error_code(&err)
+                    },
                     err.to_string(),
                 )?]);
             }
@@ -2973,6 +2992,18 @@ impl ControlHandler {
             scope,
         } = request;
         let target_module_id = target_module_id(&target).to_string();
+        if self
+            .registry
+            .get_module_by_connection(ctx.connection_id)
+            .map_err(|err| RouterError::backend(0, frame.header.corr, err.to_string()))?
+            .is_some()
+        {
+            return Ok(vec![control_error_frame(
+                &frame,
+                "invalid_request",
+                "module connections cannot open client routes",
+            )?]);
+        }
         debug!(
             connection_id = ctx.connection_id.get(),
             corr = frame.header.corr,
@@ -5978,6 +6009,7 @@ fn control_response_body_frame<T: Serialize>(
 /// Pin identity here the moment a consumer branches on a specific code.
 fn forwarding_error_code(err: &ForwardingError) -> &'static str {
     match err {
+        ForwardingError::ConnectionRoleConflict { .. } => "invalid_request",
         ForwardingError::NoModuleConnection => "target_unavailable",
         ForwardingError::ModuleReloading { .. } => "module_reloading",
         ForwardingError::ClientRouteChannelExhausted { .. }
@@ -6316,6 +6348,9 @@ mod tests {
         // recover at all — the worst thing to advertise as retryable, since every
         // client would storm a daemon that will never answer.
         let permanent = [
+            ForwardingError::ConnectionRoleConflict {
+                connection_id: ConnectionId::new(1),
+            },
             ForwardingError::ClientRouteChannelExhausted {
                 connection_id: ConnectionId::new(1),
             },
@@ -10421,6 +10456,67 @@ mod tests {
         assert_eq!(responses[0].header.ty, FrameType::Error);
         assert_eq!(parse_error(&responses[0])["code"], "invalid_hello");
         assert!(registry.get_module("aft-second").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn second_hello_preserves_registration_routes_and_launch_nonce() {
+        let registry = Arc::new(Registry::default());
+        let forwarding = Arc::new(ForwardingTable::default());
+        let handler = ControlHandler::with_forwarding(registry.clone(), forwarding.clone());
+        let (module_ctx, mut module_rx) = route_ctx(ConnectionId::new(101));
+        hello_via_sink(
+            &handler,
+            &module_ctx,
+            &mut module_rx,
+            hello_frame_with_nonce("alpha", PROTOCOL_VERSION, 1, Some("alpha-nonce")),
+        )
+        .await;
+        let (client_ctx, mut client_rx) = route_ctx(ConnectionId::new(202));
+        let pending = forwarding
+            .begin_route_bind_relay_for_test(
+                client_ctx.connection_id,
+                client_ctx.egress.clone(),
+                2,
+                "alpha",
+            )
+            .unwrap();
+        forwarding
+            .complete_pending_relay(
+                module_ctx.connection_id,
+                pending.corr,
+                RouteBindRelayOutcome::Accepted,
+            )
+            .unwrap();
+        client_rx.try_recv().unwrap();
+        for module_id in ["beta", "alpha"] {
+            let replies = handler
+                .handle_control_frame(
+                    &module_ctx,
+                    hello_frame_with_nonce(module_id, PROTOCOL_VERSION, 3, Some("replacement")),
+                )
+                .await
+                .unwrap();
+            assert_eq!(replies.len(), 1, "second HELLO must be refused");
+            assert_eq!(parse_error(&replies[0])["code"], "invalid_hello");
+        }
+        assert_eq!(registry.list_modules().unwrap().1.len(), 1);
+        assert!(registry.get_module("beta").unwrap().is_none());
+        assert!(matches!(
+            forwarding
+                .lookup_data_route(
+                    client_ctx.connection_id,
+                    pending.client_channel,
+                    pending.client_epoch,
+                )
+                .unwrap(),
+            DataRoute::Client(DataRouteState::Bound(_))
+        ));
+        assert!(handler
+            .hello_launch_nonces
+            .lock()
+            .unwrap()
+            .presented(module_ctx.connection_id, Some("alpha-nonce")));
+        assert!(module_rx.try_recv().is_err());
     }
 
     #[test]

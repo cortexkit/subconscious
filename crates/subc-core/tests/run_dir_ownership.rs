@@ -333,8 +333,10 @@ fn a_killed_daemons_lock_does_not_block_the_next_daemon_and_its_orphan_is_swept(
     let c = tree.spawn_daemon("runtime");
     let replacement = tree.wait_module_ready(c);
     assert_ne!(replacement, orphan, "the module was spawned again");
-    // The sweep waits for the orphan to stop matching its recorded identity
-    // before spawning; reaping it is up to whoever adopted it.
+    // The sweep spawns the replacement once the orphan has exited (it no longer
+    // matches the pid, start time and executable the previous daemon recorded).
+    // Reaping the exited orphan is left to whichever process adopted it, so
+    // allow it a moment to disappear.
     assert!(
         wait_until_gone(orphan, Duration::from_secs(5)),
         "the next daemon must end the previous daemon's orphan"

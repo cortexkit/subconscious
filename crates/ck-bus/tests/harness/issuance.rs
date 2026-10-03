@@ -367,6 +367,7 @@ impl VerdictClient {
     ) -> Result<Self, async_nats::ConnectError> {
         let events = Arc::new(Mutex::new(Vec::new()));
         let recorded = events.clone();
+        let label = inbox_prefix.clone();
         let mut options = async_nats::ConnectOptions::with_jwt(jwt.to_string(), move |nonce| {
             // The library needs a `Sync` future; the signing future runs as its own task
             // and only the task handle is awaited here.
@@ -380,7 +381,12 @@ impl VerdictClient {
         })
         .event_callback(move |event| {
             let recorded = recorded.clone();
+            let label = label.clone();
             async move {
+                eprintln!(
+                    "broker event {label:?} at {:?}: {event}",
+                    std::time::SystemTime::now()
+                );
                 recorded.lock().unwrap().push(event.to_string());
             }
         })
@@ -403,6 +409,7 @@ impl VerdictClient {
     ) -> Result<Self, async_nats::ConnectError> {
         let events = Arc::new(Mutex::new(Vec::new()));
         let recorded = events.clone();
+        let label = inbox_prefix.clone();
         let client = async_nats::ConnectOptions::with_auth_callback(move |nonce| {
             let presented = jwt.lock().unwrap().clone();
             // As in `connect`: the signing runs as its own task, only its handle is awaited.
@@ -420,7 +427,12 @@ impl VerdictClient {
         })
         .event_callback(move |event| {
             let recorded = recorded.clone();
+            let label = label.clone();
             async move {
+                eprintln!(
+                    "broker event {label:?} at {:?}: {event}",
+                    std::time::SystemTime::now()
+                );
                 recorded.lock().unwrap().push(event.to_string());
             }
         })

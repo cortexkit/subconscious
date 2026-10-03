@@ -1690,6 +1690,20 @@ async fn a_renewed_jwt_carries_its_holder_past_exp_and_an_unrefreshed_one_is_ref
     let Some(plane) = start_with(None, short_lifetime_env()).await else {
         return;
     };
+    // Keep server-side connection events as well as client callbacks: an expiry can
+    // race a census request on ck-bus's own renewing box connection.
+    let system = plane.system().await;
+    let mut connections = system.subscribe("$SYS.ACCOUNT.*.*").await.unwrap();
+    system.flush().await.unwrap();
+    let _connection_log = TaskGuard(tokio::spawn(async move {
+        while let Some(message) = connections.next().await {
+            eprintln!(
+                "server event {}: {}",
+                message.subject,
+                String::from_utf8_lossy(&message.payload)
+            );
+        }
+    }));
     let mut renewing = plane
         .connect_renewing(PARTICIPANT)
         .await

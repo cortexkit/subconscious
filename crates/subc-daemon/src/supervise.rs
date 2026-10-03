@@ -5090,18 +5090,14 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn rescan_preserves_running_protocol_until_respawn() {
-        let dir = std::env::temp_dir().join(format!(
-            "rescan-protocol-{}",
-            generate_launch_nonce().unwrap()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = subc_test_support::TestTempDir::new("rescan-protocol");
         let initial = ModuleSpec {
             module_id: "rescan-protocol".into(),
             program: PathBuf::from("/bin/sleep"),
             args: vec!["60".into()],
             env: ["XDG_DATA_HOME", "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME"]
                 .into_iter()
-                .map(|key| (key.into(), dir.to_string_lossy().into_owned()))
+                .map(|key| (key.into(), dir.path().to_string_lossy().into_owned()))
                 .collect(),
             reserved: false,
             reserved_prefixes: vec![],
@@ -5143,7 +5139,6 @@ mod tests {
             "the old non-wire process's clean exit must restart"
         );
         module.drain().await.unwrap();
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[cfg(unix)]

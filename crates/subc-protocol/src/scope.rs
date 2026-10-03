@@ -114,8 +114,9 @@ pub struct ScopeCarrier {
 }
 
 /// The attributes the daemon stamps without interpreting. They bear authority,
-/// so only an owner listed in the daemon's `scope_authority_owners` may set
-/// them.
+/// so only an owner module named in the daemon config's `scope_authority_owners`
+/// list (by default the module that owns agent sessions) may set them; a scope
+/// owned by any other module must leave them empty.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ScopeAttributes {
@@ -125,14 +126,17 @@ pub struct ScopeAttributes {
     /// Whether a provider may act as `agent_id`. Refused without `agent_id`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub delegates: bool,
-    /// This scope belongs to the named flow. Set only by an authority owner
-    /// (prefrontal), validated with [`validate_flow_id`], and stamped verbatim.
-    /// It needs neither `agent_id` nor `delegates`. Providers treat a non-owner
-    /// opener on a flow scope as the flow's carrier.
+    /// This scope belongs to the named flow, an automated workflow run on an
+    /// agent's behalf. Set only by an authority owner (see above), validated
+    /// with [`validate_flow_id`], and stamped verbatim. It needs neither
+    /// `agent_id` nor `delegates`. Providers treat a module other than the
+    /// owner that opens a route under a flow scope as the flow's carrier.
     ///
-    /// Like an `agent_id` change, changing this at the same epoch is accepted,
-    /// bumps the content version and drains every route under the scope with
-    /// `scope_delegation_changed`, so no live route keeps the old identity.
+    /// Like an `agent_id` change, changing this within the same scope epoch is
+    /// accepted: the scope's content version increases (the number providers
+    /// compare to notice a change), and every route under the scope is closed
+    /// with the reason `scope_delegation_changed`, so no live route keeps the
+    /// old identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub flow_id: Option<String>,
 }

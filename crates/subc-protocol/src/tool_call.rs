@@ -101,8 +101,9 @@ pub struct ToolCallRequest {
     /// [`SCHEMA_PIN_FIELD`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema_pin: Option<String>,
-    /// The session's tool preset, assigned by prefrontal and forwarded by its
-    /// carrier on every call, outside the model's arguments. Opaque to the
+    /// The session's tool preset, assigned by the module that owns the session
+    /// and forwarded by its carrier on every call, outside the model's
+    /// arguments. Opaque to the
     /// daemon. A provider checks its shape with [`validate_preset`] and answers
     /// a malformed value with `invalid_request` naming [`PRESET_FIELD`].
     ///

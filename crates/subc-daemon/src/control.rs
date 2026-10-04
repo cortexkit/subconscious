@@ -12580,8 +12580,9 @@ mod tests {
                 let (ctx, mut rx) = wide_ctx(connection);
                 let hello = hello_frame(module_id, PROTOCOL_VERSION, connection);
                 let mut body: Value = serde_json::from_slice(&hello.body).unwrap();
-                // A decoder version alone must not admit flow routes. Both
-                // kinds of target declare 0.29.0; only one promises behaviour.
+                // A decoder version alone must not admit flow routes. Every
+                // target here declares wire crate version 0.29.0; only one that
+                // declares `flow-scopes/v1` promises flow behaviour.
                 body["manifest"]["provenance"] =
                     serde_json::json!({"wire_crate_version": "0.29.0"});
                 if flow_support {

@@ -3401,7 +3401,15 @@ impl ControlHandler {
                     .scopes
                     .read()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .admit(&principal, &target_module_id, &selector, owner_configured);
+                    .admit(&principal, &target_module_id, &selector, owner_configured)
+                    .and_then(|admission| {
+                        crate::scopes::check_target_flow_support(
+                            &admission.stamp,
+                            &target_module_id,
+                            registration.manifest.capabilities.as_ref(),
+                        )?;
+                        Ok(admission)
+                    });
                 match admitted {
                     Ok(admission) => (
                         Some(BoundScope {
@@ -3558,6 +3566,37 @@ impl ControlHandler {
         } = pending;
         let mut reservation =
             RouteBindReservationGuard::new(Arc::clone(&self.forwarding), endpoint, relay_corr);
+
+        // Reserving egress can wait while a module reconnects or a swap cuts
+        // over. Check the connection the relay actually captured, not the
+        // earlier by-id lookup: a flow-aware module must not vouch for a
+        // replacement. The captured sink cannot turn into another connection.
+        if let Some(stamp) = scope_stamp
+            .as_ref()
+            .filter(|stamp| stamp.attributes.flow_id.is_some())
+        {
+            let relay_registration = self
+                .registry
+                .get_module_by_connection(endpoint.connection_id)
+                .map_err(|err| RouterError::backend(0, frame.header.corr, err.to_string()))?;
+            if let Err(refusal) = crate::scopes::check_target_flow_support(
+                stamp,
+                &target_module_id,
+                relay_registration
+                    .as_ref()
+                    .and_then(|registration| registration.manifest.capabilities.as_ref()),
+            ) {
+                reservation.release_and_disarm();
+                return Ok(vec![self.route_open_refusal_frame(
+                    ctx,
+                    &frame,
+                    &target_module_id,
+                    refusal.code,
+                    refusal.code,
+                    refusal.message,
+                )?]);
+            }
+        }
 
         debug!(
             connection_id = ctx.connection_id.get(),
@@ -12498,6 +12537,10 @@ mod tests {
         }
 
         async fn rig() -> Rig {
+            rig_with_flow_support(true).await
+        }
+
+        async fn rig_with_flow_support(flow_support: bool) -> Rig {
             let registry = Arc::new(Registry::default());
             let forwarding = Arc::new(ForwardingTable::default());
             let supervisor_handle = SupervisorHandle::new();
@@ -12535,13 +12578,26 @@ mod tests {
             let mut modules = BTreeMap::new();
             for (connection, module_id) in [(2, PLEXUS), (3, OTHER)] {
                 let (ctx, mut rx) = wide_ctx(connection);
-                hello_via_sink(
-                    &handler,
-                    &ctx,
-                    &mut rx,
-                    hello_frame(module_id, PROTOCOL_VERSION, connection),
+                let hello = hello_frame(module_id, PROTOCOL_VERSION, connection);
+                let mut body: Value = serde_json::from_slice(&hello.body).unwrap();
+                // A decoder version alone must not admit flow routes. Both
+                // kinds of target declare 0.29.0; only one promises behaviour.
+                body["manifest"]["provenance"] =
+                    serde_json::json!({"wire_crate_version": "0.29.0"});
+                if flow_support {
+                    body["manifest"]["capabilities"] =
+                        serde_json::json!({"provides": ["flow-scopes/v1"]});
+                }
+                let hello = Frame::build(
+                    FrameType::Hello,
+                    control_flags(),
+                    0,
+                    0,
+                    connection,
+                    serde_json::to_vec(&body).unwrap(),
                 )
-                .await;
+                .unwrap();
+                hello_via_sink(&handler, &ctx, &mut rx, hello).await;
                 modules.insert(module_id.to_string(), (ctx, rx));
             }
             Rig {
@@ -12644,12 +12700,26 @@ mod tests {
                 target: &str,
                 scope: Option<ScopeSelector>,
             ) -> String {
+                self.refusal_body(opener, target, scope).await["code"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            }
+
+            async fn refusal_body(
+                &mut self,
+                opener: Option<&str>,
+                target: &str,
+                scope: Option<ScopeSelector>,
+            ) -> Value {
                 let (ctx, _rx, frame) = self.open_frame(opener, target, scope);
-                let replies = self
-                    .handler
-                    .handle_control_frame(&ctx, frame)
-                    .await
-                    .unwrap();
+                let replies = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    self.handler.handle_control_frame(&ctx, frame),
+                )
+                .await
+                .expect("the open must be refused before waiting for a bind ack")
+                .unwrap();
                 assert_eq!(replies.len(), 1, "{replies:?}");
                 assert_eq!(replies[0].header.ty, FrameType::Error);
                 let (_, module_rx) = self.modules.get_mut(target).unwrap();
@@ -12657,10 +12727,8 @@ mod tests {
                     module_rx.try_recv().is_err(),
                     "a refused open relays nothing"
                 );
-                parse_error(&replies[0])["code"]
-                    .as_str()
-                    .unwrap()
-                    .to_string()
+                assert_eq!(self.forwarding.reserved_route_count().unwrap(), (0, 0));
+                parse_error(&replies[0])
             }
 
             /// Start an open and return its task and the bind the target got.
@@ -12968,6 +13036,123 @@ mod tests {
             assert!(!stamp.attributes.delegates);
             assert!(stamp.owner_authorized);
             let unscoped = rig.bound(Some(AFT), PLEXUS, None).await;
+            assert_eq!(unscoped.stamp(), None);
+        }
+
+        #[tokio::test]
+        async fn flow_scope_refuses_a_0_29_target_without_flow_capability_and_relays_nothing() {
+            let mut rig = rig_with_flow_support(false).await;
+            let mut record = session(1);
+            record.attributes.flow_id = Some("flow:7".to_string());
+            rig.sync(vec![record]).await;
+            for opener in [OWNER, AFT] {
+                let body = rig
+                    .refusal_body(Some(opener), PLEXUS, Some(rig_selector("s", Some(1))))
+                    .await;
+                assert_eq!(body["code"], "target_flow_unsupported");
+                let message = body["message"].as_str().unwrap();
+                for required in [PLEXUS, "flow-scopes/v1"] {
+                    assert!(message.contains(required), "{message}");
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn flow_scope_admits_a_capable_target_and_preserves_flow_id_on_bind() {
+            let mut rig = rig_with_flow_support(true).await;
+            let mut record = session(1);
+            record.attributes.flow_id = Some("flow:7".to_string());
+            rig.sync(vec![record]).await;
+            for opener in [OWNER, AFT] {
+                let route = rig
+                    .bound(Some(opener), PLEXUS, Some(rig_selector("s", Some(1))))
+                    .await;
+                assert!(rig.live(&route));
+                assert_eq!(
+                    route.stamp().unwrap().attributes.flow_id.as_deref(),
+                    Some("flow:7")
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn flow_scope_rechecks_the_relay_target_after_a_reconnect() {
+            use std::future::Future;
+
+            let mut rig = rig_with_flow_support(true).await;
+            let mut record = session(1);
+            record.attributes.flow_id = Some("flow:7".to_string());
+            rig.sync(vec![record]).await;
+            let (client, mut client_rx, frame) =
+                rig.open_frame(Some(AFT), PLEXUS, Some(rig_selector("s", Some(1))));
+            // Hold the route-open response permit so admission sees the first
+            // target but relay reservation cannot capture an endpoint yet.
+            for _ in 0..64 {
+                client.egress.try_send(route_bind_ack(1)).unwrap();
+            }
+            let handler = rig.handler.clone();
+            let mut open = Box::pin(handler.handle_control_frame(&client, frame));
+            std::future::poll_fn(|cx| {
+                assert!(open.as_mut().poll(cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            assert_eq!(rig.forwarding.reserved_route_count().unwrap(), (0, 0));
+
+            let old_connection = rig.modules[PLEXUS].0.connection_id;
+            rig.handler.cleanup_connection(old_connection).unwrap();
+            let (replacement, mut replacement_rx) = wide_ctx(200);
+            let hello = hello_frame(PLEXUS, PROTOCOL_VERSION, 200);
+            let mut body: Value = serde_json::from_slice(&hello.body).unwrap();
+            body["manifest"]["provenance"] = serde_json::json!({"wire_crate_version": "0.29.0"});
+            let hello = Frame::build(
+                FrameType::Hello,
+                control_flags(),
+                0,
+                0,
+                200,
+                serde_json::to_vec(&body).unwrap(),
+            )
+            .unwrap();
+            hello_via_sink(&rig.handler, &replacement, &mut replacement_rx, hello).await;
+
+            client_rx.try_recv().unwrap();
+            let replies = tokio::time::timeout(Duration::from_secs(2), open)
+                .await
+                .expect("the replacement is refused without waiting for a bind ack")
+                .unwrap();
+            assert_eq!(replies.len(), 1);
+            let body = parse_error(&replies[0]);
+            assert_eq!(body["code"], "target_flow_unsupported");
+            for required in [PLEXUS, "flow-scopes/v1"] {
+                assert!(body["message"].as_str().unwrap().contains(required));
+            }
+            assert!(replacement_rx.try_recv().is_err(), "no bind is relayed");
+            assert!(rig.modules.get_mut(PLEXUS).unwrap().1.try_recv().is_err());
+            assert_eq!(rig.forwarding.reserved_route_count().unwrap(), (0, 0));
+            assert!(rig
+                .handler
+                .registry
+                .get_module_by_connection(replacement.connection_id)
+                .unwrap()
+                .is_some());
+        }
+
+        #[tokio::test]
+        async fn scope_without_flow_id_and_unscoped_routes_admit_a_target_without_flow_capability()
+        {
+            let mut rig = rig_with_flow_support(false).await;
+            rig.sync(vec![session(1)]).await;
+            let route = rig
+                .bound(Some(AFT), PLEXUS, Some(rig_selector("s", Some(1))))
+                .await;
+            assert!(rig.live(&route));
+            assert_eq!(route.stamp().unwrap().attributes.flow_id, None);
+            let mut record = session(1);
+            record.attributes.flow_id = Some("flow:7".to_string());
+            rig.sync(vec![record]).await;
+            let unscoped = rig.bound(Some(AFT), OTHER, None).await;
+            assert!(rig.live(&unscoped));
             assert_eq!(unscoped.stamp(), None);
         }
 

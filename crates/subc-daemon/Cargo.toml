@@ -1,6 +1,6 @@
 [package]
 name = "subc-daemon"
-version = "0.31.0"
+version = "0.31.1"
 edition = "2021"
 publish = true
 description = "Embeddable subc daemon: bootstrap, module supervision, and opaque-byte splice routing."
@@ -25,7 +25,7 @@ sha2 = "0.10"
 subc-control = { path = "../subc-control", version = "0.28" }
 subc-jsonc = { path = "../subc-jsonc", version = "0.1.0" }
 subc-os = { path = "../subc-os", version = "0.1.3" }
-subc-protocol = { path = "../subc-protocol", version = "0.29.0" }
+subc-protocol = { path = "../subc-protocol", version = "0.29.1" }
 subc-transport = { path = "../subc-transport", version = "0.10" }
 subc-uptime = { path = "../subc-uptime", version = "0.1.0" }
 tokio = { version = "1", features = ["net", "rt-multi-thread", "macros", "io-util", "sync", "time", "process", "signal"] }

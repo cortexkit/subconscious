@@ -113,6 +113,11 @@ pub struct ScopeCarrier {
     pub targets: Option<Vec<String>>,
 }
 
+/// Declaring this in a manifest's `capabilities.provides` promises that the
+/// module recognises a scope carrying `flow_id` and applies flow behaviour:
+/// it never treats the flow as its owner agent.
+pub const FLOW_SCOPES_CAPABILITY: &str = "flow-scopes/v1";
+
 /// The attributes the daemon stamps without interpreting. They bear authority,
 /// so only an owner module named in the daemon config's `scope_authority_owners`
 /// list (by default the module that owns agent sessions) may set them; a scope
@@ -137,6 +142,9 @@ pub struct ScopeAttributes {
     /// compare to notice a change), and every route under the scope is closed
     /// with the reason `scope_delegation_changed`, so no live route keeps the
     /// old identity.
+    /// A target must provide [`FLOW_SCOPES_CAPABILITY`] before the daemon may
+    /// send a bind stamped with this field. Decoding it alone is not enough:
+    /// the target must also apply flow behaviour instead of agent behaviour.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub flow_id: Option<String>,
 }

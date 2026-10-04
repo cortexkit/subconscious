@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.29.1
+
+- Add `scope::FLOW_SCOPES_CAPABILITY` (`flow-scopes/v1`). A module that declares it in `capabilities.provides` promises to recognise a scope carrying `flow_id` and to apply flow behaviour, never owner-agent behaviour. Add the terminal route-open code `target_flow_unsupported`; the shared retry predicate and the golden decision table classify it as terminal. Additive: no existing type changes.
+
 ## 0.29.0
 
 - Breaking for Rust struct literals: `ToolCallRequest` gains optional `preset`, and `ScopeAttributes` gains optional `flow_id`. Both are omitted when absent, leaving existing absent-field wire bytes unchanged; `ScopeAttributes` still refuses unknown fields.

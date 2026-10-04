@@ -211,6 +211,16 @@ in section 5a):
 - `scope_ended`: the named `scope_epoch` does not match the live record. Terminal.
 - `scope_not_carrier`: the opener is neither the owner nor a listed carrier, or it is a targeted
   carrier and the target module is not in its list. Terminal.
+- `target_flow_unsupported`: the scope carries `flow_id`, but the target's
+  registered manifest does not provide `flow-scopes/v1` in `capabilities.provides`.
+  Terminal. Declaring this capability promises that the module recognises the
+  field and applies flow behaviour: it never treats a flow as its owner agent
+  for approvals, writes or grants. A protocol-version declaration alone does not
+  make that promise. The refusal names the target and the capability; nothing
+  is sent to the module and no bind is relayed. Never remove `flow_id` to
+  accommodate an unsupported target: that would make the flow look like its
+  owner's ordinary session. Scopes without `flow_id` and unscoped routes keep
+  their existing admission.
 
 There is no relay class: a module that must present a scope onward is listed as a carrier. A carrier
 route lives until the carrier closes it or the scope ends or changes as in section 3.
@@ -289,6 +299,7 @@ caller may re-open within its own deadline.
 | `scope_ended` | `route.open`, admission or commit | the named epoch is not the live one, or the scope ended | no |
 | `scope_epoch_required` | `route.open` | the open named no epoch | no |
 | `scope_not_carrier` | `route.open` | the opener is not the owner or a carrier, or not targeted at this module | no |
+| `target_flow_unsupported` | `route.open`, before bind relay | a flow scope's target does not provide `flow-scopes/v1` | no |
 | `scope_unsupported` | carrier, before opening | the daemon does not advertise `scopes/v1` | no |
 | `scope_sync_not_authority` | `scope.sync` | the connection is not the owner's sync authority | no |
 | `scope_sync_stale` | `scope.sync` | the generation is not larger than the last accepted | no |

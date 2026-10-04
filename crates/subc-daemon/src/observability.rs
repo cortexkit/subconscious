@@ -24,6 +24,7 @@ const ROUTE_OPEN_REFUSAL_COUNTER_CODES: &[&str] = &[
     ROUTE_OPEN_REFUSED_DECLARED_NOT_READY,
     ROUTE_OPEN_REFUSED_REQUIRED_CAPABILITY_UNPROVIDED,
     "target_unavailable",
+    subc_protocol::error_codes::TARGET_FLOW_UNSUPPORTED,
     "module_removed",
     "module_no_protocol",
     "unknown_module",

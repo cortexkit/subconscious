@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.31.1
+
+- Refuse a flow-scoped `route.open` before relaying any bind unless the target's registered manifest provides `flow-scopes/v1` in `capabilities.provides`. The refusal is terminal `target_flow_unsupported` and names the target and the capability. The check runs at admission and again against the connection the relay actually captured, so a replacement module cannot inherit its predecessor's declaration. The daemon never strips `flow_id`. Scopes without `flow_id` and unscoped routes are unaffected.
+
 ## 0.31.0
 
 - Takes subc-protocol 0.29.0 and the matching control/transport minor releases: `ToolCallRequest.preset` and `ScopeAttributes.flow_id` are optional wire fields, but this release is breaking for Rust struct literals. Tool-call bodies, including presets, remain opaque to the daemon.

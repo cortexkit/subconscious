@@ -86,6 +86,10 @@ final class ContractTablesTests: XCTestCase {
         decoder.keyDecodingStrategy = .convertFromSnakeCase
         let tables = try decoder.decode(DecisionTables.self, from: data)
 
+        // Route opens fail immediately in Swift, including a target that does
+        // not promise flow behaviour. Keep this terminal code in the wire record.
+        XCTAssertEqual(tables.routeOpenRetryable["target_flow_unsupported"], "terminal")
+
         XCTAssertFalse(
             tables.routeOpenRetryable.isEmpty,
             "route_open_retryable decision table must not be empty"

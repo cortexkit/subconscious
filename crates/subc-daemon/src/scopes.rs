@@ -23,10 +23,11 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 use subc_protocol::{
     error_codes,
+    manifest::CapabilityDeclarations,
     scope::{
         ParentState, ScopeEnded, ScopeParent, ScopeRecord, ScopeRecordOutcome, ScopeRecordResult,
-        ScopeSelector, ScopeStamp, ScopeStatus, MAX_CARRIER_TARGETS, MAX_LIVE_SCOPES_PER_OWNER,
-        MAX_SCOPE_ATTRIBUTE_BYTES, MAX_SCOPE_TOMBSTONES_PER_OWNER,
+        ScopeSelector, ScopeStamp, ScopeStatus, FLOW_SCOPES_CAPABILITY, MAX_CARRIER_TARGETS,
+        MAX_LIVE_SCOPES_PER_OWNER, MAX_SCOPE_ATTRIBUTE_BYTES, MAX_SCOPE_TOMBSTONES_PER_OWNER,
     },
     Principal, RouteCloseReason,
 };
@@ -243,6 +244,36 @@ pub(crate) struct ScopeAdmission {
     pub(crate) owner: String,
     pub(crate) stamp: ScopeStamp,
     pub(crate) tag: ScopeTag,
+}
+
+/// Refuse before relaying a flow bind unless the target promises flow
+/// behaviour. Decoding the stamp does not prove correct handling of approvals,
+/// writes or grants. Never strip the field: without it a flow could run as
+/// its owner's ordinary session.
+pub(crate) fn check_target_flow_support(
+    stamp: &ScopeStamp,
+    target_module: &str,
+    capabilities: Option<&CapabilityDeclarations>,
+) -> Result<(), ScopeAdmissionRefusal> {
+    if stamp.attributes.flow_id.is_none() {
+        return Ok(());
+    }
+    let supported = capabilities.is_some_and(|capabilities| {
+        capabilities
+            .provides
+            .iter()
+            .any(|capability| capability == FLOW_SCOPES_CAPABILITY)
+    });
+    if supported {
+        return Ok(());
+    }
+    Err(ScopeAdmissionRefusal {
+        code: error_codes::TARGET_FLOW_UNSUPPORTED,
+        message: format!(
+            "target module '{target_module}' does not provide capability \
+             '{FLOW_SCOPES_CAPABILITY}', required for a scope carrying flow_id"
+        ),
+    })
 }
 
 /// A refused scoped open: a code from `error_codes` and why.

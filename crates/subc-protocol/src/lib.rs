@@ -70,6 +70,10 @@ pub mod error_codes {
     pub const MODULE_RELOADING: &str = "module_reloading";
     pub const MODULE_WARMING: &str = "module_warming";
     pub const TARGET_UNAVAILABLE: &str = "target_unavailable";
+    /// A flow-scoped route targets a module that does not provide
+    /// `flow-scopes/v1`. TERMINAL: decoding `flow_id` alone does not promise
+    /// flow behaviour, and removing it would silently change the identity.
+    pub const TARGET_FLOW_UNSUPPORTED: &str = "target_flow_unsupported";
     pub const MODULE_TIMEOUT: &str = "module_timeout";
     /// The target module is declared as speaking no subc wire protocol
     /// (`protocol: "none"` in daemon config), so it has no control lane and can
@@ -176,6 +180,9 @@ pub mod error_codes {
     /// that races an unsupervised module's HELLO owns its own retry; retrying
     /// in place only papers over that race for one narrow window.
     pub fn is_retryable_route_open(code: &str) -> bool {
+        if code == TARGET_FLOW_UNSUPPORTED {
+            return false;
+        }
         matches!(
             code,
             MODULE_RELOADING

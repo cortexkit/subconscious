@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.20.55
+
+- Take subc-daemon 0.31.1: flow-scoped opens to a module that does not declare `flow-scopes/v1` are refused with terminal `target_flow_unsupported`.
+
 ## 0.20.54
 
 - Updates the daemon and wire dependency cascade for subc-protocol 0.29.0 (`ToolCallRequest.preset` and `ScopeAttributes.flow_id`), a release breaking for Rust struct literals. Absent-field wire bytes remain unchanged.

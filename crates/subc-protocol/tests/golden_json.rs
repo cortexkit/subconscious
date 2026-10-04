@@ -841,6 +841,13 @@ fn route_open_retry_predicate_matches_the_decision_table() {
 }
 
 #[test]
+fn target_flow_unsupported_is_terminal_in_the_shared_retry_predicate() {
+    assert!(!error_codes::is_retryable_route_open(
+        "target_flow_unsupported"
+    ));
+}
+
+#[test]
 fn established_route_dead_predicate_matches_the_decision_table() {
     let table: Value =
         serde_json::from_str(&fs::read_to_string(golden_path("decision_tables")).unwrap()).unwrap();

@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Classify `target_flow_unsupported` as a terminal route-open refusal, matching the golden decision table in subc-protocol 0.29.1. A target must declare `flow-scopes/v1` before it may receive a flow-scoped route.
+
 ## 0.20.1
 
 - Queue unary and managed REQUEST frames before attaching cancellation signals so an already-aborted signal cannot send CANCEL before its REQUEST.

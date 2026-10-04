@@ -107,6 +107,7 @@ fn daemon_route_open_error_codes_are_complete_in_decision_tables() {
         subc_protocol::error_codes::MODULE_RELOADING,
         subc_protocol::error_codes::MODULE_WARMING,
         subc_protocol::error_codes::TARGET_UNAVAILABLE,
+        subc_protocol::error_codes::TARGET_FLOW_UNSUPPORTED,
         subc_protocol::error_codes::MODULE_TIMEOUT,
     ];
     for code in protocol_codes {
@@ -137,6 +138,7 @@ fn daemon_route_open_error_codes_are_complete_in_decision_tables() {
         "scope_not_live",
         "scope_not_synced",
         "target_unavailable",
+        "target_flow_unsupported",
         "unknown_module",
     ];
     for code in daemon_refusal_codes {

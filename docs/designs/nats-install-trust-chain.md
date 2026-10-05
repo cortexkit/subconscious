@@ -152,11 +152,20 @@ changes), and each boot signs one new sys user and box users as they are issued.
 path.
 
 - `<nats dir>/operator.jwt`: the root-signed operator JWT.
-- `<nats dir>/server.conf`: loopback `listen`; `jetstream { store_dir: "<nats dir>/js" }`;
+- `<nats dir>/server.conf`: `listen: "127.0.0.1:<port>"` (client `--port`, default 14222);
+  `http: "127.0.0.1:<monitor_port>"` (`--monitor-port`, default 18222);
+  `max_control_line: 65536`; `jetstream { store_dir: "<nats dir>/js" }`;
   `operator: "<nats dir>/operator.jwt"`; `system_account: "<SYS id>"`;
   `resolver { type: full, dir: "<nats dir>/jwt", allow_delete: false }`;
-  `resolver_preload { <SYS id>: "<system account JWT>" }`; and the TLS block the foundation
-  requires (see 6.10).
+  `resolver_preload { <SYS id>: "<system account JWT>" }`. Both listeners always bind
+  IPv4 loopback, never a wildcard or IPv6 host; the two ports must differ. There is no
+  local TLS block (see 6.10).
+  The HTTP listener exists for the daemon's plain `/healthz` readiness probe (200 when
+  ready, 503 during storage recovery). NATS monitoring also exposes server, connection,
+  account and JetStream statistics without authentication: any local process can read
+  them under the existing local trust model. `install-apply` prints `health_url`, e.g.
+  `http://127.0.0.1:18222/healthz`, for a `protocol: "none"` module's
+  `health: { http: "<health_url>", cadence_ms, deadline_ms }` in `subc.jsonc`.
 - `<nats dir>/jwt/`: created empty. The server stores the preload there at start (N4),
   and runtime pushes land there too. After creating it, setup never writes, rewrites or
   deletes anything inside it.
@@ -164,6 +173,24 @@ path.
   sysaccount key's public halves (proposed; 6.8 covers where they come from).
 - An input for ck-bus: the path of `operator.jwt` (the source of the system account id and
   the signer public keys), the server URL and the TLS pin. See 6.5.
+
+`install-plan` records JWT signing inputs, not listener ports. Normal `install-apply`
+chooses the ports from flags/defaults, verifies supplied or stored JWTs, and atomically
+rewrites **both** `operator.jwt` and `server.conf`, even when the JWT bytes are kept.
+It does not regenerate keys or the system account id, and creates `jwt/` only if absent;
+it never rewrites existing resolver contents. Supplying new signatures can replace JWTs.
+
+For a monitoring-only upgrade of an existing rendered configuration, run
+`ck-bus install-apply --conf-only --nats-dir "<nats dir>" [--monitor-port <port>]`.
+The existing `server.conf` is the recorded configuration: its install-apply header and
+IPv4-loopback `listen` value are required; hand-written configurations are refused.
+Only the `http` line changes, inserted directly after `listen` if absent. An identical
+value leaves the file and its mtime untouched (`status: "unchanged"`); a different
+existing port is replaced only with an explicit `--monitor-port`. A non-loopback
+existing `http` value is always refused. The atomic replacement keeps the file's mode
+and touches no other install files. This path requires no keys or signatures and also
+prints `health_url`. Restart the supervised nats-server to activate a changed listener;
+the command neither restarts it nor edits `subc.jsonc`.
 
 No seed is written: the four roots' private halves never leave the vault; the system
 account identity seed exists only in setup's memory and is dropped after its public half

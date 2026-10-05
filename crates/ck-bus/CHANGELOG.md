@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.4
+
+- `install-apply` enables loopback-only NATS HTTP monitoring (`--monitor-port`, default 18222), refuses a collision with the client port, and reports the plain `/healthz` URL for daemon health probes. `--conf-only` upgrades the monitoring line in an existing rendered `server.conf` without rewriting JWTs, keys or resolver data, preserving its mode and leaving identical configurations untouched.
+
 ## 0.3.3
 
 - Updates the SDK, daemon and wire dependency cascade for subc-protocol 0.29.0 (`ToolCallRequest.preset` and `ScopeAttributes.flow_id`), a release breaking for Rust struct literals. No other behavior change.

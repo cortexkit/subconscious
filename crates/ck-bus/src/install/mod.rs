@@ -8,7 +8,9 @@
 //!   build, it prints "no ceremony needed" and writes nothing.
 //! - `ck-bus install-apply` verifies the root's signatures and writes `operator.jwt`,
 //!   `server.conf` and an empty resolver directory, then prints ck-bus's three
-//!   environment values.
+//!   environment values and the daemon health URL. Re-applying keeps stored JWT bytes
+//!   when no signatures are supplied, but still replaces both files. `--conf-only`
+//!   upgrades only the monitoring line in an existing rendered `server.conf`.
 //!
 //! Both run without `SUBC_MODULE_ID` and never reach the daemon or the vault. `ck setup`
 //! drives them. Output is one JSON object on stdout; a refusal is one line on stderr and
@@ -43,6 +45,9 @@ use payload::{Payload, PinnedKeys};
 /// ephemeral range (Linux 32768+, macOS and Windows 49152+), so an outgoing connection
 /// cannot be holding it when the server starts.
 pub const DEFAULT_PORT: u16 = 14222;
+
+/// The loopback HTTP monitoring port for the daemon's health probe.
+pub const DEFAULT_MONITOR_PORT: u16 = 18222;
 
 const SYSTEM_ACCOUNT_FILE: &str = "system_account";
 const OPERATOR_JWT_FILE: &str = "operator.jwt";
@@ -83,13 +88,16 @@ impl Flags {
             let name = flag
                 .strip_prefix("--")
                 .ok_or_else(|| format!("unexpected argument {flag:?}"))?;
-            let value = iter
-                .next()
-                .ok_or_else(|| format!("--{name} needs a value"))?;
             if pairs.iter().any(|(seen, _)| seen == name) {
                 return Err(format!("--{name} given twice"));
             }
-            pairs.push((name.to_string(), value.clone()));
+            let value = if name == "conf-only" {
+                ""
+            } else {
+                iter.next()
+                    .ok_or_else(|| format!("--{name} needs a value"))?
+            };
+            pairs.push((name.to_string(), value.to_string()));
         }
         Ok(Self(pairs))
     }
@@ -120,6 +128,17 @@ impl Flags {
     fn nats_dir(&self) -> Result<PathBuf, String> {
         let dir = self.required("nats-dir")?;
         std::path::absolute(dir).map_err(|error| format!("--nats-dir {dir}: {error}"))
+    }
+
+    fn port(&self, name: &str, default: u16) -> Result<u16, String> {
+        match self.optional(name) {
+            None => Ok(default),
+            Some(port) => port
+                .parse::<u16>()
+                .ok()
+                .filter(|port| *port != 0)
+                .ok_or_else(|| format!("--{name} {port} is not a port between 1 and 65535")),
+        }
     }
 }
 
@@ -156,6 +175,14 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// Writes `content` to `path` through a temporary file in the same directory and a
 /// rename, so a reader never sees a partial file.
 fn write_atomic(path: &Path, content: &[u8]) -> Result<(), String> {
+    write_atomic_with_permissions(path, content, None)
+}
+
+fn write_atomic_with_permissions(
+    path: &Path,
+    content: &[u8],
+    permissions: Option<fs::Permissions>,
+) -> Result<(), String> {
     let dir = path.parent().ok_or("a written path has a parent")?;
     let name = path
         .file_name()
@@ -164,6 +191,9 @@ fn write_atomic(path: &Path, content: &[u8]) -> Result<(), String> {
     let temp = dir.join(format!(".{name}.tmp-{}", std::process::id()));
     let result = (|| {
         let mut file = fs::File::create(&temp)?;
+        if let Some(permissions) = permissions {
+            file.set_permissions(permissions)?;
+        }
         file.write_all(content)?;
         file.sync_all()?;
         fs::rename(&temp, path)
@@ -380,6 +410,9 @@ fn signed_or_stored(
 }
 
 fn apply(flags: &Flags) -> Result<Value, String> {
+    if flags.optional("conf-only").is_some() {
+        return apply_conf_only(flags);
+    }
     flags.only(&[
         "nats-dir",
         "root-pub",
@@ -388,17 +421,13 @@ fn apply(flags: &Flags) -> Result<Value, String> {
         "sysaccount-input",
         "sysaccount-sig",
         "port",
+        "monitor-port",
     ])?;
     let nats_dir = flags.nats_dir()?;
     let root = public_key_hex(flags, "root-pub", NkeyRole::Operator)?;
-    let port = match flags.optional("port") {
-        None => DEFAULT_PORT,
-        Some(port) => port
-            .parse::<u16>()
-            .ok()
-            .filter(|port| *port != 0)
-            .ok_or_else(|| format!("--port {port} is not a port between 1 and 65535"))?,
-    };
+    let port = flags.port("port", DEFAULT_PORT)?;
+    let monitor_port = flags.port("monitor-port", DEFAULT_MONITOR_PORT)?;
+    conf::check_ports(port, monitor_port)?;
 
     // Every check comes before the first write.
     let operator = signed_from_flags(
@@ -450,6 +479,7 @@ fn apply(flags: &Flags) -> Result<Value, String> {
     let jwt_dir = nats_dir.join(JWT_DIR);
     let server_conf = ServerConf {
         port,
+        monitor_port,
         js_dir: &nats_dir.join(JS_DIR),
         operator_jwt: &operator_path,
         jwt_dir: &jwt_dir,
@@ -482,10 +512,40 @@ fn apply(flags: &Flags) -> Result<Value, String> {
     Ok(json!({
         "status": "applied",
         "server_conf": conf_path.display().to_string(),
+        "health_url": conf::health_url(monitor_port),
         "env": {
             NATS_URL_ENV: url,
             OPERATOR_JWT_ENV: operator_path.display().to_string(),
             SYSTEM_ACCOUNT_ENV: system_account,
         },
+    }))
+}
+
+/// The rendered server.conf is the recorded configuration: install-plan records only
+/// signing inputs, not listener ports. Preserve every byte outside the monitoring line
+/// and never load or replace operator.jwt, system_account, ceremony inputs or jwt/.
+fn apply_conf_only(flags: &Flags) -> Result<Value, String> {
+    flags.only(&["nats-dir", "conf-only", "monitor-port"])?;
+    let conf_path = flags.nats_dir()?.join(SERVER_CONF_FILE);
+    let monitor_port = flags.port("monitor-port", DEFAULT_MONITOR_PORT)?;
+    let original = fs::read_to_string(&conf_path)
+        .map_err(|error| format!("read {}: {error}", conf_path.display()))?;
+    let updated = conf::with_monitoring(
+        &original,
+        monitor_port,
+        flags.optional("monitor-port").is_some(),
+    )
+    .map_err(|error| format!("{}: {error}", conf_path.display()))?;
+    let changed = original != updated;
+    if changed {
+        let mode = fs::metadata(&conf_path)
+            .map_err(|error| format!("stat {}: {error}", conf_path.display()))?
+            .permissions();
+        write_atomic_with_permissions(&conf_path, updated.as_bytes(), Some(mode))?;
+    }
+    Ok(json!({
+        "status": if changed { "applied" } else { "unchanged" },
+        "server_conf": conf_path.display().to_string(),
+        "health_url": conf::health_url(monitor_port),
     }))
 }

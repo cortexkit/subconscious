@@ -374,6 +374,12 @@ impl Server {
         let child = Command::new(&self.bin)
             .arg("-c")
             .arg(&self.conf)
+            .env("XDG_DATA_HOME", self.conf.parent().unwrap().join("data"))
+            .env("XDG_RUNTIME_DIR", self.conf.parent().unwrap().join("run"))
+            .env(
+                "XDG_CONFIG_HOME",
+                self.conf.parent().unwrap().join("config"),
+            )
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .kill_on_drop(true)

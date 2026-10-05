@@ -586,6 +586,27 @@ Credentials (design D; foundation amendment `48c83a68e`, `0eb12229f`, `b9e827c69
   "SUBC's installer calling CKCRED", which the amendment's ceremony does not cover). In
   acceptance the harness writes the config from the fixture roots. The resolver runs
   with deletion disabled, per the foundation.
+- `server.conf` contains `listen: "127.0.0.1:<port>"` (`install-apply --port`, default
+  14222), `http: "127.0.0.1:<monitor_port>"` (`--monitor-port`, default 18222),
+  `max_control_line: 65536`, the JetStream store directory, operator JWT path, system
+  account id, full directory resolver with `allow_delete: false`, and system account
+  JWT preload. Both ports must differ and both hosts are always IPv4 loopback. The
+  HTTP listener serves the daemon's plain `/healthz` probe and NATS server, connection,
+  account and JetStream statistics. It has no authentication: any local process can
+  read it under the existing local trust model, but it must never bind a wildcard or
+  non-loopback interface. Apply output includes `health_url` for the supervised
+  `protocol: "none"` module's `health.http` in `subc.jsonc`.
+  Normal re-apply verifies/reuses stored JWTs when no signatures are supplied, but
+  still rewrites `operator.jwt` as well as `server.conf`; it does not generate keys or
+  touch existing resolver files. `install-plan` records signing inputs, not ports.
+  `install-apply --conf-only --nats-dir <dir> [--monitor-port <port>]` uses the existing
+  rendered config as the record and changes only its monitoring line, preserving
+  every other byte and the file mode. It refuses a missing install-apply header,
+  a non-IPv4-loopback client or monitor listener, and an equal client/monitor port.
+  An existing identical monitor port is a no-op, including mtime; a different one
+  requires an explicit flag. Both apply paths print the health URL. The operator
+  restarts the supervised server to activate the listener; neither path edits the
+  daemon declaration.
 - The local listener is plaintext `nats://` on `127.0.0.1`, with no certificate and no
   pin. A client authenticates with its vault-signed user JWT and its signature over the
   server's connect nonce, which ck-bus makes for it. TLS on loopback would add nothing

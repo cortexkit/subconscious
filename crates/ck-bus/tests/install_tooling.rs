@@ -51,9 +51,13 @@ struct Output {
 }
 
 fn ck_bus(args: &[&str]) -> Output {
+    let homes = tempfile::tempdir().unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_ck-bus"))
         .args(args)
         .env_remove("SUBC_MODULE_ID")
+        .env("XDG_DATA_HOME", homes.path().join("data"))
+        .env("XDG_RUNTIME_DIR", homes.path().join("run"))
+        .env("XDG_CONFIG_HOME", homes.path().join("config"))
         .stdin(Stdio::null())
         .output()
         .expect("run ck-bus");
@@ -81,6 +85,21 @@ fn snapshot(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
         }
     }
     files
+}
+
+/// Atomic rewrites can preserve bytes while still touching a JWT. Record other files'
+/// mtimes as well, so the monitoring-only arm proves it leaves them alone.
+fn other_file_mtimes(root: &Path) -> BTreeMap<PathBuf, SystemTime> {
+    snapshot(root)
+        .into_keys()
+        .filter(|path| path != Path::new("nats/server.conf"))
+        .filter_map(|path| {
+            let metadata = std::fs::metadata(root.join(&path)).unwrap();
+            metadata
+                .is_file()
+                .then(|| (path, metadata.modified().unwrap()))
+        })
+        .collect()
 }
 
 impl Fixture {
@@ -125,6 +144,16 @@ impl Fixture {
     }
 
     fn apply(&self, operator: (&str, &str), sysaccount: (&str, &str), port: u16) -> Output {
+        self.apply_with_ports(operator, sysaccount, port, 18222)
+    }
+
+    fn apply_with_ports(
+        &self,
+        operator: (&str, &str),
+        sysaccount: (&str, &str),
+        port: u16,
+        monitor_port: u16,
+    ) -> Output {
         let nats = self.nats_dir();
         ck_bus(&[
             "install-apply",
@@ -142,19 +171,26 @@ impl Fixture {
             sysaccount.1,
             "--port",
             &port.to_string(),
+            "--monitor-port",
+            &monitor_port.to_string(),
         ])
     }
 
     /// Plans, has the root sign both payloads, and applies. Returns the apply output.
     fn install(&self, port: u16) -> Value {
+        self.install_with_ports(port, 18222)
+    }
+
+    fn install_with_ports(&self, port: u16, monitor_port: u16) -> Value {
         let plan = self.plan_ok();
         let (operator, sysaccount) = payload_paths(&plan);
         let operator_sig = self.sign_file(&self.root, &operator);
         let sysaccount_sig = self.sign_file(&self.root, &sysaccount);
-        let output = self.apply(
+        let output = self.apply_with_ports(
             (&operator, &operator_sig),
             (&sysaccount, &sysaccount_sig),
             port,
+            monitor_port,
         );
         assert!(output.ok, "install-apply refused: {}", output.stderr);
         output.json
@@ -238,12 +274,21 @@ async fn planned_and_applied_config_starts_nats_and_a_system_user_reaches_sys() 
         return;
     };
     let fixture = Fixture::new();
-    let port = free_port();
-    let applied = fixture.install(port);
+    // Hold both allocations together so the client and monitor ports cannot coincide.
+    let client_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let monitor_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = client_listener.local_addr().unwrap().port();
+    let monitor_port = monitor_listener.local_addr().unwrap().port();
+    drop((client_listener, monitor_listener));
+    let applied = fixture.install_with_ports(port, monitor_port);
     let env = &applied["env"];
     let url = env["CKBUS_NATS_URL"].as_str().unwrap();
     let system_account = env["CKBUS_SYSTEM_ACCOUNT"].as_str().unwrap().to_string();
     assert_eq!(url, format!("nats://127.0.0.1:{port}"));
+    assert_eq!(
+        applied["health_url"],
+        format!("http://127.0.0.1:{monitor_port}/healthz")
+    );
     assert_eq!(
         env["CKBUS_OPERATOR_JWT"],
         fixture
@@ -257,6 +302,9 @@ async fn planned_and_applied_config_starts_nats_and_a_system_user_reaches_sys() 
     let mut child = tokio::process::Command::new(&bin)
         .arg("-c")
         .arg(applied["server_conf"].as_str().unwrap())
+        .env("XDG_DATA_HOME", fixture.dir.path().join("data"))
+        .env("XDG_RUNTIME_DIR", fixture.dir.path().join("run"))
+        .env("XDG_CONFIG_HOME", fixture.dir.path().join("config"))
         .stdout(Stdio::null())
         .stderr(std::fs::File::create(&log).unwrap())
         .kill_on_drop(true)
@@ -279,6 +327,27 @@ async fn planned_and_applied_config_starts_nats_and_a_system_user_reaches_sys() 
             }
         }
     };
+    // Probe the reported plain URL, not a synthesized readiness substitute.
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let health_url = applied["health_url"].as_str().unwrap();
+    let (authority, path) = health_url
+        .strip_prefix("http://")
+        .unwrap()
+        .split_once('/')
+        .unwrap();
+    let mut http = tokio::net::TcpStream::connect(authority).await.unwrap();
+    http.write_all(format!("GET /{path} HTTP/1.0\r\nHost: {authority}\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    let mut response = String::new();
+    tokio::time::timeout(Duration::from_secs(2), http.read_to_string(&mut response))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        response.starts_with("HTTP/1.0 200") || response.starts_with("HTTP/1.1 200"),
+        "{response}"
+    );
     // Only a system account user is served the claims lookup, and the answer is the
     // root-signed system account JWT the server stored from the preload.
     let reply = client
@@ -555,4 +624,229 @@ fn install_commands_run_without_a_module_id_and_refuse_bad_keys() {
     assert!(!output.ok);
     assert!(output.stderr.contains("--root-pub"), "{}", output.stderr);
     assert!(!nats.exists(), "a refused plan creates nothing");
+}
+
+#[test]
+fn apply_reports_the_chosen_monitoring_health_url_and_defaults() {
+    let fixture = Fixture::new();
+    let applied = fixture.install_with_ports(14223, 19223);
+    assert_eq!(applied["health_url"], "http://127.0.0.1:19223/healthz");
+    let conf = std::fs::read_to_string(fixture.nats_dir().join("server.conf")).unwrap();
+    assert!(conf.contains("http: \"127.0.0.1:19223\"\n"), "{conf}");
+
+    // Without either flag, normal apply follows the client and monitor defaults.
+    let nats = fixture.nats_dir();
+    let output = ck_bus(&[
+        "install-apply",
+        "--nats-dir",
+        nats.to_str().unwrap(),
+        "--root-pub",
+        &raw_hex(&fixture.root),
+    ]);
+    assert!(output.ok, "{}", output.stderr);
+    assert_eq!(
+        output.json["env"]["CKBUS_NATS_URL"],
+        "nats://127.0.0.1:14222"
+    );
+    assert_eq!(output.json["health_url"], "http://127.0.0.1:18222/healthz");
+    let conf = std::fs::read_to_string(nats.join("server.conf")).unwrap();
+    assert!(conf.contains("http: \"127.0.0.1:18222\"\n"), "{conf}");
+}
+
+#[test]
+fn apply_refuses_equal_client_and_monitor_ports_and_writes_nothing() {
+    let fixture = Fixture::new();
+    let plan = fixture.plan_ok();
+    let (operator, sysaccount) = payload_paths(&plan);
+    let before = snapshot(fixture.dir.path());
+    let output = fixture.apply_with_ports(
+        (&operator, &fixture.sign_file(&fixture.root, &operator)),
+        (&sysaccount, &fixture.sign_file(&fixture.root, &sysaccount)),
+        14222,
+        14222,
+    );
+    assert!(!output.ok);
+    assert!(
+        output.stderr.contains("monitor port must differ"),
+        "{}",
+        output.stderr
+    );
+    assert_eq!(snapshot(fixture.dir.path()), before);
+}
+
+fn conf_only(fixture: &Fixture, extra: &[&str]) -> Output {
+    let nats = fixture.nats_dir();
+    let mut args = vec![
+        "install-apply",
+        "--conf-only",
+        "--nats-dir",
+        nats.to_str().unwrap(),
+    ];
+    args.extend_from_slice(extra);
+    ck_bus(&args)
+}
+
+#[test]
+fn conf_only_adds_only_monitoring_and_matches_fresh_apply() {
+    let fixture = Fixture::new();
+    fixture.install_with_ports(15222, 18222);
+    let nats = fixture.nats_dir();
+    let conf_path = nats.join("server.conf");
+    let fresh = std::fs::read_to_string(&conf_path).unwrap();
+    let legacy = fresh.replace("http: \"127.0.0.1:18222\"\n", "");
+    assert_ne!(legacy, fresh, "the legacy fixture lacks monitoring");
+    std::fs::write(&conf_path, &legacy).unwrap();
+    std::fs::write(nats.join("jwt/box.jwt"), "resolver-owned claims").unwrap();
+    std::fs::create_dir_all(nats.join("js/stream/snapshots")).unwrap();
+    std::fs::write(
+        nats.join("js/stream/snapshots/data"),
+        b"stored messages\x00",
+    )
+    .unwrap();
+    std::fs::write(nats.join("ceremony/root.pub"), raw_hex(&fixture.root)).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&conf_path, std::fs::Permissions::from_mode(0o640)).unwrap();
+    }
+    let mut before = snapshot(fixture.dir.path());
+    let other_mtimes = other_file_mtimes(fixture.dir.path());
+    assert_eq!(
+        before.remove(Path::new("nats/server.conf")).unwrap(),
+        legacy.as_bytes()
+    );
+    let output = conf_only(&fixture, &[]);
+    assert!(output.ok, "{}", output.stderr);
+    assert_eq!(output.json["status"], "applied");
+    assert_eq!(output.json["health_url"], "http://127.0.0.1:18222/healthz");
+    let mut after = snapshot(fixture.dir.path());
+    assert_eq!(
+        after.remove(Path::new("nats/server.conf")).unwrap(),
+        fresh.as_bytes()
+    );
+    assert_eq!(after, before, "every other file and directory is unchanged");
+    assert_eq!(other_file_mtimes(fixture.dir.path()), other_mtimes);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_eq!(
+            std::fs::metadata(&conf_path).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+    }
+
+    let before = snapshot(fixture.dir.path());
+    let modified = std::fs::metadata(&conf_path).unwrap().modified().unwrap();
+    let output = conf_only(&fixture, &[]);
+    assert!(output.ok, "{}", output.stderr);
+    assert_eq!(output.json["status"], "unchanged");
+    assert_eq!(snapshot(fixture.dir.path()), before);
+    assert_eq!(
+        std::fs::metadata(&conf_path).unwrap().modified().unwrap(),
+        modified
+    );
+}
+
+#[test]
+fn conf_only_replaces_only_an_explicit_monitor_port_and_identical_is_untouched() {
+    let fixture = Fixture::new();
+    fixture.install_with_ports(15222, 19222);
+    let conf_path = fixture.nats_dir().join("server.conf");
+    let old = std::fs::read_to_string(&conf_path).unwrap();
+    let mut before = snapshot(fixture.dir.path());
+    let output = conf_only(&fixture, &[]);
+    assert!(
+        !output.ok,
+        "implicit default must not replace an existing port"
+    );
+    assert!(
+        output.stderr.contains("pass --monitor-port explicitly"),
+        "{}",
+        output.stderr
+    );
+    assert!(
+        output.stderr.contains(conf_path.to_str().unwrap()),
+        "{}",
+        output.stderr
+    );
+    assert_eq!(snapshot(fixture.dir.path()), before);
+
+    let modified = std::fs::metadata(&conf_path).unwrap().modified().unwrap();
+    let output = conf_only(&fixture, &["--monitor-port", "19222"]);
+    assert!(output.ok, "{}", output.stderr);
+    assert_eq!(output.json["status"], "unchanged");
+    assert_eq!(output.json["health_url"], "http://127.0.0.1:19222/healthz");
+    assert_eq!(snapshot(fixture.dir.path()), before);
+    assert_eq!(
+        std::fs::metadata(&conf_path).unwrap().modified().unwrap(),
+        modified
+    );
+
+    let output = conf_only(&fixture, &["--monitor-port", "18222"]);
+    assert!(output.ok, "{}", output.stderr);
+    assert_eq!(output.json["health_url"], "http://127.0.0.1:18222/healthz");
+    let mut after = snapshot(fixture.dir.path());
+    before.remove(Path::new("nats/server.conf")).unwrap();
+    assert_eq!(
+        after.remove(Path::new("nats/server.conf")).unwrap(),
+        old.replace("http: \"127.0.0.1:19222\"\n", "http: \"127.0.0.1:18222\"\n")
+            .as_bytes()
+    );
+    assert_eq!(after, before);
+}
+
+#[test]
+fn conf_only_refuses_handwritten_non_loopback_ambiguous_and_equal_ports_without_writes() {
+    let fixture = Fixture::new();
+    fixture.install_with_ports(15222, 18222);
+    let conf_path = fixture.nats_dir().join("server.conf");
+    let conf = std::fs::read_to_string(&conf_path).unwrap();
+    let no_http = conf.replace("http: \"127.0.0.1:18222\"\n", "");
+    let handwritten = conf.lines().skip(1).collect::<Vec<_>>().join("\n");
+    let mut refused = vec![handwritten, no_http.replace("15222", "18222")];
+    for host in ["0.0.0.0", "192.0.2.1", "::", "::1", "localhost"] {
+        refused.push(conf.replace("listen: \"127.0.0.1:", &format!("listen: \"{host}:")));
+        refused.push(conf.replace("http: \"127.0.0.1:", &format!("http: \"{host}:")));
+    }
+    refused.push(format!("{conf}http: \"127.0.0.1:18222\"\n"));
+    refused.push(format!("{conf}listen: \"127.0.0.1:15222\"\n"));
+    refused.push(conf.replace("listen: \"127.0.0.1:15222\"", "listen: \"127.0.0.1:0\""));
+    for invalid in refused {
+        std::fs::write(&conf_path, &invalid).unwrap();
+        let before = snapshot(fixture.dir.path());
+        let output = conf_only(&fixture, &[]);
+        assert!(!output.ok, "conf-only must refuse {invalid}");
+        assert!(
+            output.stderr.contains(conf_path.to_str().unwrap()),
+            "{}",
+            output.stderr
+        );
+        assert_eq!(snapshot(fixture.dir.path()), before);
+    }
+    std::fs::write(&conf_path, conf).unwrap();
+    let before = snapshot(fixture.dir.path());
+    for extra in [
+        ["--monitor-port", "15222"],
+        ["--monitor-port", "0"],
+        ["--monitor-port", "65536"],
+        ["--monitor-port", "127.0.0.1:18222"],
+        ["--monitor-host", "0.0.0.0"],
+        ["--port", "14222"],
+        ["--root-pub", "abcd"],
+    ] {
+        let output = conf_only(&fixture, &extra);
+        assert!(!output.ok, "conf-only must refuse {extra:?}");
+        assert_eq!(snapshot(fixture.dir.path()), before);
+    }
+    // Explicit replacement does not authorize a non-loopback monitoring listener.
+    std::fs::write(
+        &conf_path,
+        std::fs::read_to_string(&conf_path)
+            .unwrap()
+            .replace("http: \"127.0.0.1:", "http: \"0.0.0.0:"),
+    )
+    .unwrap();
+    let before = snapshot(fixture.dir.path());
+    assert!(!conf_only(&fixture, &["--monitor-port", "19222"]).ok);
+    assert_eq!(snapshot(fixture.dir.path()), before);
 }

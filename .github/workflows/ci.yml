@@ -146,6 +146,22 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  path-dependencies:
+    name: Path dependencies
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cargo metadata
+        run: cargo metadata --format-version 1 --locked >/dev/null
+
+      - name: Check path dependencies
+        run: |
+          bash scripts/checks/no-external-path-deps.sh
+          bash scripts/checks/no-external-path-deps.test.sh
+
   # Linux + Windows matrix. subc's transport (loopback TCP + key auth) and the
   # cortexkit-paths-backed canonicalization must behave identically across
   # platforms; Windows is the load-bearing leg because the cfg(windows) paths

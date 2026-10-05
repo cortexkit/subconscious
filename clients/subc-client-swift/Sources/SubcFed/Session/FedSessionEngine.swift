@@ -241,6 +241,7 @@ public actor FedSessionEngine {
     /// exchange completes. Whether `effects-v2` is in it decides which effect
     /// wire this session uses, and nothing else on the device records that.
     public var negotiatedFeatures: [String] { (negotiation?.features ?? []).sorted() }
+    public var peerMachineID: String? { negotiation?.peerMachineID }
     public var negotiated: FedNegotiatedSession? { negotiation }
     public var remoteCatalog: FedRemoteCatalog? { catalogTracker.applied }
     public var isCancelled: Bool { cancelledActivities }
@@ -291,7 +292,8 @@ public actor FedSessionEngine {
         try await deps.store.observePeerHello(
             responderStaticPublicKey: deps.responderStaticPublicKey,
             peerIncarnation: negotiated.peerIncarnation,
-            peerLedgerEpoch: negotiated.peerLedgerEpoch
+            peerLedgerEpoch: negotiated.peerLedgerEpoch,
+            peerMachineID: negotiated.peerMachineID
         )
 
         if let shared = deps.sharedAdmission {

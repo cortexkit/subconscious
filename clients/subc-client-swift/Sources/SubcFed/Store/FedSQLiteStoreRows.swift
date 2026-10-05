@@ -44,6 +44,7 @@ enum FedSQLiteStoreRows {
         PRIMARY KEY (responder_fp, epoch)
     );
     \(confirmedRangeSchema)
+    \(peerMachineIDSchema)
     """
 
     /// The confirmed ranges of `FedDestinationState.confirmedEffectRanges`.
@@ -61,6 +62,29 @@ enum FedSQLiteStoreRows {
         PRIMARY KEY (responder_fp, incarnation, from_seq)
     );
     """
+
+    /// Additive migration, like `confirmedRangeSchema`: old layout-1 stores
+    /// gain an empty table on open without rewriting existing recovery rows.
+    /// The name is scoped to a responder-key fingerprint, never a trust record.
+    static let peerMachineIDSchema = """
+    CREATE TABLE IF NOT EXISTS peer_machine_id(
+        responder_fp TEXT PRIMARY KEY NOT NULL,
+        machine_id TEXT NOT NULL
+    );
+    """
+
+    static func peerMachineID(fp: String, in db: FedSQLiteConnection) throws -> String? {
+        let row = try db.prepare("SELECT machine_id FROM peer_machine_id WHERE responder_fp = ?")
+        try row.bind([.text(fp)])
+        return try row.step() ? row.text(0) : nil
+    }
+
+    static func setPeerMachineID(_ id: String, fp: String, in db: FedSQLiteConnection) throws {
+        try db.run(
+            "INSERT OR REPLACE INTO peer_machine_id(responder_fp, machine_id) VALUES (?, ?)",
+            [.text(fp), .text(id)]
+        )
+    }
 
     // Effect and poisoned-epoch rows are read in insertion order. The retained
     // recorded reply used to detect ledger regression is selected by

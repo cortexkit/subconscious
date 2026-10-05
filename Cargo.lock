@@ -1872,7 +1872,7 @@ dependencies = [
 
 [[package]]
 name = "subc-daemon"
-version = "0.32.1"
+version = "0.32.0"
 dependencies = [
  "cortexkit-log",
  "cortexkit-paths",
@@ -1949,7 +1949,7 @@ dependencies = [
 
 [[package]]
 name = "subc-os"
-version = "0.1.7"
+version = "0.1.6"
 dependencies = [
  "libc",
  "rustix",

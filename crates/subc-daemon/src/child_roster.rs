@@ -88,6 +88,8 @@ struct RosterInner {
     /// Where the live-children record is written; unset means no record, the
     /// default for an in-process daemon (see `BootstrapConfig`).
     record_path: OnceLock<PathBuf>,
+    #[cfg(target_os = "macos")]
+    privacy_trampoline: OnceLock<Result<PathBuf, String>>,
 }
 
 impl RosterInner {
@@ -156,7 +158,35 @@ impl Drop for RosterGuard {
     }
 }
 
+#[cfg(target_os = "macos")]
+impl RosterGuard {
+    /// Publish an executable only after the privacy trampoline has exec'd and
+    /// the kernel image agrees with the configured module. Before then shutdown
+    /// owns the pid, but orphan cleanup has no image it could mistakenly trust.
+    pub(crate) fn confirm_executable(&self, observation: subc_os::Observation) {
+        let mut live = lock(&self.inner.live);
+        if let Some(entry) = live.get_mut(&self.key) {
+            entry.recorded.start_time = Some(observation.start_time);
+            entry.recorded.executable = observation.executable.map(ExecutableIdentity::from);
+            self.inner.write_record(&live);
+        }
+    }
+}
+
 impl ChildRoster {
+    #[cfg(target_os = "macos")]
+    pub(crate) fn set_privacy_trampoline(&self, result: Result<PathBuf, String>) {
+        let _ = self.inner.privacy_trampoline.set(result);
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn privacy_trampoline(&self) -> Result<PathBuf, String> {
+        self.inner
+            .privacy_trampoline
+            .get()
+            .cloned()
+            .unwrap_or_else(|| Err("no privacy trampoline configured".to_string()))
+    }
     /// The same roster, admitting children under one module's drain budget.
     pub(crate) fn for_module(&self, drain_budget: Arc<Mutex<Duration>>) -> Self {
         Self {

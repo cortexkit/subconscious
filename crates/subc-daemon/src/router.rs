@@ -1547,7 +1547,7 @@ mod tests {
     async fn supervisor_list_logs_contended_snapshot_lock_only() {
         let registry = Arc::new(Registry::default());
         let handle = SupervisorHandle::new();
-        let supervisor = Supervisor::new(Arc::clone(&registry), RestartPolicy::default())
+        let supervisor = Supervisor::new_for_test(Arc::clone(&registry), RestartPolicy::default())
             .with_handle(handle.clone());
         let module = supervisor
             .supervise_configured(

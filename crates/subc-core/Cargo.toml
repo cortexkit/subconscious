@@ -1,6 +1,6 @@
 [package]
 name = "subc-core"
-version = "0.20.55"
+version = "0.20.56"
 edition = "2021"
 license = "MIT"
 publish = false
@@ -30,11 +30,16 @@ name = "log-child-fixture"
 path = "tests/fixtures/log-child.rs"
 required-features = ["test-support"]
 
+[[bin]]
+name = "ck-subc-under-test"
+path = "src/bin/ck-subc-under-test.rs"
+required-features = ["test-support"]
+
 [features]
 bench-harness = ["subc-daemon/bench-harness"]
 loom = ["subc-daemon/loom"]
 # Enables the dedicated CLI fixture targets, never the shipped CLI test key.
-test-support = []
+test-support = ["subc-os/test-support"]
 
 [[bench]]
 name = "forwarding_contention"
@@ -43,7 +48,7 @@ harness = false
 required-features = ["bench-harness"]
 
 [dependencies]
-subc-daemon = { path = "../subc-daemon", version = "0.31.1" }
+subc-daemon = { path = "../subc-daemon", version = "0.32" }
 cortexkit-log = { version = "0.3.3" }
 cortexkit-paths = "0.1.1"
 base64 = "0.22"
@@ -71,7 +76,7 @@ rustix = { version = "1", default-features = false, features = ["process"] }
 [dev-dependencies]
 subc-test-support = { path = "../subc-test-support" }
 tokio = { version = "1", features = ["test-util"] }
-subc-daemon = { path = "../subc-daemon", version = "0.31.1", features = ["test-support"] }
+subc-daemon = { path = "../subc-daemon", version = "0.32", features = ["test-support"] }
 # Keep required-feature CLI fixture targets enabled for integration tests.
 subc-core = { path = ".", version = "0.20.53", features = ["test-support"] }
 

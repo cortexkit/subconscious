@@ -110,8 +110,159 @@ const SPAWN_SUBSCRIBER_BUFFER: usize = SPAWN_EVENT_RING_CAPACITY + 1;
 /// client resubscribes from the last cursor it did receive.
 pub(crate) const SPAWN_SUBSCRIBER_LAGGED_CODE: &str = "spawn_subscriber_lagged";
 
+#[cfg(target_os = "macos")]
+struct PrivacyExec {
+    reader: tokio::io::unix::AsyncFd<std::io::PipeReader>,
+    deadline: tokio::time::Instant,
+    expected: Option<subc_os::FileIdentity>,
+    trampoline: Option<subc_os::FileIdentity>,
+    script: bool,
+    module_id: String,
+}
+
+#[cfg(all(test, target_os = "macos"))]
+fn test_privacy_trampoline() -> PathBuf {
+    // Cargo's unit-test executable lives in <profile>/deps; its fixture bin
+    // lives beside that directory. This honors custom CARGO_TARGET_DIR too.
+    std::env::current_exe()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("privacy-trampoline-fixture")
+}
+
+#[cfg(target_os = "macos")]
+fn probe_privacy_trampoline(path: &std::path::Path) -> Result<(), String> {
+    use std::io::Read;
+    let mut probe = std::process::Command::new(path)
+        .args(["__disclaim-exec", "--probe"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| {
+            format!(
+                "privacy trampoline probe failed for {}: {error}",
+                path.display()
+            )
+        })?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        match probe.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(5))
+            }
+            result => {
+                let _ = probe.kill();
+                let _ = probe.wait();
+                return Err(format!(
+                    "privacy trampoline probe failed or timed out for {}: {result:?}",
+                    path.display()
+                ));
+            }
+        }
+    };
+    let mut answer = String::new();
+    if let Some(stdout) = probe.stdout.take() {
+        let _ = stdout.take(256).read_to_string(&mut answer);
+    }
+    if status.success() && answer.trim() == subc_os::privacy_identity::TRAMPOLINE_PROBE {
+        return Ok(());
+    }
+    let cause = subc_os::privacy_identity::failure_cause(status.code())
+        .unwrap_or("binary does not implement the privacy trampoline protocol");
+    Err(format!(
+        "{cause}: probe of {} exited {status}",
+        path.display()
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn privacy_command(
+    spec: &ModuleSpec,
+    roster: &ChildRoster,
+) -> Result<
+    (
+        Command,
+        Option<PrivacyExec>,
+        subc_os::privacy_identity::ExecAcknowledgement,
+    ),
+    SuperviseError,
+> {
+    let failure = |cause: String| {
+        warn!(module_id = %spec.module_id, %cause, "privacy identity trampoline refused module spawn");
+        SuperviseError::Spawn {
+            program: spec.program.clone(),
+            source: io::Error::other(cause),
+            cgroup_path: None,
+        }
+    };
+    let trampoline = roster.privacy_trampoline().map_err(failure)?;
+    // Resolve PATH with the same environment the Command will receive. For
+    // scripts retain the existing orphan-identity rule: the kernel chooses
+    // the interpreter, and its observed image is the one recorded. Do not
+    // duplicate the kernel's shebang/PATH interpreter resolution in Rust.
+    let program = if spec.program.components().count() == 1 && !spec.program.is_absolute() {
+        let path = spec
+            .env
+            .iter()
+            .find(|(key, _)| key == "PATH")
+            .map(|(_, value)| std::ffi::OsString::from(value))
+            .or_else(|| std::env::var_os("PATH"))
+            .unwrap_or_else(|| "/usr/bin:/bin".into());
+        std::env::split_paths(&path)
+            .map(|dir| dir.join(&spec.program))
+            .find(|path| path.is_file())
+            .unwrap_or_else(|| spec.program.clone())
+    } else {
+        spec.program.clone()
+    };
+    let expected = subc_os::file_identity(&program);
+    let trampoline_image = subc_os::file_identity(&trampoline);
+    let script = {
+        use std::io::Read;
+        let mut prefix = [0u8; 2];
+        std::fs::File::open(&program)
+            .is_ok_and(|mut file| file.read_exact(&mut prefix).is_ok() && &prefix == b"#!")
+    };
+    if expected.is_none() || expected == subc_os::file_identity(&trampoline) {
+        return Err(failure(
+            "privacy identity module executable is missing or is the trampoline itself".to_string(),
+        ));
+    }
+    let (reader, ack) = subc_os::privacy_identity::ExecAcknowledgement::pipe()
+        .map_err(|error| failure(error.to_string()))?;
+    let reader =
+        tokio::io::unix::AsyncFd::new(reader).map_err(|error| failure(error.to_string()))?;
+    let mut command = Command::new(&trampoline);
+    command
+        .arg("__disclaim-exec")
+        .arg(ack.fd().to_string())
+        .arg(&program);
+    ack.install(command.as_std_mut());
+    Ok((
+        command,
+        Some(PrivacyExec {
+            reader,
+            deadline: tokio::time::Instant::now() + Duration::from_secs(5),
+            expected,
+            trampoline: trampoline_image,
+            script,
+            module_id: spec.module_id.clone(),
+        }),
+        ack,
+    ))
+}
+
 struct SupervisedChild {
     child: Child,
+    #[cfg(target_os = "macos")]
+    privacy_exec: Option<PrivacyExec>,
+    /// Refusal before the module image was accepted, retained for terminal records.
+    spawn_failure: Option<String>,
     /// The protocol this process was launched with. A reload can store a new
     /// launch spec with a different protocol, but that takes effect only at the
     /// next spawn, so this process keeps being handled by the protocol it
@@ -173,6 +324,8 @@ impl SupervisedChild {
     }
 
     async fn wait(&mut self) -> io::Result<ExitStatus> {
+        #[cfg(target_os = "macos")]
+        self.confirm_privacy_exec().await;
         // The roster entry is NOT released here. A daemon shutdown waits for the
         // roster to empty and then exits the process, so releasing at the reap
         // let it exit before the exit handler wrote this child's terminal record
@@ -191,6 +344,65 @@ impl SupervisedChild {
             }
         }
         result
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn confirm_privacy_exec(&mut self) {
+        let Some(pending) = &mut self.privacy_exec else {
+            return;
+        };
+        let result = tokio::time::timeout_at(pending.deadline, async {
+            loop {
+                let mut ready = pending.reader.readable().await?;
+                let read = ready.try_io(|reader| {
+                    use std::io::Read;
+                    let mut reader = reader.get_ref();
+                    reader.read(&mut [0u8; 1])
+                });
+                match read {
+                    Ok(Ok(0)) => return Ok::<_, io::Error>(()),
+                    Ok(Ok(_)) => {
+                        return Err(io::Error::other("unexpected exec acknowledgement bytes"))
+                    }
+                    Ok(Err(error)) => return Err(error),
+                    Err(_) => continue,
+                }
+            }
+        })
+        .await;
+        // Keep the reader in self across await: select cancellation must not
+        // discard the handshake or reset its original five-second deadline.
+        let pending = self.privacy_exec.take().expect("pending exec");
+        let cause = match result {
+            Err(_) => Some("privacy identity trampoline did not exec within 5s".to_string()),
+            Ok(Err(error)) => Some(format!("privacy identity exec acknowledgement failed: {error}")),
+            Ok(Ok(())) => match self.child.try_wait() {
+                Ok(Some(status)) => Some(subc_os::privacy_identity::failure_cause(status.code())
+                    .unwrap_or("privacy identity trampoline exited before its module image was accepted").to_string()),
+                Err(error) => Some(format!("privacy identity trampoline wait failed: {error}")),
+                Ok(None) => {
+                    let image = observe_spawned_image(self.pid);
+                    if let Some(image) = image.filter(|image| image.executable.is_some() && image.executable != pending.trampoline && (image.executable == pending.expected || pending.script)) {
+                        if let Some(guard) = &self.roster_guard { guard.confirm_executable(image); }
+                        info!(module_id = %pending.module_id, pid = self.pid,
+                            "module spawned with own privacy identity (responsibility disclaimed)");
+                        None
+                    } else {
+                        Some("privacy identity trampoline executable mismatch: expected the module program, not ck-subc".to_string())
+                    }
+                }
+            },
+        };
+        if let Some(cause) = cause {
+            warn!(module_id = %pending.module_id, pid = self.pid, %cause, "privacy identity trampoline refused module spawn");
+            self.spawn_failure = Some(cause);
+            // No image is admitted on failure. Reach the entire fresh process
+            // group, including a module which spawned a helper before refusal.
+            if let Some(pid) = rustix::process::Pid::from_raw(self.pid as i32) {
+                let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+            }
+            let _ = self.child.start_kill();
+        }
     }
 
     /// Releases this child's daemon-shutdown roster entry once its exit has
@@ -767,6 +979,7 @@ struct SupervisorSnapshot {
     enabled: bool,
     process_alive: bool,
     spawned_protocol: Option<ModuleProtocol>,
+    spawn_failure: Option<String>,
     /// When each crash restart was spent, oldest first. This IS the crash
     /// budget: its in-window length is the count an operator sees and the count
     /// the restart decision is made against, so there is no second counter that
@@ -892,6 +1105,7 @@ impl SupervisorSnapshot {
             enabled,
             process_alive: false,
             spawned_protocol: None,
+            spawn_failure: None,
             crash_restarts: VecDeque::new(),
             lifetime_restarts: 0,
             spawn_generation: 0,
@@ -2199,6 +2413,31 @@ impl AfterFirstSpawnHook {
 }
 
 impl Supervisor {
+    #[cfg(test)]
+    pub(crate) fn new_for_test(registry: Arc<Registry>, policy: RestartPolicy) -> Self {
+        let supervisor = Self::new(registry, policy);
+        #[cfg(target_os = "macos")]
+        let supervisor = supervisor.with_privacy_trampoline(test_privacy_trampoline());
+        supervisor
+    }
+    /// Verify the trampoline once when configured. Missing private OS support
+    /// refuses every macOS launch by name but does not stop the daemon's control
+    /// server. Embedders must explicitly provide a binary with the subc-os hidden
+    /// entry point; the library must not exec an arbitrary hosting program.
+    pub fn with_privacy_trampoline(self, path: impl Into<PathBuf>) -> Self {
+        let path = path.into();
+        #[cfg(target_os = "macos")]
+        {
+            let result = probe_privacy_trampoline(&path).map(|()| path);
+            if let Err(cause) = &result {
+                error!(%cause, "macOS privacy identity unavailable; supervised launches will refuse");
+            }
+            self.child_roster.set_privacy_trampoline(result);
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = path;
+        self
+    }
     /// The first step of an announced daemon shutdown, before the notice and
     /// before any connection is closed.
     ///
@@ -4807,7 +5046,7 @@ mod tests {
 
         let handle = SupervisorHandle::new();
         let mut supervisor =
-            Supervisor::new(Arc::new(Registry::default()), RestartPolicy::default())
+            Supervisor::new_for_test(Arc::new(Registry::default()), RestartPolicy::default())
                 .with_handle(handle.clone());
         let observed = Arc::new(Mutex::new(Vec::<OwnerInSpawnWindow>::new()));
         let hook_handle = handle.clone();
@@ -4938,7 +5177,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn failed_enable_spawn_clears_preexisting_current_process_facts() {
-        let supervisor = Supervisor::default();
+        let supervisor =
+            Supervisor::new_for_test(Arc::new(Registry::default()), RestartPolicy::default());
         let mut runtime = supervisor.runtime_config();
         runtime.test_seed_stale_facts_before_enable_spawn = true;
         let snapshot = stale_process_snapshot(ModuleState::Disabled, false);
@@ -4972,7 +5212,8 @@ mod tests {
 
     #[tokio::test]
     async fn start_revives_stranded_restarting_but_not_pending_backoff() {
-        let supervisor = Supervisor::default();
+        let supervisor =
+            Supervisor::new_for_test(Arc::new(Registry::default()), RestartPolicy::default());
         let runtime = supervisor.runtime_config();
         let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::new(
             ModuleState::Restarting,
@@ -5025,7 +5266,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn failed_reload_spawn_clears_current_process_facts() {
-        let supervisor = Supervisor::default();
+        let supervisor =
+            Supervisor::new_for_test(Arc::new(Registry::default()), RestartPolicy::default());
         let mut runtime = supervisor.runtime_config();
         runtime.restart_policy = RestartPolicy::new(0, Duration::ZERO);
         let snapshot = stale_process_snapshot(ModuleState::Running, true);
@@ -5058,7 +5300,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn dropping_a_module_with_an_active_monitor_clears_current_process_facts() {
-        let supervisor = Supervisor::default();
+        let supervisor =
+            Supervisor::new_for_test(Arc::new(Registry::default()), RestartPolicy::default());
         let snapshot = stale_process_snapshot(ModuleState::Running, true);
         let module = supervisor.supervised_module(
             ModuleSpec {
@@ -5110,7 +5353,8 @@ mod tests {
             protocol: ModuleProtocol::None,
             overlap: Default::default(),
         };
-        let supervisor = Supervisor::default();
+        let supervisor =
+            Supervisor::new_for_test(Arc::new(Registry::default()), RestartPolicy::default());
         let module = supervisor.spawn(initial.clone()).unwrap();
         assert!(module.status().unwrap().live);
         let mut next = initial;
@@ -5156,7 +5400,9 @@ mod tests {
         std::fs::write(&script, "#!/bin/sh\nwhile :; do sleep 0.1; done\n").unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
         let record_path = dir.join("live-children.json");
-        let supervisor = Supervisor::default().with_live_children_record(&record_path);
+        let supervisor =
+            Supervisor::new_for_test(Arc::new(Registry::default()), RestartPolicy::default())
+                .with_live_children_record(&record_path);
         for (program, args) in [
             (PathBuf::from("sleep"), vec!["60".into()]),
             (script, vec![]),
@@ -5175,6 +5421,20 @@ mod tests {
                 overlap: Default::default(),
             };
             let module = supervisor.spawn(spec).unwrap();
+            #[cfg(target_os = "macos")]
+            {
+                // SETEXEC confirmation is asynchronous; the orphan record must
+                // identify the final image, never the intermediate trampoline.
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while crate::live_children::read_record(&record_path)
+                    .unwrap()
+                    .iter()
+                    .all(|entry| entry.executable.is_none())
+                {
+                    assert!(Instant::now() < deadline, "module image was not confirmed");
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }
             let entry = crate::live_children::read_record(&record_path)
                 .unwrap()
                 .pop()
@@ -5256,15 +5516,16 @@ mod tests {
             }
         });
         let configured = http_fixture(&dir, &url, 1000);
-        let module = Supervisor::default()
-            .supervise_configured_with_health(
-                configured.module_spec(),
-                true,
-                configured.health,
-                configured.drain_timeout_ms,
-                configured.restart,
-            )
-            .unwrap();
+        let module =
+            Supervisor::new_for_test(Arc::new(Registry::default()), RestartPolicy::default())
+                .supervise_configured_with_health(
+                    configured.module_spec(),
+                    true,
+                    configured.health,
+                    configured.drain_timeout_ms,
+                    configured.restart,
+                )
+                .unwrap();
         wait_http_health(&module, SupervisorHealthStatus::Ok).await;
         status.store(503, std::sync::atomic::Ordering::SeqCst);
         wait_http_health(&module, SupervisorHealthStatus::Failing).await;
@@ -5323,15 +5584,16 @@ mod tests {
         let url = format!("http://{}/healthz", unused.local_addr().unwrap());
         drop(unused);
         let configured = http_fixture(&dir, &url, 2);
-        let module = Supervisor::default()
-            .supervise_configured_with_health(
-                configured.module_spec(),
-                true,
-                configured.health,
-                configured.drain_timeout_ms,
-                configured.restart,
-            )
-            .unwrap();
+        let module =
+            Supervisor::new_for_test(Arc::new(Registry::default()), RestartPolicy::default())
+                .supervise_configured_with_health(
+                    configured.module_spec(),
+                    true,
+                    configured.health,
+                    configured.drain_timeout_ms,
+                    configured.restart,
+                )
+                .unwrap();
         let before = module.status().unwrap().spawn_generation;
         timeout(Duration::from_secs(5), async {
             loop {
@@ -5482,22 +5744,24 @@ mod tests {
         configured.args = vec!["-c".into(), config.to_string_lossy().into_owned()];
         drop(monitor);
         drop(client);
-        let module = Supervisor::default()
-            .supervise_configured_with_health(
-                configured.module_spec(),
-                true,
-                configured.health,
-                configured.drain_timeout_ms,
-                configured.restart,
-            )
-            .unwrap();
+        let module =
+            Supervisor::new_for_test(Arc::new(Registry::default()), RestartPolicy::default())
+                .supervise_configured_with_health(
+                    configured.module_spec(),
+                    true,
+                    configured.health,
+                    configured.drain_timeout_ms,
+                    configured.restart,
+                )
+                .unwrap();
         wait_http_health(&module, SupervisorHealthStatus::Ok).await;
         module.drain().await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn configuration_update_does_not_replace_captured_running_process_facts() {
-        let supervisor = Supervisor::default();
+        let supervisor =
+            Supervisor::new_for_test(Arc::new(Registry::default()), RestartPolicy::default());
         let snapshot = stale_process_snapshot(ModuleState::Running, true);
         let initial = ModuleSpec {
             module_id: "rescan-preserves-spawn-facts".to_string(),
@@ -5557,6 +5821,10 @@ async fn supervise_loop(
     // before anything else so a stop that interrupted a swap runs at once.
     let mut requeued: VecDeque<SupervisorCommand> = VecDeque::new();
     loop {
+        #[cfg(target_os = "macos")]
+        if let Some(active) = child.as_mut() {
+            active.confirm_privacy_exec().await;
+        }
         if let Some(scheduled) = runtime
             .scheduled_respawn
             .lock()
@@ -6328,7 +6596,10 @@ async fn finish_reload_child(
                 child,
                 ReloadRegistrationFailure {
                     exit_report: registration_failure_exit_report(exit_report),
-                    reason: "new child exited before registering".to_string(),
+                    reason: exited_child
+                        .spawn_failure
+                        .clone()
+                        .unwrap_or_else(|| "new child exited before registering".to_string()),
                 },
             )
             .await;
@@ -6583,7 +6854,9 @@ async fn on_child_exit(
             // Set only when the budget is what stopped the module, so the
             // terminal record says which limit was hit rather than leaving
             // `failed` to be read as "crashed once, badly".
-            let mut disposition_detail = None;
+            let mut disposition_detail = lock_snapshot(snapshot)
+                .ok()
+                .and_then(|mut state| state.spawn_failure.take());
             let now = Instant::now();
             if let Err(err) = update_snapshot(snapshot, Some(&spec.module_id), |state| {
                 clear_current_process_facts(state);
@@ -6596,7 +6869,12 @@ async fn on_child_exit(
                     } else {
                         state.state = ModuleState::Failed;
                         disposition = TerminalDisposition::Failed;
-                        disposition_detail = Some(policy.budget_exhausted_detail());
+                        let budget = policy.budget_exhausted_detail();
+                        disposition_detail =
+                            Some(disposition_detail.take().map_or_else(
+                                || budget.clone(),
+                                |cause| format!("{cause}; {budget}"),
+                            ));
                     }
                 } else {
                     state.state = ModuleState::Disabled;
@@ -6608,7 +6886,7 @@ async fn on_child_exit(
                     registration_released: false,
                 };
             }
-            if disposition_detail.is_some() {
+            if disposition == TerminalDisposition::Failed {
                 // The window is in the message, not only in the fields: this line
                 // is read in a scrollback where a bare `max_restarts=3` reads as a
                 // lifetime cap and sends the operator looking for three crashes
@@ -7062,6 +7340,9 @@ fn spawn_child_in_slot(
     };
     #[cfg(not(target_os = "linux"))]
     let _ = alternate_slot;
+    #[cfg(target_os = "macos")]
+    let (mut command, privacy_exec, exec_ack) = privacy_command(spec, roster)?;
+    #[cfg(not(target_os = "macos"))]
     let mut command = Command::new(&spec.program);
     command.args(&spec.args);
     // AMBIENT `CK_LOG` MUST NOT LEAK INTO AN OTHERWISE UNCONFIGURED MODULE — but
@@ -7188,6 +7469,10 @@ fn spawn_child_in_slot(
             });
         }
     };
+    // The parent's writer must close immediately, or SETEXEC can never give EOF.
+    // Command holds only an integer in its pre_exec callback, not another writer.
+    #[cfg(target_os = "macos")]
+    drop(exec_ack);
 
     // Containment, steps 2 and 3: assign while suspended, then resume.
     #[cfg(windows)]
@@ -7207,10 +7492,15 @@ fn spawn_child_in_slot(
     // lookup and shebang interpretation may select a different file from the
     // configured program. Keep the literal program's identity for provenance,
     // but never use it as proof that a recorded pid may be signalled.
-    let recorded_image = subc_os::Process::open(pid)
-        .ok()
-        .flatten()
-        .and_then(|process| process.observe());
+    let recorded_image = observe_spawned_image(pid);
+    // spawn() confirms the first exec only. Never persist the trampoline image;
+    // the async handshake publishes the module image after the second exec.
+    #[cfg(target_os = "macos")]
+    let recorded_image = if privacy_exec.is_some() {
+        None
+    } else {
+        recorded_image
+    };
     #[cfg(target_os = "linux")]
     let recorded_cgroup_name = cgroup_path.as_ref().map(|_| cgroup_name.clone());
     #[cfg(not(target_os = "linux"))]
@@ -7338,6 +7628,9 @@ fn spawn_child_in_slot(
         process_identity,
         pid,
         roster_guard: Some(roster_guard),
+        #[cfg(target_os = "macos")]
+        privacy_exec,
+        spawn_failure: None,
     })
 }
 
@@ -7535,6 +7828,16 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
         diff |= x ^ y;
     }
     diff == 0
+}
+
+/// The kernel's image after an acknowledged exec, shared by ordinary launches
+/// and privacy trampolines. PATH and shebang interpretation are kernel facts,
+/// not identities inferred from a configured pathname.
+fn observe_spawned_image(pid: u32) -> Option<subc_os::Observation> {
+    subc_os::Process::open(pid)
+        .ok()
+        .flatten()
+        .and_then(|process| process.observe())
 }
 
 fn spawn_and_mark_running(
@@ -8800,7 +9103,7 @@ mod slot_registration_wait_tests {
     #[tokio::test]
     async fn enable_release_failure_is_failed_and_a_second_enable_retries() {
         let registry = Arc::new(Registry::default());
-        let supervisor = Supervisor::new(Arc::clone(&registry), RestartPolicy::default());
+        let supervisor = Supervisor::new_for_test(Arc::clone(&registry), RestartPolicy::default());
         let runtime = supervisor.runtime_config();
         let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::disabled()));
         let spec = ModuleSpec {
@@ -9023,6 +9326,7 @@ fn set_running(
         info!(module_id, "restart already satisfied by generation {generation}; coalesced pending request completed");
     }
     state.drain_disposition_detail = None;
+    state.spawn_failure = None;
     // Every caller of this is a plain spawn, which always uses the primary key;
     // a promoted swap candidate sets the flag itself after this returns.
     state.in_alternate_slot = false;
@@ -9079,7 +9383,10 @@ fn classify_reaped_child_exit(
     child: &SupervisedChild,
     status: &ExitStatus,
 ) -> ExitReport {
-    let _ = update_snapshot(snapshot, None, |state| state.reaped_pid = Some(child.pid));
+    let _ = update_snapshot(snapshot, None, |state| {
+        state.reaped_pid = Some(child.pid);
+        state.spawn_failure = child.spawn_failure.clone();
+    });
     apply_deliberate_severance_marker(snapshot, child.process_identity(), classify_exit(status))
 }
 
@@ -9399,7 +9706,7 @@ mod terminal_history_tests {
     ) -> SupervisedModule {
         let registry = Arc::new(Registry::default());
         let supervisor =
-            Supervisor::new(Arc::clone(&registry), RestartPolicy::new(3, Duration::ZERO));
+            Supervisor::new_for_test(Arc::clone(&registry), RestartPolicy::new(3, Duration::ZERO));
         let module = supervisor
             .spawn(ModuleSpec {
                 module_id: "recovery-snapshot".to_string(),
@@ -9428,8 +9735,9 @@ mod terminal_history_tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn no_cgroup_placement_does_not_block_fake_aft_stub_spawn() {
-        let supervisor = Supervisor::new(Arc::new(Registry::default()), RestartPolicy::default())
-            .with_cgroup_placement(None);
+        let supervisor =
+            Supervisor::new_for_test(Arc::new(Registry::default()), RestartPolicy::default())
+                .with_cgroup_placement(None);
         let result = supervisor.spawn(ModuleSpec {
             module_id: "no-cgroup-placement".to_string(),
             program: fake_aft_stub_path(),
@@ -9514,7 +9822,7 @@ mod terminal_history_tests {
     async fn terminal_history_survives_respawn_and_keeps_both_crashes_in_order() {
         let registry = Arc::new(Registry::default());
         let supervisor =
-            Supervisor::new(Arc::clone(&registry), RestartPolicy::new(1, Duration::ZERO));
+            Supervisor::new_for_test(Arc::clone(&registry), RestartPolicy::new(1, Duration::ZERO));
         let module = supervisor
             .spawn(ModuleSpec {
                 module_id: "terminal-history".to_string(),
@@ -9559,7 +9867,7 @@ mod terminal_history_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn disable_during_crash_backoff_cancels_pending_respawn() {
         let backoff = Duration::from_secs(2);
-        let supervisor = Supervisor::new(
+        let supervisor = Supervisor::new_for_test(
             Arc::new(Registry::default()),
             RestartPolicy::new(10, backoff),
         );
@@ -9666,7 +9974,7 @@ mod terminal_history_tests {
         let dir = subc_test_support::TestTempDir::new("none-unrequested-clean-exit");
         let (spec, ready, marker) =
             protocol_none_sigterm_exits_clean_spec("none-unrequested-clean-exit", dir.path());
-        let supervisor = Supervisor::new(
+        let supervisor = Supervisor::new_for_test(
             Arc::new(Registry::default()),
             RestartPolicy::new(3, Duration::ZERO),
         );
@@ -9719,7 +10027,7 @@ mod terminal_history_tests {
     /// the budget named.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn protocol_none_repeated_clean_exits_exhaust_the_restart_budget() {
-        let supervisor = Supervisor::new(
+        let supervisor = Supervisor::new_for_test(
             Arc::new(Registry::default()),
             RestartPolicy::new(1, Duration::ZERO),
         );
@@ -9782,7 +10090,7 @@ mod terminal_history_tests {
             };
             let dir = subc_test_support::TestTempDir::new(label);
             let (spec, ready, marker) = protocol_none_sigterm_exits_clean_spec(label, dir.path());
-            let supervisor = Supervisor::new(
+            let supervisor = Supervisor::new_for_test(
                 Arc::new(Registry::default()),
                 RestartPolicy::new(3, Duration::ZERO),
             );
@@ -9828,7 +10136,7 @@ mod terminal_history_tests {
     /// protocol-none rule must not reach it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn subc_wire_clean_exit_is_still_a_stop() {
-        let supervisor = Supervisor::new(
+        let supervisor = Supervisor::new_for_test(
             Arc::new(Registry::default()),
             RestartPolicy::new(3, Duration::ZERO),
         );
@@ -9866,7 +10174,7 @@ mod terminal_history_tests {
     async fn reload_exit_keeps_roster_until_terminal_is_recorded_during_shutdown() {
         let dir = subc_test_support::TestTempDir::new("reload-roster-terminal-order");
         let record = dir.join("live-children.json");
-        let supervisor = Supervisor::new(
+        let supervisor = Supervisor::new_for_test(
             Arc::new(Registry::default()),
             RestartPolicy::new(0, Duration::ZERO),
         );
@@ -9930,7 +10238,7 @@ mod terminal_history_tests {
     /// spending budget without recording the historical restart.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn every_restart_increment_path_advances_lifetime_count() {
-        let supervisor = Supervisor::new(
+        let supervisor = Supervisor::new_for_test(
             Arc::new(Registry::default()),
             RestartPolicy::new(1, Duration::ZERO),
         );
@@ -10024,7 +10332,7 @@ mod terminal_history_tests {
 
     #[tokio::test]
     async fn deliberately_severed_live_child_records_lifetime_without_spending_restart_budget() {
-        let supervisor = Supervisor::new(
+        let supervisor = Supervisor::new_for_test(
             Arc::new(Registry::default()),
             RestartPolicy::new(3, Duration::ZERO),
         );
@@ -10078,7 +10386,7 @@ mod terminal_history_tests {
 
     #[tokio::test]
     async fn genuine_crash_spends_restart_budget_and_records_lifetime() {
-        let supervisor = Supervisor::new(
+        let supervisor = Supervisor::new_for_test(
             Arc::new(Registry::default()),
             RestartPolicy::new(3, Duration::ZERO),
         );
@@ -10149,7 +10457,7 @@ mod terminal_history_tests {
     #[tokio::test]
     async fn three_crashes_inside_the_window_stop_the_module_and_name_the_window() {
         let (logs, _guard) = crate::router::test_log::log_capture(tracing::Level::ERROR);
-        let supervisor = Supervisor::new(
+        let supervisor = Supervisor::new_for_test(
             Arc::new(Registry::default()),
             RestartPolicy::new(2, Duration::ZERO),
         );
@@ -10230,7 +10538,7 @@ mod terminal_history_tests {
     /// connection to the daemon drops.
     #[tokio::test]
     async fn a_crash_older_than_the_window_frees_its_slot_for_a_later_crash() {
-        let supervisor = Supervisor::new(
+        let supervisor = Supervisor::new_for_test(
             Arc::new(Registry::default()),
             RestartPolicy::new(2, Duration::ZERO),
         );
@@ -10299,7 +10607,7 @@ mod terminal_history_tests {
     /// operator action answers only the first.
     #[tokio::test]
     async fn an_operator_restart_clears_the_ring_and_leaves_the_ledger_alone() {
-        let supervisor = Supervisor::new(
+        let supervisor = Supervisor::new_for_test(
             Arc::new(Registry::default()),
             RestartPolicy::new(2, Duration::ZERO),
         );
@@ -10394,7 +10702,7 @@ mod terminal_history_tests {
     #[tokio::test]
     async fn drain_reap_marks_deliberate_severance_and_records_lifetime_without_budget() {
         let registry = Registry::default();
-        let supervisor = Supervisor::new(
+        let supervisor = Supervisor::new_for_test(
             Arc::new(Registry::default()),
             RestartPolicy::new(3, Duration::ZERO),
         );
@@ -10460,7 +10768,7 @@ mod terminal_history_tests {
     #[tokio::test]
     async fn ordinary_drain_reap_does_not_record_a_lifetime_restart() {
         let registry = Registry::default();
-        let supervisor = Supervisor::new(
+        let supervisor = Supervisor::new_for_test(
             Arc::new(Registry::default()),
             RestartPolicy::new(3, Duration::ZERO),
         );
@@ -10687,7 +10995,7 @@ mod health_tombstone_tests {
             on_failing: HealthAction::Report,
             critical: false,
         };
-        let supervisor = Supervisor::new(Arc::clone(&registry), RestartPolicy::default())
+        let supervisor = Supervisor::new_for_test(Arc::clone(&registry), RestartPolicy::default())
             .with_forwarding(Arc::clone(&forwarding))
             .with_handle(supervisor_handle.clone())
             .with_health_config(health);
@@ -11238,7 +11546,9 @@ mod cgroup_placement_tests {
                 .filter(|kind| kind.is_dir())
                 .count()
         };
-        let supervisor = Supervisor::default().with_cgroup_placement(Some(placement.clone()));
+        let supervisor =
+            Supervisor::new_for_test(Arc::new(Registry::default()), RestartPolicy::default())
+                .with_cgroup_placement(Some(placement.clone()));
         let runtime = supervisor.runtime_config();
         let mut spec = ModuleSpec {
             module_id: "unique-spawn".into(),
@@ -11394,6 +11704,9 @@ mod cgroup_placement_tests {
             process_identity: None,
             pid,
             roster_guard: None,
+            #[cfg(target_os = "macos")]
+            privacy_exec: None,
+            spawn_failure: None,
         };
 
         child.wait().await.expect("reap short-lived child");
@@ -11904,7 +12217,7 @@ mod job_containment_tests {
     fn fixture(label: &str, module_id: &str) -> Fixture {
         let dir = TestTempDir::new(label);
         let pid_file = dir.join("grandchild.pid");
-        let supervisor = Supervisor::new(
+        let supervisor = Supervisor::new_for_test(
             Arc::new(Registry::default()),
             RestartPolicy::new(3, Duration::ZERO),
         );
@@ -12080,6 +12393,62 @@ mod job_containment_tests {
     }
 }
 
+#[cfg(test)]
+mod privacy_trampoline_configuration_tests {
+    #[tokio::test]
+    #[cfg_attr(not(target_os = "macos"), ignore = "requires macOS privacy trampoline")]
+    async fn macos_spawn_without_a_configured_trampoline_refuses_by_name() {
+        #[cfg(target_os = "macos")]
+        {
+            let supervisor = super::Supervisor::new(
+                std::sync::Arc::new(crate::Registry::default()),
+                super::RestartPolicy::default(),
+            );
+            let error = supervisor.spawn(spec()).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("no privacy trampoline configured"),
+                "{error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[cfg_attr(not(target_os = "macos"), ignore = "requires macOS privacy trampoline")]
+    async fn macos_wrong_trampoline_is_rejected_by_the_startup_probe() {
+        #[cfg(target_os = "macos")]
+        {
+            let supervisor = super::Supervisor::new(
+                std::sync::Arc::new(crate::Registry::default()),
+                super::RestartPolicy::default(),
+            )
+            .with_privacy_trampoline(std::env::current_exe().unwrap());
+            let error = supervisor.spawn(spec()).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("binary does not implement the privacy trampoline protocol"),
+                "{error}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn spec() -> super::ModuleSpec {
+        super::ModuleSpec {
+            module_id: "privacy-configuration".into(),
+            program: "/bin/sleep".into(),
+            args: vec!["30".into()],
+            env: vec![],
+            reserved: false,
+            reserved_prefixes: vec![],
+            protocol: subc_control::ModuleProtocol::None,
+            overlap: super::ModuleOverlap::Exclusive,
+        }
+    }
+}
+
 /// The daemon's real spawn path hands a subc-wire child its launch nonce on
 /// descriptor 3, without an environment copy. The shell records the nonce
 /// and its environment after exec so these tests observe the real handover.
@@ -12121,6 +12490,11 @@ mod launch_nonce_descriptor_tests {
         let handle = SupervisorHandle::new();
         let ring = Arc::new(Mutex::new(StderrRing::new(StderrTailConfig::default())));
         let roster = ChildRoster::default();
+        #[cfg(target_os = "macos")]
+        {
+            let path = super::test_privacy_trampoline();
+            roster.set_privacy_trampoline(super::probe_privacy_trampoline(&path).map(|()| path));
+        }
         let child = super::spawn_child_in_slot(
             &spec,
             None,
@@ -12234,7 +12608,7 @@ mod cgroup_containment_tests {
             eprintln!("SKIP {test_name}: cgroup.kill unavailable (kernel < 5.14)");
             return;
         }
-        let supervisor = Supervisor::new(
+        let supervisor = Supervisor::new_for_test(
             Arc::new(Registry::default()),
             RestartPolicy::new(3, Duration::ZERO),
         )

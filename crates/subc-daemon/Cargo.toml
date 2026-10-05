@@ -1,6 +1,6 @@
 [package]
 name = "subc-daemon"
-version = "0.31.1"
+version = "0.32.0"
 edition = "2021"
 publish = true
 description = "Embeddable subc daemon: bootstrap, module supervision, and opaque-byte splice routing."
@@ -10,7 +10,12 @@ repository = "https://github.com/cortexkit/subconscious"
 [features]
 bench-harness = []
 loom = []
-test-support = []
+test-support = ["subc-os/test-support"]
+
+[[bin]]
+name = "privacy-trampoline-fixture"
+path = "tests/fixtures/privacy-trampoline.rs"
+required-features = ["test-support"]
 
 [dependencies]
 cortexkit-log = { version = "0.3.3" }

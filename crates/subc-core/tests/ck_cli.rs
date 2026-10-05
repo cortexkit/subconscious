@@ -2612,6 +2612,7 @@ async fn module_stop_waits_past_ten_seconds_within_running_drain_budget() {
         RestartPolicy::new(3, Duration::from_millis(137))
             .with_max_backoff(Duration::from_millis(7_321)),
     )
+    .with_privacy_trampoline(env!("CARGO_BIN_EXE_ck-subc"))
     .with_process_liveness(Arc::clone(&server.process_liveness))
     .with_forwarding(Arc::clone(&server.forwarding))
     .with_handle(server.supervisor_handle.clone())
@@ -3420,6 +3421,7 @@ fn supervisor_with_restart_limit(server: &TestServer, max_restarts: u32) -> Supe
         Arc::clone(&server.registry),
         RestartPolicy::new(max_restarts, Duration::from_millis(10)),
     )
+    .with_privacy_trampoline(env!("CARGO_BIN_EXE_ck-subc"))
     .with_process_liveness(Arc::clone(&server.process_liveness))
     .with_forwarding(Arc::clone(&server.forwarding))
     .with_handle(server.supervisor_handle.clone())

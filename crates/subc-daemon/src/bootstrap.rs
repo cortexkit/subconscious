@@ -143,6 +143,7 @@ pub struct BootstrapConfig {
     /// must never signal processes listed in the operator's real run
     /// directory. The shipped binary supplies `<run dir>/live-children.json`.
     live_children_path: Option<PathBuf>,
+    privacy_trampoline: Option<PathBuf>,
 }
 
 impl BootstrapConfig {
@@ -166,6 +167,7 @@ impl BootstrapConfig {
             terminal_journal_path: None,
             machine_id_path: None,
             live_children_path: None,
+            privacy_trampoline: None,
         }
     }
 
@@ -174,6 +176,13 @@ impl BootstrapConfig {
     /// Embedding daemons and tests pass a path inside their own fixture tree.
     pub fn with_live_children_record(mut self, path: impl Into<PathBuf>) -> Self {
         self.live_children_path = Some(path.into());
+        self
+    }
+
+    /// macOS module launches require an explicit executable implementing the
+    /// subc-os trampoline entry point. Other systems ignore this setting.
+    pub fn with_privacy_trampoline(mut self, path: impl Into<PathBuf>) -> Self {
+        self.privacy_trampoline = Some(path.into());
         self
     }
 
@@ -519,6 +528,7 @@ pub async fn run_with_config(config: BootstrapConfig) -> Result<(), BootstrapErr
     let capture_logs_dir = config.capture_logs_dir.clone();
     let terminal_journal_path = config.terminal_journal_path.clone();
     let live_children_path = config.live_children_path.clone();
+    let privacy_trampoline = config.privacy_trampoline.clone();
     match ensure_singleton_inner(config, false).await? {
         Outcome::AlreadyRunning => {
             info!("subc daemon already running");
@@ -543,6 +553,7 @@ pub async fn run_with_config(config: BootstrapConfig) -> Result<(), BootstrapErr
                 capture_logs_dir,
                 terminal_journal_path,
                 live_children_path,
+                privacy_trampoline,
                 #[cfg(target_os = "linux")]
                 cgroup_placement,
             )
@@ -690,6 +701,7 @@ async fn serve_bound_daemon(
     capture_logs_dir: Option<PathBuf>,
     terminal_journal_path: Option<PathBuf>,
     live_children_path: Option<PathBuf>,
+    privacy_trampoline: Option<PathBuf>,
     #[cfg(target_os = "linux")] cgroup_placement: Option<subc_cgroup::Placement>,
 ) -> Result<(), BootstrapError> {
     #[cfg(unix)]
@@ -745,6 +757,10 @@ async fn serve_bound_daemon(
         .with_handle(supervisor_handle.clone())
         .with_connection_file_path(bound.connection_file_path.clone())
         .with_daemon_incarnation(daemon_incarnation.clone());
+    let supervisor = match privacy_trampoline {
+        Some(path) => supervisor.with_privacy_trampoline(path),
+        None => supervisor,
+    };
     // ABSENT MEANS NO CAPTURE AND NO JOURNAL, NOT "THE REAL RUN DIRECTORY", and
     // the difference is a production-corruption hazard rather than a preference.
     // Both fields below follow the same rule: `None` for `capture_logs_dir`

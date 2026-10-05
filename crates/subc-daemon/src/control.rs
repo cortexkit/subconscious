@@ -6927,7 +6927,7 @@ mod tests {
     {
         let registry = Arc::new(Registry::default());
         let supervisor_handle = SupervisorHandle::new();
-        let supervisor = Supervisor::new(
+        let supervisor = Supervisor::new_for_test(
             Arc::clone(&registry),
             RestartPolicy::new(1, Duration::from_millis(10)),
         )
@@ -7039,7 +7039,7 @@ mod tests {
         let registry = Arc::new(Registry::default());
         let supervisor_handle = SupervisorHandle::new();
         let supervisor =
-            Supervisor::new(Arc::clone(&registry), RestartPolicy::new(1, Duration::ZERO))
+            Supervisor::new_for_test(Arc::clone(&registry), RestartPolicy::new(1, Duration::ZERO))
                 .with_handle(supervisor_handle.clone())
                 .with_terminal_journal(journal_path.clone(), "off-worker-daemon".to_string());
         let module = supervisor
@@ -7111,7 +7111,7 @@ mod tests {
         let registry = Arc::new(Registry::default());
         let supervisor_handle = SupervisorHandle::new();
         let supervisor =
-            Supervisor::new(Arc::clone(&registry), RestartPolicy::new(1, Duration::ZERO))
+            Supervisor::new_for_test(Arc::clone(&registry), RestartPolicy::new(1, Duration::ZERO))
                 .with_handle(supervisor_handle.clone());
         let module = supervisor
             .spawn(ModuleSpec {
@@ -9675,7 +9675,7 @@ mod tests {
         let registry = Arc::new(Registry::default());
         let supervisor_handle = SupervisorHandle::new();
         let supervisor =
-            Supervisor::new(Arc::clone(&registry), RestartPolicy::new(0, Duration::ZERO))
+            Supervisor::new_for_test(Arc::clone(&registry), RestartPolicy::new(0, Duration::ZERO))
                 .with_handle(supervisor_handle.clone())
                 .with_connection_file_path(
                     std::env::temp_dir()
@@ -9830,7 +9830,7 @@ mod tests {
         let registry = Arc::new(Registry::default());
         let supervisor_handle = SupervisorHandle::new();
         let supervisor =
-            Supervisor::new(Arc::clone(&registry), RestartPolicy::new(0, Duration::ZERO))
+            Supervisor::new_for_test(Arc::clone(&registry), RestartPolicy::new(0, Duration::ZERO))
                 .with_handle(supervisor_handle.clone())
                 .with_connection_file_path(std::env::temp_dir().join(format!(
                     "subc-route-open-refusal-info-{}",
@@ -9917,7 +9917,7 @@ mod tests {
     ) -> (SupervisorHandle, crate::supervise::SupervisedModule) {
         let supervisor_handle = SupervisorHandle::new();
         let supervisor =
-            Supervisor::new(Arc::clone(registry), RestartPolicy::new(0, Duration::ZERO))
+            Supervisor::new_for_test(Arc::clone(registry), RestartPolicy::new(0, Duration::ZERO))
                 .with_handle(supervisor_handle.clone())
                 .with_connection_file_path(std::env::temp_dir().join(format!(
                     "subc-route-outage-{module_id}-{}",
@@ -10197,7 +10197,7 @@ mod tests {
             std::process::id()
         ));
         let supervisor =
-            Supervisor::new(Arc::clone(&registry), RestartPolicy::new(0, Duration::ZERO))
+            Supervisor::new_for_test(Arc::clone(&registry), RestartPolicy::new(0, Duration::ZERO))
                 .with_handle(supervisor_handle.clone());
         let module = supervisor
             .supervise_configured(
@@ -10297,9 +10297,10 @@ mod tests {
         let registry = Arc::new(Registry::default());
         let forwarding = Arc::new(ForwardingTable::default());
         let supervisor_handle = SupervisorHandle::new();
-        let supervisor = Supervisor::new(Arc::clone(&registry), crate::RestartPolicy::default())
-            .with_forwarding(Arc::clone(&forwarding))
-            .with_handle(supervisor_handle.clone());
+        let supervisor =
+            Supervisor::new_for_test(Arc::clone(&registry), crate::RestartPolicy::default())
+                .with_forwarding(Arc::clone(&forwarding))
+                .with_handle(supervisor_handle.clone());
         let module = supervisor
             .supervise_configured(
                 crate::ModuleSpec {
@@ -12360,9 +12361,10 @@ mod tests {
         async fn describe_reports_the_incarnation_and_whether_the_owner_is_configured() {
             let registry = Arc::new(Registry::default());
             let supervisor_handle = SupervisorHandle::new();
-            let supervisor = Supervisor::new(Arc::clone(&registry), RestartPolicy::default())
-                .with_handle(supervisor_handle.clone())
-                .with_daemon_incarnation("incarnation-7".to_string());
+            let supervisor =
+                Supervisor::new_for_test(Arc::clone(&registry), RestartPolicy::default())
+                    .with_handle(supervisor_handle.clone())
+                    .with_daemon_incarnation("incarnation-7".to_string());
             // Configured with enabled: false, so the supervisor lists the
             // module without spawning a process for it.
             supervisor
@@ -12544,8 +12546,9 @@ mod tests {
             let registry = Arc::new(Registry::default());
             let forwarding = Arc::new(ForwardingTable::default());
             let supervisor_handle = SupervisorHandle::new();
-            let supervisor = Supervisor::new(Arc::clone(&registry), RestartPolicy::default())
-                .with_handle(supervisor_handle.clone());
+            let supervisor =
+                Supervisor::new_for_test(Arc::clone(&registry), RestartPolicy::default())
+                    .with_handle(supervisor_handle.clone());
             supervisor
                 .supervise_configured(
                     ModuleSpec {

@@ -50,6 +50,7 @@ async fn supervisor_provenance_reports_declared_and_observed_module_facts() {
     .await;
     let after_start_ms = unix_ms();
     let supervisor = Supervisor::new(Arc::clone(&daemon.registry), RestartPolicy::default())
+        .with_privacy_trampoline(env!("CARGO_BIN_EXE_ck-subc"))
         .with_process_liveness(process_liveness)
         .with_handle(supervisor_handle)
         .with_drain_timeout(Duration::from_millis(25))
@@ -175,6 +176,7 @@ async fn supervisor_provenance_reports_a_reserved_module_reading_its_nonce_from_
     )
     .await;
     let supervisor = Supervisor::new(Arc::clone(&daemon.registry), RestartPolicy::default())
+        .with_privacy_trampoline(env!("CARGO_BIN_EXE_ck-subc"))
         .with_process_liveness(process_liveness)
         .with_handle(supervisor_handle)
         .with_drain_timeout(Duration::from_millis(25))
@@ -221,6 +223,7 @@ async fn supervisor_provenance_marks_absent_manifest_block_unverifiable() {
     )
     .await;
     let supervisor = Supervisor::new(Arc::clone(&daemon.registry), RestartPolicy::default())
+        .with_privacy_trampoline(env!("CARGO_BIN_EXE_ck-subc"))
         .with_process_liveness(process_liveness)
         .with_handle(supervisor_handle)
         .with_drain_timeout(Duration::from_millis(25))
@@ -253,6 +256,7 @@ async fn supervisor_provenance_detects_replaced_executable_image() {
     )
     .await;
     let supervisor = Supervisor::new(Arc::clone(&daemon.registry), RestartPolicy::default())
+        .with_privacy_trampoline(env!("CARGO_BIN_EXE_ck-subc"))
         .with_process_liveness(process_liveness)
         .with_handle(supervisor_handle)
         .with_drain_timeout(Duration::from_millis(25))

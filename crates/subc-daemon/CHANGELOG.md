@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.32.0
+
+- macOS behaviour change: every supervised module (wire or `protocol: "none"`, including swaps) launches as its own responsible process. Privacy prompts name the module; grants to `ck-subc` no longer reach modules. There is no opt-in or opt-out. Grants follow the module's code signature, so modules needing Screen Recording, Accessibility, Files and Folders, Local Network or Full Disk Access must use a stable team signing identity, not ad-hoc signing which prompts again after rebuilds. Linux and Windows are unchanged.
+- Require embedded macOS supervisors to configure an explicitly probed privacy trampoline. Missing symbols and trampoline failures refuse launches by name while the daemon control server remains available. Preserve pid, stdio, process group and fd-3 launch nonce with SETEXEC, and asynchronously confirm the executable before recording it for orphan cleanup. Per-spawn INFO/WARN logs expose the identity and refusal cause.
+- Existing releases ignore unknown per-module config keys. This release adds no privacy config key and requires no configuration rollout ordering.
+
 ## 0.31.1
 
 - Refuse a flow-scoped `route.open` before relaying any bind unless the target's registered manifest provides `flow-scopes/v1` in `capabilities.provides`. The refusal is terminal `target_flow_unsupported` and names the target and the capability. The check runs at admission and again against the connection the relay actually captured, so a replacement module cannot inherit its predecessor's declaration. The daemon never strips `flow_id`. Scopes without `flow_id` and unscoped routes are unaffected.

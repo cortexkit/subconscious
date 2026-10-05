@@ -277,6 +277,22 @@ async fn main() -> Result<(), StubError> {
     // Before every branch, so the witness is available on the normal supervised
     // path and not only to the exit-only shapes.
     echo_requested_env();
+    #[cfg(all(target_os = "macos", feature = "test-support"))]
+    if let Some(path) = env::var_os("FAKE_AFT_PRIVACY_REPORT") {
+        let (responsible, parent_responsible, parent, group) =
+            subc_os::privacy_identity::privacy_observation_for_test().map_err(StubError::Io)?;
+        let nonce =
+            subc_os::launch_nonce().map_err(|error| StubError::Io(io::Error::other(error)))?;
+        let observation = json!({
+            "pid": std::process::id(), "responsible_pid": responsible,
+            "parent_responsible_pid": parent_responsible, "parent_pid": parent,
+            "process_group": group, "nonce_source": nonce.map(|n| n.source().as_str()),
+        });
+        let path = PathBuf::from(path);
+        let temporary = path.with_extension("tmp");
+        fs::write(&temporary, observation.to_string()).map_err(StubError::Io)?;
+        fs::rename(temporary, path).map_err(StubError::Io)?;
+    }
     if let Ok(path) = env::var(FAKE_AFT_PID_PATH_ENV) {
         write_pid_file(Path::new(&path)).map_err(StubError::Io)?;
     }

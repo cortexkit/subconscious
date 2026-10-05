@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.20.56
+
+- Take subc-daemon 0.32: every macOS supervised module gets its own privacy identity, without a config switch. Handle the hidden SETEXEC trampoline before runtime, logging, config and CLI probes; explicitly configure and probe the daemon's executable at startup. Grants to `ck-subc` no longer cover modules. Modules needing permissions must have a stable team code signature (ad-hoc rebuilds prompt again). Linux and Windows are unchanged.
+- Add real-process identity, inherited direct-spawn control, nonce/group, failure, executable-roster and swap tests. Fault injection is confined to a dedicated test executable, never production config.
+
 ## 0.20.55
 
 - Take subc-daemon 0.31.1: flow-scoped opens to a module that does not declare `flow-scopes/v1` are refused with terminal `target_flow_unsupported`.

@@ -346,6 +346,7 @@ fn in_process_daemon_without_a_journal_path_child() {
         .join("runtime")
         .join(subc_transport::CONNECTION_FILE_NAME);
     let config = subc_daemon::bootstrap::BootstrapConfig::new(&connection, 0)
+        .with_privacy_trampoline(env!("CARGO_BIN_EXE_ck-subc"))
         .with_daemon_config_path(root.join("config/cortexkit/subc.jsonc"))
         .unwrap();
     let runtime = tokio::runtime::Runtime::new().unwrap();

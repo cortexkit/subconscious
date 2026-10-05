@@ -1,6 +1,6 @@
 [package]
 name = "subc-os"
-version = "0.1.5"
+version = "0.1.7"
 edition = "2021"
 license = "MIT"
 publish = true
@@ -22,6 +22,9 @@ rustix = { version = "1", default-features = false, features = ["process", "std"
 # of the process-usage API they check.
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dev-dependencies]
 rustix = { version = "1", default-features = false, features = ["std", "time"] }
+
+[features]
+test-support = []
 
 [lints.rust]
 unsafe_code = "deny"

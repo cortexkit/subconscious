@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.25
+
+- Update the test daemon dependency to subc-daemon 0.32 for the macOS responsible-process launch cutover.
+
 ## 0.1.24
 
 - Updates the daemon and wire dependency cascade for subc-protocol 0.29.0 (`ToolCallRequest.preset` and `ScopeAttributes.flow_id`), a release breaking for Rust struct literals. The gateway sends no preset because its MCP host supplies none; providers must decide explicitly what an absent preset gets.

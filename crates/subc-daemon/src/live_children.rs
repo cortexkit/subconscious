@@ -1025,5 +1025,33 @@ mod tests {
             child.kill().unwrap();
             child.wait().unwrap();
         }
+
+        #[tokio::test]
+        async fn an_unconfirmed_trampoline_image_is_never_signalled_by_orphan_cleanup() {
+            let dir = TestTempDir::new("sweep-unconfirmed-trampoline");
+            let path = record_path(&dir);
+            let (mut child, mut entry) = spawn_recorded(&executable("sleep"), &["60"]);
+            entry.executable = None;
+            write_record(&path, std::slice::from_ref(&entry)).unwrap();
+            let decisions = sweep_orphans(
+                &RunDirLock::acquire(&path).unwrap(),
+                &AdoptedPids::none(),
+                quick(),
+            )
+            .await;
+            assert_eq!(
+                decisions,
+                vec![(
+                    entry,
+                    SweepDecision::Mismatched(IdentityVerdict::ExecutableUnrecorded)
+                )]
+            );
+            assert!(
+                still_running(&mut child),
+                "a pid without a confirmed module image was signalled"
+            );
+            child.kill().unwrap();
+            child.wait().unwrap();
+        }
     }
 }

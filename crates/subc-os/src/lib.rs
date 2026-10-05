@@ -41,7 +41,10 @@
 
 #![deny(unsafe_code)]
 
+#[cfg(all(unix, feature = "test-support"))]
+pub mod fork_exec_test;
 pub mod launch_nonce;
+pub mod privacy_identity;
 #[cfg(unix)]
 pub use launch_nonce::LaunchNonceHandoff;
 pub use launch_nonce::{

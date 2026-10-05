@@ -188,6 +188,8 @@ async fn run_swap_inner(
             return;
         }
     };
+    #[cfg(target_os = "macos")]
+    candidate.confirm_privacy_exec().await;
     #[cfg(target_os = "linux")]
     let candidate_cgroup = candidate
         .cgroup_placement
@@ -647,10 +649,10 @@ async fn warm_candidate(
                 };
                 return Warm::Failed(CandidateFailure {
                     arm: SwapFailureArm::CandidateExited,
-                    detail: format!(
+                    detail: candidate.spawn_failure.clone().unwrap_or_else(|| format!(
                         "the candidate exited before it was ready (code {:?}, signal {:?})",
                         exit.code, exit.signal
-                    ),
+                    )),
                     exit: Some(exit),
                     connection: registered,
                 });
@@ -921,9 +923,10 @@ mod tests {
     async fn retirement_returns_promptly_and_shutdown_waits_for_its_journal() {
         let dir = subc_test_support::TestTempDir::new("background-retirement");
         let journal = dir.join("terminals.jsonl");
-        let supervisor = Supervisor::default()
-            .with_handle(SupervisorHandle::new())
-            .with_terminal_journal(journal.clone(), "retirement-test".into());
+        let supervisor =
+            Supervisor::new_for_test(Arc::new(Registry::default()), RestartPolicy::default())
+                .with_handle(SupervisorHandle::new())
+                .with_terminal_journal(journal.clone(), "retirement-test".into());
         let runtime = supervisor.runtime_config();
         let spec = ModuleSpec {
             module_id: "retiring".into(),

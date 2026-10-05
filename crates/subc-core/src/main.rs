@@ -1,11 +1,21 @@
-#![forbid(unsafe_code)]
-
 use std::{path::PathBuf, process};
 
 use cortexkit_log::{Config, SegmentRetention};
 
+fn main() {
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    // Module arguments (including --version) are settled before any runtime,
+    // logger, config, or daemon probe can interpret them.
+    #[cfg(feature = "test-support")]
+    if env!("CARGO_BIN_NAME") == "ck-subc-under-test" {
+        subc_os::privacy_identity::trampoline_main_for_test(&args);
+    }
+    subc_os::privacy_identity::trampoline_main(&args);
+    daemon_main(args);
+}
+
 #[tokio::main]
-async fn main() {
+async fn daemon_main(args: Vec<std::ffi::OsString>) {
     // Side-effect-free provenance probes: evaluated before tracing, bootstrap, or
     // any runtime state so neither touches the start-lock nor reports an
     // already-running daemon.
@@ -20,7 +30,6 @@ async fn main() {
     //
     // Scanned across all arguments rather than only the first, because the shape
     // someone types is a real invocation with the flag appended.
-    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     if args.iter().any(|arg| arg == "--version") {
         println!("ck-subc {}", env!("CARGO_PKG_VERSION"));
         return;
@@ -90,9 +99,17 @@ async fn main() {
         process::exit(1);
     }
 
+    let privacy_trampoline = match std::env::current_exe() {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("ck-subc: could not locate privacy trampoline: {error}");
+            process::exit(1);
+        }
+    };
     let daemon = async {
         let config = subc_daemon::bootstrap::BootstrapConfig::from_env_for_daemon_binary()?
             .with_cgroup_placement(placement);
+        let config = config.with_privacy_trampoline(privacy_trampoline);
         subc_daemon::bootstrap::run_with_config(config).await
     };
     if let Err(err) = daemon.await {

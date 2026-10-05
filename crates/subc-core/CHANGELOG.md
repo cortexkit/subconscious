@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.20.57
+
+- Require subc-daemon 0.32.1 so macOS status, provenance and resource reporting wait for the module image rather than exposing the launch trampoline. The physical spawn/exit feed is unchanged.
+
 ## 0.20.56
 
 - Update to subc-daemon 0.32: every macOS supervised module gets its own privacy identity, without a config switch. `ck-subc` handles its hidden launch-trampoline argument before runtime, logging, config and CLI probes; explicitly configure and probe the daemon's executable at startup. Grants to `ck-subc` no longer cover modules. Modules needing permissions must have a stable team code signature (ad-hoc rebuilds prompt again). Linux and Windows are unchanged.

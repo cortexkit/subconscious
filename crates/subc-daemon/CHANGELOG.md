@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.32.1
+
+- Keep unconfirmed macOS trampoline pids out of status, provenance and resource reporting; publish the module pid and image only after exec confirmation. The spawn/exit feed still reports physical process facts, while status and provenance report a confirmed module.
+
 ## 0.32.0
 
 - macOS behaviour change: every supervised module (wire or `protocol: "none"`, including swaps) launches as its own responsible process. Privacy prompts name the module; grants to `ck-subc` no longer reach modules. There is no opt-in or opt-out. Grants follow the module's code signature, so modules needing Screen Recording, Accessibility, Files and Folders, Local Network or Full Disk Access must use a stable team signing identity, not ad-hoc signing which prompts again after rebuilds. Linux and Windows are unchanged.

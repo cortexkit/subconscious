@@ -4075,13 +4075,16 @@ impl ControlHandler {
 
         let mut modules = Vec::with_capacity(selected.len());
         for module in selected.drain(..) {
-            let status = module.status().map_err(|err| {
-                RouterError::backend(
-                    0,
-                    frame.header.corr,
-                    format!("failed to read supervisor status: {err}"),
-                )
-            })?;
+            let (status, observed_image) = module
+                .status_and_running_image_agreement()
+                .await
+                .map_err(|err| {
+                    RouterError::backend(
+                        0,
+                        frame.header.corr,
+                        format!("failed to read supervisor status: {err}"),
+                    )
+                })?;
             let module_declared = self
                 .registry
                 .get_module(&status.module_id)
@@ -4092,10 +4095,10 @@ impl ControlHandler {
             #[cfg(test)]
             let running_image = match &self.provenance_probe_override {
                 Some(result) => result.clone(),
-                None => module.running_image_agreement().await,
+                None => observed_image,
             };
             #[cfg(not(test))]
-            let running_image = module.running_image_agreement().await;
+            let running_image = observed_image;
             modules.push(SupervisorModuleProvenance {
                 module_id: status.module_id,
                 module_declared,

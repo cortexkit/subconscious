@@ -107,6 +107,9 @@ public struct FedNegotiatedSession: Sendable, Equatable {
     public let peerIncarnation: String
     public let peerLedgerEpoch: String
     public let peerDeviceName: String
+    /// The peer's announced machine name, not a trust or pinning authority.
+    /// Nil when the hello did not announce one (normal for older peers and phones).
+    public let peerMachineID: String?
     public let localMaxBodyBytes: UInt64
     public let localKeepaliveIntervalMs: UInt64
     public let connectionAttemptID: String?

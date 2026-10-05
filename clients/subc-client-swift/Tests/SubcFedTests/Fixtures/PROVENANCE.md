@@ -1,7 +1,8 @@
 # SubcFed exact-byte fixture provenance
 
 Every fixture in this directory is an exact-byte golden vector for the
-SubcFed wire layer. The fixtures are generated deterministically from the
+SubcFed wire layer. Except for the upstream vectors identified below, fixtures
+are generated deterministically from the
 Swift implementation under `Sources/SubcFed/` using fixed cryptographic
 entropy, so the same source + same FED_HEAD-pinned wire contract always
 produces the same bytes.
@@ -127,6 +128,27 @@ the phone-originated ones (the list query, `call` and `keepalive` carrying
 `confirmed_effects`) from the production builders to the same JSON value.
 The directory is `-text` in `.gitattributes`, so checkout never rewrites the
 line endings the digest covers.
+
+### fed-wire hello identity vectors (`fed-wire/hello-identity.jsonl`)
+
+Copied byte for byte from the callosum repository, commit
+`ee69edef2de747eeafbd89b3ff892c4d4e52b05f`, path
+`test-vectors/fed-wire/hello-identity.jsonl` (32 lines: five comments and
+27 vectors), with:
+
+```bash
+git -C <callosum> show ee69edef:test-vectors/fed-wire/hello-identity.jsonl
+```
+
+SHA-256: `ce4a780f534f063284365e3a03ba335bd8b568601d2f8f106c6b3b15c7c1c096`.
+`FedHelloIdentityVectorTests` pins this digest and runs the machine-name-only
+and absent-name rows, plus machine-name refusal rows. Rows whose acceptance
+or refusal depends on `key_record` or `key_record_seen` are skipped explicitly:
+SubcFed does not decode either field yet. Counts are printed and asserted.
+
+Malformed `machine_id` values fail the whole hello with
+`fed_limits_unsupported`, exactly as callosum's refusal rows require. A valid
+name remains informational, never an authority for trust or pinning.
 
 ### rdv-wire vectors
 

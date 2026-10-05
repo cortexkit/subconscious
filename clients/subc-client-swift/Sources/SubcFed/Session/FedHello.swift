@@ -43,7 +43,8 @@ public enum FedHelloCodec {
         incarnation: String,
         ledgerEpoch: String,
         deviceName: String,
-        connectionAttemptID: String?
+        connectionAttemptID: String?,
+        machineID: String?
     ) {
         guard frame.knownType == .hello else {
             throw FedFailure.protocolViolation(byeCode: "fed_bad_frame")
@@ -119,6 +120,17 @@ public enum FedHelloCodec {
             attemptID = value
         }
 
+        var machineID: String?
+        if let value = frame.header["machine_id"] {
+            guard case .string(let id) = value,
+                  id.utf8.count == 32,
+                  id.utf8.allSatisfy({ (0x30...0x39).contains($0) || (0x61...0x66).contains($0) })
+            else {
+                throw FedFailure.protocolViolation(byeCode: "fed_limits_unsupported")
+            }
+            machineID = id
+        }
+
         return (
             versions,
             features,
@@ -128,7 +140,8 @@ public enum FedHelloCodec {
             incarnation,
             ledgerEpoch,
             deviceName,
-            attemptID
+            attemptID,
+            machineID
         )
     }
 
@@ -169,6 +182,7 @@ public enum FedHelloCodec {
             peerIncarnation: parsed.incarnation,
             peerLedgerEpoch: parsed.ledgerEpoch,
             peerDeviceName: parsed.deviceName,
+            peerMachineID: parsed.machineID,
             localMaxBodyBytes: localPolicy.maxBodyBytes,
             localKeepaliveIntervalMs: localPolicy.keepaliveIntervalMs,
             connectionAttemptID: connectionAttemptID

@@ -81,6 +81,10 @@ public actor FedSQLiteStateStore: FedStateStore {
     }
     private var connection: FedSQLiteConnection?
     private var commitBarrier: (@Sendable (CommitBarrier) throws -> Void)?
+    private var machineIDChangeLogger: @Sendable (String) -> Void = { message in
+        Logger(subsystem: "io.cortexkit.subcfed", category: "store")
+            .notice("\(message, privacy: .public)")
+    }
 
     /// Write transactions this instance has committed. Each commit is one full
     /// flush of the write-ahead log; checkpoints add flushes of their own now
@@ -126,6 +130,11 @@ public actor FedSQLiteStateStore: FedStateStore {
 
     func setCommitBarrier(_ barrier: (@Sendable (CommitBarrier) throws -> Void)?) {
         commitBarrier = barrier
+    }
+
+    /// Test hook replacing the OSLog sink, not the decision to emit a message.
+    func setMachineIDChangeLogger(_ logger: @escaping @Sendable (String) -> Void) {
+        machineIDChangeLogger = logger
     }
 
     /// True while this instance has a transaction open. Every public method
@@ -251,6 +260,7 @@ public actor FedSQLiteStateStore: FedStateStore {
                 """)
             try db.keepWriteAheadLogFiles()
             try db.execute(FedSQLiteStoreRows.confirmedRangeSchema)
+            try db.execute(FedSQLiteStoreRows.peerMachineIDSchema)
             return db
         } catch {
             throw Self.openFailure(error)
@@ -418,10 +428,52 @@ public actor FedSQLiteStateStore: FedStateStore {
         peerIncarnation: String,
         peerLedgerEpoch: String
     ) async throws {
+        try await observePeerHello(
+            responderStaticPublicKey: responderStaticPublicKey,
+            peerIncarnation: peerIncarnation,
+            peerLedgerEpoch: peerLedgerEpoch,
+            peerMachineID: nil
+        )
+    }
+
+    public func observePeerHello(
+        responderStaticPublicKey: Data,
+        peerIncarnation: String,
+        peerLedgerEpoch: String,
+        peerMachineID: String?
+    ) async throws {
         let fp = FedStateDocument.destinationKey(forResponderPublicKey: responderStaticPublicKey)
-        _ = try write { db in
+        let (previous, _) = try write { db -> String? in
             try FedSQLiteStoreRows.ensureDestination(fp: fp, responderKey: responderStaticPublicKey, in: db)
             try FedSQLiteStoreRows.setObservedPeer(incarnation: peerIncarnation, epoch: peerLedgerEpoch, fp: fp, in: db)
+            // An omitted name is not a revocation of an earlier one.
+            guard let peerMachineID else { return nil }
+            let previous = try FedSQLiteStoreRows.peerMachineID(fp: fp, in: db)
+            if previous != peerMachineID {
+                try FedSQLiteStoreRows.setPeerMachineID(peerMachineID, fp: fp, in: db)
+            }
+            return previous
+        }
+        if let previous, let peerMachineID, previous != peerMachineID {
+            let message = "Peer \(fp) changed machine_id from \(previous) to \(peerMachineID); responder pin unchanged"
+            machineIDChangeLogger(message)
+        }
+    }
+
+    /// Last valid name announced on a session authenticated to this pinned
+    /// responder key. Nil until announced; not an authority for pairing.
+    public func peerMachineID(forResponderPublicKey publicKey: Data) async throws -> String? {
+        let fp = FedStateDocument.destinationKey(forResponderPublicKey: publicKey)
+        return try read { db in try FedSQLiteStoreRows.peerMachineID(fp: fp, in: db) }
+    }
+
+    /// Call when the app unpins or forgets a Mac. Removes only its machine name,
+    /// never destination, send-log, or unsettled-effect state. Pairing authority
+    /// and the lifecycle of the responder-key pin belong to the embedding app.
+    public func forgetPeerMachineID(forResponderPublicKey publicKey: Data) async throws {
+        let fp = FedStateDocument.destinationKey(forResponderPublicKey: publicKey)
+        _ = try write { db in
+            try db.run("DELETE FROM peer_machine_id WHERE responder_fp = ?", [.text(fp)])
         }
     }
 

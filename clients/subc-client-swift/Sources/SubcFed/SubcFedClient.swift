@@ -131,6 +131,9 @@ public actor SubcFedClient {
     /// ready. It is the only place the device can see which effect wire a
     /// session uses; the Mac-side log does not record it either.
     public private(set) var negotiatedFeatures: [String] = []
+    /// The current authenticated session's announced machine name. Nil while no
+    /// session is ready or when the peer omitted it; never a pinning authority.
+    public private(set) var peerMachineID: String?
 
     private struct PendingCall {
         let effect: FedEffectID
@@ -616,6 +619,7 @@ public actor SubcFedClient {
                 }
                 activeSession = dialed
                 negotiatedFeatures = await dialed.engine.negotiatedFeatures
+                peerMachineID = await dialed.engine.peerMachineID
                 startReceiveLoop(session: dialed)
                 planner.resetBackoff()
                 publish(.ready(sessionID: await dialed.engine.sessionID))
@@ -981,6 +985,7 @@ public actor SubcFedClient {
         }
         activeSession = nil
         negotiatedFeatures = []
+        peerMachineID = nil
     }
 
     private func cancelBackgroundWork() {

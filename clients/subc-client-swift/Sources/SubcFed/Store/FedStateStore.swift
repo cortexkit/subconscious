@@ -72,6 +72,16 @@ public protocol FedStateStore: Sendable {
         peerLedgerEpoch: String
     ) async throws
 
+    /// Records a hello received on a session authenticated to this responder's
+    /// pinned key. The machine name is informational; omission keeps any saved
+    /// name. Stores without machine-name persistence use the default below.
+    func observePeerHello(
+        responderStaticPublicKey: Data,
+        peerIncarnation: String,
+        peerLedgerEpoch: String,
+        peerMachineID: String?
+    ) async throws
+
     /// Poisons a serving ledger epoch after proven regression.
     func poisonLedgerEpoch(
         responderStaticPublicKey: Data,
@@ -89,6 +99,20 @@ public protocol FedStateStore: Sendable {
 }
 
 extension FedStateStore {
+    /// Preserves compatibility with stores that only track recovery identity.
+    public func observePeerHello(
+        responderStaticPublicKey: Data,
+        peerIncarnation: String,
+        peerLedgerEpoch: String,
+        peerMachineID: String?
+    ) async throws {
+        try await observePeerHello(
+            responderStaticPublicKey: responderStaticPublicKey,
+            peerIncarnation: peerIncarnation,
+            peerLedgerEpoch: peerLedgerEpoch
+        )
+    }
+
     /// Reserves with `reserveEffectSequence`, then commits the intent with
     /// `commitIntent`: two durable writes, for stores that cannot join them.
     public func reserveEffectSequenceAndCommitIntent(
@@ -225,6 +249,21 @@ public actor FedFaultInjectingStateStore: FedStateStore {
             responderStaticPublicKey: responderStaticPublicKey,
             peerIncarnation: peerIncarnation,
             peerLedgerEpoch: peerLedgerEpoch
+        )
+    }
+
+    public func observePeerHello(
+        responderStaticPublicKey: Data,
+        peerIncarnation: String,
+        peerLedgerEpoch: String,
+        peerMachineID: String?
+    ) async throws {
+        try check(.observePeer)
+        try await inner.observePeerHello(
+            responderStaticPublicKey: responderStaticPublicKey,
+            peerIncarnation: peerIncarnation,
+            peerLedgerEpoch: peerLedgerEpoch,
+            peerMachineID: peerMachineID
         )
     }
 

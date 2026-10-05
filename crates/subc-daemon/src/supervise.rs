@@ -121,7 +121,7 @@ struct PrivacyExec {
 }
 
 #[cfg(all(test, target_os = "macos"))]
-fn test_privacy_trampoline() -> PathBuf {
+pub(crate) fn test_privacy_trampoline() -> PathBuf {
     // Cargo's unit-test executable lives in <profile>/deps; its fixture bin
     // lives beside that directory. This honors custom CARGO_TARGET_DIR too.
     std::env::current_exe()

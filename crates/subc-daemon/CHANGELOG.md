@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.32.1
+
+- Isolate the run-directory lock release test from concurrent forks. A forked child can temporarily retain the flock even when the descriptor is close-on-exec; a deterministic process test observes that interval and verifies release at the trampoline's first exec. No production lock or spawn behaviour changes.
+
 ## 0.32.0
 
 - macOS behaviour change: every supervised module (wire or `protocol: "none"`, including swaps) launches as its own responsible process. Privacy prompts name the module; grants to `ck-subc` no longer reach modules. There is no opt-in or opt-out. Grants follow the module's code signature, so modules needing Screen Recording, Accessibility, Files and Folders, Local Network or Full Disk Access must use a stable team signing identity, not ad-hoc signing which prompts again after rebuilds. Linux and Windows are unchanged.

@@ -1,6 +1,6 @@
 [package]
 name = "subc-daemon"
-version = "0.32.0"
+version = "0.32.1"
 edition = "2021"
 publish = true
 description = "Embeddable subc daemon: bootstrap, module supervision, and opaque-byte splice routing."
@@ -29,7 +29,7 @@ serde_json = "1"
 sha2 = "0.10"
 subc-control = { path = "../subc-control", version = "0.28" }
 subc-jsonc = { path = "../subc-jsonc", version = "0.1.0" }
-subc-os = { path = "../subc-os", version = "0.1.6" }
+subc-os = { path = "../subc-os", version = "0.1.7" }
 subc-protocol = { path = "../subc-protocol", version = "0.29.1" }
 subc-transport = { path = "../subc-transport", version = "0.10" }
 subc-uptime = { path = "../subc-uptime", version = "0.1.0" }
@@ -51,6 +51,7 @@ subc-jobobject = { path = "../subc-jobobject", version = "0.2.0" }
 rustix = { version = "1", default-features = false, features = ["process"] }
 
 [dev-dependencies]
+subc-os = { path = "../subc-os", version = "0.1.7", features = ["test-support"] }
 subc-test-support = { path = "../subc-test-support" }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 loom = "0.7"

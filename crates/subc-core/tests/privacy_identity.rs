@@ -335,6 +335,28 @@ mod macos {
             .contains("privacy identity trampoline executable mismatch"));
         assert!(fixture.roster()["children"].as_array().unwrap().is_empty());
     }
+
+    pub fn module_exit_121() {
+        let fixture = Fixture::boot(true, false, json!({"FAKE_AFT_EXIT_CODE":"121"}));
+        let report = fixture.observation();
+        assert_eq!(report["responsible_pid"], report["pid"]);
+        fixture.wait(|| fixture.status()["module"]["state"] == "failed");
+        assert_eq!(fixture.status()["module"]["last_exit_code"], 121);
+        let terminals = fixture.ck(&["module", "terminals", "privacy-stub", "--json"]);
+        let history = String::from_utf8_lossy(&terminals.stdout);
+        assert!(history.contains("crash budget exhausted"), "{history}");
+        assert!(
+            !history.contains("privacy identity"),
+            "module exit 121 is not a trampoline refusal: {history}"
+        );
+        assert!(
+            !history.contains("responsibility_spawnattrs_setdisclaim"),
+            "module exit 121 is not a trampoline refusal: {history}"
+        );
+        assert!(!fixture
+            .log()
+            .contains("privacy identity trampoline refused module spawn"));
+    }
 }
 
 macro_rules! macos_test {
@@ -382,4 +404,8 @@ macos_test!(
 macos_test!(
     macos_trampoline_image_is_never_accepted_as_module,
     trampoline_image_refused
+);
+macos_test!(
+    macos_exec_success_with_immediate_exit_121_is_not_a_trampoline_refusal,
+    module_exit_121
 );

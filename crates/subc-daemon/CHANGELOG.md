@@ -5,6 +5,7 @@
 - macOS behaviour change: every supervised module (wire or `protocol: "none"`, including swaps) launches as its own responsible process. Privacy prompts name the module; grants to `ck-subc` no longer reach modules. There is no opt-in or opt-out. Grants follow the module's code signature, so modules needing Screen Recording, Accessibility, Files and Folders, Local Network or Full Disk Access must use a stable team signing identity, not ad-hoc signing which prompts again after rebuilds. Linux and Windows are unchanged.
 - Require embedded macOS supervisors to configure an explicitly probed privacy trampoline. Missing symbols and trampoline failures refuse launches by name while the daemon control server remains available. Preserve pid, stdio, process group and fd-3 launch nonce with SETEXEC, and asynchronously confirm the executable before recording it for orphan cleanup. Per-spawn INFO/WARN logs expose the identity and refusal cause.
 - Existing releases ignore unknown per-module config keys. This release adds no privacy config key and requires no configuration rollout ordering.
+- Exec acknowledgement distinguishes tagged trampoline refusals from empty successful exec EOF, preserving normal terminal records even when a real module exits immediately with codes 120–123.
 
 ## 0.31.1
 

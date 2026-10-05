@@ -23,15 +23,20 @@ At startup the supervisor probes its explicit trampoline once. It must resolve
 the responsibility symbol and return the fixed capability response. A missing
 symbol or wrong binary produces one ERROR; the daemon keeps serving `ck`, but
 each module launch refuses with the named cause. Each trampoline also resolves
-the symbol independently. Lookup, attribute setup and spawn failures print one
-stderr line and exit with reserved codes 120–123. **Never fall back to ordinary
+the symbol independently. Lookup, attribute setup and spawn failures write a
+short tagged refusal record with the named cause to the acknowledgement pipe,
+print one stderr line and exit with reserved codes 120–123. Exit status alone
+never identifies a refusal: a real module can return any of those codes.
+**Never fall back to ordinary
 exec:** that would silently give a module the daemon's grants again.
 
 A separate acknowledgement pipe has its write descriptor above fd 3 and stdio.
 It survives the first exec; the trampoline makes it CLOEXEC for SETEXEC. The
 parent drops its writer immediately after spawn. The asynchronous child monitor
-waits at most five seconds for EOF, checks whether the child exited, then
-compares the kernel image's device/inode with the resolved module executable.
+reads through EOF within five seconds. A tagged nonempty record names a refusal;
+empty EOF acknowledges exec. If the module already exited, no image is admitted
+and its ordinary exit/restart classification remains unchanged. Otherwise the
+monitor compares the kernel image's device/inode with the resolved executable.
 The supervisor refuses a missing or mismatched image, kills the fresh process
 group, and records the named spawn failure under the usual restart budget. A
 script retains the existing orphan-identity rule: the kernel's selected

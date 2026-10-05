@@ -14,6 +14,9 @@ pub fn failure_cause(code: Option<i32>) -> Option<&'static str> {
 
 /// Capability response checked by embedding supervisors before using a binary.
 pub const TRAMPOLINE_PROBE: &str = "subc-privacy-trampoline/v1";
+/// A refused SETEXEC writes this tag and its cause before closing the ack pipe.
+/// Empty EOF means exec succeeded, regardless of the module's eventual status.
+pub const EXEC_REFUSAL_TAG: &str = "SUBC_PRIVACY_REFUSAL_V1 ";
 
 /// Handle the hidden first argument before building any runtime. Returns only
 /// for ordinary daemon arguments. Every hidden-mode error exits, never execs a
@@ -183,7 +186,11 @@ mod macos {
     /// Success never returns. This must run in a freshly exec'd, single-threaded
     /// trampoline, NOT in pre_exec: CString and environment construction allocate.
     pub fn disclaim_exec(args: &[OsString]) -> Result<(), ExecError> {
-        exec(args, false)
+        let result = exec(args, false);
+        if let Err(error) = &result {
+            write_refusal_record(args, error);
+        }
+        result
     }
 
     /// Only the dedicated fixture binary calls this. No production config or
@@ -204,10 +211,44 @@ mod macos {
         if let Ok(ms) = std::env::var("SUBC_TEST_PRIVACY_EXEC_DELAY_MS") {
             std::thread::sleep(std::time::Duration::from_millis(ms.parse().unwrap()));
         }
-        exec(
+        let result = exec(
             args,
             std::env::var_os("SUBC_TEST_PRIVACY_MISSING_SYMBOL").is_some(),
-        )
+        );
+        if let Err(error) = &result {
+            write_refusal_record(args, error);
+        }
+        result
+    }
+
+    fn write_refusal_record(args: &[OsString], error: &ExecError) {
+        let Some(fd) = args
+            .first()
+            .and_then(|s| s.to_str())
+            .and_then(|s| s.parse::<i32>().ok())
+            .filter(|fd| *fd >= 4)
+        else {
+            return;
+        };
+        let record = format!("{}{error}\n", super::EXEC_REFUSAL_TAG);
+        let bytes = record.as_bytes();
+        let mut written = 0;
+        while written < bytes.len() {
+            // SAFETY: write borrows a live byte buffer and retains no pointer.
+            // The descriptor is the inherited ack pipe, never nonce or stdio.
+            // This runs after exec in a single-threaded trampoline, not pre_exec.
+            #[allow(unsafe_code)]
+            let count =
+                unsafe { libc::write(fd, bytes[written..].as_ptr().cast(), bytes.len() - written) };
+            if count > 0 {
+                written += count as usize;
+            } else if count == -1 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted
+            {
+                continue;
+            } else {
+                break;
+            }
+        }
     }
 
     type Disclaim = unsafe extern "C" fn(*mut libc::posix_spawnattr_t, libc::c_int) -> libc::c_int;

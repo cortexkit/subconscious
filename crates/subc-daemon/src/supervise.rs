@@ -172,7 +172,13 @@ fn probe_privacy_trampoline(path: &std::path::Path) -> Result<(), String> {
     if status.success() && answer.trim() == subc_os::privacy_identity::TRAMPOLINE_PROBE {
         return Ok(());
     }
-    let cause = subc_os::privacy_identity::failure_cause(status.code())
+    let mut diagnostic = String::new();
+    if let Some(stderr) = probe.stderr.take() {
+        let _ = stderr.take(1024).read_to_string(&mut diagnostic);
+    }
+    let cause = diagnostic
+        .trim()
+        .strip_prefix("ck-subc: own privacy identity refused: ")
         .unwrap_or("binary does not implement the privacy trampoline protocol");
     Err(format!(
         "{cause}: probe of {} exited {status}",
@@ -352,17 +358,24 @@ impl SupervisedChild {
             return;
         };
         let result = tokio::time::timeout_at(pending.deadline, async {
+            let mut record = Vec::new();
             loop {
                 let mut ready = pending.reader.readable().await?;
                 let read = ready.try_io(|reader| {
                     use std::io::Read;
                     let mut reader = reader.get_ref();
-                    reader.read(&mut [0u8; 1])
+                    let mut buffer = [0u8; 256];
+                    reader.read(&mut buffer).map(|count| (count, buffer))
                 });
                 match read {
-                    Ok(Ok(0)) => return Ok::<_, io::Error>(()),
-                    Ok(Ok(_)) => {
-                        return Err(io::Error::other("unexpected exec acknowledgement bytes"))
+                    Ok(Ok((0, _))) => return Ok::<_, io::Error>(record),
+                    Ok(Ok((count, buffer))) => {
+                        if record.len() + count > 1024 {
+                            return Err(io::Error::other(
+                                "privacy exec refusal record is too long",
+                            ));
+                        }
+                        record.extend_from_slice(&buffer[..count]);
                     }
                     Ok(Err(error)) => return Err(error),
                     Err(_) => continue,
@@ -372,27 +385,64 @@ impl SupervisedChild {
         .await;
         // Keep the reader in self across await: select cancellation must not
         // discard the handshake or reset its original five-second deadline.
-        let pending = self.privacy_exec.take().expect("pending exec");
+        let pending = self.privacy_exec.as_ref().expect("pending exec");
         let cause = match result {
             Err(_) => Some("privacy identity trampoline did not exec within 5s".to_string()),
-            Ok(Err(error)) => Some(format!("privacy identity exec acknowledgement failed: {error}")),
-            Ok(Ok(())) => match self.child.try_wait() {
-                Ok(Some(status)) => Some(subc_os::privacy_identity::failure_cause(status.code())
-                    .unwrap_or("privacy identity trampoline exited before its module image was accepted").to_string()),
+            Ok(Err(error)) => Some(format!(
+                "privacy identity exec acknowledgement failed: {error}"
+            )),
+            Ok(Ok(record)) if !record.is_empty() => Some(
+                std::str::from_utf8(&record)
+                    .ok()
+                    .and_then(|record| {
+                        record
+                            .trim()
+                            .strip_prefix(subc_os::privacy_identity::EXEC_REFUSAL_TAG)
+                    })
+                    .filter(|cause| !cause.is_empty())
+                    .unwrap_or("invalid privacy exec refusal record")
+                    .to_string(),
+            ),
+            Ok(Ok(_)) => match self.child.try_wait() {
+                // Empty EOF is the exec acknowledgement. A real module may exit
+                // immediately, including with a reserved trampoline status; no
+                // image is admitted, and its ordinary exit contract stays intact.
+                Ok(Some(_status)) => None,
                 Err(error) => Some(format!("privacy identity trampoline wait failed: {error}")),
                 Ok(None) => {
                     let image = observe_spawned_image(self.pid);
-                    if let Some(image) = image.filter(|image| image.executable.is_some() && image.executable != pending.trampoline && (image.executable == pending.expected || pending.script)) {
-                        if let Some(guard) = &self.roster_guard { guard.confirm_executable(image); }
+                    if let Some(image) = image.filter(|image| {
+                        image.executable.is_some()
+                            && image.executable != pending.trampoline
+                            && (image.executable == pending.expected || pending.script)
+                    }) {
+                        if let Some(guard) = &self.roster_guard {
+                            guard.confirm_executable(image);
+                        }
                         info!(module_id = %pending.module_id, pid = self.pid,
                             "module spawned with own privacy identity (responsibility disclaimed)");
                         None
+                    } else if image.is_none()
+                        || image.is_some_and(|image| image.executable.is_none())
+                    {
+                        // A process can exit between try_wait and the kernel
+                        // image read. Empty EOF already acknowledged exec, so
+                        // preserve that module's ordinary exit rather than
+                        // mislabel a disappearing image as trampoline refusal.
+                        // Keep pending in self across await so cancellation does
+                        // not discard validation or reset its original deadline.
+                        match tokio::time::timeout_at(pending.deadline, self.child.wait()).await {
+                            Ok(Ok(_status)) => None,
+                            Ok(Err(error)) => Some(format!("privacy identity trampoline wait failed: {error}")),
+                            Err(_) => Some("privacy identity module executable remained unreadable until the 5s exec deadline".to_string()),
+                        }
                     } else {
                         Some("privacy identity trampoline executable mismatch: expected the module program, not ck-subc".to_string())
                     }
                 }
             },
         };
+        let pending = self.privacy_exec.take().expect("pending exec");
         if let Some(cause) = cause {
             warn!(module_id = %pending.module_id, pid = self.pid, %cause, "privacy identity trampoline refused module spawn");
             self.spawn_failure = Some(cause);

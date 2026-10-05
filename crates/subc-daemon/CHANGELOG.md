@@ -2,7 +2,7 @@
 
 ## 0.32.1
 
-- Keep unconfirmed macOS trampoline pids out of status, provenance and resource reporting; publish the module pid and image only after exec confirmation. The spawn/exit feed still reports physical process facts, while status and provenance report a confirmed module.
+- On macOS a module's pid first runs the `ck-subc` launch trampoline, which replaces itself with the module. Status, provenance and resource readings now leave that pid out until the exec acknowledgement confirms the module image, so they never report `ck-subc` as the module. The spawn/exit feed still reports physical process facts, while status and provenance report a confirmed module.
 
 ## 0.32.0
 

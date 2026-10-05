@@ -2,7 +2,7 @@
 
 ## 0.20.57
 
-- Require subc-daemon 0.32.1 so macOS status, provenance and resource reporting wait for the module image rather than exposing the launch trampoline. The physical spawn/exit feed is unchanged.
+- Require subc-daemon 0.32.1: on macOS a module's pid briefly runs a re-executed `ck-subc` (the launch trampoline) before becoming the module, and status, provenance and resource readings now wait until the module image is confirmed instead of reporting `ck-subc`. The physical spawn/exit feed is unchanged.
 
 ## 0.20.56
 

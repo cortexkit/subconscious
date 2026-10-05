@@ -124,13 +124,23 @@ struct PrivacyExec {
 pub(crate) fn test_privacy_trampoline() -> PathBuf {
     // Cargo's unit-test executable lives in <profile>/deps; its fixture bin
     // lives beside that directory. This honors custom CARGO_TARGET_DIR too.
-    std::env::current_exe()
+    let path = std::env::current_exe()
         .unwrap()
         .parent()
         .unwrap()
         .parent()
         .unwrap()
-        .join("privacy-trampoline-fixture")
+        .join("privacy-trampoline-fixture");
+    // Without the fixture every macOS spawn is refused, and the tests that
+    // spawn fail later as a module in state Failed, which names the wrong
+    // cause. `cargo test -p subc-daemon --lib` alone does not build it.
+    assert!(
+        path.exists(),
+        "privacy-trampoline-fixture not built at {}: run `cargo build -p subc-daemon \
+         --bins --features test-support` or `cargo test -p subc-daemon` first",
+        path.display()
+    );
+    path
 }
 
 #[cfg(target_os = "macos")]
@@ -267,8 +277,12 @@ struct SupervisedChild {
     child: Child,
     #[cfg(target_os = "macos")]
     privacy_exec: Option<PrivacyExec>,
-    /// Status readers share this per-launch latch with the snapshot. Ownership
-    /// keeps the real pid immediately; reporting waits for the confirmed image.
+    /// Set once this launch's exec acknowledgement confirms the module image.
+    /// On macOS the pid first runs the `ck-subc` launch trampoline (see
+    /// `subc_os::privacy_identity`), which then replaces itself with the
+    /// module. The supervisor owns and can kill that pid from spawn, but
+    /// status readers report it only after this latch is set, so nothing
+    /// reports the trampoline's image as the module's.
     #[cfg(target_os = "macos")]
     report_ready: Arc<OnceLock<()>>,
     /// Refusal before the module image was accepted, retained for terminal records.
@@ -1020,9 +1034,10 @@ pub struct ModuleStatus {
     pub drain_timeout: Duration,
     pub restart_backoff: Duration,
     pub restart_max_backoff: Duration,
-    /// The reported module process. On macOS this stays absent until the exec
-    /// acknowledgement confirms its image; launch metadata and internal process
-    /// ownership are retained while the trampoline runs.
+    /// The module's process. On macOS this stays absent while the `ck-subc`
+    /// launch trampoline is still running in that pid, and appears once the
+    /// exec acknowledgement confirms the module image has replaced it. Launch
+    /// time and the supervisor's own hold on the process are unaffected.
     pub pid: Option<u32>,
     pub spawned_at_ms: Option<u64>,
     pub spawned_from: Option<PathBuf>,
@@ -1093,8 +1108,10 @@ struct SupervisorSnapshot {
 }
 
 impl SupervisorSnapshot {
-    /// A trampoline is owned and killable before it becomes the module. Never
-    /// let a reporting probe sample that transient executable as the module's.
+    /// The pid that status, provenance and resource readings may report. While
+    /// the launch trampoline still runs in the pid, reading its executable or
+    /// resource use would describe `ck-subc`, not the module, so none is
+    /// reported until the exec acknowledgement confirms the module image.
     fn reported_pid(&self) -> Option<u32> {
         #[cfg(target_os = "macos")]
         if self
@@ -3335,9 +3352,11 @@ impl SupervisedModule {
         })
     }
 
-    /// Pair the optional pid and image using one status read. Confirmation can
-    /// finish between separate reads; a provenance reply must not combine a
-    /// pre-confirmation missing pid with a post-confirmation image observation.
+    /// The status and the running-image check for `supervisor.provenance`,
+    /// taken from one status read. The exec acknowledgement can land between
+    /// two separate reads, and the reply would then pair "no pid yet" with an
+    /// image observed after the module started, which describes no single
+    /// moment.
     pub(crate) async fn status_and_running_image_agreement(
         &self,
     ) -> Result<(ModuleStatus, subc_control::RunningImageAgreement), SuperviseError> {

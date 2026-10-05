@@ -571,13 +571,36 @@ elif command -v codesign >/dev/null; then
     staged_sig_cmp=$(printf '%s' "$staged_sig_cmp" | sed -E 's/Identifier=[^ ]+ //')
     live_sig_cmp=$(printf '%s' "$live_sig_cmp" | sed -E 's/Identifier=[^ ]+ //')
   fi
-  [ "$staged_sig_cmp" = "$live_sig_cmp" ] || refuse "signing posture differs: staged [$staged_sig] vs running [$live_sig]"
+  # The one signer change a placement may make: ad-hoc to the daemon's own team,
+  # under the same identifier. An ad-hoc running image's designated requirement is
+  # its cdhash, so no privacy grant is bound to it and none can be lost; a
+  # team-signed image keeps grants across rebuilds, which is why a module that
+  # needs one moves to the team. The reverse, and any other team, is refused.
+  team_upgrade=0
+  if [ "$(codesign -dvv "$DEST" 2>&1 | grep -c '^Signature=adhoc')" -gt 0 ] \
+    && [ "$(codesign -dvv "$STAGED" 2>&1 | grep -c '^Signature=adhoc')" -eq 0 ]; then
+    staged_team=$(codesign -dvv "$STAGED" 2>&1 | sed -n 's/^TeamIdentifier=//p' | head -1)
+    daemon_team=$(codesign -dvv "$BIN_DIR/ck-subc" 2>&1 | sed -n 's/^TeamIdentifier=//p' | head -1)
+    staged_ident=$(codesign -dvv "$STAGED" 2>&1 | sed -n 's/^Identifier=//p' | head -1)
+    live_ident=$(codesign -dvv "$DEST" 2>&1 | sed -n 's/^Identifier=//p' | head -1)
+    [ -n "$daemon_team" ] && [ "$daemon_team" != "not set" ] && [ "$staged_team" = "$daemon_team" ] \
+      || refuse "staged binary moves from ad-hoc to team [$staged_team], but only the daemon's own team [$daemon_team] is accepted"
+    if [ "$staged_ident" != "$live_ident" ] && ! { is_linker_signed "$DEST" || has_linker_identifier "$DEST"; }; then
+      refuse "staged binary moves to the team under identifier [$staged_ident], but the running identifier is [$live_ident]; keep the identifier"
+    fi
+    has_runtime "$STAGED" || refuse "a move to the team must keep hardened runtime"
+    team_upgrade=1
+    say "signing posture: $staged_sig(ad-hoc to the daemon's team $daemon_team; no grant was bound to the ad-hoc image)"
+  fi
+  [ "$team_upgrade" -eq 1 ] || [ "$staged_sig_cmp" = "$live_sig_cmp" ] || refuse "signing posture differs: staged [$staged_sig] vs running [$live_sig]"
   if has_runtime "$DEST" && ! has_runtime "$STAGED" && [ "$ALLOW_UNHARDENED" -eq 1 ]; then
     say "hardened runtime: REMOVED BY REQUEST (--allow-unhardened): after this placement any same-user process can attach to this module and read its launch nonce, until a hardened build is placed again"
   elif has_runtime "$DEST" && ! has_runtime "$STAGED"; then
     refuse "hardened runtime would be REMOVED (pass --allow-unhardened to roll back to a pre-hardening build on purpose): the running binary has it and the staged one does not, which lets any same-user process attach and read the module's launch nonce (staged [$staged_sig] vs running [$live_sig])"
   fi
-  if has_runtime "$STAGED" && ! has_runtime "$DEST"; then
+  if [ "$team_upgrade" -eq 1 ]; then
+    :
+  elif has_runtime "$STAGED" && ! has_runtime "$DEST"; then
     say "signing posture: $staged_sig(matches running except hardened runtime, which this placement ADDS)"
   else
     say "signing posture: $staged_sig(matches running)"

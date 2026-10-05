@@ -434,8 +434,12 @@ async fn route_open_refusal_keeps_the_daemons_code_and_detail() {
             tool_target("refusal-held"),
             identity.clone(),
             br#"{"kind":"unary","value":"held"}"#.to_vec(),
+            // The deadline has to outlast at least one route.open round trip,
+            // or no refusal arrives to be kept: at 600 ms a loaded Windows
+            // runner timed out the first request itself. Every retry is refused
+            // module_warming, so a longer deadline still ends on that refusal.
             CallOptions {
-                route_retry_deadline: Duration::from_millis(600),
+                route_retry_deadline: Duration::from_secs(3),
                 ..fast_call_options()
             },
         )

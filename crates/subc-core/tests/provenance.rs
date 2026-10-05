@@ -38,6 +38,221 @@ use common::{
 const PROVENANCE_REPLY_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "requires the macOS exec acknowledgement"
+)]
+async fn macos_status_and_provenance_publish_only_a_confirmed_module_pid() {
+    #[cfg(target_os = "macos")]
+    {
+        let process_liveness = Arc::new(SupervisorProcessLiveness::new());
+        let handle = SupervisorHandle::new();
+        let daemon = start_test_daemon_with_process_liveness_and_supervisor(
+            "provenance-exec-ack",
+            process_liveness.clone(),
+            handle.clone(),
+        )
+        .await;
+        let supervisor = Supervisor::new(Arc::clone(&daemon.registry), RestartPolicy::default())
+            .with_privacy_trampoline(env!("CARGO_BIN_EXE_ck-subc-under-test"))
+            .with_process_liveness(process_liveness)
+            .with_handle(handle)
+            .with_drain_timeout(Duration::from_millis(25))
+            .with_connection_file_path(daemon.connection_file_path.clone());
+        let id = "provenance-exec-ack";
+        let mut spec = stub_spec(id, vec![("SUBC_TEST_PRIVACY_EXEC_DELAY_MS", "2500")]);
+        spec.env.extend(
+            ["XDG_DATA_HOME", "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME"]
+                .into_iter()
+                .map(|key| {
+                    (
+                        key.to_string(),
+                        daemon.temp_dir.join(key).display().to_string(),
+                    )
+                }),
+        );
+        let module = supervisor.spawn(spec).unwrap();
+
+        let ClientControlResponse::SupervisorSpawnSnapshot { snapshot } = control_request(
+            &daemon,
+            40,
+            ClientControlRequest::SupervisorSpawnSnapshot {},
+        )
+        .await
+        else {
+            panic!("expected physical spawn facts");
+        };
+        let physical = snapshot
+            .live
+            .iter()
+            .find(|entry| entry.module_id == id)
+            .unwrap();
+        let image = subc_os::Process::open(physical.pid)
+            .unwrap()
+            .unwrap()
+            .observe()
+            .unwrap();
+        assert_eq!(
+            image.executable,
+            subc_os::file_identity(std::path::Path::new(env!(
+                "CARGO_BIN_EXE_ck-subc-under-test"
+            ))),
+            "the test must observe the actual delayed trampoline"
+        );
+        let pending = module.status().unwrap();
+        assert_eq!(
+            pending.pid, None,
+            "an unconfirmed trampoline pid must not be published as the module"
+        );
+        assert_eq!(pending.spawned_at_ms, Some(physical.spawned_at_ms));
+        assert!(
+            pending.process_alive,
+            "internal ownership still tracks the spawned process"
+        );
+
+        let ClientControlResponse::SupervisorProvenance { modules, .. } =
+            provenance_request(&daemon, 41, Some(id)).await
+        else {
+            panic!("expected module provenance");
+        };
+        let observed = &modules[0].daemon_observed;
+        assert_eq!(observed.pid, None);
+        assert_eq!(observed.spawned_at_ms, pending.spawned_at_ms);
+        assert_eq!(
+            observed.running_image,
+            RunningImageAgreement::Unavailable {
+                reason: subc_control::RunningImageUnavailableReason::NotRunning
+            }
+        );
+        let ClientControlResponse::SupervisorList { modules, .. } =
+            control_request(&daemon, 42, ClientControlRequest::SupervisorList {}).await
+        else {
+            panic!("expected supervisor list");
+        };
+        assert_eq!(
+            modules
+                .iter()
+                .find(|entry| entry.module_id == id)
+                .unwrap()
+                .resources,
+            Some(subc_control::ChildResourceUsage::Unavailable {
+                reason: subc_control::ChildResourceUnavailableReason::NotRunning
+            })
+        );
+        assert_eq!(
+            module.status().unwrap().pid,
+            None,
+            "the assertions must finish while exec is still delayed"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while module.status().unwrap().pid.is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "module image was never confirmed"
+            );
+            sleep(Duration::from_millis(10)).await;
+        }
+        let confirmed = module.status().unwrap();
+        assert_eq!(confirmed.pid, Some(physical.pid));
+        assert_eq!(confirmed.spawned_at_ms, pending.spawned_at_ms);
+        let image = subc_os::Process::open(physical.pid)
+            .unwrap()
+            .unwrap()
+            .observe()
+            .unwrap();
+        assert_eq!(
+            image.executable,
+            subc_os::file_identity(std::path::Path::new(env!("CARGO_BIN_EXE_fake-aft-stub")))
+        );
+        let ClientControlResponse::SupervisorProvenance { modules, .. } =
+            provenance_request(&daemon, 43, Some(id)).await
+        else {
+            panic!("expected confirmed module provenance");
+        };
+        assert_eq!(modules[0].daemon_observed.pid, confirmed.pid);
+        assert_running_image_matches(&modules[0].daemon_observed.running_image);
+        module.stop().await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "requires the macOS exec acknowledgement"
+)]
+async fn macos_refused_trampoline_never_publishes_a_module_pid() {
+    #[cfg(target_os = "macos")]
+    {
+        let liveness = Arc::new(SupervisorProcessLiveness::new());
+        let handle = SupervisorHandle::new();
+        let daemon = start_test_daemon_with_process_liveness_and_supervisor(
+            "provenance-refused",
+            liveness.clone(),
+            handle.clone(),
+        )
+        .await;
+        let supervisor = Supervisor::new(
+            Arc::clone(&daemon.registry),
+            RestartPolicy::new(0, Duration::ZERO),
+        )
+        .with_privacy_trampoline(env!("CARGO_BIN_EXE_ck-subc-under-test"))
+        .with_process_liveness(liveness)
+        .with_handle(handle)
+        .with_connection_file_path(daemon.connection_file_path.clone());
+        let id = "provenance-refused";
+        let mut spec = stub_spec(
+            id,
+            vec![
+                ("SUBC_TEST_PRIVACY_EXEC_DELAY_MS", "500"),
+                ("SUBC_TEST_PRIVACY_MISSING_SYMBOL", "1"),
+            ],
+        );
+        spec.env.extend(
+            ["XDG_DATA_HOME", "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME"]
+                .into_iter()
+                .map(|key| {
+                    (
+                        key.to_string(),
+                        daemon.temp_dir.join(key).display().to_string(),
+                    )
+                }),
+        );
+        let module = supervisor.spawn(spec).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let status = module.status().unwrap();
+            assert_eq!(
+                status.pid, None,
+                "a refused launch must never publish a module pid"
+            );
+            if status.state == subc_daemon::ModuleState::Failed {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "trampoline refusal did not finish"
+            );
+            sleep(Duration::from_millis(10)).await;
+        }
+        let ClientControlResponse::SupervisorProvenance { modules, .. } =
+            provenance_request(&daemon, 44, Some(id)).await
+        else {
+            panic!("expected refused-launch provenance");
+        };
+        assert_eq!(modules[0].daemon_observed.pid, None);
+        assert_eq!(
+            modules[0].daemon_observed.running_image,
+            RunningImageAgreement::Unavailable {
+                reason: subc_control::RunningImageUnavailableReason::NotRunning
+            }
+        );
+        assert!(daemon.registry.get_module(id).unwrap().is_none());
+        module.stop().await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn supervisor_provenance_reports_declared_and_observed_module_facts() {
     let before_start_ms = unix_ms();
     let process_liveness = Arc::new(SupervisorProcessLiveness::new());
@@ -337,13 +552,25 @@ async fn provenance_request(
     corr: u64,
     module_id: Option<&str>,
 ) -> ClientControlResponse {
+    control_request(
+        daemon,
+        corr,
+        ClientControlRequest::SupervisorProvenance {
+            module_id: module_id.map(str::to_string),
+        },
+    )
+    .await
+}
+
+async fn control_request(
+    daemon: &TestDaemon,
+    corr: u64,
+    request: ClientControlRequest,
+) -> ClientControlResponse {
     let mut client = connect_authed_client(&daemon.connection_file_path)
         .await
         .unwrap();
-    let body = serde_json::to_vec(&ClientControlRequest::SupervisorProvenance {
-        module_id: module_id.map(str::to_string),
-    })
-    .unwrap();
+    let body = serde_json::to_vec(&request).unwrap();
     let request = Frame::build(
         FrameType::Request,
         Flags::new(false, Priority::Passive, false),

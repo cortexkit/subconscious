@@ -50,6 +50,16 @@ records the module, never the transient `ck-subc` image. This preserves the
 existing synchronous Supervisor API without blocking a Tokio worker on the
 acknowledgement. Normal shutdown can still end an unconfirmed child it owns.
 
+Status, provenance and resource reporting use the same confirmation boundary:
+the optional module pid stays absent and the running-image probe reports
+`not_running` until acknowledgement and image validation succeed. Spawn time and
+other launch metadata remain available. A refusal never publishes a module pid.
+Provenance pairs its pid and image from one status read so confirmation cannot
+split those observations. Internal shutdown, process groups and restart
+accounting continue to own the real pid from spawn. The spawn/exit feed reports
+physical process facts (including refused launches); status and provenance
+report a confirmed module, not the intermediate trampoline.
+
 Embedded macOS daemons must explicitly call
 `Supervisor::with_privacy_trampoline` (or `BootstrapConfig::with_privacy_trampoline`)
 with the `ck-subc` executable or another binary whose `main` calls `subc_os::privacy_identity::trampoline_main`

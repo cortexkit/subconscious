@@ -267,6 +267,10 @@ struct SupervisedChild {
     child: Child,
     #[cfg(target_os = "macos")]
     privacy_exec: Option<PrivacyExec>,
+    /// Status readers share this per-launch latch with the snapshot. Ownership
+    /// keeps the real pid immediately; reporting waits for the confirmed image.
+    #[cfg(target_os = "macos")]
+    report_ready: Arc<OnceLock<()>>,
     /// Refusal before the module image was accepted, retained for terminal records.
     spawn_failure: Option<String>,
     /// The protocol this process was launched with. A reload can store a new
@@ -419,6 +423,7 @@ impl SupervisedChild {
                         if let Some(guard) = &self.roster_guard {
                             guard.confirm_executable(image);
                         }
+                        let _ = self.report_ready.set(());
                         info!(module_id = %pending.module_id, pid = self.pid,
                             "module spawned with own privacy identity (responsibility disclaimed)");
                         None
@@ -1015,6 +1020,9 @@ pub struct ModuleStatus {
     pub drain_timeout: Duration,
     pub restart_backoff: Duration,
     pub restart_max_backoff: Duration,
+    /// The reported module process. On macOS this stays absent until the exec
+    /// acknowledgement confirms its image; launch metadata and internal process
+    /// ownership are retained while the trampoline runs.
     pub pid: Option<u32>,
     pub spawned_at_ms: Option<u64>,
     pub spawned_from: Option<PathBuf>,
@@ -1047,6 +1055,8 @@ struct SupervisorSnapshot {
     /// when a live PID is accepted below.
     spawn_generation: u64,
     pid: Option<u32>,
+    #[cfg(target_os = "macos")]
+    report_ready: Option<Arc<OnceLock<()>>>,
     /// Last reaped child, retained after current process facts are cleared.
     reaped_pid: Option<u32>,
     /// Whether the command-serving supervision loop has a scheduled respawn.
@@ -1083,6 +1093,20 @@ struct SupervisorSnapshot {
 }
 
 impl SupervisorSnapshot {
+    /// A trampoline is owned and killable before it becomes the module. Never
+    /// let a reporting probe sample that transient executable as the module's.
+    fn reported_pid(&self) -> Option<u32> {
+        #[cfg(target_os = "macos")]
+        if self
+            .report_ready
+            .as_ref()
+            .is_some_and(|ready| ready.get().is_none())
+        {
+            return None;
+        }
+        self.pid
+    }
+
     fn starting() -> Self {
         Self::new(ModuleState::Starting, true)
     }
@@ -1160,6 +1184,8 @@ impl SupervisorSnapshot {
             lifetime_restarts: 0,
             spawn_generation: 0,
             pid: None,
+            #[cfg(target_os = "macos")]
+            report_ready: None,
             reaped_pid: None,
             respawn_pending: false,
             coalesced_restart_pending: false,
@@ -2317,10 +2343,11 @@ impl SupervisorHandle {
         let Some(module) = self.get(module_id) else {
             return Ok(false);
         };
-        let status = module.status()?;
-        let Some((pid, start_time)) = status.pid.zip(status.process_start_time) else {
+        let snapshot = lock_snapshot(&module.inner.snapshot)?;
+        let Some((pid, start_time)) = snapshot.pid.zip(snapshot.process_start_time) else {
             return Ok(false);
         };
+        drop(snapshot);
         module.record_deliberate_severance(ProcessIdentity { pid, start_time })
     }
 
@@ -3194,6 +3221,7 @@ impl SupervisedModule {
 
     pub fn status(&self) -> Result<ModuleStatus, SuperviseError> {
         self.status_with_snapshot_lock(&self.inner.snapshot, None)
+            .map(|(status, _)| status)
     }
 
     pub(crate) fn record_deliberate_severance(
@@ -3219,13 +3247,14 @@ impl SupervisedModule {
         caller: &'static str,
     ) -> Result<ModuleStatus, SuperviseError> {
         self.status_with_snapshot_lock(&self.inner.snapshot, Some(caller))
+            .map(|(status, _)| status)
     }
 
     fn status_with_snapshot_lock(
         &self,
         snapshot: &SharedSnapshot,
         caller: Option<&'static str>,
-    ) -> Result<ModuleStatus, SuperviseError> {
+    ) -> Result<(ModuleStatus, Option<SpawnedFileIdentity>), SuperviseError> {
         let mut guard = match caller {
             Some(caller) => lock_snapshot_for_control(snapshot, &self.inner.module_id, caller)?,
             None => lock_snapshot(snapshot)?,
@@ -3262,29 +3291,32 @@ impl SupervisedModule {
             ModuleProtocol::None => running_process,
         };
 
-        Ok(ModuleStatus {
-            module_id: self.inner.module_id.clone(),
-            state: snapshot.state,
-            enabled: snapshot.enabled,
-            process_alive: snapshot.process_alive,
-            registration_active,
-            protocol,
-            live,
-            restart_count,
-            lifetime_restarts: snapshot.lifetime_restarts,
-            spawn_generation: snapshot.spawn_generation,
-            max_restarts: self.inner.restart_policy.max_restarts,
-            restart_window: self.inner.restart_policy.window,
-            drain_timeout,
-            restart_backoff: self.inner.restart_policy.backoff,
-            restart_max_backoff: self.inner.restart_policy.max_backoff,
-            pid: snapshot.pid,
-            spawned_at_ms: snapshot.spawned_at_ms,
-            spawned_from: snapshot.spawned_from,
-            process_start_time: snapshot.process_start_time,
-            last_exit: snapshot.last_exit,
-            health: snapshot.health,
-        })
+        Ok((
+            ModuleStatus {
+                module_id: self.inner.module_id.clone(),
+                state: snapshot.state,
+                enabled: snapshot.enabled,
+                process_alive: snapshot.process_alive,
+                registration_active,
+                protocol,
+                live,
+                restart_count,
+                lifetime_restarts: snapshot.lifetime_restarts,
+                spawn_generation: snapshot.spawn_generation,
+                max_restarts: self.inner.restart_policy.max_restarts,
+                restart_window: self.inner.restart_policy.window,
+                drain_timeout,
+                restart_backoff: self.inner.restart_policy.backoff,
+                restart_max_backoff: self.inner.restart_policy.max_backoff,
+                pid: snapshot.reported_pid(),
+                spawned_at_ms: snapshot.spawned_at_ms,
+                spawned_from: snapshot.spawned_from,
+                process_start_time: snapshot.process_start_time,
+                last_exit: snapshot.last_exit,
+                health: snapshot.health,
+            },
+            snapshot.spawned_file_identity,
+        ))
     }
 
     #[cfg(test)]
@@ -3303,6 +3335,26 @@ impl SupervisedModule {
         })
     }
 
+    /// Pair the optional pid and image using one status read. Confirmation can
+    /// finish between separate reads; a provenance reply must not combine a
+    /// pre-confirmation missing pid with a post-confirmation image observation.
+    pub(crate) async fn status_and_running_image_agreement(
+        &self,
+    ) -> Result<(ModuleStatus, subc_control::RunningImageAgreement), SuperviseError> {
+        let (status, identity) = self.status_with_snapshot_lock(&self.inner.snapshot, None)?;
+        let image = self
+            .inner
+            .provenance_probe
+            .observe(
+                status.pid,
+                status.spawned_from.as_deref(),
+                identity,
+                status.process_start_time,
+            )
+            .await;
+        Ok((status, image))
+    }
+
     pub(crate) async fn running_image_agreement(&self) -> subc_control::RunningImageAgreement {
         let snapshot = match lock_snapshot(&self.inner.snapshot) {
             Ok(snapshot) => snapshot.clone(),
@@ -3315,7 +3367,7 @@ impl SupervisedModule {
         self.inner
             .provenance_probe
             .observe(
-                snapshot.pid,
+                snapshot.reported_pid(),
                 snapshot.spawned_from.as_deref(),
                 snapshot.spawned_file_identity,
                 snapshot.process_start_time,
@@ -3327,7 +3379,7 @@ impl SupervisedModule {
     /// process the supervisor spawned is read, not processes it has started.
     pub(crate) fn child_resource_usage(&self) -> subc_control::ChildResourceUsage {
         let (pid, start_time) = match lock_snapshot(&self.inner.snapshot) {
-            Ok(snapshot) => (snapshot.pid, snapshot.process_start_time),
+            Ok(snapshot) => (snapshot.reported_pid(), snapshot.process_start_time),
             Err(_) => {
                 return subc_control::ChildResourceUsage::Unavailable {
                     reason: subc_control::ChildResourceUnavailableReason::Unreadable,
@@ -7687,6 +7739,8 @@ fn spawn_child_in_slot(
         roster_guard: Some(roster_guard),
         #[cfg(target_os = "macos")]
         privacy_exec,
+        #[cfg(target_os = "macos")]
+        report_ready: Arc::new(OnceLock::new()),
         spawn_failure: None,
     })
 }
@@ -9393,6 +9447,10 @@ fn set_running(
     state.enabled = true;
     state.process_alive = true;
     state.pid = child.id();
+    #[cfg(target_os = "macos")]
+    {
+        state.report_ready = Some(Arc::clone(&child.report_ready));
+    }
     state.spawned_at_ms = Some(child.spawned_at_ms);
     state.spawned_from = Some(child.spawned_from.clone());
     state.spawned_file_identity = child.spawned_file_identity;
@@ -9404,6 +9462,10 @@ fn clear_current_process_facts(state: &mut SupervisorSnapshot) {
     state.process_alive = false;
     state.spawned_protocol = None;
     state.pid = None;
+    #[cfg(target_os = "macos")]
+    {
+        state.report_ready = None;
+    }
     state.spawned_at_ms = None;
     state.spawned_from = None;
     state.spawned_file_identity = None;

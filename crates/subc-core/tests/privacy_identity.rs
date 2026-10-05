@@ -127,6 +127,18 @@ mod macos {
             serde_json::from_slice(&output.stdout).unwrap_or(Value::Null)
         }
 
+        pub fn provenance(&self) -> Value {
+            let output = self.ck(&["provenance", "privacy-stub", "--json"]);
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(response["modules"][0]["module_id"], "privacy-stub");
+            response["modules"][0]["daemon_observed"].clone()
+        }
+
         pub fn roster(&self) -> Value {
             serde_json::from_slice(
                 &fs::read(self.root.join("data/cortexkit/run/live-children.json")).unwrap(),
@@ -214,6 +226,9 @@ mod macos {
         let terminals = fixture.ck(&["module", "terminals", "privacy-stub", "--json"]);
         assert!(String::from_utf8_lossy(&terminals.stdout)
             .contains("responsibility_spawnattrs_setdisclaim is unavailable"));
+        let observed = fixture.provenance();
+        assert!(observed.get("pid").is_none());
+        assert_eq!(observed["running_image"]["reason"], "not_running");
     }
 
     pub fn confirmed_roster() {
@@ -357,6 +372,53 @@ mod macos {
             .log()
             .contains("privacy identity trampoline refused module spawn"));
     }
+
+    pub fn confirmed_reporting() {
+        let fixture = Fixture::boot(
+            true,
+            true,
+            json!({"SUBC_TEST_PRIVACY_EXEC_DELAY_MS":"2500"}),
+        );
+        fixture.wait(|| {
+            fixture
+                .root
+                .join("data/cortexkit/run/live-children.json")
+                .exists()
+                && fixture.roster()["children"][0]["pid"].as_u64().is_some()
+        });
+        let physical = fixture.roster()["children"][0]["pid"].as_u64().unwrap() as u32;
+        let image = subc_os::Process::open(physical)
+            .unwrap()
+            .unwrap()
+            .observe()
+            .unwrap();
+        assert_eq!(
+            image.executable,
+            subc_os::file_identity(std::path::Path::new(env!(
+                "CARGO_BIN_EXE_ck-subc-under-test"
+            )))
+        );
+        let pending = fixture.provenance();
+        assert!(
+            pending.get("pid").is_none(),
+            "the trampoline must not be published as the module: {pending}"
+        );
+        assert_eq!(pending["running_image"]["reason"], "not_running");
+        assert!(pending["spawned_at_ms"].as_u64().unwrap() > 0);
+        fixture.wait(|| fixture.provenance()["pid"].as_u64() == Some(u64::from(physical)));
+        let confirmed = fixture.provenance();
+        assert_eq!(confirmed["spawned_at_ms"], pending["spawned_at_ms"]);
+        assert_eq!(confirmed["running_image"]["status"], "match");
+        let image = subc_os::Process::open(physical)
+            .unwrap()
+            .unwrap()
+            .observe()
+            .unwrap();
+        assert_eq!(
+            image.executable,
+            subc_os::file_identity(std::path::Path::new(env!("CARGO_BIN_EXE_fake-aft-stub")))
+        );
+    }
 }
 
 macro_rules! macos_test {
@@ -408,4 +470,8 @@ macos_test!(
 macos_test!(
     macos_exec_success_with_immediate_exit_121_is_not_a_trampoline_refusal,
     module_exit_121
+);
+macos_test!(
+    macos_cli_provenance_waits_for_the_confirmed_module_image,
+    confirmed_reporting
 );

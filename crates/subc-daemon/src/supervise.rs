@@ -5698,8 +5698,12 @@ mod tests {
                 .await
                 .unwrap();
         });
+        // The deadline only bounds a hang. A probe that never tried the IPv6
+        // address would be refused on 127.0.0.1 and fail at once, so a longer
+        // deadline does not weaken the assertion; one second timed out under a
+        // loaded parallel test run.
         assert_eq!(
-            probe_http_health(&url, Duration::from_secs(1))
+            probe_http_health(&url, Duration::from_secs(10))
                 .await
                 .unwrap()
                 .status,
@@ -7519,8 +7523,10 @@ fn spawn_child_in_slot(
             });
         }
     };
-    // The parent's writer must close immediately, or SETEXEC can never give EOF.
-    // Command holds only an integer in its pre_exec callback, not another writer.
+    // The parent must close its writer now: the acknowledgement pipe reports EOF
+    // only when every writer is gone, and the child's copy closes when the
+    // trampoline replaces itself with the module. Command holds only an integer
+    // in its pre_exec callback, not another writer.
     #[cfg(target_os = "macos")]
     drop(exec_ack);
 
@@ -7543,8 +7549,9 @@ fn spawn_child_in_slot(
     // configured program. Keep the literal program's identity for provenance,
     // but never use it as proof that a recorded pid may be signalled.
     let recorded_image = observe_spawned_image(pid);
-    // spawn() confirms the first exec only. Never persist the trampoline image;
-    // the async handshake publishes the module image after the second exec.
+    // spawn() confirms only the first exec, into the trampoline. Never persist
+    // the trampoline image; the asynchronous acknowledgement publishes the
+    // module image once the trampoline has replaced itself with the module.
     #[cfg(target_os = "macos")]
     let recorded_image = if privacy_exec.is_some() {
         None

@@ -1,5 +1,14 @@
-//! macOS responsibility isolation at exec. A trampoline replaces itself, not
-//! its pid: the supervisor's pipes, process group and nonce descriptor survive.
+//! macOS responsibility isolation at exec. macOS charges privacy permissions
+//! (Screen Recording, Accessibility, Files and Folders) to a process's
+//! "responsible process", which is normally the program that launched it, so a
+//! supervised module would otherwise borrow the daemon's grants. The daemon
+//! therefore launches each module through a trampoline: `ck-subc` re-executed
+//! with a hidden first argument. The trampoline calls `posix_spawnp` with
+//! `POSIX_SPAWN_SETEXEC`, a Darwin flag that replaces the calling process's
+//! image in place (like `execve`) instead of creating a child, after marking the
+//! spawn as disclaiming responsibility. The module keeps the trampoline's pid,
+//! process group, pipes and fd-3 launch-nonce descriptor, and becomes its own
+//! responsible process.
 
 /// Reserved exit statuses from the trampoline, distinct from ordinary CLI errors.
 pub fn failure_cause(code: Option<i32>) -> Option<&'static str> {
@@ -121,8 +130,9 @@ mod macos {
 
     impl std::error::Error for ExecError {}
 
-    /// A second pipe, independent of fd 3. The trampoline makes its write end
-    /// close-on-exec, so EOF proves SETEXEC completed (or the trampoline exited).
+    /// A second pipe, independent of the fd-3 launch-nonce pipe. The trampoline
+    /// marks its write end close-on-exec, so EOF means the trampoline either
+    /// replaced itself with the module or exited.
     pub struct ExecAcknowledgement {
         writer: OwnedFd,
     }
@@ -142,8 +152,10 @@ mod macos {
                     return Err(io::Error::last_os_error());
                 }
             }
-            // SAFETY: duplicates an owned descriptor above the nonce/stdio range.
-            // The parent copy stays CLOEXEC; only our child clears that flag.
+            // SAFETY: duplicates the owned descriptor to number 4 or higher, so it
+            // cannot collide with stdio (0-2) or the launch-nonce descriptor the
+            // child receives as fd 3. The parent copy stays CLOEXEC; only our
+            // child clears that flag.
             #[allow(unsafe_code)]
             let fd = unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 4) };
             if fd == -1 {

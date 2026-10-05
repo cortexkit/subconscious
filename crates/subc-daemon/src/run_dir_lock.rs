@@ -258,8 +258,9 @@ mod tests {
         );
         println!("paused child {child_pid}: FD_CLOEXEC=true; parent owner dropped; acquire=RunDirBusy; lsof before first exec:\n{before_text}");
 
-        // spawn returns only after the child's first exec. The fixture then
-        // deliberately remains in the trampoline, before its second SETEXEC.
+        // spawn returns only after the child's first exec, into the trampoline.
+        // The fixture then deliberately waits there, before the trampoline
+        // replaces itself with the module (see subc_os::privacy_identity).
         let child = paused.resume();
         assert_eq!(child.id(), child_pid as u32);
         assert!(

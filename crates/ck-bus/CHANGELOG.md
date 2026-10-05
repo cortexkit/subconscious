@@ -2,7 +2,7 @@
 
 ## 0.3.5
 
-- Update the test daemon dependency to subc-daemon 0.32 for the macOS responsible-process launch cutover.
+- Update the test daemon dependency to subc-daemon 0.32 whose macOS launches give each supervised module its own privacy identity.
 
 ## 0.3.4
 

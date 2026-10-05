@@ -20,7 +20,7 @@ clears close-on-exec, including when its original descriptor is already fd 3.
 ## Fail closed and executable identity
 
 At startup the supervisor probes its explicit trampoline once. It must resolve
-the responsibility symbol and return the fixed capability response. A missing
+the responsibility symbol and print the capability string `subc-privacy-trampoline/v1`. A missing
 symbol or wrong binary produces one ERROR; the daemon keeps serving `ck`, but
 each module launch refuses with the named cause. Each trampoline also resolves
 the symbol independently. Lookup, attribute setup and spawn failures write a
@@ -52,7 +52,7 @@ acknowledgement. Normal shutdown can still end an unconfirmed child it owns.
 
 Embedded macOS daemons must explicitly call
 `Supervisor::with_privacy_trampoline` (or `BootstrapConfig::with_privacy_trampoline`)
-with `ck-subc` or a binary calling `subc_os::privacy_identity::trampoline_main`
+with the `ck-subc` executable or another binary whose `main` calls `subc_os::privacy_identity::trampoline_main`
 before any runtime. The library never assumes an arbitrary host executable
 implements this protocol. Missing configuration refuses by name.
 
@@ -70,11 +70,13 @@ Each confirmed spawn logs INFO with module_id and pid:
 `module spawned with own privacy identity (responsibility disclaimed)`.
 Refusals log WARN with their cause; the trampoline's stderr also enters the
 module capture log. Supervisor diagnostics never pollute the child's own output.
-`ck module logs <id>` exposes these facts. Identity will enter `supervisor.list`
-when `subc-control` next takes a breaking release; at that point `SupervisorEntry`
-should become `#[non_exhaustive]` with a constructor so later additions do not
-force another fleet-wide source break. Status does not claim that pending disk
+`ck module logs <id>` exposes these facts. `supervisor.list` does not report
+identity yet: adding a field to `SupervisorEntry` breaks every consumer that
+builds it with a struct literal, so the field waits for a breaking
+`subc-control` release. That release should also make `SupervisorEntry`
+`#[non_exhaustive]` with a constructor, so later additions do not force another
+fleet-wide source break. Status does not claim that pending disk
 configuration is the identity of a currently running process.
 
 Existing daemon releases ignore unknown per-module config keys rather than
-rejecting them. This cutover adds no key, so no config rollout ordering is needed.
+rejecting them. This change adds no per-module configuration key, so no config rollout ordering is needed.

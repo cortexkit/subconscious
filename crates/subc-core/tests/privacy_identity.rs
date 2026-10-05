@@ -260,7 +260,7 @@ mod macos {
     }
 
     pub fn swap() {
-        // A swap uses the same trampoline and inherited nonce handoff as a boot.
+        // A swap uses the same trampoline and launch-nonce delivery (an inherited fd-3 pipe) as a boot.
         let fixture = Fixture::boot(true, false, json!({}));
         let old_pid = fixture.observation()["pid"].clone();
         fixture.wait(|| fixture.status()["module"]["live"] == true);

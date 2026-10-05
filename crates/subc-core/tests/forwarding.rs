@@ -7197,7 +7197,13 @@ where
     client.flush().await.unwrap();
 
     let ack_frame = read_frame_timeout(client).await;
-    assert_eq!(ack_frame.header.ty, FrameType::Response);
+    assert_eq!(
+        ack_frame.header.ty,
+        FrameType::Response,
+        "route.open was answered with {:?}: {}",
+        ack_frame.header.ty,
+        String::from_utf8_lossy(&ack_frame.body)
+    );
     assert_eq!(ack_frame.header.channel, 0);
     assert_eq!(ack_frame.header.corr, corr);
     match serde_json::from_slice(&ack_frame.body).unwrap() {

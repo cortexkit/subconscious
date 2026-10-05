@@ -29,9 +29,10 @@ final class FedHelloIdentityVectorTests: XCTestCase {
                 return
             }
 
-            // Success rows with key records assert read-back of those records;
-            // their full outcome is outside this decoder's scope. Only run
-            // successes without them and refusals explicitly about machine_id.
+            // Rows carrying `key_record` or `key_record_seen` (a peer's
+            // announced public keys) expect those fields read back or refused,
+            // and SubcFed does not decode them yet. Run only the successes
+            // without them and the refusals about machine_id.
             let isMachineRefusal = name.hasPrefix("refuse_machine_id_")
             let isMachineOnlySuccess = row["refusal"] == nil
                 && header["key_record"] == nil && header["key_record_seen"] == nil

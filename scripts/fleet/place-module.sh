@@ -900,6 +900,12 @@ if [ -n "$MIGRATES" ]; then
   # no -wal, mode=ro error 14. The concern the no-fallback guard was written for
   # (dropping a WAL) cannot arise when there is no WAL to drop.
   # (CKCRED + CEREB, 2026-09-19.)
+  # A store snapshot holds the module's whole database (vendor payloads,
+  # transcripts, audit rows), so it is created owner-only. sqlite3 creates the
+  # file under the process umask, which is usually 022 and would leave a copy of
+  # a 0600 store readable by every account that can enter the staging dir.
+  : > "$store_rb" && chmod 600 "$store_rb" \
+    || refuse "could not create $store_rb owner-only; nothing has been placed"
   if [ -f "$MIGRATES-wal" ] || [ -f "$MIGRATES-journal" ]; then
     say "store has a recovery sidecar; reading mode=ro (no immutable fallback)"
     sqlite3 "file:$MIGRATES?mode=ro" ".backup $store_rb" 2>/dev/null \
@@ -916,6 +922,8 @@ if [ -n "$MIGRATES" ]; then
         so the file is damaged or is not a SQLite database."
   fi
   [ -s "$store_rb" ] || refuse "store snapshot $store_rb is empty; nothing has been placed"
+  [ "$(stat -f %Lp "$store_rb" 2>/dev/null || stat -c %a "$store_rb")" = 600 ] \
+    || refuse "store snapshot $store_rb is not owner-only (0600); nothing has been placed"
   (cd "$STAGING" && shasum -a 256 "$(basename "$store_rb")" > "$(basename "$store_rb").sha256")
   say "store rollback $(basename "$store_rb") ($(stat -f %z "$store_rb" 2>/dev/null || stat -c %s "$store_rb") bytes)"
   say "ROLLBACK IS BINARY + STORE: this card migrates, so restoring the binary alone would meet a newer schema and refuse"

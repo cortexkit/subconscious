@@ -43,7 +43,28 @@ def starts():
     return result
 
 
-def guarded(argv):
+def shell_check_count(stdout, stderr):
+    """Count completed shell cases, including the first assertion that failed."""
+    return sum(line.startswith(("PASS:", "test failure:"))
+               for line in (stdout + "\n" + stderr).splitlines())
+
+
+def require_reviewed_breadth(rows):
+    unreviewed = [row["id"] for row in rows if row["outcome"] == "CAUGHT_BROADLY"]
+    if unreviewed:
+        raise RuntimeError(f"unreviewed cross-target catches: {', '.join(unreviewed)}")
+
+
+def broad_run(args):
+    # --catalogue is global and may precede the subcommand.
+    if args[0] == "--catalogue":
+        args = args[2:]
+    elif args[0].startswith("--catalogue="):
+        args = args[1:]
+    return bool(args) and args[0] == "run" and "--broad" in args
+
+
+def guarded(argv, counted=False):
     for key in ("XDG_DATA_HOME", "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME"):
         if not os.environ.get(key):
             raise RuntimeError(f"refusing an unsandboxed invocation: {key} is absent")
@@ -52,7 +73,20 @@ def guarded(argv):
     if diff:
         print(f"NON-VACUITY BREAK applied:\n{diff}", file=sys.stderr, flush=True)
     began = time.monotonic()
-    status = subprocess.call(argv, cwd=ROOT)
+    # Cargo also runs inside command-test fixtures; preserve their working directory.
+    if counted:
+        proc = subprocess.run(argv, capture_output=True, text=True, check=False)
+        print(proc.stdout, end="", flush=True)
+        print(proc.stderr, end="", file=sys.stderr, flush=True)
+        print(f"Executed {shell_check_count(proc.stdout, proc.stderr)} shell checks", flush=True)
+        # A check's own infrastructure error must not masquerade as an assertion.
+        assertion_failed = any(line.startswith("test failure:") for line in proc.stderr.splitlines())
+        infrastructure_failed = "check itself failed:" in proc.stderr or (
+            proc.returncode != 0 and not assertion_failed
+        )
+        status = 127 if infrastructure_failed else proc.returncode
+    else:
+        status = subprocess.call(argv)
     after = starts()
     record = {
         "argv": argv, "exit_code": status, "wall_s": time.monotonic() - began,
@@ -60,7 +94,8 @@ def guarded(argv):
     }
     with open(os.environ["CK_MUTATE_INVOCATIONS"], "a", encoding="utf-8") as audit:
         audit.write(json.dumps(record) + "\n")
-    print(f"host daemon starts: {before} -> {after}", file=sys.stderr, flush=True)
+    # Do not append telemetry to nextest's JSON list output. The invocation
+    # audit records both counts without contaminating the runner's parser.
     if before != after:
         raise RuntimeError("operator daemon start count changed; stop and investigate")
     # A signal is an infrastructure failure, not a command-test catch.
@@ -69,11 +104,6 @@ def guarded(argv):
 
 def cargo(args):
     real = os.environ["CK_MUTATE_REAL_CARGO"]
-    if args and args[0] == "test" and "subc-daemon" in args and "--no-run" in args:
-        status = guarded([real, "build", "--locked", "-p", "subc-daemon", "--bins",
-                          "--features", "test-support"])
-        if status:
-            return status
     return guarded([real, *args])
 
 
@@ -83,11 +113,10 @@ def main(args):
     if args and args[0] == "--command":
         if args[1:] != [COMMAND_TEST]:
             raise RuntimeError("unknown command-test id")
-        return guarded(["bash", COMMAND_TEST])
-    if sys.platform != "darwin":
-        raise RuntimeError("this catalogue requires macOS; ignored Darwin tests are not proofs")
+        return guarded(["bash", COMMAND_TEST], counted=True)
     if not args:
-        raise RuntimeError("usage: python3 mutations/replay.py baseline|check|run|prove ...")
+        raise RuntimeError("usage: python3 mutations/replay.py selftest|baseline|check|run|prove ...")
+    os.chdir(ROOT)
     real_cargo = shutil.which("cargo")
     runner = os.environ.get("CK_MUTATE", "ck-mutate")
     if not real_cargo or not shutil.which(runner):
@@ -110,17 +139,34 @@ def main(args):
         print(f"invocation evidence: {audit.relative_to(ROOT)}", flush=True)
         before = starts()
         began = time.monotonic()
-        if args == ["baseline"]:
+        if args == ["selftest"]:
+            status = guarded([sys.executable, "-m", "unittest", "discover", "-s", "mutations",
+                              "-p", "test_*.py", "-v"])
+        elif args == ["baseline"]:
             status = cargo(["build", "--locked", "-p", "subc-daemon", "--bins",
                             "--features", "test-support"])
+            if not status:
+                status = cargo(["build", "--locked", "-p", "subc-core", "--bins",
+                                "--features", "test-support"])
             for selection in BASELINES:
                 if status:
                     break
                 status = cargo(["test", "--locked", *selection])
             if not status:
-                status = guarded(["bash", COMMAND_TEST])
+                status = guarded(["bash", COMMAND_TEST], counted=True)
         else:
             status = subprocess.call([runner, *args], cwd=ROOT)
+            if status == 0 and broad_run(args):
+                try:
+                    report = next((arg.split("=", 1)[1] for arg in args if arg.startswith("--report=")), None)
+                    if "--report" in args:
+                        report = args[args.index("--report") + 1]
+                    if not report:
+                        raise RuntimeError("broad replay requires --report to enforce reviewed catches")
+                    require_reviewed_breadth(json.loads(Path(report).read_text()))
+                except (RuntimeError, OSError, ValueError) as error:
+                    print(f"breadth policy refused replay: {error}", file=sys.stderr, flush=True)
+                    status = 127
         after = starts()
         elapsed = time.monotonic() - began
         diff = subprocess.check_output(["git", "diff", "--stat"], cwd=ROOT, text=True)
@@ -128,6 +174,7 @@ def main(args):
                    "starts_before": before, "starts_after": after,
                    "restored_diff_stat": diff, "invocations": str(audit.relative_to(ROOT))}
         audit.with_suffix(".session.json").write_text(json.dumps(session, indent=2) + "\n")
+        print(f"host daemon starts: {before} -> {after}", flush=True)
         print(f"replay wall time: {elapsed:.3f}s; restored diff stat: {diff!r}", flush=True)
         if before != after:
             raise RuntimeError("operator daemon start count changed; stop and investigate")

@@ -22,7 +22,17 @@ fn main() {
             std::io::stdin().read_to_string(&mut input).unwrap();
             println!("stdin={input}");
             println!("env={}", std::env::var("SUBC_COMMAND_VALUE").unwrap());
-            println!("cwd={}", std::env::current_dir().unwrap().display());
+            // Canonical on both sides: Windows spells a canonical path with a `\\?\`
+            // prefix and macOS resolves /var to /private/var, while current_dir
+            // reports the plain form.
+            println!(
+                "cwd={}",
+                std::env::current_dir()
+                    .unwrap()
+                    .canonicalize()
+                    .unwrap()
+                    .display()
+            );
             eprintln!("child stderr");
         }
         Some("environment") => {

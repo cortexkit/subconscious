@@ -68,8 +68,8 @@ Reports, invocation audits and session timings are written under
 `target/mutations`.
 
 Never edit a target or its tests while replay is running, and never check out
-a target mid-run. Let the runner restore its edits. For a separate manual
-break, stage the live files first, confirm an empty `git diff --stat`, capture
+a target mid-run. Let the runner restore its edits. To try a deliberate
+break by hand outside the runner, stage the live files first, confirm an empty `git diff --stat`, capture
 the nonempty mutant stat, then restore with `git checkout -- <path> && touch
 <path>` and confirm an empty stat again. Do not use stash for this sequence.
 
@@ -77,9 +77,10 @@ the nonempty mutant stat, then restore with `git checkout -- <path> && touch
 
 1. Choose a behaviour with a named test and a green baseline. Read the current
    source and its callers; history is a discovery aid, not replacement text.
-   For nonce handoff, for example, moving a pipe descriptor above stdio prevents
-   child stdio setup from overwriting it, while inode validation prevents
-   consuming an unrelated pipe at the same descriptor number.
+   Name the behaviour, not the code. For example, the launch-secret pipe is
+   moved above the standard descriptors so a child's stdio setup can't
+   overwrite it, and its inode is checked so an unrelated pipe at the same
+   number is never read: those are two rows, one per behaviour.
 2. Use an `old` anchor that matches exactly once. Put exact full test names in
    `expect_red`, using qualified candidates when validation finds duplicate
    names across binaries. Set `test_file` to the guarding test's source.
@@ -104,7 +105,7 @@ the nonempty mutant stat, then restore with `git checkout -- <path> && touch
    shared invariant justifies otherwise. For HUB, name that invariant and
    approve only the relevant `hub_targets`. Review the complete red list,
    including same-target collateral; never add HUB just to obtain a pass.
-   The adapter requires a broad report and refuses unreviewed `CAUGHT_BROADLY`.
+   `mutations/replay.py` requires a broad report and refuses unreviewed `CAUGHT_BROADLY`.
 5. Report a survivor with its exact mutation and the tests that stayed green.
    Investigate whether the test misses the behaviour or the mutant is ineffective
    on the exercised path. Never hide it by changing expectations or assigning
@@ -123,9 +124,9 @@ the nonempty mutant stat, then restore with `git checkout -- <path> && touch
 | Manual dispatch | Full ordinary replay |
 
 Edit targets, `test_file`, changed rows and root prerequisite changes drive
-diff selection. Adapter/workflow changes or an unavailable event base select
+diff selection. Changes to `mutations/` or the workflow or an unavailable event base select
 all rows. Changes to undeclared helpers or fixtures may escape diff selection;
-the nightly audit is the backstop.
+the nightly `--broad` replay of every row is the backstop.
 
 Use uploaded per-shard reports and `/usr/bin/time -l` output to tune sharding
 from **GitHub-runner measurements**, not development-Mac estimates. GitHub
@@ -141,7 +142,7 @@ Recorded total replay wall time: **6198.526 s (103m 18.526s)**.
 Recorded full broad replay wall time: **1796.188 s (29m 56.188s)**.
 These are local observations, not CI budgets or a controlled speed comparison.
 
-The per-row broad times include attributed fixture preparation, build and test
+The per-row broad times include each row's own fixture preparation, build and test
 phases. They total 1763.430 s; the session total also includes runner overhead.
 
 | Row | Broad seconds |

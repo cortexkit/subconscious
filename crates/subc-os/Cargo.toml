@@ -15,8 +15,11 @@ name = "subc-os-privacy-fixture"
 path = "tests/fixtures/privacy-trampoline.rs"
 required-features = ["test-support"]
 
+# Enables the test-support feature for this crate's own tests and fixture. It
+# carries no version on purpose: a path-only dev-dependency is dropped when the
+# crate is packaged, so publishing never looks for this version on crates.io.
 [dev-dependencies]
-subc-os = { path = ".", version = "0.1.7", features = ["test-support"] }
+subc-os = { path = ".", features = ["test-support"] }
 
 # The launch-nonce handoff (dup2 and fcntl between fork and exec) and its
 # reader (fstat, ioctl) are plain POSIX calls, so every Unix takes libc.

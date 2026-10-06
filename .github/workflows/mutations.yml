@@ -1,0 +1,106 @@
+name: Mutation catalogue
+
+# GitHub-hosted macOS needs org billing capacity. A queued job has not verified
+# anything; docs/mutation-catalogue.md records that operational prerequisite.
+on:
+  pull_request:
+  push:
+    branches: ['**']
+  schedule:
+    - cron: '43 2 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mutations-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CK_MUTATE_REV: ffdd930ce43e699cc69ee5ccb75844f9383d2ed4
+  CARGO_TERM_COLOR: never
+
+jobs:
+  replay:
+    name: macOS replay (${{ matrix.shard }}/4)
+    runs-on: macos-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        # Provisional parallelism; change it using uploaded GitHub-runner times,
+        # not the heavily contended development Mac's compile times.
+        shard: [1, 2, 3, 4]
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.138
+      - name: Install pinned mutation runner
+        run: cargo install --locked --git https://github.com/cortexkit/commons --rev "$CK_MUTATE_REV" cortexkit-mutate
+      - name: Install real NATS monitoring fixture
+        run: brew install nats-server && nats-server --version
+      - name: Record tool versions and test the replay adapter
+        run: |
+          cargo --version
+          rustc --version
+          ck-mutate --version
+          cargo nextest --version
+          python3 --version
+          python3 mutations/replay.py selftest
+      - name: Validate catalogue
+        run: python3 mutations/replay.py check
+      - name: Replay selected rows and measure on the GitHub runner
+        id: replay
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          SHARD: ${{ matrix.shard }}/4
+        run: |
+          set -euo pipefail
+          selection=(--all)
+          breadth=()
+          if [[ "$EVENT" == schedule ]]; then
+            breadth=(--broad)
+          elif [[ "$EVENT" == pull_request || ( "$EVENT" == push && "$REF" != refs/heads/master ) ]]; then
+            if [[ -n "$BASE" && "$BASE" != 0000000000000000000000000000000000000000 ]] && git cat-file -e "$BASE^{commit}"; then
+              selection=(--diff "$BASE")
+              # The runner selects edit targets, test_file and changed rows, not
+              # transitive helpers. Adapter/workflow changes warrant a full replay.
+              while IFS= read -r path; do
+                case "$path" in
+                  mutations/*|.github/workflows/mutations.yml) selection=(--all) ;;
+                esac
+              done < <(git diff --name-only "$BASE" HEAD)
+            else
+              echo 'No resolvable event base: replaying all rows, not silently skipping.'
+            fi
+          fi
+          mkdir -p target/mutations
+          /usr/bin/time -l -o target/mutations/github-replay-time.txt \
+            python3 mutations/replay.py run "${selection[@]}" "${breadth[@]}" \
+            --shard "$SHARD" --report target/mutations/replay.json
+      - name: Publish measured GitHub-runner timings
+        if: always()
+        run: |
+          if [[ -f target/mutations/github-replay-time.txt ]]; then
+            {
+              echo '### GitHub macOS replay time (including prerequisites)'
+              echo '```'
+              cat target/mutations/github-replay-time.txt
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'Replay did not start; no GitHub timing measurement exists.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mutation-results-${{ github.event_name }}-${{ matrix.shard }}
+          path: target/mutations/
+          if-no-files-found: warn

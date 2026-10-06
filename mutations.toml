@@ -1,0 +1,333 @@
+# ck-mutate 0.5.2, commons ffdd930ce43e699cc69ee5ccb75844f9383d2ed4.
+prebuild = [
+  { name = "daemon-fixture-binaries", command = ["cargo", "build", "-p", "subc-daemon", "--bins", "--features", "test-support", "--locked"], timeout_s = 1800 },
+  { name = "core-fixture-binaries", command = ["cargo", "build", "-p", "subc-core", "--bins", "--features", "test-support", "--locked"], timeout_s = 1800 },
+]
+
+[[control]]
+id = "sdk-unknown-close-fails-closed"
+guards = "Unknown daemon close reasons must never reopen a route"
+file = "crates/subc-client-rs/src/consumer.rs"
+old = "| Self::Unknown(_) => RouteCloseDisposition::MustNotReopen,"
+new = """
+=> RouteCloseDisposition::MustNotReopen,
+            Self::Unknown(_) => RouteCloseDisposition::MayReopen, // NON-VACUITY BREAK"""
+edits = []
+test_file = "crates/subc-client-rs/src/consumer.rs"
+runner = "nextest"
+package = "subc-client-rs"
+target = "--lib"
+expect_red = ["consumer::tests::route_close_reason_classifier_accepts_capability_denied_and_fails_closed_for_unknown"]
+only = false
+hub = "Unknown route-close reasons must fail closed in both the SDK classifier and the independent route-close disposition decision table."
+hub_targets = ["subc-client-rs::contract_tables"]
+timeout_s = 600
+build_timeout_s = 1800
+
+
+[[control]]
+id = "sdk-scope-close-is-terminal"
+guards = "An ended authority scope cannot be reopened from its close reason"
+file = "crates/subc-client-rs/src/consumer.rs"
+old = '"scope_ended" => Self::ScopeEnded,'
+new = '"scope_ended" => Self::Reload, // NON-VACUITY BREAK'
+edits = []
+test_file = "crates/subc-client-rs/src/consumer.rs"
+runner = "nextest"
+package = "subc-client-rs"
+target = "--lib"
+expect_red = ["consumer::tests::every_scope_close_reason_must_not_reopen", "consumer::tests::two_routes_record_distinct_reasons_and_reuse_clears_channel"]
+only = false
+hub = "Ended scopes remain terminal ScopeEnded reasons in the classifier, decision table, real-daemon close handling and pending-call error metadata; treating them as Reload widens expired authority."
+hub_targets = ["subc-client-rs::contract_tables", "subc-client-rs::real_daemon"]
+timeout_s = 600
+build_timeout_s = 1800
+
+
+[[control]]
+id = "sdk-dispatch-saturation-is-degraded"
+guards = "Sustained full data dispatch changes an otherwise Ok report to Degraded"
+file = "crates/subc-client-rs/src/lib.rs"
+old = "report.status = HealthStatus::Degraded;"
+new = "report.status = HealthStatus::Ok; // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/subc-client-rs/src/lib.rs"
+runner = "nextest"
+package = "subc-client-rs"
+target = "--lib"
+expect_red = ["tests::health_check_answers_degraded_under_saturation_and_recovers"]
+only = true
+timeout_s = 600
+build_timeout_s = 1800
+
+
+[[control]]
+id = "sdk-health-bypasses-data-permits"
+guards = "Health answers while all data request permits are occupied"
+file = "crates/subc-client-rs/src/lib.rs"
+old = "let report = dispatcher.fold_health(handler.health().await);"
+new = """
+let _permit = dispatcher.permits.acquire().await.unwrap(); // NON-VACUITY BREAK
+            let report = dispatcher.fold_health(handler.health().await);"""
+edits = []
+test_file = "crates/subc-client-rs/src/lib.rs"
+runner = "nextest"
+package = "subc-client-rs"
+target = "--lib"
+expect_red = ["tests::health_check_answers_degraded_under_saturation_and_recovers", "tests::health_check_preserves_failing_under_saturation"]
+only = true
+timeout_s = 600
+build_timeout_s = 1800
+
+
+[[control]]
+id = "privacy-reports-only-confirmed-pid"
+guards = "Reporting must hide the trampoline pid until acknowledged module exec"
+file = "crates/subc-daemon/src/supervise.rs"
+old = "state.report_ready = Some(Arc::clone(&child.report_ready));"
+new = """
+let _ = child.report_ready.set(()); // NON-VACUITY BREAK
+        state.report_ready = Some(Arc::clone(&child.report_ready));"""
+edits = []
+test_file = "crates/subc-core/tests/provenance.rs"
+runner = "nextest"
+package = "subc-core"
+target = "--test provenance"
+expect_red = ["macos_status_and_provenance_publish_only_a_confirmed_module_pid", "macos_refused_trampoline_never_publishes_a_module_pid"]
+only = false
+hub = "Status, in-process provenance and CLI provenance must all withhold the trampoline pid/image until module exec is confirmed; the privacy CLI test independently guards the same publication boundary."
+hub_targets = ["subc-core::privacy_identity"]
+platforms = ["macos"]
+timeout_s = 600
+build_timeout_s = 1800
+
+
+[[control]]
+id = "privacy-disclaims-responsibility"
+guards = "Each supervised module owns its Darwin responsibility identity, including non-wire and swap children"
+file = "crates/subc-os/src/privacy_identity.rs"
+old = "let result = disclaim(&mut attr, 1);"
+new = "let result = 0; // NON-VACUITY BREAK: omit disclaim"
+edits = []
+test_file = "crates/subc-core/tests/privacy_identity.rs"
+runner = "nextest"
+package = "subc-core"
+target = "--test privacy_identity"
+expect_red = ["macos_module_is_its_own_responsible_process", "macos_protocol_none_is_also_disclaimed", "macos_swap_candidate_has_own_identity_and_fd_nonce", "macos_exec_success_with_immediate_exit_121_is_not_a_trampoline_refusal", "macos_production_config_cannot_force_symbol_failure"]
+only = true
+platforms = ["macos"]
+timeout_s = 600
+build_timeout_s = 1800
+
+
+[[control]]
+id = "privacy-missing-symbol-fails-closed"
+guards = "A missing private disclaim symbol refuses execution rather than falling back"
+file = "crates/subc-os/src/privacy_identity.rs"
+old = "let disclaim = resolve_disclaim(missing_symbol)?;"
+new = """
+#[allow(unsafe_code)]
+        unsafe extern "C" fn missing_symbol_fallback(
+            _: *mut libc::posix_spawnattr_t, _: libc::c_int,
+        ) -> libc::c_int { 0 }
+        let disclaim: Disclaim = resolve_disclaim(missing_symbol).unwrap_or(missing_symbol_fallback); // NON-VACUITY BREAK: fall through to ordinary SETEXEC"""
+edits = []
+test_file = "crates/subc-core/tests/privacy_identity.rs"
+runner = "nextest"
+package = "subc-core"
+target = "--test privacy_identity"
+expect_red = ["macos_missing_symbol_fails_closed_without_exec"]
+only = false
+hub = "A missing disclaim API is a launch refusal: neither stub execution nor a published module pid is permitted. Privacy isolation and refused-launch provenance guard that same fail-closed boundary."
+hub_targets = ["subc-core::provenance"]
+platforms = ["macos"]
+timeout_s = 600
+build_timeout_s = 1800
+
+
+[[control]]
+id = "privacy-refusal-tag-is-required"
+guards = "Tagged exec refusal records retain the named missing-symbol cause in terminals"
+file = "crates/subc-daemon/src/supervise.rs"
+old = "Ok(Ok(record)) if !record.is_empty() => Some("
+new = "Ok(Ok(record)) if false && !record.is_empty() => Some( // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/subc-core/tests/privacy_identity.rs"
+runner = "nextest"
+package = "subc-core"
+target = "--test privacy_identity"
+expect_red = ["macos_missing_symbol_fails_closed_without_exec"]
+only = true
+platforms = ["macos"]
+timeout_s = 600
+build_timeout_s = 1800
+
+
+[[control]]
+id = "wire-first-probe-failure-invalidates-ok"
+guards = "The first unanswered wire probe invalidates cached Ok before the restart threshold"
+file = "crates/subc-daemon/src/supervise.rs"
+old = """
+if state.spawned_protocol.unwrap_or(spec.protocol) == ModuleProtocol::Subc {
+            state.health.status = SupervisorHealthStatus::Unknown;
+        }"""
+new = """
+if false { // NON-VACUITY BREAK
+            state.health.status = SupervisorHealthStatus::Unknown;
+        }"""
+edits = []
+test_file = "crates/subc-daemon/src/supervise.rs"
+runner = "nextest"
+package = "subc-daemon"
+target = "--lib"
+expect_red = ["supervise::health_tombstone_tests::unanswered_probe_is_unknown_until_threshold_and_ok_report_recovers"]
+only = true
+timeout_s = 600
+build_timeout_s = 1800
+
+
+[[control]]
+id = "lock-descriptor-closes-at-first-exec"
+guards = "A forked child may temporarily retain the lock, but its first exec must release it"
+file = "crates/subc-os/src/fork_exec_test.rs"
+old = "ready[4..].copy_from_slice(&flags.to_ne_bytes());"
+new = """
+ready[4..].copy_from_slice(&flags.to_ne_bytes());
+            libc::fcntl(observed_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC); // NON-VACUITY BREAK"""
+edits = []
+test_file = "crates/subc-daemon/src/run_dir_lock.rs"
+runner = "nextest"
+package = "subc-daemon"
+target = "--lib"
+expect_red = ["run_dir_lock::tests::a_cloexec_run_dir_lock_is_retained_only_until_the_childs_first_exec"]
+only = true
+platforms = ["macos"]
+timeout_s = 600
+build_timeout_s = 1800
+
+
+[[control]]
+id = "lock-isolated-worker-is-nonvacuous"
+guards = "The isolated lock worker must execute its selected case, not report a zero-test success"
+file = "crates/subc-daemon/src/run_dir_lock.rs"
+old = '.args(["--exact", name, "--nocapture", "--test-threads=1"])'
+new = '.args(["--exact", "NON-VACUITY-BREAK-no-such-case", "--nocapture", "--test-threads=1"]) // NON-VACUITY BREAK'
+edits = []
+test_file = "crates/subc-daemon/src/run_dir_lock.rs"
+runner = "nextest"
+package = "subc-daemon"
+target = "--lib"
+expect_red = ["run_dir_lock::tests::a_cloexec_run_dir_lock_is_retained_only_until_the_childs_first_exec", "run_dir_lock::tests::a_held_run_dir_refuses_a_second_owner_and_names_the_holder"]
+only = true
+platforms = ["macos"]
+timeout_s = 600
+build_timeout_s = 1800
+
+
+[[control]]
+id = "nonce-handoff-survives-closed-stdio"
+guards = "Parent pipe descriptors must be moved above stdio before child stdio setup"
+file = "crates/subc-os/src/launch_nonce.rs"
+old = "if read_end.as_raw_fd() < LAUNCH_NONCE_FD {"
+new = "if false { // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/subc-os/src/launch_nonce/tests.rs"
+runner = "nextest"
+package = "subc-os"
+target = "--lib"
+expect_red = ["launch_nonce::tests::unix_tests::handoff_survives_each_closed_standard_descriptor"]
+only = true
+platforms = ["macos", "linux"]
+timeout_s = 600
+build_timeout_s = 1800
+
+
+[[control]]
+id = "nonce-refuses-a-different-pipe"
+guards = "An inherited fd number must not consume another pipe with a different inode"
+file = "crates/subc-os/src/launch_nonce.rs"
+old = "if found_inode != expected_inode {"
+new = "if false { // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/subc-os/src/launch_nonce/tests.rs"
+runner = "nextest"
+package = "subc-os"
+target = "--lib"
+expect_red = ["launch_nonce::tests::unix_tests::a_different_pipe_at_the_number_is_left_unread"]
+only = true
+platforms = ["macos", "linux"]
+timeout_s = 600
+build_timeout_s = 1800
+
+
+[[control]]
+id = "scope-records-reject-unknown-constraints"
+guards = "Authority-bearing scope records reject unknown fields instead of widening grants"
+file = "crates/subc-protocol/src/scope.rs"
+old = """
+#[serde(deny_unknown_fields)]
+pub struct ScopeRecord {"""
+new = """
+// NON-VACUITY BREAK: accept unknown record fields
+pub struct ScopeRecord {"""
+edits = []
+test_file = "crates/subc-protocol/tests/golden_json.rs"
+runner = "nextest"
+package = "subc-protocol"
+target = "--test golden_json"
+expect_red = ["scope_records_refuse_unknown_fields_at_every_level"]
+only = true
+timeout_s = 600
+build_timeout_s = 1800
+
+
+[[control]]
+id = "scope-principals-reject-unknown-constraints"
+guards = "Scope principal constraints are strict while non-scope caller facts remain extensible"
+file = "crates/subc-protocol/src/scope.rs"
+old = '#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]'
+new = '#[serde(tag = "kind", rename_all = "snake_case")] // NON-VACUITY BREAK'
+edits = []
+test_file = "crates/subc-protocol/tests/golden_json.rs"
+runner = "nextest"
+package = "subc-protocol"
+target = "--test golden_json"
+expect_red = ["scope_records_refuse_unknown_fields_at_every_level", "scope_selector_refuses_unknown_principal_fields"]
+only = true
+timeout_s = 600
+build_timeout_s = 1800
+
+
+[[control]]
+id = "connection-file-owner-matches-reader"
+guards = "A private-mode connection file owned by another effective uid is refused"
+file = "crates/subc-transport/src/connection_file.rs"
+old = "if meta.uid() != uid {"
+new = "if false { // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/subc-transport/src/connection_file.rs"
+runner = "nextest"
+package = "subc-transport"
+target = "--lib"
+expect_red = ["connection_file::tests::owner_only_file_validation_refuses_a_different_effective_uid"]
+only = true
+platforms = ["macos", "linux"]
+timeout_s = 600
+build_timeout_s = 1800
+
+
+[[control]]
+id = "external-path-dependencies-are-refused"
+guards = "Cargo metadata must reject paths outside the workspace, including replace entries"
+file = "scripts/checks/no-external-path-deps.sh"
+old = "if offenders:"
+new = "if False: # NON-VACUITY BREAK"
+edits = []
+test_file = "scripts/checks/no-external-path-deps.test.sh"
+runner = "command"
+command = ["python3", "mutations/replay.py", "--command", "{test}"]
+test_count_pattern = "Executed {count} shell checks"
+expect_red = ["scripts/checks/no-external-path-deps.test.sh"]
+only = false
+timeout_s = 600
+build_timeout_s = 1800

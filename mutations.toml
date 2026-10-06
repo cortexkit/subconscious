@@ -1,0 +1,89 @@
+
+[[control]]
+id = "sdk-unknown-close-fails-closed"
+guards = "Unknown daemon close reasons must never reopen a route"
+file = "crates/subc-client-rs/src/consumer.rs"
+old = "| Self::Unknown(_) => RouteCloseDisposition::MustNotReopen,"
+new = """
+=> RouteCloseDisposition::MustNotReopen,
+            Self::Unknown(_) => RouteCloseDisposition::MayReopen, // NON-VACUITY BREAK"""
+edits = []
+test_file = "crates/subc-client-rs/src/consumer.rs"
+runner = "cargo"
+package = "subc-client-rs"
+target = "--lib"
+expect_red = ["consumer::tests::route_close_reason_classifier_accepts_capability_denied_and_fails_closed_for_unknown"]
+only = true
+timeout_s = 120
+build_timeout_s = 1800
+
+
+[[control]]
+id = "sdk-scope-close-is-terminal"
+guards = "An ended authority scope cannot be reopened from its close reason"
+file = "crates/subc-client-rs/src/consumer.rs"
+old = '"scope_ended" => Self::ScopeEnded,'
+new = '"scope_ended" => Self::Reload, // NON-VACUITY BREAK'
+edits = []
+test_file = "crates/subc-client-rs/src/consumer.rs"
+runner = "cargo"
+package = "subc-client-rs"
+target = "--lib"
+expect_red = ["consumer::tests::every_scope_close_reason_must_not_reopen", "consumer::tests::two_routes_record_distinct_reasons_and_reuse_clears_channel"]
+only = true
+timeout_s = 120
+build_timeout_s = 1800
+
+
+[[control]]
+id = "sdk-dispatch-saturation-is-degraded"
+guards = "Sustained full data dispatch changes an otherwise Ok report to Degraded"
+file = "crates/subc-client-rs/src/lib.rs"
+old = "report.status = HealthStatus::Degraded;"
+new = "report.status = HealthStatus::Ok; // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/subc-client-rs/src/lib.rs"
+runner = "cargo"
+package = "subc-client-rs"
+target = "--lib"
+expect_red = ["tests::health_check_answers_degraded_under_saturation_and_recovers"]
+only = true
+timeout_s = 120
+build_timeout_s = 1800
+
+
+[[control]]
+id = "sdk-health-bypasses-data-permits"
+guards = "Health answers while all data request permits are occupied"
+file = "crates/subc-client-rs/src/lib.rs"
+old = "let report = dispatcher.fold_health(handler.health().await);"
+new = """
+let _permit = dispatcher.permits.acquire().await.unwrap(); // NON-VACUITY BREAK
+            let report = dispatcher.fold_health(handler.health().await);"""
+edits = []
+test_file = "crates/subc-client-rs/src/lib.rs"
+runner = "cargo"
+package = "subc-client-rs"
+target = "--lib"
+expect_red = ["tests::health_check_answers_degraded_under_saturation_and_recovers", "tests::health_check_preserves_failing_under_saturation"]
+only = true
+timeout_s = 120
+build_timeout_s = 1800
+
+
+[[control]]
+id = "privacy-refusal-tag-is-required"
+guards = "Tagged exec refusal records retain the named missing-symbol cause in terminals"
+file = "crates/subc-daemon/src/supervise.rs"
+old = "Ok(Ok(record)) if !record.is_empty() => Some("
+new = "Ok(Ok(record)) if false && !record.is_empty() => Some( // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/subc-core/tests/privacy_identity.rs"
+runner = "cargo"
+package = "subc-core"
+target = "--test privacy_identity"
+expect_red = ["macos_missing_symbol_fails_closed_without_exec"]
+only = true
+timeout_s = 120
+build_timeout_s = 1800
+

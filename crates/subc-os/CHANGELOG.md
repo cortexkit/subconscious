@@ -2,7 +2,7 @@
 
 ## 0.1.7
 
-- Add public `privacy_identity::DisclaimedCommand` with argument, environment, working-directory and stdio configuration, conversion to a standard command (or a Tokio command with the `tokio` feature), startup `probe`, and deadline-bound `ExecConfirmation`. macOS children use the existing single-threaded SETEXEC trampoline and refusal protocol; timeouts and invalid acknowledgements fail closed. Other platforms launch the program directly and confirm immediately. The command owns the acknowledgement writer: drop it after spawning and before confirming.
+- Add `privacy_identity::DisclaimedCommand`, so a module can launch its own child processes (agent shells, sandboxed workers) as their own macOS privacy identity instead of inheriting the module's grants. The caller's binary acts as a launcher: its `main` calls `trampoline_main` first, and the builder re-executes it, which then replaces itself with the child as a new responsible process, the same way the daemon launches modules. `probe` checks the launcher once at startup. `ExecConfirmation::confirm` waits, up to a caller deadline, for proof that the child really started; a named refusal, a timeout or a malformed answer is an error, never success. On other platforms the program starts directly and confirmation succeeds at once. Supports arguments, environment, working directory, stdio, and a Tokio command behind the `tokio` feature. After spawning, drop the command before confirming: it holds the parent's end of the confirmation pipe.
 
 ## 0.1.6
 

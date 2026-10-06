@@ -64,6 +64,8 @@ jobs:
         run: |
           set -euo pipefail
           selection=(--all)
+          # macOS runs bash 3.2, where expanding an empty array under `set -u` is an
+          # "unbound variable" error; the ${breadth[@]+...} form below avoids it.
           breadth=()
           if [[ "$EVENT" == schedule ]]; then
             breadth=(--broad)
@@ -83,7 +85,7 @@ jobs:
           fi
           mkdir -p target/mutations
           /usr/bin/time -l -o target/mutations/github-replay-time.txt \
-            python3 mutations/replay.py run "${selection[@]}" "${breadth[@]}" \
+            python3 mutations/replay.py run "${selection[@]}" ${breadth[@]+"${breadth[@]}"} \
             --shard "$SHARD" --report target/mutations/replay.json
       - name: Publish measured GitHub-runner timings
         if: always()

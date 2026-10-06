@@ -1,6 +1,10 @@
-//! Test-only control of the interval in which a forked child still holds the
-//! parent's close-on-exec descriptors. Nothing here runs in a shipped daemon.
-//! Also observes an owned child's exit without consuming its wait status.
+//! Test-only helpers. Nothing here runs in a shipped daemon.
+//!
+//! Between `fork` and `exec`, a child still holds every descriptor the parent
+//! marked close-on-exec (the run-dir lock, for example); these helpers pause a
+//! child in that window so a test can observe it. They also wait for a child's
+//! exit without reaping it, so the supervisor under test still sees the exit
+//! status itself.
 
 use std::{
     io,

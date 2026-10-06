@@ -2,7 +2,7 @@
 
 ## 0.32.3
 
-- Add deterministic macOS privacy boundary tests: socket barriers hold a non-null trampoline image at the early roster sample, and a non-reaping exit wait forces a successful module exit 121 through confirmation's already-exited arm. The sampling seam exists only in unit-test builds and the exec barrier only in the fixture binary; production behaviour is unchanged.
+- Add deterministic macOS privacy boundary tests: one holds a module launch while the privacy trampoline (the daemon's own binary, before it execs the module) is still running, and checks that the live-children roster doesn't record the trampoline as the module; the other makes a module exit 121 on its own right after a successful exec and checks it's recorded as the module's exit, not a trampoline refusal. The sampling seam exists only in unit-test builds and the exec barrier only in the fixture binary; production behaviour is unchanged.
 
 ## 0.32.2
 

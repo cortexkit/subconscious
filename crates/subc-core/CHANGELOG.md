@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.20.59
+
+- Require subc-daemon 0.32.3, which adds test-only seams for the macOS launch boundary. Shipped behaviour is unchanged.
+
 ## 0.20.58
 
 - Require subc-daemon 0.32.2 so `ck module list` stops showing a wire module as `ok` after a failed health probe. It shows `unknown` until another report arrives, while restarts still wait for the configured failure threshold.

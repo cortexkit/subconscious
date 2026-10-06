@@ -187,5 +187,5 @@ rows guarded by `supervise::privacy_exec_boundary_tests` in `subc-daemon`:
   Its terminal record must contain only the module exit and exhausted crash
   budget, never a trampoline refusal.
 
-The measured 17-row replay above predates these additions; it is not a measurement
-of the current 19-row catalogue.
+The measurements above were taken when the catalogue had 17 rows, before these two
+were added.

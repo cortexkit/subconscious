@@ -4735,6 +4735,11 @@ async fn handle_health_probe_failure(
     // tell which one is proof of anything.
     let detail = format!("[{}] {err}", err.label());
     let _ = update_snapshot(snapshot, Some(&spec.module_id), |state| {
+        // A failed wire probe invalidates the last report, even before the
+        // restart threshold. HTTP probes already mark failures as Failing.
+        if state.spawned_protocol.unwrap_or(spec.protocol) == ModuleProtocol::Subc {
+            state.health.status = SupervisorHealthStatus::Unknown;
+        }
         state.health.last_probe_ms = Some(now_ms);
         state.health.consecutive_failures = state.health.consecutive_failures.saturating_add(1);
         state.health.detail = Some(detail.clone());
@@ -11219,6 +11224,115 @@ mod health_tombstone_tests {
         let (probe_result, ()) = tokio::join!(probe, exhaust_deadline);
         let err = probe_result.expect_err("probe must miss its deadline");
         assert!(matches!(err.evidence, HealthProbeEvidence::NoAnswer));
+    }
+
+    async fn run_probe_cycle(harness: &mut ProbeHarness, answer: bool) {
+        let registry = Arc::clone(&harness.module.inner.registry);
+        let snapshot = Arc::clone(&harness.module.inner.snapshot);
+        let process_liveness = super::SupervisorProcessLiveness::default();
+        let mut child = None;
+        let cycle = super::run_health_probe_cycle(
+            &harness.spec,
+            &harness.runtime,
+            &registry,
+            &process_liveness,
+            &snapshot,
+            &mut child,
+        );
+        let peer = async {
+            let frame = harness.module_rx.recv().await.expect("health.check frame");
+            if answer {
+                harness
+                    .forwarding
+                    .complete_module_control_rpc(
+                        harness.module_connection,
+                        frame.header.corr,
+                        Some("health.check"),
+                        ModuleControlRpcOutcome::Response(ModuleControlResponse::HealthCheck {
+                            status: HealthStatus::Ok,
+                            detail: None,
+                            metrics: Some(serde_json::json!({"ready": true})),
+                        }),
+                    )
+                    .unwrap();
+            } else {
+                tokio::time::advance(harness.runtime.health.deadline).await;
+                tokio::task::yield_now().await;
+            }
+        };
+        tokio::join!(cycle, peer);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unanswered_probe_is_unknown_until_threshold_and_ok_report_recovers() {
+        let mut harness = probe_harness();
+        // Drive the probe cycle directly with an in-memory wire peer. Stop the
+        // disabled module's monitor so only this test owns lifecycle transitions;
+        // no OS process is launched, and a restart is observed at scheduling.
+        let monitor = harness.module.inner.monitor.lock().unwrap().take().unwrap();
+        monitor.abort();
+        let _ = monitor.await;
+        super::update_snapshot(&harness.module.inner.snapshot, None, |state| {
+            state.enabled = true;
+            state.state = super::ModuleState::Running;
+            state.process_alive = true;
+        })
+        .unwrap();
+
+        run_probe_cycle(&mut harness, true).await;
+        assert_eq!(
+            harness.module.status().unwrap().health.status,
+            super::SupervisorHealthStatus::Ok
+        );
+
+        for failures in 1..harness.runtime.health.failure_threshold {
+            run_probe_cycle(&mut harness, false).await;
+            let status = harness.module.status().unwrap();
+            assert_eq!(status.health.status, super::SupervisorHealthStatus::Unknown);
+            assert_eq!(status.health.consecutive_failures, failures);
+            assert!(status.health.last_probe_ms.is_some());
+            assert!(status.health.detail.unwrap().starts_with("[no-answer]"));
+            assert!(status.health.metrics.is_none());
+            assert_eq!(status.state, super::ModuleState::Running);
+            assert!(status.process_alive);
+            assert_eq!(status.restart_count, 0);
+            assert_eq!(status.lifetime_restarts, 0);
+            assert!(status.health.last_action.is_none());
+            assert!(harness.runtime.scheduled_respawn.lock().unwrap().is_none());
+        }
+
+        run_probe_cycle(&mut harness, true).await;
+        let recovered = harness.module.status().unwrap();
+        assert_eq!(recovered.health.status, super::SupervisorHealthStatus::Ok);
+        assert_eq!(recovered.health.consecutive_failures, 0);
+        assert!(recovered.health.detail.is_none());
+        assert_eq!(
+            recovered.health.metrics,
+            Some(serde_json::json!({"ready": true}))
+        );
+        assert_eq!(recovered.lifetime_restarts, 0);
+
+        for failures in 1..=harness.runtime.health.failure_threshold {
+            run_probe_cycle(&mut harness, false).await;
+            let status = harness.module.status().unwrap();
+            assert_eq!(status.health.consecutive_failures, failures);
+            if failures < harness.runtime.health.failure_threshold {
+                assert_eq!(status.health.status, super::SupervisorHealthStatus::Unknown);
+                assert_eq!(status.state, super::ModuleState::Running);
+                assert_eq!(status.lifetime_restarts, 0);
+                assert!(harness.runtime.scheduled_respawn.lock().unwrap().is_none());
+            } else {
+                assert_eq!(
+                    status.health.status,
+                    super::SupervisorHealthStatus::Unresponsive
+                );
+                assert_eq!(status.state, super::ModuleState::Restarting);
+                assert_eq!(status.restart_count, 1);
+                assert_eq!(status.lifetime_restarts, 1);
+                assert_eq!(status.health.last_action.as_deref(), Some("restart"));
+                assert!(harness.runtime.scheduled_respawn.lock().unwrap().is_some());
+            }
+        }
     }
 
     #[tokio::test(start_paused = true)]

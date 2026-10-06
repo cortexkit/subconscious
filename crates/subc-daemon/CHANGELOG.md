@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.32.2
+
+- `ck module list` and cached health now show `unknown` as soon as a wire module fails a health probe, instead of continuing to show its last `ok` report. A later successful report restores the reported health. Restarts still wait for the configured consecutive-failure threshold; route admission and HTTP-probed `protocol: "none"` modules are unchanged.
+
 ## 0.32.1
 
 - On macOS a module's pid first runs the `ck-subc` launch trampoline, which replaces itself with the module. Status, provenance and resource readings now leave that pid out until the exec acknowledgement confirms the module image, so they never report `ck-subc` as the module. The spawn/exit feed still reports physical process facts, while status and provenance report a confirmed module.

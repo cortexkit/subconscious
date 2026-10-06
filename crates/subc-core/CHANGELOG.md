@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.20.58
+
+- Require subc-daemon 0.32.2 so `ck module list` stops showing a wire module as `ok` after a failed health probe. It shows `unknown` until another report arrives, while restarts still wait for the configured failure threshold.
+
 ## 0.20.57
 
 - Require subc-daemon 0.32.1: on macOS a module's pid briefly runs a re-executed `ck-subc` (the launch trampoline) before becoming the module, and status, provenance and resource readings now wait until the module image is confirmed instead of reporting `ck-subc`. The physical spawn/exit feed is unchanged.

@@ -23,24 +23,53 @@ BASELINES = [
 COMMAND_TEST = "scripts/checks/no-external-path-deps.test.sh"
 
 
-def starts():
-    """Count today's real host log, not the sandbox's log (missing is explicit)."""
+def host_daemon_logs(now):
+    """Select both UTC log dates from an explicit, timezone-aware clock value."""
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("host daemon observation requires a timezone-aware clock")
     directory = Path(os.environ["CK_MUTATE_HOST_LOG_DIR"])
-    today = datetime.date.today().isoformat()
-    paths = [directory / "logs" / f"subc.{today}.log", directory / "subc.log"]
+    today = now.astimezone(datetime.timezone.utc).date()
+    yesterday = today - datetime.timedelta(days=1)
+    return [directory / "logs" / f"subc.{day.isoformat()}.log"
+            for day in (today, yesterday)]
+
+
+def starts(now=None, previous=None):
+    """Keep per-file counts, including the prior observation's UTC log window."""
+    if now is None:
+        now = datetime.datetime.now(datetime.timezone.utc)
+    directory = Path(os.environ["CK_MUTATE_HOST_LOG_DIR"])
+    if not directory.exists():
+        return {}
+    paths = {str(path): path for path in host_daemon_logs(now)}
+    paths.update({name: Path(name) for name in (previous or {})})
     result = {}
-    for path in paths:
+    observed = False
+    for name, path in paths.items():
         if not path.exists():
-            result[str(path)] = None
+            result[name] = None
             continue
+        observed = True
         proc = subprocess.run(
             ["grep", "-c", "subc daemon starting", str(path)],
             capture_output=True, text=True, check=False,
         )
         if proc.returncode not in (0, 1):
             raise RuntimeError(f"cannot read host daemon log: {proc.stderr}")
-        result[str(path)] = int(proc.stdout.strip())
+        result[name] = int(proc.stdout.strip())
+    if not observed:
+        raise RuntimeError("cannot observe the host daemon")
     return result
+
+
+def start_count_increased(before, after):
+    return any(count is not None and count > (before.get(name) or 0)
+               for name, count in after.items())
+
+
+def host_observation_note(before, after):
+    return ("host daemon: none on this host" if not before and not after
+            else "host daemon: UTC log counts observed")
 
 
 def shell_check_count(stdout, stderr):
@@ -87,16 +116,17 @@ def guarded(argv, counted=False):
         status = 127 if infrastructure_failed else proc.returncode
     else:
         status = subprocess.call(argv)
-    after = starts()
+    after = starts(previous=before)
     record = {
         "argv": argv, "exit_code": status, "wall_s": time.monotonic() - began,
         "starts_before": before, "starts_after": after, "diff_stat": diff,
+        "host_daemon_observation": host_observation_note(before, after),
     }
     with open(os.environ["CK_MUTATE_INVOCATIONS"], "a", encoding="utf-8") as audit:
         audit.write(json.dumps(record) + "\n")
     # Do not append telemetry to nextest's JSON list output. The invocation
     # audit records both counts without contaminating the runner's parser.
-    if before != after:
+    if start_count_increased(before, after):
         raise RuntimeError("operator daemon start count changed; stop and investigate")
     # A signal is an infrastructure failure, not a command-test catch.
     return status if status >= 0 else 127
@@ -167,16 +197,18 @@ def main(args):
                 except (RuntimeError, OSError, ValueError) as error:
                     print(f"breadth policy refused replay: {error}", file=sys.stderr, flush=True)
                     status = 127
-        after = starts()
+        after = starts(previous=before)
         elapsed = time.monotonic() - began
         diff = subprocess.check_output(["git", "diff", "--stat"], cwd=ROOT, text=True)
         session = {"args": args, "wall_s": elapsed, "exit_code": status,
                    "starts_before": before, "starts_after": after,
+                   "host_daemon_observation": host_observation_note(before, after),
                    "restored_diff_stat": diff, "invocations": str(audit.relative_to(ROOT))}
         audit.with_suffix(".session.json").write_text(json.dumps(session, indent=2) + "\n")
+        print(host_observation_note(before, after), flush=True)
         print(f"host daemon starts: {before} -> {after}", flush=True)
         print(f"replay wall time: {elapsed:.3f}s; restored diff stat: {diff!r}", flush=True)
-        if before != after:
+        if start_count_increased(before, after):
             raise RuntimeError("operator daemon start count changed; stop and investigate")
         return status
 

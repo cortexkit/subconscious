@@ -1,5 +1,6 @@
 //! Test-only control of the interval in which a forked child still holds the
 //! parent's close-on-exec descriptors. Nothing here runs in a shipped daemon.
+//! Also observes an owned child's exit without consuming its wait status.
 
 use std::{
     io,
@@ -67,4 +68,27 @@ pub fn pause_before_exec(
 /// Whether the flags a paused fork observed still include close-on-exec.
 pub fn flags_are_close_on_exec(flags: i32) -> bool {
     flags & libc::FD_CLOEXEC != 0
+}
+
+/// Wait for an owned child's exit without reaping it. The caller must retain
+/// the child handle and prevent any other task from waiting on that child until
+/// this returns, then reap it normally. Intended for short-lived test modules:
+/// this blocks until exit, not just until the module closes a pipe before exit.
+#[cfg(target_os = "macos")]
+pub fn wait_for_child_exit_without_reaping(pid: u32) -> io::Result<()> {
+    // SAFETY: waitid writes only to the local initialized siginfo_t. WNOWAIT
+    // leaves the exit status for the owning supervisor's subsequent try_wait.
+    #[allow(unsafe_code)]
+    unsafe {
+        let mut info: libc::siginfo_t = std::mem::zeroed();
+        loop {
+            if libc::waitid(libc::P_PID, pid, &mut info, libc::WEXITED | libc::WNOWAIT) == 0 {
+                return Ok(());
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+    }
 }

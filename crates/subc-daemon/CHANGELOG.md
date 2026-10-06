@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.32.3
+
+- Add deterministic macOS privacy boundary tests: socket barriers hold a non-null trampoline image at the early roster sample, and a non-reaping exit wait forces a successful module exit 121 through confirmation's already-exited arm. The sampling seam exists only in unit-test builds and the exec barrier only in the fixture binary; production behaviour is unchanged.
+
 ## 0.32.2
 
 - `ck module list` and cached health now show `unknown` as soon as a wire module fails a health probe, instead of continuing to show its last `ok` report. A later successful report restores the reported health. Restarts still wait for the configured consecutive-failure threshold; route admission and HTTP-probed `protocol: "none"` modules are unchanged.

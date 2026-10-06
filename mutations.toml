@@ -103,6 +103,46 @@ build_timeout_s = 1800
 
 
 [[control]]
+id = "privacy-roster-withholds-the-early-trampoline-image"
+guards = "The early non-null trampoline image must not enter the roster before module exec confirmation"
+file = "crates/subc-daemon/src/supervise.rs"
+old = """
+let recorded_image = if privacy_exec.is_some() {
+        None"""
+new = """
+let recorded_image = if privacy_exec.is_some() {
+        recorded_image // NON-VACUITY BREAK"""
+edits = []
+test_file = "crates/subc-daemon/src/supervise.rs"
+runner = "nextest"
+package = "subc-daemon"
+target = "--lib"
+expect_red = ["supervise::privacy_exec_boundary_tests::macos_roster_withholds_a_nonnull_trampoline_image_until_exec_confirmation"]
+only = true
+platforms = ["macos"]
+timeout_s = 600
+build_timeout_s = 1800
+
+
+[[control]]
+id = "privacy-already-exited-module-keeps-its-exit-121"
+guards = "Empty exec acknowledgement followed by an already-exited try_wait preserves module exit 121, not a trampoline refusal"
+file = "crates/subc-daemon/src/supervise.rs"
+old = "Ok(Some(_status)) => None,"
+new = "Ok(Some(status)) => subc_os::privacy_identity::failure_cause(status.code()).map(str::to_string), // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/subc-daemon/src/supervise.rs"
+runner = "nextest"
+package = "subc-daemon"
+target = "--lib"
+expect_red = ["supervise::privacy_exec_boundary_tests::macos_already_exited_121_in_try_wait_is_a_module_exit_not_a_trampoline_refusal"]
+only = true
+platforms = ["macos"]
+timeout_s = 600
+build_timeout_s = 1800
+
+
+[[control]]
 id = "privacy-disclaims-responsibility"
 guards = "Each supervised module owns its Darwin responsibility identity, including non-wire and swap children"
 file = "crates/subc-os/src/privacy_identity.rs"

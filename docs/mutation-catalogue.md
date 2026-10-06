@@ -171,21 +171,21 @@ an expected CI duration.
 
 ## Known gaps
 
-Both mutations below survived and are reported here rather than counted as
-catches. Both edit `crates/subc-daemon/src/supervise.rs`.
+No currently recorded gaps. The two former macOS privacy gaps now have catalogue
+rows guarded by `supervise::privacy_exec_boundary_tests` in `subc-daemon`:
 
-* **Early roster sampling:** replace
-  `let recorded_image = if privacy_exec.is_some() {\n        None` with
-  `let recorded_image = if privacy_exec.is_some() {\n        recorded_image // NON-VACUITY BREAK`.
-  `macos_roster_records_only_confirmed_module_image`,
-  `macos_cli_provenance_waits_for_the_confirmed_module_image` and
-  `macos_direct_spawn_inherits_responsibility_control` stayed green, as did
-  all 13 privacy tests. The early sample can itself be absent, so this does not
-  establish that the test observed an early non-null trampoline image.
-* **Immediate exit 121:** replace `Ok(Some(_status)) => None,` with
-  `Ok(Some(status)) => subc_os::privacy_identity::failure_cause(status.code()).map(str::to_string), // NON-VACUITY BREAK`.
-  `macos_exec_success_with_immediate_exit_121_is_not_a_trampoline_refusal`
-  and `macos_direct_spawn_inherits_responsibility_control` stayed green;
-  the full core package had 908 greens and zero reds. The test may take the
-  image-disappearance/reap path instead of the already-exited `try_wait` arm,
-  leaving incorrect refusal classification on that arm undetected.
+* **Early roster sampling:** `privacy-roster-withholds-the-early-trampoline-image`
+  uses loopback socket barriers in the unit-test spawn path and fixture trampoline.
+  The test verifies a non-null trampoline image while the actual early read is
+  paused, samples the persisted roster before releasing exec, then checks the
+  confirmed module image. Neither barrier runs in production.
+* **Immediate exit 121:** `privacy-already-exited-module-keeps-its-exit-121`
+  drives spawn and confirmation separately, using the `subc-os/test-support`
+  `wait_for_child_exit_without_reaping` seam (`waitid` with `WNOWAIT`). The module
+  has exited, but its status remains available for confirmation's first
+  `try_wait`, so the test cannot take the image-disappearance path instead.
+  Its terminal record must contain only the module exit and exhausted crash
+  budget, never a trampoline refusal.
+
+The measured 17-row replay above predates these additions; it is not a measurement
+of the current 19-row catalogue.

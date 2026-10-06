@@ -1,11 +1,22 @@
 [package]
 name = "subc-os"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2021"
 license = "MIT"
 publish = true
 repository = "https://github.com/cortexkit/subconscious"
 description = "Operating-system primitives for the subc daemon that need unsafe code, behind a safe API: per-process identity, signalling, memory and CPU usage, and the launch-nonce descriptor handoff."
+
+[dependencies]
+tokio = { version = "1", optional = true, features = ["process"] }
+
+[[bin]]
+name = "subc-os-privacy-fixture"
+path = "tests/fixtures/privacy-trampoline.rs"
+required-features = ["test-support"]
+
+[dev-dependencies]
+subc-os = { path = ".", version = "0.1.7", features = ["test-support"] }
 
 # The launch-nonce handoff (dup2 and fcntl between fork and exec) and its
 # reader (fstat, ioctl) are plain POSIX calls, so every Unix takes libc.
@@ -25,6 +36,7 @@ rustix = { version = "1", default-features = false, features = ["std", "time"] }
 
 [features]
 test-support = []
+tokio = ["dep:tokio"]
 
 [lints.rust]
 unsafe_code = "deny"

@@ -9,6 +9,48 @@
 //! spawn as disclaiming responsibility. The module keeps the trampoline's pid,
 //! process group, pipes and fd-3 launch-nonce descriptor, and becomes its own
 //! responsible process.
+//!
+//! Use [`DisclaimedCommand`] for children of modules as well as supervisors. The
+//! trampoline must be the caller's own binary and must handle the hidden mode
+//! before starting threads or an async runtime. Call [`probe`] once at startup
+//! and refuse to launch children if it fails. On non-macOS platforms the builder
+//! launches the program directly, the trampoline path is unused, and both probe
+//! and confirmation succeed immediately.
+//!
+//! A trampoline, rather than a `pre_exec` SETEXEC hook, is necessary because
+//! after fork in a multithreaded process only async-signal-safe operations are
+//! allowed. Constructing C strings, collecting the environment and setting up
+//! `posix_spawn` allocate memory and can deadlock on a lock held at fork by
+//! another thread. The fresh, single-threaded trampoline does that work safely;
+//! the builder's only pre-exec work is allocation-free descriptor flag handling.
+//!
+//! ```no_run
+//! use std::{process::Stdio, time::{Duration, Instant}};
+//! use subc_os::privacy_identity::{self, DisclaimedCommand};
+//!
+//! fn main() -> Result<(), Box<dyn std::error::Error>> {
+//!     let args: Vec<_> = std::env::args_os().skip(1).collect();
+//!     privacy_identity::trampoline_main(&args); // First, before any runtime.
+//!     let trampoline = std::env::current_exe()?;
+//!     privacy_identity::probe(&trampoline, Instant::now() + Duration::from_secs(5))?;
+//!     let mut builder = DisclaimedCommand::new(trampoline, "/bin/echo");
+//!     builder.arg("hello").env("LANG", "C").stdout(Stdio::inherit());
+//!     let (mut command, confirmation) = builder.into_command()?;
+//!     let deadline = Instant::now() + Duration::from_secs(5);
+//!     let mut child = command.spawn()?;
+//!     drop(command); // Release the parent's ack writer before waiting for EOF.
+//!     if let Err(error) = confirmation.confirm(deadline) {
+//!         let _ = child.kill();
+//!         let _ = child.wait();
+//!         return Err(error.into());
+//!     }
+//!     child.wait()?;
+//!     Ok(())
+//! }
+//! ```
+
+mod command;
+pub use command::{probe, ConfirmationError, DisclaimedCommand, ExecConfirmation, ExecError};
 
 /// Reserved exit statuses from the trampoline, distinct from ordinary CLI errors.
 pub fn failure_cause(code: Option<i32>) -> Option<&'static str> {
@@ -83,52 +125,22 @@ fn trampoline_entry(args: &[std::ffi::OsString], test_hooks: bool) {
 }
 
 #[cfg(target_os = "macos")]
-pub use macos::{disclaim_exec, ExecAcknowledgement, ExecError};
+pub use macos::{disclaim_exec, ExecAcknowledgement};
 
 #[cfg(all(target_os = "macos", feature = "test-support"))]
 pub use macos::{disclaim_exec_for_test, privacy_observation_for_test};
 
 #[cfg(target_os = "macos")]
 mod macos {
+    use super::ExecError;
     use std::{
         ffi::{CString, OsString},
-        fmt, io,
+        io,
         os::{
             fd::{AsRawFd, FromRawFd, OwnedFd},
             unix::ffi::OsStrExt,
         },
     };
-
-    #[derive(Debug)]
-    pub struct ExecError {
-        code: i32,
-        detail: String,
-    }
-
-    impl ExecError {
-        pub fn exit_code(&self) -> i32 {
-            self.code
-        }
-        fn new(code: i32, detail: impl fmt::Display) -> Self {
-            Self {
-                code,
-                detail: detail.to_string(),
-            }
-        }
-    }
-
-    impl fmt::Display for ExecError {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            write!(
-                f,
-                "{}: {}",
-                super::failure_cause(Some(self.code)).unwrap_or("privacy identity failure"),
-                self.detail
-            )
-        }
-    }
-
-    impl std::error::Error for ExecError {}
 
     /// A second pipe, independent of the fd-3 launch-nonce pipe. The trampoline
     /// marks its write end close-on-exec, so EOF means the trampoline either
@@ -171,6 +183,10 @@ mod macos {
             self.writer.as_raw_fd()
         }
 
+        pub(super) fn into_writer(self) -> OwnedFd {
+            self.writer
+        }
+
         /// Register before the final nonce handoff. Retain `self` until spawn
         /// returns, then drop it and the Command so the parent holds no writer.
         pub fn install(&self, command: &mut std::process::Command) {
@@ -181,17 +197,35 @@ mod macos {
             // the caller until spawn completes and is never fd 3 or stdio.
             #[allow(unsafe_code)]
             unsafe {
-                command.pre_exec(move || {
-                    let flags = libc::fcntl(fd, libc::F_GETFD);
-                    if flags == -1
-                        || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) == -1
-                    {
-                        return Err(io::Error::last_os_error());
-                    }
-                    Ok(())
-                });
+                command.pre_exec(move || inherit_writer(fd));
             }
         }
+
+        /// Keep the descriptor alive in the command, even if confirmation is
+        /// dropped first. Dropping the command after spawn releases the parent's
+        /// writer so the reader can observe EOF.
+        pub(super) fn install_owned(self, command: &mut std::process::Command) {
+            use std::os::unix::process::CommandExt;
+            // SAFETY: the closure owns the descriptor and uses only fcntl. It
+            // cannot outlive its descriptor or acquire a Rust lock after fork.
+            #[allow(unsafe_code)]
+            unsafe {
+                command.pre_exec(move || inherit_writer(self.fd()));
+            }
+        }
+    }
+
+    fn inherit_writer(fd: i32) -> io::Result<()> {
+        // SAFETY: the installing hook retains the descriptor through spawn.
+        // Only async-signal-safe fcntl calls execute here, with no allocation.
+        #[allow(unsafe_code)]
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFD);
+            if flags == -1 || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) == -1 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        Ok(())
     }
 
     /// Execute `<ack fd> <program> <args...>` as a new responsible process.

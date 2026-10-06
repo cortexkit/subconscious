@@ -23,6 +23,11 @@ Run the full catalogue on macOS, with Python 3, Cargo and `nats-server`
 available. The catalogue uses nextest because Cargo's pretty test output can
 interleave inherited child stderr with test results.
 
+Run `cargo fetch --locked` before replay on a fresh Cargo cache, as the workflow
+does. The path-dependency command suite checks workspace metadata offline for
+all platforms; building only the host targets leaves other platforms' packages
+uncached. Missing archives are infrastructure errors, not mutation catches.
+
 The declared `prebuild` steps build `subc-daemon` and `subc-core` binaries with
 `--bins --features test-support --locked`. Keep those steps: tests spawn the
 privacy trampoline and companion binaries, and building only test targets
@@ -50,6 +55,13 @@ python3 mutations/replay.py run --only wire-first-probe-failure-invalidates-ok
 
 Run `baseline` before trusting a proof. Cargo/nextest rows do not perform
 that check automatically; command-row baselines are handled by the runner.
+In the pinned commons source, `crates/cortexkit-mutate/src/lib.rs`,
+`ReplaySession::baselines` (lines 1673–1698) invokes `replay` with
+`ReplayStage::Baseline`. Its `replay` branch (lines 1960–1970) runs command tests
+but only calls `list_results`/`resolve_expected` for Cargo/nextest, then returns
+without running the tests. Thus an unrelated baseline-red Cargo test can be
+graded as mutant collateral. This needs a runner follow-up; the adapter does
+not change that policy.
 
 Use the adapter for every replay. It pins `XDG_DATA_HOME`, `XDG_RUNTIME_DIR`
 and `XDG_CONFIG_HOME` to a fresh sandbox under `target/mutations`. Tests that

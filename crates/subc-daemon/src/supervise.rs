@@ -5535,7 +5535,7 @@ mod tests {
         ] {
             let spec = ModuleSpec {
                 module_id: "image-identity".into(),
-                program,
+                program: program.clone(),
                 args,
                 env: ["XDG_DATA_HOME", "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME"]
                     .into_iter()
@@ -5572,7 +5572,11 @@ mod tests {
                 .unwrap();
             let verdict = crate::live_children::identity_verdict(&entry, entry.pid, &observed);
             module.drain().await.unwrap();
-            assert_eq!(verdict, crate::live_children::IdentityVerdict::Matches);
+            assert_eq!(
+                verdict,
+                crate::live_children::IdentityVerdict::Matches,
+                "program {program:?}: recorded {entry:?}, observed {observed:?}"
+            );
         }
     }
 

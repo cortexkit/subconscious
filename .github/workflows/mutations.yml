@@ -44,6 +44,10 @@ jobs:
         run: cargo install --locked --git https://github.com/cortexkit/commons --rev "$CK_MUTATE_REV" cortexkit-mutate
       - name: Install real NATS monitoring fixture
         run: brew install nats-server && nats-server --version
+      - name: Fetch locked workspace metadata dependencies
+        # The command suite runs metadata offline without a platform filter.
+        # Host builds alone do not cache dependencies for Android, Windows, etc.
+        run: cargo fetch --locked
       - name: Record tool versions and test the replay adapter
         run: |
           cargo --version

@@ -10,7 +10,7 @@ use std::{
     sync::{Arc, Once},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use subc_test_support::TestTempDir;
+use subc_test_support::{ckdev_binary_in, dev_command, CkdevBinary, TestTempDir};
 
 use subc_daemon::{
     serve_listener, ConnectedClients, ControlHandler, ForwardingTable, ModuleProcessLiveness,
@@ -43,20 +43,52 @@ pub fn copy_executable(src: &Path, dst: &Path) {
 const TEST_DAEMON_VER: &str = "test-subc";
 const TEST_AUTH_DEADLINE: Duration = Duration::from_secs(2);
 
-/// Returns the dedicated CLI target after proving it contains the fixture-key
-/// support required by integration tests. A build-shape check makes a Cargo
-/// feature-resolution change fail before any test fixture can mask it.
-pub fn ck_under_test_command() -> Command {
+/// The subdirectory of a test's scratch directory that holds the binaries it
+/// runs under their `ckdev-` names. A dedicated name keeps them apart from the
+/// `bin` directories tests build as a fake CortexKit install.
+const CKDEV_BIN_DIR: &str = "ckdev-bin";
+
+/// A built binary placed under its `ckdev-` name in `scratch`, so the process
+/// a test starts from it is never listed under a production `ck-*` name.
+/// `scratch` must outlive every process started from the result.
+pub fn ckdev_bin(scratch: &Path, built: &str) -> PathBuf {
+    ckdev_binary_in(built, scratch.join(CKDEV_BIN_DIR))
+}
+
+/// The daemon binary (`ck-subc`) placed as `ckdev-subc` in `scratch`; also the
+/// privacy trampoline tests hand to a `Supervisor`.
+pub fn ckdev_subc(scratch: &Path) -> PathBuf {
+    ckdev_bin(scratch, env!("CARGO_BIN_EXE_ck-subc"))
+}
+
+/// The fault-injection daemon target (`ck-subc-under-test`) placed as
+/// `ckdev-subc-under-test` in `scratch`.
+pub fn ckdev_subc_under_test(scratch: &Path) -> PathBuf {
+    ckdev_bin(scratch, env!("CARGO_BIN_EXE_ck-subc-under-test"))
+}
+
+/// The shipped CLI (`ck`) placed as `ckdev-ck` in `scratch`.
+pub fn ckdev_ck(scratch: &Path) -> PathBuf {
+    ckdev_bin(scratch, env!("CARGO_BIN_EXE_ck"))
+}
+
+/// Returns the dedicated CLI target, run as `ckdev-under-test` from
+/// `scratch`, after proving it contains the fixture-key support required by
+/// integration tests. A build-shape check makes a Cargo feature-resolution
+/// change fail before any test fixture can mask it.
+pub fn ck_under_test_command(scratch: &Path) -> Command {
     assert_ck_under_test_build_shape();
-    Command::new(env!("CARGO_BIN_EXE_ck-under-test"))
+    dev_command(ckdev_bin(scratch, env!("CARGO_BIN_EXE_ck-under-test")))
 }
 
 fn assert_ck_under_test_build_shape() {
     static CHECKED: Once = Once::new();
 
     CHECKED.call_once(|| {
-        let path = Path::new(env!("CARGO_BIN_EXE_ck-under-test"));
-        let output = Command::new(path)
+        let placed = CkdevBinary::new(env!("CARGO_BIN_EXE_ck-under-test"));
+        let path = placed.path();
+        let output = placed
+            .command()
             .arg("--ck-build-shape")
             .output()
             .unwrap_or_else(|error| panic!("could not inspect ck-under-test {}: {error}", path.display()));

@@ -433,7 +433,11 @@ async fn signer_shape_real_binary_half() {
     let _gate = harness::acceptance_gate().await;
     harness::install_tracing();
     let tree = SignerRun::tree();
-    let real = match RealClaustrum::discover(&SignerRun::data_home(&tree), &tree.join("keys")) {
+    let real = match RealClaustrum::discover(
+        &SignerRun::data_home(&tree),
+        &tree.join("keys"),
+        &tree.join("ckdev-bin"),
+    ) {
         Ok(real) => real,
         Err(observation) => {
             RowReport::skipped(Row::SignerShape, CLAUSTRUM_BINARY_ABSENT, observation)

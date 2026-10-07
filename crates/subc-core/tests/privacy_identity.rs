@@ -7,14 +7,19 @@ mod macos {
     use std::{
         fs,
         os::unix::process::CommandExt,
+        path::PathBuf,
         process::{Child, Command, Stdio},
         thread,
         time::{Duration, Instant},
     };
-    use subc_test_support::TestTempDir;
+    use subc_test_support::{ckdev_binary_in, dev_command, TestTempDir};
 
     pub struct Fixture {
         pub root: TestTempDir,
+        /// The daemon binary this fixture runs, placed under its `ckdev-`
+        /// name in `root`. A trampoline's running image is compared with
+        /// this file, not with the cargo build it was placed from.
+        pub daemon_program: PathBuf,
         child: Child,
     }
 
@@ -47,12 +52,13 @@ mod macos {
                 "restart":{"max_restarts":0}, "env":env
             }}});
             fs::write(root.join("config/cortexkit/subc.jsonc"), config.to_string()).unwrap();
-            let program = if hooks {
+            let built = if hooks {
                 env!("CARGO_BIN_EXE_ck-subc-under-test")
             } else {
                 env!("CARGO_BIN_EXE_ck-subc")
             };
-            let mut command = Command::new(program);
+            let daemon_program = ckdev_binary_in(built, root.join("ckdev-bin"));
+            let mut command = dev_command(&daemon_program);
             for (key, value) in daemon_env.as_object().unwrap() {
                 command.env(key, value.as_str().unwrap());
             }
@@ -69,7 +75,11 @@ mod macos {
                 .process_group(0)
                 .spawn()
                 .unwrap();
-            let fixture = Self { root, child };
+            let fixture = Self {
+                root,
+                daemon_program,
+                child,
+            };
             fixture.wait(|| {
                 fixture
                     .root
@@ -107,19 +117,22 @@ mod macos {
         }
 
         pub fn ck(&self, args: &[&str]) -> std::process::Output {
-            Command::new(env!("CARGO_BIN_EXE_ck"))
-                .arg("--subc")
-                .arg(
-                    self.root
-                        .join("runtime")
-                        .join(subc_transport::CONNECTION_FILE_NAME),
-                )
-                .args(args)
-                .env("XDG_CONFIG_HOME", self.root.join("config"))
-                .env("XDG_RUNTIME_DIR", self.root.join("runtime"))
-                .env("XDG_DATA_HOME", self.root.join("data"))
-                .output()
-                .unwrap()
+            dev_command(ckdev_binary_in(
+                env!("CARGO_BIN_EXE_ck"),
+                self.root.join("ckdev-bin"),
+            ))
+            .arg("--subc")
+            .arg(
+                self.root
+                    .join("runtime")
+                    .join(subc_transport::CONNECTION_FILE_NAME),
+            )
+            .args(args)
+            .env("XDG_CONFIG_HOME", self.root.join("config"))
+            .env("XDG_RUNTIME_DIR", self.root.join("runtime"))
+            .env("XDG_DATA_HOME", self.root.join("data"))
+            .output()
+            .unwrap()
         }
 
         pub fn status(&self) -> Value {
@@ -394,9 +407,7 @@ mod macos {
             .unwrap();
         assert_eq!(
             image.executable,
-            subc_os::file_identity(std::path::Path::new(env!(
-                "CARGO_BIN_EXE_ck-subc-under-test"
-            )))
+            subc_os::file_identity(&fixture.daemon_program)
         );
         let pending = fixture.provenance();
         assert!(

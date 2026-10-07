@@ -18,7 +18,13 @@ pub fn template_value() -> Value {
     serde_json::from_str(&json).expect("fixture subc.jsonc must be valid JSON")
 }
 
+/// Writes the fixture daemon config under `fixture_root`. The supervised
+/// modules run `ck_bus_binary` as placed under its `ckdev-` name in the
+/// fixture root, so the processes the daemon starts are never listed under
+/// the production `ck-bus` name.
 pub fn render(fixture_root: &Path, ck_bus_binary: &Path, timing: SentinelTiming) -> PathBuf {
+    let ck_bus_binary =
+        &subc_test_support::ckdev_binary_in(ck_bus_binary, fixture_root.join("ckdev-bin"));
     let mut value = template_value();
     let modules = value["modules"]
         .as_object_mut()

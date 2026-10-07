@@ -1980,7 +1980,11 @@ async fn the_operator_signer_grant_authorizes_the_revocation_signature() {
     let _gate = harness::acceptance_gate().await;
     harness::install_tracing();
     let tree = SignerRun::tree();
-    let real = match RealClaustrum::discover(&SignerRun::data_home(&tree), &tree.join("keys")) {
+    let real = match RealClaustrum::discover(
+        &SignerRun::data_home(&tree),
+        &tree.join("keys"),
+        &tree.join("ckdev-bin"),
+    ) {
         Ok(real) => real,
         Err(observation) => {
             RowReport::skipped(

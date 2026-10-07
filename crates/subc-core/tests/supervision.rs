@@ -977,7 +977,7 @@ fn supervisor(server: &TestServer, max_restarts: u32, backoff: Duration) -> Supe
         Arc::clone(&server.registry),
         RestartPolicy::new(max_restarts, backoff),
     )
-    .with_privacy_trampoline(env!("CARGO_BIN_EXE_ck-subc"))
+    .with_privacy_trampoline(common::ckdev_subc(&server.temp_dir))
     .with_drain_timeout(Duration::from_millis(25))
     .with_connection_file_path(server.connection_file_path.clone())
 }
@@ -1649,7 +1649,7 @@ impl SpawnEventHarness {
             Arc::clone(&server.registry),
             RestartPolicy::new(0, Duration::ZERO),
         )
-        .with_privacy_trampoline(env!("CARGO_BIN_EXE_ck-subc"))
+        .with_privacy_trampoline(common::ckdev_subc(&server.temp_dir))
         .with_process_liveness(process_liveness)
         .with_handle(handle.clone())
         .with_connection_file_path(server.connection_file_path.clone())

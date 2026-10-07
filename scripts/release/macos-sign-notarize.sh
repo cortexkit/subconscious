@@ -46,8 +46,15 @@ for binary in "${BINARIES[@]}"; do
 
   # Execute the signed binary: the hardened runtime can break a binary whose
   # signature still verifies perfectly, and nothing else runs the bytes that
-  # actually ship.
-  version_output="$("$binary_path" --version)" || fail "signed binary refuses to run: ${binary}"
+  # actually ship. It runs through a hard link named ckdev-<name> (ck becomes
+  # ckdev-ck): the same inode and signature, but a smoke process is never
+  # listed under a production ck-* name next to an installed daemon.
+  smoke_name="ckdev-${binary#ck-}"
+  smoke_dir="$(mktemp -d)"
+  smoke_path="${smoke_dir}/${smoke_name}"
+  ln "$binary_path" "$smoke_path" 2>/dev/null || cp -p "$binary_path" "$smoke_path"
+  version_output="$("$smoke_path" --version)" || { rm -rf "$smoke_dir"; fail "signed binary refuses to run: ${binary}"; }
+  rm -rf "$smoke_dir"
   [[ -n "$version_output" ]] || fail "signed binary produced no --version output: ${binary}"
   echo "signed ${binary} runs: ${version_output}"
 

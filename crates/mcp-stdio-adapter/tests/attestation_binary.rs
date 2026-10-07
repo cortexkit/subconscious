@@ -1,17 +1,20 @@
-use std::{fs, process::Command};
+use std::fs;
 use subc_test_support::TestTempDir;
 
 #[test]
 fn manifest_is_emitted_offline_before_startup_attestation() {
     let home = TestTempDir::new("mcp-adapter-manifest");
-    let output = Command::new(env!("CARGO_BIN_EXE_ck-mcp-stdio-adapter"))
-        .env_clear()
-        .env("XDG_DATA_HOME", home.path())
-        .env("XDG_RUNTIME_DIR", home.path())
-        .env("XDG_CONFIG_HOME", home.path())
-        .arg("--manifest")
-        .output()
-        .expect("adapter manifest binary starts");
+    let output = subc_test_support::dev_command(subc_test_support::ckdev_binary_in(
+        env!("CARGO_BIN_EXE_ck-mcp-stdio-adapter"),
+        home.join("ckdev-bin"),
+    ))
+    .env_clear()
+    .env("XDG_DATA_HOME", home.path())
+    .env("XDG_RUNTIME_DIR", home.path())
+    .env("XDG_CONFIG_HOME", home.path())
+    .arg("--manifest")
+    .output()
+    .expect("adapter manifest binary starts");
 
     assert!(
         output.status.success(),
@@ -38,13 +41,16 @@ fn manifest_is_emitted_offline_before_startup_attestation() {
 #[test]
 fn unattested_binary_exits_before_any_startup_connection_work() {
     let home = TestTempDir::new("mcp-adapter-unattested");
-    let output = Command::new(env!("CARGO_BIN_EXE_ck-mcp-stdio-adapter"))
-        .env_clear()
-        .env("XDG_DATA_HOME", home.path())
-        .env("XDG_RUNTIME_DIR", home.path())
-        .env("XDG_CONFIG_HOME", home.path())
-        .output()
-        .expect("adapter binary starts");
+    let output = subc_test_support::dev_command(subc_test_support::ckdev_binary_in(
+        env!("CARGO_BIN_EXE_ck-mcp-stdio-adapter"),
+        home.join("ckdev-bin"),
+    ))
+    .env_clear()
+    .env("XDG_DATA_HOME", home.path())
+    .env("XDG_RUNTIME_DIR", home.path())
+    .env("XDG_CONFIG_HOME", home.path())
+    .output()
+    .expect("adapter binary starts");
 
     assert!(!output.status.success());
     assert_eq!(
@@ -56,17 +62,20 @@ fn unattested_binary_exits_before_any_startup_connection_work() {
 #[test]
 fn adapter_startup_writes_dated_r2_segment() {
     let home = TestTempDir::new("mcp-adapter-log");
-    let output = Command::new(env!("CARGO_BIN_EXE_ck-mcp-stdio-adapter"))
-        .env("XDG_DATA_HOME", home.path())
-        .env("XDG_RUNTIME_DIR", home.path())
-        .env("XDG_CONFIG_HOME", home.path())
-        .env("CK_LOG", "info")
-        .env("SUBC_MODULE_ID", "mcp-stdio-adapter")
-        .env("SUBC_LAUNCH_NONCE", "test-nonce")
-        .arg("--config")
-        .arg(home.join("missing-config.jsonc"))
-        .output()
-        .unwrap();
+    let output = subc_test_support::dev_command(subc_test_support::ckdev_binary_in(
+        env!("CARGO_BIN_EXE_ck-mcp-stdio-adapter"),
+        home.join("ckdev-bin"),
+    ))
+    .env("XDG_DATA_HOME", home.path())
+    .env("XDG_RUNTIME_DIR", home.path())
+    .env("XDG_CONFIG_HOME", home.path())
+    .env("CK_LOG", "info")
+    .env("SUBC_MODULE_ID", "mcp-stdio-adapter")
+    .env("SUBC_LAUNCH_NONCE", "test-nonce")
+    .arg("--config")
+    .arg(home.join("missing-config.jsonc"))
+    .output()
+    .unwrap();
     assert!(!output.status.success());
     let logs = home.join("cortexkit/mcp-stdio-adapter/logs");
     let entries: Vec<_> = fs::read_dir(&logs)

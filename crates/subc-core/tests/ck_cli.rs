@@ -331,7 +331,7 @@ const FOREIGN_SIGNATURE: &str =
 /// knows the developer's daemon), so the runtime is faked the same way the
 /// fixtures do; otherwise the refusal under test is masked by a registry
 /// read against whatever daemon the developer happens to be running.
-fn bare_setup_dry_run(index_url: &str) -> Command {
+fn bare_setup_dry_run(index_url: &str) -> CkCommand {
     let mut command = ck_command();
     command
         .args(["setup", "--dry-run"])
@@ -364,8 +364,10 @@ fn setup_dry_run_refuses_when_the_signature_header_is_stripped() {
 
 #[test]
 fn production_ck_ignores_the_test_release_index_key() {
-    let production = Path::new(env!("CARGO_BIN_EXE_ck"));
-    let shape = Command::new(production)
+    // The shipped `ck` target, run as `ckdev-ck` like every test process.
+    let production = subc_test_support::CkdevBinary::new(env!("CARGO_BIN_EXE_ck"));
+    let shape = production
+        .command()
         .arg("--ck-build-shape")
         .output()
         .expect("production ck build shape");
@@ -405,7 +407,8 @@ fn production_ck_ignores_the_test_release_index_key() {
         &std::env::var_os("PATH").unwrap_or_default(),
     )))
     .expect("fixture PATH");
-    let output = Command::new(production)
+    let output = production
+        .command()
         .args(["setup", "--dry-run"])
         .env("CK_RELEASE_INDEX_URL", &index.url)
         .env("CK_TEST_RELEASE_INDEX_PUBKEY", &index.public_key)
@@ -549,7 +552,7 @@ impl SetupFixture {
     }
 
     fn command(&self, index: &SignedIndex, args: &[&str]) -> Command {
-        let mut command = ck_command();
+        let mut command = ck_command_in(self._root.path());
         let path = std::env::join_paths(std::iter::once(self.tools.clone()).chain(
             std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
         ))
@@ -1272,7 +1275,13 @@ impl UpgradeFixture {
         write_executable(&mcp, "#!/bin/sh\necho 'ck-subc-mcp 0.17.9'\n");
         write_executable(&claustrum, "#!/bin/sh\necho 'ck-claustrum 0.8.0'\n");
         write_executable(&auth, "#!/bin/sh\necho 'ck-auth 0.8.0'\n");
-        let ck = fs::canonicalize(env!("CARGO_BIN_EXE_ck-under-test")).unwrap();
+        // The manifest names the `ck` this fixture's commands run: the test
+        // CLI as placed under its `ckdev-` name in the fixture root.
+        let ck = fs::canonicalize(common::ckdev_bin(
+            root.path(),
+            env!("CARGO_BIN_EXE_ck-under-test"),
+        ))
+        .unwrap();
         let mutations = [
             (ck, "44".repeat(32)),
             (daemon, "33".repeat(32)),
@@ -1326,7 +1335,7 @@ impl UpgradeFixture {
     }
 
     fn command(&self, index: &SignedIndex, args: &[&str]) -> Command {
-        let mut command = ck_command();
+        let mut command = ck_command_in(self._root.path());
         command
             .args(args)
             .arg("--subc")
@@ -1663,6 +1672,12 @@ fn a_copy_of_ck_on_path_is_neither_probed_recursively_nor_listed() {
     // Two copies, because a ck never probes its own executable: the CI shape
     // has many builds of ck side by side, and the recursion runs between
     // them, each copy probing the other.
+    //
+    // These copies keep `ck-` names on purpose, against the rule that test
+    // processes run as `ckdev-*`: ck discovers domains only by the `ck-`
+    // prefix, so a `ckdev-` copy would never be probed and the test would
+    // prove nothing. ck itself, not this test, starts them, and each refuses
+    // `--ck-domain` and exits at once.
     for name in ["ck-twin", "ck-twin-two"] {
         common::copy_executable(
             Path::new(env!("CARGO_BIN_EXE_ck-under-test")),
@@ -2612,7 +2627,7 @@ async fn module_stop_waits_past_ten_seconds_within_running_drain_budget() {
         RestartPolicy::new(3, Duration::from_millis(137))
             .with_max_backoff(Duration::from_millis(7_321)),
     )
-    .with_privacy_trampoline(env!("CARGO_BIN_EXE_ck-subc"))
+    .with_privacy_trampoline(common::ckdev_subc(&server.temp_dir))
     .with_process_liveness(Arc::clone(&server.process_liveness))
     .with_forwarding(Arc::clone(&server.forwarding))
     .with_handle(server.supervisor_handle.clone())
@@ -3319,8 +3334,42 @@ fn looks_like_age(text: &str) -> bool {
     text == "just now" || text.ends_with(" ago")
 }
 
-fn ck_command() -> Command {
-    let mut command = common::ck_under_test_command();
+/// A `ck` command together with the scratch directory its binary runs from.
+/// The test CLI runs as `ckdev-under-test`, placed in that directory, so it is
+/// never listed under the production `ck` name; the directory must outlive the
+/// process, so the command keeps it.
+struct CkCommand {
+    command: Command,
+    _scratch: TempDir,
+}
+
+impl Deref for CkCommand {
+    type Target = Command;
+
+    fn deref(&self) -> &Command {
+        &self.command
+    }
+}
+
+impl std::ops::DerefMut for CkCommand {
+    fn deref_mut(&mut self) -> &mut Command {
+        &mut self.command
+    }
+}
+
+fn ck_command() -> CkCommand {
+    let scratch = unique_temp_dir("ck-command");
+    CkCommand {
+        command: ck_command_in(&scratch),
+        _scratch: scratch,
+    }
+}
+
+/// [`ck_command`] for a fixture that owns a directory outliving the command
+/// and needs a stable path for the running `ck` (an installer manifest that
+/// names it, for example).
+fn ck_command_in(scratch: &Path) -> Command {
+    let mut command = common::ck_under_test_command(scratch);
     // Every CLI test gets an isolated update cache and a closed local endpoint.
     // This proves dashboard output without reaching public release infrastructure.
     // The domain list is discovered from PATH (`ck-<name> --ck-domain`), so a
@@ -3421,7 +3470,7 @@ fn supervisor_with_restart_limit(server: &TestServer, max_restarts: u32) -> Supe
         Arc::clone(&server.registry),
         RestartPolicy::new(max_restarts, Duration::from_millis(10)),
     )
-    .with_privacy_trampoline(env!("CARGO_BIN_EXE_ck-subc"))
+    .with_privacy_trampoline(common::ckdev_subc(&server.temp_dir))
     .with_process_liveness(Arc::clone(&server.process_liveness))
     .with_forwarding(Arc::clone(&server.forwarding))
     .with_handle(server.supervisor_handle.clone())

@@ -139,8 +139,7 @@ pub fn ckdev_file_name(file_name: &str) -> String {
 
 fn strip_exe_suffix(name: &str) -> (&str, &str) {
     let len = name.len();
-    if len > 4 && name.is_char_boundary(len - 4) && name[len - 4..].eq_ignore_ascii_case(".exe")
-    {
+    if len > 4 && name.is_char_boundary(len - 4) && name[len - 4..].eq_ignore_ascii_case(".exe") {
         (&name[..len - 4], &name[len - 4..])
     } else {
         (name, "")
@@ -459,7 +458,13 @@ mod tests {
                 "{name} is a production executable name"
             );
         }
-        for name in ["ckdev-subc", "ckdev-ck.exe", "cksum", "fake-aft-stub", "subc"] {
+        for name in [
+            "ckdev-subc",
+            "ckdev-ck.exe",
+            "cksum",
+            "fake-aft-stub",
+            "subc",
+        ] {
             assert!(
                 !is_production_executable_name(OsStr::new(name)),
                 "{name} is not a production executable name"
@@ -470,7 +475,9 @@ mod tests {
     /// The guard itself: the spawn helper refuses a `ck-*` path before any
     /// process starts.
     #[test]
-    #[should_panic(expected = "refusing to run a test process under the production executable name")]
+    #[should_panic(
+        expected = "refusing to run a test process under the production executable name"
+    )]
     fn dev_command_refuses_a_production_named_binary() {
         let _ = dev_command(Path::new("/nonexistent/target/debug/ck-subc"));
     }
@@ -501,7 +508,10 @@ mod tests {
         write_script(&built, "#!/bin/sh\n");
         let scratch = TestTempDir::new("ckdev-link-scratch");
         let placed = ckdev_binary_in(&built, scratch.path());
-        let (a, b) = (fs::metadata(&built).unwrap(), fs::metadata(&placed).unwrap());
+        let (a, b) = (
+            fs::metadata(&built).unwrap(),
+            fs::metadata(&placed).unwrap(),
+        );
         assert_eq!((a.dev(), a.ino()), (b.dev(), b.ino()));
         // A second call reuses the placement instead of failing on it.
         assert_eq!(ckdev_binary_in(&built, scratch.path()), placed);
@@ -547,7 +557,10 @@ mod tests {
         assert_eq!(path.file_name().unwrap(), "ckdev-ck");
         assert!(placed.command().status().unwrap().success());
         drop(placed);
-        assert!(!path.exists(), "dropping the placement removes its scratch dir");
+        assert!(
+            !path.exists(),
+            "dropping the placement removes its scratch dir"
+        );
     }
 
     /// Writes through a staging file and a `cp` child, so this multi-threaded

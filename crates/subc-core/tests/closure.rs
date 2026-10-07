@@ -697,7 +697,7 @@ fn supervisor(server: &TestServer, max_restarts: u32, backoff: Duration) -> Supe
         Arc::clone(&server.registry),
         RestartPolicy::new(max_restarts, backoff),
     )
-    .with_privacy_trampoline(env!("CARGO_BIN_EXE_ck-subc"))
+    .with_privacy_trampoline(common::ckdev_subc(&server.temp_dir))
     .with_process_liveness(Arc::clone(&server.process_liveness))
     .with_handle(server.supervisor_handle.clone())
     .with_drain_timeout(Duration::from_millis(25))

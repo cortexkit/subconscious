@@ -1,4 +1,5 @@
-//! RAII temp-dir guard and test-process naming for workspace tests. This
+//! RAII temp-dir guard, and helpers that run test programs under `ckdev-*`
+//! names so they are never mistaken for installed `ck-*` production binaries. This
 //! crate is used only as a dev-dependency.
 
 use std::{

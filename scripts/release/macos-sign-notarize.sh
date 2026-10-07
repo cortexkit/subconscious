@@ -49,9 +49,12 @@ for binary in "${BINARIES[@]}"; do
   # actually ship. It runs as a copy named ckdev-<name> (ck becomes ckdev-ck):
   # the same bytes and signature, but a smoke process is never listed under a
   # production ck-* name next to an installed daemon. A copy, not a hard link:
-  # macOS test runs saw execs through hard links to a binary SIGKILLed.
+  # macOS reports one cached path for every process running an inode, so a
+  # process started through one link can be listed under another link's name.
   smoke_name="ckdev-${binary#ck-}"
-  smoke_dir="$(mktemp -d)"
+  # Under /tmp, not $TMPDIR: a fresh executable under the per-user TMPDIR can
+  # stall its first system-policy evaluation for many minutes on macOS.
+  smoke_dir="$(mktemp -d /tmp/subc-smoke.XXXXXX)"
   smoke_path="${smoke_dir}/${smoke_name}"
   cp -p "$binary_path" "$smoke_path"
   version_output="$("$smoke_path" --version)" || { rm -rf "$smoke_dir"; fail "signed binary refuses to run: ${binary}"; }

@@ -1,8 +1,12 @@
 # Changelog
 
-## 0.20.63
+## 0.20.64
 
 - Show a module's latest health detail and headline metrics in `ck module status`, including healthy modules.
+
+## 0.20.63
+
+- Tests run the daemon, the CLI and test modules under `ckdev-*` names, so no test process is listed as a production `ck-*` binary. No change to the shipped binaries.
 
 ## 0.20.62
 

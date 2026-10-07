@@ -41,14 +41,57 @@ pub struct CallOrigin {
     /// The original caller's key for the call, with the same bounds as
     /// [`ToolCallRequest::call_key`]; check it with [`validate_call_origin`].
     pub call_key: String,
+    /// Where the call sits in the model message that asked for it, when the
+    /// forwarder knows. `None` means unknown, never "first" or "alone".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_position: Option<MessagePosition>,
 }
 
 impl CallOrigin {
-    /// An origin naming `carrier` as the caller and `call_key` as its key.
+    /// An origin naming `carrier` as the caller and `call_key` as its key, with
+    /// no message position.
     pub fn new(carrier: Principal, call_key: impl Into<String>) -> Self {
         Self {
             carrier,
             call_key: call_key.into(),
+            message_position: None,
+        }
+    }
+
+    /// Set where the call sits in the model message that asked for it.
+    pub fn with_message_position(mut self, position: MessagePosition) -> Self {
+        self.message_position = Some(position);
+        self
+    }
+}
+
+/// A relayed call's place among the tool calls of one model message.
+///
+/// A host may run one message's tool calls concurrently, so a provider whose
+/// actions must follow the model's intended order (for example input events on
+/// a shared screen) reads this to sequence them. The message id and the index
+/// travel together, because an index means nothing without the message it
+/// counts within; a position missing either one does not decode.
+///
+/// Like the rest of [`CallOrigin`], it is a claim by the forwarding module and
+/// never authority.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
+pub struct MessagePosition {
+    /// The model message's id, an opaque token with the same bounds as
+    /// [`ToolCallRequest::call_key`].
+    pub message_id: String,
+    /// The call's 0-based position among that message's tool calls, in the
+    /// order the model wrote them.
+    pub index: u32,
+}
+
+impl MessagePosition {
+    /// The call at `index` (0-based) among the tool calls of `message_id`.
+    pub fn new(message_id: impl Into<String>, index: u32) -> Self {
+        Self {
+            message_id: message_id.into(),
+            index,
         }
     }
 }
@@ -193,6 +236,11 @@ impl std::error::Error for PresetError {}
 /// of the `invalid_request` error a provider returns when it is malformed.
 pub const ORIGIN_CALL_KEY_FIELD: &str = "origin.call_key";
 
+/// The wire path of [`MessagePosition::message_id`] inside a request, for the
+/// `field` of the `invalid_request` error a provider returns when it is
+/// malformed.
+pub const ORIGIN_MESSAGE_ID_FIELD: &str = "origin.message_position.message_id";
+
 /// The longest opaque token field accepted, in bytes (every accepted byte is
 /// one ASCII character). Shared by `call_key`, `schema_pin` and scope `flow_id`.
 pub const OPAQUE_FIELD_MAX_LEN: usize = 256;
@@ -313,11 +361,16 @@ pub fn validate_preset(preset: &str) -> Result<(), PresetError> {
     Ok(())
 }
 
-/// Check a [`CallOrigin`]: its `call_key` must pass the shared opaque-field
-/// rule, and errors name [`ORIGIN_CALL_KEY_FIELD`]. Every [`Principal`] is
-/// accepted as the carrier.
+/// Check a [`CallOrigin`]: its `call_key`, and its message position's
+/// `message_id` when present, must pass the shared opaque-field rule. Errors
+/// name [`ORIGIN_CALL_KEY_FIELD`] or [`ORIGIN_MESSAGE_ID_FIELD`]. Every
+/// [`Principal`] is accepted as the carrier, and every `u32` as the index.
 pub fn validate_call_origin(origin: &CallOrigin) -> Result<(), OpaqueFieldError> {
-    validate_opaque_field(ORIGIN_CALL_KEY_FIELD, &origin.call_key)
+    validate_opaque_field(ORIGIN_CALL_KEY_FIELD, &origin.call_key)?;
+    if let Some(position) = &origin.message_position {
+        validate_opaque_field(ORIGIN_MESSAGE_ID_FIELD, &position.message_id)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -545,6 +598,76 @@ mod tests {
         );
         let decoded: ToolCallRequest = serde_json::from_value(encoded).expect("decode");
         assert_eq!(decoded, request);
+    }
+
+    /// The position travels inside `origin` as one object, and an origin without
+    /// one keeps exactly the bytes it had before positions existed.
+    #[test]
+    fn message_position_round_trips_and_is_omitted_when_unknown() {
+        let origin = relayed_origin().with_message_position(MessagePosition::new("msg_01AbC", 2));
+        let encoded = serde_json::to_value(&origin).expect("encode");
+        assert_eq!(
+            encoded,
+            json!({
+                "carrier": { "kind": "reserved", "module_id": "broca" },
+                "call_key": "broca:run-7/call-3",
+                "message_position": { "message_id": "msg_01AbC", "index": 2 }
+            })
+        );
+        let decoded: CallOrigin = serde_json::from_value(encoded).expect("decode");
+        assert_eq!(decoded, origin);
+
+        let without = serde_json::to_value(relayed_origin()).expect("encode");
+        assert!(without.get("message_position").is_none(), "{without}");
+        let decoded: CallOrigin = serde_json::from_value(without).expect("decode");
+        assert_eq!(decoded.message_position, None);
+    }
+
+    /// An index means nothing without its message, so a position missing either
+    /// member is refused at decode rather than read as a half-known order.
+    #[test]
+    fn a_message_position_missing_either_member_does_not_decode() {
+        for position in [json!({ "index": 0 }), json!({ "message_id": "m" })] {
+            let body = json!({
+                "carrier": { "kind": "direct" },
+                "call_key": "k",
+                "message_position": position
+            });
+            assert!(
+                serde_json::from_value::<CallOrigin>(body.clone()).is_err(),
+                "{body}"
+            );
+        }
+    }
+
+    /// Unknown members inside a message position are ignored when decoding, so
+    /// a reader tolerates members a later version adds.
+    #[test]
+    fn unknown_members_inside_a_message_position_are_tolerated() {
+        let decoded: CallOrigin = serde_json::from_value(json!({
+            "carrier": { "kind": "direct" },
+            "call_key": "k",
+            "message_position": { "message_id": "m", "index": 4, "later": true }
+        }))
+        .expect("unknown members inside a position are tolerated");
+        assert_eq!(decoded.message_position, Some(MessagePosition::new("m", 4)));
+    }
+
+    #[test]
+    fn a_malformed_message_id_is_refused_by_its_field() {
+        for bad in [
+            String::new(),
+            "has space".to_string(),
+            "x".repeat(OPAQUE_FIELD_MAX_LEN + 1),
+        ] {
+            let origin = CallOrigin::new(Principal::Direct, "k")
+                .with_message_position(MessagePosition::new(bad.clone(), 0));
+            let error = validate_call_origin(&origin).expect_err(&bad);
+            assert_eq!(error.field(), ORIGIN_MESSAGE_ID_FIELD, "{bad:?}");
+        }
+        let good = CallOrigin::new(Principal::Direct, "k")
+            .with_message_position(MessagePosition::new("msg_01AbC", u32::MAX));
+        assert_eq!(validate_call_origin(&good), Ok(()));
     }
 
     #[test]

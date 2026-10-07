@@ -78,7 +78,7 @@ impl TestServer {
             Arc::clone(&self.registry),
             RestartPolicy::new(0, Duration::ZERO),
         )
-        .with_privacy_trampoline(env!("CARGO_BIN_EXE_ck-subc"))
+        .with_privacy_trampoline(common::ckdev_subc())
         .with_process_liveness(Arc::clone(&self.process_liveness))
         .with_forwarding(Arc::clone(&self.forwarding))
         .with_handle(self.supervisor_handle.clone())

@@ -97,7 +97,7 @@ mod tests {
         io::{BufRead, BufReader, Write},
         os::unix::fs::MetadataExt,
         path::PathBuf,
-        process::{self, Command, Stdio},
+        process::{self, Stdio},
         sync::mpsc::{self, Receiver},
         thread,
         time::{Duration, Instant},
@@ -211,7 +211,10 @@ mod tests {
         }
 
         let root = fixture_dir("running-inode");
-        let destination = root.join("ck");
+        // The installed `ck` this test models runs as `ckdev-ck`: a test process
+        // is never listed under the production `ck` name. Nothing here depends on
+        // the file name; the property under test is the inode the holder keeps.
+        let destination = root.join("ckdev-ck");
         let candidate = root.join("candidate");
         let manifest = root.join("installer-manifest.json");
         let test_binary = env::current_exe().expect("test executable");
@@ -223,7 +226,7 @@ mod tests {
         inventory.record("binary-placement", &destination, Map::new());
         inventory.save().expect("save inventory");
 
-        let mut holder = Command::new(&destination)
+        let mut holder = subc_test_support::dev_command(&destination)
             .args(["--exact", TEST_NAME, "--nocapture"])
             .env(TEST_MODE, "hold")
             .env("CK_SELF_UPDATE_TEST_DESTINATION", &destination)
@@ -270,7 +273,7 @@ mod tests {
         assert!(wait_for_holder_exit(&mut holder).success());
         output_reader.join().expect("finish holder output reader");
 
-        let probe = Command::new(&destination)
+        let probe = subc_test_support::dev_command(&destination)
             .args(["--exact", TEST_NAME, "--nocapture"])
             .env(TEST_MODE, "probe")
             .env("CK_SELF_UPDATE_TEST_DESTINATION", &destination)

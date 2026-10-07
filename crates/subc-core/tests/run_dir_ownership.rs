@@ -14,14 +14,14 @@ use std::{
     fs,
     os::unix::process::CommandExt,
     path::{Path, PathBuf},
-    process::{Child, Command, ExitStatus, Stdio},
+    process::{Child, ExitStatus, Stdio},
     sync::{Mutex, MutexGuard},
     thread,
     time::{Duration, Instant},
 };
 
 use serde_json::{json, Value};
-use subc_test_support::{process_alive, wait_until_gone, TestTempDir};
+use subc_test_support::{ckdev_binary, dev_command, process_alive, wait_until_gone, TestTempDir};
 
 // Real daemons compete with other integration binaries for spawn and
 // registration resources; serializing this file keeps the deadlines honest.
@@ -93,7 +93,9 @@ impl Tree {
     fn spawn_daemon(&mut self, runtime: &str) -> usize {
         let runtime_dir = self.runtime_dir(runtime);
         fs::create_dir_all(&runtime_dir).unwrap();
-        let child = Command::new(env!("CARGO_BIN_EXE_ck-subc"))
+        // The daemon runs as `ckdev-subc`, never under the production name.
+        let daemon = ckdev_binary(env!("CARGO_BIN_EXE_ck-subc"));
+        let child = dev_command(daemon)
             .process_group(0)
             .env("XDG_DATA_HOME", self.root.join("data"))
             .env("XDG_CONFIG_HOME", self.root.join("config"))

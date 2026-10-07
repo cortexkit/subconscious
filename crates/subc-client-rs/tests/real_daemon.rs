@@ -1948,7 +1948,10 @@ fn spawn_daemon_child(daemon_bin: &Path, runtime_dir: &Path, config_dir: &Path) 
         .parent()
         .expect("runtime dir is inside the test temp tree")
         .join("data");
-    Command::new(daemon_bin)
+    // The daemon runs as `ckdev-subc`, never under the production `ck-subc`
+    // name it was built with.
+    let daemon_bin = &subc_test_support::ckdev_binary(daemon_bin);
+    subc_test_support::dev_command(daemon_bin)
         .env_remove(subc_protocol::SUBC_MODULE_ID_ENV)
         .env_remove(subc_protocol::SUBC_LAUNCH_NONCE_ENV)
         .env_remove(subc_client_rs::launch_nonce::LAUNCH_NONCE_FD_ENV)

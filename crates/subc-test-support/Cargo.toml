@@ -1,8 +1,12 @@
 [package]
 name = "subc-test-support"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 publish = false
+
+[dependencies]
+# Content-addresses the ckdev- binaries tests run (see ckdev_binary).
+sha2 = "0.10"
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", default-features = false, features = ["process"] }

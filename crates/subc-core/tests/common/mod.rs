@@ -10,7 +10,7 @@ use std::{
     sync::{Arc, Once},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use subc_test_support::TestTempDir;
+use subc_test_support::{ckdev_binary, dev_command, TestTempDir};
 
 use subc_daemon::{
     serve_listener, ConnectedClients, ControlHandler, ForwardingTable, ModuleProcessLiveness,
@@ -43,20 +43,40 @@ pub fn copy_executable(src: &Path, dst: &Path) {
 const TEST_DAEMON_VER: &str = "test-subc";
 const TEST_AUTH_DEADLINE: Duration = Duration::from_secs(2);
 
-/// Returns the dedicated CLI target after proving it contains the fixture-key
-/// support required by integration tests. A build-shape check makes a Cargo
-/// feature-resolution change fail before any test fixture can mask it.
+/// The daemon binary (`ck-subc`) published as `ckdev-subc` (see
+/// `subc_test_support::ckdev_binary`); also the privacy trampoline tests hand
+/// to a `Supervisor`.
+pub fn ckdev_subc() -> PathBuf {
+    ckdev_binary(env!("CARGO_BIN_EXE_ck-subc"))
+}
+
+/// The fault-injection daemon target (`ck-subc-under-test`) published as
+/// `ckdev-subc-under-test`.
+pub fn ckdev_subc_under_test() -> PathBuf {
+    ckdev_binary(env!("CARGO_BIN_EXE_ck-subc-under-test"))
+}
+
+/// The shipped CLI (`ck`) published as `ckdev-ck`.
+pub fn ckdev_ck() -> PathBuf {
+    ckdev_binary(env!("CARGO_BIN_EXE_ck"))
+}
+
+/// Returns the dedicated CLI target, run as `ckdev-under-test`, after proving
+/// it contains the fixture-key support required by integration tests. A
+/// build-shape check makes a Cargo feature-resolution change fail before any
+/// test fixture can mask it.
 pub fn ck_under_test_command() -> Command {
     assert_ck_under_test_build_shape();
-    Command::new(env!("CARGO_BIN_EXE_ck-under-test"))
+    dev_command(ckdev_binary(env!("CARGO_BIN_EXE_ck-under-test")))
 }
 
 fn assert_ck_under_test_build_shape() {
     static CHECKED: Once = Once::new();
 
     CHECKED.call_once(|| {
-        let path = Path::new(env!("CARGO_BIN_EXE_ck-under-test"));
-        let output = Command::new(path)
+        let placed = ckdev_binary(env!("CARGO_BIN_EXE_ck-under-test"));
+        let path = placed.as_path();
+        let output = dev_command(path)
             .arg("--ck-build-shape")
             .output()
             .unwrap_or_else(|error| panic!("could not inspect ck-under-test {}: {error}", path.display()));

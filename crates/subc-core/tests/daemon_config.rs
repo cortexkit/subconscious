@@ -37,9 +37,9 @@ const STATE_TIMEOUT: Duration = Duration::from_secs(10);
 struct RunningDaemon {
     connection_file_path: PathBuf,
     config_path: PathBuf,
-    // Held for RAII lifetime only: the guard's `Drop` removes the tree (or
-    // preserves it on panic). Never read directly.
-    #[allow(dead_code)]
+    // Held for RAII lifetime: the guard's `Drop` removes the tree (or
+    // preserves it on panic). Tests also place the binaries they run under
+    // their `ckdev-` names in it.
     temp_dir: TestTempDir,
     task: JoinHandle<Result<(), subc_daemon::bootstrap::BootstrapError>>,
 }
@@ -70,7 +70,7 @@ impl RunningDaemon {
         // environment and writes `<module_id>.stderr.log` into the operator's
         // live data home under fixture module ids.
         let config = BootstrapConfig::new(&connection_file_path, 0)
-            .with_privacy_trampoline(env!("CARGO_BIN_EXE_ck-subc"))
+            .with_privacy_trampoline(common::ckdev_subc())
             .with_terminal_journal_path(temp_dir.join("run").join("terminals.jsonl"))
             .with_daemon_config_path(&config_path)
             .unwrap();
@@ -132,7 +132,7 @@ async fn configured_ck_log_is_present_in_the_spawned_child_and_unconfigured_is_a
         Arc::new(Registry::default()),
         RestartPolicy::new(0, Duration::from_millis(1)),
     )
-    .with_privacy_trampoline(env!("CARGO_BIN_EXE_ck-subc"));
+    .with_privacy_trampoline(common::ckdev_subc());
     let modules = config
         .modules
         .iter()
@@ -1341,7 +1341,7 @@ async fn present_invalid_config_fails_loud_before_daemon_starts() {
 
     let err = run_with_daemon_config_path(
         BootstrapConfig::new(&connection_file_path, 0)
-            .with_privacy_trampoline(env!("CARGO_BIN_EXE_ck-subc"))
+            .with_privacy_trampoline(common::ckdev_subc())
             .with_terminal_journal_path(temp_dir.join("run").join("terminals.jsonl")),
         &config_path,
     )

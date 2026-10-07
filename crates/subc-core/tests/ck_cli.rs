@@ -364,8 +364,9 @@ fn setup_dry_run_refuses_when_the_signature_header_is_stripped() {
 
 #[test]
 fn production_ck_ignores_the_test_release_index_key() {
-    let production = Path::new(env!("CARGO_BIN_EXE_ck"));
-    let shape = Command::new(production)
+    // The shipped `ck` target, run as `ckdev-ck` like every test process.
+    let production = subc_test_support::ckdev_binary(env!("CARGO_BIN_EXE_ck"));
+    let shape = subc_test_support::dev_command(&production)
         .arg("--ck-build-shape")
         .output()
         .expect("production ck build shape");
@@ -405,7 +406,7 @@ fn production_ck_ignores_the_test_release_index_key() {
         &std::env::var_os("PATH").unwrap_or_default(),
     )))
     .expect("fixture PATH");
-    let output = Command::new(production)
+    let output = subc_test_support::dev_command(&production)
         .args(["setup", "--dry-run"])
         .env("CK_RELEASE_INDEX_URL", &index.url)
         .env("CK_TEST_RELEASE_INDEX_PUBKEY", &index.public_key)
@@ -1272,7 +1273,12 @@ impl UpgradeFixture {
         write_executable(&mcp, "#!/bin/sh\necho 'ck-subc-mcp 0.17.9'\n");
         write_executable(&claustrum, "#!/bin/sh\necho 'ck-claustrum 0.8.0'\n");
         write_executable(&auth, "#!/bin/sh\necho 'ck-auth 0.8.0'\n");
-        let ck = fs::canonicalize(env!("CARGO_BIN_EXE_ck-under-test")).unwrap();
+        // The manifest names the `ck` this fixture's commands run: the test
+        // CLI as published under its `ckdev-` name.
+        let ck = fs::canonicalize(subc_test_support::ckdev_binary(env!(
+            "CARGO_BIN_EXE_ck-under-test"
+        )))
+        .unwrap();
         let mutations = [
             (ck, "44".repeat(32)),
             (daemon, "33".repeat(32)),
@@ -1645,6 +1651,41 @@ fn daemon_lint_uses_its_explicit_config_without_a_daemon_connection() {
 // before any discovery, so the probe launches nothing; and a ck copy is
 // never listed as a domain by `--help`, which probes each copy exactly once
 // and, since each copy refuses without probing, launches nothing further.
+/// The one test allowed to place production-named (`ck-*`) executables.
+const TWIN_TEST: &str = "a_copy_of_ck_on_path_is_neither_probed_recursively_nor_listed";
+
+/// The control for the twin exemption: in this same file, a production-named
+/// spawn outside it is still refused, whether it borrows the twin test's name,
+/// names a file the exemption does not list, or skips the exemption entirely.
+#[test]
+fn a_production_named_spawn_outside_the_twin_exemption_is_refused() {
+    let bin = Path::new("/fixture/bin");
+    let refused = |attempt: &dyn Fn()| {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(attempt)).is_err()
+    };
+    assert!(
+        refused(&|| {
+            subc_test_support::exempt_production_executable(TWIN_TEST, &bin.join("ck-twin"));
+        }),
+        "another test must not borrow the twin test's exemption"
+    );
+    assert!(
+        refused(&|| {
+            subc_test_support::exempt_production_executable(
+                "a_production_named_spawn_outside_the_twin_exemption_is_refused",
+                &bin.join("ck-twin"),
+            );
+        }),
+        "the exemption names one test"
+    );
+    assert!(
+        refused(&|| {
+            let _ = subc_test_support::dev_command(bin.join(platform_binary("ck-twin")));
+        }),
+        "the spawn guard refuses a ck-* program"
+    );
+}
+
 #[test]
 fn a_copy_of_ck_on_path_is_neither_probed_recursively_nor_listed() {
     let temp = TempDir::new("ck-twin-on-path");
@@ -1663,10 +1704,20 @@ fn a_copy_of_ck_on_path_is_neither_probed_recursively_nor_listed() {
     // Two copies, because a ck never probes its own executable: the CI shape
     // has many builds of ck side by side, and the recursion runs between
     // them, each copy probing the other.
+    //
+    // These copies keep `ck-` names on purpose, the one exemption from the
+    // rule that test processes run as `ckdev-*`: what this test checks is
+    // ck's production discovery of external domains, which matches `ck-*`
+    // executables on PATH by design, so a `ckdev-` copy would never be probed
+    // and the test would check something else. ck itself, not this test,
+    // starts them, and each refuses `--ck-domain` and exits within
+    // milliseconds. The exemption names this test and these two file names
+    // exactly; any other production-named placement is refused.
     for name in ["ck-twin", "ck-twin-two"] {
+        let copy = bin.join(platform_binary(name));
         common::copy_executable(
             Path::new(env!("CARGO_BIN_EXE_ck-under-test")),
-            &bin.join(platform_binary(name)),
+            subc_test_support::exempt_production_executable(TWIN_TEST, &copy),
         );
     }
     let path = std::env::join_paths(
@@ -2612,7 +2663,7 @@ async fn module_stop_waits_past_ten_seconds_within_running_drain_budget() {
         RestartPolicy::new(3, Duration::from_millis(137))
             .with_max_backoff(Duration::from_millis(7_321)),
     )
-    .with_privacy_trampoline(env!("CARGO_BIN_EXE_ck-subc"))
+    .with_privacy_trampoline(common::ckdev_subc())
     .with_process_liveness(Arc::clone(&server.process_liveness))
     .with_forwarding(Arc::clone(&server.forwarding))
     .with_handle(server.supervisor_handle.clone())
@@ -3319,8 +3370,14 @@ fn looks_like_age(text: &str) -> bool {
     text == "just now" || text.ends_with(" ago")
 }
 
+/// The test CLI, run as `ckdev-under-test` (see `common::ck_under_test_command`).
 fn ck_command() -> Command {
     let mut command = common::ck_under_test_command();
+    isolate_ck_command(&mut command);
+    command
+}
+
+fn isolate_ck_command(command: &mut Command) {
     // Every CLI test gets an isolated update cache and a closed local endpoint.
     // This proves dashboard output without reaching public release infrastructure.
     // The domain list is discovered from PATH (`ck-<name> --ck-domain`), so a
@@ -3338,7 +3395,6 @@ fn ck_command() -> Command {
         )
         .env("CK_RELEASE_INDEX_URL", "http://127.0.0.1:0/index.json")
         .env("PATH", system_path_only());
-    command
 }
 
 /// The platform's system tool directories and nothing else.
@@ -3421,7 +3477,7 @@ fn supervisor_with_restart_limit(server: &TestServer, max_restarts: u32) -> Supe
         Arc::clone(&server.registry),
         RestartPolicy::new(max_restarts, Duration::from_millis(10)),
     )
-    .with_privacy_trampoline(env!("CARGO_BIN_EXE_ck-subc"))
+    .with_privacy_trampoline(common::ckdev_subc())
     .with_process_liveness(Arc::clone(&server.process_liveness))
     .with_forwarding(Arc::clone(&server.forwarding))
     .with_handle(server.supervisor_handle.clone())

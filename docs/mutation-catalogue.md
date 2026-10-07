@@ -1,6 +1,6 @@
 # Mutation catalogue
 
-For the vocabulary used here, see the [`cortexkit-mutate` README in cortexkit/commons](https://github.com/cortexkit/commons/blob/a32c6958bb187cff039adb3e573424c0ca33ef0d/crates/cortexkit-mutate/README.md).
+For the vocabulary used here, see the [`cortexkit-mutate` README in cortexkit/commons](https://github.com/cortexkit/commons/blob/46cc166b0df2edcfd14b3eb54ed6eeac588fed69/crates/cortexkit-mutate/README.md).
 
 The catalogue is `mutations.toml` at the repository root. `mutations/` holds
 the replay adapter and its tests. The rows guard health reporting, confirmed
@@ -9,13 +9,13 @@ route closure, connection-file ownership and Cargo path dependencies.
 
 ## Tools and prerequisites
 
-Use **`cortexkit-mutate` 0.7.1 from the cortexkit/commons repository at commit
-`a32c6958bb187cff039adb3e573424c0ca33ef0d`**. The pin makes grading reproducible;
+Use **`cortexkit-mutate` 0.8.0 from the cortexkit/commons repository at commit
+`46cc166b0df2edcfd14b3eb54ed6eeac588fed69`**. The pin makes grading reproducible;
 keep it consistent in this guide, the catalogue header and the CI workflow.
 
 ```sh
 cargo install --locked --git https://github.com/cortexkit/commons \
-  --rev a32c6958bb187cff039adb3e573424c0ca33ef0d cortexkit-mutate
+  --rev 46cc166b0df2edcfd14b3eb54ed6eeac588fed69 cortexkit-mutate
 cargo install --locked cargo-nextest --version 0.9.138
 ```
 

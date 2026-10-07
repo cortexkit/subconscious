@@ -148,9 +148,9 @@ def main(args):
         raise RuntimeError("usage: python3 mutations/replay.py selftest|baseline|check|run|prove ...")
     os.chdir(ROOT)
     real_cargo = shutil.which("cargo")
-    runner = os.environ.get("CK_MUTATE", "ck-mutate")
+    runner = os.environ.get("CK_MUTATE", "ckdev-mutate")
     if not real_cargo or not shutil.which(runner):
-        raise RuntimeError("install Cargo and the pinned ck-mutate first")
+        raise RuntimeError("install Cargo and the pinned ckdev-mutate first")
     if Path(real_cargo).resolve() == (ROOT / "mutations/bin/cargo").resolve():
         raise RuntimeError("do not put mutations/bin on PATH yourself; use this entry point")
     output = ROOT / "target/mutations"

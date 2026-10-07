@@ -18,7 +18,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  CK_MUTATE_REV: a32c6958bb187cff039adb3e573424c0ca33ef0d
+  CK_MUTATE_REV: 46cc166b0df2edcfd14b3eb54ed6eeac588fed69
   CARGO_TERM_COLOR: never
 
 jobs:
@@ -52,7 +52,7 @@ jobs:
         run: |
           cargo --version
           rustc --version
-          ck-mutate --version
+          ckdev-mutate --version
           cargo nextest --version
           python3 --version
           python3 mutations/replay.py selftest

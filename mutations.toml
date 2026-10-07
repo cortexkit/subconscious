@@ -1,4 +1,4 @@
-# Pin: cortexkit-mutate 0.7.1 from the cortexkit/commons repository at commit a32c6958bb187cff039adb3e573424c0ca33ef0d for reproducible grading.
+# Pin: cortexkit-mutate 0.8.0 from the cortexkit/commons repository at commit 46cc166b0df2edcfd14b3eb54ed6eeac588fed69 for reproducible grading.
 prebuild = [
   { name = "daemon-fixture-binaries", command = ["cargo", "build", "-p", "subc-daemon", "--bins", "--features", "test-support", "--locked"], timeout_s = 1800 },
   { name = "core-fixture-binaries", command = ["cargo", "build", "-p", "subc-core", "--bins", "--features", "test-support", "--locked"], timeout_s = 1800 },

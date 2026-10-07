@@ -81,7 +81,8 @@ pub fn run(args: &[String]) -> Option<i32> {
     })
 }
 
-/// Flags that take no value. Only `--conf-only` accepts the last two.
+/// Flags that take no value. `--keep-existing` and `--dry-run` are accepted only
+/// together with `--conf-only`.
 const VALUELESS_FLAGS: [&str; 3] = ["conf-only", "keep-existing", "dry-run"];
 
 struct Flags(Vec<(String, String)>);

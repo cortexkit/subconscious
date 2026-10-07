@@ -71,7 +71,8 @@ pub enum HealthState {
     Missing,
     /// The entry setup would write is already there.
     Matching,
-    /// The operator's own entry, kept as it is.
+    /// A `health` entry the operator wrote that differs from setup's; setup never
+    /// overwrites it.
     Kept,
 }
 
@@ -88,7 +89,8 @@ impl BusObserved {
         self.listener == ListenerState::WouldAdd || self.health == HealthState::Missing
     }
 
-    /// What a run with nothing to change says about the bus, for verbose output.
+    /// The verbose-output line for an install whose monitoring listener and health
+    /// check are both already in place.
     pub fn noop_scope(&self) -> String {
         let mut scope =
             "nats-server monitoring listener and health check are already configured".to_string();
@@ -130,7 +132,8 @@ impl fmt::Display for BusMonitoring {
     }
 }
 
-/// ck-bus's report from `install-apply --conf-only`.
+/// What `ck-bus install-apply --conf-only` printed: whether it added, kept or found the
+/// monitoring listener (`status`), and the `/healthz` URL that listener serves.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConfReport {
     pub status: String,
@@ -160,7 +163,9 @@ impl ConfTool for CkBusCommand {
         if dry_run {
             command.arg("--dry-run");
         }
-        // ck-bus treats these as offline install commands only without a module id.
+        // ck-bus handles install commands before it reads SUBC_MODULE_ID, so this run
+        // never acts as the supervised module. Removing the variable keeps it that way
+        // if setup itself was started from a supervised module's environment.
         command.env_remove("SUBC_MODULE_ID");
         let output = command.output().map_err(|error| {
             format!(
@@ -409,12 +414,17 @@ pub fn apply(
         }
     };
 
-    if listener == ListenerState::Added || health_added {
+    // A running nats-server opens a newly added listener only when it restarts. When
+    // the listener was already in the file, only the daemon has to pick up the new
+    // health entry, so a restart would be needless.
+    if listener == ListenerState::Added {
         lines.push(
             "to start the health check: restart nats-server so it opens the listener \
              (`ck module restart nats-server`), then run `ck module rescan`"
                 .to_string(),
         );
+    } else if health_added {
+        lines.push("to start the health check: run `ck module rescan`".to_string());
     }
     Ok(lines)
 }
@@ -657,6 +667,29 @@ mod tests {
         assert_eq!(
             health(&install).unwrap()["http"],
             "http://127.0.0.1:19222/healthz"
+        );
+    }
+
+    #[test]
+    fn a_listener_already_in_the_file_asks_only_for_a_rescan() {
+        // nats-server already serves this listener, so restarting it would only
+        // interrupt the bus; the daemon picks up the new health entry on rescan.
+        let install = install(Some("127.0.0.1:19222"), "");
+        let mut tool = FakeCkBus::new(&install.config_path);
+        let bus = observed(observe(&install.config_path, &mut tool));
+        let lines = apply(&install.config_path, &bus.target, &mut tool).unwrap();
+        assert!(health(&install).is_some(), "{lines:?}");
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("run `ck module rescan`")),
+            "{lines:?}"
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.contains("ck module restart nats-server")),
+            "{lines:?}"
         );
     }
 

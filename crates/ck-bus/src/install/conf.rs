@@ -84,7 +84,7 @@ fn loopback_port(line: &str, name: &str) -> Result<u16, String> {
 }
 
 /// What [`with_monitoring`] does when the file already has a monitoring listener on a
-/// different port than the one asked for.
+/// port other than the requested one: replace it, or keep the operator's port.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ExistingListener {
     /// Refuse: the caller asked for the default port and did not name one, so it

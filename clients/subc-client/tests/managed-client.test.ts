@@ -420,7 +420,7 @@ describe("SubcClient managed call", () => {
     }
   });
 
-  test("auto-retries a provable not_sent request after reconnecting and re-opening the cached route", async () => {
+  test("opens a fresh route for a managed call after reconnect", async () => {
     const { connFile } = tempConnectionFile();
     const sleeps: number[] = [];
     const firstStats = newStats();
@@ -523,14 +523,13 @@ describe("SubcClient managed call", () => {
     }
   });
 
-  test("re-attaches the same consumer_identity when reopening a cached route after reconnect", async () => {
+  test("re-attaches the same consumer_identity when a later call opens after reconnect", async () => {
     // A route opened with a consumer_identity (principal attestation) must send the
     // SAME consumer_identity when it is reopened on a fresh connection after a
     // reconnect. Dropping it there would let the daemon re-stamp the route with a
     // weaker principal than it was originally bound under — a silent post-reconnect
-    // trust downgrade. This drives the bulk reopenCachedRoutes path (not the lazy
-    // per-call openCachedRoute path) by having a route already installed before the
-    // connection drops.
+    // trust downgrade. Connection loss discards the old route, so the later call
+    // must carry the original identity on its fresh route.open.
     const { connFile } = tempConnectionFile();
     const consumerIdentity = { module_id: "reserved-module", launch_nonce: "nonce-abc" };
     const firstStats = newStats();
@@ -556,12 +555,12 @@ describe("SubcClient managed call", () => {
       const second = await startFakeDaemon({ stats: secondStats });
       writeConnectionFile(connFile, second.port);
 
-      // Second call triggers reconnect + bulk reopen of the installed route.
+      // The second call reconnects and opens a fresh route with the same identity.
       await expect(
         client.call("managed-provider", "echo", { n: 2 }, { consumerIdentity }),
       ).resolves.toEqual({ method: "echo", params: { n: 2 } });
 
-      // The reopen on connection 2 must carry the identical consumer_identity.
+      // The new route on connection 2 must carry the identical consumer_identity.
       expect(firstStats.routeOpenConsumerIdentities).toEqual([consumerIdentity]);
       expect(secondStats.routeOpenConsumerIdentities).toEqual([consumerIdentity]);
     } finally {
@@ -569,7 +568,7 @@ describe("SubcClient managed call", () => {
     }
   });
 
-  test("isolates a refused cached route while reconnecting healthy managed routes", async () => {
+  test("isolates a refused route while reconnecting healthy managed calls", async () => {
     const { connFile } = tempConnectionFile();
     const stats = newStats();
     const daemonOptions: FakeDaemonOptions = {
@@ -598,8 +597,8 @@ describe("SubcClient managed call", () => {
       });
 
       // Arm the existing response-count drop only after both routes are cached.
-      // The successful trigger response then closes connection 1 without losing
-      // either cached identity needed by the bulk reconnect reopen.
+      // The successful trigger response then closes connection 1; on reconnect,
+      // only the route used by the next call is opened.
       daemonOptions.closeAfterDataResponses = 1;
       await expect(client.call("alpha", "echo", { phase: "drop" })).resolves.toMatchObject({
         params: { phase: "drop" },
@@ -617,49 +616,13 @@ describe("SubcClient managed call", () => {
         code: "project_origin_unclassifiable",
       });
       expect(stats.connections).toBe(2);
-      expect(stats.routeOpens).toBe(5);
+      expect(stats.routeOpens).toBe(4);
     } finally {
       client.close();
     }
   });
 
-  test("a transport drop during cached-route reopen still fails the reconnect", async () => {
-    const { connFile } = tempConnectionFile();
-    const stats = newStats();
-    const daemonOptions: FakeDaemonOptions = {
-      stats,
-      routeOpenDropModule: { module_id: "beta", dropFromConnection: 2 },
-    };
-    const daemon = await startFakeDaemon(daemonOptions);
-    writeConnectionFile(connFile, daemon.port);
-
-    const client = await SubcClient.connect({
-      connectionFile: connFile,
-      identity: IDENTITY,
-      reconnectBackoff: { baseMs: 1, capMs: 1, maxAttempts: 1 },
-    });
-    try {
-      await client.call("alpha", "echo", { phase: "cache" });
-      await client.call("beta", "echo", { phase: "cache" });
-      daemonOptions.closeAfterDataResponses = 1;
-      await client.call("alpha", "echo", { phase: "drop" });
-      daemonOptions.closeAfterDataResponses = undefined;
-      await waitFor(() => clientClosedErr(client) !== null, "client to observe the transport-arm drop");
-
-      const error = await client.call("alpha", "echo", { phase: "reconnect" }).then(
-        () => null,
-        (cause: unknown) => cause,
-      );
-      expect(error).toBeInstanceOf(SubcCallError);
-      expect(error).toMatchObject({ kind: "not_sent", code: undefined });
-      expect((error as SubcCallError).cause).toBeInstanceOf(SocketClosedError);
-      expect(stats.connections).toBe(2);
-    } finally {
-      client.close();
-    }
-  });
-
-  test("does not wait out retryable route patience while reopening other cached routes", async () => {
+  test("does not wait out retryable route patience while opening the next managed route", async () => {
     const { connFile } = tempConnectionFile();
     const stats = newStats();
     const daemonOptions: FakeDaemonOptions = {
@@ -695,8 +658,8 @@ describe("SubcClient managed call", () => {
       expect(Date.now() - reconnectStartedAt).toBeLessThan(2_000);
       expect(stats.connections).toBe(2);
 
-      // Reopen discarded beta's cache entry without consuming its retry budget;
-      // beta's own next call now owns the bounded module-reload patience.
+      // Beta's old route was discarded with the connection. Its next call owns
+      // the bounded module-reload patience and observes the daemon's refusal.
       await expect(client.call("beta", "echo", { phase: "patient-open" })).rejects.toMatchObject({
         kind: "not_sent",
         code: "module_reloading",
@@ -904,9 +867,9 @@ describe("SubcClient managed call", () => {
         kind: "terminal",
         code: "route_rejected",
       });
-      // The bulk reconnect open is isolated and evicted; the waiting caller then
-      // owns one fresh route.open and receives that route's refusal directly.
-      expect(secondStats.routeOpens).toBe(2);
+      // The caller owns the fresh route.open after reconnect, so a non-transient
+      // refusal reaches that call directly without an eager background open.
+      expect(secondStats.routeOpens).toBe(1);
       expect(sleeps).toEqual([]);
     } finally {
       client.close();

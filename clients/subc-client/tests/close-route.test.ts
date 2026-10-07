@@ -168,6 +168,34 @@ for (const reason of ["scope_ended", "scope_carrier_removed", "scope_delegation_
   });
 }
 
+for (const [reason, closeReason] of [
+  ["crash", "crash"],
+  ["disable", "disable"],
+  ["capability_denied", "capability_denied"],
+  ["future_policy_reason", "unknown"],
+] as const) {
+  test(`${reason} fails in-flight work and lets a later managed call reopen`, async () => {
+    const { client, daemon } = await connectClient();
+    try {
+      daemon.state.holdRequests = true;
+      const pending = client.call("aft", "hold", {}).catch((err: unknown) => err);
+      await waitFor(() => daemon.state.dataRequests === 1, "first request received");
+      const channel = daemon.state.openedChannels[0]!;
+      await daemon.send(lifecyclePush(reason, [channel]));
+      await daemon.send(goodbye(channel));
+      expect(await pending).toMatchObject({
+        code: "route_closed",
+        closeReason,
+        kind: "outcome_unknown",
+      });
+
+      daemon.state.holdRequests = false;
+      await expect(client.call("aft", "echo", {})).resolves.toEqual({ method: "echo", params: {} });
+      expect(daemon.state.routeOpens).toBe(2);
+    } finally { client.close(); }
+  });
+}
+
 test("restart close still permits a scoped managed reopen", async () => {
   const { client, daemon } = await connectClient();
   const scope = { owner: { kind: "reserved", module_id: "owner" } as const, ref: "session", scopeEpoch: 1 };

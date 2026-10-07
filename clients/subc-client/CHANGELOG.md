@@ -4,6 +4,10 @@
 
 - Classify `target_flow_unsupported` as a terminal route-open refusal, matching the golden decision table in subc-protocol 0.29.1. A target must declare `flow-scopes/v1` before it may receive a flow-scoped route.
 
+## 0.21.1
+
+- A cached managed route now ends permanently only when its scope ends. Other route closes, including crashes and connection loss, discard the cached route so the next call opens a fresh one; calls already in flight still fail without being resent.
+
 ## 0.21.0
 
 - Add optional `scope: { owner: Principal, ref: string, scopeEpoch: number }` to direct route opens, managed calls (including binary calls), and managed closes. The selector is sent as `scope: { owner, ref, scope_epoch }`, matching the Rust protocol. Owner and ref are validated locally, and a missing, negative, fractional or unsafe epoch is refused before sending.

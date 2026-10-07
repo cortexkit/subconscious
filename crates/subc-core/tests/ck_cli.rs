@@ -1654,6 +1654,41 @@ fn daemon_lint_uses_its_explicit_config_without_a_daemon_connection() {
 // before any discovery, so the probe launches nothing; and a ck copy is
 // never listed as a domain by `--help`, which probes each copy exactly once
 // and, since each copy refuses without probing, launches nothing further.
+/// The one test allowed to place production-named (`ck-*`) executables.
+const TWIN_TEST: &str = "a_copy_of_ck_on_path_is_neither_probed_recursively_nor_listed";
+
+/// The control for the twin exemption: in this same file, a production-named
+/// spawn outside it is still refused, whether it borrows the twin test's name,
+/// names a file the exemption does not list, or skips the exemption entirely.
+#[test]
+fn a_production_named_spawn_outside_the_twin_exemption_is_refused() {
+    let bin = Path::new("/fixture/bin");
+    let refused = |attempt: &dyn Fn()| {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(attempt)).is_err()
+    };
+    assert!(
+        refused(&|| {
+            subc_test_support::exempt_production_executable(TWIN_TEST, &bin.join("ck-twin"));
+        }),
+        "another test must not borrow the twin test's exemption"
+    );
+    assert!(
+        refused(&|| {
+            subc_test_support::exempt_production_executable(
+                "a_production_named_spawn_outside_the_twin_exemption_is_refused",
+                &bin.join("ck-twin"),
+            );
+        }),
+        "the exemption names one test"
+    );
+    assert!(
+        refused(&|| {
+            let _ = subc_test_support::dev_command(bin.join(platform_binary("ck-twin")));
+        }),
+        "the spawn guard refuses a ck-* program"
+    );
+}
+
 #[test]
 fn a_copy_of_ck_on_path_is_neither_probed_recursively_nor_listed() {
     let temp = TempDir::new("ck-twin-on-path");
@@ -1673,15 +1708,19 @@ fn a_copy_of_ck_on_path_is_neither_probed_recursively_nor_listed() {
     // has many builds of ck side by side, and the recursion runs between
     // them, each copy probing the other.
     //
-    // These copies keep `ck-` names on purpose, against the rule that test
-    // processes run as `ckdev-*`: ck discovers domains only by the `ck-`
-    // prefix, so a `ckdev-` copy would never be probed and the test would
-    // prove nothing. ck itself, not this test, starts them, and each refuses
-    // `--ck-domain` and exits at once.
+    // These copies keep `ck-` names on purpose, the one exemption from the
+    // rule that test processes run as `ckdev-*`: what this test checks is
+    // ck's production discovery of external domains, which matches `ck-*`
+    // executables on PATH by design, so a `ckdev-` copy would never be probed
+    // and the test would check something else. ck itself, not this test,
+    // starts them, and each refuses `--ck-domain` and exits within
+    // milliseconds. The exemption names this test and these two file names
+    // exactly; any other production-named placement is refused.
     for name in ["ck-twin", "ck-twin-two"] {
+        let copy = bin.join(platform_binary(name));
         common::copy_executable(
             Path::new(env!("CARGO_BIN_EXE_ck-under-test")),
-            &bin.join(platform_binary(name)),
+            subc_test_support::exempt_production_executable(TWIN_TEST, &copy),
         );
     }
     let path = std::env::join_paths(

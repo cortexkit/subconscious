@@ -100,16 +100,88 @@ pub fn is_production_executable_name(file_name: &OsStr) -> bool {
 /// Panics when `program` would run under a production executable name (see
 /// [`is_production_executable_name`]). Call it before spawning any CortexKit
 /// binary from a test; [`dev_command`] and [`ckdev_binary_in`] already do.
+///
+/// Cargo's own test harness for the `ck` bin target is not refused: cargo names
+/// it `target/<profile>/deps/ck-<16 hex digits>`, and re-running that harness
+/// (a test that starts its own executable) is cargo's naming, not a copy of a
+/// production binary.
 pub fn refuse_production_executable(program: &Path) {
     let name = program.file_name().unwrap_or_default();
     assert!(
-        !is_production_executable_name(name),
+        !is_production_executable_name(name) || is_cargo_test_harness(program),
         "refusing to run a test process under the production executable name {:?} ({}): \
          `ck-*` and `ck` are reserved for installed binaries; run it through \
          subc_test_support::ckdev_binary_in or CkdevBinary so it shows as ckdev-*",
         name,
         program.display()
     );
+}
+
+/// Whether `program` is a test harness cargo built for a bin target: a file
+/// in a `deps` directory named `<target>-<16 lowercase hex digits>`.
+fn is_cargo_test_harness(program: &Path) -> bool {
+    let in_deps = program
+        .parent()
+        .and_then(Path::file_name)
+        .is_some_and(|dir| dir == "deps");
+    let Some(name) = program.file_name().and_then(OsStr::to_str) else {
+        return false;
+    };
+    let stem = strip_exe_suffix(name).0;
+    let hash = stem.rsplit_once('-').map(|(_, hash)| hash).unwrap_or("");
+    in_deps
+        && hash.len() == 16
+        && hash
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// The production-named executables a test may deliberately place, each tied
+/// to the one test allowed to place it, as `(test name, file name)`.
+///
+/// `a_copy_of_ck_on_path_is_neither_probed_recursively_nor_listed` (subc-core
+/// `tests/ck_cli.rs`) checks ck's discovery of external `ck-<domain>`
+/// executables on PATH, which matches the `ck-` prefix by design, so its two
+/// copies of ck must carry that prefix. ck, not the test, starts them, and
+/// each refuses the probe and exits within milliseconds. Nothing else is
+/// exempt: entries are compared exactly, never as patterns.
+const PRODUCTION_NAME_EXEMPTIONS: &[(&str, &str)] = &[
+    (
+        "a_copy_of_ck_on_path_is_neither_probed_recursively_nor_listed",
+        "ck-twin",
+    ),
+    (
+        "a_copy_of_ck_on_path_is_neither_probed_recursively_nor_listed",
+        "ck-twin-two",
+    ),
+];
+
+/// Returns `program` when the test named `test` is the one test allowed to
+/// place an executable with `program`'s production name (the exemption
+/// table in this crate); panics for any other test or name. A
+/// trailing `.exe` is ignored, so the exemption holds on Windows too.
+///
+/// When the calling thread carries a test name (libtest names each test's
+/// thread after it), that name must be `test` as well, so another test cannot
+/// borrow the exemption by passing the exempt test's name.
+pub fn exempt_production_executable<'a>(test: &str, program: &'a Path) -> &'a Path {
+    let file_name = program.file_name().and_then(OsStr::to_str).unwrap_or("");
+    let stem = strip_exe_suffix(file_name).0;
+    let caller = std::thread::current().name().map(str::to_string);
+    let caller_matches = match caller.as_deref() {
+        None | Some("main") => true,
+        Some(thread) => thread == test || thread.ends_with(&format!("::{test}")),
+    };
+    assert!(
+        caller_matches
+            && PRODUCTION_NAME_EXEMPTIONS
+                .iter()
+                .any(|&(exempt_test, exempt_name)| exempt_test == test && exempt_name == stem),
+        "no production-name exemption for {file_name:?} in test {test:?} (running on \
+         thread {caller:?}); test processes run as ckdev-* through \
+         subc_test_support::ckdev_binary_in"
+    );
+    program
 }
 
 /// A `Command` for `program` that refuses (panics) when `program` has a
@@ -480,6 +552,60 @@ mod tests {
     )]
     fn dev_command_refuses_a_production_named_binary() {
         let _ = dev_command(Path::new("/nonexistent/target/debug/ck-subc"));
+    }
+
+    #[test]
+    fn cargo_test_harness_for_the_ck_bin_is_not_refused() {
+        let _ = dev_command(Path::new("/w/target/debug/deps/ck-0123456789abcdef"));
+        let _ = dev_command(Path::new("/w/target/debug/deps/ck-0123456789abcdef.exe"));
+        for refused in [
+            "/w/target/debug/ck-0123456789abcdef",
+            "/w/target/debug/deps/ck-subc",
+            "/w/target/debug/deps/ck-0123456789ABCDEF",
+            "/w/target/debug/deps/ck-0123456789abcde",
+        ] {
+            assert!(
+                std::panic::catch_unwind(|| dev_command(Path::new(refused))).is_err(),
+                "{refused} must be refused"
+            );
+        }
+    }
+
+    const EXEMPT_TEST: &str = "a_copy_of_ck_on_path_is_neither_probed_recursively_nor_listed";
+
+    /// The exemption admits exactly the two twin copies, and only on the
+    /// thread of the one test it names.
+    #[test]
+    fn the_exemption_admits_only_the_named_test_and_its_two_copies() {
+        let outcomes = std::thread::Builder::new()
+            .name(EXEMPT_TEST.to_string())
+            .spawn(|| {
+                [
+                    "ck-twin",
+                    "ck-twin-two",
+                    "ck-twin.exe",
+                    "ck-twin-three",
+                    "ck-subc",
+                    "ck",
+                ]
+                .map(|name| {
+                    let path = Path::new("/fixture/bin").join(name);
+                    std::panic::catch_unwind(|| {
+                        exempt_production_executable(EXEMPT_TEST, &path);
+                    })
+                    .is_ok()
+                })
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        assert_eq!(outcomes, [true, true, true, false, false, false]);
+        // Another test cannot borrow the exemption by naming the exempt test:
+        // this thread carries this test's own name.
+        assert!(std::panic::catch_unwind(|| {
+            exempt_production_executable(EXEMPT_TEST, Path::new("/fixture/bin/ck-twin"));
+        })
+        .is_err());
     }
 
     /// The guard wired through the helper: binaries built as `ck-subc` and `ck`

@@ -1,15 +1,12 @@
 # Changelog
 
-## Unreleased
-
-- Classify `target_flow_unsupported` as a terminal route-open refusal, matching the golden decision table in subc-protocol 0.29.1. A target must declare `flow-scopes/v1` before it may receive a flow-scoped route.
-
 ## 0.21.1
 
-- A cached managed route now ends permanently only when its scope ends. Other route closes, including crashes and connection loss, discard the cached route so the next call opens a fresh one; calls already in flight still fail without being resent.
+- A cached managed route now ends permanently only when its scope ends. Other route closes, including crashes and connection loss, discard the cached route so the next call opens a fresh one; calls already in flight still fail without being resent. This fixes a regression in 0.21.0, where a long-lived client refused every later call to a module after that module crashed and was restarted.
 
 ## 0.21.0
 
+- Classify `target_flow_unsupported` as a terminal route-open refusal, matching the golden decision table in subc-protocol 0.29.1. A target must declare `flow-scopes/v1` before it may receive a flow-scoped route.
 - Add optional `scope: { owner: Principal, ref: string, scopeEpoch: number }` to direct route opens, managed calls (including binary calls), and managed closes. The selector is sent as `scope: { owner, ref, scope_epoch }`, matching the Rust protocol. Owner and ref are validated locally, and a missing, negative, fractional or unsafe epoch is refused before sending.
 - Isolate managed route cache entries by the entire scope selector, apart from unscoped routes. Reconnect reopens retain the selector but never reuse a handle from an earlier connection or daemon incarnation.
 - Preserve deadline-bounded retries for `scope_not_synced` and `scope_changed`. Terminal lifecycle close reasons, including scope revocation, prevent automatic managed reopens under the same selector; restart and reload still allow them.

@@ -224,13 +224,18 @@ fn strip_exe_suffix(name: &str) -> (&str, &str) {
 /// a production `ck-*` binary. `scratch` is a directory the test owns and keeps
 /// for as long as anything may still start the binary.
 ///
-/// The placement is a hard link: the same file, so the same inode, code
-/// signature and executable identity a provenance check compares. When the
-/// scratch directory is on another filesystem the binary is copied instead; a
-/// copy keeps its embedded code signature and gets the source's permissions,
-/// exec bit included, but it is a different inode, so a test comparing a
+/// The placement is a copy, never a hard link. A copy keeps the binary's
+/// embedded code signature and gets the source's permissions, exec bit
+/// included. It is a different inode from `built`, so a test comparing a
 /// process's executable identity must compare it with the returned path, not
 /// with `built`.
+///
+/// Why not a hard link: on macOS, privacy-trampoline probes executed through
+/// per-test hard links to `target/debug/ck-subc` were intermittently killed
+/// with SIGKILL while the suite ran (1 run in 6 of subc-core's `ck_cli`, and 3
+/// in about 21 earlier runs), while the same runs against the cargo path or
+/// against per-test copies stayed clean (0 in 6 each). The kernel reported no
+/// reason, so the cause is not established; copies avoid it.
 ///
 /// A binary already named `ckdev-*` is returned unchanged. Calling this again
 /// for the same binary and scratch directory returns the existing placement.
@@ -261,15 +266,6 @@ pub fn ckdev_binary_in(built: impl AsRef<Path>, scratch: impl AsRef<Path>) -> Pa
 fn place_binary(built: &Path, placed: &Path) -> io::Result<()> {
     if let Some(parent) = placed.parent() {
         fs::create_dir_all(parent)?;
-    }
-    match fs::hard_link(built, placed) {
-        Ok(()) => return Ok(()),
-        // Another thread of the same test placed it first; that file is the
-        // same build.
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => return Ok(()),
-        // Cross-device scratch directories and filesystems without hard links
-        // fall through to a copy.
-        Err(_) => {}
     }
     copy_into_place(built, placed)
 }
@@ -639,39 +635,32 @@ mod tests {
         );
     }
 
+    /// The placement is a copy: its own inode, the same bytes, the exec bit
+    /// kept, no staging file left behind, and reused on a second call.
     #[cfg(unix)]
     #[test]
-    fn placement_is_a_hard_link_to_the_same_inode() {
-        use std::os::unix::fs::MetadataExt;
-        let build = TestTempDir::new("ckdev-link-build");
-        let built = build.join("ck-bus");
-        write_script(&built, "#!/bin/sh\n");
-        let scratch = TestTempDir::new("ckdev-link-scratch");
-        let placed = ckdev_binary_in(&built, scratch.path());
-        let (a, b) = (
-            fs::metadata(&built).unwrap(),
-            fs::metadata(&placed).unwrap(),
-        );
-        assert_eq!((a.dev(), a.ino()), (b.dev(), b.ino()));
-        // A second call reuses the placement instead of failing on it.
-        assert_eq!(ckdev_binary_in(&built, scratch.path()), placed);
-    }
-
-    /// The cross-filesystem fallback: a copy with the exec bit preserved.
-    #[cfg(unix)]
-    #[test]
-    fn the_copy_fallback_keeps_the_exec_bit() {
-        use std::os::unix::fs::PermissionsExt;
+    fn placement_is_a_copy_with_its_own_inode_and_the_exec_bit() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
         let build = TestTempDir::new("ckdev-copy-build");
         let built = build.join("ck-subc");
         write_script(&built, "#!/bin/sh\necho copied\n");
         let scratch = TestTempDir::new("ckdev-copy-scratch");
-        let placed = scratch.join("ckdev-subc");
-        copy_into_place(&built, &placed).unwrap();
-        let mode = fs::metadata(&placed).unwrap().permissions().mode();
+        let placed = ckdev_binary_in(&built, scratch.path());
+        let (source, copy) = (
+            fs::metadata(&built).unwrap(),
+            fs::metadata(&placed).unwrap(),
+        );
+        assert_ne!(
+            (source.dev(), source.ino()),
+            (copy.dev(), copy.ino()),
+            "a placement must not share the built binary's inode"
+        );
+        assert_eq!(fs::read(&built).unwrap(), fs::read(&placed).unwrap());
+        let mode = copy.permissions().mode();
         assert_eq!(mode & 0o777, 0o755, "mode {mode:o}");
         let output = dev_command(&placed).output().unwrap();
         assert_eq!(String::from_utf8_lossy(&output.stdout), "copied\n");
+        assert_eq!(ckdev_binary_in(&built, scratch.path()), placed);
         let leftovers: Vec<_> = fs::read_dir(scratch.path())
             .unwrap()
             .map(|entry| entry.unwrap().file_name())

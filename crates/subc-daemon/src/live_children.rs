@@ -48,13 +48,22 @@ pub(crate) const LIVE_CHILDREN_FILE_NAME: &str = "live-children.json";
 /// signal on.
 const RECORD_VERSION: u32 = 1;
 
-/// Recorded executable and, for macOS `/bin/sh`, its selected interpreter.
+/// The device and inode of the executable a child was recorded running.
+///
+/// On macOS, `/bin/sh` re-execs the shell `/private/var/select/sh` points to
+/// (see `man sh`), so a `#!/bin/sh` module's image changes once after launch.
+/// For that image only, the identity also records the selected shell, read at
+/// launch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ExecutableIdentity {
     pub(crate) device: u64,
     pub(crate) inode: u64,
-    /// An optional recorded fact, not a sweep-time lookup. Older readers ignore
-    /// this field; older records omit it and retain strict single-image matching.
+    /// The selected shell for a `/bin/sh` image, read when the child was
+    /// recorded; the orphan check never looks it up again, so a selection
+    /// changed after a crash cannot make an unrelated process match. Absent on
+    /// every other image and in records written before this field existed,
+    /// which then match only the executable itself. Daemons that predate the
+    /// field ignore it when reading.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     macos_sh_interpreter: Option<InterpreterIdentity>,
 }
@@ -67,9 +76,8 @@ struct InterpreterIdentity {
 
 impl From<subc_os::FileIdentity> for ExecutableIdentity {
     fn from(identity: subc_os::FileIdentity) -> Self {
-        // This conversion is used when publishing an observed image to the
-        // roster. Capture the documented launcher's destination at that point,
-        // so a changed shell selection cannot widen a later orphan sweep.
+        // This runs when the supervisor records a confirmed module image, so the
+        // shell selection is read at launch time, never at sweep time.
         #[cfg(target_os = "macos")]
         let macos_sh_interpreter = recorded_sh_interpreter(identity);
         #[cfg(not(target_os = "macos"))]
@@ -87,8 +95,9 @@ fn recorded_sh_interpreter(image: subc_os::FileIdentity) -> Option<InterpreterId
     if subc_os::file_identity(Path::new("/bin/sh")) != Some(image) {
         return None;
     }
-    // sh(1) documents these three possible interpreters. An absent selection
-    // or any unsupported target leaves the record single-image and fail-closed.
+    // `man sh` names bash, dash and zsh as the only shells `/bin/sh` re-execs.
+    // Any other or missing selection records nothing extra, so the orphan check
+    // matches only `/bin/sh` itself.
     let selected = fs::canonicalize("/private/var/select/sh").ok()?;
     if !["/bin/bash", "/bin/dash", "/bin/zsh"]
         .iter()
@@ -624,9 +633,10 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_sh_reexec_matches_the_interpreter_recorded_at_launch() {
-        // sh(1) documents that /bin/sh re-execs the shell selected by this
-        // symlink. Model both kernel observations directly rather than race
-        // the short-lived launcher on a particular macOS version.
+        // A `#!/bin/sh` child is first seen as `/bin/sh` and then, after the
+        // re-exec, as the selected shell. Build both observations from the
+        // real files instead of trying to catch the brief `/bin/sh` phase,
+        // which some macOS versions don't expose to a sampler.
         let launcher = subc_os::file_identity(Path::new("/bin/sh")).unwrap();
         let interpreter = subc_os::file_identity(Path::new("/private/var/select/sh")).unwrap();
         assert_ne!(

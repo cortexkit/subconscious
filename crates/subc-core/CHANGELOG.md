@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.20.63
+
+- Show a module's latest health detail and headline metrics in `ck module status`, including healthy modules.
+
 ## 0.20.62
 
 - `ck setup` now health-checks nats-server on an existing bus install. It still does not install the message bus: nats-server and ck-bus are still placed with `ck-bus install-plan` and `install-apply`. When `subc.jsonc` already declares `nats-server` (`protocol: "none"`, `-c <absolute path>/server.conf`) and `ckbus` (an absolute `program`), setup first has ck-bus add the loopback monitoring listener `http: "127.0.0.1:18222"` to `server.conf` (`ck-bus install-apply --conf-only --keep-existing`). Only after that succeeds does it add `modules.nats-server.health = { http: "http://127.0.0.1:18222/healthz", cadence_ms: 30000, deadline_ms: 5000 }`. A monitoring port or `health` entry you already set is kept, and setup reports "kept your setting". A non-loopback listener is refused. An install setup cannot identify is reported and skipped. Running setup again changes nothing. To start the check, restart nats-server so it opens the listener (`ck module restart nats-server`), then run `ck module rescan`. Setup restarts neither.

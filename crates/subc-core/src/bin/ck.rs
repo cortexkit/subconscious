@@ -3229,9 +3229,7 @@ async fn health_detail(
         .map(human_health_status)
         .unwrap_or_else(|| "unknown".to_string());
     println!("{module_id}: {status}");
-    if let Some(detail) = health_operator_detail(&value) {
-        println!("  {detail}");
-    }
+    print_health_detail(&value, 1);
     match value.get("metrics") {
         Some(metrics) if !metrics.is_null() && verbose => print_metrics_tree(metrics, 1),
         Some(metrics) if !metrics.is_null() => print_headline_metrics(metrics, 1),
@@ -3340,25 +3338,9 @@ fn scalar_text(value: &Value) -> String {
 }
 
 fn print_headline_metrics(metrics: &Value, depth: usize) {
-    let Some(map) = metrics.as_object() else {
+    let Some(entries) = headline_metric_entries(metrics) else {
         print_metrics_tree(metrics, depth);
         return;
-    };
-    let marked = map
-        .get("headline")
-        .or_else(|| map.get("_headline"))
-        .and_then(Value::as_array)
-        .map(|keys| keys.iter().filter_map(Value::as_str).collect::<Vec<_>>());
-    let entries = match marked {
-        Some(keys) => keys
-            .into_iter()
-            .filter_map(|key| map.get(key).map(|value| (key, value)))
-            .collect::<Vec<_>>(),
-        None => map
-            .iter()
-            .filter(|(_, value)| !value.is_array() && !value.is_object())
-            .map(|(key, value)| (key.as_str(), value))
-            .collect::<Vec<_>>(),
     };
     if entries.is_empty() {
         println!("{}metrics: none", "  ".repeat(depth));
@@ -3366,6 +3348,52 @@ fn print_headline_metrics(metrics: &Value, depth: usize) {
     }
     for (key, value) in entries {
         print_metrics_entry(key, value, depth);
+    }
+}
+
+fn headline_metric_entries(metrics: &Value) -> Option<Vec<(&str, &Value)>> {
+    let map = metrics.as_object()?;
+    let marked = map
+        .get("headline")
+        .or_else(|| map.get("_headline"))
+        .and_then(Value::as_array)
+        .map(|keys| keys.iter().filter_map(Value::as_str).collect::<Vec<_>>());
+    Some(match marked {
+        Some(keys) => keys
+            .into_iter()
+            .filter_map(|key| map.get(key).map(|value| (key, value)))
+            .collect(),
+        None => map
+            .iter()
+            .filter(|(_, value)| !value.is_array() && !value.is_object())
+            .map(|(key, value)| (key.as_str(), value))
+            .collect(),
+    })
+}
+
+fn metrics_have_non_headline_entries(metrics: &Value) -> bool {
+    let Some(map) = metrics.as_object() else {
+        return false;
+    };
+    let Some(headline) = headline_metric_entries(metrics) else {
+        return false;
+    };
+    let marked = map
+        .get("headline")
+        .or_else(|| map.get("_headline"))
+        .and_then(Value::as_array)
+        .is_some();
+    if marked {
+        map.keys().any(|key| {
+            key != "headline"
+                && key != "_headline"
+                && !headline
+                    .iter()
+                    .any(|(headline_key, _)| *headline_key == key)
+        })
+    } else {
+        map.values()
+            .any(|value| value.is_array() || value.is_object())
     }
 }
 
@@ -6280,9 +6308,10 @@ fn print_status_table(
         .unwrap_or_else(|| "running image status unknown".to_string());
     println!("  binary: {binary} ({image})");
     print_reload_verdict(module);
-    if health_status != "ok" {
-        if let Some(detail) = health.and_then(health_operator_detail) {
-            println!("  health: {detail}");
+    if let Some(entry) = health {
+        print_health_detail(entry, 1);
+        if let Some(metrics) = entry.get("metrics").filter(|metrics| !metrics.is_null()) {
+            print_headline_metrics(metrics, 1);
         }
     }
 
@@ -6305,17 +6334,18 @@ fn print_status_table(
             enabled_word(module.get("enabled").and_then(Value::as_bool)),
             live_word(module),
         );
-        if health_status == "ok" {
-            if let Some(detail) = health.and_then(health_operator_detail) {
-                println!("  health: {detail}");
-            }
-        }
         if let Some(metrics) = health.and_then(|entry| entry.get("metrics")) {
             println!("  metrics:");
             print_metrics_tree(metrics, 2);
         }
     }
-    println!("metrics: run `ck health {module_id}`");
+    if health
+        .and_then(|entry| entry.get("metrics"))
+        .filter(|metrics| !metrics.is_null())
+        .is_some_and(metrics_have_non_headline_entries)
+    {
+        println!("metrics: run `ck health {module_id}`");
+    }
 }
 
 fn module_status_text(module: &Value) -> String {
@@ -6734,6 +6764,12 @@ fn health_operator_detail(entry: &Value) -> Option<String> {
         .filter(|detail| !detail.is_empty())
         .filter(|detail| Some(detail.trim()) != status)
         .map(str::to_string)
+}
+
+fn print_health_detail(entry: &Value, depth: usize) {
+    if let Some(detail) = health_operator_detail(entry) {
+        println!("{}{detail}", "  ".repeat(depth));
+    }
 }
 
 /// Cap a table cell so one module's large opaque metrics blob cannot make the

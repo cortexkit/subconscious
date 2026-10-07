@@ -48,10 +48,14 @@ struct TestServer {
 
 impl TestServer {
     async fn start() -> Self {
+        Self::start_named("ck-cli-server").await
+    }
+
+    async fn start_named(name: &str) -> Self {
         let process_liveness = Arc::new(SupervisorProcessLiveness::new());
         let supervisor_handle = SupervisorHandle::new();
         let daemon = start_test_daemon_with_process_liveness_and_supervisor(
-            "ck-cli-server",
+            name,
             process_liveness.clone(),
             supervisor_handle.clone(),
         )
@@ -2539,7 +2543,7 @@ async fn module_status_renders_key_value_block_byte_for_byte() {
     assert_eq!(
         rest,
         format!(
-            "0 of 1 in 10m · drain 25 ms · restart backoff 10 ms to 30s\n  launch_nonce_env: {nonce_env}\n  last exit: none\n  drain gauges: 0 drains with undeclared gauge\n  binary: {binary} ({image})\n  configured program: matches running process\n  running image: {image_verdict}\nmetrics: run `ck health aft`\n",
+            "0 of 1 in 10m · drain 25 ms · restart backoff 10 ms to 30s\n  launch_nonce_env: {nonce_env}\n  last exit: none\n  drain gauges: 0 drains with undeclared gauge\n  binary: {binary} ({image})\n  configured program: matches running process\n  running image: {image_verdict}\n",
             nonce_env = !cfg!(unix)
         )
     );
@@ -3131,6 +3135,123 @@ async fn health_summarizes_provider_state_and_headline_metrics() {
     );
 
     module.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn module_status_shows_healthy_health_detail_and_headline_metrics() {
+    let server = TestServer::start_named("ckdev-module-status-health").await;
+    let supervisor = supervisor_with_fast_health(&server);
+    let xdg_root = server.temp_dir.path().join("child-xdg");
+    let xdg_paths = [
+        ("XDG_DATA_HOME", xdg_root.join("data")),
+        ("XDG_RUNTIME_DIR", xdg_root.join("runtime")),
+        ("XDG_CONFIG_HOME", xdg_root.join("config")),
+    ];
+    for (_, path) in &xdg_paths {
+        fs::create_dir_all(path).unwrap();
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&xdg_paths[1].1, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let xdg_data = xdg_paths[0].1.to_str().unwrap();
+    let xdg_runtime = xdg_paths[1].1.to_str().unwrap();
+    let xdg_config = xdg_paths[2].1.to_str().unwrap();
+
+    let metrics = serde_json::json!({
+        "headline": ["indexing"],
+        "indexing": "view publication prefrontal 0/? files [preparing]",
+        "roots_warming": 84,
+    })
+    .to_string();
+    let with_health = spawn_stub_with_env(
+        &server,
+        &supervisor,
+        "ckdev-status-detail",
+        vec![
+            ("FAKE_AFT_ADVERTISE_HEALTH", "1"),
+            ("FAKE_AFT_HEALTH_STATUS", "ok"),
+            (
+                "FAKE_AFT_HEALTH_DETAIL",
+                "indexing view publication prefrontal 0/? files [preparing]",
+            ),
+            ("FAKE_AFT_HEALTH_METRICS", metrics.as_str()),
+            ("XDG_DATA_HOME", xdg_data),
+            ("XDG_RUNTIME_DIR", xdg_runtime),
+            ("XDG_CONFIG_HOME", xdg_config),
+        ],
+    )
+    .await;
+    let without_health_detail = spawn_stub_with_env(
+        &server,
+        &supervisor,
+        "ckdev-status-empty",
+        vec![
+            ("FAKE_AFT_ADVERTISE_HEALTH", "1"),
+            ("XDG_DATA_HOME", xdg_data),
+            ("XDG_RUNTIME_DIR", xdg_runtime),
+            ("XDG_CONFIG_HOME", xdg_config),
+        ],
+    )
+    .await;
+    wait_for_health_status(
+        &server.connection_file_path,
+        "ckdev-status-detail",
+        SupervisorHealthStatus::Ok,
+    )
+    .await;
+    wait_for_health_status(
+        &server.connection_file_path,
+        "ckdev-status-empty",
+        SupervisorHealthStatus::Ok,
+    )
+    .await;
+
+    let status = ck_with_subc(
+        &server.connection_file_path,
+        ["module", "status", "ckdev-status-detail"],
+    );
+    assert_exit(&status, 0);
+    let stdout = text(&status.stdout);
+    assert!(
+        stdout.contains("  indexing view publication prefrontal 0/? files [preparing]\n"),
+        "healthy detail missing from module status:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("  indexing: view publication prefrontal 0/? files [preparing]\n"),
+        "headline metric missing from module status:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("metrics: run `ck health ckdev-status-detail`\n"),
+        "the non-headline metrics hint should remain:\n{stdout}"
+    );
+
+    let empty = ck_with_subc(
+        &server.connection_file_path,
+        ["module", "status", "ckdev-status-empty"],
+    );
+    assert_exit(&empty, 0);
+    let empty_stdout = text(&empty.stdout);
+    assert!(
+        !empty_stdout.contains("metrics: run `ck health ckdev-status-empty`"),
+        "status without extra metrics should not print the health hint:\n{empty_stdout}"
+    );
+    assert!(
+        !empty_stdout.contains("indexing view publication prefrontal 0/? files [preparing]"),
+        "status without a health detail should omit its detail line:\n{empty_stdout}"
+    );
+    assert!(
+        !empty_stdout.contains("indexing:"),
+        "status without headline metrics should omit their lines:\n{empty_stdout}"
+    );
+    assert!(
+        !empty_stdout.contains("  metrics: none\n"),
+        "status without metrics should omit a headline line:\n{empty_stdout}"
+    );
+
+    with_health.stop().await.unwrap();
+    without_health_detail.stop().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

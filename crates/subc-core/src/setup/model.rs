@@ -5,6 +5,7 @@ use std::{
 };
 
 use super::{
+    bus_monitoring::{BusMonitoring, BusTarget},
     detection,
     mc_detection::{self, McDetection},
 };
@@ -316,6 +317,9 @@ pub struct SetupObserved {
     /// uninstall that failed partway leaves exactly this: the daemon rows
     /// gone, so no component detects, and the binaries still on disk.
     pub inventory_owned_paths: usize,
+    /// An existing nats-server install `ck setup` can give a health check, read
+    /// without changing anything. Setup does not install the bus itself.
+    pub bus_monitoring: BusMonitoring,
 }
 
 impl SetupObserved {
@@ -352,6 +356,7 @@ impl SetupObserved {
             detections,
             restart_required: Vec::new(),
             inventory_owned_paths: 0,
+            bus_monitoring: BusMonitoring::NotDeclared,
         }
     }
 
@@ -572,6 +577,12 @@ pub enum SetupOperation {
         component: Component,
     },
     RetainUserData,
+    /// Add the loopback monitoring listener to an existing nats-server's
+    /// `server.conf` (through ck-bus), then, only once that succeeded, the
+    /// nats-server health check to the daemon configuration.
+    MonitorNatsServer {
+        target: BusTarget,
+    },
 }
 
 impl SetupOperation {
@@ -589,6 +600,7 @@ impl SetupOperation {
                 | Self::StartRuntime
                 | Self::DeregisterRuntime
                 | Self::RemoveManagedComponent { .. }
+                | Self::MonitorNatsServer { .. }
         )
     }
 
@@ -612,7 +624,8 @@ impl SetupOperation {
             | Self::Validate { .. }
             | Self::DeregisterRuntime
             | Self::RemoveManagedComponent { .. }
-            | Self::RetainUserData => None,
+            | Self::RetainUserData
+            | Self::MonitorNatsServer { .. } => None,
         }
     }
 }
@@ -679,6 +692,11 @@ impl fmt::Display for SetupOperation {
             Self::RetainUserData => {
                 formatter.write_str("retain user configuration and component stores")
             }
+            Self::MonitorNatsServer { target } => write!(
+                formatter,
+                "add nats-server's monitoring listener to {}, then its health check",
+                target.nats_dir.join("server.conf").display()
+            ),
         }
     }
 }

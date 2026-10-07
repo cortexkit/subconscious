@@ -687,7 +687,41 @@ fn platform_binary(name: &str) -> String {
     }
 }
 
-fn existing_value<'a>(document: &'a Value, dotted_key: &str) -> Option<&'a Value> {
+/// Reads and parses an existing JSONC configuration. A missing file is an error
+/// here: callers that use this edit a configuration the operator already has.
+pub fn read_document(path: &Path) -> Result<(String, Value), String> {
+    let text = fs::read_to_string(path)
+        .map_err(|error| format!("could not read {}: {error}", path.display()))?;
+    let strict = jsonc_to_json(&text)
+        .map_err(|error| format!("could not parse {}: {error}", path.display()))?;
+    let document = serde_json::from_str::<Value>(&strict)
+        .map_err(|error| format!("could not parse {}: {error}", path.display()))?;
+    Ok((text, document))
+}
+
+/// Plans adding `value` at `dotted_key` in an existing configuration, keeping
+/// comments and layout. Returns `None` when the key already has any value: an
+/// existing entry belongs to the operator and is never replaced.
+pub fn plan_missing_value(
+    path: &Path,
+    dotted_key: &str,
+    value: Value,
+) -> Result<Option<ConfigChange>, String> {
+    let (before, document) = read_document(path)?;
+    if existing_value(&document, dotted_key).is_some() {
+        return Ok(None);
+    }
+    let mut after = before.clone();
+    insert_textual_value(&mut after, dotted_key, value, false)
+        .map_err(|key| format!("could not add {key} to {}", path.display()))?;
+    Ok(Some(ConfigChange {
+        path: path.to_path_buf(),
+        before,
+        after,
+    }))
+}
+
+pub fn existing_value<'a>(document: &'a Value, dotted_key: &str) -> Option<&'a Value> {
     dotted_key
         .split('.')
         .try_fold(document, |value, key| value.as_object()?.get(key))

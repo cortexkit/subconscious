@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.6
+
+- `install-apply --conf-only` takes two new flags, which `ck setup` uses to upgrade an existing install. `--keep-existing` keeps a monitoring listener that is already on another port: it reports `"status": "kept"` and a `health_url` for that port instead of refusing, and it cannot be combined with `--monitor-port`. `--dry-run` writes nothing and reports `"would apply"` where a write would happen. Without these flags, behaviour is unchanged. A non-loopback listener is still refused under every flag.
+
 ## 0.3.5
 
 - Update the test daemon dependency to subc-daemon 0.32 whose macOS launches give each supervised module its own privacy identity.

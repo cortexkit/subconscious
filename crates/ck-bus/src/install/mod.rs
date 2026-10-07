@@ -10,10 +10,13 @@
 //!   `server.conf` and an empty resolver directory, then prints ck-bus's three
 //!   environment values and the daemon health URL. Re-applying keeps stored JWT bytes
 //!   when no signatures are supplied, but still replaces both files. `--conf-only`
-//!   upgrades only the monitoring line in an existing rendered `server.conf`.
+//!   upgrades only the monitoring line in an existing rendered `server.conf`;
+//!   `--keep-existing` keeps a listener already on another port, and `--dry-run`
+//!   reports without writing.
 //!
 //! Both run without `SUBC_MODULE_ID` and never reach the daemon or the vault. `ck setup`
-//! drives them. Output is one JSON object on stdout; a refusal is one line on stderr and
+//! runs `install-apply --conf-only --keep-existing` on an install that already declares
+//! nats-server; it does not yet run install-plan or the full install-apply. Output is one JSON object on stdout; a refusal is one line on stderr and
 //! exit status 1.
 
 mod conf;
@@ -78,6 +81,9 @@ pub fn run(args: &[String]) -> Option<i32> {
     })
 }
 
+/// Flags that take no value. Only `--conf-only` accepts the last two.
+const VALUELESS_FLAGS: [&str; 3] = ["conf-only", "keep-existing", "dry-run"];
+
 struct Flags(Vec<(String, String)>);
 
 impl Flags {
@@ -91,7 +97,7 @@ impl Flags {
             if pairs.iter().any(|(seen, _)| seen == name) {
                 return Err(format!("--{name} given twice"));
             }
-            let value = if name == "conf-only" {
+            let value = if VALUELESS_FLAGS.contains(&name) {
                 ""
             } else {
                 iter.next()
@@ -524,28 +530,152 @@ fn apply(flags: &Flags) -> Result<Value, String> {
 /// The rendered server.conf is the recorded configuration: install-plan records only
 /// signing inputs, not listener ports. Preserve every byte outside the monitoring line
 /// and never load or replace operator.jwt, system_account, ceremony inputs or jwt/.
+///
+/// `--keep-existing` keeps a monitoring listener the file already has on another port
+/// and reports it (status `kept`, `health_url` on that port) instead of refusing; it
+/// cannot be combined with `--monitor-port`. `--dry-run` writes nothing and reports
+/// `would apply` where a write would happen. `ck setup` uses both to upgrade an
+/// existing install without overwriting a port the operator chose.
 fn apply_conf_only(flags: &Flags) -> Result<Value, String> {
-    flags.only(&["nats-dir", "conf-only", "monitor-port"])?;
+    flags.only(&[
+        "nats-dir",
+        "conf-only",
+        "monitor-port",
+        "keep-existing",
+        "dry-run",
+    ])?;
     let conf_path = flags.nats_dir()?.join(SERVER_CONF_FILE);
     let monitor_port = flags.port("monitor-port", DEFAULT_MONITOR_PORT)?;
+    let explicit_port = flags.optional("monitor-port").is_some();
+    let keep_existing = flags.optional("keep-existing").is_some();
+    let dry_run = flags.optional("dry-run").is_some();
+    let existing = match (keep_existing, explicit_port) {
+        (true, true) => {
+            return Err("--keep-existing and --monitor-port cannot be combined".to_string())
+        }
+        (true, false) => conf::ExistingListener::Keep,
+        (false, true) => conf::ExistingListener::Replace,
+        (false, false) => conf::ExistingListener::Refuse,
+    };
     let original = fs::read_to_string(&conf_path)
         .map_err(|error| format!("read {}: {error}", conf_path.display()))?;
-    let updated = conf::with_monitoring(
-        &original,
-        monitor_port,
-        flags.optional("monitor-port").is_some(),
-    )
-    .map_err(|error| format!("{}: {error}", conf_path.display()))?;
-    let changed = original != updated;
-    if changed {
+    let monitoring = conf::with_monitoring(&original, monitor_port, existing)
+        .map_err(|error| format!("{}: {error}", conf_path.display()))?;
+    let changed = original != monitoring.conf;
+    if changed && !dry_run {
         let mode = fs::metadata(&conf_path)
             .map_err(|error| format!("stat {}: {error}", conf_path.display()))?
             .permissions();
-        write_atomic_with_permissions(&conf_path, updated.as_bytes(), Some(mode))?;
+        write_atomic_with_permissions(&conf_path, monitoring.conf.as_bytes(), Some(mode))?;
     }
+    let status = if monitoring.port != monitor_port {
+        "kept"
+    } else if !changed {
+        "unchanged"
+    } else if dry_run {
+        "would apply"
+    } else {
+        "applied"
+    };
     Ok(json!({
-        "status": if changed { "applied" } else { "unchanged" },
+        "status": status,
         "server_conf": conf_path.display().to_string(),
-        "health_url": conf::health_url(monitor_port),
+        "health_url": conf::health_url(monitoring.port),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{apply, conf::ServerConf, Flags, SERVER_CONF_FILE};
+    use std::path::Path;
+
+    /// A rendered install configuration in a fresh directory, with the monitoring line
+    /// removed when `monitor_port` is `None` (an install made before monitoring existed).
+    fn installed(monitor_port: Option<u16>) -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let rendered = ServerConf {
+            port: 14222,
+            monitor_port: monitor_port.unwrap_or(18222),
+            js_dir: Path::new("/nats/js"),
+            operator_jwt: Path::new("/nats/operator.jwt"),
+            jwt_dir: Path::new("/nats/jwt"),
+            system_account: "ASYS",
+            system_account_jwt: "aaa.bbb.ccc",
+        }
+        .render()
+        .unwrap();
+        let conf = match monitor_port {
+            Some(_) => rendered,
+            None => rendered.replace("http: \"127.0.0.1:18222\"\n", ""),
+        };
+        std::fs::write(dir.path().join(SERVER_CONF_FILE), &conf).unwrap();
+        (dir, conf)
+    }
+
+    fn conf_only(dir: &Path, extra: &[&str]) -> Result<serde_json::Value, String> {
+        let mut args = vec![
+            "install-apply".to_string(),
+            "--conf-only".to_string(),
+            "--nats-dir".to_string(),
+            dir.display().to_string(),
+        ];
+        args.extend(extra.iter().map(ToString::to_string));
+        apply(&Flags::parse(&args[1..])?)
+    }
+
+    fn read_conf(dir: &Path) -> String {
+        std::fs::read_to_string(dir.join(SERVER_CONF_FILE)).unwrap()
+    }
+
+    #[test]
+    fn dry_run_reports_the_listener_it_would_add_and_writes_nothing() {
+        let (dir, legacy) = installed(None);
+        let output = conf_only(dir.path(), &["--keep-existing", "--dry-run"]).unwrap();
+        assert_eq!(output["status"], "would apply");
+        assert_eq!(output["health_url"], "http://127.0.0.1:18222/healthz");
+        assert_eq!(read_conf(dir.path()), legacy);
+
+        let output = conf_only(dir.path(), &["--keep-existing"]).unwrap();
+        assert_eq!(output["status"], "applied");
+        assert!(read_conf(dir.path()).contains("http: \"127.0.0.1:18222\"\n"));
+        let output = conf_only(dir.path(), &["--keep-existing", "--dry-run"]).unwrap();
+        assert_eq!(output["status"], "unchanged");
+    }
+
+    #[test]
+    fn keep_existing_reports_the_operator_s_port_and_never_rewrites_it() {
+        let (dir, chosen) = installed(Some(19222));
+        for extra in [&["--keep-existing"][..], &["--keep-existing", "--dry-run"]] {
+            let output = conf_only(dir.path(), extra).unwrap();
+            assert_eq!(output["status"], "kept");
+            assert_eq!(output["health_url"], "http://127.0.0.1:19222/healthz");
+            assert_eq!(read_conf(dir.path()), chosen);
+        }
+        // Without the flag the existing refusal stands, and the flag does not combine
+        // with an explicit port.
+        assert!(conf_only(dir.path(), &[]).is_err());
+        assert!(conf_only(dir.path(), &["--keep-existing", "--monitor-port", "18222"]).is_err());
+        assert_eq!(read_conf(dir.path()), chosen);
+    }
+
+    #[test]
+    fn keep_existing_still_refuses_a_non_loopback_listener() {
+        let (dir, conf) = installed(Some(18222));
+        let exposed = conf.replace("http: \"127.0.0.1:", "http: \"0.0.0.0:");
+        std::fs::write(dir.path().join(SERVER_CONF_FILE), &exposed).unwrap();
+        let error = conf_only(dir.path(), &["--keep-existing"]).unwrap_err();
+        assert!(error.contains("127.0.0.1:<port>"), "{error}");
+        assert_eq!(read_conf(dir.path()), exposed);
+    }
+
+    #[test]
+    fn the_new_flags_belong_to_conf_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let nats = dir.path().display().to_string();
+        for flag in ["--keep-existing", "--dry-run"] {
+            let args = ["--nats-dir".to_string(), nats.clone(), flag.to_string()];
+            let error = apply(&Flags::parse(&args).unwrap()).unwrap_err();
+            assert!(error.contains("unknown flag"), "{error}");
+        }
+    }
 }

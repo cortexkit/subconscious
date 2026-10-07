@@ -1,4 +1,5 @@
 use super::{
+    bus_monitoring::BusMonitoring,
     conversion::{explicit_conversion_requires_confirmation, selected_components},
     model::{
         Component, ComponentState, ConfigurationState, CoreVersion, DetectionOutcome, PlanOutcome,
@@ -210,6 +211,24 @@ pub fn plan_setup(observed: &SetupObserved, request: &SetupRequest) -> SetupPlan
             .push(SetupOperation::RescanComponent { component });
         plan.operations
             .push(SetupOperation::EnableComponent { component });
+    }
+
+    // After every rescan this run makes: a rescan applies a new health check
+    // live, and nats-server opens its new listener only when it restarts, so
+    // a rescan after this write would probe a listener that is not there yet.
+    match &observed.bus_monitoring {
+        BusMonitoring::Observed(bus) if bus.needs_change() => {
+            plan.operations.push(SetupOperation::MonitorNatsServer {
+                target: bus.target.clone(),
+            });
+        }
+        BusMonitoring::Observed(bus) => plan.outcomes.push(PlanOutcome::Noop {
+            scope: bus.noop_scope(),
+        }),
+        skipped @ BusMonitoring::Skipped { .. } => plan.outcomes.push(PlanOutcome::Noop {
+            scope: skipped.to_string(),
+        }),
+        BusMonitoring::NotDeclared => {}
     }
 
     plan.operations.extend([
@@ -675,6 +694,7 @@ mod tests {
             detections: BTreeMap::new(),
             restart_required: Vec::new(),
             inventory_owned_paths: 0,
+            bus_monitoring: BusMonitoring::NotDeclared,
         }
     }
 
@@ -1900,5 +1920,84 @@ mod tests {
         assert!(rendered.contains(
             "outcome: ck-subc-mcp: module is not supervised on this host; restart omitted, verified by binary version only"
         ));
+    }
+
+    fn nats_install(
+        listener: super::super::bus_monitoring::ListenerState,
+        health: super::super::bus_monitoring::HealthState,
+    ) -> BusMonitoring {
+        BusMonitoring::Observed(super::super::bus_monitoring::BusObserved {
+            target: super::super::bus_monitoring::BusTarget {
+                ckbus: std::path::PathBuf::from("/bin/ck-bus"),
+                nats_dir: std::path::PathBuf::from("/nats"),
+            },
+            listener,
+            health_url: "http://127.0.0.1:18222/healthz".to_string(),
+            health,
+        })
+    }
+
+    /// On an otherwise complete install, a nats-server without monitoring is the
+    /// only change, it comes after every rescan this run makes, and a run that
+    /// finds both pieces present plans no mutation at all.
+    #[test]
+    fn nats_server_monitoring_is_planned_after_rescans_and_only_when_missing() {
+        use super::super::bus_monitoring::{HealthState, ListenerState};
+        let mut observed = live_runtime_adding_claustrum();
+        observed.bus_monitoring = nats_install(ListenerState::WouldAdd, HealthState::Missing);
+        let plan = plan_setup(
+            &observed,
+            &SetupRequest::install(vec![Component::Claustrum]),
+        );
+        let position = |wanted: fn(&SetupOperation) -> bool| {
+            plan.operations
+                .iter()
+                .position(wanted)
+                .unwrap_or_else(|| panic!("{}", plan.render()))
+        };
+        let monitor = position(|op| matches!(op, SetupOperation::MonitorNatsServer { .. }));
+        let last_rescan = plan
+            .operations
+            .iter()
+            .rposition(|op| {
+                matches!(
+                    op,
+                    SetupOperation::RescanComponent { .. } | SetupOperation::EnableComponent { .. }
+                )
+            })
+            .expect("claustrum is rescanned");
+        assert!(monitor > last_rescan, "{}", plan.render());
+        assert!(
+            monitor < position(|op| matches!(op, SetupOperation::Validate { .. })),
+            "{}",
+            plan.render()
+        );
+
+        let mut settled = observed_setup();
+        settled
+            .components
+            .insert(Component::Core, ComponentState::Correct);
+        settled.runtime = RuntimeState::Correct;
+        settled.bus_monitoring = nats_install(ListenerState::WouldAdd, HealthState::Kept);
+        let request = SetupRequest::install(Vec::new());
+        assert_eq!(plan_setup(&settled, &request).mutation_count(), 1);
+        for (listener, health) in [
+            (ListenerState::Present, HealthState::Matching),
+            (ListenerState::Kept, HealthState::Kept),
+        ] {
+            settled.bus_monitoring = nats_install(listener, health);
+            let plan = plan_setup(&settled, &request);
+            assert_eq!(plan.mutation_count(), 0, "{}", plan.render());
+        }
+        settled.bus_monitoring = BusMonitoring::Skipped {
+            reason: "no -c".to_string(),
+        };
+        let plan = plan_setup(&settled, &request);
+        assert_eq!(plan.mutation_count(), 0);
+        assert!(
+            plan.render().contains("skipped: no -c"),
+            "{}",
+            plan.render()
+        );
     }
 }

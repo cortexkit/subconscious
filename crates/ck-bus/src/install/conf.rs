@@ -83,14 +83,37 @@ fn loopback_port(line: &str, name: &str) -> Result<u16, String> {
         .ok_or_else(|| format!("{name} must be a quoted {LISTEN_HOST}:<port> listener"))
 }
 
+/// What [`with_monitoring`] does when the file already has a monitoring listener on a
+/// different port than the one asked for.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExistingListener {
+    /// Refuse: the caller asked for the default port and did not name one, so it
+    /// cannot be sure it wants to move the operator's listener.
+    Refuse,
+    /// Replace it: the caller named the port explicitly.
+    Replace,
+    /// Keep the operator's port and report it. `ck setup` upgrades an existing install
+    /// this way, so a port someone chose is never overwritten.
+    Keep,
+}
+
+/// A configuration with monitoring, and the port its listener ends up on (the
+/// requested one, or the existing one when [`ExistingListener::Keep`] kept it).
+pub struct Monitoring {
+    pub conf: String,
+    pub port: u16,
+}
+
 /// Adds monitoring to a recorded install configuration without re-rendering any JWT,
-/// path or other directive. An existing listener is replaced only by explicit request;
-/// an identical listener is a no-op so a live server's config mtime stays unchanged.
+/// path or other directive. An existing listener on another port is handled as
+/// `existing` says; an identical listener is a no-op so a live server's config mtime
+/// stays unchanged. A listener on any host other than IPv4 loopback is refused under
+/// every policy.
 pub fn with_monitoring(
     conf: &str,
     monitor_port: u16,
-    explicit_port: bool,
-) -> Result<String, String> {
+    existing: ExistingListener,
+) -> Result<Monitoring, String> {
     if !conf.starts_with(HEADER) {
         return Err("not an install-apply rendered file: the header is absent".to_string());
     }
@@ -110,20 +133,33 @@ pub fn with_monitoring(
         }
         offset += line.len();
     }
-    let (_, insert_at, port) = listen.ok_or("the install-apply listen line is absent")?;
-    let monitoring = monitoring_line(port, monitor_port)?;
+    let (_, insert_at, listen_port) = listen.ok_or("the install-apply listen line is absent")?;
+    if let (ExistingListener::Keep, Some((_, _, current))) = (existing, http) {
+        if current != monitor_port {
+            // The kept port must still not collide with the client listener.
+            check_ports(listen_port, current)?;
+            return Ok(Monitoring {
+                conf: conf.to_string(),
+                port: current,
+            });
+        }
+    }
+    let monitoring = monitoring_line(listen_port, monitor_port)?;
     let mut updated = conf.to_string();
     match http {
-        Some((_, _, existing)) if existing == monitor_port => {}
+        Some((_, _, current)) if current == monitor_port => {}
         Some((start, end, _)) => {
-            if !explicit_port {
+            if existing == ExistingListener::Refuse {
                 return Err("http already uses a different port; pass --monitor-port explicitly to replace it".to_string());
             }
             updated.replace_range(start..end, &monitoring);
         }
         None => updated.insert_str(insert_at, &monitoring),
     }
-    Ok(updated)
+    Ok(Monitoring {
+        conf: updated,
+        port: monitor_port,
+    })
 }
 
 impl ServerConf<'_> {

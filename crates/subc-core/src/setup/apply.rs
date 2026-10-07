@@ -9,6 +9,7 @@ use serde_json::{Map, Value};
 use subc_transport::connection_file;
 
 use super::{
+    bus_monitoring::{self, BusMonitoring},
     components::{self, ReleaseArtifactSource},
     config,
     conversion::selected_components,
@@ -233,6 +234,13 @@ impl SetupBackend {
         };
         observed.configuration = configuration;
         observed.running_ck_adoption = self.running_ck_adoption();
+        if !request.uninstall {
+            observed.bus_monitoring =
+                bus_monitoring::observe(&self.paths.config_path, &mut bus_monitoring::CkBusCommand);
+            if let BusMonitoring::Skipped { .. } = &observed.bus_monitoring {
+                println!("{}", observed.bus_monitoring);
+            }
+        }
         // AFT automatic detection is disabled for alpha until its owner supplies
         // a marker contract with false-positive classification rules.
         observed.detections.remove(&Component::Aft);
@@ -334,6 +342,16 @@ impl SetupBackend {
                 )),
                 SetupOperation::RetainUserData => {
                     steps.push("would retain configuration and component stores".to_string())
+                }
+                SetupOperation::MonitorNatsServer { target } => {
+                    steps.push(format!(
+                        "would add nats-server's loopback monitoring listener to {} (ck-bus install-apply --conf-only)",
+                        components::display_home_path(&target.nats_dir.join("server.conf"))
+                    ));
+                    steps.push(format!(
+                        "would then add the nats-server health check to {}, unless one is already set",
+                        components::display_home_path(&self.paths.config_path)
+                    ));
                 }
                 SetupOperation::ObservePlatform
                 | SetupOperation::OfferOptionalComponents
@@ -733,6 +751,16 @@ impl SetupExecutor for SetupBackend {
             // separate operation remains in the plan so its current-liveness
             // requirement is visible before execution.
             SetupOperation::StartRuntime => Ok(()),
+            SetupOperation::MonitorNatsServer { target } => {
+                for line in bus_monitoring::apply(
+                    &self.paths.config_path,
+                    target,
+                    &mut bus_monitoring::CkBusCommand,
+                )? {
+                    println!("  {line}");
+                }
+                Ok(())
+            }
             SetupOperation::DeregisterRuntime => Ok(()),
             SetupOperation::RemoveManagedComponent { .. } if self.uninstall_report.is_none() => {
                 // The daemon's own connection file names the pid to stop on a

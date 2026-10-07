@@ -255,7 +255,7 @@ dependencies = [
 
 [[package]]
 name = "ck-bus"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "async-nats",
  "async-trait",
@@ -1844,7 +1844,7 @@ dependencies = [
 
 [[package]]
 name = "subc-core"
-version = "0.20.61"
+version = "0.20.62"
 dependencies = [
  "base64",
  "cortexkit-log",

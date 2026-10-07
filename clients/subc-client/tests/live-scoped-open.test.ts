@@ -18,8 +18,8 @@ test.skipIf(process.env.RUN_SUBC_LIVE !== "1")("a real daemon admits a scoped ow
   let live: LiveDaemon | undefined;
   let client: SubcClient | undefined;
   try {
-    // The same supervised raw-protocol fixture used by the Rust SDK's live scope
-    // tests supplies the owner's sync authority and records the provider's bind.
+    // fake-aft-stub is a supervised module that registers the scope (so it is the
+    // owner) and records the route.bind it receives, so the test can check the stamp.
     expect(existsSync(stub)).toBe(true);
     writeFileSync(syncPath, JSON.stringify([{ ref: "session-a", scope_epoch: 3, kind: "head" }]));
     live = await startLiveDaemon("subc-scoped-open", {

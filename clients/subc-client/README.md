@@ -95,7 +95,7 @@ await client.call("provider", "echo", {}, { scope });
 await client.closeManagedRoute(target, identity, { scope });
 ```
 
-The caller's attested principal must be the scope's owner or a listed carrier.
+The daemon checks who the caller is from its own connection record, not from the request: the caller must be the module that registered the scope (its owner), or a module the owner listed as a carrier on that scope record.
 Passing `scope` does not grant that authority: use the supervised caller's
 `consumerIdentity` (or its default environment identity) as usual. `owner` uses
 the existing `Principal` type; the reserved form above is the normal case, and

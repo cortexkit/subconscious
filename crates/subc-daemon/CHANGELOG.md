@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.32.4
+
+- On macOS, a `#!/bin/sh` module is recognised as its own orphan after a daemon crash even when the system shell launcher has re-executed the selected bash, dash or zsh interpreter. The selected interpreter's file identity is saved at launch, not resolved again after a crash or upgrade. Other image differences, reused pids and changed start times still refuse cleanup. Previous daemon versions can read the extended roster but retain their stricter single-image matching.
+
 ## 0.32.3
 
 - Add deterministic macOS privacy boundary tests: one holds a module launch while the privacy trampoline (the daemon's own binary, before it execs the module) is still running, and checks that the live-children roster doesn't record the trampoline as the module; the other makes a module exit 121 on its own right after a successful exec and checks it's recorded as the module's exit, not a trampoline refusal. The sampling seam exists only in unit-test builds and the exec barrier only in the fixture binary; production behaviour is unchanged.

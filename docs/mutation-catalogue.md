@@ -181,6 +181,55 @@ The command row's broad replay does not observe package breadth. No GitHub
 timing is recorded here; use a completed workflow's artifacts before setting
 an expected CI duration.
 
+## macOS replay environment failures
+
+Run 37545508290 at `06dac647` exposed two unrelated baseline failures plus a
+command-suite prerequisite missing from the fresh GitHub cache:
+
+* `tests::own_resource_usage_is_present_and_plausible` reported
+  `memory 1033024 bytes is implausibly small` (another shard: 1016576 bytes).
+  A fresh nextest process's Darwin physical footprint need not include its clean
+  executable mappings. The test now touches and retains 8 MiB of private pages
+  and checks that the resource reading accounts for them, preserving its byte-unit,
+  upper-bound and memory-kind assertions. Reporting KiB as bytes deliberately
+  fails this test; production readings are unchanged.
+* `supervise::tests::orphan_identity_matches_path_names_and_shebang_interpreters`
+  was initially missing assertion output from the report's truncated tail.
+  A diagnostic CI run (37547953740) on macOS 26.6.2 showed the sandboxed
+  `#!/bin/sh` module's recorded and observed start time agreeing but its image
+  changing from inode 1152921500312571409 to 1152921500312571355 on the same
+  system device, producing `ExecutableDiffers` instead of `Matches`.
+  The ambient-environment run passed seconds later. `sh(1)` documents its
+  re-exec into bash, dash or zsh selected by `/private/var/select/sh`; there is
+  no documented TMPDIR/XDG shell-selection variable. The sandbox changed the
+  fixture location and exposed a launch-image race, not a permission to ignore
+  image identity. The original `#!/bin/sh` fixture remains. The roster now saves
+  the supported selected shell's device/inode alongside the `/bin/sh` image;
+  a post-re-exec orphan can match those recorded facts without a new lookup at
+  sweep time. Pid, start-time, unreadable-image and unrelated-image refusals stay
+  strict. A deterministic record round-trip models the two images independently
+  of OS scheduling, and an unrelated system binary is explicitly refused.
+* The command row's `exit 127: program not found` was the adapter's generic
+  infrastructure status, not a missing executable. Its actual output was
+  `failed to download android_system_properties v0.1.5` and
+  `attempting to make an HTTP request, but --offline was specified`.
+  A fresh local `CARGO_HOME` populated with only
+  `cargo fetch --locked --target aarch64-apple-darwin` reproduces that exact
+  error through the command adapter. `cargo fetch --locked` populates the full
+  platform graph and restores all five shell checks; CI now does this before
+  replay. No check is excluded or made online to disguise a cache miss.
+
+The roster keeps record version 1: the previous `RecordFile`, `LiveChild` and
+`ExecutableIdentity` serde shapes ignored unknown fields. A test writes the new
+optional interpreter field through the production writer and reads the full
+record with those previous shapes. Rollback can still read every entry, although
+an older daemon retains strict single-image matching and may decline to clean up
+a shell that has re-executed. Older records lacking the field also remain strict;
+the new matcher never infers an unrecorded interpreter from the host's current
+selection. The exception does not cover other launchers (for example,
+`/usr/bin/env`) or arbitrary interpreter changes; those require separate evidence
+and safety review rather than widening this rule.
+
 ## Known gaps
 
 No currently recorded gaps. The two former macOS privacy gaps now have catalogue

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.20.60
+
+- Require subc-daemon 0.32.4 so a macOS `#!/bin/sh` module is recognised as its own orphan after a daemon crash, including the system shell launcher's transition to its selected interpreter. Other process-identity checks remain strict.
+
 ## 0.20.59
 
 - Require subc-daemon 0.32.3, which adds test-only seams for the macOS launch boundary. Shipped behaviour is unchanged.

@@ -19,7 +19,9 @@
 //! later start time), and the device and inode of the image it is executing
 //! (which catches a reuse inside one start-time tick). The start time and
 //! image come from the `subc-os` crate, the only place those reads need unsafe
-//! code.
+//! code. On macOS, `/bin/sh` is a launcher that re-execs its selected shell;
+//! when recording that image, also retain the selected interpreter's identity.
+//! Matching never resolves the shell selection again after a crash or upgrade.
 //!
 //! On Windows the sweep signals nothing: the daemon's job object already ends
 //! a crashed daemon's children, and the record is read only to log it.
@@ -46,19 +48,73 @@ pub(crate) const LIVE_CHILDREN_FILE_NAME: &str = "live-children.json";
 /// signal on.
 const RECORD_VERSION: u32 = 1;
 
-/// Device and inode of the executable a child was spawned from.
+/// Recorded executable and, for macOS `/bin/sh`, its selected interpreter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ExecutableIdentity {
     pub(crate) device: u64,
     pub(crate) inode: u64,
+    /// An optional recorded fact, not a sweep-time lookup. Older readers ignore
+    /// this field; older records omit it and retain strict single-image matching.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    macos_sh_interpreter: Option<InterpreterIdentity>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+struct InterpreterIdentity {
+    device: u64,
+    inode: u64,
 }
 
 impl From<subc_os::FileIdentity> for ExecutableIdentity {
     fn from(identity: subc_os::FileIdentity) -> Self {
+        // This conversion is used when publishing an observed image to the
+        // roster. Capture the documented launcher's destination at that point,
+        // so a changed shell selection cannot widen a later orphan sweep.
+        #[cfg(target_os = "macos")]
+        let macos_sh_interpreter = recorded_sh_interpreter(identity);
+        #[cfg(not(target_os = "macos"))]
+        let macos_sh_interpreter = None;
         Self {
             device: identity.device,
             inode: identity.inode,
+            macos_sh_interpreter,
         }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn recorded_sh_interpreter(image: subc_os::FileIdentity) -> Option<InterpreterIdentity> {
+    if subc_os::file_identity(Path::new("/bin/sh")) != Some(image) {
+        return None;
+    }
+    // sh(1) documents these three possible interpreters. An absent selection
+    // or any unsupported target leaves the record single-image and fail-closed.
+    let selected = fs::canonicalize("/private/var/select/sh").ok()?;
+    if !["/bin/bash", "/bin/dash", "/bin/zsh"]
+        .iter()
+        .any(|shell| selected == Path::new(shell))
+    {
+        return None;
+    }
+    let interpreter = subc_os::file_identity(&selected)?;
+    Some(InterpreterIdentity {
+        device: interpreter.device,
+        inode: interpreter.inode,
+    })
+}
+
+impl ExecutableIdentity {
+    fn matches(self, running: subc_os::FileIdentity) -> bool {
+        if self.device == running.device && self.inode == running.inode {
+            return true;
+        }
+        #[cfg(target_os = "macos")]
+        if self.macos_sh_interpreter.is_some_and(|interpreter| {
+            interpreter.device == running.device && interpreter.inode == running.inode
+        }) {
+            return true;
+        }
+        false
     }
 }
 
@@ -263,7 +319,7 @@ pub(crate) fn identity_verdict(
     let Some(running) = observed.executable else {
         return IdentityVerdict::ExecutableUnreadable;
     };
-    if ExecutableIdentity::from(running) != executable {
+    if !executable.matches(running) {
         return IdentityVerdict::ExecutableDiffers;
     }
     IdentityVerdict::Matches
@@ -552,6 +608,7 @@ mod tests {
             executable: Some(ExecutableIdentity {
                 device: 7,
                 inode: 11,
+                macos_sh_interpreter: None,
             }),
             cgroup_name: Some(format!("{module_id}-a")),
         }
@@ -562,6 +619,162 @@ mod tests {
             start_time,
             executable: Some(subc_os::FileIdentity { device, inode }),
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_sh_reexec_matches_the_interpreter_recorded_at_launch() {
+        // sh(1) documents that /bin/sh re-execs the shell selected by this
+        // symlink. Model both kernel observations directly rather than race
+        // the short-lived launcher on a particular macOS version.
+        let launcher = subc_os::file_identity(Path::new("/bin/sh")).unwrap();
+        let interpreter = subc_os::file_identity(Path::new("/private/var/select/sh")).unwrap();
+        assert_ne!(
+            launcher, interpreter,
+            "the fixture must model a real image change"
+        );
+        let mut entry = child("sh-script", 40);
+        entry.executable = Some(ExecutableIdentity::from(launcher));
+        let dir = TestTempDir::new("sh-interpreter-record");
+        let path = record_path(&dir);
+        write_record(&path, &[entry]).unwrap();
+        let recorded = read_record(&path).unwrap().pop().unwrap();
+        let after_reexec = observed(1_000, interpreter.device, interpreter.inode);
+        assert_eq!(
+            identity_verdict(&recorded, 40, &after_reexec),
+            IdentityVerdict::Matches
+        );
+        assert_eq!(
+            identity_verdict(&recorded, 41, &after_reexec),
+            IdentityVerdict::PidDiffers
+        );
+        assert_eq!(
+            identity_verdict(
+                &recorded,
+                40,
+                &observed(1_001, interpreter.device, interpreter.inode)
+            ),
+            IdentityVerdict::StartTimeDiffers
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_sh_reexec_refuses_an_unrelated_system_binary() {
+        let launcher = subc_os::file_identity(Path::new("/bin/sh")).unwrap();
+        let unrelated = subc_os::file_identity(Path::new("/usr/bin/true")).unwrap();
+        let interpreter = subc_os::file_identity(Path::new("/private/var/select/sh")).unwrap();
+        let mut entry = child("sh-script", 40);
+        entry.executable = Some(ExecutableIdentity::from(launcher));
+        assert_eq!(
+            identity_verdict(
+                &entry,
+                40,
+                &observed(1_000, unrelated.device, unrelated.inode)
+            ),
+            IdentityVerdict::ExecutableDiffers
+        );
+        let ordinary = ExecutableIdentity::from(unrelated);
+        assert!(ordinary.macos_sh_interpreter.is_none());
+        entry.executable = Some(ordinary);
+        assert_eq!(
+            identity_verdict(
+                &entry,
+                40,
+                &observed(1_000, interpreter.device, interpreter.inode)
+            ),
+            IdentityVerdict::ExecutableDiffers
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_sh_legacy_record_does_not_infer_an_unrecorded_interpreter() {
+        let launcher = subc_os::file_identity(Path::new("/bin/sh")).unwrap();
+        let interpreter = subc_os::file_identity(Path::new("/private/var/select/sh")).unwrap();
+        let mut entry = child("legacy-sh-script", 40);
+        // The old shape lacks the interpreter field, even on a host where the
+        // current shell selection would match. Matching must use recorded facts.
+        entry.executable = Some(
+            serde_json::from_value(serde_json::json!({
+                "device": launcher.device, "inode": launcher.inode,
+            }))
+            .unwrap(),
+        );
+        assert_eq!(
+            identity_verdict(
+                &entry,
+                40,
+                &observed(1_000, interpreter.device, interpreter.inode)
+            ),
+            IdentityVerdict::ExecutableDiffers
+        );
+        assert_eq!(
+            identity_verdict(
+                &entry,
+                40,
+                &observed(1_000, launcher.device, launcher.inode)
+            ),
+            IdentityVerdict::Matches
+        );
+    }
+
+    #[test]
+    fn a_roster_with_a_recorded_sh_interpreter_is_readable_by_the_previous_shape() {
+        // These are the complete version-1 shapes used by the previous daemon.
+        // Its serde deserializer did not deny unknown fields at either level.
+        #[derive(Debug, Deserialize, PartialEq, Eq)]
+        struct PreviousExecutableIdentity {
+            device: u64,
+            inode: u64,
+        }
+        #[derive(Debug, Deserialize, PartialEq, Eq)]
+        struct PreviousLiveChild {
+            module_id: String,
+            pid: u32,
+            protocol: ModuleProtocol,
+            start_time: Option<u64>,
+            executable: Option<PreviousExecutableIdentity>,
+            cgroup_name: Option<String>,
+        }
+        #[derive(Debug, Deserialize, PartialEq, Eq)]
+        struct PreviousRecordFile {
+            version: u32,
+            children: Vec<PreviousLiveChild>,
+        }
+
+        let mut entry = child("sh-script", 40);
+        entry.executable.as_mut().unwrap().macos_sh_interpreter = Some(InterpreterIdentity {
+            device: 7,
+            inode: 12,
+        });
+        let dir = TestTempDir::new("previous-roster-reader");
+        let path = record_path(&dir);
+        write_record(&path, &[entry]).unwrap();
+        let bytes = fs::read(&path).unwrap();
+        let new: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            new["children"][0]["executable"]["macos_sh_interpreter"]["inode"],
+            12
+        );
+        let previous: PreviousRecordFile = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            previous,
+            PreviousRecordFile {
+                version: 1,
+                children: vec![PreviousLiveChild {
+                    module_id: "sh-script".to_owned(),
+                    pid: 40,
+                    protocol: ModuleProtocol::None,
+                    start_time: Some(1_000),
+                    executable: Some(PreviousExecutableIdentity {
+                        device: 7,
+                        inode: 11
+                    }),
+                    cgroup_name: Some("sh-script-a".to_owned()),
+                }],
+            }
+        );
     }
 
     #[test]
@@ -757,6 +970,7 @@ mod tests {
             executable: Some(ExecutableIdentity {
                 device: 1,
                 inode: 2,
+                macos_sh_interpreter: None,
             }),
             cgroup_name: Some("nats-a".to_owned()),
             #[cfg(target_os = "linux")]

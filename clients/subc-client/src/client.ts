@@ -460,6 +460,13 @@ export type KnownRouteCloseReason =
 /** A route-close reason decoded from a daemon control push. */
 export type RouteCloseReason = KnownRouteCloseReason | "unknown";
 
+const SCOPE_ROUTE_CLOSE_REASONS = new Set<RouteCloseReason>([
+  "scope_ended",
+  "scope_carrier_removed",
+  "scope_delegation_changed",
+  "scope_parent_ended",
+]);
+
 /** Why a route ended. Even a planned closure can leave a call's outcome unknown. */
 export type RouteEndReason = RouteCloseReason | "closed_by_caller" | "connection_lost";
 
@@ -615,7 +622,7 @@ interface CachedRoute {
   target: Extract<RouteTarget, { kind: ManagedRouteKind }>;
   identity: BindIdentity;
   scope?: RouteScope;
-  /** A terminal daemon close must survive connection replacement, not become a reopen. */
+  /** Scope-ending closes remain terminal across reconnects because the served session is over. */
   endReason?: RouteCloseReason;
   consumerIdentity?: ConsumerIdentity;
   reverseRequests: ReverseRequestRegistry;
@@ -815,9 +822,10 @@ export class SubcClient {
 
   /**
    * Managed route + request convenience. Opens and caches a route for the module,
-   * reconnecting and re-opening cached routes after connection drops.
+   * reconnecting after transport drops with fresh route.open requests.
    * Scoped routes are isolated by owner/ref/epoch and require owner or carrier authority.
-   * Terminal scope close reasons prevent automatic reopens under the same selector.
+   * A scope-ending close permanently ends that scoped cache entry; other route
+   * closes are evicted so a later call asks the daemon to open a fresh route.
    */
   async call<Response = unknown>(
     moduleId: string,
@@ -1746,6 +1754,8 @@ export class SubcClient {
   }
 
   private endedCachedRoute(reason: RouteCloseReason): SubcCallError {
+    // This is only retained for scope-ending closes: the session is over, so a
+    // later call under the same selector must not reopen it.
     const cause = new SubcError(`cached route closed by subc (${reason}); must not reopen`, "route_closed", undefined, reason);
     return this.terminalCallError(cause.message, cause);
   }
@@ -1889,7 +1899,7 @@ export class SubcClient {
       // drop, and never the not_sent/unknown_channel class that call() retries.
       // The code says WHICH route ended, not that it is safe to send again.
       this.failHandle(handle, new SubcError("route closed by subc (GOODBYE)", "route_closed", undefined, this.routeEndReason(handle.channel)));
-      this.preventRouteReopen(handle.channel, this.routeEndReason(handle.channel));
+      this.handleCachedRouteClose(handle.channel, this.routeEndReason(handle.channel));
       if (this.liveRoutes.get(handle.channel) === handle) this.liveRoutes.delete(handle.channel);
       this.evictRouteHandle(handle);
       return;
@@ -2066,7 +2076,7 @@ export class SubcClient {
           const final = push.op === "route.closed";
           if (final || !this.routeEndReasons.get(channel)?.final) {
             this.routeEndReasons.set(channel, { reason, final });
-            if (final) this.preventRouteReopen(channel, reason);
+            if (final) this.handleCachedRouteClose(channel, reason);
           }
         }
       }
@@ -2074,16 +2084,24 @@ export class SubcClient {
       for (const [channel, module] of this.routeModules) {
         if (module === push.body.module_id) {
           this.legacyChannelReasons.set(channel, reason);
-          if (push.op === "route.closed") this.preventRouteReopen(channel, reason);
+          if (push.op === "route.closed") this.handleCachedRouteClose(channel, reason);
         }
       }
     }
   }
 
-  private preventRouteReopen(channel: number, reason: RouteCloseReason): void {
-    if (classifyRouteCloseReason(reason) !== "must_not_reopen") return;
-    for (const cached of this.routes.values()) {
-      if (cached.handle?.channel === channel) cached.endReason = reason;
+  private handleCachedRouteClose(channel: number, reason: RouteCloseReason): void {
+    for (const [key, cached] of this.routes) {
+      if (cached.handle?.channel !== channel) continue;
+      if (SCOPE_ROUTE_CLOSE_REASONS.has(reason)) {
+        // The session authority represented by this selector has ended. Keeping
+        // this tombstone prevents a later call from reviving that same scope.
+        cached.endReason = reason;
+      } else {
+        // A later call is new work: let route.open, not the close disposition,
+        // decide whether this target may serve it.
+        this.routes.delete(key);
+      }
     }
   }
 
@@ -2107,6 +2125,11 @@ export class SubcClient {
     this.routeEndReasons.clear();
     this.legacyChannelReasons.clear();
     this.routeModules.clear();
+    // Connection loss invalidates active routes. Keep only scope tombstones,
+    // whose session-ending decision must survive transport replacement.
+    for (const [key, cached] of this.routes) {
+      if (cached.endReason === undefined) this.routes.delete(key);
+    }
     for (const [key, pending] of this.pending) {
       this.rejectPending(key, pending, pending.handle ? routeError : err);
     }

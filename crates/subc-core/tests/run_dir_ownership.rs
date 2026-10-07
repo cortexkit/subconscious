@@ -21,9 +21,7 @@ use std::{
 };
 
 use serde_json::{json, Value};
-use subc_test_support::{
-    ckdev_binary_in, dev_command, process_alive, wait_until_gone, TestTempDir,
-};
+use subc_test_support::{ckdev_binary, dev_command, process_alive, wait_until_gone, TestTempDir};
 
 // Real daemons compete with other integration binaries for spawn and
 // registration resources; serializing this file keeps the deadlines honest.
@@ -96,7 +94,7 @@ impl Tree {
         let runtime_dir = self.runtime_dir(runtime);
         fs::create_dir_all(&runtime_dir).unwrap();
         // The daemon runs as `ckdev-subc`, never under the production name.
-        let daemon = ckdev_binary_in(env!("CARGO_BIN_EXE_ck-subc"), self.root.join("ckdev-bin"));
+        let daemon = ckdev_binary(env!("CARGO_BIN_EXE_ck-subc"));
         let child = dev_command(daemon)
             .process_group(0)
             .env("XDG_DATA_HOME", self.root.join("data"))

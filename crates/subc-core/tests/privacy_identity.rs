@@ -12,7 +12,7 @@ mod macos {
         thread,
         time::{Duration, Instant},
     };
-    use subc_test_support::{ckdev_binary_in, dev_command, TestTempDir};
+    use subc_test_support::{ckdev_binary, dev_command, TestTempDir};
 
     pub struct Fixture {
         pub root: TestTempDir,
@@ -57,7 +57,7 @@ mod macos {
             } else {
                 env!("CARGO_BIN_EXE_ck-subc")
             };
-            let daemon_program = ckdev_binary_in(built, root.join("ckdev-bin"));
+            let daemon_program = ckdev_binary(built);
             let mut command = dev_command(&daemon_program);
             for (key, value) in daemon_env.as_object().unwrap() {
                 command.env(key, value.as_str().unwrap());
@@ -117,22 +117,19 @@ mod macos {
         }
 
         pub fn ck(&self, args: &[&str]) -> std::process::Output {
-            dev_command(ckdev_binary_in(
-                env!("CARGO_BIN_EXE_ck"),
-                self.root.join("ckdev-bin"),
-            ))
-            .arg("--subc")
-            .arg(
-                self.root
-                    .join("runtime")
-                    .join(subc_transport::CONNECTION_FILE_NAME),
-            )
-            .args(args)
-            .env("XDG_CONFIG_HOME", self.root.join("config"))
-            .env("XDG_RUNTIME_DIR", self.root.join("runtime"))
-            .env("XDG_DATA_HOME", self.root.join("data"))
-            .output()
-            .unwrap()
+            dev_command(ckdev_binary(env!("CARGO_BIN_EXE_ck")))
+                .arg("--subc")
+                .arg(
+                    self.root
+                        .join("runtime")
+                        .join(subc_transport::CONNECTION_FILE_NAME),
+                )
+                .args(args)
+                .env("XDG_CONFIG_HOME", self.root.join("config"))
+                .env("XDG_RUNTIME_DIR", self.root.join("runtime"))
+                .env("XDG_DATA_HOME", self.root.join("data"))
+                .output()
+                .unwrap()
         }
 
         pub fn status(&self) -> Value {

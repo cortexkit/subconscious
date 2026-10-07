@@ -1971,6 +1971,7 @@ version = "0.1.2"
 dependencies = [
  "rustix",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]

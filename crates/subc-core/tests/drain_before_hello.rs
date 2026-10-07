@@ -68,7 +68,7 @@ impl Harness {
             Arc::clone(&daemon.registry),
             RestartPolicy::new(1, Duration::from_millis(100)),
         )
-        .with_privacy_trampoline(common::ckdev_subc(&daemon.temp_dir))
+        .with_privacy_trampoline(common::ckdev_subc())
         .with_process_liveness(process_liveness)
         .with_forwarding(Arc::clone(&daemon.forwarding))
         .with_handle(handle)

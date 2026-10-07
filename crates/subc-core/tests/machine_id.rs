@@ -78,7 +78,7 @@ impl Home {
     }
 
     fn spawn_daemon(&self) -> Child {
-        let mut command = subc_test_support::dev_command(common::ckdev_subc(&self.root));
+        let mut command = subc_test_support::dev_command(common::ckdev_subc());
         command.env("SUBC_CGROUP_PLACEMENT", "disabled");
         self.isolate(&mut command)
             .stdin(Stdio::null())
@@ -118,7 +118,7 @@ impl Home {
     }
 
     fn ck(&self, args: &[&str]) -> Output {
-        let mut command = common::ck_under_test_command(&self.root);
+        let mut command = common::ck_under_test_command();
         self.isolate(&mut command)
             .arg("--subc")
             .arg(self.connection_file())

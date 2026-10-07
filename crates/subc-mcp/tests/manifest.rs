@@ -4,10 +4,9 @@ use subc_test_support::TestTempDir;
 #[test]
 fn manifest_is_emitted_offline_without_module_setup() {
     let home = TestTempDir::new("subc-mcp-manifest");
-    let output = subc_test_support::dev_command(subc_test_support::ckdev_binary_in(
-        env!("CARGO_BIN_EXE_ck-subc-mcp"),
-        home.join("ckdev-bin"),
-    ))
+    let output = subc_test_support::dev_command(subc_test_support::ckdev_binary(env!(
+        "CARGO_BIN_EXE_ck-subc-mcp"
+    )))
     .env_clear()
     .env("XDG_DATA_HOME", home.path())
     .env("XDG_RUNTIME_DIR", home.path())
@@ -50,10 +49,9 @@ fn manifest_is_emitted_offline_without_module_setup() {
 #[test]
 fn module_startup_writes_dated_r2_segment() {
     let home = TestTempDir::new("subc-mcp-log");
-    let output = subc_test_support::dev_command(subc_test_support::ckdev_binary_in(
-        env!("CARGO_BIN_EXE_ck-subc-mcp"),
-        home.join("ckdev-bin"),
-    ))
+    let output = subc_test_support::dev_command(subc_test_support::ckdev_binary(env!(
+        "CARGO_BIN_EXE_ck-subc-mcp"
+    )))
     .env("XDG_DATA_HOME", home.path())
     .env("XDG_RUNTIME_DIR", home.path())
     .env("XDG_CONFIG_HOME", home.path())
@@ -105,10 +103,9 @@ fn module_startup_writes_dated_r2_segment() {
 #[test]
 fn shim_logs_without_daemon_environment_or_protocol_stdout() {
     let home = TestTempDir::new("subc-mcp-shim-log");
-    let output = subc_test_support::dev_command(subc_test_support::ckdev_binary_in(
-        env!("CARGO_BIN_EXE_ck-subc-mcp"),
-        home.join("ckdev-bin"),
-    ))
+    let output = subc_test_support::dev_command(subc_test_support::ckdev_binary(env!(
+        "CARGO_BIN_EXE_ck-subc-mcp"
+    )))
     .env_remove("SUBC_MODULE_ID")
     .env("XDG_DATA_HOME", home.path())
     .env("XDG_RUNTIME_DIR", home.path())

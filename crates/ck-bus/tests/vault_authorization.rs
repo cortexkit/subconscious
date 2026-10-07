@@ -80,11 +80,7 @@ async fn vault_authorization_against_the_real_claustrum() {
     let _gate = harness::acceptance_gate().await;
     harness::install_tracing();
     let tree = SignerRun::tree();
-    let real = match RealClaustrum::discover(
-        &SignerRun::data_home(&tree),
-        &tree.join("keys"),
-        &tree.join("ckdev-bin"),
-    ) {
+    let real = match RealClaustrum::discover(&SignerRun::data_home(&tree), &tree.join("keys")) {
         Ok(real) => real,
         Err(observation) => {
             RowReport::skipped(

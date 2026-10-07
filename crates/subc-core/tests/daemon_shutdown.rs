@@ -108,7 +108,7 @@ impl Fixture {
                 "daemon exited during startup"
             );
             if fixture.connection().exists() {
-                let output = dev_command(common::ckdev_ck(&fixture.root))
+                let output = dev_command(common::ckdev_ck())
                     .arg("--subc")
                     .arg(fixture.connection())
                     .args(["module", "status", "shutdown-observer", "--json"])
@@ -239,7 +239,7 @@ impl Drop for Fixture {
 /// module's group against the daemon's, and reproduce the service manager's
 /// kill of that group after the daemon exits.
 fn spawn_daemon(root: &TestTempDir) -> Child {
-    dev_command(common::ckdev_subc(root))
+    dev_command(common::ckdev_subc())
         .process_group(0)
         .env("XDG_DATA_HOME", root.join("data"))
         .env("XDG_CONFIG_HOME", root.join("config"))
@@ -988,7 +988,7 @@ fn binary_disabled_placement_leaves_callers_cgroup_untouched() {
         !modules.join(&module_id).exists(),
         "probe cgroup predates test"
     );
-    let mut child = dev_command(common::ckdev_subc(&root))
+    let mut child = dev_command(common::ckdev_subc())
         .env("XDG_CONFIG_HOME", root.join("config"))
         .env("XDG_RUNTIME_DIR", root.join("runtime"))
         .env("XDG_DATA_HOME", root.join("data"))
@@ -1031,7 +1031,7 @@ fn binary_disabled_placement_leaves_callers_cgroup_untouched() {
 #[test]
 fn binary_rejects_invalid_cgroup_override_before_writing_state() {
     let root = fresh_dir("binary-cgroup-invalid");
-    let output = dev_command(common::ckdev_subc(&root))
+    let output = dev_command(common::ckdev_subc())
         .env("SUBC_CGROUP_PLACEMENT", "current")
         .env("XDG_DATA_HOME", root.join("data"))
         .env("XDG_RUNTIME_DIR", root.join("runtime"))

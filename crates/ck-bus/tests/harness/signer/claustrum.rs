@@ -23,12 +23,11 @@ pub struct RealClaustrum {
 
 impl RealClaustrum {
     /// Finds both binaries, or returns the observation for `claustrum-binary-absent`.
-    /// Both run from `bin_dir` under their `ckdev-` names (`ckdev-claustrum`,
-    /// `ckdev-ck`), never under the production names they were installed with.
-    pub fn discover(data_home: &Path, key_dir: &Path, bin_dir: &Path) -> Result<Self, String> {
-        let claustrum_bin =
-            subc_test_support::ckdev_binary_in(binary_from_env("CK_CLAUSTRUM_BIN")?, bin_dir);
-        let ck_bin = subc_test_support::ckdev_binary_in(binary_from_env("CK_CK_BIN")?, bin_dir);
+    /// Both run as published `ckdev-` copies (`ckdev-claustrum`, `ckdev-ck`),
+    /// never under the production names they were installed with.
+    pub fn discover(data_home: &Path, key_dir: &Path) -> Result<Self, String> {
+        let claustrum_bin = subc_test_support::ckdev_binary(binary_from_env("CK_CLAUSTRUM_BIN")?);
+        let ck_bin = subc_test_support::ckdev_binary(binary_from_env("CK_CK_BIN")?);
         Ok(Self {
             claustrum_version: version(&claustrum_bin, &["--version"]),
             ck_version: version(&ck_bin, &["--version"]),

@@ -238,7 +238,7 @@ impl RunningDaemon {
         let connection_file_path = temp_dir.join("subc-conn.json");
         let task = tokio::spawn(run_with_config(
             BootstrapConfig::new(&connection_file_path, 0)
-                .with_privacy_trampoline(common::ckdev_subc(&temp_dir))
+                .with_privacy_trampoline(common::ckdev_subc())
                 .with_terminal_journal_path(temp_dir.join("run").join("terminals.jsonl"))
                 .with_capture_logs_dir(temp_dir.join("run").join("logs"))
                 .with_watchdog_config(watchdog_config),

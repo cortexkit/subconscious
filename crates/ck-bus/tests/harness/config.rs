@@ -19,12 +19,11 @@ pub fn template_value() -> Value {
 }
 
 /// Writes the fixture daemon config under `fixture_root`. The supervised
-/// modules run `ck_bus_binary` as placed under its `ckdev-` name in the
-/// fixture root, so the processes the daemon starts are never listed under
-/// the production `ck-bus` name.
+/// modules run `ck_bus_binary` as published under its `ckdev-` name, so the
+/// processes the daemon starts are never listed under the production `ck-bus`
+/// name.
 pub fn render(fixture_root: &Path, ck_bus_binary: &Path, timing: SentinelTiming) -> PathBuf {
-    let ck_bus_binary =
-        &subc_test_support::ckdev_binary_in(ck_bus_binary, fixture_root.join("ckdev-bin"));
+    let ck_bus_binary = &subc_test_support::ckdev_binary(ck_bus_binary);
     let mut value = template_value();
     let modules = value["modules"]
         .as_object_mut()

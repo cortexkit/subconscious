@@ -55,7 +55,7 @@ async fn macos_status_and_provenance_publish_only_a_confirmed_module_pid() {
         .await;
         // The trampoline runs as `ckdev-subc-under-test`; its running image is
         // compared with this placed file below.
-        let trampoline = common::ckdev_subc_under_test(&daemon.temp_dir);
+        let trampoline = common::ckdev_subc_under_test();
         let supervisor = Supervisor::new(Arc::clone(&daemon.registry), RestartPolicy::default())
             .with_privacy_trampoline(&trampoline)
             .with_process_liveness(process_liveness)
@@ -197,7 +197,7 @@ async fn macos_refused_trampoline_never_publishes_a_module_pid() {
             Arc::clone(&daemon.registry),
             RestartPolicy::new(0, Duration::ZERO),
         )
-        .with_privacy_trampoline(common::ckdev_subc_under_test(&daemon.temp_dir))
+        .with_privacy_trampoline(common::ckdev_subc_under_test())
         .with_process_liveness(liveness)
         .with_handle(handle)
         .with_connection_file_path(daemon.connection_file_path.clone());
@@ -266,7 +266,7 @@ async fn supervisor_provenance_reports_declared_and_observed_module_facts() {
     .await;
     let after_start_ms = unix_ms();
     let supervisor = Supervisor::new(Arc::clone(&daemon.registry), RestartPolicy::default())
-        .with_privacy_trampoline(common::ckdev_subc(&daemon.temp_dir))
+        .with_privacy_trampoline(common::ckdev_subc())
         .with_process_liveness(process_liveness)
         .with_handle(supervisor_handle)
         .with_drain_timeout(Duration::from_millis(25))
@@ -392,7 +392,7 @@ async fn supervisor_provenance_reports_a_reserved_module_reading_its_nonce_from_
     )
     .await;
     let supervisor = Supervisor::new(Arc::clone(&daemon.registry), RestartPolicy::default())
-        .with_privacy_trampoline(common::ckdev_subc(&daemon.temp_dir))
+        .with_privacy_trampoline(common::ckdev_subc())
         .with_process_liveness(process_liveness)
         .with_handle(supervisor_handle)
         .with_drain_timeout(Duration::from_millis(25))
@@ -439,7 +439,7 @@ async fn supervisor_provenance_marks_absent_manifest_block_unverifiable() {
     )
     .await;
     let supervisor = Supervisor::new(Arc::clone(&daemon.registry), RestartPolicy::default())
-        .with_privacy_trampoline(common::ckdev_subc(&daemon.temp_dir))
+        .with_privacy_trampoline(common::ckdev_subc())
         .with_process_liveness(process_liveness)
         .with_handle(supervisor_handle)
         .with_drain_timeout(Duration::from_millis(25))
@@ -472,7 +472,7 @@ async fn supervisor_provenance_detects_replaced_executable_image() {
     )
     .await;
     let supervisor = Supervisor::new(Arc::clone(&daemon.registry), RestartPolicy::default())
-        .with_privacy_trampoline(common::ckdev_subc(&daemon.temp_dir))
+        .with_privacy_trampoline(common::ckdev_subc())
         .with_process_liveness(process_liveness)
         .with_handle(supervisor_handle)
         .with_drain_timeout(Duration::from_millis(25))

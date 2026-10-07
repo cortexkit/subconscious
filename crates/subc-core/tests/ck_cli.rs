@@ -365,9 +365,8 @@ fn setup_dry_run_refuses_when_the_signature_header_is_stripped() {
 #[test]
 fn production_ck_ignores_the_test_release_index_key() {
     // The shipped `ck` target, run as `ckdev-ck` like every test process.
-    let production = subc_test_support::CkdevBinary::new(env!("CARGO_BIN_EXE_ck"));
-    let shape = production
-        .command()
+    let production = subc_test_support::ckdev_binary(env!("CARGO_BIN_EXE_ck"));
+    let shape = subc_test_support::dev_command(&production)
         .arg("--ck-build-shape")
         .output()
         .expect("production ck build shape");
@@ -407,8 +406,7 @@ fn production_ck_ignores_the_test_release_index_key() {
         &std::env::var_os("PATH").unwrap_or_default(),
     )))
     .expect("fixture PATH");
-    let output = production
-        .command()
+    let output = subc_test_support::dev_command(&production)
         .args(["setup", "--dry-run"])
         .env("CK_RELEASE_INDEX_URL", &index.url)
         .env("CK_TEST_RELEASE_INDEX_PUBKEY", &index.public_key)
@@ -552,7 +550,7 @@ impl SetupFixture {
     }
 
     fn command(&self, index: &SignedIndex, args: &[&str]) -> Command {
-        let mut command = ck_command_in(self._root.path());
+        let mut command = ck_command();
         let path = std::env::join_paths(std::iter::once(self.tools.clone()).chain(
             std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
         ))
@@ -1276,11 +1274,10 @@ impl UpgradeFixture {
         write_executable(&claustrum, "#!/bin/sh\necho 'ck-claustrum 0.8.0'\n");
         write_executable(&auth, "#!/bin/sh\necho 'ck-auth 0.8.0'\n");
         // The manifest names the `ck` this fixture's commands run: the test
-        // CLI as placed under its `ckdev-` name in the fixture root.
-        let ck = fs::canonicalize(common::ckdev_bin(
-            root.path(),
-            env!("CARGO_BIN_EXE_ck-under-test"),
-        ))
+        // CLI as published under its `ckdev-` name.
+        let ck = fs::canonicalize(subc_test_support::ckdev_binary(env!(
+            "CARGO_BIN_EXE_ck-under-test"
+        )))
         .unwrap();
         let mutations = [
             (ck, "44".repeat(32)),
@@ -1335,7 +1332,7 @@ impl UpgradeFixture {
     }
 
     fn command(&self, index: &SignedIndex, args: &[&str]) -> Command {
-        let mut command = ck_command_in(self._root.path());
+        let mut command = ck_command();
         command
             .args(args)
             .arg("--subc")
@@ -2666,7 +2663,7 @@ async fn module_stop_waits_past_ten_seconds_within_running_drain_budget() {
         RestartPolicy::new(3, Duration::from_millis(137))
             .with_max_backoff(Duration::from_millis(7_321)),
     )
-    .with_privacy_trampoline(common::ckdev_subc(&server.temp_dir))
+    .with_privacy_trampoline(common::ckdev_subc())
     .with_process_liveness(Arc::clone(&server.process_liveness))
     .with_forwarding(Arc::clone(&server.forwarding))
     .with_handle(server.supervisor_handle.clone())
@@ -3373,21 +3370,9 @@ fn looks_like_age(text: &str) -> bool {
     text == "just now" || text.ends_with(" ago")
 }
 
-/// The test CLI, run as `ckdev-under-test` from one placement per test
-/// process. CLI tests start it hundreds of times; with a fresh copy per
-/// command, renderings that pin a "just now" age failed in 5 of 6 macOS runs
-/// because the copies pushed the gap past one second.
+/// The test CLI, run as `ckdev-under-test` (see `common::ck_under_test_command`).
 fn ck_command() -> Command {
-    let mut command = common::ck_under_test_command_shared();
-    isolate_ck_command(&mut command);
-    command
-}
-
-/// [`ck_command`] for a fixture that owns a directory outliving the command
-/// and needs a stable path for the running `ck` (an installer manifest that
-/// names it, for example).
-fn ck_command_in(scratch: &Path) -> Command {
-    let mut command = common::ck_under_test_command(scratch);
+    let mut command = common::ck_under_test_command();
     isolate_ck_command(&mut command);
     command
 }
@@ -3492,7 +3477,7 @@ fn supervisor_with_restart_limit(server: &TestServer, max_restarts: u32) -> Supe
         Arc::clone(&server.registry),
         RestartPolicy::new(max_restarts, Duration::from_millis(10)),
     )
-    .with_privacy_trampoline(common::ckdev_subc(&server.temp_dir))
+    .with_privacy_trampoline(common::ckdev_subc())
     .with_process_liveness(Arc::clone(&server.process_liveness))
     .with_forwarding(Arc::clone(&server.forwarding))
     .with_handle(server.supervisor_handle.clone())

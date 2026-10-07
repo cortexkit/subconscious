@@ -4027,9 +4027,7 @@ async fn mcp_module_without_spawn_attestation_exits_loud_before_serving() {
     let xdg_config_home = server.daemon.temp_dir.join("mcp-unattested-xdg-config");
     fs::create_dir_all(&xdg_config_home).unwrap();
 
-    let mut command = Command::from(subc_test_support::dev_command(ckdev_subc_mcp(
-        &xdg_config_home,
-    )));
+    let mut command = Command::from(subc_test_support::dev_command(ckdev_subc_mcp()));
     command
         .arg("module")
         .arg("--subc")
@@ -4332,10 +4330,10 @@ fn stub_spec(module_id: &str, events_path: &Path, extra_env: &[(&str, &str)]) ->
     }
 }
 
-/// `ck-subc-mcp` placed as `ckdev-subc-mcp` under `scratch`, so the module and
+/// `ck-subc-mcp` published as `ckdev-subc-mcp`, so the module and
 /// shim processes these tests start are never listed under the production name.
-fn ckdev_subc_mcp(scratch: &Path) -> PathBuf {
-    subc_test_support::ckdev_binary_in(env!("CARGO_BIN_EXE_ck-subc-mcp"), scratch.join("ckdev-bin"))
+fn ckdev_subc_mcp() -> PathBuf {
+    subc_test_support::ckdev_binary(env!("CARGO_BIN_EXE_ck-subc-mcp"))
 }
 
 fn mcp_module_spec(
@@ -4345,7 +4343,7 @@ fn mcp_module_spec(
 ) -> ModuleSpec {
     ModuleSpec {
         module_id: module_id.to_owned(),
-        program: ckdev_subc_mcp(xdg_config_home),
+        program: ckdev_subc_mcp(),
         args: vec![
             "module".to_string(),
             "--connection-file".to_string(),
@@ -4446,9 +4444,7 @@ fn module_command(
     module_connection_file: &Path,
     xdg_config_home: &Path,
 ) -> Command {
-    let mut command = Command::from(subc_test_support::dev_command(ckdev_subc_mcp(
-        xdg_config_home,
-    )));
+    let mut command = Command::from(subc_test_support::dev_command(ckdev_subc_mcp()));
     command
         .arg("module")
         .arg("--subc")
@@ -4490,9 +4486,7 @@ fn spawn_shim(
     project_root: &Path,
     xdg_config_home: &Path,
 ) -> ShimProcess {
-    let mut command = Command::from(subc_test_support::dev_command(ckdev_subc_mcp(
-        xdg_config_home,
-    )));
+    let mut command = Command::from(subc_test_support::dev_command(ckdev_subc_mcp()));
     command
         .arg("shim")
         .arg("--module-connection-file")

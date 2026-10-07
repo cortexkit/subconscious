@@ -8,7 +8,7 @@ use std::{
 };
 
 use serde_json::{json, Value};
-use subc_test_support::{ckdev_binary_in, dev_command, TestTempDir};
+use subc_test_support::{ckdev_binary, dev_command, TestTempDir};
 
 /// At most two of this file's daemons run at once.
 ///
@@ -88,7 +88,7 @@ impl Fixture {
     fn boot(&mut self) {
         self.acquire_permit();
         self.child = Some(
-            dev_command(ckdev_bin(&self.root, env!("CARGO_BIN_EXE_ck-subc")))
+            dev_command(ckdev_binary(env!("CARGO_BIN_EXE_ck-subc")))
                 .env("XDG_DATA_HOME", self.root.join("data"))
                 .env("XDG_CONFIG_HOME", self.root.join("config"))
                 .env("XDG_RUNTIME_DIR", self.root.join("runtime"))
@@ -147,16 +147,9 @@ impl Fixture {
     }
 }
 
-/// A built binary placed under its `ckdev-` name in the fixture root's `ckdev-bin`
-/// directory, so the processes these tests start are never listed under a
-/// production `ck-*` name.
-fn ckdev_bin(root: &Path, built: &str) -> PathBuf {
-    ckdev_binary_in(built, root.join("ckdev-bin"))
-}
-
 /// Run `ck` against the daemon whose fixture root is `root`.
 fn try_ck_at(root: &Path, args: &[&str]) -> Option<String> {
-    let output = dev_command(ckdev_bin(root, env!("CARGO_BIN_EXE_ck")))
+    let output = dev_command(ckdev_binary(env!("CARGO_BIN_EXE_ck")))
         .arg("--subc")
         .arg(
             root.join("runtime")
@@ -354,7 +347,7 @@ fn in_process_daemon_without_a_journal_path_child() {
         .join("runtime")
         .join(subc_transport::CONNECTION_FILE_NAME);
     let config = subc_daemon::bootstrap::BootstrapConfig::new(&connection, 0)
-        .with_privacy_trampoline(ckdev_bin(&root, env!("CARGO_BIN_EXE_ck-subc")))
+        .with_privacy_trampoline(ckdev_binary(env!("CARGO_BIN_EXE_ck-subc")))
         .with_daemon_config_path(root.join("config/cortexkit/subc.jsonc"))
         .unwrap();
     let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -429,7 +422,7 @@ fn files_named(root: &Path, name: &str) -> Vec<PathBuf> {
 #[test]
 fn the_daemon_binary_refuses_a_relative_data_home_by_name() {
     let root = TestTempDir::new("relative-data-home");
-    let mut command = dev_command(ckdev_bin(&root, env!("CARGO_BIN_EXE_ck-subc")));
+    let mut command = dev_command(ckdev_binary(env!("CARGO_BIN_EXE_ck-subc")));
     command
         .current_dir(root.path())
         .env("XDG_CONFIG_HOME", root.join("config"))

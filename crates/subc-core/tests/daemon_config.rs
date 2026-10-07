@@ -70,7 +70,7 @@ impl RunningDaemon {
         // environment and writes `<module_id>.stderr.log` into the operator's
         // live data home under fixture module ids.
         let config = BootstrapConfig::new(&connection_file_path, 0)
-            .with_privacy_trampoline(common::ckdev_subc(&temp_dir))
+            .with_privacy_trampoline(common::ckdev_subc())
             .with_terminal_journal_path(temp_dir.join("run").join("terminals.jsonl"))
             .with_daemon_config_path(&config_path)
             .unwrap();
@@ -132,7 +132,7 @@ async fn configured_ck_log_is_present_in_the_spawned_child_and_unconfigured_is_a
         Arc::new(Registry::default()),
         RestartPolicy::new(0, Duration::from_millis(1)),
     )
-    .with_privacy_trampoline(common::ckdev_subc(&temp));
+    .with_privacy_trampoline(common::ckdev_subc());
     let modules = config
         .modules
         .iter()
@@ -565,7 +565,7 @@ async fn rescan_changed_spec_is_pending_until_reload_uses_it() {
     common::copy_executable(Path::new(env!("CARGO_BIN_EXE_fake-aft-stub")), &replacement);
     changed["program"] = json!(replacement.to_string_lossy());
     fs::write(&daemon.config_path, config_doc([changed])).unwrap();
-    let preview = ck_under_test_command(&daemon.temp_dir)
+    let preview = ck_under_test_command()
         .args(["module", "rescan", "--dry-run", "--subc"])
         .arg(&daemon.connection_file_path)
         .output()
@@ -581,7 +581,7 @@ async fn rescan_changed_spec_is_pending_until_reload_uses_it() {
         "{preview_text}"
     );
     assert!(!preview_text.contains("would restart"), "{preview_text}");
-    let applied = ck_under_test_command(&daemon.temp_dir)
+    let applied = ck_under_test_command()
         .args(["module", "rescan", "--subc"])
         .arg(&daemon.connection_file_path)
         .output()
@@ -627,7 +627,7 @@ async fn rescan_changed_spec_is_pending_until_reload_uses_it() {
             .map(|verdict| &verdict.path),
         Some(ReloadPathAgreement::Mismatch { .. })
     ));
-    let list = ck_under_test_command(&daemon.temp_dir)
+    let list = ck_under_test_command()
         .args(["module", "list", "--subc"])
         .arg(&daemon.connection_file_path)
         .output()
@@ -640,7 +640,7 @@ async fn rescan_changed_spec_is_pending_until_reload_uses_it() {
     assert!(String::from_utf8(list.stdout)
         .unwrap()
         .contains("pending (path)"));
-    let status = ck_under_test_command(&daemon.temp_dir)
+    let status = ck_under_test_command()
         .args(["module", "status", module_id, "--subc"])
         .arg(&daemon.connection_file_path)
         .output()
@@ -1133,7 +1133,7 @@ async fn ck_module_rescan_prints_reconcile_table() {
     )
     .unwrap();
 
-    let output = ck_under_test_command(&daemon.temp_dir)
+    let output = ck_under_test_command()
         .args(["module", "rescan", "--subc"])
         .arg(&daemon.connection_file_path)
         .output()
@@ -1235,7 +1235,7 @@ async fn required_capability_absence_surfaces_in_health_and_server_describe() {
             daemon.connection_file_path.to_str().unwrap(),
         ],
     ] {
-        let output = ck_under_test_command(&daemon.temp_dir)
+        let output = ck_under_test_command()
             .args(args)
             .output()
             .expect("ck launches");
@@ -1304,7 +1304,7 @@ async fn rescan_preview_reports_removal_that_strands_a_capability_consumer() {
             == 1,
         "preview must not remove the provider it warns about"
     );
-    let output = ck_under_test_command(&daemon.temp_dir)
+    let output = ck_under_test_command()
         .args(["module", "rescan", "--dry-run", "--subc"])
         .arg(&daemon.connection_file_path)
         .output()
@@ -1341,7 +1341,7 @@ async fn present_invalid_config_fails_loud_before_daemon_starts() {
 
     let err = run_with_daemon_config_path(
         BootstrapConfig::new(&connection_file_path, 0)
-            .with_privacy_trampoline(common::ckdev_subc(&temp_dir))
+            .with_privacy_trampoline(common::ckdev_subc())
             .with_terminal_journal_path(temp_dir.join("run").join("terminals.jsonl")),
         &config_path,
     )

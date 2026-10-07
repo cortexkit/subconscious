@@ -87,7 +87,7 @@ impl Drop for TestTempDir {
 /// `ck` CLI itself, belong to the production binaries installed in the
 /// CortexKit bin directory, so a test daemon running as `ck-subc` looks exactly
 /// like a second production daemon. Test processes run under `ckdev-<name>`
-/// instead; [`ckdev_binary_in`] makes such a name for a built binary.
+/// instead; [`ckdev_binary`] publishes a built binary under such a name.
 pub fn is_production_executable_name(file_name: &OsStr) -> bool {
     let Some(name) = file_name.to_str() else {
         // Production names are ASCII; a non-UTF-8 name cannot be one.
@@ -99,7 +99,7 @@ pub fn is_production_executable_name(file_name: &OsStr) -> bool {
 
 /// Panics when `program` would run under a production executable name (see
 /// [`is_production_executable_name`]). Call it before spawning any CortexKit
-/// binary from a test; [`dev_command`] and [`ckdev_binary_in`] already do.
+/// binary from a test; [`dev_command`] and [`ckdev_binary`] already do.
 ///
 /// Cargo's own test harness for the `ck` bin target is not refused: cargo names
 /// it `target/<profile>/deps/ck-<16 hex digits>`, and re-running that harness
@@ -111,7 +111,7 @@ pub fn refuse_production_executable(program: &Path) {
         !is_production_executable_name(name) || is_cargo_test_harness(program),
         "refusing to run a test process under the production executable name {:?} ({}): \
          `ck-*` and `ck` are reserved for installed binaries; run it through \
-         subc_test_support::ckdev_binary_in or CkdevBinary so it shows as ckdev-*",
+         subc_test_support::ckdev_binary so it shows as ckdev-*",
         name,
         program.display()
     );
@@ -179,14 +179,14 @@ pub fn exempt_production_executable<'a>(test: &str, program: &'a Path) -> &'a Pa
                 .any(|&(exempt_test, exempt_name)| exempt_test == test && exempt_name == stem),
         "no production-name exemption for {file_name:?} in test {test:?} (running on \
          thread {caller:?}); test processes run as ckdev-* through \
-         subc_test_support::ckdev_binary_in"
+         subc_test_support::ckdev_binary"
     );
     program
 }
 
 /// A `Command` for `program` that refuses (panics) when `program` has a
 /// production executable name. Use it for every test spawn of a CortexKit
-/// binary, with a path made by [`ckdev_binary_in`] or [`CkdevBinary`].
+/// binary, with a path made by [`ckdev_binary`].
 pub fn dev_command(program: impl AsRef<Path>) -> Command {
     let program = program.as_ref();
     refuse_production_executable(program);
@@ -218,29 +218,55 @@ fn strip_exe_suffix(name: &str) -> (&str, &str) {
     }
 }
 
-/// Place `built` (a binary cargo built, such as `CARGO_BIN_EXE_ck-subc`) in
-/// `scratch` under its `ckdev-` name (see [`ckdev_file_name`]) and return that
-/// path, so the process a test starts from it is listed as `ckdev-*`, never as
-/// a production `ck-*` binary. `scratch` is a directory the test owns and keeps
-/// for as long as anything may still start the binary.
+/// Publish `built` (a binary cargo built, such as `CARGO_BIN_EXE_ck-subc`)
+/// under its `ckdev-` name (see [`ckdev_file_name`]) and return that path, so
+/// the process a test starts from it is listed as `ckdev-*`, never as a
+/// production `ck-*` binary. A binary already named `ckdev-*` is returned
+/// unchanged.
 ///
-/// The placement is a copy, never a hard link. A copy keeps the binary's
-/// embedded code signature and gets the source's permissions, exec bit
-/// included. It is a different inode from `built`, so a test comparing a
-/// process's executable identity must compare it with the returned path, not
-/// with `built`.
+/// The path is content-addressed: `/tmp/subc-ckdev/<digest>/<ckdev name>`
+/// (the system temp directory instead of `/tmp` off Unix), where the digest
+/// covers the name and the bytes. Every test, process and run asking for the
+/// same build gets the same file, and a rebuilt binary gets a new directory.
+/// Three measurements on macOS shaped this:
 ///
-/// Why not a hard link: on macOS, privacy-trampoline probes executed through
-/// per-test hard links to `target/debug/ck-subc` were intermittently killed
-/// with SIGKILL while the suite ran (1 run in 6 of subc-core's `ck_cli`, and 3
-/// in about 21 earlier runs), while the same runs against the cargo path or
-/// against per-test copies stayed clean (0 in 6 each). The kernel reported no
-/// reason, so the cause is not established; copies avoid it.
+/// - a fresh executable under the per-user temp directory (`$TMPDIR`) can
+///   stall its first system-policy evaluation for 40+ minutes, while the same
+///   bytes under `/tmp` answered in about 40 ms, so publishing happens under
+///   `/tmp`, once per build;
+/// - privacy-trampoline probes executed through hard links to
+///   `target/debug/ck-subc` were intermittently killed with SIGKILL (1 of 6
+///   subc-core `ck_cli` runs, and 3 in about 21 earlier ones), while the cargo
+///   path and copies stayed clean (0 of 6 each), so the published file is a
+///   copy, never a link (why the links were killed is not established);
+/// - a fresh copy per CLI command slowed tests enough to push byte-exact
+///   "just now" ages past one second, so a published file is reused.
 ///
-/// A binary already named `ckdev-*` is returned unchanged. Calling this again
-/// for the same binary and scratch directory returns the existing placement.
-pub fn ckdev_binary_in(built: impl AsRef<Path>, scratch: impl AsRef<Path>) -> PathBuf {
-    let built = built.as_ref();
+/// A copy keeps the binary's embedded code signature and its exec bit, but it
+/// is a different inode from `built`, so a test comparing a process's
+/// executable identity must compare it with the returned path. Publishing
+/// stages the copy in a private directory and renames that directory into
+/// place, so a reader never sees a partial file. Tests never write to a
+/// published file: on Unix it and its directory are read-only, and a reused
+/// file is re-hashed (once per process) before it is trusted.
+pub fn ckdev_binary(built: impl AsRef<Path>) -> PathBuf {
+    ckdev_binary_at(built.as_ref(), &publish_root())
+}
+
+/// Where published `ckdev-` binaries live. `/tmp`, not `$TMPDIR`: see
+/// [`ckdev_binary`].
+fn publish_root() -> PathBuf {
+    #[cfg(unix)]
+    {
+        PathBuf::from("/tmp/subc-ckdev")
+    }
+    #[cfg(not(unix))]
+    {
+        std::env::temp_dir().join("subc-ckdev")
+    }
+}
+
+fn ckdev_binary_at(built: &Path, root: &Path) -> PathBuf {
     let file_name = built
         .file_name()
         .and_then(OsStr::to_str)
@@ -249,44 +275,198 @@ pub fn ckdev_binary_in(built: impl AsRef<Path>, scratch: impl AsRef<Path>) -> Pa
     if dev_name == file_name {
         return built.to_path_buf();
     }
-    let placed = scratch.as_ref().join(&dev_name);
-    if !placed.exists() {
-        place_binary(built, &placed).unwrap_or_else(|error| {
-            panic!(
-                "could not place {} as {}: {error}",
-                built.display(),
-                placed.display()
-            )
-        });
-    }
+    let placed = publish(built, &dev_name, root).unwrap_or_else(|error| {
+        panic!(
+            "could not publish {} as {dev_name} under {}: {error}",
+            built.display(),
+            root.display()
+        )
+    });
     refuse_production_executable(&placed);
     placed
 }
 
-fn place_binary(built: &Path, placed: &Path) -> io::Result<()> {
-    if let Some(parent) = placed.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    copy_into_place(built, placed)
+/// Hex digests of files already hashed by this process, keyed by path, size
+/// and modification time, so a binary started hundreds of times is read once.
+fn digest_cache() -> &'static std::sync::Mutex<std::collections::HashMap<DigestKey, String>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<DigestKey, String>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
 }
 
-fn copy_into_place(built: &Path, placed: &Path) -> io::Result<()> {
-    let nonce = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let staging = placed.with_file_name(format!(
-        ".{}.partial-{}-{nonce}",
-        placed.file_name().unwrap_or_default().to_string_lossy(),
-        std::process::id()
-    ));
-    copy_executable(built, &staging)?;
-    // Permissions are set by path (chmod), so no writable descriptor is held.
-    fs::set_permissions(&staging, fs::metadata(built)?.permissions())?;
-    if placed.exists() {
-        // A concurrent placement won; keep it rather than replacing a file
-        // that may already be running.
-        let _ = fs::remove_file(&staging);
-        return Ok(());
+type DigestKey = (PathBuf, String, u64, Option<std::time::SystemTime>);
+
+/// The content address: the first 32 hex digits of SHA-256 over the
+/// published name, a NUL, and the file's bytes.
+fn content_digest(path: &Path, dev_name: &str) -> io::Result<String> {
+    use sha2::{Digest, Sha256};
+    let metadata = fs::metadata(path)?;
+    let key = (
+        path.to_path_buf(),
+        dev_name.to_string(),
+        metadata.len(),
+        metadata.modified().ok(),
+    );
+    if let Some(digest) = digest_cache().lock().unwrap().get(&key) {
+        return Ok(digest.clone());
     }
-    fs::rename(&staging, placed)
+    let mut hasher = Sha256::new();
+    hasher.update(dev_name.as_bytes());
+    hasher.update([0u8]);
+    let mut file = fs::File::open(path)?;
+    io::copy(&mut file, &mut hasher)?;
+    let digest: String = hasher.finalize()[..16]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    digest_cache().lock().unwrap().insert(key, digest.clone());
+    Ok(digest)
+}
+
+fn publish(built: &Path, dev_name: &str, root: &Path) -> io::Result<PathBuf> {
+    let digest = content_digest(built, dev_name)?;
+    prepare_root(root)?;
+    let dir = root.join(&digest);
+    let placed = dir.join(dev_name);
+    if dir.exists() {
+        verify_published(&placed, dev_name, &digest)?;
+        return Ok(placed);
+    }
+    prune_stale(root);
+    let nonce = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let staging = root.join(format!(".staging-{}-{nonce}", std::process::id()));
+    fs::create_dir(&staging)?;
+    let staged = staging.join(dev_name);
+    let result = (|| {
+        copy_executable(built, &staged)?;
+        // Permissions are set by path (chmod), so no writable descriptor is
+        // held; on Unix the published file is read-only and executable.
+        fs::set_permissions(&staged, published_permissions(built)?)?;
+        if content_digest(&staged, dev_name)? != digest {
+            return Err(io::Error::other(format!(
+                "{} changed while it was being published",
+                built.display()
+            )));
+        }
+        match fs::rename(&staging, &dir) {
+            Ok(()) => {
+                seal_dir(&dir)?;
+                Ok(())
+            }
+            // Another process published the same build first; its file is
+            // checked below like any reused one.
+            Err(_) if dir.exists() => Ok(()),
+            Err(error) => Err(error),
+        }
+    })();
+    if staging.exists() {
+        remove_published(&staging);
+    }
+    result?;
+    verify_published(&placed, dev_name, &digest)?;
+    Ok(placed)
+}
+
+/// Re-hashes a published file before trusting it: a partial or altered file
+/// is refused, never run.
+fn verify_published(placed: &Path, dev_name: &str, digest: &str) -> io::Result<()> {
+    let found = content_digest(placed, dev_name)?;
+    if found == digest {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "published {} does not match its content address {digest} (found {found}); \
+             remove {} to republish it",
+            placed.display(),
+            placed.parent().unwrap_or(placed).display()
+        )))
+    }
+}
+
+/// Creates the publish root, and refuses one this user does not own or that
+/// others can write: `/tmp` is shared, and a planted file there would be run.
+fn prepare_root(root: &Path) -> io::Result<()> {
+    if !root.exists() {
+        fs::create_dir_all(root)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(root, fs::Permissions::from_mode(0o700))?;
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = fs::symlink_metadata(root)?;
+        let uid = rustix::process::getuid().as_raw();
+        if !metadata.is_dir() || metadata.uid() != uid || metadata.mode() & 0o022 != 0 {
+            return Err(io::Error::other(format!(
+                "{} must be a directory owned by uid {uid} and writable by no one else",
+                root.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn published_permissions(built: &Path) -> io::Result<fs::Permissions> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = fs::metadata(built)?.permissions().mode();
+    Ok(fs::Permissions::from_mode(mode & 0o555))
+}
+
+#[cfg(not(unix))]
+fn published_permissions(built: &Path) -> io::Result<fs::Permissions> {
+    Ok(fs::metadata(built)?.permissions())
+}
+
+/// Makes a published directory read-only, so nothing can be renamed into it
+/// or removed from it.
+fn seal_dir(dir: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o555))?;
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
+}
+
+/// Removes a staging or published directory, restoring the write permission
+/// sealing took away.
+fn remove_published(dir: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+    }
+    let _ = fs::remove_dir_all(dir);
+}
+
+/// Published builds are kept this long after publishing; older ones are
+/// removed when a new build is published. A process still running one keeps
+/// its open image, and asking again republishes it.
+const PUBLISHED_RETENTION: std::time::Duration = std::time::Duration::from_secs(3 * 24 * 60 * 60);
+
+fn prune_stale(root: &Path) {
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        let stale = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age > PUBLISHED_RETENTION);
+        if stale {
+            remove_published(&entry.path());
+        }
+    }
 }
 
 /// Copies through a `cp` child on Unix: a writable descriptor held by this
@@ -306,104 +486,6 @@ fn copy_executable(src: &Path, dst: &Path) -> io::Result<()> {
     #[cfg(not(unix))]
     {
         fs::copy(src, dst).map(|_| ())
-    }
-}
-
-/// [`ckdev_binary_in`] into one scratch directory per test process, for a
-/// binary a test process starts many times (the `ck` CLI behind every CLI
-/// test). Each placement is a new file, and on macOS a fresh copy per command
-/// slowed CLI tests enough to push byte-exact "just now" ages past one second
-/// (5 of 6 runs); placing once per process pays that cost once.
-///
-/// The directory, `subc-tests/ckdev-shared-<pid>`, outlives the process (a
-/// static is never dropped), so each new one first removes those left by
-/// processes that have ended. On non-Unix hosts nothing can tell whether the
-/// owning process ended, so those directories stay for the temp sweeper.
-pub fn ckdev_binary_shared(built: impl AsRef<Path>) -> PathBuf {
-    static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-    let dir = DIR.get_or_init(|| {
-        let parent = std::env::temp_dir().join("subc-tests");
-        remove_ended_shared_dirs(&parent);
-        let dir = parent.join(format!("{SHARED_PREFIX}{}", std::process::id()));
-        fs::create_dir_all(&dir).expect("create shared ckdev scratch dir");
-        dir
-    });
-    ckdev_binary_in(built, dir)
-}
-
-const SHARED_PREFIX: &str = "ckdev-shared-";
-
-fn remove_ended_shared_dirs(parent: &Path) {
-    #[cfg(unix)]
-    {
-        let Ok(entries) = fs::read_dir(parent) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let Some(pid) = name
-                .to_str()
-                .and_then(|name| name.strip_prefix(SHARED_PREFIX))
-                .and_then(|pid| pid.parse::<i32>().ok())
-            else {
-                continue;
-            };
-            if pid != std::process::id() as i32 && !process_alive(pid) {
-                let _ = fs::remove_dir_all(entry.path());
-            }
-        }
-    }
-    #[cfg(not(unix))]
-    let _ = parent;
-}
-
-/// A built binary placed under its `ckdev-` name (see [`ckdev_binary_in`]) in a
-/// scratch directory this value owns. Keep it alive for as long as anything
-/// may start the binary: dropping it removes the directory.
-pub struct CkdevBinary {
-    path: PathBuf,
-    _scratch: TestTempDir,
-}
-
-impl CkdevBinary {
-    /// Place `built` under its `ckdev-` name in a new scratch directory.
-    pub fn new(built: impl AsRef<Path>) -> Self {
-        let scratch = TestTempDir::new("ckdev-bin");
-        let path = ckdev_binary_in(built, scratch.path());
-        Self {
-            path,
-            _scratch: scratch,
-        }
-    }
-
-    /// The placed binary.
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
-    /// A `Command` that runs the placed binary.
-    pub fn command(&self) -> Command {
-        dev_command(&self.path)
-    }
-}
-
-impl AsRef<Path> for CkdevBinary {
-    fn as_ref(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl AsRef<OsStr> for CkdevBinary {
-    fn as_ref(&self) -> &OsStr {
-        self.path.as_os_str()
-    }
-}
-
-impl Deref for CkdevBinary {
-    type Target = Path;
-
-    fn deref(&self) -> &Path {
-        &self.path
     }
 }
 
@@ -652,48 +734,100 @@ mod tests {
         .is_err());
     }
 
+    /// A publish root inside a test temp dir. Published directories are
+    /// sealed read-only, so the guard restores write permission before the
+    /// temp dir removes the tree.
+    #[cfg(unix)]
+    struct PublishRoot {
+        temp: TestTempDir,
+    }
+
+    #[cfg(unix)]
+    impl PublishRoot {
+        fn new(label: &str) -> Self {
+            let temp = TestTempDir::new(label);
+            fs::create_dir_all(temp.join("root")).unwrap();
+            Self { temp }
+        }
+
+        fn path(&self) -> PathBuf {
+            self.temp.join("root")
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for PublishRoot {
+        fn drop(&mut self) {
+            if let Ok(entries) = fs::read_dir(self.path()) {
+                for entry in entries.flatten() {
+                    remove_published(&entry.path());
+                }
+            }
+        }
+    }
+
     /// The guard wired through the helper: binaries built as `ck-subc` and `ck`
-    /// are placed under `ckdev-*` names, in a caller's scratch directory and in
-    /// one the placement owns, and the spawn helper runs them. If the helper
-    /// handed back the built path, `dev_command` would refuse it here.
+    /// are published under `ckdev-*` names and the spawn helper runs them. If
+    /// the helper handed back the built path, `dev_command` would refuse it
+    /// here.
     #[cfg(unix)]
     #[test]
     fn a_placed_production_binary_spawns_under_its_ckdev_name() {
         let build = TestTempDir::new("ckdev-guard-build");
-        let built = build.join("ck-subc");
-        write_script(&built, "#!/bin/sh\necho placed\n");
-        let scratch = TestTempDir::new("ckdev-guard-scratch");
-        let placed = ckdev_binary_in(&built, scratch.path());
-        let output = dev_command(&placed).output().unwrap();
-        assert_eq!(String::from_utf8_lossy(&output.stdout), "placed\n");
-        assert_eq!(placed.file_name().unwrap(), "ckdev-subc");
-        assert_eq!(placed.parent(), Some(scratch.path()));
-
-        // The owning form lives until dropped, then removes its scratch dir.
-        let built = build.join("ck");
-        write_script(&built, "#!/bin/sh\n");
-        let owned = CkdevBinary::new(&built);
-        let path = owned.path().to_path_buf();
-        assert!(owned.command().status().unwrap().success());
-        assert_eq!(path.file_name().unwrap(), "ckdev-ck");
-        drop(owned);
-        assert!(
-            !path.exists(),
-            "dropping the placement removes its scratch dir"
-        );
+        let root = PublishRoot::new("ckdev-guard-root");
+        for (name, published) in [("ck-subc", "ckdev-subc"), ("ck", "ckdev-ck")] {
+            let built = build.join(name);
+            write_script(&built, &format!("#!/bin/sh\necho {name}\n"));
+            let placed = ckdev_binary_at(&built, &root.path());
+            let output = dev_command(&placed).output().unwrap();
+            assert_eq!(String::from_utf8_lossy(&output.stdout), format!("{name}\n"));
+            assert_eq!(placed.file_name().unwrap(), published);
+            assert_eq!(
+                placed.parent().and_then(Path::parent),
+                Some(root.path().as_path())
+            );
+        }
     }
 
-    /// The placement is a copy: its own inode, the same bytes, the exec bit
-    /// kept, no staging file left behind, and reused on a second call.
+    /// Two requests for the same build, even from different build paths, get
+    /// the same published file; a changed binary gets a new one.
     #[cfg(unix)]
     #[test]
-    fn placement_is_a_copy_with_its_own_inode_and_the_exec_bit() {
+    fn the_same_build_shares_one_published_path_and_a_changed_build_gets_another() {
+        let first = TestTempDir::new("ckdev-address-first");
+        let second = TestTempDir::new("ckdev-address-second");
+        let root = PublishRoot::new("ckdev-address-root");
+        let (a, b) = (first.join("ck-subc"), second.join("ck-subc"));
+        write_script(&a, "#!/bin/sh\necho one\n");
+        write_script(&b, "#!/bin/sh\necho one\n");
+        let placed = ckdev_binary_at(&a, &root.path());
+        assert_eq!(ckdev_binary_at(&a, &root.path()), placed);
+        assert_eq!(ckdev_binary_at(&b, &root.path()), placed);
+
+        let changed = TestTempDir::new("ckdev-address-changed");
+        let c = changed.join("ck-subc");
+        write_script(&c, "#!/bin/sh\necho two\n");
+        let republished = ckdev_binary_at(&c, &root.path());
+        assert_ne!(republished, placed);
+        assert_eq!(republished.file_name(), placed.file_name());
+        let output = dev_command(&republished).output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "two\n");
+        // The first build is still published, unchanged.
+        let output = dev_command(&placed).output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "one\n");
+    }
+
+    /// The published file is a read-only copy in a read-only directory: its
+    /// own inode, the same bytes, executable, and no staging left behind.
+    #[cfg(unix)]
+    #[test]
+    fn a_published_binary_is_a_sealed_copy() {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
         let build = TestTempDir::new("ckdev-copy-build");
+        let root = PublishRoot::new("ckdev-copy-root");
         let built = build.join("ck-subc");
         write_script(&built, "#!/bin/sh\necho copied\n");
-        let scratch = TestTempDir::new("ckdev-copy-scratch");
-        let placed = ckdev_binary_in(&built, scratch.path());
+        let placed = ckdev_binary_at(&built, &root.path());
         let (source, copy) = (
             fs::metadata(&built).unwrap(),
             fs::metadata(&placed).unwrap(),
@@ -701,51 +835,67 @@ mod tests {
         assert_ne!(
             (source.dev(), source.ino()),
             (copy.dev(), copy.ino()),
-            "a placement must not share the built binary's inode"
+            "a published binary must not share the built binary's inode"
         );
         assert_eq!(fs::read(&built).unwrap(), fs::read(&placed).unwrap());
-        let mode = copy.permissions().mode();
-        assert_eq!(mode & 0o777, 0o755, "mode {mode:o}");
-        let output = dev_command(&placed).output().unwrap();
-        assert_eq!(String::from_utf8_lossy(&output.stdout), "copied\n");
-        assert_eq!(ckdev_binary_in(&built, scratch.path()), placed);
-        let leftovers: Vec<_> = fs::read_dir(scratch.path())
+        assert_eq!(copy.permissions().mode() & 0o777, 0o555);
+        let dir = placed.parent().unwrap();
+        assert_eq!(
+            fs::metadata(dir).unwrap().permissions().mode() & 0o777,
+            0o555
+        );
+        assert!(
+            fs::OpenOptions::new().write(true).open(&placed).is_err(),
+            "a published binary must not be writable"
+        );
+        let entries: Vec<_> = fs::read_dir(root.path())
             .unwrap()
             .map(|entry| entry.unwrap().file_name())
             .collect();
-        assert_eq!(leftovers, [OsStr::new("ckdev-subc")]);
+        assert_eq!(entries, [dir.file_name().unwrap()]);
     }
 
+    /// A published file that no longer matches its address is refused, not
+    /// run, and so is a publish root other users can write.
     #[cfg(unix)]
     #[test]
-    fn the_shared_placement_is_reused_and_ended_processes_dirs_are_removed() {
-        let build = TestTempDir::new("ckdev-shared-build");
-        let built = build.join("ck-under-test");
-        write_script(&built, "#!/bin/sh\n");
-        let placed = ckdev_binary_shared(&built);
-        assert_eq!(ckdev_binary_shared(&built), placed);
-        assert_eq!(
-            placed.parent().and_then(Path::file_name).unwrap(),
-            OsStr::new(&format!("{SHARED_PREFIX}{}", std::process::id()))
+    fn altered_publications_and_shared_roots_are_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let build = TestTempDir::new("ckdev-refuse-build");
+        let root = PublishRoot::new("ckdev-refuse-root");
+        let built = build.join("ck-bus");
+        write_script(&built, "#!/bin/sh\necho genuine\n");
+        let placed = ckdev_binary_at(&built, &root.path());
+        let dir = placed.parent().unwrap().to_path_buf();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&placed, fs::Permissions::from_mode(0o755)).unwrap();
+        let altered = build.join("altered");
+        write_script(&altered, "#!/bin/sh\necho planted\n");
+        fs::remove_file(&placed).unwrap();
+        copy_executable(&altered, &placed).unwrap();
+        // A fresh process would hash it anew; drop this one's memo too.
+        digest_cache().lock().unwrap().clear();
+        let error = publish(&built, "ckdev-bus", &root.path()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("does not match its content address"),
+            "{error}"
         );
 
-        let parent = TestTempDir::new("ckdev-shared-sweep");
-        let ended = parent.join(format!("{SHARED_PREFIX}{}", i32::MAX - 1));
-        let own = parent.join(format!("{SHARED_PREFIX}{}", std::process::id()));
-        let unrelated = parent.join("ckdev-shared-not-a-pid");
-        for dir in [&ended, &own, &unrelated] {
-            fs::create_dir_all(dir).unwrap();
-        }
-        remove_ended_shared_dirs(&parent);
-        assert!(!ended.exists(), "an ended process's directory is removed");
-        assert!(own.exists() && unrelated.exists());
+        let open = PublishRoot::new("ckdev-open-root");
+        fs::set_permissions(open.path(), fs::Permissions::from_mode(0o777)).unwrap();
+        let error = publish(&built, "ckdev-bus", &open.path()).unwrap_err();
+        assert!(
+            error.to_string().contains("writable by no one else"),
+            "{error}"
+        );
     }
 
     #[test]
     fn an_already_ckdev_binary_is_returned_unchanged() {
         let built = Path::new("/nonexistent/ckdev-subc");
-        let scratch = TestTempDir::new("ckdev-unchanged");
-        assert_eq!(ckdev_binary_in(built, scratch.path()), built);
+        assert_eq!(ckdev_binary(built), built);
     }
 
     /// Writes through a staging file and a `cp` child, so this multi-threaded

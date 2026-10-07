@@ -53,10 +53,7 @@ struct Output {
 fn ck_bus(args: &[&str]) -> Output {
     let homes = tempfile::tempdir().unwrap();
     // Run as `ckdev-bus`, never under the production `ck-bus` name.
-    let binary = subc_test_support::ckdev_binary_in(
-        env!("CARGO_BIN_EXE_ck-bus"),
-        homes.path().join("ckdev-bin"),
-    );
+    let binary = subc_test_support::ckdev_binary(env!("CARGO_BIN_EXE_ck-bus"));
     let output = subc_test_support::dev_command(binary)
         .args(args)
         .env_remove("SUBC_MODULE_ID")

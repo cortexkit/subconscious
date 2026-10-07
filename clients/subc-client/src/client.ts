@@ -26,6 +26,7 @@ import {
   type Frame,
 } from "./envelope.js";
 import { launchNonceOrUndefined } from "./launch-nonce.js";
+import type { Principal } from "./provider.js";
 import {
   belongsToConnection,
   createRouteHandle,
@@ -118,7 +119,19 @@ export interface ConsumerIdentity {
   launch_nonce: string;
 }
 
+/** A scope selector; scopeEpoch is required even for the scope's owner. */
+export interface RouteScope {
+  /** Owner principal, passed verbatim. The daemon decides which principal kinds may own scopes. */
+  owner: Principal;
+  /** Opaque, non-empty ref within the owner. */
+  ref: string;
+  /** Safe non-negative integer, including zero; serialized as scope_epoch. */
+  scopeEpoch: number;
+}
+
 export interface RouteOpenOptions {
+  /** Open under this scope. The caller must be its owner or a listed carrier; use a daemon advertising scopes/v1. Serialized as { owner, ref, scope_epoch }. */
+  scope?: RouteScope;
   /** Optional override for the consumer identity; by default the SUBC_MODULE_ID environment variable and the process's launch nonce (see `launchNonce`) are used when both are non-empty; a refused launch-nonce descriptor counts as no nonce. Set null to send route.open without consumer_identity. */
   consumerIdentity?: ConsumerIdentity | null;
   /**
@@ -202,6 +215,8 @@ export interface RequestOptions {
 }
 
 export interface ManagedCallOptions extends RequestOptions {
+  /** Scope for the cached route and its reconnect reopens. The caller must be the scope's owner or a listed carrier; use a daemon advertising scopes/v1. Each owner/ref/epoch has a separate cache entry. */
+  scope?: RouteScope;
   /** Overrides the per-client identity used for route.open before this call. */
   identity?: BindIdentity;
   /** Defaults to management_surface, matching the store/host management APIs. */
@@ -236,6 +251,8 @@ export interface CloseRouteOptions {
 }
 
 export interface ManagedCloseRouteOptions extends CloseRouteOptions {
+  /** Scope selector used by the cached managed route; omitted selects only an unscoped route. */
+  scope?: RouteScope;
   /** Consumer identity used by the cached managed route. */
   consumerIdentity?: ConsumerIdentity | null;
   /** The registry whose derived capability set identifies the cached route. */
@@ -597,6 +614,9 @@ interface CachedRoute {
   moduleId: string;
   target: Extract<RouteTarget, { kind: ManagedRouteKind }>;
   identity: BindIdentity;
+  scope?: RouteScope;
+  /** A terminal daemon close must survive connection replacement, not become a reopen. */
+  endReason?: RouteCloseReason;
   consumerIdentity?: ConsumerIdentity;
   reverseRequests: ReverseRequestRegistry;
   handle: RouteHandle | null;
@@ -708,12 +728,14 @@ export class SubcClient {
    * Open a route and return its connection-bound immutable handle. At most
    * MAX_ROUTE_OPENS_IN_FLIGHT opens are outstanding at once; further calls wait
    * their turn.
+   * A scoped open requires the caller to be the scope's owner or a listed carrier.
    */
   async routeOpen(target: RouteTarget, identity: BindIdentity, opts: RouteOpenOptions = {}): Promise<RouteHandle> {
+    const scope = validatedRouteScope(opts.scope);
     // Without a timeout the gate always grants a slot eventually.
     const release = (await this.routeOpenGate.acquire())!;
     try {
-      return await this.sendRouteOpen(target, identity, opts);
+      return await this.sendRouteOpen(target, identity, { ...opts, scope });
     } finally {
       release();
     }
@@ -725,6 +747,7 @@ export class SubcClient {
     identity: BindIdentity,
     opts: RouteOpenOptions = {},
   ): Promise<RouteHandle> {
+    const scope = validatedRouteScope(opts.scope);
     const consumerIdentity = routeOpenConsumerIdentity(opts);
     const reverseRequests = opts.reverseRequests ?? new ReverseRequestRegistry();
     reverseRequests.seal();
@@ -735,6 +758,7 @@ export class SubcClient {
       identity,
       ...(consumerIdentity ? { consumer_identity: consumerIdentity } : {}),
       ...(consumerCapabilities.length > 0 ? { consumer_capabilities: consumerCapabilities } : {}),
+      ...(scope ? { scope: { owner: scope.owner, ref: scope.ref, scope_epoch: scope.scopeEpoch } } : {}),
     });
 
     let installed: RouteHandle | null = null;
@@ -792,6 +816,8 @@ export class SubcClient {
   /**
    * Managed route + request convenience. Opens and caches a route for the module,
    * reconnecting and re-opening cached routes after connection drops.
+   * Scoped routes are isolated by owner/ref/epoch and require owner or carrier authority.
+   * Terminal scope close reasons prevent automatic reopens under the same selector.
    */
   async call<Response = unknown>(
     moduleId: string,
@@ -1056,6 +1082,7 @@ export class SubcClient {
       identity,
       routeOpenConsumerIdentity(opts),
       (opts.reverseRequests ?? new ReverseRequestRegistry()).capabilities(),
+      validatedRouteScope(opts.scope),
     );
     const cached = this.routes.get(key);
     if (!cached) return;
@@ -1328,6 +1355,7 @@ export class SubcClient {
   }
 
   private async cachedRouteHandle(moduleId: string, opts: ManagedCallOptions): Promise<RouteHandle> {
+    const scope = validatedRouteScope(opts.scope);
     const identity = opts.identity ?? this.opts.identity;
     if (!identity) {
       throw new SubcCallError(
@@ -1343,7 +1371,7 @@ export class SubcClient {
     const consumerIdentity = routeOpenConsumerIdentity(opts);
     const reverseRequests = opts.reverseRequests ?? new ReverseRequestRegistry();
     reverseRequests.seal();
-    const key = routeCacheKey(target, identity, consumerIdentity, reverseRequests.capabilities());
+    const key = routeCacheKey(target, identity, consumerIdentity, reverseRequests.capabilities(), scope);
     let cached = this.routes.get(key);
     if (!cached) {
       cached = {
@@ -1351,6 +1379,7 @@ export class SubcClient {
         moduleId,
         target,
         identity,
+        scope,
         consumerIdentity,
         reverseRequests,
         handle: null,
@@ -1358,6 +1387,7 @@ export class SubcClient {
       };
       this.routes.set(key, cached);
     }
+    if (cached.endReason !== undefined) throw this.endedCachedRoute(cached.endReason);
     if (cached.handle && this.isLiveHandle(cached.handle)) return cached.handle;
     // The retries end at the retry deadline or at the call's own timeoutMs,
     // whichever comes first. Without timeoutMs the call has no overall deadline
@@ -1403,6 +1433,7 @@ export class SubcClient {
     const refusals = new RouteOpenRefusals();
     for (;;) {
       if (cached.closed) throw this.routeClosedDuringOpen();
+      if (cached.endReason !== undefined) throw this.endedCachedRoute(cached.endReason);
       try {
         await this.ensureConnectedForManaged();
       } catch (error) {
@@ -1417,6 +1448,7 @@ export class SubcClient {
       try {
         outcome = {
           handle: await this.sendRouteOpen(cached.target, cached.identity, {
+            scope: cached.scope,
             consumerIdentity: cached.consumerIdentity ?? null,
             reverseRequests: cached.reverseRequests,
           }),
@@ -1675,9 +1707,10 @@ export class SubcClient {
     }
     for (const key of routeKeys) {
       const cached = this.routes.get(key);
-      if (!cached || cached.closed) continue;
+      if (!cached || cached.closed || cached.endReason !== undefined) continue;
       try {
         const handle = await this.routeOpen(cached.target, cached.identity, {
+          scope: cached.scope,
           consumerIdentity: cached.consumerIdentity ?? null,
           reverseRequests: cached.reverseRequests,
         });
@@ -1710,6 +1743,11 @@ export class SubcClient {
   private routeClosedDuringOpen(): SubcCallError {
     const cause = new SubcError("route was closed before route.open completed", "route_closed", undefined, "closed_by_caller");
     return new SubcCallError("not_sent", cause.message, cause.code, cause);
+  }
+
+  private endedCachedRoute(reason: RouteCloseReason): SubcCallError {
+    const cause = new SubcError(`cached route closed by subc (${reason}); must not reopen`, "route_closed", undefined, reason);
+    return this.terminalCallError(cause.message, cause);
   }
 
   private async readLoop(sock: SubcSocket, generation: number): Promise<void> {
@@ -1851,6 +1889,7 @@ export class SubcClient {
       // drop, and never the not_sent/unknown_channel class that call() retries.
       // The code says WHICH route ended, not that it is safe to send again.
       this.failHandle(handle, new SubcError("route closed by subc (GOODBYE)", "route_closed", undefined, this.routeEndReason(handle.channel)));
+      this.preventRouteReopen(handle.channel, this.routeEndReason(handle.channel));
       if (this.liveRoutes.get(handle.channel) === handle) this.liveRoutes.delete(handle.channel);
       this.evictRouteHandle(handle);
       return;
@@ -2027,17 +2066,28 @@ export class SubcClient {
           const final = push.op === "route.closed";
           if (final || !this.routeEndReasons.get(channel)?.final) {
             this.routeEndReasons.set(channel, { reason, final });
+            if (final) this.preventRouteReopen(channel, reason);
           }
         }
       }
     } else if (typeof push.body.module_id === "string") {
       for (const [channel, module] of this.routeModules) {
-        if (module === push.body.module_id) this.legacyChannelReasons.set(channel, reason);
+        if (module === push.body.module_id) {
+          this.legacyChannelReasons.set(channel, reason);
+          if (push.op === "route.closed") this.preventRouteReopen(channel, reason);
+        }
       }
     }
   }
 
-  private routeEndReason(channel: number): RouteEndReason {
+  private preventRouteReopen(channel: number, reason: RouteCloseReason): void {
+    if (classifyRouteCloseReason(reason) !== "must_not_reopen") return;
+    for (const cached of this.routes.values()) {
+      if (cached.handle?.channel === channel) cached.endReason = reason;
+    }
+  }
+
+  private routeEndReason(channel: number): RouteCloseReason {
     const specific = this.routeEndReasons.get(channel);
     if (specific) return specific.reason;
     return this.legacyChannelReasons.get(channel) ?? "unknown";
@@ -2322,12 +2372,37 @@ function routeCacheKey(
   identity: BindIdentity,
   consumerIdentity: ConsumerIdentity | undefined,
   consumerCapabilities: readonly string[],
+  scope?: RouteScope,
 ): string {
   const consumerPart = consumerIdentity
     ? `${consumerIdentity.module_id}\0${consumerIdentity.launch_nonce}`
     : "";
   const capabilitiesPart = [...consumerCapabilities].sort().join("\0");
-  return `${target.kind}\0${target.module_id}\0${identity.project_root}\0${identity.harness}\0${identity.session}\0${consumerPart}\0${capabilitiesPart}`;
+  // A JSON tuple keeps opaque refs (including embedded separators) distinct.
+  const scopePart = scope
+    ? JSON.stringify([scope.owner.kind, scope.owner.kind === "reserved" ? scope.owner.module_id : null, scope.ref, scope.scopeEpoch])
+    : "";
+  return `${target.kind}\0${target.module_id}\0${identity.project_root}\0${identity.harness}\0${identity.session}\0${consumerPart}\0${capabilitiesPart}\0${scopePart}`;
+}
+
+/** Validate before any route-open I/O, and snapshot caller-owned mutable values for reopens. */
+function validatedRouteScope(scope: RouteScope | undefined): RouteScope | undefined {
+  if (scope === undefined) return undefined;
+  if (!scope || typeof scope.owner !== "object" || !scope.owner ||
+      !["reserved", "direct", "unverified"].includes(scope.owner.kind) ||
+      (scope.owner.kind === "reserved" && (typeof scope.owner.module_id !== "string" || scope.owner.module_id.length === 0))) {
+    throw new SubcError("scope.owner must be a Principal with a non-empty reserved module_id", "invalid_scope");
+  }
+  if (typeof scope.ref !== "string" || scope.ref.length === 0) {
+    throw new SubcError("scope.ref must be a non-empty string", "invalid_scope");
+  }
+  if (scope.scopeEpoch === undefined) {
+    throw new SubcError("scope.scopeEpoch is required", "scope_epoch_required");
+  }
+  if (!Number.isSafeInteger(scope.scopeEpoch) || scope.scopeEpoch < 0) {
+    throw new SubcError("scope.scopeEpoch must be a safe non-negative integer", "invalid_scope");
+  }
+  return { owner: { ...scope.owner }, ref: scope.ref, scopeEpoch: scope.scopeEpoch };
 }
 
 function routeOpenConsumerIdentity(opts: RouteOpenOptions = {}): ConsumerIdentity | undefined {

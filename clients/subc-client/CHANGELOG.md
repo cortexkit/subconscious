@@ -4,6 +4,13 @@
 
 - Classify `target_flow_unsupported` as a terminal route-open refusal, matching the golden decision table in subc-protocol 0.29.1. A target must declare `flow-scopes/v1` before it may receive a flow-scoped route.
 
+## 0.21.0
+
+- Add optional `scope: { owner: Principal, ref: string, scopeEpoch: number }` to direct route opens, managed calls (including binary calls), and managed closes. The selector is sent as `scope: { owner, ref, scope_epoch }`, matching the Rust protocol. Owner and ref are validated locally, and a missing, negative, fractional or unsafe epoch is refused before sending.
+- Isolate managed route cache entries by the entire scope selector, apart from unscoped routes. Reconnect reopens retain the selector but never reuse a handle from an earlier connection or daemon incarnation.
+- Preserve deadline-bounded retries for `scope_not_synced` and `scope_changed`. Terminal lifecycle close reasons, including scope revocation, prevent automatic managed reopens under the same selector; restart and reload still allow them.
+- Scoped opens require the caller to be the scope's owner or a listed carrier. The normal owner form is a reserved principal; the daemon refuses other owner kinds.
+
 ## 0.20.1
 
 - Queue unary and managed REQUEST frames before attaching cancellation signals so an already-aborted signal cannot send CANCEL before its REQUEST.

@@ -141,6 +141,66 @@ test("reused channel does not inherit its previous close reason", async () => {
   } finally { client.close(); }
 });
 
+for (const reason of ["scope_ended", "scope_carrier_removed", "scope_delegation_changed", "scope_parent_ended"]) {
+  test(`${reason} does not reopen a scoped managed route, including after reconnect`, async () => {
+    const { client, daemon } = await connectClient();
+    const scope = { owner: { kind: "reserved", module_id: "owner" } as const, ref: "session", scopeEpoch: 1 };
+    try {
+      daemon.state.holdRequests = true;
+      const pending = client.call("aft", "hold", {}, { scope }).catch((err: unknown) => err);
+      await waitFor(() => daemon.state.dataRequests === 1, "scoped request received");
+      const channel = daemon.state.openedChannels[0]!;
+      await daemon.send(lifecyclePush(reason, [channel]));
+      await daemon.send(goodbye(channel));
+      expect(await pending).toMatchObject({ code: "route_closed", closeReason: reason, kind: "outcome_unknown" });
+      await expect(client.call("aft", "echo", {}, { scope })).rejects.toMatchObject({ code: "route_closed", closeReason: reason, kind: "terminal" });
+      expect(daemon.state.routeOpens).toBe(1);
+      daemon.state.holdRequests = false;
+      // An unscoped call is unaffected, and triggers a real reconnect after EOF.
+      const internals = client as unknown as { sock: { close(): void }; closedErr: Error | null };
+      internals.sock.close();
+      await waitFor(() => internals.closedErr !== null, "client observes connection loss");
+      await client.call("aft", "echo", {});
+      expect(daemon.state.routeOpens).toBe(2);
+      await expect(client.call("aft", "echo", {}, { scope })).rejects.toMatchObject({ closeReason: reason });
+      expect(daemon.state.routeOpens).toBe(2);
+    } finally { client.close(); }
+  });
+}
+
+test("restart close still permits a scoped managed reopen", async () => {
+  const { client, daemon } = await connectClient();
+  const scope = { owner: { kind: "reserved", module_id: "owner" } as const, ref: "session", scopeEpoch: 1 };
+  try {
+    daemon.state.holdRequests = true;
+    const pending = client.call("aft", "hold", {}, { scope }).catch((err: unknown) => err);
+    await waitFor(() => daemon.state.dataRequests === 1, "scoped request received");
+    const channel = daemon.state.openedChannels[0]!;
+    await daemon.send(lifecyclePush("restart", [channel]));
+    await daemon.send(goodbye(channel));
+    expect(await pending).toMatchObject({ closeReason: "restart" });
+    daemon.state.holdRequests = false;
+    await expect(client.call("aft", "echo", {}, { scope })).resolves.toEqual({ method: "echo", params: {} });
+    expect(daemon.state.routeOpens).toBe(2);
+  } finally { client.close(); }
+});
+
+test("closeManagedRoute selects only the scoped identity tuple", async () => {
+  const { client, daemon } = await connectClient();
+  const scope = { owner: { kind: "reserved", module_id: "owner" } as const, ref: "session", scopeEpoch: 1 };
+  try {
+    await client.call("managed-provider", "echo", {});
+    await client.call("managed-provider", "echo", {}, { scope });
+    await client.closeManagedRoute(MGMT_TARGET, IDENTITY, { scope });
+    await waitFor(() => daemon.state.goodbyeChannels.length === 1, "scoped close received");
+    expect(daemon.state.goodbyeChannels).toEqual([daemon.state.openedChannels[1]!]);
+    await client.call("managed-provider", "echo", {});
+    expect(daemon.state.routeOpens).toBe(2);
+    await client.call("managed-provider", "echo", {}, { scope });
+    expect(daemon.state.routeOpens).toBe(3);
+  } finally { client.close(); }
+});
+
 test("caller close and connection loss have SDK-side close reasons", async () => {
   for (const local of [true, false]) {
     const { client, daemon } = await connectClient();

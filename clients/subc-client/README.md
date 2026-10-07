@@ -78,6 +78,45 @@ fails loud with an `AuthError` rather than connecting insecurely.
 - **Connection-file security.** On unix the file must be owner-only (`0600`); a
   group/world-readable file is rejected, because the key has effectively leaked.
 
+### Scoped routes
+
+Use a daemon advertising `scopes/v1` and pass a selector to `routeOpen()` or to
+managed `call()` / `callBinary()` options:
+
+```ts
+const scope = {
+  owner: { kind: "reserved", module_id: "session-owner" } as const,
+  ref: "session-1",
+  scopeEpoch: 1,
+};
+const route = await client.routeOpen(target, identity, { scope });
+await client.call("provider", "echo", {}, { scope });
+// Close only this scoped managed route, not the unscoped or another scope's route.
+await client.closeManagedRoute(target, identity, { scope });
+```
+
+The caller's attested principal must be the scope's owner or a listed carrier.
+Passing `scope` does not grant that authority: use the supervised caller's
+`consumerIdentity` (or its default environment identity) as usual. `owner` uses
+the existing `Principal` type; the reserved form above is the normal case, and
+the daemon refuses other owner kinds.
+
+The exact wire selector is
+`scope: { owner: { kind: "reserved", module_id: "session-owner" }, ref: "session-1", scope_epoch: 1 }`.
+With no selector, there is no `scope` key. A reserved owner's module id and the
+ref must be non-empty strings, and `scopeEpoch` must be present and a safe
+non-negative integer (zero is valid); invalid selectors fail locally before I/O.
+
+Managed routes are cached separately by target, bind and consumer identities,
+reverse capabilities, and the whole scope selector (owner, ref, epoch). Scoped
+and unscoped calls never share a route, nor do different scopes or daemon
+incarnations. Reconnect opens a fresh handle under the same selector.
+`scope_not_synced` and `scope_changed` refusals retain the managed path's retries
+within the caller's deadline. A scope-revocation close (such as `scope_ended` or
+`scope_carrier_removed`) is terminal: neither a later managed call nor a
+reconnect automatically reopens that cache entry. Use a new selector for a new
+session; reload and restart close reasons still permit reopens.
+
 ### Launch nonce
 
 A module the daemon spawns proves who it is with a launch nonce. On macOS and
@@ -115,7 +154,9 @@ the environment copy. The environment copy is read only when
 ## Testing
 
 ```sh
-bun test          # 75 unit/mock tests + 17 RUN_SUBC_LIVE-gated tests
+bun run typecheck
+bun test          # unit/mock suite; live tests are gated by RUN_SUBC_LIVE=1
+RUN_SUBC_LIVE=1 bun test tests/live-scoped-open.test.ts
 ```
 
 The live-handshake tests boot the real daemon binary
@@ -123,6 +164,12 @@ The live-handshake tests boot the real daemon binary
 byte-identity authority for this client. They skip automatically when the binary
 is not built; run `cargo build -p subc-core` first (the CI lane does this; the
 package builds the `ck-subc` executable).
+
+The scope admission test uses the same supervised `fake-aft-stub` fixture as the
+Rust SDK (built by `cargo build -p subc-core --bins`) to sync an owner's scope and
+observe the real provider bind. Live helpers hard-link the daemon as
+`ckdev-subc` inside the scratch runtime directory before spawning it, and isolate
+all three XDG homes so tests cannot reach the operator's daemon data or config.
 
 ## Layout
 

@@ -23,6 +23,7 @@ import {
   type BindIdentity,
   type CatalogEntry,
   type Frame,
+  type RouteScope,
 } from "../src/index.js";
 
 const KEY = Uint8Array.from(Array(32).fill(0x4c));
@@ -44,6 +45,7 @@ interface FakeStats {
   // The consumer_identity sent on each route.open, in order (undefined when absent),
   // so a test can assert the principal survives a reconnect reopen.
   routeOpenConsumerIdentities: (unknown | undefined)[];
+  routeOpenBodies: Buffer[];
   // Count of accepted TCP connections — a test asserts a healthy-socket deadline
   // does NOT trigger a reconnect (count stays 1).
   connections: number;
@@ -55,6 +57,7 @@ interface FakeDaemonOptions {
   // Daemon-side HMAC key — a daemon started with a different key models the
   // key rotation that happens on every real daemon restart.
   key?: Uint8Array;
+  daemonId?: Uint8Array;
   // "delay-body": reply with the frame HEADER immediately, then the body after
   //   `delayBodyMs` — so the client's read loop is mid-frame (bytes present) when a
   //   short request deadline fires, deterministically exercising timeout arbitration.
@@ -123,6 +126,7 @@ function newStats(): FakeStats {
     reverseReplies: [],
     requestFrames: [],
     routeOpenConsumerIdentities: [],
+    routeOpenBodies: [],
     connections: 0,
     closedConnections: 0,
   };
@@ -1380,6 +1384,178 @@ describe("managed route.open across a module restart", () => {
   });
 });
 
+describe("scoped route opens", () => {
+  const scope: RouteScope = { owner: { kind: "reserved", module_id: "session-owner" }, ref: "session-α", scopeEpoch: 7 };
+
+  test("scope selector is sent byte-for-byte on direct and managed opens", async () => {
+    const { connFile } = tempConnectionFile();
+    const stats = newStats();
+    const daemon = await startFakeDaemon({ stats });
+    writeConnectionFile(connFile, daemon.port);
+    const client = await SubcClient.connect({ connectionFile: connFile, identity: IDENTITY });
+    try {
+      const target = { kind: "management_surface", module_id: "scoped-provider" } as const;
+      await client.routeOpen(target, IDENTITY, { scope, consumerIdentity: null });
+      await client.call(target.module_id, "echo", {}, { scope, consumerIdentity: null });
+      const expected = Buffer.from('{"op":"route.open","target":{"kind":"management_surface","module_id":"scoped-provider"},"identity":{"project_root":"/tmp/subc-client-test","harness":"bun","session":"managed"},"scope":{"owner":{"kind":"reserved","module_id":"session-owner"},"ref":"session-α","scope_epoch":7}}', "utf8");
+      expect(stats.routeOpenBodies).toEqual([expected, expected]);
+    } finally { client.close(); }
+  });
+
+  test("unscoped direct and managed opens omit the scope key", async () => {
+    const { connFile } = tempConnectionFile();
+    const stats = newStats();
+    const daemon = await startFakeDaemon({ stats });
+    writeConnectionFile(connFile, daemon.port);
+    const client = await SubcClient.connect({ connectionFile: connFile, identity: IDENTITY });
+    try {
+      await client.routeOpen({ kind: "management_surface", module_id: "plain" }, IDENTITY, { consumerIdentity: null });
+      await client.call("plain", "echo", {}, { consumerIdentity: null });
+      expect(stats.routeOpenBodies).toHaveLength(2);
+      for (const body of stats.routeOpenBodies) expect(Object.hasOwn(JSON.parse(body.toString()), "scope")).toBe(false);
+    } finally { client.close(); }
+  });
+
+  test("cached routes isolate owner ref and epoch from each other and from unscoped", async () => {
+    const { connFile } = tempConnectionFile();
+    const stats = newStats();
+    const daemon = await startFakeDaemon({ stats });
+    writeConnectionFile(connFile, daemon.port);
+    const client = await SubcClient.connect({ connectionFile: connFile, identity: IDENTITY });
+    try {
+      const selectors = [
+        scope,
+        { ...scope, owner: { kind: "reserved", module_id: "other-owner" } as const },
+        { ...scope, ref: "other-session" },
+        { ...scope, scopeEpoch: 8 },
+        undefined,
+      ];
+      for (const selector of selectors) {
+        // Overlapping calls for the same tuple must still share one pending open.
+        await Promise.all([1, 2].map(() => client.call("pooled", "echo", {}, { scope: selector, consumerIdentity: null })));
+      }
+      expect(stats.routeOpens).toBe(5);
+      const channels = stats.requestFrames.filter((frame) => frame.channel !== 0).map((frame) => frame.channel);
+      expect(channels).toHaveLength(10);
+      expect(new Set(channels).size).toBe(5);
+      for (let i = 0; i < channels.length; i += 2) expect(channels[i]).toBe(channels[i + 1]);
+      // A fresh object with the same selector must find its existing route.
+      await client.call("pooled", "echo", {}, { scope: { ...scope, owner: { ...scope.owner } }, consumerIdentity: null });
+      expect(stats.routeOpens).toBe(5);
+    } finally { client.close(); }
+  });
+
+  test("invalid scope selectors and missing epochs are refused locally", async () => {
+    const { connFile } = tempConnectionFile();
+    const stats = newStats();
+    const daemon = await startFakeDaemon({ stats });
+    writeConnectionFile(connFile, daemon.port);
+    const client = await SubcClient.connect({ connectionFile: connFile, identity: IDENTITY });
+    try {
+      const invalid: unknown[] = [
+        { owner: scope.owner, ref: scope.ref },
+        ...[-1, 0.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1, null, "7"].map((scopeEpoch) => ({ ...scope, scopeEpoch })),
+        { ...scope, owner: { kind: "reserved", module_id: "" } },
+        { ...scope, owner: "" },
+        { ...scope, owner: null },
+        { ...scope, ref: "" },
+        { ...scope, ref: 123 },
+      ];
+      for (const selector of invalid) {
+        const code = (selector as { scopeEpoch?: unknown }).scopeEpoch === undefined ? "scope_epoch_required" : "invalid_scope";
+        const opts = { scope: selector as RouteScope, consumerIdentity: null };
+        await expect(client.routeOpen({ kind: "management_surface", module_id: "invalid" }, IDENTITY, opts)).rejects.toMatchObject({ code });
+        await expect(client.call("invalid", "echo", {}, opts)).rejects.toMatchObject({ code });
+        await expect(client.callBinary("invalid", new Uint8Array(), opts)).rejects.toMatchObject({ code });
+      }
+      expect(stats.routeOpens).toBe(0);
+      expect(stats.dataRequests).toBe(0);
+      expect(stats.requestFrames).toHaveLength(0);
+      for (const scopeEpoch of [0, Number.MAX_SAFE_INTEGER]) {
+        await client.routeOpen({ kind: "management_surface", module_id: "valid" }, IDENTITY, { scope: { ...scope, scopeEpoch }, consumerIdentity: null });
+      }
+      expect(stats.routeOpens).toBe(2);
+      expect(stats.routeOpenBodies.map((body) => JSON.parse(body.toString()).scope.scope_epoch)).toEqual([0, Number.MAX_SAFE_INTEGER]);
+    } finally { client.close(); }
+  });
+
+  test("non-reserved owner principals reach the daemon unchanged for policy refusal", async () => {
+    const { connFile } = tempConnectionFile();
+    const stats = newStats();
+    const daemon = await startFakeDaemon({ stats, routeOpenError: { code: "scope_not_live", message: "owner owns no scopes" } });
+    writeConnectionFile(connFile, daemon.port);
+    const client = await SubcClient.connect({ connectionFile: connFile, identity: IDENTITY });
+    try {
+      for (const kind of ["direct", "unverified"] as const) {
+        await expect(client.call("policy", "echo", {}, { scope: { ...scope, owner: { kind } }, consumerIdentity: null })).rejects.toMatchObject({ code: "scope_not_live", kind: "terminal" });
+      }
+      expect(stats.routeOpenBodies.map((body) => JSON.parse(body.toString()).scope.owner)).toEqual([{ kind: "direct" }, { kind: "unverified" }]);
+    } finally { client.close(); }
+  });
+
+  test("cached scopes are snapshotted and reopened on a new daemon incarnation", async () => {
+    const { connFile } = tempConnectionFile();
+    const firstStats = newStats();
+    const first = await startFakeDaemon({ stats: firstStats, closeAfterDataResponses: 1 });
+    writeConnectionFile(connFile, first.port);
+    const client = await SubcClient.connect({ connectionFile: connFile, identity: IDENTITY, reconnectBackoff: BACKOFF, sleep: async () => {} });
+    const original: RouteScope = { ...scope, owner: { ...scope.owner } };
+    const mutable: RouteScope = { ...original, owner: { ...original.owner } };
+    try {
+      await client.call("reconnect", "echo", {}, { scope: mutable, consumerIdentity: null });
+      await waitFor(() => clientClosedErr(client) !== null, "client observes daemon close");
+      await first.stop();
+      mutable.ref = "changed-by-caller";
+      mutable.scopeEpoch = 99;
+      if (mutable.owner.kind === "reserved") mutable.owner.module_id = "changed-owner";
+      const secondStats = newStats();
+      const daemonId = Uint8Array.from(Array(16).fill(0x55));
+      const second = await startFakeDaemon({ stats: secondStats, daemonId });
+      writeConnectionFile(connFile, second.port, KEY, daemonId);
+      await client.call("reconnect", "echo", {}, { scope: original, consumerIdentity: null });
+      expect(client.conn.daemonId).toEqual(daemonId);
+      expect(firstStats.routeOpens).toBe(1);
+      expect(secondStats.routeOpens).toBe(1);
+      expect(secondStats.dataRequests).toBe(1);
+      // The fake deliberately reuses the channel: a new route.open, not its number,
+      // is the evidence that the earlier incarnation's handle was not shared.
+      expect(secondStats.routeOpenBodies).toEqual(firstStats.routeOpenBodies);
+    } finally { client.close(); }
+  });
+
+  for (const code of ["scope_not_synced", "scope_changed"]) {
+    test(`${code} retries the same scoped selector within the caller deadline`, async () => {
+      const { connFile } = tempConnectionFile();
+      const stats = newStats();
+      const daemon = await startFakeDaemon({ stats, routeOpenFailFirst: { count: 2, code, message: "retry scope" } });
+      writeConnectionFile(connFile, daemon.port);
+      const client = await SubcClient.connect({ connectionFile: connFile, identity: IDENTITY, reconnectBackoff: BACKOFF });
+      try {
+        await expect(client.call("retry", "echo", {}, { scope, consumerIdentity: null, timeoutMs: 500 })).resolves.toEqual({ method: "echo", params: {} });
+        expect(stats.routeOpens).toBe(3);
+        expect(stats.routeOpenBodies[1]).toEqual(stats.routeOpenBodies[0]);
+        expect(stats.routeOpenBodies[2]).toEqual(stats.routeOpenBodies[0]);
+      } finally { client.close(); }
+    });
+
+    test(`${code} stops scoped retries at the caller deadline`, async () => {
+      const { connFile } = tempConnectionFile();
+      const stats = newStats();
+      const daemon = await startFakeDaemon({ stats, routeOpenError: { code, message: "retry scope" } });
+      writeConnectionFile(connFile, daemon.port);
+      const clock = { now: 0 };
+      const client = await SubcClient.connect({ connectionFile: connFile, identity: IDENTITY, reconnectBackoff: BACKOFF,
+        now: () => clock.now, random: () => 1, sleep: async (ms) => { clock.now += ms; } });
+      try {
+        await expect(client.call("retry", "echo", {}, { scope, consumerIdentity: null, timeoutMs: 20 })).rejects.toMatchObject({ code, kind: "not_sent" });
+        expect(clock.now).toBe(20);
+        expect(stats.routeOpens).toBeGreaterThan(1);
+        expect(stats.dataRequests).toBe(0);
+      } finally { client.close(); }
+    });
+  }
+});
+
 async function startFakeDaemon(options: FakeDaemonOptions): Promise<FakeDaemon> {
   const sockets = new Set<Socket>();
   const server = createServer((socket) => {
@@ -1414,7 +1590,7 @@ async function handleFakeConnection(socket: Socket, options: FakeDaemonOptions):
   const connectionNumber = options.stats.connections;
   const reader = new SocketReader(socket);
   const deadline = Date.now() + 5_000;
-  await authenticateFakeServer(reader, socket, deadline, options.key ?? KEY);
+  await authenticateFakeServer(reader, socket, deadline, options.key ?? KEY, options.daemonId ?? DAEMON_ID);
   let routeChannel = 41;
   // half-open mode: once tripped, this connection reads forever and answers
   // NOTHING (Pings included) — TCP stays open, the peer is effectively gone.
@@ -1470,6 +1646,7 @@ async function handleFakeConnection(socket: Socket, options: FakeDaemonOptions):
         );
       } else if (request.op === "route.open") {
         options.stats.routeOpens += 1;
+        options.stats.routeOpenBodies.push(Buffer.from(frame.body));
         options.stats.routeOpenConsumerIdentities.push(
           (request as { consumer_identity?: unknown }).consumer_identity,
         );
@@ -1653,15 +1830,16 @@ async function authenticateFakeServer(
   socket: Socket,
   deadline: number,
   key: Uint8Array = KEY,
+  daemonId: Uint8Array = DAEMON_ID,
 ): Promise<void> {
   const hello = await readAuthMessage<{ client_nonce: number[]; role: string }>(reader, deadline);
   expect(hello.role).toBe("client");
   const clientNonce = Uint8Array.from(hello.client_nonce);
-  const serverProof = computeProof(key, SERVER_PROOF_DOMAIN, clientNonce, SERVER_NONCE, DAEMON_ID);
+  const serverProof = computeProof(key, SERVER_PROOF_DOMAIN, clientNonce, SERVER_NONCE, daemonId);
   await writeAuthMessage(
     socket,
     {
-      daemon_id: Array.from(DAEMON_ID),
+      daemon_id: Array.from(daemonId),
       server_nonce: Array.from(SERVER_NONCE),
       daemon_ver: "fake-subc",
       server_proof: Array.from(serverProof),
@@ -1670,7 +1848,7 @@ async function authenticateFakeServer(
   );
 
   const auth = await readAuthMessage<{ client_auth: number[] }>(reader, deadline);
-  const expected = computeProof(key, CLIENT_AUTH_DOMAIN, clientNonce, SERVER_NONCE, DAEMON_ID);
+  const expected = computeProof(key, CLIENT_AUTH_DOMAIN, clientNonce, SERVER_NONCE, daemonId);
   expect(Buffer.from(auth.client_auth).equals(Buffer.from(expected))).toBe(true);
 }
 
@@ -1803,14 +1981,14 @@ function tempConnectionFile(): { dir: string; connFile: string } {
   return { dir, connFile: join(dir, "subc-connection.json") };
 }
 
-function writeConnectionFile(path: string, port: number, key: Uint8Array = KEY): void {
+function writeConnectionFile(path: string, port: number, key: Uint8Array = KEY, daemonId: Uint8Array = DAEMON_ID): void {
   writeFileSync(
     path,
     JSON.stringify({
       schema: 1,
       endpoints: [{ host: "127.0.0.1", port }],
       key: Array.from(key),
-      daemon_id: Array.from(DAEMON_ID),
+      daemon_id: Array.from(daemonId),
       pid: process.pid,
       daemon_ver: "fake-subc",
     }),

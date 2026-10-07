@@ -1,5 +1,5 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, linkSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -52,6 +52,9 @@ export async function startLiveDaemon(
   ensureSubcCoreBuilt();
 
   const runtimeDir = mkdtempSync(join(tmpdir(), `${prefix}-rt-`));
+  // Test daemons must not look like the operator's ck-subc to process-name tooling.
+  const executable = join(runtimeDir, "ckdev-subc");
+  linkSync(DAEMON, executable);
   const configDir = mkdtempSync(join(tmpdir(), `${prefix}-cfg-`));
   // The daemon mints its machine id and writes its run directory under the
   // data home, so it must never inherit the operator's real one.
@@ -68,7 +71,7 @@ export async function startLiveDaemon(
 
   const spawnDaemon = (): void => {
     exit = null;
-    daemon = spawn(DAEMON, [], {
+    daemon = spawn(executable, [], {
       env: {
         ...process.env,
         XDG_RUNTIME_DIR: runtimeDir,

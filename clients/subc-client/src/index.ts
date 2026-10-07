@@ -19,6 +19,7 @@ export {
   type RouteTarget,
   type ManagedRouteKind,
   type ConsumerIdentity,
+  type RouteScope,
   type RouteOpenOptions,
   type CatalogCapabilities,
   type CatalogCapabilityRequirement,

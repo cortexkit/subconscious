@@ -118,7 +118,11 @@ runner = "nextest"
 package = "subc-daemon"
 target = "--lib"
 expect_red = ["supervise::privacy_exec_boundary_tests::macos_roster_withholds_a_nonnull_trampoline_image_until_exec_confirmation"]
-only = true
+# Recording the trampoline's image as the module's also breaks other tests that
+# read the roster image (orphan identity, HTTP health), but only when a test's
+# sample lands before exec confirmation, so they go red on some runs and not
+# others. The expected test holds the launch at that point and fails every time.
+only = false
 platforms = ["macos"]
 timeout_s = 600
 build_timeout_s = 1800

@@ -18,7 +18,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  CK_MUTATE_REV: ffdd930ce43e699cc69ee5ccb75844f9383d2ed4
+  CK_MUTATE_REV: 7d08e73722fa3e79bbcc2607753978ab768f1c6b
   CARGO_TERM_COLOR: never
 
 jobs:

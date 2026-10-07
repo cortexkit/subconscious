@@ -7001,7 +7001,6 @@ async fn on_child_exit(
                         restart_schedule = Some(schedule);
                         disposition = TerminalDisposition::Restarting;
                     } else {
-                        state.state = ModuleState::Failed;
                         disposition = TerminalDisposition::Failed;
                         let budget = policy.budget_exhausted_detail();
                         disposition_detail =
@@ -7033,14 +7032,41 @@ async fn on_child_exit(
                     policy.budget_exhausted_detail()
                 );
             }
-            record_terminal_with_detail(
-                &spec.module_id,
-                terminal_ring,
-                spawn_events,
-                &exit_report,
-                disposition,
-                disposition_detail,
-            );
+            let budget_exhausted = disposition == TerminalDisposition::Failed;
+            let record_exit = || {
+                record_terminal_with_detail(
+                    &spec.module_id,
+                    terminal_ring,
+                    spawn_events,
+                    &exit_report,
+                    disposition,
+                    disposition_detail,
+                );
+            };
+            if budget_exhausted {
+                // Publish Failed only after its terminal record is available.
+                // Recording takes the event-feed lock, then ring -> journal
+                // writer (with file I/O), all without the hot snapshot lock.
+                // No lock is held when the final snapshot update runs, nor
+                // across the registration-release await below. Commands and
+                // health actions run on this same supervisor task, so none can
+                // act on the old state during the write; process facts already
+                // say the child is dead to concurrent liveness readers.
+                // A journal error is retained in history, not returned. If
+                // recording panics, still publish Failed before resuming the
+                // original unwind rather than leaving a dead child Running.
+                let recorded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(record_exit));
+                if let Err(err) = update_snapshot(snapshot, Some(&spec.module_id), |state| {
+                    state.state = ModuleState::Failed;
+                }) {
+                    error!(module_id = %spec.module_id, error = %err, "failed to publish exhausted restart budget");
+                }
+                if let Err(panic) = recorded {
+                    std::panic::resume_unwind(panic);
+                }
+            } else {
+                record_exit();
+            }
 
             if let Some(schedule) = restart_schedule {
                 NextAction::Restart {
@@ -10193,6 +10219,8 @@ mod terminal_history_tests {
             })
             .unwrap();
 
+        // Failed follows the terminal write; this deadline only bounds a hang,
+        // not an assumed duration for the two launches or their exit recording.
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             let status = module.status().unwrap();
@@ -10224,6 +10252,152 @@ mod terminal_history_tests {
             .expect("a budget failure names the budget");
         assert!(detail.contains("max_restarts=1"), "{detail}");
         assert_eq!(module.status().unwrap().spawn_generation, 2);
+    }
+
+    #[test]
+    fn restart_budget_failure_is_published_after_its_terminal_record() {
+        let supervisor = Supervisor::new_for_test(
+            Arc::new(Registry::default()),
+            RestartPolicy::new(0, Duration::ZERO),
+        );
+        let runtime = supervisor.runtime_config();
+        let spec = ModuleSpec {
+            protocol: ModuleProtocol::None,
+            ..windowed_crash_spec("budget-publication-order")
+        };
+        let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::new(
+            ModuleState::Running,
+            true,
+        )));
+        let reaped_snapshot = snapshot.clone();
+        let events = runtime.spawn_events.clone();
+        let history = runtime.terminal_ring.clone();
+
+        // Exit recording takes the event-feed lock before the history lock.
+        // Holding it pauses the writer after choosing a disposition but before
+        // recording history, without assuming anything about scheduler timing.
+        let before_record = events.0.lock().unwrap();
+        let reap = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(on_child_exit(
+                    &spec,
+                    runtime.restart_policy,
+                    &supervisor.registry,
+                    &reaped_snapshot,
+                    &runtime.terminal_ring,
+                    &runtime.spawn_events,
+                    &runtime.child_roster,
+                    ExitReport {
+                        kind: ExitKind::Clean,
+                        code: Some(0),
+                        signal: None,
+                        at_ms: 1,
+                    },
+                ))
+        });
+        // The deadline bounds a hung writer only; last_exit is the handshake.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let before_state = loop {
+            let state = lock_snapshot(&snapshot).unwrap();
+            if state.last_exit.is_some() {
+                break state.state;
+            }
+            drop(state);
+            assert!(Instant::now() < deadline, "exit decision was not reached");
+            std::thread::yield_now();
+        };
+        let before_history = history.lock().unwrap().snapshot();
+        drop(before_record);
+        assert!(matches!(reap.join().unwrap(), NextAction::Stop { .. }));
+        assert!(before_history.entries.is_empty());
+        assert_ne!(
+            before_state,
+            ModuleState::Failed,
+            "Failed was visible before its terminal record could be written"
+        );
+        assert_eq!(lock_snapshot(&snapshot).unwrap().state, ModuleState::Failed);
+        let history = history.lock().unwrap().snapshot();
+        assert_eq!(history.entries.len(), 1);
+        assert_eq!(history.entries[0].exit_code, Some(0));
+        assert_eq!(history.entries[0].disposition, TerminalDisposition::Failed);
+    }
+
+    #[tokio::test]
+    async fn restart_budget_failure_remains_failed_when_journal_append_fails() {
+        let dir = subc_test_support::TestTempDir::new("budget-journal-failure");
+        let path = dir.join("terminals.jsonl");
+        std::fs::create_dir(&path).unwrap();
+        let supervisor = Supervisor::new_for_test(
+            Arc::new(Registry::default()),
+            RestartPolicy::new(0, Duration::ZERO),
+        )
+        .with_terminal_journal(path, "budget-journal-failure".into());
+        let runtime = supervisor.runtime_config();
+        let spec = windowed_crash_spec("budget-journal-failure");
+        let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
+        assert!(matches!(
+            on_child_exit(
+                &spec,
+                runtime.restart_policy,
+                &supervisor.registry,
+                &snapshot,
+                &runtime.terminal_ring,
+                &runtime.spawn_events,
+                &runtime.child_roster,
+                crash_exit_report(1),
+            )
+            .await,
+            NextAction::Stop { .. }
+        ));
+        assert_eq!(lock_snapshot(&snapshot).unwrap().state, ModuleState::Failed);
+        let history = runtime
+            .terminal_ring
+            .lock()
+            .unwrap()
+            .durable_history(&spec.module_id);
+        assert!(history.journal_write_failures > 0);
+        assert_eq!(history.entries.len(), 1);
+        assert_eq!(history.entries[0].disposition, TerminalDisposition::Failed);
+    }
+
+    #[test]
+    fn restart_budget_failure_remains_failed_when_exit_recording_panics() {
+        let supervisor = Supervisor::new_for_test(
+            Arc::new(Registry::default()),
+            RestartPolicy::new(0, Duration::ZERO),
+        );
+        let runtime = supervisor.runtime_config();
+        let spec = windowed_crash_spec("budget-recording-panic");
+        let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
+        runtime.spawn_events.emit_spawned(&spec.module_id, 1, 1);
+        // Exhausting the event sequence makes emit_exited panic before the
+        // terminal write, exercising publication on the recording unwind.
+        runtime.spawn_events.0.lock().unwrap().seq = u64::MAX;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(on_child_exit(
+                    &spec,
+                    runtime.restart_policy,
+                    &supervisor.registry,
+                    &snapshot,
+                    &runtime.terminal_ring,
+                    &runtime.spawn_events,
+                    &runtime.child_roster,
+                    crash_exit_report(1),
+                ))
+        }));
+        let panic = result.err().expect("recording must still unwind");
+        assert_eq!(
+            panic.downcast_ref::<String>().map(String::as_str),
+            Some("spawn event sequence exhausted")
+        );
+        assert_eq!(lock_snapshot(&snapshot).unwrap().state, ModuleState::Failed);
     }
 
     /// A stop the supervisor itself requests still stops a protocol-none

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.32.5
+
+- Record the exhausted crash budget's terminal history before publishing the module as `failed`, so status readers cannot observe the failure before its exit record. Journal write failures still leave the module failed; an exit-recording panic publishes failure before continuing its unwind. Commands and health actions remain serialized by the supervisor, and journal I/O does not hold the status snapshot lock.
+
 ## 0.32.4
 
 - On macOS, a `#!/bin/sh` module is recognised as its own orphan after a daemon crash even when the system shell launcher has re-executed the selected bash, dash or zsh interpreter. The selected interpreter's file identity is saved at launch, not resolved again after a crash or upgrade. Other image differences, reused pids and changed start times still refuse cleanup. Previous daemon versions can read the extended roster but retain their stricter single-image matching.

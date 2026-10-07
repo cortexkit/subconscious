@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.20.61
+
+- Require subc-daemon 0.32.5 so an exhausted restart budget's exit record is retained before module status reports `failed`.
+
 ## 0.20.60
 
 - Require subc-daemon 0.32.4 so a macOS `#!/bin/sh` module is recognised as its own orphan after a daemon crash, including the system shell launcher's transition to its selected interpreter. Other process-identity checks remain strict.

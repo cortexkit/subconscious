@@ -331,7 +331,7 @@ const FOREIGN_SIGNATURE: &str =
 /// knows the developer's daemon), so the runtime is faked the same way the
 /// fixtures do; otherwise the refusal under test is masked by a registry
 /// read against whatever daemon the developer happens to be running.
-fn bare_setup_dry_run(index_url: &str) -> CkCommand {
+fn bare_setup_dry_run(index_url: &str) -> Command {
     let mut command = ck_command();
     command
         .args(["setup", "--dry-run"])
@@ -3373,35 +3373,14 @@ fn looks_like_age(text: &str) -> bool {
     text == "just now" || text.ends_with(" ago")
 }
 
-/// A `ck` command together with the scratch directory its binary runs from.
-/// The test CLI runs as `ckdev-under-test`, placed in that directory, so it is
-/// never listed under the production `ck` name; the directory must outlive the
-/// process, so the command keeps it.
-struct CkCommand {
-    command: Command,
-    _scratch: TempDir,
-}
-
-impl Deref for CkCommand {
-    type Target = Command;
-
-    fn deref(&self) -> &Command {
-        &self.command
-    }
-}
-
-impl std::ops::DerefMut for CkCommand {
-    fn deref_mut(&mut self) -> &mut Command {
-        &mut self.command
-    }
-}
-
-fn ck_command() -> CkCommand {
-    let scratch = unique_temp_dir("ck-command");
-    CkCommand {
-        command: ck_command_in(&scratch),
-        _scratch: scratch,
-    }
+/// The test CLI, run as `ckdev-under-test` from one placement per test
+/// process. CLI tests start it hundreds of times; with a fresh copy per
+/// command, renderings that pin a "just now" age failed in 5 of 6 macOS runs
+/// because the copies pushed the gap past one second.
+fn ck_command() -> Command {
+    let mut command = common::ck_under_test_command_shared();
+    isolate_ck_command(&mut command);
+    command
 }
 
 /// [`ck_command`] for a fixture that owns a directory outliving the command
@@ -3409,6 +3388,11 @@ fn ck_command() -> CkCommand {
 /// names it, for example).
 fn ck_command_in(scratch: &Path) -> Command {
     let mut command = common::ck_under_test_command(scratch);
+    isolate_ck_command(&mut command);
+    command
+}
+
+fn isolate_ck_command(command: &mut Command) {
     // Every CLI test gets an isolated update cache and a closed local endpoint.
     // This proves dashboard output without reaching public release infrastructure.
     // The domain list is discovered from PATH (`ck-<name> --ck-domain`), so a
@@ -3426,7 +3410,6 @@ fn ck_command_in(scratch: &Path) -> Command {
         )
         .env("CK_RELEASE_INDEX_URL", "http://127.0.0.1:0/index.json")
         .env("PATH", system_path_only());
-    command
 }
 
 /// The platform's system tool directories and nothing else.

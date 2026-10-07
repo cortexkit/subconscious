@@ -10,7 +10,9 @@ use std::{
     sync::{Arc, Once},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use subc_test_support::{ckdev_binary_in, dev_command, CkdevBinary, TestTempDir};
+use subc_test_support::{
+    ckdev_binary_in, ckdev_binary_shared, dev_command, CkdevBinary, TestTempDir,
+};
 
 use subc_daemon::{
     serve_listener, ConnectedClients, ControlHandler, ForwardingTable, ModuleProcessLiveness,
@@ -79,6 +81,14 @@ pub fn ckdev_ck(scratch: &Path) -> PathBuf {
 pub fn ck_under_test_command(scratch: &Path) -> Command {
     assert_ck_under_test_build_shape();
     dev_command(ckdev_bin(scratch, env!("CARGO_BIN_EXE_ck-under-test")))
+}
+
+/// [`ck_under_test_command`] from one placement per test process (see
+/// `subc_test_support::ckdev_binary_shared`), for callers that start the CLI
+/// many times and own no directory that outlives the command.
+pub fn ck_under_test_command_shared() -> Command {
+    assert_ck_under_test_build_shape();
+    dev_command(ckdev_binary_shared(env!("CARGO_BIN_EXE_ck-under-test")))
 }
 
 fn assert_ck_under_test_build_shape() {

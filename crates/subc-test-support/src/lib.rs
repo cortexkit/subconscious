@@ -309,6 +309,54 @@ fn copy_executable(src: &Path, dst: &Path) -> io::Result<()> {
     }
 }
 
+/// [`ckdev_binary_in`] into one scratch directory per test process, for a
+/// binary a test process starts many times (the `ck` CLI behind every CLI
+/// test). Each placement is a new file, and on macOS a fresh copy per command
+/// slowed CLI tests enough to push byte-exact "just now" ages past one second
+/// (5 of 6 runs); placing once per process pays that cost once.
+///
+/// The directory, `subc-tests/ckdev-shared-<pid>`, outlives the process (a
+/// static is never dropped), so each new one first removes those left by
+/// processes that have ended. On non-Unix hosts nothing can tell whether the
+/// owning process ended, so those directories stay for the temp sweeper.
+pub fn ckdev_binary_shared(built: impl AsRef<Path>) -> PathBuf {
+    static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    let dir = DIR.get_or_init(|| {
+        let parent = std::env::temp_dir().join("subc-tests");
+        remove_ended_shared_dirs(&parent);
+        let dir = parent.join(format!("{SHARED_PREFIX}{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("create shared ckdev scratch dir");
+        dir
+    });
+    ckdev_binary_in(built, dir)
+}
+
+const SHARED_PREFIX: &str = "ckdev-shared-";
+
+fn remove_ended_shared_dirs(parent: &Path) {
+    #[cfg(unix)]
+    {
+        let Ok(entries) = fs::read_dir(parent) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(pid) = name
+                .to_str()
+                .and_then(|name| name.strip_prefix(SHARED_PREFIX))
+                .and_then(|pid| pid.parse::<i32>().ok())
+            else {
+                continue;
+            };
+            if pid != std::process::id() as i32 && !process_alive(pid) {
+                let _ = fs::remove_dir_all(entry.path());
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = parent;
+}
+
 /// A built binary placed under its `ckdev-` name (see [`ckdev_binary_in`]) in a
 /// scratch directory this value owns. Keep it alive for as long as anything
 /// may start the binary: dropping it removes the directory.
@@ -666,6 +714,31 @@ mod tests {
             .map(|entry| entry.unwrap().file_name())
             .collect();
         assert_eq!(leftovers, [OsStr::new("ckdev-subc")]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_shared_placement_is_reused_and_ended_processes_dirs_are_removed() {
+        let build = TestTempDir::new("ckdev-shared-build");
+        let built = build.join("ck-under-test");
+        write_script(&built, "#!/bin/sh\n");
+        let placed = ckdev_binary_shared(&built);
+        assert_eq!(ckdev_binary_shared(&built), placed);
+        assert_eq!(
+            placed.parent().and_then(Path::file_name).unwrap(),
+            OsStr::new(&format!("{SHARED_PREFIX}{}", std::process::id()))
+        );
+
+        let parent = TestTempDir::new("ckdev-shared-sweep");
+        let ended = parent.join(format!("{SHARED_PREFIX}{}", i32::MAX - 1));
+        let own = parent.join(format!("{SHARED_PREFIX}{}", std::process::id()));
+        let unrelated = parent.join("ckdev-shared-not-a-pid");
+        for dir in [&ended, &own, &unrelated] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        remove_ended_shared_dirs(&parent);
+        assert!(!ended.exists(), "an ended process's directory is removed");
+        assert!(own.exists() && unrelated.exists());
     }
 
     #[test]

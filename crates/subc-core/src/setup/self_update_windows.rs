@@ -151,7 +151,6 @@ mod tests {
     use std::{
         env, fs,
         path::PathBuf,
-        process::Command,
         thread,
         time::{Duration, Instant},
     };
@@ -214,7 +213,10 @@ mod tests {
         }
 
         let root = fixture_dir("rename-replace-cleanup");
-        let destination = root.join("ck.exe");
+        // The installed `ck.exe` this test models runs as `ckdev-ck.exe`: a test
+        // process is never listed under the production `ck` name. The rename and
+        // cleanup derive every path from the destination, not from its name.
+        let destination = root.join("ckdev-ck.exe");
         let candidate = root.join("candidate.exe");
         let manifest = root.join("installer-manifest.json");
         let ready = root.join("ready");
@@ -229,7 +231,7 @@ mod tests {
         inventory.record("binary-placement", &destination, Map::new());
         inventory.save().expect("save inventory");
 
-        let mut holder = Command::new(&destination)
+        let mut holder = subc_test_support::dev_command(&destination)
             .args(["--exact", TEST_NAME, "--nocapture"])
             .env(TEST_MODE, "hold")
             .env("CK_SELF_UPDATE_TEST_READY", &ready)
@@ -261,7 +263,7 @@ mod tests {
             "original process remained active"
         );
 
-        let probe = Command::new(&destination)
+        let probe = subc_test_support::dev_command(&destination)
             .args(["--exact", TEST_NAME, "--nocapture"])
             .env(TEST_MODE, "probe")
             .env("CK_SELF_UPDATE_TEST_READY", &ready)

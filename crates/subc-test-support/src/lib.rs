@@ -482,8 +482,9 @@ mod tests {
         let _ = dev_command(Path::new("/nonexistent/target/debug/ck-subc"));
     }
 
-    /// The guard wired through the helper: a binary built as `ck-*` is placed
-    /// under a `ckdev-*` name and the spawn helper runs it. If the helper
+    /// The guard wired through the helper: binaries built as `ck-subc` and `ck`
+    /// are placed under `ckdev-*` names, in a caller's scratch directory and in
+    /// one the placement owns, and the spawn helper runs them. If the helper
     /// handed back the built path, `dev_command` would refuse it here.
     #[cfg(unix)]
     #[test]
@@ -497,6 +498,19 @@ mod tests {
         assert_eq!(String::from_utf8_lossy(&output.stdout), "placed\n");
         assert_eq!(placed.file_name().unwrap(), "ckdev-subc");
         assert_eq!(placed.parent(), Some(scratch.path()));
+
+        // The owning form lives until dropped, then removes its scratch dir.
+        let built = build.join("ck");
+        write_script(&built, "#!/bin/sh\n");
+        let owned = CkdevBinary::new(&built);
+        let path = owned.path().to_path_buf();
+        assert!(owned.command().status().unwrap().success());
+        assert_eq!(path.file_name().unwrap(), "ckdev-ck");
+        drop(owned);
+        assert!(
+            !path.exists(),
+            "dropping the placement removes its scratch dir"
+        );
     }
 
     #[cfg(unix)]
@@ -544,23 +558,6 @@ mod tests {
         let built = Path::new("/nonexistent/ckdev-subc");
         let scratch = TestTempDir::new("ckdev-unchanged");
         assert_eq!(ckdev_binary_in(built, scratch.path()), built);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn an_owned_placement_lives_until_dropped() {
-        let build = TestTempDir::new("ckdev-owned-build");
-        let built = build.join("ck");
-        write_script(&built, "#!/bin/sh\n");
-        let placed = CkdevBinary::new(&built);
-        let path = placed.path().to_path_buf();
-        assert_eq!(path.file_name().unwrap(), "ckdev-ck");
-        assert!(placed.command().status().unwrap().success());
-        drop(placed);
-        assert!(
-            !path.exists(),
-            "dropping the placement removes its scratch dir"
-        );
     }
 
     /// Writes through a staging file and a `cp` child, so this multi-threaded

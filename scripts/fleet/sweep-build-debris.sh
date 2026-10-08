@@ -32,6 +32,9 @@
 # Usage: sweep-build-debris.sh [--root DIR] [--idle-days N] [--dry-run]
 # Scheduled daily by the cortexkit.build-sweep launch agent.
 set -u
+# BSD stat, the APFS data volume and lsof's output are assumed below; on another
+# system an age read would fail for every directory.
+[ "$(uname -s)" = Darwin ] || { echo "sweep-build-debris.sh runs on macOS only" >&2; exit 69; }
 # Paths are split on newlines only, so a directory name with a space stays one path.
 IFS=$'\n'
 ROOT=~/Work/Projects/CortexKit
@@ -50,12 +53,15 @@ case "$IDLE_DAYS" in
 esac
 IDLE_CUTOFF=$(( $(date +%s) - IDLE_DAYS * 86400 ))
 # Newest modification time, in epoch seconds, of a debug directory and of the
-# subdirectories cargo writes into on every compile.
+# subdirectories cargo writes into on every compile. Fails, printing nothing,
+# when the age of a directory that exists cannot be read: an unreadable age must
+# never count as old, or a build in use would be deleted.
 newest_write() {
   local newest=0 t sub
   for sub in "$1" "$1/deps" "$1/.fingerprint" "$1/build" "$1/incremental"; do
     [ -d "$sub" ] || continue
-    t=$(stat -f %m "$sub" 2>/dev/null) || continue
+    t=$(stat -f %m "$sub" 2>/dev/null) || return 1
+    case "$t" in (''|*[!0-9]*) return 1 ;; esac
     [ "$t" -gt "$newest" ] && newest=$t
   done
   echo "$newest"
@@ -116,7 +122,10 @@ for d in $dirs; do
   if [ -n "$guarded" ]; then
     echo "  SKIP (a configured module runs from $guarded) $d"; skipped=$((skipped+1)); continue
   fi
-  if [ "$(newest_write "$d")" -ge "$IDLE_CUTOFF" ]; then
+  if ! age=$(newest_write "$d"); then
+    echo "  SKIP (age unreadable) $d"; skipped=$((skipped+1)); continue
+  fi
+  if [ "$age" -ge "$IDLE_CUTOFF" ]; then
     recent=$((recent+1)); continue
   fi
   kib=$(du -sk "$d" 2>/dev/null | cut -f1)
@@ -125,7 +134,7 @@ for d in $dirs; do
   swept=$((swept+1))
 done
 A=$(free_gib)
-echo "$(stamp) manifest: $MANIFEST ($swept removed, $skipped skipped as in use, $recent kept as written within ${IDLE_DAYS} days)"
+echo "$(stamp) manifest: $MANIFEST ($swept removed, $skipped skipped as in use or unreadable, $recent kept as written within ${IDLE_DAYS} days)"
 if [ "$DRY" = 1 ]; then
   echo "dry run: would free up to $(awk '{s+=$1} END {printf "%.0f", s/1048576}' "$MANIFEST") GiB (du sum, upper bound)"
 else

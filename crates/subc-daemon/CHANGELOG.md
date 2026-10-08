@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.32.12
+
+- Test only: three supervisor tests no longer fail when tests run in parallel. The test log capture keeps a second log dispatcher alive, so a parallel test with no subscriber can't make the logging library cache a log line as disabled; the exec-status test waits for the module's process id instead of reading it once; and the warming-snapshot test uses a fixture with no live supervisor task.
+
 ## 0.32.11
 
 - 0.32.10 was never published (its CI failed on a Linux lint error); this release carries its changes plus that fix.

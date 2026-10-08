@@ -24,9 +24,14 @@
 //! - macOS: the start time is `kp_proc.p_starttime` from `sysctl`
 //!   `KERN_PROC_PID` (microseconds since the epoch), and the executable is the
 //!   path `proc_pidpath` reports, then `stat` on that path. These two calls are
-//!   the crate's only unsafe code. macOS has no pidfd, so a signal is a plain
+//!   unsafe. macOS has no pidfd, so a signal is a plain
 //!   `kill` sent right after the checks; see [`Process::signal`].
 //! - Anywhere else: [`Process::open`] reports [`std::io::ErrorKind::Unsupported`].
+//!
+//! For persisted PID owners, [`process_identity`] reads versioned kernel start
+//! identities and distinguishes alive, dead and unknown without spawning a
+//! process. Its foreign calls are signal-zero `kill` on Unix and `proc_pidinfo`
+//! on macOS. Only dead owners may be reclaimed; unknown owners stay protected.
 //!
 //! It also reads how much memory and CPU time one process is using, for
 //! reporting only; see [`resource_usage`]. On Linux that is procfs again; on
@@ -45,6 +50,7 @@
 pub mod fork_exec_test;
 pub mod launch_nonce;
 pub mod privacy_identity;
+pub mod process_identity;
 #[cfg(unix)]
 pub use launch_nonce::LaunchNonceHandoff;
 pub use launch_nonce::{

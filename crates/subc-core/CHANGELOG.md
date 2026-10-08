@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.20.68
+
+- Test only: the `test-support` feature also enables `subc-daemon/test-support`, which the `operator.confirm` real-daemon tests need to run the daemon with a scripted confirmation provider.
+
 ## 0.20.67
 
 - Test only: the rollback-over-a-running-executable test ran a copy of `/bin/sleep` named `ck-aft` and never checked it stayed alive. macOS kills a copied platform binary run outside its system path, and a multicall coreutils refuses an unknown name, so the test passed with nothing running. It now runs a `ckdev-aft` copy of its own test binary, held open, and fails if that copy exits early.

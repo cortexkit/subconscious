@@ -9,6 +9,7 @@ members = [
     "crates/subc-cgroup",
     "crates/subc-uptime",
     "crates/subc-jobobject",
+    "crates/subc-presence",
     "crates/subc-os",
     "crates/subc-core",
     "crates/subc-daemon",

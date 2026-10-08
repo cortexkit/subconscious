@@ -44,6 +44,10 @@ subc-cgroup = { path = "../subc-cgroup", version = "0.1.5" }
 # because this crate forbids unsafe code and the Win32 calls need it.
 subc-jobobject = { path = "../subc-jobobject", version = "0.2.0" }
 
+[target.'cfg(any(target_os = "macos", windows))'.dependencies]
+# Keep authentication bindings out of every module SDK's dependency graph.
+subc-presence = { path = "../subc-presence", version = "0.1.0" }
+
 [target.'cfg(unix)'.dependencies]
 # SIGTERM for `protocol: "none"` teardown. This crate forbids unsafe code, so
 # `libc::kill` is not reachable from here; rustix wraps the same syscall safely

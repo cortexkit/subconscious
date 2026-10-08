@@ -73,21 +73,46 @@ impl OperatorLimits {
 }
 
 struct OsProvider;
+
+#[cfg(any(target_os = "macos", windows))]
+struct OsWithdraw(Arc<dyn subc_presence::Withdraw>);
+#[cfg(any(target_os = "macos", windows))]
+impl OperatorWithdraw for OsWithdraw {
+    fn withdraw(&self, _: &str) {
+        self.0.withdraw();
+    }
+}
+
 impl OperatorProvider for OsProvider {
     fn prompt(
         &self,
-        _: &str,
-        _: Box<dyn FnOnce(Arc<dyn OperatorWithdraw>) + Send>,
+        text: &str,
+        publish: Box<dyn FnOnce(Arc<dyn OperatorWithdraw>) + Send>,
     ) -> ProviderResult {
         // On Linux the prompt comes from polkit, whose agents may show only the
         // fixed message of an installed action file, not this request's summary.
         // A person must see what they approve, so Linux refuses rather than prompts.
         #[cfg(target_os = "linux")]
         {
-            ProviderResult::UnsupportedPlatform
+            let _ = (text, publish);
+            return ProviderResult::UnsupportedPlatform;
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(any(target_os = "macos", windows))]
         {
+            match subc_presence::prompt(
+                text,
+                Box::new(move |handle| publish(Arc::new(OsWithdraw(handle)))),
+            ) {
+                subc_presence::Outcome::Approved => ProviderResult::Approved,
+                subc_presence::Outcome::Declined => ProviderResult::Declined,
+                subc_presence::Outcome::ProviderError => ProviderResult::Unavailable,
+                subc_presence::Outcome::NoPresence => ProviderResult::NoPresence,
+                subc_presence::Outcome::UnsupportedPlatform => ProviderResult::UnsupportedPlatform,
+            }
+        }
+        #[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
+        {
+            let _ = (text, publish);
             ProviderResult::Unavailable
         }
     }

@@ -7,6 +7,7 @@
 ## 0.32.8
 
 - Build time only, no runtime change: the build script, which stamps the git commit into the binary, no longer recompiles the crate on every cargo run in a git worktree. It watched `.git/HEAD` and `.git/refs` paths that don't exist when `.git` is a worktree's file, and cargo treats a missing watched path as always changed. It now resolves paths with `git rev-parse --git-path` and watches only the existing HEAD, current branch ref, `packed-refs` and index, so a rebuild happens only when the checked-out commit or the index changes.
+- Connect `operator.confirm` to the isolated macOS LocalAuthentication and Windows Hello/CredUI providers. Only a successful OS authentication confirms; errors remain fail-closed. Linux still returns `unsupported_platform` without a prompt. Platform dialog withdrawal requires the recorded interactive release checks.
 
 ## 0.32.7
 

@@ -79,7 +79,13 @@ fn git_head_sha() -> Option<String> {
 fn lock_digest() -> Option<String> {
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").ok()?;
     let lock_path = PathBuf::from(&manifest_dir).join("../../Cargo.lock");
-    println!("cargo:rerun-if-changed={}", lock_path.display());
+    // Watch the lock only where it exists. A crate built from a registry or
+    // vendored copy has no workspace lock two levels up, and cargo treats a
+    // missing watched path as always changed, so naming it would rebuild this
+    // crate on every build of every consumer.
+    if lock_path.exists() {
+        println!("cargo:rerun-if-changed={}", lock_path.display());
+    }
     let bytes = std::fs::read(&lock_path).ok()?;
     Some(sha256_hex(&bytes))
 }

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.31.2
+
+- Build time only, released from the 0.31 line for consumers not yet on 0.32: the build script watches the workspace `Cargo.lock` only when it exists. Built from crates.io there is no workspace lock two levels up, and cargo treats a missing watched path as always changed, so every consumer rebuilt this crate on every build. The same fix is in 0.32.9.
+
 ## 0.31.1
 
 - Refuse a flow-scoped `route.open` before relaying any bind unless the target's registered manifest provides `flow-scopes/v1` in `capabilities.provides`. The refusal is terminal `target_flow_unsupported` and names the target and the capability. The check runs at admission and again against the connection the relay actually captured, so a replacement module cannot inherit its predecessor's declaration. The daemon never strips `flow_id`. Scopes without `flow_id` and unscoped routes are unaffected.

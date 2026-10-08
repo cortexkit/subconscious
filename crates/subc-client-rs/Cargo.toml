@@ -9,7 +9,9 @@ repository = "https://github.com/cortexkit/subconscious"
 
 [features]
 default = []
-# Enable only on a module's dev-dependency, never its production dependency.
+# A scripted stand-in daemon for a module's own tests. Enable it only in the
+# module's [dev-dependencies] entry for subc-client-rs, never in [dependencies],
+# so it can never be compiled into a shipped module.
 test-support = []
 
 [dependencies]

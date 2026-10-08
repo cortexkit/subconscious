@@ -2,7 +2,7 @@
 
 ## 0.32.14
 
-- Log module registration endings with their reasons and when a blue/green candidate replaces an incumbent; keep the existing `module registered` admission line unchanged.
+- Log each module registration ending (`module registration ended`, with the reason: connection closed, goodbye, supervisor stop or restart, failed registration, or replaced), and log when a swap restart promotes the new process's registration over the old one (`module registration promoted`). The existing `module registered` line is unchanged.
 
 ## 0.32.13
 

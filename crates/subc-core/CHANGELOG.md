@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.20.67
+
+- Test only: the rollback-over-a-running-executable test ran a copy of `/bin/sleep` named `ck-aft` and never checked it stayed alive. macOS kills a copied platform binary run outside its system path, and a multicall coreutils refuses an unknown name, so the test passed with nothing running. It now runs a `ckdev-aft` copy of its own test binary, held open, and fails if that copy exits early.
+
 ## 0.20.66
 
 - Build time only: the build script watches the workspace `Cargo.lock` only when it exists. Built from a registry or vendored copy there is no workspace lock two levels up, and cargo treats a missing watched path as always changed, so every consumer rebuilt this crate on every build.

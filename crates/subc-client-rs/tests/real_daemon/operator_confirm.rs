@@ -89,8 +89,9 @@ impl Harness {
         .unwrap();
         let events = root.join("operator.jsonl");
         let script_path = root.join("script");
-        // Gate paths are made inside this harness, even for scripts assembled
-        // before the scratch directory exists.
+        // A provider script names the file it waits on as `@GATE@`, because a
+        // script may be written before this scratch directory exists. Swap in
+        // the real path now that the directory does.
         fs::write(
             &script_path,
             script.replace("@GATE@", root.join("gate").to_str().unwrap()),
@@ -363,8 +364,10 @@ fn audit_fields(line: &str) -> BTreeMap<String, String> {
             }
         }
         let raw = &text[value_start..at];
-        // Preserve summary's Debug spelling so rejected format characters are
-        // checked against the original scalars, not a lossy JSON decoder.
+        // The audit line writes the summary in Rust's escaped Debug form, so an
+        // invisible character the daemon rejects (a bidirectional override or
+        // other format character) stays visible as an escape. Decode it with
+        // that form's own rules so the test compares exact characters.
         let value = if key == "summary" {
             serde_json::from_str::<String>(raw).expect("summary must be an escaped Debug string")
         } else {
@@ -553,7 +556,9 @@ async fn stale_route_not_permitted() {
     let mut first = h.request(FIRST, json!({"mode":"echo"})).await;
     first.reply().await;
     first.close().await;
-    // A control round trip after GOODBYE fences its processing on this socket.
+    // Frames on one socket are handled in order, so once this control call is
+    // answered the daemon has finished processing the GOODBYE sent before it
+    // and closed the route.
     control_rpc_on_stream(&mut first.stream, 4, json!({"op":"catalog.list"})).await;
     assert_eq!(
         h.call(FIRST, json!({"mode":"stale_route", "summary":"write"}))

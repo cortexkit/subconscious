@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.29.3
+
+- Add standalone, `#[non_exhaustive]` `session::OperatorConfirmRequest` and `session::OperatorConfirmReply` bodies for the module-to-daemon `operator.confirm` control operation, with constructors. The request carries the summary and the caller's route channel/epoch on the module connection; the successful reply carries `outcome: "confirmed"`. Refusals use the new `operator_declined`, `operator_presence_unavailable`, `operator_summary_invalid` and `operator_request_not_permitted` error codes. All four are terminal in the route-open retry predicate but are not route-open refusals, so the route-open decision table is unchanged. Additive: neither existing module-control enum changes, and no consumer code change is needed.
+
 ## 0.29.2
 
 - `CallOrigin` gains an optional `message_position: { message_id, index }`, where the call sits among the tool calls of one model message (0-based, in the order the model wrote them). A host may run one message's calls concurrently, so a provider that must follow the model's order reads it to sequence them. Absent means unknown. The id and the index travel together: a position missing either one does not decode. `validate_call_origin` also refuses a message id that breaks the call-key rule (empty, over 256 bytes, or outside printable non-space ASCII), naming the field `origin.message_position.message_id` (`ORIGIN_MESSAGE_ID_FIELD`) for the provider's `invalid_request` reply. Additive: `CallOrigin` is `#[non_exhaustive]`, an origin without a position keeps its existing bytes, and readers that predate it ignore the member.

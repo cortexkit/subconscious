@@ -43,7 +43,7 @@ pub mod scope;
 pub mod session;
 pub mod tool_call;
 
-/// Canonical error codes emitted while opening a client route.
+/// Canonical error codes emitted by subc.
 ///
 /// Error frames remain extensible strings, but these daemon-owned route-open
 /// outcomes need identical spelling across the daemon and SDK retry policies.
@@ -159,6 +159,19 @@ pub mod error_codes {
     pub const SCOPE_CARRIER_TARGETS_INVALID: &str = "scope_carrier_targets_invalid";
     /// The record sets `delegates` without an `agent_id` to delegate.
     pub const SCOPE_DELEGATES_WITHOUT_AGENT: &str = "scope_delegates_without_agent";
+
+    /// An `operator.confirm` was declined or withdrawn. `detail.reason` is
+    /// `person`, `backoff`, `route_closed`, `module_closed` or `caller_cancelled`.
+    pub const OPERATOR_DECLINED: &str = "operator_declined";
+    /// An `operator.confirm` could not prompt or complete. `detail.reason` is
+    /// `no_presence`, `timeout`, `module_limit`, `queue_full`, `queue_wait`,
+    /// `provider_stuck`, `unsupported_platform` or `provider_error`.
+    pub const OPERATOR_PRESENCE_UNAVAILABLE: &str = "operator_presence_unavailable";
+    /// The summary of an `operator.confirm` breaks the daemon's summary rules.
+    pub const OPERATOR_SUMMARY_INVALID: &str = "operator_summary_invalid";
+    /// An `operator.confirm` is not from a nonce-proven module connection for
+    /// an open route with a verified opener on that connection.
+    pub const OPERATOR_REQUEST_NOT_PERMITTED: &str = "operator_request_not_permitted";
 
     /// Whether a `route.open` refusal carrying `code` may be retried in place
     /// within the caller's deadline, or is terminal for the target as named.

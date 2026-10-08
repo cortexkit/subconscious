@@ -95,7 +95,7 @@ impl OperatorProvider for OsProvider {
         #[cfg(target_os = "linux")]
         {
             let _ = (text, publish);
-            return ProviderResult::UnsupportedPlatform;
+            ProviderResult::UnsupportedPlatform
         }
         #[cfg(any(target_os = "macos", windows))]
         {

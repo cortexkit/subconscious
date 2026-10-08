@@ -83,13 +83,11 @@ impl ModuleHandler for Harness {
         let route = {
             let mut previous = self.previous.lock().unwrap();
             let route = if mode == "stale_route" {
-                previous
-                    .clone()
-                    .unwrap_or_else(|| ctx.route_handle().clone())
+                previous.unwrap_or_else(|| ctx.route_handle())
             } else {
-                ctx.route_handle().clone()
+                ctx.route_handle()
             };
-            *previous = Some(ctx.route_handle().clone());
+            *previous = Some(ctx.route_handle());
             route
         };
         if mode == "echo" {

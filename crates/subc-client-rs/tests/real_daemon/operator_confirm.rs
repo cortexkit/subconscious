@@ -6,6 +6,9 @@ use super::*;
 const FIRST: &str = "operator-confirm-module-1";
 const DIRECT: &str = "operator-confirm-direct";
 const WAIT: Duration = Duration::from_secs(10);
+// Process startup competes with other worktrees' native builds on shared hosts;
+// it is not an operator-confirm deadline. Keep wire/outcome waits short below.
+const START_WAIT: Duration = Duration::from_secs(60);
 
 fn binaries() -> (PathBuf, PathBuf) {
     static BINARIES: OnceLock<(PathBuf, PathBuf)> = OnceLock::new();
@@ -14,9 +17,9 @@ fn binaries() -> (PathBuf, PathBuf) {
             let workspace = workspace_root();
             let daemon = ensure_binary(
                 &workspace,
-                binary_path(&workspace, "ck-subc-under-test"),
                 &[
                     "build",
+                    "--message-format=json-render-diagnostics",
                     "-p",
                     "subc-core",
                     "--features",
@@ -27,9 +30,9 @@ fn binaries() -> (PathBuf, PathBuf) {
             );
             let module = ensure_binary(
                 &workspace,
-                example_path(&workspace, "operator-confirm-module"),
                 &[
                     "build",
+                    "--message-format=json-render-diagnostics",
                     "-p",
                     "subc-client-rs",
                     "--example",
@@ -138,12 +141,12 @@ impl Harness {
             events,
             module_bin,
         };
-        wait_for_connection_file(&harness.daemon.connection_file, WAIT).await;
+        wait_for_connection_file(&harness.daemon.connection_file, START_WAIT).await;
         for n in 1..=6 {
             wait_for_catalog_module(
                 &harness.daemon.connection_file,
                 &format!("operator-confirm-module-{n}"),
-                WAIT,
+                START_WAIT,
             )
             .await;
         }

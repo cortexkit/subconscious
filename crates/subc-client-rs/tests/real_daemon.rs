@@ -332,13 +332,27 @@ async fn subc_consumer_catalog_list_reads_tool_provider_without_open_routes() {
     let workspace = workspace_root();
     let daemon_bin = ensure_binary(
         &workspace,
-        binary_path(&workspace, "ck-subc"),
-        &["build", "-p", "subc-core", "--bins"],
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-core",
+            "--bin",
+            "ck-subc",
+            "--message-format=json",
+        ],
     );
     let fake_aft_bin = ensure_binary(
         &workspace,
-        binary_path(&workspace, "fake-aft-stub"),
-        &["build", "-p", "subc-core", "--bin", "fake-aft-stub"],
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-core",
+            "--bin",
+            "fake-aft-stub",
+            "--message-format=json",
+        ],
     );
 
     let temp_dir = unique_temp_dir("subc-client-rs-catalog-list");
@@ -398,8 +412,15 @@ async fn route_open_refusal_keeps_the_daemons_code_and_detail() {
     let workspace = workspace_root();
     let daemon_bin = ensure_binary(
         &workspace,
-        binary_path(&workspace, "ck-subc"),
-        &["build", "-p", "subc-core", "--bins"],
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-core",
+            "--bin",
+            "ck-subc",
+            "--message-format=json",
+        ],
     );
     let temp_dir = unique_temp_dir("subc-client-rs-route-open-refusal");
     let runtime_dir = temp_dir.join("runtime");
@@ -485,8 +506,15 @@ async fn capability_resolver_does_not_fall_back_to_module_id_equality_and_orders
     let workspace = workspace_root();
     let daemon_bin = ensure_binary(
         &workspace,
-        binary_path(&workspace, "ck-subc"),
-        &["build", "-p", "subc-core", "--bins"],
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-core",
+            "--bin",
+            "ck-subc",
+            "--message-format=json",
+        ],
     );
     let temp_dir = unique_temp_dir("subc-client-rs-capability-resolvers");
     let runtime_dir = temp_dir.join("runtime");
@@ -610,13 +638,27 @@ async fn clean_subc_client_rs_serves_through_real_daemon() {
     let workspace = workspace_root();
     let daemon_bin = ensure_binary(
         &workspace,
-        binary_path(&workspace, "ck-subc"),
-        &["build", "-p", "subc-core", "--bins"],
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-core",
+            "--bin",
+            "ck-subc",
+            "--message-format=json",
+        ],
     );
     let module_bin = ensure_binary(
         &workspace,
-        example_path(&workspace, "echo-module"),
-        &["build", "-p", "subc-client-rs", "--example", "echo-module"],
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-client-rs",
+            "--example",
+            "echo-module",
+            "--message-format=json",
+        ],
     );
 
     let temp_dir = unique_temp_dir("subc-client-rs-real-daemon");
@@ -779,13 +821,27 @@ async fn a_supervised_module_reads_its_launch_nonce_from_the_descriptor_and_hell
     let workspace = workspace_root();
     let daemon_bin = ensure_binary(
         &workspace,
-        binary_path(&workspace, "ck-subc"),
-        &["build", "-p", "subc-core", "--bins"],
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-core",
+            "--bin",
+            "ck-subc",
+            "--message-format=json",
+        ],
     );
     let module_bin = ensure_binary(
         &workspace,
-        example_path(&workspace, "echo-module"),
-        &["build", "-p", "subc-client-rs", "--example", "echo-module"],
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-client-rs",
+            "--example",
+            "echo-module",
+            "--message-format=json",
+        ],
     );
 
     let temp_dir = unique_temp_dir("subc-client-rs-launch-nonce-fd");
@@ -879,8 +935,15 @@ async fn module_handle_catalog_update_refreshes_catalog_without_dropping_open_ro
     let workspace = workspace_root();
     let daemon_bin = ensure_binary(
         &workspace,
-        binary_path(&workspace, "ck-subc"),
-        &["build", "-p", "subc-core", "--bins"],
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-core",
+            "--bin",
+            "ck-subc",
+            "--message-format=json",
+        ],
     );
 
     let temp_dir = unique_temp_dir("subc-client-rs-module-handle-update");
@@ -937,8 +1000,15 @@ async fn a_registering_module_receives_the_daemons_machine_id_in_hello_ack() {
     let workspace = workspace_root();
     let daemon_bin = ensure_binary(
         &workspace,
-        binary_path(&workspace, "ck-subc"),
-        &["build", "-p", "subc-core", "--bins"],
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-core",
+            "--bin",
+            "ck-subc",
+            "--message-format=json",
+        ],
     );
 
     let temp_dir = unique_temp_dir("subc-client-rs-machine-id");
@@ -974,8 +1044,15 @@ async fn module_handle_catalog_update_surfaces_frozen_field_rejections() {
     let workspace = workspace_root();
     let daemon_bin = ensure_binary(
         &workspace,
-        binary_path(&workspace, "ck-subc"),
-        &["build", "-p", "subc-core", "--bins"],
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-core",
+            "--bin",
+            "ck-subc",
+            "--message-format=json",
+        ],
     );
 
     let temp_dir = unique_temp_dir("subc-client-rs-module-handle-frozen");
@@ -1006,8 +1083,15 @@ async fn module_handle_catalog_update_fails_fast_after_connection_death() {
     let workspace = workspace_root();
     let daemon_bin = ensure_binary(
         &workspace,
-        binary_path(&workspace, "ck-subc"),
-        &["build", "-p", "subc-core", "--bins"],
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-core",
+            "--bin",
+            "ck-subc",
+            "--message-format=json",
+        ],
     );
 
     let temp_dir = unique_temp_dir("subc-client-rs-module-handle-death");
@@ -1043,13 +1127,27 @@ async fn subc_consumer_reports_outcome_unknown_mid_call_then_reopens_after_resta
     let workspace = workspace_root();
     let daemon_bin = ensure_binary(
         &workspace,
-        binary_path(&workspace, "ck-subc"),
-        &["build", "-p", "subc-core", "--bins"],
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-core",
+            "--bin",
+            "ck-subc",
+            "--message-format=json",
+        ],
     );
     let module_bin = ensure_binary(
         &workspace,
-        example_path(&workspace, "echo-module"),
-        &["build", "-p", "subc-client-rs", "--example", "echo-module"],
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-client-rs",
+            "--example",
+            "echo-module",
+            "--message-format=json",
+        ],
     );
     let temp_dir = unique_temp_dir("subc-client-rs-consumer-midcall");
     let runtime_dir = temp_dir.join("runtime");
@@ -1151,13 +1249,27 @@ async fn subc_consumer_recovers_after_daemon_restart_and_refuses_unknown_module_
     let workspace = workspace_root();
     let daemon_bin = ensure_binary(
         &workspace,
-        binary_path(&workspace, "ck-subc"),
-        &["build", "-p", "subc-core", "--bins"],
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-core",
+            "--bin",
+            "ck-subc",
+            "--message-format=json",
+        ],
     );
     let module_bin = ensure_binary(
         &workspace,
-        example_path(&workspace, "echo-module"),
-        &["build", "-p", "subc-client-rs", "--example", "echo-module"],
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-client-rs",
+            "--example",
+            "echo-module",
+            "--message-format=json",
+        ],
     );
     let temp_dir = unique_temp_dir("subc-client-rs-consumer-race");
     let runtime_dir = temp_dir.join("runtime");
@@ -1251,13 +1363,27 @@ async fn subc_consumer_multiplexes_targets_and_classifies_reconnect_in_flight() 
     let workspace = workspace_root();
     let daemon_bin = ensure_binary(
         &workspace,
-        binary_path(&workspace, "ck-subc"),
-        &["build", "-p", "subc-core", "--bins"],
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-core",
+            "--bin",
+            "ck-subc",
+            "--message-format=json",
+        ],
     );
     let module_bin = ensure_binary(
         &workspace,
-        example_path(&workspace, "echo-module"),
-        &["build", "-p", "subc-client-rs", "--example", "echo-module"],
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-client-rs",
+            "--example",
+            "echo-module",
+            "--message-format=json",
+        ],
     );
     let temp_dir = unique_temp_dir("subc-client-rs-consumer-mux");
     let runtime_dir = temp_dir.join("runtime");
@@ -1384,13 +1510,27 @@ async fn subc_consumer_close_route_releases_the_route_and_reopens_fresh() {
     let workspace = workspace_root();
     let daemon_bin = ensure_binary(
         &workspace,
-        binary_path(&workspace, "ck-subc"),
-        &["build", "-p", "subc-core", "--bins"],
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-core",
+            "--bin",
+            "ck-subc",
+            "--message-format=json",
+        ],
     );
     let module_bin = ensure_binary(
         &workspace,
-        example_path(&workspace, "echo-module"),
-        &["build", "-p", "subc-client-rs", "--example", "echo-module"],
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-client-rs",
+            "--example",
+            "echo-module",
+            "--message-format=json",
+        ],
     );
     let temp_dir = unique_temp_dir("subc-client-rs-close-route");
     let runtime_dir = temp_dir.join("runtime");
@@ -1477,8 +1617,15 @@ async fn subc_consumer_push_events_delivers_registered_push() {
     let workspace = workspace_root();
     let daemon_bin = ensure_binary(
         &workspace,
-        binary_path(&workspace, "ck-subc"),
-        &["build", "-p", "subc-core", "--bins"],
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-core",
+            "--bin",
+            "ck-subc",
+            "--message-format=json",
+        ],
     );
     let temp_dir = unique_temp_dir("subc-client-rs-push-delivery");
     let runtime_dir = temp_dir.join("runtime");
@@ -1531,8 +1678,15 @@ async fn subc_consumer_counts_pushes_dropped_without_receiver() {
     let workspace = workspace_root();
     let daemon_bin = ensure_binary(
         &workspace,
-        binary_path(&workspace, "ck-subc"),
-        &["build", "-p", "subc-core", "--bins"],
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-core",
+            "--bin",
+            "ck-subc",
+            "--message-format=json",
+        ],
     );
     let temp_dir = unique_temp_dir("subc-client-rs-push-drop");
     let runtime_dir = temp_dir.join("runtime");
@@ -1592,8 +1746,15 @@ async fn subc_consumer_push_events_end_when_route_closes() {
     let workspace = workspace_root();
     let daemon_bin = ensure_binary(
         &workspace,
-        binary_path(&workspace, "ck-subc"),
-        &["build", "-p", "subc-core", "--bins"],
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-core",
+            "--bin",
+            "ck-subc",
+            "--message-format=json",
+        ],
     );
     let temp_dir = unique_temp_dir("subc-client-rs-push-teardown");
     let runtime_dir = temp_dir.join("runtime");
@@ -1655,13 +1816,27 @@ async fn subc_consumer_subscribe_streaming_contract() {
     let workspace = workspace_root();
     let daemon_bin = ensure_binary(
         &workspace,
-        binary_path(&workspace, "ck-subc"),
-        &["build", "-p", "subc-core", "--bins"],
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-core",
+            "--bin",
+            "ck-subc",
+            "--message-format=json",
+        ],
     );
     let module_bin = ensure_binary(
         &workspace,
-        example_path(&workspace, "echo-module"),
-        &["build", "-p", "subc-client-rs", "--example", "echo-module"],
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-client-rs",
+            "--example",
+            "echo-module",
+            "--message-format=json",
+        ],
     );
     let temp_dir = unique_temp_dir("subc-client-rs-subscribe");
     let runtime_dir = temp_dir.join("runtime");
@@ -2150,8 +2325,15 @@ async fn start_policy_harness(scripts: impl IntoIterator<Item = PolicyScript>) -
     let workspace = workspace_root();
     let daemon_bin = ensure_binary(
         &workspace,
-        binary_path(&workspace, "ck-subc"),
-        &["build", "-p", "subc-core", "--bins"],
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-core",
+            "--bin",
+            "ck-subc",
+            "--message-format=json",
+        ],
     );
     let temp_dir = unique_temp_dir("subc-client-rs-policy-resolver");
     let runtime_dir = temp_dir.join("runtime");
@@ -2449,27 +2631,55 @@ fn goodbye_frame(channel: u16, epoch: u32, corr: u64) -> Frame {
     .unwrap()
 }
 
-fn ensure_binary(workspace: &Path, path: PathBuf, cargo_args: &[&str]) -> PathBuf {
-    static BUILD_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    let _guard = BUILD_LOCK
-        .get_or_init(|| Mutex::new(()))
+fn ensure_binary(workspace: &Path, cargo_args: &[&str]) -> PathBuf {
+    type BuildResults = HashMap<Vec<String>, Result<PathBuf, String>>;
+    static BUILD_RESULTS: OnceLock<Mutex<BuildResults>> = OnceLock::new();
+    let mut results = BUILD_RESULTS
+        .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let output = Command::new("cargo")
-        .args(cargo_args)
-        .current_dir(workspace)
-        .output()
-        .unwrap_or_else(|error| panic!("failed to run cargo {cargo_args:?}: {error}"));
-    if !output.status.success() {
-        panic!(
-            "cargo {cargo_args:?} failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
-            output.status.code(),
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-    assert!(path.exists(), "expected binary at {}", path.display());
-    path
+    let key = cargo_args.iter().map(|arg| (*arg).to_owned()).collect();
+    let result = results
+        .entry(key)
+        .or_insert_with(|| {
+            let output = Command::new("cargo")
+            .args(cargo_args)
+            .current_dir(workspace)
+            .output()
+            .map_err(|error| format!("failed to run cargo {cargo_args:?}: {error}"))?;
+            if !output.status.success() {
+                return Err(format!(
+                    "cargo {cargo_args:?} failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
+                    output.status.code(),
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                ));
+            }
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .find_map(|message| {
+                    (message["reason"] == "compiler-artifact")
+                        .then(|| message["executable"].as_str().map(PathBuf::from))
+                        .flatten()
+                })
+                .ok_or_else(|| {
+                    format!(
+                        "Cargo did not report an executable for {cargo_args:?}\nstdout:\n{}\nstderr:\n{}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    )
+                })
+        })
+        .clone();
+    drop(results);
+    let artifact = result.unwrap_or_else(|error| panic!("{error}"));
+    assert!(
+        artifact.exists(),
+        "Cargo-reported executable does not exist: {}",
+        artifact.display()
+    );
+    artifact
 }
 
 fn workspace_root() -> PathBuf {
@@ -2478,21 +2688,6 @@ fn workspace_root() -> PathBuf {
         .and_then(Path::parent)
         .unwrap()
         .to_path_buf()
-}
-
-fn binary_path(workspace: &Path, name: &str) -> PathBuf {
-    workspace
-        .join("target")
-        .join("debug")
-        .join(format!("{name}{}", std::env::consts::EXE_SUFFIX))
-}
-
-fn example_path(workspace: &Path, name: &str) -> PathBuf {
-    workspace
-        .join("target")
-        .join("debug")
-        .join("examples")
-        .join(format!("{name}{}", std::env::consts::EXE_SUFFIX))
 }
 
 fn unique_temp_dir(name: &str) -> TestTempDir {
@@ -2509,8 +2704,15 @@ async fn subc_consumer_control_pushes_deliver_route_closed_on_module_death() {
     let workspace = workspace_root();
     let daemon_bin = ensure_binary(
         &workspace,
-        binary_path(&workspace, "ck-subc"),
-        &["build", "-p", "subc-core", "--bins"],
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-core",
+            "--bin",
+            "ck-subc",
+            "--message-format=json",
+        ],
     );
     let temp_dir = unique_temp_dir("subc-client-rs-control-push");
     let runtime_dir = temp_dir.join("runtime");
@@ -2570,8 +2772,15 @@ async fn subc_consumer_counts_control_pushes_dropped_without_receiver() {
     let workspace = workspace_root();
     let daemon_bin = ensure_binary(
         &workspace,
-        binary_path(&workspace, "ck-subc"),
-        &["build", "-p", "subc-core", "--bins"],
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-core",
+            "--bin",
+            "ck-subc",
+            "--message-format=json",
+        ],
     );
     let temp_dir = unique_temp_dir("subc-client-rs-control-push-drop");
     let runtime_dir = temp_dir.join("runtime");
@@ -2632,8 +2841,15 @@ async fn subc_consumer_push_burst_counts_overflow_and_keeps_the_subscription() {
     let workspace = workspace_root();
     let daemon_bin = ensure_binary(
         &workspace,
-        binary_path(&workspace, "ck-subc"),
-        &["build", "-p", "subc-core", "--bins"],
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-core",
+            "--bin",
+            "ck-subc",
+            "--message-format=json",
+        ],
     );
     let temp_dir = unique_temp_dir("subc-client-rs-push-burst");
     let runtime_dir = temp_dir.join("runtime");
@@ -2765,8 +2981,15 @@ async fn subc_consumer_retries_once_in_place_on_stale_route_epoch() {
     let workspace = workspace_root();
     let daemon_bin = ensure_binary(
         &workspace,
-        binary_path(&workspace, "ck-subc"),
-        &["build", "-p", "subc-core", "--bins"],
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-core",
+            "--bin",
+            "ck-subc",
+            "--message-format=json",
+        ],
     );
     let temp_dir = unique_temp_dir("subc-client-rs-stale-epoch");
     let runtime_dir = temp_dir.join("runtime");
@@ -3262,8 +3485,15 @@ async fn serve_returns_when_the_daemon_connection_closes_rather_than_reconnectin
     let workspace = workspace_root();
     let daemon_bin = ensure_binary(
         &workspace,
-        binary_path(&workspace, "ck-subc"),
-        &["build", "-p", "subc-core", "--bins"],
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-core",
+            "--bin",
+            "ck-subc",
+            "--message-format=json",
+        ],
     );
 
     let temp_dir = unique_temp_dir("subc-client-rs-serve-returns-on-eof");
@@ -3397,11 +3627,28 @@ async fn start_scope_harness() -> ScopeHarness {
     let workspace = workspace_root();
     let daemon_bin = ensure_binary(
         &workspace,
-        binary_path(&workspace, "ck-subc"),
-        &["build", "-p", "subc-core", "--bins"],
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-core",
+            "--bin",
+            "ck-subc",
+            "--message-format=json",
+        ],
     );
-    let stub_bin = binary_path(&workspace, "fake-aft-stub");
-    assert!(stub_bin.exists(), "expected {}", stub_bin.display());
+    let stub_bin = ensure_binary(
+        &workspace,
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-core",
+            "--bin",
+            "fake-aft-stub",
+            "--message-format=json",
+        ],
+    );
 
     let temp_dir = unique_temp_dir("subc-client-rs-scopes");
     let runtime_dir = temp_dir.join("runtime");
@@ -3991,13 +4238,27 @@ async fn start_drain_harness(
     let workspace = workspace_root();
     let daemon_bin = ensure_binary(
         &workspace,
-        binary_path(&workspace, "ck-subc"),
-        &["build", "-p", "subc-core", "--bins"],
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-core",
+            "--bin",
+            "ck-subc",
+            "--message-format=json",
+        ],
     );
     let module_bin = ensure_binary(
         &workspace,
-        example_path(&workspace, "echo-module"),
-        &["build", "-p", "subc-client-rs", "--example", "echo-module"],
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-client-rs",
+            "--example",
+            "echo-module",
+            "--message-format=json",
+        ],
     );
     let temp_dir = unique_temp_dir(name);
     let runtime_dir = temp_dir.join("runtime");
@@ -4319,13 +4580,27 @@ async fn run_scope_owner_with_config(steps: Value, extra_config: Value) -> Scope
     let workspace = workspace_root();
     let daemon_bin = ensure_binary(
         &workspace,
-        binary_path(&workspace, "ck-subc"),
-        &["build", "-p", "subc-core", "--bins"],
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-core",
+            "--bin",
+            "ck-subc",
+            "--message-format=json",
+        ],
     );
     let owner_bin = ensure_binary(
         &workspace,
-        example_path(&workspace, "scope-owner"),
-        &["build", "-p", "subc-client-rs", "--example", "scope-owner"],
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-client-rs",
+            "--example",
+            "scope-owner",
+            "--message-format=json",
+        ],
     );
 
     let temp_dir = unique_temp_dir("subc-client-rs-sdk-scopes");
@@ -4576,8 +4851,15 @@ async fn every_operation_on_a_detached_route_handle_fails_as_a_stale_route() {
     let workspace = workspace_root();
     let daemon_bin = ensure_binary(
         &workspace,
-        binary_path(&workspace, "ck-subc"),
-        &["build", "-p", "subc-core", "--bins"],
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-core",
+            "--bin",
+            "ck-subc",
+            "--message-format=json",
+        ],
     );
     let temp_dir = unique_temp_dir("subc-client-rs-detached-handle");
     let runtime_dir = temp_dir.join("runtime");

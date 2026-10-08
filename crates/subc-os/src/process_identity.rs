@@ -236,6 +236,12 @@ mod tests {
             "garbage",
             "linux-v2-1",
             "other-v1-1",
+            // A wrong prefix followed by well-formed numbers must still fail, so
+            // the check can't pass merely because the remainder is malformed.
+            "macos-v2-1-2",
+            "Macos-v1-1-2",
+            "xxxxxxxxx1-2",
+            "linux-v2-5",
             "linux-v1-",
             "linux-v1--1",
             "linux-v1-+1",

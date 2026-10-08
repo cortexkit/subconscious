@@ -472,6 +472,7 @@ struct ModuleConnection {
 
 #[derive(Debug, Default)]
 struct ForwardingInner {
+    operator_confirms: Arc<crate::operator_confirm::OperatorConfirms>,
     daemon_draining: bool,
     /// The ACTIVE slot: the one endpoint per module id that routing resolves.
     /// Every by-id lookup (relay reservation, drain-by-id, liveness, census,
@@ -562,6 +563,56 @@ pub struct ForwardingTable {
 }
 
 impl ForwardingTable {
+    pub(crate) fn operator_confirms(&self) -> Arc<crate::operator_confirm::OperatorConfirms> {
+        Arc::clone(
+            &self
+                .inner
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .operator_confirms,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_operator_principal(&self, key: ModuleRouteKey, principal: Principal) {
+        let mut inner = self.write_inner().unwrap();
+        let old = inner.module_to_client.remove(&key).unwrap();
+        let client = ClientRouteKey {
+            connection_id: old.client_connection_id,
+            channel: old.client_channel,
+        };
+        inner.client_to_module.remove(&client);
+        let mut binding = Arc::try_unwrap(old).expect("test binding has no outstanding readers");
+        binding.principal = principal;
+        let binding = Arc::new(binding);
+        inner.client_to_module.insert(client, Arc::clone(&binding));
+        inner.module_to_client.insert(key, binding);
+    }
+
+    /// Keep the binding protected through confirmation admission. Route release
+    /// takes the write lock and then the same confirm-state lock, so it cannot
+    /// miss an admitted request or leave it waiting on a vanished route.
+    pub(crate) fn with_operator_route<T>(
+        &self,
+        connection_id: ConnectionId,
+        channel: u16,
+        epoch: u32,
+        admit: impl FnOnce(Option<&RouteBinding>) -> T,
+    ) -> Result<T, ForwardingError> {
+        let inner = self.read_inner()?;
+        let binding = inner
+            .endpoint_by_connection
+            .get(&connection_id)
+            .and_then(|endpoint| {
+                inner.module_to_client.get(&ModuleRouteKey {
+                    endpoint: *endpoint,
+                    channel,
+                })
+            })
+            .filter(|binding| binding.module_epoch == epoch);
+        Ok(admit(binding.map(Arc::as_ref)))
+    }
+
     pub(crate) fn counters(&self) -> DaemonCounters {
         self.counters.clone()
     }
@@ -2894,6 +2945,10 @@ fn release_client_route_locked(
         endpoint: route.module_endpoint,
         channel: route.module_channel,
     });
+    inner.operator_confirms.route_closed(ModuleRouteKey {
+        endpoint: route.module_endpoint,
+        channel: route.module_channel,
+    });
     inner.status.remove(&(client_key, expected_epoch));
     RouteRelease::Removed(GoodbyeTarget {
         connection_id: route.module_endpoint.connection_id,
@@ -2921,6 +2976,7 @@ fn release_module_route_locked(
         .module_to_client
         .remove(&module_key)
         .expect("route checked under the same forwarding lock");
+    inner.operator_confirms.route_closed(module_key);
     route.flow.close();
     let client_key = ClientRouteKey {
         connection_id: route.client_connection_id,
@@ -3106,6 +3162,9 @@ fn remove_module_connection_locked(
     inner: &mut ForwardingInner,
     endpoint: ModuleEndpointId,
 ) -> ConnectionCleanup {
+    // Commit the disconnect before its routes are released, so their teardown
+    // cannot replace module_closed with route_closed.
+    inner.operator_confirms.module_closed(endpoint);
     inner.draining_endpoints.remove(&endpoint);
     let module_id = inner.module_id_by_endpoint.remove(&endpoint);
     if let Some(module_id) = module_id.as_ref() {

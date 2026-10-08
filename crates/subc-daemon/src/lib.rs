@@ -21,6 +21,7 @@ pub mod identity;
 mod live_children;
 pub mod machine_id;
 pub mod observability;
+pub mod operator_confirm;
 #[allow(dead_code)]
 mod provenance;
 pub mod registry;

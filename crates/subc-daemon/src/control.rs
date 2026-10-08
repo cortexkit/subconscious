@@ -30,7 +30,8 @@ use subc_protocol::{
     session::{
         validate_role_versions, HealthReport, ModuleControlPush, ModuleControlRequest,
         ModuleControlRequestFromModule, ModuleControlResponse, ModuleControlResponseToModule,
-        MODULE_CONTROL_OP_HEALTH_CHECK, MODULE_TO_SUBC_OP_CATALOG_UPDATE, ROLE_VERSIONS_FIELD,
+        OperatorConfirmRequest, MODULE_CONTROL_OP_HEALTH_CHECK, MODULE_TO_SUBC_OP_CATALOG_UPDATE,
+        ROLE_VERSIONS_FIELD,
     },
     BindIdentity, ErrorBody, Flags, FrameType, ModuleHelloAckBody, ModuleHelloBody, Principal,
     Priority, RouteTarget, PROTOCOL_VERSION,
@@ -110,6 +111,7 @@ const MODULE_TO_SUBC_CONTROL_OPS: &[&str] = &[
     "supervisor.live_roots",
     SCOPE_SYNC_OP,
     SCOPE_DESCRIBE_OP,
+    "operator.confirm",
 ];
 
 /// Module-originated ops the daemon answers but does not advertise in
@@ -1404,6 +1406,12 @@ impl ControlHandler {
             FrameType::Goodbye => self.handle_goodbye(ctx.connection_id),
             FrameType::Cancel => {
                 if self
+                    .forwarding
+                    .operator_confirms()
+                    .cancel(ctx.connection_id, frame.header.corr)
+                {
+                    Ok(Vec::new())
+                } else if self
                     .supervisor
                     .cancel_spawn_subscription(ctx.connection_id, frame.header.corr)
                 {
@@ -1417,6 +1425,15 @@ impl ControlHandler {
                 }
             }
             FrameType::Request => {
+                // This additive operation is not part of the existing exhaustive
+                // module-control enum. Probe the op before decoding that enum.
+                let op = serde_json::from_slice::<ControlOpProbe>(&frame.body).ok();
+                if op
+                    .as_ref()
+                    .is_some_and(|probe| probe.op == "operator.confirm")
+                {
+                    return self.handle_operator_confirm(ctx, frame);
+                }
                 if self
                     .forwarding
                     .module_endpoint_for_connection(ctx.connection_id)
@@ -2357,6 +2374,52 @@ impl ControlHandler {
                 self.handle_scope_describe(connection_id, frame, owner, scope_ref)
             }
         }
+    }
+
+    fn handle_operator_confirm(
+        &self,
+        ctx: &RouteCtx,
+        frame: Frame,
+    ) -> Result<Vec<Frame>, RouterError> {
+        use crate::operator_confirm::{audit, Outcome};
+        let registration = self
+            .registry
+            .get_module_by_connection(ctx.connection_id)
+            .map_err(|err| RouterError::backend(0, frame.header.corr, err.to_string()))?;
+        let Some(registration) = registration else {
+            let outcome = Outcome::refusal("not_registered");
+            audit("", "", "", outcome, Duration::ZERO, Duration::ZERO, false);
+            return Ok(vec![outcome.frame(&frame)]);
+        };
+        let request = match serde_json::from_slice::<OperatorConfirmRequest>(&frame.body) {
+            Ok(request) => request,
+            Err(_) => {
+                let outcome = Outcome::refusal("invalid_control_body");
+                audit("", "", "", outcome, Duration::ZERO, Duration::ZERO, false);
+                return Ok(vec![outcome.frame(&frame)]);
+            }
+        };
+        let module_id = registration.manifest.module_id;
+        // Finish every lookup on another daemon lock before taking forwarding.
+        let nonce = self
+            .hello_launch_nonces
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .nonce(ctx.connection_id)
+            .map(str::to_owned);
+        let nonce_proven = nonce.as_deref().is_some_and(|nonce| {
+            self.supervisor
+                .spawned_consumer_authorized(&module_id, nonce)
+        });
+        let confirms = self.forwarding.operator_confirms();
+        self.forwarding
+            .with_operator_route(
+                ctx.connection_id,
+                request.route_channel,
+                request.route_epoch,
+                |binding| confirms.admit(ctx, frame, module_id, nonce_proven, request, binding),
+            )
+            .map_err(RouterError::Forwarding)
     }
 
     /// `scope.sync`: the owner is the module registered on this connection.

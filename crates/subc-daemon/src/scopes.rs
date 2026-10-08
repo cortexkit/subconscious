@@ -78,6 +78,12 @@ impl HelloLaunchNonces {
         self.by_connection.remove(&connection_id);
     }
 
+    /// The presented credential, not a current-launch-only comparison. Swap
+    /// authorization accepts both live launches through the supervisor.
+    pub(crate) fn nonce(&self, connection_id: ConnectionId) -> Option<&str> {
+        self.by_connection.get(&connection_id).map(String::as_str)
+    }
+
     /// Whether `connection_id` presented `current`, the module's recorded
     /// spawn nonce. No recorded nonce (a module the supervisor did not spawn)
     /// is never current.

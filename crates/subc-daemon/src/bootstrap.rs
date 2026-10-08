@@ -97,6 +97,13 @@ pub enum CgroupPlacementConfig {
 
 #[derive(Debug, Clone)]
 pub struct BootstrapConfig {
+    pub operator_queue_wait: Duration,
+    pub operator_timeout: Duration,
+    pub operator_stuck_grace: Duration,
+    #[cfg(feature = "test-support")]
+    pub operator_script: Option<PathBuf>,
+    #[cfg(feature = "test-support")]
+    pub operator_events: Option<PathBuf>,
     pub connection_file_path: PathBuf,
     pub port: u16,
     pub daemon_ver: String,
@@ -150,6 +157,13 @@ impl BootstrapConfig {
     pub fn new(connection_file_path: impl Into<PathBuf>, port: u16) -> Self {
         Self {
             connection_file_path: connection_file_path.into(),
+            operator_queue_wait: Duration::from_secs(150),
+            operator_timeout: Duration::from_secs(120),
+            operator_stuck_grace: Duration::from_secs(10),
+            #[cfg(feature = "test-support")]
+            operator_script: None,
+            #[cfg(feature = "test-support")]
+            operator_events: None,
             port,
             daemon_ver: DAEMON_VERSION.to_owned(),
             configured_modules: Vec::new(),
@@ -231,11 +245,41 @@ impl BootstrapConfig {
         let run_dir = daemon_config::daemon_run_dir().map_err(BootstrapError::RunDir)?;
         let machine_id_path =
             crate::machine_id::default_machine_id_path().map_err(BootstrapError::MachineId)?;
-        Ok(Self::from_env()?
+        let config = Self::from_env()?
             .with_capture_logs_dir(run_dir.join("logs"))
             .with_terminal_journal_path(run_dir.join("terminals.jsonl"))
             .with_live_children_record(crate::live_children::record_path(&run_dir))
-            .with_machine_id_path(machine_id_path))
+            .with_machine_id_path(machine_id_path);
+        #[cfg(feature = "test-support")]
+        let config = {
+            let mut config = config;
+            config.operator_script =
+                std::env::var_os("SUBC_TEST_OPERATOR_SCRIPT").map(PathBuf::from);
+            config.operator_events =
+                std::env::var_os("SUBC_TEST_OPERATOR_EVENTS").map(PathBuf::from);
+            for (name, value) in [
+                (
+                    "SUBC_TEST_OPERATOR_QUEUE_WAIT_MS",
+                    &mut config.operator_queue_wait,
+                ),
+                (
+                    "SUBC_TEST_OPERATOR_TIMEOUT_MS",
+                    &mut config.operator_timeout,
+                ),
+                (
+                    "SUBC_TEST_OPERATOR_STUCK_MS",
+                    &mut config.operator_stuck_grace,
+                ),
+            ] {
+                if let Ok(ms) = std::env::var(name) {
+                    if let Ok(ms) = ms.parse::<u64>() {
+                        *value = Duration::from_millis(ms);
+                    }
+                }
+            }
+            config
+        };
+        Ok(config)
     }
 
     pub fn from_env_with_daemon_config_path(
@@ -515,6 +559,8 @@ pub async fn run() -> Result<(), BootstrapError> {
 /// (they measured 236 daemon lines with the subscriber installed, 0 with the
 /// call commented out) -- otherwise the fix is itself unverified.
 pub async fn run_with_config(config: BootstrapConfig) -> Result<(), BootstrapError> {
+    let forwarding = Arc::new(ForwardingTable::default());
+    forwarding.operator_confirms().configure_bootstrap(&config);
     let configured_modules = config.configured_modules.clone();
     let storage_config = config.storage_config.clone();
     let admission_facts = config.admission_facts.clone();
@@ -541,6 +587,7 @@ pub async fn run_with_config(config: BootstrapConfig) -> Result<(), BootstrapErr
             let _ = cgroup_placement_config;
             serve_bound_daemon(
                 bound,
+                forwarding,
                 configured_modules,
                 storage_config,
                 admission_facts,
@@ -689,6 +736,7 @@ pub async fn run_with_daemon_config_path(
 #[allow(clippy::too_many_arguments)]
 async fn serve_bound_daemon(
     bound: BoundDaemon,
+    forwarding: Arc<ForwardingTable>,
     configured_modules: Vec<ConfiguredModule>,
     storage_config: Option<daemon_config::StorageConfig>,
     admission_facts: AdmissionFactsConfig,
@@ -746,7 +794,6 @@ async fn serve_bound_daemon(
     let process_liveness = Arc::new(SupervisorProcessLiveness::new());
     let supervisor_handle = SupervisorHandle::new();
     let connected_clients = ConnectedClients::new();
-    let forwarding = Arc::new(ForwardingTable::default());
     let daemon_incarnation = format!(
         "{:032x}",
         u128::from_be_bytes(bound.connection_info.daemon_id)

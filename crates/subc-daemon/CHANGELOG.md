@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.32.7
+
+- Serve and advertise the additive `operator.confirm` operation with nonce/route permission checks, validated summaries, a bounded FIFO queue, decline back-off, independent withdraw/timeout/stuck timers, and bounded answer delivery. Audit every outcome with an escaped summary. The test-support provider is restricted to `ckdev-` executable names.
+
 ## 0.32.6
 
 - Validate optional module event declarations at HELLO before registry admission, refusing malformed blocks with `invalid_event_declaration` and a field-naming reason. Requires subc-protocol 0.29.3, whose manifest decoder retains `events` in the registry alongside the other manifest data. Older modules without events are unchanged.

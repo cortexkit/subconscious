@@ -112,9 +112,10 @@ impl OperatorProvider for OsProvider {
     }
 }
 
-/// Map the operating-system prompt's result. Only an explicit approval may
-/// become `Approved`; this is the one place a person's answer turns into
-/// permission, so it is a function with its own test rather than inline.
+/// Convert the operating-system prompt's result into the daemon's provider
+/// result. Only an explicit approval may become `Approved`. The real prompt
+/// needs a person, so tests can't reach this mapping through it; keeping it a
+/// separate function lets a test check that no other result grants a write.
 #[cfg(any(target_os = "macos", windows))]
 fn os_outcome(outcome: subc_presence::Outcome) -> ProviderResult {
     match outcome {

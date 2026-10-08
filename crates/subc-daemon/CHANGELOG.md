@@ -2,7 +2,7 @@
 
 ## 0.32.10
 
-- Connect `operator.confirm` to the isolated macOS LocalAuthentication and Windows Hello/CredUI providers. Only a successful OS authentication confirms; errors remain fail-closed. Linux still returns `unsupported_platform` without a prompt. Platform dialog withdrawal requires the recorded interactive release checks.
+- Connect `operator.confirm` to the isolated macOS LocalAuthentication and Windows Hello/CredUI providers. Only a successful OS authentication confirms; errors remain fail-closed. Linux still returns `unsupported_platform` without a prompt. Withdrawing a prompt that is on screen is supported only after the person-present checks in subc-presence's README pass on that platform.
 
 ## 0.32.9
 

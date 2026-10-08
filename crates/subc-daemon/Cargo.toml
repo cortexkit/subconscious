@@ -45,7 +45,9 @@ subc-cgroup = { path = "../subc-cgroup", version = "0.1.5" }
 subc-jobobject = { path = "../subc-jobobject", version = "0.2.0" }
 
 [target.'cfg(any(target_os = "macos", windows))'.dependencies]
-# Keep authentication bindings out of every module SDK's dependency graph.
+# The OS authentication prompts live only in the daemon. Keeping them in their
+# own crate, depended on here and nowhere else, keeps those platform bindings
+# out of subc-client-rs and the other crates modules build against.
 subc-presence = { path = "../subc-presence", version = "0.1.0" }
 
 [target.'cfg(unix)'.dependencies]

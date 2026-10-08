@@ -26,7 +26,9 @@ handle. An explicit successful authentication is the only approving outcome.
 
 ## Person-present release checks
 
-These checks cannot be inferred from unit tests. In particular, **Windows
+The checks below need a person at the machine and can't be inferred from unit
+tests: approving, cancelling, the password fallback, and withdrawing a prompt
+that is on screen. In particular, **Windows
 secure-desktop dialog dismissal on owner destruction is unmeasured** until the
 interactive check passes; a dialog that remains after withdraw is a failed check.
 

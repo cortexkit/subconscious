@@ -70,7 +70,8 @@ pub(super) fn prompt(text: &str, publish: Box<dyn FnOnce(Arc<dyn Withdraw>) + Se
             Event::Withdraw => {
                 // SAFETY: this thread owns the live context; invalidate is
                 // idempotent and ends evaluation with LAErrorAppCancel. Keep
-                // waiting for that reply so the daemon does not reuse the slot early.
+                // waiting for that reply: the daemon shows one prompt at a time
+                // and starts the next only after this call returns.
                 unsafe { context.invalidate() };
             }
         }

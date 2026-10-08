@@ -1,8 +1,9 @@
 //! Person-present provider smoke check, not an authorization API.
 //!
 //! Run without a timer to approve/cancel or choose the password fallback. A
-//! timer demonstrates withdrawal while a sheet/dialog is showing. This bypasses
-//! the daemon queue and therefore prints no daemon audit line.
+//! timer demonstrates withdrawal while a sheet/dialog is showing. It calls the
+//! prompt directly, without the daemon, so it skips the daemon's request queue
+//! and the audit log line the daemon writes for every request.
 
 use std::{sync::mpsc, time::Duration};
 

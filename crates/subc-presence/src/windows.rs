@@ -40,8 +40,9 @@ use zeroize::Zeroize;
 
 use crate::{no_presence, Outcome, Withdraw};
 
-// Leave margin for the 5 s CI assertion, including thread startup. Even a
-// stalled COM activation cannot hold the caller past this receive deadline.
+// The availability check must finish within 5 s (a CI test asserts this).
+// Waiting at most 4 s for its answer leaves room for thread startup, so even a
+// stalled COM activation can't hold the caller past that limit.
 const PRECHECK_LIMIT: Duration = Duration::from_secs(4);
 
 #[derive(Debug)]

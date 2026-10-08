@@ -183,16 +183,6 @@ impl Registry {
         inner.modules.insert(module_id, registration.clone());
         inner.bump_generation();
         inner.notify_module_changed(&registration.manifest.module_id);
-        info!(
-            target: "subc.registry",
-            module_id = %registration.manifest.module_id,
-            connection_id = registration.connection_id.get(),
-            module_version = %registration.manifest.module_version,
-            negotiated_ver = registration.negotiated_ver,
-            slot = %"active",
-            replaced = false,
-            "module registration admitted"
-        );
         Ok(registration)
     }
 
@@ -230,16 +220,6 @@ impl Registry {
         };
         inner.candidates.insert(module_id, registration.clone());
         inner.notify_module_changed(&registration.manifest.module_id);
-        info!(
-            target: "subc.registry",
-            module_id = %registration.manifest.module_id,
-            connection_id = registration.connection_id.get(),
-            module_version = %registration.manifest.module_version,
-            negotiated_ver = registration.negotiated_ver,
-            slot = %"candidate",
-            replaced = false,
-            "module registration admitted"
-        );
         Ok(registration)
     }
 

@@ -2,7 +2,7 @@
 
 ## 0.32.14
 
-- Log registry registration admissions and endings with module/connection identity and the known lifecycle reason, including blue/green replacement.
+- Log module registration endings with their reasons and when a blue/green candidate replaces an incumbent; keep the existing `module registered` admission line unchanged.
 
 ## 0.32.13
 

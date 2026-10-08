@@ -2131,6 +2131,15 @@ impl ControlHandler {
 
         self.apply_registration_capabilities(&registration);
 
+        info!(
+            module_id = %registration.manifest.module_id,
+            module_version = %registration.manifest.module_version,
+            negotiated_ver,
+            routable_provider = manifest_provides_routable_role(&registration.manifest),
+            connection_id = connection_id.get(),
+            "module registered"
+        );
+
         Ok(reply)
     }
 
@@ -2219,6 +2228,14 @@ impl ControlHandler {
             vec![hello_ack]
         };
         self.supervisor.mark_swap_candidate_admitted(&module_id);
+        info!(
+            module_id = %module_id,
+            module_version = %registration.manifest.module_version,
+            negotiated_ver,
+            ready = registration.ready,
+            connection_id = connection_id.get(),
+            "swap candidate registered; not routable until cutover"
+        );
         Ok(reply)
     }
 
@@ -5674,6 +5691,15 @@ fn target_has_required_role(target: &RouteTarget, roles: &[ProviderRole]) -> boo
     })
 }
 
+fn is_routable_role(role: &ProviderRole) -> bool {
+    matches!(
+        role,
+        ProviderRole::ToolProvider { .. }
+            | ProviderRole::ManagementSurface { .. }
+            | ProviderRole::InternalService { .. }
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ControlRequestBodyError {
     UnknownOp,
@@ -5973,6 +5999,10 @@ fn catalog_update_frozen_field_message(
     // control_ops live beside the manifest in the HELLO body, not inside
     // ModuleManifest, so a provides-only catalog.update cannot change them.
     None
+}
+
+fn manifest_provides_routable_role(manifest: &ModuleManifest) -> bool {
+    manifest.provides.iter().any(is_routable_role)
 }
 
 /// Returns the routable-provider concurrency subc should enforce for this manifest.
@@ -11224,7 +11254,7 @@ mod tests {
         let events: Vec<_> = captured
             .lines()
             .filter(|line| {
-                line.contains("module registration admitted")
+                line.contains("module registered module_id=aft ")
                     || line.contains("module registration ended")
             })
             .collect();
@@ -11233,19 +11263,50 @@ mod tests {
             2,
             "unexpected registry lifecycle logs: {captured}"
         );
-        assert!(events[0].contains(&format!(
-            "module_id=aft connection_id={}",
-            connection_id.get()
-        )));
-        assert!(events[0].contains("slot=active"));
-        assert!(events[0].contains("replaced=false"));
-        assert!(events[0].contains("module registration admitted"));
+        assert!(events[0].contains("module registered module_id=aft "));
+        assert!(events[0].contains(&format!("connection_id={}", connection_id.get())));
         assert!(events[1].contains(&format!(
             "module_id=aft connection_id={}",
             connection_id.get()
         )));
         assert!(events[1].contains("reason=connection_closed"));
         assert!(events[1].contains("module registration ended"));
+        assert_eq!(
+            captured
+                .lines()
+                .filter(|line| line.contains("module registered module_id=aft "))
+                .count(),
+            1,
+            "legacy registration admission line must appear once: {captured}"
+        );
+    }
+
+    #[tokio::test]
+    async fn hello_registration_keeps_legacy_module_registered_line_once() {
+        let (logs, _guard) = crate::router::test_log::log_capture(tracing::Level::INFO);
+        let registry = Arc::new(Registry::default());
+        let control = ControlHandler::new(Arc::clone(&registry));
+        let (ctx, mut rx) = route_ctx(ConnectionId::new(777));
+        hello_via_sink(
+            &control,
+            &ctx,
+            &mut rx,
+            hello_frame("prefrontal-host:test", PROTOCOL_VERSION, 1),
+        )
+        .await;
+
+        let captured = crate::router::test_log::captured_logs(&logs);
+        let admissions: Vec<_> = captured
+            .lines()
+            .filter(|line| line.contains("module registered module_id=prefrontal-host:test "))
+            .collect();
+        assert_eq!(
+            admissions.len(),
+            1,
+            "legacy admission line must remain exactly once: {captured}"
+        );
+        assert!(admissions[0].contains("routable_provider=true"));
+        assert!(admissions[0].contains("connection_id=777"));
     }
 
     fn capability_manifest(
@@ -11864,8 +11925,17 @@ mod tests {
         #[tokio::test]
         async fn replacement_logs_old_end_and_new_admission_once() {
             let (logs, _guard) = crate::router::test_log::log_capture(tracing::Level::INFO);
-            let swap = swap_with_incumbent().await;
-            register_candidate(&swap, None);
+            let mut swap = swap_with_incumbent().await;
+            swap.handler
+                .supervisor
+                .open_swap("aft", "candidate-nonce".to_string());
+            hello_via_sink(
+                &swap.handler,
+                &swap.candidate_ctx,
+                &mut swap.candidate_rx,
+                hello_frame_with_nonce("aft", PROTOCOL_VERSION, 8, Some("candidate-nonce")),
+            )
+            .await;
             cutover(&swap);
             swap.handler.cleanup_connection(INCUMBENT).unwrap();
 
@@ -11875,7 +11945,7 @@ mod tests {
                 .lines()
                 .filter(|line| {
                     line.contains("connection_id=40")
-                        && line.contains("module registration admitted")
+                        && line.contains("swap candidate registered; not routable until cutover")
                 })
                 .collect();
             assert_eq!(
@@ -11885,10 +11955,23 @@ mod tests {
             );
             assert!(new_admissions[0].contains("module_id=aft"));
             assert!(new_admissions[0].contains("connection_id=40"));
-            assert!(new_admissions[0].contains("module_version=0.1.0"));
-            assert!(new_admissions[0].contains("negotiated_ver=2"));
-            assert!(new_admissions[0].contains("slot=candidate"));
-            assert!(new_admissions[0].contains("replaced=false"));
+            assert!(
+                new_admissions[0].contains("swap candidate registered; not routable until cutover")
+            );
+            assert!(new_admissions[0].contains("ready=true"));
+
+            let old_admissions: Vec<_> = captured
+                .lines()
+                .filter(|line| {
+                    line.contains("module registered module_id=aft ")
+                        && line.contains("connection_id=30")
+                })
+                .collect();
+            assert_eq!(
+                old_admissions.len(),
+                1,
+                "unexpected incumbent admission: {captured}"
+            );
 
             let old_ends: Vec<_> = captured
                 .lines()

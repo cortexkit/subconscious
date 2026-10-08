@@ -99,22 +99,48 @@ impl OperatorProvider for OsProvider {
         }
         #[cfg(any(target_os = "macos", windows))]
         {
-            match subc_presence::prompt(
+            os_outcome(subc_presence::prompt(
                 text,
                 Box::new(move |handle| publish(Arc::new(OsWithdraw(handle)))),
-            ) {
-                subc_presence::Outcome::Approved => ProviderResult::Approved,
-                subc_presence::Outcome::Declined => ProviderResult::Declined,
-                subc_presence::Outcome::ProviderError => ProviderResult::Unavailable,
-                subc_presence::Outcome::NoPresence => ProviderResult::NoPresence,
-                subc_presence::Outcome::UnsupportedPlatform => ProviderResult::UnsupportedPlatform,
-            }
+            ))
         }
         #[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
         {
             let _ = (text, publish);
             ProviderResult::Unavailable
         }
+    }
+}
+
+/// Map the operating-system prompt's result. Only an explicit approval may
+/// become `Approved`; this is the one place a person's answer turns into
+/// permission, so it is a function with its own test rather than inline.
+#[cfg(any(target_os = "macos", windows))]
+fn os_outcome(outcome: subc_presence::Outcome) -> ProviderResult {
+    match outcome {
+        subc_presence::Outcome::Approved => ProviderResult::Approved,
+        subc_presence::Outcome::Declined => ProviderResult::Declined,
+        subc_presence::Outcome::ProviderError => ProviderResult::Unavailable,
+        subc_presence::Outcome::NoPresence => ProviderResult::NoPresence,
+        subc_presence::Outcome::UnsupportedPlatform => ProviderResult::UnsupportedPlatform,
+    }
+}
+
+#[cfg(all(test, any(target_os = "macos", windows)))]
+mod os_outcome_tests {
+    use super::*;
+
+    #[test]
+    fn only_an_os_approval_becomes_approved() {
+        use subc_presence::Outcome as Os;
+        assert_eq!(os_outcome(Os::Approved), ProviderResult::Approved);
+        assert_eq!(os_outcome(Os::Declined), ProviderResult::Declined);
+        assert_eq!(os_outcome(Os::ProviderError), ProviderResult::Unavailable);
+        assert_eq!(os_outcome(Os::NoPresence), ProviderResult::NoPresence);
+        assert_eq!(
+            os_outcome(Os::UnsupportedPlatform),
+            ProviderResult::UnsupportedPlatform
+        );
     }
 }
 

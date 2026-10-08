@@ -2655,11 +2655,20 @@ fn ensure_binary(workspace: &Path, cargo_args: &[&str]) -> PathBuf {
                     String::from_utf8_lossy(&output.stderr)
                 ));
             }
+            // Take the executable of the target the call named (`--bin X` or
+            // `--example X`), not merely the first executable cargo reports,
+            // so a build that also produces another binary can't hand back the
+            // wrong one.
+            let wanted = cargo_args
+                .windows(2)
+                .find(|pair| pair[0] == "--bin" || pair[0] == "--example")
+                .map(|pair| pair[1]);
             String::from_utf8_lossy(&output.stdout)
                 .lines()
                 .filter_map(|line| serde_json::from_str::<Value>(line).ok())
                 .find_map(|message| {
-                    (message["reason"] == "compiler-artifact")
+                    (message["reason"] == "compiler-artifact"
+                        && wanted.is_none_or(|name| message["target"]["name"] == name))
                         .then(|| message["executable"].as_str().map(PathBuf::from))
                         .flatten()
                 })

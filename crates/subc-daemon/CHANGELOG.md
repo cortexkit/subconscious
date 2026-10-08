@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.32.8
+
+- Fix build-script git provenance tracking so worktrees rebuild only when relevant git state changes.
+
 ## 0.32.7
 
 - Serve and advertise the additive `operator.confirm` operation with nonce/route permission checks, validated summaries, a bounded FIFO queue, decline back-off, independent withdraw/timeout/stuck timers, and bounded answer delivery. Audit every outcome with an escaped summary. Until a platform prompt is installed, every request is answered `operator_presence_unavailable`, so nothing can be approved by default. The scripted provider used by tests exists only with the `test-support` feature and only for daemons running under a `ckdev-` name, so a production `ck-subc` can never approve through it.

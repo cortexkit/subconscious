@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.20.65
+
+- Fix build-script git provenance tracking so worktrees rebuild only when relevant git state changes.
+
 ## 0.20.64
 
 - Show a module's latest health detail and headline metrics in `ck module status`, including healthy modules.

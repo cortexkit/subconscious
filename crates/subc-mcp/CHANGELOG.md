@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.26
+
+- Fix build-script git provenance tracking so worktrees rebuild only when relevant git state changes.
+
 ## 0.1.25
 
 - Update the test daemon dependency to subc-daemon 0.32 whose macOS launches give each supervised module its own privacy identity.

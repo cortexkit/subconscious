@@ -1,31 +1,21 @@
 use sha2::{Digest, Sha256};
-use std::{env, path::PathBuf, process::Command};
+use std::{
+    env,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 fn main() {
     println!("cargo:rerun-if-env-changed=CK_BUILD_REV");
     println!("cargo:rerun-if-env-changed=CK_BUILD_LOCK_DIGEST");
-    let root = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap()).join("../..");
-    // Resolve git paths through git so linked worktrees track their own HEAD.
-    for path in ["HEAD", "refs"] {
-        if let Ok(output) = Command::new("git")
-            .args(["rev-parse", "--git-path", path])
-            .current_dir(&root)
-            .output()
-        {
-            if output.status.success() {
-                println!(
-                    "cargo:rerun-if-changed={}",
-                    root.join(String::from_utf8_lossy(&output.stdout).trim())
-                        .display()
-                );
-            }
-        }
-    }
+    let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
+    let root = manifest_dir.join("../..");
+    emit_git_rerun_paths(&manifest_dir);
     let rev = env::var("CK_BUILD_REV")
         .ok()
         .or_else(|| {
             let output = Command::new("git")
-                .args(["rev-parse", "HEAD"])
+                .args(["--no-optional-locks", "rev-parse", "HEAD"])
                 .current_dir(&root)
                 .output()
                 .ok()?;
@@ -47,4 +37,49 @@ fn main() {
         .unwrap_or_else(|| "unavailable".to_owned());
     println!("cargo:rustc-env=CK_BUILD_REV={rev}");
     println!("cargo:rustc-env=CK_BUILD_LOCK_DIGEST={digest}");
+}
+
+// Keep this helper identical in the four build scripts; sharing it needs a build-dependency crate.
+fn emit_git_rerun_paths(root: &Path) {
+    for path in ["HEAD", "packed-refs", "index"] {
+        emit_git_rerun_path(root, path);
+    }
+
+    if let Ok(output) = Command::new("git")
+        .args(["--no-optional-locks", "symbolic-ref", "-q", "HEAD"])
+        .current_dir(root)
+        .output()
+    {
+        if output.status.success() {
+            if let Ok(branch_ref) = String::from_utf8(output.stdout) {
+                emit_git_rerun_path(root, branch_ref.trim());
+            }
+        }
+    }
+}
+
+fn emit_git_rerun_path(root: &Path, path: &str) {
+    let Some(path) = Command::new("git")
+        .args(["--no-optional-locks", "rev-parse", "--git-path", path])
+        .current_dir(root)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+    else {
+        return;
+    };
+    let path = path.trim();
+    if path.is_empty() {
+        return;
+    }
+    let path = Path::new(path);
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    };
+    if path.exists() {
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
 }

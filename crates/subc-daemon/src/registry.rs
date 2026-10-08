@@ -7,6 +7,7 @@ use std::{
 
 use subc_protocol::manifest::{CapabilityDeclarations, ModuleManifest, ProviderRole};
 use tokio::sync::watch;
+use tracing::info;
 
 /// Per-connection identity assigned by [`crate::Router`] while serving a socket.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -32,6 +33,30 @@ impl ConnectionId {
 pub enum ChannelState {
     Active,
     Closed,
+}
+
+/// Why a module registration stopped belonging to its connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RegistrationEndReason {
+    ConnectionClosed,
+    ExplicitGoodbye,
+    Replaced,
+    SupervisorStop,
+    SupervisorRestart,
+    RegistrationFailed,
+}
+
+impl RegistrationEndReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ConnectionClosed => "connection_closed",
+            Self::ExplicitGoodbye => "explicit_goodbye",
+            Self::Replaced => "replaced",
+            Self::SupervisorStop => "supervisor_stop",
+            Self::SupervisorRestart => "supervisor_restart",
+            Self::RegistrationFailed => "registration_failed",
+        }
+    }
 }
 
 /// Registry record for one active module registration.
@@ -104,6 +129,8 @@ struct RegistryInner {
     /// Former incumbents demoted by a promotion, kept only so their own
     /// connection can still find and remove them. Never routable, never listed.
     superseded: Vec<ModuleRegistration>,
+    /// The active connection that displaced each superseded registration.
+    superseded_by: HashMap<ConnectionId, ConnectionId>,
     generation: u64,
 }
 
@@ -156,6 +183,16 @@ impl Registry {
         inner.modules.insert(module_id, registration.clone());
         inner.bump_generation();
         inner.notify_module_changed(&registration.manifest.module_id);
+        info!(
+            target: "subc.registry",
+            module_id = %registration.manifest.module_id,
+            connection_id = registration.connection_id.get(),
+            module_version = %registration.manifest.module_version,
+            negotiated_ver = registration.negotiated_ver,
+            slot = %"active",
+            replaced = false,
+            "module registration admitted"
+        );
         Ok(registration)
     }
 
@@ -193,6 +230,16 @@ impl Registry {
         };
         inner.candidates.insert(module_id, registration.clone());
         inner.notify_module_changed(&registration.manifest.module_id);
+        info!(
+            target: "subc.registry",
+            module_id = %registration.manifest.module_id,
+            connection_id = registration.connection_id.get(),
+            module_version = %registration.manifest.module_version,
+            negotiated_ver = registration.negotiated_ver,
+            slot = %"candidate",
+            replaced = false,
+            "module registration admitted"
+        );
         Ok(registration)
     }
 
@@ -213,7 +260,19 @@ impl Registry {
             .modules
             .insert(module_id.to_string(), promoted.clone());
         if let Some(superseded) = superseded.clone() {
+            let replaced_connection_id = superseded.connection_id.get();
+            inner
+                .superseded_by
+                .insert(superseded.connection_id, promoted.connection_id);
             inner.superseded.push(superseded);
+            info!(
+                target: "subc.registry",
+                module_id = %module_id,
+                connection_id = promoted.connection_id.get(),
+                replaced = true,
+                replaced_connection_id,
+                "module registration promoted"
+            );
         }
         inner.bump_generation();
         inner.notify_module_changed(module_id);
@@ -337,6 +396,17 @@ impl Registry {
         &self,
         connection_id: ConnectionId,
     ) -> Result<Vec<ModuleRegistration>, RegistryError> {
+        self.deregister_connection_with_reason(
+            connection_id,
+            RegistrationEndReason::ConnectionClosed,
+        )
+    }
+
+    pub(crate) fn deregister_connection_with_reason(
+        &self,
+        connection_id: ConnectionId,
+        reason: RegistrationEndReason,
+    ) -> Result<Vec<ModuleRegistration>, RegistryError> {
         let mut inner = self.lock_inner()?;
         let module_ids: Vec<String> = inner
             .modules
@@ -366,6 +436,10 @@ impl Registry {
         let (removed, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut inner.superseded)
             .into_iter()
             .partition(|registration| registration.connection_id == connection_id);
+        let superseded_connections: std::collections::HashSet<_> = removed
+            .iter()
+            .map(|registration| registration.connection_id)
+            .collect();
         inner.superseded = kept;
         closed.extend(removed.into_iter().map(|mut registration| {
             registration.state = ChannelState::Closed;
@@ -373,6 +447,38 @@ impl Registry {
         }));
         for registration in &closed {
             inner.notify_module_changed(&registration.manifest.module_id);
+            let replaced = superseded_connections.contains(&registration.connection_id);
+            let end_reason = if replaced {
+                RegistrationEndReason::Replaced
+            } else {
+                reason
+            };
+            let replaced_by_connection_id = if replaced {
+                inner
+                    .superseded_by
+                    .remove(&registration.connection_id)
+                    .map(ConnectionId::get)
+            } else {
+                None
+            };
+            if let Some(replaced_by_connection_id) = replaced_by_connection_id {
+                info!(
+                    target: "subc.registry",
+                    module_id = %registration.manifest.module_id,
+                    connection_id = registration.connection_id.get(),
+                    reason = %end_reason.as_str(),
+                    replaced_by_connection_id,
+                    "module registration ended"
+                );
+                continue;
+            }
+            info!(
+                target: "subc.registry",
+                module_id = %registration.manifest.module_id,
+                connection_id = registration.connection_id.get(),
+                reason = %end_reason.as_str(),
+                "module registration ended"
+            );
         }
         Ok(closed)
     }

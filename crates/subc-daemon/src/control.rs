@@ -57,7 +57,7 @@ use crate::{
     provenance::{
         process_start_time, spawned_file_identity, ExecutableIdentityProbe, SpawnedFileIdentity,
     },
-    registry::{ChannelState, ConnectionId, Registry, RegistryError},
+    registry::{ChannelState, ConnectionId, RegistrationEndReason, Registry, RegistryError},
     router::{RouteCtx, RouterError},
     scopes::{BoundScope, HelloLaunchNonces, ScopeTable},
     server::MAX_PENDING_ROUTE_BINDS_PER_TARGET,
@@ -1270,13 +1270,15 @@ impl ControlHandler {
     /// registration-release watch. The signal is what the supervisor waits on
     /// before spawning a replacement, so it must only fire once forwarding
     /// teardown is also done (see [`Self::cleanup_connection`] /
-    /// [`Self::handle_goodbye`]). Used directly only where there is no forwarding
-    /// state to tear down (a HELLO that failed before module registration).
+    /// [`Self::handle_goodbye`]). Used directly only where a registry entry was
+    /// admitted but its forwarding endpoint could not be installed.
     fn deregister_connection(
         &self,
         connection_id: ConnectionId,
+        reason: RegistrationEndReason,
     ) -> Result<Vec<crate::registry::ModuleRegistration>, RegistryError> {
-        self.registry.deregister_connection(connection_id)
+        self.registry
+            .deregister_connection_with_reason(connection_id, reason)
     }
 
     pub(crate) fn route_open_target(&self, frame: &Frame) -> Option<String> {
@@ -1546,6 +1548,26 @@ impl ControlHandler {
         &self,
         connection_id: ConnectionId,
     ) -> Result<Vec<crate::registry::ModuleRegistration>, RegistryError> {
+        self.cleanup_connection_with_end_reason(
+            connection_id,
+            RegistrationEndReason::ConnectionClosed,
+        )
+    }
+
+    fn cleanup_connection_with_end_reason(
+        &self,
+        connection_id: ConnectionId,
+        requested_reason: RegistrationEndReason,
+    ) -> Result<Vec<crate::registry::ModuleRegistration>, RegistryError> {
+        let end_reason = if requested_reason == RegistrationEndReason::ConnectionClosed {
+            self.registry
+                .get_module_by_connection(connection_id)?
+                .and_then(|registration| self.supervisor.get(&registration.manifest.module_id))
+                .and_then(|module| module.registration_end_reason().ok().flatten())
+                .unwrap_or(requested_reason)
+        } else {
+            requested_reason
+        };
         let crash_closed = self
             .registry
             .get_module_by_connection(connection_id)?
@@ -1585,7 +1607,7 @@ impl ControlHandler {
             };
             (module_id, routes, reason, terminal)
         });
-        let registrations = self.deregister_connection(connection_id);
+        let registrations = self.deregister_connection(connection_id, end_reason);
         let cleanup = if crash_closed.is_some() {
             self.forwarding.cleanup_connection_counted(connection_id)
         } else {
@@ -2066,7 +2088,13 @@ impl ControlHandler {
                 // Forwarding registration failed, so there is no forwarding
                 // state to tear down. Remove the registry entry and signal the
                 // release watch directly.
-                if matches!(self.deregister_connection(connection_id), Ok(r) if !r.is_empty()) {
+                if matches!(
+                    self.deregister_connection(
+                        connection_id,
+                        RegistrationEndReason::RegistrationFailed,
+                    ),
+                    Ok(r) if !r.is_empty()
+                ) {
                     crate::supervise::notify_registration_release();
                 }
                 return Ok(vec![control_error_frame(
@@ -2102,15 +2130,6 @@ impl ControlHandler {
         }
 
         self.apply_registration_capabilities(&registration);
-
-        info!(
-            module_id = %registration.manifest.module_id,
-            module_version = %registration.manifest.module_version,
-            negotiated_ver,
-            routable_provider = manifest_provides_routable_role(&registration.manifest),
-            connection_id = connection_id.get(),
-            "module registered"
-        );
 
         Ok(reply)
     }
@@ -2180,7 +2199,13 @@ impl ControlHandler {
                 sink,
                 hello_ack,
             ) {
-                if matches!(self.deregister_connection(connection_id), Ok(r) if !r.is_empty()) {
+                if matches!(
+                    self.deregister_connection(
+                        connection_id,
+                        RegistrationEndReason::RegistrationFailed,
+                    ),
+                    Ok(r) if !r.is_empty()
+                ) {
                     crate::supervise::notify_registration_release();
                 }
                 return Ok(vec![control_error_frame(
@@ -2194,14 +2219,6 @@ impl ControlHandler {
             vec![hello_ack]
         };
         self.supervisor.mark_swap_candidate_admitted(&module_id);
-        info!(
-            module_id = %module_id,
-            module_version = %registration.manifest.module_version,
-            negotiated_ver,
-            ready = registration.ready,
-            connection_id = connection_id.get(),
-            "swap candidate registered; not routable until cutover"
-        );
         Ok(reply)
     }
 
@@ -5542,8 +5559,11 @@ impl ControlHandler {
         // GOODBYE ends the connection's logical session even when its socket
         // stays open. Use disconnect teardown so verdicts, client notices and
         // scope authority are released at the same lifecycle boundary.
-        self.cleanup_connection(connection_id)
-            .map_err(|err| RouterError::backend(0, 0, err.to_string()))?;
+        self.cleanup_connection_with_end_reason(
+            connection_id,
+            RegistrationEndReason::ExplicitGoodbye,
+        )
+        .map_err(|err| RouterError::backend(0, 0, err.to_string()))?;
         Ok(Vec::new())
     }
 }
@@ -5652,15 +5672,6 @@ fn target_has_required_role(target: &RouteTarget, roles: &[ProviderRole]) -> boo
         ) => service_id == provided,
         _ => false,
     })
-}
-
-fn is_routable_role(role: &ProviderRole) -> bool {
-    matches!(
-        role,
-        ProviderRole::ToolProvider { .. }
-            | ProviderRole::ManagementSurface { .. }
-            | ProviderRole::InternalService { .. }
-    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5962,10 +5973,6 @@ fn catalog_update_frozen_field_message(
     // control_ops live beside the manifest in the HELLO body, not inside
     // ModuleManifest, so a provides-only catalog.update cannot change them.
     None
-}
-
-fn manifest_provides_routable_role(manifest: &ModuleManifest) -> bool {
-    manifest.provides.iter().any(is_routable_role)
 }
 
 /// Returns the routable-provider concurrency subc should enforce for this manifest.
@@ -11081,6 +11088,7 @@ mod tests {
 
     #[tokio::test]
     async fn goodbye_tears_down_registration_and_later_channel_is_unknown() {
+        let (logs, _guard) = crate::router::test_log::log_capture(tracing::Level::INFO);
         let registry = Arc::new(Registry::default());
         let control = Arc::new(ControlHandler::new(Arc::clone(&registry)));
         let router = Router::with_control_handler(Arc::clone(&control));
@@ -11109,6 +11117,19 @@ mod tests {
         let error_frame = rx.recv().await.unwrap();
         assert_eq!(error_frame.header.ty, FrameType::Error);
         assert_eq!(error_frame.header.channel, channel);
+        let captured = crate::router::test_log::captured_logs(&logs);
+        assert_eq!(
+            captured
+                .lines()
+                .filter(|line| {
+                    line.contains("module_id=aft")
+                        && line.contains("reason=explicit_goodbye")
+                        && line.contains("module registration ended")
+                })
+                .count(),
+            1,
+            "unexpected GOODBYE registry log: {captured}"
+        );
     }
 
     #[tokio::test]
@@ -11173,11 +11194,13 @@ mod tests {
 
     #[tokio::test]
     async fn dropping_router_connection_releases_registration() {
+        let (logs, _guard) = crate::router::test_log::log_capture(tracing::Level::INFO);
         let registry = Arc::new(Registry::default());
         let control = Arc::new(ControlHandler::new(Arc::clone(&registry)));
-        let router = Router::with_control_handler(control);
+        let router = Router::with_control_handler(Arc::clone(&control));
         let connection = router.begin_connection();
-        let (ctx, mut rx) = route_ctx(connection.id());
+        let connection_id = connection.id();
+        let (ctx, mut rx) = route_ctx(connection_id);
 
         router
             .route_for_connection(&ctx, hello_frame("aft", PROTOCOL_VERSION, 31))
@@ -11192,6 +11215,37 @@ mod tests {
 
         assert!(registry.get_module("aft").unwrap().is_none());
         assert_eq!(registry.active_registration_count().unwrap(), 0);
+
+        control
+            .cleanup_connection(ConnectionId::new(u64::MAX))
+            .unwrap();
+        let captured = crate::router::test_log::captured_logs(&logs);
+        println!("captured registry lifecycle logs:\n{captured}");
+        let events: Vec<_> = captured
+            .lines()
+            .filter(|line| {
+                line.contains("module registration admitted")
+                    || line.contains("module registration ended")
+            })
+            .collect();
+        assert_eq!(
+            events.len(),
+            2,
+            "unexpected registry lifecycle logs: {captured}"
+        );
+        assert!(events[0].contains(&format!(
+            "module_id=aft connection_id={}",
+            connection_id.get()
+        )));
+        assert!(events[0].contains("slot=active"));
+        assert!(events[0].contains("replaced=false"));
+        assert!(events[0].contains("module registration admitted"));
+        assert!(events[1].contains(&format!(
+            "module_id=aft connection_id={}",
+            connection_id.get()
+        )));
+        assert!(events[1].contains("reason=connection_closed"));
+        assert!(events[1].contains("module registration ended"));
     }
 
     fn capability_manifest(
@@ -11805,6 +11859,56 @@ mod tests {
                 .as_object()
                 .map(|counts| counts.values().filter_map(Value::as_u64).sum())
                 .unwrap_or(0)
+        }
+
+        #[tokio::test]
+        async fn replacement_logs_old_end_and_new_admission_once() {
+            let (logs, _guard) = crate::router::test_log::log_capture(tracing::Level::INFO);
+            let swap = swap_with_incumbent().await;
+            register_candidate(&swap, None);
+            cutover(&swap);
+            swap.handler.cleanup_connection(INCUMBENT).unwrap();
+
+            let captured = crate::router::test_log::captured_logs(&logs);
+            println!("captured replacement registry logs:\n{captured}");
+            let new_admissions: Vec<_> = captured
+                .lines()
+                .filter(|line| {
+                    line.contains("connection_id=40")
+                        && line.contains("module registration admitted")
+                })
+                .collect();
+            assert_eq!(
+                new_admissions.len(),
+                1,
+                "unexpected admission logs: {captured}"
+            );
+            assert!(new_admissions[0].contains("module_id=aft"));
+            assert!(new_admissions[0].contains("connection_id=40"));
+            assert!(new_admissions[0].contains("module_version=0.1.0"));
+            assert!(new_admissions[0].contains("negotiated_ver=2"));
+            assert!(new_admissions[0].contains("slot=candidate"));
+            assert!(new_admissions[0].contains("replaced=false"));
+
+            let old_ends: Vec<_> = captured
+                .lines()
+                .filter(|line| {
+                    line.contains("connection_id=30") && line.contains("module registration ended")
+                })
+                .collect();
+            assert_eq!(old_ends.len(), 1, "unexpected end logs: {captured}");
+            assert!(old_ends[0].contains("module_id=aft"));
+            assert!(old_ends[0].contains("connection_id=30"));
+            assert!(old_ends[0].contains("reason=replaced"));
+            assert!(old_ends[0].contains("replaced_by_connection_id=40"));
+            assert_eq!(
+                captured
+                    .lines()
+                    .filter(|line| line.contains("module registration promoted"))
+                    .count(),
+                1,
+                "unexpected promotion logs: {captured}"
+            );
         }
 
         /// An ack from the incumbent for a bind it was sent before cutover,

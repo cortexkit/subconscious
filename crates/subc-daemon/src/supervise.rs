@@ -40,7 +40,7 @@ use crate::{
         ModuleDrainTarget, PendingModuleControlRpc,
     },
     provenance::{spawned_file_identity, ExecutableIdentityProbe, SpawnedFileIdentity},
-    registry::{ConnectionId, RegistryError},
+    registry::{ConnectionId, RegistrationEndReason, RegistryError},
     stderr_tail::{
         pump_stderr_to, pump_stdout_to, ChildOutputSink, StderrRing, StderrTailConfig,
         StderrTailSnapshot,
@@ -3204,6 +3204,22 @@ impl SupervisedModule {
 
     pub fn state(&self) -> Result<ModuleState, SuperviseError> {
         Ok(lock_snapshot(&self.inner.snapshot)?.state)
+    }
+
+    pub(crate) fn registration_end_reason(
+        &self,
+    ) -> Result<Option<RegistrationEndReason>, SuperviseError> {
+        let snapshot = lock_snapshot(&self.inner.snapshot)?;
+        Ok(match snapshot.state {
+            ModuleState::Draining if snapshot.draining_to_replace => {
+                Some(RegistrationEndReason::SupervisorRestart)
+            }
+            ModuleState::Draining => Some(RegistrationEndReason::SupervisorStop),
+            ModuleState::Restarting if snapshot.draining_to_replace => {
+                Some(RegistrationEndReason::SupervisorRestart)
+            }
+            _ => None,
+        })
     }
 
     /// The module's retained stderr, newest lines last.

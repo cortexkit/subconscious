@@ -26,7 +26,11 @@ fn main() {
         })
         .unwrap_or_else(|| "unavailable".to_owned());
     let lock = root.join("Cargo.lock");
-    println!("cargo:rerun-if-changed={}", lock.display());
+    // Watch the lock only where it exists: cargo treats a missing watched path
+    // as always changed and would rebuild this crate on every build.
+    if lock.exists() {
+        println!("cargo:rerun-if-changed={}", lock.display());
+    }
     let digest = env::var("CK_BUILD_LOCK_DIGEST")
         .ok()
         .or_else(|| {

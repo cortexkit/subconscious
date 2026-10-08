@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.26.3
+
+- Add the opt-in, tests-only `test-support` feature and `test_support::ModuleHarness`. Module tests can run their real serve handler over an in-memory stand-in daemon connection, bind routes, send requests, inspect replies and channel-0 traffic, and script each `operator.confirm` answer (confirmation, all four refusals with `detail.reason`, unknown operation, or silence). Use this feature only on a dev-dependency. Silence/deadline tests can use Tokio's paused clock without changing the production confirmation timeout.
+- Add `serve_from_env_with_handle(manifest, handler)`, which uses `serve`'s argv, module-id environment and launch-secret handling but returns the live `ModuleHandle` and serve future. `serve` now delegates to it, so modules that need the handle do not have to copy private launch parsing.
+
 ## 0.26.2
 
 - Add `ModuleHandle::confirm_operator(summary, caller_route)`, which asks the daemon to confirm with the person at the machine that one in-flight request may proceed (the `operator.confirm` control operation). It returns `Ok(())` only for a `confirmed` reply. Every error, including `Unsupported` from a daemon without the operation, means the module must refuse the write. It waits at most 290 seconds and never retries; dropping its future withdraws the request. Requires subc-protocol 0.29.4.

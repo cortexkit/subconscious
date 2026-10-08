@@ -2,6 +2,10 @@
 
 pub mod consumer;
 pub mod policy_cache;
+#[cfg(any(test, feature = "test-support"))]
+mod stand_in;
+#[cfg(feature = "test-support")]
+pub mod test_support;
 pub use consumer::{
     is_retryable_route_open_code, CallError, CallOptions, CatalogList, CloseRouteOptions,
     ConnectionState, ConsumerError, ConsumerOptions, ControlPush, OutcomeUnknownCause, PushEvent,
@@ -1690,7 +1694,30 @@ enum BindDecisionKind {
 /// authenticates, sends HELLO, waits for HELLO_ACK, then serves frames until
 /// GOODBYE or clean EOF. Which of those ended it is passed to
 /// [`ModuleHandler::on_connection_end`].
-pub async fn serve<H>(mut manifest: ModuleManifest, handler: H) -> Result<(), SubcModuleError>
+pub async fn serve<H>(manifest: ModuleManifest, handler: H) -> Result<(), SubcModuleError>
+where
+    H: ModuleHandler,
+{
+    let (_handle, serve_future) = serve_from_env_with_handle(manifest, handler).await?;
+    serve_future.await
+}
+
+/// Connect and register using the same launch inputs as [`serve`], returning a
+/// cloneable handle and the future that keeps the module serving.
+///
+/// Reads `--subc <connection-file>` (or `--subc=<connection-file>`) from argv
+/// and overrides the manifest's module id with `SUBC_MODULE_ID` when present.
+/// Authentication, the launch-secret pipe, HELLO and their errors are identical
+/// to [`serve`]. Unlike [`serve_with_handle`], the caller need not duplicate
+/// argument parsing or launch-environment handling.
+///
+/// The returned serve future **must be awaited or spawned**. A module can give
+/// the returned handle to its handler's shared state before starting that future,
+/// so the handler can call [`ModuleHandle::confirm_operator`].
+pub async fn serve_from_env_with_handle<H>(
+    mut manifest: ModuleManifest,
+    handler: H,
+) -> Result<(ModuleHandle, ModuleServeFuture), SubcModuleError>
 where
     H: ModuleHandler,
 {
@@ -1698,7 +1725,7 @@ where
     if let Some(module_id) = module_id_from_env()? {
         manifest.module_id = module_id;
     }
-    serve_with(&connection_file, manifest, handler).await
+    serve_with_handle(&connection_file, manifest, handler).await
 }
 
 /// Run a module with an explicit connection-file path. The manifest is sent as
@@ -1746,8 +1773,25 @@ where
         close_token,
         connection_runtime,
     );
+    let serve_future = connection_serve_future(read_half, tx, handler, handle.clone(), writer);
+    Ok((handle, serve_future))
+}
+
+// Both real connections and the in-memory test stand-in run this lifecycle,
+// including request cancellation, connection-end hooks and the writer drain.
+fn connection_serve_future<R, H>(
+    read_half: R,
+    tx: mpsc::Sender<Frame>,
+    handler: Arc<H>,
+    handle: ModuleHandle,
+    writer: tokio::task::JoinHandle<Result<(), FrameIoError>>,
+) -> ModuleServeFuture
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    H: ModuleHandler,
+{
     let serve_handle = handle.clone();
-    let serve_future = Box::pin(async move {
+    Box::pin(async move {
         // Connection loss ends this serve future. Module serving retains no
         // reconnect task or in-flight reconnect gate; a supervisor that needs
         // recovery starts a fresh serve_with_handle invocation.
@@ -1796,8 +1840,7 @@ where
             (Ok(()), Ok(Err(writer_err))) => Err(SubcModuleError::FrameIo(writer_err)),
             (Ok(()), Err(join_err)) => Err(join_err),
         }
-    });
-    Ok((handle, serve_future))
+    })
 }
 
 async fn module_loop<R, H>(
@@ -3742,19 +3785,14 @@ mod tests {
 }
 
 /// How a served module ends when its connection closes, driven against a stand-in
-/// daemon on a real socket so the writer task and its drain are the real ones.
+/// daemon on a framed in-memory connection with the real writer task and drain.
 #[cfg(test)]
 mod module_close_tests {
     use std::time::Instant;
 
-    use subc_protocol::manifest::ModuleManifest;
-    use subc_test_support::TestTempDir;
-    use subc_transport::{
-        authenticate_server, generate_daemon_id, generate_key, write_atomic, ConnectionInfo,
-        Endpoint, SCHEMA_VERSION,
-    };
-    use tokio::{net::TcpListener, sync::Notify, task::JoinHandle};
+    use tokio::{io::DuplexStream, sync::Notify};
 
+    use super::stand_in::{serve_against_stand_in_with_ops, Served};
     use super::*;
 
     /// How the test handler treats the one request it is given.
@@ -3790,85 +3828,12 @@ mod module_close_tests {
         }
     }
 
-    pub(super) struct Served {
-        pub(super) daemon: TcpStream,
-        pub(super) handle: ModuleHandle,
-        pub(super) serve: JoinHandle<Result<(), SubcModuleError>>,
-        _dir: TestTempDir,
-    }
-
-    /// Serve `handler` against a stand-in daemon that authenticates the module
-    /// and acknowledges its HELLO, then hands the daemon's socket to the test.
+    /// Serve `handler` on the shared stand-in and hand its framed connection to the test.
     async fn serve_against_stand_in<H: ModuleHandler>(handler: H) -> Served {
-        serve_against_stand_in_with_ops(handler, &[]).await
+        serve_against_stand_in_with_ops(|_| handler, &[]).await
     }
 
-    pub(super) async fn serve_against_stand_in_with_ops<H: ModuleHandler>(
-        handler: H,
-        subc_ops: &[&str],
-    ) -> Served {
-        let dir = TestTempDir::new("subc-client-rs-module-close");
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let connection = ConnectionInfo {
-            schema: SCHEMA_VERSION,
-            wire_version: None,
-            endpoints: vec![Endpoint {
-                host: "127.0.0.1".to_string(),
-                port: listener.local_addr().unwrap().port(),
-            }],
-            key: generate_key().unwrap(),
-            daemon_id: generate_daemon_id().unwrap(),
-            pid: std::process::id(),
-            daemon_ver: "subc-client-rs-module-close".to_string(),
-        };
-        let path = dir.join("subc-conn.json");
-        write_atomic(&path, &connection).unwrap();
-
-        let manifest = ModuleManifest::builder("close-test", env!("CARGO_PKG_VERSION")).build();
-        let serving =
-            tokio::spawn(async move { serve_with_handle(&path, manifest, handler).await });
-        let (mut daemon, _) = listener.accept().await.unwrap();
-        authenticate_server(
-            &mut daemon,
-            &connection.key,
-            &connection.daemon_id,
-            &connection.daemon_ver,
-            Duration::from_secs(2),
-        )
-        .await
-        .unwrap();
-        let hello = read_frame(&mut daemon).await.unwrap().unwrap();
-        assert_eq!(hello.header.ty, FrameType::Hello);
-        let ack = ModuleHelloAckBody {
-            negotiated_ver: PROTOCOL_VERSION,
-            subc_ops: subc_ops.iter().map(|op| (*op).to_owned()).collect(),
-            subc_capabilities: Vec::new(),
-            storage: None,
-            machine_id: None,
-        };
-        send(
-            &mut daemon,
-            Frame::build(
-                FrameType::HelloAck,
-                control_flags(),
-                0,
-                0,
-                HELLO_CORR,
-                serde_json::to_vec(&ack).unwrap(),
-            )
-            .unwrap(),
-        )
-        .await;
-        let (handle, serve_future) = serving.await.unwrap().unwrap();
-        Served {
-            daemon,
-            handle,
-            serve: tokio::spawn(serve_future),
-            _dir: dir,
-        }
-    }
-
-    async fn send(daemon: &mut TcpStream, frame: Frame) {
+    async fn send(daemon: &mut DuplexStream, frame: Frame) {
         write_frame(daemon, &frame).await.unwrap();
         daemon.flush().await.unwrap();
     }
@@ -4003,7 +3968,6 @@ mod module_close_tests {
             daemon,
             handle,
             serve: _serve,
-            _dir,
         } = serve_against_stand_in(EchoHandler).await;
         assert!(!handle.is_closed());
         drop(daemon);

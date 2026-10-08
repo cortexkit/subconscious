@@ -1,10 +1,14 @@
 # Changelog
 
+## 0.29.4
+
+- Add standalone, `#[non_exhaustive]` `session::OperatorConfirmRequest` and `session::OperatorConfirmReply` bodies for the module-to-daemon `operator.confirm` control operation, with constructors. The request carries the summary and the caller's route channel/epoch on the module connection; the successful reply carries `outcome: "confirmed"`. Refusals use the new `operator_declined`, `operator_presence_unavailable`, `operator_summary_invalid` and `operator_request_not_permitted` error codes. All four are terminal in the route-open retry predicate but are not route-open refusals, so the route-open decision table is unchanged. Additive: neither existing module-control enum changes, and no consumer code change is needed.
+
 ## 0.29.3
 
 - Add optional `ModuleManifest.events: Option<Vec<EventDeclaration>>` and its builder setter. `EventDeclaration` is non-exhaustive, constructor-built, and declares a name, version, filter headers and optional consent-card summary. An absent block means undeclared; an empty list affirms no events. Existing manifests keep their wire bytes.
 - Validate names against the `cortexkit-bus-naming` 0.2.0 event token rule, positive u32 versions, unique (name, version) pairs, bounded unique headers, and bounded control-free summaries. HELLO refusals name the malformed field. Headers are filter hints, never authority; the bus transports a notice and the publisher serves its body.
-- Declarations are validated and retained by the new daemon but **not yet served** by `catalog.list`, `server.describe`, or `ck catalog`. Serving is deferred to the next subc-control minor release, where catalog structures can gain the field without a hidden wire-only contract. Readers come first: older daemons silently drop `events`, and publishers must not rely on declaration discovery before the serving daemon release is deployed.
+- Declarations are validated and retained by the new daemon but **not yet served** by `catalog.list`, `server.describe`, or `ck catalog`. Serving them needs a field in subc-control's `CatalogEntry`, which is exhaustive, so it waits for a breaking subc-control release; emitting the field on the wire without the type would leave every Rust reader silently dropping it. Readers come first: older daemons silently drop `events`, and publishers must not rely on declaration discovery before the serving daemon release is deployed.
 
 ## 0.29.2
 

@@ -56,10 +56,12 @@ pub struct ModuleManifest {
     /// declares that it publishes none. Absence remains absent on the wire.
     ///
     /// Declarations are validated at HELLO and retained in the daemon registry,
-    /// but are not yet served by `catalog.list`, `server.describe`, or `ck catalog`.
-    /// Serving will land with the next subc-control minor release. Older daemons
-    /// drop this field: deploy readers first, and do not rely on declarations
-    /// until a daemon supporting their discovery is running.
+    /// but no client can read them yet: `catalog.list`, `server.describe` and
+    /// `ck catalog` do not return them, because subc-control's `CatalogEntry`
+    /// has no field for them and adding one is a breaking change. A daemon built
+    /// before this field existed drops it silently. So a flow engine cannot yet
+    /// discover a module's events from the catalog, and a module must not depend
+    /// on that discovery until a daemon that serves declarations is running.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub events: Option<Vec<EventDeclaration>>,
     /// Periodic or event-driven behavior this module performs against an external

@@ -58,8 +58,11 @@ fn hello(events: Value) -> Value {
 
 #[test]
 fn event_name_validation_table_matches_bus_token_rule() {
-    // These valid and invalid sets must agree with cortexkit-bus-naming 0.2.0's
-    // TokenKind::EventName rule (token.rs:91-143), not its wider module-id rule.
+    // These sets must agree with the event-name token rule of the bus naming
+    // crate (cortexkit-bus-naming 0.2.0, `TokenKind::EventName`): one bus subject
+    // token of 1-63 bytes, a lowercase letter or digit first, then lowercase
+    // letters, digits or underscores. Hyphens and dots, which module ids allow,
+    // are refused.
     let valid = [
         "a".to_string(),
         "0".into(),

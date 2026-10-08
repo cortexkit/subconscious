@@ -243,6 +243,61 @@ pub enum ModuleControlResponseToModule {
     },
 }
 
+/// A module's channel-0 request to confirm one in-flight write with the person.
+///
+/// This standalone body keeps the existing exhaustive module-control enums
+/// unchanged. The daemon validates the summary and the asking connection's
+/// permission before showing a prompt; constructing a request grants nothing.
+#[non_exhaustive]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OperatorConfirmRequest {
+    op: OperatorConfirmOp,
+    pub summary: String,
+    /// The caller's route channel as seen on the asking module's connection.
+    pub route_channel: u16,
+    /// The epoch of that route on the asking module's connection.
+    pub route_epoch: u32,
+}
+
+impl OperatorConfirmRequest {
+    pub fn new(summary: impl Into<String>, route_channel: u16, route_epoch: u32) -> Self {
+        Self {
+            op: OperatorConfirmOp::Confirm,
+            summary: summary.into(),
+            route_channel,
+            route_epoch,
+        }
+    }
+}
+
+/// A successful channel-0 reply to an [`OperatorConfirmRequest`].
+///
+/// Only `outcome: "confirmed"` confirms the write. Refusals use [`crate::ErrorBody`]
+/// instead. Readers must not treat an unknown outcome as confirmation.
+#[non_exhaustive]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OperatorConfirmReply {
+    op: OperatorConfirmOp,
+    pub outcome: String,
+}
+
+impl OperatorConfirmReply {
+    pub fn confirmed() -> Self {
+        Self {
+            op: OperatorConfirmOp::Confirm,
+            outcome: "confirmed".to_string(),
+        }
+    }
+}
+
+// A required, single-valued field both emits the op and refuses a missing or
+// different op when decoding, without exposing a caller-editable tag.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+enum OperatorConfirmOp {
+    #[serde(rename = "operator.confirm")]
+    Confirm,
+}
+
 impl From<HealthReport> for ModuleControlResponse {
     fn from(report: HealthReport) -> Self {
         Self::HealthCheck {

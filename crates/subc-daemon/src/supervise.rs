@@ -6062,8 +6062,10 @@ async fn supervise_loop(
                 }
             };
             tokio::pin!(probe_sleep);
-            // A non-wire child without HTTP health parks on exit and commands
-            // only. Rescans already arrive through the command channel.
+            // A `protocol: "none"` child (a plain process that never registers
+            // over the subc wire, such as nats-server) with no HTTP health
+            // check has nothing to probe, so it waits only for its exit or a
+            // supervisor command. A rescan that adds an HTTP check is a command.
             let wire_child = running_protocol(&spec, &snapshot) == ModuleProtocol::Subc;
             let active_child = child.as_mut().expect("child checked above");
             tokio::select! {
@@ -11455,8 +11457,9 @@ mod health_event_tests {
 
     #[tokio::test(start_paused = true)]
     async fn late_hello_starts_a_due_probe_in_the_notification_tick() {
-        // A zero cadence isolates notification latency from the intentional
-        // first-probe cadence. The normal 30-33 s schedule is checked below.
+        // With a zero cadence the first probe is due at once, so this measures
+        // only how fast the registration notification starts health probing,
+        // not the normal 30-33 s wait before a first probe (checked below).
         let mut actor = Actor::start(ModuleProtocol::Subc, Duration::ZERO).await;
         let tick = Instant::now();
         actor.hello(1, true);
@@ -11545,8 +11548,9 @@ mod health_event_tests {
         actor.hello(1, true);
         settle().await;
         let generation = actor.module.status().unwrap().spawn_generation;
-        // Simulate the old peer closing before the restart tears down its
-        // process. The replacement has not registered yet.
+        // Simulate the old process's connection closing before the restart
+        // tears the process down. The replacement process has started but has
+        // not sent its HELLO, so it is not registered.
         actor
             .registry
             .deregister_connection(ConnectionId::new(1))
@@ -11562,7 +11566,9 @@ mod health_event_tests {
         assert!(actor.module.status().unwrap().spawn_generation > generation);
         settle().await;
         actor.rx.close();
-        while actor.rx.try_recv().is_ok() {} // Discard old peer's stop notice.
+        // Drain the stop notice the restart queued for the old process's connection,
+        // so it isn't mistaken for traffic to the replacement.
+        while actor.rx.try_recv().is_ok() {}
         let turns = actor.turns();
         tokio::time::advance(Duration::from_secs(60)).await;
         settle().await;

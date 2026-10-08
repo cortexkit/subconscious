@@ -2,7 +2,7 @@
 
 ## 0.32.13
 
-- Park running children that have no health check instead of polling registration every 10 ms. Module-scoped registry notifications arm and disarm wire health on HELLO, reconnect, disconnect, catalog updates and swap promotion; live HTTP health configuration still changes through supervisor commands. Non-wire children without HTTP health wait only for exit or commands. Unknown-health snapshots are written only when their fields change. The advertised-health jittered cadence (30–33 seconds by default) and exit/registration-release waits are unchanged.
+- Park running children that have no health check instead of polling registration every 10 ms. For modules that register over the subc wire, health probing now starts and stops on registry notifications (HELLO, reconnect, disconnect, catalog updates and swap promotion) instead of a timer; live HTTP health configuration still changes through supervisor commands. Non-wire children without HTTP health wait only for exit or commands. Unknown-health snapshots are written only when their fields change. The advertised-health jittered cadence (30–33 seconds by default) and exit/registration-release waits are unchanged.
 
 ## 0.32.12
 

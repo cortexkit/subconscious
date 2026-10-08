@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.26.2
+
+- Add `ModuleHandle::confirm_operator(summary, caller_route)`, which asks the daemon to confirm with the person at the machine that one in-flight request may proceed (the `operator.confirm` control operation). It returns `Ok(())` only for a `confirmed` reply. Every error, including `Unsupported` from a daemon without the operation, means the module must refuse the write. It waits at most 290 seconds and never retries; dropping its future withdraws the request. Requires subc-protocol 0.29.4.
+
 ## 0.26.1
 
 - A control request the module cannot decode, such as a `route.bind` whose scope stamp carries an attribute this SDK does not know, is refused with `invalid_request` on its own correlation id, and the module keeps serving. Before, the decode error ended the module's serve loop, so one such bind stopped the whole module and every repeat after its restart stopped it again.

@@ -7,7 +7,6 @@ use std::{
 
 use windows::{
     core::{factory, w, HSTRING, PCWSTR, PWSTR},
-    Foundation::{AsyncOperationCompletedHandler, AsyncStatus, IAsyncOperation},
     Security::Credentials::UI::{
         UserConsentVerificationResult, UserConsentVerifier, UserConsentVerifierAvailability,
     },
@@ -36,6 +35,7 @@ use windows::{
         },
     },
 };
+use windows_future::{AsyncOperationCompletedHandler, AsyncStatus, IAsyncOperation};
 use zeroize::Zeroize;
 
 use crate::{no_presence, Outcome, Withdraw};
@@ -97,7 +97,9 @@ fn real_precheck() -> Result<Precheck, ()> {
                 while let Ok(reply) = receiver.recv() {
                     let input_desktop = probe_input_desktop();
                     let hello = Apartment::new()
-                        .and_then(|_apartment| UserConsentVerifier::CheckAvailabilityAsync()?.get())
+                        .and_then(|_apartment| {
+                            UserConsentVerifier::CheckAvailabilityAsync()?.join()
+                        })
                         .is_ok_and(|availability| {
                             availability == UserConsentVerifierAvailability::Available
                         });
@@ -319,7 +321,7 @@ fn token_user(token: &Token) -> windows::core::Result<Vec<usize>> {
     // SAFETY: the initial call queries the size without a writable buffer.
     let _ = unsafe { GetTokenInformation(token.0, TokenUser, None, 0, &mut bytes) };
     if bytes < size_of::<TOKEN_USER>() as u32 || bytes > 65536 {
-        return Err(windows::core::Error::from_win32());
+        return Err(windows::core::Error::from_thread());
     }
     // A word buffer provides TOKEN_USER's pointer alignment as well as room for
     // the embedded SID. It stays alive until EqualSid has read both SIDs.
@@ -400,11 +402,11 @@ fn check_credentials(buffer: &AuthBuffer) -> Outcome {
             CRED_PACK_PROTECTED_CREDENTIALS,
             buffer.pointer,
             buffer.bytes,
-            PWSTR::null(),
+            None,
             &mut user_len,
-            PWSTR::null(),
+            None,
             Some(&mut domain_len),
-            PWSTR::null(),
+            None,
             &mut password_len,
         )
     };
@@ -426,11 +428,11 @@ fn check_credentials(buffer: &AuthBuffer) -> Outcome {
             CRED_PACK_PROTECTED_CREDENTIALS,
             buffer.pointer,
             buffer.bytes,
-            PWSTR(secrets.user.as_mut_ptr()),
+            Some(PWSTR(secrets.user.as_mut_ptr())),
             &mut user_len,
-            PWSTR(secrets.domain.as_mut_ptr()),
+            Some(PWSTR(secrets.domain.as_mut_ptr())),
             Some(&mut domain_len),
-            PWSTR(secrets.password.as_mut_ptr()),
+            Some(PWSTR(secrets.password.as_mut_ptr())),
             &mut password_len,
         )
     }
@@ -601,7 +603,8 @@ mod tests {
         // SAFETY: IsWindow accepts an opaque, possibly stale HWND and does not
         // dereference it. Check the real OS object, not just our cleared field.
         assert!(!unsafe {
-            windows::Win32::UI::WindowsAndMessaging::IsWindow(HWND(window as *mut _)).as_bool()
+            windows::Win32::UI::WindowsAndMessaging::IsWindow(Some(HWND(window as *mut _)))
+                .as_bool()
         });
     }
 

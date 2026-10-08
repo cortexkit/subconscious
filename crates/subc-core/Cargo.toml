@@ -39,7 +39,7 @@ required-features = ["test-support"]
 bench-harness = ["subc-daemon/bench-harness"]
 loom = ["subc-daemon/loom"]
 # Enables the dedicated CLI fixture targets, never the shipped CLI test key.
-test-support = ["subc-os/test-support"]
+test-support = ["subc-os/test-support", "subc-daemon/test-support"]
 
 [[bench]]
 name = "forwarding_contention"

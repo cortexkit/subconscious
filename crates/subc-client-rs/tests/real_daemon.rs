@@ -5151,3 +5151,7 @@ async fn describing_an_unknown_ref_answers_not_live_with_the_owners_state() {
     run.daemon.kill_and_wait();
     assert!(serve_task.await.unwrap().is_ok());
 }
+
+// These tests share the wire helpers but have a separate, feature-enabled daemon.
+#[path = "real_daemon/operator_confirm.rs"]
+mod operator_confirm;

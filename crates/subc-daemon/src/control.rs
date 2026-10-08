@@ -1405,15 +1405,15 @@ impl ControlHandler {
             }
             FrameType::Goodbye => self.handle_goodbye(ctx.connection_id),
             FrameType::Cancel => {
+                // A Cancel on channel 0 names either a waiting operator.confirm
+                // or a spawn-event subscription; both answer nothing on success.
                 if self
                     .forwarding
                     .operator_confirms()
                     .cancel(ctx.connection_id, frame.header.corr)
-                {
-                    Ok(Vec::new())
-                } else if self
-                    .supervisor
-                    .cancel_spawn_subscription(ctx.connection_id, frame.header.corr)
+                    || self
+                        .supervisor
+                        .cancel_spawn_subscription(ctx.connection_id, frame.header.corr)
                 {
                     Ok(Vec::new())
                 } else {
@@ -2400,7 +2400,9 @@ impl ControlHandler {
             }
         };
         let module_id = registration.manifest.module_id;
-        // Finish every lookup on another daemon lock before taking forwarding.
+        // Read the launch nonce (under its own lock) before taking the forwarding
+        // table's lock below: holding forwarding while waiting on another daemon
+        // lock risks a lock-order deadlock with paths that take them the other way.
         let nonce = self
             .hello_launch_nonces
             .lock()

@@ -275,23 +275,24 @@ macro_rules! summary_refusal {
     ($name:ident, $summary:expr) => {
         #[test]
         fn $name() {
-            assert!(!valid_summary(&$summary));
+            let summary: String = $summary.into();
+            assert!(!valid_summary(&summary));
         }
     };
 }
-summary_refusal!(summary_empty, "".to_owned());
+summary_refusal!(summary_empty, "");
 summary_refusal!(summary_201_scalars, "é".repeat(201));
-summary_refusal!(summary_cr, "x\rx".to_owned());
-summary_refusal!(summary_lf, "x\nx".to_owned());
-summary_refusal!(summary_tab, "x\tx".to_owned());
-summary_refusal!(summary_line_separator, "x\u{2028}x".to_owned());
-summary_refusal!(summary_bidi_override, "x\u{202e}x".to_owned());
-summary_refusal!(summary_zero_width_space, "x\u{200b}x".to_owned());
-summary_refusal!(summary_paragraph_separator, "x\u{2029}x".to_owned());
-summary_refusal!(summary_word_joiner, "x\u{2060}x".to_owned());
-summary_refusal!(summary_bom, "x\u{feff}x".to_owned());
-summary_refusal!(summary_leading_whitespace, " x".to_owned());
-summary_refusal!(summary_trailing_whitespace, "x\u{2003}".to_owned());
+summary_refusal!(summary_cr, "x\rx");
+summary_refusal!(summary_lf, "x\nx");
+summary_refusal!(summary_tab, "x\tx");
+summary_refusal!(summary_line_separator, "x\u{2028}x");
+summary_refusal!(summary_bidi_override, "x\u{202e}x");
+summary_refusal!(summary_zero_width_space, "x\u{200b}x");
+summary_refusal!(summary_paragraph_separator, "x\u{2029}x");
+summary_refusal!(summary_word_joiner, "x\u{2060}x");
+summary_refusal!(summary_bom, "x\u{feff}x");
+summary_refusal!(summary_leading_whitespace, " x");
+summary_refusal!(summary_trailing_whitespace, "x\u{2003}");
 #[test]
 fn summary_200_multibyte_and_combining_scalars() {
     assert!(valid_summary(&"é".repeat(200)));
@@ -898,8 +899,9 @@ async fn release_between_binding_lookup_and_admission_is_never_lost() {
         let _entered = runtime.enter();
         forwarding
             .with_operator_route(key.endpoint.connection_id, key.channel, epoch, |binding| {
-                // The close is now attempting the write lock. Admission must remain
-                // visible to that close even though its lookup preceded the close.
+                // The route close running on the other thread is now waiting for
+                // the forwarding table's write lock. This admission's lookup began
+                // before that close, and the close must still see it and withdraw it.
                 barrier.wait();
                 confirms.admit(
                     &request_ctx,
@@ -955,13 +957,15 @@ async fn adjacent_check_pairs_keep_the_first_refusal() {
     );
     confirms.lock().stuck = true;
     assert_reason(&f.request(&m, 6, "valid").await[0], "backoff");
-    let mut state = confirms.lock();
-    state.backoff.clear();
-    state.stuck = false;
-    state.modules.insert("m".into(), 999);
-    drop(state);
-    // A real full queue is tested in fifo_module_limit_and_queue_full. Its
-    // occupied module's refusal still precedes queue_full there.
+    {
+        let mut state = confirms.lock();
+        state.backoff.clear();
+        state.stuck = false;
+        state.modules.insert("m".into(), 999);
+    }
+    // With this module already holding its one slot, the per-module limit
+    // refuses before the queue's capacity is consulted. A genuinely full queue
+    // is exercised in fifo_module_limit_and_queue_full.
     assert_reason(&f.request(&m, 7, "valid").await[0], "module_limit");
 }
 

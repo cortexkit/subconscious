@@ -78,8 +78,10 @@ impl HelloLaunchNonces {
         self.by_connection.remove(&connection_id);
     }
 
-    /// The presented credential, not a current-launch-only comparison. Swap
-    /// authorization accepts both live launches through the supervisor.
+    /// The launch nonce this connection presented at HELLO, if any. Unlike
+    /// [`Self::presented`], this does not compare it with the module's current
+    /// launch: during a blue/green swap two launches of one module are live, and
+    /// the caller asks the supervisor whether either of them issued this nonce.
     pub(crate) fn nonce(&self, connection_id: ConnectionId) -> Option<&str> {
         self.by_connection.get(&connection_id).map(String::as_str)
     }

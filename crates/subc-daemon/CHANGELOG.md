@@ -2,7 +2,7 @@
 
 ## 0.32.7
 
-- Serve and advertise the additive `operator.confirm` operation with nonce/route permission checks, validated summaries, a bounded FIFO queue, decline back-off, independent withdraw/timeout/stuck timers, and bounded answer delivery. Audit every outcome with an escaped summary. The test-support provider is restricted to `ckdev-` executable names.
+- Serve and advertise the additive `operator.confirm` operation with nonce/route permission checks, validated summaries, a bounded FIFO queue, decline back-off, independent withdraw/timeout/stuck timers, and bounded answer delivery. Audit every outcome with an escaped summary. Until a platform prompt is installed, every request is answered `operator_presence_unavailable`, so nothing can be approved by default. The scripted provider used by tests exists only with the `test-support` feature and only for daemons running under a `ckdev-` name, so a production `ck-subc` can never approve through it.
 
 ## 0.32.6
 

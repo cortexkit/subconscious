@@ -79,7 +79,9 @@ impl OperatorProvider for OsProvider {
         _: &str,
         _: Box<dyn FnOnce(Arc<dyn OperatorWithdraw>) + Send>,
     ) -> ProviderResult {
-        // Linux cannot show the per-request summary through a fixed polkit action.
+        // On Linux the prompt comes from polkit, whose agents may show only the
+        // fixed message of an installed action file, not this request's summary.
+        // A person must see what they approve, so Linux refuses rather than prompts.
         #[cfg(target_os = "linux")]
         {
             ProviderResult::UnsupportedPlatform

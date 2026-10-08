@@ -270,15 +270,15 @@ impl Harness {
     // Probe until the first request really occupies its module slot. This is an
     // admission barrier, not a guessed sleep, so FIFO tests cannot pass by chance.
     async fn admitted(&self, module: &str) {
+        let summary = format!("admission probe for {module}");
         assert_eq!(
-            self.call(module, json!({"summary":"admission probe"}))
-                .await["result"],
+            self.call(module, json!({"summary":summary})).await["result"],
             "unavailable"
         );
         self.audit(
             "operator_presence_unavailable",
             "module_limit",
-            Some("admission probe"),
+            Some(&summary),
         )
         .await;
     }
@@ -1031,4 +1031,14 @@ async fn linux_unsupported_platform_without_prompt() {
         "false"
     );
     assert!(h.events().is_empty());
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn macos_supervised_confirmation_crosses_privacy_trampoline() {
+    let h = Harness::start("approve").await;
+    assert_eq!(h.confirm("trampoline write").await["result"], "confirmed");
+    assert!(h
+        .logs()
+        .contains("module spawned with own privacy identity (responsibility disclaimed)"));
 }

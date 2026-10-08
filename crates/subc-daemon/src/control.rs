@@ -19,9 +19,9 @@ use subc_control::{
 use subc_protocol::{
     error_codes,
     manifest::{
-        validate_hello_capability_grammar, validate_hello_self_signal_declarations,
-        CapabilityDeclarations, CapabilityNeed, Concurrency, ManifestProvenance, ModuleManifest,
-        ProviderRole,
+        validate_hello_capability_grammar, validate_hello_event_declarations,
+        validate_hello_self_signal_declarations, CapabilityDeclarations, CapabilityNeed,
+        Concurrency, ManifestProvenance, ModuleManifest, ProviderRole,
     },
     scope::{
         ScopeRecord, ScopeRecordOutcome, ScopeRecordResult, ScopeSelector,
@@ -1809,6 +1809,13 @@ impl ControlHandler {
             return Ok(vec![control_error_frame(
                 &frame,
                 "invalid_manifest",
+                err.to_string(),
+            )?]);
+        }
+        if let Err(err) = validate_hello_event_declarations(&hello_value) {
+            return Ok(vec![control_error_frame(
+                &frame,
+                "invalid_event_declaration",
                 err.to_string(),
             )?]);
         }

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.29.3
+
+- Add optional `ModuleManifest.events: Option<Vec<EventDeclaration>>` and its builder setter. `EventDeclaration` is non-exhaustive, constructor-built, and declares a name, version, filter headers and optional consent-card summary. An absent block means undeclared; an empty list affirms no events. Existing manifests keep their wire bytes.
+- Validate names against the `cortexkit-bus-naming` 0.2.0 event token rule, positive u32 versions, unique (name, version) pairs, bounded unique headers, and bounded control-free summaries. HELLO refusals name the malformed field. Headers are filter hints, never authority; the bus transports a notice and the publisher serves its body.
+- Declarations are validated and retained by the new daemon but **not yet served** by `catalog.list`, `server.describe`, or `ck catalog`. Serving is deferred to the next subc-control minor release, where catalog structures can gain the field without a hidden wire-only contract. Readers come first: older daemons silently drop `events`, and publishers must not rely on declaration discovery before the serving daemon release is deployed.
+
 ## 0.29.2
 
 - `CallOrigin` gains an optional `message_position: { message_id, index }`, where the call sits among the tool calls of one model message (0-based, in the order the model wrote them). A host may run one message's calls concurrently, so a provider that must follow the model's order reads it to sequence them. Absent means unknown. The id and the index travel together: a position missing either one does not decode. `validate_call_origin` also refuses a message id that breaks the call-key rule (empty, over 256 bytes, or outside printable non-space ASCII), naming the field `origin.message_position.message_id` (`ORIGIN_MESSAGE_ID_FIELD`) for the provider's `invalid_request` reply. Additive: `CallOrigin` is `#[non_exhaustive]`, an origin without a position keeps its existing bytes, and readers that predate it ignore the member.

@@ -15,9 +15,10 @@ use subc_daemon::{
 };
 use subc_protocol::{
     manifest::{
-        CapabilityDeclarations, CapabilityNeed, CapabilityRequirement, Concurrency, ExecutionMode,
-        IdentityScope, ManifestProvenance, ModuleManifest, ProviderRole, SelfSignalDeclaration,
-        SelfSignalEffect, SelfSignalKind, SignalAnchor, SignalCadence, Tool,
+        CapabilityDeclarations, CapabilityNeed, CapabilityRequirement, Concurrency,
+        EventDeclaration, ExecutionMode, IdentityScope, ManifestProvenance, ModuleManifest,
+        ProviderRole, SelfSignalDeclaration, SelfSignalEffect, SelfSignalKind, SignalAnchor,
+        SignalCadence, Tool,
     },
     session::{
         ModuleControlRequest, ModuleControlRequestFromModule, ModuleControlResponse,
@@ -544,6 +545,179 @@ async fn hello_self_signals_are_mirrored_and_missing_axes_are_refused() {
     assert!(error.message.contains("invalid-self-signal-module"));
     assert!(error.message.contains("self_signals[0]"));
     assert!(error.message.contains("effect"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hello_event_declarations_are_retained_in_registry() {
+    let server = TestServer::start().await;
+    let mut module = connect_endpoint(&server, "event-module").await;
+    let declarations = vec![EventDeclaration::new("github_ci_job_failed", 1)
+        .with_headers(vec!["repo".into(), "branch".into()])
+        .with_summary(Some("A CI job failed.".into()))];
+    let mut manifest = supervision_only_manifest("event-module");
+    manifest.events = Some(declarations.clone());
+    register_module(&server, &mut module, manifest, 751).await;
+    let registration = server.registry.get_module("event-module").unwrap().unwrap();
+    assert_eq!(registration.manifest.events, Some(declarations));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hello_event_declaration_refusals_name_each_malformed_field() {
+    let server = TestServer::start().await;
+    let event = serde_json::json!({"name":"github_ci_job_failed", "version":1, "headers":["repo"]});
+    let mut cases = vec![
+        ("block_not_list", "events", serde_json::json!({})),
+        (
+            "too_many_events",
+            "events",
+            serde_json::json!(vec![event.clone(); 65]),
+        ),
+        ("entry_not_object", "events[0]", serde_json::json!([null])),
+        (
+            "duplicate_pair",
+            "events[1]",
+            serde_json::json!([event.clone(), event.clone()]),
+        ),
+    ];
+    for (name, field, value) in [
+        ("name_missing", "name", None),
+        ("name_wrong_type", "name", Some(serde_json::json!(1))),
+        ("name_empty", "name", Some(serde_json::json!(""))),
+        ("name_dotted", "name", Some(serde_json::json!("github.ci"))),
+        ("name_uppercase", "name", Some(serde_json::json!("GitHub"))),
+        ("name_hyphen", "name", Some(serde_json::json!("github-ci"))),
+        (
+            "name_leading_underscore",
+            "name",
+            Some(serde_json::json!("_github")),
+        ),
+        (
+            "name_too_long",
+            "name",
+            Some(serde_json::json!("a".repeat(64))),
+        ),
+        ("version_missing", "version", None),
+        ("version_zero", "version", Some(serde_json::json!(0))),
+        ("version_negative", "version", Some(serde_json::json!(-1))),
+        (
+            "version_fractional",
+            "version",
+            Some(serde_json::json!(1.5)),
+        ),
+        ("version_string", "version", Some(serde_json::json!("1"))),
+        (
+            "version_overflow",
+            "version",
+            Some(serde_json::json!(4294967296_u64)),
+        ),
+        ("headers_missing", "headers", None),
+        (
+            "headers_wrong_type",
+            "headers",
+            Some(serde_json::json!("repo")),
+        ),
+        (
+            "too_many_headers",
+            "headers",
+            Some(serde_json::json!((0..17)
+                .map(|i| format!("h{i}"))
+                .collect::<Vec<_>>())),
+        ),
+        (
+            "summary_too_long",
+            "summary",
+            Some(serde_json::json!("é".repeat(201))),
+        ),
+        (
+            "summary_control",
+            "summary",
+            Some(serde_json::json!("contains\ncontrol")),
+        ),
+        (
+            "summary_unicode_control",
+            "summary",
+            Some(serde_json::json!("contains\u{0085}control")),
+        ),
+        ("summary_wrong_type", "summary", Some(serde_json::json!(42))),
+    ] {
+        let mut invalid = event.clone();
+        if let Some(value) = value {
+            invalid[field] = value;
+        } else {
+            invalid.as_object_mut().unwrap().remove(field);
+        }
+        cases.push((
+            name,
+            match field {
+                "name" => "events[0].name",
+                "version" => "events[0].version",
+                "headers" => "events[0].headers",
+                _ => "events[0].summary",
+            },
+            serde_json::json!([invalid]),
+        ));
+    }
+    for (name, value) in [
+        ("header_empty", serde_json::json!([""])),
+        ("header_leading_digit", serde_json::json!(["1repo"])),
+        ("header_leading_underscore", serde_json::json!(["_repo"])),
+        ("header_uppercase", serde_json::json!(["Repo"])),
+        ("header_dotted", serde_json::json!(["repo.name"])),
+        ("header_hyphen", serde_json::json!(["repo-name"])),
+        ("header_whitespace", serde_json::json!(["repo name"])),
+        ("header_unicode", serde_json::json!(["répo"])),
+        ("header_too_long", serde_json::json!(["a".repeat(33)])),
+        ("header_wrong_type", serde_json::json!([1])),
+    ] {
+        let mut invalid = event.clone();
+        invalid["headers"] = value;
+        cases.push((name, "events[0].headers[0]", serde_json::json!([invalid])));
+    }
+    let mut duplicate_headers = event.clone();
+    duplicate_headers["headers"] = serde_json::json!(["repo", "repo"]);
+    cases.push((
+        "duplicate_headers",
+        "events[0].headers[1]",
+        serde_json::json!([duplicate_headers]),
+    ));
+
+    for (index, (name, field, events)) in cases.into_iter().enumerate() {
+        let mut module = connect_endpoint(&server, name).await;
+        let corr = 800 + index as u64;
+        let mut body = serde_json::to_value(ModuleHelloBody {
+            manifest: supervision_only_manifest(name),
+            protocol_ver: PROTOCOL_VERSION,
+            control_ops: None,
+            launch_nonce: None,
+        })
+        .unwrap();
+        body["manifest"]["events"] = events;
+        module
+            .send(
+                &Frame::build(
+                    FrameType::Hello,
+                    control_flags(),
+                    0,
+                    0,
+                    corr,
+                    serde_json::to_vec(&body).unwrap(),
+                )
+                .unwrap(),
+            )
+            .await;
+        let error = read_control_error(&mut module, corr).await;
+        assert_eq!(error.code, "invalid_event_declaration", "{name}");
+        assert!(
+            error.message.contains(field),
+            "{name}: {field} missing from {}",
+            error.message
+        );
+        assert_eq!(
+            server.registry.active_registration_count().unwrap(),
+            0,
+            "{name}: refused HELLO must not register"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

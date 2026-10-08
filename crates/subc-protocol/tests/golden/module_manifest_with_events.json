@@ -1,0 +1,1 @@
+{"module_id":"plexus","module_version":"1.0.0","protocol_ver":2,"provides":[],"events":[{"name":"github_ci_job_failed","version":1,"headers":["repo","branch","pr","conclusion"],"summary":"A GitHub CI job failed."},{"name":"github_ci_job_failed","version":2,"headers":[]}]}

@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.32.6
+
+- Validate optional module event declarations at HELLO before registry admission, refusing malformed blocks with `invalid_event_declaration` and a field-naming reason. Take subc-protocol 0.29.3, whose manifest decoder retains `events` in the registry alongside the other manifest data. Older modules without events are unchanged.
+- Declarations are **not yet served** in `catalog.list`, `server.describe`, or `ck catalog`; serving lands in the next subc-control minor release. Older daemons drop the field. Deploy readers before publishers depend on event discovery; this validation-only release is not a discovery guarantee.
+
 ## 0.32.5
 
 - Record the exhausted crash budget's terminal history before publishing the module as `failed`, so status readers cannot observe the failure before its exit record. Journal write failures still leave the module failed; an exit-recording panic publishes failure before continuing its unwind. Commands and health actions remain serialized by the supervisor, and journal I/O does not hold the status snapshot lock.

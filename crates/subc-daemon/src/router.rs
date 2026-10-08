@@ -261,7 +261,7 @@ impl std::ops::Deref for OutboundFrame {
 pub(crate) mod test_log {
     use std::{
         io::Write,
-        sync::{Arc, Mutex},
+        sync::{Arc, Mutex, OnceLock},
     };
 
     #[derive(Clone)]
@@ -284,6 +284,14 @@ pub(crate) mod test_log {
     pub(crate) fn log_capture(
         level: tracing::Level,
     ) -> (Arc<Mutex<Vec<u8>>>, tracing::dispatcher::DefaultGuard) {
+        // tracing-core's single-dispatch fast path registers callsites using
+        // the emitting thread's default subscriber. A parallel test with no
+        // subscriber can therefore cache `never` for a callsite this capture
+        // needs. Keep a second dispatch alive so registration considers all
+        // live subscribers instead. This registry is never installed as a
+        // default: each test still records only into its own thread's writer.
+        static INTEREST_ANCHOR: OnceLock<tracing::Dispatch> = OnceLock::new();
+        INTEREST_ANCHOR.get_or_init(|| tracing::Dispatch::new(tracing_subscriber::registry()));
         let output = Arc::new(Mutex::new(Vec::new()));
         let writer = Arc::clone(&output);
         let subscriber = tracing_subscriber::fmt()
@@ -305,6 +313,33 @@ pub(crate) mod test_log {
                 .clone(),
         )
         .expect("tracing output is UTF-8")
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn emit_capture_probe(source: &str) {
+            tracing::error!(source, "parallel capture probe");
+        }
+
+        #[test]
+        fn parallel_callsite_registration_keeps_the_test_capture_enabled() {
+            let (output, _guard) = log_capture(tracing::Level::ERROR);
+            // First register the very same callsite on a thread without a
+            // default subscriber, while the test's capture remains live.
+            std::thread::spawn(|| emit_capture_probe("other-thread"))
+                .join()
+                .expect("unsubscribed thread exits");
+            emit_capture_probe("captured-thread");
+
+            let logs = captured_logs(&output);
+            assert!(
+                logs.contains("captured-thread"),
+                "capture was disabled: {logs}"
+            );
+            assert!(!logs.contains("other-thread"), "capture leaked: {logs}");
+        }
     }
 }
 
@@ -2083,13 +2118,6 @@ mod tests {
         let mut sent = 0u64;
         while router.counters.snapshot()["client_egress_close_delivery_failed"] == 0 {
             assert!(sent < 1_000, "the byte budget never refused a frame");
-            // Other tests running in parallel hit the same WARN call site with
-            // no subscriber installed; if one of them registers that call site
-            // while this test's capture subscriber is being installed, tracing
-            // can cache the call site as disabled. Recomputing the cache just
-            // before each frame that may trigger the WARN keeps the capture
-            // from silently missing it.
-            tracing::callsite::rebuild_interest_cache();
             let route = &routes[(sent % 2) as usize];
             router
                 .route_for_connection(

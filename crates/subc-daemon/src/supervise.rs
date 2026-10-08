@@ -9630,7 +9630,7 @@ mod terminal_history_tests {
         time::{Duration, Instant},
     };
 
-    use tokio::time::sleep;
+    use tokio::{sync::mpsc, time::sleep};
 
     use super::{
         apply_deliberate_severance_marker, daemon_will_restart, drain_child_to_state,
@@ -9638,8 +9638,9 @@ mod terminal_history_tests {
         lock_snapshot, on_child_exit, record_deliberate_severance, record_wait_error_terminal,
         reset_restart_count, spawn_and_mark_running, update_snapshot, wait_error_exit_report,
         ExitKind, ExitReport, ModuleProtocol, ModuleSpec, ModuleState, NextAction, ProcessIdentity,
-        RestartPolicy, SpawnEventKind, StopNotice, SuperviseError, SupervisedModule, Supervisor,
-        SupervisorHandle, SupervisorHealthStatus, SupervisorSnapshot,
+        RestartPolicy, SpawnEventKind, StopNotice, SuperviseError, SupervisedConfiguration,
+        SupervisedModule, SupervisedModuleInner, Supervisor, SupervisorHandle,
+        SupervisorHealthStatus, SupervisorSnapshot,
     };
     // The supervisor's clock, distinct from the `std::time::Instant` these tests
     // use for their own wall-clock deadlines: crash-restart instants must be on
@@ -9882,29 +9883,40 @@ mod terminal_history_tests {
         let registry = Arc::new(Registry::default());
         let supervisor =
             Supervisor::new_for_test(Arc::clone(&registry), RestartPolicy::new(3, Duration::ZERO));
-        let module = supervisor
-            .spawn(ModuleSpec {
-                module_id: "recovery-snapshot".to_string(),
-                program: fake_aft_stub_path(),
-                args: Vec::new(),
-                env: Vec::new(),
-                reserved: false,
-                reserved_prefixes: Vec::new(),
-                protocol: ModuleProtocol::Subc,
-                overlap: Default::default(),
-            })
-            .unwrap();
-        update_snapshot(
-            &module.inner.snapshot,
-            Some("recovery-snapshot"),
-            |snapshot| {
-                snapshot.state = state;
-                snapshot.enabled = enabled;
-                seed_crash_restarts(snapshot, restart_count);
-            },
-        )
-        .unwrap();
-        module
+        let runtime = supervisor.runtime_config();
+        let spec = ModuleSpec {
+            module_id: "recovery-snapshot".to_string(),
+            program: fake_aft_stub_path(),
+            args: Vec::new(),
+            env: Vec::new(),
+            reserved: false,
+            reserved_prefixes: Vec::new(),
+            protocol: ModuleProtocol::Subc,
+            overlap: Default::default(),
+        };
+        let mut snapshot = SupervisorSnapshot::new(state, enabled);
+        seed_crash_restarts(&mut snapshot, restart_count);
+        // These tests read synthetic snapshots. A real child and monitor would
+        // race those reads by replacing the requested state during startup.
+        let (commands, _rx) = mpsc::channel(4);
+        SupervisedModule {
+            inner: Arc::new(SupervisedModuleInner {
+                module_id: spec.module_id.clone(),
+                registry,
+                snapshot: Arc::new(Mutex::new(snapshot)),
+                configuration: Arc::new(Mutex::new(SupervisedConfiguration {
+                    spec,
+                    health: runtime.health,
+                })),
+                stderr_ring: runtime.stderr_ring,
+                terminal_ring: runtime.terminal_ring,
+                commands,
+                monitor: Mutex::new(None),
+                restart_policy: runtime.restart_policy,
+                effective_drain_timeout: runtime.effective_drain_timeout,
+                provenance_probe: supervisor.provenance_probe.clone(),
+            }),
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -10155,11 +10167,23 @@ mod terminal_history_tests {
         );
         let module = supervisor.spawn(spec).unwrap();
         wait_for_file(&ready).await;
-        let first_pid = module
-            .status()
-            .unwrap()
-            .pid
-            .expect("a running module reports its pid");
+        // The ready file proves the child installed its SIGTERM handler, not
+        // that the supervisor has processed the privacy trampoline's exec
+        // acknowledgement. On macOS status withholds the pid until then.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let first_pid = loop {
+            let status = module.status().unwrap();
+            if status.state == ModuleState::Running {
+                if let Some(pid) = status.pid {
+                    break pid;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "a running module must report its pid after exec confirmation: {status:?}"
+            );
+            sleep(Duration::from_millis(10)).await;
+        };
 
         rustix::process::kill_process(
             rustix::process::Pid::from_raw(i32::try_from(first_pid).unwrap()).unwrap(),

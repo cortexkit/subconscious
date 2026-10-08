@@ -15,14 +15,16 @@ use std::{
 
 use serde_json::{json, Value};
 use subc_control::{ClientControlRequest, ClientControlResponse};
-use subc_daemon::bootstrap::{run_with_config, BootstrapConfig};
+use subc_daemon::bootstrap::run_with_config;
 use subc_test_support::TestTempDir;
 use tokio::task::JoinHandle;
 
 use super::{claustrum::RealClaustrum, HarnessSigner};
 use crate::harness::{
     config::{self, SentinelTiming},
-    control, data_home,
+    control,
+    daemon::bootstrap_config,
+    data_home,
     stubs::{StubRecorder, CALLOSUM_OPERATIONS, CLAUSTRUM_OPERATIONS},
 };
 
@@ -133,7 +135,7 @@ impl SignerRun {
         // A second daemon on the same tree must not be mistaken for the first one's
         // connection file.
         let _ = fs::remove_file(&connection_file);
-        let mut bootstrap = BootstrapConfig::new(&connection_file, 0)
+        let mut bootstrap = bootstrap_config(&connection_file)
             .with_terminal_journal_path(root.join("run/terminals.jsonl"))
             .with_capture_logs_dir(root.join("run/logs"));
         if let Some(machine_id) = &options.machine_id {

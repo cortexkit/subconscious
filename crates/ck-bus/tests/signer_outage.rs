@@ -109,7 +109,7 @@ use subc_client_rs::{
     BindDecision, HandlerOutcome, ModuleHandler, RequestCtx, RouteBindRequest,
 };
 use subc_control::{ClientControlRequest, ClientControlResponse};
-use subc_daemon::bootstrap::{run_with_config, BootstrapConfig};
+use subc_daemon::bootstrap::run_with_config;
 use subc_protocol::{BindIdentity, RouteTarget};
 use subc_test_support::TestTempDir;
 use tokio::task::JoinHandle;
@@ -376,7 +376,7 @@ impl Daemon {
         let connection_file = root.join("run/subc-connection.json");
         let machine_id_path = root.join("run/machine-id");
         fs::write(&machine_id_path, format!("{}\n", fresh_machine_id())).unwrap();
-        let bootstrap = BootstrapConfig::new(&connection_file, 0)
+        let bootstrap = harness::daemon::bootstrap_config(&connection_file)
             .with_terminal_journal_path(root.join("run/terminals.jsonl"))
             .with_capture_logs_dir(root.join("run/logs"))
             .with_machine_id_path(machine_id_path)

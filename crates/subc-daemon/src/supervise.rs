@@ -1046,11 +1046,25 @@ pub struct ModuleStatus {
     pub health: ModuleHealthStatus,
 }
 
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ActorSelectCheckpoint {
+    generation: u64,
+    turn: u64,
+    registered_connection: Option<ConnectionId>,
+    next_probe_at: Option<Instant>,
+    wake_after: Option<Duration>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct SupervisorSnapshot {
     /// Counts running-child loop turns, not executor polls of a parked wait.
     #[cfg(test)]
     actor_turns: u64,
+    /// Running select after exec confirmation and with no unconsumed registry
+    /// event. Recording a spawn or starting a loop turn is not this barrier.
+    #[cfg(test)]
+    actor_select: Option<ActorSelectCheckpoint>,
     state: ModuleState,
     enabled: bool,
     process_alive: bool,
@@ -1197,6 +1211,8 @@ impl SupervisorSnapshot {
         Self {
             #[cfg(test)]
             actor_turns: 0,
+            #[cfg(test)]
+            actor_select: None,
             state,
             enabled,
             process_alive: false,
@@ -5981,6 +5997,10 @@ async fn supervise_loop(
     // before anything else so a stop that interrupted a swap runs at once.
     let mut requeued: VecDeque<SupervisorCommand> = VecDeque::new();
     loop {
+        #[cfg(test)]
+        {
+            lock_snapshot(&snapshot).unwrap().actor_select = None;
+        }
         #[cfg(target_os = "macos")]
         if let Some(active) = child.as_mut() {
             active.confirm_privacy_exec().await;
@@ -6067,9 +6087,26 @@ async fn supervise_loop(
             // check has nothing to probe, so it waits only for its exit or a
             // supervisor command. A rescan that adds an HTTP check is a command.
             let wire_child = running_protocol(&spec, &snapshot) == ModuleProtocol::Subc;
+            #[cfg(test)]
+            {
+                let registration_pending = wire_child
+                    && registration_changes
+                        .as_ref()
+                        .is_some_and(|changes| changes.has_changed().unwrap());
+                let mut state = lock_snapshot(&snapshot).unwrap();
+                state.actor_select = (!registration_pending).then_some(ActorSelectCheckpoint {
+                    generation: state.spawn_generation,
+                    turn: state.actor_turns,
+                    registered_connection: health_probe.registered_connection,
+                    next_probe_at: health_probe.next_probe_at,
+                    wake_after,
+                });
+            }
             let active_child = child.as_mut().expect("child checked above");
             tokio::select! {
                 wait_result = active_child.wait() => {
+                    #[cfg(test)]
+                    { lock_snapshot(&snapshot).unwrap().actor_select = None; }
                     // Every arm below that gives up on the CHILD must keep the
                     // supervision task itself alive (child = None, loop
                     // continues into command-serving mode). Returning here
@@ -6148,6 +6185,8 @@ async fn supervise_loop(
                     }
                 }
                 command = commands.recv() => {
+                    #[cfg(test)]
+                    { lock_snapshot(&snapshot).unwrap().actor_select = None; }
                     let Some(command) = command else {
                         return;
                     };
@@ -6170,8 +6209,13 @@ async fn supervise_loop(
                         Some(changes) => { let _ = changes.changed().await; }
                         None => std::future::pending().await,
                     }
-                }, if wire_child => {}
+                }, if wire_child => {
+                    #[cfg(test)]
+                    { lock_snapshot(&snapshot).unwrap().actor_select = None; }
+                }
                 _ = &mut probe_sleep => {
+                    #[cfg(test)]
+                    { lock_snapshot(&snapshot).unwrap().actor_select = None; }
                     if health_probe.due() {
                         run_health_probe_cycle(
                             &spec,
@@ -11308,10 +11352,21 @@ mod health_event_tests {
         _home: TestTempDir,
     }
 
-    async fn settle() {
-        // Yield without advancing time: notification delivery must not depend
-        // on a timer, and OS process readiness can take several executor polls.
-        for _ in 0..100 {
+    async fn wait_for<T>(reason: &str, mut observe: impl FnMut() -> Option<T>) -> T {
+        // OS exec and socket readiness are real I/O. Stay runnable while waiting
+        // for an observed condition, rather than letting paused time auto-advance
+        // deadlines or assuming a fixed number of yields finishes the work.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let tick = Instant::now();
+        loop {
+            if let Some(value) = observe() {
+                assert_eq!(Instant::now(), tick, "{reason} must not wait for a timer");
+                return value;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {reason}"
+            );
             tokio::task::yield_now().await;
         }
     }
@@ -11356,19 +11411,33 @@ mod health_event_tests {
                 rx,
                 _home: home,
             };
-            for _ in 0..10000 {
-                if actor.turns() > 0 {
-                    return actor;
-                }
-                tokio::task::yield_now().await;
-            }
-            panic!("child did not reach its running event loop");
+            actor
+                .wait_for_select(|checkpoint| checkpoint.generation > 0)
+                .await;
+            actor
         }
 
         fn turns(&self) -> u64 {
             lock_snapshot(&self.module.inner.snapshot)
                 .unwrap()
                 .actor_turns
+        }
+
+        async fn wait_for_select(
+            &self,
+            expected: impl Fn(&ActorSelectCheckpoint) -> bool,
+        ) -> ActorSelectCheckpoint {
+            wait_for("actor select checkpoint", || {
+                let state = lock_snapshot(&self.module.inner.snapshot).unwrap();
+                state.actor_select.filter(|checkpoint| {
+                    checkpoint.generation == state.spawn_generation
+                        && state.state == ModuleState::Running
+                        && state.process_alive
+                        && state.reported_pid().is_some()
+                        && expected(checkpoint)
+                })
+            })
+            .await
         }
 
         fn hello(&mut self, connection: u64, health: bool) {
@@ -11402,8 +11471,13 @@ mod health_event_tests {
                 .unwrap();
         }
 
-        fn probe(&mut self) -> crate::router::OutboundFrame {
-            let frame = self.rx.try_recv().expect("health probe must have started");
+        async fn probe(&mut self) -> crate::router::OutboundFrame {
+            let frame = wait_for("outbound health probe", || match self.rx.try_recv() {
+                Ok(frame) => Some(frame),
+                Err(mpsc::error::TryRecvError::Empty) => None,
+                Err(mpsc::error::TryRecvError::Disconnected) => panic!("health peer disconnected"),
+            })
+            .await;
             let body: Value = serde_json::from_slice(&frame.body).unwrap();
             assert_eq!(body["op"], MODULE_CONTROL_OP_HEALTH_CHECK);
             frame
@@ -11438,7 +11512,8 @@ mod health_event_tests {
         let unregistered = Actor::start(ModuleProtocol::Subc, Duration::from_secs(30)).await;
         let mut unadvertised = Actor::start(ModuleProtocol::Subc, Duration::from_secs(30)).await;
         unadvertised.hello(1, false);
-        settle().await;
+        // Include any one-off registration wake in the budget; receiving a
+        // no-health HELLO must not turn a parked child into a polling child.
         // Advance in 10 ms steps so the old poll really executes ~6,000 turns;
         // a single 60 s jump would only observe one expired timer.
         for _ in 0..6000 {
@@ -11463,82 +11538,126 @@ mod health_event_tests {
         let mut actor = Actor::start(ModuleProtocol::Subc, Duration::ZERO).await;
         let tick = Instant::now();
         actor.hello(1, true);
-        settle().await;
-        actor.probe();
+        actor.probe().await;
         assert_eq!(Instant::now(), tick, "HELLO must not wait for a poll");
     }
 
     #[tokio::test(start_paused = true)]
     async fn hello_keeps_the_jittered_cadence_and_catalog_updates_do_not_reset_it() {
         let mut actor = Actor::start(ModuleProtocol::Subc, Duration::from_secs(30)).await;
+        let hello_tick = Instant::now();
         actor.hello(1, true);
-        settle().await;
+        let armed = actor
+            .wait_for_select(|checkpoint| {
+                checkpoint.registered_connection == Some(ConnectionId::new(1))
+                    && checkpoint.next_probe_at.is_some()
+            })
+            .await;
+        let delay = jittered_health_delay(&actor.spec.module_id, 0, actor.health.cadence);
+        assert!((Duration::from_secs(30)..Duration::from_secs(33)).contains(&delay));
+        let first_deadline = hello_tick + delay;
+        assert_eq!(armed.next_probe_at, Some(first_deadline));
         tokio::time::advance(Duration::from_secs(29)).await;
+        let turns = actor.turns();
         actor
             .registry
             .replace_catalog_for_connection(ConnectionId::new(1), vec![], None, Some(true))
             .unwrap();
-        settle().await;
+        let updated = actor
+            .wait_for_select(|checkpoint| checkpoint.turn > turns)
+            .await;
+        assert_eq!(
+            updated.next_probe_at,
+            Some(first_deadline),
+            "catalog update must not reset cadence"
+        );
         actor.no_probe();
-        let delay = jittered_health_delay(&actor.spec.module_id, 0, actor.health.cadence);
-        assert!((Duration::from_secs(30)..Duration::from_secs(33)).contains(&delay));
-        tokio::time::advance(delay - Duration::from_secs(29)).await;
-        settle().await;
-        let frame = actor.probe();
+        tokio::time::advance(first_deadline - Instant::now()).await;
+        let frame = actor.probe().await;
         actor.answer(1, frame);
-        settle().await;
         let next = jittered_health_delay(&actor.spec.module_id, 1, actor.health.cadence);
+        let next_deadline = Instant::now() + next;
+        let rearmed = actor
+            .wait_for_select(|checkpoint| {
+                checkpoint
+                    .next_probe_at
+                    .is_some_and(|deadline| deadline > first_deadline)
+            })
+            .await;
+        assert_eq!(rearmed.next_probe_at, Some(next_deadline));
         tokio::time::advance(next - Duration::from_nanos(1)).await;
-        settle().await;
         actor.no_probe();
         tokio::time::advance(Duration::from_nanos(1)).await;
-        settle().await;
-        actor.probe();
+        actor.probe().await;
     }
 
     #[tokio::test(start_paused = true)]
     async fn disconnect_disarms_and_reconnect_rearms_health() {
         let mut actor = Actor::start(ModuleProtocol::Subc, Duration::from_secs(30)).await;
         actor.hello(1, true);
-        settle().await;
+        actor
+            .wait_for_select(|checkpoint| {
+                checkpoint.registered_connection == Some(ConnectionId::new(1))
+                    && checkpoint.next_probe_at.is_some()
+            })
+            .await;
         let turns = actor.turns();
+        let tick = Instant::now();
         actor
             .registry
             .deregister_connection(ConnectionId::new(1))
             .unwrap();
-        settle().await;
-        assert!(
-            actor.turns() > turns,
-            "disconnect must wake the actor immediately"
+        let disarmed = actor
+            .wait_for_select(|checkpoint| {
+                checkpoint.turn > turns && checkpoint.registered_connection.is_none()
+            })
+            .await;
+        assert_eq!(disarmed.next_probe_at, None);
+        assert_eq!(disarmed.wake_after, None);
+        assert_eq!(
+            Instant::now(),
+            tick,
+            "disconnect must disarm in the notification tick"
         );
         tokio::time::advance(Duration::from_secs(60)).await;
-        settle().await;
         actor.no_probe();
+        let reconnect_tick = Instant::now();
         actor.hello(2, true);
-        settle().await;
-        tokio::time::advance(jittered_health_delay(
-            &actor.spec.module_id,
-            0,
-            actor.health.cadence,
-        ))
-        .await;
-        settle().await;
-        actor.probe();
+        let rearmed = actor
+            .wait_for_select(|checkpoint| {
+                checkpoint.registered_connection == Some(ConnectionId::new(2))
+                    && checkpoint.next_probe_at.is_some()
+            })
+            .await;
+        let delay = jittered_health_delay(&actor.spec.module_id, 0, actor.health.cadence);
+        assert_eq!(rearmed.next_probe_at, Some(reconnect_tick + delay));
+        tokio::time::advance(delay).await;
+        actor.probe().await;
     }
 
     #[tokio::test(start_paused = true)]
     async fn reregistration_without_health_disarms_the_old_schedule() {
         let mut actor = Actor::start(ModuleProtocol::Subc, Duration::from_secs(30)).await;
         actor.hello(1, true);
-        settle().await;
+        actor
+            .wait_for_select(|checkpoint| {
+                checkpoint.registered_connection == Some(ConnectionId::new(1))
+                    && checkpoint.next_probe_at.is_some()
+            })
+            .await;
         actor
             .registry
             .deregister_connection(ConnectionId::new(1))
             .unwrap();
         actor.hello(2, false);
-        settle().await;
+        let disarmed = actor
+            .wait_for_select(|checkpoint| {
+                checkpoint.registered_connection == Some(ConnectionId::new(2))
+            })
+            .await;
+        assert_eq!(disarmed.next_probe_at, None);
+        assert_eq!(disarmed.wake_after, None);
         tokio::time::advance(Duration::from_secs(60)).await;
-        settle().await;
         actor.no_probe();
     }
 
@@ -11546,8 +11665,12 @@ mod health_event_tests {
     async fn restart_waits_for_its_own_hello_before_rearming_health() {
         let mut actor = Actor::start(ModuleProtocol::Subc, Duration::from_secs(30)).await;
         actor.hello(1, true);
-        settle().await;
-        let generation = actor.module.status().unwrap().spawn_generation;
+        let armed = actor
+            .wait_for_select(|checkpoint| {
+                checkpoint.registered_connection == Some(ConnectionId::new(1))
+                    && checkpoint.next_probe_at.is_some()
+            })
+            .await;
         // Simulate the old process's connection closing before the restart
         // tears the process down. The replacement process has started but has
         // not sent its HELLO, so it is not registered.
@@ -11556,33 +11679,38 @@ mod health_event_tests {
             .deregister_connection(ConnectionId::new(1))
             .unwrap();
         actor.module.restart(Some(0)).await.unwrap();
-        for _ in 0..10000 {
-            if actor.module.status().unwrap().spawn_generation > generation {
-                break;
-            }
-            tokio::task::yield_now().await;
-            tokio::time::advance(Duration::from_millis(1)).await;
-        }
-        assert!(actor.module.status().unwrap().spawn_generation > generation);
-        settle().await;
+        let parked = actor
+            .wait_for_select(|checkpoint| {
+                checkpoint.generation > armed.generation
+                    && checkpoint.registered_connection.is_none()
+                    && checkpoint.next_probe_at.is_none()
+            })
+            .await;
+        assert_eq!(parked.wake_after, None);
         actor.rx.close();
         // Drain the stop notice the restart queued for the old process's connection,
         // so it isn't mistaken for traffic to the replacement.
         while actor.rx.try_recv().is_ok() {}
         let turns = actor.turns();
         tokio::time::advance(Duration::from_secs(60)).await;
-        settle().await;
-        assert_eq!(actor.turns(), turns, "replacement must park before HELLO");
+        let after = actor.turns();
+        eprintln!(
+            "restart park turns: before={turns} after={after} delta={}",
+            after - turns
+        );
+        assert_eq!(after, turns, "replacement must park before HELLO");
+        let hello_tick = Instant::now();
         actor.hello(2, true);
-        settle().await;
-        tokio::time::advance(jittered_health_delay(
-            &actor.spec.module_id,
-            0,
-            actor.health.cadence,
-        ))
-        .await;
-        settle().await;
-        actor.probe();
+        let rearmed = actor
+            .wait_for_select(|checkpoint| {
+                checkpoint.registered_connection == Some(ConnectionId::new(2))
+                    && checkpoint.next_probe_at.is_some()
+            })
+            .await;
+        let delay = jittered_health_delay(&actor.spec.module_id, 0, actor.health.cadence);
+        assert_eq!(rearmed.next_probe_at, Some(hello_tick + delay));
+        tokio::time::advance(delay).await;
+        actor.probe().await;
     }
 
     #[tokio::test(start_paused = true)]
@@ -11616,18 +11744,21 @@ mod health_event_tests {
             .update_configuration(actor.spec.clone(), actor.health.clone(), None)
             .await
             .unwrap();
-        settle().await;
-        assert!(actor.turns() > turns, "rescan must arm in the command tick");
+        let armed = actor
+            .wait_for_select(|checkpoint| {
+                checkpoint.turn > turns && checkpoint.next_probe_at.is_some()
+            })
+            .await;
+        assert_eq!(armed.next_probe_at, Some(tick + Duration::from_millis(1)));
         assert_eq!(Instant::now(), tick);
         tokio::time::advance(Duration::from_millis(1)).await;
         let mut started = false;
-        for _ in 0..10000 {
+        wait_for("successful HTTP probe", || {
             started |= started_rx.try_recv().is_ok();
-            if actor.module.status().unwrap().health.status == SupervisorHealthStatus::Ok {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
+            (started && actor.module.status().unwrap().health.status == SupervisorHealthStatus::Ok)
+                .then_some(())
+        })
+        .await;
         assert!(started, "added HTTP check must start at its first deadline");
         assert_eq!(
             actor.module.status().unwrap().health.status,
@@ -11635,15 +11766,20 @@ mod health_event_tests {
         );
         assert_eq!(Instant::now(), tick + Duration::from_millis(1));
         actor.health.http = None;
+        let turns = actor.turns();
         actor
             .module
             .update_configuration(actor.spec.clone(), actor.health.clone(), None)
             .await
             .unwrap();
-        settle().await;
+        let parked = actor
+            .wait_for_select(|checkpoint| {
+                checkpoint.turn > turns && checkpoint.next_probe_at.is_none()
+            })
+            .await;
+        assert_eq!(parked.wake_after, None);
         let turns = actor.turns();
         tokio::time::advance(Duration::from_secs(60)).await;
-        settle().await;
         assert_eq!(
             actor.turns(),
             turns,

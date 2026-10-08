@@ -15,6 +15,10 @@ static ACCEPTANCE_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new((
 static TRACING: Once = Once::new();
 
 pub async fn acceptance_gate() -> tokio::sync::MutexGuard<'static, ()> {
+    // Prepare the macOS launcher before an arm starts measuring live-server
+    // latency: a cold Cargo build is setup, not daemon or broker response time.
+    #[cfg(target_os = "macos")]
+    let _ = daemon::ckdev_subc();
     ACCEPTANCE_GATE.lock().await
 }
 

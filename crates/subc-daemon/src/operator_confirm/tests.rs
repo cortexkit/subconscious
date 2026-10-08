@@ -582,11 +582,26 @@ async fn stuck_precedes_module_limit_with_undelivered_answer() {
     );
     let m = f.module("m", 1, "nonce").await;
     let confirms = f.forwarding.operator_confirms();
-    let mut state = confirms.lock();
-    state.stuck = true;
-    state.modules.insert("m".into(), 123);
-    drop(state);
-    assert_reason(&f.request(&m, 4, "valid").await[0], "provider_stuck");
+    for corr in 10..18 {
+        m.ctx
+            .egress
+            .try_send(frame(FrameType::Pong, corr, serde_json::json!({})))
+            .unwrap();
+    }
+    assert!(f.request(&m, 4, "valid").await.is_empty());
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while {
+            let state = confirms.lock();
+            state.prompt.is_some() || state.deliveries != 1
+        } {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the actual answer is blocked on full egress");
+    assert!(confirms.lock().modules.contains_key("m"));
+    confirms.lock().stuck = true;
+    assert_reason(&f.request(&m, 5, "valid").await[0], "provider_stuck");
 }
 #[tokio::test]
 async fn backoff_uses_module_and_principal_not_route() {

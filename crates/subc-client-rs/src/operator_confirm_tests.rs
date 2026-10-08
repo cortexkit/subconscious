@@ -95,8 +95,7 @@ async fn assert_one_cancel(rx: &mut mpsc::Receiver<Frame>, corr: u64) {
 #[tokio::test]
 async fn operator_confirm_fake_daemon_confirmed_reply_succeeds() {
     let mut served =
-        super::module_close_tests::serve_against_stand_in_with_ops(Echo, &[OPERATOR_CONFIRM_OP])
-            .await;
+        super::stand_in::serve_against_stand_in_with_ops(|_| Echo, &[OPERATOR_CONFIRM_OP]).await;
     let route = served.handle.route_handle(7, 3);
     let mut call = Box::pin(served.handle.confirm_operator("Replace identity", &route));
     still_pending(call.as_mut()).await;
@@ -134,8 +133,7 @@ async fn operator_confirm_fake_daemon_confirmed_reply_succeeds() {
 #[tokio::test]
 async fn operator_confirm_fake_daemon_close_wakes_before_deadline() {
     let mut served =
-        super::module_close_tests::serve_against_stand_in_with_ops(Echo, &[OPERATOR_CONFIRM_OP])
-            .await;
+        super::stand_in::serve_against_stand_in_with_ops(|_| Echo, &[OPERATOR_CONFIRM_OP]).await;
     let route = served.handle.route_handle(7, 3);
     let mut call = Box::pin(served.handle.confirm_operator("Replace identity", &route));
     still_pending(call.as_mut()).await;

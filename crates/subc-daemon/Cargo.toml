@@ -30,7 +30,7 @@ sha2 = "0.10"
 subc-control = { path = "../subc-control", version = "0.28" }
 subc-jsonc = { path = "../subc-jsonc", version = "0.1.0" }
 subc-os = { path = "../subc-os", version = "0.1.8" }
-subc-protocol = { path = "../subc-protocol", version = "0.29.3" }
+subc-protocol = { path = "../subc-protocol", version = "0.29.4" }
 subc-transport = { path = "../subc-transport", version = "0.10" }
 subc-uptime = { path = "../subc-uptime", version = "0.1.0" }
 tokio = { version = "1", features = ["net", "rt-multi-thread", "macros", "io-util", "sync", "time", "process", "signal"] }

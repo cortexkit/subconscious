@@ -6,6 +6,7 @@ use std::{
 };
 
 use subc_protocol::manifest::{CapabilityDeclarations, ModuleManifest, ProviderRole};
+use tokio::sync::watch;
 
 /// Per-connection identity assigned by [`crate::Router`] while serving a socket.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -94,6 +95,9 @@ pub struct Registry {
 
 #[derive(Debug, Default)]
 struct RegistryInner {
+    /// Only subscribed module ids have a sender. Changes coalesce, and writers
+    /// never wait for a supervisor to receive them.
+    module_changes: HashMap<String, watch::Sender<()>>,
     modules: HashMap<String, ModuleRegistration>,
     /// Swap candidates by module id: registered, never routable, never listed.
     candidates: HashMap<String, ModuleRegistration>,
@@ -104,6 +108,24 @@ struct RegistryInner {
 }
 
 impl Registry {
+    /// Subscribe before reading a registration so a change between the read
+    /// and the supervisor's wait remains pending on this receiver.
+    pub(crate) fn subscribe_module_changes(
+        &self,
+        module_id: &str,
+    ) -> Result<watch::Receiver<()>, RegistryError> {
+        let mut inner = self.lock_inner()?;
+        // Retired supervisors must not leave an ever-growing set of ids.
+        inner
+            .module_changes
+            .retain(|_, sender| sender.receiver_count() > 0);
+        Ok(inner
+            .module_changes
+            .entry(module_id.to_string())
+            .or_insert_with(|| watch::channel(()).0)
+            .subscribe())
+    }
+
     /// Register a module manifest with the module's effective granted control op set.
     pub fn register_with_control_ops(
         &self,
@@ -133,6 +155,7 @@ impl Registry {
 
         inner.modules.insert(module_id, registration.clone());
         inner.bump_generation();
+        inner.notify_module_changed(&registration.manifest.module_id);
         Ok(registration)
     }
 
@@ -169,6 +192,7 @@ impl Registry {
             control_ops,
         };
         inner.candidates.insert(module_id, registration.clone());
+        inner.notify_module_changed(&registration.manifest.module_id);
         Ok(registration)
     }
 
@@ -192,6 +216,7 @@ impl Registry {
             inner.superseded.push(superseded);
         }
         inner.bump_generation();
+        inner.notify_module_changed(module_id);
         Ok(Some(RegistryCutover {
             promoted,
             superseded,
@@ -253,6 +278,7 @@ impl Registry {
             return Ok(false);
         };
         registration.state = state;
+        inner.notify_module_changed(module_id);
         Ok(true)
     }
 
@@ -302,6 +328,7 @@ impl Registry {
         if matches!(slot, SlotKind::Active) {
             inner.bump_generation();
         }
+        inner.notify_module_changed(&updated.manifest.module_id);
         Ok(Some(updated))
     }
 
@@ -344,6 +371,9 @@ impl Registry {
             registration.state = ChannelState::Closed;
             registration
         }));
+        for registration in &closed {
+            inner.notify_module_changed(&registration.manifest.module_id);
+        }
         Ok(closed)
     }
 
@@ -361,6 +391,12 @@ enum SlotKind {
 }
 
 impl RegistryInner {
+    fn notify_module_changed(&self, module_id: &str) {
+        if let Some(sender) = self.module_changes.get(module_id) {
+            sender.send_replace(());
+        }
+    }
+
     fn find_by_connection(
         &self,
         connection_id: ConnectionId,
@@ -480,6 +516,92 @@ pub fn module_id_path_hazard(module_id: &str) -> Result<(), String> {
         return Err("is longer than 255 bytes".to_string());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod change_notification_tests {
+    use super::*;
+
+    fn manifest() -> ModuleManifest {
+        ModuleManifest::builder("watched", "1.0.0")
+            .protocol_ver(1)
+            .build()
+    }
+
+    fn changed(receiver: &mut watch::Receiver<()>) {
+        assert!(
+            receiver.has_changed().unwrap(),
+            "registry write must notify"
+        );
+        receiver.borrow_and_update();
+    }
+
+    #[test]
+    fn every_registration_write_notifies_only_its_module() {
+        let registry = Registry::default();
+        let mut events = registry.subscribe_module_changes("watched").unwrap();
+        let other = registry.subscribe_module_changes("other").unwrap();
+        let active = ConnectionId::new(1);
+        let candidate = ConnectionId::new(2);
+        registry
+            .register_with_control_ops(manifest(), 1, active, vec![])
+            .unwrap();
+        changed(&mut events);
+        registry
+            .set_module_state_for_test("watched", ChannelState::Active)
+            .unwrap();
+        changed(&mut events);
+        registry
+            .replace_catalog_for_connection(active, vec![], None, Some(true))
+            .unwrap();
+        changed(&mut events);
+        registry
+            .register_candidate_with_control_ops(manifest(), 1, candidate, vec![])
+            .unwrap();
+        changed(&mut events);
+        registry
+            .replace_catalog_for_connection(candidate, vec![], None, Some(true))
+            .unwrap();
+        changed(&mut events);
+        registry.promote_candidate("watched").unwrap().unwrap();
+        changed(&mut events);
+        // Superseded connections can still update and deregister their slot.
+        registry
+            .replace_catalog_for_connection(active, vec![], None, Some(false))
+            .unwrap();
+        changed(&mut events);
+        registry.deregister_connection(active).unwrap();
+        changed(&mut events);
+        registry.deregister_connection(candidate).unwrap();
+        changed(&mut events);
+        registry
+            .register_candidate_with_control_ops(manifest(), 1, candidate, vec![])
+            .unwrap();
+        changed(&mut events);
+        registry.deregister_connection(candidate).unwrap();
+        changed(&mut events);
+        assert!(
+            !other.has_changed().unwrap(),
+            "other module must stay parked"
+        );
+    }
+
+    #[test]
+    fn subscription_before_read_keeps_a_change_until_waited_on() {
+        let registry = Registry::default();
+        let mut events = registry.subscribe_module_changes("watched").unwrap();
+        assert!(registry.get_module("watched").unwrap().is_none());
+        registry
+            .register_with_control_ops(manifest(), 1, ConnectionId::new(1), vec![])
+            .unwrap();
+        // Neither a later lookup nor a coalesced catalog update consumes it.
+        registry.get_module("watched").unwrap().unwrap();
+        registry
+            .replace_catalog_for_connection(ConnectionId::new(1), vec![], None, Some(true))
+            .unwrap();
+        changed(&mut events);
+        assert!(!events.has_changed().unwrap());
+    }
 }
 
 #[cfg(test)]

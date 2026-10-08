@@ -1048,6 +1048,9 @@ pub struct ModuleStatus {
 
 #[derive(Debug, Clone, PartialEq)]
 struct SupervisorSnapshot {
+    /// Counts running-child loop turns, not executor polls of a parked wait.
+    #[cfg(test)]
+    actor_turns: u64,
     state: ModuleState,
     enabled: bool,
     process_alive: bool,
@@ -1192,6 +1195,8 @@ impl SupervisorSnapshot {
 
     fn new(state: ModuleState, enabled: bool) -> Self {
         Self {
+            #[cfg(test)]
+            actor_turns: 0,
             state,
             enabled,
             process_alive: false,
@@ -4051,7 +4056,10 @@ impl HealthProbeRuntime {
             if !self.advertised {
                 self.next_probe_at = None;
                 let _ = update_snapshot(snapshot, Some(&spec.module_id), |state| {
-                    state.health = ModuleHealthStatus::default();
+                    let unknown = ModuleHealthStatus::default();
+                    if state.health != unknown {
+                        state.health = unknown;
+                    }
                 });
             } else if self.next_probe_at.is_none() {
                 self.next_probe_at = Some(
@@ -4088,11 +4096,18 @@ impl HealthProbeRuntime {
             self.advertised = false;
             self.next_probe_at = None;
             let _ = update_snapshot(snapshot, Some(&spec.module_id), |state| {
-                state.health.status = SupervisorHealthStatus::Unknown;
-                state.health.consecutive_failures = 0;
-                state.health.last_probe_ms = None;
-                state.health.detail = None;
-                state.health.metrics = None;
+                if state.health.status != SupervisorHealthStatus::Unknown
+                    || state.health.consecutive_failures != 0
+                    || state.health.last_probe_ms.is_some()
+                    || state.health.detail.is_some()
+                    || state.health.metrics.is_some()
+                {
+                    state.health.status = SupervisorHealthStatus::Unknown;
+                    state.health.consecutive_failures = 0;
+                    state.health.last_probe_ms = None;
+                    state.health.detail = None;
+                    state.health.metrics = None;
+                }
             });
             return;
         }
@@ -4114,13 +4129,12 @@ impl HealthProbeRuntime {
         }
     }
 
-    fn wake_after(&self) -> Duration {
+    fn wake_after(&self) -> Option<Duration> {
         if !self.advertised {
-            return REGISTRY_RELEASE_POLL;
+            return None;
         }
         self.next_probe_at
             .map(|next| next.saturating_duration_since(Instant::now()))
-            .unwrap_or(REGISTRY_RELEASE_POLL)
     }
 
     fn due(&self) -> bool {
@@ -5947,6 +5961,18 @@ async fn supervise_loop(
     mut commands: mpsc::Receiver<SupervisorCommand>,
 ) {
     let mut health_probe = HealthProbeRuntime::default();
+    // Registry writes (including embedded callers) notify this module only.
+    // Subscribe before the first refresh; watch retains changes that arrive
+    // while commands or probes are running. No polling fallback is needed.
+    let mut registration_changes = match registry.subscribe_module_changes(&spec.module_id) {
+        Ok(changes) => Some(changes),
+        Err(err) => {
+            // A poisoned registry cannot accept further writes, so it cannot
+            // recover via a timer. Keep exit and command handling alive.
+            warn!(module_id = %spec.module_id, error = %err, "health prober could not subscribe to registry");
+            None
+        }
+    };
     // All restart backoffs run here, including health and operator requests.
     // While one is pending the loop serves commands, so disable or drain can
     // cancel the replacement without spawning a process just to stop it.
@@ -6023,9 +6049,22 @@ async fn supervise_loop(
             continue;
         }
         if child.is_some() {
+            #[cfg(test)]
+            {
+                lock_snapshot(&snapshot).unwrap().actor_turns += 1;
+            }
             health_probe.refresh_registration(&spec, &runtime, &registry, &snapshot);
-            let probe_sleep = sleep(health_probe.wake_after());
+            let wake_after = health_probe.wake_after();
+            let probe_sleep = async move {
+                match wake_after {
+                    Some(delay) => sleep(delay).await,
+                    None => std::future::pending().await,
+                }
+            };
             tokio::pin!(probe_sleep);
+            // A non-wire child without HTTP health parks on exit and commands
+            // only. Rescans already arrive through the command channel.
+            let wire_child = running_protocol(&spec, &snapshot) == ModuleProtocol::Subc;
             let active_child = child.as_mut().expect("child checked above");
             tokio::select! {
                 wait_result = active_child.wait() => {
@@ -6124,6 +6163,12 @@ async fn supervise_loop(
                         return;
                     }
                 }
+                _ = async {
+                    match registration_changes.as_mut() {
+                        Some(changes) => { let _ = changes.changed().await; }
+                        None => std::future::pending().await,
+                    }
+                }, if wire_child => {}
                 _ = &mut probe_sleep => {
                     if health_probe.due() {
                         run_health_probe_cycle(
@@ -11242,6 +11287,371 @@ mod terminal_history_tests {
     #[test]
     fn wait_error_exit_report_is_classified_as_a_crash() {
         assert_eq!(wait_error_exit_report().kind, ExitKind::Crash);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod health_event_tests {
+    use super::*;
+    use subc_protocol::{manifest::Concurrency, session::ModuleControlResponse};
+    use subc_test_support::TestTempDir;
+
+    struct Actor {
+        module: SupervisedModule,
+        registry: Arc<Registry>,
+        forwarding: Arc<ForwardingTable>,
+        spec: ModuleSpec,
+        health: HealthConfig,
+        rx: mpsc::Receiver<crate::router::OutboundFrame>,
+        _home: TestTempDir,
+    }
+
+    async fn settle() {
+        // Yield without advancing time: notification delivery must not depend
+        // on a timer, and OS process readiness can take several executor polls.
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    impl Actor {
+        async fn start(protocol: ModuleProtocol, cadence: Duration) -> Self {
+            let home = TestTempDir::new("health-events");
+            let registry = Arc::new(Registry::default());
+            let forwarding = Arc::new(ForwardingTable::default());
+            let health = HealthConfig {
+                cadence,
+                deadline: Duration::from_secs(3600),
+                ..HealthConfig::default()
+            };
+            let supervisor =
+                Supervisor::new_for_test(registry.clone(), RestartPolicy::new(3, Duration::ZERO))
+                    .with_forwarding(forwarding.clone())
+                    .with_health_config(health.clone());
+            let spec = ModuleSpec {
+                module_id: "event-health-child".into(),
+                program: PathBuf::from("/bin/sh"),
+                // The process stays alive but has no real bus peer. Registrations
+                // below exercise the same registry writes as accepted HELLOs.
+                args: vec!["-c".into(), "exec sleep 600".into()],
+                env: ["XDG_DATA_HOME", "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME"]
+                    .into_iter()
+                    .map(|key| (key.into(), home.path().display().to_string()))
+                    .collect(),
+                reserved: false,
+                reserved_prefixes: vec![],
+                protocol,
+                overlap: Default::default(),
+            };
+            let module = supervisor.spawn(spec.clone()).unwrap();
+            let (_, rx) = mpsc::channel(8);
+            let actor = Self {
+                module,
+                registry,
+                forwarding,
+                spec,
+                health,
+                rx,
+                _home: home,
+            };
+            for _ in 0..10000 {
+                if actor.turns() > 0 {
+                    return actor;
+                }
+                tokio::task::yield_now().await;
+            }
+            panic!("child did not reach its running event loop");
+        }
+
+        fn turns(&self) -> u64 {
+            lock_snapshot(&self.module.inner.snapshot)
+                .unwrap()
+                .actor_turns
+        }
+
+        fn hello(&mut self, connection: u64, health: bool) {
+            let manifest =
+                subc_protocol::manifest::ModuleManifest::builder(&self.spec.module_id, "1.0.0")
+                    .protocol_ver(subc_protocol::PROTOCOL_VERSION)
+                    .build();
+            let connection = ConnectionId::new(connection);
+            let (tx, rx) = mpsc::channel(8);
+            self.rx = rx;
+            self.forwarding
+                .register_module_connection(
+                    connection,
+                    self.spec.module_id.clone(),
+                    subc_protocol::PROTOCOL_VERSION,
+                    Concurrency::ModuleManaged,
+                    FrameSink::new(tx),
+                )
+                .unwrap();
+            self.registry
+                .register_with_control_ops(
+                    manifest,
+                    subc_protocol::PROTOCOL_VERSION,
+                    connection,
+                    if health {
+                        vec![MODULE_CONTROL_OP_HEALTH_CHECK.into()]
+                    } else {
+                        vec![]
+                    },
+                )
+                .unwrap();
+        }
+
+        fn probe(&mut self) -> crate::router::OutboundFrame {
+            let frame = self.rx.try_recv().expect("health probe must have started");
+            let body: Value = serde_json::from_slice(&frame.body).unwrap();
+            assert_eq!(body["op"], MODULE_CONTROL_OP_HEALTH_CHECK);
+            frame
+        }
+
+        fn no_probe(&mut self) {
+            assert!(matches!(
+                self.rx.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
+        }
+
+        fn answer(&self, connection: u64, frame: crate::router::OutboundFrame) {
+            self.forwarding
+                .complete_module_control_rpc(
+                    ConnectionId::new(connection),
+                    frame.header.corr,
+                    Some(MODULE_CONTROL_OP_HEALTH_CHECK),
+                    ModuleControlRpcOutcome::Response(ModuleControlResponse::HealthCheck {
+                        status: HealthStatus::Ok,
+                        detail: None,
+                        metrics: None,
+                    }),
+                )
+                .unwrap();
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn no_health_children_park_for_sixty_seconds() {
+        let none = Actor::start(ModuleProtocol::None, Duration::from_secs(30)).await;
+        let unregistered = Actor::start(ModuleProtocol::Subc, Duration::from_secs(30)).await;
+        let mut unadvertised = Actor::start(ModuleProtocol::Subc, Duration::from_secs(30)).await;
+        unadvertised.hello(1, false);
+        settle().await;
+        // Advance in 10 ms steps so the old poll really executes ~6,000 turns;
+        // a single 60 s jump would only observe one expired timer.
+        for _ in 0..6000 {
+            tokio::time::advance(Duration::from_millis(10)).await;
+            tokio::task::yield_now().await;
+        }
+        for actor in [&none, &unregistered, &unadvertised] {
+            assert!(
+                actor.turns() <= 5,
+                "no-health actor woke {} times",
+                actor.turns()
+            );
+            assert_eq!(actor.module.state().unwrap(), ModuleState::Running);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn late_hello_starts_a_due_probe_in_the_notification_tick() {
+        // A zero cadence isolates notification latency from the intentional
+        // first-probe cadence. The normal 30-33 s schedule is checked below.
+        let mut actor = Actor::start(ModuleProtocol::Subc, Duration::ZERO).await;
+        let tick = Instant::now();
+        actor.hello(1, true);
+        settle().await;
+        actor.probe();
+        assert_eq!(Instant::now(), tick, "HELLO must not wait for a poll");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hello_keeps_the_jittered_cadence_and_catalog_updates_do_not_reset_it() {
+        let mut actor = Actor::start(ModuleProtocol::Subc, Duration::from_secs(30)).await;
+        actor.hello(1, true);
+        settle().await;
+        tokio::time::advance(Duration::from_secs(29)).await;
+        actor
+            .registry
+            .replace_catalog_for_connection(ConnectionId::new(1), vec![], None, Some(true))
+            .unwrap();
+        settle().await;
+        actor.no_probe();
+        let delay = jittered_health_delay(&actor.spec.module_id, 0, actor.health.cadence);
+        assert!((Duration::from_secs(30)..Duration::from_secs(33)).contains(&delay));
+        tokio::time::advance(delay - Duration::from_secs(29)).await;
+        settle().await;
+        let frame = actor.probe();
+        actor.answer(1, frame);
+        settle().await;
+        let next = jittered_health_delay(&actor.spec.module_id, 1, actor.health.cadence);
+        tokio::time::advance(next - Duration::from_nanos(1)).await;
+        settle().await;
+        actor.no_probe();
+        tokio::time::advance(Duration::from_nanos(1)).await;
+        settle().await;
+        actor.probe();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn disconnect_disarms_and_reconnect_rearms_health() {
+        let mut actor = Actor::start(ModuleProtocol::Subc, Duration::from_secs(30)).await;
+        actor.hello(1, true);
+        settle().await;
+        let turns = actor.turns();
+        actor
+            .registry
+            .deregister_connection(ConnectionId::new(1))
+            .unwrap();
+        settle().await;
+        assert!(
+            actor.turns() > turns,
+            "disconnect must wake the actor immediately"
+        );
+        tokio::time::advance(Duration::from_secs(60)).await;
+        settle().await;
+        actor.no_probe();
+        actor.hello(2, true);
+        settle().await;
+        tokio::time::advance(jittered_health_delay(
+            &actor.spec.module_id,
+            0,
+            actor.health.cadence,
+        ))
+        .await;
+        settle().await;
+        actor.probe();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reregistration_without_health_disarms_the_old_schedule() {
+        let mut actor = Actor::start(ModuleProtocol::Subc, Duration::from_secs(30)).await;
+        actor.hello(1, true);
+        settle().await;
+        actor
+            .registry
+            .deregister_connection(ConnectionId::new(1))
+            .unwrap();
+        actor.hello(2, false);
+        settle().await;
+        tokio::time::advance(Duration::from_secs(60)).await;
+        settle().await;
+        actor.no_probe();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn restart_waits_for_its_own_hello_before_rearming_health() {
+        let mut actor = Actor::start(ModuleProtocol::Subc, Duration::from_secs(30)).await;
+        actor.hello(1, true);
+        settle().await;
+        let generation = actor.module.status().unwrap().spawn_generation;
+        // Simulate the old peer closing before the restart tears down its
+        // process. The replacement has not registered yet.
+        actor
+            .registry
+            .deregister_connection(ConnectionId::new(1))
+            .unwrap();
+        actor.module.restart(Some(0)).await.unwrap();
+        for _ in 0..10000 {
+            if actor.module.status().unwrap().spawn_generation > generation {
+                break;
+            }
+            tokio::task::yield_now().await;
+            tokio::time::advance(Duration::from_millis(1)).await;
+        }
+        assert!(actor.module.status().unwrap().spawn_generation > generation);
+        settle().await;
+        actor.rx.close();
+        while actor.rx.try_recv().is_ok() {} // Discard old peer's stop notice.
+        let turns = actor.turns();
+        tokio::time::advance(Duration::from_secs(60)).await;
+        settle().await;
+        assert_eq!(actor.turns(), turns, "replacement must park before HELLO");
+        actor.hello(2, true);
+        settle().await;
+        tokio::time::advance(jittered_health_delay(
+            &actor.spec.module_id,
+            0,
+            actor.health.cadence,
+        ))
+        .await;
+        settle().await;
+        actor.probe();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rescan_adds_and_removes_http_health_without_polling() {
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::TcpListener,
+        };
+        let mut actor = Actor::start(ModuleProtocol::None, Duration::from_secs(30)).await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        actor.health.http = Some(format!("http://{}/health", listener.local_addr().unwrap()));
+        // One millisecond separates successive probes without a polling delay.
+        actor.health.cadence = Duration::from_millis(1);
+        let (started_tx, mut started_rx) = mpsc::channel(8);
+        let peer = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0; 1024];
+                assert!(socket.read(&mut request).await.unwrap() > 0);
+                started_tx.send(()).await.unwrap();
+                socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                    .await
+                    .unwrap();
+            }
+        });
+        let tick = Instant::now();
+        let turns = actor.turns();
+        actor
+            .module
+            .update_configuration(actor.spec.clone(), actor.health.clone(), None)
+            .await
+            .unwrap();
+        settle().await;
+        assert!(actor.turns() > turns, "rescan must arm in the command tick");
+        assert_eq!(Instant::now(), tick);
+        tokio::time::advance(Duration::from_millis(1)).await;
+        let mut started = false;
+        for _ in 0..10000 {
+            started |= started_rx.try_recv().is_ok();
+            if actor.module.status().unwrap().health.status == SupervisorHealthStatus::Ok {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(started, "added HTTP check must start at its first deadline");
+        assert_eq!(
+            actor.module.status().unwrap().health.status,
+            SupervisorHealthStatus::Ok
+        );
+        assert_eq!(Instant::now(), tick + Duration::from_millis(1));
+        actor.health.http = None;
+        actor
+            .module
+            .update_configuration(actor.spec.clone(), actor.health.clone(), None)
+            .await
+            .unwrap();
+        settle().await;
+        let turns = actor.turns();
+        tokio::time::advance(Duration::from_secs(60)).await;
+        settle().await;
+        assert_eq!(
+            actor.turns(),
+            turns,
+            "removed HTTP check must park the actor"
+        );
+        assert!(
+            started_rx.try_recv().is_err(),
+            "removed HTTP check must stay disarmed"
+        );
+        assert_eq!(
+            actor.module.status().unwrap().health,
+            ModuleHealthStatus::default()
+        );
+        peer.abort();
     }
 }
 

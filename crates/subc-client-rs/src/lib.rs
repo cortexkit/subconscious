@@ -42,6 +42,7 @@ pub use subc_control::{CatalogEntry, ConsumerIdentity};
 /// own readers must as well, and it should call it before spawning anything.
 pub use subc_os::launch_nonce;
 use subc_protocol::{
+    error_codes,
     manifest::ModuleManifest,
     scope::{
         ScopeEnded, ScopeRecord, ScopeRecordResult, ScopeStamp, ScopeStatus, SCOPE_DESCRIBE_OP,
@@ -49,8 +50,8 @@ use subc_protocol::{
     },
     session::{
         ModuleControlCommand, ModuleControlRequest, ModuleControlRequestFromModule,
-        ModuleControlResponse, ModuleControlResponseToModule, MODULE_CONTROL_OP_HEALTH_CHECK,
-        MODULE_TO_SUBC_OP_CATALOG_UPDATE,
+        ModuleControlResponse, ModuleControlResponseToModule, OperatorConfirmReply,
+        OperatorConfirmRequest, MODULE_CONTROL_OP_HEALTH_CHECK, MODULE_TO_SUBC_OP_CATALOG_UPDATE,
     },
     BindIdentity, ErrorBody, Flags, Frame, FrameBuildError, FrameType, ModuleHelloAckBody,
     ModuleHelloBody, Principal, Priority, RouteTarget, PROTOCOL_VERSION, SUBC_MODULE_ID_ENV,
@@ -76,12 +77,14 @@ use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufWriter},
     net::TcpStream,
     sync::{mpsc, oneshot, Semaphore},
-    time::{timeout, Instant},
+    time::{timeout, timeout_at, Instant},
 };
 use tokio_util::sync::{CancellationToken, WaitForCancellationFuture};
 
 const AUTH_DEADLINE: Duration = Duration::from_secs(2);
 const CATALOG_UPDATE_TIMEOUT: Duration = Duration::from_secs(10);
+const OPERATOR_CONFIRM_TIMEOUT: Duration = Duration::from_secs(290);
+const OPERATOR_CONFIRM_OP: &str = "operator.confirm";
 const EGRESS_BUFFER: usize = 64;
 const HANDLER_TASK_CAPACITY: usize = 64;
 /// A full dispatcher is normal during a burst. Report dispatch impairment only
@@ -276,6 +279,7 @@ type CatalogUpdateReply =
 type CatalogUpdateWaiter =
     oneshot::Receiver<Result<ModuleControlResponseToModule, CatalogUpdateError>>;
 type CatalogUpdateRequest = (u64, mpsc::Sender<Frame>, CatalogUpdateWaiter);
+type OperatorConfirmRequestWaiter = (u64, mpsc::Sender<Frame>, oneshot::Receiver<Frame>);
 
 /// Future returned by [`serve_with_handle`] that runs the module until GOODBYE or EOF.
 pub type ModuleServeFuture = Pin<Box<dyn Future<Output = Result<(), SubcModuleError>> + Send>>;
@@ -418,6 +422,8 @@ struct ModuleHandleShared {
     supports_live_roots: bool,
     supports_scope_sync: bool,
     supports_scope_describe: bool,
+    supports_operator_confirm: bool,
+    connection_runtime: tokio::runtime::Handle,
     connection_token: u64,
     machine_id: Option<MachineId>,
     live_routes: Mutex<HashMap<u16, RouteHandle>>,
@@ -430,6 +436,7 @@ struct ModuleHandleState {
     writer: Option<mpsc::Sender<Frame>>,
     next_corr: Option<u64>,
     pending_catalog_updates: HashMap<u64, CatalogUpdateReply>,
+    pending_operator_confirms: HashMap<u64, oneshot::Sender<Frame>>,
     closed: bool,
 }
 
@@ -439,6 +446,7 @@ impl ModuleHandle {
         writer: mpsc::Sender<Frame>,
         connection_token: u64,
         close_token: CancellationToken,
+        connection_runtime: tokio::runtime::Handle,
     ) -> Self {
         Self {
             shared: Arc::new(ModuleHandleShared {
@@ -450,6 +458,8 @@ impl ModuleHandle {
                 supports_live_roots: ack.subc_ops.iter().any(|op| op == "supervisor.live_roots"),
                 supports_scope_sync: ack.subc_ops.iter().any(|op| op == SCOPE_SYNC_OP),
                 supports_scope_describe: ack.subc_ops.iter().any(|op| op == SCOPE_DESCRIBE_OP),
+                supports_operator_confirm: ack.subc_ops.iter().any(|op| op == OPERATOR_CONFIRM_OP),
+                connection_runtime,
                 connection_token,
                 // A value that does not parse is treated like an absent one:
                 // the module learns nothing rather than a name that is wrong.
@@ -464,6 +474,7 @@ impl ModuleHandle {
                     writer: Some(writer),
                     next_corr: Some(HELLO_CORR + 1),
                     pending_catalog_updates: HashMap::new(),
+                    pending_operator_confirms: HashMap::new(),
                     closed: false,
                 }),
             }),
@@ -695,6 +706,104 @@ impl ModuleHandle {
         }
     }
 
+    /// Ask the operator to authorise one in-flight, unchanged write.
+    ///
+    /// Every error means the module must refuse the write. `Ok(())` authorises
+    /// only the write this call was made for; it must never be cached or reused.
+    /// The daemon checks the summary and whether this module may ask for the
+    /// caller's route. No failure is retried.
+    ///
+    /// A consumer call that may trigger confirmation must set
+    /// [`CallOptions::timeout`] to at least 300 seconds. This helper waits up to
+    /// 290 seconds, including egress backpressure, and dropping it withdraws an
+    /// accepted request.
+    pub async fn confirm_operator(
+        &self,
+        summary: &str,
+        caller_route: &RouteHandle,
+    ) -> Result<(), OperatorConfirmError> {
+        self.confirm_operator_with_deadline(summary, caller_route, OPERATOR_CONFIRM_TIMEOUT)
+            .await
+    }
+
+    pub(crate) async fn confirm_operator_with_deadline(
+        &self,
+        summary: &str,
+        caller_route: &RouteHandle,
+        duration: Duration,
+    ) -> Result<(), OperatorConfirmError> {
+        if caller_route.connection_token() != self.shared.connection_token {
+            return Err(OperatorConfirmError::NotPermitted);
+        }
+        if !self.shared.supports_operator_confirm {
+            return Err(OperatorConfirmError::Unsupported);
+        }
+        // Use the same absolute deadline for both capacity and the reply: a
+        // slow writer must not extend the time a confirmation can remain live.
+        let deadline = Instant::now() + duration;
+        let body = serde_json::to_vec(&OperatorConfirmRequest::new(
+            summary,
+            caller_route.channel,
+            caller_route.epoch,
+        ))
+        .map_err(|_| OperatorConfirmError::PresenceUnavailable)?;
+        let (corr, writer, rx) = self.shared.begin_operator_confirm()?;
+        let mut guard = OperatorConfirmGuard {
+            shared: Arc::clone(&self.shared),
+            runtime: self.shared.connection_runtime.clone(),
+            writer: writer.clone(),
+            corr,
+            accepted: false,
+            armed: true,
+        };
+        let frame = Frame::build_with_version(
+            self.shared.negotiated_ver,
+            FrameType::Request,
+            control_flags(),
+            0,
+            0,
+            corr,
+            body,
+        )
+        .map_err(|_| OperatorConfirmError::PresenceUnavailable)?;
+        tokio::select! {
+            result = timeout_at(deadline, writer.send(frame)) => {
+                result.map_err(|_| OperatorConfirmError::PresenceUnavailable)?
+                    .map_err(|_| OperatorConfirmError::PresenceUnavailable)?;
+            }
+            _ = self.shared.close_token.cancelled() => {
+                return Err(OperatorConfirmError::PresenceUnavailable);
+            }
+        }
+        guard.accepted = true;
+        let reply = timeout_at(deadline, rx)
+            .await
+            .map_err(|_| OperatorConfirmError::PresenceUnavailable)?
+            .map_err(|_| OperatorConfirmError::PresenceUnavailable)?;
+        guard.armed = false;
+        match reply.header.ty {
+            FrameType::Response => {
+                match serde_json::from_slice::<OperatorConfirmReply>(&reply.body) {
+                    Ok(body) if body.outcome == "confirmed" => Ok(()),
+                    _ => Err(OperatorConfirmError::PresenceUnavailable),
+                }
+            }
+            FrameType::Error => match serde_json::from_slice::<ErrorBody>(&reply.body) {
+                Ok(body) => Err(match body.code.as_str() {
+                    error_codes::OPERATOR_DECLINED => OperatorConfirmError::Declined,
+                    error_codes::OPERATOR_SUMMARY_INVALID => OperatorConfirmError::SummaryInvalid,
+                    error_codes::OPERATOR_REQUEST_NOT_PERMITTED | "not_registered" => {
+                        OperatorConfirmError::NotPermitted
+                    }
+                    "unsupported_control_frame" => OperatorConfirmError::Unsupported,
+                    _ => OperatorConfirmError::PresenceUnavailable,
+                }),
+                Err(_) => Err(OperatorConfirmError::PresenceUnavailable),
+            },
+            _ => Err(OperatorConfirmError::PresenceUnavailable),
+        }
+    }
+
     /// Send one channel-0 control request and wait for its reply, through the
     /// same correlation table, writer and timeout as `catalog_update` and
     /// `live_roots`. The caller checks that the reply is the right variant.
@@ -840,6 +949,15 @@ impl ModuleHandle {
     }
 
     fn handle_control_reply(&self, frame: Frame) -> bool {
+        let operator_reply = self
+            .shared
+            .lock_inner()
+            .pending_operator_confirms
+            .remove(&frame.header.corr);
+        if let Some(reply) = operator_reply {
+            let _ = reply.send(frame);
+            return true;
+        }
         let Some(reply) = self.shared.take_pending_catalog_update(frame.header.corr) else {
             return false;
         };
@@ -880,30 +998,37 @@ impl ModuleHandleShared {
             return Err(CatalogUpdateError::ConnectionClosed);
         }
         let Some(writer) = inner.writer.clone() else {
-            inner.closed = true;
-            self.close_token.cancel();
             drop(inner);
-            self.clear_live_routes();
+            self.close_connection();
             return Err(CatalogUpdateError::ConnectionClosed);
         };
         let Some(corr) = next_module_control_corr(&mut inner) else {
-            inner.closed = true;
-            inner.writer = None;
-            let pending = inner
-                .pending_catalog_updates
-                .drain()
-                .map(|(_, reply)| reply)
-                .collect::<Vec<_>>();
-            self.close_token.cancel();
             drop(inner);
-            self.clear_live_routes();
-            for reply in pending {
-                let _ = reply.send(Err(CatalogUpdateError::ConnectionClosed));
-            }
+            self.close_connection();
             return Err(CatalogUpdateError::ConnectionClosed);
         };
         let (tx, rx) = oneshot::channel();
         inner.pending_catalog_updates.insert(corr, tx);
+        Ok((corr, writer, rx))
+    }
+
+    fn begin_operator_confirm(&self) -> Result<OperatorConfirmRequestWaiter, OperatorConfirmError> {
+        let mut inner = self.lock_inner();
+        if inner.closed {
+            return Err(OperatorConfirmError::PresenceUnavailable);
+        }
+        let Some(writer) = inner.writer.clone() else {
+            drop(inner);
+            self.close_connection();
+            return Err(OperatorConfirmError::PresenceUnavailable);
+        };
+        let Some(corr) = next_module_control_corr(&mut inner) else {
+            drop(inner);
+            self.close_connection();
+            return Err(OperatorConfirmError::PresenceUnavailable);
+        };
+        let (tx, rx) = oneshot::channel();
+        inner.pending_operator_confirms.insert(corr, tx);
         Ok((corr, writer, rx))
     }
 
@@ -924,6 +1049,8 @@ impl ModuleHandleShared {
             inner.closed = true;
             inner.writer = None;
             self.close_token.cancel();
+            // Dropping these senders wakes raw-frame waiters immediately.
+            inner.pending_operator_confirms.clear();
             inner
                 .pending_catalog_updates
                 .drain()
@@ -954,6 +1081,79 @@ fn next_module_control_corr(inner: &mut ModuleHandleState) -> Option<u64> {
     inner.next_corr = corr.checked_add(1);
     Some(corr)
 }
+
+struct OperatorConfirmGuard {
+    shared: Arc<ModuleHandleShared>,
+    runtime: tokio::runtime::Handle,
+    writer: mpsc::Sender<Frame>,
+    corr: u64,
+    accepted: bool,
+    armed: bool,
+}
+
+impl Drop for OperatorConfirmGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.shared
+            .lock_inner()
+            .pending_operator_confirms
+            .remove(&self.corr);
+        if !self.accepted {
+            return;
+        }
+        let Ok(cancel) = Frame::build_with_version(
+            self.shared.negotiated_ver,
+            FrameType::Cancel,
+            control_flags(),
+            0,
+            0,
+            self.corr,
+            Vec::new(),
+        ) else {
+            return;
+        };
+        match self.writer.try_send(cancel) {
+            Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
+            Err(mpsc::error::TrySendError::Full(cancel)) => {
+                // The connection owns this task even if the future was polled
+                // on another runtime or dropped from a plain thread. A full
+                // egress buffer delays withdrawal; it must not discard it.
+                let writer = self.writer.clone();
+                self.runtime.spawn(async move {
+                    let _ = writer.send(cancel).await;
+                });
+            }
+        }
+    }
+}
+
+/// Failure to authorise a write through [`ModuleHandle::confirm_operator`].
+/// Every variant requires the module to refuse the write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum OperatorConfirmError {
+    Declined,
+    PresenceUnavailable,
+    SummaryInvalid,
+    NotPermitted,
+    Unsupported,
+}
+
+impl fmt::Display for OperatorConfirmError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Declined => "operator declined the write",
+            Self::PresenceUnavailable => "operator confirmation is unavailable",
+            Self::SummaryInvalid => "operator confirmation summary is invalid",
+            Self::NotPermitted => "operator confirmation is not permitted for this route",
+            Self::Unsupported => "daemon does not support operator confirmation",
+        })
+    }
+}
+
+impl Error for OperatorConfirmError {}
 
 /// Errors returned by [`ModuleHandle::catalog_update`].
 #[derive(Debug)]
@@ -1528,6 +1728,7 @@ where
     let stream = connect_to_subc(connection_file).await?;
     let (mut read_half, write_half) = tokio::io::split(stream);
     let (tx, rx) = mpsc::channel::<Frame>(EGRESS_BUFFER);
+    let connection_runtime = tokio::runtime::Handle::current();
     let writer = tokio::spawn(drain_writer(write_half, rx));
     let handler = Arc::new(handler);
 
@@ -1538,7 +1739,13 @@ where
     let connection_token = checked_increment(&NEXT_MODULE_CONNECTION_TOKEN)
         .ok_or(SubcModuleError::ConnectionTokenExhausted)?;
     let close_token = CancellationToken::new();
-    let handle = ModuleHandle::new(&ack, tx.clone(), connection_token, close_token);
+    let handle = ModuleHandle::new(
+        &ack,
+        tx.clone(),
+        connection_token,
+        close_token,
+        connection_runtime,
+    );
     let serve_handle = handle.clone();
     let serve_future = Box::pin(async move {
         // Connection loss ends this serve future. Module serving retains no
@@ -2520,11 +2727,21 @@ mod tests {
             storage: None,
             machine_id: None,
         };
-        (ModuleHandle::new(&ack, tx, 1, CancellationToken::new()), rx)
+        (
+            ModuleHandle::new(
+                &ack,
+                tx,
+                1,
+                CancellationToken::new(),
+                tokio::runtime::Handle::current(),
+            ),
+            rx,
+        )
     }
 
     #[test]
     fn module_handle_exposes_the_acked_machine_id_and_none_otherwise() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
         let handle_for = |machine_id: Option<&str>| {
             let (tx, _rx) = mpsc::channel(1);
             let ack = ModuleHelloAckBody {
@@ -2534,7 +2751,13 @@ mod tests {
                 storage: None,
                 machine_id: machine_id.map(str::to_owned),
             };
-            ModuleHandle::new(&ack, tx, 1, CancellationToken::new())
+            ModuleHandle::new(
+                &ack,
+                tx,
+                1,
+                CancellationToken::new(),
+                runtime.handle().clone(),
+            )
         };
         assert_eq!(
             handle_for(Some("0123456789abcdef0123456789abcdef"))
@@ -3508,8 +3731,8 @@ mod tests {
             .expect("epoch-5 install must be live after implicit replace");
     }
 
-    #[test]
-    fn module_control_corr_is_monotonic_and_exhausts_without_wrap() {
+    #[tokio::test]
+    async fn module_control_corr_is_monotonic_and_exhausts_without_wrap() {
         let (module_handle, _rx) = test_module_handle(&[MODULE_TO_SUBC_OP_CATALOG_UPDATE]);
         let mut inner = module_handle.shared.lock_inner();
         inner.next_corr = Some(u64::MAX);
@@ -3567,16 +3790,23 @@ mod module_close_tests {
         }
     }
 
-    struct Served {
-        daemon: TcpStream,
-        handle: ModuleHandle,
-        serve: JoinHandle<Result<(), SubcModuleError>>,
+    pub(super) struct Served {
+        pub(super) daemon: TcpStream,
+        pub(super) handle: ModuleHandle,
+        pub(super) serve: JoinHandle<Result<(), SubcModuleError>>,
         _dir: TestTempDir,
     }
 
     /// Serve `handler` against a stand-in daemon that authenticates the module
     /// and acknowledges its HELLO, then hands the daemon's socket to the test.
     async fn serve_against_stand_in<H: ModuleHandler>(handler: H) -> Served {
+        serve_against_stand_in_with_ops(handler, &[]).await
+    }
+
+    pub(super) async fn serve_against_stand_in_with_ops<H: ModuleHandler>(
+        handler: H,
+        subc_ops: &[&str],
+    ) -> Served {
         let dir = TestTempDir::new("subc-client-rs-module-close");
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let connection = ConnectionInfo {
@@ -3611,7 +3841,7 @@ mod module_close_tests {
         assert_eq!(hello.header.ty, FrameType::Hello);
         let ack = ModuleHelloAckBody {
             negotiated_ver: PROTOCOL_VERSION,
-            subc_ops: Vec::new(),
+            subc_ops: subc_ops.iter().map(|op| (*op).to_owned()).collect(),
             subc_capabilities: Vec::new(),
             storage: None,
             machine_id: None,
@@ -4002,6 +4232,9 @@ mod module_close_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod operator_confirm_tests;
 
 #[cfg(test)]
 mod detailed_error_body_tests {

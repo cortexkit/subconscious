@@ -3,9 +3,16 @@
 #
 # What goes: every `debug` directory inside a cargo target directory
 # (target/debug, target/<triple>/debug, target/<custom-profile-dir>/debug), at
-# any depth under the repos, including worktree-local and nested target dirs.
-# Debug output rebuilds from source (and from the sccache cache), so deleting it
-# costs a rebuild and nothing else. What stays: `release` directories, because
+# any depth under the repos, including worktree-local and nested target dirs,
+# that no build has written to for --idle-days days (default 3). Debug output
+# rebuilds from source, but a rebuild is far from free: sccache recovers
+# compiled crates, not links, build-script runs or incremental state, so
+# deleting a cache that is still in use turns every next build into a cold one.
+# Idleness is the newest modification time of the debug directory and of the
+# subdirectories cargo writes on every compile (deps, .fingerprint, build,
+# incremental). A build that compiles nothing writes nothing, so a target that
+# only saw fully cached builds for that long counts as idle; its next build
+# is cold once. What stays: `release` directories, because
 # staging and placement build from them, and everything that is not cargo
 # output. A target directory is recognised by the CACHEDIR.TAG cargo writes
 # into it; SwiftPM writes the same tag into `.build`, so the tag's text must
@@ -22,20 +29,37 @@
 # make the sum an upper bound. Every directory is listed in a manifest before
 # it is removed.
 #
-# Usage: sweep-build-debris.sh [--root DIR] [--dry-run]
+# Usage: sweep-build-debris.sh [--root DIR] [--idle-days N] [--dry-run]
 # Scheduled daily by the cortexkit.build-sweep launch agent.
 set -u
 # Paths are split on newlines only, so a directory name with a space stays one path.
 IFS=$'\n'
 ROOT=~/Work/Projects/CortexKit
 DRY=0
+IDLE_DAYS=3
 while [ $# -gt 0 ]; do
   case "$1" in
     --root) ROOT="$2"; shift 2 ;;
+    --idle-days) IDLE_DAYS="$2"; shift 2 ;;
     --dry-run) DRY=1; shift ;;
-    *) echo "usage: $0 [--root DIR] [--dry-run]" >&2; exit 64 ;;
+    *) echo "usage: $0 [--root DIR] [--idle-days N] [--dry-run]" >&2; exit 64 ;;
   esac
 done
+case "$IDLE_DAYS" in
+  (''|*[!0-9]*) echo "--idle-days takes a whole number of days" >&2; exit 64 ;;
+esac
+IDLE_CUTOFF=$(( $(date +%s) - IDLE_DAYS * 86400 ))
+# Newest modification time, in epoch seconds, of a debug directory and of the
+# subdirectories cargo writes into on every compile.
+newest_write() {
+  local newest=0 t sub
+  for sub in "$1" "$1/deps" "$1/.fingerprint" "$1/build" "$1/incremental"; do
+    [ -d "$sub" ] || continue
+    t=$(stat -f %m "$sub" 2>/dev/null) || continue
+    [ "$t" -gt "$newest" ] && newest=$t
+  done
+  echo "$newest"
+}
 # lsof reports resolved paths (/private/var/..., not /var/...), so the root is
 # resolved the same way or an in-use directory would not match its open files.
 ROOT=$(cd "$ROOT" 2>/dev/null && pwd -P) || { echo "no such root" >&2; exit 66; }
@@ -74,7 +98,7 @@ roots=$(find "$ROOT" -name node_modules -prune -o -name CACHEDIR.TAG -print 2>/d
       grep -q "created by cargo" "$tag" 2>/dev/null && dirname "$tag"
     done)
 
-swept=0; skipped=0
+swept=0; skipped=0; recent=0
 # `debug` at depth 1 to 3 below a root covers the plain profile, a target
 # triple and a custom target dir with a triple beneath it. Nested roots are
 # roots of their own, so their debug dirs are found again; sort -u dedupes.
@@ -92,13 +116,16 @@ for d in $dirs; do
   if [ -n "$guarded" ]; then
     echo "  SKIP (a configured module runs from $guarded) $d"; skipped=$((skipped+1)); continue
   fi
+  if [ "$(newest_write "$d")" -ge "$IDLE_CUTOFF" ]; then
+    recent=$((recent+1)); continue
+  fi
   kib=$(du -sk "$d" 2>/dev/null | cut -f1)
   echo "$kib KiB  $d" >> "$MANIFEST"
   [ "$DRY" = 1 ] || rm -rf "$d"
   swept=$((swept+1))
 done
 A=$(free_gib)
-echo "$(stamp) manifest: $MANIFEST ($swept removed, $skipped skipped as in use)"
+echo "$(stamp) manifest: $MANIFEST ($swept removed, $skipped skipped as in use, $recent kept as written within ${IDLE_DAYS} days)"
 if [ "$DRY" = 1 ]; then
   echo "dry run: would free up to $(awk '{s+=$1} END {printf "%.0f", s/1048576}' "$MANIFEST") GiB (du sum, upper bound)"
 else

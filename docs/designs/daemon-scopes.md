@@ -565,8 +565,11 @@ current. Publish the crates and restart the daemon before owners emit `expires_a
 `scope.apply` or `run_id`; the advertised `scope.apply` op is the owner's support check.
 Existing bodies with no deadline or run id and full sync only still decode and apply unchanged.
 Run binds need no reader-first rollout because only providers declaring `agent-run-scopes/v1`
-receive them. `scope.describe` returns `attributes.run_id` without that capability check,
-so older describe readers must be accounted for before run writers start. Callosum must
+receive them. `scope.describe` is not gated: it returns `attributes.run_id` to any caller.
+A reader built on subc-protocol 0.29 or older refuses unknown attribute fields, so its
+describe of a run scope fails to decode. That reader only meets a run scope if it describes
+a ref it did not receive through a bind, so before an owner writes run scopes, check that no
+such pre-0.30 reader describes the owner's refs, or upgrade it first. Callosum must
 strip `agent-run-scopes/v1` from re-exported manifests before any provider reachable through
 it declares the capability, as it does `flow-scopes/v1`: a downstream provider's opt-in
 must not imply that Callosum itself handles run-scoped binds. Providers then opt in one by

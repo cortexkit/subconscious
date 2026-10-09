@@ -1739,7 +1739,19 @@ pub enum PollKind {
     Liveness,
 }
 
+/// A registered module's catalog projection.
+///
+/// Use [`CatalogEntry::new`] and its `with_*` methods to construct entries so
+/// future fields do not require changes to callers.
+/// Struct literals and functional record updates are not supported outside this crate:
+///
+/// ```compile_fail,E0639
+/// use subc_control::CatalogEntry;
+/// let entry = CatalogEntry::new("provider", vec![], vec![]);
+/// let entry = CatalogEntry { ready: false, ..entry };
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct CatalogEntry {
     pub module_id: String,
     /// Whether the registered module currently accepts new route binds.
@@ -1793,6 +1805,62 @@ pub struct CatalogEntry {
     /// manifest. The daemon relays these declarations without interpreting them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub self_signals: Option<Vec<SelfSignalDeclaration>>,
+}
+
+impl CatalogEntry {
+    /// Construct an entry with its required fields and wire-compatible defaults.
+    #[must_use]
+    pub fn new(
+        module_id: impl Into<String>,
+        roles: Vec<ProviderRole>,
+        control_ops: Vec<String>,
+    ) -> Self {
+        Self {
+            module_id: module_id.into(),
+            ready: default_true(),
+            not_ready: None,
+            module_version: None,
+            roles,
+            control_ops,
+            capabilities: None,
+            self_signals: None,
+        }
+    }
+
+    /// Set the module's effective readiness.
+    #[must_use]
+    pub fn with_ready(mut self, ready: bool) -> Self {
+        self.ready = ready;
+        self
+    }
+
+    /// Set or clear the reason the module is not ready.
+    #[must_use]
+    pub fn with_not_ready(mut self, not_ready: Option<NotReadyReason>) -> Self {
+        self.not_ready = not_ready;
+        self
+    }
+
+    /// Set or clear the module's self-declared version.
+    #[must_use]
+    pub fn with_module_version(mut self, module_version: Option<String>) -> Self {
+        self.module_version = module_version;
+        self
+    }
+
+    /// Set or clear the module's static capability declarations.
+    #[must_use]
+    pub fn with_capabilities(mut self, capabilities: Option<CapabilityDeclarations>) -> Self {
+        self.capabilities = capabilities;
+        self
+    }
+
+    /// Set or clear the module's self-signal declarations.
+    #[must_use]
+    pub fn with_self_signals(mut self, self_signals: Option<Vec<SelfSignalDeclaration>>) -> Self {
+        self.self_signals = self_signals;
+        self
+    }
 }
 
 /// Why a registered module is not accepting new route binds.
@@ -1915,7 +1983,19 @@ pub enum ModuleProtocol {
     None,
 }
 
+/// A supervised module's current state and process observations.
+///
+/// Use [`SupervisorEntry::new`] and its `with_*` methods to construct entries so
+/// future fields do not require changes to callers.
+/// Struct literals and functional record updates are not supported outside this crate:
+///
+/// ```compile_fail,E0639
+/// use subc_control::{SupervisorEntry, SupervisorHealthStatus};
+/// let entry = SupervisorEntry::new("provider", "running", true, true, SupervisorHealthStatus::Unknown);
+/// let entry = SupervisorEntry { resources: None, ..entry };
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct SupervisorEntry {
     pub module_id: String,
     pub state: String,
@@ -2039,6 +2119,162 @@ pub struct SupervisorEntry {
     /// mistaken for a process using nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resources: Option<ChildResourceUsage>,
+}
+
+impl SupervisorEntry {
+    /// Construct an entry with its required fields and wire-compatible defaults.
+    #[must_use]
+    pub fn new(
+        module_id: impl Into<String>,
+        state: impl Into<String>,
+        enabled: bool,
+        live: bool,
+        health: SupervisorHealthStatus,
+    ) -> Self {
+        Self {
+            module_id: module_id.into(),
+            state: state.into(),
+            enabled,
+            live,
+            protocol: ModuleProtocol::default(),
+            launch_nonce_env: None,
+            health,
+            pending_reload: None,
+            last_probe_ms: None,
+            last_exit_code: None,
+            last_exit_signal: None,
+            last_exit_ms: None,
+            last_exit_kind: None,
+            restart_count: None,
+            max_restarts: None,
+            lifetime_restarts: None,
+            spawn_generation: None,
+            restart_window_secs: None,
+            drain_timeout_ms: None,
+            restart_backoff_ms: None,
+            restart_max_backoff_ms: None,
+            resources: None,
+        }
+    }
+
+    /// Set the module's declared wire protocol.
+    #[must_use]
+    pub fn with_protocol(mut self, protocol: ModuleProtocol) -> Self {
+        self.protocol = protocol;
+        self
+    }
+
+    /// Set or clear the launch nonce environment indicator.
+    #[must_use]
+    pub fn with_launch_nonce_env(mut self, launch_nonce_env: Option<bool>) -> Self {
+        self.launch_nonce_env = launch_nonce_env;
+        self
+    }
+
+    /// Set or clear the comparison between the launch spec and observed process.
+    #[must_use]
+    pub fn with_pending_reload(mut self, pending_reload: Option<PendingReloadVerdict>) -> Self {
+        self.pending_reload = pending_reload;
+        self
+    }
+
+    /// Set or clear the last health collection timestamp.
+    #[must_use]
+    pub fn with_last_probe_ms(mut self, last_probe_ms: Option<u64>) -> Self {
+        self.last_probe_ms = last_probe_ms;
+        self
+    }
+
+    /// Set or clear the most recent process exit code.
+    #[must_use]
+    pub fn with_last_exit_code(mut self, last_exit_code: Option<i32>) -> Self {
+        self.last_exit_code = last_exit_code;
+        self
+    }
+
+    /// Set or clear the most recent process exit signal.
+    #[must_use]
+    pub fn with_last_exit_signal(mut self, last_exit_signal: Option<i32>) -> Self {
+        self.last_exit_signal = last_exit_signal;
+        self
+    }
+
+    /// Set or clear the most recent process exit timestamp.
+    #[must_use]
+    pub fn with_last_exit_ms(mut self, last_exit_ms: Option<u64>) -> Self {
+        self.last_exit_ms = last_exit_ms;
+        self
+    }
+
+    /// Set or clear the most recent process exit classification.
+    #[must_use]
+    pub fn with_last_exit_kind(mut self, last_exit_kind: Option<TerminalExitKind>) -> Self {
+        self.last_exit_kind = last_exit_kind;
+        self
+    }
+
+    /// Set or clear the restart count for the current crash budget.
+    #[must_use]
+    pub fn with_restart_count(mut self, restart_count: Option<u32>) -> Self {
+        self.restart_count = restart_count;
+        self
+    }
+
+    /// Set or clear the maximum restarts allowed by the crash budget.
+    #[must_use]
+    pub fn with_max_restarts(mut self, max_restarts: Option<u32>) -> Self {
+        self.max_restarts = max_restarts;
+        self
+    }
+
+    /// Set or clear the lifetime restart count.
+    #[must_use]
+    pub fn with_lifetime_restarts(mut self, lifetime_restarts: Option<u32>) -> Self {
+        self.lifetime_restarts = lifetime_restarts;
+        self
+    }
+
+    /// Set or clear the successful spawn count for this daemon incarnation.
+    #[must_use]
+    pub fn with_spawn_generation(mut self, spawn_generation: Option<u64>) -> Self {
+        self.spawn_generation = spawn_generation;
+        self
+    }
+
+    /// Set or clear the time window of the crash budget.
+    #[must_use]
+    pub fn with_restart_window_secs(mut self, restart_window_secs: Option<u64>) -> Self {
+        self.restart_window_secs = restart_window_secs;
+        self
+    }
+
+    /// Set or clear the effective drain budget in milliseconds.
+    #[must_use]
+    pub fn with_drain_timeout_ms(mut self, drain_timeout_ms: Option<u64>) -> Self {
+        self.drain_timeout_ms = drain_timeout_ms;
+        self
+    }
+
+    /// Set or clear the effective base restart delay in milliseconds.
+    #[must_use]
+    pub fn with_restart_backoff_ms(mut self, restart_backoff_ms: Option<u64>) -> Self {
+        self.restart_backoff_ms = restart_backoff_ms;
+        self
+    }
+
+    /// Set or clear the effective maximum restart delay in milliseconds.
+    #[must_use]
+    pub fn with_restart_max_backoff_ms(mut self, restart_max_backoff_ms: Option<u64>) -> Self {
+        self.restart_max_backoff_ms = restart_max_backoff_ms;
+        self
+    }
+
+    /// Set or clear the observed resource usage of the supervised process.
+    #[must_use]
+    pub fn with_resources(mut self, resources: Option<ChildResourceUsage>) -> Self {
+        self.resources = resources;
+        self
+    }
 }
 
 /// A module process's memory and CPU time as read at list time, or why none

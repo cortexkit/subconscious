@@ -1,16 +1,13 @@
 # Scopes: owned identity records in the daemon
 
-Status: design r9. Stage 1 is built (subc-protocol 0.27.0, subc-daemon 0.25.0, master 103aa551):
-the table, `scope.sync`, `scope.describe`, route admission, the bind stamp, the commit re-check and
-the drains. Section 11 records what the build settled where this note was silent. r3 answered an Athena review of r2 (five seats, a
-unanimous "do not implement as written"); r4 added the room's review of r3, r5 added targeted
-carriers, r6 answered the Athena review of extensibility r7, and r7 answers the Athena review of
-extensibility r7.2 (rows T2-T22, T85, T87 of its triage table); r8 records the operator's
-ruling on T19. `scope.subscribe` and
-`scope.patch` are specified here but deferred to stage 7; until then providers read `describe`. Section 10 lists
-what changed and why. The
-extensibility design (magic-context `.cortexkit/alfonso/plans/ck-extensibility-r6-7-amendments.md`,
-section K2) relies on sections 2 to 6.
+Status: current behaviour, including subc-protocol 0.30.0's `scope.apply`, absolute scope
+expiry and agent-run identity. The table, `scope.sync`, `scope.describe`, route admission,
+the bind stamp, the commit re-check and the drains were built in stage 1
+(subc-protocol 0.27.0, subc-daemon 0.25.0, master 103aa551). Section 11 records what that build
+settled where this note was silent, and section 10 records earlier design decisions and their
+reasons. Only `scope.subscribe` remains deferred to a later release; until then providers read
+`scope.describe`. `scope.apply` is available now. Sections 2 to 6 define the record, authority,
+admission, reader and locking contracts that scope owners, carriers and providers rely on.
 
 ## 1. Why
 
@@ -54,13 +51,16 @@ A scope is identified by `(owner, ref)`:
   runner session, a background task) binds to `(owner, ref, scope_epoch)`. Because the owner
   keeps it, it survives daemon restarts and upgrades, which a daemon counter would not.
 - `version`: a daemon counter increased when a record's content changes, within one incarnation.
-  A sync that re-sends a record unchanged does not move it.
+  A sync or apply that re-sends a record unchanged does not move it.
   It is how a bind notices a change between admission and commit (section 4).
 
 Fields:
 - `kind`: a closed enum, `head | worker | ephemeral`, fixed for the life of an epoch. A sync that
   changes it at the same epoch refuses that record `scope_kind_changed`; the owner uses a higher
   epoch, which ends the old scope.
+- `expires_at_ms`: optional absolute Unix wall-clock milliseconds, fixed for the life of an
+  epoch. Omitted means no daemon-enforced expiry. It is a record field, not an attribute;
+  any owner may set it, for any kind (see the expiry subsection).
 - `parent`: optional `(owner, ref, scope_epoch)` of another scope. The epoch pins the parent
   session. The stamp reports the link as `parent_state`: `linked` (the parent is live at that
   epoch), `pending` (the parent's owner has not synced in this incarnation yet, so the link is
@@ -88,19 +88,70 @@ Fields:
     `agent_id`.
   - `flow_id` (optional string): this scope belongs to the named flow (section 2's
     flow identity subsection).
+  - `run_id` (optional string): this `ephemeral` scope belongs to one agent run (section 2's
+    agent-run identity subsection).
 
-**Authority gate.** `agent_id`, `delegates` and `flow_id` may be set only by an owner listed
+**Authority gate.** `agent_id`, `delegates`, `flow_id` and `run_id` may be set only by an owner listed
 in the daemon config key `scope_authority_owners` (today `["prefrontal-core"]`, the same module
 as `admission_facts_carrier_module_id`). A scope from any other owner may carry `kind`,
-`parent`, `child_owners` and `carriers` only; a sync that sets a gated attribute from an unlisted
-owner is refused by name (`scope_attribute_not_permitted`). `scope_authority_owners` is a
+`parent`, `child_owners`, `carriers` and `expires_at_ms`, with empty attributes; a sync or
+apply that sets a gated attribute from an unlisted owner is refused per record by name
+(`scope_attribute_not_permitted`). `expires_at_ms` is not gated by this list. `scope_authority_owners` is a
 restart-required key: a change takes effect only on a daemon restart, which closes every route, so
 no live route keeps an `owner_authorized` stamp its owner has lost. Providers rely on the stamp's
 `owner_authorized` alone and keep no copy of the list (section 7).
 
 Bounds: at most 10,000 live scopes per owner and 4 KiB of attributes per scope; past either the
-sync is refused by name and nothing is applied. Tombstones (section 6) are capped at 1,000 per
-owner and evicted oldest first; that bound never refuses.
+sync or apply is refused by name and nothing is applied. Tombstones (section 6) are capped at
+1,000 per owner and evicted oldest first; that bound never refuses.
+
+### Expiry: `expires_at_ms`
+
+The daemon ends a live scope when its absolute deadline is at or before the current wall clock.
+Expiry has the same effects as omission from a full sync: the ref@epoch is tombstoned, its
+routes close with `scope_ended`, and its children stay live with `parent_state: ended` and
+their routes drain with `scope_parent_ended`. There is no new close reason. Each expiry logs a warning with
+the owner, ref, epoch, deadline and number of routes closed.
+
+A new epoch's deadline must be in the future and at most `MAX_SCOPE_EXPIRY_AHEAD_MS`
+(86,400,000 ms, 24 hours) ahead. A passed deadline is refused per record as `scope_expired`;
+a deadline more than 24 hours ahead, including `u64::MAX`, is `scope_expiry_too_far`.
+Changing, adding or removing the deadline on a live epoch is `scope_expiry_immutable`,
+even if the proposed value is past or beyond that horizon; the stored value stays unchanged.
+An unchanged deadline is not re-checked against the horizon. To end early, omit the scope
+from a full sync or name its ref@epoch in `scope.apply`'s `end`. To use a different deadline,
+register a higher epoch; there is no shortening or extension within an epoch.
+
+The evaluation points are:
+- **Periodic sweep:** while any live scope has a deadline, the daemon sweeps at most 1 s
+  apart. It judges by Unix wall time, not monotonic elapsed time; a deadline passed during
+  sleep is ended at the first sweep after wake, at most 1 s later. The sweep works even
+  after the authority connection closes and changes neither authority nor `last_generation`.
+- **Accepted `scope.sync` or `scope.apply`:** under the scope write lock, the daemon sweeps
+  only the calling owner's expired scopes before classifying entries. Every whole-call
+  check must pass, including the resulting live-count limit; a whole-call refusal commits
+  nothing, including no sweep. A scope ended by this call's sweep appears once in its
+  `ended` reply. Re-sending that epoch is `scope_expired`, explicitly ending it is
+  `not_live`, and a higher-epoch upsert is `created`, not `replaced`. A per-record refusal
+  does not undo an accepted call's sweep.
+- **`route.open` admission:** after finding the live epoch and before checking the carrier,
+  a passed deadline refuses the open as `scope_not_live`, naming the ref and passed deadline.
+  Admission does not mutate the table, and `scope_expired` is not a route-open code.
+
+`scope.describe` does not evaluate expiry: it may still report a past-deadline scope as `live`
+until a sweep. Neither the bind stamp nor describe carries `expires_at_ms`. No expiry push
+or backlog is sent to the owner; it learns through describe, `scope_expired`, or `ended`
+in a call whose own sweep ended the scope. A periodic sweep's ends do not appear in a later
+call's `ended` reply.
+
+Expiry tombstones retain their cause: re-sending that ref@epoch, even without a deadline,
+is `scope_expired` while the tombstone is held. Omission, an explicit end or replacement
+before the deadline creates an owner-ended tombstone and yields `scope_epoch_ended` instead.
+Tombstones are in-memory and share the 1,000-per-owner oldest-first bound. A restart or
+eviction can lose them, but a fresh store still refuses a passed deadline. Owners must
+therefore re-send each record with its original deadline; an absent or future deadline
+can be accepted after tombstone loss. Moving wall time backwards delays a not-yet-ended
+scope but never revives an ended one while its tombstone is held.
 
 ### Flow identity: `flow_id`
 
@@ -112,7 +163,7 @@ it; an unlisted owner receives `scope_attribute_not_permitted`, just as for
 and treat a non-owner opener on a flow scope as the flow's carrier.
 
 It is 1–256 printable non-space ASCII bytes, checked with the shared opaque-token
-validator. A malformed value refuses the sync as `invalid_control_body`, naming
+validator. A malformed value refuses the whole sync or apply as `invalid_control_body`, naming
 `flow_id`. Scope refs retain their existing acceptance rule. `flow_id` alone,
 without `agent_id` and with `delegates: false`, is valid; `delegates` still requires
 `agent_id`.
@@ -123,15 +174,34 @@ scope's content version, and drains every route under it with
 `scope_delegation_changed`. New binds carry the new value; an unchanged re-sync
 neither bumps the version nor drains routes.
 
-## 3. Registering: `scope.sync`
+### Agent-run identity: `run_id`
 
-An owner sends its full set: `scope.sync {generation, scopes: [...]}`. Once it has done that
-on its current authority connection, it may send changes instead:
-`scope.patch {generation, upsert: [...], remove: [...]}`. A patch changes only the named refs,
-applies every per-record check a full sync applies, and follows the same generation rule. The
-first sync after taking authority must be a full `scope.sync`; a patch before it is refused
-`scope_patch_before_sync`. An owner with a large set (the Thalamus gateway owns every Claude Code
-subagent scope on the machine) can then register one new scope without re-sending thousands.
+The optional `attributes.run_id` identifies one run on behalf of `agent_id`; run scopes use
+the existing `ephemeral` kind, not a new kind. Like `flow_id`, it is 1–256 printable non-space
+ASCII bytes. A malformed token refuses the whole sync or apply as `invalid_control_body`,
+naming `run_id`. Only an owner in `scope_authority_owners` may set it; an unlisted owner gets
+`scope_attribute_not_permitted` even when the scope has a permitted expiry.
+
+After the existing delegates-without-agent check, the daemon refuses a record with:
+- `run_id` but no `agent_id`: `scope_run_id_without_agent`;
+- both `run_id` and `flow_id`: `scope_run_id_with_flow_id`;
+- `run_id` and `delegates: true`: `scope_run_id_delegates`.
+
+A run cannot start agents or delegate acting as its agent. The daemon stamps `run_id`
+verbatim in `ScopeStamp.attributes` only on binds to modules declaring `agent-run-scopes/v1`
+(section 4). Changing, adding or removing it on a live epoch is accepted, bumps `version`
+and drains every route under the scope with `scope_delegation_changed`. An unchanged resend
+does neither. A scope with only `flow_id` retains its existing flow rules and capability gate.
+
+## 3. Registering: `scope.sync` and `scope.apply`
+
+An owner sends its full set: `scope.sync {generation, scopes: [...]}`. Once an accepted full
+sync has made this connection the authority, it may send a delta instead:
+`scope.apply {generation, upsert: [ScopeRecord, ...], end: [{ref, scope_epoch}, ...]}`.
+Apply changes only the named refs, uses the full sync's per-record checks, and shares its
+generation sequence. It never takes authority or resets the generation baseline; a connection
+that would need to take authority must first send a full sync, or gets `scope_sync_required`.
+An owner with a large set can register or end one scope without re-sending thousands.
 
 **One sync authority per owner.** Each owner has exactly one connection whose syncs are
 accepted: its authority. The first connection of an owner to sync becomes the authority. A
@@ -144,30 +214,34 @@ current and cannot take authority, and a candidate that fails and is rolled back
 a restarted owner process is never locked out by its predecessor's connection that is wedged but
 still open. That
 covers a blue/green swap, where the owner briefly has two connections: the candidate is refused
-until cutover, and at cutover authority moves to the promoted connection in the same step as
-the forwarding switch, without touching the set. The superseded connection's syncs are refused
-from then on. When the authority connection closes, authority is free, and the next connection
-of that owner to sync takes it.
+until cutover. Promotion changes no scope-table authority or set: the promoted connection's
+first accepted full sync takes authority. An apply from it before that sync is
+`scope_sync_required`; the superseded connection is refused `scope_sync_not_authority`.
+When the authority connection closes, authority is free, and the next accepted full sync
+from that owner takes it, never an apply.
 
-**Generations.** A sync from the authority must carry a generation larger than the last one it
-accepted; an equal or smaller one is refused as stale, and a refused sync changes nothing. The
-first sync from a connection that has just taken authority is a full replace at any generation,
+**Generations.** A sync or apply from the authority must carry a generation larger than the last
+accepted; an equal or smaller one is `scope_sync_stale`, and a whole-call refusal changes nothing.
+The first sync from a connection that has just taken authority is a full replace at any generation,
 and its generation becomes the new baseline. So a restarted owner, or an owner after a daemon
 restart, is never locked out, and a stale connection can never overwrite a newer one.
 
 **Effect of a sync.**
+- An accepted call first sweeps the calling owner's expired scopes (section 2); it does not
+  sweep another owner's scopes.
 - A scope present before and absent now is ended: tombstoned, and every route under it drained
   with reason `scope_ended`.
 - **An ended scope cannot come back.** Within an incarnation, a record naming a tombstoned
-  `(owner, ref, scope_epoch)` is refused `scope_epoch_ended`; the owner must use a higher epoch.
+  `(owner, ref, scope_epoch)` is refused `scope_epoch_ended`, or `scope_expired` if expiry ended
+  it; the owner must use a higher epoch.
   Across a daemon restart the tombstones are gone, so owners persist a removal, with its epoch,
   before syncing it away, and never re-send a removed epoch.
 - A stamp is a snapshot taken at bind, so revoking authority ends the routes that carry the old
   stamp, each with its own reason so a carrier can tell them apart:
   - `scope_carrier_removed`: the opener is no longer a listed carrier, or the route's target is
     no longer in its entry's `targets` (widening a list changes nothing live);
-  - `scope_delegation_changed`: `delegates` went from true to false, or `agent_id` or `flow_id` changed;
-  - `scope_ended`: the scope is gone, or replaced by a higher epoch.
+  - `scope_delegation_changed`: `delegates` went from true to false, or `agent_id`, `flow_id` or `run_id` changed;
+  - `scope_ended`: the scope is gone, expired, or replaced by a higher epoch.
   - `scope_parent_ended`: the scope's parent ended (section 3).
   These are new `route.closed` reasons. Older SDKs map an unknown close reason to "do not
   reopen", which is right for the first and third; only carriers that use scopes, which are new
@@ -191,9 +265,50 @@ restart, is never locked out, and a stale connection can never overwrite a newer
   routes.
 - `scope.sync` from `direct` is refused by name.
 - **A refused record does not block the rest.** A record refused on its own merits (for example
-  `scope_epoch_regressed`, a forged parent, a gated attribute) keeps its previous state and is
-  named in the reply with its reason, and the other records apply. The generation rule still
+  `scope_epoch_regressed`, a forged parent, a gated attribute) keeps its post-sweep state and is
+  named in the reply with its reason, and the other records apply. An expiry sweep committed by
+  the accepted call is not undone by a record refusal. The generation rule still
   applies to the sync as a whole: a stale generation refuses everything and changes nothing.
+
+### Applying a delta
+
+`scope.apply` is a module control request on the owner's registered module connection, just
+like sync. Whole-call refusals are error frames; they change neither the set nor generation
+and run no sweep. Checks run in this order:
+1. No module registration: `not_registered`.
+2. The connection fails the launch-nonce authority check: `scope_sync_not_authority`.
+3. It is not already the authority through an accepted full sync: `scope_sync_required`.
+4. `generation <= last_generation`: `scope_sync_stale`.
+5. An empty ref, a duplicate in either list, a ref in both lists, or a malformed `run_id`
+   or `flow_id`: `invalid_control_body`, naming the ref or field. More than 10,000 entries
+   in either list is `scope_live_limit_exceeded`; an upsert with more than 4 KiB of
+   attributes is `scope_attributes_too_large`.
+
+Otherwise the calling owner's expiry sweep and per-record upserts are evaluated together
+with the named ends. An upsert yields `created`, `replaced`, `updated`, `unchanged` or
+`refused`, with the same codes as sync. An end removes only the exact live ref@epoch; its
+outcome is `ended`. Any other end, including a ref the sweep just ended, is `not_live`,
+not an error. Unnamed scopes stay live. Parent-link and cycle checks use the post-apply set:
+held scopes after the sweep, minus matching ends, plus accepted upserts.
+
+If that resulting set exceeds 10,000 live scopes, the entire call is
+`scope_live_limit_exceeded`, with nothing committed, including the sweep. At the cap, one
+matching end plus one new upsert succeeds; so does one new upsert when an expired held scope
+frees a slot. An explicit end has every effect omission has: `scope_ended` route drains,
+child links becoming `ended`, and tag publication. Children remain live.
+
+The reply is `{generation, results, end_results, ended}`. `results` contains a
+`ScopeRecordResult` for each upsert in request order; `end_results` contains
+`{ref, scope_epoch, outcome}` for each end in request order. `ended` lists every scope the
+call ended, each ref at most once, including swept scopes and replaced epochs but not their
+children. An accepted call advances generation even if every upsert is refused, every end
+is `not_live`, or both lists are empty. A later full sync still ends every scope it omits.
+
+HELLO_ACK advertises `scope.apply` in `subc_ops`. That op also signals support for
+`expires_at_ms`; older daemons reject that record field. `ModuleHandle::scope_apply` returns
+`ScopeCallError::NotSupported { op: "scope.apply" }` without sending anything when the op
+is absent. Whole-call error frames become `ScopeCallError::Refused`; per-entry refusals and
+`not_live` stay in the reply. An unexpected reply variant is `ScopeCallError::Protocol`.
 
 ## 4. Opening a route under a scope
 
@@ -207,7 +322,8 @@ in section 5a):
   Retryable: after a daemon restart a carrier's open can arrive before the owner re-syncs, and
   the carrier waits within its own bound.
 - `scope_not_live`: the owner has synced and the ref is not in its set, or the owner is not a
-  configured module. Terminal.
+  configured module, or the live epoch's deadline has passed. Terminal. A deadline refusal
+  names the ref and deadline and does not mutate the table.
 - `scope_ended`: the named `scope_epoch` does not match the live record. Terminal.
 - `scope_not_carrier`: the opener is neither the owner nor a listed carrier, or it is a targeted
   carrier and the target module is not in its list. Terminal.
@@ -221,6 +337,12 @@ in section 5a):
   accommodate an unsupported target: that would make the flow look like its
   owner's ordinary session. Scopes without `flow_id` and unscoped routes keep
   their existing admission.
+- `target_agent_run_unsupported`: the scope carries `run_id`, but the target's registered
+  manifest does not provide `agent-run-scopes/v1` in `capabilities.provides`. Terminal;
+  the message names the target and capability, and no bind is relayed. The daemon checks
+  at admission and again against the connection captured for relay; a failed re-check
+  releases the reservation. Never drop `run_id` to bypass the gate. Scopes without
+  `run_id` and unscoped routes do not require this capability.
 
 There is no relay class: a module that must present a scope onward is listed as a carrier. A carrier
 route lives until the carrier closes it or the scope ends or changes as in section 3.
@@ -231,6 +353,9 @@ principal it already stamps. The immediate opener stays in the principal field. 
 carries `owner_authorized`, computed by the daemon: true when the owner is listed in
 `scope_authority_owners`. Providers check that flag rather than keeping their own copy of the
 list.
+
+The stamp includes `attributes.run_id` when set, but never `expires_at_ms`. Only the run
+bind is capability-gated; `scope.describe` can return `run_id` to any registered reader.
 
 **Commit.** When the module acks the bind, the daemon checks the captured `(scope_epoch,
 version)` against the current record before the route becomes routable. If the scope ended or
@@ -255,6 +380,12 @@ commit, and commit can still refuse it.
 - `owner_configured`: whether the owner is a module in the supervisor's roster;
 - for `live`, the same fields as the stamp.
 
+Describe does not sweep or check the deadline, and never returns `expires_at_ms`; a
+past-deadline scope may read `live` until the next sweep. `attributes.run_id` is returned
+without an `agent-run-scopes/v1` reader gate. Pre-0.30 readers whose `ScopeAttributes`
+reject unknown fields cannot decode such a reply; run writers must wait for the rollout
+window in section 8.
+
 How a reader holding something bound to `(owner, ref, scope_epoch)` decides, in this order:
 1. `live` with the same `scope_epoch`: use it.
 2. `live` with a different `scope_epoch`: a new session under a reused ref. Refuse by name; the
@@ -274,12 +405,12 @@ most 45 s, then refuses `scope_unverifiable`. A stored approval is different: it
 refused, for as long as its own expiry allows, and it executes only after a later read answers
 case 1. The 45 s bound applies to a call waiting now, never to a stored approval.
 
-`scope.subscribe` (deferred to stage 7) is a held request shaped like
+`scope.subscribe` (deferred to a later release) is a held request shaped like
 `supervisor.spawn_subscribe`, with the same `{daemon_incarnation, seq}` cursor and too-old-cursor
 refusal. It sends a snapshot of live scopes, then events:
 - `{owner, ref, scope_epoch, created}` when a scope is created;
 - `{owner, ref, scope_epoch, ended}` when a scope ends;
-- `{owner, ref, scope_epoch, changed}` when its carriers, `delegates`, `agent_id`, `flow_id` or `parent_state`
+- `{owner, ref, scope_epoch, changed}` when its carriers, `delegates`, `agent_id`, `flow_id`, `run_id` or `parent_state`
   change;
 - `{owner, synced, scopes: [...]}` when an owner's first sync of this incarnation is accepted,
   carrying that owner's full live set.
@@ -295,33 +426,52 @@ caller may re-open within its own deadline.
 |---|---|---|---|
 | `scope_not_synced` | `route.open` | the configured owner has not synced since this daemon incarnation | yes |
 | `scope_changed` | `route.open` commit | the record changed between admission and commit | yes |
-| `scope_not_live` | `route.open` | the owner synced and the ref is not in its set, or the owner is not configured | no |
+| `scope_not_live` | `route.open` | the owner synced and the ref is not in its set, the owner is not configured, or the live epoch's deadline has passed | no |
 | `scope_ended` | `route.open`, admission or commit | the named epoch is not the live one, or the scope ended | no |
 | `scope_epoch_required` | `route.open` | the open named no epoch | no |
 | `scope_not_carrier` | `route.open` | the opener is not the owner or a carrier, or not targeted at this module | no |
 | `target_flow_unsupported` | `route.open`, before bind relay | a flow scope's target does not provide `flow-scopes/v1` | no |
+| `target_agent_run_unsupported` | `route.open`, admission and relay re-check | a run scope's target does not provide `agent-run-scopes/v1` | no |
 | `scope_unsupported` | carrier, before opening | the daemon does not advertise `scopes/v1` | no |
-| `scope_sync_not_authority` | `scope.sync` | the connection is not the owner's sync authority | no |
-| `scope_sync_stale` | `scope.sync` | the generation is not larger than the last accepted | no |
-| `scope_epoch_regressed` | per record in a sync | the epoch is lower than the one held | no |
-| `scope_attribute_not_permitted` | per record in a sync | a gated attribute from an owner not in `scope_authority_owners` | no |
-| `scope_parent_not_permitted` | per record in a sync | the parent's owner has synced, and the syncing owner is not the parent's owner or in its `child_owners`, or the parent epoch is not live | no |
-| `scope_kind_changed` | per record in a sync | `kind` differs from the held record at the same epoch | no |
-| `scope_epoch_ended` | per record in a sync | the `(owner, ref, scope_epoch)` was ended in this incarnation | no |
+| `not_registered` | `scope.sync`, `scope.apply`, `scope.describe` | the connection has no module registration | no |
+| `scope_sync_not_authority` | `scope.sync`, `scope.apply` | the connection fails the owner's authority check | no |
+| `scope_sync_required` | `scope.apply` | this connection must first take authority through an accepted full sync | no |
+| `scope_sync_stale` | `scope.sync`, `scope.apply` | the generation is not larger than the last accepted | no |
+| `invalid_control_body` | whole sync or apply | an empty or duplicate ref, a ref in both apply lists, or an invalid `flow_id` or `run_id` token | no |
+| `scope_live_limit_exceeded` | whole sync or apply | an input list or resulting live set exceeds 10,000 scopes | no |
+| `scope_attributes_too_large` | whole sync or apply | a record's attributes exceed 4 KiB | no |
+| `scope_epoch_regressed` | per upsert in sync or apply | the epoch is lower than the one held | no |
+| `scope_attribute_not_permitted` | per upsert in sync or apply | a gated attribute from an owner not in `scope_authority_owners` | no |
+| `scope_carrier_targets_invalid` | per upsert in sync or apply | a carrier's target list is empty or has more than 16 entries | no |
+| `scope_delegates_without_agent` | per upsert in sync or apply | `delegates: true` without `agent_id` | no |
+| `scope_run_id_without_agent` | per upsert in sync or apply | `run_id` without `agent_id` | no |
+| `scope_run_id_with_flow_id` | per upsert in sync or apply | both `run_id` and `flow_id` | no |
+| `scope_run_id_delegates` | per upsert in sync or apply | `run_id` with `delegates: true` | no |
+| `scope_parent_not_permitted` | per upsert in sync or apply | the parent's owner has synced, and the syncing owner is not the parent's owner or in its `child_owners`, or the parent epoch is not live | no |
+| `scope_kind_changed` | per upsert in sync or apply | `kind` differs from the held record at the same epoch | no |
+| `scope_epoch_ended` | per upsert in sync or apply | the ref@epoch has an owner-ended tombstone | no |
+| `scope_expired` | per upsert in sync or apply | the ref@epoch has an expiry tombstone, or a new epoch's deadline is at or before wall now | no |
+| `scope_expiry_immutable` | per upsert in sync or apply | the deadline was added, removed or changed on a live epoch | no |
+| `scope_expiry_too_far` | per upsert in sync or apply | a new epoch's deadline is more than 24 hours ahead | no |
+
+Only the target-unsupported and other route-open codes above participate in the route-open
+retry decision table. Per-record and whole-call scope codes do not; `scope_expired` is never
+an admission code. An apply end's `not_live` is a successful entry outcome, not a refusal.
 
 A hold for `scope_not_synced` is bounded by the opener's own deadline and at most 45 s; a stored
 approval is kept, not held, as in section 5. There is no separate daemon-side hold.
 
 Which live routes a record change drains:
 
-| Change in a sync | Routes drained | `route.closed` reason |
+| Change in a sync, apply or expiry sweep | Routes drained | `route.closed` reason |
 |---|---|---|
-| scope removed, or replaced by a higher epoch | every route under it | `scope_ended` |
+| scope omitted, explicitly ended, expired, or replaced by a higher epoch | every route under it | `scope_ended` |
 | a carrier entry removed | that carrier's routes | `scope_carrier_removed` |
 | a module removed from a carrier's `targets` | that carrier's routes to that module | `scope_carrier_removed` |
 | `delegates` true to false | every route under it | `scope_delegation_changed` |
 | `agent_id` changed | every route under it | `scope_delegation_changed` |
 | `flow_id` changed | every route under it | `scope_delegation_changed` |
+| `run_id` changed (including added or removed) | every route under it | `scope_delegation_changed` |
 | `parent_state` becomes `ended` | every route under it | `scope_parent_ended` |
 | anything else (`child_owners`, a carrier or target added, `parent_state` from `pending` to `linked`, an unchanged record) | none | |
 
@@ -332,14 +482,15 @@ still grants no more than the current record does.
 
 State, all in memory:
 - in the scope table: records keyed `(owner, ref)`, per-owner authority connection, generation,
-  `owner_synced` and the tombstones since this incarnation;
+  `owner_synced` and the tombstones since this incarnation, with cause `expired` or
+  `owner_ended`. All tombstones share the same bounded oldest-first eviction;
 - in the forwarding table: each pending bind's and each route's scope tag `(owner, ref,
   scope_epoch, version)`, and the index from a scope to its routes.
 
 Lock order is scope table, then forwarding table, always. Commit already holds the forwarding
 write lock and never takes the scope lock: it compares the pending bind's captured tag with the
-record's current `(scope_epoch, version)`, which a sync publishes into the forwarding table in the
-same step that changes the record. Ending or changing a scope: take the scope write lock, update
+record's current `(scope_epoch, version)`, which a sync, apply or expiry sweep publishes into the
+forwarding table in the same step that changes the record. Ending or changing a scope: take the scope write lock, update
 the record, then take the forwarding write lock and publish the new `(scope_epoch, version)`. Every
 pending bind tagged with the old version is then refused at commit (`scope_changed`, or
 `scope_ended` if the scope ended). Live routes are drained only as the table in section 5a says, on
@@ -356,12 +507,21 @@ is safe because it is only ever compared within one incarnation. `scope_epoch` d
 re-sends it, so a stored approval survives a restart when the same session comes back, and dies
 when a new session reuses the ref.
 
+Absolute expiry does not restart with the daemon. Owners re-send the same deadline with the
+same epoch, and the fresh store refuses it once passed. Tombstones are not persisted, so the
+daemon cannot recognise an expired epoch re-sent without its original deadline after a restart
+or tombstone eviction. A fresh store accepts an absent or future deadline. Periodic expiry
+uses the same wall-clock source as accepted calls and admission; a timer only prompts a sweep.
+
 ## 7. What providers must do
 
 - Read identity only from the bind stamp, never from a request payload.
 - Act as an agent only when `delegates` is true, `agent_id` matches, and `owner_authorized` is
   true. `agent_id` alone is identity, never
   permission to act.
+- A provider opting into `agent-run-scopes/v1` handles `run_id` as one run's identity, not
+  delegation to act as the agent. Run scopes cannot set `delegates: true`. A run's expiry
+  drains routes but cannot recall a call already forwarded, just like any other scope end.
 - Bind stored approvals and grants to `(owner, ref, scope_epoch)`, and decide on them as in
   section 5.
 - Treat the route's stamp as fixed for the route's life. A change that revokes authority drains
@@ -395,10 +555,22 @@ Readers first, then writers:
 2. The daemon ships `scope.sync`, `scope.describe`, the stamp and `scope_authority_owners`,
    advertised in `server.describe` as capability `scopes/v1`, and `scope_changed` and
    `scope_not_synced` join subc-protocol's retryable `route.open` set in the same release. An
-   older SDK treats them as terminal, which is safe. `scope.subscribe` and `scope.patch` follow in
-   stage 7 under their own capability.
+   older SDK treats them as terminal, which is safe. Only `scope.subscribe` remains deferred
+   to a later release.
 3. Owners and carriers use scopes only when the capability is advertised. A carrier that cannot
    open a scoped route fails the call (`scope_unsupported`) instead of opening an unscoped one.
+
+For expiry, deltas and run identity, subc-protocol 0.30.0 and the accompanying daemon are
+current. Publish the crates and restart the daemon before owners emit `expires_at_ms`,
+`scope.apply` or `run_id`; the advertised `scope.apply` op is the owner's support check.
+Existing bodies with no deadline or run id and full sync only still decode and apply unchanged.
+Run binds need no reader-first rollout because only providers declaring `agent-run-scopes/v1`
+receive them. `scope.describe` returns `attributes.run_id` without that capability check,
+so older describe readers must be accounted for before run writers start. Callosum must
+strip `agent-run-scopes/v1` from re-exported manifests before any provider reachable through
+it declares the capability, as it does `flow-scopes/v1`: a downstream provider's opt-in
+must not imply that Callosum itself handles run-scoped binds. Providers then opt in one by
+one; these module changes are separate from the daemon's scope contract.
 
 ## 9. Tests the daemon change must carry
 
@@ -406,7 +578,7 @@ Each fails by name when its rule is removed:
 - only the owner or a listed carrier is admitted; `direct` can neither sync nor own;
 - an open without `scope_epoch`, the owner's included, is refused `scope_epoch_required`;
 - a change of `kind` at the same epoch is refused `scope_kind_changed`; re-sending a tombstoned
-  epoch is refused `scope_epoch_ended`;
+  epoch is refused `scope_epoch_ended` or, for expiry tombstones, `scope_expired`;
 - a child synced before its parent's owner is accepted as `pending`, becomes `linked` or `ended`
   when the parent's owner syncs, and is never refused for the order; every restart ordering of
   parent and child owners is tested;
@@ -418,16 +590,37 @@ Each fails by name when its rule is removed:
 - an open naming a `scope_epoch` other than the live one is refused `scope_ended`; an open before
   the owner's first sync of this incarnation is refused `scope_not_synced` (retryable), and after
   it, for a ref not in the set, `scope_not_live`;
-- a patch changes only its named refs, is refused before a full sync, and obeys the same
-  generation and per-record checks;
+- an apply changes only its named refs, requires this connection's accepted full sync,
+  and obeys the shared generation and per-record checks; a reconnect or promoted connection
+  cannot take authority through apply;
+- an exact-epoch end drains routes and ends child links without ending the children; any other
+  end is `not_live`; accepted empty or ineffective applies still advance generation, and a
+  later full sync still ends omitted scopes;
+- whole-call refusals, including a resulting live-count overflow, change no records, tags,
+  routes, generation or expiry state; at the cap an end or accepted-call expiry frees a slot;
+- stepping the injected wall clock and sweeping ends scopes at the deadline, even without an
+  authority connection, but leaves authority and generation unchanged; no-deadline scopes
+  survive and a backwards step never revives a tombstoned epoch;
+- accepted calls sweep only their owner's expired scopes; admission refuses a passed deadline
+  without mutating state; describe does not sweep; a swept ref appears once in the call's
+  `ended`, its old epoch is `scope_expired`, and a higher epoch is `created`;
+- deadlines are immutable on live epochs; the exact 24-hour horizon is accepted, beyond it
+  (including `u64::MAX`) is refused, and a fresh store refuses a passed deadline;
+- `run_id` obeys the attribute-authority and token checks, requires `agent_id`, and cannot
+  coexist with `flow_id` or `delegates: true`; changes drain with `scope_delegation_changed`;
+- a run bind requires `agent-run-scopes/v1` both at admission and relay re-check, carries
+  `run_id` on success, and relays nothing on `target_agent_run_unsupported`; no-run scopes
+  are unaffected;
+- the client sends no apply to an unsupported daemon; apply wire goldens round-trip and
+  existing sync bodies without expiry or run identity remain compatible;
 - the same ref under two owners is two scopes;
 - a gated attribute from an owner not in `scope_authority_owners` is refused;
 - a scope ended, or changed, between admission and commit refuses the open, the module's other
   routes stay up, and the reserved pair is released;
 - removing a carrier and turning off `delegates` each drain the affected routes;
 - ending a scope drains its routes on every endpoint, including a superseded one;
-- a swap candidate's sync is refused, authority moves at cutover without changing the set, and
-  the superseded connection's sync is refused afterwards;
+- a swap candidate's sync is refused, promotion changes no scope-table state, the promoted
+  connection takes authority with its first full sync, and the superseded connection is refused;
 - a restarted owner's first sync replaces at any generation, and an equal or smaller later one
   is refused without changing anything;
 - a parent is accepted only from its owner or a principal in its `child_owners`, and only at its
@@ -462,8 +655,9 @@ From the Athena review of r2 (five seats):
    connection, and it reads a tag in the forwarding table instead of taking the scope lock.
 6. Stamps are snapshots: removing a carrier or turning off `delegates` drains routes, and a
    change between admission and commit refuses the open.
-7. One sync authority per owner, moved at cutover; r2's per-connection first sync let a swap
-   candidate wipe the live set.
+7. One sync authority per owner prevents a swap candidate from wiping the live set, which
+   r2's per-connection first sync allowed. Authority transfer is lazy through an accepted
+   full sync after promotion (section 3).
 8. An owner-supplied `scope_epoch`, refused if it goes down, stops a reused ref carrying old
    approvals and, unlike a daemon counter, survives restarts; `subscribe` reports owner sync, so a reader knows when a missing
    scope means ended.
@@ -474,7 +668,8 @@ From the room's review of r3:
     newer session under a reused ref.
 11. `scope_not_synced` (retryable) is split from `scope_not_live` (terminal), so a carrier's opens
     during the post-restart re-sync window wait instead of failing.
-12. `scope.patch` lets a large owner register or remove one scope without re-sending its set.
+12. A delta lets a large owner register or end one scope without re-sending its set; the
+    implemented operation is `scope.apply` (section 3).
 
 From the room, after r4:
 13. Carrier entries can name their target modules, so a provider listed to file asks under a
@@ -489,8 +684,9 @@ From the Athena review of extensibility r7:
 16. Unchanged records don't bump `version`; a refused record doesn't block the sync; a newer launch
     of the owner takes sync authority from a wedged older connection.
 17. One refusal table and one drain table (section 5a).
-18. `hook_order` left the daemon for `session.plan`; `scope.subscribe` and `scope.patch` are
-    deferred to stage 7, and `subscribe` gains `created` events and a full set on `synced`.
+18. `hook_order` left the daemon for `session.plan`; subscriptions and deltas were deferred
+    to a later release, and `subscribe` gained `created` events and a full set on `synced`.
+    `scope.apply` is now implemented; only subscriptions remain deferred.
 
 From the Athena review of extensibility r7.2:
 19. `kind` is fixed per epoch and an ended epoch cannot be re-created (T8, T13).
@@ -514,8 +710,8 @@ From the operator:
 The build had to decide these where the sections above were silent or loose. Each is now the
 contract; where it differs from the wording above, this section wins.
 
-- **Where sync and describe run.** `scope.sync` and `scope.describe` are module control requests,
-  sent on the sender's own registered module connection. The owner is that registration's
+- **Where sync, apply and describe run.** `scope.sync`, `scope.apply` and `scope.describe` are
+  module control requests sent on the sender's own registered module connection. The owner is that registration's
   `module_id`; nothing in the request body names it. A connection without a registration (`direct`
   and every client connection) is refused `not_registered`, which is how "`direct` cannot own
   scopes" is enforced. `scope.describe` is readable by any registered module, since every provider
@@ -524,11 +720,11 @@ contract; where it differs from the wording above, this section wins.
   sync only while the launch nonce it presented at HELLO is the supervisor's recorded spawn nonce
   for its module, compared in constant time. So a swap candidate before cutover, the superseded
   incumbent after it, and a module the supervisor did not spawn are all refused
-  `scope_sync_not_authority`. The promoted process's first sync takes authority and replaces the
-  set at any generation. The effect a caller sees is the same as the "at cutover" wording in
-  section 3.
+  `scope_sync_not_authority`. The promoted process's first full sync takes authority and replaces
+  the set at any generation; an apply before that sync is `scope_sync_required`.
 - **Advertising.** `scopes/v1` appears in both `server.describe` and HELLO_ACK, and HELLO_ACK lists
-  `scope.sync` and `scope.describe` among the module ops.
+  `scope.sync`, `scope.apply` and `scope.describe` among the module ops (`scope.apply` since
+  subc-protocol 0.30.0).
 - **Codes this note did not list.** `scope_live_limit_exceeded` and `scope_attributes_too_large`
   refuse the whole sync. `scope_carrier_targets_invalid` (an empty target list, or more than 16) and
   `scope_delegates_without_agent` refuse one record. A duplicate or empty ref in one sync refuses
@@ -537,8 +733,11 @@ contract; where it differs from the wording above, this section wins.
 - **Wire shapes.** Principals use subc-protocol's `Principal` object (`{kind, module_id}`), not
   the `reserved:aft` string used in examples above. A carrier is `{principal, targets?}`, with
   `targets` absent meaning any module. Attributes are the closed struct
-  `{agent_id?, delegates, flow_id?}` (`flow_id` since subc-protocol 0.29.0).
-  Record types refuse unknown fields.
+  `{agent_id?, delegates, flow_id?, run_id?}` (`flow_id` since subc-protocol 0.29.0,
+  `run_id` since 0.30.0). Records may carry optional `expires_at_ms` since 0.30.0;
+  omitted `expires_at_ms` and `run_id` decode as unset and are not serialized.
+  Record types refuse unknown fields. `ScopeEnd` is `{ref, scope_epoch}` and its result
+  adds `outcome: ended | not_live`.
 - **Parent links.** A link is checked only when it is new: a new record, a new epoch or a changed
   parent. An unchanged re-sent link keeps its state. A pending link settling to `linked` or `ended`
   bumps the child's `version`, so a bind in flight on the child is refused `scope_changed`; live

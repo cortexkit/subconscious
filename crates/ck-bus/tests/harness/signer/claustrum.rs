@@ -26,8 +26,9 @@ impl RealClaustrum {
     /// Both run as published `ckdev-` copies (`ckdev-claustrum`, `ckdev-ck`),
     /// never under the production names they were installed with.
     pub fn discover(data_home: &Path, key_dir: &Path) -> Result<Self, String> {
-        let claustrum_bin = subc_test_support::ckdev_binary(binary_from_env("CK_CLAUSTRUM_BIN")?);
-        let ck_bin = subc_test_support::ckdev_binary(binary_from_env("CK_CK_BIN")?);
+        let claustrum_bin =
+            cortexkit_test_support::ckdev_binary(binary_from_env("CK_CLAUSTRUM_BIN")?);
+        let ck_bin = cortexkit_test_support::ckdev_binary(binary_from_env("CK_CK_BIN")?);
         Ok(Self {
             claustrum_version: version(&claustrum_bin, &["--version"]),
             ck_version: version(&ck_bin, &["--version"]),
@@ -40,7 +41,7 @@ impl RealClaustrum {
 
     /// `ck auth <args>` against the fixture vault; panics with the output on failure.
     pub fn ck_auth(&self, args: &[&str]) -> String {
-        let output = subc_test_support::dev_command(&self.ck_bin)
+        let output = cortexkit_test_support::dev_command(&self.ck_bin)
             .arg("auth")
             .arg("--data-dir")
             .arg(&self.vault_dir)
@@ -105,7 +106,7 @@ fn binary_from_env(name: &str) -> Result<PathBuf, String> {
 }
 
 fn version(binary: &Path, args: &[&str]) -> String {
-    subc_test_support::dev_command(binary)
+    cortexkit_test_support::dev_command(binary)
         .args(args)
         .output()
         .map(|output| {

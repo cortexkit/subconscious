@@ -432,7 +432,7 @@ pub fn apply(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use subc_test_support::TestTempDir;
+    use cortexkit_test_support::ScratchDir;
 
     /// A stand-in for ck-bus. It follows `install-apply --conf-only --keep-existing`
     /// for the files these tests write: a `server.conf` without an `http:` line gets the
@@ -488,7 +488,7 @@ mod tests {
     }
 
     struct Install {
-        _dir: TestTempDir,
+        _dir: ScratchDir,
         config_path: PathBuf,
         conf_path: PathBuf,
         ckbus: PathBuf,
@@ -498,7 +498,7 @@ mod tests {
     /// given) and a `subc.jsonc` declaring nats-server and ck-bus, plus `extra`
     /// members inside the nats-server declaration.
     fn install(http: Option<&str>, extra: &str) -> Install {
-        let dir = TestTempDir::new("bus-monitoring");
+        let dir = ScratchDir::new("bus-monitoring");
         let nats = dir.join("nats");
         std::fs::create_dir_all(&nats).unwrap();
         let conf_path = nats.join(SERVER_CONF_FILE);
@@ -770,7 +770,7 @@ mod tests {
     #[test]
     fn an_install_setup_cannot_identify_is_skipped_not_guessed() {
         let mut tool = FakeCkBus::new(Path::new("/nonexistent"));
-        let dir = TestTempDir::new("bus-monitoring-skips");
+        let dir = ScratchDir::new("bus-monitoring-skips");
         let config_path = dir.join("subc.jsonc");
         // Absolute on every platform, so each case fails for the reason it names.
         let server_conf = json!(dir.join("n").join("server.conf"));
@@ -848,7 +848,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn the_ck_bus_command_line_is_conf_only_and_keeps_existing_settings() {
-        let dir = TestTempDir::new("bus-monitoring-command");
+        let dir = ScratchDir::new("bus-monitoring-command");
         let program = dir.join("ck-bus");
         super::super::test_exec::write_executable(
             &program,

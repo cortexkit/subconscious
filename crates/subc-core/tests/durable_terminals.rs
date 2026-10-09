@@ -7,8 +7,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+use cortexkit_test_support::{ckdev_binary, dev_command, ScratchDir};
 use serde_json::{json, Value};
-use subc_test_support::{ckdev_binary, dev_command, TestTempDir};
 
 /// At most two of this file's daemons run at once.
 ///
@@ -29,14 +29,14 @@ fn daemon_gate() -> &'static (Mutex<usize>, Condvar) {
 }
 
 struct Fixture {
-    root: TestTempDir,
+    root: ScratchDir,
     child: Option<Child>,
     holds_permit: bool,
 }
 
 impl Fixture {
     fn new() -> Self {
-        let root = TestTempDir::new("durable-terminals");
+        let root = ScratchDir::new("durable-terminals");
         fs::create_dir_all(root.join("config/cortexkit")).unwrap();
         fs::create_dir_all(root.join("runtime")).unwrap();
         fs::create_dir_all(root.join("data/cortexkit/run")).unwrap();
@@ -421,7 +421,7 @@ fn files_named(root: &Path, name: &str) -> Vec<PathBuf> {
 /// terminal journal) under the directory it was started from.
 #[test]
 fn the_daemon_binary_refuses_a_relative_data_home_by_name() {
-    let root = TestTempDir::new("relative-data-home");
+    let root = ScratchDir::new("relative-data-home");
     let mut command = dev_command(ckdev_binary(env!("CARGO_BIN_EXE_ck-subc")));
     command
         .current_dir(root.path())

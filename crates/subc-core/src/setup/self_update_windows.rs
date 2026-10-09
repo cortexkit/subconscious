@@ -158,14 +158,14 @@ mod tests {
     use serde_json::Map;
 
     use super::*;
-    use subc_test_support::TestTempDir;
+    use cortexkit_test_support::ScratchDir;
 
     const TEST_NAME: &str =
         "setup::self_update_windows::tests::replacement_preserves_old_until_a_successful_next_invocation_cleans_it";
     const TEST_MODE: &str = "CK_SELF_UPDATE_WINDOWS_TEST_MODE";
 
-    fn fixture_dir(name: &str) -> TestTempDir {
-        TestTempDir::new(name)
+    fn fixture_dir(name: &str) -> ScratchDir {
+        ScratchDir::new(name)
     }
 
     // The bound proves nothing about speed; it only stops a broken handshake
@@ -231,7 +231,7 @@ mod tests {
         inventory.record("binary-placement", &destination, Map::new());
         inventory.save().expect("save inventory");
 
-        let mut holder = subc_test_support::dev_command(&destination)
+        let mut holder = cortexkit_test_support::dev_command(&destination)
             .args(["--exact", TEST_NAME, "--nocapture"])
             .env(TEST_MODE, "hold")
             .env("CK_SELF_UPDATE_TEST_READY", &ready)
@@ -263,7 +263,7 @@ mod tests {
             "original process remained active"
         );
 
-        let probe = subc_test_support::dev_command(&destination)
+        let probe = cortexkit_test_support::dev_command(&destination)
             .args(["--exact", TEST_NAME, "--nocapture"])
             .env(TEST_MODE, "probe")
             .env("CK_SELF_UPDATE_TEST_READY", &ready)

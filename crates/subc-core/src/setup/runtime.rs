@@ -710,7 +710,7 @@ mod tests {
     use std::collections::VecDeque;
 
     use super::*;
-    use subc_test_support::TestTempDir;
+    use cortexkit_test_support::ScratchDir;
 
     #[derive(Default)]
     struct RecordingRunner {
@@ -729,8 +729,8 @@ mod tests {
         }
     }
 
-    fn fixture_dir(name: &str) -> TestTempDir {
-        TestTempDir::new(name)
+    fn fixture_dir(name: &str) -> ScratchDir {
+        ScratchDir::new(name)
     }
 
     /// Refuses every command with a reason on stderr, the way launchctl and
@@ -1009,7 +1009,7 @@ mod tests {
             RuntimePlatform::Linux,
             RuntimePlatform::Windows,
         ] {
-            let root = fixture_dir(platform.identifier());
+            let root = fixture_dir(&platform.identifier().replace(['/', '\\'], "-"));
             let paths = runtime_paths(platform, &root.join("bin"), &root);
             let manifest = root.join("installer-manifest.json");
             let mut inventory = Inventory::load(&manifest, "test").expect("inventory");

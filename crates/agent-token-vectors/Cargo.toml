@@ -1,6 +1,6 @@
 [package]
 name = "agent-token-vectors"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 license = "MIT"
 publish = false
@@ -13,4 +13,4 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 
 [dev-dependencies]
-subc-test-support = { path = "../subc-test-support" }
+cortexkit-test-support = "0.1.3"

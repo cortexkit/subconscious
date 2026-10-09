@@ -1430,9 +1430,9 @@ impl Error for DaemonConfigError {
 
 #[cfg(all(test, unix))]
 mod run_dir_privacy_tests {
+    use cortexkit_test_support::ScratchDir;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
-    use subc_test_support::TestTempDir;
 
     /// Both arms of the thing that actually bit: a directory this code CREATES,
     /// and one it INHERITS from another creator. The second is the real case --
@@ -1441,7 +1441,7 @@ mod run_dir_privacy_tests {
     /// nothing anywhere it mattered.
     #[test]
     fn run_dir_is_created_private_and_an_inherited_wide_one_is_tightened() {
-        let temp = TestTempDir::new("subc-run-dir-privacy");
+        let temp = ScratchDir::new("subc-run-dir-privacy");
         let created = temp.path().join("cortexkit").join("run");
         super::ensure_directory_private(&created).expect("create run dir");
         let mode = fs::metadata(&created)

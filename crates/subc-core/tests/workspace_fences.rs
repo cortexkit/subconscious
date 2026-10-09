@@ -3,7 +3,7 @@ use std::{fs, path::Path, process::Command};
 
 fn metadata() -> Value {
     let output = Command::new("cargo")
-        .args(["metadata", "--no-deps", "--format-version", "1"])
+        .args(["metadata", "--locked", "--no-deps", "--format-version", "1"])
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .output()
         .expect("run cargo metadata");
@@ -16,45 +16,34 @@ fn metadata() -> Value {
 }
 
 #[test]
-fn leaf_crate_is_unpublished_and_has_no_workspace_dependencies() {
-    let manifest = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"))
-        .expect("read leaf manifest");
-    assert!(
-        manifest
-            .lines()
-            .any(|line| line.trim() == "publish = false"),
-        "leaf crate must be publish = false"
-    );
+fn shared_test_support_is_a_registry_dev_dependency() {
     let data = metadata();
-    let package = data["packages"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|package| package["name"] == "subc-test-support")
-        .unwrap();
-    assert_eq!(
-        package["publish"],
-        serde_json::json!([]),
-        "leaf crate must not be publishable"
-    );
-    for dependency in package["dependencies"].as_array().unwrap() {
-        assert!(
-            dependency["path"].is_null(),
-            "leaf crate has a workspace path dependency: {}",
-            dependency["name"]
-        );
-    }
+    let mut consumers = 0;
     for package in data["packages"].as_array().unwrap() {
+        assert_ne!(
+            package["name"], "subc-test-support",
+            "local helper must stay retired"
+        );
         for dependency in package["dependencies"].as_array().unwrap() {
-            if dependency["name"] == "subc-test-support" {
+            if dependency["name"] == "cortexkit-test-support" {
+                consumers += 1;
                 assert_eq!(
                     dependency["kind"], "dev",
                     "{} must use the guard only as a dev-dependency",
                     package["name"]
                 );
+                assert!(
+                    dependency["path"].is_null()
+                        && dependency["source"]
+                            .as_str()
+                            .is_some_and(|source| source.starts_with("registry+")),
+                    "{} must use the published shared helper, not a local copy",
+                    package["name"]
+                );
             }
         }
     }
+    assert!(consumers > 0, "workspace must use the shared helper");
 }
 
 // Production connection-file fallbacks in subc-daemon/bootstrap.rs and
@@ -66,9 +55,6 @@ fn test_sources_do_not_create_directories_from_temp_dir() {
     let data = metadata();
     let mut offenders = Vec::new();
     for package in data["packages"].as_array().unwrap() {
-        if package["name"] == "subc-test-support" {
-            continue;
-        }
         let manifest = Path::new(package["manifest_path"].as_str().unwrap());
         let crate_dir = manifest.parent().unwrap();
         for folder in ["src", "tests"] {
@@ -80,7 +66,7 @@ fn test_sources_do_not_create_directories_from_temp_dir() {
     }
     assert!(
         offenders.is_empty(),
-        "test temp directory creation outside subc-test-support:\n{}",
+        "test temp directory creation outside cortexkit-test-support:\n{}",
         offenders.join("\n")
     );
 }
@@ -88,6 +74,10 @@ fn test_sources_do_not_create_directories_from_temp_dir() {
 fn scan_tree(dir: &Path, tests: bool, offenders: &mut Vec<String>) {
     for entry in fs::read_dir(dir).unwrap() {
         let path = entry.unwrap().path();
+        // The scanner's own string patterns mention forbidden creation without creating scratch.
+        if path == Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/workspace_fences.rs") {
+            continue;
+        }
         if path.is_dir() {
             scan_tree(&path, tests, offenders);
         } else if path.extension().is_some_and(|extension| extension == "rs") {

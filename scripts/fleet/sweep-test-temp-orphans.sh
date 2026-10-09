@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 # One-shot sweep of the EXISTING test-temp-dir orphan population.
 #
-# Before the RAII `TestTempDir` guard (crates/subc-core/src/test_support.rs),
+# Before tests used owned temporary-directory guards,
 # every test helper minted a uniquely-named directory directly under the OS
 # temp dir and never removed it on failure. The name IS the lifecycle and it
 # dies with the process, so no cleanup pass can be written after the fact --
 # which is why this is a one-shot sweep of a bounded, measured population, not
-# a recurring janitor. Future orphans live under `subc-tests/` (one recognizable
-# parent) and are attributable by directory listing; this script does NOT touch
-# that parent.
+# a recurring janitor. Guarded fixtures live under `cortexkit-tests/` (formerly
+# `subc-tests/`) and are attributable by directory listing; this script does NOT
+# touch either parent.
 #
-# The measured census (issue #85, 2026-08-30): 11,345 entries / 14 GB over ten
+# The 2026-08-30 census counted 11,345 leftover entries / 14 GB over ten
 # days, dominated by `subc-control-*`, `subc-core-*`, `subc-client-rs-*` and
 # `fake-aft-stub-copy*`. The prefix set below is bounded to the patterns the
 # pre-guard test tree actually minted (enumerated from its temp_dir call sites);
@@ -22,8 +22,8 @@
 #     path printed on stdout BEFORE anything is deleted.
 #   - --dry-run is the default; --execute is required to delete.
 #   - no bare `&&` chains: every step is an explicit, checked statement.
-#   - `subc-tests/` (the guard's parent) is refused outright, even if a prefix
-#     would match it.
+#   - `subc-tests/` and `cortexkit-tests/` are refused outright, even if a prefix
+#     would match either guard parent.
 #
 # Usage: sweep-test-temp-orphans.sh [--execute]
 
@@ -40,11 +40,11 @@ TMP_ROOT="$(cd "${TMPDIR:-/tmp}" && pwd -P)"
 # Age threshold: only delete entries whose mtime is older than this.
 AGE_MINUTES=$((48 * 60))
 
-# Bounded prefix set, from the pre-guard test-tree enumeration. Each entry is a
-# glob fragment matched against the top-level temp dir. `subc-tests/` (the
-# guard's parent) is deliberately NOT here and is refused below.
+# Bounded prefixes used by the old test helpers' directory names. Each entry is a
+# glob fragment matched against the top-level temp dir. The old and shared
+# guard parents are deliberately NOT here and are refused below.
 PREFIXES=(
-  # Measured census (issue #85).
+  # Largest populations in the 2026-08-30 census.
   'subc-control-*'
   'subc-core-*'
   'subc-client-rs-*'
@@ -101,12 +101,13 @@ done
 # future population there is attributable and out of scope for this one-shot
 # sweep; deleting it would erase the evidence the guard deliberately preserves.
 GUARD_PARENT="$TMP_ROOT/subc-tests"
+SHARED_GUARD_PARENT="$TMP_ROOT/cortexkit-tests"
 REFUSED=0
 ORPHANS=()
 for entry in "${DEDUP[@]:-}"; do
   [ -z "$entry" ] && continue
   case "$entry" in
-    "$GUARD_PARENT"|"$GUARD_PARENT"/*)
+    "$GUARD_PARENT"|"$GUARD_PARENT"/*|"$SHARED_GUARD_PARENT"|"$SHARED_GUARD_PARENT"/*)
       echo "REFUSING (guard parent, out of scope): $entry"
       REFUSED=$((REFUSED + 1))
       continue

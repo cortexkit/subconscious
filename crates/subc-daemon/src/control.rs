@@ -6404,7 +6404,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn rescan_health_only_is_live_but_launch_edits_need_reload() {
-        let dir = subc_test_support::TestTempDir::new("rescan-live-health");
+        let dir = cortexkit_test_support::ScratchDir::new("rescan-live-health");
         let path = dir.join("subc.jsonc");
         std::fs::write(&path, serde_json::json!({"version":1,"modules":{"stock":{
             "program":"/bin/sleep","args":["60"],"protocol":"none",
@@ -6459,6 +6459,7 @@ mod tests {
         );
         module.drain().await.unwrap();
     }
+    use cortexkit_test_support::ScratchDir;
     use std::{
         collections::BTreeMap,
         fmt,
@@ -6466,7 +6467,6 @@ mod tests {
         sync::{Arc, Mutex},
         time::Duration,
     };
-    use subc_test_support::TestTempDir;
 
     use serde_json::{json, Value};
     use subc_protocol::{
@@ -6894,14 +6894,14 @@ mod tests {
         Frame::build(FrameType::Request, control_flags(), 0, 0, corr, body).unwrap()
     }
 
-    fn route_open_frame(corr: u64, module_id: &str, project_root: TestTempDir) -> Frame {
+    fn route_open_frame(corr: u64, module_id: &str, project_root: ScratchDir) -> Frame {
         route_open_frame_with_consumer_capabilities(corr, module_id, project_root, None)
     }
 
     fn route_open_frame_with_consumer_capabilities(
         corr: u64,
         module_id: &str,
-        project_root: TestTempDir,
+        project_root: ScratchDir,
         consumer_capabilities: Option<Vec<String>>,
     ) -> Frame {
         let body = serde_json::to_vec(&ClientControlRequest::RouteOpen {
@@ -6926,7 +6926,7 @@ mod tests {
     fn route_open_frame_with_role_versions(
         corr: u64,
         module_id: &str,
-        project_root: TestTempDir,
+        project_root: ScratchDir,
         role_versions: Option<BTreeMap<String, String>>,
     ) -> Frame {
         let body = serde_json::to_vec(&ClientControlRequest::RouteOpen {
@@ -6958,7 +6958,7 @@ mod tests {
     fn route_open_frame_with_admission_facts(
         corr: u64,
         module_id: &str,
-        project_root: TestTempDir,
+        project_root: ScratchDir,
         consumer_identity: Option<subc_control::ConsumerIdentity>,
         facts: Option<Value>,
     ) -> Frame {
@@ -7041,8 +7041,8 @@ mod tests {
         Frame::build(FrameType::Response, control_flags(), 0, 0, corr, body).unwrap()
     }
 
-    fn unique_project_root(label: &str) -> TestTempDir {
-        TestTempDir::new(label)
+    fn unique_project_root(label: &str) -> ScratchDir {
+        ScratchDir::new(label)
     }
 
     fn assert_route_poll_liveness(frame: &Frame, expected_live: bool) {
@@ -7225,7 +7225,7 @@ mod tests {
     /// running while the read is paused.
     #[tokio::test(flavor = "current_thread")]
     async fn supervisor_terminals_reads_the_journal_off_the_runtime_worker() {
-        let dir = TestTempDir::new("terminals-off-worker");
+        let dir = ScratchDir::new("terminals-off-worker");
         let journal_path = dir.join("terminals.jsonl");
         let registry = Arc::new(Registry::default());
         let supervisor_handle = SupervisorHandle::new();

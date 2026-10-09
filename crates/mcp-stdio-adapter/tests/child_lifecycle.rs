@@ -390,7 +390,7 @@ fn mode_handler(mode: &str) -> AdapterHandler {
 
 #[tokio::test]
 async fn initialize_error_is_refused_before_tool_dispatch() {
-    let home = subc_test_support::TestTempDir::new("initialize-error-frames");
+    let home = cortexkit_test_support::ScratchDir::new("initialize-error-frames");
     let events = home.join("frames.jsonl");
     let handler = AdapterHandler::with_resolver(
         registry(
@@ -512,7 +512,7 @@ async fn early_child_exits_exhaust_spawn_budget() {
 
 #[tokio::test]
 async fn child_exit_after_healthy_window_resets_earlier_failure_streak() {
-    let home = subc_test_support::TestTempDir::new("early-exit-recovery");
+    let home = cortexkit_test_support::ScratchDir::new("early-exit-recovery");
     let generations = home.join("generations");
     std::fs::write(&generations, "0").unwrap();
     let handler = AdapterHandler::with_resolver(
@@ -585,13 +585,11 @@ async fn teardown_kills_grandchild_ignoring_sigterm() {
         rustix::process::Pid::from_raw(reply["payload"]["grandchild_pid"].as_u64().unwrap() as i32)
             .unwrap();
     evict_after_test_ttl(&handler, 1).await;
-    let gone = tokio::time::timeout(Duration::from_secs(2), async {
-        while subc_test_support::process_alive(pid.as_raw_nonzero().get()) {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+    let gone = tokio::task::spawn_blocking(move || {
+        cortexkit_test_support::wait_until_gone(pid.as_raw_nonzero().get(), Duration::from_secs(2))
     })
     .await
-    .is_ok();
+    .expect("wait for grandchild exit");
     // A failed regression must not leave its intentionally uncontained helper behind.
     if !gone {
         let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);

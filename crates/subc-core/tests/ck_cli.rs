@@ -1,3 +1,4 @@
+use cortexkit_test_support::ScratchDir as TempDir;
 use std::{
     collections::BTreeMap,
     fs,
@@ -7,7 +8,6 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use subc_test_support::TestTempDir as TempDir;
 
 use base64::Engine;
 use ed25519_dalek::{Signer, SigningKey};
@@ -369,8 +369,8 @@ fn setup_dry_run_refuses_when_the_signature_header_is_stripped() {
 #[test]
 fn production_ck_ignores_the_test_release_index_key() {
     // The shipped `ck` target, run as `ckdev-ck` like every test process.
-    let production = subc_test_support::ckdev_binary(env!("CARGO_BIN_EXE_ck"));
-    let shape = subc_test_support::dev_command(&production)
+    let production = cortexkit_test_support::ckdev_binary(env!("CARGO_BIN_EXE_ck"));
+    let shape = cortexkit_test_support::dev_command(&production)
         .arg("--ck-build-shape")
         .output()
         .expect("production ck build shape");
@@ -410,7 +410,7 @@ fn production_ck_ignores_the_test_release_index_key() {
         &std::env::var_os("PATH").unwrap_or_default(),
     )))
     .expect("fixture PATH");
-    let output = subc_test_support::dev_command(&production)
+    let output = cortexkit_test_support::dev_command(&production)
         .args(["setup", "--dry-run"])
         .env("CK_RELEASE_INDEX_URL", &index.url)
         .env("CK_TEST_RELEASE_INDEX_PUBKEY", &index.public_key)
@@ -1279,7 +1279,7 @@ impl UpgradeFixture {
         write_executable(&auth, "#!/bin/sh\necho 'ck-auth 0.8.0'\n");
         // The manifest names the `ck` this fixture's commands run: the test
         // CLI as published under its `ckdev-` name.
-        let ck = fs::canonicalize(subc_test_support::ckdev_binary(env!(
+        let ck = fs::canonicalize(cortexkit_test_support::ckdev_binary(env!(
             "CARGO_BIN_EXE_ck-under-test"
         )))
         .unwrap();
@@ -1658,6 +1658,9 @@ fn daemon_lint_uses_its_explicit_config_without_a_daemon_connection() {
 /// The one test allowed to place production-named (`ck-*`) executables.
 const TWIN_TEST: &str = "a_copy_of_ck_on_path_is_neither_probed_recursively_nor_listed";
 
+const PRODUCTION_NAME_EXEMPTIONS: &[(&str, &str)] =
+    &[(TWIN_TEST, "ck-twin"), (TWIN_TEST, "ck-twin-two")];
+
 /// The control for the twin exemption: in this same file, a production-named
 /// spawn outside it is still refused, whether it borrows the twin test's name,
 /// names a file the exemption does not list, or skips the exemption entirely.
@@ -1669,22 +1672,27 @@ fn a_production_named_spawn_outside_the_twin_exemption_is_refused() {
     };
     assert!(
         refused(&|| {
-            subc_test_support::exempt_production_executable(TWIN_TEST, &bin.join("ck-twin"));
+            cortexkit_test_support::exempt_production_executable(
+                TWIN_TEST,
+                &bin.join("ck-twin"),
+                PRODUCTION_NAME_EXEMPTIONS,
+            );
         }),
         "another test must not borrow the twin test's exemption"
     );
     assert!(
         refused(&|| {
-            subc_test_support::exempt_production_executable(
+            cortexkit_test_support::exempt_production_executable(
                 "a_production_named_spawn_outside_the_twin_exemption_is_refused",
                 &bin.join("ck-twin"),
+                PRODUCTION_NAME_EXEMPTIONS,
             );
         }),
         "the exemption names one test"
     );
     assert!(
         refused(&|| {
-            let _ = subc_test_support::dev_command(bin.join(platform_binary("ck-twin")));
+            let _ = cortexkit_test_support::dev_command(bin.join(platform_binary("ck-twin")));
         }),
         "the spawn guard refuses a ck-* program"
     );
@@ -1721,7 +1729,11 @@ fn a_copy_of_ck_on_path_is_neither_probed_recursively_nor_listed() {
         let copy = bin.join(platform_binary(name));
         common::copy_executable(
             Path::new(env!("CARGO_BIN_EXE_ck-under-test")),
-            subc_test_support::exempt_production_executable(TWIN_TEST, &copy),
+            cortexkit_test_support::exempt_production_executable(
+                TWIN_TEST,
+                &copy,
+                PRODUCTION_NAME_EXEMPTIONS,
+            ),
         );
     }
     let path = std::env::join_paths(

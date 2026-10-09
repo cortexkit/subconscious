@@ -1,6 +1,6 @@
 [package]
 name = "mcp-stdio-adapter"
-version = "0.1.10"
+version = "0.1.11"
 edition = "2021"
 license = "MIT"
 publish = false
@@ -28,4 +28,4 @@ rustix = { version = "1", default-features = false, features = ["process", "std"
 subc-jobobject = { path = "../subc-jobobject" }
 
 [dev-dependencies]
-subc-test-support = { path = "../subc-test-support" }
+cortexkit-test-support = "0.1.3"

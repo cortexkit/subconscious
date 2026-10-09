@@ -606,7 +606,7 @@ mod tests {
     };
 
     use super::*;
-    use subc_test_support::TestTempDir;
+    use cortexkit_test_support::ScratchDir;
 
     fn upgrade_target(binary: &str) -> UpgradeTarget {
         upgrade_roster(Component::ALL)
@@ -720,8 +720,8 @@ mod tests {
         }
     }
 
-    fn cache(name: &str) -> (TestTempDir, UpdateCache) {
-        let dir = TestTempDir::new(name);
+    fn cache(name: &str) -> (ScratchDir, UpdateCache) {
+        let dir = ScratchDir::new(name);
         let cache = UpdateCache::new(dir.path().join("update-metadata.json"));
         (dir, cache)
     }

@@ -7,6 +7,7 @@ use std::{
     time::Duration,
 };
 
+use cortexkit_test_support::ScratchDir;
 use subc_control::ClientControlRequest;
 use subc_daemon::{
     bootstrap::{run_with_config, BootstrapConfig, BootstrapError},
@@ -14,7 +15,6 @@ use subc_daemon::{
     DaemonSelfWatchdogConfig, Frame, Registry, Router, ServerAuth,
 };
 use subc_protocol::{Flags, FrameType, Priority, PROTOCOL_VERSION};
-use subc_test_support::TestTempDir;
 use subc_transport::{
     generate_daemon_id, generate_key, read_for_client as read_connection_file, write_atomic,
     ConnectionInfo, Endpoint, SCHEMA_VERSION,
@@ -228,7 +228,7 @@ struct RunningDaemon {
     // Held for RAII lifetime only: the guard's `Drop` removes the tree (or
     // preserves it on panic). Never read directly.
     #[allow(dead_code)]
-    temp_dir: TestTempDir,
+    temp_dir: ScratchDir,
     task: JoinHandle<Result<(), BootstrapError>>,
 }
 
@@ -256,7 +256,7 @@ impl RunningDaemon {
 impl Drop for RunningDaemon {
     fn drop(&mut self) {
         self.task.abort();
-        // The temp dir is owned by the `subc_test_support::TestTempDir` guard, whose `Drop` removes
+        // The temp dir is owned by the `cortexkit_test_support::ScratchDir` guard, whose `Drop` removes
         // the tree (or preserves it on panic).
     }
 }
@@ -470,8 +470,8 @@ fn test_connection_info(port: u16) -> ConnectionInfo {
     }
 }
 
-fn unique_temp_dir(name: &str) -> TestTempDir {
-    TestTempDir::new(name)
+fn unique_temp_dir(name: &str) -> ScratchDir {
+    ScratchDir::new(name)
 }
 
 fn control_request_frame(corr: u64, request: ClientControlRequest) -> Frame {

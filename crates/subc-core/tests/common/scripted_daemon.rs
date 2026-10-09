@@ -1,5 +1,5 @@
+use cortexkit_test_support::ScratchDir;
 use std::{future::pending, process, time::Duration};
-use subc_test_support::TestTempDir;
 
 use subc_control::{ClientControlRequest, ClientControlResponse};
 use subc_daemon::{read_frame, write_frame, Frame};
@@ -14,7 +14,7 @@ use tokio::{io::AsyncWriteExt, net::TcpListener, task::JoinHandle};
 /// daemon cannot serve deterministically.
 pub struct ScriptedDaemon {
     pub connection_file_path: std::path::PathBuf,
-    _temp_dir: TestTempDir,
+    _temp_dir: ScratchDir,
     task: JoinHandle<()>,
 }
 
@@ -30,7 +30,7 @@ pub enum ScriptedControlAction {
 
 impl ScriptedDaemon {
     pub async fn start(name: &str, steps: Vec<ScriptedControlStep>) -> Self {
-        let temp_dir = TestTempDir::new(name);
+        let temp_dir = ScratchDir::new(name);
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
             .expect("scripted daemon binds");

@@ -234,7 +234,7 @@ mod tests {
 
     #[test]
     fn daemon_log_line_matches_the_authority_fixture_byte_for_byte_without_ansi() {
-        let temp = subc_test_support::TestTempDir::new("subc-daemon-log-format");
+        let temp = cortexkit_test_support::ScratchDir::new("subc-daemon-log-format");
         let logs_dir = temp.path().to_path_buf();
         let mut config = daemon_logger_config(logs_dir.clone(), None);
         config.module_id = "fusiform".to_string();

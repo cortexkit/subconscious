@@ -1,16 +1,16 @@
 #![cfg(target_os = "linux")]
 
+use cortexkit_test_support::ScratchDir;
 use std::{fs, io, path::Path};
-use subc_test_support::TestTempDir;
 
 use subc_cgroup::{apply, prepare_at};
 use tokio::process::Command;
 
-struct ScratchRoot(TestTempDir);
+struct ScratchRoot(ScratchDir);
 
 impl ScratchRoot {
     fn new(name: &str) -> io::Result<Self> {
-        let path = TestTempDir::new(&format!("subc-cgroup-{name}"));
+        let path = ScratchDir::new(&format!("subc-cgroup-{name}"));
         fs::write(path.join("cgroup.procs"), b"")?;
         Ok(Self(path))
     }

@@ -23,7 +23,7 @@ pub fn template_value() -> Value {
 /// processes the daemon starts are never listed under the production `ck-bus`
 /// name.
 pub fn render(fixture_root: &Path, ck_bus_binary: &Path, timing: SentinelTiming) -> PathBuf {
-    let ck_bus_binary = &subc_test_support::ckdev_binary(ck_bus_binary);
+    let ck_bus_binary = &cortexkit_test_support::ckdev_binary(ck_bus_binary);
     let mut value = template_value();
     let modules = value["modules"]
         .as_object_mut()

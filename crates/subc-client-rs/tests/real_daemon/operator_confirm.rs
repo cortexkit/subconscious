@@ -47,7 +47,7 @@ fn binaries() -> (PathBuf, PathBuf) {
 struct Harness {
     _serial: tokio::sync::OwnedMutexGuard<()>,
     daemon: LiveDaemon,
-    _temp: TestTempDir,
+    _temp: ScratchDir,
     root: PathBuf,
     events: PathBuf,
     module_bin: PathBuf,

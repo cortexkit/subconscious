@@ -606,7 +606,7 @@ pub(crate) fn record_path(run_dir: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use subc_test_support::TestTempDir;
+    use cortexkit_test_support::ScratchDir;
 
     fn child(module_id: &str, pid: u32) -> LiveChild {
         LiveChild {
@@ -645,7 +645,7 @@ mod tests {
         );
         let mut entry = child("sh-script", 40);
         entry.executable = Some(ExecutableIdentity::from(launcher));
-        let dir = TestTempDir::new("sh-interpreter-record");
+        let dir = ScratchDir::new("sh-interpreter-record");
         let path = record_path(&dir);
         write_record(&path, &[entry]).unwrap();
         let recorded = read_record(&path).unwrap().pop().unwrap();
@@ -758,7 +758,7 @@ mod tests {
             device: 7,
             inode: 12,
         });
-        let dir = TestTempDir::new("previous-roster-reader");
+        let dir = ScratchDir::new("previous-roster-reader");
         let path = record_path(&dir);
         write_record(&path, &[entry]).unwrap();
         let bytes = fs::read(&path).unwrap();
@@ -789,7 +789,7 @@ mod tests {
 
     #[test]
     fn record_round_trips() {
-        let dir = TestTempDir::new("live-children-round-trip");
+        let dir = ScratchDir::new("live-children-round-trip");
         let path = record_path(&dir);
         let mut subc = child("aft", 41);
         subc.protocol = ModuleProtocol::Subc;
@@ -805,7 +805,7 @@ mod tests {
 
     #[test]
     fn a_missing_record_is_empty_and_an_unknown_version_is_refused() {
-        let dir = TestTempDir::new("live-children-missing");
+        let dir = ScratchDir::new("live-children-missing");
         let path = record_path(&dir);
         assert_eq!(read_record(&path).unwrap(), Vec::new());
         fs::write(&path, br#"{"version":99,"children":[]}"#).unwrap();
@@ -819,7 +819,7 @@ mod tests {
     /// rename must leave the previous record whole and no temp file behind.
     #[test]
     fn a_failed_write_leaves_the_previous_record_whole() {
-        let dir = TestTempDir::new("live-children-failed-write");
+        let dir = ScratchDir::new("live-children-failed-write");
         let path = record_path(&dir);
         let previous = vec![child("nats", 40)];
         write_record(&path, &previous).unwrap();
@@ -849,7 +849,7 @@ mod tests {
     /// would sooner or later see a torn one.
     #[test]
     fn a_concurrent_reader_never_sees_a_partial_record() {
-        let dir = TestTempDir::new("live-children-concurrent");
+        let dir = ScratchDir::new("live-children-concurrent");
         let path = record_path(&dir);
         let short = vec![child("nats", 40)];
         let long: Vec<LiveChild> = (0..200).map(|pid| child("module", pid)).collect();
@@ -971,7 +971,7 @@ mod tests {
     /// always lists exactly the processes the daemon has running.
     #[test]
     fn the_roster_keeps_the_record_in_step_with_admits_and_releases() {
-        let dir = TestTempDir::new("roster-record");
+        let dir = ScratchDir::new("roster-record");
         let path = record_path(&dir);
         let roster = crate::child_roster::ChildRoster::default();
         roster.record_to(path.clone());
@@ -1090,7 +1090,7 @@ mod tests {
 
         #[tokio::test]
         async fn a_recorded_child_still_running_is_terminated_at_boot() {
-            let dir = TestTempDir::new("sweep-terminates");
+            let dir = ScratchDir::new("sweep-terminates");
             let path = record_path(&dir);
             let (mut child, entry) = spawn_recorded(&executable("sleep"), &["60"]);
             write_record(&path, std::slice::from_ref(&entry)).unwrap();
@@ -1110,7 +1110,7 @@ mod tests {
 
         #[tokio::test]
         async fn a_recorded_child_ignoring_sigterm_is_killed_after_the_grace() {
-            let dir = TestTempDir::new("sweep-kills");
+            let dir = ScratchDir::new("sweep-kills");
             let path = record_path(&dir);
             // `read` is a shell builtin, so the shell itself waits on the
             // piped stdin with SIGTERM ignored; nothing else is exec'd. The
@@ -1147,7 +1147,7 @@ mod tests {
 
         #[tokio::test]
         async fn a_pid_now_held_by_an_unrelated_process_is_not_signalled() {
-            let dir = TestTempDir::new("sweep-reused-pid");
+            let dir = ScratchDir::new("sweep-reused-pid");
             let path = record_path(&dir);
             let (mut child, entry) = spawn_recorded(&executable("sleep"), &["60"]);
             // The record says the pid belonged to a process started at
@@ -1180,7 +1180,7 @@ mod tests {
 
         #[tokio::test]
         async fn same_pid_and_start_time_running_another_executable_is_not_signalled() {
-            let dir = TestTempDir::new("sweep-other-executable");
+            let dir = ScratchDir::new("sweep-other-executable");
             let path = record_path(&dir);
             let (mut child, entry) = spawn_recorded(&executable("sleep"), &["60"]);
             let mut other = entry.clone();
@@ -1212,7 +1212,7 @@ mod tests {
 
         #[tokio::test]
         async fn an_entry_for_a_gone_process_is_dropped() {
-            let dir = TestTempDir::new("sweep-gone");
+            let dir = ScratchDir::new("sweep-gone");
             let path = record_path(&dir);
             let (mut child, entry) = spawn_recorded(&executable("sleep"), &["60"]);
             child.kill().unwrap();
@@ -1232,7 +1232,7 @@ mod tests {
 
         #[tokio::test]
         async fn an_adopted_pid_is_left_running() {
-            let dir = TestTempDir::new("sweep-adopted");
+            let dir = ScratchDir::new("sweep-adopted");
             let path = record_path(&dir);
             let (mut child, entry) = spawn_recorded(&executable("sleep"), &["60"]);
             write_record(&path, std::slice::from_ref(&entry)).unwrap();
@@ -1252,7 +1252,7 @@ mod tests {
 
         #[tokio::test]
         async fn an_unconfirmed_trampoline_image_is_never_signalled_by_orphan_cleanup() {
-            let dir = TestTempDir::new("sweep-unconfirmed-trampoline");
+            let dir = ScratchDir::new("sweep-unconfirmed-trampoline");
             let path = record_path(&dir);
             let (mut child, mut entry) = spawn_recorded(&executable("sleep"), &["60"]);
             entry.executable = None;

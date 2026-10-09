@@ -53,8 +53,8 @@ struct Output {
 fn ck_bus(args: &[&str]) -> Output {
     let homes = tempfile::tempdir().unwrap();
     // Run as `ckdev-bus`, never under the production `ck-bus` name.
-    let binary = subc_test_support::ckdev_binary(env!("CARGO_BIN_EXE_ck-bus"));
-    let output = subc_test_support::dev_command(binary)
+    let binary = cortexkit_test_support::ckdev_binary(env!("CARGO_BIN_EXE_ck-bus"));
+    let output = cortexkit_test_support::dev_command(binary)
         .args(args)
         .env_remove("SUBC_MODULE_ID")
         .env("XDG_DATA_HOME", homes.path().join("data"))

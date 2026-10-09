@@ -326,7 +326,7 @@ fn platform_binary(binary: &str) -> String {
 #[cfg(test)]
 #[test]
 fn download_failure_does_not_claim_the_release_asset_is_missing() {
-    let root = subc_test_support::TestTempDir::new("upgrade-download-refusal");
+    let root = cortexkit_test_support::ScratchDir::new("upgrade-download-refusal");
     let target = super::components::upgrade_roster([super::model::Component::Aft])[0];
     let index: ReleaseIndex = serde_json::from_value(serde_json::json!({
         "schema":1, "channel":"alpha", "generated_at_ms":0,

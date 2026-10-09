@@ -578,8 +578,8 @@ async fn assert_stub_principal_controls(run: &AcceptanceRun) {
 async fn assert_hand_started_copy_refused(run: &AcceptanceRun, binary: &Path, nonce: Option<&str>) {
     // The same `ckdev-bus` placement the run's daemon supervises, so the copy
     // differs from the supervised module only in who started it.
-    let binary = subc_test_support::ckdev_binary(binary);
-    let mut command = Command::from(subc_test_support::dev_command(binary));
+    let binary = cortexkit_test_support::ckdev_binary(binary);
+    let mut command = Command::from(cortexkit_test_support::dev_command(binary));
     command
         .arg("--subc")
         .arg(&run.connection_file)

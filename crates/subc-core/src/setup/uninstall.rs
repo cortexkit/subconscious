@@ -194,7 +194,7 @@ mod tests {
     use serde_json::Map;
 
     use super::*;
-    use subc_test_support::TestTempDir;
+    use cortexkit_test_support::ScratchDir;
 
     #[derive(Default)]
     struct SuccessfulRunner;
@@ -212,8 +212,8 @@ mod tests {
         }
     }
 
-    fn fixture_dir(name: &str) -> TestTempDir {
-        TestTempDir::new(name)
+    fn fixture_dir(name: &str) -> ScratchDir {
+        ScratchDir::new(name)
     }
 
     #[test]

@@ -1,3 +1,4 @@
+use cortexkit_test_support::ScratchDir;
 use std::{
     collections::BTreeSet,
     ops::Deref,
@@ -5,7 +6,6 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use subc_test_support::TestTempDir;
 
 use subc_control::{ops, ClientControlRequest, ClientControlResponse, ModuleProtocol, PollKind};
 use subc_daemon::{
@@ -808,13 +808,13 @@ fn embedding_payload() -> Vec<u8> {
 }
 
 struct TestProject {
-    temp: TestTempDir,
+    temp: ScratchDir,
 }
 
 impl TestProject {
     fn new(label: &str) -> Self {
         Self {
-            temp: TestTempDir::new(label),
+            temp: ScratchDir::new(label),
         }
     }
 

@@ -6,6 +6,7 @@ use std::{
     time::Duration,
 };
 
+use cortexkit_test_support::ScratchDir;
 use serde_json::{json, Value};
 use subc_control::{
     ClientControlRequest, ClientControlResponse, ConsumerIdentity, ReloadPathAgreement,
@@ -19,7 +20,6 @@ use subc_protocol::{
     manifest::ModuleManifest, BindIdentity, ErrorBody, Flags, FrameType, ModuleHelloBody, Priority,
     RouteTarget, PROTOCOL_VERSION,
 };
-use subc_test_support::TestTempDir;
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt},
     net::TcpStream,
@@ -40,7 +40,7 @@ struct RunningDaemon {
     // Held for RAII lifetime: the guard's `Drop` removes the tree (or
     // preserves it on panic). Tests also place the binaries they run under
     // their `ckdev-` names in it.
-    temp_dir: TestTempDir,
+    temp_dir: ScratchDir,
     task: JoinHandle<Result<(), subc_daemon::bootstrap::BootstrapError>>,
 }
 
@@ -96,7 +96,7 @@ impl RunningDaemon {
 impl Drop for RunningDaemon {
     fn drop(&mut self) {
         self.task.abort();
-        // The temp dir is owned by the `subc_test_support::TestTempDir` guard, whose `Drop` removes
+        // The temp dir is owned by the `cortexkit_test_support::ScratchDir` guard, whose `Drop` removes
         // the tree (or preserves it on panic).
     }
 }
@@ -1846,8 +1846,8 @@ where
     .expect("timed out waiting for frame")
 }
 
-fn unique_temp_dir(name: &str) -> TestTempDir {
-    TestTempDir::new(name)
+fn unique_temp_dir(name: &str) -> ScratchDir {
+    ScratchDir::new(name)
 }
 
 /// An in-process daemon with NO `capture_logs_dir` must capture NOWHERE --

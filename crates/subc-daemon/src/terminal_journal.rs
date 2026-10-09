@@ -368,9 +368,9 @@ fn wire_entry(entry: TerminalRecord, incarnation: Option<&str>) -> TerminalEntry
 mod tests {
     use super::*;
     use crate::terminal_ring::{TerminalRing, TerminalRingConfig};
+    use cortexkit_test_support::ScratchDir;
     use std::sync::Arc;
     use subc_control::{TerminalDisposition, TerminalExitKind};
-    use subc_test_support::TestTempDir;
 
     fn record(at_ms: u64) -> TerminalRecord {
         TerminalRecord {
@@ -388,7 +388,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn shutdown_marker_survives_reopen_without_becoming_corruption_or_an_exit() {
-        let dir = TestTempDir::new("terminal-journal-shutdown");
+        let dir = ScratchDir::new("terminal-journal-shutdown");
         let path = dir.join("terminals.jsonl");
         let journal = TerminalJournal::open(path.clone(), "cut-daemon".into());
         journal.append("module", &record(8));
@@ -406,7 +406,7 @@ mod tests {
 
     #[test]
     fn journal_preserves_exit_fields_filters_modules_and_isolates_a_torn_line() {
-        let dir = TestTempDir::new("terminal-journal-fields");
+        let dir = ScratchDir::new("terminal-journal-fields");
         let path = dir.join("terminals.jsonl");
         std::fs::write(&path, b"{\"torn\":").unwrap();
         let journal = TerminalJournal::open(path, "old-daemon".into());
@@ -437,7 +437,7 @@ mod tests {
 
     #[test]
     fn journal_merge_recovers_ring_evictions_orders_exits_and_preserves_multiplicity() {
-        let dir = TestTempDir::new("terminal-journal-merge");
+        let dir = ScratchDir::new("terminal-journal-merge");
         let journal = Arc::new(TerminalJournal::open(
             dir.join("terminals.jsonl"),
             "daemon".into(),
@@ -465,7 +465,7 @@ mod tests {
 
     #[test]
     fn journal_reads_rotated_generations_after_reopening() {
-        let dir = TestTempDir::new("terminal-journal-rotation");
+        let dir = ScratchDir::new("terminal-journal-rotation");
         let path = dir.join("terminals.jsonl");
         let journal = TerminalJournal::open(path.clone(), "first".into());
         let mut large = record(1);
@@ -491,7 +491,7 @@ mod tests {
 
     #[test]
     fn journal_failed_append_leaves_the_ring_readable_and_reports_failure() {
-        let dir = TestTempDir::new("terminal-journal-write-failure");
+        let dir = ScratchDir::new("terminal-journal-write-failure");
         let path = dir.join("terminals.jsonl");
         std::fs::create_dir(&path).unwrap();
         let journal = Arc::new(TerminalJournal::open(path, "daemon".into()));

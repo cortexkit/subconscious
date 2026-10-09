@@ -1,6 +1,6 @@
 [package]
 name = "subc-transport"
-version = "0.10.0"
+version = "0.10.1"
 edition = "2021"
 publish = true
 description = "subc loopback-TCP + key transport: pre-envelope auth handshake, connection-file discovery, and async envelope frame I/O."
@@ -21,5 +21,5 @@ tokio = { version = "1", features = ["io-util", "time"] }
 rustix = { version = "1", default-features = false, features = ["process"] }
 
 [dev-dependencies]
-subc-test-support = { path = "../subc-test-support" }
+cortexkit-test-support = "0.1.3"
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "time", "test-util"] }

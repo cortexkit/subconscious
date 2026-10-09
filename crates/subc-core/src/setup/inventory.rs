@@ -317,10 +317,10 @@ impl Inventory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use subc_test_support::TestTempDir;
+    use cortexkit_test_support::ScratchDir;
 
-    fn fixture_path(name: &str) -> TestTempDir {
-        TestTempDir::new(name)
+    fn fixture_path(name: &str) -> ScratchDir {
+        ScratchDir::new(name)
     }
 
     #[test]

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.26.4
+
+- Test-only: the tests' helpers (temporary directories, process-liveness checks, and copies of test programs under `ckdev-` names) now come from the published `cortexkit-test-support` crate, which other CortexKit repositories also use, instead of a private copy in this repository. No runtime change.
+
 ## 0.26.3
 
 - Add the opt-in, tests-only `test-support` feature and `test_support::ModuleHarness`. Module tests can run their real serve handler over an in-memory stand-in daemon connection, bind routes, send requests, inspect replies and channel-0 traffic, and script each `operator.confirm` answer (confirmation, all four refusals with `detail.reason`, unknown operation, or silence). Use this feature only on a dev-dependency. Silence/deadline tests can use Tokio's paused clock without changing the production confirmation timeout.

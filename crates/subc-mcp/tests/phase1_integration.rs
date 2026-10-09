@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use cortexkit_test_support::ScratchDir;
 use std::{
     collections::BTreeMap,
     env, fs,
@@ -14,7 +15,6 @@ use std::{
     },
     time::Duration,
 };
-use subc_test_support::TestTempDir;
 
 use rmcp::{
     model::{
@@ -100,7 +100,7 @@ struct TestDaemon {
     registry: Arc<Registry>,
     forwarding: Arc<ForwardingTable>,
     connection_file_path: PathBuf,
-    temp_dir: TestTempDir,
+    temp_dir: ScratchDir,
     task: JoinHandle<Result<(), subc_daemon::ServerError>>,
 }
 
@@ -138,7 +138,7 @@ impl TestServer {
 }
 
 struct TestProject {
-    path: TestTempDir,
+    path: ScratchDir,
 }
 
 impl TestProject {
@@ -4027,7 +4027,7 @@ async fn mcp_module_without_spawn_attestation_exits_loud_before_serving() {
     let xdg_config_home = server.daemon.temp_dir.join("mcp-unattested-xdg-config");
     fs::create_dir_all(&xdg_config_home).unwrap();
 
-    let mut command = Command::from(subc_test_support::dev_command(ckdev_subc_mcp()));
+    let mut command = Command::from(cortexkit_test_support::dev_command(ckdev_subc_mcp()));
     command
         .arg("module")
         .arg("--subc")
@@ -4333,7 +4333,7 @@ fn stub_spec(module_id: &str, events_path: &Path, extra_env: &[(&str, &str)]) ->
 /// `ck-subc-mcp` published as `ckdev-subc-mcp`, so the module and
 /// shim processes these tests start are never listed under the production name.
 fn ckdev_subc_mcp() -> PathBuf {
-    subc_test_support::ckdev_binary(env!("CARGO_BIN_EXE_ck-subc-mcp"))
+    cortexkit_test_support::ckdev_binary(env!("CARGO_BIN_EXE_ck-subc-mcp"))
 }
 
 fn mcp_module_spec(
@@ -4444,7 +4444,7 @@ fn module_command(
     module_connection_file: &Path,
     xdg_config_home: &Path,
 ) -> Command {
-    let mut command = Command::from(subc_test_support::dev_command(ckdev_subc_mcp()));
+    let mut command = Command::from(cortexkit_test_support::dev_command(ckdev_subc_mcp()));
     command
         .arg("module")
         .arg("--subc")
@@ -4486,7 +4486,7 @@ fn spawn_shim(
     project_root: &Path,
     xdg_config_home: &Path,
 ) -> ShimProcess {
-    let mut command = Command::from(subc_test_support::dev_command(ckdev_subc_mcp()));
+    let mut command = Command::from(cortexkit_test_support::dev_command(ckdev_subc_mcp()));
     command
         .arg("shim")
         .arg("--module-connection-file")
@@ -5138,8 +5138,8 @@ fn assert_unknown_tool_error(error: ServiceError, name: &str) {
     }
 }
 
-fn unique_temp_dir(label: &str) -> TestTempDir {
-    TestTempDir::new(label)
+fn unique_temp_dir(label: &str) -> ScratchDir {
+    ScratchDir::new(label)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

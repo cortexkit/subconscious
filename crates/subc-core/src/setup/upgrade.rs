@@ -993,7 +993,7 @@ mod tests {
     use crate::setup::test_exec::{copy_executable, write_executable};
     use crate::setup::{components::ReleaseArtifactSource, planner::plan_upgrade};
     #[cfg(unix)]
-    use subc_test_support::TestTempDir;
+    use cortexkit_test_support::ScratchDir;
 
     fn upgrade_target(binary: &str) -> UpgradeTarget {
         upgrade_roster(Component::ALL)
@@ -1005,8 +1005,8 @@ mod tests {
     // Used only by the unix-gated tests below; gate it with them so windows
     // clippy under -D warnings does not read it as dead code.
     #[cfg(unix)]
-    fn fixture_dir(name: &str) -> TestTempDir {
-        TestTempDir::new(name)
+    fn fixture_dir(name: &str) -> ScratchDir {
+        ScratchDir::new(name)
     }
 
     #[cfg(unix)]
@@ -1061,7 +1061,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn train_version_output_is_discovered_and_post_verified() {
-        let root = TestTempDir::new("train-version-output");
+        let root = ScratchDir::new("train-version-output");
         let target = upgrade_target("ck-mc");
         let version = "ck-mc-alpha.22464bf2";
         version_binary(&root.join("ck-mc"), version);
@@ -1074,7 +1074,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn successful_upgrade_completion_removes_its_rollback_copy() {
-        let root = TestTempDir::new("upgrade-completed-rollback");
+        let root = ScratchDir::new("upgrade-completed-rollback");
         let target = upgrade_target("ck-mc");
         version_binary(&root.join("ck-mc"), "0.1.0");
         let mut backend = isolated_backend(&root, target);
@@ -1089,7 +1089,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn post_verification_rejects_a_destination_changed_after_replacement() {
-        let root = TestTempDir::new("changed-post-inode");
+        let root = ScratchDir::new("changed-post-inode");
         let target = upgrade_target("ck-mc");
         let destination = root.join("ck-mc");
         version_binary(&destination, "0.1.0");
@@ -1119,7 +1119,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn train_release_post_verifies_the_binarys_own_version() {
-        let root = TestTempDir::new("train-post-verify");
+        let root = ScratchDir::new("train-post-verify");
         let target = upgrade_target("ck-mc");
         version_binary(&root.join("ck-mc"), "0.1.0");
         let mut backend = isolated_backend(&root, target);
@@ -1562,7 +1562,7 @@ exit 1
     #[test]
     fn completion_line_follows_the_planned_from_not_the_self_report() {
         let mcp = upgrade_target("ck-subc-mcp");
-        let root = TestTempDir::new("completion-line");
+        let root = ScratchDir::new("completion-line");
         let inventory =
             Inventory::load(root.join("installer-manifest.json"), "linux-x64").expect("inventory");
         let mut backend = SystemUpgradeBackend {

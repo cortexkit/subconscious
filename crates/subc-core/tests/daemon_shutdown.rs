@@ -1,5 +1,6 @@
 #![cfg(unix)]
 
+use cortexkit_test_support::{dev_command, process_alive, wait_until_gone, ScratchDir};
 use std::{
     fs,
     os::unix::process::CommandExt,
@@ -9,7 +10,6 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use subc_test_support::{dev_command, process_alive, wait_until_gone, TestTempDir};
 
 use serde_json::{json, Value};
 use subc_daemon::{read_frame, write_frame, Frame};
@@ -22,7 +22,7 @@ mod common;
 static DAEMON_GATE: Mutex<()> = Mutex::new(());
 
 struct Fixture {
-    root: TestTempDir,
+    root: ScratchDir,
     child: Child,
     _permit: MutexGuard<'static, ()>,
 }
@@ -238,7 +238,7 @@ impl Drop for Fixture {
 /// starts each job in a new session). That is what lets a test compare a
 /// module's group against the daemon's, and reproduce the service manager's
 /// kill of that group after the daemon exits.
-fn spawn_daemon(root: &TestTempDir) -> Child {
+fn spawn_daemon(root: &ScratchDir) -> Child {
     dev_command(common::ckdev_subc())
         .process_group(0)
         .env("XDG_DATA_HOME", root.join("data"))
@@ -269,19 +269,19 @@ fn merge_module(module: &mut Value, extra: &Value) {
 
 /// A scratch directory no other test, and no earlier run, can share.
 ///
-/// `subc_test_support::TestTempDir` names a directory `<label>-<pid>-<counter>`, which is unique
+/// `cortexkit_test_support::ScratchDir` names a directory `<label>-<pid>-<counter>`, which is unique
 /// among live test processes, but it keeps a failed test's directory on disk
 /// and `create_dir_all` accepts an existing one. A later run whose pid and
 /// counter repeat would then read a stale `events.jsonl`, and a leftover
 /// `teardown_complete` or pid file would pass or fail a test for reasons that
 /// have nothing to do with the daemon. The nanosecond stamp makes the name new,
 /// and the emptiness check refuses to run if it somehow is not.
-fn fresh_dir(label: &str) -> TestTempDir {
+fn fresh_dir(label: &str) -> ScratchDir {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let dir = TestTempDir::new(&format!("{label}-{nanos}"));
+    let dir = ScratchDir::new(&format!("{label}-{nanos}"));
     assert!(
         fs::read_dir(&*dir).unwrap().next().is_none(),
         "scratch directory {} already has contents",

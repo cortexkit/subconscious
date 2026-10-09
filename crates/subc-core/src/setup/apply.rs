@@ -964,7 +964,7 @@ mod tests {
 mod adoption_tests {
     use super::*;
     use crate::setup::test_exec::write_executable;
-    use subc_test_support::TestTempDir;
+    use cortexkit_test_support::ScratchDir;
 
     /// Rollback after a later refusal must delete only what this run wrote.
     /// An adopted binary existed before the run (and may be the image a
@@ -973,7 +973,7 @@ mod adoption_tests {
     /// binaries to the other behaviour.
     #[test]
     fn rollback_deletes_placed_binaries_but_only_unrecords_adopted_ones() {
-        let root = TestTempDir::new("setup-rollback-adopted");
+        let root = ScratchDir::new("setup-rollback-adopted");
         let binary_home = root.join("bin");
         fs::create_dir_all(&binary_home).unwrap();
         let placed = binary_home.join("ck-claustrum");
@@ -1030,7 +1030,7 @@ mod adoption_tests {
 
     #[test]
     fn bootstrap_placed_ck_is_adopted_as_managed_binary() {
-        let root = TestTempDir::new("setup-adopt-running-ck");
+        let root = ScratchDir::new("setup-adopt-running-ck");
         let binary_home = root.join("bin");
         fs::create_dir_all(&binary_home).unwrap();
         let placed = binary_home.join("ck");
@@ -1093,7 +1093,7 @@ mod adoption_tests {
 
     #[test]
     fn adoption_copies_bootstrap_archive_digest_when_present() {
-        let root = TestTempDir::new("setup-adopt-archive-digest");
+        let root = ScratchDir::new("setup-adopt-archive-digest");
         let binary_home = root.join("bin");
         fs::create_dir_all(&binary_home).unwrap();
         let placed = binary_home.join("ck");

@@ -20,8 +20,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+use cortexkit_test_support::{
+    ckdev_binary, dev_command, process_alive, wait_until_gone, ScratchDir,
+};
 use serde_json::{json, Value};
-use subc_test_support::{ckdev_binary, dev_command, process_alive, wait_until_gone, TestTempDir};
 
 // Real daemons compete with other integration binaries for spawn and
 // registration resources; serializing this file keeps the deadlines honest.
@@ -32,7 +34,7 @@ const MODULE_ID: &str = "wire-less";
 /// One scratch tree: a data home and config home shared by every daemon in
 /// the test, and one runtime directory per name handed to `spawn_daemon`.
 struct Tree {
-    root: TestTempDir,
+    root: ScratchDir,
     daemons: Vec<Child>,
     _permit: MutexGuard<'static, ()>,
 }
@@ -44,7 +46,7 @@ impl Tree {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = TestTempDir::new(&format!("{label}-{nanos}"));
+        let root = ScratchDir::new(&format!("{label}-{nanos}"));
         assert!(
             fs::read_dir(&*root).unwrap().next().is_none(),
             "scratch directory {} already has contents",
@@ -408,12 +410,8 @@ fn scope_sync_stub_exits_when_daemon_is_sigkilled() {
         thread::sleep(Duration::from_millis(10));
     };
     tree.kill_daemon(daemon);
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while process_alive(pid) {
-        assert!(
-            Instant::now() < deadline,
-            "scope-sync stub {pid} survived daemon SIGKILL"
-        );
-        thread::sleep(Duration::from_millis(10));
-    }
+    assert!(
+        wait_until_gone(pid, Duration::from_secs(5)),
+        "scope-sync stub {pid} survived daemon SIGKILL"
+    );
 }

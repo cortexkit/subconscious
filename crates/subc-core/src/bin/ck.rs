@@ -8693,8 +8693,8 @@ mod tests {
     }
 
     use super::*;
+    use cortexkit_test_support::ScratchDir;
     use subc_control::{StderrCaptureState, StderrTail, StderrTailEntry};
-    use subc_test_support::TestTempDir;
 
     #[test]
     fn provenance_value_escapes_terminal_controls() {
@@ -10378,8 +10378,8 @@ mod tests {
         assert!(top_help().contains("upgrade"));
     }
 
-    fn triage_fixture_dir(name: &str) -> TestTempDir {
-        TestTempDir::new(name)
+    fn triage_fixture_dir(name: &str) -> ScratchDir {
+        ScratchDir::new(name)
     }
 
     fn write_triage_connection(path: &Path, pid: u32, key: &str) {

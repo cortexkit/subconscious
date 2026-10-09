@@ -5198,7 +5198,7 @@ mod tests {
         use crate::scopes::ScopeTable;
         use subc_protocol::{error_codes, scope::ScopeSelector, Principal};
 
-        let dir = subc_test_support::TestTempDir::new("configured-before-spawn");
+        let dir = cortexkit_test_support::ScratchDir::new("configured-before-spawn");
         let stub = |module_id: &str, program: PathBuf| ModuleSpec {
             module_id: module_id.to_string(),
             program,
@@ -5511,7 +5511,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn rescan_preserves_running_protocol_until_respawn() {
-        let dir = subc_test_support::TestTempDir::new("rescan-protocol");
+        let dir = cortexkit_test_support::ScratchDir::new("rescan-protocol");
         let initial = ModuleSpec {
             module_id: "rescan-protocol".into(),
             program: PathBuf::from("/bin/sleep"),
@@ -5567,7 +5567,7 @@ mod tests {
     #[tokio::test]
     async fn orphan_identity_matches_path_names_and_shebang_interpreters() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = subc_test_support::TestTempDir::new("spawn-image-identity");
+        let dir = cortexkit_test_support::ScratchDir::new("spawn-image-identity");
         let script = dir.join("module.sh");
         std::fs::write(&script, "#!/bin/sh\nwhile :; do sleep 0.1; done\n").unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -5670,7 +5670,7 @@ mod tests {
     #[tokio::test]
     async fn http_health_status_flips_ok_failing_ok() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let dir = subc_test_support::TestTempDir::new("http-status-flips");
+        let dir = cortexkit_test_support::ScratchDir::new("http-status-flips");
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let status = Arc::new(std::sync::atomic::AtomicU16::new(200));
         let serving_status = status.clone();
@@ -5755,7 +5755,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn http_health_no_listener_restarts_after_consecutive_failures() {
-        let dir = subc_test_support::TestTempDir::new("http-refused");
+        let dir = cortexkit_test_support::ScratchDir::new("http-refused");
         let unused = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/healthz", unused.local_addr().unwrap());
         drop(unused);
@@ -5912,7 +5912,7 @@ mod tests {
             );
             return;
         }
-        let dir = subc_test_support::TestTempDir::new("nats-http-monitoring");
+        let dir = cortexkit_test_support::ScratchDir::new("nats-http-monitoring");
         let monitor = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = monitor.local_addr().unwrap().port();
         let client = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -10265,7 +10265,7 @@ mod terminal_history_tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn protocol_none_unrequested_clean_exit_restarts_as_a_crash() {
-        let dir = subc_test_support::TestTempDir::new("none-unrequested-clean-exit");
+        let dir = cortexkit_test_support::ScratchDir::new("none-unrequested-clean-exit");
         let (spec, ready, marker) =
             protocol_none_sigterm_exits_clean_spec("none-unrequested-clean-exit", dir.path());
         let supervisor = Supervisor::new_for_test(
@@ -10458,7 +10458,7 @@ mod terminal_history_tests {
 
     #[tokio::test]
     async fn restart_budget_failure_remains_failed_when_journal_append_fails() {
-        let dir = subc_test_support::TestTempDir::new("budget-journal-failure");
+        let dir = cortexkit_test_support::ScratchDir::new("budget-journal-failure");
         let path = dir.join("terminals.jsonl");
         std::fs::create_dir(&path).unwrap();
         let supervisor = Supervisor::new_for_test(
@@ -10542,7 +10542,7 @@ mod terminal_history_tests {
             } else {
                 "none-requested-stop"
             };
-            let dir = subc_test_support::TestTempDir::new(label);
+            let dir = cortexkit_test_support::ScratchDir::new(label);
             let (spec, ready, marker) = protocol_none_sigterm_exits_clean_spec(label, dir.path());
             let supervisor = Supervisor::new_for_test(
                 Arc::new(Registry::default()),
@@ -10626,7 +10626,7 @@ mod terminal_history_tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn reload_exit_keeps_roster_until_terminal_is_recorded_during_shutdown() {
-        let dir = subc_test_support::TestTempDir::new("reload-roster-terminal-order");
+        let dir = cortexkit_test_support::ScratchDir::new("reload-roster-terminal-order");
         let record = dir.join("live-children.json");
         let supervisor = Supervisor::new_for_test(
             Arc::new(Registry::default()),
@@ -11355,8 +11355,8 @@ mod terminal_history_tests {
 #[cfg(all(test, unix))]
 mod health_event_tests {
     use super::*;
+    use cortexkit_test_support::ScratchDir;
     use subc_protocol::{manifest::Concurrency, session::ModuleControlResponse};
-    use subc_test_support::TestTempDir;
 
     struct Actor {
         module: SupervisedModule,
@@ -11365,7 +11365,7 @@ mod health_event_tests {
         spec: ModuleSpec,
         health: HealthConfig,
         rx: mpsc::Receiver<crate::router::OutboundFrame>,
-        _home: TestTempDir,
+        _home: ScratchDir,
     }
 
     async fn wait_for<T>(reason: &str, mut observe: impl FnMut() -> Option<T>) -> T {
@@ -11389,7 +11389,7 @@ mod health_event_tests {
 
     impl Actor {
         async fn start(protocol: ModuleProtocol, cadence: Duration) -> Self {
-            let home = TestTempDir::new("health-events");
+            let home = ScratchDir::new("health-events");
             let registry = Arc::new(Registry::default());
             let forwarding = Arc::new(ForwardingTable::default());
             let health = HealthConfig {
@@ -12537,18 +12537,18 @@ mod cgroup_placement_tests {
         SupervisedChild,
     };
     use crate::stderr_tail::{StderrRing, StderrTailConfig};
+    use cortexkit_test_support::ScratchDir;
     use std::{
         fs, io,
         path::{Path, PathBuf},
         sync::{Arc, Mutex},
     };
-    use subc_test_support::TestTempDir;
     use tokio::process::Command;
 
     #[tokio::test]
     async fn unique_spawn_cgroups_clean_up_across_restarts_and_shutdown() {
         use super::*;
-        let dir = TestTempDir::new("unique-spawn-cgroups");
+        let dir = ScratchDir::new("unique-spawn-cgroups");
         let root = PathBuf::from(format!(
             "/sys/fs/cgroup/subc-unique-test-{}-{}",
             std::process::id(),
@@ -12697,7 +12697,7 @@ mod cgroup_placement_tests {
 
     #[tokio::test]
     async fn reaping_a_child_removes_its_empty_module_cgroup() {
-        let root = TestTempDir::new("supervisor-reap-cgroup");
+        let root = ScratchDir::new("supervisor-reap-cgroup");
         fs::write(root.join("cgroup.procs"), b"").expect("write scratch cgroup marker");
         let placement = subc_cgroup::prepare_at(&root)
             .expect("prepare scratch cgroup root")
@@ -12743,7 +12743,7 @@ mod cgroup_placement_tests {
 
     #[test]
     fn non_empty_cgroup_removal_is_reported_without_blocking_teardown() {
-        let root = TestTempDir::new("supervisor-non-empty-cgroup");
+        let root = ScratchDir::new("supervisor-non-empty-cgroup");
         fs::write(root.join("cgroup.procs"), b"").expect("write scratch cgroup marker");
         let placement = subc_cgroup::prepare_at(&root)
             .expect("prepare scratch cgroup root")
@@ -12863,8 +12863,8 @@ mod spawn_subscriber_lag_tests {
 mod terminal_history_read_concurrency_tests {
     use super::*;
     use crate::terminal_journal::read_pause;
+    use cortexkit_test_support::ScratchDir;
     use std::sync::mpsc as std_mpsc;
-    use subc_test_support::TestTempDir;
 
     fn journaled_ring(
         journal: &Arc<crate::terminal_journal::TerminalJournal>,
@@ -12913,7 +12913,7 @@ mod terminal_history_read_concurrency_tests {
     /// the moment it started, and the next read has each exit exactly once.
     #[test]
     fn exits_recorded_during_a_paused_history_read_are_not_blocked_or_half_merged() {
-        let dir = TestTempDir::new("terminal-history-concurrent-read");
+        let dir = ScratchDir::new("terminal-history-concurrent-read");
         let path = dir.join("terminals.jsonl");
         let journal = Arc::new(crate::terminal_journal::TerminalJournal::open(
             path.clone(),
@@ -13181,12 +13181,12 @@ mod stderr_settle_tests {
 #[cfg(all(test, windows))]
 mod job_containment_tests {
     use super::*;
+    use cortexkit_test_support::ScratchDir;
     use std::{
         path::{Path, PathBuf},
         sync::{Arc, Mutex},
         time::{Duration, Instant},
     };
-    use subc_test_support::TestTempDir;
 
     /// The stub, expected beside this test executable.
     ///
@@ -13228,7 +13228,7 @@ mod job_containment_tests {
     /// Everything one fixture run needs, so the two tests below differ in exactly
     /// one place: whether the child is contained.
     struct Fixture {
-        _dir: TestTempDir,
+        _dir: ScratchDir,
         module_id: String,
         grandchild: u32,
         child: Option<SupervisedChild>,
@@ -13239,7 +13239,7 @@ mod job_containment_tests {
     }
 
     fn fixture(label: &str, module_id: &str) -> Fixture {
-        let dir = TestTempDir::new(label);
+        let dir = ScratchDir::new(label);
         let pid_file = dir.join("grandchild.pid");
         let supervisor = Supervisor::new_for_test(
             Arc::new(Registry::default()),
@@ -13346,7 +13346,7 @@ mod job_containment_tests {
     /// the job object and the containment claim is unproven.
     #[test]
     fn an_uncontained_grandchild_survives_a_direct_child_kill() {
-        let dir = TestTempDir::new("teardown-uncontained");
+        let dir = ScratchDir::new("teardown-uncontained");
         let pid_file = dir.join("grandchild.pid");
         let mut child = std::process::Command::new(stub_path())
             .env("FAKE_AFT_NEVER_CONNECT", "1")
@@ -13542,7 +13542,7 @@ mod privacy_exec_boundary_tests {
     async fn macos_roster_withholds_a_nonnull_trampoline_image_until_exec_confirmation() {
         #[cfg(target_os = "macos")]
         {
-            let root = subc_test_support::TestTempDir::new("privacy-roster-barrier");
+            let root = cortexkit_test_support::ScratchDir::new("privacy-roster-barrier");
             // Loopback sockets also work when the replay adapter's TMPDIR is
             // longer than Darwin's Unix-domain socket path limit.
             let exec_listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -13682,15 +13682,15 @@ mod privacy_exec_boundary_tests {
 mod launch_nonce_descriptor_tests {
     use super::{ChildRoster, ModuleProtocol, ModuleSpec, SupervisorHandle};
     use crate::stderr_tail::{StderrRing, StderrTailConfig};
+    use cortexkit_test_support::ScratchDir;
     use std::{
         path::PathBuf,
         sync::{Arc, Mutex},
         time::{Duration, Instant},
     };
-    use subc_test_support::TestTempDir;
 
     async fn probe(role: super::SpawnRole) {
-        let scratch = TestTempDir::new("launch-nonce-descriptor");
+        let scratch = ScratchDir::new("launch-nonce-descriptor");
         let fd_copy = scratch.join("from-descriptor");
         let env_copy = scratch.join("environment");
         let script = format!(
@@ -13775,7 +13775,7 @@ mod launch_nonce_descriptor_tests {
 #[cfg(all(test, target_os = "linux"))]
 mod cgroup_containment_tests {
     use super::*;
-    use subc_test_support::TestTempDir;
+    use cortexkit_test_support::ScratchDir;
 
     fn running(pid: u32) -> bool {
         // An orphan can remain a zombie until the container init reaps it.
@@ -13799,7 +13799,7 @@ mod cgroup_containment_tests {
     }
 
     async fn teardown_tree(test_name: &str, shutdown: bool) {
-        let dir = TestTempDir::new(test_name);
+        let dir = ScratchDir::new(test_name);
         let root = PathBuf::from(format!(
             "/sys/fs/cgroup/subc-tree-test-{test_name}-{}-{}",
             std::process::id(),

@@ -12,6 +12,7 @@ use std::{
     time::Duration,
 };
 
+use cortexkit_test_support::ScratchDir;
 use subc_client_rs::{
     async_trait, serve, serve_from_env_with_handle, HandlerOutcome, ModuleHandler, RequestCtx,
     SubcModuleError,
@@ -21,7 +22,6 @@ use subc_protocol::{
     manifest::ModuleManifest, Flags, Frame, FrameType, ModuleHelloAckBody, ModuleHelloBody,
     Priority, PROTOCOL_VERSION, SUBC_MODULE_ID_ENV,
 };
-use subc_test_support::TestTempDir;
 use subc_transport::{
     authenticate_server, generate_daemon_id, generate_key, read_frame, write_atomic, write_frame,
     ConnectionInfo, Endpoint, SCHEMA_VERSION,
@@ -143,7 +143,7 @@ fn add_subc_arg(command: &mut Command, connection_file: &Path, equals: bool) {
 }
 
 async fn registered_child(entry: &str, equals: bool, module_id: Option<&str>, secret: Secret) {
-    let dir = TestTempDir::new("subc-client-env-entry");
+    let dir = ScratchDir::new("subc-client-env-entry");
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let connection = ConnectionInfo {
         schema: SCHEMA_VERSION,
@@ -295,7 +295,7 @@ async fn env_entrypoints_preserve_the_same_launch_errors() {
                     .unwrap(),
             );
         }
-        let dir = TestTempDir::new("subc-client-env-missing-file");
+        let dir = ScratchDir::new("subc-client-env-missing-file");
         assert_child(
             command(entry)
                 .arg("--subc")

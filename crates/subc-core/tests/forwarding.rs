@@ -8,6 +8,7 @@ use std::{
     time::Duration,
 };
 
+use cortexkit_test_support::ScratchDir;
 use serde_json::Value;
 use subc_control::{
     ClientControlRequest, ClientControlResponse, ConsumerIdentity, ModuleProtocol, PollKind,
@@ -26,7 +27,6 @@ use subc_protocol::{
     BindIdentity, ErrorBody, Flags, FrameType, ModuleHelloAckBody, ModuleHelloBody, Priority,
     RouteTarget, FLAG_SUBSCRIPTION, PROTOCOL_VERSION,
 };
-use subc_test_support::TestTempDir;
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt},
     net::TcpStream,
@@ -8577,13 +8577,13 @@ fn stub_events(path: &Path) -> Vec<Value> {
 }
 
 struct TestProject {
-    temp: TestTempDir,
+    temp: ScratchDir,
 }
 
 impl TestProject {
     fn new() -> Self {
         Self {
-            temp: TestTempDir::new("forwarding-project"),
+            temp: ScratchDir::new("forwarding-project"),
         }
     }
 

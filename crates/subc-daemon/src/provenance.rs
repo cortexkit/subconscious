@@ -314,7 +314,7 @@ impl ImageDigestCache {
 
 #[cfg(test)]
 mod tests {
-    use subc_test_support::TestTempDir;
+    use cortexkit_test_support::ScratchDir;
     // Only the linux sha256 tests open files directly, and only non-linux
     // platforms assert the unavailable arm; each import gates with its users
     // so the other platforms' clippy does not fail them as unused.
@@ -330,8 +330,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     use subc_control::RunningImageUnavailableReason;
 
-    fn temp_dir(label: &str) -> TestTempDir {
-        TestTempDir::new(label)
+    fn temp_dir(label: &str) -> ScratchDir {
+        ScratchDir::new(label)
     }
 
     /// A live child running a copy of `sleep` that the test owns, returned
@@ -641,7 +641,7 @@ mod tests {
             1,
             "the 65th identity clears the 64-entry cache"
         );
-        // No manual cleanup: the subc_test_support::TestTempDir guard removes the tree on drop and
+        // No manual cleanup: the cortexkit_test_support::ScratchDir guard removes the tree on drop and
         // deliberately preserves it when the test panics.
     }
 

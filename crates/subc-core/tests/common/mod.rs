@@ -2,6 +2,7 @@
 
 pub mod scripted_daemon;
 
+use cortexkit_test_support::{ckdev_binary, dev_command, ScratchDir};
 use std::{
     io,
     net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -10,7 +11,6 @@ use std::{
     sync::{Arc, Once},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use subc_test_support::{ckdev_binary, dev_command, TestTempDir};
 
 use subc_daemon::{
     serve_listener, ConnectedClients, ControlHandler, ForwardingTable, ModuleProcessLiveness,
@@ -44,8 +44,8 @@ const TEST_DAEMON_VER: &str = "test-subc";
 const TEST_AUTH_DEADLINE: Duration = Duration::from_secs(2);
 
 /// The daemon binary (`ck-subc`) published as `ckdev-subc` (see
-/// `subc_test_support::ckdev_binary`); also the privacy trampoline tests hand
-/// to a `Supervisor`.
+/// `cortexkit_test_support::ckdev_binary`). Privacy trampoline tests also pass
+/// this binary's path to a `Supervisor` as its trampoline executable.
 pub fn ckdev_subc() -> PathBuf {
     ckdev_binary(env!("CARGO_BIN_EXE_ck-subc"))
 }
@@ -95,7 +95,7 @@ pub struct TestDaemon {
     pub registry: Arc<Registry>,
     pub forwarding: Arc<ForwardingTable>,
     pub connection_file_path: PathBuf,
-    pub temp_dir: TestTempDir,
+    pub temp_dir: ScratchDir,
     pub task: JoinHandle<Result<(), subc_daemon::ServerError>>,
 }
 
@@ -108,7 +108,7 @@ impl TestDaemon {
 impl Drop for TestDaemon {
     fn drop(&mut self) {
         self.task.abort();
-        // The temp dir is owned by the `subc_test_support::TestTempDir` guard, whose `Drop` removes
+        // The temp dir is owned by the `cortexkit_test_support::ScratchDir` guard, whose `Drop` removes
         // the tree (or preserves it on panic).
     }
 }
@@ -299,6 +299,6 @@ pub async fn connect_authed_client(path: impl AsRef<Path>) -> io::Result<TcpStre
     Ok(stream)
 }
 
-fn unique_temp_dir(name: &str) -> TestTempDir {
-    TestTempDir::new(name)
+fn unique_temp_dir(name: &str) -> ScratchDir {
+    ScratchDir::new(name)
 }

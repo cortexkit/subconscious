@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.10.1
+
+- Test-only: the tests' helpers (temporary directories, process-liveness checks, and copies of test programs under `ckdev-` names) now come from the published `cortexkit-test-support` crate, which other CortexKit repositories also use, instead of a private copy in this repository. No runtime change.
+
 ## 0.10.0
 
 - Takes subc-protocol 0.29.0: `ToolCallRequest.preset` and `ScopeAttributes.flow_id` are optional wire fields, but this release is breaking for Rust struct literals. Update protocol and transport dependencies together to avoid incompatible public protocol types.

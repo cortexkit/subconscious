@@ -1772,7 +1772,7 @@ mod tests {
 
     /// Reads a capture file written through the production sink.
     async fn capture_through_file_sink(chunks: Vec<Vec<u8>>) -> (String, u64, u64) {
-        let temp = subc_test_support::TestTempDir::new("stderr-capture-stamp");
+        let temp = cortexkit_test_support::ScratchDir::new("stderr-capture-stamp");
         let path = temp.path().join("stamped.stderr.log");
         let sink = ChildOutputSink::open(&path, cortexkit_log::Retention::default()).unwrap();
         let ring = shared(10, 10_000, 128);

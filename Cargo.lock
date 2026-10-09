@@ -4,13 +4,13 @@ version = 4
 
 [[package]]
 name = "agent-token-vectors"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
+ "cortexkit-test-support",
  "ed25519-dalek",
  "hex",
  "serde",
  "serde_json",
- "subc-test-support",
 ]
 
 [[package]]
@@ -264,7 +264,7 @@ dependencies = [
 
 [[package]]
 name = "ck-bus"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "async-nats",
  "async-trait",
@@ -274,6 +274,7 @@ dependencies = [
  "cortexkit-bus-nats",
  "cortexkit-bus-trait",
  "cortexkit-store-types",
+ "cortexkit-test-support",
  "data-encoding",
  "futures-util",
  "nkeys",
@@ -284,7 +285,6 @@ dependencies = [
  "subc-daemon",
  "subc-jsonc",
  "subc-protocol",
- "subc-test-support",
  "subc-transport",
  "syn 2.0.118",
  "tempfile",
@@ -443,6 +443,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94feb32be066be355bd3191fdf3de1f733a54a9cb84932413145b7b7f4b2135e"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "cortexkit-test-support"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "987f96b58d7a73a04dd34ffa7149f64c78914b1570a457e6c00cf0c7291aba1c"
+dependencies = [
+ "rustix",
+ "sha2",
+ "subc-os 0.1.10 (registry+https://github.com/rust-lang/crates.io-index)",
+ "tokio",
 ]
 
 [[package]]
@@ -1088,9 +1100,10 @@ dependencies = [
 
 [[package]]
 name = "mcp-stdio-adapter"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "cortexkit-log",
+ "cortexkit-test-support",
  "rustix",
  "serde",
  "serde_json",
@@ -1098,7 +1111,6 @@ dependencies = [
  "subc-jobobject",
  "subc-jsonc",
  "subc-protocol",
- "subc-test-support",
  "tokio",
  "tokio-util",
  "tracing",
@@ -1853,24 +1865,24 @@ checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 
 [[package]]
 name = "subc-cgroup"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
- "subc-test-support",
+ "cortexkit-test-support",
  "tokio",
 ]
 
 [[package]]
 name = "subc-client-rs"
-version = "0.26.3"
+version = "0.26.4"
 dependencies = [
  "async-trait",
+ "cortexkit-test-support",
  "serde",
  "serde_json",
  "sha2",
  "subc-control",
- "subc-os",
+ "subc-os 0.1.10",
  "subc-protocol",
- "subc-test-support",
  "subc-transport",
  "syn 2.0.118",
  "tokio",
@@ -1889,11 +1901,12 @@ dependencies = [
 
 [[package]]
 name = "subc-core"
-version = "0.20.68"
+version = "0.20.69"
 dependencies = [
  "base64",
  "cortexkit-log",
  "cortexkit-paths",
+ "cortexkit-test-support",
  "ed25519-dalek",
  "hex-literal",
  "rusqlite",
@@ -1905,9 +1918,8 @@ dependencies = [
  "subc-core",
  "subc-daemon",
  "subc-jsonc",
- "subc-os",
+ "subc-os 0.1.10",
  "subc-protocol",
- "subc-test-support",
  "subc-transport",
  "terminal_size",
  "tokio",
@@ -1917,10 +1929,11 @@ dependencies = [
 
 [[package]]
 name = "subc-daemon"
-version = "0.32.15"
+version = "0.32.16"
 dependencies = [
  "cortexkit-log",
  "cortexkit-paths",
+ "cortexkit-test-support",
  "fs4",
  "getrandom 0.2.17",
  "loom",
@@ -1934,10 +1947,9 @@ dependencies = [
  "subc-control",
  "subc-jobobject",
  "subc-jsonc",
- "subc-os",
+ "subc-os 0.1.10",
  "subc-presence",
  "subc-protocol",
- "subc-test-support",
  "subc-transport",
  "subc-uptime",
  "tokio",
@@ -1949,19 +1961,19 @@ dependencies = [
 name = "subc-daemon-consumer"
 version = "0.0.2"
 dependencies = [
+ "cortexkit-test-support",
  "serde_json",
  "subc-daemon",
  "subc-protocol",
- "subc-test-support",
  "subc-transport",
  "tokio",
 ]
 
 [[package]]
 name = "subc-jobobject"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
- "subc-test-support",
+ "cortexkit-test-support",
  "tokio",
  "windows-sys 0.61.2",
 ]
@@ -1975,9 +1987,10 @@ dependencies = [
 
 [[package]]
 name = "subc-mcp"
-version = "0.1.27"
+version = "0.1.28"
 dependencies = [
  "cortexkit-log",
+ "cortexkit-test-support",
  "rmcp",
  "serde",
  "serde_json",
@@ -1985,9 +1998,8 @@ dependencies = [
  "subc-control",
  "subc-daemon",
  "subc-jsonc",
- "subc-os",
+ "subc-os 0.1.10",
  "subc-protocol",
- "subc-test-support",
  "subc-transport",
  "tokio",
  "tracing",
@@ -1999,8 +2011,18 @@ version = "0.1.10"
 dependencies = [
  "libc",
  "rustix",
- "subc-os",
+ "subc-os 0.1.10",
  "tokio",
+]
+
+[[package]]
+name = "subc-os"
+version = "0.1.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "deaa591b1073aed5dcc9af687eb2bf45839bd3296a04b598b29cc2bee1bfe8d9"
+dependencies = [
+ "libc",
+ "rustix",
 ]
 
 [[package]]
@@ -2025,18 +2047,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "subc-test-support"
-version = "0.1.2"
-dependencies = [
- "rustix",
- "serde_json",
- "sha2",
-]
-
-[[package]]
 name = "subc-transport"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
+ "cortexkit-test-support",
  "getrandom 0.2.17",
  "hmac",
  "rustix",
@@ -2044,7 +2058,6 @@ dependencies = [
  "serde_json",
  "sha2",
  "subc-protocol",
- "subc-test-support",
  "subtle",
  "tokio",
 ]

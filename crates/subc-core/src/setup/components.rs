@@ -910,7 +910,7 @@ fn platform_binary(binary: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use subc_test_support::TestTempDir;
+    use cortexkit_test_support::ScratchDir;
 
     /// On unix the fake is a real shell script and the default `--version`
     /// execution runs unchanged, so the install path is exercised end to end.
@@ -959,8 +959,8 @@ mod tests {
         }
     }
 
-    fn fixture_dir(name: &str) -> TestTempDir {
-        TestTempDir::new(name)
+    fn fixture_dir(name: &str) -> ScratchDir {
+        ScratchDir::new(name)
     }
 
     fn fake_placement_digests(destination: &Path) -> Result<PlacementDigests, String> {
@@ -1030,7 +1030,7 @@ mod tests {
         fn inventory_with(
             name: &str,
             components: &[Component],
-        ) -> (TestTempDir, PathBuf, Inventory) {
+        ) -> (ScratchDir, PathBuf, Inventory) {
             let root = fixture_dir(name);
             let binary_home = root.join("bin");
             fs::create_dir_all(&binary_home).expect("binary home");

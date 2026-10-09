@@ -13,10 +13,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+use cortexkit_test_support::ScratchDir;
 use serde_json::{json, Value};
 use subc_control::{ClientControlRequest, ClientControlResponse};
 use subc_daemon::bootstrap::run_with_config;
-use subc_test_support::TestTempDir;
 use tokio::task::JoinHandle;
 
 use super::{claustrum::RealClaustrum, HarnessSigner};
@@ -39,7 +39,7 @@ pub enum ClaustrumSide<'a> {
 }
 
 pub struct SignerRun {
-    pub root: TestTempDir,
+    pub root: ScratchDir,
     /// The operator's real ckbus store, fingerprinted before the run; `shutdown` fails
     /// the run if anything under it changed.
     operator_dir: Option<PathBuf>,
@@ -54,26 +54,26 @@ pub struct SignerRun {
 impl SignerRun {
     /// Creates the run's tree without starting anything, so a ceremony can prepare the
     /// fixture vault under `data_home` first.
-    pub fn tree() -> TestTempDir {
-        let root = TestTempDir::new("ck-bus-signer");
+    pub fn tree() -> ScratchDir {
+        let root = ScratchDir::new("ck-bus-signer");
         for relative in ["data", "run/logs"] {
             fs::create_dir_all(root.join(relative)).expect("fixture directory must be creatable");
         }
         root
     }
 
-    pub fn data_home(root: &TestTempDir) -> PathBuf {
+    pub fn data_home(root: &ScratchDir) -> PathBuf {
         root.join("data")
     }
 
-    pub async fn start(root: TestTempDir, ck_bus: &Path, side: ClaustrumSide<'_>) -> Self {
+    pub async fn start(root: ScratchDir, ck_bus: &Path, side: ClaustrumSide<'_>) -> Self {
         Self::start_with(root, ck_bus, side, RunOptions::default()).await
     }
 
     /// `start`, with extra `ckbus` environment and, when given, a machine id the daemon
     /// serves on HELLO_ACK from a file inside the run's tree.
     pub async fn start_with(
-        root: TestTempDir,
+        root: ScratchDir,
         ck_bus: &Path,
         side: ClaustrumSide<'_>,
         options: RunOptions,
@@ -83,7 +83,7 @@ impl SignerRun {
 
     /// Runs a supervised relay as reserved `ckbus` for vault-authorization tests.
     /// This exercises Claustrum's grants, not the production ck-bus binary.
-    pub async fn start_vault_relay(root: TestTempDir, side: ClaustrumSide<'_>) -> Self {
+    pub async fn start_vault_relay(root: ScratchDir, side: ClaustrumSide<'_>) -> Self {
         Self::start_inner(
             root,
             Path::new(env!("CARGO_BIN_EXE_ck-bus")),
@@ -95,7 +95,7 @@ impl SignerRun {
     }
 
     async fn start_inner(
-        root: TestTempDir,
+        root: ScratchDir,
         ck_bus: &Path,
         side: ClaustrumSide<'_>,
         options: RunOptions,
@@ -242,7 +242,7 @@ impl SignerRun {
         }
     }
 
-    pub async fn shutdown(self) -> TestTempDir {
+    pub async fn shutdown(self) -> ScratchDir {
         for task in self.module_tasks {
             task.abort();
             let _ = task.await;

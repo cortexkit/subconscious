@@ -782,7 +782,7 @@ impl Error for ConnectionFileError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use subc_test_support::TestTempDir;
+    use cortexkit_test_support::ScratchDir;
 
     fn sample_info() -> ConnectionInfo {
         ConnectionInfo {
@@ -810,8 +810,8 @@ mod tests {
         std::env::temp_dir().join(name)
     }
 
-    fn unique_temp_dir(label: &str) -> TestTempDir {
-        TestTempDir::new(label)
+    fn unique_temp_dir(label: &str) -> ScratchDir {
+        ScratchDir::new(label)
     }
 
     #[cfg(unix)]
@@ -1153,7 +1153,7 @@ mod tests {
 
     #[test]
     fn write_atomic_sweeps_stale_temps_and_spares_recent_and_unrelated_files() {
-        let dir = TestTempDir::new("subc-sweep");
+        let dir = ScratchDir::new("subc-sweep");
         let target = dir.join("subc-connection.json");
 
         // A temp stranded by a dead writer: correct shape, old enough to sweep.

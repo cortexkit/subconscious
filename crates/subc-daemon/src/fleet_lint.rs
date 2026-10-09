@@ -418,7 +418,7 @@ async fn read_manifest(
     // Test fixtures must not inherit the operator's fleet paths. Keep the
     // environment on the child command, not the parallel test process.
     #[cfg(test)]
-    let isolated = subc_test_support::TestTempDir::new("fleet-lint-manifest");
+    let isolated = cortexkit_test_support::ScratchDir::new("fleet-lint-manifest");
     #[cfg(test)]
     command
         .env("XDG_DATA_HOME", isolated.path().join("data"))
@@ -521,7 +521,7 @@ mod tests {
     use subc_protocol::PROTOCOL_VERSION;
 
     use super::{lint_with_timeout, LintOutcome, LintReport, OperationalClass, MANIFEST_TIMEOUT};
-    use subc_test_support::TestTempDir as TempDir;
+    use cortexkit_test_support::ScratchDir as TempDir;
 
     #[derive(serde::Serialize)]
     struct FixtureSpec {

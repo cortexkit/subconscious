@@ -1,8 +1,8 @@
 use std::{error::Error, io, path::PathBuf, process, time::Duration};
 
+use cortexkit_test_support::ScratchDir as TestDir;
 use subc_daemon::{read_frame, write_frame, Frame};
 use subc_protocol::{Flags, FrameType, Priority};
-use subc_test_support::TestTempDir as TestDir;
 use subc_transport::{
     authenticate_client, authenticate_server, generate_daemon_id, generate_key,
     read_for_client as read_connection_file, write_atomic, ConnectionInfo, Endpoint,

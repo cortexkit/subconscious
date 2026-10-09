@@ -1,3 +1,4 @@
+use cortexkit_test_support::ScratchDir;
 use std::{
     error::Error,
     io,
@@ -5,7 +6,6 @@ use std::{
     process,
     time::Duration,
 };
-use subc_test_support::TestTempDir;
 
 use serde::{de::DeserializeOwned, Serialize};
 use subc_transport::{
@@ -485,12 +485,12 @@ async fn assert_no_client_auth(stream: &mut TcpStream) -> NoClientAuthObserved {
 }
 
 struct TestDir {
-    path: TestTempDir,
+    path: ScratchDir,
 }
 
 impl TestDir {
     fn new(name: &str) -> TestResult<Self> {
-        let path = TestTempDir::new(&format!("subc-auth-handshake-{name}"));
+        let path = ScratchDir::new(&format!("subc-auth-handshake-{name}"));
         Ok(Self { path })
     }
 

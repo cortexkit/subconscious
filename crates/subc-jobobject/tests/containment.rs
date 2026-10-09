@@ -11,12 +11,12 @@
 
 #![cfg(windows)]
 
+use cortexkit_test_support::ScratchDir;
 use std::{
     path::PathBuf,
     process::{Command, Stdio},
     time::Duration,
 };
-use subc_test_support::TestTempDir;
 
 use subc_jobobject::{process_exists, wait_for_process_exit, JobObject};
 
@@ -94,11 +94,11 @@ struct Fixture {
 }
 
 /// Wraps the workspace test guard with the fixture's existing `join` API.
-struct TempDir(TestTempDir);
+struct TempDir(ScratchDir);
 
 impl TempDir {
     fn new(label: &str) -> Self {
-        Self(TestTempDir::new(label))
+        Self(ScratchDir::new(label))
     }
 
     fn join(&self, name: &str) -> PathBuf {

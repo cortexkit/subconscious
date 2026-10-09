@@ -1,3 +1,4 @@
+use cortexkit_test_support::ScratchDir;
 use std::{
     collections::{BTreeMap, VecDeque},
     fmt, fs,
@@ -6,7 +7,6 @@ use std::{
     sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
-use subc_test_support::TestTempDir;
 
 use subc_control::{CatalogEntry, ClientControlRequest, ClientControlResponse};
 use subc_daemon::{
@@ -1770,13 +1770,13 @@ impl Drop for FrameInbox {
 }
 
 struct TestProject {
-    temp: TestTempDir,
+    temp: ScratchDir,
 }
 
 impl TestProject {
     fn new(name: &str) -> Self {
         Self {
-            temp: TestTempDir::new(name),
+            temp: ScratchDir::new(name),
         }
     }
 

@@ -1,6 +1,6 @@
 [package]
 name = "subc-jobobject"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 license = "MIT"
 publish = true
@@ -23,4 +23,4 @@ windows-sys = { version = "0.61", features = [
 unsafe_code = "deny"
 
 [dev-dependencies]
-subc-test-support = { path = "../subc-test-support" }
+cortexkit-test-support = "0.1.3"

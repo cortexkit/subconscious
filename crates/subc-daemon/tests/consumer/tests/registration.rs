@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use cortexkit_test_support::ScratchDir;
 use subc_daemon::{
     bootstrap::{run_with_config, BootstrapConfig},
     read_frame, write_frame, Frame,
@@ -8,7 +9,6 @@ use subc_protocol::{
     manifest::ModuleManifest, Flags, FrameType, ModuleHelloAckBody, ModuleHelloBody, Priority,
     PROTOCOL_VERSION,
 };
-use subc_test_support::TestTempDir;
 use subc_transport::{authenticate_client, connection_file};
 use tokio::{
     net::TcpStream,
@@ -17,7 +17,7 @@ use tokio::{
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn consumer_bootstraps_daemon_and_registers_module() {
-    let temp = TestTempDir::new("daemon-consumer-registration");
+    let temp = ScratchDir::new("daemon-consumer-registration");
     let connection_path = temp.join("subc-conn.json");
     let config = BootstrapConfig::new(&connection_path, 0)
         .with_terminal_journal_path(temp.join("terminals.jsonl"))

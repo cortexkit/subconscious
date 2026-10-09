@@ -201,8 +201,8 @@ impl Error for MachineIdFileError {
 mod tests {
     use super::*;
 
-    fn temp_dir(name: &str) -> subc_test_support::TestTempDir {
-        subc_test_support::TestTempDir::new(&format!("subc-machine-id-{name}"))
+    fn temp_dir(name: &str) -> cortexkit_test_support::ScratchDir {
+        cortexkit_test_support::ScratchDir::new(&format!("subc-machine-id-{name}"))
     }
 
     #[test]

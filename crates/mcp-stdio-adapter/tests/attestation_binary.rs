@@ -1,10 +1,10 @@
+use cortexkit_test_support::ScratchDir;
 use std::fs;
-use subc_test_support::TestTempDir;
 
 #[test]
 fn manifest_is_emitted_offline_before_startup_attestation() {
-    let home = TestTempDir::new("mcp-adapter-manifest");
-    let output = subc_test_support::dev_command(subc_test_support::ckdev_binary(env!(
+    let home = ScratchDir::new("mcp-adapter-manifest");
+    let output = cortexkit_test_support::dev_command(cortexkit_test_support::ckdev_binary(env!(
         "CARGO_BIN_EXE_ck-mcp-stdio-adapter"
     )))
     .env_clear()
@@ -39,8 +39,8 @@ fn manifest_is_emitted_offline_before_startup_attestation() {
 
 #[test]
 fn unattested_binary_exits_before_any_startup_connection_work() {
-    let home = TestTempDir::new("mcp-adapter-unattested");
-    let output = subc_test_support::dev_command(subc_test_support::ckdev_binary(env!(
+    let home = ScratchDir::new("mcp-adapter-unattested");
+    let output = cortexkit_test_support::dev_command(cortexkit_test_support::ckdev_binary(env!(
         "CARGO_BIN_EXE_ck-mcp-stdio-adapter"
     )))
     .env_clear()
@@ -59,8 +59,8 @@ fn unattested_binary_exits_before_any_startup_connection_work() {
 
 #[test]
 fn adapter_startup_writes_dated_r2_segment() {
-    let home = TestTempDir::new("mcp-adapter-log");
-    let output = subc_test_support::dev_command(subc_test_support::ckdev_binary(env!(
+    let home = ScratchDir::new("mcp-adapter-log");
+    let output = cortexkit_test_support::dev_command(cortexkit_test_support::ckdev_binary(env!(
         "CARGO_BIN_EXE_ck-mcp-stdio-adapter"
     )))
     .env("XDG_DATA_HOME", home.path())

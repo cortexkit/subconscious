@@ -380,10 +380,10 @@ mod tests {
     use std::fs;
 
     use super::*;
-    use subc_test_support::TestTempDir;
+    use cortexkit_test_support::ScratchDir;
 
-    fn fixture_dir(name: &str) -> TestTempDir {
-        TestTempDir::new(name)
+    fn fixture_dir(name: &str) -> ScratchDir {
+        ScratchDir::new(name)
     }
 
     fn fixture_environment(directory: &Path) -> McEnvironment {

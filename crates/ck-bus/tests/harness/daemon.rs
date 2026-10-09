@@ -4,9 +4,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+use cortexkit_test_support::ScratchDir;
 use subc_control::{ClientControlRequest, ClientControlResponse};
 use subc_daemon::bootstrap::{run_with_config, BootstrapConfig};
-use subc_test_support::TestTempDir;
 use tokio::task::JoinHandle;
 
 use super::{
@@ -59,12 +59,12 @@ pub(super) fn ckdev_subc() -> &'static Path {
                     .flatten()
             })
             .expect("Cargo must report the ck-subc executable artifact");
-        subc_test_support::ckdev_binary(built)
+        cortexkit_test_support::ckdev_binary(built)
     })
 }
 
 pub struct AcceptanceRun {
-    pub root: TestTempDir,
+    pub root: ScratchDir,
     pub connection_file: PathBuf,
     pub config_file: PathBuf,
     pub claustrum: StubRecorder,
@@ -75,7 +75,7 @@ pub struct AcceptanceRun {
 
 impl AcceptanceRun {
     pub async fn start(binary: &Path) -> Self {
-        let root = TestTempDir::new("ck-bus-acceptance");
+        let root = ScratchDir::new("ck-bus-acceptance");
         for relative in ["data", "run/logs"] {
             fs::create_dir_all(root.join(relative))
                 .expect("observable fixture directory must be creatable");

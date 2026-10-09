@@ -21,6 +21,8 @@ use std::{
     time::Duration,
 };
 
+#[cfg(unix)]
+use cortexkit_test_support::ScratchDir;
 use subc_control::{ClientControlRequest, ModuleProtocol};
 use subc_daemon::{
     read_frame, write_frame, Frame, ModuleSpec, ModuleState, ModuleStatus, RestartPolicy,
@@ -29,8 +31,6 @@ use subc_daemon::{
 #[cfg(unix)]
 use subc_protocol::{BindIdentity, ErrorBody, RouteTarget};
 use subc_protocol::{Flags, FrameType, Priority};
-#[cfg(unix)]
-use subc_test_support::TestTempDir;
 use tokio::{
     io::AsyncWriteExt,
     time::{sleep, timeout, Instant},
@@ -327,7 +327,7 @@ async fn route_open_against_a_module_mid_restart_is_refused_as_reloading() {
     })
     .await;
 
-    let project = TestTempDir::new("drain-before-hello-project");
+    let project = ScratchDir::new("drain-before-hello-project");
     let mut client = connect_authed_client(&harness.daemon.connection_file_path)
         .await
         .unwrap();

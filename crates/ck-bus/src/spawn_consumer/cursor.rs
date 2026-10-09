@@ -116,7 +116,7 @@ mod tests {
 
     #[test]
     fn a_written_cursor_reads_back_and_damage_reads_as_damaged() {
-        let dir = subc_test_support::TestTempDir::new("ckbus-spawn-cursor");
+        let dir = cortexkit_test_support::ScratchDir::new("ckbus-spawn-cursor");
         let store = CursorStore::new(&dir);
         let _ = std::fs::remove_file(store.path());
         assert_eq!(store.read(), CursorRead::Absent);

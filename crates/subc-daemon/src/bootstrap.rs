@@ -1577,12 +1577,12 @@ impl Error for BootstrapError {
 mod tests {
     use super::*;
     use crate::server::ServerAuth;
+    use cortexkit_test_support::ScratchDir;
     #[cfg(target_os = "linux")]
     use std::collections::BTreeSet;
     use std::sync::Mutex;
     #[cfg(target_os = "linux")]
     use subc_control::ModuleProtocol;
-    use subc_test_support::TestTempDir;
     use subc_transport::MIN_KEY_LEN;
     use tokio::io::AsyncReadExt;
     use tokio::task::JoinHandle;
@@ -1761,11 +1761,11 @@ mod tests {
         }
     }
 
-    fn unique_temp_dir(name: &str) -> TestTempDir {
-        TestTempDir::new(name)
+    fn unique_temp_dir(name: &str) -> ScratchDir {
+        ScratchDir::new(name)
     }
 
-    fn temp_connection_file_path(name: &str) -> (TestTempDir, PathBuf) {
+    fn temp_connection_file_path(name: &str) -> (ScratchDir, PathBuf) {
         let dir = unique_temp_dir(name);
         let path = dir.join("conn.json");
         (dir, path)
@@ -2218,7 +2218,7 @@ mod tests {
 
     #[tokio::test]
     async fn unpublished_boot_holds_singleton_lock_until_publication() {
-        let dir = TestTempDir::new("unpublished-singleton-lock");
+        let dir = ScratchDir::new("unpublished-singleton-lock");
         let path = dir.join("connection.json");
         let bound = expect_bound(
             ensure_singleton_inner(BootstrapConfig::new(&path, 0), false)
@@ -2237,7 +2237,7 @@ mod tests {
 
     #[tokio::test]
     async fn readiness_probe_requires_an_authenticating_server() {
-        let dir = TestTempDir::new("unserved-readiness");
+        let dir = ScratchDir::new("unserved-readiness");
         let bound = expect_bound(
             ensure_singleton_inner(BootstrapConfig::new(dir.join("connection.json"), 0), false)
                 .await
@@ -2253,7 +2253,7 @@ mod tests {
     #[tokio::test]
     async fn orphan_sweep_finishes_before_connection_file_publication() {
         use crate::live_children::{ExecutableIdentity, LiveChild};
-        let dir = TestTempDir::new("publish-after-sweep");
+        let dir = ScratchDir::new("publish-after-sweep");
         let path = dir.join("connection.json");
         let record = dir.join("live-children.json");
         let ready = dir.join("ready");
@@ -2334,7 +2334,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_nofile_raise_clamps_to_kernel_ceiling() {
-        let dir = TestTempDir::new("nofile-ceiling");
+        let dir = ScratchDir::new("nofile-ceiling");
         let result = dir.join("soft");
         let status = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "bootstrap::tests::nofile_raise_worker"])

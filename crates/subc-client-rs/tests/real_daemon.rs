@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use cortexkit_test_support::ScratchDir;
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     fs, io,
@@ -12,7 +13,6 @@ use std::{
     },
     time::Duration,
 };
-use subc_test_support::TestTempDir;
 
 use serde_json::{json, Value};
 use subc_client_rs::{
@@ -2125,8 +2125,8 @@ fn spawn_daemon_child(daemon_bin: &Path, runtime_dir: &Path, config_dir: &Path) 
         .join("data");
     // The daemon runs as `ckdev-subc`, never under the production `ck-subc`
     // name it was built with.
-    let daemon_bin = &subc_test_support::ckdev_binary(daemon_bin);
-    subc_test_support::dev_command(daemon_bin)
+    let daemon_bin = &cortexkit_test_support::ckdev_binary(daemon_bin);
+    cortexkit_test_support::dev_command(daemon_bin)
         .env_remove(subc_protocol::SUBC_MODULE_ID_ENV)
         .env_remove(subc_protocol::SUBC_LAUNCH_NONCE_ENV)
         .env_remove(subc_client_rs::launch_nonce::LAUNCH_NONCE_FD_ENV)
@@ -2306,7 +2306,7 @@ async fn wait_for_module_route(handler: &PushModuleHandler, channel: u16) -> Rou
 
 struct PolicyHarness {
     daemon: LiveDaemon,
-    _temp_dir: TestTempDir,
+    _temp_dir: ScratchDir,
     module: ModuleHandle,
     serve_task: tokio::task::JoinHandle<Result<(), SubcModuleError>>,
     handler: PolicyModuleHandler,
@@ -2374,7 +2374,7 @@ fn policy_resolver(consumer: SubcConsumer, hard_timeout: Duration) -> PolicyReso
     )
 }
 
-fn policy_project_root() -> (TestTempDir, String) {
+fn policy_project_root() -> (ScratchDir, String) {
     let root = unique_temp_dir("subc-client-rs-policy-project");
     let path = root.to_string_lossy().into_owned();
     (root, path)
@@ -2699,8 +2699,8 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
-fn unique_temp_dir(name: &str) -> TestTempDir {
-    TestTempDir::new(name)
+fn unique_temp_dir(name: &str) -> ScratchDir {
+    ScratchDir::new(name)
 }
 
 /// Issue #35: the #31 push family must be OBSERVABLE by a Rust consumer. The
@@ -3568,7 +3568,7 @@ const SCOPE_SYNC_CORR_BASE: u64 = 1_000_000;
 
 struct ScopeHarness {
     daemon: LiveDaemon,
-    _temp_dir: TestTempDir,
+    _temp_dir: ScratchDir,
     sync_path: PathBuf,
     owner_events: PathBuf,
     provider_events: PathBuf,
@@ -4243,7 +4243,7 @@ async fn start_drain_harness(
     name: &str,
     extra_env: &[(&str, &str)],
     module_settings: Value,
-) -> (TestTempDir, LiveDaemon, PathBuf) {
+) -> (ScratchDir, LiveDaemon, PathBuf) {
     let workspace = workspace_root();
     let daemon_bin = ensure_binary(
         &workspace,
@@ -4547,7 +4547,7 @@ const SDK_SCOPE_READER: &str = "subc-client-rs-sdk-scope-reader";
 
 struct ScopeOwnerRun {
     daemon: LiveDaemon,
-    _temp_dir: TestTempDir,
+    _temp_dir: ScratchDir,
     /// One entry per script step, in order: `{"ok": reply}`,
     /// `{"refused": {"code", "message"}}`, or `{"other": error}`.
     results: Vec<Value>,

@@ -9082,8 +9082,9 @@ mod tests {
         assert!(matches!(result, CallError::NotSent(_)));
     }
 
-    fn consumer_with_malformed_connection_file() -> (subc_test_support::TestTempDir, SubcConsumer) {
-        let temp = subc_test_support::TestTempDir::new("consumer-malformed-connection");
+    fn consumer_with_malformed_connection_file(
+    ) -> (cortexkit_test_support::ScratchDir, SubcConsumer) {
+        let temp = cortexkit_test_support::ScratchDir::new("consumer-malformed-connection");
         let path = temp.path().join("connection.json");
         std::fs::write(&path, b"not JSON").unwrap();
         #[cfg(unix)]

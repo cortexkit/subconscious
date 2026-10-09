@@ -107,7 +107,7 @@ mod tests {
 
     use super::*;
     use crate::setup::{inventory::Inventory, self_update, test_exec::copy_executable};
-    use subc_test_support::TestTempDir;
+    use cortexkit_test_support::ScratchDir;
 
     const TEST_NAME: &str =
         "setup::self_update_unix::tests::unix_self_update_keeps_running_process_on_original_inode";
@@ -116,8 +116,8 @@ mod tests {
     const HELPER_RESULT_PREFIX: &str = "CK_SELF_UPDATE_TEST_RESULT:";
     const HELPER_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 
-    fn fixture_dir(name: &str) -> TestTempDir {
-        TestTempDir::new(name)
+    fn fixture_dir(name: &str) -> ScratchDir {
+        ScratchDir::new(name)
     }
 
     fn wait_for_helper_line(receiver: &Receiver<String>, prefix: &str) -> String {
@@ -226,7 +226,7 @@ mod tests {
         inventory.record("binary-placement", &destination, Map::new());
         inventory.save().expect("save inventory");
 
-        let mut holder = subc_test_support::dev_command(&destination)
+        let mut holder = cortexkit_test_support::dev_command(&destination)
             .args(["--exact", TEST_NAME, "--nocapture"])
             .env(TEST_MODE, "hold")
             .env("CK_SELF_UPDATE_TEST_DESTINATION", &destination)
@@ -273,7 +273,7 @@ mod tests {
         assert!(wait_for_holder_exit(&mut holder).success());
         output_reader.join().expect("finish holder output reader");
 
-        let probe = subc_test_support::dev_command(&destination)
+        let probe = cortexkit_test_support::dev_command(&destination)
             .args(["--exact", TEST_NAME, "--nocapture"])
             .env(TEST_MODE, "probe")
             .env("CK_SELF_UPDATE_TEST_DESTINATION", &destination)

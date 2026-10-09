@@ -805,7 +805,7 @@ fn refused_audit_has_exact_fields_and_debug_escaped_summary() {
 #[cfg(feature = "test-support")]
 #[test]
 fn script_provider_is_ckdev_only_and_records_events() {
-    let dir = subc_test_support::TestTempDir::new("operator-script");
+    let dir = cortexkit_test_support::ScratchDir::new("operator-script");
     let script = dir.join("script");
     let events = dir.join("events");
     std::fs::write(
@@ -970,7 +970,7 @@ async fn adjacent_check_pairs_keep_the_first_refusal() {
 }
 
 async fn open_route_while_provider_runs(f: &Fixture, module: &mut Module, name: &str) {
-    let dir = subc_test_support::TestTempDir::new("operator-concurrent-route");
+    let dir = cortexkit_test_support::ScratchDir::new("operator-concurrent-route");
     let (client, mut rx) = ctx_fn(9000);
     let request = subc_control::ClientControlRequest::RouteOpen {
         target: subc_protocol::RouteTarget::ToolProvider {

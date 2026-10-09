@@ -166,7 +166,7 @@ mod tests {
     use std::{collections::BTreeMap, fs};
 
     use super::*;
-    use subc_test_support::TestTempDir;
+    use cortexkit_test_support::ScratchDir;
 
     fn metadata(checked_at_unix_secs: u64) -> UpdateMetadata {
         UpdateMetadata {
@@ -185,7 +185,7 @@ mod tests {
 
     #[test]
     fn old_cache_format_is_treated_as_absent() {
-        let _dir = TestTempDir::new("old-format");
+        let _dir = ScratchDir::new("old-format");
         let path = _dir.path().join("update-metadata.json");
         let cache = UpdateCache::new(&path);
         fs::write(&path, r#"{"checked_at_unix_secs":1,"targets":{}}"#).unwrap();
@@ -201,7 +201,7 @@ mod tests {
 
     #[test]
     fn absent_and_malformed_cache_files_are_distinct_from_valid_metadata() {
-        let _dir = TestTempDir::new("read-states");
+        let _dir = ScratchDir::new("read-states");
         let path = _dir.path().join("update-metadata.json");
         let cache = UpdateCache::new(&path);
         assert_eq!(cache.load(), CacheRead::Absent);

@@ -104,7 +104,7 @@ fn read_holder_pid(path: &Path) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use subc_test_support::TestTempDir;
+    use cortexkit_test_support::ScratchDir;
 
     /// Run the case in a fresh, single-test process. Other libtest workers may
     /// fork while a case holds a flock; their children retain the shared open
@@ -123,7 +123,7 @@ mod tests {
             );
             return;
         }
-        let root = TestTempDir::new("run-dir-lock-isolated");
+        let root = ScratchDir::new("run-dir-lock-isolated");
         let mut command = process::Command::new(std::env::current_exe().unwrap());
         command
             .args(["--exact", name, "--nocapture", "--test-threads=1"])
@@ -204,7 +204,7 @@ mod tests {
             }
         }
 
-        let dir = TestTempDir::new("run-dir-lock-fork-window");
+        let dir = ScratchDir::new("run-dir-lock-fork-window");
         let record = crate::live_children::record_path(&dir);
         let lock_path = dir.join(RUN_DIR_LOCK_FILE_NAME);
         let first = RunDirLock::acquire(&record).unwrap();
@@ -291,7 +291,7 @@ mod tests {
     }
 
     fn held_owner_and_release_case() {
-        let dir = TestTempDir::new("run-dir-lock-held");
+        let dir = ScratchDir::new("run-dir-lock-held");
         let record = crate::live_children::record_path(&dir);
         let first = RunDirLock::acquire(&record).unwrap();
         match RunDirLock::acquire(&record) {
@@ -310,7 +310,7 @@ mod tests {
 
     #[test]
     fn a_missing_run_dir_is_created() {
-        let dir = TestTempDir::new("run-dir-lock-missing");
+        let dir = ScratchDir::new("run-dir-lock-missing");
         let record = crate::live_children::record_path(&dir.join("run"));
         let lock = RunDirLock::acquire(&record).unwrap();
         assert_eq!(lock.live_children_record(), record);

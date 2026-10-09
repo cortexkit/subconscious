@@ -1,5 +1,6 @@
 use std::{ops::Deref, path::PathBuf, sync::Arc, time::Duration};
 
+use cortexkit_test_support::ScratchDir;
 use subc_control::{
     ChildMemoryKind, ChildResourceUnavailableReason, ChildResourceUsage, ClientControlRequest,
     ClientControlResponse, ModuleProtocol, SpawnCursor, SpawnEvent, SpawnEventKind, SpawnSnapshot,
@@ -11,7 +12,6 @@ use subc_daemon::{
     SupervisedModule, Supervisor, SupervisorHandle, SupervisorProcessLiveness,
 };
 use subc_protocol::{ErrorBody, Flags, FrameType, Priority};
-use subc_test_support::TestTempDir;
 use subc_transport::{read_frame, write_frame};
 use tokio::{
     io::AsyncWriteExt,
@@ -479,7 +479,7 @@ async fn failed_spawn_during_enable_allows_a_later_retry() {
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
     // A path that must NOT exist: the spawn is made to fail for real. The guard
     // owns the parent dir; the program path itself is a never-created child.
-    let _dir = TestTempDir::new("missing-enable-program");
+    let _dir = ScratchDir::new("missing-enable-program");
     let missing_program = _dir.path().join("missing-program");
     assert!(!missing_program.exists());
     let module = supervisor
@@ -662,7 +662,7 @@ async fn operator_restart_spawn_failure_lands_failed_not_restarting() {
 
     // Per-test copy of the stub so deleting it cannot affect parallel tests.
     // The guard owns the parent dir; the stub copy is a file inside it.
-    let _dir = TestTempDir::new("fake-aft-stub-copy");
+    let _dir = ScratchDir::new("fake-aft-stub-copy");
     let stub_copy = _dir.path().join("fake-aft-stub");
     common::copy_executable(
         std::path::Path::new(env!("CARGO_BIN_EXE_fake-aft-stub")),
@@ -1432,7 +1432,7 @@ async fn a_held_stderr_pipe_marks_the_tail_incomplete_and_its_late_output_stays_
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn child_stdout_and_stderr_reach_the_capture_file_while_only_stderr_reaches_the_ring() {
     let server = TestServer::start().await;
-    let capture = TestTempDir::new("child-output-capture");
+    let capture = ScratchDir::new("child-output-capture");
     let logs_dir = capture.join("logs");
     let supervisor =
         supervisor(&server, 0, Duration::from_millis(10)).with_capture_logs_dir(&logs_dir);
@@ -1514,7 +1514,7 @@ async fn child_stdout_and_stderr_reach_the_capture_file_while_only_stderr_reache
 async fn concurrent_child_pipes_never_tear_a_line_in_the_capture_file() {
     const BURST: usize = 150;
     let server = TestServer::start().await;
-    let capture = TestTempDir::new("child-output-burst");
+    let capture = ScratchDir::new("child-output-burst");
     let logs_dir = capture.join("logs");
     let supervisor =
         supervisor(&server, 0, Duration::from_millis(10)).with_capture_logs_dir(&logs_dir);

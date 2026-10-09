@@ -1,5 +1,5 @@
+use cortexkit_test_support::ScratchDir;
 use std::{collections::VecDeque, ops::Deref, path::Path, time::Duration};
-use subc_test_support::TestTempDir;
 
 use subc_control::{ClientControlRequest, ClientControlResponse};
 use subc_daemon::{read_frame, write_frame, ForwardingTable, Frame, Registry};
@@ -1045,13 +1045,13 @@ async fn wait_for_binding_count(forwarding: &ForwardingTable, expected: usize, w
 }
 
 struct TestProject {
-    temp: TestTempDir,
+    temp: ScratchDir,
 }
 
 impl TestProject {
     fn new(label: &str) -> Self {
         Self {
-            temp: TestTempDir::new(label),
+            temp: ScratchDir::new(label),
         }
     }
 

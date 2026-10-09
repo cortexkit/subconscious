@@ -13,7 +13,6 @@ members = [
     "crates/subc-os",
     "crates/subc-core",
     "crates/subc-daemon",
-    "crates/subc-test-support",
     "crates/subc-daemon/tests/consumer",
     "crates/ck-bus",
     "crates/subc-mcp",

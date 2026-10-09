@@ -1,9 +1,9 @@
+use cortexkit_test_support::ScratchDir;
 use std::{fs, process::Command};
-use subc_test_support::TestTempDir;
 
 #[test]
 fn generator_is_byte_identical_across_two_runs() {
-    let temp = TestTempDir::new("agent-token-vectors");
+    let temp = ScratchDir::new("agent-token-vectors");
     let first = temp.join("first.json");
     let second = temp.join("second.json");
 

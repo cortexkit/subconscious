@@ -15,8 +15,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+use cortexkit_test_support::ScratchDir;
 use serde_json::Value;
-use subc_test_support::TestTempDir;
 
 mod common;
 
@@ -28,7 +28,7 @@ const ADOPTED: &str = "fedcba9876543210fedcba9876543210";
 static DAEMON_GATE: Mutex<()> = Mutex::new(());
 
 struct Home {
-    root: TestTempDir,
+    root: ScratchDir,
     _permit: MutexGuard<'static, ()>,
 }
 
@@ -46,7 +46,7 @@ impl Drop for Daemon {
 impl Home {
     fn new(label: &str) -> Self {
         let permit = DAEMON_GATE.lock().unwrap_or_else(|p| p.into_inner());
-        let root = TestTempDir::new(label);
+        let root = ScratchDir::new(label);
         for dir in ["data", "config", "runtime"] {
             fs::create_dir_all(root.join(dir)).unwrap();
         }
@@ -78,7 +78,7 @@ impl Home {
     }
 
     fn spawn_daemon(&self) -> Child {
-        let mut command = subc_test_support::dev_command(common::ckdev_subc());
+        let mut command = cortexkit_test_support::dev_command(common::ckdev_subc());
         command.env("SUBC_CGROUP_PLACEMENT", "disabled");
         self.isolate(&mut command)
             .stdin(Stdio::null())

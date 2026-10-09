@@ -921,7 +921,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn retirement_returns_promptly_and_shutdown_waits_for_its_journal() {
-        let dir = subc_test_support::TestTempDir::new("background-retirement");
+        let dir = cortexkit_test_support::ScratchDir::new("background-retirement");
         let journal = dir.join("terminals.jsonl");
         let supervisor =
             Supervisor::new_for_test(Arc::new(Registry::default()), RestartPolicy::default())

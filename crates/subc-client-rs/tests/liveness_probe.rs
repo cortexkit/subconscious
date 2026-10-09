@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use cortexkit_test_support::ScratchDir;
 use std::{
     io,
     path::PathBuf,
@@ -10,7 +11,6 @@ use std::{
     },
     time::Duration,
 };
-use subc_test_support::TestTempDir;
 
 use subc_client_rs::{
     CallError, CallOptions, ConsumerOptions, OutcomeUnknownCause, RetryBackoff, SubcConsumer,
@@ -41,7 +41,7 @@ struct FakeDaemon {
     connection_file: PathBuf,
     connections: Arc<AtomicU64>,
     server_task: JoinHandle<()>,
-    _temp_dir: TestTempDir,
+    _temp_dir: ScratchDir,
 }
 
 impl FakeDaemon {
@@ -387,6 +387,6 @@ async fn send_frame(stream: &mut TcpStream, frame: Frame) -> io::Result<()> {
     stream.flush().await
 }
 
-fn unique_temp_dir(name: &str) -> TestTempDir {
-    TestTempDir::new(name)
+fn unique_temp_dir(name: &str) -> ScratchDir {
+    ScratchDir::new(name)
 }

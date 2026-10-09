@@ -3,6 +3,7 @@
 
 #[cfg(target_os = "macos")]
 mod macos {
+    use cortexkit_test_support::{ckdev_binary, dev_command, ScratchDir};
     use serde_json::{json, Value};
     use std::{
         fs,
@@ -12,10 +13,9 @@ mod macos {
         thread,
         time::{Duration, Instant},
     };
-    use subc_test_support::{ckdev_binary, dev_command, TestTempDir};
 
     pub struct Fixture {
-        pub root: TestTempDir,
+        pub root: ScratchDir,
         /// The daemon binary this fixture runs, placed under its `ckdev-`
         /// name in `root`. A trampoline's running image is compared with
         /// this file, not with the cargo build it was placed from.
@@ -34,7 +34,7 @@ mod macos {
             extra_env: Value,
             daemon_env: Value,
         ) -> Self {
-            let root = TestTempDir::new("privacy-identity");
+            let root = ScratchDir::new("privacy-identity");
             for directory in ["config/cortexkit", "runtime", "data/cortexkit/run"] {
                 fs::create_dir_all(root.join(directory)).unwrap();
             }
@@ -187,7 +187,7 @@ mod macos {
     }
 
     pub fn direct_control() {
-        let root = TestTempDir::new("privacy-direct-control");
+        let root = ScratchDir::new("privacy-direct-control");
         let report = root.join("observation.json");
         let mut child = Command::new(env!("CARGO_BIN_EXE_fake-aft-stub"))
             .env("FAKE_AFT_PRIVACY_REPORT", &report)

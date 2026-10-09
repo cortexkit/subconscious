@@ -9,6 +9,8 @@ use std::{sync::Arc, time::Duration};
 use std::fs;
 
 // Used by the linux AND macos match arms of assert_running_image_matches.
+#[cfg(target_os = "linux")]
+use cortexkit_test_support::ScratchDir;
 #[cfg(not(target_os = "windows"))]
 use subc_control::RunningImageEvidence;
 #[cfg(target_os = "windows")]
@@ -23,8 +25,6 @@ use subc_daemon::{
 };
 use subc_protocol::manifest::LaunchNonceSource;
 use subc_protocol::{Flags, FrameType, Priority};
-#[cfg(target_os = "linux")]
-use subc_test_support::TestTempDir;
 use tokio::{
     io::AsyncWriteExt,
     time::{sleep, timeout, Instant},
@@ -397,7 +397,7 @@ async fn supervisor_provenance_reports_a_reserved_module_reading_its_nonce_from_
         .with_handle(supervisor_handle)
         .with_drain_timeout(Duration::from_millis(25))
         .with_connection_file_path(daemon.connection_file_path.clone());
-    let scratch = subc_test_support::TestTempDir::new("provenance-nonce-source");
+    let scratch = cortexkit_test_support::ScratchDir::new("provenance-nonce-source");
     let xdg = |name: &str| (name.to_string(), scratch.join(name).display().to_string());
     let mut spec = stub_spec(
         "provenance-nonce-source",
@@ -624,8 +624,8 @@ fn assert_running_image_matches(result: &RunningImageAgreement) {
 }
 
 #[cfg(target_os = "linux")]
-fn unique_temp_dir(label: &str) -> TestTempDir {
-    TestTempDir::new(label)
+fn unique_temp_dir(label: &str) -> ScratchDir {
+    ScratchDir::new(label)
 }
 
 fn unix_ms() -> u64 {

@@ -2,7 +2,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const STEP_THRESHOLD_MS: i128 = 5_000;
 
-fn wall_now_ms() -> u64 {
+pub(crate) fn wall_now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()

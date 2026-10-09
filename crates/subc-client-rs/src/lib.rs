@@ -1268,8 +1268,10 @@ impl Error for CatalogUpdateError {}
 /// [`ModuleHandle::scope_describe`].
 ///
 /// Non-exhaustive so a later failure kind can be added without breaking
-/// callers' matches; match the variants you handle and treat the rest as an
-/// unverifiable answer.
+/// callers' matches. Match the variants you handle, and treat any other variant
+/// as a call whose effect you cannot know: after `scope_sync` or `scope_apply`,
+/// send a full `scope_sync` at a higher generation rather than assume the change
+/// did or did not apply.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ScopeCallError {

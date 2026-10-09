@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.29
+
+- Test-only: configure the `ck-subc` daemon executable to give each supervised test module a separate macOS privacy identity.
+
 ## 0.1.28
 
 - Test-only: the tests' helpers (temporary directories, process-liveness checks, and copies of test programs under `ckdev-` names) now come from the published `cortexkit-test-support` crate, which other CortexKit repositories also use, instead of a private copy in this repository. No runtime change.

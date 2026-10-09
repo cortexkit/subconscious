@@ -1,6 +1,8 @@
 #![forbid(unsafe_code)]
 
 use cortexkit_test_support::ScratchDir;
+#[cfg(target_os = "macos")]
+use std::sync::OnceLock;
 use std::{
     collections::BTreeMap,
     env, fs,
@@ -4284,16 +4286,70 @@ async fn start_test_daemon_with_process_liveness_and_supervisor(
     }
 }
 
+#[cfg(target_os = "macos")]
+fn privacy_trampoline() -> PathBuf {
+    static TRAMPOLINE: OnceLock<PathBuf> = OnceLock::new();
+    TRAMPOLINE
+        .get_or_init(|| {
+            let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+            let output = process::Command::new("cargo")
+                .args([
+                    "build",
+                    "--locked",
+                    "-p",
+                    "subc-core",
+                    "--bin",
+                    "ck-subc",
+                    "--message-format=json-render-diagnostics",
+                ])
+                .current_dir(workspace)
+                .output()
+                .expect("build the ck-subc privacy trampoline");
+            assert!(
+                output.status.success(),
+                "building ck-subc privacy trampoline failed\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let built_binary = String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .find_map(|message| {
+                    (message["reason"] == "compiler-artifact"
+                        && message["target"]["name"] == "ck-subc")
+                        .then(|| message["executable"].as_str().map(PathBuf::from))
+                        .flatten()
+                })
+                .unwrap_or_else(|| {
+                    panic!(
+                        "Cargo did not report the ck-subc executable\nstdout:\n{}\nstderr:\n{}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    )
+                });
+            assert!(
+                built_binary.exists(),
+                "ck-subc privacy trampoline was not built at {}",
+                built_binary.display()
+            );
+            cortexkit_test_support::ckdev_binary(built_binary)
+        })
+        .clone()
+}
+
 fn supervisor(server: &TestServer) -> Supervisor {
-    Supervisor::new(
+    let supervisor = Supervisor::new(
         Arc::clone(&server.daemon.registry),
         RestartPolicy::new(0, Duration::ZERO),
-    )
-    .with_process_liveness(Arc::clone(&server.process_liveness))
-    .with_forwarding(Arc::clone(&server.daemon.forwarding))
-    .with_handle(server.supervisor_handle.clone())
-    .with_drain_timeout(Duration::from_millis(25))
-    .with_connection_file_path(server.daemon.connection_file_path.clone())
+    );
+    #[cfg(target_os = "macos")]
+    let supervisor = supervisor.with_privacy_trampoline(privacy_trampoline());
+    supervisor
+        .with_process_liveness(Arc::clone(&server.process_liveness))
+        .with_forwarding(Arc::clone(&server.daemon.forwarding))
+        .with_handle(server.supervisor_handle.clone())
+        .with_drain_timeout(Duration::from_millis(25))
+        .with_connection_file_path(server.daemon.connection_file_path.clone())
 }
 
 fn stub_spec(module_id: &str, events_path: &Path, extra_env: &[(&str, &str)]) -> ModuleSpec {

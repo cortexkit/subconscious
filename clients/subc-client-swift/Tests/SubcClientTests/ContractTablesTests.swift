@@ -87,8 +87,10 @@ final class ContractTablesTests: XCTestCase {
         let tables = try decoder.decode(DecisionTables.self, from: data)
 
         // Route opens fail immediately in Swift, including a target that does
-        // not promise flow behaviour. Keep this terminal code in the wire record.
+        // not opt into flow or agent-run scope behaviour. Keep both refusals
+        // terminal in the shared wire record.
         XCTAssertEqual(tables.routeOpenRetryable["target_flow_unsupported"], "terminal")
+        XCTAssertEqual(tables.routeOpenRetryable["target_agent_run_unsupported"], "terminal")
 
         XCTAssertFalse(
             tables.routeOpenRetryable.isEmpty,

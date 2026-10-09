@@ -6,6 +6,10 @@ test("target_flow_unsupported is a terminal route.open refusal", () => {
   expect(isRetryableRouteOpenCode("target_flow_unsupported")).toBe(false);
 });
 
+test("target_agent_run_unsupported is a terminal route.open refusal", () => {
+  expect(isRetryableRouteOpenCode("target_agent_run_unsupported")).toBe(false);
+});
+
 test("module_removed is terminal while a reloading module remains retryable", () => {
   expect(isRetryableRouteOpenCode("module_reloading")).toBe(true);
   expect(isRetryableRouteOpenCode("module_removed")).toBe(false);

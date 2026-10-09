@@ -2269,8 +2269,9 @@ function isRouteOpenRefusal(err: unknown): err is SubcError & { code: string } {
 export function isRetryableRouteOpenCode(code: string | undefined): boolean {
   // A capability deny is policy, never a transient target-availability failure.
   if (code === "capability_forbidden") return false;
-  // Decoding a flow stamp alone does not promise flow behaviour.
+  // Targets must explicitly opt into flow and agent-run scope behaviour.
   if (code === "target_flow_unsupported") return false;
+  if (code === "target_agent_run_unsupported") return false;
   return (
     code === "module_reloading" ||
     code === "module_warming" ||

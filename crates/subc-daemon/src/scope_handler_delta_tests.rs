@@ -538,7 +538,8 @@ async fn scope_expiry_loop_sweeps_within_one_second_using_injected_wall_clock() 
     Arc::new(rig.handler.clone()).spawn_scope_expiry_loop();
     tokio::task::yield_now().await;
     assert!(rig.live(&route));
-    // Advancing the prompt timer alone cannot make wall time pass the deadline.
+    // Advancing Tokio's timer alone does not move the separately injected wall
+    // clock past the deadline, so the scope must survive this tick.
     tokio::time::advance(Duration::from_secs(1)).await;
     tokio::task::yield_now().await;
     assert!(rig.live(&route));

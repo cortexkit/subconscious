@@ -344,6 +344,14 @@ pub(crate) struct ExpirySwept {
     pub(crate) tag_changes: Vec<ScopeTagChange>,
 }
 
+/// One `scope.sync` (`end` is `None`: the records are the owner's whole set) or
+/// one `scope.apply` (`end` is `Some`: the records and ends are a delta).
+struct ScopeChange {
+    generation: u64,
+    scopes: Vec<ScopeRecord>,
+    end: Option<Vec<ScopeEnd>>,
+}
+
 /// A refused sync or apply leaves the table unchanged, including sync authority.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SyncRefusal {
@@ -671,9 +679,11 @@ impl ScopeTable {
             &mut state,
             connection_id,
             &is_current_launch,
-            generation,
-            scopes,
-            end,
+            ScopeChange {
+                generation,
+                scopes,
+                end,
+            },
         );
         self.owners.insert(
             owner.to_string(),
@@ -710,10 +720,13 @@ impl ScopeTable {
         state: &mut OwnerScopes,
         connection_id: ConnectionId,
         is_current_launch: &impl Fn(ConnectionId) -> bool,
-        generation: u64,
-        scopes: Vec<ScopeRecord>,
-        end: Option<Vec<ScopeEnd>>,
+        change: ScopeChange,
     ) -> Result<SyncApplied, SyncRefusal> {
+        let ScopeChange {
+            generation,
+            scopes,
+            end,
+        } = change;
         let taking_authority = Self::check_authority(state, connection_id, is_current_launch)?;
         if end.is_some() && (taking_authority || !state.synced) {
             return Err(SyncRefusal {

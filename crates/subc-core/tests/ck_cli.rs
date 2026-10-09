@@ -3763,30 +3763,16 @@ async fn wait_for_stub_request(path: &Path, channel: u16, corr: u64) {
 }
 
 fn scripted_supervisor_entry(module_id: &str, drain_timeout_ms: Option<u64>) -> SupervisorEntry {
-    SupervisorEntry {
-        launch_nonce_env: None,
-        module_id: module_id.to_string(),
-        state: "running".to_string(),
-        enabled: true,
-        live: true,
-        protocol: ModuleProtocol::Subc,
-        health: SupervisorHealthStatus::Ok,
-        pending_reload: None,
-        last_probe_ms: None,
-        last_exit_code: None,
-        last_exit_signal: None,
-        last_exit_ms: None,
-        last_exit_kind: None,
-        restart_count: Some(0),
-        max_restarts: Some(3),
-        lifetime_restarts: Some(0),
-        spawn_generation: Some(1),
-        restart_window_secs: Some(600),
-        drain_timeout_ms,
-        restart_backoff_ms: Some(100),
-        restart_max_backoff_ms: Some(30_000),
-        resources: None,
-    }
+    SupervisorEntry::new(module_id, "running", true, true, SupervisorHealthStatus::Ok)
+        .with_protocol(ModuleProtocol::Subc)
+        .with_restart_count(Some(0))
+        .with_max_restarts(Some(3))
+        .with_lifetime_restarts(Some(0))
+        .with_spawn_generation(Some(1))
+        .with_restart_window_secs(Some(600))
+        .with_drain_timeout_ms(drain_timeout_ms)
+        .with_restart_backoff_ms(Some(100))
+        .with_restart_max_backoff_ms(Some(30_000))
 }
 
 fn quota_wire_fixture() -> Value {

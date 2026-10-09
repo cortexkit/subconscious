@@ -6348,12 +6348,9 @@ mod tests {
     #[test]
     fn one_provider_with_an_illegal_tool_name_does_not_erase_the_others() {
         fn provider(module_id: &str, tool_names: &[&str]) -> CatalogEntry {
-            CatalogEntry {
-                module_id: module_id.to_string(),
-                ready: true,
-                not_ready: None,
-                module_version: None,
-                roles: vec![ProviderRole::ToolProvider {
+            CatalogEntry::new(
+                module_id,
+                vec![ProviderRole::ToolProvider {
                     tools: tool_names
                         .iter()
                         .map(|name| ManifestTool {
@@ -6368,10 +6365,8 @@ mod tests {
                     emits_push: false,
                     sub_supervises: false,
                 }],
-                control_ops: Vec::new(),
-                capabilities: None,
-                self_signals: None,
-            }
+                Vec::new(),
+            )
         }
 
         let modules = vec![
@@ -6433,15 +6428,9 @@ mod tests {
 
     #[test]
     fn combined_tool_names_are_limited_to_64_characters() {
-        let modules = vec![CatalogEntry {
-            module_id: "provider".to_owned(),
-            ready: true,
-            not_ready: None,
-            module_version: None,
-            control_ops: Vec::new(),
-            capabilities: None,
-            self_signals: None,
-            roles: vec![ProviderRole::ToolProvider {
+        let modules = vec![CatalogEntry::new(
+            "provider",
+            vec![ProviderRole::ToolProvider {
                 tools: [55, 56]
                     .into_iter()
                     .map(|length| ManifestTool {
@@ -6456,7 +6445,8 @@ mod tests {
                 emits_push: false,
                 sub_supervises: false,
             }],
-        }];
+            Vec::new(),
+        )];
         let desired =
             desired_session_from_catalog(&GatewayConfig::facade_default(), &modules).unwrap();
         let tools: Vec<_> = desired.providers.iter().flat_map(|p| &p.tools).collect();

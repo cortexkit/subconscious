@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.32.15
+
+- Log each mutating supervisor request before handling it, including the daemon-verified caller principal and connection id. Preview rescans and read-only requests are not logged.
+
 ## 0.32.14
 
 - Log each module registration ending (`module registration ended`, with the reason: connection closed, goodbye, supervisor stop or restart, failed registration, or replaced), and log when a swap restart promotes the new process's registration over the old one (`module registration promoted`). The existing `module registered` line is unchanged.

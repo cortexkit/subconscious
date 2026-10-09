@@ -2326,6 +2326,13 @@ impl ControlHandler {
                 module_id,
                 drain_timeout_ms,
             } => {
+                self.log_supervisor_request_received(
+                    ctx,
+                    frame.header.corr,
+                    ops::SUPERVISOR_RESTART,
+                    Some(&module_id),
+                    None,
+                )?;
                 self.handle_supervisor_restart(frame, module_id, drain_timeout_ms)
                     .await
             }
@@ -2333,20 +2340,57 @@ impl ControlHandler {
                 module_id,
                 ready_timeout_ms,
             } => {
+                self.log_supervisor_request_received(
+                    ctx,
+                    frame.header.corr,
+                    ops::SUPERVISOR_SWAP,
+                    Some(&module_id),
+                    None,
+                )?;
                 self.handle_supervisor_swap(frame, module_id, ready_timeout_ms)
                     .await
             }
             ClientControlRequest::SupervisorReload { module_id } => {
+                self.log_supervisor_request_received(
+                    ctx,
+                    frame.header.corr,
+                    ops::SUPERVISOR_RELOAD,
+                    Some(&module_id),
+                    None,
+                )?;
                 self.handle_supervisor_reload(frame, module_id).await
             }
             ClientControlRequest::SupervisorRescan { preview } => {
+                if !preview {
+                    self.log_supervisor_request_received(
+                        ctx,
+                        frame.header.corr,
+                        ops::SUPERVISOR_RESCAN,
+                        None,
+                        None,
+                    )?;
+                }
                 self.handle_supervisor_rescan(frame, preview).await
             }
             ClientControlRequest::SupervisorReleaseReserved { module_id } => {
+                self.log_supervisor_request_received(
+                    ctx,
+                    frame.header.corr,
+                    ops::SUPERVISOR_RELEASE_RESERVED,
+                    Some(&module_id),
+                    None,
+                )?;
                 self.handle_supervisor_release_reserved(frame, module_id)
                     .await
             }
             ClientControlRequest::SupervisorSetEnabled { module_id, enabled } => {
+                self.log_supervisor_request_received(
+                    ctx,
+                    frame.header.corr,
+                    ops::SUPERVISOR_SET_ENABLED,
+                    Some(&module_id),
+                    Some(enabled),
+                )?;
                 self.handle_supervisor_set_enabled(frame, module_id, enabled)
                     .await
             }
@@ -2369,6 +2413,37 @@ impl ControlHandler {
                 self.handle_supervisor_terminals(frame, module_id).await
             }
         }
+    }
+
+    fn log_supervisor_request_received(
+        &self,
+        ctx: &RouteCtx,
+        corr: u64,
+        op: &'static str,
+        module_id: Option<&str>,
+        enabled: Option<bool>,
+    ) -> Result<(), RouterError> {
+        let caller = self
+            .registry
+            .get_module_by_connection(ctx.connection_id)
+            .map_err(|err| RouterError::backend(0, corr, err.to_string()))?
+            .map(|registration| Principal::Reserved {
+                module_id: registration.manifest.module_id,
+            })
+            .unwrap_or(Principal::Direct);
+        let caller = principal_label(&caller);
+        // `Option` fields are recorded only when present, so a request with no
+        // module id (rescan) or no enabled flag simply omits that field.
+        info!(
+            target: "control",
+            op,
+            module_id,
+            enabled,
+            connection_id = ctx.connection_id.get(),
+            caller = %caller,
+            "supervisor request received"
+        );
+        Ok(())
     }
 
     fn handle_module_control_request(
@@ -3714,11 +3789,7 @@ impl ControlHandler {
         );
         // Rendered BEFORE the move into the relay, because the accept arm below
         // is where it is logged and the principal is gone by then.
-        let principal_label = match &principal {
-            Principal::Reserved { module_id } => format!("reserved:{module_id}"),
-            Principal::Direct => "direct".to_string(),
-            other => format!("{other:?}"),
-        };
+        let principal_label = principal_label(&principal);
         let relay = ModuleControlRequest::RouteBind {
             route_channel: module_channel,
             epoch: module_epoch,
@@ -5782,6 +5853,14 @@ fn client_control_request_op(request: &ClientControlRequest) -> &'static str {
         ClientControlRequest::SupervisorRoutes { .. } => ops::SUPERVISOR_ROUTES,
         ClientControlRequest::SupervisorStderrTail { .. } => ops::SUPERVISOR_STDERR_TAIL,
         ClientControlRequest::SupervisorTerminals { .. } => ops::SUPERVISOR_TERMINALS,
+    }
+}
+
+fn principal_label(principal: &Principal) -> String {
+    match principal {
+        Principal::Reserved { module_id } => format!("reserved:{module_id}"),
+        Principal::Direct => "direct".to_string(),
+        other => format!("{other:?}"),
     }
 }
 
@@ -9901,6 +9980,137 @@ mod tests {
         assert_eq!(event.fields.get("in_flight"), Some(&limit.to_string()));
         assert_eq!(event.fields.get("limit"), Some(&limit.to_string()));
         drop(guards);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn supervisor_set_enabled_logs_request_received_with_direct_caller() {
+        let handler = ControlHandler::new(Arc::new(Registry::default()));
+        let capture = EventCapture::default();
+        let _subscriber =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(capture.clone()));
+        let (ctx, _rx) = route_ctx(ConnectionId::new(101));
+        let frame = Frame::build(FrameType::Request, control_flags(), 0, 0, 1, Vec::new()).unwrap();
+
+        let _ = handler
+            .handle_client_control_request(
+                &ctx,
+                frame,
+                ClientControlRequest::SupervisorSetEnabled {
+                    module_id: "broca".to_string(),
+                    enabled: false,
+                },
+            )
+            .await
+            .unwrap();
+
+        let events = capture
+            .events()
+            .into_iter()
+            .filter(|event| {
+                event.target == "control"
+                    && event.fields.get("message").map(String::as_str)
+                        == Some("supervisor request received")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(events.len(), 1, "one supervisor request log line");
+        let event = &events[0];
+        assert_eq!(event.level, tracing::Level::INFO);
+        assert_eq!(
+            event.fields.get("op"),
+            Some(&format!("{:?}", ops::SUPERVISOR_SET_ENABLED))
+        );
+        assert_eq!(
+            event.fields.get("module_id"),
+            Some(&"\"broca\"".to_string())
+        );
+        assert_eq!(event.fields.get("enabled"), Some(&"false".to_string()));
+        assert_eq!(event.fields.get("connection_id"), Some(&"101".to_string()));
+        assert_eq!(event.fields.get("caller"), Some(&"direct".to_string()));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn supervisor_request_from_a_registered_module_logs_its_reserved_principal() {
+        let registry = Arc::new(Registry::default());
+        let module_connection = ConnectionId::new(303);
+        registry
+            .register_with_control_ops(
+                manifest("aft", PROTOCOL_VERSION),
+                PROTOCOL_VERSION,
+                module_connection,
+                module_baseline_control_ops(),
+            )
+            .unwrap();
+        let handler = ControlHandler::new(registry);
+        let capture = EventCapture::default();
+        let _subscriber =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(capture.clone()));
+        let (ctx, _rx) = route_ctx(module_connection);
+        let frame = Frame::build(FrameType::Request, control_flags(), 0, 0, 1, Vec::new()).unwrap();
+
+        let _ = handler
+            .handle_client_control_request(
+                &ctx,
+                frame,
+                ClientControlRequest::SupervisorSetEnabled {
+                    module_id: "broca".to_string(),
+                    enabled: false,
+                },
+            )
+            .await
+            .unwrap();
+
+        let callers = capture
+            .events()
+            .into_iter()
+            .filter(|event| {
+                event.fields.get("message").map(String::as_str)
+                    == Some("supervisor request received")
+            })
+            .map(|event| event.fields.get("caller").cloned())
+            .collect::<Vec<_>>();
+        assert_eq!(callers, vec![Some("reserved:aft".to_string())]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn supervisor_list_does_not_log_request_received() {
+        let handler = ControlHandler::new(Arc::new(Registry::default()));
+        let capture = EventCapture::default();
+        let _subscriber =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(capture.clone()));
+        let (ctx, _rx) = route_ctx(ConnectionId::new(102));
+        let frame = Frame::build(FrameType::Request, control_flags(), 0, 0, 2, Vec::new()).unwrap();
+
+        handler
+            .handle_client_control_request(&ctx, frame, ClientControlRequest::SupervisorList {})
+            .await
+            .unwrap();
+
+        assert!(capture.events().into_iter().all(|event| {
+            event.fields.get("message").map(String::as_str) != Some("supervisor request received")
+        }));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn supervisor_rescan_preview_does_not_log_request_received() {
+        let handler = ControlHandler::new(Arc::new(Registry::default()));
+        let capture = EventCapture::default();
+        let _subscriber =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(capture.clone()));
+        let (ctx, _rx) = route_ctx(ConnectionId::new(103));
+        let frame = Frame::build(FrameType::Request, control_flags(), 0, 0, 3, Vec::new()).unwrap();
+
+        handler
+            .handle_client_control_request(
+                &ctx,
+                frame,
+                ClientControlRequest::SupervisorRescan { preview: true },
+            )
+            .await
+            .unwrap();
+
+        assert!(capture.events().into_iter().all(|event| {
+            event.fields.get("message").map(String::as_str) != Some("supervisor request received")
+        }));
     }
 
     /// One wire code has several senders, so the refusal line names the check

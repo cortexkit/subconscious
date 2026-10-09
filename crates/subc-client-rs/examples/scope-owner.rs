@@ -3,12 +3,16 @@
 //! A supervised module that owns scopes through the SDK's `ModuleHandle`.
 //!
 //! Only a module the daemon launched itself may sync scopes, so the
-//! `scope.sync` / `scope.describe` helpers can only be exercised end to end
+//! `scope.sync` / `scope.apply` / `scope.describe` helpers are exercised end to end
 //! from a process the daemon supervises. This one connects, then runs the
 //! steps in the JSON file named by `SUBC_SCOPE_OWNER_SCRIPT`, in order, and
 //! appends one JSON line per step to `SUBC_SCOPE_OWNER_RESULTS`. A step is
-//! either `{"op": "sync", "generation": N, "scopes": [ScopeRecord, ...]}` or
-//! `{"op": "describe", "owner": Principal, "ref": "..."}`. After the last step
+//! `{"op": "sync", "generation": N, "scopes": [ScopeRecord, ...]}`,
+//! `{"op": "apply", "generation": N, "upsert": [ScopeRecord, ...], "end": [ScopeEnd, ...]}`,
+//! or `{"op": "describe", "owner": Principal, "ref": "..."}`. Records may use
+//! the script-only `expires_in_ms` instead of `expires_at_ms`; the step resolves
+//! it against Unix wall time when it runs. Each results line includes the
+//! resolved request, so a caller can observe the exact deadline sent. After the last step
 //! it writes `{"done": true}` and keeps serving, so the supervisor does not
 //! restart it and run the steps a second time.
 
@@ -17,16 +21,17 @@ use std::{
     fs,
     io::Write as _,
     path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use serde_json::{json, Value};
 use subc_client_rs::{
-    async_trait, HandlerOutcome, ModuleHandler, RequestCtx, ScopeCallError, ScopeDescribeReply,
-    ScopeSyncReply,
+    async_trait, HandlerOutcome, ModuleHandler, RequestCtx, ScopeApplyReply, ScopeCallError,
+    ScopeDescribeReply, ScopeSyncReply,
 };
 use subc_protocol::{
     manifest::{Concurrency, ExecutionMode, IdentityScope, ModuleManifest, ProviderRole, Tool},
-    scope::ScopeRecord,
+    scope::{ScopeEnd, ScopeRecord},
     Principal,
 };
 
@@ -56,12 +61,24 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let serving = tokio::spawn(serve);
 
     for (step, request) in script.iter().enumerate() {
+        let mut request = request.clone();
         let outcome = match request.get("op").and_then(Value::as_str) {
             Some("sync") => {
                 let generation = request["generation"].as_u64().unwrap_or(0);
+                resolve_scope_expiries(&mut request["scopes"], wall_now_ms()?)?;
                 let scopes: Vec<ScopeRecord> = serde_json::from_value(request["scopes"].clone())?;
                 match handle.scope_sync(generation, scopes).await {
                     Ok(reply) => json!({ "ok": sync_json(&reply) }),
+                    Err(error) => error_json(&error),
+                }
+            }
+            Some("apply") => {
+                let generation = request["generation"].as_u64().unwrap_or(0);
+                resolve_scope_expiries(&mut request["upsert"], wall_now_ms()?)?;
+                let upsert: Vec<ScopeRecord> = serde_json::from_value(request["upsert"].clone())?;
+                let end: Vec<ScopeEnd> = serde_json::from_value(request["end"].clone())?;
+                match handle.scope_apply(generation, upsert, end).await {
+                    Ok(reply) => json!({ "ok": apply_json(&reply) }),
                     Err(error) => error_json(&error),
                 }
             }
@@ -77,12 +94,45 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         };
         record(
             results_path.as_deref(),
-            json!({ "step": step, "result": outcome }),
+            json!({ "step": step, "request": request, "result": outcome }),
         );
     }
     record(results_path.as_deref(), json!({ "done": true }));
 
     serving.await??;
+    Ok(())
+}
+
+fn wall_now_ms() -> Result<u64, Box<dyn Error + Send + Sync>> {
+    Ok(u64::try_from(
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis(),
+    )?)
+}
+
+/// Resolve relative deadlines before decoding the strict wire type: the
+/// daemon must receive only the absolute deadline, never `expires_in_ms`.
+fn resolve_scope_expiries(
+    records: &mut Value,
+    now_ms: u64,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    for record in records
+        .as_array_mut()
+        .ok_or("scope records must be an array")?
+    {
+        let fields = record
+            .as_object_mut()
+            .ok_or("scope record must be an object")?;
+        if let Some(relative) = fields.remove("expires_in_ms") {
+            if fields.contains_key("expires_at_ms") {
+                return Err("use only one of expires_in_ms and expires_at_ms".into());
+            }
+            let relative = relative.as_u64().ok_or("expires_in_ms must be a u64")?;
+            let deadline = now_ms
+                .checked_add(relative)
+                .ok_or("scope deadline overflow")?;
+            fields.insert("expires_at_ms".to_string(), json!(deadline));
+        }
+    }
     Ok(())
 }
 
@@ -102,6 +152,15 @@ fn sync_json(reply: &ScopeSyncReply) -> Value {
     json!({
         "generation": reply.generation,
         "results": reply.results,
+        "ended": reply.ended,
+    })
+}
+
+fn apply_json(reply: &ScopeApplyReply) -> Value {
+    json!({
+        "generation": reply.generation,
+        "results": reply.results,
+        "end_results": reply.end_results,
         "ended": reply.ended,
     })
 }
@@ -170,4 +229,39 @@ fn manifest(module_id: &str) -> ModuleManifest {
             sub_supervises: false,
         }])
         .build()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relative_expiry_becomes_an_absolute_wire_deadline() {
+        let mut records = json!([
+            {"ref": "run", "scope_epoch": 1, "kind": "ephemeral", "expires_in_ms": 15000},
+            {"ref": "absolute", "scope_epoch": 2, "kind": "ephemeral", "expires_at_ms": 20000},
+            {"ref": "unbounded", "scope_epoch": 1, "kind": "ephemeral"}
+        ]);
+        resolve_scope_expiries(&mut records, 1000).unwrap();
+        assert_eq!(records[0]["expires_at_ms"], 16000);
+        assert!(records[0].get("expires_in_ms").is_none());
+        assert_eq!(records[1]["expires_at_ms"], 20000);
+        assert!(records[2].get("expires_at_ms").is_none());
+        let decoded: Vec<ScopeRecord> = serde_json::from_value(records).unwrap();
+        assert_eq!(decoded[0].expires_at_ms, Some(16000));
+        assert_eq!(decoded[1].expires_at_ms, Some(20000));
+        assert_eq!(decoded[2].expires_at_ms, None);
+    }
+
+    #[test]
+    fn malformed_or_overflowing_relative_expiries_are_script_errors() {
+        for record in [
+            json!({"expires_in_ms": -1}),
+            json!({"expires_in_ms": "15000"}),
+            json!({"expires_in_ms": 1, "expires_at_ms": 20000}),
+            json!({"expires_in_ms": u64::MAX}),
+        ] {
+            assert!(resolve_scope_expiries(&mut json!([record]), 1).is_err());
+        }
+    }
 }

@@ -4551,6 +4551,8 @@ struct ScopeOwnerRun {
     /// One entry per script step, in order: `{"ok": reply}`,
     /// `{"refused": {"code", "message"}}`, or `{"other": error}`.
     results: Vec<Value>,
+    /// Requests as executed by the example, including resolved absolute deadlines.
+    requests: Vec<Value>,
 }
 
 impl ScopeOwnerRun {
@@ -4655,6 +4657,7 @@ async fn run_scope_owner_with_config(steps: Value, extra_config: Value) -> Scope
     wait_for_connection_file(&daemon.connection_file, START_TIMEOUT).await;
     wait_for_event(&results_path, START_TIMEOUT, |event| event["done"] == true).await;
     let mut results = vec![Value::Null; steps.as_array().unwrap().len()];
+    let mut requests = vec![Value::Null; results.len()];
     for event in read_events(&results_path) {
         if let Some(step) = event["step"].as_u64() {
             let slot = &mut results[usize::try_from(step).unwrap()];
@@ -4662,6 +4665,7 @@ async fn run_scope_owner_with_config(steps: Value, extra_config: Value) -> Scope
             // owner would run it again under a new connection.
             if slot.is_null() {
                 *slot = event["result"].clone();
+                requests[usize::try_from(step).unwrap()] = event["request"].clone();
             }
         }
     }
@@ -4669,6 +4673,7 @@ async fn run_scope_owner_with_config(steps: Value, extra_config: Value) -> Scope
         daemon,
         _temp_dir: temp_dir,
         results,
+        requests,
     }
 }
 
@@ -5011,6 +5016,147 @@ impl ModuleHandler for ScopeRecordingHandler {
             .push((req.identity.session.clone(), req.scope.clone()));
         BindDecision::accept()
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_applied_run_scope_expires_and_closes_its_route_without_an_owner_resync() {
+    let mut run = run_scope_owner_with_config(
+        json!([
+            sync_step(1, json!([])),
+            {
+                "op": "apply",
+                "generation": 2,
+                "upsert": [{
+                    "ref": "run-a",
+                    "scope_epoch": 1,
+                    "kind": "ephemeral",
+                    "expires_in_ms": 15000,
+                    "carriers": [{ "principal": { "kind": "direct" } }],
+                    "attributes": { "agent_id": "agent-7", "run_id": "run-7" }
+                }],
+                "end": []
+            }
+        ]),
+        json!({ "scope_authority_owners": [SDK_SCOPE_OWNER] }),
+    )
+    .await;
+    assert_eq!(run.results[0]["ok"]["generation"], 1, "{:?}", run.results);
+    assert_eq!(run.results[1]["ok"]["generation"], 2, "{:?}", run.results);
+    assert_eq!(
+        run.results[1]["ok"]["results"][0]["outcome"], "created",
+        "{:?}",
+        run.results
+    );
+    let sent_record = &run.requests[1]["upsert"][0];
+    assert!(sent_record.get("expires_in_ms").is_none());
+    let expires_at_ms = sent_record["expires_at_ms"]
+        .as_u64()
+        .expect("the example records the absolute deadline it sent");
+    let closes_by_ms = expires_at_ms + 2000;
+
+    // Registration happens after the owner's last call. The run gate reads
+    // the provider's advertised capability when the consumer opens the route.
+    let (_provider, serve_task) = spawn_inline_module(
+        &run.daemon.connection_file,
+        inline_capability_module_manifest("run-provider", Some("agent-run-scopes/v1")),
+    )
+    .await;
+    wait_for_catalog_module(&run.daemon.connection_file, "run-provider", START_TIMEOUT).await;
+    let consumer = SubcConsumer::connect(&run.daemon.connection_file, fast_consumer_options())
+        .await
+        .unwrap();
+    let mut pushes = consumer.control_pushes(16);
+    let identity = consumer_identity("run-expiry");
+    assert!(
+        expires_at_ms.saturating_sub(unix_ms_now()) >= 2000,
+        "harness fault: fewer than 2000 ms remain before the recorded expiry at route.open"
+    );
+    let handle = consumer
+        .open_route_scoped(
+            tool_target("run-provider"),
+            identity,
+            ScopeSelector {
+                owner: sdk_scope_owner(),
+                scope_ref: "run-a".to_string(),
+                scope_epoch: Some(1),
+            },
+            fast_call_options(),
+        )
+        .await
+        .expect("a live run scope admits an opted-in provider");
+
+    // Use the recorded wall deadline, not EVENT_TIMEOUT: an early close or
+    // an expiry loop taking more than two seconds after the deadline is wrong.
+    let closed = loop {
+        assert!(
+            unix_ms_now() <= closes_by_ms,
+            "route.closed missed the expiry bound"
+        );
+        let push = timeout(
+            Duration::from_millis(closes_by_ms.saturating_sub(unix_ms_now())),
+            pushes.recv(),
+        )
+        .await
+        .expect("route.closed must arrive by expires_at_ms + 2000")
+        .expect("control push receiver stays open");
+        if push.op == "route.closed" {
+            let received_at_ms = unix_ms_now();
+            assert!(
+                received_at_ms >= expires_at_ms,
+                "route.closed arrived before expiry"
+            );
+            assert!(
+                received_at_ms <= closes_by_ms,
+                "route.closed missed the expiry bound"
+            );
+            break push;
+        }
+    };
+    assert_eq!(
+        closed.body["channels"],
+        json!([handle.channel]),
+        "{}",
+        closed.body
+    );
+    assert_eq!(closed.body["reason"], "scope_ended", "{}", closed.body);
+    assert_eq!(
+        closed.route_close_reason().unwrap().disposition(),
+        RouteCloseDisposition::MustNotReopen
+    );
+
+    // The channel GOODBYE and control push are separate frames. Require both
+    // effects inside the same wall-time bound, even if the push arrives first.
+    loop {
+        assert!(
+            unix_ms_now() <= closes_by_ms,
+            "the expired route handle is still live"
+        );
+        let result = timeout(
+            Duration::from_millis(closes_by_ms.saturating_sub(unix_ms_now())),
+            consumer.request(
+                &handle,
+                br#"{"tool":"capability.resolve","arguments":{}}"#.to_vec(),
+                fast_call_options(),
+            ),
+        )
+        .await
+        .expect("the route handle must become stale by expires_at_ms + 2000");
+        if matches!(result, Err(CallError::StaleRouteHandle(_))) {
+            assert!(
+                unix_ms_now() <= closes_by_ms,
+                "GOODBYE missed the expiry bound"
+            );
+            break;
+        }
+        sleep(Duration::from_millis(
+            20.min(closes_by_ms.saturating_sub(unix_ms_now())),
+        ))
+        .await;
+    }
+
+    consumer.close().await;
+    run.daemon.kill_and_wait();
+    assert!(serve_task.await.unwrap().is_ok());
 }
 
 /// A module served through the SDK sees the daemon's scope stamp in `on_bind`,

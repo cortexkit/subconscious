@@ -49,8 +49,8 @@ use subc_protocol::{
     error_codes,
     manifest::ModuleManifest,
     scope::{
-        ScopeEnded, ScopeRecord, ScopeRecordResult, ScopeStamp, ScopeStatus, SCOPE_DESCRIBE_OP,
-        SCOPE_SYNC_OP,
+        ScopeEnd, ScopeEndResult, ScopeEnded, ScopeRecord, ScopeRecordResult, ScopeStamp,
+        ScopeStatus, SCOPE_APPLY_OP, SCOPE_DESCRIBE_OP, SCOPE_SYNC_OP,
     },
     session::{
         ModuleControlCommand, ModuleControlRequest, ModuleControlRequestFromModule,
@@ -254,8 +254,26 @@ pub struct ScopeSyncReply {
     /// own merits is here with outcome `refused` and its code; the rest of the
     /// sync still applied.
     pub results: Vec<ScopeRecordResult>,
-    /// Scopes of this owner that the sync ended, by leaving them out or by
-    /// sending a higher epoch for the same ref.
+    /// Scopes of this owner that the sync ended, by leaving them out, sending
+    /// a higher epoch for the same ref, or sweeping their expired deadlines.
+    pub ended: Vec<ScopeEnded>,
+}
+
+/// The daemon's answer to an accepted [`ModuleHandle::scope_apply`].
+///
+/// A refusal of the whole delta is [`ScopeCallError::Refused`]; nothing changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ScopeApplyReply {
+    /// The generation the daemon accepted, echoed from the request.
+    pub generation: u64,
+    /// One result per upsert, in request order, including per-record refusals.
+    pub results: Vec<ScopeRecordResult>,
+    /// One result per requested end, in request order. A ref not live at the
+    /// named epoch has outcome `not_live`, which does not refuse the delta.
+    pub end_results: Vec<ScopeEndResult>,
+    /// Scopes this call ended, once each, through explicit ends, higher-epoch
+    /// upserts, or the calling owner's expiry sweep.
     pub ended: Vec<ScopeEnded>,
 }
 
@@ -425,6 +443,7 @@ struct ModuleHandleShared {
     supports_catalog_update: bool,
     supports_live_roots: bool,
     supports_scope_sync: bool,
+    supports_scope_apply: bool,
     supports_scope_describe: bool,
     supports_operator_confirm: bool,
     connection_runtime: tokio::runtime::Handle,
@@ -461,6 +480,7 @@ impl ModuleHandle {
                     .any(|op| op == MODULE_TO_SUBC_OP_CATALOG_UPDATE),
                 supports_live_roots: ack.subc_ops.iter().any(|op| op == "supervisor.live_roots"),
                 supports_scope_sync: ack.subc_ops.iter().any(|op| op == SCOPE_SYNC_OP),
+                supports_scope_apply: ack.subc_ops.iter().any(|op| op == SCOPE_APPLY_OP),
                 supports_scope_describe: ack.subc_ops.iter().any(|op| op == SCOPE_DESCRIBE_OP),
                 supports_operator_confirm: ack.subc_ops.iter().any(|op| op == OPERATOR_CONFIRM_OP),
                 connection_runtime,
@@ -666,6 +686,48 @@ impl ModuleHandle {
             }),
             other => Err(ScopeCallError::Protocol(format!(
                 "unexpected {SCOPE_SYNC_OP} response: {other:?}"
+            ))),
+        }
+    }
+
+    /// Apply a delta to this module's scope set (`scope.apply`).
+    ///
+    /// This connection must first have established sync authority through an
+    /// accepted [`Self::scope_sync`]. `generation` shares the full-sync sequence
+    /// and must exceed the last accepted generation. Unnamed scopes stay live;
+    /// `end` ends only the named ref at the named epoch.
+    ///
+    /// Whole-call refusals return [`ScopeCallError::Refused`] without changing
+    /// the set or generation. Per-record refusals and `not_live` ends remain in
+    /// the reply. Without `scope.apply` in HELLO_ACK, nothing is sent.
+    pub async fn scope_apply(
+        &self,
+        generation: u64,
+        upsert: Vec<ScopeRecord>,
+        end: Vec<ScopeEnd>,
+    ) -> Result<ScopeApplyReply, ScopeCallError> {
+        if !self.shared.supports_scope_apply {
+            return Err(ScopeCallError::NotSupported { op: SCOPE_APPLY_OP });
+        }
+        let request = ModuleControlRequestFromModule::ScopeApply {
+            generation,
+            upsert,
+            end,
+        };
+        match self.scope_call(SCOPE_APPLY_OP, &request).await? {
+            ModuleControlResponseToModule::ScopeApply {
+                generation,
+                results,
+                end_results,
+                ended,
+            } => Ok(ScopeApplyReply {
+                generation,
+                results,
+                end_results,
+                ended,
+            }),
+            other => Err(ScopeCallError::Protocol(format!(
+                "unexpected {SCOPE_APPLY_OP} response: {other:?}"
             ))),
         }
     }
@@ -1202,7 +1264,7 @@ impl fmt::Display for CatalogUpdateError {
 
 impl Error for CatalogUpdateError {}
 
-/// Errors returned by [`ModuleHandle::scope_sync`] and
+/// Errors returned by [`ModuleHandle::scope_sync`], [`ModuleHandle::scope_apply`] and
 /// [`ModuleHandle::scope_describe`].
 ///
 /// Non-exhaustive so a later failure kind can be added without breaking
@@ -1219,7 +1281,7 @@ pub enum ScopeCallError {
     /// `subc_protocol::error_codes` (`SCOPE_SYNC_STALE`,
     /// `SCOPE_SYNC_NOT_AUTHORITY`, `SCOPE_LIVE_LIMIT_EXCEEDED`, ...).
     Refused { code: String, message: String },
-    /// No reply arrived in time. The daemon may still have applied a sync.
+    /// No reply arrived in time. The daemon may still have applied the change.
     Timeout,
     /// The connection closed before a reply arrived.
     ConnectionClosed,
@@ -2928,6 +2990,156 @@ mod tests {
             }
         );
         assert!(timeout(Duration::from_millis(75), rx.recv()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn scope_apply_sends_nothing_without_its_own_advertised_op() {
+        for ops in [&[][..], &[SCOPE_SYNC_OP, SCOPE_DESCRIBE_OP][..]] {
+            let (handle, mut rx) = test_module_handle(ops);
+            assert_eq!(
+                handle.scope_apply(2, Vec::new(), Vec::new()).await,
+                Err(ScopeCallError::NotSupported { op: SCOPE_APPLY_OP })
+            );
+            assert!(timeout(Duration::from_millis(75), rx.recv()).await.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn scope_apply_sends_the_delta_and_preserves_per_entry_outcomes() {
+        let (handle, mut rx) = test_module_handle(&[SCOPE_APPLY_OP]);
+        let apply = tokio::spawn({
+            let handle = handle.clone();
+            async move {
+                handle
+                    .scope_apply(
+                        2,
+                        vec![ScopeRecord::new(
+                            "run",
+                            1,
+                            subc_protocol::scope::ScopeKind::Ephemeral,
+                        )
+                        .with_expires_at_ms(Some(12345))],
+                        vec![ScopeEnd::new("old", 3), ScopeEnd::new("missing", 1)],
+                    )
+                    .await
+            }
+        });
+        let request = timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(request.header.ty, FrameType::Request);
+        assert_eq!(request.header.channel, 0);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&request.body).unwrap(),
+            serde_json::json!({
+                "op": "scope.apply", "generation": 2,
+                "upsert": [{"ref": "run", "scope_epoch": 1, "kind": "ephemeral", "expires_at_ms": 12345}],
+                "end": [{"ref": "old", "scope_epoch": 3}, {"ref": "missing", "scope_epoch": 1}]
+            })
+        );
+        let body = serde_json::to_vec(&serde_json::json!({
+            "op": "scope.apply", "generation": 2,
+            "results": [{"ref": "run", "scope_epoch": 1, "outcome": "refused", "code": "scope_expired"}],
+            "end_results": [
+                {"ref": "old", "scope_epoch": 3, "outcome": "ended"},
+                {"ref": "missing", "scope_epoch": 1, "outcome": "not_live"}
+            ],
+            "ended": [{"ref": "old", "scope_epoch": 3}]
+        }))
+        .unwrap();
+        assert!(handle.handle_control_reply(control_reply(
+            FrameType::Response,
+            request.header.corr,
+            body
+        )));
+        let reply = apply.await.unwrap().unwrap();
+        assert_eq!(reply.generation, 2);
+        assert_eq!(reply.results.len(), 1);
+        assert_eq!(reply.results[0].scope_ref, "run");
+        assert_eq!(
+            reply.results[0].outcome,
+            subc_protocol::scope::ScopeRecordOutcome::Refused
+        );
+        assert_eq!(reply.results[0].code.as_deref(), Some("scope_expired"));
+        assert_eq!(reply.end_results.len(), 2);
+        assert_eq!(reply.end_results[0].scope_ref, "old");
+        assert_eq!(reply.end_results[0].scope_epoch, 3);
+        assert_eq!(
+            reply.end_results[0].outcome,
+            subc_protocol::scope::ScopeEndOutcome::Ended
+        );
+        assert_eq!(reply.end_results[1].scope_ref, "missing");
+        assert_eq!(
+            reply.end_results[1].outcome,
+            subc_protocol::scope::ScopeEndOutcome::NotLive
+        );
+        assert_eq!(reply.ended.len(), 1);
+        assert_eq!(reply.ended[0].scope_ref, "old");
+        assert_eq!(reply.ended[0].scope_epoch, 3);
+    }
+
+    #[tokio::test]
+    async fn scope_apply_rejects_a_reply_for_another_op() {
+        let (handle, mut rx) = test_module_handle(&[SCOPE_APPLY_OP]);
+        let apply = tokio::spawn({
+            let handle = handle.clone();
+            async move { handle.scope_apply(2, Vec::new(), Vec::new()).await }
+        });
+        let request = timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let body = serde_json::to_vec(&ModuleControlResponseToModule::ScopeSync {
+            generation: 2,
+            results: Vec::new(),
+            ended: Vec::new(),
+        })
+        .unwrap();
+        assert!(handle.handle_control_reply(control_reply(
+            FrameType::Response,
+            request.header.corr,
+            body
+        )));
+        assert!(matches!(
+            apply.await.unwrap(),
+            Err(ScopeCallError::Protocol(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn scope_apply_preserves_whole_call_refusal_codes() {
+        let (handle, mut rx) = test_module_handle(&[SCOPE_APPLY_OP]);
+        for code in [
+            subc_protocol::error_codes::SCOPE_SYNC_REQUIRED,
+            subc_protocol::error_codes::SCOPE_SYNC_STALE,
+            subc_protocol::error_codes::SCOPE_SYNC_NOT_AUTHORITY,
+            "not_registered",
+        ] {
+            let apply = tokio::spawn({
+                let handle = handle.clone();
+                async move { handle.scope_apply(2, Vec::new(), Vec::new()).await }
+            });
+            let request = timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let body = serde_json::to_vec(&ErrorBody::new(code, "why")).unwrap();
+            assert!(handle.handle_control_reply(control_reply(
+                FrameType::Error,
+                request.header.corr,
+                body
+            )));
+            let error = apply.await.unwrap().unwrap_err();
+            assert_eq!(
+                error,
+                ScopeCallError::Refused {
+                    code: code.to_string(),
+                    message: "why".to_string()
+                }
+            );
+            assert_eq!(error.code(), Some(code));
+        }
     }
 
     /// A reply carrying another op's body is not taken as an answer.

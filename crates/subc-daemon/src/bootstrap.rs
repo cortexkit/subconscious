@@ -980,6 +980,7 @@ async fn serve_bound_daemon(
 
     control.refresh_capability_requirements();
     Arc::clone(&control).spawn_capability_deadline_loop();
+    Arc::clone(&control).spawn_scope_expiry_loop();
 
     #[cfg(unix)]
     {

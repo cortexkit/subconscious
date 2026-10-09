@@ -305,6 +305,7 @@ pub(crate) struct EndpointRoute {
 #[derive(Debug, Clone)]
 pub(crate) struct ScopeDrainedRoute {
     pub reason: RouteCloseReason,
+    pub scope: BoundScope,
     pub module_id: String,
     pub client: GoodbyeTarget,
     pub module: GoodbyeTarget,
@@ -2670,6 +2671,10 @@ impl ForwardingTable {
             if let RouteRelease::Removed(module) = release {
                 drained.push(ScopeDrainedRoute {
                     reason,
+                    scope: route
+                        .scope
+                        .clone()
+                        .expect("selected scope drain has a bound scope"),
                     module_id: route.module_id.clone(),
                     client: GoodbyeTarget {
                         connection_id: route.client_connection_id,

@@ -24,8 +24,9 @@ use subc_protocol::{
         Concurrency, ManifestProvenance, ModuleManifest, ProviderRole,
     },
     scope::{
-        ScopeRecord, ScopeRecordOutcome, ScopeRecordResult, ScopeSelector,
-        CAP_ROUTE_ROLE_VERSIONS_V1, CAP_SCOPES_V1, SCOPE_DESCRIBE_OP, SCOPE_SYNC_OP,
+        ScopeEnd, ScopeRecord, ScopeRecordOutcome, ScopeRecordResult, ScopeSelector,
+        CAP_ROUTE_ROLE_VERSIONS_V1, CAP_SCOPES_V1, SCOPE_APPLY_OP, SCOPE_DESCRIBE_OP,
+        SCOPE_SYNC_OP,
     },
     session::{
         validate_role_versions, HealthReport, ModuleControlPush, ModuleControlRequest,
@@ -110,6 +111,7 @@ const MODULE_TO_SUBC_CONTROL_OPS: &[&str] = &[
     MODULE_TO_SUBC_OP_CATALOG_UPDATE,
     "supervisor.live_roots",
     SCOPE_SYNC_OP,
+    SCOPE_APPLY_OP,
     SCOPE_DESCRIBE_OP,
     "operator.confirm",
 ];
@@ -952,6 +954,15 @@ impl ControlHandler {
         self
     }
 
+    /// Inject the Unix wall-clock millisecond source used by every scope expiry check.
+    pub fn with_wall_clock(self, clock: impl Fn() -> u64 + Send + Sync + 'static) -> Self {
+        self.scopes
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .set_wall_clock(Arc::new(clock));
+        self
+    }
+
     #[cfg(test)]
     fn with_provenance_probe_result(mut self, result: subc_control::RunningImageAgreement) -> Self {
         self.provenance_probe_override = Some(result);
@@ -1013,6 +1024,71 @@ impl ControlHandler {
                 self.refresh_capability_requirements();
             }
         });
+    }
+
+    /// The timer only prompts sweeps. Each sweep reads wall time again, so a
+    /// deadline passed during sleep is enforced on the first tick after wake.
+    pub(crate) fn spawn_scope_expiry_loop(self: Arc<Self>) {
+        tokio::spawn(async move {
+            let mut ticks = tokio::time::interval(Duration::from_secs(1));
+            ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticks.tick().await;
+                if let Err(error) = self.sweep_expired_scopes() {
+                    warn!(%error, "scope expiry sweep failed");
+                }
+            }
+        });
+    }
+
+    pub(crate) fn sweep_expired_scopes(&self) -> Result<(), RouterError> {
+        let mut table = self
+            .scopes
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let swept = table.sweep_expired();
+        let drained = self.publish_scope_changes(&swept.tag_changes, &swept.expired)?;
+        drop(table);
+        self.close_scope_drained_routes(drained);
+        Ok(())
+    }
+
+    fn publish_scope_changes(
+        &self,
+        changes: &[crate::scopes::ScopeTagChange],
+        expired: &[crate::scopes::ScopeExpired],
+    ) -> Result<Vec<crate::forwarding::ScopeDrainedRoute>, RouterError> {
+        if changes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let drained = self
+            .forwarding
+            .publish_scope_changes(changes)
+            .map_err(RouterError::Forwarding)?;
+        let mut counts = HashMap::new();
+        for route in &drained {
+            *counts
+                .entry((
+                    route.scope.owner.as_str(),
+                    route.scope.scope_ref.as_str(),
+                    route.scope.tag.scope_epoch,
+                ))
+                .or_insert(0usize) += 1;
+        }
+        for scope in expired {
+            let routes_closed = counts
+                .get(&(
+                    scope.owner.as_str(),
+                    scope.scope_ref.as_str(),
+                    scope.scope_epoch,
+                ))
+                .copied()
+                .unwrap_or(0);
+            warn!(owner = %scope.owner, scope_ref = %scope.scope_ref,
+                scope_epoch = scope.scope_epoch, expires_at_ms = scope.expires_at_ms,
+                routes_closed, "scope expired");
+        }
+        Ok(drained)
     }
 
     fn runtime_capability_snapshot(
@@ -2479,6 +2555,11 @@ impl ControlHandler {
             ModuleControlRequestFromModule::ScopeSync { generation, scopes } => {
                 self.handle_scope_sync(connection_id, frame, generation, scopes)
             }
+            ModuleControlRequestFromModule::ScopeApply {
+                generation,
+                upsert,
+                end,
+            } => self.handle_scope_change(connection_id, frame, generation, upsert, Some(end)),
             ModuleControlRequestFromModule::ScopeDescribe { owner, scope_ref } => {
                 self.handle_scope_describe(connection_id, frame, owner, scope_ref)
             }
@@ -2543,6 +2624,18 @@ impl ControlHandler {
         generation: u64,
         scopes: Vec<ScopeRecord>,
     ) -> Result<Vec<Frame>, RouterError> {
+        self.handle_scope_change(connection_id, frame, generation, scopes, None)
+    }
+
+    fn handle_scope_change(
+        &self,
+        connection_id: ConnectionId,
+        frame: Frame,
+        generation: u64,
+        scopes: Vec<ScopeRecord>,
+        end: Option<Vec<ScopeEnd>>,
+    ) -> Result<Vec<Frame>, RouterError> {
+        let is_apply = end.is_some();
         let Some(registration) = self
             .registry
             .get_module_by_connection(connection_id)
@@ -2551,7 +2644,7 @@ impl ControlHandler {
             return Ok(vec![control_error_frame(
                 &frame,
                 "not_registered",
-                "scope.sync requires an active module registration owned by this connection",
+                "scope.sync and scope.apply require an active module registration owned by this connection",
             )?]);
         };
         let owner = registration.manifest.module_id;
@@ -2570,12 +2663,19 @@ impl ControlHandler {
             .scopes
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let outcome = table.sync(&owner, connection_id, is_current_launch, generation, scopes);
+        let outcome = match end {
+            Some(end) => table.apply(
+                &owner,
+                connection_id,
+                is_current_launch,
+                generation,
+                scopes,
+                end,
+            ),
+            None => table.sync(&owner, connection_id, is_current_launch, generation, scopes),
+        };
         let drained = match &outcome {
-            Ok(applied) => self
-                .forwarding
-                .publish_scope_changes(&applied.tag_changes)
-                .map_err(RouterError::Forwarding)?,
+            Ok(applied) => self.publish_scope_changes(&applied.tag_changes, &applied.expired)?,
             Err(_) => Vec::new(),
         };
         drop(table);
@@ -2584,6 +2684,7 @@ impl ControlHandler {
                 let counts = ScopeOutcomeCounts::of(&applied.results);
                 info!(
                     owner = %owner,
+                    op = if is_apply { SCOPE_APPLY_OP } else { SCOPE_SYNC_OP },
                     generation,
                     records = applied.results.len(),
                     created = counts.created,
@@ -2594,12 +2695,12 @@ impl ControlHandler {
                     ended = applied.ended.len(),
                     tag_changes = applied.tag_changes.len(),
                     routes_closed = drained.len(),
-                    "scope sync accepted"
+                    "scope change accepted"
                 );
-                // An accepted sync can still refuse individual records, and the
+                // An accepted scope change can still refuse individual records, and the
                 // owner is the only party that sees the reply. Name them here so
                 // an operator can tell a refused session from a missing one
-                // without the owner's logs. Capped so a sync that refuses
+                // without the owner's logs. Capped so a call that refuses
                 // thousands cannot flood the log; the count above is complete.
                 for refused in applied
                     .results
@@ -2617,23 +2718,33 @@ impl ControlHandler {
                     );
                 }
                 self.close_scope_drained_routes(drained);
-                let response = ModuleControlResponseToModule::ScopeSync {
-                    generation,
-                    results: applied.results,
-                    ended: applied.ended,
+                let response = if is_apply {
+                    ModuleControlResponseToModule::ScopeApply {
+                        generation,
+                        results: applied.results,
+                        end_results: applied.end_results,
+                        ended: applied.ended,
+                    }
+                } else {
+                    ModuleControlResponseToModule::ScopeSync {
+                        generation,
+                        results: applied.results,
+                        ended: applied.ended,
+                    }
                 };
                 Ok(vec![control_response_body_frame(
                     &frame,
                     &response,
-                    "ModuleControlResponseToModule::ScopeSync",
+                    "scope change response",
                 )?])
             }
             Err(refusal) => {
                 info!(
                     owner = %owner,
+                    op = if is_apply { SCOPE_APPLY_OP } else { SCOPE_SYNC_OP },
                     generation,
                     code = refusal.code,
-                    "scope sync refused"
+                    "scope change refused"
                 );
                 Ok(vec![control_error_frame(
                     &frame,
@@ -2911,16 +3022,16 @@ impl ControlHandler {
             .map(|registration| {
                 let not_ready = self.not_ready_reason(&registration);
                 let roles = registration.manifest.provides;
-                CatalogEntry {
-                    module_id: registration.manifest.module_id,
-                    ready: not_ready.is_none(),
-                    not_ready,
-                    module_version: Some(registration.manifest.module_version),
+                CatalogEntry::new(
+                    registration.manifest.module_id,
                     roles,
-                    control_ops: registration.control_ops,
-                    capabilities: registration.manifest.capabilities,
-                    self_signals: registration.manifest.self_signals,
-                }
+                    registration.control_ops,
+                )
+                .with_ready(not_ready.is_none())
+                .with_not_ready(not_ready)
+                .with_module_version(Some(registration.manifest.module_version))
+                .with_capabilities(registration.manifest.capabilities)
+                .with_self_signals(registration.manifest.self_signals)
             })
             .collect();
         let response = ClientControlResponse::CatalogList {
@@ -3589,6 +3700,11 @@ impl ControlHandler {
                             &target_module_id,
                             registration.manifest.capabilities.as_ref(),
                         )?;
+                        crate::scopes::check_target_agent_run_support(
+                            &admission.stamp,
+                            &target_module_id,
+                            registration.manifest.capabilities.as_ref(),
+                        )?;
                         Ok(admission)
                     });
                 match admitted {
@@ -3749,12 +3865,12 @@ impl ControlHandler {
             RouteBindReservationGuard::new(Arc::clone(&self.forwarding), endpoint, relay_corr);
 
         // Reserving egress can wait while a module reconnects or a swap cuts
-        // over. Check the connection the relay actually captured, not the
-        // earlier by-id lookup: a flow-aware module must not vouch for a
-        // replacement. The captured sink cannot turn into another connection.
+        // over. Check the relay's captured connection, not the earlier by-id
+        // lookup: the original module's flow/run capabilities cannot authorize
+        // its replacement. The captured sink stays bound to that connection.
         if let Some(stamp) = scope_stamp
             .as_ref()
-            .filter(|stamp| stamp.attributes.flow_id.is_some())
+            .filter(|stamp| stamp.attributes.flow_id.is_some() || stamp.attributes.run_id.is_some())
         {
             let relay_registration = self
                 .registry
@@ -3766,7 +3882,16 @@ impl ControlHandler {
                 relay_registration
                     .as_ref()
                     .and_then(|registration| registration.manifest.capabilities.as_ref()),
-            ) {
+            )
+            .and_then(|()| {
+                crate::scopes::check_target_agent_run_support(
+                    stamp,
+                    &target_module_id,
+                    relay_registration
+                        .as_ref()
+                        .and_then(|registration| registration.manifest.capabilities.as_ref()),
+                )
+            }) {
                 reservation.release_and_disarm();
                 return Ok(vec![self.route_open_refusal_frame(
                     ctx,
@@ -4056,32 +4181,34 @@ impl ControlHandler {
                 status.spawned_from.as_deref(),
                 image,
             ));
-            modules.push(SupervisorEntry {
-                // Keep the retired policy field on the wire for one release so
-                // existing status consumers still receive the platform policy.
-                launch_nonce_env: Some(!cfg!(unix)),
-                module_id: status.module_id,
-                state: status.state.to_string(),
-                enabled: status.enabled,
-                live: status.live,
-                protocol: status.protocol,
-                health: status.health.status,
-                pending_reload,
-                last_probe_ms: status.health.last_probe_ms,
-                last_exit_code: status.last_exit.as_ref().and_then(|e| e.code),
-                last_exit_signal: status.last_exit.as_ref().and_then(|e| e.signal),
-                last_exit_ms: status.last_exit.as_ref().map(|e| e.at_ms),
-                last_exit_kind: status.last_exit.as_ref().map(|e| e.kind.into()),
-                restart_count: Some(status.restart_count),
-                max_restarts: Some(status.max_restarts),
-                lifetime_restarts: Some(status.lifetime_restarts),
-                spawn_generation: Some(status.spawn_generation),
-                restart_window_secs: Some(status.restart_window.as_secs()),
-                drain_timeout_ms: Some(status.drain_timeout.as_millis() as u64),
-                restart_backoff_ms: Some(status.restart_backoff.as_millis() as u64),
-                restart_max_backoff_ms: Some(status.restart_max_backoff.as_millis() as u64),
-                resources,
-            });
+            // Keep the retired policy field on the wire for one release so
+            // existing status consumers still receive the platform policy.
+            modules.push(
+                SupervisorEntry::new(
+                    status.module_id,
+                    status.state.to_string(),
+                    status.enabled,
+                    status.live,
+                    status.health.status,
+                )
+                .with_launch_nonce_env(Some(!cfg!(unix)))
+                .with_protocol(status.protocol)
+                .with_pending_reload(pending_reload)
+                .with_last_probe_ms(status.health.last_probe_ms)
+                .with_last_exit_code(status.last_exit.as_ref().and_then(|e| e.code))
+                .with_last_exit_signal(status.last_exit.as_ref().and_then(|e| e.signal))
+                .with_last_exit_ms(status.last_exit.as_ref().map(|e| e.at_ms))
+                .with_last_exit_kind(status.last_exit.as_ref().map(|e| e.kind.into()))
+                .with_restart_count(Some(status.restart_count))
+                .with_max_restarts(Some(status.max_restarts))
+                .with_lifetime_restarts(Some(status.lifetime_restarts))
+                .with_spawn_generation(Some(status.spawn_generation))
+                .with_restart_window_secs(Some(status.restart_window.as_secs()))
+                .with_drain_timeout_ms(Some(status.drain_timeout.as_millis() as u64))
+                .with_restart_backoff_ms(Some(status.restart_backoff.as_millis() as u64))
+                .with_restart_max_backoff_ms(Some(status.restart_max_backoff.as_millis() as u64))
+                .with_resources(resources),
+            );
         }
         let response = ClientControlResponse::SupervisorList {
             generation,
@@ -5869,6 +5996,7 @@ fn module_control_request_op(request: &ModuleControlRequestFromModule) -> &'stat
         ModuleControlRequestFromModule::CatalogUpdate { .. } => MODULE_TO_SUBC_OP_CATALOG_UPDATE,
         ModuleControlRequestFromModule::LiveRoots {} => "supervisor.live_roots",
         ModuleControlRequestFromModule::ScopeSync { .. } => SCOPE_SYNC_OP,
+        ModuleControlRequestFromModule::ScopeApply { .. } => SCOPE_APPLY_OP,
         ModuleControlRequestFromModule::ScopeDescribe { .. } => SCOPE_DESCRIBE_OP,
     }
 }
@@ -12590,6 +12718,10 @@ mod tests {
     /// may sync is decided by the registration and launch nonce of the module
     /// connection, never by the request body.
     mod scopes {
+        mod delta {
+            include!("scope_handler_delta_tests.rs");
+        }
+
         use subc_protocol::scope::{
             ParentState, ScopeCarrier, ScopeKind, ScopeParent, ScopeRecordOutcome, ScopeStamp,
             ScopeStatus,
@@ -12600,15 +12732,7 @@ mod tests {
         const OWNER: &str = "prefrontal-core";
 
         fn head(scope_ref: &str, scope_epoch: u64) -> ScopeRecord {
-            ScopeRecord {
-                scope_ref: scope_ref.to_string(),
-                scope_epoch,
-                kind: ScopeKind::Head,
-                parent: None,
-                child_owners: Vec::new(),
-                carriers: Vec::new(),
-                attributes: Default::default(),
-            }
+            ScopeRecord::new(scope_ref, scope_epoch, ScopeKind::Head)
         }
 
         async fn call(
@@ -13015,6 +13139,10 @@ mod tests {
         }
 
         async fn rig_with_flow_support(flow_support: bool) -> Rig {
+            rig_with_scope_capabilities(flow_support, false).await
+        }
+
+        async fn rig_with_scope_capabilities(flow_support: bool, run_support: bool) -> Rig {
             let registry = Arc::new(Registry::default());
             let forwarding = Arc::new(ForwardingTable::default());
             let supervisor_handle = SupervisorHandle::new();
@@ -13060,9 +13188,15 @@ mod tests {
                 // declares `flow-scopes/v1` promises flow behaviour.
                 body["manifest"]["provenance"] =
                     serde_json::json!({"wire_crate_version": "0.29.0"});
-                if flow_support {
-                    body["manifest"]["capabilities"] =
-                        serde_json::json!({"provides": ["flow-scopes/v1"]});
+                if flow_support || run_support {
+                    let mut provides = Vec::new();
+                    if flow_support {
+                        provides.push("flow-scopes/v1");
+                    }
+                    if run_support {
+                        provides.push("agent-run-scopes/v1");
+                    }
+                    body["manifest"]["capabilities"] = serde_json::json!({"provides": provides});
                 }
                 let hello = Frame::build(
                     FrameType::Hello,
@@ -13089,12 +13223,10 @@ mod tests {
         }
 
         fn carrier(module_id: &str, targets: Option<&[&str]>) -> ScopeCarrier {
-            ScopeCarrier {
-                principal: Principal::Reserved {
-                    module_id: module_id.to_string(),
-                },
-                targets: targets.map(|targets| targets.iter().map(|t| t.to_string()).collect()),
-            }
+            ScopeCarrier::new(Principal::Reserved {
+                module_id: module_id.to_string(),
+            })
+            .with_targets(targets.map(|targets| targets.iter().map(|t| t.to_string()).collect()))
         }
 
         /// The scope most tests open under: aft carries to any module, broca
@@ -13877,13 +14009,13 @@ mod tests {
             let mut child = session(1);
             child.scope_ref = "child".to_string();
             child.kind = ScopeKind::Worker;
-            child.parent = Some(ScopeParent {
-                owner: Principal::Reserved {
+            child.parent = Some(ScopeParent::new(
+                Principal::Reserved {
                     module_id: OWNER.to_string(),
                 },
-                scope_ref: "s".to_string(),
-                scope_epoch: 1,
-            });
+                "s".to_string(),
+                1,
+            ));
             rig.sync(vec![session(1), child.clone()]).await;
             let mut child_route = rig
                 .bound(Some(AFT), PLEXUS, Some(rig_selector("child", Some(1))))

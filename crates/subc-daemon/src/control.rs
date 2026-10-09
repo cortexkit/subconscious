@@ -311,6 +311,10 @@ pub struct ControlHandler {
     /// `crate::scopes`. Shared by clones of this handler, so every connection
     /// reads and writes one table.
     scopes: Arc<RwLock<ScopeTable>>,
+    /// Wakes the expiry loop when an accepted scope change may have added a
+    /// deadline, so the loop can wait without ticking while no live scope has
+    /// one. A permit is stored when nothing waits, so no wake is lost.
+    scope_deadline_added: Arc<tokio::sync::Notify>,
     /// The configured `scope_authority_owners`, kept so a rescan can report a
     /// changed value as needing a daemon restart; rescan never applies it.
     scope_authority_owners: Vec<String>,
@@ -800,6 +804,7 @@ impl ControlHandler {
             scopes: Arc::new(RwLock::new(ScopeTable::new(
                 crate::daemon_config::default_scope_authority_owners(),
             ))),
+            scope_deadline_added: Arc::new(tokio::sync::Notify::new()),
             scope_authority_owners: crate::daemon_config::default_scope_authority_owners(),
             hello_launch_nonces: Arc::new(Mutex::new(HelloLaunchNonces::default())),
             rescan: None,
@@ -1028,12 +1033,22 @@ impl ControlHandler {
 
     /// The timer only prompts sweeps. Each sweep reads wall time again, so a
     /// deadline passed during sleep is enforced on the first tick after wake.
+    /// While no live scope carries a deadline the loop waits for an accepted
+    /// scope change instead of ticking, so a daemon without deadlines never
+    /// wakes for expiry.
     pub(crate) fn spawn_scope_expiry_loop(self: Arc<Self>) {
         tokio::spawn(async move {
-            let mut ticks = tokio::time::interval(Duration::from_secs(1));
-            ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
-                ticks.tick().await;
+                let has_deadlines = self
+                    .scopes
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .has_deadlines();
+                if !has_deadlines {
+                    self.scope_deadline_added.notified().await;
+                    continue;
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
                 if let Err(error) = self.sweep_expired_scopes() {
                     warn!(%error, "scope expiry sweep failed");
                 }
@@ -2678,7 +2693,11 @@ impl ControlHandler {
             Ok(applied) => self.publish_scope_changes(&applied.tag_changes, &applied.expired)?,
             Err(_) => Vec::new(),
         };
+        let has_deadlines = outcome.is_ok() && table.has_deadlines();
         drop(table);
+        if has_deadlines {
+            self.scope_deadline_added.notify_one();
+        }
         match outcome {
             Ok(applied) => {
                 let counts = ScopeOutcomeCounts::of(&applied.results);

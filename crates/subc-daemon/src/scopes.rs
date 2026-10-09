@@ -534,6 +534,17 @@ impl ScopeTable {
         expired
     }
 
+    /// Whether any live scope carries a deadline, which is when the expiry
+    /// loop needs to tick.
+    pub(crate) fn has_deadlines(&self) -> bool {
+        self.owners.values().any(|state| {
+            state
+                .live
+                .values()
+                .any(|scope| scope.record.expires_at_ms.is_some())
+        })
+    }
+
     /// Wall time decides expiry; timers only prompt this operation. Authority
     /// and generation are deliberately independent of a scope's lifetime.
     pub(crate) fn sweep_expired(&mut self) -> ExpirySwept {

@@ -112,6 +112,29 @@ fn sweep_expiry_uses_wall_time_and_refreshes_child_links() {
     assert!(resent.ended.is_empty());
 }
 
+/// The expiry loop ticks only while this is true, so it must turn on with the
+/// first deadline and off once the last deadline-bearing scope has ended.
+#[test]
+fn has_deadlines_tracks_only_live_scopes_with_a_deadline() {
+    let (mut table, clock) = clocked_table();
+    assert!(!table.has_deadlines());
+    sync(&mut table, OWNER, 1, vec![record("plain", 1)]);
+    assert!(!table.has_deadlines());
+    sync(
+        &mut table,
+        OWNER,
+        2,
+        vec![
+            record("plain", 1),
+            record("run", 1).with_expires_at_ms(Some(2_000)),
+        ],
+    );
+    assert!(table.has_deadlines());
+    clock.store(2_000, Ordering::SeqCst);
+    table.sweep_expired();
+    assert!(!table.has_deadlines());
+}
+
 #[test]
 fn sweep_expiry_outlives_authority_connection() {
     let (mut table, clock) = clocked_table();

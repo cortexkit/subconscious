@@ -20,6 +20,7 @@
     "scope_not_carrier": "terminal",
     "scope_not_live": "terminal",
     "scope_not_synced": "retryable",
+    "target_agent_run_unsupported": "terminal",
     "target_flow_unsupported": "terminal",
     "target_unavailable": "retryable",
     "unknown_module": "terminal"

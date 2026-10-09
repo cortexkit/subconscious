@@ -12,7 +12,10 @@ use serde_json::Value;
 
 use crate::{
     manifest::{CapabilityDeclarations, ProviderRole},
-    scope::{ScopeEnded, ScopeRecord, ScopeRecordResult, ScopeStamp, ScopeStatus},
+    scope::{
+        ScopeEnd, ScopeEndResult, ScopeEnded, ScopeRecord, ScopeRecordResult, ScopeStamp,
+        ScopeStatus,
+    },
     BindIdentity, Principal, RouteCloseReason, RouteTarget,
 };
 
@@ -190,6 +193,16 @@ pub enum ModuleControlRequestFromModule {
         generation: u64,
         scopes: Vec<ScopeRecord>,
     },
+    /// Change selected scopes after the daemon accepts a full `scope.sync` from
+    /// this connection. Shares the full sync's generation sequence. Unlike a
+    /// full sync, omitting a scope does not end it; expiry processing still runs.
+    /// A whole-call refusal is an `Error` frame and changes nothing.
+    #[serde(rename = "scope.apply")]
+    ScopeApply {
+        generation: u64,
+        upsert: Vec<ScopeRecord>,
+        end: Vec<ScopeEnd>,
+    },
     /// Read one scope's current state.
     #[serde(rename = "scope.describe")]
     ScopeDescribe {
@@ -223,6 +236,14 @@ pub enum ModuleControlResponseToModule {
     ScopeSync {
         generation: u64,
         results: Vec<ScopeRecordResult>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        ended: Vec<ScopeEnded>,
+    },
+    #[serde(rename = "scope.apply")]
+    ScopeApply {
+        generation: u64,
+        results: Vec<ScopeRecordResult>,
+        end_results: Vec<ScopeEndResult>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         ended: Vec<ScopeEnded>,
     },

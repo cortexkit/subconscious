@@ -1,0 +1,33 @@
+{
+  "end": [
+    {
+      "ref": "worker-1",
+      "scope_epoch": 1
+    },
+    {
+      "ref": "worker-0",
+      "scope_epoch": 9
+    }
+  ],
+  "generation": 8,
+  "op": "scope.apply",
+  "upsert": [
+    {
+      "attributes": {
+        "agent_id": "agent-7",
+        "run_id": "run:7/step-2"
+      },
+      "carriers": [
+        {
+          "principal": {
+            "kind": "direct"
+          }
+        }
+      ],
+      "expires_at_ms": 1725000030000,
+      "kind": "ephemeral",
+      "ref": "run-1",
+      "scope_epoch": 1
+    }
+  ]
+}

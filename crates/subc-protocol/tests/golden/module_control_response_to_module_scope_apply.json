@@ -1,0 +1,30 @@
+{
+  "end_results": [
+    {
+      "outcome": "ended",
+      "ref": "worker-1",
+      "scope_epoch": 1
+    },
+    {
+      "outcome": "not_live",
+      "ref": "worker-0",
+      "scope_epoch": 9
+    }
+  ],
+  "ended": [
+    {
+      "ref": "worker-1",
+      "scope_epoch": 1
+    }
+  ],
+  "generation": 8,
+  "op": "scope.apply",
+  "results": [
+    {
+      "outcome": "created",
+      "ref": "run-1",
+      "scope_epoch": 1,
+      "version": 1
+    }
+  ]
+}

@@ -361,6 +361,48 @@ for cand in "$(dirname "$staged_dir")/$CUR.current" \
     exit 2
   fi
 done
+# A currency declaration is the module owner's statement of which staged build
+# is live. It comes in two shapes: key=value ("stage=<path>", checked above)
+# and the older positional "<sha256>  <file>  <stamp>". The check above reads
+# only the key=value shape, so a leftover positional file naming an older
+# build could sit beside a correct key=value one and never be read. Here every
+# declaration, in either shape, either names the artifact being placed or
+# names something else. If some do and some don't, the owner's statement is
+# ambiguous, and the gate refuses even with --older, since --older means
+# "place an older build on purpose", not "ignore a contradiction".
+have_sha_all=$(shasum -a256 "$STAGED" | awk '{print $1}')
+yes_decls=""; no_decls=""
+for cand in "$(dirname "$staged_dir")/$CUR.current" \
+            "$staged_dir/$CUR.current" \
+            "$(dirname "$staged_dir")/ck-$CUR.current" \
+            "$staged_dir/ck-$CUR.current"; do
+  [ -f "$cand" ] || continue
+  if grep -q '^stage=' "$cand" 2>/dev/null; then
+    decl_stage=$(awk -F= '$1=="stage"{print $2}' "$cand")
+    case "$decl_stage" in
+      /*) ;;
+      *) decl_stage="$(cd "$(dirname "$cand")" && pwd)/$decl_stage" ;;
+    esac
+    if [ "$staged_dir" = "$decl_stage" ] || [ "$STAGED" = "$decl_stage" ]; then
+      yes_decls="$yes_decls $cand"
+    else
+      no_decls="$no_decls $cand"
+    fi
+  else
+    if [ "$(awk 'NR==1{print $1}' "$cand")" = "$have_sha_all" ]; then
+      yes_decls="$yes_decls $cand"
+    else
+      no_decls="$no_decls $cand"
+    fi
+  fi
+done
+if [ -n "$yes_decls" ] && [ -n "$no_decls" ]; then
+  echo "REFUSED: currency declarations for $CUR disagree about which artifact is live" >&2
+  echo "         name $(basename "$STAGED"):$yes_decls" >&2
+  echo "         name something else:$no_decls" >&2
+  echo "         Remove the stale one (record its content first), then retry." >&2
+  exit 2
+fi
 manifest="$staged_dir/ck-$CUR.current"
 staged_base=$(basename "$STAGED")
 if [ -n "$root_manifest" ]; then

@@ -548,3 +548,24 @@ async fn scope_expiry_loop_sweeps_within_one_second_using_injected_wall_clock() 
     assert!(!rig.live(&route));
     assert_eq!(route.closed_reason(), RouteCloseReason::ScopeEnded);
 }
+
+/// The loop waits without ticking while no live scope has a deadline. A
+/// deadline added after it has gone idle must wake it, or that scope would
+/// never expire.
+#[tokio::test(start_paused = true)]
+async fn idle_scope_expiry_loop_wakes_when_a_deadline_is_added() {
+    let mut rig = rig().await;
+    let clock = set_clock(&mut rig);
+    Arc::new(rig.handler.clone()).spawn_scope_expiry_loop();
+    tokio::task::yield_now().await;
+    rig.sync(vec![session(1).with_expires_at_ms(Some(2_000))])
+        .await;
+    let mut route = rig
+        .bound(Some(AFT), PLEXUS, Some(rig_selector("s", Some(1))))
+        .await;
+    clock.store(2_000, Ordering::SeqCst);
+    tokio::time::advance(Duration::from_secs(1)).await;
+    tokio::task::yield_now().await;
+    assert!(!rig.live(&route));
+    assert_eq!(route.closed_reason(), RouteCloseReason::ScopeEnded);
+}

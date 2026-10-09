@@ -69,14 +69,12 @@ fn control_wire_shapes_match_golden_json_and_round_trip() {
     );
     assert_golden(
         "catalog_entry_required_capability_unprovided",
-        &CatalogEntry {
-            ready: false,
-            not_ready: Some(NotReadyReason {
+        &catalog_entry_without_capabilities()
+            .with_ready(false)
+            .with_not_ready(Some(NotReadyReason {
                 reason: NotReadyReason::REQUIRED_CAPABILITY_UNPROVIDED.to_string(),
                 capability: Some("project-identity/v1".to_string()),
-            }),
-            ..catalog_entry_without_capabilities()
-        },
+            })),
     );
     assert_golden(
         "client_control_response_catalog_list_without_capabilities",
@@ -134,11 +132,7 @@ fn control_wire_shapes_match_golden_json_and_round_trip() {
         "supervisor_entry_reload_verdict_states",
         &verdicts
             .into_iter()
-            .map(|verdict| SupervisorEntry {
-                launch_nonce_env: None,
-                pending_reload: Some(verdict),
-                ..supervisor_entry()
-            })
+            .map(|verdict| supervisor_entry().with_pending_reload(Some(verdict)))
             .collect::<Vec<_>>(),
     );
     assert_golden(
@@ -179,11 +173,7 @@ fn control_wire_shapes_match_golden_json_and_round_trip() {
             },
         ]
         .into_iter()
-        .map(|resources| SupervisorEntry {
-            launch_nonce_env: None,
-            resources: Some(resources),
-            ..supervisor_entry()
-        })
+        .map(|resources| supervisor_entry().with_resources(Some(resources)))
         .collect::<Vec<_>>(),
     );
     assert_golden("poll_kind_status", &PollKind::Status);
@@ -944,83 +934,70 @@ fn bind_identity() -> BindIdentity {
 }
 
 fn catalog_entry() -> CatalogEntry {
-    CatalogEntry {
-        module_id: "aft-tools".to_string(),
-        ready: true,
-        not_ready: None,
-        module_version: Some("0.9.3".to_string()),
-        roles: provider_roles(),
-        control_ops: vec!["route.bind".to_string(), "route.status".to_string()],
-        capabilities: Some(CapabilityDeclarations {
-            provides: vec!["credentials-provider/v1".to_string()],
-            requires: vec![CapabilityRequirement {
-                capability: "context-transform/v1".to_string(),
-                need: CapabilityNeed::Optional,
-            }],
-            must_never_reach: vec!["federation-transport/v1".to_string()],
-        }),
-        self_signals: None,
-    }
+    CatalogEntry::new(
+        "aft-tools",
+        provider_roles(),
+        vec!["route.bind".to_string(), "route.status".to_string()],
+    )
+    .with_module_version(Some("0.9.3".to_string()))
+    .with_capabilities(Some(CapabilityDeclarations {
+        provides: vec!["credentials-provider/v1".to_string()],
+        requires: vec![CapabilityRequirement {
+            capability: "context-transform/v1".to_string(),
+            need: CapabilityNeed::Optional,
+        }],
+        must_never_reach: vec!["federation-transport/v1".to_string()],
+    }))
 }
 
 fn catalog_entry_with_self_signals() -> CatalogEntry {
-    CatalogEntry {
-        module_id: "signal-tools".to_string(),
-        ready: true,
-        not_ready: None,
-        module_version: Some("0.10.0".to_string()),
-        roles: Vec::new(),
-        control_ops: vec!["route.bind".to_string(), "route.status".to_string()],
-        capabilities: None,
-        self_signals: Some(vec![
-            SelfSignalDeclaration {
-                name: "provider_usage_poller".to_string(),
-                kind: SelfSignalKind::Poller,
-                effect: SelfSignalEffect::Observe,
-                anchored_to: SignalAnchor::FixedInterval,
-                cadence: Some(SignalCadence::Literal {
-                    interval_ms: 300_000,
-                }),
-                domain: Some("provider-usage".to_string()),
-                note: None,
+    CatalogEntry::new(
+        "signal-tools",
+        Vec::new(),
+        vec!["route.bind".to_string(), "route.status".to_string()],
+    )
+    .with_module_version(Some("0.10.0".to_string()))
+    .with_self_signals(Some(vec![
+        SelfSignalDeclaration {
+            name: "provider_usage_poller".to_string(),
+            kind: SelfSignalKind::Poller,
+            effect: SelfSignalEffect::Observe,
+            anchored_to: SignalAnchor::FixedInterval,
+            cadence: Some(SignalCadence::Literal {
+                interval_ms: 300_000,
+            }),
+            domain: Some("provider-usage".to_string()),
+            note: None,
+        },
+        SelfSignalDeclaration {
+            name: "claude_keepalive".to_string(),
+            kind: SelfSignalKind::Keepalive,
+            effect: SelfSignalEffect::Mutate,
+            anchored_to: SignalAnchor::Event {
+                event: "window_expiry".to_string(),
             },
-            SelfSignalDeclaration {
-                name: "claude_keepalive".to_string(),
-                kind: SelfSignalKind::Keepalive,
-                effect: SelfSignalEffect::Mutate,
-                anchored_to: SignalAnchor::Event {
-                    event: "window_expiry".to_string(),
-                },
-                cadence: Some(SignalCadence::Derived {
-                    source: "capacity_runtime.effective_cadence_ms".to_string(),
-                }),
-                domain: Some("provider-usage".to_string()),
-                note: Some("Keeps the provider session alive at the window boundary.".to_string()),
-            },
-        ]),
-    }
+            cadence: Some(SignalCadence::Derived {
+                source: "capacity_runtime.effective_cadence_ms".to_string(),
+            }),
+            domain: Some("provider-usage".to_string()),
+            note: Some("Keeps the provider session alive at the window boundary.".to_string()),
+        },
+    ]))
 }
 
 fn catalog_entry_without_capabilities() -> CatalogEntry {
-    CatalogEntry {
-        module_id: "legacy-tools".to_string(),
-        ready: true,
-        not_ready: None,
-        module_version: Some("0.8.0".to_string()),
-        roles: Vec::new(),
-        control_ops: vec!["route.bind".to_string(), "route.status".to_string()],
-        capabilities: None,
-        self_signals: None,
-    }
+    CatalogEntry::new(
+        "legacy-tools",
+        Vec::new(),
+        vec!["route.bind".to_string(), "route.status".to_string()],
+    )
+    .with_module_version(Some("0.8.0".to_string()))
 }
 
 fn catalog_entry_without_operation_description() -> CatalogEntry {
-    CatalogEntry {
-        module_id: "legacy-management".to_string(),
-        ready: true,
-        not_ready: None,
-        module_version: Some("0.7.0".to_string()),
-        roles: vec![ProviderRole::ManagementSurface {
+    CatalogEntry::new(
+        "legacy-management",
+        vec![ProviderRole::ManagementSurface {
             operations: vec![ManagementOperation {
                 name: "records.list".to_string(),
                 kind: ManagementOperationKind::Query,
@@ -1031,10 +1008,9 @@ fn catalog_entry_without_operation_description() -> CatalogEntry {
             identity_scope: vec![IdentityScope::Project],
             concurrency: Concurrency::ModuleManaged,
         }],
-        control_ops: Vec::new(),
-        capabilities: None,
-        self_signals: None,
-    }
+        Vec::new(),
+    )
+    .with_module_version(Some("0.7.0".to_string()))
 }
 
 fn spawn_cursor(seq: u64) -> SpawnCursor {
@@ -1045,36 +1021,27 @@ fn spawn_cursor(seq: u64) -> SpawnCursor {
 }
 
 fn supervisor_entry() -> SupervisorEntry {
-    SupervisorEntry {
-        launch_nonce_env: None,
-        module_id: "aft-tools".to_string(),
-        state: "running".to_string(),
-        enabled: true,
-        live: true,
-        protocol: ModuleProtocol::Subc,
-        health: SupervisorHealthStatus::Degraded,
-        pending_reload: None,
-        last_probe_ms: Some(1_700_000_000_000),
-        last_exit_code: None,
-        last_exit_signal: None,
-        last_exit_ms: Some(1_700_000_000_123),
-        last_exit_kind: None,
-        // Non-equal and non-zero so the pin would catch the two fields being
-        // swapped, which equal values or a zeroed count could not.
-        restart_count: Some(2),
-        max_restarts: Some(3),
-        lifetime_restarts: None,
-        spawn_generation: None,
-        // The pre-window shape: a daemon that never had a window omits the key,
-        // and this golden is what pins that omission.
-        restart_window_secs: None,
-        // This golden represents an older daemon and must keep all additive
-        // policy fields absent.
-        drain_timeout_ms: None,
-        restart_backoff_ms: None,
-        restart_max_backoff_ms: None,
-        resources: None,
-    }
+    SupervisorEntry::new(
+        "aft-tools",
+        "running",
+        true,
+        true,
+        SupervisorHealthStatus::Degraded,
+    )
+    .with_last_probe_ms(Some(1_700_000_000_000))
+    .with_last_exit_ms(Some(1_700_000_000_123))
+    // Non-equal and non-zero so the pin would catch the two fields being
+    // swapped, which equal values or a zeroed count could not.
+    .with_restart_count(Some(2))
+    .with_max_restarts(Some(3))
+    // The pre-window shape: a daemon that never had a window omits the key,
+    // and this golden is what pins that omission.
+    .with_restart_window_secs(None)
+    // This golden represents an older daemon and must keep all additive
+    // policy fields absent.
+    .with_drain_timeout_ms(None)
+    .with_restart_backoff_ms(None)
+    .with_restart_max_backoff_ms(None)
 }
 
 #[test]
@@ -1108,17 +1075,14 @@ fn reload_path_unknown_variant_and_reason_preserve_forward_wire() {
 /// minutes" -- and a reader that cannot see which one it has will read a
 /// recovered module as a nearly-dead one.
 fn supervisor_entry_with_restart_window() -> SupervisorEntry {
-    SupervisorEntry {
-        launch_nonce_env: None,
-        restart_window_secs: Some(600),
+    supervisor_entry()
+        .with_restart_window_secs(Some(600))
         // Deliberately unlike the built-in 30_000/100/30_000 policy so this
         // golden cannot be satisfied by reporting defaults instead of the
         // parsed policy the supervisor is running.
-        drain_timeout_ms: Some(4_321),
-        restart_backoff_ms: Some(257),
-        restart_max_backoff_ms: Some(9_876),
-        ..supervisor_entry()
-    }
+        .with_drain_timeout_ms(Some(4_321))
+        .with_restart_backoff_ms(Some(257))
+        .with_restart_max_backoff_ms(Some(9_876))
 }
 
 /// A lifetime count is an additive fact: new peers preserve it exactly, while
@@ -1205,11 +1169,7 @@ fn supervisor_entry_carries_the_declared_protocol_verbatim() {
     let subc = serde_json::to_value(supervisor_entry()).expect("entry serializes");
     assert_eq!(subc["protocol"], "subc");
 
-    let none_entry = SupervisorEntry {
-        launch_nonce_env: None,
-        protocol: ModuleProtocol::None,
-        ..supervisor_entry()
-    };
+    let none_entry = supervisor_entry().with_protocol(ModuleProtocol::None);
     let encoded = serde_json::to_value(&none_entry).expect("entry serializes");
     assert_eq!(encoded["protocol"], "none");
 
@@ -1252,13 +1212,9 @@ fn supervisor_entry_without_resources_decodes_as_absent_not_zero() {
     let decoded: SupervisorEntry = serde_json::from_value(old_wire).expect("old wire decodes");
     assert_eq!(decoded.resources, None);
 
-    let unavailable = SupervisorEntry {
-        launch_nonce_env: None,
-        resources: Some(ChildResourceUsage::Unavailable {
-            reason: ChildResourceUnavailableReason::Unreadable,
-        }),
-        ..supervisor_entry()
-    };
+    let unavailable = supervisor_entry().with_resources(Some(ChildResourceUsage::Unavailable {
+        reason: ChildResourceUnavailableReason::Unreadable,
+    }));
     let encoded = serde_json::to_value(&unavailable).expect("entry serializes");
     assert_eq!(
         encoded["resources"],

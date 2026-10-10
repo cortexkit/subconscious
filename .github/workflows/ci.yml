@@ -265,7 +265,7 @@ jobs:
       - name: Test
         if: ${{ !cancelled() }}
         timeout-minutes: 40
-        run: cargo test --workspace --all-targets --locked
+        run: cargo test --workspace --all-targets --locked --no-fail-fast
 
       # --all-targets does NOT include doctests, despite the name: it expands to
       # --lib --bins --tests --benches --examples. So a doc example that stops

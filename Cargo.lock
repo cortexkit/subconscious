@@ -2007,6 +2007,16 @@ dependencies = [
 
 [[package]]
 name = "subc-os"
+version = "0.1.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "deaa591b1073aed5dcc9af687eb2bf45839bd3296a04b598b29cc2bee1bfe8d9"
+dependencies = [
+ "libc",
+ "rustix",
+]
+
+[[package]]
+name = "subc-os"
 version = "0.1.11"
 dependencies = [
  "libc",
@@ -2014,16 +2024,6 @@ dependencies = [
  "subc-os 0.1.11",
  "tokio",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "subc-os"
-version = "0.1.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "deaa591b1073aed5dcc9af687eb2bf45839bd3296a04b598b29cc2bee1bfe8d9"
-dependencies = [
- "libc",
- "rustix",
 ]
 
 [[package]]

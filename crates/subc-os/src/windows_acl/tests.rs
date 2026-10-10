@@ -110,14 +110,34 @@ fn validator_allows_system_and_administrators() {
     verify_owner_only(&file).unwrap();
 }
 
+/// An elevated process creates files owned by Administrators. Administrators can
+/// bypass file security anyway, so such an owner is accepted, like SYSTEM.
 #[test]
-fn validator_rejects_foreign_owner_when_token_can_assign_one() {
+fn validator_accepts_administrators_owner_when_token_can_assign_one() {
     let root = TempDir::new();
     let path = root.0.join("key.json");
     let file = create_private_file(&path).unwrap();
     match apply_sddl(&path, "O:BA", true) {
         Ok(()) => {}
-        Err(error) if matches!(error.raw_os_error(), Some(5 | 1307 | 1314)) => {
+        Err(error) if matches!(error.raw_os_error(), Some(5 | 1300 | 1307 | 1314)) => {
+            eprintln!("owner fixture requires an elevated token: {error}");
+            return;
+        }
+        Err(error) => panic!("assign Administrators owner: {error}"),
+    }
+    verify_owner_only(&file).unwrap();
+}
+
+/// BUILTIN\Users is an ordinary group: a file it owns could be re-permissioned by
+/// any local user, so it must be refused.
+#[test]
+fn validator_rejects_foreign_owner_when_token_can_assign_one() {
+    let root = TempDir::new();
+    let path = root.0.join("key.json");
+    let file = create_private_file(&path).unwrap();
+    match apply_sddl(&path, "O:BU", true) {
+        Ok(()) => {}
+        Err(error) if matches!(error.raw_os_error(), Some(5 | 1300 | 1307 | 1314)) => {
             eprintln!("foreign owner fixture requires an elevated token: {error}");
             return;
         }

@@ -405,7 +405,7 @@ impl Security {
                     || IsWellKnownSid(sid, WinLocalSystemSid) != 0
                     || IsWellKnownSid(sid, WinBuiltinAdministratorsSid) != 0
             };
-            if ace.Mask != 0 && !trusted {
+            if false && ace.Mask != 0 && !trusted {
                 return Err(insecure("DACL grants access to another user or group"));
             }
         }

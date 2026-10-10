@@ -53,8 +53,10 @@ fn created_directories_have_exact_protected_user_dacls() {
     assert_owner_only(&parent, true, true);
     assert_owner_only(&path, true, true);
     let child = path.join("inherited.txt");
+    // A plain write takes the token's default owner (Administrators on an
+    // elevated runner); what matters here is the access list it inherits.
     std::fs::write(&child, b"private").unwrap();
-    assert_owner_only(&child, false, false);
+    assert_dacl_owner_only(&child, false, false);
 }
 
 #[test]
@@ -71,8 +73,8 @@ fn existing_directory_narrows_unprotected_descendants() {
     // `run` existed before narrowing, so only its access list changes; an
     // elevated test runner owns it as Administrators.
     assert_dacl_owner_only(&run, true, true);
-    assert_owner_only(&nested, true, false);
-    assert_owner_only(&child, false, false);
+    assert_dacl_owner_only(&nested, true, false);
+    assert_dacl_owner_only(&child, false, false);
     assert!(
         verify_private_dir(&root.0).is_err(),
         "existing parent stays broad"

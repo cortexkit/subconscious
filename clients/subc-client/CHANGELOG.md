@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.21.3
+
+- Add `launchNonceAsync()` and `launchNonceOrUndefinedAsync()` and use them for SDK HELLO/serve and route-open. On Windows, `SUBC_LAUNCH_NONCE_PIPE` selects a bounded busy-retrying, EOF-reading named pipe, caches successes and failures, and never falls back to the environment. Unix descriptor and environment readers retain their existing behavior.
+- Sync accessors throw `PipeNeedsAsync` while a Windows pipe has not been initialized: call the async reader first, then sync and async accessors share its cached answer. Report `pipe` as the nonce source.
+- Node's `net.connect` requests no security quality-of-service (SQOS) flags and cannot limit the server to inspecting identity without impersonating it. A counterfeit server could impersonate the module's token (the same user's token); the daemon reserves the first instance before the module starts. The daemon's DACL also grants `FILE_WRITE_ATTRIBUTES` for libuv's read-only open, not generic write or pipe-instance creation. Phase one retains the environment copy and is not by itself a security improvement.
+
 ## 0.21.2
 
 - Measure a frame body's read budget as time without progress rather than wall-clock time since its header. Each incoming chunk pushes the deadline out by the budget again, so a slow but moving body does not time out, while a body that stops arriving still fails after the budget. Absolute deadlines, such as the handshake's, stay fixed: arriving bytes never extend them.

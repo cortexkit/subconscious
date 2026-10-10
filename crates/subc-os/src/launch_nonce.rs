@@ -9,11 +9,9 @@
 //! module side is [`launch_nonce`]: it reads that descriptor once, closes it,
 //! and caches the value for the life of the process.
 //!
-//! While modules move over, the daemon also keeps setting the environment
-//! copy ([`LAUNCH_NONCE_ENV`]), and [`launch_nonce`] reads it when no
-//! descriptor is named. Windows has no descriptor handoff yet: an inheritable
-//! handle there leaks to every process any thread creates concurrently, so
-//! Windows keeps the environment copy only.
+//! Windows uses a one-time named pipe authenticated to the direct child's PID.
+//! The daemon still sets the Windows environment copy for readers that have
+//! not adopted the pipe; a named pipe takes precedence and never falls back.
 
 use std::{
     ffi::OsString,
@@ -31,6 +29,9 @@ pub const LAUNCH_NONCE_FD: i32 = 3;
 /// close whatever that process has at the number.
 pub const LAUNCH_NONCE_FD_ENV: &str = "SUBC_LAUNCH_NONCE_FD";
 
+/// Names the one-time Windows pipe. Its name is public, not a credential.
+pub const LAUNCH_NONCE_PIPE_ENV: &str = "SUBC_LAUNCH_NONCE_PIPE";
+
 /// The environment copy of the nonce, kept only while modules move to the
 /// descriptor. Same name as `subc_protocol::SUBC_LAUNCH_NONCE_ENV`; this crate
 /// does not depend on subc-protocol, so it states the name itself.
@@ -42,15 +43,18 @@ pub const LAUNCH_NONCE_ENV: &str = "SUBC_LAUNCH_NONCE";
 pub enum LaunchNonceSource {
     /// The inherited descriptor named by [`LAUNCH_NONCE_FD_ENV`].
     Fd,
+    /// The PID-authenticated Windows pipe named by [`LAUNCH_NONCE_PIPE_ENV`].
+    Pipe,
     /// The environment variable [`LAUNCH_NONCE_ENV`].
     Env,
 }
 
 impl LaunchNonceSource {
-    /// The name modules report in their provenance: `fd` or `env`.
+    /// The name modules report in their provenance.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Fd => "fd",
+            Self::Pipe => "pipe",
             Self::Env => "env",
         }
     }
@@ -86,12 +90,13 @@ impl fmt::Debug for LaunchNonce {
     }
 }
 
-/// Why the descriptor named by [`LAUNCH_NONCE_FD_ENV`] gave no nonce.
+/// Why a named launch-nonce handoff gave no nonce.
 ///
-/// None of these falls back to the environment copy. A named descriptor
+/// None of these falls back to the environment copy. A named descriptor or pipe
 /// that cannot be read means the handoff went wrong, or that this process
 /// inherited the variable from a module without inheriting the pipe; reading
-/// the environment instead would hide the first and defeat the second.
+/// the environment instead would hide a failed handoff or admit a descendant
+/// using its parent's environment credential.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum LaunchNonceError {
@@ -114,11 +119,23 @@ pub enum LaunchNonceError {
     Unreadable { fd: i32, errno: Option<i32> },
     /// The named pipe held bytes that are not UTF-8.
     NotUtf8 { fd: i32 },
+    /// The named Windows pipe could not be opened within the busy retry window.
+    PipeNotOpen { errno: i32 },
+    /// The named Windows pipe held no bytes.
+    PipeEmpty,
+    /// Reading the Windows pipe failed or exceeded its deadline.
+    PipeUnreadable { errno: Option<i32> },
+    /// The Windows pipe held bytes that are not UTF-8.
+    PipeNotUtf8,
 }
 
 impl fmt::Display for LaunchNonceError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::PipeNotOpen { errno } => write!(f, "{LAUNCH_NONCE_PIPE_ENV} names a pipe that could not be opened (errno {errno})"),
+            Self::PipeEmpty => write!(f, "the launch nonce named pipe is empty"),
+            Self::PipeUnreadable { errno } => write!(f, "could not read the launch nonce from the named pipe (errno {errno:?})"),
+            Self::PipeNotUtf8 => write!(f, "the launch nonce named pipe held bytes that are not UTF-8"),
             Self::Malformed { value } => write!(
                 f,
                 "{LAUNCH_NONCE_FD_ENV}={value:?} is not <fd>:<inode>"
@@ -208,18 +225,21 @@ static PROCESS_NONCE: LaunchNonceCell = LaunchNonceCell::new();
 ///   bytes; it is then read to end of file and closed. Anything else is a
 ///   [`LaunchNonceError`] that leaves the descriptor as it was and never
 ///   falls back to the environment.
-/// - Otherwise the value of [`LAUNCH_NONCE_ENV`] is used. Windows always
-///   takes this path.
-/// - `Ok(None)` means neither is set (or the environment copy is empty): the
+/// - On Windows, when [`LAUNCH_NONCE_PIPE_ENV`] is set, the named pipe is opened
+///   read-only at identification impersonation level and read to EOF with a
+///   bounded deadline. Errors are cached and never fall back.
+/// - Otherwise the value of [`LAUNCH_NONCE_ENV`] is used.
+/// - `Ok(None)` means no handoff is named (or the environment copy is empty): the
 ///   process was not started by the daemon.
 ///
 /// It never changes the environment. Removing either variable would break
 /// any other reader in the process still on the environment copy, and
-/// changing the environment of a multi-threaded process is unsound.
+/// changing the environment of a multi-threaded process can race readers in
+/// libraries whose environment access cannot be synchronized by this accessor.
 ///
 /// Call it before the process spawns anything. Until the first read the
 /// descriptor is inheritable (it has to be, to survive the daemon's exec),
-/// so a child spawned earlier would inherit the pipe.
+/// so a child spawned earlier could inherit and consume the module's secret.
 pub fn launch_nonce() -> Result<Option<LaunchNonce>, LaunchNonceError> {
     PROCESS_NONCE.get(|key| std::env::var_os(key))
 }
@@ -228,6 +248,10 @@ fn read_launch_nonce(
     mut lookup: impl FnMut(&str) -> Option<OsString>,
     descriptor_reads: &AtomicUsize,
 ) -> Cached {
+    #[cfg(windows)]
+    if let Some(value) = lookup(LAUNCH_NONCE_PIPE_ENV) {
+        return windows::read_pipe(&value);
+    }
     #[cfg(unix)]
     if let Some(value) = lookup(LAUNCH_NONCE_FD_ENV) {
         return unix::read_descriptor(&value, descriptor_reads);
@@ -245,6 +269,13 @@ fn read_launch_nonce(
 
 #[cfg(unix)]
 pub use unix::LaunchNonceHandoff;
+
+#[cfg(windows)]
+pub use windows::{LaunchNoncePipeDelivery, LaunchNoncePipeHandoff};
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+mod windows;
 
 #[cfg(unix)]
 mod unix {

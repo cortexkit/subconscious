@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.20.73
+
+- Show server-observed Windows launch-nonce sources in `ck module list`, module status and provenance. Unix tables remain unchanged when the observation is absent.
+
 ## 0.20.72
 
 - Discover external `ck-<name>` domains from the CortexKit bin directory before searching PATH, so a domain command works as `ck <name>` without its binary being on PATH.

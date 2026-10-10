@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.11
+
+- Add the Windows one-time launch-nonce named pipe and `Pipe` source in the process cache: read-only identification-level opens, bounded busy/read deadlines, and no environment fallback after a pipe is named. The server reserves a random first instance before spawn, rejects remote clients, verifies the direct child's PID, and closes on delivery, exit or deadline.
+- The protected current-user DACL grants `GENERIC_READ | SYNCHRONIZE | FILE_WRITE_ATTRIBUTES`; the additional attribute bit supports libuv's read-only connection attempt without granting data writes or `FILE_CREATE_PIPE_INSTANCE`.
+
 ## 0.1.10
 
 - Add `process_identity` with opaque, versioned kernel start times and PID-reuse-safe `Alive`/`Dead`/`Unknown` liveness checks. Encodings match existing Linux and macOS lease identities; Linux zombies count as dead, and unreadable or incompatible identities remain unknown. Callers must treat unknown as alive and reclaim leases or scratch directories only on dead. Other Unix platforms can probe existence; Windows returns unknown.

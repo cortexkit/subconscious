@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.30.1
+
+- Recognize `pipe` as a launch-nonce provenance source for Windows named-pipe readers; retain the open enum's unknown-source compatibility.
+
 ## 0.30.0
 
 - **Breaking.** `ScopeRecord` gains `expires_at_ms: Option<u64>`, an absolute Unix wall-clock deadline in milliseconds that the daemon enforces itself: at the deadline the scope ends as if its owner had removed it, routes under it close with `scope_ended`, and that ref at that epoch can never return (`scope_expired`). The deadline is fixed for the epoch (`scope_expiry_immutable`) and at most `MAX_SCOPE_EXPIRY_AHEAD_MS` (24 hours) ahead (`scope_expiry_too_far`).

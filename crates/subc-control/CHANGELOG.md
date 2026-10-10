@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.29.1
+
+- Add optional `launch_nonce_source` to supervisor list entries and daemon-observed module provenance for the Windows per-spawn pipe census. Older payloads still decode and absent fields still serialize identically.
+
 ## 0.29.0
 
 - **Breaking.** `CatalogEntry` and `SupervisorEntry` are `#[non_exhaustive]`; build them with `new` and the `with_*` setters, so later fields are not breaking. Requires `subc-protocol` 0.30. Wire bytes are unchanged.

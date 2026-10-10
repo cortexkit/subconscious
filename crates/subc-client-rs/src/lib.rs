@@ -41,9 +41,11 @@ use std::{
 pub use async_trait::async_trait;
 pub use subc_control::{CatalogEntry, ConsumerIdentity};
 /// The one launch-nonce reader for a module process: `launch_nonce()` reads
-/// the inherited descriptor (or, while the daemon still sets it, the
-/// `SUBC_LAUNCH_NONCE` environment copy) once and caches it. The SDK's HELLO and route opens go through it too; a module's
-/// own readers must as well, and it should call it before spawning anything.
+/// the inherited Unix descriptor, the Windows named pipe, or, when neither is
+/// named, the `SUBC_LAUNCH_NONCE` environment copy once and caches it. The SDK's
+/// HELLO and route opens go through it too; a module's own readers must as well.
+/// Read before spawning children so they cannot inherit an unread Unix pipe
+/// containing the module's credential.
 pub use subc_os::launch_nonce;
 use subc_protocol::{
     error_codes,
@@ -4466,7 +4468,7 @@ fn retained_launch_nonce() -> Option<String> {
 }
 
 /// Where this process read its launch nonce, in the form module provenance
-/// reports it (`fd` or `env`), or `None` when it has none or could not read
+/// reports it (`fd`, `pipe` or `env`), or `None` when it has none or could not read
 /// it. For a module that builds its provenance block itself:
 /// `.with_launch_nonce_source(subc_client_rs::launch_nonce_source())`.
 pub fn launch_nonce_source() -> Option<LaunchNonceSource> {

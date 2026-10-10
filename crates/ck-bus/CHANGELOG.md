@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.11
+
+- Update supervised launch-nonce provenance tests to expect the shared accessor's named-pipe source on Windows; Unix still expects the descriptor source.
+
 ## 0.3.10
 
 - Moves to `subc-protocol` 0.30 and `subc-client-rs` 0.27. No behaviour change.

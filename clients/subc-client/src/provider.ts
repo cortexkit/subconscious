@@ -27,7 +27,8 @@ import {
 } from "./envelope.js";
 import {
   isLaunchNonceError,
-  launchNonce as processLaunchNonce,
+  launchNonceAsync as processLaunchNonce,
+  launchNonceOrUndefinedAsync,
   launchNonceOrUndefined,
   type LaunchNonceError,
   type LaunchNonceSource,
@@ -680,7 +681,7 @@ export class SubcProvider {
       );
     }
 
-    const normalized = normalizeProviderConnectOptions(opts);
+    const normalized = await normalizeProviderConnectOptions(opts);
     const opened = await SubcProvider.openConnection(normalized);
     return new SubcProvider(opened.sock, opened.conn, normalized, opened.ack);
   }
@@ -1466,7 +1467,7 @@ function nonEmpty(value: string | undefined): string | undefined {
   return value && value.length > 0 ? value : undefined;
 }
 
-function normalizeProviderConnectOptions(opts: SubcProviderConnectOptions): NormalizedSubcProviderConnectOptions {
+async function normalizeProviderConnectOptions(opts: SubcProviderConnectOptions): Promise<NormalizedSubcProviderConnectOptions> {
   // The environment is read once here. The daemon injects both variables when it
   // spawns a module; together they mark the process as supervised, and the nonce
   // is also what HELLO echoes for a reserved module_id.
@@ -1478,13 +1479,13 @@ function normalizeProviderConnectOptions(opts: SubcProviderConnectOptions): Norm
   let processNonce: string | undefined;
   if (opts.launchNonce === undefined) {
     try {
-      processNonce = processLaunchNonce()?.value;
+      processNonce = (await processLaunchNonce())?.value;
     } catch (error) {
       if (isLaunchNonceError(error)) throw launchNonceUnavailable(error);
       throw error;
     }
   } else {
-    processNonce = launchNonceOrUndefined()?.value;
+    processNonce = (await launchNonceOrUndefinedAsync())?.value;
   }
   const envLaunchNonce = nonEmpty(processNonce);
   const supervised = envModuleId !== undefined && envLaunchNonce !== undefined;

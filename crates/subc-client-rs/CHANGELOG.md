@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.27.1
+
+- Document the shared Windows named-pipe launch-nonce reader used by HELLO and route-open. Update supervised-reader integration expectations to `pipe` on Windows and check daemon-observed consumption; Unix remains `fd`.
+
 ## 0.27.0
 
 - Add `ModuleHandle::scope_apply(generation, upsert, end)`, returning `ScopeApplyReply`. It returns `ScopeCallError::NotSupported` without sending anything when the daemon does not advertise `scope.apply`; a daemon that does also accepts `expires_at_ms`.

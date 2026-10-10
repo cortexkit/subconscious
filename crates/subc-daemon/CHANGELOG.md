@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.33.3
+
+- Serve Windows wire-module launch secrets over per-spawn PID-authenticated named pipes, including swap candidates. Keep the environment copy during phase one; this phase alone does not remove environment exposure. Record pipe consumption independently of HELLO declarations and report `pipe`/`env` in supervisor list and observed provenance.
+
 ## 0.33.2
 
 - Log pre-authentication rejections at info level with the peer, elapsed time, and a reason that distinguishes capacity waits, handshake deadlines, invalid proofs, malformed messages, and peers that close early. Rate-limit each reason and include its accumulated suppressed count on the next permitted line.

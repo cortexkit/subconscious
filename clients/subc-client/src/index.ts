@@ -89,10 +89,13 @@ export { SubcSocket, SocketClosedError, SocketTimeoutError } from "./socket.js";
 export {
   launchNonce,
   launchNonceOrUndefined,
+  launchNonceAsync,
+  launchNonceOrUndefinedAsync,
   isLaunchNonceError,
   LaunchNonceError,
   LAUNCH_NONCE_FD,
   SUBC_LAUNCH_NONCE_FD_ENV,
+  SUBC_LAUNCH_NONCE_PIPE_ENV,
   type LaunchNonce,
   type LaunchNonceErrorKind,
   type LaunchNonceSource,

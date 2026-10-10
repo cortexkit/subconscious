@@ -56,6 +56,20 @@ fn launch_nonce_source_round_trips_fd_and_env() {
 }
 
 #[test]
+fn launch_nonce_source_pipe_is_known_and_round_trips() {
+    let provenance =
+        ManifestProvenance::new().with_launch_nonce_source(Some(LaunchNonceSource::Pipe));
+    let encoded = serde_json::to_value(&provenance).unwrap();
+    assert_eq!(encoded, json!({ "launch_nonce_source": "pipe" }));
+    let decoded: ManifestProvenance = serde_json::from_value(encoded).unwrap();
+    assert_eq!(decoded.launch_nonce_source, Some(LaunchNonceSource::Pipe));
+    assert_eq!(
+        LaunchNonceSource::from_wire_name("pipe"),
+        LaunchNonceSource::Pipe
+    );
+}
+
+#[test]
 fn an_unset_launch_nonce_source_is_omitted_and_an_absent_one_decodes_as_none() {
     let encoded = serde_json::to_value(ManifestProvenance::new()).unwrap();
     assert_eq!(encoded, json!({}));

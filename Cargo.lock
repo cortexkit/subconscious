@@ -264,7 +264,7 @@ dependencies = [
 
 [[package]]
 name = "ck-bus"
-version = "0.3.10"
+version = "0.3.11"
 dependencies = [
  "async-nats",
  "async-trait",
@@ -453,7 +453,7 @@ checksum = "987f96b58d7a73a04dd34ffa7149f64c78914b1570a457e6c00cf0c7291aba1c"
 dependencies = [
  "rustix",
  "sha2",
- "subc-os 0.1.10 (registry+https://github.com/rust-lang/crates.io-index)",
+ "subc-os 0.1.10",
  "tokio",
 ]
 
@@ -1873,7 +1873,7 @@ dependencies = [
 
 [[package]]
 name = "subc-client-rs"
-version = "0.27.0"
+version = "0.27.1"
 dependencies = [
  "async-trait",
  "cortexkit-test-support",
@@ -1881,7 +1881,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "subc-control",
- "subc-os 0.1.10",
+ "subc-os 0.1.11",
  "subc-protocol",
  "subc-transport",
  "syn 2.0.118",
@@ -1892,7 +1892,7 @@ dependencies = [
 
 [[package]]
 name = "subc-control"
-version = "0.29.0"
+version = "0.29.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -1901,7 +1901,7 @@ dependencies = [
 
 [[package]]
 name = "subc-core"
-version = "0.20.72"
+version = "0.20.73"
 dependencies = [
  "base64",
  "cortexkit-log",
@@ -1918,7 +1918,7 @@ dependencies = [
  "subc-core",
  "subc-daemon",
  "subc-jsonc",
- "subc-os 0.1.10",
+ "subc-os 0.1.11",
  "subc-protocol",
  "subc-transport",
  "terminal_size",
@@ -1929,7 +1929,7 @@ dependencies = [
 
 [[package]]
 name = "subc-daemon"
-version = "0.33.2"
+version = "0.33.3"
 dependencies = [
  "cortexkit-log",
  "cortexkit-paths",
@@ -1947,7 +1947,7 @@ dependencies = [
  "subc-control",
  "subc-jobobject",
  "subc-jsonc",
- "subc-os 0.1.10",
+ "subc-os 0.1.11",
  "subc-presence",
  "subc-protocol",
  "subc-transport",
@@ -1987,7 +1987,7 @@ dependencies = [
 
 [[package]]
 name = "subc-mcp"
-version = "0.1.30"
+version = "0.1.31"
 dependencies = [
  "cortexkit-log",
  "cortexkit-test-support",
@@ -1998,7 +1998,7 @@ dependencies = [
  "subc-control",
  "subc-daemon",
  "subc-jsonc",
- "subc-os 0.1.10",
+ "subc-os 0.1.11",
  "subc-protocol",
  "subc-transport",
  "tokio",
@@ -2007,12 +2007,13 @@ dependencies = [
 
 [[package]]
 name = "subc-os"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "libc",
  "rustix",
- "subc-os 0.1.10",
+ "subc-os 0.1.11",
  "tokio",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2040,7 +2041,7 @@ dependencies = [
 
 [[package]]
 name = "subc-protocol"
-version = "0.30.0"
+version = "0.30.1"
 dependencies = [
  "serde",
  "serde_json",

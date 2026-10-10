@@ -275,6 +275,8 @@ fn privacy_command(
 
 struct SupervisedChild {
     child: Child,
+    #[cfg(windows)]
+    nonce_delivery: Option<subc_os::LaunchNoncePipeDelivery>,
     #[cfg(target_os = "macos")]
     privacy_exec: Option<PrivacyExec>,
     /// Set once this launch's exec acknowledgement confirms the module image.
@@ -990,6 +992,8 @@ pub struct ExitReport {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModuleStatus {
     pub module_id: String,
+    /// Server-observed Windows handoff source, not the module's declaration.
+    pub launch_nonce_source: Option<String>,
     pub state: ModuleState,
     pub enabled: bool,
     pub process_alive: bool,
@@ -1058,6 +1062,8 @@ struct ActorSelectCheckpoint {
 
 #[derive(Debug, Clone, PartialEq)]
 struct SupervisorSnapshot {
+    #[cfg(windows)]
+    pipe_consumed: Option<Arc<OnceLock<()>>>,
     /// Counts running-child loop turns, not executor polls of a parked wait.
     #[cfg(test)]
     actor_turns: u64,
@@ -1216,6 +1222,8 @@ impl SupervisorSnapshot {
             state,
             enabled,
             process_alive: false,
+            #[cfg(windows)]
+            pipe_consumed: None,
             spawned_protocol: None,
             spawn_failure: None,
             crash_restarts: VecDeque::new(),
@@ -3348,6 +3356,7 @@ impl SupervisedModule {
         Ok((
             ModuleStatus {
                 module_id: self.inner.module_id.clone(),
+                launch_nonce_source: observed_launch_nonce_source(&snapshot),
                 state: snapshot.state,
                 enabled: snapshot.enabled,
                 process_alive: snapshot.process_alive,
@@ -7408,11 +7417,13 @@ fn apply_wire_spawn_args(
 
 /// The read end of a spawn's launch-nonce pipe, prepared by
 /// [`apply_wire_spawn_args_for_role`] and installed as the child's descriptor 3
-/// by the last pre-exec step, just before `spawn()`. Windows has no descriptor
-/// handoff and keeps only the environment copy.
+/// by the last pre-exec step, just before `spawn()`. Windows prepares a named
+/// server before spawn and authenticates its client after the child exists.
 #[cfg(unix)]
 type NonceHandoff = subc_os::LaunchNonceHandoff;
-#[cfg(not(unix))]
+#[cfg(windows)]
+type NonceHandoff = subc_os::LaunchNoncePipeHandoff;
+#[cfg(not(any(unix, windows)))]
 type NonceHandoff = std::convert::Infallible;
 
 /// Prepare wire identity for a plain spawn or a swap candidate.
@@ -7429,8 +7440,7 @@ type NonceHandoff = std::convert::Infallible;
 /// returned rather than installed here, because installing it replaces
 /// whatever the child has at descriptor 3 and so must be the last pre-exec
 /// step, after the Linux cgroup placement that the caller registers later.
-/// Windows retains the environment handoff until restricted handle inheritance
-/// can be implemented outside std's process primitives.
+/// Windows also retains an environment copy during the named-pipe rollout.
 fn apply_wire_spawn_args_for_role(
     command: &mut Command,
     spec: &ModuleSpec,
@@ -7444,6 +7454,8 @@ fn apply_wire_spawn_args_for_role(
     // and passing it on would point the child at a descriptor it does not
     // have.
     command.env_remove(subc_os::LAUNCH_NONCE_FD_ENV);
+    #[cfg(windows)]
+    command.env_remove(subc_os::launch_nonce::LAUNCH_NONCE_PIPE_ENV);
     // Remove inherited or configured copies too: withholding must mean absent.
     command.env_remove(SUBC_LAUNCH_NONCE_ENV);
     if spec.protocol == ModuleProtocol::None {
@@ -7479,10 +7491,12 @@ fn apply_wire_spawn_args_for_role(
         command.env(subc_os::LAUNCH_NONCE_FD_ENV, handoff.fd_env_value());
         Some(handoff)
     };
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    let handoff = Some(prepare_windows_nonce_pipe(command, spec, &nonce)?);
+    #[cfg(not(any(unix, windows)))]
     let handoff = None;
-    // Windows keeps the environment copy: std cannot restrict an inherited pipe
-    // handle to this child without leaking it to concurrently spawned processes.
+    // Keep environment-only modules registering until live per-spawn reports
+    // show that every Windows module consumes the named pipe.
     #[cfg(not(unix))]
     command.env(SUBC_LAUNCH_NONCE_ENV, nonce);
     Ok(handoff)
@@ -7510,6 +7524,56 @@ fn apply_child_env(command: &mut Command, spec: &ModuleSpec) {
         }
         command.env(key, value);
     }
+}
+
+#[cfg(windows)]
+fn prepare_windows_nonce_pipe(
+    command: &mut Command,
+    spec: &ModuleSpec,
+    nonce: &str,
+) -> Result<NonceHandoff, SuperviseError> {
+    let handoff =
+        subc_os::LaunchNoncePipeHandoff::new(nonce).map_err(|source| SuperviseError::Spawn {
+            program: spec.program.clone(),
+            source,
+            cgroup_path: None,
+        })?;
+    command.env(subc_os::launch_nonce::LAUNCH_NONCE_PIPE_ENV, handoff.name());
+    Ok(handoff)
+}
+
+#[cfg(windows)]
+fn start_windows_nonce_pipe(
+    handoff: Option<NonceHandoff>,
+    pid: u32,
+    spec: &ModuleSpec,
+) -> Result<Option<subc_os::LaunchNoncePipeDelivery>, SuperviseError> {
+    // Use the same bounded initial-registration budget as reloads. Old readers
+    // may register from the environment and never connect to this server.
+    handoff
+        .map(|handoff| handoff.serve(pid, REGISTRY_RELEASE_TIMEOUT))
+        .transpose()
+        .map_err(|source| SuperviseError::Spawn {
+            program: spec.program.clone(),
+            source,
+            cgroup_path: None,
+        })
+}
+
+fn observed_launch_nonce_source(snapshot: &SupervisorSnapshot) -> Option<String> {
+    #[cfg(windows)]
+    if snapshot.process_alive && snapshot.spawned_protocol == Some(ModuleProtocol::Subc) {
+        return snapshot.pipe_consumed.as_ref().map(|consumed| {
+            if consumed.get().is_some() {
+                "pipe"
+            } else {
+                "env"
+            }
+            .to_owned()
+        });
+    }
+    let _ = snapshot;
+    None
 }
 
 /// Which slot a spawn fills: the module's ordinary one, or the candidate slot
@@ -7713,7 +7777,7 @@ fn spawn_child_in_slot(
     if let Some(handoff) = nonce_handoff {
         handoff.install_last(command.as_std_mut());
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     let _ = nonce_handoff;
 
     // Containment, step 1 of 3 (issue #109): create the child suspended so it
@@ -7754,6 +7818,8 @@ fn spawn_child_in_slot(
         source: io::Error::other("spawned child exposed no live pid"),
         cgroup_path: cgroup_path.clone(),
     })?;
+    #[cfg(windows)]
+    let nonce_delivery = start_windows_nonce_pipe(nonce_handoff, pid, spec)?;
     let process_start_time = crate::provenance::process_start_time(pid);
     let process_identity = process_start_time.map(|start_time| ProcessIdentity { pid, start_time });
     #[cfg(all(test, target_os = "macos"))]
@@ -7883,6 +7949,8 @@ fn spawn_child_in_slot(
 
     Ok(SupervisedChild {
         child,
+        #[cfg(windows)]
+        nonce_delivery,
         protocol: spec.protocol,
         #[cfg(target_os = "linux")]
         module_id: cgroup_name,
@@ -9610,6 +9678,13 @@ fn set_running(
     state.enabled = true;
     state.process_alive = true;
     state.pid = child.id();
+    #[cfg(windows)]
+    {
+        state.pipe_consumed = child
+            .nonce_delivery
+            .as_ref()
+            .map(|delivery| delivery.consumed());
+    }
     #[cfg(target_os = "macos")]
     {
         state.report_ready = Some(Arc::clone(&child.report_ready));
@@ -9625,6 +9700,10 @@ fn clear_current_process_facts(state: &mut SupervisorSnapshot) {
     state.process_alive = false;
     state.spawned_protocol = None;
     state.pid = None;
+    #[cfg(windows)]
+    {
+        state.pipe_consumed = None;
+    }
     #[cfg(target_os = "macos")]
     {
         state.report_ready = None;
@@ -12191,6 +12270,59 @@ mod health_tombstone_tests {
 
 #[cfg(test)]
 mod child_env_tests {
+    #[cfg(windows)]
+    use super::{
+        clear_current_process_facts, observed_launch_nonce_source, ModuleState, SupervisorSnapshot,
+    };
+    #[cfg(windows)]
+    use std::sync::{Arc, OnceLock};
+    #[cfg(windows)]
+    #[test]
+    fn windows_wire_spawn_prepares_pipe_and_keeps_phase_one_env() {
+        let spec = spec(Vec::new());
+        let mut command = Command::new("unused");
+        let handoff = apply_wire_spawn_args(&mut command, &spec, None, None)
+            .unwrap()
+            .unwrap();
+        let name = command
+            .as_std()
+            .get_envs()
+            .find(|(key, _)| *key == OsStr::new(subc_os::launch_nonce::LAUNCH_NONCE_PIPE_ENV))
+            .and_then(|(_, value)| value)
+            .unwrap();
+        assert_eq!(name, OsStr::new(handoff.name()));
+        assert!(handoff.name().starts_with(r"\\.\pipe\subc-launch-"));
+        assert!(command
+            .as_std()
+            .get_envs()
+            .any(|(key, value)| key == OsStr::new(SUBC_LAUNCH_NONCE_ENV) && value.is_some()));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_source_reporting_tracks_consumption_and_resets_per_spawn() {
+        let mut snapshot = SupervisorSnapshot::new(ModuleState::Running, true);
+        snapshot.process_alive = true;
+        snapshot.spawned_protocol = Some(ModuleProtocol::Subc);
+        let consumed = Arc::new(OnceLock::new());
+        snapshot.pipe_consumed = Some(consumed.clone());
+        assert_eq!(
+            observed_launch_nonce_source(&snapshot).as_deref(),
+            Some("env")
+        );
+        consumed.set(()).unwrap();
+        assert_eq!(
+            observed_launch_nonce_source(&snapshot).as_deref(),
+            Some("pipe")
+        );
+        snapshot.pipe_consumed = Some(Arc::new(OnceLock::new()));
+        assert_eq!(
+            observed_launch_nonce_source(&snapshot).as_deref(),
+            Some("env")
+        );
+        clear_current_process_facts(&mut snapshot);
+        assert_eq!(observed_launch_nonce_source(&snapshot), None);
+    }
     use super::{
         apply_child_env, apply_spawn_role, apply_wire_spawn_args, ModuleProtocol, ModuleSpec,
         SpawnRole, SupervisorHandle, SPAWN_ROLE_SWAP_CANDIDATE, SUBC_ARG, SUBC_LAUNCH_NONCE_ENV,
@@ -12332,7 +12464,9 @@ mod child_env_tests {
             Some(wire_handoff.expect("a descriptor handoff").fd_env_value()),
             "a subc-wire spawn names the pipe it will receive at descriptor 3"
         );
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        assert!(wire_handoff.is_some() && wire_fd_env.is_none());
+        #[cfg(not(any(unix, windows)))]
         assert!(wire_handoff.is_none() && wire_fd_env.is_none());
         let wire_args: Vec<String> = wire
             .as_std()

@@ -9,14 +9,15 @@
  * {@link launchNonce} reads that descriptor once, closes it, and caches the
  * value for the life of the process. While modules move over, the daemon also
  * keeps setting the environment copy (`SUBC_LAUNCH_NONCE`), which
- * {@link launchNonce} reads when no descriptor is named. Windows has no
- * descriptor handoff, so there only the environment copy is read.
+ * {@link launchNonce} reads when no descriptor is named. Windows uses a
+ * PID-authenticated named pipe; call {@link launchNonceAsync} to initialize it.
  *
  * This mirrors the Rust accessor in `subc-os` (`subc_os::launch_nonce`): the
  * same checks in the same order, the same error names and messages.
  */
 
 import { closeSync, fstatSync, readSync, type BigIntStats } from "node:fs";
+import { connect, type Socket } from "node:net";
 
 /** The environment copy of the nonce, kept only while modules move to the descriptor. */
 export const SUBC_LAUNCH_NONCE_ENV = "SUBC_LAUNCH_NONCE";
@@ -30,11 +31,14 @@ export const SUBC_LAUNCH_NONCE_ENV = "SUBC_LAUNCH_NONCE";
  */
 export const SUBC_LAUNCH_NONCE_FD_ENV = "SUBC_LAUNCH_NONCE_FD";
 
+/** The one-time Windows pipe name. Its name is not a secret. */
+export const SUBC_LAUNCH_NONCE_PIPE_ENV = "SUBC_LAUNCH_NONCE_PIPE";
+
 /** The descriptor number the daemon gives the pipe's read end in the module. */
 export const LAUNCH_NONCE_FD = 3;
 
 /** Where a process got its launch nonce from, as modules report it in provenance. */
-export type LaunchNonceSource = "fd" | "env";
+export type LaunchNonceSource = "fd" | "pipe" | "env";
 
 /** The nonce this process was launched with, and where it came from. */
 export interface LaunchNonce {
@@ -65,7 +69,12 @@ export type LaunchNonceErrorKind =
   /** Reading the named pipe failed. */
   | "Unreadable"
   /** The named pipe held bytes that are not UTF-8. */
-  | "NotUtf8";
+  | "NotUtf8"
+  | "PipeNeedsAsync"
+  | "PipeNotOpen"
+  | "PipeEmpty"
+  | "PipeUnreadable"
+  | "PipeNotUtf8";
 
 export interface LaunchNonceErrorDetails {
   /** The descriptor number, for every kind except `Malformed`. */
@@ -164,6 +173,26 @@ export function launchNonceOrUndefined(): LaunchNonce | undefined {
   return result.ok ? result.nonce ?? undefined : undefined;
 }
 
+/** Initialize the Windows pipe, or use the synchronous Unix/environment reader.
+ * Concurrent callers share one in-flight read and its cached result. After this
+ * completes, synchronous accessors return that same result. Node's public pipe
+ * API cannot request identification-level impersonation explicitly.
+ */
+export async function launchNonceAsync(): Promise<LaunchNonce | undefined> {
+  const cell = processCell();
+  return unwrap(await (cell.resultAsync?.() ?? cell.result()));
+}
+
+/** The async reader for route-open paths that treat a refusal as no identity. */
+export async function launchNonceOrUndefinedAsync(): Promise<LaunchNonce | undefined> {
+  try {
+    return await launchNonceAsync();
+  } catch (error) {
+    if (isLaunchNonceError(error)) return undefined;
+    throw error;
+  }
+}
+
 type CachedResult =
   | { readonly ok: true; readonly nonce: LaunchNonce | null }
   | { readonly ok: false; readonly error: LaunchNonceError };
@@ -174,6 +203,7 @@ type CachedResult =
  */
 interface SharedLaunchNonceCell {
   result(): CachedResult;
+  resultAsync?(): Promise<CachedResult>;
 }
 
 /**
@@ -219,25 +249,51 @@ export type LaunchNonceStat = (fd: number) => Pick<BigIntStats, "isFIFO" | "ino"
  */
 export class LaunchNonceCell implements SharedLaunchNonceCell {
   private cached: CachedResult | undefined;
+  private pending: Promise<CachedResult> | undefined;
   /** How many times this cell has taken a descriptor. At most one. */
   descriptorReads = 0;
   private readonly lookup: (key: string) => string | undefined;
   private readonly platform: NodeJS.Platform;
   private readonly stat: LaunchNonceStat;
+  private readonly pipeReader: (name: string) => Promise<LaunchNonce>;
 
   constructor(
     lookup: (key: string) => string | undefined,
     platform: NodeJS.Platform = process.platform,
     stat: LaunchNonceStat = (fd) => fstatSync(fd, { bigint: true }),
+    pipeReader: (name: string) => Promise<LaunchNonce> = readLaunchNoncePipe,
   ) {
     this.lookup = lookup;
     this.platform = platform;
     this.stat = stat;
+    this.pipeReader = pipeReader;
   }
 
   result(): CachedResult {
+    if (this.cached === undefined && this.platform === "win32" && this.lookup(SUBC_LAUNCH_NONCE_PIPE_ENV) !== undefined) {
+      throw new LaunchNonceError("PipeNeedsAsync", "call launchNonceAsync() before the synchronous reader when SUBC_LAUNCH_NONCE_PIPE is set");
+    }
     if (this.cached === undefined) this.cached = this.read();
     return this.cached;
+  }
+
+  async resultAsync(): Promise<CachedResult> {
+    if (this.cached !== undefined) return this.cached;
+    if (this.pending !== undefined) return this.pending;
+    const named = this.platform === "win32" ? this.lookup(SUBC_LAUNCH_NONCE_PIPE_ENV) : undefined;
+    if (named === undefined) return this.result();
+    this.pending = this.pipeReader(named).then(
+      (nonce): CachedResult => ({ ok: true, nonce }),
+      (error: unknown): CachedResult => {
+        if (!isLaunchNonceError(error)) throw error;
+        return { ok: false, error };
+      },
+    ).then((result) => { this.cached = result; return result; });
+    return this.pending;
+  }
+
+  async getAsync(): Promise<LaunchNonce | undefined> {
+    return unwrap(await this.resultAsync());
   }
 
   /** The cached value, reading it first if no caller has yet; throws a refusal. */
@@ -444,4 +500,76 @@ function closeQuietly(fd: number): void {
   } catch {
     // Nothing useful can be done if closing the consumed pipe fails.
   }
+}
+
+/** Read a one-time pipe to EOF. The injected connector and budgets let unit
+ * tests exercise busy retry and timeouts without requiring a Windows host.
+ */
+export async function readLaunchNoncePipe(
+  name: string,
+  connector: (name: string) => Socket = (path) => connect(path),
+  openWindowMs = 500,
+  readWindowMs = 2000,
+): Promise<LaunchNonce> {
+  const deadline = Date.now() + openWindowMs;
+  for (;;) {
+    try {
+      const bytes = await pipeAttempt(name, connector, Math.max(1, deadline - Date.now()), readWindowMs);
+      if (bytes.length === 0) throw new LaunchNonceError("PipeEmpty", "the launch nonce named pipe is empty");
+      let value: string;
+      try {
+        value = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+      } catch {
+        throw new LaunchNonceError("PipeNotUtf8", "the launch nonce named pipe held bytes that are not UTF-8");
+      }
+      return makeLaunchNonce(value, "pipe");
+    } catch (error) {
+      if (isLaunchNonceError(error)) throw error;
+      const busy = (error as NodeJS.ErrnoException)?.code === "EBUSY" || errnoOf(error) === 231;
+      if (!busy || Date.now() >= deadline) {
+        throw new LaunchNonceError("PipeNotOpen", "SUBC_LAUNCH_NONCE_PIPE names a pipe that could not be opened", { errno: errnoOf(error) });
+      }
+      await new Promise((resolve) => setTimeout(resolve, Math.min(10, Math.max(1, deadline - Date.now()))));
+    }
+  }
+}
+
+function pipeAttempt(
+  name: string,
+  connector: (name: string) => Socket,
+  openWindowMs: number,
+  readWindowMs: number,
+): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    let socket: Socket;
+    try { socket = connector(name); } catch (error) { reject(error); return; }
+    let connected = false;
+    let settled = false;
+    let size = 0;
+    const chunks: Buffer[] = [];
+    let timer = setTimeout(() => finish(new LaunchNonceError("PipeNotOpen", "launch nonce pipe open timed out")), openWindowMs);
+    function finish(error?: unknown): void {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      socket.destroy();
+      if (error !== undefined) reject(error);
+      else resolve(Buffer.concat(chunks));
+    }
+    socket.once("connect", () => {
+      connected = true;
+      clearTimeout(timer);
+      timer = setTimeout(() => finish(new LaunchNonceError("PipeUnreadable", "launch nonce pipe read timed out")), readWindowMs);
+    });
+    socket.on("data", (chunk: Buffer) => {
+      size += chunk.length;
+      if (size > 4096) { finish(new LaunchNonceError("PipeUnreadable", "launch nonce pipe exceeded its byte limit")); return; }
+      chunks.push(Buffer.from(chunk));
+    });
+    socket.once("end", () => finish());
+    socket.once("error", (error) => finish(connected ? new LaunchNonceError("PipeUnreadable", "could not read the launch nonce from the named pipe", { errno: errnoOf(error) }) : error));
+    socket.once("close", () => {
+      if (!settled) finish(new LaunchNonceError("PipeUnreadable", "launch nonce pipe closed before EOF"));
+    });
+  });
 }

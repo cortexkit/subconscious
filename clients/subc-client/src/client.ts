@@ -25,7 +25,7 @@ import {
   SUBSCRIPTION_FLAG,
   type Frame,
 } from "./envelope.js";
-import { launchNonceOrUndefined } from "./launch-nonce.js";
+import { launchNonceOrUndefinedAsync } from "./launch-nonce.js";
 import type { Principal } from "./provider.js";
 import {
   belongsToConnection,
@@ -762,7 +762,7 @@ export class SubcClient {
     opts: RouteOpenOptions = {},
   ): Promise<RouteHandle> {
     const scope = validatedRouteScope(opts.scope);
-    const consumerIdentity = routeOpenConsumerIdentity(opts);
+    const consumerIdentity = await routeOpenConsumerIdentity(opts);
     const reverseRequests = opts.reverseRequests ?? new ReverseRequestRegistry();
     reverseRequests.seal();
     const consumerCapabilities = reverseRequests.capabilities();
@@ -1095,7 +1095,7 @@ export class SubcClient {
     const key = routeCacheKey(
       target,
       identity,
-      routeOpenConsumerIdentity(opts),
+      await routeOpenConsumerIdentity(opts),
       (opts.reverseRequests ?? new ReverseRequestRegistry()).capabilities(),
       validatedRouteScope(opts.scope),
     );
@@ -1383,7 +1383,7 @@ export class SubcClient {
       RouteTarget,
       { kind: ManagedRouteKind }
     >;
-    const consumerIdentity = routeOpenConsumerIdentity(opts);
+    const consumerIdentity = await routeOpenConsumerIdentity(opts);
     const reverseRequests = opts.reverseRequests ?? new ReverseRequestRegistry();
     reverseRequests.seal();
     const key = routeCacheKey(target, identity, consumerIdentity, reverseRequests.capabilities(), scope);
@@ -2437,7 +2437,7 @@ function validatedRouteScope(scope: RouteScope | undefined): RouteScope | undefi
   return { owner: { ...scope.owner }, ref: scope.ref, scopeEpoch: scope.scopeEpoch };
 }
 
-function routeOpenConsumerIdentity(opts: RouteOpenOptions = {}): ConsumerIdentity | undefined {
+async function routeOpenConsumerIdentity(opts: RouteOpenOptions = {}): Promise<ConsumerIdentity | undefined> {
   if (opts.consumerIdentity !== undefined) return opts.consumerIdentity ?? undefined;
   const moduleId = process.env[SUBC_MODULE_ID_ENV];
   // The nonce comes from the one process-wide accessor, never straight from the
@@ -2445,7 +2445,7 @@ function routeOpenConsumerIdentity(opts: RouteOpenOptions = {}): ConsumerIdentit
   // descriptor, and a second reader would find some other file at its number.
   // A refused descriptor means this process has no identity to present, so the
   // route opens without one, as the Rust consumer does.
-  const launchNonce = launchNonceOrUndefined()?.value;
+  const launchNonce = (await launchNonceOrUndefinedAsync())?.value;
   if (!moduleId || !launchNonce) return undefined;
   return { module_id: moduleId, launch_nonce: launchNonce };
 }

@@ -39,10 +39,10 @@
 //! times to nanoseconds, the other two unsafe calls in the crate.
 //!
 //! And it carries the launch nonce from the daemon to each module it spawns
-//! over an inherited pipe instead of the environment: [`launch_nonce`] is the
-//! one reader every module uses, and [`LaunchNonceHandoff`] the daemon's half.
-//! That module's unsafe code is `dup2`, `fcntl`, `fstat` and `ioctl` on
-//! descriptors, each with its preconditions stated beside it.
+//! over an inherited Unix pipe or a PID-authenticated Windows named pipe:
+//! [`launch_nonce`] is the one cached reader every module uses. Windows keeps
+//! an environment copy for old Windows readers until live source reports show
+//! every module consuming the named pipe.
 
 #![deny(unsafe_code)]
 
@@ -55,8 +55,11 @@ pub mod process_identity;
 pub use launch_nonce::LaunchNonceHandoff;
 pub use launch_nonce::{
     launch_nonce, LaunchNonce, LaunchNonceError, LaunchNonceSource, LAUNCH_NONCE_ENV,
-    LAUNCH_NONCE_FD, LAUNCH_NONCE_FD_ENV,
+    LAUNCH_NONCE_FD, LAUNCH_NONCE_FD_ENV, LAUNCH_NONCE_PIPE_ENV,
 };
+
+#[cfg(windows)]
+pub use launch_nonce::{LaunchNoncePipeDelivery, LaunchNoncePipeHandoff};
 
 #[cfg(target_os = "linux")]
 mod linux;

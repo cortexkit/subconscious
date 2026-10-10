@@ -3,12 +3,15 @@ use std::{
     error::Error,
     ffi::{OsStr, OsString},
     fmt,
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io::{self, Read, Write},
     path::{Path, PathBuf},
     process,
     time::{Duration, SystemTime},
 };
+
+#[cfg(not(windows))]
+use std::fs::OpenOptions;
 
 use serde::{Deserialize, Serialize};
 use subc_protocol::PROTOCOL_VERSION;
@@ -237,7 +240,9 @@ fn ensure_parent_directory(parent: &Path) -> Result<(), ConnectionFileError> {
             .mode(0o700)
             .create(parent)
     };
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    let created = subc_os::windows_acl::create_private_dir(parent);
+    #[cfg(not(any(unix, windows)))]
     let created = fs::create_dir_all(parent);
 
     created.map_err(|source| ConnectionFileError::Io {
@@ -331,10 +336,20 @@ fn refuse_writable_ancestor_for_uid(parent: &Path, uid: u32) -> Result<(), Conne
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn refuse_writable_ancestor(parent: &Path) -> Result<(), ConnectionFileError> {
+    // Refuse a redirected publication directory with a foreign owner or broad
+    // DACL; the writer must not repair an operator-supplied existing directory.
+    subc_os::windows_acl::verify_private_dir(parent).map_err(|error| ConnectionFileError::Invalid {
+        reason: format!(
+            "connection-file directory {} is not owner-only: {error}",
+            parent.display()
+        ),
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
 fn refuse_writable_ancestor(_parent: &Path) -> Result<(), ConnectionFileError> {
-    // Windows ACLs are not a mode bitmask and the Unix reasoning does not carry.
-    // Stated rather than silently skipped so the absence is a decision.
     Ok(())
 }
 
@@ -602,11 +617,18 @@ fn verify_owner_only_for_uid(
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn verify_owner_only(path: &Path, file: &File) -> Result<(), ConnectionFileError> {
+    subc_os::windows_acl::verify_owner_only(file).map_err(|error| ConnectionFileError::Invalid {
+        reason: format!(
+            "connection file {} is not owner-only: {error}",
+            path.display()
+        ),
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
 fn verify_owner_only(_path: &Path, _file: &File) -> Result<(), ConnectionFileError> {
-    // On Windows the file inherits the per-user profile directory's ACL (owner,
-    // SYSTEM, Administrators only) at create time; see open_owner_only_new. There
-    // are no portable Unix mode bits to re-check on read here.
     Ok(())
 }
 
@@ -657,6 +679,7 @@ fn write_atomic_inner(
     Ok(())
 }
 
+#[cfg(not(windows))]
 fn open_owner_only_new(path: &Path) -> io::Result<File> {
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
@@ -665,21 +688,12 @@ fn open_owner_only_new(path: &Path) -> io::Result<File> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    #[cfg(windows)]
-    {
-        // No explicit DACL is set: the connection file is published under the
-        // per-user profile (XDG_RUNTIME_DIR is unset on Windows, so
-        // connection_file_path() falls back to %TEMP% =
-        // %LOCALAPPDATA%\Temp). That directory's inherited ACL already grants
-        // access to only the owning user, SYSTEM, and Administrators — so the
-        // same-host, non-admin attacker (the threat 0600 guards against on the
-        // world-readable Unix /tmp) cannot read the key here. Administrators can
-        // read any file (SeBackup/SeTakeOwnership) on either platform and are
-        // out of scope for a same-host secret. Revisit an explicit owner-only
-        // SECURITY_DESCRIPTOR only if the connection file ever moves off the
-        // per-user profile directory.
-    }
     options.open(path)
+}
+
+#[cfg(windows)]
+fn open_owner_only_new(path: &Path) -> io::Result<File> {
+    subc_os::windows_acl::create_private_file(path)
 }
 
 fn temp_path(parent: &Path, file_name: &std::ffi::OsStr) -> Result<PathBuf, ConnectionFileError> {
@@ -797,6 +811,86 @@ mod tests {
             pid: 4242,
             daemon_ver: "subc-test".to_owned(),
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_connection_temp_has_exact_protected_dacl_before_write() {
+        use subc_os::windows_acl::test_support::{assert_owner_only, grant_everyone};
+        let root = unique_temp_dir("windows-connection-temp");
+        grant_everyone(root.path());
+        let path = root.join("temp.json");
+        let _file = open_owner_only_new(&path).unwrap();
+        assert_owner_only(&path, false, true);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_connection_publication_has_exact_protected_dacl() {
+        use subc_os::windows_acl::test_support::{assert_owner_only, grant_everyone};
+        let root = unique_temp_dir("windows-connection-publication");
+        grant_everyone(root.path());
+        let parent = root.join("run");
+        let path = parent.join(CONNECTION_FILE_NAME);
+        write_atomic(&path, &sample_info()).unwrap();
+        assert_owner_only(&parent, true, true);
+        assert_owner_only(&path, false, true);
+        assert_eq!(read(&path).unwrap(), sample_info());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_reader_refuses_everyone_read_without_repairing_file() {
+        use subc_os::windows_acl::test_support::grant_everyone_read;
+        let root = unique_temp_dir("windows-reader-everyone");
+        subc_os::windows_acl::create_private_dir(root.path()).unwrap();
+        let path = root.join(CONNECTION_FILE_NAME);
+        write_atomic(&path, &sample_info()).unwrap();
+        grant_everyone_read(&path);
+        let json = fs::read(&path).unwrap();
+        assert!(matches!(
+            read(&path),
+            Err(ConnectionFileError::Invalid { .. })
+        ));
+        assert_eq!(fs::read(&path).unwrap(), json);
+        assert!(subc_os::windows_acl::verify_owner_only(&File::open(&path).unwrap()).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_reader_refuses_foreign_owner_when_token_can_assign_one() {
+        use subc_os::windows_acl::test_support::apply_sddl;
+        let root = unique_temp_dir("windows-reader-owner");
+        subc_os::windows_acl::create_private_dir(root.path()).unwrap();
+        let path = root.join(CONNECTION_FILE_NAME);
+        write_atomic(&path, &sample_info()).unwrap();
+        match apply_sddl(&path, "O:BA", true) {
+            Ok(()) => {}
+            Err(error) if matches!(error.raw_os_error(), Some(5 | 1307 | 1314)) => {
+                eprintln!("foreign owner fixture requires an elevated token: {error}");
+                return;
+            }
+            Err(error) => panic!("assign foreign owner: {error}"),
+        }
+        assert!(matches!(
+            read(&path),
+            Err(ConnectionFileError::Invalid { .. })
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_writer_refuses_existing_shared_directory_without_repair() {
+        use subc_os::windows_acl::test_support::grant_everyone;
+        let root = unique_temp_dir("windows-writer-shared");
+        grant_everyone(root.path());
+        let path = root.join(CONNECTION_FILE_NAME);
+        assert!(matches!(
+            write_atomic(&path, &sample_info()),
+            Err(ConnectionFileError::Invalid { .. })
+        ));
+        assert!(!path.exists());
+        assert!(subc_os::windows_acl::verify_private_dir(root.path()).is_err());
     }
 
     fn unique_temp_path() -> PathBuf {

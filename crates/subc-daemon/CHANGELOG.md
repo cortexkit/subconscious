@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.33.5
+
+- Create Windows run directories with protected owner-only DACLs instead of trusting inherited permissions, including redirected paths. Tighten existing run directories and remove broad inherited access from unprotected descendants using `subc-os`.
+
 ## 0.33.4
 
 - Include each registered module's declared bus events in `catalog.list` without changing entries whose manifests omit events.

@@ -633,8 +633,14 @@ fn ensure_directory_private(path: &Path) -> Result<(), io::Error> {
     Ok(())
 }
 
-/// Windows has no mode bits to tighten; the directory is created on first use.
-#[cfg(not(unix))]
+/// A redirected run directory must not inherit access for other users. Windows
+/// receives a protected DACL at creation and narrows existing inherited grants.
+#[cfg(windows)]
+fn ensure_directory_private(path: &Path) -> Result<(), io::Error> {
+    subc_os::windows_acl::create_private_dir(path)
+}
+
+#[cfg(not(any(unix, windows)))]
 fn ensure_directory_private(path: &Path) -> Result<(), io::Error> {
     if !path.exists() {
         fs::create_dir_all(path)?;
@@ -1425,6 +1431,35 @@ impl Error for DaemonConfigError {
             | Self::UnsupportedVersion { .. }
             | Self::InvalidValue { .. } => None,
         }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_run_dir_privacy_tests {
+    use super::ensure_directory_private;
+    use cortexkit_test_support::ScratchDir;
+    use subc_os::windows_acl::test_support::{assert_owner_only, grant_everyone};
+
+    #[test]
+    fn windows_run_dir_has_exact_protected_dacl_at_creation() {
+        let root = ScratchDir::new("windows-run-dir-create");
+        grant_everyone(root.path());
+        let path = root.join("run");
+        ensure_directory_private(&path).unwrap();
+        assert_owner_only(&path, true, true);
+    }
+
+    #[test]
+    fn windows_run_dir_narrows_existing_inherited_descendants() {
+        let root = ScratchDir::new("windows-run-dir-existing");
+        grant_everyone(root.path());
+        let path = root.join("run");
+        std::fs::create_dir(&path).unwrap();
+        let child = path.join("old.log");
+        std::fs::write(&child, b"old log").unwrap();
+        ensure_directory_private(&path).unwrap();
+        assert_owner_only(&path, true, true);
+        assert_owner_only(&child, false, false);
     }
 }
 

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.11.1
+
+- Protect Windows connection-file temporaries with an explicit owner-only DACL at creation. Verify the opened file's owner and DACL before reading, refusing foreign owners, broad grants, null DACLs and unsupported ACE types as `ConnectionFileError::Invalid`. Create missing publication directories privately and refuse existing shared publication directories without changing their ACLs.
+
 ## 0.11.0
 
 - **Breaking.** Requires `subc-protocol` 0.30. `read_frame`, `write_frame` and `FrameIoError::DecodeHeader` expose `subc-protocol` types, so their types change with it. No behaviour change.

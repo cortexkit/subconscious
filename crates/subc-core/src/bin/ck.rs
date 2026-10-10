@@ -147,20 +147,24 @@ fn top_help_with_tail(tail: &str) -> String {
     out
 }
 
-/// Finds the first executable for each `ck-<name>` PATH entry, matching the
-/// executable that dispatch would run when more than one directory has a name.
+/// Finds the first executable for each `ck-<name>`, preferring the managed bin
+/// directory over PATH when both contain a domain with the same name.
 fn external_domain_candidates() -> BTreeMap<String, ExternalDomainCandidate> {
-    let Some(path_var) = env::var_os("PATH") else {
-        return BTreeMap::new();
-    };
-    // A copy of this executable under a `ck-<name>` filename is not a domain
-    // and must never be probed: the probe would run ck, and a ck that
-    // discovered domains on that path would probe the copy again.
+    // Setup and command lookup must agree on the data home where managed binaries live.
+    let mut directories = setup::data_directory()
+        .ok()
+        .map(|data_home| vec![data_home.join("bin")])
+        .unwrap_or_default();
+    if let Some(path_var) = env::var_os("PATH") {
+        directories.extend(env::split_paths(&path_var));
+    }
+    // A renamed copy of this executable is not a domain: probing it would run
+    // ck again, and the new process would discover and probe the same copy.
     let own_executable = env::current_exe()
         .ok()
         .and_then(|exe| fs::canonicalize(exe).ok());
     let mut candidates = BTreeMap::new();
-    for directory in env::split_paths(&path_var) {
+    for directory in directories {
         let Ok(entries) = fs::read_dir(&directory) else {
             continue;
         };
@@ -200,7 +204,7 @@ fn external_domain_candidates() -> BTreeMap<String, ExternalDomainCandidate> {
                 continue;
             }
             // Resolved only to recognise ck itself. The candidate is probed and
-            // run by the name it has on PATH, never by the file a symlink points
+            // run by its discovered path, never by the file a symlink points
             // to: one binary can carry several faces chosen by argv[0]
             // (`ck-projects` and `ck-workspaces` both link to `ck-entorhinal`),
             // and running the link target would hand every face the module's
@@ -1021,7 +1025,7 @@ fn dispatch_external(domain: &str, tail: &[OsString]) -> Result<(), CkError> {
     // the BINARY'S AUTHOR delivered through the operator, and it names the exact
     // contract rather than asking them to find it.
     Err(CkError::Message(format!(
-        "'{domain}' is not a ck command, but {} exists on PATH.\n\
+        "'{domain}' is not a ck command, but {} exists.\n\
          It did not complete the domain handshake, so ck will not hand it your arguments.\n\
          To opt in, its author makes `{} --ck-domain` exit 0 with a single headline line\n\
          within 2 seconds. Until then, run it directly by name.",

@@ -58,6 +58,10 @@ the terminal unless the person asked for it (`--verbose`, `--dry-run`,
 | D6 | `ck setup <module>` on a network failure | `could not download <url>: curl: (35) LibreSSL SSL_connect …` reads as a broken release | `could not reach GitHub to download ck-mc (network error); nothing was installed. Retry: ck setup mc` — the curl text goes to `--verbose` |
 | D7 | bare `ck` | `alerts: aft` on a module in its first probe window (fixed in 0.17.6, ships with 0.17.8) | done |
 
+External domains are discovered in `<data home>/bin` first, using the same data
+home as `ck setup`, and then on `PATH`. If both directories contain the same
+`ck-<name>`, the CortexKit bin copy wins; PATH-only third-party domains still work.
+
 ## Target output, per verb
 
 Bare `ck`:

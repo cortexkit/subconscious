@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.20.72
+
+- Discover external `ck-<name>` domains from the CortexKit bin directory before searching PATH, so a domain command works as `ck <name>` without its binary being on PATH.
+
 ## 0.20.71
 
 - On Windows, register the logon task only for the current account and update the installer session PATH immediately while notifying other processes of persisted PATH changes.

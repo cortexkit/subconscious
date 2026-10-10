@@ -920,7 +920,7 @@ pub fn default_claustrum_key_path() -> Result<Option<PathBuf>, String> {
     }
 }
 
-fn data_directory() -> Result<PathBuf, String> {
+pub(crate) fn data_directory() -> Result<PathBuf, String> {
     if cfg!(windows) {
         return env::var_os("LOCALAPPDATA")
             .map(PathBuf::from)

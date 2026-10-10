@@ -1846,6 +1846,166 @@ fn a_domain_installed_as_a_symlink_is_probed_and_run_by_its_own_name() {
 }
 
 #[cfg(unix)]
+fn write_domain_program(directory: &Path, name: &str, body: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::create_dir_all(directory).expect("create fake domain directory");
+    let path = directory.join(name);
+    fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("write fake domain");
+    let mut permissions = fs::metadata(&path).expect("metadata").permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&path, permissions).expect("mark fake domain executable");
+    path
+}
+
+#[cfg(unix)]
+#[test]
+fn domain_in_cortexkit_bin_is_discovered_and_dispatched() {
+    let temp = TempDir::new("ck-domain-data-bin");
+    let data_home = temp.path().join("data-home");
+    let domain_bin = data_home.join("cortexkit").join("bin");
+    write_domain_program(
+        &domain_bin,
+        "ck-local-only",
+        "if [ \"$1\" = \"--ck-domain\" ]; then echo 'local domain'; exit 0; fi\necho dispatched-from-cortexkit-bin",
+    );
+
+    let dispatched = ck_command()
+        .args(["local-only", "list"])
+        .env("XDG_DATA_HOME", &data_home)
+        .env("PATH", system_path_only())
+        .env("CK_TEST_DOMAIN_PROBE_TIMEOUT_MS", "8000")
+        .output()
+        .expect("dispatch a domain installed only in CortexKit bin");
+    assert_exit(&dispatched, 0);
+    assert_eq!(
+        text(&dispatched.stdout).trim(),
+        "dispatched-from-cortexkit-bin"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn cortexkit_bin_domain_takes_precedence_over_path_domain() {
+    let temp = TempDir::new("ck-domain-bin-precedence");
+    let data_home = temp.path().join("data-home");
+    let domain_bin = data_home.join("cortexkit").join("bin");
+    let path_bin = temp.path().join("path-bin");
+    write_domain_program(
+        &domain_bin,
+        "ck-priority",
+        "if [ \"$1\" = \"--ck-domain\" ]; then echo 'bin-folder headline'; exit 0; fi\necho dispatched-from-cortexkit-bin",
+    );
+    write_domain_program(
+        &path_bin,
+        "ck-priority",
+        "if [ \"$1\" = \"--ck-domain\" ]; then echo 'PATH headline'; exit 0; fi\necho dispatched-from-PATH",
+    );
+
+    let dispatched = ck_command()
+        .args(["priority", "list"])
+        .env("XDG_DATA_HOME", &data_home)
+        .env("PATH", &path_bin)
+        .env("CK_TEST_DOMAIN_PROBE_TIMEOUT_MS", "8000")
+        .output()
+        .expect("dispatch the higher-priority domain");
+    assert_exit(&dispatched, 0);
+    assert_eq!(
+        text(&dispatched.stdout).trim(),
+        "dispatched-from-cortexkit-bin"
+    );
+
+    let help = ck_command()
+        .arg("--help")
+        .env("XDG_DATA_HOME", &data_home)
+        .env("PATH", &path_bin)
+        .env("CK_TEST_DOMAIN_PROBE_TIMEOUT_MS", "8000")
+        .output()
+        .expect("list the selected domain once");
+    assert_exit(&help, 0);
+    let help_text = text(&help.stdout);
+    assert!(help_text.contains("bin-folder headline"), "{help_text}");
+    assert!(!help_text.contains("PATH headline"), "{help_text}");
+    assert_eq!(
+        help_text
+            .lines()
+            .filter(|line| line.contains("priority"))
+            .count(),
+        1,
+        "a domain present in both locations must be listed only once:\n{help_text}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn non_domain_in_cortexkit_bin_is_neither_listed_nor_dispatched() {
+    let temp = TempDir::new("ck-domain-bin-nondomain");
+    let data_home = temp.path().join("data-home");
+    let domain_bin = data_home.join("cortexkit").join("bin");
+    write_domain_program(
+        &domain_bin,
+        "ck-not-domain",
+        "if [ \"$1\" = \"--ck-domain\" ]; then exit 1; fi\necho SHOULD_NOT_DISPATCH",
+    );
+
+    let help = ck_command()
+        .arg("--help")
+        .env("XDG_DATA_HOME", &data_home)
+        .env("PATH", system_path_only())
+        .env("CK_TEST_DOMAIN_PROBE_TIMEOUT_MS", "8000")
+        .output()
+        .expect("list domains without the non-domain binary");
+    assert_exit(&help, 0);
+    assert!(
+        !text(&help.stdout).contains("not-domain"),
+        "a binary that declined the handshake was listed:\n{}",
+        text(&help.stdout)
+    );
+
+    let refused = ck_command()
+        .arg("not-domain")
+        .env("XDG_DATA_HOME", &data_home)
+        .env("PATH", system_path_only())
+        .env("CK_TEST_DOMAIN_PROBE_TIMEOUT_MS", "8000")
+        .output()
+        .expect("refuse to dispatch the non-domain binary");
+    assert_exit(&refused, 1);
+    assert!(
+        refused.stdout.is_empty(),
+        "non-domain binary was dispatched"
+    );
+    assert!(
+        text(&refused.stderr).contains("is not a ck command"),
+        "the refusal should explain why dispatch was denied:\n{}",
+        text(&refused.stderr)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn path_only_domain_is_discovered_and_dispatched() {
+    let temp = TempDir::new("ck-domain-path-only");
+    let data_home = temp.path().join("data-home");
+    let path_bin = temp.path().join("path-bin");
+    fs::create_dir_all(&data_home).expect("create isolated data home without a domain");
+    write_domain_program(
+        &path_bin,
+        "ck-path-only",
+        "if [ \"$1\" = \"--ck-domain\" ]; then echo 'PATH-only domain'; exit 0; fi\necho dispatched-from-PATH",
+    );
+
+    let dispatched = ck_command()
+        .args(["path-only", "list"])
+        .env("XDG_DATA_HOME", &data_home)
+        .env("PATH", &path_bin)
+        .env("CK_TEST_DOMAIN_PROBE_TIMEOUT_MS", "8000")
+        .output()
+        .expect("dispatch a domain found only on PATH");
+    assert_exit(&dispatched, 0);
+    assert_eq!(text(&dispatched.stdout).trim(), "dispatched-from-PATH");
+}
+
+#[cfg(unix)]
 #[test]
 fn external_domains_opt_in_dispatch_and_cache_their_probe() {
     use std::os::unix::fs::PermissionsExt;
@@ -3513,19 +3673,21 @@ fn ck_command() -> Command {
 fn isolate_ck_command(command: &mut Command) {
     // Every CLI test gets an isolated update cache and a closed local endpoint.
     // This proves dashboard output without reaching public release infrastructure.
-    // The domain list is discovered from PATH (`ck-<name> --ck-domain`), so a
-    // test that pins rendered output must not see the host's real `ck-auth`
-    // or `ck-models`. Every CLI test therefore runs with the SYSTEM path only:
-    // `curl` and `sh` stay reachable (the update check shells out, and a ck
-    // that cannot spawn curl never connects to a test's listener, which wedges
-    // that test in `accept()` rather than failing it), while the user-level
-    // directories that hold installed `ck-*` binaries are absent. A test that
-    // wants a domain builds one in its own directory and prepends it.
+    // Domain discovery checks the managed bin directory and then PATH, so a
+    // test that pins rendered output must not inherit a host data home or user
+    // PATH containing real domains. Every CLI test therefore runs with the
+    // SYSTEM path only: `curl` and `sh` stay reachable (the update check shells
+    // out, and a ck that cannot spawn curl never connects to a test's listener,
+    // which wedges that test in `accept()` rather than failing it), while the
+    // user-level directories that hold installed `ck-*` binaries are absent.
+    // A test that wants a domain builds one in its own directory and prepends it.
     command
         .env(
             "CK_UPDATE_CACHE_PATH",
             unique_temp_dir("ck-update-cache").join("update-metadata.json"),
         )
+        .env("XDG_DATA_HOME", unique_temp_dir("ck-data-home").path())
+        .env("LOCALAPPDATA", unique_temp_dir("ck-local-app-data").path())
         .env("CK_RELEASE_INDEX_URL", "http://127.0.0.1:0/index.json")
         .env("PATH", system_path_only());
 }

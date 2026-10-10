@@ -26,6 +26,7 @@ mod upgrade_executor;
 mod upgrade_verification;
 mod validation;
 
+pub(crate) use apply::data_directory;
 pub use apply::{default_claustrum_key_path, SetupBackend};
 pub(crate) use components::{component_binaries_for_target, module_program};
 pub use model::{

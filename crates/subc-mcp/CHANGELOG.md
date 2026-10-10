@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.31
+
+- `ck-subc-mcp --ck-domain` prints a one-line description and exits. `ck` runs
+  that check on a `ck-<name>` program before treating it as `ck <name>`, so the
+  gateway can now be configured as `ck subc-mcp shim --harness <name>`, and new
+  installs no longer need the gateway on PATH. It answers before logging starts
+  and before the supervised-launch check, which would otherwise refuse a run
+  outside the daemon.
+
 ## 0.1.30
 
 - Moves to `subc-protocol` 0.30, `subc-control` 0.29 and `subc-daemon` 0.33. No behaviour change.

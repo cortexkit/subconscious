@@ -1,19 +1,37 @@
 use cortexkit_test_support::ScratchDir;
-use std::fs;
+use std::{fs, process::Command, time::Instant};
+
+fn isolated_mcp_command(home: &ScratchDir) -> Command {
+    let mut command = cortexkit_test_support::dev_command(cortexkit_test_support::ckdev_binary(
+        env!("CARGO_BIN_EXE_ck-subc-mcp"),
+    ));
+    command
+        .env_clear()
+        .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
+        .env("LOCALAPPDATA", home.path())
+        .env("XDG_DATA_HOME", home.path())
+        .env("XDG_RUNTIME_DIR", home.path())
+        .env("XDG_CONFIG_HOME", home.path())
+        .env("CK_PROFILE_PATH", home.join("profile"));
+    if cfg!(windows) {
+        if let Some(path) = std::env::var_os("PATH") {
+            command.env("PATH", path);
+        }
+        if let Some(system_root) = std::env::var_os("SystemRoot") {
+            command.env("SystemRoot", system_root);
+        }
+    }
+    command
+}
 
 #[test]
 fn manifest_is_emitted_offline_without_module_setup() {
     let home = ScratchDir::new("subc-mcp-manifest");
-    let output = cortexkit_test_support::dev_command(cortexkit_test_support::ckdev_binary(env!(
-        "CARGO_BIN_EXE_ck-subc-mcp"
-    )))
-    .env_clear()
-    .env("XDG_DATA_HOME", home.path())
-    .env("XDG_RUNTIME_DIR", home.path())
-    .env("XDG_CONFIG_HOME", home.path())
-    .arg("--manifest")
-    .output()
-    .expect("subc MCP manifest binary starts");
+    let output = isolated_mcp_command(&home)
+        .arg("--manifest")
+        .output()
+        .expect("subc MCP manifest binary starts");
 
     assert!(
         output.status.success(),
@@ -47,22 +65,48 @@ fn manifest_is_emitted_offline_without_module_setup() {
 }
 
 #[test]
+fn ck_domain_probe_is_a_fast_single_line_response_before_startup_checks() {
+    let home = ScratchDir::new("subc-mcp-domain-probe");
+    let started = Instant::now();
+    let output = isolated_mcp_command(&home)
+        .arg("--ck-domain")
+        .output()
+        .expect("subc MCP domain probe starts");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"CortexKit MCP gateway\n");
+    assert!(
+        output.stderr.is_empty(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        started.elapsed().as_secs_f64() < 2.0,
+        "probe took {:?}",
+        started.elapsed()
+    );
+    assert!(
+        !home.join("cortexkit/ck-subc-mcp/logs").exists(),
+        "a domain probe must not initialize logging"
+    );
+}
+
+#[test]
 fn module_startup_writes_dated_r2_segment() {
     let home = ScratchDir::new("subc-mcp-log");
-    let output = cortexkit_test_support::dev_command(cortexkit_test_support::ckdev_binary(env!(
-        "CARGO_BIN_EXE_ck-subc-mcp"
-    )))
-    .env("XDG_DATA_HOME", home.path())
-    .env("XDG_RUNTIME_DIR", home.path())
-    .env("XDG_CONFIG_HOME", home.path())
-    .env("CK_LOG", "info")
-    .env("SUBC_MODULE_ID", "ck-subc-mcp")
-    .env("SUBC_LAUNCH_NONCE", "test-nonce")
-    .arg("module")
-    .arg("--subc")
-    .arg(home.join("missing-connection.json"))
-    .output()
-    .unwrap();
+    let output = isolated_mcp_command(&home)
+        .env("CK_LOG", "info")
+        .env("SUBC_MODULE_ID", "ck-subc-mcp")
+        .env("SUBC_LAUNCH_NONCE", "test-nonce")
+        .arg("module")
+        .arg("--subc")
+        .arg(home.join("missing-connection.json"))
+        .output()
+        .unwrap();
     assert!(!output.status.success());
     let logs = home.join("cortexkit/ck-subc-mcp/logs");
     let entries: Vec<_> = fs::read_dir(&logs)
@@ -103,18 +147,12 @@ fn module_startup_writes_dated_r2_segment() {
 #[test]
 fn shim_logs_without_daemon_environment_or_protocol_stdout() {
     let home = ScratchDir::new("subc-mcp-shim-log");
-    let output = cortexkit_test_support::dev_command(cortexkit_test_support::ckdev_binary(env!(
-        "CARGO_BIN_EXE_ck-subc-mcp"
-    )))
-    .env_remove("SUBC_MODULE_ID")
-    .env("XDG_DATA_HOME", home.path())
-    .env("XDG_RUNTIME_DIR", home.path())
-    .env("XDG_CONFIG_HOME", home.path())
-    .env("CK_LOG", "info")
-    .args(["shim", "--module-connection-file"])
-    .arg(home.join("missing-connection.json"))
-    .output()
-    .unwrap();
+    let output = isolated_mcp_command(&home)
+        .env("CK_LOG", "info")
+        .args(["shim", "--module-connection-file"])
+        .arg(home.join("missing-connection.json"))
+        .output()
+        .unwrap();
     assert!(!output.status.success());
     assert!(output.stdout.is_empty(), "shim must reserve stdout for MCP");
     assert!(

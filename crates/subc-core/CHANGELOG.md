@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.20.73
+
+- Fresh installers keep `ck` in `cmd/` and place only that directory on PATH; setup adopts the installed command, and the MCP gateway is dispatched as `ck subc-mcp`.
+
 ## 0.20.72
 
 - Discover external `ck-<name>` domains from the CortexKit bin directory before searching PATH, so a domain command works as `ck <name>` without its binary being on PATH.

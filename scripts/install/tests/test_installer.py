@@ -36,10 +36,12 @@ class InstallerTests(unittest.TestCase):
             }}
         }}}}))
         self.env = dict(os.environ, HOME=str(self.home), SHELL="/bin/zsh",
+                        USERPROFILE=str(self.scratch / "user-profile"),
+                        LOCALAPPDATA=str(self.scratch / "local-app-data"),
                         XDG_DATA_HOME="", XDG_CONFIG_HOME=str(self.scratch / "config"),
                         XDG_RUNTIME_DIR=str(self.scratch / "runtime"),
                         CK_RELEASE_INDEX_URL=index.as_uri(), WSL_DISTRO_NAME="")
-        self.env.pop("CK_PROFILE_PATH", None)
+        self.env["CK_PROFILE_PATH"] = ""
 
     def install(self):
         result = subprocess.run(["bash", str(ROOT / "scripts/install/install.sh")],
@@ -78,12 +80,14 @@ class InstallerTests(unittest.TestCase):
         data = self.scratch / 'data with $literal "quotes" `ticks`\\backslash'
         self.env["XDG_DATA_HOME"] = str(data)
         self.install()
-        binary = data / "cortexkit/bin/ck"
+        binary = data / "cortexkit/cmd/ck"
         manifest = data / "cortexkit/installer-manifest.json"
         self.assertTrue(binary.is_file(), "binary was not placed in XDG_DATA_HOME")
         inventory = json.loads(manifest.read_text())
         self.assertEqual(inventory["mutations"][0]["path"], str(binary))
         self.assertEqual(inventory["mutations"][2]["path"], str(manifest))
+        self.assertIn("cortexkit/cmd", (self.home / ".zshrc").read_text())
+        self.assertNotIn("cortexkit/bin", (self.home / ".zshrc").read_text())
         self.assertFalse((self.home / ".local/share/cortexkit").exists())
         result = subprocess.run(["bash", "-c", '. "$HOME/.zshrc"; printf "%s" "$PATH"'],
                                 env=dict(self.env, PATH="/usr/bin:/bin"), cwd=self.scratch,

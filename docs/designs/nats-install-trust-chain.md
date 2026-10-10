@@ -181,7 +181,7 @@ It does not regenerate keys or the system account id, and creates `jwt/` only if
 it never rewrites existing resolver contents. Supplying new signatures can replace JWTs.
 
 For a monitoring-only upgrade of an existing rendered configuration, run
-`ck-bus install-apply --conf-only --nats-dir "<nats dir>" [--monitor-port <port>]`.
+`"${XDG_DATA_HOME:-$HOME/.local/share}/cortexkit/bin/ck-bus" install-apply --conf-only --nats-dir "<nats dir>" [--monitor-port <port>]`.
 The existing `server.conf` is the recorded configuration: its install-apply header and
 IPv4-loopback `listen` value are required; hand-written configurations are refused.
 Only the `http` line changes, inserted directly after `listen` if absent. An identical
@@ -336,9 +336,9 @@ operator or system-account record changes.
 ## 8. As installed on the first box (2026-09-24)
 
 The root ceremony ran once, as section 3 describes: two approvals (one over each payload's
-sha256), one handle, two signatures, then revocation. `ck-bus install-plan` built the operator
-JWT and the system account JWT; `ck-bus install-apply` verified both signatures against the
-pinned root before writing `operator.jwt` and `server.conf`. A second `install-plan` reports "no
+sha256), one handle, two signatures, then revocation. `"${XDG_DATA_HOME:-$HOME/.local/share}/cortexkit/bin/ck-bus" install-plan`
+built the operator JWT and the system account JWT; `"${XDG_DATA_HOME:-$HOME/.local/share}/cortexkit/bin/ck-bus" install-apply`
+verified both signatures against the pinned root before writing `operator.jwt` and `server.conf`. A second `install-plan` reports "no
 ceremony needed".
 
 The system account's own identity key is not a vault key. `install-plan` generates it in memory,

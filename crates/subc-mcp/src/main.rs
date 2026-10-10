@@ -112,6 +112,7 @@ const TOOLS_INVOKE_NAME: &str = "tools_invoke";
 const ACK_ONLY_TOOL_RESPONSE_TEXT: &str = "Queued for context compaction.";
 const FACADE_DEFAULT_DISABLED: &[&str] = &["magic-context", "llm-runner"];
 const MANIFEST_MODULE_ID: &str = "ck-subc-mcp";
+const CK_DOMAIN_HEADLINE: &str = "CortexKit MCP gateway";
 
 static NEXT_CONNECTION_TOKEN: AtomicU64 = AtomicU64::new(1);
 static LOGGER_INSTALLED: AtomicBool = AtomicBool::new(false);
@@ -923,6 +924,15 @@ async fn main() {
     // assembly tooling can read a manifest from a machine with no running daemon.
     if env::args_os().nth(1).is_some_and(|arg| arg == "--manifest") {
         print_manifest(supervision_manifest(MANIFEST_MODULE_ID.to_string()));
+        process::exit(0);
+    }
+    // `ck` probes external commands before dispatch, so answer before logging or
+    // launch attestation can add output or require a supervised environment.
+    if env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == "--ck-domain")
+    {
+        println!("{CK_DOMAIN_HEADLINE}");
         process::exit(0);
     }
     // Side-effect-free provenance probe, evaluated before any runtime arg

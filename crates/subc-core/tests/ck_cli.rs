@@ -916,17 +916,6 @@ fn single_row_table<const N: usize>(headers: [&str; N], row: [&str; N]) -> Strin
     format!("{}{}", render(headers), render(row))
 }
 
-fn home_relative(path: &str) -> String {
-    std::env::var("HOME")
-        .ok()
-        .and_then(|home| {
-            path.strip_prefix(&home)
-                .filter(|tail| tail.starts_with(std::path::MAIN_SEPARATOR))
-                .map(|tail| format!("~{tail}"))
-        })
-        .unwrap_or_else(|| path.to_string())
-}
-
 /// Asserts `output` renders the daemon uptime taken at some instant while the
 /// command ran. The CLI reads the uptime mid-run, so a test that samples it
 /// once, before or after, fails whenever a whole second ticks over in
@@ -1248,7 +1237,7 @@ fn fresh_setup_prints_the_pasteable_claude_code_command() {
     let stdout = text(&output.stdout);
     assert!(
         stdout.ends_with(
-            "next: connect your agent — Claude Code: claude mcp add ck -- ck-subc-mcp shim --harness claude-code\n      other harnesses: https://github.com/cortexkit/subconscious#readme\n"
+            "next: connect your agent — Claude Code: claude mcp add ck -- ck subc-mcp shim --harness claude-code\n      other harnesses: https://github.com/cortexkit/subconscious#readme\n"
         ),
         "stdout:\n{stdout}"
     );
@@ -2007,6 +1996,42 @@ fn path_only_domain_is_discovered_and_dispatched() {
 
 #[cfg(unix)]
 #[test]
+fn mcp_gateway_domain_is_listed_and_invoked_through_ck() {
+    let temp = TempDir::new("ck-mcp-domain");
+    let data_home = temp.path().join("data-home");
+    let domain_bin = data_home.join("cortexkit").join("bin");
+    write_domain_program(
+        &domain_bin,
+        "ck-subc-mcp",
+        "if [ \"$1\" = \"--ck-domain\" ]; then printf '%s\\n' 'CortexKit MCP gateway'; exit 0; fi\nprintf 'forwarded:'\nfor arg in \"$@\"; do printf ' <%s>' \"$arg\"; done\nprintf '\\n'",
+    );
+
+    let help = ck_command()
+        .arg("--help")
+        .env("XDG_DATA_HOME", &data_home)
+        .output()
+        .expect("render command help with the MCP gateway");
+    assert_exit(&help, 0);
+    assert!(
+        text(&help.stdout).contains("subc-mcp  CortexKit MCP gateway"),
+        "the opted-in MCP gateway should be listed:\n{}",
+        text(&help.stdout)
+    );
+
+    let dispatched = ck_command()
+        .args(["subc-mcp", "shim", "--harness", "opencode"])
+        .env("XDG_DATA_HOME", &data_home)
+        .output()
+        .expect("dispatch the MCP shim through ck");
+    assert_exit(&dispatched, 0);
+    assert_eq!(
+        text(&dispatched.stdout),
+        "forwarded: <shim> <--harness> <opencode>\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn external_domains_opt_in_dispatch_and_cache_their_probe() {
     use std::os::unix::fs::PermissionsExt;
 
@@ -2656,7 +2681,10 @@ async fn module_status_renders_key_value_block_byte_for_byte() {
     let observed = &provenance["modules"][0]["daemon_observed"];
     let pid = observed["pid"].as_u64().unwrap();
     let started = age_from_ms(observed["spawned_at_ms"].as_u64().unwrap());
-    let binary = home_relative(observed["spawned_from"].as_str().unwrap());
+    // `ck` shortens paths under its own home folder to `~`. Every test `ck` runs
+    // with a throwaway HOME (see isolate_ck_command), so the build folder is never
+    // under it and the path is printed in full.
+    let binary = observed["spawned_from"].as_str().unwrap().to_string();
     let image = match observed["running_image"]["status"].as_str() {
         Some("match") => "running image matches".to_string(),
         Some("mismatch") => "running image differs: running vs disk".to_string(),
@@ -3671,6 +3699,7 @@ fn ck_command() -> Command {
 }
 
 fn isolate_ck_command(command: &mut Command) {
+    let home = unique_temp_dir("ck-home");
     // Every CLI test gets an isolated update cache and a closed local endpoint.
     // This proves dashboard output without reaching public release infrastructure.
     // Domain discovery checks the managed bin directory and then PATH, so a
@@ -3682,12 +3711,17 @@ fn isolate_ck_command(command: &mut Command) {
     // user-level directories that hold installed `ck-*` binaries are absent.
     // A test that wants a domain builds one in its own directory and prepends it.
     command
+        .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
         .env(
             "CK_UPDATE_CACHE_PATH",
             unique_temp_dir("ck-update-cache").join("update-metadata.json"),
         )
         .env("XDG_DATA_HOME", unique_temp_dir("ck-data-home").path())
+        .env("XDG_CONFIG_HOME", unique_temp_dir("ck-config-home").path())
+        .env("XDG_RUNTIME_DIR", unique_temp_dir("ck-runtime-dir").path())
         .env("LOCALAPPDATA", unique_temp_dir("ck-local-app-data").path())
+        .env("CK_PROFILE_PATH", home.path().join(".profile"))
         .env("CK_RELEASE_INDEX_URL", "http://127.0.0.1:0/index.json")
         .env("PATH", system_path_only());
 }

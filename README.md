@@ -61,30 +61,30 @@ are added one at a time: `ck setup aft`, `ck setup mc`, `ck setup insula`,
 
 ### Connect your agent
 
-The fleet is exposed to an agent as one MCP server, `ck-subc-mcp`, run in
+The fleet is exposed to an agent as one MCP server through `ck subc-mcp` in
 `shim` mode with the harness named so the tool surface can be shaped for it.
 
 Claude Code:
 
 ```
-claude mcp add ck -- ck-subc-mcp shim --harness claude-code
+claude mcp add ck -- ck subc-mcp shim --harness claude-code
 ```
 
 OpenCode (`opencode.json`):
 
 ```json
-{ "mcp": { "ck": { "type": "local", "command": ["ck-subc-mcp", "shim", "--harness", "opencode"] } } }
+{ "mcp": { "ck": { "type": "local", "command": ["ck", "subc-mcp", "shim", "--harness", "opencode"] } } }
 ```
 
 Codex (`~/.codex/config.toml`):
 
 ```toml
 [mcp_servers.ck]
-command = "ck-subc-mcp"
-args = ["shim", "--harness", "codex"]
+command = "ck"
+args = ["subc-mcp", "shim", "--harness", "codex"]
 ```
 
-Any other MCP host: run `ck-subc-mcp shim --harness <name>` as a stdio
+Any other MCP host: run `ck subc-mcp shim --harness <name>` as a stdio
 server, where `<name>` is the host's name.
 
 ## Build

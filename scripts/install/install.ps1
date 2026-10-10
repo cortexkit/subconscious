@@ -57,7 +57,7 @@ function Test-FileBytesEqual {
 }
 
 function Ensure-UserPath {
-    param([Parameter(Mandatory = $true)][string]$BinDir)
+    param([Parameter(Mandatory = $true)][string]$CmdDir)
 
     $environmentKey = 'HKCU:\Environment'
     $key = $null
@@ -82,19 +82,19 @@ function Ensure-UserPath {
     if (-not [string]::IsNullOrWhiteSpace($currentPath)) {
         $entries = @($currentPath -split ';' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
     }
-    $containsBinDir = $false
+    $containsCmdDir = $false
     foreach ($entry in $entries) {
         $comparisonEntry = $entry
         if ($pathKind -eq [Microsoft.Win32.RegistryValueKind]::ExpandString) {
             $comparisonEntry = [Environment]::ExpandEnvironmentVariables($entry)
         }
-        if ([string]::Equals($comparisonEntry, $BinDir, [System.StringComparison]::OrdinalIgnoreCase)) {
-            $containsBinDir = $true
+        if ([string]::Equals($comparisonEntry, $CmdDir, [System.StringComparison]::OrdinalIgnoreCase)) {
+            $containsCmdDir = $true
             break
         }
     }
-    if (-not $containsBinDir) {
-        $updatedPath = @($entries + $BinDir) -join ';'
+    if (-not $containsCmdDir) {
+        $updatedPath = @($entries + $CmdDir) -join ';'
         try {
             Set-ItemProperty -Path $environmentKey -Name Path -Value $updatedPath -Type $pathKind -ErrorAction Stop
         }
@@ -116,15 +116,15 @@ function Ensure-UserPath {
     if (-not [string]::IsNullOrWhiteSpace($env:Path)) {
         $sessionEntries = @($env:Path -split ';' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
     }
-    $sessionContainsBinDir = $false
+    $sessionContainsCmdDir = $false
     foreach ($entry in $sessionEntries) {
-        if ([string]::Equals($entry, $BinDir, [System.StringComparison]::OrdinalIgnoreCase)) {
-            $sessionContainsBinDir = $true
+        if ([string]::Equals($entry, $CmdDir, [System.StringComparison]::OrdinalIgnoreCase)) {
+            $sessionContainsCmdDir = $true
             break
         }
     }
-    if (-not $sessionContainsBinDir) {
-        $env:Path = (@($BinDir) + $sessionEntries) -join ';'
+    if (-not $sessionContainsCmdDir) {
+        $env:Path = (@($CmdDir) + $sessionEntries) -join ';'
     }
 }
 
@@ -166,7 +166,7 @@ function Write-InstallerManifest {
         [Parameter(Mandatory = $true)][string]$Binary,
         [Parameter(Mandatory = $true)][string]$BinaryDigest,
         [Parameter(Mandatory = $true)][string]$ArchiveDigest,
-        [Parameter(Mandatory = $true)][string]$BinDir,
+        [Parameter(Mandatory = $true)][string]$CmdDir,
         [Parameter(Mandatory = $true)][string]$Arch
     )
 
@@ -187,7 +187,7 @@ function Write-InstallerManifest {
                 kind = 'user-path-registry'
                 registry_key = 'HKCU\Environment'
                 registry_value = 'Path'
-                path = $BinDir
+                path = $CmdDir
             },
             [ordered]@{
                 kind = 'ownership-record'
@@ -259,8 +259,8 @@ if ([string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
 $os = 'windows'
 $archiveName = "ck-$os-$arch.zip"
 $dataDir = Join-Path $env:LOCALAPPDATA 'cortexkit'
-$binDir = Join-Path $dataDir 'bin'
-$destination = Join-Path $binDir 'ck.exe'
+$cmdDir = Join-Path $dataDir 'cmd'
+$destination = Join-Path $cmdDir 'ck.exe'
 $manifest = Join-Path $dataDir 'installer-manifest.json'
 $tempDir = Join-Path ([System.IO.Path]::GetTempPath()) ("ck-install-" + [System.Guid]::NewGuid().ToString('N'))
 $archivePath = Join-Path $tempDir $archiveName
@@ -315,8 +315,8 @@ try {
     }
     else {
         try {
-            New-Item -ItemType Directory -Path $binDir -Force -ErrorAction Stop | Out-Null
-            $temporaryDestination = Join-Path $binDir '.ck.exe.tmp'
+            New-Item -ItemType Directory -Path $cmdDir -Force -ErrorAction Stop | Out-Null
+            $temporaryDestination = Join-Path $cmdDir '.ck.exe.tmp'
             Copy-Item -LiteralPath $candidate -Destination $temporaryDestination -Force -ErrorAction Stop
             Move-Item -LiteralPath $temporaryDestination -Destination $destination -Force -ErrorAction Stop
         }
@@ -326,8 +326,8 @@ try {
         Write-Output "Installed ck at $destination."
     }
 
-    Ensure-UserPath -BinDir $binDir
-    Write-InstallerManifest -Manifest $manifest -Binary $destination -BinaryDigest $candidateDigest -ArchiveDigest $expectedDigest -BinDir $binDir -Arch $arch
+    Ensure-UserPath -CmdDir $cmdDir
+    Write-InstallerManifest -Manifest $manifest -Binary $destination -BinaryDigest $candidateDigest -ArchiveDigest $expectedDigest -CmdDir $cmdDir -Arch $arch
     Write-Output 'Next: ck setup'
 }
 finally {

@@ -56,7 +56,7 @@ The teardown is scoped to the draining module's endpoint
 (`release_module_endpoint_routes`), so restarting a module that does *not* serve
 your session is uneventful.
 
-Verified as a control: a `stop claustrum && ck-auth import && start claustrum &&
+Verified as a control: a `stop claustrum && ck auth import && start claustrum &&
 health` chain run from an aft-served session returned the complete buffer —
 both ack tables, the import line, and the trailing health read — with no
 transport error. Same operator, same wrapper, same daemon, different module.

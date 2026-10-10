@@ -251,17 +251,16 @@ it must not download an MC archive and MC is excluded from `ck upgrade`.
 
 ## Installation destinations, PATH, and ownership
 
-The owner-fixed managed binary destinations are:
+Fresh installer destinations separate the operator command from managed daemon and module binaries:
 
-| Platform | Binary home | PATH mechanism |
-| --- | --- | --- |
-| macOS and Linux | `~/.local/share/cortexkit/bin` | Append a marker-delimited `# cortexkit-managed PATH begin` / `# cortexkit-managed PATH end` block to the appropriate user shell profile: `~/.zshrc`, `~/.bashrc`, or Fish `config.fish`. |
-| Windows | `%LOCALAPPDATA%\cortexkit\bin` | Update the user-scope `PATH` through the `HKCU` `Environment` registry value. |
+| Platform | `ck` command destination | Managed binary home | PATH mechanism |
+| --- | --- | --- | --- |
+| macOS and Linux | `<data home>/cortexkit/cmd/ck` | `<data home>/cortexkit/bin` | Append a marker-delimited `# cortexkit-managed PATH begin` / `# cortexkit-managed PATH end` block to the appropriate user shell profile (`~/.zshrc`, `~/.bashrc`, or Fish `config.fish`), with only `cmd/` on PATH. |
+| Windows | `%LOCALAPPDATA%\cortexkit\cmd\ck.exe` | `%LOCALAPPDATA%\cortexkit\bin` | Add only `%LOCALAPPDATA%\cortexkit\cmd` to the user-scope `PATH` through the `HKCU` `Environment` registry value. |
 
-No installation path or PATH operation requires elevation. The installer
-checks whether an existing destination binary matches its archive sidecar
-digest. On a match it reports the existing binary and skips placement; PATH and
-ownership-record steps remain idempotent.
+Existing installations are not moved by `ck setup` or `ck upgrade`; their owners move their PATH entry by hand if they want only `ck` on PATH. No automatic migration is attempted.
+
+No installation path or PATH operation requires elevation. The installer checks whether an existing destination binary matches its archive sidecar digest. On a match it reports the existing binary and skips placement; PATH and ownership-record steps remain idempotent.
 
 `installer-manifest.json` in the platform data directory is the ownership
 inventory. It records every mutation managed by installation, setup, uninstall,
@@ -423,7 +422,7 @@ never by the executor:
   case (core and the module bump together); the check exists for the case
   the order cannot fix, an index whose core is behind a module's floor.
 - `ck setup <module>` compares `requires_core` with the **installed** daemon
-  version (`ck-subc --version`; the catalog build when the daemon is live).
+  version (`"${XDG_DATA_HOME:-$HOME/.local/share}/cortexkit/bin/ck-subc" --version`; the catalog build when the daemon is live).
   Below the floor it refuses before downloading anything — "requires core
   ≥ X, installed Y; run `ck upgrade` first" — because setup must not
   silently replace the daemon to satisfy a module. A fresh `ck setup`

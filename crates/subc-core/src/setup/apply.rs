@@ -539,8 +539,19 @@ impl SetupBackend {
     fn running_ck_adoption(&self) -> Option<PathBuf> {
         let binary_home = fs::canonicalize(&self.paths.binary_home)
             .unwrap_or_else(|_| self.paths.binary_home.clone());
-        self.executable
-            .starts_with(binary_home)
+        // The installer keeps the operator command in cmd/ while setup owns
+        // daemon and module binaries in bin/; both bootstrap locations may
+        // contain an unowned ck that setup must adopt.
+        let command_home = self.paths.data_dir.join("cmd");
+        let command_home = fs::canonicalize(&command_home).unwrap_or(command_home);
+        // Resolve the executable the same way as the two folders, so a symlink in
+        // the data folder's path (macOS reaches its temp and some home folders
+        // through /var -> /private/var) cannot make a bootstrap ck look foreign.
+        let executable =
+            fs::canonicalize(&self.executable).unwrap_or_else(|_| self.executable.clone());
+        let is_bootstrap_ck =
+            executable.starts_with(&binary_home) || executable.starts_with(&command_home);
+        is_bootstrap_ck
             .then(|| self.executable.clone())
             .filter(|path| path.is_file())
             .filter(|path| !self.inventory.owns_path("managed-binary", path))
@@ -1088,6 +1099,124 @@ mod adoption_tests {
                 .and_then(|entry| entry.get("archive_sha256"))
                 .is_none(),
             "bootstrap row without archive_sha256 must not invent one"
+        );
+    }
+
+    #[test]
+    fn installer_placed_cmd_ck_is_adopted_and_self_updated_in_place() {
+        let root = ScratchDir::new("setup-adopt-cmd-ck");
+        let data_dir = root.join("cortexkit");
+        let binary_home = data_dir.join("bin");
+        let command_home = data_dir.join("cmd");
+        fs::create_dir_all(&binary_home).unwrap();
+        fs::create_dir_all(&command_home).unwrap();
+
+        let executable = command_home.join("ck");
+        write_executable(&executable, b"#!/bin/sh\necho 'ck 0.20.72'\n");
+        let daemon = binary_home.join("ck-subc");
+        let gateway = binary_home.join("ck-subc-mcp");
+        write_executable(&daemon, b"#!/bin/sh\necho 'ck-subc 0.17.10'\n");
+        write_executable(&gateway, b"#!/bin/sh\necho 'ck-subc-mcp 0.1.30'\n");
+
+        let installer_archive_digest = "cd".repeat(32);
+        let manifest = data_dir.join("installer-manifest.json");
+        fs::write(
+            &manifest,
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": 1,
+                "installer": "ck",
+                "platform": "linux-x64",
+                "mutations": [{
+                    "kind": "binary-placement",
+                    "path": executable.to_string_lossy(),
+                    "sha256": components::digest_file(&executable).unwrap(),
+                    "archive_sha256": installer_archive_digest.clone(),
+                }],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut inventory = Inventory::load(&manifest, "linux-x64").unwrap();
+        // The other Core binaries are rows that `ck setup` installed under bin/.
+        inventory.record("managed-binary", &daemon, Map::new());
+        inventory.record("managed-binary", &gateway, Map::new());
+        let platform = RuntimePlatform::current();
+        let mut backend = SetupBackend {
+            executable: executable.clone(),
+            paths: SetupPaths {
+                data_dir: data_dir.clone(),
+                binary_home: binary_home.clone(),
+                config_path: root.join("subc.jsonc"),
+                claustrum_key_path: None,
+                runtime_paths: runtime::runtime_paths(platform, &binary_home, &root),
+            },
+            platform,
+            inventory,
+            runner: SystemCommandRunner,
+            artifacts: ReleaseArtifactSource::from_index(
+                super::super::release_index::ReleaseIndex {
+                    schema: 1,
+                    channel: "alpha".to_string(),
+                    generated_at_ms: 0,
+                    components: BTreeMap::new(),
+                },
+                super::super::model::AlphaTarget::LinuxX64,
+            ),
+            runtime_status: RuntimeStatus::default(),
+            uninstall_report: None,
+            component_steps: BTreeMap::new(),
+        };
+
+        backend.adopt_running_ck(&executable).unwrap();
+        assert!(backend.inventory.owns_path("managed-binary", &executable));
+        assert!(!backend.inventory.owns_path("binary-placement", &executable));
+        assert_eq!(
+            backend
+                .inventory
+                .entry_for_path("managed-binary", &executable)
+                .and_then(|entry| entry.get("archive_sha256"))
+                .and_then(Value::as_str),
+            Some(installer_archive_digest.as_str())
+        );
+
+        let targets = super::super::upgrade::discover_managed_upgrade_targets(
+            &backend.inventory,
+            &executable,
+            Some(&DaemonCatalogBuild {
+                pid: 1,
+                version: "0.17.10".to_string(),
+            }),
+        )
+        .unwrap();
+        let ck = targets
+            .iter()
+            .find(|target| target.target.label() == "ck")
+            .expect("the running ck is an upgrade target");
+        assert_eq!(ck.destination, executable);
+
+        let candidate = root.join("verified-ck");
+        write_executable(&candidate, b"#!/bin/sh\necho 'ck 0.20.73'\n");
+        super::super::self_update::replace_verified_candidate(
+            &ck.destination,
+            &candidate,
+            &"ab".repeat(32),
+            "0.20.73",
+            &mut backend.inventory,
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read(&executable).unwrap(),
+            fs::read(&candidate).unwrap()
+        );
+        assert!(backend.inventory.owns_path("managed-binary", &executable));
+        assert_eq!(
+            backend
+                .inventory
+                .entry_for_path("managed-binary", &executable)
+                .and_then(|entry| entry.get("version"))
+                .and_then(Value::as_str),
+            Some("0.20.73")
         );
     }
 

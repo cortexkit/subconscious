@@ -56,29 +56,29 @@ try {
         $script:writtenPath = $null
         $script:writtenKind = $null
         $script:writes = 0
-        Ensure-UserPath -BinDir 'C:\CortexKit\bin'
-        if ($script:writtenPath -cne '%USERPROFILE%\.dotnet\tools;C:\Other\Bin;C:\CortexKit\bin') {
+        Ensure-UserPath -CmdDir 'C:\CortexKit\cmd'
+        if ($script:writtenPath -cne '%USERPROFILE%\.dotnet\tools;C:\Other\Bin;C:\CortexKit\cmd') {
             throw "raw PATH changed: $script:writtenPath"
         }
         if ($script:writtenKind -ne $script:kind) { throw "registry kind changed: $script:writtenKind" }
         if ($script:writes -ne 1) { throw "unexpected write count: $script:writes" }
     }
     $script:kind = [Microsoft.Win32.RegistryValueKind]::ExpandString
-    $script:rawPath = '%USERPROFILE%\cortexkit\bin;C:\Other\Bin'
+    $script:rawPath = '%USERPROFILE%\cortexkit\cmd;C:\Other\Bin'
     $script:writes = 0
-    Ensure-UserPath -BinDir 'C:\Fixture\User\cortexkit\bin'
+    Ensure-UserPath -CmdDir 'C:\Fixture\User\cortexkit\cmd'
     if ($script:writes -ne 0) { throw 'an expanded duplicate was appended' }
     $script:kind = [Microsoft.Win32.RegistryValueKind]::String
     $script:writtenPath = $null
-    Ensure-UserPath -BinDir 'C:\Fixture\User\cortexkit\bin'
-    if ($script:writtenPath -cne '%USERPROFILE%\cortexkit\bin;C:\Other\Bin;C:\Fixture\User\cortexkit\bin') {
+    Ensure-UserPath -CmdDir 'C:\Fixture\User\cortexkit\cmd'
+    if ($script:writtenPath -cne '%USERPROFILE%\cortexkit\cmd;C:\Other\Bin;C:\Fixture\User\cortexkit\cmd') {
         throw 'a literal REG_SZ entry was mistaken for an expandable duplicate'
     }
     $script:rawPath = $null
     $script:writtenPath = $null
     $script:writtenKind = $null
-    Ensure-UserPath -BinDir 'C:\CortexKit\bin'
-    if ($script:writtenPath -cne 'C:\CortexKit\bin') { throw 'absent PATH was not initialized' }
+    Ensure-UserPath -CmdDir 'C:\CortexKit\cmd'
+    if ($script:writtenPath -cne 'C:\CortexKit\cmd') { throw 'absent PATH was not initialized' }
     if ($script:writtenKind -ne [Microsoft.Win32.RegistryValueKind]::ExpandString) {
         throw 'absent PATH did not use REG_EXPAND_SZ'
     }

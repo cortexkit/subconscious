@@ -864,9 +864,11 @@ mod tests {
         subc_os::windows_acl::create_private_dir(root.path()).unwrap();
         let path = root.join(CONNECTION_FILE_NAME);
         write_atomic(&path, &sample_info()).unwrap();
-        match apply_sddl(&path, "O:BA", true) {
+        // BUILTIN\Users: an ordinary group, unlike the Administrators owner an
+        // elevated writer produces, which the reader accepts.
+        match apply_sddl(&path, "O:BU", true) {
             Ok(()) => {}
-            Err(error) if matches!(error.raw_os_error(), Some(5 | 1307 | 1314)) => {
+            Err(error) if matches!(error.raw_os_error(), Some(5 | 1300 | 1307 | 1314)) => {
                 eprintln!("foreign owner fixture requires an elevated token: {error}");
                 return;
             }

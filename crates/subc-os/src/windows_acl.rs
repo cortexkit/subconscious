@@ -347,9 +347,22 @@ impl Security {
     }
 
     fn verify_owner(&self, user: &User) -> io::Result<()> {
+        // SYSTEM and Administrators are accepted as owners for the same reason
+        // they are accepted in the DACL: they can bypass file security anyway.
+        // A file written by an elevated process is owned by Administrators, so
+        // refusing that owner would lock out files an older daemon wrote while
+        // adding no protection.
         // SAFETY: Both SIDs belong to live Win32 token/security buffers.
-        if self.owner.is_null() || unsafe { EqualSid(self.owner, user.sid()) } == 0 {
-            return Err(insecure("owner is not the current user"));
+        let trusted = !self.owner.is_null()
+            && unsafe {
+                EqualSid(self.owner, user.sid()) != 0
+                    || IsWellKnownSid(self.owner, WinLocalSystemSid) != 0
+                    || IsWellKnownSid(self.owner, WinBuiltinAdministratorsSid) != 0
+            };
+        if !trusted {
+            return Err(insecure(
+                "owner is not the current user, SYSTEM or Administrators",
+            ));
         }
         Ok(())
     }

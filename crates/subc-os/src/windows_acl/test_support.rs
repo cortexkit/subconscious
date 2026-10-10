@@ -4,19 +4,80 @@
 use super::{wide, Security, User};
 use std::{io, mem::size_of, path::Path, ptr::null_mut};
 use windows_sys::Win32::{
-    Foundation::LocalFree,
+    Foundation::{CloseHandle, GetLastError, LocalFree, ERROR_NOT_ALL_ASSIGNED, HANDLE},
     Security::{
+        AdjustTokenPrivileges,
         Authorization::{
             ConvertStringSecurityDescriptorToSecurityDescriptorW, GetNamedSecurityInfoW,
             SetNamedSecurityInfoW, SDDL_REVISION_1, SE_FILE_OBJECT,
         },
         EqualSid, GetAce, GetSecurityDescriptorControl, GetSecurityDescriptorDacl,
-        GetSecurityDescriptorOwner, ACCESS_ALLOWED_ACE, ACL, CONTAINER_INHERIT_ACE,
-        DACL_SECURITY_INFORMATION, INHERITED_ACE, OBJECT_INHERIT_ACE, OWNER_SECURITY_INFORMATION,
-        PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED,
+        GetSecurityDescriptorOwner, LookupPrivilegeValueW, ACCESS_ALLOWED_ACE, ACL,
+        CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, INHERITED_ACE, LUID_AND_ATTRIBUTES,
+        OBJECT_INHERIT_ACE, OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+        PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED, SE_PRIVILEGE_ENABLED,
+        TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
     },
     Storage::FileSystem::FILE_ALL_ACCESS,
+    System::Threading::{GetCurrentProcess, OpenProcessToken},
 };
+
+/// Enable SeRestorePrivilege on this process's token, if the token holds it.
+///
+/// Windows lets a process set a file's owner only to itself or a group it owns,
+/// unless this privilege is enabled. The foreign-owner fixtures need an owner
+/// that is neither, so they enable it first. On an unelevated token the
+/// privilege is absent and this returns an error; the fixture then reports a
+/// skip instead of a false pass.
+fn enable_restore_privilege() -> io::Result<()> {
+    let name: Vec<u16> = "SeRestorePrivilege".encode_utf16().chain(Some(0)).collect();
+    let mut token: HANDLE = null_mut();
+    // SAFETY: The pseudo-handle is valid and the output handle is writable.
+    if unsafe {
+        OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+            &mut token,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: The privilege structure is fully initialized before use.
+    let mut privileges: TOKEN_PRIVILEGES = unsafe { std::mem::zeroed() };
+    privileges.PrivilegeCount = 1;
+    let result = (|| {
+        // SAFETY: name is terminated and the LUID output is writable.
+        if unsafe {
+            LookupPrivilegeValueW(
+                null_mut(),
+                name.as_ptr(),
+                &mut privileges.Privileges[0].Luid,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        privileges.Privileges[0] = LUID_AND_ATTRIBUTES {
+            Luid: privileges.Privileges[0].Luid,
+            Attributes: SE_PRIVILEGE_ENABLED,
+        };
+        // SAFETY: token was opened with adjust rights; privileges is initialized.
+        if unsafe { AdjustTokenPrivileges(token, 0, &privileges, 0, null_mut(), null_mut()) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // AdjustTokenPrivileges succeeds even when the token lacks the
+        // privilege, and reports that only through the last error.
+        // SAFETY: Reads the calling thread's last error.
+        if unsafe { GetLastError() } == ERROR_NOT_ALL_ASSIGNED {
+            return Err(io::Error::from_raw_os_error(ERROR_NOT_ALL_ASSIGNED as i32));
+        }
+        Ok(())
+    })();
+    // SAFETY: token is a handle this function opened.
+    unsafe { CloseHandle(token) };
+    result
+}
 
 /// Assert native owner, protection and exactly one current-user full-control
 /// ACE. This reads Windows directly, not the production validator or ACL builder.
@@ -130,6 +191,7 @@ pub fn apply_sddl(path: &Path, sddl: &str, owner: bool) -> io::Result<()> {
     let mut owner_sid = null_mut();
     let mut defaulted = 0;
     let flags = if owner {
+        enable_restore_privilege()?;
         // SAFETY: descriptor is live; outputs are writable locals.
         if unsafe { GetSecurityDescriptorOwner(descriptor.0, &mut owner_sid, &mut defaulted) } == 0
         {

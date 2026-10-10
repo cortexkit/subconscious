@@ -345,6 +345,8 @@ async fn spawn_records_exact_process_facts() {
     let module_id = "fake-aft-spawn-facts";
     let spec = stub_spec(&server, module_id, std::iter::empty::<(&str, &str)>());
     let expected_program = spec.program.clone();
+    #[cfg(windows)]
+    let expected_program = std::fs::canonicalize(expected_program).unwrap();
     let before_spawn_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -1796,7 +1798,7 @@ async fn supervisor_list_reports_a_running_childs_resources() {
         .iter()
         .find(|entry| entry.module_id == "list-resources-stub")
         .expect("stub is listed");
-    if cfg!(any(target_os = "linux", target_os = "macos")) {
+    if cfg!(any(target_os = "linux", target_os = "macos", windows)) {
         let Some(ChildResourceUsage::Measured(reading)) = &entry.resources else {
             panic!("running stub was not measured: {:?}", entry.resources);
         };
@@ -1806,6 +1808,9 @@ async fn supervisor_list_reports_a_running_childs_resources() {
         );
         let expected_kind = if cfg!(target_os = "macos") {
             ChildMemoryKind::PhysFootprint
+        } else if cfg!(windows) {
+            assert_eq!(reading.swap_bytes, None);
+            ChildMemoryKind::WindowsWorkingSet
         } else {
             ChildMemoryKind::ResidentSet
         };

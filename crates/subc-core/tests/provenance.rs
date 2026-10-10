@@ -2,16 +2,14 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{sync::Arc, time::Duration};
 // The sha256 re-hash apparatus (throwaway binaries in per-test temp dirs) is
-// LINUX-only — macOS proves identity by spawn inode and Windows serves the
-// unavailable arm, neither writes files — so these imports gate with it or
+// LINUX-only — macOS and Windows compare spawn-time file objects without
+// hashing their contents — so these imports gate with it or
 // the other platforms clippy-fail them as unused under -D warnings.
 #[cfg(target_os = "linux")]
 use std::fs;
 
-// Used by the linux AND macos match arms of assert_running_image_matches.
 #[cfg(target_os = "linux")]
 use cortexkit_test_support::ScratchDir;
-#[cfg(not(target_os = "windows"))]
 use subc_control::RunningImageEvidence;
 #[cfg(target_os = "windows")]
 use subc_control::RunningImageUnavailableReason;
@@ -302,12 +300,20 @@ async fn supervisor_provenance_reports_declared_and_observed_module_facts() {
         observed_daemon.daemon_observed.pid,
         Some(std::process::id())
     );
+    #[cfg(not(windows))]
     assert!(matches!(
         observed_daemon.daemon_observed.running_image,
         RunningImageAgreement::Match { .. }
             | RunningImageAgreement::Unavailable {
                 reason: subc_control::RunningImageUnavailableReason::UnsupportedPlatform
             }
+    ));
+    #[cfg(windows)]
+    assert!(matches!(
+        observed_daemon.daemon_observed.running_image,
+        RunningImageAgreement::Unavailable {
+            reason: RunningImageUnavailableReason::ProcessIdentityUnconfirmed
+        }
     ));
     assert!(
         observed_daemon.daemon_observed.started_at_ms >= Some(before_start_ms)
@@ -341,9 +347,12 @@ async fn supervisor_provenance_reports_declared_and_observed_module_facts() {
     );
     let status = module.status().unwrap();
     assert_eq!(observed.daemon_observed.pid, status.pid);
+    let expected_program = PathBuf::from(env!("CARGO_BIN_EXE_fake-aft-stub"));
+    #[cfg(windows)]
+    let expected_program = std::fs::canonicalize(expected_program).unwrap();
     assert_eq!(
         observed.daemon_observed.spawned_from,
-        Some(PathBuf::from(env!("CARGO_BIN_EXE_fake-aft-stub")))
+        Some(expected_program)
     );
     assert!(observed.daemon_observed.spawned_at_ms.unwrap_or_default() > 0);
     assert_running_image_matches(&observed.daemon_observed.running_image);
@@ -617,8 +626,8 @@ fn assert_running_image_matches(result: &RunningImageAgreement) {
     #[cfg(target_os = "windows")]
     assert!(matches!(
         result,
-        RunningImageAgreement::Unavailable {
-            reason: RunningImageUnavailableReason::UnsupportedPlatform
+        RunningImageAgreement::Match {
+            evidence: RunningImageEvidence::WindowsSpawnFileId { .. }
         }
     ));
 }

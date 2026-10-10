@@ -412,7 +412,14 @@ async fn assert_supervisor_provenance_reads_empty_supervisor(
                 daemon.daemon_observed.running_image,
                 subc_control::RunningImageAgreement::Match { .. }
             ));
-            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            #[cfg(windows)]
+            assert!(matches!(
+                daemon.daemon_observed.running_image,
+                subc_control::RunningImageAgreement::Unavailable {
+                    reason: subc_control::RunningImageUnavailableReason::ProcessIdentityUnconfirmed
+                }
+            ));
+            #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
             assert!(matches!(
                 daemon.daemon_observed.running_image,
                 subc_control::RunningImageAgreement::Unavailable {

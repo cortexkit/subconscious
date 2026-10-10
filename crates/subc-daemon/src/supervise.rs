@@ -8202,11 +8202,20 @@ fn observe_spawned_image(pid: u32) -> Option<subc_os::Observation> {
 #[cfg(windows)]
 fn windows_spawn_capture(spec: &ModuleSpec) -> io::Result<subc_os::ExecutableCapture> {
     let mut program = spec.program.clone();
+    if program.is_absolute() || program.components().count() > 1 {
+        // An explicit path can name a PE image with no extension. Try that
+        // exact file first, as Command does, before falling back to .exe.
+        match subc_os::ExecutableCapture::open(&program) {
+            Ok(capture) => return Ok(capture),
+            Err(error)
+                if error.kind() == io::ErrorKind::NotFound && program.extension().is_none() => {}
+            Err(error) => return Err(error),
+        }
+        program.set_extension("exe");
+        return subc_os::ExecutableCapture::open(&program);
+    }
     if program.extension().is_none() {
         program.set_extension("exe");
-    }
-    if program.is_absolute() || program.components().count() > 1 {
-        return subc_os::ExecutableCapture::open(&program);
     }
     let custom_path = spec
         .env

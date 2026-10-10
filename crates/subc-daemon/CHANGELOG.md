@@ -3,6 +3,7 @@
 ## 0.33.6
 
 - Compare Windows configured and spawned paths after OS canonicalization so ordinary and verbatim spellings do not falsely require a reload. A different resolved configured program still requires a reload even when the child's executable matches the file at its original spawn path.
+- Preserve Windows launches by explicit path to extensionless executable images; only try the `.exe` suffix when the exact path is absent.
 - Capture Windows executable identity before suspended spawn and retain the child's handle for provenance and resource readings. Provenance now reports match, mismatch or unavailable using creation time and the full file ID; orphan cleanup only forces a stop on a matching creation time, and waits for exit. Persist Windows file IDs as additive version-1 fields so rollback readers keep reading the roster; Unix records and supervision are unchanged.
 
 ## 0.33.5

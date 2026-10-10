@@ -3041,7 +3041,7 @@ async fn provenance(
                 provenance_value(build.get("store_schema_version"))
             );
             // Whether this module read its launch nonce from the daemon's pipe
-            // (`fd`) or from the environment copy (`env`). Owners check it before
+            // (`fd` on Unix, `pipe` on Windows) or the environment copy (`env`). Check it before
             // the environment copy is withdrawn.
             println!(
                 "  launch nonce source: {}",
@@ -3053,6 +3053,9 @@ async fn provenance(
 
     println!("Daemon observed");
     let observed = module.get("daemon_observed").unwrap_or(&Value::Null);
+    if let Some(source) = observed.get("launch_nonce_source") {
+        println!("  launch nonce source: {}", provenance_value(Some(source)));
+    }
     println!("  pid: {}", provenance_value(observed.get("pid")));
     println!(
         "  started {}",
@@ -5986,11 +5989,14 @@ fn month_abbr(month: u32) -> &'static str {
 }
 
 fn print_module_table(modules: &[Value], verbose: bool) {
+    let show_nonce_source = modules
+        .iter()
+        .any(|module| module.get("launch_nonce_source").is_some());
     if verbose {
         let rows = modules
             .iter()
             .map(|module| {
-                vec![
+                let mut row = vec![
                     terminal_safe_string(&display_field(module, "module_id")),
                     terminal_safe_string(&display_field(module, "state")),
                     enabled_word(module.get("enabled").and_then(Value::as_bool)),
@@ -5999,30 +6005,49 @@ fn print_module_table(modules: &[Value], verbose: bool) {
                     reload_list_marker(module).to_string(),
                     child_memory_cell(module),
                     child_cpu_cell(module),
-                ]
+                ];
+                if show_nonce_source {
+                    row.push(terminal_safe_string(&display_field(
+                        module,
+                        "launch_nonce_source",
+                    )));
+                }
+                row
             })
             .collect::<Vec<_>>();
-        print_table(
-            &[
-                "module", "state", "enabled", "live", "health", "reload", "memory", "cpu",
-            ],
-            rows,
-        );
+        let mut columns = vec![
+            "module", "state", "enabled", "live", "health", "reload", "memory", "cpu",
+        ];
+        if show_nonce_source {
+            columns.push("nonce source");
+        }
+        print_table(&columns, rows);
         return;
     }
 
     let rows = modules
         .iter()
         .map(|module| {
-            vec![
+            let mut row = vec![
                 terminal_safe_string(&display_field(module, "module_id")),
                 terminal_safe_string(&module_status_text(module)),
                 terminal_safe_string(&human_health_status(&display_field(module, "health"))),
                 reload_list_marker(module).to_string(),
-            ]
+            ];
+            if show_nonce_source {
+                row.push(terminal_safe_string(&display_field(
+                    module,
+                    "launch_nonce_source",
+                )));
+            }
+            row
         })
         .collect::<Vec<_>>();
-    print_table(&["module", "status", "health", "reload"], rows);
+    let mut columns = vec!["module", "status", "health", "reload"];
+    if show_nonce_source {
+        columns.push("nonce source");
+    }
+    print_table(&columns, rows);
 }
 
 fn reload_list_marker(module: &Value) -> &'static str {
@@ -6293,6 +6318,12 @@ fn print_status_table(
     }
     if let Some(value) = module.get("launch_nonce_env").and_then(Value::as_bool) {
         println!("  launch_nonce_env: {value}");
+    }
+    if let Some(source) = module.get("launch_nonce_source") {
+        println!(
+            "  launch nonce source (daemon): {}",
+            provenance_value(Some(source))
+        );
     }
     println!("  resources: {}", format_child_resources(module));
     println!("  last exit: {}", format_last_exit(module));

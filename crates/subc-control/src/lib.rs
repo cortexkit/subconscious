@@ -634,6 +634,11 @@ pub enum ModuleDeclaredProvenance {
 /// daemon independently observed module-provided metadata.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SupervisorObservedProcess {
+    /// Windows launch-secret source: `pipe` when the server delivered the nonce
+    /// to the direct child, `env` when it only offered the environment copy.
+    /// Absent on older daemons and platforms without this observation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_nonce_source: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2085,6 +2090,10 @@ pub struct SupervisorEntry {
     /// on Windows. Non-wire modules receive no nonce on either platform.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_nonce_env: Option<bool>,
+    /// Windows server-observed handoff source (`pipe` or `env`). Non-wire and
+    /// stopped modules have no source. This is not the HELLO provenance claim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_nonce_source: Option<String>,
     pub health: SupervisorHealthStatus,
     /// Computed from the stored launch spec and observed process at list time;
     /// None means an older daemon did not report this comparison.
@@ -2204,6 +2213,7 @@ impl SupervisorEntry {
             live,
             protocol: ModuleProtocol::default(),
             launch_nonce_env: None,
+            launch_nonce_source: None,
             health,
             pending_reload: None,
             last_probe_ms: None,
@@ -2234,6 +2244,11 @@ impl SupervisorEntry {
     #[must_use]
     pub fn with_launch_nonce_env(mut self, launch_nonce_env: Option<bool>) -> Self {
         self.launch_nonce_env = launch_nonce_env;
+        self
+    }
+
+    pub fn with_launch_nonce_source(mut self, source: Option<String>) -> Self {
+        self.launch_nonce_source = source;
         self
     }
 

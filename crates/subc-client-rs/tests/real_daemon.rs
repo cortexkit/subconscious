@@ -934,7 +934,13 @@ async fn a_supervised_module_reads_its_launch_nonce_from_the_descriptor_and_hell
 
     let mut daemon = spawn_daemon(&daemon_bin, &runtime_dir, &config_dir);
     wait_for_connection_file(&daemon.connection_file, START_TIMEOUT).await;
-    let expected_source = if cfg!(unix) { "fd" } else { "env" };
+    let expected_source = if cfg!(unix) {
+        "fd"
+    } else if cfg!(windows) {
+        "pipe"
+    } else {
+        "env"
+    };
     let started = wait_for_event(&events_path, START_TIMEOUT, |event| {
         event["kind"] == "launch_nonce"
     })
@@ -959,6 +965,11 @@ async fn a_supervised_module_reads_its_launch_nonce_from_the_descriptor_and_hell
     let modules = &response["modules"];
     assert_eq!(
         modules[0]["module_declared"]["build"]["launch_nonce_source"], expected_source,
+        "{response}"
+    );
+    #[cfg(windows)]
+    assert_eq!(
+        modules[0]["daemon_observed"]["launch_nonce_source"], "pipe",
         "{response}"
     );
     daemon.kill_and_wait();

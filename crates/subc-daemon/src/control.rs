@@ -4273,6 +4273,7 @@ impl ControlHandler {
                     status.health.status,
                 )
                 .with_launch_nonce_env(Some(!cfg!(unix)))
+                .with_launch_nonce_source(status.launch_nonce_source)
                 .with_protocol(status.protocol)
                 .with_pending_reload(pending_reload)
                 .with_last_probe_ms(status.health.last_probe_ms)
@@ -4488,6 +4489,7 @@ impl ControlHandler {
                 module_id: status.module_id,
                 module_declared,
                 daemon_observed: SupervisorObservedProcess {
+                    launch_nonce_source: status.launch_nonce_source,
                     pid: status.pid,
                     spawned_at_ms: status.spawned_at_ms,
                     spawned_from: status.spawned_from,

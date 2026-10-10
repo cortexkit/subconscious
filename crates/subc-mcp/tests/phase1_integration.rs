@@ -5251,11 +5251,10 @@ async fn real_mcp_hello_declares_build_provenance() {
 }
 
 /// Where a supervised module gets its launch nonce on this platform: the daemon
-/// hands it over on a pipe on Unix, and only in the environment on Windows,
-/// which has no pipe handover yet.
+/// hands it over on an inherited Unix pipe or a PID-authenticated Windows pipe.
 fn expected_launch_nonce_source() -> subc_protocol::manifest::LaunchNonceSource {
     if cfg!(windows) {
-        subc_protocol::manifest::LaunchNonceSource::Env
+        subc_protocol::manifest::LaunchNonceSource::Pipe
     } else {
         subc_protocol::manifest::LaunchNonceSource::Fd
     }

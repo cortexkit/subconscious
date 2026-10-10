@@ -628,6 +628,7 @@ fn client_control_responses() -> Vec<(&'static str, ClientControlResponse)> {
                             .with_store_schema_version(Some("2".to_string())),
                     },
                     daemon_observed: SupervisorObservedProcess {
+                        launch_nonce_source: None,
                         pid: Some(4201),
                         spawned_at_ms: Some(1_725_000_000_002),
                         spawned_from: Some(PathBuf::from("/opt/subc/bin/aft")),
@@ -664,6 +665,7 @@ fn client_control_responses() -> Vec<(&'static str, ClientControlResponse)> {
                     module_id: "vault".to_string(),
                     module_declared: ModuleDeclaredProvenance::Unverifiable,
                     daemon_observed: SupervisorObservedProcess {
+                        launch_nonce_source: None,
                         pid: Some(4301),
                         spawned_at_ms: Some(1_725_000_000_004),
                         spawned_from: Some(PathBuf::from("/opt/subc/bin/vault")),
@@ -716,6 +718,7 @@ fn client_control_responses() -> Vec<(&'static str, ClientControlResponse)> {
                             .with_store_schema_version(Some("3".to_string())),
                     },
                     daemon_observed: SupervisorObservedProcess {
+                        launch_nonce_source: None,
                         pid: Some(4401),
                         spawned_at_ms: Some(1_725_000_000_006),
                         spawned_from: Some(PathBuf::from("/opt/subc/bin/mcp")),

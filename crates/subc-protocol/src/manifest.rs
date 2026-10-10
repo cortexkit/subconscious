@@ -824,7 +824,8 @@ pub struct ManifestProvenance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub store_schema_version: Option<String>,
     /// Where the running module read its launch nonce from: `fd` (the pipe
-    /// the daemon hands over as descriptor 3) or `env` (the environment
+    /// the daemon hands over as descriptor 3), `pipe` (the Windows named pipe),
+    /// or `env` (the environment
     /// variable kept while modules move to the pipe). Absent means the module
     /// did not say. This is a fact about the running process, not the build.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -842,6 +843,8 @@ pub struct ManifestProvenance {
 pub enum LaunchNonceSource {
     /// Read from the inherited descriptor the daemon passes.
     Fd,
+    /// Read from the PID-authenticated Windows named pipe.
+    Pipe,
     /// Read from the `SUBC_LAUNCH_NONCE` environment variable.
     Env,
     ForwardCompatibleUnknown(String),
@@ -852,6 +855,7 @@ impl LaunchNonceSource {
     pub fn wire_name(&self) -> &str {
         match self {
             Self::Fd => "fd",
+            Self::Pipe => "pipe",
             Self::Env => "env",
             Self::ForwardCompatibleUnknown(value) => value,
         }
@@ -861,6 +865,7 @@ impl LaunchNonceSource {
     pub fn from_wire_name(value: &str) -> Self {
         match value {
             "fd" => Self::Fd,
+            "pipe" => Self::Pipe,
             "env" => Self::Env,
             _ => Self::ForwardCompatibleUnknown(value.to_string()),
         }

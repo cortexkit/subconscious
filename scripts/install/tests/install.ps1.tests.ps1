@@ -15,10 +15,12 @@ BeforeAll {
 Describe 'native ck installer' {
     BeforeEach {
         $originalLocalAppData = $env:LOCALAPPDATA
+        $originalPath = $env:Path
         $originalArchitecture = $env:PROCESSOR_ARCHITECTURE
         $originalWowArchitecture = $env:PROCESSOR_ARCHITEW6432
         $originalUserProfile = $env:USERPROFILE
         $env:LOCALAPPDATA = Join-Path $TestDrive 'local-app-data'
+        $env:Path = 'C:\Windows\System32;C:\Fixture\Other'
         $env:USERPROFILE = Join-Path $TestDrive 'profile-home'
         $env:PROCESSOR_ARCHITECTURE = 'AMD64'
         Remove-Item Env:PROCESSOR_ARCHITEW6432 -ErrorAction SilentlyContinue
@@ -95,6 +97,12 @@ Describe 'native ck installer' {
 
     AfterEach {
         $env:LOCALAPPDATA = $originalLocalAppData
+        if ($null -eq $originalPath) {
+            Remove-Item Env:Path -ErrorAction SilentlyContinue
+        }
+        else {
+            $env:Path = $originalPath
+        }
         $env:PROCESSOR_ARCHITECTURE = $originalArchitecture
         if ($null -eq $originalUserProfile) {
             Remove-Item Env:USERPROFILE -ErrorAction SilentlyContinue
@@ -171,6 +179,24 @@ Describe 'native ck installer' {
             $Value -eq ('%USERPROFILE%\.dotnet\tools;C:\Other\Bin;' + (Join-Path $env:LOCALAPPDATA 'cortexkit\bin')) -and
             $Type -eq [Microsoft.Win32.RegistryValueKind]::ExpandString
         }
+    }
+
+    It 'adds the install directory to the current session PATH only once' {
+        $env:CK_RELEASE_INDEX_URL = 'https://release.fixture.example/releases/v1/index.json'
+        $binDir = Join-Path $env:LOCALAPPDATA 'cortexkit\bin'
+        $env:Path = 'C:\Windows\System32;C:\Fixture\Other'
+
+        & $installerPath | Out-Null
+
+        $pathEntries = @($env:Path -split ';')
+        $pathEntries | Should -Contain $binDir
+        $pathEntries[0] | Should -Be $binDir
+        $firstPath = $env:Path
+
+        & $installerPath | Out-Null
+
+        @($env:Path -split ';' | Where-Object { $_ -ieq $binDir }).Count | Should -Be 1
+        $env:Path | Should -Be $firstPath
     }
 
     It 'refuses an architecture the release does not ship before any fetch' {

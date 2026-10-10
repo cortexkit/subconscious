@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.20.71
+
+- On Windows, register the logon task only for the current account and update the installer session PATH immediately while notifying other processes of persisted PATH changes.
+
 ## 0.20.70
 
 - Built on `subc-daemon` 0.33: the daemon enforces scope deadlines, serves `scope.apply`, and gates agent-run scopes on `agent-run-scopes/v1`. No CLI change.

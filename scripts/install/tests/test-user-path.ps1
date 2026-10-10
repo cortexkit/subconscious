@@ -17,6 +17,7 @@ $function = $ast.Find({
 Invoke-Expression $function.Extent.Text
 
 function Refuse { param($Type, $Evidence) throw "refusal: ${Type}: $Evidence" }
+function Broadcast-EnvironmentChange {}
 function Get-ItemPropertyValue {
     param($Path, $Name, $ErrorAction)
     return [Environment]::ExpandEnvironmentVariables($script:rawPath)

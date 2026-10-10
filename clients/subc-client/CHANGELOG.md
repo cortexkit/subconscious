@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.21.2
+
+- Measure a frame body's read budget as time without progress rather than wall-clock time since its header. Each incoming chunk pushes the deadline out by the budget again, so a slow but moving body does not time out, while a body that stops arriving still fails after the budget. Absolute deadlines, such as the handshake's, stay fixed: arriving bytes never extend them.
+- Defer deadline timeout rejection past the event loop's I/O poll phase (`setImmediate`) before failing. In Node and Bun, expired timers run before I/O polling, so if the host process's event loop was blocked by CPU-bound work or a busy thread, an armed read deadline timer could expire while incoming bytes were already sitting in the OS kernel socket receive buffer. When the event loop resumed, the timer fired before the socket's data handler could read those bytes, causing parallel calls sharing the connection to fail together with "timed out waiting for N bytes" despite no network or daemon stall. The deferred check allows pending kernel bytes to be delivered and processed before any timeout is raised.
+- Add optional `bodyReadTimeoutMs` to `ConnectOptions` and `SubcProviderConnectOptions` to make the body read budget injectable.
+
 ## 0.21.1
 
 - A cached managed route now ends permanently only when its scope ends. Other route closes, including crashes and connection loss, discard the cached route so the next call opens a fresh one; calls already in flight still fail without being resent. This fixes a regression in 0.21.0, where a long-lived client refused every later call to a module after that module crashed and was restarted.

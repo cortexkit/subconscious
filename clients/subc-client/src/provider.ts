@@ -312,6 +312,12 @@ export interface SubcProviderConnectOptions {
   sleep?: (ms: number) => Promise<void>;
   /** Milliseconds to wait before emitting restored after the provider re-registers following a reconnect. */
   restoredDebounceMs?: number;
+  /**
+   * Deadline budget (ms) without progress for reading a frame body after its
+   * header arrives. Each incoming chunk pushes the deadline out again.
+   * Defaults to 30,000 ms.
+   */
+  bodyReadTimeoutMs?: number;
   /** Callback that receives ProviderConnectionState events one at a time and in order. */
   onConnectionState?: (event: ProviderConnectionState) => void | Promise<void>;
   /**
@@ -351,6 +357,7 @@ interface NormalizedSubcProviderConnectOptions {
   reconnectBackoff: ReconnectBackoff;
   sleep: (ms: number) => Promise<void>;
   restoredDebounceMs: number;
+  bodyReadTimeoutMs?: number;
   onConnectionState?: (event: ProviderConnectionState) => void | Promise<void>;
   /** The launch nonce to echo in HELLO, already resolved against the environment. */
   launchNonce?: string;
@@ -718,7 +725,9 @@ export class SubcProvider {
     const control: ControlPushState = { undecodablePushLogged: false, drainingHooks: new Set() };
     try {
       for (;;) {
-        const frame = await sock.readFrame(Number.POSITIVE_INFINITY, { afterHeaderMs: BODY_READ_TIMEOUT_MS });
+        const frame = await sock.readFrame(Number.POSITIVE_INFINITY, {
+          afterHeaderMs: this.opts.bodyReadTimeoutMs ?? BODY_READ_TIMEOUT_MS,
+        });
         const keepGoing = await this.dispatch(frame, sock, generation, control);
         if (!keepGoing) {
           if (this.sock === sock && this.generation === generation) {
@@ -1493,6 +1502,7 @@ function normalizeProviderConnectOptions(opts: SubcProviderConnectOptions): Norm
     reconnectBackoff: opts.reconnectBackoff ?? DEFAULT_RECONNECT_BACKOFF,
     sleep: opts.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms))),
     restoredDebounceMs: opts.restoredDebounceMs ?? DEFAULT_RESTORED_DEBOUNCE_MS,
+    bodyReadTimeoutMs: opts.bodyReadTimeoutMs,
     onConnectionState: opts.onConnectionState,
     launchNonce: nonEmpty(opts.launchNonce ?? envLaunchNonce),
     reconnectOnDrop: opts.reconnectOnDrop ?? !supervised,

@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
-import { createServer, type AddressInfo } from "node:net";
+import { createServer, type AddressInfo, type Socket } from "node:net";
 
-import { buildFrame, encodeFrame, FrameType, Priority, buildFlags, DecodeError } from "../src/envelope.js";
+import { buildFrame, encodeFrame, FrameType, Priority, buildFlags, DecodeError, HEADER_LEN } from "../src/envelope.js";
 import { SocketTimeoutError, SubcSocket, toWriteBuffer } from "../src/socket.js";
 
 test("outbound write buffer preserves the exact slice without copying", () => {
@@ -130,5 +130,178 @@ test("absolute body deadline still enforces a total budget (handshake semantics 
   } finally {
     socket.close();
     await close();
+  }
+});
+
+test("readFrame succeeds when event loop is blocked longer than body budget while peer has already written full body", async () => {
+  const body = new TextEncoder().encode("payload-sitting-in-kernel-buffer");
+  const frame = buildFrame(FrameType.Response, buildFlags(false, Priority.Passive, true), 1, 1, 10n, body);
+  const wire = encodeFrame(frame);
+  const headerBytes = wire.subarray(0, HEADER_LEN);
+  const bodyBytes = wire.subarray(HEADER_LEN);
+
+  let peerSock!: Socket;
+  const server = createServer((s) => {
+    peerSock = s;
+  });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+  const port = (server.address() as AddressInfo).port;
+  const socket = await SubcSocket.connect("127.0.0.1", port, Date.now() + 1_000);
+  await new Promise<void>((r) => {
+    if (peerSock) r();
+    else server.once("connection", () => r());
+  });
+
+  try {
+    peerSock.write(headerBytes);
+    let headerSeen = false;
+    const readPromise = socket.readFrame(Number.POSITIVE_INFINITY, { afterHeaderMs: 40 }, () => {
+      headerSeen = true;
+      // In onHeader, the header has arrived and readExact for the body is about
+      // to be invoked. We queue a microtask so readExact registers its waiter
+      // and arms its 40ms timer before the peer writes the body to the kernel
+      // buffer and the event loop is synchronously blocked.
+      queueMicrotask(() => {
+        peerSock.write(bodyBytes);
+        const start = Date.now();
+        while (Date.now() - start < 80) {}
+      });
+    });
+
+    const result = await readPromise;
+    expect(headerSeen).toBe(true);
+    expect(new TextDecoder().decode(result.body)).toBe("payload-sitting-in-kernel-buffer");
+  } finally {
+    socket.close();
+    peerSock?.destroy();
+    await new Promise<void>((r) => server.close(() => r()));
+  }
+});
+
+test("body that trickles in slower than budget overall with gaps shorter than budget succeeds", async () => {
+  const body = new TextEncoder().encode("trickling-body-chunks-slow-stream");
+  const frame = buildFrame(FrameType.Response, buildFlags(false, Priority.Passive, true), 1, 1, 10n, body);
+  const wire = encodeFrame(frame);
+  const headerBytes = wire.subarray(0, HEADER_LEN);
+  const bodyBytes = wire.subarray(HEADER_LEN);
+
+  let peerSock!: Socket;
+  const server = createServer((s) => {
+    peerSock = s;
+  });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+  const port = (server.address() as AddressInfo).port;
+  const socket = await SubcSocket.connect("127.0.0.1", port, Date.now() + 1_000);
+  await new Promise<void>((r) => {
+    if (peerSock) r();
+    else server.once("connection", () => r());
+  });
+
+  try {
+    peerSock.write(headerBytes);
+    // Budget is 40ms. Body is split into 3 chunks sent at 0ms, 25ms, and 50ms.
+    // Total duration is 50ms > 40ms budget, but each gap (25ms) is shorter than 40ms.
+    const part1 = bodyBytes.subarray(0, 10);
+    const part2 = bodyBytes.subarray(10, 20);
+    const part3 = bodyBytes.subarray(20);
+
+    const readPromise = socket.readFrame(Number.POSITIVE_INFINITY, { afterHeaderMs: 40 });
+
+    setTimeout(() => peerSock.write(part1), 0);
+    setTimeout(() => peerSock.write(part2), 25);
+    setTimeout(() => peerSock.write(part3), 50);
+
+    const result = await readPromise;
+    expect(new TextDecoder().decode(result.body)).toBe("trickling-body-chunks-slow-stream");
+  } finally {
+    socket.close();
+    peerSock?.destroy();
+    await new Promise<void>((r) => server.close(() => r()));
+  }
+});
+
+test("body that stops arriving fails with SocketTimeoutError after budget", async () => {
+  const body = new TextEncoder().encode("abandoned-body-incomplete");
+  const frame = buildFrame(FrameType.Response, buildFlags(false, Priority.Passive, true), 1, 1, 10n, body);
+  const wire = encodeFrame(frame);
+  const headerBytes = wire.subarray(0, HEADER_LEN);
+  const bodyBytes = wire.subarray(HEADER_LEN);
+
+  let peerSock!: Socket;
+  const server = createServer((s) => {
+    peerSock = s;
+  });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+  const port = (server.address() as AddressInfo).port;
+  const socket = await SubcSocket.connect("127.0.0.1", port, Date.now() + 1_000);
+  await new Promise<void>((r) => {
+    if (peerSock) r();
+    else server.once("connection", () => r());
+  });
+
+  try {
+    peerSock.write(headerBytes);
+    // Send only the first 5 bytes of the body, then abandon the stream.
+    const partialBody = bodyBytes.subarray(0, 5);
+
+    const readPromise = socket.readFrame(Number.POSITIVE_INFINITY, { afterHeaderMs: 40 });
+    peerSock.write(partialBody);
+
+    const err = await Promise.race([
+      readPromise.then(
+        () => null,
+        (e: unknown) => e,
+      ),
+      new Promise<string>((resolve) => setTimeout(() => resolve("timed-out-in-test"), 150)),
+    ]);
+    expect(err).toBeInstanceOf(SocketTimeoutError);
+    expect((err as Error).message).toBe(`timed out waiting for ${body.length} bytes`);
+  } finally {
+    socket.close();
+    peerSock?.destroy();
+    await new Promise<void>((r) => server.close(() => r()));
+  }
+});
+
+test("an absolute deadline is not extended by bytes that keep trickling in", async () => {
+  const body = new TextEncoder().encode("a-body-sent-one-byte-at-a-time-forever");
+  const frame = buildFrame(FrameType.Response, buildFlags(false, Priority.Passive, true), 1, 1, 10n, body);
+  const wire = encodeFrame(frame);
+  const headerBytes = wire.subarray(0, HEADER_LEN);
+  const bodyBytes = wire.subarray(HEADER_LEN);
+
+  let peerSock!: Socket;
+  const server = createServer((s) => {
+    peerSock = s;
+  });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+  const port = (server.address() as AddressInfo).port;
+  const socket = await SubcSocket.connect("127.0.0.1", port, Date.now() + 1_000);
+  await new Promise<void>((r) => {
+    if (peerSock) r();
+    else server.once("connection", () => r());
+  });
+
+  // One byte every 10 ms keeps progress flowing well past the 60 ms absolute
+  // deadline; the read must still fail at that deadline, as the handshake
+  // relies on, instead of being extended by each byte.
+  let sent = 0;
+  const drip = setInterval(() => {
+    if (sent < bodyBytes.length) peerSock.write(bodyBytes.subarray(sent, ++sent));
+  }, 10);
+  try {
+    peerSock.write(headerBytes);
+    const started = Date.now();
+    const result = await socket.readFrame(Number.POSITIVE_INFINITY, Date.now() + 60).then(
+      () => "resolved",
+      (error: unknown) => error,
+    );
+    expect(result).toBeInstanceOf(SocketTimeoutError);
+    expect(Date.now() - started).toBeLessThan(250);
+  } finally {
+    clearInterval(drip);
+    socket.close();
+    peerSock?.destroy();
+    await new Promise<void>((r) => server.close(() => r()));
   }
 });

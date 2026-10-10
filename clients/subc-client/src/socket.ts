@@ -71,7 +71,17 @@ interface Waiter {
   resolve: (bytes: Uint8Array) => void;
   reject: (err: Error) => void;
   timer: ReturnType<typeof setTimeout> | null;
+  immediate: ReturnType<typeof setImmediate> | null;
+  budget: number;
+  /**
+   * True for an idle budget (time without progress), which arriving bytes
+   * extend. False for an absolute deadline, such as the handshake's, which is
+   * a fixed bound: a peer that trickles bytes must not be able to stretch it.
+   */
+  extendOnProgress: boolean;
 }
+
+export type ReadDeadline = number | { idleTimeoutMs: number };
 
 export class SubcSocket {
   private readonly sock: net.Socket;
@@ -92,6 +102,17 @@ export class SubcSocket {
     sock.on("data", (chunk: Buffer) => {
       this.chunks.push(chunk);
       this.buffered += chunk.length;
+      if (this.waiter) {
+        if (this.waiter.immediate) {
+          clearImmediate(this.waiter.immediate);
+          this.waiter.immediate = null;
+        }
+        if (this.waiter.extendOnProgress && this.buffered < this.waiter.need) {
+          // Progress was made on the pending read: push the deadline out
+          // by the budget again so a slow but moving stream does not time out.
+          this.armWaiterTimer(this.waiter);
+        }
+      }
       this.tryServe();
     });
     const fail = (err: Error) => {
@@ -163,34 +184,107 @@ export class SubcSocket {
       throw new DecodeError(`frame body ${header.len} exceeds max ${MAX_FRAME_BODY_LEN}`, "frame_body_too_large");
     }
     onHeader?.();
-    const bodyDeadlineMs =
-      typeof bodyDeadline === "number" ? bodyDeadline : Date.now() + bodyDeadline.afterHeaderMs;
-    const body = header.len === 0 ? new Uint8Array(0) : await this.readExact(header.len, bodyDeadlineMs);
+    const bodyDeadlineArg =
+      typeof bodyDeadline === "number" ? bodyDeadline : { idleTimeoutMs: bodyDeadline.afterHeaderMs };
+    const body = header.len === 0 ? new Uint8Array(0) : await this.readExact(header.len, bodyDeadlineArg);
     return { header, body };
   }
 
-  /** Read exactly `n` bytes, rejecting if `deadlineMs` (epoch ms) passes first. */
-  readExact(n: number, deadlineMs: number): Promise<Uint8Array> {
+  /**
+   * Arm or reset the idle timeout timer for a pending waiter.
+   *
+   * In Node and Bun, expired timers run BEFORE the event loop polls for I/O.
+   * If the host process is blocked by CPU-bound work or a busy thread, the
+   * deadline timer may expire while bytes from the peer are already waiting in
+   * the OS kernel socket receive buffer. When the event loop resumes, the
+   * timer fires first, before the socket's 'data' event has had a chance to
+   * read those bytes from the kernel.
+   *
+   * A timer alone therefore cannot distinguish between "the peer never sent
+   * data" and "data arrived but has not yet been delivered across the event
+   * loop stall". We give pending socket data a chance to be delivered by
+   * deferring the timeout check past the I/O poll phase via setImmediate.
+   * (In Node, setImmediate runs after the poll phase; in Bun, a second
+   * setImmediate ensures the poll phase has run if the first ran before it).
+   * We only reject if the read is still unsatisfied and no bytes arrived
+   * meanwhile.
+   */
+  private armWaiterTimer(w: Waiter): void {
+    if (!Number.isFinite(w.budget)) return;
+    if (w.timer) {
+      clearTimeout(w.timer);
+      w.timer = null;
+    }
+    w.timer = setTimeout(() => {
+      w.timer = null;
+      const bufferedAtTimeout = this.buffered;
+      const verifyTimeout = () => {
+        if (this.waiter !== w) return;
+        if (w.extendOnProgress && this.buffered > bufferedAtTimeout) {
+          // Progress was made: bytes arrived after the timer fired.
+          // Push the deadline out by the budget again.
+          this.armWaiterTimer(w);
+          return;
+        }
+        this.waiter = null;
+        w.reject(new SocketTimeoutError(`timed out waiting for ${w.need} bytes`));
+      };
+
+      w.immediate = setImmediate(() => {
+        if (this.waiter !== w) return;
+        if (this.buffered > bufferedAtTimeout) {
+          verifyTimeout();
+        } else {
+          w.immediate = setImmediate(() => {
+            w.immediate = null;
+            verifyTimeout();
+          });
+        }
+      });
+    }, w.budget);
+  }
+
+  /**
+   * Read exactly `n` bytes, rejecting if `deadline` passes without progress.
+   * `deadline` is either an absolute epoch-ms deadline or `{ idleTimeoutMs }`
+   * specifying the maximum allowed time without progress (bytes arriving).
+   */
+  readExact(n: number, deadline: ReadDeadline): Promise<Uint8Array> {
     if (this.waiter) {
       return Promise.reject(new Error("concurrent readExact is not supported"));
     }
     if (n === 0) return Promise.resolve(new Uint8Array(0));
     return new Promise<Uint8Array>((resolve, reject) => {
-      // A non-finite deadline means "wait indefinitely" (the background frame
-      // loop relies on this; per-request timeouts live on the request waiters).
-      let timer: ReturnType<typeof setTimeout> | null = null;
-      if (Number.isFinite(deadlineMs)) {
-        const remaining = deadlineMs - Date.now();
+      let budget: number;
+      const extendOnProgress = typeof deadline === "object";
+      if (typeof deadline === "object") {
+        budget = deadline.idleTimeoutMs;
+        if (budget <= 0) {
+          reject(new SocketTimeoutError(`timed out waiting for ${n} bytes`));
+          return;
+        }
+      } else if (Number.isFinite(deadline)) {
+        const remaining = deadline - Date.now();
         if (remaining <= 0) {
           reject(new SocketTimeoutError(`timed out waiting for ${n} bytes`));
           return;
         }
-        timer = setTimeout(() => {
-          this.waiter = null;
-          reject(new SocketTimeoutError(`timed out waiting for ${n} bytes`));
-        }, remaining);
+        budget = remaining;
+      } else {
+        budget = Number.POSITIVE_INFINITY;
       }
-      this.waiter = { need: n, resolve, reject, timer };
+
+      const waiter: Waiter = {
+        need: n,
+        resolve,
+        reject,
+        timer: null,
+        immediate: null,
+        budget,
+        extendOnProgress,
+      };
+      this.waiter = waiter;
+      this.armWaiterTimer(waiter);
       this.tryServe();
     });
   }
@@ -309,12 +403,14 @@ export class SubcSocket {
       const out = this.take(w.need);
       this.waiter = null;
       if (w.timer) clearTimeout(w.timer);
+      if (w.immediate) clearImmediate(w.immediate);
       w.resolve(out);
       return;
     }
     if (this.closedErr) {
       this.waiter = null;
       if (w.timer) clearTimeout(w.timer);
+      if (w.immediate) clearImmediate(w.immediate);
       w.reject(this.closedErr);
     }
   }

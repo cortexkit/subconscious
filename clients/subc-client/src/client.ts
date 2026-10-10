@@ -428,6 +428,12 @@ export interface ConnectOptions {
    */
   timeoutArbitrationGraceMs?: number;
   /**
+   * Deadline budget (ms) without progress for reading a frame body after its
+   * header arrives. Each incoming chunk pushes the deadline out again.
+   * Defaults to 30,000 ms.
+   */
+  bodyReadTimeoutMs?: number;
+  /**
    * Observer for parsed daemon control pushes, including unrecognized ops which
    * callers should ignore. Malformed JSON is dropped and observer exceptions are
    * swallowed so they cannot fail unrelated requests. The client records route
@@ -531,6 +537,7 @@ interface NormalizedConnectOptions {
   random: () => number;
   routeOpenRetryDeadlineMs: number;
   timeoutArbitrationGraceMs: number;
+  bodyReadTimeoutMs?: number;
   livenessProbeWindowMs: number;
   onControlPush?: (push: ControlPush) => void;
 }
@@ -1766,7 +1773,7 @@ export class SubcClient {
         this.readerActive = false;
         const frame = await sock.readFrame(
           Number.POSITIVE_INFINITY,
-          { afterHeaderMs: BODY_READ_TIMEOUT_MS },
+          { afterHeaderMs: this.opts.bodyReadTimeoutMs ?? BODY_READ_TIMEOUT_MS },
           () => {
             this.readerActive = true;
           },
@@ -2371,6 +2378,7 @@ function normalizeConnectOptions(opts: ConnectOptions): NormalizedConnectOptions
     random: opts.random ?? Math.random,
     routeOpenRetryDeadlineMs: opts.routeOpenRetryDeadlineMs ?? ROUTE_OPEN_RETRY_DEADLINE_MS,
     timeoutArbitrationGraceMs: opts.timeoutArbitrationGraceMs ?? TIMEOUT_ARBITRATION_GRACE_MS,
+    bodyReadTimeoutMs: opts.bodyReadTimeoutMs,
     livenessProbeWindowMs: opts.livenessProbeWindowMs ?? LIVENESS_PROBE_WINDOW_MS,
     onControlPush: opts.onControlPush,
   };

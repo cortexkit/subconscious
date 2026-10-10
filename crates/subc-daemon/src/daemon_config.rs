@@ -1460,8 +1460,9 @@ mod windows_run_dir_privacy_tests {
         let child = path.join("old.log");
         std::fs::write(&child, b"old log").unwrap();
         ensure_directory_private(&path).unwrap();
-        assert_owner_only(&path, true, true);
-        // The file existed before narrowing, so only its access list changes.
+        // The folder and the file both existed before narrowing, so only their
+        // access lists change; an elevated test runner owns them as Administrators.
+        assert_dacl_owner_only(&path, true, true);
         assert_dacl_owner_only(&child, false, false);
     }
 }

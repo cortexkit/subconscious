@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.33.3
+
+- Keep an exited child's stdout reader running to EOF when it exceeds the 250 ms restart wait, just like stderr. Aborting that reader discarded output still buffered in the pipe, which could leave Windows capture files permanently short after a burst. The restart remains bounded; late output from either pipe may arrive after the replacement starts.
+
 ## 0.33.2
 
 - Log pre-authentication rejections at info level with the peer, elapsed time, and a reason that distinguishes capacity waits, handshake deadlines, invalid proofs, malformed messages, and peers that close early. Rate-limit each reason and include its accumulated suppressed count on the next permitted line.

@@ -81,8 +81,8 @@ const REGISTRY_RELEASE_TIMEOUT: Duration = Duration::from_secs(1);
 const REGISTRY_RELEASE_POLL: Duration = Duration::from_millis(10);
 /// How long a restart waits for the exited process's output readers.
 ///
-/// The restart does not depend on the stderr reader finishing. A reader still
-/// running at this bound is left running, and whatever it delivers later goes
+/// The restart does not depend on either output reader finishing. A stderr
+/// reader still running at this bound is left running, and its later output goes
 /// into the exited process's own section of the stderr ring (see
 /// `StderrRing::push_line_from`), ending naturally at EOF on its pipe. So the
 /// bound no longer decides whether a crash's last lines are kept: under load
@@ -97,9 +97,10 @@ const REGISTRY_RELEASE_POLL: Duration = Duration::from_millis(10);
 /// exits. Under load a slow reader can show `Incomplete` briefly; it returns to
 /// `Captured` at EOF with nothing lost.
 ///
-/// The stdout reader carries no ring, only the capture file, and is still
-/// stopped at this bound so an old process's stdout cannot trail into the file
-/// after its successor starts.
+/// The stdout reader carries no ring, only the capture file. It also continues
+/// to EOF after this bound: child exit closes the writer but does not mean the
+/// reader has consumed all buffered bytes. Late output from either pipe can
+/// therefore reach the shared capture file after the successor starts.
 const STDERR_PUMP_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
 /// Maximum number of supervised process spawn/exit facts retained per daemon incarnation.
 pub const SPAWN_EVENT_RING_CAPACITY: usize = 4096;
@@ -509,21 +510,8 @@ impl SupervisedChild {
     }
 
     async fn drain_stderr(&mut self, module_id: &str) {
-        if let Some(mut pump) = self.stdout_pump.take() {
-            match timeout(STDERR_PUMP_DRAIN_TIMEOUT, &mut pump).await {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => {
-                    warn!(module_id, error = %error, "stdout pump ended unexpectedly");
-                }
-                Err(_) => {
-                    pump.abort();
-                    warn!(
-                        module_id,
-                        waited = ?STDERR_PUMP_DRAIN_TIMEOUT,
-                        "stdout pump did not drain before restart; stopped it before the next process"
-                    );
-                }
-            }
+        if let Some(pump) = self.stdout_pump.take() {
+            settle_stdout_pump(module_id, pump, STDERR_PUMP_DRAIN_TIMEOUT).await;
         }
 
         let Some(pump) = self.stderr_pump.take() else {
@@ -536,6 +524,26 @@ impl SupervisedChild {
             STDERR_PUMP_DRAIN_TIMEOUT,
         )
         .await;
+    }
+}
+
+/// Bound the restart's wait, not the lifetime of the exited child's stdout
+/// reader. Slow pipe reads or capture writes must not turn the bound into lost
+/// output; dropping the handle lets the reader finish at EOF, like stderr.
+async fn settle_stdout_pump(module_id: &str, mut pump: JoinHandle<()>, bound: Duration) {
+    match timeout(bound, &mut pump).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            warn!(module_id, error = %error, "stdout pump ended unexpectedly");
+        }
+        Err(_) => {
+            drop(pump);
+            warn!(
+                module_id,
+                waited = ?bound,
+                "stdout pipe of the exited process has not drained; its reader keeps running without delaying the restart"
+            );
+        }
     }
 }
 
@@ -12967,8 +12975,8 @@ mod terminal_history_read_concurrency_tests {
     }
 }
 
-/// What a restart does with the exited process's stderr reader. These drive
-/// the same `settle_stderr_pump` the supervisor calls, with a reader the test
+/// What a restart does with the exited process's output readers. These drive
+/// the same settle functions the supervisor calls, with a reader the test
 /// holds, so a reader that has not been scheduled by the bound is a controlled
 /// input rather than something only a loaded machine produces.
 #[cfg(test)]
@@ -12988,9 +12996,10 @@ mod stderr_settle_tests {
         time::Instant,
     };
 
-    use super::{settle_stderr_pump, StderrPump};
+    use super::{settle_stderr_pump, settle_stdout_pump, StderrPump};
     use crate::stderr_tail::{
-        pump_stderr_to, untimed, CaptureState, OutputSink, StderrRing, StderrTailConfig, TailEntry,
+        pump_stderr_to, pump_stdout_to, split_capture_stamp, untimed, CaptureState,
+        ChildOutputSink, OutputSink, StderrRing, StderrTailConfig, TailEntry,
     };
 
     const BOUND: Duration = Duration::from_millis(250);
@@ -13162,6 +13171,79 @@ mod stderr_settle_tests {
         let snapshot = lock(&ring).snapshot(None, None);
         assert_eq!(snapshot.capture, CaptureState::Captured);
         assert_eq!(untimed(snapshot.entries), vec![line("one"), line("two")]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stdout_buffered_past_the_exit_drain_bound_reaches_the_capture_file() {
+        const BURST: usize = 150;
+        let capture = cortexkit_test_support::ScratchDir::new("stdout-exit-drain");
+        let path = capture.join("two-pipe.stderr.log");
+        let sink = ChildOutputSink::open(&path, cortexkit_log::Retention::default()).unwrap();
+        let ring = Arc::new(Mutex::new(StderrRing::new(StderrTailConfig::default())));
+        let generation = lock(&ring).begin_process();
+        let stdout = (0..BURST)
+            .map(|i| format!("out-{i:04}-{}\n", "o".repeat(64)))
+            .collect::<String>();
+        let stderr = (0..BURST)
+            .map(|i| format!("err-{i:04}-{}\n", "e".repeat(64)))
+            .collect::<String>();
+        // Model a child that has written both bursts and exited. Hold the stdout
+        // reader after one line and a partial prefix, as if pipe readiness or
+        // capture-file writes had delayed it. The final line also needs EOF to
+        // flush: neither complete nor partial buffered output may be discarded.
+        let first_chunk = stdout.find('\n').unwrap() + 1 + "out-0001-".len();
+        let (release, gate) = oneshot::channel();
+        let reader = HeldReader {
+            before: Some(stdout.as_bytes()[..first_chunk].to_vec()),
+            gate: Some(gate),
+            after: io::Cursor::new(stdout.as_bytes()[first_chunk..stdout.len() - 1].to_vec()),
+        };
+        let (finished, completion) = oneshot::channel();
+        let stdout_sink = sink.clone();
+        let pump = tokio::spawn(async move {
+            pump_stdout_to(reader, stdout_sink).await;
+            finished.send(()).unwrap();
+        });
+        pump_stderr_to(io::Cursor::new(stderr.into_bytes()), ring, generation, sink).await;
+
+        let started = Instant::now();
+        settle_stdout_pump("two-pipe", pump, BOUND).await;
+        assert_eq!(
+            started.elapsed(),
+            BOUND,
+            "a late reader must not hold up restart"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap().lines().count(),
+            BURST + 1
+        );
+
+        release
+            .send(())
+            .expect("stdout reader must survive the exit drain bound");
+        tokio::time::timeout(Duration::from_secs(1), completion)
+            .await
+            .expect("released stdout reader must reach EOF")
+            .expect("stdout capture must finish at EOF, not be cancelled");
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let mut lines = contents
+            .lines()
+            .map(|line| split_capture_stamp(line).expect("capture stamp").1)
+            .collect::<Vec<_>>();
+        let mut expected = (0..BURST)
+            .flat_map(|i| {
+                [
+                    format!("out-{i:04}-{}", "o".repeat(64)),
+                    format!("err-{i:04}-{}", "e".repeat(64)),
+                ]
+            })
+            .collect::<Vec<_>>();
+        lines.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(
+            lines, expected,
+            "both pipes must retain every complete line exactly once"
+        );
     }
 }
 

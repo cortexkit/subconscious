@@ -310,9 +310,11 @@ guards = "Authority-bearing scope records reject unknown fields instead of widen
 file = "crates/subc-protocol/src/scope.rs"
 old = """
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct ScopeRecord {"""
 new = """
 // NON-VACUITY BREAK: accept unknown record fields
+#[non_exhaustive]
 pub struct ScopeRecord {"""
 edits = []
 test_file = "crates/subc-protocol/tests/golden_json.rs"

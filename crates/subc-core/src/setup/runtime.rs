@@ -80,6 +80,65 @@ pub trait CommandRunner {
     fn run(&mut self, program: &str, args: &[String]) -> Result<CommandResult, String>;
 }
 
+impl<R: CommandRunner + ?Sized> CommandRunner for Box<R> {
+    fn run(&mut self, program: &str, args: &[String]) -> Result<CommandResult, String> {
+        (**self).run(program, args)
+    }
+}
+
+const USER_MANAGER_HINT: &str = "refusal: systemd-user-manager-unavailable: systemd is available, but no user session bus is reachable. Log in normally, or run `loginctl enable-linger $USER` then start a new login session; if it exists, export `XDG_RUNTIME_DIR=/run/user/$(id -u)`.";
+const SYSTEMD_UNAVAILABLE: &str = "refusal: systemd-unavailable: Linux setup is unsupported because systemd is not available on this host.";
+
+/// Check before setup reads release metadata or changes any files.
+pub fn preflight<R: CommandRunner>(
+    platform: RuntimePlatform,
+    runner: &mut R,
+) -> Result<(), String> {
+    if platform != RuntimePlatform::Linux {
+        return Ok(());
+    }
+
+    let args = vec!["--user".to_string(), "show-environment".to_string()];
+    let result = runner
+        .run("systemctl", &args)
+        .map_err(|_| SYSTEMD_UNAVAILABLE.to_string())?;
+    if result.success {
+        return Ok(());
+    }
+
+    // A running system manager distinguishes a missing user session from a
+    // host that cannot run systemd at all.
+    let system_result = runner
+        .run("systemctl", &["show-environment".to_string()])
+        .map_err(|_| SYSTEMD_UNAVAILABLE.to_string())?;
+    if !system_result.success {
+        return Err(SYSTEMD_UNAVAILABLE.to_string());
+    }
+
+    Err(USER_MANAGER_HINT.to_string())
+}
+
+/// Return the operator hint only when loginctl confirms linger is disabled.
+pub fn linger_hint<R: CommandRunner>(
+    platform: RuntimePlatform,
+    runner: &mut R,
+) -> Option<&'static str> {
+    if platform != RuntimePlatform::Linux {
+        return None;
+    }
+
+    let args = vec![
+        "show-user".to_string(),
+        current_uid().to_string(),
+        "-p".to_string(),
+        "Linger".to_string(),
+    ];
+    let result = runner.run("loginctl", &args).ok()?;
+    (result.success && result.stdout.lines().any(|line| line.trim() == "Linger=no")).then_some(
+        "The daemon stops at logout; run `loginctl enable-linger $USER` to keep it running.",
+    )
+}
+
 pub struct SystemCommandRunner;
 
 impl CommandRunner for SystemCommandRunner {
@@ -802,6 +861,79 @@ mod tests {
 
     fn fixture_dir(name: &str) -> ScratchDir {
         ScratchDir::new(name)
+    }
+
+    struct LingerRunner {
+        output: String,
+        calls: usize,
+    }
+
+    impl CommandRunner for LingerRunner {
+        fn run(&mut self, program: &str, args: &[String]) -> Result<CommandResult, String> {
+            self.calls += 1;
+            assert_eq!(program, "loginctl");
+            assert_eq!(args.first().map(String::as_str), Some("show-user"));
+            assert_eq!(args.get(2).map(String::as_str), Some("-p"));
+            assert_eq!(args.get(3).map(String::as_str), Some("Linger"));
+            Ok(CommandResult {
+                success: true,
+                stdout: self.output.clone(),
+                stderr: String::new(),
+            })
+        }
+    }
+
+    #[test]
+    fn linger_hint_is_shown_only_when_loginctl_reports_linger_off() {
+        let mut disabled = LingerRunner {
+            output: "Linger=no\n".to_string(),
+            calls: 0,
+        };
+        assert_eq!(
+            linger_hint(RuntimePlatform::Linux, &mut disabled),
+            Some("The daemon stops at logout; run `loginctl enable-linger $USER` to keep it running.")
+        );
+        assert_eq!(disabled.calls, 1);
+
+        let mut enabled = LingerRunner {
+            output: "Linger=yes\n".to_string(),
+            calls: 0,
+        };
+        assert_eq!(linger_hint(RuntimePlatform::Linux, &mut enabled), None);
+        assert_eq!(enabled.calls, 1);
+
+        let mut not_linux = LingerRunner {
+            output: "Linger=no\n".to_string(),
+            calls: 0,
+        };
+        assert_eq!(linger_hint(RuntimePlatform::Macos, &mut not_linux), None);
+        assert_eq!(not_linux.calls, 0);
+    }
+
+    #[test]
+    fn setup_refuses_when_the_system_service_manager_is_unavailable() {
+        let mut runner = RecordingRunner {
+            results: VecDeque::from([false, false]),
+            ..RecordingRunner::default()
+        };
+
+        let error = preflight(RuntimePlatform::Linux, &mut runner).unwrap_err();
+
+        assert!(error.contains("systemd-unavailable"), "{error}");
+        assert!(error.contains("unsupported"), "{error}");
+        assert_eq!(
+            runner.calls,
+            vec![
+                (
+                    "systemctl".to_string(),
+                    vec!["--user".to_string(), "show-environment".to_string()]
+                ),
+                (
+                    "systemctl".to_string(),
+                    vec!["show-environment".to_string()]
+                ),
+            ]
+        );
     }
 
     struct AccessDeniedRunner;

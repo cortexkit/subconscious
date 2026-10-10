@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.20.74
+
+- Refuse Linux setup before downloading or writing when the systemd user manager is unavailable, and explain how to keep the daemon running after logout.
+
 ## 0.20.73
 
 - Fresh installers keep `ck` in `cmd/` and place only that directory on PATH; setup adopts the installed command, and the MCP gateway is dispatched as `ck subc-mcp`.

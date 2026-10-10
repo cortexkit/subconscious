@@ -282,24 +282,20 @@ case "${os}-${arch}" in
 esac
 
 if [[ "$os" == "linux" ]]; then
-  if ! kernel_release=$(uname -r); then
-    kernel_release="unknown"
+  if ! command -v systemctl >/dev/null 2>&1; then
+    refuse "systemd-unavailable" "Linux setup is unsupported because systemd is not available on this host"
   fi
-  if [[ -n "${WSL_DISTRO_NAME:-}" || "$kernel_release" == *[Mm]icrosoft* || "$kernel_release" == *WSL* ]]; then
-    if ! command -v systemctl >/dev/null 2>&1; then
-      refuse "wsl-systemd-user-unavailable" "systemctl is not available for the Linux installation path"
-    fi
-    if ! systemd_evidence=$(mktemp); then
-      refuse "wsl-systemd-user-unavailable" "could not collect systemd-user prerequisite evidence"
-    fi
-    if ! systemctl --user show-environment >"$systemd_evidence" 2>&1; then
-      printf 'refusal: wsl-systemd-user-unavailable: systemctl --user show-environment failed\n' >&2
-      cat "$systemd_evidence" >&2
-      rm -f "$systemd_evidence"
-      exit 1
-    fi
+  if ! systemd_evidence=$(mktemp); then
+    refuse "systemd-user-manager-unavailable" "could not collect systemd user-manager check output"
+  fi
+  if ! systemctl --user show-environment >"$systemd_evidence" 2>&1; then
     rm -f "$systemd_evidence"
+    if systemctl show-environment >/dev/null 2>&1; then
+      refuse "systemd-user-manager-unavailable" "systemd is available, but no user session bus is reachable. Log in normally, or run \`loginctl enable-linger \$USER\` then start a new login session; if it exists, export \`XDG_RUNTIME_DIR=/run/user/\$(id -u)\`."
+    fi
+    refuse "systemd-unavailable" "Linux setup is unsupported because systemd is not available on this host"
   fi
+  rm -f "$systemd_evidence"
 fi
 
 if ! command -v curl >/dev/null 2>&1; then

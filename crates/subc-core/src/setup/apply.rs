@@ -19,7 +19,7 @@ use super::{
         RuntimeState, SetupObserved, SetupOperation, SetupRequest,
     },
     planner::{execute_setup, ExecutionMode, SetupExecutor, SetupPlan},
-    runtime::{self, RuntimePlatform, RuntimeStatus, SystemCommandRunner},
+    runtime::{self, CommandRunner, RuntimePlatform, RuntimeStatus, SystemCommandRunner},
     uninstall,
     upgrade::{binary_version, DaemonCatalogBuild},
     validation::{self, Validator},
@@ -30,7 +30,7 @@ pub struct SetupBackend {
     paths: SetupPaths,
     platform: RuntimePlatform,
     inventory: Inventory,
-    runner: SystemCommandRunner,
+    runner: Box<dyn CommandRunner>,
     artifacts: ReleaseArtifactSource,
     runtime_status: RuntimeStatus,
     uninstall_report: Option<uninstall::UninstallReport>,
@@ -86,7 +86,7 @@ impl SetupBackend {
             },
             platform,
             inventory,
-            runner: SystemCommandRunner,
+            runner: Box::new(SystemCommandRunner),
             artifacts: ReleaseArtifactSource::current(),
             runtime_status: RuntimeStatus::default(),
             uninstall_report: None,
@@ -95,6 +95,16 @@ impl SetupBackend {
     }
 
     pub fn observe(&mut self, request: &SetupRequest) -> Result<SetupObserved, String> {
+        if !request.uninstall {
+            #[cfg(feature = "test-support")]
+            let stub_runtime = env::var_os("CK_TEST_SETUP_CONTROL_OK").is_some();
+            #[cfg(not(feature = "test-support"))]
+            let stub_runtime = false;
+            if !stub_runtime {
+                runtime::preflight(self.platform, &mut self.runner)?;
+            }
+        }
+
         #[cfg(feature = "test-support")]
         if env::var_os("CK_TEST_SETUP_CONTROL_OK").is_some() {
             // `CK_TEST_SETUP_CONTROL_OK` is the test-support control that stubs
@@ -445,6 +455,9 @@ impl SetupBackend {
             }
         }
         println!("Done.");
+        if let Some(hint) = runtime::linger_hint(self.platform, &mut self.runner) {
+            println!("{hint}");
+        }
         if plan.operations.iter().any(|operation| {
             matches!(
                 operation,
@@ -954,6 +967,30 @@ pub(super) fn user_home() -> Result<PathBuf, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cortexkit_test_support::ScratchDir;
+
+    struct UnavailableUserManager;
+
+    impl CommandRunner for UnavailableUserManager {
+        fn run(
+            &mut self,
+            _program: &str,
+            args: &[String],
+        ) -> Result<runtime::CommandResult, String> {
+            if args.first().is_some_and(|arg| arg == "--user") {
+                return Ok(runtime::CommandResult {
+                    success: false,
+                    stdout: String::new(),
+                    stderr: "DBUS_SESSION_BUS_ADDRESS and XDG_RUNTIME_DIR not defined".to_string(),
+                });
+            }
+            Ok(runtime::CommandResult {
+                success: true,
+                stdout: "system manager is running".to_string(),
+                stderr: String::new(),
+            })
+        }
+    }
 
     #[test]
     fn live_daemon_missing_an_otherwise_correct_module_is_configured() {
@@ -968,6 +1005,86 @@ mod tests {
             ComponentState::Correct,
             "a stopped daemon cannot expose its registry"
         );
+    }
+
+    #[test]
+    fn setup_refuses_without_writing_when_the_user_manager_is_unavailable() {
+        let root = ScratchDir::new("setup-user-manager-preflight");
+        let mut backend = backend_without_user_manager(&root);
+
+        let error = backend
+            .observe(&SetupRequest::install(Vec::new()))
+            .unwrap_err();
+
+        assert!(
+            error.contains("systemd-user-manager-unavailable"),
+            "{error}"
+        );
+        assert!(error.contains("loginctl enable-linger $USER"), "{error}");
+        assert!(
+            !root.join("installer-manifest.json").exists(),
+            "setup must not save its inventory"
+        );
+        assert!(
+            !backend.paths.binary_home.exists(),
+            "setup must not create the binary directory"
+        );
+        assert!(
+            !backend.paths.config_path.exists(),
+            "setup must not write configuration"
+        );
+        assert!(
+            !backend.paths.runtime_paths.definition.exists(),
+            "setup must not write a service definition"
+        );
+    }
+
+    #[test]
+    fn setup_uninstall_does_not_refuse_when_the_user_manager_is_unavailable() {
+        let root = ScratchDir::new("setup-uninstall-without-user-manager");
+        let mut backend = backend_without_user_manager(&root);
+        let mut request = SetupRequest::install(Vec::new());
+        request.uninstall = true;
+
+        if let Err(error) = backend.observe(&request) {
+            assert!(
+                !error.contains("systemd-user-manager-unavailable"),
+                "{error}"
+            );
+            assert!(!error.contains("systemd-unavailable"), "{error}");
+        }
+    }
+
+    fn backend_without_user_manager(root: &ScratchDir) -> SetupBackend {
+        let binary_home = root.join("bin");
+        let inventory_path = root.join("installer-manifest.json");
+        let platform = RuntimePlatform::Linux;
+        let inventory = Inventory::load(&inventory_path, "linux-x64").unwrap();
+        SetupBackend {
+            executable: binary_home.join("ck"),
+            paths: SetupPaths {
+                data_dir: root.join("data"),
+                binary_home: binary_home.clone(),
+                config_path: root.join("subc.jsonc"),
+                claustrum_key_path: None,
+                runtime_paths: runtime::runtime_paths(platform, &binary_home, root.path()),
+            },
+            platform,
+            inventory,
+            runner: Box::new(UnavailableUserManager),
+            artifacts: ReleaseArtifactSource::from_index(
+                super::super::release_index::ReleaseIndex {
+                    schema: 1,
+                    channel: "alpha".to_string(),
+                    generated_at_ms: 0,
+                    components: BTreeMap::new(),
+                },
+                super::super::model::AlphaTarget::LinuxX64,
+            ),
+            runtime_status: RuntimeStatus::default(),
+            uninstall_report: None,
+            component_steps: BTreeMap::new(),
+        }
     }
 }
 
@@ -1007,7 +1124,7 @@ mod adoption_tests {
             },
             platform,
             inventory,
-            runner: SystemCommandRunner,
+            runner: Box::new(SystemCommandRunner),
             artifacts: ReleaseArtifactSource::from_index(
                 super::super::release_index::ReleaseIndex {
                     schema: 1,
@@ -1062,7 +1179,7 @@ mod adoption_tests {
             },
             platform,
             inventory,
-            runner: SystemCommandRunner,
+            runner: Box::new(SystemCommandRunner),
             artifacts: ReleaseArtifactSource::from_index(
                 super::super::release_index::ReleaseIndex {
                     schema: 1,
@@ -1249,7 +1366,7 @@ mod adoption_tests {
             },
             platform,
             inventory,
-            runner: SystemCommandRunner,
+            runner: Box::new(SystemCommandRunner),
             artifacts: ReleaseArtifactSource::from_index(
                 super::super::release_index::ReleaseIndex {
                     schema: 1,

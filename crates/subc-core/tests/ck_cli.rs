@@ -2453,7 +2453,7 @@ async fn module_list_json_uses_subc_override_and_shows_stub() {
     let text_output = ck_with_subc(&server.connection_file_path, ["module", "list"]);
     assert_exit(&text_output, 0);
     let text_stdout = text(&text_output.stdout);
-    let expected_list = if cfg!(any(target_os = "linux", target_os = "macos")) {
+    let expected_list = if cfg!(any(target_os = "linux", target_os = "macos", windows)) {
         "module        status   health   reload \nck-list-stub  running  unknown  nothing\n"
     } else {
         "module        status   health   reload             \nck-list-stub  running  unknown  nothing (image n/a)\n"
@@ -2490,7 +2490,7 @@ async fn module_list_renders_status_words_not_wire_booleans() {
 
     let output = ck_with_subc(&server.connection_file_path, ["module", "list"]);
     assert_exit(&output, 0);
-    let expected_list = if cfg!(any(target_os = "linux", target_os = "macos")) {
+    let expected_list = if cfg!(any(target_os = "linux", target_os = "macos", windows)) {
         "module  status   health    reload \ninsula  running  degraded  nothing\n"
     } else {
         "module  status   health    reload             \ninsula  running  degraded  nothing (image n/a)\n"
@@ -2530,7 +2530,12 @@ async fn module_list_keeps_configured_path_mismatch_pending_on_every_platform() 
         entry["pending_reload"]["path"]["configured"],
         json!(replacement)
     );
-    if !cfg!(any(target_os = "linux", target_os = "macos")) {
+    if cfg!(windows) {
+        // Configuration points elsewhere, but the retained child still runs
+        // the unchanged file at its original spawn path. Image agreement must
+        // not erase the independent configured-path mismatch above.
+        assert_eq!(entry["pending_reload"]["image"]["status"], "match");
+    } else if !cfg!(any(target_os = "linux", target_os = "macos")) {
         assert_eq!(entry["pending_reload"]["image"]["status"], "unavailable");
         assert_eq!(
             entry["pending_reload"]["image"]["reason"],
@@ -2718,7 +2723,7 @@ async fn module_status_renders_key_value_block_byte_for_byte() {
         "start age renders as an age: {rendered_age:?} vs {started:?}"
     );
     assert_eq!(before, format!("aft — running, degraded\n  pid {pid}"));
-    let image_verdict = if cfg!(any(target_os = "linux", target_os = "macos")) {
+    let image_verdict = if cfg!(any(target_os = "linux", target_os = "macos", windows)) {
         "matches file at spawned path"
     } else {
         "not checked on this platform (unsupported_platform)"
@@ -2732,7 +2737,16 @@ async fn module_status_renders_key_value_block_byte_for_byte() {
     let (resources, rest) = rest
         .split_once('\n')
         .expect("resources line is followed by more status");
-    if cfg!(any(target_os = "linux", target_os = "macos")) {
+    if cfg!(windows) {
+        let (memory, cpu) = resources
+            .split_once(" windows working set · cpu ")
+            .expect("a Windows resources line names the working-set measurement");
+        assert!(memory.starts_with("memory "), "{resources:?}");
+        assert!(
+            cpu.contains(" (user ") && cpu.contains(", kernel ") && cpu.ends_with(')'),
+            "{resources:?}"
+        );
+    } else if cfg!(any(target_os = "linux", target_os = "macos")) {
         assert!(
             resources.starts_with("memory ") && resources.contains(" · cpu "),
             "a running module renders its memory and cpu: {resources:?}"

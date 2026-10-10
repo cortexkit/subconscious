@@ -176,7 +176,9 @@ fn reload_verdict(
     image: subc_control::RunningImageAgreement,
 ) -> PendingReloadVerdict {
     let path = match spawned_from {
-        Some(spawned_from) if configured == spawned_from => ReloadPathAgreement::Match,
+        Some(spawned_from) if reload_paths_match(configured, spawned_from) => {
+            ReloadPathAgreement::Match
+        }
         Some(spawned_from) => ReloadPathAgreement::Mismatch {
             configured: configured.to_path_buf(),
             spawned_from: spawned_from.to_path_buf(),
@@ -195,6 +197,31 @@ fn reload_verdict(
         },
     };
     PendingReloadVerdict { path, image }
+}
+
+fn reload_paths_match(configured: &Path, spawned_from: &Path) -> bool {
+    if configured == spawned_from {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        // Windows spawn records the resolved verbatim path (\\?\...), while
+        // configuration keeps its original spelling. Resolve both with the OS
+        // instead of stripping prefixes or folding case, which could conflate
+        // distinct names in case-sensitive directories. Different resolved
+        // paths still differ even if their files have identical content.
+        match (
+            std::fs::canonicalize(configured),
+            std::fs::canonicalize(spawned_from),
+        ) {
+            (Ok(configured), Ok(spawned_from)) => configured == spawned_from,
+            _ => false,
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
 }
 
 #[derive(Clone)]
@@ -11629,6 +11656,63 @@ mod tests {
             subc_control::ReloadPathAgreement::Mismatch { configured, spawned_from }
                 if configured == std::path::Path::new("/bin/new")
                     && spawned_from == std::path::Path::new("/bin/old")
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_reload_path_matches_configured_and_verbatim_spawn_spellings() {
+        let dir = cortexkit_test_support::ScratchDir::new("windows-reload-path-spelling");
+        let configured = dir.join("module.exe");
+        std::fs::write(&configured, b"executable path fixture").unwrap();
+        let spawned = std::fs::canonicalize(&configured).unwrap();
+        assert_ne!(
+            configured, spawned,
+            "fixture must exercise different path spellings"
+        );
+        let forward_slashes = configured.to_string_lossy().replace('\\', "/");
+        let lower_case = configured.to_string_lossy().to_lowercase();
+        for spelling in [
+            &configured,
+            Path::new(&forward_slashes),
+            Path::new(&lower_case),
+        ] {
+            let verdict = reload_verdict(
+                spelling,
+                Some(&spawned),
+                subc_control::RunningImageAgreement::Unavailable {
+                    reason: subc_control::RunningImageUnavailableReason::ProcessIdentityUnconfirmed,
+                },
+            );
+            assert_eq!(
+                verdict.path,
+                ReloadPathAgreement::Match,
+                "configured {spelling:?}, spawned {spawned:?}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_reload_path_keeps_different_existing_program_pending() {
+        let dir = cortexkit_test_support::ScratchDir::new("windows-reload-path-change");
+        let old = dir.join("old.exe");
+        let new = dir.join("new.exe");
+        std::fs::write(&old, b"same executable content").unwrap();
+        std::fs::copy(&old, &new).unwrap();
+        let spawned = std::fs::canonicalize(&old).unwrap();
+        let image = subc_control::RunningImageAgreement::Unavailable {
+            reason: subc_control::RunningImageUnavailableReason::ProcessIdentityUnconfirmed,
+        };
+        let verdict = reload_verdict(&new, Some(&spawned), image.clone());
+        assert!(
+            matches!(verdict.path, ReloadPathAgreement::Mismatch { configured, spawned_from }
+            if configured == new && spawned_from == spawned)
+        );
+        let missing = dir.join("missing.exe");
+        assert!(matches!(
+            reload_verdict(&missing, Some(&spawned), image).path,
+            ReloadPathAgreement::Mismatch { .. }
         ));
     }
 

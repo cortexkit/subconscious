@@ -4,7 +4,7 @@ use cortexkit_test_support::{dev_command, process_alive, wait_until_gone, Scratc
 use std::{
     fs,
     os::unix::process::CommandExt,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Child, Stdio},
     sync::{Mutex, MutexGuard},
     thread,
@@ -297,6 +297,105 @@ fn unix_ms_now() -> u64 {
         .as_millis() as u64
 }
 
+fn child_is_recorded(path: &Path, pid: u32, observed: &subc_os::Observation) -> bool {
+    let Some(executable) = observed.executable else {
+        return false;
+    };
+    let Some(record) = fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+    else {
+        return false;
+    };
+    record["version"] == 1
+        && record["children"].as_array().is_some_and(|children| {
+            children.iter().any(|child| {
+                child["module_id"] == "wire-less"
+                    && child["protocol"] == "none"
+                    && child["pid"] == pid
+                    && child["start_time"] == observed.start_time
+                    && child["executable"]["device"] == executable.device
+                    && child["executable"]["inode"] == executable.inode
+            })
+        })
+}
+
+fn wait_for_recorded_child(path: &Path, pid: u32) {
+    let process = subc_os::Process::open(pid)
+        .unwrap()
+        .expect("the child must still exist before its daemon is killed");
+    let observed = process.observe().expect("the child must still be running");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !child_is_recorded(path, pid, &observed) {
+        assert!(
+            Instant::now() < deadline,
+            "the daemon never persisted the child's matching identity: {:?}",
+            fs::read_to_string(path)
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn ready_child_requires_its_matching_identity_in_the_persisted_record() {
+    let root = fresh_dir("recorded-child");
+    let record = root.join("live-children.json");
+    let pending = root.join("pending.json");
+    let observed = subc_os::Observation {
+        start_time: 23,
+        executable: Some(subc_os::FileIdentity {
+            device: 29,
+            inode: 31,
+        }),
+    };
+    let child = json!({
+        "module_id": "wire-less", "protocol": "none", "pid": 17,
+        "start_time": 23, "executable": { "device": 29, "inode": 31 },
+        "cgroup_name": null
+    });
+    let write = |path: &Path, child: Value| {
+        fs::write(
+            path,
+            serde_json::to_vec(&json!({
+                "version": 1, "children": [child]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    };
+
+    // The child publishes readiness independently of the daemon's record write.
+    // Even a complete pending record cannot authorize killing the daemon until
+    // rename makes that record visible at the path the next boot will read.
+    fs::write(root.join("wire-less.ready"), "ready\n").unwrap();
+    assert!(!child_is_recorded(&record, 17, &observed));
+    let mut previous = child.clone();
+    previous["module_id"] = json!("shutdown-observer");
+    previous["pid"] = json!(19);
+    write(&record, previous);
+    write(&pending, child.clone());
+    assert!(!child_is_recorded(&record, 17, &observed));
+    fs::rename(&pending, &record).unwrap();
+    assert!(child_is_recorded(&record, 17, &observed));
+
+    for (field, wrong) in [
+        ("pid", json!(19)),
+        ("start_time", json!(24)),
+        ("start_time", Value::Null),
+        ("executable", Value::Null),
+        ("executable", json!({ "device": 30, "inode": 31 })),
+        ("executable", json!({ "device": 29, "inode": 32 })),
+    ] {
+        let mut mismatched = child.clone();
+        mismatched[field] = wrong;
+        write(&record, mismatched);
+        assert!(
+            !child_is_recorded(&record, 17, &observed),
+            "a mismatched or missing {field} cannot identify the orphan"
+        );
+    }
+}
+
 /// Simulated EOF teardown in the observer stub. Long enough that a group kill
 /// arriving with the EOF lands mid-teardown; short enough to fit the daemon's
 /// child-exit grace.
@@ -500,6 +599,13 @@ fn orphan_of_a_killed_daemon_is_ended_by_the_next_daemon_before_it_respawns() {
         Some(json!({ "env": { "FAKE_AFT_SIGTERM_MARKER_PATH": marker_path } })),
     );
     let orphan = fixture.pid_of("wire-less.pid");
+    // The stub's ready marker only promises an installed SIGTERM handler.
+    // It can precede roster admission and the record's atomic rename, so wait
+    // for the identity the next boot must read before killing its writer.
+    wait_for_recorded_child(
+        &fixture.root.join("data/cortexkit/run/live-children.json"),
+        orphan as u32,
+    );
     fixture.kill_daemon_group();
     fixture.child.wait().unwrap();
     assert!(

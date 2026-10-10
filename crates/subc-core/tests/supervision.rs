@@ -147,7 +147,7 @@ async fn assert_disable_cancels_backoff(kind: &str) {
         ));
     } else if kind == "spawn-retry" {
         let copy = server.temp_dir.join("copied-stub");
-        std::fs::copy(&spec.program, &copy).unwrap();
+        copy_executable(&spec.program, &copy);
         spec.program = copy;
     }
     let module = Arc::new(supervisor.spawn(spec.clone()).unwrap());
@@ -2050,4 +2050,32 @@ async fn closed_spawn_subscriber_is_removed_before_the_next_emit() {
     let module = harness.spawn("spawn-after-subscriber-close").await;
     assert_eq!(module.status().unwrap().spawn_generation, 1);
     module.stop().await.unwrap();
+}
+
+/// Copy an executable this test is about to run.
+///
+/// On Linux, a copy written by this process can fail to start with "Text file
+/// busy": while this test holds the new file open for writing, another test
+/// thread may fork, and the child keeps that writable descriptor until it
+/// execs. Writing the copy in a separate `cp` process means no descriptor of
+/// this process ever has it open for writing.
+fn copy_executable(from: &std::path::Path, to: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        let status = std::process::Command::new("cp")
+            .arg(from)
+            .arg(to)
+            .status()
+            .expect("run cp");
+        assert!(
+            status.success(),
+            "cp {} {} failed: {status}",
+            from.display(),
+            to.display()
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::copy(from, to).unwrap();
+    }
 }

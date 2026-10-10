@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.29.0
+
+- **Breaking.** `CatalogEntry` and `SupervisorEntry` are `#[non_exhaustive]`; build them with `new` and the `with_*` setters, so later fields are not breaking. Requires `subc-protocol` 0.30. Wire bytes are unchanged.
+
 ## 0.28.0
 
 - Takes subc-protocol 0.29.0: `ToolCallRequest.preset` and `ScopeAttributes.flow_id` are optional wire fields, but this release is breaking for Rust struct literals. Update protocol and control dependencies together to avoid incompatible public protocol types.

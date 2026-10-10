@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.27.0
+
+- Add `ModuleHandle::scope_apply(generation, upsert, end)`, returning `ScopeApplyReply`. It returns `ScopeCallError::NotSupported` without sending anything when the daemon does not advertise `scope.apply`; a daemon that does also accepts `expires_at_ms`.
+- **Breaking.** Requires `subc-protocol` 0.30 and `subc-control` 0.29 (it re-exports `CatalogEntry`).
+
 ## 0.26.4
 
 - Test-only: the tests' helpers (temporary directories, process-liveness checks, and copies of test programs under `ckdev-` names) now come from the published `cortexkit-test-support` crate, which other CortexKit repositories also use, instead of a private copy in this repository. No runtime change.

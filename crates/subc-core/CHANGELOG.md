@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.20.70
+
+- Built on `subc-daemon` 0.33: the daemon enforces scope deadlines, serves `scope.apply`, and gates agent-run scopes on `agent-run-scopes/v1`. No CLI change.
+
 ## 0.20.69
 
 - Test-only: the tests' helpers (temporary directories, process-liveness checks, and copies of test programs under `ckdev-` names) now come from the published `cortexkit-test-support` crate, which other CortexKit repositories also use, instead of a private copy in this repository. No runtime change.

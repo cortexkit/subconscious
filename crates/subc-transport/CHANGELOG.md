@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.11.0
+
+- **Breaking.** Requires `subc-protocol` 0.30. `read_frame`, `write_frame` and `FrameIoError::DecodeHeader` expose `subc-protocol` types, so their types change with it. No behaviour change.
+
 ## 0.10.1
 
 - Test-only: the tests' helpers (temporary directories, process-liveness checks, and copies of test programs under `ckdev-` names) now come from the published `cortexkit-test-support` crate, which other CortexKit repositories also use, instead of a private copy in this repository. No runtime change.

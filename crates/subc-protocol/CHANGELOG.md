@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.30.0
+
+- **Breaking.** `ScopeRecord` gains `expires_at_ms: Option<u64>`, an absolute Unix wall-clock deadline in milliseconds that the daemon enforces itself: at the deadline the scope ends as if its owner had removed it, routes under it close with `scope_ended`, and that ref at that epoch can never return (`scope_expired`). The deadline is fixed for the epoch (`scope_expiry_immutable`) and at most `MAX_SCOPE_EXPIRY_AHEAD_MS` (24 hours) ahead (`scope_expiry_too_far`).
+- **Breaking.** `ScopeAttributes` gains `run_id`, marking a scope as one agent run. It requires `agent_id` and refuses `flow_id` and `delegates` (`scope_run_id_without_agent`, `scope_run_id_with_flow_id`, `scope_run_id_delegates`). A route under such a scope binds only to a target that declares `AGENT_RUN_SCOPES_CAPABILITY` (`agent-run-scopes/v1`); otherwise route.open is refused with the terminal `target_agent_run_unsupported`.
+- **Breaking.** New `scope.apply` module control operation (`ScopeApply` request and response variants, `ScopeEnd`, `ScopeEndOutcome`, `ScopeEndResult`): add or end individual scopes without resending the owner's whole set. It shares `scope.sync`'s generation, and needs one accepted full `scope.sync` per daemon incarnation first (`scope_sync_required`).
+- `ScopeRecord`, `ScopeAttributes`, `ScopeCarrier`, `ScopeParent`, `ScopeEnd` and `ScopeEndResult` are `#[non_exhaustive]`; build them with `new` and the `with_*` setters, so later fields are not breaking. Wire bytes of existing records are unchanged.
+
 ## 0.29.4
 
 - Add standalone, `#[non_exhaustive]` `session::OperatorConfirmRequest` and `session::OperatorConfirmReply` bodies for the module-to-daemon `operator.confirm` control operation, with constructors. The request carries the summary and the caller's route channel/epoch on the module connection; the successful reply carries `outcome: "confirmed"`. Refusals use the new `operator_declined`, `operator_presence_unavailable`, `operator_summary_invalid` and `operator_request_not_permitted` error codes. All four are terminal in the route-open retry predicate but are not route-open refusals, so the route-open decision table is unchanged. Additive: neither existing module-control enum changes, and no consumer code change is needed.

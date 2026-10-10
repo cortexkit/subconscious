@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.33.0
+
+- Enforce scope deadlines (`expires_at_ms`) on wall-clock time: an expired scope ends with every route under it closed as `scope_ended`, and is refused if resent. A route.open under a scope past its deadline is refused `scope_not_live` even before the next sweep. The expiry check runs only while some live scope has a deadline, so a daemon without deadlines never wakes for it.
+- Serve `scope.apply` (advertised in `subc_ops`) and the `run_id` rules, with the `agent-run-scopes/v1` admission gate checked at admission and again on the captured relay connection.
+- **Breaking.** Requires `subc-protocol` 0.30, `subc-control` 0.29 and `subc-transport` 0.11, whose types appear in this crate's public API.
+
 ## 0.32.16
 
 - Test-only: the tests' helpers (temporary directories, process-liveness checks, and copies of test programs under `ckdev-` names) now come from the published `cortexkit-test-support` crate, which other CortexKit repositories also use, instead of a private copy in this repository. No runtime change.

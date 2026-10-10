@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.30
+
+- Moves to `subc-protocol` 0.30, `subc-control` 0.29 and `subc-daemon` 0.33. No behaviour change.
+
 ## 0.1.29
 
 - Test-only: configure the `ck-subc` daemon executable to give each supervised test module a separate macOS privacy identity.

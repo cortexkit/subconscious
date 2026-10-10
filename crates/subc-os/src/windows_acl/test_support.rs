@@ -82,6 +82,18 @@ fn enable_restore_privilege() -> io::Result<()> {
 /// Assert native owner, protection and exactly one current-user full-control
 /// ACE. This reads Windows directly, not the production validator or ACL builder.
 pub fn assert_owner_only(path: &Path, directory: bool, protected: bool) {
+    assert_dacl(path, directory, protected, true);
+}
+
+/// Like [`assert_owner_only`], but checks only the DACL. Narrowing an existing
+/// folder changes the access list of the files already in it, never their
+/// owner, and a file created by an elevated process is owned by Administrators,
+/// so pre-existing descendants can't be held to the current-user owner check.
+pub fn assert_dacl_owner_only(path: &Path, directory: bool, protected: bool) {
+    assert_dacl(path, directory, protected, false);
+}
+
+fn assert_dacl(path: &Path, directory: bool, protected: bool, check_owner: bool) {
     let name = wide(path).unwrap();
     let mut security = Security {
         descriptor: null_mut(),
@@ -106,13 +118,15 @@ pub fn assert_owner_only(path: &Path, directory: bool, protected: bool) {
         0
     );
     let user = User::current().unwrap();
-    assert!(!security.owner.is_null());
-    // SAFETY: Both SIDs belong to live Win32 buffers.
-    assert_ne!(
-        unsafe { EqualSid(security.owner, user.sid()) },
-        0,
-        "current-user owner"
-    );
+    if check_owner {
+        assert!(!security.owner.is_null());
+        // SAFETY: Both SIDs belong to live Win32 buffers.
+        assert_ne!(
+            unsafe { EqualSid(security.owner, user.sid()) },
+            0,
+            "current-user owner"
+        );
+    }
     let mut control = 0;
     let mut revision = 0;
     // SAFETY: descriptor is live and control/revision are writable outputs.

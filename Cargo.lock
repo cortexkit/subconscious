@@ -264,7 +264,7 @@ dependencies = [
 
 [[package]]
 name = "ck-bus"
-version = "0.3.9"
+version = "0.3.10"
 dependencies = [
  "async-nats",
  "async-trait",
@@ -1100,7 +1100,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-stdio-adapter"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "cortexkit-log",
  "cortexkit-test-support",
@@ -1873,7 +1873,7 @@ dependencies = [
 
 [[package]]
 name = "subc-client-rs"
-version = "0.26.4"
+version = "0.27.0"
 dependencies = [
  "async-trait",
  "cortexkit-test-support",
@@ -1892,7 +1892,7 @@ dependencies = [
 
 [[package]]
 name = "subc-control"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -1901,7 +1901,7 @@ dependencies = [
 
 [[package]]
 name = "subc-core"
-version = "0.20.69"
+version = "0.20.70"
 dependencies = [
  "base64",
  "cortexkit-log",
@@ -1929,7 +1929,7 @@ dependencies = [
 
 [[package]]
 name = "subc-daemon"
-version = "0.32.16"
+version = "0.33.0"
 dependencies = [
  "cortexkit-log",
  "cortexkit-paths",
@@ -1987,7 +1987,7 @@ dependencies = [
 
 [[package]]
 name = "subc-mcp"
-version = "0.1.29"
+version = "0.1.30"
 dependencies = [
  "cortexkit-log",
  "cortexkit-test-support",
@@ -2040,7 +2040,7 @@ dependencies = [
 
 [[package]]
 name = "subc-protocol"
-version = "0.29.4"
+version = "0.30.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2048,7 +2048,7 @@ dependencies = [
 
 [[package]]
 name = "subc-transport"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "cortexkit-test-support",
  "getrandom 0.2.17",

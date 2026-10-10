@@ -737,6 +737,11 @@ pub enum RunningImageEvidence {
         device: u64,
         inode: u64,
     },
+    /// The spawn-time Windows file object, not verified executable content.
+    WindowsSpawnFileId {
+        volume_serial_number: u64,
+        file_id: [u8; 16],
+    },
     /// Future discriminator. `body` retains the complete ordered object; `tag`
     /// is its decoded discriminator projection.
     Unknown {
@@ -866,8 +871,17 @@ enum ReloadPathAgreementWire {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "method", rename_all = "snake_case")]
 enum RunningImageEvidenceWire {
-    LinuxProcSha256 { digest: String },
-    MacosSpawnInode { device: u64, inode: u64 },
+    LinuxProcSha256 {
+        digest: String,
+    },
+    MacosSpawnInode {
+        device: u64,
+        inode: u64,
+    },
+    WindowsSpawnFileId {
+        volume_serial_number: u64,
+        file_id: [u8; 16],
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1214,6 +1228,22 @@ fn decode_running_image_evidence(value: OrderedJsonValue) -> Result<RunningImage
                 .ok_or_else(|| "tagged object has no unsigned `inode` field".to_string())?;
             Ok(RunningImageEvidence::MacosSpawnInode { device, inode })
         }
+        "windows_spawn_file_id" => {
+            let wire: RunningImageEvidenceWire = serde_json::from_value(
+                serde_json::to_value(&body).map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string())?;
+            match wire {
+                RunningImageEvidenceWire::WindowsSpawnFileId {
+                    volume_serial_number,
+                    file_id,
+                } => Ok(RunningImageEvidence::WindowsSpawnFileId {
+                    volume_serial_number,
+                    file_id,
+                }),
+                _ => unreachable!(),
+            }
+        }
         _ => Ok(RunningImageEvidence::Unknown { tag, body }),
     }
 }
@@ -1433,6 +1463,14 @@ impl Serialize for RunningImageEvidence {
                 inode: *inode,
             }
             .serialize(serializer),
+            Self::WindowsSpawnFileId {
+                volume_serial_number,
+                file_id,
+            } => RunningImageEvidenceWire::WindowsSpawnFileId {
+                volume_serial_number: *volume_serial_number,
+                file_id: *file_id,
+            }
+            .serialize(serializer),
             Self::Unknown { body, .. } => body.serialize(serializer),
         }
     }
@@ -1458,6 +1496,18 @@ impl<'de> Deserialize<'de> for RunningImageEvidence {
                     RunningImageEvidenceWire::MacosSpawnInode { device, inode } => {
                         Ok(Self::MacosSpawnInode { device, inode })
                     }
+                    _ => unreachable!(),
+                }
+            }
+            "windows_spawn_file_id" => {
+                match serde_json::from_value(value.into_value()).map_err(D::Error::custom)? {
+                    RunningImageEvidenceWire::WindowsSpawnFileId {
+                        volume_serial_number,
+                        file_id,
+                    } => Ok(Self::WindowsSpawnFileId {
+                        volume_serial_number,
+                        file_id,
+                    }),
                     _ => unreachable!(),
                 }
             }
@@ -2339,6 +2389,9 @@ open_string_enum! {
         /// Linux `VmRSS`: pages resident in RAM, shared file-backed pages
         /// included and swapped-out pages excluded.
         ResidentSet => "resident_set",
+        /// Windows `WorkingSetSize`: resident pageable memory, including shared
+        /// pages, not Unix RSS or private committed bytes.
+        WindowsWorkingSet => "windows_working_set",
     }
 }
 
@@ -2421,6 +2474,41 @@ pub struct SupervisorHealthEntry {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn windows_running_image_evidence_round_trips_all_sixteen_id_bytes() {
+        let evidence = super::RunningImageEvidence::WindowsSpawnFileId {
+            volume_serial_number: u64::MAX,
+            file_id: [
+                0, 1, 2, 3, 4, 5, 6, 7, 128, 129, 130, 131, 252, 253, 254, 255,
+            ],
+        };
+        let agreement = super::RunningImageAgreement::Match { evidence };
+        let encoded = serde_json::to_string(&agreement).unwrap();
+        assert!(encoded.contains("windows_spawn_file_id"));
+        assert_eq!(
+            serde_json::from_str::<super::RunningImageAgreement>(&encoded).unwrap(),
+            agreement
+        );
+    }
+
+    #[test]
+    fn unix_running_image_evidence_keeps_original_wire_bytes() {
+        assert_eq!(
+            serde_json::to_string(&super::RunningImageEvidence::MacosSpawnInode {
+                device: 7,
+                inode: 11
+            })
+            .unwrap(),
+            "{\"method\":\"macos_spawn_inode\",\"device\":7,\"inode\":11}"
+        );
+        assert_eq!(
+            serde_json::to_string(&super::RunningImageEvidence::LinuxProcSha256 {
+                digest: "abc".to_owned()
+            })
+            .unwrap(),
+            "{\"method\":\"linux_proc_sha256\",\"digest\":\"abc\"}"
+        );
+    }
     use super::*;
     use subc_protocol::{BindIdentity, RouteTarget};
 

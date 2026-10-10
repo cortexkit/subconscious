@@ -39,7 +39,7 @@ use crate::{
         CloseReason, ForwardingError, ForwardingTable, GoodbyeTarget, ModuleControlRpcOutcome,
         ModuleDrainTarget, PendingModuleControlRpc,
     },
-    provenance::{spawned_file_identity, ExecutableIdentityProbe, SpawnedFileIdentity},
+    provenance::{ExecutableIdentityProbe, SpawnedFileIdentity},
     registry::{ConnectionId, RegistrationEndReason, RegistryError},
     stderr_tail::{
         pump_stderr_to, pump_stdout_to, ChildOutputSink, StderrRing, StderrTailConfig,
@@ -48,6 +48,9 @@ use crate::{
     terminal_ring::{TerminalHistorySnapshot, TerminalRecord, TerminalRing, TerminalRingConfig},
     Frame, FrameSink, Registry,
 };
+
+#[cfg(not(windows))]
+use crate::provenance::spawned_file_identity;
 
 #[path = "supervise_swap.rs"]
 mod swap;
@@ -3377,7 +3380,7 @@ impl SupervisedModule {
                 last_exit: snapshot.last_exit,
                 health: snapshot.health,
             },
-            snapshot.spawned_file_identity,
+            snapshot.spawned_file_identity.clone(),
         ))
     }
 
@@ -3433,7 +3436,7 @@ impl SupervisedModule {
             .observe(
                 snapshot.reported_pid(),
                 snapshot.spawned_from.as_deref(),
-                snapshot.spawned_file_identity,
+                snapshot.spawned_file_identity.clone(),
                 snapshot.process_start_time,
             )
             .await
@@ -3442,15 +3445,37 @@ impl SupervisedModule {
     /// Memory and CPU time of the module's current process, read now. Only the
     /// process the supervisor spawned is read, not processes it has started.
     pub(crate) fn child_resource_usage(&self) -> subc_control::ChildResourceUsage {
-        let (pid, start_time) = match lock_snapshot(&self.inner.snapshot) {
-            Ok(snapshot) => (snapshot.reported_pid(), snapshot.process_start_time),
-            Err(_) => {
-                return subc_control::ChildResourceUsage::Unavailable {
-                    reason: subc_control::ChildResourceUnavailableReason::Unreadable,
+        #[cfg(windows)]
+        {
+            let image = lock_snapshot(&self.inner.snapshot)
+                .ok()
+                .and_then(|snapshot| {
+                    snapshot
+                        .spawned_file_identity
+                        .as_ref()
+                        .and_then(|identity| identity.windows_image.clone())
+                });
+            match image {
+                Some(image) => {
+                    crate::child_resources::read_windows_handle(image.process(), image.start_time())
                 }
+                None => subc_control::ChildResourceUsage::Unavailable {
+                    reason: subc_control::ChildResourceUnavailableReason::NotRunning,
+                },
             }
-        };
-        crate::child_resources::read(pid, start_time)
+        }
+        #[cfg(not(windows))]
+        {
+            let (pid, start_time) = match lock_snapshot(&self.inner.snapshot) {
+                Ok(snapshot) => (snapshot.reported_pid(), snapshot.process_start_time),
+                Err(_) => {
+                    return subc_control::ChildResourceUsage::Unavailable {
+                        reason: subc_control::ChildResourceUnavailableReason::Unreadable,
+                    }
+                }
+            };
+            crate::child_resources::read(pid, start_time)
+        }
     }
 
     pub(crate) fn will_recover_after_connection_loss(&self) -> Result<bool, SuperviseError> {
@@ -5340,6 +5365,8 @@ mod tests {
             snapshot.spawned_file_identity = Some(SpawnedFileIdentity {
                 device: 43,
                 inode: 44,
+                #[cfg(windows)]
+                windows_image: None,
             });
         })
         .unwrap();
@@ -6942,6 +6969,8 @@ async fn set_child_enabled(
                 state.spawned_file_identity = Some(SpawnedFileIdentity {
                     device: 43,
                     inode: 44,
+                    #[cfg(windows)]
+                    windows_image: None,
                 });
             })?;
         }
@@ -7617,7 +7646,15 @@ fn spawn_child_in_slot(
     let _ = alternate_slot;
     #[cfg(target_os = "macos")]
     let (mut command, privacy_exec, exec_ack) = privacy_command(spec, roster)?;
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
+    let image_capture = windows_spawn_capture(spec).map_err(|source| SuperviseError::Spawn {
+        program: spec.program.clone(),
+        source,
+        cgroup_path: None,
+    })?;
+    #[cfg(windows)]
+    let mut command = Command::new(image_capture.path());
+    #[cfg(not(any(target_os = "macos", windows)))]
     let mut command = Command::new(&spec.program);
     command.args(&spec.args);
     // AMBIENT `CK_LOG` MUST NOT LEAK INTO AN OTHERWISE UNCONFIGURED MODULE — but
@@ -7751,18 +7788,46 @@ fn spawn_child_in_slot(
     #[cfg(target_os = "macos")]
     drop(exec_ack);
 
+    // Bind while the child is still suspended, before job assignment resumes it.
+    // Keeping the executable handle open across CreateProcessW denies rename
+    // and deletion, so the file cannot be exchanged during spawn. Bind that
+    // file ID to the process handle returned by spawn, never a reopened PID.
+    #[cfg(windows)]
+    let windows_image =
+        Arc::new(
+            image_capture
+                .bind_tokio(&child)
+                .map_err(|source| SuperviseError::Spawn {
+                    program: spec.program.clone(),
+                    source,
+                    cgroup_path: None,
+                })?,
+        );
     // Containment, steps 2 and 3: assign while suspended, then resume.
     #[cfg(windows)]
     let job = contain_spawned_child(&child, spec)?;
     let spawned_at_ms = unix_ms_now();
+    #[cfg(not(windows))]
     let spawned_from = spec.program.clone();
+    #[cfg(windows)]
+    let spawned_from = windows_image.path().to_path_buf();
+    #[cfg(not(windows))]
     let spawned_file_identity = spawned_file_identity(&spawned_from);
+    #[cfg(windows)]
+    let spawned_file_identity = Some(SpawnedFileIdentity {
+        device: 0,
+        inode: 0,
+        windows_image: Some(Arc::clone(&windows_image)),
+    });
     let pid = child.id().ok_or_else(|| SuperviseError::Spawn {
         program: spec.program.clone(),
         source: io::Error::other("spawned child exposed no live pid"),
         cgroup_path: cgroup_path.clone(),
     })?;
+    #[cfg(not(windows))]
     let process_start_time = crate::provenance::process_start_time(pid);
+    #[cfg(windows)]
+    let process_start_time = Some(windows_image.start_time());
     let process_identity = process_start_time.map(|start_time| ProcessIdentity { pid, start_time });
     #[cfg(all(test, target_os = "macos"))]
     privacy_exec_boundary_tests::before_image_sample(spec, pid);
@@ -7771,6 +7836,7 @@ fn spawn_child_in_slot(
     // lookup and shebang interpretation may select a different file from the
     // configured program. Keep the literal program's identity for provenance,
     // but never use it as proof that a recorded pid may be signalled.
+    #[cfg(not(windows))]
     let recorded_image = observe_spawned_image(pid);
     // spawn() confirms only the first exec, into the trampoline. Never persist
     // the trampoline image; the asynchronous acknowledgement publishes the
@@ -7791,10 +7857,18 @@ fn spawn_child_in_slot(
         spec.protocol,
         process_start_time,
         crate::child_roster::RecordedIdentity {
+            #[cfg(not(windows))]
             start_time: recorded_image.map(|image| image.start_time),
+            #[cfg(windows)]
+            start_time: process_start_time,
+            #[cfg(not(windows))]
             executable: recorded_image
                 .and_then(|image| image.executable)
                 .map(crate::live_children::ExecutableIdentity::from),
+            #[cfg(windows)]
+            executable: Some(crate::live_children::ExecutableIdentity::from(
+                windows_image.identity(),
+            )),
             cgroup_name: recorded_cgroup_name,
             #[cfg(target_os = "linux")]
             cgroup_placement: cgroup_placement.cloned(),
@@ -8115,11 +8189,59 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 /// The kernel's image after an acknowledged exec, shared by ordinary launches
 /// and privacy trampolines. PATH and shebang interpretation are kernel facts,
 /// not identities inferred from a configured pathname.
+#[cfg(not(windows))]
 fn observe_spawned_image(pid: u32) -> Option<subc_os::Observation> {
     subc_os::Process::open(pid)
         .ok()
         .flatten()
         .and_then(|process| process.observe())
+}
+
+/// Resolve once and spawn that exact path, so PATH lookup cannot choose a
+/// different executable after the no-delete capture was taken.
+#[cfg(windows)]
+fn windows_spawn_capture(spec: &ModuleSpec) -> io::Result<subc_os::ExecutableCapture> {
+    let mut program = spec.program.clone();
+    if program.extension().is_none() {
+        program.set_extension("exe");
+    }
+    if program.is_absolute() || program.components().count() > 1 {
+        return subc_os::ExecutableCapture::open(&program);
+    }
+    let custom_path = spec
+        .env
+        .iter()
+        .rev()
+        .find(|(key, _)| key.eq_ignore_ascii_case("PATH"));
+    let mut directories = Vec::new();
+    // These are Windows' default executable search locations. A configured
+    // PATH still overrides the inherited PATH, not the system directories.
+    if let Some(parent) = std::env::current_exe()?.parent() {
+        directories.push(parent.to_path_buf());
+    }
+    directories.push(std::env::current_dir()?);
+    if let Some(windows) = std::env::var_os("SystemRoot") {
+        let windows = PathBuf::from(windows);
+        directories.push(windows.join("System32"));
+        directories.push(windows.clone());
+    }
+    let path = custom_path
+        .map(|(_, value)| std::ffi::OsString::from(value))
+        .or_else(|| std::env::var_os("PATH"));
+    if let Some(path) = path {
+        directories.extend(std::env::split_paths(&path));
+    }
+    for directory in directories {
+        match subc_os::ExecutableCapture::open(&directory.join(&program)) {
+            Ok(capture) => return Ok(capture),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        "resolved executable not found",
+    ))
 }
 
 fn spawn_and_mark_running(
@@ -9624,7 +9746,7 @@ fn set_running(
     }
     state.spawned_at_ms = Some(child.spawned_at_ms);
     state.spawned_from = Some(child.spawned_from.clone());
-    state.spawned_file_identity = child.spawned_file_identity;
+    state.spawned_file_identity = child.spawned_file_identity.clone();
     state.process_start_time = child.process_start_time;
     Ok(())
 }

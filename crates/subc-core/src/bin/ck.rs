@@ -6575,9 +6575,16 @@ fn format_child_resources(module: &Value) -> String {
                 .unwrap_or_default();
             let user = resources.get("cpu_user_ms").and_then(Value::as_u64);
             let system = resources.get("cpu_system_ms").and_then(Value::as_u64);
+            let kernel_label = if resources.get("memory_kind").and_then(Value::as_str)
+                == Some("windows_working_set")
+            {
+                "kernel"
+            } else {
+                "system"
+            };
             let cpu = match (user, system) {
                 (Some(user), Some(system)) => format!(
-                    "{} (user {}, system {})",
+                    "{} (user {}, {kernel_label} {})",
                     format_cpu_time(user.saturating_add(system)),
                     format_cpu_time(user),
                     format_cpu_time(system)
@@ -8798,6 +8805,20 @@ mod tests {
             format_child_resources(&linux),
             "memory 2.0 MiB resident set, swap 4.0 KiB · cpu 290 ms (user 250 ms, system 40 ms)"
         );
+    }
+
+    #[test]
+    fn child_resources_render_windows_working_set_and_kernel_time() {
+        let module = serde_json::json!({ "resources": {
+            "status": "measured", "memory_bytes": 2_097_152,
+            "memory_kind": "windows_working_set", "cpu_user_ms": 250, "cpu_system_ms": 40,
+        }});
+        assert_eq!(
+            format_child_resources(&module),
+            "memory 2.0 MiB windows working set · cpu 290 ms (user 250 ms, kernel 40 ms)"
+        );
+        assert_eq!(child_memory_cell(&module), "2.0 MiB");
+        assert_eq!(child_cpu_cell(&module), "290 ms");
     }
 
     /// A daemon that predates the field, one that could not read the process,

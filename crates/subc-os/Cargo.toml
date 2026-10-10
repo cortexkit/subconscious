@@ -1,6 +1,6 @@
 [package]
 name = "subc-os"
-version = "0.1.11"
+version = "0.1.12"
 edition = "2021"
 license = "MIT"
 publish = true
@@ -38,6 +38,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
+    "Win32_System_ProcessStatus",
     "Win32_System_Threading",
 ] }
 

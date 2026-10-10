@@ -15,12 +15,49 @@ use subc_control::{
 /// handed to another process is refused rather than reported as the module's.
 /// Without it (macOS) the reading relies on the pid still naming the child,
 /// which holds until the supervisor reaps it and the pid space wraps.
+#[cfg(any(not(windows), test))]
 pub(crate) fn read(pid: Option<u32>, expected_start_time: Option<u64>) -> ChildResourceUsage {
+    #[cfg(windows)]
+    {
+        let Some(pid) = pid else {
+            return ChildResourceUsage::Unavailable {
+                reason: ChildResourceUnavailableReason::NotRunning,
+            };
+        };
+        let Some(expected) = expected_start_time else {
+            return ChildResourceUsage::Unavailable {
+                reason: ChildResourceUnavailableReason::ProcessIdentityUnconfirmed,
+            };
+        };
+        let Ok(Some(process)) = subc_os::Process::open(pid) else {
+            return ChildResourceUsage::Unavailable {
+                reason: ChildResourceUnavailableReason::Unreadable,
+            };
+        };
+        read_windows_handle(&process, expected)
+    }
+    #[cfg(not(windows))]
     read_with(pid, expected_start_time, subc_os::resource_usage, |pid| {
         crate::provenance::process_start_time(pid)
     })
 }
 
+#[cfg(windows)]
+pub(crate) fn read_windows_handle(process: &subc_os::Process, expected: u64) -> ChildResourceUsage {
+    if !matches!(process.observe(), Some(observed) if observed.start_time == expected) {
+        return ChildResourceUsage::Unavailable {
+            reason: ChildResourceUnavailableReason::ProcessIdentityUnconfirmed,
+        };
+    }
+    match process.resource_usage() {
+        Some(usage) => ChildResourceUsage::Measured(reading(usage)),
+        None => ChildResourceUsage::Unavailable {
+            reason: ChildResourceUnavailableReason::Unreadable,
+        },
+    }
+}
+
+#[cfg(any(not(windows), test))]
 fn read_with(
     pid: Option<u32>,
     expected_start_time: Option<u64>,
@@ -53,6 +90,7 @@ fn reading(usage: subc_os::ResourceUsage) -> ChildResourceReading {
         memory_kind: match usage.memory_kind {
             subc_os::MemoryKind::PhysFootprint => ChildMemoryKind::PhysFootprint,
             subc_os::MemoryKind::ResidentSet => ChildMemoryKind::ResidentSet,
+            subc_os::MemoryKind::WindowsWorkingSet => ChildMemoryKind::WindowsWorkingSet,
         },
         swap_bytes: usage.swap_bytes,
         cpu_user_ms: millis(usage.cpu_user),
@@ -64,7 +102,7 @@ fn reading(usage: subc_os::ResourceUsage) -> ChildResourceReading {
 mod tests {
     use super::*;
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     fn usage() -> subc_os::ResourceUsage {
         use std::time::Duration;
 
@@ -87,7 +125,7 @@ mod tests {
         );
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     #[test]
     fn a_failed_read_is_unreadable_not_zero() {
         assert_eq!(
@@ -98,7 +136,7 @@ mod tests {
         );
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     #[test]
     fn a_pid_now_naming_another_process_is_refused() {
         assert_eq!(
@@ -109,7 +147,7 @@ mod tests {
         );
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     #[test]
     fn a_confirmed_read_is_reported_in_wire_units() {
         assert_eq!(
@@ -124,7 +162,7 @@ mod tests {
         );
     }
 
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     #[test]
     fn an_unsupported_platform_says_so() {
         assert_eq!(
@@ -137,7 +175,7 @@ mod tests {
 
     /// The daemon's own process stands in for a child: the read goes through
     /// the real platform source, not a stub.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     #[test]
     fn a_live_process_is_measured() {
         let pid = std::process::id();

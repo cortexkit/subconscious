@@ -14,13 +14,15 @@ use sha2::{Digest, Sha256};
 use subc_control::{RunningImageAgreement, RunningImageUnavailableReason};
 // Both evidence constructors are cfg-gated to their probing platform, so on a
 // platform without a probe this import has no user and -D warnings rejects it.
-#[cfg(any(target_os = "linux", target_os = "macos", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows, test))]
 use subc_control::RunningImageEvidence;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SpawnedFileIdentity {
     pub(crate) device: u64,
     pub(crate) inode: u64,
+    #[cfg(windows)]
+    pub(crate) windows_image: Option<std::sync::Arc<subc_os::SpawnedImage>>,
 }
 
 pub(crate) fn spawned_file_identity(path: &Path) -> Option<SpawnedFileIdentity> {
@@ -108,11 +110,52 @@ impl ExecutableIdentityProbe {
             }
         }
 
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        #[cfg(windows)]
+        {
+            let Some(image) = _spawned_identity.and_then(|identity| identity.windows_image) else {
+                return unavailable(RunningImageUnavailableReason::ProcessIdentityUnconfirmed);
+            };
+            let Some(expected) = expected_start_time else {
+                return unavailable(RunningImageUnavailableReason::ProcessIdentityUnconfirmed);
+            };
+            if image.process().pid() != pid || image.path() != spawned_from {
+                return unavailable(RunningImageUnavailableReason::ProcessIdentityUnconfirmed);
+            }
+            windows_agreement(image.agreement(expected))
+        }
+
+        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
         {
             let _ = (pid, spawned_from, _spawned_identity, expected_start_time);
             unavailable(RunningImageUnavailableReason::UnsupportedPlatform)
         }
+    }
+}
+
+#[cfg(windows)]
+fn windows_agreement(agreement: subc_os::ImageAgreement) -> RunningImageAgreement {
+    let evidence =
+        |identity: subc_os::WindowsFileIdentity| RunningImageEvidence::WindowsSpawnFileId {
+            volume_serial_number: identity.volume_serial_number,
+            file_id: identity.file_id,
+        };
+    match agreement {
+        subc_os::ImageAgreement::Match(identity) => RunningImageAgreement::Match {
+            evidence: evidence(identity),
+        },
+        subc_os::ImageAgreement::Mismatch { running, disk } => RunningImageAgreement::Mismatch {
+            running: evidence(running),
+            disk: evidence(disk),
+        },
+        subc_os::ImageAgreement::Unavailable(reason) => unavailable(match reason {
+            subc_os::ImageUnavailable::ProcessExited => RunningImageUnavailableReason::NotRunning,
+            subc_os::ImageUnavailable::ProcessIdentityUnconfirmed => {
+                RunningImageUnavailableReason::ProcessIdentityUnconfirmed
+            }
+            subc_os::ImageUnavailable::SpawnPathUnreadable => {
+                RunningImageUnavailableReason::SpawnedPathUnreadable
+            }
+        }),
     }
 }
 
@@ -156,7 +199,12 @@ pub(crate) fn process_start_time(pid: u32) -> Option<u64> {
         .and_then(|stat| process_start_time_from_stat(&stat))
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(windows)]
+pub(crate) fn process_start_time(pid: u32) -> Option<u64> {
+    subc_os::start_time(pid)
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
 pub(crate) fn process_start_time(_pid: u32) -> Option<u64> {
     None
 }
@@ -650,23 +698,84 @@ mod tests {
         let spawned = SpawnedFileIdentity {
             device: 7,
             inode: 11,
+            #[cfg(windows)]
+            windows_image: None,
         };
         let same_path = SpawnedFileIdentity {
             device: 7,
             inode: 11,
+            #[cfg(windows)]
+            windows_image: None,
         };
         let replacement = SpawnedFileIdentity {
             device: 7,
             inode: 12,
+            #[cfg(windows)]
+            windows_image: None,
         };
 
         assert!(matches!(
-            compare_spawn_inode(spawned, same_path),
+            compare_spawn_inode(spawned.clone(), same_path),
             RunningImageAgreement::Match { .. }
         ));
         assert!(matches!(
             compare_spawn_inode(spawned, replacement),
             RunningImageAgreement::Mismatch { .. }
         ));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_provenance_reports_match_replacement_and_exited_unavailable() {
+        use std::os::windows::process::CommandExt;
+        struct ChildGuard(std::process::Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let dir = temp_dir("windows-provenance");
+        let executable = dir.join("child.exe");
+        std::fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
+        let capture = subc_os::ExecutableCapture::open(&executable).unwrap();
+        let mut child = ChildGuard(
+            std::process::Command::new(capture.path())
+                .creation_flags(0x4)
+                .spawn()
+                .unwrap(),
+        );
+        let image = std::sync::Arc::new(capture.bind(&child.0).unwrap());
+        let pid = Some(child.0.id());
+        let path = image.path().to_path_buf();
+        let start = Some(image.start_time());
+        let identity = Some(SpawnedFileIdentity {
+            device: 0,
+            inode: 0,
+            windows_image: Some(image),
+        });
+        let probe = ExecutableIdentityProbe::default();
+        assert!(matches!(
+            probe
+                .observe(pid, Some(&path), identity.clone(), start)
+                .await,
+            RunningImageAgreement::Match { .. }
+        ));
+        std::fs::rename(&path, dir.join("old.exe")).unwrap();
+        std::fs::write(&path, b"replacement file object").unwrap();
+        assert!(matches!(
+            probe
+                .observe(pid, Some(&path), identity.clone(), start)
+                .await,
+            RunningImageAgreement::Mismatch { .. }
+        ));
+        child.0.kill().unwrap();
+        child.0.wait().unwrap();
+        assert_eq!(
+            probe.observe(pid, Some(&path), identity, start).await,
+            RunningImageAgreement::Unavailable {
+                reason: RunningImageUnavailableReason::NotRunning
+            }
+        );
     }
 }

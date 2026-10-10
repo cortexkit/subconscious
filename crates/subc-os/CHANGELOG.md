@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.12
+
+- Add Windows handle-pinned creation-time checks, explicit forced stop and exit waiting, and working-set/CPU readings. Capture executable volume and full 128-bit file ID under a no-delete handle before suspended spawn; bind to the returned child handle and report unavailable after exit or unconfirmed observations. File-object agreement does not verify content.
+
 ## 0.1.11
 
 - Add Windows protected owner-only DACL primitives: private file and directory creation, narrowing of existing directories and their inherited descendants, and opened-handle owner/DACL verification. Reparse-point directories and foreign owners are refused; credential readers never repair insecure files.

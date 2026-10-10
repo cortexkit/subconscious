@@ -4483,7 +4483,7 @@ impl ControlHandler {
                     .observe(
                         self.daemon_provenance.pid,
                         self.daemon_provenance.executable_path.as_deref(),
-                        self.daemon_provenance.executable_identity,
+                        self.daemon_provenance.executable_identity.clone(),
                         self.daemon_provenance.process_start_time,
                     )
                     .await,

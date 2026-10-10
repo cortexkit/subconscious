@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.33.6
+
+- Capture Windows executable identity before suspended spawn and retain the child's handle for provenance and resource readings. Provenance now reports match, mismatch or unavailable using creation time and the full file ID; orphan cleanup only forces a stop on a matching creation time, and waits for exit. Persist Windows file IDs as additive version-1 fields so rollback readers keep reading the roster; Unix records and supervision are unchanged.
+
 ## 0.33.5
 
 - Advertise `catalog-events/v1` in `server.describe`, so a consumer can tell a catalog entry without `events` (the module declares none) from a daemon that does not report declared events.

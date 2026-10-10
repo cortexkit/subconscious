@@ -26,6 +26,9 @@
 //!   path `proc_pidpath` reports, then `stat` on that path. These two calls are
 //!   unsafe. macOS has no pidfd, so a signal is a plain
 //!   `kill` sent right after the checks; see [`Process::signal`].
+//! - Windows: creation time and forced stops use one retained process handle.
+//!   `ExecutableCapture` pins the resolved executable until a suspended spawn
+//!   binds its volume and 128-bit file ID to that handle and creation time.
 //! - Anywhere else: [`Process::open`] reports [`std::io::ErrorKind::Unsupported`].
 //!
 //! For persisted PID owners, [`process_identity`] reads versioned kernel start
@@ -64,6 +67,14 @@ pub use launch_nonce::{
 mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(windows)]
+mod windows;
+#[cfg(all(test, windows))]
+mod windows_tests;
+#[cfg(windows)]
+pub use windows::{
+    ExecutableCapture, ImageAgreement, ImageUnavailable, SpawnedImage, WindowsFileIdentity,
+};
 
 #[cfg(target_os = "linux")]
 use linux as platform;
@@ -72,8 +83,9 @@ use macos as platform;
 
 use std::{io, path::Path};
 
-/// True where [`Process`] can identify and signal a process by pid.
-pub const PROCESS_IDENTITY_SUPPORTED: bool = cfg!(any(target_os = "linux", target_os = "macos"));
+/// True where [`Process`] can identify and stop a process by pid.
+pub const PROCESS_IDENTITY_SUPPORTED: bool =
+    cfg!(any(target_os = "linux", target_os = "macos", windows));
 
 /// Device and inode of a file: which file, independent of the name used to
 /// reach it.
@@ -107,10 +119,13 @@ pub fn file_identity(path: &Path) -> Option<FileIdentity> {
 pub struct Observation {
     /// The kernel's start time for the process. Opaque: compare it only with a
     /// value read on the same host by this crate. Linux counts clock ticks since
-    /// boot; macOS counts microseconds since the epoch.
+    /// boot; macOS counts microseconds since the epoch; Windows counts 100 ns
+    /// intervals since the Windows epoch.
     pub start_time: u64,
     /// The file the process is executing, or `None` if it could not be read
     /// (for example, a process owned by another user).
+    /// Windows uses the full file ID in `SpawnedImage` instead of a Unix inode;
+    /// this field is always `None` there.
     pub executable: Option<FileIdentity>,
 }
 
@@ -131,7 +146,14 @@ pub fn start_time(pid: u32) -> Option<u64> {
     {
         platform::start_time(pid)
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(windows)]
+    {
+        Process::open(pid)
+            .ok()??
+            .observe()
+            .map(|observation| observation.start_time)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {
         let _ = pid;
         None
@@ -141,7 +163,8 @@ pub fn start_time(pid: u32) -> Option<u64> {
 /// True where [`resource_usage`] can read a live process. Elsewhere it always
 /// answers `None`, and a caller can use this to say "not supported here"
 /// rather than "could not read".
-pub const RESOURCE_USAGE_SUPPORTED: bool = cfg!(any(target_os = "linux", target_os = "macos"));
+pub const RESOURCE_USAGE_SUPPORTED: bool =
+    cfg!(any(target_os = "linux", target_os = "macos", windows));
 
 /// What [`ResourceUsage::memory_bytes`] measures. The platforms offer
 /// different figures, and they are not interchangeable.
@@ -155,6 +178,9 @@ pub enum MemoryKind {
     /// file-backed pages. Swapped-out pages are not included; see
     /// [`ResourceUsage::swap_bytes`].
     ResidentSet,
+    /// Windows `WorkingSetSize`: pageable memory currently resident in RAM,
+    /// including shared pages. This is not Unix RSS or private committed memory.
+    WindowsWorkingSet,
 }
 
 /// One reading of a process's memory and cumulative CPU time.
@@ -191,7 +217,11 @@ pub fn resource_usage(pid: u32) -> Option<ResourceUsage> {
     {
         platform::resource_usage(pid)
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(windows)]
+    {
+        Process::open(pid).ok()??.resource_usage()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {
         let _ = pid;
         None
@@ -204,6 +234,8 @@ pub struct Process {
     pid: u32,
     #[cfg(target_os = "linux")]
     pidfd: Option<std::os::fd::OwnedFd>,
+    #[cfg(windows)]
+    handle: std::os::windows::io::OwnedHandle,
 }
 
 impl Process {
@@ -225,7 +257,11 @@ impl Process {
         {
             Ok(platform::exists(pid).then_some(Self { pid }))
         }
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        #[cfg(windows)]
+        {
+            windows::open(pid).map(|opened| opened.map(|handle| Self { pid, handle }))
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
         {
             let _ = pid;
             Err(io::Error::new(
@@ -267,10 +303,39 @@ impl Process {
                 executable: platform::executable_identity(self.pid),
             })
         }
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        #[cfg(windows)]
+        {
+            windows::observe(self)
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
         {
             None
         }
+    }
+
+    /// Wait on the retained Windows handle. `Ok(false)` means the bound elapsed,
+    /// not that a reused PID was observed.
+    #[cfg(windows)]
+    pub fn wait_for_exit(&self, timeout: std::time::Duration) -> io::Result<bool> {
+        windows::wait(self, timeout)
+    }
+
+    /// Force the confirmed Windows process to stop, then wait on the same handle.
+    /// This is not a graceful termination signal. A different creation time
+    /// refuses before any action; `Ok(false)` means the wait bound elapsed.
+    #[cfg(windows)]
+    pub fn force_stop(
+        &self,
+        expected_start_time: u64,
+        timeout: std::time::Duration,
+    ) -> io::Result<bool> {
+        windows::force_stop(self, expected_start_time, timeout)
+    }
+
+    /// Windows resources read through the retained handle, not by reopening its PID.
+    #[cfg(windows)]
+    pub fn resource_usage(&self) -> Option<ResourceUsage> {
+        windows::resource_usage(self)
     }
 
     /// Send `signal` to the process.

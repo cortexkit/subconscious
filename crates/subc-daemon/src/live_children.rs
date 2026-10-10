@@ -23,8 +23,9 @@
 //! when recording that image, also retain the selected interpreter's identity.
 //! Matching never resolves the shell selection again after a crash or upgrade.
 //!
-//! On Windows the sweep signals nothing: the daemon's job object already ends
-//! a crashed daemon's children, and the record is read only to log it.
+//! On Windows the job object is the primary crash cleanup. The sweep is a
+//! fallback: only a matching creation time on a retained process handle permits
+//! a forced stop. An inaccessible process or reused PID is left alone.
 
 use std::{
     collections::BTreeSet,
@@ -66,6 +67,18 @@ pub(crate) struct ExecutableIdentity {
     /// field ignore it when reading.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     macos_sh_interpreter: Option<InterpreterIdentity>,
+    /// Older daemons reading version-1 `live-children.json` ignore unknown
+    /// executable fields, so adding this does not lose the roster on rollback.
+    /// Unix omits it, preserving its record bytes. Windows IDs stay here in full;
+    /// the legacy device/inode slots are zero, not a truncated Windows file ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    windows_file_identity: Option<WindowsFileIdentity>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+struct WindowsFileIdentity {
+    volume_serial_number: u64,
+    file_id: [u8; 16],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -86,6 +99,22 @@ impl From<subc_os::FileIdentity> for ExecutableIdentity {
             device: identity.device,
             inode: identity.inode,
             macos_sh_interpreter,
+            windows_file_identity: None,
+        }
+    }
+}
+
+#[cfg(windows)]
+impl From<subc_os::WindowsFileIdentity> for ExecutableIdentity {
+    fn from(identity: subc_os::WindowsFileIdentity) -> Self {
+        Self {
+            device: 0,
+            inode: 0,
+            macos_sh_interpreter: None,
+            windows_file_identity: Some(WindowsFileIdentity {
+                volume_serial_number: identity.volume_serial_number,
+                file_id: identity.file_id,
+            }),
         }
     }
 }
@@ -350,6 +379,9 @@ pub(crate) enum SweepDecision {
     Terminated,
     /// Matched; still running at the SIGTERM grace, exited after SIGKILL.
     Killed,
+    /// Windows forced stop, confirmed by waiting on the checked process handle.
+    #[cfg(windows)]
+    ForcedStopped,
     /// Matched and signalled, but still observed at the end of the bound.
     Survived,
     /// No process identity source on this platform; not signalled.
@@ -538,7 +570,56 @@ fn current_verdict(entry: &LiveChild, process: &subc_os::Process) -> Option<Iden
         .map(|observed| identity_verdict(entry, process.pid(), &observed))
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(windows)]
+async fn sweep_entries(
+    entries: Vec<LiveChild>,
+    adopted: &AdoptedPids,
+    bounds: SweepBounds,
+) -> Vec<(LiveChild, SweepDecision)> {
+    let mut decisions = Vec::new();
+    for entry in entries {
+        let decision = if adopted.contains(entry.pid) {
+            SweepDecision::Adopted
+        } else {
+            let recorded = entry.clone();
+            tokio::task::spawn_blocking(move || sweep_windows_entry(&recorded, bounds.kill_bound))
+                .await
+                .unwrap_or_else(|error| SweepDecision::Unverifiable(error.to_string()))
+        };
+        decisions.push((entry, decision));
+    }
+    decisions
+}
+
+#[cfg(windows)]
+fn sweep_windows_entry(entry: &LiveChild, wait_bound: Duration) -> SweepDecision {
+    let Some(expected) = entry.start_time else {
+        return SweepDecision::Mismatched(IdentityVerdict::StartTimeUnrecorded);
+    };
+    // Open once: creation-time validation, the forced stop and its wait all use
+    // this handle even if the PID is subsequently reused.
+    let process = match subc_os::Process::open(entry.pid) {
+        Ok(Some(process)) => process,
+        Ok(None) => return SweepDecision::Gone,
+        Err(error) => return SweepDecision::Unverifiable(error.to_string()),
+    };
+    let Some(observed) = process.observe() else {
+        return match process.wait_for_exit(Duration::ZERO) {
+            Ok(true) => SweepDecision::Gone,
+            _ => SweepDecision::Unverifiable("process creation time unavailable".to_owned()),
+        };
+    };
+    if observed.start_time != expected {
+        return SweepDecision::Mismatched(IdentityVerdict::StartTimeDiffers);
+    }
+    match process.force_stop(expected, wait_bound) {
+        Ok(true) => SweepDecision::ForcedStopped,
+        Ok(false) => SweepDecision::Survived,
+        Err(error) => SweepDecision::Unverifiable(error.to_string()),
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 async fn sweep_entries(
     entries: Vec<LiveChild>,
     adopted: &AdoptedPids,
@@ -585,6 +666,10 @@ fn log_decision(entry: &LiveChild, decision: &SweepDecision) {
         SweepDecision::Killed => {
             info!(module_id, pid, "orphan sweep: previous daemon's child exited after SIGKILL")
         }
+        #[cfg(windows)]
+        SweepDecision::ForcedStopped => {
+            info!(module_id, pid, "orphan sweep: previous daemon's child exited after a forced stop")
+        }
         SweepDecision::Survived => warn!(
             module_id,
             pid,
@@ -618,6 +703,7 @@ mod tests {
                 device: 7,
                 inode: 11,
                 macos_sh_interpreter: None,
+                windows_file_identity: None,
             }),
             cgroup_name: Some(format!("{module_id}-a")),
         }
@@ -804,6 +890,133 @@ mod tests {
     }
 
     #[test]
+    fn windows_file_id_record_is_full_width_and_readable_by_rollback_reader() {
+        #[derive(Deserialize)]
+        struct PreviousImage {
+            device: u64,
+            inode: u64,
+        }
+        #[derive(Deserialize)]
+        struct PreviousChild {
+            module_id: String,
+            pid: u32,
+            protocol: ModuleProtocol,
+            start_time: Option<u64>,
+            executable: Option<PreviousImage>,
+            cgroup_name: Option<String>,
+        }
+        #[derive(Deserialize)]
+        struct PreviousRecord {
+            version: u32,
+            children: Vec<PreviousChild>,
+        }
+        let dir = ScratchDir::new("windows-file-id-rollback");
+        let path = record_path(&dir);
+        let mut entry = child("windows-child", 40);
+        let image = entry.executable.as_mut().unwrap();
+        image.device = 0;
+        image.inode = 0;
+        image.windows_file_identity = Some(WindowsFileIdentity {
+            volume_serial_number: u64::MAX,
+            file_id: [
+                0, 1, 2, 3, 4, 5, 6, 7, 128, 129, 130, 131, 252, 253, 254, 255,
+            ],
+        });
+        write_record(&path, std::slice::from_ref(&entry)).unwrap();
+        assert_eq!(read_record(&path).unwrap(), vec![entry]);
+        let previous: PreviousRecord = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert_eq!(previous.version, 1);
+        let previous = &previous.children[0];
+        assert_eq!(previous.module_id, "windows-child");
+        assert_eq!(previous.pid, 40);
+        assert_eq!(previous.protocol, ModuleProtocol::None);
+        assert_eq!(previous.start_time, Some(1_000));
+        assert_eq!(previous.cgroup_name.as_deref(), Some("windows-child-a"));
+        assert_eq!(previous.executable.as_ref().unwrap().device, 0);
+        assert_eq!(previous.executable.as_ref().unwrap().inode, 0);
+    }
+
+    #[test]
+    fn unix_record_without_windows_identity_keeps_original_bytes() {
+        let dir = ScratchDir::new("unix-record-bytes");
+        let path = record_path(&dir);
+        write_record(&path, &[child("nats", 40)]).unwrap();
+        assert_eq!(fs::read_to_string(path).unwrap(), "{\n  \"version\": 1,\n  \"children\": [\n    {\n      \"module_id\": \"nats\",\n      \"pid\": 40,\n      \"protocol\": \"none\",\n      \"start_time\": 1000,\n      \"executable\": {\n        \"device\": 7,\n        \"inode\": 11\n      },\n      \"cgroup_name\": \"nats-a\"\n    }\n  ]\n}");
+    }
+
+    #[cfg(windows)]
+    mod windows_processes {
+        use super::*;
+        use std::os::windows::process::CommandExt;
+
+        struct ChildGuard(std::process::Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        fn spawn_recorded() -> (ChildGuard, LiveChild) {
+            // Suspended test executable: a real process identity without running
+            // another test suite or depending on an installed helper program.
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .creation_flags(0x4)
+                .spawn()
+                .unwrap();
+            let entry = LiveChild {
+                module_id: "previous".to_owned(),
+                pid: child.id(),
+                protocol: ModuleProtocol::None,
+                start_time: subc_os::start_time(child.id()),
+                executable: None,
+                cgroup_name: None,
+            };
+            assert!(entry.start_time.is_some());
+            (ChildGuard(child), entry)
+        }
+
+        #[tokio::test]
+        async fn windows_orphan_sweep_leaves_different_creation_time_alone() {
+            let (mut child, mut entry) = spawn_recorded();
+            entry.start_time = entry.start_time.map(|time| time + 1);
+            let dir = ScratchDir::new("windows-sweep-reused-pid");
+            let path = record_path(&dir);
+            write_record(&path, std::slice::from_ref(&entry)).unwrap();
+            let owner = RunDirLock::acquire(&path).unwrap();
+            let decisions =
+                sweep_orphans(&owner, &AdoptedPids::none(), SweepBounds::default()).await;
+            assert_eq!(
+                decisions,
+                vec![(
+                    entry,
+                    SweepDecision::Mismatched(IdentityVerdict::StartTimeDiffers)
+                )]
+            );
+            assert!(
+                child.0.try_wait().unwrap().is_none(),
+                "unrelated process was terminated"
+            );
+        }
+
+        #[tokio::test]
+        async fn windows_orphan_sweep_force_stops_matching_creation_time() {
+            let (mut child, entry) = spawn_recorded();
+            let dir = ScratchDir::new("windows-sweep-matched");
+            let path = record_path(&dir);
+            write_record(&path, std::slice::from_ref(&entry)).unwrap();
+            let owner = RunDirLock::acquire(&path).unwrap();
+            let decisions =
+                sweep_orphans(&owner, &AdoptedPids::none(), SweepBounds::default()).await;
+            assert_eq!(decisions, vec![(entry, SweepDecision::ForcedStopped)]);
+            assert!(
+                child.0.try_wait().unwrap().is_some(),
+                "sweep did not await forced exit"
+            );
+        }
+    }
+
+    #[test]
     fn a_missing_record_is_empty_and_an_unknown_version_is_refused() {
         let dir = ScratchDir::new("live-children-missing");
         let path = record_path(&dir);
@@ -981,6 +1194,7 @@ mod tests {
                 device: 1,
                 inode: 2,
                 macos_sh_interpreter: None,
+                windows_file_identity: None,
             }),
             cgroup_name: Some("nats-a".to_owned()),
             #[cfg(target_os = "linux")]

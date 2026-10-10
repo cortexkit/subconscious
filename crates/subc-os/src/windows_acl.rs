@@ -398,8 +398,11 @@ impl Security {
             // is part of the valid security descriptor returned by Windows.
             let ace = unsafe { &*raw.cast::<ACCESS_ALLOWED_ACE>() };
             let sid: PSID = std::ptr::addr_of!(ace.SidStart).cast_mut().cast();
-            // SAFETY: The SID and token user buffers remain live. SYSTEM and
-            // Administrators are trusted because they can bypass file ACLs anyway.
+            // SAFETY: The SID and token user buffers remain live.
+            // SYSTEM and Administrators may hold grants: both can already take
+            // ownership of any file and rewrite its ACL, so refusing their
+            // entries would add no protection and would reject every file an
+            // elevated process wrote.
             let trusted = unsafe {
                 EqualSid(sid, user.sid()) != 0
                     || IsWellKnownSid(sid, WinLocalSystemSid) != 0

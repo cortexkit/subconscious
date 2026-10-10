@@ -8,8 +8,8 @@ use windows_sys::Win32::{
     Security::{
         AdjustTokenPrivileges,
         Authorization::{
-            ConvertStringSecurityDescriptorToSecurityDescriptorW, GetNamedSecurityInfoW,
-            SetNamedSecurityInfoW, SDDL_REVISION_1, SE_FILE_OBJECT,
+            ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+            GetNamedSecurityInfoW, SetNamedSecurityInfoW, SDDL_REVISION_1, SE_FILE_OBJECT,
         },
         EqualSid, GetAce, GetSecurityDescriptorControl, GetSecurityDescriptorDacl,
         GetSecurityDescriptorOwner, LookupPrivilegeValueW, ACCESS_ALLOWED_ACE, ACL,
@@ -124,7 +124,10 @@ fn assert_dacl(path: &Path, directory: bool, protected: bool, check_owner: bool)
         assert_ne!(
             unsafe { EqualSid(security.owner, user.sid()) },
             0,
-            "current-user owner"
+            "{} is owned by {}, not the current user {}",
+            path.display(),
+            sid_string(security.owner),
+            sid_string(user.sid())
         );
     }
     let mut control = 0;
@@ -251,4 +254,21 @@ pub fn grant_everyone(path: &Path) {
 /// Grant Everyone read access on a disposable file fixture.
 pub fn grant_everyone_read(path: &Path) {
     apply_sddl(path, "D:P(A;;FR;;;WD)", false).unwrap();
+}
+
+/// Render a SID as `S-1-…` so an owner mismatch names both owners.
+fn sid_string(sid: PSID) -> String {
+    let mut text: *mut u16 = null_mut();
+    // SAFETY: sid is a live SID and text receives a LocalAlloc'd string.
+    if unsafe { ConvertSidToStringSidW(sid, &mut text) } == 0 || text.is_null() {
+        return "<unreadable SID>".to_owned();
+    }
+    // SAFETY: the returned string is NUL-terminated until it is freed below.
+    let rendered = unsafe {
+        let len = (0..).take_while(|&i| *text.add(i) != 0).count();
+        String::from_utf16_lossy(std::slice::from_raw_parts(text, len))
+    };
+    // SAFETY: text was allocated by ConvertSidToStringSidW.
+    unsafe { LocalFree(text.cast()) };
+    rendered
 }

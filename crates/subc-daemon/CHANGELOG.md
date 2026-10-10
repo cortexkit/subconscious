@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.33.3
+
+- Create Windows run directories with protected owner-only DACLs instead of trusting inherited permissions, including redirected paths. Tighten existing run directories and remove broad inherited access from unprotected descendants using `subc-os`.
+
 ## 0.33.2
 
 - Log pre-authentication rejections at info level with the peer, elapsed time, and a reason that distinguishes capacity waits, handshake deadlines, invalid proofs, malformed messages, and peers that close early. Rate-limit each reason and include its accumulated suppressed count on the next permitted line.

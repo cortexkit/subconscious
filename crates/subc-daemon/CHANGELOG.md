@@ -3,6 +3,7 @@
 ## 0.33.4
 
 - Include each registered module's declared bus events in `catalog.list` without changing entries whose manifests omit events.
+- Rate-limit pre-authentication rejection logs per listener instead of process-wide, so one listener's rejects can no longer suppress another listener's first line.
 
 ## 0.33.3
 

@@ -4,7 +4,7 @@ use std::{
     net::SocketAddr,
     sync::{
         atomic::{AtomicU64, Ordering as AtomicOrdering},
-        Arc, OnceLock,
+        Arc,
     },
     time::{Duration, Instant},
 };
@@ -70,9 +70,6 @@ pub const DEFAULT_MAX_UNAUTHENTICATED_CONNECTIONS: usize = 256;
 const CLOSE_DRAIN_GRACE: Duration = Duration::from_secs(2);
 const PRE_AUTH_REJECT_LOG_INTERVAL: Duration = Duration::from_secs(1);
 
-static PRE_AUTH_LOG_EPOCH: OnceLock<Instant> = OnceLock::new();
-static PRE_AUTH_REJECT_LIMITER: OnceLock<PreAuthRejectLimiter> = OnceLock::new();
-
 #[derive(Clone, Copy, Debug)]
 enum PreAuthRejectStage {
     WaitingForHandshakeSlot,
@@ -118,6 +115,7 @@ impl PreAuthRejectStage {
     }
 }
 
+#[derive(Debug)]
 struct PreAuthRejectRateLimit {
     next_allowed_ns: AtomicU64,
     suppressed: AtomicU64,
@@ -132,7 +130,25 @@ impl PreAuthRejectRateLimit {
     }
 }
 
+/// Rate-limit state for pre-authentication rejection logs, owned by one
+/// `ServerAuth` so each listener (and each test) counts only its own rejects.
+#[derive(Debug)]
+struct PreAuthRejectLog {
+    epoch: Instant,
+    limiter: PreAuthRejectLimiter,
+}
+
+impl PreAuthRejectLog {
+    fn new() -> Self {
+        Self {
+            epoch: Instant::now(),
+            limiter: PreAuthRejectLimiter::new(),
+        }
+    }
+}
+
 // Report accumulated rejects on the next allowed line instead of running a timer task.
+#[derive(Debug)]
 struct PreAuthRejectLimiter {
     stages: [PreAuthRejectRateLimit; 6],
 }
@@ -206,12 +222,17 @@ async fn handle_accepted_connection<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    let reject_log = Arc::clone(&auth.pre_auth_reject_log);
     let result = handle_connection(stream, router, auth).await;
     if let Err(error) = &result {
         if error.is_quiet_reject() {
-            let now = PRE_AUTH_LOG_EPOCH.get_or_init(Instant::now).elapsed();
-            let limiter = PRE_AUTH_REJECT_LIMITER.get_or_init(PreAuthRejectLimiter::new);
-            log_pre_auth_rejection(error, peer_addr, accepted_at.elapsed(), now, limiter);
+            log_pre_auth_rejection(
+                error,
+                peer_addr,
+                accepted_at.elapsed(),
+                reject_log.epoch.elapsed(),
+                &reject_log.limiter,
+            );
         } else {
             warn!(?peer_addr, error = %error, "subc connection ended with error");
         }
@@ -229,6 +250,7 @@ pub struct ServerAuth {
     deadline: Duration,
     unauthenticated: Arc<Semaphore>,
     connected_clients: ConnectedClients,
+    pre_auth_reject_log: Arc<PreAuthRejectLog>,
 }
 
 impl ServerAuth {
@@ -261,6 +283,7 @@ impl ServerAuth {
             deadline,
             unauthenticated: Arc::new(Semaphore::new(max_unauthenticated.max(1))),
             connected_clients: ConnectedClients::new(),
+            pre_auth_reject_log: Arc::new(PreAuthRejectLog::new()),
         }
     }
 
@@ -1523,6 +1546,35 @@ mod tests {
             "{captured}"
         );
         assert_pre_auth_log(&logs, "peer_closed", port);
+    }
+
+    // Rejection-log rate limits belong to one listener. A process-wide limiter
+    // let one listener's rejects silence another's for a second, which hid the
+    // second listener's first rejection entirely.
+    #[tokio::test]
+    async fn each_listener_rate_limits_its_own_rejection_logs() {
+        let (logs, _guard) = crate::router::test_log::log_capture(tracing::Level::INFO);
+        for port in [41011, 41012] {
+            let (auth, _) = test_auth_with_deadline_and_limit(Duration::from_millis(200), 4);
+            let (client, server_stream) = duplex(512);
+            drop(client);
+            handle_accepted_connection(
+                server_stream,
+                echo_router(),
+                auth,
+                SocketAddr::from(([127, 0, 0, 1], port)),
+                Instant::now(),
+            )
+            .await
+            .expect_err("closed peer must be rejected");
+        }
+        let captured = crate::router::test_log::captured_logs(&logs);
+        for port in [41011, 41012] {
+            assert!(
+                captured.contains(&format!("127.0.0.1:{port}")),
+                "listener on port {port} logged nothing: {captured}"
+            );
+        }
     }
 
     #[tokio::test]

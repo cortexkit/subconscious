@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.33.2
+
+- Log pre-authentication rejections at info level with the peer, elapsed time, and a reason that distinguishes capacity waits, handshake deadlines, invalid proofs, malformed messages, and peers that close early. Rate-limit each reason and include its accumulated suppressed count on the next permitted line.
+
 ## 0.33.1
 
 - Fix a route that `route.open` reported as open but that silently dropped the client's first requests. When a module answered the route bind very quickly, the daemon could commit the route and then, a moment later, also tell the module to drop it (a GOODBYE on the route's channel). The client got "accepted", the module logged `dropped module frame without a matching route binding cause=unbound_channel` for the client's requests, and the client waited forever for answers. The daemon now sends that GOODBYE only for a bind it really abandoned (the client went away, or the module began draining, before the module answered), and never for a route it committed. A bind the module acked for a client that had already gone still gets exactly one GOODBYE.

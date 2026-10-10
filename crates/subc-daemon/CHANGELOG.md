@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.33.4
+
+- Include each registered module's declared bus events in `catalog.list` without changing entries whose manifests omit events.
+
 ## 0.33.3
 
 - Keep an exited child's stdout reader running to EOF when it exceeds the 250 ms restart wait, just like stderr. Aborting that reader discarded output still buffered in the pipe, which could leave Windows capture files permanently short after a burst. The restart remains bounded; late output from either pipe may arrive after the replacement starts.

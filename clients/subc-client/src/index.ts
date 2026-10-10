@@ -23,6 +23,7 @@ export {
   type RouteOpenOptions,
   type CatalogCapabilities,
   type CatalogCapabilityRequirement,
+  type CatalogEventDeclaration,
   type CatalogEntry,
   type RequestOptions,
   type ManagedCallOptions,

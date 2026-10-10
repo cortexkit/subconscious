@@ -22,6 +22,7 @@ import {
   SubcClient,
   type BindIdentity,
   type CatalogEntry,
+  type CatalogEventDeclaration,
   type Frame,
   type RouteScope,
 } from "../src/index.js";
@@ -194,6 +195,32 @@ describe("daemon-originated control pushes", () => {
 });
 
 describe("SubcClient capability resolution", () => {
+  test("catalogList preserves declared bus events", async () => {
+    const { connFile } = tempConnectionFile();
+    const stats = newStats();
+    const events: CatalogEventDeclaration[] = [
+      {
+        name: "task_completed",
+        version: 2,
+        headers: ["project_id"],
+        summary: "A task completed",
+      },
+    ];
+    const daemon = await startFakeDaemon({
+      stats,
+      catalogModules: [{ ...catalogEntry("publisher", undefined), events }],
+    });
+    writeConnectionFile(connFile, daemon.port);
+
+    const client = await SubcClient.connect({ connectionFile: connFile });
+    try {
+      const module = (await client.catalogList()).find((entry) => entry.module_id === "publisher");
+      expect(module?.events).toEqual(events);
+    } finally {
+      client.close();
+    }
+  });
+
   test("resolves only explicit capability claims across zero, one, and many claimant arms", async () => {
     const { connFile } = tempConnectionFile();
     const stats = newStats();

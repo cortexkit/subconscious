@@ -3070,6 +3070,7 @@ impl ControlHandler {
                 .with_module_version(Some(registration.manifest.module_version))
                 .with_capabilities(registration.manifest.capabilities)
                 .with_self_signals(registration.manifest.self_signals)
+                .with_events(registration.manifest.events)
             })
             .collect();
         let response = ClientControlResponse::CatalogList {

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.21.3
+
+- Add optional declared bus events to `CatalogEntry`, mirroring the module manifest so consumers can inspect publishers through `catalog.list`.
+
 ## 0.21.2
 
 - Measure a frame body's read budget as time without progress rather than wall-clock time since its header. Each incoming chunk pushes the deadline out by the budget again, so a slow but moving body does not time out, while a body that stops arriving still fails after the budget. Absolute deadlines, such as the handshake's, stay fixed: arriving bytes never extend them.

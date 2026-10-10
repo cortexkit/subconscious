@@ -27,9 +27,9 @@ use subc_client_rs::{
 use subc_control::{ClientControlRequest, ClientControlResponse, PollKind};
 use subc_protocol::{
     manifest::{
-        CapabilityDeclarations, CapabilityNeed, CapabilityRequirement, Concurrency, ExecutionMode,
-        IdentityScope, ManagementOperation, ManagementOperationKind, ModuleManifest, ProviderRole,
-        Tool,
+        CapabilityDeclarations, CapabilityNeed, CapabilityRequirement, Concurrency,
+        EventDeclaration, ExecutionMode, IdentityScope, ManagementOperation,
+        ManagementOperationKind, ModuleManifest, ProviderRole, Tool,
     },
     scope::{ScopeKind, ScopeStamp, ScopeStatus},
     session::HealthStatus,
@@ -325,6 +325,62 @@ impl ModuleHandler for PolicyModuleHandler {
             routes.remove(&handle.channel);
         }
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn subc_consumer_catalog_list_reads_declared_events_from_real_daemon() {
+    let workspace = workspace_root();
+    let daemon_bin = ensure_binary(
+        &workspace,
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-core",
+            "--bin",
+            "ck-subc",
+            "--message-format=json",
+        ],
+    );
+    let temp_dir = unique_temp_dir("subc-client-rs-catalog-events");
+    let runtime_dir = temp_dir.join("runtime");
+    let config_dir = temp_dir.join("config");
+    fs::create_dir_all(&runtime_dir).unwrap();
+    write_empty_config(&config_dir);
+
+    let mut daemon = spawn_daemon(&daemon_bin, &runtime_dir, &config_dir);
+    wait_for_connection_file(&daemon.connection_file, START_TIMEOUT).await;
+
+    let events = vec![
+        EventDeclaration::new("task_completed", 2)
+            .with_headers(vec!["project_id".to_string()])
+            .with_summary(Some("A task completed".to_string())),
+        EventDeclaration::new("task_failed", 1),
+    ];
+    let manifest =
+        ModuleManifest::builder("subc-client-rs-catalog-events", env!("CARGO_PKG_VERSION"))
+            .events(Some(events.clone()))
+            .build();
+    let (_handle, serving) =
+        serve_with_handle(&daemon.connection_file, manifest, EchoModuleHandler)
+            .await
+            .unwrap();
+    let module_task = tokio::spawn(serving);
+
+    let consumer = SubcConsumer::connect(&daemon.connection_file, fast_consumer_options())
+        .await
+        .unwrap();
+    let catalog = consumer.catalog_list().await.unwrap();
+    let module = catalog
+        .modules
+        .iter()
+        .find(|module| module.module_id == "subc-client-rs-catalog-events")
+        .expect("catalog.list must include the event-publishing module");
+    assert_eq!(module.events.as_ref(), Some(&events));
+
+    module_task.abort();
+    let _ = module_task.await;
+    daemon.kill_and_wait();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

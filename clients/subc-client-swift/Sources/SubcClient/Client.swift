@@ -5,10 +5,18 @@ import Foundation
 // authenticated transport. This client is synchronous, but every route identity
 // still carries the full wire generation and connection token.
 
+public struct CatalogEventDeclaration {
+    public let name: String
+    public let version: UInt32
+    public let headers: [String]
+    public let summary: String?
+}
+
 public struct CatalogEntry {
     public let moduleId: String
     public let roles: [String]
     public let controlOps: [String]
+    public let events: [CatalogEventDeclaration]?
 }
 
 /// One decoded subscribe-stream control event (the chat-renderable unit).
@@ -127,7 +135,8 @@ public final class SubcClient {
             CatalogEntry(
                 moduleId: module["module_id"] as? String ?? "?",
                 roles: rolesOf(module["roles"]),
-                controlOps: module["control_ops"] as? [String] ?? []
+                controlOps: module["control_ops"] as? [String] ?? [],
+                events: eventsOf(module["events"])
             )
         }
     }
@@ -770,6 +779,22 @@ private func extractText(type: String, unit: [String: Any]) -> String? {
         return (unit["result"] as? [String: Any])?["output"].flatMap { ($0 as? [String: Any])?["text"] as? String }
     default:
         return nil
+    }
+}
+
+private func eventsOf(_ value: Any?) -> [CatalogEventDeclaration]? {
+    guard let objects = value as? [[String: Any]] else { return nil }
+    return objects.compactMap { event in
+        guard let name = event["name"] as? String,
+              let version = event["version"] as? UInt32,
+              let headers = event["headers"] as? [String]
+        else { return nil }
+        return CatalogEventDeclaration(
+            name: name,
+            version: version,
+            headers: headers,
+            summary: event["summary"] as? String
+        )
     }
 }
 

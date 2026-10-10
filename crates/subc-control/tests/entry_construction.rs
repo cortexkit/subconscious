@@ -5,7 +5,8 @@ use subc_control::{
     RunningImageUnavailableReason, SupervisorEntry, SupervisorHealthStatus, TerminalExitKind,
 };
 use subc_protocol::manifest::{
-    CapabilityDeclarations, SelfSignalDeclaration, SelfSignalEffect, SelfSignalKind, SignalAnchor,
+    CapabilityDeclarations, EventDeclaration, SelfSignalDeclaration, SelfSignalEffect,
+    SelfSignalKind, SignalAnchor,
 };
 
 #[test]
@@ -17,9 +18,37 @@ fn catalog_constructor_matches_wire_defaults() {
         entry
     );
     assert_eq!(
+        serde_json::to_string(&entry).unwrap(),
+        r#"{"module_id":"provider","ready":true,"roles":[],"control_ops":["route.bind"]}"#
+    );
+    assert_eq!(
         serde_json::to_value(entry).unwrap(),
         json!({"module_id": "provider", "ready": true, "roles": [], "control_ops": ["route.bind"]})
     );
+}
+
+#[test]
+fn catalog_events_use_the_manifest_declaration_shape() {
+    let events = vec![
+        EventDeclaration::new("task_completed", 2)
+            .with_headers(vec!["project_id".to_string()])
+            .with_summary(Some("A task completed".to_string())),
+        EventDeclaration::new("task_failed", 1),
+    ];
+    let entry = CatalogEntry::new("publisher", vec![], vec![]).with_events(Some(events.clone()));
+    let wire = json!({
+        "module_id": "publisher",
+        "ready": true,
+        "roles": [],
+        "control_ops": [],
+        "events": [
+            {"name": "task_completed", "version": 2, "headers": ["project_id"], "summary": "A task completed"},
+            {"name": "task_failed", "version": 1, "headers": []}
+        ]
+    });
+
+    assert_eq!(serde_json::to_value(&entry).unwrap(), wire);
+    assert_eq!(serde_json::from_value::<CatalogEntry>(wire).unwrap(), entry);
 }
 
 #[test]

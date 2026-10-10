@@ -335,6 +335,42 @@ final class ClientWireRevisionTests: XCTestCase {
         XCTAssertTrue(transport.bytes.isEmpty)
     }
 
+    func testCatalogListReturnsDeclaredBusEvents() throws {
+        let transport = ScriptedTransport()
+        try transport.append(makeFrame(
+            ty: .response,
+            channel: 0,
+            epoch: 0,
+            corr: 1,
+            json: [
+                "modules": [[
+                    "module_id": "publisher",
+                    "roles": [],
+                    "control_ops": [],
+                    "events": [
+                        [
+                            "name": "task_completed",
+                            "version": 2,
+                            "headers": ["project_id"],
+                            "summary": "A task completed",
+                        ],
+                        ["name": "task_failed", "version": 1, "headers": []],
+                    ],
+                ]],
+            ]
+        ))
+
+        let modules = try SubcClient(transport: transport).catalogList()
+        XCTAssertEqual(modules.count, 1)
+        XCTAssertEqual(modules[0].events?.count, 2)
+        XCTAssertEqual(modules[0].events?[0].name, "task_completed")
+        XCTAssertEqual(modules[0].events?[0].version, 2)
+        XCTAssertEqual(modules[0].events?[0].headers, ["project_id"])
+        XCTAssertEqual(modules[0].events?[0].summary, "A task completed")
+        XCTAssertEqual(modules[0].events?[1].name, "task_failed")
+        XCTAssertEqual(modules[0].events?[1].summary, nil)
+    }
+
     func testStaleEpochIngressIsDroppedWithoutSettlingCurrentRequest() throws {
         let transport = ScriptedTransport()
         try transport.append(makeFrame(

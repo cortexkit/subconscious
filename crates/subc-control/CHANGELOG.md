@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.29.1
+
+- Add optional manifest-mirrored bus event declarations to `CatalogEntry`, omitting the field when the manifest has no event declaration.
+
 ## 0.29.0
 
 - **Breaking.** `CatalogEntry` and `SupervisorEntry` are `#[non_exhaustive]`; build them with `new` and the `with_*` setters, so later fields are not breaking. Requires `subc-protocol` 0.30. Wire bytes are unchanged.

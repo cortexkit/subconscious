@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.27.1
+
+- Expose module-declared bus events via the SDK's re-exported `CatalogEntry`, and verify SDK readback against a real daemon.
+
 ## 0.27.0
 
 - Add `ModuleHandle::scope_apply(generation, upsert, end)`, returning `ScopeApplyReply`. It returns `ScopeCallError::NotSupported` without sending anything when the daemon does not advertise `scope.apply`; a daemon that does also accepts `expires_at_ms`.

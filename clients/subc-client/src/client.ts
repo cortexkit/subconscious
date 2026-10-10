@@ -174,6 +174,13 @@ export interface CatalogSelfSignalDeclaration {
   note?: string | null;
 }
 
+export interface CatalogEventDeclaration {
+  name: string;
+  version: number;
+  headers: string[];
+  summary?: string | null;
+}
+
 export interface CatalogEntry {
   module_id: string;
   roles: unknown[];
@@ -182,6 +189,8 @@ export interface CatalogEntry {
   capabilities?: CatalogCapabilities | null;
   /** Self-signal declarations mirrored verbatim from the registered manifest. */
   self_signals?: CatalogSelfSignalDeclaration[] | null;
+  /** Bus events mirrored verbatim from the registered module manifest. */
+  events?: CatalogEventDeclaration[] | null;
 }
 
 export interface RequestOptions {

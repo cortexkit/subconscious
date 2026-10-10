@@ -15,7 +15,10 @@ use serde::{
     Deserialize, Deserializer, Serialize, Serializer,
 };
 use subc_protocol::{
-    manifest::{CapabilityDeclarations, ManifestProvenance, ProviderRole, SelfSignalDeclaration},
+    manifest::{
+        CapabilityDeclarations, EventDeclaration, ManifestProvenance, ProviderRole,
+        SelfSignalDeclaration,
+    },
     scope::ScopeSelector,
     session::HealthStatus,
     BindIdentity, RouteTarget,
@@ -1805,6 +1808,11 @@ pub struct CatalogEntry {
     /// manifest. The daemon relays these declarations without interpreting them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub self_signals: Option<Vec<SelfSignalDeclaration>>,
+    /// Event declarations mirrored verbatim from the registering module's manifest.
+    /// Absent when the manifest omits `events`; an empty array records an affirmative
+    /// declaration that the module publishes no events.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub events: Option<Vec<EventDeclaration>>,
 }
 
 impl CatalogEntry {
@@ -1824,6 +1832,7 @@ impl CatalogEntry {
             control_ops,
             capabilities: None,
             self_signals: None,
+            events: None,
         }
     }
 
@@ -1859,6 +1868,13 @@ impl CatalogEntry {
     #[must_use]
     pub fn with_self_signals(mut self, self_signals: Option<Vec<SelfSignalDeclaration>>) -> Self {
         self.self_signals = self_signals;
+        self
+    }
+
+    /// Set or clear the event declarations mirrored from the module manifest.
+    #[must_use]
+    pub fn with_events(mut self, events: Option<Vec<EventDeclaration>>) -> Self {
+        self.events = events;
         self
     }
 }

@@ -68,7 +68,9 @@ fn existing_directory_narrows_unprotected_descendants() {
     std::fs::write(&child, b"old log").unwrap();
     assert!(verify_owner_only(&File::open(&child).unwrap()).is_err());
     create_private_dir(&run).unwrap();
-    assert_owner_only(&run, true, true);
+    // `run` existed before narrowing, so only its access list changes; an
+    // elevated test runner owns it as Administrators.
+    assert_dacl_owner_only(&run, true, true);
     assert_owner_only(&nested, true, false);
     assert_owner_only(&child, false, false);
     assert!(

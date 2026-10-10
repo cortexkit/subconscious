@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.33.1
+
+- Fix a route that `route.open` reported as open but that silently dropped the client's first requests. When a module answered the route bind very quickly, the daemon could commit the route and then, a moment later, also tell the module to drop it (a GOODBYE on the route's channel). The client got "accepted", the module logged `dropped module frame without a matching route binding cause=unbound_channel` for the client's requests, and the client waited forever for answers. The daemon now sends that GOODBYE only for a bind it really abandoned (the client went away, or the module began draining, before the module answered), and never for a route it committed. A bind the module acked for a client that had already gone still gets exactly one GOODBYE.
+
 ## 0.33.0
 
 - Enforce scope deadlines (`expires_at_ms`) on wall-clock time: an expired scope ends with every route under it closed as `scope_ended`, and is refused if resent. A route.open under a scope past its deadline is refused `scope_not_live` even before the next sweep. The expiry check runs only while some live scope has a deadline, so a daemon without deadlines never wakes for it.

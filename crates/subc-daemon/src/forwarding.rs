@@ -443,8 +443,34 @@ struct PendingRouteBindRelayEntry {
     /// compares it with the published tag.
     scope: Option<BoundScope>,
     deadline: Instant,
+    /// Set once `route.open` has finished putting the route.bind on the
+    /// module's egress queue. A path that drops this entry WITHOUT a module
+    /// reply (client teardown, module drain, the open's own abort) sends the
+    /// module a GOODBYE for the bind only when this is set, because only then
+    /// is the GOODBYE guaranteed to queue behind the bind. When it is not set,
+    /// the removal is recorded in `relays_released_before_enqueue` instead and
+    /// `route.open` sends that GOODBYE itself once its send has completed.
+    ///
+    /// A module reply does not consult it: an ack proves the module received
+    /// the bind, so the reply path decides about the GOODBYE on its own.
     relay_enqueued: bool,
     sender: oneshot::Sender<RouteBindRelayOutcome>,
+}
+
+/// What `mark_route_bind_relay_enqueued` found once `route.open` had put the
+/// route.bind on the module's queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RouteBindRelayMark {
+    /// The relay is still pending; later removals handle their own GOODBYE.
+    Marked,
+    /// The module already answered and the reply path settled the relay:
+    /// it committed the route, or it refused it and sent any GOODBYE the
+    /// module needed. `route.open` must send nothing.
+    SettledByReply,
+    /// The relay was dropped without a module reply while the bind was still
+    /// being queued, so nothing has told the module to drop the binding it
+    /// is about to create. `route.open` must send that GOODBYE.
+    ReleasedWithoutReply,
 }
 
 #[derive(Debug, Clone)]
@@ -510,6 +536,11 @@ struct ForwardingInner {
     module_to_client: HashMap<ModuleRouteKey, Arc<RouteBinding>>,
     status: HashMap<(ClientRouteKey, u32), String>,
     pending_relays: HashMap<(ModuleEndpointId, u64), PendingRouteBindRelayEntry>,
+    /// Pending relays removed without a module reply before `route.open`
+    /// marked them enqueued. `route.open` consumes its key when it marks the
+    /// relay (and sends the GOODBYE the removal could not send safely) or when
+    /// it aborts, so an entry lives only while that open is mid-send.
+    relays_released_before_enqueue: HashSet<(ModuleEndpointId, u64)>,
     /// Each scope's current `(scope_epoch, version)`, keyed `(owner, ref)`,
     /// published by a scope sync in the same step that changes the record. A
     /// bind commit reads it here so it never takes the scope table's lock
@@ -1359,17 +1390,32 @@ impl ForwardingTable {
         })
     }
 
+    /// Called by `route.open` right after the route.bind entered the module's
+    /// egress queue.
+    ///
+    /// The module reader runs concurrently with `route.open`, so a fast module
+    /// can receive the bind, ack it, and have the reader commit the route
+    /// before this runs. A missing entry therefore does not mean the bind was
+    /// abandoned: only a removal recorded in `relays_released_before_enqueue`
+    /// does. Telling the two apart is what stops `route.open` from sending a
+    /// GOODBYE for a route that was just committed.
     pub(crate) fn mark_route_bind_relay_enqueued(
         &self,
         endpoint: ModuleEndpointId,
         corr: u64,
-    ) -> Result<bool, ForwardingError> {
+    ) -> Result<RouteBindRelayMark, ForwardingError> {
         let mut inner = self.write_inner()?;
-        let Some(pending) = inner.pending_relays.get_mut(&(endpoint, corr)) else {
-            return Ok(false);
-        };
-        pending.relay_enqueued = true;
-        Ok(true)
+        if let Some(pending) = inner.pending_relays.get_mut(&(endpoint, corr)) {
+            pending.relay_enqueued = true;
+            return Ok(RouteBindRelayMark::Marked);
+        }
+        if inner
+            .relays_released_before_enqueue
+            .remove(&(endpoint, corr))
+        {
+            return Ok(RouteBindRelayMark::ReleasedWithoutReply);
+        }
+        Ok(RouteBindRelayMark::SettledByReply)
     }
 
     pub(crate) fn release_client_route(
@@ -1425,6 +1471,13 @@ impl ForwardingTable {
     ) -> Result<Option<GoodbyeTarget>, ForwardingError> {
         let mut inner = self.write_inner()?;
         let Some(pending) = inner.pending_relays.remove(&(endpoint, corr)) else {
+            // If another path dropped the relay while `route.open` was still
+            // sending the bind, and that open is now giving up without marking
+            // it (its send failed or it was cancelled), forget the record so it
+            // cannot outlive the open.
+            inner
+                .relays_released_before_enqueue
+                .remove(&(endpoint, corr));
             return Ok(None);
         };
         release_reserved_route_locked(
@@ -1586,10 +1639,10 @@ impl ForwardingTable {
                     pending.reservation.client_key,
                     pending.reservation.module_key,
                 );
-                let abandoned = pending
-                    .relay_enqueued
-                    .then(|| abandoned_route_target(&inner, &pending.reservation))
-                    .flatten();
+                // Not gated on `relay_enqueued`: an ack proves the module
+                // received the bind, and `route.open` sends nothing for a
+                // relay a reply already settled, so this is the only GOODBYE.
+                let abandoned = abandoned_route_target(&inner, &pending.reservation);
                 let _ = pending
                     .sender
                     .send(RouteBindRelayOutcome::ModuleGone(reason.to_string()));
@@ -2184,6 +2237,11 @@ fn begin_drain_locked(
                 if let Some(target) = abandoned_route_target(inner, &pending.reservation) {
                     abandoned_bindings.push(target);
                 }
+            } else {
+                // The bind may still be on its way into the module's queue;
+                // a GOODBYE sent now could overtake it. `route.open` sends
+                // it once its send completes.
+                inner.relays_released_before_enqueue.insert(key);
             }
             let _ = pending
                 .sender
@@ -2514,6 +2572,11 @@ impl ForwardingTable {
                 if let Some(target) = abandoned_route_target(inner, &pending.reservation) {
                     released.push(target);
                 }
+            } else {
+                // The bind may still be on its way into the module's queue;
+                // a GOODBYE sent now could overtake it. `route.open` sends
+                // it once its send completes.
+                inner.relays_released_before_enqueue.insert(key);
             }
             let _ = pending.sender.send(RouteBindRelayOutcome::ModuleGone(
                 "client connection closed during route.bind relay".to_string(),
@@ -3072,10 +3135,10 @@ fn commit_route_locked(
     // actually enters the queue, not when the slot was reserved.
     let client_writer_closed = pending.client_permit.send(pending.route_open_frame);
     if client_writer_closed {
-        let abandoned = pending
-            .relay_enqueued
-            .then(|| abandoned_route_target(inner, &reservation))
-            .flatten();
+        // Not gated on `relay_enqueued`: only a module ack reaches this
+        // commit, which proves the module holds the binding, and `route.open`
+        // sends nothing for a relay a reply already settled.
+        let abandoned = abandoned_route_target(inner, &reservation);
         if let Some(route) = inner.client_to_module.remove(&reservation.client_key) {
             route.flow.close();
         }
@@ -3218,10 +3281,21 @@ fn remove_module_connection_locked(
         .collect();
     let pending: Vec<_> = pending_keys
         .into_iter()
-        .filter_map(|key| inner.pending_relays.remove(&key))
+        .filter_map(|key| {
+            inner
+                .pending_relays
+                .remove(&key)
+                .map(|pending| (key, pending))
+        })
         .collect();
     let abandoned_relays = u32::try_from(pending.len()).unwrap_or(u32::MAX);
-    for pending in pending {
+    for (key, pending) in pending {
+        // Recorded like every other removal without a reply, so a `route.open`
+        // still sending the bind learns the relay was released rather than
+        // settled by the module.
+        if !pending.relay_enqueued {
+            inner.relays_released_before_enqueue.insert(key);
+        }
         let module_label = module_id.as_deref().unwrap_or("unknown");
         let _ = pending
             .sender
@@ -5125,9 +5199,12 @@ mod swap_slot_tests {
             .begin_route_bind_relay_for_test(early_client, early_sink, 1, MODULE_ID)
             .unwrap();
         assert_eq!(early.endpoint, fixture.incumbent);
-        assert!(forwarding
-            .mark_route_bind_relay_enqueued(early.endpoint, early.corr)
-            .unwrap());
+        assert_eq!(
+            forwarding
+                .mark_route_bind_relay_enqueued(early.endpoint, early.corr)
+                .unwrap(),
+            RouteBindRelayMark::Marked
+        );
 
         let cutover = forwarding.cutover_candidate(MODULE_ID).unwrap().unwrap();
         assert_eq!(

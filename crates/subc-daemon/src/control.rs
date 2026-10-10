@@ -330,6 +330,11 @@ pub struct ControlHandler {
     control_dispatch_delay: Option<Duration>,
     #[cfg(test)]
     provenance_probe_override: Option<subc_control::RunningImageAgreement>,
+    /// Holds `route.open` after the route.bind is queued to the module and
+    /// before it is marked enqueued, so a test can make the module's reply (or
+    /// a client teardown) land exactly inside that window.
+    #[cfg(test)]
+    route_bind_relay_sent_hold: Option<Arc<tokio::sync::Barrier>>,
 }
 
 impl fmt::Debug for ControlHandler {
@@ -816,6 +821,8 @@ impl ControlHandler {
             control_dispatch_delay: None,
             #[cfg(test)]
             provenance_probe_override: None,
+            #[cfg(test)]
+            route_bind_relay_sent_hold: None,
         }
     }
 
@@ -912,6 +919,18 @@ impl ControlHandler {
     #[cfg(test)]
     pub(crate) fn with_control_dispatch_delay(mut self, delay: Duration) -> Self {
         self.control_dispatch_delay = Some(delay);
+        self
+    }
+
+    /// `route.open` waits on `hold` twice after queueing a route.bind: once to
+    /// announce it is parked, once to be released. Build the barrier for two
+    /// parties, the test being the other one.
+    #[cfg(test)]
+    pub(crate) fn with_route_bind_relay_sent_hold(
+        mut self,
+        hold: Arc<tokio::sync::Barrier>,
+    ) -> Self {
+        self.route_bind_relay_sent_hold = Some(hold);
         self
     }
 
@@ -3975,10 +3994,24 @@ impl ControlHandler {
             )?]);
         }
 
-        if !self
+        #[cfg(test)]
+        if let Some(hold) = &self.route_bind_relay_sent_hold {
+            // First wait: tell the test the bind is queued. Second wait: stay
+            // here until the test has driven whatever it wants to happen
+            // between queueing the bind and marking it enqueued.
+            hold.wait().await;
+            hold.wait().await;
+        }
+
+        // A missing relay is not by itself an abandoned bind: the module may
+        // already have acked it and the route may be committed. Only a relay
+        // dropped without any module reply needs this GOODBYE; one a reply
+        // settled has already had its GOODBYE decided by the reply path.
+        if self
             .forwarding
             .mark_route_bind_relay_enqueued(endpoint, relay_corr)
             .map_err(RouterError::Forwarding)?
+            == crate::forwarding::RouteBindRelayMark::ReleasedWithoutReply
         {
             self.send_abandoned_route_bind_goodbye(
                 &module_sink,
@@ -8570,6 +8603,205 @@ mod tests {
             parse_error(&second_response[0])["code"],
             "target_unavailable"
         );
+    }
+
+    /// A handler whose `route.open` parks after queueing the route.bind and
+    /// before marking it enqueued, with module "aft" registered on connection
+    /// 40. Returns the two-party barrier that parks and releases it.
+    async fn route_open_held_after_bind_send() -> (
+        ControlHandler,
+        Arc<tokio::sync::Barrier>,
+        RouteCtx,
+        mpsc::Receiver<crate::router::OutboundFrame>,
+    ) {
+        let hold = Arc::new(tokio::sync::Barrier::new(2));
+        let handler = ControlHandler::with_forwarding(
+            Arc::new(Registry::default()),
+            Arc::new(ForwardingTable::default()),
+        )
+        .with_route_bind_relay_sent_hold(Arc::clone(&hold));
+        let (module_ctx, mut module_rx) = route_ctx(ConnectionId::new(40));
+        hello_via_sink(
+            &handler,
+            &module_ctx,
+            &mut module_rx,
+            hello_frame("aft", PROTOCOL_VERSION, 7),
+        )
+        .await;
+        (handler, hold, module_ctx, module_rx)
+    }
+
+    /// A fast module acks the route.bind, and the reader commits the route,
+    /// before `route.open` has marked the relay enqueued. The daemon used to
+    /// read the missing relay as an abandoned bind and send the module a
+    /// GOODBYE for the route it had just committed: the client was told its
+    /// route was open, the module unbound the channel, and the client's first
+    /// request was dropped on the module side as unbound.
+    #[tokio::test]
+    async fn bind_acked_before_the_enqueue_mark_commits_without_a_module_goodbye() {
+        let (handler, hold, module_ctx, mut module_rx) = route_open_held_after_bind_send().await;
+        let client = ConnectionId::new(41);
+        let (client_ctx, mut client_rx) = route_ctx(client);
+
+        let (open_task, bind) = relay_route_open(
+            &handler,
+            client,
+            &client_ctx.egress,
+            &mut module_rx,
+            200,
+            "aft",
+            "acked-before-mark",
+        )
+        .await;
+        let (module_channel, module_epoch) = route_bind_channel(&bind);
+        // route.open is now parked between queueing the bind and marking it.
+        hold.wait().await;
+
+        // The module answers inside that window, and the route commits.
+        assert!(handler
+            .handle_control_frame(&module_ctx, route_bind_ack(bind.header.corr))
+            .await
+            .unwrap()
+            .is_empty());
+        let (client_channel, client_epoch) = published_route(&client_rx.try_recv().unwrap().frame);
+
+        hold.wait().await;
+        assert!(
+            open_task.await.unwrap().is_empty(),
+            "route.open answers accepted"
+        );
+
+        // Every frame route.open could have sent is already queued, because it
+        // has returned; the module must have been sent nothing.
+        match module_rx.try_recv() {
+            Err(mpsc::error::TryRecvError::Empty) => {}
+            Ok(outbound) => panic!(
+                "module was sent {:?} on channel {} epoch {} for a route the daemon committed",
+                outbound.frame.header.ty,
+                outbound.frame.header.channel,
+                outbound.frame.header.epoch
+            ),
+            Err(err) => panic!("module egress closed: {err}"),
+        }
+
+        // The client's first request on the route is the next thing the module
+        // reads, on the binding it just created.
+        let router = Router::with_control_handler(Arc::new(handler.clone()));
+        let request = Frame::build(
+            FrameType::Request,
+            Flags::new(true, Priority::Interactive, false),
+            client_channel,
+            client_epoch,
+            201,
+            b"first request".to_vec(),
+        )
+        .unwrap();
+        router
+            .route_for_connection(&client_ctx, request)
+            .await
+            .unwrap();
+        let delivered = module_rx.try_recv().unwrap().frame;
+        assert_eq!(delivered.header.ty, FrameType::Request);
+        assert_eq!(
+            (delivered.header.channel, delivered.header.epoch),
+            (module_channel, module_epoch)
+        );
+        assert_eq!(delivered.body, b"first request");
+    }
+
+    /// The client goes away while `route.open` is still queueing the bind, so
+    /// the relay is dropped with no module reply. The teardown cannot send the
+    /// GOODBYE itself (it could reach the module ahead of the bind), so
+    /// `route.open` must send it once the bind is queued; otherwise the module
+    /// keeps a binding the daemon will never commit.
+    #[tokio::test]
+    async fn bind_released_before_the_enqueue_mark_still_sends_the_module_a_goodbye() {
+        let (handler, hold, _module_ctx, mut module_rx) = route_open_held_after_bind_send().await;
+        let client = ConnectionId::new(42);
+        let (client_ctx, _client_rx) = route_ctx(client);
+
+        let (open_task, bind) = relay_route_open(
+            &handler,
+            client,
+            &client_ctx.egress,
+            &mut module_rx,
+            300,
+            "aft",
+            "released-before-mark",
+        )
+        .await;
+        let (module_channel, module_epoch) = route_bind_channel(&bind);
+        hold.wait().await;
+
+        handler.cleanup_connection(client).unwrap();
+        assert!(
+            module_rx.try_recv().is_err(),
+            "client teardown must not GOODBYE a bind route.open is still queueing"
+        );
+
+        hold.wait().await;
+        let response = open_task.await.unwrap();
+        assert_eq!(response.len(), 1);
+        assert_eq!(parse_error(&response[0])["code"], "target_unavailable");
+
+        let goodbye = module_rx
+            .try_recv()
+            .expect("module is told to drop the binding the daemon abandoned")
+            .frame;
+        assert_eq!(goodbye.header.ty, FrameType::Goodbye);
+        assert_eq!(
+            (goodbye.header.channel, goodbye.header.epoch),
+            (module_channel, module_epoch)
+        );
+        assert!(module_rx.try_recv().is_err(), "exactly one GOODBYE");
+    }
+
+    /// The module acks inside the same window, but the client's egress closed
+    /// first, so the reader refuses to commit. The ack proves the module holds
+    /// the binding, so the reader sends the GOODBYE, and `route.open` must not
+    /// send a second one.
+    #[tokio::test]
+    async fn bind_acked_for_a_gone_client_before_the_enqueue_mark_sends_exactly_one_goodbye() {
+        let (handler, hold, module_ctx, mut module_rx) = route_open_held_after_bind_send().await;
+        let client = ConnectionId::new(43);
+        let (client_ctx, client_rx) = route_ctx(client);
+
+        let (open_task, bind) = relay_route_open(
+            &handler,
+            client,
+            &client_ctx.egress,
+            &mut module_rx,
+            400,
+            "aft",
+            "gone-client-before-mark",
+        )
+        .await;
+        let (module_channel, module_epoch) = route_bind_channel(&bind);
+        hold.wait().await;
+
+        drop(client_rx);
+        assert!(client_ctx.egress.is_closed());
+        handler
+            .handle_control_frame(&module_ctx, route_bind_ack(bind.header.corr))
+            .await
+            .unwrap();
+
+        hold.wait().await;
+        let response = open_task.await.unwrap();
+        assert_eq!(response.len(), 1);
+        assert_eq!(parse_error(&response[0])["code"], "target_unavailable");
+
+        let goodbye = module_rx
+            .try_recv()
+            .expect("module is told to drop the binding it acked")
+            .frame;
+        assert_eq!(goodbye.header.ty, FrameType::Goodbye);
+        assert_eq!(
+            (goodbye.header.channel, goodbye.header.epoch),
+            (module_channel, module_epoch)
+        );
+        assert!(module_rx.try_recv().is_err(), "exactly one GOODBYE");
+        assert_eq!(handler.forwarding.active_binding_count().unwrap(), 0);
     }
 
     /// The fence at the module-loop boundary, stated as its own contract: which

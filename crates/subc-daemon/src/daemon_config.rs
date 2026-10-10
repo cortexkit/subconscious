@@ -1438,7 +1438,9 @@ impl Error for DaemonConfigError {
 mod windows_run_dir_privacy_tests {
     use super::ensure_directory_private;
     use cortexkit_test_support::ScratchDir;
-    use subc_os::windows_acl::test_support::{assert_owner_only, grant_everyone};
+    use subc_os::windows_acl::test_support::{
+        assert_dacl_owner_only, assert_owner_only, grant_everyone,
+    };
 
     #[test]
     fn windows_run_dir_has_exact_protected_dacl_at_creation() {
@@ -1459,7 +1461,8 @@ mod windows_run_dir_privacy_tests {
         std::fs::write(&child, b"old log").unwrap();
         ensure_directory_private(&path).unwrap();
         assert_owner_only(&path, true, true);
-        assert_owner_only(&child, false, false);
+        // The file existed before narrowing, so only its access list changes.
+        assert_dacl_owner_only(&child, false, false);
     }
 }
 

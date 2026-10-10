@@ -453,7 +453,7 @@ checksum = "987f96b58d7a73a04dd34ffa7149f64c78914b1570a457e6c00cf0c7291aba1c"
 dependencies = [
  "rustix",
  "sha2",
- "subc-os 0.1.10 (registry+https://github.com/rust-lang/crates.io-index)",
+ "subc-os 0.1.10",
  "tokio",
 ]
 

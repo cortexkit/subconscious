@@ -505,9 +505,15 @@ async fn activity_real_daemon_stores_only_verified_route_actor() {
     assert_eq!(stored.actor.agent_id.as_deref(), Some("agent-1"));
     assert!(stored.actor.run_id.is_none());
     assert_eq!(stored.actor.flow_id.as_deref(), Some("flow-verified"));
+    // Windows canonicalizes to the verbatim `\\?\` form, while the route records
+    // the plain spelling; compare the roots with that prefix removed.
+    let plain = |path: std::path::PathBuf| {
+        let text = path.to_string_lossy().into_owned();
+        std::path::PathBuf::from(text.strip_prefix(r"\\?\").unwrap_or(&text))
+    };
     assert_eq!(
-        stored.actor.project_root,
-        Some(std::fs::canonicalize(project).unwrap())
+        stored.actor.project_root.map(plain),
+        Some(plain(std::fs::canonicalize(project).unwrap()))
     );
     let describe = Frame::build(
         FrameType::Request,

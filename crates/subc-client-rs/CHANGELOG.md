@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.27.2
+
+- Require the corrected Windows pipe reader and add a real supervised-module test asserting both daemon-observed and HELLO-declared `pipe` sources. Environment fallback can keep registration alive without making a broken pipe pass this test.
+
 ## 0.27.1
 
 - Expose module-declared bus events via the SDK's re-exported `CatalogEntry`, and verify SDK readback against a real daemon.

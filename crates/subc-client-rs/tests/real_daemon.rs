@@ -874,6 +874,18 @@ async fn clean_subc_client_rs_serves_through_real_daemon() {
 /// what tells the two apart.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_supervised_module_reads_its_launch_nonce_from_the_descriptor_and_hello_carries_it() {
+    assert_supervised_launch_nonce_delivery().await;
+}
+
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn windows_phase_one_supervised_module_reports_pipe_in_daemon_and_hello() {
+    // Environment fallback keeps startup available, so registration alone
+    // cannot prove the pipe works. Both independent live sources must be pipe.
+    assert_supervised_launch_nonce_delivery().await;
+}
+
+async fn assert_supervised_launch_nonce_delivery() {
     let workspace = workspace_root();
     let daemon_bin = ensure_binary(
         &workspace,

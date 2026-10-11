@@ -4,6 +4,7 @@ import {
   LaunchNonceCell, LaunchNonceError, readLaunchNoncePipe,
   launchNonce, launchNonceAsync, launchNonceOrUndefined, resetLaunchNonceForTests,
   SUBC_LAUNCH_NONCE_ENV, SUBC_LAUNCH_NONCE_PIPE_ENV,
+  SUBC_LAUNCH_NONCE_PIPE_FALLBACK_ENV,
 } from "../src/launch-nonce.js";
 
 function fakeSocket(run: (socket: Socket) => void): Socket {
@@ -104,6 +105,90 @@ describe("Windows launch nonce pipe reader", () => {
     const cell = new LaunchNonceCell((key) => key === SUBC_LAUNCH_NONCE_ENV ? "env-secret" : undefined, "linux");
     expect(await cell.getAsync()).toBe(cell.get());
     expect(cell.get()?.source).toBe("env");
+  });
+
+  test("phase_one_failed_pipe_uses_and_caches_the_explicit_environment_copy", async () => {
+    let reads = 0;
+    let sealed = false;
+    const env: Record<string, string> = {
+      [SUBC_LAUNCH_NONCE_PIPE_ENV]: "gone",
+      [SUBC_LAUNCH_NONCE_PIPE_FALLBACK_ENV]: "env",
+      [SUBC_LAUNCH_NONCE_ENV]: "phase-one-secret",
+    };
+    const cell = new LaunchNonceCell((key) => {
+      if (sealed) throw new Error("must not read environment after caching");
+      return env[key];
+    }, "win32", undefined, async () => {
+      reads += 1;
+      throw new LaunchNonceError("PipeNotOpen", "gone pipe");
+    });
+    const nonce = await cell.getAsync();
+    sealed = true;
+    expect(nonce?.value).toBe("phase-one-secret");
+    expect(nonce?.source).toBe("env");
+    expect(cell.get()).toBe(nonce);
+    expect(await cell.getAsync()).toBe(nonce);
+    expect(reads).toBe(1);
+  });
+
+  test("phase_one_matching_pipe_keeps_pipe_source_but_partial_bytes_use_env", async () => {
+    const env: Record<string, string> = {
+      [SUBC_LAUNCH_NONCE_PIPE_ENV]: "pipe",
+      [SUBC_LAUNCH_NONCE_PIPE_FALLBACK_ENV]: "env",
+      [SUBC_LAUNCH_NONCE_ENV]: "pipe-secret",
+    };
+    const matching = new LaunchNonceCell((key) => env[key], "win32", undefined,
+      async (name) => readLaunchNoncePipe(name, () => fakeSocket(succeeds)));
+    expect((await matching.getAsync())?.source).toBe("pipe");
+    const partial = new LaunchNonceCell((key) => env[key], "win32", undefined,
+      async () => ({ value: "pipe-", source: "pipe" }));
+    const nonce = await partial.getAsync();
+    expect(nonce?.source).toBe("env");
+    expect(nonce?.value).toBe("pipe-secret");
+  });
+
+  test("phase_one_sync_reader_retains_environment_startup_without_opening_pipe", async () => {
+    const env: Record<string, string> = {
+      [SUBC_LAUNCH_NONCE_PIPE_ENV]: "pipe",
+      [SUBC_LAUNCH_NONCE_PIPE_FALLBACK_ENV]: "env",
+      [SUBC_LAUNCH_NONCE_ENV]: "phase-one-secret",
+    };
+    const cell = new LaunchNonceCell((key) => env[key], "win32", undefined,
+      async () => { throw new Error("cached sync fallback must not open the pipe"); });
+    const nonce = cell.get();
+    expect(nonce?.source).toBe("env");
+    expect(nonce?.value).toBe("phase-one-secret");
+    expect(await cell.getAsync()).toBe(nonce);
+  });
+
+  test("phase_one_sync_fallback_winning_during_async_init_is_not_overwritten", async () => {
+    const env: Record<string, string> = {
+      [SUBC_LAUNCH_NONCE_PIPE_ENV]: "pipe",
+      [SUBC_LAUNCH_NONCE_PIPE_FALLBACK_ENV]: "env",
+      [SUBC_LAUNCH_NONCE_ENV]: "phase-one-secret",
+    };
+    let finish: (() => void) | undefined;
+    const cell = new LaunchNonceCell((key) => env[key], "win32", undefined,
+      () => new Promise((resolve) => { finish = () => resolve({ value: "phase-one-secret", source: "pipe" }); }));
+    const pending = cell.getAsync();
+    const nonce = cell.get();
+    expect(nonce?.source).toBe("env");
+    finish!();
+    expect(await pending).toBe(nonce);
+    expect(cell.get()).toBe(nonce);
+  });
+
+  test("pipe_fallback_requires_the_exact_marker_and_a_nonempty_environment_copy", async () => {
+    for (const [marker, copy] of [["true", "env-secret"], ["env", ""]]) {
+      const env: Record<string, string | undefined> = {
+        [SUBC_LAUNCH_NONCE_PIPE_ENV]: "gone",
+        [SUBC_LAUNCH_NONCE_PIPE_FALLBACK_ENV]: marker,
+        [SUBC_LAUNCH_NONCE_ENV]: copy,
+      };
+      const cell = new LaunchNonceCell((key) => env[key], "win32", undefined,
+        async () => { throw new LaunchNonceError("PipeNotOpen", "gone pipe"); });
+      expect(await cell.getAsync().catch(errorKind)).toBe("PipeNotOpen");
+    }
   });
 
   test.skipIf(process.platform !== "win32")("windows_net_connector_reads_real_named_pipe", async () => {

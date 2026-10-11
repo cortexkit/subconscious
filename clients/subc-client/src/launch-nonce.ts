@@ -34,6 +34,9 @@ export const SUBC_LAUNCH_NONCE_FD_ENV = "SUBC_LAUNCH_NONCE_FD";
 /** The one-time Windows pipe name. Its name is not a secret. */
 export const SUBC_LAUNCH_NONCE_PIPE_ENV = "SUBC_LAUNCH_NONCE_PIPE";
 
+/** Explicit daemon rollout permission (`env`) to retain environment startup. */
+export const SUBC_LAUNCH_NONCE_PIPE_FALLBACK_ENV = "SUBC_LAUNCH_NONCE_PIPE_FALLBACK";
+
 /** The descriptor number the daemon gives the pipe's read end in the module. */
 export const LAUNCH_NONCE_FD = 3;
 
@@ -50,7 +53,9 @@ export interface LaunchNonce {
  * Why the descriptor named by `SUBC_LAUNCH_NONCE_FD` gave no nonce. The names
  * are the Rust `LaunchNonceError` variants.
  *
- * None of these falls back to the environment copy. A named descriptor that
+ * These errors never fall back unless the Windows daemon explicitly sets
+ * `SUBC_LAUNCH_NONCE_PIPE_FALLBACK=env` while offering a nonempty environment copy.
+ * A named descriptor that
  * cannot be read means the handoff went wrong, or that this process inherited
  * the variable from a module without inheriting the pipe; reading the
  * environment instead would hide the first and defeat the second.
@@ -143,6 +148,10 @@ export function isLaunchNonceError(error: unknown): error is LaunchNonceError {
  *   names is taken only if it is a pipe with the named inode and holds bytes;
  *   it is then read to end of file and closed. Anything else throws and leaves
  *   the descriptor as it was, and never falls back to the environment.
+ * - Windows pipe reads use the async accessor. An uninitialized sync pipe
+ *   reader throws `PipeNeedsAsync`, except when the daemon explicitly permits
+ *   fallback with `SUBC_LAUNCH_NONCE_PIPE_FALLBACK=env`; then a sync reader
+ *   caches the environment copy.
  * - Otherwise the value of `SUBC_LAUNCH_NONCE` is used.
  *
  * It never changes `process.env`. Removing either variable would break any
@@ -175,7 +184,11 @@ export function launchNonceOrUndefined(): LaunchNonce | undefined {
 
 /** Initialize the Windows pipe, or use the synchronous Unix/environment reader.
  * Concurrent callers share one in-flight read and its cached result. After this
- * completes, synchronous accessors return that same result. Node's public pipe
+ * completes, synchronous accessors return that same result. With the daemon's
+ * explicit `SUBC_LAUNCH_NONCE_PIPE_FALLBACK=env` permission, failed or incomplete
+ * pipe reads cache the
+ * environment copy and its `env` source; unmarked readers stay fail-closed.
+ * Node's public pipe
  * API cannot request identification-level impersonation explicitly.
  */
 export async function launchNonceAsync(): Promise<LaunchNonce | undefined> {
@@ -271,7 +284,14 @@ export class LaunchNonceCell implements SharedLaunchNonceCell {
 
   result(): CachedResult {
     if (this.cached === undefined && this.platform === "win32" && this.lookup(SUBC_LAUNCH_NONCE_PIPE_ENV) !== undefined) {
-      throw new LaunchNonceError("PipeNeedsAsync", "call launchNonceAsync() before the synchronous reader when SUBC_LAUNCH_NONCE_PIPE is set");
+      const fallback = this.permittedPipeFallback();
+      if (fallback === undefined) {
+        throw new LaunchNonceError("PipeNeedsAsync", "call launchNonceAsync() before the synchronous reader when SUBC_LAUNCH_NONCE_PIPE is set");
+      }
+      // Legacy synchronous readers cannot use net.connect. Only the daemon's
+      // explicit fallback permission lets them retain environment startup while
+      // environment-only modules migrate to async pipe reads.
+      this.cached = { ok: true, nonce: fallback };
     }
     if (this.cached === undefined) this.cached = this.read();
     return this.cached;
@@ -282,14 +302,22 @@ export class LaunchNonceCell implements SharedLaunchNonceCell {
     if (this.pending !== undefined) return this.pending;
     const named = this.platform === "win32" ? this.lookup(SUBC_LAUNCH_NONCE_PIPE_ENV) : undefined;
     if (named === undefined) return this.result();
+    const fallback = this.permittedPipeFallback();
     this.pending = this.pipeReader(named).then(
-      (nonce): CachedResult => ({ ok: true, nonce }),
+      (nonce): CachedResult => ({ ok: true, nonce: fallback !== undefined && nonce.value !== fallback.value ? fallback : nonce }),
       (error: unknown): CachedResult => {
+        if (fallback !== undefined) return { ok: true, nonce: fallback };
         if (!isLaunchNonceError(error)) throw error;
         return { ok: false, error };
       },
-    ).then((result) => { this.cached = result; return result; });
+    ).then((result) => { this.cached ??= result; return this.cached; });
     return this.pending;
+  }
+
+  private permittedPipeFallback(): LaunchNonce | undefined {
+    if (this.lookup(SUBC_LAUNCH_NONCE_PIPE_FALLBACK_ENV) !== "env") return undefined;
+    const value = this.lookup(SUBC_LAUNCH_NONCE_ENV);
+    return value ? makeLaunchNonce(value, "env") : undefined;
   }
 
   async getAsync(): Promise<LaunchNonce | undefined> {

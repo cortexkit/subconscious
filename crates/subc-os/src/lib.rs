@@ -60,7 +60,7 @@ pub mod windows_acl;
 pub use launch_nonce::LaunchNonceHandoff;
 pub use launch_nonce::{
     launch_nonce, LaunchNonce, LaunchNonceError, LaunchNonceSource, LAUNCH_NONCE_ENV,
-    LAUNCH_NONCE_FD, LAUNCH_NONCE_FD_ENV, LAUNCH_NONCE_PIPE_ENV,
+    LAUNCH_NONCE_FD, LAUNCH_NONCE_FD_ENV, LAUNCH_NONCE_PIPE_ENV, LAUNCH_NONCE_PIPE_FALLBACK_ENV,
 };
 
 #[cfg(windows)]

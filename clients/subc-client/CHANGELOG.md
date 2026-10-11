@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.21.4
+
+- Respect explicit `SUBC_LAUNCH_NONCE_PIPE_FALLBACK=env` rollout permission: async readers still prefer the pipe, but failed or incomplete delivery caches the environment copy and its `env` source. Sync readers may use that explicitly permitted copy before async initialization; whichever cache result is established first remains stable.
+- Unmarked Windows pipes still fail without environment fallback, including `PipeNeedsAsync` before initialization. Unix descriptor behavior is unchanged. Remove the fallback permission when dropping the environment copy in a later release; fallback does not improve same-user isolation or let Node request identification-level impersonation.
+
 ## 0.21.3
 
 - Add optional declared bus events to `CatalogEntry`, mirroring the module manifest so consumers can inspect publishers through `catalog.list`.

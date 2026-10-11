@@ -18,8 +18,8 @@ use std::{
 use windows_sys::Win32::{
     Foundation::{
         LocalFree, ERROR_ACCESS_DENIED, ERROR_BROKEN_PIPE, ERROR_IO_PENDING, ERROR_PIPE_BUSY,
-        ERROR_PIPE_CONNECTED, ERROR_SEM_TIMEOUT, GENERIC_READ, HANDLE, INVALID_HANDLE_VALUE,
-        WAIT_OBJECT_0, WAIT_TIMEOUT,
+        ERROR_PIPE_CONNECTED, ERROR_PIPE_NOT_CONNECTED, ERROR_SEM_TIMEOUT, GENERIC_READ, HANDLE,
+        INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
     },
     Security::Cryptography::{BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG},
     Security::{
@@ -29,8 +29,9 @@ use windows_sys::Win32::{
         GetTokenInformation, TokenUser, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
     },
     Storage::FileSystem::{
-        CreateFileW, ReadFile, WriteFile, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED,
-        OPEN_EXISTING, PIPE_ACCESS_OUTBOUND, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT,
+        CreateFileW, FlushFileBuffers, ReadFile, WriteFile, FILE_FLAG_FIRST_PIPE_INSTANCE,
+        FILE_FLAG_OVERLAPPED, OPEN_EXISTING, PIPE_ACCESS_OUTBOUND, SECURITY_IDENTIFICATION,
+        SECURITY_SQOS_PRESENT,
     },
     System::{
         Pipes::{
@@ -41,7 +42,7 @@ use windows_sys::Win32::{
             CreateEventW, GetCurrentProcess, OpenProcess, OpenProcessToken, WaitForSingleObject,
             PROCESS_SYNCHRONIZE,
         },
-        IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED},
+        IO::{CancelIoEx, CancelSynchronousIo, GetOverlappedResult, OVERLAPPED},
     },
 };
 
@@ -157,7 +158,7 @@ impl LaunchNoncePipeHandoff {
         process: &OwnedHandle,
         deadline: Instant,
         cancelled: &AtomicBool,
-        consumed: &OnceLock<()>,
+        consumed: &Arc<OnceLock<()>>,
     ) -> io::Result<()> {
         let handle = self.pipe.as_raw_handle();
         loop {
@@ -176,11 +177,13 @@ impl LaunchNoncePipeHandoff {
                 match error.raw_os_error() {
                     Some(code) if code == ERROR_PIPE_CONNECTED as i32 => {}
                     Some(code) if code == ERROR_IO_PENDING as i32 => {
+                        operation.pending = true;
                         operation.wait(deadline, Some(process), Some(cancelled))?;
                     }
                     _ => return Err(error),
                 }
             }
+            drop(operation);
             let mut client_pid = 0;
             // SAFETY: connected server handle and valid writable output pointer.
             let matches = unsafe { GetNamedPipeClientProcessId(handle, &mut client_pid) } != 0
@@ -196,14 +199,13 @@ impl LaunchNoncePipeHandoff {
                 continue;
             }
             let mut operation = Operation::new(handle)?;
-            let mut written = 0;
             // SAFETY: nonce and OVERLAPPED remain alive through wait and cancellation.
             let result = unsafe {
                 WriteFile(
                     handle,
                     self.nonce.as_ptr(),
                     self.nonce.len() as u32,
-                    &mut written,
+                    null_mut(),
                     &mut operation.overlapped,
                 )
             };
@@ -211,13 +213,16 @@ impl LaunchNoncePipeHandoff {
                 if io::Error::last_os_error().raw_os_error() != Some(ERROR_IO_PENDING as i32) {
                     return Err(io::Error::last_os_error());
                 }
-                written = operation.wait(deadline, Some(process), Some(cancelled))?;
+                operation.pending = true;
             }
+            // Overlapped byte counts come from GetOverlappedResult, including
+            // operations that completed before WriteFile returned.
+            let written = operation.wait(deadline, Some(process), Some(cancelled))?;
             if written as usize != self.nonce.len() {
                 return Err(io::Error::other("short launch nonce pipe write"));
             }
-            let _ = consumed.set(());
-            return Ok(());
+            drop(operation);
+            return flush_delivery(self.pipe, process, deadline, cancelled, consumed.clone());
         }
     }
 }
@@ -238,6 +243,69 @@ impl LaunchNoncePipeDelivery {
 impl Drop for LaunchNoncePipeDelivery {
     fn drop(&mut self) {
         self.cancelled.store(true, Ordering::Release);
+    }
+}
+
+fn flush_delivery(
+    pipe: OwnedHandle,
+    process: &OwnedHandle,
+    deadline: Instant,
+    cancelled: &AtomicBool,
+    consumed: Arc<OnceLock<()>>,
+) -> io::Result<()> {
+    // Write completion only means Windows buffered the nonce. Flush waits for
+    // the client to drain it before disconnect/close can discard unread bytes:
+    // https://learn.microsoft.com/en-us/windows/win32/ipc/named-pipe-operations.
+    // FlushFileBuffers is synchronous even on an overlapped handle. Give it a
+    // dedicated thread so cancellation cannot target unrelated daemon I/O.
+    let flush = std::thread::Builder::new()
+        .name("launch-nonce-flush".into())
+        .spawn(move || {
+            // SAFETY: this thread uniquely owns the live server pipe handle.
+            let result = if unsafe { FlushFileBuffers(pipe.as_raw_handle()) } == 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                // Publish before EOF lets the child register, so provenance
+                // cannot observe an environment source after a successful read.
+                let _ = consumed.set(());
+                Ok(())
+            };
+            // SAFETY: the flush has finished; no asynchronous operation still
+            // uses the handle. A failed flush deliberately abandons delivery.
+            unsafe { DisconnectNamedPipe(pipe.as_raw_handle()) };
+            result
+        })?;
+
+    let mut wait_error = None;
+    while !flush.is_finished() {
+        // SAFETY: JoinHandle owns a live thread handle until join below.
+        match unsafe { WaitForSingleObject(flush.as_raw_handle(), POLL.as_millis() as u32) } {
+            WAIT_OBJECT_0 => break,
+            WAIT_TIMEOUT => {}
+            _ => {
+                wait_error = Some(io::Error::last_os_error());
+                std::thread::sleep(POLL);
+            }
+        }
+        // SAFETY: process stays live through this borrowed synchronize handle.
+        if wait_error.is_some()
+            || Instant::now() >= deadline
+            || cancelled.load(Ordering::Acquire)
+            || unsafe { WaitForSingleObject(process.as_raw_handle(), 0) } == WAIT_OBJECT_0
+        {
+            // Repeat cancellation until the worker exits: it might not have
+            // entered FlushFileBuffers when the first request was made.
+            // SAFETY: this is the dedicated flush thread, not a reusable pool
+            // thread; its only blocking I/O is on the launch pipe.
+            unsafe { CancelSynchronousIo(flush.as_raw_handle()) };
+        }
+    }
+    let result = flush
+        .join()
+        .map_err(|_| io::Error::other("launch nonce flush thread panicked"))?;
+    match wait_error {
+        Some(error) => Err(error),
+        None => result,
     }
 }
 
@@ -339,6 +407,7 @@ struct Operation {
     handle: HANDLE,
     overlapped: OVERLAPPED,
     _event: OwnedHandle,
+    pending: bool,
 }
 
 impl Operation {
@@ -353,6 +422,7 @@ impl Operation {
             handle,
             overlapped,
             _event: event,
+            pending: false,
         })
     }
 
@@ -376,6 +446,7 @@ impl Operation {
             // SAFETY: event belongs to this operation and remains live.
             match unsafe { WaitForSingleObject(self.overlapped.hEvent, POLL.as_millis() as u32) } {
                 WAIT_OBJECT_0 => {
+                    self.pending = false;
                     let mut transferred = 0;
                     // SAFETY: the signaled event means the OVERLAPPED has completed.
                     if unsafe {
@@ -395,6 +466,11 @@ impl Operation {
 
 impl Drop for Operation {
     fn drop(&mut self) {
+        // ERROR_PIPE_CONNECTED and immediate EOF do not submit an operation.
+        // Their events need not be signaled, so joining them could wait forever.
+        if !self.pending {
+            return;
+        }
         // SAFETY: cancellation names only this operation; joining it keeps all
         // caller buffers alive until Windows has stopped using their pointers.
         unsafe {
@@ -410,12 +486,16 @@ fn timeout() -> io::Error {
 }
 
 pub(super) fn read_pipe(name: &OsStr) -> Cached {
+    read_open_pipe(open_pipe(name)?)
+}
+
+fn open_pipe(name: &OsStr) -> Result<OwnedHandle, LaunchNonceError> {
     let path = wide(name);
     if path.len() <= 1 || path[..path.len() - 1].contains(&0) {
         return Err(LaunchNonceError::PipeNotOpen { errno: 123 });
     }
     let open_deadline = Instant::now() + OPEN_WINDOW;
-    let pipe = loop {
+    loop {
         // SAFETY: valid name, no inheritance, read-only access. Identification
         // security quality of service lets the server inspect identity but not
         // impersonate this process's token, even if the server is counterfeit.
@@ -431,7 +511,7 @@ pub(super) fn read_pipe(name: &OsStr) -> Cached {
             )
         });
         match result {
-            Ok(pipe) => break pipe,
+            Ok(pipe) => return Ok(pipe),
             Err(error)
                 if error.raw_os_error() == Some(ERROR_PIPE_BUSY as i32)
                     && Instant::now() < open_deadline =>
@@ -444,37 +524,40 @@ pub(super) fn read_pipe(name: &OsStr) -> Cached {
                 })
             }
         }
-    };
+    }
+}
+
+fn read_open_pipe(pipe: OwnedHandle) -> Cached {
     let deadline = Instant::now() + READ_WINDOW;
     let mut bytes = Vec::new();
     loop {
         let mut chunk = [0u8; 256];
         let mut operation = Operation::new(pipe.as_raw_handle()).map_err(pipe_unreadable)?;
-        let mut read = 0;
         // SAFETY: chunk/OVERLAPPED stay live through completion and cancellation.
         let result = unsafe {
             ReadFile(
                 pipe.as_raw_handle(),
                 chunk.as_mut_ptr(),
                 chunk.len() as u32,
-                &mut read,
+                null_mut(),
                 &mut operation.overlapped,
             )
         };
         if result == 0 {
             let error = io::Error::last_os_error();
-            if error.raw_os_error() == Some(ERROR_BROKEN_PIPE as i32) {
+            if pipe_eof(&error) {
                 break;
             }
             if error.raw_os_error() != Some(ERROR_IO_PENDING as i32) {
                 return Err(pipe_unreadable(error));
             }
-            match operation.wait(deadline, None, None) {
-                Ok(count) => read = count,
-                Err(error) if error.raw_os_error() == Some(ERROR_BROKEN_PIPE as i32) => break,
-                Err(error) => return Err(pipe_unreadable(error)),
-            }
+            operation.pending = true;
         }
+        let read = match operation.wait(deadline, None, None) {
+            Ok(count) => count,
+            Err(error) if pipe_eof(&error) => break,
+            Err(error) => return Err(pipe_unreadable(error)),
+        };
         if read == 0 {
             break;
         }
@@ -493,6 +576,10 @@ pub(super) fn read_pipe(name: &OsStr) -> Cached {
     }))
 }
 
+fn pipe_eof(error: &io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(code) if code == ERROR_BROKEN_PIPE as i32 || code == ERROR_PIPE_NOT_CONNECTED as i32)
+}
+
 fn pipe_unreadable(error: io::Error) -> LaunchNonceError {
     LaunchNonceError::PipeUnreadable {
         errno: error.raw_os_error(),
@@ -504,6 +591,7 @@ mod tests {
     use super::*;
     use crate::launch_nonce::{
         launch_nonce, LaunchNonceCell, LAUNCH_NONCE_ENV, LAUNCH_NONCE_PIPE_ENV,
+        LAUNCH_NONCE_PIPE_FALLBACK_ENV,
     };
     use std::process::{Command, Stdio};
 
@@ -591,13 +679,23 @@ mod tests {
             .env("SUBC_PIPE_TEST_CHILD", "1")
             .env(LAUNCH_NONCE_PIPE_ENV, pipe.name())
             .env(LAUNCH_NONCE_ENV, "environment-copy")
+            .env_remove(LAUNCH_NONCE_PIPE_FALLBACK_ENV)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .unwrap()
     }
 
-    fn assert_child_reads(child: std::process::Child, evidence: &OnceLock<()>) {
+    fn assert_child_reads(mut child: std::process::Child, evidence: &OnceLock<()>) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while child.try_wait().unwrap().is_none() {
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("child did not finish its bounded pipe handoff");
+            }
+            std::thread::sleep(POLL);
+        }
         let output = child.wait_with_output().unwrap();
         assert!(
             output.status.success(),
@@ -667,6 +765,214 @@ mod tests {
         });
         assert!(matches!(result, Err(LaunchNonceError::PipeNotOpen { .. })));
         assert_eq!(cell.get(|_| panic!("must use cached failure")), result);
+    }
+
+    #[test]
+    fn windows_phase_one_gone_pipe_uses_and_caches_the_environment_source() {
+        let name = LaunchNoncePipeHandoff::new("secret")
+            .unwrap()
+            .name()
+            .to_owned();
+        let cell = LaunchNonceCell::new();
+        let result = cell
+            .get(|key| match key {
+                LAUNCH_NONCE_PIPE_ENV => Some(name.clone().into()),
+                LAUNCH_NONCE_PIPE_FALLBACK_ENV => Some("env".into()),
+                LAUNCH_NONCE_ENV => Some("environment-secret".into()),
+                _ => None,
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.value(), "environment-secret");
+        assert_eq!(result.source(), LaunchNonceSource::Env);
+        assert_eq!(
+            cell.get(|_| panic!("must use cached fallback")),
+            Ok(Some(result))
+        );
+    }
+}
+
+#[cfg(test)]
+mod buffered_delivery_tests {
+    use super::*;
+    use crate::launch_nonce::{
+        launch_nonce, LAUNCH_NONCE_ENV, LAUNCH_NONCE_PIPE_ENV, LAUNCH_NONCE_PIPE_FALLBACK_ENV,
+    };
+    use std::{
+        path::{Path, PathBuf},
+        process::{Child, Command, Stdio},
+    };
+    use windows_sys::Win32::System::Pipes::PeekNamedPipe;
+
+    struct Gates(PathBuf);
+    impl Gates {
+        fn new() -> Self {
+            let name = random_name().unwrap();
+            let root = std::env::temp_dir().join(format!(
+                "subc-pipe-gates-{}",
+                name.rsplit('-').next().unwrap()
+            ));
+            std::fs::create_dir(&root).unwrap();
+            Self(root)
+        }
+        fn path(&self, name: &str) -> PathBuf {
+            self.0.join(name)
+        }
+    }
+    impl Drop for Gates {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn wait_for(path: &Path) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !path.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "pipe child did not reach {}",
+                path.display()
+            );
+            std::thread::sleep(POLL);
+        }
+    }
+
+    #[test]
+    fn windows_buffered_pipe_child_fixture() {
+        let Some(root) = std::env::var_os("SUBC_PIPE_GATES") else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        let name = std::env::var_os(LAUNCH_NONCE_PIPE_ENV).unwrap();
+        let pipe = open_pipe(&name).unwrap();
+        std::fs::write(root.join("connected"), b"ready").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let mut available = 0;
+            // SAFETY: this is the live read-only client handle, and only the
+            // byte-count output is requested; no credential bytes leave it.
+            assert_ne!(
+                unsafe {
+                    PeekNamedPipe(
+                        pipe.as_raw_handle(),
+                        null_mut(),
+                        0,
+                        null_mut(),
+                        &mut available,
+                        null_mut(),
+                    )
+                },
+                0
+            );
+            if available != 0 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "server never buffered the nonce");
+            std::thread::sleep(POLL);
+        }
+        std::fs::write(root.join("buffered"), b"ready").unwrap();
+        while !root.join("read").exists() {
+            let mut available = 0;
+            // SAFETY: same live client handle and byte-count-only query as above.
+            if unsafe {
+                PeekNamedPipe(
+                    pipe.as_raw_handle(),
+                    null_mut(),
+                    0,
+                    null_mut(),
+                    &mut available,
+                    null_mut(),
+                )
+            } == 0
+            {
+                assert!(
+                    pipe_eof(&io::Error::last_os_error()),
+                    "unexpected pipe failure"
+                );
+                drop(pipe);
+                let nonce = launch_nonce().unwrap().unwrap();
+                assert_eq!(nonce.source(), LaunchNonceSource::Env);
+                println!("child-env:{}", nonce.value());
+                std::fs::write(root.join("closed"), b"ready").unwrap();
+                return;
+            }
+            assert!(Instant::now() < deadline, "reader gate was not opened");
+            std::thread::sleep(POLL);
+        }
+        let nonce = read_open_pipe(pipe).unwrap().unwrap();
+        assert_eq!(nonce.source(), LaunchNonceSource::Pipe);
+        println!("child-pipe:{}", nonce.value());
+    }
+
+    fn spawn_buffered_reader(
+        pipe: &LaunchNoncePipeHandoff,
+        gates: &Gates,
+        fallback: bool,
+    ) -> Child {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["launch_nonce::windows::buffered_delivery_tests::windows_buffered_pipe_child_fixture", "--exact", "--nocapture"])
+            .env("SUBC_PIPE_GATES", &gates.0)
+            .env(LAUNCH_NONCE_PIPE_ENV, pipe.name())
+            .env_remove(LAUNCH_NONCE_PIPE_FALLBACK_ENV)
+            .env_remove(LAUNCH_NONCE_ENV)
+            .stdout(Stdio::piped()).stderr(Stdio::piped());
+        if fallback {
+            command
+                .env(LAUNCH_NONCE_PIPE_FALLBACK_ENV, "env")
+                .env(LAUNCH_NONCE_ENV, "test-secret");
+        }
+        command.spawn().unwrap()
+    }
+
+    #[test]
+    fn windows_client_connected_first_is_drained_before_consumption_and_eof() {
+        let gates = Gates::new();
+        let pipe = LaunchNoncePipeHandoff::new("test-secret").unwrap();
+        let mut child = spawn_buffered_reader(&pipe, &gates, false);
+        wait_for(&gates.path("connected"));
+        let delivery = pipe.serve(child.id(), Duration::from_secs(5)).unwrap();
+        wait_for(&gates.path("buffered"));
+        assert!(
+            delivery.consumed().get().is_none(),
+            "buffering bytes is not client consumption"
+        );
+        std::fs::write(gates.path("read"), b"ready").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while child.try_wait().unwrap().is_none() {
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                panic!("connected-first reader did not reach EOF");
+            }
+            std::thread::sleep(POLL);
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("child-pipe:test-secret"));
+        assert!(delivery.consumed().get().is_some());
+    }
+
+    #[test]
+    fn windows_flush_deadline_closes_pipe_without_reporting_consumption() {
+        let gates = Gates::new();
+        let pipe = LaunchNoncePipeHandoff::new("test-secret").unwrap();
+        let child = spawn_buffered_reader(&pipe, &gates, true);
+        wait_for(&gates.path("connected"));
+        let delivery = pipe.serve(child.id(), Duration::from_secs(1)).unwrap();
+        wait_for(&gates.path("buffered"));
+        wait_for(&gates.path("closed"));
+        assert!(delivery.consumed().get().is_none());
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("child-env:test-secret"));
     }
 }
 

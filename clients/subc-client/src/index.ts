@@ -97,6 +97,7 @@ export {
   LAUNCH_NONCE_FD,
   SUBC_LAUNCH_NONCE_FD_ENV,
   SUBC_LAUNCH_NONCE_PIPE_ENV,
+  SUBC_LAUNCH_NONCE_PIPE_FALLBACK_ENV,
   type LaunchNonce,
   type LaunchNonceErrorKind,
   type LaunchNonceSource,

@@ -11,7 +11,8 @@
 //!
 //! Windows uses a one-time named pipe authenticated to the direct child's PID.
 //! The daemon still sets the Windows environment copy for readers that have
-//! not adopted the pipe; a named pipe takes precedence and never falls back.
+//! not adopted the pipe. `SUBC_LAUNCH_NONCE_PIPE_FALLBACK=env` explicitly permits
+//! environment startup when delivery fails; unmarked readers remain fail-closed.
 
 use std::{
     ffi::OsString,
@@ -31,6 +32,11 @@ pub const LAUNCH_NONCE_FD_ENV: &str = "SUBC_LAUNCH_NONCE_FD";
 
 /// Names the one-time Windows pipe. Its name is public, not a credential.
 pub const LAUNCH_NONCE_PIPE_ENV: &str = "SUBC_LAUNCH_NONCE_PIPE";
+
+/// Explicit Windows rollout permission to use the environment copy if pipe
+/// delivery fails. The daemon sets this to `env` while environment-only modules
+/// migrate to pipe reads; it must be removed with the environment copy.
+pub const LAUNCH_NONCE_PIPE_FALLBACK_ENV: &str = "SUBC_LAUNCH_NONCE_PIPE_FALLBACK";
 
 /// The environment copy of the nonce, kept only while modules move to the
 /// descriptor. Same name as `subc_protocol::SUBC_LAUNCH_NONCE_ENV`; this crate
@@ -92,7 +98,9 @@ impl fmt::Debug for LaunchNonce {
 
 /// Why a named launch-nonce handoff gave no nonce.
 ///
-/// None of these falls back to the environment copy. A named descriptor or pipe
+/// These errors never fall back unless a Windows daemon explicitly permits
+/// an environment copy via [`LAUNCH_NONCE_PIPE_FALLBACK_ENV`].
+/// A named descriptor or pipe
 /// that cannot be read means the handoff went wrong, or that this process
 /// inherited the variable from a module without inheriting the pipe; reading
 /// the environment instead would hide a failed handoff or admit a descendant
@@ -227,7 +235,10 @@ static PROCESS_NONCE: LaunchNonceCell = LaunchNonceCell::new();
 ///   falls back to the environment.
 /// - On Windows, when [`LAUNCH_NONCE_PIPE_ENV`] is set, the named pipe is opened
 ///   read-only at identification impersonation level and read to EOF with a
-///   bounded deadline. Errors are cached and never fall back.
+///   bounded deadline. Without explicit fallback permission, errors are cached
+///   and never fall back. When [`LAUNCH_NONCE_PIPE_FALLBACK_ENV`] is `env` and
+///   a nonempty environment copy exists, failed or incomplete delivery instead
+///   caches that copy and its `env` source. A matching complete read stays `pipe`.
 /// - Otherwise the value of [`LAUNCH_NONCE_ENV`] is used.
 /// - `Ok(None)` means no handoff is named (or the environment copy is empty): the
 ///   process was not started by the daemon.
@@ -250,7 +261,14 @@ fn read_launch_nonce(
 ) -> Cached {
     #[cfg(windows)]
     if let Some(value) = lookup(LAUNCH_NONCE_PIPE_ENV) {
-        return windows::read_pipe(&value);
+        let fallback = if lookup(LAUNCH_NONCE_PIPE_FALLBACK_ENV).as_deref()
+            == Some(std::ffi::OsStr::new("env"))
+        {
+            environment_nonce(lookup(LAUNCH_NONCE_ENV))
+        } else {
+            None
+        };
+        return pipe_or_permitted_env(windows::read_pipe(&value), fallback);
     }
     #[cfg(unix)]
     if let Some(value) = lookup(LAUNCH_NONCE_FD_ENV) {
@@ -258,13 +276,30 @@ fn read_launch_nonce(
     }
     #[cfg(not(unix))]
     let _ = descriptor_reads;
-    Ok(lookup(LAUNCH_NONCE_ENV)
+    Ok(environment_nonce(lookup(LAUNCH_NONCE_ENV)))
+}
+
+fn environment_nonce(value: Option<OsString>) -> Option<LaunchNonce> {
+    value
         .and_then(|value| value.into_string().ok())
         .filter(|value| !value.is_empty())
         .map(|value| LaunchNonce {
             value,
             source: LaunchNonceSource::Env,
-        }))
+        })
+}
+
+#[cfg(any(windows, test))]
+fn pipe_or_permitted_env(pipe: Cached, fallback: Option<LaunchNonce>) -> Cached {
+    let Some(fallback) = fallback else {
+        return pipe;
+    };
+    match &pipe {
+        Ok(Some(nonce)) if nonce.value() == fallback.value() => pipe,
+        // A truncated but valid UTF-8 read is not a successful handoff. When
+        // fallback is permitted, both transports carry the same nonce, so compare them too.
+        _ => Ok(Some(fallback)),
+    }
 }
 
 #[cfg(unix)]
@@ -528,3 +563,56 @@ mod unix {
 
 #[cfg(test)]
 pub(crate) mod tests;
+
+#[cfg(test)]
+mod pipe_rollout_tests {
+    use super::*;
+
+    fn nonce(value: &str, source: LaunchNonceSource) -> LaunchNonce {
+        LaunchNonce {
+            value: value.to_owned(),
+            source,
+        }
+    }
+
+    #[test]
+    fn phase_one_pipe_failure_uses_the_permitted_environment_source() {
+        let result = pipe_or_permitted_env(
+            Err(LaunchNonceError::PipeEmpty),
+            Some(nonce("env-secret", LaunchNonceSource::Env)),
+        );
+        let value = result.unwrap().unwrap();
+        assert_eq!(value.value(), "env-secret");
+        assert_eq!(value.source(), LaunchNonceSource::Env);
+    }
+
+    #[test]
+    fn phase_one_partial_pipe_nonce_uses_the_permitted_environment_source() {
+        let result = pipe_or_permitted_env(
+            Ok(Some(nonce("partial", LaunchNonceSource::Pipe))),
+            Some(nonce("env-secret", LaunchNonceSource::Env)),
+        );
+        let value = result.unwrap().unwrap();
+        assert_eq!(value.value(), "env-secret");
+        assert_eq!(value.source(), LaunchNonceSource::Env);
+    }
+
+    #[test]
+    fn phase_one_complete_pipe_nonce_keeps_the_pipe_source() {
+        let result = pipe_or_permitted_env(
+            Ok(Some(nonce("same-secret", LaunchNonceSource::Pipe))),
+            Some(nonce("same-secret", LaunchNonceSource::Env)),
+        );
+        let value = result.unwrap().unwrap();
+        assert_eq!(value.value(), "same-secret");
+        assert_eq!(value.source(), LaunchNonceSource::Pipe);
+    }
+
+    #[test]
+    fn strict_pipe_failure_without_permission_stays_an_error() {
+        assert_eq!(
+            pipe_or_permitted_env(Err(LaunchNonceError::PipeEmpty), None),
+            Err(LaunchNonceError::PipeEmpty)
+        );
+    }
+}

@@ -1304,7 +1304,10 @@ impl Default for SpawnEventState {
 }
 
 #[derive(Debug, Clone, Default)]
-struct SpawnEventFeed(Arc<Mutex<SpawnEventState>>);
+struct SpawnEventFeed(
+    Arc<Mutex<SpawnEventState>>,
+    #[cfg(test)] Arc<Mutex<Option<std::net::TcpStream>>>,
+);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SpawnSubscribeRefusal {
@@ -6182,16 +6185,12 @@ async fn supervise_loop(
                         Ok(status) => classify_reaped_child_exit(&snapshot, active_child, &status),
                         Err(err) => {
                             active_child.drain_stderr(&spec.module_id).await;
-                            fail_snapshot(&snapshot, Some(&spec.module_id), None);
-                            // Every other exit path (on_child_exit's Clean/Crash arms,
-                            // the reload-registration-failure path) records a terminal
-                            // before moving on. Without one here, a module whose wait()
-                            // itself errored (e.g. already reaped) leaves no terminal
-                            // record at all -- an empty ring reads as "nothing died".
-                            record_wait_error_terminal(
+                            fail_after_wait_error(
                                 &spec.module_id,
+                                &snapshot,
                                 &runtime.terminal_ring,
                                 &runtime.spawn_events,
+                                format!("failed to wait for supervised module: {err}"),
                             );
                             untrack_if_registration_released(
                                 &process_liveness,
@@ -7092,20 +7091,27 @@ async fn on_child_exit(
                 exit_signal = ?exit_report.signal,
                 "supervised module exited cleanly"
             );
-            if let Err(err) = update_snapshot(snapshot, Some(&spec.module_id), |state| {
-                state.state = ModuleState::Stopped;
-                clear_current_process_facts(state);
-                state.last_exit = Some(exit_report.clone());
-            }) {
-                error!(module_id = %spec.module_id, error = %err, "failed to record clean module exit");
-            }
-            record_terminal(
+            if let Err(err) = publish_after_terminal_record(
                 &spec.module_id,
-                terminal_ring,
-                spawn_events,
-                &exit_report,
-                TerminalDisposition::Stopped,
-            );
+                || {
+                    record_terminal(
+                        &spec.module_id,
+                        terminal_ring,
+                        spawn_events,
+                        &exit_report,
+                        TerminalDisposition::Stopped,
+                    )
+                },
+                || {
+                    update_snapshot(snapshot, Some(&spec.module_id), |state| {
+                        state.state = ModuleState::Stopped;
+                        clear_current_process_facts(state);
+                        state.last_exit = Some(exit_report.clone());
+                    })
+                },
+            ) {
+                error!(module_id = %spec.module_id, error = %err, "failed to publish clean module exit");
+            }
             let registration_released = match wait_for_registration_release(
                 registry,
                 &spec.module_id,
@@ -7141,6 +7147,7 @@ async fn on_child_exit(
             }
             let mut restart_schedule = None;
             let mut disposition = TerminalDisposition::Disabled;
+            let mut final_state = ModuleState::Disabled;
             // Set only when the budget is what stopped the module, so the
             // terminal record says which limit was hit rather than leaving
             // `failed` to be read as "crashed once, badly".
@@ -7149,14 +7156,13 @@ async fn on_child_exit(
                 .and_then(|mut state| state.spawn_failure.take());
             let now = Instant::now();
             if let Err(err) = update_snapshot(snapshot, Some(&spec.module_id), |state| {
-                clear_current_process_facts(state);
-                state.last_exit = Some(exit_report.clone());
                 if state.enabled {
                     if let Some(schedule) = state.next_crash_restart(&policy, now) {
-                        state.state = ModuleState::Restarting;
+                        final_state = ModuleState::Restarting;
                         restart_schedule = Some(schedule);
                         disposition = TerminalDisposition::Restarting;
                     } else {
+                        final_state = ModuleState::Failed;
                         disposition = TerminalDisposition::Failed;
                         let budget = policy.budget_exhausted_detail();
                         disposition_detail =
@@ -7166,7 +7172,6 @@ async fn on_child_exit(
                             ));
                     }
                 } else {
-                    state.state = ModuleState::Disabled;
                     disposition = TerminalDisposition::Disabled;
                 }
             }) {
@@ -7188,40 +7193,27 @@ async fn on_child_exit(
                     policy.budget_exhausted_detail()
                 );
             }
-            let budget_exhausted = disposition == TerminalDisposition::Failed;
-            let record_exit = || {
-                record_terminal_with_detail(
-                    &spec.module_id,
-                    terminal_ring,
-                    spawn_events,
-                    &exit_report,
-                    disposition,
-                    disposition_detail,
-                );
-            };
-            if budget_exhausted {
-                // Publish Failed only after its terminal record is available.
-                // Recording takes the event-feed lock, then ring -> journal
-                // writer (with file I/O), all without the hot snapshot lock.
-                // No lock is held when the final snapshot update runs, nor
-                // across the registration-release await below. Commands and
-                // health actions run on this same supervisor task, so none can
-                // act on the old state during the write; process facts already
-                // say the child is dead to concurrent liveness readers.
-                // A journal error is retained in history, not returned. If
-                // recording panics, still publish Failed before resuming the
-                // original unwind rather than leaving a dead child Running.
-                let recorded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(record_exit));
-                if let Err(err) = update_snapshot(snapshot, Some(&spec.module_id), |state| {
-                    state.state = ModuleState::Failed;
-                }) {
-                    error!(module_id = %spec.module_id, error = %err, "failed to publish exhausted restart budget");
-                }
-                if let Err(panic) = recorded {
-                    std::panic::resume_unwind(panic);
-                }
-            } else {
-                record_exit();
+            if let Err(err) = publish_after_terminal_record(
+                &spec.module_id,
+                || {
+                    record_terminal_with_detail(
+                        &spec.module_id,
+                        terminal_ring,
+                        spawn_events,
+                        &exit_report,
+                        disposition,
+                        disposition_detail,
+                    )
+                },
+                || {
+                    update_snapshot(snapshot, Some(&spec.module_id), |state| {
+                        state.state = final_state;
+                        clear_current_process_facts(state);
+                        state.last_exit = Some(exit_report.clone());
+                    })
+                },
+            ) {
+                error!(module_id = %spec.module_id, error = %err, "failed to publish crashed module exit");
             }
 
             if let Some(schedule) = restart_schedule {
@@ -7254,32 +7246,45 @@ async fn on_child_exit(
                 exit_signal = ?exit_report.signal,
                 "supervised module exited after deliberate connection severance"
             );
-            let mut should_restart = false;
-            let mut disposition = TerminalDisposition::Disabled;
-            if let Err(err) = update_snapshot(snapshot, Some(&spec.module_id), |state| {
-                clear_current_process_facts(state);
-                state.last_exit = Some(exit_report.clone());
-                state.lifetime_restarts += 1;
-                if state.enabled {
-                    state.state = ModuleState::Restarting;
-                    should_restart = true;
-                    disposition = TerminalDisposition::Restarting;
-                } else {
-                    state.state = ModuleState::Disabled;
+            let should_restart = match lock_snapshot(snapshot) {
+                Ok(state) => state.enabled,
+                Err(err) => {
+                    error!(module_id = %spec.module_id, error = %err, "failed to read deliberately severed module state");
+                    return NextAction::Stop {
+                        registration_released: false,
+                    };
                 }
-            }) {
-                error!(module_id = %spec.module_id, error = %err, "failed to record deliberately severed module exit");
+            };
+            let final_state = if should_restart {
+                ModuleState::Restarting
+            } else {
+                ModuleState::Disabled
+            };
+            if let Err(err) = publish_after_terminal_record(
+                &spec.module_id,
+                || {
+                    record_terminal(
+                        &spec.module_id,
+                        terminal_ring,
+                        spawn_events,
+                        &exit_report,
+                        terminal_disposition(final_state),
+                    )
+                },
+                || {
+                    update_snapshot(snapshot, Some(&spec.module_id), |state| {
+                        state.state = final_state;
+                        clear_current_process_facts(state);
+                        state.last_exit = Some(exit_report.clone());
+                        state.lifetime_restarts += 1;
+                    })
+                },
+            ) {
+                error!(module_id = %spec.module_id, error = %err, "failed to publish deliberately severed module exit");
                 return NextAction::Stop {
                     registration_released: false,
                 };
             }
-            record_terminal(
-                &spec.module_id,
-                terminal_ring,
-                spawn_events,
-                &exit_report,
-                disposition,
-            );
 
             if should_restart {
                 NextAction::Restart { schedule: None }
@@ -7320,20 +7325,27 @@ async fn on_child_exit_during_daemon_shutdown(
         exit_kind = ?exit_report.kind,
         "supervised module exited during daemon shutdown; not restarting it"
     );
-    if let Err(err) = update_snapshot(snapshot, Some(&spec.module_id), |state| {
-        state.state = ModuleState::Stopped;
-        clear_current_process_facts(state);
-        state.last_exit = Some(exit_report.clone());
-    }) {
-        error!(module_id = %spec.module_id, error = %err, "failed to record module exit during daemon shutdown");
-    }
-    record_terminal(
+    if let Err(err) = publish_after_terminal_record(
         &spec.module_id,
-        terminal_ring,
-        spawn_events,
-        &exit_report,
-        TerminalDisposition::DaemonShutdown,
-    );
+        || {
+            record_terminal(
+                &spec.module_id,
+                terminal_ring,
+                spawn_events,
+                &exit_report,
+                TerminalDisposition::DaemonShutdown,
+            )
+        },
+        || {
+            update_snapshot(snapshot, Some(&spec.module_id), |state| {
+                state.state = ModuleState::Stopped;
+                clear_current_process_facts(state);
+                state.last_exit = Some(exit_report.clone());
+            })
+        },
+    ) {
+        error!(module_id = %spec.module_id, error = %err, "failed to publish module exit during daemon shutdown");
+    }
     let registration_released =
         wait_for_registration_release(registry, &spec.module_id, REGISTRY_RELEASE_TIMEOUT)
             .await
@@ -7343,6 +7355,52 @@ async fn on_child_exit_during_daemon_shutdown(
     }
 }
 
+// Keep the status lock out of terminal I/O. Readers may observe the previous
+// state while recording is in progress, but never a completed exit without its
+// history. Journal errors are logged by the journal and retained in the ring;
+// a recording panic still publishes the final state before resuming the unwind.
+fn publish_after_terminal_record<T>(
+    module_id: &str,
+    record: impl FnOnce(),
+    publish: impl FnOnce() -> T,
+) -> T {
+    let recorded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(record));
+    let published = publish();
+    if let Err(panic) = recorded {
+        error!(
+            module_id,
+            "terminal recording panicked; published final state before resuming unwind"
+        );
+        std::panic::resume_unwind(panic);
+    }
+    published
+}
+
+fn fail_after_wait_error(
+    module_id: &str,
+    snapshot: &SharedSnapshot,
+    terminal_ring: &Arc<Mutex<TerminalRing>>,
+    spawn_events: &SpawnEventFeed,
+    detail: String,
+) {
+    let report = wait_error_exit_report();
+    publish_after_terminal_record(
+        module_id,
+        || {
+            record_terminal_with_detail(
+                module_id,
+                terminal_ring,
+                spawn_events,
+                &report,
+                TerminalDisposition::Failed,
+                Some(detail),
+            )
+        },
+        || fail_snapshot(snapshot, Some(module_id), Some(report.clone())),
+    );
+}
+
+#[cfg(test)]
 fn record_wait_error_terminal(
     module_id: &str,
     terminal_ring: &Arc<Mutex<TerminalRing>>,
@@ -7396,6 +7454,8 @@ fn record_terminal_with_detail(
     disposition: TerminalDisposition,
     disposition_detail: Option<String>,
 ) {
+    #[cfg(test)]
+    terminal_history_tests::before_terminal_record(spawn_events);
     spawn_events.emit_exited(module_id, exit_report.code, exit_report.signal);
     let record = TerminalRecord {
         exit_code: exit_report.code,
@@ -9342,7 +9402,13 @@ async fn drain_child_to_state(
     let exit_report = match timeout(drain_timeout, child.wait()).await {
         Ok(Ok(status)) => classify_reaped_child_exit(snapshot, &child, &status),
         Ok(Err(source)) => {
-            fail_snapshot(snapshot, Some(module_id), None);
+            fail_after_wait_error(
+                module_id,
+                snapshot,
+                terminal_ring,
+                spawn_events,
+                format!("failed to wait during drain: {source}"),
+            );
             return Err(SuperviseError::Wait {
                 module_id: module_id.to_string(),
                 source,
@@ -9370,14 +9436,26 @@ async fn drain_child_to_state(
                 "drain budget expired before the module exited; killing it"
             );
             child.start_kill().map_err(|source| {
-                fail_snapshot(snapshot, Some(module_id), None);
+                fail_after_wait_error(
+                    module_id,
+                    snapshot,
+                    terminal_ring,
+                    spawn_events,
+                    format!("failed to kill during drain: {source}"),
+                );
                 SuperviseError::Kill {
                     module_id: module_id.to_string(),
                     source,
                 }
             })?;
             let status = child.wait().await.map_err(|source| {
-                fail_snapshot(snapshot, Some(module_id), None);
+                fail_after_wait_error(
+                    module_id,
+                    snapshot,
+                    terminal_ring,
+                    spawn_events,
+                    format!("failed to wait after drain kill: {source}"),
+                );
                 SuperviseError::Wait {
                     module_id: module_id.to_string(),
                     source,
@@ -9387,26 +9465,33 @@ async fn drain_child_to_state(
         }
     };
 
-    update_snapshot(snapshot, Some(module_id), |state| {
-        state.state = final_state;
-        if let Some(enabled) = enabled {
-            state.enabled = enabled;
-        }
-        clear_current_process_facts(state);
-        state.last_exit = Some(exit_report.clone());
-        if exit_report.kind == ExitKind::DeliberateSeverance {
-            state.lifetime_restarts += 1;
-        }
-    })?;
     let detail = lock_snapshot(snapshot)?.drain_disposition_detail.take();
-    record_terminal_with_detail(
+    publish_after_terminal_record(
         module_id,
-        terminal_ring,
-        spawn_events,
-        &exit_report,
-        terminal_disposition(final_state),
-        detail,
-    );
+        || {
+            record_terminal_with_detail(
+                module_id,
+                terminal_ring,
+                spawn_events,
+                &exit_report,
+                terminal_disposition(final_state),
+                detail,
+            )
+        },
+        || {
+            update_snapshot(snapshot, Some(module_id), |state| {
+                state.state = final_state;
+                if let Some(enabled) = enabled {
+                    state.enabled = enabled;
+                }
+                clear_current_process_facts(state);
+                state.last_exit = Some(exit_report.clone());
+                if exit_report.kind == ExitKind::DeliberateSeverance {
+                    state.lifetime_restarts += 1;
+                }
+            })
+        },
+    )?;
     child.drain_stderr(module_id).await;
 
     release_dead_registration(registry, forwarding, snapshot, module_id).await
@@ -10628,6 +10713,7 @@ mod terminal_history_tests {
 
     #[test]
     fn restart_budget_failure_is_published_after_its_terminal_record() {
+        use std::io::{Read, Write};
         let supervisor = Supervisor::new_for_test(
             Arc::new(Registry::default()),
             RestartPolicy::new(0, Duration::ZERO),
@@ -10641,14 +10727,10 @@ mod terminal_history_tests {
             ModuleState::Running,
             true,
         )));
+        lock_snapshot(&snapshot).unwrap().process_alive = true;
         let reaped_snapshot = snapshot.clone();
-        let events = runtime.spawn_events.clone();
+        let mut barrier = terminal_record_barrier(&runtime.spawn_events);
         let history = runtime.terminal_ring.clone();
-
-        // Exit recording takes the event-feed lock before the history lock.
-        // Holding it pauses the writer after choosing a disposition but before
-        // recording history, without assuming anything about scheduler timing.
-        let before_record = events.0.lock().unwrap();
         let reap = std::thread::spawn(move || {
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -10670,19 +10752,15 @@ mod terminal_history_tests {
                     },
                 ))
         });
-        // The deadline bounds a hung writer only; last_exit is the handshake.
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let before_state = loop {
+        let mut reached = [0];
+        barrier.read_exact(&mut reached).unwrap();
+        assert_eq!(&reached, b"R");
+        let (before_state, before_alive) = {
             let state = lock_snapshot(&snapshot).unwrap();
-            if state.last_exit.is_some() {
-                break state.state;
-            }
-            drop(state);
-            assert!(Instant::now() < deadline, "exit decision was not reached");
-            std::thread::yield_now();
+            (state.state, state.process_alive)
         };
         let before_history = history.lock().unwrap().snapshot();
-        drop(before_record);
+        barrier.write_all(b"X").unwrap();
         assert!(matches!(reap.join().unwrap(), NextAction::Stop { .. }));
         assert!(before_history.entries.is_empty());
         assert_ne!(
@@ -10690,11 +10768,297 @@ mod terminal_history_tests {
             ModuleState::Failed,
             "Failed was visible before its terminal record could be written"
         );
+        assert!(before_alive);
         assert_eq!(lock_snapshot(&snapshot).unwrap().state, ModuleState::Failed);
         let history = history.lock().unwrap().snapshot();
         assert_eq!(history.entries.len(), 1);
         assert_eq!(history.entries[0].exit_code, Some(0));
         assert_eq!(history.entries[0].disposition, TerminalDisposition::Failed);
+    }
+
+    fn terminal_record_barrier(events: &super::SpawnEventFeed) -> std::net::TcpStream {
+        use std::net::{TcpListener, TcpStream};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let writer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (barrier, _) = listener.accept().unwrap();
+        for stream in [&writer, &barrier] {
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+        }
+        *events.1.lock().unwrap() = Some(writer);
+        barrier
+    }
+
+    pub(super) fn before_terminal_record(events: &super::SpawnEventFeed) {
+        use std::io::{Read, Write};
+        let barrier = events.1.lock().unwrap().take();
+        if let Some(mut barrier) = barrier {
+            barrier.write_all(b"R").unwrap();
+            let mut release = [0];
+            barrier.read_exact(&mut release).unwrap();
+            assert_eq!(&release, b"X");
+        }
+    }
+
+    #[test]
+    fn health_restart_budget_failure_is_published_after_its_terminal_record() {
+        use std::io::{Read, Write};
+
+        let supervisor = Supervisor::new_for_test(
+            Arc::new(Registry::default()),
+            RestartPolicy::new(0, Duration::ZERO),
+        );
+        let mut runtime = supervisor.runtime_config();
+        let module = module_with_recovery_snapshot(ModuleState::Running, true, 0);
+        let snapshot = module.inner.snapshot.clone();
+        runtime.terminal_ring = module.inner.terminal_ring.clone();
+        let spec = ModuleSpec {
+            module_id: module.module_id().into(),
+            program: fake_aft_stub_path(),
+            protocol: ModuleProtocol::None,
+            env: vec![("FAKE_AFT_EXIT_CODE".into(), "17".into())],
+            ..windowed_crash_spec(module.module_id())
+        };
+        let mut barrier = terminal_record_barrier(&runtime.spawn_events);
+        let reap = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let mut child =
+                        Some(spawn_and_mark_running(&spec, &runtime, &snapshot).unwrap());
+                    health_restart_child(
+                        &spec,
+                        &runtime,
+                        &supervisor.registry,
+                        &supervisor.process_liveness,
+                        &snapshot,
+                        &mut child,
+                        SupervisorHealthStatus::Failing,
+                        Some("health probe did not answer"),
+                        1,
+                    )
+                    .await
+                    .unwrap();
+                    assert!(child.is_none());
+                });
+        });
+        // The loopback barrier acknowledges entry into terminal recording by
+        // health_restart_child's drain, then waits for the test's release byte.
+        // Status and history are observed while that writer is held, not after
+        // an elapsed-time guess about when the health action has completed.
+        let mut reached = [0];
+        barrier.read_exact(&mut reached).unwrap();
+        assert_eq!(&reached, b"R");
+        let before_status = module.status().unwrap();
+        let before_history = module.terminal_history();
+        barrier.write_all(b"X").unwrap();
+        reap.join().unwrap();
+        assert!(before_history.entries.is_empty());
+        assert_ne!(
+            before_status.state,
+            ModuleState::Failed,
+            "Failed was visible before its terminal record could be written"
+        );
+        assert!(
+            before_status.process_alive,
+            "process death was visible before its terminal record could be written"
+        );
+        let failed = module.status().unwrap();
+        assert_eq!(failed.state, ModuleState::Failed);
+        assert!(!failed.process_alive);
+        let history = module.terminal_history();
+        assert_eq!(history.entries.len(), 1);
+        assert_eq!(history.entries[0].disposition, TerminalDisposition::Failed);
+        assert_eq!(
+            history.entries[0].disposition_detail.as_deref(),
+            Some("crash budget exhausted: max_restarts=0 within window_secs=600")
+        );
+    }
+
+    #[test]
+    fn observed_exits_publish_process_death_after_terminal_history() {
+        use std::io::{Read, Write};
+        for (kind, enabled, shutdown, wait_error, expected_state) in [
+            (ExitKind::Clean, true, false, false, ModuleState::Stopped),
+            (ExitKind::Crash, true, false, false, ModuleState::Restarting),
+            (ExitKind::Crash, false, false, false, ModuleState::Disabled),
+            (
+                ExitKind::DeliberateSeverance,
+                true,
+                false,
+                false,
+                ModuleState::Restarting,
+            ),
+            #[cfg(unix)]
+            (ExitKind::Crash, true, true, false, ModuleState::Stopped),
+            (ExitKind::Crash, true, false, true, ModuleState::Failed),
+        ] {
+            let supervisor = Supervisor::new_for_test(
+                Arc::new(Registry::default()),
+                RestartPolicy::new(1, Duration::ZERO),
+            );
+            let runtime = supervisor.runtime_config();
+            #[cfg(unix)]
+            if shutdown {
+                runtime.child_roster.close();
+            }
+            #[cfg(not(unix))]
+            let _ = shutdown;
+            let spec = windowed_crash_spec("exit-publication-order");
+            let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::new(
+                ModuleState::Running,
+                enabled,
+            )));
+            lock_snapshot(&snapshot).unwrap().process_alive = true;
+            let reaped_snapshot = snapshot.clone();
+            let history = runtime.terminal_ring.clone();
+            let mut barrier = terminal_record_barrier(&runtime.spawn_events);
+            let reap = std::thread::spawn(move || {
+                if wait_error {
+                    super::fail_after_wait_error(
+                        &spec.module_id,
+                        &reaped_snapshot,
+                        &runtime.terminal_ring,
+                        &runtime.spawn_events,
+                        "wait failed".into(),
+                    );
+                } else {
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap()
+                        .block_on(on_child_exit(
+                            &spec,
+                            runtime.restart_policy,
+                            &supervisor.registry,
+                            &reaped_snapshot,
+                            &runtime.terminal_ring,
+                            &runtime.spawn_events,
+                            &runtime.child_roster,
+                            ExitReport {
+                                kind,
+                                code: Some(0),
+                                signal: None,
+                                at_ms: 1,
+                            },
+                        ));
+                }
+            });
+            let mut reached = [0];
+            barrier.read_exact(&mut reached).unwrap();
+            assert_eq!(&reached, b"R");
+            let before_alive = lock_snapshot(&snapshot).unwrap().process_alive;
+            let before_history = history.lock().unwrap().snapshot();
+            barrier.write_all(b"X").unwrap();
+            reap.join().unwrap();
+            assert!(
+                before_alive,
+                "{kind:?}: death was published before recording"
+            );
+            assert!(before_history.entries.is_empty());
+            assert_eq!(lock_snapshot(&snapshot).unwrap().state, expected_state);
+            assert!(!lock_snapshot(&snapshot).unwrap().process_alive);
+            assert_eq!(history.lock().unwrap().snapshot().entries.len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn health_restart_budget_failure_remains_failed_when_journal_append_fails() {
+        let dir = cortexkit_test_support::ScratchDir::new("health-budget-journal-failure");
+        let path = dir.join("terminals.jsonl");
+        std::fs::create_dir(&path).unwrap();
+        let supervisor = Supervisor::new_for_test(
+            Arc::new(Registry::default()),
+            RestartPolicy::new(0, Duration::ZERO),
+        )
+        .with_terminal_journal(path, "health-budget-journal-failure".into());
+        let runtime = supervisor.runtime_config();
+        let spec = ModuleSpec {
+            program: fake_aft_stub_path(),
+            protocol: ModuleProtocol::None,
+            env: vec![("FAKE_AFT_EXIT_CODE".into(), "17".into())],
+            ..windowed_crash_spec("health-budget-journal-failure")
+        };
+        let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
+        let mut child = Some(spawn_and_mark_running(&spec, &runtime, &snapshot).unwrap());
+        health_restart_child(
+            &spec,
+            &runtime,
+            &supervisor.registry,
+            &supervisor.process_liveness,
+            &snapshot,
+            &mut child,
+            SupervisorHealthStatus::Failing,
+            None,
+            1,
+        )
+        .await
+        .unwrap();
+        assert_eq!(lock_snapshot(&snapshot).unwrap().state, ModuleState::Failed);
+        assert!(!lock_snapshot(&snapshot).unwrap().process_alive);
+        let history = runtime
+            .terminal_ring
+            .lock()
+            .unwrap()
+            .durable_history(&spec.module_id);
+        assert!(history.journal_write_failures > 0);
+        assert_eq!(history.entries.len(), 1);
+        assert_eq!(history.entries[0].disposition, TerminalDisposition::Failed);
+    }
+
+    #[test]
+    fn health_restart_budget_failure_remains_failed_when_exit_recording_panics() {
+        let supervisor = Supervisor::new_for_test(
+            Arc::new(Registry::default()),
+            RestartPolicy::new(0, Duration::ZERO),
+        );
+        let runtime = supervisor.runtime_config();
+        let spec = ModuleSpec {
+            program: fake_aft_stub_path(),
+            protocol: ModuleProtocol::None,
+            env: vec![("FAKE_AFT_EXIT_CODE".into(), "17".into())],
+            ..windowed_crash_spec("health-budget-recording-panic")
+        };
+        let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let mut child =
+                        Some(spawn_and_mark_running(&spec, &runtime, &snapshot).unwrap());
+                    runtime.spawn_events.0.lock().unwrap().seq = u64::MAX;
+                    health_restart_child(
+                        &spec,
+                        &runtime,
+                        &supervisor.registry,
+                        &supervisor.process_liveness,
+                        &snapshot,
+                        &mut child,
+                        SupervisorHealthStatus::Failing,
+                        None,
+                        1,
+                    )
+                    .await
+                    .unwrap();
+                });
+        }));
+        let panic = result.expect_err("recording must still unwind");
+        assert_eq!(
+            panic.downcast_ref::<String>().map(String::as_str),
+            Some("spawn event sequence exhausted")
+        );
+        let state = lock_snapshot(&snapshot).unwrap();
+        assert_eq!(state.state, ModuleState::Failed);
+        assert!(!state.process_alive);
+        assert!(state.last_exit.is_some());
     }
 
     #[tokio::test]

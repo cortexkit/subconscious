@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.20.78
+
+- Require the health-triggered restart test to find exactly one terminal record immediately after observing a failed, reaped module. It then checks that the record names the exhausted restart budget and that enabling the module starts it again. An ordering violation now fails explicitly rather than indexing an empty history.
+
 ## 0.20.77
 
 - Show daemon-observed Windows launch-nonce sources in module list, status and provenance alongside the running-image and resource reports. Update exact CLI expectations for the Windows `pipe` column and lines; Unix output stays unchanged when the observation is absent.

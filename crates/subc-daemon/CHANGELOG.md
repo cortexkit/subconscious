@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.33.8
+
+- Record terminal history before publishing a health-budget failure or clearing the reaped child's process facts. Apply the same ordering to every child-bearing drain, ordinary exit and daemon-shutdown exit; failed waits and drain teardown errors record their unknown exit before publishing failure. Journal errors still retain the exit record in memory and publish the requested stopped, disabled, restarting or failed state. A panic during terminal recording also publishes that state before resuming the unwind. No-child spawn failures remain failures without fabricated exit records.
+- Add a test-only socket barrier at the terminal writer to prove health-budget and ordinary exits cannot publish failure or process death before history is available, plus health-budget journal-error and recording-panic coverage.
+
 ## 0.33.7
 
 - Give each Windows module process a separate named pipe, including a replacement started alongside a still-serving module. Before writing the nonce, the server requires the connected process's PID to equal the PID returned when the daemon spawned that module. Keep `SUBC_LAUNCH_NONCE` and `SUBC_LAUNCH_NONCE_PIPE_FALLBACK=env` until every module reads the pipe, so failed pipe preparation or delivery does not prevent registration. Only after the client reads every byte does the daemon record `pipe` in `supervisor.list` and `supervisor.provenance` under `daemon_observed.launch_nonce_source`; module list/status displays that record.

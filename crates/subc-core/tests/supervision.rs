@@ -223,6 +223,11 @@ async fn health_budget_exhaustion_is_failed_with_budget_detail_and_start_revives
     assert_eq!(failed.state, ModuleState::Failed);
     assert!(failed.enabled);
     let history = module.terminal_history();
+    assert_eq!(
+        history.entries.len(),
+        1,
+        "Failed status must publish its terminal record before becoming visible"
+    );
     assert_eq!(history.entries[0].disposition, TerminalDisposition::Failed);
     assert_eq!(
         history.entries[0].disposition_detail.as_deref(),

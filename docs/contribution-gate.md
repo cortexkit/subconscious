@@ -34,12 +34,10 @@ by naming its branch after a maintainer one. They are path prefixes rather than
 substrings: a branch simply named `train` is an ordinary branch.
 
 It runs on `pull_request_target`, so it has the base repository's context and
-its secrets. Two tokens do the work. A CK CI App token posts the comment and
-converts the pull request back to draft, which is what makes those writes work
-on a fork pull request. The `design-gate` check run — the one output branch
-protection actually reads — is published with the calling job's own
-`GITHUB_TOKEN`, so publishing the required check does not depend on the App's
-checks permission. The App needs `issues: write` to create missing labels.
+its secrets, though the gate reads none. Every write uses the calling job's
+own `GITHUB_TOKEN`: the comment, the conversion back to draft, and the
+`design-gate` check run, the one output branch protection actually reads.
+Under `pull_request_target` that token can write even on a fork pull request.
 
 ## What a repository adds
 
@@ -64,9 +62,6 @@ jobs:
       pull-requests: write # gate comment, draft conversion, ready for review
       checks: write # publish the design-gate check run
     uses: cortexkit/subconscious/.github/workflows/design-gate.yml@master
-    secrets:
-      CK_CI_APP_ID: ${{ secrets.CK_CI_APP_ID }}
-      CK_CI_APP_PRIVATE_KEY: ${{ secrets.CK_CI_APP_PRIVATE_KEY }}
 ```
 
 The triggers live in the caller because a reusable workflow cannot add any.
@@ -84,8 +79,7 @@ do.
 
 The `permissions:` block is an obligation rather than a knob, and `checks:
 write` is the half worth understanding. The gate publishes the `design-gate`
-check run with the calling job's own `GITHUB_TOKEN`, so that the blocking path
-needs no App checks permission — but a called workflow can only
+check run with the calling job's own `GITHUB_TOKEN` — but a called workflow can only
 narrow the scopes its caller grants, never widen them, and a repository whose
 default workflow permissions are read-only grants none of them by default.
 Withhold `checks: write` and the publish is refused; the gate fails closed, so
@@ -97,27 +91,21 @@ event arm runs lives inside the reusable workflow rather than in an `if:` in
 the caller, so a repository cannot switch the gate off by leaving a condition
 out.
 
-### 2. The two secrets
+### 2. No secrets
 
-| Secret | What it is |
-| --- | --- |
-| `CK_CI_APP_ID` | App id of the CK CI GitHub App |
-| `CK_CI_APP_PRIVATE_KEY` | That app's private key |
+The gate holds no credential beyond the calling job's own `GITHUB_TOKEN`, and
+the caller passes no secrets. Under `pull_request_target` that token carries
+the write scopes the caller grants even on pull requests from forks (the
+`pull_request` trigger is the one whose token is read-only there), so it can
+post the gate comment, convert a pull request to draft and publish the check
+run. Keep it that way: the gate runs in public repositories, and an App private
+key reachable from a `pull_request_target` job there is one bug away from
+exposing every repository that App can read.
 
-Both are declared `required: true` on `on.workflow_call.secrets`, so a caller
-that forgets one fails when the workflow is parsed rather than part-way through
-the run at the token mint step. That is why the template passes them explicitly
-instead of using `secrets: inherit`.
-
-The app needs Issues: write to create missing gate labels on pull request runs,
-and pull request write for the gate's PR updates. It does not need checks
-write: the check run is published with the caller's own `GITHUB_TOKEN`, not
-with the app token. That split is deliberate. A run can
-read the permissions a workflow grants — they are in the file above — but
-nothing in a run can read an app installation's permissions back, because that
-query needs the app's own credentials. Leaving the fail-closed publish on the
-app token would have made every pull request's mergeability depend on a
-setting nobody at the keyboard could check.
+The reusable workflow still declares `CK_CI_APP_ID` and
+`CK_CI_APP_PRIVATE_KEY` as optional and ignores them, only so that callers
+which still pass them keep parsing while they move off them. Those
+declarations go once no caller passes them.
 
 ### 3. The two labels
 
@@ -126,12 +114,11 @@ setting nobody at the keyboard could check.
 | `design-approved` | issues | a maintainer, once the design is agreed |
 | `trivial` | pull requests | a maintainer, when there is no design to agree |
 
-On pull request runs the gate creates both labels if they are missing, using
-the CK CI App token; existing labels are left as-is. The App needs Issues:
-write for this. If label creation is refused, the gate logs a warning and
-continues evaluating the PR, with a note in the gate comment when it posts
-one. Without that App permission, create the labels by hand once. The caller's `issues: read` grant
-is sufficient: the issue-labeled arm does not create labels.
+Create both labels by hand once when adopting the gate. The gate tries to
+create them on pull request runs if they are missing, but the caller's
+`issues: read` grant cannot create labels, so the attempt is refused: the gate
+then logs a warning, notes it in the gate comment, and continues evaluating the
+pull request. Existing labels are left as they are.
 
 ### 4. The pull request template
 

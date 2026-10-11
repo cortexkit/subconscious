@@ -41,13 +41,15 @@ name: Design gate
 on:
   workflow_call:
     secrets:
-      # Declared required rather than relying on `secrets: inherit`, so a
-      # caller that forgot them fails when the workflow is parsed instead of
-      # part-way through the run at the token mint step.
+      # Unused. The gate no longer mints an App token, so it holds no
+      # credential beyond the job's own GITHUB_TOKEN. These stay declared,
+      # optional, only so callers that still pass them keep parsing: GitHub
+      # refuses a caller that passes a secret the called workflow does not
+      # declare. Remove them once no caller passes them.
       CK_CI_APP_ID:
-        required: true
+        required: false
       CK_CI_APP_PRIVATE_KEY:
-        required: true
+        required: false
 
 concurrency:
   group: design-gate-${{ github.event.pull_request.number || github.event.issue.number }}
@@ -74,38 +76,23 @@ jobs:
       pull-requests: write # post the gate comment, convert back to draft
       checks: write # publish the design-gate check run on the PR head
     steps:
-      # Mint an app token so commenting and draft conversion work on fork PRs.
-      # The default GITHUB_TOKEN on fork pull_request runs was read-only;
-      # pull_request_target grants access to repo secrets so we mint an app token.
+      # Every write runs on this job's own GITHUB_TOKEN, with exactly the
+      # permissions above. Under `pull_request_target` that token carries the
+      # declared write scopes even on pull requests from forks (it is the
+      # `pull_request` trigger whose token is read-only there), so commenting
+      # and draft conversion need no App token. Keeping an App private key out
+      # of this job matters because it runs in public repositories: a key that
+      # can read private repositories must never be reachable from here.
       #
-      # The app token does NOT publish the check run: see the gate step below.
       # Every action this reusable workflow runs is pinned to a commit, because
-      # it runs in other repositories with their privileged tokens and a tag or
-      # branch can be moved to different code. When the design-gate action
-      # changes, move its two pins below to the commit that changed it.
-      - name: Mint gate token
-        id: app_token
-        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0
-        with:
-          app-id: ${{ secrets.CK_CI_APP_ID }}
-          private-key: ${{ secrets.CK_CI_APP_PRIVATE_KEY }}
-
-      # Two tokens, split by what must not fail. Publishing the `design-gate`
-      # check run is the gate's output as branch protection reads it, so it
-      # runs on this job's own GITHUB_TOKEN with the `checks: write` granted
-      # above: a token this file grants and every caller can see. Routing it
-      # through the app token instead would make blocking depend on the app
-      # installation carrying `checks: write` in every adopting repository —
-      # a precondition outside the workflow, and one that needs the app's own
-      # JWT to read back, so nobody here could tell whether it held.
-      #
-      # The app token keeps the comment and the draft conversion, which is
-      # what it was minted for.
+      # it runs in other repositories with their tokens and a tag or branch can
+      # be moved to different code. When the design-gate action changes, move
+      # its two pins below to the commit that changed it.
       - name: Evaluate the design gate
         uses: cortexkit/subconscious/.github/actions/design-gate@cb19fcc7d89704b78fd26c9d0fe1e90380495257
         with:
           mode: pull-request
-          github-token: ${{ steps.app_token.outputs.token }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
           check-token: ${{ secrets.GITHUB_TOKEN }}
 
   # Marking a pull request ready with GITHUB_TOKEN does not start another

@@ -12,9 +12,11 @@
  * workflow so they can be unit tested with no network (design-gate.test.mjs).
  * The workflow only supplies the event payload and the tokens.
  *
- * Two tokens, and which call uses which is the point: the `design-gate` check
- * run goes out on the workflow's own GITHUB_TOKEN (CHECK_TOKEN), everything
- * else on the app token (GITHUB_TOKEN). See `runPullRequestGate`.
+ * Two token inputs, and which call uses which is the point: the `design-gate`
+ * check run goes out on CHECK_TOKEN, everything else on GITHUB_TOKEN. The
+ * shared workflow passes the job's own GITHUB_TOKEN to both, but the split
+ * keeps the blocking path independent of whatever token does the other
+ * writes. See `runPullRequestGate`.
  *
  * Usage:
  *   node scripts/design-gate.mjs pull-request   # decide, comment, exit 0/1
@@ -57,7 +59,7 @@ export async function ensureLabels({ api, log = console }) {
         continue;
       }
       if (error.status === 403 || error.status === 404) {
-        log.warn?.(`design-gate: could not create label ${label.name}; CK CI App needs Issues: write permission`);
+        log.warn?.(`design-gate: could not create label ${label.name}; the token needs Issues: write permission`);
         missingPermission.push(label.name);
         continue;
       }
@@ -387,10 +389,11 @@ async function syncComment({ api, pullRequest, decision, existing, draftConverte
  *
  * That is why the check run goes out on `checkApi` and nothing else does.
  * `checkApi` is built from the workflow's own token, which the calling job
- * grants `checks: write` in a file anyone can read; `api` is built from an
- * app token, whose installation permissions can only be read back with the
- * app's own credentials. The step that decides whether a pull request is
- * blocked must not depend on a permission nobody running the gate can check.
+ * grants `checks: write` in a file anyone can read; `api` is built from the
+ * `github-token` input, which a caller could set to an App token whose
+ * installation permissions can only be read back with the App's own
+ * credentials. The step that decides whether a pull request is blocked must
+ * not depend on a permission nobody running the gate can check.
  * Both clients are passed in rather than chosen here, so this function stays
  * free of tokens: the split lives at the edge, in `main`.
  */
@@ -404,7 +407,7 @@ export async function runPullRequestGate({
 }) {
   const missingPermission = await ensureLabels({ api, log });
   const labelWarning = missingPermission.length
-    ? `Gate labels (${missingPermission.map((name) => `\`${name}\``).join(", ")}) could not be created. A maintainer must create them manually or grant the CK CI App Issues: write permission.`
+    ? `Gate labels (${missingPermission.map((name) => `\`${name}\``).join(", ")}) could not be created. A maintainer must create them by hand once.`
     : null;
   const decision = await evaluatePullRequest({ api, repoFullName, pullRequest, action });
 
@@ -473,7 +476,7 @@ export async function runPullRequestGate({
  * The check run goes out on `checkApi` here too, for the same reason it does
  * in `runPullRequestGate`: one rule for where the required check comes from,
  * rather than one per arm. On this arm both clients happen to carry the same
- * token, because an `issues` event needs no app token at all.
+ * token.
  */
 export async function runIssueLabeled({ api, checkApi, repoFullName, issue, log = console }) {
   const search = api.searchOpenPullRequests
@@ -696,8 +699,8 @@ async function main(argv) {
   const repoFullName = requireEnv("GITHUB_REPOSITORY");
   const event = JSON.parse(readFileSync(requireEnv("GITHUB_EVENT_PATH"), "utf8"));
   // One client per token, built here and nowhere else, so the rest of the
-  // script never sees a token. `api` carries the app token: the comment, the
-  // draft conversion and the ready-for-review go out on it. `checkApi`
+  // script never sees a token. `api` carries the `github-token` input: the
+  // comment, the draft conversion and the ready-for-review go out on it. `checkApi`
   // carries the calling job's own GITHUB_TOKEN and publishes the check run
   // branch protection reads, so that the blocking path needs no permission
   // from outside the workflow. Both are required: a missing one throws here,

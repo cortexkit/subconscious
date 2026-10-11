@@ -2449,11 +2449,22 @@ async fn module_list_json_uses_subc_override_and_shows_stub() {
             .any(|module| module["module_id"] == module_id),
         "ck module list --json should include the supervised stub: {value}"
     );
+    let entry = modules
+        .iter()
+        .find(|module| module["module_id"] == module_id)
+        .unwrap();
+    if cfg!(windows) {
+        assert_eq!(entry["launch_nonce_source"], "pipe");
+    } else {
+        assert!(entry.get("launch_nonce_source").is_none());
+    }
 
     let text_output = ck_with_subc(&server.connection_file_path, ["module", "list"]);
     assert_exit(&text_output, 0);
     let text_stdout = text(&text_output.stdout);
-    let expected_list = if cfg!(any(target_os = "linux", target_os = "macos", windows)) {
+    let expected_list = if cfg!(windows) {
+        "module        status   health   reload   nonce source\nck-list-stub  running  unknown  nothing  pipe        \n"
+    } else if cfg!(any(target_os = "linux", target_os = "macos")) {
         "module        status   health   reload \nck-list-stub  running  unknown  nothing\n"
     } else {
         "module        status   health   reload             \nck-list-stub  running  unknown  nothing (image n/a)\n"
@@ -2490,7 +2501,9 @@ async fn module_list_renders_status_words_not_wire_booleans() {
 
     let output = ck_with_subc(&server.connection_file_path, ["module", "list"]);
     assert_exit(&output, 0);
-    let expected_list = if cfg!(any(target_os = "linux", target_os = "macos", windows)) {
+    let expected_list = if cfg!(windows) {
+        "module  status   health    reload   nonce source\ninsula  running  degraded  nothing  pipe        \n"
+    } else if cfg!(any(target_os = "linux", target_os = "macos")) {
         "module  status   health    reload \ninsula  running  degraded  nothing\n"
     } else {
         "module  status   health    reload             \ninsula  running  degraded  nothing (image n/a)\n"
@@ -2535,6 +2548,7 @@ async fn module_list_keeps_configured_path_mismatch_pending_on_every_platform() 
         // the unchanged file at its original spawn path. Image agreement must
         // not erase the independent configured-path mismatch above.
         assert_eq!(entry["pending_reload"]["image"]["status"], "match");
+        assert_eq!(entry["launch_nonce_source"], "pipe");
     } else if !cfg!(any(target_os = "linux", target_os = "macos")) {
         assert_eq!(entry["pending_reload"]["image"]["status"], "unavailable");
         assert_eq!(
@@ -2546,9 +2560,14 @@ async fn module_list_keeps_configured_path_mismatch_pending_on_every_platform() 
     let output = ck_with_subc(&server.connection_file_path, ["module", "list"]);
     assert_exit(&output, 0);
     let stdout = text(&output.stdout);
+    let expected_suffix = if cfg!(windows) {
+        "pending (path)  pipe"
+    } else {
+        "pending (path)"
+    };
     assert!(
         stdout.lines().any(|line| {
-            line.starts_with(module_id) && line.trim_end().ends_with("pending (path)")
+            line.starts_with(module_id) && line.trim_end().ends_with(expected_suffix)
         }),
         "{stdout}"
     );
@@ -2676,6 +2695,9 @@ async fn module_status_renders_key_value_block_byte_for_byte() {
     ));
     assert_eq!(status_json["module"]["module_id"], "aft");
     assert_eq!(status_json["health"]["status"], "degraded");
+    if cfg!(windows) {
+        assert_eq!(status_json["module"]["launch_nonce_source"], "pipe");
+    }
 
     let provenance = control_rpc_value_on_stream_within(
         &mut wait_for_client(&server.connection_file_path).await,
@@ -2760,8 +2782,9 @@ async fn module_status_renders_key_value_block_byte_for_byte() {
     assert_eq!(
         rest,
         format!(
-            "0 of 1 in 10m · drain 25 ms · restart backoff 10 ms to 30s\n  launch_nonce_env: {nonce_env}\n  last exit: none\n  drain gauges: 0 drains with undeclared gauge\n  binary: {binary} ({image})\n  configured program: matches running process\n  running image: {image_verdict}\n",
-            nonce_env = !cfg!(unix)
+            "0 of 1 in 10m · drain 25 ms · restart backoff 10 ms to 30s\n  launch_nonce_env: {nonce_env}{nonce_source}\n  last exit: none\n  drain gauges: 0 drains with undeclared gauge\n  binary: {binary} ({image})\n  configured program: matches running process\n  running image: {image_verdict}\n",
+            nonce_env = !cfg!(unix),
+            nonce_source = if cfg!(windows) { "\n  launch nonce source (daemon): pipe" } else { "" },
         )
     );
 
@@ -3132,8 +3155,13 @@ async fn provenance_human_output_keeps_declared_values_under_the_declared_label(
     assert!(declared_at < observed_at, "stdout:\n{stdout}");
     let module_declared = &stdout[declared_at..observed_at];
     let module_observed = &stdout[observed_at..];
+    let expected_observed_start = if cfg!(windows) {
+        "Daemon observed\n  launch nonce source: pipe\n  pid:"
+    } else {
+        "Daemon observed\n  pid:"
+    };
     assert!(
-        module_observed.starts_with("Daemon observed\n  pid:"),
+        module_observed.starts_with(expected_observed_start),
         "module-level observed section boundary was not verified:\n{module_observed}"
     );
     for declared in [
@@ -3165,6 +3193,14 @@ async fn provenance_human_output_keeps_declared_values_under_the_declared_label(
     let source = json["modules"][0]["module_declared"]["build"]["launch_nonce_source"]
         .as_str()
         .unwrap_or_else(|| panic!("the stub declares a nonce source: {json}"));
+    let expected_source = if cfg!(windows) {
+        "pipe"
+    } else if cfg!(unix) {
+        "fd"
+    } else {
+        "env"
+    };
+    assert_eq!(source, expected_source);
     assert!(
         module_declared.contains(&format!("launch nonce source: {source}")),
         "stdout:\n{stdout}"
@@ -3180,12 +3216,12 @@ async fn provenance_human_output_keeps_declared_values_under_the_declared_label(
     assert!(stdout.contains("started "), "stdout:\n{stdout}");
     assert!(stdout.contains("spawned from:"), "stdout:\n{stdout}");
     assert!(stdout.contains("running image "), "stdout:\n{stdout}");
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     assert!(
-        stdout.contains("running image matches the file it was spawned from"),
+        module_observed.contains("running image matches the file it was spawned from"),
         "stdout:\n{stdout}"
     );
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     assert!(
         stdout.contains("running image could not be compared"),
         "stdout:\n{stdout}"

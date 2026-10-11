@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.33.7
+
+- Serve Windows wire-module launch secrets over per-spawn PID-authenticated named pipes, including swap candidates, while retaining the environment copy and explicit fallback permission during phase one. Preparation or serving setup failures retain environment startup; only a completed client drain reports `pipe` in list/status and observed provenance.
+- Keep the Windows handle-pinned image identity and resource reporting alongside the pipe lifecycle. Remove the fallback permission with the environment copy in phase two; this availability rollout does not remove environment exposure.
+
 ## 0.33.6
 
 - Compare Windows configured and spawned paths after OS canonicalization so ordinary and verbatim spellings do not falsely require a reload. A different resolved configured program still requires a reload even when the child's executable matches the file at its original spawn path.

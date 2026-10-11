@@ -2,8 +2,10 @@
 
 ## 0.21.4
 
+- Add cached `launchNonceAsync()` and `launchNonceOrUndefinedAsync()` readers and use them for SDK HELLO/serve and route-open. Windows pipe reads retry busy instances within a bounded window and read to EOF with a deadline; report `pipe` in provenance. Unix descriptor behavior remains unchanged.
 - Respect explicit `SUBC_LAUNCH_NONCE_PIPE_FALLBACK=env` rollout permission: async readers still prefer the pipe, but failed or incomplete delivery caches the environment copy and its `env` source. Sync readers may use that explicitly permitted copy before async initialization; whichever cache result is established first remains stable.
 - Unmarked Windows pipes still fail without environment fallback, including `PipeNeedsAsync` before initialization. Unix descriptor behavior is unchanged. Remove the fallback permission when dropping the environment copy in a later release; fallback does not improve same-user isolation or let Node request identification-level impersonation.
+- Node's `net.connect` requests no security quality-of-service flags, so a counterfeit server could impersonate the module's same-user token. The daemon reserves the first instance before startup and grants only the read/synchronize/write-attributes rights needed by libuv's read-only open, not data-write or instance-creation rights. The environment copy remains during the rollout, so this release is not by itself an isolation improvement.
 
 ## 0.21.3
 

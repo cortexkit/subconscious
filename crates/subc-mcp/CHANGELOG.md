@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.32
+
+- Expect the shared accessor's named-pipe nonce source in supervised Windows provenance tests; Unix still expects the descriptor source.
+
 ## 0.1.31
 
 - `ck-subc-mcp --ck-domain` prints a one-line description and exits. `ck` runs

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.20.77
+
+- Show daemon-observed Windows launch-nonce sources in module list, status and provenance alongside the running-image and resource reports. Update exact CLI expectations for the Windows `pipe` column and lines; Unix output stays unchanged when the observation is absent.
+
 ## 0.20.76
 
 - `ck module status` and `ck module list` show Windows resource readings (working set and CPU time) and the running-image check where they previously said "unavailable".

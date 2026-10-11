@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.30.2
+
+- Recognize `pipe` as a launch-nonce provenance source for Windows named-pipe readers while preserving unknown-source compatibility.
+
 ## 0.30.1
 
 - Add `manifest::CAP_CATALOG_EVENTS_V1` (`catalog-events/v1`), the `server.describe` capability a daemon advertises when `catalog.list` carries modules' declared `events`.

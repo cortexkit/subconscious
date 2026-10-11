@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.12
+
+- Expect the shared accessor's named-pipe nonce source in supervised Windows provenance tests; Unix still expects the descriptor source.
+
 ## 0.3.11
 
 - Use `cortexkit-lease` for durable replacement of state and install files.

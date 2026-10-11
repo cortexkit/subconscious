@@ -798,30 +798,20 @@ mod buffered_delivery_tests {
     use crate::launch_nonce::{
         launch_nonce, LAUNCH_NONCE_ENV, LAUNCH_NONCE_PIPE_ENV, LAUNCH_NONCE_PIPE_FALLBACK_ENV,
     };
+    use cortexkit_test_support::ScratchDir;
     use std::{
         path::{Path, PathBuf},
         process::{Child, Command, Stdio},
     };
     use windows_sys::Win32::System::Pipes::PeekNamedPipe;
 
-    struct Gates(PathBuf);
+    struct Gates(ScratchDir);
     impl Gates {
         fn new() -> Self {
-            let name = random_name().unwrap();
-            let root = std::env::temp_dir().join(format!(
-                "subc-pipe-gates-{}",
-                name.rsplit('-').next().unwrap()
-            ));
-            std::fs::create_dir(&root).unwrap();
-            Self(root)
+            Self(ScratchDir::new("subc-pipe-gates"))
         }
         fn path(&self, name: &str) -> PathBuf {
             self.0.join(name)
-        }
-    }
-    impl Drop for Gates {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
         }
     }
 
@@ -912,7 +902,7 @@ mod buffered_delivery_tests {
         let mut command = Command::new(std::env::current_exe().unwrap());
         command
             .args(["launch_nonce::windows::buffered_delivery_tests::windows_buffered_pipe_child_fixture", "--exact", "--nocapture"])
-            .env("SUBC_PIPE_GATES", &gates.0)
+            .env("SUBC_PIPE_GATES", gates.0.path())
             .env(LAUNCH_NONCE_PIPE_ENV, pipe.name())
             .env_remove(LAUNCH_NONCE_PIPE_FALLBACK_ENV)
             .env_remove(LAUNCH_NONCE_ENV)

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.14
+
+- Add PID-authenticated one-time Windows launch-nonce pipes and the cached `pipe` source. Reserve a protected, non-inheritable first instance before spawn, reject remote clients, and keep wrong-PID clients from receiving bytes. The current-user DACL grants read, synchronize and the write-attributes bit required by libuv, never generic write or pipe-instance creation.
+- Flush before disconnect/close, record consumption only after the client drains the buffer, and cancel a stalled flush within the child-lifetime/registration budget. Join only submitted overlapped operations and obtain immediate-completion byte counts through `GetOverlappedResult`.
+- Permit environment fallback only with explicit `SUBC_LAUNCH_NONCE_PIPE_FALLBACK=env` rollout permission. Complete matching reads stay `pipe`; failed or incomplete delivery caches `env`. Unmarked pipes and Unix descriptors stay fail-closed. Windows test directories now use the shared scratch-directory guard.
+
 ## 0.1.13
 
 - Normalize and resolve Windows ACL helper paths before converting them to extended-length drive or UNC paths. Private file and directory creation and path-based ACL checks now support paths beyond `MAX_PATH`, including relative inputs, while preserving already-verbatim paths.

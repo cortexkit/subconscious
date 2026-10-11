@@ -2,6 +2,7 @@
 
 ## 0.27.2
 
+- Use the shared Windows named-pipe accessor and its process cache for HELLO and route-open; Unix remains on the inherited descriptor.
 - Require the corrected Windows pipe reader and add a real supervised-module test asserting both daemon-observed and HELLO-declared `pipe` sources. Environment fallback can keep registration alive without making a broken pipe pass this test.
 
 ## 0.27.1

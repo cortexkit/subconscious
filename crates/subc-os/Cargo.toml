@@ -19,8 +19,8 @@ required-features = ["test-support"]
 # carries no version on purpose: a path-only dev-dependency is dropped when the
 # crate is packaged, so publishing never looks for this version on crates.io.
 [dev-dependencies]
-subc-os = { path = ".", features = ["test-support"] }
 cortexkit-test-support = "0.1.3"
+subc-os = { path = ".", features = ["test-support"] }
 
 # The launch-nonce handoff (dup2 and fcntl between fork and exec) and its
 # reader (fstat, ioctl) are plain POSIX calls, so every Unix takes libc.

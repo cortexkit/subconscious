@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.33.11
+
+- Correct activity tests that failed in CI: compare Windows project roots without the verbatim path prefix, and drop a test that read this changelog. No runtime change from 0.33.10, which was never published.
+
 ## 0.33.10
 
 - Serve additive `activity.record` requests from registered modules and advertise `activity-ledger/v1` in HELLO_ACK and server.describe. The daemon verifies route ownership/epoch and live scope tags before recording the verified identity of the client that opened the route, its project and scope attributes. Events with no route or scope citation identify the calling module.

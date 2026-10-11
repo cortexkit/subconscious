@@ -645,6 +645,45 @@ async fn activity_record_preserves_daemon_refusal_codes() {
 }
 
 #[tokio::test]
+async fn activity_record_reply_deadline_reports_outcome_unknown() {
+    let mut served = super::stand_in::serve_against_stand_in_with_ops_and_capabilities(
+        |_| Echo,
+        &[],
+        &[subc_control::ACTIVITY_LEDGER_CAPABILITY],
+    )
+    .await;
+    let mut call = Box::pin(
+        served
+            .handle
+            .activity_record_with_deadline(activity_record_request(), Duration::from_millis(250)),
+    );
+    still_pending(call.as_mut()).await;
+    let request = timeout(Duration::from_secs(2), read_frame(&mut served.daemon))
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(request.header.ty, FrameType::Request);
+    assert_eq!(
+        timeout(Duration::from_secs(2), call).await.unwrap(),
+        Err(ActivityRecordError::OutcomeUnknown)
+    );
+    assert!(served
+        .handle
+        .shared
+        .lock_inner()
+        .pending_activity_records
+        .is_empty());
+
+    served.handle.close_connection();
+    timeout(Duration::from_secs(3), served.serve)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
 async fn activity_record_without_capability_fails_fast_without_sending() {
     let mut served =
         super::stand_in::serve_against_stand_in_with_ops_and_capabilities(|_| Echo, &[], &[]).await;

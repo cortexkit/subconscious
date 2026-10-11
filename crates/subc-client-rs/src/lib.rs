@@ -896,11 +896,20 @@ impl ModuleHandle {
         &self,
         request: ActivityRecordRequest,
     ) -> Result<u64, ActivityRecordError> {
+        self.activity_record_with_deadline(request, OPERATOR_CONFIRM_TIMEOUT)
+            .await
+    }
+
+    async fn activity_record_with_deadline(
+        &self,
+        request: ActivityRecordRequest,
+        duration: Duration,
+    ) -> Result<u64, ActivityRecordError> {
         if !self.shared.supports_activity_ledger {
             return Err(ActivityRecordError::NotSupported);
         }
 
-        let deadline = Instant::now() + OPERATOR_CONFIRM_TIMEOUT;
+        let deadline = Instant::now() + duration;
         let body = serde_json::to_vec(&request).map_err(|err| {
             ActivityRecordError::Protocol(format!(
                 "failed to encode activity.record request body: {err}"

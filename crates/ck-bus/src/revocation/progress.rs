@@ -6,18 +6,19 @@
 //! `user_jwt_id`, and the kick targets (the server id and client id of each live
 //! connection of the user). It is written with step 0 and its inputs before step (1),
 //! replaced after each step commits, and removed after step (3). Every write is an atomic
-//! durable replacement: a sibling `*.tmp`, fsynced, renamed over the target, then the
-//! directory fsynced. The identity comes from the file name, never the body, so a record
-//! whose body is damaged still names the revocation it belongs to.
+//! durable replacement: a sibling `*.tmp` is flushed and replaces the target before the
+//! containing directory is flushed, so a completed step survives a sudden power loss. The
+//! identity comes from the file name, never the body, so a record whose body is damaged
+//! still names the revocation it belongs to.
 
 use std::{
     collections::BTreeSet,
-    fs::{self, OpenOptions},
-    io::{self, Write},
+    fs, io,
     path::{Path, PathBuf},
 };
 
 use cortexkit_bus_naming::AccountNames;
+use cortexkit_lease::durable_replace;
 use serde_json::{json, Value};
 
 pub const PROGRESS_DIR: &str = "revocation_progress";
@@ -228,19 +229,9 @@ impl ProgressStore {
         let tmp = self
             .dir
             .join(format!("{}.tmp", record.identity.file_name()));
-        {
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&tmp)?;
-            file.write_all(
-                &serde_json::to_vec_pretty(&record.to_json()).map_err(io::Error::other)?,
-            )?;
-            file.sync_all()?;
-        }
-        fs::rename(&tmp, &path)?;
-        sync_dir(&self.dir)
+        let bytes = serde_json::to_vec_pretty(&record.to_json()).map_err(io::Error::other)?;
+        fs::write(&tmp, bytes)?;
+        durable_replace(&tmp, &path)
     }
 
     /// Removes a record once its revocation is complete, or once recovery has shown
@@ -259,8 +250,8 @@ fn sync_dir(dir: &Path) -> io::Result<()> {
     fs::File::open(dir)?.sync_all()
 }
 
-/// Windows cannot open a directory as a file to flush it; the rename is the durable
-/// step there.
+/// Removing a completed record is separate from replacing one; Windows does not sync
+/// directory metadata through this removal path.
 #[cfg(not(unix))]
 fn sync_dir(_dir: &Path) -> io::Result<()> {
     Ok(())

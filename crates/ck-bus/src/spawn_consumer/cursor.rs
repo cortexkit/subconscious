@@ -2,17 +2,17 @@
 //!
 //! The value is the daemon's cursor verbatim (`{"daemon_incarnation", "seq"}`), written
 //! after the event it names has been handled, so a restart resumes at the first event
-//! it had not finished. Every write is an atomic durable replacement: a sibling `*.tmp`,
-//! fsynced, renamed over the file, the directory fsynced. A file that does not parse as
-//! a cursor is damaged and reads as absent, so the consumer snapshots and reconciles
-//! instead of resuming; the next processed event overwrites it.
+//! it had not finished. Every write replaces a sibling `*.tmp` and flushes the new file
+//! and its directory before returning, so a completed cursor survives a sudden power loss.
+//! A file that does not parse as a cursor is damaged and reads as absent, so the consumer
+//! snapshots and reconciles instead of resuming; the next processed event overwrites it.
 
 use std::{
-    fs::{self, OpenOptions},
-    io::{self, Write},
+    fs, io,
     path::{Path, PathBuf},
 };
 
+use cortexkit_lease::durable_replace;
 use subc_client_rs::consumer::SpawnCursor;
 
 pub const CURSOR_FILE: &str = "spawn_cursor.json";
@@ -71,20 +71,8 @@ impl CursorStore {
     pub fn write(&self, cursor: &SpawnCursor) -> io::Result<()> {
         let bytes = serde_json::to_vec(cursor).map_err(io::Error::other)?;
         let tmp = tmp_path(&self.path);
-        {
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&tmp)?;
-            file.write_all(&bytes)?;
-            file.sync_all()?;
-        }
-        fs::rename(&tmp, &self.path)?;
-        if let Some(dir) = self.path.parent() {
-            sync_dir(dir)?;
-        }
-        Ok(())
+        fs::write(&tmp, bytes)?;
+        durable_replace(&tmp, &self.path)
     }
 }
 
@@ -95,18 +83,6 @@ fn tmp_path(path: &Path) -> PathBuf {
         .unwrap_or_default();
     name.push(".tmp");
     path.with_file_name(name)
-}
-
-#[cfg(unix)]
-fn sync_dir(dir: &Path) -> io::Result<()> {
-    fs::File::open(dir)?.sync_all()
-}
-
-/// Windows cannot open a directory as a file to flush it; the rename is the durable
-/// step there.
-#[cfg(not(unix))]
-fn sync_dir(_dir: &Path) -> io::Result<()> {
-    Ok(())
 }
 
 #[cfg(test)]

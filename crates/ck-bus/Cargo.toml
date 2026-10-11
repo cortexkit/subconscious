@@ -1,6 +1,6 @@
 [package]
 name = "ck-bus"
-version = "0.3.10"
+version = "0.3.11"
 edition = "2021"
 publish = false
 description = "Supervised owner of the CortexKit NATS message plane."
@@ -16,6 +16,7 @@ path = "src/main.rs"
 async-nats = "0.50"
 async-trait = "0.1"
 base64 = "0.22"
+cortexkit-lease = "0.1.3"
 cortexkit-bus-trait = { version = "0.2.0", git = "https://github.com/cortexkit/commons.git", rev = "e4fb106f581c4d208a81e924a6329cfb20de616d" }
 cortexkit-bus-inmemory = { version = "0.2.0", git = "https://github.com/cortexkit/commons.git", rev = "e4fb106f581c4d208a81e924a6329cfb20de616d" }
 cortexkit-bus-naming = { version = "0.2.0", git = "https://github.com/cortexkit/commons.git", rev = "e4fb106f581c4d208a81e924a6329cfb20de616d" }

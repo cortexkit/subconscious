@@ -1,6 +1,6 @@
 [package]
 name = "cortexkit-release"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 license = "MIT"
 description = "Shared, journaled release state machine for CortexKit repositories."
@@ -21,6 +21,7 @@ path = "tests/artifacts/mod.rs"
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
+cortexkit-lease = "0.1.3"
 cortexkit-paths = "0.1.1"
 fs4 = "1"
 serde = { version = "1", features = ["derive"] }

@@ -1,20 +1,20 @@
 //! The two durable shapes bootstrap owns: `account.json` and `own_users.json`.
 //!
-//! Every write is an atomic durable replacement: a sibling `*.tmp` in the same
-//! directory, fsynced, renamed over the target, then the directory fsynced. A file that
-//! fails to parse is damaged, and damage is never repaired by rewriting: `account.json`
-//! fails closed, and a damaged `own_users.json` is left untouched and named.
+//! Every write replaces a sibling `*.tmp` and flushes both the new file and its directory
+//! before returning, so a completed save survives a sudden power loss. A file that fails
+//! to parse is damaged, and damage is never repaired by rewriting: `account.json` fails
+//! closed, and a damaged `own_users.json` is left untouched and named.
 //!
 //! Neither shape holds key material. `account.json` keeps only the PUBLIC half of the
 //! box account's identity key; its seed existed only in the memory of the process that
 //! created the account.
 
 use std::{
-    fs::{self, OpenOptions},
-    io::{self, Write},
+    fs, io,
     path::{Path, PathBuf},
 };
 
+use cortexkit_lease::durable_replace;
 use serde_json::{json, Value};
 use subc_protocol::MachineId;
 
@@ -211,27 +211,7 @@ fn write_atomic(path: &Path, value: &Value) -> io::Result<()> {
         .file_name()
         .ok_or_else(|| io::Error::other("store file has no name"))?;
     let tmp = dir.join(format!("{}.tmp", file_name.to_string_lossy()));
-    {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&tmp)?;
-        file.write_all(&serde_json::to_vec_pretty(value).map_err(io::Error::other)?)?;
-        file.sync_all()?;
-    }
-    fs::rename(&tmp, path)?;
-    sync_dir(dir)
-}
-
-#[cfg(unix)]
-fn sync_dir(dir: &Path) -> io::Result<()> {
-    fs::File::open(dir)?.sync_all()
-}
-
-/// Windows cannot open a directory as a file to flush it; the rename is the durable
-/// step there.
-#[cfg(not(unix))]
-fn sync_dir(_dir: &Path) -> io::Result<()> {
-    Ok(())
+    let bytes = serde_json::to_vec_pretty(value).map_err(io::Error::other)?;
+    fs::write(&tmp, bytes)?;
+    durable_replace(&tmp, path)
 }

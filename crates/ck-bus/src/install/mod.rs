@@ -31,6 +31,7 @@ use std::{
 };
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use cortexkit_lease::durable_replace;
 use nkeys::KeyPair;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -179,8 +180,8 @@ fn sha256_hex(bytes: &[u8]) -> String {
         .collect()
 }
 
-/// Writes `content` to `path` through a temporary file in the same directory and a
-/// rename, so a reader never sees a partial file.
+/// Replaces `path` from a sibling temporary file and flushes the file and directory so
+/// successful install settings survive a sudden power loss.
 fn write_atomic(path: &Path, content: &[u8]) -> Result<(), String> {
     write_atomic_with_permissions(path, content, None)
 }
@@ -202,8 +203,8 @@ fn write_atomic_with_permissions(
             file.set_permissions(permissions)?;
         }
         file.write_all(content)?;
-        file.sync_all()?;
-        fs::rename(&temp, path)
+        drop(file);
+        durable_replace(&temp, path)
     })();
     result.map_err(|error| {
         let _ = fs::remove_file(&temp);
@@ -587,7 +588,7 @@ fn apply_conf_only(flags: &Flags) -> Result<Value, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply, conf::ServerConf, Flags, SERVER_CONF_FILE};
+    use super::{apply, conf::ServerConf, write_atomic, Flags, SERVER_CONF_FILE};
     use std::path::Path;
 
     /// A rendered install configuration in a fresh directory, with the monitoring line
@@ -626,6 +627,21 @@ mod tests {
 
     fn read_conf(dir: &Path) -> String {
         std::fs::read_to_string(dir.join(SERVER_CONF_FILE)).unwrap()
+    }
+
+    #[test]
+    fn write_atomic_replaces_contents_and_leaves_no_temporary_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(SERVER_CONF_FILE);
+        let temp = dir
+            .path()
+            .join(format!(".{SERVER_CONF_FILE}.tmp-{}", std::process::id()));
+        std::fs::write(&path, b"old settings").unwrap();
+
+        write_atomic(&path, b"new settings").unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"new settings");
+        assert!(!temp.exists(), "the temporary name must be removed");
     }
 
     #[test]

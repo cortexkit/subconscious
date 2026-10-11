@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.2
+
+- Use `cortexkit-lease` for durable approval and lease-holder replacements.
+
 ## 0.1.1
 
 - Refuse non-public phases without an execution implementation instead of

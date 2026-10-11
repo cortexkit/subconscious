@@ -9,6 +9,7 @@ use crate::{
     state::TrainJournalIdentity,
     ApprovalToken, ArtifactId, CommitId, DeclarationDigest, RepositoryId, TrainId,
 };
+use cortexkit_lease::durable_replace;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -271,13 +272,12 @@ impl ApprovalStore {
             .map_err(|source| approval_io(&temporary, source))?;
         file.write_all(&bytes)
             .map_err(|source| approval_io(&temporary, source))?;
-        file.sync_all()
-            .map_err(|source| ApprovalError::UnsupportedDurability {
-                path: temporary.clone(),
-                source,
-            })?;
-        fs::rename(&temporary, &path).map_err(|source| approval_io(&path, source))?;
-        sync_directory(&parent)
+        drop(file);
+        // Public work must not proceed on an approval that could vanish after a reboot.
+        durable_replace(&temporary, &path).map_err(|source| ApprovalError::UnsupportedDurability {
+            path: path.clone(),
+            source,
+        })
     }
 
     fn repository_dir(&self) -> PathBuf {
@@ -420,6 +420,29 @@ mod tests {
             subject.public_effects[0],
             plan.first_public_trigger.unwrap()
         );
+    }
+
+    #[test]
+    fn approval_save_replaces_target_and_leaves_no_temporary_file() {
+        let (_root, store) = store();
+        let subject = build_approval_subject(&plan("v1.2.3")).unwrap();
+        let path = store.approval_path();
+        fs::write(&path, b"old approval").unwrap();
+
+        store
+            .persist_confirmed(subject, ApprovalToken::new("confirmed-v1.2.3"))
+            .unwrap();
+
+        let bytes = fs::read(&path).unwrap();
+        assert!(bytes
+            .windows(b"confirmed-v1.2.3".len())
+            .any(|window| window == b"confirmed-v1.2.3"));
+        let entries = fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(Result::unwrap)
+            .collect::<Vec<_>>();
+        assert_eq!(entries.len(), 1, "no temporary file should remain");
+        assert_eq!(entries[0].path(), path);
     }
 
     #[test]

@@ -13,16 +13,17 @@
 //! is added. A file that does not parse at all has no readable entry, so every
 //! generation is refused and the file is never rewritten (nothing could be preserved).
 //!
-//! Every write is an atomic durable replacement: a sibling `*.tmp`, fsynced, renamed over
-//! the file, the directory fsynced. Entries for exited generations are not pruned here.
+//! Every write replaces a sibling `*.tmp` and flushes both the new file and its directory
+//! before returning, so a completed epoch advance survives a sudden power loss. Entries
+//! for exited generations are not pruned here.
 
 use std::{
-    fs::{self, OpenOptions},
-    io::{self, Write},
+    fs, io,
     path::{Path, PathBuf},
     sync::Mutex,
 };
 
+use cortexkit_lease::durable_replace;
 use serde_json::{json, Map, Value};
 
 pub const HIGH_WATER_FILE: &str = "epoch_high_water.json";
@@ -224,29 +225,9 @@ fn write_atomic(path: &Path, value: &Value) -> io::Result<()> {
         .ok_or_else(|| io::Error::other("store file has no parent directory"))?;
     fs::create_dir_all(dir)?;
     let tmp = tmp_path(path);
-    {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&tmp)?;
-        file.write_all(&serde_json::to_vec_pretty(value).map_err(io::Error::other)?)?;
-        file.sync_all()?;
-    }
-    fs::rename(&tmp, path)?;
-    sync_dir(dir)
-}
-
-#[cfg(unix)]
-fn sync_dir(dir: &Path) -> io::Result<()> {
-    fs::File::open(dir)?.sync_all()
-}
-
-/// Windows cannot open a directory as a file to flush it; the rename is the durable step
-/// there.
-#[cfg(not(unix))]
-fn sync_dir(_dir: &Path) -> io::Result<()> {
-    Ok(())
+    let bytes = serde_json::to_vec_pretty(value).map_err(io::Error::other)?;
+    fs::write(&tmp, bytes)?;
+    durable_replace(&tmp, path)
 }
 
 #[cfg(test)]

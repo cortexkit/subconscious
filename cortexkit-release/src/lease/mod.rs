@@ -1,11 +1,13 @@
 //! Exclusive, durable leases for release-train mutation.
 //!
 //! Lease acquisition uses the operating system's exclusive file lock and writes
-//! a synchronized holder record only after the lock is held. A filesystem that
-//! rejects either operation is refused; this module never substitutes a
-//! best-effort lock or an unsynchronized marker file.
+//! a synchronized holder record only after the lock is held. A second process needs that
+//! record to identify the owner after a restart. A filesystem that rejects either operation
+//! is refused; this module never substitutes a best-effort lock or an unsynchronized marker
+//! file.
 
 use crate::{RepositoryId, TrainId};
+use cortexkit_lease::durable_replace;
 use fs4::{FileExt, TryLockError};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -178,7 +180,6 @@ impl LeaseStore {
             process_started_at_ms: process_started_at_millis()?,
         };
         write_holder(&path, &holder)?;
-        sync_directory(parent)?;
         Ok(LeaseGuard {
             file: Some(file),
             path: lock_path,
@@ -239,12 +240,11 @@ fn write_holder(path: &Path, holder: &LeaseHolder) -> Result<(), LeaseError> {
     let mut file = File::create(&temp).map_err(|source| lease_io(&temp, source))?;
     file.write_all(&bytes)
         .map_err(|source| lease_io(&temp, source))?;
-    file.sync_all()
-        .map_err(|source| LeaseError::UnsupportedDurability {
-            path: temp.clone(),
-            source,
-        })?;
-    fs::rename(&temp, path).map_err(|source| lease_io(path, source))
+    drop(file);
+    durable_replace(&temp, path).map_err(|source| LeaseError::UnsupportedDurability {
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 fn lock_failure(path: &Path, scope: LeaseScope, source: TryLockError) -> LeaseError {

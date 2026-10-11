@@ -4,16 +4,17 @@
 //! The file is a record for the operator and for the next process's start-up log. It
 //! never answers health: a verdict describes the process that measured it, and a new
 //! process starts down until its own first probe answers. Every write is an atomic
-//! durable replacement (a sibling `*.tmp`, fsynced, renamed over the file, the directory
-//! fsynced). A file that does not parse is damaged and reads as absent, which is already
-//! a new process's start state.
+//! durable replacement: a sibling `*.tmp` is flushed and replaces the target before the
+//! directory is flushed, so a completed verdict survives a sudden power loss. A file that
+//! does not parse is damaged and reads as absent, which is already a new process's start
+//! state.
 
 use std::{
-    fs::{self, OpenOptions},
-    io::{self, Write},
+    fs, io,
     path::{Path, PathBuf},
 };
 
+use cortexkit_lease::durable_replace;
 use serde_json::Value;
 
 pub const VERDICT_FILE: &str = "sentinel_verdict.json";
@@ -75,20 +76,8 @@ impl VerdictStore {
     pub fn write(&self, verdict: &Value) -> io::Result<()> {
         let bytes = serde_json::to_vec(verdict).map_err(io::Error::other)?;
         let tmp = tmp_path(&self.path);
-        {
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&tmp)?;
-            file.write_all(&bytes)?;
-            file.sync_all()?;
-        }
-        fs::rename(&tmp, &self.path)?;
-        if let Some(dir) = self.path.parent() {
-            sync_dir(dir)?;
-        }
-        Ok(())
+        fs::write(&tmp, bytes)?;
+        durable_replace(&tmp, &self.path)
     }
 }
 
@@ -99,18 +88,6 @@ fn tmp_path(path: &Path) -> PathBuf {
         .unwrap_or_default();
     name.push(".tmp");
     path.with_file_name(name)
-}
-
-#[cfg(unix)]
-fn sync_dir(dir: &Path) -> io::Result<()> {
-    fs::File::open(dir)?.sync_all()
-}
-
-/// Windows cannot open a directory as a file to flush it; the rename is the durable
-/// step there.
-#[cfg(not(unix))]
-fn sync_dir(_dir: &Path) -> io::Result<()> {
-    Ok(())
 }
 
 #[cfg(test)]

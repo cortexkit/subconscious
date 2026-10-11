@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.11
+
+- Use `cortexkit-lease` for durable replacement of state and install files.
+
 ## 0.3.10
 
 - Moves to `subc-protocol` 0.30 and `subc-client-rs` 0.27. No behaviour change.

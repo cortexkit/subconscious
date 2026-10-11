@@ -93,7 +93,8 @@ Reads expose what every agent has done, so they are operator surfaces only:
 
 - direct connections (`ck activity`);
 - `reserved:callosum`, which may forward only requests stamped from the operator's phone
-  (the same `fed-phone:` gate Cingulate uses);
+  (the same `fed-phone:` gate Cingulate uses). This is the phone's whole read path: the
+  daemon serves the phone directly, and no other module sits between them;
 - `reserved:ckbus` for a mirror;
 - later, `reserved:basal` for notice rules.
 
@@ -130,6 +131,17 @@ When the bus is installed, ck-bus subscribes with `activity.subscribe` and repub
 each entry on `ck.<account>.event.subc.activity.v1`. Flows and other consumers can
 then react without polling. The ledger itself never depends on the bus.
 
+## First events from prefrontal
+
+All are recorded on the scope prefrontal owns, so each names its agent:
+
+- a worker launched, settled, rejected, cancelled or failed;
+- a campaign fired or closed;
+- a flow installed (with its approval kind, card or policy, and the rule that allowed
+  it), revoked or disabled;
+- a package approved or denied;
+- a grant given or revoked.
+
 ## Later
 
 - **Tamper evidence for team users.** Each entry gains `prev`, a hash of the previous
@@ -137,12 +149,11 @@ then react without polling. The ledger itself never depends on the bus.
   controls. The v1 entry format reserves the field name.
 - **Notices from rules.** User notices become rules over the ledger, possibly flows
   that subscribe and write to the user's notice sink.
+- **An agent reading entries about itself.** A lead agent may later want its own
+  workers' entries. Because every entry already carries the daemon-stamped `agent_id`
+  and scope owner, that is a read filter fixed to the caller's own agent, added
+  without changing the entry format.
 
 ## Open questions
 
-1. **The phone's read path.** Is a narrow Callosum forward of `activity.query` and
-   `activity.subscribe` right, or should a module (Cingulate) serve the phone's view?
-2. **Retention defaults.** 30 days and 64 MiB.
-3. **Which events core records first.** The proposal is worker launched, settled,
-   rejected and cancelled; flow installed, revoked and disabled; package approved and
-   denied; grant given and revoked.
+1. **Retention defaults.** 30 days and 64 MiB.

@@ -113,6 +113,12 @@ jobs:
         with:
           bun-version: latest
 
+      # Store and log use the locked sibling private-files package before its first publish.
+      - name: Build sibling private-files for store and log
+        if: ${{ steps.pkg.outputs.dir == 'clients/store' || steps.pkg.outputs.dir == 'clients/log' }}
+        working-directory: clients/private-files
+        run: bun install --frozen-lockfile && bun run build
+
       # Log's locked local dependency exports compiled files. Build them before
       # installing log so verification and prepack work on a fresh checkout.
       - name: Build sibling store for log

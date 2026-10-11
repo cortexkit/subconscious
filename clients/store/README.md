@@ -12,11 +12,26 @@ Postgres database names or sqlite store paths.
 ## Install
 
 It ships compiled ESM and type declarations and runs on Bun or Node ≥ 18.
-The package has no runtime dependencies beyond Node's built-in modules.
+Windows private operations use `@cortexkit/private-files` (`^0.1.0`). macOS and
+Linux do not load that package or require its native addon.
 
 ```jsonc
 // from the subconscious monorepo
 "dependencies": { "@cortexkit/store": "workspace:*" }
+```
+
+For development before private-files is published, the committed Bun lockfile
+links `../private-files` while package.json keeps the published semver dependency,
+just as `clients/log` links its sibling store. Build the sibling first:
+
+```sh
+cd clients/private-files
+bun install --frozen-lockfile
+bun run build
+cd ../store
+bun install --frozen-lockfile
+bun run typecheck
+bun test
 ```
 
 ## Usage
@@ -36,21 +51,24 @@ const path = sqliteStorePath("/data", "ai-provider-quota");
 ## Owner-only secret paths
 
 ```ts
-import { checkOwnerOnlyPath, checkOwnerOnlyPathAsync } from "@cortexkit/store";
+import { checkOwnerOnlyPathAsync, createPrivateFile } from "@cortexkit/store";
 
 const result = await checkOwnerOnlyPathAsync(tokenPath);
 if (!result.ok) {
   throw new Error(`${result.reason}: ${result.path}`);
 }
-// Only after a successful check, create the parent and write the secret securely.
-// A synchronous caller can use checkOwnerOnlyPath(tokenPath) instead.
+// The immediate parent must already exist. Creation is exclusive, not replacement.
+await createPrivateFile(tokenPath, secretBytes);
 ```
 
 Both checks return `{ ok: true }` or `{ ok: false, reason, path }`. They never
 create files or directories. A missing target is checked through its nearest
-existing ancestor, with the remaining components included in the resolved path.
-An existing directory is checked itself; for an existing file, its resolved
-parent is checked. Resolution or inspection errors refuse rather than grant trust.
+existing ancestor. On Unix the remaining components are included in the resolved
+path; an existing directory is checked itself and an existing file's resolved
+parent is checked. On Windows an existing file or directory is verified itself,
+or the nearest existing directory is verified for a missing target. Windows links
+are not resolved away before verification: native reparse-point checks must see
+them. Resolution or inspection errors refuse rather than grant trust.
 
 - **Unix:** resolve symlinks, then inspect every directory through the root with
   `lstat` and `stat`. Owners must be the effective user or root, with no group or
@@ -60,25 +78,44 @@ parent is checked. Resolution or inspection errors refuse rather than grant trus
   owner and group must match euid/egid, `/etc/group` must list no members other
   than that user, and `/etc/passwd` must have no other user with that primary gid.
   Unreadable, malformed, missing, or ambiguous account records refuse the exception.
-- **Windows:** resolve junctions and symlinks using native realpath, and require
-  case-insensitive, component-wise containment in `%LOCALAPPDATA%` or `%APPDATA%`.
-  Unset/empty values fall back to `%USERPROFILE%\AppData\Local` and
-  `%USERPROFILE%\AppData\Roaming`, respectively. Each root must itself resolve to
-  an existing directory. Documents, sibling prefixes, and links leaving these
-  roots are refused. Default app-data ACLs grant the user, SYSTEM, and
-  Administrators access; **deliberately loosened ACLs are not detected**, because
-  Node cannot read DACLs. Rust code uses the real DACL verification in `subc-os`.
+- **Windows:** verified owner-only security descriptor via @cortexkit/private-files.
+  There is no AppData location rule or fallback. Native verification uses the same
+  descriptor policy as Rust, including compatible inherited Rust-written files,
+  and refuses unsafe ancestry and reparse points. Only absolute, unambiguous local
+  drive paths on fixed ACL-persisting volumes are supported; see the sibling's
+  README for the full boundaries. A missing addon (`PrivateFilesUnavailableError`)
+  refuses with a clear reason; no unchecked or mode-only write is allowed.
+  `checkOwnerOnlyPath` always refuses on Windows with guidance to use
+  `checkOwnerOnlyPathAsync`, because native verification is asynchronous.
 
-`options` can inject `platform`, `env` (a string/undefined record), `euid`, `egid`,
+`options` can inject `platform`, `euid`, `egid`,
 and `fs`. The sync `fs` methods are `realpathSync`, `lstatSync`, `statSync`, and
 `readFileSync`; the async twin takes promise-returning `realpath`, `lstat`, `stat`,
 and `readFile`. Reads return bytes for strict UTF-8 decoding of account files.
 Omitted methods use the real filesystem; inject all methods for isolated tests.
 An explicit `null` effective ID models an unavailable identity.
+The legacy `env` option is retained for compatibility but no longer grants trust.
 
 This is a preflight check, not an atomic filesystem capability: another process
-can change the path afterward. Callers must still use secure creation and write
-operations, including owner-only file modes and appropriate symlink protections.
+can change the path afterward. **Creating through `createPrivateFile` and
+`createPrivateDirectory` is the safe path on Windows:** private-files sets and
+verifies the descriptor atomically at creation and writes through that same handle.
+Checking a path and then writing by path leaves a race window. Both wrappers
+refuse a missing addon and propagate security failures, never falling back.
+
+`createPrivateFile(path, bytes)` exclusively creates one file;
+`createPrivateDirectory(path)` creates one directory, not a recursive tree. Neither
+overwrites, repairs, or reuses an existing object. On Unix these wrappers check
+the parent with the unchanged Unix policy before creating with `0600`/`0700`.
+Unix preflight and pathname creation are not an atomic capability; callers still
+need to control concurrent changes to their paths.
+
+The Windows module-boundary delegation and unavailable-addon tests run on all
+hosts in isolated mock processes. The test named `real Windows creates and
+verifies owner-only security descriptors` runs only on real Windows with a matching
+native prebuild. Portable tests do not qualify Windows ACL enforcement; the
+private-files Windows qualification suite supplies that proof. The unchanged real
+Unix filesystem checks and no-addon/exclusive-creation tests run on macOS/Linux.
 
 ## Scope
 

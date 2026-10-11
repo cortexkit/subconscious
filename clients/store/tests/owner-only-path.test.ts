@@ -1,6 +1,6 @@
 import { chmodSync, existsSync, mkdtempSync, mkdirSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, posix, win32 } from "node:path";
+import { join, posix } from "node:path";
 import { describe, expect, test } from "bun:test";
 
 import {
@@ -23,9 +23,9 @@ function ioError(code: string): Error & { code: string } {
 const passwd = "# comment\n\nalice:x:10:20::/:/bin/sh\n";
 const group = "# comment\n\nalice:x:20:\n";
 
-function fileSystem(platform: "linux" | "win32") {
-  const paths = platform === "win32" ? win32 : posix;
-  const key = (path: string) => platform === "win32" ? paths.normalize(path).toLowerCase() : paths.normalize(path);
+function fileSystem() {
+  const paths = posix;
+  const key = (path: string) => paths.normalize(path);
   const nodes = new Map<string, { path: string; value: OwnerOnlyPathMetadata }>();
   const links = new Map<string, string>();
   const calls: string[] = [];
@@ -81,7 +81,7 @@ async function checkBoth(path: string, options: OwnerOnlyPathOptions): Promise<O
 }
 
 function unixTree() {
-  const fixture = fileSystem("linux");
+  const fixture = fileSystem();
   fixture.add("/", directory(0o755, 0, 0));
   fixture.add("/home", directory(0o755, 0, 0));
   fixture.add("/home/alice");
@@ -89,25 +89,6 @@ function unixTree() {
   return { ...fixture, options: { platform: "linux", euid: 10, egid: 20, fs: fixture.fs } };
 }
 
-function windowsTree() {
-  const fixture = fileSystem("win32");
-  const local = "C:\\Users\\alice\\AppData\\Local";
-  const roaming = "C:\\Users\\alice\\AppData\\Roaming";
-  // Windows's synthetic Unix bits are intentionally public; the policy must ignore them.
-  const synthetic = directory(0o777);
-  fixture.add(local, synthetic);
-  fixture.add(roaming, synthetic);
-  fixture.add(`${local}\\Client`, synthetic);
-  fixture.add(`${roaming}\\Client`, synthetic);
-  fixture.add("C:\\Users\\alice\\Documents", synthetic);
-  fixture.add("C:\\Users\\alice\\AppDataX", synthetic);
-  fixture.add("C:\\Public", synthetic);
-  fixture.add("C:\\Public\\secret.json", { ...synthetic, isDirectory: () => false });
-  return {
-    ...fixture, local, roaming,
-    options: { platform: "win32", env: { LOCALAPPDATA: local, APPDATA: roaming }, fs: fixture.fs },
-  };
-}
 
 function expectRefusal(result: OwnerOnlyPathResult, reason: string, path?: string) {
   expect(result.ok).toBe(false);
@@ -260,98 +241,6 @@ describe("Unix user-private groups", () => {
   });
 });
 
-describe("Windows private app-data containment", () => {
-  test("Windows accepts inside LOCALAPPDATA", async () => {
-    const tree = windowsTree();
-    expect(await checkBoth(`${tree.local}\\Client\\token.json`, tree.options)).toEqual({ ok: true });
-  });
-
-  test("Windows accepts inside APPDATA", async () => {
-    const tree = windowsTree();
-    expect(await checkBoth(`${tree.roaming}\\Client\\token.json`, tree.options)).toEqual({ ok: true });
-  });
-
-  test("Windows refuses Documents", async () => {
-    const tree = windowsTree();
-    expectRefusal(await checkBoth("C:\\Users\\alice\\Documents\\token.json", tree.options), "outside the user's private app-data folders");
-  });
-
-  test("Windows refuses the AppDataX sibling", async () => {
-    const tree = windowsTree();
-    tree.add("C:\\Users\\alice\\AppData", directory(0o777));
-    expectRefusal(await checkBoth("C:\\Users\\alice\\AppDataX\\token.json", {
-      ...tree.options, env: { LOCALAPPDATA: "C:\\Users\\alice\\AppData" },
-    }), "outside the user's private app-data folders");
-  });
-
-  test("Windows refuses a Local-prefix sibling with the default roots", async () => {
-    const tree = windowsTree();
-    tree.add(`${tree.local}X`, directory(0o777));
-    expectRefusal(await checkBoth(`${tree.local}X\\token.json`, tree.options), "outside the user's private app-data folders");
-  });
-
-  test("Windows accepts case differences", async () => {
-    const tree = windowsTree();
-    expect(await checkBoth("c:\\uSeRs\\ALICE\\appdata\\LOCAL\\client\\token.json", tree.options)).toEqual({ ok: true });
-  });
-
-  test("Windows refuses a junction whose realpath leaves the root", async () => {
-    const tree = windowsTree();
-    tree.link(`${tree.local}\\escape`, "C:\\Public");
-    expectRefusal(await checkBoth(`${tree.local}\\escape\\secret.json`, tree.options), "outside the user's private app-data folders", "C:\\Public\\secret.json");
-  });
-
-  test("Windows refuses missing descendants of an escaping junction", async () => {
-    const tree = windowsTree();
-    tree.link(`${tree.local}\\escape`, "C:\\Public");
-    expectRefusal(await checkBoth(`${tree.local}\\escape\\missing\\token.json`, tree.options), "outside the user's private app-data folders", "C:\\Public\\missing\\token.json");
-  });
-
-  test("Windows resolves the trusted roots as well as the target", async () => {
-    const tree = windowsTree();
-    tree.add("D:\\Private", directory(0o777));
-    tree.link(tree.local, "D:\\Private");
-    expect(await checkBoth("D:\\Private\\missing\\token.json", tree.options)).toEqual({ ok: true });
-  });
-
-  for (const folder of ["Local", "Roaming"]) {
-    test(`Windows falls back to USERPROFILE for ${folder}`, async () => {
-      const tree = windowsTree();
-      expect(await checkBoth(`C:\\Users\\alice\\AppData\\${folder}\\Client\\token.json`, {
-        ...tree.options, env: { USERPROFILE: "C:\\Users\\alice", LOCALAPPDATA: "", APPDATA: "" },
-      })).toEqual({ ok: true });
-    });
-  }
-
-  test("Windows names the failure with no configured root", async () => {
-    const tree = windowsTree();
-    expectRefusal(await checkBoth(`${tree.local}\\Client\\token.json`, { ...tree.options, env: {} }), "could not resolve any of the user's private app-data folders");
-  });
-
-  test("Windows names the failure with no resolvable root", async () => {
-    const tree = windowsTree();
-    expectRefusal(await checkBoth(`${tree.local}\\Client\\token.json`, {
-      ...tree.options, env: { LOCALAPPDATA: "C:\\Unavailable", APPDATA: "C:\\AlsoUnavailable" },
-    }), "could not resolve any of the user's private app-data folders");
-  });
-
-  test("Windows refuses other volumes and UNC shares", async () => {
-    const tree = windowsTree();
-    for (const path of ["D:\\Public", "\\\\server\\share\\Public"]) {
-      tree.add(path, directory(0o777));
-      expectRefusal(await checkBoth(`${path}\\token.json`, tree.options), "outside the user's private app-data folders");
-    }
-  });
-
-  test("Windows checks containment of the full missing path", async () => {
-    const tree = windowsTree();
-    const path = `${tree.local}\\Client\\new\\nested\\token.json`;
-    const nodeCount = tree.calls.length;
-    expect(await checkBoth(path, tree.options)).toEqual({ ok: true });
-    expect(tree.calls.length).toBeGreaterThan(nodeCount);
-    expect(() => tree.fs.lstatSync(path)).toThrow("ENOENT");
-  });
-});
 
 describe("resolution errors", () => {
   test("refuses a dangling symlink rather than treating it as missing", async () => {

@@ -23,3 +23,4 @@ export {
   type OwnerOnlyPathFileSystem,
   type OwnerOnlyPathAsyncFileSystem,
 } from "./owner-only-path.js";
+export { createPrivateFile, createPrivateDirectory } from "./private-write.js";

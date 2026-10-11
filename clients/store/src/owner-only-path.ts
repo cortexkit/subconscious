@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import * as fsAsync from "node:fs/promises";
 import { posix, win32 } from "node:path";
+import { withWindowsPrivateFiles } from "./windows-private-files.js";
 
 export type OwnerOnlyPathResult =
   | { ok: true }
@@ -104,37 +105,31 @@ function* resolveTarget(input: string, paths: typeof posix): Check<{
   }
 }
 
-function isInsideWindowsRoot(root: string, target: string): boolean {
-  const relative = win32.relative(root.toLowerCase(), target.toLowerCase());
-  return relative === "" || (!win32.isAbsolute(relative) && relative.split("\\")[0] !== "..");
-}
-
-function* checkWindows(input: string, env: Record<string, string | undefined>): Check<OwnerOnlyPathResult> {
-  let target: string;
+async function checkWindows(input: string, io: OwnerOnlyPathAsyncFileSystem): Promise<OwnerOnlyPathResult> {
+  let candidate = input;
+  let missing = false;
   try {
-    target = (yield* resolveTarget(input, win32)).resolved;
-  } catch {
-    return refused(input, "could not resolve target or its nearest existing ancestor");
-  }
-  const roots = [
-    env.LOCALAPPDATA || (env.USERPROFILE ? win32.join(env.USERPROFILE, "AppData", "Local") : undefined),
-    env.APPDATA || (env.USERPROFILE ? win32.join(env.USERPROFILE, "AppData", "Roaming") : undefined),
-  ];
-  let resolvedRoots = 0;
-  for (const root of roots) {
-    if (!root || !win32.isAbsolute(root)) continue;
-    try {
-      const resolved = yield* realpath(root);
-      if (!(yield* metadata("stat", resolved)).isDirectory()) continue;
-      resolvedRoots++;
-      if (isInsideWindowsRoot(resolved, target)) return { ok: true };
-    } catch {
-      // An unavailable root cannot grant trust; another configured private root may still do so.
+    if (!input || input.includes("\0") || !win32.isAbsolute(input)) throw new Error("expected an absolute Windows path");
+    for (;;) {
+      let entry: OwnerOnlyPathMetadata;
+      try {
+        entry = await io.lstat(candidate);
+      } catch (error) {
+        if (!isMissing(error)) throw error;
+        const parent = win32.dirname(candidate);
+        if (parent === candidate) throw error;
+        candidate = parent;
+        missing = true;
+        continue;
+      }
+      if (missing && !entry.isDirectory()) throw new Error("nearest existing ancestor is not a directory");
+      // Do not realpath Windows links: the native verifier must see and refuse reparse points.
+      await withWindowsPrivateFiles((api) => api.verifyPrivatePath(candidate, entry.isDirectory() ? "directory" : "file"));
+      return { ok: true };
     }
+  } catch (error) {
+    return refused(candidate, `Windows private-path verification refused: ${error instanceof Error ? error.message : String(error)}`);
   }
-  return refused(target, resolvedRoots === 0
-    ? "could not resolve any of the user's private app-data folders"
-    : "outside the user's private app-data folders");
 }
 
 function accountRecords(bytes: Uint8Array, count: 4 | 7): string[][] {
@@ -231,21 +226,19 @@ function* checkUnix(input: string, euid: number | null | undefined, egid: number
 }
 
 function policy(input: string, options: PolicyOptions): Check<OwnerOnlyPathResult> {
-  const platform = options.platform ?? process.platform;
-  return platform === "win32"
-    ? checkWindows(input, options.env ?? process.env)
-    : checkUnix(input,
-      options.euid === undefined ? process.geteuid?.() : options.euid,
-      options.egid === undefined ? process.getegid?.() : options.egid);
+  return checkUnix(input,
+    options.euid === undefined ? process.geteuid?.() : options.euid,
+    options.egid === undefined ? process.getegid?.() : options.egid);
 }
 
 /**
  * Check a secret-storage path without creating anything. Unix checks the resolved
- * ancestor chain; Windows trusts resolved containment in Local/Roaming app data.
- * Containment cannot detect deliberately loosened Windows ACLs (Node has no DACL
- * API). Rust callers should use subc-os for DACL verification.
+ * ancestor chain; Windows requires the async entry point for native verification.
  */
 export function checkOwnerOnlyPath(input: string, options: OwnerOnlyPathOptions = {}): OwnerOnlyPathResult {
+  if ((options.platform ?? process.platform) === "win32") {
+    return refused(input, "Windows security descriptor verification is asynchronous; use checkOwnerOnlyPathAsync");
+  }
   const io: OwnerOnlyPathFileSystem = {
     realpathSync: fs.realpathSync.native,
     lstatSync: fs.lstatSync,
@@ -274,7 +267,7 @@ export function checkOwnerOnlyPath(input: string, options: OwnerOnlyPathOptions 
   return step.value;
 }
 
-/** Async filesystem twin of checkOwnerOnlyPath, with the identical policy. */
+/** Unix uses the sync policy; Windows verifies the owner-only security descriptor natively. */
 export async function checkOwnerOnlyPathAsync(input: string, options: OwnerOnlyPathAsyncOptions = {}): Promise<OwnerOnlyPathResult> {
   const io: OwnerOnlyPathAsyncFileSystem = {
     realpath: fsAsync.realpath,
@@ -283,6 +276,7 @@ export async function checkOwnerOnlyPathAsync(input: string, options: OwnerOnlyP
     readFile: fsAsync.readFile,
     ...options.fs,
   };
+  if ((options.platform ?? process.platform) === "win32") return checkWindows(input, io);
   const check = policy(input, options);
   let step = check.next();
   while (!step.done) {

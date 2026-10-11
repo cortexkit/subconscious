@@ -316,6 +316,13 @@ impl<'de> Deserialize<'de> for ModuleManifest {
     }
 }
 
+/// The `server.describe` capability a daemon advertises when `catalog.list`
+/// carries each module's declared `events`. Without it, an entry with no
+/// `events` cannot tell "this module declares none" from "this daemon never
+/// reports them", so a consumer that acts on declared events checks for this
+/// first.
+pub const CAP_CATALOG_EVENTS_V1: &str = "catalog-events/v1";
+
 /// A versioned bus event notice whose body is served by the publisher.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]

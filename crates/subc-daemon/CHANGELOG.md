@@ -2,6 +2,7 @@
 
 ## 0.33.5
 
+- Advertise `catalog-events/v1` in `server.describe`, so a consumer can tell a catalog entry without `events` (the module declares none) from a daemon that does not report declared events.
 - Create Windows run directories with protected owner-only DACLs instead of trusting inherited permissions, including redirected paths. Tighten existing run directories and remove broad inherited access from unprotected descendants using `subc-os`.
 
 ## 0.33.4

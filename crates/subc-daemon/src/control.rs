@@ -793,6 +793,7 @@ impl ControlHandler {
                 CAP_ADMISSION_FACTS_RELAY.to_string(),
                 CAP_SCOPES_V1.to_string(),
                 CAP_ROUTE_ROLE_VERSIONS_V1.to_string(),
+                subc_protocol::manifest::CAP_CATALOG_EVENTS_V1.to_string(),
             ]),
             route_bind_relay_timeout: DEFAULT_ROUTE_BIND_RELAY_TIMEOUT,
             route_bind_relay_timeouts: BTreeMap::new(),
@@ -10120,6 +10121,33 @@ mod tests {
         };
         assert!(
             capabilities.iter().any(|c| c == CAP_ROUTE_ROLE_VERSIONS_V1),
+            "{capabilities:?}"
+        );
+    }
+
+    /// `catalog-events/v1` is in `server.describe`, so a consumer can tell a
+    /// catalog entry without `events` (the module declares none) from a daemon
+    /// that never reports declared events.
+    #[tokio::test]
+    async fn catalog_events_capability_is_advertised() {
+        let handler = ControlHandler::new(Arc::new(Registry::default()));
+        let body = serde_json::to_vec(&ClientControlRequest::ServerDescribe {}).unwrap();
+        let frame = Frame::build(FrameType::Request, control_flags(), 0, 0, 5, body).unwrap();
+        let reply = handler
+            .handle_control_frame(&route_ctx(ConnectionId::new(151)).0, frame)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let ClientControlResponse::ServerDescribe { capabilities, .. } =
+            serde_json::from_slice(&reply.body).unwrap()
+        else {
+            panic!("not a server.describe reply");
+        };
+        assert!(
+            capabilities
+                .iter()
+                .any(|c| c == subc_protocol::manifest::CAP_CATALOG_EVENTS_V1),
             "{capabilities:?}"
         );
     }

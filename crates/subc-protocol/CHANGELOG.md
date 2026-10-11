@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.30.1
+
+- Add `manifest::CAP_CATALOG_EVENTS_V1` (`catalog-events/v1`), the `server.describe` capability a daemon advertises when `catalog.list` carries modules' declared `events`.
+
 ## 0.30.0
 
 - **Breaking.** `ScopeRecord` gains `expires_at_ms: Option<u64>`, an absolute Unix wall-clock deadline in milliseconds that the daemon enforces itself: at the deadline the scope ends as if its owner had removed it, routes under it close with `scope_ended`, and that ref at that epoch can never return (`scope_expired`). The deadline is fixed for the epoch (`scope_expiry_immutable`) and at most `MAX_SCOPE_EXPIRY_AHEAD_MS` (24 hours) ahead (`scope_expiry_too_far`).

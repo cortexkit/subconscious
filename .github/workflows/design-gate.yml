@@ -38,18 +38,11 @@ name: Design gate
 # green. A caller that leaves them out only re-evaluates on the next push or a
 # manual re-run from the checks tab.
 
+# The gate takes no secrets: it holds no credential beyond the job's own
+# GITHUB_TOKEN. A caller that passes one is refused when the workflow is
+# parsed, which is the intended signal that it is still on the old contract.
 on:
   workflow_call:
-    secrets:
-      # Unused. The gate no longer mints an App token, so it holds no
-      # credential beyond the job's own GITHUB_TOKEN. These stay declared,
-      # optional, only so callers that still pass them keep parsing: GitHub
-      # refuses a caller that passes a secret the called workflow does not
-      # declare. Remove them once no caller passes them.
-      CK_CI_APP_ID:
-        required: false
-      CK_CI_APP_PRIVATE_KEY:
-        required: false
 
 concurrency:
   group: design-gate-${{ github.event.pull_request.number || github.event.issue.number }}

@@ -102,10 +102,9 @@ run. Keep it that way: the gate runs in public repositories, and an App private
 key reachable from a `pull_request_target` job there is one bug away from
 exposing every repository that App can read.
 
-The reusable workflow still declares `CK_CI_APP_ID` and
-`CK_CI_APP_PRIVATE_KEY` as optional and ignores them, only so that callers
-which still pass them keep parsing while they move off them. Those
-declarations go once no caller passes them.
+The reusable workflow declares no secrets, so a caller that still passes
+`CK_CI_APP_ID` or `CK_CI_APP_PRIVATE_KEY` is refused when its workflow is
+parsed. Delete its `secrets:` block.
 
 ### 3. The two labels
 

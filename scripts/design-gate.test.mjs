@@ -1445,8 +1445,8 @@ describe("workflow security properties", () => {
       "the gate must not mint an App token",
     );
     assert.ok(
-      !/secrets\.CK_CI_/.test(stripCommentLines(workflowYaml)),
-      "the gate must not read the CK CI App secrets",
+      !/CK_CI_/.test(stripCommentLines(workflowYaml)),
+      "the gate must neither declare nor read the CK CI App secrets",
     );
 
     // Isolate the pull-request job (design-gate)

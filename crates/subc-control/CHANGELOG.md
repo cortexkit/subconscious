@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.29.4
+
+- Add standalone, op-tagged activity record, query and subscribe request/response types, ledger entries, actor citations and cursors. The exhaustive `ClientControlRequest`, `ClientControlResponse` and `ClientControlPush` enums are unchanged; dispatch activity bodies using the operation name in each body's `op` field.
+- Add activity operation names, refusal-code constants and the `activity-ledger/v1` capability. Query replies require a current-incarnation `head` cursor; record requests contain no caller-supplied actor.
+
 ## 0.29.3
 
 - Add optional `launch_nonce_source` to supervisor list entries and daemon-observed module provenance for per-spawn Windows pipe consumption. Older payloads still decode, and the fields are omitted when no observation is available.

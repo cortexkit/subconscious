@@ -26,6 +26,9 @@ use subc_protocol::{
 
 pub use subc_protocol::RouteCloseReason;
 
+mod activity;
+pub use activity::*;
+
 macro_rules! open_string_enum {
     (
         $(#[$meta:meta])*
@@ -134,6 +137,9 @@ pub mod ops {
     pub const SUPERVISOR_PROVENANCE: &str = "supervisor.provenance";
     pub const SUPERVISOR_SPAWN_SNAPSHOT: &str = "supervisor.spawn_snapshot";
     pub const SUPERVISOR_SPAWN_SUBSCRIBE: &str = "supervisor.spawn_subscribe";
+    pub const ACTIVITY_RECORD: &str = "activity.record";
+    pub const ACTIVITY_QUERY: &str = "activity.query";
+    pub const ACTIVITY_SUBSCRIBE: &str = "activity.subscribe";
 }
 
 /// Client-originated channel-0 control RPC body.

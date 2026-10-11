@@ -1914,7 +1914,7 @@ dependencies = [
 
 [[package]]
 name = "subc-control"
-version = "0.29.3"
+version = "0.29.4"
 dependencies = [
  "serde",
  "serde_json",

@@ -40,6 +40,10 @@ const AUTH_DEADLINE: Duration = Duration::from_secs(2);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const DASHBOARD_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const CONTROL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
+/// The daemon's default operator delivery budget includes queueing, the prompt,
+/// and provider recovery. Reserve it even for older daemons and log mode because
+/// the wire does not advertise whether a privileged request will prompt.
+const OPERATOR_RESPONSE_BUDGET: Duration = Duration::from_secs(290);
 /// Time for the daemon to finish post-drain process teardown, publish the
 /// response, and absorb scheduler jitter after the configured drain budget.
 const DRAIN_RESPONSE_MARGIN: Duration = Duration::from_secs(2);
@@ -1246,6 +1250,7 @@ impl CkClient {
         operation: String,
         verify_command: String,
     ) -> Result<Value, CkError> {
+        let response_timeout = response_timeout.saturating_add(OPERATOR_RESPONSE_BUDGET);
         match self.rpc_value_with_timeout(request, response_timeout).await {
             Err(CkError::ResponseTimeout { timeout }) => Err(CkError::OutcomeUnknown {
                 operation,
@@ -8087,7 +8092,41 @@ fn discover_connection_file(override_path: Option<&Path>) -> Result<ResolvedConn
 
 fn decode_error_body(body: &[u8]) -> String {
     match serde_json::from_slice::<subc_protocol::ErrorBody>(body) {
-        Ok(error) => format!("{} — {}", error.code, error.message),
+        Ok(error) => {
+            let reason = error
+                .detail
+                .as_ref()
+                .and_then(|detail| detail.get("reason"))
+                .and_then(Value::as_str);
+            let message = match error.code.as_str() {
+                subc_protocol::error_codes::OPERATOR_DECLINED
+                | subc_protocol::error_codes::OPERATOR_PRESENCE_UNAVAILABLE
+                    if reason == Some("backoff") =>
+                {
+                    "refused without asking: too many recent declines"
+                }
+                subc_protocol::error_codes::OPERATOR_DECLINED => match reason {
+                    Some("person") => "declined at the operator prompt",
+                    _ => "operator approval cancelled or withdrawn",
+                },
+                subc_protocol::error_codes::OPERATOR_PRESENCE_UNAVAILABLE => match reason {
+                    Some("timeout") => "operator prompt timed out without approval",
+                    Some("queue_wait") => {
+                        "refused without asking: operator prompt queue wait expired"
+                    }
+                    Some("queue_full") => "refused without asking: operator prompt queue is full",
+                    Some("module_limit") => {
+                        "refused without asking: too many pending operator requests"
+                    }
+                    Some("provider_stuck") => {
+                        "no way to ask the operator: confirmation provider is stuck"
+                    }
+                    _ => "no way to ask the operator on this machine",
+                },
+                _ => &error.message,
+            };
+            format!("{} — {message}", error.code)
+        }
         Err(_) => String::from_utf8_lossy(body).into_owned(),
     }
 }
@@ -8287,6 +8326,419 @@ fn a_successful_command_stays_successful_when_old_image_cleanup_fails() {
 
 #[cfg(test)]
 mod tests {
+    mod privileged_operator_rpc {
+        use super::super::*;
+        use subc_protocol::{error_codes, ErrorBody, PROTOCOL_VERSION};
+        use subc_transport::{
+            authenticate_server, generate_daemon_id, generate_key, Endpoint, SCHEMA_VERSION,
+        };
+        use tokio::{net::TcpListener, task::JoinHandle};
+
+        fn operator_error(code: &str, reason: Option<&str>) -> CkError {
+            let mut body = ErrorBody::new(code, "operator confirmation refused");
+            if let Some(reason) = reason {
+                body = body.with_detail(json!({"reason": reason}));
+            }
+            CkError::Rejected(decode_error_body(&serde_json::to_vec(&body).unwrap()))
+        }
+
+        #[test]
+        fn operator_refusals_are_one_line_and_nonzero() {
+            for (code, reason, expected) in [
+                (
+                    error_codes::OPERATOR_DECLINED,
+                    Some("person"),
+                    "declined at the operator prompt",
+                ),
+                (
+                    error_codes::OPERATOR_PRESENCE_UNAVAILABLE,
+                    Some("timeout"),
+                    "operator prompt timed out without approval",
+                ),
+                (
+                    error_codes::OPERATOR_DECLINED,
+                    Some("caller_cancelled"),
+                    "operator approval cancelled or withdrawn",
+                ),
+                (
+                    error_codes::OPERATOR_DECLINED,
+                    None,
+                    "operator approval cancelled or withdrawn",
+                ),
+                (
+                    error_codes::OPERATOR_PRESENCE_UNAVAILABLE,
+                    Some("unsupported_platform"),
+                    "no way to ask the operator on this machine",
+                ),
+                (
+                    error_codes::OPERATOR_PRESENCE_UNAVAILABLE,
+                    Some("no_presence"),
+                    "no way to ask the operator on this machine",
+                ),
+                (
+                    error_codes::OPERATOR_PRESENCE_UNAVAILABLE,
+                    Some("queue_wait"),
+                    "refused without asking: operator prompt queue wait expired",
+                ),
+                (
+                    error_codes::OPERATOR_PRESENCE_UNAVAILABLE,
+                    Some("queue_full"),
+                    "refused without asking: operator prompt queue is full",
+                ),
+                (
+                    error_codes::OPERATOR_PRESENCE_UNAVAILABLE,
+                    Some("module_limit"),
+                    "refused without asking: too many pending operator requests",
+                ),
+                (
+                    error_codes::OPERATOR_PRESENCE_UNAVAILABLE,
+                    Some("provider_stuck"),
+                    "no way to ask the operator: confirmation provider is stuck",
+                ),
+            ] {
+                let error = decorate_error(operator_error(code, reason), false, None);
+                assert_eq!(error.to_string(), format!("{code} — {expected}"));
+                assert_eq!(error.to_string().lines().count(), 1);
+                assert_eq!(error.exit_code(), 1);
+            }
+        }
+
+        #[test]
+        fn backoff_refuses_without_claiming_a_prompt_was_shown() {
+            for code in [
+                error_codes::OPERATOR_DECLINED,
+                error_codes::OPERATOR_PRESENCE_UNAVAILABLE,
+            ] {
+                let error = operator_error(code, Some("backoff"));
+                assert_eq!(
+                    error.to_string(),
+                    format!("{code} — refused without asking: too many recent declines")
+                );
+                assert!(!error.to_string().contains("prompt"));
+                assert_eq!(error.exit_code(), 1);
+            }
+        }
+
+        #[test]
+        fn unrelated_error_rendering_is_unchanged() {
+            let body = ErrorBody::new("existing_code", "existing message")
+                .with_detail(json!({"reason": "backoff"}));
+            assert_eq!(
+                decode_error_body(&serde_json::to_vec(&body).unwrap()),
+                "existing_code — existing message"
+            );
+            assert_eq!(decode_error_body(b"not JSON"), "not JSON");
+        }
+
+        async fn connected_pair() -> (CkClient, TcpStream) {
+            let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap();
+            let info = ConnectionInfo {
+                schema: SCHEMA_VERSION,
+                wire_version: Some(PROTOCOL_VERSION),
+                endpoints: vec![Endpoint {
+                    host: "127.0.0.1".to_string(),
+                    port: listener.local_addr().unwrap().port(),
+                }],
+                key: generate_key().unwrap(),
+                daemon_id: generate_daemon_id().unwrap(),
+                pid: process::id(),
+                daemon_ver: "scripted-test-daemon".to_string(),
+            };
+            let resolved = ResolvedConnection {
+                path: PathBuf::from("scripted-connection.json"),
+                info: info.clone(),
+            };
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                authenticate_server(
+                    &mut stream,
+                    &info.key,
+                    &info.daemon_id,
+                    &info.daemon_ver,
+                    AUTH_DEADLINE,
+                )
+                .await
+                .unwrap();
+                stream
+            });
+            let client = CkClient::connect(resolved).await.unwrap();
+            (client, server.await.unwrap())
+        }
+
+        async fn reply(stream: &mut TcpStream, request: &Frame, ty: FrameType, body: Value) {
+            let frame = Frame::build_with_version(
+                request.header.ver,
+                ty,
+                request.header.flags,
+                0,
+                0,
+                request.header.corr,
+                serde_json::to_vec(&body).unwrap(),
+            )
+            .unwrap();
+            write_frame(stream, &frame).await.unwrap();
+        }
+
+        // Paused Tokio time can otherwise jump to a deadline while loopback IO
+        // waits on the OS. Keep a runnable task until the request is on the wire.
+        fn keep_time_frozen_during_io() -> JoinHandle<()> {
+            tokio::spawn(async {
+                loop {
+                    tokio::task::yield_now().await;
+                }
+            })
+        }
+
+        async fn begin_command(
+            expected: ClientControlRequest,
+            list: Value,
+        ) -> (JoinHandle<Result<(), CkError>>, TcpStream, Frame) {
+            let awake = keep_time_frozen_during_io();
+            let started = time::Instant::now();
+            let (mut client, mut server) = connected_pair().await;
+            let command = expected.clone();
+            let task = tokio::spawn(async move {
+                match command {
+                    ClientControlRequest::SupervisorRestart {
+                        module_id,
+                        drain_timeout_ms,
+                    } => module_restart(&mut client, &module_id, drain_timeout_ms, true).await,
+                    ClientControlRequest::SupervisorSwap {
+                        module_id,
+                        ready_timeout_ms,
+                    } => module_swap(&mut client, &module_id, ready_timeout_ms, true).await,
+                    ClientControlRequest::SupervisorRescan { preview } => {
+                        module_rescan(&mut client, true, preview).await
+                    }
+                    ClientControlRequest::SupervisorReleaseReserved { module_id } => {
+                        module_release_reserved(&mut client, &module_id, true).await
+                    }
+                    ClientControlRequest::SupervisorSetEnabled { module_id, enabled } => {
+                        module_set_enabled(&mut client, &module_id, enabled, true).await
+                    }
+                    ClientControlRequest::SupervisorList {} => {
+                        supervisor_list(&mut client).await.map(|_| ())
+                    }
+                    _ => panic!("unsupported test command"),
+                }
+            });
+            let mut frame = read_frame(&mut server).await.unwrap().unwrap();
+            if matches!(
+                expected,
+                ClientControlRequest::SupervisorSetEnabled { .. }
+                    | ClientControlRequest::SupervisorRescan { preview: false }
+            ) {
+                assert_eq!(
+                    serde_json::from_slice::<ClientControlRequest>(&frame.body).unwrap(),
+                    ClientControlRequest::SupervisorList {}
+                );
+                reply(&mut server, &frame, FrameType::Response, list).await;
+                frame = read_frame(&mut server).await.unwrap().unwrap();
+            }
+            assert_eq!(frame.header.ty, FrameType::Request);
+            assert_eq!(frame.header.channel, 0);
+            assert_eq!(
+                serde_json::from_slice::<ClientControlRequest>(&frame.body).unwrap(),
+                expected
+            );
+            assert_eq!(time::Instant::now(), started);
+            awake.abort();
+            (task, server, frame)
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn restart_never_reply_is_unknown_only_at_300_seconds_without_retry() {
+            let (task, mut server, _) = begin_command(
+                ClientControlRequest::SupervisorRestart {
+                    module_id: "aft".to_string(),
+                    drain_timeout_ms: None,
+                },
+                json!({}),
+            )
+            .await;
+            time::advance(Duration::from_secs(299)).await;
+            tokio::task::yield_now().await;
+            assert!(
+                !task.is_finished(),
+                "restart must still wait at 299 seconds"
+            );
+            time::advance(Duration::from_secs(1)).await;
+            let error = task.await.unwrap().unwrap_err();
+            assert!(matches!(
+                error,
+                CkError::OutcomeUnknown { timeout, .. } if timeout == Duration::from_secs(300)
+            ));
+            assert_eq!(error.exit_code(), 4);
+            assert!(error
+                .to_string()
+                .contains("outcome unknown: `ck module restart aft`"));
+            assert!(
+                read_frame(&mut server).await.unwrap().is_none(),
+                "no retry frame"
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn every_privileged_command_adds_290_seconds_to_its_existing_window() {
+            for (request, list, seconds) in [
+                (
+                    ClientControlRequest::SupervisorSwap {
+                        module_id: "aft".to_string(),
+                        ready_timeout_ms: Some(7_000),
+                    },
+                    json!({}),
+                    307,
+                ),
+                (
+                    ClientControlRequest::SupervisorReleaseReserved {
+                        module_id: "aft".to_string(),
+                    },
+                    json!({}),
+                    300,
+                ),
+                (
+                    ClientControlRequest::SupervisorSetEnabled {
+                        module_id: "aft".to_string(),
+                        enabled: false,
+                    },
+                    json!({"modules": [{"module_id": "aft", "drain_timeout_ms": 5_000}]}),
+                    297,
+                ),
+                (
+                    ClientControlRequest::SupervisorSetEnabled {
+                        module_id: "aft".to_string(),
+                        enabled: true,
+                    },
+                    json!({"modules": [{"module_id": "aft"}]}),
+                    322,
+                ),
+                (
+                    ClientControlRequest::SupervisorRescan { preview: false },
+                    json!({"modules": [{"module_id": "aft", "drain_timeout_ms": 5_000}, {"module_id": "other", "drain_timeout_ms": 11_000}]}),
+                    308,
+                ),
+                (
+                    ClientControlRequest::SupervisorRescan { preview: false },
+                    json!({"modules": []}),
+                    300,
+                ),
+            ] {
+                let (task, mut server, _) = begin_command(request, list).await;
+                time::advance(Duration::from_secs(seconds - 1)).await;
+                tokio::task::yield_now().await;
+                assert!(
+                    !task.is_finished(),
+                    "must still wait before {seconds} seconds"
+                );
+                time::advance(Duration::from_secs(1)).await;
+                let error = task.await.unwrap().unwrap_err();
+                assert!(matches!(
+                    error,
+                    CkError::OutcomeUnknown { timeout, .. } if timeout == Duration::from_secs(seconds)
+                ));
+                assert_eq!(error.exit_code(), 4);
+                assert!(
+                    read_frame(&mut server).await.unwrap().is_none(),
+                    "no retry frame"
+                );
+            }
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn read_and_rescan_preview_keep_the_ten_second_window() {
+            for request in [
+                ClientControlRequest::SupervisorList {},
+                ClientControlRequest::SupervisorRescan { preview: true },
+            ] {
+                let (task, mut server, _) = begin_command(request, json!({})).await;
+                time::advance(Duration::from_secs(9)).await;
+                tokio::task::yield_now().await;
+                assert!(!task.is_finished());
+                time::advance(Duration::from_secs(1)).await;
+                let error = task.await.unwrap().unwrap_err();
+                assert!(matches!(
+                    error,
+                    CkError::ResponseTimeout { timeout } if timeout == Duration::from_secs(10)
+                ));
+                assert_eq!(error.exit_code(), 1);
+                assert!(read_frame(&mut server).await.unwrap().is_none());
+            }
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn restart_handles_approval_reply_after_fifteen_seconds() {
+            let (task, mut server, frame) = begin_command(
+                ClientControlRequest::SupervisorRestart {
+                    module_id: "aft".to_string(),
+                    drain_timeout_ms: None,
+                },
+                json!({}),
+            )
+            .await;
+            time::advance(Duration::from_secs(15)).await;
+            assert!(!task.is_finished());
+            let awake = keep_time_frozen_during_io();
+            reply(
+                &mut server,
+                &frame,
+                FrameType::Response,
+                json!({"applied": true}),
+            )
+            .await;
+            let list = read_frame(&mut server).await.unwrap().unwrap();
+            assert_eq!(
+                serde_json::from_slice::<ClientControlRequest>(&list.body).unwrap(),
+                ClientControlRequest::SupervisorList {}
+            );
+            reply(
+                &mut server,
+                &list,
+                FrameType::Response,
+                json!({"modules": [{"module_id": "aft", "state": "restarting"}]}),
+            )
+            .await;
+            task.await.unwrap().unwrap();
+            awake.abort();
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn restart_handles_operator_error_replies_without_outcome_unknown() {
+            for (code, reason) in [
+                (error_codes::OPERATOR_DECLINED, "person"),
+                (error_codes::OPERATOR_DECLINED, "backoff"),
+                (error_codes::OPERATOR_PRESENCE_UNAVAILABLE, "no_presence"),
+            ] {
+                let (task, mut server, frame) = begin_command(
+                    ClientControlRequest::SupervisorRestart {
+                        module_id: "aft".to_string(),
+                        drain_timeout_ms: None,
+                    },
+                    json!({}),
+                )
+                .await;
+                let awake = keep_time_frozen_during_io();
+                reply(
+                    &mut server,
+                    &frame,
+                    FrameType::Error,
+                    json!({"code": code, "message": "operator confirmation refused", "detail": {"reason": reason}}),
+                )
+                .await;
+                let error = task.await.unwrap().unwrap_err();
+                awake.abort();
+                assert!(matches!(error, CkError::Rejected(_)));
+                assert_eq!(
+                    error.to_string(),
+                    operator_error(code, Some(reason)).to_string()
+                );
+                assert_eq!(error.exit_code(), 1);
+                assert!(read_frame(&mut server).await.unwrap().is_none());
+            }
+        }
+    }
+
     #[test]
     fn terminal_dispositions_render_as_words() {
         let label = |disposition: &str| {

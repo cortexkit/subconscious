@@ -1,6 +1,6 @@
 [package]
 name = "subc-os"
-version = "0.1.15"
+version = "0.1.16"
 edition = "2021"
 license = "MIT"
 publish = true
@@ -36,6 +36,8 @@ rustix = { version = "1", default-features = false, features = ["process", "std"
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_Networking_WinSock",
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Security_Cryptography",

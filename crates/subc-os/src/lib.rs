@@ -54,6 +54,7 @@ pub mod fork_exec_test;
 pub mod launch_nonce;
 pub mod privacy_identity;
 pub mod process_identity;
+pub mod socket_peer;
 #[cfg(windows)]
 pub mod windows_acl;
 #[cfg(unix)]

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.33.9
+
+- Serve additive `activity.record` requests from registered modules and advertise `activity-ledger/v1` in HELLO_ACK and server.describe. The daemon verifies route ownership/epoch and live scope tags before recording the verified identity of the client that opened the route, its project and scope attributes. Events with no route or scope citation identify the calling module.
+- Append `activity.jsonl` beside the terminal journal through cortexkit-log on a bounded single-writer queue. Replies follow successful writes, sequence numbers resume across retained rotated files, and reopening adds a newline after an incomplete final record so it cannot swallow the next append. Open/write failures and queue saturation refuse recording without holding connection readers or stopping routing, supervision or shutdown.
+- Enforce module-owned kinds, Unicode scalar and compact JSON size limits, strict request shape and incarnation-long per-module token buckets (60 initial tokens, 10/s). Add controlled-clock, fault-injection and isolated TCP daemon tests.
+
 ## 0.33.8
 
 - Record terminal history before publishing a health-budget failure or clearing the reaped child's process facts. Apply the same ordering to every child-bearing drain, ordinary exit and daemon-shutdown exit; failed waits and drain teardown errors record their unknown exit before publishing failure. Journal errors still retain the exit record in memory and publish the requested stopped, disabled, restarting or failed state. A panic during terminal recording also publishes that state before resuming the unwind. No-child spawn failures remain failures without fabricated exit records.

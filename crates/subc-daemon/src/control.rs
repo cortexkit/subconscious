@@ -86,6 +86,8 @@ const CAP_ADMISSION_FACTS_RELAY: &str = "admission_facts_relay_v1";
 
 const SUBC_CONTROL_OPS: &[&str] = &[
     ops::ACTIVITY_RECORD,
+    ops::ACTIVITY_QUERY,
+    ops::ACTIVITY_SUBSCRIBE,
     ops::SERVER_DESCRIBE,
     ops::CATALOG_LIST,
     ops::ROUTE_OPEN,
@@ -300,6 +302,7 @@ const ROUTE_OPEN_NOT_SERVING_REASONS: &[&str] = &[
 pub struct ControlHandler {
     registry: Arc<Registry>,
     activity: Option<crate::activity::ActivityLedger>,
+    activity_streams: Arc<Mutex<HashMap<(ConnectionId, u64), tokio::task::AbortHandle>>>,
     forwarding: Arc<ForwardingTable>,
     process_liveness: Option<Arc<dyn ModuleProcessLiveness>>,
     supervisor: SupervisorHandle,
@@ -813,6 +816,7 @@ impl ControlHandler {
         Self {
             registry,
             activity: None,
+            activity_streams: Arc::new(Mutex::new(HashMap::new())),
             forwarding,
             process_liveness: None,
             supervisor: SupervisorHandle::new(),
@@ -1560,8 +1564,8 @@ impl ControlHandler {
             }
             FrameType::Goodbye => self.handle_goodbye(ctx.connection_id),
             FrameType::Cancel => {
-                // A Cancel on channel 0 names either a waiting operator.confirm
-                // or a spawn-event subscription; both answer nothing on success.
+                // A Cancel on channel 0 names a waiting operator.confirm or a
+                // subscription. Successful cancellation has no ordinary reply.
                 if self
                     .forwarding
                     .operator_confirms()
@@ -1569,13 +1573,14 @@ impl ControlHandler {
                     || self
                         .supervisor
                         .cancel_spawn_subscription(ctx.connection_id, frame.header.corr)
+                    || self.cancel_activity_subscription(ctx, &frame)?
                 {
                     Ok(Vec::new())
                 } else {
                     Ok(vec![control_error_frame(
                         &frame,
                         "unknown_subscription",
-                        "no supervisor spawn subscription has this correlation id",
+                        "no subscription has this correlation id",
                     )?])
                 }
             }
@@ -1588,6 +1593,11 @@ impl ControlHandler {
                     .is_some_and(|probe| probe.op == ops::ACTIVITY_RECORD)
                 {
                     return self.handle_activity_record(ctx, frame).await;
+                }
+                if op.as_ref().is_some_and(|probe| {
+                    probe.op == ops::ACTIVITY_QUERY || probe.op == ops::ACTIVITY_SUBSCRIBE
+                }) {
+                    return self.handle_activity_read(ctx, frame).await;
                 }
                 if op
                     .as_ref()
@@ -1819,6 +1829,17 @@ impl ControlHandler {
             self.refresh_capability_requirements();
         }
         self.supervisor.remove_spawn_subscribers(connection_id);
+        self.activity_streams
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|(id, _), task| {
+                if *id == connection_id {
+                    task.abort();
+                    false
+                } else {
+                    true
+                }
+            });
         // Sync authority dies with its connection, so the owner's next
         // connection can take it; the owner's scopes stay as they are.
         self.hello_launch_nonces
@@ -3044,6 +3065,198 @@ impl ControlHandler {
             "ModuleControlResponseToModule::CatalogUpdate",
         )
         .map(|frame| vec![frame])
+    }
+
+    pub(crate) fn with_activity_ledger_config(
+        mut self,
+        run_dir: &Path,
+        incarnation: String,
+        config: crate::activity::ActivityConfig,
+    ) -> Self {
+        self.activity = Some(crate::activity::ActivityLedger::open_config(
+            run_dir.join("activity.jsonl"),
+            incarnation,
+            config,
+        ));
+        self
+    }
+
+    pub(crate) async fn configure_activity(
+        &self,
+        config: crate::activity::ActivityConfig,
+    ) -> Result<(), &'static str> {
+        match &self.activity {
+            Some(ledger) => ledger.configure(config).await,
+            None => Ok(()),
+        }
+    }
+
+    fn cancel_activity_subscription(
+        &self,
+        ctx: &RouteCtx,
+        frame: &Frame,
+    ) -> Result<bool, RouterError> {
+        let task = self
+            .activity_streams
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&(ctx.connection_id, frame.header.corr));
+        let Some(task) = task else {
+            return Ok(false);
+        };
+        task.abort();
+        let end = Frame::build_with_version(
+            response_version(frame),
+            FrameType::StreamEnd,
+            control_flags(),
+            0,
+            0,
+            frame.header.corr,
+            Vec::new(),
+        )
+        .map_err(|error| RouterError::backend(0, frame.header.corr, error.to_string()))?;
+        let sink = ctx.egress.clone();
+        tokio::spawn(async move {
+            let _ = sink.send(end).await;
+        });
+        Ok(true)
+    }
+
+    async fn handle_activity_read(
+        &self,
+        ctx: &RouteCtx,
+        frame: Frame,
+    ) -> Result<Vec<Frame>, RouterError> {
+        use subc_control::{
+            ActivityQueryRequest, ActivitySubscribeRequest, ActivitySubscribeResponse,
+            ACTIVITY_MALFORMED, ACTIVITY_READ_FORBIDDEN, ACTIVITY_UNAVAILABLE,
+        };
+        #[derive(Deserialize)]
+        struct Identity {
+            #[serde(default)]
+            consumer_identity: Option<ConsumerIdentity>,
+        }
+        let identity: Identity = match serde_json::from_slice(&frame.body) {
+            Ok(identity) => identity,
+            Err(_) => {
+                return Ok(vec![control_error_frame(
+                    &frame,
+                    ACTIVITY_MALFORMED,
+                    "malformed activity read",
+                )?])
+            }
+        };
+        let principal = self.route_open_principal(&frame, identity.consumer_identity)?;
+        let admitted = matches!(principal, Ok(Principal::Direct))
+            || matches!(&principal, Ok(Principal::Reserved { module_id }) if module_id == "callosum" || module_id == "ckbus");
+        if !admitted {
+            return Ok(vec![control_error_frame(
+                &frame,
+                ACTIVITY_READ_FORBIDDEN,
+                "activity reads require an operator or trusted mirror principal",
+            )?]);
+        }
+        let Some(ledger) = &self.activity else {
+            return Ok(vec![control_error_frame(
+                &frame,
+                ACTIVITY_UNAVAILABLE,
+                "activity ledger unavailable",
+            )?]);
+        };
+        if serde_json::from_slice::<ControlOpProbe>(&frame.body)
+            .is_ok_and(|probe| probe.op == ops::ACTIVITY_QUERY)
+        {
+            let result = match serde_json::from_slice::<ActivityQueryRequest>(&frame.body) {
+                Ok(request) => ledger.query(request).await,
+                Err(_) => Err(ACTIVITY_MALFORMED),
+            };
+            return match result {
+                Ok(reply) => Ok(vec![control_response_body_frame(
+                    &frame,
+                    &reply,
+                    ops::ACTIVITY_QUERY,
+                )?]),
+                Err(code) => Ok(vec![control_error_frame(
+                    &frame,
+                    code,
+                    "activity query refused",
+                )?]),
+            };
+        }
+        let request: ActivitySubscribeRequest = match serde_json::from_slice(&frame.body) {
+            Ok(request) => request,
+            Err(_) => {
+                return Ok(vec![control_error_frame(
+                    &frame,
+                    ACTIVITY_MALFORMED,
+                    "malformed activity subscription",
+                )?])
+            }
+        };
+        let mut subscription = match ledger.subscribe(request.since).await {
+            Ok(subscription) => subscription,
+            Err(code) => {
+                return Ok(vec![control_error_frame(
+                    &frame,
+                    code,
+                    "activity subscription refused",
+                )?])
+            }
+        };
+        let key = (ctx.connection_id, frame.header.corr);
+        let sink = ctx.egress.clone();
+        let mut streams = self
+            .activity_streams
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        streams.retain(|_, task| !task.is_finished());
+        if streams.get(&key).is_some_and(|task| !task.is_finished()) {
+            return Ok(vec![control_error_frame(
+                &frame,
+                "duplicate_subscription",
+                "activity subscription correlation id already in use",
+            )?]);
+        }
+        let task = tokio::spawn(async move {
+            loop {
+                let entry = if let Some(entry) = subscription.replay.pop_front() {
+                    Some(entry)
+                } else {
+                    subscription.receiver.recv().await
+                };
+                let Some(entry) = entry else {
+                    break;
+                };
+                let Ok(body) = serde_json::to_vec(&ActivitySubscribeResponse { entry }) else {
+                    return;
+                };
+                let Ok(next) = Frame::build_with_version(
+                    response_version(&frame),
+                    FrameType::StreamData,
+                    control_flags(),
+                    0,
+                    0,
+                    frame.header.corr,
+                    body,
+                ) else {
+                    return;
+                };
+                if sink.send(next).await.is_err() {
+                    return;
+                }
+            }
+            // Dropping a full subscriber's sender drains its accepted entries
+            // before the terminal error, preserving their order on the wire.
+            if let Some(code) = subscription.terminal_code() {
+                if let Ok(end) =
+                    control_error_frame(&frame, code, "activity subscriber fell behind")
+                {
+                    let _ = sink.send(end).await;
+                }
+            }
+        });
+        streams.insert(key, task.abort_handle());
+        Ok(Vec::new())
     }
 
     async fn handle_activity_record(
@@ -4939,7 +5152,7 @@ impl ControlHandler {
 
         let operation_lock = self.supervisor.operation_lock();
         let _operation_guard = operation_lock.lock().await;
-        let loaded = match crate::daemon_config::load(&context.config_path) {
+        let loaded = match crate::daemon_config::load_with_activity(&context.config_path) {
             Ok(config) => config,
             Err(err) => {
                 return Ok(vec![control_error_frame(
@@ -4956,7 +5169,7 @@ impl ControlHandler {
         // writing via write-new-then-rename, or a half-finished edit, is enough
         // to open that window. Refuse instead: a config that cannot be read
         // carries no instruction to remove anything.
-        let Some(config) = loaded else {
+        let Some((config, activity_config)) = loaded else {
             return Ok(vec![control_error_frame(
                 &frame,
                 "invalid_daemon_config",
@@ -5069,6 +5282,12 @@ impl ControlHandler {
             }
         };
         if !preview {
+            if let Err(code) = self.configure_activity(activity_config).await {
+                warn!(
+                    code,
+                    "activity retention could not be applied during rescan"
+                );
+            }
             self.capability_evaluator
                 .configure(configured_capabilities, reserved_capabilities);
             self.capability_evaluator.wake_deadline_loop();
@@ -6788,6 +7007,9 @@ pub(crate) fn send_route_control_pushes(
 
 #[cfg(test)]
 mod tests {
+    mod activity_read {
+        include!("activity_read_tests.rs");
+    }
     #[cfg(unix)]
     #[tokio::test]
     async fn rescan_health_only_is_live_but_launch_edits_need_reload() {

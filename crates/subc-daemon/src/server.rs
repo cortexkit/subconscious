@@ -462,7 +462,7 @@ enum ConnectionLoopExit {
 /// Every accepted TCP connection must complete the key-auth prelude before any
 /// envelope bytes are read by the router. Outbound frames flow through a bounded
 /// [`FrameSink`] drained by one writer task. Inbound dispatch remains serial for
-/// every frame except `route.open` and `activity.record`; their bind/append waits
+/// every frame except `route.open` and activity operations; their bind/file waits
 /// run in connection-owned tasks so unrelated frames can keep flowing.
 pub async fn handle_connection<S>(
     mut stream: S,
@@ -723,9 +723,18 @@ where
             && frame.header.ty == subc_protocol::FrameType::Request
             && serde_json::from_slice::<serde_json::Value>(&frame.body)
                 .ok()
-                .is_some_and(|body| body["op"] == subc_control::ops::ACTIVITY_RECORD)
+                .is_some_and(|body| {
+                    matches!(
+                        body["op"].as_str(),
+                        Some(
+                            subc_control::ops::ACTIVITY_RECORD
+                                | subc_control::ops::ACTIVITY_QUERY
+                                | subc_control::ops::ACTIVITY_SUBSCRIBE
+                        )
+                    )
+                })
         {
-            // Bound outstanding activity-record tasks as well as the disk queue,
+            // Bound outstanding activity tasks as well as the disk queue,
             // so the reader never waits for either capacity when the disk stalls.
             if activity_tasks.len() >= 128 {
                 let response = crate::control::control_error_frame(

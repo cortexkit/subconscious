@@ -3107,6 +3107,15 @@ fn provenance_image(value: Option<&Value>) -> String {
     match status {
         "match" => "matches the file it was spawned from".to_string(),
         "mismatch" => "differs from the file it was spawned from (running vs disk)".to_string(),
+        "unavailable" if value.get("reason").and_then(Value::as_str) == Some("process_hidden") => {
+            "is not observable (process hidden)".to_string()
+        }
+        "unavailable"
+            if value.get("reason").and_then(Value::as_str)
+                == Some("running_executable_permission_denied") =>
+        {
+            "is not readable (non-dumpable)".to_string()
+        }
         "unavailable" => format!(
             "could not be compared with the file it was spawned from ({})",
             provenance_value(value.get("reason"))
@@ -6385,6 +6394,12 @@ fn print_status_table(
 }
 
 fn module_status_text(module: &Value) -> String {
+    if let Some(pid) = module
+        .get("waiting_for_previous_pid")
+        .and_then(Value::as_u64)
+    {
+        return format!("waiting: previous instance (pid {pid}) is still running but hidden; it cannot be identified");
+    }
     if module.get("enabled").and_then(Value::as_bool) == Some(false) {
         return "stopped".to_string();
     }
@@ -6479,6 +6494,17 @@ fn running_image_clause(image: &Value) -> String {
     match image.get("status").and_then(Value::as_str) {
         Some("match") => "running image matches".to_string(),
         Some("mismatch") => "running image differs: running vs disk".to_string(),
+        Some("unavailable")
+            if image.get("reason").and_then(Value::as_str) == Some("process_hidden") =>
+        {
+            "running image not observable (process hidden)".to_string()
+        }
+        Some("unavailable")
+            if image.get("reason").and_then(Value::as_str)
+                == Some("running_executable_permission_denied") =>
+        {
+            "running image not readable (non-dumpable)".to_string()
+        }
         Some("unavailable") => format!(
             "running image differs: {}",
             provenance_value(image.get("reason"))
@@ -8771,6 +8797,45 @@ mod tests {
             assert!(!rendered.bytes().any(|byte| byte < 0x20));
             assert!(rendered.contains(r"\x1b"), "rendered: {rendered:?}");
         }
+    }
+
+    #[test]
+    fn hidden_running_image_and_previous_instance_wait_are_rendered_distinctly() {
+        let image = serde_json::json!({"status": "unavailable", "reason": "process_hidden"});
+        assert_eq!(
+            running_image_clause(&image),
+            "running image not observable (process hidden)"
+        );
+        assert_eq!(
+            provenance_image(Some(&image)),
+            "is not observable (process hidden)"
+        );
+        let module = serde_json::json!({"state": "starting", "waiting_for_previous_pid": 42});
+        assert_eq!(module_status_text(&module), "waiting: previous instance (pid 42) is still running but hidden; it cannot be identified");
+    }
+
+    #[test]
+    fn non_dumpable_running_image_is_rendered_as_not_readable() {
+        let image = serde_json::json!({
+            "status": "unavailable",
+            "reason": "running_executable_permission_denied"
+        });
+        assert_eq!(
+            running_image_clause(&image),
+            "running image not readable (non-dumpable)"
+        );
+        assert_eq!(
+            provenance_image(Some(&image)),
+            "is not readable (non-dumpable)"
+        );
+        let ordinary = serde_json::json!({
+            "status": "unavailable",
+            "reason": "running_executable_unreadable"
+        });
+        assert_eq!(
+            running_image_clause(&ordinary),
+            "running image differs: running_executable_unreadable"
+        );
     }
 
     #[test]

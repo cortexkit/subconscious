@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.15
+
+- Add `Process::observe_with_executable_access` and `ExecutableAccess` to distinguish Linux executable permission denial (EACCES/EPERM) from other failures. Preserve `Observation`, `FileIdentity`, and `Process::observe` for existing callers; macOS and Windows keep their previous observations. A non-dumpable Linux child can hide its executable while its start time remains readable.
+- Add `Process::is_alive_but_unobservable` for Linux procfs mounts that hide the entire process entry. Keep a PID-backed handle when pidfds are unavailable but signal-zero still finds the process; missing procfs evidence is not proof of exit.
+
 ## 0.1.14
 
 - Add PID-authenticated one-time Windows launch-nonce pipes and the cached `pipe` source. Reserve a protected, non-inheritable first instance before spawn, reject remote clients, and keep wrong-PID clients from receiving bytes. The current-user DACL grants read, synchronize and the write-attributes bit required by libuv, never generic write or pipe-instance creation.

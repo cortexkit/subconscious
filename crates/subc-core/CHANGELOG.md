@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.20.79
+
+- Render Linux executable permission denial as `not readable (non-dumpable)` in module status and provenance rather than as an image difference or a generic unavailable result. The image is still unavailable for verification; this does not weaken upgrade checks.
+- Show `not observable (process hidden)` when procfs hides a live process, and identify the previous PID when a module is waiting for its hidden predecessor to exit.
+
 ## 0.20.78
 
 - Require the health-triggered restart test to find exactly one terminal record immediately after observing a failed, reaped module. It then checks that the record names the exhausted restart budget and that enabling the module starts it again. An ordering violation now fails explicitly rather than indexing an empty history.

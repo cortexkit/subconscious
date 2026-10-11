@@ -3333,14 +3333,15 @@ impl ControlHandler {
         // safe to track.
         self.route_outages
             .record_not_serving(module_id, "supervised_not_registered");
-        control_error_frame(
-            frame,
-            code,
+        let message = if let Some(pid) = status.waiting_for_previous_pid {
+            format!("waiting: previous instance (pid {pid}) is still running but hidden; it cannot be identified")
+        } else {
             format!(
                 "module_id '{module_id}' is supervised but not available (state={}, enabled={}, live={})",
                 status.state, status.enabled, status.live
-            ),
-        )
+            )
+        };
+        control_error_frame(frame, code, message)
     }
 
     async fn handle_route_open(
@@ -3399,6 +3400,18 @@ impl ControlHandler {
                     detail: Some(serde_json::json!({ "field": ROLE_VERSIONS_FIELD })),
                 },
             )?]);
+        }
+
+        if let Some((status, _)) = self.supervisor_status(&target_module_id, frame.header.corr)? {
+            if status.waiting_for_previous_pid.is_some() {
+                return Ok(vec![self.supervised_absent_route_open_refusal_frame(
+                    ctx,
+                    &frame,
+                    &target_module_id,
+                    "module_warming",
+                    &status,
+                )?]);
+            }
         }
 
         // WHY THESE REPLIES DISCRIMINATE FREELY, since the usual rule is the
@@ -4274,6 +4287,7 @@ impl ControlHandler {
                 )
                 .with_launch_nonce_env(Some(!cfg!(unix)))
                 .with_launch_nonce_source(status.launch_nonce_source)
+                .with_waiting_for_previous_pid(status.waiting_for_previous_pid)
                 .with_protocol(status.protocol)
                 .with_pending_reload(pending_reload)
                 .with_last_probe_ms(status.health.last_probe_ms)

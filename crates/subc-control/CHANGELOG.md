@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.29.5
+
+- Add the `running_executable_permission_denied` running-image unavailable reason for Linux non-dumpable processes. Keep the existing unavailable wire envelope so older readers retain the new reason as an unknown string. Exhaustive Rust matches on `RunningImageUnavailableReason` must account for the new arm.
+- Add the `process_hidden` unavailable reason and optional `SupervisorEntry.waiting_for_previous_pid` for a module blocked by a previous hidden instance. The previous PID is separate from the daemon's currently supervised process identity; old payloads and readers remain compatible.
+
 ## 0.29.4
 
 - Add standalone, op-tagged activity record, query and subscribe request/response types, ledger entries, actor citations and cursors. The exhaustive `ClientControlRequest`, `ClientControlResponse` and `ClientControlPush` enums are unchanged; dispatch activity bodies using the operation name in each body's `op` field.

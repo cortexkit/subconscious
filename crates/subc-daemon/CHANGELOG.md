@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.33.9
+
+- Sweep recorded Linux children whose PID and start time match when executable access is denied with EACCES/EPERM. Log at info that the executable is not readable (non-dumpable), without claiming image agreement. Missing recorded identities, PID reuse, different executables, and other read failures still refuse signalling; macOS and Windows are unchanged.
+- Report permission-denied running images with a distinct unavailable reason after confirming the process start time. This remains unavailable, not an image match, for reload and upgrade decisions.
+- On Linux procfs with `hidepid`, keep alive-but-unobservable orphans without signalling them. Merge their records across roster rewrites, block only their module IDs with an explicit previous-PID waiting reason, and keep unrelated modules serving. Recheck existence with signal-zero about every five seconds; only ESRCH releases the record and permits normal configured startup, without spending crash-restart budget. Start, restart, reload, swap, and route requests report the waiting reason while that previous instance exists.
+
 ## 0.33.8
 
 - Record terminal history before publishing a health-budget failure or clearing the reaped child's process facts. Apply the same ordering to every child-bearing drain, ordinary exit and daemon-shutdown exit; failed waits and drain teardown errors record their unknown exit before publishing failure. Journal errors still retain the exit record in memory and publish the requested stopped, disabled, restarting or failed state. A panic during terminal recording also publishes that state before resuming the unwind. No-child spawn failures remain failures without fabricated exit records.

@@ -1,31 +1,12 @@
 use super::{test_support::*, *};
-use std::{
-    path::PathBuf,
-    sync::atomic::{AtomicU64, Ordering},
-};
+use cortexkit_test_support::ScratchDir;
+use std::{ffi::OsString, os::windows::ffi::OsStringExt, path::PathBuf};
 
-struct TempDir(PathBuf);
+struct TempDir(ScratchDir);
 
 impl TempDir {
     fn new() -> Self {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "subc-acl-{}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir(&path).unwrap();
-        Self(path)
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        Self(ScratchDir::new("subc-acl"))
     }
 }
 
@@ -173,4 +154,143 @@ fn private_directory_refuses_junction_without_changing_target() {
     assert!(create_private_dir(&link).is_err());
     assert_owner_only(&target, true, true);
     std::fs::remove_dir(&link).unwrap();
+}
+
+// Scratch roots can already be verbatim. Remove that prefix in these fixtures
+// so a raw Win32 call cannot accidentally inherit long-path support from setup.
+fn ordinary_path(path: &Path) -> PathBuf {
+    let value: Vec<u16> = path.as_os_str().encode_wide().collect();
+    let unc: Vec<u16> = r"\\?\UNC\".encode_utf16().collect();
+    let verbatim: Vec<u16> = r"\\?\".encode_utf16().collect();
+    let value = if value.starts_with(&unc) {
+        r"\\"
+            .encode_utf16()
+            .chain(value.into_iter().skip(unc.len()))
+            .collect::<Vec<_>>()
+    } else if value.starts_with(&verbatim) {
+        value[verbatim.len()..].to_vec()
+    } else {
+        value
+    };
+    PathBuf::from(OsString::from_wide(&value))
+}
+
+fn long_parent(root: &Path) -> PathBuf {
+    let mut path = ordinary_path(root);
+    while path.as_os_str().encode_wide().count() <= 300 {
+        path.push("long-path-component");
+    }
+    // Use std's long-path support for setup so removing the ACL helper's
+    // conversion fails at private creation, not while building the fixture.
+    std::fs::create_dir_all(&path).unwrap();
+    path
+}
+
+#[test]
+fn private_file_beyond_max_path_has_owner_only_acl() {
+    let root = TempDir::new();
+    let path = long_parent(&root.0).join("connection.json");
+    assert!(path.as_os_str().encode_wide().count() > 300);
+    let file = create_private_file(&path).expect("create private file beyond MAX_PATH");
+    assert_owner_only(&path, false, true);
+    verify_owner_only(&file).unwrap();
+}
+
+#[test]
+fn private_directory_beyond_max_path_has_owner_only_acl() {
+    let root = TempDir::new();
+    let parent = long_parent(&root.0).join("private");
+    let path = parent.join("run");
+    assert!(path.as_os_str().encode_wide().count() > 300);
+    create_private_dir(&path).expect("create private directory beyond MAX_PATH");
+    assert_owner_only(&parent, true, true);
+    assert_owner_only(&path, true, true);
+    verify_private_dir(&path).unwrap();
+    create_private_dir(&path).expect("tighten existing private directory beyond MAX_PATH");
+    assert_owner_only(&path, true, true);
+}
+
+#[test]
+fn forward_slashes_and_parent_components_resolve_before_verbatim_prefix() {
+    let root = TempDir::new();
+    let base = ordinary_path(&root.0);
+    let supplied = PathBuf::from(format!(
+        "{}/absent/../run",
+        base.to_str().unwrap().replace('\\', "/")
+    ));
+    create_private_dir(&supplied).unwrap();
+    let expected = base.join("run");
+    assert_owner_only(&expected, true, true);
+    verify_private_dir(&supplied).unwrap();
+    let file_path = supplied.join("absent/../connection.json");
+    let file = create_private_file(&file_path).unwrap();
+    assert_owner_only(&expected.join("connection.json"), false, true);
+    verify_owner_only(&file).unwrap();
+    assert!(!base.join("absent").exists());
+    assert!(!expected.join("absent").exists());
+}
+
+#[test]
+fn wide_drive_path_is_normalized_and_verbatim() {
+    assert_eq!(
+        wide(Path::new(r"C:/folder/./absent/../file")).unwrap(),
+        r"\\?\C:\folder\file"
+            .encode_utf16()
+            .chain(Some(0))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn wide_unc_path_is_normalized_and_verbatim() {
+    assert_eq!(
+        wide(Path::new(r"\\server\share\folder\..\file")).unwrap(),
+        r"\\?\UNC\server\share\file"
+            .encode_utf16()
+            .chain(Some(0))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn wide_relative_path_is_resolved_and_normalized() {
+    let expected = std::env::current_dir().unwrap().join("connection.json");
+    let expected = ordinary_path(&expected);
+    let expected = expected.to_str().unwrap();
+    let expected = match expected.strip_prefix(r"\\") {
+        Some(unc) => format!(r"\\?\UNC\{unc}"),
+        None => format!(r"\\?\{expected}"),
+    };
+    assert_eq!(
+        wide(Path::new("absent/../connection.json")).unwrap(),
+        expected.encode_utf16().chain(Some(0)).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn wide_verbatim_paths_are_not_double_prefixed_or_normalized() {
+    for path in [
+        r"\\?\C:\folder\..\file",
+        r"\\?\UNC\server\share\folder\..\file",
+    ] {
+        assert_eq!(
+            wide(Path::new(path)).unwrap(),
+            path.encode_utf16().chain(Some(0)).collect::<Vec<_>>()
+        );
+    }
+    let root = TempDir::new();
+    let path = root.0.join("verbatim.json");
+    let verbatim = root.0.canonicalize().unwrap().join("verbatim.json");
+    assert!(verbatim.to_str().unwrap().starts_with(r"\\?\"));
+    let file = create_private_file(&verbatim).unwrap();
+    assert_owner_only(&path, false, true);
+    verify_owner_only(&file).unwrap();
+}
+
+#[test]
+fn wide_rejects_embedded_nul() {
+    assert_eq!(
+        wide(Path::new("file\0name")).unwrap_err().kind(),
+        io::ErrorKind::InvalidInput
+    );
 }

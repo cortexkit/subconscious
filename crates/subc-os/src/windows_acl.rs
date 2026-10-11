@@ -48,12 +48,27 @@ impl Drop for Handle {
 }
 
 fn wide(path: &Path) -> io::Result<Vec<u16>> {
+    // Verbatim Win32 paths bypass MAX_PATH and disable Windows normalization,
+    // so resolve relative paths and normalize separators and dot components
+    // before prefixing. std::path::absolute preserves already-verbatim inputs.
+    let path = std::path::absolute(path)?;
     let mut value: Vec<u16> = path.as_os_str().encode_wide().collect();
     if value.contains(&0) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "path contains NUL",
         ));
+    }
+    let verbatim: Vec<u16> = r"\\?\".encode_utf16().collect();
+    if !value.starts_with(&verbatim) {
+        value = if value.starts_with(&[b'\\' as u16, b'\\' as u16]) {
+            r"\\?\UNC\"
+                .encode_utf16()
+                .chain(value.into_iter().skip(2))
+                .collect()
+        } else {
+            verbatim.into_iter().chain(value).collect()
+        };
     }
     value.push(0);
     Ok(value)

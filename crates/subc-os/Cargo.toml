@@ -1,6 +1,6 @@
 [package]
 name = "subc-os"
-version = "0.1.12"
+version = "0.1.13"
 edition = "2021"
 license = "MIT"
 publish = true
@@ -20,6 +20,7 @@ required-features = ["test-support"]
 # crate is packaged, so publishing never looks for this version on crates.io.
 [dev-dependencies]
 subc-os = { path = ".", features = ["test-support"] }
+cortexkit-test-support = "0.1.3"
 
 # The launch-nonce handoff (dup2 and fcntl between fork and exec) and its
 # reader (fstat, ioctl) are plain POSIX calls, so every Unix takes libc.

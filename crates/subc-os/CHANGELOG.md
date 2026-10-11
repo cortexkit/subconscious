@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.13
+
+- Normalize and resolve Windows ACL helper paths before converting them to extended-length drive or UNC paths. Private file and directory creation and path-based ACL checks now support paths beyond `MAX_PATH`, including relative inputs, while preserving already-verbatim paths.
+
 ## 0.1.12
 
 - Add Windows handle-pinned creation-time checks, explicit forced stop and exit waiting, and working-set/CPU readings. Capture executable volume and full 128-bit file ID under a no-delete handle before suspended spawn; bind to the returned child handle and report unavailable after exit or unconfirmed observations. File-object agreement does not verify content.

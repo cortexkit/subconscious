@@ -1903,7 +1903,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "subc-control",
- "subc-os 0.1.12",
+ "subc-os 0.1.13",
  "subc-protocol",
  "subc-transport",
  "syn 2.0.118",
@@ -1940,7 +1940,7 @@ dependencies = [
  "subc-core",
  "subc-daemon",
  "subc-jsonc",
- "subc-os 0.1.12",
+ "subc-os 0.1.13",
  "subc-protocol",
  "subc-transport",
  "terminal_size",
@@ -1969,7 +1969,7 @@ dependencies = [
  "subc-control",
  "subc-jobobject",
  "subc-jsonc",
- "subc-os 0.1.12",
+ "subc-os 0.1.13",
  "subc-presence",
  "subc-protocol",
  "subc-transport",
@@ -2020,7 +2020,7 @@ dependencies = [
  "subc-control",
  "subc-daemon",
  "subc-jsonc",
- "subc-os 0.1.12",
+ "subc-os 0.1.13",
  "subc-protocol",
  "subc-transport",
  "tokio",
@@ -2039,11 +2039,12 @@ dependencies = [
 
 [[package]]
 name = "subc-os"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
+ "cortexkit-test-support",
  "libc",
  "rustix",
- "subc-os 0.1.12",
+ "subc-os 0.1.13",
  "tokio",
  "windows-sys 0.61.2",
 ]
@@ -2080,7 +2081,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "subc-os 0.1.12",
+ "subc-os 0.1.13",
  "subc-protocol",
  "subtle",
  "tokio",

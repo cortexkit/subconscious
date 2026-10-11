@@ -14,8 +14,15 @@
 # deletion is wasted seconds on every train cleanup.
 zero=0000000000000000000000000000000000000000
 pushed=""
-while read -r _ local_sha _ _; do
+# The branches this push updates, for the in-flight CI notice below. CI's
+# concurrency group is per ref, so only a run on a pushed branch can be
+# cancelled by this push.
+pushed_branches=""
+while read -r _ local_sha remote_ref _; do
   [ -n "$local_sha" ] && [ "$local_sha" != "$zero" ] && pushed="$local_sha"
+  case "$remote_ref" in
+    refs/heads/*) [ "$local_sha" != "$zero" ] && pushed_branches="$pushed_branches ${remote_ref#refs/heads/}" ;;
+  esac
 done
 # No stdin (a direct invocation) falls back to HEAD; a deletion-only push
 # leaves `pushed` empty and skips the lock check.
@@ -170,11 +177,21 @@ fi
 # Degrades silently when gh is absent, unauthenticated, or offline: a pre-push
 # hook must not depend on the network to let you push.
 if command -v gh >/dev/null 2>&1; then
+  # The scheduled-run check below reads the checkout's branch; the in-flight
+  # check reads each branch this push updates, which is the only place a run
+  # can be cancelled. Pushing a release branch from master never cancels
+  # master's run.
   branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
-  inflight=$(gh run list --branch "$branch" --event push --limit 5 \
-      --json status,headSha,workflowName \
-      --jq '.[] | select(.status=="in_progress" or .status=="queued") | "\(.headSha[0:8]) \(.workflowName)"' \
-      2>/dev/null | head -3)
+  inflight=""
+  for target in $pushed_branches; do
+    runs=$(gh run list --branch "$target" --event push --limit 5 \
+        --json status,headSha,workflowName \
+        --jq '.[] | select(.status=="in_progress" or .status=="queued") | "\(.headSha[0:8]) \(.workflowName)"' \
+        2>/dev/null | head -3)
+    [ -n "$runs" ] && inflight="$inflight$(printf '%s\n' "$runs" | sed "s|^|$target: |")
+"
+  done
+  inflight=$(printf '%s' "$inflight" | sed '/^$/d')
   # A SCHEDULED RED REPORTS TO NOBODY, so carry it on the next push.
   #
   # A push gate answers "is this change good" and you read it BECAUSE you just
@@ -317,7 +334,7 @@ print(int((datetime.datetime.now(datetime.timezone.utc)-t).total_seconds()//3600
 
   if [ -n "$inflight" ]; then
     echo "" >&2
-    echo "pre-push NOTICE: a CI run is IN FLIGHT on $branch and this push will cancel it:" >&2
+    echo "pre-push NOTICE: a CI run is IN FLIGHT on a branch this push updates, and the push will cancel it:" >&2
     echo "$inflight" | sed 's/^/  /' >&2
     echo "  (cancel-in-progress kills the older run; its watcher will report 'cancelled')" >&2
   fi

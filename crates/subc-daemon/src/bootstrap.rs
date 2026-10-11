@@ -113,6 +113,7 @@ pub struct BootstrapConfig {
     /// Module ids whose scopes may carry the attributes that grant authority.
     scope_authority_owners: Vec<String>,
     privileged_operator_prompt: daemon_config::PrivilegedOperatorPrompt,
+    activity_config: daemon_config::ActivityConfig,
     daemon_config_path: Option<PathBuf>,
     configured_port: Option<u16>,
     /// Daemon-wide route.bind relay budget in milliseconds (the fallback for
@@ -172,6 +173,7 @@ impl BootstrapConfig {
             admission_facts: AdmissionFactsConfig::default(),
             scope_authority_owners: daemon_config::default_scope_authority_owners(),
             privileged_operator_prompt: daemon_config::PrivilegedOperatorPrompt::default(),
+            activity_config: daemon_config::ActivityConfig::default(),
             daemon_config_path: None,
             configured_port: None,
             route_bind_relay_default_ms: None,
@@ -288,8 +290,11 @@ impl BootstrapConfig {
         daemon_config_path: impl AsRef<Path>,
     ) -> Result<Self, BootstrapError> {
         let daemon_config_path = daemon_config_path.as_ref().to_path_buf();
-        let daemon_config =
-            daemon_config::load(&daemon_config_path).map_err(BootstrapError::DaemonConfig)?;
+        let (daemon_config, activity_config) =
+            daemon_config::load_with_activity(&daemon_config_path)
+                .map_err(BootstrapError::DaemonConfig)?
+                .map(|(config, activity)| (Some(config), activity))
+                .unwrap_or_default();
         let config_port = daemon_config.as_ref().and_then(|config| config.port);
         let storage_config = daemon_config
             .as_ref()
@@ -345,6 +350,7 @@ impl BootstrapConfig {
             .with_admission_facts_config(admission_facts_carrier_module_id, admission_facts_targets)
             .with_scope_authority_owners(scope_authority_owners)
             .with_privileged_operator_prompt(privileged_operator_prompt)
+            .with_activity_config(activity_config)
             .with_route_bind_relay_default_ms(route_bind_relay_default_ms)
             .with_reserved_capabilities(reserved_capabilities)
             .with_daemon_config_source(daemon_config_path, config_port)
@@ -356,8 +362,11 @@ impl BootstrapConfig {
         daemon_config_path: impl AsRef<Path>,
     ) -> Result<Self, BootstrapError> {
         let daemon_config_path = daemon_config_path.as_ref().to_path_buf();
-        let daemon_config =
-            daemon_config::load(&daemon_config_path).map_err(BootstrapError::DaemonConfig)?;
+        let (daemon_config, activity_config) =
+            daemon_config::load_with_activity(&daemon_config_path)
+                .map_err(BootstrapError::DaemonConfig)?
+                .map(|(config, activity)| (Some(config), activity))
+                .unwrap_or_default();
         let configured_port = daemon_config.as_ref().and_then(|config| config.port);
         let storage_config = daemon_config
             .as_ref()
@@ -392,6 +401,7 @@ impl BootstrapConfig {
             .with_admission_facts_config(admission_facts_carrier_module_id, admission_facts_targets)
             .with_scope_authority_owners(scope_authority_owners)
             .with_privileged_operator_prompt(privileged_operator_prompt)
+            .with_activity_config(activity_config)
             .with_route_bind_relay_default_ms(route_bind_relay_default_ms)
             .with_reserved_capabilities(reserved_capabilities)
             .with_daemon_config_source(daemon_config_path, configured_port))
@@ -440,6 +450,11 @@ impl BootstrapConfig {
         mode: daemon_config::PrivilegedOperatorPrompt,
     ) -> Self {
         self.privileged_operator_prompt = mode;
+        self
+    }
+
+    pub fn with_activity_config(mut self, config: daemon_config::ActivityConfig) -> Self {
+        self.activity_config = config;
         self
     }
 
@@ -587,6 +602,7 @@ pub async fn run_with_config(config: BootstrapConfig) -> Result<(), BootstrapErr
     let admission_facts = config.admission_facts.clone();
     let scope_authority_owners = config.scope_authority_owners.clone();
     let privileged_operator_prompt = config.privileged_operator_prompt;
+    let activity_config = config.activity_config;
     let daemon_config_path = config.daemon_config_path.clone();
     let configured_port = config.configured_port;
     let route_bind_relay_default_ms = config.route_bind_relay_default_ms;
@@ -615,6 +631,7 @@ pub async fn run_with_config(config: BootstrapConfig) -> Result<(), BootstrapErr
                 admission_facts,
                 scope_authority_owners,
                 privileged_operator_prompt,
+                activity_config,
                 daemon_config_path,
                 configured_port,
                 route_bind_relay_default_ms,
@@ -765,6 +782,7 @@ async fn serve_bound_daemon(
     admission_facts: AdmissionFactsConfig,
     scope_authority_owners: Vec<String>,
     privileged_operator_prompt: daemon_config::PrivilegedOperatorPrompt,
+    activity_config: daemon_config::ActivityConfig,
     daemon_config_path: Option<PathBuf>,
     configured_port: Option<u16>,
     route_bind_relay_default_ms: Option<u64>,
@@ -928,7 +946,8 @@ async fn serve_bound_daemon(
             reserved_capabilities,
         );
     if let Some(run_dir) = activity_run_dir {
-        control = control.with_activity_ledger(&run_dir, daemon_incarnation);
+        control =
+            control.with_activity_ledger_config(&run_dir, daemon_incarnation, activity_config);
     }
     if let Some(ms) = route_bind_relay_default_ms {
         // A daemon-wide config value overrides the built-in default; a

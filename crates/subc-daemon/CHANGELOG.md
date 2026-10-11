@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.34.1
+
+- Add `ActivityConfig`, `load_with_activity` and a bootstrap retention builder without changing the public `DaemonConfig` struct or exhaustive wire enums. Module and activity policies are parsed from the same config document during bootstrap and rescan.
+- Serve `activity.query` and `activity.subscribe` for Direct readers and nonce-verified `reserved:callosum` / `reserved:ckbus`. A registered module connection uses that module's reserved principal and ignores any supplied consumer identity, so only Callosum and ck-bus can read activity data through that connection. A separate consumer connection presenting no consumer identity is Direct, including one opened by a supervised module: the daemon cannot distinguish it from the operator's `ck` connection, so it retains local operator read access.
+- Filter retained JSONL by agent, project, module, kind and inclusive time bounds, ordered by sequence with exclusive sequence pagination. Pin every query's current-incarnation head and file handles/lengths under the writer lock; scan after unlocking, off the connection reader. Count and skip malformed lines and repair incomplete tails on reopen.
+- Replay successful appends from the current incarnation's 1024-entry ring and end a lagging feed after its queued entries with `activity_subscriber_lagged`. After restart, a query's head cursor combines the new daemon's incarnation ID with the previous daemon's highest retained sequence; it is accepted while no entry after that cursor has left the ring, but once eviction would leave a gap it refuses `activity_cursor_too_old` and requires query recovery. Foreign incarnation cursors refuse `activity_cursor_incarnation_mismatch`.
+- Add `activity.max_age_days` (30) and `activity.max_total_mb` (64), both positive integers. Bootstrap uses these bounds and executed `supervisor.rescan` reopens the sink under the writer lock to apply changes without a restart; previews do not prune. The size budget includes the active file plus rotated generations, scaling per-file size for budgets beyond 256 MiB.
+
 ## 0.34.0
 
 - **Breaking.** Upgrade direct dependencies to `subc-protocol` 0.31, `subc-control` 0.30 and `subc-transport` 0.12 together with the daemon: its public API passes their types to consumers. Replace `ScopeStamp` literals with its constructor and setters and account for optional `call_mode` in raw bind constructors and exhaustive patterns. Restart the daemon before scope owners send delegating runs. Providers must read every bind's mode, handle all three known modes and refuse unknown modes before declaring `call-modes/v1`; the daemon does not enforce per-tool mode restrictions.

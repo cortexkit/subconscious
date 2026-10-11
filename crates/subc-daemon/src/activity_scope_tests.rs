@@ -678,3 +678,141 @@ async fn activity_real_daemon_failures_leave_reader_routing_supervision_and_shut
         pause.1.notify_all();
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn activity_real_daemon_restart_head_and_query_do_not_block_reader() {
+    if isolated_child("read-io", "control::tests::scopes::activity::activity_real_daemon_restart_head_and_query_do_not_block_reader") { return; }
+    let scratch = ScratchDir::new("activity-real-read");
+    let mut rig = rig().await;
+    rig.handler = rig
+        .handler
+        .with_activity_ledger(scratch.path(), "old".into());
+    assert_eq!(
+        record_on(&rig, PLEXUS, Value::Null).await.header.ty,
+        FrameType::Response
+    );
+    rig.handler = rig
+        .handler
+        .with_activity_ledger(scratch.path(), "new".into());
+    let ledger = rig.handler.activity.as_ref().unwrap().clone();
+    rig.handler
+        .cleanup_connection(rig.modules[PLEXUS].0.connection_id)
+        .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let info = subc_transport::ConnectionInfo {
+        schema: subc_transport::SCHEMA_VERSION,
+        wire_version: Some(PROTOCOL_VERSION),
+        endpoints: vec![],
+        key: subc_transport::generate_key().unwrap(),
+        daemon_id: subc_transport::generate_daemon_id().unwrap(),
+        pid: std::process::id(),
+        daemon_ver: "activity-read-test".into(),
+    };
+    let router = Arc::new(Router::with_control_handler(Arc::new(rig.handler.clone())));
+    let preexisting_connections: Vec<_> = (0..3).map(|_| router.begin_connection()).collect();
+    let serving = tokio::spawn(crate::server::serve_listener(
+        listener,
+        router,
+        crate::server::ServerAuth::new(info.key.clone(), info.daemon_id, &info.daemon_ver),
+    ));
+    let mut module = connect(address, &info).await;
+    crate::write_frame(&mut module, &hello_frame(PLEXUS, PROTOCOL_VERSION, 1))
+        .await
+        .unwrap();
+    assert_eq!(receive(&mut module).await.header.ty, FrameType::HelloAck);
+    let mut client = connect(address, &info).await;
+    let request = |body: Value, corr| {
+        Frame::build(
+            FrameType::Request,
+            control_flags(),
+            0,
+            0,
+            corr,
+            serde_json::to_vec(&body).unwrap(),
+        )
+        .unwrap()
+    };
+    crate::write_frame(
+        &mut client,
+        &request(serde_json::json!({"op":"activity.query","limit":100}), 500),
+    )
+    .await
+    .unwrap();
+    let reply = receive(&mut client).await;
+    let page: subc_control::ActivityQueryResponse = serde_json::from_slice(&reply.body).unwrap();
+    assert_eq!(
+        page.entries
+            .iter()
+            .map(|entry| entry.seq)
+            .collect::<Vec<_>>(),
+        [1]
+    );
+    assert_eq!(
+        page.head,
+        subc_control::ActivityCursor {
+            daemon_incarnation: "new".into(),
+            seq: 1
+        }
+    );
+    crate::write_frame(
+        &mut client,
+        &request(
+            serde_json::json!({"op":"activity.subscribe","since":page.head}),
+            501,
+        ),
+    )
+    .await
+    .unwrap();
+    crate::write_frame(&mut module, &event(PLEXUS, Value::Null))
+        .await
+        .unwrap();
+    assert_eq!(receive(&mut module).await.header.ty, FrameType::Response);
+    let live = receive(&mut client).await;
+    assert_eq!(live.header.ty, FrameType::StreamData);
+    assert_eq!(live.header.corr, 501);
+    assert_eq!(
+        serde_json::from_slice::<subc_control::ActivitySubscribeResponse>(&live.body)
+            .unwrap()
+            .entry
+            .seq,
+        2
+    );
+    let entered = Arc::new(std::sync::Barrier::new(2));
+    let release = Arc::new(std::sync::Barrier::new(2));
+    let worker_entered = entered.clone();
+    let worker_release = release.clone();
+    let blocker = std::thread::spawn(move || {
+        ledger.with_writer_lock(|| {
+            worker_entered.wait();
+            worker_release.wait();
+        })
+    });
+    entered.wait();
+    crate::write_frame(
+        &mut client,
+        &request(serde_json::json!({"op":"activity.query","limit":100}), 502),
+    )
+    .await
+    .unwrap();
+    crate::write_frame(
+        &mut client,
+        &Frame::build(FrameType::Ping, control_flags(), 0, 0, 503, Vec::new()).unwrap(),
+    )
+    .await
+    .unwrap();
+    let pong = tokio::time::timeout(Duration::from_secs(1), crate::read_frame(&mut client)).await;
+    release.wait();
+    blocker.join().unwrap();
+    let pong = pong
+        .expect("query must leave the channel-0 reader free to answer ping")
+        .unwrap()
+        .unwrap();
+    assert_eq!((pong.header.ty, pong.header.corr), (FrameType::Pong, 503));
+    assert_eq!(receive(&mut client).await.header.corr, 502);
+    let cancel = Frame::build(FrameType::Cancel, control_flags(), 0, 0, 501, Vec::new()).unwrap();
+    crate::write_frame(&mut client, &cancel).await.unwrap();
+    assert_eq!(receive(&mut client).await.header.ty, FrameType::StreamEnd);
+    serving.abort();
+    drop(preexisting_connections);
+}

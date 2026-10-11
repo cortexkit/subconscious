@@ -59,8 +59,11 @@ fn wide(path: &Path) -> io::Result<Vec<u16>> {
             "path contains NUL",
         ));
     }
+    // A device path (`\\.\...`, such as a named pipe) is already exempt from
+    // MAX_PATH and must never be rewritten as a UNC share.
     let verbatim: Vec<u16> = r"\\?\".encode_utf16().collect();
-    if !value.starts_with(&verbatim) {
+    let device: Vec<u16> = r"\\.\".encode_utf16().collect();
+    if !value.starts_with(&verbatim) && !value.starts_with(&device) {
         value = if value.starts_with(&[b'\\' as u16, b'\\' as u16]) {
             r"\\?\UNC\"
                 .encode_utf16()

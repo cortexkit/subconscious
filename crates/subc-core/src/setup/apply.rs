@@ -96,8 +96,12 @@ impl SetupBackend {
 
     pub fn observe(&mut self, request: &SetupRequest) -> Result<SetupObserved, String> {
         if !request.uninstall {
+            // `CK_TEST_SETUP_PREFLIGHT_OK` skips only this check, for tests that
+            // exercise the real setup path on a Linux CI runner, which has no
+            // systemd user manager to satisfy it.
             #[cfg(feature = "test-support")]
-            let stub_runtime = env::var_os("CK_TEST_SETUP_CONTROL_OK").is_some();
+            let stub_runtime = env::var_os("CK_TEST_SETUP_CONTROL_OK").is_some()
+                || env::var_os("CK_TEST_SETUP_PREFLIGHT_OK").is_some();
             #[cfg(not(feature = "test-support"))]
             let stub_runtime = false;
             if !stub_runtime {

@@ -1040,6 +1040,9 @@ fn setup_core_drift_floor_refusal_is_actionable_and_never_mutates() {
         let output = fixture
             .command(&index, args)
             .env_remove("CK_TEST_SETUP_CONTROL_OK")
+            // This test is about the core-version floor, not the Linux user-manager
+            // preflight, which a CI container cannot satisfy.
+            .env("CK_TEST_SETUP_PREFLIGHT_OK", "1")
             .output()
             .unwrap();
         assert_exit(&output, 1);

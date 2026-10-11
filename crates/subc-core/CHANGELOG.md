@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.20.75
+
+- Fix two tests broken by the Linux setup preflight: the adoption test now boxes its command runner, and the core-version-floor test skips only the preflight (through a test-support switch), since a Linux CI container has no systemd user manager.
+
 ## 0.20.74
 
 - Refuse Linux setup before downloading or writing when the systemd user manager is unavailable, and explain how to keep the daemon running after logout.

@@ -36,6 +36,7 @@ use serde::{Deserialize, Serialize};
 
 pub use machine_id::{MachineId, MachineIdError};
 
+pub mod call_mode;
 pub mod frame;
 pub mod machine_id;
 pub mod manifest;
@@ -71,12 +72,14 @@ pub mod error_codes {
     pub const MODULE_WARMING: &str = "module_warming";
     pub const TARGET_UNAVAILABLE: &str = "target_unavailable";
     /// A flow-scoped route targets a module that does not provide
-    /// `flow-scopes/v1`. TERMINAL: decoding `flow_id` alone does not promise
-    /// flow behaviour, and removing it would silently change the identity.
+    /// either `flow-scopes/v1` or `call-modes/v1`. TERMINAL: decoding `flow_id`
+    /// alone does not promise flow behaviour, and removing it would silently
+    /// change the identity.
     pub const TARGET_FLOW_UNSUPPORTED: &str = "target_flow_unsupported";
-    /// An agent-run-scoped route targets a module that does not provide
-    /// `agent-run-scopes/v1`. TERMINAL: removing `run_id` would silently change
-    /// the identity under which the route acts.
+    /// An agent-run-scoped route targets a module providing neither
+    /// `agent-run-scopes/v1` nor `call-modes/v1`, or a delegating run targets a
+    /// module without `call-modes/v1`. TERMINAL: removing `run_id` or delegation
+    /// would silently change the identity or authority under which the route acts.
     pub const TARGET_AGENT_RUN_UNSUPPORTED: &str = "target_agent_run_unsupported";
     pub const MODULE_TIMEOUT: &str = "module_timeout";
     /// The target module is declared as speaking no subc wire protocol
@@ -181,8 +184,9 @@ pub mod error_codes {
     pub const SCOPE_RUN_ID_WITHOUT_AGENT: &str = "scope_run_id_without_agent";
     /// The record sets both `run_id` and `flow_id`; a run scope is not a flow scope.
     pub const SCOPE_RUN_ID_WITH_FLOW_ID: &str = "scope_run_id_with_flow_id";
-    /// The record sets `run_id` with `delegates`; an agent-run scope cannot
-    /// delegate the agent's authority.
+    /// Legacy refusal for a record setting `run_id` with `delegates`.
+    /// No longer emitted by validation: run records may delegate, and route
+    /// admission instead requires a target providing `call-modes/v1`.
     pub const SCOPE_RUN_ID_DELEGATES: &str = "scope_run_id_delegates";
 
     /// An `operator.confirm` was declined or withdrawn. `detail.reason` is

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.31.0
+
+- **Breaking.** Add `call_mode::CallMode` (`classic`, `codemode`, `flow`, or a preserved `Unknown(String)`), `CALL_MODES_CAPABILITY` (`call-modes/v1`), and `derive_call_mode`. Providers must refuse unknown modes. Declare the capability only when reading the mode on every bind and handling all three known modes.
+- **Breaking.** `ModuleControlRequest::RouteBind` gains `call_mode: Option<CallMode>`. Rust constructors must supply it; wire readers receiving an absent field must derive the mode from the bind's scope, not always choose classic. Daemons send it only to targets declaring `call-modes/v1`, including on classic routes.
+- **Breaking.** `ScopeStamp` gains `expires_at_ms: Option<u64>` and becomes `#[non_exhaustive]`: replace struct literals with `ScopeStamp::new` and the `with_*` setters. The deadline is absolute Unix wall-clock milliseconds and fixed per epoch. Both new wire fields are omitted when absent, so binds to older providers keep their existing shape.
+- Run scope records may now delegate. `scope_run_id_delegates` remains a stable code for older peers, but validation no longer emits it. To migrate providers to `call-modes/v1`, this release keeps the legacy run and flow capabilities working: non-delegating run scopes can bind to `agent-run-scopes/v1` or `call-modes/v1` targets, while delegating run scopes require `call-modes/v1`. Flow scopes can bind to `flow-scopes/v1` or `call-modes/v1` targets. Unsupported targets retain the terminal `target_agent_run_unsupported` and `target_flow_unsupported` refusals.
+
 ## 0.30.2
 
 - Recognize `pipe` as a launch-nonce provenance source for Windows named-pipe readers while preserving unknown-source compatibility.

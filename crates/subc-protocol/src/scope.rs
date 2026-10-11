@@ -149,11 +149,15 @@ impl ScopeCarrier {
 /// Declaring this in a manifest's `capabilities.provides` promises that the
 /// module recognises a scope carrying `flow_id` and applies flow behaviour:
 /// it never treats the flow as its owner agent.
+/// During migration, either this capability or
+/// [`crate::call_mode::CALL_MODES_CAPABILITY`] admits flow scopes.
 pub const FLOW_SCOPES_CAPABILITY: &str = "flow-scopes/v1";
 
 /// Declaring this in a manifest's `capabilities.provides` promises that the
 /// module recognises `run_id` as one agent run and does not exercise the agent's
 /// delegated authority under that scope.
+/// During migration it admits non-delegating run scopes; delegating runs require
+/// [`crate::call_mode::CALL_MODES_CAPABILITY`] instead.
 pub const AGENT_RUN_SCOPES_CAPABILITY: &str = "agent-run-scopes/v1";
 
 /// The authority attributes the daemon copies into scope stamps unchanged.
@@ -181,18 +185,21 @@ pub struct ScopeAttributes {
     /// compare to notice a change), and every route under the scope is closed
     /// with the reason `scope_delegation_changed`, so no live route keeps the
     /// old identity.
-    /// A target must provide [`FLOW_SCOPES_CAPABILITY`] before the daemon may
-    /// send a bind stamped with this field. Decoding it alone is not enough:
+    /// A target must provide [`FLOW_SCOPES_CAPABILITY`] or
+    /// [`crate::call_mode::CALL_MODES_CAPABILITY`] before the daemon may send a
+    /// bind stamped with this field. Decoding it alone is not enough:
     /// the target must also apply flow behaviour instead of agent behaviour.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub flow_id: Option<String>,
     /// Identifies one run carried out on behalf of `agent_id`. Requires
-    /// `agent_id`, forbids `flow_id` and `delegates`, and uses
+    /// `agent_id`, forbids `flow_id`, and uses
     /// [`validate_run_id`]'s token rule.
     /// Adding, changing or removing it within an epoch increments the scope's
     /// content version and closes routes under the scope with
     /// `scope_delegation_changed`. The daemon sends this field in a bind only to
-    /// a target module providing [`AGENT_RUN_SCOPES_CAPABILITY`].
+    /// a target module providing [`AGENT_RUN_SCOPES_CAPABILITY`] or
+    /// [`crate::call_mode::CALL_MODES_CAPABILITY`]. A delegating run scope is
+    /// accepted as a record, but binds only to a target providing the latter.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<String>,
 }
@@ -473,7 +480,9 @@ pub enum ScopeStatus {
 }
 
 /// The fields the daemon stamps for a live scope.
+/// Build with [`ScopeStamp::new`] and the setters so future fields are additive.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ScopeStamp {
     pub owner: Principal,
     #[serde(rename = "ref")]
@@ -489,6 +498,64 @@ pub struct ScopeStamp {
     /// Whether the owner is listed in the daemon's `scope_authority_owners`.
     /// Providers decide on this flag and keep no copy of the list.
     pub owner_authorized: bool,
+    /// Absolute Unix wall-clock deadline in milliseconds, fixed for this epoch.
+    /// On route binds the daemon sends this deadline only to targets declaring
+    /// [`crate::call_mode::CALL_MODES_CAPABILITY`], because older providers may
+    /// reject unfamiliar scope-stamp fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at_ms: Option<u64>,
+}
+
+impl ScopeStamp {
+    /// A stamp with no parent, attributes or deadline, and no owner authority.
+    pub fn new(
+        owner: Principal,
+        scope_ref: impl Into<String>,
+        scope_epoch: u64,
+        kind: ScopeKind,
+    ) -> Self {
+        Self {
+            owner,
+            scope_ref: scope_ref.into(),
+            scope_epoch,
+            kind,
+            parent: None,
+            parent_state: None,
+            attributes: ScopeAttributes::new(),
+            owner_authorized: false,
+            expires_at_ms: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_parent(mut self, parent: Option<ScopeParent>) -> Self {
+        self.parent = parent;
+        self
+    }
+
+    #[must_use]
+    pub fn with_parent_state(mut self, parent_state: Option<ParentState>) -> Self {
+        self.parent_state = parent_state;
+        self
+    }
+
+    #[must_use]
+    pub fn with_attributes(mut self, attributes: ScopeAttributes) -> Self {
+        self.attributes = attributes;
+        self
+    }
+
+    #[must_use]
+    pub fn with_owner_authorized(mut self, owner_authorized: bool) -> Self {
+        self.owner_authorized = owner_authorized;
+        self
+    }
+
+    #[must_use]
+    pub fn with_expires_at_ms(mut self, expires_at_ms: Option<u64>) -> Self {
+        self.expires_at_ms = expires_at_ms;
+        self
+    }
 }
 
 #[cfg(test)]

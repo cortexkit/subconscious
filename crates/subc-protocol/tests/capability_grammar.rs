@@ -1,9 +1,20 @@
 use std::fs;
 
 use serde_json::{json, Value};
+use subc_protocol::call_mode::CALL_MODES_CAPABILITY;
 use subc_protocol::manifest::{
     is_valid_capability_identifier, validate_manifest_capability_grammar,
 };
+
+#[test]
+fn call_modes_capability_has_the_canonical_spelling_and_is_valid_in_a_manifest() {
+    assert_eq!(CALL_MODES_CAPABILITY, "call-modes/v1");
+    assert!(is_valid_capability_identifier(CALL_MODES_CAPABILITY));
+    validate_manifest_capability_grammar(&json!({
+        "capabilities": { "provides": [CALL_MODES_CAPABILITY] }
+    }))
+    .unwrap();
+}
 
 #[test]
 fn capability_grammar_vectors_pin_lexical_and_schema_refusals() {

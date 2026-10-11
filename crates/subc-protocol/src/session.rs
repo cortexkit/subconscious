@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
+    call_mode::CallMode,
     manifest::{CapabilityDeclarations, ProviderRole},
     scope::{
         ScopeEnd, ScopeEndResult, ScopeEnded, ScopeRecord, ScopeRecordResult, ScopeStamp,
@@ -110,6 +111,12 @@ pub enum ModuleControlRequest {
         /// that predates scopes. A provider that needs a scope refuses the bind.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         scope: Option<ScopeStamp>,
+        /// The daemon-derived mode, sent only to targets declaring
+        /// [`crate::call_mode::CALL_MODES_CAPABILITY`]. If absent, readers derive
+        /// the mode from `scope` with [`crate::call_mode::derive_call_mode`].
+        /// Providers must refuse an unknown mode.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call_mode: Option<CallMode>,
     },
     #[serde(rename = "health.check")]
     HealthCheck {},
@@ -564,6 +571,7 @@ mod tests {
             role_versions,
             admission_facts: None,
             scope: None,
+            call_mode: None,
         };
         let absent = serde_json::to_value(bind(None)).unwrap();
         assert!(absent.get("role_versions").is_none(), "{absent}");

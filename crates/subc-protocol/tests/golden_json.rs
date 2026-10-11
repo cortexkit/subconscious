@@ -3,6 +3,7 @@ use std::{fmt::Debug, fs, path::PathBuf};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
 use subc_protocol::{
+    call_mode::CallMode,
     error_codes,
     manifest::{
         Bindings, CapabilityDeclarations, Concurrency, ExecutionMode, IdentityBinding,
@@ -287,18 +288,15 @@ fn protocol_wire_shapes_match_golden_json_and_round_trip() {
             daemon_incarnation: "0123456789abcdef0123456789abcdef".to_string(),
             owner_synced: true,
             owner_configured: true,
-            scope: Some(ScopeStamp {
-                owner: principal_reserved(),
-                scope_ref: "head-1".to_string(),
-                scope_epoch: 3,
-                kind: ScopeKind::Head,
-                parent: None,
-                parent_state: None,
-                attributes: ScopeAttributes::new()
-                    .with_agent_id(Some("agent-7".to_string()))
-                    .with_delegates(true),
-                owner_authorized: true,
-            }),
+            scope: Some(
+                ScopeStamp::new(principal_reserved(), "head-1", 3, ScopeKind::Head)
+                    .with_attributes(
+                        ScopeAttributes::new()
+                            .with_agent_id(Some("agent-7".to_string()))
+                            .with_delegates(true),
+                    )
+                    .with_owner_authorized(true),
+            ),
         },
     );
     assert_golden(
@@ -343,6 +341,81 @@ fn protocol_wire_shapes_match_golden_json_and_round_trip() {
         "module_manifest_diet",
         &ModuleManifest::builder("diet-module", "1.0.0").build(),
     );
+}
+
+#[test]
+fn call_mode_route_binds_match_golden_json_and_round_trip() {
+    let unscoped = module_control_request(None, None);
+    let mut run = module_control_request_with_scope();
+    let mut flow = module_control_request_with_scope();
+    for (bind, attributes) in [
+        (
+            &mut run,
+            ScopeAttributes::new()
+                .with_agent_id(Some("agent-7".to_string()))
+                .with_run_id(Some("run:7".to_string())),
+        ),
+        (
+            &mut flow,
+            ScopeAttributes::new()
+                .with_agent_id(Some("agent-7".to_string()))
+                .with_delegates(true)
+                .with_flow_id(Some("flow:run-7/step-2".to_string())),
+        ),
+    ] {
+        let ModuleControlRequest::RouteBind {
+            scope: Some(stamp), ..
+        } = bind
+        else {
+            panic!("expected a scoped bind");
+        };
+        stamp.attributes = attributes;
+    }
+
+    for (name, bind) in [
+        (
+            "module_control_request_route_bind_without_consumer_capabilities",
+            &unscoped,
+        ),
+        ("module_control_request_route_bind_with_run_id", &run),
+        ("module_control_request_route_bind_with_flow_id", &flow),
+    ] {
+        // Older providers must see neither new field, even on scoped routes.
+        let wire = serde_json::to_value(bind).unwrap();
+        assert!(wire.get("call_mode").is_none());
+        assert!(wire["scope"].get("expires_at_ms").is_none());
+        assert_golden(name, bind);
+    }
+
+    for (name, mut bind, mode) in [
+        (
+            "module_control_request_route_bind_with_call_mode_classic",
+            unscoped,
+            CallMode::Classic,
+        ),
+        (
+            "module_control_request_route_bind_with_call_mode_codemode",
+            run,
+            CallMode::Codemode,
+        ),
+        (
+            "module_control_request_route_bind_with_call_mode_flow",
+            flow,
+            CallMode::Flow,
+        ),
+    ] {
+        let ModuleControlRequest::RouteBind {
+            scope, call_mode, ..
+        } = &mut bind
+        else {
+            panic!("expected a route.bind");
+        };
+        *call_mode = Some(mode);
+        if let Some(stamp) = scope {
+            stamp.expires_at_ms = Some(1_725_000_030_000);
+        }
+        assert_golden(name, &bind);
+    }
 }
 
 fn scope_head_record() -> ScopeRecord {
@@ -1122,6 +1195,7 @@ fn module_control_request(
         role_versions: None,
         admission_facts,
         scope: None,
+        call_mode: None,
     }
 }
 
@@ -1154,6 +1228,7 @@ fn module_control_request_role_versions(with_role_versions: bool) -> ModuleContr
         }),
         admission_facts: None,
         scope: None,
+        call_mode: None,
     }
 }
 
@@ -1184,26 +1259,31 @@ fn module_control_request_with_scope() -> ModuleControlRequest {
         consumer_capabilities,
         role_versions: None,
         admission_facts,
-        scope: Some(ScopeStamp {
-            owner: Principal::Reserved {
-                module_id: "prefrontal-core".to_string(),
-            },
-            scope_ref: "head-1".to_string(),
-            scope_epoch: 3,
-            kind: ScopeKind::Worker,
-            parent: Some(ScopeParent::new(
+        scope: Some(
+            ScopeStamp::new(
+                Principal::Reserved {
+                    module_id: "prefrontal-core".to_string(),
+                },
+                "head-1",
+                3,
+                ScopeKind::Worker,
+            )
+            .with_parent(Some(ScopeParent::new(
                 Principal::Reserved {
                     module_id: "prefrontal-core".to_string(),
                 },
                 "head-0",
                 2,
-            )),
-            parent_state: Some(ParentState::Linked),
-            attributes: ScopeAttributes::new()
-                .with_agent_id(Some("agent-7".to_string()))
-                .with_delegates(true),
-            owner_authorized: true,
-        }),
+            )))
+            .with_parent_state(Some(ParentState::Linked))
+            .with_attributes(
+                ScopeAttributes::new()
+                    .with_agent_id(Some("agent-7".to_string()))
+                    .with_delegates(true),
+            )
+            .with_owner_authorized(true),
+        ),
+        call_mode: None,
     }
 }
 

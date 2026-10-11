@@ -2,9 +2,9 @@ use serde_json::json;
 use subc_protocol::{
     error_codes,
     scope::{
-        validate_run_id, ScopeAttributes, ScopeCarrier, ScopeEnd, ScopeEndOutcome, ScopeEndResult,
-        ScopeKind, ScopeParent, ScopeRecord, AGENT_RUN_SCOPES_CAPABILITY,
-        MAX_SCOPE_EXPIRY_AHEAD_MS, SCOPE_APPLY_OP,
+        validate_run_id, ParentState, ScopeAttributes, ScopeCarrier, ScopeEnd, ScopeEndOutcome,
+        ScopeEndResult, ScopeKind, ScopeParent, ScopeRecord, ScopeStamp,
+        AGENT_RUN_SCOPES_CAPABILITY, MAX_SCOPE_EXPIRY_AHEAD_MS, SCOPE_APPLY_OP,
     },
     session::{ModuleControlRequestFromModule, ModuleControlResponseToModule},
     tool_call::OpaqueFieldError,
@@ -117,16 +117,9 @@ fn run_only_attributes_are_not_empty_and_round_trip_on_bind_stamps() {
         serde_json::to_value(&attributes).unwrap(),
         json!({"run_id": "run:7"})
     );
-    let stamp = subc_protocol::scope::ScopeStamp {
-        owner: Principal::Direct,
-        scope_ref: "run-1".to_string(),
-        scope_epoch: 9,
-        kind: ScopeKind::Ephemeral,
-        parent: None,
-        parent_state: None,
-        attributes,
-        owner_authorized: true,
-    };
+    let stamp = ScopeStamp::new(Principal::Direct, "run-1", 9, ScopeKind::Ephemeral)
+        .with_attributes(attributes)
+        .with_owner_authorized(true);
     let encoded = serde_json::to_value(&stamp).unwrap();
     assert_eq!(encoded["attributes"], json!({"run_id": "run:7"}));
     assert!(encoded.get("expires_at_ms").is_none());
@@ -154,6 +147,68 @@ fn run_id_uses_shared_opaque_token_bounds_and_names_its_field() {
             OpaqueFieldError::InvalidCharacter { field, index: 1 }
         );
         assert_eq!(error.field(), "run_id");
+    }
+}
+
+#[test]
+fn scope_stamp_constructor_and_setters_round_trip_all_optional_fields() {
+    let stamp = ScopeStamp::new(Principal::Direct, "run-1", 9, ScopeKind::Ephemeral)
+        .with_parent(Some(ScopeParent::new(Principal::Direct, "head-1", 3)))
+        .with_parent_state(Some(ParentState::Linked))
+        .with_attributes(
+            ScopeAttributes::new()
+                .with_agent_id(Some("agent-7".to_string()))
+                .with_run_id(Some("run:7".to_string()))
+                .with_delegates(true),
+        )
+        .with_owner_authorized(true)
+        .with_expires_at_ms(Some(1_725_000_030_000));
+    let wire = json!({
+        "owner": {"kind": "direct"},
+        "ref": "run-1", "scope_epoch": 9, "kind": "ephemeral",
+        "parent": {"owner": {"kind": "direct"}, "ref": "head-1", "scope_epoch": 3},
+        "parent_state": "linked",
+        "attributes": {"agent_id": "agent-7", "run_id": "run:7", "delegates": true},
+        "owner_authorized": true,
+        "expires_at_ms": 1_725_000_030_000u64
+    });
+    assert_eq!(serde_json::to_value(&stamp).unwrap(), wire);
+    assert_eq!(serde_json::from_value::<ScopeStamp>(wire).unwrap(), stamp);
+}
+
+#[test]
+fn scope_stamp_defaults_omit_optional_fields_and_setters_can_clear_them() {
+    let stamp = ScopeStamp::new(Principal::Direct, "scope-1", 1, ScopeKind::Head);
+    let wire = json!({
+        "owner": {"kind": "direct"},
+        "ref": "scope-1", "scope_epoch": 1, "kind": "head",
+        "owner_authorized": false
+    });
+    assert_eq!(serde_json::to_value(&stamp).unwrap(), wire);
+    assert_eq!(serde_json::from_value::<ScopeStamp>(wire).unwrap(), stamp);
+    let cleared = stamp
+        .clone()
+        .with_parent(Some(ScopeParent::new(Principal::Direct, "parent", 1)))
+        .with_parent(None)
+        .with_parent_state(Some(ParentState::Linked))
+        .with_parent_state(None)
+        .with_attributes(ScopeAttributes::new().with_run_id(Some("run:7".to_string())))
+        .with_attributes(ScopeAttributes::new())
+        .with_owner_authorized(true)
+        .with_owner_authorized(false)
+        .with_expires_at_ms(Some(42))
+        .with_expires_at_ms(None);
+    assert_eq!(cleared, stamp);
+}
+
+#[test]
+fn scope_stamp_deadlines_keep_strict_wire_types() {
+    for invalid_expiry in [json!(-1), json!("42"), json!(1.5)] {
+        assert!(serde_json::from_value::<ScopeStamp>(json!({
+            "owner": {"kind": "direct"}, "ref": "run-1", "scope_epoch": 9,
+            "kind": "ephemeral", "owner_authorized": true, "expires_at_ms": invalid_expiry
+        }))
+        .is_err());
     }
 }
 

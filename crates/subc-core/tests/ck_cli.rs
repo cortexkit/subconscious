@@ -2299,12 +2299,11 @@ async fn module_logs_merges_sources_by_timestamp_and_reports_real_filter_counts(
     );
 }
 
-/// The daemon stamps each capture line with the moment it read it, so the
-/// stderr lane interleaves with the daemon's and the module's own lines by
-/// time. A capture file begun before that has unstamped lines at its top;
-/// they are still shown, and still undated, rather than given a time.
+/// A capture file begun before daemon stamping has an unstamped head.
+/// Those lines inherit the first following stamp, so they stay at the
+/// beginning of the capture lane instead of becoming the merged tail.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn module_logs_orders_stamped_capture_lines_by_stamp_and_keeps_unstamped_ones() {
+async fn module_logs_orders_legacy_capture_head_before_stamped_tail() {
     let module_id = "stamped-capture";
     let data_home = unique_temp_dir("ck-module-logs-stamped-data");
     let runtime_dir = unique_temp_dir("ck-module-logs-stamped-runtime");
@@ -2361,11 +2360,11 @@ async fn module_logs_orders_stamped_capture_lines_by_stamp_and_keeps_unstamped_o
         text(&output.stdout),
         concat!(
             "daemon       2026-09-19T07:04:01.000Z INFO  subc: spawned module_id=stamped-capture\n",
+            "stderr       old unstamped line\n",
             "stderr       2026-09-19T07:04:02.000Z first stamped line\n",
             "mod          2026-09-19T07:04:03.000Z INFO  stamped-capture: module line\n",
             "daemon       2026-09-19T07:04:04.000Z WARN  subc: slow module_id=stamped-capture\n",
             "stderr       2026-09-19T07:04:05.000Z second stamped line\n",
-            "stderr       old unstamped line\n",
         )
     );
 }

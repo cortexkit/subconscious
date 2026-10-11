@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.20.81
+
+- Order legacy unstamped capture lines using their position relative to stamped lines in the same capture file, apply `--since` to inherited capture times, and identify inherited times in JSON.
+
 ## 0.20.80
 
 - Update the internal CLI and daemon executable to `subc-protocol` 0.31, `subc-control` 0.30, `subc-transport` 0.12 and `subc-daemon` 0.34 for call modes and stamped deadlines. Restart the daemon before writing delegating run scopes; providers opt into `call-modes/v1` only after implementing mode handling. CLI commands are unchanged. The test provider ignores the new optional `call_mode` bind field.

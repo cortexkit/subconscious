@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.27.3
+
+- Add `ModuleHandle::activity_record(request)` for module authors to append one typed activity-ledger entry and receive its sequence number. It requires the daemon's `activity-ledger/v1` capability, preserves daemon refusal codes and messages, never retries, and reports an unknown outcome if the reply deadline expires after sending. Requires `subc-control` 0.29.4, the minimum release that provides the activity request types and capability.
+
 ## 0.27.2
 
 - Use the shared Windows named-pipe accessor and its process cache for HELLO and route-open; Unix remains on the inherited descriptor.

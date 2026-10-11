@@ -526,3 +526,145 @@ async fn operator_confirm_closed_writer_fails_without_leaking_pending_entry() {
     );
     assert_eq!(pending_count(&handle), 0);
 }
+
+fn activity_record_request() -> ActivityRecordRequest {
+    ActivityRecordRequest {
+        kind: "task.completed".into(),
+        summary: "Build finished".into(),
+        subject: Some(ActivitySubject {
+            subject_type: "task".into(),
+            id: "build-42".into(),
+        }),
+        details: Some(serde_json::Map::from_iter([(
+            "attempt".into(),
+            serde_json::json!(2),
+        )])),
+        on: Some(ActivityOn::Route(ActivityRoute {
+            channel: 7,
+            epoch: 3,
+        })),
+    }
+}
+
+#[tokio::test]
+async fn activity_record_serializes_request_and_returns_seq() {
+    let mut served = super::stand_in::serve_against_stand_in_with_ops_and_capabilities(
+        |_| Echo,
+        &[],
+        &[subc_control::ACTIVITY_LEDGER_CAPABILITY],
+    )
+    .await;
+    let request = activity_record_request();
+    let expected_body = serde_json::to_vec(&request).unwrap();
+    let mut call = Box::pin(served.handle.activity_record(request));
+    still_pending(call.as_mut()).await;
+
+    let frame = timeout(Duration::from_secs(2), read_frame(&mut served.daemon))
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(frame.header.ty, FrameType::Request);
+    assert_eq!(frame.header.channel, 0);
+    assert_eq!(frame.header.epoch, 0);
+    assert_eq!(frame.body, expected_body);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&frame.body).unwrap()["op"],
+        "activity.record"
+    );
+
+    let response = Frame::build(
+        FrameType::Response,
+        control_flags(),
+        0,
+        0,
+        frame.header.corr,
+        serde_json::to_vec(&subc_control::ActivityRecordResponse { seq: 42 }).unwrap(),
+    )
+    .unwrap();
+    write_frame(&mut served.daemon, &response).await.unwrap();
+    served.daemon.flush().await.unwrap();
+    assert_eq!(timeout(Duration::from_secs(2), call).await.unwrap(), Ok(42));
+
+    served.handle.close_connection();
+    timeout(Duration::from_secs(3), served.serve)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn activity_record_preserves_daemon_refusal_codes() {
+    let codes = [
+        subc_control::ACTIVITY_KIND_FORBIDDEN,
+        subc_control::ACTIVITY_MALFORMED,
+        subc_control::ACTIVITY_TOO_LARGE,
+        subc_control::ACTIVITY_RATE_LIMITED,
+        subc_control::ACTIVITY_ACTOR_UNKNOWN,
+        subc_control::ACTIVITY_UNAVAILABLE,
+    ];
+
+    for code in codes {
+        let mut served = super::stand_in::serve_against_stand_in_with_ops_and_capabilities(
+            |_| Echo,
+            &[],
+            &[subc_control::ACTIVITY_LEDGER_CAPABILITY],
+        )
+        .await;
+        let mut call = Box::pin(served.handle.activity_record(activity_record_request()));
+        still_pending(call.as_mut()).await;
+        let request = timeout(Duration::from_secs(2), read_frame(&mut served.daemon))
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let refusal = reply(
+            FrameType::Error,
+            request.header.corr,
+            serde_json::json!({"code": code, "message": "recording refused"}),
+        );
+        write_frame(&mut served.daemon, &refusal).await.unwrap();
+        served.daemon.flush().await.unwrap();
+        assert_eq!(
+            timeout(Duration::from_secs(2), call).await.unwrap(),
+            Err(ActivityRecordError::Refused {
+                code: code.to_owned(),
+                message: "recording refused".into(),
+            }),
+            "{code}"
+        );
+
+        served.handle.close_connection();
+        timeout(Duration::from_secs(3), served.serve)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn activity_record_without_capability_fails_fast_without_sending() {
+    let mut served =
+        super::stand_in::serve_against_stand_in_with_ops_and_capabilities(|_| Echo, &[], &[]).await;
+    let result = timeout(
+        Duration::from_millis(100),
+        served.handle.activity_record(activity_record_request()),
+    )
+    .await;
+    assert!(matches!(result, Ok(Err(ActivityRecordError::NotSupported))));
+    assert!(
+        timeout(Duration::from_millis(50), read_frame(&mut served.daemon))
+            .await
+            .is_err(),
+        "unsupported call must not send a frame"
+    );
+
+    served.handle.close_connection();
+    timeout(Duration::from_secs(3), served.serve)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+}

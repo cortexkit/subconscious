@@ -13,6 +13,14 @@ pub(crate) async fn serve_against_stand_in_with_ops<H: ModuleHandler>(
     make_handler: impl FnOnce(ModuleHandle) -> H,
     subc_ops: &[&str],
 ) -> Served {
+    serve_against_stand_in_with_ops_and_capabilities(make_handler, subc_ops, &[]).await
+}
+
+pub(crate) async fn serve_against_stand_in_with_ops_and_capabilities<H: ModuleHandler>(
+    make_handler: impl FnOnce(ModuleHandle) -> H,
+    subc_ops: &[&str],
+    subc_capabilities: &[&str],
+) -> Served {
     // Start at the acknowledged connection, bypassing discovery, authentication
     // and HELLO's launch nonce. Frames, dispatch and writer shutdown are real.
     let (module, daemon) = tokio::io::duplex(64 * 1024);
@@ -21,7 +29,10 @@ pub(crate) async fn serve_against_stand_in_with_ops<H: ModuleHandler>(
     let ack = ModuleHelloAckBody {
         negotiated_ver: PROTOCOL_VERSION,
         subc_ops: subc_ops.iter().map(|op| (*op).to_owned()).collect(),
-        subc_capabilities: Vec::new(),
+        subc_capabilities: subc_capabilities
+            .iter()
+            .map(|capability| (*capability).to_owned())
+            .collect(),
         storage: None,
         machine_id: None,
     };

@@ -39,7 +39,11 @@ use std::{
 };
 
 pub use async_trait::async_trait;
-pub use subc_control::{CatalogEntry, ConsumerIdentity};
+pub use subc_control::{
+    ActivityOn, ActivityRecordRequest, ActivityRoute, ActivityScope, ActivitySubject, CatalogEntry,
+    ConsumerIdentity,
+};
+use subc_control::{ActivityRecordResponse, ACTIVITY_LEDGER_CAPABILITY};
 /// The one launch-nonce reader for a module process: `launch_nonce()` reads
 /// the inherited Unix descriptor, the Windows named pipe, or, when neither is
 /// named, the `SUBC_LAUNCH_NONCE` environment copy once and caches it. The SDK's
@@ -304,6 +308,7 @@ type CatalogUpdateWaiter =
     oneshot::Receiver<Result<ModuleControlResponseToModule, CatalogUpdateError>>;
 type CatalogUpdateRequest = (u64, mpsc::Sender<Frame>, CatalogUpdateWaiter);
 type OperatorConfirmRequestWaiter = (u64, mpsc::Sender<Frame>, oneshot::Receiver<Frame>);
+type ActivityRecordRequestWaiter = (u64, mpsc::Sender<Frame>, oneshot::Receiver<Frame>);
 
 /// Future returned by [`serve_with_handle`] that runs the module until GOODBYE or EOF.
 pub type ModuleServeFuture = Pin<Box<dyn Future<Output = Result<(), SubcModuleError>> + Send>>;
@@ -448,6 +453,7 @@ struct ModuleHandleShared {
     supports_scope_apply: bool,
     supports_scope_describe: bool,
     supports_operator_confirm: bool,
+    supports_activity_ledger: bool,
     connection_runtime: tokio::runtime::Handle,
     connection_token: u64,
     machine_id: Option<MachineId>,
@@ -462,6 +468,7 @@ struct ModuleHandleState {
     next_corr: Option<u64>,
     pending_catalog_updates: HashMap<u64, CatalogUpdateReply>,
     pending_operator_confirms: HashMap<u64, oneshot::Sender<Frame>>,
+    pending_activity_records: HashMap<u64, oneshot::Sender<Frame>>,
     closed: bool,
 }
 
@@ -485,6 +492,10 @@ impl ModuleHandle {
                 supports_scope_apply: ack.subc_ops.iter().any(|op| op == SCOPE_APPLY_OP),
                 supports_scope_describe: ack.subc_ops.iter().any(|op| op == SCOPE_DESCRIBE_OP),
                 supports_operator_confirm: ack.subc_ops.iter().any(|op| op == OPERATOR_CONFIRM_OP),
+                supports_activity_ledger: ack
+                    .subc_capabilities
+                    .iter()
+                    .any(|capability| capability == ACTIVITY_LEDGER_CAPABILITY),
                 connection_runtime,
                 connection_token,
                 // A value that does not parse is treated like an absent one:
@@ -501,6 +512,7 @@ impl ModuleHandle {
                     next_corr: Some(HELLO_CORR + 1),
                     pending_catalog_updates: HashMap::new(),
                     pending_operator_confirms: HashMap::new(),
+                    pending_activity_records: HashMap::new(),
                     closed: false,
                 }),
             }),
@@ -872,6 +884,89 @@ impl ModuleHandle {
         }
     }
 
+    /// Append one activity-ledger entry from this module connection.
+    ///
+    /// The daemon must advertise `activity-ledger/v1` in HELLO_ACK or the call
+    /// fails without sending anything. A daemon refusal preserves its code and
+    /// message in [`ActivityRecordError::Refused`]. The request is never retried.
+    /// If the reply deadline expires after sending, the entry may or may not
+    /// have been stored; [`ActivityRecordError::OutcomeUnknown`] requires the
+    /// caller to treat the result as unknown rather than send a duplicate.
+    pub async fn activity_record(
+        &self,
+        request: ActivityRecordRequest,
+    ) -> Result<u64, ActivityRecordError> {
+        if !self.shared.supports_activity_ledger {
+            return Err(ActivityRecordError::NotSupported);
+        }
+
+        let deadline = Instant::now() + OPERATOR_CONFIRM_TIMEOUT;
+        let body = serde_json::to_vec(&request).map_err(|err| {
+            ActivityRecordError::Protocol(format!(
+                "failed to encode activity.record request body: {err}"
+            ))
+        })?;
+        let (corr, writer, rx) = self.shared.begin_activity_record()?;
+        let _guard = ActivityRecordGuard {
+            shared: Arc::clone(&self.shared),
+            corr,
+        };
+        let frame = Frame::build_with_version(
+            self.shared.negotiated_ver,
+            FrameType::Request,
+            control_flags(),
+            0,
+            0,
+            corr,
+            body,
+        )
+        .map_err(|err| {
+            ActivityRecordError::Protocol(format!(
+                "failed to build activity.record request frame: {err}"
+            ))
+        })?;
+
+        tokio::select! {
+            result = timeout_at(deadline, writer.send(frame)) => {
+                result.map_err(|_| ActivityRecordError::Timeout)?
+                    .map_err(|_| ActivityRecordError::ConnectionClosed)?;
+            }
+            _ = self.shared.close_token.cancelled() => {
+                return Err(ActivityRecordError::ConnectionClosed);
+            }
+        }
+
+        let reply = timeout_at(deadline, rx)
+            .await
+            .map_err(|_| ActivityRecordError::OutcomeUnknown)?
+            .map_err(|_| ActivityRecordError::ConnectionClosed)?;
+        match reply.header.ty {
+            FrameType::Response => {
+                let response = serde_json::from_slice::<ActivityRecordResponse>(&reply.body)
+                    .map_err(|err| {
+                        ActivityRecordError::Protocol(format!(
+                            "invalid activity.record response body: {err}"
+                        ))
+                    })?;
+                Ok(response.seq)
+            }
+            FrameType::Error => {
+                let body = serde_json::from_slice::<ErrorBody>(&reply.body).map_err(|err| {
+                    ActivityRecordError::Protocol(format!(
+                        "invalid activity.record error body: {err}"
+                    ))
+                })?;
+                Err(ActivityRecordError::Refused {
+                    code: body.code,
+                    message: body.message,
+                })
+            }
+            ty => Err(ActivityRecordError::Protocol(format!(
+                "unexpected activity.record terminal frame: {ty:?}"
+            ))),
+        }
+    }
+
     /// Send one channel-0 control request and wait for its reply, through the
     /// same correlation table, writer and timeout as `catalog_update` and
     /// `live_roots`. The caller checks that the reply is the right variant.
@@ -1026,6 +1121,15 @@ impl ModuleHandle {
             let _ = reply.send(frame);
             return true;
         }
+        let activity_reply = self
+            .shared
+            .lock_inner()
+            .pending_activity_records
+            .remove(&frame.header.corr);
+        if let Some(reply) = activity_reply {
+            let _ = reply.send(frame);
+            return true;
+        }
         let Some(reply) = self.shared.take_pending_catalog_update(frame.header.corr) else {
             return false;
         };
@@ -1100,8 +1204,32 @@ impl ModuleHandleShared {
         Ok((corr, writer, rx))
     }
 
+    fn begin_activity_record(&self) -> Result<ActivityRecordRequestWaiter, ActivityRecordError> {
+        let mut inner = self.lock_inner();
+        if inner.closed {
+            return Err(ActivityRecordError::ConnectionClosed);
+        }
+        let Some(writer) = inner.writer.clone() else {
+            drop(inner);
+            self.close_connection();
+            return Err(ActivityRecordError::ConnectionClosed);
+        };
+        let Some(corr) = next_module_control_corr(&mut inner) else {
+            drop(inner);
+            self.close_connection();
+            return Err(ActivityRecordError::ConnectionClosed);
+        };
+        let (tx, rx) = oneshot::channel();
+        inner.pending_activity_records.insert(corr, tx);
+        Ok((corr, writer, rx))
+    }
+
     fn take_pending_catalog_update(&self, corr: u64) -> Option<CatalogUpdateReply> {
         self.lock_inner().pending_catalog_updates.remove(&corr)
+    }
+
+    fn remove_pending_activity_record(&self, corr: u64) {
+        self.lock_inner().pending_activity_records.remove(&corr);
     }
 
     fn remove_pending_catalog_update(&self, corr: u64) {
@@ -1119,6 +1247,7 @@ impl ModuleHandleShared {
             self.close_token.cancel();
             // Dropping these senders wakes raw-frame waiters immediately.
             inner.pending_operator_confirms.clear();
+            inner.pending_activity_records.clear();
             inner
                 .pending_catalog_updates
                 .drain()
@@ -1148,6 +1277,17 @@ fn next_module_control_corr(inner: &mut ModuleHandleState) -> Option<u64> {
     let corr = inner.next_corr?;
     inner.next_corr = corr.checked_add(1);
     Some(corr)
+}
+
+struct ActivityRecordGuard {
+    shared: Arc<ModuleHandleShared>,
+    corr: u64,
+}
+
+impl Drop for ActivityRecordGuard {
+    fn drop(&mut self) {
+        self.shared.remove_pending_activity_record(self.corr);
+    }
 }
 
 struct OperatorConfirmGuard {
@@ -1222,6 +1362,59 @@ impl fmt::Display for OperatorConfirmError {
 }
 
 impl Error for OperatorConfirmError {}
+
+/// Failure to append an activity entry through [`ModuleHandle::activity_record`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ActivityRecordError {
+    /// HELLO_ACK did not advertise `activity-ledger/v1`, so nothing was sent.
+    NotSupported,
+    /// The daemon refused the request. `code` is the daemon's exact refusal code.
+    Refused { code: String, message: String },
+    /// The send deadline expired before the request entered the writer queue.
+    Timeout,
+    /// The request was sent, but no reply arrived before the deadline.
+    OutcomeUnknown,
+    /// The module connection closed before a reply arrived.
+    ConnectionClosed,
+    /// The daemon reply was malformed or was not an activity.record reply.
+    Protocol(String),
+}
+
+impl ActivityRecordError {
+    /// The daemon's refusal code, when the daemon refused the request.
+    pub fn code(&self) -> Option<&str> {
+        match self {
+            Self::Refused { code, .. } => Some(code),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for ActivityRecordError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotSupported => write!(
+                f,
+                "daemon HELLO_ACK did not advertise {ACTIVITY_LEDGER_CAPABILITY} support"
+            ),
+            Self::Refused { code, message } => {
+                write!(f, "activity.record refused by subc: {code} ({message})")
+            }
+            Self::Timeout => write!(f, "timed out before activity.record was sent"),
+            Self::OutcomeUnknown => write!(
+                f,
+                "timed out waiting for activity.record reply; outcome unknown"
+            ),
+            Self::ConnectionClosed => {
+                write!(f, "subc connection closed before activity.record replied")
+            }
+            Self::Protocol(message) => write!(f, "activity.record protocol error: {message}"),
+        }
+    }
+}
+
+impl Error for ActivityRecordError {}
 
 /// Errors returned by [`ModuleHandle::catalog_update`].
 #[derive(Debug)]

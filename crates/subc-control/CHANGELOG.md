@@ -5,6 +5,11 @@
 - **Breaking.** Requires `subc-protocol` 0.31. Public control types carry protocol types, so consumers must upgrade control and protocol together to avoid incompatible copies. Replace `ScopeStamp` literals with `ScopeStamp::new` and its `with_*` setters, and account for optional `call_mode` in raw `ModuleControlRequest::RouteBind` constructors and exhaustive patterns.
 - Call-mode providers declare `call-modes/v1` only after reading every bind's mode, handling classic, codemode and flow, and refusing `CallMode::Unknown`. Legacy non-delegating run and flow binds remain supported; delegating runs require the new capability. Control operations otherwise keep their existing behavior.
 
+## 0.29.5
+
+- Add the `running_executable_permission_denied` running-image unavailable reason for Linux non-dumpable processes. Keep the existing unavailable wire envelope so older readers retain the new reason as an unknown string. Exhaustive Rust matches on `RunningImageUnavailableReason` must account for the new arm.
+- Add the `process_hidden` unavailable reason and optional `SupervisorEntry.waiting_for_previous_pid` for a module blocked by a previous hidden instance. The previous PID is separate from the daemon's currently supervised process identity; old payloads and readers remain compatible.
+
 ## 0.29.4
 
 - Add standalone, op-tagged activity record, query and subscribe request/response types, ledger entries, actor citations and cursors. The exhaustive `ClientControlRequest`, `ClientControlResponse` and `ClientControlPush` enums are unchanged; dispatch activity bodies using the operation name in each body's `op` field.

@@ -26,8 +26,23 @@ pub(crate) fn open(pid: u32) -> io::Result<Option<Option<OwnedFd>>> {
         Err(Errno::SRCH) => Ok(None),
         // ENOSYS: a kernel older than 5.3. EPERM or EACCES: a seccomp or LSM
         // policy refusing the call. Either way the pid-based path still works.
-        Err(_) => Ok(start_time(pid).map(|_| None)),
+        Err(_) => Ok((start_time(pid).is_some() || exists(pid)).then_some(None)),
     }
+}
+
+fn exists(pid: u32) -> bool {
+    raw_pid(pid).is_some_and(|pid| rustix::process::test_kill_process(pid) != Err(Errno::SRCH))
+}
+
+pub(crate) fn alive_but_unobservable(pid: u32, pidfd: Option<&OwnedFd>) -> bool {
+    pidfd_alive(pidfd)
+        && std::fs::metadata(format!("/proc/{pid}")).is_err_and(|error| {
+            matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
+            )
+        })
+        && exists(pid)
 }
 
 /// A pidfd becomes readable once its process has exited, whether or not it
@@ -123,8 +138,14 @@ pub(crate) fn memory_from_status(status: &str) -> Option<(u64, Option<u64>)> {
 
 /// `stat` through the `/proc/<pid>/exe` link, which names the image the
 /// process is running even after its file was replaced or unlinked.
-pub(crate) fn executable_identity(pid: u32) -> Option<FileIdentity> {
-    crate::file_identity(std::path::Path::new(&format!("/proc/{pid}/exe")))
+pub(crate) fn executable_identity(pid: u32) -> std::io::Result<FileIdentity> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = std::fs::metadata(format!("/proc/{pid}/exe"))?;
+    Ok(FileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
 }
 
 pub(crate) fn signal(pid: u32, pidfd: Option<&OwnedFd>, signal: Signal) -> Result<(), Errno> {

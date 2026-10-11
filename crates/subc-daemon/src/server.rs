@@ -462,8 +462,8 @@ enum ConnectionLoopExit {
 /// Every accepted TCP connection must complete the key-auth prelude before any
 /// envelope bytes are read by the router. Outbound frames flow through a bounded
 /// [`FrameSink`] drained by one writer task. Inbound dispatch remains serial for
-/// every frame except `route.open`; only that bind wait runs in a connection-owned
-/// task so it cannot hold unrelated frames behind a slow target module.
+/// every frame except `route.open` and `activity.record`; their bind/append waits
+/// run in connection-owned tasks so unrelated frames can keep flowing.
 pub async fn handle_connection<S>(
     mut stream: S,
     router: Arc<Router>,
@@ -684,7 +684,11 @@ async fn connection_loop<R>(
 where
     R: AsyncRead + Unpin,
 {
+    let mut activity_tasks = JoinSet::new();
     loop {
+        while let Some(result) = activity_tasks.try_join_next() {
+            finish_route_open_task(result)?;
+        }
         while let Some(result) = route_open_tasks.try_join_next() {
             finish_route_open_task(result)?;
         }
@@ -703,6 +707,9 @@ where
                         result.expect("a non-empty route.open JoinSet has a next task")
                     )?;
                 }
+                result = activity_tasks.join_next(), if !activity_tasks.is_empty() => {
+                    finish_route_open_task(result.expect("non-empty activity task set"))?;
+                }
                 result = &mut read => {
                     break match result.map_err(ConnectionError::FrameIo)? {
                         Some(frame) => frame,
@@ -711,6 +718,35 @@ where
                 }
             }
         };
+
+        if frame.header.channel == 0
+            && frame.header.ty == subc_protocol::FrameType::Request
+            && serde_json::from_slice::<serde_json::Value>(&frame.body)
+                .ok()
+                .is_some_and(|body| body["op"] == subc_control::ops::ACTIVITY_RECORD)
+        {
+            // Bound outstanding activity-record tasks as well as the disk queue,
+            // so the reader never waits for either capacity when the disk stalls.
+            if activity_tasks.len() >= 128 {
+                let response = crate::control::control_error_frame(
+                    &frame,
+                    subc_control::ACTIVITY_UNAVAILABLE,
+                    "activity queue full",
+                )
+                .map_err(ConnectionError::Router)?;
+                ctx.egress
+                    .send(response)
+                    .await
+                    .map_err(ConnectionError::Router)?;
+            } else {
+                let task_router = Arc::clone(&router);
+                let task_ctx = ctx.clone();
+                activity_tasks.spawn(async move {
+                    route_open_tail(task_router, task_ctx, frame, Instant::now()).await
+                });
+            }
+            continue;
+        }
 
         if let Some(target_module_id) = router.route_open_target(&frame) {
             // A task can finish while the reader is waiting for the next frame.
@@ -753,8 +789,8 @@ where
             continue;
         }
 
-        // Every non-route.open frame keeps the original serial dispatch path,
-        // including read backpressure and close-cancellation coupling.
+        // Other frames still route serially: routing can backpressure reads,
+        // and a connection close cancels the in-progress route.
         let route_result = tokio::select! {
             close = &mut close_receiver => {
                 return Ok(ConnectionLoopExit::CloseRequested(close_reason(close)));

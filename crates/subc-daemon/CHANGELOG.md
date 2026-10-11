@@ -8,6 +8,18 @@
 - Include the immutable epoch deadline in `scope.describe` stamps. Existing Rust stamp decoders accept extra fields, and Swift's management reply path preserves them. The TypeScript client has no describe API or reply decoder; its provider bind decoder ignores extra fields. Swift has no provider bind decoder.
 - Update the record-validation test that formerly required `run_id` with `delegates` to be refused: delegation is now checked against each route's target, not rejected in scope records. Add daemon bind golden fixtures and reconnect tests that replace an admitted declarer with a legacy endpoint, verifying field omission and delegation refusal at relay re-check.
 
+## 0.33.10
+
+- Serve additive `activity.record` requests from registered modules and advertise `activity-ledger/v1` in HELLO_ACK and server.describe. The daemon verifies route ownership/epoch and live scope tags before recording the verified identity of the client that opened the route, its project and scope attributes. Events with no route or scope citation identify the calling module.
+- Append `activity.jsonl` beside the terminal journal through cortexkit-log on a bounded single-writer queue. Replies follow successful writes, sequence numbers resume across retained rotated files, and reopening adds a newline after an incomplete final record so it cannot swallow the next append. Open/write failures and queue saturation refuse recording without holding connection readers or stopping routing, supervision or shutdown.
+- Enforce module-owned kinds, Unicode scalar and compact JSON size limits, strict request shape and incarnation-long per-module token buckets (60 initial tokens, 10/s). Add controlled-clock, fault-injection and isolated TCP daemon tests.
+
+## 0.33.9
+
+- Sweep recorded Linux children whose PID and start time match when executable access is denied with EACCES/EPERM. Log at info that the executable is not readable (non-dumpable), without claiming image agreement. Missing recorded identities, PID reuse, different executables, and other read failures still refuse signalling; macOS and Windows are unchanged.
+- Report permission-denied running images with a distinct unavailable reason after confirming the process start time. This remains unavailable, not an image match, for reload and upgrade decisions.
+- On Linux procfs with `hidepid`, keep alive-but-unobservable orphans without signalling them. Merge their records across roster rewrites, block only their module IDs with an explicit previous-PID waiting reason, and keep unrelated modules serving. Recheck existence with signal-zero about every five seconds; only ESRCH releases the record and permits normal configured startup, without spending crash-restart budget. Start, restart, reload, swap, and route requests report the waiting reason while that previous instance exists.
+
 ## 0.33.8
 
 - Record terminal history before publishing a health-budget failure or clearing the reaped child's process facts. Apply the same ordering to every child-bearing drain, ordinary exit and daemon-shutdown exit; failed waits and drain teardown errors record their unknown exit before publishing failure. Journal errors still retain the exit record in memory and publish the requested stopped, disabled, restarting or failed state. A panic during terminal recording also publishes that state before resuming the unwind. No-child spawn failures remain failures without fabricated exit records.

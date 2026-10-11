@@ -1,8 +1,13 @@
 # Changelog
 
-## 0.20.79
+## 0.20.80
 
 - Update the internal CLI and daemon executable to `subc-protocol` 0.31, `subc-control` 0.30, `subc-transport` 0.12 and `subc-daemon` 0.34 for call modes and stamped deadlines. Restart the daemon before writing delegating run scopes; providers opt into `call-modes/v1` only after implementing mode handling. CLI commands are unchanged. The test provider ignores the new optional `call_mode` bind field.
+
+## 0.20.79
+
+- Render Linux executable permission denial as `not readable (non-dumpable)` in module status and provenance rather than as an image difference or a generic unavailable result. The image is still unavailable for verification; this does not weaken upgrade checks.
+- Show `not observable (process hidden)` when procfs hides a live process, and identify the previous PID when a module is waiting for its hidden predecessor to exit.
 
 ## 0.20.78
 

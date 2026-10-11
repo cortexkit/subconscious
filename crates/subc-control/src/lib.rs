@@ -769,6 +769,8 @@ open_string_enum! {
         NotRunning => "not_running",
         UnsupportedPlatform => "unsupported_platform",
         RunningExecutableUnreadable => "running_executable_unreadable",
+        RunningExecutablePermissionDenied => "running_executable_permission_denied",
+        ProcessHidden => "process_hidden",
         SpawnedPathUnreadable => "spawned_path_unreadable",
         HashFailed => "hash_failed",
         ProcessIdentityUnconfirmed => "process_identity_unconfirmed",
@@ -2076,6 +2078,10 @@ pub enum ModuleProtocol {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[non_exhaustive]
 pub struct SupervisorEntry {
+    /// A hidden previous instance blocks only this module's next spawn. This
+    /// PID is not the supervised child and must not be presented as its identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting_for_previous_pid: Option<u32>,
     pub module_id: String,
     pub state: String,
     pub enabled: bool,
@@ -2220,6 +2226,7 @@ impl SupervisorEntry {
         Self {
             module_id: module_id.into(),
             state: state.into(),
+            waiting_for_previous_pid: None,
             enabled,
             live,
             protocol: ModuleProtocol::default(),
@@ -2260,6 +2267,12 @@ impl SupervisorEntry {
 
     pub fn with_launch_nonce_source(mut self, source: Option<String>) -> Self {
         self.launch_nonce_source = source;
+        self
+    }
+
+    #[must_use]
+    pub fn with_waiting_for_previous_pid(mut self, pid: Option<u32>) -> Self {
+        self.waiting_for_previous_pid = pid;
         self
     }
 
@@ -2752,6 +2765,14 @@ mod tests {
                 "running_executable_unreadable",
             ),
             (
+                RunningImageUnavailableReason::RunningExecutablePermissionDenied,
+                "running_executable_permission_denied",
+            ),
+            (
+                RunningImageUnavailableReason::ProcessHidden,
+                "process_hidden",
+            ),
+            (
                 RunningImageUnavailableReason::SpawnedPathUnreadable,
                 "spawned_path_unreadable",
             ),
@@ -2780,6 +2801,26 @@ mod tests {
             let decoded: TerminalDisposition = serde_json::from_str(&wire).unwrap();
             assert_eq!(decoded, value);
         }
+    }
+
+    #[test]
+    fn supervisor_waiting_previous_pid_is_optional_and_round_trips() {
+        let entry = SupervisorEntry::new(
+            "waiting-module",
+            "starting",
+            true,
+            false,
+            SupervisorHealthStatus::Unknown,
+        );
+        let old_wire = serde_json::to_value(&entry).unwrap();
+        assert!(old_wire.get("waiting_for_previous_pid").is_none());
+        let decoded: SupervisorEntry = serde_json::from_value(old_wire).unwrap();
+        assert_eq!(decoded.waiting_for_previous_pid, None);
+        let entry = entry.with_waiting_for_previous_pid(Some(42));
+        let wire = serde_json::to_value(&entry).unwrap();
+        assert_eq!(wire["waiting_for_previous_pid"], 42);
+        let decoded: SupervisorEntry = serde_json::from_value(wire).unwrap();
+        assert_eq!(decoded.waiting_for_previous_pid, Some(42));
     }
 
     #[test]

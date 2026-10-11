@@ -88,6 +88,8 @@ struct RosterInner {
     /// Where the live-children record is written; unset means no record, the
     /// default for an in-process daemon (see `BootstrapConfig`).
     record_path: OnceLock<PathBuf>,
+    #[cfg(target_os = "linux")]
+    retained: Mutex<Vec<LiveChild>>,
     #[cfg(target_os = "macos")]
     privacy_trampoline: OnceLock<Result<PathBuf, String>>,
 }
@@ -113,12 +115,44 @@ impl RosterInner {
                 cgroup_name: entry.recorded.cgroup_name.clone(),
             })
             .collect();
+        #[cfg(target_os = "linux")]
+        let children: Vec<_> = children
+            .into_iter()
+            .chain(lock(&self.retained).iter().cloned())
+            .collect();
         if let Err(error) = crate::live_children::write_record(path, &children) {
             warn!(
                 path = %path.display(),
                 %error,
                 "could not rewrite the live-children record; a crash now could leave orphans the next boot cannot find"
             );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn recheck_retained(&self) {
+        // Take `live` before `retained`, matching record writes made when a
+        // newly spawned child joins the roster. This prevents pruning from
+        // racing a write that must preserve a previous hidden process.
+        let live = lock(&self.live);
+        let changed = {
+            let mut retained = lock(&self.retained);
+            let before = retained.len();
+            retained.retain(|entry| {
+                let Some(pid) = i32::try_from(entry.pid)
+                    .ok()
+                    .and_then(rustix::process::Pid::from_raw)
+                else {
+                    return true;
+                };
+                // Only signal-zero ESRCH permits dropping an unidentifiable
+                // previous instance. Permission and other errors keep it blocked.
+                rustix::process::test_kill_process(pid) != Err(rustix::io::Errno::SRCH)
+            });
+            retained.len() != before
+        };
+        if changed {
+            self.write_record(&live);
         }
     }
 }
@@ -211,7 +245,36 @@ impl ChildRoster {
     /// Keep the live-children record at `path` from now on. Set once, before
     /// anything is admitted; a second call is ignored.
     pub(crate) fn record_to(&self, path: PathBuf) {
-        let _ = self.inner.record_path.set(path);
+        #[cfg(target_os = "linux")]
+        let retained = crate::live_children::read_record(&path).unwrap_or_default();
+        let first_record = self.inner.record_path.set(path).is_ok();
+        #[cfg(not(target_os = "linux"))]
+        let _ = first_record;
+        #[cfg(target_os = "linux")]
+        if first_record {
+            *lock(&self.inner.retained) = retained;
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                let weak = Arc::downgrade(&self.inner);
+                runtime.spawn(async move {
+                    loop {
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                        let Some(inner) = weak.upgrade() else {
+                            return;
+                        };
+                        inner.recheck_retained();
+                    }
+                });
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn previous_instance_pid(&self, module_id: &str) -> Option<u32> {
+        self.inner.recheck_retained();
+        lock(&self.inner.retained)
+            .iter()
+            .find(|entry| entry.module_id == module_id)
+            .map(|entry| entry.pid)
     }
 
     pub(crate) fn admit(

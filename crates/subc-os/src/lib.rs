@@ -132,6 +132,16 @@ pub struct Observation {
     pub executable: Option<FileIdentity>,
 }
 
+/// Whether the running executable's identity could be read. Permission denial
+/// is distinct on Linux because a non-dumpable process hides its executable
+/// while leaving its start time readable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutableAccess {
+    Readable,
+    PermissionDenied,
+    Unavailable,
+}
+
 /// A signal [`Process::signal`] can send.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Signal {
@@ -291,9 +301,32 @@ impl Process {
         }
     }
 
-    /// The process's start time and executable, or `None` once it has exited
-    /// (including as a zombie not yet reaped by its parent).
+    /// The process's start time and executable, or `None` when it has exited
+    /// (including as a zombie not yet reaped) or cannot be observed. On Linux,
+    /// [`Self::is_alive_but_unobservable`] distinguishes a hidden procfs entry.
     pub fn observe(&self) -> Option<Observation> {
+        self.observe_with_executable_access()
+            .map(|(observed, _)| observed)
+    }
+
+    /// Whether Linux hides the entire procfs entry while the process still
+    /// exists. This proves existence, not identity, and never authorizes a signal.
+    /// Other platforms return false without changing their observation behavior.
+    pub fn is_alive_but_unobservable(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            linux::alive_but_unobservable(self.pid, self.pidfd.as_ref())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            false
+        }
+    }
+
+    /// Observe the process and distinguish Linux executable permission denial
+    /// from other failures, without changing the legacy observation's fields.
+    /// Other platforms retain their existing readable/unavailable distinction.
+    pub fn observe_with_executable_access(&self) -> Option<(Observation, ExecutableAccess)> {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             #[cfg(target_os = "linux")]
@@ -301,14 +334,33 @@ impl Process {
                 return None;
             }
             let start_time = platform::start_time(self.pid)?;
-            Some(Observation {
-                start_time,
-                executable: platform::executable_identity(self.pid),
-            })
+            #[cfg(target_os = "linux")]
+            let (executable, access) = match linux::executable_identity(self.pid) {
+                Ok(identity) => (Some(identity), ExecutableAccess::Readable),
+                Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                    (None, ExecutableAccess::PermissionDenied)
+                }
+                Err(_) => (None, ExecutableAccess::Unavailable),
+            };
+            #[cfg(target_os = "macos")]
+            let executable = macos::executable_identity(self.pid);
+            #[cfg(target_os = "macos")]
+            let access = if executable.is_some() {
+                ExecutableAccess::Readable
+            } else {
+                ExecutableAccess::Unavailable
+            };
+            Some((
+                Observation {
+                    start_time,
+                    executable,
+                },
+                access,
+            ))
         }
         #[cfg(windows)]
         {
-            windows::observe(self)
+            windows::observe(self).map(|observed| (observed, ExecutableAccess::Unavailable))
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
         {

@@ -69,6 +69,13 @@ impl ExecutableIdentityProbe {
 
         #[cfg(target_os = "linux")]
         {
+            if subc_os::Process::open(pid)
+                .ok()
+                .flatten()
+                .is_some_and(|process| process.is_alive_but_unobservable())
+            {
+                return unavailable(RunningImageUnavailableReason::ProcessHidden);
+            }
             let Some(expected_start_time) = expected_start_time else {
                 return unavailable(RunningImageUnavailableReason::ProcessIdentityUnconfirmed);
             };
@@ -78,10 +85,27 @@ impl ExecutableIdentityProbe {
             tokio::task::spawn_blocking(move || {
                 let running = match File::open(&running_path) {
                     Ok(file) => file,
-                    Err(_) => {
+                    Err(error) => {
+                        if subc_os::Process::open(pid)
+                            .ok()
+                            .flatten()
+                            .is_some_and(|process| process.is_alive_but_unobservable())
+                        {
+                            return unavailable(RunningImageUnavailableReason::ProcessHidden);
+                        }
+                        if error.kind() == std::io::ErrorKind::PermissionDenied {
+                            if process_start_time(pid) != Some(expected_start_time) {
+                                return unavailable(
+                                    RunningImageUnavailableReason::ProcessIdentityUnconfirmed,
+                                );
+                            }
+                            return unavailable(
+                                RunningImageUnavailableReason::RunningExecutablePermissionDenied,
+                            );
+                        }
                         return unavailable(
                             RunningImageUnavailableReason::RunningExecutableUnreadable,
-                        )
+                        );
                     }
                 };
                 if process_start_time(pid) != Some(expected_start_time) {

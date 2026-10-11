@@ -1,7 +1,8 @@
 # Scopes: owned identity records in the daemon
 
-Status: current behaviour, including subc-protocol 0.30.0's `scope.apply`, absolute scope
-expiry and agent-run identity. The table, `scope.sync`, `scope.describe`, route admission,
+Status: current behaviour, including subc-protocol 0.31.0's call modes, stamped deadlines
+and delegating run scopes, and 0.30.0's `scope.apply`, absolute scope expiry and agent-run
+identity. The table, `scope.sync`, `scope.describe`, route admission,
 the bind stamp, the commit re-check and the drains were built in stage 1
 (subc-protocol 0.27.0, subc-daemon 0.25.0, master 103aa551). Section 11 records what that build
 settled where this note was silent, and section 10 records earlier design decisions and their
@@ -139,9 +140,11 @@ The evaluation points are:
   Admission does not mutate the table, and `scope_expired` is not a route-open code.
 
 `scope.describe` does not evaluate expiry: it may still report a past-deadline scope as `live`
-until a sweep. Neither the bind stamp nor describe carries `expires_at_ms`. No expiry push
-or backlog is sent to the owner; it learns through describe, `scope_expired`, or `ended`
-in a call whose own sweep ended the scope. A periodic sweep's ends do not appear in a later
+until a sweep. It returns `expires_at_ms` when set; the bind stamp carries that deadline only
+to a target declaring `call-modes/v1` (section 4a). The deadline is fixed per epoch, so the
+bind-time value stays exact. No expiry push or backlog is sent to the owner; it learns
+through describe, `scope_expired`, or `ended` in a call whose own sweep ended the scope.
+A periodic sweep's ends do not appear in a later
 call's `ended` reply.
 
 Expiry tombstones retain their cause: re-sending that ref@epoch, even without a deadline,
@@ -184,14 +187,18 @@ naming `run_id`. Only an owner in `scope_authority_owners` may set it; an unlist
 
 After the existing delegates-without-agent check, the daemon refuses a record with:
 - `run_id` but no `agent_id`: `scope_run_id_without_agent`;
-- both `run_id` and `flow_id`: `scope_run_id_with_flow_id`;
-- `run_id` and `delegates: true`: `scope_run_id_delegates`.
+- both `run_id` and `flow_id`: `scope_run_id_with_flow_id`.
 
-A run cannot start agents or delegate acting as its agent. The daemon stamps `run_id`
-verbatim in `ScopeStamp.attributes` only on binds to modules declaring `agent-run-scopes/v1`
-(section 4). Changing, adding or removing it on a live epoch is accepted, bumps `version`
-and drains every route under the scope with `scope_delegation_changed`. An unchanged resend
-does neither. A scope with only `flow_id` retains its existing flow rules and capability gate.
+A run record may set `delegates: true`; the run-authority rule is enforced at route admission
+and relay re-check instead of record validation. A delegating run binds only to a module
+declaring `call-modes/v1`. A non-delegating run may also bind to a legacy
+`agent-run-scopes/v1` target, which was written assuming a run never carries its agent's
+authority (sections 4 and 4a). `scope_run_id_delegates` remains a stable code for older peers,
+but this daemon's record validation no longer emits it. The daemon stamps `run_id` verbatim
+in `ScopeStamp.attributes` on admitted binds. Changing, adding or removing it on a live
+epoch is accepted, bumps `version` and drains every route under the scope with
+`scope_delegation_changed`. An unchanged resend does neither. A scope with only `flow_id`
+retains its existing flow rules and capability gate.
 
 ## 3. Registering: `scope.sync` and `scope.apply`
 
@@ -328,9 +335,9 @@ in section 5a):
 - `scope_not_carrier`: the opener is neither the owner nor a listed carrier, or it is a targeted
   carrier and the target module is not in its list. Terminal.
 - `target_flow_unsupported`: the scope carries `flow_id`, but the target's
-  registered manifest does not provide `flow-scopes/v1` in `capabilities.provides`.
-  Terminal. Declaring this capability promises that the module recognises the
-  field and applies flow behaviour: it never treats a flow as its owner agent
+  registered manifest provides neither `call-modes/v1` nor `flow-scopes/v1` in
+  `capabilities.provides`. Terminal. Declaring either capability promises that the module
+  recognises the field and applies flow behaviour: it never treats a flow as its owner agent
   for approvals, writes or grants. A protocol-version declaration alone does not
   make that promise. The refusal names the target and the capability; nothing
   is sent to the module and no bind is relayed. Never remove `flow_id` to
@@ -338,11 +345,15 @@ in section 5a):
   owner's ordinary session. Scopes without `flow_id` and unscoped routes keep
   their existing admission.
 - `target_agent_run_unsupported`: the scope carries `run_id`, but the target's registered
-  manifest does not provide `agent-run-scopes/v1` in `capabilities.provides`. Terminal;
-  the message names the target and capability, and no bind is relayed. The daemon checks
-  at admission and again against the connection captured for relay; a failed re-check
-  releases the reservation. Never drop `run_id` to bypass the gate. Scopes without
-  `run_id` and unscoped routes do not require this capability.
+  manifest provides neither `call-modes/v1` nor `agent-run-scopes/v1` in
+  `capabilities.provides`, or the run delegates and the target does not provide
+  `call-modes/v1`. Terminal; the message names the target and capability requirement,
+  including delegation when that is the reason, and no bind is relayed. Never drop `run_id`
+  to bypass the gate. Scopes without `run_id` and unscoped routes do not require the run gate.
+
+Both gates run at admission and again against the connection captured for relay; a failed
+re-check releases the reservation. The captured endpoint also determines which new bind
+fields can be emitted, even if the earlier lookup by module id found a different manifest.
 
 There is no relay class: a module that must present a scope onward is listed as a carrier. A carrier
 route lives until the carrier closes it or the scope ends or changes as in section 3.
@@ -354,8 +365,9 @@ carries `owner_authorized`, computed by the daemon: true when the owner is liste
 `scope_authority_owners`. Providers check that flag rather than keeping their own copy of the
 list.
 
-The stamp includes `attributes.run_id` when set, but never `expires_at_ms`. Only the run
-bind is capability-gated; `scope.describe` can return `run_id` to any registered reader.
+The stamp includes `attributes.run_id` when set, and `expires_at_ms` when set and the
+captured target declares `call-modes/v1`. Run and flow binds are capability-gated;
+`scope.describe` can return both identities and the deadline to any registered reader.
 
 **Commit.** When the module acks the bind, the daemon checks the captured `(scope_epoch,
 version)` against the current record before the route becomes routable. If the scope ended or
@@ -370,6 +382,43 @@ client's routes to it.
 A provider must not take irreversible action inside `on_bind`: the route is not live until
 commit, and commit can still refuse it.
 
+## 4a. Call modes
+
+`route.bind.call_mode` is an optional field beside `scope`, stamped by the daemon, never
+claimed by the caller. It is `codemode` for a scope carrying `attributes.run_id`, `flow` for
+one carrying `attributes.flow_id`, and `classic` for a plain scope or no scope. The shared
+`derive_call_mode` function supplies this rule to both the daemon and the Rust SDK.
+
+A target whose captured relay endpoint declares `call-modes/v1` (a *declarer*) receives
+`call_mode` on every bind, including classic binds. Declaring the capability promises to
+read the mode on every bind and handle all three known values. A provider must refuse an
+unknown mode; the wire enum preserves unknown strings as `CallMode::Unknown` rather than
+failing decoding.
+No other target receives `call_mode` or the stamp's `expires_at_ms`, because a reader that
+predates a field may reject it and stop serving. Field selection uses the captured endpoint,
+not the admission lookup by module id.
+
+During migration, a non-delegating run binds to a target declaring either `call-modes/v1`
+or `agent-run-scopes/v1`, and a flow binds to either `call-modes/v1` or `flow-scopes/v1`.
+A legacy target still receives the existing scope attributes, but neither new bind field,
+even when the scope has a deadline. A target declaring neither matching capability is
+refused. A delegating run record is accepted, but its route binds only to `call-modes/v1`:
+the run-authority rule has moved from record validation to admission and relay re-check.
+The legacy capabilities remain supported in this release and retire only after a fleet
+census in a later release.
+
+For an older daemon that admits a dual-declaring provider through its legacy capability
+and omits `call_mode`, the Rust SDK derives `RouteBindRequest.call_mode` from the bind's
+scope: codemode for a run, flow for a flow, classic otherwise. A missing field is not a
+blanket classic default. A daemon that predates call modes rejects `run_id` together with
+`delegates: true` during record validation, so it never sends a delegating run bind.
+
+Mode is separate from the caller's role, selected by core as the tool-call `preset` and
+unchanged by this release. Providers enforce each tool's permitted modes and refuse
+unsupported combinations: the daemon never reads request bodies or tool names, so it
+cannot enforce per-tool modes. The providers' design lives in
+prefrontal's docs/designs/call-modes.md.
+
 ## 5. Reading: `scope.describe` and `scope.subscribe`
 
 `scope.describe {owner, ref}` answers:
@@ -380,9 +429,12 @@ commit, and commit can still refuse it.
 - `owner_configured`: whether the owner is a module in the supervisor's roster;
 - for `live`, the same fields as the stamp.
 
-Describe does not sweep or check the deadline, and never returns `expires_at_ms`; a
-past-deadline scope may read `live` until the next sweep. `attributes.run_id` is returned
-without an `agent-run-scopes/v1` reader gate. Pre-0.30 readers whose `ScopeAttributes`
+Describe does not sweep or check the deadline; a past-deadline scope may read `live` until
+the next sweep. Its live stamp includes `expires_at_ms` when set. There is no reader
+capability gate for the deadline or `attributes.run_id`. Rust stamp readers ignore unknown
+top-level fields, and Swift's management reply path preserves extra stamp fields. The
+TypeScript client has no describe API or reply decoder. The deadline can therefore be
+returned without a new reader-first window. Pre-0.30 readers whose `ScopeAttributes`
 reject unknown fields cannot decode such a reply; run writers must wait for the rollout
 window in section 8.
 
@@ -430,8 +482,8 @@ caller may re-open within its own deadline.
 | `scope_ended` | `route.open`, admission or commit | the named epoch is not the live one, or the scope ended | no |
 | `scope_epoch_required` | `route.open` | the open named no epoch | no |
 | `scope_not_carrier` | `route.open` | the opener is not the owner or a carrier, or not targeted at this module | no |
-| `target_flow_unsupported` | `route.open`, before bind relay | a flow scope's target does not provide `flow-scopes/v1` | no |
-| `target_agent_run_unsupported` | `route.open`, admission and relay re-check | a run scope's target does not provide `agent-run-scopes/v1` | no |
+| `target_flow_unsupported` | `route.open`, admission and relay re-check | a flow scope's target provides neither `call-modes/v1` nor `flow-scopes/v1` | no |
+| `target_agent_run_unsupported` | `route.open`, admission and relay re-check | a run scope's target provides neither `call-modes/v1` nor `agent-run-scopes/v1`, or the run delegates and the target lacks `call-modes/v1` | no |
 | `scope_unsupported` | carrier, before opening | the daemon does not advertise `scopes/v1` | no |
 | `not_registered` | `scope.sync`, `scope.apply`, `scope.describe` | the connection has no module registration | no |
 | `scope_sync_not_authority` | `scope.sync`, `scope.apply` | the connection fails the owner's authority check | no |
@@ -446,7 +498,7 @@ caller may re-open within its own deadline.
 | `scope_delegates_without_agent` | per upsert in sync or apply | `delegates: true` without `agent_id` | no |
 | `scope_run_id_without_agent` | per upsert in sync or apply | `run_id` without `agent_id` | no |
 | `scope_run_id_with_flow_id` | per upsert in sync or apply | both `run_id` and `flow_id` | no |
-| `scope_run_id_delegates` | per upsert in sync or apply | `run_id` with `delegates: true` | no |
+| `scope_run_id_delegates` | older peers' record validation only | legacy refusal for `run_id` with `delegates: true`; retained as a stable code, no longer emitted by this daemon's validation | no |
 | `scope_parent_not_permitted` | per upsert in sync or apply | the parent's owner has synced, and the syncing owner is not the parent's owner or in its `child_owners`, or the parent epoch is not live | no |
 | `scope_kind_changed` | per upsert in sync or apply | `kind` differs from the held record at the same epoch | no |
 | `scope_epoch_ended` | per upsert in sync or apply | the ref@epoch has an owner-ended tombstone | no |
@@ -519,9 +571,13 @@ uses the same wall-clock source as accepted calls and admission; a timer only pr
 - Act as an agent only when `delegates` is true, `agent_id` matches, and `owner_authorized` is
   true. `agent_id` alone is identity, never
   permission to act.
-- A provider opting into `agent-run-scopes/v1` handles `run_id` as one run's identity, not
-  delegation to act as the agent. Run scopes cannot set `delegates: true`. A run's expiry
-  drains routes but cannot recall a call already forwarded, just like any other scope end.
+- A provider opting into `call-modes/v1` reads the mode on every bind, handles all three known
+  modes, refuses unknown modes and enforces its own per-tool mode restrictions (section 4a).
+  A legacy `agent-run-scopes/v1` provider receives only non-delegating runs, so `run_id` is
+  identity, not permission to act as the agent. A declarer may receive a delegating run and
+  applies the same `delegates`, `agent_id` and `owner_authorized` checks as for any scope.
+  A run's expiry drains routes but cannot recall a call already forwarded, just like any
+  other scope end; providers can use the stamped deadline to cap work to the remaining time.
 - Bind stored approvals and grants to `(owner, ref, scope_epoch)`, and decide on them as in
   section 5.
 - Treat the route's stamp as fixed for the route's life. A change that revokes authority drains
@@ -560,12 +616,13 @@ Readers first, then writers:
 3. Owners and carriers use scopes only when the capability is advertised. A carrier that cannot
    open a scoped route fails the call (`scope_unsupported`) instead of opening an unscoped one.
 
-For expiry, deltas and run identity, subc-protocol 0.30.0 and the accompanying daemon are
-current. Publish the crates and restart the daemon before owners emit `expires_at_ms`,
+Expiry, deltas and run identity shipped in subc-protocol 0.30.0 and the accompanying daemon.
+Publish the crates and restart the daemon before owners emit `expires_at_ms`,
 `scope.apply` or `run_id`; the advertised `scope.apply` op is the owner's support check.
 Existing bodies with no deadline or run id and full sync only still decode and apply unchanged.
-Run binds need no reader-first rollout because only providers declaring `agent-run-scopes/v1`
-receive them. `scope.describe` is not gated: it returns `attributes.run_id` to any caller.
+Run binds need no reader-first rollout because only providers declaring `call-modes/v1` or
+`agent-run-scopes/v1` receive them, with delegating runs restricted to `call-modes/v1`.
+`scope.describe` is not gated: it returns `attributes.run_id` to any caller.
 A reader built on subc-protocol 0.29 or older refuses unknown attribute fields, so its
 describe of a run scope fails to decode. That reader only meets a run scope if it describes
 a ref it did not receive through a bind, so before an owner writes run scopes, check that no
@@ -574,6 +631,20 @@ strip `agent-run-scopes/v1` from re-exported manifests before any provider reach
 it declares the capability, as it does `flow-scopes/v1`: a downstream provider's opt-in
 must not imply that Callosum itself handles run-scoped binds. Providers then opt in one by
 one; these module changes are separate from the daemon's scope contract.
+
+Call modes and stamped deadlines ship in subc-protocol 0.31.0 with breaking releases of
+subc-control, subc-transport, subc-client-rs and subc-daemon. Rust consumers replace
+`ScopeStamp` literals with `ScopeStamp::new` and its `with_*` setters and include the
+optional `call_mode` in raw `RouteBind` constructors and exhaustive patterns. Providers upgrade their
+readers before declaring `call-modes/v1`. The TypeScript client ignores extra bind fields
+and has no describe API or reply decoder. Swift exposes no route.bind provider decoder,
+but its management reply path preserves the describe deadline. Binds remain reader-gated;
+describe deadlines need no new rollout window. A provider declaring both the new and legacy
+capabilities remains compatible with an older daemon through the scope-derived SDK fallback.
+Deploy the new
+daemon before owners write delegating run records. Callosum must strip `call-modes/v1`
+from re-exported manifests as well, so a downstream opt-in never claims that the relay
+itself reads modes. Per-tool declarations and provider mode handling ship separately.
 
 ## 9. Tests the daemon change must carry
 
@@ -610,10 +681,19 @@ Each fails by name when its rule is removed:
 - deadlines are immutable on live epochs; the exact 24-hour horizon is accepted, beyond it
   (including `u64::MAX`) is refused, and a fresh store refuses a passed deadline;
 - `run_id` obeys the attribute-authority and token checks, requires `agent_id`, and cannot
-  coexist with `flow_id` or `delegates: true`; changes drain with `scope_delegation_changed`;
-- a run bind requires `agent-run-scopes/v1` both at admission and relay re-check, carries
-  `run_id` on success, and relays nothing on `target_agent_run_unsupported`; no-run scopes
-  are unaffected;
+  coexist with `flow_id`; delegating run records are accepted, and changes drain with
+  `scope_delegation_changed`;
+- both admission and relay re-check allow non-delegating runs with `call-modes/v1` or
+  `agent-run-scopes/v1`, require `call-modes/v1` for delegating runs, and allow flows with
+  `call-modes/v1` or `flow-scopes/v1`; unsupported targets receive no bind and a failed
+  re-check releases the reservation;
+- declarers receive codemode for runs, flow for flows and classic for plain or unscoped
+  binds; legacy targets retain scope attributes but receive neither `call_mode` nor
+  `expires_at_ms`, even with a deadline; the captured relay endpoint, not an earlier
+  admission lookup, chooses the fields;
+- a declarer's stamp and a live describe reply carry a set deadline; unknown modes decode
+  to `Unknown`, and the SDK derives an absent mode from the scope, including on an
+  older-daemon bind to a dual-declaring provider;
 - the client sends no apply to an unsupported daemon; apply wire goldens round-trip and
   existing sync bodies without expiry or run identity remain compatible;
 - the same ref under two owners is two scopes;

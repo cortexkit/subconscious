@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.13
+
+- Update the internal adapter to `subc-protocol` 0.31 and `subc-client-rs` 0.28. MCP stdio clients need no request changes; this dependency update does not declare `call-modes/v1` or implement provider mode handling.
+
 ## 0.1.12
 
 - Moves to `subc-protocol` 0.30 and `subc-client-rs` 0.27. No behaviour change.

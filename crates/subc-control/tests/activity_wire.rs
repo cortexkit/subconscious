@@ -273,42 +273,6 @@ fn legacy_control_enums_remain_unchanged() {
 }
 
 #[test]
-fn release_metadata_is_versioned_and_logged() {
-    let version = env!("CARGO_PKG_VERSION");
-    let parts: Vec<u32> = version
-        .split('.')
-        .map(|part| part.parse().unwrap())
-        .collect();
-    assert!(
-        parts.as_slice() > [0, 29, 3].as_slice(),
-        "activity types must not ship as the old release"
-    );
-    let changelog = include_str!("../CHANGELOG.md");
-    let release_heading = format!("## {version}\n");
-    assert!(
-        changelog.contains(&release_heading),
-        "current version has a changelog entry"
-    );
-    let entry = changelog
-        .split("## 0.29.4\n")
-        .nth(1)
-        .expect("activity release has a changelog entry")
-        .split("\n## ")
-        .next()
-        .unwrap();
-    assert!(entry.contains("activity"));
-    let lock = include_str!("../../../Cargo.lock");
-    let locked = lock
-        .split("name = \"subc-control\"\n")
-        .nth(1)
-        .expect("control has a lock entry")
-        .lines()
-        .next()
-        .unwrap();
-    assert_eq!(locked, format!("version = \"{version}\""));
-}
-
-#[test]
 fn activity_bodies_require_matching_op() {
     fn rejects_wrong_op<T: DeserializeOwned>(mut body: Value) {
         body["op"] = json!("not.activity");

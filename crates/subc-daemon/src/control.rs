@@ -46,7 +46,7 @@ use crate::{
         CapabilityVerdict, DuplicateClaimSource, RegisteredModule, RequirementStatus,
         RuntimeModule,
     },
-    daemon_config::RestartRequiredSection,
+    daemon_config::{PrivilegedOperatorPrompt, RestartRequiredSection},
     forwarding::{
         CloseReason, EndpointRoute, ForwardingError, ForwardingTable, GoodbyeTarget,
         ModuleControlRpcCompletion, ModuleControlRpcOutcome, ModuleEndpointId,
@@ -264,6 +264,7 @@ struct SupervisorRescanContext {
     admission_facts_carrier_module_id: Option<String>,
     admission_facts_targets: Option<Vec<String>>,
     scope_authority_owners: Vec<String>,
+    privileged_operator_prompt: PrivilegedOperatorPrompt,
 }
 
 /// Refusal labels passed to `observe_route_open_refusal` that mean the target
@@ -347,6 +348,8 @@ pub struct ControlHandler {
     /// The configured `scope_authority_owners`, kept so a rescan can report a
     /// changed value as needing a daemon restart; rescan never applies it.
     scope_authority_owners: Vec<String>,
+    /// Fixed at startup so rescan cannot change the policy that guards rescan itself.
+    privileged_operator_prompt: PrivilegedOperatorPrompt,
     /// The launch nonce each module connection presented at HELLO, which is how
     /// a `scope.sync` is matched to the owner's current launch.
     hello_launch_nonces: Arc<Mutex<HelloLaunchNonces>>,
@@ -843,6 +846,7 @@ impl ControlHandler {
             ))),
             scope_deadline_added: Arc::new(tokio::sync::Notify::new()),
             scope_authority_owners: crate::daemon_config::default_scope_authority_owners(),
+            privileged_operator_prompt: PrivilegedOperatorPrompt::default(),
             hello_launch_nonces: Arc::new(Mutex::new(HelloLaunchNonces::default())),
             rescan: None,
             connected_clients: ConnectedClients::new(),
@@ -904,6 +908,12 @@ impl ControlHandler {
     pub fn with_scope_authority_owners(mut self, owners: Vec<String>) -> Self {
         self.scopes = Arc::new(RwLock::new(ScopeTable::new(owners.iter().cloned())));
         self.scope_authority_owners = owners;
+        self
+    }
+
+    /// Set the startup policy before installing the rescan context or serving requests.
+    pub fn with_privileged_operator_prompt(mut self, mode: PrivilegedOperatorPrompt) -> Self {
+        self.privileged_operator_prompt = mode;
         self
     }
 
@@ -1062,6 +1072,7 @@ impl ControlHandler {
             admission_facts_carrier_module_id: self.admission_facts_carrier_module_id.clone(),
             admission_facts_targets: self.admission_facts_targets.clone(),
             scope_authority_owners: self.scope_authority_owners.clone(),
+            privileged_operator_prompt: self.privileged_operator_prompt,
         });
         self
     }
@@ -4956,6 +4967,7 @@ impl ControlHandler {
             admission_facts_carrier_module_id,
             admission_facts_targets,
             scope_authority_owners,
+            privileged_operator_prompt,
             modules,
             reserved_capabilities,
         ) = (
@@ -4964,6 +4976,7 @@ impl ControlHandler {
             config.admission_facts_carrier_module_id,
             config.admission_facts_targets,
             config.scope_authority_owners,
+            config.privileged_operator_prompt,
             config.modules,
             config.reserved_capabilities,
         );
@@ -4989,6 +5002,9 @@ impl ControlHandler {
                 }
                 RestartRequiredSection::ScopeAuthorityOwners => {
                     scope_authority_owners != context.scope_authority_owners
+                }
+                RestartRequiredSection::PrivilegedOperatorPrompt => {
+                    privileged_operator_prompt != context.privileged_operator_prompt
                 }
             };
             if changed {
@@ -10707,6 +10723,119 @@ mod tests {
         assert!(capture.events().into_iter().all(|event| {
             event.fields.get("message").map(String::as_str) != Some("supervisor request received")
         }));
+    }
+
+    #[tokio::test]
+    async fn privileged_operator_prompt_rescan_reports_changes_without_changing_running_mode() {
+        assert_eq!(
+            ControlHandler::default().privileged_operator_prompt,
+            PrivilegedOperatorPrompt::Log
+        );
+        for (initial, changed, running) in [
+            ("log", "enforce", PrivilegedOperatorPrompt::Log),
+            ("enforce", "log", PrivilegedOperatorPrompt::Enforce),
+        ] {
+            let dir = ScratchDir::new("rescan-privileged-operator-prompt");
+            let path = dir.join("subc.jsonc");
+            std::fs::write(
+                &path,
+                json!({"version":1,"privileged_operator_prompt":initial}).to_string(),
+            )
+            .unwrap();
+            let config = crate::daemon_config::load(&path).unwrap().unwrap();
+            let registry = Arc::new(Registry::default());
+            let handle = SupervisorHandle::new();
+            let supervisor = Supervisor::new(registry.clone(), RestartPolicy::default())
+                .with_handle(handle.clone());
+            let handler = ControlHandler::new(registry)
+                .with_supervisor(handle)
+                .with_privileged_operator_prompt(config.privileged_operator_prompt)
+                .with_supervisor_rescan(supervisor, &path, config.port);
+            let (ctx, _rx) = route_ctx(ConnectionId::new(104));
+
+            for (disk_mode, needs_restart) in [
+                (Some(initial), false),
+                (Some(changed), true),
+                (Some(changed), true),
+                (None, running == PrivilegedOperatorPrompt::Enforce),
+                (Some(initial), false),
+            ] {
+                let mut doc = json!({"version":1});
+                if let Some(mode) = disk_mode {
+                    doc["privileged_operator_prompt"] = json!(mode);
+                }
+                std::fs::write(&path, doc.to_string()).unwrap();
+                for preview in [true, false] {
+                    let request = ClientControlRequest::SupervisorRescan { preview };
+                    let frame = Frame::build(
+                        FrameType::Request,
+                        control_flags(),
+                        0,
+                        0,
+                        1,
+                        serde_json::to_vec(&request).unwrap(),
+                    )
+                    .unwrap();
+                    let frames = handler.handle_control_frame(&ctx, frame).await.unwrap();
+                    assert_eq!(frames.len(), 1);
+                    let ClientControlResponse::SupervisorRescan { result } =
+                        serde_json::from_slice(&frames[0].body).unwrap()
+                    else {
+                        panic!("expected a rescan response");
+                    };
+                    let expected = if needs_restart {
+                        vec!["privileged_operator_prompt"]
+                    } else {
+                        Vec::new()
+                    };
+                    assert_eq!(result.restart_required, expected);
+                    assert_eq!(handler.privileged_operator_prompt, running);
+                    assert_eq!(
+                        handler.rescan.as_ref().unwrap().privileged_operator_prompt,
+                        running
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn privileged_operator_prompt_rescan_refuses_invalid_values() {
+        let dir = ScratchDir::new("rescan-invalid-privileged-operator-prompt");
+        let path = dir.join("subc.jsonc");
+        let registry = Arc::new(Registry::default());
+        let handle = SupervisorHandle::new();
+        let supervisor =
+            Supervisor::new(registry.clone(), RestartPolicy::default()).with_handle(handle.clone());
+        let handler = ControlHandler::new(registry)
+            .with_supervisor(handle)
+            .with_privileged_operator_prompt(PrivilegedOperatorPrompt::Enforce)
+            .with_supervisor_rescan(supervisor, &path, None);
+        let (ctx, _rx) = route_ctx(ConnectionId::new(105));
+        for preview in [true, false] {
+            std::fs::write(
+                &path,
+                r#"{"version":1,"privileged_operator_prompt":"unknown"}"#,
+            )
+            .unwrap();
+            let request = ClientControlRequest::SupervisorRescan { preview };
+            let frame = Frame::build(
+                FrameType::Request,
+                control_flags(),
+                0,
+                0,
+                1,
+                serde_json::to_vec(&request).unwrap(),
+            )
+            .unwrap();
+            let frames = handler.handle_control_frame(&ctx, frame).await.unwrap();
+            assert_eq!(frames.len(), 1);
+            assert_eq!(parse_error(&frames[0])["code"], "invalid_daemon_config");
+            assert_eq!(
+                handler.privileged_operator_prompt,
+                PrivilegedOperatorPrompt::Enforce
+            );
+        }
     }
 
     /// One wire code has several senders, so the refusal line names the check

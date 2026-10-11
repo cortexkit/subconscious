@@ -51,15 +51,17 @@ pub enum RestartRequiredSection {
     AdmissionFactsCarrierModuleId,
     AdmissionFactsTargets,
     ScopeAuthorityOwners,
+    PrivilegedOperatorPrompt,
 }
 
 impl RestartRequiredSection {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Port,
         Self::Storage,
         Self::AdmissionFactsCarrierModuleId,
         Self::AdmissionFactsTargets,
         Self::ScopeAuthorityOwners,
+        Self::PrivilegedOperatorPrompt,
     ];
 
     pub const fn label(self) -> &'static str {
@@ -69,8 +71,18 @@ impl RestartRequiredSection {
             Self::AdmissionFactsCarrierModuleId => "admission_facts_carrier_module_id",
             Self::AdmissionFactsTargets => "admission_facts_targets",
             Self::ScopeAuthorityOwners => "scope_authority_owners",
+            Self::PrivilegedOperatorPrompt => "privileged_operator_prompt",
         }
     }
+}
+
+/// Whether privileged client operations are only logged or require operator approval.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum PrivilegedOperatorPrompt {
+    #[default]
+    Log,
+    Enforce,
 }
 
 /// `scope_authority_owners` when the config does not set it: the session
@@ -151,6 +163,8 @@ impl LoggingConfig {
 pub struct DaemonConfig {
     pub path: PathBuf,
     pub port: Option<u16>,
+    /// Restart-required: rescan must not change the policy that guards rescan itself.
+    pub privileged_operator_prompt: PrivilegedOperatorPrompt,
     /// Daemon-wide default drain budget (ms) for module teardown: how long a
     /// drain waits for already-dispatched requests to finalize. `None` uses
     /// the built-in default (30s). Per-module `drain_timeout_ms` overrides.
@@ -372,6 +386,8 @@ struct RawDaemonConfig {
     version: u32,
     #[serde(default)]
     port: Option<u16>,
+    #[serde(default)]
+    privileged_operator_prompt: PrivilegedOperatorPrompt,
     #[serde(default)]
     drain_timeout_ms: Option<u64>,
     #[serde(default)]
@@ -911,6 +927,7 @@ fn parse_doc(doc: &str, path: &Path) -> Result<DaemonConfig, DaemonConfigError> 
     Ok(DaemonConfig {
         path: path.to_path_buf(),
         port: raw.port,
+        privileged_operator_prompt: raw.privileged_operator_prompt,
         drain_timeout_ms: default_drain_timeout_ms,
         route_bind_relay_timeout_ms: default_route_bind_relay_timeout_ms,
         modules,
@@ -1741,8 +1758,43 @@ mod tests {
                 "admission_facts_carrier_module_id",
                 "admission_facts_targets",
                 "scope_authority_owners",
+                "privileged_operator_prompt",
             ]
         );
+    }
+
+    #[test]
+    fn privileged_operator_prompt_defaults_to_log_and_accepts_both_modes() {
+        let path = Path::new("/tmp/subc.jsonc");
+        let config = parse_doc(r#"{"version":1}"#, path).unwrap();
+        assert_eq!(
+            config.privileged_operator_prompt,
+            PrivilegedOperatorPrompt::Log
+        );
+        for (value, expected) in [
+            ("log", PrivilegedOperatorPrompt::Log),
+            ("enforce", PrivilegedOperatorPrompt::Enforce),
+        ] {
+            let config = parse_doc(
+                &format!(r#"{{"version":1,"privileged_operator_prompt":"{value}"}}"#),
+                path,
+            )
+            .unwrap();
+            assert_eq!(config.privileged_operator_prompt, expected);
+        }
+    }
+
+    #[test]
+    fn privileged_operator_prompt_refuses_unknown_values_and_wrong_types() {
+        let path = Path::new("/tmp/subc.jsonc");
+        for value in [r#""unknown""#, r#""Enforce""#, "null", "true", "1", "{}"] {
+            let error = parse_doc(
+                &format!(r#"{{"version":1,"privileged_operator_prompt":{value}}}"#),
+                path,
+            )
+            .unwrap_err();
+            assert!(matches!(error, DaemonConfigError::InvalidJson { .. }));
+        }
     }
 
     #[test]

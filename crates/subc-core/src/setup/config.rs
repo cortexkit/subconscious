@@ -1093,6 +1093,21 @@ mod tests {
     }
 
     #[test]
+    fn pending_privileged_operator_prompt_requires_restart_only_on_a_live_host() {
+        let keys = [
+            "privileged_operator_prompt",
+            "modules.example.enabled",
+            "privileged_operator_prompt",
+        ];
+        assert_eq!(
+            restart_required_from_pending_keys(true, keys),
+            ["privileged_operator_prompt"]
+        );
+        assert!(restart_required_from_pending_keys(false, keys).is_empty());
+        assert!(restart_required_from_pending_keys(true, ["modules.example.enabled"]).is_empty());
+    }
+
+    #[test]
     fn live_host_missing_storage_is_a_restart_required_section() {
         let root = fixture_path("pending-storage-restart");
         let config = root.join("subc.jsonc");

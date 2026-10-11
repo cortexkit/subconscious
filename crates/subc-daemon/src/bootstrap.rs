@@ -112,6 +112,7 @@ pub struct BootstrapConfig {
     admission_facts: AdmissionFactsConfig,
     /// Module ids whose scopes may carry the attributes that grant authority.
     scope_authority_owners: Vec<String>,
+    privileged_operator_prompt: daemon_config::PrivilegedOperatorPrompt,
     daemon_config_path: Option<PathBuf>,
     configured_port: Option<u16>,
     /// Daemon-wide route.bind relay budget in milliseconds (the fallback for
@@ -170,6 +171,7 @@ impl BootstrapConfig {
             storage_config: None,
             admission_facts: AdmissionFactsConfig::default(),
             scope_authority_owners: daemon_config::default_scope_authority_owners(),
+            privileged_operator_prompt: daemon_config::PrivilegedOperatorPrompt::default(),
             daemon_config_path: None,
             configured_port: None,
             route_bind_relay_default_ms: None,
@@ -302,6 +304,10 @@ impl BootstrapConfig {
             .as_ref()
             .map(|config| config.scope_authority_owners.clone())
             .unwrap_or_else(daemon_config::default_scope_authority_owners);
+        let privileged_operator_prompt = daemon_config
+            .as_ref()
+            .map(|config| config.privileged_operator_prompt)
+            .unwrap_or_default();
         let route_bind_relay_default_ms = daemon_config
             .as_ref()
             .and_then(|config| config.route_bind_relay_timeout_ms);
@@ -338,6 +344,7 @@ impl BootstrapConfig {
             .with_storage_config(storage_config)
             .with_admission_facts_config(admission_facts_carrier_module_id, admission_facts_targets)
             .with_scope_authority_owners(scope_authority_owners)
+            .with_privileged_operator_prompt(privileged_operator_prompt)
             .with_route_bind_relay_default_ms(route_bind_relay_default_ms)
             .with_reserved_capabilities(reserved_capabilities)
             .with_daemon_config_source(daemon_config_path, config_port)
@@ -365,6 +372,10 @@ impl BootstrapConfig {
             .as_ref()
             .map(|config| config.scope_authority_owners.clone())
             .unwrap_or_else(daemon_config::default_scope_authority_owners);
+        let privileged_operator_prompt = daemon_config
+            .as_ref()
+            .map(|config| config.privileged_operator_prompt)
+            .unwrap_or_default();
         let route_bind_relay_default_ms = daemon_config
             .as_ref()
             .and_then(|config| config.route_bind_relay_timeout_ms);
@@ -380,6 +391,7 @@ impl BootstrapConfig {
             .with_storage_config(storage_config)
             .with_admission_facts_config(admission_facts_carrier_module_id, admission_facts_targets)
             .with_scope_authority_owners(scope_authority_owners)
+            .with_privileged_operator_prompt(privileged_operator_prompt)
             .with_route_bind_relay_default_ms(route_bind_relay_default_ms)
             .with_reserved_capabilities(reserved_capabilities)
             .with_daemon_config_source(daemon_config_path, configured_port))
@@ -419,6 +431,15 @@ impl BootstrapConfig {
     /// Absent from a config, this is `daemon_config::default_scope_authority_owners`.
     pub fn with_scope_authority_owners(mut self, owners: Vec<String>) -> Self {
         self.scope_authority_owners = owners;
+        self
+    }
+
+    /// Choose the privileged-operation policy for the daemon's entire lifetime.
+    pub fn with_privileged_operator_prompt(
+        mut self,
+        mode: daemon_config::PrivilegedOperatorPrompt,
+    ) -> Self {
+        self.privileged_operator_prompt = mode;
         self
     }
 
@@ -565,6 +586,7 @@ pub async fn run_with_config(config: BootstrapConfig) -> Result<(), BootstrapErr
     let storage_config = config.storage_config.clone();
     let admission_facts = config.admission_facts.clone();
     let scope_authority_owners = config.scope_authority_owners.clone();
+    let privileged_operator_prompt = config.privileged_operator_prompt;
     let daemon_config_path = config.daemon_config_path.clone();
     let configured_port = config.configured_port;
     let route_bind_relay_default_ms = config.route_bind_relay_default_ms;
@@ -592,6 +614,7 @@ pub async fn run_with_config(config: BootstrapConfig) -> Result<(), BootstrapErr
                 storage_config,
                 admission_facts,
                 scope_authority_owners,
+                privileged_operator_prompt,
                 daemon_config_path,
                 configured_port,
                 route_bind_relay_default_ms,
@@ -741,6 +764,7 @@ async fn serve_bound_daemon(
     storage_config: Option<daemon_config::StorageConfig>,
     admission_facts: AdmissionFactsConfig,
     scope_authority_owners: Vec<String>,
+    privileged_operator_prompt: daemon_config::PrivilegedOperatorPrompt,
     daemon_config_path: Option<PathBuf>,
     configured_port: Option<u16>,
     route_bind_relay_default_ms: Option<u64>,
@@ -887,6 +911,7 @@ async fn serve_bound_daemon(
         .with_machine_id(bound.machine_id.clone())
         .with_admission_facts_config(admission_facts.carrier_module_id, admission_facts.targets)
         .with_scope_authority_owners(scope_authority_owners)
+        .with_privileged_operator_prompt(privileged_operator_prompt)
         .with_route_bind_relay_timeouts(route_bind_relay_timeouts)
         .with_daemon_provenance(
             bound.connection_info.pid,
@@ -1966,6 +1991,116 @@ mod tests {
             "expected a run-directory refusal, got {error}"
         );
         assert!(error.to_string().contains("XDG_DATA_HOME"), "{error}");
+    }
+
+    #[test]
+    fn privileged_operator_prompt_is_loaded_by_both_bootstrap_config_paths() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        let _port = EnvGuard::unset(SUBC_PORT_ENV);
+        let (_dir, conn_path) = temp_connection_file_path("privileged-operator-prompt");
+        let config_path = conn_path.with_file_name("subc.jsonc");
+        for (doc, expected) in [
+            (None, daemon_config::PrivilegedOperatorPrompt::Log),
+            (
+                Some(r#"{"version":1}"#),
+                daemon_config::PrivilegedOperatorPrompt::Log,
+            ),
+            (
+                Some(r#"{"version":1,"privileged_operator_prompt":"log"}"#),
+                daemon_config::PrivilegedOperatorPrompt::Log,
+            ),
+            (
+                Some(r#"{"version":1,"privileged_operator_prompt":"enforce"}"#),
+                daemon_config::PrivilegedOperatorPrompt::Enforce,
+            ),
+        ] {
+            if let Some(doc) = doc {
+                fs::write(&config_path, doc).unwrap();
+            }
+            assert_eq!(
+                BootstrapConfig::from_env_with_daemon_config_path(&config_path)
+                    .unwrap()
+                    .privileged_operator_prompt,
+                expected
+            );
+            assert_eq!(
+                BootstrapConfig::new(&conn_path, 0)
+                    .with_daemon_config_path(&config_path)
+                    .unwrap()
+                    .privileged_operator_prompt,
+                expected
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn privileged_operator_prompt_is_snapshotted_by_running_daemon() {
+        let dir = unique_temp_dir("privileged-operator-prompt-bootstrap");
+        let connection_path = dir.join("connection.json");
+        let config_path = dir.join("subc.jsonc");
+        fs::write(
+            &config_path,
+            r#"{"version":1,"privileged_operator_prompt":"enforce"}"#,
+        )
+        .unwrap();
+        let config = BootstrapConfig::new(&connection_path, 0)
+            .with_daemon_config_path(&config_path)
+            .unwrap();
+        let daemon = AbortOnDrop::new(tokio::spawn(run_with_config(config)));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !connection_path.exists() {
+                assert!(
+                    !daemon.handle.is_finished(),
+                    "daemon exited before publishing"
+                );
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let info = connection_file::read(&connection_path).unwrap();
+        let mut client = connect_from_info(&info).await.unwrap();
+        authenticate_client(&mut client, &info, Duration::from_secs(5))
+            .await
+            .unwrap();
+        for (correlation, mode, expected) in [
+            (1, "enforce", Vec::new()),
+            (2, "log", vec!["privileged_operator_prompt"]),
+            (3, "log", vec!["privileged_operator_prompt"]),
+        ] {
+            fs::write(
+                &config_path,
+                serde_json::json!({"version":1,"privileged_operator_prompt":mode}).to_string(),
+            )
+            .unwrap();
+            let frame = crate::Frame::build(
+                subc_protocol::FrameType::Request,
+                subc_protocol::Flags::new(false, subc_protocol::Priority::Interactive, false),
+                0,
+                0,
+                correlation,
+                serde_json::to_vec(&subc_control::ClientControlRequest::SupervisorRescan {
+                    preview: true,
+                })
+                .unwrap(),
+            )
+            .unwrap();
+            crate::write_frame(&mut client, &frame).await.unwrap();
+            let reply =
+                tokio::time::timeout(Duration::from_secs(5), crate::read_frame(&mut client))
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(reply.header.ty, subc_protocol::FrameType::Response);
+            assert_eq!(reply.header.corr, correlation);
+            let subc_control::ClientControlResponse::SupervisorRescan { result } =
+                serde_json::from_slice(&reply.body).unwrap()
+            else {
+                panic!("expected a rescan response");
+            };
+            assert_eq!(result.restart_required, expected);
+        }
     }
 
     #[test]

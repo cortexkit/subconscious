@@ -46,14 +46,7 @@ async fn append(handler: &ControlHandler, at_ms: u64) {
 #[tokio::test]
 async fn activity_reads_admit_direct_and_only_verified_trusted_principals() {
     let scratch = ScratchDir::new("activity-read-identity");
-    let (handler, ctx, mut rx) = setup(&scratch);
-    hello_via_sink(
-        &handler,
-        &ctx,
-        &mut rx,
-        hello_frame("worker", PROTOCOL_VERSION, 1),
-    )
-    .await;
+    let (handler, ctx, _rx) = setup(&scratch);
     for op in ["activity.query", "activity.subscribe"] {
         for (index, identity) in [
             None,
@@ -95,6 +88,130 @@ async fn activity_reads_admit_direct_and_only_verified_trusted_principals() {
         }
     }
     handler.cleanup_connection(ctx.connection_id).unwrap();
+}
+
+#[tokio::test]
+async fn activity_registered_non_mirror_reads_refuse_with_or_without_consumer_identity() {
+    let scratch = ScratchDir::new("activity-module-read-forbidden");
+    let (handler, ctx, mut rx) = setup(&scratch);
+    hello_via_sink(
+        &handler,
+        &ctx,
+        &mut rx,
+        hello_frame("worker", PROTOCOL_VERSION, 1),
+    )
+    .await;
+    assert_eq!(
+        handler
+            .forwarding
+            .module_id_for_connection(ctx.connection_id)
+            .unwrap()
+            .as_deref(),
+        Some("worker")
+    );
+    for op in ["activity.query", "activity.subscribe"] {
+        for identity in [
+            None,
+            Some(("worker", "nonce-worker")),
+            Some(("callosum", "nonce-callosum")),
+            Some(("ckbus", "nonce-ckbus")),
+        ] {
+            let replies = handler
+                .handle_control_frame(&ctx, read_frame(op, 20, identity))
+                .await
+                .unwrap();
+            assert_eq!(replies.len(), 1, "{op}: {identity:?}");
+            assert_eq!(replies[0].header.ty, FrameType::Error, "{op}: {identity:?}");
+            assert_eq!(
+                parse_error(&replies[0])["code"],
+                ACTIVITY_READ_FORBIDDEN,
+                "{op}: {identity:?}"
+            );
+        }
+    }
+    handler.cleanup_connection(ctx.connection_id).unwrap();
+}
+
+#[tokio::test]
+async fn activity_registered_ckbus_reads_admit_and_ignore_consumer_identity() {
+    let scratch = ScratchDir::new("activity-module-mirror-read");
+    let (handler, ctx, mut rx) = setup(&scratch);
+    hello_via_sink(
+        &handler,
+        &ctx,
+        &mut rx,
+        hello_frame_with_nonce("ckbus", PROTOCOL_VERSION, 1, Some("nonce-ckbus")),
+    )
+    .await;
+    assert_eq!(
+        handler
+            .forwarding
+            .module_id_for_connection(ctx.connection_id)
+            .unwrap()
+            .as_deref(),
+        Some("ckbus")
+    );
+    for op in ["activity.query", "activity.subscribe"] {
+        for (index, identity) in [
+            None,
+            Some(("worker", "nonce-worker")),
+            Some(("unlaunched", "wrong")),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let replies = handler
+                .handle_control_frame(&ctx, read_frame(op, 30 + index as u64, identity))
+                .await
+                .unwrap();
+            if op == "activity.query" {
+                assert_eq!(replies.len(), 1);
+                assert_eq!(replies[0].header.ty, FrameType::Response, "{identity:?}");
+                let page: ActivityQueryResponse = serde_json::from_slice(&replies[0].body).unwrap();
+                assert_eq!(page.head.daemon_incarnation, "reads");
+            } else {
+                assert!(replies.is_empty(), "{identity:?}");
+            }
+        }
+    }
+    handler.cleanup_connection(ctx.connection_id).unwrap();
+}
+
+#[tokio::test]
+async fn activity_reads_admit_unidentified_separate_consumer_as_direct() {
+    let scratch = ScratchDir::new("activity-separate-consumer-read");
+    let (handler, module_ctx, mut module_rx) = setup(&scratch);
+    hello_via_sink(
+        &handler,
+        &module_ctx,
+        &mut module_rx,
+        hello_frame("worker", PROTOCOL_VERSION, 1),
+    )
+    .await;
+    let (consumer_ctx, _consumer_rx) = route_ctx(ConnectionId::new(2));
+    assert!(handler
+        .forwarding
+        .module_id_for_connection(consumer_ctx.connection_id)
+        .unwrap()
+        .is_none());
+    for op in ["activity.query", "activity.subscribe"] {
+        let replies = handler
+            .handle_control_frame(&consumer_ctx, read_frame(op, 40, None))
+            .await
+            .unwrap();
+        if op == "activity.query" {
+            assert_eq!(replies.len(), 1);
+            assert_eq!(replies[0].header.ty, FrameType::Response);
+        } else {
+            assert!(replies.is_empty());
+        }
+    }
+    handler
+        .cleanup_connection(consumer_ctx.connection_id)
+        .unwrap();
+    handler
+        .cleanup_connection(module_ctx.connection_id)
+        .unwrap();
 }
 
 #[tokio::test]

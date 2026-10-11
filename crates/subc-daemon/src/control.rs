@@ -3136,17 +3136,29 @@ impl ControlHandler {
             #[serde(default)]
             consumer_identity: Option<ConsumerIdentity>,
         }
-        let identity: Identity = match serde_json::from_slice(&frame.body) {
-            Ok(identity) => identity,
-            Err(_) => {
-                return Ok(vec![control_error_frame(
-                    &frame,
-                    ACTIVITY_MALFORMED,
-                    "malformed activity read",
-                )?])
+        // A registered module connection already identifies its caller. Ignore
+        // consumer_identity there so a module cannot borrow a mirror's identity.
+        // Only separate consumer connections use the Direct/nonce trust boundary.
+        let principal = match self
+            .forwarding
+            .module_id_for_connection(ctx.connection_id)
+            .map_err(RouterError::Forwarding)?
+        {
+            Some(module_id) => Ok(Principal::Reserved { module_id }),
+            None => {
+                let identity: Identity = match serde_json::from_slice(&frame.body) {
+                    Ok(identity) => identity,
+                    Err(_) => {
+                        return Ok(vec![control_error_frame(
+                            &frame,
+                            ACTIVITY_MALFORMED,
+                            "malformed activity read",
+                        )?])
+                    }
+                };
+                self.route_open_principal(&frame, identity.consumer_identity)?
             }
         };
-        let principal = self.route_open_principal(&frame, identity.consumer_identity)?;
         let admitted = matches!(principal, Ok(Principal::Direct))
             || matches!(&principal, Ok(Principal::Reserved { module_id }) if module_id == "callosum" || module_id == "ckbus");
         if !admitted {

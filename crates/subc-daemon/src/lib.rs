@@ -6,6 +6,7 @@
 
 #![forbid(unsafe_code)]
 
+mod activity;
 pub mod bootstrap;
 pub(crate) mod capability_requirements;
 mod child_resources;

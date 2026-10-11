@@ -844,8 +844,15 @@ async fn serve_bound_daemon(
     // The supervisor already treats `None` as no-capture and no-journal, so
     // this only removes invented defaults. The binary keeps capturing and
     // journaling via `BootstrapConfig::from_env_for_daemon_binary`.
+
+    // Keep both ledgers in the explicitly selected run directory. An embedded
+    // daemon without a journal path must not write to the operator's live ledger.
+    let activity_run_dir = terminal_journal_path
+        .as_ref()
+        .and_then(|path| path.parent())
+        .map(Path::to_path_buf);
     let supervisor = match terminal_journal_path {
-        Some(path) => supervisor.with_terminal_journal(path, daemon_incarnation),
+        Some(path) => supervisor.with_terminal_journal(path, daemon_incarnation.clone()),
         None => supervisor,
     };
     let supervisor = match capture_logs_dir {
@@ -895,6 +902,9 @@ async fn serve_bound_daemon(
                 .map(|module| (module.module_id.clone(), module.enabled)),
             reserved_capabilities,
         );
+    if let Some(run_dir) = activity_run_dir {
+        control = control.with_activity_ledger(&run_dir, daemon_incarnation);
+    }
     if let Some(ms) = route_bind_relay_default_ms {
         // A daemon-wide config value overrides the built-in default; a
         // `None` here leaves the ControlHandler's 12s default in place.
@@ -1576,6 +1586,9 @@ impl Error for BootstrapError {
 
 #[cfg(test)]
 mod tests {
+    mod activity {
+        include!("activity_bootstrap_tests.rs");
+    }
     use super::*;
     use crate::server::ServerAuth;
     use cortexkit_test_support::ScratchDir;

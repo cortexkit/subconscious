@@ -84,6 +84,7 @@ const CAP_SESSION_ATTACH: &str = "session_attach_v1";
 const CAP_ADMISSION_FACTS_RELAY: &str = "admission_facts_relay_v1";
 
 const SUBC_CONTROL_OPS: &[&str] = &[
+    ops::ACTIVITY_RECORD,
     ops::SERVER_DESCRIBE,
     ops::CATALOG_LIST,
     ops::ROUTE_OPEN,
@@ -297,6 +298,7 @@ const ROUTE_OPEN_NOT_SERVING_REASONS: &[&str] = &[
 #[derive(Clone)]
 pub struct ControlHandler {
     registry: Arc<Registry>,
+    activity: Option<crate::activity::ActivityLedger>,
     forwarding: Arc<ForwardingTable>,
     process_liveness: Option<Arc<dyn ModuleProcessLiveness>>,
     supervisor: SupervisorHandle,
@@ -809,6 +811,7 @@ impl ControlHandler {
         let route_outages = forwarding.route_outages();
         Self {
             registry,
+            activity: None,
             forwarding,
             process_liveness: None,
             supervisor: SupervisorHandle::new(),
@@ -821,6 +824,7 @@ impl ControlHandler {
                 CAP_SCOPES_V1.to_string(),
                 CAP_ROUTE_ROLE_VERSIONS_V1.to_string(),
                 subc_protocol::manifest::CAP_CATALOG_EVENTS_V1.to_string(),
+                subc_control::ACTIVITY_LEDGER_CAPABILITY.to_string(),
             ]),
             route_bind_relay_timeout: DEFAULT_ROUTE_BIND_RELAY_TIMEOUT,
             route_bind_relay_timeouts: BTreeMap::new(),
@@ -861,6 +865,16 @@ impl ControlHandler {
         storage_config: Option<crate::daemon_config::StorageConfig>,
     ) -> Self {
         self.storage_config = storage_config;
+        self
+    }
+
+    /// Open the ledger on its own writer thread; an unavailable sink does not
+    /// prevent the daemon from serving routing or supervisor requests.
+    pub fn with_activity_ledger(mut self, run_dir: &Path, incarnation: String) -> Self {
+        self.activity = Some(crate::activity::ActivityLedger::open(
+            run_dir.join("activity.jsonl"),
+            incarnation,
+        ));
         self
     }
 
@@ -1568,6 +1582,12 @@ impl ControlHandler {
                 // This additive operation is not part of the existing exhaustive
                 // module-control enum. Probe the op before decoding that enum.
                 let op = serde_json::from_slice::<ControlOpProbe>(&frame.body).ok();
+                if op
+                    .as_ref()
+                    .is_some_and(|probe| probe.op == ops::ACTIVITY_RECORD)
+                {
+                    return self.handle_activity_record(ctx, frame).await;
+                }
                 if op
                     .as_ref()
                     .is_some_and(|probe| probe.op == "operator.confirm")
@@ -3022,6 +3042,125 @@ impl ControlHandler {
         .map(|frame| vec![frame])
     }
 
+    async fn handle_activity_record(
+        &self,
+        ctx: &RouteCtx,
+        frame: Frame,
+    ) -> Result<Vec<Frame>, RouterError> {
+        use subc_control::{
+            ActivityRecordRequest, ActivityRecordResponse, ACTIVITY_ACTOR_UNKNOWN,
+            ACTIVITY_MALFORMED, ACTIVITY_UNAVAILABLE,
+        };
+        let result = async {
+            let module = self
+                .forwarding
+                .module_id_for_connection(ctx.connection_id)
+                .ok()
+                .flatten()
+                .ok_or(ACTIVITY_ACTOR_UNKNOWN)?;
+            let request: ActivityRecordRequest =
+                serde_json::from_slice(&frame.body).map_err(|_| ACTIVITY_MALFORMED)?;
+            crate::activity::validate(&module, &request)?;
+            let actor = self.activity_actor(ctx.connection_id, &module, request.on.as_ref())?;
+            let ledger = self.activity.as_ref().ok_or(ACTIVITY_UNAVAILABLE)?;
+            let at_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            ledger.record(module, request, actor, at_ms).await
+        }
+        .await;
+        match result {
+            Ok(entry) => Ok(vec![control_response_body_frame(
+                &frame,
+                &ActivityRecordResponse { seq: entry.seq },
+                "activity.record",
+            )?]),
+            Err(code) => Ok(vec![control_error_frame(
+                &frame,
+                code,
+                "activity recording refused",
+            )?]),
+        }
+    }
+
+    fn activity_actor(
+        &self,
+        connection: ConnectionId,
+        module: &str,
+        on: Option<&subc_control::ActivityOn>,
+    ) -> Result<subc_control::ActivityActor, &'static str> {
+        use crate::forwarding::{DataRoute, DataRouteState};
+        use subc_control::{ActivityActor, ActivityOn, ACTIVITY_ACTOR_UNKNOWN};
+        let principal = |id: &str| Principal::Reserved {
+            module_id: id.to_owned(),
+        };
+        let mut actor = ActivityActor {
+            principal: principal(module),
+            scope_owner: None,
+            agent_id: None,
+            run_id: None,
+            flow_id: None,
+            project_root: None,
+        };
+        let scope = match on {
+            None => return Ok(actor),
+            Some(ActivityOn::Scope(scope)) => {
+                let selector = subc_protocol::scope::ScopeSelector {
+                    owner: principal(module),
+                    scope_ref: scope.scope_ref.clone(),
+                    scope_epoch: Some(scope.epoch),
+                };
+                self.scopes
+                    .read()
+                    .map_err(|_| ACTIVITY_ACTOR_UNKNOWN)?
+                    .admit(&principal(module), module, &selector, true)
+                    .map_err(|_| ACTIVITY_ACTOR_UNKNOWN)?
+            }
+            Some(ActivityOn::Route(route)) => {
+                let DataRoute::Module(DataRouteState::Bound(binding)) = self
+                    .forwarding
+                    .lookup_data_route(connection, route.channel, route.epoch)
+                    .map_err(|_| ACTIVITY_ACTOR_UNKNOWN)?
+                else {
+                    return Err(ACTIVITY_ACTOR_UNKNOWN);
+                };
+                if binding.module_id != module {
+                    return Err(ACTIVITY_ACTOR_UNKNOWN);
+                }
+                actor.principal = binding.principal.clone();
+                actor.project_root = binding
+                    .project_root
+                    .as_ref()
+                    .map(|root| root.as_path().to_path_buf());
+                let Some(bound) = &binding.scope else {
+                    return Ok(actor);
+                };
+                let owner = principal(&bound.owner);
+                let selector = subc_protocol::scope::ScopeSelector {
+                    owner: owner.clone(),
+                    scope_ref: bound.scope_ref.clone(),
+                    scope_epoch: Some(bound.tag.scope_epoch),
+                };
+                let admitted = self
+                    .scopes
+                    .read()
+                    .map_err(|_| ACTIVITY_ACTOR_UNKNOWN)?
+                    .admit(&owner, module, &selector, true)
+                    .map_err(|_| ACTIVITY_ACTOR_UNKNOWN)?;
+                if admitted.tag != bound.tag {
+                    return Err(ACTIVITY_ACTOR_UNKNOWN);
+                }
+                admitted
+            }
+        };
+        actor.scope_owner = Some(scope.stamp.owner);
+        actor.agent_id = scope.stamp.attributes.agent_id;
+        actor.run_id = scope.stamp.attributes.run_id;
+        actor.flow_id = scope.stamp.attributes.flow_id;
+        Ok(actor)
+    }
+
     fn handle_server_describe(&self, frame: Frame) -> Result<Vec<Frame>, RouterError> {
         self.refresh_capability_requirements();
         // A bare connection count is ambiguous between many clients holding a
@@ -3030,6 +3169,12 @@ impl ControlHandler {
         // diagnostic endpoint must still answer if the forwarding lock is
         // contended.
         let mut counters = self.counters.snapshot();
+        if let (Some(ledger), Some(obj)) = (&self.activity, counters.as_object_mut()) {
+            obj.insert(
+                "activity_unparseable_lines".into(),
+                ledger.read_errors().into(),
+            );
+        }
         if let (Ok((connections_with_routes, max)), Some(obj)) = (
             self.forwarding.client_route_concentration(),
             counters.as_object_mut(),
@@ -6382,7 +6527,7 @@ fn pong(frame: &Frame) -> Result<Frame, RouterError> {
     .map_err(RouterError::FrameBuild)
 }
 
-fn control_error_frame(
+pub(crate) fn control_error_frame(
     frame: &Frame,
     code: &'static str,
     message: impl Into<String>,
@@ -13098,6 +13243,9 @@ mod tests {
     /// may sync is decided by the registration and launch nonce of the module
     /// connection, never by the request body.
     mod scopes {
+        mod activity {
+            include!("activity_scope_tests.rs");
+        }
         mod delta {
             include!("scope_handler_delta_tests.rs");
         }

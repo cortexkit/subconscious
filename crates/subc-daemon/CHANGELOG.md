@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.33.10
+
+- Serve additive `activity.record` requests from registered modules and advertise `activity-ledger/v1` in HELLO_ACK and server.describe. The daemon verifies route ownership/epoch and live scope tags before recording the verified identity of the client that opened the route, its project and scope attributes. Events with no route or scope citation identify the calling module.
+- Append `activity.jsonl` beside the terminal journal through cortexkit-log on a bounded single-writer queue. Replies follow successful writes, sequence numbers resume across retained rotated files, and reopening adds a newline after an incomplete final record so it cannot swallow the next append. Open/write failures and queue saturation refuse recording without holding connection readers or stopping routing, supervision or shutdown.
+- Enforce module-owned kinds, Unicode scalar and compact JSON size limits, strict request shape and incarnation-long per-module token buckets (60 initial tokens, 10/s). Add controlled-clock, fault-injection and isolated TCP daemon tests.
+
 ## 0.33.9
 
 - Sweep recorded Linux children whose PID and start time match when executable access is denied with EACCES/EPERM. Log at info that the executable is not readable (non-dumpable), without claiming image agreement. Missing recorded identities, PID reuse, different executables, and other read failures still refuse signalling; macOS and Windows are unchanged.

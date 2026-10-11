@@ -308,6 +308,61 @@ final class EnvelopeRevisionTests: XCTestCase {
 }
 
 final class ClientWireRevisionTests: XCTestCase {
+    private func scopeDescribeGoldenReply(_ fixture: String) throws -> [String: Any] {
+        let url = try XCTUnwrap(Bundle.module.url(forResource: fixture, withExtension: "json"))
+        let body = try Data(contentsOf: url)
+        let transport = ScriptedTransport()
+        try transport.append(makeFrame(
+            ty: .response, channel: 0, epoch: 0, corr: 1,
+            json: ["route_channel": 12, "route_epoch": 1]
+        ))
+        // Feed the golden bytes through the client reader, not a test-only JSON decoder.
+        try transport.append(encodeFrame(
+            ty: .response, flags: 0, channel: 12, epoch: 1, corr: 2, body: body
+        ))
+        let client = SubcClient(transport: transport)
+        let route = try client.routeOpenManagementSurface(
+            moduleId: "module", projectRoot: "/tmp", harness: "test", session: "session"
+        )
+        let reply = try client.callManagement(
+            route: route, method: "scope.describe",
+            params: ["owner": ["kind": "reserved", "module_id": "prefrontal-core"], "ref": "head-1"]
+        )
+        XCTAssertTrue(transport.bytes.isEmpty)
+        XCTAssertEqual(transport.writes.count, 2)
+        let request = try decodeWrittenFrame(transport.writes[1])
+        let payload = try XCTUnwrap(try JSONSerialization.jsonObject(with: request.body) as? [String: Any])
+        XCTAssertEqual(payload["method"] as? String, "scope.describe")
+        XCTAssertEqual(reply["op"] as? String, "scope.describe")
+        XCTAssertEqual(reply["status"] as? String, "live")
+        XCTAssertEqual((reply["scope_epoch"] as? NSNumber)?.uint64Value, 3)
+        XCTAssertEqual(reply["daemon_incarnation"] as? String, "daemon-0001")
+        XCTAssertEqual(reply["owner_synced"] as? Bool, true)
+        XCTAssertEqual(reply["owner_configured"] as? Bool, true)
+        return reply
+    }
+
+    func testScopeDescribeGoldenReplyPreservesDeadlineAndUnknownStampFields() throws {
+        let reply = try scopeDescribeGoldenReply("scope-describe-with-deadline")
+        let scope = try XCTUnwrap(reply["scope"] as? [String: Any])
+        XCTAssertEqual(scope["ref"] as? String, "head-1")
+        XCTAssertEqual((scope["scope_epoch"] as? NSNumber)?.uint64Value, 3)
+        XCTAssertEqual((scope["expires_at_ms"] as? NSNumber)?.uint64Value, 1_725_000_030_000)
+        let attributes = try XCTUnwrap(scope["attributes"] as? [String: Any])
+        XCTAssertEqual(attributes["run_id"] as? String, "run:7")
+        let extra = try XCTUnwrap(scope["future_stamp_field"] as? [String: Any])
+        XCTAssertEqual(extra["enabled"] as? Bool, true)
+    }
+
+    func testScopeDescribeLegacyGoldenReplyHasNoDeadline() throws {
+        let reply = try scopeDescribeGoldenReply("scope-describe-legacy")
+        let scope = try XCTUnwrap(reply["scope"] as? [String: Any])
+        XCTAssertEqual(scope["ref"] as? String, "head-1")
+        XCTAssertNil(scope["expires_at_ms"])
+        let attributes = try XCTUnwrap(scope["attributes"] as? [String: Any])
+        XCTAssertEqual(attributes["run_id"] as? String, "run:7")
+    }
+
     func testManagementStreamEndCompletesVoidReply() throws {
         let transport = ScriptedTransport()
         try transport.append(makeFrame(

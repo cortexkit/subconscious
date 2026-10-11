@@ -41,6 +41,8 @@ let package = Package(
                 .copy("Fixtures/wire_vectors.json"),
                 .copy("Fixtures/board-wire-fixtures-v1.json"),
                 .copy("Fixtures/board-wire-v3.json"),
+                .copy("Fixtures/scope-describe-legacy.json"),
+                .copy("Fixtures/scope-describe-with-deadline.json"),
             ]
         ),
     ]

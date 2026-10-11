@@ -1,0 +1,22 @@
+{
+  "op": "scope.describe",
+  "status": "live",
+  "scope_epoch": 3,
+  "daemon_incarnation": "daemon-0001",
+  "owner_synced": true,
+  "owner_configured": true,
+  "scope": {
+    "owner": { "kind": "reserved", "module_id": "prefrontal-core" },
+    "ref": "head-1",
+    "scope_epoch": 3,
+    "kind": "worker",
+    "parent": {
+      "owner": { "kind": "reserved", "module_id": "prefrontal-core" },
+      "ref": "head-0",
+      "scope_epoch": 2
+    },
+    "parent_state": "linked",
+    "attributes": { "agent_id": "agent-7", "run_id": "run:7" },
+    "owner_authorized": true
+  }
+}

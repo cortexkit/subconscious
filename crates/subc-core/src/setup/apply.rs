@@ -1269,7 +1269,7 @@ mod adoption_tests {
             },
             platform,
             inventory,
-            runner: SystemCommandRunner,
+            runner: Box::new(SystemCommandRunner),
             artifacts: ReleaseArtifactSource::from_index(
                 super::super::release_index::ReleaseIndex {
                     schema: 1,

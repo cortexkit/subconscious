@@ -26,6 +26,7 @@ use std::{
 };
 
 use subc_protocol::{
+    call_mode::CALL_MODES_CAPABILITY,
     error_codes,
     manifest::CapabilityDeclarations,
     scope::{
@@ -274,10 +275,9 @@ pub(crate) fn check_target_flow_support(
         return Ok(());
     }
     let supported = capabilities.is_some_and(|capabilities| {
-        capabilities
-            .provides
-            .iter()
-            .any(|capability| capability == FLOW_SCOPES_CAPABILITY)
+        capabilities.provides.iter().any(|capability| {
+            capability == FLOW_SCOPES_CAPABILITY || capability == CALL_MODES_CAPABILITY
+        })
     });
     if supported {
         return Ok(());
@@ -286,13 +286,14 @@ pub(crate) fn check_target_flow_support(
         code: error_codes::TARGET_FLOW_UNSUPPORTED,
         message: format!(
             "target module '{target_module}' does not provide capability \
-             '{FLOW_SCOPES_CAPABILITY}', required for a scope carrying flow_id"
+             '{CALL_MODES_CAPABILITY}' or '{FLOW_SCOPES_CAPABILITY}', required for a scope carrying flow_id"
         ),
     })
 }
 
-/// Only providers declaring `agent-run-scopes/v1` may receive a `run_id`
-/// stamp: decoding the field alone does not promise correct agent-run behaviour.
+/// A run requires `call-modes/v1` or, during migration, `agent-run-scopes/v1`.
+/// Delegating runs require `call-modes/v1`: legacy providers assumed a run never
+/// carries its agent's authority, so decoding the stamp alone is not sufficient.
 pub(crate) fn check_target_agent_run_support(
     stamp: &ScopeStamp,
     target_module: &str,
@@ -300,16 +301,21 @@ pub(crate) fn check_target_agent_run_support(
 ) -> Result<(), ScopeAdmissionRefusal> {
     if stamp.attributes.run_id.is_none()
         || capabilities.is_some_and(|caps| {
-            caps.provides
-                .iter()
-                .any(|cap| cap == AGENT_RUN_SCOPES_CAPABILITY)
+            caps.provides.iter().any(|cap| {
+                cap == CALL_MODES_CAPABILITY
+                    || (!stamp.attributes.delegates && cap == AGENT_RUN_SCOPES_CAPABILITY)
+            })
         })
     {
         return Ok(());
     }
     Err(ScopeAdmissionRefusal {
         code: error_codes::TARGET_AGENT_RUN_UNSUPPORTED,
-        message: format!("target module '{target_module}' does not provide capability '{AGENT_RUN_SCOPES_CAPABILITY}', required for a scope carrying run_id"),
+        message: if stamp.attributes.delegates {
+            format!("target module '{target_module}' does not provide capability '{CALL_MODES_CAPABILITY}', required for a run scope delegating agent authority")
+        } else {
+            format!("target module '{target_module}' does not provide capability '{CALL_MODES_CAPABILITY}' or '{AGENT_RUN_SCOPES_CAPABILITY}', required for a scope carrying run_id")
+        },
     })
 }
 
@@ -1207,12 +1213,6 @@ impl ScopeTable {
                     "run_id cannot accompany flow_id".to_string(),
                 ));
             }
-            if record.attributes.delegates {
-                return Some((
-                    error_codes::SCOPE_RUN_ID_DELEGATES,
-                    "run_id cannot delegate agent authority".to_string(),
-                ));
-            }
         }
         let epoch = record.scope_epoch;
         if let Some(cause) = tombstones.cause(&record.scope_ref, epoch) {
@@ -1620,16 +1620,17 @@ impl ScopeTable {
         }
         Ok(ScopeAdmission {
             owner: owner.to_string(),
-            stamp: ScopeStamp {
-                owner: selector.owner.clone(),
-                scope_ref: scope_ref.clone(),
+            stamp: ScopeStamp::new(
+                selector.owner.clone(),
+                scope_ref.clone(),
                 scope_epoch,
-                kind: scope.record.kind,
-                parent: scope.record.parent.clone(),
-                parent_state: scope.parent_state,
-                attributes: scope.record.attributes.clone(),
-                owner_authorized: self.owner_authorized(owner),
-            },
+                scope.record.kind,
+            )
+            .with_parent(scope.record.parent.clone())
+            .with_parent_state(scope.parent_state)
+            .with_attributes(scope.record.attributes.clone())
+            .with_owner_authorized(self.owner_authorized(owner))
+            .with_expires_at_ms(scope.record.expires_at_ms),
             tag: scope.tag(),
         })
     }
@@ -1653,16 +1654,19 @@ impl ScopeTable {
                 status: ScopeStatus::Live,
                 scope_epoch: Some(scope.record.scope_epoch),
                 owner_synced: state.synced,
-                stamp: Some(ScopeStamp {
-                    owner: owner.clone(),
-                    scope_ref: scope_ref.to_string(),
-                    scope_epoch: scope.record.scope_epoch,
-                    kind: scope.record.kind,
-                    parent: scope.record.parent.clone(),
-                    parent_state: scope.parent_state,
-                    attributes: scope.record.attributes.clone(),
-                    owner_authorized: self.owner_authorized(owner_id),
-                }),
+                stamp: Some(
+                    ScopeStamp::new(
+                        owner.clone(),
+                        scope_ref,
+                        scope.record.scope_epoch,
+                        scope.record.kind,
+                    )
+                    .with_parent(scope.record.parent.clone())
+                    .with_parent_state(scope.parent_state)
+                    .with_attributes(scope.record.attributes.clone())
+                    .with_owner_authorized(self.owner_authorized(owner_id))
+                    .with_expires_at_ms(scope.record.expires_at_ms),
+                ),
             };
         }
         match state.tombstones.latest(scope_ref) {

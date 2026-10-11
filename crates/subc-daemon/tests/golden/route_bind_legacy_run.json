@@ -1,0 +1,16 @@
+{
+  "op": "route.bind",
+  "route_channel": 1,
+  "epoch": 1,
+  "identity": { "project_root": "/project", "harness": "unit", "session": "session" },
+  "principal": { "kind": "reserved", "module_id": "aft" },
+  "target": { "kind": "tool_provider", "module_id": "plexus" },
+  "scope": {
+    "owner": { "kind": "reserved", "module_id": "prefrontal-core" },
+    "ref": "s",
+    "scope_epoch": 1,
+    "kind": "ephemeral",
+    "attributes": { "agent_id": "agent-1", "run_id": "run:7" },
+    "owner_authorized": true
+  }
+}

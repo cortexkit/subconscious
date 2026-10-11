@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Require subc-protocol 0.31. Targets declaring `call-modes/v1` receive a scope-derived `call_mode` on every bind and `expires_at_ms` on stamps with deadlines. Legacy targets receive neither new field: non-delegating runs still bind through `agent-run-scopes/v1`, and flows through `flow-scopes/v1`. Both route admission and the captured relay endpoint require `call-modes/v1` or the matching legacy capability.
+- Accept delegating run scope records, but refuse their binds unless the target declares `call-modes/v1`. Older run providers assumed no delegated agent authority; the refusal names that delegation and a relay refusal releases its reservation.
+- Include the immutable epoch deadline in `scope.describe` stamps. Existing Rust stamp decoders accept extra fields, and the TypeScript and Swift clients' generic response paths do not reject extra JSON fields.
+- Update the record-validation test that formerly required `run_id` with `delegates` to be refused: delegation is now checked against each route's target, not rejected in scope records. Add daemon bind golden fixtures and reconnect tests that replace an admitted declarer with a legacy endpoint, verifying field omission and delegation refusal at relay re-check.
+
 ## 0.33.8
 
 - Record terminal history before publishing a health-budget failure or clearing the reaped child's process facts. Apply the same ordering to every child-bearing drain, ordinary exit and daemon-shutdown exit; failed waits and drain teardown errors record their unknown exit before publishing failure. Journal errors still retain the exit record in memory and publish the requested stopped, disabled, restarting or failed state. A panic during terminal recording also publishes that state before resuming the unwind. No-child spawn failures remain failures without fabricated exit records.

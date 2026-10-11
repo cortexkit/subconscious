@@ -596,11 +596,6 @@ fn run_id_rules_and_expiry_attribute_authority_are_distinct() {
                 .with_delegates(true),
             error_codes::SCOPE_RUN_ID_WITH_FLOW_ID,
         ),
-        (
-            3,
-            with_agent.clone().with_delegates(true),
-            error_codes::SCOPE_RUN_ID_DELEGATES,
-        ),
     ] {
         assert_eq!(
             code(&sync(
@@ -612,6 +607,21 @@ fn run_id_rules_and_expiry_attribute_authority_are_distinct() {
             Some(expected)
         );
     }
+    let reply = sync(
+        &mut table,
+        OWNER,
+        3,
+        vec![record("s", 1).with_attributes(with_agent.clone().with_delegates(true))],
+    );
+    assert_eq!(reply.results[0].outcome, ScopeRecordOutcome::Created);
+    assert!(
+        table
+            .describe(&reserved(OWNER), "s")
+            .stamp
+            .unwrap()
+            .attributes
+            .delegates
+    );
     let reply = sync(
         &mut table,
         OTHER,

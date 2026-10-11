@@ -17,6 +17,7 @@ use subc_control::{
     SupervisorRescanResult, SupervisorRoute, SupervisorRouteConsumer, SupervisorRouteModule,
 };
 use subc_protocol::{
+    call_mode::{derive_call_mode, CALL_MODES_CAPABILITY},
     error_codes,
     manifest::{
         validate_hello_capability_grammar, validate_hello_event_declarations,
@@ -3744,7 +3745,7 @@ impl ControlHandler {
         // compared with the published one at commit, so a sync between here
         // and the module's ack refuses the open instead of binding a stamp
         // that is no longer true.
-        let (bound_scope, scope_stamp) = match scope {
+        let (bound_scope, mut scope_stamp) = match scope {
             None => (None, None),
             Some(selector) => {
                 let owner_configured = match &selector.owner {
@@ -3935,28 +3936,27 @@ impl ControlHandler {
         // over. Check the relay's captured connection, not the earlier by-id
         // lookup: the original module's flow/run capabilities cannot authorize
         // its replacement. The captured sink stays bound to that connection.
+        let relay_registration = self
+            .registry
+            .get_module_by_connection(endpoint.connection_id)
+            .map_err(|err| RouterError::backend(0, frame.header.corr, err.to_string()))?;
+        let relay_capabilities = relay_registration
+            .as_ref()
+            .and_then(|registration| registration.manifest.capabilities.as_ref());
         if let Some(stamp) = scope_stamp
             .as_ref()
             .filter(|stamp| stamp.attributes.flow_id.is_some() || stamp.attributes.run_id.is_some())
         {
-            let relay_registration = self
-                .registry
-                .get_module_by_connection(endpoint.connection_id)
-                .map_err(|err| RouterError::backend(0, frame.header.corr, err.to_string()))?;
             if let Err(refusal) = crate::scopes::check_target_flow_support(
                 stamp,
                 &target_module_id,
-                relay_registration
-                    .as_ref()
-                    .and_then(|registration| registration.manifest.capabilities.as_ref()),
+                relay_capabilities,
             )
             .and_then(|()| {
                 crate::scopes::check_target_agent_run_support(
                     stamp,
                     &target_module_id,
-                    relay_registration
-                        .as_ref()
-                        .and_then(|registration| registration.manifest.capabilities.as_ref()),
+                    relay_capabilities,
                 )
             }) {
                 reservation.release_and_disarm();
@@ -3970,6 +3970,19 @@ impl ControlHandler {
                 )?]);
             }
         }
+
+        // Older readers may reject unknown fields. Select both new fields from
+        // the captured endpoint's declaration, including on unscoped binds.
+        let call_mode = if relay_capabilities
+            .is_some_and(|caps| caps.provides.iter().any(|cap| cap == CALL_MODES_CAPABILITY))
+        {
+            Some(derive_call_mode(scope_stamp.as_ref()))
+        } else {
+            if let Some(stamp) = scope_stamp.as_mut() {
+                stamp.expires_at_ms = None;
+            }
+            None
+        };
 
         debug!(
             connection_id = ctx.connection_id.get(),
@@ -3992,6 +4005,7 @@ impl ControlHandler {
             role_versions,
             admission_facts,
             scope: scope_stamp,
+            call_mode,
         };
         let relay_body = serde_json::to_vec(&relay).map_err(|err| {
             RouterError::backend(
@@ -13087,6 +13101,9 @@ mod tests {
         mod delta {
             include!("scope_handler_delta_tests.rs");
         }
+        mod call_modes {
+            include!("scope_call_mode_tests.rs");
+        }
 
         use subc_protocol::scope::{
             ParentState, ScopeCarrier, ScopeKind, ScopeParent, ScopeRecordOutcome, ScopeStamp,
@@ -13509,6 +13526,35 @@ mod tests {
         }
 
         async fn rig_with_scope_capabilities(flow_support: bool, run_support: bool) -> Rig {
+            let mut provides = Vec::new();
+            if flow_support {
+                provides.push("flow-scopes/v1");
+            }
+            if run_support {
+                provides.push("agent-run-scopes/v1");
+            }
+            rig_with_target_capabilities(&provides).await
+        }
+
+        fn hello_with_capabilities(module_id: &str, connection: u64, provides: &[&str]) -> Frame {
+            let hello = hello_frame(module_id, PROTOCOL_VERSION, connection);
+            let mut body: Value = serde_json::from_slice(&hello.body).unwrap();
+            // Decoder versions alone cannot admit scoped calls: only a capability
+            // declaration promises the required run or flow behaviour.
+            body["manifest"]["provenance"] = serde_json::json!({"wire_crate_version": "0.29.0"});
+            body["manifest"]["capabilities"] = serde_json::json!({"provides": provides});
+            Frame::build(
+                FrameType::Hello,
+                control_flags(),
+                0,
+                0,
+                connection,
+                serde_json::to_vec(&body).unwrap(),
+            )
+            .unwrap()
+        }
+
+        async fn rig_with_target_capabilities(provides: &[&str]) -> Rig {
             let registry = Arc::new(Registry::default());
             let forwarding = Arc::new(ForwardingTable::default());
             let supervisor_handle = SupervisorHandle::new();
@@ -13547,32 +13593,7 @@ mod tests {
             let mut modules = BTreeMap::new();
             for (connection, module_id) in [(2, PLEXUS), (3, OTHER)] {
                 let (ctx, mut rx) = wide_ctx(connection);
-                let hello = hello_frame(module_id, PROTOCOL_VERSION, connection);
-                let mut body: Value = serde_json::from_slice(&hello.body).unwrap();
-                // A decoder version alone must not admit flow routes. Every
-                // target here declares wire crate version 0.29.0; only one that
-                // declares `flow-scopes/v1` promises flow behaviour.
-                body["manifest"]["provenance"] =
-                    serde_json::json!({"wire_crate_version": "0.29.0"});
-                if flow_support || run_support {
-                    let mut provides = Vec::new();
-                    if flow_support {
-                        provides.push("flow-scopes/v1");
-                    }
-                    if run_support {
-                        provides.push("agent-run-scopes/v1");
-                    }
-                    body["manifest"]["capabilities"] = serde_json::json!({"provides": provides});
-                }
-                let hello = Frame::build(
-                    FrameType::Hello,
-                    control_flags(),
-                    0,
-                    0,
-                    connection,
-                    serde_json::to_vec(&body).unwrap(),
-                )
-                .unwrap();
+                let hello = hello_with_capabilities(module_id, connection, provides);
                 hello_via_sink(&handler, &ctx, &mut rx, hello).await;
                 modules.insert(module_id.to_string(), (ctx, rx));
             }

@@ -129,7 +129,7 @@ fn descriptors(pid: i32) -> Option<Vec<ProcFdInfo>> {
         };
         if bytes <= 0
             || bytes as usize > fds.len() * size_of::<ProcFdInfo>()
-            || bytes as usize % size_of::<ProcFdInfo>() != 0
+            || !(bytes as usize).is_multiple_of(size_of::<ProcFdInfo>())
         {
             return None;
         }

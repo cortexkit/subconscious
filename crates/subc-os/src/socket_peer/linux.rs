@@ -54,7 +54,9 @@ fn parse_address(field: &str) -> Option<SocketAddr> {
     // procfs prints native-endian 32-bit words, including each IPv6 word.
     let bytes: Vec<u8> = address
         .as_bytes()
-        .chunks_exact(8)
+        .as_chunks::<8>()
+        .0
+        .iter()
         .map(|word| {
             u32::from_str_radix(std::str::from_utf8(word).ok()?, 16)
                 .ok()

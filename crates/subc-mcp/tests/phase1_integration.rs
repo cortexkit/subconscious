@@ -509,6 +509,22 @@ impl ScriptedProvider {
         }
     }
 
+    async fn wait_reverse_outcome(&mut self, corr: u64) -> Result<Value, Value> {
+        match self
+            .wait_for_event("reverse outcome", |event| {
+                matches!(event,
+                ScriptedProviderEvent::ReverseResponse { corr: event_corr, .. }
+                | ScriptedProviderEvent::ReverseError { corr: event_corr, .. }
+                if *event_corr == corr)
+            })
+            .await
+        {
+            ScriptedProviderEvent::ReverseResponse { body, .. } => Ok(body),
+            ScriptedProviderEvent::ReverseError { body, .. } => Err(body),
+            other => panic!("expected reverse outcome event, got {other:?}"),
+        }
+    }
+
     async fn wait_reverse_error(&mut self, corr: u64) -> Value {
         match self
             .wait_for_event("reverse error", |event| {
@@ -1075,17 +1091,15 @@ async fn mcp_initialize_publishes_reverse_peer_before_initialized_notification()
         .provider
         .send_reverse_request(route, 907, elicitation_body("initialize-boundary"))
         .await;
-    let (raw_stdin, raw_stdout) = tokio::select! {
-        result = raw_client => result.expect("raw MCP client should handle elicitation"),
-        error = harness.provider.wait_reverse_error(907) => {
-            panic!("reverse request was rejected after initialize instead of reaching the host: {error}")
-        }
-    };
+    let (raw_client_result, provider_response) =
+        wait_reverse_outcome_and_client(raw_client, harness.provider.wait_reverse_outcome(907))
+            .await;
+    let (raw_stdin, raw_stdout) =
+        raw_client_result.expect("raw MCP client should handle elicitation");
     wait_for_atomic_at_least(&prompt_count, 1, "pre-initialized elicitation prompts").await;
     harness.shim.stdin = Some(raw_stdin);
     harness.shim.stdout = Some(raw_stdout);
 
-    let provider_response = harness.provider.wait_reverse_response(907).await;
     assert_eq!(
         provider_response.pointer("/content/initializeBoundary"),
         Some(&Value::Bool(true))
@@ -1102,6 +1116,64 @@ async fn mcp_initialize_publishes_reverse_peer_before_initialized_notification()
     .await;
     drop(harness.shim.stdin.take());
     harness.shutdown().await;
+}
+
+async fn wait_reverse_outcome_and_client<T>(
+    client: impl std::future::Future<Output = T>,
+    outcome: impl std::future::Future<Output = Result<Value, Value>>,
+) -> (T, Value) {
+    tokio::pin!(client, outcome);
+    // A response can reach the provider before the client's stdio flush future
+    // resumes. Consume response and error through one waiter, and retain a
+    // response-first result rather than discarding it while waiting for errors.
+    let require_response = |result: Result<Value, Value>| {
+        result.unwrap_or_else(|error| {
+        panic!("reverse request was rejected after initialize instead of reaching the host: {error}")
+    })
+    };
+    tokio::select! {
+        result = &mut client => (result, require_response(outcome.await)),
+        reply = &mut outcome => {
+            let response = require_response(reply);
+            (client.await, response)
+        }
+    }
+}
+
+#[tokio::test]
+async fn reverse_initialize_retains_a_response_before_client_completion() {
+    let (command_tx, _command_rx) = mpsc::channel(1);
+    let (events_tx, events_rx) = mpsc::channel(1);
+    let mut provider = ScriptedProvider {
+        module_id: "response-first".into(),
+        tool_name: "probe".into(),
+        command_tx,
+        events_rx,
+        task: tokio::spawn(async {}),
+    };
+    let expected = json!({"content": {"initializeBoundary": true}});
+    events_tx
+        .send(ScriptedProviderEvent::ReverseResponse {
+            corr: 907,
+            body: expected.clone(),
+        })
+        .await
+        .unwrap();
+    let (release_client, client_released) = tokio::sync::oneshot::channel();
+    let outcome = async {
+        let reply = provider.wait_reverse_outcome(907).await;
+        release_client.send(()).unwrap();
+        reply
+    };
+    let client = async {
+        client_released.await.unwrap();
+        "client completed"
+    };
+    let (client_result, response) = wait_reverse_outcome_and_client(client, outcome).await;
+    assert_eq!(client_result, "client completed");
+    assert_eq!(response, expected);
+    assert!(provider.events_rx.try_recv().is_err());
+    provider.task.await.unwrap();
 }
 
 #[tokio::test]

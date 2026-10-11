@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.33
+
+- Keep response and error events in one waiter in the initialize-boundary reverse-request test, so a provider response arriving before the raw client's stdio write completion cannot be discarded by an error-only waiter. Add a deterministic response-first regression; MCP runtime behavior and timeout budgets are unchanged.
+
 ## 0.1.32
 
 - Expect the shared accessor's named-pipe nonce source in supervised Windows provenance tests; Unix still expects the descriptor source.

@@ -247,11 +247,11 @@ impl ChildRoster {
     pub(crate) fn record_to(&self, path: PathBuf) {
         #[cfg(target_os = "linux")]
         let retained = crate::live_children::read_record(&path).unwrap_or_default();
-        if self.inner.record_path.set(path).is_err() {
-            return;
-        }
+        let first_record = self.inner.record_path.set(path).is_ok();
+        #[cfg(not(target_os = "linux"))]
+        let _ = first_record;
         #[cfg(target_os = "linux")]
-        {
+        if first_record {
             *lock(&self.inner.retained) = retained;
             if let Ok(runtime) = tokio::runtime::Handle::try_current() {
                 let weak = Arc::downgrade(&self.inner);

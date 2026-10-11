@@ -34,7 +34,10 @@ export const SUBC_LAUNCH_NONCE_FD_ENV = "SUBC_LAUNCH_NONCE_FD";
 /** The one-time Windows pipe name. Its name is not a secret. */
 export const SUBC_LAUNCH_NONCE_PIPE_ENV = "SUBC_LAUNCH_NONCE_PIPE";
 
-/** Explicit daemon rollout permission (`env`) to retain environment startup. */
+/** When the daemon sets this variable to `env`, a failed pipe read may use
+ * `SUBC_LAUNCH_NONCE` instead. The daemon keeps that copy until every module
+ * reads its secret from the pipe, so older modules can still register.
+ */
 export const SUBC_LAUNCH_NONCE_PIPE_FALLBACK_ENV = "SUBC_LAUNCH_NONCE_PIPE_FALLBACK";
 
 /** The descriptor number the daemon gives the pipe's read end in the module. */
@@ -186,17 +189,20 @@ export function launchNonceOrUndefined(): LaunchNonce | undefined {
  * Concurrent callers share one in-flight read and its cached result. After this
  * completes, synchronous accessors return that same result. With the daemon's
  * explicit `SUBC_LAUNCH_NONCE_PIPE_FALLBACK=env` permission, failed or incomplete
- * pipe reads cache the
- * environment copy and its `env` source; unmarked readers stay fail-closed.
- * Node's public pipe
- * API cannot request identification-level impersonation explicitly.
+ * pipe reads cache `SUBC_LAUNCH_NONCE` and its `env` source. Without that variable
+ * set to `env`, a failed pipe read remains an error even if the copy exists.
+ * Node's public pipe API cannot ask Windows to let the server inspect the
+ * client's identity without also allowing it to impersonate the client's token.
  */
 export async function launchNonceAsync(): Promise<LaunchNonce | undefined> {
   const cell = processCell();
   return unwrap(await (cell.resultAsync?.() ?? cell.result()));
 }
 
-/** The async reader for route-open paths that treat a refusal as no identity. */
+/** Return the cached nonce asynchronously, or `undefined` if its read failed.
+ * The SDK uses this when building `route.open`: without a nonce it omits
+ * `consumer_identity` instead of presenting an unread or invalid credential.
+ */
 export async function launchNonceOrUndefinedAsync(): Promise<LaunchNonce | undefined> {
   try {
     return await launchNonceAsync();

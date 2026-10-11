@@ -880,8 +880,10 @@ async fn a_supervised_module_reads_its_launch_nonce_from_the_descriptor_and_hell
 #[cfg(windows)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn windows_phase_one_supervised_module_reports_pipe_in_daemon_and_hello() {
-    // Environment fallback keeps startup available, so registration alone
-    // cannot prove the pipe works. Both independent live sources must be pipe.
+    // A failed pipe read may use SUBC_LAUNCH_NONCE until every Windows module
+    // reads the pipe, so successful registration alone cannot prove delivery.
+    // Require both the module's registration-message source and the daemon's
+    // per-spawn delivery record to say pipe.
     assert_supervised_launch_nonce_delivery().await;
 }
 

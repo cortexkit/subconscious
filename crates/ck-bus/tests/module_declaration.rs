@@ -678,8 +678,10 @@ async fn real_ckbus_hello_declares_build_provenance() {
     run.shutdown().await;
 }
 
-/// Where a supervised module gets its launch nonce on this platform: the daemon
-/// hands it over on an inherited Unix pipe or a PID-authenticated Windows pipe.
+/// The source ck-bus must report in its registration message's
+/// `manifest.provenance.launch_nonce_source`: `fd` for the Unix pipe inherited
+/// at spawn, or `pipe` for the Windows named pipe that serves only the process
+/// whose PID the daemon received when it spawned ck-bus.
 fn expected_launch_nonce_source() -> subc_protocol::manifest::LaunchNonceSource {
     if cfg!(windows) {
         subc_protocol::manifest::LaunchNonceSource::Pipe

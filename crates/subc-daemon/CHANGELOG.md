@@ -2,8 +2,8 @@
 
 ## 0.33.7
 
-- Serve Windows wire-module launch secrets over per-spawn PID-authenticated named pipes, including swap candidates, while retaining the environment copy and explicit fallback permission during phase one. Preparation or serving setup failures retain environment startup; only a completed client drain reports `pipe` in list/status and observed provenance.
-- Keep the Windows handle-pinned image identity and resource reporting alongside the pipe lifecycle. Remove the fallback permission with the environment copy in phase two; this availability rollout does not remove environment exposure.
+- Give each Windows module process a separate named pipe, including a replacement started alongside a still-serving module. Before writing the nonce, the server requires the connected process's PID to equal the PID returned when the daemon spawned that module. Keep `SUBC_LAUNCH_NONCE` and `SUBC_LAUNCH_NONCE_PIPE_FALLBACK=env` until every module reads the pipe, so failed pipe preparation or delivery does not prevent registration. Only after the client reads every byte does the daemon record `pipe` in `supervisor.list` and `supervisor.provenance` under `daemon_observed.launch_nonce_source`; module list/status displays that record.
+- Keep the process handle used for Windows executable-identity and resource checks alongside the pipe handles. Remove the fallback permission with the environment copy once every module reads the pipe; keeping the copy still exposes the secret to other processes running as the same user.
 
 ## 0.33.6
 

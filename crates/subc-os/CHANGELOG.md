@@ -3,8 +3,8 @@
 ## 0.1.14
 
 - Add PID-authenticated one-time Windows launch-nonce pipes and the cached `pipe` source. Reserve a protected, non-inheritable first instance before spawn, reject remote clients, and keep wrong-PID clients from receiving bytes. The current-user DACL grants read, synchronize and the write-attributes bit required by libuv, never generic write or pipe-instance creation.
-- Flush before disconnect/close, record consumption only after the client drains the buffer, and cancel a stalled flush within the child-lifetime/registration budget. Join only submitted overlapped operations and obtain immediate-completion byte counts through `GetOverlappedResult`.
-- Permit environment fallback only with explicit `SUBC_LAUNCH_NONCE_PIPE_FALLBACK=env` rollout permission. Complete matching reads stay `pipe`; failed or incomplete delivery caches `env`. Unmarked pipes and Unix descriptors stay fail-closed. Windows test directories now use the shared scratch-directory guard.
+- Call `FlushFileBuffers` before disconnecting and closing the server, and record delivery only after the connected module process has read all buffered nonce bytes. Cancel a stalled flush when that spawned process exits, the caller drops the delivery guard, or the serving deadline expires; the daemon currently supplies a one-second registration deadline. Wait for completion only for overlapped operations actually submitted to Windows, and obtain byte counts through `GetOverlappedResult` even when a call completes immediately.
+- Allow a failed or incomplete pipe read to use `SUBC_LAUNCH_NONCE` only when `SUBC_LAUNCH_NONCE_PIPE_FALLBACK=env` explicitly permits it. The daemon offers the same secret through both sources until every module reads the pipe: matching complete reads cache `pipe`, while reads using the permitted copy cache `env`. Without that permission, pipe errors remain errors; Unix descriptor reads never use an environment copy after a descriptor is named. Windows tests allocate directories through `cortexkit_test_support::ScratchDir`, which owns their cleanup.
 
 ## 0.1.13
 

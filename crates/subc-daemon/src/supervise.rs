@@ -1003,7 +1003,10 @@ pub struct ExitReport {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModuleStatus {
     pub module_id: String,
-    /// Server-observed Windows handoff source, not the module's declaration.
+    /// The daemon's Windows per-spawn record: `pipe` after the process it
+    /// spawned read all nonce bytes, otherwise `env` for the offered copy.
+    /// List/status reports use this record, not the source the module sends
+    /// in its registration message's manifest.provenance.launch_nonce_source.
     pub launch_nonce_source: Option<String>,
     pub state: ModuleState,
     pub enabled: bool,
@@ -7463,7 +7466,9 @@ type NonceHandoff = subc_os::LaunchNoncePipeHandoff;
 #[cfg(not(any(unix, windows)))]
 type NonceHandoff = std::convert::Infallible;
 
-/// Prepare wire identity for a plain spawn or a swap candidate.
+/// Create the launch nonce that a new module process must present when it
+/// registers or opens a consumer connection, including a replacement process
+/// started alongside a still-serving module.
 ///
 /// A plain spawn replaces the module's recorded nonce. A swap candidate records
 /// a separate candidate token so the still-serving incumbent and its consumers
@@ -7476,8 +7481,11 @@ type NonceHandoff = std::convert::Infallible;
 /// process of the same user cannot read it with `ps eww`. That handoff is
 /// returned rather than installed here, because installing it replaces
 /// whatever the child has at descriptor 3 and so must be the last pre-exec
-/// step, after the Linux cgroup placement that the caller registers later.
-/// Windows also retains an environment copy during the named-pipe rollout.
+/// step. Later in `spawn_child_in_slot`, `apply_cgroup_placement` first registers
+/// the Linux callback that writes the process into its cgroup. Only after that
+/// does `handoff.install_last` register the descriptor-3 replacement, so it
+/// cannot close a descriptor the cgroup callback still needs.
+/// Windows keeps SUBC_LAUNCH_NONCE as well until every module reads the named pipe.
 fn apply_wire_spawn_args_for_role(
     command: &mut Command,
     spec: &ModuleSpec,
@@ -7535,8 +7543,9 @@ fn apply_wire_spawn_args_for_role(
     let handoff = prepare_windows_nonce_pipe(command, spec, &nonce);
     #[cfg(not(any(unix, windows)))]
     let handoff = None;
-    // Keep environment-only modules registering until live per-spawn reports
-    // show that every Windows module consumes the named pipe.
+    // Older modules still read SUBC_LAUNCH_NONCE to register. Keep that copy
+    // until the daemon's per-spawn delivery records show that every running
+    // Windows module has read its secret from the named pipe.
     #[cfg(not(unix))]
     command.env(SUBC_LAUNCH_NONCE_ENV, nonce);
     Ok(handoff)
@@ -7575,8 +7584,10 @@ fn prepare_windows_nonce_pipe(
     match subc_os::LaunchNoncePipeHandoff::new(nonce) {
         Ok(handoff) => {
             command.env(subc_os::LAUNCH_NONCE_PIPE_ENV, handoff.name());
-            // The environment copy remains the availability contract until all
-            // live modules consume the pipe. Unmarked readers stay fail-closed.
+            // Let a failed pipe read use SUBC_LAUNCH_NONCE so the process can
+            // still register until every module reads the pipe. A reader without
+            // this variable set to env returns the pipe error instead of using
+            // an inherited or configured environment copy.
             command.env(subc_os::LAUNCH_NONCE_PIPE_FALLBACK_ENV, "env");
             Some(handoff)
         }
@@ -7593,8 +7604,9 @@ fn start_windows_nonce_pipe(
     pid: u32,
     spec: &ModuleSpec,
 ) -> Option<subc_os::LaunchNoncePipeDelivery> {
-    // Use the same bounded initial-registration budget as reloads. Old readers
-    // may register from the environment and never connect to this server.
+    // Close an unread pipe after REGISTRY_RELEASE_TIMEOUT (one second), the
+    // same maximum wait used for registration during a reload. Older modules
+    // may register using SUBC_LAUNCH_NONCE without ever connecting to the pipe.
     handoff.and_then(|handoff| match handoff.serve(pid, REGISTRY_RELEASE_TIMEOUT) {
         Ok(delivery) => Some(delivery),
         Err(error) => {

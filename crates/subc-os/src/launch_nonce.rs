@@ -296,8 +296,10 @@ fn pipe_or_permitted_env(pipe: Cached, fallback: Option<LaunchNonce>) -> Cached 
     };
     match &pipe {
         Ok(Some(nonce)) if nonce.value() == fallback.value() => pipe,
-        // A truncated but valid UTF-8 read is not a successful handoff. When
-        // fallback is permitted, both transports carry the same nonce, so compare them too.
+        // The daemon supplies the same nonce through the pipe and
+        // SUBC_LAUNCH_NONCE until every module reads the pipe. With explicit
+        // permission to use the copy, reject even valid UTF-8 pipe bytes that
+        // differ from it: a truncated secret would otherwise fail registration.
         _ => Ok(Some(fallback)),
     }
 }

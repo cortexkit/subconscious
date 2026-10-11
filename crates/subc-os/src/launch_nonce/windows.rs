@@ -65,7 +65,9 @@ fn owned(handle: HANDLE) -> io::Result<OwnedHandle> {
     }
 }
 
-/// A server created before spawn. Dropping it closes the reserved name.
+/// Owns the named-pipe server created before the daemon starts the module.
+/// While its handle stays open, another process cannot create an instance with
+/// the same name. Dropping it closes that handle and releases the pipe name.
 pub struct LaunchNoncePipeHandoff {
     pipe: OwnedHandle,
     name: String,
@@ -227,8 +229,11 @@ impl LaunchNoncePipeHandoff {
     }
 }
 
-/// Per-spawn consumption evidence, independent of anything the module declares.
-/// Dropping the guard cancels a pending handoff (including a discarded candidate).
+/// Records whether the process started for this spawn read every nonce byte.
+/// The daemon sets this only after the pipe flush completes; it does not trust
+/// the source field sent by the module in its registration message.
+/// Dropping this guard asks the serving thread to stop waiting and close the
+/// pipe, including when a replacement process is discarded before promotion.
 pub struct LaunchNoncePipeDelivery {
     consumed: Arc<OnceLock<()>>,
     cancelled: Arc<AtomicBool>,
@@ -265,8 +270,10 @@ fn flush_delivery(
             let result = if unsafe { FlushFileBuffers(pipe.as_raw_handle()) } == 0 {
                 Err(io::Error::last_os_error())
             } else {
-                // Publish before EOF lets the child register, so provenance
-                // cannot observe an environment source after a successful read.
+                // Record the completed read before disconnecting sends EOF.
+                // The module can register as soon as it receives EOF, so the
+                // daemon's list/status and supervisor.provenance responses must
+                // already report pipe rather than the offered environment copy.
                 let _ = consumed.set(());
                 Ok(())
             };

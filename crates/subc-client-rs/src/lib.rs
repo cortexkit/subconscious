@@ -4467,9 +4467,10 @@ fn retained_launch_nonce() -> Option<String> {
     RETAINED_LAUNCH_NONCE.get().cloned()
 }
 
-/// Where this process read its launch nonce, in the form module provenance
-/// reports it (`fd`, `pipe` or `env`), or `None` when it has none or could not read
-/// it. For a module that builds its provenance block itself:
+/// The cached launch-nonce source (`fd`, `pipe` or `env`), or `None` when no
+/// nonce is available. The SDK records this in the registration message's
+/// `manifest.provenance.launch_nonce_source`; the daemon stores that declaration
+/// for `ck provenance` to display. A module constructing that record can use:
 /// `.with_launch_nonce_source(subc_client_rs::launch_nonce_source())`.
 pub fn launch_nonce_source() -> Option<LaunchNonceSource> {
     launch_nonce()

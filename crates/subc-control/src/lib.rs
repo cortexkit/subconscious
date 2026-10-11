@@ -634,9 +634,11 @@ pub enum ModuleDeclaredProvenance {
 /// daemon independently observed module-provided metadata.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SupervisorObservedProcess {
-    /// Windows launch-secret source: `pipe` when the server delivered the nonce
-    /// to the direct child, `env` when it only offered the environment copy.
-    /// Absent on older daemons and platforms without this observation.
+    /// The daemon's Windows delivery record for this process: `pipe` after the
+    /// process whose PID was returned by spawn has read all nonce bytes; `env`
+    /// when that delivery was not completed and SUBC_LAUNCH_NONCE was offered.
+    /// This is returned under `daemon_observed.launch_nonce_source` by
+    /// `supervisor.provenance`, and is absent when the daemon cannot report it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_nonce_source: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2090,8 +2092,11 @@ pub struct SupervisorEntry {
     /// on Windows. Non-wire modules receive no nonce on either platform.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_nonce_env: Option<bool>,
-    /// Windows server-observed handoff source (`pipe` or `env`). Non-wire and
-    /// stopped modules have no source. This is not the HELLO provenance claim.
+    /// The daemon's Windows per-spawn delivery result: `pipe` after the spawned
+    /// process read all bytes, otherwise `env` for the offered environment copy.
+    /// Returned in `supervisor.list`, independently of the source the module
+    /// declares in `manifest.provenance.launch_nonce_source` when registering.
+    /// Processes that do not speak the wire protocol and stopped modules omit it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_nonce_source: Option<String>,
     pub health: SupervisorHealthStatus,

@@ -3040,9 +3040,10 @@ async fn provenance(
                 "  store schema version: {}",
                 provenance_value(build.get("store_schema_version"))
             );
-            // Whether this module read its launch nonce from the daemon's pipe
-            // (`fd` on Unix, `pipe` on Windows) or the environment copy (`env`). Check it before
-            // the environment copy is withdrawn.
+            // Display the source the module sent in its registration message's
+            // manifest.provenance.launch_nonce_source: fd, pipe or env. Keep the
+            // Windows environment copy until every live module reports pipe;
+            // registration alone can succeed using that copy after a failed read.
             println!(
                 "  launch nonce source: {}",
                 provenance_value(build.get("launch_nonce_source"))

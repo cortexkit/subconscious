@@ -24,6 +24,7 @@ mod live_children;
 pub mod machine_id;
 pub mod observability;
 pub mod operator_confirm;
+pub mod privileged_prompt;
 #[allow(dead_code)]
 mod provenance;
 pub mod registry;

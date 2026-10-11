@@ -94,6 +94,10 @@ use tokio_util::sync::{CancellationToken, WaitForCancellationFuture};
 const AUTH_DEADLINE: Duration = Duration::from_secs(2);
 const CATALOG_UPDATE_TIMEOUT: Duration = Duration::from_secs(10);
 const OPERATOR_CONFIRM_TIMEOUT: Duration = Duration::from_secs(290);
+/// The daemon appends an activity entry and replies at once; there is no
+/// prompt to wait for, so a record shares the catalog update's ordinary
+/// control-reply window rather than the operator prompt's.
+const ACTIVITY_RECORD_TIMEOUT: Duration = Duration::from_secs(10);
 const OPERATOR_CONFIRM_OP: &str = "operator.confirm";
 const EGRESS_BUFFER: usize = 64;
 const HANDLER_TASK_CAPACITY: usize = 64;
@@ -896,7 +900,7 @@ impl ModuleHandle {
         &self,
         request: ActivityRecordRequest,
     ) -> Result<u64, ActivityRecordError> {
-        self.activity_record_with_deadline(request, OPERATOR_CONFIRM_TIMEOUT)
+        self.activity_record_with_deadline(request, ACTIVITY_RECORD_TIMEOUT)
             .await
     }
 

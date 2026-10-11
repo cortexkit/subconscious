@@ -48,6 +48,7 @@ pub use subc_control::{CatalogEntry, ConsumerIdentity};
 /// containing the module's credential.
 pub use subc_os::launch_nonce;
 use subc_protocol::{
+    call_mode::derive_call_mode,
     error_codes,
     manifest::ModuleManifest,
     scope::{
@@ -63,6 +64,7 @@ use subc_protocol::{
     ModuleHelloBody, Principal, Priority, RouteTarget, PROTOCOL_VERSION, SUBC_MODULE_ID_ENV,
 };
 pub use subc_protocol::{
+    call_mode::{CallMode, CALL_MODES_CAPABILITY},
     manifest::{
         build_provenance, CapabilityDeclarations, CapabilityNeed, CapabilityRequirement,
         ExecutionMode, LaunchNonceSource, ManifestProvenance, ProvenanceFormError, ProviderRole,
@@ -1671,12 +1673,16 @@ pub struct RouteBindRequest {
     /// the route. `None` means the route was opened without a scope, or by a
     /// daemon that predates scopes.
     pub scope: Option<ScopeStamp>,
+    /// The daemon's call mode, or the mode derived from `scope` when an older
+    /// daemon omits it. Providers must refuse [`CallMode::Unknown`].
+    pub call_mode: CallMode,
 }
 
 impl RouteBindRequest {
     /// A bind with the members every bind has and every optional one absent:
     /// no principal, no consumer capabilities, no role versions, no admission
-    /// facts and no scope. Set those with the `with_*` methods.
+    /// facts and no scope. The call mode is classic. Set fields with the
+    /// `with_*` methods.
     pub fn new(handle: RouteHandle, target: RouteTarget, identity: BindIdentity) -> Self {
         Self {
             handle,
@@ -1687,6 +1693,7 @@ impl RouteBindRequest {
             role_versions: None,
             admission_facts: None,
             scope: None,
+            call_mode: derive_call_mode(None),
         }
     }
 
@@ -1717,9 +1724,17 @@ impl RouteBindRequest {
         self
     }
 
-    /// Set [`Self::scope`].
+    /// Set [`Self::scope`] and derive its call mode. To override the derived
+    /// mode, call [`Self::with_call_mode`] afterwards.
     pub fn with_scope(mut self, scope: ScopeStamp) -> Self {
+        self.call_mode = derive_call_mode(Some(&scope));
         self.scope = Some(scope);
+        self
+    }
+
+    /// Set [`Self::call_mode`], overriding the mode derived from the scope.
+    pub fn with_call_mode(mut self, call_mode: CallMode) -> Self {
+        self.call_mode = call_mode;
         self
     }
 }
@@ -2356,6 +2371,7 @@ where
             role_versions,
             admission_facts,
             scope,
+            call_mode,
         } => {
             // Implicit-replace rule (wire spec 3.3.0): the daemon never rebinds a live
             // channel, but its route-gone GOODBYE to modules is best-effort, so a bind
@@ -2400,6 +2416,7 @@ where
                 consumer_capabilities,
                 role_versions,
                 admission_facts,
+                call_mode: call_mode.unwrap_or_else(|| derive_call_mode(scope.as_ref())),
                 scope,
             };
             let decision = handler.on_bind(&req).await;
@@ -2751,6 +2768,9 @@ impl From<serde_json::Error> for SubcModuleError {
         Self::Json(err)
     }
 }
+
+#[cfg(test)]
+mod call_mode_tests;
 
 #[cfg(test)]
 mod tests {
@@ -3772,6 +3792,7 @@ mod tests {
             role_versions: None,
             admission_facts: None,
             scope: None,
+            call_mode: None,
         })
         .unwrap();
         Frame::build(FrameType::Request, control_flags(), 0, 0, corr, body).unwrap()
@@ -4073,6 +4094,7 @@ mod module_close_tests {
             role_versions: None,
             admission_facts: None,
             scope: None,
+            call_mode: None,
         })
         .unwrap();
         send(

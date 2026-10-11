@@ -16,13 +16,13 @@ use std::{
 
 use serde_json::{json, Value};
 use subc_client_rs::{
-    async_trait, serve_with_handle, BindDecision, CallError, CallOptions, CatalogUpdateError,
-    CloseRouteOptions, ConsumerIdentity, ConsumerOptions, HandlerOutcome, ModuleHandle,
-    ModuleHandler, OutcomeUnknownCause, PolicyResolveError, PolicyResolver, PolicyResolverConfig,
-    PolicyVerdict, ProjectRef, RequestCtx, RetryBackoff, ReverseRequestRegistrationError,
-    RouteBindRequest, RouteCloseDisposition, RouteCloseReason, RouteEndReason, RouteHandle,
-    ScopeCallError, ScopeDescribeReply, ScopeSelector, SubcConsumer, SubcModuleError, Subject,
-    SubscribeOptions,
+    async_trait, serve_with_handle, BindDecision, CallError, CallMode, CallOptions,
+    CatalogUpdateError, CloseRouteOptions, ConsumerIdentity, ConsumerOptions, HandlerOutcome,
+    ModuleHandle, ModuleHandler, OutcomeUnknownCause, PolicyResolveError, PolicyResolver,
+    PolicyResolverConfig, PolicyVerdict, ProjectRef, RequestCtx, RetryBackoff,
+    ReverseRequestRegistrationError, RouteBindRequest, RouteCloseDisposition, RouteCloseReason,
+    RouteEndReason, RouteHandle, ScopeCallError, ScopeDescribeReply, ScopeSelector, SubcConsumer,
+    SubcModuleError, Subject, SubscribeOptions,
 };
 use subc_control::{ClientControlRequest, ClientControlResponse, PollKind};
 use subc_protocol::{
@@ -4908,6 +4908,7 @@ fn a_route_bind_request_is_built_through_its_constructor_and_setters() {
     assert_eq!(bare.role_versions, None);
     assert_eq!(bare.admission_facts, None);
     assert_eq!(bare.scope, None);
+    assert_eq!(bare.call_mode, CallMode::Classic);
 
     let stamp: ScopeStamp = serde_json::from_value(json!({
         "owner": { "kind": "reserved", "module_id": "prefrontal-core" },
@@ -4927,7 +4928,8 @@ fn a_route_bind_request_is_built_through_its_constructor_and_setters() {
         .with_consumer_capabilities(vec!["elicitation".to_string()])
         .with_role_versions(role_versions.clone())
         .with_admission_facts(json!({ "schema": 1 }))
-        .with_scope(stamp.clone());
+        .with_scope(stamp.clone())
+        .with_call_mode(CallMode::Flow);
     assert_eq!(full.principal, Some(principal));
     assert_eq!(
         full.consumer_capabilities,
@@ -4936,6 +4938,7 @@ fn a_route_bind_request_is_built_through_its_constructor_and_setters() {
     assert_eq!(full.role_versions, Some(role_versions));
     assert_eq!(full.admission_facts, Some(json!({ "schema": 1 })));
     assert_eq!(full.scope, Some(stamp));
+    assert_eq!(full.call_mode, CallMode::Flow);
 }
 
 /// A detached handle belongs to no connection: every operation that would
@@ -5382,3 +5385,6 @@ async fn describing_an_unknown_ref_answers_not_live_with_the_owners_state() {
 // These tests share the wire helpers but have a separate, feature-enabled daemon.
 #[path = "real_daemon/operator_confirm.rs"]
 mod operator_confirm;
+
+#[path = "real_daemon/call_modes.rs"]
+mod call_modes;

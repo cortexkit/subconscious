@@ -203,6 +203,7 @@ impl ModuleHarness {
             role_versions: request.role_versions,
             admission_facts: request.admission_facts,
             scope: request.scope,
+            call_mode: Some(request.call_mode),
         };
         let corr = self.allocate_corr();
         self.send(

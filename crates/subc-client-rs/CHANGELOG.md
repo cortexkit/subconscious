@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Requires `subc-protocol` 0.31. `RouteBindRequest` exposes `call_mode`, and the SDK re-exports `CallMode` and `CALL_MODES_CAPABILITY`. Providers must refuse `CallMode::Unknown` and declare `call-modes/v1` only when they handle all three known modes.
+- When an older daemon omits `call_mode`, the SDK derives it from the bind's scope: a run is codemode, a flow is flow, and a plain or absent scope is classic. `with_scope` derives the same mode in provider tests; call `with_call_mode` afterwards to override it.
+- Targets declaring `call-modes/v1` receive the run deadline in `ScopeStamp::expires_at_ms`; `scope_describe` also preserves it. Targets declaring only `agent-run-scopes/v1` or `flow-scopes/v1` still admit the matching non-delegating run or flow binds, but receive neither `call_mode` nor `expires_at_ms` so older readers continue to work.
+
 ## 0.27.2
 
 - Use the shared Windows named-pipe accessor and its process cache for HELLO and route-open; Unix remains on the inherited descriptor.

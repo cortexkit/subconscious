@@ -1,9 +1,5 @@
 # Changelog
 
-## 0.1.15
-
-- Coordinate the package version with the `subc-protocol` 0.31 call-mode release. No API or behavior change; consumers need no code changes, but path consumers must refresh their lockfile for the new package version.
-
 ## 0.1.14
 
 - Add PID-authenticated one-time Windows launch-nonce pipes and the cached `pipe` source. Reserve a protected, non-inheritable first instance before spawn, reject remote clients, and keep wrong-PID clients from receiving bytes. The current-user DACL grants read, synchronize and the write-attributes bit required by libuv, never generic write or pipe-instance creation.

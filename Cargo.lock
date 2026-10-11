@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "agent-token-vectors"
-version = "0.1.3"
+version = "0.1.2"
 dependencies = [
  "cortexkit-test-support",
  "ed25519-dalek",
@@ -622,7 +622,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1583,7 +1583,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1887,7 +1887,7 @@ checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 
 [[package]]
 name = "subc-cgroup"
-version = "0.1.7"
+version = "0.1.6"
 dependencies = [
  "cortexkit-test-support",
  "tokio",
@@ -1993,7 +1993,7 @@ dependencies = [
 
 [[package]]
 name = "subc-jobobject"
-version = "0.2.2"
+version = "0.2.1"
 dependencies = [
  "cortexkit-test-support",
  "tokio",
@@ -2002,7 +2002,7 @@ dependencies = [
 
 [[package]]
 name = "subc-jsonc"
-version = "0.1.3"
+version = "0.1.2"
 dependencies = [
  "serde_json",
 ]
@@ -2029,7 +2029,7 @@ dependencies = [
 
 [[package]]
 name = "subc-os"
-version = "0.1.15"
+version = "0.1.14"
 dependencies = [
  "cortexkit-test-support",
  "libc",
@@ -2041,7 +2041,7 @@ dependencies = [
 
 [[package]]
 name = "subc-presence"
-version = "0.1.1"
+version = "0.1.0"
 dependencies = [
  "block2",
  "objc2",
@@ -2079,7 +2079,7 @@ dependencies = [
 
 [[package]]
 name = "subc-uptime"
-version = "0.1.2"
+version = "0.1.1"
 dependencies = [
  "rustix",
  "windows-sys 0.61.2",
@@ -2134,7 +2134,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

@@ -4,6 +4,7 @@
 //! acquire the forwarding lock, and neither can hold up the policy timers.
 use std::{
     collections::{HashMap, VecDeque},
+    path::PathBuf,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -19,10 +20,55 @@ use tokio::{
 };
 
 use crate::{
+    caller_identity::CallerIdentity,
     forwarding::{ModuleEndpointId, ModuleRouteKey, RouteBinding},
     router::RouteCtx,
-    Frame,
+    ConnectionId, Frame,
 };
+
+/// Person declines of privileged client requests that start a cooldown when
+/// they all fall within `DECLINE_WINDOW` of the newest one.
+const DECLINE_LIMIT: usize = 3;
+const DECLINE_WINDOW: Duration = Duration::from_secs(10 * 60);
+/// Measured from the decline that started the cooldown. Refusals during the
+/// cooldown are not declines by a person, so they never extend it.
+const DECLINE_COOLDOWN: Duration = Duration::from_secs(10 * 60);
+
+/// Monotonic time for the repeated-decline cooldown. Tests replace it so the
+/// ten-minute window and cooldown can be crossed without waiting.
+pub(crate) type CooldownClock = Arc<dyn Fn() -> Instant + Send + Sync>;
+
+/// Who repeated person declines of privileged requests are counted against.
+/// The executable path keeps a reconnecting program under its cooldown; a
+/// caller whose executable could not be resolved is counted per connection,
+/// because nothing else the daemon owns ties its connections together.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum DeclineKey {
+    Executable(PathBuf),
+    Connection(ConnectionId),
+}
+
+impl DeclineKey {
+    pub(crate) fn for_caller(caller: &CallerIdentity, connection: ConnectionId) -> Self {
+        match caller.executable() {
+            Some(executable) => Self::Executable(executable.to_path_buf()),
+            None => Self::Connection(connection),
+        }
+    }
+}
+
+impl std::fmt::Display for DeclineKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Executable(path) => write!(f, "{}", path.display()),
+            Self::Connection(connection) => write!(
+                f,
+                "an unidentified local process on connection {}",
+                connection.get()
+            ),
+        }
+    }
+}
 
 /// A blocking provider publishes a withdraw handle as soon as one exists, then
 /// returns only when its prompt has ended. Publishing is allowed to be delayed:
@@ -245,7 +291,10 @@ fn valid_summary(summary: &str) -> bool {
 
 enum RequestKind {
     Module(ModuleRouteKey),
-    Privileged(Mutex<Option<oneshot::Sender<Outcome>>>),
+    Privileged {
+        answer: Mutex<Option<oneshot::Sender<Outcome>>>,
+        key: DeclineKey,
+    },
 }
 
 struct Request {
@@ -274,6 +323,11 @@ struct State {
     queue: VecDeque<Arc<Request>>,
     modules: HashMap<String, u64>,
     backoff: HashMap<(String, String), Instant>,
+    cooldown_clock: CooldownClock,
+    /// Recent person declines of privileged requests, oldest first.
+    declines: HashMap<DeclineKey, VecDeque<Instant>>,
+    /// When each privileged caller's cooldown ends.
+    cooldowns: HashMap<DeclineKey, Instant>,
     prompt: Option<Active>,
     stuck: bool,
     running: bool,
@@ -312,6 +366,9 @@ impl Default for OperatorConfirms {
                 queue: VecDeque::new(),
                 modules: HashMap::new(),
                 backoff: HashMap::new(),
+                cooldown_clock: Arc::new(Instant::now),
+                declines: HashMap::new(),
+                cooldowns: HashMap::new(),
                 prompt: None,
                 stuck: false,
                 running: false,
@@ -434,6 +491,8 @@ impl OperatorConfirms {
 
     /// Client-control approval shares the module confirmation queue and timers,
     /// but returns a decision to dispatch instead of sending an operator reply.
+    /// A caller in its repeated-decline cooldown is refused before anything else
+    /// is checked, without a prompt.
     pub(crate) async fn approve_privileged(
         self: &Arc<Self>,
         ctx: &RouteCtx,
@@ -441,11 +500,20 @@ impl OperatorConfirms {
         operation: &str,
         text: String,
         caller: String,
+        key: DeclineKey,
     ) -> Outcome {
         let (answer, receive) = oneshot::channel();
         let id = {
             let mut state = self.lock();
-            let refusal = if state.stuck {
+            let now = (state.cooldown_clock)();
+            state.cooldowns.retain(|_, until| *until > now);
+            state.declines.retain(|_, declines| {
+                declines.retain(|at| now.saturating_duration_since(*at) < DECLINE_WINDOW);
+                !declines.is_empty()
+            });
+            let refusal = if state.cooldowns.contains_key(&key) {
+                Some(Outcome::declined("backoff"))
+            } else if state.stuck {
                 Some(Outcome::unavailable("provider_stuck"))
             } else if state.queue.len() >= 4 {
                 Some(Outcome::unavailable("queue_full"))
@@ -473,7 +541,10 @@ impl OperatorConfirms {
                 summary: text.clone(),
                 principal: caller,
                 text,
-                kind: RequestKind::Privileged(Mutex::new(Some(answer))),
+                kind: RequestKind::Privileged {
+                    answer: Mutex::new(Some(answer)),
+                    key,
+                },
                 ctx: ctx.clone(),
                 frame: frame.clone(),
                 arrived: now,
@@ -537,9 +608,12 @@ impl OperatorConfirms {
             prompt,
             shown,
         );
-        if let RequestKind::Privileged(answer) = &request.kind {
+        if let RequestKind::Privileged { answer, key } = &request.kind {
             if let Some(answer) = answer.lock().unwrap_or_else(|p| p.into_inner()).take() {
                 let _ = answer.send(outcome);
+            }
+            if outcome.reason == "person" {
+                self.count_person_decline(state, key);
             }
             return;
         }
@@ -565,6 +639,37 @@ impl OperatorConfirms {
                 state.modules.remove(&request.module_id);
             }
         });
+    }
+
+    /// Only a person's decline at the prompt reaches here: withdrawals, timeouts
+    /// and unavailability commit other reasons. The prompt that recorded the
+    /// limit-reaching decline has already ended, so starting the cooldown only
+    /// refuses this caller's requests still waiting in the queue.
+    fn count_person_decline(self: &Arc<Self>, state: &mut State, key: &DeclineKey) {
+        let now = (state.cooldown_clock)();
+        let declines = state.declines.entry(key.clone()).or_default();
+        declines.retain(|at| now.saturating_duration_since(*at) < DECLINE_WINDOW);
+        declines.push_back(now);
+        if declines.len() < DECLINE_LIMIT {
+            return;
+        }
+        // Counting restarts after the cooldown instead of carrying old declines.
+        state.declines.remove(key);
+        state.cooldowns.insert(key.clone(), now + DECLINE_COOLDOWN);
+        tracing::warn!(target: "subc_daemon::operator_confirm", caller = %key,
+            cooldown_secs = DECLINE_COOLDOWN.as_secs(),
+            "privileged requests refused without a prompt after repeated operator declines");
+        let mut index = 0;
+        while index < state.queue.len() {
+            if matches!(&state.queue[index].kind,
+                RequestKind::Privileged { key: queued, .. } if queued == key)
+            {
+                let request = state.queue.remove(index).expect("queue index");
+                self.commit(state, request, Outcome::declined("backoff"), None, false);
+            } else {
+                index += 1;
+            }
+        }
     }
 
     fn withdraw_matching(
@@ -622,7 +727,10 @@ impl OperatorConfirms {
     }
     pub(crate) fn connection_closed(self: &Arc<Self>, connection: crate::ConnectionId) {
         self.withdraw_matching(
-            |r| matches!(r.kind, RequestKind::Privileged(_)) && r.ctx.connection_id == connection,
+            |r| {
+                matches!(r.kind, RequestKind::Privileged { .. })
+                    && r.ctx.connection_id == connection
+            },
             "caller_cancelled",
         );
     }

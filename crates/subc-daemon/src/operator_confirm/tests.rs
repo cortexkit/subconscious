@@ -1818,3 +1818,366 @@ async fn privileged_scripted_unavailable_refuses_restart() {
     )
     .await;
 }
+
+/// A provider whose every prompt waits until the test chooses its result.
+struct Stepped {
+    events: mpsc::UnboundedSender<Event>,
+    results: Mutex<std::sync::mpsc::Receiver<ProviderResult>>,
+    answers: Mutex<std::sync::mpsc::Sender<ProviderResult>>,
+}
+impl Stepped {
+    fn new() -> (Arc<Self>, mpsc::UnboundedReceiver<Event>) {
+        let (events, rx) = mpsc::unbounded_channel();
+        let (answers, results) = std::sync::mpsc::channel();
+        (
+            Arc::new(Self {
+                events,
+                results: Mutex::new(results),
+                answers: Mutex::new(answers),
+            }),
+            rx,
+        )
+    }
+    fn answer(&self, result: ProviderResult) {
+        self.answers.lock().unwrap().send(result).unwrap();
+    }
+}
+struct SteppedHandle(Arc<Stepped>);
+impl OperatorWithdraw for SteppedHandle {
+    fn withdraw(&self, reason: &str) {
+        self.0.events.send(Event::Withdraw(reason.into())).ok();
+        // The prompt returns a person's decline after it was withdrawn. The
+        // daemon has already answered, so this late decline must not count.
+        self.0.answer(ProviderResult::Declined);
+    }
+}
+impl OperatorProvider for Arc<Stepped> {
+    fn prompt(
+        &self,
+        text: &str,
+        publish: Box<dyn FnOnce(Arc<dyn OperatorWithdraw>) + Send>,
+    ) -> ProviderResult {
+        self.events.send(Event::Shown(text.into())).ok();
+        publish(Arc::new(SteppedHandle(self.clone())));
+        let result = self
+            .results
+            .lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap_or(ProviderResult::Unavailable);
+        self.events.send(Event::Returned).ok();
+        result
+    }
+}
+
+/// Replaces the cooldown's monotonic clock so tests can cross ten minutes.
+#[derive(Clone)]
+struct ManualClock(Arc<Mutex<Instant>>);
+impl ManualClock {
+    fn install(f: &Fixture) -> Self {
+        let clock = Self(Arc::new(Mutex::new(Instant::now())));
+        let reader = clock.clone();
+        f.forwarding.operator_confirms().lock().cooldown_clock =
+            Arc::new(move || *reader.0.lock().unwrap());
+        clock
+    }
+    fn advance(&self, by: Duration) {
+        *self.0.lock().unwrap() += by;
+    }
+}
+
+/// Real loopback endpoints whose OS lookup resolves to this test process, so
+/// every connection recorded with them is the same executable reconnecting.
+struct SelfCaller {
+    endpoints: (std::net::SocketAddr, std::net::SocketAddr),
+    executable: std::path::PathBuf,
+    _client: tokio::net::TcpStream,
+    _accepted: tokio::net::TcpStream,
+}
+async fn self_caller() -> SelfCaller {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let client = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+        .await
+        .unwrap();
+    let (accepted, _) = listener.accept().await.unwrap();
+    let endpoints = (
+        accepted.local_addr().unwrap(),
+        accepted.peer_addr().unwrap(),
+    );
+    let caller = tokio::task::spawn_blocking(move || {
+        CallerIdentity::lookup_endpoints(endpoints.0, endpoints.1)
+    })
+    .await
+    .unwrap();
+    SelfCaller {
+        endpoints,
+        executable: caller
+            .executable()
+            .expect("the test process resolves as its own caller")
+            .to_path_buf(),
+        _client: client,
+        _accepted: accepted,
+    }
+}
+
+/// A restart on a fresh connection, resolved to `caller` or left unidentified.
+fn restart_from(
+    f: &Fixture,
+    caller: Option<&SelfCaller>,
+    connection: u64,
+    corr: u64,
+) -> tokio::task::JoinHandle<Vec<Frame>> {
+    let (client, rx) = ctx_fn(connection);
+    f.handler
+        .record_caller_endpoints(client.connection_id, caller.map(|c| c.endpoints));
+    let handler = f.handler.clone();
+    tokio::spawn(async move {
+        let _rx = rx;
+        handler
+            .handle_control_frame(&client, restart(corr))
+            .await
+            .unwrap()
+    })
+}
+
+async fn person_decline(
+    f: &Fixture,
+    provider: &Stepped,
+    events: &mut mpsc::UnboundedReceiver<Event>,
+    caller: &SelfCaller,
+    connection: u64,
+) {
+    let task = restart_from(f, Some(caller), connection, connection);
+    assert!(matches!(event(events).await, Event::Shown(_)));
+    provider.answer(ProviderResult::Declined);
+    assert_eq!(event(events).await, Event::Returned);
+    let answer = decision(task).await;
+    assert_eq!(body(&answer)["code"], error_codes::OPERATOR_DECLINED);
+    assert_reason(&answer, "person");
+}
+
+async fn approved_after_prompt(
+    task: tokio::task::JoinHandle<Vec<Frame>>,
+    provider: &Stepped,
+    events: &mut mpsc::UnboundedReceiver<Event>,
+) -> String {
+    let Event::Shown(text) = event(events).await else {
+        panic!("the request must prompt")
+    };
+    provider.answer(ProviderResult::Approved);
+    assert_eq!(event(events).await, Event::Returned);
+    assert_eq!(
+        body(&decision(task).await)["code"],
+        "unknown_module",
+        "an approved request reaches the restart handler"
+    );
+    text
+}
+
+async fn refused_by_backoff(
+    f: &Fixture,
+    events: &mut mpsc::UnboundedReceiver<Event>,
+    caller: &SelfCaller,
+    connection: u64,
+) {
+    let answer = decision(restart_from(f, Some(caller), connection, connection)).await;
+    assert_eq!(body(&answer)["code"], error_codes::OPERATOR_DECLINED);
+    assert_reason(&answer, "backoff");
+    assert!(events.try_recv().is_err(), "no prompt during the cooldown");
+}
+
+const COOLDOWN_WARNING: &str =
+    "privileged requests refused without a prompt after repeated operator declines";
+
+#[tokio::test]
+async fn privileged_three_person_declines_from_one_executable_start_a_ten_minute_cooldown() {
+    let (provider, mut events) = Stepped::new();
+    let f = privileged_fixture(Arc::new(provider.clone()), OperatorLimits::default());
+    let clock = ManualClock::install(&f);
+    let caller = self_caller().await;
+    let (logs, _guard) = crate::router::test_log::log_capture(tracing::Level::INFO);
+    // Each decline comes over a different connection: the executable is the key.
+    person_decline(&f, &provider, &mut events, &caller, 900).await;
+    clock.advance(Duration::from_secs(5 * 60));
+    person_decline(&f, &provider, &mut events, &caller, 901).await;
+    clock.advance(Duration::from_secs(4 * 60 + 59));
+    assert!(!crate::router::test_log::captured_logs(&logs).contains(COOLDOWN_WARNING));
+    person_decline(&f, &provider, &mut events, &caller, 902).await;
+
+    let captured = crate::router::test_log::captured_logs(&logs);
+    let warnings: Vec<_> = captured
+        .lines()
+        .filter(|line| line.contains(COOLDOWN_WARNING))
+        .collect();
+    assert_eq!(warnings.len(), 1, "{captured}");
+    assert!(warnings[0].contains("WARN"), "{captured}");
+    assert!(
+        warnings[0].contains(&caller.executable.display().to_string()),
+        "{captured}"
+    );
+
+    // The fourth request on the same connection, then a reconnect.
+    refused_by_backoff(&f, &mut events, &caller, 902).await;
+    refused_by_backoff(&f, &mut events, &caller, 903).await;
+    let captured = crate::router::test_log::captured_logs(&logs);
+    let refusals: Vec<_> = captured
+        .lines()
+        .filter(|line| line.contains("operator_confirm_audit") && line.contains("backoff"))
+        .collect();
+    assert_eq!(refusals.len(), 2, "{captured}");
+    assert!(
+        refusals
+            .iter()
+            .all(|line| line.contains("prompt_shown=false")),
+        "{captured}"
+    );
+
+    // Another caller is not under this executable's cooldown.
+    let text =
+        approved_after_prompt(restart_from(&f, None, 904, 904), &provider, &mut events).await;
+    assert!(text.ends_with("an unidentified local process"), "{text}");
+
+    // Refusals near the end do not extend the cooldown, which ends ten
+    // minutes after the third decline.
+    clock.advance(Duration::from_secs(10 * 60 - 1));
+    refused_by_backoff(&f, &mut events, &caller, 905).await;
+    clock.advance(Duration::from_secs(1));
+    let text = approved_after_prompt(
+        restart_from(&f, Some(&caller), 906, 906),
+        &provider,
+        &mut events,
+    )
+    .await;
+    assert!(
+        text.contains(&format!("pid {}", std::process::id())),
+        "{text}"
+    );
+    assert_eq!(
+        crate::router::test_log::captured_logs(&logs)
+            .matches(COOLDOWN_WARNING)
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn privileged_declines_older_than_ten_minutes_slide_out_of_the_count() {
+    let (provider, mut events) = Stepped::new();
+    let f = privileged_fixture(Arc::new(provider.clone()), OperatorLimits::default());
+    let clock = ManualClock::install(&f);
+    let caller = self_caller().await;
+    person_decline(&f, &provider, &mut events, &caller, 910).await;
+    clock.advance(Duration::from_secs(60));
+    person_decline(&f, &provider, &mut events, &caller, 911).await;
+    clock.advance(Duration::from_secs(9 * 60));
+    // Ten minutes after the first decline, only two remain in the window.
+    person_decline(&f, &provider, &mut events, &caller, 912).await;
+    clock.advance(Duration::from_secs(30));
+    person_decline(&f, &provider, &mut events, &caller, 913).await;
+    refused_by_backoff(&f, &mut events, &caller, 914).await;
+}
+
+#[tokio::test]
+async fn privileged_withdrawals_timeouts_and_unavailability_do_not_count_toward_cooldown() {
+    let (provider, mut events) = Stepped::new();
+    let f = privileged_fixture(
+        Arc::new(provider.clone()),
+        OperatorLimits {
+            queue_wait: Duration::from_secs(150),
+            prompt_timeout: Duration::from_secs(2),
+            stuck_grace: Duration::from_secs(10),
+        },
+    );
+    let caller = self_caller().await;
+    person_decline(&f, &provider, &mut events, &caller, 920).await;
+
+    let disconnected = restart_from(&f, Some(&caller), 921, 921);
+    assert!(matches!(event(&mut events).await, Event::Shown(_)));
+    f.forwarding
+        .operator_confirms()
+        .connection_closed(ConnectionId::new(921));
+    assert_eq!(
+        event(&mut events).await,
+        Event::Withdraw("caller_cancelled".into())
+    );
+    assert_eq!(event(&mut events).await, Event::Returned);
+    assert_reason(&decision(disconnected).await, "caller_cancelled");
+
+    let timed_out = restart_from(&f, Some(&caller), 922, 922);
+    assert!(matches!(event(&mut events).await, Event::Shown(_)));
+    assert_eq!(event(&mut events).await, Event::Withdraw("timeout".into()));
+    assert_eq!(event(&mut events).await, Event::Returned);
+    assert_reason(&decision(timed_out).await, "timeout");
+
+    for (connection, result, reason) in [
+        (923, ProviderResult::Unavailable, "provider_error"),
+        (924, ProviderResult::NoPresence, "no_presence"),
+        (
+            925,
+            ProviderResult::UnsupportedPlatform,
+            "unsupported_platform",
+        ),
+    ] {
+        let task = restart_from(&f, Some(&caller), connection, connection);
+        assert!(matches!(event(&mut events).await, Event::Shown(_)));
+        provider.answer(result);
+        assert_eq!(event(&mut events).await, Event::Returned);
+        assert_reason(&decision(task).await, reason);
+    }
+
+    // Only the two person declines count, so this third one is still asked.
+    person_decline(&f, &provider, &mut events, &caller, 926).await;
+    person_decline(&f, &provider, &mut events, &caller, 927).await;
+    refused_by_backoff(&f, &mut events, &caller, 928).await;
+}
+
+#[tokio::test]
+async fn privileged_cooldown_refuses_queued_requests_from_that_executable_only() {
+    let (provider, mut events) = Stepped::new();
+    let f = privileged_fixture(Arc::new(provider.clone()), OperatorLimits::default());
+    let caller = self_caller().await;
+    person_decline(&f, &provider, &mut events, &caller, 930).await;
+    person_decline(&f, &provider, &mut events, &caller, 931).await;
+
+    let on_screen = restart_from(&f, Some(&caller), 932, 932);
+    assert!(matches!(event(&mut events).await, Event::Shown(_)));
+    let (logs, _guard) = crate::router::test_log::log_capture(tracing::Level::INFO);
+    let queued_same = restart_from(&f, Some(&caller), 933, 933);
+    let queued_other = restart_from(&f, None, 934, 934);
+    let queued_same_again = restart_from(&f, Some(&caller), 935, 935);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while f.forwarding.operator_confirms().lock().queue.len() != 3 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+
+    provider.answer(ProviderResult::Declined);
+    assert_eq!(event(&mut events).await, Event::Returned);
+    // The prompt on screen ends with the person's own answer.
+    assert_reason(&decision(on_screen).await, "person");
+    for task in [queued_same, queued_same_again] {
+        let answer = decision(task).await;
+        assert_eq!(body(&answer)["code"], error_codes::OPERATOR_DECLINED);
+        assert_reason(&answer, "backoff");
+    }
+    let text = approved_after_prompt(queued_other, &provider, &mut events).await;
+    assert!(text.ends_with("an unidentified local process"), "{text}");
+    assert!(
+        events.try_recv().is_err(),
+        "queued requests from the cooled-down executable are never shown"
+    );
+    let captured = crate::router::test_log::captured_logs(&logs);
+    let refusals: Vec<_> = captured
+        .lines()
+        .filter(|line| line.contains("operator_confirm_audit") && line.contains("backoff"))
+        .collect();
+    assert_eq!(refusals.len(), 2, "{captured}");
+    assert!(
+        refusals
+            .iter()
+            .all(|line| line.contains("prompt_shown=false")),
+        "{captured}"
+    );
+}

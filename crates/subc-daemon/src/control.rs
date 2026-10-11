@@ -2541,10 +2541,12 @@ impl ControlHandler {
                         "privileged request would prompt the operator");
                 }
                 PrivilegedOperatorPrompt::Enforce => {
+                    let key =
+                        crate::operator_confirm::DeclineKey::for_caller(&caller, ctx.connection_id);
                     let outcome = self
                         .forwarding
                         .operator_confirms()
-                        .approve_privileged(ctx, &frame, op, text, caller.description())
+                        .approve_privileged(ctx, &frame, op, text, caller.description(), key)
                         .await;
                     if outcome.code != "confirmed" {
                         return Ok(vec![outcome.frame(&frame)]);

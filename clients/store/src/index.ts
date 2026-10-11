@@ -13,3 +13,13 @@ export {
   moduleDataDir,
   moduleStorePath,
 } from "./derivation.js";
+export {
+  checkOwnerOnlyPath,
+  checkOwnerOnlyPathAsync,
+  type OwnerOnlyPathResult,
+  type OwnerOnlyPathOptions,
+  type OwnerOnlyPathAsyncOptions,
+  type OwnerOnlyPathMetadata,
+  type OwnerOnlyPathFileSystem,
+  type OwnerOnlyPathAsyncFileSystem,
+} from "./owner-only-path.js";

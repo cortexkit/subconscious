@@ -595,7 +595,7 @@ impl ActivityRead {
                 entries.push(entry);
             }
         }
-        entries.sort_unstable_by(|a, b| b.seq.cmp(&a.seq));
+        entries.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.seq));
         entries.truncate(request.limit as usize);
         Ok(ActivityQueryResponse {
             cursor: entries.last().map(|entry| entry.seq),

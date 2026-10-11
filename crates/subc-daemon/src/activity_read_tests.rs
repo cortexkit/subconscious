@@ -309,7 +309,7 @@ async fn activity_subscription_wire_lag_error_follows_all_queued_entries() {
                 parse_error(&frame)["code"],
                 subc_control::ACTIVITY_SUBSCRIBER_LAGGED
             );
-            assert!(last >= 256 && last < 300);
+            assert!((256..300).contains(&last));
             break;
         }
         assert_eq!(frame.header.ty, FrameType::StreamData);

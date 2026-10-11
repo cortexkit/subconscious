@@ -50,7 +50,9 @@ inputs:
 runs:
   using: composite
   steps:
-    - uses: actions/setup-node@v5
+    # Pinned to a commit, not a tag: this action runs inside workflows that hold
+    # privileged tokens, and a tag can be moved to point at different code.
+    - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
       with:
         node-version: "24"
 

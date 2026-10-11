@@ -28,6 +28,7 @@ import {
   type ManifestInput,
   type ManifestProvenance,
   type ProviderConnectionState,
+  type RouteBindRequest,
   type SubcProviderConnectOptions,
 } from "../src/index.js";
 import { LaunchNonceError, resetLaunchNonceForTests } from "../src/launch-nonce.js";
@@ -684,6 +685,82 @@ describe("SubcProvider serve loop", () => {
     expect(bound).toEqual([
       { channel: stamped.route_channel as number, epoch: stamped.epoch as number },
     ]);
+  });
+
+  test("accepts route.bind goldens with unread call_mode and scope expires_at_ms", async () => {
+    // Exercise the provider's real projection: parsing a fixture by itself would
+    // not detect a serve-loop regression that rejects new bind fields.
+    for (const mode of ["classic", "codemode", "flow"] as const) {
+      const stamped = JSON.parse(
+        readFileSync(
+          join(
+            import.meta.dir,
+            `../../../crates/subc-protocol/tests/golden/module_control_request_route_bind_with_call_mode_${mode}.json`,
+          ),
+          "utf8",
+        ),
+      ) as Record<string, unknown>;
+      expect(stamped.call_mode).toBe(mode);
+      if (mode === "classic") {
+        expect(stamped.scope).toBeUndefined();
+      } else {
+        expect((stamped.scope as Record<string, unknown>).expires_at_ms).toBe(1725000030000);
+      }
+
+      const writes: Frame[] = [];
+      const sock = fakeWritableSocket(writes);
+      const bound: { channel: number; epoch: number }[] = [];
+      const bindRequests: RouteBindRequest[] = [];
+      const provider = Object.create(SubcProvider.prototype) as {
+        sock: unknown;
+        generation: number;
+        closeStarted: boolean;
+        closedErr: Error | null;
+        liveRoutes: Map<number, RouteHandle>;
+        connectionToken: object;
+        opts: {
+          onBind: (request: RouteBindRequest) => void;
+          onBound: (handle: RouteHandle) => void;
+        };
+        handleControlRequest(frame: Frame, sock: unknown, generation: number): Promise<void>;
+      };
+      provider.sock = sock;
+      provider.generation = 1;
+      provider.closeStarted = false;
+      provider.closedErr = null;
+      provider.liveRoutes = new Map();
+      provider.connectionToken = newConnectionToken();
+      provider.opts = {
+        onBind: (request) => { bindRequests.push(request); },
+        onBound: (handle) => { bound.push({ channel: handle.channel, epoch: handle.epoch }); },
+      };
+
+      await provider.handleControlRequest(
+        buildFrame(FrameType.Request, CONTROL_FLAGS, 0, 0, 44n, encodeJson(stamped)),
+        sock,
+        1,
+      );
+      expect(writes).toHaveLength(1);
+      expect(writes[0]!.header.ty).toBe(FrameType.Response);
+      expect(writes[0]!.header.corr).toBe(44n);
+      expect(parseJson(writes[0]!.body)).toEqual({ op: "route.bind" });
+      expect(bound).toEqual([{ channel: 42, epoch: 7 }]);
+      expect(provider.liveRoutes.get(42)?.epoch).toBe(7);
+      expect(bindRequests).toHaveLength(1);
+      const request = bindRequests[0]!;
+      expect(request.handle).toBe(provider.liveRoutes.get(42)!);
+      expect(request.target).toEqual({ kind: "tool_provider", module_id: "aft-tools" });
+      expect(request.identity).toEqual({
+        harness: "opencode",
+        project_root: "/tmp/subc/project",
+        session: "session-0001",
+      });
+      expect(request.principal).toEqual(
+        mode === "classic" ? { kind: "direct" } : { kind: "reserved", module_id: "broca" },
+      );
+      expect("call_mode" in request).toBe(false);
+      expect("scope" in request).toBe(false);
+    }
   });
 
   // onRouteGone is consumer code awaited inside the read loop. A throw from it

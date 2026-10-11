@@ -1165,7 +1165,7 @@ async fn privileged_registered_module_restart_is_unsupported_in_both_modes() {
         );
         let m = f.module("module-caller", 803, "nonce").await;
         #[cfg(unix)]
-        let target = supervised_privileged_target(&f);
+        let target = supervised_privileged_target(&f).await;
         #[cfg(unix)]
         let before = target.status().unwrap();
         let frames = f
@@ -1329,7 +1329,7 @@ fn privileged_child_waits_until_supervisor_teardown() {
 }
 
 #[cfg(unix)]
-fn supervised_privileged_target(f: &Fixture) -> crate::supervise::SupervisedModule {
+async fn supervised_privileged_target(f: &Fixture) -> crate::supervise::SupervisedModule {
     let registry = Arc::new(Registry::default());
     let supervisor = crate::Supervisor::new_for_test(registry, crate::RestartPolicy::default())
         .with_handle(f.supervisor.clone());
@@ -1347,7 +1347,19 @@ fn supervised_privileged_target(f: &Fixture) -> crate::supervise::SupervisedModu
         protocol: subc_control::ModuleProtocol::None,
         overlap: crate::supervise::ModuleOverlap::Exclusive,
     };
-    supervisor.supervise_configured(spec, true).unwrap()
+    let module = supervisor.supervise_configured(spec, true).unwrap();
+    // On macOS the supervisor withholds the pid until the privacy trampoline
+    // confirms the exec, so a test comparing pids before and after a restart
+    // must start from a child whose pid is already published.
+    let deadline = std::time::Instant::now() + Duration::from_secs(4);
+    while module.status().unwrap().pid.is_none() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the supervised child never published its pid"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    module
 }
 
 #[cfg(unix)]
@@ -1356,7 +1368,7 @@ async fn privileged_restart_approval_restarts_only_the_received_target() {
     let (provider, mut events) =
         Controlled::new(ProviderResult::Approved, false, false, Duration::ZERO);
     let f = privileged_fixture(Arc::new(provider.clone()), OperatorLimits::default());
-    let module = supervised_privileged_target(&f);
+    let module = supervised_privileged_target(&f).await;
     let before = module.status().unwrap();
     let (client, _rx) = ctx_fn(830);
     let task = held_restart(&f, client, 145);
@@ -1391,7 +1403,7 @@ async fn privileged_restart_decline_leaves_the_running_process_unchanged() {
         Arc::new(Immediate(ProviderResult::Declined)),
         OperatorLimits::default(),
     );
-    let module = supervised_privileged_target(&f);
+    let module = supervised_privileged_target(&f).await;
     let before = module.status().unwrap();
     let (client, _rx) = ctx_fn(831);
     let answer = decision(held_restart(&f, client, 146)).await;
@@ -1412,7 +1424,7 @@ async fn privileged_restart_unavailable_leaves_the_running_process_unchanged() {
         Arc::new(Immediate(ProviderResult::Unavailable)),
         OperatorLimits::default(),
     );
-    let module = supervised_privileged_target(&f);
+    let module = supervised_privileged_target(&f).await;
     let before = module.status().unwrap();
     let (client, _rx) = ctx_fn(832);
     let answer = decision(held_restart(&f, client, 147)).await;
@@ -1500,7 +1512,7 @@ async fn privileged_disconnect_withdraws_prompt_and_discards_late_approval() {
         Controlled::new(ProviderResult::Approved, false, false, Duration::ZERO);
     let f = privileged_fixture(Arc::new(provider.clone()), OperatorLimits::default());
     #[cfg(unix)]
-    let module = supervised_privileged_target(&f);
+    let module = supervised_privileged_target(&f).await;
     #[cfg(unix)]
     let before = module.status().unwrap();
     let router = Arc::new(crate::Router::with_control_handler(f.handler.clone()));

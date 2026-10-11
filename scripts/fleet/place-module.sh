@@ -100,7 +100,7 @@ set -euo pipefail
 
 STAGING="${CK_STAGING:-$HOME/.local/share/cortexkit/staging}"
 BIN_DIR="${CK_BIN_DIR:-$HOME/.local/share/cortexkit/bin}"
-MODULE=""; STAGED=""; DEST=""; PATH_FACE=""; MARKER=""; CONTROL=""; OLD_CONTROL=""; GONE=""; RESTART=1; PLACE=0; OLDER=0; MIGRATES=""; NEW_REQUIREMENT=""; ALLOW_UNHARDENED=0; ALLOW_UNSTRIPPED=0; INSTALL=0
+MODULE=""; STAGED=""; DEST=""; PATH_FACE=""; MARKER=""; CONTROL=""; OLD_CONTROL=""; GONE=""; RESTART=1; PLACE=0; OLDER=0; MIGRATES=""; NEW_REQUIREMENT=""; ALLOW_UNHARDENED=0; ALLOW_UNSTRIPPED=0; ALLOW_UNSTAMPED=0; INSTALL=0
 
 while (($# > 0)); do
   case "$1" in
@@ -125,6 +125,10 @@ while (($# > 0)); do
     # are built stripped; this lets an incident placement of an unstripped build
     # through on purpose.
     --allow-unstripped) ALLOW_UNSTRIPPED=1; shift ;;
+    # A build that stamps no commit (it was built from a dirty tree, or outside
+    # git) cannot prove which source it came from. This lets one through on
+    # purpose, for an incident; the output says it was unstamped.
+    --allow-unstamped) ALLOW_UNSTAMPED=1; shift ;;
     --before) BEFORE_CMD="$2"; shift 2 ;;
     # A card that MIGRATES THE STORE cannot be rolled back by binary alone: the
     # old binary meets a newer schema and refuses on store_ahead, which is the
@@ -486,6 +490,59 @@ else
     say "currency: INFERRED from mtime (no ck-$CUR.current); $staged_base is newest"
   fi
 fi
+
+# The sidecar and the currency declaration prove the bytes are the staged file
+# the owner named; they do not prove those bytes were built from the commit the
+# owner named. A module's `--manifest` reports its build provenance: the commit
+# it was built from, or why it stamped none (a dirty tree declines to stamp).
+# Entorhinal 0.1.22 and 0.1.23 were both placed from dirty trees, attesting no
+# commit, and nothing here noticed. So: refuse an unstamped build, and refuse a
+# stamped commit that disagrees with the declared revision, unless
+# --allow-unstamped is given on purpose.
+#
+# The probe runs the staged binary with only `--manifest`, under a throwaway
+# XDG home and a 5 s alarm, so a binary that does not know the flag cannot touch
+# real stores or hang the gate. A binary that does not answer is reported as
+# unchecked rather than refused: not every module serves `--manifest` yet.
+prov_home=$(mktemp -d)
+prov_json=$(XDG_DATA_HOME="$prov_home/data" XDG_RUNTIME_DIR="$prov_home/run" XDG_CONFIG_HOME="$prov_home/config" \
+  perl -e 'alarm 5; exec @ARGV' "$STAGED" --manifest 2>/dev/null </dev/null) || prov_json=""
+rm -rf "$prov_home"
+prov_line=$(printf '%s' "$prov_json" | python3 -c '
+import json, sys
+try:
+    p = json.load(sys.stdin).get("provenance") or {}
+except Exception:
+    print("unreported"); sys.exit(0)
+sha = p.get("build_git_sha") or ""
+why = p.get("build_git_sha_absence_reason") or ""
+print("stamped " + sha if sha else ("unstamped " + why if why else "unreported"))
+' 2>/dev/null || echo unreported)
+case "$prov_line" in
+  "stamped "*)
+    stamped=${prov_line#stamped }
+    if [ -n "${want_rev:-}" ]; then
+      n=${#stamped}; [ ${#want_rev} -lt "$n" ] && n=${#want_rev}
+      if [ "${stamped:0:$n}" = "${want_rev:0:$n}" ]; then
+        say "provenance: built from ${stamped:0:12}, matching the declared revision"
+      elif [ "$ALLOW_UNSTAMPED" -eq 1 ]; then
+        say "provenance: built from ${stamped:0:12}, NOT the declared ${want_rev:0:12} (--allow-unstamped given)"
+      else
+        refuse "staged binary was built from ${stamped:0:12}, but the currency declaration names revision ${want_rev:0:12}. Rebuild from the declared commit, fix the declaration, or pass --allow-unstamped on purpose"
+      fi
+    else
+      say "provenance: built from ${stamped:0:12}; no declared revision to compare (the declaration has no revision=)"
+    fi ;;
+  "unstamped "*)
+    why=${prov_line#unstamped }
+    if [ "$ALLOW_UNSTAMPED" -eq 1 ]; then
+      say "provenance: build stamps no commit ($why); placed unstamped by request (--allow-unstamped)"
+    else
+      refuse "staged binary stamps no commit ($why), so it cannot prove which source it was built from. Rebuild from a clean tree, or pass --allow-unstamped on purpose"
+    fi ;;
+  *)
+    say "provenance: not checked (the binary did not answer --manifest)" ;;
+esac
 
 # Signing posture must match the running image: an ad-hoc re-sign of a Developer ID
 # binary silently revokes its macOS TCC grants, and the reverse is a surprise too.

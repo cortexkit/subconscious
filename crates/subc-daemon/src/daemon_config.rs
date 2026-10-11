@@ -8,6 +8,7 @@ use std::{
     time::Duration,
 };
 
+pub use crate::activity::ActivityConfig;
 use cortexkit_log::Retention;
 use serde::Deserialize;
 use subc_control::ModuleProtocol;
@@ -371,6 +372,8 @@ pub enum DaemonConfigError {
 struct RawDaemonConfig {
     version: u32,
     #[serde(default)]
+    activity: ActivityConfig,
+    #[serde(default)]
     port: Option<u16>,
     #[serde(default)]
     drain_timeout_ms: Option<u64>,
@@ -549,6 +552,19 @@ pub fn load(path: impl AsRef<Path>) -> Result<Option<DaemonConfig>, DaemonConfig
     parse_doc(&doc, path).map(Some)
 }
 
+/// Load module configuration and activity retention from the same document.
+/// Reading once prevents an edit between reads from mixing two configurations
+/// during rescan, without adding fields to the public `DaemonConfig` struct.
+pub fn load_with_activity(
+    path: impl AsRef<Path>,
+) -> Result<Option<(DaemonConfig, ActivityConfig)>, DaemonConfigError> {
+    let path = path.as_ref();
+    let Some(doc) = read_config_doc(path)? else {
+        return Ok(None);
+    };
+    parse_doc_with_activity(&doc, path).map(Some)
+}
+
 /// Loads only the daemon-wide logging block for tracing initialization.
 ///
 /// The daemon installs its global subscriber before bootstrap parses the full
@@ -713,6 +729,13 @@ fn read_config_doc(path: &Path) -> Result<Option<String>, DaemonConfigError> {
 }
 
 fn parse_doc(doc: &str, path: &Path) -> Result<DaemonConfig, DaemonConfigError> {
+    parse_doc_with_activity(doc, path).map(|(config, _)| config)
+}
+
+fn parse_doc_with_activity(
+    doc: &str,
+    path: &Path,
+) -> Result<(DaemonConfig, ActivityConfig), DaemonConfigError> {
     let json = jsonc_to_json(doc).map_err(|message| DaemonConfigError::InvalidJsonc {
         path: path.to_path_buf(),
         message,
@@ -908,18 +931,27 @@ fn parse_doc(doc: &str, path: &Path) -> Result<DaemonConfig, DaemonConfigError> 
         })
         .transpose()?;
 
-    Ok(DaemonConfig {
-        path: path.to_path_buf(),
-        port: raw.port,
-        drain_timeout_ms: default_drain_timeout_ms,
-        route_bind_relay_timeout_ms: default_route_bind_relay_timeout_ms,
-        modules,
-        storage,
-        admission_facts_carrier_module_id: raw.admission_facts_carrier_module_id,
-        admission_facts_targets: raw.admission_facts_targets,
-        scope_authority_owners,
-        reserved_capabilities: raw.reserved_capabilities,
-    })
+    if raw.activity.max_age_days == 0 || raw.activity.max_total_mb == 0 {
+        return Err(DaemonConfigError::InvalidValue {
+            path: path.to_path_buf(),
+            message: "activity.max_age_days and activity.max_total_mb must be positive".into(),
+        });
+    }
+    Ok((
+        DaemonConfig {
+            path: path.to_path_buf(),
+            port: raw.port,
+            drain_timeout_ms: default_drain_timeout_ms,
+            route_bind_relay_timeout_ms: default_route_bind_relay_timeout_ms,
+            modules,
+            storage,
+            admission_facts_carrier_module_id: raw.admission_facts_carrier_module_id,
+            admission_facts_targets: raw.admission_facts_targets,
+            scope_authority_owners,
+            reserved_capabilities: raw.reserved_capabilities,
+        },
+        raw.activity,
+    ))
 }
 
 fn parse_logging_config(
@@ -2773,5 +2805,54 @@ mod tests {
     fn reject_unterminated_block_comment() {
         let err = parse_doc(r#"{ "version": 1, /*"#, Path::new("subc.jsonc")).unwrap_err();
         assert!(matches!(err, DaemonConfigError::InvalidJsonc { .. }));
+    }
+}
+
+#[cfg(test)]
+mod activity_config_tests {
+    use super::*;
+
+    #[test]
+    fn activity_config_defaults_partial_overrides_and_positive_bounds() {
+        let path = Path::new("subc.jsonc");
+        let default = parse_doc_with_activity(r#"{"version":1,"modules":{}}"#, path).unwrap();
+        assert_eq!(
+            default.1,
+            ActivityConfig {
+                max_age_days: 30,
+                max_total_mb: 64
+            }
+        );
+        let changed = parse_doc_with_activity(
+            r#"{"version":1,"activity":{"max_age_days":7,"max_total_mb":8}}"#,
+            path,
+        )
+        .unwrap();
+        assert_eq!(
+            changed.1,
+            ActivityConfig {
+                max_age_days: 7,
+                max_total_mb: 8
+            }
+        );
+        let partial =
+            parse_doc_with_activity(r#"{"version":1,"activity":{"max_age_days":7}}"#, path)
+                .unwrap();
+        assert_eq!(
+            partial.1,
+            ActivityConfig {
+                max_age_days: 7,
+                max_total_mb: 64
+            }
+        );
+        for doc in [
+            r#"{"version":1,"activity":{"max_age_days":0}}"#,
+            r#"{"version":1,"activity":{"max_total_mb":0}}"#,
+        ] {
+            assert!(parse_doc(doc, path).is_err());
+        }
+        assert!(!RestartRequiredSection::ALL
+            .iter()
+            .any(|section| section.label() == "activity"));
     }
 }

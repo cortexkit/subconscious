@@ -386,10 +386,10 @@ async fn supervisor_provenance_reports_declared_and_observed_module_facts() {
     module.stop().await.unwrap();
 }
 
-/// A reserved module the supervisor spawns reads its launch nonce from the
-/// descriptor the spawn hands it: it is admitted, which a reserved module is
-/// only with its exact spawn nonce in HELLO, and its declared provenance says
-/// the nonce came from `fd` even though the environment copy is set too.
+/// A reserved module must echo its exact spawn nonce to register. Its cached
+/// provenance must name the inherited Unix descriptor or the Windows pipe,
+/// rather than the environment copy Windows still offers for older modules
+/// whose readers have not adopted the pipe.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn supervisor_provenance_reports_a_reserved_module_reading_its_nonce_from_the_descriptor() {
     let process_liveness = Arc::new(SupervisorProcessLiveness::new());
@@ -430,10 +430,17 @@ async fn supervisor_provenance_reports_a_reserved_module_reading_its_nonce_from_
     };
     let expected = if cfg!(unix) {
         LaunchNonceSource::Fd
+    } else if cfg!(windows) {
+        LaunchNonceSource::Pipe
     } else {
         LaunchNonceSource::Env
     };
     assert_eq!(build.launch_nonce_source, Some(expected));
+    #[cfg(windows)]
+    assert_eq!(
+        modules[0].daemon_observed.launch_nonce_source.as_deref(),
+        Some("pipe")
+    );
     module.stop().await.unwrap();
 }
 

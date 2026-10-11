@@ -29,7 +29,7 @@ serde_json = "1"
 sha2 = "0.10"
 subc-control = { path = "../subc-control", version = "0.29.3" }
 subc-jsonc = { path = "../subc-jsonc", version = "0.1.0" }
-subc-os = { path = "../subc-os", version = "0.1.13", features = ["tokio"] }
+subc-os = { path = "../subc-os", version = "0.1.14", features = ["tokio"] }
 subc-protocol = { path = "../subc-protocol", version = "0.30.2" }
 subc-transport = { path = "../subc-transport", version = "0.11.1" }
 subc-uptime = { path = "../subc-uptime", version = "0.1.0" }
@@ -57,7 +57,7 @@ subc-presence = { path = "../subc-presence", version = "0.1.0" }
 rustix = { version = "1", default-features = false, features = ["process"] }
 
 [dev-dependencies]
-subc-os = { path = "../subc-os", version = "0.1.13", features = ["test-support"] }
+subc-os = { path = "../subc-os", version = "0.1.14", features = ["test-support"] }
 cortexkit-test-support = "0.1.3"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 loom = "0.7"

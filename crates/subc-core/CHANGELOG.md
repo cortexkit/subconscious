@@ -3,6 +3,7 @@
 ## 0.20.77
 
 - Show daemon-observed Windows launch-nonce sources in module list, status and provenance alongside the running-image and resource reports. Update exact CLI expectations for the Windows `pipe` column and lines; Unix output stays unchanged when the observation is absent.
+- Require exact `pipe` provenance from a reserved Windows module, including the daemon-observed source; Unix still requires `fd`.
 
 ## 0.20.76
 

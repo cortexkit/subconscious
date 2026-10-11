@@ -230,9 +230,9 @@ describe("required labels", () => {
       assert.equal(result.conclusion, "failure");
       assert.equal(state.checkRuns[0].conclusion, "failure");
       assert.equal(warnings.length, 2);
-      for (const warning of warnings) assert.match(warning, /CK CI App needs Issues: write permission/);
+      for (const warning of warnings) assert.match(warning, /the token needs Issues: write permission/);
       assert.match(state.comments[0].body, /Gate labels \(`design-approved`, `trivial`\) could not be created/);
-      assert.match(state.comments[0].body, /grant the CK CI App Issues: write permission/);
+      assert.match(state.comments[0].body, /create them by hand once/);
     });
   }
 
@@ -1432,15 +1432,22 @@ describe("workflow security properties", () => {
     assert.equal(invokesGit("cd /tmp && git checkout $REF"), true);
   });
 
-  // This arm used to read "the gate step must not mention secrets.GITHUB_TOKEN
-  // at all", which was the right claim while the step took one token. It now
-  // takes two, and the whole point of the second one is that it IS
-  // secrets.GITHUB_TOKEN, so the claim is made per input instead: the app
-  // token still does the writes that need it, and the required check run is
-  // published with the calling job's own token so that blocking a pull
-  // request depends on nothing outside this workflow.
-  test("pull-request job gives the App token to github-token and GITHUB_TOKEN to check-token", () => {
+  // The gate runs in public repositories, so it must hold no credential beyond
+  // its own job's GITHUB_TOKEN: an App private key reachable from a
+  // `pull_request_target` job in a public repository is one bug away from
+  // exposing every repository that App can read. Under `pull_request_target`
+  // the job token carries the declared write scopes even for fork pull
+  // requests, so both the writes and the required check run use it.
+  test("pull-request job runs every write on the job's own GITHUB_TOKEN and mints no App token", () => {
     const workflowYaml = gateFileYaml(GATE_FILES[0]);
+    assert.ok(
+      !stripCommentLines(workflowYaml).includes("create-github-app-token"),
+      "the gate must not mint an App token",
+    );
+    assert.ok(
+      !/CK_CI_/.test(stripCommentLines(workflowYaml)),
+      "the gate must neither declare nor read the CK CI App secrets",
+    );
 
     // Isolate the pull-request job (design-gate)
     const prJobMatch = workflowYaml.match(
@@ -1448,15 +1455,6 @@ describe("workflow security properties", () => {
     );
     assert.ok(prJobMatch, "design-gate job must be present in workflow");
     const prJobYaml = prJobMatch[1];
-
-    // Find the App token step id
-    const appTokenStepMatch =
-      prJobYaml.match(/id:\s*([a-zA-Z0-9_-]+)\s*\n\s*uses:\s*actions\/create-github-app-token/m) ||
-      prJobYaml.match(
-        /uses:\s*actions\/create-github-app-token[^\n]*\n[\s\S]*?id:\s*([a-zA-Z0-9_-]+)/m,
-      );
-    assert.ok(appTokenStepMatch, "must have an actions/create-github-app-token step with an id");
-    const appTokenId = appTokenStepMatch[1];
 
     // The gate now runs as a composite action rather than an inline `run:`, so
     // the token arrives as the action's `github-token` input.
@@ -1473,14 +1471,8 @@ describe("workflow security properties", () => {
     const checkTokenValue = gateStep.match(/check-token:\s*(.+)/)?.[1] ?? "";
 
     assert.ok(
-      !githubTokenValue.includes("secrets.GITHUB_TOKEN"),
-      `the comment and draft conversion must run on the App token (found: ${githubTokenValue})`,
-    );
-
-    const expectedOutput = `steps.${appTokenId}.outputs.token`;
-    assert.ok(
-      githubTokenValue.includes(expectedOutput),
-      `github-token must reference ${expectedOutput} (found: ${githubTokenValue})`,
+      githubTokenValue.includes("secrets.GITHUB_TOKEN"),
+      `the comment and draft conversion must run on the job's own GITHUB_TOKEN (found: ${githubTokenValue})`,
     );
 
     assert.ok(

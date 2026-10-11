@@ -1756,15 +1756,18 @@ impl ControlHandler {
             // The forwarding table gates all providers at the start of daemon
             // shutdown, before their connections are closed. An ordinary
             // module disconnect still reports crash if that gate is not set.
-            let reason = match self.forwarding.is_daemon_draining() {
-                Ok(true) => RouteCloseReason::Restart,
-                Ok(false) => RouteCloseReason::Crash,
+            let (reason, drained) = match self
+                .forwarding
+                .daemon_drain_result_for_connection(connection_id)
+            {
+                Ok(Some(drained)) => (RouteCloseReason::Restart, drained),
+                Ok(None) => (RouteCloseReason::Crash, false),
                 Err(err) => {
                     warn!(error = %err, "failed to read daemon drain state; reporting crash conservatively");
-                    RouteCloseReason::Crash
+                    (RouteCloseReason::Crash, false)
                 }
             };
-            (module_id, routes, reason, terminal)
+            (module_id, routes, reason, drained, terminal)
         });
         let registrations = self.deregister_connection(connection_id, end_reason);
         let cleanup = if crash_closed.is_some() {
@@ -1786,7 +1789,7 @@ impl ControlHandler {
         // teardown knows how many pending route.bind relays it aborted. It still
         // goes out before the GOODBYEs for the released routes, and its targets
         // were captured above, before teardown removed those routes.
-        if let Some((module_id, routes, reason, terminal)) = crash_closed {
+        if let Some((module_id, routes, reason, drained, terminal)) = crash_closed {
             let abandoned = cleanup
                 .as_ref()
                 .map_or(0, |cleanup| cleanup.abandoned_relays);
@@ -1797,7 +1800,7 @@ impl ControlHandler {
                     module_id,
                     channels: Vec::new(),
                     reason,
-                    drained: false,
+                    drained,
                     abandoned,
                     excluded_subscriptions: 0,
                     terminal: Some(terminal),
@@ -12097,6 +12100,171 @@ mod tests {
         );
         assert_eq!(client_rx.try_recv().unwrap().header.ty, FrameType::Goodbye);
         assert_eq!(handler.forwarding.active_binding_count().unwrap(), 0);
+    }
+
+    struct RouteClosedFixture {
+        handler: ControlHandler,
+        #[cfg(unix)]
+        supervisor: Supervisor,
+        module_ctx: RouteCtx,
+        #[cfg(unix)]
+        module_rx: mpsc::Receiver<crate::router::OutboundFrame>,
+        client_rx: mpsc::Receiver<crate::router::OutboundFrame>,
+        route: Arc<crate::forwarding::RouteBinding>,
+    }
+
+    async fn route_closed_fixture() -> RouteClosedFixture {
+        let registry = Arc::new(Registry::default());
+        let handler = ControlHandler::new(Arc::clone(&registry));
+        #[cfg(unix)]
+        let supervisor = Supervisor::new(registry, RestartPolicy::default())
+            .with_forwarding(Arc::clone(&handler.forwarding));
+        let (module_ctx, mut module_rx) = route_ctx(ConnectionId::new(701));
+        register_capability_manifest(
+            &handler,
+            &module_ctx,
+            &mut module_rx,
+            capability_manifest("prov", &[], &[]),
+            1,
+        )
+        .await;
+        let (client_rx, bind) = open_route_for_capability_test(
+            &handler,
+            &module_ctx,
+            &mut module_rx,
+            702,
+            2,
+            "prov",
+            None,
+        )
+        .await;
+        let ModuleControlRequest::RouteBind {
+            route_channel: channel,
+            epoch: route_epoch,
+            ..
+        } = bind
+        else {
+            panic!("expected route.bind");
+        };
+        let crate::forwarding::DataRoute::Module(crate::forwarding::DataRouteState::Bound(route)) =
+            handler
+                .forwarding
+                .lookup_data_route(module_ctx.connection_id, channel, route_epoch)
+                .unwrap()
+        else {
+            panic!("the acknowledged route must be bound");
+        };
+        RouteClosedFixture {
+            handler,
+            #[cfg(unix)]
+            supervisor,
+            module_ctx,
+            #[cfg(unix)]
+            module_rx,
+            client_rx,
+            route,
+        }
+    }
+
+    impl RouteClosedFixture {
+        #[cfg(unix)]
+        async fn cut(&mut self) {
+            let notices = async {
+                let mut draining = self.module_rx.recv().await.unwrap();
+                assert!(matches!(
+                    serde_json::from_slice::<subc_protocol::session::ModuleControlCommand>(
+                        &draining.body
+                    )
+                    .unwrap(),
+                    subc_protocol::session::ModuleControlCommand::Draining {
+                        reason: RouteCloseReason::Restart,
+                        ..
+                    }
+                ));
+                draining.flushed.take().unwrap().send(()).unwrap();
+                let mut closing = self.client_rx.recv().await.unwrap();
+                assert!(matches!(
+                    serde_json::from_slice::<ClientControlPush>(&closing.body).unwrap(),
+                    ClientControlPush::RouteClosing {
+                        reason: RouteCloseReason::Restart,
+                        ..
+                    }
+                ));
+                closing.flushed.take().unwrap().send(()).unwrap();
+            };
+            let (result, ()) = tokio::join!(self.supervisor.drain_for_daemon_shutdown(), notices);
+            result.unwrap();
+        }
+
+        fn disconnect(&mut self) -> ClientControlPush {
+            self.handler
+                .cleanup_connection(self.module_ctx.connection_id)
+                .unwrap();
+            let closed = self.client_rx.try_recv().unwrap();
+            assert_eq!(closed.header.ty, FrameType::Push);
+            let push = serde_json::from_slice::<ClientControlPush>(&closed.body).unwrap();
+            assert!(matches!(
+                &push,
+                ClientControlPush::RouteClosed { channels, abandoned: 0, .. }
+                    if channels == &[self.route.client_channel]
+            ));
+            assert_eq!(
+                self.client_rx.try_recv().unwrap().header.ty,
+                FrameType::Goodbye
+            );
+            assert_eq!(self.handler.forwarding.active_binding_count().unwrap(), 0);
+            push
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn daemon_cut_quiet_routes_report_restart_and_drained() {
+        let mut fixture = route_closed_fixture().await;
+        fixture.cut().await;
+        assert!(matches!(
+            fixture.disconnect(),
+            ClientControlPush::RouteClosed {
+                reason: RouteCloseReason::Restart,
+                drained: true,
+                ..
+            }
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn daemon_cut_in_flight_past_budget_reports_restart_and_not_drained() {
+        let mut fixture = route_closed_fixture().await;
+        fixture.route.flow.acquire_tagged(99, false).await.unwrap();
+        let started = tokio::time::Instant::now();
+        fixture.cut().await;
+        assert!(started.elapsed() >= Duration::from_secs(2));
+        assert_eq!(fixture.route.flow.in_flight(), 1);
+        assert!(matches!(
+            fixture.disconnect(),
+            ClientControlPush::RouteClosed {
+                reason: RouteCloseReason::Restart,
+                drained: false,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn module_connection_crash_reports_crash_and_not_drained() {
+        let mut fixture = route_closed_fixture().await;
+        // The server calls cleanup_connection on module EOF. Without a planned
+        // daemon shutdown, that disconnect must remain a crash with no prior
+        // route.closing notice, even when the route has no in-flight calls.
+        assert!(matches!(
+            fixture.disconnect(),
+            ClientControlPush::RouteClosed {
+                reason: RouteCloseReason::Crash,
+                drained: false,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]

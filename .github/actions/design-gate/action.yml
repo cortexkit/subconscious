@@ -33,9 +33,9 @@ inputs:
     description: >-
       Token the gate reads the linked issue with, creates missing labels,
       and posts the gate comment, the draft conversion and the
-      ready-for-review with. The pull-request caller mints an app token for
-      these writes on fork pull requests. Creating missing labels needs App
-      Issues: write; without it the gate warns and continues.
+      ready-for-review with. The shared workflow passes the job's own
+      GITHUB_TOKEN. Creating missing labels needs Issues: write, which the
+      callers do not grant; without it the gate warns and continues.
     required: true
   check-token:
     description: >-

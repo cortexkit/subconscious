@@ -780,6 +780,7 @@ fn thin_core_ops() -> BTreeSet<&'static str> {
         ops::SUPERVISOR_PROVENANCE,
         ops::SUPERVISOR_SPAWN_SNAPSHOT,
         ops::SUPERVISOR_SPAWN_SUBSCRIBE,
+        ops::ACTIVITY_RECORD,
     ])
 }
 

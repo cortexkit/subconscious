@@ -501,6 +501,11 @@ struct ModuleConnection {
 struct ForwardingInner {
     operator_confirms: Arc<crate::operator_confirm::OperatorConfirms>,
     daemon_draining: bool,
+    /// Whether forwarding reached quiescence during daemon shutdown, for each
+    /// active endpoint present when shutdown began. A pending wait is false
+    /// because it has not proved quiescence. Endpoint generations prevent a
+    /// result from describing a replacement connection with the same module id.
+    daemon_drain_results: HashMap<ModuleEndpointId, bool>,
     /// The ACTIVE slot: the one endpoint per module id that routing resolves.
     /// Every by-id lookup (relay reservation, drain-by-id, liveness, census,
     /// live roots, module-control RPCs) reads this map and nothing else.
@@ -2109,15 +2114,49 @@ impl ForwardingTable {
     }
 
     /// Whether daemon-wide shutdown has begun draining all providers.
-    pub(crate) fn is_daemon_draining(&self) -> Result<bool, ForwardingError> {
-        Ok(self.read_inner()?.daemon_draining)
+    /// `None` means normal operation; during daemon shutdown, return the
+    /// endpoint's measured result, or false if no completed measurement exists.
+    pub(crate) fn daemon_drain_result_for_connection(
+        &self,
+        connection_id: ConnectionId,
+    ) -> Result<Option<bool>, ForwardingError> {
+        let inner = self.read_inner()?;
+        Ok(inner.daemon_draining.then(|| {
+            inner
+                .endpoint_by_connection
+                .get(&connection_id)
+                .and_then(|endpoint| inner.daemon_drain_results.get(endpoint))
+                .copied()
+                .unwrap_or(false)
+        }))
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn record_daemon_drain_result(
+        &self,
+        endpoint: ModuleEndpointId,
+        drained: bool,
+    ) -> Result<(), ForwardingError> {
+        let mut inner = self.write_inner()?;
+        // Only update an endpoint captured at the start of daemon shutdown.
+        // Teardown removes its entry, so a late wait cannot recreate the result
+        // or attribute it to a replacement connection.
+        if let Some(result) = inner.daemon_drain_results.get_mut(&endpoint) {
+            *result = drained;
+        }
+        Ok(())
     }
 
     /// Gate every provider atomically, including registrations racing shutdown.
     /// No supervisor lock is held while taking the forwarding lock.
     #[cfg(unix)]
-    pub(crate) fn begin_daemon_drain(&self) -> Result<Vec<String>, ForwardingError> {
+    pub(crate) fn begin_daemon_drain(
+        &self,
+    ) -> Result<Vec<(String, ModuleEndpointId)>, ForwardingError> {
         let mut inner = self.write_inner()?;
+        if inner.daemon_draining {
+            return Ok(Vec::new());
+        }
         inner.daemon_draining = true;
         let modules = inner
             .modules_by_id
@@ -2125,14 +2164,15 @@ impl ForwardingTable {
             .map(|(id, module)| (id.clone(), module.endpoint))
             .collect::<Vec<_>>();
         for (_, endpoint) in &modules {
+            inner.daemon_drain_results.insert(*endpoint, false);
             inner
                 .draining_endpoints
                 .insert(*endpoint, RouteCloseReason::Restart);
         }
         // Swap candidates and superseded incumbents are not routable, but they
         // are live endpoints that could still be sent module-control work, so
-        // the daemon-wide gate covers them too. The returned ids are unchanged:
-        // they name modules for the supervisor to drain, one per id.
+        // the daemon-wide gate covers them too. Only the active endpoints are
+        // returned to the supervisor for measurement, one per module id.
         let off_slot_endpoints = inner
             .candidates_by_id
             .values()
@@ -2144,7 +2184,7 @@ impl ForwardingTable {
                 .draining_endpoints
                 .insert(endpoint, RouteCloseReason::Restart);
         }
-        Ok(modules.into_iter().map(|(id, _)| id).collect())
+        Ok(modules)
     }
 
     /// Begin draining whatever endpoint is ACTIVE for `module_id`.
@@ -3234,6 +3274,7 @@ fn remove_module_connection_locked(
     // cannot replace module_closed with route_closed.
     inner.operator_confirms.module_closed(endpoint);
     inner.draining_endpoints.remove(&endpoint);
+    inner.daemon_drain_results.remove(&endpoint);
     let module_id = inner.module_id_by_endpoint.remove(&endpoint);
     if let Some(module_id) = module_id.as_ref() {
         if inner
@@ -4041,7 +4082,10 @@ mod tests {
     #[cfg(unix)]
     fn daemon_drain_gates_current_and_racing_provider_registrations() {
         let (forwarding, _, endpoint, _, sink, _) = route_fixture("provider");
-        assert_eq!(forwarding.begin_daemon_drain().unwrap(), ["provider"]);
+        assert_eq!(
+            forwarding.begin_daemon_drain().unwrap(),
+            [("provider".to_string(), endpoint)]
+        );
         assert!(forwarding.endpoint_is_draining(endpoint).unwrap());
         assert!(matches!(
             forwarding.register_module_connection(
@@ -4053,6 +4097,71 @@ mod tests {
             ),
             Err(ForwardingError::ConnectionClosing { .. })
         ));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn daemon_drain_results_are_endpoint_fenced_and_removed_on_cleanup() {
+        let (forwarding, connection, endpoint, _, _, _) = route_fixture("provider");
+        assert_eq!(
+            forwarding
+                .daemon_drain_result_for_connection(connection)
+                .unwrap(),
+            None
+        );
+        forwarding
+            .record_daemon_drain_result(endpoint, true)
+            .unwrap();
+        forwarding.begin_daemon_drain().unwrap();
+        assert_eq!(
+            forwarding
+                .daemon_drain_result_for_connection(connection)
+                .unwrap(),
+            Some(false)
+        );
+        let replacement = ModuleEndpointId {
+            generation: endpoint.generation + 1,
+            ..endpoint
+        };
+        forwarding
+            .record_daemon_drain_result(replacement, true)
+            .unwrap();
+        assert_eq!(
+            forwarding
+                .daemon_drain_result_for_connection(connection)
+                .unwrap(),
+            Some(false)
+        );
+        forwarding
+            .record_daemon_drain_result(endpoint, true)
+            .unwrap();
+        assert_eq!(
+            forwarding
+                .daemon_drain_result_for_connection(connection)
+                .unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            forwarding
+                .daemon_drain_result_for_connection(ConnectionId::new(300))
+                .unwrap(),
+            Some(false)
+        );
+        forwarding.cleanup_connection(connection).unwrap();
+        forwarding
+            .record_daemon_drain_result(endpoint, true)
+            .unwrap();
+        assert_eq!(
+            forwarding
+                .daemon_drain_result_for_connection(connection)
+                .unwrap(),
+            Some(false)
+        );
+        assert!(forwarding
+            .read_inner()
+            .unwrap()
+            .daemon_drain_results
+            .is_empty());
     }
 
     #[test]

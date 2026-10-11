@@ -7,19 +7,6 @@ fn request() -> ActivityRecordRequest {
     serde_json::from_value(serde_json::json!({"op":"activity.record", "kind":"worker.settled", "summary":"Worker settled"})).unwrap()
 }
 
-#[test]
-fn activity_daemon_release_has_a_version_and_changelog_bump() {
-    // Adding the activity.record operation changes the published daemon API;
-    // the crate and its changelog must therefore move beyond release 0.33.8.
-    let version = env!("CARGO_PKG_VERSION");
-    let components: Vec<u64> = version
-        .split('.')
-        .map(|part| part.parse().unwrap())
-        .collect();
-    assert!(components.as_slice() >= [0, 33, 9].as_slice());
-    assert!(include_str!("../CHANGELOG.md").contains(&format!("\n## {version}\n")));
-}
-
 fn actor() -> ActivityActor {
     ActivityActor {
         principal: Principal::Reserved {

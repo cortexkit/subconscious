@@ -8,6 +8,14 @@
 - Include the immutable epoch deadline in `scope.describe` stamps. Existing Rust stamp decoders accept extra fields, and Swift's management reply path preserves them. The TypeScript client has no describe API or reply decoder; its provider bind decoder ignores extra fields. Swift has no provider bind decoder.
 - Update the record-validation test that formerly required `run_id` with `delegates` to be refused: delegation is now checked against each route's target, not rejected in scope records. Add daemon bind golden fixtures and reconnect tests that replace an admitted declarer with a legacy endpoint, verifying field omission and delegation refusal at relay re-check.
 
+## 0.33.12
+
+- On a daemon cut, `route.closed` keeps `reason: restart` and now reports the module connection's measured `drained` result, just like a single-module restart. A quiet route reports `true`; a drain that exceeds the two-second budget, fails, or has no recorded measurement reports `false`. Results belong to the connection drained by the cut, not a replacement registration with the same module id. `abandoned` still counts route.bind relays torn down separately and is not covered by `drained`.
+
+## 0.33.11
+
+- Correct activity tests that failed in CI: compare Windows project roots without the verbatim path prefix, and drop a test that read this changelog. No runtime change from 0.33.10, which was never published.
+
 ## 0.33.10
 
 - Serve additive `activity.record` requests from registered modules and advertise `activity-ledger/v1` in HELLO_ACK and server.describe. The daemon verifies route ownership/epoch and live scope tags before recording the verified identity of the client that opened the route, its project and scope attributes. Events with no route or scope citation identify the calling module.

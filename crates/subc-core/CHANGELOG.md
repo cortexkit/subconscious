@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.20.81
+
+- Update the internal CLI and daemon executable to `subc-daemon` 0.35, which adds the `privileged_operator_prompt` config key and the matching restart-required section. Setup reports a pending `privileged_operator_prompt` edit on a live host as restart-required.
+- `ck` allows an extra 290 seconds (the daemon's default operator budget) for every privileged command before reporting outcome-unknown, against any daemon and in both modes, because the wire does not say whether a request will prompt. `ck module restart` now reports outcome-unknown after 300 seconds instead of 10 when the daemon never replies; `ck` still never retries. Replies that arrive are handled as before.
+- `ck` prints a one-line reason for `operator_declined` and `operator_presence_unavailable`, and "refused without asking: too many recent declines" for `detail.reason` `backoff`, then exits non-zero.
+
 ## 0.20.80
 
 - Update the internal CLI and daemon executable to `subc-protocol` 0.31, `subc-control` 0.30, `subc-transport` 0.12 and `subc-daemon` 0.34 for call modes and stamped deadlines. Restart the daemon before writing delegating run scopes; providers opt into `call-modes/v1` only after implementing mode handling. CLI commands are unchanged. The test provider ignores the new optional `call_mode` bind field.

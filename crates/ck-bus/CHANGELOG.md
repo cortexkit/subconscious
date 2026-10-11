@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.14
+
+- Raise the daemon test dependency to `subc-daemon` 0.35, whose public config types gained the `privileged_operator_prompt` setting. Bus behaviour is unchanged.
+
 ## 0.3.13
 
 - Update the internal bus module to `subc-protocol` 0.31 and `subc-client-rs` 0.28, with control, transport and daemon test dependencies upgraded together. Bus consumers need no request changes; this dependency update does not declare `call-modes/v1` or implement provider mode handling.

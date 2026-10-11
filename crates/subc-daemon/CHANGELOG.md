@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.33.12
+
+- On a daemon cut, `route.closed` keeps `reason: restart` and now reports the module connection's measured `drained` result, just like a single-module restart. A quiet route reports `true`; a drain that exceeds the two-second budget, fails, or has no recorded measurement reports `false`. Results belong to the connection drained by the cut, not a replacement registration with the same module id. `abandoned` still counts route.bind relays torn down separately and is not covered by `drained`.
+
 ## 0.33.11
 
 - Correct activity tests that failed in CI: compare Windows project roots without the verbatim path prefix, and drop a test that read this changelog. No runtime change from 0.33.10, which was never published.

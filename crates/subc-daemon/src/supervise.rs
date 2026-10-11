@@ -2610,16 +2610,16 @@ impl Supervisor {
         let Some(forwarding) = &self.forwarding else {
             return Ok(());
         };
-        let module_ids = forwarding
+        let modules = forwarding
             .begin_daemon_drain()
             .map_err(SuperviseError::Forwarding)?;
         let deadline_ms =
             unix_ms_now().saturating_add((NOTICE_BUDGET + DRAIN_BUDGET).as_millis() as u64);
         let mut notices = tokio::task::JoinSet::new();
         let mut drains = Vec::new();
-        for module_id in module_ids {
+        for (module_id, endpoint) in modules {
             let Some(target) = forwarding
-                .begin_module_drain(&module_id, RouteCloseReason::Restart)
+                .begin_endpoint_drain(endpoint, RouteCloseReason::Restart)
                 .map_err(SuperviseError::Forwarding)?
             else {
                 continue;
@@ -2696,16 +2696,26 @@ impl Supervisor {
             let mut runtime = self.runtime_config();
             runtime.health.cadence = Duration::from_millis(100);
             waits.spawn(async move {
-                wait_for_forwarding_quiescence(
+                let wait_result = wait_for_forwarding_quiescence(
                     &forwarding,
                     &module_id,
                     &runtime,
                     endpoint,
                     deadline,
                     &gauges,
-                    DrainScope::Active,
+                    DrainScope::Endpoint(endpoint),
                 )
-                .await
+                .await;
+                // Store the measurement before the task returns: quiescence
+                // may be reached just as the deadline stops the join loop from
+                // collecting results. Unfinished or failed waits report false.
+                forwarding
+                    .record_daemon_drain_result(
+                        endpoint,
+                        drained_after_quiescence_wait(&wait_result),
+                    )
+                    .map_err(SuperviseError::Forwarding)?;
+                wait_result
             });
         }
         while let Ok(Some(result)) = timeout_at(deadline, waits.join_next()).await {

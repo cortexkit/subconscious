@@ -880,6 +880,7 @@ impl ControlHandler {
             run_dir.join("activity.jsonl"),
             incarnation,
         ));
+        self.supervisor.set_activity(self.activity.clone());
         self
     }
 
@@ -991,6 +992,7 @@ impl ControlHandler {
 
     pub fn with_supervisor(mut self, supervisor: SupervisorHandle) -> Self {
         self.supervisor = supervisor;
+        self.supervisor.set_activity(self.activity.clone());
         self
     }
 
@@ -2314,6 +2316,9 @@ impl ControlHandler {
 
         self.apply_registration_capabilities(&registration);
 
+        self.supervisor
+            .record_activity_registration(&registration.manifest.module_id);
+
         info!(
             module_id = %registration.manifest.module_id,
             module_version = %registration.manifest.module_version,
@@ -2516,7 +2521,8 @@ impl ControlHandler {
                     Some(&module_id),
                     None,
                 )?;
-                self.handle_supervisor_restart(frame, module_id, drain_timeout_ms)
+                let requester = self.supervisor_requester(ctx, frame.header.corr)?;
+                self.handle_supervisor_restart(frame, module_id, drain_timeout_ms, requester)
                     .await
             }
             ClientControlRequest::SupervisorSwap {
@@ -2530,7 +2536,8 @@ impl ControlHandler {
                     Some(&module_id),
                     None,
                 )?;
-                self.handle_supervisor_swap(frame, module_id, ready_timeout_ms)
+                let requester = self.supervisor_requester(ctx, frame.header.corr)?;
+                self.handle_supervisor_swap(frame, module_id, ready_timeout_ms, requester)
                     .await
             }
             ClientControlRequest::SupervisorReload { module_id } => {
@@ -2541,7 +2548,9 @@ impl ControlHandler {
                     Some(&module_id),
                     None,
                 )?;
-                self.handle_supervisor_reload(frame, module_id).await
+                let requester = self.supervisor_requester(ctx, frame.header.corr)?;
+                self.handle_supervisor_reload(frame, module_id, requester)
+                    .await
             }
             ClientControlRequest::SupervisorRescan { preview } => {
                 if !preview {
@@ -2553,7 +2562,9 @@ impl ControlHandler {
                         None,
                     )?;
                 }
-                self.handle_supervisor_rescan(frame, preview).await
+                let requester = self.supervisor_requester(ctx, frame.header.corr)?;
+                self.handle_supervisor_rescan(frame, preview, requester)
+                    .await
             }
             ClientControlRequest::SupervisorReleaseReserved { module_id } => {
                 self.log_supervisor_request_received(
@@ -2574,7 +2585,8 @@ impl ControlHandler {
                     Some(&module_id),
                     Some(enabled),
                 )?;
-                self.handle_supervisor_set_enabled(frame, module_id, enabled)
+                let requester = self.supervisor_requester(ctx, frame.header.corr)?;
+                self.handle_supervisor_set_enabled(frame, module_id, enabled, requester)
                     .await
             }
             ClientControlRequest::SupervisorHealthProbe { module_id } => {
@@ -2606,14 +2618,7 @@ impl ControlHandler {
         module_id: Option<&str>,
         enabled: Option<bool>,
     ) -> Result<(), RouterError> {
-        let caller = self
-            .registry
-            .get_module_by_connection(ctx.connection_id)
-            .map_err(|err| RouterError::backend(0, corr, err.to_string()))?
-            .map(|registration| Principal::Reserved {
-                module_id: registration.manifest.module_id,
-            })
-            .unwrap_or(Principal::Direct);
+        let caller = self.supervisor_requester(ctx, corr)?;
         let caller = principal_label(&caller);
         // `Option` fields are recorded only when present, so a request with no
         // module id (rescan) or no enabled flag simply omits that field.
@@ -2627,6 +2632,17 @@ impl ControlHandler {
             "supervisor request received"
         );
         Ok(())
+    }
+
+    fn supervisor_requester(&self, ctx: &RouteCtx, corr: u64) -> Result<Principal, RouterError> {
+        Ok(self
+            .registry
+            .get_module_by_connection(ctx.connection_id)
+            .map_err(|err| RouterError::backend(0, corr, err.to_string()))?
+            .map(|registration| Principal::Reserved {
+                module_id: registration.manifest.module_id,
+            })
+            .unwrap_or(Principal::Direct))
     }
 
     fn handle_module_control_request(
@@ -3078,6 +3094,7 @@ impl ControlHandler {
             incarnation,
             config,
         ));
+        self.supervisor.set_activity(self.activity.clone());
         self
     }
 
@@ -3402,6 +3419,14 @@ impl ControlHandler {
             obj.insert(
                 "activity_unparseable_lines".into(),
                 ledger.read_errors().into(),
+            );
+            obj.insert(
+                "activity_lifecycle_append_failures".into(),
+                ledger.lifecycle_failures().into(),
+            );
+            obj.insert(
+                "activity_started_digest_skips".into(),
+                ledger.lifecycle_digest_skips().into(),
             );
         }
         if let (Ok((connections_with_routes, max)), Some(obj)) = (
@@ -4982,6 +5007,7 @@ impl ControlHandler {
         frame: Frame,
         module_id: String,
         drain_timeout_ms: Option<u64>,
+        requester: Principal,
     ) -> Result<Vec<Frame>, RouterError> {
         let operation_lock = self.supervisor.operation_lock();
         let _operation_guard = operation_lock.lock().await;
@@ -4994,7 +5020,10 @@ impl ControlHandler {
         };
 
         self.route_outages.mark_operator_action(&module_id);
-        if let Err(err) = module.restart(drain_timeout_ms).await {
+        if let Err(err) = module
+            .restart_requested(drain_timeout_ms, Some(requester))
+            .await
+        {
             self.route_outages
                 .operator_action_ended_unrefused(&module_id);
             let (code, message) = match err {
@@ -5031,6 +5060,7 @@ impl ControlHandler {
         frame: Frame,
         module_id: String,
         ready_timeout_ms: Option<u64>,
+        requester: Principal,
     ) -> Result<Vec<Frame>, RouterError> {
         // The daemon-wide operation lock is held only to resolve the handle,
         // not across the swap. The swap can take its whole readiness budget,
@@ -5053,7 +5083,7 @@ impl ControlHandler {
 
         self.route_outages.mark_operator_action(&module_id);
         if let Err(err) = module
-            .swap(ready_timeout_ms.map(Duration::from_millis))
+            .swap_requested(ready_timeout_ms.map(Duration::from_millis), Some(requester))
             .await
         {
             self.route_outages
@@ -5108,6 +5138,7 @@ impl ControlHandler {
         &self,
         frame: Frame,
         module_id: String,
+        requester: Principal,
     ) -> Result<Vec<Frame>, RouterError> {
         let operation_lock = self.supervisor.operation_lock();
         let _operation_guard = operation_lock.lock().await;
@@ -5120,7 +5151,7 @@ impl ControlHandler {
         };
 
         self.route_outages.mark_operator_action(&module_id);
-        if let Err(err) = module.reload().await {
+        if let Err(err) = module.reload_requested(Some(requester)).await {
             self.route_outages
                 .operator_action_ended_unrefused(&module_id);
             let (code, message) = match err {
@@ -5153,6 +5184,7 @@ impl ControlHandler {
         &self,
         frame: Frame,
         preview: bool,
+        requester: Principal,
     ) -> Result<Vec<Frame>, RouterError> {
         let Some(context) = self.rescan.clone() else {
             return Ok(vec![control_error_frame(
@@ -5285,7 +5317,7 @@ impl ControlHandler {
             Vec::new()
         };
         let result = match self
-            .reconcile_supervised_modules(&context.supervisor, modules, preview)
+            .reconcile_supervised_modules(&context.supervisor, modules, preview, requester.clone())
             .await
         {
             Ok(result) => result,
@@ -5294,6 +5326,9 @@ impl ControlHandler {
             }
         };
         if !preview {
+            if let Some(ledger) = &self.activity {
+                ledger.module_rescanned(&result.added, &result.removed, requester);
+            }
             if let Err(code) = self.configure_activity(activity_config).await {
                 warn!(
                     code,
@@ -5397,6 +5432,7 @@ impl ControlHandler {
         supervisor: &Supervisor,
         configured_modules: Vec<crate::daemon_config::ConfiguredModule>,
         preview: bool,
+        requester: Principal,
     ) -> Result<SupervisorRescanResult, String> {
         let mut current = BTreeMap::new();
         for module in self.supervisor.list() {
@@ -5492,9 +5528,12 @@ impl ControlHandler {
                 .get(module_id)
                 .expect("removed module came from current supervisor state")
                 .0;
-            module.retire().await.map_err(|err| {
-                format!("failed to retire module_id '{module_id}' during rescan: {err}")
-            })?;
+            module
+                .retire_requested(Some(requester.clone()))
+                .await
+                .map_err(|err| {
+                    format!("failed to retire module_id '{module_id}' during rescan: {err}")
+                })?;
             // TOMBSTONE BEFORE RETIRE, and the order is the whole fix.
             //
             // `handle_route_open` resolves an absent module in three steps:
@@ -5559,7 +5598,7 @@ impl ControlHandler {
                 // edit to the config, so the resulting outage was asked for.
                 self.route_outages.mark_operator_action(module_id);
                 module
-                    .set_enabled(configured_module.enabled)
+                    .set_enabled_requested(configured_module.enabled, Some(requester.clone()))
                     .await
                     .map_err(|err| {
                         self.route_outages.operator_action_ended_unrefused(module_id);
@@ -5576,12 +5615,13 @@ impl ControlHandler {
                 .get(module_id)
                 .expect("added module id came from configured map");
             supervisor
-                .supervise_configured_with_health(
+                .supervise_configured_requested(
                     configured_module.module_spec(),
                     configured_module.enabled,
                     configured_module.health.clone(),
                     configured_module.drain_timeout_ms,
                     configured_module.restart,
+                    Some(requester.clone()),
                 )
                 .map_err(|err| {
                     format!("failed to add module_id '{module_id}' during rescan: {err}")
@@ -5607,6 +5647,7 @@ impl ControlHandler {
         frame: Frame,
         module_id: String,
         enabled: bool,
+        requester: Principal,
     ) -> Result<Vec<Frame>, RouterError> {
         let operation_lock = self.supervisor.operation_lock();
         let _operation_guard = operation_lock.lock().await;
@@ -5621,7 +5662,7 @@ impl ControlHandler {
         // Enabling counts as well as disabling: a module an operator starts
         // is refused until it registers, and that wait was asked for.
         self.route_outages.mark_operator_action(&module_id);
-        let applied = match module.set_enabled(enabled).await {
+        let applied = match module.set_enabled_requested(enabled, Some(requester)).await {
             Ok(applied) => applied,
             Err(err) => {
                 self.route_outages
@@ -7022,6 +7063,10 @@ mod tests {
     mod activity_read {
         include!("activity_read_tests.rs");
     }
+
+    mod lifecycle_activity {
+        include!("control_lifecycle_tests.rs");
+    }
     #[cfg(unix)]
     #[tokio::test]
     async fn rescan_health_only_is_live_but_launch_edits_need_reload() {
@@ -7055,7 +7100,12 @@ mod tests {
         configured.health.http = Some("http://127.0.0.1:1/healthz".into());
         configured.health.cadence = std::time::Duration::from_secs(3600);
         let health_only = handler
-            .reconcile_supervised_modules(&supervisor, vec![configured.clone()], false)
+            .reconcile_supervised_modules(
+                &supervisor,
+                vec![configured.clone()],
+                false,
+                Principal::Direct,
+            )
             .await
             .unwrap();
         assert!(
@@ -7069,7 +7119,7 @@ mod tests {
         );
         configured.args = vec!["61".into()];
         let launch = handler
-            .reconcile_supervised_modules(&supervisor, vec![configured], false)
+            .reconcile_supervised_modules(&supervisor, vec![configured], false, Principal::Direct)
             .await
             .unwrap();
         assert_eq!(launch.changed_pending_reload, ["stock"]);

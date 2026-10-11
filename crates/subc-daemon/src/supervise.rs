@@ -20,7 +20,7 @@ use subc_protocol::{
         HealthReport, HealthStatus, ModuleControlCommand, ModuleControlRequest,
         MODULE_CONTROL_OP_HEALTH_CHECK,
     },
-    Flags, FrameType, Priority, SUBC_LAUNCH_NONCE_ENV, SUBC_MODULE_ID_ENV,
+    Flags, FrameType, Principal, Priority, SUBC_LAUNCH_NONCE_ENV, SUBC_MODULE_ID_ENV,
 };
 use tokio::{
     process::{Child, Command},
@@ -54,6 +54,9 @@ use crate::provenance::spawned_file_identity;
 
 #[path = "supervise_swap.rs"]
 mod swap;
+
+#[path = "supervise_activity.rs"]
+mod activity;
 
 /// Command-line flag used by supervised modules to find subc.
 ///
@@ -1765,6 +1768,9 @@ type ReloadReply = oneshot::Sender<Result<(), SuperviseError>>;
 
 #[derive(Debug, Clone)]
 struct SupervisorRuntimeConfig {
+    start_requester: Option<Principal>,
+    pending_activity_restart: bool,
+    provenance_probe: ExecutableIdentityProbe,
     /// Restart operations hand their backoff to the loop, which keeps serving commands.
     scheduled_respawn: Arc<Mutex<Option<PendingRespawn>>>,
     /// A reload acknowledges completion only after its replacement registers.
@@ -1817,6 +1823,8 @@ struct SupervisedConfiguration {
 /// launch nonces recorded at spawn are checked by the same daemon instance.
 #[derive(Debug, Clone, Default)]
 pub struct SupervisorHandle {
+    activity: Arc<Mutex<Option<crate::activity::ActivityLedger>>>,
+    activity_images: Arc<Mutex<HashMap<String, activity::ActivityImage>>>,
     modules: Arc<Mutex<HashMap<String, SupervisedModule>>>,
     /// Module ids the supervisor has taken on. An id is added BEFORE the
     /// module's first process is spawned and removed only when the module
@@ -2429,6 +2437,10 @@ impl SupervisorHandle {
     }
 
     pub(crate) fn retire(&self, module_id: &str) -> Option<SupervisedModule> {
+        self.activity_images
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(module_id);
         self.spawn_nonces
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -2898,6 +2910,7 @@ impl Supervisor {
 
         let runtime = self.runtime_config();
         let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
+        let activity_spawn = runtime.begin_activity_spawn(&spec.module_id);
         let spawned = spawn_child(
             &spec,
             runtime.connection_file_path.as_deref(),
@@ -2920,6 +2933,9 @@ impl Supervisor {
             }
         };
         self.mark_first_process_running(&spec, &runtime, &snapshot, &child)?;
+        if let Some(spawn) = activity_spawn {
+            spawn.complete(&snapshot);
+        }
 
         Ok(self.supervised_module(spec, runtime, snapshot, Some(child)))
     }
@@ -2996,6 +3012,7 @@ impl Supervisor {
         }
 
         let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
+        let activity_spawn = runtime.begin_activity_spawn(&spec.module_id);
         let spawned = spawn_child(
             &spec,
             runtime.connection_file_path.as_deref(),
@@ -3011,6 +3028,9 @@ impl Supervisor {
         match spawned {
             Ok(child) => {
                 self.mark_first_process_running(&spec, &runtime, &snapshot, &child)?;
+                if let Some(spawn) = activity_spawn {
+                    spawn.complete(&snapshot);
+                }
                 Ok(self.supervised_module(spec, runtime, snapshot, Some(child)))
             }
             Err(err) => {
@@ -3039,10 +3059,30 @@ impl Supervisor {
         drain_timeout_ms: Option<u64>,
         restart_policy: RestartPolicy,
     ) -> Result<SupervisedModule, SuperviseError> {
+        self.supervise_configured_requested(
+            spec,
+            enabled,
+            health,
+            drain_timeout_ms,
+            restart_policy,
+            None,
+        )
+    }
+
+    pub(crate) fn supervise_configured_requested(
+        &self,
+        spec: ModuleSpec,
+        enabled: bool,
+        health: HealthConfig,
+        drain_timeout_ms: Option<u64>,
+        restart_policy: RestartPolicy,
+        requester: Option<Principal>,
+    ) -> Result<SupervisedModule, SuperviseError> {
         validate_spec(&spec)?;
         self.establish_identity(&spec);
 
         let mut runtime = self.runtime_config();
+        runtime.start_requester = requester;
         runtime.health = health.clone();
         runtime.restart_policy = restart_policy;
         if let Some(ms) = drain_timeout_ms {
@@ -3065,6 +3105,7 @@ impl Supervisor {
         }
 
         let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
+        let activity_spawn = runtime.begin_activity_spawn(&spec.module_id);
         let spawned = spawn_child(
             &spec,
             runtime.connection_file_path.as_deref(),
@@ -3080,6 +3121,9 @@ impl Supervisor {
         match spawned {
             Ok(child) => {
                 self.mark_first_process_running(&spec, &runtime, &snapshot, &child)?;
+                if let Some(spawn) = activity_spawn {
+                    spawn.complete(&snapshot);
+                }
                 Ok(self.supervised_module(spec, runtime, snapshot, Some(child)))
             }
             Err(err) => {
@@ -3107,6 +3151,9 @@ impl Supervisor {
     fn runtime_config(&self) -> SupervisorRuntimeConfig {
         let effective_drain_timeout = Arc::new(Mutex::new(self.drain_timeout));
         SupervisorRuntimeConfig {
+            start_requester: None,
+            pending_activity_restart: false,
+            provenance_probe: self.provenance_probe.clone(),
             scheduled_respawn: Arc::default(),
             deferred_reload_reply: Arc::default(),
             restart_policy: self.restart_policy,
@@ -3565,7 +3612,10 @@ impl SupervisedModule {
         self.stop().await
     }
 
-    pub(crate) async fn retire(&self) -> Result<(), SuperviseError> {
+    pub(crate) async fn retire_requested(
+        &self,
+        requester: Option<Principal>,
+    ) -> Result<(), SuperviseError> {
         match self.state()? {
             ModuleState::Stopped | ModuleState::Failed => return Ok(()),
             ModuleState::Starting
@@ -3579,7 +3629,10 @@ impl SupervisedModule {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.inner
             .commands
-            .send(SupervisorCommand::Retire { reply: reply_tx })
+            .send(SupervisorCommand::Retire {
+                requester,
+                reply: reply_tx,
+            })
             .await
             .map_err(|_| SuperviseError::CommandClosed {
                 module_id: self.inner.module_id.clone(),
@@ -3590,6 +3643,13 @@ impl SupervisedModule {
     }
 
     pub async fn stop(&self) -> Result<(), SuperviseError> {
+        self.stop_requested(None).await
+    }
+
+    pub(crate) async fn stop_requested(
+        &self,
+        requester: Option<Principal>,
+    ) -> Result<(), SuperviseError> {
         match self.state()? {
             ModuleState::Stopped | ModuleState::Failed => return Ok(()),
             ModuleState::Starting
@@ -3603,7 +3663,10 @@ impl SupervisedModule {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.inner
             .commands
-            .send(SupervisorCommand::Drain { reply: reply_tx })
+            .send(SupervisorCommand::Drain {
+                requester,
+                reply: reply_tx,
+            })
             .await
             .map_err(|_| SuperviseError::CommandClosed {
                 module_id: self.inner.module_id.clone(),
@@ -3614,11 +3677,20 @@ impl SupervisedModule {
     }
 
     pub async fn restart(&self, drain_timeout_ms: Option<u64>) -> Result<(), SuperviseError> {
+        self.restart_requested(drain_timeout_ms, None).await
+    }
+
+    pub(crate) async fn restart_requested(
+        &self,
+        drain_timeout_ms: Option<u64>,
+        requester: Option<Principal>,
+    ) -> Result<(), SuperviseError> {
         let received_at_generation = lock_snapshot(&self.inner.snapshot)?.spawn_generation;
         let (reply_tx, reply_rx) = oneshot::channel();
         self.inner
             .commands
             .send(SupervisorCommand::Restart {
+                requester,
                 drain_timeout_ms,
                 received_at_generation,
                 queued_at: Instant::now(),
@@ -3638,10 +3710,19 @@ impl SupervisedModule {
     /// process then drains in the background of the supervise loop) or has
     /// failed, leaving the old process serving.
     pub async fn swap(&self, ready_timeout: Option<Duration>) -> Result<(), SuperviseError> {
+        self.swap_requested(ready_timeout, None).await
+    }
+
+    pub(crate) async fn swap_requested(
+        &self,
+        ready_timeout: Option<Duration>,
+        requester: Option<Principal>,
+    ) -> Result<(), SuperviseError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.inner
             .commands
             .send(SupervisorCommand::Swap {
+                requester,
                 ready_timeout,
                 reply: reply_tx,
             })
@@ -3655,10 +3736,20 @@ impl SupervisedModule {
     }
 
     pub async fn reload(&self) -> Result<(), SuperviseError> {
+        self.reload_requested(None).await
+    }
+
+    pub(crate) async fn reload_requested(
+        &self,
+        requester: Option<Principal>,
+    ) -> Result<(), SuperviseError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.inner
             .commands
-            .send(SupervisorCommand::Reload { reply: reply_tx })
+            .send(SupervisorCommand::Reload {
+                requester,
+                reply: reply_tx,
+            })
             .await
             .map_err(|_| SuperviseError::CommandClosed {
                 module_id: self.inner.module_id.clone(),
@@ -3669,10 +3760,19 @@ impl SupervisedModule {
     }
 
     pub async fn set_enabled(&self, enabled: bool) -> Result<bool, SuperviseError> {
+        self.set_enabled_requested(enabled, None).await
+    }
+
+    pub(crate) async fn set_enabled_requested(
+        &self,
+        enabled: bool,
+        requester: Option<Principal>,
+    ) -> Result<bool, SuperviseError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.inner
             .commands
             .send(SupervisorCommand::SetEnabled {
+                requester,
                 enabled,
                 reply: reply_tx,
             })
@@ -3791,12 +3891,15 @@ impl Drop for SupervisedModuleInner {
 #[derive(Debug)]
 enum SupervisorCommand {
     Drain {
+        requester: Option<Principal>,
         reply: oneshot::Sender<Result<(), SuperviseError>>,
     },
     Retire {
+        requester: Option<Principal>,
         reply: oneshot::Sender<Result<(), SuperviseError>>,
     },
     Restart {
+        requester: Option<Principal>,
         /// Operator override for this one restart's drain budget, in ms. `None`
         /// uses the module's configured/default budget; `Some(0)` cuts
         /// immediately (wedge bounce: a stuck request never settles, so
@@ -3812,9 +3915,11 @@ enum SupervisorCommand {
         reply: oneshot::Sender<Result<(), SuperviseError>>,
     },
     Reload {
+        requester: Option<Principal>,
         reply: oneshot::Sender<Result<(), SuperviseError>>,
     },
     SetEnabled {
+        requester: Option<Principal>,
         enabled: bool,
         reply: oneshot::Sender<Result<bool, SuperviseError>>,
     },
@@ -3827,6 +3932,7 @@ enum SupervisorCommand {
         reply: oneshot::Sender<()>,
     },
     Swap {
+        requester: Option<Principal>,
         /// How long the candidate may take to register and declare itself
         /// ready. `None` uses [`DEFAULT_SWAP_READY_TIMEOUT`].
         ready_timeout: Option<Duration>,
@@ -6254,6 +6360,8 @@ async fn supervise_loop(
                         &runtime.child_roster,
                         exit_report,
                     ).await;
+                    runtime.start_requester = None;
+                    runtime.pending_activity_restart = false;
                     // The exit is recorded, so a daemon shutdown may stop
                     // waiting for this child (see `SupervisedChild::wait`).
                     active_child.release_roster();
@@ -6326,6 +6434,10 @@ async fn supervise_loop(
                             &snapshot,
                             &mut child,
                         ).await;
+                        if child.is_none() {
+                            runtime.start_requester = None;
+                            runtime.pending_activity_restart = false;
+                        }
                         if child.is_some() {
                             health_probe.schedule_next(&spec, runtime.health.cadence);
                         }
@@ -6368,6 +6480,10 @@ async fn supervise_loop(
                     if matches!(pending.kind, RespawnKind::Reload) {
                         let reply = runtime.deferred_reload_reply.lock().unwrap_or_else(|p| p.into_inner()).take();
                         let result = finish_reload_child(&spec, &runtime, &registry, &process_liveness, &snapshot, &mut child).await;
+                        if result.is_ok() && runtime.pending_activity_restart {
+                            runtime.record_activity_transition("subc.module_restarted", &spec.module_id, runtime.start_requester.clone());
+                        }
+                        runtime.pending_activity_restart = false;
                         if let Some(reply) = reply { let _ = reply.send(result); }
                         continue;
                     }
@@ -6375,6 +6491,10 @@ async fn supervise_loop(
                     match spawn_and_mark_running(&spec, &runtime, &snapshot) {
                         Ok(next_child) => {
                             child = Some(next_child);
+                            if runtime.pending_activity_restart {
+                                runtime.record_activity_transition("subc.module_restarted", &spec.module_id, runtime.start_requester.clone());
+                                runtime.pending_activity_restart = false;
+                            }
                             debug!(module_id = %spec.module_id, "supervised module restarted after crash");
                         }
                         Err(err) => {
@@ -6512,7 +6632,7 @@ async fn handle_supervisor_command(
     let command = if let Some(pid) = runtime.child_roster.previous_instance_pid(&spec.module_id) {
         match command {
             SupervisorCommand::Restart { reply, .. }
-            | SupervisorCommand::Reload { reply }
+            | SupervisorCommand::Reload { reply, .. }
             | SupervisorCommand::Swap { reply, .. } => {
                 let _ = reply.send(Err(previous_instance_error(spec, pid)));
                 return true;
@@ -6520,6 +6640,7 @@ async fn handle_supervisor_command(
             SupervisorCommand::SetEnabled {
                 enabled: true,
                 reply,
+                ..
             } => {
                 let _ = reply.send(Err(previous_instance_error(spec, pid)));
                 return true;
@@ -6530,7 +6651,7 @@ async fn handle_supervisor_command(
         command
     };
     match command {
-        SupervisorCommand::Drain { reply } => {
+        SupervisorCommand::Drain { requester, reply } => {
             // A plain stop runs no forwarding drain, so nothing reaches the
             // module over its connection before the wait: ask by signal.
             let result = drain_optional_child(
@@ -6549,13 +6670,20 @@ async fn handle_supervisor_command(
             )
             .await;
             let registration_released = result.is_ok();
+            if registration_released {
+                runtime.record_activity_transition(
+                    "subc.module_stopped",
+                    &spec.module_id,
+                    requester,
+                );
+            }
             let _ = reply.send(result);
             if registration_released {
                 process_liveness.untrack_if_current(&spec.module_id, snapshot);
             }
             false
         }
-        SupervisorCommand::Retire { reply } => {
+        SupervisorCommand::Retire { requester, reply } => {
             let result = async {
                 let stop_notice = begin_forwarding_drain_if_configured(
                     spec,
@@ -6584,6 +6712,13 @@ async fn handle_supervisor_command(
             }
             .await;
             let registration_released = result.is_ok();
+            if registration_released {
+                runtime.record_activity_transition(
+                    "subc.module_stopped",
+                    &spec.module_id,
+                    requester,
+                );
+            }
             let _ = reply.send(result);
             if registration_released {
                 process_liveness.untrack_if_current(&spec.module_id, snapshot);
@@ -6591,6 +6726,7 @@ async fn handle_supervisor_command(
             false
         }
         SupervisorCommand::Restart {
+            requester,
             drain_timeout_ms,
             received_at_generation,
             queued_at,
@@ -6686,13 +6822,20 @@ async fn handle_supervisor_command(
                         state.state = ModuleState::Failed;
                         clear_current_process_facts(state);
                     });
+                } else {
+                    runtime.start_requester = requester;
+                    runtime.pending_activity_restart = true;
                 }
             }
             true
         }
-        SupervisorCommand::Reload { reply } => {
+        SupervisorCommand::Reload { requester, reply } => {
             let result =
                 reload_child(spec, runtime, registry, process_liveness, snapshot, child).await;
+            if result.is_ok() {
+                runtime.start_requester = requester;
+                runtime.pending_activity_restart = true;
+            }
             if result.is_ok()
                 && runtime
                     .scheduled_respawn
@@ -6710,7 +6853,15 @@ async fn handle_supervisor_command(
             }
             true
         }
-        SupervisorCommand::SetEnabled { enabled, reply } => {
+        SupervisorCommand::SetEnabled {
+            enabled,
+            requester,
+            reply,
+        } => {
+            let previous_requester = runtime.start_requester.clone();
+            if enabled {
+                runtime.start_requester = requester.clone();
+            }
             let result = set_child_enabled(
                 spec,
                 runtime,
@@ -6721,6 +6872,21 @@ async fn handle_supervisor_command(
                 enabled,
             )
             .await;
+            if matches!(result, Ok(true)) {
+                runtime.pending_activity_restart = false;
+                if enabled {
+                    runtime.start_requester = requester;
+                } else {
+                    runtime.start_requester = None;
+                    runtime.record_activity_transition(
+                        "subc.module_disabled",
+                        &spec.module_id,
+                        requester,
+                    );
+                }
+            } else {
+                runtime.start_requester = previous_requester;
+            }
             let _ = reply.send(result);
             true
         }
@@ -6757,12 +6923,18 @@ async fn handle_supervisor_command(
             true
         }
         SupervisorCommand::Swap {
+            requester,
             ready_timeout,
             reply,
         } => {
+            let mut swap_runtime = runtime.clone();
+            swap_runtime.start_requester = requester;
+            let before = lock_snapshot(snapshot)
+                .ok()
+                .map(|state| state.spawn_generation);
             let end = swap::run_swap(
                 spec,
-                runtime,
+                &swap_runtime,
                 registry,
                 process_liveness,
                 snapshot,
@@ -6772,6 +6944,13 @@ async fn handle_supervisor_command(
                 reply,
             )
             .await;
+            if before
+                != lock_snapshot(snapshot)
+                    .ok()
+                    .map(|state| state.spawn_generation)
+            {
+                runtime.start_requester = swap_runtime.start_requester;
+            }
             requeued.extend(end.requeue);
             true
         }
@@ -8516,6 +8695,7 @@ fn spawn_and_mark_running(
     runtime: &SupervisorRuntimeConfig,
     snapshot: &SharedSnapshot,
 ) -> Result<SupervisedChild, SuperviseError> {
+    let activity_spawn = runtime.begin_activity_spawn(&spec.module_id);
     let child = spawn_child(
         spec,
         runtime.connection_file_path.as_deref(),
@@ -8527,6 +8707,9 @@ fn spawn_and_mark_running(
         runtime.cgroup_placement.as_ref(),
     )?;
     set_running(snapshot, &child, &spec.module_id, &runtime.spawn_events)?;
+    if let Some(spawn) = activity_spawn {
+        spawn.complete(snapshot);
+    }
     Ok(child)
 }
 

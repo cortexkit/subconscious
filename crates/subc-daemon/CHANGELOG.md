@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.34.2
+
+- Record best-effort `subc.module_started` activity when a registered module's running-image identity differs from its latest start entry still present in the retained activity log. Compare the complete provenance evidence: Linux SHA-256 digest, macOS device/inode, or Windows volume/file ID. Include the tagged values in `details.old_evidence` and `details.new_evidence`, and identify the control requester as actor, or `reserved:subc` (the daemon itself) for a start with no requester. Count a skipped start only when no running-image evidence is available. A change between evidence methods, for example after moving a module to another platform, records a new start because identities measured by different methods cannot establish that the executable is unchanged.
+- Record requested stop, restart/reload, swap cutover, disable and roster-changing rescan outcomes with the requester's verified principal. Refusals, no-ops, crash restarts and unrequested exits do not produce transition events.
+- Queue lifecycle appends without waiting on storage or spending module rate credit. Count and warn with the event kind on failed or dropped appends; expose `activity_lifecycle_append_failures` and `activity_started_digest_skips` alongside the activity capability in `server.describe`.
+
 ## 0.34.1
 
 - Add `ActivityConfig`, `load_with_activity` and a bootstrap retention builder without changing the public `DaemonConfig` struct or exhaustive wire enums. Module and activity policies are parsed from the same config document during bootstrap and rescan.

@@ -16,6 +16,7 @@ on:
       - "subc-client@*"
       - "store@*"
       - "log@*"
+      - "private-files@*"
 
 concurrency:
   group: release-npm-${{ github.ref }}-${{ github.sha }}
@@ -26,14 +27,57 @@ permissions:
   id-token: write # REQUIRED: lets the job mint the GitHub OIDC token npm verifies.
 
 jobs:
+  private-files-prebuilds:
+    name: Native N-API v8 prebuild (${{ matrix.arch }})
+    if: startsWith(github.ref_name, 'private-files@')
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            arch: x64
+          - os: windows-11-arm
+            arch: arm64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '24'
+          architecture: ${{ matrix.arch }}
+      - name: Build with MSVC and record toolchain/runtime
+        shell: pwsh
+        working-directory: clients/private-files
+        run: |
+          node --version
+          node -p 'JSON.stringify(process.versions)'
+          ./native/build.ps1 -Arch '${{ matrix.arch }}'
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: private-files-prebuild-${{ matrix.arch }}
+          path: clients/private-files/prebuilds/*.node
+          if-no-files-found: error
+      - name: Upload PE import inspection
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: private-files-build-${{ matrix.arch }}
+          path: clients/private-files/private-files-evidence/imports-*.txt
+          if-no-files-found: error
+
   publish:
     name: Publish npm package
+    needs: private-files-prebuilds
+    # Other npm tags skip the native job and retain their existing publish path.
+    if: ${{ !cancelled() && (needs.private-files-prebuilds.result == 'success' || needs.private-files-prebuilds.result == 'skipped') }}
     # Blacksmith runner (private repo on the free plan blocks GitHub-hosted
     # Actions). Blacksmith is a drop-in that honors GitHub-native OIDC, so
     # trusted publishing works unchanged as long as id-token: write is granted.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       # Map the tag prefix to the package directory. Adding a package = add a
       # tag pattern above + a case arm here + the one-time npm Trusted Publisher.
@@ -46,13 +90,14 @@ jobs:
             subc-client) DIR="clients/subc-client" ;;
             store)       DIR="clients/store" ;;
             log)         DIR="clients/log" ;;
+            private-files) DIR="clients/private-files" ;;
             *) echo "::error::No package mapping for tag prefix '$PKG'"; exit 1 ;;
           esac
           echo "dir=$DIR" >> "$GITHUB_OUTPUT"
           echo "version=${TAG#*@}" >> "$GITHUB_OUTPUT"
           echo "Publishing from $DIR (tag $TAG)"
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "22"
           registry-url: "https://registry.npmjs.org"
@@ -64,7 +109,7 @@ jobs:
       - name: Upgrade npm to a trusted-publishing-capable version
         run: npm install -g npm@11
 
-      - uses: oven-sh/setup-bun@v2
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version: latest
 
@@ -89,6 +134,19 @@ jobs:
           bun install --frozen-lockfile
           bun run typecheck
           bun test
+
+      - name: Assemble Windows prebuilds
+        if: ${{ steps.pkg.outputs.dir == 'clients/private-files' }}
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: private-files-prebuild-*
+          path: clients/private-files/prebuilds/
+          merge-multiple: true
+
+      - name: Check Windows prebuild architectures and delayed host imports
+        if: ${{ steps.pkg.outputs.dir == 'clients/private-files' }}
+        working-directory: clients/private-files
+        run: node scripts/check-prebuilds.mjs
 
       # Guard: the tag version must match package.json, so a stale or mistyped
       # tag can't publish the wrong version (mirrors the crate release guard).

@@ -1,0 +1,174 @@
+name: Windows private-files qualification
+on:
+  push:
+    branches: [master, 'train/**']
+    paths: ['clients/private-files/**', '.github/workflows/private-files.yml']
+  pull_request:
+    paths: ['clients/private-files/**', '.github/workflows/private-files.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  posix:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: clients/private-files
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: oven-sh/setup-bun@ecf28ddc73e819eb6fa29df6b34ef8921c743461 # v2.1.3
+        with:
+          bun-version: '1.4.2'
+      - run: |
+          bun --version
+          bun install --frozen-lockfile
+          bun run typecheck
+          bun run test
+      - name: Real foreign-owner fixture with root permissions
+        run: sudo "$(command -v bun)" test test/private-files.test.ts --test-name-pattern 'POSIX refuses foreign-owned'
+  private-files-prebuilds:
+    name: Native N-API v8 prebuild (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            arch: x64
+          - os: windows-11-arm
+            arch: arm64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '24'
+          architecture: ${{ matrix.arch }}
+      - name: Build with MSVC and record toolchain/runtime
+        shell: pwsh
+        working-directory: clients/private-files
+        run: |
+          node --version
+          node -p 'JSON.stringify(process.versions)'
+          ./native/build.ps1 -Arch '${{ matrix.arch }}'
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: private-files-prebuild-${{ matrix.arch }}
+          path: clients/private-files/prebuilds/*.node
+          if-no-files-found: error
+      - name: Upload PE import inspection
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: private-files-build-${{ matrix.arch }}
+          path: clients/private-files/private-files-evidence/imports-*.txt
+          if-no-files-found: error
+  acl:
+    needs: private-files-prebuilds
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: clients/private-files
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, windows-2022, windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '24'
+      - uses: oven-sh/setup-bun@ecf28ddc73e819eb6fa29df6b34ef8921c743461 # v2.1.3, native Windows ARM64 support
+        with:
+          bun-version: '1.3.14'
+      - name: Install, compile TypeScript and MSVC N-API v8 prebuild
+        shell: pwsh
+        run: |
+          bun install --frozen-lockfile
+          if ($LASTEXITCODE) { throw 'Frozen install failed' }
+          bun run build
+          if ($LASTEXITCODE) { throw 'TypeScript build failed' }
+          ./native/build.ps1
+      - name: Load the distribution prebuilds produced by the dedicated matrix
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: private-files-prebuild-*
+          path: clients/private-files/prebuilds/
+          merge-multiple: true
+      - name: Check both packaged machine architectures
+        run: node scripts/check-prebuilds.mjs
+      - name: Build Rust compatibility fixture with locked dependencies and stable toolchain
+        id: rust_fixture
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          rustup toolchain install stable --profile minimal
+          if ($LASTEXITCODE -ne 0) { throw 'Stable Rust install failed' }
+          rustc +stable --version
+          if ($LASTEXITCODE -ne 0) { throw 'Stable Rust version query failed' }
+          cargo +stable build --locked --manifest-path test/fixtures/rust/Cargo.toml --target-dir test/fixtures/rust/target
+          $buildExitCode = $LASTEXITCODE
+          if ($buildExitCode -ne 0) { throw "Rust fixture build failed (exit $buildExitCode)" }
+          if (!(Test-Path -Path 'test/fixtures/rust/target/debug/private-files-rust-fixture.exe' -PathType Leaf)) {
+            throw 'Rust fixture build did not produce the executable required by the ACL tests'
+          }
+      - name: Compare Windows PowerShell inherited and clean module paths
+        run: ./test/windows/module-path-probe.ps1
+      - name: Node 24 real-host ACL and second-user tests
+        shell: pwsh
+        run: |
+          ./test/windows/run-acl.ps1 -Runtime node
+      - name: Disabled-verifier, real-test-count and runtime-version negative controls, restore and rebuild
+        shell: pwsh
+        run: ./scripts/negative-control.ps1
+      - name: Bun 1.3.14 isolated N-API load
+        if: always()
+        run: |
+          $version = bun --version
+          Write-Output "bun --version: $version"
+          if ($version -ne '1.3.14') { throw "Expected Bun 1.3.14; setup did not succeed (got $version)" }
+          bun -e 'require("./prebuilds/private-files-win32-" + process.arch + ".node"); console.log("N-API loaded in Bun " + Bun.version + " (" + process.arch + ")")'
+          if ($LASTEXITCODE) { throw 'Bun 1.3.14 isolated addon load failed' }
+      - name: Bun 1.3.14 real-host ACL and second-user tests
+        if: always() && steps.rust_fixture.outcome == 'success'
+        shell: pwsh
+        run: |
+          ./test/windows/run-acl.ps1 -Runtime bun -ExpectedVersion '1.3.14'
+      - uses: oven-sh/setup-bun@ecf28ddc73e819eb6fa29df6b34ef8921c743461 # v2.1.3
+        if: always()
+        with:
+          bun-version: '1.4.2'
+      - name: Bun 1.4.2 isolated N-API load
+        if: always()
+        run: |
+          $version = bun --version
+          Write-Output "bun --version: $version"
+          if ($version -ne '1.4.2') { throw "Expected Bun 1.4.2; setup did not succeed (got $version)" }
+          bun -e 'require("./prebuilds/private-files-win32-" + process.arch + ".node"); console.log("N-API loaded in Bun " + Bun.version + " (" + process.arch + ")")'
+          if ($LASTEXITCODE) { throw 'Bun 1.4.2 isolated addon load failed' }
+      - name: Bun 1.4.2 real-host ACL and second-user tests
+        if: always() && steps.rust_fixture.outcome == 'success'
+        shell: pwsh
+        run: |
+          ./test/windows/run-acl.ps1 -Runtime bun -ExpectedVersion '1.4.2'
+      - name: Select x64 Node under emulation on ARM64 Windows
+        if: always() && matrix.os == 'windows-11-arm'
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '24'
+          architecture: x64
+      - name: Prove emulated x64 Node loads the x64 prebuild
+        if: always() && matrix.os == 'windows-11-arm' && steps.rust_fixture.outcome == 'success'
+        run: |
+          ./test/windows/run-acl.ps1 -Runtime node
+      - name: Upload descriptors, versions, timings and mutation proof
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: private-files-evidence-${{ matrix.os }}
+          path: clients/private-files/private-files-evidence/
+          if-no-files-found: error

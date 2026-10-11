@@ -18,6 +18,12 @@ impl CallerIdentity {
         Self::lookup_with(accepted, loopback_socket_peer)
     }
 
+    /// Resolve an endpoint pair captured from the daemon's accepted socket.
+    /// Like `lookup`, this walks OS process tables and must run off async workers.
+    pub(crate) fn lookup_endpoints(local: SocketAddr, peer: SocketAddr) -> Self {
+        Self::from_lookup_result(loopback_socket_peer(local, peer))
+    }
+
     fn lookup_with(
         accepted: &TcpStream,
         lookup: impl FnOnce(SocketAddr, SocketAddr) -> Option<SocketPeer>,

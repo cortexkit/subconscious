@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fmt,
+    net::SocketAddr,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, RwLock},
     time::{Duration, Instant as StdInstant},
@@ -42,6 +43,7 @@ use tokio::time::{timeout_at, Instant};
 use tracing::{debug, info, warn};
 
 use crate::{
+    caller_identity::CallerIdentity,
     capability_requirements::{
         log_duplicate_claim_events, log_requirement_events, CapabilityRequirementEvaluator,
         CapabilityVerdict, DuplicateClaimSource, RegisteredModule, RequirementStatus,
@@ -56,6 +58,7 @@ use crate::{
     observability::{
         ROUTE_OPEN_REFUSED_DECLARED_NOT_READY, ROUTE_OPEN_REFUSED_REQUIRED_CAPABILITY_UNPROVIDED,
     },
+    privileged_prompt::{prompt_text, PrivilegedOperation},
     provenance::{
         process_start_time, spawned_file_identity, ExecutableIdentityProbe, SpawnedFileIdentity,
     },
@@ -351,6 +354,10 @@ pub struct ControlHandler {
     scope_authority_owners: Vec<String>,
     /// Fixed at startup so rescan cannot change the policy that guards rescan itself.
     privileged_operator_prompt: PrivilegedOperatorPrompt,
+    caller_endpoints: Arc<Mutex<HashMap<ConnectionId, (SocketAddr, SocketAddr)>>>,
+    #[cfg(test)]
+    caller_lookup:
+        Option<Arc<dyn Fn(Option<(SocketAddr, SocketAddr)>) -> CallerIdentity + Send + Sync>>,
     /// The launch nonce each module connection presented at HELLO, which is how
     /// a `scope.sync` is matched to the owner's current launch.
     hello_launch_nonces: Arc<Mutex<HelloLaunchNonces>>,
@@ -848,6 +855,9 @@ impl ControlHandler {
             scope_deadline_added: Arc::new(tokio::sync::Notify::new()),
             scope_authority_owners: crate::daemon_config::default_scope_authority_owners(),
             privileged_operator_prompt: PrivilegedOperatorPrompt::default(),
+            caller_endpoints: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(test)]
+            caller_lookup: None,
             hello_launch_nonces: Arc::new(Mutex::new(HelloLaunchNonces::default())),
             rescan: None,
             connected_clients: ConnectedClients::new(),
@@ -1558,6 +1568,64 @@ impl ControlHandler {
         self.handle_control_frame_timed(ctx, frame, None).await
     }
 
+    pub(crate) fn record_caller_endpoints(
+        &self,
+        connection: ConnectionId,
+        endpoints: Option<(SocketAddr, SocketAddr)>,
+    ) {
+        let mut callers = self
+            .caller_endpoints
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        callers.remove(&connection);
+        if let Some(endpoints) = endpoints {
+            callers.insert(connection, endpoints);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_caller_lookup_for_test(
+        mut self,
+        lookup: impl Fn(Option<(SocketAddr, SocketAddr)>) -> CallerIdentity + Send + Sync + 'static,
+    ) -> Self {
+        self.caller_lookup = Some(Arc::new(lookup));
+        self
+    }
+
+    async fn resolve_caller(&self, connection: ConnectionId) -> CallerIdentity {
+        let endpoints = self
+            .caller_endpoints
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&connection)
+            .copied();
+        #[cfg(test)]
+        let lookup = self.caller_lookup.clone();
+        tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            if let Some(lookup) = lookup {
+                return lookup(endpoints);
+            }
+            endpoints
+                .map(|(local, peer)| CallerIdentity::lookup_endpoints(local, peer))
+                .unwrap_or_default()
+        })
+        .await
+        .unwrap_or_default()
+    }
+
+    pub(crate) fn defers_privileged_control(&self, ctx: &RouteCtx, frame: &Frame) -> bool {
+        frame.header.channel == 0
+            && frame.header.ty == FrameType::Request
+            && self
+                .forwarding
+                .module_endpoint_for_connection(ctx.connection_id)
+                .is_ok_and(|endpoint| endpoint.is_none())
+            && parse_client_control_request(&frame.body)
+                .ok()
+                .is_some_and(|request| privileged_operation(&request).is_some())
+    }
+
     pub(crate) async fn handle_control_frame_timed(
         &self,
         ctx: &RouteCtx,
@@ -1718,6 +1786,13 @@ impl ControlHandler {
         &self,
         connection_id: ConnectionId,
     ) -> Result<Vec<crate::registry::ModuleRegistration>, RegistryError> {
+        self.caller_endpoints
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&connection_id);
+        self.forwarding
+            .operator_confirms()
+            .connection_closed(connection_id);
         self.cleanup_connection_with_end_reason(
             connection_id,
             RegistrationEndReason::ConnectionClosed,
@@ -2454,6 +2529,28 @@ impl ControlHandler {
         frame: Frame,
         request: ClientControlRequest,
     ) -> Result<Vec<Frame>, RouterError> {
+        if let Some(operation) = privileged_operation(&request) {
+            let caller = self.resolve_caller(ctx.connection_id).await;
+            let op = client_control_request_op(&request);
+            let text = prompt_text(operation, &caller);
+            match self.privileged_operator_prompt {
+                PrivilegedOperatorPrompt::Log => {
+                    info!(target: "subc_daemon::privileged_prompt", operation = op,
+                        target = ?operation, caller = %caller.description(), summary = %text,
+                        "privileged request would prompt the operator");
+                }
+                PrivilegedOperatorPrompt::Enforce => {
+                    let outcome = self
+                        .forwarding
+                        .operator_confirms()
+                        .approve_privileged(ctx, &frame, op, text, caller.description())
+                        .await;
+                    if outcome.code != "confirmed" {
+                        return Ok(vec![outcome.frame(&frame)]);
+                    }
+                }
+            }
+        }
         match request {
             ClientControlRequest::ServerDescribe {} => self.handle_server_describe(frame),
             ClientControlRequest::CatalogList { module_id } => {
@@ -6231,6 +6328,50 @@ fn log_slow_control_dispatch(
             elapsed_ms = elapsed.as_millis() as u64,
             "slow control dispatch"
         );
+    }
+}
+
+/// Every new client operation needs an explicit privilege decision here.
+fn privileged_operation(request: &ClientControlRequest) -> Option<PrivilegedOperation<'_>> {
+    match request {
+        ClientControlRequest::SupervisorRestart { module_id, .. } => {
+            Some(PrivilegedOperation::Restart { module_id })
+        }
+        ClientControlRequest::SupervisorSwap { module_id, .. } => {
+            Some(PrivilegedOperation::Swap { module_id })
+        }
+        ClientControlRequest::SupervisorReload { module_id } => {
+            Some(PrivilegedOperation::Reload { module_id })
+        }
+        ClientControlRequest::SupervisorRescan { preview } => {
+            if *preview {
+                None
+            } else {
+                Some(PrivilegedOperation::Rescan)
+            }
+        }
+        ClientControlRequest::SupervisorSetEnabled { module_id, enabled } => {
+            Some(PrivilegedOperation::SetEnabled {
+                module_id,
+                enabled: *enabled,
+            })
+        }
+        ClientControlRequest::SupervisorReleaseReserved { module_id } => {
+            Some(PrivilegedOperation::ReleaseReserved { module_id })
+        }
+        ClientControlRequest::ServerDescribe {}
+        | ClientControlRequest::CatalogList { .. }
+        | ClientControlRequest::RouteOpen { .. }
+        | ClientControlRequest::RoutePoll { .. }
+        | ClientControlRequest::SupervisorList {}
+        | ClientControlRequest::SupervisorHealth {}
+        | ClientControlRequest::SupervisorHealthProbe { .. }
+        | ClientControlRequest::SupervisorRoutes { .. }
+        | ClientControlRequest::SupervisorProvenance { .. }
+        | ClientControlRequest::SupervisorStderrTail { .. }
+        | ClientControlRequest::SupervisorTerminals { .. }
+        | ClientControlRequest::SupervisorSpawnSnapshot {}
+        | ClientControlRequest::SupervisorSpawnSubscribe { .. } => None,
     }
 }
 
@@ -10742,6 +10883,17 @@ mod tests {
         }));
     }
 
+    struct ApproveOperator;
+    impl crate::operator_confirm::OperatorProvider for ApproveOperator {
+        fn prompt(
+            &self,
+            _: &str,
+            _: Box<dyn FnOnce(Arc<dyn crate::operator_confirm::OperatorWithdraw>) + Send>,
+        ) -> crate::operator_confirm::ProviderResult {
+            crate::operator_confirm::ProviderResult::Approved
+        }
+    }
+
     #[tokio::test]
     async fn privileged_operator_prompt_rescan_reports_changes_without_changing_running_mode() {
         assert_eq!(
@@ -10768,6 +10920,10 @@ mod tests {
                 .with_supervisor(handle)
                 .with_privileged_operator_prompt(config.privileged_operator_prompt)
                 .with_supervisor_rescan(supervisor, &path, config.port);
+            handler.forwarding.operator_confirms().configure(
+                Arc::new(ApproveOperator),
+                crate::operator_confirm::OperatorLimits::default(),
+            );
             let (ctx, _rx) = route_ctx(ConnectionId::new(104));
 
             for (disk_mode, needs_restart) in [
@@ -10828,6 +10984,10 @@ mod tests {
             .with_supervisor(handle)
             .with_privileged_operator_prompt(PrivilegedOperatorPrompt::Enforce)
             .with_supervisor_rescan(supervisor, &path, None);
+        handler.forwarding.operator_confirms().configure(
+            Arc::new(ApproveOperator),
+            crate::operator_confirm::OperatorLimits::default(),
+        );
         let (ctx, _rx) = route_ctx(ConnectionId::new(105));
         for preview in [true, false] {
             std::fs::write(

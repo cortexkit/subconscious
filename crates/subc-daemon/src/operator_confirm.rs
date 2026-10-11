@@ -14,7 +14,7 @@ use subc_protocol::{
     ErrorBody, Flags, FrameType, Principal, Priority,
 };
 use tokio::{
-    sync::Notify,
+    sync::{oneshot, Notify},
     time::{timeout_at, Instant},
 };
 
@@ -151,7 +151,7 @@ pub(crate) struct Outcome {
     pub reason: &'static str,
 }
 impl Outcome {
-    fn unavailable(reason: &'static str) -> Self {
+    pub(crate) fn unavailable(reason: &'static str) -> Self {
         Self {
             code: error_codes::OPERATOR_PRESENCE_UNAVAILABLE,
             reason,
@@ -243,13 +243,18 @@ fn valid_summary(summary: &str) -> bool {
         })
 }
 
+enum RequestKind {
+    Module(ModuleRouteKey),
+    Privileged(Mutex<Option<oneshot::Sender<Outcome>>>),
+}
+
 struct Request {
     id: u64,
     module_id: String,
     summary: String,
     principal: String,
     text: String,
-    key: ModuleRouteKey,
+    kind: RequestKind,
     ctx: RouteCtx,
     frame: Frame,
     arrived: Instant,
@@ -280,6 +285,18 @@ struct State {
 pub(crate) struct OperatorConfirms {
     state: Mutex<State>,
     wake: Notify,
+}
+
+struct WithdrawOnDrop {
+    confirms: Arc<OperatorConfirms>,
+    id: u64,
+}
+
+impl Drop for WithdrawOnDrop {
+    fn drop(&mut self) {
+        self.confirms
+            .withdraw_matching(|request| request.id == self.id, "caller_cancelled");
+    }
 }
 impl std::fmt::Debug for OperatorConfirms {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -401,16 +418,80 @@ impl OperatorConfirms {
             module_id,
             summary: request.summary,
             principal,
-            key: ModuleRouteKey {
+            kind: RequestKind::Module(ModuleRouteKey {
                 endpoint: binding.module_endpoint,
                 channel: binding.module_channel,
-            },
+            }),
             ctx: ctx.clone(),
             frame,
             arrived: now,
             delivery_deadline: now + state.limits.delivery_budget(),
         });
         state.modules.insert(pending.module_id.clone(), pending.id);
+        self.enqueue(&mut state, pending);
+        Vec::new()
+    }
+
+    /// Client-control approval shares the module confirmation queue and timers,
+    /// but returns a decision to dispatch instead of sending an operator reply.
+    pub(crate) async fn approve_privileged(
+        self: &Arc<Self>,
+        ctx: &RouteCtx,
+        frame: &Frame,
+        operation: &str,
+        text: String,
+        caller: String,
+    ) -> Outcome {
+        let (answer, receive) = oneshot::channel();
+        let id = {
+            let mut state = self.lock();
+            let refusal = if state.stuck {
+                Some(Outcome::unavailable("provider_stuck"))
+            } else if state.queue.len() >= 4 {
+                Some(Outcome::unavailable("queue_full"))
+            } else {
+                None
+            };
+            if let Some(outcome) = refusal {
+                audit(
+                    operation,
+                    &text,
+                    &caller,
+                    outcome,
+                    Duration::ZERO,
+                    Duration::ZERO,
+                    false,
+                );
+                return outcome;
+            }
+            state.next_id += 1;
+            let id = state.next_id;
+            let now = Instant::now();
+            let pending = Arc::new(Request {
+                id,
+                module_id: operation.into(),
+                summary: text.clone(),
+                principal: caller,
+                text,
+                kind: RequestKind::Privileged(Mutex::new(Some(answer))),
+                ctx: ctx.clone(),
+                frame: frame.clone(),
+                arrived: now,
+                delivery_deadline: now + state.limits.delivery_budget(),
+            });
+            self.enqueue(&mut state, pending);
+            id
+        };
+        let _withdraw = WithdrawOnDrop {
+            confirms: Arc::clone(self),
+            id,
+        };
+        receive
+            .await
+            .unwrap_or_else(|_| Outcome::unavailable("provider_error"))
+    }
+
+    fn enqueue(self: &Arc<Self>, state: &mut State, pending: Arc<Request>) {
         if state.prompt.is_none() && state.queue.is_empty() {
             state.prompt = Some(Active {
                 request: pending,
@@ -428,7 +509,6 @@ impl OperatorConfirms {
             tokio::spawn(Arc::clone(self).run());
         }
         self.wake.notify_one();
-        Vec::new()
     }
 
     fn commit(
@@ -442,7 +522,7 @@ impl OperatorConfirms {
         let now = Instant::now();
         let wait = started.unwrap_or(now).duration_since(request.arrived);
         let prompt = started.map(|at| now.duration_since(at)).unwrap_or_default();
-        if outcome.reason == "person" {
+        if outcome.reason == "person" && matches!(request.kind, RequestKind::Module(_)) {
             state.backoff.insert(
                 (request.module_id.clone(), request.principal.clone()),
                 now + Duration::from_secs(30),
@@ -457,6 +537,12 @@ impl OperatorConfirms {
             prompt,
             shown,
         );
+        if let RequestKind::Privileged(answer) = &request.kind {
+            if let Some(answer) = answer.lock().unwrap_or_else(|p| p.into_inner()).take() {
+                let _ = answer.send(outcome);
+            }
+            return;
+        }
         let this = Arc::clone(self);
         #[cfg(test)]
         {
@@ -523,10 +609,22 @@ impl OperatorConfirms {
         matched
     }
     pub(crate) fn route_closed(self: &Arc<Self>, key: ModuleRouteKey) {
-        self.withdraw_matching(|r| r.key == key, "route_closed");
+        self.withdraw_matching(
+            |r| matches!(r.kind, RequestKind::Module(k) if k == key),
+            "route_closed",
+        );
     }
     pub(crate) fn module_closed(self: &Arc<Self>, endpoint: ModuleEndpointId) {
-        self.withdraw_matching(|r| r.key.endpoint == endpoint, "module_closed");
+        self.withdraw_matching(
+            |r| matches!(r.kind, RequestKind::Module(k) if k.endpoint == endpoint),
+            "module_closed",
+        );
+    }
+    pub(crate) fn connection_closed(self: &Arc<Self>, connection: crate::ConnectionId) {
+        self.withdraw_matching(
+            |r| matches!(r.kind, RequestKind::Privileged(_)) && r.ctx.connection_id == connection,
+            "caller_cancelled",
+        );
     }
     pub(crate) fn cancel(self: &Arc<Self>, connection: crate::ConnectionId, corr: u64) -> bool {
         self.withdraw_matching(

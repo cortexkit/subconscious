@@ -1,4 +1,5 @@
 use std::{
+    any::Any,
     error::Error,
     fmt, io,
     net::SocketAddr,
@@ -462,8 +463,9 @@ enum ConnectionLoopExit {
 /// Every accepted TCP connection must complete the key-auth prelude before any
 /// envelope bytes are read by the router. Outbound frames flow through a bounded
 /// [`FrameSink`] drained by one writer task. Inbound dispatch remains serial for
-/// every frame except `route.open` and `activity.record`; their bind/append waits
-/// run in connection-owned tasks so unrelated frames can keep flowing.
+/// every frame except `route.open`, `activity.record` and privileged requests;
+/// their bind, append and operator waits run in connection-owned tasks so
+/// unrelated frames can keep flowing.
 pub async fn handle_connection<S>(
     mut stream: S,
     router: Arc<Router>,
@@ -472,6 +474,11 @@ pub async fn handle_connection<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    // Capture only socket facts here. Process-table lookup happens lazily on a
+    // blocking thread when privileged dispatch needs a caller description.
+    let endpoints = (&stream as &dyn Any)
+        .downcast_ref::<tokio::net::TcpStream>()
+        .and_then(|tcp| tcp.local_addr().ok().zip(tcp.peer_addr().ok()));
     // Over-cap connections WAIT for a handshake slot (bounded by the auth deadline)
     // instead of being reset. A restart herd — every client and supervised child
     // re-dialing the fresh daemon at once — otherwise loses supervised modules to
@@ -515,6 +522,7 @@ where
 
     let mut connection = router.begin_connection();
     let connection_id = connection.id();
+    router.record_caller_endpoints(connection_id, endpoints);
     // `authenticated.role` is CLIENT-SUPPLIED and unverified -- the handshake
     // proves possession of the connection key, nothing about who is calling. So
     // this exclusion is safe ONLY while the role decides a reporting question and
@@ -551,12 +559,14 @@ where
     };
 
     let mut route_open_tasks = JoinSet::new();
+    let mut privileged_tasks = JoinSet::new();
     let loop_result = connection_loop(
         &mut read_half,
         Arc::clone(&router),
         ctx.clone(),
         close_receiver,
         &mut route_open_tasks,
+        &mut privileged_tasks,
     )
     .await;
 
@@ -568,6 +578,9 @@ where
     // cleanup has cleared it, with nothing left to refuse it and nothing to
     // clean it up. shutdown() aborts and then waits.
     route_open_tasks.shutdown().await;
+    // Abort held approvals and wait for their withdrawal guards before lifting
+    // this connection's cleanup state or removing its caller endpoints.
+    privileged_tasks.shutdown().await;
 
     drop(ctx);
     drop(egress);
@@ -680,6 +693,7 @@ async fn connection_loop<R>(
     ctx: RouteCtx,
     mut close_receiver: ConnectionCloseReceiver,
     route_open_tasks: &mut JoinSet<Result<(), RouterError>>,
+    privileged_tasks: &mut JoinSet<Result<(), RouterError>>,
 ) -> Result<ConnectionLoopExit, ConnectionError>
 where
     R: AsyncRead + Unpin,
@@ -687,6 +701,9 @@ where
     let mut activity_tasks = JoinSet::new();
     loop {
         while let Some(result) = activity_tasks.try_join_next() {
+            finish_route_open_task(result)?;
+        }
+        while let Some(result) = privileged_tasks.try_join_next() {
             finish_route_open_task(result)?;
         }
         while let Some(result) = route_open_tasks.try_join_next() {
@@ -709,6 +726,9 @@ where
                 }
                 result = activity_tasks.join_next(), if !activity_tasks.is_empty() => {
                     finish_route_open_task(result.expect("non-empty activity task set"))?;
+                }
+                result = privileged_tasks.join_next(), if !privileged_tasks.is_empty() => {
+                    finish_route_open_task(result.expect("non-empty privileged task set"))?;
                 }
                 result = &mut read => {
                     break match result.map_err(ConnectionError::FrameIo)? {
@@ -786,6 +806,15 @@ where
             route_open_tasks.spawn(async move {
                 route_open_tail(task_router, task_ctx, frame, dispatch_started_at).await
             });
+            continue;
+        }
+
+        if router.defers_privileged_control(&ctx, &frame) {
+            let task_router = Arc::clone(&router);
+            let task_ctx = ctx.clone();
+            let started = Instant::now();
+            privileged_tasks
+                .spawn(async move { route_open_tail(task_router, task_ctx, frame, started).await });
             continue;
         }
 

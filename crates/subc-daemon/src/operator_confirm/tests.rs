@@ -1050,3 +1050,759 @@ fn log_capture() -> (tracing::Dispatch, Arc<Mutex<Vec<String>>>) {
         messages,
     )
 }
+
+fn privileged_fixture(provider: Arc<dyn OperatorProvider>, limits: OperatorLimits) -> Fixture {
+    let mut f = Fixture::new(provider, limits);
+    f.handler =
+        Arc::new((*f.handler).clone().with_privileged_operator_prompt(
+            crate::daemon_config::PrivilegedOperatorPrompt::Enforce,
+        ));
+    f
+}
+
+fn restart(corr: u64) -> Frame {
+    frame(
+        FrameType::Request,
+        corr,
+        serde_json::json!({
+            "op":"supervisor.restart", "module_id":"held-target", "drain_timeout_ms":137
+        }),
+    )
+}
+
+fn held_restart(f: &Fixture, client: RouteCtx, corr: u64) -> tokio::task::JoinHandle<Vec<Frame>> {
+    let handler = f.handler.clone();
+    tokio::spawn(async move {
+        handler
+            .handle_control_frame(&client, restart(corr))
+            .await
+            .unwrap()
+    })
+}
+
+async fn decision(task: tokio::task::JoinHandle<Vec<Frame>>) -> Frame {
+    tokio::time::timeout(Duration::from_secs(4), task)
+        .await
+        .expect("privileged request terminates")
+        .unwrap()
+        .remove(0)
+}
+
+#[tokio::test]
+async fn privileged_restart_approval_holds_dispatch_until_provider_approves() {
+    let (provider, mut events) =
+        Controlled::new(ProviderResult::Approved, false, false, Duration::ZERO);
+    let f = privileged_fixture(Arc::new(provider.clone()), OperatorLimits::default());
+    let (client, _rx) = ctx_fn(800);
+    let task = held_restart(&f, client, 137);
+    let Event::Shown(text) = event(&mut events).await else {
+        panic!("prompt must be shown")
+    };
+    assert_eq!(
+        text,
+        "Restart module held-target — requested by an unidentified local process"
+    );
+    assert!(
+        !task.is_finished(),
+        "restart must not dispatch before approval"
+    );
+    provider.release();
+    let answer = decision(task).await;
+    assert_eq!(answer.header.corr, 137);
+    assert_eq!(
+        body(&answer)["code"],
+        "unknown_module",
+        "approved request reaches the real restart handler"
+    );
+}
+
+#[tokio::test]
+async fn privileged_restart_decline_never_dispatches() {
+    let (provider, mut events) =
+        Controlled::new(ProviderResult::Declined, false, false, Duration::ZERO);
+    let f = privileged_fixture(Arc::new(provider.clone()), OperatorLimits::default());
+    let (client, _rx) = ctx_fn(801);
+    let task = held_restart(&f, client, 138);
+    assert!(matches!(event(&mut events).await, Event::Shown(_)));
+    assert!(!task.is_finished());
+    provider.release();
+    let answer = decision(task).await;
+    assert_eq!(body(&answer)["code"], error_codes::OPERATOR_DECLINED);
+    assert_reason(&answer, "person");
+}
+
+#[tokio::test]
+async fn privileged_restart_unavailable_never_dispatches() {
+    let f = privileged_fixture(
+        Arc::new(Immediate(ProviderResult::Unavailable)),
+        OperatorLimits::default(),
+    );
+    let (client, _rx) = ctx_fn(802);
+    let answer = decision(held_restart(&f, client, 139)).await;
+    assert_eq!(
+        body(&answer)["code"],
+        error_codes::OPERATOR_PRESENCE_UNAVAILABLE
+    );
+    assert_reason(&answer, "provider_error");
+}
+
+#[tokio::test]
+async fn privileged_registered_module_restart_is_unsupported_in_both_modes() {
+    for mode in [
+        crate::daemon_config::PrivilegedOperatorPrompt::Log,
+        crate::daemon_config::PrivilegedOperatorPrompt::Enforce,
+    ] {
+        let (provider, mut events) =
+            Controlled::new(ProviderResult::Approved, false, false, Duration::ZERO);
+        let mut f = privileged_fixture(Arc::new(provider), OperatorLimits::default());
+        f.handler = Arc::new(
+            (*f.handler)
+                .clone()
+                .with_privileged_operator_prompt(mode)
+                .with_caller_lookup_for_test(|_| {
+                    panic!("a registered module must never trigger caller lookup")
+                }),
+        );
+        let m = f.module("module-caller", 803, "nonce").await;
+        #[cfg(unix)]
+        let target = supervised_privileged_target(&f);
+        #[cfg(unix)]
+        let before = target.status().unwrap();
+        let frames = f
+            .handler
+            .handle_control_frame(&m.ctx, restart(140))
+            .await
+            .unwrap();
+        assert_eq!(body(&frames[0])["code"], "unsupported_control_frame");
+        assert!(events.try_recv().is_err());
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                target.status().unwrap().spawn_generation,
+                before.spawn_generation
+            );
+            assert_eq!(target.status().unwrap().pid, before.pid);
+            target.stop().await.unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn privileged_reads_route_open_health_probe_and_preview_never_prompt_or_lookup() {
+    let f = privileged_fixture(
+        Arc::new(Immediate(ProviderResult::Approved)),
+        OperatorLimits::default(),
+    );
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count = calls.clone();
+    let handler = (*f.handler).clone().with_caller_lookup_for_test(move |_| {
+        count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        crate::caller_identity::CallerIdentity::default()
+    });
+    let (client, _rx) = ctx_fn(804);
+    for request in [
+        serde_json::json!({"op":"server.describe"}),
+        serde_json::json!({"op":"catalog.list"}),
+        serde_json::json!({"op":"supervisor.list"}),
+        serde_json::json!({"op":"supervisor.health"}),
+        serde_json::json!({"op":"supervisor.routes"}),
+        serde_json::json!({"op":"supervisor.provenance"}),
+        serde_json::json!({"op":"supervisor.stderr_tail","module_id":"missing"}),
+        serde_json::json!({"op":"supervisor.terminals","module_id":"missing"}),
+        serde_json::json!({"op":"supervisor.spawn_snapshot"}),
+        serde_json::json!({"op":"supervisor.spawn_subscribe"}),
+        serde_json::json!({"op":"supervisor.health_probe","module_id":"missing"}),
+        serde_json::json!({"op":"supervisor.rescan","preview":true}),
+        serde_json::json!({"op":"route.poll","route_channel":1,"route_epoch":1,"kind":"status"}),
+        serde_json::json!({"op":"route.open","target":{"kind":"tool_provider","module_id":"missing"},"identity":{"project_root":"/test","harness":"test","session":"test"}}),
+    ] {
+        // Decode first so a malformed fixture cannot masquerade as a no-prompt read.
+        let _: subc_control::ClientControlRequest =
+            serde_json::from_value(request.clone()).unwrap();
+        let replies = handler
+            .handle_control_frame(&client, frame(FrameType::Request, 141, request))
+            .await
+            .unwrap();
+        assert!(replies
+            .iter()
+            .all(|reply| body(reply)["code"] != error_codes::OPERATOR_PRESENCE_UNAVAILABLE));
+        assert!(f.forwarding.operator_confirms().lock().prompt.is_none());
+        assert!(f.forwarding.operator_confirms().lock().queue.is_empty());
+    }
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn privileged_caller_lookup_runs_on_a_blocking_thread() {
+    let runtime_thread = std::thread::current().id();
+    let f = privileged_fixture(
+        Arc::new(Immediate(ProviderResult::Unavailable)),
+        OperatorLimits::default(),
+    );
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count = calls.clone();
+    let handler = (*f.handler).clone().with_caller_lookup_for_test(move |_| {
+        assert_ne!(std::thread::current().id(), runtime_thread);
+        count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        crate::caller_identity::CallerIdentity::default()
+    });
+    let (client, _rx) = ctx_fn(805);
+    let replies = handler
+        .handle_control_frame(&client, restart(142))
+        .await
+        .unwrap();
+    assert_eq!(
+        body(&replies[0])["code"],
+        error_codes::OPERATOR_PRESENCE_UNAVAILABLE
+    );
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn privileged_and_module_requests_share_queue_full_and_queue_wait() {
+    let (provider, mut events) =
+        Controlled::new(ProviderResult::Approved, false, true, Duration::ZERO);
+    let f = privileged_fixture(
+        Arc::new(provider.clone()),
+        OperatorLimits {
+            queue_wait: Duration::from_millis(150),
+            prompt_timeout: Duration::from_secs(4),
+            stuck_grace: Duration::from_millis(50),
+        },
+    );
+    let m = f.module("shared", 806, "nonce").await;
+    assert!(f.request(&m, 1, "module first").await.is_empty());
+    assert!(matches!(event(&mut events).await, Event::Shown(_)));
+    let mut tasks = Vec::new();
+    for id in 810..814 {
+        let (client, _rx) = ctx_fn(id);
+        tasks.push(held_restart(&f, client, id));
+    }
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while f.forwarding.operator_confirms().lock().queue.len() != 4 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let (client, _rx) = ctx_fn(814);
+    let answer = decision(held_restart(&f, client, 814)).await;
+    assert_reason(&answer, "queue_full");
+    for task in tasks {
+        assert_reason(&decision(task).await, "queue_wait");
+    }
+    provider.release();
+    receive(&mut { m.rx }).await;
+}
+
+#[tokio::test]
+async fn privileged_requests_share_stuck_provider_refusal() {
+    let (provider, mut events) =
+        Controlled::new(ProviderResult::Approved, false, true, Duration::ZERO);
+    let f = privileged_fixture(Arc::new(provider.clone()), short_limits());
+    let (client, _rx) = ctx_fn(820);
+    let task = held_restart(&f, client, 143);
+    assert!(matches!(event(&mut events).await, Event::Shown(_)));
+    assert_reason(&decision(task).await, "timeout");
+    assert_eq!(event(&mut events).await, Event::Withdraw("timeout".into()));
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !f.forwarding.operator_confirms().lock().stuck {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let (client, _rx) = ctx_fn(821);
+    assert_reason(
+        &decision(held_restart(&f, client, 144)).await,
+        "provider_stuck",
+    );
+    provider.release();
+}
+
+#[test]
+#[ignore = "child process fixture for privileged restart tests"]
+fn privileged_child_waits_until_supervisor_teardown() {
+    loop {
+        std::thread::park();
+    }
+}
+
+#[cfg(unix)]
+fn supervised_privileged_target(f: &Fixture) -> crate::supervise::SupervisedModule {
+    let registry = Arc::new(Registry::default());
+    let supervisor = crate::Supervisor::new_for_test(registry, crate::RestartPolicy::default())
+        .with_handle(f.supervisor.clone());
+    let spec = crate::ModuleSpec {
+        module_id: "held-target".into(),
+        program: std::env::current_exe().unwrap(),
+        args: vec![
+            "--exact".into(),
+            "operator_confirm::tests::privileged_child_waits_until_supervisor_teardown".into(),
+            "--ignored".into(),
+        ],
+        env: Vec::new(),
+        reserved: false,
+        reserved_prefixes: Vec::new(),
+        protocol: subc_control::ModuleProtocol::None,
+        overlap: crate::supervise::ModuleOverlap::Exclusive,
+    };
+    supervisor.supervise_configured(spec, true).unwrap()
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn privileged_restart_approval_restarts_only_the_received_target() {
+    let (provider, mut events) =
+        Controlled::new(ProviderResult::Approved, false, false, Duration::ZERO);
+    let f = privileged_fixture(Arc::new(provider.clone()), OperatorLimits::default());
+    let module = supervised_privileged_target(&f);
+    let before = module.status().unwrap();
+    let (client, _rx) = ctx_fn(830);
+    let task = held_restart(&f, client, 145);
+    assert!(matches!(event(&mut events).await, Event::Shown(_)));
+    assert_eq!(
+        module.status().unwrap().spawn_generation,
+        before.spawn_generation
+    );
+    assert!(!task.is_finished());
+    provider.release();
+    let answer = decision(task).await;
+    assert_eq!(answer.header.corr, 145);
+    assert_eq!(
+        body(&answer),
+        serde_json::json!({"op":"supervisor.ack","module_id":"held-target","applied":true})
+    );
+    tokio::time::timeout(Duration::from_secs(4), async {
+        while module.status().unwrap().spawn_generation == before.spawn_generation {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("approval actually replaces the child");
+    assert_ne!(module.status().unwrap().pid, before.pid);
+    module.stop().await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn privileged_restart_decline_leaves_the_running_process_unchanged() {
+    let f = privileged_fixture(
+        Arc::new(Immediate(ProviderResult::Declined)),
+        OperatorLimits::default(),
+    );
+    let module = supervised_privileged_target(&f);
+    let before = module.status().unwrap();
+    let (client, _rx) = ctx_fn(831);
+    let answer = decision(held_restart(&f, client, 146)).await;
+    assert_eq!(body(&answer)["code"], error_codes::OPERATOR_DECLINED);
+    assert_reason(&answer, "person");
+    assert_eq!(
+        module.status().unwrap().spawn_generation,
+        before.spawn_generation
+    );
+    assert_eq!(module.status().unwrap().pid, before.pid);
+    module.stop().await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn privileged_restart_unavailable_leaves_the_running_process_unchanged() {
+    let f = privileged_fixture(
+        Arc::new(Immediate(ProviderResult::Unavailable)),
+        OperatorLimits::default(),
+    );
+    let module = supervised_privileged_target(&f);
+    let before = module.status().unwrap();
+    let (client, _rx) = ctx_fn(832);
+    let answer = decision(held_restart(&f, client, 147)).await;
+    assert_eq!(
+        body(&answer)["code"],
+        error_codes::OPERATOR_PRESENCE_UNAVAILABLE
+    );
+    assert_reason(&answer, "provider_error");
+    assert_eq!(
+        module.status().unwrap().spawn_generation,
+        before.spawn_generation
+    );
+    assert_eq!(module.status().unwrap().pid, before.pid);
+    module.stop().await.unwrap();
+}
+
+async fn privileged_socket(
+    router: Arc<crate::Router>,
+) -> (
+    tokio::io::DuplexStream,
+    tokio::task::JoinHandle<Result<(), crate::server::ConnectionError>>,
+) {
+    use subc_transport::{authenticate_client, ConnectionInfo, Endpoint, SCHEMA_VERSION};
+    let (mut client, server) = tokio::io::duplex(64 * 1024);
+    let key = vec![0x42; 32];
+    let daemon_id = [0x24; 16];
+    let auth = crate::server::ServerAuth::new(key.clone(), daemon_id, "test-subc");
+    let server = tokio::spawn(crate::server::handle_connection(server, router, auth));
+    let connection = ConnectionInfo {
+        schema: SCHEMA_VERSION,
+        wire_version: None,
+        endpoints: vec![Endpoint {
+            host: "127.0.0.1".into(),
+            port: 1,
+        }],
+        key,
+        daemon_id,
+        pid: std::process::id(),
+        daemon_ver: "test-subc".into(),
+    };
+    authenticate_client(&mut client, &connection, Duration::from_secs(2))
+        .await
+        .unwrap();
+    (client, server)
+}
+
+async fn socket_reply(client: &mut tokio::io::DuplexStream) -> Frame {
+    tokio::time::timeout(Duration::from_secs(2), crate::read_frame(client))
+        .await
+        .expect("reader must not wait behind an operator prompt")
+        .unwrap()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn privileged_prompt_does_not_hold_same_or_other_connection_reader() {
+    let (provider, mut events) =
+        Controlled::new(ProviderResult::Approved, false, false, Duration::ZERO);
+    let f = privileged_fixture(Arc::new(provider.clone()), OperatorLimits::default());
+    let router = Arc::new(crate::Router::with_control_handler(f.handler.clone()));
+    let (mut first, first_server) = privileged_socket(router.clone()).await;
+    let (mut second, second_server) = privileged_socket(router).await;
+    crate::write_frame(&mut first, &restart(150)).await.unwrap();
+    assert!(matches!(event(&mut events).await, Event::Shown(_)));
+    let read = frame(
+        FrameType::Request,
+        151,
+        serde_json::json!({"op":"supervisor.list"}),
+    );
+    crate::write_frame(&mut first, &read).await.unwrap();
+    crate::write_frame(&mut second, &read).await.unwrap();
+    assert_eq!(socket_reply(&mut first).await.header.corr, 151);
+    assert_eq!(socket_reply(&mut second).await.header.corr, 151);
+    provider.release();
+    assert_eq!(socket_reply(&mut first).await.header.corr, 150);
+    drop(first);
+    drop(second);
+    first_server.await.unwrap().unwrap();
+    second_server.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn privileged_disconnect_withdraws_prompt_and_discards_late_approval() {
+    let (provider, mut events) =
+        Controlled::new(ProviderResult::Approved, false, false, Duration::ZERO);
+    let f = privileged_fixture(Arc::new(provider.clone()), OperatorLimits::default());
+    #[cfg(unix)]
+    let module = supervised_privileged_target(&f);
+    #[cfg(unix)]
+    let before = module.status().unwrap();
+    let router = Arc::new(crate::Router::with_control_handler(f.handler.clone()));
+    let (mut client, server) = privileged_socket(router).await;
+    crate::write_frame(&mut client, &restart(152))
+        .await
+        .unwrap();
+    assert!(matches!(event(&mut events).await, Event::Shown(_)));
+    drop(client);
+    assert_eq!(
+        event(&mut events).await,
+        Event::Withdraw("caller_cancelled".into())
+    );
+    assert_eq!(event(&mut events).await, Event::Returned);
+    tokio::time::timeout(Duration::from_secs(2), server)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(f.forwarding.operator_confirms().lock().queue.is_empty());
+    #[cfg(unix)]
+    {
+        assert_eq!(
+            module.status().unwrap().spawn_generation,
+            before.spawn_generation
+        );
+        assert_eq!(module.status().unwrap().pid, before.pid);
+        module.stop().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn privileged_disconnect_while_queued_never_shows_that_prompt() {
+    let (provider, mut events) =
+        Controlled::new(ProviderResult::Approved, false, false, Duration::ZERO);
+    let f = privileged_fixture(Arc::new(provider.clone()), OperatorLimits::default());
+    let router = Arc::new(crate::Router::with_control_handler(f.handler.clone()));
+    let (mut first, first_server) = privileged_socket(router.clone()).await;
+    let (mut queued, queued_server) = privileged_socket(router).await;
+    crate::write_frame(&mut first, &restart(153)).await.unwrap();
+    assert!(matches!(event(&mut events).await, Event::Shown(_)));
+    crate::write_frame(&mut queued, &restart(154))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while f.forwarding.operator_confirms().lock().queue.is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    drop(queued);
+    tokio::time::timeout(Duration::from_secs(2), queued_server)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(f.forwarding.operator_confirms().lock().queue.is_empty());
+    provider.release();
+    assert_eq!(socket_reply(&mut first).await.header.corr, 153);
+    assert_eq!(event(&mut events).await, Event::Returned);
+    assert!(events.try_recv().is_err());
+    drop(first);
+    first_server.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn privileged_applying_rescan_reads_after_approval_and_keeps_enforce_until_restart() {
+    let dir = cortexkit_test_support::ScratchDir::new("privileged-rescan");
+    let path = dir.join("subc.jsonc");
+    std::fs::write(
+        &path,
+        r#"{"version":1,"privileged_operator_prompt":"enforce"}"#,
+    )
+    .unwrap();
+    let (provider, mut events) =
+        Controlled::new(ProviderResult::Approved, false, false, Duration::ZERO);
+    let mut f = privileged_fixture(Arc::new(provider.clone()), OperatorLimits::default());
+    let supervisor = crate::Supervisor::new_for_test(
+        Arc::new(Registry::default()),
+        crate::RestartPolicy::default(),
+    )
+    .with_handle(f.supervisor.clone());
+    f.handler = Arc::new(
+        (*f.handler)
+            .clone()
+            .with_supervisor_rescan(supervisor, &path, None),
+    );
+    let router = Arc::new(crate::Router::with_control_handler(f.handler.clone()));
+    let (mut client, server) = privileged_socket(router).await;
+    crate::write_frame(
+        &mut client,
+        &frame(
+            FrameType::Request,
+            155,
+            serde_json::json!({"op":"supervisor.rescan"}),
+        ),
+    )
+    .await
+    .unwrap();
+    let Event::Shown(text) = event(&mut events).await else {
+        panic!("rescan prompt")
+    };
+    assert_eq!(text, "Apply the daemon config file as it reads when approved (rescan) — requested by an unidentified local process");
+    assert!(f.supervisor.get("edited-after-prompt").is_none());
+    std::fs::write(&path, r#"{"version":1,"privileged_operator_prompt":"log","modules":{"edited-after-prompt":{"program":"never-executed","enabled":false}}}"#).unwrap();
+    provider.release();
+    let answer = socket_reply(&mut client).await;
+    assert_eq!(
+        body(&answer)["restart_required"],
+        serde_json::json!(["privileged_operator_prompt"])
+    );
+    assert!(
+        f.supervisor.get("edited-after-prompt").is_some(),
+        "the approved rescan must apply the edited file"
+    );
+    assert_eq!(event(&mut events).await, Event::Returned);
+    crate::write_frame(&mut client, &restart(156))
+        .await
+        .unwrap();
+    assert!(
+        matches!(event(&mut events).await, Event::Shown(text) if text.starts_with("Restart module held-target"))
+    );
+    assert_eq!(socket_reply(&mut client).await.header.corr, 156);
+    assert_eq!(event(&mut events).await, Event::Returned);
+    drop(client);
+    server.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn privileged_log_mode_runs_every_classified_write_and_logs_once() {
+    let f = Fixture::new(
+        Arc::new(Immediate(ProviderResult::Declined)),
+        OperatorLimits::default(),
+    );
+    let (client, _rx) = ctx_fn(840);
+    for request in [
+        serde_json::json!({"op":"supervisor.restart","module_id":"log-target"}),
+        serde_json::json!({"op":"supervisor.swap","module_id":"log-target"}),
+        serde_json::json!({"op":"supervisor.reload","module_id":"log-target"}),
+        serde_json::json!({"op":"supervisor.rescan"}),
+        serde_json::json!({"op":"supervisor.set_enabled","module_id":"log-target","enabled":false}),
+        serde_json::json!({"op":"supervisor.set_enabled","module_id":"log-target","enabled":true}),
+        serde_json::json!({"op":"supervisor.release_reserved","module_id":"log-target"}),
+    ] {
+        let (logs, _guard) = crate::router::test_log::log_capture(tracing::Level::INFO);
+        let op = request["op"].as_str().unwrap();
+        let replies = f
+            .handler
+            .handle_control_frame(&client, frame(FrameType::Request, 157, request.clone()))
+            .await
+            .unwrap();
+        assert_eq!(replies.len(), 1);
+        assert_ne!(body(&replies[0])["code"], error_codes::OPERATOR_DECLINED);
+        assert!(f.forwarding.operator_confirms().lock().prompt.is_none());
+        let logs = crate::router::test_log::captured_logs(&logs);
+        let lines: Vec<_> = logs
+            .lines()
+            .filter(|line| line.contains("privileged request would prompt the operator"))
+            .collect();
+        assert_eq!(lines.len(), 1, "{logs}");
+        assert!(lines[0].contains("INFO") && lines[0].contains(op));
+        assert!(lines[0].contains("an unidentified local process"));
+        if op != "supervisor.rescan" {
+            assert!(lines[0].contains("log-target"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn privileged_caller_endpoint_records_are_removed_and_never_reused_stale() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let observed = seen.clone();
+    let f = privileged_fixture(
+        Arc::new(Immediate(ProviderResult::Unavailable)),
+        OperatorLimits::default(),
+    );
+    let handler = (*f.handler)
+        .clone()
+        .with_caller_lookup_for_test(move |endpoints| {
+            observed.lock().unwrap().push(endpoints);
+            crate::caller_identity::CallerIdentity::default()
+        });
+    let router = crate::Router::with_control_handler(Arc::new(handler.clone()));
+    let connection = router.begin_connection();
+    let (client, _rx) = ctx_fn(connection.id().get());
+    let endpoints = (
+        "127.0.0.1:41234".parse().unwrap(),
+        "127.0.0.1:41235".parse().unwrap(),
+    );
+    handler.record_caller_endpoints(client.connection_id, Some(endpoints));
+    handler
+        .handle_control_frame(&client, restart(158))
+        .await
+        .unwrap();
+    drop(connection);
+    handler
+        .handle_control_frame(&client, restart(159))
+        .await
+        .unwrap();
+    handler.record_caller_endpoints(client.connection_id, Some(endpoints));
+    handler.record_caller_endpoints(client.connection_id, None);
+    handler
+        .handle_control_frame(&client, restart(160))
+        .await
+        .unwrap();
+    assert_eq!(*seen.lock().unwrap(), vec![Some(endpoints), None, None]);
+}
+
+#[tokio::test]
+async fn privileged_log_names_the_caller_resolved_from_accepted_socket_endpoints() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let _client = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+        .await
+        .unwrap();
+    let (accepted, _) = listener.accept().await.unwrap();
+    let f = Fixture::new(
+        Arc::new(Immediate(ProviderResult::Declined)),
+        OperatorLimits::default(),
+    );
+    let (client, _rx) = ctx_fn(842);
+    f.handler.record_caller_endpoints(
+        client.connection_id,
+        Some((
+            accepted.local_addr().unwrap(),
+            accepted.peer_addr().unwrap(),
+        )),
+    );
+    let (logs, _guard) = crate::router::test_log::log_capture(tracing::Level::INFO);
+    f.handler
+        .handle_control_frame(&client, restart(161))
+        .await
+        .unwrap();
+    let logs = crate::router::test_log::captured_logs(&logs);
+    let expected = format!("pid {} (", std::process::id());
+    assert!(logs.contains(&expected), "{logs}");
+    assert!(
+        logs.contains(
+            std::env::current_exe()
+                .unwrap()
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+        ),
+        "{logs}"
+    );
+}
+
+#[cfg(feature = "test-support")]
+async fn scripted_privileged_restart(result: &str, expected_code: &str, expected_reason: &str) {
+    let dir = cortexkit_test_support::ScratchDir::new("privileged-script");
+    let script = dir.join("script");
+    let events = dir.join("events");
+    std::fs::write(&script, result).unwrap();
+    let mut config = crate::bootstrap::BootstrapConfig::new(dir.join("connection"), 0);
+    config.operator_script = Some(script);
+    config.operator_events = Some(events.clone());
+    let provider = super::test_provider::select(
+        Arc::new(Immediate(ProviderResult::NoPresence)),
+        &config,
+        Some(std::path::Path::new("ckdev-subc")),
+    );
+    let f = privileged_fixture(provider, OperatorLimits::default());
+    let (client, _rx) = ctx_fn(850);
+    let answer = decision(held_restart(&f, client, 162)).await;
+    assert_eq!(answer.header.corr, 162);
+    assert_eq!(body(&answer)["code"], expected_code);
+    if !expected_reason.is_empty() {
+        assert_reason(&answer, expected_reason);
+    }
+    let events: Vec<serde_json::Value> = std::fs::read_to_string(events)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0]["event"], "prompt_shown");
+    assert_eq!(
+        events[0]["text"],
+        "Restart module held-target — requested by an unidentified local process"
+    );
+    assert_eq!(events[1]["event"], "provider_returned");
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn privileged_scripted_approval_dispatches_the_original_restart() {
+    scripted_privileged_restart("approve", "unknown_module", "").await;
+}
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn privileged_scripted_decline_refuses_restart() {
+    scripted_privileged_restart("decline", error_codes::OPERATOR_DECLINED, "person").await;
+}
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn privileged_scripted_unavailable_refuses_restart() {
+    scripted_privileged_restart(
+        "unavailable",
+        error_codes::OPERATOR_PRESENCE_UNAVAILABLE,
+        "provider_error",
+    )
+    .await;
+}

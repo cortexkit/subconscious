@@ -785,6 +785,18 @@ impl Router {
         self.control.route_open_target(frame)
     }
 
+    pub(crate) fn record_caller_endpoints(
+        &self,
+        connection: ConnectionId,
+        endpoints: Option<(std::net::SocketAddr, std::net::SocketAddr)>,
+    ) {
+        self.control.record_caller_endpoints(connection, endpoints);
+    }
+
+    pub(crate) fn defers_privileged_control(&self, ctx: &RouteCtx, frame: &Frame) -> bool {
+        self.control.defers_privileged_control(ctx, frame)
+    }
+
     pub(crate) fn route_open_capacity_refusal(
         &self,
         ctx: &RouteCtx,
@@ -822,7 +834,8 @@ impl Router {
                 "routing control frame"
             );
             // The connection loop dispatches every control operation directly
-            // except `route.open`. Its task passes a timestamp captured before
+            // except `route.open`, activity writes and privileged requests. Each
+            // task passes a timestamp captured before
             // spawn, so slow-dispatch timing includes scheduler delay but no
             // wait in an application-owned queue.
             let dispatch_started_at = (frame.header.ty == FrameType::Request)

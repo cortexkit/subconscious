@@ -354,10 +354,11 @@ pub struct ControlHandler {
     scope_authority_owners: Vec<String>,
     /// Fixed at startup so rescan cannot change the policy that guards rescan itself.
     privileged_operator_prompt: PrivilegedOperatorPrompt,
+    /// The local and peer address of each accepted TCP client connection, read
+    /// from the daemon's own socket, so a privileged request can name its caller.
     caller_endpoints: Arc<Mutex<HashMap<ConnectionId, (SocketAddr, SocketAddr)>>>,
     #[cfg(test)]
-    caller_lookup:
-        Option<Arc<dyn Fn(Option<(SocketAddr, SocketAddr)>) -> CallerIdentity + Send + Sync>>,
+    caller_lookup: Option<TestCallerLookup>,
     /// The launch nonce each module connection presented at HELLO, which is how
     /// a `scope.sync` is matched to the owner's current launch.
     hello_launch_nonces: Arc<Mutex<HelloLaunchNonces>>,
@@ -6330,6 +6331,11 @@ fn log_slow_control_dispatch(
         );
     }
 }
+
+/// A test stand-in for the OS caller lookup, given the recorded endpoints.
+#[cfg(test)]
+type TestCallerLookup =
+    Arc<dyn Fn(Option<(SocketAddr, SocketAddr)>) -> CallerIdentity + Send + Sync>;
 
 /// Every new client operation needs an explicit privilege decision here.
 fn privileged_operation(request: &ClientControlRequest) -> Option<PrivilegedOperation<'_>> {

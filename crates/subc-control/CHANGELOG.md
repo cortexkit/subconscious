@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.29.2
+
+- Add `RunningImageEvidence::WindowsSpawnFileId` (volume serial number and full 128-bit file ID) and the `windows_working_set` memory kind, so Windows reports a running-image check and resource readings instead of "unavailable". Older readers decode the new evidence as unknown. `RunningImageEvidence` is not `#[non_exhaustive]`, so a downstream crate that matches it exhaustively must add the new arm.
+
 ## 0.29.1
 
 - Add optional manifest-mirrored bus event declarations to `CatalogEntry`, omitting the field when the manifest has no event declaration.

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.7
+
+- Coordinate the package version with the `subc-protocol` 0.31 call-mode release. No API or behavior change; consumers need no code changes, but path consumers must refresh their lockfile for the new package version.
+
 ## 0.1.6
 
 - Test-only: the tests' helpers (temporary directories, process-liveness checks, and copies of test programs under `ckdev-` names) now come from the published `cortexkit-test-support` crate, which other CortexKit repositories also use, instead of a private copy in this repository. No runtime change.

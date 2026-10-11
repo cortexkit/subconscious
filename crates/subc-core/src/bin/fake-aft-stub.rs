@@ -1405,6 +1405,7 @@ async fn handle_control_request(
             role_versions,
             admission_facts,
             scope,
+            call_mode: _,
         } => {
             state.tentative_channels.insert(route_channel, epoch);
             record_event(

@@ -1,10 +1,11 @@
 # Changelog
 
-## Unreleased
+## 0.34.0
 
+- **Breaking.** Upgrade direct dependencies to `subc-protocol` 0.31, `subc-control` 0.30 and `subc-transport` 0.12 together with the daemon: its public API passes their types to consumers. Replace `ScopeStamp` literals with its constructor and setters and account for optional `call_mode` in raw bind constructors and exhaustive patterns. Restart the daemon before scope owners send delegating runs. Providers must read every bind's mode, handle all three known modes and refuse unknown modes before declaring `call-modes/v1`; the daemon does not enforce per-tool mode restrictions.
 - Require subc-protocol 0.31. Targets declaring `call-modes/v1` receive a scope-derived `call_mode` on every bind and `expires_at_ms` on stamps with deadlines. Legacy targets receive neither new field: non-delegating runs still bind through `agent-run-scopes/v1`, and flows through `flow-scopes/v1`. Both route admission and the captured relay endpoint require `call-modes/v1` or the matching legacy capability.
 - Accept delegating run scope records, but refuse their binds unless the target declares `call-modes/v1`. Older run providers assumed no delegated agent authority; the refusal names that delegation and a relay refusal releases its reservation.
-- Include the immutable epoch deadline in `scope.describe` stamps. Existing Rust stamp decoders accept extra fields, and the TypeScript and Swift clients' generic response paths do not reject extra JSON fields.
+- Include the immutable epoch deadline in `scope.describe` stamps. Existing Rust stamp decoders accept extra fields, and Swift's management reply path preserves them. The TypeScript client has no describe API or reply decoder; its provider bind decoder ignores extra fields. Swift has no provider bind decoder.
 - Update the record-validation test that formerly required `run_id` with `delegates` to be refused: delegation is now checked against each route's target, not rejected in scope records. Add daemon bind golden fixtures and reconnect tests that replace an admitted declarer with a legacy endpoint, verifying field omission and delegation refusal at relay re-check.
 
 ## 0.33.8

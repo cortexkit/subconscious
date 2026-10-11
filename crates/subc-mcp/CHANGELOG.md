@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.34
+
+- Update the internal MCP gateway to `subc-protocol` 0.31, `subc-control` 0.30 and `subc-transport` 0.12 for the call-mode release. MCP clients need no request changes: the daemon derives mode from scope, not payloads. Providers handling calls opt into `call-modes/v1` separately; legacy non-delegating run and flow routing remains supported.
+
 ## 0.1.33
 
 - Keep response and error events in one waiter in the initialize-boundary reverse-request test, so a provider response arriving before the raw client's stdio write completion cannot be discarded by an error-only waiter. Add a deterministic response-first regression; MCP runtime behavior and timeout budgets are unchanged.

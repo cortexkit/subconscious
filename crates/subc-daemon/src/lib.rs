@@ -8,6 +8,7 @@
 
 mod activity;
 pub mod bootstrap;
+pub mod caller_identity;
 pub(crate) mod capability_requirements;
 mod child_resources;
 mod child_roster;

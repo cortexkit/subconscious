@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.16
+
+- Add `socket_peer::loopback_socket_peer`, a best-effort lookup of the connecting process's PID and executable for an accepted loopback TCP connection. Match the peer's full socket tuple using libproc on macOS, socket inodes in Linux procfs, and the Windows extended TCP owner table. Unavailable or unreadable identities return `None`; this information is for caller descriptions, not authentication.
+
 ## 0.1.15
 
 - Add `Process::observe_with_executable_access` and `ExecutableAccess` to distinguish Linux executable permission denial (EACCES/EPERM) from other failures. Preserve `Observation`, `FileIdentity`, and `Process::observe` for existing callers; macOS and Windows keep their previous observations. A non-dumpable Linux child can hide its executable while its start time remains readable.

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.17
+
+- Reinstate the activity-ledger mirror on `ck.<account>.event.subc.activity.v1`, preserving each entry's `(daemon_incarnation, seq)`. Advance `activity_cursor.json` only after broker storage acknowledgement, and back off and resume from it on failure or restart.
+- Start fresh or damaged cursors at query head without backfill. When the daemon refuses a saved cursor or ends a feed that fell behind, replay the entries it still keeps in its ledger file, in sequence order, then follow from its current head. Entries the daemon already deleted under its 30-day or size limit can't be replayed; the mirror logs each such gap with its first and last sequence numbers.
+- Share the vault's supervised launch-identity helper with the mirror preflight. SDK activity reads carry `reserved:ckbus`; missing identity warns once about unverified local reads, and nonce-read errors stop initialization.
+- Test-only: tests wait for the mirror's checkpoint signal instead of reopening the cursor file, which on Windows made the checkpoint's file replacement fail.
+- Scope test mutex guards before asynchronous waits so all-targets strict clippy accepts the mirror tests.
+
 ## 0.3.16
 
 - Withdraws 0.3.15, which never shipped: the activity ledger's bus copy returns in a later release, once it passes on Windows. The code is identical to 0.3.14.

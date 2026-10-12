@@ -1117,7 +1117,7 @@ struct SupervisorSnapshot {
     report_ready: Option<Arc<OnceLock<()>>>,
     /// Last reaped child, retained after current process facts are cleared.
     reaped_pid: Option<u32>,
-    /// Whether the command-serving supervision loop has a scheduled respawn.
+    /// Whether a replacement has already been scheduled for the current process.
     respawn_pending: bool,
     /// A second restart is waiting for the replacement already scheduled.
     coalesced_restart_pending: bool,
@@ -3574,6 +3574,7 @@ impl SupervisedModule {
         Ok(match snapshot.state {
             ModuleState::Restarting => true,
             ModuleState::Failed | ModuleState::Disabled => false,
+            _ if snapshot.enabled && snapshot.respawn_pending => true,
             _ => daemon_will_restart(&mut snapshot, &self.inner.restart_policy, Instant::now()),
         })
     }
@@ -7429,6 +7430,12 @@ async fn on_child_exit(
             if let Err(err) = update_snapshot(snapshot, Some(&spec.module_id), |state| {
                 if state.enabled {
                     if let Some(schedule) = state.next_crash_restart(&policy, now) {
+                        // Reserving the last slot exhausts the budget for the
+                        // replacement, not for this exit. Publish its scheduled
+                        // recovery atomically with the reservation so connection
+                        // cleanup sees it while terminal recording still holds
+                        // the visible state at Running.
+                        state.respawn_pending = true;
                         final_state = ModuleState::Restarting;
                         restart_schedule = Some(schedule);
                         disposition = TerminalDisposition::Restarting;
@@ -11066,6 +11073,91 @@ mod terminal_history_tests {
         assert_eq!(history.entries.len(), 1);
         assert_eq!(history.entries[0].exit_code, Some(0));
         assert_eq!(history.entries[0].disposition, TerminalDisposition::Failed);
+    }
+
+    #[test]
+    fn crash_restart_at_budget_limit_remains_recoverable_while_recording() {
+        use std::io::{Read, Write};
+
+        let supervisor = Supervisor::new_for_test(
+            Arc::new(Registry::default()),
+            RestartPolicy::new(3, Duration::ZERO),
+        );
+        let mut runtime = supervisor.runtime_config();
+        let module = module_with_recovery_snapshot(ModuleState::Running, true, 2);
+        let snapshot = module.inner.snapshot.clone();
+        lock_snapshot(&snapshot).unwrap().process_alive = true;
+        runtime.terminal_ring = module.inner.terminal_ring.clone();
+        let spec = windowed_crash_spec(module.module_id());
+        let mut barrier = terminal_record_barrier(&runtime.spawn_events);
+        let reaped_snapshot = snapshot.clone();
+        let reap = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(on_child_exit(
+                    &spec,
+                    runtime.restart_policy,
+                    &supervisor.registry,
+                    &reaped_snapshot,
+                    &runtime.terminal_ring,
+                    &runtime.spawn_events,
+                    &runtime.child_roster,
+                    ExitReport {
+                        kind: ExitKind::Crash,
+                        code: Some(2),
+                        signal: None,
+                        at_ms: 1,
+                    },
+                ))
+        });
+
+        // Hold the crash handler between its budget decision and publication.
+        // Connection cleanup must still see the recovery that this crash chose,
+        // even when that recovery consumes the last available restart slot.
+        let mut reached = [0];
+        barrier.read_exact(&mut reached).unwrap();
+        assert_eq!(&reached, b"R");
+        let before_status = module.status().unwrap();
+        let before_history = module.terminal_history();
+        let before_recovers = module.will_recover_after_connection_loss().unwrap();
+        barrier.write_all(b"X").unwrap();
+        assert!(matches!(reap.join().unwrap(), NextAction::Restart { .. }));
+
+        assert_eq!(before_status.state, ModuleState::Running);
+        assert!(before_status.process_alive);
+        assert_eq!(before_status.restart_count, 3);
+        assert!(before_history.entries.is_empty());
+        assert!(
+            before_recovers,
+            "connection cleanup would report a terminal close for a scheduled crash restart"
+        );
+        let restarting = module.status().unwrap();
+        assert_eq!(restarting.state, ModuleState::Restarting);
+        assert_eq!(restarting.restart_count, 3);
+        assert!(module.will_recover_after_connection_loss().unwrap());
+        let history = module.terminal_history();
+        assert_eq!(history.entries.len(), 1);
+        assert_eq!(
+            history.entries[0].disposition,
+            TerminalDisposition::Restarting
+        );
+
+        // Once the replacement is running, its next crash must be judged
+        // against the exhausted budget rather than the previous recovery.
+        update_snapshot(&snapshot, Some(module.module_id()), |state| {
+            state.state = ModuleState::Running;
+            state.respawn_pending = false;
+        })
+        .unwrap();
+        assert!(!module.will_recover_after_connection_loss().unwrap());
+        update_snapshot(&snapshot, Some(module.module_id()), |state| {
+            state.enabled = false;
+            state.respawn_pending = true;
+        })
+        .unwrap();
+        assert!(!module.will_recover_after_connection_loss().unwrap());
     }
 
     fn terminal_record_barrier(events: &super::SpawnEventFeed) -> std::net::TcpStream {

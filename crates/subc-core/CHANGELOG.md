@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.20.84
+
+- Make forwarding-test stub spawn helpers and replacement attachments wait for catalog publication on a separate authenticated connection, so route.open cannot race installation of the module's forwarding endpoint.
+
+- Make the crash route-close tests wait for catalog publication and trigger crashes only after binding, rather than racing a launch-relative timer that could attach to an already restarted process. Verify that the client can reopen after the non-terminal close and that crashing the replacement exhausts the one-restart budget. The test provider supports crashing on a bound-route request.
+
 ## 0.20.83
 
 - Add `ck activity` with agent, project, module, kind, inclusive millisecond time-range and limit filters, a UTC time/module/actor/summary table, and JSON output. `--follow` subscribes from the query's head without a handoff gap and applies the same filters to live entries; JSON follow output is one entry per line.

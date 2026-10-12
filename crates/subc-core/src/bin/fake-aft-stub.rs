@@ -42,6 +42,8 @@ use tokio::{
 
 const FAKE_AFT_MODULE_ID_ENV: &str = "FAKE_AFT_MODULE_ID";
 const FAKE_AFT_CRASH_AFTER_MS_ENV: &str = "FAKE_AFT_CRASH_AFTER_MS";
+/// Exit 2 on a bound-route request so tests can finish attaching before a crash.
+const FAKE_AFT_CRASH_ON_REQUEST_ENV: &str = "FAKE_AFT_CRASH_ON_REQUEST";
 /// Exit 0 after the delay: exercises the supervisor's clean-exit arm, which
 /// must keep the supervision command channel alive for later operator restarts.
 const FAKE_AFT_CLEAN_EXIT_AFTER_MS_ENV: &str = "FAKE_AFT_CLEAN_EXIT_AFTER_MS";
@@ -1062,6 +1064,9 @@ async fn handle_frame(
                     "body_json": serde_json::from_slice::<Value>(&frame.body).ok(),
                 }),
             )?;
+            if env_flag(FAKE_AFT_CRASH_ON_REQUEST_ENV) {
+                std::process::exit(2);
+            }
             let behavior = request_behavior(config, &frame.body);
             let fanout_channels = state
                 .bound_channels

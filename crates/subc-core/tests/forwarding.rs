@@ -400,8 +400,7 @@ async fn health_restart_spawn_failure_marks_failed_and_start_recovers() {
         ],
     );
     spec.program = program.clone();
-    let module = supervisor.spawn(spec).unwrap();
-    wait_for_registration(&server.registry, module_id, SETUP_TIMEOUT).await;
+    let module = spawn_published_stub(&server, &supervisor, spec).await;
 
     // The running process keeps its executable mapped after unlink on Unix, while
     // the health-triggered replacement deterministically fails at Command::spawn.
@@ -1233,10 +1232,12 @@ async fn reserved_consumer_identity_stamps_reserved_principal() {
             .await;
 
     let consumer_module_id = "fake-consumer-reserved";
-    let consumer = supervisor
-        .spawn(reserved_stub_spec(&server, consumer_module_id))
-        .unwrap();
-    wait_for_registration(&server.registry, consumer_module_id, SETUP_TIMEOUT).await;
+    let consumer = spawn_published_stub(
+        &server,
+        &supervisor,
+        reserved_stub_spec(&server, consumer_module_id),
+    )
+    .await;
     let launch_nonce = server
         .supervisor_handle
         .reserved_launch_nonce_for(consumer_module_id)
@@ -1300,10 +1301,12 @@ async fn mismatched_consumer_identity_rejects_without_route_bind() {
             .await;
 
     let consumer_module_id = "fake-consumer-mismatch";
-    let consumer = supervisor
-        .spawn(reserved_stub_spec(&server, consumer_module_id))
-        .unwrap();
-    wait_for_registration(&server.registry, consumer_module_id, SETUP_TIMEOUT).await;
+    let consumer = spawn_published_stub(
+        &server,
+        &supervisor,
+        reserved_stub_spec(&server, consumer_module_id),
+    )
+    .await;
 
     let project = TestProject::new();
     let mut client = connect_authed_client(&server.connection_file_path)
@@ -1508,10 +1511,8 @@ async fn reserved_module_spawned_by_supervisor_registers_but_foreign_hello_is_re
     // The supervisor spawns the reserved stub; it reads SUBC_LAUNCH_NONCE and echoes
     // it, so it registers. (spawn waits for registration, so reaching here proves the
     // real nonce round-trip succeeded.)
-    let module = supervisor
-        .spawn(reserved_stub_spec(&server, module_id))
-        .unwrap();
-    wait_for_registration(&server.registry, module_id, SETUP_TIMEOUT).await;
+    let module =
+        spawn_published_stub(&server, &supervisor, reserved_stub_spec(&server, module_id)).await;
 
     // A foreign authed connection claiming the same reserved module_id, with NO
     // nonce, is rejected reserved_module — it cannot impersonate the vault.
@@ -2452,6 +2453,7 @@ async fn draining_notice_precedes_quiescence_wait_and_route_lifecycle_stays_orde
     wait_for_registration(&server.registry, module_id, SETUP_TIMEOUT).await;
     assert!(server.registry.generation().unwrap() > generation_before);
 
+    wait_for_catalog_publication(&server, module_id).await;
     let mut fresh_client = connect_authed_client(&server.connection_file_path)
         .await
         .unwrap();
@@ -3636,6 +3638,7 @@ async fn supervisor_set_enabled_disable_tears_down_blocks_then_enable_respawns()
     })
     .await;
 
+    wait_for_catalog_publication(&server, module_id).await;
     let second = attach_on_stream(&mut client, &project, 325, "ses-reenabled", module_id).await;
     assert!(second.route_channel > 0);
 
@@ -6653,6 +6656,7 @@ async fn module_restart_invalidates_old_generation_route_and_fresh_attach_succee
     ));
     assert_eq!(server.forwarding.active_binding_count().unwrap(), 0);
 
+    wait_for_catalog_publication(&server, module_id).await;
     let fresh_ack =
         attach_on_stream(&mut client, &project, 703, "ses-new-generation", module_id).await;
     assert!(fresh_ack.route_channel > 0);
@@ -6967,6 +6971,7 @@ async fn multi_provider_generation_invalidation_goodbyes_restarted_provider_only
         1043,
         payload_a,
     );
+    wait_for_catalog_publication(&server, module_b).await;
     let fresh_ack_b =
         attach_on_stream(&mut client, &project, 1044, "ses-gen-b-fresh", module_b).await;
     assert_ne!(fresh_ack_b.route_channel, old_ack_b.route_channel);
@@ -7033,12 +7038,25 @@ async fn route_closed_crash_at_max_minus_one_is_non_terminal() {
         &server,
         &supervisor,
         module_id,
-        [("FAKE_AFT_CRASH_AFTER_MS", "750")],
+        [("FAKE_AFT_CRASH_ON_REQUEST", "1")],
     )
     .await;
 
     let project = TestProject::new();
     let (mut client, ack) = attach_client(&server, &project, 1061, "ses-crash-one-restart").await;
+    let initial = module.status().unwrap();
+    assert_eq!(initial.restart_count, 0);
+    assert_eq!(initial.lifetime_restarts, 0);
+
+    // A launch-relative crash timer can expire before attachment, leaving the
+    // route on the replacement whose next crash really is terminal. Trigger
+    // each crash only after binding to the process whose budget we are testing.
+    write_frame(
+        &mut client,
+        &data_request(ack.route_channel, ack.route_epoch, 1063, b"crash"),
+    )
+    .await
+    .unwrap();
     let closed = read_frame_timeout(&mut client).await;
     assert_route_lifecycle_push(
         &closed,
@@ -7058,8 +7076,47 @@ async fn route_closed_crash_at_max_minus_one_is_non_terminal() {
     })
     .await;
     assert_eq!(status.restart_count, 1);
+    assert_eq!(status.lifetime_restarts, 1);
+    assert_eq!(status.spawn_generation, initial.spawn_generation + 1);
 
-    module.stop().await.unwrap();
+    // The same connection must be able to reopen after the non-terminal close.
+    // With the sole restart spent, crashing the replacement must now be terminal.
+    wait_for_catalog_publication(&server, module_id).await;
+    let reopened = attach_on_stream(
+        &mut client,
+        &project,
+        1064,
+        "ses-crash-one-restart",
+        module_id,
+    )
+    .await;
+    write_frame(
+        &mut client,
+        &data_request(reopened.route_channel, reopened.route_epoch, 1065, b"crash"),
+    )
+    .await
+    .unwrap();
+    let closed = read_frame_timeout(&mut client).await;
+    assert_route_lifecycle_push(
+        &closed,
+        "route.closed",
+        module_id,
+        "crash",
+        Some(false),
+        Some(0),
+        Some(true),
+    );
+    let goodbye = read_frame_timeout(&mut client).await;
+    assert_eq!(goodbye.header.ty, FrameType::Goodbye);
+    assert_eq!(goodbye.header.channel, reopened.route_channel);
+
+    let failed = wait_for_status(&module, SETUP_TIMEOUT, |status| {
+        status.state == ModuleState::Failed && !status.registration_active && !status.live
+    })
+    .await;
+    assert_eq!(failed.restart_count, 1);
+    assert_eq!(failed.lifetime_restarts, 1);
+    assert_eq!(failed.spawn_generation, status.spawn_generation);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -7071,12 +7128,18 @@ async fn route_closed_crash_at_max_is_terminal() {
         &server,
         &supervisor,
         module_id,
-        [("FAKE_AFT_CRASH_AFTER_MS", "750")],
+        [("FAKE_AFT_CRASH_ON_REQUEST", "1")],
     )
     .await;
 
     let project = TestProject::new();
     let (mut client, ack) = attach_client(&server, &project, 1062, "ses-crash-no-restarts").await;
+    write_frame(
+        &mut client,
+        &data_request(ack.route_channel, ack.route_epoch, 1066, b"crash"),
+    )
+    .await
+    .unwrap();
     let closed = read_frame_timeout(&mut client).await;
     assert_route_lifecycle_push(
         &closed,
@@ -7176,6 +7239,44 @@ async fn attach_client(
         .unwrap();
     let ack = attach_on_stream(&mut client, project, corr, session, &module_id).await;
     (client, ack)
+}
+
+async fn wait_for_catalog_publication(server: &TestServer, module_id: &str) {
+    let mut client = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    let corr = 1;
+    // A registry entry can exist before HELLO has installed its forwarding
+    // endpoint. Catalog visibility is the fence that makes route.open ready.
+    timeout(SETUP_TIMEOUT, async {
+        loop {
+            write_frame(
+                &mut client,
+                &control_request_frame(
+                    corr,
+                    ClientControlRequest::CatalogList {
+                        module_id: Some(module_id.to_string()),
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+            let frame = read_frame(&mut client).await.unwrap().unwrap();
+            assert_eq!(frame.header.ty, FrameType::Response);
+            assert_eq!(frame.header.channel, 0);
+            assert_eq!(frame.header.corr, corr);
+            match serde_json::from_slice(&frame.body).unwrap() {
+                ClientControlResponse::CatalogList { modules, .. } => {
+                    if modules.iter().any(|entry| entry.module_id == module_id) {
+                        break;
+                    }
+                }
+                other => panic!("unexpected catalog.list response: {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("module did not become visible in catalog.list");
 }
 
 async fn attach_on_stream<S>(
@@ -8190,9 +8291,7 @@ async fn spawn_stub(
     supervisor: &Supervisor,
     module_id: &str,
 ) -> SupervisedModule {
-    let module = supervisor.spawn(stub_spec(server, module_id)).unwrap();
-    wait_for_registration(&server.registry, module_id, SETUP_TIMEOUT).await;
-    module
+    spawn_published_stub(server, supervisor, stub_spec(server, module_id)).await
 }
 
 async fn spawn_stub_with_env<K, V, I>(
@@ -8206,10 +8305,23 @@ where
     V: Into<String>,
     I: IntoIterator<Item = (K, V)>,
 {
-    let module = supervisor
-        .spawn(stub_spec_with_env(server, module_id, extra_env))
-        .unwrap();
-    wait_for_registration(&server.registry, module_id, SETUP_TIMEOUT).await;
+    spawn_published_stub(
+        server,
+        supervisor,
+        stub_spec_with_env(server, module_id, extra_env),
+    )
+    .await
+}
+
+async fn spawn_published_stub(
+    server: &TestServer,
+    supervisor: &Supervisor,
+    spec: ModuleSpec,
+) -> SupervisedModule {
+    let module_id = spec.module_id.clone();
+    let module = supervisor.spawn(spec).unwrap();
+    wait_for_registration(&server.registry, &module_id, SETUP_TIMEOUT).await;
+    wait_for_catalog_publication(server, &module_id).await;
     module
 }
 
@@ -8782,8 +8894,10 @@ async fn swap_cuts_new_routes_over_to_a_ready_candidate_and_drains_the_incumbent
     let incumbent_events = server.stub_events_path("swap-e2e-incumbent");
     let candidate_events = server.stub_events_path("swap-e2e-candidate");
     let ready_gate = server.temp_dir.join("swap-e2e-ready");
-    let module = supervisor
-        .spawn(swap_spec(
+    let module = spawn_published_stub(
+        &server,
+        &supervisor,
+        swap_spec(
             &server,
             module_id,
             [
@@ -8794,8 +8908,9 @@ async fn swap_cuts_new_routes_over_to_a_ready_candidate_and_drains_the_incumbent
                 ("FAKE_AFT_ECHO_ENV", "SUBC_SPAWN_ROLE".to_string()),
                 ("SUBC_SPAWN_ROLE", "swap_candidate".to_string()),
             ],
-        ))
-        .unwrap();
+        ),
+    )
+    .await;
     let incumbent = wait_for_registration(&server.registry, module_id, SETUP_TIMEOUT).await;
     let incumbent_status = module.status().unwrap();
 
@@ -8953,16 +9068,19 @@ async fn swap_whose_candidate_never_becomes_ready_leaves_the_incumbent_undrained
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
     let incumbent_events = server.stub_events_path("swap-never-ready-incumbent");
     let candidate_events = server.stub_events_path("swap-never-ready-candidate");
-    let module = supervisor
-        .spawn(swap_spec(
+    let module = spawn_published_stub(
+        &server,
+        &supervisor,
+        swap_spec(
             &server,
             module_id,
             [(
                 "FAKE_AFT_EVENTS_PATH",
                 incumbent_events.to_string_lossy().into_owned(),
             )],
-        ))
-        .unwrap();
+        ),
+    )
+    .await;
     let incumbent = wait_for_registration(&server.registry, module_id, SETUP_TIMEOUT).await;
     let project = TestProject::new();
     let mut route_client = connect_authed_client(&server.connection_file_path)
@@ -9045,13 +9163,12 @@ async fn swap_candidate_dying_mid_warm_spends_no_restart_budget() {
     let module_id = "fake-aft-swap-dies-warming";
     let server = TestServer::start().await;
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
-    let module = supervisor
-        .spawn(swap_spec(
-            &server,
-            module_id,
-            std::iter::empty::<(&str, &str)>(),
-        ))
-        .unwrap();
+    let module = spawn_published_stub(
+        &server,
+        &supervisor,
+        swap_spec(&server, module_id, std::iter::empty::<(&str, &str)>()),
+    )
+    .await;
     let incumbent = wait_for_registration(&server.registry, module_id, SETUP_TIMEOUT).await;
     let before = module.status().unwrap();
 
@@ -9153,13 +9270,12 @@ async fn disabling_a_module_mid_swap_aborts_the_swap_without_waiting_for_it() {
     let ready_budget = Duration::from_secs(30);
     let server = TestServer::start().await;
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
-    let module = supervisor
-        .spawn(swap_spec(
-            &server,
-            module_id,
-            std::iter::empty::<(&str, &str)>(),
-        ))
-        .unwrap();
+    let module = spawn_published_stub(
+        &server,
+        &supervisor,
+        swap_spec(&server, module_id, std::iter::empty::<(&str, &str)>()),
+    )
+    .await;
     wait_for_registration(&server.registry, module_id, SETUP_TIMEOUT).await;
     let before = module.status().unwrap();
     module

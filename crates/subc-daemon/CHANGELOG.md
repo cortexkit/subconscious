@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.34.9
+
+- Register every accepted configured module with the supervisor before publishing the connection file, in `starting` or `disabled` state. Start enabled processes and their monitors only after publication, so children can read their `--subc` file and discovery-time status requests cannot incorrectly report an accepted configured module as unsupervised. Preserve per-module health, restart and drain policies and record spawn failures on the existing status handle. Entries refused during registration are logged and skipped without preventing publication or startup of the other modules.
+- Keep `configured module supervised` as the activation-time log, separate from the earlier registration log. Verify that a configured `protocol: "none"` child's first spawn persists its PID, start time and executable identity without a HELLO. The shutdown child roster (`ChildRoster::admit`) still writes `live-children.json` synchronously, with macOS executable confirmation following the trampoline's exec acknowledgement.
+
 ## 0.34.8
 
 - Withdraws 0.34.7, which was never published: listing configured modules before the connection file is published returns in a later release with a fix for the orphan-sweep regression it caused. The code is identical to 0.34.6.

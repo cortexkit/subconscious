@@ -212,6 +212,13 @@ pub trait BoxPlane: Send + Sync {
     async fn ensure_census(&self, account: &AccountNames) -> Result<(), PlaneError>;
     async fn ensure_stream(&self, spec: &StreamSpec) -> Result<(), PlaneError>;
     async fn publish(&self, subject: &str, payload: Vec<u8>) -> Result<(), PlaneError>;
+    /// A projection may checkpoint only after JetStream acknowledges storage.
+    /// Publish-and-flush alone can succeed before a broker rejects the message.
+    async fn publish_stored(&self, _subject: &str, _payload: Vec<u8>) -> Result<(), PlaneError> {
+        Err(PlaneError::new(
+            "this plane cannot acknowledge stored publishes",
+        ))
+    }
     /// Writes one census record: a JetStream publish on the census key's KV subject
     /// (`AccountNames::census_subject`), answered only once the census stream has stored
     /// it. The bucket keeps one value per key, so this overwrites the module's entry.
@@ -669,6 +676,16 @@ impl BoxPlane for NatsBox {
             .flush()
             .await
             .map_err(|error| PlaneError::new(format!("flush after {subject}: {error}")))
+    }
+
+    async fn publish_stored(&self, subject: &str, payload: Vec<u8>) -> Result<(), PlaneError> {
+        self.jetstream
+            .publish(subject.to_string(), payload.into())
+            .await
+            .map_err(|error| PlaneError::new(format!("publish {subject}: {error}")))?
+            .await
+            .map_err(|error| PlaneError::new(format!("store {subject}: {error}")))?;
+        Ok(())
     }
 
     async fn census_put(&self, subject: &str, value: Vec<u8>) -> Result<(), PlaneError> {

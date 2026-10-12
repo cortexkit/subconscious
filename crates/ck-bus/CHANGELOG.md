@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.15
+
+- Mirror the daemon activity ledger to `ck.<account>.event.subc.activity.v1` with the original `(daemon_incarnation, seq)` identity. Checkpoint only after broker storage acknowledgement; publish failures back off and replay after restart.
+- Store the durable checkpoint in `activity_cursor.json`. Fresh or damaged cursors start at the query head without backfill. When the daemon refuses a cursor recorded before its last restart or one older than its in-memory event history, or ends a feed because its subscriber fell behind, replay the entries the daemon still keeps in its ledger file, in sequence order. Entries the daemon has already deleted under its 30-day or size limit can't be replayed; the mirror logs each such gap with the first and last missing sequence numbers.
+- Require the activity-enabled Rust SDK (0.28.1 or newer), and add deterministic failure, restart, crash-window and query/follow recovery tests.
+- Check the shared launch identity before opening the mirror's consumer connection; the SDK still adds it to activity requests automatically. If the reader has no daemon-issued launch identity, warn once that it reads as an unverified local caller (Direct), not `reserved:ckbus`. A nonce-read error stops the reads.
+
 ## 0.3.14
 
 - Test-only: use paused Tokio time to check that health checks respond while a probe is hung, without measuring elapsed wall-clock time.

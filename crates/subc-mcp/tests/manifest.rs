@@ -1,5 +1,10 @@
 use cortexkit_test_support::ScratchDir;
-use std::{fs, process::Command, time::Instant};
+use std::{
+    fs,
+    process::{Command, Stdio},
+    thread,
+    time::{Duration, Instant},
+};
 
 fn isolated_mcp_command(home: &ScratchDir) -> Command {
     let mut command = cortexkit_test_support::dev_command(cortexkit_test_support::ckdev_binary(
@@ -65,13 +70,54 @@ fn manifest_is_emitted_offline_without_module_setup() {
 }
 
 #[test]
-fn ck_domain_probe_is_a_fast_single_line_response_before_startup_checks() {
+fn ck_domain_probe_is_a_single_line_response_before_startup_checks() {
     let home = ScratchDir::new("subc-mcp-domain-probe");
+    let blocked_data_home = home.join("not-a-directory");
+    fs::write(&blocked_data_home, b"this path is a file, not a directory")
+        .expect("create an unusable data home");
+    let missing_runtime_dir = home.join("missing-runtime");
     let started = Instant::now();
-    let output = isolated_mcp_command(&home)
+    let mut child = isolated_mcp_command(&home)
+        // The cleared environment omits SUBC_MODULE_ID and SUBC_LAUNCH_NONCE. The
+        // file-valued data paths and absent runtime directory also make logging
+        // and connection-file access fail if startup reaches those steps.
+        .env("HOME", &blocked_data_home)
+        .env("USERPROFILE", &blocked_data_home)
+        .env("LOCALAPPDATA", &blocked_data_home)
+        .env("XDG_DATA_HOME", &blocked_data_home)
+        .env("XDG_RUNTIME_DIR", &missing_runtime_dir)
+        .env("XDG_CONFIG_HOME", &blocked_data_home)
+        .env("CK_PROFILE_PATH", blocked_data_home.join("profile"))
         .arg("--ck-domain")
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .expect("subc MCP domain probe starts");
+
+    // This only bounds a broken probe that hangs; process startup speed is not
+    // part of the behavior this test measures.
+    let timeout = Duration::from_secs(30);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if started.elapsed() < timeout => {
+                thread::sleep(Duration::from_millis(25));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("subc MCP domain probe did not exit within {timeout:?}");
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("failed to wait for subc MCP domain probe: {error}");
+            }
+        }
+    }
+    let output = child
+        .wait_with_output()
+        .expect("collect subc MCP domain probe output");
 
     assert!(
         output.status.success(),
@@ -83,11 +129,6 @@ fn ck_domain_probe_is_a_fast_single_line_response_before_startup_checks() {
         output.stderr.is_empty(),
         "stderr: {}",
         String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
-        started.elapsed().as_secs_f64() < 2.0,
-        "probe took {:?}",
-        started.elapsed()
     );
     assert!(
         !home.join("cortexkit/ck-subc-mcp/logs").exists(),

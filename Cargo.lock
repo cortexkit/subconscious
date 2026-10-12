@@ -2011,7 +2011,7 @@ dependencies = [
 
 [[package]]
 name = "subc-mcp"
-version = "0.1.34"
+version = "0.1.35"
 dependencies = [
  "cortexkit-log",
  "cortexkit-test-support",

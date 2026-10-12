@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.35
+
+- Test-only: verify the `--ck-domain` probe exits successfully with startup
+  prerequisites deliberately unavailable, without asserting a wall-clock
+  duration.
+
 ## 0.1.34
 
 - Update the internal MCP gateway to `subc-protocol` 0.31, `subc-control` 0.30 and `subc-transport` 0.12 for the call-mode release. MCP clients need no request changes: the daemon derives mode from scope, not payloads. Providers handling calls opt into `call-modes/v1` separately; legacy non-delegating run and flow routing remains supported.

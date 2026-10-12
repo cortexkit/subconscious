@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.34.4
+
+- Test only: the lifecycle provenance test waits for macOS exec confirmation before reading the running image, instead of failing when the status read comes first.
+
 ## 0.34.3
 
 - List a module in `catalog.list`, and advance the catalog generation, only once its forwarding endpoint is installed and `route.open` can reach it. A HELLO now reserves the module's registry entry unpublished (the id is claimed, so a duplicate HELLO is still refused), installs the forwarding endpoint (queueing HELLO_ACK first, as before), then publishes the entry. Previously a client that opened a route as soon as the module was listed could be refused `target_unavailable` ("has no live forwarding connection"). While the entry is reserved but not yet published, `catalog.list` omits it but `route.open` and supervisor lookups still find it, so `route.open` answers `target_unavailable`, never `unknown_module`. A HELLO whose forwarding registration fails leaves the catalog generation unchanged. Swap candidates are published the same way, so the swap supervisor no longer sees a candidate as registered before the candidate's forwarding endpoint exists, which could fail the cutover. Add `Registry::register_unpublished_with_control_ops`, `register_unpublished_candidate_with_control_ops`, `publish_registration`, `published_registration` and `list_registered_modules`; the existing `register_with_control_ops` and `register_candidate_with_control_ops` still publish immediately.

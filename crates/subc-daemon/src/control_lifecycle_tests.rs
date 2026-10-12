@@ -205,6 +205,40 @@ async fn lifecycle_requested_restart_disable_refusal_and_noop_use_verified_reque
     );
 }
 
+/// The running-image evidence `supervisor.provenance` reports for `module`,
+/// read once the supervisor is willing to report it.
+///
+/// On macOS the child first runs the `ck-subc` launch trampoline, and status
+/// withholds the pid (so the image check reads `NotRunning`) until the
+/// supervision loop has processed the trampoline's exec acknowledgement. That
+/// acknowledgement is handled asynchronously, so a status read made as soon
+/// as the module has registered can come back before it. On macOS the started
+/// activity entry does not wait for it: its evidence is the spawn-time file
+/// identity (device and inode) of the spawned program, the same value status
+/// reports once exec is confirmed. So this waits for that one withheld state
+/// to end, yielding so the supervision task can run, and fails at once on any
+/// other non-match. Elsewhere the pid is never withheld, so the first read
+/// already matches.
+#[cfg(unix)]
+async fn reported_running_image(
+    module: &crate::supervise::SupervisedModule,
+) -> subc_control::RunningImageEvidence {
+    loop {
+        let (status, image) = module.status_and_running_image_agreement().await.unwrap();
+        match image {
+            subc_control::RunningImageAgreement::Match { evidence } => return evidence,
+            subc_control::RunningImageAgreement::Unavailable {
+                reason: subc_control::RunningImageUnavailableReason::NotRunning,
+            } if status.pid.is_none()
+                && status.state == crate::supervise::ModuleState::Running =>
+            {
+                tokio::task::yield_now().await
+            }
+            other => panic!("running image never matched: {other:?} with status {status:?}"),
+        }
+    }
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn lifecycle_registration_on_new_build_without_requester_matches_provenance() {
@@ -246,10 +280,9 @@ async fn lifecycle_registration_on_new_build_without_requester_matches_provenanc
             module_id: "subc".into()
         }
     );
-    let (_, image) = module.status_and_running_image_agreement().await.unwrap();
-    let subc_control::RunningImageAgreement::Match { evidence } = image else {
-        panic!("sleep running image must have provenance evidence")
-    };
+    let evidence = timeout(Duration::from_secs(5), reported_running_image(&module))
+        .await
+        .expect("sleep running image must have provenance evidence once exec is confirmed");
     assert_eq!(
         started.details["new_evidence"],
         serde_json::to_value(evidence).unwrap()

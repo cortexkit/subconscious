@@ -5386,5 +5386,7 @@ async fn describing_an_unknown_ref_answers_not_live_with_the_owners_state() {
 #[path = "real_daemon/operator_confirm.rs"]
 mod operator_confirm;
 
+mod activity;
+
 #[path = "real_daemon/call_modes.rs"]
 mod call_modes;

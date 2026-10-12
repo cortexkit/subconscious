@@ -28,7 +28,10 @@ use subc_protocol::{
     Flags, Frame, FrameBuildError, FrameType, Priority, RouteTarget, SUBC_MODULE_ID_ENV,
 };
 
-use crate::RouteHandle;
+use crate::{
+    ActivityCursor, ActivityQueryRequest, ActivityQueryResponse, ActivitySubscribeRequest,
+    ActivitySubscription, RouteHandle,
+};
 use subc_transport::{
     authenticate_client, connection_file, read_frame, write_frame, AuthError, ConnectionFileError,
     FrameIoError,
@@ -71,6 +74,13 @@ const REVERSE_REQUEST_UNHANDLED: &str = "reverse_request_unhandled";
 /// buffer would drop the stream on its own replay. Twice that leaves room for live
 /// events arriving while the replay is being read.
 const SPAWN_EVENT_BUFFER: usize = 8192;
+// Hold the daemon's 1024-entry activity replay plus live entries without ending
+// a healthy subscriber merely because its initial replay arrives in a burst.
+const ACTIVITY_EVENT_BUFFER: usize = 2048;
+
+#[cfg(test)]
+#[path = "activity_consumer_tests.rs"]
+mod activity_consumer_tests;
 
 /// `supervisor.spawn_subscribe` refused a cursor from another daemon incarnation.
 pub const SPAWN_CURSOR_INCARNATION_MISMATCH: &str = "spawn_cursor_incarnation_mismatch";
@@ -1304,6 +1314,94 @@ impl SubcConsumer {
                     self.shared.sleep_until_retry(deadline, delay).await?;
                     continue;
                 }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
+    /// Query the newest-first activity ledger. The reply preserves entries, the
+    /// continuation cursor and the head to subscribe from without a query/follow gap.
+    /// Identity is filled from the supervised launch environment, as for route.open;
+    /// without one the daemon treats the caller as Direct. Refusals retain their code
+    /// through [`CallError::code`]. Transport retries are paced to the call deadline.
+    pub async fn query_activity(
+        &self,
+        request: ActivityQueryRequest,
+    ) -> Result<ActivityQueryResponse, CallError> {
+        let deadline = Instant::now() + self.shared.opts.call_timeout;
+        let body = activity_read_body(request)?;
+        let mut attempt = 0usize;
+        loop {
+            attempt = attempt.saturating_add(1);
+            match self
+                .shared
+                .control_call(body.clone(), deadline, false, None)
+                .await
+            {
+                Ok(TerminalFrame::Response { body, .. }) => {
+                    return serde_json::from_slice(&body).map_err(|err| {
+                        CallError::not_sent(format!("invalid activity.query response: {err}"))
+                    });
+                }
+                Ok(TerminalFrame::Error { body, .. }) => return Err(CallError::Module(body)),
+                Ok(TerminalFrame::StreamEnd) => {
+                    return Err(CallError::not_sent("activity.query returned StreamEnd"));
+                }
+                Err(err)
+                    if is_retryable_catalog_transport_error(&err) && Instant::now() < deadline =>
+                {
+                    let delay = self.shared.jittered(
+                        self.shared
+                            .opts
+                            .reconnect_backoff
+                            .delay_after_attempt(attempt),
+                    );
+                    self.shared.sleep_until_retry(deadline, delay).await?;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
+    /// Follow durable activity entries after `since`, or from now if absent.
+    /// The launch identity is filled as for [`Self::query_activity`]. Refused cursors
+    /// and subscriber lag are terminal stream errors whose daemon code is readable
+    /// through [`crate::ActivityStreamError::code`]. On reconnect the stream ends;
+    /// recover with a query and subscribe from its head.
+    pub async fn subscribe_activity(
+        &self,
+        since: Option<ActivityCursor>,
+    ) -> Result<ActivitySubscription, CallError> {
+        let deadline = Instant::now() + self.shared.opts.call_timeout;
+        let body = activity_read_body(ActivitySubscribeRequest { since })?;
+        loop {
+            self.shared.ensure_connected_for_call(deadline).await?;
+            let permit = Arc::new(Semaphore::new(1))
+                .acquire_owned()
+                .await
+                .map_err(|_| CallError::not_sent("activity subscription permit closed"))?;
+            match self
+                .shared
+                .send_subscription(SubscriptionSend {
+                    expected_handle: None,
+                    channel: 0,
+                    epoch: 0,
+                    body: body.clone(),
+                    priority: Priority::Interactive,
+                    admission_class: AdmissionClass::Normal,
+                    event_buffer: ACTIVITY_EVENT_BUFFER,
+                    deadline,
+                    permit,
+                })
+                .await
+            {
+                Ok(inner) => {
+                    return Ok(ActivitySubscription {
+                        inner,
+                        finished: false,
+                    })
+                }
+                Err(err) if err.is_not_sent() && Instant::now() < deadline => continue,
                 Err(err) => return Err(err),
             }
         }
@@ -5320,6 +5418,21 @@ async fn writer_loop<W>(
             return;
         }
     }
+}
+
+fn activity_read_body(request: impl serde::Serialize) -> Result<Vec<u8>, CallError> {
+    #[derive(serde::Serialize)]
+    struct ReadRequest<T> {
+        #[serde(flatten)]
+        request: T,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        consumer_identity: Option<ConsumerIdentity>,
+    }
+    serde_json::to_vec(&ReadRequest {
+        request,
+        consumer_identity: consumer_identity_from_env(),
+    })
+    .map_err(|err| CallError::not_sent(format!("failed to encode activity read: {err}")))
 }
 
 fn route_open_consumer_identity(opts: &CallOptions) -> Option<ConsumerIdentity> {

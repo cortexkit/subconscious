@@ -588,7 +588,13 @@ async fn warm_candidate(
             Some(connection) => RegistrationSlot::Connection(connection),
             None => RegistrationSlot::Candidate(module_id),
         };
-        match registry.registration(slot) {
+        // Only a published candidate counts as registered. A candidate's HELLO
+        // reserves its registry entry before installing its forwarding
+        // endpoint and publishes it after; a ready candidate seen in between
+        // would be promoted while the forwarding cutover still finds no
+        // candidate endpoint, and the swap would fail as if the candidate's
+        // connection had closed.
+        match registry.published_registration(slot) {
             Ok(Some(registration)) => {
                 registered = Some(registration.connection_id);
                 if registration.ready {

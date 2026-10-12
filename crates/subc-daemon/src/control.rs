@@ -368,6 +368,13 @@ pub struct ControlHandler {
     /// a client teardown) land exactly inside that window.
     #[cfg(test)]
     route_bind_relay_sent_hold: Option<Arc<tokio::sync::Barrier>>,
+    /// Holds a HELLO after its registry entry is reserved and before its
+    /// forwarding endpoint is installed, so a test can read the catalog and
+    /// open routes while the module is registered but not yet routable. A
+    /// blocking barrier because the HELLO handler is synchronous; the test
+    /// runs the HELLO on its own thread.
+    #[cfg(test)]
+    hello_registry_to_forwarding_hold: Option<Arc<std::sync::Barrier>>,
 }
 
 impl fmt::Debug for ControlHandler {
@@ -860,6 +867,8 @@ impl ControlHandler {
             provenance_probe_override: None,
             #[cfg(test)]
             route_bind_relay_sent_hold: None,
+            #[cfg(test)]
+            hello_registry_to_forwarding_hold: None,
         }
     }
 
@@ -980,6 +989,27 @@ impl ControlHandler {
     ) -> Self {
         self.route_bind_relay_sent_hold = Some(hold);
         self
+    }
+
+    /// A HELLO waits on `hold` twice between reserving its registry entry and
+    /// installing its forwarding endpoint: once to announce it is parked, once
+    /// to be released. Build the barrier for two parties, the test being the
+    /// other one, and run the HELLO on a thread of its own.
+    #[cfg(test)]
+    pub(crate) fn with_hello_registry_to_forwarding_hold(
+        mut self,
+        hold: Arc<std::sync::Barrier>,
+    ) -> Self {
+        self.hello_registry_to_forwarding_hold = Some(hold);
+        self
+    }
+
+    #[cfg(test)]
+    fn hold_between_registry_and_forwarding(&self) {
+        if let Some(hold) = &self.hello_registry_to_forwarding_hold {
+            hold.wait();
+            hold.wait();
+        }
     }
 
     pub fn with_process_liveness(
@@ -1192,7 +1222,12 @@ impl ControlHandler {
                 })
             })
             .collect::<Result<Vec<_>, RouterError>>()?;
-        let (_, registrations) = self.registry.list_modules().map_err(|err| {
+        // Include every registration, published or not. The capability
+        // evaluator counts a module as providing its capabilities as soon as it
+        // has registered, even before `catalog.list` shows it, so a HELLO in
+        // progress does not change other modules' required-capability
+        // verdicts. See `Registry::list_registered_modules`.
+        let registrations = self.registry.list_registered_modules().map_err(|err| {
             RouterError::backend(
                 0,
                 0,
@@ -1259,7 +1294,7 @@ impl ControlHandler {
     /// or target claim was added. This is deliberately a control-plane census:
     /// the opaque forwarding hot path must not grow a per-frame capability check.
     fn enforce_capability_denies(&self) {
-        let (_, registrations) = match self.registry.list_modules() {
+        let registrations = match self.registry.list_registered_modules() {
             Ok(snapshot) => snapshot,
             Err(err) => {
                 warn!(error = %err, "failed to read registrations for capability deny census");
@@ -2213,7 +2248,13 @@ impl ControlHandler {
                 hello_ack,
             );
         }
-        let registration = match self.registry.register_with_control_ops(
+        // Registered unpublished: the module id is claimed, so a duplicate HELLO
+        // is refused, but `catalog.list` does not show the module and the
+        // catalog generation does not move until it is published below, once
+        // its forwarding endpoint exists. Listing it now would advertise a
+        // module that `route.open` still refuses for having no forwarding
+        // connection.
+        let registration = match self.registry.register_unpublished_with_control_ops(
             hello.manifest,
             negotiated_ver,
             connection_id,
@@ -2244,6 +2285,8 @@ impl ControlHandler {
                 )?])
             }
         };
+        #[cfg(test)]
+        self.hold_between_registry_and_forwarding();
 
         let reply = if let Some(sink) = sink {
             // The forwarding table's module store is also the daemon-to-module
@@ -2271,8 +2314,9 @@ impl ControlHandler {
                 hello_ack,
             ) {
                 // Forwarding registration failed, so there is no forwarding
-                // state to tear down. Remove the registry entry and signal the
-                // release watch directly.
+                // state to tear down. Remove the registry entry, which was never
+                // published and so never listed or counted in the catalog
+                // generation, and signal the release watch directly.
                 if matches!(
                     self.deregister_connection(
                         connection_id,
@@ -2298,6 +2342,22 @@ impl ControlHandler {
             // ahead of the ack; it goes out as the reply.
             vec![hello_ack]
         };
+
+        // The module is routable now (or, without a sink, as routable as it
+        // will ever be), so the catalog may list it. Publishing bumps the
+        // catalog generation in the same registry critical section that makes
+        // the module listed.
+        if !self
+            .registry
+            .publish_registration(connection_id)
+            .map_err(|err| RouterError::backend(0, frame.header.corr, err.to_string()))?
+        {
+            debug!(
+                module_id = %registration.manifest.module_id,
+                connection_id = connection_id.get(),
+                "registration was removed before it could be published"
+            );
+        }
 
         // Exposure over assumption: Concurrency's serde default is pinned to the
         // pre-field behavior (ModuleManaged), so a management surface that is
@@ -2336,10 +2396,17 @@ impl ControlHandler {
     /// connection (its `catalog.update` finds it) but by no by-id lookup, so
     /// nothing routes to it until the supervisor cuts over.
     ///
-    /// Registry first, then forwarding, the same order as an ordinary HELLO;
-    /// a forwarding failure removes the registry entry again. The capability
-    /// census is not run: it describes routable modules, and this one is not
-    /// routable until promotion.
+    /// Registry first (unpublished), then forwarding, then publication, the
+    /// same order as an ordinary HELLO; a forwarding failure removes the
+    /// registry entry again. The swap supervisor treats a published, ready
+    /// candidate as registered and promotes it, and promotion needs the
+    /// candidate's forwarding endpoint, so the candidate is published only
+    /// once that endpoint exists. Unlike an ordinary HELLO, this does not
+    /// recompute capability verdicts or run the capability deny census
+    /// (`enforce_capability_denies`): both are about the module in the active
+    /// slot, which `route.open` can target. A candidate sits in the candidate
+    /// slot, so it neither provides capabilities to other modules nor can be
+    /// routed to until promotion moves it into the active slot.
     #[allow(clippy::too_many_arguments)]
     fn register_swap_candidate(
         &self,
@@ -2352,7 +2419,7 @@ impl ControlHandler {
         hello_ack: Frame,
     ) -> Result<Vec<Frame>, RouterError> {
         let module_id = manifest.module_id.clone();
-        let registration = match self.registry.register_candidate_with_control_ops(
+        let registration = match self.registry.register_unpublished_candidate_with_control_ops(
             manifest,
             negotiated_ver,
             connection_id,
@@ -2383,6 +2450,8 @@ impl ControlHandler {
                 )?])
             }
         };
+        #[cfg(test)]
+        self.hold_between_registry_and_forwarding();
         let reply = if let Some(sink) = sink {
             // Same ordering as an ordinary HELLO: the forwarding table queues
             // the HELLO_ACK before the candidate endpoint is inserted, because
@@ -2415,6 +2484,17 @@ impl ControlHandler {
         } else {
             vec![hello_ack]
         };
+        if !self
+            .registry
+            .publish_registration(connection_id)
+            .map_err(|err| RouterError::backend(0, frame.header.corr, err.to_string()))?
+        {
+            debug!(
+                module_id = %module_id,
+                connection_id = connection_id.get(),
+                "swap candidate registration was removed before it could be published"
+            );
+        }
         self.supervisor.mark_swap_candidate_admitted(&module_id);
         info!(
             module_id = %module_id,
@@ -9096,6 +9176,204 @@ mod tests {
         );
     }
 
+    /// One `catalog.list` as a client sees it: the generation and the listed
+    /// module ids with their readiness.
+    async fn catalog_snapshot(
+        handler: &ControlHandler,
+        client_ctx: &RouteCtx,
+        corr: u64,
+    ) -> (u64, Vec<(String, bool)>) {
+        let body =
+            serde_json::to_vec(&ClientControlRequest::CatalogList { module_id: None }).unwrap();
+        let request = Frame::build(FrameType::Request, control_flags(), 0, 0, corr, body).unwrap();
+        let reply = handler
+            .handle_control_frame(client_ctx, request)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let ClientControlResponse::CatalogList {
+            generation,
+            modules,
+            ..
+        } = serde_json::from_slice(&reply.body).unwrap()
+        else {
+            panic!("not a catalog.list reply");
+        };
+        (
+            generation,
+            modules
+                .into_iter()
+                .map(|entry| (entry.module_id, entry.ready))
+                .collect(),
+        )
+    }
+
+    /// A handler whose HELLO for module "aft" on connection 40 is parked
+    /// between reserving its registry entry and installing its forwarding
+    /// endpoint. Returns the handler, the two-party barrier (wait once to know
+    /// the HELLO is parked, once more to release it), the HELLO's thread, and
+    /// the module's context and receiver.
+    fn hello_held_before_forwarding() -> (
+        ControlHandler,
+        Arc<std::sync::Barrier>,
+        std::thread::JoinHandle<Vec<Frame>>,
+        RouteCtx,
+        mpsc::Receiver<crate::router::OutboundFrame>,
+    ) {
+        let hold = Arc::new(std::sync::Barrier::new(2));
+        let handler = ControlHandler::with_forwarding(
+            Arc::new(Registry::default()),
+            Arc::new(ForwardingTable::default()),
+        )
+        .with_hello_registry_to_forwarding_hold(Arc::clone(&hold));
+        let (module_ctx, module_rx) = route_ctx(ConnectionId::new(40));
+        let hello = {
+            let handler = handler.clone();
+            let module_ctx = module_ctx.clone();
+            std::thread::spawn(move || {
+                handler
+                    .handle_hello(
+                        module_ctx.connection_id,
+                        Some(module_ctx.egress.clone()),
+                        hello_frame("aft", PROTOCOL_VERSION, 7),
+                    )
+                    .unwrap()
+            })
+        };
+        (handler, hold, hello, module_ctx, module_rx)
+    }
+
+    /// While a HELLO has reserved its registry entry but its forwarding
+    /// endpoint is not installed yet, `route.open` to the module can only be
+    /// refused. `catalog.list` must not list the module in that window: a
+    /// client that opens a route as soon as it sees a module listed and ready
+    /// would be refused for a module the daemon had just advertised. The
+    /// refusal in the window stays the retryable `target_unavailable`, never
+    /// `unknown_module`, and the id stays claimed against a duplicate HELLO.
+    /// Once the HELLO completes, the module is listed and a route to it opens.
+    #[tokio::test]
+    async fn module_is_listed_only_once_route_open_to_it_can_succeed() {
+        let (handler, hold, hello, module_ctx, mut module_rx) = hello_held_before_forwarding();
+        let client = ConnectionId::new(41);
+        let (client_ctx, mut client_rx) = route_ctx(client);
+
+        hold.wait();
+        // Parked: the registry holds "aft", forwarding has no endpoint for it.
+        assert!(handler.registry.get_module("aft").unwrap().is_some());
+        assert!(!handler
+            .forwarding
+            .has_live_module_connection("aft")
+            .unwrap());
+        let (_, listed) = catalog_snapshot(&handler, &client_ctx, 300).await;
+        assert!(
+            listed.is_empty(),
+            "catalog.list listed a module route.open cannot reach yet: {listed:?}"
+        );
+        let refused = handler
+            .handle_control_frame(
+                &client_ctx,
+                route_open_frame(301, "aft", unique_project_root("listed-window")),
+            )
+            .await
+            .unwrap();
+        assert_eq!(parse_error(&refused[0])["code"], "target_unavailable");
+        let (duplicate_ctx, _duplicate_rx) = route_ctx(ConnectionId::new(42));
+        let duplicate = handler
+            .handle_control_frame(&duplicate_ctx, hello_frame("aft", PROTOCOL_VERSION, 8))
+            .await
+            .unwrap();
+        assert_eq!(parse_error(&duplicate[0])["code"], "duplicate_module_id");
+
+        hold.wait();
+        assert!(hello.join().unwrap().is_empty(), "HELLO succeeds");
+        let ack = module_rx.try_recv().unwrap().frame;
+        assert_eq!(ack.header.ty, FrameType::HelloAck);
+        let (_, listed) = catalog_snapshot(&handler, &client_ctx, 302).await;
+        assert_eq!(listed, vec![("aft".to_string(), true)]);
+
+        let (open_task, bind) = relay_route_open(
+            &handler,
+            client,
+            &client_ctx.egress,
+            &mut module_rx,
+            303,
+            "aft",
+            "listed-after",
+        )
+        .await;
+        assert!(handler
+            .handle_control_frame(&module_ctx, route_bind_ack(bind.header.corr))
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(open_task.await.unwrap().is_empty(), "route.open accepted");
+        published_route(&client_rx.try_recv().unwrap().frame);
+    }
+
+    /// A catalog watcher keys on the generation: when it changes, it re-reads
+    /// the listing. So the generation must advance exactly when the module
+    /// appears. If it advanced while the module was still hidden, a watcher
+    /// would read the new generation without the module, and the module would
+    /// later appear under that same generation with nothing telling the
+    /// watcher to look again.
+    #[tokio::test]
+    async fn catalog_generation_advances_when_the_module_appears_and_not_before() {
+        let (handler, hold, hello, _module_ctx, _module_rx) = hello_held_before_forwarding();
+        let (client_ctx, _client_rx) = route_ctx(ConnectionId::new(41));
+        let (before, _) = catalog_snapshot(&handler, &client_ctx, 300).await;
+
+        hold.wait();
+        let (during, listed) = catalog_snapshot(&handler, &client_ctx, 301).await;
+        assert!(listed.is_empty());
+        assert_eq!(
+            during, before,
+            "the generation moved while the module was not listed"
+        );
+
+        hold.wait();
+        assert!(hello.join().unwrap().is_empty(), "HELLO succeeds");
+        let (after, listed) = catalog_snapshot(&handler, &client_ctx, 302).await;
+        assert_eq!(listed, vec![("aft".to_string(), true)]);
+        assert_eq!(
+            after,
+            before + 1,
+            "the module appeared without exactly one generation bump"
+        );
+    }
+
+    /// A HELLO whose forwarding endpoint cannot be installed (here the
+    /// module's sink is already closed, so its HELLO_ACK cannot be queued) is
+    /// refused and leaves nothing behind: no registry entry, no catalog entry,
+    /// and the catalog generation where it was.
+    #[tokio::test]
+    async fn failed_forwarding_registration_leaves_no_registry_or_catalog_trace() {
+        let registry = Arc::new(Registry::default());
+        let handler = ControlHandler::with_forwarding(
+            Arc::clone(&registry),
+            Arc::new(ForwardingTable::default()),
+        );
+        let (client_ctx, _client_rx) = route_ctx(ConnectionId::new(41));
+        let (before, _) = catalog_snapshot(&handler, &client_ctx, 300).await;
+        let (module_ctx, module_rx) = route_ctx(ConnectionId::new(40));
+        drop(module_rx);
+
+        let replies = handler
+            .handle_control_frame(&module_ctx, hello_frame("aft", PROTOCOL_VERSION, 7))
+            .await
+            .unwrap();
+        assert_eq!(replies[0].header.ty, FrameType::Error, "{replies:?}");
+        assert!(registry.get_module("aft").unwrap().is_none());
+        assert!(registry
+            .get_module_by_connection(module_ctx.connection_id)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            catalog_snapshot(&handler, &client_ctx, 301).await,
+            (before, Vec::new())
+        );
+    }
+
     /// A handler whose `route.open` parks after queueing the route.bind and
     /// before marking it enqueued, with module "aft" registered on connection
     /// 40. Returns the two-party barrier that parks and releases it.
@@ -13242,6 +13520,82 @@ mod tests {
             let cutover = swap.forwarding.cutover_candidate("aft").unwrap().unwrap();
             swap.registry.promote_candidate("aft").unwrap().unwrap();
             cutover.incumbent.unwrap()
+        }
+
+        /// A swap candidate's HELLO reserves its candidate registry entry
+        /// before installing its candidate forwarding endpoint. The swap
+        /// supervisor promotes a ready candidate as soon as it reads it as
+        /// registered, and promotion cuts forwarding over to the candidate
+        /// endpoint, so the lookup the supervisor reads
+        /// (`Registry::published_registration`) must not return the candidate
+        /// until that endpoint exists. Otherwise the cutover finds no candidate
+        /// endpoint and the swap fails as if the candidate had disconnected.
+        #[tokio::test]
+        async fn swap_candidate_is_published_only_after_its_forwarding_endpoint_exists() {
+            let mut swap = swap_with_incumbent().await;
+            let hold = Arc::new(std::sync::Barrier::new(2));
+            let handler = swap
+                .handler
+                .clone()
+                .with_hello_registry_to_forwarding_hold(Arc::clone(&hold));
+            handler
+                .supervisor
+                .open_swap("aft", "candidate-nonce".to_string());
+            let hello = {
+                let handler = handler.clone();
+                let candidate_ctx = swap.candidate_ctx.clone();
+                std::thread::spawn(move || {
+                    handler
+                        .handle_hello(
+                            candidate_ctx.connection_id,
+                            Some(candidate_ctx.egress.clone()),
+                            hello_frame_with_nonce(
+                                "aft",
+                                PROTOCOL_VERSION,
+                                8,
+                                Some("candidate-nonce"),
+                            ),
+                        )
+                        .unwrap()
+                })
+            };
+
+            hold.wait();
+            // Parked: the candidate slot is claimed but not published, and
+            // forwarding has no candidate endpoint.
+            assert!(swap
+                .registry
+                .registration(crate::registry::RegistrationSlot::Candidate("aft"))
+                .unwrap()
+                .is_some());
+            assert!(swap
+                .registry
+                .published_registration(crate::registry::RegistrationSlot::Candidate("aft"))
+                .unwrap()
+                .is_none());
+            assert!(swap
+                .forwarding
+                .module_endpoint_for_connection(CANDIDATE)
+                .unwrap()
+                .is_none());
+
+            hold.wait();
+            assert!(hello.join().unwrap().is_empty(), "candidate HELLO succeeds");
+            assert_eq!(
+                swap.candidate_rx.try_recv().unwrap().frame.header.ty,
+                FrameType::HelloAck
+            );
+            let published = swap
+                .registry
+                .published_registration(crate::registry::RegistrationSlot::Candidate("aft"))
+                .unwrap()
+                .expect("candidate is published once its HELLO completes");
+            assert_eq!(published.connection_id, CANDIDATE);
+            assert!(swap
+                .forwarding
+                .module_endpoint_for_connection(CANDIDATE)
+                .unwrap()
+                .is_some());
         }
 
         fn keyed_total(counters: &Value, key: &str) -> u64 {

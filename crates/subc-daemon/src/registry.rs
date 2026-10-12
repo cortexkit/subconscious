@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     error::Error,
     fmt,
     sync::{Mutex, MutexGuard},
@@ -131,6 +131,20 @@ struct RegistryInner {
     superseded: Vec<ModuleRegistration>,
     /// The active connection that displaced each superseded registration.
     superseded_by: HashMap<ConnectionId, ConnectionId>,
+    /// Connections whose registration is reserved but not yet published.
+    ///
+    /// A HELLO registers in the registry before the daemon installs the
+    /// module's forwarding endpoint, and until that endpoint exists a
+    /// `route.open` to the module cannot be relayed. A registration in this set
+    /// already holds its module id (a duplicate HELLO is refused) and is found
+    /// by every lookup except two: [`Registry::list_modules`], which feeds
+    /// `catalog.list`, and [`Registry::published_registration`], which the swap
+    /// supervisor reads to decide that a candidate has registered. Adding a
+    /// registration to this set does not bump the catalog generation;
+    /// [`Registry::publish_registration`] removes it and bumps the generation
+    /// in the same critical section, so a catalog reader sees the module and
+    /// the new generation together.
+    unpublished: HashSet<ConnectionId>,
     generation: u64,
 }
 
@@ -154,12 +168,46 @@ impl Registry {
     }
 
     /// Register a module manifest with the module's effective granted control op set.
+    ///
+    /// The registration is published at once: it is listed by
+    /// [`Self::list_modules`] and bumps the catalog generation. The HELLO path
+    /// uses [`Self::register_unpublished_with_control_ops`] instead, because it
+    /// still has to install the module's forwarding endpoint.
     pub fn register_with_control_ops(
         &self,
         manifest: ModuleManifest,
         negotiated_ver: u8,
         connection_id: ConnectionId,
         control_ops: Vec<String>,
+    ) -> Result<ModuleRegistration, RegistryError> {
+        self.register_active(manifest, negotiated_ver, connection_id, control_ops, true)
+    }
+
+    /// Register a module manifest without listing it yet.
+    ///
+    /// The registration holds its module id and is visible to every lookup
+    /// except [`Self::list_modules`] (and so `catalog.list`) and
+    /// [`Self::published_registration`]. The catalog generation does not move.
+    /// Call [`Self::publish_registration`] once the module can actually be
+    /// routed to; if that never becomes possible, deregistering the connection
+    /// removes the entry without the catalog ever having listed it.
+    pub fn register_unpublished_with_control_ops(
+        &self,
+        manifest: ModuleManifest,
+        negotiated_ver: u8,
+        connection_id: ConnectionId,
+        control_ops: Vec<String>,
+    ) -> Result<ModuleRegistration, RegistryError> {
+        self.register_active(manifest, negotiated_ver, connection_id, control_ops, false)
+    }
+
+    fn register_active(
+        &self,
+        manifest: ModuleManifest,
+        negotiated_ver: u8,
+        connection_id: ConnectionId,
+        control_ops: Vec<String>,
+        publish: bool,
     ) -> Result<ModuleRegistration, RegistryError> {
         let module_id = manifest.module_id.clone();
         if let Err(reason) = module_id_path_hazard(&module_id) {
@@ -181,7 +229,11 @@ impl Registry {
         };
 
         inner.modules.insert(module_id, registration.clone());
-        inner.bump_generation();
+        if publish {
+            inner.bump_generation();
+        } else {
+            inner.unpublished.insert(connection_id);
+        }
         inner.notify_module_changed(&registration.manifest.module_id);
         Ok(registration)
     }
@@ -194,12 +246,44 @@ impl Registry {
     /// while the swap is open; deciding whether a candidate may register at all
     /// belongs to the caller that admits it. A second candidate for the same id
     /// is refused.
+    ///
+    /// The candidate is published at once, meaning candidate-slot lookups
+    /// through [`Self::published_registration`] return it immediately. The
+    /// HELLO path uses
+    /// [`Self::register_unpublished_candidate_with_control_ops`] instead.
     pub fn register_candidate_with_control_ops(
         &self,
         manifest: ModuleManifest,
         negotiated_ver: u8,
         connection_id: ConnectionId,
         control_ops: Vec<String>,
+    ) -> Result<ModuleRegistration, RegistryError> {
+        self.register_candidate(manifest, negotiated_ver, connection_id, control_ops, true)
+    }
+
+    /// Register a swap candidate that [`Self::published_registration`] does not
+    /// return until [`Self::publish_registration`] is called for its
+    /// connection. The swap supervisor reads that lookup to decide the
+    /// candidate has registered, and it promotes a ready candidate straight
+    /// away; promoting one whose forwarding endpoint is not installed yet would
+    /// fail the cutover.
+    pub fn register_unpublished_candidate_with_control_ops(
+        &self,
+        manifest: ModuleManifest,
+        negotiated_ver: u8,
+        connection_id: ConnectionId,
+        control_ops: Vec<String>,
+    ) -> Result<ModuleRegistration, RegistryError> {
+        self.register_candidate(manifest, negotiated_ver, connection_id, control_ops, false)
+    }
+
+    fn register_candidate(
+        &self,
+        manifest: ModuleManifest,
+        negotiated_ver: u8,
+        connection_id: ConnectionId,
+        control_ops: Vec<String>,
+        publish: bool,
     ) -> Result<ModuleRegistration, RegistryError> {
         let module_id = manifest.module_id.clone();
         if let Err(reason) = module_id_path_hazard(&module_id) {
@@ -219,8 +303,38 @@ impl Registry {
             control_ops,
         };
         inner.candidates.insert(module_id, registration.clone());
+        if !publish {
+            inner.unpublished.insert(connection_id);
+        }
         inner.notify_module_changed(&registration.manifest.module_id);
         Ok(registration)
+    }
+
+    /// Publish the registration `connection_id` holds, in whichever slot.
+    ///
+    /// For an active registration this is the moment `catalog.list` starts
+    /// listing the module, and the catalog generation advances under the same
+    /// lock, so no reader can see the new generation without the module or the
+    /// module without the new generation. A candidate is not listed either way;
+    /// publishing it only makes it visible to
+    /// [`Self::published_registration`].
+    ///
+    /// Returns `false` when there is nothing to publish: the connection holds
+    /// no registration any more, or it was already published.
+    pub fn publish_registration(&self, connection_id: ConnectionId) -> Result<bool, RegistryError> {
+        let mut inner = self.lock_inner()?;
+        if !inner.unpublished.remove(&connection_id) {
+            return Ok(false);
+        }
+        let Some((slot, registration)) = inner.find_by_connection(connection_id) else {
+            return Ok(false);
+        };
+        let module_id = registration.manifest.module_id.clone();
+        if matches!(slot, SlotKind::Active) {
+            inner.bump_generation();
+        }
+        inner.notify_module_changed(&module_id);
+        Ok(true)
     }
 
     /// Move the candidate for `module_id` into the active slot and demote the
@@ -295,11 +409,50 @@ impl Registry {
         Ok(self.lock_inner()?.modules.len())
     }
 
+    /// The catalog generation and the active registrations `catalog.list`
+    /// shows. Unpublished registrations (see
+    /// [`Self::register_unpublished_with_control_ops`]) are left out.
     pub fn list_modules(&self) -> Result<(u64, Vec<ModuleRegistration>), RegistryError> {
+        let inner = self.lock_inner()?;
+        let mut modules = inner
+            .modules
+            .values()
+            .filter(|registration| !inner.unpublished.contains(&registration.connection_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        modules.sort_by(|left, right| left.manifest.module_id.cmp(&right.manifest.module_id));
+        Ok((inner.generation, modules))
+    }
+
+    /// Every active registration, including unpublished ones.
+    ///
+    /// For the capability evaluator and the capability deny census, which
+    /// count a module as soon as it has registered. Whether `catalog.list`
+    /// shows the module yet does not change their verdicts.
+    pub fn list_registered_modules(&self) -> Result<Vec<ModuleRegistration>, RegistryError> {
         let inner = self.lock_inner()?;
         let mut modules = inner.modules.values().cloned().collect::<Vec<_>>();
         modules.sort_by(|left, right| left.manifest.module_id.cmp(&right.manifest.module_id));
-        Ok((inner.generation, modules))
+        Ok(modules)
+    }
+
+    /// Like [`Self::registration`], but a registration that is not published
+    /// yet is reported as absent.
+    pub fn published_registration(
+        &self,
+        slot: RegistrationSlot<'_>,
+    ) -> Result<Option<ModuleRegistration>, RegistryError> {
+        let inner = self.lock_inner()?;
+        let registration = match slot {
+            RegistrationSlot::Active(module_id) => inner.modules.get(module_id),
+            RegistrationSlot::Candidate(module_id) => inner.candidates.get(module_id),
+            RegistrationSlot::Connection(connection_id) => inner
+                .find_by_connection(connection_id)
+                .map(|(_, registration)| registration),
+        };
+        Ok(registration
+            .filter(|registration| !inner.unpublished.contains(&registration.connection_id))
+            .cloned())
     }
 
     pub fn generation(&self) -> Result<u64, RegistryError> {
@@ -340,7 +493,7 @@ impl Registry {
     /// call, and if only the active slot were searched its update would find
     /// nothing and the candidate would never become ready. Only a change to the
     /// active slot bumps the catalog generation, because only the active slot is
-    /// listed.
+    /// listed, and only once that registration is published.
     pub fn replace_catalog_for_connection(
         &self,
         connection_id: ConnectionId,
@@ -364,7 +517,7 @@ impl Registry {
             registration.manifest.ready = Some(ready);
         }
         let updated = registration.clone();
-        if matches!(slot, SlotKind::Active) {
+        if matches!(slot, SlotKind::Active) && !inner.unpublished.contains(&connection_id) {
             inner.bump_generation();
         }
         inner.notify_module_changed(&updated.manifest.module_id);
@@ -388,6 +541,9 @@ impl Registry {
         reason: RegistrationEndReason,
     ) -> Result<Vec<ModuleRegistration>, RegistryError> {
         let mut inner = self.lock_inner()?;
+        // A registration that was never published was never listed, so
+        // removing it leaves the catalog, and its generation, as they were.
+        let was_published = !inner.unpublished.remove(&connection_id);
         let module_ids: Vec<String> = inner
             .modules
             .iter()
@@ -397,7 +553,7 @@ impl Registry {
 
         let mut closed: Vec<ModuleRegistration> = module_ids
             .into_iter()
-            .filter_map(|module_id| inner.close_module(&module_id))
+            .filter_map(|module_id| inner.close_module(&module_id, was_published))
             .collect();
 
         let candidate_ids: Vec<String> = inner
@@ -521,10 +677,12 @@ impl RegistryInner {
         }
     }
 
-    fn close_module(&mut self, module_id: &str) -> Option<ModuleRegistration> {
+    fn close_module(&mut self, module_id: &str, listed: bool) -> Option<ModuleRegistration> {
         let mut registration = self.modules.remove(module_id)?;
         registration.state = ChannelState::Closed;
-        self.bump_generation();
+        if listed {
+            self.bump_generation();
+        }
         Some(registration)
     }
 
@@ -687,6 +845,98 @@ mod change_notification_tests {
             .unwrap();
         changed(&mut events);
         assert!(!events.has_changed().unwrap());
+    }
+}
+
+#[cfg(test)]
+mod publication_tests {
+    use super::*;
+
+    fn manifest() -> ModuleManifest {
+        ModuleManifest::builder("m", "1.0.0")
+            .protocol_ver(1)
+            .build()
+    }
+
+    /// An unpublished registration holds its id and answers routing lookups,
+    /// but `list_modules` leaves it out and the generation stays put until
+    /// it is published; publishing lists it and bumps the generation once.
+    #[test]
+    fn unpublished_registration_is_unlisted_until_published() {
+        let registry = Registry::default();
+        let connection = ConnectionId::new(1);
+        registry
+            .register_unpublished_with_control_ops(manifest(), 1, connection, vec![])
+            .unwrap();
+        assert_eq!(registry.list_modules().unwrap(), (0, Vec::new()));
+        assert!(registry.get_module("m").unwrap().is_some());
+        assert_eq!(registry.list_registered_modules().unwrap().len(), 1);
+        assert!(registry
+            .published_registration(RegistrationSlot::Active("m"))
+            .unwrap()
+            .is_none());
+        assert!(matches!(
+            registry.register_with_control_ops(manifest(), 1, ConnectionId::new(2), vec![]),
+            Err(RegistryError::DuplicateModuleId { .. })
+        ));
+        // A catalog update before publication does not move the generation.
+        registry
+            .replace_catalog_for_connection(connection, vec![], None, Some(true))
+            .unwrap();
+        assert_eq!(registry.generation().unwrap(), 0);
+
+        assert!(registry.publish_registration(connection).unwrap());
+        let (generation, listed) = registry.list_modules().unwrap();
+        assert_eq!(generation, 1);
+        assert_eq!(listed.len(), 1);
+        assert!(!registry.publish_registration(connection).unwrap());
+        assert_eq!(registry.generation().unwrap(), 1);
+    }
+
+    /// Removing a registration that was never published leaves no catalog
+    /// trace: the generation does not move, and a later publish is a no-op.
+    #[test]
+    fn deregistering_an_unpublished_registration_leaves_the_generation() {
+        let registry = Registry::default();
+        let connection = ConnectionId::new(1);
+        registry
+            .register_unpublished_with_control_ops(manifest(), 1, connection, vec![])
+            .unwrap();
+        assert_eq!(registry.deregister_connection(connection).unwrap().len(), 1);
+        assert_eq!(registry.list_modules().unwrap(), (0, Vec::new()));
+        assert!(!registry.publish_registration(connection).unwrap());
+        assert_eq!(registry.generation().unwrap(), 0);
+    }
+
+    /// An unpublished candidate holds the candidate slot but
+    /// `published_registration` does not return it until it is published.
+    /// Publishing a candidate does not bump the generation: candidates are
+    /// never listed.
+    #[test]
+    fn unpublished_candidate_is_hidden_from_published_lookups() {
+        let registry = Registry::default();
+        let candidate = ConnectionId::new(2);
+        registry
+            .register_unpublished_candidate_with_control_ops(manifest(), 1, candidate, vec![])
+            .unwrap();
+        assert!(registry
+            .registration(RegistrationSlot::Candidate("m"))
+            .unwrap()
+            .is_some());
+        assert!(registry
+            .published_registration(RegistrationSlot::Candidate("m"))
+            .unwrap()
+            .is_none());
+        assert!(registry
+            .published_registration(RegistrationSlot::Connection(candidate))
+            .unwrap()
+            .is_none());
+        assert!(registry.publish_registration(candidate).unwrap());
+        assert!(registry
+            .published_registration(RegistrationSlot::Candidate("m"))
+            .unwrap()
+            .is_some());
+        assert_eq!(registry.generation().unwrap(), 0);
     }
 }
 

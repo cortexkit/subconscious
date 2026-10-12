@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.31.3
+
+- Released from the 0.31 line for consumers not yet on 0.33.7 or later: require subc-os below 0.1.12. subc-os 0.1.12 added a `MemoryKind` variant (the Windows working set) that this line's code doesn't handle, so a lock that resolved a newer subc-os next to this line failed to compile (E0004). Newer subc-daemon releases (0.33.7 and up) handle it.
+
 ## 0.31.2
 
 - Build time only, released from the 0.31 line for consumers not yet on 0.32: the build script watches the workspace `Cargo.lock` only when it exists. Built from crates.io there is no workspace lock two levels up, and cargo treats a missing watched path as always changed, so every consumer rebuilt this crate on every build. The same fix is in 0.32.9.

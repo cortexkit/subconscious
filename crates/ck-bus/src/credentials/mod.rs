@@ -13,7 +13,6 @@
 //! from throwaway keys.
 
 pub mod custody;
-pub mod identity;
 pub mod issue;
 pub mod jwt;
 pub mod lifetime;

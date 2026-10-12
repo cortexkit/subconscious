@@ -29,8 +29,7 @@ pub fn operator_module_dir() -> Option<PathBuf> {
 /// state-file constant in ck-bus's source (named beside it);
 /// `every_ckbus_state_file_is_classified` fails if a new one is added there
 /// without being listed here or in [`CONTENT_COMPARED`].
-pub const LIVE_REWRITTEN: [&str; 5] = [
-    "activity_cursor.json",  // activity_mirror::cursor::CURSOR_FILE
+pub const LIVE_REWRITTEN: [&str; 4] = [
     "spawn_cursor.json",     // spawn_consumer::cursor::CURSOR_FILE
     "sentinel_verdict.json", // sentinel::verdict::VERDICT_FILE
     "own_users.json",        // bootstrap::store::OWN_USERS_FILE

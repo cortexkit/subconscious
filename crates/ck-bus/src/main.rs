@@ -26,8 +26,6 @@ mod membership;
 // durable progress; superseded users are found from the census.
 #[allow(dead_code)]
 mod revocation;
-// The activity projection has its own checkpoint and cannot delay ledger appends.
-mod activity_mirror;
 // The spawn-stream consumer: revokes the credential of every process that exits, and
 // reconciles the census against the supervisor's spawn snapshot.
 #[allow(dead_code)]
@@ -177,13 +175,6 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         &store_root,
         bootstrap.ready(),
         module_id.clone(),
-        std::time::Duration::from_millis(sentinel_period_ms),
-    );
-    let _activity_mirror = activity_mirror::wire(
-        credentials::vault::subc_arg(env::args_os())
-            .ok_or("ck-bus needs --subc <connection file> to mirror activity")?,
-        &store_root,
-        bootstrap.ready(),
         std::time::Duration::from_millis(sentinel_period_ms),
     );
     bootstrap.serve(wired.manifest, wired.handler).await?;

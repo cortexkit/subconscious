@@ -8,13 +8,13 @@ mod stand_in;
 pub mod test_support;
 pub use consumer::{
     is_retryable_route_open_code, CallError, CallOptions, CatalogList, CloseRouteOptions,
-    ConnectionState, ConsumerError, ConsumerOptions, ControlPush, OutcomeUnknownCause, PushEvent,
-    RetryBackoff, ReverseRequestContext, ReverseRequestError, ReverseRequestRegistrationError,
-    ReverseRequestRegistry, RouteCloseDisposition, RouteCloseReason, RouteEndReason,
-    RoutePollResult, ScopeSelector, SpawnStreamError, SpawnSubscription, SubcConsumer,
-    SubscribeOptions, Subscription, SubscriptionClosed, DEFAULT_CALL_TIMEOUT,
-    DEFAULT_LIVENESS_PROBE_WINDOW, DEFAULT_ROUTE_RETRY_DEADLINE, SPAWN_CURSOR_INCARNATION_MISMATCH,
-    SPAWN_CURSOR_TOO_OLD, SPAWN_SUBSCRIBER_LAGGED,
+    ConnectionState, ConsumerCapabilityError, ConsumerError, ConsumerOptions, ControlPush,
+    OutcomeUnknownCause, PushEvent, RetryBackoff, ReverseRequestContext, ReverseRequestError,
+    ReverseRequestRegistrationError, ReverseRequestRegistry, RouteCloseDisposition,
+    RouteCloseReason, RouteEndReason, RoutePollResult, ScopeSelector, SpawnStreamError,
+    SpawnSubscription, SubcConsumer, SubscribeOptions, Subscription, SubscriptionClosed,
+    DEFAULT_CALL_TIMEOUT, DEFAULT_LIVENESS_PROBE_WINDOW, DEFAULT_ROUTE_RETRY_DEADLINE,
+    SPAWN_CURSOR_INCARNATION_MISMATCH, SPAWN_CURSOR_TOO_OLD, SPAWN_SUBSCRIBER_LAGGED,
 };
 pub use policy_cache::{
     PolicyResolveError, PolicyResolver, PolicyResolverConfig, PolicyResolverFootprint,
@@ -1856,9 +1856,11 @@ pub struct RouteBindRequest {
     pub target: RouteTarget,
     pub identity: BindIdentity,
     pub principal: Option<Principal>,
-    /// Consumer-declared reverse-request capabilities for this bind. This is a
-    /// declaration, not a verified privilege; providers treat an absent field as
-    /// no reverse-request capability. Known MCP method-family values today are
+    /// Consumer-declared reverse-request families and provider-contract
+    /// capabilities for this bind. For example, `content/v1` declares that a
+    /// consumer understands the tool-provider content result format. This remains
+    /// an unverified declaration that grants nothing; providers treat an absent
+    /// field as no declared capability. Known MCP method-family values today are
     /// "elicitation", "sampling", and "roots".
     pub consumer_capabilities: Option<Vec<String>>,
     /// The versions of provider roles the consumer declared it speaks on this

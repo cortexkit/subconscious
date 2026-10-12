@@ -20,9 +20,9 @@ use subc_client_rs::{
     CloseRouteOptions, ConsumerIdentity, ConsumerOptions, HandlerOutcome, ModuleHandle,
     ModuleHandler, OutcomeUnknownCause, PolicyResolveError, PolicyResolver, PolicyResolverConfig,
     PolicyVerdict, ProjectRef, RequestCtx, RetryBackoff, ReverseRequestRegistrationError,
-    RouteBindRequest, RouteCloseDisposition, RouteCloseReason, RouteEndReason, RouteHandle,
-    ScopeCallError, ScopeDescribeReply, ScopeSelector, SubcConsumer, SubcModuleError, Subject,
-    SubscribeOptions,
+    ReverseRequestRegistry, RouteBindRequest, RouteCloseDisposition, RouteCloseReason,
+    RouteEndReason, RouteHandle, ScopeCallError, ScopeDescribeReply, ScopeSelector, SubcConsumer,
+    SubcModuleError, Subject, SubscribeOptions,
 };
 use subc_control::{ClientControlRequest, ClientControlResponse, PollKind};
 use subc_protocol::{
@@ -52,6 +52,35 @@ const CONSUMER_MODULE_B: &str = "subc-client-rs-consumer-b";
 const CATALOG_FAKE_AFT_MODULE_ID: &str = "subc-client-rs-catalog-fake-aft";
 const PUSH_MODULE_ID: &str = "subc-client-rs-push";
 const POLICY_MODULE_ID: &str = "subc-client-rs-policy-resolver";
+
+#[test]
+fn route_option_legacy_struct_literals_and_default_updates_still_compile() {
+    let _full_call = CallOptions {
+        timeout: Duration::from_secs(30),
+        priority: Priority::Interactive,
+        admission_class: subc_protocol::AdmissionClass::Normal,
+        route_retry: RetryBackoff::default(),
+        route_retry_deadline: Duration::from_secs(90),
+        consumer_identity: None,
+        reverse_requests: ReverseRequestRegistry::new(),
+        role_versions: None,
+    };
+    let _full_close = CloseRouteOptions {
+        drain: false,
+        drain_timeout: Duration::from_secs(30),
+        consumer_identity: None,
+        reverse_requests: ReverseRequestRegistry::new(),
+        role_versions: None,
+    };
+    let _call_update = CallOptions {
+        timeout: Duration::from_secs(5),
+        ..CallOptions::default()
+    };
+    let _close_update = CloseRouteOptions {
+        drain: true,
+        ..CloseRouteOptions::default()
+    };
+}
 
 struct LiveDaemon {
     child: Child,

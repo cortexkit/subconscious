@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.27.4
+
+- Add validated provider-contract consumer-capability declarations to client route options. The SDK merges them with reverse-request handler families, forwards them to provider binds, and keeps routes with different declarations in separate cache entries; declarations remain unverified and grant no privilege.
+
 ## 0.27.3
 
 - Add `ModuleHandle::activity_record(request)` for module authors to append one typed activity-ledger entry and receive its sequence number. It requires the daemon's `activity-ledger/v1` capability, preserves daemon refusal codes and messages, never retries, and reports an unknown outcome if the reply deadline expires after sending. Requires `subc-control` 0.29.4, the minimum release that provides the activity request types and capability.

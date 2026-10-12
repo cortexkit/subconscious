@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.34.8
+
+- Withdraws 0.34.7, which was never published: listing configured modules before the connection file is published returns in a later release with a fix for the orphan-sweep regression it caused. The code is identical to 0.34.6.
+
 ## 0.34.6
 
 - Keep a crash's `route.closed` non-terminal when the supervisor has reserved the last available restart slot but has not yet published `Restarting`. Publish the pending-recovery fact atomically with the budget reservation, so connection cleanup cannot mistake the replacement's exhausted budget for the crashed process's recovery verdict. Terminal exit history still precedes the visible state change. Add a deterministic terminal-record barrier regression test.

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.34.5
+
+- Publish the connection file at startup from tokio's blocking-thread pool instead of an async worker thread. The write fsyncs, and on a slow or busy disk that held a runtime worker for seconds (an in-process daemon in a test harness may share two workers with everything else). The order and guarantees are unchanged: the file is still written owner-only, fsynced and atomically renamed, only after the readiness probe authenticates, and the singleton start lock stays held until the write finishes, even if the startup future is dropped meanwhile. If the write task panics or is cancelled, startup fails with `ConnectionFileWrite` naming the file. Loading or minting the machine id, which fsyncs a newly minted file, also moved to the blocking pool, holding the start and run-directory locks the same way.
+
 ## 0.34.4
 
 - Test only: the lifecycle provenance test waits for macOS exec confirmation before reading the running image, instead of failing when the status read comes first.

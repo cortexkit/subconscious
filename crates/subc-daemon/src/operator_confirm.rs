@@ -395,7 +395,7 @@ impl OperatorConfirms {
         let pending = Arc::new(Request {
             id: state.next_id,
             text: format!(
-                "{module_id} asks: {} (requested by {opener})",
+                "approve a request from {module_id}: {} (requested by {opener})",
                 request.summary
             ),
             module_id,

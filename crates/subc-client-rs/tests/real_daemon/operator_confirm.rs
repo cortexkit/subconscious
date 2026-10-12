@@ -638,7 +638,10 @@ async fn fifo_four_waiters() {
         .collect();
     assert_eq!(shown.len(), 5);
     for (n, text) in shown.iter().enumerate() {
-        assert!(text.starts_with(&format!("operator-confirm-module-{} asks:", n + 1)));
+        assert!(text.starts_with(&format!(
+            "approve a request from operator-confirm-module-{}:",
+            n + 1
+        )));
     }
 }
 #[tokio::test]
@@ -968,7 +971,7 @@ async fn direct_prompt_text_and_exact_audit() {
     assert_eq!(h.confirm("write this record").await["result"], "confirmed");
     assert_eq!(
         h.event("prompt_shown", "").await["text"],
-        "operator-confirm-module-1 asks: write this record (requested by a local program)"
+        "approve a request from operator-confirm-module-1: write this record (requested by a local program)"
     );
     let audit = h.audit("confirmed", "", Some("write this record")).await;
     assert_eq!(audit["principal"], "direct");
@@ -977,7 +980,7 @@ async fn direct_prompt_text_and_exact_audit() {
 async fn reserved_prompt_text() {
     let h = Harness::start("approve").await;
     assert_eq!(h.call(FIRST, json!({"mode":"forward", "peer":"operator-confirm-module-2", "summary":"write this record"})).await["result"], "confirmed");
-    assert_eq!(h.event("prompt_shown", "").await["text"], "operator-confirm-module-2 asks: write this record (requested by operator-confirm-module-1)");
+    assert_eq!(h.event("prompt_shown", "").await["text"], "approve a request from operator-confirm-module-2: write this record (requested by operator-confirm-module-1)");
     assert_eq!(
         h.audit("confirmed", "", Some("write this record")).await["principal"],
         "reserved:operator-confirm-module-1"

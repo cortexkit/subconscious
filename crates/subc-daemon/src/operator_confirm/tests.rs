@@ -408,7 +408,7 @@ async fn route_close_withdraws_and_discards_late_provider_error() {
     assert!(f.request(&m, 4, "valid").await.is_empty());
     assert_eq!(
         event(&mut events).await,
-        Event::Shown("m asks: valid (requested by a local program)".into())
+        Event::Shown("approve a request from m: valid (requested by a local program)".into())
     );
     f.close(&m);
     let answer = receive(&mut m.rx).await;
@@ -512,7 +512,7 @@ async fn fifo_module_limit_and_queue_full() {
             assert_eq!(
                 event(&mut events).await,
                 Event::Shown(format!(
-                    "m{} asks: waiting (requested by a local program)",
+                    "approve a request from m{}: waiting (requested by a local program)",
                     index + 1
                 ))
             );

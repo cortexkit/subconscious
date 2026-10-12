@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.34.10
+
+- Change the reason to “approve a request from {module_id}: {summary} (requested by {opener}).” The macOS Touch ID sheet places that reason after “{app} is trying to,” so this verb phrase makes the whole sentence grammatical.
+
 ## 0.34.9
 
 - Register every accepted configured module with the supervisor before publishing the connection file, in `starting` or `disabled` state. Start enabled processes and their monitors only after publication, so children can read their `--subc` file and discovery-time status requests cannot incorrectly report an accepted configured module as unsupervised. Preserve per-module health, restart and drain policies and record spawn failures on the existing status handle. Entries refused during registration are logged and skipped without preventing publication or startup of the other modules.

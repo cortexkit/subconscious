@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.20.83
+
+- Add `ck activity` with agent, project, module, kind, inclusive millisecond time-range and limit filters, a UTC time/module/actor/summary table, and JSON output. `--follow` subscribes from the query's head without a handoff gap and applies the same filters to live entries; JSON follow output is one entry per line.
+
 ## 0.20.81
 
 - Order legacy unstamped capture lines using their position relative to stamped lines in the same capture file, apply `--since` to inherited capture times, and identify inherited times in JSON.

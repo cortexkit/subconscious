@@ -8,6 +8,9 @@
 #[path = "../setup/mod.rs"]
 mod setup;
 
+#[path = "activity/mod.rs"]
+mod activity;
+
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     env,
@@ -61,7 +64,8 @@ const FRAME_DROP_ALERT_REQUIRED_NONZERO_MINUTES: u64 = 10;
 
 const TOP_HELP_BASE: &str = "ck — CortexKit operator CLI\n\nusage:\n  ck [--subc <connection-file>] [--json] <domain> [<verb>] [<args>]\n\ndomains:\n  setup     plan and apply the managed CortexKit installation\n  upgrade   plan managed component upgrades\n  module    supervised modules: list, status, stderr, terminals, restart, stop, start, rescan, release\n  catalog   what is registered on the wire (not the supervised roster)
   routes    live consumers for one module or the whole daemon\n  provenance daemon-attested and module-declared build/process facts\n  health    one-line health for every supervised module\n  quota     AI-provider quota and usage windows\n  daemon    daemon version, uptime, connection info, offline triage, and CI lint
-  machine   this machine's id: show it, or adopt a restored one";
+  machine   this machine's id: show it, or adopt a restored one
+  activity  consequential agent and module events";
 
 const TOP_HELP_TAIL: &str = "flags:\n  --subc <file>   use a specific connection file (default: auto-discover)\n  --json          raw JSON output instead of tables\n  --verbose       include diagnostic detail and complete metrics\n\nrun 'ck <domain>' with no verb to see that domain's commands";
 
@@ -504,6 +508,11 @@ async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), CkError> {
     if let Command::MachineAdopt { id, force } = &args.command {
         return machine_adopt(args.subc.as_deref(), id, *force, args.json).await;
     }
+    if let Command::Activity(options) = &args.command {
+        return activity::run(options, args.subc.as_deref(), args.json)
+            .await
+            .map_err(|error| decorate_error(error, args.json, args.subc.as_deref()));
+    }
 
     let resolved = discover_connection_file(args.subc.as_deref())
         .map_err(|error| decorate_error(error, args.json, args.subc.as_deref()))?;
@@ -586,6 +595,7 @@ async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), CkError> {
         | Command::Upgrade { .. }
         | Command::Help(_)
         | Command::External { .. }
+        | Command::Activity(_)
         | Command::BuildShape => unreachable!("handled before connect"),
     };
     result.map_err(|error| decorate_error(error, args.json, args.subc.as_deref()))
@@ -1058,6 +1068,7 @@ enum Command {
         dry_run: bool,
     },
     Module(ModuleCommand),
+    Activity(activity::Options),
     Routes {
         module_id: Option<String>,
     },
@@ -7807,6 +7818,7 @@ fn is_builtin_domain(domain: &str) -> bool {
             | "daemon"
             | "machine"
             | "quota"
+            | "activity"
             | "help"
     )
 }
@@ -7828,9 +7840,11 @@ fn parse_command(domain: &str, tail: &[OsString]) -> Result<Command, CkError> {
                 Some("health") => HEALTH_HELP.into(),
                 Some("daemon") => DAEMON_HELP.into(),
                 Some("machine") => MACHINE_HELP.into(),
+                Some("activity") => activity::HELP.into(),
                 _ => top_help(),
             }))
         }
+        "activity" => activity::parse(tail),
         "setup"
             if tail
                 .iter()

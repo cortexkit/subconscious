@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.16
+
+- Add `windows_acl::restrict_current_process`, callable on every platform (a no-op outside Windows). On Windows, apply one protected process DACL granting only limited query, synchronization and termination rights to the token user and OWNER RIGHTS; the latter removes the owner's implicit ability to rewrite the DACL. This is startup defense in depth, not protection against administrators, `SeDebugPrivilege`, existing handles or memory already exposed.
+- Add Windows cross-process tests for the retained daemon rights, denied memory/thread/handle/DACL access, and an unrestricted memory-read control.
+- Read back and independently verify the restricted child's protected process DACL. Run access checks through a separate opener with `SeDebugPrivilege` removed, and report token elevation and privilege state to distinguish DACL failures from privileged bypasses on elevated Windows runners.
+
 ## 0.1.15
 
 - Add `Process::observe_with_executable_access` and `ExecutableAccess` to distinguish Linux executable permission denial (EACCES/EPERM) from other failures. Preserve `Observation`, `FileIdentity`, and `Process::observe` for existing callers; macOS and Windows keep their previous observations. A non-dumpable Linux child can hide its executable while its start time remains readable.

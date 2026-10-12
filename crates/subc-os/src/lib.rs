@@ -54,7 +54,7 @@ pub mod fork_exec_test;
 pub mod launch_nonce;
 pub mod privacy_identity;
 pub mod process_identity;
-#[cfg(windows)]
+#[cfg_attr(not(windows), path = "windows_acl_noop.rs")]
 pub mod windows_acl;
 #[cfg(unix)]
 pub use launch_nonce::LaunchNonceHandoff;

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.28.2
+
+- Let route options add validated consumer-capability declarations alongside reverse-request handler families. The merged, sorted list is forwarded to the provider bind and kept in the route cache identity; declarations such as `content/v1` remain unverified and grant no privilege.
+
 ## 0.28.1
 
 - Add `ModuleHandle::record_activity`, checking `activity-ledger/v1` before sending and returning typed `ActivityRefusal` classifications with the daemon's original error body. Recording does not retry after timeout or connection loss because the append may already be durable.

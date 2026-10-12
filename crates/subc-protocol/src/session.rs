@@ -78,13 +78,14 @@ pub enum ModuleControlRequest {
         /// unattested rather than as trusted-by-default.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         principal: Option<Principal>,
-        /// Consumer-declared reverse-request capabilities for the route. This is
-        /// an unverified declaration, not a privilege grant; if a consumer
-        /// over-declares, providers may still send reverse requests that later
-        /// time out or deny. Providers must treat an absent field as no
-        /// reverse-request capability. The vocabulary is open strings; known MCP
-        /// method-family values today are "elicitation", "sampling", and
-        /// "roots".
+        /// Consumer-declared reverse-request families and provider-contract
+        /// capabilities for the route. For example, `content/v1` declares that
+        /// the consumer understands the tool-provider content result format.
+        /// This remains an unverified declaration that grants nothing; a provider
+        /// that over-trusts it may still send reverse requests that later time
+        /// out or deny. Providers must treat an absent field as no declared
+        /// capability. The vocabulary is open strings; known MCP method-family
+        /// values today are "elicitation", "sampling", and "roots".
         #[serde(default, skip_serializing_if = "Option::is_none")]
         consumer_capabilities: Option<Vec<String>>,
         /// The versions of provider roles the consumer speaks on this route,

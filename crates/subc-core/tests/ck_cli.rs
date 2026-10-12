@@ -1353,6 +1353,31 @@ impl UpgradeFixture {
             );
         command
     }
+
+    fn set_core_version(&self, version: &str) {
+        let mut connection: Value =
+            serde_json::from_slice(&fs::read(&self.connection_file).unwrap()).unwrap();
+        connection["daemon_ver"] = json!(version);
+        fs::write(
+            &self.connection_file,
+            serde_json::to_vec(&connection).unwrap(),
+        )
+        .unwrap();
+        let path = self
+            .home
+            .join(".local/share/cortexkit/installer-manifest.json");
+        let mut inventory: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        // The fixture records ck, ck-subc and ck-subc-mcp before other components.
+        for entry in inventory["mutations"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .take(3)
+        {
+            entry["version"] = json!(version);
+        }
+        fs::write(path, serde_json::to_vec(&inventory).unwrap()).unwrap();
+    }
 }
 
 fn upgrade_index(
@@ -1443,6 +1468,99 @@ fn upgrade_and_check_say_everything_is_current_in_one_line() {
         assert_exit(&output, 0);
         assert!(output.stderr.is_empty(), "stderr: {}", text(&output.stderr));
         assert_eq!(text(&output.stdout), expected);
+    }
+}
+
+fn core_release_index(base: &str, version: &str) -> (Value, BTreeMap<String, Vec<u8>>) {
+    let (mut index, archives) = upgrade_index(
+        base,
+        "0.55.1",
+        &"22".repeat(32),
+        version,
+        &"aa".repeat(32),
+        "0.8.0",
+        &"55".repeat(32),
+    );
+    let core = &mut index["components"]["core"];
+    core["release"] = json!(format!("subc-core-v{version}"));
+    let assets = &mut core["assets"][host_target()];
+    assets["ck-subc"]["reports"] = json!(version);
+    assets["ck-subc"]["sha256"] = json!("bb".repeat(32));
+    assets["ck-subc-mcp"]["reports"] = Value::Null;
+    assets["ck-subc-mcp"]["sha256"] = json!("cc".repeat(32));
+    (index, archives)
+}
+
+#[test]
+fn upgrade_noops_when_0_20_83_is_installed_and_cache_and_index_offer_0_20_41() {
+    let fixture = UpgradeFixture::new("ck-upgrade-no-downgrade");
+    fixture.set_core_version("0.20.83");
+    let cache = fixture._root.path().join("update-metadata.json");
+    fs::write(&cache, serde_json::to_vec(&json!({
+        "format_version": 3,
+        "checked_at_unix_secs": now_ms() / 1000,
+        "targets": {
+            "ck": {"version": "0.20.41", "sha256": "aa".repeat(32)},
+            "ck-subc": {"version": "0.20.41", "sha256": "bb".repeat(32)},
+            "ck-subc-mcp": {"version": "0.20.41", "sha256": "cc".repeat(32), "reports_release_version": false}
+        }
+    })).unwrap()).unwrap();
+    let index = serve_signed_index(|base| core_release_index(base, "0.20.41"));
+    let manifest = fixture
+        .home
+        .join(".local/share/cortexkit/installer-manifest.json");
+    let before = fs::read(&manifest).unwrap();
+    for args in [
+        &["upgrade"][..],
+        &["upgrade", "--check"][..],
+        &["upgrade", "--dry-run"][..],
+        &[][..],
+    ] {
+        let output = fixture
+            .command(&index, args)
+            .env("CK_TEST_CK_VERSION", "0.20.83")
+            .env("CK_TEST_SUBC_MCP_VERSION", "0.1.0")
+            .output()
+            .unwrap();
+        assert_exit(&output, 0);
+        assert!(output.stderr.is_empty(), "stderr: {}", text(&output.stderr));
+        let stdout = text(&output.stdout);
+        assert!(!stdout.contains("0.20.41"), "stdout:\n{stdout}");
+        if args.is_empty() {
+            assert!(stdout.contains("updates: none"), "stdout:\n{stdout}");
+        } else if !args.contains(&"--dry-run") {
+            assert!(
+                stdout.starts_with("Everything is up to date"),
+                "stdout:\n{stdout}"
+            );
+        }
+        assert_eq!(
+            fs::read(&manifest).unwrap(),
+            before,
+            "upgrade must not mutate inventory"
+        );
+    }
+}
+
+#[test]
+fn upgrade_check_still_offers_a_strictly_newer_core_release() {
+    let fixture = UpgradeFixture::new("ck-upgrade-newer-core");
+    fixture.set_core_version("0.20.83");
+    let index = serve_signed_index(|base| core_release_index(base, "0.20.84"));
+    let output = fixture
+        .command(&index, &["upgrade", "--check"])
+        .env("CK_TEST_CK_VERSION", "0.20.83")
+        .env("CK_TEST_SUBC_MCP_VERSION", "0.1.0")
+        .output()
+        .unwrap();
+    assert_exit(&output, 0);
+    let stdout = text(&output.stdout);
+    for update in [
+        "ck 0.20.83 → 0.20.84",
+        "ck-subc 0.20.83 → 0.20.84",
+        "ck-subc-mcp → release 0.20.84",
+    ] {
+        assert!(stdout.contains(update), "stdout:\n{stdout}");
     }
 }
 

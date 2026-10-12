@@ -12,7 +12,8 @@ pub const UPDATE_CACHE_FORMAT_VERSION: u32 = 3;
 /// Release evidence retained after a successful user-initiated update check.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CachedRelease {
-    /// Display-only release text; sibling binaries need not share it.
+    /// Release version used to reject downgrades; sibling binaries need not
+    /// report this version themselves.
     pub version: String,
     /// Digest of this binary's asset for the invoking host, or `None` when the
     /// signed index has no matching asset for that target.

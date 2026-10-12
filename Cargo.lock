@@ -1923,7 +1923,7 @@ dependencies = [
 
 [[package]]
 name = "subc-core"
-version = "0.20.84"
+version = "0.20.85"
 dependencies = [
  "base64",
  "cortexkit-log",
@@ -1933,6 +1933,7 @@ dependencies = [
  "hex-literal",
  "rusqlite",
  "rustix",
+ "semver",
  "serde",
  "serde_json",
  "sha2",

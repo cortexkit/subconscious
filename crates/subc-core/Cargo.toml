@@ -1,6 +1,6 @@
 [package]
 name = "subc-core"
-version = "0.20.84"
+version = "0.20.85"
 edition = "2021"
 license = "MIT"
 publish = false
@@ -55,6 +55,7 @@ base64 = "0.22"
 ed25519-dalek = "2"
 hex-literal = "0.4"
 rusqlite = { version = "0.32", features = ["bundled"] }
+semver = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"

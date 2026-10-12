@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.20.85
+
+- `ck` and `ck upgrade` never offer or install a release older than what is installed, including binaries that don't report their own version (judged by a sibling from the same release that does). Cached update metadata that names a release older than the installed one predates this install, so it is refetched even inside its 24-hour lifetime; if the refetch fails, no update is shown. Replacing a damaged binary with the same release, and restoring the previous binary when an upgrade fails, still work as before.
+
 ## 0.20.84
 
 - Make forwarding-test stub spawn helpers and replacement attachments wait for catalog publication on a separate authenticated connection, so route.open cannot race installation of the module's forwarding endpoint.

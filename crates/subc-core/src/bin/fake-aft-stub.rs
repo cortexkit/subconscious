@@ -274,6 +274,11 @@ type InFlightRegistry = Arc<Mutex<HashMap<InFlightKey, oneshot::Sender<()>>>>;
 
 #[tokio::main]
 async fn main() -> Result<(), StubError> {
+    #[cfg(windows)]
+    if env_flag("FAKE_AFT_RESTRICT_PROCESS") {
+        subc_os::windows_acl::restrict_current_process()
+            .expect("FAKE_AFT_RESTRICT_PROCESS: restrict_current_process failed");
+    }
     // Before every branch, so the witness is available on the normal supervised
     // path and not only to the exit-only shapes.
     echo_requested_env();

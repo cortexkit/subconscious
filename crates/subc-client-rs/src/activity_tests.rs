@@ -202,4 +202,3 @@ async fn activity_record_timeout_cancel_and_connection_close_release_waiters() {
         .pending_activity_records
         .is_empty());
 }
-

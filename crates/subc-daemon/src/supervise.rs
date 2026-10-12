@@ -1175,6 +1175,10 @@ impl SupervisorSnapshot {
         Self::new(ModuleState::Disabled, false)
     }
 
+    fn failed() -> Self {
+        Self::new(ModuleState::Failed, true)
+    }
+
     /// Crash restarts still inside `window`, having dropped the ones that are
     /// not. Pruning on read is what makes the budget a rate: an instant older
     /// than the window stops holding a slot the moment anybody counts.
@@ -2536,16 +2540,6 @@ pub struct Supervisor {
     test_after_first_spawn: AfterFirstSpawnHook,
 }
 
-/// A roster entry whose monitor and first process have not started yet.
-/// Keeping the command receiver here lets discovery serve status immediately
-/// while start/stop requests wait until bootstrap has published the connection file.
-pub(crate) struct RegisteredConfiguredModule {
-    spec: ModuleSpec,
-    runtime: SupervisorRuntimeConfig,
-    module: SupervisedModule,
-    commands: mpsc::Receiver<SupervisorCommand>,
-}
-
 /// Test-only hook run on the path that takes on a new module, right after its
 /// first `spawn_child` returns (the process exists and could already be
 /// registering) and before that process is handed to the module's supervise
@@ -3001,14 +2995,55 @@ impl Supervisor {
         spec: ModuleSpec,
         enabled: bool,
     ) -> Result<SupervisedModule, SuperviseError> {
-        self.supervise_configured_requested(
-            spec,
-            enabled,
-            self.health.clone(),
-            None,
-            self.restart_policy,
-            None,
-        )
+        validate_spec(&spec)?;
+        self.establish_identity(&spec);
+
+        let runtime = self.runtime_config();
+        if !enabled {
+            let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::disabled()));
+            return Ok(self.supervised_module(spec, runtime, snapshot, None));
+        }
+
+        #[cfg(target_os = "linux")]
+        if let Some(pid) = runtime.child_roster.previous_instance_pid(&spec.module_id) {
+            let mut snapshot = SupervisorSnapshot::starting();
+            snapshot.waiting_for_previous_pid = Some(pid);
+            return Ok(self.supervised_module(spec, runtime, Arc::new(Mutex::new(snapshot)), None));
+        }
+
+        let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
+        let activity_spawn = runtime.begin_activity_spawn(&spec.module_id);
+        let spawned = spawn_child(
+            &spec,
+            runtime.connection_file_path.as_deref(),
+            self.supervisor_handle.as_ref(),
+            &runtime.stderr_ring,
+            runtime.capture_logs_dir.as_deref(),
+            &runtime.child_roster,
+            #[cfg(target_os = "linux")]
+            runtime.cgroup_placement.as_ref(),
+        );
+        #[cfg(test)]
+        self.test_after_first_spawn.run(&spec.module_id);
+        match spawned {
+            Ok(child) => {
+                self.mark_first_process_running(&spec, &runtime, &snapshot, &child)?;
+                if let Some(spawn) = activity_spawn {
+                    spawn.complete(&snapshot);
+                }
+                Ok(self.supervised_module(spec, runtime, snapshot, Some(child)))
+            }
+            Err(err) => {
+                error!(
+                    module_id = %spec.module_id,
+                    program = %spec.program.display(),
+                    error = %err,
+                    "configured module failed to spawn; marking failed and continuing"
+                );
+                let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::failed()));
+                Ok(self.supervised_module(spec, runtime, snapshot, None))
+            }
+        }
     }
 
     /// Supervise a configured module with its own health, drain, and crash
@@ -3043,33 +3078,12 @@ impl Supervisor {
         restart_policy: RestartPolicy,
         requester: Option<Principal>,
     ) -> Result<SupervisedModule, SuperviseError> {
-        let registered = self.register_configured_with_health(
-            spec,
-            enabled,
-            health,
-            drain_timeout_ms,
-            restart_policy,
-        )?;
-        self.start_registered_configured(registered, requester)
-    }
-
-    /// Record a configured module as starting or disabled, without launching a
-    /// process or running its monitor. Bootstrap registers the entire roster
-    /// before publishing discovery, then activates it once children can read
-    /// the connection file passed in their `--subc` argument.
-    pub(crate) fn register_configured_with_health(
-        &self,
-        spec: ModuleSpec,
-        enabled: bool,
-        health: HealthConfig,
-        drain_timeout_ms: Option<u64>,
-        restart_policy: RestartPolicy,
-    ) -> Result<RegisteredConfiguredModule, SuperviseError> {
         validate_spec(&spec)?;
         self.establish_identity(&spec);
 
         let mut runtime = self.runtime_config();
-        runtime.health = health;
+        runtime.start_requester = requester;
+        runtime.health = health.clone();
         runtime.restart_policy = restart_policy;
         if let Some(ms) = drain_timeout_ms {
             runtime.drain_timeout = Duration::from_millis(ms);
@@ -3078,99 +3092,60 @@ impl Supervisor {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = runtime.drain_timeout;
         }
-        let snapshot = if enabled {
-            SupervisorSnapshot::starting()
-        } else {
-            SupervisorSnapshot::disabled()
-        };
-        #[cfg(target_os = "linux")]
-        let snapshot = {
-            let mut snapshot = snapshot;
-            if enabled {
-                snapshot.waiting_for_previous_pid =
-                    runtime.child_roster.previous_instance_pid(&spec.module_id);
-            }
-            snapshot
-        };
-        let (module, commands) =
-            self.register_module(&spec, &runtime, Arc::new(Mutex::new(snapshot)));
-        Ok(RegisteredConfiguredModule {
-            spec,
-            runtime,
-            module,
-            commands,
-        })
-    }
+        if !enabled {
+            let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::disabled()));
+            return Ok(self.supervised_module(spec, runtime, snapshot, None));
+        }
 
-    /// Activate a previously registered module. Queued control requests are
-    /// served by the monitor after the initial configured spawn has settled.
-    pub(crate) fn start_registered_configured(
-        &self,
-        registered: RegisteredConfiguredModule,
-        requester: Option<Principal>,
-    ) -> Result<SupervisedModule, SuperviseError> {
-        let RegisteredConfiguredModule {
-            spec,
-            mut runtime,
-            module,
-            commands,
-        } = registered;
-        runtime.start_requester = requester;
-        let snapshot = &module.inner.snapshot;
-        let should_spawn = {
-            let state = lock_snapshot(snapshot)?;
-            state.enabled && state.waiting_for_previous_pid.is_none()
-        };
-        let child = if should_spawn {
-            let activity_spawn = runtime.begin_activity_spawn(&spec.module_id);
-            let spawned = spawn_child(
-                &spec,
-                runtime.connection_file_path.as_deref(),
-                self.supervisor_handle.as_ref(),
-                &runtime.stderr_ring,
-                runtime.capture_logs_dir.as_deref(),
-                &runtime.child_roster,
-                #[cfg(target_os = "linux")]
-                runtime.cgroup_placement.as_ref(),
-            );
-            #[cfg(test)]
-            self.test_after_first_spawn.run(&spec.module_id);
-            match spawned {
-                Ok(child) => {
-                    self.mark_first_process_running(&spec, &runtime, snapshot, &child)?;
-                    if let Some(spawn) = activity_spawn {
-                        spawn.complete(snapshot);
-                    }
-                    Some(child)
+        #[cfg(target_os = "linux")]
+        if let Some(pid) = runtime.child_roster.previous_instance_pid(&spec.module_id) {
+            let mut snapshot = SupervisorSnapshot::starting();
+            snapshot.waiting_for_previous_pid = Some(pid);
+            return Ok(self.supervised_module(spec, runtime, Arc::new(Mutex::new(snapshot)), None));
+        }
+
+        let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
+        let activity_spawn = runtime.begin_activity_spawn(&spec.module_id);
+        let spawned = spawn_child(
+            &spec,
+            runtime.connection_file_path.as_deref(),
+            self.supervisor_handle.as_ref(),
+            &runtime.stderr_ring,
+            runtime.capture_logs_dir.as_deref(),
+            &runtime.child_roster,
+            #[cfg(target_os = "linux")]
+            runtime.cgroup_placement.as_ref(),
+        );
+        #[cfg(test)]
+        self.test_after_first_spawn.run(&spec.module_id);
+        match spawned {
+            Ok(child) => {
+                self.mark_first_process_running(&spec, &runtime, &snapshot, &child)?;
+                if let Some(spawn) = activity_spawn {
+                    spawn.complete(&snapshot);
                 }
-                Err(err) => {
-                    if runtime.health.critical {
-                        error!(
-                            module_id = %spec.module_id,
-                            program = %spec.program.display(),
-                            error = %err,
-                            "critical configured module failed to spawn; marking failed and alerting"
-                        );
-                    } else {
-                        error!(
-                            module_id = %spec.module_id,
-                            program = %spec.program.display(),
-                            error = %err,
-                            "configured module failed to spawn; marking failed and continuing"
-                        );
-                    }
-                    update_snapshot(snapshot, Some(&spec.module_id), |state| {
-                        state.state = ModuleState::Failed;
-                        clear_current_process_facts(state);
-                    })?;
-                    None
-                }
+                Ok(self.supervised_module(spec, runtime, snapshot, Some(child)))
             }
-        } else {
-            None
-        };
-        self.start_monitor(spec, runtime, &module, child, commands);
-        Ok(module)
+            Err(err) => {
+                if health.critical {
+                    error!(
+                        module_id = %spec.module_id,
+                        program = %spec.program.display(),
+                        error = %err,
+                        "critical configured module failed to spawn; marking failed and alerting"
+                    );
+                } else {
+                    error!(
+                        module_id = %spec.module_id,
+                        program = %spec.program.display(),
+                        error = %err,
+                        "configured module failed to spawn; marking failed and continuing"
+                    );
+                }
+                let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::failed()));
+                Ok(self.supervised_module(spec, runtime, snapshot, None))
+            }
+        }
     }
 
     fn runtime_config(&self) -> SupervisorRuntimeConfig {
@@ -3222,17 +3197,6 @@ impl Supervisor {
         snapshot: SharedSnapshot,
         child: Option<SupervisedChild>,
     ) -> SupervisedModule {
-        let (module, commands) = self.register_module(&spec, &runtime, snapshot);
-        self.start_monitor(spec, runtime, &module, child, commands);
-        module
-    }
-
-    fn register_module(
-        &self,
-        spec: &ModuleSpec,
-        runtime: &SupervisorRuntimeConfig,
-        snapshot: SharedSnapshot,
-    ) -> (SupervisedModule, mpsc::Receiver<SupervisorCommand>) {
         let configuration = Arc::new(Mutex::new(SupervisedConfiguration {
             spec: spec.clone(),
             health: runtime.health.clone(),
@@ -3245,6 +3209,16 @@ impl Supervisor {
         let restart_policy = runtime.restart_policy;
         let effective_drain_timeout = Arc::clone(&runtime.effective_drain_timeout);
         let (tx, rx) = mpsc::channel(4);
+        let monitor = tokio::spawn(supervise_loop(
+            spec.clone(),
+            runtime,
+            Arc::clone(&self.registry),
+            Arc::clone(&self.process_liveness),
+            Arc::clone(&snapshot),
+            child,
+            rx,
+        ));
+
         let module_id = spec.module_id.clone();
         let module = SupervisedModule {
             inner: Arc::new(SupervisedModuleInner {
@@ -3255,42 +3229,19 @@ impl Supervisor {
                 stderr_ring,
                 terminal_ring,
                 commands: tx,
-                monitor: Mutex::new(None),
+                monitor: Mutex::new(Some(monitor)),
                 restart_policy,
                 effective_drain_timeout,
                 provenance_probe: self.provenance_probe.clone(),
             }),
         };
-        // Identity gates and the configured mark must precede the roster entry,
-        // so a client never sees a module without its admission policy.
+        // The identity gates and the configured mark were set by
+        // `establish_identity` before any process was spawned; only the roster
+        // entry waits for the module handle, which needs the spawned child.
         if let Some(supervisor_handle) = &self.supervisor_handle {
             supervisor_handle.insert(module.clone());
         }
-        (module, rx)
-    }
-
-    fn start_monitor(
-        &self,
-        spec: ModuleSpec,
-        runtime: SupervisorRuntimeConfig,
-        module: &SupervisedModule,
-        child: Option<SupervisedChild>,
-        commands: mpsc::Receiver<SupervisorCommand>,
-    ) {
-        let monitor = tokio::spawn(supervise_loop(
-            spec,
-            runtime,
-            Arc::clone(&self.registry),
-            Arc::clone(&self.process_liveness),
-            Arc::clone(&module.inner.snapshot),
-            child,
-            commands,
-        ));
-        *module
-            .inner
-            .monitor
-            .lock()
-            .unwrap_or_else(|p| p.into_inner()) = Some(monitor);
+        module
     }
 }
 
@@ -5417,15 +5368,15 @@ mod tests {
     }
 
     /// A supervised module's process can connect, register, sync its scopes
-    /// and describe them as soon as it is spawned. A plain `spawn` does not put
-    /// the module on the roster until afterward; configured supervision does
-    /// so before spawning. In both cases the owner must
+    /// and describe them as soon as it is spawned, which is BEFORE the
+    /// supervisor puts the module on the roster. In that window the owner must
     /// already read as configured, so a scoped `route.open` against it is
     /// refused as retryable `scope_not_synced` and not as terminal
     /// `scope_not_live` ("will never sync").
     ///
-    /// The hook runs just after each initial spawn attempt, before returning to
-    /// the caller, so no race with a real child's registration is needed.
+    /// The hook runs in exactly that window on every path that takes on a new
+    /// module, so no race with a real child is needed: `on_roster: false`
+    /// proves each observation was taken before the roster insert.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_new_module_is_configured_before_its_first_process_can_register() {
         use crate::scopes::ScopeTable;
@@ -5523,7 +5474,7 @@ mod tests {
         .map(|module_id| OwnerInSpawnWindow {
             module_id: module_id.to_string(),
             configured: true,
-            on_roster: !matches!(module_id, "plain" | "spawn-error"),
+            on_roster: false,
             admission_refusal: Some(error_codes::SCOPE_NOT_SYNCED),
         })
         .collect::<Vec<_>>();

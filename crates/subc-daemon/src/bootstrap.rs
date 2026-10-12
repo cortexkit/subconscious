@@ -941,44 +941,6 @@ async fn serve_bound_daemon(
     )
     .with_connected_clients(connected_clients);
 
-    // Discovery must expose every accepted configured module, including disabled
-    // ones. Registration creates status handles but neither starts monitors
-    // nor launches processes: children need the published file for `--subc`.
-    let mut registered_modules = Vec::with_capacity(configured_modules.len());
-    for configured in configured_modules {
-        let enabled = configured.enabled;
-        let health = configured.health.clone();
-        let module_id = configured.module_id.clone();
-        let registered = match supervisor.register_configured_with_health(
-            configured.module_spec(),
-            enabled,
-            health.clone(),
-            configured.drain_timeout_ms,
-            configured.restart,
-        ) {
-            Ok(registered) => registered,
-            Err(err) => {
-                error!(module_id = %module_id, error = %err, "failed to supervise configured module; continuing daemon startup");
-                continue;
-            }
-        };
-        registered_modules.push(registered);
-        // A relaxed threshold can silently outlive the temporary allowance
-        // that required it, so report the extra tolerance on every boot.
-        let default_threshold = HealthConfig::default().failure_threshold;
-        if enabled && health.failure_threshold > default_threshold {
-            warn!(
-                module_id = %module_id,
-                failure_threshold = health.failure_threshold,
-                default_threshold,
-                tolerance_secs = health.cadence.as_secs() * u64::from(health.failure_threshold),
-                "health failure threshold is relaxed above the default; a wedged module stays unflagged for longer"
-            );
-        }
-        info!(module_id = %module_id, enabled, "configured module registered");
-    }
-    control.refresh_capability_requirements();
-
     let mut serve_task =
         AbortOnDrop::new(tokio::spawn(serve_listeners(bound.listeners, router, auth)));
     verify_serving(&bound.connection_info).await?;
@@ -995,8 +957,6 @@ async fn serve_bound_daemon(
     )
     .await;
     published?;
-    #[cfg(test)]
-    startup_publication_hook::run(&bound.connection_file_path).await;
     drop(publication_lock);
     let _clock_step_task = AbortOnDrop::new(crate::watchdog::spawn_clock_step_monitor());
     // Off the startup path: it runs `systemctl`, and only ever logs.
@@ -1013,9 +973,41 @@ async fn serve_bound_daemon(
         .spawn(),
     );
 
-    for registered in registered_modules {
-        if let Err(err) = supervisor.start_registered_configured(registered, None) {
-            error!(error = %err, "failed to start configured module; continuing daemon startup");
+    for configured in configured_modules {
+        let enabled = configured.enabled;
+        let health = configured.health.clone();
+        let module_id = configured.module_id.clone();
+        match supervisor.supervise_configured_with_health(
+            configured.module_spec(),
+            enabled,
+            health.clone(),
+            configured.drain_timeout_ms,
+            configured.restart,
+        ) {
+            Ok(_) => {
+                // A raised failure threshold is normally a temporary allowance for a
+                // drive that deliberately stops a module, and it widens the window in
+                // which a genuinely wedged module looks fine. It is only ever noticed
+                // when someone thinks to re-read the config, so a relaxation outlives
+                // its reason silently: a rig ran five days at 240s of tolerance against
+                // a 90s default because a comment promising a revert was mistaken for
+                // the revert. Saying so on every boot costs one line and removes the
+                // need for anyone to remember.
+                let default_threshold = HealthConfig::default().failure_threshold;
+                if enabled && health.failure_threshold > default_threshold {
+                    warn!(
+                        module_id = %module_id,
+                        failure_threshold = health.failure_threshold,
+                        default_threshold,
+                        tolerance_secs = health.cadence.as_secs() * u64::from(health.failure_threshold),
+                        "health failure threshold is relaxed above the default; a wedged module stays unflagged for longer"
+                    );
+                }
+                info!(module_id = %module_id, enabled, "configured module supervised");
+            }
+            Err(err) => {
+                error!(module_id = %module_id, error = %err, "failed to supervise configured module; continuing daemon startup");
+            }
         }
     }
 
@@ -1406,44 +1398,6 @@ mod connection_file_write_hook {
     }
 }
 
-/// A path-scoped barrier after publication and before any configured activation.
-/// The async wait leaves the listeners free to answer discovery-time requests.
-#[cfg(test)]
-mod startup_publication_hook {
-    use std::{
-        path::{Path, PathBuf},
-        sync::{Mutex, PoisonError},
-    };
-    use tokio::sync::oneshot;
-
-    type Barrier = (oneshot::Sender<()>, oneshot::Receiver<()>);
-    static BARRIERS: Mutex<Vec<(PathBuf, Barrier)>> = Mutex::new(Vec::new());
-
-    pub(super) fn install(path: &Path) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
-        let (entered_tx, entered_rx) = oneshot::channel();
-        let (release_tx, release_rx) = oneshot::channel();
-        BARRIERS
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push((path.to_path_buf(), (entered_tx, release_rx)));
-        (entered_rx, release_tx)
-    }
-
-    pub(super) async fn run(path: &Path) {
-        let barrier = {
-            let mut barriers = BARRIERS.lock().unwrap_or_else(PoisonError::into_inner);
-            barriers
-                .iter()
-                .position(|(hooked, _)| hooked == path)
-                .map(|index| barriers.swap_remove(index).1)
-        };
-        if let Some((entered, release)) = barrier {
-            let _ = entered.send(());
-            let _ = release.await;
-        }
-    }
-}
-
 fn is_absent_or_stale_connection_file(err: &ConnectionFileError) -> bool {
     match err {
         ConnectionFileError::Io { source, .. } if source.kind() == io::ErrorKind::NotFound => true,
@@ -1814,9 +1768,6 @@ impl Error for BootstrapError {
 mod tests {
     mod activity {
         include!("activity_bootstrap_tests.rs");
-    }
-    mod startup_order {
-        include!("startup_order_tests.rs");
     }
     use super::*;
     use crate::server::ServerAuth;

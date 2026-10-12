@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.34.7
+
+- Register every accepted configured module with the supervisor before publishing the connection file, in `starting` or `disabled` state. Start enabled processes and their monitors only after publication, so children can read their `--subc` file and discovery-time status requests cannot incorrectly report an accepted configured module as unsupervised. Preserve per-module health, restart and drain policies and record spawn failures on the existing status handle. Entries refused during registration are logged and skipped without preventing publication or startup of the other modules.
+
 ## 0.34.6
 
 - Keep a crash's `route.closed` non-terminal when the supervisor has reserved the last available restart slot but has not yet published `Restarting`. Publish the pending-recovery fact atomically with the budget reservation, so connection cleanup cannot mistake the replacement's exhausted budget for the crashed process's recovery verdict. Terminal exit history still precedes the visible state change. Add a deterministic terminal-record barrier regression test.

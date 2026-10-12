@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.14
+
+- Test-only: use paused Tokio time to check that health checks respond while a probe is hung, without measuring elapsed wall-clock time.
+
 ## 0.3.13
 
 - Update the internal bus module to `subc-protocol` 0.31 and `subc-client-rs` 0.28, with control, transport and daemon test dependencies upgraded together. Bus consumers need no request changes; this dependency update does not declare `call-modes/v1` or implement provider mode handling.

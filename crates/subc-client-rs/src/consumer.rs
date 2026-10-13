@@ -3261,8 +3261,19 @@ impl Shared {
         // "deadline elapsed", so "the module was reloading" stays
         // distinguishable from "the connection failed".
         let mut refusals = RouteOpenRefusals::default();
+        // An attempt that ends because the deadline passed hands back the kept
+        // refusal. That covers an attempt that never left the client (NotSent)
+        // and one the daemon received but had not answered by the deadline
+        // (OutcomeUnknown with the Deadline cause): a busy daemon can answer
+        // the final retry a few milliseconds late, and the refusals before it
+        // still say why the route never opened. Dropping the unanswered
+        // attempt's own outcome is safe: route.open requests are sent with
+        // `retain_late_route_open`, so a late acceptance is closed again with
+        // a GOODBYE instead of being handed to anyone.
         let expired = |err: CallError, refusals: &mut RouteOpenRefusals| {
-            if err.is_not_sent() && Instant::now() >= route_deadline {
+            let ended_by_deadline =
+                err.is_not_sent() || err.outcome_cause() == Some(OutcomeUnknownCause::Deadline);
+            if ended_by_deadline && Instant::now() >= route_deadline {
                 if let Some(refused) = std::mem::take(refusals).into_error(key.target_label()) {
                     return refused;
                 }
@@ -7983,6 +7994,88 @@ mod tests {
                 Some(code)
             );
         }
+    }
+
+    /// The daemon refuses the first route.open with `module_warming`, then the
+    /// retry is written and accepted but never answered, so the retry deadline
+    /// expires while that attempt is still waiting. The caller must still get
+    /// the refusal it already received, as `NotSent`, rather than the bare
+    /// "timed out at its deadline" of the unanswered attempt. A busy daemon
+    /// that answers the final retry a few milliseconds late hits this path.
+    #[tokio::test]
+    async fn refusal_survives_a_retry_still_in_flight_at_the_deadline() {
+        let (shared, consumer, mut receiver) = route_open_stand_in(seeded_random(11));
+        let options = CallOptions {
+            timeout: Duration::from_secs(5),
+            route_retry: RetryBackoff {
+                base: Duration::ZERO,
+                cap: Duration::ZERO,
+                max_attempts: 2,
+            },
+            route_retry_deadline: Duration::from_millis(300),
+            ..CallOptions::default()
+        };
+        let mut task = tokio::spawn(async move {
+            consumer
+                .open_route(restart_target("warming"), restart_identity(), options)
+                .await
+        });
+        let generation = shared.lock_inner().generation;
+        let refusal = ErrorBody {
+            code: error_codes::MODULE_WARMING.to_string(),
+            message: "warming is not ready".to_string(),
+            detail: Some(serde_json::json!({"reason": "required_capability_unprovided"})),
+        };
+        let mut attempts = 0usize;
+        let mut held = false;
+        let err = loop {
+            tokio::select! {
+                command = receiver.recv() => {
+                    let Some(command) = command else {
+                        break task.await.unwrap().expect_err("route.open must fail");
+                    };
+                    if command.frame.header.ty != FrameType::Request {
+                        continue;
+                    }
+                    attempts += 1;
+                    if attempts == 1 {
+                        let frame = route_open_answer(
+                            command.frame.header.corr,
+                            0,
+                            Some(refusal.clone()),
+                        );
+                        assert!(dispatch_frame(&shared, generation, frame).await);
+                    } else {
+                        // What the writer task does once the frame is on the
+                        // socket: from here a timeout is OutcomeUnknown.
+                        held = shared.mark_pending_accepted(
+                            command.pending.expect("a route.open is a pending request"),
+                        );
+                    }
+                }
+                joined = &mut task => {
+                    break joined.unwrap().expect_err("route.open must fail");
+                }
+            }
+        };
+        shared.close_sync("test complete");
+        assert_eq!(
+            attempts, 2,
+            "one refused attempt, then one held past the deadline"
+        );
+        assert!(
+            held,
+            "the second attempt must be accepted and left unanswered"
+        );
+        assert!(
+            err.is_not_sent(),
+            "a refused route never delivered the request: {err}"
+        );
+        let body = err
+            .route_open_refusal()
+            .unwrap_or_else(|| panic!("the refusal must survive the deadline: {err}"));
+        assert_eq!(body.code, error_codes::MODULE_WARMING);
+        assert_eq!(body.detail, refusal.detail);
     }
 
     #[test]

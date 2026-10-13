@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.28.3
+
+- Keep the daemon's route.open refusal when the retry deadline expires while a later retry is still waiting for its answer. Before, a refusal such as `module_warming` was dropped in that case, and the caller got only "route.open did not complete (request on channel 0 timed out at its deadline)" with no `route_open_refusal()`. This happened when a busy daemon answered the final retry a few milliseconds after the deadline. The error is now `NotSent` and carries the refusal, as it already did when the deadline expired between attempts.
+
 ## 0.28.2
 
 - Let route options add validated consumer-capability declarations alongside reverse-request handler families. The merged, sorted list is forwarded to the provider bind and kept in the route cache identity; declarations such as `content/v1` remain unverified and grant no privilege.

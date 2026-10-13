@@ -583,6 +583,8 @@ pub(crate) type ConnectionCloseReceiver = oneshot::Receiver<CloseReason>;
 #[derive(Debug, Default)]
 pub struct ForwardingTable {
     inner: Arc<RwLock<ForwardingInner>>,
+    #[cfg(feature = "test-support")]
+    route_closing_hold: Mutex<Option<oneshot::Receiver<()>>>,
     close_registry: Mutex<HashMap<ConnectionId, oneshot::Sender<CloseReason>>>,
     counters: DaemonCounters,
     /// Per-target-module bind-relay breaker state. It lives here, beside the
@@ -600,6 +602,24 @@ pub struct ForwardingTable {
 }
 
 impl ForwardingTable {
+    /// Hold the next supervisor drain between enqueueing `module.draining` and
+    /// `route.closing`, so a test can forward a response in that window. Dropping
+    /// the returned sender also releases the hold, including on a test panic.
+    #[cfg(feature = "test-support")]
+    pub fn hold_route_closing_for_test(&self) -> oneshot::Sender<()> {
+        let (release, hold) = oneshot::channel();
+        *self.route_closing_hold.lock().unwrap() = Some(hold);
+        release
+    }
+
+    #[cfg(feature = "test-support")]
+    pub(crate) async fn wait_before_route_closing_for_test(&self) {
+        let hold = self.route_closing_hold.lock().unwrap().take();
+        if let Some(hold) = hold {
+            let _ = hold.await;
+        }
+    }
+
     pub(crate) fn operator_confirms(&self) -> Arc<crate::operator_confirm::OperatorConfirms> {
         Arc::clone(
             &self

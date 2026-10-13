@@ -1000,20 +1000,25 @@ async fn handle_frame(
                 ModuleControlCommand::Draining {
                     reason,
                     deadline_ms,
-                } => record_event(
-                    config,
-                    json!({
-                        "kind": "draining",
-                        "reason": reason,
-                        "deadline_ms": deadline_ms,
-                        "shutdown_marker_seen": env::var_os("FAKE_AFT_SHUTDOWN_JOURNAL")
-                            .and_then(|path| fs::read_to_string(path).ok())
-                            .is_some_and(|journal| journal.lines().any(|line| {
-                                serde_json::from_str::<Value>(line).is_ok_and(|entry|
-                                    entry["event"] == "daemon_shutdown")
-                            })),
-                    }),
-                )?,
+                } => {
+                    record_event(
+                        config,
+                        json!({
+                            "kind": "draining",
+                            "reason": reason,
+                            "deadline_ms": deadline_ms,
+                            "shutdown_marker_seen": env::var_os("FAKE_AFT_SHUTDOWN_JOURNAL")
+                                .and_then(|path| fs::read_to_string(path).ok())
+                                .is_some_and(|journal| journal.lines().any(|line| {
+                                    serde_json::from_str::<Value>(line).is_ok_and(|entry|
+                                        entry["event"] == "daemon_shutdown")
+                                })),
+                        }),
+                    )?;
+                    for request in std::mem::take(&mut state.respond_on_draining) {
+                        emit_response(writer, config, request).await?;
+                    }
+                }
             }
             Ok(true)
         }
@@ -1076,7 +1081,20 @@ async fn handle_frame(
             let request_writer = writer.clone();
             let request_config = config.clone();
 
-            if behavior.delay.is_zero() {
+            if behavior.respond_on_draining {
+                // A held request can settle only after the drain command arrives;
+                // unlike a timed delay, this proves notice-before-quiescence.
+                send_requested_pushes(
+                    writer,
+                    config,
+                    frame.header.ver,
+                    frame.header.channel,
+                    frame.header.epoch,
+                    &fanout_channels,
+                )
+                .await?;
+                state.respond_on_draining.push(frame);
+            } else if behavior.delay.is_zero() {
                 handle_data_request(
                     request_writer,
                     frame,
@@ -1758,6 +1776,7 @@ async fn send_outbound(writer: &mpsc::Sender<Frame>, frame: Frame) -> Result<(),
 struct RequestBehavior {
     delay: Duration,
     cancellable: bool,
+    respond_on_draining: bool,
 }
 
 /// A route request is a tool call when it decodes as the shared tool-call
@@ -1781,6 +1800,7 @@ fn request_behavior(config: &StubConfig, body: &[u8]) -> RequestBehavior {
         return RequestBehavior {
             delay,
             cancellable: true,
+            respond_on_draining: false,
         };
     }
 
@@ -1788,6 +1808,7 @@ fn request_behavior(config: &StubConfig, body: &[u8]) -> RequestBehavior {
         return RequestBehavior {
             delay: Duration::ZERO,
             cancellable: true,
+            respond_on_draining: false,
         };
     }
 
@@ -1806,6 +1827,10 @@ fn request_behavior(config: &StubConfig, body: &[u8]) -> RequestBehavior {
     RequestBehavior {
         delay: Duration::from_millis(delay_ms),
         cancellable: !uncancellable,
+        respond_on_draining: parsed
+            .as_ref()
+            .and_then(|value| value.get("respond_on_draining").and_then(Value::as_bool))
+            .unwrap_or(false),
     }
 }
 
@@ -2106,6 +2131,7 @@ struct StubState {
     tentative_channels: BTreeMap<u16, u32>,
     route_bind_count: usize,
     in_flight: InFlightRegistry,
+    respond_on_draining: Vec<Frame>,
 }
 
 impl Default for StubState {
@@ -2115,6 +2141,7 @@ impl Default for StubState {
             tentative_channels: BTreeMap::new(),
             route_bind_count: 0,
             in_flight: Arc::new(Mutex::new(HashMap::new())),
+            respond_on_draining: Vec::new(),
         }
     }
 }

@@ -577,6 +577,85 @@ async fn subc_consumer_catalog_list_reads_tool_provider_without_open_routes() {
     daemon.kill_and_wait();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn subc_consumer_supervisor_list_includes_enabled_and_disabled_modules_from_real_daemon() {
+    const ENABLED_MODULE_ID: &str = "subc-client-rs-supervisor-enabled";
+    const DISABLED_MODULE_ID: &str = "subc-client-rs-supervisor-disabled";
+
+    let workspace = workspace_root();
+    let daemon_bin = ensure_binary(
+        &workspace,
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-core",
+            "--bin",
+            "ck-subc",
+            "--message-format=json",
+        ],
+    );
+    let fake_aft_bin = ensure_binary(
+        &workspace,
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-core",
+            "--bin",
+            "fake-aft-stub",
+            "--message-format=json",
+        ],
+    );
+
+    let temp_dir = unique_temp_dir("subc-client-rs-supervisor-list");
+    let runtime_dir = temp_dir.join("runtime");
+    let config_dir = temp_dir.join("config");
+    fs::create_dir_all(&runtime_dir).unwrap();
+    fs::create_dir_all(config_dir.join("cortexkit")).unwrap();
+    let mut config: Value =
+        serde_json::from_str(&fake_aft_stub_config_doc(&fake_aft_bin, ENABLED_MODULE_ID)).unwrap();
+    config["modules"][DISABLED_MODULE_ID] = json!({
+        "program": fake_aft_bin.to_string_lossy(),
+        "args": [],
+        "env": {},
+        "enabled": false,
+    });
+    fs::write(
+        config_dir.join("cortexkit").join("subc.jsonc"),
+        serde_json::to_string_pretty(&config).unwrap(),
+    )
+    .unwrap();
+
+    let mut daemon = spawn_daemon(&daemon_bin, &runtime_dir, &config_dir);
+    wait_for_connection_file(&daemon.connection_file, START_TIMEOUT).await;
+    wait_for_catalog_module(&daemon.connection_file, ENABLED_MODULE_ID, START_TIMEOUT).await;
+
+    let consumer = SubcConsumer::connect(&daemon.connection_file, fast_consumer_options())
+        .await
+        .unwrap();
+    let response = consumer.supervisor_list().await.unwrap();
+    assert_eq!(response.modules.len(), 2);
+
+    let enabled = response
+        .modules
+        .iter()
+        .find(|module| module.module_id == ENABLED_MODULE_ID)
+        .expect("supervisor.list must include the enabled configured module");
+    assert!(enabled.enabled);
+    assert_eq!(enabled.state, "running");
+
+    let disabled = response
+        .modules
+        .iter()
+        .find(|module| module.module_id == DISABLED_MODULE_ID)
+        .expect("supervisor.list must include the disabled configured module");
+    assert!(!disabled.enabled);
+    assert_eq!(disabled.state, "disabled");
+
+    daemon.kill_and_wait();
+}
+
 /// A route.open the daemon refuses surfaces its refusal body, `detail`
 /// included, through `CallError::route_open_refusal`. Two paths: a terminal
 /// refusal returns at once with its own body, and a retryable one that

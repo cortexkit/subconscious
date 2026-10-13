@@ -14,6 +14,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+pub use subc_control::SupervisorEntry;
 use subc_control::{
     CatalogEntry, ClientControlRequest, ClientControlResponse, ConsumerIdentity, PollKind,
 };
@@ -693,6 +694,16 @@ pub struct CatalogList {
     pub modules: Vec<CatalogEntry>,
     #[serde(default)]
     pub subc_ops: Vec<String>,
+}
+
+/// Typed response from the daemon's channel-0 `supervisor.list` operation.
+///
+/// Unlike `catalog.list`, this includes configured modules that are stopped or
+/// disabled, along with their current supervisor state.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SupervisorListResponse {
+    pub generation: u64,
+    pub modules: Vec<SupervisorEntry>,
 }
 
 /// A provider-originated push delivered on one live route.
@@ -1393,6 +1404,65 @@ impl SubcConsumer {
                     // Connection-file and discovery failures can complete without
                     // yielding. Pace the outer retry as well as reconnect itself,
                     // so repeated immediate failures cannot monopolize the executor.
+                    let delay = self.shared.jittered(
+                        self.shared
+                            .opts
+                            .reconnect_backoff
+                            .delay_after_attempt(attempt),
+                    );
+                    self.shared.sleep_until_retry(deadline, delay).await?;
+                    continue;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
+    /// Fetch the supervisor's configured module list over channel 0.
+    /// Transport retries use the consumer's reconnect backoff and call deadline.
+    pub async fn supervisor_list(&self) -> Result<SupervisorListResponse, CallError> {
+        let deadline = Instant::now() + self.shared.opts.call_timeout;
+        let body = serde_json::to_vec(&ClientControlRequest::SupervisorList {}).map_err(|err| {
+            CallError::not_sent(format!("failed to encode supervisor.list: {err}"))
+        })?;
+
+        let mut attempt = 0usize;
+        loop {
+            attempt = attempt.saturating_add(1);
+            match self
+                .shared
+                .control_call(body.clone(), deadline, false, None)
+                .await
+            {
+                Ok(TerminalFrame::Response { body, .. }) => {
+                    let response =
+                        serde_json::from_slice::<ClientControlResponse>(&body).map_err(|err| {
+                            CallError::not_sent(format!(
+                                "failed to decode supervisor.list response: {err}"
+                            ))
+                        })?;
+                    let ClientControlResponse::SupervisorList {
+                        generation,
+                        modules,
+                    } = response
+                    else {
+                        return Err(CallError::not_sent(
+                            "supervisor.list returned an unexpected control response",
+                        ));
+                    };
+                    return Ok(SupervisorListResponse {
+                        generation,
+                        modules,
+                    });
+                }
+                Ok(TerminalFrame::Error { body, .. }) => return Err(CallError::Module(body)),
+                Ok(TerminalFrame::StreamEnd) => {
+                    return Err(CallError::not_sent("supervisor.list returned StreamEnd"));
+                }
+                Err(err)
+                    if is_retryable_catalog_transport_error(&err) && Instant::now() < deadline =>
+                {
+                    // Pace immediate discovery failures so retries cannot monopolize the executor.
                     let delay = self.shared.jittered(
                         self.shared
                             .opts

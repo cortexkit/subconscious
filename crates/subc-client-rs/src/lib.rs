@@ -15,8 +15,9 @@ pub use consumer::{
     ReverseRequestRegistrationError, ReverseRequestRegistry, RouteCloseDisposition,
     RouteCloseReason, RouteEndReason, RoutePollResult, ScopeSelector, SpawnStreamError,
     SpawnSubscription, SubcConsumer, SubscribeOptions, Subscription, SubscriptionClosed,
-    DEFAULT_CALL_TIMEOUT, DEFAULT_LIVENESS_PROBE_WINDOW, DEFAULT_ROUTE_RETRY_DEADLINE,
-    SPAWN_CURSOR_INCARNATION_MISMATCH, SPAWN_CURSOR_TOO_OLD, SPAWN_SUBSCRIBER_LAGGED,
+    SupervisorEntry, SupervisorListResponse, DEFAULT_CALL_TIMEOUT, DEFAULT_LIVENESS_PROBE_WINDOW,
+    DEFAULT_ROUTE_RETRY_DEADLINE, SPAWN_CURSOR_INCARNATION_MISMATCH, SPAWN_CURSOR_TOO_OLD,
+    SPAWN_SUBSCRIBER_LAGGED,
 };
 pub use policy_cache::{
     PolicyResolveError, PolicyResolver, PolicyResolverConfig, PolicyResolverFootprint,

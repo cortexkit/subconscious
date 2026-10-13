@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.28.4
+
+- Add `SubcConsumer::supervisor_list` and typed `SupervisorListResponse` so modules can read every configured module's enabled flag and supervisor state.
+
 ## 0.28.3
 
 - Keep the daemon's route.open refusal when the retry deadline expires while a later retry is still waiting for its answer. Before, a refusal such as `module_warming` was dropped in that case, and the caller got only "route.open did not complete (request on channel 0 timed out at its deadline)" with no `route_open_refusal()`. This happened when a busy daemon answered the final retry a few milliseconds after the deadline. The error is now `NotSent` and carries the refusal, as it already did when the deadline expired between attempts.

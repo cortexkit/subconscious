@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -21,6 +21,50 @@ test.skipIf(process.platform === "win32")("Unix checks and exclusive private cre
   const child = spawnSync(process.execPath, ["run", fileURLToPath(new URL("./fixtures/unix-without-addon.ts", import.meta.url))], { encoding: "utf8" });
   expect(child.status, child.stdout + child.stderr).toBe(0);
   expect(child.stdout).toContain("Unix checks and creation without addon passed");
+});
+
+// /tmp is root-owned and sticky on macOS (as /private/tmp) and Linux; a
+// private directory directly inside it is the owner-only child the sticky
+// rule asks for. A host without such a /tmp skips the case.
+const stickyTmp = (() => {
+  if (process.platform === "win32") return false;
+  try {
+    const s = statSync("/tmp");
+    return s.uid === 0 && (s.mode & 0o1000) !== 0;
+  } catch {
+    return false;
+  }
+})();
+
+test.skipIf(!stickyTmp)("a private directory can be created directly inside root-owned sticky /tmp", async () => {
+  const dir = `/tmp/ck-store-sticky-${process.pid}-${Date.now()}`;
+  try {
+    await createPrivateDirectory(dir);
+    expect(statSync(dir).mode & 0o777).toBe(0o700);
+    expect(await checkOwnerOnlyPathAsync(join(dir, "token.json"))).toEqual({ ok: true });
+    await createPrivateFile(join(dir, "token.json"), "secret");
+    await expect(createPrivateDirectory(dir)).rejects.toThrow();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test.skipIf(!stickyTmp)("a private file directly inside sticky /tmp stays refused, matching checkOwnerOnlyPath", async () => {
+  const file = `/tmp/ck-store-sticky-file-${process.pid}-${Date.now()}`;
+  try {
+    await expect(createPrivateFile(file, "secret")).rejects.toThrow("sticky ancestor without an owner-only child");
+    expect((await checkOwnerOnlyPathAsync(file)).ok).toBe(false);
+  } finally {
+    rmSync(file, { force: true });
+  }
+});
+
+test.skipIf(!stickyTmp)("a sticky folder above the parent still needs its owner-only child", async () => {
+  // The parent doesn't exist yet, so /tmp is not the immediate parent and
+  // nothing owner-only stands between it and the target.
+  const missing = `/tmp/ck-store-missing-${process.pid}-${Date.now()}`;
+  await expect(createPrivateDirectory(join(missing, "private"))).rejects.toThrow("sticky ancestor without an owner-only child");
+  expect(() => statSync(missing)).toThrow();
 });
 
 // These tests require a real Windows host and matching native prebuild; mocks do not prove ACLs.

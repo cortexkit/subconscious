@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.2
+
+- `createPrivateDirectory` can create a private directory directly inside a
+  root-owned sticky folder such as `/tmp`. It used to refuse with "sticky
+  ancestor without an owner-only child" before creating the very owner-only
+  child the rule asks for. The new directory is checked with the same policy
+  after creation and removed if it fails. A sticky folder higher up still
+  needs an existing owner-only directory below it, and a file directly inside
+  a sticky folder is still refused, as `checkOwnerOnlyPath` refuses it.
+
 ## 0.2.1
 
 - Publish the 0.2.0 changes below. The `0.2.0` on npm was built from an earlier commit: it checks Windows paths with an AppData location rule and doesn't use @cortexkit/private-files. Use 0.2.1 or later.

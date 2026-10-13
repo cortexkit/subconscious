@@ -29,7 +29,11 @@ test("published tarballs install and import under Node and Bun", () => {
     const storeTarball = pack(storeDir);
     const logTarball = pack(logDir);
     const packedLog = JSON.parse(run("tar", ["-xOf", logTarball, "package/package.json"]));
-    expect(packedLog.dependencies["@cortexkit/store"]).toBe(`^${store.version}`);
+    // The range must admit the sibling store being packed; a store patch
+    // release doesn't force log to raise its floor.
+    const storeRange = packedLog.dependencies["@cortexkit/store"];
+    expect(storeRange).toStartWith("^");
+    expect(Bun.semver.satisfies(store.version, storeRange)).toBe(true);
     writeFileSync(join(temp, "package.json"), JSON.stringify({ private: true, type: "module" }));
     run("npm", ["install", "--ignore-scripts", "--no-audit", "--no-fund", privateTarball, storeTarball, logTarball]);
     for (const name of ["store", "log"]) {

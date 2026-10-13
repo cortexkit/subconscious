@@ -34,6 +34,7 @@ struct ProcFdInfo {
 struct SocketInfo([u8; 1024]);
 
 pub(super) fn lookup(local: SocketAddr, peer: SocketAddr) -> Option<SocketPeer> {
+    let mut holder = None;
     for pid in pids()? {
         if pid <= 0 {
             continue;
@@ -61,14 +62,21 @@ pub(super) fn lookup(local: SocketAddr, peer: SocketAddr) -> Option<SocketPeer> 
                 continue;
             }
             if matches_connecting_socket(&info.0, local, peer) {
-                return Some(SocketPeer {
-                    pid: pid as u32,
-                    executable: executable(pid)?,
-                });
+                // Count processes, not descriptors: dup within a process does
+                // not make its identity ambiguous, but inheritance by a fork does.
+                if holder.is_some() {
+                    return None;
+                }
+                holder = Some(pid);
+                break;
             }
         }
     }
-    None
+    let pid = holder?;
+    Some(SocketPeer {
+        pid: pid as u32,
+        executable: executable(pid)?,
+    })
 }
 
 fn pids() -> Option<Vec<i32>> {

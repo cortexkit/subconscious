@@ -1608,9 +1608,19 @@ impl<T> Drop for AbortOnDrop<T> {
 
 #[derive(Debug)]
 struct StartLock {
-    // Keep the locked file handle alive for the duration of bootstrap; closing
-    // it releases the advisory lock while leaving the stable path in place.
+    // Keep the locked file handle alive for the duration of bootstrap.
     _file: fs::File,
+}
+
+impl Drop for StartLock {
+    fn drop(&mut self) {
+        // Closing alone leaves the lock held if a concurrent fork inherited
+        // the open file description and has not exec'd yet. Unlock explicitly
+        // so a restart can reclaim the singleton as soon as bootstrap ends.
+        if let Err(error) = FileExt::unlock(&self._file) {
+            tracing::warn!(%error, "failed to release the singleton start lock");
+        }
+    }
 }
 
 impl StartLock {
@@ -2616,6 +2626,34 @@ mod tests {
         );
         drop(bound);
         FileExt::try_lock(&contender).unwrap();
+    }
+
+    #[tokio::test]
+    async fn start_lock_drop_releases_claim_with_a_shared_file_description() {
+        let dir = ScratchDir::new("shared-singleton-lock");
+        let path = dir.join("connection.json");
+        let bound = expect_bound(
+            ensure_singleton_inner(BootstrapConfig::new(&path, 0), false)
+                .await
+                .unwrap(),
+        );
+        // try_clone shares the open file description just as fork does,
+        // without relying on the timing of another test's child spawn.
+        let inherited = bound
+            .publication_lock
+            .as_ref()
+            .unwrap()
+            ._file
+            .try_clone()
+            .unwrap();
+        let contender = open_owner_only_lock(&start_lock_path(&path)).unwrap();
+        assert!(matches!(
+            FileExt::try_lock(&contender),
+            Err(TryLockError::WouldBlock)
+        ));
+        drop(bound);
+        FileExt::try_lock(&contender).expect("dropping bootstrap releases even an inherited lock");
+        drop(inherited);
     }
 
     #[tokio::test]

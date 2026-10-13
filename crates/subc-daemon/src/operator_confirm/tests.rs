@@ -1724,30 +1724,21 @@ async fn privileged_caller_endpoint_records_are_removed_and_never_reused_stale()
 
 #[tokio::test]
 async fn privileged_log_names_the_caller_resolved_from_accepted_socket_endpoints() {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let _client = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
-        .await
-        .unwrap();
-    let (accepted, _) = listener.accept().await.unwrap();
+    let caller = child_caller().await;
     let f = Fixture::new(
         Arc::new(Immediate(ProviderResult::Declined)),
         OperatorLimits::default(),
     );
     let (client, _rx) = ctx_fn(842);
-    f.handler.record_caller_endpoints(
-        client.connection_id,
-        Some((
-            accepted.local_addr().unwrap(),
-            accepted.peer_addr().unwrap(),
-        )),
-    );
+    f.handler
+        .record_caller_endpoints(client.connection_id, Some(caller.endpoints));
     let (logs, _guard) = crate::router::test_log::log_capture(tracing::Level::INFO);
     f.handler
         .handle_control_frame(&client, restart(161))
         .await
         .unwrap();
     let logs = crate::router::test_log::captured_logs(&logs);
-    let expected = format!("pid {} (", std::process::id());
+    let expected = format!("pid {} (", caller.child.id());
     assert!(logs.contains(&expected), "{logs}");
     assert!(
         logs.contains(
@@ -1886,20 +1877,69 @@ impl ManualClock {
     }
 }
 
-/// Real loopback endpoints whose OS lookup resolves to this test process, so
-/// every connection recorded with them is the same executable reconnecting.
-struct SelfCaller {
+/// The connecting socket is opened after exec in a child that never forks.
+/// Other tests can fork the parent without inheriting that socket, so every
+/// lookup must identify this child rather than fall back to a connection key.
+struct ChildCaller {
     endpoints: (std::net::SocketAddr, std::net::SocketAddr),
     executable: std::path::PathBuf,
-    _client: tokio::net::TcpStream,
+    child: CallerChild,
     _accepted: tokio::net::TcpStream,
 }
-async fn self_caller() -> SelfCaller {
+struct CallerChild(std::process::Child);
+
+impl CallerChild {
+    fn id(&self) -> u32 {
+        self.0.id()
+    }
+}
+
+impl Drop for CallerChild {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[test]
+#[ignore = "re-exec socket owner fixture"]
+fn privileged_caller_child_holds_socket() {
+    use std::io::{Read, Write};
+    let address = std::env::var("SUBC_TEST_CALLER_ADDRESS").unwrap();
+    let mut socket = std::net::TcpStream::connect(address).unwrap();
+    socket.write_all(b"R").unwrap();
+    let mut byte = [0];
+    assert_eq!(socket.read(&mut byte).unwrap(), 0);
+}
+
+async fn child_caller() -> ChildCaller {
+    use tokio::io::AsyncReadExt;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let client = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+    let child = CallerChild(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "operator_confirm::tests::privileged_caller_child_holds_socket",
+                "--ignored",
+            ])
+            .env(
+                "SUBC_TEST_CALLER_ADDRESS",
+                listener.local_addr().unwrap().to_string(),
+            )
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let (mut accepted, _) = tokio::time::timeout(Duration::from_secs(10), listener.accept())
         .await
+        .expect("socket owner child connects")
         .unwrap();
-    let (accepted, _) = listener.accept().await.unwrap();
+    let mut ready = [0];
+    tokio::time::timeout(Duration::from_secs(10), accepted.read_exact(&mut ready))
+        .await
+        .expect("socket owner child signals readiness")
+        .unwrap();
+    assert_eq!(&ready, b"R");
     let endpoints = (
         accepted.local_addr().unwrap(),
         accepted.peer_addr().unwrap(),
@@ -1909,13 +1949,14 @@ async fn self_caller() -> SelfCaller {
     })
     .await
     .unwrap();
-    SelfCaller {
+    assert_eq!(caller.pid(), Some(child.id()));
+    ChildCaller {
         endpoints,
         executable: caller
             .executable()
-            .expect("the test process resolves as its own caller")
+            .expect("the child process resolves as the caller")
             .to_path_buf(),
-        _client: client,
+        child,
         _accepted: accepted,
     }
 }
@@ -1923,7 +1964,7 @@ async fn self_caller() -> SelfCaller {
 /// A restart on a fresh connection, resolved to `caller` or left unidentified.
 fn restart_from(
     f: &Fixture,
-    caller: Option<&SelfCaller>,
+    caller: Option<&ChildCaller>,
     connection: u64,
     corr: u64,
 ) -> tokio::task::JoinHandle<Vec<Frame>> {
@@ -1944,7 +1985,7 @@ async fn person_decline(
     f: &Fixture,
     provider: &Stepped,
     events: &mut mpsc::UnboundedReceiver<Event>,
-    caller: &SelfCaller,
+    caller: &ChildCaller,
     connection: u64,
 ) {
     let task = restart_from(f, Some(caller), connection, connection);
@@ -1977,7 +2018,7 @@ async fn approved_after_prompt(
 async fn refused_by_backoff(
     f: &Fixture,
     events: &mut mpsc::UnboundedReceiver<Event>,
-    caller: &SelfCaller,
+    caller: &ChildCaller,
     connection: u64,
 ) {
     let answer = decision(restart_from(f, Some(caller), connection, connection)).await;
@@ -1994,7 +2035,7 @@ async fn privileged_three_person_declines_from_one_executable_start_a_ten_minute
     let (provider, mut events) = Stepped::new();
     let f = privileged_fixture(Arc::new(provider.clone()), OperatorLimits::default());
     let clock = ManualClock::install(&f);
-    let caller = self_caller().await;
+    let caller = child_caller().await;
     let (logs, _guard) = crate::router::test_log::log_capture(tracing::Level::INFO);
     // Each decline comes over a different connection: the executable is the key.
     person_decline(&f, &provider, &mut events, &caller, 900).await;
@@ -2049,7 +2090,7 @@ async fn privileged_three_person_declines_from_one_executable_start_a_ten_minute
     )
     .await;
     assert!(
-        text.contains(&format!("pid {}", std::process::id())),
+        text.contains(&format!("pid {}", caller.child.id())),
         "{text}"
     );
     assert_eq!(
@@ -2065,7 +2106,7 @@ async fn privileged_declines_older_than_ten_minutes_slide_out_of_the_count() {
     let (provider, mut events) = Stepped::new();
     let f = privileged_fixture(Arc::new(provider.clone()), OperatorLimits::default());
     let clock = ManualClock::install(&f);
-    let caller = self_caller().await;
+    let caller = child_caller().await;
     person_decline(&f, &provider, &mut events, &caller, 910).await;
     clock.advance(Duration::from_secs(60));
     person_decline(&f, &provider, &mut events, &caller, 911).await;
@@ -2088,7 +2129,7 @@ async fn privileged_withdrawals_timeouts_and_unavailability_do_not_count_toward_
             stuck_grace: Duration::from_secs(10),
         },
     );
-    let caller = self_caller().await;
+    let caller = child_caller().await;
     person_decline(&f, &provider, &mut events, &caller, 920).await;
 
     let disconnected = restart_from(&f, Some(&caller), 921, 921);
@@ -2135,7 +2176,7 @@ async fn privileged_withdrawals_timeouts_and_unavailability_do_not_count_toward_
 async fn privileged_cooldown_refuses_queued_requests_from_that_executable_only() {
     let (provider, mut events) = Stepped::new();
     let f = privileged_fixture(Arc::new(provider.clone()), OperatorLimits::default());
-    let caller = self_caller().await;
+    let caller = child_caller().await;
     person_decline(&f, &provider, &mut events, &caller, 930).await;
     person_decline(&f, &provider, &mut events, &caller, 931).await;
 

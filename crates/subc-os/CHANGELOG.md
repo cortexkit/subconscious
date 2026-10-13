@@ -3,6 +3,7 @@
 ## 0.1.17
 
 - Add `socket_peer::loopback_socket_peer`, a best-effort lookup of the connecting process's PID and executable for an accepted loopback TCP connection. Match the peer's full socket tuple using libproc on macOS, socket inodes in Linux procfs, and the Windows extended TCP owner table. Unavailable or unreadable identities return `None`; this information is for caller descriptions, not authentication.
+- Return `None` when macOS libproc or Linux procfs finds multiple processes holding the peer socket, including an inherited descriptor between fork and exec. Duplicated descriptors in one process remain unambiguous. Windows' TCP owner table reports one owner per connection and cannot enumerate every process holding an inherited or duplicated socket handle; its best-effort description is unchanged.
 
 ## 0.1.16
 

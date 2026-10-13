@@ -1,6 +1,11 @@
 //! Best-effort process descriptions for the peer of an accepted loopback TCP
 //! connection. These snapshots are not credentials: processes can exit, exec,
-//! or share a socket while a lookup is running.
+//! or share a socket while a lookup is running. macOS libproc and Linux procfs
+//! enumerate socket holders; if more than one visible process holds the peer
+//! socket (for example after fork), the caller is ambiguous and unresolved.
+//! Windows' TCP owner table reports one owning PID per connection, not every
+//! process with an inherited or duplicated socket handle, so it cannot detect
+//! that kind of sharing. None of these OS snapshots proves exclusive ownership.
 
 use std::{net::SocketAddr, path::PathBuf};
 
@@ -23,8 +28,9 @@ pub struct SocketPeer {
 /// the owning socket's local address is `peer`, not the listener's address.
 ///
 /// Returns `None` on unsupported platforms, non-loopback connections, lookup
-/// races, or insufficient OS visibility. This is a blocking, diagnostic lookup,
-/// not an authorization check; failure must not by itself refuse a request.
+/// races, multiple visible holders, or insufficient OS visibility. This is a
+/// blocking, diagnostic lookup, not an authorization check; failure must not by
+/// itself refuse a request.
 pub fn loopback_socket_peer(local: SocketAddr, peer: SocketAddr) -> Option<SocketPeer> {
     lookup_with(local, peer, platform_lookup)
 }
@@ -120,3 +126,6 @@ mod tests {
         ));
     }
 }
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod shared_tests;

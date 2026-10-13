@@ -9,6 +9,7 @@ pub(super) fn lookup(local: SocketAddr, peer: SocketAddr) -> Option<SocketPeer> 
         .filter_map(|path| fs::read_to_string(path).ok())
         .find_map(|table| connecting_inode(&table, local, peer))?;
     let socket_link = format!("socket:[{inode}]");
+    let mut holder = None;
     for process in fs::read_dir("/proc").ok()?.flatten() {
         let Some(pid) = process
             .file_name()
@@ -24,12 +25,19 @@ pub(super) fn lookup(local: SocketAddr, peer: SocketAddr) -> Option<SocketPeer> 
         for fd in fds.flatten() {
             if fs::read_link(fd.path()).ok().as_deref() == Some(std::path::Path::new(&socket_link))
             {
-                let executable = fs::read_link(process.path().join("exe")).ok()?;
-                return Some(SocketPeer { pid, executable });
+                // Multiple descriptors in one process are harmless, but a
+                // forked process can hold the same socket under another PID.
+                if holder.is_some() {
+                    return None;
+                }
+                holder = Some(pid);
+                break;
             }
         }
     }
-    None
+    let pid = holder?;
+    let executable = fs::read_link(format!("/proc/{pid}/exe")).ok()?;
+    Some(SocketPeer { pid, executable })
 }
 
 fn connecting_inode(table: &str, local: SocketAddr, peer: SocketAddr) -> Option<u64> {

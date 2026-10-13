@@ -1,0 +1,19 @@
+{
+  "name": "@cortexkit/private-files",
+  "version": "0.1.0",
+  "description": "Async owner-only private files for Windows N-API v8 and POSIX modes",
+  "license": "MIT",
+  "type": "module",
+  "repository": { "type": "git", "url": "git+https://github.com/cortexkit/subconscious.git", "directory": "clients/private-files" },
+  "exports": { ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" } },
+  "files": ["dist/", "prebuilds/", "native/", "test/native-open-policy.c", "test/native-security.c", "README.md", "LICENSE"],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "bun test test/private-files.test.ts",
+    "prepublishOnly": "bun run build && bun scripts/check-prebuilds.mjs"
+  },
+  "devDependencies": { "@types/bun": "1.4.2", "typescript": "7.0.2" },
+  "publishConfig": { "access": "public", "tag": "latest" },
+  "cortexkit": { "tagPrefix": "private-files@" }
+}

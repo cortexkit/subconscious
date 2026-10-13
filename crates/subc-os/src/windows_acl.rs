@@ -1,4 +1,4 @@
-//! Owner-only Windows DACLs for directories and credential files.
+//! Protected Windows DACLs for private files, directories and processes.
 //!
 //! New objects receive a protected DACL at creation, rather than exposing a
 //! secret under an inherited DACL before tightening it. Readers inspect the
@@ -9,7 +9,7 @@
 use std::{
     fs::File,
     io,
-    mem::{size_of, zeroed},
+    mem::{size_of, size_of_val, zeroed},
     os::windows::{ffi::OsStrExt, io::AsRawHandle, io::FromRawHandle},
     path::Path,
     ptr::{null, null_mut},
@@ -19,14 +19,15 @@ use windows_sys::Win32::{
     Foundation::{CloseHandle, LocalFree, ERROR_ALREADY_EXISTS, HANDLE, INVALID_HANDLE_VALUE},
     Security::{
         AddAccessAllowedAceEx,
-        Authorization::{GetSecurityInfo, SetSecurityInfo, SE_FILE_OBJECT},
-        EqualSid, GetAce, GetLengthSid, GetTokenInformation, InitializeAcl,
+        Authorization::{GetSecurityInfo, SetSecurityInfo, SE_FILE_OBJECT, SE_KERNEL_OBJECT},
+        CreateWellKnownSid, EqualSid, GetAce, GetLengthSid, GetTokenInformation, InitializeAcl,
         InitializeSecurityDescriptor, IsWellKnownSid, SetSecurityDescriptorControl,
         SetSecurityDescriptorDacl, SetSecurityDescriptorOwner, TokenUser,
-        WinBuiltinAdministratorsSid, WinLocalSystemSid, ACCESS_ALLOWED_ACE, ACE_HEADER, ACL,
-        ACL_REVISION, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, OBJECT_INHERIT_ACE,
-        OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
-        PSID, SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR, SE_DACL_PROTECTED, TOKEN_QUERY, TOKEN_USER,
+        WinBuiltinAdministratorsSid, WinCreatorOwnerRightsSid, WinLocalSystemSid,
+        ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_REVISION, CONTAINER_INHERIT_ACE,
+        DACL_SECURITY_INFORMATION, OBJECT_INHERIT_ACE, OWNER_SECURITY_INFORMATION,
+        PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES,
+        SECURITY_DESCRIPTOR, SECURITY_MAX_SID_SIZE, SE_DACL_PROTECTED, TOKEN_QUERY, TOKEN_USER,
     },
     Storage::FileSystem::{
         CreateDirectoryW, CreateFileW, GetFileInformationByHandle, GetFileType,
@@ -35,7 +36,10 @@ use windows_sys::Win32::{
         FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
         FILE_TYPE_DISK, OPEN_EXISTING, READ_CONTROL, WRITE_DAC,
     },
-    System::Threading::{GetCurrentProcess, OpenProcessToken},
+    System::Threading::{
+        GetCurrentProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
+        PROCESS_SYNCHRONIZE as SYNCHRONIZE, PROCESS_TERMINATE,
+    },
 };
 
 struct Handle(HANDLE);
@@ -79,19 +83,26 @@ fn wide(path: &Path) -> io::Result<Vec<u16>> {
 
 struct User(Vec<usize>);
 
+fn call_error(call: &str, error: io::Error) -> io::Error {
+    io::Error::new(error.kind(), format!("{call}: {error}"))
+}
+
 impl User {
     fn current() -> io::Result<Self> {
         let mut token = null_mut();
         // SAFETY: The pseudo process handle is valid and token is a writable output.
         if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
-            return Err(io::Error::last_os_error());
+            return Err(call_error("OpenProcessToken", io::Error::last_os_error()));
         }
         let token = Handle(token);
         let mut bytes = 0;
         // SAFETY: A null buffer with length zero requests the required buffer size.
         unsafe { GetTokenInformation(token.0, TokenUser, null_mut(), 0, &mut bytes) };
         if (bytes as usize) < size_of::<TOKEN_USER>() {
-            return Err(io::Error::last_os_error());
+            return Err(call_error(
+                "GetTokenInformation(TokenUser size)",
+                io::Error::last_os_error(),
+            ));
         }
         let mut user = Self(vec![0; (bytes as usize).div_ceil(size_of::<usize>())]);
         // SAFETY: The pointer-aligned buffer has at least bytes bytes and retains
@@ -106,7 +117,10 @@ impl User {
             )
         } == 0
         {
-            return Err(io::Error::last_os_error());
+            return Err(call_error(
+                "GetTokenInformation(TokenUser)",
+                io::Error::last_os_error(),
+            ));
         }
         Ok(user)
     }
@@ -115,6 +129,95 @@ impl User {
         // SAFETY: current initialized an aligned TOKEN_USER and its embedded SID.
         unsafe { (*(self.0.as_ptr().cast::<TOKEN_USER>())).User.Sid }
     }
+}
+
+/// Restricts newly opened handles to this process using a protected DACL.
+///
+/// Exactly two allowed ACEs grant only `PROCESS_QUERY_LIMITED_INFORMATION`,
+/// `SYNCHRONIZE` and `PROCESS_TERMINATE`: one for the token user and one for
+/// OWNER RIGHTS (`S-1-3-4`). OWNER RIGHTS replaces the owner's implicit
+/// `READ_CONTROL` and `WRITE_DAC`, preventing the user from restoring a broader
+/// DACL. These are deliberately the only rights kept: the daemon's process
+/// queries, launch-nonce checks and job-object handling open module processes
+/// with exactly these rights. The daemon's own spawn handle predates this change
+/// and keeps its original rights; do not broaden the DACL to accommodate it.
+///
+/// Call at the top of `main`, before reading any secrets. This is defense in
+/// depth, not a security boundary: any process holding enabled
+/// `SeDebugPrivilege` (such as an elevated administrator) bypasses the process
+/// DACL and can still access memory, and memory exposed before the
+/// call is not protected. Handles already opened retain their access rights.
+/// The entire DACL is built before a single `SetSecurityInfo` call applies it;
+/// failures identify the failing Win32 call and never apply a partial DACL.
+/// On other operating systems, this function does nothing and returns `Ok(())`.
+pub fn restrict_current_process() -> io::Result<()> {
+    let user = User::current()?;
+    let mut owner_rights = [0u32; (SECURITY_MAX_SID_SIZE as usize).div_ceil(size_of::<u32>())];
+    let owner_rights_sid = owner_rights.as_mut_ptr().cast();
+    let mut owner_rights_bytes = size_of_val(&owner_rights) as u32;
+    // SAFETY: The aligned output buffer has SECURITY_MAX_SID_SIZE bytes. This
+    // well-known SID needs no domain SID and stays live through the ACL copies.
+    if unsafe {
+        CreateWellKnownSid(
+            WinCreatorOwnerRightsSid,
+            null_mut(),
+            owner_rights_sid,
+            &mut owner_rights_bytes,
+        )
+    } == 0
+    {
+        return Err(call_error(
+            "CreateWellKnownSid(OWNER RIGHTS)",
+            io::Error::last_os_error(),
+        ));
+    }
+    // SAFETY: User retains the valid token SID returned by GetTokenInformation.
+    let user_bytes = unsafe { GetLengthSid(user.sid()) } as usize;
+    let bytes = size_of::<ACL>()
+        + 2 * (size_of::<ACCESS_ALLOWED_ACE>() - size_of::<u32>())
+        + user_bytes
+        + owner_rights_bytes as usize;
+    let mut acl = vec![0u32; bytes.div_ceil(size_of::<u32>())];
+    let acl_ptr = acl.as_mut_ptr().cast();
+    // SAFETY: The aligned buffer fits an ACL header and both ACEs with their SIDs.
+    if unsafe { InitializeAcl(acl_ptr, size_of_val(acl.as_slice()) as u32, ACL_REVISION) } == 0 {
+        return Err(call_error(
+            "InitializeAcl(process)",
+            io::Error::last_os_error(),
+        ));
+    }
+    let rights = PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE | PROCESS_TERMINATE;
+    for (sid, access) in [(user.sid(), rights), (owner_rights_sid, rights)] {
+        // SAFETY: Both SIDs are valid and live. The initialized ACL has room for
+        // both non-inheriting ACEs; AddAccessAllowedAceEx copies each SID.
+        if unsafe { AddAccessAllowedAceEx(acl_ptr, ACL_REVISION, 0, access, sid) } == 0 {
+            return Err(call_error(
+                "AddAccessAllowedAceEx(process)",
+                io::Error::last_os_error(),
+            ));
+        }
+    }
+    // SAFETY: GetCurrentProcess supplies a valid pseudo handle with WRITE_DAC.
+    // The completed ACL stays live for the single call that replaces the DACL;
+    // no owner, group or SACL pointers are used with these security flags.
+    let status = unsafe {
+        SetSecurityInfo(
+            GetCurrentProcess(),
+            SE_KERNEL_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            null_mut(),
+            null_mut(),
+            acl_ptr,
+            null_mut(),
+        )
+    };
+    if status != 0 {
+        return Err(call_error(
+            "SetSecurityInfo(process DACL)",
+            io::Error::from_raw_os_error(status as i32),
+        ));
+    }
+    Ok(())
 }
 
 struct OwnerAcl(Vec<u32>);
@@ -456,3 +559,6 @@ pub fn verify_private_dir(path: &Path) -> io::Result<()> {
 pub mod test_support;
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod process_restriction_tests;

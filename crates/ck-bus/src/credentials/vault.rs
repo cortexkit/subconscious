@@ -9,7 +9,7 @@ use subc_client_rs::{
     consumer::{CallError, CallOptions, ConsumerOptions, SubcConsumer},
     ConsumerIdentity,
 };
-use subc_protocol::{BindIdentity, RouteTarget, SUBC_MODULE_ID_ENV};
+use subc_protocol::{BindIdentity, RouteTarget};
 use tokio::sync::OnceCell;
 
 use super::wire::{self, ReplyError, VaultPublicKey, VaultSignature};
@@ -133,17 +133,7 @@ impl ClaustrumRoute {
         let connection_file = subc_arg(env::args_os()).ok_or_else(|| {
             "ck-bus needs --subc <connection file> to reach the vault".to_string()
         })?;
-        let launch_nonce = subc_client_rs::launch_nonce()
-            .map_err(|error| format!("ck-bus cannot read its launch nonce: {error}"))?;
-        let identity = match (env::var(SUBC_MODULE_ID_ENV), launch_nonce) {
-            (Ok(module_id), Some(launch_nonce)) if !module_id.is_empty() => {
-                Some(ConsumerIdentity {
-                    module_id,
-                    launch_nonce: launch_nonce.value().to_string(),
-                })
-            }
-            _ => None,
-        };
+        let identity = super::identity::supervised_identity()?;
         Ok(Self::new(connection_file, identity))
     }
 

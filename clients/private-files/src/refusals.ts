@@ -1,0 +1,8 @@
+export const WRONG_OWNER = 'wrong-owner'
+export const EXTRA_ACE = 'extra-ace'
+export const NOT_PROTECTED = 'not-protected'
+export const NULL_DACL = 'null-dacl'
+export const EMPTY_DACL = 'empty-dacl'
+export const REPARSE_POINT = 'reparse-point'
+export const UNSUPPORTED_FILESYSTEM = 'unsupported-filesystem'
+export const MODE_REFUSAL = 'mode'

@@ -373,13 +373,23 @@ async fn run_swap_inner(
     let incumbent_generation = lock_snapshot(snapshot)
         .map(|state| state.spawn_generation)
         .unwrap_or(0);
+    let activity_spawn = runtime.begin_activity_spawn(module_id);
     if let Err(err) = set_running(snapshot, &candidate, module_id, &runtime.spawn_events) {
         error!(module_id, error = %err, "failed to record the promoted swap candidate");
     }
     let _ = update_snapshot(snapshot, Some(module_id), |state| {
         state.in_alternate_slot = candidate_alternate;
     });
+    if let Some(spawn) = activity_spawn {
+        spawn.complete(snapshot);
+    }
+    handle.record_activity_registration(module_id);
     process_liveness.track(module_id.to_string(), Arc::clone(snapshot));
+    runtime.record_activity_transition(
+        "subc.module_swapped",
+        module_id,
+        runtime.start_requester.clone(),
+    );
     let incumbent = child.replace(candidate);
     info!(
         module_id,
@@ -468,11 +478,12 @@ fn serve_command_while_warming(
         SupervisorCommand::SetEnabled {
             enabled: true,
             reply,
+            ..
         } => {
             let _ = reply.send(Ok(false));
             None
         }
-        SupervisorCommand::Restart { reply, .. } | SupervisorCommand::Reload { reply } => {
+        SupervisorCommand::Restart { reply, .. } | SupervisorCommand::Reload { reply, .. } => {
             let _ = reply.send(Err(in_progress()));
             None
         }
@@ -577,7 +588,13 @@ async fn warm_candidate(
             Some(connection) => RegistrationSlot::Connection(connection),
             None => RegistrationSlot::Candidate(module_id),
         };
-        match registry.registration(slot) {
+        // Only a published candidate counts as registered. A candidate's HELLO
+        // reserves its registry entry before installing its forwarding
+        // endpoint and publishes it after; a ready candidate seen in between
+        // would be promoted while the forwarding cutover still finds no
+        // candidate endpoint, and the swap would fail as if the candidate's
+        // connection had closed.
+        match registry.published_registration(slot) {
             Ok(Some(registration)) => {
                 registered = Some(registration.connection_id);
                 if registration.ready {

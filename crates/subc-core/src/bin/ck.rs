@@ -8,6 +8,9 @@
 #[path = "../setup/mod.rs"]
 mod setup;
 
+#[path = "activity/mod.rs"]
+mod activity;
+
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     env,
@@ -65,7 +68,8 @@ const FRAME_DROP_ALERT_REQUIRED_NONZERO_MINUTES: u64 = 10;
 
 const TOP_HELP_BASE: &str = "ck — CortexKit operator CLI\n\nusage:\n  ck [--subc <connection-file>] [--json] <domain> [<verb>] [<args>]\n\ndomains:\n  setup     plan and apply the managed CortexKit installation\n  upgrade   plan managed component upgrades\n  module    supervised modules: list, status, stderr, terminals, restart, stop, start, rescan, release\n  catalog   what is registered on the wire (not the supervised roster)
   routes    live consumers for one module or the whole daemon\n  provenance daemon-attested and module-declared build/process facts\n  health    one-line health for every supervised module\n  quota     AI-provider quota and usage windows\n  daemon    daemon version, uptime, connection info, offline triage, and CI lint
-  machine   this machine's id: show it, or adopt a restored one";
+  machine   this machine's id: show it, or adopt a restored one
+  activity  consequential agent and module events";
 
 const TOP_HELP_TAIL: &str = "flags:\n  --subc <file>   use a specific connection file (default: auto-discover)\n  --json          raw JSON output instead of tables\n  --verbose       include diagnostic detail and complete metrics\n\nrun 'ck <domain>' with no verb to see that domain's commands";
 
@@ -508,6 +512,11 @@ async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), CkError> {
     if let Command::MachineAdopt { id, force } = &args.command {
         return machine_adopt(args.subc.as_deref(), id, *force, args.json).await;
     }
+    if let Command::Activity(options) = &args.command {
+        return activity::run(options, args.subc.as_deref(), args.json)
+            .await
+            .map_err(|error| decorate_error(error, args.json, args.subc.as_deref()));
+    }
 
     let resolved = discover_connection_file(args.subc.as_deref())
         .map_err(|error| decorate_error(error, args.json, args.subc.as_deref()))?;
@@ -590,6 +599,7 @@ async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), CkError> {
         | Command::Upgrade { .. }
         | Command::Help(_)
         | Command::External { .. }
+        | Command::Activity(_)
         | Command::BuildShape => unreachable!("handled before connect"),
     };
     result.map_err(|error| decorate_error(error, args.json, args.subc.as_deref()))
@@ -1062,6 +1072,7 @@ enum Command {
         dry_run: bool,
     },
     Module(ModuleCommand),
+    Activity(activity::Options),
     Routes {
         module_id: Option<String>,
     },
@@ -1490,6 +1501,7 @@ struct LogEntry {
     lane: String,
     line: String,
     timestamp: Option<SystemTime>,
+    time_inherited: bool,
     level: Option<ParsedLevel>,
     tag: Option<String>,
     source_order: usize,
@@ -1541,10 +1553,11 @@ async fn module_logs(
     Ok(())
 }
 
-/// Undated lines (capture-file lines written before the daemon stamped them,
-/// whose raw child bytes need not carry a time) sort AFTER every dated line: `Option`'s natural order puts
-/// `None` first, which would render a module's crash stderr above yesterday's
-/// daemon lines. Within the undated tail, source order holds.
+/// Undated lines (including captures from files with no daemon stamps) sort
+/// AFTER every dated line: `Option`'s natural order puts `None` first, which
+/// would render a module's crash stderr above older daemon lines. Within the
+/// undated tail, source order holds. Capture lines from stamped files inherit
+/// an anchor time before reaching this sort.
 fn sort_log_entries(entries: &mut [LogEntry]) {
     entries.sort_by(|left, right| {
         left.timestamp
@@ -1770,13 +1783,38 @@ fn collect_log_text(
     let since = options
         .since
         .and_then(|duration| SystemTime::now().checked_sub(duration));
+    let first_capture_stamp = if source.capture {
+        contents.lines().find_map(capture_stamp_time)
+    } else {
+        None
+    };
+    let mut preceding_capture_stamp = None;
     for line in contents.lines() {
         counts.total += 1;
-        let (timestamp, parsed) = if source.capture {
+        let (mut timestamp, parsed, capture_stamp) = if source.capture {
             capture_line_facts(line)
         } else {
             let parsed = line_facts(line);
-            (parsed.as_ref().map(|parsed| parsed.timestamp), parsed)
+            (parsed.as_ref().map(|parsed| parsed.timestamp), parsed, None)
+        };
+        if let Some(stamp) = capture_stamp {
+            preceding_capture_stamp = Some(stamp);
+        }
+        let time_inherited = if source.capture && timestamp.is_none() {
+            // Capture files are append-only, so file position orders an
+            // unstamped line against the capture's stamped lines. The nearest
+            // preceding stamp (or first following stamp for a legacy head) is
+            // a safe ordering anchor, not a measured time; JSON marks it as
+            // inherited so consumers do not mistake the anchor for the line's
+            // own timestamp.
+            if let Some(stamp) = preceding_capture_stamp.or(first_capture_stamp) {
+                timestamp = Some(stamp);
+                true
+            } else {
+                false
+            }
+        } else {
+            false
         };
         if source.daemon
             && parsed
@@ -1828,6 +1866,7 @@ fn collect_log_text(
             lane: source.lane.clone(),
             line: line.to_string(),
             timestamp,
+            time_inherited,
             level: parsed.as_ref().map(|parsed| parsed.level),
             tag: parsed.and_then(|parsed| parsed.component.map(str::to_string)),
             source_order: *source_order,
@@ -1852,6 +1891,10 @@ struct LineFacts<'a> {
     body: &'a str,
 }
 
+fn capture_stamp_time(line: &str) -> Option<SystemTime> {
+    split_capture_stamp(line).map(|(at_ms, _)| UNIX_EPOCH + Duration::from_millis(at_ms))
+}
+
 /// The time and facts of one line of the daemon's capture file.
 ///
 /// The daemon stamps each capture line with the moment it read it, so a
@@ -1859,11 +1902,18 @@ struct LineFacts<'a> {
 /// the module's own bytes are a fleet log line, its level and component still
 /// drive `--level` and `--tag`. A line written before the daemon stamped
 /// capture lines is read exactly as it was then: dated only if the module's
-/// bytes carry a time of their own, and otherwise left undated.
-fn capture_line_facts(line: &str) -> (Option<SystemTime>, Option<LineFacts<'_>>) {
+/// bytes carry a time of their own, and otherwise returned without a time for
+/// `collect_log_text` to inherit from neighboring capture stamps when available.
+fn capture_line_facts(
+    line: &str,
+) -> (
+    Option<SystemTime>,
+    Option<LineFacts<'_>>,
+    Option<SystemTime>,
+) {
     let Some((at_ms, module_bytes)) = split_capture_stamp(line) else {
         let parsed = line_facts(line);
-        return (parsed.as_ref().map(|parsed| parsed.timestamp), parsed);
+        return (parsed.as_ref().map(|parsed| parsed.timestamp), parsed, None);
     };
     let at = UNIX_EPOCH + Duration::from_millis(at_ms);
     // The whole line is tried second: an old unstamped fleet line starts with
@@ -1876,7 +1926,7 @@ fn capture_line_facts(line: &str) -> (Option<SystemTime>, Option<LineFacts<'_>>)
             timestamp: at,
             ..parsed
         });
-    (Some(at), parsed)
+    (Some(at), parsed, Some(at))
 }
 
 fn line_facts(line: &str) -> Option<LineFacts<'_>> {
@@ -1990,18 +2040,7 @@ fn log_level_rank(level: ParsedLevel) -> u8 {
 
 fn print_log_entries(entries: &[LogEntry], json_output: bool) -> Result<(), CkError> {
     if json_output {
-        let lines = entries
-            .iter()
-            .map(|entry| {
-                json!({
-                    "source": entry.lane,
-                    "line": entry.line,
-                    "timestamp": entry.timestamp.map(format_system_time),
-                    "level": entry.level.map(log_level_name),
-                    "tag": entry.tag,
-                })
-            })
-            .collect::<Vec<_>>();
+        let lines = entries.iter().map(log_entry_json).collect::<Vec<_>>();
         return print_json(&json!({ "lines": lines }));
     }
     let color = ansi_color_enabled();
@@ -2014,6 +2053,17 @@ fn print_log_entries(entries: &[LogEntry], json_output: bool) -> Result<(), CkEr
         }
     }
     Ok(())
+}
+
+fn log_entry_json(entry: &LogEntry) -> Value {
+    json!({
+        "source": entry.lane,
+        "line": entry.line,
+        "timestamp": entry.timestamp.map(format_system_time),
+        "time_inherited": entry.time_inherited,
+        "level": entry.level.map(log_level_name),
+        "tag": entry.tag,
+    })
 }
 
 fn fixed_lane(lane: &str) -> String {
@@ -7773,6 +7823,7 @@ fn is_builtin_domain(domain: &str) -> bool {
             | "daemon"
             | "machine"
             | "quota"
+            | "activity"
             | "help"
     )
 }
@@ -7794,9 +7845,11 @@ fn parse_command(domain: &str, tail: &[OsString]) -> Result<Command, CkError> {
                 Some("health") => HEALTH_HELP.into(),
                 Some("daemon") => DAEMON_HELP.into(),
                 Some("machine") => MACHINE_HELP.into(),
+                Some("activity") => activity::HELP.into(),
                 _ => top_help(),
             }))
         }
+        "activity" => activity::parse(tail),
         "setup"
             if tail
                 .iter()
@@ -8955,11 +9008,12 @@ mod tests {
     }
 
     /// The daemon now stamps every capture line, so the stderr lane merges
-    /// with the daemon's and the module's own lines by time. A capture file
-    /// begun before that holds unstamped lines, which must still be shown and
-    /// must stay undated: the reader has no record of when they were written.
+    /// with the daemon's and the module's own lines by time. The capture file
+    /// is append-only: a legacy line can use the nearest capture stamp in its
+    /// file as an ordering anchor, with a leading line using the first stamp.
+    /// JSON keeps that anchor distinct from a time carried by the line.
     #[test]
-    fn capture_lines_merge_by_their_stamp_and_unstamped_ones_stay_undated() {
+    fn capture_lines_merge_by_stamp_and_legacy_lines_inherit_ordering_times() {
         let capture = LogSource {
             lane: "stderr".to_string(),
             path: PathBuf::from("engram.stderr.log"),
@@ -8988,7 +9042,8 @@ mod tests {
         let mut counts = LogFilterCounts::default();
         let mut entries = Vec::new();
         let mut order = 0;
-        // Capture first, so only the stamps can put the lines in order.
+        // Collect the capture lane first so source order preserves its file
+        // order when legacy lines share a capture stamp.
         collect_log_text(
             "engram",
             &capture,
@@ -9014,10 +9069,10 @@ mod tests {
             lines,
             vec![
                 "2026-09-19T07:04:01.000Z INFO  subc: spawned module_id=engram",
+                "thread 'main' panicked at src/main.rs:1:1: before stamping",
                 "2026-09-19T07:04:02.000Z booting",
                 "2026-09-19T07:04:03.000Z WARN  subc: slow module_id=engram",
                 "2026-09-19T07:04:04.000Z 2026-09-19T07:04:03.999Z WARN  engram.store: own line",
-                "thread 'main' panicked at src/main.rs:1:1: before stamping",
             ]
         );
         let timestamps: Vec<Option<String>> = entries
@@ -9029,18 +9084,20 @@ mod tests {
             vec![
                 Some("1789801441.000Z".to_string()),
                 Some("1789801442.000Z".to_string()),
+                Some("1789801442.000Z".to_string()),
                 Some("1789801443.000Z".to_string()),
                 // The capture stamp, not the module's own claim a millisecond
                 // earlier.
                 Some("1789801444.000Z".to_string()),
-                None,
             ],
-            "a stamped line is dated by its stamp; an unstamped one gets no time"
+            "a leading legacy line inherits the first capture stamp; a line's timestamp is still marked as inherited"
         );
+        assert!(entries[1].time_inherited);
+        assert!(!entries[2].time_inherited);
         // The module's own fleet line after the stamp still carries its level
         // and component for `--level` and `--tag`.
-        assert_eq!(entries[3].level, Some(ParsedLevel::Warn));
-        assert_eq!(entries[3].tag.as_deref(), Some("store"));
+        assert_eq!(entries[4].level, Some(ParsedLevel::Warn));
+        assert_eq!(entries[4].tag.as_deref(), Some("store"));
         assert_eq!(counts.unparsed, 2, "the plain capture lines have no level");
     }
 
@@ -11180,5 +11237,311 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(command, Command::Help(text) if text.contains("daemon triage")));
+    }
+
+    #[test]
+    fn module_logs_inherits_capture_head_and_preserves_merged_tail_order() {
+        let module_id = "logs-test";
+        let capture = LogSource {
+            lane: "stderr".into(),
+            path: PathBuf::new(),
+            daemon: false,
+            capture: true,
+        };
+        let daemon = LogSource {
+            lane: "daemon".into(),
+            path: PathBuf::new(),
+            daemon: true,
+            capture: false,
+        };
+        let options = ModuleLogsOptions {
+            lines: 3,
+            follow: false,
+            since: None,
+            tag: None,
+            level: None,
+            lane: None,
+        };
+        let mut counts = LogFilterCounts::default();
+        let mut entries = Vec::new();
+        let mut source_order = 0;
+        collect_log_text(
+            module_id,
+            &capture,
+            concat!(
+                "legacy capture head\n",
+                "2026-09-19T07:04:02.000Z first stamped capture\n",
+                "legacy capture middle\n",
+                "2026-09-19T07:04:05.000Z second stamped capture\n",
+                "legacy capture tail\n",
+            ),
+            &options,
+            &mut counts,
+            &mut entries,
+            &mut source_order,
+        );
+        collect_log_text(
+            module_id,
+            &daemon,
+            concat!(
+                "2026-09-19T07:04:03.000Z INFO  subc: middle daemon module_id=logs-test\n",
+                "2026-09-19T07:04:06.000Z INFO  subc: newest daemon module_id=logs-test\n",
+            ),
+            &options,
+            &mut counts,
+            &mut entries,
+            &mut source_order,
+        );
+
+        sort_log_entries(&mut entries);
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.line.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "legacy capture head",
+                "2026-09-19T07:04:02.000Z first stamped capture",
+                "legacy capture middle",
+                "2026-09-19T07:04:03.000Z INFO  subc: middle daemon module_id=logs-test",
+                "2026-09-19T07:04:05.000Z second stamped capture",
+                "legacy capture tail",
+                "2026-09-19T07:04:06.000Z INFO  subc: newest daemon module_id=logs-test",
+            ]
+        );
+        let tail = &entries[entries.len() - options.lines..];
+        assert_eq!(
+            tail.iter()
+                .map(|entry| entry.line.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "2026-09-19T07:04:05.000Z second stamped capture",
+                "legacy capture tail",
+                "2026-09-19T07:04:06.000Z INFO  subc: newest daemon module_id=logs-test",
+            ]
+        );
+        assert!(tail.iter().all(|entry| entry.line != "legacy capture head"));
+    }
+
+    #[test]
+    fn module_logs_undated_capture_between_stamps_stays_between_them() {
+        let module_id = "logs-test";
+        let capture = LogSource {
+            lane: "stderr".into(),
+            path: PathBuf::new(),
+            daemon: false,
+            capture: true,
+        };
+        let daemon = LogSource {
+            lane: "daemon".into(),
+            path: PathBuf::new(),
+            daemon: true,
+            capture: false,
+        };
+        let options = ModuleLogsOptions {
+            lines: 20,
+            follow: false,
+            since: None,
+            tag: None,
+            level: None,
+            lane: None,
+        };
+        let mut counts = LogFilterCounts::default();
+        let mut entries = Vec::new();
+        let mut source_order = 0;
+        collect_log_text(
+            module_id,
+            &capture,
+            concat!(
+                "2026-09-19T07:04:02.000Z first capture\n",
+                "legacy capture between stamps\n",
+                "2026-09-19T07:04:05.000Z second capture\n",
+            ),
+            &options,
+            &mut counts,
+            &mut entries,
+            &mut source_order,
+        );
+        collect_log_text(
+            module_id,
+            &daemon,
+            "2026-09-19T07:04:03.000Z INFO  subc: middle daemon module_id=logs-test\n",
+            &options,
+            &mut counts,
+            &mut entries,
+            &mut source_order,
+        );
+
+        sort_log_entries(&mut entries);
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.line.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "2026-09-19T07:04:02.000Z first capture",
+                "legacy capture between stamps",
+                "2026-09-19T07:04:03.000Z INFO  subc: middle daemon module_id=logs-test",
+                "2026-09-19T07:04:05.000Z second capture",
+            ]
+        );
+        assert!(entries[1].time_inherited);
+    }
+
+    #[test]
+    fn module_logs_capture_without_stamps_remains_undated_and_bypasses_since() {
+        let capture = LogSource {
+            lane: "stderr".into(),
+            path: PathBuf::new(),
+            daemon: false,
+            capture: true,
+        };
+        let daemon = LogSource {
+            lane: "daemon".into(),
+            path: PathBuf::new(),
+            daemon: true,
+            capture: false,
+        };
+        let options = ModuleLogsOptions {
+            lines: 20,
+            follow: false,
+            since: Some(Duration::from_secs(12 * 60 * 60)),
+            tag: None,
+            level: None,
+            lane: None,
+        };
+        let daemon_time = format_capture_test_time(SystemTime::now());
+        let daemon_text = format!("{daemon_time} INFO  subc: current daemon module_id=logs-test\n");
+        let mut counts = LogFilterCounts::default();
+        let mut entries = Vec::new();
+        let mut source_order = 0;
+        collect_log_text(
+            "logs-test",
+            &capture,
+            "legacy line one\nlegacy line two\n",
+            &options,
+            &mut counts,
+            &mut entries,
+            &mut source_order,
+        );
+        collect_log_text(
+            "logs-test",
+            &daemon,
+            &daemon_text,
+            &options,
+            &mut counts,
+            &mut entries,
+            &mut source_order,
+        );
+
+        sort_log_entries(&mut entries);
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].line, daemon_text.trim_end());
+        assert_eq!(entries[1].line, "legacy line one");
+        assert_eq!(entries[2].line, "legacy line two");
+        assert!(entries[1..]
+            .iter()
+            .all(|entry| entry.timestamp.is_none() && !entry.time_inherited));
+        assert_eq!(counts.before_since, 0);
+    }
+
+    #[test]
+    fn module_logs_json_marks_capture_inherited_times() {
+        let capture = LogSource {
+            lane: "stderr".into(),
+            path: PathBuf::new(),
+            daemon: false,
+            capture: true,
+        };
+        let options = ModuleLogsOptions {
+            lines: 20,
+            follow: false,
+            since: None,
+            tag: None,
+            level: None,
+            lane: None,
+        };
+        let mut counts = LogFilterCounts::default();
+        let mut entries = Vec::new();
+        let mut source_order = 0;
+        collect_log_text(
+            "logs-test",
+            &capture,
+            concat!(
+                "legacy head\n",
+                "2026-09-19T07:04:02.000Z stamped capture\n",
+            ),
+            &options,
+            &mut counts,
+            &mut entries,
+            &mut source_order,
+        );
+
+        let inherited = log_entry_json(&entries[0]);
+        let stamped = log_entry_json(&entries[1]);
+        assert_eq!(inherited["time_inherited"], true);
+        assert_eq!(stamped["time_inherited"], false);
+        assert!(inherited["timestamp"].is_string());
+        assert!(stamped["timestamp"].is_string());
+    }
+
+    fn format_capture_test_time(time: SystemTime) -> String {
+        let elapsed = time.duration_since(UNIX_EPOCH).unwrap();
+        let seconds = elapsed.as_secs();
+        let parts = utc_parts_from_epoch_secs(seconds);
+        format!(
+            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+            parts.year,
+            parts.month,
+            parts.day,
+            parts.hour,
+            parts.minute,
+            seconds % 60,
+            elapsed.subsec_millis(),
+        )
+    }
+
+    #[test]
+    fn module_logs_since_filters_capture_lines_by_inherited_time() {
+        let now = SystemTime::now();
+        let old = format_capture_test_time(now - Duration::from_secs(24 * 60 * 60));
+        let recent = format_capture_test_time(now - Duration::from_secs(60 * 60));
+        let capture = LogSource {
+            lane: "stderr".into(),
+            path: PathBuf::new(),
+            daemon: false,
+            capture: true,
+        };
+        let options = ModuleLogsOptions {
+            lines: 50,
+            follow: false,
+            since: Some(Duration::from_secs(12 * 60 * 60)),
+            tag: None,
+            level: None,
+            lane: None,
+        };
+        let text = format!(
+            "legacy stale head\n{old} stale stamped line\nlegacy stale middle\n{recent} recent stamped line\nlegacy recent tail\n"
+        );
+        let mut counts = LogFilterCounts::default();
+        let mut entries = Vec::new();
+        let mut source_order = 0;
+        collect_log_text(
+            "logs-test",
+            &capture,
+            &text,
+            &options,
+            &mut counts,
+            &mut entries,
+            &mut source_order,
+        );
+
+        assert_eq!(counts.before_since, 3);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].line, format!("{recent} recent stamped line"));
+        assert_eq!(entries[1].line, "legacy recent tail");
+        assert!(entries
+            .iter()
+            .all(|entry| entry.time_inherited || entry.line.contains("recent stamped")));
     }
 }

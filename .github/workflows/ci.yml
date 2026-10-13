@@ -364,6 +364,14 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
+      # Store depends on the sibling private-files package through its lock
+      # until that package is on npm, and log depends on store. Build
+      # private-files first so a fresh checkout has its JavaScript and
+      # declarations when store is installed, typechecked or packed.
+      - name: Build sibling private-files for store and log
+        if: ${{ matrix.pkg == 'store' || matrix.pkg == 'log' }}
+        working-directory: clients/private-files
+        run: bun install --frozen-lockfile && bun run build
       # Log's locked local dependency exports compiled files. Build them before
       # installing log so a fresh checkout has both JavaScript and declarations.
       - name: Build sibling store for log

@@ -185,7 +185,8 @@ async fn activity_paused_full_queue_refuses_without_acknowledging_unwritten_entr
             request: request(),
             actor: actor(),
             at_ms: 7,
-            reply,
+            reply: Some(reply),
+            lifecycle: None,
         })
         .unwrap();
     assert_eq!(

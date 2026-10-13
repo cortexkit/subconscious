@@ -137,7 +137,8 @@ struct Append {
     request: ActivityRecordRequest,
     actor: ActivityActor,
     at_ms: u64,
-    reply: oneshot::Sender<Result<ActivityEntry, &'static str>>,
+    reply: Option<oneshot::Sender<Result<ActivityEntry, &'static str>>>,
+    lifecycle: Option<lifecycle::PendingLifecycle>,
 }
 
 /// Clones share the bounded queue and per-module rate credit until this daemon stops.
@@ -146,6 +147,7 @@ pub(crate) struct ActivityLedger {
     sender: mpsc::Sender<Append>,
     read_errors: Arc<AtomicU64>,
     shared: Arc<SharedWriter>,
+    lifecycle_counters: Arc<lifecycle::LifecycleCounters>,
 }
 
 impl std::fmt::Debug for ActivityLedger {
@@ -219,9 +221,26 @@ impl ActivityLedger {
                 worker.ready.notify_all();
                 pause.wait();
                 while let Some(append) = receiver.blocking_recv() {
+                    let mut append = append;
                     let mut guard = worker.lock().unwrap();
-                    let result = guard.as_mut().unwrap().append(&append);
-                    let _ = append.reply.send(result);
+                    let writer = guard.as_mut().unwrap();
+                    match writer.prepare_lifecycle(&mut append, &writer_errors) {
+                        Ok(false) => {
+                            append.lifecycle.as_mut().unwrap().completed = true;
+                            continue;
+                        }
+                        Err(_) => continue,
+                        Ok(true) => {}
+                    }
+                    let result = writer.append(&append);
+                    if result.is_ok() {
+                        if let Some(pending) = &mut append.lifecycle {
+                            pending.completed = true;
+                        }
+                    }
+                    if let Some(reply) = append.reply.take() {
+                        let _ = reply.send(result);
+                    }
                 }
             });
         if let Err(error) = started {
@@ -234,6 +253,7 @@ impl ActivityLedger {
             sender,
             read_errors,
             shared,
+            lifecycle_counters: Arc::default(),
         }
     }
 
@@ -285,7 +305,8 @@ impl ActivityLedger {
                 request,
                 actor,
                 at_ms,
-                reply,
+                reply: Some(reply),
+                lifecycle: None,
             })
             .map_err(|_| ACTIVITY_UNAVAILABLE)?;
         received.await.unwrap_or(Err(ACTIVITY_UNAVAILABLE))
@@ -401,7 +422,9 @@ impl Writer {
     }
 
     fn append(&mut self, append: &Append) -> Result<ActivityEntry, &'static str> {
-        validate(&append.module, &append.request)?;
+        if append.lifecycle.is_none() {
+            validate(&append.module, &append.request)?;
+        }
         if self.sink.is_none() || self.next_seq == u64::MAX {
             return Err(ACTIVITY_UNAVAILABLE);
         }
@@ -413,7 +436,7 @@ impl Writer {
             credit_ms: 6000,
             updated_ms: now,
         });
-        if !bucket.available(now) {
+        if append.lifecycle.is_none() && !bucket.available(now) {
             return Err(ACTIVITY_RATE_LIMITED);
         }
         let entry = ActivityEntry {
@@ -445,7 +468,9 @@ impl Writer {
             tracing::warn!(kind = %entry.kind, %error, "activity append failed");
             return Err(ACTIVITY_UNAVAILABLE);
         }
-        bucket.credit_ms -= 100;
+        if append.lifecycle.is_none() {
+            bucket.credit_ms -= 100;
+        }
         self.next_seq += 1;
         self.ring.push_back(entry.clone());
         if self.ring.len() > RING_CAPACITY {
@@ -653,3 +678,12 @@ fn retained_max(path: &Path, keep: u8, read_errors: &AtomicU64) -> io::Result<u6
 #[cfg(test)]
 #[path = "activity_tests.rs"]
 mod tests;
+
+#[path = "activity_lifecycle.rs"]
+mod lifecycle;
+
+pub(crate) use lifecycle::{ImageFacts, RegistrationImage};
+
+#[cfg(test)]
+#[path = "activity_lifecycle_tests.rs"]
+mod lifecycle_tests;

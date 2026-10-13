@@ -1,6 +1,9 @@
 use std::{
     collections::VecDeque,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 
@@ -159,6 +162,16 @@ fn only_violations_on_the_sentinels_own_subjects_count() {
 /// forever, as a round over a bus that stopped responding would without a timeout.
 struct ScriptedProbe {
     script: Mutex<VecDeque<RoundOutcome>>,
+    hanging_round_started: tokio::sync::Notify,
+    hanging_round_pending: AtomicBool,
+}
+
+struct PendingRound<'a>(&'a AtomicBool);
+
+impl Drop for PendingRound<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
 }
 
 #[async_trait]
@@ -167,7 +180,12 @@ impl Probe for ScriptedProbe {
         let next = self.script.lock().unwrap().pop_front();
         match next {
             Some(outcome) => outcome,
-            None => std::future::pending().await,
+            None => {
+                self.hanging_round_pending.store(true, Ordering::SeqCst);
+                let _pending = PendingRound(&self.hanging_round_pending);
+                self.hanging_round_started.notify_one();
+                std::future::pending().await
+            }
         }
     }
 }
@@ -218,13 +236,15 @@ async fn the_answer_is_bootstraps_until_bootstrap_is_ready() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test(start_paused = true)]
 async fn a_hung_bus_cannot_slow_the_health_answer() {
-    // One answered round, then every round hangs. Bound: 3 * 40 + 20 = 140 ms.
+    // Virtual time keeps the stale threshold and round timeout deterministic.
     let timing = timing(40, 20);
     let monitor = Arc::new(Monitor::new("1-1".to_string(), timing));
     let probe = Arc::new(ScriptedProbe {
         script: Mutex::new(VecDeque::from([answered()])),
+        hanging_round_started: tokio::sync::Notify::new(),
+        hanging_round_pending: AtomicBool::new(false),
     });
     let (_ready_tx, ready) = tokio::sync::watch::channel(None);
     let answer = Answer::new(
@@ -236,35 +256,49 @@ async fn a_hung_bus_cannot_slow_the_health_answer() {
     );
     let driving = {
         let monitor = monitor.clone();
+        let probe = probe.clone();
         tokio::spawn(async move {
             monitor.drive(probe.as_ref(), &|_verdict| {}).await;
         })
     };
 
-    let started = Instant::now();
-    let mut slowest = Duration::ZERO;
-    let mut seen_up = false;
+    // Confirm the test is exercising health reads while the probe future is pending.
+    probe.hanging_round_started.notified().await;
+    assert!(probe.hanging_round_pending.load(Ordering::SeqCst));
+    let first_report = tokio::time::timeout(Duration::from_millis(1), answer.report_health())
+        .await
+        .expect("health answers must not wait on the pending probe round")
+        .unwrap();
+    assert_eq!(first_report.status, HealthStatus::Ok);
+    for _ in 0..10 {
+        let report = tokio::time::timeout(Duration::from_millis(1), answer.report_health())
+            .await
+            .expect("health answers must not wait on the pending probe round")
+            .unwrap();
+        assert_eq!(report.status, HealthStatus::Ok);
+        assert!(probe.hanging_round_pending.load(Ordering::SeqCst));
+    }
+
+    let deadline = Instant::now() + Duration::from_millis(800);
+    let mut seen_up = true;
     let mut down_after_up = None;
-    while started.elapsed() < Duration::from_millis(800) {
-        let asked = Instant::now();
-        let report = answer.report_health().await.unwrap();
-        slowest = slowest.max(asked.elapsed());
+    while Instant::now() < deadline {
+        let report = tokio::time::timeout(Duration::from_millis(1), answer.report_health())
+            .await
+            .expect("health answers must not wait on a probe round")
+            .unwrap();
         if report.status == HealthStatus::Ok {
             seen_up = true;
         } else if seen_up && down_after_up.is_none() {
-            down_after_up = Some((cause_of(&report).unwrap().to_string(), started.elapsed()));
+            down_after_up = Some(cause_of(&report).unwrap().to_string());
         }
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     driving.abort();
     assert!(seen_up, "the answered round reported up");
-    let (cause, _) = down_after_up.expect("the hung bus is reported down");
+    let cause = down_after_up.expect("the hung bus is reported down");
     assert!(
         cause == cause::NO_REPLY || cause == cause::STALE,
         "down names the hung round or the stale success: {cause}"
-    );
-    assert!(
-        slowest < Duration::from_millis(20),
-        "every health answer returns without waiting on the hung round; slowest {slowest:?}"
     );
 }

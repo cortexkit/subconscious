@@ -1,6 +1,6 @@
 [package]
 name = "subc-presence"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 publish = true
 description = "Operating-system operator authentication prompts for the subc daemon."

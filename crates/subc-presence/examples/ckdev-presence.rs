@@ -27,7 +27,8 @@ fn main() {
         eprintln!("too many arguments");
         std::process::exit(2);
     }
-    let sentence = format!("ckdev-presence asks: {summary} (requested by a local program)");
+    let sentence =
+        format!("approve a request from ckdev-presence: {summary} (requested by a local program)");
     println!("reason: {sentence}");
     let (finished, completion) = mpsc::channel::<()>();
     let outcome = subc_presence::prompt(

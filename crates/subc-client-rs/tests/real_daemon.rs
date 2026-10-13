@@ -20,9 +20,9 @@ use subc_client_rs::{
     CatalogUpdateError, CloseRouteOptions, ConsumerIdentity, ConsumerOptions, HandlerOutcome,
     ModuleHandle, ModuleHandler, OutcomeUnknownCause, PolicyResolveError, PolicyResolver,
     PolicyResolverConfig, PolicyVerdict, ProjectRef, RequestCtx, RetryBackoff,
-    ReverseRequestRegistrationError, RouteBindRequest, RouteCloseDisposition, RouteCloseReason,
-    RouteEndReason, RouteHandle, ScopeCallError, ScopeDescribeReply, ScopeSelector, SubcConsumer,
-    SubcModuleError, Subject, SubscribeOptions,
+    ReverseRequestRegistrationError, ReverseRequestRegistry, RouteBindRequest,
+    RouteCloseDisposition, RouteCloseReason, RouteEndReason, RouteHandle, ScopeCallError,
+    ScopeDescribeReply, ScopeSelector, SubcConsumer, SubcModuleError, Subject, SubscribeOptions,
 };
 use subc_control::{ClientControlRequest, ClientControlResponse, PollKind};
 use subc_protocol::{
@@ -52,6 +52,106 @@ const CONSUMER_MODULE_B: &str = "subc-client-rs-consumer-b";
 const CATALOG_FAKE_AFT_MODULE_ID: &str = "subc-client-rs-catalog-fake-aft";
 const PUSH_MODULE_ID: &str = "subc-client-rs-push";
 const POLICY_MODULE_ID: &str = "subc-client-rs-policy-resolver";
+
+#[test]
+fn route_option_legacy_struct_literals_and_default_updates_still_compile() {
+    let _full_call = CallOptions {
+        timeout: Duration::from_secs(30),
+        priority: Priority::Interactive,
+        admission_class: subc_protocol::AdmissionClass::Normal,
+        route_retry: RetryBackoff::default(),
+        route_retry_deadline: Duration::from_secs(90),
+        consumer_identity: None,
+        reverse_requests: ReverseRequestRegistry::new(),
+        role_versions: None,
+    };
+    let _full_close = CloseRouteOptions {
+        drain: false,
+        drain_timeout: Duration::from_secs(30),
+        consumer_identity: None,
+        reverse_requests: ReverseRequestRegistry::new(),
+        role_versions: None,
+    };
+    let _call_update = CallOptions {
+        timeout: Duration::from_secs(5),
+        ..CallOptions::default()
+    };
+    let _close_update = CloseRouteOptions {
+        drain: true,
+        ..CloseRouteOptions::default()
+    };
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn declared_consumer_capabilities_reach_provider_bind_on_real_daemon() {
+    let workspace = workspace_root();
+    let daemon_bin = ensure_binary(
+        &workspace,
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-core",
+            "--bin",
+            "ck-subc",
+            "--message-format=json",
+        ],
+    );
+    let temp_dir = unique_temp_dir("subc-client-rs-consumer-capabilities");
+    let runtime_dir = temp_dir.join("runtime");
+    let config_dir = temp_dir.join("config");
+    fs::create_dir_all(&runtime_dir).unwrap();
+    write_empty_config(&config_dir);
+
+    let mut daemon = spawn_daemon(&daemon_bin, &runtime_dir, &config_dir);
+    wait_for_connection_file(&daemon.connection_file, START_TIMEOUT).await;
+    let manifest = inline_module_manifest("subc-client-rs-capability-provider", &["echo"]);
+    let handler = ConsumerCapabilitiesRecordingHandler::default();
+    let (_module, serving) =
+        spawn_inline_module_with_handler(&daemon.connection_file, manifest, handler.clone()).await;
+
+    let consumer = SubcConsumer::connect(&daemon.connection_file, fast_consumer_options())
+        .await
+        .unwrap();
+    let reverse_requests = ReverseRequestRegistry::new();
+    reverse_requests
+        .on_request("elicitation", |_body, _ctx| async { Vec::new() })
+        .unwrap();
+    let opts = CallOptions {
+        reverse_requests,
+        ..fast_call_options()
+    }
+    .with_consumer_capability("content/v1")
+    .unwrap()
+    .with_consumer_capability("elicitation")
+    .unwrap();
+    consumer
+        .open_route(
+            tool_target("subc-client-rs-capability-provider"),
+            BindIdentity::new(PathBuf::from("/tmp/project"), "tests", "capabilities"),
+            opts,
+        )
+        .await
+        .unwrap();
+
+    {
+        let binds = handler
+            .binds
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(
+            binds.as_slice(),
+            &[Some(vec![
+                "content/v1".to_string(),
+                "elicitation".to_string()
+            ])],
+            "the real provider bind must receive the merged, sorted, unique declaration list"
+        );
+    }
+    serving.abort();
+    let _ = serving.await;
+    daemon.kill_and_wait();
+}
 
 struct LiveDaemon {
     child: Child,
@@ -96,6 +196,26 @@ struct EchoModuleHandler;
 impl ModuleHandler for EchoModuleHandler {
     async fn handle(&self, _ctx: RequestCtx, body: Vec<u8>) -> HandlerOutcome {
         HandlerOutcome::Response(body)
+    }
+}
+
+#[derive(Clone, Default)]
+struct ConsumerCapabilitiesRecordingHandler {
+    binds: Arc<Mutex<Vec<Option<Vec<String>>>>>,
+}
+
+#[async_trait]
+impl ModuleHandler for ConsumerCapabilitiesRecordingHandler {
+    async fn handle(&self, _ctx: RequestCtx, body: Vec<u8>) -> HandlerOutcome {
+        HandlerOutcome::Response(body)
+    }
+
+    async fn on_bind(&self, request: &RouteBindRequest) -> BindDecision {
+        self.binds
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(request.consumer_capabilities.clone());
+        BindDecision::accept()
     }
 }
 
@@ -453,6 +573,85 @@ async fn subc_consumer_catalog_list_reads_tool_provider_without_open_routes() {
         .expect("fake-aft-stub must advertise at least one tool");
     assert!(!tool.name.is_empty());
     assert!(tool.schema.is_object());
+
+    daemon.kill_and_wait();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn subc_consumer_supervisor_list_includes_enabled_and_disabled_modules_from_real_daemon() {
+    const ENABLED_MODULE_ID: &str = "subc-client-rs-supervisor-enabled";
+    const DISABLED_MODULE_ID: &str = "subc-client-rs-supervisor-disabled";
+
+    let workspace = workspace_root();
+    let daemon_bin = ensure_binary(
+        &workspace,
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-core",
+            "--bin",
+            "ck-subc",
+            "--message-format=json",
+        ],
+    );
+    let fake_aft_bin = ensure_binary(
+        &workspace,
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-core",
+            "--bin",
+            "fake-aft-stub",
+            "--message-format=json",
+        ],
+    );
+
+    let temp_dir = unique_temp_dir("subc-client-rs-supervisor-list");
+    let runtime_dir = temp_dir.join("runtime");
+    let config_dir = temp_dir.join("config");
+    fs::create_dir_all(&runtime_dir).unwrap();
+    fs::create_dir_all(config_dir.join("cortexkit")).unwrap();
+    let mut config: Value =
+        serde_json::from_str(&fake_aft_stub_config_doc(&fake_aft_bin, ENABLED_MODULE_ID)).unwrap();
+    config["modules"][DISABLED_MODULE_ID] = json!({
+        "program": fake_aft_bin.to_string_lossy(),
+        "args": [],
+        "env": {},
+        "enabled": false,
+    });
+    fs::write(
+        config_dir.join("cortexkit").join("subc.jsonc"),
+        serde_json::to_string_pretty(&config).unwrap(),
+    )
+    .unwrap();
+
+    let mut daemon = spawn_daemon(&daemon_bin, &runtime_dir, &config_dir);
+    wait_for_connection_file(&daemon.connection_file, START_TIMEOUT).await;
+    wait_for_catalog_module(&daemon.connection_file, ENABLED_MODULE_ID, START_TIMEOUT).await;
+
+    let consumer = SubcConsumer::connect(&daemon.connection_file, fast_consumer_options())
+        .await
+        .unwrap();
+    let response = consumer.supervisor_list().await.unwrap();
+    assert_eq!(response.modules.len(), 2);
+
+    let enabled = response
+        .modules
+        .iter()
+        .find(|module| module.module_id == ENABLED_MODULE_ID)
+        .expect("supervisor.list must include the enabled configured module");
+    assert!(enabled.enabled);
+    assert_eq!(enabled.state, "running");
+
+    let disabled = response
+        .modules
+        .iter()
+        .find(|module| module.module_id == DISABLED_MODULE_ID)
+        .expect("supervisor.list must include the disabled configured module");
+    assert!(!disabled.enabled);
+    assert_eq!(disabled.state, "disabled");
 
     daemon.kill_and_wait();
 }
@@ -5385,6 +5584,8 @@ async fn describing_an_unknown_ref_answers_not_live_with_the_owners_state() {
 // These tests share the wire helpers but have a separate, feature-enabled daemon.
 #[path = "real_daemon/operator_confirm.rs"]
 mod operator_confirm;
+
+mod activity;
 
 #[path = "real_daemon/call_modes.rs"]
 mod call_modes;

@@ -1,10 +1,28 @@
 # Changelog
 
-## 0.20.81
+## 0.20.86
 
 - Update the internal CLI and daemon executable to `subc-daemon` 0.35, which adds the `privileged_operator_prompt` config key and the matching restart-required section. Setup reports a pending `privileged_operator_prompt` edit on a live host as restart-required.
 - `ck` allows an extra 290 seconds (the daemon's default operator budget) for every privileged command before reporting outcome-unknown, against any daemon and in both modes, because the wire does not say whether a request will prompt. `ck module restart` now reports outcome-unknown after 300 seconds instead of 10 when the daemon never replies; `ck` still never retries. Replies that arrive are handled as before.
 - `ck` prints a one-line reason for `operator_declined` and `operator_presence_unavailable`, and "refused without asking: too many recent declines" for `detail.reason` `backoff`, then exits non-zero.
+
+## 0.20.85
+
+- `ck` and `ck upgrade` never offer or install a release older than what is installed, including binaries that don't report their own version (judged by a sibling from the same release that does). Cached update metadata that names a release older than the installed one predates this install, so it is refetched even inside its 24-hour lifetime; if the refetch fails, no update is shown. Replacing a damaged binary with the same release, and restoring the previous binary when an upgrade fails, still work as before.
+
+## 0.20.84
+
+- Make forwarding-test stub spawn helpers and replacement attachments wait for catalog publication on a separate authenticated connection, so route.open cannot race installation of the module's forwarding endpoint.
+
+- Make the crash route-close tests wait for catalog publication and trigger crashes only after binding, rather than racing a launch-relative timer that could attach to an already restarted process. Verify that the client can reopen after the non-terminal close and that crashing the replacement exhausts the one-restart budget. The test provider supports crashing on a bound-route request.
+
+## 0.20.83
+
+- Add `ck activity` with agent, project, module, kind, inclusive millisecond time-range and limit filters, a UTC time/module/actor/summary table, and JSON output. `--follow` subscribes from the query's head without a handoff gap and applies the same filters to live entries; JSON follow output is one entry per line.
+
+## 0.20.81
+
+- Order legacy unstamped capture lines using their position relative to stamped lines in the same capture file, apply `--since` to inherited capture times, and identify inherited times in JSON.
 
 ## 0.20.80
 

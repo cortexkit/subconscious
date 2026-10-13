@@ -1,8 +1,14 @@
 # Changelog
 
-## 0.1.16
+## 0.1.17
 
 - Add `socket_peer::loopback_socket_peer`, a best-effort lookup of the connecting process's PID and executable for an accepted loopback TCP connection. Match the peer's full socket tuple using libproc on macOS, socket inodes in Linux procfs, and the Windows extended TCP owner table. Unavailable or unreadable identities return `None`; this information is for caller descriptions, not authentication.
+
+## 0.1.16
+
+- Add `windows_acl::restrict_current_process`, callable on every platform (a no-op outside Windows). On Windows, apply one protected process DACL granting only limited query, synchronization and termination rights to the token user and OWNER RIGHTS; the latter removes the owner's implicit ability to rewrite the DACL. This is startup defense in depth, not protection against administrators, `SeDebugPrivilege`, existing handles or memory already exposed.
+- Add Windows cross-process tests for the retained daemon rights, denied memory/thread/handle/DACL access, and an unrestricted memory-read control.
+- Read back and independently verify the restricted child's protected process DACL. Run access checks through a separate opener with `SeDebugPrivilege` removed, and report token elevation and privilege state to distinguish DACL failures from privileged bypasses on elevated Windows runners.
 
 ## 0.1.15
 

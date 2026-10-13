@@ -7,8 +7,43 @@
 - In `log` (the default), every privileged client request runs as before and logs one INFO line naming the operation, target and caller that would have been prompted.
 - In `enforce`, the daemon holds each privileged client request and asks the operator through the same provider, queue and limits as `operator.confirm`. It runs the request as received only on approval; a decline or withdrawal answers `operator_declined` and no possible prompt answers `operator_presence_unavailable`, both with the existing `detail.reason` strings. No wire code is added. Held requests do not block their connection's reader, and a disconnect withdraws the prompt and runs nothing. Linux keeps refusing with `operator_presence_unavailable`.
 - The prompt text is built by the daemon from the operation, its target and the caller, never from client text, and fits the `operator.confirm` 200-character summary rule (`privileged_prompt::prompt_text`). An applying rescan's prompt promises no module count: the config is read after approval.
-- Add `caller_identity::CallerIdentity`, which resolves the pid and executable of the process on the other end of an accepted loopback connection (libproc on macOS, `/proc` socket inodes on Linux, `GetExtendedTcpTable` on Windows, through `subc-os` 0.1.16). A failed lookup is described as "an unidentified local process" and never refuses a request on its own.
+- Add `caller_identity::CallerIdentity`, which resolves the pid and executable of the process on the other end of an accepted loopback connection (libproc on macOS, `/proc` socket inodes on Linux, `GetExtendedTcpTable` on Windows, through `subc-os` 0.1.17). A failed lookup is described as "an unidentified local process" and never refuses a request on its own.
 - Three person declines of privileged requests within a sliding 10 minutes from one executable (one connection when the executable is unresolved) start a 10-minute cooldown and log one WARN line naming the executable. During it, that executable's requests, including ones already queued and a reconnect, are answered at once with `operator_declined` and `detail.reason` `backoff`, without a prompt, and audited with `prompt_shown` false. Disconnects, withdrawals, timeouts and unavailability do not count, and refusals during the cooldown do not extend it.
+
+## 0.34.10
+
+- Change the reason to “approve a request from {module_id}: {summary} (requested by {opener}).” The macOS Touch ID sheet places that reason after “{app} is trying to,” so this verb phrase makes the whole sentence grammatical.
+
+## 0.34.9
+
+- Register every accepted configured module with the supervisor before publishing the connection file, in `starting` or `disabled` state. Start enabled processes and their monitors only after publication, so children can read their `--subc` file and discovery-time status requests cannot incorrectly report an accepted configured module as unsupervised. Preserve per-module health, restart and drain policies and record spawn failures on the existing status handle. Entries refused during registration are logged and skipped without preventing publication or startup of the other modules.
+- Keep `configured module supervised` as the activation-time log, separate from the earlier registration log. Verify that a configured `protocol: "none"` child's first spawn persists its PID, start time and executable identity without a HELLO. The shutdown child roster (`ChildRoster::admit`) still writes `live-children.json` synchronously, with macOS executable confirmation following the trampoline's exec acknowledgement.
+
+## 0.34.8
+
+- Withdraws 0.34.7, which was never published: listing configured modules before the connection file is published returns in a later release with a fix for the orphan-sweep regression it caused. The code is identical to 0.34.6.
+
+## 0.34.6
+
+- Keep a crash's `route.closed` non-terminal when the supervisor has reserved the last available restart slot but has not yet published `Restarting`. Publish the pending-recovery fact atomically with the budget reservation, so connection cleanup cannot mistake the replacement's exhausted budget for the crashed process's recovery verdict. Terminal exit history still precedes the visible state change. Add a deterministic terminal-record barrier regression test.
+
+## 0.34.5
+
+- Publish the connection file at startup from tokio's blocking-thread pool instead of an async worker thread. The write fsyncs, and on a slow or busy disk that held a runtime worker for seconds (an in-process daemon in a test harness may share two workers with everything else). The order and guarantees are unchanged: the file is still written owner-only, fsynced and atomically renamed, only after the readiness probe authenticates, and the singleton start lock stays held until the write finishes, even if the startup future is dropped meanwhile. If the write task panics or is cancelled, startup fails with `ConnectionFileWrite` naming the file. Loading or minting the machine id, which fsyncs a newly minted file, also moved to the blocking pool, holding the start and run-directory locks the same way.
+
+## 0.34.4
+
+- Test only: the lifecycle provenance test waits for macOS exec confirmation before reading the running image, instead of failing when the status read comes first.
+
+## 0.34.3
+
+- List a module in `catalog.list`, and advance the catalog generation, only once its forwarding endpoint is installed and `route.open` can reach it. A HELLO now reserves the module's registry entry unpublished (the id is claimed, so a duplicate HELLO is still refused), installs the forwarding endpoint (queueing HELLO_ACK first, as before), then publishes the entry. Previously a client that opened a route as soon as the module was listed could be refused `target_unavailable` ("has no live forwarding connection"). While the entry is reserved but not yet published, `catalog.list` omits it but `route.open` and supervisor lookups still find it, so `route.open` answers `target_unavailable`, never `unknown_module`. A HELLO whose forwarding registration fails leaves the catalog generation unchanged. Swap candidates are published the same way, so the swap supervisor no longer sees a candidate as registered before the candidate's forwarding endpoint exists, which could fail the cutover. Add `Registry::register_unpublished_with_control_ops`, `register_unpublished_candidate_with_control_ops`, `publish_registration`, `published_registration` and `list_registered_modules`; the existing `register_with_control_ops` and `register_candidate_with_control_ops` still publish immediately.
+
+## 0.34.2
+
+- Record best-effort `subc.module_started` activity when a registered module's running-image identity differs from its latest start entry still present in the retained activity log. Compare the complete provenance evidence: Linux SHA-256 digest, macOS device/inode, or Windows volume/file ID. Include the tagged values in `details.old_evidence` and `details.new_evidence`, and identify the control requester as actor, or `reserved:subc` (the daemon itself) for a start with no requester. Count a skipped start only when no running-image evidence is available. A change between evidence methods, for example after moving a module to another platform, records a new start because identities measured by different methods cannot establish that the executable is unchanged.
+- Record requested stop, restart/reload, swap cutover, disable and roster-changing rescan outcomes with the requester's verified principal. Refusals, no-ops, crash restarts and unrequested exits do not produce transition events.
+- Queue lifecycle appends without waiting on storage or spending module rate credit. Count and warn with the event kind on failed or dropped appends; expose `activity_lifecycle_append_failures` and `activity_started_digest_skips` alongside the activity capability in `server.describe`.
 
 ## 0.34.1
 

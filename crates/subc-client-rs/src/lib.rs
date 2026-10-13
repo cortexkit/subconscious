@@ -1,20 +1,23 @@
 #![forbid(unsafe_code)]
 
+pub mod activity;
 pub mod consumer;
 pub mod policy_cache;
 #[cfg(any(test, feature = "test-support"))]
 mod stand_in;
 #[cfg(feature = "test-support")]
 pub mod test_support;
+pub use activity::*;
 pub use consumer::{
     is_retryable_route_open_code, CallError, CallOptions, CatalogList, CloseRouteOptions,
-    ConnectionState, ConsumerError, ConsumerOptions, ControlPush, OutcomeUnknownCause, PushEvent,
-    RetryBackoff, ReverseRequestContext, ReverseRequestError, ReverseRequestRegistrationError,
-    ReverseRequestRegistry, RouteCloseDisposition, RouteCloseReason, RouteEndReason,
-    RoutePollResult, ScopeSelector, SpawnStreamError, SpawnSubscription, SubcConsumer,
-    SubscribeOptions, Subscription, SubscriptionClosed, DEFAULT_CALL_TIMEOUT,
-    DEFAULT_LIVENESS_PROBE_WINDOW, DEFAULT_ROUTE_RETRY_DEADLINE, SPAWN_CURSOR_INCARNATION_MISMATCH,
-    SPAWN_CURSOR_TOO_OLD, SPAWN_SUBSCRIBER_LAGGED,
+    ConnectionState, ConsumerCapabilityError, ConsumerError, ConsumerOptions, ControlPush,
+    OutcomeUnknownCause, PushEvent, RetryBackoff, ReverseRequestContext, ReverseRequestError,
+    ReverseRequestRegistrationError, ReverseRequestRegistry, RouteCloseDisposition,
+    RouteCloseReason, RouteEndReason, RoutePollResult, ScopeSelector, SpawnStreamError,
+    SpawnSubscription, SubcConsumer, SubscribeOptions, Subscription, SubscriptionClosed,
+    SupervisorEntry, SupervisorListResponse, DEFAULT_CALL_TIMEOUT, DEFAULT_LIVENESS_PROBE_WINDOW,
+    DEFAULT_ROUTE_RETRY_DEADLINE, SPAWN_CURSOR_INCARNATION_MISMATCH, SPAWN_CURSOR_TOO_OLD,
+    SPAWN_SUBSCRIBER_LAGGED,
 };
 pub use policy_cache::{
     PolicyResolveError, PolicyResolver, PolicyResolverConfig, PolicyResolverFootprint,
@@ -450,6 +453,7 @@ struct ModuleHandleShared {
     supports_scope_apply: bool,
     supports_scope_describe: bool,
     supports_operator_confirm: bool,
+    supports_activity: bool,
     connection_runtime: tokio::runtime::Handle,
     connection_token: u64,
     machine_id: Option<MachineId>,
@@ -464,6 +468,7 @@ struct ModuleHandleState {
     next_corr: Option<u64>,
     pending_catalog_updates: HashMap<u64, CatalogUpdateReply>,
     pending_operator_confirms: HashMap<u64, oneshot::Sender<Frame>>,
+    pending_activity_records: HashMap<u64, oneshot::Sender<Frame>>,
     closed: bool,
 }
 
@@ -487,6 +492,10 @@ impl ModuleHandle {
                 supports_scope_apply: ack.subc_ops.iter().any(|op| op == SCOPE_APPLY_OP),
                 supports_scope_describe: ack.subc_ops.iter().any(|op| op == SCOPE_DESCRIBE_OP),
                 supports_operator_confirm: ack.subc_ops.iter().any(|op| op == OPERATOR_CONFIRM_OP),
+                supports_activity: ack
+                    .subc_capabilities
+                    .iter()
+                    .any(|capability| capability == ACTIVITY_LEDGER_CAPABILITY),
                 connection_runtime,
                 connection_token,
                 // A value that does not parse is treated like an absent one:
@@ -503,6 +512,7 @@ impl ModuleHandle {
                     next_corr: Some(HELLO_CORR + 1),
                     pending_catalog_updates: HashMap::new(),
                     pending_operator_confirms: HashMap::new(),
+                    pending_activity_records: HashMap::new(),
                     closed: false,
                 }),
             }),
@@ -1019,6 +1029,15 @@ impl ModuleHandle {
     }
 
     fn handle_control_reply(&self, frame: Frame) -> bool {
+        let activity_reply = self
+            .shared
+            .lock_inner()
+            .pending_activity_records
+            .remove(&frame.header.corr);
+        if let Some(reply) = activity_reply {
+            let _ = reply.send(frame);
+            return true;
+        }
         let operator_reply = self
             .shared
             .lock_inner()
@@ -1121,6 +1140,7 @@ impl ModuleHandleShared {
             self.close_token.cancel();
             // Dropping these senders wakes raw-frame waiters immediately.
             inner.pending_operator_confirms.clear();
+            inner.pending_activity_records.clear();
             inner
                 .pending_catalog_updates
                 .drain()
@@ -1652,10 +1672,12 @@ pub struct RouteBindRequest {
     pub target: RouteTarget,
     pub identity: BindIdentity,
     pub principal: Option<Principal>,
-    /// Consumer-declared reverse-request capabilities for this bind. This is a
-    /// declaration, not a verified privilege; providers treat an absent field as
-    /// no reverse-request capability. Known MCP method-family values today are
-    /// "elicitation", "sampling", and "roots".
+    /// Consumer-declared reverse-request families and provider-contract
+    /// capabilities for this bind. For example, `content/v1` declares that a
+    /// consumer understands the tool-provider content result format. This is an
+    /// unverified declaration, not a privilege grant; providers treat an absent
+    /// field as no declared capability. Known MCP method-family values today
+    /// are "elicitation", "sampling", and "roots".
     pub consumer_capabilities: Option<Vec<String>>,
     /// The versions of provider roles the consumer declared it speaks on this
     /// route, role name to version (`{"tool-provider": "v1"}`), as the daemon

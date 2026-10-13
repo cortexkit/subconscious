@@ -147,7 +147,7 @@ fn bare_json_prints_the_one_top_help() {
     assert_exit(&output, 0);
     assert_eq!(
         text(&output.stdout),
-        "ck — CortexKit operator CLI\n\nusage:\n  ck [--subc <connection-file>] [--json] <domain> [<verb>] [<args>]\n\ndomains:\n  setup     plan and apply the managed CortexKit installation\n  upgrade   plan managed component upgrades\n  module    supervised modules: list, status, stderr, terminals, restart, stop, start, rescan, release\n  catalog   what is registered on the wire (not the supervised roster)\n  routes    live consumers for one module or the whole daemon\n  provenance daemon-attested and module-declared build/process facts\n  health    one-line health for every supervised module\n  quota     AI-provider quota and usage windows\n  daemon    daemon version, uptime, connection info, offline triage, and CI lint\n  machine   this machine's id: show it, or adopt a restored one\n\nflags:\n  --subc <file>   use a specific connection file (default: auto-discover)\n  --json          raw JSON output instead of tables\n  --verbose       include diagnostic detail and complete metrics\n\nrun 'ck <domain>' with no verb to see that domain's commands\n"
+        "ck — CortexKit operator CLI\n\nusage:\n  ck [--subc <connection-file>] [--json] <domain> [<verb>] [<args>]\n\ndomains:\n  setup     plan and apply the managed CortexKit installation\n  upgrade   plan managed component upgrades\n  module    supervised modules: list, status, stderr, terminals, restart, stop, start, rescan, release\n  catalog   what is registered on the wire (not the supervised roster)\n  routes    live consumers for one module or the whole daemon\n  provenance daemon-attested and module-declared build/process facts\n  health    one-line health for every supervised module\n  quota     AI-provider quota and usage windows\n  daemon    daemon version, uptime, connection info, offline triage, and CI lint\n  machine   this machine's id: show it, or adopt a restored one\n  activity  consequential agent and module events\n\nflags:\n  --subc <file>   use a specific connection file (default: auto-discover)\n  --json          raw JSON output instead of tables\n  --verbose       include diagnostic detail and complete metrics\n\nrun 'ck <domain>' with no verb to see that domain's commands\n"
     );
 }
 
@@ -1353,6 +1353,31 @@ impl UpgradeFixture {
             );
         command
     }
+
+    fn set_core_version(&self, version: &str) {
+        let mut connection: Value =
+            serde_json::from_slice(&fs::read(&self.connection_file).unwrap()).unwrap();
+        connection["daemon_ver"] = json!(version);
+        fs::write(
+            &self.connection_file,
+            serde_json::to_vec(&connection).unwrap(),
+        )
+        .unwrap();
+        let path = self
+            .home
+            .join(".local/share/cortexkit/installer-manifest.json");
+        let mut inventory: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        // The fixture records ck, ck-subc and ck-subc-mcp before other components.
+        for entry in inventory["mutations"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .take(3)
+        {
+            entry["version"] = json!(version);
+        }
+        fs::write(path, serde_json::to_vec(&inventory).unwrap()).unwrap();
+    }
 }
 
 fn upgrade_index(
@@ -1443,6 +1468,99 @@ fn upgrade_and_check_say_everything_is_current_in_one_line() {
         assert_exit(&output, 0);
         assert!(output.stderr.is_empty(), "stderr: {}", text(&output.stderr));
         assert_eq!(text(&output.stdout), expected);
+    }
+}
+
+fn core_release_index(base: &str, version: &str) -> (Value, BTreeMap<String, Vec<u8>>) {
+    let (mut index, archives) = upgrade_index(
+        base,
+        "0.55.1",
+        &"22".repeat(32),
+        version,
+        &"aa".repeat(32),
+        "0.8.0",
+        &"55".repeat(32),
+    );
+    let core = &mut index["components"]["core"];
+    core["release"] = json!(format!("subc-core-v{version}"));
+    let assets = &mut core["assets"][host_target()];
+    assets["ck-subc"]["reports"] = json!(version);
+    assets["ck-subc"]["sha256"] = json!("bb".repeat(32));
+    assets["ck-subc-mcp"]["reports"] = Value::Null;
+    assets["ck-subc-mcp"]["sha256"] = json!("cc".repeat(32));
+    (index, archives)
+}
+
+#[test]
+fn upgrade_noops_when_0_20_83_is_installed_and_cache_and_index_offer_0_20_41() {
+    let fixture = UpgradeFixture::new("ck-upgrade-no-downgrade");
+    fixture.set_core_version("0.20.83");
+    let cache = fixture._root.path().join("update-metadata.json");
+    fs::write(&cache, serde_json::to_vec(&json!({
+        "format_version": 3,
+        "checked_at_unix_secs": now_ms() / 1000,
+        "targets": {
+            "ck": {"version": "0.20.41", "sha256": "aa".repeat(32)},
+            "ck-subc": {"version": "0.20.41", "sha256": "bb".repeat(32)},
+            "ck-subc-mcp": {"version": "0.20.41", "sha256": "cc".repeat(32), "reports_release_version": false}
+        }
+    })).unwrap()).unwrap();
+    let index = serve_signed_index(|base| core_release_index(base, "0.20.41"));
+    let manifest = fixture
+        .home
+        .join(".local/share/cortexkit/installer-manifest.json");
+    let before = fs::read(&manifest).unwrap();
+    for args in [
+        &["upgrade"][..],
+        &["upgrade", "--check"][..],
+        &["upgrade", "--dry-run"][..],
+        &[][..],
+    ] {
+        let output = fixture
+            .command(&index, args)
+            .env("CK_TEST_CK_VERSION", "0.20.83")
+            .env("CK_TEST_SUBC_MCP_VERSION", "0.1.0")
+            .output()
+            .unwrap();
+        assert_exit(&output, 0);
+        assert!(output.stderr.is_empty(), "stderr: {}", text(&output.stderr));
+        let stdout = text(&output.stdout);
+        assert!(!stdout.contains("0.20.41"), "stdout:\n{stdout}");
+        if args.is_empty() {
+            assert!(stdout.contains("updates: none"), "stdout:\n{stdout}");
+        } else if !args.contains(&"--dry-run") {
+            assert!(
+                stdout.starts_with("Everything is up to date"),
+                "stdout:\n{stdout}"
+            );
+        }
+        assert_eq!(
+            fs::read(&manifest).unwrap(),
+            before,
+            "upgrade must not mutate inventory"
+        );
+    }
+}
+
+#[test]
+fn upgrade_check_still_offers_a_strictly_newer_core_release() {
+    let fixture = UpgradeFixture::new("ck-upgrade-newer-core");
+    fixture.set_core_version("0.20.83");
+    let index = serve_signed_index(|base| core_release_index(base, "0.20.84"));
+    let output = fixture
+        .command(&index, &["upgrade", "--check"])
+        .env("CK_TEST_CK_VERSION", "0.20.83")
+        .env("CK_TEST_SUBC_MCP_VERSION", "0.1.0")
+        .output()
+        .unwrap();
+    assert_exit(&output, 0);
+    let stdout = text(&output.stdout);
+    for update in [
+        "ck 0.20.83 → 0.20.84",
+        "ck-subc 0.20.83 → 0.20.84",
+        "ck-subc-mcp → release 0.20.84",
+    ] {
+        assert!(stdout.contains(update), "stdout:\n{stdout}");
     }
 }
 
@@ -2299,12 +2417,11 @@ async fn module_logs_merges_sources_by_timestamp_and_reports_real_filter_counts(
     );
 }
 
-/// The daemon stamps each capture line with the moment it read it, so the
-/// stderr lane interleaves with the daemon's and the module's own lines by
-/// time. A capture file begun before that has unstamped lines at its top;
-/// they are still shown, and still undated, rather than given a time.
+/// A capture file begun before daemon stamping has an unstamped head.
+/// Those lines inherit the first following stamp, so they stay at the
+/// beginning of the capture lane instead of becoming the merged tail.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn module_logs_orders_stamped_capture_lines_by_stamp_and_keeps_unstamped_ones() {
+async fn module_logs_orders_legacy_capture_head_before_stamped_tail() {
     let module_id = "stamped-capture";
     let data_home = unique_temp_dir("ck-module-logs-stamped-data");
     let runtime_dir = unique_temp_dir("ck-module-logs-stamped-runtime");
@@ -2361,11 +2478,11 @@ async fn module_logs_orders_stamped_capture_lines_by_stamp_and_keeps_unstamped_o
         text(&output.stdout),
         concat!(
             "daemon       2026-09-19T07:04:01.000Z INFO  subc: spawned module_id=stamped-capture\n",
+            "stderr       old unstamped line\n",
             "stderr       2026-09-19T07:04:02.000Z first stamped line\n",
             "mod          2026-09-19T07:04:03.000Z INFO  stamped-capture: module line\n",
             "daemon       2026-09-19T07:04:04.000Z WARN  subc: slow module_id=stamped-capture\n",
             "stderr       2026-09-19T07:04:05.000Z second stamped line\n",
-            "stderr       old unstamped line\n",
         )
     );
 }

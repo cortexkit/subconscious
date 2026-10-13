@@ -1,8 +1,14 @@
 # Changelog
 
-## 0.1.35
+## 0.1.36
 
 - Require `subc-daemon` 0.35, whose public config types gained the `privileged_operator_prompt` setting. The MCP gateway's behaviour is unchanged.
+
+## 0.1.35
+
+- Test-only: verify the `--ck-domain` probe exits successfully with startup
+  prerequisites deliberately unavailable, without asserting a wall-clock
+  duration.
 
 ## 0.1.34
 

@@ -1,6 +1,6 @@
 [package]
 name = "subc-core"
-version = "0.20.81"
+version = "0.20.86"
 edition = "2021"
 license = "MIT"
 publish = false
@@ -55,10 +55,12 @@ base64 = "0.22"
 ed25519-dalek = "2"
 hex-literal = "0.4"
 rusqlite = { version = "0.32", features = ["bundled"] }
+semver = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 subc-control = { path = "../subc-control", version = "0.30.0" }
+subc-client-rs = { path = "../subc-client-rs", version = "0.28.1" }
 subc-jsonc = { path = "../subc-jsonc" }
 terminal_size = "0.4"
 subc-os = { path = "../subc-os" }

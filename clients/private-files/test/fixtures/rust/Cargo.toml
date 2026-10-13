@@ -1,0 +1,11 @@
+[package]
+name = "private-files-rust-fixture"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[target.'cfg(windows)'.dependencies]
+subc-os = "=0.1.14"
+cortexkit-lease = "=0.1.3"

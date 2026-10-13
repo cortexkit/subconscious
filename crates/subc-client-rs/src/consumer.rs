@@ -14,6 +14,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+pub use subc_control::SupervisorEntry;
 use subc_control::{
     CatalogEntry, ClientControlRequest, ClientControlResponse, ConsumerIdentity, PollKind,
 };
@@ -28,7 +29,10 @@ use subc_protocol::{
     Flags, Frame, FrameBuildError, FrameType, Priority, RouteTarget, SUBC_MODULE_ID_ENV,
 };
 
-use crate::RouteHandle;
+use crate::{
+    ActivityCursor, ActivityQueryRequest, ActivityQueryResponse, ActivitySubscribeRequest,
+    ActivitySubscription, RouteHandle,
+};
 use subc_transport::{
     authenticate_client, connection_file, read_frame, write_frame, AuthError, ConnectionFileError,
     FrameIoError,
@@ -71,6 +75,13 @@ const REVERSE_REQUEST_UNHANDLED: &str = "reverse_request_unhandled";
 /// buffer would drop the stream on its own replay. Twice that leaves room for live
 /// events arriving while the replay is being read.
 const SPAWN_EVENT_BUFFER: usize = 8192;
+// Hold the daemon's 1024-entry activity replay plus live entries without ending
+// a healthy subscriber merely because its initial replay arrives in a burst.
+const ACTIVITY_EVENT_BUFFER: usize = 2048;
+
+#[cfg(test)]
+#[path = "activity_consumer_tests.rs"]
+mod activity_consumer_tests;
 
 /// `supervisor.spawn_subscribe` refused a cursor from another daemon incarnation.
 pub const SPAWN_CURSOR_INCARNATION_MISMATCH: &str = "spawn_cursor_incarnation_mismatch";
@@ -115,10 +126,12 @@ impl Error for ReverseRequestError {}
 struct ReverseRequestRegistryState {
     handlers: HashMap<String, ReverseRequestHandler>,
     declared_families: Option<BTreeSet<String>>,
+    consumer_capabilities: BTreeSet<String>,
 }
 
-/// Handler registry prepared before route.open. Its method families are the
-/// route's derived consumer_capabilities declaration.
+/// Handler registry prepared before route.open. It carries the reverse-request
+/// method families and any extra capability strings added through route options'
+/// `with_consumer_capability` builder.
 #[derive(Clone, Default)]
 pub struct ReverseRequestRegistry {
     inner: Arc<Mutex<ReverseRequestRegistryState>>,
@@ -128,6 +141,7 @@ impl fmt::Debug for ReverseRequestRegistry {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ReverseRequestRegistry")
             .field("capabilities", &self.capabilities())
+            .field("consumer_capabilities", &self.consumer_capabilities())
             .finish()
     }
 }
@@ -135,6 +149,7 @@ impl fmt::Debug for ReverseRequestRegistry {
 impl PartialEq for ReverseRequestRegistry {
     fn eq(&self, other: &Self) -> bool {
         self.capabilities() == other.capabilities()
+            && self.consumer_capabilities() == other.consumer_capabilities()
     }
 }
 
@@ -201,6 +216,35 @@ impl ReverseRequestRegistry {
         let mut capabilities = state.handlers.keys().cloned().collect::<Vec<_>>();
         capabilities.sort();
         capabilities
+    }
+
+    fn declare_consumer_capability(
+        &self,
+        capability: String,
+    ) -> Result<(), ConsumerCapabilityError> {
+        if capability.is_empty()
+            || capability.len() > 64
+            || !capability.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
+        {
+            return Err(ConsumerCapabilityError { capability });
+        }
+
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .consumer_capabilities
+            .insert(capability);
+        Ok(())
+    }
+
+    fn consumer_capabilities(&self) -> Vec<String> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .consumer_capabilities
+            .iter()
+            .cloned()
+            .collect()
     }
 
     fn handler(&self, method_family: &str) -> Option<ReverseRequestHandler> {
@@ -386,6 +430,32 @@ impl Default for ConsumerOptions {
     }
 }
 
+/// A consumer-capability declaration was empty, contained whitespace or
+/// non-printable/non-ASCII bytes, or exceeded 64 bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConsumerCapabilityError {
+    capability: String,
+}
+
+impl ConsumerCapabilityError {
+    /// The invalid declaration value.
+    pub fn capability(&self) -> &str {
+        &self.capability
+    }
+}
+
+impl fmt::Display for ConsumerCapabilityError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "invalid consumer capability {:?}: expected 1-64 printable ASCII bytes without whitespace",
+            self.capability
+        )
+    }
+}
+
+impl Error for ConsumerCapabilityError {}
+
 /// Options for [`SubcConsumer::close_route`].
 #[derive(Debug, Clone)]
 pub struct CloseRouteOptions {
@@ -399,7 +469,8 @@ pub struct CloseRouteOptions {
     /// when absent, SUBC_MODULE_ID and SUBC_LAUNCH_NONCE environment variables
     /// identify the route for a supervised consumer.
     pub consumer_identity: Option<ConsumerIdentity>,
-    /// The registry whose derived capability set identifies the route being closed.
+    /// Reverse-request handlers plus extra capability strings added through
+    /// [`Self::with_consumer_capability`]. Together, they identify the route being closed.
     pub reverse_requests: ReverseRequestRegistry,
     /// The role versions the route being closed was opened with (see
     /// [`CallOptions::role_versions`]); part of the route's identity.
@@ -418,6 +489,35 @@ impl Default for CloseRouteOptions {
     }
 }
 
+impl CloseRouteOptions {
+    /// Add a provider-contract capability declaration to the route identity.
+    ///
+    /// Values are merged with the reverse-request families. For example,
+    /// `content/v1` declares the tool-provider content result format; the
+    /// declaration is not verified and grants no privilege.
+    ///
+    /// Like reverse-request handlers, declarations are kept in the options'
+    /// shared reverse-request state, so options cloned before this call share
+    /// the declaration. Add declarations before cloning options for other
+    /// routes.
+    pub fn with_consumer_capability(
+        self,
+        capability: impl Into<String>,
+    ) -> Result<Self, ConsumerCapabilityError> {
+        self.reverse_requests
+            .declare_consumer_capability(capability.into())?;
+        Ok(self)
+    }
+
+    /// The extra capability strings added with `with_consumer_capability`, not
+    /// the reverse-request handler families. For example, `content/v1` declares
+    /// tool-provider content-result support; declarations are unverified and
+    /// grant nothing.
+    pub fn consumer_capabilities(&self) -> Vec<String> {
+        self.reverse_requests.consumer_capabilities()
+    }
+}
+
 /// Per-call options for [`SubcConsumer::call`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallOptions {
@@ -431,8 +531,10 @@ pub struct CallOptions {
     pub route_retry_deadline: Duration,
     /// Explicit consumer identity for route.open; when absent, non-empty SUBC_MODULE_ID and SUBC_LAUNCH_NONCE environment variables are used.
     pub consumer_identity: Option<ConsumerIdentity>,
-    /// Reverse-request handlers for this route. consumer_capabilities is derived
-    /// from the registered method families and omitted when this registry is empty.
+    /// Reverse-request handlers plus extra capability strings added with
+    /// [`Self::with_consumer_capability`]. For example, `content/v1` declares
+    /// tool-provider content-result support. These declarations are unverified
+    /// and grant nothing; both sets are merged and omitted when empty.
     pub reverse_requests: ReverseRequestRegistry,
     /// The versions of provider roles this consumer speaks on the route, role
     /// name to version (`{"tool-provider": "v1"}`), sent on `route.open` and
@@ -465,6 +567,37 @@ impl Default for CallOptions {
     }
 }
 
+impl CallOptions {
+    /// Add a provider-contract capability declaration to the route.
+    ///
+    /// The list is merged with reverse-request handler families, sorted and
+    /// de-duplicated. For example, `content/v1` declares the tool-provider
+    /// content result format. This remains an unverified declaration and grants
+    /// no privilege. Invalid values are rejected here, before route.open can be
+    /// sent.
+    ///
+    /// Like reverse-request handlers, declarations are kept in the options'
+    /// shared reverse-request state, so options cloned before this call share
+    /// the declaration. Add declarations before cloning options for other
+    /// routes.
+    pub fn with_consumer_capability(
+        self,
+        capability: impl Into<String>,
+    ) -> Result<Self, ConsumerCapabilityError> {
+        self.reverse_requests
+            .declare_consumer_capability(capability.into())?;
+        Ok(self)
+    }
+
+    /// The extra capability strings added with `with_consumer_capability`, not
+    /// the reverse-request handler families. For example, `content/v1` declares
+    /// tool-provider content-result support; declarations are unverified and
+    /// grant nothing.
+    pub fn consumer_capabilities(&self) -> Vec<String> {
+        self.reverse_requests.consumer_capabilities()
+    }
+}
+
 /// Options for [`SubcConsumer::subscribe`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubscribeOptions {
@@ -483,8 +616,10 @@ pub struct SubscribeOptions {
     pub route_open_timeout: Duration,
     /// Explicit consumer identity for route.open; when absent, non-empty SUBC_MODULE_ID and SUBC_LAUNCH_NONCE environment variables are used.
     pub consumer_identity: Option<ConsumerIdentity>,
-    /// Reverse-request handlers for this route. consumer_capabilities is derived
-    /// from the registered method families and omitted when this registry is empty.
+    /// Reverse-request handlers plus extra capability strings added with
+    /// [`Self::with_consumer_capability`]. For example, `content/v1` declares
+    /// tool-provider content-result support. These declarations are unverified
+    /// and grant nothing; both sets are merged and omitted when empty.
     pub reverse_requests: ReverseRequestRegistry,
     /// The role versions declared on the subscription's route; see
     /// [`CallOptions::role_versions`].
@@ -504,6 +639,31 @@ impl Default for SubscribeOptions {
             reverse_requests: ReverseRequestRegistry::new(),
             role_versions: None,
         }
+    }
+}
+
+impl SubscribeOptions {
+    /// Add a provider-contract capability declaration to the subscription route.
+    ///
+    /// This merges with reverse-request families. For example, `content/v1`
+    /// declares the tool-provider content result format. The declaration is
+    /// unverified and grants no privilege; invalid values are refused before
+    /// route.open is sent.
+    pub fn with_consumer_capability(
+        self,
+        capability: impl Into<String>,
+    ) -> Result<Self, ConsumerCapabilityError> {
+        self.reverse_requests
+            .declare_consumer_capability(capability.into())?;
+        Ok(self)
+    }
+
+    /// The extra capability strings added with `with_consumer_capability`, not
+    /// the reverse-request handler families. For example, `content/v1` declares
+    /// tool-provider content-result support; declarations are unverified and
+    /// grant nothing.
+    pub fn consumer_capabilities(&self) -> Vec<String> {
+        self.reverse_requests.consumer_capabilities()
     }
 }
 
@@ -534,6 +694,16 @@ pub struct CatalogList {
     pub modules: Vec<CatalogEntry>,
     #[serde(default)]
     pub subc_ops: Vec<String>,
+}
+
+/// Typed response from the daemon's channel-0 `supervisor.list` operation.
+///
+/// Unlike `catalog.list`, this includes configured modules that are stopped or
+/// disabled, along with their current supervisor state.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SupervisorListResponse {
+    pub generation: u64,
+    pub modules: Vec<SupervisorEntry>,
 }
 
 /// A provider-originated push delivered on one live route.
@@ -1067,15 +1237,18 @@ impl SubcConsumer {
         .await
     }
 
-    /// Open one admitted route, with the reverse-request handlers and timeout in
-    /// `opts`.
+    /// Open one admitted route, with the reverse-request handlers, capability
+    /// declarations and timeout in `opts`.
     ///
-    /// The route declares the capabilities of the handlers registered on
-    /// `opts.reverse_requests`, and requests the provider sends back on it
-    /// (elicitation, sampling) reach those handlers, exactly as on a managed
-    /// route. The handlers must be registered before this call: the registry is
-    /// sealed when the route opens, because the capabilities it declares are what
-    /// the provider was told.
+    /// The route declares the method families of handlers registered on
+    /// `opts.reverse_requests`, together with any provider-contract declarations
+    /// in the extra declarations reported by `opts.consumer_capabilities()`. For example, `content/v1` declares the
+    /// tool-provider content result format. These are unverified declarations,
+    /// not privilege grants. Requests the provider sends back (elicitation,
+    /// sampling) reach the registered handlers, exactly as on a managed route.
+    /// Handlers must be registered before this call: the registry is sealed
+    /// when the route opens, because the declared method families are what the
+    /// provider was told.
     ///
     /// Like [`Self::open_route_with_admission_facts`], the route is never cached
     /// or reopened; after a failure or a close the caller performs admission again.
@@ -1113,11 +1286,7 @@ impl SubcConsumer {
         reverse_requests: Option<ReverseRequestRegistry>,
         deadline: Instant,
     ) -> Result<RouteHandle, CallError> {
-        let consumer_capabilities = if reverse_requests.is_some() {
-            route_open_consumer_capabilities(opts)
-        } else {
-            None
-        };
+        let consumer_capabilities = route_open_consumer_capabilities(opts);
         let target_label = route_target_label(&target);
         let body = serde_json::to_vec(&ClientControlRequest::RouteOpen {
             target,
@@ -1249,6 +1418,65 @@ impl SubcConsumer {
         }
     }
 
+    /// Fetch the supervisor's configured module list over channel 0.
+    /// Transport retries use the consumer's reconnect backoff and call deadline.
+    pub async fn supervisor_list(&self) -> Result<SupervisorListResponse, CallError> {
+        let deadline = Instant::now() + self.shared.opts.call_timeout;
+        let body = serde_json::to_vec(&ClientControlRequest::SupervisorList {}).map_err(|err| {
+            CallError::not_sent(format!("failed to encode supervisor.list: {err}"))
+        })?;
+
+        let mut attempt = 0usize;
+        loop {
+            attempt = attempt.saturating_add(1);
+            match self
+                .shared
+                .control_call(body.clone(), deadline, false, None)
+                .await
+            {
+                Ok(TerminalFrame::Response { body, .. }) => {
+                    let response =
+                        serde_json::from_slice::<ClientControlResponse>(&body).map_err(|err| {
+                            CallError::not_sent(format!(
+                                "failed to decode supervisor.list response: {err}"
+                            ))
+                        })?;
+                    let ClientControlResponse::SupervisorList {
+                        generation,
+                        modules,
+                    } = response
+                    else {
+                        return Err(CallError::not_sent(
+                            "supervisor.list returned an unexpected control response",
+                        ));
+                    };
+                    return Ok(SupervisorListResponse {
+                        generation,
+                        modules,
+                    });
+                }
+                Ok(TerminalFrame::Error { body, .. }) => return Err(CallError::Module(body)),
+                Ok(TerminalFrame::StreamEnd) => {
+                    return Err(CallError::not_sent("supervisor.list returned StreamEnd"));
+                }
+                Err(err)
+                    if is_retryable_catalog_transport_error(&err) && Instant::now() < deadline =>
+                {
+                    // Pace immediate discovery failures so retries cannot monopolize the executor.
+                    let delay = self.shared.jittered(
+                        self.shared
+                            .opts
+                            .reconnect_backoff
+                            .delay_after_attempt(attempt),
+                    );
+                    self.shared.sleep_until_retry(deadline, delay).await?;
+                    continue;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
     /// Fetch the supervisor's atomic spawn snapshot (`supervisor.spawn_snapshot`)
     /// over channel 0: the live processes with their spawn generations, and the
     /// cursor at which they were observed.
@@ -1304,6 +1532,94 @@ impl SubcConsumer {
                     self.shared.sleep_until_retry(deadline, delay).await?;
                     continue;
                 }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
+    /// Query the newest-first activity ledger. The reply preserves entries, the
+    /// continuation cursor and the head to subscribe from without a query/follow gap.
+    /// Identity is filled from the supervised launch environment, as for route.open;
+    /// without one the daemon treats the caller as Direct. Refusals retain their code
+    /// through [`CallError::code`]. Transport retries are paced to the call deadline.
+    pub async fn query_activity(
+        &self,
+        request: ActivityQueryRequest,
+    ) -> Result<ActivityQueryResponse, CallError> {
+        let deadline = Instant::now() + self.shared.opts.call_timeout;
+        let body = activity_read_body(request)?;
+        let mut attempt = 0usize;
+        loop {
+            attempt = attempt.saturating_add(1);
+            match self
+                .shared
+                .control_call(body.clone(), deadline, false, None)
+                .await
+            {
+                Ok(TerminalFrame::Response { body, .. }) => {
+                    return serde_json::from_slice(&body).map_err(|err| {
+                        CallError::not_sent(format!("invalid activity.query response: {err}"))
+                    });
+                }
+                Ok(TerminalFrame::Error { body, .. }) => return Err(CallError::Module(body)),
+                Ok(TerminalFrame::StreamEnd) => {
+                    return Err(CallError::not_sent("activity.query returned StreamEnd"));
+                }
+                Err(err)
+                    if is_retryable_catalog_transport_error(&err) && Instant::now() < deadline =>
+                {
+                    let delay = self.shared.jittered(
+                        self.shared
+                            .opts
+                            .reconnect_backoff
+                            .delay_after_attempt(attempt),
+                    );
+                    self.shared.sleep_until_retry(deadline, delay).await?;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
+    /// Follow durable activity entries after `since`, or from now if absent.
+    /// The launch identity is filled as for [`Self::query_activity`]. Refused cursors
+    /// and subscriber lag are terminal stream errors whose daemon code is readable
+    /// through [`crate::ActivityStreamError::code`]. On reconnect the stream ends;
+    /// recover with a query and subscribe from its head.
+    pub async fn subscribe_activity(
+        &self,
+        since: Option<ActivityCursor>,
+    ) -> Result<ActivitySubscription, CallError> {
+        let deadline = Instant::now() + self.shared.opts.call_timeout;
+        let body = activity_read_body(ActivitySubscribeRequest { since })?;
+        loop {
+            self.shared.ensure_connected_for_call(deadline).await?;
+            let permit = Arc::new(Semaphore::new(1))
+                .acquire_owned()
+                .await
+                .map_err(|_| CallError::not_sent("activity subscription permit closed"))?;
+            match self
+                .shared
+                .send_subscription(SubscriptionSend {
+                    expected_handle: None,
+                    channel: 0,
+                    epoch: 0,
+                    body: body.clone(),
+                    priority: Priority::Interactive,
+                    admission_class: AdmissionClass::Normal,
+                    event_buffer: ACTIVITY_EVENT_BUFFER,
+                    deadline,
+                    permit,
+                })
+                .await
+            {
+                Ok(inner) => {
+                    return Ok(ActivitySubscription {
+                        inner,
+                        finished: false,
+                    })
+                }
+                Err(err) if err.is_not_sent() && Instant::now() < deadline => continue,
                 Err(err) => return Err(err),
             }
         }
@@ -3015,8 +3331,19 @@ impl Shared {
         // "deadline elapsed", so "the module was reloading" stays
         // distinguishable from "the connection failed".
         let mut refusals = RouteOpenRefusals::default();
+        // An attempt that ends because the deadline passed hands back the kept
+        // refusal. That covers an attempt that never left the client (NotSent)
+        // and one the daemon received but had not answered by the deadline
+        // (OutcomeUnknown with the Deadline cause): a busy daemon can answer
+        // the final retry a few milliseconds late, and the refusals before it
+        // still say why the route never opened. Dropping the unanswered
+        // attempt's own outcome is safe: route.open requests are sent with
+        // `retain_late_route_open`, so a late acceptance is closed again with
+        // a GOODBYE instead of being handed to anyone.
         let expired = |err: CallError, refusals: &mut RouteOpenRefusals| {
-            if err.is_not_sent() && Instant::now() >= route_deadline {
+            let ended_by_deadline =
+                err.is_not_sent() || err.outcome_cause() == Some(OutcomeUnknownCause::Deadline);
+            if ended_by_deadline && Instant::now() >= route_deadline {
                 if let Some(refused) = std::mem::take(refusals).into_error(key.target_label()) {
                     return refused;
                 }
@@ -5322,6 +5649,21 @@ async fn writer_loop<W>(
     }
 }
 
+fn activity_read_body(request: impl serde::Serialize) -> Result<Vec<u8>, CallError> {
+    #[derive(serde::Serialize)]
+    struct ReadRequest<T> {
+        #[serde(flatten)]
+        request: T,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        consumer_identity: Option<ConsumerIdentity>,
+    }
+    serde_json::to_vec(&ReadRequest {
+        request,
+        consumer_identity: consumer_identity_from_env(),
+    })
+    .map_err(|err| CallError::not_sent(format!("failed to encode activity read: {err}")))
+}
+
 fn route_open_consumer_identity(opts: &CallOptions) -> Option<ConsumerIdentity> {
     opts.consumer_identity
         .clone()
@@ -5336,7 +5678,10 @@ fn close_route_consumer_identity(opts: &CloseRouteOptions) -> Option<ConsumerIde
 
 fn route_open_consumer_capabilities(opts: &CallOptions) -> Option<Vec<String>> {
     opts.reverse_requests.seal();
-    let capabilities = opts.reverse_requests.capabilities();
+    let mut capabilities = opts.reverse_requests.capabilities();
+    capabilities.extend(opts.consumer_capabilities());
+    capabilities.sort();
+    capabilities.dedup();
     (!capabilities.is_empty()).then_some(capabilities)
 }
 
@@ -5354,7 +5699,10 @@ fn route_open_role_versions(
 
 fn close_route_consumer_capabilities(opts: &CloseRouteOptions) -> Option<Vec<String>> {
     opts.reverse_requests.seal();
-    let capabilities = opts.reverse_requests.capabilities();
+    let mut capabilities = opts.reverse_requests.capabilities();
+    capabilities.extend(opts.consumer_capabilities());
+    capabilities.sort();
+    capabilities.dedup();
     (!capabilities.is_empty()).then_some(capabilities)
 }
 
@@ -5721,15 +6069,21 @@ mod tests {
     async fn capture_route_open(
         reverse_requests: ReverseRequestRegistry,
     ) -> (serde_json::Value, RouteHandle) {
+        capture_route_open_with_options(CallOptions {
+            reverse_requests,
+            ..CallOptions::default()
+        })
+        .await
+    }
+
+    async fn capture_route_open_with_options(
+        opts: CallOptions,
+    ) -> (serde_json::Value, RouteHandle) {
         let shared = writer_test_shared();
         let (writer, mut receiver) = mpsc::channel(4);
         shared.lock_inner().writer = Some(writer);
         let consumer = SubcConsumer {
             shared: Arc::clone(&shared),
-        };
-        let opts = CallOptions {
-            reverse_requests,
-            ..CallOptions::default()
         };
         let task = tokio::spawn(async move {
             consumer
@@ -5851,6 +6205,79 @@ mod tests {
             Some(&serde_json::json!(["elicitation"]))
         );
         release_reverse_request_registry(handle);
+    }
+
+    #[tokio::test]
+    async fn declared_consumer_capabilities_merge_with_handler_families_on_route_open() {
+        let registry = ReverseRequestRegistry::new();
+        registry
+            .on_request("elicitation", |_body, _ctx| async { Vec::new() })
+            .unwrap();
+        let opts = CallOptions {
+            reverse_requests: registry,
+            ..CallOptions::default()
+        }
+        .with_consumer_capability("content/v1")
+        .unwrap()
+        .with_consumer_capability("elicitation")
+        .unwrap()
+        .with_consumer_capability("content/v1")
+        .unwrap();
+
+        let (request, handle) = capture_route_open_with_options(opts).await;
+        assert_eq!(
+            request.get("consumer_capabilities"),
+            Some(&serde_json::json!(["content/v1", "elicitation"]))
+        );
+        release_reverse_request_registry(handle);
+    }
+
+    #[test]
+    fn invalid_consumer_capability_declarations_are_rejected_before_route_open() {
+        let (shared, mut receiver) = {
+            let shared = writer_test_shared();
+            let (writer, receiver) = mpsc::channel(4);
+            shared.lock_inner().writer = Some(writer);
+            (shared, receiver)
+        };
+        let too_long = "x".repeat(65);
+        for invalid in [
+            String::new(),
+            "content v1".to_string(),
+            "content\tv1".to_string(),
+            "content\nv1".to_string(),
+            "cöntent/v1".to_string(),
+            "content/\u{7f}v1".to_string(),
+            too_long,
+        ] {
+            let error = CallOptions::default()
+                .with_consumer_capability(invalid.clone())
+                .expect_err("invalid declarations must not produce route options");
+            assert_eq!(error.capability(), invalid);
+            assert!(
+                receiver.try_recv().is_err(),
+                "invalid declaration {invalid:?} must be rejected before any frame is queued"
+            );
+        }
+        let close_error = CloseRouteOptions::default()
+            .with_consumer_capability("bad value")
+            .expect_err("close-route declarations use the same validation");
+        assert_eq!(close_error.capability(), "bad value");
+        let call_options = CallOptions::default()
+            .with_consumer_capability("content/v1")
+            .unwrap();
+        assert_eq!(
+            call_options.consumer_capabilities(),
+            vec!["content/v1".to_string()]
+        );
+        let close_options = CloseRouteOptions::default()
+            .with_consumer_capability("content/v1")
+            .unwrap();
+        assert_eq!(
+            close_options.consumer_capabilities(),
+            vec!["content/v1".to_string()]
+        );
+        shared.close_sync("test complete");
     }
 
     #[tokio::test]
@@ -7180,6 +7607,65 @@ mod tests {
         assert_eq!(left, right);
     }
 
+    #[tokio::test]
+    async fn routes_with_and_without_declared_consumer_capabilities_are_kept_apart() {
+        let (shared, consumer, mut receiver) = route_open_stand_in(seeded_random(10));
+        let (undeclared_request, undeclared) = open_answered_with(
+            &shared,
+            &consumer,
+            &mut receiver,
+            CallOptions::default(),
+            74,
+            "the undeclared route opens first",
+        )
+        .await;
+        assert!(undeclared_request.get("consumer_capabilities").is_none());
+
+        let declared_opts = CallOptions::default()
+            .with_consumer_capability("content/v1")
+            .unwrap();
+        let (declared_request, declared) = open_answered_with(
+            &shared,
+            &consumer,
+            &mut receiver,
+            declared_opts.clone(),
+            75,
+            "a declared open must not reuse the undeclared route",
+        )
+        .await;
+        assert_eq!(
+            declared_request["consumer_capabilities"],
+            serde_json::json!(["content/v1"])
+        );
+        assert_ne!(undeclared, declared);
+
+        assert_eq!(
+            consumer
+                .open_route(restart_target("plexus"), restart_identity(), declared_opts)
+                .await
+                .unwrap(),
+            declared,
+            "the same declaration must reuse its cached route"
+        );
+        assert_eq!(
+            consumer
+                .open_route(
+                    restart_target("plexus"),
+                    restart_identity(),
+                    CallOptions::default(),
+                )
+                .await
+                .unwrap(),
+            undeclared,
+            "an undeclared open must continue to reuse only its own route"
+        );
+        assert!(
+            receiver.try_recv().is_err(),
+            "both subsequent opens are cache hits"
+        );
+        shared.close_sync("test complete");
+    }
+
     fn scope_selector(owner: &str, scope_ref: &str, scope_epoch: u64) -> ScopeSelector {
         ScopeSelector {
             owner: subc_protocol::Principal::Reserved {
@@ -7578,6 +8064,88 @@ mod tests {
                 Some(code)
             );
         }
+    }
+
+    /// The daemon refuses the first route.open with `module_warming`, then the
+    /// retry is written and accepted but never answered, so the retry deadline
+    /// expires while that attempt is still waiting. The caller must still get
+    /// the refusal it already received, as `NotSent`, rather than the bare
+    /// "timed out at its deadline" of the unanswered attempt. A busy daemon
+    /// that answers the final retry a few milliseconds late hits this path.
+    #[tokio::test]
+    async fn refusal_survives_a_retry_still_in_flight_at_the_deadline() {
+        let (shared, consumer, mut receiver) = route_open_stand_in(seeded_random(11));
+        let options = CallOptions {
+            timeout: Duration::from_secs(5),
+            route_retry: RetryBackoff {
+                base: Duration::ZERO,
+                cap: Duration::ZERO,
+                max_attempts: 2,
+            },
+            route_retry_deadline: Duration::from_millis(300),
+            ..CallOptions::default()
+        };
+        let mut task = tokio::spawn(async move {
+            consumer
+                .open_route(restart_target("warming"), restart_identity(), options)
+                .await
+        });
+        let generation = shared.lock_inner().generation;
+        let refusal = ErrorBody {
+            code: error_codes::MODULE_WARMING.to_string(),
+            message: "warming is not ready".to_string(),
+            detail: Some(serde_json::json!({"reason": "required_capability_unprovided"})),
+        };
+        let mut attempts = 0usize;
+        let mut held = false;
+        let err = loop {
+            tokio::select! {
+                command = receiver.recv() => {
+                    let Some(command) = command else {
+                        break task.await.unwrap().expect_err("route.open must fail");
+                    };
+                    if command.frame.header.ty != FrameType::Request {
+                        continue;
+                    }
+                    attempts += 1;
+                    if attempts == 1 {
+                        let frame = route_open_answer(
+                            command.frame.header.corr,
+                            0,
+                            Some(refusal.clone()),
+                        );
+                        assert!(dispatch_frame(&shared, generation, frame).await);
+                    } else {
+                        // What the writer task does once the frame is on the
+                        // socket: from here a timeout is OutcomeUnknown.
+                        held = shared.mark_pending_accepted(
+                            command.pending.expect("a route.open is a pending request"),
+                        );
+                    }
+                }
+                joined = &mut task => {
+                    break joined.unwrap().expect_err("route.open must fail");
+                }
+            }
+        };
+        shared.close_sync("test complete");
+        assert_eq!(
+            attempts, 2,
+            "one refused attempt, then one held past the deadline"
+        );
+        assert!(
+            held,
+            "the second attempt must be accepted and left unanswered"
+        );
+        assert!(
+            err.is_not_sent(),
+            "a refused route never delivered the request: {err}"
+        );
+        let body = err
+            .route_open_refusal()
+            .unwrap_or_else(|| panic!("the refusal must survive the deadline: {err}"));
+        assert_eq!(body.code, error_codes::MODULE_WARMING);
+        assert_eq!(body.detail, refusal.detail);
     }
 
     #[test]

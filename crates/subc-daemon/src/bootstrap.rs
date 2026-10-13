@@ -966,18 +966,62 @@ async fn serve_bound_daemon(
     )
     .with_connected_clients(connected_clients);
 
+    // Discovery must expose every accepted configured module, including disabled
+    // ones. Registration creates status handles but neither starts monitors
+    // nor launches processes: children need the published file for `--subc`.
+    let mut registered_modules = Vec::with_capacity(configured_modules.len());
+    for configured in configured_modules {
+        let enabled = configured.enabled;
+        let health = configured.health.clone();
+        let module_id = configured.module_id.clone();
+        let registered = match supervisor.register_configured_with_health(
+            configured.module_spec(),
+            enabled,
+            health.clone(),
+            configured.drain_timeout_ms,
+            configured.restart,
+        ) {
+            Ok(registered) => registered,
+            Err(err) => {
+                error!(module_id = %module_id, error = %err, "failed to supervise configured module; continuing daemon startup");
+                continue;
+            }
+        };
+        registered_modules.push(registered);
+        // A relaxed threshold can silently outlive the temporary allowance
+        // that required it, so report the extra tolerance on every boot.
+        let default_threshold = HealthConfig::default().failure_threshold;
+        if enabled && health.failure_threshold > default_threshold {
+            warn!(
+                module_id = %module_id,
+                failure_threshold = health.failure_threshold,
+                default_threshold,
+                tolerance_secs = health.cadence.as_secs() * u64::from(health.failure_threshold),
+                "health failure threshold is relaxed above the default; a wedged module stays unflagged for longer"
+            );
+        }
+        info!(module_id = %module_id, enabled, "configured module registered");
+    }
+    control.refresh_capability_requirements();
+
     let mut serve_task =
         AbortOnDrop::new(tokio::spawn(serve_listeners(bound.listeners, router, auth)));
     verify_serving(&bound.connection_info).await?;
     // A published endpoint promises that authentication can complete now.
     // Orphan cleanup and control-plane construction can take longer than an
     // existing-daemon probe's deadline, so finish both before discovery.
-    write_atomic(&bound.connection_file_path, &bound.connection_info).map_err(|source| {
-        BootstrapError::ConnectionFileWrite {
-            path: bound.connection_file_path.clone(),
-            source,
-        }
-    })?;
+    // The write fsyncs, so it runs on tokio's blocking pool (see
+    // `publish_connection_file`). The singleton lock travels with it and comes
+    // back only once the file is in place.
+    let (published, publication_lock) = publish_connection_file(
+        &bound.connection_file_path,
+        &bound.connection_info,
+        publication_lock,
+    )
+    .await;
+    published?;
+    #[cfg(test)]
+    startup_publication_hook::run(&bound.connection_file_path).await;
     drop(publication_lock);
     let _clock_step_task = AbortOnDrop::new(crate::watchdog::spawn_clock_step_monitor());
     // Off the startup path: it runs `systemctl`, and only ever logs.
@@ -994,40 +1038,13 @@ async fn serve_bound_daemon(
         .spawn(),
     );
 
-    for configured in configured_modules {
-        let enabled = configured.enabled;
-        let health = configured.health.clone();
-        let module_id = configured.module_id.clone();
-        match supervisor.supervise_configured_with_health(
-            configured.module_spec(),
-            enabled,
-            health.clone(),
-            configured.drain_timeout_ms,
-            configured.restart,
-        ) {
-            Ok(_) => {
-                // A raised failure threshold is normally a temporary allowance for a
-                // drive that deliberately stops a module, and it widens the window in
-                // which a genuinely wedged module looks fine. It is only ever noticed
-                // when someone thinks to re-read the config, so a relaxation outlives
-                // its reason silently: a rig ran five days at 240s of tolerance against
-                // a 90s default because a comment promising a revert was mistaken for
-                // the revert. Saying so on every boot costs one line and removes the
-                // need for anyone to remember.
-                let default_threshold = HealthConfig::default().failure_threshold;
-                if enabled && health.failure_threshold > default_threshold {
-                    warn!(
-                        module_id = %module_id,
-                        failure_threshold = health.failure_threshold,
-                        default_threshold,
-                        tolerance_secs = health.cadence.as_secs() * u64::from(health.failure_threshold),
-                        "health failure threshold is relaxed above the default; a wedged module stays unflagged for longer"
-                    );
-                }
-                info!(module_id = %module_id, enabled, "configured module supervised");
+    for registered in registered_modules {
+        match supervisor.start_registered_configured(registered, None) {
+            Ok(module) => {
+                info!(module_id = %module.module_id(), "configured module supervised");
             }
             Err(err) => {
-                error!(module_id = %module_id, error = %err, "failed to supervise configured module; continuing daemon startup");
+                error!(error = %err, "failed to start configured module; continuing daemon startup");
             }
         }
     }
@@ -1152,12 +1169,35 @@ async fn ensure_singleton_inner(
     // Established under the start lock, and under the run-directory lock when
     // there is one, and before binding: a corrupt file stops boot before
     // anything is published, and two daemons racing to start cannot both mint.
-    let machine_id = config
-        .machine_id_path
-        .as_deref()
-        .map(crate::machine_id::load_or_mint)
-        .transpose()
-        .map_err(BootstrapError::MachineId)?;
+    //
+    // Minting a new machine id fsyncs its file, so loading or minting runs on
+    // tokio's blocking pool. Both locks travel with that work, so neither is
+    // released while a mint is in flight.
+    let (machine_id, lock, run_dir_lock) = match config.machine_id_path {
+        None => (None, lock, run_dir_lock),
+        Some(machine_id_path) => {
+            let task_path = machine_id_path.clone();
+            match run_blocking_holding((lock, run_dir_lock), move || {
+                crate::machine_id::load_or_mint(&task_path)
+            })
+            .await
+            {
+                Ok((Ok(id), (lock, run_dir_lock))) => (Some(id), lock, run_dir_lock),
+                Ok((Err(error), _locks)) => return Err(BootstrapError::MachineId(error)),
+                Err(join_error) => {
+                    return Err(BootstrapError::MachineId(
+                        crate::machine_id::MachineIdFileError::Write {
+                            path: machine_id_path,
+                            source: io::Error::other(describe_blocking_task_failure(
+                                "loading or minting the machine id",
+                                &join_error,
+                            )),
+                        },
+                    ))
+                }
+            }
+        }
+    };
 
     let (listeners, endpoints) = bind_loopback(config.port).await?;
     let connection_info = ConnectionInfo {
@@ -1173,12 +1213,17 @@ async fn ensure_singleton_inner(
     // The low-level binding API historically publishes for callers that serve
     // these listeners themselves. The daemon entry point defers publication
     // until its own authentication server is running.
-    if publish {
-        if let Err(source) = write_atomic(&path, &connection_info) {
+    let publication_lock = if publish {
+        let (published, lock) = publish_connection_file(&path, &connection_info, lock).await;
+        if let Err(error) = published {
             drop(listeners);
-            return Err(BootstrapError::ConnectionFileWrite { path, source });
+            return Err(error);
         }
-    }
+        drop(lock);
+        None
+    } else {
+        Some(lock)
+    };
 
     Ok(Outcome::Bound(BoundDaemon {
         listeners,
@@ -1187,7 +1232,7 @@ async fn ensure_singleton_inner(
         connection_file_source: config.connection_file_source,
         machine_id,
         run_dir_lock,
-        publication_lock: (!publish).then_some(lock),
+        publication_lock,
     }))
 }
 
@@ -1260,6 +1305,173 @@ async fn verify_serving(info: &ConnectionInfo) -> Result<(), BootstrapError> {
         }
     }
     Err(BootstrapError::StartupNotServing)
+}
+
+/// Run blocking filesystem work (an fsync, a rename) on tokio's blocking-thread
+/// pool rather than on the async worker thread that awaits it. On a slow or
+/// busy disk an fsync can take seconds, and a runtime has few worker threads
+/// (an in-process test daemon may share two with everything else), so doing it
+/// inline stalls unrelated tasks for that long.
+///
+/// `guards` (lock handles) move into the blocking task and are handed back
+/// with the work's result. If the awaiting future is dropped first, the work
+/// still runs to completion on its thread and the guards are released only
+/// after it ends, so a lock is never given up while the work it protects is
+/// still writing.
+///
+/// `Err` means the task panicked, or was cancelled before it started because
+/// the runtime is shutting down; the guards have then been released already.
+async fn run_blocking_holding<G, T>(
+    guards: G,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<(T, G), JoinError>
+where
+    G: Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(move || {
+        let output = work();
+        (output, guards)
+    })
+    .await
+}
+
+/// Explain, for a startup error, why blocking work produced no result.
+fn describe_blocking_task_failure(work: &str, join_error: &JoinError) -> String {
+    if join_error.is_panic() {
+        format!("the background thread {work} panicked before finishing: {join_error}")
+    } else {
+        format!(
+            "the background thread {work} was cancelled before finishing, because the async runtime is shutting down: {join_error}"
+        )
+    }
+}
+
+/// Publish the connection file: owner-only permissions, written to a temporary
+/// file, fsynced and renamed over `path` (all done by `write_atomic`). The
+/// write runs on tokio's blocking pool through [`run_blocking_holding`], so the
+/// fsync never holds an async worker thread.
+///
+/// `guard` is the singleton start lock (or whatever the caller must keep held
+/// across publication); it is returned with the result. It comes back `None`
+/// only when the write task panicked or was cancelled, in which case the
+/// result is an error and the file must be treated as not published.
+async fn publish_connection_file<G: Send + 'static>(
+    path: &Path,
+    info: &ConnectionInfo,
+    guard: G,
+) -> (Result<(), BootstrapError>, Option<G>) {
+    let task_path = path.to_path_buf();
+    let task_info = info.clone();
+    let outcome =
+        run_blocking_holding(guard, move || write_connection_file(&task_path, &task_info)).await;
+    match outcome {
+        Ok((Ok(()), guard)) => (Ok(()), Some(guard)),
+        Ok((Err(source), guard)) => (
+            Err(BootstrapError::ConnectionFileWrite {
+                path: path.to_path_buf(),
+                source,
+            }),
+            Some(guard),
+        ),
+        Err(join_error) => (
+            Err(BootstrapError::ConnectionFileWrite {
+                path: path.to_path_buf(),
+                source: ConnectionFileError::Io {
+                    op: "write",
+                    path: path.to_path_buf(),
+                    source: io::Error::other(describe_blocking_task_failure(
+                        "writing the connection file",
+                        &join_error,
+                    )),
+                },
+            }),
+            None,
+        ),
+    }
+}
+
+/// The synchronous connection-file write, including its fsync. Call it only
+/// through [`publish_connection_file`], which keeps it off the async workers.
+fn write_connection_file(path: &Path, info: &ConnectionInfo) -> Result<(), ConnectionFileError> {
+    #[cfg(test)]
+    connection_file_write_hook::run(path);
+    write_atomic(path, info)
+}
+
+/// Lets a test run code inside the connection-file write, on whichever thread
+/// performs it, for example to block there and check what else can still run.
+#[cfg(test)]
+mod connection_file_write_hook {
+    use std::{
+        path::{Path, PathBuf},
+        sync::{Mutex, PoisonError},
+    };
+
+    type Hook = Box<dyn FnOnce() + Send>;
+
+    /// Keyed by connection-file path, so a hook fires only for the test that
+    /// installed it while other tests publish their own files in parallel.
+    static HOOKS: Mutex<Vec<(PathBuf, Hook)>> = Mutex::new(Vec::new());
+
+    /// Run `hook` once, at the start of the next write of `path`.
+    pub(super) fn install(path: &Path, hook: impl FnOnce() + Send + 'static) {
+        HOOKS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((path.to_path_buf(), Box::new(hook)));
+    }
+
+    pub(super) fn run(path: &Path) {
+        let hook = {
+            let mut hooks = HOOKS.lock().unwrap_or_else(PoisonError::into_inner);
+            hooks
+                .iter()
+                .position(|(hooked, _)| hooked == path)
+                .map(|index| hooks.swap_remove(index).1)
+        };
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+}
+
+/// A path-scoped barrier after publication and before any configured activation.
+/// The async wait leaves the listeners free to answer discovery-time requests.
+#[cfg(test)]
+mod startup_publication_hook {
+    use std::{
+        path::{Path, PathBuf},
+        sync::{Mutex, PoisonError},
+    };
+    use tokio::sync::oneshot;
+
+    type Barrier = (oneshot::Sender<()>, oneshot::Receiver<()>);
+    static BARRIERS: Mutex<Vec<(PathBuf, Barrier)>> = Mutex::new(Vec::new());
+
+    pub(super) fn install(path: &Path) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        BARRIERS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((path.to_path_buf(), (entered_tx, release_rx)));
+        (entered_rx, release_tx)
+    }
+
+    pub(super) async fn run(path: &Path) {
+        let barrier = {
+            let mut barriers = BARRIERS.lock().unwrap_or_else(PoisonError::into_inner);
+            barriers
+                .iter()
+                .position(|(hooked, _)| hooked == path)
+                .map(|index| barriers.swap_remove(index).1)
+        };
+        if let Some((entered, release)) = barrier {
+            let _ = entered.send(());
+            let _ = release.await;
+        }
+    }
 }
 
 fn is_absent_or_stale_connection_file(err: &ConnectionFileError) -> bool {
@@ -1632,6 +1844,9 @@ impl Error for BootstrapError {
 mod tests {
     mod activity {
         include!("activity_bootstrap_tests.rs");
+    }
+    mod startup_order {
+        include!("startup_order_tests.rs");
     }
     use super::*;
     use crate::server::ServerAuth;
@@ -2485,6 +2700,90 @@ mod tests {
             ended,
             "the published daemon must not still owe its orphan sweep"
         );
+    }
+
+    /// Publishing the connection file fsyncs, which can take seconds on a busy
+    /// disk, so the daemon must do it off the async worker thread. The hook
+    /// blocks inside the write until another task on the same single-threaded
+    /// runtime has run. Writing on the worker thread would starve that task: the
+    /// hook then gives up after its deadline and the test fails, as it does if
+    /// startup publishes without going through the hooked write at all.
+    #[tokio::test(flavor = "current_thread")]
+    async fn connection_file_publication_leaves_the_async_runtime_free() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (_dir, path) = temp_connection_file_path("publish-off-runtime");
+        let write_started = Arc::new(AtomicBool::new(false));
+        let (progress_tx, progress_rx) = std::sync::mpsc::channel::<()>();
+        let (verdict_tx, verdict_rx) = std::sync::mpsc::channel::<bool>();
+        let hook_started = Arc::clone(&write_started);
+        connection_file_write_hook::install(&path, move || {
+            hook_started.store(true, Ordering::SeqCst);
+            let progressed = progress_rx.recv_timeout(Duration::from_secs(5)).is_ok();
+            let _ = verdict_tx.send(progressed);
+        });
+        // Signals only after the write has started, so a message can only come
+        // from this task running while the write is still blocked.
+        let ticker = tokio::spawn(async move {
+            loop {
+                if write_started.load(Ordering::SeqCst) {
+                    let _ = progress_tx.send(());
+                    return;
+                }
+                sleep(Duration::from_millis(5)).await;
+            }
+        });
+
+        let daemon = tokio::spawn(run_with_config(BootstrapConfig::new(&path, 0)));
+        let published = timeout(Duration::from_secs(15), async {
+            while !path.exists() && !daemon.is_finished() {
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        let daemon_exited = daemon.is_finished();
+        daemon.abort();
+        let daemon_result = daemon.await;
+        ticker.abort();
+
+        assert!(
+            published.is_ok() && !daemon_exited,
+            "the daemon must start and publish its connection file: {daemon_result:?}"
+        );
+        match verdict_rx.try_recv() {
+            Ok(true) => {}
+            Ok(false) => panic!(
+                "no other task on the runtime ran while the connection file was being written: the write is blocking the async worker thread"
+            ),
+            Err(_) => panic!("startup published the connection file without the hooked write"),
+        }
+    }
+
+    /// A write that never reports back must stop startup with an error naming
+    /// the connection file, never be taken as published.
+    #[tokio::test]
+    async fn a_panicking_connection_file_write_fails_startup() {
+        let (_dir, path) = temp_connection_file_path("publish-panics");
+        connection_file_write_hook::install(&path, || {
+            panic!("deliberate panic inside the connection-file write")
+        });
+
+        let error = timeout(
+            Duration::from_secs(15),
+            run_with_config(BootstrapConfig::new(&path, 0)),
+        )
+        .await
+        .expect("startup must end once the write task fails")
+        .expect_err("startup must fail when the connection-file write panics");
+
+        assert!(
+            matches!(&error, BootstrapError::ConnectionFileWrite { path: failed, .. } if failed == &path),
+            "expected a connection-file write error, got {error:?}"
+        );
+        let message = error.to_string();
+        assert!(message.contains(&path.display().to_string()), "{message}");
+        assert!(message.contains("panicked"), "{message}");
+        assert!(!path.exists(), "no connection file may be published");
     }
 
     #[cfg(target_os = "macos")]

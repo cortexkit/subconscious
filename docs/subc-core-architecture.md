@@ -323,6 +323,8 @@ The local IPC transport. **Loopback TCP + a shared key** — chosen over Unix-do
 | **Supervision** | spawn/drain/restart/**hot-swap**; nested child-process cleanup |
 | **Trust + conformance** | tier gating; codec cache-law gate; auth vault-grant review |
 
+The activity ledger is the daemon's append-only record of who did what: modules record their own consequential events, the daemon stamps the actor, and only operator surfaces (`ck`, the phone and the bus mirror) may read it. Its design is in [`docs/designs/activity-ledger.md`](designs/activity-ledger.md).
+
 ---
 
 ## 6. Concurrency & the delivery contract

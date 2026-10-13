@@ -67,7 +67,7 @@ mod tests {
     fn unsupported_platform_never_publishes_a_prompt() {
         assert_eq!(
             prompt(
-                "module asks: write (requested by a local program)",
+                "approve a request from module: write (requested by a local program)",
                 Box::new(|_| { panic!("unsupported platforms must not create a prompt") })
             ),
             Outcome::UnsupportedPlatform

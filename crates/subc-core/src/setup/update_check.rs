@@ -29,7 +29,7 @@ type SourceFuture<'a> =
 /// and whether the signed index lists it for this host.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReleaseEvidence {
-    /// Display-only release text. It is intentionally not part of currency.
+    /// Release version used to reject downgrades before comparing digests.
     pub version: String,
     pub sha256: Option<String>,
     /// Whether the binary's own `--version` is the release version (the
@@ -41,7 +41,7 @@ pub struct ReleaseEvidence {
 /// State read from one inventory-owned binary. Currency compares
 /// `archive_sha256` (the zip the binary was extracted from) to the index asset
 /// digest. `sha256` is the extracted binary — a different file — and is not a
-/// currency input; version text is retained only for rendering.
+/// currency input. Release versions additionally prevent downgrades.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InstalledBinary {
     pub version: String,
@@ -369,11 +369,15 @@ pub async fn dashboard_update_at<S: ReleaseSource>(
     };
     if let Some(metadata) = &cached {
         // An explicit check may have cached only the then-installed roster.
-        // Freshness alone cannot establish currency for a later installation.
+        // Freshness alone cannot establish currency for a later installation:
+        // an older release also means this cache predates an installed build.
         if metadata.is_fresh_at(now_unix_secs)
             && roster_for_installed(installed)
                 .iter()
                 .all(|target| metadata.targets.contains_key(target.label()))
+            && roster_for_installed(installed)
+                .iter()
+                .all(|&target| release_can_replace(target, metadata, installed))
         {
             return dashboard_state(metadata, installed, now_unix_secs);
         }
@@ -400,7 +404,7 @@ pub async fn dashboard_update_at<S: ReleaseSource>(
 }
 
 /// Refreshes each installed roster target using a separate ten-second deadline.
-/// This is only called by `ck upgrade --check`; bare `ck` instead uses the shared 800 ms
+/// This is called by `ck upgrade`, including `--check`; bare `ck` uses the shared 800 ms
 /// deadline above and never acquires a per-target wait.
 pub async fn check_update_metadata<S: ReleaseSource>(
     cache: &UpdateCache,
@@ -442,7 +446,8 @@ pub async fn check_update_metadata<S: ReleaseSource>(
 }
 
 /// Applies host-specific release digests to the explicit upgrade planner state.
-/// Version strings remain in the rendered plan but never decide a replacement.
+/// Release versions reject downgrades; archive digests decide whether an eligible
+/// release needs a replacement, including repairs of the same release.
 pub fn observed_from_metadata(
     metadata: &UpdateMetadata,
     installed: &BTreeMap<String, InstalledBinary>,
@@ -453,6 +458,9 @@ pub fn observed_from_metadata(
         let Some(release) = metadata.targets.get(target.label()) else {
             continue;
         };
+        if !release_can_replace(target, metadata, installed) {
+            continue;
+        }
         let Some(release_digest) = release.sha256.as_deref() else {
             if let Some(expected_asset) = expected_asset_name(target, &platform) {
                 observed.releases.insert(
@@ -531,6 +539,9 @@ fn dashboard_state(
         .into_iter()
         .filter_map(|target| {
             let release = metadata.targets.get(target.label())?;
+            if !release_can_replace(target, metadata, installed) {
+                return None;
+            }
             let installed = installed.get(target.label())?;
             let release_digest = release.sha256.as_deref()?;
             let from = if release.reports_release_version {
@@ -561,6 +572,34 @@ fn dashboard_state(
     } else {
         DashboardUpdate::Available { updates, cache_age }
     }
+}
+
+/// A component's release-reporting siblings establish its installed release
+/// floor. This also protects binaries that print an unrelated crate version
+/// (for example ck-subc-mcp) from moving back to an older component release.
+fn release_can_replace(
+    target: UpgradeTarget,
+    metadata: &UpdateMetadata,
+    installed: &BTreeMap<String, InstalledBinary>,
+) -> bool {
+    let Some(release) = metadata
+        .targets
+        .get(target.label())
+        .and_then(|release| semver::Version::parse(&release.version).ok())
+    else {
+        return true;
+    };
+    roster_for_installed(installed)
+        .into_iter()
+        .filter(|sibling| sibling.component == target.component)
+        .filter(|sibling| {
+            metadata
+                .targets
+                .get(sibling.label())
+                .is_some_and(|release| release.reports_release_version)
+        })
+        .filter_map(|sibling| semver::Version::parse(&installed[sibling.label()].version).ok())
+        .all(|installed| release.cmp_precedence(&installed).is_ge())
 }
 
 fn roster_for_installed(installed: &BTreeMap<String, InstalledBinary>) -> Vec<UpgradeTarget> {
@@ -800,6 +839,132 @@ mod tests {
             }
         );
         assert!(source.calls().is_empty());
+    }
+
+    fn old_install_cache() -> UpdateMetadata {
+        let mut cached = metadata(10_000, "0.20.41");
+        cached
+            .targets
+            .get_mut("ck-subc-mcp")
+            .unwrap()
+            .reports_release_version = false;
+        cached
+    }
+
+    #[tokio::test]
+    async fn newer_install_refetches_a_fresh_0_20_41_cache_without_offering_a_downgrade() {
+        let (_dir, cache) = cache("cache-predates-install");
+        let cached = old_install_cache();
+        cache.write(&cached).unwrap();
+        let mut installed = installed("0.20.83");
+        installed.get_mut("ck-subc-mcp").unwrap().version = "0.1.0".into();
+        for (source, refreshed) in [
+            (StaticSource::successful("0.20.83"), true),
+            (
+                StaticSource::failing(ReleaseSourceError::Offline("offline".into())),
+                false,
+            ),
+        ] {
+            cache.write(&cached).unwrap();
+            let update = dashboard_update_at(
+                &cache,
+                &source,
+                &installed,
+                10_030,
+                Duration::from_millis(100),
+            )
+            .await;
+            if refreshed {
+                assert!(
+                    matches!(update, DashboardUpdate::Current { .. }),
+                    "{update:?}"
+                );
+                assert_eq!(
+                    cache.load(),
+                    CacheRead::Present(metadata(10_030, "0.20.83"))
+                );
+            } else {
+                assert!(
+                    matches!(update, DashboardUpdate::NotChecked { .. }),
+                    "{update:?}"
+                );
+                assert_eq!(cache.load(), CacheRead::Present(cached.clone()));
+            }
+            assert!(
+                !source.calls().is_empty(),
+                "older cache must trigger a fetch"
+            );
+        }
+    }
+
+    #[test]
+    fn older_release_is_neither_a_dashboard_update_nor_an_upgrade_even_without_a_digest() {
+        let cached = old_install_cache();
+        let mut installed = installed("0.20.83");
+        installed.get_mut("ck-subc-mcp").unwrap().version = "0.1.0".into();
+        for recorded_digest in [true, false] {
+            if !recorded_digest {
+                for binary in installed.values_mut() {
+                    binary.archive_sha256 = None;
+                }
+            }
+            assert!(matches!(
+                dashboard_state(&cached, &installed, 10_030),
+                DashboardUpdate::Current { .. }
+            ));
+            let observed = observed_from_metadata(&cached, &installed);
+            for target in observed.roster.iter().copied() {
+                assert_eq!(
+                    observed.target_state(target),
+                    UpgradeState::Current,
+                    "{target}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn strictly_newer_release_is_still_offered_by_dashboard_and_upgrade() {
+        let cached = metadata(10_000, "0.20.84");
+        let installed = installed("0.20.83");
+        let DashboardUpdate::Available { updates, .. } =
+            dashboard_state(&cached, &installed, 10_030)
+        else {
+            panic!("newer release must be offered");
+        };
+        assert_eq!(updates.len(), upgrade_roster(Component::ALL).len());
+        let observed = observed_from_metadata(&cached, &installed);
+        for target in observed.roster.iter().copied() {
+            assert!(
+                matches!(
+                    observed.target_state(target),
+                    UpgradeState::UpdateAvailable { .. }
+                ),
+                "{target}"
+            );
+        }
+    }
+
+    #[test]
+    fn release_order_uses_semver_precedence_not_lexical_order_or_build_metadata() {
+        for (release, installed_version, allowed) in [
+            ("0.20.9", "0.20.83", false),
+            ("0.20.100", "0.20.83", true),
+            ("0.20.83-alpha.2", "0.20.83-alpha.10", false),
+            ("0.20.83-alpha.10", "0.20.83", false),
+            ("0.20.83", "0.20.83-alpha.10", true),
+            ("0.20.83+old", "0.20.83+new", true),
+        ] {
+            assert_eq!(
+                release_can_replace(
+                    upgrade_target("ck"),
+                    &metadata(100, release),
+                    &installed(installed_version)
+                ),
+                allowed,
+                "{installed_version} -> {release}"
+            );
+        }
     }
 
     #[tokio::test]

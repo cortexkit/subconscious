@@ -5,7 +5,7 @@
     "": {
       "name": "@cortexkit/log",
       "dependencies": {
-        "@cortexkit/store": "^0.2.0",
+        "@cortexkit/store": "^0.2.1",
       },
       "devDependencies": {
         "@types/bun": "^1.3.14",

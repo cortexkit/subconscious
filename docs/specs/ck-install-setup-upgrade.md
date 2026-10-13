@@ -1,13 +1,11 @@
-# ck install / setup / upgrade — alpha distribution for subc + AFT (+MC)
+# ck install / setup / upgrade — alpha distribution for subc + AFT (+Magic Context)
 
 Status: DRAFT r4 — alpha amendment, controlling before implementation.
 
 ## Amendment record and controlling authority
 
-This amendment is the controlling normative authority for the alpha distribution
-campaign. It folds the final chair rulings from the 2026-08-29
-`ck-install-setup-upgrade` campaign, refire 5. If this document conflicts with
-an earlier campaign draft, an implementation plan, or the superseded r1 text,
+This amendment is the controlling normative authority for alpha distribution.
+If this document conflicts with an earlier draft, an implementation plan, or the superseded r1 text,
 this amendment wins. An implementation conflict must be surfaced; code must
 not silently choose a different contract.
 
@@ -18,13 +16,13 @@ not conflict with this amendment.
 | Superseded r1 clause | Controlling replacement in this amendment |
 | --- | --- |
 | **Flow**, “Test matrix before any user” | [Alpha support and release inventory](#alpha-support-and-release-inventory) fixes the supported target set and adds the release-inventory gate. |
-| **ck setup**, step 1, “Detect platform + existing state” | [Refusal classes](#refusal-classes), [Setup command model](#setup-command-model), and [MC detection](#mc-detection) define the supported-target, dry-run, and detection contracts. |
-| **ck setup**, step 2, “Fetch + verify companion binaries … (daemon, ck-subc-mcp, ck-aft; MC optional)” | [Release assets and component availability](#release-assets-and-component-availability) fixes the managed binary set, makes MC wiring-only for alpha, and defines release-incomplete refusal. |
+| **ck setup**, step 1, “Detect platform + existing state” | [Refusal classes](#refusal-classes), [Setup command model](#setup-command-model), and [Magic Context detection](#mc-detection) define the supported-target, dry-run, and detection contracts. |
+| **ck setup**, step 2, “Fetch + verify companion binaries … (daemon, ck-subc-mcp, ck-aft; Magic Context optional)” | [Release assets and component availability](#release-assets-and-component-availability) fixes the managed binary set, makes Magic Context wiring-only for alpha, and defines release-incomplete refusal. |
 | **ck setup**, step 4, “Windows service (sc.exe / windows-service crate path)” | [Per-user runtime registration](#per-user-runtime-registration) requires the non-elevated `\\CortexKit\\subc-daemon` scheduled task instead of an elevated Windows service. |
-| **ck setup**, step 5, “detect standalone AFT (NDJSON transport) and standalone MC; OFFER conversion” | [AFT conversion](#aft-conversion) disables automatic AFT detection for alpha, and [MC detection](#mc-detection) supplies MC’s owner-pinned read-only two-tier detector and offer rules. |
+| **ck setup**, step 5, “detect standalone AFT (NDJSON transport) and standalone Magic Context; OFFER conversion” | [AFT conversion](#aft-conversion) disables automatic AFT detection for alpha, and [Magic Context detection](#mc-detection) supplies Magic Context’s owner-pinned read-only two-tier detector and offer rules. |
 | **ck setup**, step 7, “service dereg, PATH unlink, binaries removed” | [Installation destinations, PATH, and ownership](#installation-destinations-path-and-ownership) and [Setup command model](#setup-command-model) limit uninstall to the ownership inventory and retain user data. |
 | **Settled by operator**, item 2, “the standalone-conversion offer is the same code path as a later add” | Accepted conversion still uses the normal component-add path, but [AFT conversion](#aft-conversion) permits AFT conversion only through the explicit confirmed verb during alpha. |
-| **ck upgrade**, “Check” bullet, including comparison against releases for “subc / aft / mc” | [Update checks](#update-checks) and [Upgrade ordering and target restarts](#upgrade-ordering-and-target-restarts) exclude MC from alpha upgrades and define the interactive check deadlines. |
+| **ck upgrade**, “Check” bullet, including comparison against releases for “subc / aft / mc” | [Update checks](#update-checks) and [Upgrade ordering and target restarts](#upgrade-ordering-and-target-restarts) exclude Magic Context from alpha upgrades and define the interactive check deadlines. |
 | **ck upgrade**, “Upgrade” bullet, including a single `supervisor.restart` path | [Upgrade ordering and target restarts](#upgrade-ordering-and-target-restarts) separates module, daemon, and self-update restart behavior. |
 | **ck upgrade**, “Ordering” bullet | [Upgrade ordering and target restarts](#upgrade-ordering-and-target-restarts) places the daemon before the modules and makes `ck` self-update the final target. |
 | **ck upgrade**, “Channels” bullet | [Alpha support and release inventory](#alpha-support-and-release-inventory) and [Release lanes](#release-lanes) define the supported inventory gate and AFT’s cross-repository release dependency. |
@@ -245,9 +243,9 @@ matching per-asset sidecar is the only digest source. Installers and upgrade do
 not use a platform mapping table or an aggregate digest manifest.
 
 The alpha binary inventory is `ck`, `ck-subc`, and `ck-subc-mcp` from the
-subconscious release lane, plus `ck-aft` from the AFT release lane. MC has no
-alpha release archive: alpha may wire an already available MC component, but
-it must not download an MC archive and MC is excluded from `ck upgrade`.
+subconscious release lane, plus `ck-aft` from the AFT release lane. Magic Context has no
+alpha release archive: alpha may wire an already available Magic Context component, but
+it must not download an Magic Context archive and Magic Context is excluded from `ck upgrade`.
 
 ## Installation destinations, PATH, and ownership
 
@@ -310,12 +308,13 @@ registration, and stores by zero bytes.
 An implementation-grade automatic AFT detector is an AFT-owner, post-alpha
 dependency. Before a later detection slice may be implemented, that owner must
 specify its path, environment precedence, qualifying predicate,
-malformed-or-locked classification, and false-positive fixtures. This campaign
+malformed-or-locked classification, and false-positive fixtures. This installer implementation
 must not invent that contract.
 
-## MC detection
+<a id="mc-detection"></a>
+## Magic Context detection
 
-MC automatic detection is read-only and selects one data directory in this
+Magic Context automatic detection is read-only and selects one data directory in this
 order:
 
 1. `MAGIC_CONTEXT_TEST_DATA_DIR`
@@ -325,7 +324,7 @@ order:
 
 Each override names the directory containing `context.db`. On Windows the
 literal default is `%USERPROFILE%\.local\share\cortexkit\magic-context\`.
-No AppData path exists or is probed for MC detection; this is the user-profile
+No AppData path exists or is probed for Magic Context detection; this is the user-profile
 resolution of the Unix fallback.
 
 The detector opens `context.db` using a read-only SQLite `mode=ro` URI. It does
@@ -344,15 +343,15 @@ is fresh and gets no offer. A foreign SQLite database without qualifying
 migration evidence and torn state with `context.db-wal` or `context.db-shm`
 but no `context.db` get no offer. Sidecar absence is not evidence either way.
 
-`SQLITE_BUSY` while opening or reading a qualifying MC database means
+`SQLITE_BUSY` while opening or reading a qualifying Magic Context database means
 **installed and live**. It deliberately produces no automatic conversion offer
 because the detector cannot safely determine tier-2 durable state while the
 installation is live. `ck setup mc --convert` remains available for that
 classification and every other classification, and it always requires
 confirmation before mutation.
 
-Automatic MC detection on Windows has an additional owner gate: it may offer
-conversion only after the MC owner confirms that standalone Windows installs
+Automatic Magic Context detection on Windows has an additional owner gate: it may offer
+conversion only after the Magic Context owner confirms that standalone Windows installs
 write the literal default path above. Until that confirmation, Windows uses
 only the explicit confirmed `ck setup mc --convert` path. A no-override Windows
 fixture is required.
@@ -392,7 +391,7 @@ binaries or restarting a runtime.
 
 `ck upgrade` discovers installed targets, reads binary `--version` output and
 daemon catalog build information, compares them with the applicable latest
-release data, and produces an ordered plan. MC is never an upgrade target in
+release data, and produces an ordered plan. Magic Context is never an upgrade target in
 alpha because it has no alpha archive.
 
 For every selected non-self target, the executor derives the matching archive
@@ -460,11 +459,11 @@ a subsequent invocation must execute the new destination inode. On Windows,
 
 The subconscious Windows release lane is in this repository’s alpha scope.
 AFT release-lane work is cross-repository and belongs to the AFT owner; no
-campaign slice may implement it here. Until that lane publishes the required
+installer change may implement it here. Until that lane publishes the required
 supported-target archive and matching sidecar, an AFT selection on an otherwise
 supported target fails with the **release-incomplete** refusal.
 
-MC is wiring-only for alpha, ships no alpha release archive, and remains
+Magic Context is wiring-only for alpha, ships no alpha release archive, and remains
 excluded from `ck upgrade`. It may adopt the archive convention only when its
 CLI joins a later release channel.
 
@@ -482,7 +481,7 @@ release-incomplete refusals; direct archive and sidecar naming; installer
 idempotence and its prohibition on executing setup; dry-run read-only behavior
 and plan equivalence; all per-user runtime registrations with immediate
 liveness; manifest-limited uninstall and self-update ownership; explicit AFT
-conversion; MC precedence, two tiers, foreign and torn state, `SQLITE_BUSY`,
+conversion; Magic Context precedence, two tiers, foreign and torn state, `SQLITE_BUSY`,
 and the Windows owner gate; the bare-`ck` 800 ms budget; the 10-second
 per-target `--check` bound; target-specific restart behavior; upgrade ordering;
 and both self-update replacement lifecycles.
@@ -498,6 +497,6 @@ inventory gate must succeed before that matrix begins.
   installer work.
 - An elevated Windows service, MSI, winget, Homebrew formula, or Linux distro
   package in alpha.
-- MC alpha release archives or MC participation in `ck upgrade`.
-- Cloudflare mirror-route deployment in this campaign.
+- Magic Context alpha release archives or Magic Context participation in `ck upgrade`.
+- Cloudflare mirror-route deployment in this installer implementation.
 - New daemon RPCs or module wire-protocol changes.

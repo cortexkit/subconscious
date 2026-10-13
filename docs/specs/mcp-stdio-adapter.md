@@ -1,12 +1,5 @@
 # ck-mcp-stdio-adapter — resident subc module for third-party stdio MCP servers
 
-Status: Not Built (spec settled 2026-08-16; slices dispatch against this document)
-Design provenance: subconscious issue #20, plexus#4, spec campaigns ct_...9327c2ca2c38 / ct_...95068b13a9f0
-(both round-capped; their panels' blocking findings are folded here, and this document supersedes both drafts),
-plus six recorded rulings (env map, TTL policy, capability cache, deadline coherence, frame ceiling, base env).
-This document SUPERSEDES the adapter bullet in `docs/specs/mcp-router.md` — and that bullet was
-EDITED in the same commit that landed this spec (412ab265), not superseded by declaration alone:
-the router doc now describes the singleton architecture and points here.
 
 ## Intent
 
@@ -30,7 +23,7 @@ down.
   asserts health on behalf of a module that measured nothing. Route-reachable by module id, no
   facade-advertised tools.
   This is representable in the frozen manifest vocabulary today (no protocol change), and it is the
-  same shape plexus already consumes for claustrum. PLEX discovery rule: bind by well-known module
+  same shape plexus already consumes for claustrum. Discovery rule: bind by well-known module
   id `mcp-stdio-adapter`; server names come from the operator registry, out of band. The facade
   (subc-mcp) never sees child tools directly; exposure to agents is plexus's connector surface,
   governed by plexus per `docs/specs/mcp-router.md`.
@@ -172,14 +165,7 @@ refusal at review time.
   authenticated-looking, wrong identity) and this spec refuses to make it constructable. Handles in
   the env map are minted scoped to THIS adapter's module identity (claustrum-side grant scoping),
   so one compromised server definition cannot resolve a sibling adapter's secrets.
-- **Credential resolution — BUILD ITEM, not an existing path:** the campaign's evidence sweep found
-  no reusable handle-resolution client for the `{handle: ...}` map; the adapter's first slice builds
-  a claustrum route-plane consumer (subc-client-rs against claustrum's possession-only read surface,
-  the same wire contract plexus consumes) as a named deliverable. If claustrum's served contract
-  does not match this spec's assumption, the slice STOPS AND REPORTS rather than improvising an
-  in-adapter resolver — this is a security boundary. Unresolvable required handle ⇒ that spawn
-  fails `spawn_failed`; the route error names server and env VARIABLE, never the handle id, never
-  any value.
+- An unresolvable required credential handle fails the spawn with `spawn_failed`; the route error names the server and environment variable, never the handle ID or value.
 - Idle eviction after per-server TTL: stdin close, `EVICTION_GRACE_MS = 5_000`, then process-TREE
   kill (orphan prevention, not confinement; Windows via job objects, cfg-split like supervise.rs).
   Invisible to callers — and the state machine that makes the invisibility TRUE rather than
@@ -215,17 +201,7 @@ refusal at review time.
 
 ## Robustness, isolation, and disclosure boundaries
 
-- **Threat model, stated plainly (panel-forced narrowing):** the constructed-environment rule
-  guarantees NON-PROPAGATION — the child's environment contains no daemon material. It does not
-  and cannot guarantee SECRECY from an actively hostile same-UID child: v1 has no sandboxing, so
-  such a child can read the adapter's `/proc/<pid>/environ`, cmdline, or any same-user file.
-  Nonce/connection-material compromise by a hostile same-UID child is OUT OF SCOPE for v1 and the
-  README says so. The cheap fences that ARE in scope: the adapter SCRUBS `SUBC_LAUNCH_NONCE` from
-  its own environment after startup (retaining it only in memory for route identity); the daemon
-  socket and connection-file descriptors are opened/kept CLOEXEC so no child inherits an FD
-  (acceptance covers FD inheritance); the child env map parse-REFUSES any `SUBC_*` key; and
-  `command` values are recommended absolute — a bare name resolves against the frozen base PATH
-  once at spawn with the resolved absolute path logged.
+- Constructed environments prevent propagation of daemon material but do not provide secrecy from a hostile same-UID child; v1 has no child sandbox. The adapter scrubs `SUBC_LAUNCH_NONCE` after startup, keeps daemon connection descriptors CLOEXEC, refuses `SUBC_*` child environment keys, and recommends absolute commands, logging the resolved absolute path for bare names at spawn.
 - Server names match `[a-z0-9-]{1,64}` (pinned charset: case-sensitive matching over a
   case-insensitive-filesystem OS invites Windows case-folding ambiguity, so the charset simply has
   no case).
@@ -234,11 +210,7 @@ refusal at review time.
   `child_framing_error` for that server only; other servers serve concurrently; the adapter never
   exits for a child's bytes. Child stdout/stderr noise lands in a bounded per-child ring.
 - At-most-once forwarding: a written `tools/call` is never re-sent.
-- **DLP boundary, stated honestly:** credential values appear in none of the surfaces the ADAPTER
-  AUTHORS — its logs, its refusal/error bodies, its health output. The per-child noise ring and
-  forwarded MCP results hold CHILD-authored bytes verbatim and are outside adapter DLP: a
-  credential-consuming child can echo its own secret, and the adapter does not scan or redact child
-  output. The README states this plainly.
+- Credential values appear in no adapter-authored logs, error bodies, or health output; child noise and forwarded results remain verbatim child-authored bytes, which the adapter neither scans nor redacts even if a child echoes its secrets.
 - Health-Path-Rule v3: `health.check` replies from in-memory atomics. Stable health-detail keys
   (fleet-pulse consumes them): `children_live`, `children_max`, `spawns_total`,
   `spawn_failures_total`, `idle_evictions_total`, `calls_in_flight`, `oldest_in_flight_ms`,
@@ -299,8 +271,6 @@ refusal at review time.
 - OPERATOR SURFACE: module visible in `ck module list`/`ck health`; every named health key present
   and moving under load.
 - Windows CI green on the full matrix.
-- PLEX MILESTONE: registration + `tools/list` servable ⇒ ping PLEX; their manifest guard flips only
-  after a live proof against this adapter.
 
 ## Non-goals
 
@@ -318,9 +288,3 @@ refusal at review time.
 - No multi-instance adapters (singleton; recorded as assumption-adopted-as-boundary;
   `DuplicateModuleId` is fatal).
 - No persistence (no store.db; stateless across restarts).
-
-## Open items (tracked, non-blocking for slice 1)
-
-- Claustrum consumer contract verification is slice 1's first task (STOP-and-report on mismatch).
-- `LANG` value policy on Unix (pin `C.UTF-8` vs passthrough) — decide in slice 1 with the base-env
-  constant and its test.

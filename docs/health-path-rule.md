@@ -1,10 +1,6 @@
 # Health-Path-Rule v3
 
-The fleet doctrine for module health checks. Canonical text; previously this
-lived only in the SUBC seat's memory, which violated its own spirit (a rule one
-machine can read is not a rule). v1 → v2 added the lock-set clause; v2 → v3
-added the no-subprocess clause after two fleet-wide outages in one day
-(2026-08-08).
+The module health-check contract.
 
 ## The rule
 
@@ -31,13 +27,6 @@ resource** — outside your process entirely, and precisely the resource that is
 degraded under the conditions the probe exists to survive. The health reply
 execs into the exact fault it is supposed to report on.
 
-Proof case: aft's `build_health_report` called `artifact_cache_key()` per live
-root (33 of them) on the channel-0 reply path; that function spawns `git` per
-unmemoized root with 3 retries plus backoff. On a host intermittently blocking
-fresh-binary exec for 12s+, the 5s deadline was unreachable: 33 roots × 12s
-serial = 396s before retries. Result: near-continuous probe failure from the
-moment the binary answered — three kills in eight minutes against a four-hour
-healthy base rate on the previous build.
 
 ## The lock-set clause (v2)
 

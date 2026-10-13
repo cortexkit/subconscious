@@ -5,16 +5,7 @@ authoritative — `crates/subc-client-rs/src/consumer.rs` for Rust,
 `clients/subc-client/src/client.ts` for TypeScript. Where the two SDKs differ,
 this document says so rather than averaging them.)
 
-Audience: OWNERS OF HAND-ROLLED CLIENTS. Seven fleet modules speak the wire
-directly on `subc-protocol`/`subc-transport` (broca, engram, astrocyte,
-cerebellum, insula, claustrum — measured 2026-08-24 by lockfile census: these
-six carry no `subc-client-rs` in their committed Cargo.lock; aft has since
-adopted the SDK and left this list) and never execute the SDK code where these
-affordances live. The SDKs arrived at each behavior by decision; a hand-rolled
-client arrives at whatever its author reached for. The motivating failure
-shape: a client that retries a wrong module id without a bound and without
-ever printing the id it is dialing presents as an outage of the TARGET module,
-indefinitely, with the client's own health green throughout.
+Audience: authors of hand-rolled clients, whose direct wire implementations do not execute SDK recovery code.
 
 This is a list of CONCERNS, not constants. The constants are readable in the
 SDKs and are situational — a consumer may deliberately run a shorter call
@@ -45,8 +36,7 @@ permanent and fails immediately. Retries stop at a deadline — TS
 `ROUTE_OPEN_RETRY_DEADLINE_MS` = 90s inside managed `call()`, or the call's
 `timeoutMs` when that comes first; Rust's `route_retry_deadline` defaults to
 90s and is configurable per call, and the call's own `timeout` ends the retries
-when it comes first. 90s covers a whole module restart (drain, stop, boot; one
-was measured at 62.5s). Scope note: the retry loop
+when it comes first. Scope note: the retry loop
 lives in the MANAGED call path in both SDKs; TS `routeOpen()` called directly
 performs one RPC and does not retry.
 
@@ -59,16 +49,10 @@ On the naming half, the precise failure mode: THE DAEMON'S REJECTION PAYLOAD
 ALREADY NAMES THE MODULE ID. A client that WRAPS the daemon's message inherits
 the naming for free and is compliant; the failure mode is specifically a
 client that BUILDS ITS OWN TERMINAL MESSAGE and drops the payload. Testable
-by asking whether the daemon's own bytes survive to the caller. (One
-hand-rolled owner audited this item, wrote an id-injection fix, and the
-mutation test showed the fix redundant — the propagated payload already
-carried it. Wrap, don't substitute.) Rust's deadline expiry today reports
+by asking whether the daemon's own bytes survive to the caller. Rust's deadline expiry today reports
 `"retry deadline elapsed"` without re-stating the id at the outermost layer —
 if you substitute messages anywhere, re-attach the target.
 
-Note `module_warming` appears in `docs/ARCHITECTURE.md` as a distinct
-post-respawn state; as of this writing NO shipped code emits or matches it —
-do not build handling for it from the architecture doc alone.
 
 ## 2. unknown_channel means evict-and-reopen-once, not retry and not fail
 
@@ -161,10 +145,7 @@ daemon restart) hide the kind that is never expected. Keep them cumulative
 across reconnects, since a reconnect is exactly the event whose evidence
 you want afterwards. And PUBLISHING IS THE HALF THAT IS EASY TO SKIP: a
 counter no surface exposes is the same invisibility this item exists to
-fix, wearing a different coat (one implementation's dead-code lint
-rejected exactly this — the correct verdict for the wrong reason). The
-satisfiable-vacuously form is "counted"; the real requirement is counted
-AND readable from outside the process.
+fix; the requirement is counted AND readable from outside the process.
 
 Field-shape rule when surfacing the counters (in a health payload or
 anywhere): EMIT ZERO WHEN ZERO IS A STATE; OMIT WHEN ZERO IS A LIE. A COUNT
@@ -215,9 +196,7 @@ identity — is keyed by the canonical path, not the spelled one. Two traps:
   is precisely the step that follows the symlink, so a folder rename
   re-partitions every path-derived key even when the old path still resolves.
   The failure has NO signal: valid root, successful bind, empty history —
-  indistinguishable from a genuinely new session. (A census after one rename
-  found 65 sessions stranded across two stores, 41 of them unnoticed by their
-  own client.)
+   indistinguishable from a genuinely new session.
 - When computing any path-derived key, resolve the root the way the daemon
   will FIRST (realpath, then derive) — `/tmp` is a symlink on macOS, and a
   path that looks canonical to a human is not necessarily canonical to the

@@ -1,14 +1,11 @@
 # External events: the cross-module contract
 
-Date: 2026-08-10. Custodian: SUBC (contract seam custody, per
-#retina-external-events room fold [19]). Counterparties: PLEX (observation),
-ALF (delivery), MC (authoring + migration).
+Plexus owns observation, Prefrontal owns delivery, Magic Context owns
+condition authoring and migration, and subc supplies transport and supervision.
 
-This note records the seams BETWEEN modules. Each module's internals live in
-its own repo (plexus `docs/design/triggers.md`, prefrontal
-`.cortexkit/alfonso/plans/unified-waker-v1.md`). Where this note and a
-module's implementation disagree, this note is the contract and the
-implementation has a bug — or the room amends this note, in that order.
+This document defines the contract between those modules; their internal
+implementations remain in their owning repositories. An implementation that
+disagrees with this contract must be corrected or the contract explicitly revised.
 
 ## What of this runs, as of 2026-08-10
 
@@ -16,7 +13,7 @@ Precision reads as existence, so: the observation plane is DEPLOYED AND
 PROVEN END TO END (operator ceremony through live authenticated GitHub poll,
 two subscriptions, scheduler extracting real events after the MCP envelope
 fix). The delivery plane (unified waker, status line) is DESIGNED AND
-REVIEWED, build not started. The authoring plane (ctx_note compile-or-refuse)
+specified, build not started. The authoring plane (ctx_note compile-or-refuse)
 and the 76-condition migrator are COMMITTED OBLIGATIONS, not code. Move items
 up as they ship.
 
@@ -25,10 +22,10 @@ up as they ship.
     plexus     watches. Operator-minted subscriptions poll vendors on
                cadence into a durable event log. NO code path lets an
                event cause an action.
-    ALF        delivers. Consumes the log (list/ack), merges with its own
+    prefrontal delivers. Consumes the log (list/ack), merges with its own
                scheduled fires and advisory backlog into ONE idle digest
                and ONE mid-work status line. Owns per-agent seen-state.
-    MC         authors. ctx_note compiles prose conditions to provider
+    magic-context authors. ctx_note compiles prose conditions to provider
                configs at write time; keeps note-body custody (events
                reference notes, never copy them).
     subc       carries frames and supervises processes. No scheduler, no
@@ -83,13 +80,13 @@ up as they ship.
    stdin re-creates the secret-in-arguments primitive the wire guard
    exists to kill.
 
-7. CAPABILITY RESTRICTION IS ABOUT REACH, NOT DESIGN (PLEX's ruling, the
+7. CAPABILITY RESTRICTION IS ABOUT REACH, NOT DESIGN (the
    room's sharpest). A read-only, network-free, credential-free local-fs
    provider is still a credential-read oracle if it runs where key
    material is readable ("does file X contain string Z" against a binding
    key leaks one bit per query). Therefore:
    - the local-predicate provider ships as a script-tier executable
-     (MC's, the reference implementation of the provider contract), never
+     (Magic Context's reference implementation of the provider contract), never
      hosted inside plexus;
    - a provider must not be spawned by, or reachable from, the process
      holding the binding key — same-uid process separation alone buys
@@ -97,7 +94,7 @@ up as they ship.
      own storage, no vault access);
    - the path fence is FILE-GRANULAR with explicit carve-ins (plexus's
      catalog/ is legitimately readable and sits beside the binding key;
-     MC's live conditions read non-secret files under the same root), and
+     Magic Context's live conditions read non-secret files under the same root), and
      it fences the event store too — `store.db` holds every vendor
      payload ever observed, the largest exfil surface in the module;
    - the fence is advisory against a MALICIOUS provider while providers
@@ -106,7 +103,7 @@ up as they ship.
 
 8. RENDERING BELONGS TO THE DELIVERY LAYER. Plexus serves vendor payloads
    verbatim (mutation-guarded); what a GitHub issue "reads like" is
-   presentation policy in ALF's renderer, keyed on manifest action names.
+   presentation policy in Prefrontal's renderer, keyed on manifest action names.
    Digest lines carry counts and references, never bodies; note-backed
    events name the note id.
 
@@ -135,19 +132,7 @@ up as they ship.
   Unwrapping is transport-level protocol decode in plexus (7702590):
   structuredContent preferred, single parseable text block unwrapped,
   anything else served unchanged. Poll shapes address the BARE result.
-- GitHub v1 surface, every line measured (both MCP endpoints, readonly 27
-  tools and full 44): ISSUES work today, end to end, deduplicated. PRs and
-  releases accept NO timestamp bound (`list_releases` not even an ordering),
-  and the ordered-timestamp cursor requires one -- ordering is not bounding.
-  A poll shape declaring a `since` the vendor ignores would advance its
-  watermark, dedupe-suppress its own re-fetches, and read as a healthy
-  quiet feed while silently blind past page one: internally consistent, no
-  error, wrong, and it would pass the first live call too. Comment READS
-  and workflow-run tools DO NOT EXIST on either MCP endpoint (the only
-  comment tools are writes) -- those are REST-transport questions, never
-  MCP cursor questions. "Our endpoint omits it" and "the vendor does not
-  serve it" are different propositions; only the second closes a question,
-  so measure the full surface before concluding from the narrow one.
+- Cursor-based poll shapes require a verified timestamp-bound parameter; ordering alone is not a bound, and a vendor-ignored `since` must not be treated as cursor coverage.
 - Releases are solved by a SCALAR-DIFF strategy, a first-class SIBLING to
   the cursor model, not a bent instance of it: fixed args in, ONE value
   out, compare against stored, emit only on CHANGE, the watermark IS the
@@ -156,10 +141,6 @@ up as they ship.
   the cursors. The same shape serves the local-predicate provider's whole
   corpus class (mtime moved, file contains string, tag > vX) -- one
   strategy for the 60% local class and the release slice together. The
-  vendor schema alone would have commissioned an unbounded release pager;
-  the condition corpus showed no condition needs release enumeration at
-  all. The measurement says what is POSSIBLE, the corpus says what is
-  NEEDED, and designs are built where they intersect.
 - That pairing is the DESIGN GATE for every future provider surface: a new
   poll shape or strategy requires BOTH a measured vendor schema and a
   demand reading (condition corpus, usage records, or a named consumer).
@@ -189,64 +170,29 @@ up as they ship.
   no error anywhere. The general check for any keyed hand-off: WHO REFUSES
   A KEY NOBODY READS? If nobody, the misspelling is admitted somewhere and
   ignored somewhere else, and both layers pass their own tests. The
-  measurement that retired "operator care" as the answer: the designer of
-  the seed semantics, in the test written to protect them, seeded a key
-  the strategy ignores -- within the hour.
 - A poll shape is a claim about a vendor's REQUEST SCHEMA, and an
   unmeasured claim is unevaluated. Manifest ingestion validates shape
   against the model, not against the vendor; the `drift` check gains
   poll-parameter validation against the live inputSchema so a manifest
   cannot declare a parameter the vendor does not accept.
-- The GitHub credential is a static PAT: the vault cannot probe its
-  liveness and will report `active` past its 2027-08-11 expiry. The ONLY
-  health signal is consumers reporting auth failures with the SERVED
-  `record_version` — that reporting path is load-bearing observability,
-  not telemetry.
+- For credentials whose liveness cannot be probed by the vault, consumers report authentication failures with the served `record_version`; a stored `active` status alone is not a health signal.
 
 ## Reading the event log: the time dimension lies three ways
 
-Every reading below was internally consistent — fields set, zero failures,
-plausible counts — and wrong. All three occurred during this plane's first
-live day, two of them minutes after their authors wrote the rule they broke.
+Every event-log observation is dated against process start; observations from different moments are not one snapshot, and deduplication is demonstrated across two poll cycles, not within one.
 
-- STALE-AS-CURRENT: the first post-restart poll reading predated the
-  restart; a zero from the old binary read as the new binary failing. Date
-  any observation against PROCESS START, not against your own restart
-  command.
-- TWO-MOMENTS-AS-ONE: a log line and a health probe minutes apart read as
-  one simultaneous snapshot, manufacturing a state divergence that never
-  existed.
-- ONE-MOMENT-AS-TWO: a single poll cycle's 11-events-11-distinct read as
-  dedupe proof; dedupe is only observable across TWO cycles.
-
-The requirement is a check, not an exhortation — the rule was demonstrably
-broken by someone who had just written it: ANY CLAIM ABOUT A POLL-CYCLE
-PROPERTY NAMES THE `last_polled_at_ms` PAIR THAT BRACKETS IT. A property
-claim without its bracketing timestamps is unevaluated, the same way a rate
-without a distribution is unquoted.
+Any claim about a poll-cycle property names the bracketing `last_polled_at_ms` pair; a property claim without those timestamps is unevaluated.
 
 ## Why the operator chain is a standing requirement
 
-Four defects in one evening were invisible to green CI and visible within
-minutes of the real chain: an authority kind no entry point could mint, a
-manifest that could not be withdrawn, a pre-registered deploy relation that
-had never been verified, and an MCP envelope no fixture reproduced (the
-poller's own comment predicted the failure mode months early; the fixture
-supplied the bare shape the vendor never sends). A connector is not proven
-by its fixtures, and the first real call is a design activity, not a
-validation step. The empty-store operator chain (memory #9883) plus one
-live-vendor call per poll shape is the acceptance bar for anything that
-joins this plane.
+The acceptance bar for a connector joining this plane is the empty-store operator chain plus one live-vendor call per poll shape; fixtures alone do not prove the connector.
+
 
 ## Delivery half: scheduled wakes (folded 2026-08-15 from #scheduled-wakes)
 
-The delivery design this contract deferred is now specified. SINGLE SOURCE:
-`prefrontal/.cortexkit/alfonso/plans/scheduled-wake-v1.md` (ALF's repo; the
-room-fold section cites the seat posts). This section records only what
-binds ACROSS repos — the pins each seat co-signed — by citation, not
-paraphrase; on any divergence the plan doc governs.
+This section specifies the public cross-repository delivery contract for scheduled wakes.
 
-One WAKE concept: SOURCE (timer | PLEX event | condition script | idleness)
+One WAKE concept: SOURCE (timer | Plexus event | condition script | idleness)
 → POLICY (per-source store rows on prefrontal; scope ladder
 Global > Workspace > Project > Alfonso, MOST-SPECIFIC-WINS) → DELIVERY (one
 composer, existing wake-effect machinery over this contract's transport —
@@ -281,15 +227,15 @@ Cross-repo pins, verbatim from the room (seq cites in the plan doc's fold):
 Local-fs/git condition probes run in a STANDALONE KEYLESS MODULE (prefrontal
 repo; @cortexkit/retina-local-fs + QuickJS-WASM runner), supervised by subc
 with reserved attestation — never inside plexus (a file-reading probe beside
-the binding key is a credential oracle) and never as daemon shell. SUBC owns
-the module's carriage: subc.jsonc entry, spawn attestation, health contract
+the binding key is a credential oracle) and never as daemon shell. Daemon
+integration supplies its subc.jsonc entry, spawn attestation, and health contract
 per Health-Path-Rule v3.
 
-## Conformance fixtures (owed, SUBC)
+## Conformance fixtures
 
 Golden vectors for the events facade (subscribe refusals, list/ack shapes,
 gap rows, health fields), pinned at both ends per the cross-repo payload
-rule, landing once ALF's consumer code exists to pin against.
+rule, available once the Prefrontal consumer exists to pin against.
 
 ## Addendum: `deliver_to` delivery routing (shipped 2026-08-25, written from producer-real shapes)
 
@@ -306,7 +252,7 @@ paraphrase):
 - `deliver_to` (optional, registry agent **id**, e.g. `agent_2bfd6927602f7977`):
   resolved from agent name at SET time and frozen as the id — names drift,
   ids do not. Validation outcomes at set time are three-way: mistyped
-  (`deliver_to_agent_unknown`), retired (`deliver_to_agent_retired` — ALF's
+  (`deliver_to_agent_unknown`), retired (`deliver_to_agent_retired` — Prefrontal's
   registry serves retired ids as a positive "gone", distinct from unknown),
   and resolver fault (typed, retryable, never fail-open).
 - Precedence: **`deliver_to` wins for delivery routing when present;

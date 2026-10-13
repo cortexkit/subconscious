@@ -224,6 +224,10 @@ jobs:
           tar -xzf "$tgz" -C "$RUNNER_TEMP"
           echo "$RUNNER_TEMP/nats-server-$v-linux-amd64" >> "$GITHUB_PATH"
 
+      - name: Check CortexKit layout
+        if: ${{ matrix.os == 'ubuntu' }}
+        run: bash scripts/check-cortexkit-layout.sh
+
       - name: Format check
         run: cargo fmt --all -- --check
 

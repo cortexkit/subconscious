@@ -1,55 +1,14 @@
 # Fleet logging — one crate, one format, module-owned files
 
-Status: normative, **r2**. Approved by the operator 2026-09-19 after the fleet
-log census (`docs/audits/fleet-log-census-2026-09-19.md`) found two of nineteen
-producers on the r1 format two weeks after r1 was approved. r2 supersedes r1 on
-the line format, the file layout, rotation, and the tag mechanism; it keeps
-r1's crate architecture, levels, `CK_LOG` knob, redaction, session semantics,
-and adoption rules for the two live-user modules.
+This is revision **r2** of the logging contract: it replaces the previous revision's positional module ID, separate tag field, per-harness filenames and rename-based rotation with the line format and dated segments below. Crate APIs, levels, `CK_LOG`, redaction and session semantics remain; readers support both revisions during migration.
 
-What changed and why, in one paragraph: r1 had a `tag=` field orthogonal to
-level, a positional module id, per-harness files for plugins, and rename-based
-rotation. The census showed a fleet with six line formats, and the design
-conversation that followed found that every mainstream logging framework
-solves "errors only, but also perf metrics" the same way — a **hierarchical
-logger name with per-logger levels**, never a separate tag dimension. r2 adopts
-that, which also settles where the module id lives (it is the root of the
-logger name), and moves rotation from rename to **date-stamped segments**,
-which removes the multi-writer race that per-harness files existed to avoid,
-so plugins and the module can share one file.
+## Shared SDKs
 
-## Why one crate
+Modules and plugin lanes must emit through the shared SDK, not just depend on its package. If the daemon's stderr capture contains a line the currently running binary can produce, that module is still bypassing its own logger and the adoption check reports a defect; old captured history alone is not a defect (see “File layout”).
 
-The census found two modules with a logging framework and twelve with bare
-`eprintln!`: three tags carried a dead or mixed name (`[ck-quota]` ×27 after the
-rename; `thalamus:` ×4 vs `thalamus ` ×11; `[alfonso-core]` ×13 beside
-`[prefrontal-core]`), two owners called their own prefix unstable, one tagged
-by Rust crate path, and the exact tags collided with the same string used as a
-repository path by other modules. Twelve of fourteen have no level control.
-Two plugin lanes log to `$TMPDIR`, one of them uncapped. Consistency across
-fourteen implementations does not happen by asking; it happens when the file,
-format, rotation, retention, levels, logger names, session field and redaction
-all come from one place a module initialises with its module id and nothing
-else — the same lesson the data-path resolver taught.
+Rust uses `cortexkit-log` from commons; TypeScript harness-hosted plugins use `@cortexkit/log` in `clients/log`.
 
-The 2026-09-19 census measured the cost of the gap directly: eleven seats
-**linked** the crate and one **routed** through it. Linking is a Cargo edit;
-routing is the per-seat change nobody is blocked on, and the daemon's stderr
-capture (a well-behaved fallback with rotation and a renderer) removed the
-visible cost of not doing it. Adoption is therefore **mandatory** under r2, and
-the capture lane's non-emptiness becomes a reported finding rather than a
-sentence in a spec.
-
-- Rust: `cortexkit-log` in `commons/crates/cortexkit-log` (landed at commons
-  `01da197`; publish to crates.io follows the first fleet adopter; path-dep
-  consumers get the usual lock-wave notice).
-- TypeScript: `@cortexkit/log` in `subconscious/clients/log` (beside
-  `@cortexkit/store`), for harness-hosted plugins; landed at `a4575374`.
-- Both are conformance-tested against one golden fixture set that lives in
-  `subconscious/crates/subc-core/tests/fixtures/log_format_golden.json` and is
-  vendored into commons (authority side owns the fixture; same rule as the
-  store-path golden). **The r2 fixture is a breaking rewrite of the r1 one**;
-  both twins re-pin in the same change.
+Rust and TypeScript implementations test against `crates/subc-core/tests/fixtures/log_format_golden.json`, the authority fixture copied into the `cortexkit/commons` repository. Because r2 changes the expected r1 bytes, both implementations update their vendored fixture and parser/formatter expectations together.
 
 ## Line format
 
@@ -71,7 +30,7 @@ sentence in a spec.
 Field by field, each with the reason it is where it is:
 
 - **`<timestamp>`** — RFC3339, UTC, millisecond precision, `Z` suffix. Fixed
-  width, lexically monotonic (MC's dashboard sorts on it). Never local time.
+  width, lexically monotonic (Magic Context's dashboard sorts on it). Never local time.
 - **`<LEVEL>`** — one of `TRACE DEBUG INFO WARN ERROR`, padded to five. Fixed
   column so the eye can run down it.
 - **`<logger>:`** — the **hierarchical logger name**, dotted, rooted at the
@@ -104,10 +63,7 @@ Field by field, each with the reason it is where it is:
 message and inside every value, so a record can never span two lines. This is
 not a formatting preference: `tail`, `grep`, a merge-by-time and every doctor
 read the file **per line**, and a record that is correct and complete across
-two lines is two lines to all of them. BROCA measured it in their own capture
-the day r2 was approved — a prefix rule satisfied per record left 8 of 29 lines
-unattributable, and the fleet census read the continuation as a producer with
-no id. Multi-line payloads (backtraces) are emitted as one line per source
+two lines is two lines to all of them. Multi-line payloads (backtraces) are emitted as one line per source
 line, each carrying the full prefix and a `logger` of `<module>.panic`; the
 crate installs a panic hook that does this so a module's last words land in
 its own file, not only the daemon's ring.
@@ -143,8 +99,7 @@ accepted for the reason above: the text line is the human lane.
 
 ### Bound fields
 
-Two scopes, both required by the operator's ask (session ids for AFT and MC,
-agent ids for prefrontal):
+Two field-binding scopes are required below: session identity for tool/compaction modules such as AFT and Magic Context, and agent identity for Prefrontal.
 
 - **Process-level** — bound once at `init` and present on every line the
   process writes. For a plugin, `harness=<pi|opencode|omp|claude-code|…>` is
@@ -169,7 +124,7 @@ the logger hierarchy, which is how every framework does it:
 
 ```
 CK_LOG=error                                errors only, fleet-wide
-CK_LOG=error,magic-context.perf=info        errors, plus MC's perf lines
+CK_LOG=error,magic-context.perf=info        errors, plus Magic Context's perf lines
 CK_LOG=warn,aft=debug                       everything aft, warnings elsewhere
 CK_LOG=info,engram.gc=trace                 one component at trace
 ```
@@ -184,7 +139,7 @@ level control; it forgoes only sub-component granularity.
 **Manifest declaration of logger names is NOT REQUIRED and cannot be expressed
 today.** `ModuleManifest` carries no logger field and `subc-protocol` has no
 builder method for one, so this paragraph previously stated a requirement no
-adopter could satisfy (ASTRO, 2026-09-19, reading the spec and the protocol
+adopter could satisfy (the specification and the protocol
 source together rather than either alone). A normative line nobody can meet has
 one end state: each adopter works out privately that it is optional and skips
 it, until the spec says one thing and twenty repos do another and the next
@@ -221,7 +176,7 @@ undeclared name), which is one of the three doors the operator confirmed.
   `<module>.<harness>.log` because a plugin runs inside the harness process and
   cannot share a file handle across a rename-based rotation. r2 has no rename
   (below), so the plugins and the module all append to today's segment and
-  `harness=` on every plugin line is what tells them apart. A user debugging MC
+  `harness=` on every plugin line is what tells them apart. A user debugging Magic Context
   reads **one timeline**, not four files to reconstruct one.
 - **Date-stamped, never renamed.** Every writer computes today's segment name
   from the UTC clock and opens it `O_APPEND | O_CREAT`, one `write(2)` per
@@ -254,13 +209,11 @@ undeclared name), which is one of the three doors the operator confirmed.
   NOT "non-empty" — that check flags every adopted module forever, because
   NOTHING TRUNCATES THESE FILES: the pre-adoption history stays on disk and the
   file keeps its last-minutes-before-the-bounce growth across the placement
-  itself. PLEX measured exactly that (2026-09-19): their capture GREW 28,243 ->
-  28,478 across adoption and contained zero lines the new build was capable of
-  producing. A FILE THAT GREW IS NOT A FILE BEING WRITTEN.
+  itself; growth across placement does not alone prove that the new binary is writing the capture.
 
   The discriminating question is what SHAPE the lines are. After r2 the cheap
   form is "capture contains an r2-shaped line" (timestamp, level, `module[.component]:`),
-  which reads 0 for an adopted module whose history is r1. Where a seat retired
+  which reads 0 for an adopted module whose history is r1. Where a module retired
   a hand-rolled prefix, the absence of that literal from the new image makes the
   old lines structurally unproducible, which is a stronger discriminator still —
   and a grep for the retired literal is the control that proves the search works
@@ -279,16 +232,14 @@ engram backup descriptor names its store FILE (`whole-db`, `path: "store.db"`)
 already captures nothing under `logs/`, by construction rather than by
 exclusion: naming one file cannot sweep its parent. A DIRECTORY-shaped
 descriptor would capture segments, so a module writing one must exclude
-`logs/` explicitly. Stated here because the seat writing a descriptor in six
-months will not have read the thread this came from (THALAMUS, ASTRO, ENGRAM,
-2026-09-19).
+  `logs/` explicitly.
 
 **Wherever two components must agree on a path, one resolves it and the other
 is told.** A module's segment directory derives from the data directory the
 daemon hands it at HELLO (or the state directory a rig points it at), never
 from a second resolution of the same environment: a re-derived path reads as
 equivalent and is the mechanism behind every isolated instance that appended
-to the operator's segment this week. ENGRAM's descriptor path holds the same
+to the operator's current segment. Engram's descriptor path holds the same
 invariant from the other end.
 
 - **Policy is per-module** because volumes differ by orders of magnitude
@@ -302,7 +253,7 @@ invariant from the other end.
                                                     "alarm_segment_mb": 256 } } }
   ```
   Defaults when the key is absent: `info`, no per-logger overrides, 14 days,
-  256 MiB. Standalone MC/AFT read the same keys from
+  256 MiB. Standalone Magic Context/AFT read the same keys from
   `.cortexkit/<module>.jsonc log.*`; env wins, as for every other knob.
 - **Execution is by the writer, at process start and at each day roll.** With
   date-stamped names, pruning is a **string comparison on the filename** — no
@@ -316,8 +267,7 @@ invariant from the other end.
   cross it for a job the writer does correctly. The one case the writer cannot
   cover — a retired module that never starts again — is an **operator verb**
   (`ck logs prune`, later), where the operator owns everything and no boundary
-  is crossed. Measured 2026-09-19, orphaned log directories on this host are
-  negligible.
+  is crossed.
 - `max_age_days` bounds the set independently of rate; the segment alarm
   bounds the rate's visibility. Rate-driven loggers (upload progress, walk
   slices) ship at `debug` or below in the module's own baseline; a module must
@@ -345,7 +295,7 @@ write. The fleet default redacts, and both twins pin it with the fixture's
   after a value written inside parentheses or brackets, as in reqwest's
   `for url (…)`.
 
-A module composes its own on top (MC's sanitizer; claustrum's hand-written redacting
+A module composes its own on top (Magic Context's sanitizer; claustrum's hand-written redacting
 `Debug` impls remain the first line of defence). A module MUST NOT log prompt
 text, message bodies, or credential payloads at any level; the redactor is the
 backstop, not the policy.
@@ -369,12 +319,7 @@ backstop, not the policy.
 Attribution is satisfied per-record and the log is read per-line. Any format
 where those two can diverge — a continuation line carrying part of a record
 without its timestamp, level, or module — produces a census that is right about
-lines and wrong about producers. Measured on 2026-09-19: a `tail -1` sample of
-the shared stderr capture landed on a continuation line and recorded a module as
-emitting no identifier at all, when every one of its records carried one. Under
-r2 the logger writes module and component on each line by construction, so a
-record that wraps still carries them; the property is structural rather than
-maintained.
+lines and wrong about producers. Under r2 the logger writes module and component on each line by construction, so a record that wraps still carries them; the property is structural rather than maintained.
 
 The cheap test for any log format: ask what a continuation line carries, not
 what the record carries. A format where a record can span more than one line
@@ -385,21 +330,10 @@ builds the first, so the second is the only real option.
 
 ### Readers, not just producers
 
-**Any change to this format carries a READERS line beside its producer roster,
-or it is not ready to post.** The r2 adoption call ([#520]) named producers and
-no readers, because an adoption call names who must ACT — and the consumers of a
-format do nothing until the day they break, which makes them invisible in
-exactly the notice that would have warned them (MC's framing, 2026-09-19, after
-their drift detector caught a re-vendor that would have shipped a broken
-parser).
+Any format change names its readers alongside its producers.
 
-Known readers of this format, to be named in any future change:
+Known reader classes include CLI doctors, desktop dashboards, `ck module logs`, and tools tailing or matching `<module>.<date>.log`.
 
-- `aft` — CLI doctor, extracts errors into GitHub issues
-- `magic-context` — CLI doctor (`packages/cli/src/lib/log-lines.ts`) AND the
-  desktop dashboard's Rust twin
-- `ck module logs` — reads r1 and r2 both, deliberately
-- anyone grepping, tailing or regexing `<module>.<date>.log`
 
 **r1 and r2 lines coexist on disk in the same directory for the whole adoption
 window, so a reader needs both arms rather than a cutover.** The cheapest
@@ -408,11 +342,7 @@ discriminator is the colon: r2 renders `fusiform: poll changed`, r1 renders
 MIXED file, since a per-grammar test passes while one arm quietly consumes the
 other grammar's lines.
 
-**Mandatory, fleet-wide.** Every module and every plugin lane, as each seat has
-time; a seat that cannot adopt names the blocker on the record. The census
-question posted 2026-09-19 ([#512] in `#fleet-notices`) collects each seat's
-reason before the wave, so a crate gap is fixed in commons rather than
-discovered ten times.
+Logging adoption is mandatory for every module and plugin lane; a consumer unable to adopt records its blocker.
 
 - **Live-user modules (aft, magic-context) move only with their doctors.**
   Both have CLI doctors that parse today's paths and formats to extract errors
@@ -422,35 +352,14 @@ discovered ten times.
   read-only compatibility inputs, never written again after the cut. Nothing
   else in the fleet waits on them.
 
-  Measured doctor contracts (2026-09-05), which the r2 format satisfies without
-  special cases: both doctors are line-regex over free text, keyed on message
-  words (`failed:`, `Error:`, `EMERGENCY`, `exception`, `crashed:`,
-  `panicked at`, `timed out after <n>ms`) that the module's message text keeps;
-  neither parses timestamp, level, or fields. Session filters widen to accept
-  `session=<issuer>:<id>` inside the bracket beside the bracketed form for one
-  release, with the raw `ses_…` / uuid preserved as the id. AFT's telemetry
-  parsers anchor on the message (`index_event kind=… root=…`, `perf tick:`,
-  `slow tool_call …`) and require the `key=value` tail unquoted — satisfied
-  because AFT sanitises those values (no spaces, no `=`) and the format quotes
-  only values that contain a space, `"` or newline. MC's dashboard sorts
-  lexically on the timestamp capture; RFC3339 with `Z` and fixed millisecond
-  width is lexically monotonic. Owners re-key error extraction on `<LEVEL>`
-  once levels exist (their migration, not a format requirement).
 
   Consumers pin their parsers against the authority fixture rather than
   against sample lines.
-- **A module whose diagnostics are not on stderr** (thalamus: durable
-  failure-state JSON plus a per-turn decision log keyed by `exchange_id`) still
-  adopts for the lines it does emit, and says so in its census row. The crate
-  does not replace a structured instrument; it replaces `eprintln!`.
+- Modules with structured diagnostics still adopt the shared SDK for emitted lines; the crate replaces free-form stderr printing, not structured instruments.
 - `logs/` under a module data dir is never captured by engram, as an
   engram-wide rule independent of descriptors (rotation churn would otherwise
   be a fresh upload every capture); the status surface says it was excluded.
-- Every other module: replace `eprintln!` with the crate; the census items
-  each owner took (broca session ids on every line, insula heartbeat only on
-  change, thalamus/astrocyte/synapse prefixes, synapse worker rings forwarded,
-  callosum crate-path targets, prefrontal's uncapped plugin log) are done in
-  that same change because the crate makes them the default shape.
+- Other modules replace `eprintln!` with the shared SDK's logger, retention, and session defaults.
 - The daemon: `subc.log` becomes `subc.<date>.log` through the same crate;
   `CK_LOG`, `loggers`, `max_age_days` and `alarm_segment_mb` injected at spawn
   from `subc.jsonc`; the `module_id` prefix leaves the daemon's own lines and
@@ -458,11 +367,7 @@ discovered ten times.
 
 ### Ergonomics, because they decide adoption
 
-Today `eprintln!` needs nothing and the crate needs a `Config`, an `init`, and a
-kept `Handle`. That gradient is backwards and it is most of why ten seats linked
-without routing. r2 requires the crate to offer a **zero-argument path** for a
-supervised module: the daemon already injects `CK_LOG` at spawn and already
-injects `SUBC_MODULE_ID` (`supervise.rs:3936`, for launch attestation), so
+The crate offers a zero-argument path for a supervised module:
 `cortexkit_log::init_from_env()` resolves module id, data dir, level and
 retention with no arguments. Nothing new is injected for this; the crate reads
 what is already there. The retention and per-logger keys ride in `CK_LOG`'s
@@ -470,19 +375,6 @@ siblings (`CK_LOG_MAX_AGE_DAYS`, `CK_LOG_ALARM_SEGMENT_MB`), which the daemon
 derives from the `log` block — r1 named the `Retention` struct but no env
 contract, which is what stopped the daemon injecting it. A plugin, which has no daemon, passes its module
 id and harness and nothing else.
-
-## `ck logs` — deferred
-
-Built once the fleet is on one format, not before; a renderer over six formats
-is a renderer with six special cases. Shape when it comes:
-
-```text
-ck logs [<id>] [-n <lines>] [-f] [--since <dur>] [--logger <name>] [--level <l>] [--lane module|<harness>|stderr|daemon] [--json]
-```
-
-Globs `<module>.*.log` and merges by timestamp; `-f` notices a new segment at
-midnight; `--lane` filters on `harness=` rather than on file. The r1 `ck module
-logs` verb keeps working over the capture and daemon files until then.
 
 ## Out of scope
 

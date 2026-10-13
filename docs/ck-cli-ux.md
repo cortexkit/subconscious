@@ -1,10 +1,6 @@
 # `ck` operator CLI — UX treatment
 
-Status: S1–S3 landed and driven on the macOS alpha VM; the after transcript is `docs/evidence/ck-cli-walk-2026-09-04-after.txt`. Normative for the alpha CLI. Written from a full walk of every verb on a
-fresh macOS alpha VM (released 0.17.5, all five modules installed) on
-2026-09-04, after the operator reported the mechanical voice and the
-module-binaries-as-domains defect. The captured "before" outputs live in the
-walk transcript referenced by the commits that implement this note.
+Normative for the `ck` operator CLI's alpha interface.
 
 ## Who reads `ck`
 
@@ -158,7 +154,7 @@ the 36-provider list stays under `--verbose`.
 
 `ck routes` with none: `no live routes` (no footer).
 
-Help text rewrites (jargon out): `ck setup --help` "without calling an installation mutator" → "without changing anything"; `ck upgrade --help` "MC is wiring-only in alpha" → drop; `ck module release <id>` "retire a removed module's retained reserved-id gate" → "forget a removed module's reserved id so another module may use it".
+Help text rewrites (jargon out): `ck setup --help` "without calling an installation mutator" → "without changing anything"; `ck upgrade --help` remove legacy optional-component wording; `ck module release <id>` "retire a removed module's retained reserved-id gate" → "forget a removed module's reserved id so another module may use it".
 
 Errors: `ck module status nosuch` → `no module named 'nosuch'. Run ck module list.` (one line, exit 1). `ck health nosuch` → same. `ck nosuchverb` → `unknown command 'nosuchverb'. Run ck --help.` (no usage dump).
 

@@ -3,38 +3,6 @@
 **Status:** draft for the push-notifications channel. Normative sections are marked
 MUST/MUST NOT. Golden vectors are the authority where prose and vectors disagree.
 
-## What of this runs, as of 2026-08-10
-
-This section exists because the rest of the document is precise enough to
-implement against, and precision reads as existence. A reader has no other signal
-separating what runs from what was written.
-
-Built and executed:
-
-- The sealing primitive, `commons/crates/cortexkit-push-seal`: `seal`, `open`,
-  the ciphersuite pinning, the envelope layout, and the size cap. Ten tests.
-- Hand tools over it: `handseal`, `handopen`, `kp` as crate examples. The
-  handseal/handopen round trip is the only end-to-end exercise outside the
-  crate's own tests.
-- The Swift conformance harness for the vector corpus, at
-  `clients/subc-client-swift/Tests/SubcFedTests/Fixtures/PushSealedPayloadConformanceTests.swift`.
-
-Not built anywhere:
-
-- **The sealer described below as "Rust, in `prefrontal`, in-process".** No call
-  site exists in that repository; verified by search with a control proving the
-  search can return matches there. Sealing is done by hand, by an operator
-  running the example binary.
-- The notification submit endpoint that would carry a sealed blob.
-- The vector corpus itself. The harness that would consume it is written, and
-  skips when the corpus is absent.
-- Any possession proof binding a registered public key to the device holding its
-  private half.
-
-Move items out of the second list as they ship rather than deleting this section.
-A standing disclaimer decays into furniture; a list someone has to edit has a
-maintainer.
-
 ## What this is
 
 A sealed blob carried inside an APNs notification, so a question can appear on a
@@ -53,9 +21,7 @@ established by vectors both sides run, never by review.
 
 **Sealing executes where the plaintext already is.** The question text is minted
 in `prefrontal`. Sealing anywhere else requires moving plaintext toward the key,
-which widens the set of components that can read it; moving a *public* key toward
-the plaintext costs nothing. This was contested and settled on that argument
-after a lifecycle objection was withdrawn — see "Sender key material" below.
+which widens the set of readers, while moving a public key to the plaintext does not; sealing therefore remains where the plaintext originates.
 
 `callosum` supplies the recipient's public key and carries the sealed bytes as
 opaque data. It does not seal and cannot open.
@@ -74,8 +40,7 @@ Two consequences that are load-bearing elsewhere in this design:
 - **The blob is authenticated but not attributable.** Base mode proves the
   payload was not tampered with; it does not prove who wrote it. The recipient's
   public key is not secret, so anyone holding it can produce a blob the phone
-  opens successfully. This is accepted for v1 and bounded by the deep-link rule
-  below, not by cryptography.
+   opens successfully; v1 attribution is bounded by the deep-link rule below, not by cryptography.
 
 ## Ciphersuite, info, and associated data
 
@@ -303,13 +268,6 @@ does not read it cannot know.
 
 ## The APNs realisation
 
-**This section exists because the join between three seats' deliverables was
-written down by nobody.** The sealer emits raw bytes, the submit path takes hex,
-this document said "base64 for the APNs payload field" and named no field, and the
-endpoint spec on the other side said nothing about the APNs JSON at all -- by
-design, since the payload is opaque to it. Each seat's own half was correct and
-complete. **A boundary owned by nobody has no author to notice it is missing.**
-
 The realisation is normative and lives here:
 
 ```json
@@ -339,13 +297,6 @@ payload rendering that quotes values erases the difference, including a dry-run
 line read at 2am. So assert on the PARSED value (`parsed["aps"]["mutable-content"]
 == 1`), never on the text.
 
-This repository has already been bitten by the same family in the other direction:
-a Swift JSON encoder checked `as? Bool` before the number branch, and because
-Foundation bridges `NSNumber(0)`/`NSNumber(1)` to `Bool`, **every numeric 0 and 1
-went onto the wire as `false`/`true`** until it was fixed. **A JSON scalar whose
-type is chosen by a language's coercion rules rather than by the writer is a
-boundary defect waiting for a reader**, and 0 and 1 are where it lands.
-
 **`mutable-content: 1` is the one to check before the first send.** It is a
 SENDER-side key, so it correctly appears nowhere in the client, which is precisely
 why it had no owner. Without it the notification arrives, looks almost right, and
@@ -371,13 +322,6 @@ result rather than remembered**, because they are read at the worst possible tim
 **Only the tap-opens-to-the-ask case is unambiguous. Every other row is an
 enumeration, and that form is deliberate.**
 
-Three independent versions of the ambiguous-tap row were written in one hour and
-TWO WERE WRONG, in OPPOSITE directions, each by someone who had just correctly
-diagnosed the class. The first said the symptom meant the blob never opened --
-naming one cause, which sends the investigation at the seal. The second said it
-does NOT mean the decrypt failed -- excluding a cause that is genuinely on the
-list, which sends the investigation away from a real one.
-
 **A negative claim about causation is still a claim about causation**, and it is
 the more dangerous form because it wears the costume of a correction. On a symptom
 with several causes the only safe shape is to enumerate them and say the
@@ -391,7 +335,7 @@ decrypt at the only place an operator can observe either. **A diagnostic that
 attributes a multi-cause symptom to one cause sends the investigation at the piece
 with the most tests**, which is the piece least likely to be wrong.
 
-**Hand the blob across seat boundaries in ONE encoding.** Hex from the sealer, with
+**Pass the blob between producer and submitter in ONE encoding.** Hex from the sealer, with
 base64 applied once by the submit path. A blob re-encoded at each hop is a
 transcription error waiting for a reader.
 
@@ -445,38 +389,9 @@ integrity. Rendering attacker-chosen text on a lock screen is the same threshold
 as the reply button named above, reached one step earlier. Authenticated mode
 first, question text second, never the reverse.
 
-## The APNs environment is measured, not assumed
+## APNs environment diagnostics
 
-**The provider key is PRODUCTION-configured, established by measurement rather
-than by the portal screen or anyone's recollection.** Recorded here because it was
-the link every seat named as the first suspect for a vanished notification, and
-because the measurement is cheap to repeat and needs no real device token:
-
-    api.push.apple.com          400  BadDeviceToken             <- key ACCEPTED, device rejected
-    api.sandbox.push.apple.com  403  BadEnvironmentKeyInToken   <- key refused BY NAME
-    control: prod host, corrupted bearer
-                                403  InvalidProviderToken       <- the prod answer depended on the key
-
-The order is what carries it. Production authenticated the key and got as far as
-the device lookup; sandbox refused the key itself naming the environment; and the
-control proves production's answer was about the key rather than what that host
-tells everyone. The environment check precedes the device lookup, so **a fake
-device token is sufficient for this experiment**.
-
-**A CORRECTION WORTH KEEPING, because four seats repeated the wrong version
-within an hour:** the belief in circulation was that a mismatched environment key
-is *accepted at submit and silently dropped*. It is not. APNs refuses it loudly
-with a reason string that names the problem. The error was reasoning from a true
-general property (a token minted for one environment is rejected by the other) to
-an invented specific failure mode, without checking whether the boundary reports
-it. **It spread quickly because it matched the pattern the reviewers were already
-hunting** — a claim that fits the room's current theory is the one that gets least
-scrutiny.
-
-Consequence: if a submitted notification is accepted and never arrives, the
-environment is the LAST suspect rather than the first. The honest candidates are
-the device token, the seal/open agreement, the extension's keychain access, and
-the topic.
+A mismatched environment key is refused with an APNs reason string, not silently accepted and dropped; when APNs accepts a notification but it does not appear on the device, check the device token, seal/open agreement, extension keychain access, and topic.
 
 ## Vectors
 
@@ -674,12 +589,7 @@ loudly and say so.
 - Delivery endpoint, collapse keys, alerting-vs-silent — `callosum`.
 - Reconciliation of the lock screen against live state — the app.
 
-**Whether the opener can read its own key is out of scope here, and it is the
-failure this feature has already hit twice.** A blob can be byte-perfect and
-unopenable, because the private half was written to a keychain group the
-extension cannot reach. That is not a property of the bytes, so no vector can
-reach it: it is a property of the two-process arrangement and MUST be proven on a
-device, reading from the extension's identity rather than the app's.
+The Swift notification extension opens the sealed payload and must be able to read the device's private key from its own keychain identity. Prove that access on a real device, not only from the app process: byte-vector tests cannot exercise the app/extension access boundary.
 
 It matters here because a green vector suite reads as "sealing works" when all it
 establishes is that the bytes are right — and this failure renders as the same
@@ -710,14 +620,6 @@ NOT YET PERFORMED IT.** Binding the sealing key into the enrollment transcript i
 correct and this document keeps that rule. What it originally failed to say is
 what becomes of a device that enrolled BEFORE the field existed.
 
-Measured on a live device rather than reasoned about: the key is generated inside
-the enrollment call, enrollment runs only from the pairing screen, and the pairing
-screen is shown only when the device is unpaired. **An already-paired device
-therefore cannot reach the generation site at all.** Following this specification
-exactly produces a device that can receive notifications and has no key to receive
-them with -- permanently, with no error anywhere. Not a refusal: an ABSENCE. An
-empty registry column, no exception, no log line, on a path whose visible outcome
-is already silence.
 
 **So: any field bound into a one-time ceremony MUST ship with its re-entry path in
 the same change, and this document MUST name the already-completed population
@@ -744,35 +646,7 @@ is a STOP rather than a retry.** Re-running the ceremony will fail the same way 
 report success again. When the read-back is empty, the fault is in key generation
 on the device -- not in the server, and not in the seal.
 
-This is the already-enrolled defect above reached by a different road: same
-terminal state (an empty registry column, no error, no log line), different cause,
-and the reachability fix does not close it.
-
-**THE SERVER HOLDS A SECOND COPY OF EVERY DEVICE-HELD VALUE, AND THE ONLY MOMENT
-BOTH COPIES EXIST IN ONE PROCESS IS REGISTRATION.** The sealing key and the push
-token are each held by the device and stored server-side, and both diverge the
-same silent way: enrollment succeeded weeks ago, notifications never arrive for
-that device, and every component reports healthy.
-
-**They are stored in TWO tables with two writers and two refresh rates, and the
-difference decides everything below.** "The registry" reads as one thing; the
-divergence risk lives entirely in the fact that it is two:
-
-| value | written | refreshed | stale copy |
-| --- | --- | --- | --- |
-| push token | route table | EVERY launch and foreground, unconditionally | **self-heals** on next launch |
-| sealing key | device row | ONCE, during the enrollment ceremony | **permanent** |
-
-**A stale sealing key never repairs itself, and it can go stale with nothing
-failing** -- a keychain wipe, an app reinstall, any path where the device
-regenerates its keypair without re-enrolling. The server then holds a key the
-device no longer has, forever, and sealing to it produces a notification that
-arrives and never opens: the ambiguous row of the table above, permanently, with
-no error at any layer.
-
-That is the one-time-ceremony rule one step later. **A value bound to a ceremony
-that runs once cannot be refreshed by any routine path, so its divergence is
-permanent by construction.**
+Routine device registration compares the device-held sealing-key fingerprint against its stored copy; the push token refreshes on each launch and foreground, while the sealing key is ceremony-bound and cannot self-heal by token refresh.
 
 **THEREFORE THE FREQUENT PATH MUST CARRY A FINGERPRINT OF THE RARE ONE.** Device
 registration already runs every launch and is already device-authenticated;
@@ -798,28 +672,6 @@ inherits the transcript binding; a second endpoint writing the same registry
 column would be a second door into it, and only one of the two would be covered by
 the reasoning above.
 
-**THE FIELD SET HAS THREE INDEPENDENT PRODUCERS, AND THE THIRD IS THE ONE THAT
-GETS MISSED.** The enrollment proof context is built separately by the rendezvous
-server's verifier, by the Swift client, and by the Rust client the Mac daemon
-uses to enroll itself. Two of those are obvious from the phone-facing design; the
-third only appears if someone enumerates producers rather than counting sides.
-Adding a field to two of the three produces a context mismatch and refuses EVERY
-enrollment from the missing one.
+The server verifier, Swift enrollment client and Rust enrollment client all construct the same proof context. They sort object keys canonically and hash key names as well as values, so a field-name mismatch produces different proof bytes and enrollment refusal rather than registering a key outside the proof.
 
-**A fourth is structurally impossible and it is worth recording why**, so nobody
-re-derives it: `SubcFed` owns the proof CONSTRUCTION (`FedDualPoP`) and takes the
-context as a caller-supplied `[String: String]`. It canonicalizes and signs
-whatever it is handed, enumerating no fields, so it cannot hold an opinion about
-the field set to disagree with.
-
-Both canonicalizers sort object keys byte-lexicographically and serialize the KEY
-NAMES into the hashed bytes, verified at source on each side. Two consequences,
-both load-bearing: the new field has no POSITION to negotiate, and a name
-mismatch changes the hash on both sides, so it **fails at the first enrollment
-rather than silently leaving the key unbound**.
-
-**The safe landing order follows from the server building its context from the
-STORED challenge record rather than from the completion request:** a field the
-server does not yet store is simply absent from its context. So accept-and-store
-can land first with no window; the BINDING is the lockstep moment, and it must be
-simultaneous across all three producers.
+The server may first accept and store the new sealing-key field without binding it into proofs. When proof construction starts including that field, update the server verifier and both enrollment clients together, because the server constructs its signed context from the stored challenge, not from completion parameters.

@@ -1,10 +1,6 @@
-# MC Module Wiring Contract — own-harness leg (v2)
+# Magic Context Module Wiring Contract — own-harness leg (v2)
 
-Status: **FROZEN (v3)** — Oracle pass 1 (bg_f359db24, NO-GO, 7 blockers) and
-MC's reverse pass (pm_726cf238, ACCEPT + 6 findings) folded; the §3.2 mid
-decision landed (LLMRUNNER: option (a), logical-coordinate basis, pm_5ac053cf;
-MC endorsed (a) independently). Owner: subc. Consumers: MC (transform side),
-LLMRUNNER (producer side).
+The wire fields, message identity rules, codec boundary and producer obligations below are fixed for the owned-harness integration: the `llm-runner` module drives the model loop and calls the transform, unlike a plugin attached to a third-party host. §7 defines the version.
 
 Scope: the OWN-HARNESS leg (llm-runner as producer). MITM and plugin legs later;
 leg-dependent decisions pin the own-harness resolution and mark the MITM slot.
@@ -19,7 +15,7 @@ magic-context/docs/specs/codec.md (#2), docs/specs/mc-plugin-subc-connection.md
 ## 1. The pipeline
 
 ```
-llm-runner (producer)                    MC module (transform)
+llm-runner (producer)                    Magic Context module (transform)
   canonical messages + durable ids        flatten -> block-granular items (INTERNAL)
     -> CkMessage array + id sidecar ──►   block identity (module-owned, §3)
     + usage / agent_drop_ids              classify -> HARD/SOFT/defer (cache-core)
@@ -31,14 +27,14 @@ llm-runner (producer)                    MC module (transform)
 - **llm-runner** owns the provider render (C7) and the durable store (WAL +
   message identity). It produces CK#1 `CkMessage`s and renders the returned
   array verbatim (keystone invariant: no re-derivation/reorder/filter).
-- **MC module** owns the transform: flattening, block identity, cache-stability
+- **Magic Context module** owns the transform: flattening, block identity, cache-stability
   state machine, decision surface.
 - **subc** routes opaque bytes. No subc-core changes anywhere in this contract.
 
 ## 2. Transform-request wire
 
 The request carries FULL CK messages (not pre-flattened thin items) plus an
-identity sidecar. Rationale (Oracle #8): the decision surface reads full
+identity sidecar. The decision surface reads full
 `ToolCall.input` (edit-marker payloads, ctx_note action, todowrite view) and
 message-level grouping (BoundaryMsg role/ordinal); and llm-runner's render side
 consumes messages, not flat items — so messages are the wire unit, and the
@@ -55,7 +51,7 @@ projection).
       "mid": "…",                   // durable per-message identity (§3.2) — sidecar
       "ordinal": 42,                 // DURABLE monotonic lineage coordinate — NOT the
                                      //  array index (index restarts at 0 under the §6.5
-                                     //  coverage trim while MC's ordinal-keyed durable
+                                     //  coverage trim while Magic Context's ordinal-keyed durable
                                      //  state keeps advancing; same data-not-position
                                      //  rule as mid: stable per mid across requests,
                                      //  strictly increasing in lineage order, renderer-
@@ -71,10 +67,10 @@ projection).
 }
 ```
 
-### 2.1 System is IN the array (Oracle #1)
+### 2.1 System is IN the array
 
 Leading `Role::System` message(s) ride the array as ordinary CK content, marked
-by position, and MC treats them as PINNED: never summarized, reordered, or
+by position, and Magic Context treats them as PINNED: never summarized, reordered, or
 reduced (CK#1's pinned-system rule). Their bytes feed the HARD-bust hash;
 `render_config` carries only the epoch marker. The transformed array returns
 them verbatim in position, so the producer renders one array with no out-of-band
@@ -82,25 +78,18 @@ re-hoisting.
 
 ### 2.2 `usage` (pressure — caller-owned)
 
-Provider-reported usage is ground truth the module cannot derive. Feeds the
-85/95 bands + emergency fixedFloor. Poison analysis accepted (worst case is
-cache-economics harm; the caller owns `messages` anyway). RESTART CONTINUITY
-(Oracle #9, rule precise per MC R5): request-supplied NON-ZERO usage always
-WINS — a genuine post-reclaim/post-fold DECREASE must be accepted or the
-emergency band never exits; absent/zero usage (first pass, restart) falls back
-to the ModuleMeta-persisted last value. Compose-side budgets remain
-module-internal (estimator over composed m0/m1/tail).
+Provider-reported usage is caller-owned ground truth and feeds the 85/95 pressure bands and emergency fixedFloor; non-zero request usage wins over the persisted last value, including decreases after reclaim or fold, while absent or zero usage falls back to ModuleMeta and composed budgets remain module-internal.
 
 ### 2.3 `agent_drop_ids` (control signal — caller-owned)
 
 ctx_reduce §N§ marks as flat block ids (§3.3 vocabulary — the producer addresses
 blocks by `mid#index`, which the harness derives from the same id sidecar it
 sent). Leg-optional (absent on MITM). Module treats the set as durable add-only,
-filtered through frozen_keys. CLEARING RULE (Oracle #7): the producer clears its
+filtered through frozen_keys. CLEARING RULE: the producer clears its
 accumulated set only after a transformed response for a request carrying those
 ids has been RENDERED; until then every retry re-sends the identical set.
 
-### 2.4 Scheduler input source map (Oracle #9)
+### 2.4 Scheduler input source map
 
 Every `SchedulerInputs` field has exactly one source:
 
@@ -121,14 +110,14 @@ Every `SchedulerInputs` field has exactly one source:
 
 ### 3.1 Flatten at module ingress
 
-MC projects `messages` → flat block-granular items internally: one item per
+Magic Context projects `messages` → flat block-granular items internally: one item per
 `ContentBlock`, typed fields (kind, name, file_path via PATH_KEYS, full
 `ToolCall.input`, provider_executed, arc grouping, message role/ordinal
 back-reference) projected 1:1 from CK#1. The reduction mechanics (slices 2/3)
 keep keying on id/ordinal/bytes — unchanged. Nothing pre-flattened crosses the
 wire.
 
-ARC IDENTITY (MC R1 — same demotion as block identity): `arc_id` MUST be
+ARC IDENTITY: `arc_id` MUST be
 session-injective. `tool_call_id` is only the PAIRING HINT — ToolResult→ToolCall
 pairing resolves by id + adjacency (nearest-FIFO within the message
 neighborhood), and the arc is then KEYED by the ToolCall block's `mid#i`. A bare
@@ -139,13 +128,7 @@ Ingress test: two turns each containing `call_0` produce two distinct arcs.
 
 ### 3.2 Durable message identity (`mid`) — DECIDED: (a), logical-coordinate basis
 
-Background (Oracle #2, source-verified): llm-runner's prompt model had NO
-durable per-message id — `Message` carries role/content/origin only;
-`AssistantMessage.message_id` is dropped at prompt-commit (and empty-prone);
-`RunStarted.input` is bare `Vec<Message>`.
-
-DECISION (LLMRUNNER, pm_5ac053cf; MC concurring): **explicit durable `mid` as
-DATA on the canonical Message** — `Option<Mid>`, serde-skip-none (additive,
+**Explicit durable `mid` is data on the canonical Message** — `Option<Mid>`, serde-skip-none (additive,
 same shape/discipline as the shipped `origin` field), stamped identically at
 the live-append site and the replay-reconstruct sites.
 
@@ -154,14 +137,14 @@ the live-append site and the replay-reconstruct sites.
   coordinates are identical across the store-merge and full-replay read paths
   by construction; WAL byte-stream positions are not (that would be (b)'s
   fragility inside (a)'s carrier).
-- **OPAQUE to MC**: the mid is a producer-owned token. MC uses it ONLY for
+- **OPAQUE to Magic Context**: the mid is a producer-owned token. Magic Context uses it ONLY for
   equality and for composing block ids by concatenation (`<mid>#<index>`) —
   it never parses mid internals; the format stays LLMRUNNER's to evolve.
   RESERVED CHARACTER: the producer guarantees `#` never appears in a mid, so
   `mid#index` stays injective given injective mids.
 - **Producer guarantee**: the transform-request builder asserts mid PRESENT on
   every message it sends (deriving on the fly from the logical coordinates for
-  any legacy record) — the Option on the type never reaches MC as None.
+  any legacy record) — the Option on the type never reaches Magic Context as None.
 - **C7 commitment (3 tests, LLMRUNNER)**: (1) render(with-mids) ==
   render(mids-stripped), byte-identical; (2) cross-read-path mid identity rides
   the EXISTING merge_equals_full_replay_at_every_turn_boundary gate for free
@@ -221,7 +204,7 @@ How each producer satisfies it:
   Here the first-seen-pin discipline via the leg's sidecar is genuinely
   MUST-load-bearing (no native ids to fall back on), unlike Pi's belt case.
 
-### 3.3 Block identity: `mid#<block_index>` for ALL blocks (Oracle #3 fix)
+### 3.3 Block identity: `mid#<block_index>` for ALL blocks
 
 `block_id = <mid>#<block_index>` uniformly — including tool blocks.
 `tool_call_id` is DEMOTED to pairing/arc metadata only (it stays in the typed
@@ -231,13 +214,13 @@ across turns and a frozen `red:call_0#call` would cross-apply. The selection
 golden's `id#call`/`id#result` strings become `mid#i` — decision logic
 unchanged, mechanical golden regen at wiring (as always planned for id strings).
 
-### 3.4 Identity invariants (cache-critical, now ENFORCED not asserted — Oracle #4)
+### 3.4 Identity invariants (cache-critical)
 
 - REPRODUCIBLE: same producer history → same ids every pass and across restart.
 - INJECTIVE within a session.
 - ENFORCEMENT: at first sight of a `mid`, the module persists its ordered
   block-identity vector (per-block kind + byte-fingerprint), batched into the
-  PASS-COMMIT transaction (MC R6 — no standalone per-mid writes; the pass stays
+  PASS-COMMIT transaction (no standalone per-mid writes; the pass stays
   single-write). On every later pass it fail-CLOSES on drift: changed block
   list for a live `mid`, duplicate ids in one request, or a frozen `red:<id>`
   whose target vanishes while its message is live. Codec/projection version is
@@ -252,19 +235,19 @@ unchanged, mechanical golden regen at wiring (as always planned for id strings).
 2. **Arc atomicity carries to render**: a reduced arc renders with all members
    present in reduced form, or (only where the grammar permits) the complete
    arc omitted together. Never a half-rendered arc.
-3. **Opaque/Media v1 posture (Oracle #10): FAIL-LOUD.** Own-harness v1 rejects
+3. **Opaque/Media v1 posture: FAIL-LOUD.** Own-harness v1 rejects
    at ingress any `Opaque` block (and Media beyond llm-runner's supported set)
    with a typed error, rather than carrying a lossy projection. Full CK#1
    Opaque carriage {source, kind, raw, arc} is the MITM-leg prerequisite and
    lands there. (llm-runner's own canonical does not emit Opaque today; this
    gate is a tripwire, not a feature cut.)
 
-## 5. Synthetic injection = a FROZEN RENDER UNIT (Oracle #5 fix)
+## 5. Synthetic injection = a FROZEN RENDER UNIT
 
 The synthetic todo part follows the same freeze/replay discipline as every
 byte-affecting unit (this is what Unit I's freeze/replay transition already
 implements — the v1 draft's "re-composed each pass" wording was wrong):
-- CAPTURE (MC R2 — survives coverage): at each bust the module persists the
+- CAPTURE (survives coverage): at each bust the module persists the
   newest tail todo-state (todowrite ToolCall.input) into ModuleMeta and
   composes FROM ModuleMeta. A tail-only read would silently Clear the view once
   a coverage advance consumes the todowrite into compacted history (long
@@ -286,24 +269,24 @@ Per transform pass, llm-runner:
 3. Supplies `usage` (last provider response), `agent_drop_ids` (accumulated;
    clearing rule §2.3), and — on the pass after a provider overflow error —
    `overflow_error_text` verbatim.
-4. Sends on its MC route (unary, Interactive) and awaits the transformed array.
+4. Sends on its Magic Context route (unary, Interactive) and awaits the transformed array.
 5. Renders the returned array VERBATIM in order (keystone invariant).
-   RESPONSE + TRIM (MC R3): the response carries `coverage_ordinal` alongside
+   RESPONSE + TRIM: the response carries `coverage_ordinal` alongside
    the transformed array. The producer MAY trim its NEXT request's `messages`
    to those at/above `coverage_ordinal` (mids are durable so identity is
    unaffected; the module re-trims internally regardless, so a non-trimming
    producer stays correct). Bounds the wire+flatten cost on long sessions (2M+
    token sessions exist) instead of O(session) forever.
-6. FAILURE POSTURE (Oracle #6 — fail-open is REJECTED): on MC-route failure,
+6. FAILURE POSTURE (fail-open is rejected): on Magic Context route failure,
    ONE retry with the byte-identical request; if that fails, replay the
    LAST-KNOWN-GOOD transformed array IFF full request identity matches
    `{session_id, full_array_fingerprint, render_config, serializer_profile_id}`
    (the #4 LKG rule — a stale LKG never replays against a changed input);
-   otherwise FAIL the turn with a typed MC-unavailable error. NEVER send the
+   otherwise FAIL the turn with a typed Magic Context-unavailable error. NEVER send the
    raw untransformed array (it busts the cache once on the failure and again on
    recovery, and can overflow the context the transform exists to manage).
-7. RETRY/COMMIT AMBIGUITY (Oracle #7, mechanism per MC R4): a lost response
-   after MC's CAS commit is safe by IDEMPOTENCE VIA DETERMINISTIC
+7. RETRY/COMMIT AMBIGUITY: a lost response
+   after Magic Context's CAS commit is safe by IDEMPOTENCE VIA DETERMINISTIC
    FROZEN-REPLAY, not a response cache: the byte-identical retry arrives at
    the new row_version and re-evaluates as a defer-class pass whose frozen
    sets replay byte-identically (selection excludes frozen_keys → no new
@@ -313,27 +296,12 @@ Per transform pass, llm-runner:
 Timing: once per provider call, before render, on the complete outgoing array.
 
 SUBAGENT SESSIONS: a child/subagent session is an ordinary session (own
-BindIdentity, own route, own lineage) — MC is ON by default for children
+BindIdentity, own route, own lineage) — Magic Context is ON by default for children
 (mirroring the Pi children-with-discovery-ON model); capability gating happens
-per-agent fail-closed at the tool-surface layer, never by disabling MC.
+per-agent fail-closed at the tool-surface layer, never by disabling Magic Context.
 
 ## 7. Versioning + evolution
 
 `"v": 1` on request/response; unknown fields ignored (additive evolution). The
-resolved boundary items fold back into the MC-owned specs (CK#1, codec.md) by MC
-after the reverse pass; this doc is the contract of record until then.
-
-## 8. Open items
-
-1. **§3.2 `mid` derivation** — LLMRUNNER decision (a)/(b) + the C7
-   renderer-ignores-mid test commitment. THE freeze gate. (MC endorses (a).)
-2. MITM-leg slots (module-assigned first-seen identity; Opaque carriage;
-   injection inert) — deferred by design, tracked in the ledger.
-3. Coverage-GC verify-pin — RESOLVED (confirmed a REAL gap by MC's
-   writer-relocation Oracle, bg_b314e8c9): HARD folds prune covered `red:*`
-   (surviving_red_units), but a COVERAGE-EXTENDING SOFT advances
-   `coverage_ordinal` WITHOUT pruning — a now-covered frozen reduction survives
-   as silent bloat + a false-ReductionConflict trap (not a stale-byte replay;
-   build_output trims covered items before applying reductions). Fix lands in
-   MC's W1: prune frozen `red:<id>` targeting ordinals <= the new
-   coverage_ordinal on ANY coverage advance, plus a fail-loud invariant test.
+transform boundary follows the canonical CK Message and codec specifications in
+the Magic Context repository; this document defines the own-harness integration contract.

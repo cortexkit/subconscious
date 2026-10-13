@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>SUBC: The CortexKit Landscape</title>
+<title>subc: The CortexKit Landscape</title>
 <style>
   :root {
     --bg:#0b0e14; --panel:#11161f; --panel2:#161c28; --line:#222b3a;
@@ -149,24 +149,22 @@
 </head>
 <body>
 <nav class="side">
-  <div class="brand"><span class="dot"></span><b>SUBC</b></div>
+  <div class="brand"><span class="dot"></span><b>subc</b></div>
   <small>the cortexkit landscape</small>
   <div class="nav-link active" data-go="overview"><span class="ix">◇</span> Overview</div>
   <div class="nav-link" data-go="protocol"><span class="ix">⊟</span> Protocol &amp; Envelope</div>
-  <div class="nav-link" data-go="modules"><span class="ix">⊞</span> Module Ecosystem</div>
   <div class="nav-link" data-go="flows"><span class="ix">⇄</span> Data Flows</div>
   <div class="nav-link" data-go="transport"><span class="ix">⚷</span> Transport &amp; Auth</div>
   <div class="nav-link" data-go="storage"><span class="ix">▤</span> Storage</div>
   <div class="nav-link" data-go="auth"><span class="ix">⊙</span> Multi-Auth</div>
   <div class="nav-link" data-go="cache"><span class="ix">❄</span> Cache-Policy Core</div>
-  <div class="nav-link" data-go="status"><span class="ix">✓</span> Status</div>
 </nav>
 
 <main>
   <!-- OVERVIEW -->
   <section class="page show" id="overview">
     <div class="eyebrow">The CortexKit Landscape</div>
-    <h1>SUBC: the multiplexed splice-router</h1>
+    <h1>subc: the multiplexed splice-router</h1>
     <p class="lead">The per-user <code>ck-subc</code> daemon supervises CortexKit modules and routes their traffic by reading a fixed 21-byte WIRE v2 header. Payload bodies remain opaque.</p>
 
     <div class="callout">
@@ -203,7 +201,7 @@
     </div>
 
     <h2>The thin-core bet</h2>
-    <p class="muted">SUBC reads only the envelope header to route opaque payloads. A new module declares a manifest and speaks the wire without adding module-specific parsing to the daemon. Channel 0 carries control RPCs; non-zero routes use independent client-side and module-side channel spaces.</p>
+    <p class="muted">subc reads only the envelope header to route opaque payloads. A new module declares a manifest and speaks the wire without adding module-specific parsing to the daemon. Channel 0 carries control RPCs; non-zero routes use independent client-side and module-side channel spaces.</p>
     <p class="muted">Fleet binaries follow the <code>ck-*</code> naming convention. The <code>ck</code> operator CLI covers module list, status, restart and rescan, health with a per-module fresh-probe detail verb, quota, and daemon operations. The daemon also self-watchdogs with a 60-second loopback self-probe and connection-file integrity check, and raises file-descriptor limits for its children.</p>
   </section>
 
@@ -248,15 +246,6 @@
     <div class="callout"><b>RouteHandle safety.</b> SDKs wrap <code>(channel, epoch)</code> with a private per-connection token. Mandatory endpoint-side epoch validation rejects frames from a previous binding, and the token prevents a stale handle from one socket from acting on a later socket.</div>
   </section>
 
-  <!-- MODULES -->
-  <section class="page" id="modules">
-    <div class="eyebrow">The Fleet</div>
-    <h1>Module ecosystem</h1>
-    <p class="lead">Each module is an independently supervised process with an explicit role and storage boundary. Click a card for current detail.</p>
-    <div class="grid" id="modGrid"></div>
-    <div class="mod-detail" id="modDetail"><div class="empty-hint">Select a module above to inspect it.</div></div>
-  </section>
-
   <!-- DATA FLOWS -->
   <section class="page" id="flows">
     <div class="eyebrow">Data Flows</div>
@@ -286,7 +275,7 @@
   <section class="page" id="transport">
     <div class="eyebrow">Transport &amp; Auth</div>
     <h1>A local, authenticated boundary</h1>
-    <p class="lead">SUBC listens only on loopback TCP and publishes connection material through a user-owned <code>0600</code> file.</p>
+    <p class="lead">subc listens only on loopback TCP and publishes connection material through a user-owned <code>0600</code> file.</p>
     <table class="frames">
       <thead><tr><th>Boundary</th><th>Mechanism</th></tr></thead>
       <tbody>
@@ -354,44 +343,7 @@
     <div class="callout"><b>Cross-language contract.</b> Nine golden vectors shared with magic-context lock boundary presence, state transitions, and replay behavior across implementations.</div>
   </section>
 
-  <!-- STATUS -->
-  <section class="page" id="status">
-    <div class="eyebrow">Status · 2026-07-19</div>
-    <h1>Shipped and building</h1>
-    <p class="lead">The production substrate is broad. Current work is concentrated in new surfaces, resilience, and the next distributed phases.</p>
-    <div class="status-grid">
-      <div class="status-col shipped">
-        <h2>Shipped</h2>
-        <ul>
-          <li>WIRE v2 fleet-wide across 9+ modules</li>
-          <li>AFT over subc in production</li>
-          <li>Magic-context compaction on both legs: owned via broca and Claude Code via thalamus</li>
-          <li>Health system v2</li>
-          <li>Federation proven over WAN</li>
-          <li>Credentials vault and CortexKit Account service</li>
-          <li>Astrocyte v1 personal scope</li>
-          <li>Engram cloud plane and garbage collection</li>
-          <li>Team-mode Room-1 org authority, implementation-complete for four seats</li>
-          <li>Board v1</li>
-        </ul>
-      </div>
-      <div class="status-col building">
-        <h2>Building</h2>
-        <ul>
-          <li>Wernicke chat gateway</li>
-          <li>Chaos suite</li>
-          <li>brocatui</li>
-          <li>Cortex app design</li>
-          <li>Room-2 ceilings and quorum</li>
-          <li>Engram restore</li>
-          <li>Federation phase 3</li>
-        </ul>
-      </div>
-    </div>
-    <div class="callout"><b>Honest boundary.</b> “Shipped” means implemented and proven at the scope named. Later phases remain listed as building even when their contracts are already designed.</div>
-  </section>
-
-  <footer>SUBC landscape explainer · updated 2026-07-19 · all sections live</footer>
+  <footer>subc architecture and protocol explainer</footer>
 </main>
 
 <script>
@@ -426,47 +378,6 @@
   });
   showField('len');
 
-  const MODS = [
-    { id:"aft", nm:"AFT", role:"tool_provider", status:"LIVE", desc:"About 21 code-perception and editing tools, with semantic and callgraph indexes.", binary:"aft · v0.47.x", provides:"search · outline · zoom · callgraph · edit · inspect · bash", storage:"workspace indexes and filters", repo:"cortexkit/aft", note:"The subc transport is in production. The old OpenCode-managed NDJSON tool lane is retired." },
-    { id:"broca", nm:"broca", role:"management_surface", status:"LIVE", desc:"WAL-first exactly-once agent loop across five provider wire families.", binary:"ck-broca", provides:"sessions · runs · cap admission", storage:"WAL source of truth + SQLite projection + lease", repo:"cortexkit/broca", note:"Owns session lineage. Cap enforcement integrates with astrocyte; usage is read from its run index." },
-    { id:"magic-context", nm:"magic-context", role:"tool_provider", status:"LIVE", desc:"Context transformation, compaction, historian, memory, and cache-stability tools.", binary:"ck-mc", provides:"transform · ctx_* · compaction · historian · memory", storage:"context state + cortexkit-cache-core policy", repo:"cortexkit/magic-context", note:"Serves owned harnesses through broca and unowned harnesses through thalamus." },
-    { id:"thalamus", nm:"thalamus", role:"MITM proxy module", status:"LIVE", desc:"Provider-wire compaction and capture for Claude Code and Codex.", binary:"ck-thalamus", provides:"byte-splice compaction · capture · cache-read verification", storage:"capture and compaction state", repo:"cortexkit/thalamus", note:"Handles unowned harnesses without requiring them to adopt a CortexKit client SDK." },
-    { id:"quota", nm:"quota", role:"management_surface", status:"LIVE", desc:"Quota and usage windows for 30+ providers with multi-account support.", binary:"ck-quota · ai-provider-quota", provides:"provider usage windows · account pressure", storage:"module-scoped SQLite", repo:"cortexkit/ai-provider-quota", note:"Feeds ck quota and the cost-primary router." },
-    { id:"credentials", nm:"cortexkit-credentials", role:"management_surface", status:"LIVE", desc:"Encrypted vault, vault-native OAuth root, and the cloud CortexKit Account service.", binary:"ck-credentials", provides:"ck auth login · credential handles · account and org identity", storage:"encrypted local vault + audit chain", repo:"cortexkit/cortexkit-credentials", note:"account.cortexkit.io ships five login methods. The organization layer is live." },
-    { id:"alfonso", nm:"alfonso", role:"management_surface + tool_provider", status:"LIVE", desc:"Agent runtime for asks, rooms, Board, work graphs, athena, and masons.", binary:"ck-alfonso-core + ck-alfonso-routing", provides:"agent runtime · background tasks · model routing", storage:"runtime, Board, and work-graph state", repo:"cortexkit/alfonso", note:"Routing is cost-primary across models and accounts that clear the requested capability bar." },
-    { id:"synapse", nm:"synapse", role:"management_surface", status:"LIVE", desc:"Certified local AI infrastructure lanes for embeddings and rerankers.", binary:"ck-synapse", provides:"embeddings · rerankers · local model lanes", storage:"certification and local model state", repo:"cortexkit/synapse", note:"Runs as a supervised production module." },
-    { id:"callosum", nm:"callosum", role:"federation_transport", status:"LIVE", desc:"Noise IK cross-machine transport with default-deny exposure and exactly-once effects.", binary:"ck-callosum · subc-federation", provides:"device and org transport · Room-1 authority carriage", storage:"peer, exposure, and effect state", repo:"cortexkit/subc-federation", note:"Phases 1–2 are WAN-proven. Phase 3 rendezvous, relay, and pairing UX are designed." },
-    { id:"astrocyte", nm:"astrocyte", role:"management_surface", status:"LIVE", desc:"AI spend metering, price snapshots, and cap admission verdicts.", binary:"ck-astrocyte", provides:"spend facts · price snapshots · cap verdicts", storage:"v1 personal-scope spend store", repo:"cortexkit/astrocyte", note:"Deny is a verdict, never enforcement. Broca applies enforcement." },
-    { id:"engram", nm:"engram", role:"backup_plane", status:"LIVE", desc:"Zero-knowledge encrypted backup with per-device manifest chains.", binary:"ck-engram", provides:"encrypted backup · cloud manifests · garbage collection", storage:"client ciphertext + Cloudflare Durable Objects", repo:"cortexkit/engram", note:"The cloud plane and garbage collection are live. Restore is designed." },
-    { id:"wernicke", nm:"wernicke", role:"chat_gateway", status:"BUILDING", desc:"Slack, Teams, Telegram, and Discord gateway with linked-owner authority.", binary:"ck-wernicke", provides:"chat ingress · Room-1 acting-for consumer", storage:"store-nothing-durable gateway posture", repo:"cortexkit/wernicke", note:"The authority spine is frozen and the walking skeleton runs. Product completion is still in progress." },
-    { id:"subc-mcp", nm:"subc-mcp", role:"gateway", status:"LIVE", desc:"Policy-aware MCP surface for clients that do not speak subc directly.", binary:"ck-subc-mcp", provides:"search mode · ack_only · tombstones · prompts · elicitation", storage:"no tool data; policy and attestation state only", repo:"cortexkit/subconscious", note:"Ships status and wrapup prompts, elicitation relay, and spawn attestation." }
-  ];
-  const grid = document.getElementById('modGrid');
-  const detail = document.getElementById('modDetail');
-  MODS.forEach(m => {
-    const c = document.createElement('div');
-    const statusClass = m.status.toLowerCase();
-    c.className = 'card';
-    c.dataset.id = m.id;
-    c.innerHTML = '<div class="top"><div><div class="nm">' + m.nm + '</div><div class="role">' + m.role + '</div></div>'
-      + '<span class="st ' + statusClass + '">' + m.status + '</span></div>'
-      + '<div class="desc">' + m.desc + '</div>';
-    c.addEventListener('click', () => {
-      document.querySelectorAll('#modGrid .card').forEach(x => x.classList.remove('sel'));
-      c.classList.add('sel');
-      detail.innerHTML = '<div class="top" style="display:flex;align-items:center;justify-content:space-between">'
-        + '<div><h3>' + m.nm + '</h3><div class="role" style="color:var(--faint);font-family:var(--mono);font-size:12px">' + m.role + '</div></div>'
-        + '<span class="st ' + statusClass + '">' + m.status + '</span></div>'
-        + '<div class="kv">'
-        + '<div class="k">binary</div><div><code>' + m.binary + '</code></div>'
-        + '<div class="k">provides</div><div>' + m.provides + '</div>'
-        + '<div class="k">storage</div><div>' + m.storage + '</div>'
-        + '<div class="k">repo</div><div><code>' + m.repo + '</code></div>'
-        + '<div class="k">note</div><div class="muted">' + m.note + '</div>'
-        + '</div>';
-    });
-    grid.appendChild(c);
-  });
 </script>
 </body>
 </html>

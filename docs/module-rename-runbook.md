@@ -13,8 +13,6 @@ way to trigger it is somebody months later creating a small helper repo under
 the old familiar name, with no idea it was ever taken. Low probability, zero
 recovery.
 
-Burned so far: `cortexkit-credentials`, `subc-federation`, `ck-projects`,
-`ai-provider-quota`, `alfonso`.
 
 ## `uses:` is the one reference that does not redirect
 
@@ -39,34 +37,10 @@ find . -maxdepth 4 -path '*/.github/workflows/*.y*ml' -print0 |
 An unbounded `find` over these trees can stall and return empty rather than
 erroring, which reads exactly like a clean fleet.
 
-Covers renaming a supervised module's directory, module id, or both. Written
-after the `ai-proxy` -> `thalamus` rename, which broke four things that a
-reference sweep could not have found.
-
-Renames queued against this: `cortexkit-credentials` -> `claustrum` (ratified;
-the Latin means "a bolt, an enclosure", which is what a vault is) and
-`ai-provider-quota` -> `insula`. `subc-federation` -> `callosum` is done.
-
-All three have since landed. The quota rename was held for a week on a belief
-that its name-keyed crash journal had to migrate first, or an empty one would
-double-spend reset credits. Both halves of that were wrong, and both were
-checked only when someone finally read the source: the journal path is a
-hardcoded literal that a module-id rename cannot move, and losing the file
-exposes at most a thirty-minute window against a server that is already
-idempotent on the redemption id. See `rename-window-prep.md` for the corrected
-sizing — the blocking belief failed safe, which is exactly why nothing pressed
-anyone to test it.
 
 ## Why a reference sweep is not enough
 
-A sweep asks *what refers to this name*. Every casualty of the last two renames
-was **keyed by** it — a lookup, not a reference — so all of them sat outside that
-question however carefully it was asked.
-
-They also all failed as **absence** rather than error: an empty screen, an empty
-contact list, a job that stopped running, an inbox that reports nothing while
-hundreds of messages wait under the old spelling. Nothing errored on either side
-in any of the four cases.
+A reference sweep cannot find every lookup keyed by the old name or path; a missed lookup may return empty state without an error.
 
 So ask both questions before starting: **what is keyed on this name, and what is
 keyed on this path.**
@@ -75,24 +49,12 @@ keyed on this path.**
 A derived identity is invisible to a reference sweep *and* to a path sweep, because
 the path itself never appears anywhere — only its digest, computed at runtime.
 
-The vault rename found two: a keychain service named
-`<prefix>:<first 8 bytes of SHA-256(canonical data_dir)>`, and an anti-splice vault
-id that is a full SHA-256 over the same bytes, each derived independently by the
-daemon and the CLI from their own view of the directory. Neither is greppable.
-
 **Ask this question of each owner rather than trying to answer it centrally.** It is
 a genuine limit rather than a weak sweep: grep cannot find a hash of a string that is
 never written down, so the only way to find a derived identity is to read the code
 that computes it — which the component's owner is uniquely positioned to do.
 
-This produces a failure ordering worth internalising: **moving the store alone was
-worse than moving nothing.** Nothing moved leaves a vault that reads as empty;
-store-only leaves a vault that is *locked*, because a real store opens and its key
-is looked up under a scope that has never existed — and it presents as a key problem
-rather than a rename problem, so the symptom points away from the change that caused
-it. A partial migration can also self-repair into a plausible wrong state: the CLI's
-default data dir follows the module id, so it would bootstrap a **new empty vault**
-at the new path rather than erroring.
+A store move must account for related key scopes and path-derived identities; moving only the store can leave its key unreachable, while a component that bootstraps absent state may create a plausible empty replacement instead of refusing.
 
 ## Before the move
 
@@ -170,10 +132,7 @@ never examined, because nobody re-derives a number that agrees with them.
    same reason — a partial-file backup is worse than none, because it would be
    trusted.
 
-   Measured here: 520 audit rows lived only in the sidecar, and three of four
-   verification checks could not see the difference, because the values they read
-   were old enough to have been folded in already. **Include one continuously
-   growing table in the checks** — it is the only kind sensitive to a lost tail.
+   Verify a continuously growing table against its pre-move row-count floor: recently committed rows can exist only in the write-ahead sidecar, so a missing sidecar leaves that count short even when older tables still match.
 
    **Open verification copies read-only, and treat that as load-bearing rather
    than good manners.** A write-ahead database missing its sidecar *refuses to
@@ -183,9 +142,7 @@ never examined, because nobody re-derives a number that agrees with them.
    **That refusal is ambiguous, and the two readings are opposites.** It means
    either *this copy is missing its most recent writes* or *this store was shut
    down cleanly* — a clean shutdown folds the sidecar into the main file and
-   removes it, leaving nothing for a read-only connection to attach to. Measured
-   during one migration: the directory went from four files to two and the main
-   file grew by almost exactly the sidecar's size.
+   removes it, leaving nothing for a read-only connection to attach to.
 
    So **the flag is the right default for reading a live store, and proves nothing
    about a stopped one.** At the verification step, the counts do the work: the
@@ -193,13 +150,6 @@ never examined, because nobody re-derives a number that agrees with them.
    at or above its recorded floor proves it kept its tail — because a partial copy
    comes back *short* while every other check passes.
 
-   The flaw in the earlier wording is worth keeping as a caution: it was derived
-   against a running store, where the sidecar always exists, and applied at a step
-   that only ever runs against a stopped one. **A rule validated in one state and
-   applied in another was never true where it was written to be used.** Followed
-   literally it would have called a successful migration a data loss, at exactly
-   the moment when the natural response is to undo correct work. Opened read-write it opens happily and answers every query —
-   silently short. The flag converts a silent wrong answer into a hard error.
 
    So **the error is the finding.** `unable to open database file` on a copy you
    just made is not an obstacle to work around by dropping the flag; it is the
@@ -218,8 +168,7 @@ never examined, because nobody re-derives a number that agrees with them.
    a store still demanding the epoch the old name accumulated over its lifetime.
 
    The store then serves reads and refuses every write, permanently. Restarting
-   adds one per attempt, so it cannot catch up -- measured here at 4 against a
-   required 174, and that gap only grows with the store's age.
+   adds one per attempt and cannot reliably catch up to the accumulated fence epoch.
 
    With the module stopped and the lease file unheld: read the epoch from the
    fence row, then write that number into the new name's lease file. First open
@@ -232,10 +181,7 @@ never examined, because nobody re-derives a number that agrees with them.
    **This is the step most likely to be skipped, because its failure arrives
    minutes later and does not look like a rename problem.** Reads keep working,
    so health is green and callers succeed; only writes fail, so credentials serve
-   until individual tokens need refreshing and then fail one at a time with the
-   cause several steps upstream. It cost a live outage here, and it had been
-   written down from two earlier occurrences without being carried into this
-   runbook -- a note that has to be remembered is not a procedure.
+   until individual tokens need refreshing and then fail one at a time with the cause several steps upstream.
 5. Move the directory; apply the identity change; reconcile.
 
    **Changing a `program` path needs a rescan AND a restart, in that order.**
@@ -245,10 +191,7 @@ never examined, because nobody re-derives a number that agrees with them.
    silently starts the OLD executable again, while every config-derived check
    agrees with the new config.
 
-   That is why the inode comparison is load-bearing rather than ceremonial: it
-   is the only step that reads the RUNNING image. Measured — restart-only left
-   the previous binary serving with the config reading new, and only the inode
-   check disagreed.
+   Compare the running process's executable inode with the file at the intended program path (see “Placing a signed binary”); a match verifies the actual executable, whereas configuration alone names only what a future spawn would use.
 
    Read the rescan's whole output. `added` and `removed` are both empty for
    this case; the informative row is a third one, and truncating the output
@@ -260,23 +203,20 @@ never examined, because nobody re-derives a number that agrees with them.
 7. **Restart the resident** so it re-binds to the real path. This step is not
    optional and not reorderable: a session's project root is captured at start and
    is *not* re-resolved per call, so a session that has not restarted is still
-   bound to the old path however the new one reads. Confirmed the hard way — a
-   resident acted before restarting, and every command was refused at a
-   precondition on the bound root, including one using only absolute paths with no
-   working-directory reference.
+   bound to the old path however the new one reads.
 8. **Remove the link only after the resident confirms it has restarted, and
    confirm it by asking rather than by measuring.** There is no filesystem
    check for this. A session's bound project root is not its working directory,
-   so a seat can be entirely dependent on a path that `lsof` shows nobody
+   so a client can be entirely dependent on a path that `lsof` shows nobody
    standing in — the measurement is accurate and answers a different question.
 
-   Removing a link on that evidence wedges the seat completely: every tool call
+   Removing a link on that evidence wedges the client completely: every tool call
    is refused at a precondition, including calls using only absolute paths, and
    the session can neither work around it nor restart itself. It can still send
    messages, which is the only reason you find out.
 
    Links must not linger either. A symlinked path and its target can register
-   as two different directories in the peer registry, which splits a seat's
+   as two different directories in the peer registry, which splits a client's
    message routing from its message visibility.
    The confirmation is a claim, so verify it the same way: **remove the link,
    then have the resident act, while you are watching.** Do not verify by
@@ -305,10 +245,7 @@ Reading a store during any of this: use `mode=ro` on a **live** database and
 `immutable=1` only on a **stopped** one. The immutable flag cannot write, which
 is why it is right for a rollback target -- but it also ignores the write-ahead
 sidecar, so against a running store it returns a pre-write snapshot confidently
-and without erroring. Measured here on one file at one instant: it said 174
-while a read-only open said 175, with 189 KB of committed data in the sidecar
-that the first could not see. The property that makes it safe on a stopped store
-is the same property that makes it wrong on a live one.
+and without erroring; that is why it is safe only on a stopped store, never a live one.
 
 ## Placing a signed binary
 
@@ -414,17 +351,12 @@ something went, not live routes.
 
 ## Path-keyed stores: the class the compatibility symlink cannot help
 
-(Added 2026-08-11 after the brocatui -> alfonso-tui rename stranded 24 broca
-sessions' WAL history.)
 
 A compatibility symlink preserves PATH RESOLUTION. It does not preserve any
 identity derived from the CANONICALIZED path, because canonicalization
 (realpath at the daemon's route bind) follows the symlink — turning the
 symlink back into a rename for every consumer that hashes the resolved path
-into a durable key. Broca keys session WALs by FNV-1a over
-`{project_root}\u{1f}{harness}\u{1f}{session}`; after the rename, the same
-session hashes to a different WAL and history opens empty with no error —
-the empty-lineage signature, indistinguishable from a new session.
+    into a durable key; after a rename the same session can therefore open empty history under a different key without an error.
 
 Before any project folder rename, enumerate THREE store classes, not two:
 1. module-id-keyed stores (lease preseed rule, above);
@@ -440,13 +372,7 @@ identity-never-repointed invariant by making the repoint an audited event,
 and it inverts cleanly if the mapping is wrong. Do NOT rewrite client-side
 indexes first — that destroys the mapping the re-key needs.
 
-Outcome of the 2026-08-11 instance: all 24 WALs re-keyed and verified
-(reversal manifest at backups/wal-rekey-20260811T144418Z.json written
-BEFORE the first rename; live open served the previously-empty session).
-Broca proved by experiment that the WAL is addressed by the key hash alone
-— the bind triple embedded in run_started is forensic provenance and must
-NOT be rewritten to match, since it is the only surviving record of the
-original root.
+When recording the old-root → new-root re-key, leave the original root embedded in stored records (for example a WAL's `run_started` bind triple) unchanged: it records where the history originated, not the hash used to find it now.
 
 Checklist sharpening from a near-miss during the recovery: when computing
 a path-derived key, RESOLVE THE ROOT THE WAY THE DAEMON WILL, THEN HASH —
@@ -470,21 +396,13 @@ private `*_DATA_DIR` env conventions; rigs relocate the whole tree via
 
 The two anomaly signatures fleet-pulse scans for, and what they mean:
 
-- `<module>/cortexkit/<module>/...` (doubled nesting): an already-qualified
-  module directory was fed to the two-argument `sqlite_store_path` as a data
-  home (the astrocyte 2026-08 defect — both halves honored their own contract
-  with the boundary drawn twice). Fix: adopt `module_store_path`, then one
-  stop-move-restart, moving the nested contents UP.
+- `<module>/cortexkit/<module>/...` (doubled nesting) means an already-qualified module directory was passed where the resolver expected a data home. Use the shared `module_store_path` function described above to resolve the module directory once, then stop, move the nested contents up, and restart in one migration window.
 - 0-byte `store.db` beside real state (decoy): every tool that opens it reads
   "empty store" when the fact is "wrong location" — an empty database and an
   absent one are different facts that look identical at the only place anyone
   checks. Delete the decoy FIRST during any migration (it must not win a race
   as the target), and if something recreates it, the creator is the defect.
-  Known creator class (AFT forensics, 2026-08): OPERATOR PROBES -- a bare
-  `sqlite3 <guessed-path>` CLI invocation creates exactly this 0-byte decoy on
-  a path miss, silently. Probe with `sqlite3 'file:<path>?mode=ro'` (URI
-  read-only refuses to create) or stat the path first; every seat that mines
-  its own telemetry by CLI has this exposure.
+   A bare `sqlite3 <guessed-path>` probe can create a decoy on a path miss; probe with URI `mode=ro`, which refuses creation, or stat the path first.
 
 Migration invariants, both learned the expensive way: the single-writer lease
 is keyed by DIRECTORY (basename stable), so the lease file must travel WITH
@@ -493,48 +411,14 @@ the rename steps above if the file cannot travel); and the move order is
 API-first — adopt the resolver in the binary, then move the store once, so
 the data never sits at a path the running code disagrees with.
 
-One more ordering pin from the first migration under this section (astrocyte):
-THE OLD BINARY AND THE NEW CONFIG DISAGREE FOR AS LONG AS THEY COEXIST. Land
-the resolver binary, the restart, and the private-var removal in ONE window --
-never fix the config first. The config edit is the tempting half because it
-looks like a one-line change, and it is the half that breaks a running daemon:
-a crash-respawn between the early config edit and the planned restart spawns
-the OLD binary without its var, which resolves a different path than the store
-it was just holding.
+Land the resolver binary, restart, and removal of any legacy module-specific data-directory environment variable in one window; never edit configuration first, because a crash-respawn could start the old resolver without its variable and choose a different store path.
 
-Verify the post-move store by INODE, never by path: `lsof` prints the path
-RECORDED AT OPEN TIME, so a process writing to files your `mv` replaced still
-displays the correct path while every write lands in orphaned inodes -- the
-path check reports success in exactly the failure it exists to detect
-(astrocyte's second restart). Compare `lsof -p <pid> -Fin` (the `i` field --
-use the field output, not awk column arithmetic on the table form) against
-`stat -f %i <store path>`; equal or the daemon is writing to an orphan. Same
-rule as binary deploys, carried to data files.
+Verify the post-move store by inode, never by path: `lsof` prints the path recorded at open time, so a process writing to an orphaned inode can still display the expected path. Compare the `i` field from `lsof -p <pid> -Fin` with `stat -f %i <store path>`; unequal inodes mean the daemon is not writing to the current store file, even if the printed paths agree.
 
 And the window must be SPAWN-FREE BY CONFIG, not just stopped: `ck module
 stop` disables at RUNTIME only, and a `rescan` reconciles against the CONFIG
--- config `enabled:true` over runtime-disabled SPAWNS THE MODULE (this is how
-astrocyte's fresh store appeared mid-move: the var-drop rescan undid the
-stop). During a store move, carry `enabled:false` in the config itself through
-the move, rescan (now spawn-free), move, then flip enabled back and start.
+-- a rescan can spawn a runtime-stopped module when config still says `enabled:true`. Keep `enabled:false` in configuration through the move and rescan, then enable and start only after the move.
 
-A MIGRATION MUST BELONG TO THE CONSTRUCTOR THAT ASKED THE ENVIRONMENT WHERE
-TO LIVE (QTA's insula journal move): placed in a general-purpose constructor,
-the adopt-on-first-read migration ran under `cargo test` -- which resolved the
-LEGACY path from the process environment while building over a scratch dir,
-adopted the host's real records into the scratch file, and deleted the
-original eight minutes before the deploy meant to migrate them (harmless only
-because every record was past retention; on a host with a pending record it
-destroys a live fence). Anything reachable from a general constructor is
-reachable from a test, and a test that runs a migration has production side
-effects unless the path cannot consult the environment at all. Companion: a
-guard for this class must be able to FAIL -- QTA's first test seeded a scratch
-legacy file the buggy path never read (it reads the environment's), so it
-passed with the bug reinstated; the decidable form asserts over SOURCE that
-the universal path never references the legacy location.
+A migration belongs only to the constructor that resolved its production location from the environment, never a general-purpose constructor reachable by tests; its guard must exercise the actual legacy-location path rather than an unrelated scratch proxy.
 
-And do not read a green `--check-config` preflight as clearance for the move:
-preflight validates the CONFIG FILE, while this hazard lives between the config
-and the STORE (the var/resolver disagreement is invisible to any check that
-never opens the data directory). A preflight that cannot fail on the hazard
-being managed says nothing about it (astrocyte migration, 2026-08).
+A green `--check-config` preflight validates configuration, not agreement between the running resolver and the store, and cannot by itself clear a data move.

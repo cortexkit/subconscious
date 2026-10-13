@@ -14,8 +14,12 @@
 # Planning/decision artifacts kept LOCAL for now (Ufuk: not in the shared repo)
 /_bmad-output
 
-# Magic Context / CortexKit per-project module data (not source)
-.cortexkit/
+# Internal documentation and tool runtime state stay local; neither is public documentation or a shipped product file.
+/.cortexkit/*
+!/.cortexkit/release-notes/
+!/.cortexkit/skills/
+!/.cortexkit/rules/
+!/.cortexkit/WORKER.md
 
 # Auto-generated docs from a background tooling pass (not authored source — kept out
 # of the repo; same files appear in sibling repos from the same generator).

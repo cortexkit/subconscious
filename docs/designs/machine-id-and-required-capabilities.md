@@ -5,26 +5,6 @@ consumers move. This supersedes callosum minting a box id (callosum
 `docs/design/n1-box-identity-and-key-records.md` §2.2) and the "required-need
 violations are loud reports" line of `docs/specs/capability-grammar.md` r2.
 
-## Why
-
-Two operator concerns, one principle: nothing should depend on a module it
-does not need.
-
-- If callosum mints the machine id, prefrontal's local copies and ck-bus's
-  per-machine account depend on the cross-machine module, even for a user with
-  one machine. The daemon is on every machine and every module already depends
-  on it, so the daemon owning the id adds no dependency edge. It is the usual
-  layering: the operating system owns `/etc/machine-id`, not the networking
-  service.
-- There were already three machine identities: prefrontal's local
-  `machine_<8 hex>` row (`machine_binding`), callosum's proposed box id, and
-  ck-bus's `{acct}`. One owner ends that.
-- Optional dependencies double the code paths a feature must keep correct.
-  Prefrontal was built to run without entorhinal because nothing enforced a
-  required dependency, so optional was the only honest choice. Enforcing
-  required dependencies lets a module declare what it needs and delete the
-  fallbacks.
-
 ## 1. The machine id
 
 **What.** 16 random bytes, rendered as 32 lowercase hex characters. Opaque: no
@@ -76,7 +56,7 @@ ck-bus account's streams, prefrontal's local machine binding). A later `adopt`
 changes the id at the next daemon start. So a module that keys durable state on
 the id must handle registration with an id different from the one it last saw,
 and must say in its own design what it does: ck-bus starts a new account and
-treats the old one's streams as orphans to collect; prefrontal's rule is ALF's
+treats the old one's streams as orphans to collect; prefrontal's rule is
 to write. `ck setup` on a fresh machine asks whether it is a new machine or a
 restore before the daemon's first start, so the safe order is the default path.
 
@@ -119,22 +99,3 @@ What it does not do, deliberately:
   other's capabilities are both provided as soon as both register.
 
 Optional needs are unchanged: silent, and the consumer degrades by declaration.
-
-## 3. Rollout
-
-1. Daemon: the machine id (mint, `HELLO_ACK` field, `server.describe`,
-   `ck daemon`, `ck machine adopt`). Golden vector for the new field.
-2. Daemon: required-capability readiness. Mutation proofs: removing the check
-   lets an open reach a module whose required provider is absent; counting
-   readiness instead of registration for "provided" deadlocks a mutual pair.
-3. entorhinal (mine) declares `provides` for its project-identity surface
-   (`resolve`, `resolve_project_id`, `enumerate`, register), names settled when
-   the change is written.
-4. prefrontal (ALF) declares entorhinal's capability `required`, deletes the
-   no-entorhinal paths once the daemon from step 2 is deployed, and moves its
-   `machine_binding` local row to the daemon's id.
-5. callosum (CALLO) reads the daemon's id instead of minting one; announce and
-   clone detection unchanged; trust export records the id and import refuses on
-   mismatch with the `adopt` instruction.
-6. ck-bus: `{acct}` derives from the daemon's machine id (spec amendment).
-7. Other modules that depend on entorhinal declare it the same way (broca asked).

@@ -1,91 +1,6 @@
 # Phone effect store on SQLite, and list-based reconciliation
 
-Status: draft r2 (SUBC). r2 folds CKIOS's review of section 1 and CALLO's review of
-section 2.
-Nothing here is built. The contract it must keep is `docs/subc-federation-design.md`
-section 6.1: effect id `(origin pubkey, incarnation, seq)`, intent durable before the
-first network write, outcome durable before the caller sees the reply, recovery
-reconciliation, and no change ever executed twice.
-
-## Why
-
-The phone keeps its send log as one JSON document (`fed-state.json`) rewritten whole on
-every step, with its own write/flush/rename/flush-folder sequence. That shape assumed a
-handful of open changes. Settled records were never deleted, so on the operator's phone
-it reached about 540 records and 3 MB, and each change costs several full flushes. The
-8.7 s pause was a separate bug (fixed in 7f343c14); the store shape is still wrong for
-what it does. Callosum's side of the same ledger is already SQLite (`dedup_ledger`,
-keyed by peer, incarnation, seq).
-
-## 1. Phone store (SubcFed, Swift, system SQLite via `import SQLite3`)
-
-No new dependency. Not Core Data or SwiftData: the send log needs exact control over
-when a write is durable.
-
-Tables:
-- `meta(key PRIMARY KEY, value)`: schema version, local identity digest, local
-  incarnation, local ledger epoch, next seq.
-- `destination(responder_fp PRIMARY KEY, responder_pubkey, observed_peer_incarnation,
-  observed_peer_ledger_epoch, confirmed_incarnation, confirmed_seq)`.
-- `effect(responder_fp, incarnation, seq, phase, disposition, peer_ledger_epoch,
-  peer_incarnation, terminal_kind, terminal_code, terminal_body,
-  PRIMARY KEY (responder_fp, incarnation, seq))`, plus an index on
-  `(responder_fp, disposition)` so "every open change for this Mac" is one indexed read.
-- `poisoned_epoch(responder_fp, epoch, PRIMARY KEY (responder_fp, epoch))`.
-
-Durability: WAL mode, `synchronous=FULL`, `fullfsync=ON` and `checkpoint_fullfsync=ON`
-(Darwin SQLite otherwise uses plain fsync, weaker than today's F_FULLFSYNC). One commit
-is one full flush of the WAL; a checkpoint, every thousand or so pages, adds flushes of
-its own.
-
-Transactions per change:
-1. Reserve the seq and insert the intent row in one `BEGIN IMMEDIATE` transaction.
-   Durable before the first network write. (1 flush)
-2. `sent`: not durable. After a crash, `intent` and `sent` reconcile the same way (both
-   ask the Mac). The tidy-up task is auditing every reader of `.sent`; this design adopts
-   its finding.
-3. Outcome, watermark advance and pruning in one transaction. Durable before the caller
-   sees the reply. (1 flush)
-
-So a change costs 2 full flushes, against 6 in the JSON file store after d8d0b9a8 (about
-9-12 before it).
-
-Queries that replace hand-written loops:
-- Open changes: `SELECT ... WHERE responder_fp=? AND disposition='unknown'`.
-- Confirmed watermark: the lowest open seq minus one, capped at the highest settled seq
-  (`MIN`/`MAX` over the index), local incarnation only.
-- Regression sentinel: the highest-seq `recorded` row for the live peer epoch.
-- Pruning: delete settled rows of the local incarnation at or below the watermark,
-  except the sentinel row for each peer epoch. Nothing is pruned while any epoch of that
-  destination is poisoned.
-
-Locking: SQLite's own locking replaces the advisory lock file. The database stays in
-the app's own Application Support folder, never an app-group container: iOS terminates a
-suspended app holding a lock on a shared-container file (0xdead10cc). CKIOS confirmed
-that only the app process opens the store (the notification extension does not link
-SubcFed; no widgets or background tasks). The app is woken in the background by silent
-pushes and can write the store then, so:
-- Rule: no transaction stays open across an `await` or a possible suspension. Every
-  transaction is short and synchronous; no long-lived `BEGIN`, no read transaction held
-  across an await.
-
-File protection and backup:
-- Files keep the default protection class (complete until first user authentication).
-  The database, `-wal` and `-shm` must all carry the same class.
-- Before first unlock an open fails with an I/O error. That is a distinct, retryable
-  "store locked" failure, never treated as "no database".
-- The database, `-wal` and `-shm` are excluded from backup (`isExcludedFromBackup`). The
-  device key is Keychain `AfterFirstUnlockThisDeviceOnly` (FedPrivateKeyStore.swift:145),
-  so a restored phone has a new identity. A restored send log would belong to an identity
-  it no longer has, and could carry an old incarnation. A fresh store mints a fresh
-  incarnation, which is what section 6.1 relies on.
-
-Legacy cleanup: on open, discard `fed-state.json` and `fed-state.json.migrated`
-from the store directory, logging any deletion failure without failing the open.
-JSON is no longer imported; an absent database starts a fresh send log. Database
-existence, never an open failure, decides whether to create: a locked phone must
-not replace an intact database. New databases are built under a temporary name
-and renamed into place once complete, so interrupted builds are never used.
+This design batches status queries without changing effect execution: each change keeps the ID `(origin pubkey, incarnation, seq)`, records durable intent before its first network write and durable outcome before replying, and reconciles after recovery. The change's effect must never execute twice; see `docs/subc-federation-design.md`, §6.1.
 
 ## 2. Wire: ask about many changes at once, and confirm by id
 
@@ -93,7 +8,7 @@ Today `effect_status` takes one id, so reconnecting with N open changes is N rou
 The watermark is one number on `call` and `keepalive` frames; callosum prunes rows at or
 below it after 24 h of reachable time and moves its expired floor.
 
-Proposed (settled with CALLO):
+Proposed reconciliation contract:
 
 **List `effect_status`.**
 - Up to 32 ids per request, the size of callosum's rate burst (32/s, burst 32, 16
@@ -136,15 +51,3 @@ Rollout, readers first: callosum ships list `effect_status`, `confirmed_effects`
 `confirmed` status, advertised as the hello capability `effects-v2`. The phone uses them
 only when the Mac advertises it, and keeps today's per-id queries and watermark
 otherwise.
-
-## Work split
-
-1. Callosum, `effects-v2` reader (CALLO): list `effect_status`, confirmed ranges, the
-   `confirmed` status. Placed and running before any phone sends v2.
-2. SubcFed store on SQLite with migration (SUBC): section 1. Ships with the v1 wire
-   first, so the store change and the wire change are verified separately.
-3. SubcFed `effects-v2` sender (SUBC): list reconnect and `confirmed_effects`, used only
-   when the Mac advertises the capability.
-4. App (CKIOS): the saved-state size readout reads the database and `-wal`; the new
-   migration failure gets its own notice. iOS floor is 26.0; system SQLite there has WAL
-   and the fullfsync pragmas.

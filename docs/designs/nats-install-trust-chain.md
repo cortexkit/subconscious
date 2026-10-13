@@ -1,16 +1,8 @@
 # The NATS trust chain at install time: who signs what, and when
 
-Status: DESIGN, for review, then for CKCRED as the list of keys and ceremonies.
-Scope: the local `nats-server`'s install-time configuration, which `ck setup` writes
-(`server-config-writer-unnamed` in `docs/specs/ck-bus-module.md` r2, now assigned to SUBC),
-and the keys and signatures it depends on. Nothing here is implemented.
+Scope: the local `nats-server` install-time configuration and the keys and signatures it depends on.
 
-Keys that exist today (Ed25519, claustrum vault, minted 2026-09-24):
-`signing:ck-bus-operator-root:1` (operator identity, zero grants, ceremony only, public half
-pinned in setup's config), `signing:ck-bus-operator-signer:1` (operator signing key, `sign`
-to `reserved:ckbus`, ruling R14), `signing:ck-bus-account:1` (`sign` and `read` to
-`reserved:ckbus`, signs user JWTs). `signing:msgsig` is not involved. `ck setup` reaches
-the vault as a `direct` principal, so it can sign only through the root ceremony.
+`ck setup` reaches the vault as a `direct` principal and can sign only through the root ceremony; `signing:msgsig` is not part of this installation trust chain.
 
 ## Server rules this design relies on
 
@@ -50,9 +42,7 @@ in `github.com/nats-io/nats-server`, cited as file plus item.
 - N7. A change to the trusted operators is not supported by config reload
   (`server/reload.go::diffOptions`, the `trustedkeys` comment), so a new operator JWT needs a
   server restart. Moving to or from a resolver is also refused on reload.
-- N8. Account limits missing from an account JWT decode as 0 and are enforced as "none
-  allowed" (rig finding, `docs/designs/nats-federation-rig-results.md`, Common
-  configuration). Every account JWT here sets every limit explicitly.
+- N8. Account limits missing from an account JWT decode as 0 and are enforced as "none allowed"; every account JWT here sets every limit explicitly.
 
 ## 1. The JWTs at first start and who signs each
 
@@ -87,20 +77,18 @@ Why the box account is created by ck-bus and not preloaded. (a) Its name comes f
 machine id, which ck-bus receives from the daemon at HELLO_ACK; setup is not the
 authority for it. (b) ck-bus already needs the signer to re-sign this JWT for every
 revocation (R14), so creating it gives ck-bus no authority it lacks. (c) The same path
-then covers a machine-id change (a new `{acct}`, open question 8) and the federation
-account, with no ceremony. (d) The root signs one payload fewer. The cost is a
-contradiction with the foundation's install step (4), listed in section 6.
+  The box account is created by ck-bus rather than preloaded.
 
 ## 2. Vault keys and grants
 
 One new key. Ids use the `signing:<provider>:<generation>` grammar.
 
-| Credential id | Status | Role in NATS | Grants |
-| --- | --- | --- | --- |
-| `signing:ck-bus-operator-root:1` | exists | operator identity | none; signs by ceremony only |
-| `signing:ck-bus-operator-signer:1` | exists | operator signing key | `sign` to `reserved:ckbus` (exists); `read` proposed, see 6.2 |
-| `signing:ck-bus-account:1` | exists | box account signing key | `sign` and `read` to `reserved:ckbus` (exist) |
-| `signing:ck-bus-sysaccount:1` | NEW, proposed id | system account signing key | `sign` and `read` to `reserved:ckbus`, each an exact selector |
+| Credential id | Role in NATS | Grants |
+| --- | --- | --- |
+| `signing:ck-bus-operator-root:1` | operator identity | none; signs by ceremony only |
+| `signing:ck-bus-operator-signer:1` | operator signing key | exact `sign` and `read` to `reserved:ckbus` |
+| `signing:ck-bus-account:1` | box account signing key | exact `sign` and `read` to `reserved:ckbus` |
+| `signing:ck-bus-sysaccount:1` | system account signing key | exact `sign` and `read` to `reserved:ckbus` |
 
 The new key is minted like the account key: `ck auth mint-signing-key --id
 signing:ck-bus-sysaccount:1`, then two `ck auth grant --principal reserved:ckbus
@@ -148,7 +136,7 @@ changes), and each boot signs one new sys user and box users as they are issued.
 ## 4. What setup writes, and where
 
 `<nats dir>` stands for the nats-server module's data directory. The proposal is
-`cortexkit_store_types::module_data_dir(<nats-server module id>)`; SUBC names the final
+`cortexkit_store_types::module_data_dir(<nats-server module id>)`; the daemon configuration names the final
 path.
 
 - `<nats dir>/operator.jwt`: the root-signed operator JWT.
@@ -239,113 +227,35 @@ once `user-jwt-ttl-unpinned` is pinned. This differs from the spec (6.7).
 - Machine-id change (a new `{acct}`): ck-bus creates a second box account through the
   signer, as at first boot. No ceremony and no new keys.
 
-## 6. Unagreed or contradictory, listed and not resolved
+## 7. Installation requirements
 
-1. Key naming. The spec's Credentials table and `crates/ck-bus/src/credentials/roots.rs`
-   (`RootCredential::Operator`) have one operator key, `signing:ck-bus-operator:1`, which
-   signs the account JWTs. The minted reality is two keys, root and signer. The table
-   should name both, and the root should get no ck-bus row.
-2. The signer's grants. The spec says ck-bus needs `read` as well as `sign` on every key
-   for `credential.public_key`. The signer has `sign` only, and ck-bus needs its public key
-   to write the account JWT's `iss`. Two ways to meet it: grant `read` (CKCRED), or match
-   the sign reply's `key_id` (`sha256(public)[..8]`) against the operator JWT's
-   `signing_keys`. Not chosen here.
-3. `signing:ck-bus-sysaccount:1`: its id and its two grants are this document's proposal,
-   unagreed with CKCRED. The spec lists the id "by analogy".
-4. Foundation install step (4) has the installer sign "both account JWTs" at install.
-   This design has the root sign only the system account, and ck-bus create the box
-   account through the signer. The foundation's owner (ALF) and CKCRED must agree.
-5. ck-bus's inputs. The spec gives ck-bus no channel for the operator JWT path, the system
-   account id, the server URL or the TLS pin. The spec's "eight shapes and nothing else"
-   store also has no field for the box account's public id: `account.json` would have to
-   carry it. Also open: an ABSENT (not damaged) `account.json` on a server that already has
-   a box account must not create a second account. Absence is neutral, so ck-bus would
-   first have to find the existing one (for example by a claims list and the account
-   `name`). The rule is unwritten.
-6. The sys-user grant (`permission_golden.txt`: `$SYS.REQ.CLAIMS.UPDATE`, the kick,
-   connect and disconnect) has no claims-lookup subject, although the spec's revocation
-   step and this design both read the account JWT back through a lookup. It also has no
-   inbox subscription for the replies. A9 has to settle both. The generic update subject
-   does cover pushing a new account.
-7. The spec's bootstrap says ck-bus revokes the previous incarnation's own users, which
-   includes system-account users. That would make ck-bus re-sign the system account and
-   break section 5's invariant. This design proposes not revoking them (seeds gone,
-   expiry pending).
-8. Where setup gets the signer's and sysaccount key's public halves. Setup is `direct` and
-   holds no `read` grant. The proposal is to pin them from `mint-signing-key`'s printed
-   output next to the root pin, and to have ck-bus refuse to start (health down, naming
-   the mismatch) when the vault's public keys differ from what the operator JWT and the
-   system account JWT list. CKCRED may prefer a direct read op.
-9. The ceremony's shape for two payloads: one approval handle over two sha256 values, or
-   two handles in one session. CKCRED's to define.
-10. TLS. The foundation's install step (4) also writes TLS material for the local
-    listener. Stock `nats-server` reads its TLS private key from a file, so "no private
-    key on disk" holds only for the NATS trust chain. Whether a loopback listener needs
-    TLS, and who owns that key, is open (SUBC, ALF).
-11. `server-config-writer-unnamed` is still "unnamed" in the spec, but is now assigned to
-    SUBC. The spec also needs a named restart path: a new operator JWT needs a server
-    restart (N7), and setup has to ask the daemon for it, since nats-server is a supervised
-    sibling.
-12. Open question 8 (does a new `{acct}` need new root keys): this design's answer is no,
-    because the new account lists the same account signing key. Sharing that key across
-    the old and new accounts is a choice for CKCRED and the operator to confirm.
+The `6.x` labels below identify individual installation rules referenced by the earlier sections (for example the loopback/TLS rule `6.10`). Repeat the root-signing procedure in §3 only when the operator or system-account record changes.
 
-## 7. SUBC's decisions on section 6 (2026-09-24)
-
-Outcome, read from the vault by CKCRED on 2026-09-25: 6.2 and 6.3 were granted as proposed
-on 2026-09-24 (`reserved:ckbus` holds exact `sign` and `read` on
-`signing:ck-bus-operator-signer:1` and on `signing:ck-bus-sysaccount:1`), and the ceremony
-for the operator and system-account roots ran the same day in one session with one handle
-and two approvals (vault seq 18413-18416). No further ceremony is needed unless the
-operator or system-account record changes.
-
-- 6.1: the spec's Credentials table and `RootCredential` get two operator rows, root and
-  signer, and the root gets no ck-bus row. That lands with slice 4.
-- 6.2: ask CKCRED for an exact `read` grant on the signer to `reserved:ckbus`. Matching
+- 6.1: the root-credential table above and `RootCredential` distinguish the operator identity key from its signing key; ck-bus never requests vault access to the operator identity key.
+- 6.2: the signer requires an exact `read` grant to `reserved:ckbus`. Matching
   `key_id` against the operator JWT is a second path to the same fact, and it would silently
   disagree the day the id derivation changes.
-- 6.3: proposed to CKCRED as written: `signing:ck-bus-sysaccount:1`, exact `sign` and `read`
-  to `reserved:ckbus`.
-- 6.4: agreed, ck-bus creates the box account through the signer. That needs ALF to amend
-  the foundation's install step (4).
-- 6.5: slice 4 owns it. ck-bus reads the operator JWT path, the server URL and the system
+- 6.3: `signing:ck-bus-sysaccount:1` requires exact `sign` and `read` grants to `reserved:ckbus`.
+- 6.4: ck-bus creates the box account through the signer.
+- 6.5: ck-bus reads the operator JWT path, the server URL and the system
   account id from its supervised config (env), and `account.json` gains the box account's
   public id. An ABSENT `account.json` triggers a lookup by account name before any create,
   and a found account is adopted, never duplicated.
-- 6.6: already settled. commons `bd7f699` adds the claims lookup and `_INBOX.<cred>.>`
-  subscribe to the system grant, and ck-bus re-pins in slice 4.
-- 6.7: agreed, ck-bus does not revoke its own previous system-account users; the spec's
-  bootstrap wording is amended. Their seeds died with the process, so they can't answer a
+- 6.6: the system grant includes claims lookup and `_INBOX.<cred>.>` subscription.
+- 6.7: ck-bus does not revoke its own previous system-account users; Their seeds died with the process, so they can't answer a
   nonce challenge.
-- 6.8: agreed. The signer and sysaccount public halves are pinned from mint output beside
+- 6.8: the signer and sysaccount public halves are pinned from mint output beside
   the root pin. ck-bus refuses to start (health down, naming the mismatch) when the vault
   disagrees with what the JWTs list.
-- 6.9: CKCRED's call.
 - 6.10: no TLS on the local listener. It binds loopback only, and every client authenticates
   by JWT nonce challenge, the same trust boundary as the daemon's loopback HMAC. TLS
-  belongs on the leaf link to the hub, which is a federation slice. That needs ALF to amend
-  the foundation's install step (4).
+  belongs on the leaf link to the hub.
 - 6.11: setup asks the daemon to restart the nats-server module (`supervisor.restart`) after
-  writing a new operator JWT, and verifies the new process. The spec gate is renamed to
-  SUBC.
-- 6.12: agreed, no new root keys for a new `{acct}`.
-- N5 is a security fact the slices must carry: a claims update is saved without a trust or
-  `iat` check. So only ck-bus's system user may hold the claims-update permission, and every
-  push is read back through the lookup before ck-bus treats it as applied.
+  writing a new operator JWT, and verifies the new process.
+- 6.12: no new root keys for a new `{acct}`.
+- N5 requires that only ck-bus's system user hold claims-update permission, and every push is read back through lookup before ck-bus treats it as applied, because updates are saved without a trust or `iat` check.
 
-## 8. As installed on the first box (2026-09-24)
-
-The root ceremony ran once, as section 3 describes: two approvals (one over each payload's
-sha256), one handle, two signatures, then revocation. `"${XDG_DATA_HOME:-$HOME/.local/share}/cortexkit/bin/ck-bus" install-plan`
-built the operator JWT and the system account JWT; `"${XDG_DATA_HOME:-$HOME/.local/share}/cortexkit/bin/ck-bus" install-apply`
-verified both signatures against the pinned root before writing `operator.jwt` and `server.conf`. A second `install-plan` reports "no
-ceremony needed".
-
-The system account's own identity key is not a vault key. `install-plan` generates it in memory,
-keeps only the public half (`<nats dir>/system_account` and the JWTs), and drops the seed, so
-nobody holds the private half. An account identity key only ever signs its account's own claims,
-and here the root signs those, so the seed has no job. Users are signed by the sysaccount signing
-key in the vault. Re-keying the system account means a new root ceremony, which is intended.
+## 8. Installation default
 
 `install-apply` defaults the local listener to port 14222. That avoids a developer's own
 nats-server on the stock 4222 and stays below every common ephemeral port range.

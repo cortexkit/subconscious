@@ -82,6 +82,10 @@ if ($Mode -eq 'fixture') {
       $everyone = [System.Security.Principal.SecurityIdentifier]::new('S-1-1-0')
       $security.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new($everyone, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow'))
     }
+    'inheritableAdministrators' {
+      $administrators = [System.Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')
+      $security.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new($administrators, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow'))
+    }
     'inherited' {
       $security.SetAccessRuleProtection($false, $false)
       foreach ($rule in $security.GetAccessRules($true, $false, [Security.Principal.SecurityIdentifier])) {

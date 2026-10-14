@@ -184,15 +184,15 @@ static int descriptor(Job *j, HANDLE h, int canonical) {
     j->refusal = "unsupported-filesystem";
     fail(j, error, "Filesystem cannot return a Windows owner/DACL; use local NTFS"); return 0;
   }
-  /* Administrators-owned files remain readable across elevation changes. Other
-   * group owners have implicit WRITE_DAC and cannot satisfy the private policy. */
-  int valid = owner && (canonical ? approved_owner(owner, j->sid) : EqualSid(owner, j->sid));
+  /* The same trusted owners may be read or secured without taking ownership.
+   * Other group owners have implicit WRITE_DAC and cannot satisfy the private policy. */
+  int valid = approved_owner(owner, j->sid);
   if (!valid) {
     j->refusal = "wrong-owner";
     if (owner) ConvertSidToStringSidW(owner, &j->detail);
     fail(j, ERROR_ACCESS_DENIED, canonical ?
         "Owner is neither the user SID, Administrators nor LocalSystem" :
-        "Permission replacement requires the user SID as owner; ownership will not be taken");
+        "Permission replacement requires the user SID, Administrators or LocalSystem as owner; ownership will not be taken");
   }
   if (valid && canonical) {
     if (!GetSecurityDescriptorControl(sd, &control, &revision)) {
@@ -239,7 +239,7 @@ static int descriptor(Job *j, HANDLE h, int canonical) {
         }
       }
     }
-    if (!valid) fail(j, ERROR_ACCESS_DENIED, "Strict owner-only DACL required; explicitly migrate current-user-owned objects");
+    if (!valid) fail(j, ERROR_ACCESS_DENIED, "Strict owner-only DACL required; explicitly migrate trusted-owner objects");
   }
   LocalFree(sd);
   return valid;

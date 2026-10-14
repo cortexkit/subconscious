@@ -188,10 +188,10 @@ function inspect(mode, data) {
   })
 }
 
-async function canonical(path, directory) {
+async function canonical(path, directory, ownerSid) {
   const sd = await inspect('inspect', { path })
   reports.push({ name: path, descriptor: sd })
-  assert.equal(sd.owner, sd.currentUser)
+  assert.equal(sd.owner, ownerSid ?? sd.currentUser)
   assert.equal(sd.control & 0x1004, 0x1004, 'present protected DACL')
   assert.deepEqual(sd.aces, [
     { type: 0, flags: directory ? 3 : 0, mask: 0x1f01ff, sid: sd.currentUser },
@@ -337,6 +337,62 @@ test('null-DACL, empty-DACL and foreign-owner fixtures refuse', async () => {
   assert.equal((await readOwnerOnly(administratorsFile)).toString(), 'approved owner bytes')
 })
 
+test('secure repairs Administrators-owned inherited file and directory without taking ownership', async () => {
+  const parent = join(root, 'administrators-repair')
+  await createPrivateDirectory(parent)
+  // Administrators may control ancestors, but their inherited ACE is not a private-file DACL.
+  await inspect('fixture', { path: parent, kind: 'inheritableAdministrators' })
+  for (const kind of ['file', 'directory']) {
+    const path = join(parent, kind)
+    if (kind === 'file') await writeFile(path, 'legacy bytes')
+    else await mkdir(path)
+    await inspect('fixture', { path, kind: 'administratorsOwner' })
+    const before = await inspect('inspect', { path })
+    assert.equal(before.owner, 'S-1-5-32-544')
+    assert.equal(before.control & 0x1000, 0, 'fixture must have an unprotected DACL')
+    assert.equal(before.aces.length, 2)
+    assert.ok(before.aces.every((ace) => ace.flags & 16), 'fixture ACEs must be inherited')
+    assert.equal((await verifyOwnerOnly(path)).refusal.reason, 'extra-ace')
+    const child = kind === 'directory' ? join(path, 'legacy') : null
+    let childBefore
+    if (child) {
+      await writeFile(child, 'legacy bytes')
+      childBefore = await inspect('inspect', { path: child })
+    }
+    await securePrivatePath(path, kind)
+    await canonical(path, kind === 'directory', before.owner)
+    assert.deepEqual(await verifyOwnerOnly(path), { ok: true })
+    if (child) {
+      assert.deepEqual(await inspect('inspect', { path: child }), childBefore)
+      await securePrivatePath(child, 'file')
+      assert.deepEqual(await verifyOwnerOnly(child), { ok: true })
+    }
+    assert.equal((await readOwnerOnly(child ?? path)).toString(), 'legacy bytes')
+  }
+})
+
+test('secure refuses a non-trusted user owner with its SID and leaves the DACL unchanged', async () => {
+  const file = join(root, 'non-trusted-owner-repair')
+  await createPrivateFile(file, 'unchanged bytes')
+  const owner = await inspect('fixture', { path: file, kind: 'userOwner' })
+  const before = await inspect('inspect', { path: file })
+  assert.equal(before.owner, owner.sid)
+  assert.notEqual(before.owner, before.currentUser)
+  await assert.rejects(() => securePrivatePath(file, 'file'), (error) => {
+    assert.equal(error.code, 'ERR_PRIVATE_FILES_SECURITY')
+    assert.equal(error.reason, 'wrong-owner')
+    assert.equal(error.ownerSid, owner.sid)
+    assert.equal(error.win32Code, 5)
+    return true
+  })
+  assert.deepEqual(await inspect('inspect', { path: file }), before)
+  assert.deepEqual(await verifyOwnerOnly(file), {
+    ok: false,
+    refusal: { reason: 'wrong-owner', ownerSid: owner.sid },
+  })
+  assert.equal((await readFile(file)).toString(), 'unchanged bytes')
+})
+
 test('junction leaf and junction ancestor refuse', async () => {
   const target = join(root, 'target')
   await createPrivateDirectory(target)
@@ -385,8 +441,11 @@ test('explicit current-owner migration and same-directory rename retain owner-on
   const file = join(directory, 'legacy')
   await createPrivateFile(file, 'legacy bytes')
   await inspect('fixture', { path: file, kind: 'foreign' })
+  const before = await inspect('inspect', { path: file })
+  assert.equal(before.owner, before.currentUser)
   await securePrivatePath(file, 'file')
   await canonical(file, false)
+  assert.deepEqual(await verifyOwnerOnly(file), { ok: true })
   assert.equal((await readPrivateFile(file)).toString(), 'legacy bytes')
   const staging = join(directory, 'staging')
   await createPrivateFile(staging, 'replacement')

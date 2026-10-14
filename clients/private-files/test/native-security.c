@@ -313,14 +313,13 @@ static void owner_policy(void) {
   fake_descriptor = 1; fake_user = j.sid; j.default_owner = users;
   PSID owners[] = { j.sid, admins, system, users };
   for (size_t i = 0; i < 4; ++i) {
-    fake_owner = owners[i]; j.reason = j.refusal = NULL;
-    REQUIRE(descriptor(&j, NULL, 1) == (i != 3));
-    if (i == 3) REQUIRE(j.refusal && !strcmp(j.refusal, "wrong-owner"));
-    if (j.detail) { LocalFree(j.detail); j.detail = NULL; }
+    for (int canonical = 0; canonical <= 1; ++canonical) {
+      fake_owner = owners[i]; j.reason = j.refusal = NULL;
+      REQUIRE(descriptor(&j, NULL, canonical) == (i != 3));
+      if (i == 3) REQUIRE(j.refusal && !strcmp(j.refusal, "wrong-owner"));
+      if (j.detail) { LocalFree(j.detail); j.detail = NULL; }
+    }
   }
-  fake_owner = admins; j.reason = NULL;
-  REQUIRE(!descriptor(&j, NULL, 0));
-  if (j.detail) LocalFree(j.detail);
   fake_descriptor = 0;
   free(j.token); free(j.owner_token);
 }

@@ -9855,7 +9855,7 @@ mod tests {
     fn missing_window_renders_as_not_reported_row() {
         let entry = serde_json::json!({
             "provider": "anthropic",
-            "account": "wwaxpoetic@yahoo.com",
+            "account": "person@example.invalid",
             "usage": { "primary": { "usedPercent": 7.0, "windowMinutes": 300 } }
         });
         // Render against a template set that includes a window this account

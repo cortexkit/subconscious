@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.20.88
+
+- Test-only: the `ck` quota fixture uses a placeholder account address (`person@example.invalid`) instead of a real-looking email.
+
 ## 0.20.87
 
 - Update the internal CLI and daemon executable to `subc-daemon` 0.35, which adds the `privileged_operator_prompt` config key and the matching restart-required section. Setup reports a pending `privileged_operator_prompt` edit on a live host as restart-required.

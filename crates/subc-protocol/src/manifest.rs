@@ -328,6 +328,11 @@ pub const CAP_CATALOG_EVENTS_V1: &str = "catalog-events/v1";
 /// hash only when the daemon it is connected to advertises this capability.
 pub const CAP_SCOPE_BIND_PROOF_V1: &str = "scope-bind-proof/v1";
 
+/// Bind proofs are required only from non-attested openers; reserved modules
+/// are exempt. Owners relying on this exemption should set `bind_proof_sha256`
+/// only when the connected daemon advertises this capability.
+pub const CAP_SCOPE_BIND_PROOF_V2: &str = "scope-bind-proof/v2";
+
 /// Atomic idle-only scope rotation and connection-held scope presence.
 pub const CAP_SCOPE_REPLACE_IF_IDLE_V1: &str = "scope-replace-if-idle/v1";
 

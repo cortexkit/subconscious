@@ -318,15 +318,19 @@ is absent. Whole-call error frames become `ScopeCallError::Refused`; per-entry r
 `route.open` accepts `scope: {owner, ref, scope_epoch, bind_proof?, hold_presence?}`. `bind_proof` is
 base64url of the 32 secret bytes without padding. The daemon decodes the proof,
 hashes those bytes with SHA-256 and compares digest bytes in constant time, at
-admission and again before sending the captured relay bind. The owner must
-present the proof too; there is no owner exception. A record without a hash
+admission and again before sending the captured relay bind, but only when the
+opener's daemon-stamped principal is not `reserved`. Reserved modules, including
+the owner and listed reserved carriers, are attested by their launch nonce and
+need no proof; any proof they send is ignored. Direct and other non-reserved
+openers must present a matching proof under a hashed scope. A record without a hash
 behaves exactly as before: a selector's proof, even malformed, is ignored. Hosts
 may therefore send proofs unconditionally once they hold one. Proofs never enter
 logs, refusal detail, `scope.describe`, module `route.bind` stamps or activity
 attribution; the hash also stays out of describe replies and bind stamps.
 Scope owners should set `bind_proof_sha256` only when the daemon they are
-connected to advertises `scope-bind-proof/v1` in HELLO_ACK or `server.describe`;
-older daemons may reject records carrying the hash.
+connected to advertises `scope-bind-proof/v2` in HELLO_ACK or `server.describe`.
+The daemon also advertises v1 for compatibility; v1 alone does not promise the
+reserved-opener exemption. Older daemons may reject records carrying the hash.
 
 ### Idle-only rotation and connection-held presence
 
@@ -334,8 +338,9 @@ An owner may set `replace_only_if_idle: true` on a record in `scope.sync` or
 `scope.apply` to rotate its epoch or change its bind-proof hash without taking
 over a live session. If the ref is live and the proposed record has a higher
 epoch or changes `bind_proof_sha256` at the same epoch, the daemon refuses that
-record while the current epoch has any bound route, admitted bind still in
-flight, or connected presence holder. The per-record result is `outcome:
+record while the current epoch has any non-reserved opener's bound route,
+admitted bind still in flight, or connected presence holder. Reserved openers'
+routes do not show whether the host is alive and do not count. The per-record result is `outcome:
 "refused"`, `code: "scope_epoch_in_use"`; its message says routes are still bound
 without counting or naming them. The old record and routes stay untouched;
 other records apply independently. Created and unchanged records are never
@@ -343,7 +348,7 @@ refused by this condition. The flag is a request condition, not stored scope
 content; absent or false preserves unconditional replacement and its usual
 route drains.
 
-Admission reserves epoch usage under the same scope-table write lock that
+Admission of non-reserved openers reserves epoch usage under the same scope-table write lock that
 checks and applies conditional records. The reservation remains counted while
 egress is waiting, while the module handles the bind, and after commit until
 route closure. Failed or cancelled binds release it. No open can enter between
@@ -360,7 +365,8 @@ expiring the epoch discards its holders; a daemon restart clears all in-memory
 state and all connections. Presence is capped at eight distinct connections
 per epoch (including provisional holders during binds); additional opens still
 bind but do not add presence. Repeated opens on a holder's connection share its
-entry.
+entry. A reserved opener's `hold_presence` records no presence, even after a
+successful bind.
 
 Both fields require `scope-replace-if-idle/v1`, advertised in HELLO_ACK and
 `server.describe`. Owners send the condition and hosts send `hold_presence`
@@ -374,8 +380,8 @@ can never be carried into a newer session that reused the ref. The daemon admits
 when the opener is the owner or a listed carrier, and otherwise refuses by name (the full set is
 in section 5a):
 - `scope_epoch_required`: the open named no epoch. Terminal.
-- `scope_bind_proof_required`: the record has a hash but the selector has no proof. Terminal.
-- `scope_bind_proof_mismatch`: the proof is not valid unpadded base64url of 32 bytes,
+- `scope_bind_proof_required`: a non-reserved opener's record has a hash but its selector has no proof. Terminal.
+- `scope_bind_proof_mismatch`: a non-reserved opener's proof is not valid unpadded base64url of 32 bytes,
   or its SHA-256 differs from the record's hash. Terminal; clients never retry it.
 - `scope_not_synced`: the owner has not synced since this incarnation started and is configured.
   Retryable: after a daemon restart a carrier's open can arrive before the owner re-syncs, and

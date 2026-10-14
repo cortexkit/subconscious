@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.36.3
+
+- Require scope bind proofs only from non-reserved daemon-stamped openers, both at admission and before captured relay. Launch-attested reserved owners and carriers need no proof and ignore any proof sent. Their binds do not count toward idle-only rotation, and their `hold_presence` records no presence. Advertise `scope-bind-proof/v2` alongside v1 and `scope-replace-if-idle/v1`; owners can gate hashes on v2.
+
 ## 0.36.2
 
 - With `replace_only_if_idle: true`, atomically refuse epoch replacement or same-epoch bind-proof change with per-record `scope_epoch_in_use` while the live epoch has routes, admitted binds in flight, or connection-held presence. An absent or false flag keeps unconditional replacement and its usual route drains. Scoped opens can hold presence until client disconnect or epoch end, surviving target restart; cap holders at eight, so further connections may bind but acquire no presence. Refused opens leave no presence. Advertise `scope-replace-if-idle/v1` in HELLO_ACK and `server.describe`.

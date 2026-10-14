@@ -271,15 +271,12 @@ async fn scope_bind_proof_admits_matching_digest() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn scope_bind_proof_owner_requires_proof() {
+async fn scope_bind_proof_reserved_owner_ignores_proof() {
     let mut f = Fixture::new().await;
     f.sync(1, Some(HASH)).await;
-    let err = f.open(1, None, true).await.unwrap_err();
-    assert_eq!(
-        err.scope_bind_proof_refusal(),
-        Some(ScopeBindProofRefusal::Required),
-        "{err:?}"
-    );
+    for proof in [None, Some(NEXT_PROOF), Some("malformed+proof=")] {
+        f.open(1, proof, true).await.unwrap();
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

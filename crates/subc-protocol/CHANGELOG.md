@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.32.3
+
+- Add `manifest::CAP_SCOPE_BIND_PROOF_V2` (`scope-bind-proof/v2`): bind proofs are required only from non-attested openers; reserved modules are exempt. Owners relying on reserved modules opening without proofs should set hashes only after discovering v2. The daemon continues advertising v1.
+
 ## 0.32.2
 
 - Add optional `ScopeRecord.replace_only_if_idle` and `ScopeSelector.hold_presence`, with builder setters and false omitted from wire bytes. Both types remain non-exhaustive. Add `manifest::CAP_SCOPE_REPLACE_IF_IDLE_V1` (`scope-replace-if-idle/v1`) covering atomic idle-only rotation and connection-held presence; send these fields only after capability discovery. Add terminal `SCOPE_EPOCH_IN_USE` (`scope_epoch_in_use`) for per-record conditional replacement refusal.

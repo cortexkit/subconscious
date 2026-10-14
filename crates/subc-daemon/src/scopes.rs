@@ -1663,7 +1663,7 @@ impl ScopeTable {
         owner_configured: bool,
     ) -> Result<ScopeAdmission, ScopeAdmissionRefusal> {
         let admission = self.attribute(opener, target_module, selector, owner_configured)?;
-        self.check_bind_proof(selector)?;
+        self.check_bind_proof(opener, selector)?;
         Ok(admission)
     }
 
@@ -1671,9 +1671,12 @@ impl ScopeTable {
     /// admission. The forwarding entry owns the lease until failure or close;
     /// successful presence instead belongs to the client connection and survives
     /// route close. A failed bind never promotes its provisional presence.
+    /// Reserved openers are launch-attested carriers, not evidence of a live
+    /// host: their binds and requested presence do not count toward idleness.
     pub(crate) fn reserve_bind(
         &mut self,
         admission: &ScopeAdmission,
+        opener: &Principal,
         connection_id: ConnectionId,
         hold_presence: bool,
     ) -> BoundScope {
@@ -1684,11 +1687,14 @@ impl ScopeTable {
             .live
             .get_mut(&admission.stamp.scope_ref)
             .unwrap();
-        held.binds.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let counts_for_idle = !matches!(opener, Principal::Reserved { .. });
+        if counts_for_idle {
+            held.binds.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
         held.presence.retain(|_, present| {
             present.load(std::sync::atomic::Ordering::SeqCst) || Arc::strong_count(present) > 1
         });
-        let presence = if hold_presence {
+        let presence = if hold_presence && counts_for_idle {
             if let Some(present) = held.presence.get(&connection_id) {
                 Some(Arc::clone(present))
             } else if held.presence.len() < 8 {
@@ -1707,7 +1713,7 @@ impl ScopeTable {
             tag: admission.tag,
             _lease: Arc::new(ScopeBindLease {
                 binds: Arc::clone(&held.binds),
-                released: std::sync::atomic::AtomicBool::new(false),
+                released: std::sync::atomic::AtomicBool::new(!counts_for_idle),
                 presence,
             }),
         }
@@ -1716,10 +1722,16 @@ impl ScopeTable {
     /// Recheck only the proof constraint on the selected live epoch. Tag
     /// settlement still handles ended or changed scopes, preserving the bind
     /// behavior of records without a hash.
+    /// The daemon-stamped opener determines whether proof is needed; reserved
+    /// modules are already launch-attested, so any proof they send is ignored.
     pub(crate) fn check_bind_proof(
         &self,
+        opener: &Principal,
         selector: &ScopeSelector,
     ) -> Result<(), ScopeAdmissionRefusal> {
+        if matches!(opener, Principal::Reserved { .. }) {
+            return Ok(());
+        }
         let record = reserved_module_id(&selector.owner)
             .and_then(|owner| self.owners.get(owner))
             .and_then(|owner| owner.live.get(&selector.scope_ref))
@@ -1912,6 +1924,54 @@ mod tests {
 
     fn table() -> ScopeTable {
         ScopeTable::new([PREFRONTAL.to_string()])
+    }
+
+    #[test]
+    fn scope_bind_proof_non_reserved_openers_require_matching_proof() {
+        const HASH: &str = "4bb06f8e4e3a7715d201d573d0aa423762e55dabd61a2c02278fa56cc6d294e0";
+        const PROOF: &str = "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc";
+        let mut table = table();
+        let mut record = head("s", 1).with_bind_proof_sha256(Some(HASH.into()));
+        record.carriers.push(ScopeCarrier::new(Principal::Direct));
+        sync(&mut table, PREFRONTAL, conn(1), 1, vec![record]);
+        let selector = ScopeSelector::new(reserved(PREFRONTAL), "s", Some(1));
+        assert_eq!(
+            table
+                .admit(&Principal::Direct, AFT, &selector, true)
+                .unwrap_err()
+                .code,
+            error_codes::SCOPE_BIND_PROOF_REQUIRED
+        );
+        for opener in [Principal::Direct, Principal::Unverified] {
+            assert_eq!(
+                table.check_bind_proof(&opener, &selector).unwrap_err().code,
+                error_codes::SCOPE_BIND_PROOF_REQUIRED
+            );
+            assert_eq!(
+                table
+                    .check_bind_proof(
+                        &opener,
+                        &selector.clone().with_bind_proof(Some("wrong".into()))
+                    )
+                    .unwrap_err()
+                    .code,
+                error_codes::SCOPE_BIND_PROOF_MISMATCH
+            );
+            table
+                .check_bind_proof(
+                    &opener,
+                    &selector.clone().with_bind_proof(Some(PROOF.into())),
+                )
+                .unwrap();
+        }
+        table
+            .admit(
+                &Principal::Direct,
+                AFT,
+                &selector.with_bind_proof(Some(PROOF.into())),
+                true,
+            )
+            .unwrap();
     }
 
     #[test]

@@ -3,6 +3,58 @@ use subc_protocol::scope::ScopeRecordResult;
 const HASH: &str = "4bb06f8e4e3a7715d201d573d0aa423762e55dabd61a2c02278fa56cc6d294e0";
 const PROOF: &str = "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc";
 
+fn direct_session(epoch: u64) -> ScopeRecord {
+    let mut record = session(epoch);
+    record.carriers.push(ScopeCarrier::new(Principal::Direct));
+    record
+}
+
+#[tokio::test]
+async fn idle_replace_ignores_reserved_routes() {
+    for delta in [false, true] {
+        for opener in [OWNER, AFT] {
+            let mut rig = rig().await;
+            rig.sync(vec![session(1)]).await;
+            let mut route = rig
+                .bound(Some(opener), PLEXUS, Some(rig.selector("s", Some(1))))
+                .await;
+            assert_eq!(
+                change(&mut rig, vec![session(2).with_replace_only_if_idle(true)], delta)
+                    .await[0]
+                    .outcome,
+                ScopeRecordOutcome::Replaced
+            );
+            assert!(!rig.live(&route));
+            assert_eq!(route.closed_reason(), RouteCloseReason::ScopeEnded);
+        }
+    }
+}
+
+#[tokio::test]
+async fn reserved_hold_presence_records_nothing() {
+    for opener in [OWNER, AFT] {
+        let mut rig = rig().await;
+        rig.sync(vec![session(1)]).await;
+        let route = rig
+            .bound(
+                Some(opener),
+                PLEXUS,
+                Some(rig.selector("s", Some(1)).with_hold_presence(true)),
+            )
+            .await;
+        rig.handler
+            .cleanup_connection(rig.modules[PLEXUS].0.connection_id)
+            .unwrap();
+        assert!(!rig.live(&route));
+        assert_eq!(
+            change(&mut rig, vec![session(2).with_replace_only_if_idle(true)], true)
+                .await[0]
+                .outcome,
+            ScopeRecordOutcome::Replaced
+        );
+    }
+}
+
 async fn change(rig: &mut Rig, records: Vec<ScopeRecord>, delta: bool) -> Vec<ScopeRecordResult> {
     rig.generation += 1;
     let request = if delta {
@@ -41,11 +93,11 @@ fn refused(result: &ScopeRecordResult) {
 async fn idle_replace_refuses_live_route_then_succeeds_after_close() {
     for delta in [false, true] {
         let mut rig = rig().await;
-        rig.sync(vec![session(1)]).await;
+        rig.sync(vec![direct_session(1)]).await;
         let route = rig
-            .bound(Some(AFT), PLEXUS, Some(rig.selector("s", Some(1))))
+            .bound(None, PLEXUS, Some(rig.selector("s", Some(1))))
             .await;
-        let replacement = session(2)
+        let replacement = direct_session(2)
             .with_bind_proof_sha256(Some(HASH.into()))
             .with_replace_only_if_idle(true);
         let before = describe(&rig.handler, &rig.owner, OWNER, "s").await;
@@ -69,13 +121,13 @@ async fn idle_replace_refuses_live_route_then_succeeds_after_close() {
         let results = change(&mut rig, vec![replacement], delta).await;
         assert_eq!(results[0].outcome, ScopeRecordOutcome::Replaced);
         assert_eq!(
-            rig.refused(Some(AFT), PLEXUS, Some(rig.selector("s", Some(2))))
+            rig.refused(None, PLEXUS, Some(rig.selector("s", Some(2))))
                 .await,
             error_codes::SCOPE_BIND_PROOF_REQUIRED
         );
         let new_route = rig
             .bound(
-                Some(AFT),
+                None,
                 PLEXUS,
                 Some(
                     rig.selector("s", Some(2))
@@ -90,18 +142,18 @@ async fn idle_replace_refuses_live_route_then_succeeds_after_close() {
 #[tokio::test]
 async fn idle_hash_change_refuses_bound_but_unchanged_never_refuses() {
     let mut rig = rig().await;
-    rig.sync(vec![session(1)]).await;
+    rig.sync(vec![direct_session(1)]).await;
     let route = rig
-        .bound(Some(AFT), PLEXUS, Some(rig.selector("s", Some(1))))
+        .bound(None, PLEXUS, Some(rig.selector("s", Some(1))))
         .await;
     let results = change(
         &mut rig,
-        vec![session(1).with_replace_only_if_idle(true)],
+        vec![direct_session(1).with_replace_only_if_idle(true)],
         true,
     )
     .await;
     assert_eq!(results[0].outcome, ScopeRecordOutcome::Unchanged);
-    let update = session(1)
+    let update = direct_session(1)
         .with_bind_proof_sha256(Some(HASH.into()))
         .with_replace_only_if_idle(true);
     refused(&change(&mut rig, vec![update.clone()], true).await[0]);
@@ -115,13 +167,13 @@ async fn idle_hash_change_refuses_bound_but_unchanged_never_refuses() {
         ScopeRecordOutcome::Updated
     );
     assert_eq!(
-        rig.refused(Some(AFT), PLEXUS, Some(rig.selector("s", Some(1))))
+        rig.refused(None, PLEXUS, Some(rig.selector("s", Some(1))))
             .await,
         error_codes::SCOPE_BIND_PROOF_REQUIRED
     );
     let new_route = rig
         .bound(
-            Some(AFT),
+            None,
             PLEXUS,
             Some(
                 rig.selector("s", Some(1))
@@ -135,12 +187,12 @@ async fn idle_hash_change_refuses_bound_but_unchanged_never_refuses() {
 #[tokio::test]
 async fn unconditional_replace_still_closes_routes() {
     let mut rig = rig().await;
-    rig.sync(vec![session(1)]).await;
+    rig.sync(vec![direct_session(1)]).await;
     let mut route = rig
-        .bound(Some(AFT), PLEXUS, Some(rig.selector("s", Some(1))))
+        .bound(None, PLEXUS, Some(rig.selector("s", Some(1))))
         .await;
     assert_eq!(
-        change(&mut rig, vec![session(2)], true).await[0].outcome,
+        change(&mut rig, vec![direct_session(2)], true).await[0].outcome,
         ScopeRecordOutcome::Replaced
     );
     assert!(!rig.live(&route));
@@ -151,9 +203,9 @@ async fn unconditional_replace_still_closes_routes() {
 async fn idle_replace_counts_admitted_bind_before_egress_reservation() {
     use std::future::Future;
     let mut rig = rig().await;
-    rig.sync(vec![session(1)]).await;
+    rig.sync(vec![direct_session(1)]).await;
     let (client, mut rx, frame) =
-        rig.open_frame(Some(AFT), PLEXUS, Some(rig.selector("s", Some(1))));
+        rig.open_frame(None, PLEXUS, Some(rig.selector("s", Some(1))));
     for _ in 0..64 {
         client.egress.try_send(route_bind_ack(1)).unwrap();
     }
@@ -167,7 +219,7 @@ async fn idle_replace_counts_admitted_bind_before_egress_reservation() {
     refused(
         &change(
             &mut rig,
-            vec![session(2).with_replace_only_if_idle(true)],
+            vec![direct_session(2).with_replace_only_if_idle(true)],
             true,
         )
         .await[0],
@@ -179,7 +231,7 @@ async fn idle_replace_counts_admitted_bind_before_egress_reservation() {
     assert_eq!(
         change(
             &mut rig,
-            vec![session(2).with_replace_only_if_idle(true)],
+            vec![direct_session(2).with_replace_only_if_idle(true)],
             true
         )
         .await[0]
@@ -191,10 +243,10 @@ async fn idle_replace_counts_admitted_bind_before_egress_reservation() {
 #[tokio::test]
 async fn presence_survives_target_disconnect_until_holder_disconnect() {
     let mut rig = rig().await;
-    rig.sync(vec![session(1)]).await;
+    rig.sync(vec![direct_session(1)]).await;
     let route = rig
         .bound(
-            Some(AFT),
+            None,
             PLEXUS,
             Some(rig.selector("s", Some(1)).with_hold_presence(true)),
         )
@@ -203,7 +255,7 @@ async fn presence_survives_target_disconnect_until_holder_disconnect() {
         .cleanup_connection(rig.modules[PLEXUS].0.connection_id)
         .unwrap();
     assert!(!rig.live(&route));
-    let replacement = session(2).with_replace_only_if_idle(true);
+    let replacement = direct_session(2).with_replace_only_if_idle(true);
     refused(&change(&mut rig, vec![replacement.clone()], true).await[0]);
     rig.handler
         .cleanup_connection(route.client.connection_id)
@@ -217,11 +269,11 @@ async fn presence_survives_target_disconnect_until_holder_disconnect() {
 #[tokio::test]
 async fn refused_open_does_not_hold_presence() {
     let mut rig = rig().await;
-    rig.sync(vec![session(1).with_bind_proof_sha256(Some(HASH.into()))])
+    rig.sync(vec![direct_session(1).with_bind_proof_sha256(Some(HASH.into()))])
         .await;
     assert_eq!(
         rig.refused(
-            Some(AFT),
+            None,
             PLEXUS,
             Some(rig.selector("s", Some(1)).with_hold_presence(true))
         )
@@ -231,7 +283,7 @@ async fn refused_open_does_not_hold_presence() {
     assert_eq!(
         change(
             &mut rig,
-            vec![session(2).with_replace_only_if_idle(true)],
+            vec![direct_session(2).with_replace_only_if_idle(true)],
             true
         )
         .await[0]
@@ -243,23 +295,23 @@ async fn refused_open_does_not_hold_presence() {
 #[tokio::test]
 async fn unconditional_replace_drops_old_epoch_presence() {
     let mut rig = rig().await;
-    rig.sync(vec![session(1)]).await;
+    rig.sync(vec![direct_session(1)]).await;
     let route = rig
         .bound(
-            Some(AFT),
+            None,
             PLEXUS,
             Some(rig.selector("s", Some(1)).with_hold_presence(true)),
         )
         .await;
     assert_eq!(
-        change(&mut rig, vec![session(2)], true).await[0].outcome,
+        change(&mut rig, vec![direct_session(2)], true).await[0].outcome,
         ScopeRecordOutcome::Replaced
     );
     assert!(!rig.live(&route));
     assert_eq!(
         change(
             &mut rig,
-            vec![session(3).with_replace_only_if_idle(true)],
+            vec![direct_session(3).with_replace_only_if_idle(true)],
             true
         )
         .await[0]
@@ -271,12 +323,12 @@ async fn unconditional_replace_drops_old_epoch_presence() {
 #[tokio::test]
 async fn presence_holder_limit_does_not_refuse_opens() {
     let mut rig = rig().await;
-    rig.sync(vec![session(1)]).await;
+    rig.sync(vec![direct_session(1)]).await;
     let mut routes = Vec::new();
     for _ in 0..9 {
         routes.push(
             rig.bound(
-                Some(AFT),
+                None,
                 PLEXUS,
                 Some(rig.selector("s", Some(1)).with_hold_presence(true)),
             )
@@ -286,7 +338,7 @@ async fn presence_holder_limit_does_not_refuse_opens() {
     rig.handler
         .cleanup_connection(rig.modules[PLEXUS].0.connection_id)
         .unwrap();
-    let replacement = session(2).with_replace_only_if_idle(true);
+    let replacement = direct_session(2).with_replace_only_if_idle(true);
     refused(&change(&mut rig, vec![replacement.clone()], true).await[0]);
     for route in &routes[..8] {
         rig.handler
@@ -302,7 +354,7 @@ async fn presence_holder_limit_does_not_refuse_opens() {
 #[tokio::test]
 async fn idle_condition_is_checked_under_scope_write_lock() {
     let mut rig = rig().await;
-    rig.sync(vec![session(1)]).await;
+    rig.sync(vec![direct_session(1)]).await;
     let scopes = Arc::downgrade(&rig.handler.scopes);
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let observed = Arc::clone(&calls);
@@ -321,7 +373,7 @@ async fn idle_condition_is_checked_under_scope_write_lock() {
     assert_eq!(
         change(
             &mut rig,
-            vec![session(2).with_replace_only_if_idle(true)],
+            vec![direct_session(2).with_replace_only_if_idle(true)],
             true
         )
         .await[0]
@@ -334,9 +386,9 @@ async fn idle_condition_is_checked_under_scope_write_lock() {
 #[tokio::test]
 async fn closed_route_snapshots_do_not_keep_epoch_busy() {
     let mut rig = rig().await;
-    rig.sync(vec![session(1)]).await;
+    rig.sync(vec![direct_session(1)]).await;
     let route = rig
-        .bound(Some(AFT), PLEXUS, Some(rig.selector("s", Some(1))))
+        .bound(None, PLEXUS, Some(rig.selector("s", Some(1))))
         .await;
     let snapshot = rig
         .forwarding
@@ -348,7 +400,7 @@ async fn closed_route_snapshots_do_not_keep_epoch_busy() {
     assert_eq!(
         change(
             &mut rig,
-            vec![session(2).with_replace_only_if_idle(true)],
+            vec![direct_session(2).with_replace_only_if_idle(true)],
             true
         )
         .await[0]
@@ -361,10 +413,10 @@ async fn closed_route_snapshots_do_not_keep_epoch_busy() {
 #[tokio::test]
 async fn module_refused_open_does_not_hold_presence() {
     let mut rig = rig().await;
-    rig.sync(vec![session(1)]).await;
+    rig.sync(vec![direct_session(1)]).await;
     let relayed = rig
         .relayed(
-            Some(AFT),
+            None,
             PLEXUS,
             Some(rig.selector("s", Some(1)).with_hold_presence(true)),
         )
@@ -383,7 +435,7 @@ async fn module_refused_open_does_not_hold_presence() {
     assert_eq!(
         change(
             &mut rig,
-            vec![session(2).with_replace_only_if_idle(true)],
+            vec![direct_session(2).with_replace_only_if_idle(true)],
             true
         )
         .await[0]

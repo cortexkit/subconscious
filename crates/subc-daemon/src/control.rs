@@ -848,6 +848,7 @@ impl ControlHandler {
                 CAP_ROUTE_ROLE_VERSIONS_V1.to_string(),
                 subc_protocol::manifest::CAP_CATALOG_EVENTS_V1.to_string(),
                 subc_protocol::manifest::CAP_SCOPE_BIND_PROOF_V1.to_string(),
+                subc_protocol::manifest::CAP_SCOPE_BIND_PROOF_V2.to_string(),
                 subc_protocol::manifest::CAP_SCOPE_REPLACE_IF_IDLE_V1.to_string(),
                 subc_control::ACTIVITY_LEDGER_CAPABILITY.to_string(),
             ]),
@@ -4380,6 +4381,7 @@ impl ControlHandler {
                         )?;
                         let bound = scopes.reserve_bind(
                             &admission,
+                            &principal,
                             ctx.connection_id,
                             selector.hold_presence,
                         );
@@ -4553,7 +4555,7 @@ impl ControlHandler {
                 .scopes
                 .read()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .check_bind_proof(selector)
+                .check_bind_proof(&principal, selector)
             {
                 reservation.release_and_disarm();
                 return Ok(vec![self.route_open_refusal_frame(
@@ -11124,6 +11126,10 @@ mod tests {
             "{:?}",
             ack.subc_capabilities
         );
+        assert!(ack
+            .subc_capabilities
+            .iter()
+            .any(|c| c == subc_protocol::manifest::CAP_SCOPE_BIND_PROOF_V2));
 
         let (client, _client_rx) = route_ctx(ConnectionId::new(153));
         let body = serde_json::to_vec(&ClientControlRequest::ServerDescribe {}).unwrap();
@@ -11145,6 +11151,9 @@ mod tests {
                 .any(|c| c == subc_protocol::manifest::CAP_SCOPE_BIND_PROOF_V1),
             "{capabilities:?}"
         );
+        assert!(capabilities
+            .iter()
+            .any(|c| c == subc_protocol::manifest::CAP_SCOPE_BIND_PROOF_V2));
     }
 
     #[tokio::test]
@@ -15531,10 +15540,11 @@ mod tests {
             const NEXT_HASH: &str =
                 "2578ccf8645b2d1dc10c465eff843585970f3a7e22296a92cad55d489a272072";
             let mut rig = rig().await;
-            rig.sync(vec![session(1).with_bind_proof_sha256(Some(HASH.into()))])
-                .await;
+            let mut record = session(1).with_bind_proof_sha256(Some(HASH.into()));
+            record.carriers.push(ScopeCarrier::new(Principal::Direct));
+            rig.sync(vec![record.clone()]).await;
             let (client, mut rx, frame) = rig.open_frame(
-                Some(AFT),
+                None,
                 PLEXUS,
                 Some(
                     rig.selector("s", Some(1))
@@ -15553,10 +15563,8 @@ mod tests {
                 std::task::Poll::Ready(())
             })
             .await;
-            rig.sync(vec![
-                session(1).with_bind_proof_sha256(Some(NEXT_HASH.into()))
-            ])
-            .await;
+            record.bind_proof_sha256 = Some(NEXT_HASH.into());
+            rig.sync(vec![record]).await;
             rx.try_recv().unwrap();
             let replies = tokio::time::timeout(Duration::from_secs(2), open)
                 .await
@@ -15569,6 +15577,83 @@ mod tests {
             assert!(!String::from_utf8_lossy(&replies[0].body).contains(PROOF));
             assert!(rig.modules.get_mut(PLEXUS).unwrap().1.try_recv().is_err());
             assert_eq!(rig.forwarding.reserved_route_count().unwrap(), (0, 0));
+        }
+
+        #[tokio::test]
+        async fn scope_bind_proof_reserved_openers_ignore_proof() {
+            const HASH: &str = "4bb06f8e4e3a7715d201d573d0aa423762e55dabd61a2c02278fa56cc6d294e0";
+            let mut rig = rig().await;
+            rig.sync(vec![session(1).with_bind_proof_sha256(Some(HASH.into()))])
+                .await;
+            for opener in [OWNER, AFT] {
+                for proof in [None, Some("malformed+proof=")] {
+                    let route = rig
+                        .bound(
+                            Some(opener),
+                            PLEXUS,
+                            Some(
+                                rig.selector("s", Some(1))
+                                    .with_bind_proof(proof.map(str::to_string)),
+                            ),
+                        )
+                        .await;
+                    assert!(rig.live(&route));
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn scope_bind_proof_reserved_opener_passes_hash_change_before_captured_relay() {
+            use std::future::Future;
+            const HASH: &str = "4bb06f8e4e3a7715d201d573d0aa423762e55dabd61a2c02278fa56cc6d294e0";
+            const NEXT_HASH: &str =
+                "2578ccf8645b2d1dc10c465eff843585970f3a7e22296a92cad55d489a272072";
+            let mut rig = rig().await;
+            rig.sync(vec![session(1).with_bind_proof_sha256(Some(HASH.into()))])
+                .await;
+            let (client, mut rx, frame) =
+                rig.open_frame(Some(AFT), PLEXUS, Some(rig.selector("s", Some(1))));
+            for _ in 0..64 {
+                client.egress.try_send(route_bind_ack(1)).unwrap();
+            }
+            let handler = rig.handler.clone();
+            let mut open = Box::pin(handler.handle_control_frame(&client, frame));
+            std::future::poll_fn(|cx| {
+                assert!(open.as_mut().poll(cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            rig.sync(vec![
+                session(1).with_bind_proof_sha256(Some(NEXT_HASH.into()))
+            ])
+            .await;
+            rx.try_recv().unwrap();
+            let (_, module_rx) = rig.modules.get_mut(PLEXUS).unwrap();
+            let bind = std::future::poll_fn(|cx| {
+                assert!(open.as_mut().poll(cx).is_pending());
+                module_rx.poll_recv(cx)
+            })
+            .await
+            .unwrap()
+            .frame;
+            handler
+                .handle_control_frame(&rig.modules[PLEXUS].0, route_bind_ack(bind.header.corr))
+                .await
+                .unwrap();
+            let replies = tokio::time::timeout(Duration::from_secs(2), open)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(replies.len(), 1);
+            // Proof rechecking allowed the relay. Independent tag settlement
+            // still asks the opener to retry after any same-epoch content change.
+            assert_eq!(parse_error(&replies[0])["code"], error_codes::SCOPE_CHANGED);
+            assert_eq!(rig.forwarding.reserved_route_count().unwrap(), (0, 0));
+            while rig.modules.get_mut(PLEXUS).unwrap().1.try_recv().is_ok() {}
+            let route = rig
+                .bound(Some(AFT), PLEXUS, Some(rig.selector("s", Some(1))))
+                .await;
+            assert!(rig.live(&route));
         }
 
         #[tokio::test]

@@ -2,6 +2,7 @@
 prebuild = [
   { name = "daemon-fixture-binaries", command = ["cargo", "build", "-p", "subc-daemon", "--bins", "--features", "test-support", "--locked"], timeout_s = 1800 },
   { name = "core-fixture-binaries", command = ["cargo", "build", "-p", "subc-core", "--bins", "--features", "test-support", "--locked"], timeout_s = 1800 },
+  { name = "operator-confirm-module-fixture", command = ["cargo", "build", "-p", "subc-client-rs", "--example", "operator-confirm-module", "--locked"], timeout_s = 1800 },
 ]
 
 [[control]]

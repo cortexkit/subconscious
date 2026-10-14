@@ -2952,19 +2952,24 @@ async fn module_terminals_renders_one_record_byte_for_byte() {
     ));
     let entry = &json["entries"][0];
     assert_eq!(json["entries"].as_array().unwrap().len(), 1);
-    let when = age_from_ms(entry["at_ms"].as_u64().unwrap());
+    let at_ms = entry["at_ms"].as_u64().unwrap();
+    let fixed_now_ms = at_ms - 7 * 24 * 60 * 60 * 1_000;
     let disposition = entry["disposition"]
         .as_str()
         .unwrap()
         .replace(['_', '-'], " ");
 
-    let output = ck_with_subc(&server.connection_file_path, ["module", "terminals", "aft"]);
+    let output = ck_with_subc_at_now(
+        &server.connection_file_path,
+        ["module", "terminals", "aft"],
+        fixed_now_ms,
+    );
     assert_exit(&output, 0);
     assert_eq!(
         text(&output.stdout),
         single_row_table(
             ["when", "exit", "disposition", "daemon"],
-            [&when, "exit 7", &disposition, "-"]
+            ["in 7d", "exit 7", &disposition, "-"]
         )
     );
 
@@ -3924,6 +3929,20 @@ fn system_path_only() -> std::ffi::OsString {
 fn ck_with_subc<const N: usize>(connection_file: &Path, args: [&str; N]) -> Output {
     let mut command = ck_command();
     command.args(args).arg("--subc").arg(connection_file);
+    command.output().unwrap()
+}
+
+fn ck_with_subc_at_now<const N: usize>(
+    connection_file: &Path,
+    args: [&str; N],
+    now_ms: u64,
+) -> Output {
+    let mut command = ck_command();
+    command
+        .env("CK_TEST_TERMINALS_NOW_MS", now_ms.to_string())
+        .args(args)
+        .arg("--subc")
+        .arg(connection_file);
     command.output().unwrap()
 }
 

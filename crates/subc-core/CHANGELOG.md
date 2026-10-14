@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.20.90
+
+- Keep terminal-table byte-for-byte rendering deterministic by allowing the test-support CLI to use a fixed clock for relative ages.
+
 ## 0.20.89
 
 - Upgrade the daemon and SDK wire crates for per-scope bind proofs. Add real-daemon tests, each starting its own daemon on a throwaway data, runtime and config folder, for a missing, wrong, malformed and matching proof, the owner needing the proof too, a new epoch replacing the hash, and unchanged admission for scopes registered without a hash.

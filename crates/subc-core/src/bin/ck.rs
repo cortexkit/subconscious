@@ -7068,10 +7068,20 @@ fn format_duration(duration: Duration) -> String {
 }
 
 fn format_age_from_epoch_ms_now(timestamp_ms: u64) -> String {
-    let now_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as u64)
-        .unwrap_or(timestamp_ms);
+    #[cfg(feature = "test-support")]
+    let test_now_ms = env::var_os("CK_TEST_TERMINALS_NOW_MS")
+        .and_then(|value| value.to_str()?.parse::<u64>().ok());
+    #[cfg(not(feature = "test-support"))]
+    let test_now_ms: Option<u64> = None;
+
+    // The exact-output CLI test fixes this clock so slow runners cannot cross
+    // a relative-age boundary while the table's byte layout is asserted.
+    let now_ms = test_now_ms.unwrap_or_else(|| {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as u64)
+            .unwrap_or(timestamp_ms)
+    });
     format_age_from_epoch_ms(timestamp_ms, now_ms)
 }
 

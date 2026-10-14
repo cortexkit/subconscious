@@ -410,6 +410,65 @@ struct RouteOpenRequest {
     scope: Option<ScopeSelector>,
 }
 
+#[derive(Clone, Copy)]
+enum RouteOpenPhase {
+    Admission,
+    ProjectRoot,
+    EgressReservation,
+    BindSend,
+    BindAckWait,
+}
+
+/// Store elapsed time for each route-open phase, including attempts that end
+/// in an early refusal or backend error. Admission also includes rechecks and
+/// commit bookkeeping performed between the other timed phases.
+struct RouteOpenTimings {
+    module_id: String,
+    principal: String,
+    admission: Duration,
+    project_root: Duration,
+    egress_reservation: Duration,
+    bind_send: Duration,
+    bind_ack_wait: Duration,
+    phase: Option<RouteOpenPhase>,
+    phase_started_at: Instant,
+}
+
+impl RouteOpenTimings {
+    fn new() -> Self {
+        Self {
+            module_id: String::new(),
+            // Refusals before attestation must not claim a verified principal.
+            principal: "unresolved".to_string(),
+            admission: Duration::ZERO,
+            project_root: Duration::ZERO,
+            egress_reservation: Duration::ZERO,
+            bind_send: Duration::ZERO,
+            bind_ack_wait: Duration::ZERO,
+            phase: Some(RouteOpenPhase::Admission),
+            phase_started_at: Instant::now(),
+        }
+    }
+
+    fn finish(&mut self) {
+        let elapsed = self.phase_started_at.elapsed();
+        match self.phase.take() {
+            Some(RouteOpenPhase::Admission) => self.admission += elapsed,
+            Some(RouteOpenPhase::ProjectRoot) => self.project_root += elapsed,
+            Some(RouteOpenPhase::EgressReservation) => self.egress_reservation += elapsed,
+            Some(RouteOpenPhase::BindSend) => self.bind_send += elapsed,
+            Some(RouteOpenPhase::BindAckWait) => self.bind_ack_wait += elapsed,
+            None => {}
+        }
+    }
+
+    fn enter(&mut self, phase: RouteOpenPhase) {
+        self.finish();
+        self.phase = Some(phase);
+        self.phase_started_at = Instant::now();
+    }
+}
+
 struct RouteBindReservationGuard {
     forwarding: Arc<ForwardingTable>,
     endpoint: ModuleEndpointId,
@@ -1760,7 +1819,13 @@ impl ControlHandler {
                     log_control_dispatch_arrival(op, ctx.connection_id, corr);
                     let result =
                         self.handle_module_control_request(ctx.connection_id, frame, request);
-                    log_slow_control_dispatch(dispatch_started_at, op, ctx.connection_id, corr);
+                    log_slow_control_dispatch(
+                        dispatch_started_at,
+                        op,
+                        ctx.connection_id,
+                        corr,
+                        None,
+                    );
                     return result;
                 }
 
@@ -1792,14 +1857,24 @@ impl ControlHandler {
                 let op = client_control_request_op(&request);
                 let corr = frame.header.corr;
                 log_control_dispatch_arrival(op, ctx.connection_id, corr);
+                let mut route_open_timings = (op == ops::ROUTE_OPEN).then(RouteOpenTimings::new);
                 #[cfg(test)]
                 if let Some(delay) = self.control_dispatch_delay {
                     tokio::time::sleep(delay).await;
                 }
                 let result = self
-                    .handle_client_control_request(ctx, frame, request)
+                    .handle_client_control_request(ctx, frame, request, &mut route_open_timings)
                     .await;
-                log_slow_control_dispatch(dispatch_started_at, op, ctx.connection_id, corr);
+                if let Some(timings) = route_open_timings.as_mut() {
+                    timings.finish();
+                }
+                log_slow_control_dispatch(
+                    dispatch_started_at,
+                    op,
+                    ctx.connection_id,
+                    corr,
+                    route_open_timings.as_ref(),
+                );
                 result
             }
             FrameType::Push => {
@@ -2638,6 +2713,7 @@ impl ControlHandler {
         ctx: &RouteCtx,
         frame: Frame,
         request: ClientControlRequest,
+        route_open_timings: &mut Option<RouteOpenTimings>,
     ) -> Result<Vec<Frame>, RouterError> {
         if let Some(operation) = privileged_operation(&request) {
             let caller = self.resolve_caller(ctx.connection_id).await;
@@ -2689,6 +2765,7 @@ impl ControlHandler {
                         admission_facts,
                         scope,
                     },
+                    route_open_timings.get_or_insert_with(RouteOpenTimings::new),
                 )
                 .await
             }
@@ -3942,6 +4019,7 @@ impl ControlHandler {
         ctx: &RouteCtx,
         frame: Frame,
         request: RouteOpenRequest,
+        timings: &mut RouteOpenTimings,
     ) -> Result<Vec<Frame>, RouterError> {
         let RouteOpenRequest {
             target,
@@ -3953,6 +4031,7 @@ impl ControlHandler {
             scope,
         } = request;
         let target_module_id = target_module_id(&target).to_string();
+        timings.module_id.clone_from(&target_module_id);
         if self
             .registry
             .get_module_by_connection(ctx.connection_id)
@@ -4270,6 +4349,7 @@ impl ControlHandler {
                 return Ok(vec![error]);
             }
         };
+        timings.principal = principal_label(&principal);
 
         // This is attested, control-plane policy for supervised module origins.
         // Keep it before route reservation and out of the opaque forwarding hot
@@ -4424,6 +4504,7 @@ impl ControlHandler {
         // admitted under. Lexical cleanup would mint a DIFFERENT identity for the
         // same caller the moment the directory vanished, which strands the run more
         // quietly than refusing it.
+        timings.enter(RouteOpenPhase::ProjectRoot);
         let project_root = match ProjectRootId::from_path_allowing_missing(&identity.project_root) {
             Ok(project_root) => project_root,
             Err(err) => {
@@ -4434,6 +4515,7 @@ impl ControlHandler {
                 )?])
             }
         };
+        timings.enter(RouteOpenPhase::Admission);
         identity.project_root = project_root.as_path().to_path_buf();
 
         // Last gate before any relay work, and deliberately after the cheap
@@ -4496,6 +4578,7 @@ impl ControlHandler {
         // daemons) wins over the daemon-wide default.
         let route_bind_relay_timeout = self.route_bind_relay_timeout_for(&target_module_id);
         let relay_deadline = Instant::now() + route_bind_relay_timeout;
+        timings.enter(RouteOpenPhase::EgressReservation);
         let pending = match self
             .forwarding
             .begin_route_bind_relay_for(
@@ -4523,6 +4606,7 @@ impl ControlHandler {
                 )?])
             }
         };
+        timings.enter(RouteOpenPhase::Admission);
         let crate::forwarding::PendingRouteBindRelay {
             endpoint,
             module_sink,
@@ -4650,7 +4734,10 @@ impl ControlHandler {
         )
         .map_err(RouterError::FrameBuild)?;
 
-        if let Err(err) = module_sink.send(relay_frame).await {
+        timings.enter(RouteOpenPhase::BindSend);
+        let sent = module_sink.send(relay_frame).await;
+        timings.enter(RouteOpenPhase::Admission);
+        if let Err(err) = sent {
             reservation.release_and_disarm();
             return Ok(vec![self.route_open_refusal_frame(
                 ctx,
@@ -4689,7 +4776,10 @@ impl ControlHandler {
             );
         }
 
-        match timeout_at(relay_deadline, receiver).await {
+        timings.enter(RouteOpenPhase::BindAckWait);
+        let outcome = timeout_at(relay_deadline, receiver).await;
+        timings.enter(RouteOpenPhase::Admission);
+        match outcome {
             Ok(Ok(RouteBindRelayOutcome::Accepted)) => {
                 reservation.disarm();
                 if breaker.record_accepted() {
@@ -6693,12 +6783,31 @@ fn log_slow_control_dispatch(
     op: &'static str,
     connection_id: ConnectionId,
     corr: u64,
+    route_open_timings: Option<&RouteOpenTimings>,
 ) {
     let Some(dispatch_started_at) = dispatch_started_at else {
         return;
     };
-    let elapsed = dispatch_started_at.elapsed();
+    // Use the same monotonic clock as the phase timers and relay deadline.
+    let elapsed = Instant::from_std(dispatch_started_at).elapsed();
     if elapsed >= SLOW_CONTROL_DISPATCH_THRESHOLD {
+        if let Some(timings) = route_open_timings {
+            warn!(
+                op = %op,
+                connection_id = connection_id.get(),
+                corr,
+                elapsed_ms = elapsed.as_millis() as u64,
+                module_id = ?timings.module_id,
+                principal = %timings.principal,
+                admission_ms = timings.admission.as_millis() as u64,
+                project_root_ms = timings.project_root.as_millis() as u64,
+                egress_reservation_ms = timings.egress_reservation.as_millis() as u64,
+                bind_send_ms = timings.bind_send.as_millis() as u64,
+                bind_ack_wait_ms = timings.bind_ack_wait.as_millis() as u64,
+                "slow control dispatch"
+            );
+            return;
+        }
         warn!(
             op = %op,
             connection_id = connection_id.get(),
@@ -11445,6 +11554,7 @@ mod tests {
                     module_id: "broca".to_string(),
                     enabled: false,
                 },
+                &mut None,
             )
             .await
             .unwrap();
@@ -11501,6 +11611,7 @@ mod tests {
                     module_id: "broca".to_string(),
                     enabled: false,
                 },
+                &mut None,
             )
             .await
             .unwrap();
@@ -11527,7 +11638,12 @@ mod tests {
         let frame = Frame::build(FrameType::Request, control_flags(), 0, 0, 2, Vec::new()).unwrap();
 
         handler
-            .handle_client_control_request(&ctx, frame, ClientControlRequest::SupervisorList {})
+            .handle_client_control_request(
+                &ctx,
+                frame,
+                ClientControlRequest::SupervisorList {},
+                &mut None,
+            )
             .await
             .unwrap();
 
@@ -11550,6 +11666,7 @@ mod tests {
                 &ctx,
                 frame,
                 ClientControlRequest::SupervisorRescan { preview: true },
+                &mut None,
             )
             .await
             .unwrap();
@@ -14469,6 +14586,10 @@ mod tests {
         mod idle_tests {
             use super::*;
             include!("scope_idle_tests.rs");
+        }
+        mod route_open_timings {
+            use super::*;
+            include!("route_open_timing_tests.rs");
         }
         mod activity {
             include!("activity_scope_tests.rs");

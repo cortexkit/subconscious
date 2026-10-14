@@ -42,6 +42,7 @@ async fn request(
             ctx,
             Frame::build(FrameType::Request, control_flags(), 0, 0, 1, Vec::new()).unwrap(),
             body,
+            &mut None,
         )
         .await
         .unwrap()

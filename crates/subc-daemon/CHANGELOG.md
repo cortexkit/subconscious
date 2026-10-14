@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.36.4
+
+- Slow `route.open` dispatch warnings now name the target module and attested opener and report time spent in admission and scope checks, project-root filesystem resolution, egress reservation, bind send, and the bind ACK wait. Fast opens emit no additional logs; routing and scope admission semantics are unchanged. Refusals before opener attestation report `principal=unresolved`.
+
 ## 0.36.3
 
 - Require scope bind proofs only from non-reserved daemon-stamped openers, both at admission and before captured relay. Launch-attested reserved owners and carriers need no proof and ignore any proof sent. Their binds do not count toward idle-only rotation, and their `hold_presence` records no presence. Advertise `scope-bind-proof/v2` alongside v1 and `scope-replace-if-idle/v1`; owners can gate hashes on v2.

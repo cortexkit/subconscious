@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.20.86
+## 0.20.87
 
 - Update the internal CLI and daemon executable to `subc-daemon` 0.35, which adds the `privileged_operator_prompt` config key and the matching restart-required section. Setup reports a pending `privileged_operator_prompt` edit on a live host as restart-required.
 - `ck` allows an extra 290 seconds (the daemon's default operator budget) for every privileged command before reporting outcome-unknown, against any daemon and in both modes, because the wire does not say whether a request will prompt. `ck module restart` now reports outcome-unknown after 300 seconds instead of 10 when the daemon never replies; `ck` still never retries. Replies that arrive are handled as before.

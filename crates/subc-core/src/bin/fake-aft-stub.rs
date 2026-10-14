@@ -42,6 +42,9 @@ use tokio::{
 
 const FAKE_AFT_MODULE_ID_ENV: &str = "FAKE_AFT_MODULE_ID";
 const FAKE_AFT_CRASH_AFTER_MS_ENV: &str = "FAKE_AFT_CRASH_AFTER_MS";
+/// After registration, spawn a descendant that ignores daemon EOF and retains
+/// the module's stderr writer, so only process-tree containment can reap it.
+const FAKE_AFT_CONTAINMENT_WITNESS_ENV: &str = "FAKE_AFT_CONTAINMENT_WITNESS";
 /// Exit 2 on a bound-route request so tests can finish attaching before a crash.
 const FAKE_AFT_CRASH_ON_REQUEST_ENV: &str = "FAKE_AFT_CRASH_ON_REQUEST";
 /// Exit 0 after the delay: exercises the supervisor's clean-exit arm, which
@@ -435,6 +438,44 @@ fn spawn_grandchild_if_requested() -> Result<(), StubError> {
     Ok(())
 }
 
+fn spawn_containment_witness_if_requested(config: &StubConfig) -> Result<(), StubError> {
+    if !env_flag(FAKE_AFT_CONTAINMENT_WITNESS_ENV) {
+        return Ok(());
+    }
+    let child = Command::new(env::current_exe().map_err(StubError::Io)?)
+        .env(FAKE_AFT_GRANDCHILD_MODE_ENV, "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(StubError::Io)?;
+    let pid = child.id();
+    let creation = subc_os::start_time(pid).ok_or_else(|| {
+        StubError::Io(io::Error::other(
+            "containment witness creation time unavailable",
+        ))
+    })?;
+    let parent_creation = subc_os::start_time(std::process::id()).ok_or_else(|| {
+        StubError::Io(io::Error::other(
+            "containment witness parent creation time unavailable",
+        ))
+    })?;
+    record_event(
+        config,
+        json!({
+            "kind": "containment_witness_spawned",
+            "parent_pid": std::process::id(),
+            "parent_creation": parent_creation,
+            "pid": pid,
+            "creation": creation,
+        }),
+    )?;
+    // Dropping Child does not terminate the parked descendant. Its process and
+    // stderr writer must be reclaimed by the supervising process group or job.
+    drop(child);
+    Ok(())
+}
+
 fn announce_never_connect_ready() -> Result<(), StubError> {
     let Ok(path) = env::var(FAKE_AFT_NEVER_CONNECT_READY_PATH_ENV) else {
         return Ok(());
@@ -706,6 +747,7 @@ where
 
     send_hello(&writer, &config).await?;
     expect_hello_ack(read_half).await?;
+    spawn_containment_witness_if_requested(&config)?;
 
     if let Some(path) = config.launch_nonce_path.clone() {
         write_launch_nonce(&path, config.launch_nonce.as_deref())?;

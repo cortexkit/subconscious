@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.20.93
+
+- Test-only: let the fake module opt into parked grandchildren that ignore daemon EOF and retain its stderr writer. Strengthen the Windows crash/respawn hard-kill regression to verify both generations' descendants, alternating tree kills and daemon-only termination with a separate sampling gate for each mode.
+
 ## 0.20.92
 
 - Ship daemon 0.36.2's atomic idle-only scope rotation and connection-held presence support; add `scope_epoch_in_use` to the shared terminal-code contract checks.

@@ -28,6 +28,101 @@ struct TestServer {
     daemon: TestDaemon,
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delayed_call_receipt_precedes_crash_and_client_survives_respawn() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor(&server, 3, Duration::from_millis(100))
+        .with_forwarding(Arc::clone(&server.forwarding));
+    let module_id = "delayed-crash-receipt";
+    let events = server.temp_dir.join("delayed-crash-events.jsonl");
+    let events_path = events.to_string_lossy();
+    let module = spawn_stub_with_env(
+        &server,
+        &supervisor,
+        module_id,
+        [
+            ("FAKE_AFT_CRASH_AFTER_MS", "2500"),
+            ("FAKE_AFT_EVENTS_PATH", events_path.as_ref()),
+        ],
+    )
+    .await;
+    let client = Arc::new(
+        subc_client_rs::SubcConsumer::connect(&server.connection_file_path, Default::default())
+            .await
+            .unwrap(),
+    );
+    let call_client = Arc::clone(&client);
+    let identity =
+        subc_protocol::BindIdentity::new(server.temp_dir.path(), "kill-regression", "receipt");
+    let call_identity = identity.clone();
+    let target = subc_protocol::RouteTarget::ToolProvider {
+        module_id: module_id.to_owned(),
+    };
+    let call_target = target.clone();
+    let call = tokio::spawn(async move {
+        call_client
+            .call(
+                call_target,
+                call_identity,
+                serde_json::to_vec(&serde_json::json!({
+                    "name": "fake_read", "arguments": { "delay_ms": 30_000 }
+                }))
+                .unwrap(),
+                subc_client_rs::CallOptions {
+                    timeout: Duration::from_secs(10),
+                    ..Default::default()
+                },
+            )
+            .await
+    });
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let received = std::fs::read_to_string(&events)
+            .unwrap_or_default()
+            .lines()
+            .any(|line| {
+                serde_json::from_str::<serde_json::Value>(line).is_ok_and(|event| {
+                    event["kind"] == "request_received"
+                        && event["body_json"]["name"] == "fake_read"
+                        && event["body_json"]["arguments"]["delay_ms"] == 30_000
+                })
+            });
+        if received {
+            break;
+        }
+        assert!(
+            !call.is_finished() && Instant::now() < deadline,
+            "the delayed request must be received before the initial crash"
+        );
+        sleep(Duration::from_millis(10)).await;
+    }
+    assert!(!call.is_finished(), "receipt precedes response completion");
+    assert!(timeout(Duration::from_secs(5), call)
+        .await
+        .unwrap()
+        .unwrap()
+        .is_err());
+    wait_for_status(&module, Duration::from_secs(5), |status| {
+        status.spawn_generation == 2 && status.live
+    })
+    .await;
+    // The retained consumer can send to the replacement after its first call
+    // fails; observing receipt never requires waiting for a delayed response.
+    client
+        .call(
+            target,
+            identity,
+            serde_json::to_vec(&serde_json::json!({"name": "fake_read", "arguments": {}})).unwrap(),
+            subc_client_rs::CallOptions {
+                timeout: Duration::from_secs(2),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    module.stop().await.unwrap();
+}
+
 impl TestServer {
     async fn start() -> Self {
         Self {

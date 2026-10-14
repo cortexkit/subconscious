@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.20.91
+
+- `ck`'s fixed test clock now lives in a helper chosen at build time, so release builds read the real clock with no constant-None call that release-profile clippy refuses.
+
 ## 0.20.90
 
 - Keep terminal-table byte-for-byte rendering deterministic by allowing the test-support CLI to use a fixed clock for relative ages.

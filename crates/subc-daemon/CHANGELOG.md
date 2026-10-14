@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.36.5
+
+- Always refuse module→client frames whose header plus body exceeds the client sink's total egress byte budget (4 MiB), even though previously they could pass through an empty queue. Oversized replies become daemon-origin `ERROR frame_too_large` on the same channel/epoch/correlation, ending only that request; other routes on the connection remain usable. Oversized reverse Requests are answered with the same ERROR to the module instead of reaching the client. This backstop complements the fleet's 3 MiB per-frame rule. A frame that would fit an empty queue but meets a full one is different: the client has stopped reading, so the slow client is still closed as before. The same applies when the replacement ERROR itself meets a full queue, so the module's frame reader never waits on a stuck client.
+- An oversized Push remains the one oversize case that closes the client connection, with a WARN naming the module, client principal, channel, frame size and limit. Route-local recovery requires a dedicated `route.closed` reason and a decoder-first rollout because deployed Rust clients cannot decode new reason variants. Control and other egress admission accounting is unchanged.
+
 ## 0.36.4
 
 - Slow `route.open` dispatch warnings now name the target module and attested opener and report time spent in admission and scope checks, project-root filesystem resolution, egress reservation, bind send, and the bind ACK wait. Fast opens emit no additional logs; routing and scope admission semantics are unchanged. Refusals before opener attestation report `principal=unresolved`.

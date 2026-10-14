@@ -156,7 +156,7 @@ pub(crate) struct UndeliveredFrame<'a> {
 }
 
 /// How a route's principal appears in logs: `direct`, or `reserved:<module>`.
-fn principal_label(principal: &Principal) -> String {
+pub(crate) fn principal_label(principal: &Principal) -> String {
     match principal {
         Principal::Reserved { module_id } => format!("reserved:{module_id}"),
         Principal::Direct => "direct".to_string(),

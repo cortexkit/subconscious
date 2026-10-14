@@ -53,6 +53,10 @@ pub mod error_codes {
 
     pub const UNKNOWN_CHANNEL: &str = "unknown_channel";
     pub const STALE_ROUTE_EPOCH: &str = "stale_route_epoch";
+    /// A module reply exceeds the client connection's whole egress byte budget.
+    /// TERMINAL for this request: the module already received it, and retrying
+    /// unchanged would produce the same oversized reply. The route stays open.
+    pub const FRAME_TOO_LARGE: &str = "frame_too_large";
     pub const UNKNOWN_MODULE: &str = "unknown_module";
     pub const MODULE_REMOVED: &str = "module_removed";
     /// The target module's endpoint is draining for a reload, restart or disable.

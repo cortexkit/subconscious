@@ -5,6 +5,7 @@
     "bad_consumer_identity": "terminal",
     "capability_forbidden": "terminal",
     "forwarding_error": "terminal",
+    "frame_too_large": "terminal",
     "invalid_project_root": "terminal",
     "invalid_request": "terminal",
     "module_reloading": "retryable",
@@ -44,6 +45,8 @@
       { "code": "target_unavailable", "daemon_origin": true, "route_dead": false },
       { "code": "module_warming", "daemon_origin": false, "route_dead": false },
       { "code": "module_warming", "daemon_origin": true, "route_dead": false },
+      { "code": "frame_too_large", "daemon_origin": false, "route_dead": false },
+      { "code": "frame_too_large", "daemon_origin": true, "route_dead": false },
       { "code": "handler_failed", "daemon_origin": false, "route_dead": false },
       { "code": "handler_failed", "daemon_origin": true, "route_dead": false }
     ]

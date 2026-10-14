@@ -64,6 +64,21 @@ subc-protocol tests/golden/decision_tables.json.
 A client that lets 4 MiB of replies queue up unread is disconnected with a logged warning that
 names the connection, its routes and the module whose reply overflowed. Clients must keep reading.
 
+A module→client frame whose header plus body alone exceeds that connection's egress byte
+budget is refused before enqueue, even when the queue is empty. Replies (including stream
+data and stream ends) become a daemon-origin `ERROR` with code `frame_too_large` on the
+same channel, epoch and correlation; the request ends, but the route and other routes on
+the connection remain usable. Rust and TypeScript do not reopen or retry on this code,
+and Swift throws without retrying. Retrying unchanged can repeat module side effects and
+produce the same oversized reply. An oversized reverse Request is answered with that
+ERROR on the module's channel, without reaching the client or closing the route. An
+oversized Push still closes the client connection: deployed Rust clients cannot decode
+a new `route.closed` reason, so route-local Push recovery needs a decoder-first rollout.
+A frame that would fit an empty queue but meets a full one is a different case: the client has
+stopped reading, so it is disconnected as a slow client, as described above. The replacement ERROR
+follows the same rule, because the daemon never makes a module's frame reader wait on one stuck client.
+
+
 ### 1.3 Modules
 
 | Limit | Value | Source |

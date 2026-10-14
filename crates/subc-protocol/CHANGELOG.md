@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.32.4
+
+- Add terminal `error_codes::FRAME_TOO_LARGE` (`frame_too_large`) for a module reply whose header plus body exceeds the client connection's egress budget. It does not mark the established route dead: Rust and TypeScript SDKs return the request error without reopening or retrying; Swift already throws on route ERRORs without retrying. Retrying the same request could repeat module side effects and produce the same oversized reply. No envelope or protocol-version change.
+
 ## 0.32.3
 
 - Add `manifest::CAP_SCOPE_BIND_PROOF_V2` (`scope-bind-proof/v2`): bind proofs are required only from non-attested openers; reserved modules are exempt. Owners relying on reserved modules opening without proofs should set hashes only after discovering v2. The daemon continues advertising v1.

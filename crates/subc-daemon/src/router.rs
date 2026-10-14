@@ -11,13 +11,13 @@ use std::{
 
 use subc_protocol::{error_codes, ErrorBody, Flags, FrameType, Priority};
 use tokio::sync::{mpsc, Notify};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::{
     control::ControlHandler,
     forwarding::{
-        CloseReason, ConnectionCloseReceiver, DataRoute, DataRouteState, ForwardingError,
-        ForwardingTable, RouteBinding, RouteRelease, UndeliveredFrame,
+        principal_label, CloseReason, ConnectionCloseReceiver, DataRoute, DataRouteState,
+        ForwardingError, ForwardingTable, RouteBinding, RouteRelease, UndeliveredFrame,
     },
     registry::ConnectionId,
     DaemonCounters, Frame, FrameBuildError,
@@ -958,6 +958,19 @@ impl Router {
                     return Ok(());
                 }
 
+                // Accounting allows an oversized frame to occupy an empty queue
+                // on other send paths. Refuse it at this splice before admission,
+                // so the next ordinary reply cannot close a multiplexed client.
+                let bytes = queued_frame_bytes(&frame);
+                let limit = route.client_sink.accounting.byte_budget;
+                if bytes > limit {
+                    let ty = frame.header.ty;
+                    drop(frame);
+                    return self
+                        .refuse_oversized_module_frame(ctx, &route, ty, corr, bytes)
+                        .await;
+                }
+
                 // A terminal frame ends the request at the module whether or not
                 // the client can still take it, so its credit is released before
                 // delivery is attempted. Releasing only after a successful
@@ -1053,6 +1066,110 @@ impl Router {
             };
             if let Some(error_frame) = err.to_error_frame() {
                 ctx.egress.send(error_frame).await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn refuse_oversized_module_frame(
+        &self,
+        ctx: &RouteCtx,
+        route: &RouteBinding,
+        ty: FrameType,
+        corr: u64,
+        bytes: usize,
+    ) -> Result<(), RouterError> {
+        let limit = route.client_sink.accounting.byte_budget;
+        if ty == FrameType::Push {
+            // Deployed Rust clients cannot decode a new route.closed reason.
+            // Until that vocabulary can be extended compatibly, an oversized
+            // unsolicited push still closes the connection, with its cause named.
+            if self
+                .forwarding
+                .escalate_client_delivery_failure(
+                    route.client_connection_id,
+                    route.client_channel,
+                    route.client_epoch,
+                    CloseReason::new(
+                        error_codes::FRAME_TOO_LARGE,
+                        format!(
+                            "oversized push: size={bytes} limit={limit} (header plus body bytes)"
+                        ),
+                    ),
+                    UndeliveredFrame {
+                        module_id: Some(&route.module_id),
+                        sink: &route.client_sink,
+                    },
+                )
+                .map_err(RouterError::Forwarding)?
+            {
+                self.counters
+                    .increment_client_egress_close_delivery_failed();
+            }
+            return Ok(());
+        }
+
+        warn!(
+            connection_id = route.client_connection_id.get(),
+            module_id = %route.module_id,
+            client_principal = %principal_label(&route.principal),
+            client_channel = route.client_channel,
+            frame_type = ?ty,
+            frame_bytes = bytes,
+            byte_limit = limit,
+            "refusing oversized module-to-client frame with ERROR frame_too_large"
+        );
+        if ty == FrameType::Request {
+            // A reverse request belongs to the module, not to a waiting client.
+            // Answer its sender without forwarding any part of it to the client.
+            ctx.egress
+                .send(frame_too_large_error(
+                    route.module_channel,
+                    route.module_epoch,
+                    corr,
+                    bytes,
+                    limit,
+                )?)
+                .await?;
+        } else {
+            // A refused stream chunk also ends the waiting request. Releasing
+            // its credit prevents a finished request from keeping a drain alive.
+            route.flow.release_corr(corr);
+            let error = frame_too_large_error(
+                route.client_channel,
+                route.client_epoch,
+                corr,
+                bytes,
+                limit,
+            )?;
+            // This runs on the module connection's frame reader, so it must not
+            // wait for client egress: a stuck client would stall every route of
+            // the module. Enqueue it like the reply it replaces, and treat a full
+            // queue exactly as ordinary backpressure.
+            if let Err(err) = route.client_sink.try_send(error) {
+                if self
+                    .forwarding
+                    .escalate_client_delivery_failure(
+                        route.client_connection_id,
+                        route.client_channel,
+                        route.client_epoch,
+                        CloseReason::new(
+                            "module_to_client_delivery_failed",
+                            format!(
+                                "failed to enqueue frame_too_large for client channel {} corr {corr}: {err}",
+                                route.client_channel
+                            ),
+                        ),
+                        UndeliveredFrame {
+                            module_id: Some(&route.module_id),
+                            sink: &route.client_sink,
+                        },
+                    )
+                    .map_err(RouterError::Forwarding)?
+                {
+                    self.counters
+                        .increment_client_egress_close_delivery_failed();
+                }
             }
         }
         Ok(())
@@ -1357,6 +1474,32 @@ fn error_frame(channel: u16, epoch: u32, corr: u64, code: &str, message: String)
         body,
     )
     .ok()
+}
+
+fn frame_too_large_error(
+    channel: u16,
+    epoch: u32,
+    corr: u64,
+    bytes: usize,
+    limit: usize,
+) -> Result<Frame, RouterError> {
+    let body = serde_json::to_vec(&ErrorBody {
+        code: error_codes::FRAME_TOO_LARGE.to_string(),
+        message: format!(
+            "module frame of {bytes} bytes exceeds client egress limit of {limit} bytes"
+        ),
+        detail: Some(serde_json::json!({ "frame_bytes": bytes, "byte_limit": limit })),
+    })
+    .expect("serializing a frame size error");
+    Frame::build(
+        FrameType::Error,
+        Flags::new(false, Priority::Passive, false).with_daemon_origin(),
+        channel,
+        epoch,
+        corr,
+        body,
+    )
+    .map_err(RouterError::FrameBuild)
 }
 
 impl fmt::Display for RouterError {
@@ -2006,6 +2149,431 @@ mod tests {
             body,
         )
         .unwrap()
+    }
+
+    fn module_route_for_test(
+        router: &Router,
+        ctx: &RouteCtx,
+        route: &crate::forwarding::PendingRouteBindRelay,
+    ) -> Arc<RouteBinding> {
+        match router
+            .forwarding
+            .lookup_data_route(ctx.connection_id, route.module_channel, route.module_epoch)
+            .unwrap()
+        {
+            DataRoute::Module(DataRouteState::Bound(binding)) => binding,
+            other => panic!("expected a bound module route, got {other:?}"),
+        }
+    }
+
+    fn assert_frame_size_error(frame: &Frame, channel: u16, epoch: u32, corr: u64, bytes: usize) {
+        assert_eq!(frame.header.ty, FrameType::Error);
+        assert_eq!(frame.header.channel, channel);
+        assert_eq!(frame.header.epoch, epoch);
+        assert_eq!(frame.header.corr, corr);
+        assert!(frame.header.flags.is_daemon_origin());
+        let body: ErrorBody = serde_json::from_slice(&frame.body).unwrap();
+        assert_eq!(body.code, error_codes::FRAME_TOO_LARGE);
+        let limit = crate::server::CONNECTION_EGRESS_BYTE_BUDGET;
+        assert!(body.message.contains(&bytes.to_string()));
+        assert!(body.message.contains(&limit.to_string()));
+        assert_eq!(
+            body.detail,
+            Some(serde_json::json!({ "frame_bytes": bytes, "byte_limit": limit }))
+        );
+    }
+
+    #[tokio::test]
+    async fn module_egress_response_oversized_reply_keeps_connection_and_other_route() {
+        let (logs, _guard) = test_log::log_capture(tracing::Level::WARN);
+        let (router, sink, mut rx, ctx, routes, mut close) = multi_route_client(
+            "oversize-provider",
+            ConnectionId::new(80),
+            ConnectionId::new(81),
+            2,
+        )
+        .await;
+        let binding = module_route_for_test(&router, &ctx, &routes[0]);
+        binding.flow.acquire_tagged(101, false).await.unwrap();
+        module_route_for_test(&router, &ctx, &routes[1])
+            .flow
+            .acquire_tagged(102, false)
+            .await
+            .unwrap();
+        let limit = crate::server::CONNECTION_EGRESS_BYTE_BUDGET;
+        let oversized = Frame::build(
+            FrameType::Response,
+            Flags::new(false, Priority::Interactive, true),
+            routes[0].module_channel,
+            routes[0].module_epoch,
+            101,
+            vec![b'x'; limit - subc_protocol::HEADER_LEN + 1],
+        )
+        .unwrap();
+        assert_eq!(sink.backlog().queued_bytes, 0);
+        router.route_for_connection(&ctx, oversized).await.unwrap();
+
+        // Reproduce a large reply followed by ordinary traffic on another route
+        // before the client reads anything. The large reply must not monopolize
+        // the queue and make that second delivery close the shared connection.
+        router
+            .route_for_connection(
+                &ctx,
+                route_frame(
+                    FrameType::Response,
+                    routes[1].module_channel,
+                    routes[1].module_epoch,
+                    102,
+                ),
+            )
+            .await
+            .unwrap();
+        assert!(
+            close.try_recv().is_err(),
+            "an oversized reply must not close the multiplexed client"
+        );
+        let error = rx.try_recv().expect("the waiting client gets an ERROR");
+        assert_frame_size_error(
+            &error,
+            routes[0].client_channel,
+            routes[0].client_epoch,
+            101,
+            limit + 1,
+        );
+        let second = rx.try_recv().expect("the other route's reply arrives");
+        assert_eq!(second.header.ty, FrameType::Response);
+        assert_eq!(second.header.channel, routes[1].client_channel);
+        assert_eq!(second.header.epoch, routes[1].client_epoch);
+        assert_eq!(second.header.corr, 102);
+        assert_eq!(second.body, b"route-body");
+        assert_eq!(binding.flow.drain_in_flight(), 0);
+        for route in &routes {
+            module_route_for_test(&router, &ctx, route);
+        }
+        assert!(rx.try_recv().is_err());
+        drop((error, second));
+        assert_eq!(sink.backlog().queued_bytes, 0);
+        assert_eq!(
+            router.counters.snapshot()["client_egress_close_delivery_failed"],
+            0
+        );
+
+        let captured = test_log::captured_logs(&logs);
+        let warnings: Vec<_> = captured
+            .lines()
+            .filter(|line| line.contains("WARN"))
+            .collect();
+        assert_eq!(warnings.len(), 1, "{captured}");
+        let warning = warnings[0];
+        for expected in [
+            "module_id=oversize-provider".to_string(),
+            "client_principal=direct".to_string(),
+            format!("client_channel={}", routes[0].client_channel),
+            format!("frame_bytes={}", limit + 1),
+            format!("byte_limit={limit}"),
+        ] {
+            assert!(warning.contains(&expected), "missing {expected}: {warning}");
+        }
+    }
+
+    #[tokio::test]
+    async fn module_egress_response_that_fits_empty_queue_still_closes_full_client() {
+        let (router, sink, mut rx, ctx, routes, mut close) = multi_route_client(
+            "backpressure-provider",
+            ConnectionId::new(82),
+            ConnectionId::new(83),
+            2,
+        )
+        .await;
+        let limit = crate::server::CONNECTION_EGRESS_BYTE_BUDGET;
+        // Exactly the limit, including its header, must be admitted to an empty
+        // queue. Leave it unread to deterministically exhaust only byte capacity.
+        router
+            .route_for_connection(
+                &ctx,
+                Frame::build(
+                    FrameType::Response,
+                    Flags::new(false, Priority::Interactive, true),
+                    routes[0].module_channel,
+                    routes[0].module_epoch,
+                    201,
+                    vec![b'x'; limit - subc_protocol::HEADER_LEN],
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(sink.backlog().queued_bytes, limit);
+        assert_eq!(sink.backlog().queued_frames, 1);
+        let ordinary = route_frame(
+            FrameType::Response,
+            routes[1].module_channel,
+            routes[1].module_epoch,
+            202,
+        );
+        assert!(queued_frame_bytes(&ordinary) < limit);
+        let mut delivery = Box::pin(router.route_for_connection(&ctx, ordinary));
+        // Backpressure closes immediately rather than parking a replacement
+        // ERROR behind a full queue. Poll once; no clock or timeout is involved.
+        let result = std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(std::future::Future::poll(delivery.as_mut(), cx))
+        })
+        .await;
+        assert!(
+            matches!(result, std::task::Poll::Ready(Ok(()))),
+            "full-queue delivery must close, not wait for an oversized-frame ERROR"
+        );
+        drop(delivery);
+        let reason = close.try_recv().expect("the full client must close");
+        assert!(reason
+            .to_string()
+            .contains("module_to_client_delivery_failed"));
+        assert!(!reason.to_string().contains("frame_too_large"));
+        assert_eq!(
+            router.counters.snapshot()["client_egress_close_delivery_failed"],
+            1
+        );
+        let admitted = rx.try_recv().expect("the budget-sized frame was admitted");
+        assert_eq!(admitted.header.ty, FrameType::Response);
+        assert_eq!(admitted.header.corr, 201);
+        assert!(
+            rx.try_recv().is_err(),
+            "no oversized-frame ERROR is substituted for backpressure"
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_reply_to_a_full_client_closes_it_without_waiting() {
+        let (router, sink, _rx, ctx, routes, mut close) = multi_route_client(
+            "full-oversize-provider",
+            ConnectionId::new(90),
+            ConnectionId::new(91),
+            2,
+        )
+        .await;
+        let limit = crate::server::CONNECTION_EGRESS_BYTE_BUDGET;
+        // Fill the client's queue to its budget and leave it unread.
+        router
+            .route_for_connection(
+                &ctx,
+                Frame::build(
+                    FrameType::Response,
+                    Flags::new(false, Priority::Interactive, true),
+                    routes[0].module_channel,
+                    routes[0].module_epoch,
+                    501,
+                    vec![b'x'; limit - subc_protocol::HEADER_LEN],
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(sink.backlog().queued_bytes, limit);
+        let oversized = Frame::build(
+            FrameType::Response,
+            Flags::new(false, Priority::Interactive, true),
+            routes[1].module_channel,
+            routes[1].module_epoch,
+            502,
+            vec![b'y'; limit - subc_protocol::HEADER_LEN + 1],
+        )
+        .unwrap();
+        let mut delivery = Box::pin(router.route_for_connection(&ctx, oversized));
+        // The module's frame reader must never park on a stuck client: one poll
+        // completes, and the full client is closed as ordinary backpressure.
+        let result = std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(std::future::Future::poll(delivery.as_mut(), cx))
+        })
+        .await;
+        assert!(
+            matches!(result, std::task::Poll::Ready(Ok(()))),
+            "the replacement ERROR must not wait for a full client queue"
+        );
+        drop(delivery);
+        let reason = close.try_recv().expect("the full client must close");
+        assert!(reason
+            .to_string()
+            .contains("module_to_client_delivery_failed"));
+    }
+
+    #[tokio::test]
+    async fn oversized_reverse_request_errors_module_without_reaching_client() {
+        let (router, _sink, mut rx, mut ctx, routes, mut close) = multi_route_client(
+            "reverse-oversize-provider",
+            ConnectionId::new(84),
+            ConnectionId::new(85),
+            2,
+        )
+        .await;
+        let (module_tx, mut module_rx) = mpsc::channel(8);
+        ctx.egress = FrameSink::new(module_tx);
+        let limit = crate::server::CONNECTION_EGRESS_BYTE_BUDGET;
+        router
+            .route_for_connection(
+                &ctx,
+                Frame::build(
+                    FrameType::Request,
+                    Flags::new(false, Priority::Interactive, false),
+                    routes[0].module_channel,
+                    routes[0].module_epoch,
+                    301,
+                    vec![b'r'; limit - subc_protocol::HEADER_LEN + 1],
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            rx.try_recv().is_err(),
+            "the reverse request never reaches the client"
+        );
+        let error = module_rx.try_recv().expect("the module gets the refusal");
+        assert_frame_size_error(
+            &error,
+            routes[0].module_channel,
+            routes[0].module_epoch,
+            301,
+            limit + 1,
+        );
+        assert!(module_rx.try_recv().is_err());
+        for (index, route) in routes.iter().enumerate() {
+            module_route_for_test(&router, &ctx, route);
+            router
+                .route_for_connection(
+                    &ctx,
+                    route_frame(
+                        FrameType::Response,
+                        route.module_channel,
+                        route.module_epoch,
+                        302 + index as u64,
+                    ),
+                )
+                .await
+                .unwrap();
+            let reply = rx.try_recv().expect("both routes still deliver");
+            assert_eq!(reply.header.ty, FrameType::Response);
+            assert_eq!(reply.header.channel, route.client_channel);
+        }
+        assert!(close.try_recv().is_err());
+        assert_eq!(
+            router.counters.snapshot()["client_egress_close_delivery_failed"],
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_push_closes_client_with_precise_warn() {
+        let (logs, _guard) = test_log::log_capture(tracing::Level::WARN);
+        let (router, _sink, mut rx, ctx, routes, mut close) = multi_route_client(
+            "push-oversize-provider",
+            ConnectionId::new(86),
+            ConnectionId::new(87),
+            2,
+        )
+        .await;
+        let limit = crate::server::CONNECTION_EGRESS_BYTE_BUDGET;
+        router
+            .route_for_connection(
+                &ctx,
+                Frame::build(
+                    FrameType::Push,
+                    Flags::new(false, Priority::Interactive, false),
+                    routes[0].module_channel,
+                    routes[0].module_epoch,
+                    0,
+                    vec![b'p'; limit - subc_protocol::HEADER_LEN + 1],
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let reason = close
+            .try_recv()
+            .expect("unsolicited oversize still closes the client");
+        assert!(reason
+            .to_string()
+            .contains("frame_too_large: oversized push"));
+        assert!(
+            rx.try_recv().is_err(),
+            "no part of the oversized push is forwarded"
+        );
+        let captured = test_log::captured_logs(&logs);
+        let warnings: Vec<_> = captured
+            .lines()
+            .filter(|line| line.contains("WARN"))
+            .collect();
+        assert_eq!(warnings.len(), 1, "{captured}");
+        let warning = warnings[0];
+        for expected in [
+            "oversized push".to_string(),
+            "module_id=\"push-oversize-provider\"".to_string(),
+            "principals=direct".to_string(),
+            format!("client_channel={}", routes[0].client_channel),
+            format!("size={}", limit + 1),
+            format!("limit={limit}"),
+        ] {
+            assert!(warning.contains(&expected), "missing {expected}: {warning}");
+        }
+        assert_eq!(
+            router.counters.snapshot()["client_egress_close_delivery_failed"],
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_stream_and_error_frames_end_request_even_with_queued_traffic() {
+        let (router, sink, mut rx, ctx, routes, mut close) = multi_route_client(
+            "stream-oversize-provider",
+            ConnectionId::new(88),
+            ConnectionId::new(89),
+            2,
+        )
+        .await;
+        let binding = module_route_for_test(&router, &ctx, &routes[0]);
+        let limit = crate::server::CONNECTION_EGRESS_BYTE_BUDGET;
+        for ty in [
+            FrameType::StreamData,
+            FrameType::StreamEnd,
+            FrameType::Error,
+        ] {
+            binding.flow.acquire_tagged(401, false).await.unwrap();
+            sink.try_send(route_frame(
+                FrameType::Response,
+                routes[1].client_channel,
+                routes[1].client_epoch,
+                402,
+            ))
+            .unwrap();
+            router
+                .route_for_connection(
+                    &ctx,
+                    Frame::build(
+                        ty,
+                        Flags::new(false, Priority::Interactive, false),
+                        routes[0].module_channel,
+                        routes[0].module_epoch,
+                        401,
+                        vec![b's'; limit - subc_protocol::HEADER_LEN + 1],
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert!(close.try_recv().is_err());
+            assert_eq!(rx.try_recv().unwrap().header.corr, 402);
+            let error = rx
+                .try_recv()
+                .expect("every correlated oversize frame becomes ERROR");
+            assert_frame_size_error(
+                &error,
+                routes[0].client_channel,
+                routes[0].client_epoch,
+                401,
+                limit + 1,
+            );
+            assert_eq!(binding.flow.drain_in_flight(), 0, "{ty:?} ends the request");
+            assert!(rx.try_recv().is_err());
+        }
     }
 
     /// An awaited send (a control or error reply) is never refused by the byte

@@ -447,6 +447,7 @@ pub struct ModuleHandle {
 
 struct ModuleHandleShared {
     negotiated_ver: u8,
+    daemon_capabilities: Vec<String>,
     supports_catalog_update: bool,
     supports_live_roots: bool,
     supports_scope_sync: bool,
@@ -483,6 +484,7 @@ impl ModuleHandle {
         Self {
             shared: Arc::new(ModuleHandleShared {
                 negotiated_ver: ack.negotiated_ver,
+                daemon_capabilities: ack.subc_capabilities.clone(),
                 supports_catalog_update: ack
                     .subc_ops
                     .iter()
@@ -527,6 +529,26 @@ impl ModuleHandle {
     /// a substitute. The id is a name, never an authority: see [`MachineId`].
     pub fn machine_id(&self) -> Option<&MachineId> {
         self.shared.machine_id.as_ref()
+    }
+
+    /// The daemon capability identifiers delivered in this connection's HELLO_ACK.
+    ///
+    /// The list preserves the daemon's order and unknown capability identifiers.
+    pub fn daemon_capabilities(&self) -> &[String] {
+        &self.shared.daemon_capabilities
+    }
+
+    /// Whether this daemon advertised `capability` in this connection's HELLO_ACK.
+    ///
+    /// Scope owners should check
+    /// `daemon_supports(subc_protocol::manifest::CAP_SCOPE_BIND_PROOF_V1)`
+    /// before setting `ScopeRecord.bind_proof_sha256` on records sent over
+    /// this connection.
+    pub fn daemon_supports(&self, capability: &str) -> bool {
+        self.shared
+            .daemon_capabilities
+            .iter()
+            .any(|advertised| advertised == capability)
     }
 
     /// Resolves once this module's connection to the daemon has closed: after a

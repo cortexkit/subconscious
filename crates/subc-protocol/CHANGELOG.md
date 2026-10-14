@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.32.1
+
+- Add `manifest::CAP_SCOPE_BIND_PROOF_V1` (`scope-bind-proof/v1`). A daemon advertising it stores scope bind-proof hashes and enforces proofs on scoped route opens; owners set `bind_proof_sha256` only when their connected daemon advertises it.
+
 ## 0.32.0
 
 - **Breaking.** Add optional `ScopeSelector.bind_proof` and `ScopeRecord.bind_proof_sha256`. Selectors are non-exhaustive: use `ScopeSelector::new` and `with_bind_proof`. Validate hashes as 64 lowercase hexadecimal characters. Add terminal `scope_bind_proof_required` and `scope_bind_proof_mismatch` codes. Proofs are redacted in Debug/Display; unset fields preserve existing wire bytes.

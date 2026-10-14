@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.36.1
+
+- Advertise `scope-bind-proof/v1` in HELLO_ACK and `server.describe`. Owners should set `bind_proof_sha256` only when the connected daemon advertises this capability.
+
 ## 0.36.0
 
 - **Breaking wire dependency upgrade.** Store optional scope bind-proof hashes. When a scope has one, every route open under it needs the matching proof: from the scope's owner and from every principal the owner lists as a carrier alike. It's checked at admission and again just before the bind is relayed to the module, in case the owner re-registered the scope meanwhile. Decode unpadded base64url of 32 bytes, hash the decoded bytes with SHA-256 and compare digest bytes in constant time. Without a hash, admission remains unchanged and proofs are ignored. Proofs never enter describe replies, logs, refusal details, activity attribution or module bind stamps; the hash stays out of describe and bind stamps.

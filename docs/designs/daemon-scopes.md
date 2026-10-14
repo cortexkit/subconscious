@@ -328,6 +328,9 @@ behaves exactly as before: a selector's proof, even malformed, is ignored. Hosts
 may therefore send proofs unconditionally once they hold one. Proofs never enter
 logs, refusal detail, `scope.describe`, module `route.bind` stamps or activity
 attribution; the hash also stays out of describe replies and bind stamps.
+Scope owners should set `bind_proof_sha256` only when the daemon they are
+connected to advertises `scope-bind-proof/v1` in HELLO_ACK or `server.describe`;
+older daemons may reject records carrying the hash.
 
 Every opener sends `scope_epoch`, the owner
 included: an owner forwarding a call names the epoch of the call it serves, so an old inbound call

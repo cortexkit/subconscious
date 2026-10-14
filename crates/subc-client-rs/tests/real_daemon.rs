@@ -1320,6 +1320,50 @@ async fn a_registering_module_receives_the_daemons_machine_id_in_hello_ack() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn daemon_capabilities_round_trip_from_real_hello_ack() {
+    let workspace = workspace_root();
+    let daemon_bin = ensure_binary(
+        &workspace,
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-core",
+            "--bin",
+            "ck-subc",
+            "--message-format=json",
+        ],
+    );
+
+    let temp_dir = unique_temp_dir("subc-client-rs-daemon-capabilities");
+    let runtime_dir = temp_dir.join("runtime");
+    let config_dir = temp_dir.join("config");
+    fs::create_dir_all(&runtime_dir).unwrap();
+    write_empty_config(&config_dir);
+
+    let mut daemon = spawn_daemon(&daemon_bin, &runtime_dir, &config_dir);
+    wait_for_connection_file(&daemon.connection_file, START_TIMEOUT).await;
+    let (handle, serve_task) = spawn_inline_module(
+        &daemon.connection_file,
+        inline_module_manifest("subc-client-rs-daemon-capabilities", &["a"]),
+    )
+    .await;
+
+    let capabilities = handle.daemon_capabilities();
+    assert!(
+        capabilities
+            .iter()
+            .any(|capability| capability == subc_protocol::manifest::CAP_SCOPE_BIND_PROOF_V1),
+        "HELLO_ACK capabilities: {capabilities:?}"
+    );
+    assert!(handle.daemon_supports(subc_protocol::manifest::CAP_SCOPE_BIND_PROOF_V1));
+    assert!(!handle.daemon_supports("not-advertised/v1"));
+
+    daemon.kill_and_wait();
+    assert!(serve_task.await.unwrap().is_ok());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn module_handle_catalog_update_surfaces_frozen_field_rejections() {
     let workspace = workspace_root();
     let daemon_bin = ensure_binary(

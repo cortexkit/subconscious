@@ -323,6 +323,11 @@ impl<'de> Deserialize<'de> for ModuleManifest {
 /// first.
 pub const CAP_CATALOG_EVENTS_V1: &str = "catalog-events/v1";
 
+/// A daemon advertising this capability stores scope `bind_proof_sha256` hashes
+/// and enforces `bind_proof` on scoped route opens. A scope owner should set the
+/// hash only when the daemon it is connected to advertises this capability.
+pub const CAP_SCOPE_BIND_PROOF_V1: &str = "scope-bind-proof/v1";
+
 /// A versioned bus event notice whose body is served by the publisher.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]

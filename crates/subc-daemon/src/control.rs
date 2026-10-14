@@ -847,6 +847,7 @@ impl ControlHandler {
                 CAP_SCOPES_V1.to_string(),
                 CAP_ROUTE_ROLE_VERSIONS_V1.to_string(),
                 subc_protocol::manifest::CAP_CATALOG_EVENTS_V1.to_string(),
+                subc_protocol::manifest::CAP_SCOPE_BIND_PROOF_V1.to_string(),
                 subc_control::ACTIVITY_LEDGER_CAPABILITY.to_string(),
             ]),
             route_bind_relay_timeout: DEFAULT_ROUTE_BIND_RELAY_TIMEOUT,
@@ -11100,6 +11101,48 @@ mod tests {
             capabilities
                 .iter()
                 .any(|c| c == subc_protocol::manifest::CAP_CATALOG_EVENTS_V1),
+            "{capabilities:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn scope_bind_proof_capability_is_advertised_in_hello_ack_and_server_describe() {
+        let handler = ControlHandler::new(Arc::new(Registry::default()));
+        let (module, mut module_rx) = route_ctx(ConnectionId::new(152));
+        let ack = hello_via_sink(
+            &handler,
+            &module,
+            &mut module_rx,
+            hello_frame("scope-proof-owner", PROTOCOL_VERSION, 1),
+        )
+        .await;
+        let ack = parse_ack(&ack);
+        assert!(
+            ack.subc_capabilities
+                .iter()
+                .any(|c| c == subc_protocol::manifest::CAP_SCOPE_BIND_PROOF_V1),
+            "{:?}",
+            ack.subc_capabilities
+        );
+
+        let (client, _client_rx) = route_ctx(ConnectionId::new(153));
+        let body = serde_json::to_vec(&ClientControlRequest::ServerDescribe {}).unwrap();
+        let frame = Frame::build(FrameType::Request, control_flags(), 0, 0, 5, body).unwrap();
+        let reply = handler
+            .handle_control_frame(&client, frame)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let ClientControlResponse::ServerDescribe { capabilities, .. } =
+            serde_json::from_slice(&reply.body).unwrap()
+        else {
+            panic!("not a server.describe reply");
+        };
+        assert!(
+            capabilities
+                .iter()
+                .any(|c| c == subc_protocol::manifest::CAP_SCOPE_BIND_PROOF_V1),
             "{capabilities:?}"
         );
     }

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.29.1
+
+- Expose the daemon's HELLO_ACK capability list through `ModuleHandle::daemon_capabilities` and `daemon_supports`. Scope owners should check `scope-bind-proof/v1` before setting `bind_proof_sha256`.
+
 ## 0.29.0
 
 - **Breaking dependency upgrade** to subc-protocol 0.32. `ScopeSelector` is now `#[non_exhaustive]`: build it with `ScopeSelector::new(owner, scope_ref, scope_epoch)` and add a bind proof with `.with_bind_proof(Some(proof))`. `CallError::scope_bind_proof_refusal` returns `Required` or `Mismatch` for the two terminal refusals; neither is retried. Route cache keys tell different proofs apart without storing the proof text. A scope registered without a hash ignores the proof.

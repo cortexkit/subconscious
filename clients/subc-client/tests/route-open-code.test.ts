@@ -2,6 +2,11 @@ import { expect, test } from "bun:test";
 
 import { isRetryableRouteOpenCode } from "../src/client";
 
+test("scope bind proof refusals are terminal", () => {
+  expect(isRetryableRouteOpenCode("scope_bind_proof_required")).toBe(false);
+  expect(isRetryableRouteOpenCode("scope_bind_proof_mismatch")).toBe(false);
+});
+
 test("target_flow_unsupported is a terminal route.open refusal", () => {
   expect(isRetryableRouteOpenCode("target_flow_unsupported")).toBe(false);
 });

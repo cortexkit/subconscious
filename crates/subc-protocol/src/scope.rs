@@ -49,6 +49,29 @@ fn deserialize_scope_principals<'de, D: serde::Deserializer<'de>>(
         .map(|principals| principals.into_iter().map(Into::into).collect())
 }
 
+/// A scope bind-proof hash is the lowercase hexadecimal SHA-256 digest.
+pub fn validate_bind_proof_sha256(hash: &str) -> Result<(), &'static str> {
+    if hash.len() == 64
+        && hash
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        Ok(())
+    } else {
+        Err("bind_proof_sha256 must be exactly 64 lowercase hexadecimal characters")
+    }
+}
+
+fn deserialize_bind_proof_sha256<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    let hash = Option::<String>::deserialize(deserializer)?;
+    if let Some(hash) = &hash {
+        validate_bind_proof_sha256(hash).map_err(serde::de::Error::custom)?;
+    }
+    Ok(hash)
+}
+
 /// The `server.describe` capability a daemon advertises when it admits routes
 /// under scopes. A carrier that needs a scoped route and does not see it fails
 /// the call (`scope_unsupported`) instead of opening an unscoped route.
@@ -266,6 +289,14 @@ pub struct ScopeRecord {
     /// restart, and uses a higher one when it reuses the ref for a new session.
     pub scope_epoch: u64,
     pub kind: ScopeKind,
+    /// Only the holder of the scope's bind proof can bind it when this hash is
+    /// present. Without a hash, admission is unchanged and proofs are ignored.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_bind_proof_sha256"
+    )]
+    pub bind_proof_sha256: Option<String>,
     /// Absolute Unix wall-clock deadline in milliseconds. It cannot be added,
     /// changed or removed within this scope epoch; absent means no deadline.
     /// This is not an authority attribute.
@@ -293,12 +324,19 @@ impl ScopeRecord {
             scope_ref: scope_ref.into(),
             scope_epoch,
             kind,
+            bind_proof_sha256: None,
             expires_at_ms: None,
             parent: None,
             child_owners: Vec::new(),
             carriers: Vec::new(),
             attributes: ScopeAttributes::default(),
         }
+    }
+
+    #[must_use]
+    pub fn with_bind_proof_sha256(mut self, hash: Option<String>) -> Self {
+        self.bind_proof_sha256 = hash;
+        self
     }
 
     #[must_use]
@@ -388,8 +426,9 @@ impl ScopeEndResult {
 /// `scope_epoch` is optional on the wire only so that leaving it out is
 /// refused by name (`scope_epoch_required`) rather than as a malformed body:
 /// every opener must name it, the owner included.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct ScopeSelector {
     #[serde(deserialize_with = "deserialize_scope_principal")]
     pub owner: Principal,
@@ -397,6 +436,47 @@ pub struct ScopeSelector {
     pub scope_ref: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope_epoch: Option<u64>,
+    /// Base64url-encoded 32-byte secret, without padding. Ignored for records
+    /// without a bind-proof hash, so holders may always send their proof.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bind_proof: Option<String>,
+}
+
+impl ScopeSelector {
+    pub fn new(owner: Principal, scope_ref: impl Into<String>, scope_epoch: Option<u64>) -> Self {
+        Self {
+            owner,
+            scope_ref: scope_ref.into(),
+            scope_epoch,
+            bind_proof: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_bind_proof(mut self, proof: Option<String>) -> Self {
+        self.bind_proof = proof;
+        self
+    }
+}
+
+impl std::fmt::Debug for ScopeSelector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScopeSelector")
+            .field("owner", &self.owner)
+            .field("scope_ref", &self.scope_ref)
+            .field("scope_epoch", &self.scope_epoch)
+            .field(
+                "bind_proof",
+                &self.bind_proof.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
+}
+
+impl std::fmt::Display for ScopeSelector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(self, f)
+    }
 }
 
 /// The state of a scope's parent link.

@@ -28,6 +28,23 @@ use subc_protocol::{
 // when a wire-shape change is intentional and the TS mirror is updated too.
 #[test]
 fn protocol_wire_shapes_match_golden_json_and_round_trip() {
+    assert_golden(
+        "scope_selector_with_bind_proof",
+        &subc_protocol::scope::ScopeSelector::new(
+            Principal::Reserved {
+                module_id: "prefrontal-core".into(),
+            },
+            "head-1",
+            Some(3),
+        )
+        .with_bind_proof(Some("BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc".into())),
+    );
+    assert_golden(
+        "scope_record_with_bind_proof_sha256",
+        &scope_head_record().with_bind_proof_sha256(Some(
+            "4bb06f8e4e3a7715d201d573d0aa423762e55dabd61a2c02278fa56cc6d294e0".into(),
+        )),
+    );
     assert_golden("bind_identity", &bind_identity());
     assert_golden(
         "route_target_tool_provider",

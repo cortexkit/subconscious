@@ -7,6 +7,18 @@ import XCTest
 /// must decline to produce a hint (or a reason) rather than pass an unknown
 /// value through or fail the call.
 final class FedHostRefusalHintTests: XCTestCase {
+    func testScopeBindProofCodesUseTheTerminalModuleErrorPath() throws {
+        for code in [ScopeBindProofCodes.required, ScopeBindProofCodes.mismatch] {
+            let frame = errorFrame(#"{"code":"\#(code)"}"#)
+            XCTAssertEqual(frame.terminalCode, code)
+            XCTAssertNil(frame.terminalHostRefusal)
+            let failure = FedFailure.moduleError(code: code)
+            XCTAssertEqual(try JSONDecoder().decode(FedFailure.self, from: JSONEncoder().encode(failure)), failure)
+            XCTAssertFalse(failure.description.isEmpty)
+            XCTAssertNotNil(ScopeBindProofCodes.message(for: code))
+        }
+    }
+
     private func errorFrame(_ json: String) -> FedFrame {
         FedFrame(
             type: "call_frame",

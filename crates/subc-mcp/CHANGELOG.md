@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.37
+
+- Upgrade scope wire dependencies to subc-protocol 0.32 and subc-daemon 0.36.
+
 ## 0.1.36
 
 - Require `subc-daemon` 0.35, whose public config types gained the `privileged_operator_prompt` setting. The MCP gateway's behaviour is unchanged.

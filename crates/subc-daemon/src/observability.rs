@@ -45,6 +45,8 @@ const ROUTE_OPEN_REFUSAL_COUNTER_CODES: &[&str] = &[
     subc_protocol::error_codes::SCOPE_NOT_LIVE,
     subc_protocol::error_codes::SCOPE_ENDED,
     subc_protocol::error_codes::SCOPE_NOT_CARRIER,
+    subc_protocol::error_codes::SCOPE_BIND_PROOF_REQUIRED,
+    subc_protocol::error_codes::SCOPE_BIND_PROOF_MISMATCH,
     subc_protocol::error_codes::SCOPE_CHANGED,
     subc_protocol::error_codes::INVALID_REQUEST,
 ];

@@ -14,6 +14,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use sha2::{Digest, Sha256};
 pub use subc_control::SupervisorEntry;
 use subc_control::{
     CatalogEntry, ClientControlRequest, ClientControlResponse, ConsumerIdentity, PollKind,
@@ -2325,6 +2326,15 @@ pub enum CallError {
 }
 
 impl CallError {
+    /// A typed terminal scope bind-proof refusal, if the daemon returned one.
+    pub fn scope_bind_proof_refusal(&self) -> Option<ScopeBindProofRefusal> {
+        match self.route_open_refusal()?.code.as_str() {
+            error_codes::SCOPE_BIND_PROOF_REQUIRED => Some(ScopeBindProofRefusal::Required),
+            error_codes::SCOPE_BIND_PROOF_MISMATCH => Some(ScopeBindProofRefusal::Mismatch),
+            _ => None,
+        }
+    }
+
     /// Why the route ended. The error remains `NotSent` or `OutcomeUnknown`:
     /// this reason never makes a sent call safe to resend.
     pub fn close_reason(&self) -> Option<&RouteEndReason> {
@@ -2469,6 +2479,14 @@ struct RouteOpenRefused {
     /// The last refusal of a retry loop, when it is not `body`: kept so the
     /// message still says what the daemon answered most recently.
     most_recent: Option<ErrorBody>,
+}
+
+/// Terminal refusals requiring the caller to supply the scope's current proof.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ScopeBindProofRefusal {
+    Required,
+    Mismatch,
 }
 
 impl fmt::Display for RouteOpenRefused {
@@ -4781,6 +4799,7 @@ struct ScopeKey {
     owner: String,
     scope_ref: String,
     scope_epoch: Option<u64>,
+    bind_proof_digest: Option<[u8; 32]>,
 }
 
 impl From<&ScopeSelector> for ScopeKey {
@@ -4790,6 +4809,10 @@ impl From<&ScopeSelector> for ScopeKey {
                 .unwrap_or_else(|_| format!("{:?}", value.owner)),
             scope_ref: value.scope_ref.clone(),
             scope_epoch: value.scope_epoch,
+            bind_proof_digest: value
+                .bind_proof
+                .as_ref()
+                .map(|proof| Sha256::digest(proof.as_bytes()).into()),
         }
     }
 }
@@ -7667,13 +7690,13 @@ mod tests {
     }
 
     fn scope_selector(owner: &str, scope_ref: &str, scope_epoch: u64) -> ScopeSelector {
-        ScopeSelector {
-            owner: subc_protocol::Principal::Reserved {
+        ScopeSelector::new(
+            subc_protocol::Principal::Reserved {
                 module_id: owner.to_string(),
             },
-            scope_ref: scope_ref.to_string(),
-            scope_epoch: Some(scope_epoch),
-        }
+            scope_ref.to_string(),
+            Some(scope_epoch),
+        )
     }
 
     #[test]

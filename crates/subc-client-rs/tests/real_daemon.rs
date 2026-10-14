@@ -4038,13 +4038,13 @@ fn scope_record(scope_ref: &str, scope_epoch: u64) -> Value {
 }
 
 fn scope_selector(scope_ref: &str, scope_epoch: u64) -> ScopeSelector {
-    ScopeSelector {
-        owner: Principal::Reserved {
+    ScopeSelector::new(
+        Principal::Reserved {
             module_id: SCOPE_OWNER.to_string(),
         },
-        scope_ref: scope_ref.to_string(),
-        scope_epoch: Some(scope_epoch),
-    }
+        scope_ref.to_string(),
+        Some(scope_epoch),
+    )
 }
 
 fn refusal_code(err: &CallError) -> Option<&str> {
@@ -5358,11 +5358,7 @@ async fn an_applied_run_scope_expires_and_closes_its_route_without_an_owner_resy
         .open_route_scoped(
             tool_target("run-provider"),
             identity,
-            ScopeSelector {
-                owner: sdk_scope_owner(),
-                scope_ref: "run-a".to_string(),
-                scope_epoch: Some(1),
-            },
+            ScopeSelector::new(sdk_scope_owner(), "run-a".to_string(), Some(1)),
             fast_call_options(),
         )
         .await
@@ -5503,11 +5499,7 @@ async fn a_served_modules_on_bind_receives_the_daemons_scope_stamp() {
         .open_route_scoped(
             target.clone(),
             identity("scoped"),
-            ScopeSelector {
-                owner: sdk_scope_owner(),
-                scope_ref: "session-a".to_string(),
-                scope_epoch: Some(3),
-            },
+            ScopeSelector::new(sdk_scope_owner(), "session-a".to_string(), Some(3)),
             fast_call_options(),
         )
         .await

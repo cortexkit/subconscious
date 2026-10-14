@@ -306,13 +306,13 @@ fn client_control_requests() -> Vec<(&'static str, ClientControlRequest)> {
                 consumer_capabilities: None,
                 role_versions: None,
                 admission_facts: None,
-                scope: Some(subc_protocol::scope::ScopeSelector {
-                    owner: subc_protocol::Principal::Reserved {
+                scope: Some(subc_protocol::scope::ScopeSelector::new(
+                    subc_protocol::Principal::Reserved {
                         module_id: "prefrontal-core".to_string(),
                     },
-                    scope_ref: "head-1".to_string(),
-                    scope_epoch: Some(3),
-                }),
+                    "head-1",
+                    Some(3),
+                )),
             },
         ),
         (

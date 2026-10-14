@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.29.0
+
+- **Breaking dependency upgrade.** Use the new scope-selector constructor and `with_bind_proof`. Expose typed terminal refusals through `CallError::scope_bind_proof_refusal` (`Required` / `Mismatch`); neither code retries. Route cache identity distinguishes proof digests without retaining proof text in cache keys. Proofs are ignored by scopes without a registered hash.
+
 ## 0.28.4
 
 - Add `SubcConsumer::supervisor_list` and typed `SupervisorListResponse` so modules can read every configured module's enabled flag and supervisor state.

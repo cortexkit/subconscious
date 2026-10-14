@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { createServer, type AddressInfo, type Server, type Socket } from "node:net";
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -1376,6 +1376,43 @@ describe("managed route.open across a module restart", () => {
 
 describe("scoped route opens", () => {
   const scope: RouteScope = { owner: { kind: "reserved", module_id: "session-owner" }, ref: "session-α", scopeEpoch: 7 };
+
+  test("bind proof selector matches the Rust golden on direct and managed opens", async () => {
+    const golden = JSON.parse(readFileSync(new URL("../../../crates/subc-protocol/tests/golden/scope_selector_with_bind_proof.json", import.meta.url), "utf8")) as {
+      owner: RouteScope["owner"]; ref: string; scope_epoch: number; bind_proof: string;
+    };
+    const selector: RouteScope = { owner: golden.owner, ref: golden.ref, scopeEpoch: golden.scope_epoch, bindProof: golden.bind_proof };
+    const { connFile } = tempConnectionFile();
+    const stats = newStats();
+    const daemon = await startFakeDaemon({ stats });
+    writeConnectionFile(connFile, daemon.port);
+    const client = await SubcClient.connect({ connectionFile: connFile, identity: IDENTITY });
+    try {
+      const target = { kind: "management_surface", module_id: "proof-provider" } as const;
+      await client.routeOpen(target, IDENTITY, { scope: selector, consumerIdentity: null });
+      await client.call(target.module_id, "echo", {}, { scope: selector, consumerIdentity: null });
+      expect(stats.routeOpenBodies).toHaveLength(2);
+      for (const body of stats.routeOpenBodies) expect(JSON.parse(body.toString()).scope).toEqual(golden);
+      await client.call(target.module_id, "echo", {}, { scope: { ...selector, bindProof: "different" }, consumerIdentity: null });
+      await client.call(target.module_id, "echo", {}, { scope: { ...selector, bindProof: undefined }, consumerIdentity: null });
+      expect(stats.routeOpens).toBe(4);
+    } finally { client.close(); }
+  });
+
+  for (const code of ["scope_bind_proof_required", "scope_bind_proof_mismatch"]) {
+    test(`${code} never retries or sends data`, async () => {
+      const { connFile } = tempConnectionFile();
+      const stats = newStats();
+      const daemon = await startFakeDaemon({ stats, routeOpenError: { code, message: "scope proof refused" } });
+      writeConnectionFile(connFile, daemon.port);
+      const client = await SubcClient.connect({ connectionFile: connFile, identity: IDENTITY });
+      try {
+        await expect(client.call("proof-provider", "echo", {}, { scope, consumerIdentity: null })).rejects.toMatchObject({ code, kind: "terminal" });
+        expect(stats.routeOpens).toBe(1);
+        expect(stats.dataRequests).toBe(0);
+      } finally { client.close(); }
+    });
+  }
 
   test("scope selector is sent byte-for-byte on direct and managed opens", async () => {
     const { connFile } = tempConnectionFile();

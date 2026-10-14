@@ -5460,13 +5460,13 @@ mod tests {
             // Exactly what the control plane computes for a scoped route.open
             // naming this module as the owner of a scope it has not synced.
             let configured = hook_handle.is_configured(module_id);
-            let selector = ScopeSelector {
-                owner: Principal::Reserved {
+            let selector = ScopeSelector::new(
+                Principal::Reserved {
                     module_id: module_id.to_string(),
                 },
-                scope_ref: "s".to_string(),
-                scope_epoch: Some(1),
-            };
+                "s".to_string(),
+                Some(1),
+            );
             let carrier = Principal::Reserved {
                 module_id: "carrier".to_string(),
             };

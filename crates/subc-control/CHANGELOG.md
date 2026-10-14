@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.31.0
+
+- **Breaking dependency upgrade.** Use subc-protocol 0.32 scope selectors with optional bind proofs. Existing selectors serialize unchanged when the proof is absent.
+
 ## 0.30.0
 
 - **Breaking.** Requires `subc-protocol` 0.31. Public control types carry protocol types, so consumers must upgrade control and protocol together to avoid incompatible copies. Replace `ScopeStamp` literals with `ScopeStamp::new` and its `with_*` setters, and account for optional `call_mode` in raw `ModuleControlRequest::RouteBind` constructors and exhaustive patterns.

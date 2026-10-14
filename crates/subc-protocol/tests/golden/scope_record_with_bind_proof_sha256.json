@@ -1,0 +1,34 @@
+{
+  "attributes": {
+    "agent_id": "agent-7",
+    "delegates": true
+  },
+  "bind_proof_sha256": "4bb06f8e4e3a7715d201d573d0aa423762e55dabd61a2c02278fa56cc6d294e0",
+  "carriers": [
+    {
+      "principal": {
+        "kind": "reserved",
+        "module_id": "broca"
+      }
+    },
+    {
+      "principal": {
+        "kind": "reserved",
+        "module_id": "aft"
+      },
+      "targets": [
+        "plexus",
+        "prefrontal-core"
+      ]
+    }
+  ],
+  "child_owners": [
+    {
+      "kind": "reserved",
+      "module_id": "magic-context"
+    }
+  ],
+  "kind": "head",
+  "ref": "head-1",
+  "scope_epoch": 3
+}

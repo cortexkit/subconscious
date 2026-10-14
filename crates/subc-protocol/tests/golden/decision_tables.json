@@ -14,6 +14,8 @@
     "module_warming": "retryable",
     "op_not_allowed": "terminal",
     "route_limit": "terminal",
+    "scope_bind_proof_required": "terminal",
+    "scope_bind_proof_mismatch": "terminal",
     "scope_changed": "retryable",
     "scope_ended": "terminal",
     "scope_epoch_required": "terminal",

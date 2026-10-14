@@ -44,6 +44,19 @@ A non-zero-channel GOODBYE is **terminal + idempotent** for that route, from eit
 - A second GOODBYE / GOODBYE on an unknown route = typed no-op (connection survives).
 
 ## 3. Shared primitives (`subc-protocol`)
+
+Scope bind proofs are optional constraints on `scopes/v1` records. An owner registers
+`bind_proof_sha256` (64 lowercase hex SHA-256 of a 32-byte secret) in `scope.sync`
+or `scope.apply`. `route.open.scope.bind_proof` carries the secret as unpadded
+base64url. Only the holder of the scope's bind proof can bind it; owner and carrier
+authorization and the epoch checks still apply, including to the owner itself.
+`scope_bind_proof_required` and `scope_bind_proof_mismatch` are terminal refusals.
+When a record has no hash, admission is unchanged and any proof is ignored, so
+hosts can always send a proof once they hold one. The proof is redacted from
+Debug/Display and never echoed in logs, refusals, describe replies, activity
+stamps or provider binds. The hash is also omitted from describe and bind stamps.
+Rust selectors use `ScopeSelector::new(...).with_bind_proof(...)`; upgrade the
+wire crates together because `ScopeSelector` is now non-exhaustive.
 ```rust
 pub struct ConfigTier { pub tier: String, pub source: String, pub doc: String } // unchanged
 

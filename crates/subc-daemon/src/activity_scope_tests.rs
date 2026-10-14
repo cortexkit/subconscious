@@ -25,6 +25,24 @@ fn citation(bound: &Bound) -> Value {
 }
 
 #[tokio::test]
+async fn activity_scope_and_route_stamps_never_echo_bind_proof() {
+    const PROOF: &str = "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc";
+    const HASH: &str = "4bb06f8e4e3a7715d201d573d0aa423762e55dabd61a2c02278fa56cc6d294e0";
+    let scratch = ScratchDir::new("activity-bind-proof");
+    let mut rig = rig().await;
+    rig.handler = rig.handler.with_activity_ledger(scratch.path(), "daemon".into());
+    rig.sync(vec![session(1).with_bind_proof_sha256(Some(HASH.into()))]).await;
+    let bound = rig.bound(Some(AFT), PLEXUS,
+        Some(rig.selector("s", Some(1)).with_bind_proof(Some(PROOF.into())))).await;
+    assert_eq!(record_on(&rig, PLEXUS, citation(&bound)).await.header.ty, FrameType::Response);
+    assert_eq!(record_on(&rig, OWNER, serde_json::json!({"scope":{"ref":"s","epoch":1}})).await.header.ty, FrameType::Response);
+    let ledger = std::fs::read_to_string(scratch.path().join("activity.jsonl")).unwrap();
+    assert_eq!(ledger.lines().count(), 2);
+    assert!(!ledger.contains(PROOF));
+    assert!(!ledger.contains(HASH));
+}
+
+#[tokio::test]
 async fn activity_route_stamps_verified_opener_project_and_scope_attributes() {
     let scratch = ScratchDir::new("activity-route");
     let mut rig = rig_with_scope_capabilities(true, true).await;

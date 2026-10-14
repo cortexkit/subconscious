@@ -76,13 +76,9 @@ async fn handler_sweep_ends_routes_and_child_links_without_owner_calls() {
         let mut parent_route = rig
             .bound(Some(AFT), PLEXUS, Some(rig_selector("s", Some(1))))
             .await;
-        let child_selector = ScopeSelector {
-            owner: Principal::Reserved {
-                module_id: MAGIC.into(),
-            },
-            scope_ref: "child".into(),
-            scope_epoch: Some(1),
-        };
+        let child_selector = ScopeSelector::new(Principal::Reserved {
+            module_id: MAGIC.into(),
+        }, "child", Some(1));
         let mut child_route = rig.bound(Some(MAGIC), OTHER, Some(child_selector)).await;
         if !connected {
             rig.handler
@@ -172,13 +168,9 @@ async fn handler_accepted_sync_and_apply_sweep_and_return_once_without_deadlock(
         )
         .await
         .unwrap();
-        let other_selector = ScopeSelector {
-            owner: Principal::Reserved {
-                module_id: BROCA.into(),
-            },
-            scope_ref: "other-s".into(),
-            scope_epoch: Some(1),
-        };
+        let other_selector = ScopeSelector::new(Principal::Reserved {
+            module_id: BROCA.into(),
+        }, "other-s", Some(1));
         let mut other_route = rig.bound(Some(BROCA), OTHER, Some(other_selector)).await;
         clock.store(2_000, Ordering::SeqCst);
         let reply = if delta {

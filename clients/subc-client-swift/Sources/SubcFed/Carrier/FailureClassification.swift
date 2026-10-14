@@ -461,7 +461,7 @@ extension FedFailure: CustomStringConvertible {
         case let .moduleError(code, message, _):
             // The module's own prose says what to do about it, so prefer it and
             // fall back to the code only when no message was sent.
-            return message ?? "The remote service refused this request (\(code))."
+            return message ?? ScopeBindProofCodes.message(for: code) ?? "The remote service refused this request (\(code))."
         case .indeterminateMutation:
             return "It is not known whether this change was applied."
         case .admissionQueueFull:

@@ -10,6 +10,7 @@
 // correlation id, not arrival order.
 
 import { promises as fs } from "node:fs";
+import { createHash } from "node:crypto";
 import { debuglog } from "node:util";
 
 import { AuthError, authenticateClient } from "./auth.js";
@@ -127,6 +128,8 @@ export interface RouteScope {
   ref: string;
   /** Safe non-negative integer, including zero; serialized as scope_epoch. */
   scopeEpoch: number;
+  /** Base64url of a 32-byte secret, without padding; sent as bind_proof. Ignored by scopes without a hash. */
+  bindProof?: string;
 }
 
 export interface RouteOpenOptions {
@@ -781,7 +784,9 @@ export class SubcClient {
       identity,
       ...(consumerIdentity ? { consumer_identity: consumerIdentity } : {}),
       ...(consumerCapabilities.length > 0 ? { consumer_capabilities: consumerCapabilities } : {}),
-      ...(scope ? { scope: { owner: scope.owner, ref: scope.ref, scope_epoch: scope.scopeEpoch } } : {}),
+      ...(scope ? { scope: { owner: scope.owner, ref: scope.ref, scope_epoch: scope.scopeEpoch,
+        ...(scope.bindProof !== undefined ? { bind_proof: scope.bindProof } : {}),
+      } } : {}),
     });
 
     let installed: RouteHandle | null = null;
@@ -2288,6 +2293,7 @@ export function isRetryableRouteOpenCode(code: string | undefined): boolean {
   // Targets must explicitly opt into flow and agent-run scope behaviour.
   if (code === "target_flow_unsupported") return false;
   if (code === "target_agent_run_unsupported") return false;
+  if (code === "scope_bind_proof_required" || code === "scope_bind_proof_mismatch") return false;
   return (
     code === "module_reloading" ||
     code === "module_warming" ||
@@ -2421,7 +2427,8 @@ function routeCacheKey(
   const capabilitiesPart = [...consumerCapabilities].sort().join("\0");
   // A JSON tuple keeps opaque refs (including embedded separators) distinct.
   const scopePart = scope
-    ? JSON.stringify([scope.owner.kind, scope.owner.kind === "reserved" ? scope.owner.module_id : null, scope.ref, scope.scopeEpoch])
+    ? JSON.stringify([scope.owner.kind, scope.owner.kind === "reserved" ? scope.owner.module_id : null, scope.ref, scope.scopeEpoch,
+      scope.bindProof === undefined ? null : createHash("sha256").update(scope.bindProof).digest("hex")])
     : "";
   return `${target.kind}\0${target.module_id}\0${identity.project_root}\0${identity.harness}\0${identity.session}\0${consumerPart}\0${capabilitiesPart}\0${scopePart}`;
 }
@@ -2443,7 +2450,9 @@ function validatedRouteScope(scope: RouteScope | undefined): RouteScope | undefi
   if (!Number.isSafeInteger(scope.scopeEpoch) || scope.scopeEpoch < 0) {
     throw new SubcError("scope.scopeEpoch must be a safe non-negative integer", "invalid_scope");
   }
-  return { owner: { ...scope.owner }, ref: scope.ref, scopeEpoch: scope.scopeEpoch };
+  return { owner: { ...scope.owner }, ref: scope.ref, scopeEpoch: scope.scopeEpoch,
+    ...(scope.bindProof !== undefined ? { bindProof: scope.bindProof } : {}),
+  };
 }
 
 async function routeOpenConsumerIdentity(opts: RouteOpenOptions = {}): Promise<ConsumerIdentity | undefined> {

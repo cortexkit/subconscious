@@ -91,6 +91,8 @@ final class ContractTablesTests: XCTestCase {
         // terminal in the shared wire record.
         XCTAssertEqual(tables.routeOpenRetryable["target_flow_unsupported"], "terminal")
         XCTAssertEqual(tables.routeOpenRetryable["target_agent_run_unsupported"], "terminal")
+        XCTAssertEqual(tables.routeOpenRetryable["scope_bind_proof_required"], "terminal")
+        XCTAssertEqual(tables.routeOpenRetryable["scope_bind_proof_mismatch"], "terminal")
 
         XCTAssertFalse(
             tables.routeOpenRetryable.isEmpty,

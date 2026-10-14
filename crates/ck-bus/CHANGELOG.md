@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.4.0
+
+- Upgrade the Rust SDK and protocol dependencies for non-exhaustive scope selectors and per-scope bind proofs. Bus behavior is unchanged.
+
 ## 0.3.18
 
 - Raise the daemon test dependency to `subc-daemon` 0.35, whose public config types gained the `privileged_operator_prompt` setting. Bus behaviour is unchanged.

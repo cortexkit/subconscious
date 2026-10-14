@@ -41,11 +41,7 @@ async fn scopes_with_deadline() -> (ScopeOwnerRun, ScopeStamp) {
 }
 
 fn selector(scope_ref: &str) -> ScopeSelector {
-    ScopeSelector {
-        owner: sdk_scope_owner(),
-        scope_ref: scope_ref.to_string(),
-        scope_epoch: Some(1),
-    }
+    ScopeSelector::new(sdk_scope_owner(), scope_ref.to_string(), Some(1))
 }
 
 #[derive(Clone, Default)]

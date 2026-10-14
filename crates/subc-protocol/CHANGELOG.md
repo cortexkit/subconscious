@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.32.0
+
+- **Breaking.** Add optional `ScopeSelector.bind_proof` and `ScopeRecord.bind_proof_sha256`. Selectors are non-exhaustive: use `ScopeSelector::new` and `with_bind_proof`. Validate hashes as 64 lowercase hexadecimal characters. Add terminal `scope_bind_proof_required` and `scope_bind_proof_mismatch` codes. Proofs are redacted in Debug/Display; unset fields preserve existing wire bytes.
+
 ## 0.31.0
 
 - **Breaking.** Add `call_mode::CallMode` (`classic`, `codemode`, `flow`, or a preserved `Unknown(String)`), `CALL_MODES_CAPABILITY` (`call-modes/v1`), and `derive_call_mode`. Providers must refuse unknown modes. Declare the capability only when reading the mode on every bind and handling all three known modes.

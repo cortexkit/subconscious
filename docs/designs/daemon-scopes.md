@@ -49,6 +49,13 @@ A scope is identified by `(owner, ref)`:
   It is how a bind notices a change between admission and commit (section 4).
 
 Fields:
+- `bind_proof_sha256`: optional SHA-256 of the scope's 32 secret bytes, encoded as
+  exactly 64 lowercase hexadecimal characters. Accepted in both `scope.sync` and
+  `scope.apply`; malformed hashes refuse decoding/validation. The owner mints the
+  secret and gives it only to the host that registered the session. Only the
+  holder of the scope's bind proof can bind it, in addition to the existing owner,
+  carrier and epoch rules. A new epoch replaces the hash and still closes the old
+  epoch's routes. The daemon stores only the hash, never the proof.
 - `kind`: a closed enum, `head | worker | ephemeral`, fixed for the life of an epoch. A sync that
   changes it at the same epoch refuses that record `scope_kind_changed`; the owner uses a higher
   epoch, which ends the old scope.
@@ -312,12 +319,25 @@ is absent. Whole-call error frames become `ScopeCallError::Refused`; per-entry r
 
 ## 4. Opening a route under a scope
 
-`route.open` gains `scope: {owner, ref, scope_epoch}`. Every opener sends `scope_epoch`, the owner
+`route.open` accepts `scope: {owner, ref, scope_epoch, bind_proof?}`. `bind_proof` is
+base64url of the 32 secret bytes without padding. The daemon decodes the proof,
+hashes those bytes with SHA-256 and compares digest bytes in constant time, at
+admission and again before sending the captured relay bind. The owner must
+present the proof too; there is no owner exception. A record without a hash
+behaves exactly as before: a selector's proof, even malformed, is ignored. Hosts
+may therefore send proofs unconditionally once they hold one. Proofs never enter
+logs, refusal detail, `scope.describe`, module `route.bind` stamps or activity
+attribution; the hash also stays out of describe replies and bind stamps.
+
+Every opener sends `scope_epoch`, the owner
 included: an owner forwarding a call names the epoch of the call it serves, so an old inbound call
 can never be carried into a newer session that reused the ref. The daemon admits the open only
 when the opener is the owner or a listed carrier, and otherwise refuses by name (the full set is
 in section 5a):
 - `scope_epoch_required`: the open named no epoch. Terminal.
+- `scope_bind_proof_required`: the record has a hash but the selector has no proof. Terminal.
+- `scope_bind_proof_mismatch`: the proof is not valid unpadded base64url of 32 bytes,
+  or its SHA-256 differs from the record's hash. Terminal; clients never retry it.
 - `scope_not_synced`: the owner has not synced since this incarnation started and is configured.
   Retryable: after a daemon restart a carrier's open can arrive before the owner re-syncs, and
   the carrier waits within its own bound.
@@ -474,6 +494,8 @@ caller may re-open within its own deadline.
 | `scope_not_live` | `route.open` | the owner synced and the ref is not in its set, the owner is not configured, or the live epoch's deadline has passed | no |
 | `scope_ended` | `route.open`, admission or commit | the named epoch is not the live one, or the scope ended | no |
 | `scope_epoch_required` | `route.open` | the open named no epoch | no |
+| `scope_bind_proof_required` | `route.open`, admission and relay re-check | the record has a hash but no proof was supplied | no |
+| `scope_bind_proof_mismatch` | `route.open`, admission and relay re-check | proof malformed or digest differs from the stored hash | no |
 | `scope_not_carrier` | `route.open` | the opener is not the owner or a carrier, or not targeted at this module | no |
 | `target_flow_unsupported` | `route.open`, admission and relay re-check | a flow scope's target provides neither `call-modes/v1` nor `flow-scopes/v1` | no |
 | `target_agent_run_unsupported` | `route.open`, admission and relay re-check | a run scope's target provides neither `call-modes/v1` nor `agent-run-scopes/v1`, or the run delegates and the target lacks `call-modes/v1` | no |

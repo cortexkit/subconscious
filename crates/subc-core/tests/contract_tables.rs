@@ -108,6 +108,8 @@ fn daemon_route_open_error_codes_are_complete_in_decision_tables() {
         subc_protocol::error_codes::MODULE_WARMING,
         subc_protocol::error_codes::TARGET_UNAVAILABLE,
         subc_protocol::error_codes::TARGET_FLOW_UNSUPPORTED,
+        subc_protocol::error_codes::SCOPE_BIND_PROOF_REQUIRED,
+        subc_protocol::error_codes::SCOPE_BIND_PROOF_MISMATCH,
         subc_protocol::error_codes::MODULE_TIMEOUT,
     ];
     for code in protocol_codes {
@@ -132,6 +134,8 @@ fn daemon_route_open_error_codes_are_complete_in_decision_tables() {
         "op_not_allowed",
         "route_limit",
         "scope_changed",
+        "scope_bind_proof_required",
+        "scope_bind_proof_mismatch",
         "scope_ended",
         "scope_epoch_required",
         "scope_not_carrier",

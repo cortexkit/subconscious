@@ -3543,15 +3543,15 @@ impl ControlHandler {
         let scope = match on {
             None => return Ok(actor),
             Some(ActivityOn::Scope(scope)) => {
-                let selector = subc_protocol::scope::ScopeSelector {
-                    owner: principal(module),
-                    scope_ref: scope.scope_ref.clone(),
-                    scope_epoch: Some(scope.epoch),
-                };
+                let selector = subc_protocol::scope::ScopeSelector::new(
+                    principal(module),
+                    scope.scope_ref.clone(),
+                    Some(scope.epoch),
+                );
                 self.scopes
                     .read()
                     .map_err(|_| ACTIVITY_ACTOR_UNKNOWN)?
-                    .admit(&principal(module), module, &selector, true)
+                    .attribute(&principal(module), module, &selector, true)
                     .map_err(|_| ACTIVITY_ACTOR_UNKNOWN)?
             }
             Some(ActivityOn::Route(route)) => {
@@ -3574,16 +3574,16 @@ impl ControlHandler {
                     return Ok(actor);
                 };
                 let owner = principal(&bound.owner);
-                let selector = subc_protocol::scope::ScopeSelector {
-                    owner: owner.clone(),
-                    scope_ref: bound.scope_ref.clone(),
-                    scope_epoch: Some(bound.tag.scope_epoch),
-                };
+                let selector = subc_protocol::scope::ScopeSelector::new(
+                    owner.clone(),
+                    bound.scope_ref.clone(),
+                    Some(bound.tag.scope_epoch),
+                );
                 let admitted = self
                     .scopes
                     .read()
                     .map_err(|_| ACTIVITY_ACTOR_UNKNOWN)?
-                    .admit(&owner, module, &selector, true)
+                    .attribute(&owner, module, &selector, true)
                     .map_err(|_| ACTIVITY_ACTOR_UNKNOWN)?;
                 if admitted.tag != bound.tag {
                     return Err(ACTIVITY_ACTOR_UNKNOWN);
@@ -4347,7 +4347,7 @@ impl ControlHandler {
         // compared with the published one at commit, so a sync between here
         // and the module's ack refuses the open instead of binding a stamp
         // that is no longer true.
-        let (bound_scope, mut scope_stamp) = match scope {
+        let (bound_scope, mut scope_stamp) = match &scope {
             None => (None, None),
             Some(selector) => {
                 let owner_configured = match &selector.owner {
@@ -4363,7 +4363,7 @@ impl ControlHandler {
                     .scopes
                     .read()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .admit(&principal, &target_module_id, &selector, owner_configured)
+                    .admit(&principal, &target_module_id, selector, owner_configured)
                     .and_then(|admission| {
                         crate::scopes::check_target_flow_support(
                             &admission.stamp,
@@ -4545,6 +4545,26 @@ impl ControlHandler {
         let relay_capabilities = relay_registration
             .as_ref()
             .and_then(|registration| registration.manifest.capabilities.as_ref());
+        if let Some(selector) = &scope {
+            // Egress reservation may wait across a scope update. Recheck the
+            // proof against the current record before sending the captured bind.
+            if let Err(refusal) = self
+                .scopes
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .check_bind_proof(selector)
+            {
+                reservation.release_and_disarm();
+                return Ok(vec![self.route_open_refusal_frame(
+                    ctx,
+                    &frame,
+                    &target_module_id,
+                    refusal.code,
+                    refusal.code,
+                    refusal.message,
+                )?]);
+            }
+        }
         if let Some(stamp) = scope_stamp
             .as_ref()
             .filter(|stamp| stamp.attributes.flow_id.is_some() || stamp.attributes.run_id.is_some())
@@ -14439,6 +14459,30 @@ mod tests {
             serde_json::from_slice(&reply.body).unwrap()
         }
 
+        #[tokio::test]
+        async fn scope_describe_never_echoes_bind_proof_or_hash() {
+            const PROOF: &str = "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc";
+            const HASH: &str = "4bb06f8e4e3a7715d201d573d0aa423762e55dabd61a2c02278fa56cc6d294e0";
+            let mut rig = rig().await;
+            rig.sync(vec![session(1).with_bind_proof_sha256(Some(HASH.into()))])
+                .await;
+            let _bound = rig
+                .bound(
+                    Some(AFT),
+                    PLEXUS,
+                    Some(
+                        rig.selector("s", Some(1))
+                            .with_bind_proof(Some(PROOF.into())),
+                    ),
+                )
+                .await;
+            let reply = describe(&rig.handler, &rig.owner, OWNER, "s").await;
+            let output = serde_json::to_string(&reply).unwrap();
+            assert!(output.contains("\"status\":\"live\""));
+            assert!(!output.contains(PROOF));
+            assert!(!output.contains(HASH));
+        }
+
         /// Register `module_id` on `connection` with `nonce`, returning its ctx.
         async fn module(
             handler: &ControlHandler,
@@ -14900,13 +14944,13 @@ mod tests {
             }
 
             fn selector(&self, scope_ref: &str, scope_epoch: Option<u64>) -> ScopeSelector {
-                ScopeSelector {
-                    owner: Principal::Reserved {
+                ScopeSelector::new(
+                    Principal::Reserved {
                         module_id: OWNER.to_string(),
                     },
-                    scope_ref: scope_ref.to_string(),
+                    scope_ref.to_string(),
                     scope_epoch,
-                }
+                )
             }
 
             fn open_frame(
@@ -15166,13 +15210,13 @@ mod tests {
         }
 
         fn rig_selector(scope_ref: &str, scope_epoch: Option<u64>) -> ScopeSelector {
-            ScopeSelector {
-                owner: Principal::Reserved {
+            ScopeSelector::new(
+                Principal::Reserved {
                     module_id: OWNER.to_string(),
                 },
-                scope_ref: scope_ref.to_string(),
+                scope_ref.to_string(),
                 scope_epoch,
-            }
+            )
         }
 
         #[tokio::test]
@@ -15200,13 +15244,13 @@ mod tests {
             assert!(subc_protocol::error_codes::is_retryable_route_open(&code));
 
             // An owner that is not configured will never sync: terminal.
-            let ghost = ScopeSelector {
-                owner: Principal::Reserved {
+            let ghost = ScopeSelector::new(
+                Principal::Reserved {
                     module_id: "ghost".to_string(),
                 },
-                scope_ref: "s".to_string(),
-                scope_epoch: Some(1),
-            };
+                "s".to_string(),
+                Some(1),
+            );
             assert_eq!(
                 rig.refused(Some(AFT), PLEXUS, Some(ghost)).await,
                 error_codes::SCOPE_NOT_LIVE
@@ -15261,13 +15305,13 @@ mod tests {
             sync(&rig.handler, &broca, 1, vec![head("b", 1)])
                 .await
                 .unwrap();
-            let own = ScopeSelector {
-                owner: Principal::Reserved {
+            let own = ScopeSelector::new(
+                Principal::Reserved {
                     module_id: BROCA.to_string(),
                 },
-                scope_ref: "b".to_string(),
-                scope_epoch: Some(1),
-            };
+                "b".to_string(),
+                Some(1),
+            );
             let route = rig.bound(Some(BROCA), PLEXUS, Some(own)).await;
             assert!(!route.stamp().unwrap().owner_authorized);
         }
@@ -15396,6 +15440,54 @@ mod tests {
                 .get_module_by_connection(replacement.connection_id)
                 .unwrap()
                 .is_some());
+        }
+
+        #[tokio::test]
+        async fn scope_bind_proof_rechecks_current_hash_before_captured_relay() {
+            use std::future::Future;
+            const PROOF: &str = "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc";
+            const HASH: &str = "4bb06f8e4e3a7715d201d573d0aa423762e55dabd61a2c02278fa56cc6d294e0";
+            const NEXT_HASH: &str =
+                "2578ccf8645b2d1dc10c465eff843585970f3a7e22296a92cad55d489a272072";
+            let mut rig = rig().await;
+            rig.sync(vec![session(1).with_bind_proof_sha256(Some(HASH.into()))])
+                .await;
+            let (client, mut rx, frame) = rig.open_frame(
+                Some(AFT),
+                PLEXUS,
+                Some(
+                    rig.selector("s", Some(1))
+                        .with_bind_proof(Some(PROOF.into())),
+                ),
+            );
+            // Hold egress reservation while the scope owner changes its bind-proof
+            // hash, so a proof valid at admission must be checked again at relay.
+            for _ in 0..64 {
+                client.egress.try_send(route_bind_ack(1)).unwrap();
+            }
+            let handler = rig.handler.clone();
+            let mut open = Box::pin(handler.handle_control_frame(&client, frame));
+            std::future::poll_fn(|cx| {
+                assert!(open.as_mut().poll(cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            rig.sync(vec![
+                session(1).with_bind_proof_sha256(Some(NEXT_HASH.into()))
+            ])
+            .await;
+            rx.try_recv().unwrap();
+            let replies = tokio::time::timeout(Duration::from_secs(2), open)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                parse_error(&replies[0])["code"],
+                error_codes::SCOPE_BIND_PROOF_MISMATCH
+            );
+            assert!(!String::from_utf8_lossy(&replies[0].body).contains(PROOF));
+            assert!(rig.modules.get_mut(PLEXUS).unwrap().1.try_recv().is_err());
+            assert_eq!(rig.forwarding.reserved_route_count().unwrap(), (0, 0));
         }
 
         #[tokio::test]

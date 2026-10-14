@@ -25,6 +25,10 @@ use std::{
     sync::Arc,
 };
 
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
+
 use subc_protocol::{
     call_mode::CALL_MODES_CAPABILITY,
     error_codes,
@@ -113,6 +117,20 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
         return false;
     }
     a.iter().zip(b).fold(0u8, |diff, (x, y)| diff | (x ^ y)) == 0
+}
+
+fn bind_proof_matches(proof: &str, hash: &str) -> bool {
+    let mut decoded = [0u8; 32];
+    if proof.len() != 43 || URL_SAFE_NO_PAD.decode_slice(proof, &mut decoded) != Ok(32) {
+        return false;
+    }
+    // The stored hash is validated before entering the table. Compare digest
+    // bytes in constant time; neither the proof nor its digest enters a stamp.
+    let nibble = |b: u8| if b <= b'9' { b - b'0' } else { b - b'a' + 10 };
+    let expected: [u8; 32] = std::array::from_fn(|i| {
+        (nibble(hash.as_bytes()[2 * i]) << 4) | nibble(hash.as_bytes()[2 * i + 1])
+    });
+    bool::from(Sha256::digest(decoded).as_slice().ct_eq(&expected))
 }
 
 /// What a bind captures at admission and compares at commit: the session the
@@ -1095,6 +1113,14 @@ impl ScopeTable {
         }
         let mut seen = HashSet::new();
         for record in scopes {
+            if let Some(hash) = &record.bind_proof_sha256 {
+                subc_protocol::scope::validate_bind_proof_sha256(hash).map_err(|message| {
+                    SyncRefusal {
+                        code: INVALID_CONTROL_BODY,
+                        message: message.to_string(),
+                    }
+                })?;
+            }
             if record.scope_ref.is_empty() {
                 return Err(SyncRefusal {
                     code: INVALID_CONTROL_BODY,
@@ -1549,6 +1575,54 @@ impl ScopeTable {
         selector: &ScopeSelector,
         owner_configured: bool,
     ) -> Result<ScopeAdmission, ScopeAdmissionRefusal> {
+        let admission = self.attribute(opener, target_module, selector, owner_configured)?;
+        self.check_bind_proof(selector)?;
+        Ok(admission)
+    }
+
+    /// Recheck only the proof constraint on the selected live epoch. Tag
+    /// settlement still handles ended or changed scopes, preserving the bind
+    /// behavior of records without a hash.
+    pub(crate) fn check_bind_proof(
+        &self,
+        selector: &ScopeSelector,
+    ) -> Result<(), ScopeAdmissionRefusal> {
+        let record = reserved_module_id(&selector.owner)
+            .and_then(|owner| self.owners.get(owner))
+            .and_then(|owner| owner.live.get(&selector.scope_ref))
+            .map(|scope| &scope.record)
+            .filter(|record| Some(record.scope_epoch) == selector.scope_epoch);
+        let Some(record) = record else {
+            return Ok(());
+        };
+        if let Some(hash) = &record.bind_proof_sha256 {
+            let proof = selector
+                .bind_proof
+                .as_deref()
+                .ok_or_else(|| ScopeAdmissionRefusal {
+                    code: error_codes::SCOPE_BIND_PROOF_REQUIRED,
+                    message: "this scope requires a bind proof".to_string(),
+                })?;
+            if !bind_proof_matches(proof, hash) {
+                return Err(ScopeAdmissionRefusal {
+                    code: error_codes::SCOPE_BIND_PROOF_MISMATCH,
+                    message: "the bind proof does not match this scope".to_string(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolve attribution for an already attested module or bound route.
+    /// Activity reporting is not a new bind and must not retain or require the
+    /// original bind proof. Route opens must use `admit` instead.
+    pub(crate) fn attribute(
+        &self,
+        opener: &Principal,
+        target_module: &str,
+        selector: &ScopeSelector,
+        owner_configured: bool,
+    ) -> Result<ScopeAdmission, ScopeAdmissionRefusal> {
         let refuse = |code: &'static str, message: String| ScopeAdmissionRefusal { code, message };
         let Some(scope_epoch) = selector.scope_epoch else {
             return Err(refuse(
@@ -1705,6 +1779,19 @@ mod tests {
 
     fn table() -> ScopeTable {
         ScopeTable::new([PREFRONTAL.to_string()])
+    }
+
+    #[test]
+    fn scope_record_validation_refuses_malformed_bind_proof_hashes() {
+        for hash in ["A".repeat(64), "a".repeat(63), "g".repeat(64)] {
+            let mut table = table();
+            let record = head("s", 1).with_bind_proof_sha256(Some(hash));
+            let error = table
+                .sync(PREFRONTAL, conn(1), any_current, 1, vec![record])
+                .unwrap_err();
+            assert_eq!(error.code, INVALID_CONTROL_BODY);
+            assert!(error.message.contains("bind_proof_sha256"));
+        }
     }
 
     fn record(scope_ref: &str, scope_epoch: u64, kind: ScopeKind) -> ScopeRecord {

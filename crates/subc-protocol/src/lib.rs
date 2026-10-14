@@ -122,6 +122,11 @@ pub mod error_codes {
     /// listed carrier, or it is a targeted carrier and the target module is not
     /// in its list. TERMINAL.
     pub const SCOPE_NOT_CARRIER: &str = "scope_not_carrier";
+    /// A scope with a bind-proof hash requires every opener, including its
+    /// owner, to present the proof. TERMINAL.
+    pub const SCOPE_BIND_PROOF_REQUIRED: &str = "scope_bind_proof_required";
+    /// The proof is malformed or does not match the scope's hash. TERMINAL.
+    pub const SCOPE_BIND_PROOF_MISMATCH: &str = "scope_bind_proof_mismatch";
     /// Raised by a carrier, never by the daemon: the daemon does not advertise
     /// `scopes/v1`, so the carrier fails the call instead of opening an
     /// unscoped route.
@@ -222,7 +227,13 @@ pub mod error_codes {
     /// that races an unsupervised module's HELLO owns its own retry; retrying
     /// in place only papers over that race for one narrow window.
     pub fn is_retryable_route_open(code: &str) -> bool {
-        if matches!(code, TARGET_FLOW_UNSUPPORTED | TARGET_AGENT_RUN_UNSUPPORTED) {
+        if matches!(
+            code,
+            TARGET_FLOW_UNSUPPORTED
+                | TARGET_AGENT_RUN_UNSUPPORTED
+                | SCOPE_BIND_PROOF_REQUIRED
+                | SCOPE_BIND_PROOF_MISMATCH
+        ) {
             return false;
         }
         matches!(

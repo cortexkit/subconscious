@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.20.89
+
+- Upgrade the daemon and SDK wire crates for per-scope bind proofs. Add isolated real-daemon coverage for required, wrong, malformed, matching, owner and epoch-replacement proofs, and unchanged admission for records without a hash.
+
 ## 0.20.88
 
 - Test-only: the `ck` quota fixture uses a placeholder account address (`person@example.invalid`) instead of a real-looking email.

@@ -1,0 +1,9 @@
+{
+  "bind_proof": "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc",
+  "owner": {
+    "kind": "reserved",
+    "module_id": "prefrontal-core"
+  },
+  "ref": "head-1",
+  "scope_epoch": 3
+}

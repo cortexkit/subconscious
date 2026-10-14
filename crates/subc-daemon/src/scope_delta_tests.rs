@@ -225,11 +225,7 @@ fn admission_refuses_passed_deadline_without_mutating_the_table() {
         1,
         vec![record("s", 1).with_expires_at_ms(Some(2_000))],
     );
-    let selector = ScopeSelector {
-        owner: reserved(OWNER),
-        scope_ref: "s".into(),
-        scope_epoch: Some(1),
-    };
+    let selector = ScopeSelector::new(reserved(OWNER), "s", Some(1));
     clock.store(2_000, Ordering::SeqCst);
     let refusal = table
         .admit(&reserved(OWNER), "provider", &selector, true)

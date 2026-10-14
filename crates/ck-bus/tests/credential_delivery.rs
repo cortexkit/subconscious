@@ -1,5 +1,5 @@
 //! Ladder row "Credential delivery and attestation" (slice 5 of
-//! `docs/specs/ck-bus-module.md`). served-by: harness-signer (the box account root that
+//! `docs/ck-bus.md`). served-by: harness-signer (the box account root that
 //! signs the participant's JWT), against a real nats-server and the acceptance daemon.
 //!
 //! A participant spawned by the daemon as a supervised module (this row's own

@@ -3,7 +3,7 @@ import XCTest
 @testable import SubcFed
 
 /// Conformance harness for the sealed push payload corpus
-/// (`docs/specs/push-sealed-payload.md`).
+/// (`docs/push-sealed-payload.md`).
 ///
 /// The corpus is minted by the Rust sealer in `callosum` and consumed here, so
 /// the cross-implementation property is tested by a side that had no hand in
@@ -45,7 +45,7 @@ final class PushSealedPayloadConformanceTests: XCTestCase {
                 """
                 push-sealed corpus not delivered yet; expected at \
                 \(Self.corpusFile.path). Minted by callosum's sealer per \
-                docs/specs/push-sealed-payload.md. This suite enforces the moment \
+                docs/push-sealed-payload.md. This suite enforces the moment \
                 the file appears.
                 """
             )
@@ -102,7 +102,7 @@ final class PushSealedPayloadConformanceTests: XCTestCase {
             XCTFail(
                 "pinned to vector-set \(pinnedVectorSet), corpus declares \(declared). "
                     + "Re-read the required-negatives table in "
-                    + "docs/specs/push-sealed-payload.md and update this list."
+                    + "docs/push-sealed-payload.md and update this list."
             )
             return
         }

@@ -1,5 +1,5 @@
-//! Ladder row "Machine id and account" (slice 4 of `docs/specs/ck-bus-module.md`, with
-//! the key and first-boot rules of `docs/designs/nats-install-trust-chain.md`).
+//! Ladder row "Machine id and account" (slice 4 of `docs/ck-bus.md`, with
+//! the key and first-boot rules of `docs/nats-install-trust-chain.md`).
 //! served-by: harness-signer.
 //!
 //! A supervised ck-bus boots against a real `nats-server` configured the way `ck setup`

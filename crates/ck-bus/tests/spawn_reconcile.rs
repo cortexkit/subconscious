@@ -1,5 +1,5 @@
 //! Ladder row "Spawn reconciliation and census recovery" (slice 7 of
-//! `docs/specs/ck-bus-module.md`), against a real nats-server, the acceptance daemon and
+//! `docs/ck-bus.md`), against a real nats-server, the acceptance daemon and
 //! the supervised `ck-bus` binary.
 //!
 //! Serving side: harness-signer. Every JWT and revocation list the supervised ck-bus

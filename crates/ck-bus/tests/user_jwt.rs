@@ -1,4 +1,4 @@
-//! Ladder row "User JWT and seed absence" (slice 3 of `docs/specs/ck-bus-module.md`). served-by: harness-signer.
+//! Ladder row "User JWT and seed absence" (slice 3 of `docs/ck-bus.md`). served-by: harness-signer.
 //!
 //! ck-bus builds a participant user JWT and has the harness signer's root sign it over
 //! the daemon, exactly as it would have claustrum sign it. A real `nats-server`, whose

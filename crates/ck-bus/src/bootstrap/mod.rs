@@ -1,7 +1,7 @@
 //! Bootstrap: the machine id and the box account, ck-bus's own users, the census bucket,
 //! the six streams and the two module durables.
 //!
-//! Keys and signatures follow `docs/designs/nats-install-trust-chain.md` (sections 1, 3
+//! Keys and signatures follow `docs/nats-install-trust-chain.md` (sections 1, 3
 //! and 7). The operator root signed the operator JWT and the system account JWT at
 //! install; ck-bus never uses it. At boot ck-bus:
 //!

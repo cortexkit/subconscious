@@ -5,7 +5,7 @@
 //! `root_credential_id`; ck-bus writes only the provider token and generation, never
 //! the id as a literal.
 //!
-//! The operator has two keys (`docs/designs/nats-install-trust-chain.md`, sections 1
+//! The operator has two keys (`docs/nats-install-trust-chain.md`, sections 1
 //! and 7). The ROOT is the operator identity: it self-signs the operator JWT and signs
 //! the system account JWT, once, by ceremony at install, and ck-bus never uses it. The
 //! SIGNER is listed in the operator JWT's `signing_keys` and signs the box account JWT,

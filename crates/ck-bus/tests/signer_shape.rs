@@ -1,4 +1,4 @@
-//! Ladder row "Signer wire shape" (slice 3 of `docs/specs/ck-bus-module.md`). served-by: harness-signer for the golden
+//! Ladder row "Signer wire shape" (slice 3 of `docs/ck-bus.md`). served-by: harness-signer for the golden
 //! half; claustrum-binary for the real-binary half, which records
 //! `claustrum-binary-absent` and reports SKIP when `CK_CLAUSTRUM_BIN` or `CK_CK_BIN` is
 //! missing.

@@ -1,5 +1,5 @@
 //! Ladder row "A3 census write and issuance recovery" (slice 5 of
-//! `docs/specs/ck-bus-module.md`). served-by: harness-signer, against a real
+//! `docs/ck-bus.md`). served-by: harness-signer, against a real
 //! nats-server and the acceptance daemon.
 //!
 //! - Census write: a supervised participant's `ckbus.credential` writes exactly one

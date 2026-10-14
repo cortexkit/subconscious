@@ -23,7 +23,7 @@
 //! settled unrecorded.
 //!
 //! Which record is first is a function of the stream alone, so the answer survives a
-//! restart without a file of its own; `docs/specs/ck-bus-module.md` lists every shape
+//! restart without a file of its own; `docs/ck-bus.md` lists every shape
 //! ck-bus's durable store may hold, and none is for dead letters. At
 //! every start ck-bus reads how far the previous `c_ckbus_dead` had settled (its ack
 //! floor), saves that floor in `c_ckbus_dead_checkpoint`'s metadata, then deletes and

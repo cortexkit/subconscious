@@ -3,7 +3,7 @@
 This is the Story 1.1 AC3 representative mapping for the local
 `subc ↔ module` leg. It deliberately covers frame-shape classes rather than
 enumerating every AFT command, preserving the envelope extensibility described
-in `docs/subc-core-architecture.md` §4.8.
+in `docs/wire-contract.md`.
 
 Architecture §4.8 fixes the 17-byte little-endian header:
 `len u32`, `ver u8`, `type u8`, `flags u8`, `channel u16`, `corr u64`, followed

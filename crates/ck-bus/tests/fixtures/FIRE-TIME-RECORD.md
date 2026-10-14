@@ -6,7 +6,7 @@ slice was being authored on 2026-09-20. The live in-process daemon reported
 
 ## Source sections read
 
-The implementation was checked against `docs/specs/ck-bus-module.md`:
+The implementation was checked against `docs/ck-bus.md`:
 
 - Constraints: Repository and dependencies; Acceptance test layout; Module declaration and
   acceptance fixture; Sequencing and file fences, including the row/slice/test-file table;

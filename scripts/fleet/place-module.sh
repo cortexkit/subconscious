@@ -563,7 +563,7 @@ signing_posture() {
 # change a placement may make, and only from off to on. Each module holds a launch
 # nonce that admits any connection presenting it as that module; hardened runtime
 # is what stops another process of the same user attaching a debugger and reading
-# it (docs/designs/launch-nonce-descriptor.md). Modules gain the flag one placement
+# it (docs/launch-nonce.md). Modules gain the flag one placement
 # at a time, so an exact match on it would refuse every module's first hardened
 # build. Removing it is refused, because that lets same-user processes attach again.
 cd_flags() {

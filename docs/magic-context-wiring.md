@@ -1,0 +1,307 @@
+# Magic Context Module Wiring Contract — own-harness leg (v2)
+
+The wire fields, message identity rules, codec boundary and producer obligations below are fixed for the owned-harness integration: the `llm-runner` module drives the model loop and calls the transform, unlike a plugin attached to a third-party host. §7 defines the version.
+
+Scope: the OWN-HARNESS leg (llm-runner as producer). MITM and plugin legs later;
+leg-dependent decisions pin the own-harness resolution and mark the MITM slot.
+
+Consolidates the five codec-boundary ledger items + the wave-2 wire rulings.
+References: magic-context/docs/specs/ck-message.md (CK#1),
+magic-context/docs/specs/codec.md (#2), docs/magic-context-plugin-connection.md
+(#4), docs/magic-context-cache-policy.md (#6).
+
+---
+
+## 1. The pipeline
+
+```
+llm-runner (producer)                    Magic Context module (transform)
+  canonical messages + durable ids        flatten -> block-granular items (INTERNAL)
+    -> CkMessage array + id sidecar ──►   block identity (module-owned, §3)
+    + usage / agent_drop_ids              classify -> HARD/SOFT/defer (cache-core)
+    (subc route, Interactive)             decision surface (selection/scheduler/
+                                            boundary/trigger/injection)
+  render VERBATIM ◄── transformed array   [pinned system ++ m0, m1 ++ tail]
+```
+
+- **llm-runner** owns the provider render (C7) and the durable store (WAL +
+  message identity). It produces CK#1 `CkMessage`s and renders the returned
+  array verbatim (keystone invariant: no re-derivation/reorder/filter).
+- **Magic Context module** owns the transform: flattening, block identity, cache-stability
+  state machine, decision surface.
+- **subc** routes opaque bytes. No subc-core changes anywhere in this contract.
+
+## 2. Transform-request wire
+
+The request carries FULL CK messages (not pre-flattened thin items) plus an
+identity sidecar. The decision surface reads full
+`ToolCall.input` (edit-marker payloads, ctx_note action, todowrite view) and
+message-level grouping (BoundaryMsg role/ordinal); and llm-runner's render side
+consumes messages, not flat items — so messages are the wire unit, and the
+flatten lives at MODULE INGRESS (module owns reduction identity → owns the
+projection).
+
+```jsonc
+{
+  "v": 1,
+  "session_id": "…",
+  "render_config": "…",             // frozen render-config hash basis (epoch marker)
+  "messages": [                      // FULL CK#1 CkMessages, in order, INCLUDING
+    {                                //  leading system message(s) — see §2.1
+      "mid": "…",                   // durable per-message identity (§3.2) — sidecar
+      "ordinal": 42,                 // DURABLE monotonic lineage coordinate — NOT the
+                                     //  array index (index restarts at 0 under the §6.5
+                                     //  coverage trim while Magic Context's ordinal-keyed durable
+                                     //  state keeps advancing; same data-not-position
+                                     //  rule as mid: stable per mid across requests,
+                                     //  strictly increasing in lineage order, renderer-
+                                     //  ignored). Neither field is part of CK#1.
+      "ck": { /* CkMessage: role, content[], origin, provider_extras, meta */ }
+    }
+  ],
+  "usage": {                         // caller-owned pressure ground truth (§2.2)
+    "current_total_input_tokens": 123456,
+    "context_limit_tokens": 200000
+  },
+  "agent_drop_ids": ["…"]           // control-plane side input (§2.3)
+}
+```
+
+### 2.1 System is IN the array
+
+Leading `Role::System` message(s) ride the array as ordinary CK content, marked
+by position, and Magic Context treats them as PINNED: never summarized, reordered, or
+reduced (CK#1's pinned-system rule). Their bytes feed the HARD-bust hash;
+`render_config` carries only the epoch marker. The transformed array returns
+them verbatim in position, so the producer renders one array with no out-of-band
+re-hoisting.
+
+### 2.2 `usage` (pressure — caller-owned)
+
+Provider-reported usage is caller-owned ground truth and feeds the 85/95 pressure bands and emergency fixedFloor; non-zero request usage wins over the persisted last value, including decreases after reclaim or fold, while absent or zero usage falls back to ModuleMeta and composed budgets remain module-internal.
+
+### 2.3 `agent_drop_ids` (control signal — caller-owned)
+
+ctx_reduce §N§ marks as flat block ids (§3.3 vocabulary — the producer addresses
+blocks by `mid#index`, which the harness derives from the same id sidecar it
+sent). Leg-optional (absent on MITM). Module treats the set as durable add-only,
+filtered through frozen_keys. CLEARING RULE: the producer clears its
+accumulated set only after a transformed response for a request carrying those
+ids has been RENDERED; until then every retry re-sends the identical set.
+
+### 2.4 Scheduler input source map
+
+Every `SchedulerInputs` field has exactly one source:
+
+| Input | Source |
+|---|---|
+| current_total_input_tokens, context_limit | request `usage` (+ ModuleMeta max-merge, §2.2) |
+| executeThreshold %, TTLs, bands, smart_drops, keep-Ns, reserves | config-home, frozen at bind |
+| last_response_time_ms, session timing | request-derived (now_ms) + ModuleMeta |
+| prior_input_sample, has_prior_drop (emergency latch) | ModuleMeta (durable) |
+| last_execute_ordinal (two-pass watermark) | ModuleMeta (durable) |
+| deferred_execute, drain_latch | ModuleMeta (durable) |
+| overflow_error_text | request-supplied on the pass AFTER a provider overflow error (producer forwards the provider 400 body verbatim); absent otherwise |
+| tail_state / items | derived from `messages` at ingress |
+| pass class | module-DECIDED (Unit S) — never caller-supplied |
+| boundary_present | module-derived from durable state — never caller-supplied |
+
+## 3. Flattening, granularity, identity (the load-bearing seam)
+
+### 3.1 Flatten at module ingress
+
+Magic Context projects `messages` → flat block-granular items internally: one item per
+`ContentBlock`, typed fields (kind, name, file_path via PATH_KEYS, full
+`ToolCall.input`, provider_executed, arc grouping, message role/ordinal
+back-reference) projected 1:1 from CK#1. The reduction mechanics (slices 2/3)
+keep keying on id/ordinal/bytes — unchanged. Nothing pre-flattened crosses the
+wire.
+
+ARC IDENTITY: `arc_id` MUST be
+session-injective. `tool_call_id` is only the PAIRING HINT — ToolResult→ToolCall
+pairing resolves by id + adjacency (nearest-FIFO within the message
+neighborhood), and the arc is then KEYED by the ToolCall block's `mid#i`. A bare
+tool_call_id arc key would fuse arcs across turns under per-turn synthesized ids
+(Gemini `call_0`), corrupting emergency reclaim accounting, arc-atomic emission,
+and shared-Reasoning dedup — the TS v10 (callID, owner_message_id) lesson.
+Ingress test: two turns each containing `call_0` produce two distinct arcs.
+
+### 3.2 Durable message identity (`mid`) — DECIDED: (a), logical-coordinate basis
+
+**Explicit durable `mid` is data on the canonical Message** — `Option<Mid>`, serde-skip-none (additive,
+same shape/discipline as the shipped `origin` field), stamped identically at
+the live-append site and the replay-reconstruct sites.
+
+- **Value basis = DURABLE LOGICAL COORDINATES** (episode index + step_id +
+  role-slot; input messages by input index) — NOT wal_seq/sub_index. Logical
+  coordinates are identical across the store-merge and full-replay read paths
+  by construction; WAL byte-stream positions are not (that would be (b)'s
+  fragility inside (a)'s carrier).
+- **OPAQUE to Magic Context**: the mid is a producer-owned token. Magic Context uses it ONLY for
+  equality and for composing block ids by concatenation (`<mid>#<index>`) —
+  it never parses mid internals; the format stays LLMRUNNER's to evolve.
+  RESERVED CHARACTER: the producer guarantees `#` never appears in a mid, so
+  `mid#index` stays injective given injective mids.
+- **Producer guarantee**: the transform-request builder asserts mid PRESENT on
+  every message it sends (deriving on the fly from the logical coordinates for
+  any legacy record) — the Option on the type never reaches Magic Context as None.
+- **C7 commitment (3 tests, LLMRUNNER)**: (1) render(with-mids) ==
+  render(mids-stripped), byte-identical; (2) cross-read-path mid identity rides
+  the EXISTING merge_equals_full_replay_at_every_turn_boundary gate for free
+  (whole-Message comparison — the gate that already caught the origin seed
+  bug); (3) stamping non-vacuousness (non-empty, scheme-conformant, injective
+  per session).
+- Forking: forked lineages copy prefix mids verbatim (data, not position) — no
+  fork special-case.
+
+### 3.2.1 The mid stability contract is TWO-WAY (all codecs, not just llm-runner)
+
+3.2 pins llm-runner's basis; this is the general obligation every codec that
+produces `mid`s must satisfy — the plugin/codec leg (OpenCode/Pi), the CC MITM
+leg, and any future producer. A `mid` is a STABLE PER-MESSAGE IDENTITY across
+passes, which is TWO directions, both load-bearing:
+
+1. **No reuse** — a `mid` never maps to different content across passes. A
+   revert-then-continue mints FRESH mids for the new continuation; it never
+   re-stamps an old mid onto new content. (This is the revert-stability rule:
+   same mid ⇒ same content, forever.)
+2. **No churn** — a message that PERSISTS across passes keeps the SAME mid;
+   the same content is never re-stamped under a different mid. Once a message
+   is first assigned a mid, that mid is monotonic-stable for that message.
+
+Both are required because a cache frozen unit (a boundary anchor or a reduction
+target) is KEYED by `mid#index`. Violating (1) makes boundary-presence match a
+stale mid onto wrong content; violating (2) makes a boundary anchor's mid vanish
+from the live array (→ spurious reconcile/re-cut) and orphans reductions whose
+target mid no longer exists. The one-directional phrasing "same mid ⇒ same
+content" alone is insufficient — churn (different-mid-same-content) is permitted
+by that literal phrasing but breaks frozen-unit stability, so the contract is
+explicitly both directions.
+
+How each producer satisfies it:
+- **llm-runner** (§3.2): durable logical coordinates are stable-by-construction
+  in both directions (a persistent message's coordinates don't change; a new
+  message gets new coordinates). No extra mechanism.
+- **OpenCode**: `mid = info.id`, immutable-per-message — both directions free.
+- **Pi**: `mid = responseId` when present at first sight, else
+  `pi-ts-<timestamp>`; the FIRST-SEEN mid is PINNED via the id sidecar so a
+  streaming entry that later gains a `responseId` keeps its first-seen mid (no
+  churn). The mid value is opaque — keeping a "uglier" `pi-ts` mid after settle
+  is correct, only stability matters. For Pi the pin is SHOULD-hard
+  (defense-in-depth), not MUST-load-bearing: churn cannot reach a frozen-unit key
+  by construction — the only entries whose id can change are mid-stream assistant
+  entries (no `responseId` yet), which are by definition the NEWEST message and
+  thus always inside the protected live tail, so coverage/reductions/boundary
+  minting never reach an entry still on a fallback mid; all other
+  timestamp-keyed classes (user, toolResult, custom) never carry `responseId` and
+  are timestamp-stable forever; and a restart mid-stream aborts the stream so the
+  fallback mid becomes the entry's permanent identity. The unconditional pin
+  guards only a FUTURE harness behavior change (e.g. Pi backfilling `responseId`s
+  on resume).
+- **CC MITM leg** (ai-proxy): positional wire arrays have no native durable id,
+  so the codec's id-synthesis MUST be content-anchored or sequence-monotonic —
+  never bare-positional (a positional id churns the moment the array shifts).
+  Here the first-seen-pin discipline via the leg's sidecar is genuinely
+  MUST-load-bearing (no native ids to fall back on), unlike Pi's belt case.
+
+### 3.3 Block identity: `mid#<block_index>` for ALL blocks
+
+`block_id = <mid>#<block_index>` uniformly — including tool blocks.
+`tool_call_id` is DEMOTED to pairing/arc metadata only (it stays in the typed
+fields for arc grouping and render pairing), because it is NOT session-injective:
+Gemini synthesis emits per-turn `call_0`, so `<tool_call_id>#call` collides
+across turns and a frozen `red:call_0#call` would cross-apply. The selection
+golden's `id#call`/`id#result` strings become `mid#i` — decision logic
+unchanged, mechanical golden regen at wiring (as always planned for id strings).
+
+### 3.4 Identity invariants (cache-critical)
+
+- REPRODUCIBLE: same producer history → same ids every pass and across restart.
+- INJECTIVE within a session.
+- ENFORCEMENT: at first sight of a `mid`, the module persists its ordered
+  block-identity vector (per-block kind + byte-fingerprint), batched into the
+  PASS-COMMIT transaction (no standalone per-mid writes; the pass stays
+  single-write). On every later pass it fail-CLOSES on drift: changed block
+  list for a live `mid`, duplicate ids in one request, or a frozen `red:<id>`
+  whose target vanishes while its message is live. Codec/projection version is
+  part of the HARD epoch (render_config), so an intentional projection change
+  is a clean HARD, never silent identity drift.
+
+## 4. Codec render obligations
+
+1. **No-omit pairing**: reduced ToolCall renders as a valid tool_use, reduced
+   ToolResult as a tool_result, even at `[dropped N]`/skeleton. Never omit a
+   drop-markered block (orphaned tool_use 400s).
+2. **Arc atomicity carries to render**: a reduced arc renders with all members
+   present in reduced form, or (only where the grammar permits) the complete
+   arc omitted together. Never a half-rendered arc.
+3. **Opaque/Media v1 posture: FAIL-LOUD.** Own-harness v1 rejects
+   at ingress any `Opaque` block (and Media beyond llm-runner's supported set)
+   with a typed error, rather than carrying a lossy projection. Full CK#1
+   Opaque carriage {source, kind, raw, arc} is the MITM-leg prerequisite and
+   lands there. (llm-runner's own canonical does not emit Opaque today; this
+   gate is a tripwire, not a feature cut.)
+
+## 5. Synthetic injection = a FROZEN RENDER UNIT
+
+The synthetic todo part follows the same freeze/replay discipline as every
+byte-affecting unit (this is what Unit I's freeze/replay transition already
+implements — the v1 draft's "re-composed each pass" wording was wrong):
+- CAPTURE (survives coverage): at each bust the module persists the
+  newest tail todo-state (todowrite ToolCall.input) into ModuleMeta and
+  composes FROM ModuleMeta. A tail-only read would silently Clear the view once
+  a coverage advance consumes the todowrite into compacted history (long
+  sessions); ModuleMeta capture preserves the TS `last_todo_state` semantics
+  with no wire change. Unit I's Clear outcome remains for a genuinely
+  terminal/emptied list, never for mere absence-from-tail.
+- Composed ONLY on a bust pass; FROZEN with the pass; a defer replays the
+  frozen bytes VERBATIM (a todo change mid-defer rides the next bust).
+- Marked `synthetic: true` on the wire (annotation-only, excluded from the
+  cache hash), rendered by the producer as an ordinary block, never persisted
+  into the producer's durable store.
+
+## 6. Producer contract (llm-runner side)
+
+Per transform pass, llm-runner:
+1. Builds the `CkMessage` array (its canonical → CK#1 mapping; confirm
+   provider_executed handling; system message(s) included, §2.1).
+2. Supplies per-message `mid` + ordinal (per the §3.2 decision).
+3. Supplies `usage` (last provider response), `agent_drop_ids` (accumulated;
+   clearing rule §2.3), and — on the pass after a provider overflow error —
+   `overflow_error_text` verbatim.
+4. Sends on its Magic Context route (unary, Interactive) and awaits the transformed array.
+5. Renders the returned array VERBATIM in order (keystone invariant).
+   RESPONSE + TRIM: the response carries `coverage_ordinal` alongside
+   the transformed array. The producer MAY trim its NEXT request's `messages`
+   to those at/above `coverage_ordinal` (mids are durable so identity is
+   unaffected; the module re-trims internally regardless, so a non-trimming
+   producer stays correct). Bounds the wire+flatten cost on long sessions (2M+
+   token sessions exist) instead of O(session) forever.
+6. FAILURE POSTURE (fail-open is rejected): on Magic Context route failure,
+   ONE retry with the byte-identical request; if that fails, replay the
+   LAST-KNOWN-GOOD transformed array IFF full request identity matches
+   `{session_id, full_array_fingerprint, render_config, serializer_profile_id}`
+   (the #4 LKG rule — a stale LKG never replays against a changed input);
+   otherwise FAIL the turn with a typed Magic Context-unavailable error. NEVER send the
+   raw untransformed array (it busts the cache once on the failure and again on
+   recovery, and can overflow the context the transform exists to manage).
+7. RETRY/COMMIT AMBIGUITY: a lost response
+   after Magic Context's CAS commit is safe by IDEMPOTENCE VIA DETERMINISTIC
+   FROZEN-REPLAY, not a response cache: the byte-identical retry arrives at
+   the new row_version and re-evaluates as a defer-class pass whose frozen
+   sets replay byte-identically (selection excludes frozen_keys → no new
+   decisions → same bytes out). No literal re-serve mechanism exists or is
+   needed. Producer-side inputs advance only AFTER a rendered response (§2.3).
+
+Timing: once per provider call, before render, on the complete outgoing array.
+
+SUBAGENT SESSIONS: a child/subagent session is an ordinary session (own
+BindIdentity, own route, own lineage) — Magic Context is ON by default for children
+(mirroring the Pi children-with-discovery-ON model); capability gating happens
+per-agent fail-closed at the tool-surface layer, never by disabling Magic Context.
+
+## 7. Versioning + evolution
+
+`"v": 1` on request/response; unknown fields ignored (additive evolution). The
+transform boundary follows the canonical CK Message and codec specifications in
+the Magic Context repository; this document defines the own-harness integration contract.

@@ -1,0 +1,1375 @@
+# ck-bus: the supervised NATS message-plane module
+
+The contracts defined in the sections below take precedence over the summary in “Normative requirements index” at the end of this document.
+
+## Intent
+
+`ck-bus` is the supervised module at `crates/ck-bus/`, binary `ck-bus`, module ID `ckbus`. It issues and revokes credentials, registers participants in the census, bootstraps streams and consumers, reports liveness through its sentinel, and consumes dead-letter and process-spawn streams. Federation separates local and cross-machine accounts, configures the leaf link to a hub, and encrypts each delivery to its recipient while signing its sender context.
+
+The local message plane works without a hub and remains isolated from federation accounts. Cross-machine delivery connects a local NATS leaf server to the hub, retains pending items in a durable outbox, and encrypts/signs deliveries using recipient public keys from Callosum's verified peer records; see “Federation role” below.
+
+The daemon supplies the opaque, persistent machine name defined in `docs/machine-id-and-required-capabilities.md`, §1; the NATS account name `{acct}` is `box_<machine id>`, and that name grants no authority.
+
+`nats-server` is supervised with `protocol: "none"`, meaning process supervision without the subc HELLO handshake; no separate handshake-bypassing supervision mode is added. The daemon holds no bus credential and opens no subc route to the Claustrum credentials vault. The ck-bus sentinel, not the supervisor's liveness probe, reports message-plane health.
+
+An acceptance row may retire its F-PROV fixture only after every gate covering that row is discharged and no row still runs against that fixture; an absent dependency is a named skip or rig failure, never a pass.
+## Non-goals
+
+- Porting any workload (rooms, wakes, peer deliveries, effect intents, Pi pushes) onto
+  the bus. Those are later prefrontal slices; this work lands the owner they need.
+- Denying a child process the parent's launch-nonce principal. The foundation records
+  it as an observation; it stays one here.
+- Any daemon change. No slice edits the daemon; the supervisor holds no credential and
+  writes nothing to the census. Where a gate names a daemon change as its discharge,
+  that change belongs to daemon maintenance outside this module.
+- Authoring commons changes as slices. A slice that needs one files it as a branch for
+  the dependency maintainer to merge, then re-pins to the merged revision.
+- Building the hub, the hosted hub, the pairing ceremony, the key-record exchange, or
+  the leaf credential. Those belong to the Callosum and Claustrum maintainers and the operator. ck-bus consumes
+  `callosum.hub_read` and `callosum.peer_keys_read` and the vault ops, and runs no
+  ceremony.
+- Cross-machine rooms beyond delivery remain outside scope:
+  ck-bus seals and opens ROOM deliveries like PEER and WAKE, and nothing here makes a
+  room readable while its owning store is offline.
+- Collecting streams left behind by a machine-id change (Credentials, below): ck-bus
+  names them and deletes nothing.
+- Windows. The unix scope is Linux and macOS; non-unix is `a1-signal-unix-only`.
+- A cold-start admission limiter is not required by the current foundation.
+
+## Constraints
+
+Evidence currency and citation form. Every citation is a repository-relative path plus
+an item name (`crates/subc-control/src/lib.rs::SupervisorObservedProcess`), read at the
+commit named beside it, or at the evidence snapshot 6844bbb5b7f9 where none is named.
+`ev-N` ids and line ranges are not citation vocabulary. HEAD moves, so every slice
+re-reads at fire time the file and item it depends on and records the path, item and
+observed shape. A citation that no longer holds is a gate to record, not a fact to
+carry forward. Where this section names an item but not its file, the slice records the
+path. Dependency claims not checked against source are marked as unverified reports.
+
+Repository and dependencies.
+- Crate `crates/ck-bus`, package and binary `ck-bus`, module id `ckbus`. The daemon
+  injects `SUBC_MODULE_ID` on every spawn; the crate never sets it and reads it as
+  given. The root `Cargo.toml` `members` entry and its one-line description in the
+  trailing comment block landed in slice 0.
+- Acceptance layout, fixed so no later slice edits a manifest. Cargo builds only the
+  direct `.rs` children of `crates/ck-bus/tests/` as integration targets, so every row
+  file is a direct child at the path the Sequencing table names, auto-discovered, with no
+  `[[test]]` entry. The shared harness is `crates/ck-bus/tests/harness/mod.rs` and its
+  submodules, which each row file pulls in with `mod harness;`. A slice that believes it
+  needs a manifest target stops and reports.
+- Test inventory check, stated once. Every slice's done test runs
+  `cargo test -p ck-bus -- --list` and reads the combined cargo output. For its own
+  target and every row target landed so far, it requires cargo's
+  `Running tests/<file>.rs` line and at least one listed test name under it. A target
+  with zero listed tests fails. A build with no `Running tests/` line for a landed
+  target is never reported green.
+- Unix scope is Linux and macOS. `a1-signal-unix-only` records one condition, a
+  non-unix host (Windows), where the A1 rows assert nothing. No row is restricted to
+  Linux. The argv read is the portable `ps -ww -o args= -p <pid>`.
+- `ck-bus` dev-depends on `subc-daemon` with `features = ["test-support"]` as a
+  workspace path dep resolving to subc-daemon >= 0.20.5. The floor is checked against
+  the workspace source, not a wire op: `ServerDescribe` carries `protocol_ver`,
+  `build_git_sha` and `build_lock_digest` but no crate version. Every such test calls
+  `BootstrapConfig::with_capture_logs_dir` and `with_terminal_journal_path` with
+  fixture-tree paths. The capture directory carries stdout and stderr only, so no arm
+  reads argv from it. Wire types come from `subc-protocol`, `subc-transport` and
+  `subc-control` directly, never through `subc-daemon` re-exports.
+  The machine id needs subc-protocol >= 0.25.0 on the module side, which carries
+  `ModuleHelloAckBody.machine_id`.
+- Bus primitives come from cortexkit/commons in the three-field form
+  `{ version, git, rev }`, never a branch, pinned at
+  `4f09c7c7c7f86394d21abde6ed3f97b582ee4d28` at r2 and now at
+  `e4fb106f581c4d208a81e924a6329cfb20de616d` (commons master: the four bus crates at
+  0.2.0, with the event stream family, the flow-engine grant, the delivery authority's
+  ROOM binding and ROOM durable, and the cursor's delivery count, `term` and
+  `in_progress`). `cortexkit-store-types` 0.2.2 is added the
+  same way. Dependency changes are merged by their maintainers; a consumer needing
+  one files it as a branch and re-pins to the merged sha, and the gate it carried flips on
+  the new pin. `091bd1fc0` is the prefrontal commit at which the rig last regenerated
+  the permission golden; it is provenance only, never a manifest pin.
+- NATS JWT and nkey encoding: a slice may add a crate for nkey encoding and JWT
+  construction (the `nkeys` crate or equivalent), pinned exactly and named in its
+  report. No slice adds a dependency that holds or persists a seed outside process
+  memory.
+- Golden diff rule, stated once and identically in the A9 row: the regenerated golden
+  differs from its prefrontal-era predecessor in exactly the header line naming the
+  generator plus zero or more added subjects, each named in the slice report. Every
+  subject, stream and grant the foundation enumerates is byte-identical, and nothing is
+  removed or modified.
+- Every subject, stream, bucket, grant, consumer and credential-id name comes from
+  `cortexkit-bus-naming`; the module emits no name of its own. A refused name is a
+  refused act. At the pinned sha the crate constructs `c_ckbus_dead`
+  (`AccountNames::consumer_name`) and not the census key grammar (slice 0 record). The
+  names this revision adds and the crate must construct before a row emits them are:
+  the census key grammar, `box_<machine id>`, the root credential ids (Credentials),
+  the federation account's inbox and outbox families, and the federation stream
+  names. `naming-constructor-absent` is recordable by any row, naming the constructor
+  it stopped on. The row never emits the literal or floats the pin.
+- Foundation text reaches a slice by one path: a verbatim vendored copy at
+  `crates/ck-bus/tests/fixtures/foundation/nats-message-plane-foundation.md` with a
+  `SOURCE` file naming the prefrontal commit and sha256. Slice 0 vendored
+  `76a910737`, which predates the amendment. Slice 2 re-vendors at `b9e827c69` or later
+  and rewrites `DISPOSITION-MAPPING.md` for the amended rows. A2's child-signing half is
+  now answered by bus-held seeds, and the audit-read references are gone. A quoting
+  slice shows the quoted material byte-for-byte in the copy. With no copy and no
+  operator-supplied extract, it records the D gate and reconstructs nothing.
+
+Durable store: eight shapes and nothing else, under the store root below.
+- `spawn_cursor.json`: last processed spawn cursor.
+- `epoch_high_water.json`: the highest (generation, epoch) issued per module.
+- `sentinel_verdict.json`: the last verdict plus the incarnation id that wrote it.
+- `account.json`: the machine id and `{acct}` this store last served, and the box
+  account's identity public key (`account_public`, the account id), which ck-bus
+  generated once in memory at first boot. The seed is never kept. Absent, it is not
+  a reason to create: boot lists the resolver's accounts and adopts one named
+  `{acct}` before it creates anything.
+- `own_users.json`: the public keys of this incarnation's box-account, system-account
+  and, once federation lands, federation-account users, plus the earlier box users
+  still pending revocation. Written before each first connect so the next
+  incarnation can revoke its box users.
+- `revocation_progress/{module_id}.g{generation}.e{epoch}.json`, one file per
+  in-flight revocation. It carries that identity, `highest_completed_step` (inclusive
+  domain 0..=3), the user public key, the `user_jwt_id`, and the kick target.
+- Two federation shapes that exist only once the federation slices land:
+  `fed_send/{recipient_machine_id}.json` (the next sequence, plus at most one reserved
+  (sequence, delivery id) pair) and `fed_recv/{sender_machine_id}.json` (the durable
+  high-water mark and the gap list).
+
+No shape holds key material: a seed is never written anywhere (Credentials).
+
+Durability and damage.
+- Every write is an atomic durable replacement: a sibling `*.tmp` in the same
+  directory, fsynced, renamed over the target, the directory fsynced. A progress
+  record is never rewritten in place. A stale `*.tmp` is ignored at start and removed.
+  A file that fails to parse, or is short, is damaged. For the per-identity shapes,
+  identity comes from the filename, never the body.
+- `spawn_cursor.json` damaged: read as absent, so the module snapshots and
+  reconciles. `sentinel_verdict.json` damaged: read as absent, which is already this
+  process's start state.
+- `own_users.json` damaged: left untouched, path named in the report and start-up
+  log. The previous incarnation's users are then not revoked by name; they die by
+  expiry (R16: at most 15 minutes). Nothing guesses a key.
+- `account.json` damaged: fails closed. The module refuses to create streams or issue
+  credentials, answers health down with class `Unavailable` naming the file, and never
+  rewrites it. A wrong `{acct}` would build a second plane silently.
+- `epoch_high_water.json` damaged: fails closed per generation. The entry for a
+  (module, generation) is fsynced before the JWT for that epoch is signed, so it bounds
+  every epoch issued. The census cannot reconstruct it: a revoked epoch's entry is
+  gone. So for an unreadable entry the module issues no further epoch for that
+  generation. It leaves the file untouched and names it, refuses re-issue and
+  membership mints for the generation with a recorded refusal, answers health down
+  with `Unavailable`, and keeps serving the connections already open. A generation
+  spawned afterwards gets a fresh entry.
+- `revocation_progress` damaged: read as `highest_completed_step: 0` with its key,
+  jwt id and kick target lost. Recovery takes the census entry for the filename's
+  module id, and there are three outcomes.
+  - The entry is at exactly the filename's (generation, epoch): re-derive the inputs
+    from its `credential_public` and `user_jwt_id`, then replay from step (1). Every
+    step is idempotent.
+  - The read succeeds but the entry is absent, damaged or at another pair: the lost
+    key cannot be recovered. Issuance overwrites the census entry on its own, without
+    going through revocation, so an entry that is absent or names another pair proves
+    nothing about whether this record's credential was revoked. Recovery keeps the
+    damaged progress file, pushes nothing, and defers on every pass until the file is
+    repaired; it never claims completion.
+  - The read fails: recovery keeps the file, defers and retries once per sentinel period.
+- The two federation shapes are durable before the act they cover (a reservation
+  before publish, a high-water mark before ack). A damaged `fed_recv` file refuses
+  delivery from that sender until repaired: it quarantines, never guesses a high-water
+  mark, and names the file. A damaged `fed_send` file refuses sealing to that
+  recipient.
+
+Store root: `cortexkit_store_types::module_data_dir("ckbus")` (`cortexkit-store-types`
+0.2.2 at the commons pin, recorded by slice 0). The returned directory is used as-is and
+must be absolute. The module refuses to start unless `XDG_DATA_HOME` or `HOME` is set
+and the root is absolute. The literal `~/.local/share` is never used. Every acceptance
+run sets `XDG_DATA_HOME` into its fixture tree and asserts nothing was written under the
+operator's real data home. The store is raw module state, not the managed sqlite store,
+so `ck-bus` does not open the `StorageDescriptor` on HELLO_ACK. The census lives in the
+bucket, root keys live in Claustrum, per-process keys live in memory, and nothing else
+is durable.
+
+Module declaration and acceptance fixture (slice 0, merged).
+`crates/ck-bus/tests/fixtures/subc.jsonc` carries these blocks: the `ckbus` block; the
+`nats-server` block; the stand-in child declared twice, once `protocol: "none"` and
+once with the key omitted, both naming `tests/support/standin_child.sh`; and the
+`claustrum` and `callosum` stub blocks. A later slice adds a module block (the harness
+signer, a real claustrum, a second daemon's blocks) only through the harness's
+per-test config renderer: it adds a renderer registration in its own harness
+submodule, never by editing the fixture file. A slice that cannot stops and reports.
+No slice edits an operator-facing deployed `subc.jsonc`.
+- `protocol: "subc"`. `protocol: "none"` would make `route.open` terminal with
+  `module_no_protocol` and suppress health, leaving ruling (3) unimplementable.
+- `reserved: true` from the first placement. The flag makes the daemon check the
+  launch nonce on HELLO, so no unsupervised process can register `ckbus` and receive
+  every child's sign and credential requests. It protects the provider's identity and
+  has nothing to do with the callers' attestation (Credentials). `ck-bus` reads
+  `SUBC_LAUNCH_NONCE` and echoes it verbatim in `ModuleHelloBody::launch_nonce`, never
+  synthesising, defaulting or caching it. Registration is asserted by the declaration
+  row's four observables, never by a `supervisor.list` entry. The daemon refuses
+  `reserved: true` with `protocol: "none"` at parse.
+- Catalog advertisement is read from the `CatalogEntry` field slice 0 named. If it
+  disappears at fire time, the arm fails loudly and invents no accessor.
+- Supervised pid source (R6), stated once. Every arm that needs a supervised pid reads
+  `supervisor.provenance` narrowed to the module id under test, at
+  `daemon_observed.pid` on the entry whose `module_id` matches, and cites that op. It is
+  not read from `supervisor.list` (no pid field), the daemon-internal snapshot, or
+  `ck module status`. An unnarrowed reply is never indexed positionally. There are
+  three outcomes: (a) an error frame fails the arm, quoting the code and the id; (b) an
+  entry whose `pid` is `None` or absent is re-read once per 200 ms for up to 2 s, then
+  fails quoting the last reply, with no fallback and no `ps` on an empty pid; (c)
+  `Some(pid)` proceeds. Settling after a spawn is the same bounded re-read.
+- Terminal records, read only by A1, come from the fixture terminal journal,
+  cross-read against `supervisor.terminals` in the same run, against the fields slice 0
+  recorded. A missing field path fails loudly.
+- `drain_timeout_ms` is declared explicitly; every arm reads the effective value from
+  `supervisor.list`.
+
+Health answer. `ckbus` advertises `health.check` and answers it with the sentinel's
+verdict for the running process: state plus class. The module-side leg is
+`ModuleControlResponse::HealthCheck { status, detail, metrics }`. The client leg is
+`ClientControlResponse::SupervisorHealthProbe { module_id, status, detail, metrics }`.
+Both carry `metrics: Option<serde_json::Value>`.
+- Every arm reads the class through `supervisor.health_probe` only. The cached
+  `supervisor.health` snapshot passes metrics through `truncate_health_metrics`
+  (`supervise.rs::handle_health_report`), and the probe path relays them whole (slice 0
+  record). If the probe path starts truncating, that is a
+  `health-class-carrier-unpinned` observation naming the leg.
+- The module writes the byte-exact `Unavailable` or `Denied` at `metrics.class`, with
+  `detail` carrying `bus.health.up` or `bus.health.down` and no class when up. Status is
+  `Failing` when down (slice 0 record). No second encoding is invented.
+- The persisted verdict never answers for a process that did not write it. On start
+  the verdict is down/`Unavailable` until this process's first probe answers.
+- The probe transports the verdict and never originates one. An answered unhealthy
+  probe does not escalate: `supervise.rs::handle_health_report` dispatches it through
+  the declared action, the `ckbus` declaration fixes both unhealthy actions to
+  `report`, and `apply_l3_health_action`'s `Report` branch does not restart (slice 0
+  record). Ruling (3) holds by that citation.
+- The module never exits on a Claustrum, signing, broker or federation failure.
+  Exiting burns the crash budget and lands `Failed`. It stays registered, retries on
+  the sentinel period, and answers health down with the class and a `detail` naming the
+  cause.
+- Health down with class `Unavailable` also covers four cases, each named in `detail`:
+  the machine id absent (`machine-id-absent`), the system-account user unissuable
+  (`sysaccount-absent`, per the foundation), a damaged `account.json`, and a root key
+  the vault answers `not_found` for (`root-key-unreachable`).
+
+Outbound calls, principal and serving side. The module calls Claustrum
+(`credential.sign`, `credential.public_key`) and Callosum (`callosum.hub_read`, and
+from the federation slices `callosum.peer_keys_read`). Each call is a subc route opened
+with `route.open` through `subc-transport` and `subc-protocol` directly. Target ids are
+the real `claustrum` and `callosum` in acceptance and in production. No outbound route
+reads a vault record's secret half: `credential.get` and `credential.get_scoped` are
+never called, and a signing key refuses them by design.
+- Principal. Every route the module opens carries `ConsumerIdentity { module_id,
+  launch_nonce }` in `ClientControlRequest::RouteOpen.consumer_identity`, from
+  `SUBC_MODULE_ID` and `SUBC_LAUNCH_NONCE`. Only then does
+  `control.rs::route_open_principal` stamp `Principal::Reserved { module_id }`, after
+  `SupervisorHandle::spawned_consumer_authorized`. An absent identity stamps
+  `Principal::Direct`. An altered one is refused `bad_consumer_identity`. The callee
+  observes the stamp at `subc_client_rs::RouteBindRequest.principal` (slice 0 record).
+  Claustrum answers a `Direct` caller against a `reserved:ckbus` grant with
+  `not_found`, byte-identical to "no such key". So a missing identity reads as a missing
+  key, and the module's report names both causes when it sees `not_found`. The HELLO
+  nonce echo never establishes the principal on an outbound route.
+- Serving side (R10, amended by R12). No acceptance run uses a real callosum. Three
+  serving sides exist, and every row states which one served it, in its report as
+  `served-by: <side>`:
+  - `harness-stub`: the slice-0 stubs under `tests/harness/stubs.rs`, registered as
+    `claustrum` and `callosum` so `route.open` resolves as in production. A stub is a
+    fixture of shape. It serves the recorded reply shapes, records the principal it
+    observed, never verifies a signature, and never produces one.
+    `stub-reply-shape-unrecorded` is recordable by any row, naming the op it stopped
+    on (R11). The shape table is data with one registration seam (op name to recorded
+    reply body), so filling it adds rows rather than control flow.
+  - `harness-signer`: a harness module under `tests/harness/signer/**`, registered as
+    `claustrum` in the runs that use it. It holds fixture Ed25519 root keys generated
+    per run, and answers `credential.sign` and `credential.public_key` with real
+    signatures and real public halves, in exactly claustrum's wire shape (Credentials).
+    It exists only under `tests/`, and the production binary has no path to it; the
+    signer-shape row checks both properties. It proves ck-bus's own behaviour: the JWT
+    ck-bus builds is accepted by a real `nats-server` whose operator and account JWTs the
+    harness wrote from the same fixture keys. It proves no vault authority. It answers
+    every principal the same way, and a row that asserts authorization against it fails
+    the harness.
+  - `claustrum-binary`: a real claustrum found through `CK_CLAUSTRUM_BIN`, declared by
+    the harness renderer into a fixture vault under the run's `XDG_DATA_HOME`. The
+    ceremony is run there with the placed `ck auth` commands (Credentials), with `ck`
+    found through `CK_CK_BIN`. The vault-authorization rows run only here. If either
+    binary is absent, the row records `claustrum-binary-absent` in its report and on
+    stderr and reports SKIP. It never passes and never falls back to another side.
+- The harness fails a run in which a row omits its `served-by`, in which a row
+  asserting authorization was served by anything but `claustrum-binary`, or in which
+  an arm authenticates to the broker with material the harness signer did not sign
+  under a key the harness wrote into the server config.
+- Refusals are classified, not collapsed. `target_unavailable` and `module_warming` are
+  retryable and retried on the sentinel period. `module_no_protocol` is terminal and
+  reports health down/`Unavailable` naming the target, without exiting.
+
+Credentials (design D; foundation amendment `48c83a68e`, `0eb12229f`, `b9e827c69`).
+- Root keys are the only vault records. The operator creates them once by ceremony,
+  in the syntax the placed `ck auth` accepts: `ck auth mint-signing-key --id
+  signing:<provider>[:<generation>]`. It generates the Ed25519 pair inside the vault
+  and prints only the public key and key id. Each key then gets exact grants to the
+  principal `reserved:ckbus`, one `ck auth grant --principal reserved:ckbus
+  --selector-kind exact --selector <credential id> --operation <op>` per operation. The
+  selector is exact, never a category. Claustrum's authorization contract requires TWO grants per key, `sign` for `credential.sign` and `read` for
+  `credential.public_key`, because the sign grant alone does not authorize the public
+  key. Claustrum's own test
+  `credentials-module/src/main.rs::sign_grant_does_not_authorize_scoped_public_key`
+  pins that at `57a501b`.
+- Rotation. A root rotates only by `ck auth mint-signing-key --replace` on the same
+  id. `record_version` is NOT monotonic across a delete-and-remint or a vault
+  restore, so a consumer detects a rotated key by comparing `key_id` first, and uses
+  the version only when the `key_id` values are equal. ck-bus keeps the `key_id` of
+  every root it signed with in memory. When a `credential.sign` or
+  `credential.public_key` reply carries a different `key_id`, it treats the root as
+  rotated. It re-reads the public key, re-issues the JWTs that root signed, and
+  reports the rotation. It never trusts a version number alone.
+- Root credential roles:
+
+  | Root | Credential id | Signs |
+  | --- | --- | --- |
+  | box account signing key | `signing:ck-bus-account:1` | participant and ck-bus box-account user JWTs |
+  | system account signing key | `signing:ck-bus-sysaccount:1` | the system-account user JWT |
+  | operator root | `signing:ck-bus-operator-root:1` | the operator JWT (self-signed) and the system account JWT, once, by ceremony at install |
+  | operator signer | `signing:ck-bus-operator-signer:1` | the box account JWT, at first boot and in every revocation claims update |
+  | federation account signing key | `signing:ck-bus-fedaccount:1` | ck-bus's federation-account user JWT |
+  | message-signing key | `signing:msgsig:<host>:1` | per-message sender signatures; `<host>` is the machine ID |
+
+  ck-bus never calls the vault for the operator root; `RootCredential::OperatorRoot` refuses a credential ID. The operator signer needs exact `sign` and `read` grants to `reserved:ckbus`; the message-signing key needs `sign` for `reserved:ckbus` and `read` for `reserved:callosum`, which publishes its public half.
+  Resolve credential IDs through `cortexkit-bus-naming::root_credential_id`. For installation key roles, JWT issuers and first-boot behavior, the requirements in `docs/nats-install-trust-chain.md`, §§1–5 and §7, take precedence over conflicting statements here.
+- Root ceremony is a per-root deployment prerequisite, not an acceptance-row gate. Harness signers use throwaway roots generated per run, and real-vault rows run the ceremony in fixture vaults; finding a production credential ID or `key_id` in a fixture fails the run. When a production root answers `not_found`, ck-bus reports `root-key-unreachable` and names the credential ID.
+- `credential.sign` wire shape, implemented by claustrum at `57a501b`
+  (`crates/credentials-core/src/signing.rs::sign_ed25519`, `::key_id_for_public`;
+  `crates/credentials-module/src/read_surface.rs`). The request carries
+  `credential_id` and `payload_b64`, standard base64. The signature is pure Ed25519
+  over the DECODED bytes, with no pre-hash. Payload is at most 1 MiB. The reply is
+  `{signature_b64, key_id}`: `signature_b64` is standard padded base64 of 64 bytes, and
+  `key_id` is lowercase hex of `sha256(public key)[..8]`, not the nkey.
+  `credential.public_key` returns the 32 raw public bytes as lowercase hex in
+  `public_key_hex`. ck-bus builds every NATS encoding itself: the nkey string (role
+  prefix, base32, crc16) from the hex, and the JWT signature by re-encoding
+  `signature_b64` as base64url without padding over the `<header>.<payload>` ASCII it
+  sent. The signer-shape row pins this against a golden request/reply pair.
+- Per-process keys never leave ck-bus's memory: participants' users and ck-bus's own
+  box-account, system-account and federation-account users. Each is an Ed25519 nkey
+  generated in ck-bus's memory on issue and never written to env, argv, disk, the
+  store, a log, a report, or the vault. ck-bus builds the user JWT with the grant the
+  foundation enumerates for that role (the naming crate's generator) and has the right
+  root sign it through `credential.sign`. The child never holds its seed. When the
+  server asks for a connect nonce signature, the child asks ck-bus over its subc route
+  and ck-bus signs in memory. A copied
+  child-held seed works anywhere until expiry, while a bus-held seed works only for a
+  caller that reaches ck-bus as that module.
+- Delivery and attestation. ck-bus serves two ops to supervised children over the subc
+  wire: `ckbus.credential`, `ckbus.credential_renew` and
+  `ckbus.nonce_sign`. These spellings discharge `ckbus-client-ops-unagreed`.
+  - `ckbus.credential` returns the caller's user JWT, its `{acct}`, its inbox prefix
+    `_INBOX.{credential_public}`, and the server URL.
+  - `ckbus.nonce_sign` signs the given nonce with the caller's current seed.
+  - `ckbus.credential_renew` (R16) re-signs the caller's current key with a fresh `exp`;
+    it follows the same principal rules.
+  - Both authorize by the stamped principal alone. `Principal::Reserved { module_id }`
+    binds the answer to that `module_id` and to the live generation the spawn stream
+    shows for it. A body field claiming another id is ignored. A `Direct` caller gets
+    the named refusal `ckbus_principal_direct` and nothing else. A caller whose module id
+    has no live generation gets `ckbus_generation_not_live`.
+  - Every subc-wire spawn receives a nonce whether or not it is declared `reserved`, so
+    a participant qualifies by presenting its consumer identity. No participant needs
+    `reserved: true`.
+  - Participants at launch are ck-bus and prefrontal-core only; every other module joins
+    when its port lands.
+- Revocation is NATS state, never a vault delete. Three ordered steps, the
+  foundation's four minus the dropped vault delete.
+  1. Read `user_jwt_id` and the user public key from the census value. Add the user
+     public key to the box account JWT's `revocations`, have the operator key sign the
+     updated account JWT through `credential.sign`, and push it over the system-account
+     user's claims-update subject. The subject string comes from A9's golden. The
+     directory resolver persists it.
+  2. Delete the census key.
+  3. Kick the client over `$SYS`.
+
+  The account JWT being updated is read from the server by the system-account user's
+  claims lookup (subject from A9's golden) immediately before each update, never from a
+  local cache. ck-bus is the single writer. A lookup that fails defers the revocation.
+  The progress record is written and fsynced with `highest_completed_step: 0` and its
+  inputs before step (1), replaced with N after step N commits, and cleared after step
+  (3). On restart the module resumes at `highest_completed_step + 1`. The progress
+  record, not the census, is the recovery source. Exactly-once counts effects: exactly
+  one revocation entry for the user key in the account claims read back, and exactly one
+  `$SYS` disconnect event for the target in the run's capture. Replays are required to
+  be no-ops: re-adding a present revocation leaves the claims equal, and a repeated kick
+  of a gone client emits no new event. The arms assert this, and nothing assumes it.
+- JWT expiry is the foundation's second revocation half, with the lifetime R16 pins:
+  every user JWT carries `exp` 15 minutes after issue, and about 10 minutes in its
+  holder renews it through `ckbus.credential_renew`, a same-key re-sign at the same
+  epoch (R16). A key whose revocation ck-bus has recorded is never renewed, so a user
+  whose revocation was lost to damage stays valid for at most 15 minutes.
+- ck-bus restart and in-memory keys. With nats-server 2.15.0 and the full resolver, while ck-bus is down, open
+  connections keep working and new connects and reconnects fail, because nobody can sign
+  a nonce. A ck-bus restart loses every seed, and the restarted process does not revoke
+  the users it cannot sign for, because revoking disconnects them. A child that asks it
+  to sign for a key it does not hold gets `ckbus_credential_superseded`. The child then
+  calls `ckbus.credential`, and ck-bus issues at the next epoch: high-water first, JWT
+  signed, census overwritten, then the superseded user revoked by the three steps.
+  "Reconnect succeeds once the signer returns" therefore means "after one credential
+  refetch" (Open questions). On start, ck-bus reads `own_users.json`, revokes the
+  previous incarnation's own users once its new ones connect, then writes its own new
+  keys. nats-server is a daemon-supervised sibling, never ck-bus's child, so a ck-bus
+  crash cannot restart it.
+- Machine id and `{acct}`. ck-bus reads `ModuleHelloAckBody.machine_id`, validates it
+  with `subc_protocol::MachineId::parse`, and derives `{acct}` = `box_<machine id>`
+  through the naming crate. That is 36 bytes, inside the foundation's account lexicon.
+  The id is a name, never an authority: nothing is admitted or trusted because it
+  matches.
+  - An absent field means the daemon predates the machine id, never "no machine" and
+    never a reason to mint. ck-bus creates nothing, issues nothing, and answers
+    `machine-id-absent`. This is a deployment gate: the acceptance daemon at
+    `cac1e9bd`+ serves the id, so no row carries it.
+  - An id that differs from `account.json`'s (a `ck machine adopt` between runs), or a
+    box account for another machine id found on the server when `account.json` is
+    absent, is REFUSED: ck-bus creates no second box account while one exists under the old id. It
+    answers health down/`Unavailable` with cause `machine-id-changed`, naming both
+    ids, creates and deletes nothing, and leaves `account.json` as it is. The operator
+    decides the migration.
+  - This spec does not make root keys per `{acct}`, since the credential ids carry no
+    token. Whether a new `{acct}` needs new account keys is an Open question.
+- Server configuration. The local server needs its operator JWT, system account and
+  the directory resolver before it starts. It is a sibling started concurrently, so
+  ck-bus cannot write that config in time. ck-bus's install tooling (`ck-bus
+   install-plan` and `install-apply`) writes it. The production `ck setup` bus step
+  that runs this tooling on an operator's machine is not built
+  (`server-config-writer-unnamed`, a deployment gate). In
+  acceptance the harness writes the config from the fixture roots. The resolver runs
+  with deletion disabled, per the foundation.
+- `server.conf` contains `listen: "127.0.0.1:<port>"` (`install-apply --port`, default
+  14222), `http: "127.0.0.1:<monitor_port>"` (`--monitor-port`, default 18222),
+  `max_control_line: 65536`, the JetStream store directory, operator JWT path, system
+  account id, full directory resolver with `allow_delete: false`, and system account
+  JWT preload. Both ports must differ and both hosts are always IPv4 loopback. The
+  HTTP listener serves the daemon's plain `/healthz` probe and NATS server, connection,
+  account and JetStream statistics. It has no authentication: any local process can
+  read it under the existing local trust model, but it must never bind a wildcard or
+  non-loopback interface. Apply output includes `health_url` for the supervised
+  `protocol: "none"` module's `health.http` in `subc.jsonc`.
+  Normal re-apply verifies/reuses stored JWTs when no signatures are supplied, but
+  still rewrites `operator.jwt` as well as `server.conf`; it does not generate keys or
+  touch existing resolver files. `install-plan` records signing inputs, not ports.
+  `install-apply --conf-only --nats-dir <dir> [--monitor-port <port>]` uses the existing
+  rendered config as the record and changes only its monitoring line, preserving
+  every other byte and the file mode. It refuses a missing install-apply header,
+  a non-IPv4-loopback client or monitor listener, and an equal client/monitor port.
+  An existing identical monitor port is a no-op, including mtime; a different one
+  requires an explicit flag. Both apply paths print the health URL. The operator
+  restarts the supervised server to activate the listener; neither path edits the
+  daemon declaration.
+- The local listener is plaintext `nats://` on `127.0.0.1`, with no certificate and no
+  pin. A client authenticates with its vault-signed user JWT and its signature over the
+  server's connect nonce, which ck-bus makes for it. TLS on loopback would add nothing
+  against the only party that can reach the listener: a process on this machine, which
+  is already inside the trust boundary every participant shares (R15). The server needs
+  no TLS material for it. Hub links leave the machine and carry TLS.
+- `server-config-writer-unnamed` and `root-ceremony-unrun` block placement, not rows.
+
+Ownership of acts.
+- Issuance: ck-bus issues every per-process credential. Issuing and writing the census
+  key are one act, in this order:
+  1. Fence against the spawn snapshot's generation.
+  2. Advance and fsync `epoch_high_water`.
+  3. Generate the nkey in memory and sign the JWT.
+  4. (Retired by R15: agent durables are created by prefrontal through
+     `ckbus.agent_durable_bind`, not at issuance.)
+  5. Write the census key.
+  6. Answer `ckbus.credential`.
+
+  A crash anywhere before step 5 leaves an unusable signed JWT (its seed died with the
+  process) and no census entry: nothing to roll back. The reconciliation re-issues. A
+  crash after step 5 leaves a census entry whose key nobody holds, which is the restart
+  rule above.
+- Census writes use ck-bus's own box-account user. ck-bus's own census key is
+  self-written, the single named exception, and its authority rests on the box account
+  grant. A participant never holds write on its own entry.
+- Bootstrap: on start, after the machine id and roots resolve, ck-bus signs its
+  system-account user with the system account key and connects to `$SYS`, finds or
+  (only if none exists) creates the box account, re-signs its JWT for the same id with
+  the operator signer, carrying earlier revocations and adding the previous
+  incarnation's box users, pushes it, and reads it back through the claims lookup
+  before treating it as applied (a claims update is saved without a trust or `iat`
+  check). It then issues its box-account user, connects, and creates the census bucket
+  and all six streams with their literal bindings if absent, then the two module
+  durables (Module streams and durables, below). It does NOT revoke the
+  previous incarnation's system-account users (trust-chain design 6.7): their seeds
+  died with that process, so they cannot answer a nonce, and revoking them would
+  re-sign the root-signed system account. Only ck-bus's system user holds the
+  claims-update permission. ck-bus reads its broker inputs from its supervised
+  environment: `CKBUS_NATS_URL` (a loopback `nats://` URL; the listener is plaintext by
+  design, see the local listener above),
+  `CKBUS_OPERATOR_JWT` (the operator JWT's path) and `CKBUS_SYSTEM_ACCOUNT` (which must
+  equal the operator JWT's `system_account`); the operator signer must be listed in the
+  operator JWT's `signing_keys`, or ck-bus refuses with `operator-jwt-mismatch`. The
+  local listener binds a loopback address explicitly, never `0.0.0.0`, and needs
+  `max_control_line` above the 4 KiB default: a CONNECT carrying ck-bus's box grant is
+  longer (a setup obligation, measured in slice 4). It never publishes a workload message and holds no workload
+  publish grant in the box account. If the system-account user cannot be issued, the
+  module serves nothing and answers `sysaccount-absent`, per the foundation: revocation
+  is never left silently unenforced.
+- Sentinel probe: hosted in the module process, requester and responder in one process
+  through the server, period 10 s, timeout 2 s. Three failures report `bus.health.down`.
+  A permissions violation on its own sentinel or inbox subjects within the period wins
+  over the requester's timeout. These are the shipped defaults, with no operator-facing
+  key. The test seam is `CKBUS_SENTINEL_PERIOD_MS` and `CKBUS_SENTINEL_TIMEOUT_MS`,
+  set by the harness renderer in the `ckbus` block's `env` list (slice 0). At start the
+  module emits exactly one structured log line carrying `sentinel_period_ms`,
+  `sentinel_timeout_ms` and its incarnation id. Every arm computing `3 * period +
+  timeout` parses that line and fails when it is absent. The harness sets 1000 ms and
+  200 ms for the health and A8 rows, so a down bound is 3.2 s and those two rows are
+  budgeted at 120 s together. Exceeding the budget fails the row with the measured wall
+  time. Silence before the first answer is the initial down/`Unavailable` verdict. The
+  verdict is published on the bus and is also the `health.check` answer; it never gates
+  spawning.
+- Dead-letter consumer: `c_ckbus_dead` on `CK_{ACCT}_EFFECT_DEAD`, deduplicating on
+  message id, because the claimant publishes the record before `term()`.
+- Module streams and durables. Bootstrap creates the six streams of
+  `shipped_streams`: ROOM, WAKE, PEER, EFFECT, EFFECT_DEAD and EVENT. EVENT
+  (`CK_{ACCT}_EVENT`, binding `ck.{acct}.event.>`, subjects
+  `ck.{acct}.event.{module_id}.{event}.v{version}`) holds module events: 7 days, 1 GiB,
+  discard old, limits retention (not a work queue), and at most 10,000 messages per
+  subject (`max_msgs_per_subject`), so one noisy event cannot evict every other
+  subject's history. Only EVENT sets a per-subject cap; the other five are sent exactly
+  the configuration the five-stream ck-bus sent, so a plane built by it is upgraded in
+  place: the server accepts each create as the existing stream, and only EVENT and the
+  durables below are new. Bootstrap then creates two module durables, named
+  `module_consumer_name(module_id)` (`m_{module_id}`), on every boot and before either
+  module's first credential, so events and posts made before the module first connects
+  are kept for it:
+  - `m_basal` on `CK_{ACCT}_EVENT`, filtered on `ck.{acct}.event.>`: the flow engine
+    reads every module event through it;
+  - `m_prefrontal-core` on `CK_{ACCT}_ROOM`, filtered on the ROOM binding
+    `ck.{acct}.room.*.post`: prefrontal-core is the only consumer of room posts.
+
+  Both carry the shipped durable configuration (pull, explicit ack, deliver all, ack
+  wait 30 s, max-deliver unlimited, max ack pending 1000), each filter checked with
+  `validate_consumer` against its stream's binding. Creation is strict: an identical
+  durable is the server's idempotent success, and one with a different configuration
+  is refused, never replaced, and boot reports `module-durables-unavailable`. Neither
+  module may create, delete or replace its durable; each holds pull, ack and info on its
+  own durable by name.
+- Membership: re-issue at the next epoch of the same generation, overwrite the census
+  key, adjust the room consumer's `filter_subjects`, and revoke the superseded epoch,
+  within the foundation's 10 s bound. The client reconnects by refetching.
+
+Spawn event stream. The module never
+synthesises a generation from restart counters.
+- `supervisor.spawn_snapshot` returns `{cursor: {daemon_incarnation, seq}, ring_bound,
+  live[]}` under one lock. `supervisor.spawn_subscribe {since: Option<SpawnCursor>}`
+  delivers one `StreamData` per event: `{cursor, kind: spawned | exited, module_id,
+  spawn_generation, pid, exit_code?, exit_signal?}`. The consumer builds against the
+  `subc-control` types `SpawnCursor`, `LiveSpawn`, `SpawnSnapshot`, `SpawnEventKind` and
+  `SpawnEvent`.
+- Refusals, asserted byte-exact: `spawn_cursor_incarnation_mismatch` with
+  `current_daemon_incarnation`, and `spawn_cursor_too_old` with
+  `oldest_retained_cursor`. A stream the daemon drops for a stalled subscriber ends with
+  a terminal `spawn_subscriber_lagged` carrying `first_undelivered_cursor`, after every
+  queued event. The consumer resubscribes from the last cursor it received.
+- `exited` is fact-only, and revocation runs on the fact alone. `ring_bound` is read
+  from the reply, never hard-coded. Every terminal path emits `exited`, and
+  `spawn_generation` increments once per successful spawn.
+- The last processed cursor is recorded. On restart the consumer resumes, or across an
+  incarnation or a damaged cursor it snapshots and reconciles. Live generations with no
+  census entry are issued lazily, on the child's first `ckbus.credential`, because
+  ck-bus has no channel to push a credential. Entries with no live generation are
+  revoked. The same reconciliation runs every 60 s. Generation fencing compares
+  generations only.
+
+Standing rules carried from the foundation.
+- Absence is neutral. An unsuccessful read is never a confirmed absence, and recovery
+  obeys the same rule.
+- Spawn generation belongs to the daemon. Credential epoch is ck-bus's and starts at 0 per
+  generation.
+- Permission files are allow-only, wildcards are whole-token, and every stream-bearing
+  subject is emitted with the six literal stream names expanded per account.
+- Inbox prefix is `_INBOX.{credential_public}` on every client the module runs or
+  issues for, set before connecting.
+- No constant from an unverified citation is hard-coded in a control. The drain
+  ceiling, sentinel values, claims-update, claims-lookup and kick subjects, and the
+  JetStream request set are read at run time.
+
+Federation role. With no hub row in
+the roster, the federation code is inert: no federation account user, no leaf
+configuration, no sealing. The single-machine plane is unchanged. A hub read that
+fails or answers "no hub" is health-neutral, because the local bus is unaffected.
+Federation state is reported separately under `detail` keys prefixed `fed.`.
+- Federation account. Each machine has a local federation account, distinct from the
+  box account and bound to the leaf remote. It holds only sealed cross-machine
+  families: an outbox and an inbox, whose grammar is owed by
+  `fed-foundation-amendment-unlanded`. Effect subjects never exist in it. ck-bus holds
+  a federation-account user. The account's JWT is signed by the box-local operator
+  key; the user's JWT by the federation account signing key.
+- The authority boundary. ck-bus's
+  federation authority is limited to sealing outbound frames and opening inbound frames
+  in the federation account. It holds no publish permission in the box account, so
+  effect intents never cross machines, and it never republishes an opened body under
+  its box-account user. How an opened delivery reaches the recipient's local consumer
+  without a box-account publish by ck-bus is unsettled (Open questions: local delivery
+  path). The candidate is a server-side account import from a federation-account
+  local-delivery family into the box account's ROOM, WAKE and PEER subjects only, with
+  the leaf remote denying that family. It rests on `nats-federation-rig` and on
+  `fed-foundation-amendment-unlanded`, and no slice asserts it before both clear.
+- Outbound capture must be durable, because loss is not acceptable across a split. The
+  foundation's disjoint bindings make capturing `ck.{other}.…` in the box account
+  impossible without overlapping the local streams. So the outbound family and the
+  participant's cross-machine publish grant are part of
+  `fed-foundation-amendment-unlanded`. ck-bus consumes from a durable, acks the local
+  original only after the sealed frame's publish ack, and never uses a core-NATS
+  subscription as the outbound path.
+- Cross-machine delivery requires four
+  families, not three: ROOM, WAKE, PEER and SYNC (`ck.{dst}.sync.{src_machine_id}.state`: directory
+  rows, ask copies, write outcomes, snapshots, presence), added to the federation account's inbox and
+  outbox families and the leaf publish grant. Stream settings are per family, not one shared stream:
+  WAKE max-age 24 h (a day-old wake is noise), ROOM, PEER and SYNC 7 d, all discard-new; presence is a
+  last-value subject (`max_msgs_per_subject: 1`, one subject per sender), never store-and-forward.
+  ck-bus reports a per-destination forward backlog (frames accepted from the box-account hand-off but
+  not yet accepted by the federation outbox or the hub) under `fed.` health detail, because the
+  hand-off ack is the last thing prefrontal can observe, so a full hub stream is otherwise invisible to
+  it. Dedupe and gap-skipping (`outbox.skip` for a write past its deadline) are prefrontal's, above
+  the bus.
+- Leaf configuration. ck-bus reads `callosum.hub_read` every 60 s and on every
+  reconnect. Exactly one hub is accepted; two are refused. The SPKI SHA-256 pin from the
+  roster column is the authority and candidate addresses are advisory: a dial whose
+  presented SPKI differs is refused before any credential is sent. A tombstoned or
+  changed hub identity disconnects the leaf within 75 s of the roster write. ck-bus
+  produces a leaf configuration document into its run directory: the ordered candidates,
+  the pin, the federation account's public key and the leaf credential reference. The
+  mechanism by which the leaf-bearing server consumes it, and whether config reload
+  can add, change and drop a leaf remote without a restart, rests on
+  `nats-federation-rig` and on the leaf-signing shape.
+- Hub and accounts. A self-hosted hub (the default) or the hosted hub (opt-in) holds
+  one account per user. The leaf binds the federation account into it. Routing from a
+  per-machine federation account into a per-user hub account is `nats-federation-rig`.
+  `{acct}` in a subject names the recipient machine. Local subjects staying off the
+  leaf under a hub-side `ck.{own}.>` subscription is `nats-federation-rig`. The census
+  bucket and `$SYS` never cross.
+- Leaf signing. Stock `nats-server` gives a leaf remote only a creds file or an nkey,
+  which would put a seed on disk. The leaf credential is a key of the hub's account,
+  created at pairing (`leaf-credential-ceremony-unlanded`), and ck-bus never creates
+  it. The shapes are (1) a Rust bridge, (2) an ephemeral memory-backed creds fd, and
+  (3) a Go binary embedding `nats-server` with `SignatureCB` calling `credential.sign`
+  over subc. r3 recommends (3), pending `SignatureCB` in the pinned server
+  (`nats-federation-rig`). Under (3) the Go binary needs its own consumer identity and
+  exact grant, or it routes its callback through ck-bus's `ckbus.nonce_sign`; the daemon and
+  vault maintainers choose (`leaf-signing-shape-unchosen`). The link arm runs labelled with the
+  shape it built. The connect error must name the signer, so "vault unavailable" and
+  "hub refused" read differently.
+- Keys. Each machine holds two operational keys in its vault: a seal key (X25519, for
+  HPKE) and a message-signing key (Ed25519, `signing:msgsig:<machine id>:1`, used
+  through `credential.sign`, which works today).
+  - The seal key is a new vault kind, a KEM key, minted with
+    `ck auth mint-kem-key --id kem:<name>`. `<name>` is unagreed; by analogy this spec
+    uses `kem:ck-bus-seal:1`. It is refused by `get` and `sign`. Its public half comes
+    from `credential.public_key` with algorithm `"x25519"`. Its private half is usable
+    only through `credential.open`, by `credential_id` under a new `open` grant given to
+    `reserved:ckbus` alone. A handle is refused.
+  - The Claustrum KEM contract is not yet implemented: support is gated by
+    `kemkey-open-unlanded`, and deploying it needs claustrum store migration 11.
+  - Which principal gets `read` on the KEM key, so callosum can publish the public half,
+    is unagreed.
+  - This machine's record generation, and a single op returning both public halves with
+    it, remain unnamed (`own-key-record-op-unnamed`). ck-bus needs neither to seal or
+    open. The generation lives in the vault's credential ids, never in the trust
+    document.
+  - Peers' key records reach ck-bus only through callosum's local-only management op
+    `callosum.peer_keys_read`, which callosum's forwarder refuses to any remote peer.
+    Callosum stores records only from verified peers in the paired Noise session, gated
+    by the pairing ceremony counter, and clears them on retire, re-pair and tombstone
+    (callosum contract at `f5d34f8`; a test stub records the served reply shape). ck-bus never reads a key record from the hub, a registry,
+    or a message.
+- Sealing. For a delivery addressed to another machine, the body travels inline and
+  sealed. The digest moves inside the seal and no header carries anything sensitive.
+  - Sign inside, then seal. ck-bus has `msgsig` sign a purpose-tagged context covering
+    the envelope version, sender machine id, recipient machine id, the full destination
+    (family, `agent_id`, and `session_id` or `room_id`), message id, the sender's
+    sequence number and the body.
+  - It then seals that signed plaintext by HPKE base mode, the only suite the vault
+    opens: KEM 0x0020 DHKEM(X25519, HKDF-SHA256), KDF 0x0001 HKDF-SHA256, AEAD 0x0003
+    ChaCha20-Poly1305. `info` is `sender_machine_id|recipient_machine_id`, and `aad` is
+    empty in envelope version 1. The vault interprets neither `info` nor `aad`, so the
+    machine ids and the destination are bound by the inner signature, and the opener
+    checks them there. Nothing relies on `info` for binding.
+  - Sealing needs only the recipient's public key, so it does not need
+    `kemkey-open-unlanded`. ck-bus refuses to seal a body whose opening context would
+    exceed the vault's 1 MiB limit. The item is reported, never truncated.
+  - A delivery for N machines is sealed N times. A hosted hub is never a recipient.
+  - A peer with no current key record is not sealed to. The outbound item waits, never
+    falls back to plaintext, and is reported. A peer absent from `callosum.peer_keys_read`
+    (removed) is fenced: ck-bus stops sealing to it and stops accepting from it. Removal
+    is not instantaneous; the hub-side revocation of its leaf credential is the
+    ceremony's, not ck-bus's.
+- Sequence. r3 says "per-sender sequence". A single counter per sender would show every
+  recipient gaps for frames sent elsewhere, so ck-bus numbers per (sender, recipient)
+  pair (Open questions). Before publishing, ck-bus fsyncs a reservation of (sequence,
+  delivery id) in `fed_send/{recipient}.json`. It publishes with `Nats-Msg-Id` =
+  delivery id, and advances only after the publish ack. A redelivered local original
+  whose delivery id matches the reservation reuses its sequence, so a crash neither
+  skips nor reuses a number.
+- Opening. For each inbound frame on its own inbox, ck-bus makes one call:
+  `credential.open {credential_id, enc_b64, ciphertext_b64, info_b64, aad_b64}`,
+  answered `{plaintext_b64, key_id}`, by `credential_id` and never by handle. No
+  `enrollment_token` is sent; it is optional in the contract. Failures are classified:
+  - `open_failed` is the vault's one uniform permanent failure, covering bad `enc`, the
+    wrong key, tampering, and a wrong `aad` or `info`. It quarantines the frame.
+  - `context_overflow` (over 1 MiB) quarantines the frame.
+  - `kind_not_openable` means the credential id names a non-KEM key. That is ck-bus's
+    misconfiguration, not the frame's fault: frames wait, and health `detail` carries
+    `fed.open_misconfigured` naming the id.
+  - `not_found`, and transport refusals, leave frames waiting.
+
+  A `key_id` different from the one last seen means the seal key rotated, and is
+  reported. ck-bus then verifies the inner signature against the sender's current
+  `msgsig` record and checks the signed machine ids against the sender and itself. It rejects any
+  mismatch between the opened destination and the arrival subject, and dedupes on
+  (sender, sequence) against `fed_recv/{sender}.json`, which it fsyncs before acking.
+  It reports gaps as `fed.gap`. Unsigned, unverifiable, mismatched, retired-generation
+  or unopenable frames are quarantined under their own terminal disposition. They are
+  never acked as delivered, and never `Absent` or a digest mismatch. While Claustrum is
+  down, inbound frames wait unopened: late, not lost. Recipient-side idempotent insert on
+  delivery id stays the owning store's job.
+- Split tolerance. Federation streams need days of max-age, discard new, a stated
+  re-sync bound, and recipient dedupe. The values are owed by
+  `fed-foundation-amendment-unlanded`, and ck-bus creates no federation stream before
+  they are pinned. Two behaviours rest on `nats-federation-rig`: sourcing a stream
+  across a split with catch-up, and a subject-filtered purge of one recipient's inbox.
+
+Sequencing and file fences. Slices are strictly sequential, and each depends only on
+earlier ones. Their fences are disjoint by subdirectory. One path is the declared
+integration ref: `crates/ck-bus/src/main.rs`, authored by slice 0, in which a later slice
+adds only its `mod <area>;` line and one wiring call, both named in its plan entry. The
+harness has the same rule at `crates/ck-bus/tests/harness/mod.rs`: a later slice adds
+only its `mod <submodule>;` line there, and a shape-table row through the stubs'
+registration seam. No slice writes inside another slice's directory. A slice that needs
+an edit outside its fence stops and reports.
+- Forward dependencies are carried by seams. `crates/ck-bus/src/runtime/**` (slice 0)
+  defines the internal interfaces each later area implements, each defaulting to a
+  refusal naming the area. No row may pass against a refusing default. An arm needing a
+  second area lands in the later of the two slices, and that slice owns its row. A slice
+  adding an area the r1 seams did not name (credentials, issuance, federation) adds its
+  seam inside its own area and wires it through its one `main.rs` call.
+- Slice 0 (crate, merged `0b6f32da`) owns the root `Cargo.toml`,
+  `crates/ck-bus/Cargo.toml`, `src/runtime/**`, `tests/harness/**` as it stands,
+  `tests/module_declaration.rs` and `tests/fixtures/**`. It landed every r1 slice-0
+  obligation (FIRE-TIME-RECORD.md): the runtime skeleton that completes HELLO, echoes
+  the nonce, serves the control lane and advertises `health.check`; the stubs; the
+  renderer with the sentinel env seam; the store root; the field records; the naming
+  report; the vendored foundation copy; the disposition mapping. Slice 1 (supervised
+  server, merged `2b7ccc94`, follow-up `4bc1d17e`) owns `tests/support/**` and the two A1
+  files.
+- Every row has exactly one owning slice and one test file, named here and nowhere
+  else. Paths are relative to `crates/ck-bus/`. Each slice after 1 owns the `src/**` area
+  and harness submodule its entry names, plus its test files.
+
+| Ladder row | Owning slice (fence) | Test file |
+| --- | --- | --- |
+| Module declaration and registration | 0, crate (merged) | `tests/module_declaration.rs` |
+| A1 supervised server lifecycle | 1, supervised server (merged) | `tests/supervised_server.rs` |
+| A1 argv non-injection | 1, supervised server (merged) | `tests/supervised_server_argv.rs` |
+| Grant generation | 2, grants (`src/grants/**`, `tests/fixtures/foundation/**`) | `tests/grant_generation.rs` |
+| Signer wire shape | 3, credentials (`src/credentials/**`, `tests/harness/signer/**`) | `tests/signer_shape.rs` |
+| Vault authorization | 3, credentials | `tests/vault_authorization.rs` |
+| User JWT and seed absence | 3, credentials | `tests/user_jwt.rs` |
+| Machine id and account | 4, bootstrap (`src/bootstrap/**`) | `tests/account_identity.rs` |
+| Install bootstrap and own users | 4, bootstrap | `tests/install_bootstrap.rs` |
+| Credential delivery and attestation | 5, issuance (`src/issuance/**`) | `tests/credential_delivery.rs` |
+| A3 census write and issuance recovery | 5, issuance | `tests/census.rs` |
+| A9 grant conformance | 5, issuance | `tests/grant_conformance.rs` |
+| A3 revocation | 6, revocation (`src/revocation/**`) | `tests/revocation.rs` |
+| Spawn-stream consumer | 7, spawn consumer (`src/spawn_consumer/**`) | `tests/spawn_stream.rs` |
+| Spawn reconciliation and census recovery | 7, spawn consumer | `tests/spawn_reconcile.rs` |
+| Module health answer | 8, sentinel (`src/sentinel/**`) | `tests/module_health.rs` |
+| A8 sentinel probe | 8, sentinel | `tests/sentinel.rs` |
+| Dead-letter | 9, dead-letter (`src/dead_letter/**`) | `tests/dead_letter.rs` |
+| Membership lifecycle | 10, membership (`src/membership/**`) | `tests/membership.rs` |
+| Signer outage and restart | 11, outage (no `src` area; test only) | `tests/signer_outage.rs` |
+| Federation account and isolation | 12, federation link (`src/fed_link/**`, `tests/harness/fed/**`) | `tests/fed_account.rs` |
+| Leaf configuration | 12, federation link | `tests/leaf.rs` |
+| Leaf link, labelled | 12, federation link | `tests/leaf_link.rs` |
+| Seal outbound | 13, sealing (`src/fed_seal/**`) | `tests/fed_seal.rs` |
+| Open inbound | 13, sealing | `tests/fed_open.rs` |
+| Federation sequence and crash | 13, sealing | `tests/fed_sequence.rs` |
+| Split store-and-forward | 14, split and removal (`src/fed_store/**`) | `tests/fed_split.rs` |
+| Peer removal fence | 14, split and removal | `tests/fed_removal.rs` |
+| A6/A7 prefrontal re-run | no subconscious slice | none in this repository |
+
+- That order is the dependency order, and a slice that reorders it says why. Grants
+  come before any issuance because every JWT carries a generated grant. Credentials come
+  before bootstrap because ck-bus's own users are issued through them. Bootstrap comes
+  before issuance because participant durables need the streams. Issuance comes before
+  revocation because revocation reads what issuance wrote, and revocation before the
+  spawn consumer because reconciliation revokes. The sentinel follows the areas whose
+  deferrals it reads back. Outage closes the single-machine plane. Every federation slice
+  (12 to 14) comes after slice 11 and depends only on earlier slices. No single-machine
+  slice waits on a federation gate.
+- Slice 2 re-vendors the foundation and the prefrontal golden at `b9e827c69` or later
+  into `tests/fixtures/foundation/`, updating `SOURCE` and `DISPOSITION-MAPPING.md`.
+  That discharges `foundation-disposition-table-unquoted` again. The r1 mapping's A2
+  exclusion is rewritten: seed absence for ck-bus's own process is now claimed by
+  "User JWT and seed absence". The r1 references to the audit-read gate are removed.
+
+## Acceptance ladder
+
+Every arm pairs with a control that fails for the intended reason, on an empty vault
+and an empty broker store, per the foundation. Module-side arms live in
+`crates/ck-bus/tests/`, one direct-child file per row. The harness that enforces these
+rules lives at `crates/ck-bus/tests/harness/`. No subconscious slice edits prefrontal's
+rig. Every run sets `XDG_DATA_HOME` into its fixture tree and asserts nothing was
+written under the operator's real data home. The foundation's arms are not
+re-specified. The completion test is stated once, in Intent.
+
+Ladder completeness. This ladder is the set of rows this spec claims. Whether it covers
+every F-PROV row is settled by slice 2's disposition mapping; until then the Intent gate
+stands. A4 and A6 stay named exclusions from slice 0's mapping, and A5 is now the
+federation rows.
+
+Serving side, per row. Every row states its `served-by` in the table, and its report
+repeats it: `harness-stub`, `harness-signer`, `claustrum-binary`, `none` (no Claustrum
+or Callosum route), or a combination for rows that use two. A `harness-signer` pass
+proves what ck-bus built and how the broker judged it. It never proves that the vault
+would authorize ck-bus, or refuse another caller. Only a `claustrum-binary` pass
+proves that.
+
+Gating rules. Each row names in its Gates cell every skip name its arm can record. The
+rig fails a run in which a row:
+- records a skip name that is neither in its own cell nor universal;
+- reports a pass while reaching an op absent from the serving side's advertised
+  vocabulary;
+- omits its `served-by`;
+- records an unnamed skip.
+
+Gating is per row, and the row is the unit of skip. Where part of an assertion set
+gates and part does not, the ladder splits the row. A row gates now when it carries no
+standing S or D gate and no C condition fires. A slice that finds a gate discharged
+flips its row and says so.
+
+Universal conditions, recordable by any row without listing, naming what was observed:
+`naming-constructor-absent` (C), `health-class-carrier-unpinned` (C, rows that read the
+class), `stub-reply-shape-unrecorded` (C, `harness-stub` rows), and `nats-server-absent`
+or `nats-server-too-old` (C, per the foundation's constants, with the observed version).
+`foundation-disposition-table-unquoted` suppresses the completion claim only. No row
+records it.
+
+| Row | Consumes | served-by | Gates named | State |
+| --- | --- | --- | --- | --- |
+| Module declaration and registration | daemon config parse; nonce echo; `supervisor.list`, `catalog.list`, `supervisor.provenance` | none | none row-specific | green (slice 0) |
+| A1 supervised server lifecycle | acceptance daemon >= 0.20.5; real `nats-server` under `protocol: "none"`; stand-in child | none | `a1-signal-unix-only` (C) | green on Linux and macOS (slice 1) |
+| A1 argv non-injection | the same spawn; provenance pid; `ps -ww -o args= -p <pid>`; effective `connection_file_path` | none | `a1-signal-unix-only` (C) | green on Linux and macOS (slice 1) |
+| Grant generation | naming crate generator; vendored foundation and golden | none | none row-specific | gates now |
+| Signer wire shape | `credential.sign`, `credential.public_key` shapes cited at claustrum `57a501b`; golden request/reply pair | harness-signer; claustrum-binary for the real-binary half | `claustrum-binary-absent` (C, real-binary half only) | harness half gates now |
+| Vault authorization | real claustrum + `ck auth` ceremony in a fixture vault; `route.open` with and without `ConsumerIdentity` | claustrum-binary | `claustrum-binary-absent` (C) | gates when the binaries are present; loud skip otherwise |
+| User JWT and seed absence | `credential.sign` for JWT signatures; real `nats-server` with harness-written operator and account JWTs | harness-signer | none row-specific | gates now |
+| Machine id and account | `ModuleHelloAckBody.machine_id`; `account.json`; bucket and stream creation | harness-signer | none row-specific | gates now |
+| Install bootstrap and own users | own box and system users; census bucket, six streams, the two module durables, in-place upgrade of a five-stream plane; `$SYS` kick; `own_users.json` | harness-signer | none row-specific | gates now |
+| Credential delivery and attestation | `ckbus.credential`, `ckbus.nonce_sign` over subc; stamped principal; spawn snapshot for the live generation | harness-signer | `spawn-stream-unlanded` (C) | gates now |
+| A3 census write and issuance recovery | issuance order; census key grammar; `epoch_high_water.json` | harness-signer | `naming-constructor-absent` for the census key until commons constructs it | skipped until the census key constructor lands |
+| A9 grant conformance | participant, bus-module and system users on a live server; prefrontal seat for the golden | harness-signer | `prefrontal-seat-unnamed` (S, the golden-commit half only) | live-server half gates now |
+| A3 revocation | the three steps; claims lookup and update; `$SYS` capture; operator-key signing | harness-signer | none row-specific | gates now |
+| Spawn-stream consumer | `supervisor.spawn_snapshot`, `supervisor.spawn_subscribe`, cursor, refusal codes | none | `spawn-stream-unlanded` (C) | gates now, subject to that read |
+| Spawn reconciliation and census recovery | the same ops; issuance and revocation | harness-signer | `spawn-stream-unlanded` (C) | gates now |
+| Module health answer | `health.check` carrier; `supervisor.health_probe`; the deferral controls' health half | harness-signer; harness-stub for the refusing-signer control | none row-specific | gates now |
+| A8 sentinel probe | own box user; probe; `supervisor.health_probe` | harness-signer; harness-stub for the refusing-signer control | none row-specific | gates now |
+| Dead-letter | own user and a claimant user; `c_ckbus_dead` | harness-signer | none row-specific | gates now |
+| Membership lifecycle | the foundation's membership contract from the vendored copy; re-issue; revocation | harness-signer | `membership-contract-unpinned` (D, and S if the foundation names no op) | skipped until quoted |
+| Signer outage and restart | supervised ck-bus and nats-server; issuance; revocation; renewal (R16) | harness-signer | none row-specific (`user-jwt-ttl-unpinned` discharged by R16) | gates now, the expiry arm included |
+| Federation account and isolation | federation account JWT and user; local-subject isolation; local delivery path | harness-signer | `fed-foundation-amendment-unlanded` (S); `nats-federation-rig` (S: local subjects off the leaf; account routing) | skipped |
+| Leaf configuration | `callosum.hub_read` | harness-stub | none row-specific | gates now against the stub's recorded shape |
+| Leaf link, labelled | hub server in the harness; leaf credential; the chosen or labelled shape | harness-signer | `leaf-credential-ceremony-unlanded` (S); `nats-federation-rig` (S: account routing; `SignatureCB` for shape 3) | skipped; runs labelled once the rig reports |
+| Seal outbound | `callosum.peer_keys_read`; `msgsig` via `credential.sign`; HPKE seal; outbound durable | harness-stub + harness-signer | `fed-foundation-amendment-unlanded` (S) | skipped |
+| Open inbound | `credential.open` per the vault's (Claustrum's) contract; `fed_recv` | harness-signer for opening behaviour; claustrum-binary for the `open` grant and shape half; harness-stub for peer keys | `fed-foundation-amendment-unlanded` (S); `kemkey-open-unlanded` (S) and `claustrum-binary-absent` (C), real-binary half only | skipped |
+| Federation sequence and crash | `fed_send`, `fed_recv`; publish ack; redelivery | harness-signer; claustrum-binary for the open half | as Seal outbound, plus Open inbound's gates for the receive half | skipped |
+| Split store-and-forward | federation streams; sourcing across a split; recipient purge | harness-signer | `fed-foundation-amendment-unlanded` (S); `nats-federation-rig` (S: sourcing across a split; subject-filtered purge) | skipped |
+| Peer removal fence | `callosum.peer_keys_read` losing a peer | harness-stub | `fed-foundation-amendment-unlanded` (S) | skipped |
+| A6/A7 prefrontal re-run | built `ck-bus` reachable from prefrontal's rig | n/a | `prefrontal-seat-unnamed` (S) | skipped |
+
+Row contents.
+
+- Module declaration and registration (kept). `supervisor.list` reports `ckbus` with
+  `protocol: "subc"` and the declared `drain_timeout_ms`. That proves configuration,
+  never registration. Four registration observables are asserted individually (R6):
+  1. `supervisor.provenance` narrowed to `ckbus` yields a pid P by the three-outcome
+     rule.
+  2. `catalog.list` reports exactly one `ckbus` registration, with `health.check` among
+     the advertised control ops read from the recorded `CatalogEntry` field.
+  3. A hand-started `ck-bus` with `SUBC_LAUNCH_NONCE` absent or altered has its HELLO
+     refused and never appears in `catalog.list`.
+  4. A re-read of provenance afterwards returns the same P, and `catalog.list` still
+     shows only the supervised registration.
+
+  `live: true` is asserted too. Reservation is asserted through that spawn/HELLO pair
+  only. The daemon refuses `reserved: true` with `protocol: "none"` at parse. The row
+  also runs the inventory check.
+- A1 supervised server lifecycle, unix (kept). The declared `nats-server` is launched
+  directly under `protocol: "none"`, with no wrapper and no stand-in for the primary
+  arm.
+  - Precondition: the recorded subc-daemon version is >= 0.20.5.
+  - Terminal records come from the fixture journal, cross-read against
+    `supervisor.terminals`. "Inside the budget" means the record's completion timestamp
+    minus the instant captured just before teardown, against `drain_timeout_ms` from
+    `supervisor.list`.
+  - On teardown and restart the server records one terminal record strictly inside the
+    budget, with a clean stop (`exit_code == Some(0)` or `exit_signal == Some(15)`),
+    never `Some(9)` and never at or past the budget.
+  - Controls (R8) are three argv-ignoring, never-registering stand-ins under
+    `tests/support/`. None registers, so the supervisor asks each by SIGTERM at drain
+    start whatever its declared protocol (#125). (a) `standin-none`
+    (`standin_child.sh`, `protocol: "none"`): a clean stop strictly inside the budget.
+    (b) `standin-default-protocol` (the same script with the key omitted, so a Subc
+    module handed `--subc` it ignores, shown running and `live: false` first): the same
+    clean stop, proving an unregistered subc module is signalled rather than killed at
+    the deadline. (c) `standin-ignores-term` (`standin_ignores_term.sh`, `protocol:
+    "none"`, a short budget, torn down only after its ready file shows the trap is
+    installed): the negative control, `exit_signal == Some(9)` at or past its budget,
+    proving the harness can see a kill at the deadline. Each stand-in's elapsed time is
+    printed beside its budget.
+  - No real `nats-server` is declared with the key removed; that would measure the
+    unknown-flag error. Off unix the row records `a1-signal-unix-only` and asserts
+    nothing.
+- A1 argv non-injection, unix (kept). The pid comes from provenance alone, by the
+  three-outcome rule. `ps -ww -o args= -p <pid>` is recorded verbatim, and no
+  whitespace-separated token equals or begins with `--subc`.
+  - Fixture constraint: the `nats-server` block and both stand-in blocks declare a
+    non-empty `args` list with no whitespace in any element, and the arm names each
+    final element.
+  - Self-checks: empty output fails, a non-zero `ps` exit fails, and the last token
+    must equal the named final argument. The companion assertion is token-sequence
+    equality with the declared argv, argv[0] compared after path normalisation and the
+    rest byte-exact.
+  - Control: the daemon's effective `connection_file_path`, read and recorded in the
+    same run. A run where it is absent fails, since then the absence of `--subc` proves
+    nothing. Off unix the row records `a1-signal-unix-only`.
+- Grant generation. The generator in `src/grants/**`, fed the foundation's pinned
+  golden literals (`box_goldenfixture`, `ckbus`, `agent_gold_a`, `agent_gold_b`,
+  `room_gold_bound`, `room_gold_unbound`), emits the per-process, bus-module and
+  system-account permission sets. Compared against the vendored golden under the golden
+  diff rule, they differ in the header line and named added subjects only. Controls: a
+  generator emitting a partial-token `CK_{ACCT}_*` or a `deny` entry fails, and an
+  out-of-lexicon account (`box_a-b`) is refused at derivation with the token named.
+- Signer wire shape. The harness signer's `credential.sign` and `credential.public_key`
+  are checked against a committed golden request/reply pair. The pair holds: a fixed
+  RFC 8032 test key; a payload whose `payload_b64` is standard base64; a reply whose
+  `signature_b64` is standard padded base64 of the pure-Ed25519 signature over the
+  decoded bytes; `key_id` = hex of `sha256(pub)[..8]`; and `public_key_hex` as 32 bytes
+  of lowercase hex. The pair cites claustrum `57a501b`, with
+  `credentials-core/src/signing.rs::sign_ed25519` and `::key_id_for_public`.
+  - With `claustrum-binary` present, the same request is sent to the real binary, with
+    the same key imported by ceremony if the ceremony allows a fixed key. Otherwise a
+    minted key is used, and the check verifies the signature under the returned public
+    key and recomputes `key_id`. Any divergence in field names, encodings or padding
+    fails the row by name.
+  - Controls: a signer that pre-hashes, that signs the base64 text instead of the
+    decoded bytes, or that returns base64url fails. The production binary is built and
+    its symbol table and dependency tree are checked for the signer module. Present
+    means fail.
+- Vault authorization (`claustrum-binary` only). The fixture vault receives the
+  ceremony: `ck auth mint-signing-key --id signing:ck-bus-account:1`, then `sign` and
+  `read` grants to `reserved:ckbus`, exact selector.
+  - A real supervised `ckbus` whose `route.open` carries `ConsumerIdentity` gets
+    `credential.sign` and `credential.public_key` answered.
+  - Twin: the same open without the identity, arriving `Direct`, gets `not_found` for
+    both.
+  - With only the `sign` grant, `credential.public_key` answers `not_found` and
+    `credential.sign` succeeds.
+  - No test constructs `Principal::Reserved` directly.
+  - A missing binary records `claustrum-binary-absent` loudly and reports SKIP.
+- User JWT and seed absence. ck-bus builds a participant user JWT, signed through the
+  harness signer. A real `nats-server`, whose operator and account JWTs the harness
+  wrote from the same fixture keys, accepts it, with the connect nonce signed by
+  ck-bus's `ckbus.nonce_sign` path. Controls:
+  - one flipped signature byte is refused by the server as an authorization error;
+  - a JWT signed by a key the server does not trust is refused;
+  - a nonce signed with a different seed is refused.
+
+  Seed absence, on enumerated surfaces only, for the ck-bus process and for a
+  participant: its environment (`/proc/<pid>/environ` on Linux, `ps eww -o command=`
+  on macOS), argv, the store root, the capture logs and the slice report contain no
+  string matching `S[UAOCN][A-Z2-7]{54}`. Control: a harness-planted seed in the store
+  is found by the same scan.
+- Machine id and account. `{acct}` is `box_` plus the HELLO_ACK machine id, and the
+  bucket and streams carry it. A supervised restart keeps the account id, so a durable
+  consumer resumes at its cursor. With `account.json` deleted, boot adopts the account
+  found by name, with no second account. Booting with another machine id while the old
+  box account exists is refused, health down naming both ids, with no second account
+  (slice 4, amending r2's new-account rule). A claims update whose read-back differs
+  from the push is not applied and is reported (unit level). A damaged `account.json` fails closed
+  with health down naming it. Absence of the field is not drivable against the
+  acceptance daemon and is asserted at unit level against the seam: nothing is created,
+  and the answer is `machine-id-absent`.
+- Install bootstrap and own users. From an empty broker store and a fixture vault
+  holding only the roots, ck-bus issues its own box and system users, creates the census
+  bucket and the six streams with their literal bindings and the two module durables,
+  writes its own census key, publishes on its sentinel subject, and performs a
+  successful `$SYS` kick of a harness client. No fleet operator key is present anywhere.
+  - Upgrade in place (`tests/stream_upgrade.rs`): a plane built the way the five-stream
+    ck-bus built it, with one message stored on each stream, is booted by the current
+    ck-bus. The five streams keep their configuration as the server reports it, their
+    creation time and their messages; the event stream and both module durables exist,
+    and a room post made before `m_prefrontal-core` existed is pending on it. A further
+    boot changes nothing. The configuration ck-bus emits for the five is asserted
+    byte-for-byte against what the five-stream build emitted, since the server refuses a
+    create that differs from the stored stream.
+  - A restart writes a new `own_users.json` and revokes the previous incarnation's box
+    users (not its system users): the claims read back contain their keys, and a
+    client presenting a revoked user's JWT is refused as revoked. The old ck-bus user's
+    own JWT cannot be presented at all (its seed died, and the server verifies the
+    nonce before it checks revocation), so the arm also records a harness-held key as
+    a previous box user and presents that one.
+  - With the signer refusing (`harness-stub` control), ck-bus creates nothing, deletes
+    nothing, and retries once per sentinel period, read from its own log line. Its
+    health half is asserted by the health row.
+  - The system-account root refusing yields `sysaccount-absent` and no plane.
+- Credential delivery and attestation. A harness participant, spawned as a supervised
+  module and presenting its consumer identity, calls `ckbus.credential`. It gets a JWT
+  whose subject is a fresh user key and whose grant matches the generator for its
+  module id and live generation. It then connects via `ckbus.nonce_sign`.
+  - The same child calling `Direct` gets `ckbus_principal_direct` and nothing else.
+  - A body claiming another module id is answered for the attested id.
+  - A module with no live generation gets `ckbus_generation_not_live`.
+  - The stub, or ck-bus's own log, records the observed principal for every answer.
+  - `ckbus` is declared `reserved: true`, so a hand-started impostor cannot register
+    `ckbus` to receive these calls. That is asserted by the declaration row's refused
+    HELLO, and cited here.
+- A3 census write and issuance recovery. There is exactly one census key per live
+  process, written before its first publish, and a respawn overwrites it at a higher
+  generation with epoch 0. The value carries `credential_public`, `user_jwt_id`,
+  `spawn_generation`, `credential_epoch`, `schema_versions`, `identities` and `rooms`.
+  Crash arms at each boundary of the issuance order:
+  - (i) after the high-water fsync and before signing, and (ii) after signing and before
+    the census write: the restart leaves no census entry, no usable credential, and
+    nothing to roll back. The next `ckbus.credential` issues at a higher epoch.
+  - (iii) after the census write and before the answer: the entry names a key nobody
+    holds. The child's refetch issues the next epoch and revokes the superseded user.
+  - (iv) damaged `epoch_high_water.json` while a generation is live: no epoch is issued
+    for it, the refusal is recorded, the file is untouched and named, health is
+    down/`Unavailable`, and open connections keep serving. A later generation issues
+    normally.
+  - Longevity, under an injected sweep clock: a long-lived participant keeps its key.
+- A9 grant conformance, live-server half. Under generated grants on a live server:
+  - The per-process user may pull and ack its own consumers, get and watch the census
+    (including the ordered-consumer create and delete under `KV_CK_{ACCT}_CENSUS`),
+    publish to `ck.{acct}.effect.dead` and to a bound room.
+  - It is refused (server-side `Denied`) on another identity's ack, pull or info, on a
+    consumer create on the four workload streams, on a census write, on an unbound room,
+    and on any `$SYS` or sentinel subject.
+  - The bus-module user may get, watch, put and delete the census and manage the six
+    streams, and is refused every workload publish.
+  - The system user may send the kick, the claims update and the claims lookup, and
+    nothing else. These subject strings are what the golden records.
+  - The default-inbox client connects and is refused at subscribe.
+
+  The golden-commit half (regenerating prefrontal's
+  `tests/grants/permission_golden.txt` from this generator) records
+  `prefrontal-seat-unnamed`. The subconscious slice fails its own arm if it writes
+  outside its worktree.
+- A3 revocation. The three steps produce the foundation's observables: `Unavailable` on
+  the severed socket, exactly one `$SYS` disconnect event, and `Denied` on an explicit
+  reconnect within 5 s. The push in step (1) severs the connection itself, and the
+  event's reason is `Credentials Revoked`, not the kick's (slice 6, measured against
+  nats-server v2.15.0 in `tests/revocation.rs`). The kick in step (3) is a backstop for
+  a connection the push did not sever, and it normally finds nothing: the server
+  answers `no such client or leafnode id`, which counts as already gone, and any other
+  kick refusal fails the step. Revoking before kicking is the safe order: a kick alone
+  lets the client reconnect at once with the same JWT (the control below). A second reconnect after a server restart is still
+  refused, proving the claims update persisted. Exactly-once is asserted on the defined
+  observables.
+  - (i) A kill between any two steps, or after a step and before its progress update,
+    ends with one revocation entry and one disconnect event, and replays are no-ops.
+    That includes a crash just after the zero-step record.
+  - (ii) Progress corrupted after step (1), with the census entry present: the inputs
+    are re-derived from the census and the steps replay.
+  - (iii) Corrupted after step (2): the file is cleared and nothing is issued.
+  - (iv) Corrupted with the census read failing: the module defers.
+
+  Controls:
+  - an unkicked participant keeps working;
+  - a participant with its trait-layer watch disabled is refused on reconnect all the
+    same;
+  - a kick without the claims update reconnects successfully;
+  - ck-bus merely dropping a key from memory makes the child's next connect fail inside
+    `ckbus.nonce_sign` (`ckbus_credential_superseded`), unseen by the server. That is
+    the local-versus-server distinction the dropped vault-delete control used to draw;
+  - a bus-module user generated without census read fails step (1) outright;
+  - an operator-key signature refused fails step (1) and pushes nothing, and the census
+    entry is untouched.
+- Spawn-stream consumer (kept). Both op names appear in `subc_ops`, and the observed
+  list is recorded. Under the six mutation controls of the spawn-stream brief the
+  consumer converges. The two refusal codes and their detail keys are asserted
+  byte-exact, `ring_bound` is read from the reply, and a lagged stream resubscribes from
+  its last cursor. The consumer issues and revokes nothing.
+- Spawn reconciliation and census recovery. Reconciliation revokes entries with no live
+  generation, and serves live generations with no entry on their first
+  `ckbus.credential`. It converges on each mutation control. A ck-bus restart while
+  participants keep running, and a respawn during the subscription gap, end with
+  exactly one usable census identity per live generation after the refetch. The cursor
+  is read back from the fixture store, and a corrupted `spawn_cursor.json` produces a
+  fresh snapshot.
+- Module health answer (kept). `supervisor.health_probe` for `ckbus` returns the
+  byte-exact class at `metrics.class`, written by the module into `health.check`, and
+  every arm names that op. The control removing `health.check` advertisement reports
+  `Unknown` and is never probed. This row owns the health half of every deferral control
+  (bootstrap's refusing signer, the failed census read, a damaged `account.json`): down,
+  `Unavailable`, `detail` naming the cause, all through the round trip. It runs under
+  the harness sentinel values parsed from the log line, within the 120 s budget.
+- A8 sentinel probe. Every down transition is bounded by `3 * period + timeout` from the
+  parsed log line.
+  - Server up: `bus.health.up` within two periods, with the reply on the module's own
+    inbox prefix.
+  - Server stopped, reply publish permitted: down/`Unavailable` within the bound, read
+    through the probe.
+  - Reply publish removed against a healthy server: down/`Denied`.
+  - Before the first answer the verdict is the initial down/`Unavailable`. This includes
+    the restart arm that persists `up`, stops the broker, restarts ck-bus and queries
+    before the first probe.
+  - With the Claustrum stub refusing `credential.sign` (`harness-stub`): ck-bus stays
+    `running`, `restart_count` is unchanged after three periods, and the class is
+    `Unavailable`.
+- Dead-letter. A claimant driven to cap exhaustion publishes the record and terms. With
+  a crash injected between the two, `c_ckbus_dead` observes one record per message id,
+  and the item is never both terminated and unrecorded. Both connections authenticate
+  under harness-signer-signed JWTs ck-bus built.
+- Membership lifecycle. ck-bus re-issues at the next epoch, overwrites the census key,
+  adjusts the room consumer's `filter_subjects` and revokes the superseded epoch, all
+  within 10 s of the membership event the foundation names. The client reconnects by
+  refetching. Publish is refused before and accepted after for a join, the reverse for a
+  leave, and the superseded epoch is refused on reconnect. The spawn snapshot shows the
+  original generation throughout. Concurrent and duplicate changes converge on one
+  highest epoch. The arm quotes the foundation's membership op and caller from the
+  vendored copy, and without that it records `membership-contract-unpinned`.
+- Signer outage and restart (the amendment's arms).
+  - Kill ck-bus under the supervisor: nats-server's pid from provenance is unchanged,
+    connected participants keep publishing and receiving, and a new participant's
+    connect fails until ck-bus is back. Twin: restart nats-server with ck-bus up, and
+    every participant re-signs through `ckbus.nonce_sign` and reconnects.
+  - ck-bus killed and restarted: established connections survive. A participant forced
+    to reconnect gets `ckbus_credential_superseded`, refetches, reconnects at the next
+    epoch, and its superseded user is revoked. Participants never forced to reconnect
+    stay connected.
+  - Controls: with ck-bus down and nats-server restarted, every participant is
+    disconnected and stays so until ck-bus returns, which is the accepted failure mode
+    and the reason the lifetimes must stay independent. ck-bus is never the parent of
+    nats-server.
+  - Expiry arm (R16): a JWT is re-issued before its `exp`, and an unrefreshed one is
+    refused after it. A renewal across an in-flight pull acks nothing twice and loses
+    nothing.
+- Federation account and isolation (`nats-federation-rig`: local subjects off the leaf;
+  account routing). ck-bus's federation user can publish to another machine's inbox and
+  subscribe to its own. It cannot publish in the box account, and it never carries an
+  effect subject.
+  - A hub-side subscription on `ck.{own}.>` receives no local traffic. The control binds
+    the leaf to the box account and shows that it would.
+  - The local delivery path, once settled, delivers an opened PEER, WAKE or ROOM body to
+    the local consumer with no box-account publish by ck-bus. An effect-family frame has
+    no path at all.
+- Leaf configuration (`harness-stub`). `callosum.hub_read` is read every 60 s and on
+  every reconnect. One hub is accepted and two are refused. The pin is the authority:
+  a candidate presenting another SPKI is refused before a credential is sent. A
+  tombstoned or changed hub withdraws the leaf document, with its disconnect observable
+  asserted in the link row within 75 s. No hub row leaves the federation inert and
+  health unchanged. The stub's `hub_read` shape is the foundation's (weaker citation)
+  until Callosum's served shape is recorded.
+- Leaf link, labelled. A message published toward another machine crosses a harness
+  hub on the leaf credential, and an inbound dial to the leaf fails. The arm and the
+  report name the shape built. Under shape 3, the connect error names the signer when
+  the signer is down. No seedless leaf authentication is claimed until the shape is
+  chosen.
+- Seal outbound. For a recipient in `callosum.peer_keys_read`, the frame on the
+  outbox carries no plaintext body and no digest header. Opening it with the recipient's
+  fixture seal key yields a signed context covering every bound field. A peer without a
+  record gets no frame and a reported wait, with no plaintext fallback, and a broadcast
+  to N machines yields N frames and none addressed to a hosted hub. Controls: tampering
+  with the destination, the sequence or the body breaks the inner signature, and the
+  HPKE `info` differing by one byte fails to open.
+- Open inbound. The harness signer serves `credential.open` in Claustrum's contract shape
+  from a throwaway KEM key. That shape is pinned by a golden pair built from the RFC
+  9180 A.2 base-mode vectors, and the golden check runs against the real binary once
+  `kemkey-open-unlanded` clears. The real-binary half also asserts the authorization:
+  the `open` grant opens, a `sign` or `read` grant alone does not, a handle is refused,
+  and a `Direct` caller gets `not_found`. It asserts the failures too: a wrong key or
+  tampered `aad` gets `open_failed`, and a signing-key id gets `kind_not_openable`. A
+  valid frame is opened, verified, delivered by the local delivery path, and its
+  (sender, sequence) is recorded before the ack. The following are quarantined with their own disposition, never
+  acked as delivered: an unsigned frame, a frame signed by a key other than the sender's
+  current record, a destination and subject mismatch, a retired generation, and
+  garbage. Claustrum down: frames wait unopened and are delivered after it returns.
+- Federation sequence and crash. Sequences are per (sender, recipient). A kill after the
+  reservation fsync and before the publish ack re-seals the redelivered original with
+  the same sequence. The recipient delivers once, sees no gap, and dedupes the duplicate.
+  A frame withheld by the harness hub shows up as `fed.gap` naming the sequence. A
+  replayed old frame is deduped.
+- Split store-and-forward (`nats-federation-rig`: sourcing across a split;
+  subject-filtered purge). A message sent while the recipient is disconnected is
+  delivered after reconnect, beyond JetStream's duplicate window. A full outbox refuses
+  with `Unavailable` naming the limit, never dropping. Purging one recipient's inbox
+  leaves the others'.
+- Peer removal fence. A peer disappearing from `callosum.peer_keys_read` stops being
+  sealed to within one read period, and its later frames are quarantined. The report
+  names the fence. Revoking the removed peer's hub leaf credential is not asserted here;
+  it is the ceremony's.
+- A6/A7 prefrontal re-run. A6 conformance and A7 no-regression stay green on
+  prefrontal's rig with the module present, and `bus-module-unlanded` appears in no
+  recorded skip. No subconscious slice owns this row, and it records
+  `prefrontal-seat-unnamed` until the Prefrontal maintainer identifies the responsible
+  integration work, built binary path, and rig-side vocabulary enforcement owner.
+
+## Normative requirements index
+
+The index summarizes normative requirements; where an index line and a section disagree, the section governs.
+
+- R4: every health arm reads the class through `supervisor.health_probe`.
+- R5: recovery that destroys or clears anything needs a successful authoritative read.
+  An unreadable census concludes nothing.
+- R6: the supervised pid is read from `supervisor.provenance`, narrowed, at
+  `daemon_observed.pid`, by the three-outcome rule.
+- R7: the argv read is `ps -ww -o args= -p <pid>`. Unix scope is Linux and macOS, and
+  `a1-signal-unix-only` records Windows.
+- R8: the A1 controls are three argv-ignoring, never-registering stand-ins: under
+  `protocol: "none"`, under the default protocol, and a SIGTERM-ignoring one as the
+  negative control (amended for #125, when an unregistered subc module began being
+  signalled at drain start).
+- R9: WITHDRAWN in r2. The root-record lookup and mint-on-absence rule has no subject
+  under design D, because roots are ceremony keys and ck-bus mints nothing in the vault.
+- R10: the route targets in acceptance are the real ids `claustrum` and `callosum`,
+  served by harness modules registered under those ids. This discharges
+  `route-target-ids-unnamed`. Amended by R12.
+- R11: `stub-reply-shape-unrecorded` is a fire-time condition naming the op, and the
+  stub shape table is data.
+- R12 (r2): three serving sides. `harness-stub` serves shape. `harness-signer` serves
+  real signatures in claustrum's exact wire shape, from throwaway fixture keys. A
+  signature is a pure function of key and bytes, so a pass proves the JWT ck-bus built
+  is accepted by a real `nats-server`, and proves no vault authority.
+  `claustrum-binary` alone serves authorization rows, and its absence is a loud skip,
+  never a pass. Every row states its side.
+- R13: leaf signing uses a Go binary embedding `nats-server`, with `RemoteLeafOpts.SignatureCB` obtaining each connect signature from the vault so the leaf seed never touches disk. The binary is a subc-declared module with its own launch nonce, and the exact leaf-key `sign` grant belongs to its reserved principal, never `reserved:ckbus`. It signs only length-capped NATS-nonce-shaped input, keeps its vault connection CLOEXEC toward children, and presents `ConsumerIdentity {module_id, launch_nonce}` on `route.open`; acceptance must confirm a real sign arrives as that reserved principal, not `direct`.
+- R14: revocation uses a narrow operator signing key and short-lived user tokens; the operator root stays out of daily use and can remove an exposed signer from the operator JWT, while ck-bus updates the account JWT's revocation list using its exact signing grant.
+- R15: agent bus access is account-scoped. A participant's
+  credential names no agents, and its grant may pull from any agent's durable in its box
+  account. The operator accepts that any bus module on the machine can read any agent's
+  queue, as within the machine's existing trust boundary: every participant is a
+  daemon-attested module running as the same user. The rejected alternative listed each
+  process's agents in its credential and reissued it, with a reconnect, on every
+  residence change.
+  Agent streams and the whole-token grant. An agent has one durable,
+  `consumer_name(agent_id)` (`c_{agent_id}`), on each of the three agent streams:
+  `CK_{ACCT}_WAKE` (filter `wake_fire(agent)`), `CK_{ACCT}_PEER` (`peer_filter(agent)`)
+  and `CK_{ACCT}_EFFECT` (`effect_filter(agent)`). ROOM, EFFECT_DEAD and EVENT are not
+  agent streams. NATS wildcards are whole-token only, so the grant cannot say `c_*`: it is a
+  whole-token `*` in the consumer position on each agent stream
+  (`$JS.API.CONSUMER.MSG.NEXT.<S>.*`, `$JS.API.CONSUMER.INFO.<S>.*`, `$JS.ACK.<S>.*.>`,
+  plus `$JS.API.STREAM.INFO.<S>`). That grant also reaches any other consumer on those
+  streams, so ck-bus never creates a non-agent durable on WAKE, PEER or EFFECT (its own
+  `c_ckbus_dead` is on EFFECT_DEAD, and the module durables `m_basal` and
+  `m_prefrontal-core` are on EVENT and ROOM). The membership row asserts this against
+  bootstrap's stream set and against the live server's consumers.
+  Three grants, chosen by the attested principal at issuance, none naming an agent. The
+  module id each is generated for is the daemon-stamped route principal, never a
+  request field:
+  - participant (every module except prefrontal-core and basal): its own `_INBOX`,
+    pull, ack and info on any agent durable as above, the `effect_dead` publish, census
+    read, and publish on its own module events, `ck.{acct}.event.{module_id}.>`, and on
+    no other module's. No workload publish at all.
+  - delivery authority (only `reserved:prefrontal-core`): the participant set plus
+    publish on `ck.{acct}.wake.*.fire`, `ck.{acct}.peer.*.*.deliver`,
+    `ck.{acct}.effect.*.*.intent` for every agent, and the ROOM binding
+    `ck.{acct}.room.*.post` for every room, and pull, ack and info on its one ROOM
+    durable `m_prefrontal-core` by name (no consumer create or delete on ROOM).
+  - flow engine (only `reserved:basal`, `FLOW_ENGINE_MODULE`): its own `_INBOX`, census
+    read, the `effect_dead` publish, pull, ack and info on its own durable `m_basal` on
+    EVENT, and for dry-run replay unnamed consumer create, consumer info and flow control
+    (`$JS.FC.<EVENT>.>`) on EVENT. No workload publish, no event publish and no agent
+    durable.
+  The naming crate owns the three constructors (`participant_permissions(account,
+  credential_public, module_id, bound_rooms)`, `delivery_authority_permissions(..)` with
+  a `delivery-authority` principal, and `flow_engine_permissions(account,
+  credential_public, module_id)` with a `flow-engine` principal) and the bus-grant
+  additions below (commons `f884fabe`, then `e4fb106f` for the event stream, the
+  flow-engine grant and the ROOM durable). Nothing in the participant grant depends on
+  agents, so a participant is never reissued when agents come or go: a credential
+  issued before a bind pulls from the durable bound afterwards.
+  Prefrontal owns residence. It creates, removes and reads each agent's durables through
+  ops on ck-bus's ManagementSurface, accepted only from `reserved:prefrontal-core`
+  (anything else, `Direct` included, is refused with `ckbus_caller_not_permitted`), with
+  every name taken from the naming crate:
+  - `ckbus.agent_durable_bind {agent_id}` creates the three durables (pull, explicit
+    ack, deliver all, ack wait 30 s, max-deliver 5 on EFFECT and -1 elsewhere, max ack
+    pending 1000) and replies `{agent_id, durables: [{stream, durable, filter_subject,
+    created}]}`. It is idempotent: an existing durable with the same configuration is
+    `created: false`, and one with a different configuration is refused
+    (`ckbus_agent_durable_conflict`, naming the stream and each differing field), never
+    replaced. A refusal on one stream leaves the others as they are; a retry converges.
+  - `ckbus.agent_durable_delete {agent_id}` deletes the three durables, then purges the
+    agent's filter subject from each stream, so its undelivered messages are gone and a
+    later bind does not deliver them again. It replies `{agent_id, deleted: [stream..],
+    purged: {stream: count}}`. Deleting an absent durable succeeds. The purge needs
+    `$JS.API.STREAM.PURGE.<S>` in the bus grant; the filter travels in the request body,
+    which permissions cannot see, so ck-bus's code restricts each purge to one agent's
+    filter.
+  - `ckbus.agent_durables_list` replies one row per consumer on an agent stream,
+    `[{agent_id, stream, durable, pending, filter_subject}]`, where `pending` is the
+    durable's undelivered count (`num_pending`). A consumer that is not an agent durable
+    is listed with `agent_id: null`. It needs `$JS.API.CONSUMER.NAMES.<S>` in the bus
+    grant. Prefrontal reconciles against it at boot and on a slow cadence: it binds
+    durables its registry says should exist, and deletes a durable only once that
+    agent's registry row is terminal, never on absence alone.
+  - `ckbus.agent_effects_pending {agent_id}` replies `{agent_id, stream, durable, bound,
+    undelivered, in_flight, pending}` for the agent's EFFECT durable: `pending` is
+    `undelivered + in_flight`, each also reported on its own. In-flight
+    (delivered-and-unacked) intents count because a merge deletes `from` and purges its
+    subjects, so an intent mid-claim whose claimant then naks would be lost. Losing an
+    intent silently is worse than a merge that waits for an operator. nats-server
+    (v2.15.0, measured by the membership row) keeps an intent that exhausted
+    max-deliver in flight until it is termed or acked, or until the durable delivers
+    another message; neither the ack wait nor repeated naks release it, and a term
+    releases it at once. The claimant (commons
+    `dad55b95`) writes the dead-letter record on the next-to-last delivery and terms on
+    the last, so an intent stays stuck only if its claimant dies on both of those
+    deliveries, and in the usual case its record was already written on the first. ck-bus
+    holds no ack grant on agent durables and cannot release it. Prefrontal escalates to
+    the operator when `pending == in_flight` (non-zero) persists past
+    `max_deliver x ack_wait` (5 x 30 s on a bound durable).
+  Merge is prefrontal's, not a ck-bus op, and no stream-to-stream copy runs (this replaces an
+  earlier copy order). A merge is decided core-side,
+  in prefrontal's store, where the message bodies live: it terminalizes the source agent,
+  supersedes its fires and bounces its queued deliveries, so copying their announcements
+  to the survivor would deliver nothing. Prefrontal then calls
+  `ckbus.agent_durable_delete {from}`, which deletes the source's durables and purges its
+  subjects. ck-bus holds no workload publish either way (line 609 stands; ck-bus holds
+  signing power and must not also inject messages), and nothing in ck-bus assumes a
+  copy runs: its behaviour is unchanged. Merge and dispose both terminalize the agent,
+  then delete its durables only once `ckbus.agent_effects_pending` reports `pending ==
+  0`, for the reason given above. A non-zero answer, or a failed call, means no delete:
+  prefrontal leaves the durables in place and retries on its slow reconcile cadence.
+  Issuance step 4 no longer creates `c_{agent_id}` durables; prefrontal's bind does. The
+  membership row keeps rooms only, still gated on `membership-contract-unpinned`.
+- R16 (discharges `user-jwt-ttl-unpinned`): every user JWT ck-bus
+  issues carries `exp` 15 minutes after issue. ck-bus renews at 10 minutes, with a few
+  seconds of per-process jitter so processes don't renew in step, by handing the new JWT
+  to the client's auth callback before `exp`, so the reconnect nats-server forces at
+  expiry uses it. Renewal must lose no work: the test renews across an in-flight pull
+  and asserts nothing is acked twice and nothing is lost. If async-nats does not
+  reconnect seamlessly, report the limitation to the message-plane foundation maintainer before choosing a longer lifetime;
+  15 minutes holds while revocation stays the primary control.
+  Renewal is a same-key re-sign, never a new epoch: epoch changes and
+  revocation stay reserved for rotation and supersede, as before. A participant renews
+  through `ckbus.credential_renew {credential_public}`, accepted under
+  `ckbus.credential`'s principal rules from the attested caller whose live generation
+  holds that key. It returns a JWT for the same user key with a fresh `iat` and `exp`,
+  and replies `{jwt, exp, user_jwt_id, credential_public, spawn_generation,
+  credential_epoch}`, `exp` in seconds since the epoch as in the claim, so the holder
+  schedules its next renewal without decoding the token and a renewal that raced a
+  supersede is recognisable. No epoch change, no census rewrite (the census keeps the
+  issue's `user_jwt_id`), no revocation and no kick: the old JWT expires, nats-server's
+  disconnect at its `exp` is the one reconnect, and that reconnect presents the renewed
+  JWT. Refusals are named so the holder re-issues through `ckbus.credential` instead:
+  `ckbus_credential_revoked` when ck-bus has recorded the key's revocation,
+  `ckbus_credential_superseded` when the key is not the module's current one (replaced,
+  or issued by an earlier ck-bus process), and `ckbus_generation_not_live` as for
+  `ckbus.credential`. ck-bus renews its own users' JWTs the same way, handing each to its
+  own connection's auth callback. Jitter is per process only (a few seconds); reconnects
+  are already spread by each connection's own issue time.

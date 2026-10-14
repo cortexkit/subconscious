@@ -1,4 +1,4 @@
-//! Ladder row "Spawn-stream consumer" (slice 7 of `docs/specs/ck-bus-module.md`).
+//! Ladder row "Spawn-stream consumer" (slice 7 of `docs/ck-bus.md`).
 //!
 //! Serving side: none. No arm opens a Claustrum or Callosum route. The daemon arms run
 //! the acceptance daemon (the shape stubs registered, never reached) and drive ck-bus's

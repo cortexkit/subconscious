@@ -1,6 +1,6 @@
 //! Upgrading a plane that ck-bus 0.1.29 built with five streams to the current six
 //! streams and two module durables, in place. This is the upgrade arm of the "Install
-//! bootstrap and own users" acceptance row in `docs/specs/ck-bus-module.md`. The vault
+//! bootstrap and own users" acceptance row in `docs/ck-bus.md`. The vault
 //! is the harness signer answered in process, the broker a real `nats-server`; no subc
 //! daemon is started.
 //!

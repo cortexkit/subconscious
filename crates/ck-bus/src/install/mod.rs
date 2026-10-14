@@ -1,6 +1,6 @@
 //! Offline install tooling for the local `nats-server`: the payloads of the install root
 //! ceremony, and the server configuration written from the signed result
-//! (`docs/designs/nats-install-trust-chain.md`, sections 1-5 and 7).
+//! (`docs/nats-install-trust-chain.md`, sections 1-5 and 7).
 //!
 //! - `ck-bus install-plan` creates (or reads back) the system account identity and
 //!   writes the signing inputs the root must sign, printing each one's path, sha256 and

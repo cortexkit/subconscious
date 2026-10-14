@@ -1,5 +1,5 @@
 //! The install-time trust chain and a local `nats-server` configured the way `ck setup`
-//! configures it (`docs/designs/nats-install-trust-chain.md`, sections 1 and 4), built
+//! configures it (`docs/nats-install-trust-chain.md`, sections 1 and 4), built
 //! from throwaway fixture keys, plus the observers the bootstrap rows read.
 //!
 //! - The operator ROOT self-signs the operator JWT (`signing_keys` = the operator signer)

@@ -1,110 +1,104 @@
 # subconscious
 
-The process fabric of [CortexKit](https://github.com/cortexkit): a per-user
-daemon (`ck-subc`) that supervises a fleet of tool modules and routes traffic
-between them and AI-agent clients over a small binary wire protocol.
-
-Agents talk to one daemon; the daemon spawns, supervises, health-checks, and
-routes to the modules that do the actual work (code intelligence, model
-running, credentials, memory, and the rest of the CortexKit fleet). One
-machine, one daemon, many modules, many concurrent agent clients.
+subconscious is the local router and supervisor every
+[CortexKit](https://github.com/cortexkit) module runs under. One daemon,
+`ck-subc`, runs per user account: it starts and supervises the modules, checks
+their health, restarts them when they fail, and routes calls between them and
+the agents, apps and tools that use them over an authenticated loopback
+connection. It routes calls on a fixed 21-byte header and never reads their
+bodies; it parses only the JSON control messages on each connection's
+channel 0. The `ck` CLI installs, upgrades and operates it.
 
 ## What's here
 
-| crate / package | what it is |
-|---|---|
-| `crates/subc-core` | the daemon (`ck-subc`), operator CLI (`ck`), router, supervisor |
-| `crates/subc-protocol` | the wire contract: 21-byte envelope, frames, manifests — single source of truth |
-| `crates/subc-transport` | loopback TCP, HMAC handshake, connection file |
-| `crates/subc-control` | channel-0 control-plane RPC types |
-| `crates/subc-client-rs` | Rust client SDK (consumers and modules) |
-| `crates/subc-mcp` | MCP gateway: exposes the module fleet as an MCP server |
-| `crates/mcp-stdio-adapter` | runs third-party stdio MCP servers as supervised children |
-| `clients/subc-client` | TypeScript client SDK (`@cortexkit/subc-client`) |
-| `clients/subc-client-swift` | Swift client SDK + fed-wire client for phone/desktop apps |
-| `clients/store` | TypeScript storage-path derivation (`@cortexkit/store`) |
+| Path | What it is |
+| --- | --- |
+| `crates/subc-core` | The `ck-subc` daemon binary and the `ck` operator CLI, including setup and upgrade. |
+| `crates/subc-daemon` | The daemon as a library: bootstrap, supervision, routing, control plane. |
+| `crates/subc-protocol` | The wire contract: envelope, frames, module control bodies, manifest, scopes. |
+| `crates/subc-control` | Client-facing control-plane bodies. |
+| `crates/subc-transport` | Loopback TCP, the HMAC handshake, the connection file, frame I/O. |
+| `crates/subc-client-rs` | Rust SDK for clients and modules. |
+| `crates/subc-os` | Process identity, signalling and the launch-nonce handoff, behind a safe API. |
+| `crates/subc-cgroup`, `crates/subc-jobobject` | Child containment on Linux (cgroups) and Windows (job objects). |
+| `crates/subc-presence` | Operating-system prompts that ask the person at the machine to approve an action. |
+| `crates/subc-uptime` | A monotonic clock that counts time asleep. |
+| `crates/subc-jsonc` | JSONC-to-JSON normalisation for config readers. |
+| `crates/subc-mcp` | `ck-subc-mcp`: presents the module fleet to an MCP host as one server. |
+| `crates/mcp-stdio-adapter` | `ck-mcp-stdio-adapter`: runs third-party stdio MCP servers as supervised children. |
+| `crates/ck-bus` | `ck-bus`: the module that owns the local NATS message plane. |
+| `crates/agent-token-vectors` | Conformance vectors for signed agent assertion tokens. |
+| `cortexkit-release` | `ck-release`: the shared, journaled release state machine. |
+| `clients/subc-client` | TypeScript SDK, `@cortexkit/subc-client`. |
+| `clients/subc-client-swift` | Swift SDK and the client side of the federation wire, for native apps. |
+| `clients/store` | `@cortexkit/store`: storage descriptors and path derivation for TypeScript. |
+| `clients/log` | `@cortexkit/log`: the shared log format for TypeScript. |
+| `clients/private-files` | `@cortexkit/private-files`: owner-only files on Windows and POSIX. |
 
-## Design in one paragraph
-
-The daemon routes by reading a fixed 21-byte envelope header and never
-deserializes payloads. Modules register over an authenticated loopback
-handshake, declare manifests (tools, capabilities, health), and are spawned
-with launch nonces so identity can't be squatted. Clients open routes to
-modules by capability or id; the daemon translates channel ids, enforces
-flow-control credits, drains gracefully on restarts, and serves a typed
-control plane (`catalog.list`, `route.open`, `supervisor.*`) on channel 0.
-Everything observable is designed to fail loud and typed: refusals carry
-codes, drops carry counters, and provenance is attested by whichever party
-can actually verify it.
-
-## Install (alpha)
+## Install
 
 macOS and Linux:
 
-```
+```sh
 curl -fsSL https://cortexkit.io/install | bash
 ck setup
 ```
 
 Windows (PowerShell):
 
-```
+```powershell
 irm https://cortexkit.io/install/win | iex
 ck setup
 ```
 
-`ck setup` places the daemon, registers it with your session's service
-manager (launchd, systemd --user, or a logon task), and starts it. Modules
-are added one at a time: `ck setup aft`, `ck setup mc`, `ck setup insula`,
-`ck setup claustrum`, `ck setup synapse`. Bare `ck` shows what is running;
-`ck upgrade` updates everything that has a newer release.
+The install script places only `ck`. `ck setup` installs the daemon, registers
+it with your login session's service manager (launchd, `systemd --user`, or a
+logon task), starts it, and offers optional modules. `ck` on its own shows what
+is running; `ck upgrade` updates everything that has a newer release. To
+connect an agent, add `ck subc-mcp shim --harness <name>` as an MCP server.
+Step-by-step instructions, including uninstalling, are in
+[`docs/install-and-upgrade.md`](docs/install-and-upgrade.md).
 
-### Connect your agent
+## Build and test
 
-The fleet is exposed to an agent as one MCP server through `ck subc-mcp` in
-`shim` mode with the harness named so the tool surface can be shaped for it.
+These need only a Rust toolchain (stable):
 
-Claude Code:
-
-```
-claude mcp add ck -- ck subc-mcp shim --harness claude-code
-```
-
-OpenCode (`opencode.json`):
-
-```json
-{ "mcp": { "ck": { "type": "local", "command": ["ck", "subc-mcp", "shim", "--harness", "opencode"] } } }
+```sh
+cargo build --workspace --locked
+cargo test --locked -p subc-protocol -p subc-control -p subc-transport
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
 ```
 
-Codex (`~/.codex/config.toml`):
+The full suite, as CI runs it on Linux and Windows:
 
-```toml
-[mcp_servers.ck]
-command = "ck"
-args = ["subc-mcp", "shim", "--harness", "codex"]
+```sh
+cargo test --workspace --all-targets --locked --no-fail-fast
 ```
 
-Any other MCP host: run `ck subc-mcp shim --harness <name>` as a stdio
-server, where `<name>` is the host's name.
+Some `ck-bus` tests run a real `nats-server` (CI pins v2.15.0) and need it on
+`PATH`. A few tests are macOS- or Windows-specific and are skipped elsewhere.
 
-## Build
+The TypeScript packages need [Bun](https://bun.sh):
 
+```sh
+cd clients/subc-client
+bun install --frozen-lockfile
+bun run typecheck
+bun test
 ```
-cargo build --workspace
-cargo test --workspace
-```
 
-TypeScript packages live under `clients/` (`bun install && bun test`).
-Some integration suites expect sibling checkouts of other CortexKit
-repositories; unit and protocol tests run standalone.
+`clients/store` depends on `clients/private-files`, and `clients/log` on both;
+build those first with `bun install --frozen-lockfile && bun run build`.
 
-## Docs
+## Documentation
 
-`docs/` carries the architecture and design records as they evolved —
-protocol specs, design docs, runbooks, and the engineering briefing the
-fleet's agents maintain. It is intentionally a working history rather than
-polished documentation.
+Start with [`docs/architecture.md`](docs/architecture.md): the pieces, how a
+request flows, the rules that matter, and an index of every contract and
+operator guide. Security reporting and the threat model are in
+[`SECURITY.md`](SECURITY.md); how to contribute is in
+[`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).

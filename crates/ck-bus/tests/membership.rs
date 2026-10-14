@@ -1,4 +1,4 @@
-//! Ladder row "Membership lifecycle" (slice 10 of `docs/specs/ck-bus-module.md`), under
+//! Ladder row "Membership lifecycle" (slice 10 of `docs/ck-bus.md`), under
 //! ruling R15: prefrontal owns agent residence and drives each agent's durables through
 //! ck-bus's agent-durable ops. served-by: harness-signer (the box account root that
 //! signs every issued credential), against a real nats-server and the acceptance daemon.

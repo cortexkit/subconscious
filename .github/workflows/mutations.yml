@@ -1,7 +1,7 @@
 name: Mutation catalogue
 
 # GitHub-hosted macOS needs org billing capacity. A queued job has not verified
-# anything; docs/mutation-catalogue.md records that operational prerequisite.
+# anything; docs/mutations.md records that operational prerequisite.
 on:
   pull_request:
   push:

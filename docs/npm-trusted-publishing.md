@@ -20,7 +20,7 @@ So the values below are worth reading before you fill the form, not after.
 |---|---|---|
 | `@cortexkit/subc-client` | configured | manual, then OIDC |
 | `@cortexkit/store` | configured | manual, then OIDC |
-| `@cortexkit/log` | configured 2026-09-19 | manual 0.2.0 (OIDC cannot create a package that does not exist) |
+| `@cortexkit/log` | configured | manual 0.2.0 (OIDC cannot create a package that does not exist) |
 
 Form values for this repo, derived from `.github/workflows/release-npm.yml`
 rather than remembered:

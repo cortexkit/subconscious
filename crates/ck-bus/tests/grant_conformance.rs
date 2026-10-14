@@ -1,4 +1,4 @@
-//! Ladder row "A9 grant conformance" (slice 5 of `docs/specs/ck-bus-module.md`),
+//! Ladder row "A9 grant conformance" (slice 5 of `docs/ck-bus.md`),
 //! live-server half. served-by: harness-signer (every user JWT here is built by ck-bus's
 //! own code with the generated grant and signed by the harness signer's roots), against
 //! a real nats-server whose box account, census bucket and six streams a supervised

@@ -1,5 +1,5 @@
 //! `server.conf` for the local `nats-server`, as `install-apply` writes it
-//! (`docs/designs/nats-install-trust-chain.md`, section 4, with SUBC's decision 6.10).
+//! (`docs/nats-install-trust-chain.md`, section 4, with SUBC's decision 6.10).
 //!
 //! - `listen` binds the IPv4 loopback address. Stock nats-server has a single client
 //!   listener, so `::1` cannot be bound alongside it, and a wildcard address is never

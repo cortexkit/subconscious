@@ -1,4 +1,4 @@
-//! Ladder row "Module health answer" (slice 8 of `docs/specs/ck-bus-module.md`), through
+//! Ladder row "Module health answer" (slice 8 of `docs/ck-bus.md`), through
 //! the daemon's round trip: every arm reads ck-bus's answer with
 //! `supervisor.health_probe`, which relays the module's `health.check` metrics whole.
 //!

@@ -1,4 +1,4 @@
-//! Row reports, checked against the acceptance ladder of `docs/specs/ck-bus-module.md`
+//! Row reports, checked against the acceptance ladder of `docs/ck-bus.md`
 //! (revision 2): the rows, the skip names each row may record, and the side that served
 //! each row.
 //!

@@ -6,7 +6,7 @@ amendment), vendored byte-for-byte beside this file. The disposition table is at
 126-136 of that copy; F-PROV's five acts are at lines 116-124.
 
 Every name in backticks in the right-hand column is a row of the acceptance ladder in
-`docs/specs/ck-bus-module.md` (r2). A foundation row no ladder row claims is a named
+`docs/ck-bus.md` (r2). A foundation row no ladder row claims is a named
 exclusion, and the cell says who keeps it. `crates/ck-bus/tests/grant_generation.rs`
 checks that every foundation row below appears here and that every cell names a ladder
 row or says "Named exclusion".

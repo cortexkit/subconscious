@@ -1,4 +1,4 @@
-//! Ladder row "Dead-letter" (slice 9 of `docs/specs/ck-bus-module.md`), against a real
+//! Ladder row "Dead-letter" (slice 9 of `docs/ck-bus.md`), against a real
 //! nats-server and the acceptance daemon. served-by: harness-signer. Both connections
 //! the row names authenticate under JWTs ck-bus's own code built and the harness signer
 //! signed: ck-bus's box user (built by the supervised ck-bus at bootstrap, or by ck-bus's

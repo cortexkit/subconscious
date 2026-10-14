@@ -1,4 +1,4 @@
-//! The two root-signed JWTs of the install ceremony (`docs/designs/nats-install-trust-chain.md`,
+//! The two root-signed JWTs of the install ceremony (`docs/nats-install-trust-chain.md`,
 //! sections 1 and 3): their claims, their signing inputs, and the checks that bind a
 //! signing input to the claims shown for approval.
 //!

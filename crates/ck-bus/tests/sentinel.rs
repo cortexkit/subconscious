@@ -1,4 +1,4 @@
-//! Ladder row "A8 sentinel probe" (slice 8 of `docs/specs/ck-bus-module.md`), against a
+//! Ladder row "A8 sentinel probe" (slice 8 of `docs/ck-bus.md`), against a
 //! real nats-server and the acceptance daemon.
 //!
 //! Serving sides, per arm:

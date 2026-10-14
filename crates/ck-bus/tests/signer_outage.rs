@@ -1,4 +1,4 @@
-//! Ladder row "Signer outage and restart" (slice 11 of `docs/specs/ck-bus-module.md`),
+//! Ladder row "Signer outage and restart" (slice 11 of `docs/ck-bus.md`),
 //! against the acceptance daemon supervising BOTH the `ck-bus` binary and a real
 //! `nats-server` as siblings, as production declares them.
 //!

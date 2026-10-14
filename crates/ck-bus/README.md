@@ -1,8 +1,8 @@
 # ck-bus
 
 The supervised owner of the CortexKit NATS message plane (module id `ckbus`). The build
-specification is `docs/specs/ck-bus-module.md`; keys and first boot follow
-`docs/designs/nats-install-trust-chain.md`.
+specification is `docs/ck-bus.md`; keys and first boot follow
+`docs/nats-install-trust-chain.md`.
 
 ## Supervised environment
 

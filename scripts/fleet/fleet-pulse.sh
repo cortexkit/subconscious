@@ -122,7 +122,7 @@ except Exception:
       layout_bad="$layout_bad $(basename "$md")(0-byte-store)"
     fi
   done
-  [ -n "$layout_bad" ] && printf '  LAYOUT ANOMALY:%s -- see docs/module-rename-runbook.md data-layout section\n' "$layout_bad"
+  [ -n "$layout_bad" ] && printf '  LAYOUT ANOMALY:%s -- see docs/renaming-a-module.md data-layout section\n' "$layout_bad"
   # SYNAPSE CERTIFICATION (2026-08-30, SYNAPSE nomination after the Aug 25-29
   # four-day silent refusal): certification_stale=true means synapse FAIL-CLOSED
   # refuses the affected model class while process health reads ok -- the exact
@@ -991,7 +991,7 @@ fi
 # subc-transport/protocol directly with hand-rolled frame loops; nothing in a
 # green fleet check distinguishes them. This census keeps the population named
 # so every future SDK fix has its non-inheriting list ready-made (docs:
-# cortexkit-sdk-affordances.md \u00a710b).
+# docs/client-affordances.md section 13).
 # Transition-printing (ENGRAM's decay-shape note): a list that prints every
 # pulse becomes background by the third cycle, and the rows most worth reading
 # are the ones that only matter when they CHANGE. So membership transitions

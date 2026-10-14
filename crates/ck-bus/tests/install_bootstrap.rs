@@ -1,6 +1,6 @@
 //! Ladder row "Install bootstrap and own users" (slice 4 of
-//! `docs/specs/ck-bus-module.md`, with the first-boot rules of
-//! `docs/designs/nats-install-trust-chain.md`).
+//! `docs/ck-bus.md`, with the first-boot rules of
+//! `docs/nats-install-trust-chain.md`).
 //!
 //! Serving sides, per arm: the boot, restart and kick arms are served by the
 //! harness-signer; the refusing-signer control by the harness-stub; the loopback arm by

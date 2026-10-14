@@ -2,7 +2,7 @@
 
 The TypeScript fleet logger for harness-hosted CortexKit plugins and clients. It
 writes the canonical line format and the module-owned day segments specified in
-`docs/specs/fleet-logging.md` (r2), and it is the twin of the Rust
+`docs/logging.md` (r2), and it is the twin of the Rust
 `cortexkit-log` crate: both render every case of
 `crates/subc-core/tests/fixtures/log_format_golden.json` byte for byte.
 

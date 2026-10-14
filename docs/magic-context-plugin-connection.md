@@ -1,0 +1,133 @@
+# SPEC #4 — Magic Context plugin ↔ subc module connection
+
+Use `docs/magic-context-wiring.md` for transform messages and `docs/magic-context-cache-policy.md` for frozen cache state. The canonical CK Message model and serializer codec are defined in the Magic Context repository (`cortexkit/magic-context`), at `docs/specs/ck-message.md` and `docs/specs/codec.md`.
+
+## 1. Purpose
+
+The wire protocol between an OpenCode/Pi **plugin shim** (in the host process) and the
+**Magic Context subc module** (the daemon). This is the PLUGIN integration position: the harness drives
+its own loop; each transform pass, the plugin hands the post-compaction message array to the
+Magic Context module over subc and gets the transformed array back to hand to the harness's serializer.
+
+Contrast with MITM (SPEC #3): there we own the wire and forward with the harness's auth. Here
+the harness serializes the final bytes from the transformed array we return — the same shape
+as Magic Context works today in-process, except the transform is now over-wire Rust instead of in-process
+TS. **Byte-for-byte the same flow; only the transform's location moves.**
+
+## 2. Roles
+
+- **Plugin shim** (thin, in the host process; Magic Context owns its internals): hooks the host's
+  transform point, encodes the host message array → CK (the HARNESS-MODEL codec — MessageV2↔CK
+  or AgentMessage↔CK, SPEC #2/Magic Context), sends it to the Magic Context module, receives the transformed CK,
+  decodes CK → host messages, hands them to the host's serializer. Keeps out-of-band DELIVERY
+  (Channel 1/2 nudges via the host's `tool.execute.after`/`sendMessage`, TUI, notifications) —
+  those are NOT transform mutations (Edge E).
+- **Magic Context module** (the daemon's transform brain; SPEC #5): holds the frozen-set + durable store,
+  runs the transform consuming the cache-policy core, serializes per-session.
+
+## 3. The request (plugin → Magic Context module)
+
+A channel-data request on the plugin's route to the Magic Context module:
+```
+{
+  session_id,                 // stable per harness session; the Magic Context per-session actor key
+  serializer_profile,         // e.g. "opencode-aisdk-1.17" | "pi-0.80" — the healing-coverage key
+  render_config,              // the HARD-bust EPOCH tuple (see note) — { system_hash, tool_set_id, model_key, serializer_profile_id }
+  full_array_fingerprint,     // whole-input identity (DELTA staleness + LKG validity) — NOT the cache anchor
+  payload,                    // one of: { full: CK[] } | { tail_delta: ... }   (see §4)
+}
+```
+- `serializer_profile` (Edge C, REQUIRED): the Magic Context module maps it to a healing-coverage table
+  to compute the provider-quirk residual (`quirk_work = provider_requirement −
+  serializer_healing(provider, profile)`). It's also what gates the reasoning-strip merge-term.
+- `full_array_fingerprint` — **distinct from the cache anchor**.
+  It is a fingerprint over the WHOLE input array (covered prefix AND tail), used for (i) DELTA
+  staleness (does the daemon's held canonical still match the plugin's view) and (ii) LKG-replay
+  validity (§7). The CACHE-REPLAY anchor itself is the cache-core's **boundary-presence** check
+  (mechanism (a), `magic-context-cache-policy.md`) — internal to the Magic Context module over the array it
+  holds, NOT a plugin-sent covered-prefix fingerprint. The plugin sends whole-array identity; the
+  module owns boundary-presence.
+- `render_config`: the HARD-bust EPOCH tuple. NOTE the role split (cache-core §B / CK#1 §2.1):
+  `system_hash` is a CONTENT-DERIVED epoch/HARD-bust MARKER (system is CK content, NOT a
+  `FrozenRenderConfig` render input — it lives in the CK message array). `tool_set_id` / `model_key`
+  / `serializer_profile_id` correspond to cache-core `FrozenRenderConfig` members. A change to any
+  is a HARD bust. So `render_config` here is the observed bust-epoch tuple, defined BY REFERENCE to
+  cache-core's closed `FrozenRenderConfig` (plus the system-content epoch marker), not a competing
+  definition.
+
+## 4. always-full vs delta (Edge A — measurement-gated)
+
+- **ALWAYS-FULL is the baseline** (required: MITM is always-full by nature; the plugin path
+  reuses the same always-full daemon code). The plugin sends `{ full: CK[] }` each pass; the
+  Magic Context module holds the frozen-set and applies it. The full array is always cheap for the plugin
+  to produce (the host re-hands it every pass today).
+- **DELTA is a plugin-path optimization**, not the baseline: a delta carries `full_array_fingerprint`, and the authoritative daemon replies `NEED_FULL_SYNC` when its held canonical array does not match, so the plugin resends `{ full: CK[] }` rather than guessing a base.
+
+**`full_array_fingerprint` (delta staleness) is NOT the cache anchor (boundary-presence)** —
+different identities for different jobs. Delta staleness needs WHOLE-ARRAY freshness: a covered-prefix-only
+anchor stays equal while the daemon's held TAIL goes stale (a new user message outside the covered
+prefix), so a delta could apply to the wrong base without tripping NEED_FULL_SYNC. So NEED_FULL_SYNC
+keys on `full_array_fingerprint`; cache replay keys on the module-internal boundary-presence.
+
+## 5. The response (Magic Context module → plugin)
+
+```
+{ transformed: CK[] }            // the transformed array (always-full path)
+   | { transformed_tail_delta }  // delta path, if Edge A adopts it
+   | NEED_FULL_SYNC              // delta path staleness sentinel → plugin resends full
+```
+The plugin decodes `transformed` CK → host messages and hands them to the host serializer. The
+transform-time INJECTIONS (synthetic-todowrite, m0/m1 history, drop placeholders = frozen
+units) are IN the returned array (Edge E: daemon owns injections). The Magic Context module applies the
+provider-quirk residual (the downstream gap-fill, SPEC #2 decide_*) to the returned array per
+`serializer_profile` so the host serializer doesn't have to.
+
+## 6. Durability boundary (Edge B)
+
+- The Magic Context module persists the cache-DECISION state (frozen_units + scheduler/boundary/overflow/
+  historian-failure), **NOT message content** — content reconstructs from the plugin's
+  full-array hand-off (the host DB is the source of truth for content).
+- Restart: the held canonical is empty → next pass triggers NEED_FULL_SYNC (delta path) or just
+  receives the full array (always-full path) → the Magic Context module re-applies the durably-persisted
+  frozen-set → byte-identical output.
+
+## 7. Daemon-unavailable / transform-failure (Edge D)
+
+- Fail-open raw-passthrough is **REJECTED** (causes double-bust / provider overflow).
+- The plugin caches the LAST Magic-Context-returned transformed array per session (last-known-good), keyed
+  by the FULL request identity `{session_id, full_array_fingerprint, render_config,
+  serializer_profile_id}`. On daemon-down/timeout: re-emit the cached transformed array ONLY when
+  the current request's `{session_id, full_array_fingerprint, render_config, serializer_profile_id}`
+  EXACTLY equals the LKG cache key (same bytes, provably safe); on ANY difference → **ABORT THE
+  TURN** (surface a clean error), never a raw cache-busting/overflowing array. **LKG replay keys
+  on `full_array_fingerprint` (whole-array identity), NOT the cache anchor/boundary-presence** —
+  the cache anchor only proves the covered PREFIX is spliceable; it stays equal while a new tail
+  message arrives (the silent-stale-tail hole), so whole-array identity is required to replay a
+  WHOLE transformed array. (This is the same anchor-vs-full-array distinction as §3/§4.)
+- Health: the plugin reads subc Ping/Pong + connection-liveness (a real signal, not just an IPC
+  timeout); a transform-failure returns a clean Error frame, not a hang. (The host-side
+  quiet-cancel mechanism — OpenCode's duck-typed sentinel — is the plugin's concern; the subc
+  side provides the clean error to trigger it.)
+
+## 8. Per-session serialization (Edge F)
+
+The transform is now async (await-subc); the host transform hook tolerates a promise. Rapid
+consecutive passes for the SAME session must not race in the Magic Context module — the Magic Context module
+serializes per-session via an in-process actor keyed by `session_id` (the subc coordinator
+precedent; trivial vs today's cross-process leases).
+
+## 9. Compaction marker (Edge G)
+
+The host compaction marker (OpenCode's `filterCompacted` boundary) STAYS plugin-side: it's how
+the plugin limits what it forwards (else it ships the daemon a pre-compaction 2M-token array).
+The protocol operates on the POST-marker array; the marker-advance coordination with the host
+stays plugin-side. The daemon never sees it. (On the owned/MITM paths there is no host marker —
+the daemon/MITM module owns the boundary.)
+
+## 10. What the plugin shim must NOT do
+
+- NOT apply provider quirks itself (the Magic Context module's downstream gap-fill does, per
+  `serializer_profile`) — except where the host serializer already heals (then it's a no-op).
+- NOT hold cache-decision state (the Magic Context module owns the frozen-set).
+- NOT push host config over the wire (config is the host's own on-disk read; the daemon is a
+  read-only consumer).

@@ -410,8 +410,7 @@ fn table_first_cells(text: &str, header: &str) -> Vec<(String, String)> {
 fn disposition_mapping_covers_every_foundation_row() {
     let foundation = read_fixture("nats-message-plane-foundation.md");
     let mapping = read_fixture("DISPOSITION-MAPPING.md");
-    let spec_path =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../docs/specs/ck-bus-module.md");
+    let spec_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../docs/ck-bus.md");
     let spec = fs::read_to_string(&spec_path).expect("read the ck-bus spec");
     let ladder_rows = table_first_cells(&spec, "| Ladder row |")
         .into_iter()

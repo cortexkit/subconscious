@@ -10,7 +10,7 @@
 //! tests compare it with prefrontal's committed reference copy (vendored as
 //! `tests/fixtures/foundation/permission_golden.txt`): it may differ only in the header
 //! line and in added subjects that are named explicitly (the golden diff rule in
-//! `docs/specs/ck-bus-module.md`).
+//! `docs/ck-bus.md`).
 
 use std::{collections::BTreeSet, error::Error, fmt};
 

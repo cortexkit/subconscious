@@ -2,7 +2,7 @@
 
 ## 0.20.89
 
-- Upgrade the daemon and SDK wire crates for per-scope bind proofs. Add isolated real-daemon coverage for required, wrong, malformed, matching, owner and epoch-replacement proofs, and unchanged admission for records without a hash.
+- Upgrade the daemon and SDK wire crates for per-scope bind proofs. Add real-daemon tests, each starting its own daemon on a throwaway data, runtime and config folder, for a missing, wrong, malformed and matching proof, the owner needing the proof too, a new epoch replacing the hash, and unchanged admission for scopes registered without a hash.
 
 ## 0.20.88
 

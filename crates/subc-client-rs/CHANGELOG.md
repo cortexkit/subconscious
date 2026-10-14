@@ -2,7 +2,7 @@
 
 ## 0.29.0
 
-- **Breaking dependency upgrade.** Use the new scope-selector constructor and `with_bind_proof`. Expose typed terminal refusals through `CallError::scope_bind_proof_refusal` (`Required` / `Mismatch`); neither code retries. Route cache identity distinguishes proof digests without retaining proof text in cache keys. Proofs are ignored by scopes without a registered hash.
+- **Breaking dependency upgrade** to subc-protocol 0.32. `ScopeSelector` is now `#[non_exhaustive]`: build it with `ScopeSelector::new(owner, scope_ref, scope_epoch)` and add a bind proof with `.with_bind_proof(Some(proof))`. `CallError::scope_bind_proof_refusal` returns `Required` or `Mismatch` for the two terminal refusals; neither is retried. Route cache keys tell different proofs apart without storing the proof text. A scope registered without a hash ignores the proof.
 
 ## 0.28.4
 

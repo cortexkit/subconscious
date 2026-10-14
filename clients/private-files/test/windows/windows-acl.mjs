@@ -13,6 +13,7 @@ import {
   securePrivatePath,
   verifyOwnerOnly,
   verifyPrivatePath,
+  verifySafeParent,
 } from '../../dist/index.js'
 
 assert.equal(
@@ -49,6 +50,67 @@ test('reserved devices in every component refuse before opening', () => nativePr
 test('ACE and SID decoding stays within declared extents', () => nativeProof('bounded-aces'))
 test('secure changes only its handle and leaves child ACLs unchanged', () => nativeProof('secure-handle'))
 test('delay hook uses only the host executable without loader fallback', () => nativeProof('delay-hook'))
+test('safe-parent unknown SID traverse-only and ACE semantics', () => nativeProof('safe-parent-aces'))
+
+test('safe-parent accepts the real admin OpenCode config and inherit-only root grants', async () => {
+  const config = join(process.env.USERPROFILE, '.config', 'opencode')
+  await mkdir(config, { recursive: true })
+  const profile = await inspect('inspect', { path: process.env.USERPROFILE })
+  const appContainerTraverse = profile.aces.filter((ace) => ace.type === 0 && !(ace.flags & 8) && ace.sid.startsWith('S-1-15-3-') && ace.mask === 0x00100020)
+  console.log(`admin profile AppContainer traverse entry present: ${appContainerTraverse.length > 0}`)
+  reports.push({ profile: process.env.USERPROFILE, appContainerTraverse })
+  assert.deepEqual(await verifySafeParent(config), { ok: true })
+})
+
+test('safe-parent refuses Users Modify and the runner temp tree', async () => {
+  const parent = join(root, 'users-modify')
+  await mkdir(parent)
+  await inspect('fixture', { path: parent, kind: 'usersModify' })
+  const result = await verifySafeParent(parent)
+  assert.equal(result.ok, false)
+  assert.equal(result.reason, 'writable-by-others')
+  assert.equal(result.level.toLowerCase(), parent.toLowerCase())
+  assert.equal(result.sid, 'S-1-5-32-545')
+  const temp = await verifySafeParent(process.env.RUNNER_TEMP || 'D:\\a\\_temp')
+  assert.equal(temp.ok, false)
+  assert.equal(temp.reason, 'writable-by-others')
+})
+
+test('safe-parent refuses ancestor FILE_DELETE_CHILD', async () => {
+  const ancestor = join(root, 'delete-child-ancestor')
+  const parent = join(ancestor, 'config')
+  await mkdir(parent, { recursive: true })
+  await inspect('fixture', { path: ancestor, kind: 'usersDeleteChild' })
+  const result = await verifySafeParent(parent)
+  assert.equal(result.ok, false)
+  assert.equal(result.reason, 'writable-by-others')
+  assert.equal(result.level.toLowerCase(), ancestor.toLowerCase())
+  assert.equal(result.mask, 0x40)
+})
+
+test('safe-parent refuses reparse points at parent and ancestor', async () => {
+  const target = join(root, 'safe-parent-target')
+  const link = join(root, 'safe-parent-junction')
+  await mkdir(join(target, 'config'), { recursive: true })
+  await inspect('fixture', { path: link, kind: 'junction', target })
+  for (const path of [link, join(link, 'config')]) {
+    const result = await verifySafeParent(path)
+    assert.equal(result.ok, false)
+    assert.equal(result.reason, 'reparse-point')
+    assert.equal(result.level.toLowerCase(), link.toLowerCase())
+  }
+})
+
+test('safe-parent refuses a parent owned by a non-trusted user', async () => {
+  const parent = join(root, 'safe-parent-foreign-owner')
+  await mkdir(parent)
+  const owner = await inspect('fixture', { path: parent, kind: 'userOwner' })
+  const result = await verifySafeParent(parent)
+  assert.equal(result.ok, false)
+  assert.equal(result.reason, 'wrong-owner')
+  assert.equal(result.sid, owner.sid)
+  assert.equal(result.level.toLowerCase(), parent.toLowerCase())
+})
 const script = fileURLToPath(new URL('./inspect.ps1', import.meta.url))
 const powershell = join(
   process.env.SystemRoot,
@@ -204,6 +266,7 @@ test('real ACL creation, independent descriptors, same-handle read and standard-
   assert.equal(probe.fileDenied, true)
   assert.equal(probe.directoryDenied, true)
   assert.equal(probe.standardWriter, true)
+  console.log(`standard-user profile AppContainer traverse entry present: ${probe.diagnostics.appContainerTraversePresent}`)
   reports.push({ probe })
 })
 

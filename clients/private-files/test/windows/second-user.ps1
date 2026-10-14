@@ -8,6 +8,10 @@ try {
   $standard = !$principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
   $profile = [Environment]::GetFolderPath([Environment+SpecialFolder]::UserProfile)
   $diagnostics = @{ userSid = $identity.User.Value; standardUser = $standard; profile = $profile; profileExists = [IO.Directory]::Exists($profile); environmentProfile = $env:USERPROFILE; workingDirectory = [Environment]::CurrentDirectory }
+  $security = [Security.AccessControl.DirectorySecurity]::new($profile, [Security.AccessControl.AccessControlSections]::Access)
+  $raw = [Security.AccessControl.RawSecurityDescriptor]::new($security.GetSecurityDescriptorBinaryForm(), 0)
+  $traverse = @($raw.DiscretionaryAcl | Where-Object { [int]$_.AceType -eq 0 -and !([int]$_.AceFlags -band 8) -and $_.SecurityIdentifier.Value.StartsWith('S-1-15-3-') -and $_.AccessMask -eq 0x00100020 })
+  $diagnostics.appContainerTraversePresent = $traverse.Count -gt 0
   $control = [IO.File]::ReadAllText($data.control) -eq 'public-control'
   $diagnostics.controlRead = $control
   if (!$control) { throw 'The standard user could not read the public control file' }

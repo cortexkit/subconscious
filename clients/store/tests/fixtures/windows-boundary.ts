@@ -5,6 +5,9 @@ const calls: Array<[string, string, unknown?]> = [];
 let failure: Error | undefined;
 mock.module("@cortexkit/private-files", () => ({
   PrivateFilesUnavailableError,
+  checkPosixOwnerOnlyPath() { throw new Error("Windows must not run the POSIX policy"); },
+  async checkPosixOwnerOnlyPathAsync() { throw new Error("Windows must not run the POSIX policy"); },
+  async verifySafeParent() { throw new Error("store Windows behavior still uses the owner-only rule"); },
   async verifyPrivatePath(path: string, kind: string) {
     calls.push(["verify", path, kind]);
     if (failure) throw failure;

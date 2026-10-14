@@ -49,6 +49,8 @@ typedef struct {
   LPWSTR detail;
   DWORD mask;
   int created;
+  wchar_t *level;
+  size_t *ends;
 } Job;
 
 static void fail(Job *j, DWORD error, const char *reason) {
@@ -288,6 +290,116 @@ static int trusted_ancestor(Job *j, HANDLE h, int creation_parent) {
   return valid;
 }
 
+/* Ancestors protect the next child, not every entry they could create. The root
+ * has no parent, so its own DELETE/WRITE_DAC rights cannot replace it from above. */
+static DWORD safe_parent_rights(int containing, int has_parent) {
+  DWORD rights = FILE_DELETE_CHILD | GENERIC_ALL;
+  if (containing || has_parent) rights |= DELETE | WRITE_DAC | WRITE_OWNER | GENERIC_WRITE;
+  if (containing) rights |= FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY;
+  return rights;
+}
+
+static int safe_descriptor(Job *j, HANDLE h, DWORD dangerous) {
+  PSID owner = NULL;
+  PACL acl = NULL;
+  PSECURITY_DESCRIPTOR sd = NULL;
+  DWORD error = GetSecurityInfo(h, SE_FILE_OBJECT, PF_QUERY_SECURITY_INFO,
+      &owner, NULL, &acl, NULL, &sd);
+  if (error != ERROR_SUCCESS) {
+    j->refusal = "unsupported-filesystem";
+    fail(j, error, "Directory owner/DACL unavailable"); return 0;
+  }
+  if (!owner || !IsValidSid(owner) || (!EqualSid(owner, j->sid) && !privileged_sid(owner))) {
+    j->refusal = "wrong-owner";
+    if (owner && IsValidSid(owner)) ConvertSidToStringSidW(owner, &j->detail);
+  } else if (!acl) {
+    j->refusal = "null-dacl";
+  } else if (!IsValidAcl(acl)) {
+    j->refusal = "extra-ace";
+  } else {
+    for (DWORD i = 0; i < acl->AceCount; ++i) {
+      ACCESS_ALLOWED_ACE *ace = ordinary_ace(acl, i);
+      /* Reject unknown types even when inherit-only; their semantics are not known. */
+      if (!ace) { j->refusal = "extra-ace"; break; }
+      if (ace->Header.AceFlags & INHERIT_ONLY_ACE) continue;
+      if (ace->Header.AceType == ACCESS_DENIED_ACE_TYPE) continue;
+      if ((ace->Mask & dangerous) && !EqualSid(&ace->SidStart, j->sid) && !privileged_sid(&ace->SidStart)) {
+        j->refusal = "writable-by-others";
+        ConvertSidToStringSidW(&ace->SidStart, &j->detail);
+        j->mask = ace->Mask & dangerous;
+        break;
+      }
+    }
+  }
+  LocalFree(sd);
+  if (j->refusal) { fail(j, ERROR_ACCESS_DENIED, "Directory entries can be replaced by an untrusted principal"); return 0; }
+  return 1;
+}
+
+static void safe_level(Job *j, size_t end) {
+  memcpy(j->level, j->path, end * sizeof(wchar_t));
+  j->level[end] = 0;
+}
+
+/* Open one component relative to a pinned directory. No absolute pathname is
+ * resolved again after the root is open, and no handle permits delete sharing. */
+static HANDLE open_safe_component(Job *j, HANDLE parent, wchar_t *component, size_t length) {
+  UNICODE_STRING name;
+  name.Buffer = component;
+  name.Length = (USHORT)(length * sizeof(wchar_t));
+  name.MaximumLength = name.Length;
+  OBJECT_ATTRIBUTES object;
+  memset(&object, 0, sizeof(object));
+  object.Length = sizeof(object);
+  object.RootDirectory = parent;
+  object.ObjectName = &name;
+  object.Attributes = OBJ_CASE_INSENSITIVE;
+  IO_STATUS_BLOCK io;
+  HANDLE handle = INVALID_HANDLE_VALUE;
+  NTSTATUS status = NtCreateFile(&handle, READ_CONTROL | FILE_READ_ATTRIBUTES, &object, &io, NULL,
+      FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ | FILE_SHARE_WRITE, FILE_OPEN,
+      FILE_OPEN_REPARSE_POINT | FILE_OPEN_FOR_BACKUP_INTENT, NULL, 0);
+  if (status < 0) {
+    fail(j, RtlNtStatusToDosError(status), "Cannot open directory component by pinned handle");
+    return INVALID_HANDLE_VALUE;
+  }
+  return handle;
+}
+
+static int pin_safe_parent(Job *j, const wchar_t *root, size_t length) {
+  j->ancestors = calloc(length + 1, sizeof(HANDLE));
+  j->ends = calloc(length + 1, sizeof(size_t));
+  j->level = calloc(length + 1, sizeof(wchar_t));
+  if (!j->ancestors || !j->ends || !j->level) {
+    fail(j, ERROR_OUTOFMEMORY, "Directory handle allocation failed"); return 0;
+  }
+  safe_level(j, 3);
+  HANDLE h = CreateFileW(root, READ_CONTROL | FILE_READ_ATTRIBUTES,
+      FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
+      FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, NULL);
+  if (h == INVALID_HANDLE_VALUE) { fail(j, GetLastError(), "Cannot pin volume root"); return 0; }
+  j->ends[j->count] = 3;
+  j->ancestors[j->count++] = h;
+  if (!attributes(j, h, 1)) return 0;
+  size_t start = 3;
+  for (size_t end = 3; end <= length && length > 3; ++end) {
+    if (j->path[end] && j->path[end] != L'\\') continue;
+    safe_level(j, end);
+    h = open_safe_component(j, h, j->path + start, end - start);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    j->ends[j->count] = end;
+    j->ancestors[j->count++] = h;
+    if (!attributes(j, h, 1)) return 0;
+    start = end + 1;
+  }
+  /* Inspect from the containing directory upward using only the retained handles. */
+  for (size_t i = j->count; i > 0; --i) {
+    safe_level(j, j->ends[i - 1]);
+    if (!safe_descriptor(j, j->ancestors[i - 1], safe_parent_rights(i == j->count, i > 1))) return 0;
+  }
+  return 1;
+}
+
 static HANDLE open_object(Job *j, const wchar_t *path, DWORD access, DWORD disposition, SECURITY_ATTRIBUTES *sa, int directory, int report_error) {
   HANDLE h = CreateFileW(path, access,
       disposition == CREATE_NEW ? 0 : FILE_SHARE_READ | FILE_SHARE_WRITE, sa, disposition,
@@ -352,7 +464,7 @@ static int pin_ancestors(Job *j) {
   size_t length = wcslen(j->path);
   /* Reject device/UNC paths, streams, relative paths and ambiguous Win32 names.
    * Callers pass an absolute local DOS path; no pathname normalization is trusted. */
-  if (length < 4 || !((j->path[0] >= L'A' && j->path[0] <= L'Z') ||
+  if (length < (j->op == 4 ? 3u : 4u) || !((j->path[0] >= L'A' && j->path[0] <= L'Z') ||
       (j->path[0] >= L'a' && j->path[0] <= L'z')) || j->path[1] != L':' || j->path[2] != L'\\') {
     j->refusal = "unsupported-filesystem";
     fail(j, ERROR_NOT_SUPPORTED, "Use an absolute local drive path, not UNC/device/network paths"); return 0;
@@ -368,7 +480,7 @@ static int pin_ancestors(Job *j) {
     fail(j, ERROR_NOT_SUPPORTED, "Volume cannot persist ACLs (FAT/exFAT unsupported); use NTFS"); return 0;
   }
   size_t start = 3;
-  for (size_t i = 3; i <= length; ++i) {
+  for (size_t i = 3; i <= length && length > 3; ++i) {
     wchar_t c = j->path[i];
     if (c == L'/' || c == L':' || (c && c < 32) || c == L'*' || c == L'?' || c == L'"' || c == L'<' || c == L'>' || c == L'|') {
       fail(j, ERROR_INVALID_NAME, "Ambiguous path component is forbidden"); return 0;
@@ -384,6 +496,7 @@ static int pin_ancestors(Job *j) {
       start = i + 1;
     }
   }
+  if (j->op == 4) return pin_safe_parent(j, root, length);
   j->ancestors = calloc(length, sizeof(HANDLE));
   if (!j->ancestors) { fail(j, ERROR_OUTOFMEMORY, "Handle allocation failed"); return 0; }
   HANDLE root_handle = open_object(j, root, READ_CONTROL | FILE_READ_ATTRIBUTES, OPEN_EXISTING, NULL, 1, 1);
@@ -410,6 +523,7 @@ static void execute(napi_env env, void *data) {
   Job *j = data;
   PACL acl = NULL;
   if (!user_sid(j) || !pin_ancestors(j)) goto done;
+  if (j->op == 4) goto done;
   DWORD acl_size = sizeof(ACL) + sizeof(ACCESS_ALLOWED_ACE) - sizeof(DWORD) + GetLengthSid(j->sid);
   acl = malloc(acl_size);
   if (!acl) { fail(j, ERROR_OUTOFMEMORY, "ACL allocation failed"); goto done; }
@@ -497,7 +611,7 @@ done:
   }
   if (j->leaf != INVALID_HANDLE_VALUE) CloseHandle(j->leaf);
   for (size_t i = j->count; i > 0; --i) CloseHandle(j->ancestors[i-1]);
-  free(j->ancestors); free(j->token); free(j->owner_token); free(acl);
+  free(j->ancestors); free(j->ends); free(j->token); free(j->owner_token); free(acl);
 }
 
 static int js_allowed(napi_status status) {
@@ -507,6 +621,7 @@ static int js_allowed(napi_status status) {
 static void release_job(Job *j) {
   if (j->bytes) { SecureZeroMemory(j->bytes, j->length); free(j->bytes); }
   free(j->path);
+  free(j->level);
   if (j->detail) LocalFree(j->detail);
   free(j);
 }
@@ -541,6 +656,10 @@ static napi_status security_error(napi_env env, Job *j, napi_value *result) {
   CHECK_NAPI(napi_set_named_property(env, error, "win32Code", value));
   CHECK_NAPI(napi_create_string_utf16(env, (char16_t *)j->path, NAPI_AUTO_LENGTH, &value));
   CHECK_NAPI(napi_set_named_property(env, error, "path", value));
+  if (j->level) {
+    CHECK_NAPI(napi_create_string_utf16(env, (char16_t *)j->level, NAPI_AUTO_LENGTH, &value));
+    CHECK_NAPI(napi_set_named_property(env, error, "level", value));
+  }
   CHECK_NAPI(napi_create_string_utf8(env, j->refusal ? j->refusal : "io-error", NAPI_AUTO_LENGTH, &value));
   CHECK_NAPI(napi_set_named_property(env, error, "reason", value));
   if (j->detail) {
@@ -582,7 +701,7 @@ static napi_value dispatch(napi_env env, napi_callback_info info) {
   napi_status status = napi_get_cb_info(env, info, &argc, args, NULL, &operation);
   if (status != napi_ok) goto api_failure;
   int op = (int)(intptr_t)operation;
-  if (argc < (op == 1 ? 1u : 2u)) goto bad_arguments;
+  if (argc < (op == 1 || op == 4 ? 1u : 2u)) goto bad_arguments;
   status = napi_get_value_string_utf16(env, args[0], NULL, 0, &length);
   if (status != napi_ok) goto api_failure;
   if (!length || length > 32000) goto bad_arguments;
@@ -594,7 +713,7 @@ static napi_value dispatch(napi_env env, napi_callback_info info) {
   status = napi_get_value_string_utf16(env, args[0], (char16_t *)j->path, length + 1, &length);
   if (status != napi_ok) goto invalid;
   if (wcslen(j->path) != length) goto invalid;
-  if (op != 1) {
+  if (op != 1 && op != 4) {
     char kind[16] = {0}; size_t n = 0;
     status = napi_get_value_string_utf8(env, args[1], kind, sizeof(kind), &n);
     if (status != napi_ok) goto invalid;
@@ -642,8 +761,8 @@ bad_arguments:
 }
 
 static napi_value init(napi_env env, napi_value exports) {
-  const char *names[] = { "create", "read", "verify", "secure" };
-  for (intptr_t i = 0; i < 4; ++i) {
+  const char *names[] = { "create", "read", "verify", "secure", "verifySafeParent" };
+  for (intptr_t i = 0; i < 5; ++i) {
     napi_value fn = NULL;
     napi_status status = napi_create_function(env, names[i], NAPI_AUTO_LENGTH, dispatch, (void *)i, &fn);
     if (status == napi_ok) status = napi_set_named_property(env, exports, names[i], fn);

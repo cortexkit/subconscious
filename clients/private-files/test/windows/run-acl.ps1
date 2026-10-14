@@ -1,4 +1,4 @@
-param([ValidateSet('node','bun')][string]$Runtime, [int]$ExpectedCount = 21, [ValidatePattern('^[a-z0-9-]*$')][string]$EvidenceSuffix = '', [string]$ExpectedVersion = '')
+param([ValidateSet('node','bun')][string]$Runtime, [int]$ExpectedCount = 27, [ValidatePattern('^[a-z0-9-]*$')][string]$EvidenceSuffix = '', [string]$ExpectedVersion = '')
 $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $false
 $env:NO_COLOR = '1'

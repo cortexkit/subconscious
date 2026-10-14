@@ -1,6 +1,6 @@
 {
   "name": "@cortexkit/private-files",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Async owner-only private files for Windows N-API v8 and POSIX modes",
   "license": "MIT",
   "type": "module",

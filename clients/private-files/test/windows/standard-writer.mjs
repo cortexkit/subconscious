@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
-import { rm, writeFile } from 'node:fs/promises'
+import { mkdir, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
@@ -8,9 +8,13 @@ import {
   readOwnerOnly,
   securePrivatePath,
   verifyOwnerOnly,
+  verifySafeParent,
 } from './package/dist/index.js'
 
 const root = join(process.argv[2], `ckpf-standard-${crypto.randomUUID()}`)
+const config = join(process.argv[2], '.config', 'opencode')
+await mkdir(config, { recursive: true })
+assert.deepEqual(await verifySafeParent(config), { ok: true }, 'fresh standard-user OpenCode config')
 try {
   await createOwnerOnly(root, { kind: 'dir' })
   const file = join(root, 'token')

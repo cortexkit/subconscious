@@ -2,6 +2,7 @@ import { chmodSync, existsSync, mkdtempSync, mkdirSync, rmSync, symlinkSync } fr
 import { tmpdir } from "node:os";
 import { join, posix } from "node:path";
 import { describe, expect, test } from "bun:test";
+import { ubuntuPrivateGroup } from "../../private-files/test/fixtures/ubuntu-private-group.js";
 
 import {
   checkOwnerOnlyPath,
@@ -211,6 +212,14 @@ const groupCases: Array<[string, string | undefined, GroupOverride]> = [
 ];
 
 describe("Unix user-private groups", () => {
+  test("Ubuntu umask-0002 config accepts a private group and refuses a second member", async () => {
+    for (const secondMember of [false, true]) {
+      const fixture = ubuntuPrivateGroup(secondMember);
+      const result = await checkBoth(fixture.path, { ...fixture.sync, platform: "linux" });
+      if (secondMember) expectRefusal(result, "other group members", fixture.path);
+      else expect(result).toEqual({ ok: true });
+    }
+  });
   for (const [name, reason, override] of groupCases) {
     test(`user-private group ${reason ? "refuses" : "accepts"} ${name}`, async () => {
       const tree = unixTree();

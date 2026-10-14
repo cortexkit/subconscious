@@ -6,6 +6,7 @@ export interface PrivateFilesNative {
   read(path: string): Promise<Buffer>
   verify(path: string, kind?: PrivateKind | 'auto'): Promise<void>
   secure(path: string, kind: PrivateKind): Promise<void>
+  verifySafeParent(path: string): Promise<void>
 }
 
 export class PrivateFilesUnavailableError extends Error {
@@ -46,7 +47,7 @@ export function loadPrivateFilesNative(): PrivateFilesNative {
     backend = createRequire(import.meta.url)(`../prebuilds/${binary}`)
     if (
       !backend ||
-      ['create', 'read', 'verify', 'secure'].some(
+      ['create', 'read', 'verify', 'secure', 'verifySafeParent'].some(
         (key) =>
           typeof backend?.[key as keyof PrivateFilesNative] !== 'function',
       )

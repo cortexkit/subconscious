@@ -5,6 +5,13 @@ import {
   PrivateFilesUnavailableError,
 } from './loader.js'
 import type { PrivateKind } from './policy.js'
+import {
+  checkPosixOwnerOnlyPath,
+  checkPosixOwnerOnlyPathAsync,
+  type PosixOwnerOnlyPathOptions,
+  type PosixOwnerOnlyPathAsyncOptions,
+  type PosixOwnerOnlyPathResult,
+} from './posix-path.js'
 
 export { PrivateFilesUnavailableError } from './loader.js'
 export {
@@ -13,6 +20,50 @@ export {
   type PrivateKind,
 } from './policy.js'
 export * from './refusals.js'
+export * from './posix-path.js'
+
+export type SafeParentResult =
+  | { ok: true }
+  | { ok: false; reason: string; path: string; level?: string; sid?: string; mask?: number }
+
+function posixParentResult(path: string, result: PosixOwnerOnlyPathResult): SafeParentResult {
+  if (result.ok) return result
+  const writable = /writable|sticky|user-private group/.test(result.reason)
+  return {
+    ok: false,
+    reason: writable ? 'writable-by-others' : result.reason === 'foreign owner'
+      ? 'wrong-owner' : result.reason === 'ancestor is not a directory' ? 'wrong-kind' : 'io-error',
+    path,
+    level: result.path,
+  }
+}
+
+/** POSIX-only synchronous form; Windows requires handle-based asynchronous verification. */
+export function verifySafeParentSync(path: string, options: PosixOwnerOnlyPathOptions = {}): SafeParentResult {
+  if (process.platform === 'win32') return { ok: false, reason: 'unsupported-filesystem', path }
+  return posixParentResult(path, checkPosixOwnerOnlyPath(path, { ...options, directoryOnly: true }))
+}
+
+/** Check whether a directory and its ancestors protect entries from untrusted writers. */
+export async function verifySafeParent(path: string, options: PosixOwnerOnlyPathAsyncOptions = {}): Promise<SafeParentResult> {
+  if (process.platform !== 'win32') {
+    return posixParentResult(path, await checkPosixOwnerOnlyPathAsync(path, { ...options, directoryOnly: true }))
+  }
+  try {
+    await loadPrivateFilesNative().verifySafeParent(path)
+    return { ok: true }
+  } catch (error) {
+    if (error instanceof PrivateFilesUnavailableError) return { ok: false, reason: 'unsupported-filesystem', path }
+    const native = error as Error & { code?: string; reason?: string; level?: string; sid?: string; ownerSid?: string; mask?: number }
+    if (native.code !== 'ERR_PRIVATE_FILES_SECURITY') throw error
+    return {
+      ok: false, reason: native.reason ?? 'io-error', path,
+      ...(native.level ? { level: native.level } : {}),
+      ...(native.sid || native.ownerSid ? { sid: native.sid ?? native.ownerSid } : {}),
+      ...(native.mask !== undefined ? { mask: native.mask } : {}),
+    }
+  }
+}
 
 /** Exclusive creation; Windows checks owner/DACL/reparse status before writing through the creation handle. */
 export async function createPrivateFile(

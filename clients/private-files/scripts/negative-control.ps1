@@ -46,7 +46,7 @@ try {
   try {
     & ./test/windows/run-acl.ps1 -Runtime node -EvidenceSuffix '-count-negative'
   } catch {
-    if ($_.Exception.Message -notmatch 'required_real_acl_test_count: expected 21 executed non-skipped tests; got tests=21 pass=0 fail=0 skip=21') { throw }
+    if ($_.Exception.Message -notmatch 'required_real_acl_test_count: expected 27 executed non-skipped tests; got tests=27 pass=0 fail=0 skip=27') { throw }
     $_.Exception.Message | Tee-Object -FilePath private-files-evidence/count-negative-test.txt
     $caught = $true
   }

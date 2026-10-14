@@ -12,8 +12,8 @@ Postgres database names or sqlite store paths.
 ## Install
 
 It ships compiled ESM and type declarations and runs on Bun or Node ≥ 18.
-Windows private operations use `@cortexkit/private-files` (`^0.1.0`). macOS and
-Linux do not load that package or require its native addon.
+The shared POSIX ancestor policy and Windows private operations use `@cortexkit/private-files` (`^0.2.0`). Its JavaScript package is required on every platform; native prebuilds are needed only on Windows. macOS and
+Linux load only its JavaScript implementation and do not require its native addon.
 
 ```jsonc
 // from the subconscious monorepo

@@ -148,6 +148,9 @@ static BOOL WINAPI probe_GetTokenInformation(HANDLE h, TOKEN_INFORMATION_CLASS t
 static PSID fake_owner;
 static PSID fake_user;
 static int fake_descriptor;
+static DWORD fake_mask = FILE_ALL_ACCESS;
+static BYTE fake_flags, fake_type;
+static int fake_null_dacl;
 static DWORD WINAPI probe_GetSecurityInfo(HANDLE h, SE_OBJECT_TYPE type, SECURITY_INFORMATION information,
     PSID *owner, PSID *group, PACL *acl, PACL *sacl, PSECURITY_DESCRIPTOR *sd) {
   if (!fake_descriptor) return GetSecurityInfo(h, type, information, owner, group, acl, sacl, sd);
@@ -156,7 +159,9 @@ static DWORD WINAPI probe_GetSecurityInfo(HANDLE h, SE_OBJECT_TYPE type, SECURIT
   *sd = block; *acl = (PACL)(block + SECURITY_DESCRIPTOR_MIN_LENGTH); *owner = fake_owner;
   InitializeSecurityDescriptor(*sd, SECURITY_DESCRIPTOR_REVISION);
   InitializeAcl(*acl, length, ACL_REVISION);
-  AddAccessAllowedAceEx(*acl, ACL_REVISION, 0, FILE_ALL_ACCESS, fake_user);
+  AddAccessAllowedAceEx(*acl, ACL_REVISION, fake_flags, fake_mask, fake_user);
+  ((ACE_HEADER *)((BYTE *)*acl + sizeof(ACL)))->AceType = fake_type;
+  if (fake_null_dacl) *acl = NULL;
   SetSecurityDescriptorDacl(*sd, TRUE, *acl, FALSE);
   SetSecurityDescriptorControl(*sd, SE_DACL_PROTECTED, SE_DACL_PROTECTED);
   return ERROR_SUCCESS;
@@ -203,6 +208,38 @@ static BOOL WINAPI probe_IsValidSid(PSID sid) { if (malformed) ++sid_calls; retu
 #ifdef __MINGW32__
 #undef const
 #endif
+
+static void safe_parent_aces(void) {
+  Job identity = {0};
+  REQUIRE(user_sid(&identity));
+  fake_descriptor = 1;
+  fake_owner = identity.sid;
+  REQUIRE(ConvertStringSidToSidW(L"S-1-15-3-65536-599108337-2355189375-1353122160-3480128286-3345335107-485756383-4087318168-230526575", &fake_user));
+  const DWORD masks[] = { FILE_TRAVERSE | SYNCHRONIZE, FILE_WRITE_EA | FILE_WRITE_ATTRIBUTES,
+    FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY, FILE_DELETE_CHILD, DELETE, WRITE_DAC, WRITE_OWNER, GENERIC_WRITE, GENERIC_ALL };
+  for (size_t i = 0; i < sizeof(masks) / sizeof(masks[0]); ++i) {
+    Job j = {0}; j.sid = identity.sid;
+    fake_mask = masks[i];
+    REQUIRE(safe_descriptor(&j, NULL, safe_parent_rights(1, 1)) == (i < 2));
+    if (i >= 2) REQUIRE(j.refusal && !strcmp(j.refusal, "writable-by-others"));
+    if (j.detail) LocalFree(j.detail);
+  }
+  for (int variant = 0; variant < 4; ++variant) {
+    Job j = {0}; j.sid = identity.sid;
+    fake_mask = GENERIC_ALL;
+    fake_flags = variant == 0 || variant == 2 ? INHERIT_ONLY_ACE : 0;
+    fake_type = variant == 1 ? ACCESS_DENIED_ACE_TYPE : variant == 2 ? ACCESS_ALLOWED_CALLBACK_ACE_TYPE : 0;
+    fake_null_dacl = variant == 3;
+    REQUIRE(safe_descriptor(&j, NULL, safe_parent_rights(1, 1)) == (variant < 2));
+    if (variant == 2) REQUIRE(j.refusal && !strcmp(j.refusal, "extra-ace"));
+    if (variant == 3) REQUIRE(j.refusal && !strcmp(j.refusal, "null-dacl"));
+    if (j.detail) LocalFree(j.detail);
+  }
+  fake_descriptor = fake_flags = fake_type = fake_null_dacl = 0;
+  fake_mask = FILE_ALL_ACCESS;
+  LocalFree(fake_user); fake_user = fake_owner = NULL;
+  free(identity.token); free(identity.owner_token);
+}
 
 static void reset_host(void) {
   calls = fail_at = fail_forever = resolved = rejected = deleted = queued = thrown = invalid_value = 0;
@@ -458,6 +495,7 @@ int main(int argc, char **argv) {
   if (!strcmp(argv[1], "directory-identity")) directory_identity(root);
   else if (!strcmp(argv[1], "private-write")) private_write(root);
   else if (!strcmp(argv[1], "owner-policy")) owner_policy();
+  else if (!strcmp(argv[1], "safe-parent-aces")) safe_parent_aces();
   else if (!strcmp(argv[1], "napi-failures")) napi_failures();
   else if (!strcmp(argv[1], "zeroize")) zeroize(root);
   else if (!strcmp(argv[1], "token-queries")) token_queries();

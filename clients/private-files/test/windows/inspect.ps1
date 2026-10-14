@@ -50,6 +50,30 @@ if ($Mode -eq 'fixture') {
   $security = ReadSecurity $path
   $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
   switch ($inputData.kind) {
+    'userOwner' {
+      $name = 'ckpfowner' + [Guid]::NewGuid().ToString('N').Substring(0, 10)
+      $password = ConvertTo-SecureString ('aA1!' + [Guid]::NewGuid().ToString('N')) -AsPlainText -Force
+      $created = $false
+      try {
+        $user = New-LocalUser -Name $name -Password $password -AccountNeverExpires
+        $created = $true
+        Add-LocalGroupMember -Group (Get-LocalGroup -SID 'S-1-5-32-545').Name -Member $name
+        & icacls $path /setowner "*$($user.SID.Value)" | Out-Null
+        if ($LASTEXITCODE) { throw 'Could not set non-trusted user owner fixture' }
+        @{ sid = $user.SID.Value } | ConvertTo-Json
+      } finally {
+        if ($created) { Remove-LocalUser -Name $name -ErrorAction Stop }
+      }
+      exit
+    }
+    'usersModify' {
+      $users = [Security.Principal.SecurityIdentifier]::new('S-1-5-32-545')
+      $security.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($users, 'Modify', 'Allow'))
+    }
+    'usersDeleteChild' {
+      $users = [Security.Principal.SecurityIdentifier]::new('S-1-5-32-545')
+      $security.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($users, 'DeleteSubdirectoriesAndFiles', 'Allow'))
+    }
     'foreign' {
       $everyone = [System.Security.Principal.SecurityIdentifier]::new('S-1-1-0')
       $security.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new($everyone, 'FullControl', 'Allow'))

@@ -11,7 +11,10 @@ import {
   securePrivatePath,
   verifyOwnerOnly,
   verifyPrivatePath,
+  verifySafeParent,
+  verifySafeParentSync,
 } from '../src/index.js'
+import { ubuntuPrivateGroup } from './fixtures/ubuntu-private-group.js'
 import { loadPrivateFilesNative, privateFilesBinary } from '../src/loader.js'
 import { isPrivateDescriptor, type PrivateDescriptor } from '../src/policy.js'
 
@@ -148,6 +151,37 @@ afterEach(async () => {
 describe.skipIf(process.platform === 'win32')(
   'private files POSIX compatibility',
   () => {
+    test('safe-parent accepts Ubuntu umask-0002 user-private config group', async () => {
+      const fixture = ubuntuPrivateGroup()
+      expect(verifySafeParentSync(fixture.path, fixture.sync)).toEqual({ ok: true })
+      expect(await verifySafeParent(fixture.path, fixture.async)).toEqual({ ok: true })
+    })
+    test('safe-parent refuses Ubuntu config group with a second member', async () => {
+      const fixture = ubuntuPrivateGroup(true)
+      const refused = { ok: false, reason: 'writable-by-others', path: fixture.path, level: fixture.path }
+      expect(verifySafeParentSync(fixture.path, fixture.sync)).toEqual(refused)
+      expect(await verifySafeParent(fixture.path, fixture.async)).toEqual(refused)
+    })
+    test('safe-parent accepts a 0755 directory and refuses group or world write', async () => {
+      const fixture = ubuntuPrivateGroup()
+      const entry = fixture.nodes.get(fixture.path)!
+      entry.mode = 0o755
+      expect(await verifySafeParent(fixture.path, fixture.async)).toEqual({ ok: true })
+      for (const mode of [0o775, 0o777]) {
+        entry.mode = mode
+        entry.gid = 1001
+        const refused = { ok: false, reason: 'writable-by-others', path: fixture.path, level: fixture.path }
+        expect(verifySafeParentSync(fixture.path, fixture.sync)).toEqual(refused)
+        expect(await verifySafeParent(fixture.path, fixture.async)).toEqual(refused)
+      }
+    })
+    test('safe-parent refuses a writable ancestor and names its level', async () => {
+      const fixture = ubuntuPrivateGroup()
+      fixture.nodes.get('/home')!.mode = 0o775
+      const refused = { ok: false, reason: 'writable-by-others', path: fixture.path, level: '/home' }
+      expect(verifySafeParentSync(fixture.path, fixture.sync)).toEqual(refused)
+      expect(await verifySafeParent(fixture.path, fixture.async)).toEqual(refused)
+    })
     test('loader refuses a missing or incompatible addon instead of a mode fallback', () => {
       expect(() => loadPrivateFilesNative()).toThrow('No mode-only fallback')
     })

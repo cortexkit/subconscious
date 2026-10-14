@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.3
+
+- Use the shared POSIX ancestor policy from `@cortexkit/private-files` 0.2.0, preserving the existing public API and refusal messages. Ubuntu's umask-0002 config layout remains accepted when its user-owned directory's effective group has no other members and no other users sharing it as their primary group.
+- POSIX now requires the `private-files` JavaScript package to be installed because it owns the single policy implementation; store no longer runs with that dependency absent. Native prebuilds remain unnecessary on POSIX and are never loaded by its checks.
+
 ## 0.2.2
 
 - `createPrivateDirectory` can create a private directory directly inside a

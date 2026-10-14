@@ -1,5 +1,5 @@
-import { expect } from "bun:test";
-import { chmodSync, cpSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { expect, spyOn } from "bun:test";
+import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -7,8 +7,15 @@ import { pathToFileURL } from "node:url";
 const base = mkdtempSync(join(tmpdir(), "store-without-addon-"));
 try {
   chmodSync(base, 0o700);
-  // Copy only source, with no node_modules: any runtime addon import would fail.
+  // Provision only the JS dependency: native loading would fail without prebuilds.
   cpSync(new URL("../../src", import.meta.url), join(base, "src"), { recursive: true });
+  const dependency = join(base, "node_modules", "@cortexkit", "private-files");
+  mkdirSync(dependency, { recursive: true });
+  for (const path of ["dist", "package.json"]) {
+    cpSync(new URL(`../../../private-files/${path}`, import.meta.url), join(dependency, path), { recursive: true });
+  }
+  const loader = await import(pathToFileURL(join(dependency, "dist/loader.js")).href);
+  const nativeLoad = spyOn(loader, "loadPrivateFilesNative").mockImplementation(() => { throw new Error("POSIX must never load the native addon"); });
   const { checkOwnerOnlyPath, checkOwnerOnlyPathAsync, createPrivateFile, createPrivateDirectory } = await import(pathToFileURL(join(base, "src/index.ts")).href);
   const dir = join(base, "private");
   const file = join(dir, "token.json");
@@ -27,6 +34,8 @@ try {
   await expect(createPrivateDirectory(join(dir, "exposed-dir"))).rejects.toThrow("world-writable ancestor");
   expect(existsSync(join(dir, "exposed"))).toBe(false);
   expect(existsSync(join(dir, "exposed-dir"))).toBe(false);
+  expect(nativeLoad).not.toHaveBeenCalled();
+  nativeLoad.mockRestore();
   console.log("Unix checks and creation without addon passed");
 } finally {
   rmSync(base, { recursive: true, force: true });

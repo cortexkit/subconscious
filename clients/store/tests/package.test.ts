@@ -4,7 +4,7 @@ import { mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
-test.skipIf(process.platform === "win32")("published tarballs keep semver and Unix imports work without private-files", () => {
+test.skipIf(process.platform === "win32")("published tarballs keep semver and Unix imports work without native prebuilds", () => {
   const storeDir = resolve(import.meta.dir, "..");
   const privateDir = resolve(storeDir, "../private-files");
   // Use real installed copies, not workspace links that could conceal missing package files.
@@ -24,15 +24,21 @@ test.skipIf(process.platform === "win32")("published tarballs keep semver and Un
     const privateTarball = pack(privateDir);
     const storeTarball = pack(storeDir);
     const manifest = JSON.parse(run("tar", ["-xOf", storeTarball, "package/package.json"]));
-    expect(manifest.dependencies["@cortexkit/private-files"]).toBe("^0.1.0");
+    expect(manifest.dependencies["@cortexkit/private-files"]).toBe("^0.2.0");
     writeFileSync(join(temp, "package.json"), JSON.stringify({ private: true, type: "module" }));
     run("npm", ["install", "--offline", "--ignore-scripts", "--no-audit", "--no-fund", privateTarball, storeTarball]);
     for (const name of ["store", "private-files"]) {
       expect(realpathSync(join(temp, "node_modules", "@cortexkit", name))).toBe(join(realpathSync(temp), "node_modules", "@cortexkit", name));
     }
-    // Remove the runtime dependency entirely to prove Unix ESM never loads it.
-    rmSync(join(temp, "node_modules", "@cortexkit", "private-files"), { recursive: true });
+    // Keep the shared JS policy, but remove every native binary from the install.
+    const dependency = join(temp, "node_modules", "@cortexkit", "private-files");
+    rmSync(join(dependency, "prebuilds"), { recursive: true, force: true });
+    expect(() => realpathSync(join(dependency, "prebuilds"))).toThrow();
     const probe = `import { checkOwnerOnlyPath, checkOwnerOnlyPathAsync, createPrivateDirectory, createPrivateFile } from '@cortexkit/store';
+import { loadPrivateFilesNative } from './node_modules/@cortexkit/private-files/dist/loader.js';
+let nativeRefused = false;
+try { loadPrivateFilesNative(); } catch (error) { nativeRefused = error.code === 'ERR_PRIVATE_FILES_UNAVAILABLE'; }
+if (!nativeRefused) throw new Error('missing native addon control did not refuse');
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -46,10 +52,14 @@ for (const result of [checkOwnerOnlyPath(file), await checkOwnerOnlyPathAsync(fi
 await createPrivateDirectory(dir);
 await createPrivateFile(file, 'secret');
 if (await readFile(file, 'utf8') !== 'secret') throw new Error('private write failed');
+const platform = process.platform;
+Object.defineProperty(process, 'platform', { value: 'win32' });
+try {
 const missing = await checkOwnerOnlyPathAsync('D:\\\\Secrets', {
   platform: 'win32', fs: {lstat: async () => ({mode: 0o777, isDirectory: () => true})},
 });
-if (missing.ok || !missing.reason.includes('@cortexkit/private-files is unavailable')) throw new Error('missing Windows package did not refuse: ' + JSON.stringify(missing));
+if (missing.ok || !missing.reason.includes('native addon is unavailable')) throw new Error('missing Windows addon did not refuse: ' + JSON.stringify(missing));
+} finally { Object.defineProperty(process, 'platform', { value: platform }); }
 console.log('packed Unix operations without addon passed');
 } finally {
   await rm(base, {recursive: true, force: true});

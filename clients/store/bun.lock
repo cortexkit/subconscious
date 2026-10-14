@@ -5,7 +5,7 @@
     "": {
       "name": "@cortexkit/store",
       "dependencies": {
-        "@cortexkit/private-files": "^0.1.0",
+        "@cortexkit/private-files": "^0.2.0",
       },
       "devDependencies": {
         "@types/bun": "^1.3.14",

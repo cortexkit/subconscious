@@ -17,7 +17,7 @@ test("Windows path checks delegate to private-files and fail closed", () => boun
 test("Windows synchronous checks refuse with async guidance", () => boundary("sync"));
 test("Windows private creation delegates bytes and refuses unavailable addons", () => boundary("create"));
 
-test.skipIf(process.platform === "win32")("Unix checks and exclusive private creation work without private-files installed", () => {
+test.skipIf(process.platform === "win32")("Unix checks and exclusive private creation work without native prebuilds", () => {
   const child = spawnSync(process.execPath, ["run", fileURLToPath(new URL("./fixtures/unix-without-addon.ts", import.meta.url))], { encoding: "utf8" });
   expect(child.status, child.stdout + child.stderr).toBe(0);
   expect(child.stdout).toContain("Unix checks and creation without addon passed");

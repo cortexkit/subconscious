@@ -242,12 +242,7 @@ Admitted readers:
 Every other principal refuses `activity_read_forbidden`. Agent sessions never reach
 channel 0, so no agent can read the ledger.
 
-A supervised module that opens a separate consumer connection without
-`consumer_identity` is indistinguishable from the operator's `ck` and is admitted as
-Direct. That is the existing local trust boundary every direct operation has. Closing
-it belongs to operator elevation, separate later work to tell the operator's own direct
-connections apart from any other local process; until then, every direct operation
-shares this gap.
+The activity reader allowlist above admits the `Direct` principal assigned to a connection without `consumer_identity`; that principal does not prove the connection belongs to the operator, so another local process omitting identity receives the same read admission.
 
 ### What must never be recorded
 
@@ -361,7 +356,7 @@ consumer-side query and subscribe helpers.
 All are recorded on the scope prefrontal owns, so each names its agent:
 
 - a worker launched, settled, rejected, cancelled or failed;
-- a campaign fired or closed;
+- a work graph started or closed;
 - a flow installed (with its approval kind, card or policy, and the rule that allowed
   it), revoked or disabled;
 - a package approved or denied;

@@ -1,26 +1,15 @@
 # subc wire batch, September 2026 — r1
 
-Status: draft r1 for review (BROCA, MC, AFT, ALF). One lock wave carries every
-item here; nothing in it ships alone, because each item alone re-stales the
-same twelve path-dependency consumers and the per-bump cost is a human
-reading `frame.rs` at BROCA, not a lockfile line.
 
-**Frame layout: unchanged.** `crates/subc-protocol/src/frame.rs` was last
-modified 2026-07-13 (`5c1e2d23`). Every item below is a JSON body field, a
-new channel-0 push, an SDK function, or a transport-crate helper. Envelope
-bytes do not move.
+**Frame layout: unchanged.** Every item below is a JSON body field, a new channel-0 push, an SDK function, or a transport-crate helper; envelope bytes do not move.
 
-Crates and versions the wave bumps: `subc-protocol` 0.19.0 → 0.20.0,
-`subc-control` 0.11.2 → 0.12.0, `subc-transport` 0.6.0 → 0.6.1,
-`subc-client-rs` 0.12.1 → 0.13.0, `@cortexkit/subc-client` (minor). Daemon
-ships first (rule #16822): every reader-side change below is deployed and
-verified running before the omitting or newly-sending producer is announced.
+Readers are deployed and verified before a producer omits an old field or sends a new one.
 
 ---
 
 ## 1. `BindIdentity.project_id: Option<String>` (subc-protocol)
 
-**Consumer:** BROCA (durable per-project lineage keyed on a rename-stable id).
+**Consumer:** Broca (durable per-project lineage keyed on a rename-stable id).
 **Producer:** harness plugins / prefrontal supplying it on `route.open`.
 
 ```rust
@@ -48,17 +37,9 @@ Semantics, normative:
   catch a producer that drops the id later**. This invariant is the only
   brace; it goes in the doc comment and the CONSUMER-IMPACT notice verbatim.
 
-  **Stated as the consequence, not the rule (BROCA):** a producer that
-  alternates between `Some(id)` and `None` across binds SILENTLY FORKS THE
-  LINEAGE — two WAL files, two lease keys, two store rows, and no error at
-  either end. Neither half is corrupt, which is why nothing reports it; the
-  second half simply looks like a new session. Broca's re-key work exists
-  because 21,473 sessions drifted exactly this way through a directory
-  rename. Therefore: **a producer that cannot answer consistently must
-  answer `None` consistently.** Having the id is not better than not having
-  it if the answer is unstable. This sentence goes in the doc comment.
+   alternation between `Some(id)` and `None` silently forks lineage, so a producer that cannot answer consistently must answer `None` consistently.
 
-  **How a producer honours it (producer rule, normative — ALF's wording):**
+  **Producer rule:**
   *"A producer resolves `project_id` at most once per session, before the
   session's first bind, and persists the outcome with the session;
   subsequent binds of that session send the persisted value and never
@@ -89,11 +70,8 @@ Semantics, normative:
   `--json`. The suffix is load-bearing: a truncated id that looks complete
   is the bounded-page shape — someone compares two truncations, finds them
   equal, and concludes the ids match.
-  Two consumers disagreed and converged on this shape: ALF (the reader
-  debugging a forked lineage compares two rows by eye; `jq` defeats the
-  purpose) and BROCA (the consumers are programs; do not spend the width —
-  but if it must appear, truncate to 8 and mark it). The abbreviated form
-  is what both accept.
+  The table supports comparison by eye with eight characters plus a visible
+  ellipsis; automated consumers use `--json` for the full identifier.
 - **Construct impact:** `BindIdentity` is a plain struct with struct-literal
   construction sites across the fleet; this is construct-breaking for them.
   The wave adds `BindIdentity::new(project_root, harness, session)` and
@@ -104,18 +82,12 @@ options gain `project_id`. Both default to absent.
 
 ## 2. Drain: stop notice to the module, busy predicate, subscription-excluded quiescence
 
-**Consumers:** BROCA (seal), AFT (StreamEnd held-open subscriptions), every
+**Consumers:** Broca (seal), AFT (StreamEnd held-open subscriptions), every
 module with a graceful-stop hook.
 
-Facts this stands on (supervise.rs, 2026-09-11): the daemon sends **no
-SIGTERM** on any path. Restart = route drain (30 s ceiling) → `route.closed`
-pushes → route GOODBYEs → module GOODBYE on channel 0 → wait ≤30 s for the
-child to exit → SIGKILL. The graceful-stop signal a module gets is the
-channel-0 GOODBYE, today at drain END. Broca's drains hit the 30 s ceiling
-with zero runs in flight because `session.subscribe` holds a request credit
-open; AFT's 328 held-open subscriptions do the same. `drained: false` is the
-steady state for both, and it is a measurement of the predicate, not of the
-modules.
+A graceful module stop is triggered by channel-0 GOODBYE, not SIGTERM; `Draining` moves the early stop notice to drain start while GOODBYE remains the exit trigger at drain end.
+
+The described restart sequence drains routes for up to 30 seconds, emits `route.closed` and route GOODBYEs, sends the module's channel-0 GOODBYE, then waits at most 30 seconds for child exit before SIGKILL.
 
 Three changes, landing together or not at all:
 
@@ -140,11 +112,9 @@ the module's channel 0 **at drain start**, before the quiescence wait
 begins — never at the end of the window, and never as a courtesy before
 SIGKILL. A notice delivered at the end of the window is indistinguishable
 from no notice, because the work it authorises (a seal, a flush) takes
-longer than what remains. BROCA's seal was dead code for a week for the
-adjacent reason: wired to SIGTERM, which the daemon never sends, so the
-handler never ran while the process exited 0.
+longer than what remains.
 
-**Recommendation to implementers, from the same incident:** log BOTH arms of
+**Recommendation to implementers:** log BOTH arms of
 the stop hook, including the success shape ("sealed 0, none in flight"). A
 module that logs only its failure arm cannot be told apart from one whose
 handler never fired; silence must be a finding, never a success shape.
@@ -179,22 +149,14 @@ nobody greps is the shape this fleet has spent two days convicting. HELLO is
 never refused on this: the fail-safe direction is correct (busy-on-omission
 cannot cut work; quiet-on-omission can), and it should be diffable.
 
-**Why 2b is the whole fix and 2c is a cleanup (BROCA's measurement):** broca
-breaks the wire predicate in BOTH directions — `session.send` returns an
-admission ack and then the run executes 10–900 s in the actor (wire quiet
-while busy), and `session.subscribe` holds a credit for the stream's
-lifetime (wire busy while idle). Their last drain logged `waited 30s
-routes_notified 49 route_goodbyes 49 drained false` on a box with both.
-Wire credits have no relationship to a module's work in either direction;
-2c removes one of two symmetric errors, 2b removes the other. After 2c
-alone, that drain completes faster and is still wrong about runs.
+Wire credits do not prove module work is quiescent: a call can acknowledge admission before background work completes, while an idle subscription can hold a credit indefinitely; declared busy gauges and subscription exclusion address these distinct cases.
 
 **2c. Subscription-excluded wire quiescence.** `endpoint_in_flight_count`
 (forwarding.rs:1347) counts every acquired credit. The drain's quiescence
 wait excludes credits whose request the **client declared a subscription at
 open** — an explicit request-kind bit on the route request, never inferred.
-AFT's review killed the inferred form: "first reply was `StreamData` with no
-terminal yet" is not a discriminator, because a `bash` call with `wait:true`
+The first reply is not a subscription discriminator: `StreamData` with no
+terminal yet can also come from a `bash` call with `wait:true`
 on a 25-minute cargo run holds its permit exactly the same way for exactly as
 long and MUST count as in flight (it is the class `drained:false` was right
 about), and a provider that streams a long tool result would be misread the
@@ -230,7 +192,7 @@ module whose gauge is still non-zero at 30 s is killed as today. A module
 declares `Busy` to protect work that settles inside its own deadline
 contract, not to hold the daemon.
 
-Seal rules a module's stop hook must satisfy, cited from BROCA's design:
+Seal rules a module's stop hook must satisfy:
 interrupted work is `Interrupted`, never `Cancelled`; a seal that drops the
 indeterminate set is worse than none; when fsync cannot land, exit unsealed
 and say so; **the success path logs too**, including "sealed 0 in flight" —
@@ -238,13 +200,7 @@ silence must never be a success shape.
 
 ## 3. `call_with_streamed_body` (SDK affordance; no daemon change)
 
-**Consumer:** MC. The 82.7 MB cold seed that motivated this is gone (the
-adapter now ships inventory deltas and boundary-scoped seeds); the realistic
-streamed body is a `state_sync` cold seed for a session the module has never
-seen (single-digit MB) and later the D5 `lineage.begin/put/finish` uploads,
-which the D5 contract already chunks above 1 MiB with begin/put/finish
-semantics of its own (R11). The affordance stays because the shape is
-right; the motivating size is recorded here so nobody sizes buffers to it.
+**Consumer:** Magic Context. Streamed bodies carry a `state_sync` cold seed for a previously unseen session or `lineage.begin/put/finish` uploads; that lineage protocol already chunks data above 1 MiB with its own begin/put/finish semantics. This SDK affordance remains available without a daemon change.
 
 Facts: `MAX_FRAME_BODY_LEN` is 64 MiB (subc-protocol lib.rs:162). The
 client→module data path is `route.module_sink.send(frame).await`
@@ -293,7 +249,7 @@ Refusals by name, before any bytes are buffered past the ceiling:
   `on_stream_begin` admits on the head; this is the symmetric close.
 
 No resume after a dropped chunk: under backpressure-not-drop a dropped chunk
-is a dropped connection, and the consumer re-sends the whole body (MC's
+is a dropped connection, and the consumer re-sends the whole body (Magic Context's
 bodies are idempotent by key — `state_sync` on ordinal/inventory, D5 uploads
 on digest). One trailer digest over the whole body, not per chunk: these
 bodies are consumed whole.
@@ -317,8 +273,7 @@ crate bump and fleet notice.
 env_named)` does not, so a caller passing `Some("")` gets `PathBuf::from("")`
 (a bare relative filename, i.e. cwd) as its only candidate. The filter moves
 into the ladder for both `env_named` and `runtime_dir`; test: `Some("")`
-behaves as `None` and every candidate is absolute. (ENGRAM fixture-vacuity;
-FUSI #144.)
+behaves as `None` and every candidate is absolute.
 
 ## 5. `pub const WIRE_CRATE_VERSION: &str = env!("CARGO_PKG_VERSION")` (subc-protocol)
 
@@ -330,7 +285,7 @@ subc-protocol* reads as "the version of the wire crates" rather than "the
 version of this one". Keeping the precise name, adding no alias — two spellings
 of one const is a surface to keep synchronised for no gain.
 
-For `ManifestProvenance.wire_crate_version`; PLEX and BROCA refuse to
+For `ManifestProvenance.wire_crate_version`; Plexus and Broca refuse to
 hand-type it.
 
 ## 6. Daemon logging `with_ansi(false)` (subc-core, same window)
@@ -343,88 +298,12 @@ current rendering are closed. Lands in the daemon cut that carries 2a–2c.
 
 ---
 
-## Order of operations
+## Public presentation and refusal requirements
 
-1. Daemon cut (2a sender, 2b/2c predicate, 4 reader-side, 6) placed and
-   verified running here and on the alpha VMs.
-2. One `#fleet-notices` post: CONSUMER-IMPACT per crate, the frame-layout
-   line above for BROCA, the `project_id` producer invariants verbatim, the
-   owed-set from `scripts/fleet/check-sibling-locks.sh`, the grep each
-   consumer runs.
-3. Producers move: prefrontal/plugins send `project_id`; broca and aft wire
-   `Draining` into their stop hooks; MC adopts `call_with_streamed_body`.
+Swift SDK `Draining { reason, deadline_ms }` must not appear to the app as `FedConnectionState.disconnected` or a retryable failure; invisible presentation or a distinct waiting state is acceptable, but a healthy drain must not look like a connection fault.
 
-## Consumer ledger (one line per seat, added as reviews arrive)
+Undeclared drain gauges make that drain busy, are counted as `drains_with_undeclared_gauge`, and never refuse HELLO; several gauges are summed.
 
-- **callosum** (CALLO): item 1 — one production construction site
-  (`runtime.rs:11837`) plus eight test literals, all migrate to `::new`;
-  as a producer on the serving-side `route.open` its `project_id` is always
-  absent (no entorhinal resolution on that path), so consistency holds by
-  construction. Item 2 — consumer of both 2a and 2b; 2a lets it refuse
-  inbound admission at drain start (origin classifies `not_sent`, retries
-  elsewhere) and 2b will anchor `Busy` to a new `ledgered_in_flight` gauge
-  so the drain waits for exactly the calls whose interruption is an
-  `ambiguous` reconciliation. Items 3–6: no exposure.
+Trailer digests are optional by SDK default, verified when present, and required by an op declaring `streamed_body_digest: Required`; an absent required digest refuses on the head with `streamed_body_digest_required`.
 
-- **broca** (BROCA): items 1, 2a, 2b, 2c — the consumer whose work the
-  drain exists to protect. r1 stands on 1 and 2a with two hardenings
-  folded (consequence-stated alternation caveat; stop-notice timing and
-  both-arms logging). 2b changed: gauges plural and summed
-  (`runs_in_flight + opening`), omission counted not only logged. 2c is a
-  stronger yes than asked: broca breaks the wire predicate in both
-  directions today, measured, so excluding subscriptions removes one of two
-  symmetric errors and adds no hazard. `ck routes`: would prefer `--json`
-  only; accepts the abbreviated-and-marked table form. Items 3–6: no
-  exposure.
-
-- **prefrontal** (ALF): item 1 — the PRODUCER that matters for BROCA's
-  lineage (prefrontal-core opening worker/gather routes as
-  `alfonso:<task or gather id>`; the host plugin binds to prefrontal-core
-  and keys nothing on the field). r1 did NOT stand as written: it needed the
-  producer rule above, which ALF found by reading their own resolver — all
-  three outcome arms carry an id, and the unavailable arm at cold start is a
-  real alternating path. Both folded. Their producer change lands with the
-  resolve-once rule and a five-shape pin; commit to follow. Items 2–6: no
-  exposure.
-
-- **aft** (AFT): item 2c — the consumer whose 328 held-open wake
-  subscriptions pinned every drain to the ceiling. r1 stands with one
-  change, folded: the subscription discriminator is an EXPLICIT request-kind
-  bit set by the client at open (their 1a), not inferred from the first reply
-  frame (their 1b, which misreads a long `wait:true` tool call). Cancel-on-
-  `route.closing` is safe against 2c in either ordering; stop-first is
-  normative. `excluded_subscriptions` on `route.closed` added at their
-  request. Items 1, 3–6: no exposure.
-
-- **magic-context** (MC): item 3 — first consumer; r1 stands with the
-  digest-required arm and the two ceiling sentences (body-bytes-only, and
-  over-cap on both the early `total_bytes` arm and the late actual-bytes
-  arm) folded above. Will always send the trailer digest. Items 1, 2, 4–6:
-  no exposure.
-
-- **alfonso-ios** (CKIOS): item 1 — the phone is a pure client and never
-  sends `BindIdentity`; no consumer. Item 2a — a consumer seam, not a
-  reviewer note: whatever `Draining{reason, deadline_ms}` becomes in the
-  Swift SDK, it must not surface to the app as `FedConnectionState.disconnected`
-  or as a retryable failure; the phone renders `disconnected` as "Lost the
-  connection to your Mac", and a healthy drain rendered that way is
-  "waiting is not failing" one layer down. Invisible is acceptable; a
-  distinct state (`awaitingPeer`-shaped) is acceptable; error-shaped is
-  not. Normative for the Swift SDK arm of 2a.
-
-## Open for review
-
-- 2b: ~~gauge omission~~ — settled by BROCA: busy for that drain, COUNTED
-  on the daemon (`drains_with_undeclared_gauge`), never refused at HELLO;
-  gauges may be several and are summed. **Validation target before the
-  declaration API exists:** broca's `health.check` already serves
-  `runs_in_flight`, `opening`, `closing`, `active_sessions`; driving a
-  `session.send` and sampling during admission shows `opening` non-zero
-  while `runs_in_flight` is still zero — the real window that makes the sum
-  load-bearing. Test 2b's summing against that before any fixture.
-- 3: ~~whether the trailer digest is mandatory~~ — settled by MC: optional
-  by SDK default, verified when present, and **requirable per op** via
-  `streamed_body_digest: Required` (refused as
-  `streamed_body_digest_required` on the head).
-- 1: ~~whether `ck routes` should render `project_id`~~ — settled by ALF:
-  table, abbreviated; full in `--json`.
+`ck routes` shows a present `project_id` in its table as `pj-` plus eight characters and a visible ellipsis (§1); `--json` returns the complete identifier so callers do not compare truncations as if they were full IDs.

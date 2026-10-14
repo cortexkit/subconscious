@@ -529,12 +529,53 @@ public struct BoardLaneItem: Codable, Equatable {
     /// `pending`, `active`, `done`, `blocked`; open for the producer to extend.
     public var state: String
     public var wait: BoardLaneWait?
+    /// When the owner expects the item done, in Unix milliseconds.
+    public var etaMs: Int64?
+    /// When the item last changed state, in Unix milliseconds.
+    public var changedAtMs: Int64?
+    /// What the owner does next on this item, at most 300 characters.
+    public var followUp: String?
+    /// A reference to the owner's note behind this item.
+    public var noteRef: String?
 
-    public init(id: String, text: String, state: String, wait: BoardLaneWait? = nil) {
+    public init(
+        id: String, text: String, state: String, wait: BoardLaneWait? = nil,
+        etaMs: Int64? = nil, changedAtMs: Int64? = nil, followUp: String? = nil, noteRef: String? = nil
+    ) {
         self.id = id
         self.text = text
         self.state = state
         self.wait = wait
+        self.etaMs = etaMs
+        self.changedAtMs = changedAtMs
+        self.followUp = followUp
+        self.noteRef = noteRef
+    }
+
+    // Lane elements arrive snake_case on the wire, and camelCase after a
+    // consumer's key normalization, so each key decodes in either spelling.
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: AnyCodingKey.self)
+        id = try c.either("id")
+        text = try c.either("text")
+        state = try c.either("state")
+        wait = try c.eitherIfPresent("wait")
+        etaMs = try c.eitherIfPresent("etaMs")
+        changedAtMs = try c.eitherIfPresent("changedAtMs")
+        followUp = try c.eitherIfPresent("followUp")
+        noteRef = try c.eitherIfPresent("noteRef")
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: AnyCodingKey.self)
+        try c.encode(id, forKey: .named("id"))
+        try c.encode(text, forKey: .named("text"))
+        try c.encode(state, forKey: .named("state"))
+        try c.encodeIfPresent(wait, forKey: .named("wait"))
+        try c.encodeIfPresent(etaMs, forKey: .named("etaMs"))
+        try c.encodeIfPresent(changedAtMs, forKey: .named("changedAtMs"))
+        try c.encodeIfPresent(followUp, forKey: .named("followUp"))
+        try c.encodeIfPresent(noteRef, forKey: .named("noteRef"))
     }
 }
 

@@ -7,10 +7,6 @@ daemon.
 
 ## 0. v2 doctrine amendment (2026-07-09, supersedes the §1 L2 honesty mechanism)
 
-Ruling after a production false-positive kill: under machine-wide CPU
-saturation, a busy-but-healthy module missed 3×5s probes on the dispatch
-path, the prober escalated to a health restart, and the respawn warm turned a
-15s load spike into a multi-minute route-unavailable outage.
 
 The generic split, for every module:
 
@@ -42,11 +38,7 @@ The generic split, for every module:
   retry-soon from stuck. Modules shrink the window with lazy root/domain
   warm-on-bind rather than upfront warm.
 
-Adoption is incremental: modules move to the insulated-lane + stamped-signal
-shape as they touch health code (AFT first; its dispatch-liveness gauges
-already carry the queue/in-flight ages). Until a module adopts, the v1
-dispatch-path probe semantics below remain its contract, with the §5 ladder
-softened by the restart-policy split above.
+Until a module serves health on the insulated lane with dispatch-stamped signals (§0), it retains the v1 dispatch-path probe contract. Its threshold/escalation ladder (§5) follows §0's distinction: lane or process failure and stale dispatch heartbeats may restart it, while degraded-but-moving health is reported rather than killed.
 
 ## 1. The layers
 
@@ -152,9 +144,9 @@ L3 "degraded"/"failing"  → per-module configured action (closed set):
 ```
 
 - `report` (default): carried in supervisor.list/health, logged. The module
-  is expected to remediate internally (ALF's sweep/re-home precedent).
+  is expected to remediate internally.
 - `restart`: for modules whose degraded state is known restart-curable.
-- `alert`: loud surfacing for CRITICAL modules (per-module criticality — MC
+- `alert`: loud surfacing for CRITICAL modules (per-module criticality — Magic Context
   failing breaks context infra and must not be quiet; quota failing degrades
   quietly). v1 alert = ERROR-level daemon log line + status in
   supervisor.health; the CK app subscribes later.
@@ -226,17 +218,6 @@ non-positive cadence ⇒ config parse error, fail-loud at boot).
   CK app becomes the outside observer later.
 - Connection-file integrity check rides the watchdog (file present, 0600,
   parses, matches the live port/key).
-
-## 9. v2 direction (banked, not built)
-
-- LLM-assisted diagnosis (user-consented): on `failing`/`unresponsive`, hand
-  the health history + module log tail + supervisor state to a model for a
-  root-cause hypothesis and suggested action, surfaced in the CK app —
-  diagnosis stays ADVISORY; actions remain the closed set. Requires the
-  health history to exist: v1's supervisor.health is deliberately shaped so
-  its reports can be ring-buffered later without a wire change.
-- Health-history persistence (ring buffer → store) and the CK app health
-  panel ride the same v2.
 
 ## 10. Tests (gate)
 

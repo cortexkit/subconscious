@@ -57,7 +57,9 @@ console.log('packed Unix operations without addon passed');
     for (const runtime of ["node", "bun"]) {
       expect(run(runtime, ["--input-type=module", "-e", probe])).toContain("packed Unix operations without addon passed");
     }
-    expect(JSON.parse(readFileSync(join(temp, "node_modules", "@cortexkit", "store", "package.json"), "utf8")).version).toBe("0.2.0");
+    // The installed copy is the tarball packed above, not a registry version.
+    const sourceVersion = JSON.parse(readFileSync(join(storeDir, "package.json"), "utf8")).version;
+    expect(JSON.parse(readFileSync(join(temp, "node_modules", "@cortexkit", "store", "package.json"), "utf8")).version).toBe(sourceVersion);
   } finally {
     rmSync(temp, { recursive: true, force: true });
   }

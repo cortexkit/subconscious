@@ -28,14 +28,7 @@ Identity comes from the connection, never the request. `route_open_principal`
 supervised launch, refuses `bad_consumer_identity` otherwise, and makes it `direct` when it
 presents no identity. Every rule below uses that principal.
 
-**What that does and does not protect against.** The launch nonce is a bearer value, and any
-connection presenting it is admitted as `reserved:<id>`. Today it is delivered in the module's
-environment, which a same-user process can read (`ps eww`), so today scopes protect against bugs
-and accidents, not against local code running as the user, a prompt-injected agent's shell
-included. `docs/designs/launch-nonce-descriptor.md` is the stage-2 track that closes it: the nonce
-over an inherited pipe, and every module and ck-subc signed with hardened runtime so no same-user
-process can attach and read it. It makes no boundary claim until its last step, which ships in
-stage 7.
+Scopes prevent accidental identity misuse but do not stop another process running as the same user from taking a module's identity until its launch nonce is delivered over an inherited descriptor and hardened-runtime signing prevents debugger access; see `docs/designs/launch-nonce-descriptor.md`, §1.
 
 ## 2. The record
 
@@ -552,7 +545,7 @@ covered by the drain rule; a commit after it sees the new version and refuses.
 
 **Restarts and upgrades are the same case for scopes.** The table starts empty, every
 `owner_synced` is false, `daemon_incarnation` is new, and readers hold as in section 5. The
-in-place upgrade (`docs/designs/daemon-in-place-upgrade.md`) does not carry routes or pending
+The in-place upgrade does not carry routes or pending
 binds and gives the new process a new daemon id, so it does not hand over scope state: owners
 re-sync and subscribers take a new snapshot, exactly as after a restart. `version` restarts, which
 is safe because it is only ever compared within one incarnation. `scope_epoch` does not: the owner
@@ -602,49 +595,21 @@ uses the same wall-clock source as accepted calls and admission; a timer only pr
     no open route under the scope checks `scope.describe` once per running task per interval
     until `scope.subscribe` ships in stage 7.
 
-## 8. Rollout
+## 8. Compatibility
 
-Readers first, then writers:
-1. Providers that need a scope refuse a bind without a stamp. Today's daemon drops unknown
-   `route.open` request fields, so a carrier naming a scope on an old daemon gets an unstamped
-   route, which the provider's refusal makes fail closed.
-2. The daemon ships `scope.sync`, `scope.describe`, the stamp and `scope_authority_owners`,
-   advertised in `server.describe` as capability `scopes/v1`, and `scope_changed` and
-   `scope_not_synced` join subc-protocol's retryable `route.open` set in the same release. An
-   older SDK treats them as terminal, which is safe. Only `scope.subscribe` remains deferred
-   to a later release.
-3. Owners and carriers use scopes only when the capability is advertised. A carrier that cannot
-   open a scoped route fails the call (`scope_unsupported`) instead of opening an unscoped one.
+A provider requiring scope identity refuses a bind without the daemon's scope stamp (§5). Scope owners and their authorized carriers—the modules allowed to open routes for an owner—use scopes only when the daemon advertises `scopes/v1`; failure to open a stamped route returns `scope_unsupported`, never an unscoped fallback.
 
-Expiry, deltas and run identity shipped in subc-protocol 0.30.0 and the accompanying daemon.
-Publish the crates and restart the daemon before owners emit `expires_at_ms`,
-`scope.apply` or `run_id`; the advertised `scope.apply` op is the owner's support check.
-Existing bodies with no deadline or run id and full sync only still decode and apply unchanged.
-Run binds need no reader-first rollout because only providers declaring `call-modes/v1` or
-`agent-run-scopes/v1` receive them, with delegating runs restricted to `call-modes/v1`.
-`scope.describe` is not gated: it returns `attributes.run_id` to any caller.
-A reader built on subc-protocol 0.29 or older refuses unknown attribute fields, so its
-describe of a run scope fails to decode. That reader only meets a run scope if it describes
-a ref it did not receive through a bind, so before an owner writes run scopes, check that no
-such pre-0.30 reader describes the owner's refs, or upgrade it first. Callosum must
-strip `agent-run-scopes/v1` from re-exported manifests before any provider reachable through
-it declares the capability, as it does `flow-scopes/v1`: a downstream provider's opt-in
-must not imply that Callosum itself handles run-scoped binds. Providers then opt in one by
-one; these module changes are separate from the daemon's scope contract.
+A caller may retry route-open refusals `scope_changed` and `scope_not_synced`. Older SDKs have a closed retry-code set, so an unrecognized code terminates the call rather than retrying without its scope stamp. Scope-change subscriptions (`scope.subscribe`) are not yet implemented.
 
-Call modes and stamped deadlines ship in subc-protocol 0.31.0 with breaking releases of
-subc-control, subc-transport, subc-client-rs and subc-daemon. Rust consumers replace
-`ScopeStamp` literals with `ScopeStamp::new` and its `with_*` setters and include the
-optional `call_mode` in raw `RouteBind` constructors and exhaustive patterns. Providers upgrade their
-readers before declaring `call-modes/v1`. The TypeScript client ignores extra bind fields
-and has no describe API or reply decoder. Swift exposes no route.bind provider decoder,
-but its management reply path preserves the describe deadline. Binds remain reader-gated;
-describe deadlines need no new rollout window. A provider declaring both the new and legacy
-capabilities remains compatible with an older daemon through the scope-derived SDK fallback.
-Deploy the new
-daemon before owners write delegating run records. Callosum must strip `call-modes/v1`
-from re-exported manifests as well, so a downstream opt-in never claims that the relay
-itself reads modes. Per-tool declarations and provider mode handling ship separately.
+Before sending expiry, deltas or run identity, owners check HELLO_ACK's advertised module ops for `scope.apply` (§11). That operation shipped with `expires_at_ms` and `run_id` in subc-protocol 0.30.0, so its presence is their support check; older full-sync bodies without deadline or run ID still decode unchanged.
+
+The daemon sends run-scoped binds only to providers declaring `call-modes/v1` or `agent-run-scopes/v1`; a delegating run requires `call-modes/v1`. Before writing run scopes, owners upgrade any reader using subc-protocol versions older than 0.30.0 that can describe the owner's scope references, because those readers reject unknown `attributes.run_id` fields.
+
+Callosum removes `flow-scopes/v1`, `agent-run-scopes/v1`, and `call-modes/v1` declarations from manifests it re-exports: a remote provider's ability to read these bind fields must not claim that the intervening federation relay can read them.
+
+Rust providers upgrade their wire crates before declaring `call-modes/v1`, construct scope stamps with `ScopeStamp::new` and its setters instead of struct literals that must enumerate every new optional wire field, and handle optional `call_mode` in raw `RouteBind` values. TypeScript ignores extra bind fields and has no `scope.describe` reply decoder; Swift preserves describe deadlines in management replies but has no provider-side `route.bind` decoder.
+
+For a provider declaring new and legacy capabilities, an older-daemon bind may omit `call_mode`; the SDK then derives codemode for run scopes, flow mode for flow scopes, and classic mode for plain or unscoped binds (§9). Owners send delegating run records only after deploying a daemon that supports delegating runs.
 
 ## 9. Tests the daemon change must carry
 
@@ -722,76 +687,9 @@ Each fails by name when its rule is removed:
   too-old cursor;
 - the tombstone bound evicts and never refuses; the live-scope and attribute bounds refuse.
 
-## 10. Changes from r2
+## 11. Implementation clarifications
 
-From the Athena review of r2 (five seats):
-1. The in-place upgrade does not carry routes or the incarnation. r2 said it did; it treated an
-   upgrade as invisible. An upgrade is now handled exactly like a restart (section 6).
-2. `agent_id`, `delegates` and `hook_order` are gated to `scope_authority_owners`. In r2 any
-   owner could set them, so any supervised module could claim a user's agent.
-3. The relay admission class is deleted. In r2 any module a session called could present its
-   full stamp, `delegates` included, to any target.
-4. A parent is accepted only from the parent's owner (and, since r6, a principal in its
-   `child_owners`); r2's "serving it" clause let any callee forge a parent link. An earlier wording
-   of this item also allowed the parent's carrier, which r6 removed.
-5. The commit re-check is a settled rejection arm, not an `Err` that closes the module
-   connection, and it reads a tag in the forwarding table instead of taking the scope lock.
-6. Stamps are snapshots: removing a carrier or turning off `delegates` drains routes, and a
-   change between admission and commit refuses the open.
-7. One sync authority per owner prevents a swap candidate from wiping the live set, which
-   r2's per-connection first sync allowed. Authority transfer is lazy through an accepted
-   full sync after promotion (section 3).
-8. An owner-supplied `scope_epoch`, refused if it goes down, stops a reused ref carrying old
-   approvals and, unlike a daemon counter, survives restarts; `subscribe` reports owner sync, so a reader knows when a missing
-   scope means ended.
-9. The tombstone bound evicts and never refuses; r2 read both ways.
-
-From the room's review of r3:
-10. `route.open` can name the `scope_epoch`, so a carrier's lazy open can't be admitted into a
-    newer session under a reused ref.
-11. `scope_not_synced` (retryable) is split from `scope_not_live` (terminal), so a carrier's opens
-    during the post-restart re-sync window wait instead of failing.
-12. A delta lets a large owner register or end one scope without re-sending its set; the
-    implemented operation is `scope.apply` (section 3).
-
-From the room, after r4:
-13. Carrier entries can name their target modules, so a provider listed to file asks under a
-    session's scope cannot open to any other module as that session. Without it, removing the
-    relay class had only moved the widening from per call to per scope.
-
-From the Athena review of extensibility r7:
-14. Non-owner openers must name the epoch (`scope_epoch_required`); r5 made it optional, so a
-    carrier that omitted it could be admitted into a newer session under a reused ref.
-15. Parents carry their epoch and are granted by `child_owners`, not by carrying; r5 let any
-    carrier parent a scope on a head, and gave Magic Context no way to parent at all.
-16. Unchanged records don't bump `version`; a refused record doesn't block the sync; a newer launch
-    of the owner takes sync authority from a wedged older connection.
-17. One refusal table and one drain table (section 5a).
-18. `hook_order` left the daemon for `session.plan`; subscriptions and deltas were deferred
-    to a later release, and `subscribe` gained `created` events and a full set on `synced`.
-    `scope.apply` is now implemented; only subscriptions remain deferred.
-
-From the Athena review of extensibility r7.2:
-19. `kind` is fixed per epoch and an ended epoch cannot be re-created (T8, T13).
-20. Parent links are verified against the parent's owner's synced set, with a `pending` state for
-    any restart ordering, and a parent ending drains its children's routes (T11, T12).
-21. Every open names the epoch, the owner's included (T21); `owner_authorized` is the only rule
-    and its key is restart-required (T14, T22).
-22. "Current launch" means the supervisor's active launch, so a swap candidate never takes sync
-    authority (T7).
-23. Stored approvals are kept under their own expiry and a live call waits at most 45 s; a full-set
-    miss is definitive and may be deleted (T10, T18).
-24. The locking prose drains per the table, not every route (T15); the drain-reason prose matches
-    the table (T16); section 1 points at the launch-nonce track (T17); the non-authority field list
-    includes `child_owners` (T9); a drain does not recall a delivered call (T19, open).
-
-From the operator:
-25. T19 decided: revocation stops running work under the scope (section 7), not only new calls.
-
-## 11. Settled by the stage 1 build (r9)
-
-The build had to decide these where the sections above were silent or loose. Each is now the
-contract; where it differs from the wording above, this section wins.
+The following implementation rules resolve ambiguous wording above; where they differ, this section governs.
 
 - **Where sync, apply and describe run.** `scope.sync`, `scope.apply` and `scope.describe` are
   module control requests sent on the sender's own registered module connection. The owner is that registration's

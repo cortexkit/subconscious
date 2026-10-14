@@ -2335,6 +2335,15 @@ async fn supervisor_restart_with_zero_drain_override_cuts_the_inflight_request()
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn draining_notice_precedes_quiescence_wait_and_route_lifecycle_stays_ordered() {
+    exercise_draining_notice_and_lifecycle(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn draining_lifecycle_accepts_response_before_route_closing() {
+    exercise_draining_notice_and_lifecycle(true).await;
+}
+
+async fn exercise_draining_notice_and_lifecycle(response_first: bool) {
     let server = TestServer::start().await;
     let supervisor = supervisor_with_drain_timeout(
         &server,
@@ -2350,10 +2359,8 @@ async fn draining_notice_precedes_quiescence_wait_and_route_lifecycle_stays_orde
         "draining-before-wait",
         [
             ("FAKE_AFT_DELAY_FROM_BODY", "1"),
-            // Receipt evidence for the drain race below: the stub PUSHes on the
-            // request channel BEFORE its delay, so reading that push proves the
-            // slow request crossed client -> daemon -> module and is genuinely
-            // in flight before the reload is issued.
+            // Receipt proves the request reached the module before reload. The
+            // response is held until module.draining, not for a timed delay.
             ("FAKE_AFT_PUSH_ON_REQUEST", "1"),
         ],
     )
@@ -2373,7 +2380,7 @@ async fn draining_notice_precedes_quiescence_wait_and_route_lifecycle_stays_orde
     )
     .await;
     let slow_corr = 402;
-    let slow_payload = br#"{"delay_ms":50,"jsonrpc":"2.0","id":"reload-happy"}"#;
+    let slow_payload = br#"{"respond_on_draining":true,"jsonrpc":"2.0","id":"reload-happy"}"#;
     write_frame(
         &mut route_client,
         &data_request(ack.route_channel, ack.route_epoch, slow_corr, slow_payload),
@@ -2382,16 +2389,16 @@ async fn draining_notice_precedes_quiescence_wait_and_route_lifecycle_stays_orde
     .unwrap();
     route_client.flush().await.unwrap();
 
-    // Wait for the module's receipt push before reloading. Without it the test
-    // writes the request on one connection and the reload on another, and the
-    // daemon's two reader tasks race: ~half the time the drain's phase one lands
-    // before the request frame is even read, the request is never in flight, the
-    // drain settles on an empty route, and the client's first frame is the
-    // teardown GOODBYE instead of the Response (issue #11, 10/20 on master).
-    // The drain contract is "drain what is in flight at drain start" -- the test
-    // must establish in-flightness, not assume its own write raced ahead.
+    // The request and reload use different connections. Wait for receipt so
+    // the daemon cannot start draining before it has admitted the request.
     let receipt = read_push(&mut route_client, ack.route_channel).await;
     assert_eq!(receipt.header.epoch, ack.route_epoch);
+
+    // The module settles this request only on module.draining. Holding the
+    // supervisor before route.closing makes the response-first order certain,
+    // while the daemon's router and per-connection writer still run normally.
+    let mut release_closing =
+        response_first.then(|| server.forwarding.hold_route_closing_for_test());
 
     let mut control_client = connect_authed_client(&server.connection_file_path)
         .await
@@ -2409,18 +2416,76 @@ async fn draining_notice_precedes_quiescence_wait_and_route_lifecycle_stays_orde
     .unwrap();
     control_client.flush().await.unwrap();
 
-    let closing = read_frame_timeout(&mut route_client).await;
-    assert_route_lifecycle_push(
-        &closing,
-        "route.closing",
-        module_id,
-        "reload",
-        None,
-        None,
-        None,
+    // Lifecycle pushes must stay closing -> closed -> GOODBYE. A response is
+    // enqueued independently by the module reader, so it can precede either
+    // push; the admitted request must still settle before terminal GOODBYE.
+    let mut lifecycle_step = 0;
+    let mut saw_response = false;
+    for index in 0..4 {
+        let frame = read_frame_timeout(&mut route_client).await;
+        if response_first && index == 0 {
+            assert_eq!(
+                frame.header.ty,
+                FrameType::Response,
+                "forced response-first interleaving"
+            );
+        }
+        match frame.header.ty {
+            FrameType::Response => {
+                assert!(!saw_response, "duplicate response");
+                assert_response(&frame, ack.route_channel, slow_corr, slow_payload);
+                assert_eq!(frame.header.epoch, ack.route_epoch);
+                saw_response = true;
+                if let Some(release) = release_closing.take() {
+                    release.send(()).unwrap();
+                }
+            }
+            FrameType::Push => {
+                match lifecycle_step {
+                    0 => assert_route_lifecycle_push(
+                        &frame,
+                        "route.closing",
+                        module_id,
+                        "reload",
+                        None,
+                        None,
+                        None,
+                    ),
+                    1 => assert_route_lifecycle_push(
+                        &frame,
+                        "route.closed",
+                        module_id,
+                        "reload",
+                        Some(true),
+                        Some(0),
+                        Some(false),
+                    ),
+                    _ => panic!("unexpected lifecycle push: {frame:?}"),
+                }
+                assert_eq!(
+                    serde_json::from_slice::<Value>(&frame.body).unwrap()["channels"],
+                    serde_json::json!([ack.route_channel]),
+                );
+                lifecycle_step += 1;
+            }
+            FrameType::Goodbye => {
+                assert_eq!(lifecycle_step, 2, "GOODBYE must follow route.closed");
+                assert!(
+                    saw_response,
+                    "the admitted request must settle before GOODBYE"
+                );
+                assert_eq!(frame.header.channel, ack.route_channel);
+                assert_eq!(frame.header.epoch, ack.route_epoch);
+                lifecycle_step += 1;
+            }
+            _ => panic!("unexpected drain frame: {frame:?}"),
+        }
+    }
+    assert!(saw_response, "drain must deliver the admitted response");
+    assert_eq!(
+        lifecycle_step, 3,
+        "drain must deliver the complete lifecycle"
     );
-    let response = read_frame_timeout(&mut route_client).await;
-    assert_response(&response, ack.route_channel, slow_corr, slow_payload);
     wait_for_stub_event(&events_path, SETUP_TIMEOUT, |event| {
         event_is_terminal(event, "response", ack.route_channel, slow_corr)
     })
@@ -2434,20 +2499,6 @@ async fn draining_notice_precedes_quiescence_wait_and_route_lifecycle_stays_orde
         draining_position < terminal_position,
         "draining command must reach the module before the in-flight request settles"
     );
-    let closed = read_frame_timeout(&mut route_client).await;
-    assert_route_lifecycle_push(
-        &closed,
-        "route.closed",
-        module_id,
-        "reload",
-        Some(true),
-        Some(0),
-        Some(false),
-    );
-    let goodbye = read_frame_timeout(&mut route_client).await;
-    assert_eq!(goodbye.header.ty, FrameType::Goodbye);
-    assert_eq!(goodbye.header.channel, ack.route_channel);
-
     let applied = read_supervisor_ack_on_stream(&mut control_client, 403, module_id).await;
     assert!(applied);
     wait_for_registration(&server.registry, module_id, SETUP_TIMEOUT).await;
@@ -7774,7 +7825,12 @@ fn assert_route_lifecycle_push(
     abandoned: Option<u32>,
     terminal: Option<bool>,
 ) {
-    assert_eq!(frame.header.ty, FrameType::Push);
+    assert_eq!(
+        frame.header.ty,
+        FrameType::Push,
+        "unexpected lifecycle frame: {:?}",
+        frame.header
+    );
     assert_eq!(frame.header.channel, 0);
     assert_eq!(frame.header.epoch, 0);
     assert_eq!(frame.header.corr, 0);

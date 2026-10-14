@@ -9357,6 +9357,8 @@ async fn begin_forwarding_drain_with(
     };
     {
         send_module_draining(&spec.module_id, reason, deadline_ms, target);
+        #[cfg(feature = "test-support")]
+        forwarding.wait_before_route_closing_for_test().await;
         let routes = forwarding
             .endpoint_routes(target.endpoint)
             .map_err(SuperviseError::Forwarding)?;

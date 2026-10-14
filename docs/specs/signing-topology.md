@@ -1,10 +1,7 @@
 # CortexKit release signing topology
 
 Revision: signing-topology/v2
-Status: Built (v1 governed fleet deployments since 2026-08-06; v2 adds a real
-signing identity after TCC cdhash-pinning was measured orphaning grants on
-every rebuild. Rollout is per-binary at its next natural placement).
-Owner: subconscious (SUBC seat). Consumers cite the revision string above.
+Status: built signing contract; consumers cite the revision string above.
 
 ## The topology in one paragraph
 
@@ -20,23 +17,11 @@ environments.
 
 1. SIGN AT STAGE, WITH THE FLEET IDENTITY AND A PINNED IDENTIFIER.
    `codesign --force --sign "$CK_SIGNING_IDENTITY" --identifier <deployed-name>`
-   runs on the staged artifact. The fleet identity on this host is
-   `Apple Development: ISMET UFUK ALTINOK (7UX762GU88)` (from the existing
-   Apple Developer account; the same account CKIOS publishes to TestFlight
-   with). A bare `codesign --force --sign -` DERIVES the identifier from
+   runs on the staged artifact. A bare `codesign --force --sign -` derives the identifier from
    LC_UUID (prefix `55554944`), which changes on every rebuild — never use it.
 
-2. WHY A REAL IDENTITY (the v2 change): TCC pins an ad-hoc-signed binary's
-   grants to its CDHASH, because an ad-hoc signature has no stable designated
-   requirement — so every rebuild silently orphaned Screen Recording and
-   Accessibility grants while System Settings kept showing the toggle ON (the
-   pane displays the record, not whether it applies). A real identity gives
-   the binary a designated requirement of identifier + certificate chain
-   (verified on this host: `identifier "ck-subc" and anchor apple generic and
-   certificate leaf[subject.CN] = "Apple Development: ..."`), which SURVIVES
-   REBUILDS. Grants die once at the ad-hoc-to-identity transition, then never
-   again from a rebuild. Certificate renewal preserves the subject CN, so the
-   requirement survives renewal too.
+2. USE A REAL IDENTITY FOR REBUILD-STABLE TCC GRANTS.
+   Ad-hoc signing pins TCC grants to a cdhash; identity signing instead supplies a stable designated requirement based on the identifier and certificate chain, which survives rebuilds and certificate renewal preserving the subject CN.
 
 3. THE IDENTIFIER IS THE DEPLOYED NAME, NOT THE BUILT NAME.
    Read the name from the launch configuration (`subc.jsonc` `program`), not
@@ -58,33 +43,15 @@ environments.
 
 6. STAGED AND PLACED ARE BYTE-IDENTICAL.
    Because signing happens at stage and placement is a plain copy, whole-file
-   SHA-256 is a valid placement check. Identity signing is deterministic on
-   this host (measured under v2 adoption: two independent signings of one
-   binary produce identical bytes), preserving the property v1 measured for
-   ad-hoc. An artifact hash published for verification is valid ONLY paired
+   SHA-256 is a valid placement check. An artifact hash published for verification is valid only paired
    with the exact signing command that produced it; any re-sign invalidates
    previously published hashes and requires republication to every verifier.
 
-7. FIRST-EXEC ASSESSMENT IS PER FILE, NOT PER BUILD (measured at v2
-   adoption): Gatekeeper assesses a newly-signed binary on ITS first exec —
-   staged ck-models cost 22.5s then 3ms; the byte-identical PLACED copy of
-   ck-fusiform cost 15.4s on its own first exec even though the staged copy
-   had been warmed. A copy at a new inode pays the toll again. Therefore the
-   warm-exec ladder step runs ON THE DEPLOY PATH after placement — warming
-   the staged artifact buys the placed file nothing — and a multi-second
-   first exec inside a supervisor health window reads as a failed start (a
-   deployment failure that never recurs, the worst kind to debug).
+7. FIRST-EXEC ASSESSMENT IS PER FILE, NOT PER BUILD.
+   A newly signed copy at a new inode may pay Gatekeeper's first-exec cost even when its byte-identical staged source was warmed; warm execution therefore runs on the deployed path after placement, outside the supervisor health window.
 
-8. ROLLOUT AND THE TRANSITION COST, STATED HONESTLY.
-   Each binary moves to the identity at its NEXT NATURAL PLACEMENT — no
-   fleet-wide re-sign wave (a re-sign wave would orphan every TCC grant at
-   once and invalidate every published hash for no operational win). The
-   FIRST placement of a TCC-dependent binary under the identity orphans its
-   grants one final time; that re-grant is a named ladder step for that
-   placement. Ad-hoc remains valid for binaries not yet transitioned and for
-   throwaway/test artifacts; a gate consumer that requires the identity binds
-   v2 and checks the certificate authority in `codesign -dv` output, not just
-   the identifier.
+8. THE TRANSITION REQUIRES AN OPERATOR RE-GRANT.
+   The first identity-signed placement of a TCC-dependent binary orphans its prior ad-hoc grants, so re-grant is a named placement step; ad-hoc signing remains valid for untransitioned and throwaway artifacts, while a v2 consumer checks the certificate authority as well as the identifier.
 
 9. VERIFICATION INSTRUMENTS.
    LC_UUID (`dwarfdump --uuid`) identifies a (commit, path, toolchain) triple

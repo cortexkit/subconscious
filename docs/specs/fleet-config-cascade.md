@@ -1,13 +1,8 @@
 # Fleet Config Cascade (auto-approval and every future gate)
 
-Status: CO-SIGNED and build-approved (Ufuk, ask_639e782a). Resolver op and
-consumer helper are LIVE and integration-proven against each other; parking
-and revision_bump push are the next prefrontal slice.
+The configuration resolver operation and shared client helper implement the scope and verdict rules below.
 
-Ufuk's requirement: fleet config gates are settable at
-GLOBAL > WORKSPACE > PROJECT > ALFONSO with override at each level, one common
-mechanism for every module enforcing any gate (auto-approval is the first
-consumer, not the shape). Plexus is a consumer, not the designer.
+Fleet config gates use GLOBAL > WORKSPACE > PROJECT > ALFONSO with override at each level and one common mechanism for every enforcing module.
 
 ## Roles
 
@@ -23,12 +18,7 @@ consumer, not the shape). Plexus is a consumer, not the designer.
   generation across all scopes; any policy write bumps it, so push
   invalidation and cache watermarks are the same number. It holds agent
   identity, already stamps admission facts modules trust (cerebellum's
-  `sessionKind`), and queries entorhinal for workspace/project membership, so
-  the hierarchy has exactly one home. Working precedent for the whole shape,
-  cited as evidence rather than argument: plexus
-  `crates/plexus-core/src/github_identity.rs` already fetches prefrontal's
-  read-only `agent.github_identity` fail-closed — enforcer-initiated, no
-  caller-carried claims.
+  `sessionKind`), and queries entorhinal for workspace/project membership, so the hierarchy has exactly one home.
 - **subc** owns TRANSPORT + STALENESS: revision-stamped verdicts, TTL floor,
   push-on-change over the existing push lane for live caches, and ONE shared
   consumer helper (`subc-client-rs` resolve-with-cache) so the fleet gets a
@@ -37,7 +27,7 @@ consumer, not the shape). Plexus is a consumer, not the designer.
   subject principal, project root. No ontology import — if a mechanism makes a
   consumer model workspaces, the cascade is in the wrong layer.
 
-## Constraints (settled, argued in pm_3145409b / pm_9c0ea844)
+## Constraints
 
 1. **The enforcer initiates the resolution.** A cascade verdict arriving as a
    claim on a request is forgeable by anything that can reach the enforcer; a
@@ -49,17 +39,11 @@ consumer, not the shape). Plexus is a consumer, not the designer.
      a human appears (queues work, does not drop it).
    - UNATTENDED RECURRING work (pollers) treats unreachable as TRANSIENT:
      no park, no suspend, no cursor advance; existing backoff absorbs it.
-     A poller that parks per tick manufactures a wall of stale near-identical
-     asks nobody will action — the 875-of-877 non-alarm gap-row class that
-     trains dismissal. Both arms are fail-closed; only one mints an artifact.
+      Neither caller type executes the action without a verdict; only attended callers create a durable pending request for a human decision.
 3. **Bounded call, measured number.** The resolve call carries BOTH a p99
    target and a hard timeout (a p99 target is not a timeout). The timeout is
    ENFORCED BY THE SHARED HELPER in subc-client-rs, not by each consumer, so
-   five consumers cannot invent five timeout behaviors around one op. Latency
-   is measured and published with the op, not promised: expectation is p50
-   <5ms daemon-local (wire floor ~0.3ms measured), steady state zero round
-   trips under the TTL cache. Dispatch paths sit under supervisor deadlines;
-   no unbounded inline dependency.
+    consumer timeout behaviors. A cache hit within its TTL makes no resolver round trip; dispatch paths still obey supervisor deadlines and admit no unbounded inline dependency.
 4. **The push lane must never carry correctness** — stated as a constraint,
    not a description, because it erodes: the moment any consumer skips a fetch
    because a push said "nothing changed", the restart-catch-up-by-construction
@@ -86,11 +70,7 @@ closed default) and `deny_unknown_domain` (undeclared-domain marker);
 `revision` is the CURRENT global generation at resolve time, never the matched
 rule's write stamp. The op serves on the resolver's MANAGEMENT SURFACE.
 
-Lesson pinned with the contract, from three integration drifts (subject
-encoding, request envelope, route plane) that field-name prose never covered:
-PRE-COMMITTING FIELD NAMES IS NOT PRE-COMMITTING THE CONTRACT — encodings,
-envelopes, vocabularies, and planes pin only as producer-real bytes, and a
-build-local fake must mirror the CONVENTION, not the draft that invented it.
+The producer's fixture above pins the encoded bytes, envelope, vocabulary and route plane because its requests run against real dispatch; a local test stub must reproduce those served shapes, not merely copy the field names.
 
 ## Named anti-pattern: materializing the cascade into consumer rows
 
@@ -129,8 +109,3 @@ Gate namespace: freeform dotted ids namespaced by consumer module
 (`plexus.github_write`), no registration ceremony. An unresolvable or
 policy-less gate resolves to the DOMAIN'S DECLARED DEFAULT — closed for
 approval domains — so an unknown gate is safe by construction.
-
-## Process
-
-Ufuk reviews the assembled spec before anything is built; the doc routes to
-him at co-sign time.

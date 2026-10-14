@@ -59,8 +59,8 @@ terminals, so the daemon limits their size and character set at its boundary.
 `supervisor.provenance {}` reads the whole box;
 `supervisor.provenance { module_id }` reads one module.
 A consumer's own documentation about which subc version it runs is not provenance;
-the `supervisor.provenance` declaration is. See rows 557 and 558 of
-`docs/hunting-loop-briefing.md` on present-tense claims about path dependencies.
+the `supervisor.provenance` declaration is. Check path dependencies against actual
+source rather than inferring the running version from lockfiles.
 
 On Linux, running-image evidence is SHA-256 over open handles for `/proc/<pid>/exe`
 and the captured spawn path. On macOS it is a spawn-inode comparison only, weaker
@@ -223,7 +223,7 @@ namespaces; per-op lines for the big ones, one line for the rest.
 
 **work.* (27)** — work graph: `create`, `get`, `list`, `children`, `add_dep`,
 `deps`, `deps_from`, `child_rollup`, `list_ready`, `is_ready`, `claim`,
-`set_status`, `mint_graph` (campaign → graph), `close_epic`,
+`set_status`, `mint_graph` (stored task plan → graph), `close_epic`,
 `cancel_campaign_item`, `stamp_merged`, `settle`, `restamp`, `claim_dispatch`,
 `dispatch_intent`, `mark_dispatch_launched`, `link_execution`, `executions`,
 `resolve_alias`, `list_scoped`, `show_composite`, `delivery_snapshot`.
@@ -266,7 +266,7 @@ registration/liveness (`register_provider`, `heartbeat_provider`,
 `count_inbox`, `get_inbox_message`, `discard_message`, `mark_delivery_failed`,
 `reset_claim`.
 
-**init.* (12)** — seat bootstrap and head-session handoffs: `get_state`,
+**init.* (12)** — agent bootstrap and head-session handoffs: `get_state`,
 `resolve_phase`, `claim`, `save_global`, `hire_head_with_handoff`, handoff
 get/list/deliver/attempt/claim/fail ops.
 
@@ -279,7 +279,7 @@ schedule set/delete/list, `fires_list`, `fire_ack`, `create`, `author`.
 **policy.* (6)** — fleet config cascade: `resolve`, `set`, `delete`, `list`,
 `park`, `subscribe` (held stream; `revision_bump` pushes).
 
-**athena.* (6)** — consult/campaign engine: `consult`, `campaign_raw`,
+**athena.* (6)** — consultation and task orchestration: `consult`, `campaign_raw`,
 `list_consults`, `get_consult`, `spec_status`, `cancel`.
 
 **attachment.* (4)** — chunked upload: `begin`, `append`, `status`, `commit`.
@@ -300,7 +300,7 @@ Singles: `gh.route` [m] (governed GitHub verb routing), `harness.capabilities`
 [q] (fleet idleness source), `comment_clarity.extract` [q].
 
 **Tools (3)**: `ask` (worker → parent blocking question), `record_evidence`,
-`record_learning` (campaign evidence/learning capture).
+`record_learning` (workflow evidence/learning capture).
 
 ## prefrontal-host:* (one per live host session; 10 ops each)
 

@@ -4,16 +4,6 @@ Implements §2/§3 of `docs/subc-mcp-gateway-design.md` for the generic-MCP-host
 path. Scope: `crates/subc-mcp` only. subc-core is untouched (thin-core §5 of the
 design doc holds).
 
-v2 incorporates the Oracle gate findings (bg_284e68fb): harness identity moved
-off `clientInfo.name` onto the existing trusted `--harness` flag, a normative
-raw-config schema + monotonic project-tier merge, search-mode dispatch pinned to
-a private binding table, meta-tool name reservation, the catalog-liveness
-exception, zero-tool provider route drop, and a concrete default-deny mechanism.
-v3 folds the re-gate (bg_03eb1252): schema aligned with the shipped
-`RawGatewayConfig` spelling and shapes, explicit null semantics, unknown-field
-rejection stated as an implementation requirement, project-tier `refresh`
-dropped, collision semantics corrected to the shipped whole-attach fail-closed,
-and monotonicity defined over the provider-callable set.
 
 ## 1. What v1 builds
 
@@ -130,7 +120,7 @@ global baseline is fully composed:
   already enabled in the baseline.
 - `tools.overrides.<t>.description`: DROPPED at project tier entirely (WARN).
   An in-repo file rewriting model-facing tool descriptions is a prompt-injection
-  channel (Oracle finding; same class as AFT dropping privileged fields from
+  channel (the same restriction applies when AFT drops privileged fields from
   project config).
 - `namespace`: DROPPED at project tier (renaming affects collision handling and
   model-facing names — identity-adjacent, global-only).
@@ -163,7 +153,7 @@ The RESOLVED POLICY is computed once at shim-session attach (the existing
 `attach_session` → config read → `desired_session_from_catalog` flow already
 does this — v1 formalizes it) and frozen for the session.
 
-### 5.2 The liveness exception (explicit, Oracle S5)
+### 5.2 The liveness exception
 
 POLICY is frozen; LIVENESS is not. Catalog changes (provider registers,
 provider GOODBYE/dies) continue to mutate the served surface immediately and
@@ -198,7 +188,7 @@ they become a PENDING change applied per the session's `refresh` mode:
 When the resolved mode is `search`:
 
 - `tools/list` returns EXACTLY two tools: `tools_search` and `tools_invoke`.
-- **The outer `tools/call` dispatch accepts ONLY those two names** (Oracle S6).
+- **The outer `tools/call` dispatch accepts ONLY those two names**.
   The resolved per-tool bindings move to a PRIVATE table reachable only through
   `tools_invoke` — a direct `tools/call` on a resolved tool name returns the
   same error as a nonexistent tool. No bypass.
@@ -213,7 +203,7 @@ When the resolved mode is `search`:
   `invalid_params("unknown tool '<name>'")` error (§8: "indistinguishable"
   means this exact single error path, not a family of similar messages).
 
-### 6.1 Meta-tool name reservation (Oracle S7)
+### 6.1 Meta-tool name reservation
 
 `tools_search` and `tools_invoke` are RESERVED exposed names in every mode.
 The collision pass treats a provider tool resolving to either name as a
@@ -223,7 +213,7 @@ the session on any exposed-name collision; this spec does not change that —
 the fix is the user renaming the provider namespace). The v2 text claiming
 per-tool exclusion was wrong about the shipped behavior and is retracted.
 
-## 7. Zero-tool providers get no route (Oracle S9)
+## 7. Zero-tool providers get no route
 
 If a provider's resolved callable tool set is empty (all tools policy-disabled
 or provider disabled), `desired_session_from_catalog` EXCLUDES it: no route is
@@ -243,7 +233,7 @@ route; v2 closes that.)
   Facade policy narrows on top; it never grants.
 - Collision handling stays fail-closed; meta-tool names reserved.
 
-## 9. Default-deny for agent-internal modules (Oracle S10)
+## 9. Default-deny for agent-internal modules
 
 The facade ships a built-in constant `FACADE_DEFAULT_DISABLED: &[&str] =
 &["magic-context", "llm-runner"]` — modules whose tool surfaces are
@@ -256,27 +246,7 @@ BEFORE the global tier merges. The GLOBAL tier may explicitly enable them
 This is a facade-local default, not a manifest change — revisit as a manifest
 capability flag (`facade_exposable`) if the list grows.
 
-Rationale for the two entries: `magic-context`'s `ctx_reduce` requires the
-shim-ephemeral → durable-session mapping that does not exist yet (the Mode-4
-convergence design); `llm-runner`'s session ops are consumer APIs, not tools.
-
-> STATE CLAIM, STALE AS OF 2026-07-31. The mapping SHIPPED: the shim carries a
-> wrapper-minted conversation token (`CK_INSTANCE_TOKEN`) and binds the session
-> verbatim, and `ctx_reduce` runs in production under `mode: "ack_only"` with
-> the reduction applied downstream from the completed provider response.
-> `magic-context` is enabled at the global tier in the live config, which is
-> exactly the escape hatch the paragraph above describes.
->
-> The DECISION is unchanged and still correct: these module IDs are
-> baseline-denied, and only the global tier may enable them. What rotted is the
-> OBSERVATION the decision was written around — a spec is frozen to preserve
-> reasoning, and reasoning does not rot the way state claims do. Marked here,
-> where a reader meets the stale sentence, rather than in a note at the end
-> that the misled reader never reaches.
->
-> `llm-runner` was also renamed to `broca` and no longer appears in the daemon
-> config under that name. The entry is kept as written because it is a
-> historical record of a gated decision; the current module ID is `broca`.
+These literal module IDs remain baseline-denied, and only the global tier may enable them; the list is not a census of current deployments.
 
 ## 10. Tests (gate)
 

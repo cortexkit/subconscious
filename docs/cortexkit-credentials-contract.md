@@ -10,7 +10,7 @@ same defect as a digest printed instead of written: a fact that does not sit
 next to the thing it describes goes stale silently and reads as
 authoritative. Read the claustrum copy; do not restore content here.
 
-Error-class vocabulary changes are announced by CKCRED the same way wire
+Error-class vocabulary changes are announced by the Claustrum maintainer the same way wire
 field changes are (CONSUMER-IMPACT), per the bump-announcement contract
 requested by synapse's vault client (conservative-fallback consumers need
 the announcement to keep unknown-class handling optimal).

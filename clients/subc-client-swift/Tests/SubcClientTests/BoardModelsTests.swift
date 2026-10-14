@@ -232,6 +232,33 @@ final class BoardModelsTests: XCTestCase {
         XCTAssertEqual(rotten.rotten, true)
     }
 
+    /// Items carry four optional fields: ETA, last change, follow-up and note
+    /// reference. They decode from the snake_case wire and from camelized
+    /// replies; an item without them stays nil rather than defaulting.
+    func testLaneItemOptionalFieldsDecodeInEitherSpelling() throws {
+        let snake = Data(#"""
+        {"id":"it_1","text":"Ship it","state":"active","eta_ms":1700000900000,
+         "changed_at_ms":1700000800000,"follow_up":"Rerun CI","note_ref":"note:42"}
+        """#.utf8)
+        let item = try JSONDecoder().decode(BoardLaneItem.self, from: snake)
+        XCTAssertEqual(item.etaMs, 1_700_000_900_000)
+        XCTAssertEqual(item.changedAtMs, 1_700_000_800_000)
+        XCTAssertEqual(item.followUp, "Rerun CI")
+        XCTAssertEqual(item.noteRef, "note:42")
+
+        let camelized = try JSONSerialization.data(withJSONObject: JSONKeyNormalizer.camelize(
+            try JSONSerialization.jsonObject(with: snake)))
+        XCTAssertEqual(try JSONDecoder().decode(BoardLaneItem.self, from: camelized), item)
+        XCTAssertEqual(try JSONDecoder().decode(BoardLaneItem.self, from: JSONEncoder().encode(item)), item)
+
+        let bare = try JSONDecoder().decode(
+            BoardLaneItem.self, from: Data(#"{"id":"it_2","text":"Old","state":"pending"}"#.utf8))
+        XCTAssertNil(bare.etaMs)
+        XCTAssertNil(bare.changedAtMs)
+        XCTAssertNil(bare.followUp)
+        XCTAssertNil(bare.noteRef)
+    }
+
     /// A producer older than the V3 cut sends no `laneBlocks`; that is `nil`,
     /// distinct from an empty array.
     func testLaneBlocksAbsentDecodesAsNil() throws {

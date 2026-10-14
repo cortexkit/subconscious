@@ -1,7 +1,6 @@
-# `cortexkit-paths` — ProjectRootId canonicalization spec (v0, for AFT review)
+# `cortexkit-paths` — ProjectRootId canonicalization spec
 
-**Status:** draft for AFT-Alfonso review. Seeds the shared `cortexkit-paths` crate so subc and AFT canonicalize **byte-identically by construction** (one crate, not two algorithms reconciled by vectors). Vectors below are a regression guard on the shared code.
-
+The subc daemon and the AFT code-perception tool both use `cortexkit-paths` to turn project-root paths into the same canonical ID; the vectors below test that shared algorithm for regressions.
 ## Scope
 This crate owns exactly ONE transformation: **an already-resolved project-root path → a canonical `ProjectRootId`.** It is deliberately small and dependency-light: **no serde, no transport, no git.** Published to crates.io, cortexkit-neutral (AFT consumes it standalone pre-daemon).
 
@@ -44,13 +43,6 @@ Given a real existing dir `R` (canonical `Rc`):
 | 8 | (macOS) `/var/<existing>` | `/private/var/<existing>` |
 | 9 | `R/SUB` vs `R/sub` on case-insensitive FS, `SUB` the on-disk case | both → `Rc/SUB` (realpath stored case; no fold) |
 
-## Open for AFT
-- Confirm vector #9's exact expectation on your case-insensitive test envs (we expect realpath returns the on-disk stored case; flag if your platform observations differ).
-- Confirm the `NonExistentPath` reject is right for **all** ProjectRootId callers on your side at attach time (operation-target/create-file handling stays your layer atop `CanonicalPath`).
-- Any additional edge case from your ad-hoc canonicalization consolidation (P0) that should become a seed vector.
-
----
-
 ## DELTA 1 — Windows verbatim prefix (DECIDED, in-crate, `#[cfg(windows)]`)
 
 `std::fs::canonicalize` returns the **verbatim extended-length** form on Windows. The crate MUST normalize it to **non-verbatim** before producing the id — otherwise subc, AFT, and the harness walk-up all diverge on Windows and the by-construction parity breaks exactly where it is hardest to debug, and the verbatim prefix leaks into anything that keys/compares/displays the id:
@@ -66,15 +58,6 @@ Additional seed vectors:
 |---|---|---|
 | 10 | (Windows) `\\?\C:\<existing>` | `C:\<existing>` (verbatim stripped) |
 | 11 | (Windows) `\\?\UNC\server\share\<existing>` | `\\server\share\<existing>` (verbatim UNC stripped) |
-
-## Resolution status (AFT review — converged)
-
-- **DELTA 1 (Windows verbatim):** folded in above; AFT's `windows_non_verbatim_path` is the reference impl; lives in the shared crate, Windows-correct from v0.
-- **#2 NonExistentPath reject:** CONFIRMED correct for ProjectRootId at attach (a project root always exists at configure/attach). AFT's current root canonicalization uses a `canonicalize_or_normalize` fallback; switching ProjectRootId to reject is the right tightening. The normalize fallback stays AFT-side on `CanonicalPath` for operation-target/create-file paths.
-- **#9 case-insensitive stored-case:** matches AFT's assumption (realpath stored case, no fold). Provisionally confirmed; AFT adds a live-verified case-collision vector when the crate lands.
-- **#3 other edges:** none beyond Windows-verbatim. AFT routes its ~10+ scattered root-identity canonicalization sites through this crate during P0; operation/relative-path sites stay the AFT-side `CanonicalPath` layer.
-
-**Converged → crate creation proceeds.** (The "Open for AFT" section above is now resolved by this block.)
 
 ## DELTA 1 addendum — Windows drive-letter case (vector #12)
 

@@ -1,9 +1,6 @@
 # subc Authenticated Principal (wire-shape design note)
 
-Status: **CONFIRMED / wire-frozen** — AFT checked the shape against its 7-point
-consumer contract point-by-point (pm_b5d66d4d), all seven map; one AFT-side
-policy delta folded into §3 (absent principal → untrusted). Design basis:
-Option A.
+Status: **wire-frozen**. The schema below is the provider-visible principal contract.
 
 ## 1. What the principal is (and is not)
 
@@ -15,8 +12,8 @@ same-user key possession is the accepted floor). Its real job: distinguish
 containable) from **first-party-direct** (host plugins, runner) — attested by
 mechanisms that already exist (reserved module ids + launch nonces).
 
-Three consumers, one design: AFT Theme-2 trust enforcement, federation v3
-(blocker #5: caller-identity vs target-selection split), and the tool-surface
+Three consumers use this principal contract: AFT trust enforcement, federation's
+separation of caller identity from target selection, and the tool-surface
 policy's identity axis (docs/subc-mcp-gateway-design.md §2.4).
 
 ## 2. Wire shape
@@ -84,23 +81,23 @@ The principal's `module_id` is the daemon's supervised-module id, verbatim
 principal namespace — the subc.jsonc module id IS the vocabulary. Stable and
 documented; modules policy-map these strings.
 
-## 3. Module-side policy (AFT's, for confirmation)
+## 3. Module-side policy
 
-subc provides the fact; the module owns the mapping. AFT's stated policy:
+subc provides the fact; the module owns the mapping. The AFT tool module applies this policy:
 - `direct` → trusted (first-party host plugins; opencode/pi/runner equally).
 - `reserved:<id>` → per-id allowlist over daemon-spawned, spawn-attested module
   ids (trust `llm-runner`; UNTRUST `subc-mcp` — the facade is the remote-model
   choke point → containment/forced-restrict). The facade's attestation does not
   depend on a `reserved: true` config flag.
 - `unverified` → fail-closed (defensive backstop).
-- `principal` ABSENT → **UNTRUSTED (forced-restrict)** — AFT-confirmed delta:
+- `principal` ABSENT → **UNTRUSTED (forced-restrict)**:
   both sides are pre-release (no legacy daemon to be rollout-compatible with),
   and absent→trusted would turn a daemon bug that fails to stamp into a silent
   trust grant — the exact silent-downgrade class this design closes. Enforcement
   is module policy, so this costs the wire nothing; soften only if a real
   rollout-order constraint emerges.
 
-`harness` stays cosmetic (routing/storage-slug); AFT audits that nothing
+`harness` stays cosmetic (routing/storage-slug); providers must ensure that nothing
 trust-relevant keys off it when the principal lands.
 
 ## 4. SDK changes (attach-if-env-present)

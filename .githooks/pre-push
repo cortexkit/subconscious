@@ -35,7 +35,22 @@ if [ -n "$pushed" ]; then
   # declared workspace member and cargo metadata failed on a phantom, refusing
   # a correct push. Whole-tree costs a moment more and cannot rot.
   if git archive "$pushed" 2>/dev/null | tar -x -C "$tmp" 2>/dev/null; then
-    if ! (cd "$tmp" && cargo metadata --locked --format-version 1 >/dev/null 2>&1); then
+    # Bounded, and a timeout is reported as itself. cargo takes a global
+    # package-cache lock, so another cargo process stuck on a slow or
+    # unresponsive disk makes this call wait forever. Unbounded, the push hung;
+    # killed from outside, it was misreported as a lock mismatch.
+    # perl's alarm is portable where `timeout` is not installed; exit 142 is
+    # SIGALRM.
+    (cd "$tmp" && perl -e 'alarm shift; exec @ARGV' 120 \
+      cargo metadata --locked --format-version 1 >/dev/null 2>&1)
+    rc=$?
+    if [ "$rc" -eq 142 ]; then
+      echo "pre-push: cargo metadata did not finish in 120 s, so the lock check could not run." >&2
+      echo "          Another cargo process is probably holding cargo's package-cache lock," >&2
+      echo "          or a build folder's disk is not answering. Find it with:" >&2
+      echo "          ps -axo pid,etime,command | grep '[c]argo '" >&2
+      exit 1
+    elif [ "$rc" -ne 0 ]; then
       echo "pre-push: the pushed commit's Cargo.lock does not match its manifests (run cargo update -w or commit the lock)" >&2
       exit 1
     fi

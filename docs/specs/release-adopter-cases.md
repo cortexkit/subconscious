@@ -23,8 +23,7 @@ public provider call.
 `ready` means the row has a specified declaration, observable outcome, and
 future test name. `deferred-by-owner` identifies an unavailable case and the
 specific owner action required to complete it. `deferred-by-machine` identifies
-a specified behavior that the current machine cannot express; the completeness
-ledger records the missing mechanism. Every row has one of these explicit
+a specified behavior that the current machine cannot express; the case tables record the missing mechanism. Every row has one of these explicit
 statuses; no row is left unresolved or owner-gated without a recorded
 disposition.
 
@@ -34,18 +33,9 @@ disposition.
 | --- | --- | --- | --- | --- |
 | `synthetic-e2e-01` | `tests/fixtures/adopters/synthetic-e2e-01.release.jsonc` | After an interruption between an irreversible fake effect and its completion append, resume observes `present` evidence, records completion, and does not invoke that effect a second time. The train then completes. | `adopter_case_synthetic_e2e_01_reconciles_interrupted_train` | ready |
 
-## MC saga failure modes
+## Interrupted-release failure cases
 
-Rows supplied by the MC owner from the v0.40.1 eleven-attempt saga ledger
-plus the r1-r3 incidents, transcribed verbatim-in-substance and confirmed by
-the owner against this diff. Cross-cutting property recorded at the owner's
-request: modes 01, 05, 06, 07, 10, and 11 are all precheck-detectable and
-share one requirement — the machine must refuse BEFORE mutating anything.
-The saga's real cost was mutations (tags, version bumps, half-runs)
-interleaved with failures; holding all mutations behind a single
-journal-guarded commit point converts most of this table into cheap
-refusals. Declaration-feature needs per row are noted in parentheses after
-the effect.
+Cases `mc-saga-01`, `mc-saga-05`, `mc-saga-06`, `mc-saga-07`, `mc-saga-10`, and `mc-saga-11` inspect declared format, residue, sibling state, environment and tool requirements locally; they must refuse before mutation when those checks fail, as specified by their table rows.
 
 | Case ID | Declaration fixture path | Expected refusal or reconciliation effect | Eventual test name | Status |
 | --- | --- | --- | --- | --- |
@@ -61,13 +51,13 @@ the effect.
 | `mc-saga-10` | `tests/data/adopters/mc-saga-10.release.jsonc` | Declared tool pins are carried by `precheck-tool-pinning` parameters, while artifacts retain real identity channels. A missing exact pin emits `TOOL_UNPINNED`; an observed version mismatch emits `TOOL_MISMATCH`; both name the tool and append `Refused` before mutation. | `adopter_case_mc_saga_10_unpinned_tool_refuses` | ready |
 | `mc-saga-11` | `tests/data/adopters/mc-saga-11.release.jsonc` | Declared process, port, foreign-lock, and temporary residue checks implement both arms: unclearable residue emits typed `RESIDUE_PRESENT` and mutates nothing; clearable residue is removed and recorded as `ResidueSwept`. Current-live journaled paths are passed over. | `adopter_case_mc_saga_11_residue_swept_or_refused` | ready |
 
-## ALF no-tag train
+## No-tag train
 
 | Case ID | Declaration fixture path | Expected refusal or reconciliation effect | Eventual test name | Status |
 | --- | --- | --- | --- | --- |
 | `alf-notag-01` | `tests/fixtures/adopters/alf-notag-01.release.jsonc` | The no-tag train is keyed by its intended commit, validates the embedded build-SHA evidence during reconciliation, and completes without a tag, push, publish, or machine-owned placement action. | `adopter_case_alf_notag_01_reconciles_embedded_build_sha` | ready |
 
-## AFT independently parameterized `ci_watch` instances
+## Independently parameterized `ci_watch` instances
 
 The two rows intentionally use separate declaration files and independent
 instance identities. Sharing a workflow result, run ID, selector, or rerun
@@ -78,19 +68,8 @@ budget between them is not coverage for either row.
 | `aft-ciw-01` | `tests/fixtures/adopters/aft-ciw-01-pre-tag-tests.release.jsonc` | The pre-tag Tests workflow is selected at the intended release-commit SHA, journals its own run ID, and applies only its declared rerun budget before the tag trigger is admitted. | `adopter_case_aft_ciw_01_keeps_pre_tag_watch_independent` | ready |
 | `aft-ciw-02` | `tests/fixtures/adopters/aft-ciw-02-post-tag-release.release.jsonc` | The post-tag release workflow is selected by its tag ref, journals a distinct run ID, and applies only its own declared rerun budget; its state cannot reconcile the pre-tag watcher. | `adopter_case_aft_ciw_02_keeps_post_tag_watch_independent` | ready |
 
-## Completeness ledger
+## Support status
 
-| Inventory | Required rows | Listed rows | Deferred-by-machine rows | Deferred-by-owner rows | Unresolved owner-gated rows |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Synthetic end-to-end train | 1 | 1 | 0 | 0 | 0 |
-| MC saga failure modes | 11 | 11 | 2 | 0 | 0 |
-| ALF no-tag train | 1 | 1 | 0 | 0 | 0 |
-| AFT `ci_watch` instances | 2 | 2 | 0 | 0 | 0 |
-| **Total** | **15** | **15** | **2** | **0** | **0** |
+The required inventory has 15 cases: `synthetic-e2e-01`, eleven `mc-saga-*` failure cases, `alf-notag-01`, and two independent `aft-ciw-*` watchers. The machine lacks two specified mechanisms, so `mc-saga-03` and `mc-saga-09` have status `deferred-by-machine`, not completed coverage.
 
-### Deferred-by-machine detail
-
-| Case ID | Missing machine behavior |
-| --- | --- |
-| `mc-saga-03` | Box-gate-exclusive scheduling or locking for a load-classified leg. Per-leg retry attempts and their output artifacts are implemented. |
-| `mc-saga-09` | Post-CI artifact-manifest reconciliation that emits `PUBLISH_INCOMPLETE` for a green zero-artifact run. |
+The load-flake case `mc-saga-03` already has per-leg retries and output artifacts but still needs a box-gate lock to exclude other load-heavy jobs. The skip-cascade case `mc-saga-09` still needs post-CI artifact aggregation that refuses `PUBLISH_INCOMPLETE` when CI is green but produces no artifacts.

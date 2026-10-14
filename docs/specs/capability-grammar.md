@@ -1,6 +1,6 @@
 # Capability grammar: requires / provides / must-never-reach
 
-Status: Not Built (spec r2 — revised against Athena panel ct_…2cfbac01e4f8)
+Status: not built; specification revision r2.
 Owner: subc (manifest + daemon checks), module owners (capability cuts + corpora)
 
 ## End state
@@ -47,7 +47,7 @@ transition path ranges would have given, without range semantics.)
 **Registry**: capability definitions live in
 `docs/capabilities/<name>/<version>/` in subconscious (card + corpus), one
 directory per version, immutable once referenced by any shipped manifest.
-The set of names is reviewed (room), not open-mint.
+Capability names require registry approval; modules cannot mint arbitrary names.
 
 ## 2. Manifest changes (subc-protocol)
 
@@ -231,8 +231,7 @@ it in its own CI. `ck capability verify <name>/<version> --against
 ## 6. Capability cuts
 
 Per module, the owner names the umbrellas and assigns consumer-facing ops;
-module-private ops stay outside. Central first pass:
-`docs/capabilities/DRAFT-cuts.md` (owners correct).
+module-private ops stay outside.
 
 Three granularity tests, applied in priority order **T > C > R** (transaction
 integrity is structural, consumer cohesion is evidence, replacement shape is
@@ -284,14 +283,13 @@ re-triggers the transaction test on every write that touches both.
 6. SDK `resolve_provider(s)` per card cardinality.
 7. Capability registry scaffold + first corpora (claustrum, astrocyte,
    usage-fact-producer) + `ck capability verify`.
-8. Owner drafting round for remaining cuts; opportunistic join migration.
+8. Maintainers define remaining capability cuts and migrate shared joins as needed.
 
 ### Candidate deny-edges (recorded as they surface)
 
 - `condition-runner` → `credentials-provider/v1` (keyless-by-design; the
   founding edge — one layer of three, per §3's honest scope).
-- display-producing modules → `federation-transport/v1`: CALLO's streaming-room
-  boundary (2026-08-23) — display frames may reach the fed hop only via the
+- display-producing modules → `federation-transport/v1`: display frames may reach the federation hop only via the
   producer-coalesced ring, because a raw display lane at fast-provider cadence
   (measured 20x spread, 67 records/s) becomes per-record crypto and per-message
   relay cost. A deny-edge makes "cannot be constructed" a route.open check
@@ -308,16 +306,16 @@ re-triggers the transaction test on every write that touches both.
   payload it seals, so its capability card carries the obligation "refuse
   display-kind payload classes" as a corpus-pinned refusal vector. One
   boundary, two enforcement points, split by what each layer can see.
-  CALLO's vacuity precision (accepted): no display-kind payload class exists
+  No display-kind payload class exists
   on the fed wire today, so a refusal vector authored NOW cannot fail and
   would read as satisfied forever. The obligation is therefore written as a
   condition on the future change, not a check on current code: whoever adds
   display vocabulary to fed-wire adds the ingress refusal IN THE SAME CHANGE,
-  with a vector that fails if the refusal is absent. CALLO holds a matching
-  trigger on their side keyed to display/streaming frame kinds appearing in
-  their wire spec.
+  with a vector that fails if the refusal is absent. The federation transport
+  implementation must enforce the same trigger when display or streaming
+  frame kinds appear in its wire specification.
 
-## 9. Open questions (remaining after panel r2)
+## 9. Open questions
 
 - `--manifest` emission for modules whose manifest is partly runtime-computed
   (AFT's tool surface varies by config): lint against the static core only?
@@ -325,17 +323,6 @@ re-triggers the transaction test on every write that touches both.
   only with a concrete third-party bridge use case.
 - AFT's undo-record seam: merge agent-tools-core + file-safety, or keep the
   three-way cut and pin the undo-record contract as a join key with its own
-  corpus vectors (AFT owns the call; decide before corpora are minted).
+  corpus vectors (the tool-provider maintainer decides before corpora are minted).
 - Runtime attestation of corpus-pass evidence (deferred; revisit when a
   capability card demands it).
-
-## Panel provenance
-
-r1 reviewed by Athena panel ct_00000000-0000-4000-98ce-2cfbac01e4f8
-(2026-08-23, 4 seats). r2 incorporates: the manifest field collision (verified
-at manifest.rs:19 before amending), three-state evaluation with settle
-condition and state carve-outs, episode-scoped alarm dedup, cache
-lifetime/keying split, honest deny-edge scope + census re-evaluation,
-capability-squatting defenses, exact-immutable versioning, card-declared
-cardinality, T>C>R test ordering with the private-coupling clarification, and
-the decidable single-sibling rule.

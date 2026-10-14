@@ -1,71 +1,17 @@
 # Launch nonce over an inherited descriptor
 
-Status: design r7, steps 1 and 2 built (subc-protocol 0.26.0, subc-os 0.1.3). r6 added rows T4
-and T6 of the Athena review of extensibility r7.2. r5 added
-the review's roster and staging and the operator's ruling on the Thalamus gateway. r4 added each seat's signing measurements. r3 added the throwaway spike
-recorded in `launch-nonce-spike-results.md`. Nothing here is built; the extensibility design (magic-context
-`ck-extensibility-design-r7.2.md`, sections 4.9 and 18) makes it a stage-2 prerequisite, and it
-waits on the operator's approval of that design as a whole.
 
-## 1. Why
+## 1. Boundary and signing requirements
 
-Every subc-wire module gets a launch nonce at spawn, and any connection presenting it is
-admitted as `reserved:<module_id>` (`spawned_consumer_authorized`, supervise.rs). The daemon
-hands it over in the environment (`command.env(SUBC_LAUNCH_NONCE_ENV, nonce)` in
-`apply_wire_spawn_args_for_role`). On macOS a same-user process can read another process's
-initial environment (`ps eww`, `sysctl KERN_PROCARGS2`), and AFT measured that its Seatbelt
-profile does not stop that read from an agent shell, even with `process-info*` and
-`kern.procargs2` denied. So a prompt-injected agent can take any module's nonce with two commands
-and act as that module, including `reserved:callosum`, which is what the operator-authority rule
-rests on.
+To prevent another process running as the same user from taking a module's launch identity, deliver its nonce over the inherited pipe (§2) instead of the readable environment, and sign every module and `ck-subc` with hardened runtime and no `com.apple.security.get-task-allow` entitlement so debuggers cannot read the pipe or process memory; neither measure alone suffices.
 
-**The descriptor alone is not the boundary; debuggability is.** The spike measured it: with
-Developer Mode on, `lldb -p <module pid>` from another same-user shell attached with no prompt and
-`read(3, ...)` returned the exact nonce before the module had read it. After the module reads it,
-the nonce sits in its memory for the life of the process, where a debugger reads it just as easily.
-A copy of the same binary signed with hardened runtime refused the attach. No installed fleet
-binary is hardened today (all are `adhoc`, `adhoc,linker-signed` or unsigned), and `ck-subc` itself,
-which holds every module's nonce, is signed without hardened runtime.
+Hardened runtime restricts generated executable memory. JIT runtimes require the `cs.allow-jit` and `cs.allow-unsigned-executable-memory` entitlement exceptions; code generators that do not use `MAP_JIT` require the latter entitlement or an interpreter. Plain Rust binaries linking only system libraries require no such exception.
 
-So the boundary needs both halves:
-1. **The nonce is never in the environment,** which is readable without any debugger rights. That
-   is this note's descriptor handoff.
-2. **Every module binary and `ck-subc` are signed with hardened runtime and without
-   `com.apple.security.get-task-allow`,** so no same-user process can attach and read the pipe or
-   the process memory. That is a signing requirement in every module's release pipeline, checked
-   by the census (section 4) and by the placement gate.
+The placement smoke test must exercise capabilities requiring signing exceptions rather than relying on flags or `--version`, including guest execution, a JIT-bound loop, and dynamic-library loading where applicable.
 
-Neither half alone does anything against a same-user process. Whether an agent's Seatbelt profile
-blocks attach on its own was not tested; it is not relied on.
+A module requiring `cs.disable-library-validation` must verify a loaded dylib's SHA-256 against a pinned list and accept another path only through an operator setting fixed at spawn, never a runtime redirect.
 
-**What the signing rule is, precisely** (measured by each seat on copies of its own binary):
-- **The boundary is `runtime` present and `com.apple.security.get-task-allow` absent.** Other
-  hardened-runtime exceptions do not reopen attach: a copy with `cs.allow-jit` and
-  `cs.allow-unsigned-executable-memory` still refused `lldb`.
-- **Plain Rust binaries linking only system libraries need nothing else:** ck-subc, broca,
-  Magic Context, Thalamus, callosum, prefrontal-core and prefrontal-routing all ran normally with
-  `-o runtime` alone.
-- **JIT runtimes (a `bun build --compile` or node binary) need `cs.allow-jit` and
-  `cs.allow-unsigned-executable-memory`.** Without them nothing fails: `--version` works and the
-  engine silently runs without its JIT, 14x slower in a measured loop (condition-runner).
-- **Code generators that don't use `MAP_JIT` need `cs.allow-unsigned-executable-memory`, or an
-  interpreter.** Plexus links Wasmtime, whose Cranelift output is killed (SIGKILL) at the first guest
-  execution under hardened runtime with `allow-jit` alone. Plexus prefers Wasmtime's Pulley
-  interpreter, so it needs no entitlement.
-- **A flags check is not enough.** Every one of these failures passes `--version`, and Plexus's
-  appears only the first time a probe runs. So the placement gate runs a smoke test that exercises
-  each capability that needs an exception: one guest execution for Plexus, a JIT-bound hot loop for
-  a Bun or node module, an ONNX Runtime load for AFT, and the computer and browser desk checks for
-  Cerebellum. A binary with no exceptions gets its normal startup smoke.
-- **A module that loads a dylib not signed by its own team needs
-  `cs.disable-library-validation`, and that opens a third path**: the dylib is code running inside
-  the module, where the nonce is. AFT loads ONNX Runtime from a user-writable directory. Such a
-  module must verify the dylib's sha256 against a pinned list before loading it, and accept any
-  other path only from an operator setting fixed at spawn, so a running module cannot be
-  redirected. The same rule applies to any future module with a plugin or dylib load.
-
-What it does not close: `direct` (any same-user process holding the connection file) and keys
-stored in same-user files (the iOS simulator keys CALLO found). Those are separate decisions.
+This design does not restrict a `direct` consumer holding the connection file, or protect keys in files readable by other same-user processes.
 
 ## 2. Daemon
 
@@ -142,51 +88,16 @@ accessor in the same release as the SDK version that calls it: the HELLO line an
 per-route read (Broca has two sites in two crates, Plexus and Thalamus have a direct HELLO read
 plus SDK routes, Prefrontal has six direct readers). The module's test opens a route after HELLO
 has read from the descriptor. Because the accessor never clears the environment, a missed reader
-still works until step 4; `ck fleet lint` and the census are what find it before then.
+  still works while an environment copy is available; after the Unix producer removes that copy, a missed reader cannot rely on it, so lint and the census must verify migration before removal.
 
 Helper processes a module starts that must connect as the module (not agent children) get the
 nonce the same way the module did: over a one-read pipe the module creates and hands to the helper,
 read by the same accessor. Never in argv, never in the environment, never in a file, because all
 three are readable by a same-user process. `subc-os` exposes the handoff for modules to use.
 
-## 4. Census
+## 5. Reader migration and deployment verification
 
-A module's build provenance gains one field, with this exact shape:
-
-    "provenance": { ..., "launch_nonce_source": "fd" }
-
-- The value is `"fd"` or `"env"`, from the accessor's cached source.
-  Absent means the module did not say, and counts as not done.
-- It is a new optional field on `ManifestProvenance` in `subc-protocol`, serialized only when set.
-  The provenance struct decodes leniently, so an older daemon drops it and nothing breaks.
-- It is filled through subc-protocol's provenance builders, so a module that already declares
-  provenance through them (Plexus, Thalamus) gets it by passing the accessor's source, and the
-  census reads one field in one place. Because `ManifestProvenance` has public fields, adding
-  one breaks code that builds it as a struct literal; the builders are the supported path, and
-  the patch on the 0.18 line of subc-client-rs carries the builder change so the Thalamus gateway
-  can report `fd` without the newer manifest API.
-- A module whose provenance is only sent on some builds adds the field there: Broca adds
-  `launch_nonce_source` to its existing stamped-build provenance block. The
-daemon records it, and `ck --json provenance <id>` reports it per running module. The census reads
-the running images, never the locks: a module counts as done only when its live HELLO says `fd`.
-A module declaring no provenance counts as not done.
-
-The census also reads each running binary's code signature: a module counts as done only when its
-HELLO says `fd` AND its running image has the `runtime` flag and no `get-task-allow`, plus the two
-JIT entitlements if it embeds a JIT, and a module with `disable-library-validation` has a recorded
-dylib pin. `ck-subc` meets the same rule. The placement gate refuses a staged build that fails
-it, and refuses to replace a hardened module with an unhardened build.
-
-`ck fleet lint` flags any direct read or removal of `SUBC_LAUNCH_NONCE` in module source, so a
-module with its own frame loop cannot skip the accessor unnoticed. Readers already known in this
-repo: subc-client-rs (HELLO, `lib.rs`; route open, `consumer.rs`), subc-mcp (three sites),
-`ck-bus` (`credentials/vault.rs`), `mcp-stdio-adapter` (`attestation.rs`, which calls
-`env::remove_var` on it today and must stop), and `fake-aft-stub`.
-
-## 5. Rollout
-
-**What a process a module spawns sees, from step 2.** The daemon sets `SUBC_LAUNCH_NONCE_FD` for
-every wire module from step 2, so a module's own children inherit the variable:
+**Child inheritance after descriptor handoff.** The daemon sets `SUBC_LAUNCH_NONCE_FD` for every wire module, so a module's own children inherit the variable:
 - **A module that reads through the accessor** reads and closes the pipe, so a process it spawns
   inherits the variable without the pipe. That process's accessor refuses (`NotOpen` or
   `WrongPipe`), so its route opens carry no identity (they are `direct`) and a `serve()` in it fails
@@ -198,7 +109,7 @@ every wire module from step 2, so a module's own children inherit the variable:
   unread pipe along with the environment copy they already inherit today. That adds no exposure the
   environment copy does not already have, and it ends when the module switches.
 
-Readers first; the boundary exists only after the last step.
+Readers migrate before environment removal; a live boundary is asserted only after the deployment verification below.
 
 **Shipped in subc-daemon 0.28.0:** Unix supervised wire modules receive the nonce only
 through the pipe and `SUBC_LAUNCH_NONCE_FD`, including swap candidates.
@@ -214,36 +125,7 @@ Unix environment copy and no longer makes a module pending reload. The status
 wire field remains for one release, reporting `false` on Unix and `true` on
 Windows for compatibility; it is not a measurement of the running environment.
 
-**Roster.** The census covers every process the daemon spawns, read from the daemon's own spawn
-list (`subc.jsonc` and the live supervisor), never from a list written here. That includes
-ck-subc-mcp, ck-bus, condition-runner, Engram, Entorhinal, Claustrum and Cerebellum, and ck-subc
-itself for the signing half. A module added later joins the census by being spawned.
-
-**Staging, per the operator's ruling.** Steps 1 to 3 are the stage-2 track. Step 4 and the
-operator-authority rule move to stage 7, because the Thalamus gateway stays held until then on an
-SDK line that cannot read the pipe; the gateway's pipe switch and signing ride its stage-7 deploy.
-Until step 4, widening operations behave as they do today, and the note makes no boundary claim.
-1. Publish the accessor (`subc-os`, subc-client-rs, `@cortexkit/subc-client`), with patch
-   releases on lines modules are pinned to (the Thalamus gateway pins subc-client-rs 0.18.4).
-2. The daemon starts passing the descriptor as well as the environment variable.
-3. Every module adopts the accessor, is signed with hardened runtime, and is redeployed; so is
-   `ck-subc`. The census reads `fd` and hardened for all of them.
-4. The daemon stops setting `SUBC_LAUNCH_NONCE`, then relaunches every module once. A nonce
-   rotates on every respawn, so the relaunch makes every nonce ever delivered in an environment
-   dead: a process still holding one (a module started before the switch, or a helper it spawned)
-   can no longer present it. The final census then reads, for every running spawned process, that
-   its HELLO says `fd` and that `SUBC_LAUNCH_NONCE` is absent from its initial environment
-   (`KERN_PROCARGS2`). A module that still reads only the environment fails its HELLO with a named
-   refusal and does not start, the intended fail-closed result, and the census before this step is
-   what makes it not happen.
-5. The operator-authority rule goes into force.
-
-Step 4's Unix producer removal shipped in subc-daemon 0.28.0 after the live census
-found all 20 wire modules reading `fd` (19 using the rehearsal switch and Wernicke
-stripping the copy in its launcher). There is no longer a config rollback switch.
-Deployment must still relaunch every module and repeat the final census before
-asserting the operator-authority rule; shipping the producer change alone does
-not establish that live boundary.
+Deployment must relaunch every module and verify descriptor provenance, hardened-runtime signing, and absence of the Unix environment nonce for every running spawned process before asserting the operator-authority boundary; the Unix producer change alone does not establish it, and no config rollback switch remains.
 
 ## 6. Tests
 
@@ -252,7 +134,7 @@ not establish that live boundary.
 - Two readers in one process (HELLO, then an SDK route open) both get the value; the second never
   touches the descriptor.
 - The accessor leaves the process environment unchanged.
-- `ps eww` on a spawned child shows no `SUBC_LAUNCH_NONCE` once step 4 is on.
+- `ps eww` on a spawned Unix child shows no `SUBC_LAUNCH_NONCE` after environment removal.
 - A grandchild spawned after the module's first read gets no descriptor, and its accessor refuses
   by name; the spawn-before-read case is covered by the "call it first" lint.
 - A named but empty descriptor, a closed one, a non-pipe and a different pipe each fail with their
@@ -264,10 +146,3 @@ not establish that live boundary.
 - A same-user `lldb -p` on a module signed per section 1 is refused.
 - A JIT-embedding module signed without the JIT entitlements fails its startup self-test by name.
 - A module with a dylib pin refuses a replaced dylib.
-
-## 7. Separate defect found by the spike
-
-The daemon passes to modules every descriptor it inherited without close-on-exec (the spike's probe
-received the tool runner's descriptors 4 and 5). Under launchd the daemon inherits only 0 to 2, so
-production is likely unaffected, but a daemon started from a shell leaks whatever that shell held.
-The spawn should close every descriptor above 2 other than the handoff; that is a separate fix.

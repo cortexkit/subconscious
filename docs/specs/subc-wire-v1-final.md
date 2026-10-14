@@ -1,27 +1,5 @@
 # subc Wire v1 — Final Envelope Revision
 
-Status: DRAFT — pending blind Oracle gate, then flip-day build.
-Decided in channel `#subc-wire-v1-final` (all six seats: SUBC, AFT, MC, ALF, BROCA, FED + Ufuk), 2026-07-12.
-
-## 0. Why this revision exists, and why it is in-place
-
-Nothing public consumes the subc wire. Every consumer/producer is first-party
-(the supervised fleet + the three client libraries). This is therefore an
-**in-place revision of the v1 layout**, not a versioned migration: no dual
-codec, no version negotiation, no compatibility machinery. The whole fleet is
-rebuilt and restarted in one coordinated cutover (§9).
-
-This is the last free window: once a public consumer exists, the envelope is
-versioning-forever and in-place changes stop being possible. The round
-inventoried every seat's envelope-level needs (§8 records the negative space)
-so the layout is final.
-
-**Driver:** routing-audit BLOCKER — the daemon reuses a released module-local
-channel after the u16 cursor wraps; a late frame for a closed route can then
-misdeliver into a different tenant's route (cross-tenant body exposure, credit
-corruption). Client-side mitigations shrink the window; only a wire-level
-epoch eliminates the class.
-
 ## 1. Envelope layout
 
 Fixed **21-byte** header (was 17), little-endian:
@@ -40,9 +18,9 @@ Fixed **21-byte** header (was 17), little-endian:
   frozen-prefix invariant is preserved verbatim: any receiver of any future
   version can always read `len` and `ver`. This revision slots `epoch` between
   `channel` and `corr`; nothing moves inside the frozen prefix.
-- Channel stays **u16**. Decided on ALF's capacity fact (concurrent-live
+- Channel stays **u16**. Capacity is determined by concurrent-live
   routes per shared connection: tens–low hundreds realistic, low thousands
-  pathological — two orders under 65,536) plus the durable escape hatch that
+  pathological — two orders under 65,536, plus the durable escape hatch that
   channel space is per-connection (a hypothetical >65k shape shards to a
   second connection, zero wire change). u16 keeps the daemon's hot-path
   dispatch a flat O(1) array; u32 would force hashmap lookup on every relay
@@ -65,7 +43,7 @@ fails loud and named: `DecodeError::UnsupportedVersion { ver: 1 }` — an
 actionable "rebuild this binary" signal instead of a framing-corruption hunt.
 One constant, zero machinery.
 
-Two normative rules that make the tripwire actually fire (gate finding 6):
+Two rules enforce the stale-binary tripwire: an endpoint must reject a frame or HELLO that advertises a protocol version different from its compiled codec version.
 
 - **Prefix-first reads.** Every frame reader reads and validates the 5-byte
   frozen prefix BEFORE reading the remainder of the header. Normatively this
@@ -105,7 +83,7 @@ The first binding of any route slot gets epoch `1`.
 - The daemon owns all epoch counters, exactly as it owns channel allocation.
   Per connection (client side) and per endpoint (module side) it keeps a
   lazily-populated `slot → last_epoch` map.
-- **Epochs are minted at RESERVATION time, not commit** (gate finding 5):
+- **Epochs are minted at RESERVATION time, not commit**:
   when the daemon reserves the client/module channel pair for a
   `route.open`, it increments both slots' epoch counters and stores both
   epochs in the pending reservation (`PendingRouteBindRelay`). The epochs
@@ -191,7 +169,7 @@ The first binding of any route slot gets epoch `1`.
   module-control RPCs (whose completion path today ignores the stored
   deadline).
 
-### 3.2.1 Client API shape: the route handle (gate finding 4)
+### 3.2.1 Client API shape: the route handle
 
 Wire route identity is `(channel, epoch)`. Each SDK wraps it in an
 immutable `RouteHandle` that ADDITIONALLY carries an opaque, non-wire
@@ -235,7 +213,7 @@ fake-aft-stub, `ck`/`subc-probe`, Swift client) migrate to handles.
   copy the epoch of the frame they answer; a mismatched frame produces no
   Error at all).
 
-**Layer 2 — receiving endpoints** (gate finding 1, BLOCKER-driven): relay
+**Layer 2 — receiving endpoints:** relay
 validation alone is insufficient because forwarding is not atomic with the
 table lookup — the daemon snapshots the binding, releases the table lock,
 then enqueues; a release+rebind can interleave, so a frame validated against
@@ -315,7 +293,7 @@ so no new reservation can race into a connection that is being torn down.
 Escalation call sites retain the failing frame's epoch (carried on
 `RouteBinding`/`GoodbyeTarget`/`RouterError`).
 
-Direction-agnostic is load-bearing (AFT's pin, ALF concurring): reverse-lane
+Direction-agnostic validation is required: reverse-lane
 Requests (module→client elicitation/sampling, `execute_effect`) are validated
 identically at both layers — a consent prompt surviving a rebind onto a new
 epoch is a cross-tenant delivery. Pure-header frames (`Cancel`, `Goodbye`,
@@ -354,7 +332,7 @@ handled by epoch comparison —
 Rejecting all binds on installed channels is a defect: one dropped
 route-gone GOODBYE would wedge the slot forever on that endpoint.
 
-### 3.3.1 Route-referencing channel-0 operations (gate finding 3)
+### 3.3.1 Route-referencing channel-0 operations
 
 Any channel-0 payload that references a route by channel number must carry
 the epoch alongside, and the daemon validates the pair atomically against
@@ -464,18 +442,16 @@ waits for that phase.
   skip-tolerant; recovery is consumer-level (cursor replay / skip-and-log).
   Terminal frames (`StreamEnd`, `Error`, `Response`) are structurally never
   sheddable, so streams always end or the connection closes. Known
-  consumers: broca display-lane deltas (lossy by contract), ALF room hints
+  consumers: broca display-lane deltas (lossy by contract), Prefrontal room hints
   (design-lossy, poll-floor recovery), future WAN/Cortex-App telemetry
-  pushes. MC's 26GB shadow-mirror retention incident is the *rationale* for
-  daemon-level shed semantics existing, but the mirror lane itself is NOT a
-  consumer: it sends Request-shaped frames (which stay on client-side
-  bounded-queue discipline, already shipped) and the lane is temporary by
-  design. Request-shed is deliberately not offered — it would require
+  pushes. A mirror lane carrying Request-shaped frames is not a consumer of
+  these shed semantics: it stays on client-side bounded-queue discipline.
+  Request-shed is deliberately not offered — it would require
   synthetic-error machinery in the daemon.
 - `11` reserved-invalid — decode-rejected (`ReservedAdmissionClass`), same
   posture as priority `0b11`.
 
-Composition rule (BROCA's sentence, normative): the admission class governs
+Composition rule: the admission class governs
 **admission/shed only** and composes orthogonally with PRIORITY, which orders
 **within** a class. An expedited frame is ordered among expedited frames by
 PRIORITY. SHEDDABLE remains illegal outside `Push`/`StreamData` regardless of
@@ -503,101 +479,31 @@ ships with the shedding implementation, not with flip-day.
   `ReservedFlagBits` (bit 7 only), `ReservedPriorityBits`,
   `PureHeaderFrameWithBody`.
 
-## 7. Surface changes by artifact
-
-| Artifact | Change |
-|---|---|
-| `subc-protocol` | header codec 21B, `epoch` field, ver=2, flags field + decode errors, `RouteBind.epoch`, `RouteStatus.route_epoch` |
-| `subc-control` | `RouteOpen` response `route_epoch: u32`; `RoutePoll` request `route_epoch: u32` + response handle echo in every arm |
-| `subc-core` | per-slot epoch counters (connection + endpoint scoped), minting at reservation (`PendingRouteBindRelay` carries both epochs + client sink/version), synchronous commit-on-bind-ack under the write lock, epoch-fenced compare-and-remove release paths, epoch-fenced delivery-failure escalation + connection closing-mark, validation+rewrite in relay path, epoch fields on `GoodbyeTarget`/route-Error synthesis, `RouteStatus`/`RoutePoll` epoch validation + handle echo, allocator skip-live + retire-at-MAX, exact-version handshake |
-| `subc-transport` | prefix-first `read_frame` (`frame_io.rs` is the shared fixed-header reader: read+validate the 5-byte prefix, then the remaining header, preserving the body-size rejection before allocating `len` bytes) |
-| TS / Rust / Swift clients | envelope constants + codec; `RouteHandle {channel, epoch}` as the only route-scoped API currency (§3.2.1); endpoint-side ingress epoch validation + `(channel, epoch, corr)` in-flight keying (§3.3 layer 2); `routeOpen` epoch plumb; provider serve loop stamps + validates module-side epoch; call options expose an optional per-call admission class (default NORMAL — first consumer: synapse EXPEDITE on interactive embed queries) |
-| `subc-mcp` + all modules | rebuild against bumped crates; ALL bare-channel state in subc-mcp migrates to `RouteHandle`/`(channel, epoch, corr)`: `SessionInner.routes`/`ToolBinding`, `PendingKey (u16,u64) → (u16,u32,u64)`, `ReverseRelay.routes`/`pending`; `subc_reader_loop` performs endpoint validation before any dispatch; reverse replies retain the INGRESS handle (never look up the current epoch at reply time); fake-aft-stub, `ck`, `subc-probe` likewise; hand-rolled channel-0 matches: RouteBind/RouteOpen/RouteStatus/RoutePoll gain epoch fields (additive), golden JSONs regenerated |
-| Golden vectors | envelope/frame vectors regenerated for all three client languages; auth vectors unchanged (pre-envelope) |
-
-`RouteTarget` (Tool/Management surface discriminator) is untouched — FED's
-preservation ask; the fed forwarder needs no re-verification unless its
-encoding changes (it does not).
+`RouteTarget` and its tool/management discriminator encoding are unchanged by this envelope revision.
 
 ## 8. Considered and declined (the negative space, on record)
 
 - **Per-frame trust/principal** — bind-time stamping via RouteBind is
-  correct; per-frame invites confused-deputy bugs. (AFT)
+  correct; per-frame invites confused-deputy bugs.
 - **Tool-name / routing key in header** — body-opaque zero-deserialization
-  stays. (AFT, unanimous)
-- **Compression flag** — BINARY bit + body-level negotiation covers it. (AFT)
+  stays.
+- **Compression flag** — BINARY bit + body-level negotiation covers it.
 - **Transport-level sequence / stream-id / effect-id** — ordering is TCP +
   WAL-replay-on-resubscribe; exactly-once is durability-domain (intent logs,
   dedup ledgers); a header field cannot answer did-the-target-execute-before-
   dying and would be a second authority that can only agree or lie. The wire
-  stays honest at at-most-once. (BROCA, ALF twin discharges)
+  stays honest at at-most-once.
 - **Federation header space** — fed-frames are an independently-versioned
   Noise codec beside the loopback envelope; reserving subc-header space for
-  fed would re-couple the two versioning timelines. Structural no. (FED)
+  fed would re-couple the two versioning timelines.
 - **Channel u32** — capacity fact + per-connection sharding hatch + flat
-  dispatch; see §1. (Resolved against MC's initial lean; MC's correctness
-  concern is carried entirely by the epoch.)
+  dispatch; see §1. Epochs, not wider channel numbers, prevent stale-route delivery.
 
-## 9. Flip-day cutover runbook
+## 9. Version compatibility
 
-Mixed old/new-layout processes cannot parse each other; the cutover is
-all-at-once, batched with a natural OpenCode restart window (ALF's ask).
+A peer using the old header layout cannot parse the new 21-byte layout (§1). Endpoints provide neither a second decoder nor version negotiation: the frozen-prefix version byte must equal the endpoint's protocol version, or decoding refuses `UnsupportedVersion`.
 
-1. Land the full change set on master (protocol + core + clients + vectors),
-   CI green on all three OSes, cross-checked with the Windows clippy target.
-2. Rebuild every fleet binary from the same protocol rev. The synchronized
-   set is enumerated from the DAEMON'S LIVE ROSTER (`ck module list` +
-   connected consumers), never from design-round attendance. Hand-rolled
-   route-plane seams (not SDK-carried, self-identified via source audit:
-   AFT's module frame loop, broca's two seams, subc-mcp) land the
-   endpoint-validation layer + `(channel, epoch)` state migration in their
-   own code — EXCEPT MC's TS shadow-sender (hand-rolled today), which
-   instead DELETES its private framing and migrates onto
-   `@cortexkit/subc-client` at the flip, inheriting the validation layer
-   (hardening a temporary fail-open lane privately would be waste). As of
-   this writing (9 supervised modules): `ck-subc`,
-   `ck-subc-mcp`, `ck-aft` (hand-rolled serve loop + TS plugin transport +
-   test drivers — three seams),
-   `ck-mc`, `ck-thalamus` (live on every CC turn — a stale thalamus is a
-   USER-FACING outage, first-class participant), `ck-broca` (BOTH seams
-   hand-rolled, not SDK-carried: broca-subc consumer + broca-module-serve
-   loop each land the endpoint-validation layer and RouteHandle migration in
-   broca-owned code; broca-session/broca-run/ck-import rebuild with it;
-   same user-facing class as thalamus), `ck-quota` (hand-rolled codec:
-   direct subc-protocol/transport deps, own frame loop — no SDK seam; epoch
-   threading is module-owned, verified via its real-daemon round-trip),
-   `ck-credentials` (hand-rolled codec: module + CLI admin client + probe, direct protocol/transport deps — layer-2 validation self-implemented), `ck-alfonso-core`, `ck-alfonso-routing` — plus the
-   plugin-side consumers reloading at the OpenCode restart (alfonso TS
-   plugin, AFT plugin, MC shadow lane — the latter fail-open, batched free)
-   and the Swift client/chat app. Re-enumerate the roster at flip time.
-   "Rebuild before next deploy" class (not live-supervised, off-cycle safe
-   under the tripwire): fed module (dormant Hetzner box), `ck-synapse` (not
-   in prod subc.jsonc), cortexkit-e2e suite (repin + rebuild before its next
-   run). Peers rebuild their own repos (peer-owns-repo rule) against
-   the bumped crates; publish `subc-protocol` + `subc-transport` in lockstep
-   (republish-the-whole-chain rule) and `@cortexkit/subc-client` for the TS
-   consumers.
-3. Pre-staging grep for every module that constructs `ModuleManifest` by
-   hand: no `protocol_ver` LITERAL — declare `subc_protocol::PROTOCOL_VERSION`
-   instead. A stale hardcode is rejected at registration (loud, by design)
-   but surfaces one layer up as "module never appears in the catalog," which
-   costs a log dive to localize (FED hit this during staging). SDK-carried
-   HELLO is immune; the manifest field is author-supplied.
-4. Stage binaries at their deploy paths, signed (macOS codesign rule). Owners
-   with versioned staging rituals (AFT's `aft-stable`/`ck-aft` symlink +
-   NDJSON versioned cache) restage in the same window so a post-flip module
-   respawn cannot resolve a ver-1 binary.
-4. One window: stop daemon, swap binaries, `bootout`/`bootstrap` the launchd
-   service, restart OpenCode so plugin-side clients reload. Two-artifact
-   participants (alfonso: Rust modules + TS plugin; AFT likewise) must land
-   both artifacts in the same window — a half-flip is loud-down under the
-   ver tripwire (correct, but down until both sides match), never a silent
-   desync.
-5. Verify: fleet re-registers (`ck module list`), health table all-ok,
-   `UnsupportedVersion` counter zero (any nonzero = a stale binary, named by
-   connection), one end-to-end tool call + one broca turn + one MC transform.
-6. Swift client + chat app rebuilt; golden-vector parity suites green in all
-   three languages.
+A module constructing its HELLO manifest directly sets `protocol_ver` from `subc_protocol::PROTOCOL_VERSION`, the constant compiled with its frame codec, rather than hardcoding a number; otherwise registration can advertise a different layout from the bytes it sends.
 
 ## 10. Test plan (gate-relevant)
 

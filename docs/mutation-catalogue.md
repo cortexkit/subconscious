@@ -147,40 +147,6 @@ verification; runner availability and private-org billing capacity are required.
 GitHub-hosted runners without a host run directory record the absence of a
 daemon; an existing directory without observable UTC logs still fails closed.
 
-## Measured 2026-10-06 on the operator's Mac (heavily loaded)
-
-Catalogue: **17 rows**, with **13 CAUGHT and 4 HUB** verified outcomes.
-Recorded total replay wall time: **6198.526 s (103m 18.526s)**.
-Recorded full broad replay wall time: **1796.188 s (29m 56.188s)**.
-These are local observations, not CI budgets or a controlled speed comparison.
-
-The per-row broad times include each row's own fixture preparation, build and test
-phases. They total 1763.430 s; the session total also includes runner overhead.
-
-| Row | Broad seconds |
-| --- | ---: |
-| connection-file-owner-matches-reader | 54.639 |
-| external-path-dependencies-are-refused | 40.623 |
-| lock-descriptor-closes-at-first-exec | 118.827 |
-| lock-isolated-worker-is-nonvacuous | 109.637 |
-| nonce-handoff-survives-closed-stdio | 44.613 |
-| nonce-refuses-a-different-pipe | 33.816 |
-| privacy-disclaims-responsibility | 190.472 |
-| privacy-missing-symbol-fails-closed | 208.351 |
-| privacy-refusal-tag-is-required | 232.777 |
-| privacy-reports-only-confirmed-pid | 196.049 |
-| scope-principals-reject-unknown-constraints | 89.486 |
-| scope-records-reject-unknown-constraints | 69.193 |
-| sdk-dispatch-saturation-is-degraded | 81.607 |
-| sdk-health-bypasses-data-permits | 42.137 |
-| sdk-scope-close-is-terminal | 89.910 |
-| sdk-unknown-close-fails-closed | 45.780 |
-| wire-first-probe-failure-invalidates-ok | 115.513 |
-
-The command row's broad replay does not observe package breadth. No GitHub
-timing is recorded here; use a completed workflow's artifacts before setting
-an expected CI duration.
-
 ## Environment notes for fresh runners
 
 * The command row runs `cargo metadata` offline over the whole platform graph,
@@ -215,6 +181,3 @@ rows guarded by `supervise::privacy_exec_boundary_tests` in `subc-daemon`:
   `try_wait`, so the test cannot take the image-disappearance path instead.
   Its terminal record must contain only the module exit and exhausted crash
   budget, never a trampoline refusal.
-
-The measurements above were taken when the catalogue had 17 rows, before these two
-were added.

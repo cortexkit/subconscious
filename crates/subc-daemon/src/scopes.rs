@@ -269,6 +269,55 @@ pub(crate) struct BoundScope {
     pub(crate) owner: String,
     pub(crate) scope_ref: String,
     pub(crate) tag: ScopeTag,
+    // Shared by pending and committed forwarding entries, so moving a bind
+    // into a route never creates an idle window.
+    _lease: Arc<ScopeBindLease>,
+}
+
+#[derive(Debug)]
+struct ScopeBindLease {
+    binds: Arc<std::sync::atomic::AtomicUsize>,
+    released: std::sync::atomic::AtomicBool,
+    presence: Option<Arc<std::sync::atomic::AtomicBool>>,
+}
+
+impl PartialEq for ScopeBindLease {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.binds, &other.binds)
+    }
+}
+
+impl Eq for ScopeBindLease {}
+
+impl Drop for ScopeBindLease {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+impl ScopeBindLease {
+    fn release(&self) {
+        if !self
+            .released
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            self.binds.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
+impl BoundScope {
+    pub(crate) fn commit_presence(&self) {
+        if let Some(presence) = &self._lease.presence {
+            presence.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// Data dispatch can retain binding snapshots after a route closes. Release
+    /// usage at table removal rather than waiting for those snapshots to drop.
+    pub(crate) fn release_bind(&self) {
+        self._lease.release();
+    }
 }
 
 /// An admitted scoped open: what the bind is stamped with, and the tag the
@@ -394,12 +443,14 @@ pub(crate) struct ScopeDescription {
     pub(crate) stamp: Option<ScopeStamp>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 struct LiveScope {
     record: ScopeRecord,
     version: u64,
     /// `None` exactly when the record has no parent.
     parent_state: Option<ParentState>,
+    binds: Arc<std::sync::atomic::AtomicUsize>,
+    presence: HashMap<ConnectionId, Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl LiveScope {
@@ -496,6 +547,8 @@ pub(crate) struct ScopeTable {
     wall_clock: Arc<dyn Fn() -> u64 + Send + Sync>,
     #[cfg(test)]
     link_lookups: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    pub(crate) idle_check_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 fn reserved_module_id(principal: &Principal) -> Option<&str> {
@@ -535,6 +588,8 @@ impl ScopeTable {
             wall_clock: Arc::new(crate::clock::wall_now_ms),
             #[cfg(test)]
             link_lookups: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            idle_check_hook: None,
         }
     }
 
@@ -629,6 +684,9 @@ impl ScopeTable {
     /// owner's next connection to sync can take it.
     pub(crate) fn release_connection(&mut self, connection_id: ConnectionId) {
         for state in self.owners.values_mut() {
+            for scope in state.live.values_mut() {
+                scope.presence.remove(&connection_id);
+            }
             if state
                 .authority
                 .is_some_and(|authority| authority.connection_id == connection_id)
@@ -825,7 +883,32 @@ impl ScopeTable {
         }
         for (index, record) in scopes.iter().enumerate() {
             let held = state.live.get(&record.scope_ref);
-            match Self::record_refusal(record, held, &state.tombstones, owner_authorized, now) {
+            let refusal =
+                Self::record_refusal(record, held, &state.tombstones, owner_authorized, now)
+                    .or_else(|| {
+                        #[cfg(test)]
+                        if record.replace_only_if_idle {
+                            if let Some(hook) = &self.idle_check_hook {
+                                hook();
+                            }
+                        }
+                        held.filter(|held| {
+                            record.replace_only_if_idle
+                                && (record.scope_epoch > held.record.scope_epoch
+                                    || record.bind_proof_sha256 != held.record.bind_proof_sha256)
+                                && (held.binds.load(std::sync::atomic::Ordering::SeqCst) != 0
+                                    || held.presence.values().any(|present| {
+                                        present.load(std::sync::atomic::Ordering::SeqCst)
+                                    }))
+                        })
+                        .map(|_| {
+                            (
+                                error_codes::SCOPE_EPOCH_IN_USE,
+                                "routes are still bound to the live scope epoch".to_string(),
+                            )
+                        })
+                    });
+            match refusal {
                 Some(refusal) => {
                     refusals.insert(index, refusal);
                     if let Some(held) = held {
@@ -833,7 +916,9 @@ impl ScopeTable {
                     }
                 }
                 None => {
-                    next.insert(record.scope_ref.clone(), record.clone());
+                    let mut stored = record.clone();
+                    stored.replace_only_if_idle = false;
+                    next.insert(record.scope_ref.clone(), stored);
                 }
             }
         }
@@ -981,6 +1066,8 @@ impl ScopeTable {
                     record,
                     version,
                     parent_state,
+                    binds: held.map(|held| Arc::clone(&held.binds)).unwrap_or_default(),
+                    presence: held.map(|held| held.presence.clone()).unwrap_or_default(),
                 },
             );
         }
@@ -1578,6 +1665,52 @@ impl ScopeTable {
         let admission = self.attribute(opener, target_module, selector, owner_configured)?;
         self.check_bind_proof(selector)?;
         Ok(admission)
+    }
+
+    /// Reserve usage while the caller still holds the scope write lock used for
+    /// admission. The forwarding entry owns the lease until failure or close;
+    /// successful presence instead belongs to the client connection and survives
+    /// route close. A failed bind never promotes its provisional presence.
+    pub(crate) fn reserve_bind(
+        &mut self,
+        admission: &ScopeAdmission,
+        connection_id: ConnectionId,
+        hold_presence: bool,
+    ) -> BoundScope {
+        let held = self
+            .owners
+            .get_mut(&admission.owner)
+            .unwrap()
+            .live
+            .get_mut(&admission.stamp.scope_ref)
+            .unwrap();
+        held.binds.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        held.presence.retain(|_, present| {
+            present.load(std::sync::atomic::Ordering::SeqCst) || Arc::strong_count(present) > 1
+        });
+        let presence = if hold_presence {
+            if let Some(present) = held.presence.get(&connection_id) {
+                Some(Arc::clone(present))
+            } else if held.presence.len() < 8 {
+                let present = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                held.presence.insert(connection_id, Arc::clone(&present));
+                Some(present)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        BoundScope {
+            owner: admission.owner.clone(),
+            scope_ref: admission.stamp.scope_ref.clone(),
+            tag: admission.tag,
+            _lease: Arc::new(ScopeBindLease {
+                binds: Arc::clone(&held.binds),
+                released: std::sync::atomic::AtomicBool::new(false),
+                presence,
+            }),
+        }
     }
 
     /// Recheck only the proof constraint on the selected live epoch. Tag

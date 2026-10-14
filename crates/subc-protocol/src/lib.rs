@@ -127,6 +127,9 @@ pub mod error_codes {
     pub const SCOPE_BIND_PROOF_REQUIRED: &str = "scope_bind_proof_required";
     /// The proof is malformed or does not match the scope's hash. TERMINAL.
     pub const SCOPE_BIND_PROOF_MISMATCH: &str = "scope_bind_proof_mismatch";
+    /// An idle-only epoch/proof replacement found routes, admitted binds or
+    /// connected presence under the live epoch. Per-record refusal. TERMINAL.
+    pub const SCOPE_EPOCH_IN_USE: &str = "scope_epoch_in_use";
     /// Raised by a carrier, never by the daemon: the daemon does not advertise
     /// `scopes/v1`, so the carrier fails the call instead of opening an
     /// unscoped route.
@@ -233,6 +236,7 @@ pub mod error_codes {
                 | TARGET_AGENT_RUN_UNSUPPORTED
                 | SCOPE_BIND_PROOF_REQUIRED
                 | SCOPE_BIND_PROOF_MISMATCH
+                | SCOPE_EPOCH_IN_USE
         ) {
             return false;
         }

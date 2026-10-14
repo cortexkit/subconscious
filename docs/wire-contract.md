@@ -193,6 +193,11 @@ admission refusals in [`scopes.md`](scopes.md) section 5a, including
 `scope_bind_proof_required` and `scope_bind_proof_mismatch`. This is the list
 in `crates/subc-protocol/tests/golden/decision_tables.json`.
 
+`scope_epoch_in_use` is also terminal in that table. It is a per-record
+`scope.sync` / `scope.apply` refusal, not a `route.open` refusal: an idle-only
+epoch or bind-proof replacement found bound routes, in-flight binds or
+connection-held presence under the live epoch (see `scopes.md` section 4).
+
 ### 5.2 Established-route death
 
 `error_codes::is_established_route_dead` answers "evict this route, reopen it

@@ -194,6 +194,7 @@ in `server.describe.capabilities` (`subc_capabilities` in
 | `route-role-versions/v1` | `route.open` accepts `role_versions` and copies it to the bind. |
 | `catalog-events/v1` | `catalog.list` carries each module's declared `events`, so an entry without them means the module declares none. |
 | `scope-bind-proof/v1` | Scope records may carry `bind_proof_sha256`, and scoped opens must present the proof. |
+| `scope-replace-if-idle/v1` | Scope records may request atomic idle-only epoch/proof replacement; scoped opens may hold connection presence across route closures. |
 | `activity-ledger/v1` | The `activity.*` ops exist. |
 
 A client checks for a capability before sending a field or op that depends on

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.22.1
+
+- Pin `scope_epoch_in_use` as terminal alongside scope bind-proof refusals in the shared decision table.
+
 ## 0.22.0
 
 - Add `RouteScope.bindProof`, sent as `bind_proof`: the secret a scope's owner gave the host that registered the session. When the owner registered a hash of that secret with the scope, the daemon admits a route under the scope only with the matching proof. The two refusals (`scope_bind_proof_required`, `scope_bind_proof_mismatch`) are terminal (`crates/subc-protocol/tests/golden/decision_tables.json`) and are never retried. Route cache keys tell different proofs apart. A scope registered without a hash ignores the proof, so a host holding one can always send it.

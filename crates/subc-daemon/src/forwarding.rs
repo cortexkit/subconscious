@@ -3069,6 +3069,9 @@ fn release_client_route_locked(
         .remove(&client_key)
         .expect("route checked under the same forwarding lock");
     route.flow.close();
+    if let Some(scope) = &route.scope {
+        scope.release_bind();
+    }
     inner.module_to_client.remove(&ModuleRouteKey {
         endpoint: route.module_endpoint,
         channel: route.module_channel,
@@ -3106,6 +3109,9 @@ fn release_module_route_locked(
         .expect("route checked under the same forwarding lock");
     inner.operator_confirms.route_closed(module_key);
     route.flow.close();
+    if let Some(scope) = &route.scope {
+        scope.release_bind();
+    }
     let client_key = ClientRouteKey {
         connection_id: route.client_connection_id,
         channel: route.client_channel,
@@ -3184,7 +3190,7 @@ fn commit_route_locked(
         .insert(reservation.client_key, Arc::clone(&binding));
     inner
         .module_to_client
-        .insert(reservation.module_key, binding);
+        .insert(reservation.module_key, Arc::clone(&binding));
     let previous_published = inner
         .last_published_epoch
         .insert(reservation.client_key, reservation.client_epoch);
@@ -3222,6 +3228,9 @@ fn commit_route_locked(
         return Ok(abandoned);
     }
 
+    if let Some(scope) = &binding.scope {
+        scope.commit_presence();
+    }
     let _ = pending.sender.send(RouteBindRelayOutcome::Accepted);
     Ok(None)
 }

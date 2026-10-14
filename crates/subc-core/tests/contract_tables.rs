@@ -136,6 +136,7 @@ fn daemon_route_open_error_codes_are_complete_in_decision_tables() {
         "scope_changed",
         "scope_bind_proof_required",
         "scope_bind_proof_mismatch",
+        "scope_epoch_in_use",
         "scope_ended",
         "scope_epoch_required",
         "scope_not_carrier",

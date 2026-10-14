@@ -64,7 +64,7 @@ use crate::{
     },
     registry::{ChannelState, ConnectionId, RegistrationEndReason, Registry, RegistryError},
     router::{RouteCtx, RouterError},
-    scopes::{BoundScope, HelloLaunchNonces, ScopeTable},
+    scopes::{HelloLaunchNonces, ScopeTable},
     server::MAX_PENDING_ROUTE_BINDS_PER_TARGET,
     stderr_tail::{CaptureState, TailEntry},
     supervise::{
@@ -848,6 +848,7 @@ impl ControlHandler {
                 CAP_ROUTE_ROLE_VERSIONS_V1.to_string(),
                 subc_protocol::manifest::CAP_CATALOG_EVENTS_V1.to_string(),
                 subc_protocol::manifest::CAP_SCOPE_BIND_PROOF_V1.to_string(),
+                subc_protocol::manifest::CAP_SCOPE_REPLACE_IF_IDLE_V1.to_string(),
                 subc_control::ACTIVITY_LEDGER_CAPABILITY.to_string(),
             ]),
             route_bind_relay_timeout: DEFAULT_ROUTE_BIND_RELAY_TIMEOUT,
@@ -4360,10 +4361,11 @@ impl ControlHandler {
                     Principal::Reserved { module_id } => self.supervisor.is_configured(module_id),
                     _ => false,
                 };
-                let admitted = self
+                let mut scopes = self
                     .scopes
-                    .read()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .write()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let admitted = scopes
                     .admit(&principal, &target_module_id, selector, owner_configured)
                     .and_then(|admission| {
                         crate::scopes::check_target_flow_support(
@@ -4376,17 +4378,15 @@ impl ControlHandler {
                             &target_module_id,
                             registration.manifest.capabilities.as_ref(),
                         )?;
-                        Ok(admission)
+                        let bound = scopes.reserve_bind(
+                            &admission,
+                            ctx.connection_id,
+                            selector.hold_presence,
+                        );
+                        Ok((admission, bound))
                     });
                 match admitted {
-                    Ok(admission) => (
-                        Some(BoundScope {
-                            owner: admission.owner,
-                            scope_ref: admission.stamp.scope_ref.clone(),
-                            tag: admission.tag,
-                        }),
-                        Some(admission.stamp),
-                    ),
+                    Ok((admission, bound)) => (Some(bound), Some(admission.stamp)),
                     Err(refusal) => {
                         return Ok(vec![self.route_open_refusal_frame(
                             ctx,
@@ -11148,6 +11148,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scope_replace_if_idle_capability_is_advertised_in_hello_ack_and_server_describe() {
+        let handler = ControlHandler::new(Arc::new(Registry::default()));
+        let (module, mut rx) = route_ctx(ConnectionId::new(154));
+        let ack = hello_via_sink(
+            &handler,
+            &module,
+            &mut rx,
+            hello_frame("idle-scope-owner", PROTOCOL_VERSION, 1),
+        )
+        .await;
+        assert!(parse_ack(&ack)
+            .subc_capabilities
+            .iter()
+            .any(|cap| cap == subc_protocol::manifest::CAP_SCOPE_REPLACE_IF_IDLE_V1));
+        let (client, _rx) = route_ctx(ConnectionId::new(155));
+        let body = serde_json::to_vec(&ClientControlRequest::ServerDescribe {}).unwrap();
+        let frame = Frame::build(FrameType::Request, control_flags(), 0, 0, 5, body).unwrap();
+        let reply = handler
+            .handle_control_frame(&client, frame)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let ClientControlResponse::ServerDescribe { capabilities, .. } =
+            serde_json::from_slice(&reply.body).unwrap()
+        else {
+            panic!("not a server.describe reply")
+        };
+        assert!(capabilities
+            .iter()
+            .any(|cap| cap == subc_protocol::manifest::CAP_SCOPE_REPLACE_IF_IDLE_V1));
+    }
+
+    #[tokio::test]
     async fn supervision_only_module_health_probe_does_not_enable_route_open_and_cleans_up() {
         let registry = Arc::new(Registry::default());
         let forwarding = Arc::new(ForwardingTable::default());
@@ -14423,6 +14457,10 @@ mod tests {
     /// may sync is decided by the registration and launch nonce of the module
     /// connection, never by the request body.
     mod scopes {
+        mod idle_tests {
+            use super::*;
+            include!("scope_idle_tests.rs");
+        }
         mod activity {
             include!("activity_scope_tests.rs");
         }

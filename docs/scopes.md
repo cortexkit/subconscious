@@ -315,7 +315,7 @@ is absent. Whole-call error frames become `ScopeCallError::Refused`; per-entry r
 
 ## 4. Opening a route under a scope
 
-`route.open` accepts `scope: {owner, ref, scope_epoch, bind_proof?}`. `bind_proof` is
+`route.open` accepts `scope: {owner, ref, scope_epoch, bind_proof?, hold_presence?}`. `bind_proof` is
 base64url of the 32 secret bytes without padding. The daemon decodes the proof,
 hashes those bytes with SHA-256 and compares digest bytes in constant time, at
 admission and again before sending the captured relay bind. The owner must
@@ -327,6 +327,46 @@ attribution; the hash also stays out of describe replies and bind stamps.
 Scope owners should set `bind_proof_sha256` only when the daemon they are
 connected to advertises `scope-bind-proof/v1` in HELLO_ACK or `server.describe`;
 older daemons may reject records carrying the hash.
+
+### Idle-only rotation and connection-held presence
+
+An owner may set `replace_only_if_idle: true` on a record in `scope.sync` or
+`scope.apply` to rotate its epoch or change its bind-proof hash without taking
+over a live session. If the ref is live and the proposed record has a higher
+epoch or changes `bind_proof_sha256` at the same epoch, the daemon refuses that
+record while the current epoch has any bound route, admitted bind still in
+flight, or connected presence holder. The per-record result is `outcome:
+"refused"`, `code: "scope_epoch_in_use"`; its message says routes are still bound
+without counting or naming them. The old record and routes stay untouched;
+other records apply independently. Created and unchanged records are never
+refused by this condition. The flag is a request condition, not stored scope
+content; absent or false preserves unconditional replacement and its usual
+route drains.
+
+Admission reserves epoch usage under the same scope-table write lock that
+checks and applies conditional records. The reservation remains counted while
+egress is waiting, while the module handles the bind, and after commit until
+route closure. Failed or cancelled binds release it. No open can enter between
+the idle check and the change; ordinary tag/proof rechecks still settle binds
+against unconditional updates.
+
+A host can send `hold_presence: true` in its selector to keep its client
+connection present for that scope epoch after a successful admitted bind.
+In-flight binds already block rotation; refused opens create no lasting
+presence. Presence survives route closure, including a target module restart,
+so another local process cannot take over during the host's rebind window.
+Closing the holder's connection removes presence. Replacing, ending or
+expiring the epoch discards its holders; a daemon restart clears all in-memory
+state and all connections. Presence is capped at eight distinct connections
+per epoch (including provisional holders during binds); additional opens still
+bind but do not add presence. Repeated opens on a holder's connection share its
+entry.
+
+Both fields require `scope-replace-if-idle/v1`, advertised in HELLO_ACK and
+`server.describe`. Owners send the condition and hosts send `hold_presence`
+only after seeing that capability: older daemons reject unknown record and
+selector fields. `scope_epoch_in_use` is terminal, not an automatic retry
+instruction; the owner decides when to attempt registration again.
 
 Every opener sends `scope_epoch`, the owner
 included: an owner forwarding a call names the epoch of the call it serves, so an old inbound call
@@ -495,6 +535,7 @@ caller may re-open within its own deadline.
 | `scope_epoch_required` | `route.open` | the open named no epoch | no |
 | `scope_bind_proof_required` | `route.open`, admission and relay re-check | the record has a hash but no proof was supplied | no |
 | `scope_bind_proof_mismatch` | `route.open`, admission and relay re-check | proof malformed or digest differs from the stored hash | no |
+| `scope_epoch_in_use` | `scope.sync` / `scope.apply`, per record | conditional epoch/proof replacement has routes, in-flight binds or connected presence holders | no |
 | `scope_not_carrier` | `route.open` | the opener is not the owner or a carrier, or not targeted at this module | no |
 | `target_flow_unsupported` | `route.open`, admission and relay re-check | a flow scope's target provides neither `call-modes/v1` nor `flow-scopes/v1` | no |
 | `target_agent_run_unsupported` | `route.open`, admission and relay re-check | a run scope's target provides neither `call-modes/v1` nor `agent-run-scopes/v1`, or the run delegates and the target lacks `call-modes/v1` | no |

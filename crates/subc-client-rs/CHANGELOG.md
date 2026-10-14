@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.29.2
+
+- Re-export protocol 0.32.2 scope builders for capability-gated idle-only replacement and connection-held presence. `scope_epoch_in_use` is terminal in the shared contract table.
+
 ## 0.29.1
 
 - Expose the daemon's HELLO_ACK capability list through `ModuleHandle::daemon_capabilities` and `daemon_supports`. Scope owners should check `scope-bind-proof/v1` before setting `bind_proof_sha256`.

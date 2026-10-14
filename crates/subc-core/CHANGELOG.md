@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.20.92
+
+- Ship daemon 0.36.2's atomic idle-only scope rotation and connection-held presence support; add `scope_epoch_in_use` to the shared terminal-code contract checks.
+
 ## 0.20.91
 
 - `ck`'s fixed test clock now lives in a helper chosen at build time, so release builds read the real clock with no constant-None call that release-profile clippy refuses.

@@ -297,6 +297,12 @@ pub struct ScopeRecord {
         deserialize_with = "deserialize_bind_proof_sha256"
     )]
     pub bind_proof_sha256: Option<String>,
+    /// Refuse an epoch replacement or bind-proof change while routes are bound
+    /// to the live epoch, including binds admitted but not yet committed, or
+    /// connected presence holders remain. Send only after capability discovery.
+    /// This is a request condition, not a stored scope attribute.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub replace_only_if_idle: bool,
     /// Absolute Unix wall-clock deadline in milliseconds. It cannot be added,
     /// changed or removed within this scope epoch; absent means no deadline.
     /// This is not an authority attribute.
@@ -325,6 +331,7 @@ impl ScopeRecord {
             scope_epoch,
             kind,
             bind_proof_sha256: None,
+            replace_only_if_idle: false,
             expires_at_ms: None,
             parent: None,
             child_owners: Vec::new(),
@@ -336,6 +343,12 @@ impl ScopeRecord {
     #[must_use]
     pub fn with_bind_proof_sha256(mut self, hash: Option<String>) -> Self {
         self.bind_proof_sha256 = hash;
+        self
+    }
+
+    #[must_use]
+    pub fn with_replace_only_if_idle(mut self, replace_only_if_idle: bool) -> Self {
+        self.replace_only_if_idle = replace_only_if_idle;
         self
     }
 
@@ -440,6 +453,10 @@ pub struct ScopeSelector {
     /// without a bind-proof hash, so holders may always send their proof.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bind_proof: Option<String>,
+    /// Keep connection-held presence after an admitted open, even if its route
+    /// closes. Send only to daemons advertising `scope-replace-if-idle/v1`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hold_presence: bool,
 }
 
 impl ScopeSelector {
@@ -449,12 +466,19 @@ impl ScopeSelector {
             scope_ref: scope_ref.into(),
             scope_epoch,
             bind_proof: None,
+            hold_presence: false,
         }
     }
 
     #[must_use]
     pub fn with_bind_proof(mut self, proof: Option<String>) -> Self {
         self.bind_proof = proof;
+        self
+    }
+
+    #[must_use]
+    pub fn with_hold_presence(mut self, hold_presence: bool) -> Self {
+        self.hold_presence = hold_presence;
         self
     }
 }

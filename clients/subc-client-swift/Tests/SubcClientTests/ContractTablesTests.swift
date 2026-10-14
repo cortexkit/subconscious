@@ -93,6 +93,7 @@ final class ContractTablesTests: XCTestCase {
         XCTAssertEqual(tables.routeOpenRetryable["target_agent_run_unsupported"], "terminal")
         XCTAssertEqual(tables.routeOpenRetryable["scope_bind_proof_required"], "terminal")
         XCTAssertEqual(tables.routeOpenRetryable["scope_bind_proof_mismatch"], "terminal")
+        XCTAssertEqual(tables.routeOpenRetryable["scope_epoch_in_use"], "terminal")
 
         XCTAssertFalse(
             tables.routeOpenRetryable.isEmpty,

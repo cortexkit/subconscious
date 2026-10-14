@@ -328,6 +328,9 @@ pub const CAP_CATALOG_EVENTS_V1: &str = "catalog-events/v1";
 /// hash only when the daemon it is connected to advertises this capability.
 pub const CAP_SCOPE_BIND_PROOF_V1: &str = "scope-bind-proof/v1";
 
+/// Atomic idle-only scope rotation and connection-held scope presence.
+pub const CAP_SCOPE_REPLACE_IF_IDLE_V1: &str = "scope-replace-if-idle/v1";
+
 /// A versioned bus event notice whose body is served by the publisher.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]

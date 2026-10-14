@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.32.2
+
+- Add optional `ScopeRecord.replace_only_if_idle` and `ScopeSelector.hold_presence`, with builder setters and false omitted from wire bytes. Both types remain non-exhaustive. Add `manifest::CAP_SCOPE_REPLACE_IF_IDLE_V1` (`scope-replace-if-idle/v1`) covering atomic idle-only rotation and connection-held presence; send these fields only after capability discovery. Add terminal `SCOPE_EPOCH_IN_USE` (`scope_epoch_in_use`) for per-record conditional replacement refusal.
+
 ## 0.32.1
 
 - Add `manifest::CAP_SCOPE_BIND_PROOF_V1` (`scope-bind-proof/v1`). A daemon advertising it stores scope bind-proof hashes and enforces proofs on scoped route opens; owners set `bind_proof_sha256` only when their connected daemon advertises it.

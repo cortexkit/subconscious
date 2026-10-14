@@ -5,6 +5,7 @@ import { isRetryableRouteOpenCode } from "../src/client";
 test("scope bind proof refusals are terminal", () => {
   expect(isRetryableRouteOpenCode("scope_bind_proof_required")).toBe(false);
   expect(isRetryableRouteOpenCode("scope_bind_proof_mismatch")).toBe(false);
+  expect(isRetryableRouteOpenCode("scope_epoch_in_use")).toBe(false);
 });
 
 test("target_flow_unsupported is a terminal route.open refusal", () => {

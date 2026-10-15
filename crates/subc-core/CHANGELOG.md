@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.20.94
+
+- `ck` prints a metric or field whose value is JSON `null` as "unknown" instead of "none". A null means the module could not determine the value, so it must not read like an empty result. Empty strings, arrays and objects still print "none".
+
 ## 0.20.93
 
 - Test-only: let the fake module opt into parked grandchildren that ignore daemon EOF and retain its stderr writer. Strengthen the Windows crash/respawn hard-kill regression to verify both generations' descendants, alternating tree kills and daemon-only termination with a separate sampling gate for each mode.

@@ -3400,7 +3400,10 @@ fn inline_scalar_object(map: &serde_json::Map<String, Value>) -> Option<String> 
 
 fn scalar_text(value: &Value) -> String {
     match value {
-        Value::Null => "none".to_string(),
+        // A null field means the producer could not determine the value, so it
+        // must not read like an empty result: "none" would turn "not measured"
+        // into "measured nothing". Empty strings and arrays stay "none".
+        Value::Null => "unknown".to_string(),
         Value::String(value) if value.is_empty() => "none".to_string(),
         Value::String(value) => value.clone(),
         Value::Bool(true) => "enabled".to_string(),
@@ -8394,6 +8397,34 @@ fn a_successful_command_stays_successful_when_old_image_cleanup_fails() {
 
 #[cfg(test)]
 mod tests {
+    mod metric_rendering {
+        use super::super::*;
+
+        #[test]
+        fn an_unmeasured_metric_reads_unknown_never_none() {
+            assert_eq!(format_metric_value("actor_count", &Value::Null), "unknown");
+            assert_eq!(scalar_text(&Value::Null), "unknown");
+            let inline = inline_scalar_object(
+                json!({"actor_count": null, "root_count": 3})
+                    .as_object()
+                    .unwrap(),
+            );
+            assert_eq!(
+                inline.as_deref(),
+                Some("actor_count=unknown · root_count=3")
+            );
+        }
+
+        #[test]
+        fn an_empty_value_still_reads_none() {
+            assert_eq!(scalar_text(&json!("")), "none");
+            assert_eq!(
+                inline_scalar_object(json!({}).as_object().unwrap()).as_deref(),
+                Some("none")
+            );
+        }
+    }
+
     mod privileged_operator_rpc {
         use super::super::*;
         use subc_protocol::{error_codes, ErrorBody, PROTOCOL_VERSION};

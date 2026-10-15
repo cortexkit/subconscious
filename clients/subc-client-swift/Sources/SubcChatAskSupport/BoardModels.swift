@@ -587,6 +587,11 @@ public struct BoardLaneWait: Codable, Equatable {
     public var ref: String?
     public var refState: String?
     public var refTerminalAtMs: Int64?
+    /// The board owner's most recent idle transition, repeated on each wait and
+    /// absent when the owner has no turn anchor yet. A held board ages its
+    /// `rotten` verdict against it: a terminal reference is rotten once it has
+    /// been terminal for over an hour and the owner has gone idle since.
+    public var lastIdleTransitionMs: Int64?
     public var rotten: Bool?
     public var sinceMs: Int64
     public var agentId: String?
@@ -596,13 +601,15 @@ public struct BoardLaneWait: Codable, Equatable {
 
     public init(
         on: String, ref: String? = nil, refState: String? = nil, refTerminalAtMs: Int64? = nil,
-        rotten: Bool? = nil, sinceMs: Int64, agentId: String? = nil, displayName: String? = nil,
-        sender: String? = nil, excerpt: String? = nil
+        lastIdleTransitionMs: Int64? = nil, rotten: Bool? = nil, sinceMs: Int64,
+        agentId: String? = nil, displayName: String? = nil, sender: String? = nil,
+        excerpt: String? = nil
     ) {
         self.on = on
         self.ref = ref
         self.refState = refState
         self.refTerminalAtMs = refTerminalAtMs
+        self.lastIdleTransitionMs = lastIdleTransitionMs
         self.rotten = rotten
         self.sinceMs = sinceMs
         self.agentId = agentId
@@ -617,6 +624,7 @@ public struct BoardLaneWait: Codable, Equatable {
         ref = try c.eitherIfPresent("ref")
         refState = try c.eitherIfPresent("refState")
         refTerminalAtMs = try c.eitherIfPresent("refTerminalAtMs")
+        lastIdleTransitionMs = try c.eitherIfPresent("lastIdleTransitionMs")
         rotten = try c.eitherIfPresent("rotten")
         sinceMs = try c.either("sinceMs")
         agentId = try c.eitherIfPresent("agentId")
@@ -631,6 +639,7 @@ public struct BoardLaneWait: Codable, Equatable {
         try c.encodeIfPresent(ref, forKey: .named("ref"))
         try c.encodeIfPresent(refState, forKey: .named("refState"))
         try c.encodeIfPresent(refTerminalAtMs, forKey: .named("refTerminalAtMs"))
+        try c.encodeIfPresent(lastIdleTransitionMs, forKey: .named("lastIdleTransitionMs"))
         try c.encodeIfPresent(rotten, forKey: .named("rotten"))
         try c.encode(sinceMs, forKey: .named("sinceMs"))
         try c.encodeIfPresent(agentId, forKey: .named("agentId"))

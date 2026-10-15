@@ -232,6 +232,29 @@ final class BoardModelsTests: XCTestCase {
         XCTAssertEqual(rotten.rotten, true)
     }
 
+    /// A wait carries the board owner's last idle transition so a held board can
+    /// age its rotten verdict. It decodes from either spelling, stays nil when
+    /// absent, and is written only when present.
+    func testLaneWaitLastIdleTransitionDecodesInEitherSpellingAndStaysOptional() throws {
+        let snake = Data(#"{"on":"user","ref_state":"terminal","ref_terminal_at_ms":1700000000000,"last_idle_transition_ms":1700003700000,"since_ms":1699999000000}"#.utf8)
+        let camel = Data(#"{"on":"user","refState":"terminal","refTerminalAtMs":1700000000000,"lastIdleTransitionMs":1700003700000,"sinceMs":1699999000000}"#.utf8)
+        for data in [snake, camel] {
+            let wait = try JSONDecoder().decode(BoardLaneWait.self, from: data)
+            XCTAssertEqual(wait.lastIdleTransitionMs, 1_700_003_700_000)
+            XCTAssertEqual(wait.refTerminalAtMs, 1_700_000_000_000)
+        }
+
+        let absent = try JSONDecoder().decode(
+            BoardLaneWait.self, from: Data(#"{"on":"user","since_ms":1699999000000}"#.utf8))
+        XCTAssertNil(absent.lastIdleTransitionMs, "an owner without a turn anchor sends nothing")
+        let encoded = String(decoding: try JSONEncoder().encode(absent), as: UTF8.self)
+        XCTAssertFalse(encoded.contains("lastIdleTransitionMs"), "absent stays absent on encode")
+
+        let built = BoardLaneWait(on: "user", lastIdleTransitionMs: 42, sinceMs: 1)
+        let again = try JSONDecoder().decode(BoardLaneWait.self, from: JSONEncoder().encode(built))
+        XCTAssertEqual(again.lastIdleTransitionMs, 42)
+    }
+
     /// Items carry four optional fields: ETA, last change, follow-up and note
     /// reference. They decode from the snake_case wire and from camelized
     /// replies; an item without them stays nil rather than defaulting.

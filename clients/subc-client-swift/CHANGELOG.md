@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- `AskRequest` decodes the optional `headAgentId` (spelled with a lowercase d, exactly as the producer writes it): the lead agent of a worker's ask, resolved by the producer from the verified scope chain. A head's own ask has no such key and decodes as `nil`. It is for placing the ask under its lead agent and confers no approval authority. No error cases change.
 - Add `ScopeBindProofCodes.required` and `.mismatch`, the daemon's two refusal codes for a scoped route open that is missing its scope's bind proof or carries the wrong one. Callers receive them as `FedFailure.moduleError` with a readable message, the same case other terminal refusals use, so no public SubcFed enum gains a case and existing exhaustive switches keep compiling. Both codes are terminal (`crates/subc-protocol/tests/golden/decision_tables.json`): never retry the open.
 
 - `BoardLaneItem` decodes four optional fields: `etaMs`, `changedAtMs`, `followUp` and `noteRef`. Each accepts the snake_case wire spelling or the camelCase spelling after key normalization, like the other lane types. Items without them decode as before.

@@ -83,6 +83,11 @@ public struct AskRequest: Codable, Equatable, Identifiable {
     public var purpose: String?
     public var recipientKind: String?
     public var askerSessionID: String?
+    /// The lead agent of a worker's ask, resolved by the producer from the verified
+    /// scope chain; absent on a head's own ask. The wire key is spelled `headAgentId`
+    /// (lowercase d), unlike `requestID` and `askerSessionID`. It places the ask under
+    /// its lead agent for display only and confers no approval authority.
+    public var headAgentId: String?
     public var taskID: String?
     public var question: String
     public var context: String?

@@ -40,6 +40,33 @@ final class AskModelsTests: XCTestCase {
         XCTAssertEqual(ask.state, "pending")
     }
 
+    func testDecodesWorkerAskHeadAgentIdAndLeavesItNilWhenAbsent() throws {
+        let worker = try decodeAsk([
+            "requestID": "ask-worker",
+            "question": "May I read the file?",
+            "askedAt": 1_700_000_000_000 as Int64,
+            "headAgentId": "agent_lead",
+        ])
+        XCTAssertEqual(worker.headAgentId, "agent_lead")
+
+        let head = try decodeAsk([
+            "requestID": "ask-head",
+            "question": "Continue?",
+            "askedAt": 1_700_000_000_000 as Int64,
+        ])
+        XCTAssertNil(head.headAgentId)
+
+        // Only the producer's exact spelling is read, so a differently cased key is
+        // not mistaken for it.
+        let misspelled = try decodeAsk([
+            "requestID": "ask-other",
+            "question": "Continue?",
+            "askedAt": 1_700_000_000_000 as Int64,
+            "headAgentID": "agent_lead",
+        ])
+        XCTAssertNil(misspelled.headAgentId)
+    }
+
     func testDecodesMinimalAskRecordWithOnlyRequiredFields() throws {
         let ask = try decodeAsk([
             "requestID": "ask-minimal",

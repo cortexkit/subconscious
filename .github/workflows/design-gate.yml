@@ -90,7 +90,7 @@ jobs:
       # be moved to different code. When the design-gate action changes, move
       # its two pins below to the commit that changed it.
       - name: Evaluate the design gate
-        uses: cortexkit/subconscious/.github/actions/design-gate@117932fd88a38f99259dc7353313745ad479b09a
+        uses: cortexkit/subconscious/.github/actions/design-gate@0fad4b7008afa739e49858fe1083f194a6d00bb6
         with:
           mode: pull-request
           owner-bots: ${{ inputs.owner-bots }}
@@ -119,7 +119,7 @@ jobs:
       # This arm runs on an `issues` event, where GITHUB_TOKEN can already do
       # everything the gate needs, so both tokens are the same one here.
       - name: Release pull requests waiting on this issue
-        uses: cortexkit/subconscious/.github/actions/design-gate@117932fd88a38f99259dc7353313745ad479b09a
+        uses: cortexkit/subconscious/.github/actions/design-gate@0fad4b7008afa739e49858fe1083f194a6d00bb6
         with:
           mode: issue-labeled
           github-token: ${{ secrets.GITHUB_TOKEN }}

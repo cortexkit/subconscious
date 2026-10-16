@@ -4,6 +4,7 @@ mod components;
 mod config;
 mod conversion;
 mod detection;
+mod file_modes;
 mod inventory;
 mod mc_detection;
 mod model;

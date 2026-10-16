@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 000
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)
 installer="$repo_root/scripts/install/install.sh"
@@ -11,6 +12,20 @@ mkdir -p "$stub_dir"
 fail() {
   printf 'test failure: %s\n' "$1" >&2
   exit 1
+}
+
+mode_of() {
+  local mode
+  mode=$(stat -f '%Lp' "$1" 2>/dev/null) || mode=$(stat -c '%a' "$1")
+  printf '%s\n' "$mode"
+}
+
+assert_mode() {
+  local path="$1"
+  local expected="$2"
+  local actual
+  actual=$(mode_of "$path")
+  [[ "$actual" == "$expected" ]] || fail "$path mode is $actual, expected $expected"
 }
 
 cat >"$stub_dir/uname" <<'EOF'
@@ -39,6 +54,15 @@ while (($# > 0)); do
       ;;
   esac
 done
+if [[ "${CK_TEST_ASSERT_TEMP_MODES:-0}" == "1" && "$url" == *index.json ]]; then
+  stage_dir=$(dirname "$out")
+  stage_mode=$(stat -f '%Lp' "$stage_dir" 2>/dev/null) || stage_mode=$(stat -c '%a' "$stage_dir")
+  stage_owner=$(stat -f '%u' "$stage_dir" 2>/dev/null) || stage_owner=$(stat -c '%u' "$stage_dir")
+  if [[ "$stage_mode" != "700" || "$stage_owner" != "$(id -u)" ]]; then
+    printf 'test failure: staging directory mode/owner is %s/%s, expected 700/%s before file chmod\n' "$stage_mode" "$stage_owner" "$(id -u)" >&2
+    exit 17
+  fi
+fi
 printf '%s\n' "$url" >>"$CK_TEST_REQUEST_LOG"
 if [[ "$url" == *index.json ]]; then
   if [[ "${CK_TEST_DOWNLOAD_FAILURE:-}" == "index" ]]; then
@@ -83,10 +107,46 @@ while (($# > 0)); do
       destination="$2"
       shift 2
       ;;
-    *) shift ;;
+    *)
+      archive="$1"
+      shift
+      ;;
   esac
 done
 mkdir -p "$destination"
+if [[ "${CK_TEST_ASSERT_TEMP_MODES:-0}" == "1" ]]; then
+  mode_of() {
+    local mode
+    mode=$(stat -f '%Lp' "$1" 2>/dev/null) || mode=$(stat -c '%a' "$1")
+    printf '%s\n' "$mode"
+  }
+  owner_of() {
+    local owner
+    owner=$(stat -f '%u' "$1" 2>/dev/null) || owner=$(stat -c '%u' "$1")
+    printf '%s\n' "$owner"
+  }
+  expected_owner=$(id -u)
+  [[ "$(mode_of "$destination")" == "700" ]] || {
+    printf 'test failure: extraction directory is not private\n' >&2
+    exit 13
+  }
+  [[ "$(mode_of "$(dirname "$destination")")" == "700" ]] || {
+    printf 'test failure: staging directory is not private\n' >&2
+    exit 14
+  }
+  [[ "$(owner_of "$destination")" == "$expected_owner" && "$(owner_of "$(dirname "$destination")")" == "$expected_owner" ]] || {
+    printf 'test failure: staging directory is not owned by the current user before file chmod\n' >&2
+    exit 18
+  }
+  [[ "$(mode_of "$archive")" == "600" ]] || {
+    printf 'test failure: downloaded archive is not owner-only\n' >&2
+    exit 15
+  }
+  [[ "$(mode_of "$(dirname "$archive")/index.json")" == "600" ]] || {
+    printf 'test failure: downloaded index is not owner-only\n' >&2
+    exit 16
+  }
+fi
 cat >"$destination/ck" <<'CK'
 #!/usr/bin/env bash
 printf 'setup process started\n' >"$CK_TEST_SETUP_MARKER"
@@ -108,7 +168,21 @@ if [[ "${1:-}" == "--user" || "${CK_TEST_SYSTEMD_SYSTEM_RESULT:-0}" == "0" ]]; t
   exit 0
 fi
 EOF
-chmod +x "$stub_dir/uname" "$stub_dir/curl" "$stub_dir/unzip" "$stub_dir/systemctl"
+cat >"$stub_dir/chmod" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+target="$2"
+stage_dir=$(dirname "$target")
+stage_mode=$(stat -f '%Lp' "$stage_dir" 2>/dev/null) || stage_mode=$(stat -c '%a' "$stage_dir")
+stage_owner=$(stat -f '%u' "$stage_dir" 2>/dev/null) || stage_owner=$(stat -c '%u' "$stage_dir")
+expected_owner=$(id -u)
+if [[ "$stage_mode" != "700" || "$stage_owner" != "$expected_owner" ]]; then
+  printf 'test failure: chmod target %s has staging directory mode/owner %s/%s, expected 700/%s\n' "$target" "$stage_mode" "$stage_owner" "$expected_owner" >&2
+  exit 19
+fi
+exec /bin/chmod "$@"
+EOF
+chmod +x "$stub_dir/uname" "$stub_dir/curl" "$stub_dir/unzip" "$stub_dir/systemctl" "$stub_dir/chmod"
 
 run_installer() {
   local home="$1"
@@ -128,8 +202,10 @@ run_installer() {
     CK_RELEASE_INDEX_URL=https://release.fixture.example/releases/v1/index.json \
     CK_TEST_REQUEST_LOG="$home/requests.log" \
     CK_TEST_SETUP_MARKER="$home/setup-called" \
+    CK_TEST_ASSERT_TEMP_MODES=1 \
     "$@" \
     bash "$installer" >"$output_file" 2>&1; then
+    cat "$output_file" >&2
     return 1
   fi
 }
@@ -145,6 +221,11 @@ grep -Fq 'ck-linux-x64.zip' "$linux_home/requests.log" || fail 'Linux archive na
 grep -Fq 'Next: ck setup' "$linux_output" || fail 'installer did not print the setup command'
 [[ ! -e "$linux_home/setup-called" ]] || fail 'installer started the extracted ck process'
 [[ -x "$linux_home/.local/share/cortexkit/cmd/ck" ]] || fail 'installer did not place ck in cmd'
+assert_mode "$linux_home/.local/share/cortexkit" 700
+assert_mode "$linux_home/.local/share/cortexkit/cmd" 755
+assert_mode "$linux_home/.local/share/cortexkit/cmd/ck" 755
+assert_mode "$linux_home/.local/share/cortexkit/installer-manifest.json" 600
+assert_mode "$linux_home/.bashrc" 600
 [[ "$(grep -Fc '# cortexkit-managed PATH begin' "$linux_home/.bashrc")" == "1" ]] || fail 'PATH block was not recorded exactly once'
 grep -Fq "$linux_home/.local/share/cortexkit/cmd" "$linux_home/.bashrc" || fail 'PATH block did not use cmd'
 ! grep -Fq "$linux_home/.local/share/cortexkit/bin" "$linux_home/.bashrc" || fail 'PATH block still includes bin'
@@ -196,6 +277,7 @@ grep -Fq 'Next: ck setup' "$rerun_output" || fail 'no-op installer did not print
 [[ "$(grep -Fc '# cortexkit-managed PATH begin' "$linux_home/.bashrc")" == "1" ]] || fail 'no-op installer duplicated the PATH block'
 [[ "$(shasum -a 256 "$linux_manifest" | awk '{print $1}')" == "$manifest_before" ]] || fail 're-run rewrote an existing manifest (setup rows would be lost)'
 [[ -f "$linux_sidecar" ]] || fail 're-run did not write the bootstrap sidecar'
+assert_mode "$linux_sidecar" 600
 grep -Fq "\"archive_sha256\": \"$archive_digest\"" "$linux_sidecar" || fail 'sidecar did not record the archive digest'
 grep -Fq "\"sha256\": \"$binary_digest\"" "$linux_sidecar" || fail 'sidecar did not record the placed binary digest'
 grep -Fq 'ck-subc' "$linux_manifest" || fail 'daemon row vanished from the manifest'

@@ -10,7 +10,7 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
 use super::{
-    config,
+    config, file_modes,
     inventory::Inventory,
     model::{AlphaTarget, Component, PlatformObservation, ReleaseAvailability},
     release_index::{self, IndexAsset, IndexRefusal, ReleaseIndex},
@@ -278,15 +278,13 @@ impl ReleaseArtifactSource {
                 .map_err(|error| format!("clock before Unix epoch: {error}"))?
                 .as_nanos()
         ));
-        fs::create_dir_all(&temp).map_err(|error| {
-            format!(
-                "could not create download directory {}: {error}",
-                temp.display()
-            )
-        })?;
+        file_modes::create_private_directory(&temp)?;
         let archive = temp.join(&archive_name);
+        #[cfg(unix)]
+        file_modes::create_new_file(&archive, 0o600)?;
         release_index::download(&asset.url, &archive)
             .map_err(|raw| self.network_download_error(binary, &raw))?;
+        file_modes::set_new_file_mode(&archive, 0o600)?;
         let expected = asset.sha256.to_ascii_lowercase();
         let actual = digest_file(&archive)?;
         if actual != expected {
@@ -302,6 +300,8 @@ impl ReleaseArtifactSource {
             format_mebibytes(archive_bytes)
         );
         let extracted = temp.join("extracted");
+        #[cfg(unix)]
+        file_modes::create_private_directory(&extracted)?;
         extract(&archive, &extracted)?;
         let candidate = extracted.join(&binary_name);
         if !candidate.is_file() {
@@ -309,6 +309,7 @@ impl ReleaseArtifactSource {
                 "{archive_name} did not contain {binary_name} at its archive root"
             ));
         }
+        file_modes::set_new_file_mode(&candidate, 0o755)?;
         Ok(FetchedCandidate {
             temp,
             candidate,
@@ -333,31 +334,14 @@ impl ArtifactSource for ReleaseArtifactSource {
                 destination.display()
             )
         })?;
-        fs::create_dir_all(parent).map_err(|error| {
-            format!(
-                "could not create managed binary directory {}: {error}",
-                parent.display()
-            )
-        })?;
+        file_modes::ensure_owned_directory(parent, 0o755)?;
         let temporary = destination.with_extension("setup.tmp");
-        fs::copy(&candidate, &temporary).map_err(|error| {
+        file_modes::copy_file_with_mode(&candidate, &temporary, 0o755).map_err(|error| {
             format!(
                 "could not place {binary_name} at {}: {error}",
                 destination.display()
             )
         })?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&temporary, fs::Permissions::from_mode(0o755)).map_err(
-                |error| {
-                    format!(
-                        "could not mark {} executable: {error}",
-                        destination.display()
-                    )
-                },
-            )?;
-        }
         fs::rename(&temporary, destination).map_err(|error| {
             format!(
                 "could not replace managed binary {}: {error}",
@@ -867,13 +851,15 @@ fn extraction_command(windows: bool, archive: &Path, destination: &Path) -> Comm
     if windows {
         return super::upgrade_assets::windows_extract_command(archive, destination);
     }
-    let mut command = Command::new("unzip");
-    command.args([
-        "-q".as_ref(),
-        archive.as_os_str(),
-        "-d".as_ref(),
-        destination.as_os_str(),
-    ]);
+    let mut command = Command::new("/bin/sh");
+    command
+        .args([
+            "-c",
+            "umask 077; exec unzip -q \"$1\" -d \"$2\"",
+            "ck-setup-unzip",
+        ])
+        .arg(archive)
+        .arg(destination);
     command
 }
 

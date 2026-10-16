@@ -8,6 +8,7 @@ use std::{
 use sha2::{Digest, Sha256};
 
 use super::{
+    file_modes,
     model::{AlphaTarget, UpgradeTarget},
     release_index::{self, ReleaseIndex},
     update_check::upgrade_target_index_path,
@@ -177,7 +178,16 @@ pub fn prepare_upgrade_asset<F: UpgradeAssetFetcher>(
     let workspace = WorkspaceGuard(temporary_workspace(target)?);
     let archive = workspace.0.join(&names.archive);
 
+    #[cfg(unix)]
+    file_modes::create_new_file(&archive, 0o600).map_err(|reason| UpgradeAssetError::Io {
+        asset: names.archive.clone(),
+        reason,
+    })?;
     let expected = fetcher.fetch_archive(target, platform, &archive)?;
+    file_modes::set_new_file_mode(&archive, 0o600).map_err(|reason| UpgradeAssetError::Io {
+        asset: names.archive.clone(),
+        reason,
+    })?;
     let actual = sha256_file(&archive).map_err(|reason| UpgradeAssetError::Io {
         asset: names.archive.clone(),
         reason,
@@ -191,6 +201,11 @@ pub fn prepare_upgrade_asset<F: UpgradeAssetFetcher>(
     }
 
     let extracted = workspace.0.join("extracted");
+    #[cfg(unix)]
+    file_modes::create_private_directory(&extracted).map_err(|reason| UpgradeAssetError::Io {
+        asset: names.archive.clone(),
+        reason,
+    })?;
     extract(&archive, &extracted).map_err(|reason| UpgradeAssetError::Extraction {
         asset: names.archive.clone(),
         reason,
@@ -202,6 +217,12 @@ pub fn prepare_upgrade_asset<F: UpgradeAssetFetcher>(
             reason: format!("archive did not contain {} at its root", names.binary),
         });
     }
+    file_modes::set_new_file_mode(&candidate, 0o755).map_err(|reason| {
+        UpgradeAssetError::Extraction {
+            asset: names.archive.clone(),
+            reason,
+        }
+    })?;
     Ok(PreparedUpgradeAsset {
         names,
         candidate,
@@ -249,12 +270,9 @@ fn temporary_workspace(target: UpgradeTarget) -> Result<PathBuf, UpgradeAssetErr
         target.label(),
         process::id()
     ));
-    fs::create_dir_all(&workspace).map_err(|error| UpgradeAssetError::Io {
+    file_modes::create_private_directory(&workspace).map_err(|reason| UpgradeAssetError::Io {
         asset: target.label().to_string(),
-        reason: format!(
-            "could not create temporary workspace {}: {error}",
-            workspace.display()
-        ),
+        reason,
     })?;
     Ok(workspace)
 }
@@ -305,13 +323,15 @@ pub(super) fn windows_extract_command(archive: &Path, destination: &Path) -> Com
 }
 
 fn unix_extract_command(archive: &Path, destination: &Path) -> Command {
-    let mut command = Command::new("unzip");
-    command.args([
-        "-q".to_string(),
-        archive.to_string_lossy().into_owned(),
-        "-d".to_string(),
-        destination.to_string_lossy().into_owned(),
-    ]);
+    let mut command = Command::new("/bin/sh");
+    command
+        .args([
+            "-c",
+            "umask 077; exec unzip -q \"$1\" -d \"$2\"",
+            "ck-upgrade-unzip",
+        ])
+        .arg(archive)
+        .arg(destination);
     command
 }
 

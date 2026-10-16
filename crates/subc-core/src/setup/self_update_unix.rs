@@ -5,7 +5,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use super::{upgrade_assets::sha256_file, upgrade_verification::destination_inode};
+use super::{file_modes, upgrade_assets::sha256_file, upgrade_verification::destination_inode};
 
 /// Stage the already-verified candidate beside its destination, so the final
 /// rename is within one filesystem and therefore atomically replaces `ck`.
@@ -13,14 +13,12 @@ pub(super) fn replace_verified_candidate(
     destination: &Path,
     candidate: &Path,
 ) -> Result<(String, Option<PathBuf>), String> {
-    use std::os::unix::fs::PermissionsExt;
-
     let temporary = unique_sibling(destination)?;
     let prior_inode = destination_inode(destination)?;
     let candidate_digest = sha256_file(candidate)?;
 
     let result = (|| {
-        fs::copy(candidate, &temporary).map_err(|error| {
+        file_modes::copy_file_with_mode(candidate, &temporary, 0o755).map_err(|error| {
             format!(
                 "refusal: could not stage verified ck replacement at {}: {error}",
                 temporary.display()
@@ -32,12 +30,6 @@ pub(super) fn replace_verified_candidate(
                 temporary.display()
             ));
         }
-        fs::set_permissions(&temporary, fs::Permissions::from_mode(0o755)).map_err(|error| {
-            format!(
-                "refusal: could not mark staged ck replacement {} executable: {error}",
-                temporary.display()
-            )
-        })?;
         fs::rename(&temporary, destination).map_err(|error| {
             format!(
                 "refusal: could not atomically rename verified ck replacement {} over {}: {error}",

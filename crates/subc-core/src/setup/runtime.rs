@@ -6,6 +6,8 @@ use std::{
 
 use serde_json::{Map, Value};
 
+#[cfg(unix)]
+use super::file_modes;
 use super::inventory::Inventory;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -422,18 +424,32 @@ pub fn ensure<R: CommandRunner>(
                 paths.definition.display()
             )
         })?;
-        fs::create_dir_all(parent).map_err(|error| {
-            format!(
-                "could not create runtime directory {}: {error}",
-                parent.display()
-            )
-        })?;
-        fs::write(&paths.definition, desired).map_err(|error| {
-            format!(
-                "could not write runtime definition {}: {error}",
-                paths.definition.display()
-            )
-        })?;
+        #[cfg(unix)]
+        {
+            file_modes::ensure_owned_directory(parent, 0o755)?;
+            file_modes::write_atomic(
+                &paths.definition,
+                desired.as_bytes(),
+                0o644,
+                0o644,
+                "plist.tmp",
+            )?;
+        }
+        #[cfg(not(unix))]
+        {
+            fs::create_dir_all(parent).map_err(|error| {
+                format!(
+                    "could not create runtime directory {}: {error}",
+                    parent.display()
+                )
+            })?;
+            fs::write(&paths.definition, desired).map_err(|error| {
+                format!(
+                    "could not write runtime definition {}: {error}",
+                    paths.definition.display()
+                )
+            })?;
+        }
     }
     let mut fields = Map::new();
     fields.insert(

@@ -13,6 +13,7 @@ use super::{
     components::{self, ReleaseArtifactSource},
     config,
     conversion::selected_components,
+    file_modes,
     inventory::Inventory,
     model::{
         Component, ComponentState, ConfigurationState, PlatformObservation, ReleaseAvailability,
@@ -281,6 +282,7 @@ impl SetupBackend {
         .iter()
         .map(|kind| self.inventory.paths_for_kind(kind).len())
         .sum();
+        observed.permissions_need_tightening = self.permissions_need_tightening()?;
         Ok(observed)
     }
 
@@ -298,6 +300,9 @@ impl SetupBackend {
         }
 
         let mut steps = Vec::new();
+        if plan.permission_repair {
+            steps.push("would tighten permissions on existing CortexKit paths".to_string());
+        }
         let registering_runtime = plan
             .operations
             .iter()
@@ -659,6 +664,25 @@ impl SetupBackend {
         } else {
             "ck-auth"
         });
+        #[cfg(unix)]
+        if let Some(key_path) = key_path {
+            if let Some(parent) = key_path.parent() {
+                if key_path.starts_with(&self.paths.data_dir) {
+                    file_modes::ensure_owned_directory(parent, 0o700)?;
+                } else {
+                    file_modes::ensure_private_parents(parent)?;
+                }
+            }
+        }
+        #[cfg(unix)]
+        let mut command = {
+            let mut command = Command::new("/bin/sh");
+            command
+                .args(["-c", "umask 077; exec \"$@\"", "ck-auth-bootstrap"])
+                .arg(auth);
+            command
+        };
+        #[cfg(not(unix))]
         let mut command = Command::new(auth);
         command.arg("bootstrap");
         if let Some(key_path) = key_path {
@@ -668,11 +692,129 @@ impl SetupBackend {
             .status()
             .map_err(|error| format!("could not run ck auth bootstrap: {error}"))?;
         if status.success() {
+            if let Some(key_path) = key_path {
+                #[cfg(unix)]
+                if !fs::symlink_metadata(key_path)
+                    .is_ok_and(|metadata| metadata.file_type().is_file())
+                {
+                    return Err(format!(
+                        "claustrum key {} is not a regular file",
+                        key_path.display()
+                    ));
+                }
+                file_modes::tighten_owned_file(key_path, 0o600)?;
+            }
             println!("  initialized claustrum credentials");
             Ok(())
         } else {
             Err(format!("ck auth bootstrap failed with {status}"))
         }
+    }
+
+    fn tighten_existing_permissions(&self) -> Result<(), String> {
+        let config_directory = self
+            .paths
+            .config_path
+            .parent()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| self.paths.data_dir.clone());
+        for (path, ceiling) in [
+            (self.paths.data_dir.clone(), 0o700),
+            (self.paths.binary_home.clone(), 0o755),
+            (config_directory, 0o700),
+            (self.paths.data_dir.join("cmd"), 0o755),
+            (self.paths.data_dir.join("claustrum"), 0o700),
+            (self.paths.data_dir.join("stores"), 0o700),
+        ] {
+            file_modes::tighten_owned_directory(&path, ceiling)?;
+        }
+
+        if self
+            .inventory
+            .owns_path("runtime-definition", &self.paths.runtime_paths.definition)
+            || self
+                .inventory
+                .owns_path("runtime-registration", &self.paths.runtime_paths.definition)
+        {
+            if let Some(parent) = self.paths.runtime_paths.definition.parent() {
+                file_modes::tighten_owned_directory(parent, 0o755)?;
+            }
+        }
+
+        let inventory_path = self.paths.data_dir.join("installer-manifest.json");
+        file_modes::tighten_owned_file(&inventory_path, 0o644)?;
+        file_modes::tighten_inventory_files(&self.inventory)?;
+        if let Some(key_path) = &self.paths.claustrum_key_path {
+            file_modes::tighten_owned_file(key_path, 0o600)?;
+        }
+        Ok(())
+    }
+
+    fn permissions_need_tightening(&self) -> Result<bool, String> {
+        let config_directory = self
+            .paths
+            .config_path
+            .parent()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| self.paths.data_dir.clone());
+        for (path, ceiling) in [
+            (self.paths.data_dir.clone(), 0o700),
+            (self.paths.binary_home.clone(), 0o755),
+            (config_directory, 0o700),
+            (self.paths.data_dir.join("cmd"), 0o755),
+            (self.paths.data_dir.join("claustrum"), 0o700),
+            (self.paths.data_dir.join("stores"), 0o700),
+        ] {
+            if file_modes::directory_needs_tightening(&path, ceiling)? {
+                return Ok(true);
+            }
+        }
+
+        if self
+            .inventory
+            .owns_path("runtime-definition", &self.paths.runtime_paths.definition)
+            || self
+                .inventory
+                .owns_path("runtime-registration", &self.paths.runtime_paths.definition)
+        {
+            if let Some(parent) = self.paths.runtime_paths.definition.parent() {
+                if file_modes::directory_needs_tightening(parent, 0o755)? {
+                    return Ok(true);
+                }
+            }
+        }
+
+        if file_modes::file_needs_tightening(
+            &self.paths.data_dir.join("installer-manifest.json"),
+            0o644,
+        )? {
+            return Ok(true);
+        }
+        for kind in ["managed-binary", "binary-placement"] {
+            for path in self.inventory.paths_for_kind(kind) {
+                if file_modes::file_needs_tightening(&path, 0o755)? {
+                    return Ok(true);
+                }
+            }
+        }
+        for path in self.inventory.paths_for_kind("configuration") {
+            if file_modes::file_needs_tightening(&path, 0o600)? {
+                return Ok(true);
+            }
+        }
+        for kind in ["runtime-definition", "runtime-registration"] {
+            for path in self.inventory.paths_for_kind(kind) {
+                if file_modes::file_needs_tightening(&path, 0o644)? {
+                    return Ok(true);
+                }
+            }
+        }
+        if let Some(key_path) = &self.paths.claustrum_key_path {
+            if file_modes::file_needs_tightening(key_path, 0o600)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn restart_runtime(&mut self, sections: &[String]) -> Result<(), String> {
@@ -686,6 +828,22 @@ impl SetupBackend {
 
 impl SetupExecutor for SetupBackend {
     type Error = String;
+
+    fn prepare_apply(&mut self, plan: &SetupPlan) -> Result<(), Self::Error> {
+        if plan
+            .operations
+            .iter()
+            .any(|operation| matches!(operation, SetupOperation::RemoveManagedComponent { .. }))
+        {
+            return Ok(());
+        }
+        self.tighten_existing_permissions()?;
+        let has_mutating_operation = plan.operations.iter().any(SetupOperation::mutates);
+        if plan.permission_repair && !has_mutating_operation {
+            println!("  tightened permissions on existing CortexKit paths");
+        }
+        Ok(())
+    }
 
     fn apply(&mut self, operation: &SetupOperation) -> Result<(), Self::Error> {
         match operation {

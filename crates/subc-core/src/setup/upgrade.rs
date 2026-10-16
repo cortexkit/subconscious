@@ -12,6 +12,7 @@ use subc_transport::connection_file;
 
 use super::{
     components::{installed_components, upgrade_roster},
+    file_modes,
     inventory::Inventory,
     model::{AlphaTarget, Component, UpgradeObserved, UpgradeTarget},
     release_index::ReleaseIndex,
@@ -128,6 +129,31 @@ fn load_current_inventory() -> Result<Inventory, String> {
             .to_string()
             .as_str(),
     )
+}
+
+fn tighten_upgrade_permissions(data_dir: &Path, inventory: &Inventory) -> Result<(), String> {
+    file_modes::tighten_owned_directory(data_dir, 0o700)?;
+    file_modes::tighten_owned_directory(&data_dir.join("bin"), 0o755)?;
+    file_modes::tighten_owned_directory(&data_dir.join("cmd"), 0o755)?;
+    file_modes::tighten_owned_directory(&data_dir.join("claustrum"), 0o700)?;
+    file_modes::tighten_owned_directory(&data_dir.join("stores"), 0o700)?;
+    for path in inventory.paths_for_kind("configuration") {
+        if let Some(parent) = path.parent() {
+            file_modes::tighten_owned_directory(parent, 0o700)?;
+        }
+    }
+    for path in inventory
+        .paths_for_kind("runtime-definition")
+        .into_iter()
+        .chain(inventory.paths_for_kind("runtime-registration"))
+    {
+        if let Some(parent) = path.parent() {
+            file_modes::tighten_owned_directory(parent, 0o755)?;
+        }
+    }
+    file_modes::tighten_owned_file(&data_dir.join("installer-manifest.json"), 0o644)?;
+    file_modes::tighten_owned_file(&data_dir.join("claustrum/master.key"), 0o600)?;
+    file_modes::tighten_inventory_files(inventory)
 }
 
 /// Discover only inventory-owned binaries belonging to installed components.
@@ -306,7 +332,9 @@ impl SystemUpgradeBackend {
                 ));
             }
         };
+        let data_dir = load_current_inventory_root()?;
         let inventory = load_current_inventory()?;
+        tighten_upgrade_permissions(&data_dir, &inventory)?;
         let expected_versions = targets
             .iter()
             .map(|item| {
@@ -583,7 +611,7 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
     fn create_rollback_copy(&mut self, target: UpgradeTarget) -> Result<String, String> {
         let (destination, rollback) = self.target_mutable_paths(target)?;
         let prior_inode = destination_inode(&destination)?;
-        fs::copy(&destination, &rollback).map_err(|error| {
+        file_modes::copy_file_with_mode(&destination, &rollback, 0o755).map_err(|error| {
             format!(
                 "could not create rollback copy {} from {}: {error}",
                 rollback.display(),
@@ -627,20 +655,16 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
                 destination.display()
             )
         })?;
+        file_modes::ensure_owned_directory(parent, 0o755)?;
         let temporary = parent.join(format!(".{}.upgrade", target.label()));
-        fs::copy(&prepared.candidate, &temporary).map_err(|error| {
-            format!(
-                "could not place verified candidate at {}: {error}",
-                temporary.display()
-            )
-        })?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&temporary, fs::Permissions::from_mode(0o755)).map_err(
-                |error| format!("could not mark {} executable: {error}", temporary.display()),
-            )?;
-        }
+        file_modes::copy_file_with_mode(&prepared.candidate, &temporary, 0o755).map_err(
+            |error| {
+                format!(
+                    "could not place verified candidate at {}: {error}",
+                    temporary.display()
+                )
+            },
+        )?;
         fs::rename(&temporary, &destination).map_err(|error| {
             format!(
                 "could not replace managed destination {}: {error}",
@@ -851,13 +875,7 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
         #[cfg(unix)]
         if target.is_self_replacing() {
             super::self_update_unix::replace_verified_candidate(&destination, &rollback)?;
-            fs::set_permissions(
-                &destination,
-                fs::metadata(&rollback)
-                    .map_err(|error| format!("could not read ck rollback mode: {error}"))?
-                    .permissions(),
-            )
-            .map_err(|error| format!("could not restore ck rollback mode: {error}"))?;
+            file_modes::set_new_file_mode(&destination, 0o755)?;
         } else {
             restore_rollback_by_rename(&rollback, &destination)?;
         }
@@ -900,13 +918,20 @@ fn restore_rollback_by_rename(rollback: &Path, destination: &Path) -> Result<(),
             .as_nanos()
     ));
     let result = (|| {
-        fs::copy(rollback, &temporary)
+        #[cfg(unix)]
+        file_modes::copy_file_with_mode(rollback, &temporary, 0o755)
             .map_err(|error| format!("could not stage rollback {}: {error}", rollback.display()))?;
-        let permissions = fs::metadata(rollback)
-            .map_err(|error| format!("could not read rollback mode: {error}"))?
-            .permissions();
-        fs::set_permissions(&temporary, permissions)
-            .map_err(|error| format!("could not restore rollback mode: {error}"))?;
+        #[cfg(not(unix))]
+        {
+            fs::copy(rollback, &temporary).map_err(|error| {
+                format!("could not stage rollback {}: {error}", rollback.display())
+            })?;
+            let permissions = fs::metadata(rollback)
+                .map_err(|error| format!("could not read rollback mode: {error}"))?
+                .permissions();
+            fs::set_permissions(&temporary, permissions)
+                .map_err(|error| format!("could not restore rollback mode: {error}"))?;
+        }
         fs::rename(&temporary, destination).map_err(|error| {
             format!(
                 "could not rename rollback over {}: {error}",
@@ -1015,6 +1040,69 @@ mod tests {
             path,
             format!("#!/bin/sh\necho 'binary {version}'\n").as_bytes(),
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn upgrade_tightens_existing_modes_only_on_owned_files() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = fixture_dir("upgrade-mode-repair");
+        let data_dir = root.join("cortexkit");
+        let binary_dir = data_dir.join("bin");
+        let config_dir = root.join(".config/cortexkit");
+        let runtime_dir = root.join("Library/LaunchAgents");
+        let claustrum_dir = data_dir.join("claustrum");
+        let directories = [
+            data_dir.clone(),
+            binary_dir.clone(),
+            config_dir.clone(),
+            runtime_dir.clone(),
+            claustrum_dir.clone(),
+            data_dir.join("cmd"),
+            data_dir.join("stores"),
+        ];
+        for directory in &directories {
+            fs::create_dir_all(directory).unwrap();
+        }
+        let binary = binary_dir.join("ck-aft");
+        let config = config_dir.join("subc.jsonc");
+        let runtime = runtime_dir.join("cortexkit.subc.plist");
+        let key = claustrum_dir.join("master.key");
+        let manifest = data_dir.join("installer-manifest.json");
+        let unrelated = data_dir.join("user-note.txt");
+        for path in [&binary, &config, &runtime, &key, &unrelated] {
+            fs::write(path, "contents").unwrap();
+        }
+        let mut inventory = Inventory::load(&manifest, "macos-arm64").unwrap();
+        inventory.record("managed-binary", &binary, Map::new());
+        inventory.record("configuration", &config, Map::new());
+        inventory.record("runtime-definition", &runtime, Map::new());
+        inventory.save().unwrap();
+
+        for directory in &directories {
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o777)).unwrap();
+        }
+        for path in [&binary, &config, &runtime, &key, &manifest, &unrelated] {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o666)).unwrap();
+        }
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o777)).unwrap();
+
+        tighten_upgrade_permissions(&data_dir, &inventory).unwrap();
+
+        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&data_dir), 0o700);
+        assert_eq!(mode(&binary_dir), 0o755);
+        assert_eq!(mode(&data_dir.join("cmd")), 0o755);
+        assert_eq!(mode(&config_dir), 0o700);
+        assert_eq!(mode(&runtime_dir), 0o755);
+        assert_eq!(mode(&claustrum_dir), 0o700);
+        assert_eq!(mode(&binary), 0o755);
+        assert_eq!(mode(&config), 0o600);
+        assert_eq!(mode(&runtime), 0o644);
+        assert_eq!(mode(&key), 0o600);
+        assert_eq!(mode(&manifest), 0o644);
+        assert_eq!(mode(&unrelated), 0o666);
     }
 
     #[cfg(unix)]

@@ -1,6 +1,8 @@
-use std::{collections::BTreeMap, env, fs, io::ErrorKind, path::PathBuf, process, time::Duration};
+use std::{collections::BTreeMap, env, fs, io::ErrorKind, path::PathBuf, time::Duration};
 
 use serde::{Deserialize, Serialize};
+
+use super::file_modes;
 
 pub const UPDATE_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
@@ -119,15 +121,15 @@ impl UpdateCache {
         let Some(parent) = path.parent() else {
             return Err(format!("cache path {} has no parent", path.display()));
         };
-        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        file_modes::ensure_owned_directory(parent, 0o700)?;
         let bytes = serde_json::to_vec(metadata).map_err(|error| error.to_string())?;
-        let temporary = path.with_extension(format!("tmp-{}", process::id()));
-        fs::write(&temporary, bytes).map_err(|error| error.to_string())?;
-        if let Err(error) = fs::rename(&temporary, path) {
-            let _ = fs::remove_file(&temporary);
-            return Err(error.to_string());
-        }
-        Ok(())
+        file_modes::write_atomic(
+            path,
+            &bytes,
+            0o644,
+            0o644,
+            &format!("tmp-{}", std::process::id()),
+        )
     }
 }
 

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.20.98
+
+- Set installed executables to 0755 and private data/staging paths to 0700 regardless of the caller's umask. Keep generated `subc.jsonc` owner-only because module env blocks can hold tokens; non-secret inventory, update metadata, and daemon service definitions are at most 0644. Setup tightens loose modes on owned paths; run `ck setup` to tighten an existing install without changing unrelated files.
+
 ## 0.20.97
 
 - Add a hidden `--ck-cli-face-reserved-names` mode that prints the subcommands `ck` handles itself, one per line, without contacting the daemon. Module placement reads it to refuse a module command (`ck <name>`, served by a `ck-<name>` link) that a built-in would shadow.

@@ -12,6 +12,9 @@ use super::{
 pub struct SetupPlan {
     pub operations: Vec<SetupOperation>,
     pub outcomes: Vec<PlanOutcome>,
+    /// Unix setup needs this extra permissions-only step when observation finds
+    /// loose modes on app-specific directories or inventory-owned files.
+    pub(crate) permission_repair: bool,
 }
 
 impl SetupPlan {
@@ -27,11 +30,13 @@ impl SetupPlan {
         })
     }
 
+    /// Counts planned operations and any implicit permissions repair.
     pub fn mutation_count(&self) -> usize {
         self.operations
             .iter()
             .filter(|operation| operation.mutates())
             .count()
+            + usize::from(self.permission_repair)
     }
 
     /// The dry-run text an operator reads before consenting. `ck setup`
@@ -55,6 +60,7 @@ pub fn plan_setup(observed: &SetupObserved, request: &SetupRequest) -> SetupPlan
     let mut plan = SetupPlan {
         operations: vec![SetupOperation::ObservePlatform],
         outcomes: Vec::new(),
+        permission_repair: cfg!(unix) && observed.permissions_need_tightening && !request.uninstall,
     };
 
     let PlatformObservation::Supported(target) = &observed.platform else {
@@ -335,6 +341,12 @@ pub trait SetupExecutor {
 
     fn apply(&mut self, operation: &SetupOperation) -> Result<(), Self::Error>;
 
+    /// Tightens permissions on files this installation owns before an
+    /// authorized apply, including a plan with no component changes.
+    fn prepare_apply(&mut self, _plan: &SetupPlan) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
     /// Removes only the completed steps for `component` from this execution.
     /// The default preserves simple executors that never create component-owned
     /// state, while the filesystem executor records each applied step by component.
@@ -383,6 +395,8 @@ pub fn execute_setup<E: SetupExecutor>(
     if mode == ExecutionMode::DryRun || !plan.is_authorized() {
         return Ok(report);
     }
+
+    executor.prepare_apply(plan)?;
 
     let mut pending_restart: Option<Vec<String>> = None;
     let mut restart_applied = false;
@@ -684,6 +698,7 @@ mod tests {
             platform: PlatformObservation::Supported(AlphaTarget::LinuxX64),
             components,
             releases,
+            permissions_need_tightening: false,
             requires_core: BTreeMap::new(),
             installed_core_version: None,
             core_binary_present: false,
@@ -1980,20 +1995,41 @@ mod tests {
         settled.runtime = RuntimeState::Correct;
         settled.bus_monitoring = nats_install(ListenerState::WouldAdd, HealthState::Kept);
         let request = SetupRequest::install(Vec::new());
-        assert_eq!(plan_setup(&settled, &request).mutation_count(), 1);
+        let plan = plan_setup(&settled, &request);
+        assert_eq!(
+            plan.operations
+                .iter()
+                .filter(|operation| operation.mutates())
+                .count(),
+            1
+        );
         for (listener, health) in [
             (ListenerState::Present, HealthState::Matching),
             (ListenerState::Kept, HealthState::Kept),
         ] {
             settled.bus_monitoring = nats_install(listener, health);
             let plan = plan_setup(&settled, &request);
-            assert_eq!(plan.mutation_count(), 0, "{}", plan.render());
+            assert_eq!(
+                plan.operations
+                    .iter()
+                    .filter(|operation| operation.mutates())
+                    .count(),
+                0,
+                "{}",
+                plan.render()
+            );
         }
         settled.bus_monitoring = BusMonitoring::Skipped {
             reason: "no -c".to_string(),
         };
         let plan = plan_setup(&settled, &request);
-        assert_eq!(plan.mutation_count(), 0);
+        assert_eq!(
+            plan.operations
+                .iter()
+                .filter(|operation| operation.mutates())
+                .count(),
+            0
+        );
         assert!(
             plan.render().contains("skipped: no -c"),
             "{}",

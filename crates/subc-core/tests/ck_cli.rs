@@ -583,7 +583,19 @@ impl SetupFixture {
     }
 
     fn command(&self, index: &SignedIndex, args: &[&str]) -> Command {
-        let mut command = ck_command();
+        #[cfg(unix)]
+        let command = direct_ck_command();
+        #[cfg(not(unix))]
+        let command = ck_command();
+        self.command_from(command, index, args)
+    }
+
+    #[cfg(unix)]
+    fn command_direct(&self, index: &SignedIndex, args: &[&str]) -> Command {
+        self.command_from(direct_ck_command(), index, args)
+    }
+
+    fn command_from(&self, mut command: Command, index: &SignedIndex, args: &[&str]) -> Command {
         let path = std::env::join_paths(std::iter::once(self.tools.clone()).chain(
             std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
         ))
@@ -606,6 +618,21 @@ impl SetupFixture {
             .env("CK_TEST_RELEASE_INDEX_PUBKEY", &index.public_key)
             .env("CK_TEST_SETUP_CONTROL_OK", "1")
             .env("CK_TEST_SETUP_MODULES", "aft,claustrum,insula");
+        command
+    }
+
+    #[cfg(unix)]
+    fn command_with_zero_umask(&self, index: &SignedIndex, args: &[&str]) -> Command {
+        let child = self.command_direct(index, args);
+        let mut command = Command::new(env!("CARGO_BIN_EXE_mode-umask-helper"));
+        command.arg(child.get_program()).args(child.get_args());
+        for (key, value) in child.get_envs() {
+            if let Some(value) = value {
+                command.env(key, value);
+            } else {
+                command.env_remove(key);
+            }
+        }
         command
     }
 }
@@ -884,6 +911,18 @@ fn write_executable(path: &Path, contents: &str) {
     }
 }
 
+#[cfg(unix)]
+fn assert_mode(path: &Path, expected: u32) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let actual = fs::metadata(path)
+        .expect("mode metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(actual, expected, "unexpected mode for {}", path.display());
+}
+
 fn service_manager_program() -> &'static str {
     if cfg!(target_os = "macos") {
         "launchctl"
@@ -1088,6 +1127,41 @@ fn setup_core_drift_floor_refusal_is_actionable_and_never_mutates() {
 #[test]
 fn setup_nothing_to_do_never_renders_outcome_no_op() {
     let fixture = SetupFixture::installed("ck-setup-current");
+    // The no-op claim applies only when this existing install already has
+    // setup's managed modes; loose paths now produce a real tightening step.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let cortexkit = fixture.data_home.join("cortexkit");
+        let binary_dir = cortexkit.join("bin");
+        let config = fixture.config_home.join("cortexkit/subc.jsonc");
+        let config_dir = config.parent().unwrap().to_path_buf();
+        let manifest = cortexkit.join("installer-manifest.json");
+        for (path, mode) in [
+            (&cortexkit, 0o700),
+            (&binary_dir, 0o755),
+            (&config_dir, 0o700),
+            (&config, 0o600),
+            (&manifest, 0o644),
+        ] {
+            fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+        }
+        for binary in [
+            "ck-subc",
+            "ck-subc-mcp",
+            "ck-aft",
+            "ck-claustrum",
+            "ck-auth",
+            "ck-insula",
+        ] {
+            fs::set_permissions(
+                cortexkit.join("bin").join(platform_binary(binary)),
+                fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+        }
+    }
     let index = serve_signed_index(|base| setup_index(base, None));
     let output = fixture.command(&index, &["setup"]).output().unwrap();
 
@@ -1153,13 +1227,14 @@ fn setup_mc_dry_run_has_future_steps_and_the_config_diff() {
     assert_exit(&output, 0);
     let stdout = text(&output.stdout);
     for line in [
-        "  1. would download and verify ck-mc (12.1 MiB)".to_string(),
+        "  1. would tighten permissions on existing CortexKit paths".to_string(),
+        "  2. would download and verify ck-mc (12.1 MiB)".to_string(),
         format!(
-            "  2. would place ~/.local/share/cortexkit/bin/{}",
+            "  3. would place ~/.local/share/cortexkit/bin/{}",
             platform_binary("ck-mc")
         ),
-        "  3. would configure magic-context in ~/.config/cortexkit/subc.jsonc".to_string(),
-        "  4. would register magic-context with the daemon and check its health".to_string(),
+        "  4. would configure magic-context in ~/.config/cortexkit/subc.jsonc".to_string(),
+        "  5. would register magic-context with the daemon and check its health".to_string(),
         "proposed configuration diff:".to_string(),
         "+    \"magic-context\": {".to_string(),
     ] {
@@ -1273,6 +1348,239 @@ fn fresh_setup_prints_the_pasteable_claude_code_command() {
         ),
         "stdout:\n{stdout}"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn setup_creates_owned_paths_with_explicit_modes_under_zero_umask() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = SetupFixture::fresh("ck-setup-zero-umask-modes");
+    let cortexkit = fixture.data_home.join("cortexkit");
+    let bin = cortexkit.join("bin");
+    fs::set_permissions(&cortexkit, fs::Permissions::from_mode(0o777)).unwrap();
+    fs::set_permissions(&bin, fs::Permissions::from_mode(0o777)).unwrap();
+    let stage_report = fixture._root.path().join("stage-modes");
+    write_executable(
+        &fixture.tools.join("unzip"),
+        r##"#!/bin/sh
+set -eu
+archive=""
+destination=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -q) shift ;;
+    -d) destination="$2"; shift 2 ;;
+    *) archive="$1"; shift ;;
+  esac
+done
+mode_of() {
+  local mode
+  mode=$(stat -f '%Lp' "$1" 2>/dev/null) || mode=$(stat -c '%a' "$1")
+  printf '%s' "$mode"
+}
+printf '%s %s %s\n' "$(mode_of "$(dirname "$archive")")" "$(mode_of "$destination")" "$(mode_of "$archive")" >>"$CK_TEST_STAGE_REPORT"
+case "$archive" in
+  *ck-subc-mcp-*.zip) binary=ck-subc-mcp ;;
+  *ck-subc-*.zip) binary=ck-subc ;;
+  *) exit 2 ;;
+esac
+printf '#!/bin/sh\necho "%s 0.17.10"\n' "$binary" >"$destination/$binary"
+"##,
+    );
+
+    let subc = fixture_archive(fixture._root.path(), "ck-subc", "ck-subc 0.17.10", 0);
+    let mcp = fixture_archive(
+        fixture._root.path(),
+        "ck-subc-mcp",
+        "ck-subc-mcp 0.17.10",
+        0,
+    );
+    let index = serve_signed_index(|base| {
+        let target = host_target();
+        let mut assets = BTreeMap::new();
+        assets.insert("/ck-subc.zip".to_string(), subc.clone());
+        assets.insert("/ck-subc-mcp.zip".to_string(), mcp.clone());
+        (
+            json!({
+                "schema": 1,
+                "channel": "alpha",
+                "generated_at_ms": now_ms(),
+                "components": {
+                    "core": index_component(
+                        "subc-core-v0.17.10",
+                        Some("0.17.10"),
+                        &target,
+                        [
+                            ("ck-subc", fixture_asset(format!("{base}/ck-subc.zip"), sha256_hex(&subc), subc.len() as u64, Some("0.17.10"))),
+                            ("ck-subc-mcp", fixture_asset(format!("{base}/ck-subc-mcp.zip"), sha256_hex(&mcp), mcp.len() as u64, Some("0.17.10"))),
+                        ],
+                    ),
+                },
+            }),
+            assets,
+        )
+    });
+    let output = fixture
+        .command_with_zero_umask(&index, &["setup"])
+        .env("CK_TEST_SETUP_RUNTIME_MISSING", "1")
+        .env("CK_TEST_STAGE_REPORT", &stage_report)
+        .output()
+        .expect("setup runs with zero umask in its child");
+
+    assert_exit(&output, 0);
+    assert_mode(&cortexkit, 0o700);
+    assert_mode(&bin, 0o755);
+    assert_mode(&bin.join(platform_binary("ck-subc")), 0o755);
+    assert_mode(&bin.join(platform_binary("ck-subc-mcp")), 0o755);
+    assert_mode(&cortexkit.join("installer-manifest.json"), 0o644);
+    let config = fixture.config_home.join("cortexkit");
+    assert_mode(&config, 0o700);
+    assert_mode(&config.join("subc.jsonc"), 0o600);
+    assert_mode(&runtime_definition(&fixture.home), 0o644);
+    let stage_modes = fs::read_to_string(stage_report).expect("staging mode report");
+    assert_eq!(stage_modes.lines().count(), 2, "{stage_modes}");
+    for modes in stage_modes.lines() {
+        assert_eq!(modes, "700 700 600", "unexpected staging modes: {modes}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn setup_tightens_existing_owned_modes_on_a_noop_plan_without_chmodding_unowned_files() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = SetupFixture::installed("ck-setup-tighten-existing-modes");
+    let cortexkit = fixture.data_home.join("cortexkit");
+    let bin = cortexkit.join("bin");
+    let config = fixture.config_home.join("cortexkit").join("subc.jsonc");
+    let manifest = cortexkit.join("installer-manifest.json");
+    let mut document: Value = serde_json::from_slice(&fs::read(&manifest).unwrap()).unwrap();
+    document["mutations"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"kind": "configuration", "path": config.clone()}));
+    fs::write(&manifest, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
+
+    for path in [&cortexkit, &bin] {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o777)).unwrap();
+    }
+    fs::set_permissions(&manifest, fs::Permissions::from_mode(0o666)).unwrap();
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o666)).unwrap();
+    for binary in [
+        "ck-subc",
+        "ck-subc-mcp",
+        "ck-aft",
+        "ck-claustrum",
+        "ck-auth",
+        "ck-insula",
+    ] {
+        fs::set_permissions(
+            bin.join(platform_binary(binary)),
+            fs::Permissions::from_mode(0o777),
+        )
+        .unwrap();
+    }
+    let unrelated = cortexkit.join("user-owned.txt");
+    fs::write(&unrelated, "leave this file alone").unwrap();
+    fs::set_permissions(&unrelated, fs::Permissions::from_mode(0o666)).unwrap();
+
+    let index = serve_signed_index(|base| setup_index(base, None));
+    let output = fixture.command_direct(&index, &["setup"]).output().unwrap();
+
+    assert_exit(&output, 0);
+    assert_eq!(
+        text(&output.stdout),
+        "  tightened permissions on existing CortexKit paths\nDone.\n"
+    );
+    assert_mode(&cortexkit, 0o700);
+    assert_mode(&bin, 0o755);
+    assert_mode(&manifest, 0o644);
+    assert_mode(&config, 0o600);
+    assert_mode(&unrelated, 0o666);
+    for binary in [
+        "ck-subc",
+        "ck-subc-mcp",
+        "ck-aft",
+        "ck-claustrum",
+        "ck-auth",
+        "ck-insula",
+    ] {
+        assert_mode(&bin.join(platform_binary(binary)), 0o755);
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn setup_keeps_bootstrapped_claustrum_key_owner_only_under_zero_umask() {
+    let fixture = SetupFixture::fresh("ck-setup-zero-umask-key");
+    let core_daemon = fixture_archive(fixture._root.path(), "ck-subc", "ck-subc 0.17.10", 0);
+    let core_mcp = fixture_archive(
+        fixture._root.path(),
+        "ck-subc-mcp",
+        "ck-subc-mcp 0.17.10",
+        0,
+    );
+    let claustrum = fixture_archive(
+        fixture._root.path(),
+        "ck-claustrum",
+        "ck-claustrum 0.17.10",
+        0,
+    );
+    let auth_binary = platform_binary("ck-auth");
+    let auth_script = "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'ck-auth 0.17.10'; exit 0; fi\nif [ \"$1\" = \"bootstrap\" ]; then shift; while [ $# -gt 0 ]; do if [ \"$1\" = \"--key-path\" ]; then key=\"$2\"; shift 2; else shift; fi; done; if [ -n \"${key:-}\" ]; then printf secret >\"$key\"; fi; exit 0; fi\nexit 2\n".to_string();
+    let auth = stored_zip(&[(&auth_binary, auth_script.as_bytes())]);
+    let index = serve_signed_index(|base| {
+        let target = host_target();
+        let mut assets = BTreeMap::new();
+        for (name, archive) in [
+            ("ck-subc", &core_daemon),
+            ("ck-subc-mcp", &core_mcp),
+            ("ck-claustrum", &claustrum),
+            ("ck-auth", &auth),
+        ] {
+            assets.insert(format!("/{name}.zip"), archive.clone());
+        }
+        (
+            json!({
+                "schema": 1,
+                "channel": "alpha",
+                "generated_at_ms": now_ms(),
+                "components": {
+                    "core": index_component(
+                        "subc-core-v0.17.10",
+                        Some("0.17.10"),
+                        &target,
+                        [
+                            ("ck-subc", fixture_asset(format!("{base}/ck-subc.zip"), sha256_hex(&core_daemon), core_daemon.len() as u64, Some("0.17.10"))),
+                            ("ck-subc-mcp", fixture_asset(format!("{base}/ck-subc-mcp.zip"), sha256_hex(&core_mcp), core_mcp.len() as u64, Some("0.17.10"))),
+                        ],
+                    ),
+                    "claustrum": index_component(
+                        "subc-claustrum-v0.17.10",
+                        Some("0.17.10"),
+                        &target,
+                        [
+                            ("ck-claustrum", fixture_asset(format!("{base}/ck-claustrum.zip"), sha256_hex(&claustrum), claustrum.len() as u64, Some("0.17.10"))),
+                            ("ck-auth", fixture_asset(format!("{base}/ck-auth.zip"), sha256_hex(&auth), auth.len() as u64, Some("0.17.10"))),
+                        ],
+                    ),
+                },
+            }),
+            assets,
+        )
+    });
+    let output = fixture
+        .command_with_zero_umask(&index, &["setup", "claustrum"])
+        .env("CK_TEST_SETUP_RUNTIME_MISSING", "1")
+        .output()
+        .expect("claustrum setup runs with zero umask in its child");
+
+    assert_exit(&output, 0);
+    let cortexkit = fixture.data_home.join("cortexkit");
+    assert_mode(&cortexkit, 0o700);
+    assert_mode(&cortexkit.join("claustrum"), 0o700);
+    assert_mode(&cortexkit.join("claustrum/master.key"), 0o600);
 }
 
 struct UpgradeFixture {
@@ -3952,6 +4260,16 @@ fn looks_like_age(text: &str) -> bool {
 /// The test CLI, run as `ckdev-under-test` (see `common::ck_under_test_command`).
 fn ck_command() -> Command {
     let mut command = common::ck_under_test_command();
+    isolate_ck_command(&mut command);
+    command
+}
+
+#[cfg(unix)]
+fn direct_ck_command() -> Command {
+    // Setup fixtures use isolated user paths, so they can run Cargo's
+    // `ck-under-test` binary without publishing `ckdev-under-test` into
+    // `/tmp/cortexkit-ckdev-<uid>`.
+    let mut command = Command::new(env!("CARGO_BIN_EXE_ck-under-test"));
     isolate_ck_command(&mut command);
     command
 }

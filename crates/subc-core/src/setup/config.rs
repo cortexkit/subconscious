@@ -7,7 +7,7 @@ use std::{
 use serde_json::{Map, Value};
 use subc_jsonc::{jsonc_member_span, jsonc_object_span, jsonc_to_json};
 
-use super::model::Component;
+use super::{file_modes, model::Component};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConfigConflict {
@@ -294,22 +294,14 @@ pub fn apply(change: &ConfigChange) -> Result<(), String> {
             change.path.display()
         )
     })?;
-    fs::create_dir_all(parent).map_err(|error| {
-        format!(
-            "could not create configuration directory {}: {error}",
-            parent.display()
-        )
-    })?;
-    let temporary = change.path.with_extension("jsonc.tmp");
-    fs::write(&temporary, &change.after)
-        .map_err(|error| format!("could not write {}: {error}", temporary.display()))?;
-    fs::rename(&temporary, &change.path).map_err(|error| {
-        format!(
-            "could not replace configuration {} with {}: {error}",
-            change.path.display(),
-            temporary.display()
-        )
-    })
+    file_modes::ensure_owned_directory(parent, 0o700)?;
+    file_modes::write_atomic(
+        &change.path,
+        change.after.as_bytes(),
+        0o600,
+        0o600,
+        "jsonc.tmp",
+    )
 }
 
 /// Removes only a component's values when setup must unwind a later failure.

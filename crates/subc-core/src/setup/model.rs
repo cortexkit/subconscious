@@ -290,6 +290,9 @@ pub struct SetupObserved {
     pub platform: PlatformObservation,
     pub components: BTreeMap<Component, ComponentState>,
     pub releases: BTreeMap<Component, ReleaseAvailability>,
+    /// True when an app-specific directory or inventory-owned file exceeds
+    /// setup's permission ceilings.
+    pub permissions_need_tightening: bool,
     /// Module daemon floors copied from the signed release index.
     pub requires_core: BTreeMap<Component, String>,
     /// The installed daemon version, absent when neither live catalog nor binary
@@ -346,6 +349,7 @@ impl SetupObserved {
             platform: PlatformObservation::current(),
             components,
             releases,
+            permissions_need_tightening: false,
             requires_core: BTreeMap::new(),
             installed_core_version: None,
             core_binary_present: false,

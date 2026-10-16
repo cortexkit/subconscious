@@ -5,7 +5,7 @@ use std::{
 
 use serde_json::{json, Map, Value};
 
-use super::components::OWNED_BINARY_KINDS;
+use super::{components::OWNED_BINARY_KINDS, file_modes};
 
 const SCHEMA_VERSION: u64 = 1;
 
@@ -268,29 +268,20 @@ impl Inventory {
             .path
             .parent()
             .ok_or_else(|| format!("inventory {} has no parent directory", self.path.display()))?;
-        fs::create_dir_all(parent).map_err(|error| {
-            format!(
-                "could not create inventory directory {}: {error}",
-                parent.display()
-            )
-        })?;
+        file_modes::ensure_owned_directory(parent, 0o700)?;
         let serialized = serde_json::to_string_pretty(&self.document).map_err(|error| {
             format!(
                 "could not serialize inventory {}: {error}",
                 self.path.display()
             )
         })?;
-        let temporary = self.path.with_extension("json.tmp");
-        fs::write(&temporary, format!("{serialized}\n")).map_err(|error| {
-            format!("could not write inventory {}: {error}", temporary.display())
-        })?;
-        fs::rename(&temporary, &self.path).map_err(|error| {
-            format!(
-                "could not replace inventory {} with {}: {error}",
-                self.path.display(),
-                temporary.display()
-            )
-        })?;
+        file_modes::write_atomic(
+            &self.path,
+            format!("{serialized}\n").as_bytes(),
+            0o644,
+            0o644,
+            "json.tmp",
+        )?;
         self.changed = false;
         Ok(())
     }

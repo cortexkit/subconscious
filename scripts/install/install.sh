@@ -12,7 +12,9 @@ if [ -z "${BASH_VERSION:-}" ]; then
   printf 'refusal: wrong-shell: this installer needs bash; run: curl -fsSL https://cortexkit.io/install | bash\n' >&2
   exit 64
 fi
-set -euo pipefail
+
+# Fix every subsequent file creation independently of the caller's umask.
+umask 077
 
 readonly INDEX_URL_DEFAULT="https://cortexkit.io/releases/v1/index.json"
 readonly PATH_BLOCK_BEGIN="# cortexkit-managed PATH begin"
@@ -50,6 +52,67 @@ sha256_for() {
 
 json_escape() {
   printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
+}
+
+# Create missing parents with an explicit mode; the caller's umask cannot
+# widen a new directory beyond the mode requested here.
+ensure_created_directory_tree() {
+  local directory="$1"
+  local mode="$2"
+  local refusal_type="${3:-placement-failed}"
+  local parent
+
+  if [[ -d "$directory" ]]; then
+    return
+  fi
+  parent=$(dirname "$directory")
+  if [[ "$parent" != "$directory" && ! -d "$parent" ]]; then
+    ensure_created_directory_tree "$parent" 700 "$refusal_type"
+  fi
+  if ! mkdir -m "$mode" "$directory"; then
+    refuse "$refusal_type" "could not create directory $directory"
+  fi
+}
+
+# Path-based chmod is safe only inside a private stage that other users cannot
+# replace; verify both its permissions and owner before using it.
+is_private_staging_directory() {
+  local directory="$1"
+  local mode
+  local owner
+  local expected_owner
+
+  [[ -d "$directory" && ! -L "$directory" ]] || return 1
+  mode=$(stat -f '%Lp' "$directory" 2>/dev/null) || mode=$(stat -c '%a' "$directory" 2>/dev/null) || return 1
+  owner=$(stat -f '%u' "$directory" 2>/dev/null) || owner=$(stat -c '%u' "$directory" 2>/dev/null) || return 1
+  expected_owner=$(id -u) || return 1
+  [[ "$mode" == "700" && "$owner" == "$expected_owner" ]]
+}
+
+is_owned_nonwritable_directory() {
+  local directory="$1"
+  local mode
+  local owner
+  local expected_owner
+  local permission_bits
+  local group_mode
+  local other_mode
+
+  [[ -d "$directory" && ! -L "$directory" ]] || return 1
+  mode=$(stat -f '%Lp' "$directory" 2>/dev/null) || mode=$(stat -c '%a' "$directory" 2>/dev/null) || return 1
+  owner=$(stat -f '%u' "$directory" 2>/dev/null) || owner=$(stat -c '%u' "$directory" 2>/dev/null) || return 1
+  expected_owner=$(id -u) || return 1
+  [[ "$owner" == "$expected_owner" ]] || return 1
+  case "$mode" in
+    ''|*[!0-7]*) return 1 ;;
+  esac
+  permission_bits="${mode: -3}"
+  group_mode="${permission_bits:1:1}"
+  other_mode="${permission_bits:2:1}"
+  case "$group_mode$other_mode" in
+    *[2367]*) return 1 ;;
+  esac
+  return 0
 }
 
 select_profile() {
@@ -99,9 +162,7 @@ ensure_profile_path() {
   done
 
   profile_directory=$(dirname "$profile")
-  if ! mkdir -p "$profile_directory"; then
-    refuse "path-update-failed" "could not create profile directory $profile_directory"
-  fi
+  ensure_created_directory_tree "$profile_directory" 700 path-update-failed
   if [[ ! -e "$profile" ]]; then
     if ! : >"$profile"; then
       refuse "path-update-failed" "could not create shell profile $profile"
@@ -118,9 +179,9 @@ ensure_profile_path() {
     rm -f "$without_block"
     refuse "path-update-failed" "could not prepare update for $profile"
   fi
-  # mktemp creates mode 0600 files. Preserve the profile's existing metadata
-  # before filling the replacement so an update cannot change its permissions.
-  if ! cp -p "$profile" "$updated_profile" || ! : >"$updated_profile"; then
+  # Keep the replacement owner-only while constructing it; copying metadata
+  # from a previously writable profile would expose the temporary contents.
+  if ! : >"$updated_profile"; then
     rm -f "$without_block" "$updated_profile"
     refuse "path-update-failed" "could not preserve shell profile metadata for $profile"
   fi
@@ -260,6 +321,13 @@ EOF
   fi
 }
 
+cleanup_staging() {
+  rm -rf "$temp_dir"
+  if [[ -n "${placement_stage:-}" ]]; then
+    rm -rf "$placement_stage"
+  fi
+}
+
 if ! raw_os=$(uname -s); then
   refuse "unsupported-platform" "could not determine operating system"
 fi
@@ -315,7 +383,10 @@ manifest="$data_dir/installer-manifest.json"
 if ! temp_dir=$(mktemp -d); then
   refuse "download-failed" "could not create a temporary download directory"
 fi
-trap 'rm -rf "$temp_dir"' EXIT HUP INT TERM
+trap cleanup_staging EXIT HUP INT TERM
+if ! is_private_staging_directory "$temp_dir"; then
+  refuse "download-failed" "temporary download directory is not owner-only or is not owned by this user"
+fi
 archive_path="$temp_dir/$archive_name"
 extract_dir="$temp_dir/extracted"
 index_path="$temp_dir/index.json"
@@ -388,8 +459,9 @@ if [[ "$actual_digest" != "$expected_digest" ]]; then
   refuse "digest-mismatch" "$archive_name expected $expected_digest but downloaded $actual_digest"
 fi
 
-if ! mkdir -p "$extract_dir"; then
-  refuse "extraction-failed" "could not create extraction directory for $archive_name"
+ensure_created_directory_tree "$extract_dir" 700 extraction-failed
+if ! is_private_staging_directory "$extract_dir"; then
+  refuse "extraction-failed" "extraction directory is not owner-only or is not owned by this user"
 fi
 if ! unzip -q "$archive_path" -d "$extract_dir"; then
   refuse "extraction-failed" "could not extract $archive_name"
@@ -398,20 +470,29 @@ candidate="$extract_dir/ck"
 if [[ ! -f "$candidate" ]]; then
   refuse "extraction-failed" "$archive_name did not contain ck at its archive root"
 fi
-if ! chmod u+x "$candidate"; then
-  refuse "extraction-failed" "could not make extracted ck executable"
+if ! chmod 755 "$candidate"; then
+  refuse "extraction-failed" "could not set executable mode on extracted ck"
 fi
 candidate_digest=$(sha256_for "$candidate")
+
+ensure_created_directory_tree "$data_dir" 700
+ensure_created_directory_tree "$cmd_dir" 755
+if ! is_owned_nonwritable_directory "$data_dir" || ! is_owned_nonwritable_directory "$cmd_dir"; then
+  refuse "placement-failed" "data and command directories must be owned by this user and not writable by others; run ck setup to repair existing paths"
+fi
 
 if [[ -f "$destination" ]] && cmp -s "$candidate" "$destination"; then
   printf 'ck already matches verified download at %s; skipping placement.\n' "$destination"
 else
-  if ! mkdir -p "$cmd_dir"; then
-    refuse "placement-failed" "could not create destination directory $cmd_dir"
+  # This private sibling keeps the mode change off the destination path and
+  # makes the final move a same-filesystem atomic rename.
+  if ! placement_stage=$(mktemp -d "$cmd_dir/.ck-stage.XXXXXX"); then
+    refuse "placement-failed" "could not prepare destination staging directory"
   fi
-  if ! placement_tmp=$(mktemp "$cmd_dir/.ck.XXXXXX"); then
-    refuse "placement-failed" "could not prepare destination $destination"
+  if ! is_private_staging_directory "$placement_stage"; then
+    refuse "placement-failed" "destination staging directory is not owner-only or is not owned by this user"
   fi
+  placement_tmp="$placement_stage/ck"
   if ! cp "$candidate" "$placement_tmp"; then
     rm -f "$placement_tmp"
     refuse "placement-failed" "could not copy ck to $destination"
@@ -421,9 +502,12 @@ else
     refuse "placement-failed" "could not make $destination executable"
   fi
   if ! mv "$placement_tmp" "$destination"; then
-    rm -f "$placement_tmp"
     refuse "placement-failed" "could not place ck at $destination"
   fi
+  if ! rmdir "$placement_stage"; then
+    refuse "placement-failed" "could not remove destination staging directory"
+  fi
+  placement_stage=""
   printf 'Installed ck at %s.\n' "$destination"
 fi
 

@@ -11,6 +11,8 @@ use hex_literal::hex;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 
+use super::file_modes;
+
 /// Generation 1 verifying key for the CortexKit release index.
 ///
 /// A later generation ships in a new `ck` before the index worker switches
@@ -159,32 +161,43 @@ fn fetch_index_at(
     now_ms: u64,
     deadline: Duration,
 ) -> Result<ReleaseIndex, IndexRefusal> {
-    let index_path = temporary_path("index.json");
-    let header_path = temporary_path("index.headers");
-    let signature = match download_index(url, &index_path, &header_path, deadline) {
-        Ok(signature) => signature,
-        Err(reason) => {
-            let _ = fs::remove_file(&index_path);
-            let _ = fs::remove_file(&header_path);
-            return Err(IndexRefusal::Unreachable {
-                url: url.to_string(),
-                reason,
-            });
+    let workspace = temporary_path("index");
+    file_modes::create_private_directory(&workspace).map_err(|reason| {
+        IndexRefusal::Unreachable {
+            url: url.to_string(),
+            reason,
         }
-    };
-    let index_bytes = match fs::read(&index_path) {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            let _ = fs::remove_file(&index_path);
-            let _ = fs::remove_file(&header_path);
-            return Err(IndexRefusal::Unreachable {
-                url: url.to_string(),
-                reason: error.to_string(),
-            });
+    })?;
+    let _workspace = IndexWorkspace(workspace.clone());
+    let index_path = workspace.join("index.json");
+    let header_path = workspace.join("index.headers");
+    #[cfg(unix)]
+    for path in [&index_path, &header_path] {
+        file_modes::create_new_file(path, 0o600).map_err(|reason| IndexRefusal::Unreachable {
+            url: url.to_string(),
+            reason,
+        })?;
+    }
+    let signature = download_index(url, &index_path, &header_path, deadline).map_err(|reason| {
+        IndexRefusal::Unreachable {
+            url: url.to_string(),
+            reason,
         }
-    };
-    let _ = fs::remove_file(&index_path);
-    let _ = fs::remove_file(&header_path);
+    })?;
+    for path in [&index_path, &header_path] {
+        if path.exists() {
+            file_modes::set_new_file_mode(path, 0o600).map_err(|reason| {
+                IndexRefusal::Unreachable {
+                    url: url.to_string(),
+                    reason,
+                }
+            })?;
+        }
+    }
+    let index_bytes = fs::read(&index_path).map_err(|error| IndexRefusal::Unreachable {
+        url: url.to_string(),
+        reason: error.to_string(),
+    })?;
     let Some(signature) = signature.filter(|value| !value.is_empty()) else {
         return Err(IndexRefusal::SignatureInvalid {
             url: url.to_string(),
@@ -416,6 +429,14 @@ fn temporary_path(name: &str) -> PathBuf {
             .expect("system time is after the Unix epoch")
             .as_nanos()
     ))
+}
+
+struct IndexWorkspace(PathBuf);
+
+impl Drop for IndexWorkspace {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
 }
 
 fn unix_now_ms() -> u64 {

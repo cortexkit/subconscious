@@ -990,6 +990,31 @@ fn display_home_path(path: &Path) -> String {
     }
 }
 
+fn unknown_external_command_error(domain: &str) -> String {
+    let search_hint = match setup::data_directory() {
+        Ok(data_home) => {
+            let source = if cfg!(windows) {
+                "LOCALAPPDATA"
+            } else if env::var_os("XDG_DATA_HOME")
+                .filter(|value| !value.is_empty())
+                .is_some()
+            {
+                "XDG_DATA_HOME"
+            } else {
+                "HOME"
+            };
+            format!(
+                "No ck-{domain} in the CortexKit bin folder ({}, from {source}) or on PATH.",
+                display_home_path(&data_home.join("bin"))
+            )
+        }
+        Err(_) => format!(
+            "No ck-{domain} in the CortexKit bin folder (data home could not be resolved) or on PATH."
+        ),
+    };
+    format!("unknown command '{domain}'. {search_hint} Run ck --help.")
+}
+
 /// Dispatch only a binary that completed the domain handshake. The handshake
 /// result is cached, but a changed executable gets a new stamp and is probed
 /// again before it can receive operator input.
@@ -1003,9 +1028,7 @@ fn dispatch_external(domain: &str, tail: &[OsString]) -> Result<(), CkError> {
                 module_id: module_id.clone(),
             })
         } else {
-            Err(CkError::Message(format!(
-                "unknown command '{domain}'. Run ck --help."
-            )))
+            Err(CkError::Message(unknown_external_command_error(domain)))
         };
     };
     if probe_external_domain(&candidate).is_some() {

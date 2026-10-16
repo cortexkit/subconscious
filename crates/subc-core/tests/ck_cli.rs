@@ -2324,11 +2324,65 @@ fn external_domains_opt_in_dispatch_and_cache_their_probe() {
         .output()
         .expect("reject unknown command");
     assert_exit(&unknown, 1);
-    assert_eq!(
-        text(&unknown.stderr).trim(),
-        "unknown command 'nosuch'. Run ck --help."
+    assert!(
+        text(&unknown.stderr)
+            .contains("unknown command 'nosuch'. No ck-nosuch in the CortexKit bin folder ("),
+        "unknown-command diagnostic did not name the managed bin folder:\n{}",
+        text(&unknown.stderr)
+    );
+    assert!(
+        text(&unknown.stderr).contains("from XDG_DATA_HOME) or on PATH. Run ck --help."),
+        "unknown-command diagnostic did not name its search sources:\n{}",
+        text(&unknown.stderr)
     );
     assert!(!text(&unknown.stderr).contains("usage:"));
+}
+
+#[cfg(not(windows))]
+#[test]
+fn unknown_command_names_managed_bin_folder_from_xdg_data_home() {
+    let temp = TempDir::new("ck-unknown-xdg-data-home");
+    let home = temp.path().join("home");
+    let xdg_data_home = home.join("xdg");
+    let path = temp.path().join("path");
+    fs::create_dir_all(&home).expect("create isolated home");
+    fs::create_dir_all(&path).expect("create isolated PATH");
+
+    let output = ck_command()
+        .arg("nosuchdomain")
+        .env("HOME", &home)
+        .env("XDG_DATA_HOME", &xdg_data_home)
+        .env("PATH", &path)
+        .output()
+        .expect("run unknown command with XDG data home");
+    assert_exit(&output, 1);
+    assert_eq!(
+        text(&output.stderr).trim(),
+        "unknown command 'nosuchdomain'. No ck-nosuchdomain in the CortexKit bin folder (~/xdg/cortexkit/bin, from XDG_DATA_HOME) or on PATH. Run ck --help."
+    );
+}
+
+#[cfg(not(windows))]
+#[test]
+fn unknown_command_names_managed_bin_folder_from_home() {
+    let temp = TempDir::new("ck-unknown-home-data-home");
+    let home = temp.path().join("home");
+    let path = temp.path().join("path");
+    fs::create_dir_all(&home).expect("create isolated home");
+    fs::create_dir_all(&path).expect("create isolated PATH");
+
+    let output = ck_command()
+        .arg("nosuchdomain")
+        .env("HOME", &home)
+        .env_remove("XDG_DATA_HOME")
+        .env("PATH", &path)
+        .output()
+        .expect("run unknown command with HOME data home");
+    assert_exit(&output, 1);
+    assert_eq!(
+        text(&output.stderr).trim(),
+        "unknown command 'nosuchdomain'. No ck-nosuchdomain in the CortexKit bin folder (~/.local/share/cortexkit/bin, from HOME) or on PATH. Run ck --help."
+    );
 }
 
 #[test]

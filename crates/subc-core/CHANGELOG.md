@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.20.96
+
+- When `ck <domain>` cannot find a command, name the managed bin folder it searched (or say when its data home could not be resolved) and state where that data home came from (XDG_DATA_HOME or HOME).
+
 ## 0.20.95
 
 - Require subc-daemon 0.36.6 so Linux crash recovery records the module's executable rather than the daemon executable briefly inherited by a newly spawned child. Recording the wrong executable prevented the next daemon from recognizing and stopping that child after a crash. Orphan shutdown test timeouts now report the initial and current observations, persisted record, configured executable's device/inode and Linux `/proc/<pid>/exe` link.

@@ -209,6 +209,163 @@ fi
 say() { printf '%s\n' "$*"; }
 refuse() { printf 'REFUSED: %s\n' "$*" >&2; exit 2; }
 
+FACE_STATE="not_checked"
+FACE_NAMES=()
+FACE_CREATE_NAMES=()
+FACE_KEEP_NAMES=()
+FACE_REMOVE_PATHS=()
+
+# Read the link target rather than following the link path, then resolve it
+# relative to the link's directory before comparing it with the placed binary.
+face_link_resolves_to_dest() {
+  [ -L "$1" ] || return 1
+  local target
+  target=$(readlink "$1") || return 1
+  python3 - "$1" "$target" "$DEST" <<'PY'
+import os, sys
+link, target, destination = sys.argv[1:]
+target_path = target if os.path.isabs(target) else os.path.join(os.path.dirname(os.path.abspath(link)), target)
+sys.exit(0 if os.path.realpath(target_path) == os.path.realpath(destination) else 1)
+PY
+}
+
+face_is_declared() {
+  local name
+  [ "${#FACE_NAMES[@]}" -gt 0 ] || return 1
+  for name in "${FACE_NAMES[@]}"; do
+    [ "$name" = "$1" ] && return 0
+  done
+  return 1
+}
+
+prepare_cli_face_plan() {
+  FACE_CREATE_NAMES=()
+  FACE_KEEP_NAMES=()
+  FACE_REMOVE_PATHS=()
+  [ "$FACE_STATE" = "present" ] || return 0
+
+  if [ "${#FACE_NAMES[@]}" -gt 0 ]; then
+    local ck_command reserved_output reserved name face_path link
+    ck_command=$(command -v ck || true)
+    if [ -z "$ck_command" ]; then
+      [ -x "$BIN_DIR/ck" ] || refuse "cannot check reserved CLI face names: no ck command is on PATH and $BIN_DIR/ck is not executable"
+      ck_command="$BIN_DIR/ck"
+    fi
+    reserved_output=$("$ck_command" --ck-cli-face-reserved-names) \
+      || refuse "could not read reserved CLI face names from $ck_command"
+    for name in "${FACE_NAMES[@]}"; do
+      while IFS= read -r reserved; do
+        [ "$reserved" = "$name" ] \
+          && refuse "CLI face '$name' is a built-in ck command and cannot be placed"
+      done <<< "$reserved_output"
+    done
+  fi
+
+  if [ "${#FACE_NAMES[@]}" -gt 0 ]; then
+    for name in "${FACE_NAMES[@]}"; do
+      face_path="$BIN_DIR/ck-$name"
+      if [ -L "$face_path" ]; then
+        if face_link_resolves_to_dest "$face_path"; then
+          FACE_KEEP_NAMES+=("$name")
+        else
+          refuse "$face_path is a symlink not owned by $DEST; refusing to replace it"
+        fi
+      elif [ -e "$face_path" ] || [ -d "$face_path" ]; then
+        refuse "$face_path already exists and is not a symlink owned by $DEST; refusing to replace it"
+      else
+        FACE_CREATE_NAMES+=("$name")
+      fi
+    done
+  fi
+
+  for link in "$BIN_DIR"/ck-*; do
+    [ -L "$link" ] || continue
+    face=${link##*/ck-}
+    face_is_declared "$face" && continue
+    if face_link_resolves_to_dest "$link"; then
+      FACE_REMOVE_PATHS+=("$link")
+    fi
+  done
+}
+
+print_cli_face_plan() {
+  case "$FACE_STATE" in
+    not_checked) say "cli faces: not checked; links unchanged" ;;
+    absent) say "cli faces: not declared; existing links left unchanged" ;;
+    present)
+      local name link
+      if [ "${#FACE_CREATE_NAMES[@]}" -gt 0 ]; then
+        for name in "${FACE_CREATE_NAMES[@]}"; do
+          say "cli face: would create ck-$name -> $DEST"
+        done
+      fi
+      if [ "${#FACE_KEEP_NAMES[@]}" -gt 0 ]; then
+        for name in "${FACE_KEEP_NAMES[@]}"; do
+          say "cli face: would keep ck-$name -> $DEST"
+        done
+      fi
+      if [ "${#FACE_REMOVE_PATHS[@]}" -gt 0 ]; then
+        for link in "${FACE_REMOVE_PATHS[@]}"; do
+          say "cli face: would remove ${link##*/} -> $DEST"
+        done
+      fi ;;
+  esac
+}
+
+reconcile_cli_faces() {
+  case "$FACE_STATE" in
+    not_checked) say "cli faces: not checked; links unchanged"; return 0 ;;
+    absent) say "cli faces: not declared; existing links left unchanged"; return 0 ;;
+  esac
+
+  local relative_target name face_path temp_link link
+  mkdir -p "$BIN_DIR"
+  relative_target=$(python3 - "$DEST" "$BIN_DIR" <<'PY'
+import os, sys
+print(os.path.relpath(os.path.abspath(sys.argv[1]), os.path.abspath(sys.argv[2])))
+PY
+  ) || refuse "could not compute a relative CLI face target for $DEST"
+
+  if [ "${#FACE_KEEP_NAMES[@]}" -gt 0 ]; then
+    for name in "${FACE_KEEP_NAMES[@]}"; do
+      say "cli face: kept ck-$name -> $DEST"
+    done
+  fi
+  if [ "${#FACE_CREATE_NAMES[@]}" -gt 0 ]; then
+    for name in "${FACE_CREATE_NAMES[@]}"; do
+      face_path="$BIN_DIR/ck-$name"
+      if [ -L "$face_path" ]; then
+        if face_link_resolves_to_dest "$face_path"; then
+          say "cli face: kept ck-$name -> $DEST"
+          continue
+        fi
+        refuse "$face_path changed to a symlink not owned by $DEST; refusing to replace it"
+      elif [ -e "$face_path" ] || [ -d "$face_path" ]; then
+        refuse "$face_path appeared as a non-owned path; refusing to replace it"
+      fi
+      temp_link="$BIN_DIR/.ck-$name.$$.$RANDOM.tmp"
+      ln -s "$relative_target" "$temp_link" \
+        || refuse "could not create temporary CLI face link for ck-$name"
+      if ! mv -f "$temp_link" "$face_path"; then
+        rm -f "$temp_link"
+        refuse "could not publish CLI face link ck-$name"
+      fi
+      say "cli face: created ck-$name -> $DEST"
+    done
+  fi
+  if [ "${#FACE_REMOVE_PATHS[@]}" -gt 0 ]; then
+    for link in "${FACE_REMOVE_PATHS[@]}"; do
+      # Re-read immediately before unlinking so a user-replaced link survives.
+      if face_link_resolves_to_dest "$link"; then
+        rm "$link" || refuse "could not remove stale CLI face ${link##*/}"
+        say "cli face: removed ${link##*/} -> $DEST"
+      else
+        refuse "stale CLI face ${link##*/} no longer points to $DEST; left it unchanged"
+      fi
+    done
+  fi
+}
+
 # BEFORE-READINGS: what exists only while the OUTGOING image runs.
 #
 # ENGRAM's rule (2026-09-19), from a quota incident where they killed a runaway
@@ -508,6 +665,72 @@ prov_home=$(mktemp -d)
 prov_json=$(XDG_DATA_HOME="$prov_home/data" XDG_RUNTIME_DIR="$prov_home/run" XDG_CONFIG_HOME="$prov_home/config" \
   perl -e 'alarm 5; exec @ARGV' "$STAGED" --manifest 2>/dev/null </dev/null) || prov_json=""
 rm -rf "$prov_home"
+face_probe_result=$(printf '%s' "$prov_json" | python3 -c '
+import json, os, re, sys
+
+class DuplicateKeyError(ValueError):
+    pass
+
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise DuplicateKeyError(f"duplicate JSON object key {key}")
+        result[key] = value
+    return result
+
+raw = sys.stdin.read()
+try:
+    manifest = json.loads(raw, object_pairs_hook=unique_object)
+except DuplicateKeyError as error:
+    print(f"invalid: {error}")
+    raise SystemExit(0)
+except Exception:
+    print("not_checked")
+    raise SystemExit(0)
+if not isinstance(manifest, dict):
+    print("not_checked")
+    raise SystemExit(0)
+if "cli_faces" not in manifest:
+    print("absent")
+    raise SystemExit(0)
+faces = manifest["cli_faces"]
+if not isinstance(faces, list):
+    print("invalid: cli_faces must be an array")
+    raise SystemExit(0)
+seen = set()
+for index, face in enumerate(faces):
+    if not isinstance(face, dict) or set(face) != {"name", "binary"}:
+        print(f"invalid: cli_faces[{index}] must contain exactly name and binary")
+        raise SystemExit(0)
+    name, binary = face["name"], face["binary"]
+    if not isinstance(name, str) or name.startswith("ck-") or not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", name, re.ASCII):
+        print(f"invalid: cli_faces[{index}].name is not a lowercase command name")
+        raise SystemExit(0)
+    if name in seen:
+        print(f"invalid: duplicate cli face name {name}")
+        raise SystemExit(0)
+    seen.add(name)
+    if not isinstance(binary, str) or binary != os.path.basename(sys.argv[1]):
+        print(f"invalid: cli_faces[{index}].binary must equal {os.path.basename(sys.argv[1])}")
+        raise SystemExit(0)
+print("present")
+for name in sorted(seen):
+    print(name)
+' "$DEST") || face_probe_result="not_checked"
+case "$face_probe_result" in
+  not_checked) FACE_STATE="not_checked" ;;
+  absent) FACE_STATE="absent" ;;
+  invalid:*) refuse "invalid cli_faces in --manifest: ${face_probe_result#invalid: }" ;;
+  present|$'present\n'*)
+    FACE_STATE="present"
+    face_names_text="${face_probe_result#present}"
+    while IFS= read -r face_name; do
+      [ -n "$face_name" ] && FACE_NAMES+=("$face_name")
+    done <<< "${face_names_text#$'\n'}"
+    ;;
+  *) FACE_STATE="not_checked" ;;
+esac
 prov_line=$(printf '%s' "$prov_json" | python3 -c '
 import json, sys
 try:
@@ -937,6 +1160,10 @@ if ! "$floor_check" "$MODULE" "$STAGED"; then
   exit 2
 fi
 
+# Plan all face changes before publishing either the binary or a link. The
+# dry-run path uses the same collision checks and reports the intended result.
+prepare_cli_face_plan
+
 # A GATE WITH SIDE EFFECTS MUST BE EXERCISABLE WITHOUT THEM. Every arm above is a
 # read; everything below mutates. Without this split the only way to test a new arm
 # is to place a binary -- which is how 0.3.92 reached production outside its quiet
@@ -944,6 +1171,7 @@ fi
 # what the script does after the arms pass. Remembering that it places is exactly the
 # thing that failed.
 if [ "$PLACE" != "1" ]; then
+  print_cli_face_plan
   say "=== arms evaluated, NOTHING placed and NOTHING restarted (pass --place to mutate)"
   exit 0
 fi
@@ -1087,6 +1315,7 @@ say "placed sha ${placed_digest%"${placed_digest#????????}"} (equals staged)"
 # placement path that runs `codesign --force` after staging would strip
 # hardened runtime and its exceptions, and needs its own check of the placed file.
 say "warm-exec at destination: $("$DEST" --version 2>&1 | head -1)"
+reconcile_cli_faces
 
 # Rollback retention: the newest three per binary (and per module store) are
 # kept, which always includes the one taken above. Without it every placement

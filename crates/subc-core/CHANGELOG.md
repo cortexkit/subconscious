@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.20.97
+
+- Add a hidden `--ck-cli-face-reserved-names` mode that prints the subcommands `ck` handles itself, one per line, without contacting the daemon. Module placement reads it to refuse a module command (`ck <name>`, served by a `ck-<name>` link) that a built-in would shadow.
+
 ## 0.20.96
 
 - When `ck <domain>` cannot find a command, name the managed bin folder it searched (or say when its data home could not be resolved) and state where that data home came from (XDG_DATA_HOME or HOME).

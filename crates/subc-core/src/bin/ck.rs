@@ -57,6 +57,20 @@ const TRIAGE_LOG_TAIL_LINES: usize = 20;
 const EXPECTED_DAEMON_BINARY: &str = "ck-subc";
 const QUOTA_MODULE_ID: &str = "insula";
 const CK_HARNESS: &str = "ck";
+const BUILTIN_DOMAINS: &[&str] = &[
+    "activity",
+    "catalog",
+    "daemon",
+    "health",
+    "help",
+    "machine",
+    "module",
+    "provenance",
+    "quota",
+    "routes",
+    "setup",
+    "upgrade",
+];
 
 #[cfg(feature = "test-support")]
 const CK_BUILD_SHAPE: &str = "test-support: on";
@@ -467,6 +481,10 @@ async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), CkError> {
         println!("{CK_BUILD_SHAPE}");
         return Ok(());
     }
+    if matches!(&args.command, Command::CliFaceReservedNames) {
+        println!("{}", BUILTIN_DOMAINS.join("\n"));
+        return Ok(());
+    }
 
     // Help and external dispatch resolve without a daemon connection: help is
     // static text, and an external ck-<domain> tool discovers its own connection.
@@ -600,7 +618,8 @@ async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), CkError> {
         | Command::Help(_)
         | Command::External { .. }
         | Command::Activity(_)
-        | Command::BuildShape => unreachable!("handled before connect"),
+        | Command::BuildShape
+        | Command::CliFaceReservedNames => unreachable!("handled before connect"),
     };
     result.map_err(|error| decorate_error(error, args.json, args.subc.as_deref()))
 }
@@ -1087,6 +1106,8 @@ enum Command {
     /// Prints the compile-time test-support state so integration tests reject a
     /// binary that cannot verify their fixture-signed release index.
     BuildShape,
+    /// Prints built-in command names so module command names can be checked for collisions.
+    CliFaceReservedNames,
     Dashboard,
     Setup(setup::SetupRequest),
     Upgrade {
@@ -7785,6 +7806,17 @@ fn parse_args(argv: impl IntoIterator<Item = OsString>) -> Result<CkArgs, CkErro
                     command: Command::BuildShape,
                 })
             }
+            // Placement uses this mode to avoid creating a module command name
+            // that conflicts with a built-in command.
+            Some(arg) if arg == OsStr::new("--ck-cli-face-reserved-names") => {
+                return Ok(CkArgs {
+                    program: program.clone(),
+                    subc,
+                    json,
+                    verbose,
+                    command: Command::CliFaceReservedNames,
+                })
+            }
             // `--ck-domain` is the probe ck sends to `ck-<name>` binaries on
             // PATH. ck itself is the dispatcher, never a domain, and it must
             // answer the probe WITHOUT discovering domains: cargo puts
@@ -7853,23 +7885,17 @@ fn parse_args(argv: impl IntoIterator<Item = OsString>) -> Result<CkArgs, CkErro
 }
 
 fn is_builtin_domain(domain: &str) -> bool {
-    matches!(
-        domain,
-        "setup"
-            | "upgrade"
-            | "module"
-            | "routes"
-            | "provenance"
-            | "health"
-            | "daemon"
-            | "machine"
-            | "quota"
-            | "activity"
-            | "help"
-    )
+    BUILTIN_DOMAINS.contains(&domain)
 }
 
 fn parse_command(domain: &str, tail: &[OsString]) -> Result<Command, CkError> {
+    if !is_builtin_domain(domain) {
+        return Ok(Command::External {
+            domain: domain.to_string(),
+            tail: tail.to_vec(),
+        });
+    }
+
     // Built-in domains parse their verbs strictly and answer verbless/misused
     // invocations with the DOMAIN's help, not the whole command tree.
     match domain {
@@ -8100,10 +8126,7 @@ fn parse_command(domain: &str, tail: &[OsString]) -> Result<Command, CkError> {
                 }),
             }
         }
-        _ => Ok(Command::External {
-            domain: domain.to_string(),
-            tail: tail.to_vec(),
-        }),
+        _ => unreachable!("every built-in domain has a parse_command arm"),
     }
 }
 

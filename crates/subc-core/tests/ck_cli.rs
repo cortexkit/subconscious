@@ -151,6 +151,35 @@ fn bare_json_prints_the_one_top_help() {
     );
 }
 
+#[test]
+fn hidden_cli_face_reserved_names_list_every_builtin_domain() {
+    let output = ck_command()
+        .arg("--ck-cli-face-reserved-names")
+        .output()
+        .unwrap();
+    assert_exit(&output, 0);
+    let output_text = text(&output.stdout);
+    let names = output_text.lines().collect::<Vec<_>>();
+    assert_eq!(
+        names,
+        [
+            "activity",
+            "catalog",
+            "daemon",
+            "health",
+            "help",
+            "machine",
+            "module",
+            "provenance",
+            "quota",
+            "routes",
+            "setup",
+            "upgrade",
+        ]
+    );
+    assert!(output.stderr.is_empty());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bare_ck_renders_degraded_module_and_no_updates_byte_for_byte() {
     let server = TestServer::start().await;

@@ -9,15 +9,15 @@ mod stand_in;
 pub mod test_support;
 pub use activity::*;
 pub use consumer::{
-    is_retryable_route_open_code, CallError, CallOptions, CatalogList, CloseRouteOptions,
-    ConnectionState, ConsumerCapabilityError, ConsumerError, ConsumerOptions, ControlPush,
-    OutcomeUnknownCause, PushEvent, RetryBackoff, ReverseRequestContext, ReverseRequestError,
-    ReverseRequestRegistrationError, ReverseRequestRegistry, RouteCloseDisposition,
-    RouteCloseReason, RouteEndReason, RoutePollResult, ScopeBindProofRefusal, ScopeSelector,
-    SpawnStreamError, SpawnSubscription, SubcConsumer, SubscribeOptions, Subscription,
-    SubscriptionClosed, SupervisorEntry, SupervisorListResponse, DEFAULT_CALL_TIMEOUT,
-    DEFAULT_LIVENESS_PROBE_WINDOW, DEFAULT_ROUTE_RETRY_DEADLINE, SPAWN_CURSOR_INCARNATION_MISMATCH,
-    SPAWN_CURSOR_TOO_OLD, SPAWN_SUBSCRIBER_LAGGED,
+    is_retryable_route_open_code, CallError, CallOptions, CancelHandle, CancelOutcome, CatalogList,
+    CloseRouteOptions, ConnectionState, ConsumerCapabilityError, ConsumerError, ConsumerOptions,
+    ControlPush, OutcomeUnknownCause, PushEvent, RetryBackoff, ReverseRequestContext,
+    ReverseRequestError, ReverseRequestRegistrationError, ReverseRequestRegistry,
+    RouteCloseDisposition, RouteCloseReason, RouteEndReason, RoutePollResult,
+    ScopeBindProofRefusal, ScopeSelector, SpawnStreamError, SpawnSubscription, SubcConsumer,
+    SubscribeOptions, Subscription, SubscriptionClosed, SupervisorEntry, SupervisorListResponse,
+    DEFAULT_CALL_TIMEOUT, DEFAULT_LIVENESS_PROBE_WINDOW, DEFAULT_ROUTE_RETRY_DEADLINE,
+    SPAWN_CURSOR_INCARNATION_MISMATCH, SPAWN_CURSOR_TOO_OLD, SPAWN_SUBSCRIBER_LAGGED,
 };
 pub use policy_cache::{
     PolicyResolveError, PolicyResolver, PolicyResolverConfig, PolicyResolverFootprint,

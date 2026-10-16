@@ -5706,3 +5706,6 @@ mod activity;
 
 #[path = "real_daemon/call_modes.rs"]
 mod call_modes;
+
+#[path = "real_daemon/cancellable.rs"]
+mod cancellable;

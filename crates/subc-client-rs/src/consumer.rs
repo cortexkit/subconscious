@@ -84,6 +84,10 @@ const ACTIVITY_EVENT_BUFFER: usize = 2048;
 #[path = "activity_consumer_tests.rs"]
 mod activity_consumer_tests;
 
+mod cancellation;
+pub use cancellation::{CancelHandle, CancelOutcome};
+use cancellation::{CancelRegistration, UnaryCancel};
+
 /// `supervisor.spawn_subscribe` refused a cursor from another daemon incarnation.
 pub const SPAWN_CURSOR_INCARNATION_MISMATCH: &str = "spawn_cursor_incarnation_mismatch";
 /// `supervisor.spawn_subscribe` refused a cursor older than the daemon's retained ring.
@@ -1719,6 +1723,62 @@ impl SubcConsumer {
         body: Vec<u8>,
         opts: CallOptions,
     ) -> Result<Vec<u8>, CallError> {
+        self.request_inner(handle, body, opts, None).await
+    }
+
+    /// Like [`Self::request`], with explicit cancellation of the in-flight request.
+    ///
+    /// The returned future is lazy and has the same result and deadline as `request`.
+    /// Calling [`CancelHandle::cancel`] sends at most one header-only Cancel on the
+    /// request's route; it does not stop waiting for the provider's Response or Error.
+    /// Dropping the handle sends nothing. Dropping the future only removes its
+    /// pending registration, **without sending Cancel**.
+    ///
+    /// ```no_run
+    /// # async fn turn(consumer: &subc_client_rs::SubcConsumer,
+    /// # route: &subc_client_rs::RouteHandle,
+    /// # turn_stopped: impl std::future::Future<Output = ()>) -> Result<(), subc_client_rs::CallError> {
+    /// let (cancel, reply) = consumer.request_cancellable(
+    ///     route, b"work".to_vec(), subc_client_rs::CallOptions::default());
+    /// tokio::pin!(reply);
+    /// tokio::select! {
+    ///     result = &mut reply => { let _body = result?; }
+    ///     () = turn_stopped => {
+    ///         cancel.cancel().await;
+    ///         let _body = reply.await?; // Keep any final Response body.
+    ///     }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn request_cancellable(
+        &self,
+        handle: &RouteHandle,
+        body: Vec<u8>,
+        opts: CallOptions,
+    ) -> (
+        CancelHandle,
+        impl Future<Output = Result<Vec<u8>, CallError>> + Send + '_,
+    ) {
+        let consumer = self;
+        let handle = *handle;
+        let (cancel, registration) = CancelRegistration::new(Arc::clone(&self.shared));
+        let future = async move {
+            let guard = registration;
+            consumer
+                .request_inner(&handle, body, opts, Some(Arc::clone(&guard.state)))
+                .await
+        };
+        (cancel, future)
+    }
+
+    async fn request_inner(
+        &self,
+        handle: &RouteHandle,
+        body: Vec<u8>,
+        opts: CallOptions,
+        cancel: Option<Arc<UnaryCancel>>,
+    ) -> Result<Vec<u8>, CallError> {
         let deadline = Instant::now() + opts.timeout;
         let route = self.shared.route_state(*handle)?;
         let permit = match timeout_at(deadline, Arc::clone(&route.sem).acquire_owned()).await {
@@ -1732,17 +1792,20 @@ impl SubcConsumer {
         };
         let result = self
             .shared
-            .send_request(RequestSend {
-                expected_handle: Some(*handle),
-                channel: handle.channel,
-                epoch: handle.epoch,
-                body,
-                priority: opts.priority,
-                admission_class: opts.admission_class,
-                deadline,
-                retain_late_route_open: false,
-                route_open_reverse_requests: None,
-            })
+            .send_request_cancellable(
+                RequestSend {
+                    expected_handle: Some(*handle),
+                    channel: handle.channel,
+                    epoch: handle.epoch,
+                    body,
+                    priority: opts.priority,
+                    admission_class: opts.admission_class,
+                    deadline,
+                    retain_late_route_open: false,
+                    route_open_reverse_requests: None,
+                },
+                cancel,
+            )
             .await;
         drop(permit);
         match result? {
@@ -1923,6 +1986,45 @@ impl SubcConsumer {
         body: Vec<u8>,
         opts: CallOptions,
     ) -> Result<Vec<u8>, CallError> {
+        self.call_inner(target, identity, body, opts, None).await
+    }
+
+    /// Managed unary call with explicit cancellation, like [`Self::request_cancellable`].
+    ///
+    /// Uses the same route opening, options, errors and deadline as [`Self::call`].
+    /// Once cancellation is requested, a dead-route refusal is returned rather than
+    /// retrying work the caller has asked to stop. Cancellation during route opening
+    /// is remembered and sent after the Request is queued. Dropping either value
+    /// sends no Cancel; dropping the future removes its pending registration.
+    pub fn call_cancellable(
+        &self,
+        target: RouteTarget,
+        identity: BindIdentity,
+        body: Vec<u8>,
+        opts: CallOptions,
+    ) -> (
+        CancelHandle,
+        impl Future<Output = Result<Vec<u8>, CallError>> + Send + '_,
+    ) {
+        let consumer = self;
+        let (cancel, registration) = CancelRegistration::new(Arc::clone(&self.shared));
+        let future = async move {
+            let guard = registration;
+            consumer
+                .call_inner(target, identity, body, opts, Some(Arc::clone(&guard.state)))
+                .await
+        };
+        (cancel, future)
+    }
+
+    async fn call_inner(
+        &self,
+        target: RouteTarget,
+        identity: BindIdentity,
+        body: Vec<u8>,
+        opts: CallOptions,
+        cancel: Option<Arc<UnaryCancel>>,
+    ) -> Result<Vec<u8>, CallError> {
         let call_deadline = Instant::now() + opts.timeout;
         let mut retried_unknown_channel = false;
         let consumer_identity = route_open_consumer_identity(&opts);
@@ -1975,17 +2077,20 @@ impl SubcConsumer {
 
             let response = self
                 .shared
-                .send_request(RequestSend {
-                    expected_handle: Some(route.handle),
-                    channel: route.handle.channel,
-                    epoch: route.handle.epoch,
-                    body: body.clone(),
-                    priority: opts.priority,
-                    admission_class: opts.admission_class,
-                    deadline: call_deadline,
-                    retain_late_route_open: false,
-                    route_open_reverse_requests: None,
-                })
+                .send_request_cancellable(
+                    RequestSend {
+                        expected_handle: Some(route.handle),
+                        channel: route.handle.channel,
+                        epoch: route.handle.epoch,
+                        body: body.clone(),
+                        priority: opts.priority,
+                        admission_class: opts.admission_class,
+                        deadline: call_deadline,
+                        retain_late_route_open: false,
+                        route_open_reverse_requests: None,
+                    },
+                    cancel.clone(),
+                )
                 .await;
             drop(permit);
 
@@ -2005,6 +2110,7 @@ impl SubcConsumer {
                 Ok(TerminalFrame::Error { body, flags })
                     if error_codes::is_established_route_dead(flags, &body.code)
                         && !retried_unknown_channel
+                        && !cancel.as_ref().is_some_and(|cancel| cancel.requested())
                         && Instant::now() < call_deadline =>
                 {
                     retried_unknown_channel = true;
@@ -2012,7 +2118,11 @@ impl SubcConsumer {
                     continue;
                 }
                 Ok(TerminalFrame::Error { body, .. }) => return Err(CallError::Module(body)),
-                Err(err) if err.is_not_sent() && Instant::now() < call_deadline => {
+                Err(err)
+                    if err.is_not_sent()
+                        && Instant::now() < call_deadline
+                        && !cancel.as_ref().is_some_and(|cancel| cancel.requested()) =>
+                {
                     self.shared.invalidate_route(&route_key, Some(route.handle));
                     self.shared.ensure_connected_for_call(call_deadline).await?;
                     continue;
@@ -3544,6 +3654,14 @@ impl Shared {
         self: &Arc<Self>,
         request: RequestSend,
     ) -> Result<TerminalFrame, CallError> {
+        self.send_request_cancellable(request, None).await
+    }
+
+    async fn send_request_cancellable(
+        self: &Arc<Self>,
+        request: RequestSend,
+        cancel: Option<Arc<UnaryCancel>>,
+    ) -> Result<TerminalFrame, CallError> {
         let RequestSend {
             expected_handle,
             channel,
@@ -3671,6 +3789,13 @@ impl Shared {
                 return Err(CallError::not_sent(
                     "call deadline elapsed waiting for writer capacity",
                 ));
+            }
+        }
+
+        if let Some(cancel) = cancel {
+            cancel.activate(key, priority, deadline);
+            if cancel.requested() {
+                cancel.cancel().await;
             }
         }
 

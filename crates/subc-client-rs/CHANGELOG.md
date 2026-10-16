@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.29.3
+
+- Add `SubcConsumer::request_cancellable` (open route handle) and `call_cancellable` (managed route with `CallOptions`), returning an explicit `CancelHandle` and the unary reply future. Cancellation sends at most one empty-body Cancel with the request's channel, epoch and correlation, without discarding a late Response body or hiding a provider Error. Dropping either value sends no Cancel; dropping the future removes its pending registration. `CancelOutcome` distinguishes settled requests, closed routes and lost connections. A cancelled managed call does not retry a dead-route refusal.
+
 ## 0.29.2
 
 - Re-export protocol 0.32.2 scope builders for capability-gated idle-only replacement and connection-held presence. `scope_epoch_in_use` is terminal in the shared contract table.

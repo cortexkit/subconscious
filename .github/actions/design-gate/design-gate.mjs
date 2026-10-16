@@ -192,15 +192,32 @@ function hasLabel(labels, name) {
   return (labels ?? []).some((label) => label.toLowerCase() === name);
 }
 
+/** Reject malformed exemptions so a caller's configuration error fails the run. */
+export function parseOwnerBots(value = "") {
+  return value.split(/[\s,]+/).filter(Boolean).map((entry) => {
+    const match = entry.match(/^([^:]*\[bot\]):([0-9]+)$/);
+    if (!match) {
+      throw new Error(`design-gate: invalid owner-bots entry ${JSON.stringify(entry)}; expected login[bot]:digits`);
+    }
+    // Keep ids exact even beyond Number's precision, and accept leading zeroes.
+    return { login: match[1], id: BigInt(match[2]).toString() };
+  });
+}
+
 /**
  * Why this pull request is not a contributor PR the gate applies to, or null
  * when the gate applies.
  */
-export function pullRequestSkipReason(pullRequest, repoFullName) {
+export function pullRequestSkipReason(pullRequest, repoFullName, ownerBots = []) {
   if (hasLabel(pullRequest.labels, TRIVIAL_LABEL)) {
     return `the \`${TRIVIAL_LABEL}\` label is applied`;
   }
   if (sameRepo(pullRequest.headRepoFullName, repoFullName)) {
+    if (pullRequest.authorType === "Bot" && ownerBots.some((bot) =>
+      bot.login === pullRequest.authorLogin && bot.id === String(pullRequest.authorId),
+    )) {
+      return `opened by this repository's own bot \`${pullRequest.authorLogin}\``;
+    }
     const prefix = MAINTAINER_BRANCH_PREFIXES.find((candidate) =>
       isUnderBranchPrefix(pullRequest.headRef ?? "", candidate),
     );
@@ -223,8 +240,8 @@ export function pullRequestSkipReason(pullRequest, repoFullName) {
  *   skipped: boolean,
  * }}
  */
-export function decide({ pullRequest, repoFullName, issue = null, action = "opened" }) {
-  const skipReason = pullRequestSkipReason(pullRequest, repoFullName);
+export function decide({ pullRequest, repoFullName, issue = null, action = "opened", ownerBots = [] }) {
+  const skipReason = pullRequestSkipReason(pullRequest, repoFullName, ownerBots);
   if (skipReason) {
     return {
       conclusion: "success",
@@ -333,12 +350,12 @@ export function carriesConvertedMarker(comment) {
 }
 
 /** Fetch the linked issue (if any) and decide. */
-export async function evaluatePullRequest({ api, repoFullName, pullRequest, action = "opened" }) {
-  const linked = pullRequestSkipReason(pullRequest, repoFullName)
+export async function evaluatePullRequest({ api, repoFullName, pullRequest, action = "opened", ownerBots = [] }) {
+  const linked = pullRequestSkipReason(pullRequest, repoFullName, ownerBots)
     ? null
     : parseLinkedIssue(pullRequest.body, repoFullName);
   const issue = linked ? await api.getIssue(linked.number) : null;
-  return decide({ pullRequest, repoFullName, issue, action });
+  return decide({ pullRequest, repoFullName, issue, action, ownerBots });
 }
 
 /** The gate comment already on a pull request, or null. Throws when comments cannot be read. */
@@ -403,13 +420,14 @@ export async function runPullRequestGate({
   repoFullName,
   pullRequest,
   action = "opened",
+  ownerBots = [],
   log = console,
 }) {
   const missingPermission = await ensureLabels({ api, log });
   const labelWarning = missingPermission.length
     ? `Gate labels (${missingPermission.map((name) => `\`${name}\``).join(", ")}) could not be created. A maintainer must create them by hand once.`
     : null;
-  const decision = await evaluatePullRequest({ api, repoFullName, pullRequest, action });
+  const decision = await evaluatePullRequest({ api, repoFullName, pullRequest, action, ownerBots });
 
   let draftConverted = false;
   if (decision.convertToDraft && !pullRequest.isDraft) {
@@ -549,6 +567,9 @@ export function normalizePullRequest(raw) {
     headRef: raw.head?.ref ?? "",
     headRepoFullName: raw.head?.repo?.full_name ?? "",
     headSha: raw.head?.sha ?? "",
+    authorLogin: raw.user?.login ?? "",
+    authorId: raw.user?.id ?? null,
+    authorType: raw.user?.type ?? "",
   };
 }
 
@@ -710,6 +731,7 @@ async function main(argv) {
   const checkApi = createGitHubApi({ token: requireEnv("CHECK_TOKEN"), repoFullName });
 
   if (mode === "pull-request") {
+    const ownerBots = parseOwnerBots(process.env.DESIGN_GATE_OWNER_BOTS);
     const pullRequest = normalizePullRequest(event.pull_request);
     const result = await runPullRequestGate({
       api,
@@ -717,6 +739,7 @@ async function main(argv) {
       repoFullName,
       pullRequest,
       action: event.action,
+      ownerBots,
     });
     // The job summary is what GitHub shows as the check's summary, so the
     // contributor reads the same words in the checks tab and in the comment.

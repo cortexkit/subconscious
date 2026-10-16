@@ -43,6 +43,14 @@ name: Design gate
 # parsed, which is the intended signal that it is still on the old contract.
 on:
   workflow_call:
+    inputs:
+      # Under `pull_request_target`, the caller workflow is read from the base
+      # branch, so a pull request cannot change its own bot exemptions.
+      owner-bots:
+        description: Whitespace- or comma-separated login:id pairs for the repository's own bots.
+        type: string
+        required: false
+        default: ""
 
 concurrency:
   group: design-gate-${{ github.event.pull_request.number || github.event.issue.number }}
@@ -85,6 +93,7 @@ jobs:
         uses: cortexkit/subconscious/.github/actions/design-gate@117932fd88a38f99259dc7353313745ad479b09a
         with:
           mode: pull-request
+          owner-bots: ${{ inputs.owner-bots }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
           check-token: ${{ secrets.GITHUB_TOKEN }}
 

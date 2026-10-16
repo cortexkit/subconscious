@@ -10,7 +10,9 @@
  */
 
 import assert from "node:assert/strict";
-import { existsSync, readFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { describe, test } from "node:test";
 import { fileURLToPath } from "node:url";
@@ -25,7 +27,9 @@ import {
   DESIGN_APPROVED_LABEL,
   draftNote,
   GATE_MESSAGE,
+  normalizePullRequest,
   parseLinkedIssue,
+  parseOwnerBots,
   pullRequestSkipReason,
   runIssueLabeled,
   runPullRequestGate,
@@ -401,6 +405,69 @@ describe("parseLinkedIssue", () => {
   });
 });
 
+describe("parseOwnerBots", () => {
+  test("empty configuration means no exemptions", () => {
+    assert.deepEqual(parseOwnerBots(), []);
+    assert.deepEqual(parseOwnerBots(""), []);
+    assert.deepEqual(parseOwnerBots(" \n\t"), []);
+  });
+
+  test("accepts whitespace- and comma-separated bot pairs", () => {
+    assert.deepEqual(parseOwnerBots(" aft-alfonso[bot]:318960130,other[bot]:42\nthird[bot]:123\tlast[bot]:9 "), [
+      { login: "aft-alfonso[bot]", id: "318960130" },
+      { login: "other[bot]", id: "42" },
+      { login: "third[bot]", id: "123" },
+      { login: "last[bot]", id: "9" },
+    ]);
+  });
+
+  test("keeps numeric ids exact and normalizes leading zeroes", () => {
+    assert.deepEqual(parseOwnerBots("first[bot]:00318960130 second[bot]:9007199254740993"), [
+      { login: "first[bot]", id: "318960130" },
+      { login: "second[bot]", id: "9007199254740993" },
+    ]);
+  });
+
+  for (const entry of [
+    "aft-alfonso[bot]:",
+    "aft-alfonso[bot]",
+    "aft-alfonso[bot]:318960130x",
+    "aft-alfonso:318960130",
+    "aft:alfonso[bot]:318960130",
+    ":318960130",
+  ]) {
+    test(`malformed owner-bots entry ${JSON.stringify(entry)} fails the run and names the entry`, (t) => {
+      assert.throws(() => parseOwnerBots(`valid[bot]:42,${entry}`), (error) => {
+        assert.ok(error.message.includes(JSON.stringify(entry)));
+        return true;
+      });
+
+      const dir = mkdtempSync(join(tmpdir(), "design-gate-"));
+      t.after(() => rmSync(dir, { recursive: true, force: true }));
+      const eventPath = join(dir, "event.json");
+      writeFileSync(eventPath, JSON.stringify({ action: "opened", pull_request: {} }));
+      const result = spawnSync(process.execPath, [
+        fileURLToPath(new URL("../.github/actions/design-gate/design-gate.mjs", import.meta.url)),
+        "pull-request",
+      ], {
+        encoding: "utf8",
+        timeout: 5000,
+        env: {
+          GITHUB_REPOSITORY: REPO,
+          GITHUB_EVENT_PATH: eventPath,
+          GITHUB_TOKEN: "fixture",
+          CHECK_TOKEN: "fixture",
+          GITHUB_API_URL: "http://127.0.0.1:1",
+          DESIGN_GATE_OWNER_BOTS: entry,
+        },
+      });
+      assert.ifError(result.error);
+      assert.equal(result.status, 1);
+      assert.ok(result.stderr.includes(`invalid owner-bots entry ${JSON.stringify(entry)}`), result.stderr);
+    });
+  }
+});
+
 describe("pullRequestSkipReason", () => {
   const cases = [
     ["maintainer train branch", { headRepoFullName: REPO, headRef: "train/v0.56" }, true],
@@ -427,6 +494,56 @@ describe("pullRequestSkipReason", () => {
     test(name, () => {
       const reason = pullRequestSkipReason(pullRequest(overrides), REPO);
       assert.equal(reason !== null, skipped, `reason: ${reason}`);
+    });
+  }
+});
+
+describe("owner-bot exemptions", () => {
+  const login = "aft-alfonso[bot]";
+  const id = 318960130;
+  const ownerBots = parseOwnerBots(`${login}:${id}`);
+
+  test("normalization retains the author's login, numeric id and type", () => {
+    const pr = normalizePullRequest({ user: { login, id, type: "Bot" } });
+    assert.equal(pr.authorLogin, login);
+    assert.equal(pr.authorId, id);
+    assert.equal(pr.authorType, "Bot");
+  });
+
+  const cases = [
+    ["matching bot on a same-repo branch is exempt", {}, ownerBots, true],
+    ["id matches but login differs is not exempt", { authorLogin: "other[bot]" }, ownerBots, false],
+    ["login matches but id differs is not exempt", { authorId: id + 1 }, ownerBots, false],
+    ["User with matching id and login is not exempt", { authorType: "User" }, ownerBots, false],
+    ["matching bot on a fork is not exempt", { headRepoFullName: "contributor/aft" }, ownerBots, false],
+    ["matching bot with nothing configured is not exempt", {}, undefined, false],
+  ];
+  for (const [name, overrides, configuredBots, skipped] of cases) {
+    test(name, async () => {
+      const pr = pullRequest({
+        headRepoFullName: REPO,
+        authorLogin: login,
+        authorId: id,
+        authorType: "Bot",
+        body: skipped ? "Refs #999" : "",
+        ...overrides,
+      });
+      const { api, checkApi, state } = createFixtureApi();
+      api.getIssue = async () => assert.fail("an exempt bot must not fetch a linked issue");
+      const result = await runPullRequestGate({
+        api, checkApi, repoFullName: REPO, pullRequest: pr, ownerBots: configuredBots, log: silentLog,
+      });
+      assert.equal(result.skipped, skipped);
+      assert.equal(result.conclusion, skipped ? "success" : "failure");
+      assert.equal(state.checkRuns[0].conclusion, result.conclusion);
+      if (skipped) {
+        assert.equal(result.message, `Design gate skipped: opened by this repository's own bot \`${login}\`.`);
+        assert.deepEqual(state.convertedToDraft, []);
+        assert.deepEqual(state.comments, []);
+      } else {
+        assert.equal(result.message, GATE_MESSAGE);
+        assert.deepEqual(state.convertedToDraft, [pr.nodeId]);
+      }
     });
   }
 });
@@ -1393,6 +1510,13 @@ describe("workflow security properties", () => {
       assert.deepEqual(offenders, [], `${file.path} must not invoke git`);
     });
 
+    test(`${file.label} never interpolates owner-bots into a run script`, () => {
+      const offenders = runScripts(gateFileYaml(file)).filter((script) =>
+        /\$\{\{[^}]*owner-bots[^}]*\}\}/.test(script),
+      );
+      assert.deepEqual(offenders, [], `${file.path} must pass owner-bots via the environment, not shell interpolation`);
+    });
+
     test(`${file.label} has no checkout step referencing the PR head`, () => {
       assert.deepEqual(
         checkoutStepsReferencingHead(gateFileYaml(file)),
@@ -1507,5 +1631,28 @@ describe("workflow security properties", () => {
       /GITHUB_TOKEN:\s*\$\{\{\s*inputs\.github-token\s*\}\}/,
       "the gate step must still receive github-token as GITHUB_TOKEN",
     );
+  });
+
+  test("owner-bots is optional and flows from the caller to the script environment", () => {
+    const workflowYaml = stripCommentLines(gateFileYaml(GATE_FILES[0]));
+    const actionYaml = stripCommentLines(gateFileYaml(GATE_FILES[1]));
+    const workflowInput = workflowYaml.match(/\n      owner-bots:\n([\s\S]*?)(?=\n\S|\n      [\w-]+:|$)/)?.[1];
+    assert.ok(workflowInput, "workflow_call must declare owner-bots");
+    assert.match(workflowInput, /type:\s*string/);
+    assert.match(workflowInput, /required:\s*false/);
+    assert.match(workflowInput, /default:\s*""/);
+
+    const prStep = stepBlocks(workflowYaml).find((step) => /mode:\s*pull-request/.test(step));
+    assert.ok(prStep, "the workflow must invoke the pull-request action");
+    assert.match(prStep, /owner-bots:\s*\$\{\{\s*inputs\.owner-bots\s*\}\}/);
+
+    const actionInput = actionYaml.match(/\n  owner-bots:\n([\s\S]*?)(?=\n  [\w-]+:|\nruns:)/)?.[1];
+    assert.ok(actionInput, "the action must declare owner-bots");
+    assert.match(actionInput, /required:\s*false/);
+    assert.match(actionInput, /default:\s*""/);
+
+    const scriptStep = stepBlocks(actionYaml).find((step) => runScripts(step).some((script) => script.includes("design-gate.mjs")));
+    assert.ok(scriptStep, "the action must run the gate script");
+    assert.match(scriptStep, /\n\s+env:\s*\n(?:[^\n]*\n)*?\s+DESIGN_GATE_OWNER_BOTS:\s*\$\{\{\s*inputs\.owner-bots\s*\}\}/);
   });
 });

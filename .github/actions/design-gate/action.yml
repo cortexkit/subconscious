@@ -29,6 +29,12 @@ inputs:
       `issue-labeled` to release the pull requests waiting on a newly approved
       issue.
     required: true
+  owner-bots:
+    description: >-
+      Whitespace- or comma-separated login:id pairs for this repository's own
+      bots. Only Bot authors on same-repository branches can be exempted.
+    required: false
+    default: ""
   github-token:
     description: >-
       Token the gate reads the linked issue with, creates missing labels,
@@ -60,8 +66,10 @@ runs:
       shell: bash
       # `mode` arrives as an environment variable rather than being expanded
       # into the command line, so its value is never parsed as shell.
+      # `owner-bots` stays in the environment for the same reason.
       run: node "${GITHUB_ACTION_PATH}/design-gate.mjs" "${DESIGN_GATE_MODE}"
       env:
         DESIGN_GATE_MODE: ${{ inputs.mode }}
+        DESIGN_GATE_OWNER_BOTS: ${{ inputs.owner-bots }}
         GITHUB_TOKEN: ${{ inputs.github-token }}
         CHECK_TOKEN: ${{ inputs.check-token }}

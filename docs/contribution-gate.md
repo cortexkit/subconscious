@@ -6,7 +6,8 @@ one canonical home — this repository — and every other repository calls it w
 `uses:`. Nobody copies it; two copies drift.
 
 > Behaviour changes need an approved issue first. Bypass is the
-> maintainer-applied `trivial` label, full stop. A path glob is a judgement
+> maintainer-applied `trivial` label for contributor PRs; the repository's own
+> configured bot PRs are exempt. A path glob is a judgement
 > about effect made from a filename, and the filename is not where the effect
 > lives — a test-only PR can delete the test that guarded a behaviour.
 
@@ -32,6 +33,11 @@ Bypasses are a maintainer-only `trivial` label on the pull request, and the
 when the head branch is in the repository itself, so a fork cannot buy a bypass
 by naming its branch after a maintainer one. They are path prefixes rather than
 substrings: a branch simply named `train` is an ordinary branch.
+
+The repository's own configured bot authors are also exempt on same-repository
+branches, regardless of branch name or labels. Bot PRs that do not meet those
+conditions and contributor PRs still need an approved issue unless one of the
+existing bypasses applies.
 
 It runs on `pull_request_target`, so it has the base repository's context and
 its secrets, though the gate reads none. Every write uses the calling job's
@@ -62,6 +68,9 @@ jobs:
       pull-requests: write # gate comment, draft conversion, ready for review
       checks: write # publish the design-gate check run
     uses: cortexkit/subconscious/.github/workflows/design-gate.yml@master
+    # Optional: this repository's own bot accounts, as login:id pairs.
+    with:
+      owner-bots: "example-app[bot]:123456789"
 ```
 
 The triggers live in the caller because a reusable workflow cannot add any.
@@ -69,6 +78,17 @@ Both trigger blocks are required: `pull_request_target` evaluates pull
 requests, and `issues: labeled` is what releases the drafts waiting on an issue
 when a maintainer approves it. A caller that declares only the first gets a
 gate that blocks and never unblocks.
+
+`owner-bots` is optional (empty by default): a whitespace- or comma-separated
+list of `login:id` pairs for the repository owner's own bots. It exempts only
+authors whose GitHub type is `Bot` and whose head branch is in the base
+repository. Both login and numeric id must match, so a reused login or a
+different account cannot inherit an exemption. Under `pull_request_target`,
+the caller workflow and this configuration are read from the **base branch**;
+a pull request cannot grant itself an exemption. Find a bot's numeric id with
+`gh api '/users/<login>'` and read the `.id` field. Each login must end in
+`[bot]` and contain no colon, and each id must contain only digits; malformed
+entries fail the run and name the bad entry rather than being ignored.
 
 `labeled` and `unlabeled` are in the pull request types so that a maintainer
 applying `trivial` to a failing pull request (or removing it) re-runs the gate
@@ -86,10 +106,10 @@ Withhold `checks: write` and the publish is refused; the gate fails closed, so
 every pull request stays blocked. Copy all four lines: naming any permission
 sets every unnamed one to `none`.
 
-Nothing else is configurable, and that is deliberate. The decision of which
-event arm runs lives inside the reusable workflow rather than in an `if:` in
-the caller, so a repository cannot switch the gate off by leaving a condition
-out.
+Apart from `owner-bots`, nothing else is configurable, and that is deliberate.
+The decision of which event arm runs lives inside the reusable workflow rather
+than in an `if:` in the caller, so a repository cannot switch the gate off by
+leaving a condition out.
 
 ### 2. No secrets
 
@@ -207,11 +227,11 @@ against both files that actually run the gate.
 node --test scripts/design-gate.test.mjs
 ```
 
-**The suite is 128 arms.** That number is pinned here on purpose: a lift that
-reports anything other than `# tests 128` has a setup defect before it has a
+**The suite contains 149 test cases.** That number is pinned here on purpose: a lift that
+reports anything other than `# tests 149` has a setup defect before it has a
 gate. The security arms read the workflow and the action from disk, and a
 missing file reports as a named failure — `workflow file missing at <path>` —
-rather than as arms that quietly fail to register.
+rather than as test cases that quietly fail to register.
 
 `actionlint` covers the reusable workflow.
 

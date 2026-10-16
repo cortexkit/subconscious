@@ -34,8 +34,9 @@ when the head branch is in the repository itself, so a fork cannot buy a bypass
 by naming its branch after a maintainer one. They are path prefixes rather than
 substrings: a branch simply named `train` is an ordinary branch.
 
-The repository's own configured bot authors are also exempt on same-repository
-branches, regardless of branch name or labels. Bot PRs that do not meet those
+Pull requests opened by the repository's own configured bots are also exempt,
+regardless of branch name or labels, when the head branch is in the repository
+the gate runs for (not a fork). Bot PRs that do not meet those
 conditions and contributor PRs still need an approved issue unless one of the
 existing bypasses applies.
 

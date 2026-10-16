@@ -2955,8 +2955,87 @@ fn goodbye_frame(channel: u16, epoch: u32, corr: u64) -> Frame {
     .unwrap()
 }
 
+struct BinaryFixture {
+    path: PathBuf,
+    _scratch: ScratchDir,
+}
+
+fn build_binary_fixture(
+    workspace: &Path,
+    build: impl FnOnce() -> Result<PathBuf, String>,
+) -> Result<BinaryFixture, String> {
+    // Nextest runs each test in its own process. Cargo's build lock ends before
+    // we can copy its output, and on macOS even a fresh build replaces the
+    // example's executable. Hold our own cross-process lock through the copy,
+    // then use a private snapshot that later Cargo builds cannot remove.
+    let lock_dir = workspace.join("target/real-daemon-fixtures");
+    fs::create_dir_all(&lock_dir).map_err(|error| format!("fixture lock directory: {error}"))?;
+    let lock = fs::File::options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_dir.join("build.lock"))
+        .map_err(|error| format!("fixture build lock: {error}"))?;
+    lock.lock()
+        .map_err(|error| format!("locking fixture build: {error}"))?;
+    let artifact = build()?;
+    let scratch = unique_temp_dir("cargo-fixture");
+    let path = scratch.join(
+        artifact
+            .file_name()
+            .ok_or_else(|| format!("executable has no filename: {}", artifact.display()))?,
+    );
+    fs::copy(&artifact, &path)
+        .map_err(|error| format!("snapshotting {}: {error}", artifact.display()))?;
+    Ok(BinaryFixture {
+        path,
+        _scratch: scratch,
+    })
+}
+
+#[test]
+fn binary_fixture_outlives_cargo_output_replacement() {
+    let workspace = unique_temp_dir("fixture-snapshot");
+    let artifact = workspace.join("example");
+    fs::write(&artifact, b"original executable").unwrap();
+    let fixture = build_binary_fixture(&workspace, || Ok(artifact.clone())).unwrap();
+    fs::remove_file(&artifact).unwrap();
+    assert_eq!(fs::read(&fixture.path).unwrap(), b"original executable");
+    fs::write(&artifact, b"replacement executable").unwrap();
+    assert_eq!(fs::read(&fixture.path).unwrap(), b"original executable");
+}
+
+#[test]
+fn binary_fixture_build_holds_the_cross_process_lock() {
+    let workspace = unique_temp_dir("fixture-lock");
+    let artifact = workspace.join("example");
+    fs::write(&artifact, b"executable").unwrap();
+    let lock_path = workspace.join("target/real-daemon-fixtures/build.lock");
+    let _fixture = build_binary_fixture(&workspace, || {
+        let other = fs::File::options()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        assert!(matches!(
+            other.try_lock(),
+            Err(fs::TryLockError::WouldBlock)
+        ));
+        Ok(artifact)
+    })
+    .unwrap();
+    fs::File::options()
+        .read(true)
+        .write(true)
+        .open(lock_path)
+        .unwrap()
+        .try_lock()
+        .unwrap();
+}
+
 fn ensure_binary(workspace: &Path, cargo_args: &[&str]) -> PathBuf {
-    type BuildResults = HashMap<Vec<String>, Result<PathBuf, String>>;
+    type BuildResults = HashMap<Vec<String>, Result<BinaryFixture, String>>;
     static BUILD_RESULTS: OnceLock<Mutex<BuildResults>> = OnceLock::new();
     let mut results = BUILD_RESULTS
         .get_or_init(|| Mutex::new(HashMap::new()))
@@ -2965,7 +3044,7 @@ fn ensure_binary(workspace: &Path, cargo_args: &[&str]) -> PathBuf {
     let key = cargo_args.iter().map(|arg| (*arg).to_owned()).collect();
     let result = results
         .entry(key)
-        .or_insert_with(|| {
+        .or_insert_with(|| build_binary_fixture(workspace, || {
             let output = Command::new("cargo")
             .args(cargo_args)
             .current_dir(workspace)
@@ -3003,13 +3082,15 @@ fn ensure_binary(workspace: &Path, cargo_args: &[&str]) -> PathBuf {
                         String::from_utf8_lossy(&output.stderr)
                     )
                 })
-        })
-        .clone();
+        }))
+        .as_ref()
+        .map(|fixture| fixture.path.clone())
+        .map_err(Clone::clone);
     drop(results);
     let artifact = result.unwrap_or_else(|error| panic!("{error}"));
     assert!(
         artifact.exists(),
-        "Cargo-reported executable does not exist: {}",
+        "binary fixture does not exist: {}",
         artifact.display()
     );
     artifact

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.36.6
+
+- On Linux, wait for the kernel's first-exec flag to clear before sampling a spawned child's executable for the live-children record. `posix_spawn` can return while `/proc/<pid>/exe` still names the inherited daemon image. Recording that image permanently prevented strict orphan cleanup after a hard daemon kill, including for `protocol: "none"` children that never register. PID, start-time and executable matching remain strict; PATH and shebang launches still record the actual kernel image.
+
 ## 0.36.5
 
 - Always refuse module→client frames whose header plus body exceeds the client sink's total egress byte budget (4 MiB), even though previously they could pass through an empty queue. Oversized replies become daemon-origin `ERROR frame_too_large` on the same channel/epoch/correlation, ending only that request; other routes on the connection remain usable. Oversized reverse Requests are answered with the same ERROR to the module instead of reaching the client. This backstop complements the fleet's 3 MiB per-frame rule. A frame that would fit an empty queue but meets a full one is different: the client has stopped reading, so the slow client is still closed as before. The same applies when the replacement ERROR itself meets a full queue, so the module's frame reader never waits on a stuck client.

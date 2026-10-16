@@ -3,7 +3,7 @@
 use cortexkit_test_support::{dev_command, process_alive, wait_until_gone, ScratchDir};
 use std::{
     fs,
-    os::unix::process::CommandExt,
+    os::unix::{fs::MetadataExt, process::CommandExt},
     path::{Path, PathBuf},
     process::{Child, Stdio},
     sync::{Mutex, MutexGuard},
@@ -320,19 +320,80 @@ fn child_is_recorded(path: &Path, pid: u32, observed: &subc_os::Observation) -> 
         })
 }
 
-fn wait_for_recorded_child(path: &Path, pid: u32) {
+fn recorded_child_diagnostics(
+    path: &Path,
+    process: &subc_os::Process,
+    observed: &subc_os::Observation,
+    program: &Path,
+) -> String {
+    let pid = process.pid();
+    let program_identity = fs::metadata(program).map(|stat| (stat.dev(), stat.ino()));
+    #[cfg(target_os = "linux")]
+    let proc_exe = fs::read_link(format!("/proc/{pid}/exe"));
+    #[cfg(not(target_os = "linux"))]
+    let proc_exe = "unavailable on this platform";
+    format!(
+        "the daemon never persisted the child's matching identity: \
+         pid={pid}, initial observation={observed:?}, current observation={:?}, \
+         record={:?}, configured program={program:?}, \
+         program stat (device, inode)={program_identity:?}, /proc/{pid}/exe={proc_exe:?}",
+        process.observe(),
+        fs::read_to_string(path),
+    )
+}
+
+fn wait_for_recorded_child(path: &Path, pid: u32, program: &Path) {
     let process = subc_os::Process::open(pid)
         .unwrap()
         .expect("the child must still exist before its daemon is killed");
     let observed = process.observe().expect("the child must still be running");
     let deadline = Instant::now() + Duration::from_secs(10);
     while !child_is_recorded(path, pid, &observed) {
-        assert!(
-            Instant::now() < deadline,
-            "the daemon never persisted the child's matching identity: {:?}",
-            fs::read_to_string(path)
-        );
+        if Instant::now() >= deadline {
+            panic!(
+                "{}",
+                recorded_child_diagnostics(path, &process, &observed, program)
+            );
+        }
         thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn recorded_child_timeout_reports_both_identities_and_executable_paths() {
+    let root = fresh_dir("recorded-child-diagnostics");
+    let record = root.join("live-children.json");
+    let child = json!({
+        "module_id": "wire-less", "protocol": "none", "pid": std::process::id(),
+        "start_time": 41, "executable": { "device": 43, "inode": 47 }
+    });
+    let record_text = json!({ "version": 1, "children": [child] }).to_string();
+    fs::write(&record, &record_text).unwrap();
+    let process = subc_os::Process::open(std::process::id()).unwrap().unwrap();
+    let observed = subc_os::Observation {
+        start_time: 23,
+        executable: Some(subc_os::FileIdentity {
+            device: 29,
+            inode: 31,
+        }),
+    };
+    let program = std::env::current_exe().unwrap();
+    let stat = fs::metadata(&program).unwrap();
+    let diagnostics = recorded_child_diagnostics(&record, &process, &observed, &program);
+    for expected in [
+        format!("pid={}", process.pid()),
+        "initial observation=Observation { start_time: 23, executable: Some(FileIdentity { device: 29, inode: 31 }) }".into(),
+        "current observation=Some(Observation".into(),
+        format!("record=Ok({record_text:?})"),
+        format!("configured program={program:?}"),
+        format!("program stat (device, inode)=Ok(({}, {}))", stat.dev(), stat.ino()),
+    ] {
+        assert!(diagnostics.contains(&expected), "missing {expected:?}: {diagnostics}");
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let exe = fs::read_link(format!("/proc/{}/exe", process.pid())).unwrap();
+        assert!(diagnostics.contains(&format!("/proc/{}/exe=Ok({exe:?})", process.pid())));
     }
 }
 
@@ -605,6 +666,7 @@ fn orphan_of_a_killed_daemon_is_ended_by_the_next_daemon_before_it_respawns() {
     wait_for_recorded_child(
         &fixture.root.join("data/cortexkit/run/live-children.json"),
         orphan as u32,
+        Path::new(env!("CARGO_BIN_EXE_fake-aft-stub")),
     );
     fixture.kill_daemon_group();
     fixture.child.wait().unwrap();

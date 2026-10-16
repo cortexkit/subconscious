@@ -8322,11 +8322,10 @@ fn spawn_child_in_slot(
     let process_identity = process_start_time.map(|start_time| ProcessIdentity { pid, start_time });
     #[cfg(all(test, target_os = "macos"))]
     privacy_exec_boundary_tests::before_image_sample(spec, pid);
-    // Unix spawn returns after exec's error pipe closes. The kernel image is
-    // therefore the executable to compare during a future orphan sweep: PATH
-    // lookup and shebang interpretation may select a different file from the
-    // configured program. Keep the literal program's identity for provenance,
-    // but never use it as proof that a recorded pid may be signalled.
+    // Record the committed kernel image, not the configured pathname: PATH
+    // lookup and shebang interpretation can select a different executable.
+    // Linux's posix_spawn can return before that image is installed, so the
+    // observer also waits for the kernel's first-exec flag to clear.
     #[cfg(not(windows))]
     let recorded_image = observe_spawned_image(pid);
     // spawn() confirms only the first exec, into the trampoline. Never persist
@@ -8684,10 +8683,193 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 /// not identities inferred from a configured pathname.
 #[cfg(not(windows))]
 fn observe_spawned_image(pid: u32) -> Option<subc_os::Observation> {
-    subc_os::Process::open(pid)
-        .ok()
-        .flatten()
-        .and_then(|process| process.observe())
+    let process = subc_os::Process::open(pid).ok().flatten()?;
+    #[cfg(target_os = "linux")]
+    return sample_after_linux_exec(
+        || {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+            let committed = linux_exec_committed(&stat);
+            #[cfg(test)]
+            spawn_image_tests::report_exec_state(committed);
+            committed
+        },
+        || process.observe(),
+    );
+    #[cfg(not(target_os = "linux"))]
+    process.observe()
+}
+
+/// glibc's posix_spawn parent can wake in exec_mmap before the child's new mm
+/// is installed. PF_FORKNOEXEC is cleared later in begin_new_exec, after that
+/// installation. Until it clears, /proc/pid/exe can still name the daemon.
+#[cfg(target_os = "linux")]
+fn linux_exec_committed(stat: &str) -> Option<bool> {
+    const PF_FORKNOEXEC: u64 = 0x40;
+    let flags = stat.rsplit_once(')')?.1.split_whitespace().nth(6)?;
+    Some(flags.parse::<u64>().ok()? & PF_FORKNOEXEC == 0)
+}
+
+#[cfg(target_os = "linux")]
+fn sample_after_linux_exec(
+    mut exec_committed: impl FnMut() -> Option<bool>,
+    observe: impl FnOnce() -> Option<subc_os::Observation>,
+) -> Option<subc_os::Observation> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    while !exec_committed()? {
+        // A failed or indefinitely stalled exec must not publish the inherited
+        // image as authority to signal a future orphan. Missing identity keeps
+        // the existing conservative orphan-sweep behavior.
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_micros(50));
+    }
+    observe()
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod spawn_image_tests {
+    use super::*;
+    use std::cell::{Cell, RefCell};
+
+    enum ExecEvent {
+        Uncommitted,
+        Image(Option<subc_os::Observation>),
+    }
+
+    thread_local! {
+        static EXEC_EVENTS: RefCell<Option<std::sync::mpsc::Sender<ExecEvent>>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn report_exec_state(committed: Option<bool>) {
+        if committed == Some(false) {
+            EXEC_EVENTS.with(|events| {
+                if let Some(events) = events.borrow_mut().take() {
+                    let _ = events.send(ExecEvent::Uncommitted);
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn linux_spawn_observation_waits_for_a_paused_fork_to_exec() {
+        use std::io::{Read, Write};
+        use std::os::fd::AsRawFd;
+
+        let descriptor = std::fs::File::open("/dev/null").unwrap();
+        let mut command = std::process::Command::new("/bin/sleep");
+        command.arg("30");
+        let (mut ready, mut release) =
+            subc_os::fork_exec_test::pause_before_exec(&mut command, descriptor.as_raw_fd())
+                .unwrap();
+        let spawn = std::thread::spawn(move || command.spawn());
+        let mut message = [0u8; 8];
+        ready.read_exact(&mut message).unwrap();
+        let pid = i32::from_ne_bytes(message[..4].try_into().unwrap()) as u32;
+        let before = std::fs::read_to_string(format!("/proc/{pid}/stat"));
+        let inherited = subc_os::Process::open(pid).unwrap().unwrap().observe();
+        let (events, received) = std::sync::mpsc::channel();
+        let observer = std::thread::spawn(move || {
+            EXEC_EVENTS.with(|slot| *slot.borrow_mut() = Some(events.clone()));
+            let image = observe_spawned_image(pid);
+            let _ = events.send(ExecEvent::Image(image));
+        });
+        // Release only once the production observer has seen the uncommitted
+        // exec, or has incorrectly returned the inherited image. Either way,
+        // release and reap before asserting so a regression cannot leak a child.
+        let first = received.recv_timeout(Duration::from_secs(5));
+        release.write_all(&[1]).unwrap();
+        let mut child = spawn.join().unwrap().unwrap();
+        let after = match first {
+            Ok(ExecEvent::Uncommitted) => match received.recv_timeout(Duration::from_secs(5)) {
+                Ok(ExecEvent::Image(image)) => image,
+                _ => None,
+            },
+            Ok(ExecEvent::Image(image)) => image,
+            Err(_) => None,
+        };
+        observer.join().unwrap();
+        child.kill().unwrap();
+        child.wait().unwrap();
+
+        assert_eq!(linux_exec_committed(&before.unwrap()), Some(false));
+        assert_eq!(
+            inherited.unwrap().executable,
+            subc_os::file_identity(&std::env::current_exe().unwrap())
+        );
+        assert_eq!(
+            after.unwrap().executable,
+            subc_os::file_identity(std::path::Path::new("/bin/sleep"))
+        );
+    }
+
+    #[test]
+    fn spawned_image_is_not_sampled_until_linux_exec_commits() {
+        let committed = Cell::new(false);
+        let inherited = subc_os::Observation {
+            start_time: 23,
+            executable: Some(subc_os::FileIdentity {
+                device: 29,
+                inode: 31,
+            }),
+        };
+        let module = subc_os::Observation {
+            start_time: 23,
+            executable: Some(subc_os::FileIdentity {
+                device: 29,
+                inode: 37,
+            }),
+        };
+        let polls = Cell::new(0);
+        let image = sample_after_linux_exec(
+            || {
+                polls.set(polls.get() + 1);
+                // Hold the inherited image through the first poll, as in the
+                // posix_spawn parent-wake window, then commit the module image.
+                committed.set(polls.get() == 2);
+                Some(committed.get())
+            },
+            || Some(if committed.get() { module } else { inherited }),
+        );
+        assert_eq!(image, Some(module));
+        assert_eq!(polls.get(), 2);
+    }
+
+    #[test]
+    fn linux_exec_flag_is_read_from_flags_after_the_last_parenthesis() {
+        assert_eq!(
+            linux_exec_committed("17 (a ) b) R 1 2 3 4 5 4194368"),
+            Some(false)
+        );
+        assert_eq!(
+            linux_exec_committed("17 (a ) b) R 1 2 3 4 5 4194304"),
+            Some(true)
+        );
+        assert_eq!(linux_exec_committed("17 (a) R 1 2 3 4 5 invalid"), None);
+        assert_eq!(linux_exec_committed("17 (a) R"), None);
+    }
+
+    #[test]
+    fn unreadable_exec_state_never_samples_an_inherited_image() {
+        assert_eq!(
+            sample_after_linux_exec(
+                || None,
+                || panic!("must not sample before exec confirmation")
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn uncommitted_exec_times_out_without_sampling_an_inherited_image() {
+        assert_eq!(
+            sample_after_linux_exec(
+                || Some(false),
+                || panic!("must not sample after an exec timeout")
+            ),
+            None
+        );
+    }
 }
 
 /// Resolve once and spawn that exact path, so PATH lookup cannot choose a

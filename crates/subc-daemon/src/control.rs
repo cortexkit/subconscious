@@ -4004,7 +4004,9 @@ impl ControlHandler {
         self.route_outages
             .record_not_serving(module_id, "supervised_not_registered");
         let message = if let Some(pid) = status.waiting_for_previous_pid {
-            format!("waiting: previous instance (pid {pid}) is still running but hidden; it cannot be identified")
+            status.waiting_for_previous_detail.clone().unwrap_or_else(|| {
+                format!("waiting: previous instance (pid {pid}) is still running but could not be verified")
+            })
         } else {
             format!(
                 "module_id '{module_id}' is supervised but not available (state={}, enabled={}, live={})",
@@ -6083,12 +6085,27 @@ impl ControlHandler {
         )
         .map_err(RouterError::FrameBuild)?;
 
-        if let Err(err) = module_sink.send(probe_frame).await {
-            return Ok(vec![control_error_frame(
-                &frame,
-                "target_unavailable",
-                err.to_string(),
-            )?]);
+        // Queue admission and the reply share one deadline, so a module that
+        // stops reading cannot park the requesting connection's reader forever.
+        match timeout_at(deadline, module_sink.send(probe_frame)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                return Ok(vec![control_error_frame(
+                    &frame,
+                    "target_unavailable",
+                    err.to_string(),
+                )?]);
+            }
+            Err(_) => {
+                return Ok(vec![control_error_frame(
+                    &frame,
+                    "module_timeout",
+                    format!(
+                        "module_id '{module_id}' did not answer health.check within {:?}",
+                        self.health_probe_timeout
+                    ),
+                )?]);
+            }
         }
 
         match timeout_at(deadline, receiver).await {

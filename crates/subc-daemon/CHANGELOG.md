@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.36.7
+
+- Retain previous daemon children whose identity cannot be verified or that survive the stop deadlines. Their module ID alone waits for the previous PID to disappear, with a reason distinguishing unverifiable instances from instances that did not stop. Preserve the blocker and reason across roster rewrites; positive PID, start-time and image mismatches remain unsignalled and are not retained.
+- Include module-egress queue admission in an explicit health probe's existing deadline and return `module_timeout` when admission stalls, so later requests on the caller's connection can proceed. Cancel activity-task-cap refusal sends when the connection closes. Other inline backpressure behavior is unchanged.
+
 ## 0.36.6
 
 - On Linux, wait for the kernel's first-exec flag to clear before sampling a spawned child's executable for the live-children record. `posix_spawn` can return while `/proc/<pid>/exe` still names the inherited daemon image. Recording that image permanently prevented strict orphan cleanup after a hard daemon kill, including for `protocol: "none"` children that never register. PID, start-time and executable matching remain strict; PATH and shebang launches still record the actual kernel image.

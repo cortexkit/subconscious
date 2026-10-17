@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.20.99
+
+- Require subc-daemon 0.36.7 to prevent duplicate starts beside unverifiable or surviving previous instances and bound inline health-probe admission. Describe a previous-instance startup wait without assuming the process is hidden; the existing status PID also covers instances that could not be verified or stopped.
+
 ## 0.20.98
 
 - Set installed executables to 0755 and private data/staging paths to 0700 regardless of the caller's umask. Keep generated `subc.jsonc` owner-only because module env blocks can hold tokens; non-secret inventory, update metadata, and daemon service definitions are at most 0644. Setup tightens loose modes on owned paths; run `ck setup` to tighten an existing install without changing unrelated files.

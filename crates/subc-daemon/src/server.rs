@@ -763,10 +763,13 @@ where
                     "activity queue full",
                 )
                 .map_err(ConnectionError::Router)?;
-                ctx.egress
-                    .send(response)
-                    .await
-                    .map_err(ConnectionError::Router)?;
+                let send_result = tokio::select! {
+                    close = &mut close_receiver => {
+                        return Ok(ConnectionLoopExit::CloseRequested(close_reason(close)));
+                    }
+                    result = ctx.egress.send(response) => result,
+                };
+                send_result.map_err(ConnectionError::Router)?;
             } else {
                 let task_router = Arc::clone(&router);
                 let task_ctx = ctx.clone();
@@ -2113,6 +2116,217 @@ mod tests {
         drop(module);
         client_server.await.unwrap().unwrap();
         let _ = module_server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn full_module_egress_health_probe_does_not_block_same_client_other_route() {
+        use crate::ConnectionId;
+        use subc_control::{ClientControlRequest, ClientControlResponse};
+        use subc_protocol::{
+            manifest::{
+                Concurrency, ExecutionMode, IdentityScope, ModuleManifest, ProviderRole, Tool,
+            },
+            session::ModuleControlResponse,
+            BindIdentity, ModuleHelloBody, RouteTarget,
+        };
+
+        let probe_timeout = Duration::from_millis(100);
+        let handler = Arc::new(
+            ControlHandler::new(Arc::new(Registry::default()))
+                .with_health_probe_timeout(probe_timeout),
+        );
+        let router = Arc::new(Router::with_control_handler(Arc::clone(&handler)));
+        let hello = |name: &str| {
+            Frame::build(
+                FrameType::Hello,
+                Flags::new(false, Priority::Passive, false),
+                0,
+                0,
+                1,
+                serde_json::to_vec(&ModuleHelloBody {
+                    manifest: ModuleManifest::builder(name, "0.1.0")
+                        .protocol_ver(PROTOCOL_VERSION)
+                        .provides(vec![ProviderRole::ToolProvider {
+                            tools: vec![Tool {
+                                name: "read".into(),
+                                description: None,
+                                execution_mode: ExecutionMode::Pure,
+                                schema: serde_json::json!({"type": "object"}),
+                            }],
+                            identity_scope: vec![IdentityScope::Project, IdentityScope::Session],
+                            concurrency: Concurrency::ModuleManaged,
+                            emits_push: false,
+                            sub_supervises: false,
+                        }])
+                        .build(),
+                    protocol_ver: PROTOCOL_VERSION,
+                    control_ops: Some(vec!["health.check".to_owned()]),
+                    launch_nonce: None,
+                })
+                .unwrap(),
+            )
+            .unwrap()
+        };
+        let (blocked_tx, mut blocked_rx) = mpsc::channel(1);
+        let blocked_ctx = RouteCtx {
+            connection_id: ConnectionId::new(90001),
+            egress: FrameSink::new(blocked_tx),
+        };
+        handler
+            .handle_control_frame(&blocked_ctx, hello("blocked"))
+            .await
+            .unwrap();
+        assert_eq!(
+            blocked_rx.try_recv().unwrap().header.ty,
+            FrameType::HelloAck
+        );
+        let filler = request(0, 99, b"queue filler");
+        blocked_ctx.egress.try_send(filler.clone()).unwrap();
+        assert!(
+            blocked_ctx.egress.try_send(filler).is_err(),
+            "module queue must actually be full"
+        );
+
+        let (healthy_tx, mut healthy_rx) = mpsc::channel(8);
+        let healthy_ctx = RouteCtx {
+            connection_id: ConnectionId::new(90002),
+            egress: FrameSink::new(healthy_tx),
+        };
+        handler
+            .handle_control_frame(&healthy_ctx, hello("healthy"))
+            .await
+            .unwrap();
+        assert_eq!(
+            healthy_rx.try_recv().unwrap().header.ty,
+            FrameType::HelloAck
+        );
+        let (auth, conn) = test_auth();
+        let (mut client, client_stream) = duplex(4096);
+        let client_server =
+            tokio::spawn(handle_connection(client_stream, Arc::clone(&router), auth));
+        authenticate(&mut client, &conn).await;
+        let control_request = |corr, body: ClientControlRequest| {
+            Frame::build(
+                FrameType::Request,
+                Flags::new(false, Priority::Interactive, false),
+                0,
+                0,
+                corr,
+                serde_json::to_vec(&body).unwrap(),
+            )
+            .unwrap()
+        };
+        crate::write_frame(
+            &mut client,
+            &control_request(
+                2,
+                ClientControlRequest::RouteOpen {
+                    target: RouteTarget::ToolProvider {
+                        module_id: "healthy".into(),
+                    },
+                    identity: BindIdentity::new(
+                        std::env::current_dir().unwrap(),
+                        "unit",
+                        "session",
+                    ),
+                    consumer_identity: None,
+                    consumer_capabilities: None,
+                    role_versions: None,
+                    admission_facts: None,
+                    scope: None,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        let bind = timeout(TEST_DEADLINE, healthy_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        handler
+            .handle_control_frame(
+                &healthy_ctx,
+                Frame::build(
+                    FrameType::Response,
+                    Flags::new(false, Priority::Passive, false),
+                    0,
+                    0,
+                    bind.header.corr,
+                    serde_json::to_vec(&ModuleControlResponse::RouteBindAck {}).unwrap(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let opened = timeout(TEST_DEADLINE, read_frame(&mut client))
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let (channel, epoch) =
+            match serde_json::from_slice::<ClientControlResponse>(&opened.body).unwrap() {
+                ClientControlResponse::RouteOpen {
+                    route_channel,
+                    route_epoch,
+                } => (route_channel, route_epoch),
+                other => panic!("expected a healthy module route, got {other:?}"),
+            };
+
+        let probe = control_request(
+            3,
+            ClientControlRequest::SupervisorHealthProbe {
+                module_id: "blocked".into(),
+            },
+        );
+        let mut ping = request(channel, 4, b"healthy request");
+        ping.header.epoch = epoch;
+        crate::write_frame(&mut client, &probe).await.unwrap();
+        crate::write_frame(&mut client, &ping).await.unwrap();
+        timeout(probe_timeout + Duration::from_secs(1), async {
+            let timed_out = read_frame(&mut client).await.unwrap().unwrap();
+            assert_eq!(timed_out.header.corr, 3);
+            assert_eq!(timed_out.header.ty, FrameType::Error);
+            let error: ErrorBody = serde_json::from_slice(&timed_out.body).unwrap();
+            assert_eq!(error.code, "module_timeout");
+            let forwarded = healthy_rx.recv().await.unwrap();
+            assert_eq!(forwarded.header.corr, ping.header.corr);
+            assert_eq!(forwarded.body, ping.body);
+            let reply = Frame::build(
+                FrameType::Response,
+                ping.header.flags,
+                forwarded.header.channel,
+                forwarded.header.epoch,
+                forwarded.header.corr,
+                b"healthy response".to_vec(),
+            )
+            .unwrap();
+            router
+                .route_for_connection(&healthy_ctx, reply)
+                .await
+                .unwrap();
+            let pong = read_frame(&mut client).await.unwrap().unwrap();
+            assert_eq!(pong.header.ty, FrameType::Response);
+            assert_eq!(pong.header.channel, channel);
+            assert_eq!(pong.header.epoch, epoch);
+            assert_eq!(pong.header.corr, 4);
+            assert_eq!(pong.body, b"healthy response");
+        })
+        .await
+        .expect(
+            "the same client's healthy route must answer within the probe deadline plus margin",
+        );
+        assert_eq!(
+            blocked_rx.len(),
+            1,
+            "the blocked module must remain undrained"
+        );
+        assert_eq!(blocked_rx.try_recv().unwrap().header.corr, 99);
+        assert!(
+            blocked_rx.try_recv().is_err(),
+            "a timed-out probe must not be enqueued later"
+        );
+        drop(client);
+        client_server.await.unwrap().unwrap();
     }
 
     #[tokio::test]

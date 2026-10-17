@@ -1006,8 +1006,10 @@ pub struct ExitReport {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModuleStatus {
     pub module_id: String,
-    /// A previous daemon's hidden process, not a child owned by this supervisor.
+    /// A previous daemon's unresolved process, not a child owned by this supervisor.
     pub waiting_for_previous_pid: Option<u32>,
+    /// Why the previous instance still prevents a new start.
+    pub waiting_for_previous_detail: Option<String>,
     /// The daemon's Windows per-spawn record: `pipe` after the process it
     /// spawned read all nonce bytes, otherwise `env` for the offered copy.
     /// List/status reports use this record, not the source the module sends
@@ -1096,6 +1098,7 @@ struct SupervisorSnapshot {
     spawned_protocol: Option<ModuleProtocol>,
     spawn_failure: Option<String>,
     waiting_for_previous_pid: Option<u32>,
+    waiting_for_previous_detail: Option<String>,
     /// When each crash restart was spent, oldest first. This IS the crash
     /// budget: its in-window length is the count an operator sees and the count
     /// the restart decision is made against, so there is no second counter that
@@ -1243,6 +1246,7 @@ impl SupervisorSnapshot {
             spawned_protocol: None,
             spawn_failure: None,
             waiting_for_previous_pid: None,
+            waiting_for_previous_detail: None,
             crash_restarts: VecDeque::new(),
             lifetime_restarts: 0,
             spawn_generation: 0,
@@ -3083,12 +3087,14 @@ impl Supervisor {
         } else {
             SupervisorSnapshot::disabled()
         };
-        #[cfg(target_os = "linux")]
         let snapshot = {
             let mut snapshot = snapshot;
             if enabled {
-                snapshot.waiting_for_previous_pid =
-                    runtime.child_roster.previous_instance_pid(&spec.module_id);
+                if let Some((pid, reason)) = runtime.child_roster.previous_instance(&spec.module_id)
+                {
+                    snapshot.waiting_for_previous_pid = Some(pid);
+                    snapshot.waiting_for_previous_detail = Some(reason.waiting_message(pid));
+                }
             }
             snapshot
         };
@@ -3497,6 +3503,7 @@ impl SupervisedModule {
         Ok((
             ModuleStatus {
                 waiting_for_previous_pid: snapshot.waiting_for_previous_pid,
+                waiting_for_previous_detail: snapshot.waiting_for_previous_detail.clone(),
                 module_id: self.inner.module_id.clone(),
                 launch_nonce_source: observed_launch_nonce_source(&snapshot),
                 state: snapshot.state,
@@ -6247,12 +6254,10 @@ async fn supervise_loop(
     // Commands a swap handed back to run next (see `swap::SwapEnd`). Served
     // before anything else so a stop that interrupted a swap runs at once.
     let mut requeued: VecDeque<SupervisorCommand> = VecDeque::new();
-    #[cfg(target_os = "linux")]
     let mut previous_instance_recheck = tokio::time::interval_at(
         Instant::now() + Duration::from_secs(5),
         Duration::from_secs(5),
     );
-    #[cfg(target_os = "linux")]
     previous_instance_recheck.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         #[cfg(test)]
@@ -6582,7 +6587,6 @@ async fn supervise_loop(
                 }
             }
         } else {
-            #[cfg(target_os = "linux")]
             let command = if lock_snapshot(&snapshot)
                 .is_ok_and(|state| state.waiting_for_previous_pid.is_some())
             {
@@ -6603,6 +6607,7 @@ async fn supervise_loop(
                             } else {
                                 let _ = update_snapshot(&snapshot, Some(&spec.module_id), |state| {
                                     state.waiting_for_previous_pid = None;
+                                    state.waiting_for_previous_detail = None;
                                 });
                             }
                         }
@@ -6612,8 +6617,6 @@ async fn supervise_loop(
             } else {
                 commands.recv().await
             };
-            #[cfg(not(target_os = "linux"))]
-            let command = commands.recv().await;
             let Some(command) = command else {
                 return;
             };
@@ -6678,28 +6681,28 @@ async fn handle_supervisor_command(
     commands: &mut mpsc::Receiver<SupervisorCommand>,
     requeued: &mut VecDeque<SupervisorCommand>,
 ) -> bool {
-    #[cfg(target_os = "linux")]
-    let command = if let Some(pid) = runtime.child_roster.previous_instance_pid(&spec.module_id) {
-        match command {
-            SupervisorCommand::Restart { reply, .. }
-            | SupervisorCommand::Reload { reply, .. }
-            | SupervisorCommand::Swap { reply, .. } => {
-                let _ = reply.send(Err(previous_instance_error(spec, pid)));
-                return true;
+    let command =
+        if let Some((pid, reason)) = runtime.child_roster.previous_instance(&spec.module_id) {
+            match command {
+                SupervisorCommand::Restart { reply, .. }
+                | SupervisorCommand::Reload { reply, .. }
+                | SupervisorCommand::Swap { reply, .. } => {
+                    let _ = reply.send(Err(previous_instance_error(spec, pid, reason)));
+                    return true;
+                }
+                SupervisorCommand::SetEnabled {
+                    enabled: true,
+                    reply,
+                    ..
+                } => {
+                    let _ = reply.send(Err(previous_instance_error(spec, pid, reason)));
+                    return true;
+                }
+                other => other,
             }
-            SupervisorCommand::SetEnabled {
-                enabled: true,
-                reply,
-                ..
-            } => {
-                let _ = reply.send(Err(previous_instance_error(spec, pid)));
-                return true;
-            }
-            other => other,
-        }
-    } else {
-        command
-    };
+        } else {
+            command
+        };
     match command {
         SupervisorCommand::Drain { requester, reply } => {
             // A plain stop runs no forwarding drain, so nothing reaches the
@@ -8039,13 +8042,14 @@ fn apply_spawn_role(command: &mut Command, role: SpawnRole) {
     }
 }
 
-#[cfg(target_os = "linux")]
-fn previous_instance_error(spec: &ModuleSpec, pid: u32) -> SuperviseError {
+fn previous_instance_error(
+    spec: &ModuleSpec,
+    pid: u32,
+    reason: crate::live_children::RetainedReason,
+) -> SuperviseError {
     SuperviseError::Spawn {
         program: spec.program.clone(),
-        source: io::Error::new(io::ErrorKind::WouldBlock, format!(
-            "waiting: previous instance (pid {pid}) is still running but hidden; it cannot be identified"
-        )),
+        source: io::Error::new(io::ErrorKind::WouldBlock, reason.waiting_message(pid)),
         cgroup_path: None,
     }
 }
@@ -8097,9 +8101,8 @@ fn spawn_child_in_slot(
     role: SpawnRole,
     alternate_slot: bool,
 ) -> Result<SupervisedChild, SuperviseError> {
-    #[cfg(target_os = "linux")]
-    if let Some(pid) = roster.previous_instance_pid(&spec.module_id) {
-        return Err(previous_instance_error(spec, pid));
+    if let Some((pid, reason)) = roster.previous_instance(&spec.module_id) {
+        return Err(previous_instance_error(spec, pid, reason));
     }
     if roster.is_closed() {
         return Err(SuperviseError::Spawn {
@@ -10447,6 +10450,7 @@ fn set_running(
     state.drain_disposition_detail = None;
     state.spawn_failure = None;
     state.waiting_for_previous_pid = None;
+    state.waiting_for_previous_detail = None;
     // Every caller of this is a plain spawn, which always uses the primary key;
     // a promoted swap candidate sets the flag itself after this returns.
     state.in_alternate_slot = false;
@@ -10476,6 +10480,7 @@ fn set_running(
 
 fn clear_current_process_facts(state: &mut SupervisorSnapshot) {
     state.waiting_for_previous_pid = None;
+    state.waiting_for_previous_detail = None;
     state.process_alive = false;
     state.spawned_protocol = None;
     state.pid = None;

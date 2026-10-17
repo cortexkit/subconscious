@@ -28,7 +28,7 @@
 //! a forced stop. An inaccessible process or reused PID is left alone.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs, io,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
@@ -177,13 +177,25 @@ pub(crate) struct LiveChild {
 struct RecordFile {
     version: u32,
     children: Vec<LiveChild>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    retained_reasons: BTreeMap<u32, RetainedReason>,
 }
 
 /// Replace the record at `path` with `children`.
+#[cfg(test)]
 pub(crate) fn write_record(path: &Path, children: &[LiveChild]) -> io::Result<()> {
+    write_record_with_reasons(path, children, BTreeMap::new())
+}
+
+pub(crate) fn write_record_with_reasons(
+    path: &Path,
+    children: &[LiveChild],
+    retained_reasons: BTreeMap<u32, RetainedReason>,
+) -> io::Result<()> {
     let bytes = serde_json::to_vec_pretty(&RecordFile {
         version: RECORD_VERSION,
         children: children.to_vec(),
+        retained_reasons,
     })
     .map_err(io::Error::other)?;
     write_atomically(path, &bytes, |_| Ok(()))
@@ -215,16 +227,24 @@ impl std::fmt::Display for RecordReadError {
 /// The children listed at `path`. A missing file is an empty record: the
 /// previous daemon never spawned anything, or this is the first boot.
 pub(crate) fn read_record(path: &Path) -> Result<Vec<LiveChild>, RecordReadError> {
+    read_record_with_reasons(path).map(|(children, _)| children)
+}
+
+pub(crate) fn read_record_with_reasons(
+    path: &Path,
+) -> Result<(Vec<LiveChild>, BTreeMap<u32, RetainedReason>), RecordReadError> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok((Vec::new(), BTreeMap::new()))
+        }
         Err(error) => return Err(RecordReadError::Io(error)),
     };
     let record: RecordFile = serde_json::from_slice(&bytes).map_err(RecordReadError::Malformed)?;
     if record.version != RECORD_VERSION {
         return Err(RecordReadError::UnknownVersion(record.version));
     }
-    Ok(record.children)
+    Ok((record.children, record.retained_reasons))
 }
 
 /// Write `bytes` to a new file beside `path`, then rename it over `path`.
@@ -351,6 +371,15 @@ impl IdentityVerdict {
             Self::ExecutableDiffers => "the process is running another executable",
         }
     }
+
+    fn refusal(self) -> SweepDecision {
+        match self {
+            Self::PidDiffers | Self::StartTimeDiffers | Self::ExecutableDiffers => {
+                SweepDecision::Mismatched(self)
+            }
+            _ => SweepDecision::Unverifiable(self.describe().to_owned()),
+        }
+    }
 }
 
 /// Compare a record entry with what is running at `observed_pid` now. Only
@@ -411,6 +440,39 @@ pub(crate) enum SweepDecision {
     NotSignalledOnThisPlatform,
 }
 
+/// Why a previous instance still prevents starting its configured module.
+/// Kept separately from identity evidence so it can never authorize a signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RetainedReason {
+    Hidden,
+    Unverifiable,
+    Survived,
+}
+
+impl RetainedReason {
+    pub(crate) fn waiting_message(self, pid: u32) -> String {
+        let reason = match self {
+            Self::Hidden => "is still running but hidden; it cannot be identified",
+            Self::Unverifiable => "is still running but could not be verified",
+            Self::Survived => "did not stop",
+        };
+        format!("waiting: previous instance (pid {pid}) {reason}")
+    }
+}
+
+impl SweepDecision {
+    fn retained_reason(&self) -> Option<RetainedReason> {
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::AliveButUnobservable => Some(RetainedReason::Hidden),
+            Self::Unverifiable(_) => Some(RetainedReason::Unverifiable),
+            Self::Survived => Some(RetainedReason::Survived),
+            _ => None,
+        }
+    }
+}
+
 /// How long the sweep waits after each signal.
 #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 #[derive(Debug, Clone, Copy)]
@@ -439,7 +501,7 @@ const POLL: Duration = Duration::from_millis(20);
 
 /// End every process the previous daemon's record lists that is still
 /// exactly the process recorded, except those in `adopted`, then replace the
-/// record with any alive-but-unobservable entries. Runs before any module is spawned.
+/// record with instances that could not be verified or stopped. Runs before any module is spawned.
 ///
 /// The record is the one in the run directory `owner` locks. Requiring the
 /// lock means the record cannot belong to a daemon that is still running:
@@ -451,6 +513,19 @@ pub(crate) async fn sweep_orphans(
     adopted: &AdoptedPids,
     bounds: SweepBounds,
 ) -> Vec<(LiveChild, SweepDecision)> {
+    sweep_orphans_with(owner, adopted, bounds, sweep_entries).await
+}
+
+async fn sweep_orphans_with<'a, F, Fut>(
+    owner: &RunDirLock,
+    adopted: &'a AdoptedPids,
+    bounds: SweepBounds,
+    sweep: F,
+) -> Vec<(LiveChild, SweepDecision)>
+where
+    F: FnOnce(Vec<LiveChild>, &'a AdoptedPids, SweepBounds) -> Fut,
+    Fut: std::future::Future<Output = Vec<(LiveChild, SweepDecision)>>,
+{
     let path = owner.live_children_record();
     let entries = match read_record(path) {
         Ok(entries) => entries,
@@ -463,22 +538,22 @@ pub(crate) async fn sweep_orphans(
             Vec::new()
         }
     };
-    let decisions = sweep_entries(entries, adopted, bounds).await;
+    let decisions = sweep(entries, adopted, bounds).await;
     for (entry, decision) in &decisions {
         log_decision(entry, decision);
     }
     let retained: Vec<_> = decisions
         .iter()
-        .filter_map(|(entry, _decision)| {
-            #[cfg(target_os = "linux")]
-            if *_decision == SweepDecision::AliveButUnobservable {
-                return Some(entry.clone());
-            }
-            let _ = entry;
-            None
+        .filter(|(_, decision)| decision.retained_reason().is_some())
+        .map(|(entry, _)| entry.clone())
+        .collect();
+    let reasons = decisions
+        .iter()
+        .filter_map(|(entry, decision)| {
+            decision.retained_reason().map(|reason| (entry.pid, reason))
         })
         .collect();
-    if let Err(error) = write_record(path, &retained) {
+    if let Err(error) = write_record_with_reasons(path, &retained, reasons) {
         warn!(path = %path.display(), %error, "could not reset the live-children record after the orphan sweep");
     }
     decisions
@@ -499,6 +574,20 @@ async fn sweep_entries_with_verdict(
     adopted: &AdoptedPids,
     bounds: SweepBounds,
     verdict_for: impl Fn(&LiveChild, &subc_os::Process) -> Option<IdentityVerdict>,
+) -> Vec<(LiveChild, SweepDecision)> {
+    sweep_entries_with_hooks(entries, adopted, bounds, verdict_for, |process, signal| {
+        process.signal(signal)
+    })
+    .await
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn sweep_entries_with_hooks(
+    entries: Vec<LiveChild>,
+    adopted: &AdoptedPids,
+    bounds: SweepBounds,
+    verdict_for: impl Fn(&LiveChild, &subc_os::Process) -> Option<IdentityVerdict>,
+    signal: impl Fn(&subc_os::Process, subc_os::Signal) -> io::Result<bool>,
 ) -> Vec<(LiveChild, SweepDecision)> {
     use subc_os::{Process, Signal};
     use tokio::time::{sleep, Instant};
@@ -553,7 +642,7 @@ async fn sweep_entries_with_verdict(
                     pidfd = process.signals_through_pidfd(),
                     "orphan sweep: previous daemon's child still running and matches pid, start time and executable; sending SIGTERM"
                 );
-                match process.signal(Signal::Terminate) {
+                match signal(&process, Signal::Terminate) {
                     Ok(true) => signalled.push((entry, process)),
                     // It exited between the check and the signal.
                     Ok(false) => decisions.push((entry, SweepDecision::Gone)),
@@ -562,7 +651,7 @@ async fn sweep_entries_with_verdict(
                     }
                 }
             }
-            Some(verdict) => decisions.push((entry, SweepDecision::Mismatched(verdict))),
+            Some(verdict) => decisions.push((entry, verdict.refusal())),
         }
     }
 
@@ -572,7 +661,11 @@ async fn sweep_entries_with_verdict(
         if verdict == Some(IdentityVerdict::ProcessHidden) {
             return Some(SweepDecision::AliveButUnobservable);
         }
-        (!verdict.is_some_and(IdentityVerdict::permits_signal)).then_some(exited)
+        match verdict {
+            None => Some(exited),
+            Some(verdict) if verdict.permits_signal() => None,
+            Some(verdict) => Some(verdict.refusal()),
+        }
     };
     let term_deadline = Instant::now() + bounds.term_grace;
     loop {
@@ -603,7 +696,7 @@ async fn sweep_entries_with_verdict(
             grace_ms = bounds.term_grace.as_millis() as u64,
             "orphan sweep: previous daemon's child still running after SIGTERM grace; sending SIGKILL"
         );
-        let _ = process.signal(Signal::Kill);
+        let _ = signal(process, Signal::Kill);
     }
     let kill_deadline = Instant::now() + bounds.kill_bound;
     loop {
@@ -691,7 +784,7 @@ async fn sweep_entries(
 #[cfg(windows)]
 fn sweep_windows_entry(entry: &LiveChild, wait_bound: Duration) -> SweepDecision {
     let Some(expected) = entry.start_time else {
-        return SweepDecision::Mismatched(IdentityVerdict::StartTimeUnrecorded);
+        return IdentityVerdict::StartTimeUnrecorded.refusal();
     };
     // Open once: creation-time validation, the forced stop and its wait all use
     // this handle even if the PID is subsequently reused.
@@ -755,7 +848,7 @@ fn log_decision(entry: &LiveChild, decision: &SweepDecision) {
             module_id,
             pid,
             %error,
-            "orphan sweep: could not inspect the recorded pid; not signalled"
+            "orphan sweep: could not verify or stop the recorded pid; keeping its record and blocking its module"
         ),
         #[cfg(target_os = "linux")]
         SweepDecision::AliveButUnobservable => info!(
@@ -775,7 +868,7 @@ fn log_decision(entry: &LiveChild, decision: &SweepDecision) {
         SweepDecision::Survived => warn!(
             module_id,
             pid,
-            "orphan sweep: previous daemon's child still observed after SIGKILL; continuing boot"
+            "orphan sweep: previous daemon's child still observed after SIGKILL; keeping its record and blocking its module"
         ),
         SweepDecision::NotSignalledOnThisPlatform => info!(
             module_id,
@@ -1846,10 +1939,159 @@ pub(crate) mod tests {
                 decisions,
                 vec![(
                     entry,
-                    SweepDecision::Mismatched(IdentityVerdict::ExecutableUnreadable)
+                    SweepDecision::Unverifiable(
+                        IdentityVerdict::ExecutableUnreadable.describe().to_owned()
+                    )
                 )]
             );
             assert!(alive, "the sweep must leave the unreadable child running");
+        }
+
+        #[cfg(target_os = "linux")]
+        async fn retained_orphan_blocks_only_its_module(survived: bool) {
+            use crate::supervise::{ModuleOverlap, ModuleSpec, RestartPolicy, Supervisor};
+            use std::sync::Arc;
+
+            let dir = ScratchDir::new("unverified-orphan-blocks-one");
+            let path = record_path(&dir);
+            let program = executable("sleep");
+            let (child, entry) = spawn_recorded(&program, &["60"]);
+            let mut fixture = NonDumpableChild {
+                child,
+                entry,
+                program: program.clone(),
+            };
+            write_record(&path, std::slice::from_ref(&fixture.entry)).unwrap();
+            let owner = RunDirLock::acquire(&path).unwrap();
+            let decisions = sweep_orphans_with(
+                &owner,
+                &AdoptedPids::none(),
+                SweepBounds {
+                    term_grace: Duration::ZERO,
+                    kill_bound: Duration::ZERO,
+                },
+                |entries, adopted, bounds| async move {
+                    sweep_entries_with_hooks(
+                        entries,
+                        adopted,
+                        bounds,
+                        |entry, process| {
+                            if survived {
+                                current_verdict(entry, process)
+                            } else {
+                                let mut observed = process.observe().unwrap();
+                                observed.executable = None;
+                                Some(verdict_with_executable_access(
+                                    entry,
+                                    process.pid(),
+                                    &observed,
+                                    subc_os::ExecutableAccess::Unavailable,
+                                ))
+                            }
+                        },
+                        |_process, signal| {
+                            // Simulate successful TERM delivery without exiting, then
+                            // a failed KILL. The real child stays killable for cleanup.
+                            if signal == subc_os::Signal::Terminate {
+                                Ok(true)
+                            } else {
+                                Err(io::Error::other("injected signal failure"))
+                            }
+                        },
+                    )
+                    .await
+                },
+            )
+            .await;
+            let reason = if survived {
+                RetainedReason::Survived
+            } else {
+                RetainedReason::Unverifiable
+            };
+            assert_eq!(decisions.len(), 1);
+            assert_eq!(decisions[0].1.retained_reason(), Some(reason));
+            assert_eq!(
+                read_record(&path).unwrap(),
+                vec![fixture.entry.clone()],
+                "the top-level sweep must retain the blocker"
+            );
+            assert!(still_running(&mut fixture.child));
+
+            let roster = crate::child_roster::ChildRoster::default();
+            roster.record_to(path.clone());
+            assert_eq!(
+                roster.previous_instance("previous"),
+                Some((fixture.entry.pid, reason))
+            );
+            assert_eq!(roster.previous_instance_pid("unrelated"), None);
+            let guard = roster.admit(
+                "unrelated".to_owned(),
+                std::process::id(),
+                ModuleProtocol::None,
+                None,
+                crate::child_roster::RecordedIdentity::default(),
+            );
+            assert!(read_record(&path).unwrap().contains(&fixture.entry));
+            drop(guard);
+            let supervisor = Supervisor::new(
+                Arc::new(crate::registry::Registry::default()),
+                RestartPolicy::default(),
+            )
+            .with_live_children_record(path.clone());
+            let spec = |module_id: &str| ModuleSpec {
+                module_id: module_id.to_owned(),
+                program: program.clone(),
+                args: vec!["60".to_owned()],
+                env: vec![],
+                reserved: false,
+                reserved_prefixes: vec![],
+                protocol: ModuleProtocol::None,
+                overlap: ModuleOverlap::Exclusive,
+            };
+            let waiting = supervisor
+                .supervise_configured(spec("previous"), true)
+                .unwrap();
+            let other = supervisor
+                .supervise_configured(spec("unrelated"), true)
+                .unwrap();
+            let status = waiting.status().unwrap();
+            assert_eq!(status.waiting_for_previous_pid, Some(fixture.entry.pid));
+            assert_eq!(
+                status.waiting_for_previous_detail,
+                Some(reason.waiting_message(fixture.entry.pid))
+            );
+            assert!(!status.process_alive && status.pid.is_none());
+            assert_eq!(status.spawn_generation, 0);
+            assert!(
+                other.status().unwrap().live,
+                "an unrelated module must start"
+            );
+            let refusal = waiting.set_enabled(true).await.unwrap_err().to_string();
+            assert!(refusal.contains(&reason.waiting_message(fixture.entry.pid)));
+            assert!(waiting.restart(None).await.is_err());
+            assert!(waiting.reload().await.is_err());
+            assert!(waiting.swap(None).await.is_err());
+            assert!(supervisor.spawn(spec("previous")).is_err());
+            other.stop().await.unwrap();
+            waiting.stop().await.unwrap();
+            assert_eq!(read_record(&path).unwrap(), vec![fixture.entry.clone()]);
+            assert!(still_running(&mut fixture.child));
+            fixture.child.kill().unwrap();
+            fixture.child.wait().unwrap();
+            assert_eq!(roster.previous_instance_pid("previous"), None);
+            assert!(read_record(&path).unwrap().is_empty());
+        }
+
+        #[cfg(target_os = "linux")]
+        #[tokio::test]
+        async fn live_unverifiable_orphan_is_retained_and_blocks_only_its_module() {
+            retained_orphan_blocks_only_its_module(false).await;
+        }
+
+        #[cfg(target_os = "linux")]
+        #[tokio::test]
+        async fn surviving_orphan_is_retained_and_blocks_only_its_module() {
+            retained_orphan_blocks_only_its_module(true).await;
         }
 
         #[tokio::test]
@@ -2011,7 +2253,9 @@ pub(crate) mod tests {
                 decisions,
                 vec![(
                     entry,
-                    SweepDecision::Mismatched(IdentityVerdict::ExecutableUnrecorded)
+                    SweepDecision::Unverifiable(
+                        IdentityVerdict::ExecutableUnrecorded.describe().to_owned()
+                    )
                 )]
             );
             assert!(

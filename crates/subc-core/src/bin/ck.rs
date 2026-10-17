@@ -6500,7 +6500,7 @@ fn module_status_text(module: &Value) -> String {
         .get("waiting_for_previous_pid")
         .and_then(Value::as_u64)
     {
-        return format!("waiting: previous instance (pid {pid}) is still running but hidden; it cannot be identified");
+        return format!("waiting: a previous instance (pid {pid}) may still be running; it will start once that process exits");
     }
     if module.get("enabled").and_then(Value::as_bool) == Some(false) {
         return "stopped".to_string();
@@ -9412,7 +9412,7 @@ mod tests {
             "is not observable (process hidden)"
         );
         let module = serde_json::json!({"state": "starting", "waiting_for_previous_pid": 42});
-        assert_eq!(module_status_text(&module), "waiting: previous instance (pid 42) is still running but hidden; it cannot be identified");
+        assert_eq!(module_status_text(&module), "waiting: a previous instance (pid 42) may still be running; it will start once that process exits");
     }
 
     #[test]

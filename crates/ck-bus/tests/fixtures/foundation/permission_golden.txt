@@ -161,6 +161,7 @@ allow flow-engine publish $JS.API.STREAM.INFO.KV_CK_BOX_GOLDENFIXTURE_CENSUS
 allow flow-engine publish $JS.API.STREAM.MSG.GET.KV_CK_BOX_GOLDENFIXTURE_CENSUS
 allow flow-engine publish $JS.FC.CK_BOX_GOLDENFIXTURE_EVENT.>
 allow flow-engine publish ck.box_goldenfixture.effect.dead
+allow flow-engine publish ck.box_goldenfixture.event.basal.>
 allow flow-engine subscribe $KV.CK_BOX_GOLDENFIXTURE_CENSUS.>
 allow flow-engine subscribe _INBOX.basal.>
 
@@ -213,6 +214,7 @@ expect-refused flow-engine publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_RO
 expect-refused flow-engine publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_ROOM.m_prefrontal-core room-stream
 expect-refused flow-engine publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_WAKE.c_agent_gold_a agent-durable
 expect-refused flow-engine publish $JS.API.STREAM.INFO.CK_BOX_GOLDENFIXTURE_ROOM room-stream
+expect-refused flow-engine publish ck.box_goldenfixture.event.other.pull_request_review.v1 foreign-module-event
 expect-refused flow-engine publish ck.box_goldenfixture.room.room_gold_bound.post room-stream
 expect-refused flow-engine publish ck.box_goldenfixture.wake.agent_gold_a.fire workload-publish
 expect-refused flow-engine subscribe ck.box_goldenfixture.room.room_gold_bound.> room-stream

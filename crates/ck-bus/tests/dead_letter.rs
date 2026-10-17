@@ -396,7 +396,7 @@ async fn publish_record(
         )
         .await
         .unwrap_or_else(|error| panic!("the claimant publishes the dead letter: {error:?}"))
-        .stream_seq
+        .stream_sequence()
 }
 
 // ---- The claimant child ----
@@ -489,7 +489,7 @@ async fn claimant_main(config: Value) {
         .expect("the dead-letter record is stored before term");
     say(&format!(
         "published {} delivery {}",
-        ack.stream_seq, exhausted.item.delivery_count
+        ack.stream_sequence(), exhausted.item.delivery_count
     ));
     if read_stdin_line().await == "term" {
         // `term()` returns once the server has confirmed it, so no flush is needed

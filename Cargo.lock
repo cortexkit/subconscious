@@ -264,7 +264,7 @@ dependencies = [
 
 [[package]]
 name = "ck-bus"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "async-nats",
  "async-trait",
@@ -364,8 +364,8 @@ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
 name = "cortexkit-bus-inmemory"
-version = "0.2.0"
-source = "git+https://github.com/cortexkit/commons.git?rev=e4fb106f581c4d208a81e924a6329cfb20de616d#e4fb106f581c4d208a81e924a6329cfb20de616d"
+version = "0.3.0"
+source = "git+https://github.com/cortexkit/commons.git?rev=5586ebd0bc6240efd4723ae22493a6ed3c5bdb8d#5586ebd0bc6240efd4723ae22493a6ed3c5bdb8d"
 dependencies = [
  "async-trait",
  "cortexkit-bus-naming",
@@ -375,13 +375,13 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-bus-naming"
-version = "0.2.0"
-source = "git+https://github.com/cortexkit/commons.git?rev=e4fb106f581c4d208a81e924a6329cfb20de616d#e4fb106f581c4d208a81e924a6329cfb20de616d"
+version = "0.2.1"
+source = "git+https://github.com/cortexkit/commons.git?rev=5586ebd0bc6240efd4723ae22493a6ed3c5bdb8d#5586ebd0bc6240efd4723ae22493a6ed3c5bdb8d"
 
 [[package]]
 name = "cortexkit-bus-nats"
-version = "0.2.0"
-source = "git+https://github.com/cortexkit/commons.git?rev=e4fb106f581c4d208a81e924a6329cfb20de616d#e4fb106f581c4d208a81e924a6329cfb20de616d"
+version = "0.3.0"
+source = "git+https://github.com/cortexkit/commons.git?rev=5586ebd0bc6240efd4723ae22493a6ed3c5bdb8d#5586ebd0bc6240efd4723ae22493a6ed3c5bdb8d"
 dependencies = [
  "async-nats",
  "async-trait",
@@ -394,8 +394,8 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-bus-trait"
-version = "0.2.0"
-source = "git+https://github.com/cortexkit/commons.git?rev=e4fb106f581c4d208a81e924a6329cfb20de616d#e4fb106f581c4d208a81e924a6329cfb20de616d"
+version = "0.3.0"
+source = "git+https://github.com/cortexkit/commons.git?rev=5586ebd0bc6240efd4723ae22493a6ed3c5bdb8d#5586ebd0bc6240efd4723ae22493a6ed3c5bdb8d"
 dependencies = [
  "async-trait",
  "sha2",
@@ -622,7 +622,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1583,7 +1583,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2138,7 +2138,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.4.1
+
+- Basal (the flow engine) may publish its own module events on
+  `ck.{acct}.event.basal.>`, as every other participant may on its own. Its
+  first lifecycle event was refused as a permissions violation, and the server
+  closed the connection its event reader shares, so the reader delivered nothing.
+  It still cannot publish another module's events.
+- Take the commons bus crates at 0.3.0 (bus-naming 0.2.1). Publishes now return a
+  receipt that reports a deduplicated publish; bus behavior is otherwise unchanged.
+
 ## 0.4.0
 
 - Upgrade the Rust SDK and protocol dependencies for non-exhaustive scope selectors and per-scope bind proofs. Bus behavior is unchanged.

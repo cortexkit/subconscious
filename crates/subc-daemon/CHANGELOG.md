@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.31.4
+
+- Backport from 0.33.1: no GOODBYE for a route a fast module ack committed. `route.open` queued the route.bind and only then marked the relay enqueued, so a module that acked inside that window had its just-committed route treated as abandoned and was sent a GOODBYE; the client was told the route was accepted and its first requests were dropped. The mark now distinguishes a relay a reply already settled from one dropped without a reply, and only the latter gets the GOODBYE.
+
 ## 0.31.3
 
 - Released from the 0.31 line for consumers not yet on 0.33.7 or later: require subc-os below 0.1.12. subc-os 0.1.12 added a `MemoryKind` variant (the Windows working set) that this line's code doesn't handle, so a lock that resolved a newer subc-os next to this line failed to compile (E0004). Newer subc-daemon releases (0.33.7 and up) handle it.

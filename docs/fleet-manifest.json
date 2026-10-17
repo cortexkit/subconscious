@@ -15,6 +15,12 @@
       "acquisition": "source",
       "lock_refresh": "manual"
     },
+    "basal": {
+      "repo": "cortexkit/basal",
+      "binary": "ck-basal",
+      "acquisition": "source",
+      "lock_refresh": "manual"
+    },
     "broca": {
       "repo": "cortexkit/broca",
       "binary": "ck-broca",

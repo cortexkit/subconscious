@@ -1,44 +1,7 @@
 name: SubcFed
 
-# STATUS: THIS LANE HAS NEVER VERIFIED ANYTHING. Of its first 31 runs, 30 were
-# cancelled and one was in flight -- zero successes, zero failures, and ZERO
-# STEPS EXECUTED in any of them. The jobs are created and given a start time,
-# then wait for a `macos-13` runner that never arrives, until the next push
-# cancels them. Observed lifetimes ranged from 8 minutes to 7 hours.
-#
-# CAUSE: `macos-13` is a GitHub-hosted runner, and GitHub blocks private-repo
-# Actions jobs for this free-plan org at the zero spending limit -- the same
-# constraint ci.yml documents, which is why every other lane runs on Blacksmith.
-# Blacksmith has no macOS runners, so there is no drop-in substitution: this
-# workflow cannot run until the org's billing changes or a self-hosted macOS
-# runner exists.
-#
-# WHY IT IS LEFT IN PLACE RATHER THAN DELETED: the job definitions below are
-# correct and are the specification of what Swift CI should do once a runner
-# exists. Deleting them loses that; leaving them un-annotated is worse, because
-# a queued-forever lane renders in the checks list as pending rather than
-# failing, and a pending check reads as "still running" indefinitely.
-#
-# WHY IT IS NOT MADE TO FAIL FAST, which would be the better rendering: there is
-# no mechanism that produces one. `timeout-minutes` counts EXECUTION time, and
-# these jobs never execute a step -- measured here, one run survived 423 minutes,
-# past the 360-minute default, without the default firing. A job waiting for an
-# unsatisfiable runner label is not running slowly; it is not running. So the
-# choice is a pending check that is ANNOTATED, or no workflow at all, and the
-# annotation keeps the specification.
-#
-# THE TRIGGER FOR REMOVING THIS BLOCK: if a macOS runner becomes available
-# (org billing change, or a self-hosted macOS runner), the jobs below should run
-# unmodified. Verify by conclusion distribution rather than by the newest run --
-# `gh run list --workflow=subc-fed.yml --limit 50 --json conclusion` grouped by
-# value. A single green among cancellations is the signal; the latest status is
-# not, because a cancellation and a success render alike in a checks list once
-# the next push arrives.
-#
-# WHAT ACTUALLY VERIFIES THE SWIFT CLIENT TODAY: local runs on the dev box
-# (`DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test`,
-# 311 tests at the time of writing). That is discipline, not enforcement --
-# nothing refuses an unverified push to clients/subc-client-swift/.
+# Runs on GitHub-hosted macOS runners, which are free for this public
+# repository. It runs only when the Swift client or this file changes.
 on:
   push:
     branches: [master, 'train/**']
@@ -56,29 +19,24 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Package tests on macOS 13 or later. The SubcFed library targets iOS 16+
-  # and macOS 13+, so the test runner must be macOS 13 or later to satisfy the
-  # deployment floor. Xcode provides the Swift toolchain that builds and runs
-  # the SwiftPM test suite.
+  # Package tests on macOS, with the runner image's default Xcode providing the
+  # Swift toolchain. The library targets iOS 16+ and macOS 13+; the runner is
+  # newer than that floor, and build-macos below checks the floor.
   test:
     name: swift test (macOS)
-    runs-on: macos-13
+    runs-on: macos-latest
     defaults:
       run:
         working-directory: clients/subc-client-swift
     steps:
       - uses: actions/checkout@v5
 
-      - name: Select Xcode
-        run: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
-
       - name: Resolve package dependencies
         run: swift package resolve
 
       - name: Run package tests
         run: |
-          DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
-            swift test
+          swift test
 
   # Build the SubcFed scheme for generic iOS with the package's declared iOS 16
   # deployment floor. Code signing is disabled because the CI runner has no
@@ -86,23 +44,19 @@ jobs:
   # compiles for the iOS target.
   build-ios:
     name: xcodebuild (generic/platform=iOS)
-    runs-on: macos-13
+    runs-on: macos-latest
     defaults:
       run:
         working-directory: clients/subc-client-swift
     steps:
       - uses: actions/checkout@v5
 
-      - name: Select Xcode
-        run: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
-
       - name: Resolve package dependencies
         run: swift package resolve
 
       - name: Build SubcFed for generic iOS
         run: |
-          DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
-            xcodebuild -scheme SubcFed \
+          xcodebuild -scheme SubcFed \
               -destination 'generic/platform=iOS' \
               -derivedDataPath .build/xcode-derived \
               CODE_SIGNING_ALLOWED=NO \
@@ -113,23 +67,19 @@ jobs:
   # post-macOS-13 API use is a build failure. Code signing is disabled.
   build-macos:
     name: xcodebuild (generic/platform=macOS, MACOSX_DEPLOYMENT_TARGET=13.0)
-    runs-on: macos-13
+    runs-on: macos-latest
     defaults:
       run:
         working-directory: clients/subc-client-swift
     steps:
       - uses: actions/checkout@v5
 
-      - name: Select Xcode
-        run: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
-
       - name: Resolve package dependencies
         run: swift package resolve
 
       - name: Build SubcFed for generic macOS
         run: |
-          DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
-            xcodebuild -scheme SubcFed \
+          xcodebuild -scheme SubcFed \
               -destination 'generic/platform=macOS' \
               -derivedDataPath .build/xcode-derived-macos \
               MACOSX_DEPLOYMENT_TARGET=13.0 \

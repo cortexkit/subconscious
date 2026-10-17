@@ -39,6 +39,8 @@ final class RdvRegistryRowStrictnessTests: XCTestCase {
         let decoded = try RdvRegistryRow.decode(row())
         XCTAssertEqual(decoded.name, "galdor")
         XCTAssertEqual(decoded.platform, "ios")
+        XCTAssertEqual(decoded.capabilities, [])
+        XCTAssertFalse(decoded.servesFed)
         XCTAssertNil(decoded.enrollmentID)
         XCTAssertNil(decoded.supersessionGeneration)
     }
@@ -125,5 +127,51 @@ final class RdvRegistryRowStrictnessTests: XCTestCase {
                 XCTAssertEqual(field, key)
             }
         }
+    }
+
+    func testRegistryCapabilitiesVectorsUseProductionSnapshotDecoder() throws {
+        let vectors = try RdvWireFixtures.jsonlLines("registry-capabilities.jsonl")
+        XCTAssertEqual(vectors.count, 16, "the pinned capability vector set must contain all 16 cases")
+        let expectedAcceptedCapabilities: [String: [String]] = [
+            "absent": [],
+            "empty-list": [],
+            "fed-serve": ["fed-serve"],
+            "eight-valid-tokens": ["a", "a-", "a0", "b", "c", "d", "fed-serve", "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"],
+            "unknown-well-formed": ["future-route-v2"],
+        ]
+        var seenAccepted = Set<String>()
+
+        for line in vectors {
+            let vector = try XCTUnwrap(try JSONSerialization.jsonObject(with: line) as? [String: Any])
+            let name = try XCTUnwrap(vector["name"] as? String)
+            let outcome = try XCTUnwrap(vector["outcome"] as? String)
+            let raw = try XCTUnwrap(vector["raw"] as? String)
+            let payload: RdvJSONObject
+            guard case .object(let object) = try RdvJSONValue.parse(Data(raw.utf8)) else {
+                return XCTFail("vector \(name) raw payload must be an object")
+            }
+            payload = object
+
+            switch outcome {
+            case "accept":
+                seenAccepted.insert(name)
+                do {
+                    let snapshot = try RdvRegistrySnapshot.decode(payload)
+                    let row = try XCTUnwrap(snapshot.devices.first, "vector \(name) must contain a registry row")
+                    let expected = try XCTUnwrap(expectedAcceptedCapabilities[name], "vector \(name) needs a pinned expected list")
+                    XCTAssertEqual(row.capabilities, expected, "vector \(name) decoded capabilities")
+                    XCTAssertEqual(row.servesFed, expected.contains("fed-serve"), "vector \(name) fed-serve hint")
+                } catch {
+                    XCTFail("accept vector \(name) must decode through the registry snapshot path: \(error)")
+                }
+            case "refuse":
+                XCTAssertThrowsError(
+                    try RdvRegistrySnapshot.decode(payload),
+                    "refuse vector \(name) must be rejected by the registry snapshot path")
+            default:
+                XCTFail("vector \(name) has unknown outcome \(outcome)")
+            }
+        }
+        XCTAssertEqual(seenAccepted, Set(expectedAcceptedCapabilities.keys), "all accepted vectors need expected lists")
     }
 }

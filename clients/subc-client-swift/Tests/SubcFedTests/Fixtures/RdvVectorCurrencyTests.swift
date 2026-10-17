@@ -31,6 +31,7 @@ final class RdvVectorCurrencyTests: XCTestCase {
         "nesting-depth.jsonl": "deefbb3e6efdc7cc6d677f862711e2d00483c1acbcd3da3724cb548e8b5969a6",
         "parse-reject.jsonl": "c7fcc91cd4c39319331bdd69e00dcdfd3294216eb2be65d84c50e1edde9e0cb2",
         "pipe-token.jsonl": "c9c061a52f3dcb9896b13a1827b7e07c4b2db4330123d99611fb635920415996",
+        "registry-capabilities.jsonl": "6a52008b48fef139cabbbed786761fe961d54fe113b3d3a80f52eb88be706cdb",
         "rust-signed.jsonl": "2926ad2c6af8245fcaa8646bf3f972a9769e31c73103369ac9a42e898a785959",
         "ts-signed.jsonl": "917257b5c4429667e2c5ca5310fbbebc6129f4f9517514e2d9089de92e7782ba",
         "device-record-key.json": "9c850d8c6812995fb5c141278f7d7606290f1fa16e817c7607a0c57e78224c6d",

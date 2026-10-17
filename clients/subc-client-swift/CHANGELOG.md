@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Decode the optional registry-row `capabilities` list only when it contains at most eight unique, byte-sorted tokens matching `^[a-z][a-z0-9-]{0,31}$`; expose the list on `RdvRegistryRow`. `servesFed` is true when the list contains `fed-serve`, meaning the computer says it accepts direct connections from paired devices. It is a routing hint only: it does not authenticate a peer or grant access, and a device still connects only to computers it has paired with.
+
 - Add test-only coverage verifying that two live clients for different peers can share one SQLite store without mixing peer state, and that concurrent store instances assign unique, durable sequence numbers to every mutation.
 
 - `BoardLaneWait` decodes the optional `lastIdleTransitionMs`, accepting `lastIdleTransitionMs` or `last_idle_transition_ms`: the board owner's most recent idle transition, repeated on each wait and absent when the owner has no turn anchor. A held board uses it to age a wait's `rotten` verdict while the server answers `unchanged`. It is encoded only when present, and the memberwise initializer gains a defaulted parameter, so existing call sites compile unchanged.

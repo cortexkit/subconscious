@@ -71,6 +71,22 @@ struct RdvFieldDecoder {
     }
 }
 
+private enum RdvRegistryCapabilitiesError: Error, Equatable, Sendable, CustomStringConvertible {
+    case expectedArrayOfStrings
+    case tooManyTokens
+    case invalidToken
+    case notSortedAndUnique
+
+    var description: String {
+        switch self {
+        case .expectedArrayOfStrings: return "registry row capabilities must be an array of strings"
+        case .tooManyTokens: return "registry row capabilities allows at most 8 tokens"
+        case .invalidToken: return "registry row capability token must match ^[a-z][a-z0-9-]{0,31}$"
+        case .notSortedAndUnique: return "registry row capabilities must be sorted and unique"
+        }
+    }
+}
+
 // MARK: - Candidate and registry row
 
 public enum RdvCandidateKind: String, Sendable, Equatable {
@@ -152,6 +168,8 @@ public struct RdvRegistryRow: Sendable, Equatable {
     /// before this shipped would stop every current client seeing ANY peer, on the
     /// peer-discovery path, presenting as a transport fault.
     public let pushSealPubkeyHex: String?
+    /// Registry-advertised features; unknown well-formed tokens are preserved.
+    public let capabilities: [String]
 
     public init(
         x25519PubkeyHex: String,
@@ -164,7 +182,8 @@ public struct RdvRegistryRow: Sendable, Equatable {
         reenrolledAfterTombstone: Bool,
         enrollmentID: String? = nil,
         supersessionGeneration: String? = nil,
-        pushSealPubkeyHex: String? = nil
+        pushSealPubkeyHex: String? = nil,
+        capabilities: [String] = []
     ) {
         self.x25519PubkeyHex = x25519PubkeyHex
         self.ed25519PubkeyHex = ed25519PubkeyHex
@@ -177,6 +196,7 @@ public struct RdvRegistryRow: Sendable, Equatable {
         self.enrollmentID = enrollmentID
         self.supersessionGeneration = supersessionGeneration
         self.pushSealPubkeyHex = pushSealPubkeyHex
+        self.capabilities = capabilities
     }
 
     static func decode(_ object: RdvJSONObject) throws -> RdvRegistryRow {
@@ -188,6 +208,12 @@ public struct RdvRegistryRow: Sendable, Equatable {
                 throw RdvJSONError.wrongType(field: "candidates")
             }
             candidates.append(try RdvCandidate.decode(candidateObject))
+        }
+        let capabilities: [String]
+        if decoder.object["capabilities"] == nil {
+            capabilities = []
+        } else {
+            capabilities = try Self.decodeCapabilities(decoder.array("capabilities"))
         }
         let row = RdvRegistryRow(
             x25519PubkeyHex: try decoder.string("x25519_pubkey_hex"),
@@ -202,11 +228,38 @@ public struct RdvRegistryRow: Sendable, Equatable {
             // before these fields existed still decodes.
             enrollmentID: try decoder.optionalString("enrollment_id"),
             supersessionGeneration: try decoder.optionalDecimalString("supersession_generation"),
-            pushSealPubkeyHex: try decoder.optionalString("push_seal_pubkey_hex")
+            pushSealPubkeyHex: try decoder.optionalString("push_seal_pubkey_hex"),
+            capabilities: capabilities
         )
         try decoder.finish()
         return row
     }
+
+    private static func decodeCapabilities(_ values: [RdvJSONValue]) throws -> [String] {
+        guard values.count <= 8 else { throw RdvRegistryCapabilitiesError.tooManyTokens }
+        let tokens = try values.map { value -> String in
+            guard case .string(let token) = value else {
+                throw RdvRegistryCapabilitiesError.expectedArrayOfStrings
+            }
+            let bytes = Array(token.utf8)
+            guard (1...32).contains(bytes.count),
+                  let first = bytes.first, (97...122).contains(first),
+                  bytes.dropFirst().allSatisfy({ (97...122).contains($0) || (48...57).contains($0) || $0 == 45 })
+            else {
+                throw RdvRegistryCapabilitiesError.invalidToken
+            }
+            return token
+        }
+        for (previous, next) in zip(tokens, tokens.dropFirst()) {
+            guard previous.utf8.lexicographicallyPrecedes(next.utf8) else {
+                throw RdvRegistryCapabilitiesError.notSortedAndUnique
+            }
+        }
+        return tokens
+    }
+
+    /// The `fed-serve` token advertises support for accepting secure device-to-device sessions; the token itself neither authenticates peers nor grants access.
+    public var servesFed: Bool { capabilities.contains("fed-serve") }
 
     /// The public-class candidates in dial order: `observed` before
     /// `self_reported` (docs/rdv-wire.md §5.6 dual-stack fix). LAN and relay

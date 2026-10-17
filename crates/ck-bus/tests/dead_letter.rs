@@ -489,7 +489,8 @@ async fn claimant_main(config: Value) {
         .expect("the dead-letter record is stored before term");
     say(&format!(
         "published {} delivery {}",
-        ack.stream_sequence(), exhausted.item.delivery_count
+        ack.stream_sequence(),
+        exhausted.item.delivery_count
     ));
     if read_stdin_line().await == "term" {
         // `term()` returns once the server has confirmed it, so no flush is needed

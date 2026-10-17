@@ -252,9 +252,8 @@ pub(crate) fn read_record_with_reasons(
 /// Rename within one directory is atomic, so `path` always holds either the
 /// previous complete record or the new one, never a prefix, whenever the
 /// daemon dies. `before_rename` runs between the two steps; it exists so a
-/// test can fail the write at that point. The file is not fsynced: the record
-/// only has to survive the daemon process dying, which leaves the page cache
-/// intact, and a whole-machine crash ends every child with it.
+/// test can fail the write at that point. Sync the file before replacement and
+/// the containing directory afterwards so successful admission is durable.
 fn write_atomically(
     path: &Path,
     bytes: &[u8],
@@ -274,11 +273,41 @@ fn write_atomically(
     ));
     let result = write_new_owner_only(&temp, bytes)
         .and_then(|()| before_rename(&temp))
-        .and_then(|()| fs::rename(&temp, path));
+        .and_then(|()| replace_record(&temp, path, directory));
     if result.is_err() {
         let _ = fs::remove_file(&temp);
     }
     result
+}
+
+fn replace_record(temp: &Path, path: &Path, directory: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        let _ = directory;
+        // The temp file's bytes were synced before this point. Plain rename
+        // (MoveFileExW with replace) is used rather than a write-through
+        // replace helper because it succeeds while another process holds the
+        // destination open with the default share mode, which a concurrent
+        // reader of this record does. Windows has no directory fsync.
+        fs::rename(temp, path)
+    }
+    #[cfg(not(windows))]
+    {
+        fs::rename(temp, path)?;
+        #[cfg(unix)]
+        fs::File::open(directory)?.sync_all()?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_NEXT_FILE_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn fail_next_file_sync() {
+    FAIL_NEXT_FILE_SYNC.set(true);
 }
 
 fn write_new_owner_only(path: &Path, bytes: &[u8]) -> io::Result<()> {
@@ -293,7 +322,12 @@ fn write_new_owner_only(path: &Path, bytes: &[u8]) -> io::Result<()> {
         options.mode(0o600);
     }
     let mut file = options.open(path)?;
-    file.write_all(bytes)
+    file.write_all(bytes)?;
+    #[cfg(test)]
+    if FAIL_NEXT_FILE_SYNC.replace(false) {
+        return Err(io::Error::other("injected live-children file sync failure"));
+    }
+    file.sync_all()
 }
 
 /// Pids a handover from a previous daemon image says are being adopted, which
@@ -661,10 +695,18 @@ async fn sweep_entries_with_hooks(
         if verdict == Some(IdentityVerdict::ProcessHidden) {
             return Some(SweepDecision::AliveButUnobservable);
         }
+        // This process was verified before it was signalled, so a positive
+        // mismatch now means the pid has gone (and may already be reused). An
+        // unreadable executable is usually the process mid-exit; keep polling
+        // rather than recording a verified, signalled child as unverifiable.
+        // Whatever is still present at the kill deadline is Survived.
         match verdict {
             None => Some(exited),
             Some(verdict) if verdict.permits_signal() => None,
-            Some(verdict) => Some(verdict.refusal()),
+            Some(verdict) => match verdict.refusal() {
+                SweepDecision::Mismatched(_) => Some(exited),
+                _ => None,
+            },
         }
     };
     let term_deadline = Instant::now() + bounds.term_grace;

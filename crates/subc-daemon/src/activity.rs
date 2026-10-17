@@ -682,7 +682,7 @@ mod tests;
 #[path = "activity_lifecycle.rs"]
 mod lifecycle;
 
-pub(crate) use lifecycle::{ImageFacts, RegistrationImage};
+pub(crate) use lifecycle::{ExecOutcome, ExecOwner, ExecState, ImageFacts, RegistrationImage};
 
 #[cfg(test)]
 #[path = "activity_lifecycle_tests.rs"]

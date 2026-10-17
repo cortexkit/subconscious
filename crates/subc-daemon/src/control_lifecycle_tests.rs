@@ -213,10 +213,8 @@ async fn lifecycle_requested_restart_disable_refusal_and_noop_use_verified_reque
 /// withholds the pid (so the image check reads `NotRunning`) until the
 /// supervision loop has processed the trampoline's exec acknowledgement. That
 /// acknowledgement is handled asynchronously, so a status read made as soon
-/// as the module has registered can come back before it. On macOS the started
-/// activity entry does not wait for it: its evidence is the spawn-time file
-/// identity (device and inode) of the spawned program, the same value status
-/// reports once exec is confirmed. So this waits for that one withheld state
+/// as the module has registered can come back before it. Both the started
+/// activity entry and status wait for exec confirmation. This waits for that withheld state
 /// to end, yielding so the supervision task can run, and fails at once on any
 /// other non-match. Elsewhere the pid is never withheld, so the first read
 /// already matches.
@@ -762,4 +760,67 @@ async fn lifecycle_requested_enable_stamps_requester_on_registered_start() {
     );
     handler.cleanup_connection(provider.connection_id).unwrap();
     module.stop().await.unwrap();
+}
+
+#[cfg(target_os = "macos")]
+async fn held_exec_registration(refuse: bool, immediate_exit: bool) -> Vec<subc_control::ActivityEntry> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let home = ScratchDir::new("held-exec-registration");
+    let registry = Arc::new(Registry::default());
+    let handle = SupervisorHandle::new();
+    let supervisor = Supervisor::new_for_test(registry.clone(), RestartPolicy::new(0, Duration::ZERO))
+        .with_handle(handle.clone())
+        .with_drain_timeout(Duration::ZERO)
+        .with_live_children_record(home.join("live-children.json"));
+    let handler = ControlHandler::new(registry)
+        .with_supervisor(handle)
+        .with_activity_ledger(home.path(), "held-exec".into());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut launch = spec(&home, subc_control::ModuleProtocol::Subc);
+    if immediate_exit {
+        launch.program = "/bin/sh".into();
+        launch.args = vec!["-c".into(), "exit 0".into()];
+    }
+    launch.env.push(("SUBC_TEST_BEFORE_EXEC_CONFIRM".into(), listener.local_addr().unwrap().to_string()));
+    let module = supervisor.spawn(launch).unwrap();
+    let (mut pause, _) = timeout(Duration::from_secs(5), listener.accept()).await.unwrap().unwrap();
+    let mut ready = [0];
+    timeout(Duration::from_secs(5), pause.read_exact(&mut ready)).await.unwrap().unwrap();
+    assert_eq!(&ready, b"R");
+    let mut pid = [0; 4];
+    pause.read_exact(&mut pid).await.unwrap();
+    if immediate_exit {
+        tokio::task::spawn_blocking(move || {
+            subc_os::fork_exec_test::wait_for_child_exit_without_reaping(u32::from_ne_bytes(pid))
+        }).await.unwrap().unwrap();
+    }
+    // Exercise accepted HELLO and the real writer queue while confirmation is
+    // held, rather than constructing a lifecycle append directly.
+    let (ctx, mut rx) = route_ctx(ConnectionId::new(901));
+    hello_via_sink(&handler, &ctx, &mut rx, hello_frame(module.module_id(), PROTOCOL_VERSION, 1)).await;
+    pause.write_all(if refuse { b"F" } else { b"X" }).await.unwrap();
+    timeout(Duration::from_secs(5), flush(&handler)).await.unwrap();
+    let starts = handler.activity.as_ref().unwrap().query(query()).await.unwrap().entries
+        .into_iter().filter(|entry| entry.kind == "subc.module_started").collect();
+    handler.cleanup_connection(ctx.connection_id).unwrap();
+    module.stop().await.unwrap();
+    starts
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn refused_exec_never_appends_module_started() {
+    assert!(held_exec_registration(true, false).await.is_empty());
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn confirmed_exec_registration_appends_start() {
+    assert_eq!(held_exec_registration(false, false).await.len(), 1);
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn immediate_successful_exit_is_not_refusal() {
+    assert_eq!(held_exec_registration(false, true).await.len(), 1);
 }

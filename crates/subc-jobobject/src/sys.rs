@@ -24,8 +24,8 @@ use windows_sys::Win32::{
             JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
         },
         Threading::{
-            OpenProcess, OpenThread, ResumeThread, WaitForSingleObject, CREATE_NO_WINDOW,
-            CREATE_SUSPENDED, PROCESS_SYNCHRONIZE, THREAD_SUSPEND_RESUME,
+            GetCurrentProcess, OpenProcess, OpenThread, ResumeThread, WaitForSingleObject,
+            CREATE_NO_WINDOW, CREATE_SUSPENDED, PROCESS_SYNCHRONIZE, THREAD_SUSPEND_RESUME,
         },
     },
 };
@@ -90,6 +90,16 @@ pub struct JobObject {
 unsafe impl Send for JobObject {}
 
 impl JobObject {
+    /// Contain this process and all subsequently created children, including
+    /// suspended children not yet assigned to a narrower per-module job.
+    pub(crate) fn assign_current_process(&self) -> io::Result<()> {
+        // GetCurrentProcess returns a pseudo-handle, which must not be closed.
+        if unsafe { AssignProcessToJobObject(self.handle, GetCurrentProcess()) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
     /// Create a job object whose members die with it.
     pub fn new() -> io::Result<Self> {
         // A null `SECURITY_ATTRIBUTES` gives the default descriptor and a null

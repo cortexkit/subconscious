@@ -30,6 +30,64 @@ pub(crate) struct ImageFacts {
     pub(crate) path: Option<PathBuf>,
     pub(crate) identity: Option<crate::provenance::SpawnedFileIdentity>,
     pub(crate) start: Option<u64>,
+    pub(crate) exec: Arc<ExecOutcome>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExecState {
+    Pending,
+    CommittedExec,
+    Refused,
+}
+
+/// Records exec confirmation for one launch. An old queued registration must
+/// not count a replacement process's successful exec as its own.
+#[derive(Debug)]
+pub(crate) struct ExecOutcome {
+    state: Mutex<ExecState>,
+    ready: std::sync::Condvar,
+}
+
+impl PartialEq for ExecOutcome {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self, other)
+    }
+}
+
+impl ExecOutcome {
+    pub(crate) fn new() -> Self {
+        Self {
+            state: Mutex::new(ExecState::Pending),
+            ready: std::sync::Condvar::new(),
+        }
+    }
+
+    pub(crate) fn finish(&self, outcome: ExecState) {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if *state == ExecState::Pending {
+            *state = outcome;
+            self.ready.notify_all();
+        }
+    }
+
+    fn committed(&self) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        while *state == ExecState::Pending {
+            state = self.ready.wait(state).unwrap_or_else(|p| p.into_inner());
+        }
+        *state == ExecState::CommittedExec
+    }
+}
+
+/// Dropping an unconfirmed child refuses its queued activity, so the activity
+/// writer cannot remain blocked waiting for confirmation that will never come.
+#[derive(Debug)]
+pub(crate) struct ExecOwner(pub(crate) Arc<ExecOutcome>);
+
+impl Drop for ExecOwner {
+    fn drop(&mut self) {
+        self.0.finish(ExecState::Refused);
+    }
 }
 
 impl RegistrationImage {
@@ -58,6 +116,9 @@ impl RegistrationImage {
             }
             slot.as_ref().unwrap().clone()
         }?;
+        if !facts.exec.committed() {
+            return None;
+        }
         running_evidence(self.runtime.block_on(self.probe.observe(
             facts.pid,
             facts.path.as_deref(),

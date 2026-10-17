@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.20.100
+
+- Require subc-daemon 0.36.8. On Windows, every module is now ended with the daemon even if the daemon is killed; the daemon's record of running modules survives a crash; and the activity log records a module start only once its program has actually run.
+
 ## 0.20.99
 
 - Require subc-daemon 0.36.7 to prevent duplicate starts beside unverifiable or surviving previous instances and bound inline health-probe admission. Describe a previous-instance startup wait without assuming the process is hidden; the existing status PID also covers instances that could not be verified or stopped.

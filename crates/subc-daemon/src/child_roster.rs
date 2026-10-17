@@ -97,9 +97,9 @@ impl RosterInner {
     /// Rewrite the record from `live`. Called with the `live` lock held, so
     /// concurrent admits and releases write their snapshots in the order they
     /// changed the roster and the last write on disk is the current roster.
-    fn write_record(&self, live: &HashMap<u64, RosterEntry>) {
+    fn write_record(&self, live: &HashMap<u64, RosterEntry>) -> std::io::Result<()> {
         let Some(path) = self.record_path.get() else {
-            return;
+            return Ok(());
         };
         let mut entries: Vec<(&u64, &RosterEntry)> = live.iter().collect();
         entries.sort_by_key(|(key, _)| **key);
@@ -130,7 +130,9 @@ impl RosterInner {
                 %error,
                 "could not rewrite the live-children record; a crash now could leave orphans the next boot cannot find"
             );
+            return Err(error);
         }
+        Ok(())
     }
 
     fn recheck_retained(&self) {
@@ -173,7 +175,7 @@ impl RosterInner {
             retained.len() != before
         };
         if changed {
-            self.write_record(&live);
+            let _ = self.write_record(&live);
         }
     }
 }
@@ -208,7 +210,7 @@ impl Drop for RosterGuard {
     fn drop(&mut self) {
         let mut live = lock(&self.inner.live);
         if live.remove(&self.key).is_some() {
-            self.inner.write_record(&live);
+            let _ = self.inner.write_record(&live);
         }
     }
 }
@@ -218,13 +220,17 @@ impl RosterGuard {
     /// Publish an executable only after the privacy trampoline has exec'd and
     /// the kernel image agrees with the configured module. Before then shutdown
     /// owns the pid, but orphan cleanup has no image it could mistakenly trust.
-    pub(crate) fn confirm_executable(&self, observation: subc_os::Observation) {
+    pub(crate) fn confirm_executable(
+        &self,
+        observation: subc_os::Observation,
+    ) -> std::io::Result<()> {
         let mut live = lock(&self.inner.live);
         if let Some(entry) = live.get_mut(&self.key) {
             entry.recorded.start_time = Some(observation.start_time);
             entry.recorded.executable = observation.executable.map(ExecutableIdentity::from);
-            self.inner.write_record(&live);
+            self.inner.write_record(&live)?;
         }
+        Ok(())
     }
 }
 
@@ -317,7 +323,7 @@ impl ChildRoster {
         protocol: ModuleProtocol,
         start_time: Option<u64>,
         recorded: RecordedIdentity,
-    ) -> RosterGuard {
+    ) -> std::io::Result<RosterGuard> {
         let key = self.inner.next_key.fetch_add(1, Ordering::Relaxed);
         let mut live = lock(&self.inner.live);
         live.insert(
@@ -331,12 +337,15 @@ impl ChildRoster {
                 drain_budget: Arc::clone(&self.drain_budget),
             },
         );
-        self.inner.write_record(&live);
+        if let Err(error) = self.inner.write_record(&live) {
+            live.remove(&key);
+            return Err(error);
+        }
         drop(live);
-        RosterGuard {
+        Ok(RosterGuard {
             inner: Arc::clone(&self.inner),
             key,
-        }
+        })
     }
 
     #[cfg(unix)]

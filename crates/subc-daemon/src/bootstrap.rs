@@ -800,6 +800,12 @@ async fn serve_bound_daemon(
     // Windows has no SIGTERM. Ctrl-C is a different event, not an equivalent
     // service-stop contract, so this shutdown handler is intentionally Unix-only.
     raise_nofile_limit();
+    #[cfg(windows)]
+    if let Err(error) = subc_jobobject::ensure_root_job() {
+        // Keep the control plane available. The root-job API caches setup
+        // failures, so later module spawns refuse instead of running unprotected.
+        warn!(%error, "module launches disabled: Windows root job setup failed");
+    }
 
     info!(
         connection_file = %bound.connection_file_path.display(),

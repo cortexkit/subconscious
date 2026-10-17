@@ -1,6 +1,6 @@
 [package]
 name = "subc-daemon"
-version = "0.36.7"
+version = "0.36.8"
 edition = "2021"
 publish = true
 description = "Embeddable subc daemon: bootstrap, module supervision, and opaque-byte splice routing."
@@ -44,7 +44,7 @@ subc-cgroup = { path = "../subc-cgroup", version = "0.1.5" }
 [target.'cfg(windows)'.dependencies]
 # Job-object containment for module grandchildren (issue #109). A leaf crate
 # because this crate forbids unsafe code and the Win32 calls need it.
-subc-jobobject = { path = "../subc-jobobject", version = "0.2.0" }
+subc-jobobject = { path = "../subc-jobobject", version = "0.2.2" }
 
 [target.'cfg(any(target_os = "macos", windows))'.dependencies]
 # The OS authentication prompts live only in the daemon. Keeping them in their

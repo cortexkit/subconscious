@@ -271,6 +271,11 @@ async fn lifecycle_unmeasurable_registration_uses_writer_skip_counter() {
         path: None,
         identity: None,
         start: None,
+        exec: {
+            let exec = Arc::new(ExecOutcome::new());
+            exec.finish(ExecState::CommittedExec);
+            exec
+        },
     }));
     assert!(starts(&ledger).await.is_empty());
     assert_eq!(ledger.lifecycle_digest_skips(), 1);

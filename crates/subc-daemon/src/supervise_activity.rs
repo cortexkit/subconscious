@@ -10,14 +10,15 @@ pub(super) struct ActivitySpawn(ActivityImage);
 
 impl ActivitySpawn {
     pub(super) fn complete(self, snapshot: &SharedSnapshot) {
-        let facts = lock_snapshot(snapshot)
-            .ok()
-            .map(|state| crate::activity::ImageFacts {
+        let facts = lock_snapshot(snapshot).ok().and_then(|state| {
+            Some(crate::activity::ImageFacts {
                 pid: state.pid,
                 path: state.spawned_from.clone(),
                 identity: state.spawned_file_identity.clone(),
                 start: state.process_start_time,
-            });
+                exec: state.exec_outcome.clone()?,
+            })
+        });
         self.0.image.complete(facts);
     }
 }

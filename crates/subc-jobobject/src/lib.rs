@@ -64,6 +64,31 @@ use std::{
 
 pub use sys::{JobObject, CONTAINMENT_CREATION_FLAGS, CREATE_SUSPENDED_FLAG};
 
+/// Install process-lifetime containment before creating any module.
+///
+/// The unnamed job's sole handle is non-inheritable (CreateJobObjectW receives
+/// null security attributes) and deliberately lives in a static: dropping a job
+/// containing this process would terminate the caller too. Children inherit job
+/// membership at creation, without inheriting the handle that keeps them alive.
+/// Per-module jobs nest beneath it on Windows 8 and later. An existing service
+/// or scheduler job must allow nested assignment; incompatibility is a sticky
+/// error, never a reason to launch outside containment. No breakaway is enabled.
+pub fn ensure_root_job() -> io::Result<()> {
+    static ROOT: std::sync::OnceLock<Result<std::sync::Mutex<JobObject>, String>> =
+        std::sync::OnceLock::new();
+    ROOT.get_or_init(|| {
+        let install = || {
+            let job = JobObject::new()?;
+            job.assign_current_process()?;
+            Ok::<_, io::Error>(std::sync::Mutex::new(job))
+        };
+        install().map_err(|error| format!("Windows root job containment unavailable: {error}"))
+    })
+    .as_ref()
+    .map(|_| ())
+    .map_err(|error| io::Error::other(error.clone()))
+}
+
 /// A process handle suitable for [`JobObject::assign`].
 ///
 /// `std` and `tokio` children expose their handle differently — `AsRawHandle`

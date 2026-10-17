@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.36.8
+
+- At startup the daemon stops modules left running by a previous daemon that died. If such a module was identified and signalled, and its executable then becomes unreadable (usually because it is exiting), the daemon now keeps waiting for it to go. Previously it recorded the module as unidentifiable, which held back that module's restart until the old process disappeared. A module still running at the kill deadline is recorded as surviving, as before.
+- On Windows, contain the daemon in a process-lifetime, non-breakaway kill-on-close root job before module creation. Suspended children inherit protection even before per-module job assignment, including `protocol: "none"` modules. Root setup failures disable launches; per-module containment failures kill and reap the suspended child rather than resume it unprotected. Service and scheduler host jobs must support nested assignment (Windows 8+).
+- Durably flush live-children records before replacement and synchronize their containing directory on Unix (Windows has no directory sync, so a plain replacing rename is used there, which also tolerates a concurrent reader). Failed admission or confirmed-image publication now refuses and kills the child instead of continuing with an unrecorded process.
+- A module's HELLO registration queues `subc.module_started` activity, but the ledger now waits for confirmation that its launch executed the module program. Late refusals discard queued starts; confirmed modules that exit immediately still count, and retained-build deduplication remains unchanged.
+
 ## 0.36.7
 
 - Retain previous daemon children whose identity cannot be verified or that survive the stop deadlines. Their module ID alone waits for the previous PID to disappear, with a reason distinguishing unverifiable instances from instances that did not stop. Preserve the blocker and reason across roster rewrites; positive PID, start-time and image mismatches remain unsignalled and are not retained.

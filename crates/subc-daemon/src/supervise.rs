@@ -125,6 +125,8 @@ struct PrivacyExec {
     trampoline: Option<subc_os::FileIdentity>,
     script: bool,
     module_id: String,
+    #[cfg(test)]
+    confirmation_pause: Option<(String, Option<tokio::net::TcpStream>)>,
 }
 
 #[cfg(all(test, target_os = "macos"))]
@@ -275,6 +277,12 @@ fn privacy_command(
             trampoline: trampoline_image,
             script,
             module_id: spec.module_id.clone(),
+            #[cfg(test)]
+            confirmation_pause: spec
+                .env
+                .iter()
+                .find(|(key, _)| key == "SUBC_TEST_BEFORE_EXEC_CONFIRM")
+                .map(|(_, address)| (address.clone(), None)),
         }),
         ack,
     ))
@@ -282,6 +290,7 @@ fn privacy_command(
 
 struct SupervisedChild {
     child: Child,
+    exec: crate::activity::ExecOwner,
     #[cfg(windows)]
     nonce_delivery: Option<subc_os::LaunchNoncePipeDelivery>,
     #[cfg(target_os = "macos")]
@@ -410,6 +419,40 @@ impl SupervisedChild {
             }
         })
         .await;
+        #[cfg(test)]
+        let result = if let Some((address, stream)) = &mut pending.confirmation_pause {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            if stream.is_none() {
+                *stream = Some(
+                    tokio::net::TcpStream::connect(address.as_str())
+                        .await
+                        .unwrap(),
+                );
+                stream.as_mut().unwrap().write_all(b"R").await.unwrap();
+                stream
+                    .as_mut()
+                    .unwrap()
+                    .write_all(&self.pid.to_ne_bytes())
+                    .await
+                    .unwrap();
+            }
+            let mut reply = [0];
+            stream
+                .as_mut()
+                .unwrap()
+                .read_exact(&mut reply)
+                .await
+                .unwrap();
+            pending.confirmation_pause = None;
+            if &reply == b"F" {
+                Ok(Err(io::Error::other("injected late exec refusal")))
+            } else {
+                assert_eq!(&reply, b"X");
+                result
+            }
+        } else {
+            result
+        };
         // Keep the reader in self across await: select cancellation must not
         // discard the handshake or reset its original five-second deadline.
         let pending = self.privacy_exec.as_ref().expect("pending exec");
@@ -443,13 +486,21 @@ impl SupervisedChild {
                             && image.executable != pending.trampoline
                             && (image.executable == pending.expected || pending.script)
                     }) {
-                        if let Some(guard) = &self.roster_guard {
-                            guard.confirm_executable(image);
+                        if let Err(error) = self
+                            .roster_guard
+                            .as_ref()
+                            .map(|guard| guard.confirm_executable(image))
+                            .transpose()
+                        {
+                            Some(format!(
+                                "could not durably record confirmed module image: {error}"
+                            ))
+                        } else {
+                            let _ = self.report_ready.set(());
+                            info!(module_id = %pending.module_id, pid = self.pid,
+                                "module spawned with own privacy identity (responsibility disclaimed)");
+                            None
                         }
-                        let _ = self.report_ready.set(());
-                        info!(module_id = %pending.module_id, pid = self.pid,
-                            "module spawned with own privacy identity (responsibility disclaimed)");
-                        None
                     } else if image.is_none()
                         || image.is_some_and(|image| image.executable.is_none())
                     {
@@ -471,6 +522,13 @@ impl SupervisedChild {
             },
         };
         let pending = self.privacy_exec.take().expect("pending exec");
+        // Exec confirmation describes launch success, not roster retirement.
+        // Keep even a reaped child recorded until its terminal history exists.
+        self.exec.0.finish(if cause.is_some() {
+            crate::activity::ExecState::Refused
+        } else {
+            crate::activity::ExecState::CommittedExec
+        });
         if let Some(cause) = cause {
             warn!(module_id = %pending.module_id, pid = self.pid, %cause, "privacy identity trampoline refused module spawn");
             self.spawn_failure = Some(cause);
@@ -1083,6 +1141,7 @@ struct ActorSelectCheckpoint {
 
 #[derive(Debug, Clone, PartialEq)]
 struct SupervisorSnapshot {
+    exec_outcome: Option<Arc<crate::activity::ExecOutcome>>,
     #[cfg(windows)]
     pipe_consumed: Option<Arc<OnceLock<()>>>,
     /// Counts running-child loop turns, not executor polls of a parked wait.
@@ -1234,6 +1293,7 @@ impl SupervisorSnapshot {
 
     fn new(state: ModuleState, enabled: bool) -> Self {
         Self {
+            exec_outcome: None,
             #[cfg(test)]
             actor_turns: 0,
             #[cfg(test)]
@@ -8258,7 +8318,14 @@ fn spawn_child_in_slot(
     // grandchild -- before it is in the job. See `contain_spawned_child` for the
     // other two steps and why the window matters.
     #[cfg(windows)]
-    subc_jobobject::suspend_on_create_async(&mut command);
+    {
+        subc_jobobject::ensure_root_job().map_err(|source| SuperviseError::Spawn {
+            program: spec.program.clone(),
+            source,
+            cgroup_path: None,
+        })?;
+        subc_jobobject::suspend_on_create_async(&mut command);
+    }
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(source) => {
@@ -8273,6 +8340,8 @@ fn spawn_child_in_slot(
             });
         }
     };
+    #[cfg(test)]
+    spawn_record_tests::after_create(&child, spec);
     // The parent must close its writer now: the acknowledgement pipe reports EOF
     // only when every writer is gone, and the child's copy closes when the
     // trampoline replaces itself with the module. Command holds only an integer
@@ -8285,19 +8354,21 @@ fn spawn_child_in_slot(
     // and deletion, so the file cannot be exchanged during spawn. Bind that
     // file ID to the process handle returned by spawn, never a reopened PID.
     #[cfg(windows)]
-    let windows_image =
-        Arc::new(
-            image_capture
-                .bind_tokio(&child)
-                .map_err(|source| SuperviseError::Spawn {
-                    program: spec.program.clone(),
-                    source,
-                    cgroup_path: None,
-                })?,
-        );
-    // Containment, steps 2 and 3: assign while suspended, then resume.
+    let windows_image = match image_capture.bind_tokio(&child) {
+        Ok(image) => Arc::new(image),
+        Err(source) => {
+            kill_and_reap_rejected_child(&mut child);
+            return Err(SuperviseError::Spawn {
+                program: spec.program.clone(),
+                source,
+                cgroup_path: None,
+            });
+        }
+    };
+    // Assign the suspended child to its module job; resume only after its
+    // process identity has been durably recorded for orphan recovery.
     #[cfg(windows)]
-    let job = contain_spawned_child(&child, spec)?;
+    let job = contain_spawned_child(&mut child, spec)?;
     let spawned_at_ms = unix_ms_now();
     #[cfg(not(windows))]
     let spawned_from = spec.program.clone();
@@ -8367,6 +8438,29 @@ fn spawn_child_in_slot(
             cgroup_placement: cgroup_placement.cloned(),
         },
     );
+    let roster_guard = match roster_guard {
+        Ok(guard) => guard,
+        Err(source) => {
+            #[cfg(windows)]
+            if let Some(job) = &job {
+                let _ = job.terminate();
+            }
+            #[cfg(target_os = "linux")]
+            kill_module_cgroup(cgroup_placement, &cgroup_name);
+            kill_and_reap_rejected_child(&mut child);
+            #[cfg(target_os = "linux")]
+            if let Some(placement) = cgroup_placement {
+                remove_module_cgroup(placement, &cgroup_name);
+            }
+            return Err(SuperviseError::Spawn {
+                program: spec.program.clone(),
+                source: io::Error::other(format!(
+                    "could not durably record module child: {source}"
+                )),
+                cgroup_path,
+            });
+        }
+    };
     // The check at the top of this function can pass just before daemon
     // shutdown begins, and the process is only in the roster from here on.
     // The shutdown stop returns as soon as it finds the roster empty, so a
@@ -8415,6 +8509,12 @@ fn spawn_child_in_slot(
         });
     }
 
+    #[cfg(windows)]
+    if let Err(error) = resume_suspended_child(pid, spec) {
+        kill_and_reap_rejected_child(&mut child);
+        return Err(error);
+    }
+
     let stdout_pump = match child.stdout.take() {
         Some(stdout) => Some(tokio::spawn(pump_stdout_to(stdout, output_sink.clone()))),
         None => {
@@ -8456,8 +8556,17 @@ fn spawn_child_in_slot(
         }
     };
 
+    let exec = Arc::new(crate::activity::ExecOutcome::new());
+    #[cfg(target_os = "macos")]
+    let pending_exec = privacy_exec.is_some();
+    #[cfg(not(target_os = "macos"))]
+    let pending_exec = false;
+    if !pending_exec {
+        exec.finish(crate::activity::ExecState::CommittedExec);
+    }
     Ok(SupervisedChild {
         child,
+        exec: crate::activity::ExecOwner(exec),
         #[cfg(windows)]
         nonce_delivery,
         protocol: spec.protocol,
@@ -8485,6 +8594,272 @@ fn spawn_child_in_slot(
     })
 }
 
+#[cfg(test)]
+mod spawn_record_tests {
+    use super::*;
+
+    thread_local! {
+        static LAST_PID: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+    }
+
+    pub(super) fn after_create(child: &Child, _spec: &ModuleSpec) {
+        LAST_PID.set(child.id());
+        #[cfg(windows)]
+        if let Some((_, address)) = _spec
+            .env
+            .iter()
+            .find(|(key, _)| key == "SUBC_TEST_AFTER_CREATE")
+        {
+            use std::io::{Read, Write};
+            let mut stream = std::net::TcpStream::connect(address).unwrap();
+            stream
+                .write_all(&child.id().unwrap().to_ne_bytes())
+                .unwrap();
+            let mut release = [0];
+            stream.read_exact(&mut release).unwrap();
+        }
+    }
+
+    #[cfg(windows)]
+    pub(super) fn assignment_failpoint(spec: &ModuleSpec) -> io::Result<()> {
+        if spec
+            .env
+            .iter()
+            .any(|(key, _)| key == "SUBC_TEST_ASSIGNMENT_FAILURE")
+        {
+            Err(io::Error::other("injected module job assignment failure"))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn spec() -> ModuleSpec {
+        ModuleSpec {
+            module_id: "spawn-record-worker".into(),
+            #[cfg(unix)]
+            program: "/bin/sleep".into(),
+            #[cfg(windows)]
+            program: std::env::current_exe().unwrap(),
+            #[cfg(unix)]
+            args: vec!["60".into()],
+            #[cfg(windows)]
+            args: vec![
+                "--exact".into(),
+                "supervise::spawn_record_tests::windows_store_touch_fixture".into(),
+                "--nocapture".into(),
+            ],
+            env: vec![],
+            reserved: false,
+            reserved_prefixes: vec![],
+            protocol: ModuleProtocol::None,
+            overlap: Default::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn record_sync_failure_fails_spawn_and_reaps_child() {
+        let home = cortexkit_test_support::ScratchDir::new("record-sync-failure");
+        let supervisor =
+            Supervisor::new_for_test(Arc::new(Registry::default()), RestartPolicy::default())
+                .with_live_children_record(home.join("live-children.json"));
+        crate::live_children::fail_next_file_sync();
+        let result = supervisor.spawn(spec());
+        let failed = result.is_err();
+        if let Ok(module) = result {
+            module.stop().await.unwrap();
+        }
+        assert!(failed, "record failure must fail spawn");
+        let pid = LAST_PID.get().expect("the real OS child was created");
+        assert!(
+            subc_os::Process::open(pid).unwrap().is_none(),
+            "child {pid} survived rejected admission or was not reaped"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "manual on-device latency measurement"]
+    fn durable_record_write_latency_50() {
+        let home = cortexkit_test_support::ScratchDir::new("record-latency");
+        let path = home.join("live-children.json");
+        let children = vec![crate::live_children::LiveChild {
+            module_id: "latency-worker".into(),
+            pid: std::process::id(),
+            protocol: ModuleProtocol::None,
+            start_time: Some(1),
+            executable: None,
+            cgroup_name: None,
+        }];
+        let mut samples = Vec::new();
+        for _ in 0..50 {
+            let start = std::time::Instant::now();
+            crate::live_children::write_record(&path, &children).unwrap();
+            samples.push(start.elapsed());
+        }
+        samples.sort();
+        eprintln!(
+            "durable_record_write_latency_50: n=50 median={:?} p95={:?}",
+            (samples[24] + samples[25]) / 2,
+            samples[47]
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_store_touch_fixture() {
+        if let Some(path) = std::env::var_os("SUBC_TEST_STORE_TOUCH") {
+            std::fs::write(path, b"module ran").unwrap();
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_daemon_fixture() {
+        let Ok(address) = std::env::var("SUBC_TEST_DAEMON_BARRIER") else {
+            return;
+        };
+        let mut spec = spec();
+        spec.env.push(("SUBC_TEST_AFTER_CREATE".into(), address));
+        let supervisor =
+            Supervisor::new_for_test(Arc::new(Registry::default()), RestartPolicy::default());
+        let _module = supervisor.spawn(spec).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_daemon_death_before_module_job_assignment_leaves_no_child() {
+        use std::io::Read;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        // An outer job models a scheduler/service host. The daemon's root and
+        // root job must nest without requiring breakaway from this job.
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "supervise::spawn_record_tests::windows_daemon_fixture",
+                "--nocapture",
+            ])
+            .env(
+                "SUBC_TEST_DAEMON_BARRIER",
+                listener.local_addr().unwrap().to_string(),
+            );
+        let mut daemon = subc_jobobject::spawn_contained(&mut command).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let mut stream = loop {
+            if let Ok((stream, _)) = listener.accept() {
+                break stream;
+            }
+            assert!(
+                daemon.child.try_wait().unwrap().is_none(),
+                "daemon failed before rendezvous"
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "daemon did not reach CreateProcess failpoint"
+            );
+            std::thread::yield_now();
+        };
+        stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        let mut pid = [0; 4];
+        stream.read_exact(&mut pid).unwrap();
+        let pid = u32::from_ne_bytes(pid);
+        assert!(subc_jobobject::process_exists(pid));
+        // Terminate only the daemon, not its outer job: otherwise the host job
+        // would also kill a child whose daemon never joined its root job.
+        daemon.child.kill().unwrap();
+        daemon.child.wait().unwrap();
+        let exited = subc_jobobject::wait_for_process_exit(pid, Duration::from_secs(10));
+        if !exited {
+            daemon.job.terminate().unwrap();
+        }
+        assert!(exited, "suspended child {pid} outlived hard-killed daemon");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_containment_failure_never_resumes() {
+        let home = cortexkit_test_support::ScratchDir::new("assignment-refusal");
+        let sentinel = home.join("store-touched");
+        let mut spec = spec();
+        spec.env
+            .push(("SUBC_TEST_ASSIGNMENT_FAILURE".into(), "1".into()));
+        spec.env.push((
+            "SUBC_TEST_STORE_TOUCH".into(),
+            sentinel.display().to_string(),
+        ));
+        let supervisor =
+            Supervisor::new_for_test(Arc::new(Registry::default()), RestartPolicy::default());
+        let result = supervisor.spawn(spec);
+        // A version that resumes despite assignment failure must have time to
+        // execute its sentinel before dropping the returned module kills it.
+        if let Ok(module) = result {
+            let _ = tokio::time::timeout(Duration::from_secs(10), async {
+                while !sentinel.exists() && module.state().unwrap() == ModuleState::Running {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await;
+            let _ = module.stop().await;
+            panic!(
+                "assignment failure resumed a module; store touched={}",
+                sentinel.exists()
+            );
+        }
+        assert!(
+            !sentinel.exists(),
+            "refused module executed store-touch sentinel"
+        );
+        assert!(!subc_jobobject::process_exists(LAST_PID.get().unwrap()));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_nested_daemon_fixture() {
+        let Some(sentinel) = std::env::var_os("SUBC_TEST_NESTED_STORE") else {
+            return;
+        };
+        let mut spec = spec();
+        spec.env.push((
+            "SUBC_TEST_STORE_TOUCH".into(),
+            sentinel.to_str().unwrap().into(),
+        ));
+        let supervisor =
+            Supervisor::new_for_test(Arc::new(Registry::default()), RestartPolicy::default());
+        let module = supervisor
+            .spawn(spec)
+            .expect("per-module job must nest below daemon and host jobs");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !PathBuf::from(&sentinel).exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        module.stop().await.unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_module_job_nests_under_host_job() {
+        let home = cortexkit_test_support::ScratchDir::new("nested-jobs");
+        let sentinel = home.join("nested-store-touched");
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "supervise::spawn_record_tests::windows_nested_daemon_fixture",
+                "--nocapture",
+            ])
+            .env("SUBC_TEST_NESTED_STORE", &sentinel);
+        let mut daemon = subc_jobobject::spawn_contained(&mut command).unwrap();
+        assert!(daemon.child.wait().unwrap().success());
+        assert!(sentinel.exists(), "nested protocol:none module never ran");
+    }
+}
+
 #[cfg(target_os = "linux")]
 pub(crate) fn kill_module_cgroup(placement: Option<&subc_cgroup::Placement>, module_id: &str) {
     use subc_cgroup::KillOutcome;
@@ -8502,64 +8877,54 @@ pub(crate) fn kill_module_cgroup(placement: Option<&subc_cgroup::Placement>, mod
     }
 }
 
-/// Contain a freshly spawned Windows child and start it.
+/// Assign a freshly spawned Windows child without ever resuming on failure.
 ///
 /// Steps 2 and 3 of the suspended-create contract: the job is created and the
 /// child assigned **while it is still suspended** (step 1 is
-/// `suspend_on_create_async` at the spawn site), then the child is resumed.
-///
-/// A child that is never resumed hangs forever holding a pid, so a resume
-/// failure kills the child and fails the spawn rather than returning a
-/// `SupervisedChild` that can never run.
-///
-/// An assignment failure is NOT fatal: an uncontained module behaves exactly as
-/// it did before this existed, whereas refusing to start one would be a new
-/// outage. It is logged at warn because it means a helper process could leak.
+/// `suspend_on_create_async` at the spawn site). The caller resumes only after
+/// the child's roster admission is durable. Failed containment kills and reaps
+/// the suspended child instead of running an unprotected module.
 #[cfg(windows)]
 fn contain_spawned_child(
-    child: &Child,
+    child: &mut Child,
     spec: &ModuleSpec,
 ) -> Result<Option<subc_jobobject::JobObject>, SuperviseError> {
-    let module_id = spec.module_id.as_str();
-    let Some(pid) = child.id() else {
-        // The child exited between spawn and here. Its tree, if it made one,
-        // needs no containment: nothing is left to contain.
-        warn!(
-            module_id,
-            "spawned child had already exited before containment; no job object attached"
-        );
-        return Ok(None);
+    let assignment = || {
+        let job = subc_jobobject::JobObject::new()?;
+        #[cfg(test)]
+        spawn_record_tests::assignment_failpoint(spec)?;
+        job.assign(child)?;
+        Ok::<_, io::Error>(job)
     };
-
-    let job = match subc_jobobject::JobObject::new() {
-        Ok(job) => job,
+    match assignment() {
+        Ok(job) => Ok(Some(job)),
         Err(source) => {
-            warn!(
-                module_id,
-                error = %source,
-                "could not create a job object; this module's helper processes will not be \
-                 reaped on teardown"
-            );
-            // Resume regardless: leaving the child suspended would turn a
-            // containment gap into a hung module.
-            resume_suspended_child(pid, spec)?;
-            return Ok(None);
+            kill_and_reap_rejected_child(child);
+            Err(SuperviseError::Spawn {
+                program: spec.program.clone(),
+                source: io::Error::other(format!(
+                    "Windows module job containment failed: {source}"
+                )),
+                cgroup_path: None,
+            })
         }
-    };
-
-    if let Err(source) = job.assign(child) {
-        warn!(
-            module_id,
-            error = %source,
-            "could not assign the child to its job object; this module's helper processes \
-             will not be reaped on teardown"
-        );
-        resume_suspended_child(pid, spec)?;
-        return Ok(None);
     }
+}
 
-    resume_suspended_child(pid, spec)?;
-    Ok(Some(job))
+/// Rejection is synchronous: do not return a spawn error while the child can
+/// still run, or rely on kill-on-drop to reap it at some later runtime turn.
+fn kill_and_reap_rejected_child(child: &mut Child) {
+    #[cfg(unix)]
+    if let Some(pid) = child
+        .id()
+        .and_then(|pid| rustix::process::Pid::from_raw(pid as i32))
+    {
+        let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+    }
+    let _ = child.start_kill();
+    while matches!(child.try_wait(), Ok(None)) {
+        std::thread::yield_now();
+    }
 }
 
 /// Resume a suspended child, killing it if it cannot be started.
@@ -10472,6 +10837,7 @@ fn set_running(
         state.report_ready = Some(Arc::clone(&child.report_ready));
     }
     state.spawned_at_ms = Some(child.spawned_at_ms);
+    state.exec_outcome = Some(Arc::clone(&child.exec.0));
     state.spawned_from = Some(child.spawned_from.clone());
     state.spawned_file_identity = child.spawned_file_identity.clone();
     state.process_start_time = child.process_start_time;
@@ -10493,6 +10859,7 @@ fn clear_current_process_facts(state: &mut SupervisorSnapshot) {
         state.report_ready = None;
     }
     state.spawned_at_ms = None;
+    state.exec_outcome = None;
     state.spawned_from = None;
     state.spawned_file_identity = None;
     state.process_start_time = None;
@@ -14008,6 +14375,7 @@ mod cgroup_placement_tests {
         let pid = child.id().expect("spawned child has pid");
         let mut child = SupervisedChild {
             child,
+            exec: crate::activity::ExecOwner(Arc::new(crate::activity::ExecOutcome::new())),
             protocol: ModuleProtocol::Subc,
             module_id: module_id.to_string(),
             cgroup_placement: Some(placement),

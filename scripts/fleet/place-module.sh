@@ -87,6 +87,8 @@
 #   place-module.sh --module <id> --staged <path> [--dest <path>] [--path-face <name>]
 #                   --marker <string> [--control <string>] [--old-control <string>]
 #                   [--no-restart]
+#   place-module.sh --module <id> --rollback <stamp> [--dest <path>]
+#                   [--restore-store <path>] [--no-restart]
 #   place-module.sh --module <id> --staged <path> [--dest <path>] --marker <string> --install
 #                   (a module's FIRST install: no running binary, never restarts)
 #
@@ -100,13 +102,15 @@ set -euo pipefail
 
 STAGING="${CK_STAGING:-$HOME/.local/share/cortexkit/staging}"
 BIN_DIR="${CK_BIN_DIR:-$HOME/.local/share/cortexkit/bin}"
-MODULE=""; STAGED=""; DEST=""; PATH_FACE=""; MARKER=""; CONTROL=""; OLD_CONTROL=""; GONE=""; RESTART=1; PLACE=0; OLDER=0; MIGRATES=""; NEW_REQUIREMENT=""; ALLOW_UNHARDENED=0; ALLOW_UNSTRIPPED=0; ALLOW_UNSTAMPED=0; INSTALL=0
+MODULE=""; STAGED=""; DEST=""; PATH_FACE=""; MARKER=""; CONTROL=""; OLD_CONTROL=""; GONE=""; RESTART=1; PLACE=0; OLDER=0; MIGRATES=""; NEW_REQUIREMENT=""; ALLOW_UNHARDENED=0; ALLOW_UNSTRIPPED=0; ALLOW_UNSTAMPED=0; INSTALL=0; ROLLBACK=""; RESTORE_STORE=""
 
 while (($# > 0)); do
   case "$1" in
     --module) MODULE="$2"; shift 2 ;;
     --staged) STAGED="$2"; shift 2 ;;
     --dest) DEST="$2"; shift 2 ;;
+    --rollback) ROLLBACK="$2"; shift 2 ;;
+    --restore-store) RESTORE_STORE="$2"; shift 2 ;;
     --path-face) PATH_FACE="$2"; shift 2 ;;
     --marker) MARKER="$2"; shift 2 ;;
     --control) CONTROL="$2"; shift 2 ;;
@@ -153,8 +157,15 @@ while (($# > 0)); do
 done
 
 [ -n "$MODULE" ] || { echo "REFUSED: --module is required" >&2; exit 2; }
-[ -n "$STAGED" ] || { echo "REFUSED: --staged is required" >&2; exit 2; }
-[ -n "$MARKER" ] || { echo "REFUSED: --marker is required (a discriminator that separates this build from the running one); pass --marker none for a change that adds no literal" >&2; exit 2; }
+if [ -n "$ROLLBACK" ]; then
+  [[ "$ROLLBACK" =~ ^[0-9]{8}T[0-9]{6}Z$ ]] || { echo "REFUSED: --rollback must be a UTC stamp in YYYYMMDDTHHMMSSZ form" >&2; exit 2; }
+  [ "$INSTALL" -eq 0 ] || { echo "REFUSED: --rollback cannot be combined with --install" >&2; exit 2; }
+  [ -z "$MIGRATES" ] || { echo "REFUSED: --rollback cannot be combined with --migrates; use --restore-store" >&2; exit 2; }
+else
+  [ -n "$STAGED" ] || { echo "REFUSED: --staged is required" >&2; exit 2; }
+  [ -n "$MARKER" ] || { echo "REFUSED: --marker is required (a discriminator that separates this build from the running one); pass --marker none for a change that adds no literal" >&2; exit 2; }
+  [ -z "$RESTORE_STORE" ] || { echo "REFUSED: --restore-store requires --rollback" >&2; exit 2; }
+fi
 
 # `--marker none` IS FOR A CHANGE THAT ADDS NO STRING, and it is honest rather
 # than a bypass. A deletion-only fix, a removed call, a private fn that inlines
@@ -197,13 +208,17 @@ if [ "$RESTART" -eq 1 ] && ! ck module status "$MODULE" >/dev/null 2>&1; then
   exit 2
 fi
 DEST="${DEST:-$BIN_DIR/ck-$MODULE}"
-[ -f "$STAGED" ] || { echo "REFUSED: staged artifact not found: $STAGED" >&2; exit 2; }
-if [ "$INSTALL" -eq 1 ]; then
-  [ ! -e "$DEST" ] || { echo "REFUSED: --install but $DEST already exists, so this is a placement; drop --install" >&2; exit 2; }
-  [ -z "$MIGRATES" ] || { echo "REFUSED: --migrates with --install: a module installed for the first time has no store to snapshot" >&2; exit 2; }
-  [ "$MARKER" != "none" ] || { echo "REFUSED: --install needs a real --marker: with no running image, a string found in the staged binary is the check that the instrument read this build" >&2; exit 2; }
+if [ -n "$ROLLBACK" ]; then
+  [ -f "$DEST" ] || { echo "REFUSED: destination does not exist: $DEST" >&2; exit 2; }
 else
-  [ -f "$DEST" ] || { echo "REFUSED: destination does not exist, so this is an install rather than a placement (pass --install for a module's first install): $DEST" >&2; exit 2; }
+  [ -f "$STAGED" ] || { echo "REFUSED: staged artifact not found: $STAGED" >&2; exit 2; }
+  if [ "$INSTALL" -eq 1 ]; then
+    [ ! -e "$DEST" ] || { echo "REFUSED: --install but $DEST already exists, so this is a placement; drop --install" >&2; exit 2; }
+    [ -z "$MIGRATES" ] || { echo "REFUSED: --migrates with --install: a module installed for the first time has no store to snapshot" >&2; exit 2; }
+    [ "$MARKER" != "none" ] || { echo "REFUSED: --install needs a real --marker: with no running image, a string found in the staged binary is the check that the instrument read this build" >&2; exit 2; }
+  else
+    [ -f "$DEST" ] || { echo "REFUSED: destination does not exist, so this is an install rather than a placement (pass --install for a module's first install): $DEST" >&2; exit 2; }
+  fi
 fi
 
 say() { printf '%s\n' "$*"; }
@@ -365,6 +380,238 @@ PY
     done
   fi
 }
+
+# Probe an image's manifest once, validate its CLI face declaration, and expose
+# the raw JSON for the provenance check that normal placement also performs.
+probe_cli_faces() {
+  local image="$1" probe_home face_probe_result
+  FACE_NAMES=()
+  FACE_STATE="not_checked"
+  FACE_PROBE_JSON=""
+  probe_home=$(mktemp -d)
+  FACE_PROBE_JSON=$(XDG_DATA_HOME="$probe_home/data" XDG_RUNTIME_DIR="$probe_home/run" XDG_CONFIG_HOME="$probe_home/config" \
+    perl -e 'alarm 5; exec @ARGV' "$image" --manifest 2>/dev/null </dev/null) || FACE_PROBE_JSON=""
+  rm -rf "$probe_home"
+  face_probe_result=$(printf '%s' "$FACE_PROBE_JSON" | python3 -c '
+import json, os, re, sys
+
+class DuplicateKeyError(ValueError):
+    pass
+
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise DuplicateKeyError(f"duplicate JSON object key {key}")
+        result[key] = value
+    return result
+
+raw = sys.stdin.read()
+try:
+    manifest = json.loads(raw, object_pairs_hook=unique_object)
+except DuplicateKeyError as error:
+    print(f"invalid: {error}")
+    raise SystemExit(0)
+except Exception:
+    print("not_checked")
+    raise SystemExit(0)
+if not isinstance(manifest, dict):
+    print("not_checked")
+    raise SystemExit(0)
+if "cli_faces" not in manifest:
+    print("absent")
+    raise SystemExit(0)
+faces = manifest["cli_faces"]
+if not isinstance(faces, list):
+    print("invalid: cli_faces must be an array")
+    raise SystemExit(0)
+seen = set()
+for index, face in enumerate(faces):
+    if not isinstance(face, dict) or set(face) != {"name", "binary"}:
+        print(f"invalid: cli_faces[{index}] must contain exactly name and binary")
+        raise SystemExit(0)
+    name, binary = face["name"], face["binary"]
+    if not isinstance(name, str) or name.startswith("ck-") or not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", name, re.ASCII):
+        print(f"invalid: cli_faces[{index}].name is not a lowercase command name")
+        raise SystemExit(0)
+    if name in seen:
+        print(f"invalid: duplicate cli face name {name}")
+        raise SystemExit(0)
+    seen.add(name)
+    if not isinstance(binary, str) or binary != os.path.basename(sys.argv[1]):
+        print(f"invalid: cli_faces[{index}].binary must equal {os.path.basename(sys.argv[1])}")
+        raise SystemExit(0)
+print("present")
+for name in sorted(seen):
+    print(name)
+' "$DEST") || face_probe_result="not_checked"
+  case "$face_probe_result" in
+    not_checked) FACE_STATE="not_checked" ;;
+    absent) FACE_STATE="absent" ;;
+    invalid:*) refuse "invalid cli_faces in --manifest: ${face_probe_result#invalid: }" ;;
+    present|$'present\n'*)
+      FACE_STATE="present"
+      face_names_text="${face_probe_result#present}"
+      while IFS= read -r face_name; do
+        [ -n "$face_name" ] && FACE_NAMES+=("$face_name")
+      done <<< "${face_names_text#$'\n'}"
+      ;;
+    *) FACE_STATE="not_checked" ;;
+  esac
+  return 0
+}
+
+rollback_mode() {
+  local rollback_file rollback_sidecar rollback_digest sidecar_digest current_backup backup_tmp
+  local current_digest backup_digest store_snapshot store_saved_dir suffix restore_suffix source_path saved_path
+  local integrity_output integrity_status placed_digest placed_version restart_out
+  rollback_file="$STAGING/$(basename "$DEST").rollback-$ROLLBACK"
+  rollback_sidecar="$rollback_file.sha256"
+  [ -f "$rollback_file" ] || refuse "rollback snapshot not found: $rollback_file"
+  [ -f "$rollback_sidecar" ] || refuse "rollback sidecar not found: $rollback_sidecar"
+  (cd "$STAGING" && shasum -c "$(basename "$rollback_sidecar")" >/dev/null 2>&1) \
+    || refuse "rollback sidecar does not verify its artifact: $(basename "$rollback_sidecar")"
+  rollback_digest=$(shasum -a 256 "$rollback_file" | awk '{print $1}')
+  sidecar_digest=$(awk 'NR==1{print $1}' "$rollback_sidecar")
+  [ -n "$sidecar_digest" ] && [ "$rollback_digest" = "$sidecar_digest" ] \
+    || refuse "rollback sidecar digest does not describe its named snapshot"
+
+  store_snapshot=""
+  if [ -n "$RESTORE_STORE" ]; then
+    store_snapshot="$STAGING/$MODULE.store.db.rollback-$ROLLBACK"
+    [ -f "$store_snapshot" ] || refuse "store rollback snapshot not found: $store_snapshot"
+  else
+    say "store: untouched (--restore-store not given)"
+  fi
+
+  # A retained binary must still satisfy every format floor recorded by its
+  # module; restoring an older image does not make newer on-disk data readable.
+  floor_check="$(dirname "$0")/check-format-floors.sh"
+  "$floor_check" "$MODULE" "$rollback_file" || exit 2
+  probe_cli_faces "$rollback_file"
+  prepare_cli_face_plan
+
+  if [ "$PLACE" != "1" ]; then
+    print_cli_face_plan
+    say "rollback: would restore $rollback_file (sha ${rollback_digest:0:8})"
+    [ -z "$RESTORE_STORE" ] || say "store: would restore $store_snapshot to $RESTORE_STORE"
+    say "=== rollback checked, NOTHING placed and NOTHING restarted (pass --place to mutate)"
+    return 0
+  fi
+
+  mkdir -p "$STAGING"
+  current_backup="$STAGING/$(basename "$DEST").rollback-$(date -u +%Y%m%dT%H%M%SZ)"
+  [ ! -e "$current_backup" ] || refuse "a rollback snapshot already exists for this UTC second: $current_backup"
+  backup_tmp="$current_backup.tmp.$$"
+  cp "$DEST" "$backup_tmp" || { rm -f "$backup_tmp"; refuse "could not save the current binary before rollback"; }
+  current_digest=$(shasum -a 256 "$DEST" | awk '{print $1}')
+  backup_digest=$(shasum -a 256 "$backup_tmp" | awk '{print $1}')
+  if [ -z "$current_digest" ] || [ "$current_digest" != "$backup_digest" ]; then
+    rm -f "$backup_tmp"
+    refuse "current binary rollback copy differs from its source; nothing has been placed"
+  fi
+  mv "$backup_tmp" "$current_backup" || refuse "could not publish the current binary rollback copy"
+  (cd "$STAGING" && shasum -a 256 "$(basename "$current_backup")" > "$(basename "$current_backup").sha256") \
+    || refuse "could not write the current binary rollback sidecar"
+  if [ -f "$DEST.format-versions.json" ]; then
+    cp "$DEST.format-versions.json" "$current_backup.format-versions.json"
+  fi
+  say "rollback $(basename "$current_backup") matches live (${current_digest:0:8})"
+
+  if [ -n "$RESTORE_STORE" ]; then
+    local stop_out
+    if ! stop_out=$(ck module stop "$MODULE" 2>&1); then
+      refuse "could not stop '$MODULE' before restoring its store: $stop_out"
+    fi
+    [ -z "$stop_out" ] || printf '%s\n' "$stop_out" | tail -1
+    store_saved_dir=$(mktemp -d "$STAGING/.${MODULE}.store-set-aside.XXXXXX") \
+      || refuse "could not create an owner-only store preservation folder in $STAGING"
+    chmod 700 "$store_saved_dir"
+    for suffix in "" -wal -shm; do
+      source_path="$RESTORE_STORE$suffix"
+      if [ -e "$source_path" ] || [ -L "$source_path" ]; then
+        if ! mv "$source_path" "$store_saved_dir/$(basename "$RESTORE_STORE")$suffix"; then
+          for restore_suffix in "" -wal -shm; do
+            saved_path="$store_saved_dir/$(basename "$RESTORE_STORE")$restore_suffix"
+            [ -e "$saved_path" ] || [ -L "$saved_path" ] || continue
+            mv "$saved_path" "$RESTORE_STORE$restore_suffix" || refuse "could not put the set-aside store files back; preserved copies remain in $store_saved_dir"
+          done
+          refuse "could not move the current store files into $store_saved_dir"
+        fi
+      fi
+    done
+    if ! cp "$store_snapshot" "$RESTORE_STORE" || ! chmod 600 "$RESTORE_STORE"; then
+      rm -f "$RESTORE_STORE"
+      for suffix in "" -wal -shm; do
+        saved_path="$store_saved_dir/$(basename "$RESTORE_STORE")$suffix"
+        [ -e "$saved_path" ] || [ -L "$saved_path" ] || continue
+        mv "$saved_path" "$RESTORE_STORE$suffix" || refuse "could not restore the set-aside store files; preserved copies remain in $store_saved_dir"
+      done
+      refuse "could not copy the store snapshot into place with mode 0600"
+    fi
+    integrity_status=0
+    integrity_output=$(sqlite3 "$RESTORE_STORE" 'PRAGMA integrity_check' 2>&1) || integrity_status=$?
+    if [ "$integrity_status" -ne 0 ] || [ "$integrity_output" != "ok" ]; then
+      rm -f "$RESTORE_STORE"
+      for suffix in "" -wal -shm; do
+        saved_path="$store_saved_dir/$(basename "$RESTORE_STORE")$suffix"
+        [ -e "$saved_path" ] || [ -L "$saved_path" ] || continue
+        mv "$saved_path" "$RESTORE_STORE$suffix" || refuse "restored store failed integrity_check and the prior files could not be restored; preserved copies remain in $store_saved_dir"
+      done
+      refuse "restored store failed PRAGMA integrity_check (${integrity_output:-no result}); prior store files were restored and the module was not started"
+    fi
+    say "store integrity_check: ok; prior store files preserved in $store_saved_dir"
+  fi
+
+  say "=== place"
+  cp "$rollback_file" "$DEST.tmp" && mv "$DEST.tmp" "$DEST"
+  if [ -f "$rollback_file.format-versions.json" ]; then
+    cp "$rollback_file.format-versions.json" "$DEST.format-versions.json.tmp" \
+      && mv "$DEST.format-versions.json.tmp" "$DEST.format-versions.json"
+  else
+    rm -f "$DEST.format-versions.json"
+  fi
+  placed_digest=$(shasum -a 256 "$DEST" | awk '{print $1}')
+  [ -n "$placed_digest" ] && [ "$placed_digest" = "$rollback_digest" ] \
+    || refuse "placed bytes differ from the verified rollback snapshot (snapshot $rollback_digest, placed $placed_digest)"
+  say "placed sha ${placed_digest:0:8} (equals rollback snapshot)"
+  placed_version=$("$DEST" --version 2>&1 | head -1)
+  say "warm-exec at destination: $placed_version"
+  reconcile_cli_faces
+
+  prune="$(dirname "$0")/prune-rollbacks.sh"
+  if ! CK_STAGING="$STAGING" "$prune" --keep 3 --apply "$(basename "$DEST")"; then
+    say "WARNING: rollback prune failed; the rollback itself succeeded and older snapshots were kept"
+  fi
+  say "rolled back to $ROLLBACK"
+
+  if [ "$RESTART" -eq 1 ]; then
+    say "=== restart"
+    if [ -n "$RESTORE_STORE" ]; then
+      if ! restart_out=$(ck module start "$MODULE" 2>&1); then
+        refuse "start of '$MODULE' failed after rollback; the restored binary and store are on disk: ${restart_out}"
+      fi
+    else
+      if ! restart_out=$(ck module restart "$MODULE" 2>&1); then
+        refuse "restart of '$MODULE' failed after rollback; the restored binary is on disk: ${restart_out}"
+      fi
+    fi
+    printf '%s\n' "$restart_out" | tail -1
+    say "$(date -u +%FT%TZ) restart initiated -- verify on a lane opened AFTER this point:"
+    say "  ck --json provenance $MODULE | python3 -c 'import json,sys; print(json.load(sys.stdin)[\"modules\"][0][\"daemon_observed\"][\"pid\"])'"
+    say "  then inode proc-vs-disk on that pid, which is the only proof it runs these bytes"
+    say "  logs: event in the module's r2 sink ~/.local/share/cortexkit/$MODULE/logs/$MODULE.<YYYY-MM-DD>.log (timestamped)"
+    say "        archive ~/.local/share/cortexkit/run/logs/$MODULE.stderr.log must not GROW ($(wc -c < ~/.local/share/cortexkit/run/logs/$MODULE.stderr.log 2>/dev/null || echo 0) bytes now); a line found there is historical"
+  else
+    [ -z "$RESTORE_STORE" ] || say "module remains stopped (--no-restart)"
+    say "restart skipped (--no-restart)"
+  fi
+}
+
+if [ -n "$ROLLBACK" ]; then
+  rollback_mode
+  exit 0
+fi
 
 # BEFORE-READINGS: what exists only while the OUTGOING image runs.
 #
@@ -661,76 +908,8 @@ fi
 # XDG home and a 5 s alarm, so a binary that does not know the flag cannot touch
 # real stores or hang the gate. A binary that does not answer is reported as
 # unchecked rather than refused: not every module serves `--manifest` yet.
-prov_home=$(mktemp -d)
-prov_json=$(XDG_DATA_HOME="$prov_home/data" XDG_RUNTIME_DIR="$prov_home/run" XDG_CONFIG_HOME="$prov_home/config" \
-  perl -e 'alarm 5; exec @ARGV' "$STAGED" --manifest 2>/dev/null </dev/null) || prov_json=""
-rm -rf "$prov_home"
-face_probe_result=$(printf '%s' "$prov_json" | python3 -c '
-import json, os, re, sys
-
-class DuplicateKeyError(ValueError):
-    pass
-
-def unique_object(pairs):
-    result = {}
-    for key, value in pairs:
-        if key in result:
-            raise DuplicateKeyError(f"duplicate JSON object key {key}")
-        result[key] = value
-    return result
-
-raw = sys.stdin.read()
-try:
-    manifest = json.loads(raw, object_pairs_hook=unique_object)
-except DuplicateKeyError as error:
-    print(f"invalid: {error}")
-    raise SystemExit(0)
-except Exception:
-    print("not_checked")
-    raise SystemExit(0)
-if not isinstance(manifest, dict):
-    print("not_checked")
-    raise SystemExit(0)
-if "cli_faces" not in manifest:
-    print("absent")
-    raise SystemExit(0)
-faces = manifest["cli_faces"]
-if not isinstance(faces, list):
-    print("invalid: cli_faces must be an array")
-    raise SystemExit(0)
-seen = set()
-for index, face in enumerate(faces):
-    if not isinstance(face, dict) or set(face) != {"name", "binary"}:
-        print(f"invalid: cli_faces[{index}] must contain exactly name and binary")
-        raise SystemExit(0)
-    name, binary = face["name"], face["binary"]
-    if not isinstance(name, str) or name.startswith("ck-") or not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", name, re.ASCII):
-        print(f"invalid: cli_faces[{index}].name is not a lowercase command name")
-        raise SystemExit(0)
-    if name in seen:
-        print(f"invalid: duplicate cli face name {name}")
-        raise SystemExit(0)
-    seen.add(name)
-    if not isinstance(binary, str) or binary != os.path.basename(sys.argv[1]):
-        print(f"invalid: cli_faces[{index}].binary must equal {os.path.basename(sys.argv[1])}")
-        raise SystemExit(0)
-print("present")
-for name in sorted(seen):
-    print(name)
-' "$DEST") || face_probe_result="not_checked"
-case "$face_probe_result" in
-  not_checked) FACE_STATE="not_checked" ;;
-  absent) FACE_STATE="absent" ;;
-  invalid:*) refuse "invalid cli_faces in --manifest: ${face_probe_result#invalid: }" ;;
-  present|$'present\n'*)
-    FACE_STATE="present"
-    face_names_text="${face_probe_result#present}"
-    while IFS= read -r face_name; do
-      [ -n "$face_name" ] && FACE_NAMES+=("$face_name")
-    done <<< "${face_names_text#$'\n'}"
-    ;;
-  *) FACE_STATE="not_checked" ;;
-esac
+probe_cli_faces "$STAGED"
+prov_json="$FACE_PROBE_JSON"
 prov_line=$(printf '%s' "$prov_json" | python3 -c '
 import json, sys
 try:

@@ -2,7 +2,7 @@
 
 ## 0.20.101
 
-- Require subc-daemon 0.36.9 so connection teardown cannot wait indefinitely for a writer blocked after peer EOF or a read/protocol error.
+- Require subc-daemon 0.36.9. When a client connection ends because the peer closed it or a read failed, the daemon now stops the connection's outgoing writer after a two-second flush grace, as it already did for a requested close, so a peer that stops reading can no longer hold the connection's cleanup forever.
 
 ## 0.20.100
 

@@ -287,8 +287,9 @@ fn publishes(grant: &grants::Grant, subject: &str) -> bool {
         .any(|pattern| covers(pattern, subject))
 }
 
-/// The attested `reserved:basal` gets the flow-engine grant: its own event-stream durable
-/// and nothing that produces a workload message or reads an agent's queue.
+/// The attested `reserved:basal` gets the flow-engine grant: its own event-stream durable,
+/// publish on its own module events, and nothing that produces a workload message, another
+/// module's events, or reads an agent's queue.
 #[test]
 fn basal_is_issued_the_flow_engine_grant_and_no_workload_publish() {
     let names = grants::derive_account("box_membershipflow").unwrap();
@@ -309,7 +310,6 @@ fn basal_is_issued_the_flow_engine_grant_and_no_workload_publish() {
         names.peer_delivery("agent_flow", "sess_flow").unwrap(),
         names.effect_intent("agent_flow", "sess_flow").unwrap(),
         names.room_binding().replace('*', "room_flow"),
-        names.event_subject("basal", "flow_ran", 1).unwrap(),
         names.event_subject("other", "flow_ran", 1).unwrap(),
     ] {
         assert!(
@@ -317,6 +317,11 @@ fn basal_is_issued_the_flow_engine_grant_and_no_workload_publish() {
             "basal must not publish {subject}"
         );
     }
+    // Basal emits flow lifecycle events on its own subjects, as every participant may.
+    assert!(publishes(
+        &basal,
+        &names.event_subject("basal", "flow_ran", 1).unwrap()
+    ));
     for stream in names.streams().agent_streams() {
         assert!(
             !publishes(

@@ -85,6 +85,18 @@ const DEFAULT_RESTART_WINDOW: Duration = Duration::from_secs(600);
 pub const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 const REGISTRY_RELEASE_TIMEOUT: Duration = Duration::from_secs(1);
 const REGISTRY_RELEASE_POLL: Duration = Duration::from_millis(10);
+/// How long a drain waits after one busy-gauge probe completes before it asks
+/// again.
+///
+/// A drain re-probes on this short interval of its own rather than on the
+/// module's health cadence. The default cadence (30 s) equals the default
+/// drain ceiling, so a cadence-paced drain that found the module busy at its
+/// first probe never asked a second time: it waited out the whole ceiling and
+/// forced GOODBYE even after the gauges had read zero. The interval is counted
+/// from the moment the previous probe finished, and probes run one at a time,
+/// so a slow module is never asked more often than it can answer. Periodic
+/// health checks outside a drain keep using the configured cadence.
+const DRAIN_BUSY_REPROBE_INTERVAL: Duration = Duration::from_millis(250);
 /// How long a restart waits for the exited process's output readers.
 ///
 /// The restart does not depend on either output reader finishing. A stderr
@@ -9416,6 +9428,8 @@ fn busy_gauges_of(
 /// busy gauges, for a health probe to report them quiet. The probe is addressed
 /// by `scope`: a swap's superseded incumbent must be asked about its own
 /// gauges, and by module id the probe would reach the promoted candidate.
+/// While the gauges read busy, the probe repeats every
+/// [`DRAIN_BUSY_REPROBE_INTERVAL`] until they read quiet or `deadline` passes.
 async fn wait_for_forwarding_quiescence(
     forwarding: &ForwardingTable,
     module_id: &str,
@@ -9461,7 +9475,9 @@ async fn wait_for_forwarding_quiescence(
                     false
                 }
             };
-            next_probe_at = Instant::now() + runtime.health.cadence.max(REGISTRY_RELEASE_POLL);
+            // Counted from the probe's completion: the probe above was awaited,
+            // so no second probe can start while one is still outstanding.
+            next_probe_at = Instant::now() + drain_busy_reprobe_interval();
         }
 
         let in_flight = forwarding
@@ -9483,6 +9499,13 @@ async fn wait_for_forwarding_quiescence(
         }
         sleep(wait).await;
     }
+}
+
+/// The wait between drain busy-gauge probes: the larger of
+/// [`DRAIN_BUSY_REPROBE_INTERVAL`] and [`REGISTRY_RELEASE_POLL`], the
+/// drain's own in-flight poll interval.
+fn drain_busy_reprobe_interval() -> Duration {
+    DRAIN_BUSY_REPROBE_INTERVAL.max(REGISTRY_RELEASE_POLL)
 }
 
 /// The `route.closed` `drained` value implied by a quiescence-wait outcome.
@@ -13404,6 +13427,225 @@ mod health_event_tests {
             ModuleHealthStatus::default()
         );
         peer.abort();
+    }
+}
+
+#[cfg(test)]
+mod drain_busy_reprobe_tests {
+    //! The drain's busy-gauge wait, driven against an in-process module
+    //! connection whose health answers the test scripts. Time is paused, so
+    //! every elapsed duration below is exact virtual time.
+    use super::*;
+    use std::sync::Mutex as StdMutex;
+    use subc_protocol::{manifest::Concurrency, session::ModuleControlResponse};
+
+    const MODULE_ID: &str = "drain-reprobe-module";
+    const CONNECTION: u64 = 7;
+    const GAUGE: &str = "runs_in_flight";
+    /// The production default for both the health cadence and the drain
+    /// ceiling, which is the pairing that used to cost a full ceiling.
+    const CADENCE: Duration = Duration::from_secs(30);
+    const CEILING: Duration = Duration::from_secs(30);
+
+    /// How the scripted module answers each `health.check`.
+    #[derive(Clone, Copy)]
+    enum Answer {
+        /// Report the gauge busy until this instant, quiet from then on, after
+        /// taking `latency` to answer.
+        BusyUntil { until: Instant, latency: Duration },
+        /// Never answer.
+        Silent,
+    }
+
+    struct Drain {
+        forwarding: Arc<ForwardingTable>,
+        runtime: SupervisorRuntimeConfig,
+        endpoint: crate::ModuleEndpointId,
+        /// When each probe reached the module.
+        probes: Arc<StdMutex<Vec<Instant>>>,
+        responder: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drain {
+        fn start(answer: Answer) -> Self {
+            let registry = Arc::new(Registry::default());
+            let forwarding = Arc::new(ForwardingTable::default());
+            let health = HealthConfig {
+                cadence: CADENCE,
+                ..HealthConfig::default()
+            };
+            let runtime = Supervisor::new_for_test(registry, RestartPolicy::new(3, Duration::ZERO))
+                .with_forwarding(forwarding.clone())
+                .with_health_config(health)
+                .runtime_config();
+            let (tx, mut rx) = mpsc::channel::<crate::router::OutboundFrame>(8);
+            let endpoint = forwarding
+                .register_module_connection(
+                    ConnectionId::new(CONNECTION),
+                    MODULE_ID.to_string(),
+                    subc_protocol::PROTOCOL_VERSION,
+                    Concurrency::ModuleManaged,
+                    FrameSink::new(tx),
+                )
+                .unwrap();
+            let probes = Arc::new(StdMutex::new(Vec::new()));
+            let responder = tokio::spawn({
+                let forwarding = forwarding.clone();
+                let probes = probes.clone();
+                async move {
+                    while let Some(frame) = rx.recv().await {
+                        let body: Value = serde_json::from_slice(&frame.body).unwrap();
+                        assert_eq!(body["op"], MODULE_CONTROL_OP_HEALTH_CHECK);
+                        probes.lock().unwrap().push(Instant::now());
+                        let Answer::BusyUntil { until, latency } = answer else {
+                            continue;
+                        };
+                        sleep(latency).await;
+                        let busy = u64::from(Instant::now() < until);
+                        // A probe abandoned at its deadline has no RPC left to
+                        // complete, so a late answer may be refused.
+                        let _ = forwarding.complete_module_control_rpc(
+                            ConnectionId::new(CONNECTION),
+                            frame.header.corr,
+                            Some(MODULE_CONTROL_OP_HEALTH_CHECK),
+                            ModuleControlRpcOutcome::Response(ModuleControlResponse::HealthCheck {
+                                status: HealthStatus::Ok,
+                                detail: None,
+                                metrics: Some(serde_json::json!({ GAUGE: busy })),
+                            }),
+                        );
+                    }
+                }
+            });
+            Self {
+                forwarding,
+                runtime,
+                endpoint,
+                probes,
+                responder,
+            }
+        }
+
+        /// Run one by-id drain wait with `ceiling`, returning its verdict and
+        /// how long it took.
+        async fn run(&self, ceiling: Duration) -> (bool, Duration) {
+            let started = Instant::now();
+            let drained = wait_for_forwarding_quiescence(
+                &self.forwarding,
+                MODULE_ID,
+                &self.runtime,
+                self.endpoint,
+                started + ceiling,
+                &[GAUGE.to_string()],
+                DrainScope::Active,
+            )
+            .await
+            .unwrap();
+            (drained, started.elapsed())
+        }
+
+        fn probes(&self) -> Vec<Instant> {
+            self.probes.lock().unwrap().clone()
+        }
+    }
+
+    impl Drop for Drain {
+        fn drop(&mut self) {
+            self.responder.abort();
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn busy_at_first_probe_then_quiet_drains_long_before_the_ceiling() {
+        let drain = Drain::start(Answer::BusyUntil {
+            until: Instant::now() + Duration::from_secs(1),
+            latency: Duration::ZERO,
+        });
+        let (drained, elapsed) = drain.run(CEILING).await;
+        assert!(
+            drained,
+            "gauges that read zero during the drain must let it finish drained, \
+             not wait out the {CADENCE:?} health cadence (elapsed {elapsed:?})"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "drain took {elapsed:?} after the gauges went quiet at 1s"
+        );
+        let probes = drain.probes();
+        assert!(
+            probes.len() >= 2,
+            "the module was busy at the first probe, so a quiet verdict needs a second: {probes:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn busy_throughout_ends_undrained_at_the_ceiling_with_bounded_probes() {
+        let started = Instant::now();
+        let drain = Drain::start(Answer::BusyUntil {
+            until: started + Duration::from_secs(3600),
+            latency: Duration::ZERO,
+        });
+        let (drained, elapsed) = drain.run(CEILING).await;
+        assert!(!drained, "a module busy throughout must not drain");
+        assert!(
+            elapsed >= CEILING && elapsed < CEILING + drain_busy_reprobe_interval(),
+            "a busy module is held until the ceiling and no longer: {elapsed:?}"
+        );
+        // Re-probing is paced by the interval, not a busy loop: at most one
+        // probe per interval across the ceiling, plus the first at time zero.
+        let probes = drain.probes();
+        let max_probes = (CEILING.as_millis() / drain_busy_reprobe_interval().as_millis()) + 1;
+        assert!(
+            probes.len() as u128 <= max_probes,
+            "{} probes in a {CEILING:?} drain exceeds the {max_probes} the interval allows",
+            probes.len()
+        );
+        for pair in probes.windows(2) {
+            assert!(
+                pair[1] - pair[0] >= drain_busy_reprobe_interval(),
+                "consecutive probes {:?} apart",
+                pair[1] - pair[0]
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_probe_is_never_overlapped_by_the_next() {
+        // Each answer takes longer than the re-probe interval; the next probe
+        // must wait for the previous answer and then the interval.
+        let latency = Duration::from_secs(1);
+        let drain = Drain::start(Answer::BusyUntil {
+            until: Instant::now() + Duration::from_secs(3600),
+            latency,
+        });
+        let (drained, _) = drain.run(Duration::from_secs(5)).await;
+        assert!(!drained);
+        let probes = drain.probes();
+        assert!(probes.len() >= 2, "the drain must re-probe: {probes:?}");
+        for pair in probes.windows(2) {
+            assert!(
+                pair[1] - pair[0] >= latency + drain_busy_reprobe_interval(),
+                "a probe started {:?} after the previous one, before it could finish",
+                pair[1] - pair[0]
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unanswered_probe_cannot_hold_the_drain_past_its_ceiling() {
+        let drain = Drain::start(Answer::Silent);
+        let ceiling = Duration::from_secs(2);
+        let (drained, elapsed) = drain.run(ceiling).await;
+        assert!(!drained, "an unanswered probe counts as busy");
+        assert!(
+            elapsed >= ceiling && elapsed < ceiling + drain_busy_reprobe_interval(),
+            "the probe deadline is capped at the drain ceiling: {elapsed:?}"
+        );
+        assert_eq!(
+            drain.probes().len(),
+            1,
+            "the unanswered probe holds the only slot until the ceiling"
+        );
     }
 }
 

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.36.10
+
+- A drain now re-checks a module's declared busy gauges every 250 ms while they read busy, instead of once per health cadence. The default cadence (30 s) equals the default drain ceiling, so a module busy at the drain's first check was never checked again: it waited the full 30 s and was cut with `drained: false` even after its gauges reached zero. Each check still starts only after the previous one finished and is still bounded by the drain ceiling; a missing or unreadable gauge still counts as busy. Health checks outside a drain keep their configured cadence.
+
 ## 0.36.9
 
 - When a client connection ends because the peer closed it or a read failed, the daemon now gives its outgoing writer the same two-second flush grace as a requested close, then stops it. Before, teardown waited with no limit, so a peer that stopped reading could hold the connection's cleanup forever.

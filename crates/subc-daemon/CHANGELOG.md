@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.36.9
+
+- When a client connection ends because the peer closed it or a read failed, the daemon now gives its outgoing writer the same two-second flush grace as a requested close, then stops it. Before, teardown waited with no limit, so a peer that stopped reading could hold the connection's cleanup forever.
+
 ## 0.36.8
 
 - At startup the daemon stops modules left running by a previous daemon that died. If such a module was identified and signalled, and its executable then becomes unreadable (usually because it is exiting), the daemon now keeps waiting for it to go. Previously it recorded the module as unidentifiable, which held back that module's restart until the old process disappeared. A module still running at the kill deadline is recorded as surviving, as before.

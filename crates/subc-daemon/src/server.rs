@@ -551,7 +551,7 @@ where
     // happens only when a frame finishes or the connection ends.
     let mut read_half = BufReader::new(read_half);
     let (egress, rx) = connection_egress();
-    let mut writer = tokio::spawn(drain_writer(write_half, rx));
+    let writer = tokio::spawn(drain_writer(write_half, rx));
 
     let ctx = RouteCtx {
         connection_id,
@@ -590,23 +590,7 @@ where
         Ok(ConnectionLoopExit::CloseRequested(reason)) => Some(reason.to_string()),
         Ok(ConnectionLoopExit::PeerClosed) | Err(_) => None,
     };
-    let writer_result = if close_reason.is_some() {
-        match timeout(CLOSE_DRAIN_GRACE, &mut writer).await {
-            Ok(result) => Some(result.map_err(ConnectionError::WriterTask)),
-            Err(_) => {
-                warn!(
-                    connection_id = connection_id.get(),
-                    grace = ?CLOSE_DRAIN_GRACE,
-                    "connection writer did not drain after close request; aborting writer task"
-                );
-                writer.abort();
-                let _ = writer.await;
-                None
-            }
-        }
-    } else {
-        Some(writer.await.map_err(ConnectionError::WriterTask))
-    };
+    let writer_result = finish_connection_writer(writer, connection_id.get()).await;
 
     let result = if let Some(reason) = close_reason.as_deref() {
         match writer_result {
@@ -631,11 +615,9 @@ where
             }
         }
     } else {
-        let writer_result =
-            writer_result.expect("writer result is present without a close request");
         match (loop_result, writer_result) {
-            (Err(loop_err), Ok(Ok(()))) => Err(loop_err),
-            (Err(loop_err), Ok(Err(writer_err))) => {
+            (Err(loop_err), Some(Ok(Ok(()))) | None) => Err(loop_err),
+            (Err(loop_err), Some(Ok(Err(writer_err)))) => {
                 warn!(
                     connection_id = connection_id.get(),
                     writer_error = %writer_err,
@@ -643,7 +625,7 @@ where
                 );
                 Err(loop_err)
             }
-            (Err(loop_err), Err(join_err)) => {
+            (Err(loop_err), Some(Err(join_err))) => {
                 warn!(
                     connection_id = connection_id.get(),
                     join_error = %join_err,
@@ -651,11 +633,11 @@ where
                 );
                 Err(loop_err)
             }
-            (Ok(ConnectionLoopExit::PeerClosed), Ok(Ok(()))) => Ok(()),
-            (Ok(ConnectionLoopExit::PeerClosed), Ok(Err(writer_err))) => {
+            (Ok(ConnectionLoopExit::PeerClosed), Some(Ok(Ok(()))) | None) => Ok(()),
+            (Ok(ConnectionLoopExit::PeerClosed), Some(Ok(Err(writer_err)))) => {
                 Err(ConnectionError::FrameIo(writer_err))
             }
-            (Ok(ConnectionLoopExit::PeerClosed), Err(join_err)) => Err(join_err),
+            (Ok(ConnectionLoopExit::PeerClosed), Some(Err(join_err))) => Err(join_err),
             (Ok(ConnectionLoopExit::CloseRequested(_)), _) => {
                 unreachable!("close requests are handled before normal writer result matching")
             }
@@ -685,6 +667,27 @@ where
     }
 
     result
+}
+
+async fn finish_connection_writer(
+    mut writer: JoinHandle<Result<(), FrameIoError>>,
+    connection_id: u64,
+) -> Option<Result<Result<(), FrameIoError>, ConnectionError>> {
+    // Even after inbound EOF or an error, the peer may keep its receive side
+    // open without reading. Give queued frames the same grace on every exit.
+    match timeout(CLOSE_DRAIN_GRACE, &mut writer).await {
+        Ok(result) => Some(result.map_err(ConnectionError::WriterTask)),
+        Err(_) => {
+            warn!(
+                connection_id,
+                grace = ?CLOSE_DRAIN_GRACE,
+                "connection writer did not drain during teardown; aborting writer task"
+            );
+            writer.abort();
+            let _ = writer.await;
+            None
+        }
+    }
 }
 
 async fn connection_loop<R>(
@@ -1147,6 +1150,7 @@ impl Error for ConnectionError {
 #[cfg(test)]
 mod tests {
     use std::{
+        future::Future,
         pin::Pin,
         sync::atomic::{AtomicUsize, Ordering},
         task::{Context, Poll},
@@ -1168,6 +1172,178 @@ mod tests {
 
     const TEST_DEADLINE: Duration = Duration::from_secs(2);
     const TEST_DAEMON_VER: &str = "test-subc-server";
+
+    struct ObservedStream {
+        inner: tokio::io::DuplexStream,
+        write_blocked: Arc<tokio::sync::Notify>,
+        dropped: Arc<AtomicUsize>,
+        read_error: Option<tokio::sync::oneshot::Receiver<()>>,
+    }
+
+    impl AsyncRead for ObservedStream {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            if let Some(receiver) = self.read_error.as_mut() {
+                match Pin::new(receiver).poll(cx) {
+                    Poll::Ready(Ok(())) => {
+                        self.read_error = None;
+                        return Poll::Ready(Err(io::ErrorKind::ConnectionReset.into()));
+                    }
+                    Poll::Ready(Err(_)) => self.read_error = None,
+                    Poll::Pending => {}
+                }
+            }
+            Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for ObservedStream {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let result = Pin::new(&mut self.inner).poll_write(cx, buf);
+            if result.is_pending() {
+                self.write_blocked.notify_one();
+            }
+            result
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    impl Drop for ObservedStream {
+        fn drop(&mut self) {
+            self.dropped.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    struct BlockedWriterConnection {
+        client: tokio::io::DuplexStream,
+        server: JoinHandle<Result<(), ConnectionError>>,
+        stream_dropped: Arc<AtomicUsize>,
+        read_error: Option<tokio::sync::oneshot::Sender<()>>,
+        router: Arc<Router>,
+    }
+
+    impl BlockedWriterConnection {
+        async fn new() -> Self {
+            let (mut client, inner) = duplex(256);
+            let write_blocked = Arc::new(tokio::sync::Notify::new());
+            let stream_dropped = Arc::new(AtomicUsize::new(0));
+            let (read_error, receiver) = tokio::sync::oneshot::channel();
+            let stream = ObservedStream {
+                inner,
+                write_blocked: Arc::clone(&write_blocked),
+                dropped: Arc::clone(&stream_dropped),
+                read_error: Some(receiver),
+            };
+            let (auth, conn) = test_auth();
+            let router = echo_router();
+            let server = tokio::spawn(handle_connection(stream, Arc::clone(&router), auth));
+            authenticate(&mut client, &conn).await;
+
+            // Ignore any backpressure observed during authentication. The echo
+            // reply is larger than the duplex capacity and the client never reads it.
+            let _ = timeout(Duration::ZERO, write_blocked.notified()).await;
+            write_frame(&mut client, &request(7, 1, &[b'x'; 1024]))
+                .await
+                .unwrap();
+            timeout(TEST_DEADLINE, write_blocked.notified())
+                .await
+                .expect("writer should block on the unread echo reply");
+            assert!(!server.is_finished());
+            assert_eq!(stream_dropped.load(Ordering::SeqCst), 0);
+            Self {
+                client,
+                server,
+                stream_dropped,
+                read_error: Some(read_error),
+                router,
+            }
+        }
+
+        async fn finish(&mut self) -> Result<(), ConnectionError> {
+            let started = tokio::time::Instant::now();
+            let result = timeout(CLOSE_DRAIN_GRACE + Duration::from_secs(1), &mut self.server)
+                .await
+                .expect("connection teardown exceeded writer drain grace plus margin")
+                .expect("connection task should not panic");
+            assert!(started.elapsed() >= CLOSE_DRAIN_GRACE);
+            assert_eq!(
+                self.stream_dropped.load(Ordering::SeqCst),
+                1,
+                "writer must release its stream half before teardown completes"
+            );
+            result
+        }
+
+        fn request_close(&self) {
+            // Each fixture owns a fresh router, so its only connection has ID 1.
+            assert!(self.router.forwarding().request_connection_close(
+                crate::registry::ConnectionId::new(1),
+                CloseReason::new("test_close", "test requested close"),
+            ));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn peer_eof_bounds_blocked_writer_teardown() {
+        let mut connection = BlockedWriterConnection::new().await;
+        // Half-close only the client-to-server direction: the unread receive
+        // buffer must stay alive so the server's writer cannot finish naturally.
+        connection.client.shutdown().await.unwrap();
+        connection.finish().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn read_error_bounds_blocked_writer_teardown() {
+        let mut connection = BlockedWriterConnection::new().await;
+        connection.read_error.take().unwrap().send(()).unwrap();
+        let error = connection.finish().await.unwrap_err();
+        assert!(matches!(
+            error,
+            ConnectionError::FrameIo(FrameIoError::Io(error))
+                if error.kind() == io::ErrorKind::ConnectionReset
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn close_requested_bounds_blocked_writer_teardown() {
+        let mut connection = BlockedWriterConnection::new().await;
+        connection.request_close();
+        connection.finish().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn close_requested_flushes_queued_reply_before_grace() {
+        let mut connection = BlockedWriterConnection::new().await;
+        connection.request_close();
+        let started = tokio::time::Instant::now();
+        let reply = timeout(CLOSE_DRAIN_GRACE, read_frame(&mut connection.client))
+            .await
+            .expect("queued reply should flush before the grace expires")
+            .unwrap()
+            .unwrap();
+        assert_eq!(reply.body, vec![b'x'; 1024]);
+        timeout(CLOSE_DRAIN_GRACE, &mut connection.server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(started.elapsed() < CLOSE_DRAIN_GRACE);
+        assert_eq!(connection.stream_dropped.load(Ordering::SeqCst), 1);
+    }
 
     /// Reply-path stamp, slow polarity: a channel-0 reply whose queue residency
     /// exceeds the threshold must produce the slow-control-reply-write WARN with

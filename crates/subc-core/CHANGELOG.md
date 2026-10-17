@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.20.101
+
+- Require subc-daemon 0.36.9 so connection teardown cannot wait indefinitely for a writer blocked after peer EOF or a read/protocol error.
+
 ## 0.20.100
 
 - Require subc-daemon 0.36.8. On Windows, every module is now ended with the daemon even if the daemon is killed; the daemon's record of running modules survives a crash; and the activity log records a module start only once its program has actually run.

@@ -1923,7 +1923,7 @@ dependencies = [
 
 [[package]]
 name = "subc-core"
-version = "0.20.100"
+version = "0.20.101"
 dependencies = [
  "base64",
  "cortexkit-log",
@@ -1953,7 +1953,7 @@ dependencies = [
 
 [[package]]
 name = "subc-daemon"
-version = "0.36.8"
+version = "0.36.9"
 dependencies = [
  "base64",
  "cortexkit-log",

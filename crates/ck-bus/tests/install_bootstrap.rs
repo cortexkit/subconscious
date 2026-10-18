@@ -596,7 +596,9 @@ async fn local_listener_refuses_a_connect_from_a_non_loopback_address() {
     let dir = tempfile::tempdir().unwrap();
     let server = BusServer::start(&bin, dir.path(), &trust, LOOPBACK).await;
     let conf = std::fs::read_to_string(dir.path().join("server.conf")).unwrap();
-    assert!(conf.contains(&format!("listen: \"127.0.0.1:{}\"", server.port)));
+    // The kit has nats-server choose the port number (`-1`), so the config names
+    // only the loopback host; the connects below check the bound port itself.
+    assert!(conf.contains("listen: \"127.0.0.1:-1\""), "{conf}");
     assert!(!conf.contains("0.0.0.0"), "never the wildcard address");
 
     TcpStream::connect(("127.0.0.1", server.port)).expect("a loopback connect is accepted");

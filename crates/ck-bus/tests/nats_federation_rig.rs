@@ -240,12 +240,62 @@ impl Operator {
 // Servers, monitoring and the split proxy
 // ---------------------------------------------------------------------------------
 
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .expect("bind probe port")
-        .local_addr()
-        .expect("probe addr")
-        .port()
+/// Returns the client and monitoring ports bound by the nats-server `child`, read
+/// from the `<executable>_<pid>.ports` file it writes under `ports_dir` once every
+/// listener is up. Servers listen on kernel-chosen ports (`:-1`): choosing a free port here
+/// and handing the number over would let two servers started together be given
+/// the same port, and the loser exits with "address already in use".
+async fn bound_ports(
+    child: &mut Child,
+    ports_dir: &Path,
+    stderr: &Path,
+    log: &Path,
+    limit: Duration,
+) -> (u16, u16) {
+    let pid = child.id().expect("a running nats-server has a pid");
+    let suffix = format!("_{pid}.ports");
+    let deadline = Instant::now() + limit;
+    loop {
+        let found = std::fs::read_dir(ports_dir)
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with(&suffix))
+            });
+        // The file is written in place; an unparsable read is a write in progress.
+        if let Some(ports) = found
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            .and_then(|value| Some((url_port(&value["nats"])?, url_port(&value["monitoring"])?)))
+        {
+            return ports;
+        }
+        let exited = child.try_wait().ok().flatten();
+        if exited.is_some() || Instant::now() >= deadline {
+            let tail = |path: &Path| {
+                let text = std::fs::read_to_string(path).unwrap_or_default();
+                let lines: Vec<&str> = text.lines().collect();
+                lines[lines.len().saturating_sub(40)..].join("\n")
+            };
+            panic!(
+                "nats-server ports file never appeared in {} (exit: {exited:?})\n\
+                 stderr tail:\n{}\nserver.log tail:\n{}",
+                ports_dir.display(),
+                tail(stderr),
+                tail(log)
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// The port of the first URL in a ports-file list such as `["nats://127.0.0.1:4222"]`.
+fn url_port(urls: &Value) -> Option<u16> {
+    urls.get(0)?.as_str()?.rsplit(':').next()?.parse().ok()
 }
 
 async fn wait_for<F, Fut>(what: &str, limit: Duration, mut probe: F) -> Duration
@@ -285,6 +335,7 @@ struct Server {
     bin: PathBuf,
     conf: PathBuf,
     log: PathBuf,
+    /// Bound by the running server; zero until `start` reads its ports file.
     client_port: u16,
     http_port: u16,
     child: Option<Child>,
@@ -314,8 +365,6 @@ impl Server {
         std::fs::create_dir_all(&dir).expect("server dir");
         let operator_path = dir.join("operator.jwt");
         std::fs::write(&operator_path, operator.jwt()).expect("operator jwt");
-        let client_port = free_port();
-        let http_port = free_port();
         let log = dir.join("server.log");
         let mut preload = format!(
             "  {}: \"{}\"\n",
@@ -338,8 +387,9 @@ impl Server {
         };
         let conf = format!(
             "server_name: \"{name}\"\n\
-             listen: \"127.0.0.1:{client_port}\"\n\
-             http: \"127.0.0.1:{http_port}\"\n\
+             listen: \"127.0.0.1:-1\"\n\
+             http: \"127.0.0.1:-1\"\n\
+             ports_file_dir: \"{ports}\"\n\
              log_file: \"{log}\"\n\
              logtime: true\n\
              jetstream {{ store_dir: \"{js}\", domain: \"{domain}\" }}\n\
@@ -348,6 +398,7 @@ impl Server {
              {resolver}\n\
              resolver_preload {{\n{preload}}}\n\
              {extra}\n",
+            ports = dir.join("ports").display(),
             log = log.display(),
             js = dir.join("js").display(),
             op = operator_path.display(),
@@ -360,8 +411,8 @@ impl Server {
             bin: bin.to_path_buf(),
             conf: conf_path,
             log,
-            client_port,
-            http_port,
+            client_port: 0,
+            http_port: 0,
             child: None,
         }
     }
@@ -370,8 +421,16 @@ impl Server {
         format!("nats://127.0.0.1:{}", self.client_port)
     }
 
+    /// Starts the server and waits for `/healthz`. A restarted server binds new
+    /// ports, so `url()` and the monitoring port are only valid after this returns.
     async fn start(&mut self) {
-        let child = Command::new(&self.bin)
+        let dir = self.conf.parent().unwrap().to_path_buf();
+        // A file left by a killed earlier run must never be read as this run's.
+        let ports_dir = dir.join("ports");
+        let _ = std::fs::remove_dir_all(&ports_dir);
+        std::fs::create_dir_all(&ports_dir).expect("ports dir");
+        let stderr = dir.join("server.stderr");
+        let mut child = Command::new(&self.bin)
             .arg("-c")
             .arg(&self.conf)
             .env("XDG_DATA_HOME", self.conf.parent().unwrap().join("data"))
@@ -381,10 +440,19 @@ impl Server {
                 self.conf.parent().unwrap().join("config"),
             )
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            // Errors raised before the log file is open only reach stderr.
+            .stderr(std::fs::File::create(&stderr).expect("server stderr file"))
             .kill_on_drop(true)
             .spawn()
             .expect("spawn nats-server");
+        (self.client_port, self.http_port) = bound_ports(
+            &mut child,
+            &ports_dir,
+            &stderr,
+            &self.log,
+            Duration::from_secs(20),
+        )
+        .await;
         self.child = Some(child);
         let port = self.http_port;
         let what = format!("{} /healthz ok", self.name);
@@ -574,7 +642,6 @@ impl Rig {
         let leaf_user_b = user_account.user("leaf-b");
         let hub_client = user_account.user("hub-client");
 
-        let hub_leaf_port = free_port();
         let mut hub = Server::configure(
             &bin,
             &root,
@@ -588,9 +655,18 @@ impl Rig {
             // remote's URL list. A leaf that lost its proxied link then redials the
             // hub directly and the split never happens (measured; see the results
             // document).
-            &format!("leafnodes {{ listen: \"127.0.0.1:{hub_leaf_port}\", no_advertise: true }}"),
+            "leafnodes { listen: \"127.0.0.1:-1\", no_advertise: true }",
         );
         hub.start().await;
+        // The ports file names only client and monitoring listeners; `/varz`
+        // reports the leafnode listener the hub bound.
+        let hub_leaf_port = http_get(hub.http_port, "/varz")
+            .await
+            .and_then(|body| serde_json::from_str::<Value>(&body).ok())
+            .and_then(|varz| varz["leaf"]["port"].as_u64())
+            .and_then(|port| u16::try_from(port).ok())
+            .filter(|port| *port != 0)
+            .expect("hub /varz reports its bound leafnode port");
         let proxy_a = Proxy::start(hub_leaf_port).await;
         let proxy_b = Proxy::start(hub_leaf_port).await;
 
@@ -1382,8 +1458,8 @@ async fn rig5_leaf_signature_callback_and_key_on_disk() {
         std::fs::write(
             &conf,
             format!(
-                "listen: \"127.0.0.1:{}\"\nleafnodes {{ remotes: [ {{ url: \"nats-leaf://127.0.0.1:1\", {key}: \"vault\" }} ] }}\n",
-                free_port()
+                // `-t` only parses the file, so no port is ever bound.
+                "listen: \"127.0.0.1:-1\"\nleafnodes {{ remotes: [ {{ url: \"nats-leaf://127.0.0.1:1\", {key}: \"vault\" }} ] }}\n"
             ),
         )
         .expect("conf");

@@ -858,11 +858,24 @@ async fn start_with(
     // it is stopped at once, and the supervisor runs the same configuration instead.
     let server = BusServer::start(&bin, &root.join("nats"), &trust, LOOPBACK).await;
     let url = server.url.clone();
+    let port = server.port;
     let server_log = server.log.clone();
     let conf = server.dir.join("server.conf");
     let mut env = server.ckbus_env();
     env.extend(ckbus_env);
     server.stop().await;
+    // The kit's config has nats-server pick its client port (`-1`). The supervised
+    // server must listen at the URL ck-bus and the observer were given, and keep it
+    // across the restarts below, so write the port the harness server bound back
+    // into the config.
+    let text = std::fs::read_to_string(&conf).expect("read server.conf");
+    let random = "listen: \"127.0.0.1:-1\"\n";
+    assert_eq!(text.matches(random).count(), 1, "{text}");
+    std::fs::write(
+        &conf,
+        text.replace(random, &format!("listen: \"127.0.0.1:{port}\"\n")),
+    )
+    .expect("pin the client port");
     let guard = ServerGuard { conf: conf.clone() };
 
     let config_file = render_config(&root, env, |value| {

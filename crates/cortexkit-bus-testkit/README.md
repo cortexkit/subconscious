@@ -53,7 +53,10 @@ counts an early return as passed; inspect the skip line or set REQUIRE in CI.
 
 `BusServer::start(BusOptions)` owns server.conf, ephemeral loopback client and
 monitoring ports, JetStream, a full directory resolver, operator JWT and preloaded
-system account. `ckbus_env()` returns the bootstrap environment. Optional
+system account. nats-server picks both ports itself and reports them in a ports
+file under the fixture's `ports/` directory, so brokers started at the same time
+never contend for one port; each start therefore gets new ports and a new `url`.
+`ckbus_env()` returns the bootstrap environment. Optional
 `directory`, `trust` and `preload` fields support tests that keep a resolver across
 broker restarts or test JWTs without ck-bus bootstrap; an explicitly supplied
 directory remains caller-owned.

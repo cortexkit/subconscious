@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.1.3
+
+- `BusServer::start` no longer picks its client and monitoring ports itself.
+  It used to bind a free port, release it and write the number into the
+  nats-server config, so two brokers started at the same moment could be handed
+  the same port; the loser exited with "address already in use" and its test
+  timed out on `/healthz`. The config now asks nats-server to bind
+  kernel-chosen ports (`listen`/`http` on `127.0.0.1:-1`) and to report them
+  through `ports_file_dir` (both available in every supported nats-server,
+  2.10 and later), and the kit reads `url` and `port` from that ports file.
+  A server that never writes the file fails with a timeout naming the ports
+  file and carrying the tail of the server's stderr and log; stderr now goes
+  to `server.stderr` in the fixture directory. No API change.
+
 ## 0.1.2
 
 - Move to subc-control 0.32 and subc-client-rs 0.30. No behavior change.

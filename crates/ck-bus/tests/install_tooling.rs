@@ -222,6 +222,51 @@ fn free_port() -> u16 {
         .port()
 }
 
+/// Returns the client and monitoring ports bound by the nats-server `child`, read
+/// from the `<executable>_<pid>.ports` file it writes under `ports_dir` once every
+/// listener is up. Panics with the server's stderr tail if the file never appears.
+async fn bound_ports(
+    child: &mut tokio::process::Child,
+    ports_dir: &std::path::Path,
+    stderr: &std::path::Path,
+) -> (u16, u16) {
+    let suffix = format!("_{}.ports", child.id().expect("a running nats-server"));
+    let url_port =
+        |urls: &Value| -> Option<u16> { urls.get(0)?.as_str()?.rsplit(':').next()?.parse().ok() };
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let found = std::fs::read_dir(ports_dir)
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with(&suffix))
+            });
+        // The file is written in place; an unparsable read is a write in progress.
+        if let Some(ports) = found
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            .and_then(|value| Some((url_port(&value["nats"])?, url_port(&value["monitoring"])?)))
+        {
+            return ports;
+        }
+        let exited = child.try_wait().ok().flatten();
+        if exited.is_some() || Instant::now() >= deadline {
+            let text = std::fs::read_to_string(stderr).unwrap_or_default();
+            let lines: Vec<&str> = text.lines().collect();
+            panic!(
+                "nats-server ports file never appeared in {} (exit: {exited:?})\nstderr tail:\n{}",
+                ports_dir.display(),
+                lines[lines.len().saturating_sub(40)..].join("\n")
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 fn nats_server_bin() -> Option<PathBuf> {
     match std::env::var_os("CK_NATS_SERVER_BIN") {
         Some(path) if !path.is_empty() => Some(PathBuf::from(path)),
@@ -276,12 +321,10 @@ async fn planned_and_applied_config_starts_nats_and_a_system_user_reaches_sys() 
         return;
     };
     let fixture = Fixture::new();
-    // Hold both allocations together so the client and monitor ports cannot coincide.
-    let client_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let monitor_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = client_listener.local_addr().unwrap().port();
-    let monitor_port = monitor_listener.local_addr().unwrap().port();
-    drop((client_listener, monitor_listener));
+    // install-apply only writes these numbers; the server below is told to bind
+    // kernel-chosen ports instead (see the spawn), so nothing is ever listening on
+    // them and no concurrently running test can be handed the same port.
+    let (port, monitor_port) = (14_222, 18_223);
     let applied = fixture.install_with_ports(port, monitor_port);
     let env = &applied["env"];
     let url = env["CKBUS_NATS_URL"].as_str().unwrap();
@@ -300,10 +343,31 @@ async fn planned_and_applied_config_starts_nats_and_a_system_user_reaches_sys() 
             .to_string()
     );
 
+    // The reported URLs are the ports the written config listens on.
+    let conf_path = applied["server_conf"].as_str().unwrap();
+    let conf = std::fs::read_to_string(conf_path).unwrap();
+    assert!(
+        conf.contains(&format!("listen: \"127.0.0.1:{port}\"\n")),
+        "{conf}"
+    );
+    assert!(
+        conf.contains(&format!("http: \"127.0.0.1:{monitor_port}\"\n")),
+        "{conf}"
+    );
+
+    // Booting on the written ports would need them free at spawn time, and a port
+    // chosen free earlier can be taken by a broker another test starts meanwhile.
+    // `-p -1 -m -1` replace only the two port numbers (the config's 127.0.0.1
+    // hosts and everything else stand), and nats-server reports what it bound in
+    // `<executable>_<pid>.ports`.
+    let ports_dir = fixture.dir.path().join("ports");
+    std::fs::create_dir_all(&ports_dir).unwrap();
     let log = fixture.dir.path().join("server.log");
     let mut child = tokio::process::Command::new(&bin)
         .arg("-c")
-        .arg(applied["server_conf"].as_str().unwrap())
+        .arg(conf_path)
+        .args(["-p", "-1", "-m", "-1", "--ports_file_dir"])
+        .arg(&ports_dir)
         .env("XDG_DATA_HOME", fixture.dir.path().join("data"))
         .env("XDG_RUNTIME_DIR", fixture.dir.path().join("run"))
         .env("XDG_CONFIG_HOME", fixture.dir.path().join("config"))
@@ -312,6 +376,9 @@ async fn planned_and_applied_config_starts_nats_and_a_system_user_reaches_sys() 
         .kill_on_drop(true)
         .spawn()
         .expect("spawn nats-server");
+    let (bound_port, bound_monitor_port) = bound_ports(&mut child, &ports_dir, &log).await;
+    let url = format!("nats://127.0.0.1:{bound_port}");
+    let url = url.as_str();
 
     let deadline = Instant::now() + Duration::from_secs(20);
     let client = loop {
@@ -329,15 +396,17 @@ async fn planned_and_applied_config_starts_nats_and_a_system_user_reaches_sys() 
             }
         }
     };
-    // Probe the reported plain URL, not a synthesized readiness substitute.
+    // Probe the reported health path over HTTP on the bound monitoring port, not a
+    // synthesized readiness substitute.
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     let health_url = applied["health_url"].as_str().unwrap();
-    let (authority, path) = health_url
+    let (_, path) = health_url
         .strip_prefix("http://")
         .unwrap()
         .split_once('/')
         .unwrap();
-    let mut http = tokio::net::TcpStream::connect(authority).await.unwrap();
+    let authority = format!("127.0.0.1:{bound_monitor_port}");
+    let mut http = tokio::net::TcpStream::connect(&authority).await.unwrap();
     http.write_all(format!("GET /{path} HTTP/1.0\r\nHost: {authority}\r\n\r\n").as_bytes())
         .await
         .unwrap();

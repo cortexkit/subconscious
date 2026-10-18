@@ -134,7 +134,12 @@ function refusal(cell: LaunchNonceCell): LaunchNonceError {
   throw new Error("expected the accessor to refuse, but it returned a nonce");
 }
 
-describe("launch nonce accessor, in process", () => {
+// These suites exercise the POSIX descriptor path (SUBC_LAUNCH_NONCE_FD and FIFOs).
+// On Windows the accessor never reads that variable; it reads the named pipe in
+// SUBC_LAUNCH_NONCE_PIPE instead, which tests/launch-nonce-pipe.test.ts covers.
+const POSIX_DESCRIPTOR_ONLY = process.platform === "win32";
+
+describe.skipIf(POSIX_DESCRIPTOR_ONLY)("launch nonce accessor, in process", () => {
   test("reads the named pipe to end of file, closes it, and reports fd", () => {
     const pipe = fifo(DAEMON_NONCE);
     const cell = cellWith(`${pipe.fd}:${pipe.inode}`);
@@ -322,7 +327,7 @@ describe("launch nonce accessor, in process", () => {
   });
 });
 
-describe("launch nonce accessor, process-wide", () => {
+describe.skipIf(POSIX_DESCRIPTOR_ONLY)("launch nonce accessor, process-wide", () => {
   const saved = { fd: process.env[SUBC_LAUNCH_NONCE_FD_ENV], env: process.env[SUBC_LAUNCH_NONCE_ENV] };
 
   afterEach(() => {
@@ -431,7 +436,7 @@ function launch(runtime: Runtime, opts: { nonce: string; fdValue?: string; mode?
 
 const GRANDCHILD_REFUSALS = ["NotOpen", "NotAPipe", "WrongPipe"];
 
-describe.each(runtimes())("launch nonce in a spawned $name child", (runtime) => {
+describe.skipIf(POSIX_DESCRIPTOR_ONLY).each(runtimes())("launch nonce in a spawned $name child", (runtime) => {
   test("reads the nonce from descriptor 3, closes it, and leaves process.env unchanged", () => {
     const report = launch(runtime, { nonce: DAEMON_NONCE });
 

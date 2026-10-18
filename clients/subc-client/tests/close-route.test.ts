@@ -62,6 +62,8 @@ interface FakeState {
   holdRequests?: boolean;
   dataRequests?: number;
   lastDataRequest?: Frame;
+  holdRouteOpenReplies?: boolean;
+  heldRouteOpenReply?: Frame;
   nextChannel?: number;
 }
 
@@ -70,6 +72,7 @@ interface FakeDaemon {
   state: FakeState;
   stop(): Promise<void>;
   send(frame: Frame): Promise<void>;
+  sendBytes(bytes: Uint8Array): Promise<void>;
 }
 
 afterEach(async () => {
@@ -347,6 +350,73 @@ describe("SubcClient.closeRoute", () => {
   });
 });
 
+describe("request Error frames", () => {
+  for (const delivery of ["separate write", "coalesced with route.open", "split mid-header"] as const) {
+    test(`request rejects with the daemon code within 1.5s: ${delivery}`, async () => {
+      const { client, daemon } = await connectClient();
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        daemon.state.holdRequests = true;
+        const handle = await client.routeOpen(TOOL_TARGET, IDENTITY);
+        // A request needs an already-open route. Hold a second open's reply so
+        // it can legally share a write with the first route's request error.
+        let anotherOpen: Promise<unknown> | undefined;
+        if (delivery === "coalesced with route.open") {
+          daemon.state.holdRouteOpenReplies = true;
+          anotherOpen = client.routeOpen(TOOL_TARGET, IDENTITY).then(
+            (opened) => ({ kind: "opened", channel: opened.channel }),
+            (error: unknown) => ({ kind: "rejected", error }),
+          );
+          await waitFor(() => daemon.state.heldRouteOpenReply !== undefined, "held route.open reply");
+        }
+
+        let settled = false;
+        const outcome = Promise.race([
+          client.request(handle, { method: "reject_me" }).then(
+            (value) => { settled = true; return { kind: "resolved", value } as const; },
+            (error: unknown) => { settled = true; return { kind: "rejected", error } as const; },
+          ),
+          new Promise<{ kind: "timed_out" }>((resolve) => {
+            timer = setTimeout(() => resolve({ kind: "timed_out" }), 1_500);
+          }),
+        ]);
+        await waitFor(() => daemon.state.lastDataRequest !== undefined, "unary request received");
+        const request = daemon.state.lastDataRequest!;
+        const errorBody = { code: "invalid_request", message: "fake daemon rejected the request" };
+        const errorFrame = buildFrame(
+          FrameType.Error, buildFlags(false, Priority.Interactive, false),
+          request.header.channel, request.header.epoch, request.header.corr, encodeJson(errorBody),
+        );
+        const bytes = encodeFrame(errorFrame);
+        if (delivery === "coalesced with route.open") {
+          await daemon.sendBytes(Buffer.concat([encodeFrame(daemon.state.heldRouteOpenReply!), bytes]));
+        } else if (delivery === "split mid-header") {
+          const split = Math.floor(HEADER_LEN / 2);
+          await daemon.sendBytes(bytes.subarray(0, split));
+          // Give the reader a turn with only a partial header available.
+          await new Promise((resolve) => setTimeout(resolve, 20));
+          expect(settled).toBe(false);
+          await daemon.sendBytes(bytes.subarray(split));
+        } else {
+          await daemon.send(errorFrame);
+        }
+
+        const result = await outcome;
+        expect(result).toMatchObject({ kind: "rejected", error: errorBody });
+        if (result.kind !== "rejected") throw new Error(`unexpected request outcome: ${result.kind}`);
+        expect(result.error).toBeInstanceOf(SubcError);
+        if (anotherOpen) {
+          expect(await anotherOpen).toEqual({ kind: "opened", channel: daemon.state.openedChannels[1] });
+          expect(daemon.state.openedChannels[1]).not.toBe(handle.channel);
+        }
+      } finally {
+        if (timer) clearTimeout(timer);
+        client.close();
+      }
+    });
+  }
+});
+
 describe("subscription ended", () => {
   async function subscribed() {
     const { client, daemon } = await connectClient();
@@ -469,7 +539,10 @@ async function startFakeDaemon(): Promise<FakeDaemon> {
     port,
     state,
     send: async (frame) => {
-      for (const socket of sockets) await writeFrame(socket, frame, Date.now() + 2_000);
+      await daemon.sendBytes(encodeFrame(frame));
+    },
+    sendBytes: async (bytes) => {
+      for (const socket of sockets) await writeAll(socket, bytes, Date.now() + 2_000);
     },
     stop: async () => {
       if (stopped) return;
@@ -503,7 +576,9 @@ async function handleConnection(socket: Socket, state: FakeState): Promise<void>
         const channel = state.nextChannel!++;
         state.openedChannels.push(channel);
         if (state.routeOpenGate) await state.routeOpenGate;
-        await writeFrame(socket, responseFrame(frame, { op: "route.open", route_channel: channel, route_epoch: 1 }), deadline);
+        const reply = responseFrame(frame, { op: "route.open", route_channel: channel, route_epoch: 1 });
+        if (state.holdRouteOpenReplies) state.heldRouteOpenReply = reply;
+        else await writeFrame(socket, reply, deadline);
       }
       continue;
     }

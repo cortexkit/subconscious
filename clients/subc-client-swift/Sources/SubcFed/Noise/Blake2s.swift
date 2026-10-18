@@ -68,7 +68,7 @@ struct FedBLAKE2s {
     }
 
     static func hkdf(chainingKey: Data, inputKeyMaterial: Data, outputCount: Int) -> [Data] {
-        precondition(outputCount > 0)
+        precondition((1...3).contains(outputCount))
         let tempKey = hmac(key: chainingKey, message: inputKeyMaterial)
         var previous = Data()
         var outputs: [Data] = []

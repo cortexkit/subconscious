@@ -1,0 +1,738 @@
+{
+  "test_values_only": true,
+  "wrong_secret": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+  "foreign_static": {
+    "private": "b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1",
+    "public": "d3337e4d4ee503a66976feb1fadf5bd21ba96fc2b1571b3e980d87cf49797510"
+  },
+  "dummy_psk": "d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0",
+  "cases": [
+    {
+      "id": "wrong_secret",
+      "message1": "79a631eede1bf9c98f12032cdeadd0e7a079398fc786b88cc846ec89af85a51ab981b0b57bfa76f47a86a035be894a568aeae6373a11534d3e9527c394dc6c898e83b595458da76d7283f1ffe10da4532ee90b6bf4cb67c70ba89d43b1c86aef",
+      "entry": "normal_IK_then_pairing",
+      "responder_state": {
+        "static": {
+          "private": "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+          "public": "358072d6365880d1aeea329adf9121383851ed21a28e3b75e965d0d2cd166254"
+        },
+        "now_unix": 2000000000,
+        "window": {
+          "status": "open",
+          "expiry_unix": 2000000300,
+          "secret": "808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f"
+        },
+        "trial_psk": "6f9fba7b395998014bbb9ab37dfb5d6392a853e1d1b655716758e023819823ad",
+        "account_devices": [
+          {
+            "static_public": "8f40c5adb68f25624ae5b214ea767a6ec94d829d3d7b5e1ad1ba6f3e2138285f",
+            "status": "live",
+            "name": "Test phone"
+          }
+        ],
+        "prior_event": null
+      },
+      "plain_ik_trial": {
+        "error": "invalid_tag",
+        "operations": [
+          "DH:es",
+          "HKDF2:es",
+          "AEAD_DECRYPT:s"
+        ]
+      },
+      "pairing_trial": {
+        "error": "invalid_tag",
+        "operations": [
+          "HKDF2:e",
+          "DH:es",
+          "HKDF2:es",
+          "AEAD_DECRYPT:s",
+          "DH:ss",
+          "HKDF2:ss",
+          "HKDF3:psk",
+          "AEAD_DECRYPT:payload1"
+        ],
+        "authenticated_static": null
+      },
+      "expected": {
+        "outcome": "zero_bytes",
+        "response_hex": "",
+        "prompt": false,
+        "reason": "pairing_authentication_failed",
+        "atomic_claim_attempted": false,
+        "window_state_after": "open"
+      }
+    },
+    {
+      "id": "right_secret_foreign_key",
+      "message1": "79a631eede1bf9c98f12032cdeadd0e7a079398fc786b88cc846ec89af85a51ae5f20b55839050305915ec90ae206bea580e0b68b63d16697722cf32fc9d31c6f25e958843a376db18baebcd9fab6efab2c165f1d32224319d46a55d78f906f3",
+      "entry": "normal_IK_then_pairing",
+      "responder_state": {
+        "static": {
+          "private": "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+          "public": "358072d6365880d1aeea329adf9121383851ed21a28e3b75e965d0d2cd166254"
+        },
+        "now_unix": 2000000000,
+        "window": {
+          "status": "open",
+          "expiry_unix": 2000000300,
+          "secret": "808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f"
+        },
+        "trial_psk": "6f9fba7b395998014bbb9ab37dfb5d6392a853e1d1b655716758e023819823ad",
+        "account_devices": [
+          {
+            "static_public": "8f40c5adb68f25624ae5b214ea767a6ec94d829d3d7b5e1ad1ba6f3e2138285f",
+            "status": "live",
+            "name": "Test phone"
+          }
+        ],
+        "prior_event": null
+      },
+      "plain_ik_trial": {
+        "error": "invalid_tag",
+        "operations": [
+          "DH:es",
+          "HKDF2:es",
+          "AEAD_DECRYPT:s"
+        ]
+      },
+      "pairing_trial": {
+        "error": null,
+        "operations": [
+          "HKDF2:e",
+          "DH:es",
+          "HKDF2:es",
+          "AEAD_DECRYPT:s",
+          "DH:ss",
+          "HKDF2:ss",
+          "HKDF3:psk",
+          "AEAD_DECRYPT:payload1"
+        ],
+        "authenticated_static": "d3337e4d4ee503a66976feb1fadf5bd21ba96fc2b1571b3e980d87cf49797510"
+      },
+      "expected": {
+        "outcome": "foreign_device_refused",
+        "response_hex": "",
+        "prompt": false,
+        "reason": "device_not_live_on_account",
+        "atomic_claim_attempted": false,
+        "window_state_after": "open"
+      }
+    },
+    {
+      "id": "plain_ik_through_pairing_path",
+      "message1": "79a631eede1bf9c98f12032cdeadd0e7a079398fc786b88cc846ec89af85a51aad5b8febedeb97415be53612205e6bfab385e34cb127dd8854c4f9afb10f9b0ef1d3dbabd88ee7eebc65e8693870d307ae4836f13013ef44b5c852f38b45134d",
+      "entry": "pairing_trial_only",
+      "responder_state": {
+        "static": {
+          "private": "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+          "public": "358072d6365880d1aeea329adf9121383851ed21a28e3b75e965d0d2cd166254"
+        },
+        "now_unix": 2000000000,
+        "window": {
+          "status": "open",
+          "expiry_unix": 2000000300,
+          "secret": "808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f"
+        },
+        "trial_psk": "6f9fba7b395998014bbb9ab37dfb5d6392a853e1d1b655716758e023819823ad",
+        "account_devices": [
+          {
+            "static_public": "8f40c5adb68f25624ae5b214ea767a6ec94d829d3d7b5e1ad1ba6f3e2138285f",
+            "status": "live",
+            "name": "Test phone"
+          }
+        ],
+        "prior_event": null
+      },
+      "plain_ik_trial": {
+        "error": null,
+        "operations": [
+          "DH:es",
+          "HKDF2:es",
+          "AEAD_DECRYPT:s",
+          "DH:ss",
+          "HKDF2:ss",
+          "AEAD_DECRYPT:payload1"
+        ]
+      },
+      "pairing_trial": {
+        "error": "invalid_tag",
+        "operations": [
+          "HKDF2:e",
+          "DH:es",
+          "HKDF2:es",
+          "AEAD_DECRYPT:s"
+        ],
+        "authenticated_static": null
+      },
+      "expected": {
+        "outcome": "zero_bytes",
+        "response_hex": "",
+        "prompt": false,
+        "reason": "pairing_authentication_failed",
+        "atomic_claim_attempted": false,
+        "window_state_after": "open"
+      }
+    },
+    {
+      "id": "replayed_message1",
+      "message1": "79a631eede1bf9c98f12032cdeadd0e7a079398fc786b88cc846ec89af85a51ab981b0b57bfa76f47a86a035be894a568aeae6373a11534d3e9527c394dc6c898e83b595458da76d7283f1ffe10da4538fc76bcc03da00c84eabf92ed74ff9b3",
+      "entry": "normal_IK_then_pairing",
+      "responder_state": {
+        "static": {
+          "private": "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+          "public": "358072d6365880d1aeea329adf9121383851ed21a28e3b75e965d0d2cd166254"
+        },
+        "now_unix": 2000000000,
+        "window": {
+          "status": "claimed",
+          "expiry_unix": 2000000300,
+          "secret": null
+        },
+        "trial_psk": "d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0",
+        "account_devices": [
+          {
+            "static_public": "8f40c5adb68f25624ae5b214ea767a6ec94d829d3d7b5e1ad1ba6f3e2138285f",
+            "status": "live",
+            "name": "Test phone"
+          }
+        ],
+        "prior_event": {
+          "accepted_message1": "79a631eede1bf9c98f12032cdeadd0e7a079398fc786b88cc846ec89af85a51ab981b0b57bfa76f47a86a035be894a568aeae6373a11534d3e9527c394dc6c898e83b595458da76d7283f1ffe10da4538fc76bcc03da00c84eabf92ed74ff9b3",
+          "atomic_claim_winner": "original_dial",
+          "message2_already_sent": "70e3bf5dfc3cea74242aaa5d4bd8bab978827755495aa87386db65fa3858d9088f517ed75f019cdf24dbe31e14bce311"
+        }
+      },
+      "plain_ik_trial": {
+        "error": "invalid_tag",
+        "operations": [
+          "DH:es",
+          "HKDF2:es",
+          "AEAD_DECRYPT:s"
+        ]
+      },
+      "pairing_trial": {
+        "error": "invalid_tag",
+        "operations": [
+          "HKDF2:e",
+          "DH:es",
+          "HKDF2:es",
+          "AEAD_DECRYPT:s",
+          "DH:ss",
+          "HKDF2:ss",
+          "HKDF3:psk",
+          "AEAD_DECRYPT:payload1"
+        ],
+        "authenticated_static": null
+      },
+      "expected": {
+        "outcome": "zero_bytes",
+        "response_hex": "",
+        "prompt": false,
+        "reason": "window_claimed",
+        "atomic_claim_attempted": false,
+        "window_state_after": "claimed"
+      }
+    },
+    {
+      "id": "dial_after_claim",
+      "message1": "79a631eede1bf9c98f12032cdeadd0e7a079398fc786b88cc846ec89af85a51ae5f20b55839050305915ec90ae206bea580e0b68b63d16697722cf32fc9d31c6f25e958843a376db18baebcd9fab6efab2c165f1d32224319d46a55d78f906f3",
+      "entry": "normal_IK_then_pairing",
+      "responder_state": {
+        "static": {
+          "private": "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+          "public": "358072d6365880d1aeea329adf9121383851ed21a28e3b75e965d0d2cd166254"
+        },
+        "now_unix": 2000000000,
+        "window": {
+          "status": "claimed",
+          "expiry_unix": 2000000300,
+          "secret": null
+        },
+        "trial_psk": "d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0",
+        "account_devices": [
+          {
+            "static_public": "8f40c5adb68f25624ae5b214ea767a6ec94d829d3d7b5e1ad1ba6f3e2138285f",
+            "status": "live",
+            "name": "Test phone"
+          }
+        ],
+        "prior_event": {
+          "atomic_claim_winner": "another_dial"
+        }
+      },
+      "plain_ik_trial": {
+        "error": "invalid_tag",
+        "operations": [
+          "DH:es",
+          "HKDF2:es",
+          "AEAD_DECRYPT:s"
+        ]
+      },
+      "pairing_trial": {
+        "error": "invalid_tag",
+        "operations": [
+          "HKDF2:e",
+          "DH:es",
+          "HKDF2:es",
+          "AEAD_DECRYPT:s",
+          "DH:ss",
+          "HKDF2:ss",
+          "HKDF3:psk",
+          "AEAD_DECRYPT:payload1"
+        ],
+        "authenticated_static": null
+      },
+      "expected": {
+        "outcome": "zero_bytes",
+        "response_hex": "",
+        "prompt": false,
+        "reason": "window_claimed",
+        "atomic_claim_attempted": false,
+        "window_state_after": "claimed"
+      }
+    },
+    {
+      "id": "dial_after_expiry",
+      "message1": "79a631eede1bf9c98f12032cdeadd0e7a079398fc786b88cc846ec89af85a51ab981b0b57bfa76f47a86a035be894a568aeae6373a11534d3e9527c394dc6c898e83b595458da76d7283f1ffe10da4538fc76bcc03da00c84eabf92ed74ff9b3",
+      "entry": "normal_IK_then_pairing",
+      "responder_state": {
+        "static": {
+          "private": "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+          "public": "358072d6365880d1aeea329adf9121383851ed21a28e3b75e965d0d2cd166254"
+        },
+        "now_unix": 2000000000,
+        "window": {
+          "status": "expired",
+          "expiry_unix": 1999999999,
+          "secret": null
+        },
+        "trial_psk": "d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0",
+        "account_devices": [
+          {
+            "static_public": "8f40c5adb68f25624ae5b214ea767a6ec94d829d3d7b5e1ad1ba6f3e2138285f",
+            "status": "live",
+            "name": "Test phone"
+          }
+        ],
+        "prior_event": null
+      },
+      "plain_ik_trial": {
+        "error": "invalid_tag",
+        "operations": [
+          "DH:es",
+          "HKDF2:es",
+          "AEAD_DECRYPT:s"
+        ]
+      },
+      "pairing_trial": {
+        "error": "invalid_tag",
+        "operations": [
+          "HKDF2:e",
+          "DH:es",
+          "HKDF2:es",
+          "AEAD_DECRYPT:s",
+          "DH:ss",
+          "HKDF2:ss",
+          "HKDF3:psk",
+          "AEAD_DECRYPT:payload1"
+        ],
+        "authenticated_static": null
+      },
+      "expected": {
+        "outcome": "zero_bytes",
+        "response_hex": "",
+        "prompt": false,
+        "reason": "window_expired",
+        "atomic_claim_attempted": false,
+        "window_state_after": "expired"
+      }
+    },
+    {
+      "id": "no_window",
+      "message1": "79a631eede1bf9c98f12032cdeadd0e7a079398fc786b88cc846ec89af85a51ab981b0b57bfa76f47a86a035be894a568aeae6373a11534d3e9527c394dc6c898e83b595458da76d7283f1ffe10da4538fc76bcc03da00c84eabf92ed74ff9b3",
+      "entry": "normal_IK_then_pairing",
+      "responder_state": {
+        "static": {
+          "private": "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+          "public": "358072d6365880d1aeea329adf9121383851ed21a28e3b75e965d0d2cd166254"
+        },
+        "now_unix": 2000000000,
+        "window": {
+          "status": "absent",
+          "expiry_unix": null,
+          "secret": null
+        },
+        "trial_psk": "d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0",
+        "account_devices": [
+          {
+            "static_public": "8f40c5adb68f25624ae5b214ea767a6ec94d829d3d7b5e1ad1ba6f3e2138285f",
+            "status": "live",
+            "name": "Test phone"
+          }
+        ],
+        "prior_event": null
+      },
+      "plain_ik_trial": {
+        "error": "invalid_tag",
+        "operations": [
+          "DH:es",
+          "HKDF2:es",
+          "AEAD_DECRYPT:s"
+        ]
+      },
+      "pairing_trial": {
+        "error": "invalid_tag",
+        "operations": [
+          "HKDF2:e",
+          "DH:es",
+          "HKDF2:es",
+          "AEAD_DECRYPT:s",
+          "DH:ss",
+          "HKDF2:ss",
+          "HKDF3:psk",
+          "AEAD_DECRYPT:payload1"
+        ],
+        "authenticated_static": null
+      },
+      "expected": {
+        "outcome": "zero_bytes",
+        "response_hex": "",
+        "prompt": false,
+        "reason": "window_absent",
+        "atomic_claim_attempted": false,
+        "window_state_after": "absent"
+      }
+    },
+    {
+      "id": "removed_account_device",
+      "message1": "79a631eede1bf9c98f12032cdeadd0e7a079398fc786b88cc846ec89af85a51ab981b0b57bfa76f47a86a035be894a568aeae6373a11534d3e9527c394dc6c898e83b595458da76d7283f1ffe10da4538fc76bcc03da00c84eabf92ed74ff9b3",
+      "entry": "normal_IK_then_pairing",
+      "responder_state": {
+        "static": {
+          "private": "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+          "public": "358072d6365880d1aeea329adf9121383851ed21a28e3b75e965d0d2cd166254"
+        },
+        "now_unix": 2000000000,
+        "window": {
+          "status": "open",
+          "expiry_unix": 2000000300,
+          "secret": "808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f"
+        },
+        "trial_psk": "6f9fba7b395998014bbb9ab37dfb5d6392a853e1d1b655716758e023819823ad",
+        "account_devices": [
+          {
+            "static_public": "8f40c5adb68f25624ae5b214ea767a6ec94d829d3d7b5e1ad1ba6f3e2138285f",
+            "status": "removed",
+            "name": "Test phone"
+          }
+        ],
+        "prior_event": null
+      },
+      "plain_ik_trial": {
+        "error": "invalid_tag",
+        "operations": [
+          "DH:es",
+          "HKDF2:es",
+          "AEAD_DECRYPT:s"
+        ]
+      },
+      "pairing_trial": {
+        "error": null,
+        "operations": [
+          "HKDF2:e",
+          "DH:es",
+          "HKDF2:es",
+          "AEAD_DECRYPT:s",
+          "DH:ss",
+          "HKDF2:ss",
+          "HKDF3:psk",
+          "AEAD_DECRYPT:payload1"
+        ],
+        "authenticated_static": "8f40c5adb68f25624ae5b214ea767a6ec94d829d3d7b5e1ad1ba6f3e2138285f"
+      },
+      "expected": {
+        "outcome": "foreign_device_refused",
+        "response_hex": "",
+        "prompt": false,
+        "reason": "device_not_live_on_account",
+        "atomic_claim_attempted": false,
+        "window_state_after": "open"
+      }
+    }
+  ],
+  "equal_work": [
+    {
+      "id": "window_open",
+      "message1": "79a631eede1bf9c98f12032cdeadd0e7a079398fc786b88cc846ec89af85a51ae5f20b55839050305915ec90ae206bea580e0b68b63d16697722cf32fc9d31c6f25e958843a376db18baebcd9fab6efab2c165f1d32224319d46a55d78f906f3",
+      "entry": "normal_IK_then_pairing",
+      "responder_state": {
+        "static": {
+          "private": "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+          "public": "358072d6365880d1aeea329adf9121383851ed21a28e3b75e965d0d2cd166254"
+        },
+        "now_unix": 2000000000,
+        "window": {
+          "status": "open",
+          "expiry_unix": 2000000300,
+          "secret": "808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f"
+        },
+        "trial_psk": "6f9fba7b395998014bbb9ab37dfb5d6392a853e1d1b655716758e023819823ad",
+        "account_devices": [
+          {
+            "static_public": "8f40c5adb68f25624ae5b214ea767a6ec94d829d3d7b5e1ad1ba6f3e2138285f",
+            "status": "live",
+            "name": "Test phone"
+          }
+        ],
+        "prior_event": null
+      },
+      "plain_ik_trial": {
+        "error": "invalid_tag",
+        "operations": [
+          "DH:es",
+          "HKDF2:es",
+          "AEAD_DECRYPT:s"
+        ]
+      },
+      "pairing_trial": {
+        "error": null,
+        "operations": [
+          "HKDF2:e",
+          "DH:es",
+          "HKDF2:es",
+          "AEAD_DECRYPT:s",
+          "DH:ss",
+          "HKDF2:ss",
+          "HKDF3:psk",
+          "AEAD_DECRYPT:payload1"
+        ],
+        "authenticated_static": "d3337e4d4ee503a66976feb1fadf5bd21ba96fc2b1571b3e980d87cf49797510"
+      },
+      "expected": {
+        "outcome": "foreign_device_refused",
+        "response_hex": "",
+        "prompt": false,
+        "reason": "device_not_live_on_account",
+        "atomic_claim_attempted": false,
+        "window_state_after": "open"
+      },
+      "ordered_primitive_operations": [
+        "IK/DH:es",
+        "IK/HKDF2:es",
+        "IK/AEAD_DECRYPT:s",
+        "IKpsk1/HKDF2:e",
+        "IKpsk1/DH:es",
+        "IKpsk1/HKDF2:es",
+        "IKpsk1/AEAD_DECRYPT:s",
+        "IKpsk1/DH:ss",
+        "IKpsk1/HKDF2:ss",
+        "IKpsk1/HKDF3:psk",
+        "IKpsk1/AEAD_DECRYPT:payload1"
+      ]
+    },
+    {
+      "id": "no_window_dummy",
+      "message1": "79a631eede1bf9c98f12032cdeadd0e7a079398fc786b88cc846ec89af85a51ae5f20b55839050305915ec90ae206bea580e0b68b63d16697722cf32fc9d31c6f25e958843a376db18baebcd9fab6efab2c165f1d32224319d46a55d78f906f3",
+      "entry": "normal_IK_then_pairing",
+      "responder_state": {
+        "static": {
+          "private": "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+          "public": "358072d6365880d1aeea329adf9121383851ed21a28e3b75e965d0d2cd166254"
+        },
+        "now_unix": 2000000000,
+        "window": {
+          "status": "absent",
+          "expiry_unix": null,
+          "secret": null
+        },
+        "trial_psk": "d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0",
+        "account_devices": [
+          {
+            "static_public": "8f40c5adb68f25624ae5b214ea767a6ec94d829d3d7b5e1ad1ba6f3e2138285f",
+            "status": "live",
+            "name": "Test phone"
+          }
+        ],
+        "prior_event": null
+      },
+      "plain_ik_trial": {
+        "error": "invalid_tag",
+        "operations": [
+          "DH:es",
+          "HKDF2:es",
+          "AEAD_DECRYPT:s"
+        ]
+      },
+      "pairing_trial": {
+        "error": "invalid_tag",
+        "operations": [
+          "HKDF2:e",
+          "DH:es",
+          "HKDF2:es",
+          "AEAD_DECRYPT:s",
+          "DH:ss",
+          "HKDF2:ss",
+          "HKDF3:psk",
+          "AEAD_DECRYPT:payload1"
+        ],
+        "authenticated_static": null
+      },
+      "expected": {
+        "outcome": "zero_bytes",
+        "response_hex": "",
+        "prompt": false,
+        "reason": "window_absent",
+        "atomic_claim_attempted": false,
+        "window_state_after": "absent"
+      },
+      "ordered_primitive_operations": [
+        "IK/DH:es",
+        "IK/HKDF2:es",
+        "IK/AEAD_DECRYPT:s",
+        "IKpsk1/HKDF2:e",
+        "IKpsk1/DH:es",
+        "IKpsk1/HKDF2:es",
+        "IKpsk1/AEAD_DECRYPT:s",
+        "IKpsk1/DH:ss",
+        "IKpsk1/HKDF2:ss",
+        "IKpsk1/HKDF3:psk",
+        "IKpsk1/AEAD_DECRYPT:payload1"
+      ]
+    },
+    {
+      "id": "wrong_secret",
+      "message1": "79a631eede1bf9c98f12032cdeadd0e7a079398fc786b88cc846ec89af85a51ae5f20b55839050305915ec90ae206bea580e0b68b63d16697722cf32fc9d31c6f25e958843a376db18baebcd9fab6efa68f0218cbc4ef18a4157c591aef0a952",
+      "entry": "normal_IK_then_pairing",
+      "responder_state": {
+        "static": {
+          "private": "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+          "public": "358072d6365880d1aeea329adf9121383851ed21a28e3b75e965d0d2cd166254"
+        },
+        "now_unix": 2000000000,
+        "window": {
+          "status": "open",
+          "expiry_unix": 2000000300,
+          "secret": "808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f"
+        },
+        "trial_psk": "6f9fba7b395998014bbb9ab37dfb5d6392a853e1d1b655716758e023819823ad",
+        "account_devices": [
+          {
+            "static_public": "8f40c5adb68f25624ae5b214ea767a6ec94d829d3d7b5e1ad1ba6f3e2138285f",
+            "status": "live",
+            "name": "Test phone"
+          }
+        ],
+        "prior_event": null
+      },
+      "plain_ik_trial": {
+        "error": "invalid_tag",
+        "operations": [
+          "DH:es",
+          "HKDF2:es",
+          "AEAD_DECRYPT:s"
+        ]
+      },
+      "pairing_trial": {
+        "error": "invalid_tag",
+        "operations": [
+          "HKDF2:e",
+          "DH:es",
+          "HKDF2:es",
+          "AEAD_DECRYPT:s",
+          "DH:ss",
+          "HKDF2:ss",
+          "HKDF3:psk",
+          "AEAD_DECRYPT:payload1"
+        ],
+        "authenticated_static": null
+      },
+      "expected": {
+        "outcome": "zero_bytes",
+        "response_hex": "",
+        "prompt": false,
+        "reason": "pairing_authentication_failed",
+        "atomic_claim_attempted": false,
+        "window_state_after": "open"
+      },
+      "ordered_primitive_operations": [
+        "IK/DH:es",
+        "IK/HKDF2:es",
+        "IK/AEAD_DECRYPT:s",
+        "IKpsk1/HKDF2:e",
+        "IKpsk1/DH:es",
+        "IKpsk1/HKDF2:es",
+        "IKpsk1/AEAD_DECRYPT:s",
+        "IKpsk1/DH:ss",
+        "IKpsk1/HKDF2:ss",
+        "IKpsk1/HKDF3:psk",
+        "IKpsk1/AEAD_DECRYPT:payload1"
+      ]
+    }
+  ],
+  "sequences": [
+    {
+      "id": "foreign_then_legitimate",
+      "responder_state": {
+        "static": {
+          "private": "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+          "public": "358072d6365880d1aeea329adf9121383851ed21a28e3b75e965d0d2cd166254"
+        },
+        "ephemeral": {
+          "private": "c15724f6754bd4a8a81b00cf89763cb392f3bd883a1e8a257bfc1d50090d86f5",
+          "public": "70e3bf5dfc3cea74242aaa5d4bd8bab978827755495aa87386db65fa3858d908"
+        },
+        "now_unix": 2000000000,
+        "window": {
+          "status": "open",
+          "expiry_unix": 2000000300,
+          "secret": "808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f"
+        },
+        "trial_psk": "6f9fba7b395998014bbb9ab37dfb5d6392a853e1d1b655716758e023819823ad",
+        "account_devices": [
+          {
+            "static_public": "8f40c5adb68f25624ae5b214ea767a6ec94d829d3d7b5e1ad1ba6f3e2138285f",
+            "status": "live",
+            "name": "Test phone"
+          }
+        ]
+      },
+      "steps": [
+        {
+          "id": "foreign_dial",
+          "message1": "79a631eede1bf9c98f12032cdeadd0e7a079398fc786b88cc846ec89af85a51ae5f20b55839050305915ec90ae206bea580e0b68b63d16697722cf32fc9d31c6f25e958843a376db18baebcd9fab6efab2c165f1d32224319d46a55d78f906f3",
+          "window_state_before": "open",
+          "expected": {
+            "outcome": "foreign_device_refused",
+            "response_hex": "",
+            "prompt": false,
+            "events": [
+              "secret_verified",
+              "account_device_check"
+            ],
+            "atomic_claim_attempted": false,
+            "window_state_after": "open"
+          }
+        },
+        {
+          "id": "legitimate_dial",
+          "message1": "79a631eede1bf9c98f12032cdeadd0e7a079398fc786b88cc846ec89af85a51ab981b0b57bfa76f47a86a035be894a568aeae6373a11534d3e9527c394dc6c898e83b595458da76d7283f1ffe10da4538fc76bcc03da00c84eabf92ed74ff9b3",
+          "window_state_before": "open",
+          "expected": {
+            "outcome": "pairing_handshake_succeeded",
+            "response_hex": "70e3bf5dfc3cea74242aaa5d4bd8bab978827755495aa87386db65fa3858d9088f517ed75f019cdf24dbe31e14bce311",
+            "prompt": true,
+            "events": [
+              "secret_verified",
+              "account_device_check",
+              "atomic_window_claim",
+              "message2"
+            ],
+            "atomic_claim_attempted": true,
+            "window_state_after": "claimed"
+          }
+        }
+      ]
+    }
+  ]
+}

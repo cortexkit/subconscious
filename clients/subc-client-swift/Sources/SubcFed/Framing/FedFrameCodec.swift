@@ -5,6 +5,7 @@ public typealias FedFrameHeader = FedJSONObject
 public enum FedFrameType: String, Sendable, Equatable, CaseIterable {
     case hello
     case bye
+    case pairingResult = "pairing_result"
     case keepalive
     case catalog
     case call
@@ -400,6 +401,10 @@ public enum FedFrameCodec {
         }
 
         switch knownType {
+        case .pairingResult:
+            guard Set(header.keys) == ["type", "outcome"], header["outcome"] == .string("granted") else {
+                throw FedFrameError.invalidHeaderField(type: type, field: "outcome")
+            }
         case .hello:
             try requireArray(header, key: "versions", type: type) { values in
                 guard !values.isEmpty, values.count <= 16 else { return false }
@@ -549,6 +554,7 @@ public enum FedFrameCodec {
 
     fileprivate static func validateBody(_ body: Data, type: String, header: FedJSONObject) throws {
         let bodyless = [
+            FedFrameType.pairingResult.rawValue,
             FedFrameType.hello.rawValue,
             FedFrameType.bye.rawValue,
             FedFrameType.keepalive.rawValue,
@@ -808,6 +814,7 @@ public struct FedFrameStreamDecoder: Sendable {
                         throw FedFrameError.invalidSyntaxInvariant
                     }
                     let bodyless = [
+                        FedFrameType.pairingResult.rawValue,
                         FedFrameType.hello.rawValue,
                         FedFrameType.bye.rawValue,
                         FedFrameType.keepalive.rawValue,

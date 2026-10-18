@@ -87,8 +87,10 @@ public struct FedNoiseHandshakeResult {
     public func makeRecordSession(
         carrier: any FedNoiseMessageCarrier
     ) throws -> FedNoiseRecordSession {
-        try FedNoiseRecordSession(transportMaterial: handoff.take(), carrier: carrier)
+        try FedNoiseRecordSession(transportMaterial: takeTransportMaterial(), carrier: carrier)
     }
+
+    func takeTransportMaterial() throws -> FedNoiseTransportMaterial { try handoff.take() }
 }
 
 final class FedNoiseSymmetricState {
@@ -116,6 +118,14 @@ final class FedNoiseSymmetricState {
         let outputs = FedBLAKE2s.hkdf(chainingKey: chainingKey, inputKeyMaterial: input, outputCount: 2)
         chainingKey = outputs[0]
         cipherKey = outputs[1]
+        nonce = 0
+    }
+
+    func mixKeyAndHash(_ input: Data) {
+        let outputs = FedBLAKE2s.hkdf(chainingKey: chainingKey, inputKeyMaterial: input, outputCount: 3)
+        chainingKey = outputs[0]
+        mixHash(outputs[1])
+        cipherKey = outputs[2]
         nonce = 0
     }
 
@@ -163,17 +173,24 @@ public final class FedNoiseIKInitiator {
 
     private let staticKey: FedNoiseKeyPair
     private let pinnedResponderStatic: Data
+    private let pairingPSK: Data?
     private var symmetric: FedNoiseSymmetricState
     private var ephemeralKey: FedNoiseKeyPair?
     private var handshakeMessageWritten = false
     private var handshakeComplete = false
 
-    public init(staticKey: FedNoiseKeyPair, pinnedResponderStatic: Data, prologue: Data = FedNoiseIKInitiator.prologue) throws {
+    public convenience init(staticKey: FedNoiseKeyPair, pinnedResponderStatic: Data, prologue: Data = FedNoiseIKInitiator.prologue) throws {
+        try self.init(staticKey: staticKey, pinnedResponderStatic: pinnedResponderStatic, prologue: prologue, pairingPSK: nil)
+    }
+
+    init(staticKey: FedNoiseKeyPair, pinnedResponderStatic: Data, prologue: Data, pairingPSK: Data?) throws {
         guard pinnedResponderStatic.count == 32 else { throw FedNoiseError.invalidKeyLength }
+        if let pairingPSK, pairingPSK.count != 32 { throw FedNoiseError.invalidKeyLength }
         self.staticKey = staticKey
         self.pinnedResponderStatic = pinnedResponderStatic
+        self.pairingPSK = pairingPSK
         self.symmetric = try FedNoiseSymmetricState(
-            protocolName: Data(Self.protocolName.utf8),
+            protocolName: Data((pairingPSK == nil ? Self.protocolName : FedNoiseIKpsk1Initiator.protocolName).utf8),
             prologue: prologue,
             responderStatic: pinnedResponderStatic
         )
@@ -199,9 +216,11 @@ public final class FedNoiseIKInitiator {
         var message = Data()
         message.append(ephemeral.publicKey)
         symmetric.mixHash(ephemeral.publicKey)
+        if pairingPSK != nil { symmetric.mixKey(ephemeral.publicKey) }
         symmetric.mixKey(try dh(ephemeral.privateKey, pinnedResponderStatic))
         message.append(try symmetric.encryptAndHash(staticKey.publicKey))
         symmetric.mixKey(try dh(staticKey.privateKey, pinnedResponderStatic))
+        if let pairingPSK { symmetric.mixKeyAndHash(pairingPSK) }
         message.append(try symmetric.encryptAndHash(Data()))
         handshakeMessageWritten = true
         return message
@@ -218,6 +237,7 @@ public final class FedNoiseIKInitiator {
             let responderEphemeral = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: Data(message.prefix(32)))
             let responderEphemeralBytes = responderEphemeral.rawRepresentation
             symmetric.mixHash(responderEphemeralBytes)
+            if pairingPSK != nil { symmetric.mixKey(responderEphemeralBytes) }
             symmetric.mixKey(try dh(ephemeralKey.privateKey, responderEphemeralBytes))
             symmetric.mixKey(try dh(staticKey.privateKey, responderEphemeralBytes))
             let payload = try symmetric.decryptAndHash(Data(message.dropFirst(32)))

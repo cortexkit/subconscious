@@ -929,6 +929,9 @@ public actor FedSessionEngine {
 
     private func handleInboundFrame(_ frame: FedFrame) async throws {
         switch frame.knownType {
+        case .pairingResult:
+            await disconnect(reason: .protocolViolation(byeCode: "fed_bad_frame"))
+            throw FedFailure.protocolViolation(byeCode: "fed_bad_frame")
         case .hello:
             if helloGate.remoteHelloReceived {
                 throw FedFailure.protocolViolation(byeCode: "fed_bad_frame")
@@ -1007,6 +1010,10 @@ public actor FedSessionEngine {
             }
             let chunk = try await deps.transport.receive()
             let frames = try streamDecoder.append(chunk)
+            if frames.contains(where: { $0.knownType == .pairingResult }) {
+                await disconnect(reason: .protocolViolation(byeCode: "fed_bad_frame"))
+                throw FedFailure.protocolViolation(byeCode: "fed_bad_frame")
+            }
             if let first = frames.first {
                 if var activeKeepalive = keepalive {
                     activeKeepalive.noteInboundFrame(at: deps.clock.nowNanoseconds())

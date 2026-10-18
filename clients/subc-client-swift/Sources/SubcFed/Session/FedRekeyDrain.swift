@@ -51,7 +51,7 @@ public struct FedRekeyDrainPolicy: Sendable {
                 return false
             }
             return true
-        case .hello, .catalog, .effectStatus, .effectStatusResult:
+        case .hello, .catalog, .effectStatus, .effectStatusResult, .pairingResult:
             return false
         }
     }

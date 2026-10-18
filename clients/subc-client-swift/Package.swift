@@ -27,12 +27,13 @@ let package = Package(
     ],
     targets: [
         .target(name: "SubcClient"),
-        .target(name: "SubcFed"),
+        .target(name: "SubcFed", resources: [.copy("Resources/bip39-english.txt")]),
         .target(name: "SubcChatAskSupport"),
         .executableTarget(name: "SubcSwiftProbe", dependencies: ["SubcClient"]),
         .testTarget(
             name: "SubcFedTests",
-            dependencies: ["SubcFed"]
+            dependencies: ["SubcFed"],
+            resources: [.copy("Fixtures/fed-pairing-v1")]
         ),
         .testTarget(
             name: "SubcClientTests",

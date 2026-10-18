@@ -159,6 +159,23 @@ public struct CandidateFailure: Codable, Sendable, Equatable {
 }
 
 public enum FedFailure: Error, Codable, Sendable, Equatable {
+    /// Open raw values let callers retain future pairing refusals without a new enum case.
+    public struct PairingNotAcceptedReason: RawRepresentable, Codable, Sendable, Equatable, Hashable {
+        public let rawValue: String
+        public init(rawValue: String) { self.rawValue = rawValue }
+        public static let noAnswer = Self(rawValue: "no_answer")
+        public static let declined = Self(rawValue: "declined")
+        public static let expired = Self(rawValue: "expired")
+        public init(from decoder: Decoder) throws {
+            self.init(rawValue: try decoder.singleValueContainer().decode(String.self))
+        }
+        public func encode(to encoder: Encoder) throws {
+            var c = encoder.singleValueContainer()
+            try c.encode(rawValue)
+        }
+    }
+
+    case pairingNotAccepted(reason: PairingNotAcceptedReason)
     case notDialOwner
     case unsupportedEnrollmentClass
     case storeLossReenrollmentRequired
@@ -216,12 +233,13 @@ public enum FedFailure: Error, Codable, Sendable, Equatable {
              fedEffectsUnsupported, storeCorrupt, storeUnavailable, storeMigrationFailed,
              storeLocked, reservationFailed, persistenceFailed, cancelled, suspended, disconnected,
              moduleError, indeterminateMutation, admissionQueueFull, admissionQueueTimedOut,
-             noEligibleCandidates, allCandidatesFailed
+             noEligibleCandidates, allCandidatesFailed, pairingNotAccepted
     }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         switch try c.decode(Kind.self, forKey: .kind) {
+        case .pairingNotAccepted: self = .pairingNotAccepted(reason: try c.decode(PairingNotAcceptedReason.self, forKey: .code))
         case .notDialOwner: self = .notDialOwner
         case .unsupportedEnrollmentClass: self = .unsupportedEnrollmentClass
         case .storeLossReenrollmentRequired: self = .storeLossReenrollmentRequired
@@ -264,6 +282,8 @@ public enum FedFailure: Error, Codable, Sendable, Equatable {
     public func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
         switch self {
+        case .pairingNotAccepted(let reason):
+            try c.encode(Kind.pairingNotAccepted, forKey: .kind); try c.encode(reason, forKey: .code)
         case .notDialOwner: try c.encode(Kind.notDialOwner, forKey: .kind)
         case .unsupportedEnrollmentClass: try c.encode(Kind.unsupportedEnrollmentClass, forKey: .kind)
         case .storeLossReenrollmentRequired: try c.encode(Kind.storeLossReenrollmentRequired, forKey: .kind)
@@ -413,6 +433,12 @@ extension FedFailure: CustomStringConvertible {
             return "The remote device belongs to a different account than expected."
         case .noiseAuthenticationFailed:
             return "The encrypted handshake failed to authenticate."
+        case .pairingNotAccepted(let reason):
+            switch reason {
+            case .declined: return "The computer didn't accept this phone."
+            case .expired: return "The computer didn't confirm in time. Scan a new code."
+            default: return "Couldn't reach the computer. Show a new QR code on it, keep both on the same network, and scan again."
+            }
         case .framingViolation:
             return "The remote device sent data this version cannot read."
         case let .protocolViolation(byeCode):

@@ -71,6 +71,9 @@ public actor SubcFedClient {
     private let clock: any FedMonotonicClock
     private let entropy: any FedNoiseEntropy
     private let dialFactory: any FedCandidateDialFactory
+    private let pairingDialFactory: FedNetworkDialFactory
+    private var pairingGeneration: UInt64 = 0
+    private var pendingPairing: FedPendingPairing?
     private var defaultManagementTarget: FedManagementTarget?
     /// The single authority for whether this client observed its state document
     /// minted fresh. Do not re-derive this from a later snapshot or revision:
@@ -157,7 +160,8 @@ public actor SubcFedClient {
         managementTarget: FedManagementTarget? = nil,
         clock: any FedMonotonicClock = SystemFedMonotonicClock(),
         entropy: any FedNoiseEntropy = SystemFedNoiseEntropy(),
-        dialFactory: any FedCandidateDialFactory = FedUnimplementedDialFactory()
+        dialFactory: any FedCandidateDialFactory = FedUnimplementedDialFactory(),
+        pairingDialFactory: FedNetworkDialFactory = FedNetworkDialFactory()
     ) {
         self.activeProfile = profile
         self.dialPolicy = dialPolicy
@@ -168,6 +172,7 @@ public actor SubcFedClient {
         self.clock = clock
         self.entropy = entropy
         self.dialFactory = dialFactory
+        self.pairingDialFactory = pairingDialFactory
     }
 
     deinit {
@@ -195,6 +200,57 @@ public actor SubcFedClient {
         try await beginDialCycle(reason: .explicitConnect)
     }
 
+    /// Call only after checking the QR key against the account's signed device list.
+    /// This dial uses only the scanned hints, never the profile, rendezvous or relay.
+    /// A grant is not a saved pin: the app must still ask for acknowledgement.
+    /// The result deadline is injectable but cannot shorten the 130-second minimum.
+    public func pair(qr: FedPairingQR, resultTimeout: Duration = .seconds(130)) async throws -> FedPendingPairing {
+        let resultTimeout = max(resultTimeout, .seconds(130))
+        pairingGeneration &+= 1
+        let generation = pairingGeneration
+        let previous = pendingPairing
+        pendingPairing = nil
+        await previous?.cancel()
+        guard pairingGeneration == generation else { throw FedFailure.cancelled }
+        guard Double(qr.expiryUnix) > Date().timeIntervalSince1970 else { throw FedPairingQR.Refusal.pastExpiry }
+        let key = try await keyStore.staticPrivateKey()
+        guard pairingGeneration == generation else { throw FedFailure.cancelled }
+        let staticKey = try FedNoiseKeyPair(privateKey: key)
+        for hint in qr.hints {
+            try Task.checkCancellation()
+            guard pairingGeneration == generation else { throw FedFailure.cancelled }
+            let connected: (session: FedNoiseRecordSession, handshakeHash: Data)
+            do {
+                connected = try await pairingDialFactory.dialPairing(
+                    hint: hint, qr: qr, staticKey: staticKey, clock: clock, policy: dialPolicy, entropy: entropy
+                )
+            } catch {
+                if Task.isCancelled || pairingGeneration != generation { throw FedFailure.cancelled }
+                continue
+            }
+            guard pairingGeneration == generation, !Task.isCancelled else {
+                await connected.session.close()
+                throw FedFailure.cancelled
+            }
+            let pending = try FedPendingPairing(qr: qr, session: connected.session, handshakeHash: connected.handshakeHash,
+                                               clock: clock, resultTimeout: resultTimeout)
+            pendingPairing = pending
+            return pending
+        }
+        throw FedFailure.pairingNotAccepted(reason: .noAnswer)
+    }
+
+    public func pair(qr scan: String, resultTimeout: Duration = .seconds(130)) async throws -> FedPendingPairing {
+        try await pair(qr: FedPairingQR.parse(scan), resultTimeout: resultTimeout)
+    }
+
+    public func cancelPairing() async {
+        pairingGeneration &+= 1
+        let pending = pendingPairing
+        pendingPairing = nil
+        await pending?.cancel()
+    }
+
     /// Records that the embedding completed device re-enrollment after local
     /// federation state was lost. The enrollment identifier is retained for audit;
     /// it is not matched against a remote value by this client.
@@ -216,6 +272,7 @@ public actor SubcFedClient {
     }
 
     public func disconnect() async {
+        await cancelPairing()
         explicitlyDisconnected = true
         dialGeneration &+= 1
         cancelBackgroundWork()
@@ -224,6 +281,7 @@ public actor SubcFedClient {
     }
 
     public func suspend() async {
+        await cancelPairing()
         explicitlyDisconnected = false
         dialGeneration &+= 1
         cancelBackgroundWork()

@@ -103,6 +103,24 @@ public struct FedNetworkDialFactory: FedCandidateDialFactory {
 
     // MARK: - Direct TCP rung
 
+    func dialPairing(
+        hint: FedPairingQR.Hint, qr: FedPairingQR, staticKey: FedNoiseKeyPair,
+        clock: any FedMonotonicClock, policy: FedDialPolicy, entropy: any FedNoiseEntropy
+    ) async throws -> (session: FedNoiseRecordSession, handshakeHash: Data) {
+        let initiator = try FedNoiseIKpsk1Initiator(
+            staticKey: staticKey, responderStatic: qr.computerStaticPublicKey,
+            psk: FedPairingCrypto.derivePSK(secret: qr.secret, computerStaticPublicKey: qr.computerStaticPublicKey)
+        )
+        let connect = self.connect
+        let carrier = try await FedTCPRecordCarrier.establish(clock: clock, timeout: policy.carrierConnect) {
+            try await connect(hint.ipv4, hint.port)
+        }
+        let session = try await initiator.establish(
+            on: carrier, clock: clock, timeout: policy.noiseHandshake, entropy: entropy
+        )
+        return (session, initiator.handshakeHash)
+    }
+
     private func dialDirect(host: String, port: UInt16, context: FedDialAttemptContext) async throws -> FedDialedSession {
         let staticKey = try FedNoiseKeyPair(privateKey: context.localPrivateKey)
         let initiator = try FedNoiseIKInitiator(

@@ -41,7 +41,7 @@ use subc_transport::{
 use tokio::{
     io::{AsyncWrite, AsyncWriteExt, BufWriter},
     net::{tcp::OwnedReadHalf, TcpStream},
-    sync::{mpsc, oneshot, Notify, OwnedSemaphorePermit, Semaphore},
+    sync::{mpsc, oneshot, watch, Notify, OwnedSemaphorePermit, Semaphore},
     task::JoinHandle,
     time::{sleep, sleep_until, timeout_at, Instant},
 };
@@ -838,16 +838,33 @@ pub struct SubcConsumer {
     shared: Arc<Shared>,
 }
 
+/// The first terminal outcome of a subscription.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub enum SubscriptionEnd {
+    Response(Vec<u8>),
+    StreamEnd,
+    Error(ErrorBody),
+    RouteClosed {
+        reason: RouteEndReason,
+    },
+    ConnectionLost,
+    Cancelled,
+    /// The bounded event channel filled before the caller drained it.
+    Backpressure,
+}
+
 /// A live subscription to a provider event stream.
 ///
 /// The event receiver yields each `StreamData` payload for the held-open request's
 /// correlation id. Await [`Subscription::closed`] to learn whether the provider ended
-/// the stream cleanly (`StreamEnd`) or the stream was rejected by an Error frame,
+/// the stream cleanly (`Response` or `StreamEnd`) or the stream was rejected by an Error frame,
 /// route GOODBYE, connection drop, or local backpressure. Dropping the subscription
 /// sends a best-effort Cancel frame, the same as calling [`Subscription::unsubscribe`].
 pub struct Subscription {
     events: mpsc::Receiver<Vec<u8>>,
     closed: SubscriptionClosed,
+    ended: watch::Receiver<Option<SubscriptionEnd>>,
     cancel: SubscriptionCancel,
 }
 
@@ -859,12 +876,28 @@ impl Subscription {
 
     /// Future that resolves when the subscription reaches a terminal state.
     ///
-    /// It resolves with `Ok(())` on `StreamEnd` or local unsubscribe, and returns a
+    /// It resolves with `Ok(())` on `Response`, `StreamEnd` or local unsubscribe, and returns a
     /// [`CallError`] for module Error frames, route teardown, connection loss, or
     /// event-channel backpressure. Await it after the event receiver returns `None`
     /// to distinguish a clean end from an error.
     pub fn closed(&mut self) -> &mut SubscriptionClosed {
         &mut self.closed
+    }
+
+    /// Wait for the terminal outcome, retaining a Response body or module Error.
+    ///
+    /// This is independent of the one-shot [`Self::closed`] future: either can be
+    /// awaited first, and `ended` can be awaited again after completion. Neither
+    /// method reads frames; both observe the same pending request's settlement.
+    pub async fn ended(&mut self) -> SubscriptionEnd {
+        loop {
+            if let Some(end) = self.ended.borrow().clone() {
+                return end;
+            }
+            if self.ended.changed().await.is_err() {
+                return SubscriptionEnd::ConnectionLost;
+            }
+        }
     }
 
     /// Cancel the held-open request.
@@ -4023,6 +4056,7 @@ impl Shared {
         };
         let (events_tx, events_rx) = mpsc::channel(event_buffer.max(1));
         let (closed_tx, closed_rx) = oneshot::channel();
+        let (ended_tx, ended_rx) = watch::channel(None);
         {
             let mut inner = self.lock_inner();
             if inner.closed || inner.generation != generation || inner.writer.is_none() {
@@ -4037,7 +4071,7 @@ impl Shared {
             }
             inner.pending.insert(
                 key,
-                PendingEntry::subscription(events_tx, closed_tx, permit, priority),
+                PendingEntry::subscription(events_tx, closed_tx, ended_tx, permit, priority),
             );
         }
         let mut registration = PendingRegistration::new(Arc::clone(self), key, false);
@@ -4072,6 +4106,7 @@ impl Shared {
         Ok(Subscription {
             events: events_rx,
             closed: SubscriptionClosed { rx: closed_rx },
+            ended: ended_rx,
             cancel: SubscriptionCancel::new(Arc::clone(self), key, priority),
         })
     }
@@ -5107,6 +5142,7 @@ enum PendingCompletion {
     Subscription {
         events: mpsc::Sender<Vec<u8>>,
         closed: oneshot::Sender<Result<(), CallError>>,
+        ended: watch::Sender<Option<SubscriptionEnd>>,
         _permit: OwnedSemaphorePermit,
         priority: Priority,
     },
@@ -5138,6 +5174,7 @@ impl PendingEntry {
     fn subscription(
         events: mpsc::Sender<Vec<u8>>,
         closed: oneshot::Sender<Result<(), CallError>>,
+        ended: watch::Sender<Option<SubscriptionEnd>>,
         permit: OwnedSemaphorePermit,
         priority: Priority,
     ) -> Self {
@@ -5150,6 +5187,7 @@ impl PendingEntry {
             completion: PendingCompletion::Subscription {
                 events,
                 closed,
+                ended,
                 _permit: permit,
                 priority,
             },
@@ -5189,23 +5227,36 @@ impl PendingEntry {
             PendingCompletion::Unary(tx) => {
                 let _ = tx.send(PendingResult::Terminal(terminal));
             }
-            PendingCompletion::Subscription { closed, .. } => {
-                let result = match terminal {
-                    PendingTerminal::Response { .. } | PendingTerminal::StreamEnd => Ok(()),
-                    PendingTerminal::Error { body, .. } => Err(CallError::Module(body)),
+            PendingCompletion::Subscription { closed, ended, .. } => {
+                let (end, result) = match terminal {
+                    PendingTerminal::Response { body, .. } => {
+                        (SubscriptionEnd::Response(body), Ok(()))
+                    }
+                    PendingTerminal::StreamEnd => (SubscriptionEnd::StreamEnd, Ok(())),
+                    PendingTerminal::Error { body, .. } => (
+                        SubscriptionEnd::Error(body.clone()),
+                        Err(CallError::Module(body)),
+                    ),
                 };
+                let _ = ended.send(Some(end));
                 let _ = closed.send(result);
             }
         }
     }
 
     fn settle_failure(self, reason: String) {
-        let accepted = self.accepted;
-        self.settle_call_error(classify_failure(
-            accepted,
-            reason,
-            OutcomeUnknownCause::ConsumerClosed,
-        ));
+        let err = classify_failure(self.accepted, reason, OutcomeUnknownCause::ConsumerClosed);
+        match self.completion {
+            PendingCompletion::Unary(tx) => {
+                let _ = tx.send(PendingResult::CallError(err));
+            }
+            PendingCompletion::Subscription { closed, ended, .. } => {
+                let _ = ended.send(Some(SubscriptionEnd::RouteClosed {
+                    reason: RouteEndReason::ClosedByCaller,
+                }));
+                let _ = closed.send(Err(err));
+            }
+        }
     }
 
     fn settle_call_error(self, err: CallError) {
@@ -5213,7 +5264,20 @@ impl PendingEntry {
             PendingCompletion::Unary(tx) => {
                 let _ = tx.send(PendingResult::CallError(err));
             }
-            PendingCompletion::Subscription { closed, .. } => {
+            PendingCompletion::Subscription { closed, ended, .. } => {
+                let end = if let Some(reason) = err.close_reason() {
+                    match reason {
+                        RouteEndReason::ConnectionLost => SubscriptionEnd::ConnectionLost,
+                        reason => SubscriptionEnd::RouteClosed {
+                            reason: reason.clone(),
+                        },
+                    }
+                } else if matches!(err, CallError::SubscriptionBackpressure(_)) {
+                    SubscriptionEnd::Backpressure
+                } else {
+                    SubscriptionEnd::ConnectionLost
+                };
+                let _ = ended.send(Some(end));
                 let _ = closed.send(Err(err));
             }
         }
@@ -5221,7 +5285,8 @@ impl PendingEntry {
 
     fn settle_subscription_result(self, result: Result<(), CallError>) {
         match self.completion {
-            PendingCompletion::Subscription { closed, .. } => {
+            PendingCompletion::Subscription { closed, ended, .. } => {
+                let _ = ended.send(Some(SubscriptionEnd::Cancelled));
                 let _ = closed.send(result);
             }
             PendingCompletion::Unary(tx) => {
@@ -8315,6 +8380,239 @@ mod tests {
         }
     }
 
+    // The fake module receives the queued Request and injects frames through the
+    // same dispatcher as the socket reader, without a daemon process.
+    async fn watch_subscribed() -> (
+        SubcConsumer,
+        mpsc::Receiver<WriteCommand>,
+        Subscription,
+        Frame,
+    ) {
+        let (shared, mut rx, handle) = reverse_test_shared(ReverseRequestRegistry::new());
+        shared.lock_inner().one_shot_routes.insert(
+            handle.channel,
+            RouteState {
+                handle,
+                sem: Arc::new(Semaphore::new(1)),
+            },
+        );
+        let consumer = SubcConsumer { shared };
+        let subscription = consumer
+            .subscribe_route(&handle, b"watch".to_vec(), SubscribeOptions::default())
+            .await
+            .unwrap();
+        let request = rx.recv().await.unwrap().frame;
+        (consumer, rx, subscription, request)
+    }
+
+    fn watch_terminal(request: &Frame, ty: FrameType, body: Vec<u8>) -> Frame {
+        Frame::build(
+            ty,
+            Flags::new(false, Priority::Interactive, false),
+            request.header.channel,
+            request.header.epoch,
+            request.header.corr,
+            body,
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn subscription_ended_preserves_response_body_and_closed_stays_ok() {
+        let (consumer, _rx, mut subscription, request) = watch_subscribed().await;
+        let body = vec![0, 255, 128, 1, 10];
+        assert!(
+            dispatch_frame(
+                &consumer.shared,
+                1,
+                watch_terminal(&request, FrameType::Response, body.clone())
+            )
+            .await
+        );
+        subscription.closed().await.unwrap();
+        assert_eq!(
+            subscription.ended().await,
+            SubscriptionEnd::Response(body.clone())
+        );
+        subscription.unsubscribe().unwrap();
+        assert_eq!(subscription.ended().await, SubscriptionEnd::Response(body));
+        assert_eq!(subscription.events().recv().await, None);
+    }
+
+    #[tokio::test]
+    async fn subscription_ended_distinguishes_empty_response_from_stream_end() {
+        let (consumer, _rx, mut subscription, request) = watch_subscribed().await;
+        assert!(
+            dispatch_frame(
+                &consumer.shared,
+                1,
+                watch_terminal(&request, FrameType::Response, Vec::new())
+            )
+            .await
+        );
+        assert_eq!(
+            subscription.ended().await,
+            SubscriptionEnd::Response(Vec::new())
+        );
+        subscription.closed().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn subscription_ended_reports_stream_end_and_closed_stays_ok() {
+        let (consumer, _rx, mut subscription, request) = watch_subscribed().await;
+        assert!(
+            dispatch_frame(
+                &consumer.shared,
+                1,
+                watch_terminal(&request, FrameType::StreamEnd, Vec::new())
+            )
+            .await
+        );
+        assert_eq!(subscription.ended().await, SubscriptionEnd::StreamEnd);
+        subscription.closed().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn subscription_ended_reports_module_error_code_and_detail() {
+        let (consumer, _rx, mut subscription, request) = watch_subscribed().await;
+        let error = ErrorBody {
+            code: "no_grant".to_string(),
+            message: "not accepted: no grant".to_string(),
+            detail: Some(serde_json::json!({"capability": "watch"})),
+        };
+        assert!(
+            dispatch_frame(
+                &consumer.shared,
+                1,
+                watch_terminal(
+                    &request,
+                    FrameType::Error,
+                    serde_json::to_vec(&error).unwrap()
+                )
+            )
+            .await
+        );
+        assert_eq!(
+            subscription.ended().await,
+            SubscriptionEnd::Error(error.clone())
+        );
+        let CallError::Module(closed_error) = subscription.closed().await.unwrap_err() else {
+            panic!("closed must still return the module error");
+        };
+        assert_eq!(closed_error, error);
+        subscription.unsubscribe().unwrap();
+        assert_eq!(subscription.ended().await, SubscriptionEnd::Error(error));
+    }
+
+    #[tokio::test]
+    async fn subscription_ended_reports_unsubscribe_as_cancelled_and_ignores_late_terminal() {
+        let (consumer, mut rx, mut subscription, request) = watch_subscribed().await;
+        subscription.unsubscribe().unwrap();
+        subscription.unsubscribe().unwrap();
+        subscription.closed().await.unwrap();
+        assert_eq!(subscription.ended().await, SubscriptionEnd::Cancelled);
+        let cancel = rx.recv().await.unwrap().frame;
+        assert_eq!(cancel.header.ty, FrameType::Cancel);
+        assert_eq!(cancel.header.corr, request.header.corr);
+        assert!(rx.try_recv().is_err());
+        assert!(
+            dispatch_frame(
+                &consumer.shared,
+                1,
+                watch_terminal(&request, FrameType::Response, b"late".to_vec())
+            )
+            .await
+        );
+        assert_eq!(subscription.ended().await, SubscriptionEnd::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn subscription_ended_retains_route_close_reason() {
+        let (consumer, _rx, mut subscription, request) = watch_subscribed().await;
+        let push = Frame::build(FrameType::Push, Flags::new(false, Priority::Interactive, false), 0, 0, 0,
+            serde_json::to_vec(&serde_json::json!({"op": "route.closed", "module_id": "watch", "reason": "capability_denied", "channels": [request.header.channel]})).unwrap()).unwrap();
+        assert!(dispatch_frame(&consumer.shared, 1, push).await);
+        assert!(
+            dispatch_frame(
+                &consumer.shared,
+                1,
+                watch_terminal(&request, FrameType::Goodbye, Vec::new())
+            )
+            .await
+        );
+        let reason = RouteEndReason::Daemon(RouteCloseReason::CapabilityDenied);
+        assert_eq!(
+            subscription.ended().await,
+            SubscriptionEnd::RouteClosed {
+                reason: reason.clone()
+            }
+        );
+        assert_eq!(
+            subscription.closed().await.unwrap_err().close_reason(),
+            Some(&reason)
+        );
+    }
+
+    #[tokio::test]
+    async fn subscription_ended_reports_connection_loss() {
+        let (consumer, _rx, mut subscription, _request) = watch_subscribed().await;
+        consumer
+            .shared
+            .handle_generation_drop(1, "fake connection lost".to_string());
+        assert_eq!(subscription.ended().await, SubscriptionEnd::ConnectionLost);
+        assert!(subscription.closed().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn subscription_ended_waiter_wakes_on_stream_end() {
+        let (consumer, _rx, mut subscription, request) = watch_subscribed().await;
+        let (end, dispatched) = tokio::join!(subscription.ended(), async {
+            tokio::task::yield_now().await;
+            dispatch_frame(
+                &consumer.shared,
+                1,
+                watch_terminal(&request, FrameType::StreamEnd, Vec::new()),
+            )
+            .await
+        });
+        assert!(dispatched);
+        assert_eq!(end, SubscriptionEnd::StreamEnd);
+        subscription.closed().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn subscription_ended_reports_backpressure_without_hiding_closed_error() {
+        let (consumer, _rx, mut subscription, request) = watch_subscribed().await;
+        for _ in 0..=DEFAULT_SUBSCRIPTION_EVENT_BUFFER {
+            assert!(
+                dispatch_frame(
+                    &consumer.shared,
+                    1,
+                    watch_terminal(&request, FrameType::StreamData, vec![1])
+                )
+                .await
+            );
+        }
+        assert_eq!(subscription.ended().await, SubscriptionEnd::Backpressure);
+        assert!(matches!(
+            subscription.closed().await,
+            Err(CallError::SubscriptionBackpressure(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn subscription_ended_reports_client_close_as_route_closed_by_caller() {
+        let (consumer, _rx, mut subscription, _request) = watch_subscribed().await;
+        consumer.close().await;
+        assert_eq!(
+            subscription.ended().await,
+            SubscriptionEnd::RouteClosed {
+                reason: RouteEndReason::ClosedByCaller
+            }
+        );
+        assert!(subscription.closed().await.is_err());
+    }
+
     #[test]
     fn drain_pending_channel_can_skip_subscriptions() {
         let mut pending = HashMap::new();
@@ -8338,12 +8636,19 @@ mod tests {
 
         let (events_tx, _events_rx) = mpsc::channel(1);
         let (closed_tx, _closed_rx) = oneshot::channel();
+        let (ended_tx, _ended_rx) = watch::channel(None);
         let permit = Arc::new(Semaphore::new(1))
             .try_acquire_owned()
             .expect("test semaphore permit should be available");
         pending.insert(
             subscription_key,
-            PendingEntry::subscription(events_tx, closed_tx, permit, Priority::Interactive),
+            PendingEntry::subscription(
+                events_tx,
+                closed_tx,
+                ended_tx,
+                permit,
+                Priority::Interactive,
+            ),
         );
 
         let drained = drain_pending_handle(&mut pending, handle, false);

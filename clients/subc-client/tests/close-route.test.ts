@@ -61,6 +61,7 @@ interface FakeState {
   dataGate?: Promise<void>;
   holdRequests?: boolean;
   dataRequests?: number;
+  lastDataRequest?: Frame;
   nextChannel?: number;
 }
 
@@ -346,6 +347,102 @@ describe("SubcClient.closeRoute", () => {
   });
 });
 
+describe("subscription ended", () => {
+  async function subscribed() {
+    const { client, daemon } = await connectClient();
+    daemon.state.holdRequests = true;
+    const handle = await client.routeOpen(TOOL_TARGET, IDENTITY);
+    const subscription = client.subscribe(handle, { watch: true }, () => {});
+    await waitFor(() => daemon.state.lastDataRequest !== undefined, "watch request received");
+    const request = daemon.state.lastDataRequest!;
+    const terminal = (ty: FrameType, body: Uint8Array = new Uint8Array()) => buildFrame(
+      ty, buildFlags(false, Priority.Interactive, false),
+      request.header.channel, request.header.epoch, request.header.corr, body,
+    );
+    return { client, daemon, handle, subscription, terminal };
+  }
+
+  test("subscription ended preserves terminal Response bytes and closed still resolves", async () => {
+    const { client, daemon, subscription, terminal } = await subscribed();
+    try {
+      const body = Uint8Array.from([0, 255, 128, 1, 10]);
+      await daemon.send(terminal(FrameType.Response, body));
+      expect(await subscription.closed).toBeUndefined();
+      const end = await subscription.ended;
+      expect(end.kind).toBe("response");
+      if (end.kind !== "response") throw new Error(`unexpected end: ${end.kind}`);
+      expect(Array.from(end.body)).toEqual(Array.from(body));
+      subscription.unsubscribe();
+      expect(await subscription.ended).toBe(end);
+    } finally { client.close(); }
+  });
+
+  test("subscription ended distinguishes an empty Response from STREAM_END", async () => {
+    const { client, daemon, subscription, terminal } = await subscribed();
+    try {
+      await daemon.send(terminal(FrameType.Response));
+      expect(await subscription.ended).toEqual({ kind: "response", body: new Uint8Array() });
+      expect(await subscription.closed).toBeUndefined();
+    } finally { client.close(); }
+  });
+
+  test("subscription ended reports STREAM_END and closed still resolves", async () => {
+    const { client, daemon, subscription, terminal } = await subscribed();
+    try {
+      await daemon.send(terminal(FrameType.StreamEnd));
+      expect(await subscription.ended).toEqual({ kind: "stream_end" });
+      expect(await subscription.closed).toBeUndefined();
+    } finally { client.close(); }
+  });
+
+  test("subscription ended reports module ERROR code and detail without rejecting", async () => {
+    const { client, daemon, subscription, terminal } = await subscribed();
+    const closed = subscription.closed.catch((err: unknown) => err);
+    try {
+      const error = { code: "no_grant", message: "not accepted: no grant", detail: { capability: "watch" } };
+      await daemon.send(terminal(FrameType.Error, encodeJson(error)));
+      expect(await subscription.ended).toEqual({ kind: "error", ...error });
+      expect(await closed).toBeInstanceOf(SubcError);
+      expect(await closed).toMatchObject(error);
+      subscription.unsubscribe();
+      expect(await subscription.ended).toEqual({ kind: "error", ...error });
+    } finally { client.close(); }
+  });
+
+  test("subscription ended reports caller unsubscribe as cancelled and ignores a late terminal", async () => {
+    const { client, daemon, subscription, terminal } = await subscribed();
+    try {
+      subscription.unsubscribe();
+      subscription.unsubscribe();
+      expect(await subscription.closed).toBeUndefined();
+      expect(await subscription.ended).toEqual({ kind: "cancelled" });
+      await daemon.send(terminal(FrameType.Response, encodeJson({ late: true })));
+      expect(await subscription.ended).toEqual({ kind: "cancelled" });
+    } finally { client.close(); }
+  });
+
+  test("subscription ended retains the route close reason", async () => {
+    const { client, daemon, handle, subscription } = await subscribed();
+    const closed = subscription.closed.catch((err: unknown) => err);
+    try {
+      await daemon.send(lifecyclePush("capability_denied", [handle.channel]));
+      await daemon.send(goodbye(handle.channel));
+      expect(await subscription.ended).toEqual({ kind: "route_closed", reason: "capability_denied" });
+      expect(await closed).toMatchObject({ code: "route_closed", closeReason: "capability_denied" });
+    } finally { client.close(); }
+  });
+
+  test("subscription ended reports connection loss without rejecting", async () => {
+    const { client, daemon, subscription } = await subscribed();
+    const closed = subscription.closed.catch((err: unknown) => err);
+    try {
+      await daemon.stop();
+      expect(await subscription.ended).toEqual({ kind: "connection_lost" });
+      expect(await closed).toBeInstanceOf(Error);
+    } finally { client.close(); }
+  });
+});
+
 async function connectClient(): Promise<{ client: SubcClient; daemon: FakeDaemon }> {
   const daemon = await startFakeDaemon();
   const { connFile } = tempConnectionFile();
@@ -412,6 +509,7 @@ async function handleConnection(socket: Socket, state: FakeState): Promise<void>
     }
 
     state.dataRequests = (state.dataRequests ?? 0) + 1;
+    state.lastDataRequest = frame;
     if (state.holdRequests) continue;
     // Data request on a route channel: echo it back (after the optional drain gate).
     if (state.dataGate) await state.dataGate;

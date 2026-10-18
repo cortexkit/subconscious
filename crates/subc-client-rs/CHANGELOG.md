@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.30.1
+
+- Add `Subscription::ended()` and the non-exhaustive `SubscriptionEnd` enum to retain terminal Response bytes, module `ErrorBody`, route close reasons, connection loss, cancellation and event-channel backpressure. The independent, repeatable waiter does not consume the existing one-shot `closed()` future or read frames; `closed()` keeps its existing `Result<(), CallError>` behavior.
+
 ## 0.30.0
 
 - Move to subc-control 0.32. Breaking because the re-exported `PendingReloadVerdict` gained the `spec` field; no other change.

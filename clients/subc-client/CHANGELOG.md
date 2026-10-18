@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.22.2
+
+- Add `Subscription.ended: Promise<SubscriptionEnd>`, which always resolves with the first terminal outcome: Response bytes (including an empty body), STREAM_END, module ERROR code/message/detail, route close reason, connection loss or caller unsubscribe. `closed: Promise<void>` retains its existing resolve/reject behavior.
+
 ## 0.22.1
 
 - Pin `scope_epoch_in_use` as terminal alongside scope bind-proof refusals in the shared decision table.

@@ -334,18 +334,29 @@ export class SubcCallError extends Error {
   }
 }
 
+/** The first terminal outcome of a subscription. */
+export type SubscriptionEnd =
+  | { kind: "response"; body: Uint8Array }
+  | { kind: "stream_end" }
+  | { kind: "error"; code: SubcError["code"]; message: string; detail?: unknown }
+  | { kind: "route_closed"; reason: RouteEndReason }
+  | { kind: "connection_lost" }
+  | { kind: "cancelled" };
+
 /**
  * A live subscription to a provider's event stream, riding a single held-open
  * request. `onEvent` fires for each StreamData frame; `closed` resolves when the
- * provider ends the stream (StreamEnd) or the consumer unsubscribes, and rejects on
+ * provider ends the stream (Response or StreamEnd) or the consumer unsubscribes, and rejects on
  * an Error terminal or a route GOODBYE. `unsubscribe` cancels the held-open request
  * so the provider unwinds.
  */
 export interface Subscription {
   /** Cancel the subscription: sends Cancel on the held-open request; idempotent. */
   unsubscribe(): void;
-  /** Resolves on StreamEnd or local unsubscribe; rejects on an Error terminal or route close. */
+  /** Resolves on Response, StreamEnd or local unsubscribe; rejects on an Error terminal or route close. */
   readonly closed: Promise<void>;
+  /** Always resolves with the first terminal outcome, including a Response body. */
+  readonly ended: Promise<SubscriptionEnd>;
 }
 
 export class SubcError extends Error {
@@ -378,7 +389,7 @@ function requireBinaryBody(body: unknown): Uint8Array {
 interface Pending {
   handle: RouteHandle | null;
   resolve: (frame: Frame) => void;
-  reject: (err: Error) => void;
+  reject: (err: Error, frame?: Frame) => void;
   onProgress?: (body: Uint8Array) => void;
   timer: ReturnType<typeof setTimeout> | null;
   classifyFailure?: (err: Error) => Error;
@@ -956,16 +967,37 @@ export class SubcClient {
 
     let subscriptionPending: Pending | null = null;
     let resolveClosed: (() => void) | null = null;
+    let resolveEnded!: (end: SubscriptionEnd) => void;
+    const ended = new Promise<SubscriptionEnd>((resolve) => { resolveEnded = resolve; });
+    const endFailure = (err: Error, frame?: Frame): void => {
+      if (frame?.header.ty === FrameType.Error) {
+        const error = err as SubcError;
+        resolveEnded({ kind: "error", code: error.code, message: error.message, detail: error.detail });
+      } else if (err instanceof SubcError && err.closeReason && err.closeReason !== "connection_lost") {
+        resolveEnded({ kind: "route_closed", reason: err.closeReason });
+      } else {
+        resolveEnded({ kind: "connection_lost" });
+      }
+    };
     const closed = new Promise<void>((resolve, reject) => {
       if (this.closedErr) {
+        endFailure(this.closedErr);
         reject(this.closedErr);
         return;
       }
       resolveClosed = resolve;
       subscriptionPending = {
         handle,
-        resolve: () => resolve(),
-        reject,
+        resolve: (frame) => {
+          resolveEnded(frame.header.ty === FrameType.Response
+            ? { kind: "response", body: frame.body }
+            : { kind: "stream_end" });
+          resolve();
+        },
+        reject: (err, frame) => {
+          endFailure(err, frame);
+          reject(err);
+        },
         onProgress: onEvent,
         timer: null,
         subscription: true,
@@ -1003,10 +1035,13 @@ export class SubcClient {
     const unsubscribe = (): void => {
       if (cancelled) return;
       cancelled = true;
-      if (subscriptionPending && resolveClosed) this.settle(key, subscriptionPending, resolveClosed);
+      if (subscriptionPending && resolveClosed) this.settle(key, subscriptionPending, () => {
+        resolveEnded({ kind: "cancelled" });
+        resolveClosed?.();
+      });
       if (this.isLiveHandle(handle)) this.cancel(handle, corr, priority);
     };
-    return { unsubscribe, closed };
+    return { unsubscribe, closed, ended };
   }
 
   /**
@@ -1894,7 +1929,7 @@ export class SubcClient {
           this.settle(key, pending, () => pending.resolve(frame));
           return;
         case FrameType.Error:
-          this.settle(key, pending, () => pending.reject(this.errorFromFrame(frame)));
+          this.settle(key, pending, () => pending.reject(this.errorFromFrame(frame), frame));
           return;
         default:
           return;

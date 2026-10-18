@@ -37,6 +37,7 @@ export {
   type SubcCallErrorKind,
   type SubscribeOptions,
   type Subscription,
+  type SubscriptionEnd,
   type CloseRouteOptions,
   type ManagedCloseRouteOptions,
   type RoutePollKind,

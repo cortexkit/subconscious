@@ -1,4 +1,4 @@
-# Fed QR pairing v1 test vectors
+# Fed QR pairing v1.1 test vectors
 
 **These bytes are the authority implementers test against.** Both Rust callosum
 and Swift SubcFed must consume them, not generate their own expected bytes. This
@@ -10,24 +10,25 @@ Never use these keys or this generator for a real pairing ceremony.
 
 | File | Contents |
 | --- | --- |
-| `generate.py` | Spec-literal revision-34 reference, independent cross-check, QR fixture parser, and 9 named tests. |
+| `generate.py` | Noise revision-34 reference, independent handshake/transport cross-check, frame and QR codecs, and 13 named tests. |
 | `requirements.txt` | Exact versions: `cryptography==46.0.5`, `noiseprotocol==0.3.1`. |
 | `bip39-english.txt` | Pinned 2048-word BIP-39 English list, zero-based indices. |
 | `handshakes.json` | Three complete IKpsk1 handshakes and a same-input plain-IK control, all raw inputs, PSK extract/expand, three-output HKDF intermediate values, messages, final hashes and both split keys. |
+| `frames.json` | Thirteen post-handshake scenarios (16 transport records), including result acceptance, strict-header refusals, a dropped stray phone frame, and plain-IK violations before and after hello. |
 | `responder.json` | Eight negative state-machine fixtures, a foreign-then-legitimate dial sequence, a fixed dummy PSK, and three refusal paths with identical ordered DH/HKDF/AEAD traces measured in the reference. |
 | `words.json` | Positive confirmations, a pair of complete transcripts whose 44-bit confirmations differ in exactly one bit, a hand-built digest for bit extraction, and a hand-built handshake hash for the complete derivation. |
 | `qr.json` | Four accepted payloads and 27 refusals, including all design-note refusals. Entry points distinguish scan text from direct decoded-payload tests; exact lengths are included. |
 | `SHA256SUMS` | SHA-256 of every regular file in this directory except itself, in filename order. |
 
 All binary JSON fields are lowercase hex unless explicitly described otherwise.
-Message payloads are empty. Split key names describe wire direction, not local
+Handshake message payloads are empty. Split key names describe wire direction, not local
 send/receive order: `initiator_to_responder` is Noise `c1`, and
 `responder_to_initiator` is `c2`. Static and ephemeral private fields are raw
 32-byte X25519 inputs (X25519 performs its normal scalar clamping).
 
 ## Regeneration and verification
 
-Requires Python 3.9+; verified with Python 3.14.4. Run from the repository root:
+Requires Python 3.9+; verified with Python 3.9.6 and 3.14.4. Run from the repository root:
 
 ```sh
 python3 -m venv /tmp/fed-pairing-v1-venv
@@ -37,7 +38,7 @@ python3 -m venv /tmp/fed-pairing-v1-venv
 (cd vectors/fed-pairing-v1 && shasum -a 256 -c SHA256SUMS)
 ```
 
-The generator always executes the second implementation and all nine tests,
+The generator always executes independent `noiseprotocol` 0.3.1 and all thirteen tests,
 even in `--check` mode. It refuses optimized Python (`-O`), which would disable
 assertions. `--check` verifies byte equality without rewriting files. No clock,
 random entropy, network, platform-specific formatting or run timestamp affects
@@ -89,7 +90,8 @@ additional test checks the application PSK derivation and the complete 96-byte
 three-output HKDF against `cryptography`'s RFC-5869 HKDF.
 
 Neither callosum's `snow` nor SubcFed generated any bytes. SubcFed's existing
-Noise sources were consulted only for the protocol/prologue naming conventions.
+Noise sources were consulted for protocol/prologue naming conventions; both
+implementations' frame and transport codecs also define the v1.1 encoding below.
 
 ### Design-note deviations and choices
 
@@ -333,3 +335,146 @@ report the supplied input lengths where applicable.
 declared independently of the parser and the tests assert the parser throws
 that reason. The hints are dial-only data, never a pin or saved address; these
 byte fixtures do not replace the required signed account-key check or ceremony.
+
+## Post-handshake result frames (v1.1)
+
+The `fed-pairing-v1.1` release extends `fed-pairing-v1` without changing any
+handshake, responder, confirmation-word or QR bytes. The directory name stays
+`fed-pairing-v1` so both consumers can update their pin without relocating files.
+The release maintainer, not this generator, creates the new tag.
+
+A pairing session has **no hello** after IKpsk1 message 2. While the computer is
+waiting for the four-word decision, the phone sends nothing. The computer's only
+application frame is one of these empty-body results, followed by closing:
+
+* `{"type":"pairing_result","outcome":"granted"}` → `granted`;
+* `{"type":"bye","code":"fed_pairing_declined"}` → `declined`;
+* `{"type":"bye","code":"fed_pairing_expired"}` → `expired`.
+
+These displayed objects describe fields, not their serialized order. The encoded
+headers are compact UTF-8 JSON with keys in lexicographic order, e.g.
+`{"outcome":"granted","type":"pairing_result"}`. Each plaintext frame is:
+
+```text
+uint32le(header_UTF8_byte_length) || header_UTF8 || uint32le(body_byte_length) || body
+```
+
+Each plaintext frame fits in **one** Noise transport record. A record is
+`uint32le(ciphertext_byte_length) || ciphertext_with_16_byte_tag`, with a maximum
+ciphertext length of 65535 and maximum plaintext length of 65519. The two length
+layers both use four-byte little-endian lengths. Transport associated data is
+empty; the length prefix is outside the ciphertext and is not associated data.
+The ChaChaPoly nonce is `00000000 || uint64le(counter)` and is **not transmitted**.
+
+### Reading `frames.json`
+
+Every case starts a separate test session immediately after its referenced
+`handshake_id`'s message 2. Both directional transport counters start at zero;
+**never concatenate these independent cases into one session**. Reusing test
+keys and nonce zero across fixtures is intentional and unsafe outside tests.
+The pairing fixtures use `one_bit_a`; both normal-session controls use
+`plain_ik_control`. Their raw keys remain solely in `handshakes.json`.
+
+Each case declares `session`, ordered `records`, and an independently stated
+`expected.phone_outcome` plus `expected.dropped_phone_frames`. Each record gives:
+
+* `direction`, `split_key`, numeric `nonce`, and the full AEAD `nonce_bytes_hex`;
+* `header`, `body_hex`, and the codec-generated `plaintext_frame_hex`;
+* `ciphertext_hex` (including the tag) and `transport_record_hex` (including the
+  four-byte record length).
+
+The duplicate-key case has `header: null` and lossless `header_pairs` instead.
+The encoder serializes this list of fields using the same JSON scalar encoding
+and frame lengths as ordinary headers; it never embeds a hand-written frame.
+It emits `outcome` twice with the **same** value, so a first-wins or last-wins
+parser would incorrectly grant. Strict JSON decoding must reject it before
+result validation.
+
+`computer_to_phone` uses the computer's sending key, Noise `c2` /
+`responder_to_initiator`; `phone_to_computer` uses `c1` /
+`initiator_to_responder`. The stray-phone case injects an encrypted keepalive,
+which the computer authenticates/decrypts and drops at the application layer,
+then sends granted. Its counters are `[0, 0]`, **not** `[0, 1]`: receiving does not
+advance the computer's sending CipherState. This injected violation does not
+change the rule that a conforming phone sends nothing while pending.
+
+The nine `protocol_violation` cases cover a result with an extra field, a
+nonempty body, a non-granted outcome, or a duplicate outcome; a computer
+keepalive instead of a result; a pairing bye with an extra `message`; a bye with
+non-pairing code `fed_goodbye`; and `pairing_result` on a normal plain-IK session
+both before and after hello negotiation.
+Only the exact empty-body granted/declined/expired headers are valid here. These
+fixtures specify phone validation and pending-session behavior, not a complete
+implementation of normal-session framing or the computer's enrollment store.
+
+The two plain-IK controls declare `isolates` to distinguish their rules:
+`pairing_result_on_plain_ik` sends the result immediately at computer nonce 0
+and violates the hello-first rule. `pairing_result_after_plain_ik_hello` first
+exchanges minimum-schema hello frames at nonce 0 in each direction, then sends
+the result at computer nonce 1. The latter isolates the explicit prohibition on
+`pairing_result` in an already-negotiated ordinary session; ignoring unknown
+types after hello must not silently discard this forbidden frame.
+
+The hello builder uses only the nine fields needed by both codecs: `type`,
+`versions`, `features`, `max_body_bytes`, `max_in_flight`, `keepalive_interval_ms`,
+`incarnation`, `ledger_epoch`, and `device_name`, with an empty body. Versions are
+`[1]`, features are empty, and limits use the permitted minima 4096/1/1000.
+Incarnations, ledger epochs and names are fixed test values. The schema and
+bounds are from callosum `docs/fed-wire.md:173-206` and
+`crates/fed-core/src/frame.rs:788-805`, plus Swift
+`Framing/FedFrameCodec.swift:403-428`. Rust permits omitting `device_name`, but
+Swift requires it; retaining it is the smallest interoperable header. This is a
+schema optionality difference, not a JSON byte-encoding disagreement.
+
+`test_frame_records_independent_noiseprotocol` replays the source handshake with
+fresh independent `noiseprotocol` 0.3.1 peers for **every case**. For every record,
+including the stray phone record and all application-invalid headers, it checks
+the sending/receiving nonce, independent ciphertext, outer length prefix,
+receiver decryption, decoded header and body. The duplicate-key case is decoded
+losslessly and then required to fail strict decoding. The other frame tests pin
+canonical header strings, both frame lengths, directional key identifiers, the
+plain-IK source, and independently declared phone outcomes.
+
+### Encoding authorities and revision boundary
+
+The companion callosum repository was read at
+`34180020dd9305d55c880efd142db4d0155796b1`. Its history adds pairing in
+`e005905634f176ba1217085adde8b23f9788dc7e`, then tightens the pairing bye keys,
+codes and timeouts in `3418002`; the latter amendment is included here.
+
+* Pairing behavior and exact result schemas: callosum
+  `docs/fed-wire.md:87-107`; strict duplicate-key rejection:
+  `docs/fed-wire.md:142-146`. The outer record format is at
+  `docs/fed-wire.md:24-27`, and the plaintext frame format at
+  `docs/fed-wire.md:124-140`.
+* Swift frame layout:
+  `clients/subc-client-swift/Sources/SubcFed/Framing/FedFrameCodec.swift:226-260`,
+  with little-endian length emission at `:675-677`. JSON comes from
+  `JSONModel/FedJSONValue.swift:329-331`; its writer sorts object keys and joins
+  with no whitespace at `:429-443` (all paths under the same SubcFed source root).
+* Rust frame layout: callosum `crates/fed-core/src/frame.rs:1234-1243`.
+  Its JSON header builders serialize `serde_json::Value`/`Map` with `to_vec`,
+  e.g. `crates/fed-core/src/session.rs:1600-1629`. `Cargo.toml:44` and
+  `crates/fed-core/Cargo.toml:12` use serde_json's default sorted-map behavior,
+  without `preserve_order`. For these ASCII fields and integer/array values, this agrees
+  with Swift's compact, key-sorted bytes. **No Swift/Rust header-serialization
+  disagreement was found.**
+* Outer record prefix: Swift `Carrier/OuterRecordCodec.swift:8-26`; Rust
+  `crates/fed-core/src/transport.rs:382-403`. The 65519-byte plaintext cap follows
+  Swift `Noise/NoiseRecordSession.swift:35-40` and Rust
+  `crates/fed-core/src/transport.rs:31-38`.
+* Empty transport AD and independent nonce advancement: Swift
+  `Noise/NoiseRecordSession.swift:144-179`; nonce byte layout:
+  `Noise/NoiseIK.swift:405-409`. The phone's send/receive split-key mapping is
+  `Noise/NoiseIK.swift:226-229`. The independent Noise peers additionally check
+  both roles' raw split keys before checking each transport record.
+
+The pairing amendment is a **specification**, not evidence that either pinned
+client already implements pairing-session validation. In particular, callosum's
+ordinary parser accepts general byes and treats `pairing_result` as unknown
+(`crates/fed-core/src/frame.rs:806-809,927-930`); its ordinary post-hello session
+ignores unknown types (`crates/fed-core/src/session.rs:1355-1361`). The v1.1
+violation expectations intentionally follow the new pairing specification,
+not that generic ordinary-session behavior. Consumers must apply the fixtures
+to their pairing-aware paths. No production client was changed or executed by
+this generator.

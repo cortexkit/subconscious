@@ -1,0 +1,420 @@
+{
+  "test_values_only": true,
+  "version": "fed-pairing-v1.1",
+  "each_case_starts_after_message2_with_fresh_split_nonces": true,
+  "encoding": {
+    "frame": "uint32le(header_length) || UTF-8 JSON || uint32le(body_length) || body",
+    "header_json": "compact, lexicographically sorted keys; duplicate keys only in the malformed case",
+    "record": "uint32le(ciphertext_length) || ciphertext_with_tag",
+    "max_ciphertext_bytes": 65535,
+    "max_plaintext_bytes": 65519,
+    "associated_data_hex": "",
+    "nonce": "00000000 || uint64le(counter); not transmitted"
+  },
+  "pairing_session": {
+    "computer_sends_hello": false,
+    "phone_while_pending": "send_nothing",
+    "computer_drops_stray_phone_frames": true,
+    "computer_closes_after_result": true
+  },
+  "cases": [
+    {
+      "id": "granted",
+      "handshake_id": "one_bit_a",
+      "session": "pairing",
+      "records": [
+        {
+          "direction": "computer_to_phone",
+          "split_key": "responder_to_initiator",
+          "nonce": 0,
+          "nonce_bytes_hex": "000000000000000000000000",
+          "header": {
+            "type": "pairing_result",
+            "outcome": "granted"
+          },
+          "body_hex": "",
+          "plaintext_frame_hex": "2d0000007b226f7574636f6d65223a226772616e746564222c2274797065223a2270616972696e675f726573756c74227d00000000",
+          "ciphertext_hex": "a0be3bef0a1c65a4b635b0d1c13df5b3bb4afdb20bd44938c3ece5d532295ab1d4538f030c153bab0898692a29f5db58de87f69065e4cffa42ac446a79fddf6400ad7bcc25",
+          "transport_record_hex": "45000000a0be3bef0a1c65a4b635b0d1c13df5b3bb4afdb20bd44938c3ece5d532295ab1d4538f030c153bab0898692a29f5db58de87f69065e4cffa42ac446a79fddf6400ad7bcc25"
+        }
+      ],
+      "expected": {
+        "phone_outcome": "granted",
+        "dropped_phone_frames": 0
+      }
+    },
+    {
+      "id": "declined",
+      "handshake_id": "one_bit_a",
+      "session": "pairing",
+      "records": [
+        {
+          "direction": "computer_to_phone",
+          "split_key": "responder_to_initiator",
+          "nonce": 0,
+          "nonce_bytes_hex": "000000000000000000000000",
+          "header": {
+            "type": "bye",
+            "code": "fed_pairing_declined"
+          },
+          "body_hex": "",
+          "plaintext_frame_hex": "2c0000007b22636f6465223a226665645f70616972696e675f6465636c696e6564222c2274797065223a22627965227d00000000",
+          "ciphertext_hex": "a1be3bef0a1c69bea633fd868679aaf58348fdb50dd8437db0aaf4cf2e2516ee9201c2480a0525a975d02e3b25fc8d07a387f690c604e8cb82fbe35ff937d3e562ccda03",
+          "transport_record_hex": "44000000a1be3bef0a1c69bea633fd868679aaf58348fdb50dd8437db0aaf4cf2e2516ee9201c2480a0525a975d02e3b25fc8d07a387f690c604e8cb82fbe35ff937d3e562ccda03"
+        }
+      ],
+      "expected": {
+        "phone_outcome": "declined",
+        "dropped_phone_frames": 0
+      }
+    },
+    {
+      "id": "expired",
+      "handshake_id": "one_bit_a",
+      "session": "pairing",
+      "records": [
+        {
+          "direction": "computer_to_phone",
+          "split_key": "responder_to_initiator",
+          "nonce": 0,
+          "nonce_bytes_hex": "000000000000000000000000",
+          "header": {
+            "type": "bye",
+            "code": "fed_pairing_expired"
+          },
+          "body_hex": "",
+          "plaintext_frame_hex": "2b0000007b22636f6465223a226665645f70616972696e675f65787069726564222c2274797065223a22627965227d00000000",
+          "ciphertext_hex": "a6be3bef0a1c69bea633fd868679aaf58348fdb50dd8437db0abe9dc2b3e1defd40fcc1e070c30ee6dc86e2039bbd27aa387f656c1405412b1aee64dffb18f45cfbfaf",
+          "transport_record_hex": "43000000a6be3bef0a1c69bea633fd868679aaf58348fdb50dd8437db0abe9dc2b3e1defd40fcc1e070c30ee6dc86e2039bbd27aa387f656c1405412b1aee64dffb18f45cfbfaf"
+        }
+      ],
+      "expected": {
+        "phone_outcome": "expired",
+        "dropped_phone_frames": 0
+      }
+    },
+    {
+      "id": "stray_phone_then_granted",
+      "handshake_id": "one_bit_a",
+      "session": "pairing",
+      "records": [
+        {
+          "direction": "phone_to_computer",
+          "split_key": "initiator_to_responder",
+          "nonce": 0,
+          "nonce_bytes_hex": "000000000000000000000000",
+          "header": {
+            "type": "keepalive"
+          },
+          "body_hex": "",
+          "plaintext_frame_hex": "140000007b2274797065223a226b656570616c697665227d00000000",
+          "ciphertext_hex": "96e91f0d869f9101b0394f426f59286af8666a5d99b26068c55079d95cb88f9201632aaeef323450d2d147b0",
+          "transport_record_hex": "2c00000096e91f0d869f9101b0394f426f59286af8666a5d99b26068c55079d95cb88f9201632aaeef323450d2d147b0"
+        },
+        {
+          "direction": "computer_to_phone",
+          "split_key": "responder_to_initiator",
+          "nonce": 0,
+          "nonce_bytes_hex": "000000000000000000000000",
+          "header": {
+            "type": "pairing_result",
+            "outcome": "granted"
+          },
+          "body_hex": "",
+          "plaintext_frame_hex": "2d0000007b226f7574636f6d65223a226772616e746564222c2274797065223a2270616972696e675f726573756c74227d00000000",
+          "ciphertext_hex": "a0be3bef0a1c65a4b635b0d1c13df5b3bb4afdb20bd44938c3ece5d532295ab1d4538f030c153bab0898692a29f5db58de87f69065e4cffa42ac446a79fddf6400ad7bcc25",
+          "transport_record_hex": "45000000a0be3bef0a1c65a4b635b0d1c13df5b3bb4afdb20bd44938c3ece5d532295ab1d4538f030c153bab0898692a29f5db58de87f69065e4cffa42ac446a79fddf6400ad7bcc25"
+        }
+      ],
+      "expected": {
+        "phone_outcome": "granted",
+        "dropped_phone_frames": 1
+      }
+    },
+    {
+      "id": "pairing_result_extra_field",
+      "handshake_id": "one_bit_a",
+      "session": "pairing",
+      "records": [
+        {
+          "direction": "computer_to_phone",
+          "split_key": "responder_to_initiator",
+          "nonce": 0,
+          "nonce_bytes_hex": "000000000000000000000000",
+          "header": {
+            "type": "pairing_result",
+            "outcome": "granted",
+            "extra": "x"
+          },
+          "body_hex": "",
+          "plaintext_frame_hex": "390000007b226578747261223a2278222c226f7574636f6d65223a226772616e746564222c2274797065223a2270616972696e675f726573756c74227d00000000",
+          "ciphertext_hex": "b4be3bef0a1c6fa9b624be9e9e3db7b3f01af3a90bd242778aecab8e253e19e582468a48525e21b5278f2e637ee9ce13d1ee98f73aea7615f3679f073a55a3f7a3c1514161c4bea19c9191b3f75cc6852f",
+          "transport_record_hex": "51000000b4be3bef0a1c6fa9b624be9e9e3db7b3f01af3a90bd242778aecab8e253e19e582468a48525e21b5278f2e637ee9ce13d1ee98f73aea7615f3679f073a55a3f7a3c1514161c4bea19c9191b3f75cc6852f"
+        }
+      ],
+      "expected": {
+        "phone_outcome": "protocol_violation",
+        "dropped_phone_frames": 0
+      }
+    },
+    {
+      "id": "pairing_result_with_body",
+      "handshake_id": "one_bit_a",
+      "session": "pairing",
+      "records": [
+        {
+          "direction": "computer_to_phone",
+          "split_key": "responder_to_initiator",
+          "nonce": 0,
+          "nonce_bytes_hex": "000000000000000000000000",
+          "header": {
+            "type": "pairing_result",
+            "outcome": "granted"
+          },
+          "body_hex": "78",
+          "plaintext_frame_hex": "2d0000007b226f7574636f6d65223a226772616e746564222c2274797065223a2270616972696e675f726573756c74227d0100000078",
+          "ciphertext_hex": "a0be3bef0a1c65a4b635b0d1c13df5b3bb4afdb20bd44938c3ece5d532295ab1d4538f030c153bab0898692a29f5db58de86f69065e07bf43804217321b640c7b8dd21f08edb",
+          "transport_record_hex": "46000000a0be3bef0a1c65a4b635b0d1c13df5b3bb4afdb20bd44938c3ece5d532295ab1d4538f030c153bab0898692a29f5db58de86f69065e07bf43804217321b640c7b8dd21f08edb"
+        }
+      ],
+      "expected": {
+        "phone_outcome": "protocol_violation",
+        "dropped_phone_frames": 0
+      }
+    },
+    {
+      "id": "pairing_result_wrong_outcome",
+      "handshake_id": "one_bit_a",
+      "session": "pairing",
+      "records": [
+        {
+          "direction": "computer_to_phone",
+          "split_key": "responder_to_initiator",
+          "nonce": 0,
+          "nonce_bytes_hex": "000000000000000000000000",
+          "header": {
+            "type": "pairing_result",
+            "outcome": "declined"
+          },
+          "body_hex": "",
+          "plaintext_frame_hex": "2e0000007b226f7574636f6d65223a226465636c696e6564222c2274797065223a2270616972696e675f726573756c74227d00000000",
+          "ciphertext_hex": "a3be3bef0a1c65a4b635b0d1c13df5b3b85dffb016df487ecde2b3d83b3c1da9cc019e0b170e3ca230b57e3c2fecc30e81faf69065983d6f02b1243dc45725ddf59961e7f979",
+          "transport_record_hex": "46000000a3be3bef0a1c65a4b635b0d1c13df5b3b85dffb016df487ecde2b3d83b3c1da9cc019e0b170e3ca230b57e3c2fecc30e81faf69065983d6f02b1243dc45725ddf59961e7f979"
+        }
+      ],
+      "expected": {
+        "phone_outcome": "protocol_violation",
+        "dropped_phone_frames": 0
+      }
+    },
+    {
+      "id": "computer_keepalive",
+      "handshake_id": "one_bit_a",
+      "session": "pairing",
+      "records": [
+        {
+          "direction": "computer_to_phone",
+          "split_key": "responder_to_initiator",
+          "nonce": 0,
+          "nonce_bytes_hex": "000000000000000000000000",
+          "header": {
+            "type": "keepalive"
+          },
+          "body_hex": "",
+          "plaintext_frame_hex": "140000007b2274797065223a226b656570616c697665227d00000000",
+          "ciphertext_hex": "99be3bef0a1c7ea8b233fd868674aaf4ac59f0b509d40f67efce91aca6e26575881614668036bdd06e995a2c",
+          "transport_record_hex": "2c00000099be3bef0a1c7ea8b233fd868674aaf4ac59f0b509d40f67efce91aca6e26575881614668036bdd06e995a2c"
+        }
+      ],
+      "expected": {
+        "phone_outcome": "protocol_violation",
+        "dropped_phone_frames": 0
+      }
+    },
+    {
+      "id": "pairing_result_on_plain_ik",
+      "handshake_id": "plain_ik_control",
+      "session": "plain_ik",
+      "records": [
+        {
+          "direction": "computer_to_phone",
+          "split_key": "responder_to_initiator",
+          "nonce": 0,
+          "nonce_bytes_hex": "000000000000000000000000",
+          "header": {
+            "type": "pairing_result",
+            "outcome": "granted"
+          },
+          "body_hex": "",
+          "plaintext_frame_hex": "2d0000007b226f7574636f6d65223a226772616e746564222c2274797065223a2270616972696e675f726573756c74227d00000000",
+          "ciphertext_hex": "89dfabb5a7eb12335747ae180e1caade3e9d06edb2ab73e71cdc0e095ecffe2186e1d359b9fdda8271ebd6876fa690cb47ccac17599865c4579243ed87aa89318da81d450e",
+          "transport_record_hex": "4500000089dfabb5a7eb12335747ae180e1caade3e9d06edb2ab73e71cdc0e095ecffe2186e1d359b9fdda8271ebd6876fa690cb47ccac17599865c4579243ed87aa89318da81d450e"
+        }
+      ],
+      "expected": {
+        "phone_outcome": "protocol_violation",
+        "dropped_phone_frames": 0
+      },
+      "isolates": "normal_session_requires_hello_first"
+    },
+    {
+      "id": "pairing_result_after_plain_ik_hello",
+      "handshake_id": "plain_ik_control",
+      "session": "plain_ik",
+      "isolates": "normal_session_forbids_pairing_result_after_hello",
+      "records": [
+        {
+          "direction": "computer_to_phone",
+          "split_key": "responder_to_initiator",
+          "nonce": 0,
+          "nonce_bytes_hex": "000000000000000000000000",
+          "header": {
+            "type": "hello",
+            "versions": [
+              1
+            ],
+            "features": [],
+            "max_body_bytes": 4096,
+            "max_in_flight": 1,
+            "keepalive_interval_ms": 1000,
+            "incarnation": "00000000-0000-4000-8000-000000000001",
+            "ledger_epoch": "test-ledger-computer",
+            "device_name": "Test computer"
+          },
+          "body_hex": "",
+          "plaintext_frame_hex": "eb0000007b226465766963655f6e616d65223a225465737420636f6d7075746572222c226665617475726573223a5b5d2c22696e6361726e6174696f6e223a2230303030303030302d303030302d343030302d383030302d303030303030303030303031222c226b656570616c6976655f696e74657276616c5f6d73223a313030302c226c65646765725f65706f6368223a22746573742d6c65646765722d636f6d7075746572222c226d61785f626f64795f6279746573223a343039362c226d61785f696e5f666c69676874223a312c2274797065223a2268656c6c6f222c2276657273696f6e73223a5b315d7d00000000",
+          "ciphertext_hex": "4fdfabb5a7eb1923554da2103450f1913ccd5da192ab64b1109d151d5edfa87ed6b39e12adf1d5915bebd68738f0bfb416eec5793a9cce10fb0eb5b9af46d83a599cf0afdbd5b6a89e6a8794806846d564af0eae22c6aad2ce2758d6c8db25be2c599bb97aa3a663b6f0b15ce3fb0e03583de3ca336e89b0033c6c7a7122b8fbe2ffe9ae5fcc3aeed807c32a16a797feb664f00d39965984df67885437025b1ba8b15aa55b5e3569eecad526689c75dd8a375c6642e94a11cc92ec8fdcc7065137aebaf86894df185545e0a476501c34a6e3fb4a8a5d2e2aa380092dc4732c07d636e2c23a8a63b3abe8627ef5589fbb2d63a9e6e3cac7500b0e00ddc44a194c07baa2",
+          "transport_record_hex": "030100004fdfabb5a7eb1923554da2103450f1913ccd5da192ab64b1109d151d5edfa87ed6b39e12adf1d5915bebd68738f0bfb416eec5793a9cce10fb0eb5b9af46d83a599cf0afdbd5b6a89e6a8794806846d564af0eae22c6aad2ce2758d6c8db25be2c599bb97aa3a663b6f0b15ce3fb0e03583de3ca336e89b0033c6c7a7122b8fbe2ffe9ae5fcc3aeed807c32a16a797feb664f00d39965984df67885437025b1ba8b15aa55b5e3569eecad526689c75dd8a375c6642e94a11cc92ec8fdcc7065137aebaf86894df185545e0a476501c34a6e3fb4a8a5d2e2aa380092dc4732c07d636e2c23a8a63b3abe8627ef5589fbb2d63a9e6e3cac7500b0e00ddc44a194c07baa2"
+        },
+        {
+          "direction": "phone_to_computer",
+          "split_key": "initiator_to_responder",
+          "nonce": 0,
+          "nonce_bytes_hex": "000000000000000000000000",
+          "header": {
+            "type": "hello",
+            "versions": [
+              1
+            ],
+            "features": [],
+            "max_body_bytes": 4096,
+            "max_in_flight": 1,
+            "keepalive_interval_ms": 1000,
+            "incarnation": "00000000-0000-4000-8000-000000000002",
+            "ledger_epoch": "test-ledger-phone",
+            "device_name": "Test phone"
+          },
+          "body_hex": "",
+          "plaintext_frame_hex": "e50000007b226465766963655f6e616d65223a22546573742070686f6e65222c226665617475726573223a5b5d2c22696e6361726e6174696f6e223a2230303030303030302d303030302d343030302d383030302d303030303030303030303032222c226b656570616c6976655f696e74657276616c5f6d73223a313030302c226c65646765725f65706f6368223a22746573742d6c65646765722d70686f6e65222c226d61785f626f64795f6279746573223a343039362c226d61785f696e5f666c69676874223a312c2274797065223a2268656c6c6f222c2276657273696f6e73223a5b315d7d00000000",
+          "ciphertext_hex": "cedf520cf475cc61a58960dd83373e8cac5b526690996a0350afcee5c7ad79c26da0913aeb27d3c631056edb9bba89b2cb00a25a8b8cba894c22ec4ced4135d822d9d5e38a789d2d3cc162fb4f2977059fdd38e74a2fab26cc799ca053899bdf5cf9d7fea489bb02beae873427a0a9dee2f0c16c746e31d1c1e3eb2eb690627fc115d59939b7556d08e45d89d9057d119156b8247d29300ff3ac5728cc844af6b3b4120e95dcac5f0a2fee5ba65349840b4228b066944aead426d7ba7fc3c142ecc599402ac2c30f19a380003167406064b961e10fcf9e803264912c6c8b08bd191df2be60f8fd04ce176673e8ab5463fccbab033747d276e975affe0e",
+          "transport_record_hex": "fd000000cedf520cf475cc61a58960dd83373e8cac5b526690996a0350afcee5c7ad79c26da0913aeb27d3c631056edb9bba89b2cb00a25a8b8cba894c22ec4ced4135d822d9d5e38a789d2d3cc162fb4f2977059fdd38e74a2fab26cc799ca053899bdf5cf9d7fea489bb02beae873427a0a9dee2f0c16c746e31d1c1e3eb2eb690627fc115d59939b7556d08e45d89d9057d119156b8247d29300ff3ac5728cc844af6b3b4120e95dcac5f0a2fee5ba65349840b4228b066944aead426d7ba7fc3c142ecc599402ac2c30f19a380003167406064b961e10fcf9e803264912c6c8b08bd191df2be60f8fd04ce176673e8ab5463fccbab033747d276e975affe0e"
+        },
+        {
+          "direction": "computer_to_phone",
+          "split_key": "responder_to_initiator",
+          "nonce": 1,
+          "nonce_bytes_hex": "000000000100000000000000",
+          "header": {
+            "type": "pairing_result",
+            "outcome": "granted"
+          },
+          "body_hex": "",
+          "plaintext_frame_hex": "2d0000007b226f7574636f6d65223a226772616e746564222c2274797065223a2270616972696e675f726573756c74227d00000000",
+          "ciphertext_hex": "b7a14bae845349c9b137b81277513d02c7356b550367092ea8edb8c7dd6a0c329e28709f3d3372ccd04277234db904a3ac0956c4c53883e53fd85829fe7a0ae6b7dedc2b2f",
+          "transport_record_hex": "45000000b7a14bae845349c9b137b81277513d02c7356b550367092ea8edb8c7dd6a0c329e28709f3d3372ccd04277234db904a3ac0956c4c53883e53fd85829fe7a0ae6b7dedc2b2f"
+        }
+      ],
+      "expected": {
+        "phone_outcome": "protocol_violation",
+        "dropped_phone_frames": 0
+      }
+    },
+    {
+      "id": "pairing_bye_extra_field",
+      "handshake_id": "one_bit_a",
+      "session": "pairing",
+      "records": [
+        {
+          "direction": "computer_to_phone",
+          "split_key": "responder_to_initiator",
+          "nonce": 0,
+          "nonce_bytes_hex": "000000000000000000000000",
+          "header": {
+            "type": "bye",
+            "code": "fed_pairing_declined",
+            "message": "x"
+          },
+          "body_hex": "",
+          "plaintext_frame_hex": "3a0000007b22636f6465223a226665645f70616972696e675f6465636c696e6564222c226d657373616765223a2278222c2274797065223a22627965227d00000000",
+          "ciphertext_hex": "b7be3bef0a1c69bea633fd868679aaf58348fdb50dd8437db0aaf4cf2e2516ee9201c248131926bf368d697b66bbd7588fa582e915fd315ca46992406528a3f7a31dc4df076c66aeffa68f559a651dd987d7",
+          "transport_record_hex": "52000000b7be3bef0a1c69bea633fd868679aaf58348fdb50dd8437db0aaf4cf2e2516ee9201c248131926bf368d697b66bbd7588fa582e915fd315ca46992406528a3f7a31dc4df076c66aeffa68f559a651dd987d7"
+        }
+      ],
+      "expected": {
+        "phone_outcome": "protocol_violation",
+        "dropped_phone_frames": 0
+      }
+    },
+    {
+      "id": "non_pairing_bye_code",
+      "handshake_id": "one_bit_a",
+      "session": "pairing",
+      "records": [
+        {
+          "direction": "computer_to_phone",
+          "split_key": "responder_to_initiator",
+          "nonce": 0,
+          "nonce_bytes_hex": "000000000000000000000000",
+          "header": {
+            "type": "bye",
+            "code": "fed_goodbye"
+          },
+          "body_hex": "",
+          "plaintext_frame_hex": "230000007b22636f6465223a226665645f676f6f64627965222c2274797065223a22627965227d00000000",
+          "ciphertext_hex": "aebe3bef0a1c69bea633fd868679aaf5835ff3b31bd3547fcde2b3d83b3c1da9cc018c131b5e28cc57ea0c74338903a215095f99f497ecc014d073",
+          "transport_record_hex": "3b000000aebe3bef0a1c69bea633fd868679aaf5835ff3b31bd3547fcde2b3d83b3c1da9cc018c131b5e28cc57ea0c74338903a215095f99f497ecc014d073"
+        }
+      ],
+      "expected": {
+        "phone_outcome": "protocol_violation",
+        "dropped_phone_frames": 0
+      }
+    },
+    {
+      "id": "pairing_result_duplicate_outcome",
+      "handshake_id": "one_bit_a",
+      "session": "pairing",
+      "records": [
+        {
+          "direction": "computer_to_phone",
+          "split_key": "responder_to_initiator",
+          "nonce": 0,
+          "nonce_bytes_hex": "000000000000000000000000",
+          "header": null,
+          "body_hex": "",
+          "plaintext_frame_hex": "410000007b226f7574636f6d65223a226772616e746564222c226f7574636f6d65223a226772616e746564222c2274797065223a2270616972696e675f726573756c74227d00000000",
+          "ciphertext_hex": "ccbe3bef0a1c65a4b635b0d1c13df5b3bb4afdb20bd44938c3ecfed9362f17e69301d448190e34a2238f687b70bbdb03d3e2d4aa47e8720ff46285421827c684d67186831a09aeda8222b76ab96117899e4b18037395134505",
+          "transport_record_hex": "59000000ccbe3bef0a1c65a4b635b0d1c13df5b3bb4afdb20bd44938c3ecfed9362f17e69301d448190e34a2238f687b70bbdb03d3e2d4aa47e8720ff46285421827c684d67186831a09aeda8222b76ab96117899e4b18037395134505",
+          "header_pairs": [
+            [
+              "outcome",
+              "granted"
+            ],
+            [
+              "outcome",
+              "granted"
+            ],
+            [
+              "type",
+              "pairing_result"
+            ]
+          ]
+        }
+      ],
+      "expected": {
+        "phone_outcome": "protocol_violation",
+        "dropped_phone_frames": 0
+      }
+    }
+  ]
+}

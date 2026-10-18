@@ -292,6 +292,7 @@ def cross_check(vector):
         assert peer.get_handshake_hash().hex() == vector["handshake_hash"]
         assert peer.noise_protocol.cipher_state_encrypt.k.hex() == vector["split"][sending]
         assert peer.noise_protocol.cipher_state_decrypt.k.hex() == vector["split"][receiving]
+    return initiator, responder
 
 
 def trial(sr, message, psk):
@@ -580,6 +581,127 @@ def word_pair_values(counter):
     return values
 
 
+def encode_frame(header, body=b""):
+    """Compact sorted JSON; field pairs retain duplicate keys for refusal tests."""
+    pairs = sorted(header.items() if isinstance(header, dict) else header)
+    compact = lambda value: json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    header_bytes = ("{" + ",".join(compact(key) + ":" + compact(value) for key, value in pairs) + "}").encode("utf-8")
+    return struct.pack("<I", len(header_bytes)) + header_bytes + struct.pack("<I", len(body)) + body
+
+
+def frame_record(source, header, body, direction, nonce):
+    if direction not in ("computer_to_phone", "phone_to_computer"):
+        raise ValueError("unknown_record_direction")
+    frame = encode_frame(header, body)
+    if len(frame) > 65519:
+        raise ValueError("frame_exceeds_one_transport_record")
+    split_key = "responder_to_initiator" if direction == "computer_to_phone" else "initiator_to_responder"
+    key = bytes.fromhex(source["split"][split_key])
+    nonce_bytes = b"\0" * 4 + struct.pack("<Q", nonce)
+    ciphertext = ChaCha20Poly1305(key).encrypt(nonce_bytes, frame, b"")
+    record = {"direction": direction, "split_key": split_key, "nonce": nonce,
+              "nonce_bytes_hex": nonce_bytes.hex(), "header": header if isinstance(header, dict) else None,
+              "body_hex": body.hex(), "plaintext_frame_hex": frame.hex(), "ciphertext_hex": ciphertext.hex(),
+              "transport_record_hex": (struct.pack("<I", len(ciphertext)) + ciphertext).hex()}
+    if not isinstance(header, dict):
+        record["header_pairs"] = [list(pair) for pair in sorted(header)]
+    return record
+
+
+def unpack_frame(frame):
+    """Separate the two little-endian lengths without interpreting the header."""
+    if len(frame) < 8:
+        raise ValueError("truncated_frame")
+    header_end = 4 + struct.unpack_from("<I", frame)[0]
+    if header_end + 4 > len(frame):
+        raise ValueError("truncated_frame")
+    body_length = struct.unpack_from("<I", frame, header_end)[0]
+    if header_end + 4 + body_length != len(frame):
+        raise ValueError("frame_length_mismatch")
+    return frame[4:header_end], frame[header_end + 4:]
+
+
+def unique_header_object(pairs):
+    header = {}
+    for key, value in pairs:
+        if key in header:
+            raise ValueError("duplicate_header_key")
+        header[key] = value
+    return header
+
+
+def decode_frame(frame):
+    header_bytes, body = unpack_frame(frame)
+    header = json.loads(header_bytes.decode("utf-8"), object_pairs_hook=unique_header_object)
+    if not isinstance(header, dict):
+        raise ValueError("header_not_object")
+    return header, body
+
+
+def phone_frame_outcome(header, body, pairing):
+    """Validate only the post-handshake result, not the full fed state machine."""
+    if pairing and not body:
+        if header == {"type": "pairing_result", "outcome": "granted"}:
+            return "granted"
+        for outcome in ("declined", "expired"):
+            if header == {"type": "bye", "code": "fed_pairing_" + outcome}:
+                return outcome
+    return "protocol_violation"
+
+
+def control_hello(role):
+    """Minimum shared hello schema; Swift additionally requires device_name."""
+    return {"type": "hello", "versions": [1], "features": [], "max_body_bytes": 4096,
+            "max_in_flight": 1, "keepalive_interval_ms": 1000,
+            "incarnation": "00000000-0000-4000-8000-00000000000" + ("1" if role == "computer" else "2"),
+            "ledger_epoch": "test-ledger-" + role, "device_name": "Test " + role}
+
+
+def frame_vectors(positive, control):
+    cases = []
+
+    def add(case_id, header, outcome, body=b"", plain_ik=False, stray=False):
+        source = control if plain_ik else positive
+        records = []
+        if stray:
+            records.append(frame_record(source, {"type": "keepalive"}, b"", "phone_to_computer", 0))
+        records.append(frame_record(source, header, body, "computer_to_phone", 0))
+        cases.append({"id": case_id, "handshake_id": source["id"],
+                      "session": "plain_ik" if plain_ik else "pairing", "records": records,
+                      "expected": {"phone_outcome": outcome, "dropped_phone_frames": int(stray)}})
+
+    granted = {"type": "pairing_result", "outcome": "granted"}
+    add("granted", granted, "granted")
+    add("declined", {"type": "bye", "code": "fed_pairing_declined"}, "declined")
+    add("expired", {"type": "bye", "code": "fed_pairing_expired"}, "expired")
+    add("stray_phone_then_granted", granted, "granted", stray=True)
+    add("pairing_result_extra_field", {**granted, "extra": "x"}, "protocol_violation")
+    add("pairing_result_with_body", granted, "protocol_violation", body=b"x")
+    add("pairing_result_wrong_outcome", {"type": "pairing_result", "outcome": "declined"}, "protocol_violation")
+    add("computer_keepalive", {"type": "keepalive"}, "protocol_violation")
+    add("pairing_result_on_plain_ik", granted, "protocol_violation", plain_ik=True)
+    cases[-1]["isolates"] = "normal_session_requires_hello_first"
+    cases.append({"id": "pairing_result_after_plain_ik_hello", "handshake_id": control["id"],
+                  "session": "plain_ik", "isolates": "normal_session_forbids_pairing_result_after_hello",
+                  "records": [frame_record(control, control_hello("computer"), b"", "computer_to_phone", 0),
+                              frame_record(control, control_hello("phone"), b"", "phone_to_computer", 0),
+                              frame_record(control, granted, b"", "computer_to_phone", 1)],
+                  "expected": {"phone_outcome": "protocol_violation", "dropped_phone_frames": 0}})
+    add("pairing_bye_extra_field", {"type": "bye", "code": "fed_pairing_declined", "message": "x"}, "protocol_violation")
+    add("non_pairing_bye_code", {"type": "bye", "code": "fed_goodbye"}, "protocol_violation")
+    add("pairing_result_duplicate_outcome", list(granted.items()) + [("outcome", "granted")], "protocol_violation")
+    return {"test_values_only": True, "version": "fed-pairing-v1.1",
+            "each_case_starts_after_message2_with_fresh_split_nonces": True,
+            "encoding": {"frame": "uint32le(header_length) || UTF-8 JSON || uint32le(body_length) || body",
+                         "header_json": "compact, lexicographically sorted keys; duplicate keys only in the malformed case",
+                         "record": "uint32le(ciphertext_length) || ciphertext_with_tag",
+                         "max_ciphertext_bytes": 65535, "max_plaintext_bytes": 65519,
+                         "associated_data_hex": "", "nonce": "00000000 || uint64le(counter); not transmitted"},
+            "pairing_session": {"computer_sends_hello": False, "phone_while_pending": "send_nothing",
+                                "computer_drops_stray_phone_frames": True, "computer_closes_after_result": True},
+            "cases": cases}
+
+
 def generate_data():
     blob = (ROOT / "bip39-english.txt").read_bytes()
     assert hashlib.sha256(blob).hexdigest() == WORDLIST_SHA256
@@ -604,7 +726,8 @@ def generate_data():
     return {"handshakes.json": {"test_values_only": True, "noise_revision": 34,
                                 "positive_cases": positives, "plain_ik_control": control},
             "responder.json": responder_vectors(word_pair_values(341070), positives[0], control),
-            "words.json": words, "qr.json": qr_vectors(word_pair_values(341070))}
+            "words.json": words, "qr.json": qr_vectors(word_pair_values(341070)),
+            "frames.json": frame_vectors(positives[0], control)}
 
 
 DATA = {}
@@ -616,6 +739,143 @@ class VectorTests(unittest.TestCase):
         for vector in vectors["positive_cases"] + [vectors["plain_ik_control"]]:
             with self.subTest(id=vector["id"]):
                 cross_check(vector)
+
+    def test_frame_encoding_lengths_and_canonical_headers(self):
+        cases = DATA["frames.json"]["cases"]
+        self.assertEqual(sum(len(case["records"]) for case in cases), 16)
+        headers = {}
+        for case in cases:
+            for record in case["records"]:
+                frame = bytes.fromhex(record["plaintext_frame_hex"])
+                header_bytes, body = unpack_frame(frame)
+                self.assertEqual(frame[:4], len(header_bytes).to_bytes(4, "little"))
+                body_offset = 4 + len(header_bytes)
+                self.assertEqual(frame[body_offset:body_offset + 4], len(body).to_bytes(4, "little"))
+                self.assertEqual(record["nonce_bytes_hex"], (b"\0" * 4 + record["nonce"].to_bytes(8, "little")).hex())
+                expected_key = ("responder_to_initiator" if record["direction"] == "computer_to_phone"
+                                else "initiator_to_responder")
+                self.assertEqual(record["split_key"], expected_key)
+                self.assertLessEqual(len(frame), 65519)
+                headers[case["id"]] = header_bytes.decode("utf-8")
+        self.assertEqual(headers["granted"], '{"outcome":"granted","type":"pairing_result"}')
+        self.assertEqual(headers["declined"], '{"code":"fed_pairing_declined","type":"bye"}')
+        self.assertEqual(headers["expired"], '{"code":"fed_pairing_expired","type":"bye"}')
+        self.assertEqual(headers["pairing_result_duplicate_outcome"],
+                         '{"outcome":"granted","outcome":"granted","type":"pairing_result"}')
+        self.assertEqual(next(c for c in cases if c["id"] == "pairing_result_on_plain_ik")["handshake_id"],
+                         DATA["handshakes.json"]["plain_ik_control"]["id"])
+
+    def test_frame_records_independent_noiseprotocol(self):
+        handshakes = DATA["handshakes.json"]
+        by_id = {v["id"]: v for v in handshakes["positive_cases"] + [handshakes["plain_ik_control"]]}
+        for case in DATA["frames.json"]["cases"]:
+            with self.subTest(id=case["id"]):
+                source = by_id[case["handshake_id"]]
+                self.assertEqual(source["protocol"], (PAIR if case["session"] == "pairing" else IK).decode())
+                initiator, responder = cross_check(source)
+                for record in case["records"]:
+                    self.assertIn(record["direction"], ("computer_to_phone", "phone_to_computer"))
+                    sender, receiver = ((responder, initiator) if record["direction"] == "computer_to_phone"
+                                        else (initiator, responder))
+                    self.assertEqual(sender.noise_protocol.cipher_state_encrypt.n, record["nonce"])
+                    self.assertEqual(receiver.noise_protocol.cipher_state_decrypt.n, record["nonce"])
+                    frame = bytes.fromhex(record["plaintext_frame_hex"])
+                    ciphertext = sender.encrypt(frame)
+                    self.assertEqual(ciphertext.hex(), record["ciphertext_hex"])
+                    wire = bytes.fromhex(record["transport_record_hex"])
+                    self.assertEqual(len(wire), 4 + len(ciphertext))
+                    self.assertEqual(int.from_bytes(wire[:4], "little"), len(ciphertext))
+                    self.assertEqual(wire[4:], ciphertext)
+                    decrypted = receiver.decrypt(wire[4:])
+                    self.assertEqual(decrypted, frame)
+                    if "header_pairs" in record:
+                        header_bytes, body = unpack_frame(decrypted)
+                        self.assertEqual(json.loads(header_bytes, object_pairs_hook=list),
+                                         [tuple(pair) for pair in record["header_pairs"]])
+                        with self.assertRaisesRegex(ValueError, "^duplicate_header_key$"):
+                            decode_frame(decrypted)
+                    else:
+                        header, body = decode_frame(decrypted)
+                        self.assertEqual(header, record["header"])
+                    self.assertEqual(body.hex(), record["body_hex"])
+
+    def test_frame_phone_outcomes_and_pending_drop(self):
+        expected = {"granted": "granted", "declined": "declined", "expired": "expired",
+                    "stray_phone_then_granted": "granted", "pairing_result_extra_field": "protocol_violation",
+                    "pairing_result_with_body": "protocol_violation", "pairing_result_wrong_outcome": "protocol_violation",
+                    "computer_keepalive": "protocol_violation", "pairing_result_on_plain_ik": "protocol_violation",
+                    "pairing_bye_extra_field": "protocol_violation", "non_pairing_bye_code": "protocol_violation",
+                    "pairing_result_duplicate_outcome": "protocol_violation",
+                    "pairing_result_after_plain_ik_hello": "protocol_violation"}
+        cases = DATA["frames.json"]["cases"]
+        self.assertEqual(len(cases), len(expected))
+        self.assertEqual({c["id"] for c in cases}, set(expected))
+        for case in cases:
+            with self.subTest(id=case["id"]):
+                dropped = 0
+                hello_directions = set()
+                outcome = "pending" if case["session"] == "pairing" else "normal_session"
+                for record in case["records"]:
+                    try:
+                        header, body = decode_frame(bytes.fromhex(record["plaintext_frame_hex"]))
+                    except ValueError as error:
+                        self.assertEqual(str(error), "duplicate_header_key")
+                        outcome = "protocol_violation"
+                        continue
+                    if case["id"] == "pairing_result_after_plain_ik_hello" and header["type"] == "hello":
+                        self.assertEqual(body, b"")
+                        self.assertEqual(record["nonce"], 0)
+                        self.assertNotIn(record["direction"], hello_directions)
+                        hello_directions.add(record["direction"])
+                        continue
+                    if record["direction"] == "phone_to_computer":
+                        self.assertEqual(outcome, "pending")
+                        dropped += 1
+                    else:
+                        if case["id"] == "pairing_result_after_plain_ik_hello":
+                            self.assertEqual(hello_directions, {"computer_to_phone", "phone_to_computer"})
+                            self.assertEqual(record["nonce"], 1)
+                        outcome = phone_frame_outcome(header, body, case["session"] == "pairing")
+                self.assertEqual(outcome, expected[case["id"]])
+                self.assertEqual(case["expected"]["phone_outcome"], outcome)
+                self.assertEqual(case["expected"]["dropped_phone_frames"], dropped)
+                self.assertEqual(dropped, int(case["id"] == "stray_phone_then_granted"))
+        stray = next(c for c in cases if c["id"] == "stray_phone_then_granted")
+        self.assertEqual([r["direction"] for r in stray["records"]], ["phone_to_computer", "computer_to_phone"])
+        self.assertEqual([r["nonce"] for r in stray["records"]], [0, 0])
+
+    def test_plain_ik_hello_controls(self):
+        import uuid
+
+        cases = {c["id"]: c for c in DATA["frames.json"]["cases"]}
+        immediate = cases["pairing_result_on_plain_ik"]
+        negotiated = cases["pairing_result_after_plain_ik_hello"]
+        self.assertEqual(immediate["isolates"], "normal_session_requires_hello_first")
+        self.assertEqual(negotiated["isolates"], "normal_session_forbids_pairing_result_after_hello")
+        self.assertEqual(immediate["records"][0]["nonce"], 0)
+        self.assertEqual([r["nonce"] for r in negotiated["records"]], [0, 0, 1])
+        self.assertEqual([r["direction"] for r in negotiated["records"]],
+                         ["computer_to_phone", "phone_to_computer", "computer_to_phone"])
+        self.assertEqual([r["header"]["type"] for r in negotiated["records"]], ["hello", "hello", "pairing_result"])
+        required = {"type", "versions", "features", "max_body_bytes", "max_in_flight",
+                    "keepalive_interval_ms", "incarnation", "ledger_epoch", "device_name"}
+        for record in negotiated["records"][:2]:
+            header = record["header"]
+            self.assertEqual(set(header), required)
+            self.assertEqual(header["versions"], [1])
+            self.assertEqual(header["features"], [])
+            self.assertTrue(4096 <= header["max_body_bytes"] <= (1 << 32) - 1)
+            self.assertTrue(1 <= header["max_in_flight"] <= 4096)
+            self.assertTrue(1000 <= header["keepalive_interval_ms"] <= 60000)
+            self.assertEqual(str(uuid.UUID(header["incarnation"])), header["incarnation"])
+            self.assertTrue(header["ledger_epoch"])
+            self.assertLessEqual(len(header["device_name"].encode("utf-8")), 256)
+            self.assertEqual(record["body_hex"], "")
+        for case in (immediate, negotiated):
+            self.assertEqual(case["handshake_id"], DATA["handshakes.json"]["plain_ik_control"]["id"])
+        for case in cases.values():
+            if case["session"] == "pairing":
+                self.assertNotIn("hello", [r["header"]["type"] for r in case["records"] if r["header"] is not None])
 
     def test_lengths_and_plain_ik_control(self):
         vectors = DATA["handshakes.json"]
@@ -785,7 +1045,8 @@ def main():
     else:
         (ROOT / "SHA256SUMS").write_bytes(sums)
     print(f"{len(rendered)} JSON files; {len(files)} file digests; "
-          "4 independent handshakes agreed on messages, hash, and both raw split keys.")
+          "4 independent handshakes agreed on messages, hash, and both raw split keys; "
+          f"{sum(len(case['records']) for case in DATA['frames.json']['cases'])} independent transport records agreed.")
 
 
 if __name__ == "__main__":

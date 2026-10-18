@@ -17,7 +17,7 @@ Never use these keys or this generator for a real pairing ceremony.
 | `frames.json` | Thirteen post-handshake scenarios (16 transport records), including result acceptance, strict-header refusals, a dropped stray phone frame, and plain-IK violations before and after hello. |
 | `responder.json` | Eight negative state-machine fixtures, a foreign-then-legitimate dial sequence, a fixed dummy PSK, and three refusal paths with identical ordered DH/HKDF/AEAD traces measured in the reference. |
 | `words.json` | Positive confirmations, a pair of complete transcripts whose 44-bit confirmations differ in exactly one bit, a hand-built digest for bit extraction, and a hand-built handshake hash for the complete derivation. |
-| `qr.json` | Four accepted payloads and 27 refusals, including all design-note refusals. Entry points distinguish scan text from direct decoded-payload tests; exact lengths are included. |
+| `qr.json` | Eleven accepted payloads and 27 refusals, covering display-name filtering, malformed fields, expiry, size limits, and invalid hint addresses/ports. Entry points distinguish scan text from direct decoded-payload tests; exact lengths are included. |
 | `SHA256SUMS` | SHA-256 of every regular file in this directory except itself, in filename order. |
 
 All binary JSON fields are lowercase hex unless explicitly described otherwise.
@@ -335,6 +335,14 @@ report the supplied input lengths where applicable.
 declared independently of the parser and the tests assert the parser throws
 that reason. The hints are dial-only data, never a pin or saved address; these
 byte fixtures do not replace the required signed account-key check or ceremony.
+
+For accepted QR names, `raw_name` preserves the decoded UTF-8 text verbatim.
+`display_name` removes Unicode scalars in general category Cc and the exact
+callosum display filter ranges: U+00AD, U+061C, U+180E, U+200B–U+200F,
+U+2028–U+202E, U+2060–U+206F, U+FEFF, U+FFF9–U+FFFB and U+E0000–U+E007F.
+Remaining scalars are concatenated without normalization or replacement. The
+display-name vectors include each representative character and a mixed name;
+both parsed fields are pinned so removing a scalar never changes `raw_name`.
 
 ## Post-handshake result frames (v1.1)
 

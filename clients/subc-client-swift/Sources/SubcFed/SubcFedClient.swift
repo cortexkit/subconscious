@@ -232,8 +232,17 @@ public actor SubcFedClient {
                 await connected.session.close()
                 throw FedFailure.cancelled
             }
-            let pending = try FedPendingPairing(qr: qr, session: connected.session, handshakeHash: connected.handshakeHash,
-                                               clock: clock, resultTimeout: resultTimeout)
+            let pending: FedPendingPairing
+            do {
+                pending = try FedPendingPairing(qr: qr, session: connected.session, handshakeHash: connected.handshakeHash,
+                                                clock: clock, resultTimeout: resultTimeout)
+            } catch {
+                // The session was established but nothing owns it yet: close it
+                // here, or the computer's pairing window stays claimed by a
+                // connection the phone has abandoned.
+                await connected.session.close()
+                throw error
+            }
             pendingPairing = pending
             return pending
         }

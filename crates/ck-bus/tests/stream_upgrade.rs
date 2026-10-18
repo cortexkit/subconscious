@@ -56,7 +56,6 @@ use harness::{
     signer::{nats::nats_server_bin, HarnessSigner, SIGNER_OPERATIONS},
 };
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use subc_client_rs::HandlerOutcome;
 use subc_protocol::MachineId;
 
@@ -266,11 +265,7 @@ impl BoxPlane for FiveStreamBox {
 }
 
 fn fresh_machine_id() -> String {
-    let seed = format!("{:?}{}", std::time::SystemTime::now(), std::process::id());
-    Sha256::digest(seed.as_bytes())[..16]
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
+    cortexkit_bus_testkit::new_machine_id()
 }
 
 async fn boot_with(

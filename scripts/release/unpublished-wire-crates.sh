@@ -50,6 +50,7 @@ wire_crates=(
   subc-jobobject
   subc-presence
   subc-daemon
+  cortexkit-bus-testkit
 )
 unpublished=()
 tmp_dir=$(mktemp -d)

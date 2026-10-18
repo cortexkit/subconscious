@@ -68,7 +68,6 @@ use harness::{
 };
 use nkeys::KeyPair;
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 
 const BOOT_LIMIT: Duration = Duration::from_secs(60);
 const PERIOD_MS: u64 = 500;
@@ -86,11 +85,7 @@ fn signer_passed() {
 }
 
 fn fresh_machine_id() -> String {
-    let seed = format!("{:?}{}", std::time::SystemTime::now(), std::process::id());
-    Sha256::digest(seed.as_bytes())[..16]
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
+    cortexkit_bus_testkit::new_machine_id()
 }
 
 fn server_bin() -> Option<std::path::PathBuf> {

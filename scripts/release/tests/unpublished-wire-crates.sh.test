@@ -28,7 +28,7 @@ write_current_responses() {
   local crate
   for crate in subc-protocol subc-transport subc-control subc-client-rs \
     subc-jsonc subc-cgroup subc-uptime subc-os subc-jobobject subc-presence \
-    subc-daemon; do
+    subc-daemon cortexkit-bus-testkit; do
     write_response "$dir" "$crate" "$(manifest_version "$crate")"
   done
 }
@@ -73,6 +73,15 @@ all_current="$test_root/all-current"
 write_current_responses "$all_current"
 check_case all-current '' 0 \
   env SUBC_REGISTRY_JSON_DIR="$all_current" bash "$detector"
+
+testkit_new="$test_root/testkit-new"
+write_current_responses "$testkit_new"
+printf '%s\n' 404 >"$testkit_new/cortexkit-bus-testkit.status"
+printf '%s\n' '{"errors":[{"detail":"crate does not exist"}]}' \
+  >"$testkit_new/cortexkit-bus-testkit.json"
+check_case new-bus-testkit \
+  "cortexkit-bus-testkit $(manifest_version cortexkit-bus-testkit)" 0 \
+  bash "$detector" --registry-json-dir "$testkit_new"
 
 two_behind="$test_root/two-behind"
 write_current_responses "$two_behind"

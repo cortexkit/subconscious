@@ -1,191 +1,52 @@
-//! The install-time trust chain and a local `nats-server` configured the way `ck setup`
-//! configures it (`docs/nats-install-trust-chain.md`, sections 1 and 4), built
-//! from throwaway fixture keys, plus the observers the bootstrap rows read.
-//!
-//! - The operator ROOT self-signs the operator JWT (`signing_keys` = the operator signer)
-//!   and signs the system account JWT (`signing_keys` = the system account key). The
-//!   harness holds it the way the install ceremony would; ck-bus never sees it.
-//! - The harness signer holds the three keys ck-bus signs with, under their production
-//!   credential ids and with throwaway key material: the operator signer, the system
-//!   account key and the box account key.
-//! - The server runs the full (directory) resolver with deletion disabled, preloads only
-//!   the system account, and listens on loopback only, with no TLS.
-//!
-//! No box account exists before ck-bus boots: ck-bus creates it.
+//! ck-bus-specific observers over the shared private-bus test kit.
 #![allow(dead_code)]
 
+use super::{control, signer::nats::unix_now};
+pub use cortexkit_bus_testkit::LOOPBACK;
+use nkeys::KeyPair;
+use serde_json::Value;
 use std::{
-    collections::BTreeSet,
-    num::NonZeroU32,
     path::{Path, PathBuf},
-    process::Stdio,
     time::{Duration, Instant},
 };
-
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use cortexkit_bus_naming::{root_credential_id, RootCredentialKind};
-use nkeys::KeyPair;
-use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use subc_control::{ClientControlRequest, ClientControlResponse};
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpStream,
-    process::{Child, Command},
-};
 
-use super::{
-    control,
-    signer::{nats::unix_now, HarnessSigner},
-};
-
-/// The credential id the operator minted `signing:<provider>:1` under.
-pub fn root_id(provider: &str) -> String {
-    root_credential_id(RootCredentialKind::Signing, provider, NonZeroU32::new(1))
-        .expect("a fixed provider token is in the lexicon")
-}
-
-pub fn box_root_id() -> String {
-    root_id("ck-bus-account")
-}
-
-pub fn system_root_id() -> String {
-    root_id("ck-bus-sysaccount")
-}
-
-pub fn signer_root_id() -> String {
-    root_id("ck-bus-operator-signer")
-}
-
-fn encode_jwt(signer: &KeyPair, subject: &str, name: &str, iat: i64, nats: Value) -> String {
-    let mut claims = json!({
-        "jti": "",
-        "iat": iat,
-        "iss": signer.public_key(),
-        "name": name,
-        "sub": subject,
-        "nats": nats,
-    });
-    let digest = Sha256::digest(claims.to_string().as_bytes());
-    claims["jti"] = Value::String(super::signer::hex(&digest).to_uppercase());
-    let input = format!(
-        "{}.{}",
-        URL_SAFE_NO_PAD.encode(br#"{"alg":"ed25519-nkey","typ":"JWT"}"#),
-        URL_SAFE_NO_PAD.encode(claims.to_string().as_bytes())
-    );
-    let signature = signer
-        .sign(input.as_bytes())
-        .expect("fixture keys hold seeds");
-    format!("{input}.{}", URL_SAFE_NO_PAD.encode(signature))
-}
-
-/// A decoded JWT's claims.
-pub fn claims(jwt: &str) -> Value {
-    let part = jwt.trim().split('.').nth(1).expect("a JWT has claims");
-    serde_json::from_slice(&URL_SAFE_NO_PAD.decode(part).expect("claims are base64url"))
-        .expect("claims are JSON")
-}
-
-/// The fixture trust chain.
-pub struct TrustChain {
-    pub signer: HarnessSigner,
-    operator_root: KeyPair,
-    /// The system account id. Its identity seed was dropped at generation, as setup
-    /// does.
-    pub system_account: String,
-}
-
-impl TrustChain {
-    pub fn generate() -> Self {
-        let signer = HarnessSigner::from_pairs([
-            (signer_root_id(), KeyPair::new_operator()),
-            (system_root_id(), KeyPair::new_account()),
-            (box_root_id(), KeyPair::new_account()),
-        ]);
-        Self {
-            signer,
-            operator_root: KeyPair::new_operator(),
-            system_account: KeyPair::new_account().public_key(),
-        }
+/// Compatibility adapter for ck-bus's externally owned, restartable fixture trees.
+/// All broker configuration and process management live in the published kit.
+pub struct BusServer(cortexkit_bus_testkit::BusServer);
+impl std::ops::Deref for BusServer {
+    type Target = cortexkit_bus_testkit::BusServer;
+    fn deref(&self) -> &Self::Target {
+        &self.0
     }
-
-    /// The operator signer as the operator JWT lists it (`O...`).
-    pub fn signer_public(&self) -> String {
-        self.signer.root(&signer_root_id()).account_public()
+}
+impl std::ops::DerefMut for BusServer {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
     }
-
-    /// The box account root as a box account JWT lists it (`A...`).
-    pub fn box_root_public(&self) -> String {
-        self.signer.root(&box_root_id()).account_public()
-    }
-
-    pub fn operator_jwt(&self) -> String {
-        encode_jwt(
-            &self.operator_root,
-            &self.operator_root.public_key(),
-            "ckbus-harness-operator",
-            unix_now() - 120,
-            json!({
-                "type": "operator",
-                "version": 2,
-                "system_account": self.system_account,
-                "signing_keys": [self.signer_public()],
-                "strict_signing_key_usage": false,
-            }),
+}
+impl BusServer {
+    pub async fn start(bin: &Path, dir: &Path, trust: &TrustChain, listen_host: &str) -> Self {
+        assert_eq!(
+            listen_host, LOOPBACK,
+            "private brokers only listen on loopback"
+        );
+        Self(
+            cortexkit_bus_testkit::BusServer::start(cortexkit_bus_testkit::BusOptions {
+                binary: Some(bin.to_path_buf()),
+                directory: Some(dir.to_path_buf()),
+                trust: Some(trust.clone()),
+                ..Default::default()
+            })
+            .await
+            .expect("private NATS server"),
         )
     }
-
-    pub fn system_account_jwt(&self) -> String {
-        encode_jwt(
-            &self.operator_root,
-            &self.system_account,
-            "SYS",
-            unix_now() - 120,
-            json!({
-                "type": "account",
-                "version": 2,
-                "limits": {
-                    "subs": -1, "data": -1, "payload": -1, "imports": -1, "exports": -1,
-                    "wildcards": true, "conn": -1, "leaf": -1,
-                },
-                "signing_keys": [self.signer.root(&system_root_id()).account_public()],
-                "default_permissions": {"pub": {}, "sub": {}},
-            }),
-        )
-    }
-
-    /// A harness user in `account_public`, signed by the root the account lists, with no
-    /// permission restriction.
-    pub fn user_jwt(
-        &self,
-        root_id: &str,
-        account_public: &str,
-        user: &KeyPair,
-        iat: i64,
-    ) -> String {
-        self.user_jwt_for_subject(root_id, account_public, &user.public_key(), iat)
-    }
-
-    /// `user_jwt` for a user key given by its public half only.
-    pub fn user_jwt_for_subject(
-        &self,
-        root_id: &str,
-        account_public: &str,
-        subject: &str,
-        iat: i64,
-    ) -> String {
-        encode_jwt(
-            &self.signer.root(root_id).pair,
-            subject,
-            "harness-user",
-            iat,
-            json!({
-                "type": "user", "version": 2, "issuer_account": account_public,
-                "pub": {}, "sub": {}, "subs": -1, "data": -1, "payload": -1,
-            }),
-        )
+    pub async fn stop(self) {
+        self.0.stop().await;
     }
 }
+pub use cortexkit_bus_testkit::trust::*;
 
 /// Connects with `jwt`, answering the nonce with `user`.
 pub async fn connect(
@@ -247,168 +108,6 @@ pub async fn lookup(system: &async_nats::Client, account_public: &str) -> Option
         .await
         .expect("claims lookup answers");
     (!reply.payload.is_empty()).then(|| String::from_utf8(reply.payload.to_vec()).unwrap())
-}
-
-pub struct BusServer {
-    pub dir: PathBuf,
-    pub url: String,
-    pub port: u16,
-    pub listen_host: String,
-    pub log: PathBuf,
-    pub operator_jwt: PathBuf,
-    pub system_account: String,
-    conf: PathBuf,
-    bin: PathBuf,
-    http_port: u16,
-    child: Option<Child>,
-}
-
-impl BusServer {
-    /// Writes setup's outputs and starts the server listening on `listen_host`. Every
-    /// production-shaped caller passes `LOOPBACK`.
-    pub async fn start(bin: &Path, dir: &Path, trust: &TrustChain, listen_host: &str) -> Self {
-        std::fs::create_dir_all(dir.join("jwt")).expect("resolver dir");
-        let operator_jwt = dir.join("operator.jwt");
-        std::fs::write(&operator_jwt, trust.operator_jwt()).expect("operator jwt");
-        let port = free_port();
-        let http_port = free_port();
-        let log = dir.join("server.log");
-        // Stock nats-server has one client listener, so the harness binds the IPv4
-        // loopback address explicitly; it never binds the wildcard address.
-        // `max_control_line` is raised because a user JWT carrying ck-bus's box grant
-        // makes a CONNECT line longer than the server's 4 KiB default, which the server
-        // refuses as "maximum control line exceeded". `debug` makes the log name why a
-        // connect was refused (revoked versus a bad signature) and why a client closed.
-        // The debug log shows public keys and JWTs, never a seed.
-        let conf = format!(
-            "listen: \"{listen_host}:{port}\"\n\
-             max_control_line: 65536\n\
-             debug: true\n\
-             http: \"127.0.0.1:{http_port}\"\n\
-             log_file: \"{log}\"\n\
-             jetstream {{ store_dir: \"{js}\" }}\n\
-             operator: \"{operator}\"\n\
-             system_account: \"{system}\"\n\
-             resolver {{ type: full, dir: \"{jwt}\", allow_delete: false, interval: \"2m\" }}\n\
-             resolver_preload {{\n  {system}: \"{system_jwt}\"\n}}\n",
-            log = log.display(),
-            js = dir.join("js").display(),
-            operator = operator_jwt.display(),
-            system = trust.system_account,
-            jwt = dir.join("jwt").display(),
-            system_jwt = trust.system_account_jwt(),
-        );
-        let conf_path = dir.join("server.conf");
-        std::fs::write(&conf_path, conf).expect("server conf");
-        let mut server = Self {
-            dir: dir.to_path_buf(),
-            url: format!("nats://127.0.0.1:{port}"),
-            port,
-            listen_host: listen_host.to_string(),
-            log,
-            operator_jwt,
-            system_account: trust.system_account.clone(),
-            conf: conf_path,
-            bin: bin.to_path_buf(),
-            http_port,
-            child: None,
-        };
-        server.spawn().await;
-        server
-    }
-
-    async fn spawn(&mut self) {
-        let child = Command::new(&self.bin)
-            .arg("-c")
-            .arg(&self.conf)
-            .env("XDG_DATA_HOME", self.dir.join("data"))
-            .env("XDG_RUNTIME_DIR", self.dir.join("run"))
-            .env("XDG_CONFIG_HOME", self.dir.join("config"))
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-            .expect("spawn nats-server");
-        self.child = Some(child);
-        let deadline = Instant::now() + Duration::from_secs(20);
-        while !healthz(self.http_port).await {
-            assert!(
-                Instant::now() < deadline,
-                "nats-server never answered /healthz; log at {}",
-                self.log.display()
-            );
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    }
-
-    /// ck-bus's broker inputs, as its supervised environment carries them.
-    pub fn ckbus_env(&self) -> Vec<(String, String)> {
-        vec![
-            ("CKBUS_NATS_URL".to_string(), self.url.clone()),
-            (
-                "CKBUS_OPERATOR_JWT".to_string(),
-                self.operator_jwt.display().to_string(),
-            ),
-            (
-                "CKBUS_SYSTEM_ACCOUNT".to_string(),
-                self.system_account.clone(),
-            ),
-        ]
-    }
-
-    /// Every account id the directory resolver has stored (one `<id>.jwt` each).
-    pub fn stored_accounts(&self) -> BTreeSet<String> {
-        std::fs::read_dir(self.dir.join("jwt"))
-            .map(|entries| {
-                entries
-                    .filter_map(Result::ok)
-                    .filter_map(|entry| {
-                        entry
-                            .file_name()
-                            .to_str()
-                            .and_then(|name| name.strip_suffix(".jwt"))
-                            .map(str::to_string)
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
-    pub fn log_text(&self) -> String {
-        std::fs::read_to_string(&self.log).unwrap_or_default()
-    }
-
-    pub async fn stop(mut self) {
-        if let Some(mut child) = self.child.take() {
-            let _ = child.kill().await;
-        }
-    }
-}
-
-pub const LOOPBACK: &str = "127.0.0.1";
-
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .expect("bind probe port")
-        .local_addr()
-        .expect("probe addr")
-        .port()
-}
-
-async fn healthz(port: u16) -> bool {
-    let Ok(mut stream) = TcpStream::connect(("127.0.0.1", port)).await else {
-        return false;
-    };
-    if stream
-        .write_all(b"GET /healthz HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n")
-        .await
-        .is_err()
-    {
-        return false;
-    }
-    let mut buf = Vec::new();
-    let read = tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut buf)).await;
-    matches!(read, Ok(Ok(_))) && String::from_utf8_lossy(&buf).contains("\"ok\"")
 }
 
 /// Every structured ck-bus log line named `event` in the run's capture logs, oldest

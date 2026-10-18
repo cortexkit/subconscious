@@ -70,7 +70,6 @@ use harness::{
     },
 };
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use subc_client_rs::HandlerOutcome;
 use subc_protocol::MachineId;
 
@@ -92,9 +91,7 @@ fn passed() {
 }
 
 fn fresh_machine_id() -> String {
-    let seed = format!("{:?}{}", std::time::SystemTime::now(), std::process::id());
-    let digest = Sha256::digest(seed.as_bytes());
-    digest[..16].iter().map(|b| format!("{b:02x}")).collect()
+    cortexkit_bus_testkit::new_machine_id()
 }
 
 /// The server, a daemon serving `machine_id`, and a supervised ck-bus pointed at both.

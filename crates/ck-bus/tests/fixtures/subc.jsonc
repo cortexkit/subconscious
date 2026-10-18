@@ -1,22 +1,7 @@
 {
-  // This single template declares every module used by the acceptance rows, preventing per-test configuration drift.
+  // ckbus is supplied by cortexkit-bus-testkit; these are ck-bus-specific controls.
   "version": 1,
   "modules": {
-    "ckbus": {
-      "program": "__CK_BUS_BIN__",
-      "args": [],
-      "env": {
-        "XDG_DATA_HOME": "__XDG_DATA_HOME__"
-      },
-      "enabled": true,
-      "reserved": true,
-      "protocol": "subc",
-      "drain_timeout_ms": 2000,
-      "health": {
-        "on_degraded": "report",
-        "on_failing": "report"
-      }
-    },
     "nats-server": {
       "program": "nats-server",
       "args": ["--port", "0", "--name", "ckbus-acceptance-final-argument"],

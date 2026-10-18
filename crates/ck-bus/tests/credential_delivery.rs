@@ -55,7 +55,6 @@ use harness::{
     },
 };
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use subc_protocol::Principal;
 
 const BOOT_LIMIT: Duration = Duration::from_secs(60);
@@ -74,11 +73,7 @@ fn vocabulary() -> BTreeSet<String> {
 }
 
 fn fresh_machine_id() -> String {
-    let seed = format!("{:?}{}", std::time::SystemTime::now(), std::process::id());
-    Sha256::digest(seed.as_bytes())[..16]
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
+    cortexkit_bus_testkit::new_machine_id()
 }
 
 struct Plane {

@@ -15,6 +15,7 @@ members = [
     "crates/subc-daemon",
     "crates/subc-daemon/tests/consumer",
     "crates/ck-bus",
+    "crates/cortexkit-bus-testkit",
     "crates/subc-mcp",
     "crates/mcp-stdio-adapter",
     "crates/agent-token-vectors",

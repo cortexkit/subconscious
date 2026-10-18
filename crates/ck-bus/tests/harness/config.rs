@@ -15,7 +15,14 @@ pub struct SentinelTiming {
 
 pub fn template_value() -> Value {
     let json = subc_jsonc::jsonc_to_json(TEMPLATE).expect("fixture subc.jsonc must be valid JSONC");
-    serde_json::from_str(&json).expect("fixture subc.jsonc must be valid JSON")
+    let mut value: Value =
+        serde_json::from_str(&json).expect("fixture subc.jsonc must be valid JSON");
+    let shared =
+        cortexkit_bus_testkit::subc_config(Path::new(env!("CARGO_BIN_EXE_ck-bus")), &[], &[])
+            .expect("shared ckbus configuration");
+    let shared: Value = serde_json::from_str(&shared).unwrap();
+    value["modules"]["ckbus"] = shared["modules"]["ckbus"].clone();
+    value
 }
 
 /// Writes the fixture daemon config under `fixture_root`. The supervised

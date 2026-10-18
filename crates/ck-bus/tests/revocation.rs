@@ -107,7 +107,6 @@ use revocation::{
     Boundary, Completed, RevocationError, RevocationPlane, Revoker, Target,
 };
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use subc_client_rs::HandlerOutcome;
 
 const BOOT_LIMIT: Duration = Duration::from_secs(60);
@@ -139,11 +138,7 @@ fn passed() {
 }
 
 fn fresh_machine_id() -> String {
-    let seed = format!("{:?}{}", std::time::SystemTime::now(), std::process::id());
-    Sha256::digest(seed.as_bytes())[..16]
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
+    cortexkit_bus_testkit::new_machine_id()
 }
 
 /// A supervised ck-bus that booted (so the box account exists) beside a real server.

@@ -139,8 +139,8 @@ impl SignerRun {
             .with_terminal_journal_path(root.join("run/terminals.jsonl"))
             .with_capture_logs_dir(root.join("run/logs"));
         if let Some(machine_id) = &options.machine_id {
-            let path = root.join("run/machine-id");
-            fs::write(&path, format!("{machine_id}\n")).expect("fixture machine id must write");
+            let path = cortexkit_bus_testkit::write_machine_id(&Self::data_home(&root), machine_id)
+                .expect("fixture machine id must write");
             bootstrap = bootstrap.with_machine_id_path(path);
         }
         let bootstrap = bootstrap

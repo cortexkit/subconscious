@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.2
+
+- Reuse cortexkit-bus-testkit for acceptance tests' NATS bootstrap, signing
+  fixtures, ckbus configuration and machine ids instead of maintaining a private
+  broker rig. Existing acceptance daemons remain in-process.
+
 ## 0.4.1
 
 - Basal (the flow engine) may publish its own module events on

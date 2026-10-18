@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.5
+
+- Take cortexkit-bus-naming 0.2.4, whose event-consumer table adds
+  `prefrontal-routing` reading insula events: bootstrap creates its durable
+  `m_prefrontal-routing` and issues its own-durable pull, ack and info grant.
+
 ## 0.4.4
 
 - Take cortexkit-bus-naming 0.2.3: bootstrap the closed event-consumer table's

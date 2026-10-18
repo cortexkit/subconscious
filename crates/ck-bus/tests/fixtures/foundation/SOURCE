@@ -3,8 +3,8 @@ source_commit: b9e827c69d98fb0c1241925961ebb5184752a25a
 source_path: docs/specs/nats-message-plane-foundation.md
 source_sha256: bc306d7478134fb02b3ac5c5cc8271e52b34cbeffd95fb1a999ed5d6916ef657
 golden_repository: cortexkit/commons
-golden_commit: 4af0f7e1aabf92499d876a99684be99c03e4cc74
+golden_commit: 28b7507904bc413f845365ba72ffc18b1e4054fd
 golden_path: crates/cortexkit-bus-naming/tests/grants/permission_golden.txt
-golden_sha256: eb73890a530fc00328baae3518542090f18ec82d7901f90295a20a978a46e5bb
+golden_sha256: 4ceed84fff8e8684beaead13adf7dfdba3a83984ad5350ad0415b3ffb8a294db
 recorded_at: 2026-10-18
-golden_crate_version: cortexkit-bus-naming 0.2.3
+golden_crate_version: cortexkit-bus-naming 0.2.4

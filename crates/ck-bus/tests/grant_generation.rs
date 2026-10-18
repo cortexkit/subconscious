@@ -197,6 +197,8 @@ fn grant_generation_emits_each_role_set_from_the_pinned_literals() {
     .expect("flow-engine grant");
     let astrocyte = grants::issued_grant(&account, "astrocyte", "astrocyte", &[])
         .expect("astrocyte's issued participant grant");
+    let routing = grants::issued_grant(&account, "prefrontal-routing", "prefrontal-routing", &[])
+        .expect("prefrontal-routing's issued participant grant");
     let by_role = [
         (Principal::Participant, &participant),
         (Principal::DeliveryAuthority, &delivery),
@@ -204,6 +206,7 @@ fn grant_generation_emits_each_role_set_from_the_pinned_literals() {
         (Principal::System, &system),
         (Principal::FlowEngine, &flow_engine),
         (Principal::EventConsumer("astrocyte"), &astrocyte),
+        (Principal::EventConsumer("prefrontal-routing"), &routing),
     ];
 
     for (principal, grant) in by_role {
@@ -366,7 +369,7 @@ fn vendored_foundation_and_golden_match_their_source_record() {
     // so it moves with the pin in Cargo.toml.
     assert_eq!(
         field("golden_commit"),
-        "4af0f7e1aabf92499d876a99684be99c03e4cc74"
+        "28b7507904bc413f845365ba72ffc18b1e4054fd"
     );
     for (file, digest_field) in [
         ("nats-message-plane-foundation.md", "source_sha256"),

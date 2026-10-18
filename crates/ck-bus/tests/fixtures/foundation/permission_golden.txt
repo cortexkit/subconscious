@@ -193,6 +193,32 @@ allow astrocyte publish ck.box_goldenfixture.effect.dead
 allow astrocyte publish ck.box_goldenfixture.event.astrocyte.>
 allow astrocyte subscribe $KV.CK_BOX_GOLDENFIXTURE_CENSUS.>
 allow astrocyte subscribe _INBOX.astrocyte.>
+allow prefrontal-routing publish $JS.ACK.CK_BOX_GOLDENFIXTURE_EFFECT.*.>
+allow prefrontal-routing publish $JS.ACK.CK_BOX_GOLDENFIXTURE_EVENT.m_prefrontal-routing.>
+allow prefrontal-routing publish $JS.ACK.CK_BOX_GOLDENFIXTURE_PEER.*.>
+allow prefrontal-routing publish $JS.ACK.CK_BOX_GOLDENFIXTURE_WAKE.*.>
+allow prefrontal-routing publish $JS.API.CONSUMER.CREATE.KV_CK_BOX_GOLDENFIXTURE_CENSUS
+allow prefrontal-routing publish $JS.API.CONSUMER.CREATE.KV_CK_BOX_GOLDENFIXTURE_CENSUS.>
+allow prefrontal-routing publish $JS.API.CONSUMER.DELETE.KV_CK_BOX_GOLDENFIXTURE_CENSUS.>
+allow prefrontal-routing publish $JS.API.CONSUMER.DURABLE.CREATE.KV_CK_BOX_GOLDENFIXTURE_CENSUS.>
+allow prefrontal-routing publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_EFFECT.*
+allow prefrontal-routing publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_EVENT.m_prefrontal-routing
+allow prefrontal-routing publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_PEER.*
+allow prefrontal-routing publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_WAKE.*
+allow prefrontal-routing publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EFFECT.*
+allow prefrontal-routing publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_prefrontal-routing
+allow prefrontal-routing publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_PEER.*
+allow prefrontal-routing publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_WAKE.*
+allow prefrontal-routing publish $JS.API.DIRECT.GET.KV_CK_BOX_GOLDENFIXTURE_CENSUS.>
+allow prefrontal-routing publish $JS.API.STREAM.INFO.CK_BOX_GOLDENFIXTURE_EFFECT
+allow prefrontal-routing publish $JS.API.STREAM.INFO.CK_BOX_GOLDENFIXTURE_PEER
+allow prefrontal-routing publish $JS.API.STREAM.INFO.CK_BOX_GOLDENFIXTURE_WAKE
+allow prefrontal-routing publish $JS.API.STREAM.INFO.KV_CK_BOX_GOLDENFIXTURE_CENSUS
+allow prefrontal-routing publish $JS.API.STREAM.MSG.GET.KV_CK_BOX_GOLDENFIXTURE_CENSUS
+allow prefrontal-routing publish ck.box_goldenfixture.effect.dead
+allow prefrontal-routing publish ck.box_goldenfixture.event.prefrontal-routing.>
+allow prefrontal-routing subscribe $KV.CK_BOX_GOLDENFIXTURE_CENSUS.>
+allow prefrontal-routing subscribe _INBOX.prefrontal-routing.>
 
 expect-refused participant publish $JS.ACK.CK_BOX_GOLDENFIXTURE_ROOM.m_prefrontal-core.> room-durable
 expect-refused participant publish $JS.API.CONSUMER.CREATE.CK_BOX_GOLDENFIXTURE_EFFECT.c_agent_gold_a consumer-create
@@ -225,6 +251,7 @@ expect-refused delivery-authority publish $JS.API.CONSUMER.DELETE.CK_BOX_GOLDENF
 expect-refused delivery-authority publish $JS.API.CONSUMER.DURABLE.CREATE.CK_BOX_GOLDENFIXTURE_ROOM.m_prefrontal-core durable-create
 expect-refused delivery-authority publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_astrocyte foreign-event-durable
 expect-refused delivery-authority publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_basal foreign-event-durable
+expect-refused delivery-authority publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_prefrontal-routing foreign-event-durable
 expect-refused delivery-authority publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_ROOM.m_ckbus foreign-room-durable
 expect-refused delivery-authority publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_ROOM.m_other foreign-room-durable
 expect-refused delivery-authority publish $JS.API.STREAM.MSG.GET.CK_BOX_GOLDENFIXTURE_EVENT event-direct-read
@@ -258,6 +285,15 @@ expect-refused astrocyte publish $JS.API.CONSUMER.CREATE.CK_BOX_GOLDENFIXTURE_EV
 expect-refused astrocyte publish $JS.API.CONSUMER.DELETE.CK_BOX_GOLDENFIXTURE_EVENT.m_astrocyte event-consumer-delete
 expect-refused astrocyte publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_basal foreign-event-durable
 expect-refused astrocyte publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_prefrontal-core foreign-event-durable
+expect-refused astrocyte publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_prefrontal-routing foreign-event-durable
 expect-refused astrocyte publish $JS.API.STREAM.MSG.GET.CK_BOX_GOLDENFIXTURE_EVENT event-direct-read
 expect-refused astrocyte publish ck.box_goldenfixture.event.broca.run.v1 foreign-module-event
 expect-refused astrocyte publish ck.box_goldenfixture.event.insula.quota_sampled.v1 foreign-module-event
+expect-refused prefrontal-routing publish $JS.API.CONSUMER.CREATE.CK_BOX_GOLDENFIXTURE_EVENT event-consumer-create
+expect-refused prefrontal-routing publish $JS.API.CONSUMER.DELETE.CK_BOX_GOLDENFIXTURE_EVENT.m_prefrontal-routing event-consumer-delete
+expect-refused prefrontal-routing publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_astrocyte foreign-event-durable
+expect-refused prefrontal-routing publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_basal foreign-event-durable
+expect-refused prefrontal-routing publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_prefrontal-core foreign-event-durable
+expect-refused prefrontal-routing publish $JS.API.STREAM.MSG.GET.CK_BOX_GOLDENFIXTURE_EVENT event-direct-read
+expect-refused prefrontal-routing publish ck.box_goldenfixture.event.broca.run.v1 foreign-module-event
+expect-refused prefrontal-routing publish ck.box_goldenfixture.event.insula.quota_sampled.v1 foreign-module-event

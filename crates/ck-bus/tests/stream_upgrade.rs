@@ -453,6 +453,11 @@ async fn a_five_stream_plane_upgrades_in_place_to_six_streams_and_the_module_dur
             format!("ck.{}.event.insula.>", names.account()),
         ),
         (
+            streams.event.clone(),
+            "m_prefrontal-routing",
+            format!("ck.{}.event.insula.>", names.account()),
+        ),
+        (
             streams.room.clone(),
             "m_prefrontal-core",
             names.room_binding(),
@@ -691,7 +696,11 @@ async fn bootstrap_creates_every_table_event_durable_with_its_filter_and_setting
         return;
     };
     drop(plane.bootstrap().await);
-    for (durable, module) in [("m_prefrontal-core", "broca"), ("m_astrocyte", "insula")] {
+    for (durable, module) in [
+        ("m_prefrontal-core", "broca"),
+        ("m_astrocyte", "insula"),
+        ("m_prefrontal-routing", "insula"),
+    ] {
         let info = plane.consumer(durable).await.get_info().await.unwrap();
         let config = info.config;
         let filters = if config.filter_subjects.is_empty() {
@@ -725,7 +734,12 @@ async fn second_bootstrap_keeps_event_durable_creation_times_and_ack_floors() {
     drop(plane.bootstrap().await);
     plane.store_event("broca", "run.started").await;
     plane.store_event("insula", "signal").await;
-    let durables = ["m_basal", "m_prefrontal-core", "m_astrocyte"];
+    let durables = [
+        "m_basal",
+        "m_prefrontal-core",
+        "m_astrocyte",
+        "m_prefrontal-routing",
+    ];
     let mut before = Vec::new();
     for durable in durables {
         assert!(plane.ack_one(durable).await > 0);
@@ -905,7 +919,7 @@ async fn prefrontal_event_grant_pulls_and_acks_seven_token_events_but_refuses_ot
     );
     // Check each denied subject through the server's permission-violation callback,
     // not merely a timed-out request that could also mean an unavailable broker.
-    for durable in ["m_basal", "m_astrocyte"] {
+    for durable in ["m_basal", "m_astrocyte", "m_prefrontal-routing"] {
         for verb in ["INFO", "MSG.NEXT"] {
             let subject = format!(
                 "$JS.API.CONSUMER.{verb}.{}.{durable}",
@@ -943,7 +957,8 @@ async fn prefrontal_event_grant_pulls_and_acks_seven_token_events_but_refuses_ot
             .collect::<Vec<_>>()
             .await
             .len(),
-        3,
+        // basal's flow-engine durable plus one per event-consumer table entry
+        1 + cortexkit_bus_naming::EVENT_CONSUMERS.len(),
         "a denied create added no consumer"
     );
     plane.server.stop().await;

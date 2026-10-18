@@ -7,6 +7,10 @@ on:
   push:
     tags:
       - "*-v*"
+      # Test-vector tags share the `-v<n>` suffix but name no crate; without
+      # this exclusion each one runs the full verify matrix and then fails
+      # at publish.
+      - "!fed-pairing-v*"
 
 concurrency:
   # A retag at a different commit must not wait behind a stale release run.

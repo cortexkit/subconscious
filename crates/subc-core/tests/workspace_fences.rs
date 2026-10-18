@@ -15,6 +15,11 @@ fn metadata() -> Value {
     serde_json::from_slice(&output.stdout).expect("metadata JSON")
 }
 
+/// Crates that exist only to be test dependencies of other crates. They may take
+/// the shared test helper as a normal dependency because they are never linked
+/// into a production binary; the second check below keeps it that way.
+const TEST_ONLY_CRATES: &[&str] = &["cortexkit-bus-testkit"];
+
 #[test]
 fn shared_test_support_is_a_registry_dev_dependency() {
     let data = metadata();
@@ -24,14 +29,24 @@ fn shared_test_support_is_a_registry_dev_dependency() {
             package["name"], "subc-test-support",
             "local helper must stay retired"
         );
+        let test_only = TEST_ONLY_CRATES.contains(&package["name"].as_str().unwrap());
         for dependency in package["dependencies"].as_array().unwrap() {
-            if dependency["name"] == "cortexkit-test-support" {
-                consumers += 1;
+            if TEST_ONLY_CRATES.contains(&dependency["name"].as_str().unwrap()) {
                 assert_eq!(
                     dependency["kind"], "dev",
-                    "{} must use the guard only as a dev-dependency",
-                    package["name"]
+                    "{} must take the test-only crate {} only as a dev-dependency",
+                    package["name"], dependency["name"]
                 );
+            }
+            if dependency["name"] == "cortexkit-test-support" {
+                consumers += 1;
+                if !test_only {
+                    assert_eq!(
+                        dependency["kind"], "dev",
+                        "{} must use the guard only as a dev-dependency",
+                        package["name"]
+                    );
+                }
                 assert!(
                     dependency["path"].is_null()
                         && dependency["source"]

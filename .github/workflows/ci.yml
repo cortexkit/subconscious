@@ -362,12 +362,18 @@ jobs:
   # because they only report once someone is already publishing — the failure
   # arrives attached to the one action you least want to abort.
   ts-client:
-    name: TS (${{ matrix.pkg }})
-    runs-on: ubuntu-latest
+    name: TS (${{ matrix.pkg }}${{ matrix.os == 'windows-latest' && ', windows' || '' }})
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         pkg: [subc-client, store, log]
+        os: [ubuntu-latest]
+        # The client also runs on Windows hosts, where loopback TCP can split and
+        # coalesce reads differently, so its unit suite gets a Windows leg too.
+        include:
+          - pkg: subc-client
+            os: windows-latest
     defaults:
       run:
         working-directory: clients/${{ matrix.pkg }}
@@ -429,21 +435,23 @@ jobs:
       # Restricted to the subc-client leg: the store and log packages have no
       # daemon tests, so building a daemon there would be pure cost.
       - uses: dtolnay/rust-toolchain@stable
-        if: ${{ !cancelled() && matrix.pkg == 'subc-client' }}
+        if: ${{ !cancelled() && matrix.pkg == 'subc-client' && matrix.os == 'ubuntu-latest' }}
       # tests/live-daemon.ts builds the daemon itself when target/debug/ck-subc is
       # missing, so this step is not what makes the suite work -- it moves the
       # build OUT of the first test, where a cold compile would run against bun's
       # per-test timeout and fail as a daemon defect rather than a slow build.
       # Path and target must stay in step with DAEMON in that helper.
       - name: Pre-build ck-subc for the live suite
-        if: ${{ !cancelled() && matrix.pkg == 'subc-client' }}
+        if: ${{ !cancelled() && matrix.pkg == 'subc-client' && matrix.os == 'ubuntu-latest' }}
         working-directory: .
         run: cargo build --locked -p subc-core --bin ck-subc
       # RUN_SUBC_LIVE only OPENS the gate; it cannot prove the blocks executed.
       # A skipped describe and a passing one both report success, so the step
       # asserts the live tests actually ran -- see the guard in the run body.
+      # The live suite's shell guard uses bash, tee and /tmp, so it runs on the
+      # Linux leg only; the Windows leg runs the unit suite above.
       - name: Live daemon suite
-        if: ${{ !cancelled() && matrix.pkg == 'subc-client' }}
+        if: ${{ !cancelled() && matrix.pkg == 'subc-client' && matrix.os == 'ubuntu-latest' }}
         env:
           RUN_SUBC_LIVE: "1"
         run: |

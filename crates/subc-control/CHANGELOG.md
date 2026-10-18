@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.32.0
+
+- `PendingReloadVerdict` gains `spec: Option<LaunchSpecAgreement>`: whether the running process was started with the module's currently configured launch inputs (program, arguments, configured environment and protocol). `Match`, `Mismatch`, `Unavailable { reason }` (`not_running`, `spawned_spec_unavailable`), or `Unknown` for a status a newer daemon sends. `None` means the daemon predates the field, never agreement. Breaking for code that builds `PendingReloadVerdict` with a struct literal: add `spec`.
+
 ## 0.31.0
 
 - **Breaking dependency upgrade.** Use subc-protocol 0.32 scope selectors with optional bind proofs. Existing selectors serialize unchanged when the proof is absent.

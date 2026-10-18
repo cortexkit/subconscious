@@ -1,6 +1,6 @@
 [package]
 name = "subc-core"
-version = "0.20.102"
+version = "0.20.103"
 edition = "2021"
 license = "MIT"
 publish = false
@@ -38,6 +38,13 @@ required-features = ["test-support"]
 [[bin]]
 name = "mode-umask-helper"
 path = "tests/fixtures/mode-umask-helper.rs"
+required-features = ["test-support"]
+
+# Other workspace tests rebuild fake-aft-stub without test-support. A separate
+# target keeps those builds from replacing the privacy fixture's reporter.
+[[bin]]
+name = "privacy-aft-stub"
+path = "tests/fixtures/privacy-aft-stub.rs"
 required-features = ["test-support"]
 
 [features]

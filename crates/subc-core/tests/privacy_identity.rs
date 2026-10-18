@@ -46,7 +46,7 @@ mod macos {
                 .unwrap()
                 .extend(extra_env.as_object().unwrap().clone());
             let config = json!({"version":1, "modules":{"privacy-stub":{
-                "program":env!("CARGO_BIN_EXE_fake-aft-stub"),
+                "program":env!("CARGO_BIN_EXE_privacy-aft-stub"),
                 "reserved":wire,
                 "protocol":if wire { "subc" } else { "none" }, "overlap":"safe",
                 "restart":{"max_restarts":0}, "env":env
@@ -186,10 +186,10 @@ mod macos {
         });
     }
 
-    pub fn direct_control() {
+    fn direct_observation() -> Value {
         let root = ScratchDir::new("privacy-direct-control");
         let report = root.join("observation.json");
-        let mut child = Command::new(env!("CARGO_BIN_EXE_fake-aft-stub"))
+        let mut child = Command::new(env!("CARGO_BIN_EXE_privacy-aft-stub"))
             .env("FAKE_AFT_PRIVACY_REPORT", &report)
             .env("FAKE_AFT_EXIT_CODE", "0")
             .env_remove("SUBC_LAUNCH_NONCE_FD")
@@ -200,7 +200,21 @@ mod macos {
             .spawn()
             .unwrap();
         assert!(child.wait().unwrap().success());
-        let observation: Value = serde_json::from_slice(&fs::read(report).unwrap()).unwrap();
+        assert!(
+            report.exists(),
+            "privacy fixture exited without writing its report; the reporter must be compiled in"
+        );
+        serde_json::from_slice(&fs::read(report).unwrap()).unwrap()
+    }
+
+    pub fn fixture_reporter() {
+        let observation = direct_observation();
+        assert!(observation["pid"].as_u64().unwrap() > 0);
+        assert!(observation["responsible_pid"].as_u64().unwrap() > 0);
+    }
+
+    pub fn direct_control() {
+        let observation = direct_observation();
         assert_ne!(observation["pid"], observation["responsible_pid"]);
         assert_eq!(
             observation["responsible_pid"],
@@ -256,7 +270,7 @@ mod macos {
         fixture.wait(|| fixture.roster()["children"][0]["executable"].is_object());
         let recorded = fixture.roster();
         let expected =
-            subc_os::file_identity(std::path::Path::new(env!("CARGO_BIN_EXE_fake-aft-stub")))
+            subc_os::file_identity(std::path::Path::new(env!("CARGO_BIN_EXE_privacy-aft-stub")))
                 .unwrap();
         assert_eq!(recorded["children"][0]["pid"], report["pid"]);
         assert_eq!(
@@ -424,7 +438,7 @@ mod macos {
             .unwrap();
         assert_eq!(
             image.executable,
-            subc_os::file_identity(std::path::Path::new(env!("CARGO_BIN_EXE_fake-aft-stub")))
+            subc_os::file_identity(std::path::Path::new(env!("CARGO_BIN_EXE_privacy-aft-stub")))
         );
     }
 }
@@ -444,6 +458,7 @@ macro_rules! macos_test {
 }
 
 macos_test!(macos_module_is_its_own_responsible_process, own_identity);
+macos_test!(macos_privacy_fixture_has_its_reporter, fixture_reporter);
 macos_test!(
     macos_direct_spawn_inherits_responsibility_control,
     direct_control

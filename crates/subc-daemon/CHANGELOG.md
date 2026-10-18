@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.36.11
+
+- At spawn, record a private fingerprint of the module's configured launch inputs (program, ordered arguments, the configured `env` block, protocol), excluding inherited environment and the per-spawn values the daemon injects. `supervisor.list` reports `pending_reload.spec`: `mismatch` after a rescan changes any of them until the module restarts, `unavailable` when no fingerprint was recorded for the running process. The fingerprint itself never leaves the daemon.
+
 ## 0.36.10
 
 - A drain now re-checks a module's declared busy gauges every 250 ms while they read busy, instead of once per health cadence. The default cadence (30 s) equals the default drain ceiling, so a module busy at the drain's first check was never checked again: it waited the full 30 s and was cut with `drained: false` even after its gauges reached zero. Each check still starts only after the previous one finished and is still bounded by the drain ceiling; a missing or unreadable gauge still counts as busy. Health checks outside a drain keep their configured cadence.

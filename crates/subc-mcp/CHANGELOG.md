@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.38
+
+- Move to subc-control 0.32 and subc-client-rs 0.30. No behavior change.
+
 ## 0.1.37
 
 - Upgrade scope wire dependencies to subc-protocol 0.32 and subc-daemon 0.36.

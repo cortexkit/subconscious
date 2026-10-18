@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.4.3
+
+- Move to subc-control 0.32 and subc-client-rs 0.30. No behavior change.
+
 ## 0.4.2
 
 - Reuse cortexkit-bus-testkit for acceptance tests' NATS bootstrap, signing

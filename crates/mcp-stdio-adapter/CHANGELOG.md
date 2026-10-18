@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.15
+
+- Move to subc-control 0.32 and subc-client-rs 0.30. No behavior change.
+
 ## 0.1.14
 
 - Upgrade the SDK and scope wire dependencies for per-scope bind proofs.

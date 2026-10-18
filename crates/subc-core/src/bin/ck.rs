@@ -6169,12 +6169,26 @@ fn reload_list_marker(module: &Value) -> &'static str {
     let path = verdict.pointer("/path/status").and_then(Value::as_str);
     let image = verdict.pointer("/image/status").and_then(Value::as_str);
     let image_reason = verdict.pointer("/image/reason").and_then(Value::as_str);
+    let spec = verdict.pointer("/spec/status").and_then(Value::as_str);
+    if spec == Some("mismatch") {
+        return match (path, image) {
+            (Some("mismatch"), Some("mismatch")) => "pending (path+image+spec)",
+            (Some("mismatch"), _) => "pending (path+spec)",
+            (_, Some("mismatch")) => "pending (image+spec)",
+            _ => "pending (spec)",
+        };
+    }
     match (path, image, image_reason) {
         (Some("mismatch"), Some("mismatch"), _) => "pending (path+image)",
         (Some("mismatch"), _, _) => "pending (path)",
         (Some("match"), Some("mismatch"), _) => "pending (image)",
-        (Some("match"), Some("match"), _) => "nothing",
-        (Some("match"), Some("unavailable"), Some("unsupported_platform")) => "nothing (image n/a)",
+        (Some("match"), Some("match"), _) if spec == Some("match") => "nothing",
+        (Some("match"), Some("match"), _) if spec.is_none() => "nothing (spec not reported)",
+        (Some("match"), Some("unavailable"), Some("unsupported_platform"))
+            if spec == Some("match") =>
+        {
+            "nothing (image n/a)"
+        }
         _ => "unknown",
     }
 }
@@ -6217,6 +6231,24 @@ fn print_reload_verdict(module: &Value) {
         "  running image: {}",
         image_reload_sentence(verdict.get("image"))
     );
+    let spec = verdict.get("spec");
+    let sentence = match spec
+        .and_then(|value| value.get("status"))
+        .and_then(Value::as_str)
+    {
+        Some("match") => "matches running process".to_string(),
+        Some("mismatch") => "pending reload (configured launch inputs changed)".to_string(),
+        Some("unavailable") => format!(
+            "unknown ({})",
+            spec.and_then(|value| value.get("reason"))
+                .and_then(Value::as_str)
+                .map(terminal_safe_string)
+                .unwrap_or_else(|| "reason unavailable".into())
+        ),
+        Some(other) => format!("unknown ({})", terminal_safe_string(other)),
+        None => "not reported".to_string(),
+    };
+    println!("  launch spec: {sentence}");
 }
 
 fn image_reload_sentence(image: Option<&Value>) -> String {
@@ -8915,8 +8947,12 @@ mod tests {
         let unknown = serde_json::json!({"pending_reload": {"path": {"status":"unavailable", "reason":"not_running"}, "image": {"status":"unavailable", "reason":"not_running"}}});
         assert_eq!(reload_list_marker(&unknown), "unknown");
         assert_eq!(reload_list_marker(&serde_json::json!({})), "unknown");
-        let clear = serde_json::json!({"pending_reload": {"path": {"status":"match"}, "image": {"status":"match"}}});
+        let clear = serde_json::json!({"pending_reload": {"path": {"status":"match"}, "image": {"status":"match"}, "spec": {"status":"match"}}});
         assert_eq!(reload_list_marker(&clear), "nothing");
+        let older = serde_json::json!({"pending_reload": {"path": {"status":"match"}, "image": {"status":"match"}}});
+        assert_eq!(reload_list_marker(&older), "nothing (spec not reported)");
+        let spec = serde_json::json!({"pending_reload": {"path": {"status":"match"}, "image": {"status":"unavailable", "reason":"unsupported_platform"}, "spec": {"status":"mismatch"}}});
+        assert_eq!(reload_list_marker(&spec), "pending (spec)");
     }
 
     #[test]
@@ -8971,6 +9007,7 @@ mod tests {
         let module = serde_json::json!({"pending_reload": {
             "path": {"status": "match"},
             "image": {"status": "unavailable", "reason": "unsupported_platform"},
+            "spec": {"status": "match"},
         }});
         assert_eq!(reload_list_marker(&module), "nothing (image n/a)");
         assert_eq!(

@@ -203,7 +203,33 @@ fn reload_verdict(
             },
         },
     };
-    PendingReloadVerdict { path, image }
+    PendingReloadVerdict {
+        path,
+        image,
+        spec: None,
+    }
+}
+
+fn launch_spec_agreement(
+    configured: &crate::supervise::ModuleSpec,
+    running: bool,
+    spawned: Option<&crate::supervise::LaunchSpecDigest>,
+) -> subc_control::LaunchSpecAgreement {
+    use subc_control::{LaunchSpecAgreement as Agreement, LaunchSpecUnavailableReason as Reason};
+    if !running {
+        return Agreement::Unavailable {
+            reason: Reason::NotRunning,
+        };
+    }
+    match spawned {
+        None => Agreement::Unavailable {
+            reason: Reason::SpawnedSpecUnavailable,
+        },
+        Some(digest) if *digest == crate::supervise::LaunchSpecDigest::from_spec(configured) => {
+            Agreement::Match
+        }
+        Some(_) => Agreement::Mismatch,
+    }
 }
 
 fn reload_paths_match(configured: &Path, spawned_from: &Path) -> bool {
@@ -4988,11 +5014,14 @@ impl ControlHandler {
             // Read per request so the figure is current when the operator asks;
             // the daemon samples nothing in between.
             let resources = Some(module.child_resource_usage());
-            let pending_reload = Some(reload_verdict(
-                &configured.program,
-                status.spawned_from.as_deref(),
-                image,
+            let mut verdict =
+                reload_verdict(&configured.program, status.spawned_from.as_deref(), image);
+            verdict.spec = Some(launch_spec_agreement(
+                &configured,
+                status.process_alive,
+                status.launch_spec_digest.as_ref(),
             ));
+            let pending_reload = Some(verdict);
             // Keep the retired policy field on the wire for one release so
             // existing status consumers still receive the platform policy.
             modules.push(
@@ -12934,6 +12963,40 @@ mod tests {
                 if configured == std::path::Path::new("/bin/new")
                     && spawned_from == std::path::Path::new("/bin/old")
         ));
+    }
+
+    #[test]
+    fn launch_spec_without_running_digest_is_unavailable_not_match() {
+        use subc_control::{
+            LaunchSpecAgreement as Agreement, LaunchSpecUnavailableReason as Reason,
+        };
+        let configured = crate::supervise::ModuleSpec {
+            module_id: "legacy".into(),
+            program: "/module".into(),
+            args: Vec::new(),
+            env: Vec::new(),
+            reserved: false,
+            reserved_prefixes: Vec::new(),
+            protocol: subc_control::ModuleProtocol::Subc,
+            overlap: Default::default(),
+        };
+        let digest = crate::supervise::LaunchSpecDigest::from_spec(&configured);
+        assert_eq!(
+            launch_spec_agreement(&configured, false, Some(&digest)),
+            Agreement::Unavailable {
+                reason: Reason::NotRunning
+            }
+        );
+        assert_eq!(
+            launch_spec_agreement(&configured, true, None),
+            Agreement::Unavailable {
+                reason: Reason::SpawnedSpecUnavailable
+            }
+        );
+        assert_eq!(
+            launch_spec_agreement(&configured, true, Some(&digest)),
+            Agreement::Match
+        );
     }
 
     #[cfg(windows)]

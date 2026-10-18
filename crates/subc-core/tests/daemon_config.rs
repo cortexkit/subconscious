@@ -613,8 +613,13 @@ async fn rescan_changed_spec_is_pending_until_reload_uses_it() {
         STATE_TIMEOUT,
     )
     .await;
+    let verdict = pending.pending_reload.unwrap();
+    assert!(matches!(
+        verdict.spec,
+        Some(subc_control::LaunchSpecAgreement::Mismatch)
+    ));
     assert!(
-        matches!(pending.pending_reload.unwrap().path, ReloadPathAgreement::Mismatch { configured, .. } if configured == replacement)
+        matches!(verdict.path, ReloadPathAgreement::Mismatch { configured, .. } if configured == replacement)
     );
     let again = supervisor_rescan(&daemon.connection_file_path, 510).await;
     assert!(again.changed_pending_reload.is_empty());
@@ -639,7 +644,7 @@ async fn rescan_changed_spec_is_pending_until_reload_uses_it() {
     );
     assert!(String::from_utf8(list.stdout)
         .unwrap()
-        .contains("pending (path)"));
+        .contains("pending (path+spec)"));
     let status = ck_under_test_command()
         .args(["module", "status", module_id, "--subc"])
         .arg(&daemon.connection_file_path)
@@ -653,6 +658,10 @@ async fn rescan_changed_spec_is_pending_until_reload_uses_it() {
     let status_text = String::from_utf8(status.stdout).unwrap();
     assert!(
         status_text.contains("configured program: pending reload"),
+        "{status_text}"
+    );
+    assert!(
+        status_text.contains("launch spec: pending reload"),
         "{status_text}"
     );
     assert!(
@@ -681,7 +690,7 @@ async fn rescan_changed_spec_is_pending_until_reload_uses_it() {
         response,
         ClientControlResponse::SupervisorAck { applied: true, .. }
     ));
-    wait_for_supervisor_entry(
+    let reloaded = wait_for_supervisor_entry(
         &daemon.connection_file_path,
         module_id,
         |entry| {
@@ -693,6 +702,10 @@ async fn rescan_changed_spec_is_pending_until_reload_uses_it() {
         STATE_TIMEOUT,
     )
     .await;
+    assert!(matches!(
+        reloaded.pending_reload.unwrap().spec,
+        Some(subc_control::LaunchSpecAgreement::Match)
+    ));
 
     let mut new_client = wait_for_client(&daemon.connection_file_path, START_TIMEOUT).await;
     let new_route = open_route(&mut new_client, module_id, 507).await;
@@ -704,6 +717,83 @@ async fn rescan_changed_spec_is_pending_until_reload_uses_it() {
         call_tool(&mut new_client, new_route, 509, "echo").await,
         "after-reload"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rescan_env_args_and_protocol_only_edits_stay_pending_until_restart() {
+    for dimension in ["env", "args", "protocol"] {
+        let module_id = "launch-only";
+        let mut original = stub_module(module_id, true, [("FAKE_AFT_NEVER_CONNECT", "1")]);
+        if dimension == "args" {
+            original["protocol"] = json!("none");
+        }
+        let daemon =
+            RunningDaemon::start("daemon-launch-spec", Some(config_doc([original.clone()]))).await;
+        wait_for_supervisor_entry(
+            &daemon.connection_file_path,
+            module_id,
+            |entry| {
+                matches!(
+                    entry.pending_reload.as_ref().and_then(|v| v.spec.as_ref()),
+                    Some(subc_control::LaunchSpecAgreement::Match)
+                )
+            },
+            STATE_TIMEOUT,
+        )
+        .await;
+
+        let mut changed = original;
+        match dimension {
+            "env" => changed["env"]["FAKE_AFT_TOOLCALL_RESULT"] = json!("after-rescan"),
+            "args" => changed["args"] = json!(["--new-configured-argument"]),
+            "protocol" => changed["protocol"] = json!("none"),
+            _ => unreachable!(),
+        }
+        fs::write(&daemon.config_path, config_doc([changed])).unwrap();
+        let applied = supervisor_rescan(&daemon.connection_file_path, 960).await;
+        assert_eq!(applied.changed_pending_reload, [module_id], "{dimension}");
+        wait_for_supervisor_entry(
+            &daemon.connection_file_path,
+            module_id,
+            |entry| {
+                matches!(
+                    entry.pending_reload.as_ref().and_then(|v| v.spec.as_ref()),
+                    Some(subc_control::LaunchSpecAgreement::Mismatch)
+                )
+            },
+            STATE_TIMEOUT,
+        )
+        .await;
+        let mut control = wait_for_client(&daemon.connection_file_path, START_TIMEOUT).await;
+        let result = control_rpc_on_stream(
+            &mut control,
+            961,
+            ClientControlRequest::SupervisorRestart {
+                module_id: module_id.into(),
+                drain_timeout_ms: Some(0),
+            },
+        )
+        .await;
+        assert!(
+            matches!(
+                result,
+                ClientControlResponse::SupervisorAck { applied: true, .. }
+            ),
+            "{dimension}"
+        );
+        wait_for_supervisor_entry(
+            &daemon.connection_file_path,
+            module_id,
+            |entry| {
+                matches!(
+                    entry.pending_reload.as_ref().and_then(|v| v.spec.as_ref()),
+                    Some(subc_control::LaunchSpecAgreement::Match)
+                )
+            },
+            STATE_TIMEOUT,
+        )
+        .await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

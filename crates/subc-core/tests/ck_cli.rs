@@ -2961,6 +2961,7 @@ async fn module_list_json_uses_subc_override_and_shows_stub() {
         .iter()
         .find(|module| module["module_id"] == module_id)
         .unwrap();
+    assert_eq!(entry["pending_reload"]["spec"]["status"], "match");
     if cfg!(windows) {
         assert_eq!(entry["launch_nonce_source"], "pipe");
     } else {
@@ -3069,9 +3070,9 @@ async fn module_list_keeps_configured_path_mismatch_pending_on_every_platform() 
     assert_exit(&output, 0);
     let stdout = text(&output.stdout);
     let expected_suffix = if cfg!(windows) {
-        "pending (path)  pipe"
+        "pending (path+spec)  pipe"
     } else {
-        "pending (path)"
+        "pending (path+spec)"
     };
     assert!(
         stdout.lines().any(|line| {
@@ -3081,6 +3082,106 @@ async fn module_list_keeps_configured_path_mismatch_pending_on_every_platform() 
     );
 
     module.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn launch_inputs_change_pending_spec_until_restart() {
+    for dimension in ["env", "args", "protocol"] {
+        let server = TestServer::start().await;
+        let supervisor = supervisor(&server);
+        let module_id = "spec-change";
+        let mut spec = stub_spec(module_id);
+        if dimension != "env" {
+            spec.env.push(("FAKE_AFT_NEVER_CONNECT".into(), "1".into()));
+        }
+        if dimension == "args" {
+            spec.protocol = ModuleProtocol::None;
+        }
+        let module = supervisor.spawn(spec.clone()).unwrap();
+        let before = assert_json_success(ck_with_subc(
+            &server.connection_file_path,
+            ["module", "list", "--json"],
+        ));
+        assert_eq!(
+            before["modules"][0]["pending_reload"]["spec"]["status"], "match",
+            "{dimension}"
+        );
+        match dimension {
+            "env" => spec
+                .env
+                .push(("FAKE_AFT_TOOLCALL_RESULT".into(), "updated".into())),
+            "args" => spec.args.push("--different-launch-input".into()),
+            "protocol" => spec.protocol = ModuleProtocol::None,
+            _ => unreachable!(),
+        }
+        module.update_spec_for_test(spec).await.unwrap();
+        let pending = assert_json_success(ck_with_subc(
+            &server.connection_file_path,
+            ["module", "list", "--json"],
+        ));
+        assert_eq!(
+            pending["modules"][0]["pending_reload"]["spec"]["status"], "mismatch",
+            "{dimension}"
+        );
+        let before_generation = module.status().unwrap().spawn_generation;
+        module.restart(None).await.unwrap();
+        wait_for_supervisor_entry(&server.connection_file_path, module_id, |entry| {
+            entry.state == "running"
+                && entry
+                    .spawn_generation
+                    .is_some_and(|generation| generation > before_generation)
+        })
+        .await;
+        let after = assert_json_success(ck_with_subc(
+            &server.connection_file_path,
+            ["module", "list", "--json"],
+        ));
+        assert_eq!(
+            after["modules"][0]["pending_reload"]["spec"]["status"], "match",
+            "{dimension}"
+        );
+        module.stop().await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn distinct_connection_files_and_fresh_nonces_do_not_pending_reload() {
+    let first = TestServer::start().await;
+    let second = TestServer::start().await;
+    assert_ne!(first.connection_file_path, second.connection_file_path);
+    let first_supervisor = supervisor(&first);
+    let second_supervisor = supervisor(&second);
+    let first_module = spawn_stub(&first, &first_supervisor, "same-spec").await;
+    let second_module = spawn_stub(&second, &second_supervisor, "same-spec").await;
+    for server in [&first, &second] {
+        let list = assert_json_success(ck_with_subc(
+            &server.connection_file_path,
+            ["module", "list", "--json"],
+        ));
+        assert_eq!(
+            list["modules"][0]["pending_reload"]["spec"]["status"],
+            "match"
+        );
+    }
+    let before_generation = first_module.status().unwrap().spawn_generation;
+    first_module.restart(None).await.unwrap();
+    wait_for_supervisor_entry(&first.connection_file_path, "same-spec", |entry| {
+        entry.state == "running"
+            && entry
+                .spawn_generation
+                .is_some_and(|generation| generation > before_generation)
+    })
+    .await;
+    let list = assert_json_success(ck_with_subc(
+        &first.connection_file_path,
+        ["module", "list", "--json"],
+    ));
+    assert_eq!(
+        list["modules"][0]["pending_reload"]["spec"]["status"],
+        "match"
+    );
+    first_module.stop().await.unwrap();
+    second_module.stop().await.unwrap();
 }
 
 /// What an operator is told about a module that speaks no subc wire.
@@ -3202,6 +3303,10 @@ async fn module_status_renders_key_value_block_byte_for_byte() {
         ["module", "status", "aft", "--json"],
     ));
     assert_eq!(status_json["module"]["module_id"], "aft");
+    assert_eq!(
+        status_json["module"]["pending_reload"]["spec"]["status"],
+        "match"
+    );
     assert_eq!(status_json["health"]["status"], "degraded");
     if cfg!(windows) {
         assert_eq!(status_json["module"]["launch_nonce_source"], "pipe");
@@ -3290,7 +3395,7 @@ async fn module_status_renders_key_value_block_byte_for_byte() {
     assert_eq!(
         rest,
         format!(
-            "0 of 1 in 10m · drain 25 ms · restart backoff 10 ms to 30s\n  launch_nonce_env: {nonce_env}{nonce_source}\n  last exit: none\n  drain gauges: 0 drains with undeclared gauge\n  binary: {binary} ({image})\n  configured program: matches running process\n  running image: {image_verdict}\n",
+            "0 of 1 in 10m · drain 25 ms · restart backoff 10 ms to 30s\n  launch_nonce_env: {nonce_env}{nonce_source}\n  last exit: none\n  drain gauges: 0 drains with undeclared gauge\n  binary: {binary} ({image})\n  configured program: matches running process\n  running image: {image_verdict}\n  launch spec: matches running process\n",
             nonce_env = !cfg!(unix),
             nonce_source = if cfg!(windows) { "\n  launch nonce source (daemon): pipe" } else { "" },
         )

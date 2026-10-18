@@ -148,8 +148,16 @@ enforced on a module's `HELLO`, and a module that never registers never sends
 one, so the pair declares a protection that could never be checked.
 
 A `protocol` change on a running module is a pending-reload difference, like
-`program` or `args`: `supervisor.rescan --dry-run` reports it, and it takes
-effect when the module is next reloaded.
+`program`, `args` or configured `env`: `supervisor.rescan --dry-run` reports it;
+after apply, `ck module list` names `spec` as pending until the module restarts.
+`ck module status` reports independent path, image and launch-spec verdicts.
+The launch-spec comparison covers exactly the configured program, ordered args,
+configured env block and protocol. It ignores inherited environment, the
+connection file path, module id and launch nonce injected on each spawn. The
+status (`match`, `mismatch` or `unavailable`) goes over the control wire, plus
+a reason when it is `unavailable`; the digest stays in the daemon. A stopped
+module or a running process without a recorded digest reports `unavailable`,
+and an older daemon's omitted spec verdict is rendered as `not reported`.
 
 ## Pre-auth limits are not configuration
 

@@ -5,12 +5,13 @@ use serde_json::Value;
 use subc_control::{
     CatalogEntry, ChildMemoryKind, ChildResourceReading, ChildResourceUnavailableReason,
     ChildResourceUsage, ClientControlPush, ClientControlRequest, ClientControlResponse,
-    ConsumerIdentity, DaemonBuildProvenance, DaemonObservedProcess, LiveSpawn,
-    ModuleDeclaredProvenance, ModuleProtocol, NotReadyReason, PendingReloadVerdict, PollKind,
-    ReloadPathAgreement, ReloadPathUnavailableReason, RouteCloseReason, RunningImageAgreement,
-    RunningImageEvidence, RunningImageUnavailableReason, SpawnCursor, SpawnEvent, SpawnEventKind,
-    SpawnSnapshot, StderrCaptureState, StderrTail, StderrTailEntry, SupervisorDaemonProvenance,
-    SupervisorEntry, SupervisorHealthEntry, SupervisorHealthStatus, SupervisorModuleProvenance,
+    ConsumerIdentity, DaemonBuildProvenance, DaemonObservedProcess, LaunchSpecAgreement,
+    LaunchSpecUnavailableReason, LiveSpawn, ModuleDeclaredProvenance, ModuleProtocol,
+    NotReadyReason, PendingReloadVerdict, PollKind, ReloadPathAgreement,
+    ReloadPathUnavailableReason, RouteCloseReason, RunningImageAgreement, RunningImageEvidence,
+    RunningImageUnavailableReason, SpawnCursor, SpawnEvent, SpawnEventKind, SpawnSnapshot,
+    StderrCaptureState, StderrTail, StderrTailEntry, SupervisorDaemonProvenance, SupervisorEntry,
+    SupervisorHealthEntry, SupervisorHealthStatus, SupervisorModuleProvenance,
     SupervisorObservedProcess, SupervisorRescanResult, SupervisorRoute, SupervisorRouteConsumer,
     SupervisorRouteModule,
 };
@@ -105,6 +106,7 @@ fn control_wire_shapes_match_golden_json_and_round_trip() {
             image: RunningImageAgreement::Match {
                 evidence: evidence("old"),
             },
+            spec: Some(LaunchSpecAgreement::Mismatch),
         },
         PendingReloadVerdict {
             path: ReloadPathAgreement::Match,
@@ -112,6 +114,7 @@ fn control_wire_shapes_match_golden_json_and_round_trip() {
                 running: evidence("old"),
                 disk: evidence("new"),
             },
+            spec: Some(LaunchSpecAgreement::Match),
         },
         PendingReloadVerdict {
             path: ReloadPathAgreement::Unavailable {
@@ -120,12 +123,16 @@ fn control_wire_shapes_match_golden_json_and_round_trip() {
             image: RunningImageAgreement::Unavailable {
                 reason: RunningImageUnavailableReason::NotRunning,
             },
+            spec: Some(LaunchSpecAgreement::Unavailable {
+                reason: LaunchSpecUnavailableReason::NotRunning,
+            }),
         },
         PendingReloadVerdict {
             path: ReloadPathAgreement::Match,
             image: RunningImageAgreement::Match {
                 evidence: evidence("same"),
             },
+            spec: None,
         },
     ];
     assert_golden(

@@ -5,7 +5,7 @@ import XCTest
 
 enum PairingVectors {
     typealias Object = [String: Any]
-    static let manifestSHA256 = "537138af3bced55bd32e8c1dd3ab70d365fdcf03b44dbef8bba9b419062be2b6"
+    static let manifestSHA256 = "c158b9db12d39aab1ade7869774e430da8302feb3db2a7f70a0e41645c82889c"
     static func url(_ name: String) throws -> URL {
         try XCTUnwrap(Bundle.module.url(forResource: name, withExtension: nil, subdirectory: "fed-pairing-v1"))
     }

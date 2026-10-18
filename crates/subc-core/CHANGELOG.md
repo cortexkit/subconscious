@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.20.102
+
+- Test-only: give macOS privacy-identity checks a dedicated module fixture whose required feature preserves its observation reporter when other workspace tests rebuild the ordinary fake module without test support. Production daemon behavior and exec timeouts are unchanged.
+
 ## 0.20.101
 
 - Require subc-daemon 0.36.9. When a client connection ends because the peer closed it or a read failed, the daemon now stops the connection's outgoing writer after a two-second flush grace, as it already did for a requested close, so a peer that stops reading can no longer hold the connection's cleanup forever.

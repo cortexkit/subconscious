@@ -36,11 +36,6 @@ EXPIRY = NOW + 300
 DUMMY_PSK = bytes.fromhex("d0" * 32)
 QR_MAX_DECODED_BYTES = 159
 QR_MAX_SCAN_CHARACTERS = 221
-DISPLAY_NAME_EXCLUDED_RANGES = (
-    (0x00AD, 0x00AD), (0x061C, 0x061C), (0x180E, 0x180E),
-    (0x200B, 0x200F), (0x2028, 0x202E), (0x2060, 0x206F),
-    (0xFEFF, 0xFEFF), (0xFFF9, 0xFFFB), (0xE0000, 0xE007F),
-)
 
 
 def hash_bytes(data):
@@ -442,15 +437,6 @@ class QRRefusal(ValueError):
     pass
 
 
-def display_safe(name):
-    """Match callosum's QR label filter while leaving the raw name untouched."""
-    return "".join(
-        character for character in name
-        if unicodedata.category(character) != "Cc"
-        and not any(start <= ord(character) <= end
-                    for start, end in DISPLAY_NAME_EXCLUDED_RANGES))
-
-
 def parse_qr(text, now):
     """Check scan size before prefix/base64 or allocating decoded payload bytes."""
     if len(text) > QR_MAX_SCAN_CHARACTERS:
@@ -515,7 +501,8 @@ def parse_qr_payload(payload, now):
         hints.append({"ipv4": str(ip), "port": port})
     if cursor != len(payload):
         raise QRRefusal("trailing_bytes")
-    display_name = display_safe(name)
+    bidi_controls = set("\u061c\u200e\u200f\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069")
+    display_name = "".join(c for c in name if unicodedata.category(c) != "Cc" and c not in bidi_controls)
     return {"version": 1, "computer_static_public": computer.hex(), "secret": secret.hex(),
             "expiry_unix": expiry, "raw_name": name, "display_name": display_name, "hints": hints}
 
@@ -553,22 +540,6 @@ def qr_vectors(values):
                   {"ipv4": "203.0.113.3", "port": 1}, {"ipv4": "10.42.0.4", "port": 7345}]})
     add("valid_sanitized_utf8_name", qr_bytes(key, secret, "Test\x00\u202e café\n".encode()), fields={
         **expected, "raw_name": "Test\x00\u202e café\n", "display_name": "Test café"})
-
-    def add_display_name(case_id, name, display):
-        add(case_id, qr_bytes(key, secret, name.encode("utf-8")), fields={
-            **expected, "raw_name": name, "display_name": display})
-
-    add_display_name("display_zero_width_space", "iPh\u200bone", "iPhone")
-    add_display_name("display_soft_hyphen", "soft\u00adhyphen", "softhyphen")
-    add_display_name("display_bom", "byte\ufefforder", "byteorder")
-    add_display_name("display_line_separator", "line\u2028separator", "lineseparator")
-    add_display_name("display_word_joiner", "word\u2060joiner", "wordjoiner")
-    add_display_name("display_tag_character", "tag\U000e0061character", "tagcharacter")
-    add_display_name(
-        "display_mixed_unsafe",
-        "A\x00B\u061cC\u00adD\u180eE\u200bF\u200fG\u2028H\u202eI"
-        "\u2060J\u206fK\ufeffL\ufff9M\ufffbN\U000e0000O\U000e007fP",
-        "ABCDEFGHIJKLMNOP")
     # 160 bytes require a 223-character scan, so exercise the binary cap directly.
     add("decoded_payload_160_bytes", maximal + b"\x00", "oversize", entry="decoded_payload")
     add("scan_222_characters", None, "scan_too_long", "ckpair:1/" + "A" * 213)

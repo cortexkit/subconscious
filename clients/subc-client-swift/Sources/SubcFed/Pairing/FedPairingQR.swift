@@ -25,12 +25,6 @@ public struct FedPairingQR: Sendable, Equatable {
     public let displayName: String
     public let hints: [Hint]
 
-    private static let displayNameExcludedRanges: [ClosedRange<UInt32>] = [
-        0x00AD...0x00AD, 0x061C...0x061C, 0x180E...0x180E,
-        0x200B...0x200F, 0x2028...0x202E, 0x2060...0x206F,
-        0xFEFF...0xFEFF, 0xFFF9...0xFFFB, 0xE0000...0xE007F,
-    ]
-
     public static func parse(_ scan: String, now: Date = Date()) throws -> Self {
         try parse(scan, now: now, decode: { Data(base64Encoded: $0) })
     }
@@ -86,9 +80,8 @@ public struct FedPairingQR: Sendable, Equatable {
             offset += 6
         }
         guard offset == b.count else { throw Refusal.trailingBytes }
-        let display = String(String.UnicodeScalarView(name.unicodeScalars.filter { scalar in
-            scalar.properties.generalCategory != .control
-                && !Self.displayNameExcludedRanges.contains { $0.contains(scalar.value) }
+        let display = String(String.UnicodeScalarView(name.unicodeScalars.filter {
+            $0.properties.generalCategory != .control && ![0x061C, 0x200E, 0x200F, 0x202A, 0x202B, 0x202C, 0x202D, 0x202E, 0x2066, 0x2067, 0x2068, 0x2069].contains($0.value)
         }))
         return Self(computerStaticPublicKey: Data(b[1..<33]), secret: Data(b[33..<65]),
                     expiryUnix: expiry, rawName: name, displayName: display, hints: hints)

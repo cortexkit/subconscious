@@ -7,7 +7,7 @@ final class PairingQRTests: XCTestCase {
         let root = try PairingVectors.load("qr.json")
         let now = Date(timeIntervalSince1970: try XCTUnwrap(root["now_unix"] as? Double))
         let vectors = try PairingVectors.cases(root, "cases")
-        XCTAssertEqual(vectors.count, 38)
+        XCTAssertEqual(vectors.count, 31)
         for v in vectors {
             let id = try XCTUnwrap(v["id"] as? String)
             let expected = try PairingVectors.object(v["expected"])

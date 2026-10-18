@@ -345,6 +345,29 @@ async fn private_daemon_isolates_and_cleans_up() {
     assert_eq!(homes["data"], daemon.data_home.display().to_string());
     assert_eq!(homes["runtime"], daemon.runtime_dir.display().to_string());
     assert_eq!(homes["config"], daemon.config_home.display().to_string());
+    // The daemon allocated a real per-module SQLite descriptor under the private
+    // data home, as production does, so a module opening a leased store can run.
+    wait_file(
+        &daemon.runtime_dir.join("module-storage.json"),
+        Some(&daemon),
+    )
+    .await;
+    let storage: Value = serde_json::from_slice(
+        &std::fs::read(daemon.runtime_dir.join("module-storage.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        storage["backend"]["backend"], "sqlite",
+        "storage descriptor: {storage}"
+    );
+    assert_eq!(
+        storage["backend"]["path"],
+        format!(
+            "{}/cortexkit/{module_id}/store.db",
+            daemon.data_home.display()
+        ),
+        "storage descriptor: {storage}"
+    );
     let root = daemon.root().to_path_buf();
     let pid = daemon.pid();
     let module_pids = [

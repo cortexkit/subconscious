@@ -28,6 +28,17 @@ impl Default for DaemonOptions {
     }
 }
 
+/// Add the daemon's central storage section, as every production config has, so
+/// each module's HELLO_ACK carries a real storage descriptor. The backend is
+/// SQLite under the private data home, never the operator's: a module that opens
+/// its leased store then exercises the daemon's own per-module allocation.
+fn with_storage(config: &str, data_home: &Path) -> Result<String, RigError> {
+    let mut value: serde_json::Value =
+        serde_json::from_str(config).map_err(|error| RigError::Invalid(error.to_string()))?;
+    value["storage"] = serde_json::json!({"backend": "sqlite", "data_home": data_home});
+    serde_json::to_string_pretty(&value).map_err(|error| RigError::Invalid(error.to_string()))
+}
+
 pub fn new_machine_id() -> String {
     let key = nkeys::KeyPair::new_user();
     crate::signer::hex(&Sha256::digest(key.public_key().as_bytes())[..16])
@@ -82,7 +93,10 @@ impl PrivateDaemon {
         let config_file = config_home.join("cortexkit/subc.jsonc");
         std::fs::write(
             &config_file,
-            crate::subc_config(&ck_bus, &bus.ckbus_env(), &options.modules)?,
+            with_storage(
+                &crate::subc_config(&ck_bus, &bus.ckbus_env(), &options.modules)?,
+                &data_home,
+            )?,
         )?;
         let connection_file = runtime_dir.join("subc-connection.json");
         let log = root.path().join("daemon.log");

@@ -28,6 +28,17 @@ impl ModuleHandler for Idle {
     async fn handle(&self, _ctx: RequestCtx, _body: Vec<u8>) -> HandlerOutcome {
         HandlerOutcome::Response(b"{}".to_vec())
     }
+
+    /// Record the storage descriptor the daemon allocated for this module, so a
+    /// test can check the private daemon serves one under its own data home.
+    async fn on_hello_ack(&self, ack: &subc_protocol::ModuleHelloAckBody) {
+        let runtime = PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap());
+        std::fs::write(
+            runtime.join("module-storage.json"),
+            serde_json::to_vec(&ack.storage).unwrap(),
+        )
+        .unwrap();
+    }
 }
 
 async fn ckbus_call(

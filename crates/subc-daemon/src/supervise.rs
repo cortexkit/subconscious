@@ -10,6 +10,7 @@ use std::{
 
 use cortexkit_log::Retention;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use subc_control::{
     ClientControlPush, LiveSpawn, ModuleProtocol, RouteCloseReason, SpawnCursor, SpawnEvent,
     SpawnEventKind, SpawnSnapshot, SupervisorHealthStatus, TerminalDisposition, TerminalExitKind,
@@ -359,6 +360,7 @@ struct SupervisedChild {
     stderr_ring: Arc<Mutex<StderrRing>>,
     spawned_at_ms: u64,
     spawned_from: PathBuf,
+    launch_spec_digest: LaunchSpecDigest,
     spawned_file_identity: Option<SpawnedFileIdentity>,
     process_start_time: Option<u64>,
     process_identity: Option<ProcessIdentity>,
@@ -732,6 +734,73 @@ pub struct ModuleSpec {
     /// config because the daemon must be able to answer it while the module is
     /// down, and so a module cannot talk itself into it after registering.
     pub overlap: ModuleOverlap,
+}
+
+/// Only the configured launch inputs enter this value; spawned connection paths,
+/// nonces and inherited environment never do. Its bytes remain daemon-private.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct LaunchSpecDigest([u8; 32]);
+
+impl fmt::Debug for LaunchSpecDigest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("LaunchSpecDigest([redacted])")
+    }
+}
+
+impl LaunchSpecDigest {
+    pub(crate) fn from_spec(spec: &ModuleSpec) -> Self {
+        fn field(hash: &mut Sha256, bytes: &[u8]) {
+            hash.update((bytes.len() as u64).to_le_bytes());
+            hash.update(bytes);
+        }
+        let mut hash = Sha256::new();
+        if let Some(program) = spec.program.to_str() {
+            field(&mut hash, b"utf8-program");
+            field(&mut hash, program.as_bytes());
+        } else {
+            // The daemon config is UTF-8, but in-process callers may provide
+            // native paths: lossy conversion would collapse distinct programs.
+            #[cfg(unix)]
+            {
+                use std::os::unix::ffi::OsStrExt;
+                field(&mut hash, b"unix-program");
+                field(&mut hash, spec.program.as_os_str().as_bytes());
+            }
+            #[cfg(windows)]
+            {
+                use std::os::windows::ffi::OsStrExt;
+                field(&mut hash, b"windows-program");
+                let bytes = spec
+                    .program
+                    .as_os_str()
+                    .encode_wide()
+                    .flat_map(u16::to_le_bytes)
+                    .collect::<Vec<_>>();
+                field(&mut hash, &bytes);
+            }
+            #[cfg(not(any(unix, windows)))]
+            field(&mut hash, spec.program.to_string_lossy().as_bytes());
+        }
+        hash.update((spec.args.len() as u64).to_le_bytes());
+        for arg in &spec.args {
+            field(&mut hash, arg.as_bytes());
+        }
+        let mut env = spec.env.iter().collect::<Vec<_>>();
+        env.sort_unstable();
+        hash.update((env.len() as u64).to_le_bytes());
+        for (key, value) in env {
+            field(&mut hash, key.as_bytes());
+            field(&mut hash, value.as_bytes());
+        }
+        field(
+            &mut hash,
+            match spec.protocol {
+                ModuleProtocol::Subc => b"subc",
+                ModuleProtocol::None => b"none",
+            },
+        );
+        Self(hash.finalize().into())
+    }
 }
 
 /// Whether a module tolerates a second process of itself running alongside.
@@ -1136,6 +1205,7 @@ pub struct ModuleStatus {
     pub pid: Option<u32>,
     pub spawned_at_ms: Option<u64>,
     pub spawned_from: Option<PathBuf>,
+    pub(crate) launch_spec_digest: Option<LaunchSpecDigest>,
     pub process_start_time: Option<u64>,
     pub last_exit: Option<ExitReport>,
     pub health: ModuleHealthStatus,
@@ -1197,6 +1267,7 @@ struct SupervisorSnapshot {
     coalesced_restart_pending: bool,
     spawned_at_ms: Option<u64>,
     spawned_from: Option<PathBuf>,
+    launch_spec_digest: Option<LaunchSpecDigest>,
     spawned_file_identity: Option<SpawnedFileIdentity>,
     process_start_time: Option<u64>,
     deliberate_severance: Option<ProcessIdentity>,
@@ -1330,6 +1401,7 @@ impl SupervisorSnapshot {
             coalesced_restart_pending: false,
             spawned_at_ms: None,
             spawned_from: None,
+            launch_spec_digest: None,
             spawned_file_identity: None,
             process_start_time: None,
             deliberate_severance: None,
@@ -3595,6 +3667,7 @@ impl SupervisedModule {
                 pid: snapshot.reported_pid(),
                 spawned_at_ms: snapshot.spawned_at_ms,
                 spawned_from: snapshot.spawned_from,
+                launch_spec_digest: snapshot.launch_spec_digest,
                 process_start_time: snapshot.process_start_time,
                 last_exit: snapshot.last_exit,
                 health: snapshot.health,
@@ -5641,6 +5714,7 @@ mod tests {
             snapshot.pid = Some(41);
             snapshot.spawned_at_ms = Some(42);
             snapshot.spawned_from = Some(PathBuf::from("/spawned/module"));
+            snapshot.launch_spec_digest = Some(LaunchSpecDigest([0xA5; 32]));
             snapshot.spawned_file_identity = Some(SpawnedFileIdentity {
                 device: 43,
                 inode: 44,
@@ -5658,6 +5732,7 @@ mod tests {
         assert_eq!(snapshot.pid, None);
         assert_eq!(snapshot.spawned_at_ms, None);
         assert_eq!(snapshot.spawned_from, None);
+        assert_eq!(snapshot.launch_spec_digest, None);
         assert_eq!(snapshot.spawned_file_identity, None);
     }
 
@@ -8593,6 +8668,7 @@ fn spawn_child_in_slot(
         stderr_ring: Arc::clone(ring),
         spawned_at_ms,
         spawned_from,
+        launch_spec_digest: LaunchSpecDigest::from_spec(spec),
         spawned_file_identity,
         process_start_time,
         process_identity,
@@ -10862,6 +10938,7 @@ fn set_running(
     state.spawned_at_ms = Some(child.spawned_at_ms);
     state.exec_outcome = Some(Arc::clone(&child.exec.0));
     state.spawned_from = Some(child.spawned_from.clone());
+    state.launch_spec_digest = Some(child.launch_spec_digest.clone());
     state.spawned_file_identity = child.spawned_file_identity.clone();
     state.process_start_time = child.process_start_time;
     Ok(())
@@ -10884,6 +10961,7 @@ fn clear_current_process_facts(state: &mut SupervisorSnapshot) {
     state.spawned_at_ms = None;
     state.exec_outcome = None;
     state.spawned_from = None;
+    state.launch_spec_digest = None;
     state.spawned_file_identity = None;
     state.process_start_time = None;
     state.deliberate_severance = None;
@@ -14088,9 +14166,9 @@ mod child_env_tests {
         assert_eq!(observed_launch_nonce_source(&snapshot), None);
     }
     use super::{
-        apply_child_env, apply_spawn_role, apply_wire_spawn_args, ModuleProtocol, ModuleSpec,
-        SpawnRole, SupervisorHandle, SPAWN_ROLE_SWAP_CANDIDATE, SUBC_ARG, SUBC_LAUNCH_NONCE_ENV,
-        SUBC_MODULE_ID_ENV, SUBC_SPAWN_ROLE_ENV,
+        apply_child_env, apply_spawn_role, apply_wire_spawn_args, LaunchSpecDigest, ModuleProtocol,
+        ModuleSpec, SpawnRole, SupervisorHandle, SPAWN_ROLE_SWAP_CANDIDATE, SUBC_ARG,
+        SUBC_LAUNCH_NONCE_ENV, SUBC_MODULE_ID_ENV, SUBC_SPAWN_ROLE_ENV,
     };
     use std::{ffi::OsStr, path::PathBuf};
     use tokio::process::Command;
@@ -14106,6 +14184,53 @@ mod child_env_tests {
             protocol: ModuleProtocol::Subc,
             overlap: Default::default(),
         }
+    }
+
+    #[test]
+    fn configured_launch_spec_digest_is_canonical_and_excludes_injected_inputs() {
+        let base = spec(vec![("A".into(), "B=C".into()), ("Z".into(), "v".into())]);
+        let digest = LaunchSpecDigest::from_spec(&base);
+        let mut reordered = base.clone();
+        reordered.env.reverse();
+        reordered.module_id = "different-id".into();
+        reordered.reserved = true;
+        reordered.overlap = Default::default();
+        assert_eq!(digest, LaunchSpecDigest::from_spec(&reordered));
+        let mut delimiter_collision = base.clone();
+        delimiter_collision.env[0] = ("A=B".into(), "C".into());
+        assert_ne!(digest, LaunchSpecDigest::from_spec(&delimiter_collision));
+        let mut changed = base.clone();
+        changed.protocol = ModuleProtocol::None;
+        assert_ne!(digest, LaunchSpecDigest::from_spec(&changed));
+        changed = base.clone();
+        changed.args.push("--flag".into());
+        assert_ne!(digest, LaunchSpecDigest::from_spec(&changed));
+        changed = base.clone();
+        changed.program = PathBuf::from("/other");
+        assert_ne!(digest, LaunchSpecDigest::from_spec(&changed));
+        changed = base.clone();
+        changed.env[1].1 = "other".into();
+        assert_ne!(digest, LaunchSpecDigest::from_spec(&changed));
+        assert!(!format!("{digest:?}").contains("B=C"));
+        assert!(!format!("{digest:?}").contains("[u8"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_program_bytes_do_not_collapse_through_lossy_utf8() {
+        use std::os::unix::ffi::OsStringExt;
+        let mut left = spec(Vec::new());
+        left.program = std::ffi::OsString::from_vec(vec![b'/', 0xff]).into();
+        let mut right = left.clone();
+        right.program = std::ffi::OsString::from_vec(vec![b'/', 0xfe]).into();
+        assert_eq!(
+            left.program.to_string_lossy(),
+            right.program.to_string_lossy()
+        );
+        assert_ne!(
+            LaunchSpecDigest::from_spec(&left),
+            LaunchSpecDigest::from_spec(&right)
+        );
     }
 
     /// Ambient `CK_LOG` is REMOVED for an unconfigured module, and a configured
@@ -14435,8 +14560,8 @@ mod jitter_tests {
 #[cfg(all(test, target_os = "linux"))]
 mod cgroup_placement_tests {
     use super::{
-        apply_cgroup_placement, remove_module_cgroup, ModuleProtocol, ModuleSpec, SuperviseError,
-        SupervisedChild,
+        apply_cgroup_placement, remove_module_cgroup, LaunchSpecDigest, ModuleProtocol, ModuleSpec,
+        SuperviseError, SupervisedChild,
     };
     use crate::stderr_tail::{StderrRing, StderrTailConfig};
     use cortexkit_test_support::ScratchDir;
@@ -14626,6 +14751,7 @@ mod cgroup_placement_tests {
             stderr_ring: Arc::new(Mutex::new(StderrRing::new(StderrTailConfig::default()))),
             spawned_at_ms: 0,
             spawned_from: PathBuf::from("true"),
+            launch_spec_digest: LaunchSpecDigest([0; 32]),
             spawned_file_identity: None,
             process_start_time: None,
             process_identity: None,

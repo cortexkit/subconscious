@@ -19,6 +19,9 @@
         "configured": "/bin/new",
         "spawned_from": "/bin/old",
         "status": "mismatch"
+      },
+      "spec": {
+        "status": "mismatch"
       }
     },
     "protocol": "subc",
@@ -47,6 +50,9 @@
       },
       "path": {
         "status": "match"
+      },
+      "spec": {
+        "status": "match"
       }
     },
     "protocol": "subc",
@@ -67,6 +73,10 @@
         "status": "unavailable"
       },
       "path": {
+        "reason": "not_running",
+        "status": "unavailable"
+      },
+      "spec": {
         "reason": "not_running",
         "status": "unavailable"
       }

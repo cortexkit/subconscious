@@ -656,12 +656,83 @@ pub struct SupervisorObservedProcess {
     pub running_image: RunningImageAgreement,
 }
 
-/// Independent comparisons of configured path and running image at list time.
+/// Independent comparisons of configured path, launch spec and running image at list time.
 /// An absent verdict means the daemon predates this field, not agreement.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct PendingReloadVerdict {
     pub path: ReloadPathAgreement,
     pub image: RunningImageAgreement,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec: Option<LaunchSpecAgreement>,
+}
+
+impl PendingReloadVerdict {
+    pub fn new(path: ReloadPathAgreement, image: RunningImageAgreement) -> Self {
+        Self {
+            path,
+            image,
+            spec: None,
+        }
+    }
+
+    pub fn with_spec(mut self, spec: LaunchSpecAgreement) -> Self {
+        self.spec = Some(spec);
+        self
+    }
+}
+
+#[cfg(test)]
+mod launch_spec_wire_tests {
+    use super::*;
+
+    #[test]
+    fn older_daemon_omission_is_not_reported_and_unknown_status_round_trips() {
+        let old = r#"{"path":{"status":"match"},"image":{"status":"unavailable","reason":"not_running"}}"#;
+        let parsed: PendingReloadVerdict = serde_json::from_str(old).unwrap();
+        assert_eq!(parsed.spec, None);
+        assert_eq!(serde_json::to_string(&parsed).unwrap(), old);
+        let future = r#"{"status":"future_spec","detail":{"z":1,"a":2}}"#;
+        let parsed: LaunchSpecAgreement = serde_json::from_str(future).unwrap();
+        assert!(
+            matches!(parsed, LaunchSpecAgreement::Unknown { ref tag, .. } if tag == "future_spec")
+        );
+        assert_eq!(serde_json::to_string(&parsed).unwrap(), future);
+        let unavailable = LaunchSpecAgreement::Unavailable {
+            reason: LaunchSpecUnavailableReason::SpawnedSpecUnavailable,
+        };
+        let encoded = serde_json::to_string(&unavailable).unwrap();
+        assert_eq!(
+            encoded,
+            r#"{"status":"unavailable","reason":"spawned_spec_unavailable"}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<LaunchSpecAgreement>(&encoded).unwrap(),
+            unavailable
+        );
+    }
+}
+
+/// Comparison of the configured launch inputs with the inputs recorded at spawn.
+/// No digest or configured env values are sent to clients.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LaunchSpecAgreement {
+    Match,
+    Mismatch,
+    Unavailable {
+        reason: LaunchSpecUnavailableReason,
+    },
+    Unknown {
+        tag: String,
+        body: OrderedJsonObject,
+    },
+}
+
+open_string_enum! {
+    LaunchSpecUnavailableReason {
+        NotRunning => "not_running",
+        SpawnedSpecUnavailable => "spawned_spec_unavailable",
+    }
 }
 
 /// Whether the running process was spawned from the currently configured program.
@@ -881,6 +952,14 @@ enum ReloadPathAgreementWire {
     Unavailable {
         reason: ReloadPathUnavailableReason,
     },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum LaunchSpecAgreementWire {
+    Match,
+    Mismatch,
+    Unavailable { reason: LaunchSpecUnavailableReason },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1347,6 +1426,43 @@ impl Serialize for ReloadPathAgreement {
             }
             .serialize(serializer),
             Self::Unknown { body, .. } => body.serialize(serializer),
+        }
+    }
+}
+
+impl Serialize for LaunchSpecAgreement {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Match => LaunchSpecAgreementWire::Match.serialize(serializer),
+            Self::Mismatch => LaunchSpecAgreementWire::Mismatch.serialize(serializer),
+            Self::Unavailable { reason } => LaunchSpecAgreementWire::Unavailable {
+                reason: reason.clone(),
+            }
+            .serialize(serializer),
+            Self::Unknown { body, .. } => body.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for LaunchSpecAgreement {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let (tag, body) = read_tagged(deserializer, "status")?;
+        match tag.as_str() {
+            "match" => Ok(Self::Match),
+            "mismatch" => Ok(Self::Mismatch),
+            "unavailable" => match serde_json::from_value(body.into_value())
+                .map_err(D::Error::custom)?
+            {
+                LaunchSpecAgreementWire::Unavailable { reason } => Ok(Self::Unavailable { reason }),
+                _ => unreachable!(),
+            },
+            _ => Ok(Self::Unknown { tag, body }),
         }
     }
 }

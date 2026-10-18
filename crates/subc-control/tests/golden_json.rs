@@ -5,12 +5,13 @@ use serde_json::Value;
 use subc_control::{
     CatalogEntry, ChildMemoryKind, ChildResourceReading, ChildResourceUnavailableReason,
     ChildResourceUsage, ClientControlPush, ClientControlRequest, ClientControlResponse,
-    ConsumerIdentity, DaemonBuildProvenance, DaemonObservedProcess, LiveSpawn,
-    ModuleDeclaredProvenance, ModuleProtocol, NotReadyReason, PendingReloadVerdict, PollKind,
-    ReloadPathAgreement, ReloadPathUnavailableReason, RouteCloseReason, RunningImageAgreement,
-    RunningImageEvidence, RunningImageUnavailableReason, SpawnCursor, SpawnEvent, SpawnEventKind,
-    SpawnSnapshot, StderrCaptureState, StderrTail, StderrTailEntry, SupervisorDaemonProvenance,
-    SupervisorEntry, SupervisorHealthEntry, SupervisorHealthStatus, SupervisorModuleProvenance,
+    ConsumerIdentity, DaemonBuildProvenance, DaemonObservedProcess, LaunchSpecAgreement,
+    LaunchSpecUnavailableReason, LiveSpawn, ModuleDeclaredProvenance, ModuleProtocol,
+    NotReadyReason, PendingReloadVerdict, PollKind, ReloadPathAgreement,
+    ReloadPathUnavailableReason, RouteCloseReason, RunningImageAgreement, RunningImageEvidence,
+    RunningImageUnavailableReason, SpawnCursor, SpawnEvent, SpawnEventKind, SpawnSnapshot,
+    StderrCaptureState, StderrTail, StderrTailEntry, SupervisorDaemonProvenance, SupervisorEntry,
+    SupervisorHealthEntry, SupervisorHealthStatus, SupervisorModuleProvenance,
     SupervisorObservedProcess, SupervisorRescanResult, SupervisorRoute, SupervisorRouteConsumer,
     SupervisorRouteModule,
 };
@@ -97,36 +98,41 @@ fn control_wire_shapes_match_golden_json_and_round_trip() {
         digest: digest.to_string(),
     };
     let verdicts = [
-        PendingReloadVerdict {
-            path: ReloadPathAgreement::Mismatch {
+        PendingReloadVerdict::new(
+            ReloadPathAgreement::Mismatch {
                 configured: "/bin/new".into(),
                 spawned_from: "/bin/old".into(),
             },
-            image: RunningImageAgreement::Match {
+            RunningImageAgreement::Match {
                 evidence: evidence("old"),
             },
-        },
-        PendingReloadVerdict {
-            path: ReloadPathAgreement::Match,
-            image: RunningImageAgreement::Mismatch {
+        )
+        .with_spec(LaunchSpecAgreement::Mismatch),
+        PendingReloadVerdict::new(
+            ReloadPathAgreement::Match,
+            RunningImageAgreement::Mismatch {
                 running: evidence("old"),
                 disk: evidence("new"),
             },
-        },
-        PendingReloadVerdict {
-            path: ReloadPathAgreement::Unavailable {
+        )
+        .with_spec(LaunchSpecAgreement::Match),
+        PendingReloadVerdict::new(
+            ReloadPathAgreement::Unavailable {
                 reason: ReloadPathUnavailableReason::NotRunning,
             },
-            image: RunningImageAgreement::Unavailable {
+            RunningImageAgreement::Unavailable {
                 reason: RunningImageUnavailableReason::NotRunning,
             },
-        },
-        PendingReloadVerdict {
-            path: ReloadPathAgreement::Match,
-            image: RunningImageAgreement::Match {
+        )
+        .with_spec(LaunchSpecAgreement::Unavailable {
+            reason: LaunchSpecUnavailableReason::NotRunning,
+        }),
+        PendingReloadVerdict::new(
+            ReloadPathAgreement::Match,
+            RunningImageAgreement::Match {
                 evidence: evidence("same"),
             },
-        },
+        ),
     ];
     assert_golden(
         "supervisor_entry_reload_verdict_states",

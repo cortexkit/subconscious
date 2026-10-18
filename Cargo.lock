@@ -79,7 +79,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -90,7 +90,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -264,7 +264,7 @@ dependencies = [
 
 [[package]]
 name = "ck-bus"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "async-nats",
  "async-trait",
@@ -366,7 +366,8 @@ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 [[package]]
 name = "cortexkit-bus-inmemory"
 version = "0.3.0"
-source = "git+https://github.com/cortexkit/commons.git?rev=5586ebd0bc6240efd4723ae22493a6ed3c5bdb8d#5586ebd0bc6240efd4723ae22493a6ed3c5bdb8d"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "61fc01c2c813b7c6cc6e94873f176777167c84e49594b649ad6a467dd7947951"
 dependencies = [
  "async-trait",
  "cortexkit-bus-naming",
@@ -376,13 +377,15 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-bus-naming"
-version = "0.2.1"
-source = "git+https://github.com/cortexkit/commons.git?rev=5586ebd0bc6240efd4723ae22493a6ed3c5bdb8d#5586ebd0bc6240efd4723ae22493a6ed3c5bdb8d"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f42484239fb8f3e7aa9eed12b701ee7b6da359909be908e3f6cc2369baf0ae56"
 
 [[package]]
 name = "cortexkit-bus-nats"
 version = "0.3.0"
-source = "git+https://github.com/cortexkit/commons.git?rev=5586ebd0bc6240efd4723ae22493a6ed3c5bdb8d#5586ebd0bc6240efd4723ae22493a6ed3c5bdb8d"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "60c584e3abd14eabddb785074d43b50947975e8485922753c3e1db1105771a96"
 dependencies = [
  "async-nats",
  "async-trait",
@@ -417,7 +420,8 @@ dependencies = [
 [[package]]
 name = "cortexkit-bus-trait"
 version = "0.3.0"
-source = "git+https://github.com/cortexkit/commons.git?rev=5586ebd0bc6240efd4723ae22493a6ed3c5bdb8d#5586ebd0bc6240efd4723ae22493a6ed3c5bdb8d"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "12bf09b0c0f60249cd95cbcf9f3e4babb3b5c1322fc90a220744a8d8e85231c2"
 dependencies = [
  "async-trait",
  "sha2",
@@ -645,7 +649,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -1214,7 +1218,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -1615,7 +1619,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -1892,7 +1896,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "52d1cfed4120b4d927bf7c0f86d2087a4a7d6027c906d9f9d525a80573b9be51"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -2170,7 +2174,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -2180,7 +2184,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "230a1b821ccbd75b185820a1f1ff7b14d21da1e442e22c0863ea5f08771a8874"
 dependencies = [
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]

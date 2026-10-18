@@ -112,9 +112,8 @@ pub fn census_config(account: &AccountNames) -> stream::Config {
 ///
 /// The per-subject message cap is set only when the spec names one (only the event
 /// stream does). Otherwise it is left at the client's default, so the five streams that
-/// predate the event stream are sent exactly the configuration they were created with:
-/// the server compares a create against the stored stream and refuses any difference,
-/// so a changed field there would stop an upgraded ck-bus from booting.
+/// predate the event stream are sent exactly the configuration they were created with.
+/// Existing event streams have their per-subject cap reconciled in place.
 pub fn stream_config(spec: &StreamSpec) -> stream::Config {
     let mut config = stream::Config {
         name: spec.name.clone(),
@@ -250,6 +249,11 @@ pub trait BoxPlane: Send + Sync {
     /// same name with a different configuration is refused by the server and left as it
     /// is, never updated. An identical one is the server's idempotent success.
     async fn create_durable(&self, durable: &DurableConsumer) -> Result<(), PlaneError>;
+    /// Reconciles a bootstrap-owned module durable without deleting its cursor. The
+    /// broker refuses changes to immutable settings rather than resetting its ack floor.
+    async fn ensure_module_durable(&self, durable: &DurableConsumer) -> Result<(), PlaneError> {
+        self.create_durable(durable).await
+    }
     /// One consumer's configuration and counters. `Ok(None)` is the server's own answer
     /// that the stream holds no consumer of that name; a read that fails is an `Err`.
     async fn consumer_state(
@@ -664,6 +668,37 @@ impl BoxPlane for NatsBox {
     }
 
     async fn ensure_stream(&self, spec: &StreamSpec) -> Result<(), PlaneError> {
+        if let Some(cap) = spec.max_msgs_per_subject {
+            let what = format!("stream info {}", spec.name);
+            let reply = self
+                .api(format!("STREAM.INFO.{}", spec.name), json!({}), &what)
+                .await?;
+            if api_error_code(&reply) != Some(STREAM_NOT_FOUND) {
+                api_refusal(&reply, &what)?;
+                let mut config: stream::Config = serde_json::from_value(reply["config"].clone())
+                    .map_err(|error| PlaneError::new(format!("{what}: {error}")))?;
+                let old = config.max_messages_per_subject;
+                if old != cap {
+                    // Change only the limit being upgraded, preserving the stream's
+                    // messages and all other stored settings.
+                    config.max_messages_per_subject = cap;
+                    self.jetstream
+                        .update_stream(config)
+                        .await
+                        .map_err(|error| {
+                            PlaneError::new(format!("update stream {}: {error}", spec.name))
+                        })?;
+                    super::log_event(
+                        "ckbus.stream.limit_updated",
+                        json!({
+                            "stream": spec.name, "max_msgs_per_subject_old": old,
+                            "max_msgs_per_subject_new": cap,
+                        }),
+                    );
+                }
+                return Ok(());
+            }
+        }
         self.create(stream_config(spec)).await
     }
 
@@ -782,18 +817,8 @@ impl BoxPlane for NatsBox {
     }
 
     async fn create_durable(&self, durable: &DurableConsumer) -> Result<(), PlaneError> {
-        let config = jetstream::consumer::pull::Config {
-            durable_name: Some(durable.durable.clone()),
-            ack_policy: jetstream::consumer::AckPolicy::Explicit,
-            deliver_policy: jetstream::consumer::DeliverPolicy::All,
-            ack_wait: durable.ack_wait,
-            max_deliver: durable.max_deliver,
-            max_ack_pending: durable.max_ack_pending,
-            filter_subjects: durable.filter_subjects.clone(),
-            ..Default::default()
-        };
         self.jetstream
-            .create_consumer_strict_on_stream(config, durable.stream.as_str())
+            .create_consumer_strict_on_stream(durable_config(durable), durable.stream.as_str())
             .await
             .map(|_| ())
             .map_err(|error| {
@@ -801,6 +826,29 @@ impl BoxPlane for NatsBox {
                     "create durable {} on {}: {error}",
                     durable.durable, durable.stream
                 ))
+            })
+    }
+
+    async fn ensure_module_durable(&self, durable: &DurableConsumer) -> Result<(), PlaneError> {
+        // JetStream's create-or-update is idempotent for identical settings. Mutable
+        // settings (including filters) change in place; immutable ones return an error.
+        // Never fall back to delete-and-create: a live module may already have acked.
+        self.jetstream
+            .create_consumer_on_stream(durable_config(durable), durable.stream.as_str())
+            .await
+            .map(|_| ())
+            .map_err(|error| {
+                let message = format!(
+                    "reconcile module durable {} on {} (cursor retained): {error}",
+                    durable.durable, durable.stream
+                );
+                super::log_event(
+                    "ckbus.bootstrap.module_durable_refused",
+                    json!({
+                        "stream": durable.stream, "durable": durable.durable, "error": message,
+                    }),
+                );
+                PlaneError::new(message)
             })
     }
 
@@ -888,6 +936,20 @@ impl BoxPlane for NatsBox {
 
 /// The JetStream API's error code for a consumer the stream does not have.
 const CONSUMER_NOT_FOUND: u64 = 10014;
+const STREAM_NOT_FOUND: u64 = 10059;
+
+fn durable_config(durable: &DurableConsumer) -> jetstream::consumer::pull::Config {
+    jetstream::consumer::pull::Config {
+        durable_name: Some(durable.durable.clone()),
+        ack_policy: jetstream::consumer::AckPolicy::Explicit,
+        deliver_policy: jetstream::consumer::DeliverPolicy::All,
+        ack_wait: durable.ack_wait,
+        max_deliver: durable.max_deliver,
+        max_ack_pending: durable.max_ack_pending,
+        filter_subjects: durable.filter_subjects.clone(),
+        ..Default::default()
+    }
+}
 
 fn api_error_code(reply: &Value) -> Option<u64> {
     reply.get("error")?.get("err_code")?.as_u64()

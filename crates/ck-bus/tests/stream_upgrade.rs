@@ -1,5 +1,5 @@
 //! Upgrading a plane that ck-bus 0.1.29 built with five streams to the current six
-//! streams and two module durables, in place. This is the upgrade arm of the "Install
+//! streams and module durables, in place. This is the upgrade arm of the "Install
 //! bootstrap and own users" acceptance row in `docs/ck-bus.md`. The vault
 //! is the harness signer answered in process, the broker a real `nats-server`; no subc
 //! daemon is started.
@@ -13,7 +13,8 @@
 //!   creation time, same message count), the event stream exists with its limits, and
 //!   `m_basal` and `m_prefrontal-core` exist with the shipped durable configuration. The
 //!   room post published before `m_prefrontal-core` existed is pending on it. A further
-//!   boot leaves all six streams and both module durables unchanged.
+//!   boot leaves all six streams and all module durables unchanged. Further cases cover
+//!   an existing event stream's cap and readers whose acknowledgement floors must survive.
 
 #[allow(dead_code)]
 #[path = "../src/bootstrap/mod.rs"]
@@ -46,16 +47,19 @@ use bootstrap::{
 };
 use cortexkit_bus_naming::{shipped_streams, AccountNames, StreamKind, StreamSpec, GIB};
 use credentials::{
+    issue::{sign_user_jwt, UserJwtRequest},
     vault::{VaultError, VaultSigning},
     wire::{self, VaultPublicKey, VaultSignature},
     Credentials,
 };
+use futures_util::StreamExt;
 use harness::{
     bus::{self, BusServer, TrustChain, LOOPBACK},
+    issuance::VerdictClient,
     report::{Row, RowReport, ServedBy},
     signer::{nats::nats_server_bin, HarnessSigner, SIGNER_OPERATIONS},
 };
-use serde_json::Value;
+use serde_json::{json, Value};
 use subc_client_rs::HandlerOutcome;
 use subc_protocol::MachineId;
 
@@ -74,7 +78,7 @@ const EARLIER_STREAM_CONFIGS: [&str; 5] = [
     r#"{"name":"CK_BOX_UPGRADEGOLDEN_EFFECT_DEAD","max_bytes":67108864,"max_msgs":0,"max_msgs_per_subject":0,"discard":"old","subjects":["ck.box_upgradegolden.effect.dead"],"retention":"limits","max_consumers":0,"max_age":604800000000000,"storage":"file","num_replicas":1,"duplicate_window":120000000000,"consumer_limits":null}"#,
 ];
 
-const EVENT_PER_SUBJECT_CAP: i64 = 10_000;
+const EVENT_PER_SUBJECT_CAP: i64 = 100_000;
 
 fn signer_vocabulary() -> BTreeSet<String> {
     SIGNER_OPERATIONS
@@ -439,6 +443,16 @@ async fn a_five_stream_plane_upgrades_in_place_to_six_streams_and_the_module_dur
     let module_durables = [
         (streams.event.clone(), "m_basal", names.event_binding()),
         (
+            streams.event.clone(),
+            "m_prefrontal-core",
+            format!("ck.{}.event.broca.>", names.account()),
+        ),
+        (
+            streams.event.clone(),
+            "m_astrocyte",
+            format!("ck.{}.event.insula.>", names.account()),
+        ),
+        (
             streams.room.clone(),
             "m_prefrontal-core",
             names.room_binding(),
@@ -473,7 +487,7 @@ async fn a_five_stream_plane_upgrades_in_place_to_six_streams_and_the_module_dur
     .await
     .expect("the event is stored");
 
-    // Booting again changes nothing: every stream and both durables stay as they are.
+    // Booting again changes nothing: every stream and durable stays as it is.
     let mut six = older
         .iter()
         .map(|(stream, _)| stream.clone())
@@ -506,4 +520,409 @@ async fn a_five_stream_plane_upgrades_in_place_to_six_streams_and_the_module_dur
 
     server.stop().await;
     passed();
+}
+
+/// An actual private NATS account bootstrapped as the five-stream version left it.
+/// Each test chooses the event stream and consumer state the upgraded bootstrap sees.
+struct UpgradePlane {
+    server: BusServer,
+    _dir: tempfile::TempDir,
+    deps: BootDeps,
+    config: Result<BrokerConfig, String>,
+    machine_id: MachineId,
+    names: AccountNames,
+    account_public: String,
+    broker: NatsBroker,
+    js: jetstream::Context,
+}
+
+impl UpgradePlane {
+    async fn start() -> Self {
+        let (bin, version) = nats_server_bin().expect("real-bus upgrade tests require nats-server");
+        eprintln!("nats-server {version}");
+        let trust = TrustChain::generate();
+        let dir = tempfile::tempdir().unwrap();
+        let server = BusServer::start(&bin, &dir.path().join("nats"), &trust, LOOPBACK).await;
+        let credentials = Arc::new(Credentials::new(Arc::new(InProcessVault {
+            signer: trust.signer.clone(),
+        })));
+        let deps = BootDeps {
+            credentials: credentials.clone(),
+            grants: Arc::new(grants::GrantSeam),
+            store: Store::new(dir.path().join("store")),
+            incarnation: "event-upgrade".to_string(),
+            own_spawn: Arc::new(FixedOwnSpawn),
+        };
+        let config = Ok(BrokerConfig {
+            url: server.url.clone(),
+            operator_jwt_path: server.operator_jwt.clone(),
+            system_account: server.system_account.clone(),
+        });
+        let machine_id = MachineId::parse(&fresh_machine_id()).unwrap();
+        let names = AccountNames::derive(&format!("box_{}", machine_id.as_str())).unwrap();
+        let ready = boot_with(
+            &machine_id,
+            &config,
+            &FiveStreamBroker(NatsBroker::new(server.url.clone(), credentials.clone())),
+            &deps,
+        )
+        .await;
+        let account_public = ready.account.account_public.clone();
+        let js = jetstream::new(bus::box_client(&trust, &server, &account_public).await);
+        let broker = NatsBroker::new(server.url.clone(), credentials);
+        Self {
+            server,
+            _dir: dir,
+            deps,
+            config,
+            machine_id,
+            names,
+            account_public,
+            broker,
+            js,
+        }
+    }
+
+    async fn bootstrap(&self) -> Ready {
+        boot_with(&self.machine_id, &self.config, &self.broker, &self.deps).await
+    }
+
+    async fn store_event(&self, module: &str, event: &str) -> u64 {
+        self.js
+            .publish(
+                self.names.event_subject(module, event, 1).unwrap(),
+                "kept event".into(),
+            )
+            .await
+            .unwrap()
+            .await
+            .unwrap()
+            .sequence
+    }
+
+    async fn consumer(&self, durable: &str) -> jetstream::consumer::Consumer<pull::Config> {
+        self.js
+            .get_consumer_from_stream(durable, &self.names.streams().event)
+            .await
+            .unwrap_or_else(|error| panic!("{durable} must exist: {error}"))
+    }
+
+    async fn ack_one(&self, durable: &str) -> u64 {
+        let consumer = self.consumer(durable).await;
+        let message = consumer
+            .fetch()
+            .max_messages(1)
+            .expires(Duration::from_secs(3))
+            .messages()
+            .await
+            .unwrap()
+            .next()
+            .await
+            .expect("an event arrives")
+            .unwrap();
+        let sequence = message.info().unwrap().stream_sequence;
+        message.double_ack().await.unwrap();
+        assert_eq!(
+            consumer.get_info().await.unwrap().ack_floor.stream_sequence,
+            sequence
+        );
+        sequence
+    }
+
+    async fn cursor(&self, durable: &str) -> Value {
+        let info = self.consumer(durable).await.get_info().await.unwrap();
+        json!({
+            "created": info.created, "config": info.config,
+            "ack_floor": [info.ack_floor.consumer_sequence, info.ack_floor.stream_sequence],
+            "delivered": [info.delivered.consumer_sequence, info.delivered.stream_sequence],
+            "num_ack_pending": info.num_ack_pending,
+            "num_pending": info.num_pending,
+        })
+    }
+}
+
+#[tokio::test]
+async fn bootstrap_raises_existing_event_cap_to_100000_without_losing_messages() {
+    let _gate = harness::acceptance_gate().await;
+    let plane = UpgradePlane::start().await;
+    let spec = shipped_streams(&plane.names)
+        .into_iter()
+        .find(|spec| spec.kind == StreamKind::Event)
+        .unwrap();
+    let mut config = bootstrap::plane::stream_config(&spec);
+    config.max_messages_per_subject = 10_000;
+    plane.js.create_stream(config).await.unwrap();
+    let sequence = plane.store_event("broca", "run.started").await;
+    let before = stream_state(&plane.js, &spec.name).await;
+    assert_eq!(before.0["max_msgs_per_subject"], 10_000);
+    drop(plane.bootstrap().await);
+    let after = stream_state(&plane.js, &spec.name).await;
+    assert_eq!(after.0["max_msgs_per_subject"], 100_000);
+    assert_eq!(after.1, before.1, "the stream was not recreated");
+    assert_eq!(after.2, before.2, "messages survived the cap update");
+    let message = plane
+        .js
+        .get_stream(&spec.name)
+        .await
+        .unwrap()
+        .get_raw_message(sequence)
+        .await
+        .unwrap();
+    assert_eq!(message.payload.as_ref(), b"kept event");
+    plane.server.stop().await;
+}
+
+#[tokio::test]
+async fn bootstrap_creates_every_table_event_durable_with_its_filter_and_settings() {
+    let _gate = harness::acceptance_gate().await;
+    let plane = UpgradePlane::start().await;
+    drop(plane.bootstrap().await);
+    for (durable, module) in [("m_prefrontal-core", "broca"), ("m_astrocyte", "insula")] {
+        let info = plane.consumer(durable).await.get_info().await.unwrap();
+        let config = info.config;
+        let filters = if config.filter_subjects.is_empty() {
+            vec![config.filter_subject]
+        } else {
+            config.filter_subjects
+        };
+        assert_eq!(
+            filters,
+            vec![format!("ck.{}.event.{module}.>", plane.names.account())]
+        );
+        assert!(config.deliver_subject.is_none(), "{durable} must be pull");
+        assert_eq!(config.ack_policy, jetstream::consumer::AckPolicy::Explicit);
+        assert_eq!(
+            config.deliver_policy,
+            jetstream::consumer::DeliverPolicy::All
+        );
+        assert_eq!(config.ack_wait, Duration::from_secs(30));
+        assert_eq!(config.max_ack_pending, 1_000);
+        assert_eq!(config.max_deliver, -1);
+    }
+    plane.server.stop().await;
+}
+
+#[tokio::test]
+async fn second_bootstrap_keeps_event_durable_creation_times_and_ack_floors() {
+    let _gate = harness::acceptance_gate().await;
+    let plane = UpgradePlane::start().await;
+    drop(plane.bootstrap().await);
+    plane.store_event("broca", "run.started").await;
+    plane.store_event("insula", "signal").await;
+    let durables = ["m_basal", "m_prefrontal-core", "m_astrocyte"];
+    let mut before = Vec::new();
+    for durable in durables {
+        assert!(plane.ack_one(durable).await > 0);
+        before.push(plane.cursor(durable).await);
+    }
+    drop(plane.bootstrap().await);
+    for (durable, before) in durables.into_iter().zip(before) {
+        assert_eq!(
+            plane.cursor(durable).await,
+            before,
+            "{durable} did not churn"
+        );
+    }
+    plane.server.stop().await;
+}
+
+#[tokio::test]
+async fn bootstrap_updates_event_filters_and_limits_in_place_preserving_ack_floors() {
+    let _gate = harness::acceptance_gate().await;
+    let plane = UpgradePlane::start().await;
+    drop(plane.bootstrap().await);
+    let sequence = plane.store_event("broca", "run.started").await;
+    assert_eq!(plane.ack_one("m_prefrontal-core").await, sequence);
+    let before = plane.cursor("m_prefrontal-core").await;
+    let mut old = plane
+        .consumer("m_prefrontal-core")
+        .await
+        .cached_info()
+        .config
+        .clone();
+    old.filter_subject.clear();
+    old.filter_subjects = vec![format!("ck.{}.event.>", plane.names.account())];
+    old.ack_wait = Duration::from_secs(60);
+    old.max_ack_pending = 5;
+    plane
+        .js
+        .update_consumer_on_stream(old, &plane.names.streams().event)
+        .await
+        .unwrap();
+    drop(plane.bootstrap().await);
+    assert_eq!(plane.cursor("m_prefrontal-core").await, before);
+    plane.server.stop().await;
+}
+
+#[tokio::test]
+async fn bootstrap_refuses_immutable_event_config_without_deleting_an_acked_durable() {
+    let _gate = harness::acceptance_gate().await;
+    let plane = UpgradePlane::start().await;
+    drop(plane.bootstrap().await);
+    plane
+        .js
+        .delete_consumer_from_stream("m_prefrontal-core", &plane.names.streams().event)
+        .await
+        .unwrap();
+    plane
+        .js
+        .create_consumer_on_stream(
+            pull::Config {
+                durable_name: Some("m_prefrontal-core".to_string()),
+                filter_subject: format!("ck.{}.event.broca.>", plane.names.account()),
+                ack_policy: jetstream::consumer::AckPolicy::All,
+                ..Default::default()
+            },
+            &plane.names.streams().event,
+        )
+        .await
+        .unwrap();
+    plane.store_event("broca", "run.started").await;
+    assert!(plane.ack_one("m_prefrontal-core").await > 0);
+    let before = plane.cursor("m_prefrontal-core").await;
+    let failure = match boot(
+        Some(&plane.machine_id),
+        BrokerInputs {
+            config: &plane.config,
+            broker: &plane.broker,
+        },
+        &plane.deps,
+    )
+    .await
+    {
+        Ok(_) => panic!("an immutable ack-policy mismatch must refuse bootstrap"),
+        Err(failure) => failure,
+    };
+    assert_eq!(failure.cause, bootstrap::cause::MODULE_DURABLES_UNAVAILABLE);
+    assert!(
+        failure.message.contains("m_prefrontal-core"),
+        "{}",
+        failure.message
+    );
+    assert_eq!(plane.cursor("m_prefrontal-core").await, before);
+    plane.server.stop().await;
+}
+
+#[tokio::test]
+async fn prefrontal_event_grant_pulls_and_acks_seven_token_events_but_refuses_other_durables_and_create(
+) {
+    let _gate = harness::acceptance_gate().await;
+    let plane = UpgradePlane::start().await;
+    drop(plane.bootstrap().await);
+    let credentials = plane.deps.credentials.clone();
+    let user = credentials.custody.generate_user();
+    let grant = grants::issued_grant(&plane.names, "prefrontal-core", &user, &[]).unwrap();
+    let now = harness::signer::nats::unix_now();
+    let jwt = sign_user_jwt(
+        credentials.vault.as_ref(),
+        &credentials.key_ids,
+        &UserJwtRequest {
+            root_credential_id: &bus::box_root_id(),
+            user_public: &user,
+            issuer_account: Some(&plane.account_public),
+            name: "event-reader-conformance",
+            issued_at: now,
+            expires_at: now + 900,
+            grant: &grant,
+        },
+    )
+    .await
+    .unwrap();
+    let signer_user = user.clone();
+    let client = VerdictClient::connect(
+        &plane.server.url,
+        &jwt.jwt,
+        Arc::new(move |nonce| {
+            let signed = credentials
+                .custody
+                .sign_nonce(&signer_user, &nonce)
+                .map_err(|error| error.to_string());
+            Box::pin(async move { signed })
+        }),
+        Some(format!("_INBOX.{user}")),
+    )
+    .await
+    .unwrap();
+    let subject = plane
+        .names
+        .event_subject("broca", "run.started", 1)
+        .unwrap();
+    assert_eq!(subject.split('.').count(), 7);
+    let sequence = plane.store_event("broca", "run.started").await;
+    let js = jetstream::new(client.client.clone());
+    let consumer: jetstream::consumer::Consumer<pull::Config> = js
+        .get_consumer_from_stream("m_prefrontal-core", &plane.names.streams().event)
+        .await
+        .expect("prefrontal-core may inspect its event durable");
+    let message = consumer
+        .fetch()
+        .max_messages(1)
+        .expires(Duration::from_secs(3))
+        .messages()
+        .await
+        .unwrap()
+        .next()
+        .await
+        .expect("seven-token broca event arrives")
+        .unwrap();
+    assert_eq!(message.subject.as_str(), subject);
+    let ack = message.reply.clone().unwrap().to_string();
+    message.ack().await.unwrap();
+    client.expect_allowed(&ack).await;
+    for verb in ["INFO", "MSG.NEXT"] {
+        client
+            .expect_allowed(&format!(
+                "$JS.API.CONSUMER.{verb}.{}.m_prefrontal-core",
+                plane.names.streams().event
+            ))
+            .await;
+    }
+    assert_eq!(
+        consumer.get_info().await.unwrap().ack_floor.stream_sequence,
+        sequence
+    );
+    // Check each denied subject through the server's permission-violation callback,
+    // not merely a timed-out request that could also mean an unavailable broker.
+    for durable in ["m_basal", "m_astrocyte"] {
+        for verb in ["INFO", "MSG.NEXT"] {
+            let subject = format!(
+                "$JS.API.CONSUMER.{verb}.{}.{durable}",
+                plane.names.streams().event
+            );
+            client.publish(&subject, b"{}").await;
+            client.expect_denied(&subject).await;
+        }
+        let subject = ack.replace(".m_prefrontal-core.", &format!(".{durable}."));
+        assert_ne!(subject, ack);
+        client.publish(&subject, b"").await;
+        client.expect_denied(&subject).await;
+    }
+    for subject in [
+        format!("$JS.API.CONSUMER.CREATE.{}", plane.names.streams().event),
+        format!(
+            "$JS.API.CONSUMER.CREATE.{}.m_prefrontal-core",
+            plane.names.streams().event
+        ),
+        format!(
+            "$JS.API.CONSUMER.DURABLE.CREATE.{}.m_prefrontal-core",
+            plane.names.streams().event
+        ),
+    ] {
+        client.publish(&subject, b"{}").await;
+        client.expect_denied(&subject).await;
+    }
+    assert_eq!(
+        plane
+            .js
+            .get_stream(&plane.names.streams().event)
+            .await
+            .unwrap()
+            .consumer_names()
+            .collect::<Vec<_>>()
+            .await
+            .len(),
+        3,
+        "a denied create added no consumer"
+    );
+    plane.server.stop().await;
 }

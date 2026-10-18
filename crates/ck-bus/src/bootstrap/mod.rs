@@ -1,5 +1,5 @@
 //! Bootstrap: the machine id and the box account, ck-bus's own users, the census bucket,
-//! the six streams and the two module durables.
+//! the six streams and the module durables.
 //!
 //! Keys and signatures follow `docs/nats-install-trust-chain.md` (sections 1, 3
 //! and 7). The operator root signed the operator JWT and the system account JWT at
@@ -16,8 +16,8 @@
 //!    incarnation's box users added), has the operator signer sign it, pushes it, and
 //!    reads it back through the claims lookup before treating it as applied;
 //! 4. signs its box-account user with the box account root, connects, creates the
-//!    census bucket and the six streams if absent, then the module durables `m_basal`
-//!    (event stream) and `m_prefrontal-core` (ROOM) if absent, writes its own census key
+//!    census bucket and the six streams if absent, reconciles the event and ROOM module
+//!    durables without deleting their cursors, writes its own census key
 //!    (the single census entry ck-bus writes for itself), and publishes on its sentinel
 //!    subject.
 //!
@@ -25,7 +25,7 @@
 //! sent exactly the configuration they were created with, which the server accepts as
 //! the existing stream, and only the event stream and the module durables are new.
 //!
-//! Both users' JWTs expire 15 minutes after issue (R16); a renewal task per user
+//! Both users' JWTs expire 15 minutes after issue; a renewal task per user
 //! (`credentials::renewal`) re-signs the same key before then, and each connection
 //! presents the renewed JWT when nats-server makes it reconnect at the old one's `exp`.
 //!
@@ -497,15 +497,14 @@ pub async fn boot(
             .await
             .map_err(|error| Failure::retry(cause::STREAMS_UNAVAILABLE, error.message))?;
     }
-    // The module durables exist from the first boot on, before either module asks for a
-    // credential, so nothing published before it first connects is lost to it. Create
-    // is strict: an identical durable is the server's idempotent success, and one with a
-    // different configuration is refused and never replaced.
+    // Create or reconcile module readers before issuing credentials. Updates retain
+    // their acknowledgement floors; an immutable configuration mismatch stops boot
+    // rather than deleting a module's cursor.
     let durables = module_durables::planned(&names)
         .map_err(|error| Failure::stop(cause::MODULE_DURABLES_UNAVAILABLE, error))?;
     for durable in &durables {
         box_plane
-            .create_durable(durable)
+            .ensure_module_durable(durable)
             .await
             .map_err(|error| Failure::retry(cause::MODULE_DURABLES_UNAVAILABLE, error.message))?;
     }

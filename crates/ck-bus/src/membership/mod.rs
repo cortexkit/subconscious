@@ -31,7 +31,7 @@
 //!
 //! The pull grant on any agent durable is a whole-token `*` in the consumer position on
 //! the three agent streams, so no consumer other than an agent's `c_{agent_id}` may ever
-//! exist on them. `CKBUS_OWNED_DURABLES` lists the consumers ck-bus itself owns, and its
+//! exist on them. `ckbus_owned_durables` lists the consumers ck-bus itself owns, and its
 //! test holds them off the agent streams.
 
 use std::{sync::Arc, time::Duration};
@@ -92,11 +92,19 @@ pub const AGENT_STREAM_KINDS: [StreamKind; 3] =
 /// Consumers ck-bus creates, other than agent durables, by stream kind and name: its own
 /// dead-letter consumer and the module durables bootstrap creates. None may sit on an
 /// agent stream: the participant grant pulls any consumer there.
-pub const CKBUS_OWNED_DURABLES: [(StreamKind, &str); 3] = [
-    (StreamKind::EffectDead, "c_ckbus_dead"),
-    (StreamKind::Event, "m_basal"),
-    (StreamKind::Room, "m_prefrontal-core"),
-];
+pub fn ckbus_owned_durables() -> impl Iterator<Item = (StreamKind, &'static str)> {
+    [
+        (StreamKind::EffectDead, "c_ckbus_dead"),
+        (StreamKind::Event, "m_basal"),
+        (StreamKind::Room, "m_prefrontal-core"),
+    ]
+    .into_iter()
+    .chain(
+        cortexkit_bus_naming::EVENT_CONSUMERS
+            .iter()
+            .map(|reader| (StreamKind::Event, reader.durable)),
+    )
+}
 
 /// The literal names of the agent streams, as the naming crate lists them (the list its
 /// whole-token `*` grants are written against).

@@ -141,7 +141,7 @@ fn ckbus_owned_durables_stay_off_the_agent_streams() {
         );
     }
 
-    for (kind, durable) in membership::CKBUS_OWNED_DURABLES {
+    for (kind, durable) in membership::ckbus_owned_durables() {
         let stream = membership::stream_name(&names, kind);
         assert!(
             bootstrap.contains(&stream),
@@ -158,10 +158,8 @@ fn ckbus_owned_durables_stay_off_the_agent_streams() {
     // stream, so the check above covers them.
     for durable in bootstrap::module_durables::planned(&names).unwrap() {
         assert!(
-            membership::CKBUS_OWNED_DURABLES
-                .iter()
-                .any(|(kind, name)| *name == durable.durable
-                    && membership::stream_name(&names, *kind) == durable.stream),
+            membership::ckbus_owned_durables().any(|(kind, name)| name == durable.durable
+                && membership::stream_name(&names, kind) == durable.stream),
             "{} on {} is listed as ck-bus-owned",
             durable.durable,
             durable.stream

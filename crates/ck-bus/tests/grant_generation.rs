@@ -195,9 +195,18 @@ fn grant_generation_emits_each_role_set_from_the_pinned_literals() {
         fixture.flow_engine_module,
     )
     .expect("flow-engine grant");
+    let astrocyte = grants::issued_grant(&account, "astrocyte", "astrocyte", &[])
+        .expect("astrocyte's issued participant grant");
+    let by_role = [
+        (Principal::Participant, &participant),
+        (Principal::DeliveryAuthority, &delivery),
+        (Principal::Bus, &bus),
+        (Principal::System, &system),
+        (Principal::FlowEngine, &flow_engine),
+        (Principal::EventConsumer("astrocyte"), &astrocyte),
+    ];
 
-    for grant in [&participant, &delivery, &bus, &system, &flow_engine] {
-        let principal = grant.role().principal();
+    for (principal, grant) in by_role {
         assert_eq!(
             grant.publish_allow(),
             &golden_allows(&golden, principal, Operation::Publish),
@@ -250,13 +259,6 @@ fn grant_generation_emits_each_role_set_from_the_pinned_literals() {
 
     // Every refusal the golden expects must be outside the generated allow set of its
     // principal, so the grants cannot pass a refused act the live-server arm checks.
-    let by_role = [
-        (Principal::Participant, &participant),
-        (Principal::DeliveryAuthority, &delivery),
-        (Principal::Bus, &bus),
-        (Principal::System, &system),
-        (Principal::FlowEngine, &flow_engine),
-    ];
     let mut expectations = 0;
     for line in golden.lines() {
         let fields = line.split_whitespace().collect::<Vec<_>>();
@@ -364,7 +366,7 @@ fn vendored_foundation_and_golden_match_their_source_record() {
     // so it moves with the pin in Cargo.toml.
     assert_eq!(
         field("golden_commit"),
-        "5586ebd0bc6240efd4723ae22493a6ed3c5bdb8d"
+        "4af0f7e1aabf92499d876a99684be99c03e4cc74"
     );
     for (file, digest_field) in [
         ("nats-message-plane-foundation.md", "source_sha256"),

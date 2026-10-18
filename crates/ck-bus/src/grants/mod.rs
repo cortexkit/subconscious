@@ -301,7 +301,7 @@ pub fn system_account_grant(
     Grant::from_entries(GrantRole::SystemAccount, account, entries)
 }
 
-/// Renders the permission document for a golden fixture from the five role grants.
+/// Renders the permission document from the role grants and closed event-reader table.
 ///
 /// The fixture has no real user key, so each role's module id stands in where a
 /// credential public key goes: the participant's and bus module's inbox subjects read
@@ -337,10 +337,27 @@ pub fn render_fixture_document(fixture: GoldenFixture) -> Result<String, GrantRe
     ];
     let expectations = generate_permission_golden(fixture)?;
 
-    let allows = grants
+    let mut allows = grants
         .iter()
         .flat_map(Grant::allow_entries)
         .collect::<BTreeSet<_>>();
+    for reader in cortexkit_bus_naming::EVENT_CONSUMERS
+        .iter()
+        .filter(|reader| {
+            reader.module_id != fixture.delivery_authority_module
+                && reader.module_id != fixture.module_id
+        })
+    {
+        allows.extend(
+            issued_grant(&account, reader.module_id, reader.module_id, &[])?
+                .allow_entries()
+                .into_iter()
+                .map(|mut entry| {
+                    entry.principal = Principal::EventConsumer(reader.module_id);
+                    entry
+                }),
+        );
+    }
 
     let mut output = format!("{GENERATOR_HEADER}\n");
     for (name, value) in [

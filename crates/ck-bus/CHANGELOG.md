@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.4.4
+
+- Take cortexkit-bus-naming 0.2.3: bootstrap the closed event-consumer table's
+  `m_prefrontal-core` (broca events) and `m_astrocyte` (insula events), and issue
+  their own-durable pull, ack and info grants. Event names support 1–4 tokens.
+- Reconcile module consumers in place, retaining acknowledgement floors and
+  refusing immutable configuration changes without deleting a durable.
+- Raise existing event streams' per-subject cap from 10,000 to 100,000 in place,
+  preserving stored messages and logging the old and new limits.
+- Take `cortexkit-bus-trait`, `cortexkit-bus-inmemory` and `cortexkit-bus-nats` 0.3.0 from crates.io instead of a commons git revision, so the build carries one copy of `cortexkit-bus-naming` (0.2.3) rather than also its 0.2.1 through the git-pinned crates.
+
 ## 0.4.3
 
 - Move to subc-control 0.32 and subc-client-rs 0.30. No behavior change.

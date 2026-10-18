@@ -537,8 +537,18 @@ struct UpgradePlane {
 }
 
 impl UpgradePlane {
-    async fn start() -> Self {
-        let (bin, version) = nats_server_bin().expect("real-bus upgrade tests require nats-server");
+    /// Starts the plane, or records the crate's usual `nats-server-absent` skip and
+    /// returns `None` when no server binary is available (the Windows CI leg has none).
+    async fn start() -> Option<Self> {
+        let (bin, version) = match nats_server_bin() {
+            Ok(found) => found,
+            Err((gate, observation)) => {
+                RowReport::skipped(Row::InstallBootstrap, gate, observation)
+                    .served_by(ServedBy::HarnessSigner)
+                    .emit(&signer_vocabulary());
+                return None;
+            }
+        };
         eprintln!("nats-server {version}");
         let trust = TrustChain::generate();
         let dir = tempfile::tempdir().unwrap();
@@ -570,7 +580,7 @@ impl UpgradePlane {
         let account_public = ready.account.account_public.clone();
         let js = jetstream::new(bus::box_client(&trust, &server, &account_public).await);
         let broker = NatsBroker::new(server.url.clone(), credentials);
-        Self {
+        Some(Self {
             server,
             _dir: dir,
             deps,
@@ -580,7 +590,7 @@ impl UpgradePlane {
             account_public,
             broker,
             js,
-        }
+        })
     }
 
     async fn bootstrap(&self) -> Ready {
@@ -644,7 +654,9 @@ impl UpgradePlane {
 #[tokio::test]
 async fn bootstrap_raises_existing_event_cap_to_100000_without_losing_messages() {
     let _gate = harness::acceptance_gate().await;
-    let plane = UpgradePlane::start().await;
+    let Some(plane) = UpgradePlane::start().await else {
+        return;
+    };
     let spec = shipped_streams(&plane.names)
         .into_iter()
         .find(|spec| spec.kind == StreamKind::Event)
@@ -675,7 +687,9 @@ async fn bootstrap_raises_existing_event_cap_to_100000_without_losing_messages()
 #[tokio::test]
 async fn bootstrap_creates_every_table_event_durable_with_its_filter_and_settings() {
     let _gate = harness::acceptance_gate().await;
-    let plane = UpgradePlane::start().await;
+    let Some(plane) = UpgradePlane::start().await else {
+        return;
+    };
     drop(plane.bootstrap().await);
     for (durable, module) in [("m_prefrontal-core", "broca"), ("m_astrocyte", "insula")] {
         let info = plane.consumer(durable).await.get_info().await.unwrap();
@@ -705,7 +719,9 @@ async fn bootstrap_creates_every_table_event_durable_with_its_filter_and_setting
 #[tokio::test]
 async fn second_bootstrap_keeps_event_durable_creation_times_and_ack_floors() {
     let _gate = harness::acceptance_gate().await;
-    let plane = UpgradePlane::start().await;
+    let Some(plane) = UpgradePlane::start().await else {
+        return;
+    };
     drop(plane.bootstrap().await);
     plane.store_event("broca", "run.started").await;
     plane.store_event("insula", "signal").await;
@@ -729,7 +745,9 @@ async fn second_bootstrap_keeps_event_durable_creation_times_and_ack_floors() {
 #[tokio::test]
 async fn bootstrap_updates_event_filters_and_limits_in_place_preserving_ack_floors() {
     let _gate = harness::acceptance_gate().await;
-    let plane = UpgradePlane::start().await;
+    let Some(plane) = UpgradePlane::start().await else {
+        return;
+    };
     drop(plane.bootstrap().await);
     let sequence = plane.store_event("broca", "run.started").await;
     assert_eq!(plane.ack_one("m_prefrontal-core").await, sequence);
@@ -757,7 +775,9 @@ async fn bootstrap_updates_event_filters_and_limits_in_place_preserving_ack_floo
 #[tokio::test]
 async fn bootstrap_refuses_immutable_event_config_without_deleting_an_acked_durable() {
     let _gate = harness::acceptance_gate().await;
-    let plane = UpgradePlane::start().await;
+    let Some(plane) = UpgradePlane::start().await else {
+        return;
+    };
     drop(plane.bootstrap().await);
     plane
         .js
@@ -807,7 +827,9 @@ async fn bootstrap_refuses_immutable_event_config_without_deleting_an_acked_dura
 async fn prefrontal_event_grant_pulls_and_acks_seven_token_events_but_refuses_other_durables_and_create(
 ) {
     let _gate = harness::acceptance_gate().await;
-    let plane = UpgradePlane::start().await;
+    let Some(plane) = UpgradePlane::start().await else {
+        return;
+    };
     drop(plane.bootstrap().await);
     let credentials = plane.deps.credentials.clone();
     let user = credentials.custody.generate_user();

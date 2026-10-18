@@ -1,0 +1,108 @@
+{
+  "label_utf8": "ck-fed-pair-words-v1",
+  "label_hex": "636b2d6665642d706169722d776f7264732d7631",
+  "wordlist_sha256": "2f5eed53a4727b4bf8880d8f3f199efc90e58503646d9ff8eff3a2ed3b24dbda",
+  "positive_cases": [
+    {
+      "id": "one_bit_a",
+      "handshake_hash": "c2eb9cc5f75595f0a6ccfddd8c0170b27001054e2c32a48f0778a7e96505ef26",
+      "digest": "79133289e1373e3f59797e46174c271a8b9dabb42049396e5e38ca68685d2fc6",
+      "first_44_bits_hex": "79133289e13",
+      "indices": [
+        968,
+        1228,
+        1299,
+        1555
+      ],
+      "words": [
+        "jungle",
+        "office",
+        "pen",
+        "second"
+      ]
+    },
+    {
+      "id": "one_bit_b",
+      "handshake_hash": "393d045e4592c7bf5c91d4a68b17c332b88e2fc08ad837733b78536ebe0a8dd3",
+      "digest": "79133289e931a514d294a37c01c0619024c550c87ba4a2caf262cc6bc76d311c",
+      "first_44_bits_hex": "79133289e93",
+      "indices": [
+        968,
+        1228,
+        1299,
+        1683
+      ],
+      "words": [
+        "jungle",
+        "office",
+        "pen",
+        "sponsor"
+      ]
+    },
+    {
+      "id": "distinct_inputs",
+      "handshake_hash": "d893e0c6b4130290e9bc56bca0f79a33b1e13c99229e5b4ef9fca2b3d3476b2c",
+      "digest": "9951da1b82496b826c73daaca85930c4b1595b4d1d8a78da93e1a176c3eb0dc7",
+      "first_44_bits_hex": "9951da1b824",
+      "indices": [
+        1226,
+        1142,
+        1079,
+        36
+      ],
+      "words": [
+        "off",
+        "mom",
+        "manage",
+        "afraid"
+      ]
+    }
+  ],
+  "one_bit_transcript_pair": {
+    "ids": [
+      "one_bit_a",
+      "one_bit_b"
+    ],
+    "responder_ephemeral_counters": [
+      341070,
+      500948
+    ],
+    "first_44_bits_xor_hex": "00000000080",
+    "hamming_distance": 1
+  },
+  "extraction_only": {
+    "id": "hand_built_digest_big_endian",
+    "input_is": "post_label_hash_digest_not_handshake_hash",
+    "digest": "0000040100300000000000000000000000000000000000000000000000000000",
+    "first_44_bits_hex": "00000401003",
+    "indices": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "words": [
+      "abandon",
+      "ability",
+      "able",
+      "about"
+    ]
+  },
+  "hand_built_handshake_hash": {
+    "handshake_hash": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+    "digest": "a23e22bd2e3fdd9ee5d112a49fa456fd4f459ede59ee2038f7559ea307718902",
+    "first_44_bits_hex": "a23e22bd2e3",
+    "indices": [
+      1297,
+      1928,
+      1402,
+      739
+    ],
+    "words": [
+      "peasant",
+      "valve",
+      "quantum",
+      "fragile"
+    ]
+  }
+}

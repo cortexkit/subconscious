@@ -58,25 +58,43 @@ fn hello(events: Value) -> Value {
 
 #[test]
 fn event_name_validation_table_matches_bus_token_rule() {
-    // These sets must agree with the event-name token rule of the bus naming
-    // crate (cortexkit-bus-naming 0.2.0, `TokenKind::EventName`): one bus subject
-    // token of 1-63 bytes, a lowercase letter or digit first, then lowercase
-    // letters, digits or underscores. Hyphens and dots, which module ids allow,
-    // are refused.
+    // These sets must agree with cortexkit-bus-naming 0.2.6: one to four
+    // dot-separated tokens, each at most 63 bytes and starting with a lowercase
+    // letter or digit; version-shaped levels (`v` followed by digits) are reserved.
     let valid = [
         "a".to_string(),
         "0".into(),
         "github_ci_job_failed".into(),
         "a_0".into(),
+        "compaction.advanced".into(),
+        "run.started".into(),
+        "a.b.c".into(),
+        "a.b.c.d".into(),
+        "a_.b_0".into(),
         "a".repeat(63),
+        [
+            "a".repeat(63),
+            "b".repeat(63),
+            "c".repeat(63),
+            "d".repeat(63),
+        ]
+        .join("."),
     ];
     let invalid = [
         "".to_string(),
         "_event".into(),
         "Event".into(),
         "eVent".into(),
-        "event.name".into(),
         "event-name".into(),
+        "a..b".into(),
+        ".a".into(),
+        "a.".into(),
+        "A.b".into(),
+        "a.*".into(),
+        "a.>".into(),
+        "a.b.c.d.e".into(),
+        "v1".into(),
+        "a.v2".into(),
         "*".into(),
         ">".into(),
         "event*".into(),
@@ -97,6 +115,14 @@ fn event_name_validation_table_matches_bus_token_rule() {
             }
         }
     }
+}
+
+#[test]
+fn event_name_validation_refuses_empty_token() {
+    let body = hello(json!([{"name": "a..b", "version": 1, "headers": []}]));
+    let error = validate_hello_event_declarations(&body)
+        .expect_err("a doubled dot creates an empty event-name token");
+    assert_eq!(error.field(), "events[0].name");
 }
 
 #[test]

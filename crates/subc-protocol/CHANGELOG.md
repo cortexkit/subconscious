@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.32.7
+
+- Match `cortexkit-bus-naming` 0.2.6's event-name grammar in manifest validation: event names contain one to four non-empty dot-separated tokens, each 1–63 bytes and starting with a lowercase letter or digit; version-shaped levels (`v` followed by digits) are reserved. Modules must not declare dotted events until the running daemon carries this release; older daemons refuse dotted names at HELLO.
+
 ## 0.32.6
 
 - Add optional `ScopeAttributes.on_behalf_of_agent` and its builder: attribution only, never authority or `agent_id`. Authority owners may set it using the agent token rule, but not alongside `agent_id`, `delegates`, `flow_id` or `run_id`. Changes rotate the content version and close routes. The daemon advertises `scope::SCOPE_ON_BEHALF_OF_CAPABILITY` (`scope-on-behalf-of/v1`) and includes the field in bind stamps only for targets declaring it, and in describe replies only for callers declaring it.

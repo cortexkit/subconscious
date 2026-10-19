@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.36.17
+
+- Upgrade to subc-protocol 0.32.7 so HELLO accepts event names with one to four dot-separated tokens according to bus-naming 0.2.6. Modules must not declare dotted events until the running daemon carries this release; older daemons refuse dotted names at HELLO.
+
 ## 0.36.16
 
 - Support attribution-only `ScopeAttributes.on_behalf_of_agent` from scope-authority owners. Reject conflicting agent/delegation/flow/run attributes, validate the agent token, and close scoped routes when attribution changes. Advertise `scope-on-behalf-of/v1` in HELLO_ACK and `server.describe`; send the attribute in bind stamps only to declaring targets and in `scope.describe` replies only to declaring callers. Legacy readers never receive the field.

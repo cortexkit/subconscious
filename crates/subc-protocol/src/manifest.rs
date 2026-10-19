@@ -384,10 +384,12 @@ pub const CAP_SCOPE_REPLACE_IF_IDLE_V1: &str = "scope-replace-if-idle/v1";
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct EventDeclaration {
-    /// One NATS subject token: `[a-z0-9][a-z0-9_]{0,62}`.
+    /// One to four dot-separated NATS subject tokens, each
+    /// `[a-z0-9][a-z0-9_]{0,62}`. Levels shaped like `v` followed by digits
+    /// are reserved for the event subject's version.
     ///
-    /// This is the event token rule in `cortexkit-bus-naming` 0.2.0,
-    /// [`token.rs`, lines 91–143](https://docs.rs/cortexkit-bus-naming/0.2.0/src/cortexkit_bus_naming/token.rs.html#91-143).
+    /// This matches `cortexkit-bus-naming` 0.2.6,
+    /// [`token.rs`, lines 91–121](https://docs.rs/cortexkit-bus-naming/0.2.6/src/cortexkit_bus_naming/token.rs.html#91-121).
     pub name: String,
     /// Event schema version, at least 1.
     pub version: u32,
@@ -467,12 +469,26 @@ pub fn validate_hello_event_declarations(hello: &Value) -> Result<(), EventDecla
     )
 }
 
+/// Matches `cortexkit-bus-naming` 0.2.6's event-name grammar. Keep manifest
+/// declarations aligned with the names accepted in bus subjects.
 fn is_valid_event_name(name: &str) -> bool {
-    (1..=63).contains(&name.len())
-        && name.as_bytes()[0].is_ascii_alphanumeric()
-        && name
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+    let level_count = name.split('.').count();
+    (1..=4).contains(&level_count)
+        && name.split('.').all(|level| {
+            if level.is_empty() {
+                return false;
+            }
+            let first = level.as_bytes()[0];
+            (1..=63).contains(&level.len())
+                && (first.is_ascii_lowercase() || first.is_ascii_digit())
+                && level
+                    .bytes()
+                    .skip(1)
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+                && !level.strip_prefix('v').is_some_and(|digits| {
+                    !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+                })
+        })
 }
 
 fn validate_events_value(value: Option<&Value>) -> Result<(), EventDeclarationError> {
@@ -502,7 +518,7 @@ fn validate_events_value(value: Option<&Value>) -> Result<(), EventDeclarationEr
         if !is_valid_event_name(name) {
             return Err(EventDeclarationError::new(
                 name_field,
-                "must match [a-z0-9][a-z0-9_]{0,62}",
+                "must contain one to four valid dot-separated event-name levels",
             ));
         }
         let version = entry

@@ -4,10 +4,23 @@ import Foundation
 public struct FedCatalogOperation: Sendable, Equatable {
     public let name: String
     public let kind: String
+    public let delivery: Delivery?
 
-    public init(name: String, kind: String) {
+    public struct Delivery: RawRepresentable, Sendable, Hashable, Codable {
+        public let rawValue: String
+        public init(rawValue: String) { self.rawValue = rawValue }
+        public init(from decoder: Decoder) throws { self.init(rawValue: try decoder.singleValueContainer().decode(String.self)) }
+        public func encode(to encoder: Encoder) throws {
+            var container = encoder.singleValueContainer()
+            try container.encode(rawValue)
+        }
+        public static let watch = Self(rawValue: "watch")
+    }
+
+    public init(name: String, kind: String, delivery: Delivery? = nil) {
         self.name = name
         self.kind = kind
+        self.delivery = delivery
     }
 
     public var isMutation: Bool {
@@ -137,11 +150,16 @@ public enum FedCatalogCodec {
                     else {
                         continue
                     }
+                    var delivery: FedCatalogOperation.Delivery?
+                    if let value = op["delivery"] {
+                        guard case .string(let text) = value else { continue }
+                        delivery = .init(rawValue: text)
+                    }
                     if seenNames.contains(name) {
                         throw FedFailure.protocolViolation(byeCode: "fed_bad_frame")
                     }
                     seenNames.insert(name)
-                    operations.append(FedCatalogOperation(name: name, kind: kind))
+                    operations.append(FedCatalogOperation(name: name, kind: kind, delivery: delivery))
                 }
             }
 

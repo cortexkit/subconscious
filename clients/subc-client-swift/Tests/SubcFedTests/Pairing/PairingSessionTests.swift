@@ -279,7 +279,7 @@ final class PairingSessionTests: XCTestCase {
             ))
             let bytes = Self.rawFrame(#"{"type":"pairing_result","outcome":"granted"}"#)
             if afterHello {
-                let hello = FedHelloCodec.buildLocalHello(policy: try FedHelloPolicy(),
+                let hello = FedHelloCodec.buildLocalHello(policy: try FedHelloPolicy(features: ["mgmt-v1", "effects-v1", "effects-v2"]),
                     incarnation: "00000000-0000-4000-8000-0000000000aa",
                     ledgerEpoch: "00000000-0000-4000-8000-0000000000bb", connectionAttemptID: nil)
                 await transport.enqueueInbound(try FedFrameCodec.encode(hello, negotiationComplete: false))

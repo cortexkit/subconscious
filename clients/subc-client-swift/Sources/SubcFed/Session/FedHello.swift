@@ -121,6 +121,11 @@ public enum FedHelloCodec {
         }
 
         var machineID: String?
+        if let cap = frame.header["max_subscriptions"] {
+            guard case .integer(let value) = cap, (1...64).contains(value) else {
+                throw FedFailure.protocolViolation(byeCode: "fed_limits_unsupported")
+            }
+        }
         if let value = frame.header["machine_id"] {
             guard case .string(let id) = value,
                   id.utf8.count == 32,
@@ -163,6 +168,16 @@ public enum FedHelloCodec {
 
         let localFeatures = Set(localPolicy.features)
         var negotiated = localFeatures.intersection(parsed.features)
+        var maxSubscriptions: UInt64?
+        if let cap = remote.header["max_subscriptions"] {
+            guard case .integer(let value) = cap, (1...64).contains(value) else {
+                throw FedFailure.protocolViolation(byeCode: "fed_limits_unsupported")
+            }
+            maxSubscriptions = value
+        }
+        if negotiated.contains("subscribe-v1"), maxSubscriptions == nil {
+            throw FedFailure.protocolViolation(byeCode: "fed_limits_unsupported")
+        }
 
         // Feature downgrade protection: refuse if peer drops effects-v1 while
         // the origin still holds unsettled ledgered effects.
@@ -178,6 +193,7 @@ public enum FedHelloCodec {
             features: negotiated,
             peerMaxBodyBytes: parsed.maxBodyBytes,
             peerMaxInFlight: parsed.maxInFlight,
+            peerMaxSubscriptions: maxSubscriptions,
             peerKeepaliveIntervalMs: parsed.keepaliveIntervalMs,
             peerIncarnation: parsed.incarnation,
             peerLedgerEpoch: parsed.ledgerEpoch,

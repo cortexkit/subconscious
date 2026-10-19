@@ -103,8 +103,22 @@ public actor SubcFedClient {
     /// Never set in production.
     private var reconnectTestBarrier: (@Sendable () async -> Void)?
     private var activeSession: FedDialedSession?
+    private var establishingSession: FedDialedSession?
     private var receiveTask: Task<Void, Never>?
     private var pendingCalls: [UInt64: PendingCall] = [:]
+    private var subscriptions: [UInt64: SubscriptionRecord] = [:]
+    private var subscriptionGeneration = UUID()
+    private var nextSubscriptionID: UInt64 = 1
+    private var subscriptionOutbox: [(id: UInt64, frame: FedFrame)] = []
+    private var subscriptionWriter: Task<Void, Never>?
+
+    private final class SubscriptionRecord {
+        let storage = FedSubscriptionStorage()
+        var wire = FedSubscriptionWireState()
+        var opening: CheckedContinuation<Void, Error>?
+        var writeStarted = false
+        var closing = false
+    }
     private var stateContinuations: [UUID: AsyncStream<FedConnectionState>.Continuation] = [:]
     /// Non-terminal `call_frame`s (`push` / `stream_data`) received while no
     /// subscription surface exists to deliver them to.
@@ -176,6 +190,7 @@ public actor SubcFedClient {
     }
 
     deinit {
+        subscriptionWriter?.cancel()
         reconnectTask?.cancel()
         receiveTask?.cancel()
     }
@@ -416,6 +431,145 @@ public actor SubcFedClient {
             }
         )
     }
+
+    // MARK: - Subscriptions
+
+    /// Opens a catalog-advertised management watch. Payloads and cursors are opaque;
+    /// no handle escapes until the peer accepts with `open`.
+    public func subscribe(module: String, op: String, body: Data) async throws -> FedSubscription {
+        try Task.checkCancellation()
+        guard let session = activeSession ?? establishingSession else {
+            throw FedSubscriptionFailure(reason: .sessionLost, underlying: .disconnected)
+        }
+        let generation = subscriptionGeneration
+        let cap = try await session.engine.subscriptionAdmission(module: module, op: op, bodyBytes: body.count)
+        try Task.checkCancellation()
+        guard generation == subscriptionGeneration, isCurrentSession(session) else {
+            throw FedSubscriptionFailure(reason: .sessionLost, underlying: .disconnected)
+        }
+        guard subscriptions.count < Int(cap) else { throw FedSubscriptionFailure(reason: .subscriptionLimit) }
+        guard nextSubscriptionID <= FedSubscriptionCodec.maximumID else {
+            throw FedSubscriptionFailure(reason: .subscriptionLimit)
+        }
+        let id = nextSubscriptionID
+        nextSubscriptionID += 1
+        let record = SubscriptionRecord()
+        subscriptions[id] = record
+        let frame = FedFrame(type: "subscribe", fields: [
+            "id": .integer(id), "module": .string(module), "op": .string(op),
+        ], body: body)
+        try record.wire.receive(frame)
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                record.opening = continuation
+                if Task.isCancelled {
+                    cancelSubscription(id: id, generation: generation)
+                } else {
+                    subscriptionOutbox.append((id, frame))
+                    startSubscriptionWriter(session: session, generation: generation)
+                }
+            }
+        } onCancel: { [weak self] in
+            Task { await self?.cancelSubscription(id: id, generation: generation) }
+        }
+        if Task.isCancelled {
+            cancelSubscription(id: id, generation: generation)
+            throw CancellationError()
+        }
+        return FedSubscription(storage: record.storage) { [weak self] in
+            await self?.cancelSubscription(id: id, generation: generation)
+        }
+    }
+
+    private func isCurrentSession(_ session: FedDialedSession) -> Bool {
+        activeSession?.engine === session.engine
+    }
+
+    private func cancelSubscription(id: UInt64, generation: UUID) {
+        guard generation == subscriptionGeneration, let record = subscriptions[id], !record.closing else { return }
+        record.opening?.resume(throwing: CancellationError())
+        record.opening = nil
+        closeSubscription(id: id, record: record, reason: .unsubscribed)
+    }
+
+    private func closeSubscription(id: UInt64, record: SubscriptionRecord, reason: FedSubscriptionReason) {
+        guard !record.closing else { return }
+        record.closing = true
+        record.storage.settle(.success(FedSubscriptionEnd(reason: reason, source: .local, body: Data(), moduleError: nil)))
+        if !record.writeStarted {
+            subscriptionOutbox.removeAll { $0.id == id }
+            subscriptions.removeValue(forKey: id)
+            return
+        }
+        record.wire.unsubscribe()
+        subscriptionOutbox.append((id, FedFrame(type: "unsubscribe", fields: ["id": .integer(id)])))
+        if let session = activeSession { startSubscriptionWriter(session: session, generation: subscriptionGeneration) }
+    }
+
+    private func receiveSubscription(_ frame: FedFrame) throws {
+        guard case .integer(let id) = frame.header["id"], let record = subscriptions[id] else {
+            throw FedFailure.protocolViolation(byeCode: "fed_bad_frame")
+        }
+        try record.wire.receive(frame)
+        switch frame.typeName {
+        case "open":
+            record.opening?.resume()
+            record.opening = nil
+        case "subscription_refused":
+            guard case .string(let code) = frame.header["code"] else { return }
+            let failure = FedSubscriptionFailure(reason: .init(rawValue: code), source: .peer)
+            record.opening?.resume(throwing: failure)
+            record.opening = nil
+            record.storage.settle(.failure(failure))
+            subscriptions.removeValue(forKey: id)
+            subscriptionOutbox.removeAll { $0.id == id }
+        case "notice":
+            if !record.closing, !record.storage.offer(frame.body) {
+                closeSubscription(id: id, record: record, reason: .lagged)
+            }
+        case "end":
+            guard case .string(let reason) = frame.header["reason"] else { return }
+            let moduleError = reason == "module_error" ? try FedSubscriptionCodec.moduleError(frame.body) : nil
+            record.storage.settle(.success(FedSubscriptionEnd(
+                reason: .init(rawValue: reason), source: .peer, body: frame.body, moduleError: moduleError
+            )))
+            subscriptions.removeValue(forKey: id)
+            // A queued unsubscribe is unnecessary once the peer has ended the watch.
+            subscriptionOutbox.removeAll { $0.id == id }
+        default: throw FedFailure.protocolViolation(byeCode: "fed_bad_frame")
+        }
+    }
+
+    /// At most one writer and one coalesced unsubscribe per reserved id. The reader
+    /// only offers/enqueues; a stalled carrier is closed by the monotonic deadline.
+    private func startSubscriptionWriter(session: FedDialedSession, generation: UUID) {
+        guard subscriptionWriter == nil else { return }
+        subscriptionWriter = Task { [weak self] in
+            await self?.writeSubscriptions(session: session, generation: generation)
+        }
+    }
+
+    private func writeSubscriptions(session: FedDialedSession, generation: UUID) async {
+        while generation == subscriptionGeneration, isCurrentSession(session), !Task.isCancelled {
+            guard !subscriptionOutbox.isEmpty else { subscriptionWriter = nil; return }
+            let command = subscriptionOutbox.removeFirst()
+            guard let record = subscriptions[command.id] else { continue }
+            if command.frame.typeName == "subscribe" { record.writeStarted = true }
+            do {
+                try await FedStageDeadlineRunner(clock: clock).run(stage: .carrierConnect, duration: .seconds(15)) {
+                    try await session.engine.sendSubscriptionFrame(command.frame)
+                }
+            } catch {
+                guard generation == subscriptionGeneration, isCurrentSession(session) else { return }
+                await handleSessionLoss(error)
+                return
+            }
+        }
+    }
+
+    var subscriptionReservationCount: Int { subscriptions.count }
+    var subscriptionWaiterCount: Int { subscriptions.values.reduce(0) { $0 + $1.storage.waitingConsumers } }
+    func waitForSubscriptionWriter() async { await subscriptionWriter?.value }
 
     // MARK: - Dial cycle
 
@@ -675,6 +829,10 @@ public actor SubcFedClient {
             )
             do {
                 let dialed = try await dialFactory.dial(candidate: candidate, context: context)
+                establishingSession = dialed
+                defer {
+                    if establishingSession?.engine === dialed.engine { establishingSession = nil }
+                }
                 try await dialed.engine.establish()
                 // Re-validate after the establish await: a concurrent disconnect or
                 // a newer dial generation must not be resurrected into a ready
@@ -774,8 +932,9 @@ public actor SubcFedClient {
                     // slow call's time splits into the network's share and ours.
                     let receivedAtNs = await self.clock.nowNanoseconds()
                     let frames = try await session.engine.processInboundBytes(chunk)
-                    await self.handleInboundFrames(frames, session: session, receivedAtNs: receivedAtNs)
+                    try await self.handleInboundFrames(frames, session: session, receivedAtNs: receivedAtNs)
                 } catch {
+                    guard await self.isCurrentSession(session) else { return }
                     await self.handleSessionLoss(error)
                     return
                 }
@@ -787,8 +946,13 @@ public actor SubcFedClient {
         _ frames: [FedFrame],
         session: FedDialedSession,
         receivedAtNs: UInt64
-    ) async {
+    ) async throws {
         for frame in frames {
+            guard isCurrentSession(session) else { return }
+            if FedSubscriptionCodec.frameTypes.contains(frame.typeName ?? "") {
+                try receiveSubscription(frame)
+                continue
+            }
             guard frame.knownType == .callFrame else { continue }
             guard let effectValue = frame.header["effect"],
                   let effect = FedEffectID.fromJSON(effectValue)
@@ -1043,14 +1207,28 @@ public actor SubcFedClient {
     }
 
     private func tearDownSession(reason: FedFailure) async {
+        let session = activeSession
+        activeSession = nil
+        establishingSession = nil
         receiveTask?.cancel()
         receiveTask = nil
+        subscriptionWriter?.cancel()
+        subscriptionWriter = nil
+        subscriptionOutbox.removeAll()
+        subscriptionGeneration = UUID()
+        nextSubscriptionID = 1
+        let lost = FedSubscriptionFailure(reason: .sessionLost, underlying: reason)
+        for record in subscriptions.values {
+            record.opening?.resume(throwing: lost)
+            record.opening = nil
+            record.storage.settle(.failure(lost))
+        }
+        subscriptions.removeAll()
         await completePendingCalls(with: reason)
-        if let session = activeSession {
+        if let session {
             await session.engine.disconnect(reason: reason)
             await session.transport.close()
         }
-        activeSession = nil
         negotiatedFeatures = []
         peerMachineID = nil
     }

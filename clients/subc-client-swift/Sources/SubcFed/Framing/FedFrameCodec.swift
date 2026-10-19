@@ -386,6 +386,10 @@ public enum FedFrameCodec {
         negotiationComplete: Bool,
         negotiatedFeatures: Set<String>
     ) throws {
+        if FedSubscriptionCodec.frameTypes.contains(type) {
+            try FedSubscriptionCodec.validateHeader(header, type: type, complete: negotiationComplete, features: negotiatedFeatures)
+            return
+        }
         guard let knownType = FedFrameType(rawValue: type) else {
             if FedEffectsV2Codec.frameTypes.contains(type) {
                 try FedEffectsV2Codec.validateListHeader(
@@ -406,6 +410,11 @@ public enum FedFrameCodec {
                 throw FedFrameError.invalidHeaderField(type: type, field: "outcome")
             }
         case .hello:
+            if let cap = header["max_subscriptions"] {
+                guard case .integer(let value) = cap, (1...64).contains(value) else {
+                    throw FedFrameError.invalidHeaderField(type: type, field: "max_subscriptions")
+                }
+            }
             try requireArray(header, key: "versions", type: type) { values in
                 guard !values.isEmpty, values.count <= 16 else { return false }
                 return values.allSatisfy { if case .integer = $0 { return true }; return false }
@@ -553,6 +562,10 @@ public enum FedFrameCodec {
     }
 
     fileprivate static func validateBody(_ body: Data, type: String, header: FedJSONObject) throws {
+        if FedSubscriptionCodec.frameTypes.contains(type) {
+            try FedSubscriptionCodec.validateBody(body, type: type, header: header)
+            return
+        }
         let bodyless = [
             FedFrameType.pairingResult.rawValue,
             FedFrameType.hello.rawValue,
@@ -829,6 +842,7 @@ public struct FedFrameStreamDecoder: Sendable {
                     bodyLength = Int(declared)
                     discardBody = FedFrameType(rawValue: type) == nil
                         && !FedEffectsV2Codec.frameTypes.contains(type)
+                        && !FedSubscriptionCodec.frameTypes.contains(type)
                     bodyBuffer = discardBody ? Data() : Data(capacity: bodyLength)
                     if bodyLength == 0 {
                         try completeBody(&frames)

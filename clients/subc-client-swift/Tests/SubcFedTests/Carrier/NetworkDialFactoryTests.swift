@@ -278,7 +278,7 @@ final class NetworkDialFactoryTests: XCTestCase {
         var decoder = FedFrameStreamDecoder(negotiationComplete: false)
         _ = try decoder.append(try await session.receiveTransportPayload())
         let responderHello = FedHelloCodec.buildLocalHello(
-            policy: try FedHelloPolicy(),
+            policy: try FedHelloPolicy(features: ["mgmt-v1", "effects-v1", "effects-v2"]),
             incarnation: "00000000-0000-4000-8000-00000000aaaa",
             ledgerEpoch: "11111111-1111-4111-8111-11111111bbbb",
             connectionAttemptID: nil

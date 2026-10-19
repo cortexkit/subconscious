@@ -199,6 +199,8 @@ public actor FedSessionEngine {
     private var catalogTracker = FedCatalogTracker()
     private var keepalive: FedKeepaliveController?
     private var streamDecoder = FedFrameStreamDecoder(negotiationComplete: false)
+    private var writingFrame = false
+    private var writeWaiters: [CheckedContinuation<Void, Error>] = []
     private var role: FedSessionRole = .primary
     private var drain: FedRekeyDrainPolicy?
     private var admission: FedAdmissionController?
@@ -410,6 +412,7 @@ public actor FedSessionEngine {
         }
 
         let operation = try lookupOperation(moduleID: moduleID, method: method)
+        guard operation.delivery != .watch else { throw FedFailure.catalogTargetUnavailable }
         let classification = FedOriginEffectLog.classify(
             operationKind: operation.kind,
             peerFeatures: negotiation.features
@@ -828,6 +831,8 @@ public actor FedSessionEngine {
         cancelledActivities = true
         lastFailure = reason
         phase = .closed
+        for waiter in writeWaiters { waiter.resume(throwing: reason) }
+        writeWaiters.removeAll()
         if var activeKeepalive = keepalive {
             activeKeepalive.cancel()
             keepalive = activeKeepalive
@@ -928,6 +933,7 @@ public actor FedSessionEngine {
     // MARK: - Internals
 
     private func handleInboundFrame(_ frame: FedFrame) async throws {
+        try FedSubscriptionCodec.validateDirection(frame, fromOrigin: false)
         switch frame.knownType {
         case .pairingResult:
             await disconnect(reason: .protocolViolation(byeCode: "fed_bad_frame"))
@@ -970,7 +976,12 @@ public actor FedSessionEngine {
 
     private func sendFrame(_ frame: FedFrame, negotiationComplete: Bool? = nil) async throws {
         if cancelledActivities { throw FedFailure.cancelled }
-        if let drain, role == .draining {
+        if FedSubscriptionCodec.frameTypes.contains(frame.typeName ?? "") {
+            try FedSubscriptionCodec.validateDirection(frame, fromOrigin: true)
+            if role == .draining, frame.typeName != "unsubscribe" {
+                throw FedFailure.disconnected
+            }
+        } else if let drain, role == .draining {
             let type = frame.knownType ?? .bye
             let seq: UInt64?
             if let effectValue = frame.header["effect"],
@@ -994,12 +1005,57 @@ public actor FedSessionEngine {
             negotiationComplete: complete,
             negotiatedFeatures: features
         )
+        try await acquireFrameWriter()
+        defer { releaseFrameWriter() }
+        guard !cancelledActivities else { throw FedFailure.cancelled }
         try await deps.transport.send(bytes)
-        emittedFrames.append(frame)
+        // Watch requests must not accumulate payload history for the life of a session.
+        if !FedSubscriptionCodec.frameTypes.contains(frame.typeName ?? "") { emittedFrames.append(frame) }
         if var activeKeepalive = keepalive {
             activeKeepalive.noteOutboundFrame(at: deps.clock.nowNanoseconds())
             keepalive = activeKeepalive
         }
+    }
+
+    private func acquireFrameWriter() async throws {
+        if writingFrame {
+            try await withCheckedThrowingContinuation { writeWaiters.append($0) }
+        } else {
+            writingFrame = true
+        }
+    }
+
+    private func releaseFrameWriter() {
+        if !writeWaiters.isEmpty { writeWaiters.removeFirst().resume() }
+        else { writingFrame = false }
+    }
+
+    func sendSubscriptionFrame(_ frame: FedFrame) async throws {
+        try await sendFrame(frame)
+    }
+
+    func subscriptionAdmission(module: String, op: String, bodyBytes: Int) throws -> UInt64 {
+        guard let negotiation, negotiation.features.contains("subscribe-v1"), negotiation.managementEnabled else {
+            throw FedSubscriptionFailure(reason: .unsupported)
+        }
+        guard let catalog = catalogTracker.applied else {
+            throw FedSubscriptionFailure(reason: .catalogUnavailable)
+        }
+        guard phase == .ready, role == .primary else {
+            throw FedSubscriptionFailure(reason: .sessionLost, underlying: lastFailure ?? .disconnected)
+        }
+        guard FedCatalogCodec.isValidIdentifier(module), !module.contains("."), FedCatalogCodec.isValidOperationName(op),
+              let operation = catalog.lookup(moduleID: module, operation: op),
+              operation.kind == "query", operation.delivery == .watch else {
+            throw FedSubscriptionFailure(reason: .notWatch)
+        }
+        guard UInt64(bodyBytes) <= negotiation.peerMaxBodyBytes else {
+            throw FedFrameError.bodyTooLarge(declared: UInt32(clamping: bodyBytes), maximum: UInt32(clamping: negotiation.peerMaxBodyBytes))
+        }
+        guard let cap = negotiation.peerMaxSubscriptions else {
+            throw FedFailure.protocolViolation(byeCode: "fed_limits_unsupported")
+        }
+        return cap
     }
 
     private func receiveOneFrame() async throws -> FedFrame {

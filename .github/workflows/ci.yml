@@ -146,6 +146,26 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  vectors:
+    name: Shared wire vectors
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: vectors/*/requirements.txt
+      - name: Regenerate and verify every vector release
+        shell: bash
+        run: |
+          set -euo pipefail
+          for directory in vectors/*/; do
+            python3 -m pip install -r "${directory}requirements.txt"
+            python3 "${directory}generate.py" --check
+            (cd "$directory" && sha256sum --check SHA256SUMS)
+          done
+
   path-dependencies:
     name: Path dependencies
     runs-on: ubuntu-latest

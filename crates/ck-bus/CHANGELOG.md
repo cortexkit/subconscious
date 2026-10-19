@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.4.8
+
+- Fixed: the daemon's activity ledger never reached the bus. The bus module's grant did not allow publishing `ck.{acct}.event.subc.activity.v1`, so the server refused every copy and the mirror retried every 15 s without storing anything. The grant (from `cortexkit-bus-naming` 0.2.7) now allows exactly that subject, and a live-server test checks that the copy is stored and that publishing another module's events is still refused.
+- `m_prefrontal-core` also reads Basal's four flow-instance lifecycle events (`event.basal.flow_instance_created.v1`, `_extended`, `_ended`, `_expired`). Bootstrap widens the existing durable in place and keeps its position on Broca's events.
+
 ## 0.4.7
 
 - Create the `m_thalamus` durable reader so the Claude Code gateway can read Magic Context's compaction notices, and widen `m_magic-context`'s filter to also read `event.thalamus.compaction.>`. Bootstrap's create-or-update widens the existing durable in place, so Magic Context keeps its reading position. Takes `cortexkit-bus-naming` 0.2.6.

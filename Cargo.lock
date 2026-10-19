@@ -264,7 +264,7 @@ dependencies = [
 
 [[package]]
 name = "ck-bus"
-version = "0.4.7"
+version = "0.4.8"
 dependencies = [
  "async-nats",
  "async-trait",
@@ -377,9 +377,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-bus-naming"
-version = "0.2.6"
+version = "0.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2be653c416dc2912a1e13e7b03455f9eaab24d1fe4c549c8d1c4a4f649472d07"
+checksum = "696b59aebd321f2a7deb0cc1423aeeccb0e18f774f4144d755edddef062b593d"
 
 [[package]]
 name = "cortexkit-bus-nats"

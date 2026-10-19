@@ -138,6 +138,7 @@ allow bus publish $JS.API.STREAM.UPDATE.CK_BOX_GOLDENFIXTURE_WAKE
 allow bus publish $JS.API.STREAM.UPDATE.KV_CK_BOX_GOLDENFIXTURE_CENSUS
 allow bus publish $KV.CK_BOX_GOLDENFIXTURE_CENSUS.>
 allow bus publish _INBOX.ckbus.>
+allow bus publish ck.box_goldenfixture.event.subc.activity.v1
 allow bus publish ck.box_goldenfixture.sentinel.ping
 allow bus subscribe $KV.CK_BOX_GOLDENFIXTURE_CENSUS.>
 allow bus subscribe _INBOX.ckbus.>
@@ -367,7 +368,9 @@ expect-refused delivery-authority publish $KV.CK_BOX_GOLDENFIXTURE_CENSUS.forbid
 expect-refused delivery-authority publish $SYS.REQ.CLAIMS.UPDATE system-subject
 expect-refused delivery-authority publish ck.box_goldenfixture.event.broca.run.v1 foreign-module-event
 expect-refused delivery-authority publish ck.box_goldenfixture.event.insula.quota_sampled.v1 foreign-module-event
+expect-refused delivery-authority subscribe ck.box_goldenfixture.event.basal.> foreign-event-subscribe
 expect-refused bus publish ck.box_goldenfixture.effect.agent_gold_a.session_gold.intent workload-publish
+expect-refused bus publish ck.box_goldenfixture.event.broca.run.v1 foreign-module-event
 expect-refused bus publish ck.box_goldenfixture.peer.agent_gold_a.session_gold.deliver workload-publish
 expect-refused bus publish ck.box_goldenfixture.room.room_gold_bound.post workload-publish
 expect-refused bus publish ck.box_goldenfixture.wake.agent_gold_a.fire workload-publish

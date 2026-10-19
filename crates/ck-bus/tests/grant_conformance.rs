@@ -575,6 +575,18 @@ async fn generated_grants_hold_on_a_live_server() {
         b.publish(&subject, b"workload").await;
         b.expect_denied(&subject).await;
     }
+    // The bus module copies the daemon's activity ledger onto the event stream
+    // under `subc`, because the daemon holds no bus credential. The live server
+    // must accept and store exactly that subject, and still refuse the bus
+    // module's publish on another module's events.
+    let activity = names.event_subject("subc", "activity", 1).unwrap();
+    let event_before = stored(&observer, &streams.event).await;
+    b.publish(&activity, b"{}").await;
+    b.expect_allowed(&activity).await;
+    assert_eq!(stored(&observer, &streams.event).await, event_before + 1);
+    let foreign_event = names.event_subject("broca", "run", 1).unwrap();
+    b.publish(&foreign_event, b"{}").await;
+    b.expect_denied(&foreign_event).await;
 
     // ---- The system user ----
     let golden = std::fs::read_to_string(

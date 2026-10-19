@@ -20,9 +20,9 @@ import { SocketReader, startServer, writeAll, type ReproServer, type Stats } fro
 
 export const KEY = Uint8Array.from(Array(32).fill(0x4c));
 export const DAEMON_ID = Uint8Array.from(Array(16).fill(0x7d));
-const SERVER_NONCE = Uint8Array.from(Array.from({ length: 32 }, (_, i) => 0xa0 + i));
+export const SERVER_NONCE = Uint8Array.from(Array.from({ length: 32 }, (_, i) => 0xa0 + i));
 export const IDENTITY = { project_root: "/tmp/subc-client-test", harness: "bun", session: "managed" };
-const BACKOFF = { baseMs: 5, capMs: 10, maxAttempts: 4 };
+export const BACKOFF = { baseMs: 5, capMs: 10, maxAttempts: 4 };
 
 export function startManagedServer(): Promise<ReproServer> {
   return startServer(handleFakeConnection);
@@ -66,19 +66,27 @@ export function responseFrame(request: Frame, body: unknown): Frame {
   return buildFrame(FrameType.Response, buildFlags(false, Priority.Interactive, false), request.header.channel, request.header.epoch, request.header.corr, encodeJson(body));
 }
 
-export async function authenticateFakeServer(reader: SocketReader, socket: Socket, deadline: number): Promise<void> {
+// key/daemonId default as in the test's authenticateFakeServer (1855-1861); a
+// restarted fake daemon passes its rotated key.
+export async function authenticateFakeServer(
+  reader: SocketReader,
+  socket: Socket,
+  deadline: number,
+  key: Uint8Array = KEY,
+  daemonId: Uint8Array = DAEMON_ID,
+): Promise<void> {
   const hello = await readAuthMessage<{ client_nonce: number[]; role: string }>(reader, deadline);
   assert.equal(hello.role, "client");
   const clientNonce = Uint8Array.from(hello.client_nonce);
-  const serverProof = computeProof(KEY, SERVER_PROOF_DOMAIN, clientNonce, SERVER_NONCE, DAEMON_ID);
+  const serverProof = computeProof(key, SERVER_PROOF_DOMAIN, clientNonce, SERVER_NONCE, daemonId);
   await writeAuthMessage(socket, {
-    daemon_id: Array.from(DAEMON_ID),
+    daemon_id: Array.from(daemonId),
     server_nonce: Array.from(SERVER_NONCE),
     daemon_ver: "fake-subc",
     server_proof: Array.from(serverProof),
   }, deadline);
   const auth = await readAuthMessage<{ client_auth: number[] }>(reader, deadline);
-  const expected = computeProof(KEY, CLIENT_AUTH_DOMAIN, clientNonce, SERVER_NONCE, DAEMON_ID);
+  const expected = computeProof(key, CLIENT_AUTH_DOMAIN, clientNonce, SERVER_NONCE, daemonId);
   assert.equal(Buffer.from(auth.client_auth).equals(Buffer.from(expected)), true);
 }
 
@@ -103,7 +111,7 @@ export async function readFrame(reader: SocketReader, deadline: number): Promise
   return { header, body };
 }
 
-async function writeFrame(socket: Socket, frame: Frame, deadline: number): Promise<void> {
+export async function writeFrame(socket: Socket, frame: Frame, deadline: number): Promise<void> {
   await writeAll(socket, encodeFrame(frame), deadline);
 }
 

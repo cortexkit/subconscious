@@ -123,3 +123,59 @@ jobs:
         with:
           name: win-bun-narrow-1.4.3
           path: ${{ runner.temp }}/win-bun-narrow/
+
+  # The two daemon-restart tests that exit abnormally alone on Bun 1.4.3: each
+  # alone in its own file, then the same sequence split across a fake-daemon
+  # process and a client process (scripts/win-restart-split.ts), with the
+  # client as a plain script and inside bun:test. Five fresh runs per row.
+  restart-split:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        bun: ['1.4.3', '1.3.14']
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ matrix.bun }}
+      - name: Bun ${{ matrix.bun }} - daemon restart rows
+        continue-on-error: true
+        run: ./clients/subc-client/scripts/win-bun-subsets.ps1 -Set restart -Label '${{ matrix.bun }}' -OutputDirectory "$env:RUNNER_TEMP/win-bun-restart"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: win-bun-restart-${{ matrix.bun }}
+          path: ${{ runner.temp }}/win-bun-restart/
+
+  # The control-push test that fails on Bun 1.3.14, rebuilt exactly
+  # (scripts/win-push-ladder.test.ts) with each difference from the logged copy
+  # switched on alone and cumulatively, plus the real test and the old copy as
+  # controls. Five fresh runs per row.
+  push-ladder:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        bun: ['1.3.14', '1.4.3']
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ matrix.bun }}
+      - name: Bun ${{ matrix.bun }} - control-push ladder rows
+        continue-on-error: true
+        run: ./clients/subc-client/scripts/win-bun-subsets.ps1 -Set ladder -Label '${{ matrix.bun }}' -OutputDirectory "$env:RUNNER_TEMP/win-bun-ladder"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: win-bun-ladder-${{ matrix.bun }}
+          path: ${{ runner.temp }}/win-bun-ladder/

@@ -602,6 +602,58 @@ pub struct ForwardingTable {
 }
 
 impl ForwardingTable {
+    /// Install scripted operator confirmation for an in-process integration harness,
+    /// without bootstrapping a daemon process. Only available with `test-support`.
+    ///
+    /// The script has one response per line: `approve`, `decline`, `unavailable`,
+    /// `hang` (until withdrawn), or `approve when <path>` (wait for the path to
+    /// exist). Unreadable or exhausted scripts fail closed. If supplied, `events`
+    /// receives the provider's JSON-lines event log. `limits: None` uses
+    /// [`OperatorLimits::default`](crate::operator_confirm::OperatorLimits); use
+    /// `Some(OperatorLimits { queue_wait, prompt_timeout, stuck_grace })` to
+    /// override the queue wait, prompt timeout and stuck-provider grace periods.
+    ///
+    /// The current executable's file name **must start with `ckdev-`**. Otherwise
+    /// this logs a warning and keeps the OS provider, just like bootstrap.
+    /// `cortexkit-test-support`'s `ckdev_binary` copies a harness executable under
+    /// a qualifying name; run that copy to enable scripted confirmation. See
+    /// `crates/subc-client-rs/tests/real_daemon/operator_confirm.rs` for the
+    /// reference end-to-end harness.
+    ///
+    /// Configure the table shared by the harness's `ControlHandler` and `Router`
+    /// before serving any requests. This also configures privileged confirmations
+    /// that use the same table.
+    ///
+    /// # Panics
+    ///
+    /// Panics if operator-confirm processing has already started.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use std::{path::Path, sync::Arc};
+    /// use subc_daemon::{ControlHandler, ForwardingTable, Registry};
+    ///
+    /// let registry = Arc::new(Registry::default());
+    /// let forwarding = Arc::new(ForwardingTable::default());
+    /// forwarding.configure_operator_script(
+    ///     Path::new("operator.script"),
+    ///     Some(Path::new("operator.events")),
+    ///     None,
+    /// );
+    /// let handler = ControlHandler::with_forwarding(registry, forwarding);
+    /// ```
+    #[cfg(feature = "test-support")]
+    pub fn configure_operator_script(
+        &self,
+        script: &std::path::Path,
+        events: Option<&std::path::Path>,
+        limits: Option<crate::operator_confirm::OperatorLimits>,
+    ) {
+        self.operator_confirms()
+            .configure_script(script, events, limits);
+    }
+
     /// Hold the next supervisor drain between enqueueing `module.draining` and
     /// `route.closing`, so a test can forward a response in that window. Dropping
     /// the returned sender also releases the hold, including on a test panic.

@@ -396,8 +396,12 @@ impl OperatorConfirms {
     pub(crate) fn configure_bootstrap(&self, config: &crate::bootstrap::BootstrapConfig) {
         let provider: Arc<dyn OperatorProvider> = Arc::new(OsProvider);
         #[cfg(feature = "test-support")]
-        let provider =
-            test_provider::select(provider, config, std::env::current_exe().ok().as_deref());
+        let provider = test_provider::select(
+            provider,
+            config.operator_script.as_deref(),
+            config.operator_events.as_deref(),
+            std::env::current_exe().ok().as_deref(),
+        );
         self.configure(
             provider,
             OperatorLimits {
@@ -406,6 +410,22 @@ impl OperatorConfirms {
                 stuck_grace: config.operator_stuck_grace,
             },
         );
+    }
+
+    #[cfg(feature = "test-support")]
+    pub(crate) fn configure_script(
+        &self,
+        script: &std::path::Path,
+        events: Option<&std::path::Path>,
+        limits: Option<OperatorLimits>,
+    ) {
+        let provider = test_provider::select(
+            Arc::new(OsProvider),
+            Some(script),
+            events,
+            test_provider::current_executable().as_deref(),
+        );
+        self.configure(provider, limits.unwrap_or_default());
     }
 
     /// Called while the forwarding read lock still protects this binding. All

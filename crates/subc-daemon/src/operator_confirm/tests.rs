@@ -803,6 +803,118 @@ fn refused_audit_has_exact_fields_and_debug_escaped_summary() {
 }
 
 #[cfg(feature = "test-support")]
+fn configure_script_as(
+    forwarding: &ForwardingTable,
+    executable: &str,
+    script: &std::path::Path,
+    events: Option<&std::path::Path>,
+    limits: Option<OperatorLimits>,
+) {
+    super::test_provider::EXECUTABLE_FOR_TEST.with(|value| {
+        let previous = value.replace(Some(executable.into()));
+        forwarding.configure_operator_script(script, events, limits);
+        value.replace(previous);
+    });
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn in_process_operator_script_confirms_then_declines() {
+    let dir = cortexkit_test_support::ScratchDir::new("in-process-operator-script");
+    let script = dir.join("script");
+    let events = dir.join("events");
+    std::fs::write(&script, "approve\ndecline\n").unwrap();
+    let registry = Arc::new(Registry::default());
+    let forwarding = Arc::new(ForwardingTable::default());
+    configure_script_as(
+        &forwarding,
+        "ckdev-in-process-harness",
+        &script,
+        Some(&events),
+        Some(short_limits()),
+    );
+    let supervisor = SupervisorHandle::new();
+    let handler = Arc::new(
+        ControlHandler::with_forwarding(registry, forwarding.clone())
+            .with_supervisor(supervisor.clone()),
+    );
+    let router = crate::Router::with_control_handler(handler.clone());
+    assert!(Arc::ptr_eq(&router.forwarding(), &forwarding));
+    let fixture = Fixture {
+        forwarding,
+        handler,
+        supervisor,
+    };
+    let limits = fixture.forwarding.operator_confirms().lock().limits;
+    assert_eq!(limits.queue_wait, short_limits().queue_wait);
+    assert_eq!(limits.prompt_timeout, short_limits().prompt_timeout);
+    assert_eq!(limits.stuck_grace, short_limits().stuck_grace);
+    let mut module = fixture.module("scripted-module", 900, "spawn-proof").await;
+    for (corr, outcome) in [(2, "confirmed"), (3, "operator_declined")] {
+        assert!(fixture
+            .request(&module, corr, "Delete the test record")
+            .await
+            .is_empty());
+        let reply = receive(&mut module.rx).await;
+        assert_eq!(reply.header.corr, corr);
+        if outcome == "confirmed" {
+            assert_eq!(reply.header.ty, FrameType::Response);
+            assert_eq!(body(&reply)["outcome"], outcome);
+        } else {
+            assert_eq!(reply.header.ty, FrameType::Error);
+            assert_eq!(body(&reply)["code"], outcome);
+        }
+    }
+    let events: Vec<serde_json::Value> = std::fs::read_to_string(events)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(events.len(), 4);
+    assert_eq!(events[0]["event"], "prompt_shown");
+    assert_eq!(events[1]["result"], "approved");
+    assert_eq!(events[2]["event"], "prompt_shown");
+    assert_eq!(events[3]["result"], "declined");
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn in_process_operator_script_non_ckdev_falls_back_and_warns() {
+    let dir = cortexkit_test_support::ScratchDir::new("refused-in-process-operator-script");
+    let script = dir.join("script");
+    let events = dir.join("events");
+    std::fs::write(&script, "approve\n").unwrap();
+    let forwarding = ForwardingTable::default();
+    let (logs, _guard) = crate::router::test_log::log_capture(tracing::Level::WARN);
+    configure_script_as(&forwarding, "ck-subc", &script, Some(&events), None);
+    assert!(
+        !events.exists(),
+        "the scripted provider must not be installed"
+    );
+    let logs = crate::router::test_log::captured_logs(&logs);
+    assert!(
+        logs.contains(
+            "operator confirm test provider refused: executable name must start with ckdev-"
+        ),
+        "{logs}"
+    );
+    assert!(logs.contains("WARN"), "{logs}");
+    let confirms = forwarding.operator_confirms();
+    let state = confirms.lock();
+    let defaults = OperatorLimits::default();
+    assert_eq!(state.limits.queue_wait, defaults.queue_wait);
+    assert_eq!(state.limits.prompt_timeout, defaults.prompt_timeout);
+    assert_eq!(state.limits.stuck_grace, defaults.stuck_grace);
+    // Linux's OS provider refuses without showing a prompt. Do not invoke the
+    // real biometric provider on platforms where it would require a person.
+    #[cfg(target_os = "linux")]
+    assert_eq!(
+        state.provider.prompt("text", Box::new(|_| {})),
+        ProviderResult::UnsupportedPlatform
+    );
+}
+
+#[cfg(feature = "test-support")]
 #[test]
 fn script_provider_is_ckdev_only_and_records_events() {
     let dir = cortexkit_test_support::ScratchDir::new("operator-script");
@@ -819,7 +931,8 @@ fn script_provider_is_ckdev_only_and_records_events() {
     config.operator_events = Some(events.clone());
     let refused = super::test_provider::select(
         Arc::new(Immediate(ProviderResult::NoPresence)),
-        &config,
+        config.operator_script.as_deref(),
+        config.operator_events.as_deref(),
         Some(std::path::Path::new("ck-subc")),
     );
     assert_eq!(
@@ -829,7 +942,8 @@ fn script_provider_is_ckdev_only_and_records_events() {
     assert!(!events.exists());
     let selected = super::test_provider::select(
         Arc::new(Immediate(ProviderResult::NoPresence)),
-        &config,
+        config.operator_script.as_deref(),
+        config.operator_events.as_deref(),
         Some(std::path::Path::new("ckdev-subc")),
     );
     assert_eq!(
@@ -1764,7 +1878,8 @@ async fn scripted_privileged_restart(result: &str, expected_code: &str, expected
     config.operator_events = Some(events.clone());
     let provider = super::test_provider::select(
         Arc::new(Immediate(ProviderResult::NoPresence)),
-        &config,
+        config.operator_script.as_deref(),
+        config.operator_events.as_deref(),
         Some(std::path::Path::new("ckdev-subc")),
     );
     let f = privileged_fixture(provider, OperatorLimits::default());

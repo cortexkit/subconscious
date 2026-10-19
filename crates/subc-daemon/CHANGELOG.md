@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.36.14
+
+- With `test-support`, in-process harnesses can install the existing scripted operator-confirm provider through `ForwardingTable::configure_operator_script`, including optional event logging and timing limits, without bootstrapping a daemon process. The executable must still be named `ckdev-*`; other names retain the OS provider and log the same refusal as bootstrap. Builds without the feature are unchanged.
+
 ## 0.36.13
 
 - Tests only, no behaviour change. Pin two scope-table rules that codemode run scopes rely on: a parent ending never ends a child, which stays live, drains with `scope_parent_ended`, and still admits binds stamped `parent_state: ended`; and re-pointing a child's `parent` at its parent's new epoch in the same sync keeps the link `linked` and drains nothing, while a re-point in a later sync makes it `linked` again.

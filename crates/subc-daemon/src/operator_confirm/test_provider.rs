@@ -8,12 +8,28 @@ use std::{
 
 use super::{OperatorProvider, OperatorWithdraw, ProviderResult};
 
+#[cfg(test)]
+thread_local! {
+    pub(super) static EXECUTABLE_FOR_TEST: std::cell::RefCell<Option<std::path::PathBuf>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+pub(super) fn current_executable() -> Option<std::path::PathBuf> {
+    #[cfg(test)]
+    if let Some(executable) = EXECUTABLE_FOR_TEST.with(|value| value.borrow().clone()) {
+        return Some(executable);
+    }
+    std::env::current_exe().ok()
+}
+
 pub(super) fn select(
     os: Arc<dyn OperatorProvider>,
-    config: &crate::bootstrap::BootstrapConfig,
+    script: Option<&Path>,
+    events: Option<&Path>,
     executable: Option<&Path>,
 ) -> Arc<dyn OperatorProvider> {
-    let Some(script) = &config.operator_script else {
+    let Some(script) = script else {
         return os;
     };
     if !executable
@@ -37,9 +53,7 @@ pub(super) fn select(
         lines: Mutex::new(lines),
         events: Arc::new(Events {
             file: Mutex::new(
-                config
-                    .operator_events
-                    .as_ref()
+                events
                     .and_then(|path| OpenOptions::new().create(true).append(true).open(path).ok()),
             ),
         }),

@@ -583,7 +583,28 @@ async fn hello_event_declaration_refusals_name_each_malformed_field() {
         ("name_missing", "name", None),
         ("name_wrong_type", "name", Some(serde_json::json!(1))),
         ("name_empty", "name", Some(serde_json::json!(""))),
-        ("name_dotted", "name", Some(serde_json::json!("github.ci"))),
+        // Dotted names are valid bus event names; these are the dotted shapes
+        // the bus grammar still refuses.
+        (
+            "name_empty_level",
+            "name",
+            Some(serde_json::json!("github..ci")),
+        ),
+        (
+            "name_trailing_dot",
+            "name",
+            Some(serde_json::json!("github.")),
+        ),
+        (
+            "name_version_level",
+            "name",
+            Some(serde_json::json!("github.v2")),
+        ),
+        (
+            "name_five_levels",
+            "name",
+            Some(serde_json::json!("a.b.c.d.e")),
+        ),
         ("name_uppercase", "name", Some(serde_json::json!("GitHub"))),
         ("name_hyphen", "name", Some(serde_json::json!("github-ci"))),
         (

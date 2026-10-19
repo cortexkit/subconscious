@@ -11,7 +11,25 @@ fn main() {
         subc_os::privacy_identity::trampoline_main_for_test(&args);
     }
     subc_os::privacy_identity::trampoline_main(&args);
+    if args.iter().any(|arg| arg == "--build-info") {
+        // Upgrade compares this offline identity with the running daemon's
+        // server.describe response before claiming the new release is live.
+        println!(
+            "{}",
+            serde_json::json!({
+                "core_version": env!("CARGO_PKG_VERSION"),
+                "build_git_sha": embedded_build_identity(option_env!("SUBC_BUILD_GIT_SHA"), 40),
+                "build_lock_digest": embedded_build_identity(option_env!("SUBC_BUILD_LOCK_DIGEST"), 64),
+            })
+        );
+        return;
+    }
     daemon_main(args);
+}
+
+fn embedded_build_identity(value: Option<&str>, length: usize) -> Option<&str> {
+    value
+        .filter(|value| value.len() == length && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
 }
 
 #[tokio::main]
@@ -62,9 +80,10 @@ async fn daemon_main(args: Vec<std::ffi::OsString>) {
             "ck-subc {} — the CortexKit subc daemon\n\n\
              Started by launchd; it takes no arguments and reads its configuration\n\
              from subc.jsonc under the XDG config directory.\n\n\
-             flags:\n  \
-               --version   print the version and exit\n  \
-               --help      print this and exit\n\n\
+              flags:\n  \
+                --version   print the version and exit\n  \
+                --build-info print offline core version and build identity as JSON\n  \
+                --help      print this and exit\n\n\
              To inspect or control a running daemon use `ck` (`ck module list`,\n\
              `ck health`, `ck daemon`). Running this binary directly starts a daemon.",
             env!("CARGO_PKG_VERSION")
@@ -345,6 +364,18 @@ mod tests {
                 "Rust's default hook must still write to stderr"
             );
         }
+    }
+
+    #[test]
+    fn offline_build_identity_never_reports_missing_or_dirty_sha_as_verified() {
+        assert_eq!(embedded_build_identity(None, 40), None);
+        assert_eq!(embedded_build_identity(Some("unavailable"), 40), None);
+        let sha = "a".repeat(40);
+        assert_eq!(embedded_build_identity(Some(&sha), 40), Some(sha.as_str()));
+        assert_eq!(
+            embedded_build_identity(Some(&format!("{sha}-dirty")), 40),
+            None
+        );
     }
 
     #[test]

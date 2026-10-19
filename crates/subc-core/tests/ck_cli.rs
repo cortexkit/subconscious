@@ -660,6 +660,9 @@ fn installed_claustrum_entry(bin: &Path, data_home: &Path) -> Value {
 struct SignedIndex {
     url: String,
     public_key: String,
+    // Only the Unix-only setup refusal tests assert which URLs were fetched.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    requests: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 fn serve_signed_index(
@@ -673,6 +676,8 @@ fn serve_signed_index(
     let signature =
         base64::engine::general_purpose::STANDARD.encode(signing.sign(&body).to_bytes());
     let public_key = base64::engine::general_purpose::STANDARD.encode(signing.verifying_key());
+    let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let served_requests = requests.clone();
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else {
@@ -686,6 +691,7 @@ fn serve_signed_index(
                 .next()
                 .and_then(|line| line.split_whitespace().nth(1))
                 .unwrap_or("/");
+            served_requests.lock().unwrap().push(path.to_string());
             let (response, signature_header) = if path == "/index.json" {
                 (&body, Some(signature.as_str()))
             } else if let Some(asset) = assets.get(path) {
@@ -715,6 +721,7 @@ fn serve_signed_index(
     SignedIndex {
         url: format!("{base}/index.json"),
         public_key,
+        requests,
     }
 }
 
@@ -1086,6 +1093,10 @@ fn setup_core_drift_floor_refusal_is_actionable_and_never_mutates() {
     let manifest_before = fs::read(&manifest_path).unwrap();
     let index = serve_signed_index(|base| {
         let (mut index, assets) = setup_index(base, None);
+        // Keep the core release current so the module-floor refusal, rather
+        // than the independent downgrade refusal, is the property under test.
+        index["components"]["core"]["version"] = json!("0.17.19");
+        index["components"]["core"]["release"] = json!("subc-core-v0.17.19");
         let mut aft = index_component(
             "v1.0.0",
             Some("1.0.0"),
@@ -1125,43 +1136,182 @@ fn setup_core_drift_floor_refusal_is_actionable_and_never_mutates() {
 }
 
 #[test]
+#[cfg(unix)]
+fn setup_unowned_refusals_match_dry_run_without_downloads_or_changes() {
+    for version in ["0.20.98", "0.17.8", "unknown"] {
+        let fixture = SetupFixture::fresh("setup-unowned-refusal");
+        let binary_home = fixture.data_home.join("cortexkit/bin");
+        let binary = binary_home.join("ck-subc-mcp");
+        let script = format!("#!/bin/sh\necho 'ck-subc-mcp {version}'\n");
+        write_executable(&binary, &script);
+        let index = serve_signed_index(|base| setup_index(base, None));
+        let mut outputs = Vec::new();
+        for args in [&["setup", "--dry-run"][..], &["setup"][..]] {
+            let output = fixture.command(&index, args).output().unwrap();
+            assert_exit(&output, 1);
+            assert!(!text(&output.stdout).contains("Installing"));
+            assert!(!text(&output.stdout).contains("Continue?"));
+            outputs.push(text(&output.stdout));
+            assert_eq!(fs::read(&binary).unwrap(), script.as_bytes());
+            assert!(!binary_home.join("ck-subc").exists());
+            assert!(!fixture
+                .data_home
+                .join("cortexkit/installer-manifest.json")
+                .exists());
+            assert!(!fixture.config_home.join("cortexkit/subc.jsonc").exists());
+            assert!(!runtime_definition(&fixture.home).exists());
+        }
+        assert_eq!(outputs[0], outputs[1]);
+        if version == "0.20.98" {
+            assert!(outputs[0].contains("0.20.98, newer than the latest release (0.17.9)"));
+            assert!(outputs[0].contains("ck setup will not downgrade it. Nothing was changed."));
+        } else {
+            assert!(outputs[0]
+                .contains("ck setup did not install it. Move it aside and run ck setup again."));
+        }
+        assert_eq!(
+            *index.requests.lock().unwrap(),
+            vec!["/index.json", "/index.json"]
+        );
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn setup_owned_newer_daemon_refuses_even_when_configuration_is_correct() {
+    let fixture = SetupFixture::installed("setup-owned-newer-daemon");
+    write_executable(
+        &fixture.data_home.join("cortexkit/bin/ck-subc"),
+        "#!/bin/sh\necho 'ck-subc 0.20.98+local'\n",
+    );
+    let config = fixture.config_home.join("cortexkit/subc.jsonc");
+    let inventory = fixture.data_home.join("cortexkit/installer-manifest.json");
+    let before = (fs::read(&config).unwrap(), fs::read(&inventory).unwrap());
+    let index = serve_signed_index(|base| setup_index(base, None));
+    for args in [&["setup", "--dry-run"][..], &["setup"][..]] {
+        let output = fixture.command(&index, args).output().unwrap();
+        assert_exit(&output, 1);
+        assert_eq!(text(&output.stdout), "This computer runs CortexKit daemon 0.20.98+local, newer than the latest release (0.17.9). ck setup will not downgrade it. Nothing was changed.\n");
+        assert_eq!(
+            (fs::read(&config).unwrap(), fs::read(&inventory).unwrap()),
+            before
+        );
+    }
+    assert_eq!(
+        *index.requests.lock().unwrap(),
+        vec!["/index.json", "/index.json"]
+    );
+}
+
+#[test]
+fn daemon_build_info_is_offline_and_reports_the_core_release() {
+    let root = TempDir::new("daemon-offline-build-info");
+    let config_home = root.join("config");
+    fs::create_dir_all(config_home.join("cortexkit")).unwrap();
+    let config = config_home.join("cortexkit/subc.jsonc");
+    fs::write(&config, "not valid configuration").unwrap();
+    let runtime = root.join("runtime");
+    let output = Command::new(cortexkit_test_support::ckdev_binary(env!(
+        "CARGO_BIN_EXE_ck-subc-under-test"
+    )))
+    .arg("--build-info")
+    .env("HOME", root.path())
+    .env("USERPROFILE", root.path())
+    .env("XDG_CONFIG_HOME", &config_home)
+    .env("XDG_DATA_HOME", "relative-data-home-must-not-be-read")
+    .env("XDG_RUNTIME_DIR", &runtime)
+    .env("SUBC_CGROUP_PLACEMENT", "invalid-must-not-be-read")
+    .output()
+    .unwrap();
+    assert_exit(&output, 0);
+    assert!(output.stderr.is_empty(), "{}", text(&output.stderr));
+    let info: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(info["core_version"], env!("CARGO_PKG_VERSION"));
+    for (key, length) in [("build_git_sha", 40), ("build_lock_digest", 64)] {
+        let value = info.get(key).expect("offline identity field");
+        assert!(
+            value.is_null()
+                || value.as_str().is_some_and(|value| value.len() == length
+                    && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        );
+    }
+    assert_eq!(
+        fs::read_to_string(config).unwrap(),
+        "not valid configuration"
+    );
+    assert!(!runtime.exists());
+    assert!(!root.join(".local").exists());
+}
+
+#[test]
+#[cfg(unix)]
+fn setup_live_daemon_uses_core_release_not_connection_library_version() {
+    use std::os::unix::fs::PermissionsExt;
+    use subc_transport::connection_file::{self, ConnectionInfo, Endpoint};
+
+    let fixture = SetupFixture::installed("setup-live-core-version");
+    write_executable(
+        &fixture.data_home.join("cortexkit/bin/ck-subc"),
+        "#!/bin/sh\necho 'ck-subc 0.20.83'\n",
+    );
+    set_setup_managed_modes(&fixture);
+    let connection_path = fixture.home.join("live-daemon.json");
+    let connection = ConnectionInfo {
+        schema: connection_file::SCHEMA_VERSION,
+        wire_version: Some(subc_protocol::PROTOCOL_VERSION),
+        endpoints: vec![Endpoint {
+            host: "127.0.0.1".to_string(),
+            port: 1,
+        }],
+        key: vec![7; connection_file::KEY_LEN],
+        daemon_id: [8; connection_file::DAEMON_ID_LEN],
+        pid: std::process::id(),
+        daemon_ver: "0.36.5".to_string(),
+    };
+    fs::write(&connection_path, serde_json::to_vec(&connection).unwrap()).unwrap();
+    fs::set_permissions(&connection_path, fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(
+        connection_file::discover(Some(&connection_path))
+            .unwrap()
+            .info
+            .daemon_ver,
+        "0.36.5"
+    );
+    let config = fixture.config_home.join("cortexkit/subc.jsonc");
+    let inventory = fixture.data_home.join("cortexkit/installer-manifest.json");
+    let before = (fs::read(&config).unwrap(), fs::read(&inventory).unwrap());
+    let index = serve_signed_index(|base| {
+        let (mut index, assets) = setup_index(base, None);
+        index["components"]["core"]["version"] = json!("0.20.83");
+        index["components"]["core"]["release"] = json!("subc-core-v0.20.83");
+        (index, assets)
+    });
+    for args in [&["setup", "--dry-run"][..], &["setup"][..]] {
+        let output = fixture
+            .command(&index, args)
+            .env("SUBC_CONNECTION_FILE", &connection_path)
+            .output()
+            .unwrap();
+        assert_exit(&output, 0);
+        assert_eq!(text(&output.stdout), "CortexKit is set up: daemon running, aft · claustrum · insula ok.\nOptional modules not installed: mc, synapse — run `ck setup mc` or `ck setup synapse`.\n");
+        assert_eq!(
+            (fs::read(&config).unwrap(), fs::read(&inventory).unwrap()),
+            before
+        );
+    }
+    assert_eq!(
+        *index.requests.lock().unwrap(),
+        vec!["/index.json", "/index.json"]
+    );
+}
+
+#[test]
 fn setup_nothing_to_do_never_renders_outcome_no_op() {
     let fixture = SetupFixture::installed("ck-setup-current");
     // The no-op claim applies only when this existing install already has
     // setup's managed modes; loose paths now produce a real tightening step.
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        let cortexkit = fixture.data_home.join("cortexkit");
-        let binary_dir = cortexkit.join("bin");
-        let config = fixture.config_home.join("cortexkit/subc.jsonc");
-        let config_dir = config.parent().unwrap().to_path_buf();
-        let manifest = cortexkit.join("installer-manifest.json");
-        for (path, mode) in [
-            (&cortexkit, 0o700),
-            (&binary_dir, 0o755),
-            (&config_dir, 0o700),
-            (&config, 0o600),
-            (&manifest, 0o644),
-        ] {
-            fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
-        }
-        for binary in [
-            "ck-subc",
-            "ck-subc-mcp",
-            "ck-aft",
-            "ck-claustrum",
-            "ck-auth",
-            "ck-insula",
-        ] {
-            fs::set_permissions(
-                cortexkit.join("bin").join(platform_binary(binary)),
-                fs::Permissions::from_mode(0o755),
-            )
-            .unwrap();
-        }
-    }
+    set_setup_managed_modes(&fixture);
     let index = serve_signed_index(|base| setup_index(base, None));
     let output = fixture.command(&index, &["setup"]).output().unwrap();
 
@@ -1171,6 +1321,40 @@ fn setup_nothing_to_do_never_renders_outcome_no_op() {
         text(&output.stdout),
         "CortexKit is set up: daemon running, aft · claustrum · insula ok.\nOptional modules not installed: mc, synapse — run `ck setup mc` or `ck setup synapse`.\n"
     );
+}
+
+#[cfg(unix)]
+fn set_setup_managed_modes(fixture: &SetupFixture) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let cortexkit = fixture.data_home.join("cortexkit");
+    let binary_dir = cortexkit.join("bin");
+    let config = fixture.config_home.join("cortexkit/subc.jsonc");
+    let config_dir = config.parent().unwrap().to_path_buf();
+    let manifest = cortexkit.join("installer-manifest.json");
+    for (path, mode) in [
+        (&cortexkit, 0o700),
+        (&binary_dir, 0o755),
+        (&config_dir, 0o700),
+        (&config, 0o600),
+        (&manifest, 0o644),
+    ] {
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+    for binary in [
+        "ck-subc",
+        "ck-subc-mcp",
+        "ck-aft",
+        "ck-claustrum",
+        "ck-auth",
+        "ck-insula",
+    ] {
+        fs::set_permissions(
+            cortexkit.join("bin").join(platform_binary(binary)),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+    }
 }
 
 // Magic Context has no Windows release (`Component::Mc` is declared
@@ -1587,6 +1771,8 @@ struct UpgradeFixture {
     _root: TempDir,
     home: PathBuf,
     connection_file: PathBuf,
+    #[cfg(windows)]
+    core_version: std::cell::RefCell<String>,
 }
 
 impl UpgradeFixture {
@@ -1653,7 +1839,7 @@ impl UpgradeFixture {
                 key: generate_key().unwrap(),
                 daemon_id: generate_daemon_id().unwrap(),
                 pid: std::process::id(),
-                daemon_ver: "0.17.9".to_string(),
+                daemon_ver: "0.36.5".to_string(),
             },
         )
         .unwrap();
@@ -1661,6 +1847,8 @@ impl UpgradeFixture {
             _root: root,
             home,
             connection_file,
+            #[cfg(windows)]
+            core_version: std::cell::RefCell::new("0.17.9".to_string()),
         }
     }
 
@@ -1688,18 +1876,21 @@ impl UpgradeFixture {
                 "CK_UPDATE_CACHE_PATH",
                 self._root.path().join("update-metadata.json"),
             );
+        #[cfg(windows)]
+        command.env("CK_TEST_SUBC_VERSION", self.core_version.borrow().as_str());
         command
     }
 
     fn set_core_version(&self, version: &str) {
-        let mut connection: Value =
-            serde_json::from_slice(&fs::read(&self.connection_file).unwrap()).unwrap();
-        connection["daemon_ver"] = json!(version);
-        fs::write(
-            &self.connection_file,
-            serde_json::to_vec(&connection).unwrap(),
-        )
-        .unwrap();
+        #[cfg(windows)]
+        self.core_version.replace(version.to_string());
+        write_executable(
+            &self
+                .home
+                .join(".local/share/cortexkit/bin")
+                .join(platform_binary("ck-subc")),
+            &format!("#!/bin/sh\necho 'ck-subc {version}'\n"),
+        );
         let path = self
             .home
             .join(".local/share/cortexkit/installer-manifest.json");

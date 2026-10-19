@@ -408,7 +408,7 @@ const MACHINE_HELP: &str = "ck machine — this machine's id, the name the daemo
 
 const DAEMON_HELP: &str = "ck daemon — daemon version, uptime, connection info, offline triage, and CI lint\n\nusage:\n  ck [--json] [--verbose] daemon\n  ck [--json] daemon triage\n  ck daemon lint [<config>] [--verbose]\n\n  triage reads only the local run directory; it never contacts the daemon.\n  lint reads module manifests without connecting to the daemon.";
 
-const SETUP_HELP: &str = "ck setup — plan managed CortexKit installation\n\nusage:\n  ck setup [aft|mc|insula|claustrum|synapse] [--with aft,mc,insula,claustrum,synapse] [--dry-run] [--verbose]\n  ck setup claustrum [--key-path <file>]\n  ck setup <aft|mc> --convert [--confirm]\n  ck setup --uninstall [--dry-run]\n\n  Bare setup installs core and offers optional components. --dry-run prints the\n  complete plan without changing anything. --convert is explicit and requires\n  --confirm before it can apply a conversion plan. --verbose includes plan outcomes\n  and download diagnostics when a network request fails.";
+const SETUP_HELP: &str = "ck setup — plan managed CortexKit installation\n\nusage:\n  ck setup [aft|mc|insula|claustrum|synapse] [--with aft,mc,insula,claustrum,synapse] [--dry-run] [--verbose] [--yes|-y]\n  ck setup claustrum [--key-path <file>]\n  ck setup <aft|mc> --convert [--confirm]\n  ck setup --uninstall [--dry-run]\n\n  Bare setup installs core and offers optional components. --dry-run prints the\n  complete plan without changing anything. Interactive setup shows that plan and\n  asks Continue? [y/N] before changes; --yes (-y) skips the question. Piped or\n  non-terminal setup proceeds without a question. --convert is explicit and requires\n  --confirm before it can apply a conversion plan. --verbose includes plan outcomes\n  and download diagnostics when a network request fails.";
 
 const UPGRADE_HELP: &str = "ck upgrade — plan managed component upgrades\n\nusage:\n  ck upgrade [--dry-run] [--verbose]\n  ck upgrade --check [--verbose]\n\n  --check reports available updates without changing anything. --dry-run prints\n  the complete plan without changing anything. --verbose includes plan outcomes\n  and execution evidence.";
 
@@ -7281,11 +7281,48 @@ fn setup_command(program: &Path, request: &setup::SetupRequest) -> Result<(), Ck
         print_verbose_setup_outcomes(&plan, request.verbose);
         return Ok(());
     }
+    if !confirm_setup_if_interactive(
+        request,
+        io::stdin().is_terminal(),
+        io::stdout().is_terminal(),
+        || {
+            backend.print_dry_run(&plan).map_err(CkError::Message)?;
+            backend
+                .print_proposed_diffs(&plan, request)
+                .map_err(CkError::Message)?;
+            confirm_setup(&mut io::stdin().lock(), &mut io::stdout().lock())
+                .map_err(|error| CkError::Message(format!("could not confirm setup: {error}")))
+        },
+    )? {
+        println!("Nothing was changed.");
+        return Ok(());
+    }
     backend
         .apply_plan(&plan, request)
         .map_err(CkError::Message)?;
     print_verbose_outcomes(&plan.outcomes, request.verbose);
     Ok(())
+}
+
+fn confirm_setup_if_interactive(
+    request: &setup::SetupRequest,
+    stdin_terminal: bool,
+    stdout_terminal: bool,
+    confirm: impl FnOnce() -> Result<bool, CkError>,
+) -> Result<bool, CkError> {
+    if !request.yes && stdin_terminal && stdout_terminal {
+        confirm()
+    } else {
+        Ok(true)
+    }
+}
+
+fn confirm_setup(input: &mut impl io::BufRead, output: &mut impl io::Write) -> io::Result<bool> {
+    write!(output, "Continue? [y/N] ")?;
+    output.flush()?;
+    let mut answer = String::new();
+    input.read_line(&mut answer)?;
+    Ok(matches!(answer.trim(), "y" | "yes"))
 }
 
 fn setup_no_change_summary(
@@ -7423,23 +7460,15 @@ async fn upgrade_command(
     verbose: bool,
     dry_run: bool,
 ) -> Result<(), CkError> {
-    // The daemon connection file is the daemon catalog build evidence. It is
-    // optional while no inventory-owned daemon exists; discovery turns its
-    // absence into a refusal only when an owned daemon actually needs a version.
-    // The discovered path is kept for the executor: after the daemon rung
-    // restarts the service, completion is read from that same file, and the
-    // backend only knew an explicit --subc, so every discovered daemon reached
-    // the restart and then refused verification for want of a path.
+    // Keep the discovered path for post-restart verification. Installed core
+    // versions come from the managed binary, not the connection's library tag.
     let connection = discover_connection_file(subc).ok();
     let connection_path = subc
         .map(Path::to_path_buf)
         .or_else(|| connection.as_ref().map(|found| found.path.clone()));
-    let daemon_catalog = connection.map(|found| setup::DaemonCatalogBuild {
-        pid: found.info.pid,
-        version: found.info.daemon_ver,
-    });
-    let discovered = setup::discover_current_upgrade_targets(executable, daemon_catalog.as_ref())
-        .map_err(CkError::Rejected)?;
+    let discovered =
+        setup::discover_current_upgrade_targets(executable, None::<&setup::DaemonCatalogBuild>)
+            .map_err(CkError::Rejected)?;
     let cache = setup::UpdateCache::from_environment();
     let source = setup::IndexReleaseSource::from_environment(setup::TARGET_CHECK_BUDGET);
     let upgrade_roster = discovered
@@ -7606,6 +7635,7 @@ fn parse_setup_command(tail: &[OsString]) -> Result<setup::SetupRequest, CkError
     let mut uninstall = false;
     let mut dry_run = false;
     let mut verbose = false;
+    let mut yes = false;
     let mut convert = false;
     let mut conversion_confirmed = false;
     let mut claustrum_key_path = None;
@@ -7648,6 +7678,10 @@ fn parse_setup_command(tail: &[OsString]) -> Result<setup::SetupRequest, CkError
             }
             "--verbose" => {
                 verbose = true;
+                index += 1;
+            }
+            "--yes" | "-y" => {
+                yes = true;
                 index += 1;
             }
             "--uninstall" => {
@@ -7725,6 +7759,7 @@ fn parse_setup_command(tail: &[OsString]) -> Result<setup::SetupRequest, CkError
     request.uninstall = uninstall;
     request.dry_run = dry_run;
     request.verbose = verbose;
+    request.yes = yes;
     request.convert = if convert { explicit_component } else { None };
     request.conversion_confirmed = conversion_confirmed;
     if claustrum_selected {
@@ -11034,6 +11069,63 @@ mod tests {
                 module_id: Some(module_id)
             } if module_id == "aft"
         ));
+    }
+
+    #[test]
+    fn setup_confirmation_is_skipped_when_stdin_is_not_a_terminal() {
+        let request = setup::SetupRequest::install(vec![]);
+        let mut prompted = false;
+        assert!(confirm_setup_if_interactive(&request, false, true, || {
+            prompted = true;
+            Ok(true)
+        })
+        .unwrap());
+        assert!(!prompted, "non-terminal stdin must never run confirmation");
+    }
+
+    #[test]
+    fn setup_confirmation_is_skipped_when_stdout_is_not_a_terminal_or_yes_is_set() {
+        let mut request = setup::SetupRequest::install(vec![]);
+        for (stdin, stdout, yes) in [(true, false, false), (true, true, true)] {
+            request.yes = yes;
+            assert!(confirm_setup_if_interactive(&request, stdin, stdout, || {
+                panic!("confirmation should be skipped")
+            })
+            .unwrap());
+        }
+    }
+
+    #[test]
+    fn setup_confirmation_prompts_on_terminals_and_only_accepts_y_or_yes() {
+        let request = setup::SetupRequest::install(vec![]);
+        for (answer, expected) in [
+            ("y\n", true),
+            ("yes\n", true),
+            ("\n", false),
+            ("", false),
+            ("no\n", false),
+            ("Y\n", false),
+            ("anything\n", false),
+        ] {
+            let mut output = Vec::new();
+            let accepted = confirm_setup_if_interactive(&request, true, true, || {
+                confirm_setup(&mut answer.as_bytes(), &mut output)
+                    .map_err(|error| CkError::Message(error.to_string()))
+            })
+            .unwrap();
+            assert_eq!(accepted, expected, "answer {answer:?}");
+            assert_eq!(output, b"Continue? [y/N] ");
+        }
+    }
+
+    #[test]
+    fn setup_yes_flags_are_parsed_and_documented() {
+        for flag in ["--yes", "-y"] {
+            let request = parse_setup_command(&[OsString::from(flag)]).unwrap();
+            assert!(request.yes);
+            assert!(SETUP_HELP.contains(flag));
+        }
+        assert!(!parse_setup_command(&[]).unwrap().yes);
     }
 
     #[test]

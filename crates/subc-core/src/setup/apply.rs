@@ -6,7 +6,6 @@ use std::{
 };
 
 use serde_json::{Map, Value};
-use subc_transport::connection_file;
 
 use super::{
     bus_monitoring::{self, BusMonitoring},
@@ -22,7 +21,6 @@ use super::{
     planner::{execute_setup, ExecutionMode, SetupExecutor, SetupPlan},
     runtime::{self, CommandRunner, RuntimePlatform, RuntimeStatus, SystemCommandRunner},
     uninstall,
-    upgrade::{binary_version, DaemonCatalogBuild},
     validation::{self, Validator},
 };
 
@@ -151,6 +149,7 @@ impl SetupBackend {
         let registered_modules = self.live_enabled_modules()?;
         let mut components = BTreeMap::new();
         let mut releases = BTreeMap::new();
+        let mut unowned_binaries = BTreeMap::new();
         // A failed index is about the document, not a single component: setup
         // must not plan any installation from it.
         self.artifacts.ensure_index()?;
@@ -189,6 +188,20 @@ impl SetupBackend {
             };
             let binary_ok =
                 components::is_installed(component, &self.paths.binary_home, &self.inventory);
+            if !request.uninstall && selected.contains(&component) && !binary_ok {
+                if let PlatformObservation::Supported(target) = PlatformObservation::current() {
+                    unowned_binaries.insert(
+                        component,
+                        components::observe_unowned_binaries(
+                            component,
+                            &self.paths.binary_home,
+                            &self.inventory,
+                            &release_index,
+                            target,
+                        ),
+                    );
+                }
+            }
             components.insert(
                 component,
                 observed_component_state(
@@ -225,17 +238,16 @@ impl SetupBackend {
         let mut observed = SetupObserved::unconfigured_current_host();
         observed.components = components;
         observed.releases = releases;
+        observed.unowned_binaries = unowned_binaries;
+        observed.available_core_version = release_index
+            .components
+            .get("core")
+            .and_then(|entry| entry.version.clone());
         observed.requires_core = requires_core;
         observed.core_binary_present =
             self.paths.runtime_paths.daemon.is_file() || self.runtime_status.live;
-        if observed.core_binary_present
-            && selected.iter().any(|component| {
-                component.module_id().is_some()
-                    && observed.requires_core.contains_key(component)
-                    && observed.component_state(*component) == ComponentState::Missing
-            })
-        {
-            observed.installed_core_version = self.observed_daemon_version();
+        if observed.core_binary_present && !request.uninstall {
+            observed.installed_core_version = self.observed_core_version();
         }
         observed.runtime = if self.runtime_status.registered
             && self.runtime_status.live
@@ -501,17 +513,10 @@ impl SetupBackend {
         }
     }
 
-    fn observed_daemon_version(&self) -> Option<String> {
-        if self.runtime_status.live {
-            let discovered = connection_file::discover(None).ok()?;
-            let catalog = DaemonCatalogBuild {
-                pid: discovered.info.pid,
-                version: discovered.info.daemon_ver,
-            };
-            Some(catalog.version)
-        } else {
-            binary_version(&self.paths.runtime_paths.daemon).ok()
-        }
+    fn observed_core_version(&self) -> Option<String> {
+        // The connection file's daemon_ver identifies the subc-daemon library,
+        // not the subc-core release that setup's index and module floors name.
+        components::observed_binary_version(&self.paths.runtime_paths.daemon)
     }
 
     /// Returns enabled module ids only when the daemon is live. A stopped daemon
@@ -1461,10 +1466,7 @@ mod adoption_tests {
         let targets = super::super::upgrade::discover_managed_upgrade_targets(
             &backend.inventory,
             &executable,
-            Some(&DaemonCatalogBuild {
-                pid: 1,
-                version: "0.17.10".to_string(),
-            }),
+            None,
         )
         .unwrap();
         let ck = targets

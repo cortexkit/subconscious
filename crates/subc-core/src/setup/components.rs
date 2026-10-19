@@ -12,7 +12,10 @@ use sha2::{Digest, Sha256};
 use super::{
     config, file_modes,
     inventory::Inventory,
-    model::{AlphaTarget, Component, PlatformObservation, ReleaseAvailability},
+    model::{
+        AlphaTarget, Component, CoreVersion, PlatformObservation, ReleaseAvailability,
+        UnownedBinary,
+    },
     release_index::{self, IndexAsset, IndexRefusal, ReleaseIndex},
 };
 
@@ -497,6 +500,54 @@ pub fn is_installed(component: Component, binary_home: &Path, inventory: &Invent
     component_is_owned(component, binary_home, inventory)
 }
 
+pub(super) fn observe_unowned_binaries(
+    component: Component,
+    binary_home: &Path,
+    inventory: &Inventory,
+    index: &ReleaseIndex,
+    target: AlphaTarget,
+) -> Vec<UnownedBinary> {
+    let entry = index.components.get(component.label());
+    component_binaries_for_target(component, target)
+        .iter()
+        .filter_map(|binary| {
+            let path = binary_home.join(platform_binary(binary));
+            if fs::symlink_metadata(&path).is_err()
+                || OWNED_BINARY_KINDS
+                    .iter()
+                    .any(|kind| inventory.owns_path(kind, &path))
+            {
+                return None;
+            }
+            let release_version = entry.and_then(|entry| {
+                entry
+                    .assets
+                    .get(target.label())
+                    .and_then(|assets| assets.get(*binary))
+                    .and_then(|asset| asset.reports.clone())
+                    .or_else(|| entry.version.clone())
+            });
+            Some(UnownedBinary {
+                version: observed_binary_version(&path),
+                path,
+                release_version,
+            })
+        })
+        .collect()
+}
+
+pub(super) fn observed_binary_version(path: &Path) -> Option<String> {
+    let output = run_probe_tolerating_text_busy(path, "--version").ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .map(|token| token.trim_start_matches('v'))
+        .find(|token| CoreVersion::from_release(token).is_ok() || token.starts_with("ck-mc-"))
+        .map(ToOwned::to_owned)
+}
+
 /// The inventory kinds under which a managed binary is owned. Setup records
 /// `managed-binary`; the bootstrap installers and `ck upgrade` record
 /// `binary-placement`. Upgrade discovery and the roster must agree on this
@@ -779,7 +830,7 @@ pub enum Acceptance {
 /// carries the wrong binary from becoming a supervised module, and pays the
 /// first-exec toll on the destination inode before the daemon spawns it.
 fn verify_acceptance(path: &Path, acceptance: &Acceptance) -> Result<(), String> {
-    let output = run_version_tolerating_text_busy(path)
+    let output = run_probe_tolerating_text_busy(path, "--version")
         .map_err(|error| format!("could not run {} --version: {error}", path.display()))?;
     if !output.status.success() {
         return Err(format!(
@@ -798,21 +849,57 @@ fn verify_acceptance(path: &Path, acceptance: &Acceptance) -> Result<(), String>
     })
 }
 
-/// Executes `<path> --version`, retrying briefly on ETXTBSY. On Linux a
+/// Executes an offline binary probe, retrying briefly on ETXTBSY. On Linux a
 /// `fork` in another thread of this process inherits every open descriptor,
 /// including the write end of a binary that a sibling thread is still
 /// finishing; until that child execs (which closes it), the kernel refuses
 /// to execute the file as "text busy". The window is microseconds but the
 /// error is real, and the fix belongs here rather than in a test because
-/// the same race exists for any multi-threaded caller of this acceptance.
-fn run_version_tolerating_text_busy(path: &Path) -> std::io::Result<std::process::Output> {
+/// the same race exists for any multi-threaded caller of this probe helper.
+pub(super) fn run_probe_tolerating_text_busy(
+    path: &Path,
+    argument: &str,
+) -> std::io::Result<std::process::Output> {
+    // An unowned executable may not implement --version, or may hang. Bound
+    // both execution and output collection before trusting it during planning.
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?
+                    .block_on(async {
+                        tokio::time::timeout(
+                            std::time::Duration::from_secs(2),
+                            probe_output(path, argument),
+                        )
+                        .await
+                        .map_err(|_| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                format!("{argument} timed out"),
+                            )
+                        })?
+                    })
+            })
+            .join()
+            .map_err(|_| std::io::Error::other("offline binary probe panicked"))?
+    })
+}
+
+async fn probe_output(path: &Path, argument: &str) -> std::io::Result<std::process::Output> {
     const TEXT_BUSY: i32 = 26;
     let mut attempts = 0;
     loop {
-        match Command::new(path).arg("--version").output() {
+        match tokio::process::Command::new(path)
+            .arg(argument)
+            .kill_on_drop(true)
+            .output()
+            .await
+        {
             Err(error) if error.raw_os_error() == Some(TEXT_BUSY) && attempts < 20 => {
                 attempts += 1;
-                std::thread::sleep(std::time::Duration::from_millis(25));
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
             }
             result => return result,
         }
@@ -1531,6 +1618,66 @@ mod tests {
             generated_at_ms: 1_788_425_000_000,
             components,
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn observation_records_only_unowned_destinations_and_their_versions() {
+        let root = ScratchDir::new("setup-unowned-observation");
+        let daemon = root.join("ck-subc");
+        let mcp = root.join("ck-subc-mcp");
+        crate::setup::test_exec::write_executable(
+            &daemon,
+            b"#!/bin/sh\necho 'ck-subc 0.20.98+local'\n",
+        );
+        fs::write(&mcp, "not executable").unwrap();
+        let inventory = Inventory::load(root.join("inventory.json"), "linux-x64").unwrap();
+        let binaries = observe_unowned_binaries(
+            Component::Core,
+            root.path(),
+            &inventory,
+            &index_with_core_linux(),
+            AlphaTarget::LinuxX64,
+        );
+        assert_eq!(
+            binaries,
+            vec![
+                UnownedBinary {
+                    path: daemon.clone(),
+                    version: Some("0.20.98+local".to_string()),
+                    release_version: Some("0.16.0".to_string())
+                },
+                UnownedBinary {
+                    path: mcp,
+                    version: None,
+                    release_version: Some("0.16.0".to_string())
+                },
+            ]
+        );
+        let mut inventory = inventory;
+        inventory.record("managed-binary", &daemon, Map::new());
+        assert_eq!(
+            observe_unowned_binaries(
+                Component::Core,
+                root.path(),
+                &inventory,
+                &index_with_core_linux(),
+                AlphaTarget::LinuxX64
+            )
+            .len(),
+            1
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn observation_bounds_an_unowned_binary_that_hangs_on_version() {
+        let root = ScratchDir::new("setup-version-timeout");
+        let binary = root.join("hang");
+        crate::setup::test_exec::write_executable(&binary, b"#!/bin/sh\nexec sleep 60\n");
+        let start = std::time::Instant::now();
+        assert_eq!(observed_binary_version(&binary), None);
+        assert!(start.elapsed() < std::time::Duration::from_secs(10));
     }
 
     #[test]

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.20.105
+
+- Setup reads the installed core version from the managed `ck-subc --version`, also while the daemon runs. The connection file's `daemon_ver` is the daemon library's version, which is numbered separately from the core release, so comparing it with a release or a module's core floor was wrong.
+- Upgrade reads the installed core version the same way. It also proves the running daemon is the new release: a new offline `ck-subc --build-info` prints the placed binary's core version and build identity (commit SHA and lock digest), and upgrade compares that with the running daemon's build identity from `server.describe`. An older daemon still running with the same library version keeps readiness waiting and fails post-verification. A placed binary without a clean build identity is never reported as verified.
+- Refuse setup at plan time when an unowned binary would be replaced, unless its version matches the release and apply can adopt identical bytes. Never downgrade a newer installed daemon, even when already managed. Real runs and dry runs report the same refusal before downloading binary archives or changing configuration or services.
+- Interactive setup shows the dry-run plan and asks `Continue? [y/N]` before changes. Only `y` or `yes` proceeds; `--yes` (`-y`) skips the question. Non-terminal callers continue without prompting.
+
 ## 0.20.104
 
 - New macOS service definitions restart the daemon after a crash, paced by a 10-second throttle, while clean shutdowns stay stopped. New Windows tasks retry failures every minute (up to 255 times), run without a time limit, and keep running on battery power. Existing service definitions are not replaced by upgrade or by setup while the daemon is running; see the recovery-settings instructions in `docs/operating-the-daemon.md` to apply them during a planned interruption. Linux restart behavior is unchanged.

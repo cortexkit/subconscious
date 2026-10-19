@@ -82,7 +82,7 @@ impl fmt::Display for Component {
     }
 }
 
-/// A daemon version used only for module compatibility-floor comparisons.
+/// A numeric release version used for compatibility and downgrade comparisons.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct CoreVersion(u64, u64, u64);
 
@@ -286,17 +286,28 @@ pub enum DetectionOutcome {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UnownedBinary {
+    pub path: std::path::PathBuf,
+    pub version: Option<String>,
+    pub release_version: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SetupObserved {
     pub platform: PlatformObservation,
     pub components: BTreeMap<Component, ComponentState>,
     pub releases: BTreeMap<Component, ReleaseAvailability>,
+    /// Existing destinations that setup did not install. Equal versions still
+    /// require a byte comparison during apply before ownership can be adopted.
+    pub unowned_binaries: BTreeMap<Component, Vec<UnownedBinary>>,
+    pub available_core_version: Option<String>,
     /// True when an app-specific directory or inventory-owned file exceeds
     /// setup's permission ceilings.
     pub permissions_need_tightening: bool,
     /// Module daemon floors copied from the signed release index.
     pub requires_core: BTreeMap<Component, String>,
-    /// The installed daemon version, absent when neither live catalog nor binary
-    /// version evidence could be read.
+    /// The subc-core release reported by the installed ck-subc binary, absent
+    /// when its version cannot be read. The daemon library has a separate version.
     pub installed_core_version: Option<String>,
     /// A daemon binary or live daemon already exists, even if its configuration
     /// needs repair. Setup does not replace existing managed binaries.
@@ -349,6 +360,8 @@ impl SetupObserved {
             platform: PlatformObservation::current(),
             components,
             releases,
+            unowned_binaries: BTreeMap::new(),
+            available_core_version: None,
             permissions_need_tightening: false,
             requires_core: BTreeMap::new(),
             installed_core_version: None,
@@ -385,6 +398,7 @@ pub struct SetupRequest {
     pub uninstall: bool,
     pub dry_run: bool,
     pub verbose: bool,
+    pub yes: bool,
     pub convert: Option<Component>,
     pub conversion_confirmed: bool,
     /// The one key-file answer used for both claustrum bootstrap and daemon env.
@@ -398,6 +412,7 @@ impl SetupRequest {
             uninstall: false,
             dry_run: false,
             verbose: false,
+            yes: false,
             convert: None,
             conversion_confirmed: false,
             claustrum_key_path: None,
@@ -772,7 +787,7 @@ pub struct UpgradeObserved {
     pub requires_core: BTreeMap<Component, String>,
     /// Core version in the signed index, used only when the daemon is upgraded.
     pub available_core_version: Option<String>,
-    /// Daemon version observed from the live catalog before planning.
+    /// Installed ck-subc release, read from the managed binary before planning.
     pub installed_core_version: Option<String>,
     pub supervised_modules: BTreeSet<String>,
     pub daemon_unreachable_reason: Option<String>,

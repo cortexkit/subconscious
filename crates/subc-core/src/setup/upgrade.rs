@@ -31,6 +31,7 @@ use super::{
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DaemonCatalogBuild {
     pub pid: u32,
+    /// Connection metadata reports the daemon library, not the core release.
     pub version: String,
 }
 
@@ -38,10 +39,36 @@ pub struct DaemonCatalogBuild {
 pub struct ManagedUpgradeTarget {
     pub target: UpgradeTarget,
     pub destination: PathBuf,
-    /// Display-only version text from the binary or daemon catalog.
+    /// Binary-reported version; the core release also gates module compatibility.
     pub installed_version: String,
     /// Archive digest recorded at placement. Currency is undecidable without it.
     pub installed_archive_sha256: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct CoreBuildInfo {
+    core_version: String,
+    build_git_sha: Option<String>,
+    build_lock_digest: Option<String>,
+}
+
+impl CoreBuildInfo {
+    fn has_identity(&self) -> bool {
+        [(&self.build_git_sha, 40), (&self.build_lock_digest, 64)]
+            .into_iter()
+            .all(|(value, length)| {
+                value.as_ref().is_some_and(|value| {
+                    value.len() == length && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+            })
+    }
+
+    fn matches_running(&self, running: &Value) -> bool {
+        self.has_identity()
+            && running.get("build_git_sha").and_then(Value::as_str) == self.build_git_sha.as_deref()
+            && running.get("build_lock_digest").and_then(Value::as_str)
+                == self.build_lock_digest.as_deref()
+    }
 }
 
 /// Load the ownership record from the per-user data directory before discovery.
@@ -160,7 +187,7 @@ fn tighten_upgrade_permissions(data_dir: &Path, inventory: &Inventory) -> Result
 pub fn discover_managed_upgrade_targets(
     inventory: &Inventory,
     executable: &Path,
-    daemon_catalog: Option<&DaemonCatalogBuild>,
+    _daemon_catalog: Option<&DaemonCatalogBuild>,
 ) -> Result<Vec<ManagedUpgradeTarget>, String> {
     let owned = super::components::owned_binary_paths(inventory);
     let executable = canonical_or_original(executable);
@@ -186,15 +213,7 @@ pub fn discover_managed_upgrade_targets(
                 destination.display()
             ));
         }
-        let installed_version = if target.is_daemon() {
-            daemon_catalog
-                .ok_or_else(|| {
-                    "refusal: daemon catalog build information is unavailable for inventory-owned ck-subc"
-                        .to_string()
-                })?
-                .version
-                .clone()
-        } else {
+        let installed_version = {
             #[cfg(feature = "test-support")]
             if let Some(version) = test_installed_version(target) {
                 version
@@ -231,7 +250,7 @@ fn test_installed_version(target: UpgradeTarget) -> Option<String> {
     env::var_os(key).map(|version| version.to_string_lossy().into_owned())
 }
 
-/// Combines inventory and running-version evidence with the release check.
+/// Combines inventory and installed binary versions with the release check.
 pub fn observed_upgrade_targets(
     metadata: &UpdateMetadata,
     discovered: &[ManagedUpgradeTarget],
@@ -491,6 +510,14 @@ impl SystemUpgradeBackend {
     }
 
     fn daemon_ready(&self) -> Result<bool, String> {
+        let target = self
+            .targets
+            .values()
+            .find(|item| item.target.is_daemon())
+            .ok_or_else(|| {
+                "no managed daemon target was supplied for service verification".to_string()
+            })?;
+        let disk = self.daemon_build(target.target)?;
         let Some(subc) = &self.subc else {
             return Err(
                 "no daemon connection file was supplied for service verification".to_string(),
@@ -504,17 +531,36 @@ impl SystemUpgradeBackend {
         let Ok(connection) = connection_file::read_for_client(subc) else {
             return Ok(false);
         };
-        let expected = self
-            .targets
-            .values()
-            .find(|item| item.target.is_daemon())
-            .and_then(|item| self.expected_versions.get(item.target.label()))
-            .map(String::as_str)
-            .unwrap_or_default();
-        if connection.pid == 0 || connection.daemon_ver != expected {
+        if connection.pid == 0 {
             return Ok(false);
         }
-        Ok(self.run_ck(&["daemon"]).is_ok())
+        let Ok(response) = self.run_ck(&["--json", "daemon"]) else {
+            return Ok(false);
+        };
+        let Ok(running) = serde_json::from_str::<Value>(&response) else {
+            return Ok(false);
+        };
+        Ok(disk.matches_running(&running))
+    }
+
+    fn daemon_build(&self, target: UpgradeTarget) -> Result<CoreBuildInfo, String> {
+        let destination = &self.target(target)?.destination;
+        let output = super::components::run_probe_tolerating_text_busy(destination, "--build-info")
+            .map_err(|error| format!("could not read managed ck-subc build identity: {error}"))?;
+        if !output.status.success() {
+            return Err("refusal: managed ck-subc does not report offline build identity; cannot verify the running core release".to_string());
+        }
+        let disk: CoreBuildInfo = serde_json::from_slice(&output.stdout)
+            .map_err(|error| format!("invalid managed ck-subc build identity: {error}"))?;
+        if !disk.has_identity() {
+            return Err("refusal: managed ck-subc build identity is unavailable; cannot verify the running core release".to_string());
+        }
+        let version = super::components::observed_binary_version(destination)
+            .ok_or_else(|| "could not read managed ck-subc release version".to_string())?;
+        if disk.core_version != version || version != self.expected_version(target)? {
+            return Err(format!("refusal: managed ck-subc reports core {}, expected {}; cannot verify the running core release", disk.core_version, self.expected_version(target)?));
+        }
+        Ok(disk)
     }
 
     fn module_provenance(&self, target: UpgradeTarget) -> Result<(Option<u32>, bool), String> {
@@ -785,13 +831,26 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
                 binary_version(destination)?,
             )
         } else if target.is_daemon() {
+            let disk = self.daemon_build(target)?;
             let subc = self.subc.as_ref().ok_or_else(|| {
                 "no daemon connection file was supplied for verification".to_string()
             })?;
             let info = connection_file::read_for_client(subc)
                 .map_err(|error| format!("could not read daemon connection: {error}"))?;
-            self.run_ck(&["daemon"])?;
-            (Some(info.pid), true, true, info.daemon_ver)
+            if info.pid == 0 {
+                return Err("daemon connection did not report a live pid".to_string());
+            }
+            let response = self.run_ck(&["--json", "daemon"])?;
+            let running: Value = serde_json::from_str(&response)
+                .map_err(|error| format!("invalid daemon build response: {error}"))?;
+            // A healthy old daemon can have the same library version. Only its
+            // own build identity can tie the running process to the placed core.
+            (
+                Some(info.pid),
+                true,
+                disk.matches_running(&running),
+                disk.core_version,
+            )
         } else if target.is_self_replacing() {
             (Some(process_id()), true, true, binary_version(destination)?)
         } else {
@@ -1147,6 +1206,119 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn daemon_build_backend(root: &Path, disk: Value, running: Value) -> SystemUpgradeBackend {
+        write_executable(&root.join("ck-subc"), format!(
+            "#!/bin/sh\nif [ \"$1\" = --build-info ]; then\n  echo '{disk}'\nelse\n  echo 'ck-subc 0.20.83'\nfi\n"
+        ).as_bytes());
+        write_executable(
+            &root.join("ck"),
+            format!("#!/bin/sh\necho '{running}'\n").as_bytes(),
+        );
+        let target = upgrade_target("ck-subc");
+        let mut backend = isolated_backend(root, target);
+        backend.set_expected_version(target, "0.20.83".to_string());
+        let connection_path = root.join("connection.json");
+        subc_transport::write_atomic(
+            &connection_path,
+            &subc_transport::ConnectionInfo {
+                schema: subc_transport::SCHEMA_VERSION,
+                wire_version: Some(subc_protocol::PROTOCOL_VERSION),
+                endpoints: vec![subc_transport::Endpoint {
+                    host: "127.0.0.1".to_string(),
+                    port: 1,
+                }],
+                key: vec![7; 32],
+                daemon_id: [8; 16],
+                pid: 44,
+                daemon_ver: "0.36.5".to_string(),
+            },
+        )
+        .unwrap();
+        backend.subc = Some(connection_path);
+        backend
+    }
+
+    #[cfg(unix)]
+    fn core_build(sha: Option<&str>, lock: Option<&str>) -> Value {
+        serde_json::json!({"core_version": "0.20.83", "build_git_sha": sha, "build_lock_digest": lock})
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_readiness_accepts_matching_core_build_with_library_0_36_5() {
+        let root = fixture_dir("daemon-ready-core-build");
+        let build = core_build(Some(&"a".repeat(40)), Some(&"1".repeat(64)));
+        let backend = daemon_build_backend(root.path(), build.clone(), build);
+        assert!(backend.daemon_ready().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_readiness_waits_for_old_build_with_same_library_version() {
+        let root = fixture_dir("daemon-ready-old-build");
+        let disk = core_build(Some(&"a".repeat(40)), Some(&"1".repeat(64)));
+        let old = core_build(Some(&"b".repeat(40)), Some(&"1".repeat(64)));
+        let backend = daemon_build_backend(root.path(), disk, old);
+        assert!(!backend.daemon_ready().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_post_verify_accepts_matching_core_build_with_library_0_36_5() {
+        let root = fixture_dir("daemon-post-core-build");
+        let build = core_build(Some(&"a".repeat(40)), Some(&"1".repeat(64)));
+        let mut backend = daemon_build_backend(root.path(), build.clone(), build);
+        let evidence = backend.post_verify(upgrade_target("ck-subc")).unwrap();
+        assert!(evidence.contains("version=0.20.83"), "{evidence}");
+        assert!(evidence.contains("running-image=matched"), "{evidence}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_post_verify_rejects_old_build_with_same_library_version() {
+        let root = fixture_dir("daemon-post-old-build");
+        let disk = core_build(Some(&"a".repeat(40)), Some(&"1".repeat(64)));
+        let old = core_build(Some(&"b".repeat(40)), Some(&"1".repeat(64)));
+        let mut backend = daemon_build_backend(root.path(), disk, old);
+        let error = backend.post_verify(upgrade_target("ck-subc")).unwrap_err();
+        assert!(error.contains("running"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_activation_never_accepts_absent_or_dirty_build_identity() {
+        let root = fixture_dir("daemon-unverifiable-build");
+        let sha = "a".repeat(40);
+        let lock = "1".repeat(64);
+        for disk in [
+            core_build(None, Some(&lock)),
+            core_build(Some("unavailable"), Some(&lock)),
+            core_build(Some(&format!("{sha}-dirty")), Some(&lock)),
+            core_build(Some(&sha), None),
+        ] {
+            let mut backend = daemon_build_backend(root.path(), disk.clone(), disk);
+            assert!(backend
+                .daemon_ready()
+                .unwrap_err()
+                .contains("build identity is unavailable"));
+            assert!(backend
+                .post_verify(upgrade_target("ck-subc"))
+                .unwrap_err()
+                .contains("build identity is unavailable"));
+        }
+        for running in [
+            core_build(None, Some(&lock)),
+            core_build(Some(&sha), None),
+            core_build(Some(&sha), Some(&"2".repeat(64))),
+        ] {
+            let mut backend =
+                daemon_build_backend(root.path(), core_build(Some(&sha), Some(&lock)), running);
+            assert!(!backend.daemon_ready().unwrap());
+            assert!(backend.post_verify(upgrade_target("ck-subc")).is_err());
+        }
+    }
+
+    #[cfg(unix)]
     #[test]
     fn train_version_output_is_discovered_and_post_verified() {
         let root = ScratchDir::new("train-version-output");
@@ -1332,7 +1504,7 @@ mod tests {
         version_binary(&ck, "1.0.0");
         version_binary(&mcp, "1.1.0");
         version_binary(&aft, "1.2.0");
-        version_binary(&daemon, "not-used");
+        version_binary(&daemon, "1.3.0");
         version_binary(&mc, "99.0.0");
         let mut inventory =
             Inventory::load(root.join("installer-manifest.json"), "linux-x64").expect("inventory");
@@ -1346,7 +1518,7 @@ mod tests {
             &ck,
             Some(&DaemonCatalogBuild {
                 pid: 44,
-                version: "1.3.0".to_string(),
+                version: "0.36.5".to_string(),
             }),
         )
         .expect("discover targets");
@@ -1357,12 +1529,35 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["ck-subc", "ck-subc-mcp", "ck-aft", "ck-mc", "ck"]
         );
-        // The daemon's version is the catalog's; siblings and ck report their own.
+        // Every version names its installed binary, not the daemon library.
         assert_eq!(targets[0].installed_version, "1.3.0");
         assert_eq!(targets[1].installed_version, "1.1.0");
         assert_eq!(targets[2].installed_version, "1.2.0");
         assert_eq!(targets[3].installed_version, "99.0.0");
         assert_eq!(targets[4].installed_version, "1.0.0");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovery_uses_binary_core_release_instead_of_library_version() {
+        let root = fixture_dir("discovery-core-release");
+        let daemon = root.join("ck-subc");
+        let mcp = root.join("ck-subc-mcp");
+        version_binary(&daemon, "0.20.83");
+        version_binary(&mcp, "0.1.38");
+        let mut inventory = Inventory::load(root.join("inventory.json"), "linux-x64").unwrap();
+        for path in [&daemon, &mcp] {
+            inventory.record("managed-binary", path, Map::new());
+        }
+        let catalog = DaemonCatalogBuild {
+            pid: 44,
+            version: "0.36.5".to_string(),
+        };
+        for catalog in [Some(&catalog), None] {
+            let targets =
+                discover_managed_upgrade_targets(&inventory, &root.join("ck"), catalog).unwrap();
+            assert_eq!(targets[0].installed_version, "0.20.83");
+        }
     }
 
     #[cfg(unix)]

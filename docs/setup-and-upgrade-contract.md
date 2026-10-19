@@ -250,16 +250,54 @@ The command surface is:
 
 - `ck setup` installs and wires core, then offers eligible optional components.
 - `ck setup aft` and `ck setup mc` explicitly add a component.
-- `ck setup --with aft,mc` selects optional components non-interactively.
+- `ck setup --with aft,mc` selects optional components explicitly.
 - `ck setup --dry-run` is strictly read-only: it prints the full setup plan,
   including observations, proposed mutations, and refusals, without creating,
   replacing, registering, starting, or changing anything. Its plan must be
   equivalent to the plan used by the corresponding non-dry-run invocation.
+- When stdin and stdout are both terminals, a mutating setup (including
+  uninstall) prints the same plan and proposed diffs as `--dry-run`, then asks
+  `Continue? [y/N]`. Only `y` or `yes` proceeds. Any other answer, including
+  end-of-input, exits successfully with `Nothing was changed.` No-op plans and
+  refusals do not ask. `--yes` (`-y`) skips this question, not safety checks or
+  the separate `--confirm` required for conversion. If either stream is not a
+  terminal, setup proceeds without a question for scripted callers. The shell
+  and PowerShell bootstrap installers only print `Next: ck setup`; they do not
+  invoke it.
 - `ck setup aft --convert` and `ck setup mc --convert` are explicit conversion
   paths and require confirmation before any mutation.
 - `ck setup --uninstall` prints a removal plan, deregisters only manifest-owned
   runtime registrations, removes manifest-owned links and binaries, and leaves
   user configuration and stores on disk with a retention note.
+
+Before planning installation, setup inspects existing unowned binary
+destinations and reads `--version` with a two-second deadline. A newer binary,
+or a newer installed daemon even when inventory-owned and otherwise correct,
+refuses the entire plan: `ck setup will not downgrade it. Nothing was changed.`
+The refusal names the observed version (including a reported build suffix) and
+the latest release version. An older or unreadable unowned binary refuses with
+its path, explains that setup did not install it, and asks the operator to move
+it aside and run `ck setup` again. Neither refusal downloads binary archives,
+writes configuration, nor registers services, in a real run or a dry run.
+An unowned binary reporting the same version remains eligible for adoption:
+apply downloads the release and adopts only byte-identical files; a version
+match alone does not establish ownership.
+
+The installed core release comes from the managed `ck-subc --version`, whether
+the daemon is running or stopped. The connection file's `daemon_ver` identifies
+the separately versioned `subc-daemon` library and must not be compared with a
+core release or a module's `requires_core` floor.
+
+Upgrade discovery uses the managed binary's core release as well. After
+activation, reading the disk version alone is not evidence about the running
+daemon. `ck-subc --build-info` is an offline JSON probe (core version, build SHA,
+lock digest), evaluated before runtime/configuration or daemon startup. Upgrade
+requires its core version and `--version` to equal the expected release, then
+compares its build SHA and lock digest with the authenticated running daemon's
+`server.describe` response (`ck --json daemon`). A healthy old daemon with a
+different build does not satisfy readiness or verification. Missing, malformed,
+or dirty offline build identity refuses verification; absent or mismatching
+running identity never satisfies readiness. No new wire field is required.
 
 Configuration writes are additive. Setup prints the proposed diff before a
 write and refuses a conflicting user-owned value by naming the key and leaving

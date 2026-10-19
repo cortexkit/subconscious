@@ -76,6 +76,52 @@ pub fn plan_setup(observed: &SetupObserved, request: &SetupRequest) -> SetupPlan
         return plan_uninstall(observed, plan);
     }
 
+    if let (Some(installed), Some(release)) = (
+        &observed.installed_core_version,
+        &observed.available_core_version,
+    ) {
+        if version_is_newer(installed, release) {
+            plan.outcomes.push(PlanOutcome::Refusal {
+                reason: downgrade_refusal("CortexKit daemon", installed, release),
+            });
+            return plan;
+        }
+    }
+
+    for component in selected_components(request) {
+        if observed.component_state(component) != ComponentState::Missing {
+            continue;
+        }
+        for binary in observed
+            .unowned_binaries
+            .get(&component)
+            .into_iter()
+            .flatten()
+        {
+            let reason = match (&binary.version, &binary.release_version) {
+                (Some(installed), Some(release)) if version_is_newer(installed, release) => {
+                    Some(downgrade_refusal(
+                        &super::components::display_home_path(&binary.path),
+                        installed,
+                        release,
+                    ))
+                }
+                (Some(installed), Some(release)) if installed == release => None,
+                _ => Some(format!(
+                    "{} exists without inventory ownership; ck setup did not install it. \
+                     Move it aside and run ck setup again. Nothing was changed.",
+                    super::components::display_home_path(&binary.path)
+                )),
+            };
+            if let Some(reason) = reason {
+                plan.outcomes.push(PlanOutcome::Refusal { reason });
+            }
+        }
+    }
+    if !plan.is_authorized() {
+        return plan;
+    }
+
     if let Some(path) = &observed.running_ck_adoption {
         plan.operations
             .push(SetupOperation::AdoptRunningCk { path: path.clone() });
@@ -246,6 +292,23 @@ pub fn plan_setup(observed: &SetupObserved, request: &SetupRequest) -> SetupPlan
         },
     ]);
     plan
+}
+
+fn version_is_newer(installed: &str, release: &str) -> bool {
+    match (
+        CoreVersion::from_release(installed),
+        CoreVersion::from_release(release),
+    ) {
+        (Ok(installed), Ok(release)) => installed > release,
+        _ => false,
+    }
+}
+
+fn downgrade_refusal(name: &str, installed: &str, release: &str) -> String {
+    format!(
+        "This computer runs {name} {installed}, newer than the latest release ({release}). \
+         ck setup will not downgrade it. Nothing was changed."
+    )
 }
 
 fn setup_core_floor_refusal(
@@ -660,7 +723,7 @@ mod tests {
 
     use super::super::{
         components::upgrade_roster,
-        model::{AlphaTarget, HostTarget, PlatformObservation},
+        model::{AlphaTarget, HostTarget, PlatformObservation, UnownedBinary},
     };
     use super::*;
 
@@ -698,6 +761,8 @@ mod tests {
             platform: PlatformObservation::Supported(AlphaTarget::LinuxX64),
             components,
             releases,
+            unowned_binaries: BTreeMap::new(),
+            available_core_version: None,
             permissions_need_tightening: false,
             requires_core: BTreeMap::new(),
             installed_core_version: None,
@@ -728,6 +793,91 @@ mod tests {
         observed.core_binary_present = true;
         observed.runtime = RuntimeState::Correct;
         observed
+    }
+
+    fn setup_with_unowned_binary(version: Option<&str>) -> SetupObserved {
+        let mut observed = observed_setup();
+        observed.available_core_version = Some("0.20.83".to_string());
+        observed.unowned_binaries.insert(
+            Component::Core,
+            vec![UnownedBinary {
+                path: "/managed/bin/ck-subc-mcp".into(),
+                version: version.map(ToOwned::to_owned),
+                release_version: Some("0.20.83".to_string()),
+            }],
+        );
+        observed
+    }
+
+    #[test]
+    fn setup_refuses_unowned_newer_binary_before_any_mutation() {
+        let observed = setup_with_unowned_binary(Some("0.20.98"));
+        let plan = plan_setup(&observed, &SetupRequest::install(vec![]));
+        assert!(!plan.is_authorized());
+        assert_eq!(plan.mutation_count(), 0);
+        assert_eq!(plan.blocking_outcome(), Some(&PlanOutcome::Refusal {
+            reason: "This computer runs /managed/bin/ck-subc-mcp 0.20.98, newer than the latest release (0.20.83). ck setup will not downgrade it. Nothing was changed.".to_string(),
+        }));
+        let mut executor = RecordingExecutor::default();
+        execute_setup(&plan, ExecutionMode::Apply, &mut executor).unwrap();
+        assert!(executor.applied.is_empty());
+    }
+
+    #[test]
+    fn setup_keeps_byte_verified_adoption_for_unowned_same_version() {
+        let observed = setup_with_unowned_binary(Some("0.20.83"));
+        let plan = plan_setup(&observed, &SetupRequest::install(vec![]));
+        assert!(plan.is_authorized());
+        assert!(plan.operations.contains(&SetupOperation::InstallComponent {
+            component: Component::Core
+        }));
+    }
+
+    #[test]
+    fn setup_refuses_unowned_older_binary_before_any_mutation() {
+        let observed = setup_with_unowned_binary(Some("0.20.82"));
+        let plan = plan_setup(&observed, &SetupRequest::install(vec![]));
+        assert!(!plan.is_authorized());
+        assert_eq!(plan.mutation_count(), 0);
+        assert!(plan.blocking_outcome().unwrap().to_string().contains(
+            "/managed/bin/ck-subc-mcp exists without inventory ownership; ck setup did not install it. Move it aside and run ck setup again. Nothing was changed."
+        ));
+    }
+
+    #[test]
+    fn setup_refuses_unowned_unknown_binary_before_any_mutation() {
+        let observed = setup_with_unowned_binary(None);
+        let plan = plan_setup(&observed, &SetupRequest::install(vec![]));
+        assert!(!plan.is_authorized());
+        assert_eq!(plan.mutation_count(), 0);
+        assert!(plan
+            .blocking_outcome()
+            .unwrap()
+            .to_string()
+            .contains("ck setup did not install it"));
+    }
+
+    #[test]
+    fn setup_refuses_owned_newer_core_even_when_correct() {
+        let mut observed = installed_core_setup(Some("0.20.98+local.build"));
+        observed.available_core_version = Some("0.20.83".to_string());
+        let plan = plan_setup(&observed, &SetupRequest::install(vec![]));
+        assert!(!plan.is_authorized());
+        assert_eq!(plan.mutation_count(), 0);
+        assert!(plan.blocking_outcome().unwrap().to_string().contains(
+            "CortexKit daemon 0.20.98+local.build, newer than the latest release (0.20.83)"
+        ));
+    }
+
+    #[test]
+    fn setup_unowned_binary_dry_run_and_real_run_plans_agree() {
+        for version in [Some("0.20.98"), Some("0.20.83"), Some("0.20.82"), None] {
+            let observed = setup_with_unowned_binary(version);
+            let mut request = SetupRequest::install(vec![]);
+            let real = plan_setup(&observed, &request);
+            request.dry_run = true;
+            assert_eq!(real, plan_setup(&observed, &request));
+        }
     }
 
     fn updates_target(plan: &UpgradePlan, target: UpgradeTarget) -> bool {

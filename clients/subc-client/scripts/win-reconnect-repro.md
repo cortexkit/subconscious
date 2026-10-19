@@ -183,3 +183,109 @@ the fewest tests that crashed in at least one of its five runs is the smallest
 set found that still makes Bun 1.4.3 exit abnormally. If only L0 crashes, the
 failure needs more of the file than any subset here; if no row crashes, the
 job did not reproduce it.
+
+## Daemon-restart rows (`restart-split`, Bun 1.4.3 and 1.3.14)
+
+`win-bun-subsets.ps1 -Set restart` runs six rows, five fresh runs each:
+
+| Row | What it shows |
+| --- | --- |
+| `real-key-rotation-alone` | The real "recovers across a daemon restart that rotates the key" test alone in its file: the same-job baseline for the split rows (it exited abnormally in 4 of 5 runs on 1.4.3 before) and, on 1.3.14, whether the older runtime does the same |
+| `real-consumer-identity-alone` | The same for "re-attaches the same consumer_identity when a later call opens after reconnect" |
+| `split-key-rotation-run` | The key-rotation sequence with the fake daemon in one Bun process and the managed client in another, the client a plain `bun` script. A client crash here is the closest these experiments get to a plugin whose daemon restarts |
+| `split-key-rotation-test` | The same, with the client process running the sequence as a single `bun test` test (the fake daemon stays a plain script) |
+| `split-consumer-identity-run` / `-test` | The same two layouts for the consumer_identity sequence |
+
+`win-restart-split.ts` (observer) starts the fake daemon (`--role server`) and
+the client, either `--role client` (plain) or `bun test
+scripts/win-restart-split-client.test.ts` (with `WIN_BUN_REPRO=1` and the
+scenario and connection file in its environment). It relays the restart over
+Bun IPC and writes one JSON result per run: `status` (pass, crash, failure,
+timeout), `crashed` (the roles that exited abnormally), and for each process the
+exit code, signal, whether its output contained Bun crash text, whether the
+observer killed it (`forced`), a JS failure it reported, and whether the client
+finished the sequence. Children's output is prefixed `[server]` or `[client]`
+in the run log, and each step is a `RESTARTDIAG` line.
+
+What is copied exactly from the tests: the fake daemon's handshake (with the
+rotated key for key-rotation), its Ping/catalog.list/route.open/echo arms and
+`closeAfterDataResponses: 1` on daemon 1 only; `reconnectBackoff` 5/10/4 and the
+instant `sleep` hook; the `waitFor` poll for the client's `closedErr` before the
+restart; daemon 1 stopped (sockets destroyed, listener closed) before daemon 2
+listens on a new port (`listen(0)`, as in the tests); the connection file
+rewritten with the new port and the original key; for key-rotation, the
+two-sleep stale window whose last sleep writes the rotated key (the client
+process writes it, as the test process does); and the checks: both calls
+answered, the stale window consumed, daemon 2 served one data request, and both
+daemons saw the same consumer_identity. The bun:test client asserts each call
+with `await expect(call).resolves.toEqual(...)` and the default 5 s timeout,
+as the tests do; the plain client uses node:assert.
+
+What differs from the tests besides the process split: the daemon process
+writes the connection file (the test process does in the tests), the client
+learns of the restart over IPC, and stopping daemon 2 happens after the client
+process exits (the tests stop it in afterEach after `client.close()`, so the
+order is the same). Each run makes the sequence once, like one test.
+
+Reading the rows: a `client` crash in `split-*-run` means a Bun process running
+only the managed client crashed while its separate fake daemon restarted. A
+`client` crash only in `split-*-test` points at the client running under
+bun:test. A `server` crash concerns the fake daemon's process, which real users
+replace with the Rust daemon. No crash in any split row while the real rows
+still crash in the same job means these sequences crashed only with the fake
+daemon and client in one process. Five passes are a non-reproduction, not
+evidence of safety; the real daemon and real backoff timings are not part of
+any row.
+
+## Control-push ladder (`push-ladder`, Bun 1.3.14 and 1.4.3)
+
+`win-push-ladder.test.ts` rebuilds the failing test (managed-client.test.ts:142-172)
+with a copy of its fixture: `startFakeDaemon` registering the daemon for
+afterEach, `handleFakeConnection`'s Ping and catalog.list arms with the two
+pushes and the response written as three separate callback writes, the bun:test `expect`
+handshake checks, and the afterEach that stops the daemon and removes the temp
+directory. Each difference between that test and the logged copy
+(`win-push-timeout.test.ts` variant=exact, which passed 5/5 on 1.3.14) is a
+switch:
+
+| Switch | Real test | Logged copy |
+| --- | --- | --- |
+| `plain-await` | call 2 is `await expect(client.catalogList()).resolves.toEqual([])` | call 2 is awaited, then `expect(modules).toEqual([])` |
+| `race-watchdog` | calls awaited directly | each call raced with a promise a 15 s timer rejects |
+| `snapshot-timer` | no timer | a 4.5 s timer logs the client state (the copy arms it before connecting; the ladder arms it after) |
+| `timeout-20s` | bun:test default 5 s | 20 s |
+| `client-tap` | none | a second `data` listener and end/close/error listeners on the client's node:net socket |
+| `server-listeners` | only the fixture's `once("close")` | end/close/error listeners and an accept log on each fake socket |
+| `server-logs` | `writeFrame`, no logs | logs the handshake, each frame read, and each write's queue/return/callback, reading `writableLength` |
+| `observer-log` | `(push) => seen.push(push)` | logs, then records |
+| `node-assert` | handshake checks with `expect` | with node:assert |
+| `in-test-cleanup` | afterEach stops the daemon and removes the directory | the test's finally does, right after `client.close()` |
+| `call-logs` | no logs after calls; observer checked after call 1 only | state logged after each call; the observer checked again after call 2 |
+
+Not switched, because they cannot be removed or carry no I/O: the copy's
+describe/test names and `describe.skipIf` opt-in (the ladder has its own), the
+temp-directory prefix (the ladder uses the real one), and the copy's
+`let client`/`client?.close()` form. Present in every ladder row but not in the
+real test: a side handler on each catalog.list promise that logs how it settles,
+the RESULT line, and the timing logs in afterEach and the fake's stop. Neither
+changes what the test awaits.
+
+Rows, five fresh runs each, on both versions:
+
+| Row | What it shows |
+| --- | --- |
+| `control-real-test-alone` | The real test in this job (failed 5/5 on 1.3.14 before) |
+| `control-logged-exact` | The old logged copy in this job (passed 5/5 on 1.3.14 before) |
+| `ladder-real-silent` | Whether the rebuilt test fails like the real one. Its `PUSHLADDER REJECTION` line gives the rejected call's error class, name, code, kind, message and cause chain, and the time since the call was issued; the next lines give the client state at that moment (bytes buffered and awaited by the reader, pending requests, the client's and socket's closedErr, whether the node:net socket is destroyed, observer calls, and the fake's connection and request counts) and the stack |
+| `ladder-real` | The same with the client state also logged before each call |
+| `ladder-only-<switch>` | The real test with one difference from the copy: a switch whose row passes is enough on its own to stop the failure |
+| `ladder-cum-NN-<switch>` | The real test with switches 1..NN on; the first row that passes is where the cumulative removal stops the failure, and `cum-11` has every switch, i.e. the copy |
+
+The summary's Detail column shows, per run, the outcome and the first rejected
+call as `callN:<class>/code=<code>/kind=<kind>@<ms>`. The afterEach lines
+(`afterEach-start`, `stop destroying sockets`, `stop server.close callback`,
+`afterEach-done`) show whether a 5 s bun:test timeout was spent in the test body
+or in the cleanup. If `ladder-real-silent` passes while `control-real-test-alone`
+fails in the same job, the rebuild does not capture what makes the real test
+fail, and the remaining difference is the real test file itself (its other
+tests' registration and imports).

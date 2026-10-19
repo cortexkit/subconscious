@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.22.4
+
+- A read with an absolute deadline now fails at that deadline even while the peer keeps sending bytes. Previously a byte arriving just after the deadline timer fired cancelled the pending timeout check, so a slowly dripping peer could hold the read open long past its deadline (seen on Windows: 616 ms against a 60 ms deadline). Reads with an idle budget still extend on progress.
+
 ## 0.22.3
 
 - Export `DaemonUnavailableError`, a `SubcCallError` with `kind: "not_sent"` and `recovery: "user_action_required"`, for initial missing-file/refused-port failures and exhausted transient transport reconnects. It explains that the daemon is not running or unreachable and asks hosts to stop CortexKit tool calls until the user runs `ck setup` or restarts the service and confirms recovery. The original `cause` and its `code` are retained. Reconnect budgets, authentication/validation errors and already-sent unknown-outcome failures are unchanged.

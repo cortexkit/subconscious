@@ -4,6 +4,8 @@
 // copying avoids registering bun:test suites or rewriting the test at load time.
 // In particular, preserve await writeFrame(...) followed immediately by
 // socket.destroy(): changing that timing would change the crash experiment.
+// The constants and handshake/frame helpers are exported for reuse by
+// win-push-timeout.test.ts, which needs the same fake-daemon handshake.
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, writeFileSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -16,10 +18,10 @@ import {
 } from "../src/index.js";
 import { SocketReader, startServer, writeAll, type ReproServer, type Stats } from "./win-reconnect-transport.js";
 
-const KEY = Uint8Array.from(Array(32).fill(0x4c));
-const DAEMON_ID = Uint8Array.from(Array(16).fill(0x7d));
+export const KEY = Uint8Array.from(Array(32).fill(0x4c));
+export const DAEMON_ID = Uint8Array.from(Array(16).fill(0x7d));
 const SERVER_NONCE = Uint8Array.from(Array.from({ length: 32 }, (_, i) => 0xa0 + i));
-const IDENTITY = { project_root: "/tmp/subc-client-test", harness: "bun", session: "managed" };
+export const IDENTITY = { project_root: "/tmp/subc-client-test", harness: "bun", session: "managed" };
 const BACKOFF = { baseMs: 5, capMs: 10, maxAttempts: 4 };
 
 export function startManagedServer(): Promise<ReproServer> {
@@ -60,11 +62,11 @@ async function handleFakeConnection(socket: Socket, stats: Stats): Promise<void>
   }
 }
 
-function responseFrame(request: Frame, body: unknown): Frame {
+export function responseFrame(request: Frame, body: unknown): Frame {
   return buildFrame(FrameType.Response, buildFlags(false, Priority.Interactive, false), request.header.channel, request.header.epoch, request.header.corr, encodeJson(body));
 }
 
-async function authenticateFakeServer(reader: SocketReader, socket: Socket, deadline: number): Promise<void> {
+export async function authenticateFakeServer(reader: SocketReader, socket: Socket, deadline: number): Promise<void> {
   const hello = await readAuthMessage<{ client_nonce: number[]; role: string }>(reader, deadline);
   assert.equal(hello.role, "client");
   const clientNonce = Uint8Array.from(hello.client_nonce);
@@ -95,7 +97,7 @@ async function writeAuthMessage(socket: Socket, value: unknown, deadline: number
   await writeAll(socket, body, deadline);
 }
 
-async function readFrame(reader: SocketReader, deadline: number): Promise<Frame> {
+export async function readFrame(reader: SocketReader, deadline: number): Promise<Frame> {
   const header = decodeHeader(await reader.readExact(HEADER_LEN, deadline));
   const body = header.len === 0 ? new Uint8Array(0) : await reader.readExact(header.len, deadline);
   return { header, body };
@@ -105,11 +107,11 @@ async function writeFrame(socket: Socket, frame: Frame, deadline: number): Promi
   await writeAll(socket, encodeFrame(frame), deadline);
 }
 
-function encodeJson(value: unknown): Uint8Array {
+export function encodeJson(value: unknown): Uint8Array {
   return new Uint8Array(Buffer.from(JSON.stringify(value), "utf8"));
 }
 
-function parseJson(body: Uint8Array): unknown {
+export function parseJson(body: Uint8Array): unknown {
   return JSON.parse(Buffer.from(body).toString("utf8"));
 }
 

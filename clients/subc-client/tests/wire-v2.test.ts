@@ -17,6 +17,7 @@ import {
   type Frame,
 } from "../src/index.js";
 import { createRouteHandle, newConnectionToken, type RouteHandle } from "../src/route-handle.js";
+import { rejectionOf, throwerOf } from "./settle.js";
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -158,12 +159,12 @@ describe("RouteHandle fencing and endpoint validation", () => {
     internals.connectionToken = token;
     internals.liveRoutes = new Map([[9, current]]);
 
-    await expect(client.request(stale, {})).rejects.toBeInstanceOf(StaleRouteHandleError);
-    await expect(client.routePoll(stale, "status")).rejects.toBeInstanceOf(StaleRouteHandleError);
+    expect(await rejectionOf(client.request(stale, {}))).toBeInstanceOf(StaleRouteHandleError);
+    expect(await rejectionOf(client.routePoll(stale, "status"))).toBeInstanceOf(StaleRouteHandleError);
     expect(() => client.cancel(stale, 8n)).toThrow(StaleRouteHandleError);
     expect(() => client.subscribe(stale, {}, () => undefined)).toThrow(StaleRouteHandleError);
-    await expect(client.closeRoute(stale)).rejects.toBeInstanceOf(StaleRouteHandleError);
-    await expect(client.closeRouteChannel(stale)).rejects.toBeInstanceOf(StaleRouteHandleError);
+    expect(await rejectionOf(client.closeRoute(stale))).toBeInstanceOf(StaleRouteHandleError);
+    expect(await rejectionOf(client.closeRouteChannel(stale))).toBeInstanceOf(StaleRouteHandleError);
     expect(socket.writes).toEqual([]);
   });
 
@@ -212,7 +213,7 @@ describe("RouteHandle fencing and endpoint validation", () => {
     internals.liveRoutes = new Map([[replacement.channel, replacement]]);
 
     expect(() => subscription.unsubscribe()).not.toThrow();
-    await expect(subscription.closed).resolves.toBeUndefined();
+    expect(await subscription.closed).toBeUndefined();
     expect(internals.pending.size).toBe(0);
     expect(socket.writes).toHaveLength(1);
     expect(socket.writes[0]!.header.ty).toBe(FrameType.Request);
@@ -238,7 +239,7 @@ describe("RouteHandle fencing and endpoint validation", () => {
     expect(settled).toBe(false);
     expect(client.droppedIngressFrames).toBe(1);
     internals.dispatch(response(outbound, { current: true }));
-    await expect(pending).resolves.toEqual({ current: true });
+    expect(await pending).toEqual({ current: true });
   });
 
   test("RoutePoll sends epoch and ignores a response echo for another generation", async () => {
@@ -262,7 +263,7 @@ describe("RouteHandle fencing and endpoint validation", () => {
     expect(settled).toBe(false);
     const expected = { op: "route.poll", route_channel: 11, route_epoch: 4, status: null, live: true };
     internals.dispatch(response(outbound, expected));
-    await expect(poll).resolves.toEqual(expected);
+    expect(await poll).toEqual(expected);
   });
 
   test("EXPEDITE stamps egress and channel-0 corr emits u64::MAX once without wrap", async () => {
@@ -281,7 +282,7 @@ describe("RouteHandle fencing and endpoint validation", () => {
     }));
     await poll;
     internals.closeStarted = true;
-    await expect(client.catalogList()).rejects.toMatchObject({ code: "corr_exhausted" });
+    expect(await rejectionOf(client.catalogList())).toMatchObject({ code: "corr_exhausted" });
     expect(socket.writes.filter((frame) => frame.header.ty === FrameType.Request && frame.header.corr === 0n)).toEqual([]);
     expect(socket.closeCount).toBe(1);
   });
@@ -296,10 +297,10 @@ describe("RouteHandle fencing and endpoint validation", () => {
         late = onLate;
         throw new SubcError("local timeout", "request_deadline");
       };
-      await expect(client.routeOpen(
+      expect(await rejectionOf(client.routeOpen(
         { kind: "management_surface", module_id: "provider" },
         { project_root: "/tmp", harness: "test", session: "late" },
-      )).rejects.toMatchObject({ code: "request_deadline" });
+      ))).toMatchObject({ code: "request_deadline" });
       if (!queueWrites) internals.closeStarted = true;
       late(buildFrame(FrameType.Response, 0, 0, 0, 1n, json({
         op: "route.open", route_channel: 23, route_epoch: 9,
@@ -325,14 +326,14 @@ describe("binary request and reply bodies", () => {
     expect(outbound.body).toEqual(body);
 
     internals.dispatch(response(outbound, { accepted: true }));
-    await expect(pending).resolves.toEqual({ accepted: true });
+    expect(await pending).toEqual({ accepted: true });
   });
 
   test("rejects a non-byte binary request before writing a frame and names its type", async () => {
     const { client, socket, handle } = clientHarness();
 
-    await expect(client.request(handle, { dishonest: true }, { binary: true }))
-      .rejects.toMatchObject({ code: "binary_body_required", message: expect.stringContaining("got object") });
+    expect(await rejectionOf(client.request(handle, { dishonest: true }, { binary: true })))
+      .toMatchObject({ code: "binary_body_required", message: expect.stringContaining("got object") });
     expect(socket.writes).toEqual([]);
   });
 
@@ -350,7 +351,7 @@ describe("binary request and reply bodies", () => {
       outbound.header.corr,
       reply,
     ));
-    await expect(pending).resolves.toEqual(reply);
+    expect(await pending).toEqual(reply);
   });
 
   test("keeps call() JSON-only and rejects binary before route.open", async () => {
@@ -361,8 +362,8 @@ describe("binary request and reply bodies", () => {
       return handle;
     };
 
-    await expect(client.call("provider", "download", { offset: 0 }, { binary: true }))
-      .rejects.toMatchObject({
+    expect(await rejectionOf(client.call("provider", "download", { offset: 0 }, { binary: true })))
+      .toMatchObject({
         code: "binary_call_requires_call_binary",
         message: expect.stringContaining("callBinary"),
       });
@@ -391,7 +392,7 @@ describe("binary request and reply bodies", () => {
       outbound.header.corr,
       reply,
     ));
-    await expect(pending).resolves.toEqual(reply);
+    expect(await pending).toEqual(reply);
   });
 
   test("keeps Error frames on the JSON error path and surfaces SubcCallError", async () => {
@@ -411,7 +412,7 @@ describe("binary request and reply bodies", () => {
     );
     expect(hasBinary(error.header.flags)).toBe(false);
     internals.dispatch(error);
-    await expect(pending).rejects.toBeInstanceOf(SubcCallError);
+    expect(await rejectionOf(pending)).toBeInstanceOf(SubcCallError);
   });
 });
 
@@ -421,7 +422,7 @@ describe("provider bind publication and unknown-slot precedence", () => {
     const events: string[] = [];
     internals.opts.onBind = async (request: { handle: RouteHandle }) => {
       events.push("bind");
-      await expect(provider.push(request.handle, json({ illegal: true }))).rejects.toBeInstanceOf(StaleRouteHandleError);
+      expect(await rejectionOf(provider.push(request.handle, json({ illegal: true })))).toBeInstanceOf(StaleRouteHandleError);
       expect(socket.writes).toEqual([]);
       return true;
     };
@@ -454,7 +455,7 @@ describe("provider bind publication and unknown-slot precedence", () => {
       warnings.push(args);
     };
     try {
-      await expect(internals.handleControlRequest(bindFrame(20, 9), socket, 1)).resolves.toBeUndefined();
+      expect(await internals.handleControlRequest(bindFrame(20, 9), socket, 1)).toBeUndefined();
       expect(internals.liveRoutes.get(20)).toMatchObject({ channel: 20, epoch: 9 });
       expect(socket.writes[0]!.header.ty).toBe(FrameType.Response);
       expect(warnings).toHaveLength(1);
@@ -492,7 +493,7 @@ describe("provider bind publication and unknown-slot precedence", () => {
     };
     internals.opts.onRouteGone = (handle: RouteHandle) => cleaned.push(handle);
 
-    await expect(internals.handleControlRequest(bindFrame(19, 8), socket, 1)).rejects.toThrow("write failed");
+    expect(await throwerOf(internals.handleControlRequest(bindFrame(19, 8), socket, 1))).toThrow("write failed");
     expect(bound).toBe(false);
     expect(internals.liveRoutes.size).toBe(0);
     expect(cleaned).toHaveLength(1);
@@ -539,8 +540,8 @@ describe("provider bind publication and unknown-slot precedence", () => {
     const current = createRouteHandle(20, 1, token);
     internals.connectionToken = token;
     internals.liveRoutes = new Map([[20, current]]);
-    await expect(provider.push(stale, json({ delayed: true }))).rejects.toBeInstanceOf(StaleRouteHandleError);
-    await expect(provider.request(stale, json({ delayed: true }))).rejects.toBeInstanceOf(StaleRouteHandleError);
+    expect(await rejectionOf(provider.push(stale, json({ delayed: true })))).toBeInstanceOf(StaleRouteHandleError);
+    expect(await rejectionOf(provider.request(stale, json({ delayed: true })))).toBeInstanceOf(StaleRouteHandleError);
     expect(() => provider.cancel(stale, 5n)).toThrow(StaleRouteHandleError);
     expect(() => provider.closeRoute(stale)).toThrow(StaleRouteHandleError);
     expect(socket.writes).toHaveLength(writesBeforeReconnect);

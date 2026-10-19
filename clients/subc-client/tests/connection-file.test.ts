@@ -5,6 +5,7 @@ import { join } from "node:path";
 
 import { ConnectionFileError, readConnectionFile, readConnectionFileForUid } from "../src/connection-file.js";
 import { PROTOCOL_VERSION } from "../src/envelope.js";
+import { rejectionOf, throwerOf } from "./settle.js";
 
 const dirs: string[] = [];
 
@@ -44,14 +45,14 @@ describe("connection file reader", () => {
   });
 
   test("accepts a matching wire_version", async () => {
-    await expect(readConnectionFile(tempFile(validInfo({ wire_version: PROTOCOL_VERSION })))).resolves.toMatchObject({
+    expect(await readConnectionFile(tempFile(validInfo({ wire_version: PROTOCOL_VERSION })))).toMatchObject({
       schema: 1,
     });
   });
 
   test("rejects a mismatched wire_version with upgrade guidance", async () => {
     const wireVersion = PROTOCOL_VERSION + 1;
-    await expect(readConnectionFile(tempFile(validInfo({ wire_version: wireVersion })))).rejects.toThrow(
+    expect(await throwerOf(readConnectionFile(tempFile(validInfo({ wire_version: wireVersion }))))).toThrow(
       new RegExp(
         `connection file wire_version ${wireVersion} but this client speaks ${PROTOCOL_VERSION}; the client library must be upgraded`,
       ),
@@ -60,7 +61,7 @@ describe("connection file reader", () => {
 
   test.if(process.platform !== "win32")("rejects a group/world-readable file", async () => {
     const path = tempFile(validInfo(), 0o644);
-    await expect(readConnectionFile(path)).rejects.toThrow(/insecure permissions/);
+    expect(await throwerOf(readConnectionFile(path))).toThrow(/insecure permissions/);
   });
 
   // The arms share one 0600 file and differ only in the uid the reader expects,
@@ -68,35 +69,35 @@ describe("connection file reader", () => {
   test.if(process.platform !== "win32")("rejects an owner-only file owned by another uid", async () => {
     const path = tempFile(validInfo(), 0o600);
     const owner = statSync(path).uid;
-    await expect(readConnectionFileForUid(path, owner)).resolves.toMatchObject({ schema: 1 });
+    expect(await readConnectionFileForUid(path, owner)).toMatchObject({ schema: 1 });
     const foreign = owner === 0 ? 1 : 0;
     const refusal = readConnectionFileForUid(path, foreign);
-    await expect(refusal).rejects.toBeInstanceOf(ConnectionFileError);
-    await expect(refusal).rejects.toThrow(`is owned by uid ${owner}, expected effective uid ${foreign}`);
+    expect(await rejectionOf(refusal)).toBeInstanceOf(ConnectionFileError);
+    expect(await throwerOf(refusal)).toThrow(`is owned by uid ${owner}, expected effective uid ${foreign}`);
   });
 
   test("rejects an unsupported schema", async () => {
-    await expect(readConnectionFile(tempFile(validInfo({ schema: 2 })))).rejects.toThrow(
+    expect(await throwerOf(readConnectionFile(tempFile(validInfo({ schema: 2 }))))).toThrow(
       /unsupported connection file schema 2/,
     );
   });
 
   test("rejects an empty endpoint list", async () => {
-    await expect(readConnectionFile(tempFile(validInfo({ endpoints: [] })))).rejects.toThrow(
+    expect(await throwerOf(readConnectionFile(tempFile(validInfo({ endpoints: [] }))))).toThrow(
       /at least one endpoint/,
     );
   });
 
   test("rejects a short key", async () => {
-    await expect(
-      readConnectionFile(tempFile(validInfo({ key: Array(16).fill(1) }))),
-    ).rejects.toThrow(/key is too short/);
+    expect(
+      await throwerOf(readConnectionFile(tempFile(validInfo({ key: Array(16).fill(1) })))),
+    ).toThrow(/key is too short/);
   });
 
   test("rejects an out-of-range key byte", async () => {
     const key = Array(32).fill(1);
     key[0] = 427;
-    await expect(readConnectionFile(tempFile(validInfo({ key })))).rejects.toThrow(
+    expect(await throwerOf(readConnectionFile(tempFile(validInfo({ key }))))).toThrow(
       "connection file field 'key' has invalid byte 427",
     );
   });
@@ -104,14 +105,14 @@ describe("connection file reader", () => {
   test("rejects an out-of-range daemon_id byte", async () => {
     const daemonId = Array(16).fill(1);
     daemonId[0] = -1;
-    await expect(readConnectionFile(tempFile(validInfo({ daemon_id: daemonId })))).rejects.toThrow(
+    expect(await throwerOf(readConnectionFile(tempFile(validInfo({ daemon_id: daemonId }))))).toThrow(
       "connection file field 'daemon_id' has invalid byte -1",
     );
   });
 
   test("rejects a wrong-length daemon_id", async () => {
-    await expect(
-      readConnectionFile(tempFile(validInfo({ daemon_id: Array(8).fill(1) }))),
-    ).rejects.toThrow(ConnectionFileError);
+    expect(
+      await throwerOf(readConnectionFile(tempFile(validInfo({ daemon_id: Array(8).fill(1) })))),
+    ).toThrow(ConnectionFileError);
   });
 });

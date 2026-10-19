@@ -16,6 +16,7 @@ import { AuthError } from "../src/auth.js";
 import { readConnectionFile } from "../src/connection-file.js";
 import { SubcClient } from "../src/index.js";
 import { startLiveDaemon, type LiveDaemon } from "./live-daemon.js";
+import { throwerOf } from "./settle.js";
 
 // Live tests need a compiled subc-core daemon (Rust toolchain). They are
 // OFF by default so the unit suite runs in a bun-only environment (npm
@@ -59,7 +60,7 @@ describe.skipIf(!LIVE)("live handshake against real subc-core", () => {
 
     // Server's proof (computed with the real key) won't match what our client
     // expects (computed with the flipped key) -> the client aborts the handshake.
-    await expect(SubcClient.connect({ connectionFile: badPath })).rejects.toThrow(AuthError);
+    expect(await throwerOf(SubcClient.connect({ connectionFile: badPath }))).toThrow(AuthError);
     expect(conn.daemonId.length).toBe(16);
   });
 });

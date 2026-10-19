@@ -83,7 +83,8 @@ the request control-plane, never a poison-prone content field (same discipline a
   gates *surface* (which tools). Orthogonal: principal = who, policy = what.
 - **Session axis = `BindIdentity {root, harness, session}`** — already relayed
   per-route. The session layer keys on it. A mid-session policy change is a
-  control op on the route (see §2.5).
+  control op on the route (see §2.5). The MCP facade binds one session per MCP
+  connection; providers can opt into one bind per calling conversation (§7).
 - **agent-role** is a caller-supplied label, distinct from the principal (one
   authenticated caller can run many agent roles).
 
@@ -172,3 +173,63 @@ The future code runtime exposes only tool bindings from the resolved policy (§2
 `agent-role` is a free-form caller/app label. The caller supplies the resolved tool policy when binding its session, then updates it through the gateway's `policy.set`; tool-set changes wait for the session's `immediate`, `on-hard`, or `on-soft` refresh condition unless the user explicitly applies them (§2.5).
 
 Search ranks enabled tools by their names and descriptions; ranking from recorded usage is future module work, not a current policy input. Future code execution runs in a dedicated module, while subc-core continues only to route opaque bytes (§5).
+
+## 7. Session binding and per-call conversation binding
+
+**One bind per MCP connection.** When a shim attaches, the facade opens one
+route per enabled tool provider, all bound with the same `BindIdentity`: the
+project root, the harness, and a session. If the shim's hello carries a valid
+instance token (the per-launch token a wrapper such as the ck-claude launcher
+exports as `CK_INSTANCE_TOKEN`), that token is the session verbatim; otherwise
+the session is a synthetic per-shim id. Every call on the connection goes out on
+these attach routes.
+
+**The problem it leaves.** Claude Code runs its lead agent and its subagents
+over one MCP connection, so they all reach a provider on the same attach route
+and the provider sees one session. A provider that acts on "the current
+conversation" (Magic Context's `ctx_reduce`) would apply a subagent's call to
+the lead agent's conversation.
+
+**Opt-in: `mcp-conversation-binding/v1`.** A tool provider that lists
+`mcp-conversation-binding/v1` in its manifest's `capabilities.provides` (read
+from the daemon catalog) gets one bind per calling conversation instead. For a
+`tools/call` to such a provider:
+
+1. If the request's `_meta` carries `"claudecode/toolUseId"` and the shim has a
+   valid instance token, the facade asks the Claude Code gateway's management
+   surface (module `thalamus`) `session.resolve` with
+   `{instance_token, tool_use_id}`, on the same route kind the `/ck:status`
+   prompt uses, and waits up to 8 seconds (the gateway may hold its answer up to
+   5 seconds while the tool use reaches it).
+2. The shape of the answer (with or without the `result` envelope) decides
+   where the call goes:
+   - `{session: "<string>"}` names the conversation: for example `<sid>` for
+     the lead agent and `<sid>/<agent>` for a subagent; the facade never parses
+     it. The call is sent on a route to the provider whose bind copies every
+     attach-route field (project root, harness) except `session`, which is
+     exactly that string. The facade keeps one such route per (provider,
+     session), opens it on first use, and reuses it for later calls. This
+     includes the lead agent's own calls: its resolved session differs from the
+     instance token the attach route is bound to.
+   - An answer with neither `session` nor `unresolved` is an older gateway's,
+     which ignores `tool_use_id` and answers the instance-token form
+     (`{session_id, last_traffic_ms}` or `{session_id: null}`). The call goes
+     on the attach route, unchanged, as before per-call binding existed.
+   - `{unresolved: true, reason}` (`unknown_tool_use`, `unknown_instance`, or
+     any other reason), a gateway error, a timeout, a `_meta` value that is not
+     a non-empty string, or any other answer returns a plain MCP tool error
+     (`isError: true`) naming the reason. Nothing is sent to the provider, and
+     the call does **not** fall back to the attach route.
+
+Calls without the `_meta` key, calls to providers that do not declare the
+capability, and shims without a valid instance token use the attach route, as
+before.
+
+**Bounds and lifetime.** One MCP connection holds at most 32 conversation
+routes; a call that would need another is refused with a tool error naming the
+limit, and existing conversations keep their routes. A route the daemon closes
+(its provider went away) is forgotten, and that conversation's next call opens a
+new one. Routes minted on a relay connection that has since been replaced are
+dropped the same way. When the MCP connection ends, every conversation route is
+closed with a route GOODBYE alongside the attach routes. The facade logs only
+the tool-use id from `_meta`, at debug level.

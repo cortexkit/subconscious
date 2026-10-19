@@ -28,10 +28,11 @@ use prompts::{
 use rmcp::{
     model::{
         CallToolRequestParams, CallToolResult, CancelledNotificationParam, ClientCapabilities,
-        ClientResult, CustomRequest, ErrorCode, ErrorData, GetPromptRequestParams, GetPromptResult,
-        Implementation, InitializeRequestParams, InitializeResult, JsonObject, ListPromptsResult,
-        ListToolsResult, PaginatedRequestParams, ProgressNotificationParam, ProgressToken,
-        RequestId, ServerCapabilities, ServerInfo, ServerRequest, Tool as McpTool, ToolAnnotations,
+        ClientResult, Content, CustomRequest, ErrorCode, ErrorData, GetPromptRequestParams,
+        GetPromptResult, Implementation, InitializeRequestParams, InitializeResult, JsonObject,
+        ListPromptsResult, ListToolsResult, Meta, PaginatedRequestParams,
+        ProgressNotificationParam, ProgressToken, RequestId, ServerCapabilities, ServerInfo,
+        ServerRequest, Tool as McpTool, ToolAnnotations,
     },
     service::{NotificationContext, Peer, PeerRequestOptions, RequestContext, ServiceError},
     transport::async_rw::AsyncRwTransport,
@@ -115,6 +116,32 @@ const ACK_ONLY_TOOL_RESPONSE_TEXT: &str = "Queued for context compaction.";
 const FACADE_DEFAULT_DISABLED: &[&str] = &["magic-context", "llm-runner"];
 const MANIFEST_MODULE_ID: &str = "ck-subc-mcp";
 const CK_DOMAIN_HEADLINE: &str = "CortexKit MCP gateway";
+/// Capability a tool-provider module lists in its manifest's
+/// `capabilities.provides` to have each Claude Code tool call bound to the
+/// conversation that made it, instead of to the MCP connection.
+///
+/// Claude Code's lead agent and its subagents share one MCP connection, and
+/// that connection's routes are bound once, at attach, to the launch's
+/// instance token. A module that acts on "the current conversation" (Magic
+/// Context's `ctx_reduce`, for one) would otherwise apply a subagent's call to
+/// the lead agent's conversation. For a module that declares this capability,
+/// each call carrying Claude Code's tool-use id is resolved to its own
+/// conversation by the gateway and sent on a route bound to that conversation.
+/// Modules that do not declare it keep the single per-connection route.
+const MCP_CONVERSATION_BINDING_CAPABILITY: &str = "mcp-conversation-binding/v1";
+/// Key Claude Code sets in a `tools/call` request's `_meta` to the id of the
+/// tool use that made the call. The gateway maps it to the conversation
+/// (lead agent or subagent) that issued that tool use.
+const CLAUDE_CODE_TOOL_USE_ID_META_KEY: &str = "claudecode/toolUseId";
+/// How long to wait for the gateway's `session.resolve` answer for one call.
+/// The gateway may hold the answer up to 5 s while the tool use it is asked
+/// about reaches it on the provider wire; this leaves margin over that.
+const CONVERSATION_RESOLVE_TIMEOUT: Duration = Duration::from_secs(8);
+/// Most conversation-bound routes one MCP connection may hold open. Each
+/// distinct (module, conversation) pair costs one route; a call that would
+/// need one more is refused with a tool error rather than evicting a route a
+/// running subagent may still be using.
+const MAX_CONVERSATION_ROUTES: usize = 32;
 
 static NEXT_CONNECTION_TOKEN: AtomicU64 = AtomicU64::new(1);
 static LOGGER_INSTALLED: AtomicBool = AtomicBool::new(false);
@@ -1200,6 +1227,11 @@ enum ToolBinding {
 struct ForwardBinding {
     route: RouteHandle,
     bare_tool_name: String,
+    /// Provider the tool belongs to; names the target when the call is sent
+    /// on a conversation-bound route instead of `route`.
+    module_id: String,
+    /// Whether the provider declares `MCP_CONVERSATION_BINDING_CAPABILITY`.
+    conversation_binding: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1210,6 +1242,8 @@ struct DesiredSession {
 #[derive(Debug, Clone)]
 struct DesiredProvider {
     module_id: String,
+    /// Whether the catalog entry declares `MCP_CONVERSATION_BINDING_CAPABILITY`.
+    conversation_binding: bool,
     tools: Vec<DesiredTool>,
 }
 
@@ -2508,11 +2542,19 @@ async fn handle_shim_connection(
     let attached = attach_session(&subc, &hello).await?;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let reconcile_gate = Arc::new(Mutex::new(()));
-    let prompt_backend = Arc::new(RouteBackend::new(Arc::new(SubcPromptRouteClient::new(
+    let prompt_routes: Arc<dyn PromptRouteClient> = Arc::new(SubcPromptRouteClient::new(
         subc.clone(),
         attached.state.identity.clone(),
         Arc::clone(&attached.relay_session),
-    ))));
+    ));
+    let prompt_backend = Arc::new(RouteBackend::new(Arc::clone(&prompt_routes)));
+    let conversation = Arc::new(ConversationRouter::new(
+        subc.clone(),
+        attached.state.identity.clone(),
+        Arc::clone(&attached.relay_session),
+        hello.instance_token.clone(),
+        prompt_routes,
+    ));
 
     let handler = SubcMcpServer::new(
         subc.clone(),
@@ -2523,6 +2565,7 @@ async fn handle_shim_connection(
         Arc::clone(&reconcile_gate),
         hello.instance_token.clone(),
         prompt_backend,
+        Arc::clone(&conversation),
     );
     let (read_half, write_half) = stream.into_split();
     let transport = AsyncRwTransport::<RoleServer, _, _>::new_server(read_half, write_half);
@@ -2535,7 +2578,9 @@ async fn handle_shim_connection(
     subc.relay()
         .unregister_session_routes(&attached.relay_session)
         .await;
-    let goodbye_result = send_route_goodbyes(&subc, attached.state.route_handles()).await;
+    let mut routes = attached.state.route_handles();
+    routes.extend(conversation.close());
+    let goodbye_result = send_route_goodbyes(&subc, routes).await;
 
     match (serve_result, goodbye_result) {
         (Ok(()), Ok(())) => Ok(()),
@@ -2929,11 +2974,21 @@ fn desired_session_from_catalog(
 
         providers.push(DesiredProvider {
             module_id: entry.module_id.clone(),
+            conversation_binding: declares_conversation_binding(entry),
             tools,
         });
     }
 
     Ok(DesiredSession { providers })
+}
+
+fn declares_conversation_binding(entry: &CatalogEntry) -> bool {
+    entry.capabilities.as_ref().is_some_and(|capabilities| {
+        capabilities
+            .provides
+            .iter()
+            .any(|capability| capability == MCP_CONVERSATION_BINDING_CAPABILITY)
+    })
 }
 
 fn session_inner_from_desired(
@@ -2959,6 +3014,8 @@ fn session_inner_from_desired(
                 ToolMode::Forward => ToolBinding::Forward(ForwardBinding {
                     route,
                     bare_tool_name: desired_tool.bare_tool.name,
+                    module_id: provider.module_id.clone(),
+                    conversation_binding: provider.conversation_binding,
                 }),
                 ToolMode::AckOnly => ToolBinding::AckOnly {
                     acks: subc.relay().ack_only_counter(&exposed_name),
@@ -4089,6 +4146,7 @@ async fn notify_policy_refresh(peer: &Peer<RoleServer>, changes: PolicyRefreshCh
     true
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn session_lifecycle(
     subc: SubcClient,
     state: Arc<SessionState>,
@@ -4097,6 +4155,7 @@ async fn session_lifecycle(
     peer: Peer<RoleServer>,
     mut shutdown: watch::Receiver<bool>,
     reconcile_gate: Arc<Mutex<()>>,
+    conversation: Arc<ConversationRouter>,
 ) {
     let mut config_poll = time::interval(CATALOG_POLL_INTERVAL);
     config_poll.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
@@ -4128,6 +4187,7 @@ async fn session_lifecycle(
             event = events.recv() => {
                 match event {
                     Ok(SubcEvent::RouteGoodbye { handle }) => {
+                        conversation.forget_route(handle);
                         if state.remove_route(handle) && !notify_tool_list_changed(&peer).await {
                             break;
                         }
@@ -4297,6 +4357,18 @@ trait PromptRouteClient: Send + Sync {
         target: PromptRouteTarget,
         bind_session: Option<String>,
         body: serde_json::Value,
+    ) -> PromptRouteFuture<'a> {
+        self.call_with_wait(target, bind_session, body, SUBC_RESPONSE_TIMEOUT)
+    }
+
+    /// `call` with an explicit bound on how long to wait for the answer once
+    /// the route is open. A wait that expires is a `Transport` failure.
+    fn call_with_wait<'a>(
+        &'a self,
+        target: PromptRouteTarget,
+        bind_session: Option<String>,
+        body: serde_json::Value,
+        wait: Duration,
     ) -> PromptRouteFuture<'a>;
 }
 
@@ -4360,6 +4432,7 @@ impl SubcPromptRouteClient {
         target: PromptRouteTarget,
         bind_session: Option<String>,
         body: serde_json::Value,
+        wait: Duration,
     ) -> std::result::Result<serde_json::Value, PromptRouteFailure> {
         let (target, target_label) = match target {
             PromptRouteTarget::MagicContext => (
@@ -4411,7 +4484,7 @@ impl SubcPromptRouteClient {
                 })?;
             let frame = self
                 .subc
-                .request_on_route(route, frame, SUBC_RESPONSE_TIMEOUT)
+                .request_on_route(route, frame, wait)
                 .await
                 .map_err(|error| {
                     tracing::debug!(target: "prompt", "route request failed: {error}");
@@ -4454,13 +4527,14 @@ impl SubcPromptRouteClient {
 }
 
 impl PromptRouteClient for SubcPromptRouteClient {
-    fn call<'a>(
+    fn call_with_wait<'a>(
         &'a self,
         target: PromptRouteTarget,
         bind_session: Option<String>,
         body: serde_json::Value,
+        wait: Duration,
     ) -> PromptRouteFuture<'a> {
-        Box::pin(async move { self.call_route(target, bind_session, body).await })
+        Box::pin(async move { self.call_route(target, bind_session, body, wait).await })
     }
 }
 
@@ -4647,6 +4721,384 @@ fn map_prompt_route_failure(failure: PromptRouteFailure) -> PromptBackendError {
     }
 }
 
+/// What a `tools/call` request's `_meta` says about Claude Code's tool-use id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolUseIdMeta<'a> {
+    /// The key is not present: the call is not from Claude Code, or from a
+    /// version that does not send it.
+    Absent,
+    Present(&'a str),
+    /// The key is present but is not a non-empty string.
+    Malformed,
+}
+
+fn claude_code_tool_use_id(meta: &Meta) -> ToolUseIdMeta<'_> {
+    match meta.get(CLAUDE_CODE_TOOL_USE_ID_META_KEY) {
+        None => ToolUseIdMeta::Absent,
+        Some(serde_json::Value::String(id)) if !id.is_empty() => ToolUseIdMeta::Present(id),
+        Some(_) => ToolUseIdMeta::Malformed,
+    }
+}
+
+/// Why a call to a conversation-bound module was not sent. Each one becomes a
+/// plain tool error for the model; none of them falls back to the route bound
+/// at attach, because that route belongs to the lead agent's conversation and
+/// a subagent's call sent on it would act on the wrong conversation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ConversationRouteRefusal {
+    /// `_meta` carried the tool-use id key with an empty or non-string value.
+    MalformedToolUseId,
+    /// The gateway answered that it cannot place the tool use, with its reason
+    /// (`unknown_tool_use`, `unknown_instance`, or anything else it sends).
+    Unresolved(String),
+    /// The gateway could not be reached, or did not answer in time.
+    GatewayUnreachable,
+    /// The gateway answered with an error frame carrying this code.
+    GatewayError(String),
+    /// The gateway's answer was not an object, carried a field of the wrong
+    /// type, an empty session, or `unresolved` without `true`.
+    GatewayReplyMalformed,
+    /// This MCP connection already holds the maximum number of
+    /// conversation-bound routes.
+    RouteLimit(usize),
+    /// The daemon did not open a route to the module for the conversation.
+    RouteOpenFailed(String),
+    /// The MCP connection is closing; no new route is opened for it.
+    Closed,
+}
+
+impl ConversationRouteRefusal {
+    fn reason(&self) -> String {
+        match self {
+            Self::MalformedToolUseId => format!(
+                "the request's _meta \"{CLAUDE_CODE_TOOL_USE_ID_META_KEY}\" is not a non-empty string"
+            ),
+            Self::Unresolved(reason) => format!("the gateway could not resolve it: {reason}"),
+            Self::GatewayUnreachable => format!(
+                "the gateway could not be reached or did not answer within {} seconds",
+                CONVERSATION_RESOLVE_TIMEOUT.as_secs()
+            ),
+            Self::GatewayError(code) => format!("the gateway returned an error: {code}"),
+            Self::GatewayReplyMalformed => "the gateway's answer was malformed".to_owned(),
+            Self::RouteLimit(limit) => format!(
+                "this MCP connection already has the maximum of {limit} conversation routes open"
+            ),
+            Self::RouteOpenFailed(error) => {
+                format!("no route to the module could be opened for the conversation: {error}")
+            }
+            Self::Closed => "the MCP connection is closing".to_owned(),
+        }
+    }
+
+    fn tool_result(&self, module_id: &str) -> CallToolResult {
+        CallToolResult::error(vec![Content::text(format!(
+            "This tool call was not sent to '{module_id}': CortexKit could not tell which \
+             Claude Code conversation made it ({}). Sending it anyway could act on another \
+             conversation.",
+            self.reason()
+        ))])
+    }
+}
+
+/// The gateway's answer to `session.resolve` asked with a tool-use id. Unknown
+/// fields are ignored, which is how an older gateway's answer (`session_id`,
+/// `last_traffic_ms`) decodes with both fields here absent.
+#[derive(Debug, Deserialize)]
+struct ConversationResolveReply {
+    #[serde(default)]
+    session: Option<String>,
+    #[serde(default)]
+    unresolved: Option<bool>,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+/// What the gateway's `session.resolve` answer says to do with the call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ConversationResolution {
+    /// Send the call on a route bound to this session.
+    Session(String),
+    /// The gateway predates per-call resolution: it ignored the tool-use id
+    /// and answered the instance-token form (`{session_id, last_traffic_ms}`
+    /// or `{session_id: null}`). The call goes on the attach route, as it did
+    /// before conversation binding existed.
+    GatewayNotPerCall,
+}
+
+/// Decodes the gateway's `session.resolve` answer.
+///
+/// The answer is accepted with or without the `{"result": ...}` envelope the
+/// gateway's other management answers carry. The shape `{session}` /
+/// `{unresolved, reason}` is what was agreed with the gateway's owner; whether
+/// its dispatcher wraps it is not something this repository can check.
+///
+/// The shape decides the outcome: a non-empty `session` string selects the
+/// conversation route; `unresolved: true` refuses the call; an answer with
+/// neither field is an older gateway's and keeps the attach route; anything
+/// else is refused as malformed.
+fn parse_conversation_resolve_reply(
+    value: serde_json::Value,
+) -> std::result::Result<ConversationResolution, ConversationRouteRefusal> {
+    let value = match value {
+        serde_json::Value::Object(mut map) => match map.remove("result") {
+            Some(inner) => inner,
+            None => serde_json::Value::Object(map),
+        },
+        other => other,
+    };
+    if !value.is_object() {
+        return Err(ConversationRouteRefusal::GatewayReplyMalformed);
+    }
+    let reply = serde_json::from_value::<ConversationResolveReply>(value)
+        .map_err(|_| ConversationRouteRefusal::GatewayReplyMalformed)?;
+    match (reply.session, reply.unresolved) {
+        (_, Some(true)) => {
+            let reason = reply
+                .reason
+                .filter(|reason| !reason.is_empty())
+                .unwrap_or_else(|| "unspecified".to_owned());
+            Err(ConversationRouteRefusal::Unresolved(reason))
+        }
+        (Some(session), None) if !session.is_empty() => {
+            Ok(ConversationResolution::Session(session))
+        }
+        (None, None) => Ok(ConversationResolution::GatewayNotPerCall),
+        _ => Err(ConversationRouteRefusal::GatewayReplyMalformed),
+    }
+}
+
+type ConversationRouteKey = (String, String);
+
+/// Routes for modules declaring `MCP_CONVERSATION_BINDING_CAPABILITY`, one per
+/// (module, conversation) pair, for one MCP connection.
+///
+/// Claude Code's lead agent and its subagents share one MCP connection. Its
+/// attach routes are bound to the launch's instance token, so a module that
+/// keys state by the bound session sees every agent's call as the same
+/// conversation. For a module that opts in, each call carrying Claude Code's
+/// tool-use id is resolved by the gateway (`session.resolve`) to the session
+/// string of the agent that made it, and sent on a route bound to exactly
+/// that string. Those routes are opened on first use with the attach identity
+/// except for the session, reused for later calls, and closed with the MCP
+/// connection.
+struct ConversationRouter {
+    subc: SubcClient,
+    /// The attach bind identity. Conversation routes copy it and replace only
+    /// the session.
+    identity: BindIdentity,
+    relay_session: Arc<RelaySession>,
+    /// The shim's instance token, when it sent a valid one. Without it the
+    /// gateway has nothing to resolve against, and calls behave as they did
+    /// before conversation binding existed.
+    instance_token: Option<String>,
+    /// The client the prompt backend uses for the gateway's management
+    /// surface; resolution goes through the same route kind.
+    resolver: Arc<dyn PromptRouteClient>,
+    resolve_timeout: Duration,
+    route_limit: usize,
+    /// `None` once the MCP connection has ended and the routes were closed.
+    routes: std::sync::Mutex<Option<HashMap<ConversationRouteKey, RouteHandle>>>,
+    /// Serializes route opens, so two concurrent first calls for the same
+    /// conversation open one route rather than two.
+    open_gate: Mutex<()>,
+}
+
+impl ConversationRouter {
+    fn new(
+        subc: SubcClient,
+        identity: BindIdentity,
+        relay_session: Arc<RelaySession>,
+        instance_token: Option<String>,
+        resolver: Arc<dyn PromptRouteClient>,
+    ) -> Self {
+        Self {
+            subc,
+            identity,
+            relay_session,
+            instance_token: instance_token.filter(|token| valid_instance_token(token)),
+            resolver,
+            resolve_timeout: CONVERSATION_RESOLVE_TIMEOUT,
+            route_limit: MAX_CONVERSATION_ROUTES,
+            routes: std::sync::Mutex::new(Some(HashMap::new())),
+            open_gate: Mutex::new(()),
+        }
+    }
+
+    fn lock_routes(
+        &self,
+    ) -> std::sync::MutexGuard<'_, Option<HashMap<ConversationRouteKey, RouteHandle>>> {
+        self.routes.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("recovering from poisoned conversation route lock");
+            poisoned.into_inner()
+        })
+    }
+
+    /// The route a call to `binding`'s tool goes out on.
+    ///
+    /// The attach route unless all of these hold: the module opted in, the
+    /// shim has an instance token, and the call's `_meta` carries the tool-use
+    /// id key. When they do, the gateway's answer decides: a session sends the
+    /// call on that conversation's route, an older gateway's answer (no
+    /// per-call resolution yet) keeps the attach route, and anything else
+    /// refuses the call. A refused call never falls back to the attach route.
+    async fn route_for_call(
+        &self,
+        binding: &ForwardBinding,
+        tool_use_id: ToolUseIdMeta<'_>,
+    ) -> std::result::Result<RouteHandle, ConversationRouteRefusal> {
+        if !binding.conversation_binding {
+            return Ok(binding.route);
+        }
+        let Some(instance_token) = self.instance_token.as_deref() else {
+            return Ok(binding.route);
+        };
+        let tool_use_id = match tool_use_id {
+            ToolUseIdMeta::Absent => return Ok(binding.route),
+            ToolUseIdMeta::Malformed => return Err(ConversationRouteRefusal::MalformedToolUseId),
+            ToolUseIdMeta::Present(id) => id,
+        };
+        tracing::debug!(target: "conversation",
+            "resolving the conversation of tool use {tool_use_id} for '{}'",
+            binding.module_id
+        );
+        match self.resolve(instance_token, tool_use_id).await? {
+            ConversationResolution::Session(session) => {
+                self.route_for_session(&binding.module_id, session).await
+            }
+            ConversationResolution::GatewayNotPerCall => {
+                tracing::debug!(target: "conversation",
+                    "gateway does not resolve tool uses yet; tool use {tool_use_id} keeps the attach route"
+                );
+                Ok(binding.route)
+            }
+        }
+    }
+
+    async fn resolve(
+        &self,
+        instance_token: &str,
+        tool_use_id: &str,
+    ) -> std::result::Result<ConversationResolution, ConversationRouteRefusal> {
+        let reply = self
+            .resolver
+            .call_with_wait(
+                PromptRouteTarget::Thalamus,
+                None,
+                serde_json::json!({
+                    "method": "session.resolve",
+                    "params": {
+                        "instance_token": instance_token,
+                        "tool_use_id": tool_use_id,
+                    },
+                }),
+                self.resolve_timeout,
+            )
+            .await
+            .map_err(|failure| match failure {
+                PromptRouteFailure::Transport => ConversationRouteRefusal::GatewayUnreachable,
+                PromptRouteFailure::Remote(code) => ConversationRouteRefusal::GatewayError(code),
+                PromptRouteFailure::Malformed => ConversationRouteRefusal::GatewayReplyMalformed,
+            })?;
+        parse_conversation_resolve_reply(reply)
+    }
+
+    /// The route bound to `session` for `module_id`, opened if missing.
+    async fn route_for_session(
+        &self,
+        module_id: &str,
+        session: String,
+    ) -> std::result::Result<RouteHandle, ConversationRouteRefusal> {
+        let key = (module_id.to_owned(), session);
+        if let Some(route) = self.live_route(&key)? {
+            return Ok(route);
+        }
+        let _open_guard = self.open_gate.lock().await;
+        if let Some(route) = self.live_route(&key)? {
+            return Ok(route);
+        }
+        {
+            let routes = self.lock_routes();
+            let routes = routes.as_ref().ok_or(ConversationRouteRefusal::Closed)?;
+            if routes.len() >= self.route_limit {
+                return Err(ConversationRouteRefusal::RouteLimit(self.route_limit));
+            }
+        }
+
+        let mut identity = self.identity.clone();
+        identity.session = key.1.clone();
+        let route = open_provider_route(
+            &self.subc,
+            module_id,
+            &identity,
+            self.relay_session.consumer_capabilities(),
+            Arc::clone(&self.relay_session),
+        )
+        .await
+        .map_err(|error| {
+            tracing::debug!(target: "conversation",
+                "failed to open a conversation route to '{module_id}': {error}"
+            );
+            ConversationRouteRefusal::RouteOpenFailed(error.to_string())
+        })?;
+
+        let closed = {
+            let mut routes = self.lock_routes();
+            match routes.as_mut() {
+                Some(routes) => {
+                    routes.insert(key, route);
+                    false
+                }
+                None => true,
+            }
+        };
+        if closed {
+            // The connection ended while this route was opening: close it
+            // here, since the disconnect already closed the ones it knew of.
+            self.subc.relay().drop_route(route).await;
+            let _ = send_route_goodbye(&self.subc, route).await;
+            return Err(ConversationRouteRefusal::Closed);
+        }
+        Ok(route)
+    }
+
+    /// The open route for `key`, if any. Routes minted on an earlier relay
+    /// connection closed with it and are forgotten here.
+    fn live_route(
+        &self,
+        key: &ConversationRouteKey,
+    ) -> std::result::Result<Option<RouteHandle>, ConversationRouteRefusal> {
+        let live_token = self.subc.connection_token();
+        let mut routes = self.lock_routes();
+        let routes = routes.as_mut().ok_or(ConversationRouteRefusal::Closed)?;
+        routes.retain(|_, handle| handle.connection_token == live_token);
+        Ok(routes.get(key).copied())
+    }
+
+    /// Forgets a route the daemon closed (its provider went away), so the
+    /// next call for that conversation opens a fresh one.
+    fn forget_route(&self, handle: RouteHandle) {
+        if let Some(routes) = self.lock_routes().as_mut() {
+            routes.retain(|_, route| *route != handle);
+        }
+    }
+
+    /// Marks the router closed and returns its routes on the live relay
+    /// connection, for the caller to send GOODBYE on. Routes on an earlier
+    /// connection closed with it and are not returned.
+    fn close(&self) -> Vec<RouteHandle> {
+        let live_token = self.subc.connection_token();
+        let mut routes = self
+            .lock_routes()
+            .take()
+            .unwrap_or_default()
+            .into_values()
+            .filter(|handle| handle.connection_token == live_token)
+            .collect::<Vec<_>>();
+        routes.sort_unstable_by_key(|handle| (handle.channel, handle.epoch));
+        routes
+    }
+}
+
 #[derive(Clone)]
 struct SubcMcpServer {
     subc: SubcClient,
@@ -4656,6 +5108,7 @@ struct SubcMcpServer {
     shutdown: watch::Receiver<bool>,
     reconcile_gate: Arc<Mutex<()>>,
     prompts: PromptService,
+    conversation: Arc<ConversationRouter>,
 }
 
 /// The tool-call request body the gateway sends on a route is the shared
@@ -4874,6 +5327,7 @@ impl ServerHandler for SubcMcpServer {
         self.relay_session.record_peer(peer.clone());
         let shutdown = self.shutdown.clone();
         let reconcile_gate = Arc::clone(&self.reconcile_gate);
+        let conversation = Arc::clone(&self.conversation);
         tokio::spawn(session_lifecycle(
             subc,
             state,
@@ -4882,6 +5336,7 @@ impl ServerHandler for SubcMcpServer {
             peer,
             shutdown,
             reconcile_gate,
+            conversation,
         ));
     }
 }
@@ -4897,6 +5352,7 @@ impl SubcMcpServer {
         reconcile_gate: Arc<Mutex<()>>,
         instance_token: Option<String>,
         prompt_backend: Arc<dyn PromptBackend>,
+        conversation: Arc<ConversationRouter>,
     ) -> Self {
         Self {
             subc,
@@ -4906,6 +5362,7 @@ impl SubcMcpServer {
             shutdown,
             reconcile_gate,
             prompts: PromptService::new(instance_token, prompt_backend),
+            conversation,
         }
     }
 
@@ -5074,7 +5531,14 @@ impl SubcMcpServer {
                 )),
             );
         }
-        let route = binding.route;
+        let route = match self
+            .conversation
+            .route_for_call(&binding, claude_code_tool_use_id(&context.meta))
+            .await
+        {
+            Ok(route) => route,
+            Err(refusal) => return Ok(refusal.tool_result(&binding.module_id)),
+        };
         let progress_token = context.meta.get_progress_token();
         let body =
             route_tool_call_request(binding.bare_tool_name, arguments, progress_token.clone())?;
@@ -6579,11 +7043,12 @@ mod tests {
     }
 
     impl PromptRouteClient for MockPromptRouteClient {
-        fn call<'a>(
+        fn call_with_wait<'a>(
             &'a self,
             target: PromptRouteTarget,
             bind_session: Option<String>,
             body: serde_json::Value,
+            _wait: Duration,
         ) -> PromptRouteFuture<'a> {
             Box::pin(async move {
                 self.calls.lock().expect("prompt route calls lock").push((
@@ -7136,6 +7601,7 @@ mod tests {
                     PromptRouteTarget::Thalamus,
                     None,
                     serde_json::json!({"method":"status"}),
+                    SUBC_RESPONSE_TIMEOUT,
                 )
                 .await;
             assert_eq!(result.is_err(), remote_error);
@@ -7719,6 +8185,8 @@ mod tests {
                 ToolBinding::Forward(ForwardBinding {
                     route: forward_route,
                     bare_tool_name: "read".to_owned(),
+                    module_id: "aft".to_owned(),
+                    conversation_binding: false,
                 }),
             )]),
         )));
@@ -7777,6 +8245,7 @@ mod tests {
             DesiredSession {
                 providers: vec![DesiredProvider {
                     module_id: "test-provider".to_owned(),
+                    conversation_binding: false,
                     tools,
                 }],
             }
@@ -8499,5 +8968,629 @@ mod tests {
             );
             assert_eq!(source, ModuleConnectionFileSource::TempDirFallback);
         }
+    }
+
+    const TEST_INSTANCE_TOKEN: &str = "instance-token-123";
+
+    /// What the fake daemon below observed, in order.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum FakeDaemonEvent {
+        RouteOpen {
+            target: RouteTarget,
+            identity: BindIdentity,
+            channel: u16,
+        },
+        RouteRequest {
+            channel: u16,
+            body: serde_json::Value,
+        },
+        Goodbye {
+            channel: u16,
+        },
+    }
+
+    /// The daemon end of a `SubcClient`: answers every route.open with a new
+    /// channel and records what arrives. Route requests are recorded and never
+    /// answered, so a request to the gateway on it times out.
+    struct FakeDaemon {
+        events: Arc<StdMutex<Vec<FakeDaemonEvent>>>,
+        task: JoinHandle<()>,
+    }
+
+    impl FakeDaemon {
+        fn start(mut stream: TcpStream) -> Self {
+            let events = Arc::new(StdMutex::new(Vec::new()));
+            let recorded = Arc::clone(&events);
+            let task = tokio::spawn(async move {
+                let mut next_channel = 10_u16;
+                while let Ok(Some(frame)) = read_frame(&mut stream).await {
+                    let event = match frame.header.ty {
+                        FrameType::Request if frame.header.channel == 0 => {
+                            let request: ClientControlRequest =
+                                serde_json::from_slice(&frame.body).unwrap();
+                            let ClientControlRequest::RouteOpen {
+                                target, identity, ..
+                            } = request
+                            else {
+                                panic!("unexpected control request: {request:?}");
+                            };
+                            let channel = next_channel;
+                            next_channel += 1;
+                            let body = serde_json::to_vec(&ClientControlResponse::RouteOpen {
+                                route_channel: channel,
+                                route_epoch: 1,
+                            })
+                            .unwrap();
+                            let response = build_frame(
+                                FrameType::Response,
+                                control_flags(),
+                                0,
+                                0,
+                                frame.header.corr,
+                                body,
+                            )
+                            .unwrap();
+                            recorded.lock().unwrap().push(FakeDaemonEvent::RouteOpen {
+                                target,
+                                identity,
+                                channel,
+                            });
+                            write_frame(&mut stream, &response).await.unwrap();
+                            stream.flush().await.unwrap();
+                            continue;
+                        }
+                        FrameType::Request => FakeDaemonEvent::RouteRequest {
+                            channel: frame.header.channel,
+                            body: serde_json::from_slice(&frame.body).unwrap(),
+                        },
+                        FrameType::Goodbye => FakeDaemonEvent::Goodbye {
+                            channel: frame.header.channel,
+                        },
+                        _ => continue,
+                    };
+                    recorded.lock().unwrap().push(event);
+                }
+            });
+            Self { events, task }
+        }
+
+        fn events(&self) -> Vec<FakeDaemonEvent> {
+            self.events.lock().unwrap().clone()
+        }
+
+        async fn wait_for_events(&self, count: usize) -> Vec<FakeDaemonEvent> {
+            let deadline = time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let events = self.events();
+                if events.len() >= count {
+                    return events;
+                }
+                assert!(
+                    time::Instant::now() < deadline,
+                    "fake daemon saw {events:?}, expected at least {count} events"
+                );
+                time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+    }
+
+    impl Drop for FakeDaemon {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    fn conversation_test_identity() -> BindIdentity {
+        BindIdentity::new(
+            PathBuf::from("/tmp/subc-mcp-conversation"),
+            "mcp:claude-code".to_owned(),
+            TEST_INSTANCE_TOKEN.to_owned(),
+        )
+    }
+
+    async fn conversation_router_with(
+        resolver: Arc<dyn PromptRouteClient>,
+        instance_token: Option<&str>,
+    ) -> (ConversationRouter, FakeDaemon) {
+        let (client, server) = connected_tcp_stream_pair().await;
+        let subc = SubcClient::start(client);
+        let daemon = FakeDaemon::start(server);
+        let router = ConversationRouter::new(
+            subc,
+            conversation_test_identity(),
+            Arc::new(RelaySession::new("relay-session".to_owned())),
+            instance_token.map(str::to_owned),
+            resolver,
+        );
+        (router, daemon)
+    }
+
+    fn forward_binding(router: &ConversationRouter, conversation_binding: bool) -> ForwardBinding {
+        ForwardBinding {
+            // The attach route; the fake daemon never hands out channel 3.
+            route: router.subc.route_handle(3, 1),
+            bare_tool_name: "ctx_reduce".to_owned(),
+            module_id: "magic-context".to_owned(),
+            conversation_binding,
+        }
+    }
+
+    fn magic_context_target() -> RouteTarget {
+        RouteTarget::ToolProvider {
+            module_id: "magic-context".to_owned(),
+        }
+    }
+
+    fn resolve_call(tool_use_id: &str) -> (PromptRouteTarget, Option<String>, serde_json::Value) {
+        (
+            PromptRouteTarget::Thalamus,
+            None,
+            serde_json::json!({
+                "method": "session.resolve",
+                "params": {
+                    "instance_token": TEST_INSTANCE_TOKEN,
+                    "tool_use_id": tool_use_id,
+                },
+            }),
+        )
+    }
+
+    #[test]
+    fn tool_use_id_is_read_from_the_claude_code_meta_key() {
+        let meta = |value: serde_json::Value| {
+            let mut meta = Meta::new();
+            meta.0
+                .insert(CLAUDE_CODE_TOOL_USE_ID_META_KEY.to_owned(), value);
+            meta
+        };
+        assert_eq!(claude_code_tool_use_id(&Meta::new()), ToolUseIdMeta::Absent);
+        assert_eq!(
+            claude_code_tool_use_id(&meta(serde_json::json!("toolu_01"))),
+            ToolUseIdMeta::Present("toolu_01")
+        );
+        assert_eq!(
+            claude_code_tool_use_id(&meta(serde_json::json!(""))),
+            ToolUseIdMeta::Malformed
+        );
+        assert_eq!(
+            claude_code_tool_use_id(&meta(serde_json::json!(7))),
+            ToolUseIdMeta::Malformed
+        );
+
+        // rmcp moves a request's wire `_meta` into the request's meta, which
+        // its serve loop hands to the handler as `RequestContext::meta`; the
+        // `claudecode/toolUseId` value must be found there exactly as Claude
+        // Code sends it.
+        let request: rmcp::model::ClientJsonRpcMessage =
+            serde_json::from_value(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 14,
+                "method": "tools/call",
+                "params": {
+                    "name": "magic-context_ctx_reduce",
+                    "arguments": {},
+                    "_meta": {"claudecode/toolUseId": "toolu_01", "progressToken": 14},
+                },
+            }))
+            .unwrap();
+        let rmcp::model::JsonRpcMessage::Request(request) = request else {
+            panic!("expected a request");
+        };
+        use rmcp::model::GetMeta;
+        assert_eq!(
+            claude_code_tool_use_id(request.request.get_meta()),
+            ToolUseIdMeta::Present("toolu_01")
+        );
+    }
+
+    #[test]
+    fn only_a_catalog_entry_providing_the_capability_opts_in() {
+        let mut entry = CatalogEntry::new(
+            "magic-context",
+            vec![ProviderRole::ToolProvider {
+                tools: vec![ManifestTool {
+                    name: "ctx_reduce".to_owned(),
+                    description: None,
+                    execution_mode: ExecutionMode::Pure,
+                    schema: serde_json::json!({"type": "object"}),
+                }],
+                identity_scope: Vec::new(),
+                concurrency: subc_protocol::manifest::Concurrency::Serial,
+                emits_push: false,
+                sub_supervises: false,
+            }],
+            Vec::new(),
+        );
+        let opted_in = |entry: &CatalogEntry| {
+            desired_session_from_catalog(&GatewayConfig::default(), std::slice::from_ref(entry))
+                .unwrap()
+                .providers[0]
+                .conversation_binding
+        };
+        assert!(!opted_in(&entry), "no capabilities declared");
+        entry.capabilities = Some(subc_protocol::manifest::CapabilityDeclarations {
+            provides: vec!["some-other-capability/v1".to_owned()],
+            requires: Vec::new(),
+            must_never_reach: Vec::new(),
+        });
+        assert!(!opted_in(&entry), "a different capability");
+        entry.capabilities = Some(subc_protocol::manifest::CapabilityDeclarations {
+            provides: vec![MCP_CONVERSATION_BINDING_CAPABILITY.to_owned()],
+            requires: Vec::new(),
+            must_never_reach: Vec::new(),
+        });
+        assert!(opted_in(&entry));
+    }
+
+    /// A subagent call and a lead-agent call reach the module on two routes
+    /// bound to the exact session strings the gateway returned, neither of
+    /// them the attach route, and a later call for a conversation reuses its
+    /// route.
+    #[tokio::test]
+    async fn conversation_bound_calls_use_a_route_bound_to_the_resolved_session() {
+        let resolver = Arc::new(MockPromptRouteClient::new([
+            Ok(serde_json::json!({"result": {"session": "sid-1/agent-a"}})),
+            Ok(serde_json::json!({"session": "sid-1"})),
+            Ok(serde_json::json!({"result": {"session": "sid-1/agent-a"}})),
+            Ok(serde_json::json!({"result": {"session": "sid-1/agent-a"}})),
+        ]));
+        let (router, daemon) =
+            conversation_router_with(resolver.clone(), Some(TEST_INSTANCE_TOKEN)).await;
+        let binding = forward_binding(&router, true);
+
+        let subagent = router
+            .route_for_call(&binding, ToolUseIdMeta::Present("toolu_sub"))
+            .await
+            .unwrap();
+        let head = router
+            .route_for_call(&binding, ToolUseIdMeta::Present("toolu_head"))
+            .await
+            .unwrap();
+        let subagent_again = router
+            .route_for_call(&binding, ToolUseIdMeta::Present("toolu_sub_2"))
+            .await
+            .unwrap();
+
+        assert_ne!(subagent, binding.route);
+        assert_ne!(head, binding.route);
+        assert_ne!(subagent, head);
+        assert_eq!(
+            subagent_again, subagent,
+            "same conversation reuses its route"
+        );
+
+        // Every bind field but the session is the attach route's, the harness
+        // included.
+        let attach = conversation_test_identity();
+        assert_eq!(attach.harness, "mcp:claude-code");
+        let opened = |session: &str, channel: u16| FakeDaemonEvent::RouteOpen {
+            target: magic_context_target(),
+            identity: BindIdentity::new(
+                attach.project_root.clone(),
+                attach.harness.clone(),
+                session.to_owned(),
+            ),
+            channel,
+        };
+        assert_eq!(
+            daemon.events(),
+            vec![
+                opened("sid-1/agent-a", subagent.channel),
+                opened("sid-1", head.channel),
+            ]
+        );
+        assert_eq!(
+            resolver.calls(),
+            vec![
+                resolve_call("toolu_sub"),
+                resolve_call("toolu_head"),
+                resolve_call("toolu_sub_2"),
+            ]
+        );
+
+        // A route the daemon closed is forgotten, and the conversation's next
+        // call opens a fresh one.
+        router.forget_route(subagent);
+        let reopened = router
+            .route_for_call(&binding, ToolUseIdMeta::Present("toolu_sub_3"))
+            .await
+            .unwrap();
+        assert_ne!(reopened, subagent);
+        assert_eq!(daemon.events().len(), 3);
+    }
+
+    /// `unresolved` (any reason), a gateway error, and a malformed answer each
+    /// refuse the call with a tool error naming the reason; nothing is sent to
+    /// the module and the attach route is not used.
+    #[tokio::test]
+    async fn unresolved_conversation_refuses_the_call_without_reaching_the_module() {
+        let resolver = Arc::new(MockPromptRouteClient::new([
+            Ok(serde_json::json!({"result": {"unresolved": true, "reason": "unknown_tool_use"}})),
+            Ok(serde_json::json!({"unresolved": true, "reason": "unknown_instance"})),
+            Ok(serde_json::json!({"result": {"unresolved": true, "reason": "something_new"}})),
+            Err(PromptRouteFailure::Remote("invalid_request".to_owned())),
+            Ok(serde_json::json!({"result": {"session": 7}})),
+            Ok(serde_json::json!({"result": {"session": ""}})),
+            Ok(serde_json::json!({"result": {"unresolved": false}})),
+            Ok(serde_json::json!({"result": "sid-1"})),
+        ]));
+        let (router, daemon) =
+            conversation_router_with(resolver.clone(), Some(TEST_INSTANCE_TOKEN)).await;
+        let binding = forward_binding(&router, true);
+
+        let mut refusals = Vec::new();
+        for _ in 0..8 {
+            refusals.push(
+                router
+                    .route_for_call(&binding, ToolUseIdMeta::Present("toolu_x"))
+                    .await
+                    .expect_err("an unresolvable call must not get a route"),
+            );
+        }
+        assert_eq!(
+            refusals,
+            vec![
+                ConversationRouteRefusal::Unresolved("unknown_tool_use".to_owned()),
+                ConversationRouteRefusal::Unresolved("unknown_instance".to_owned()),
+                ConversationRouteRefusal::Unresolved("something_new".to_owned()),
+                ConversationRouteRefusal::GatewayError("invalid_request".to_owned()),
+                ConversationRouteRefusal::GatewayReplyMalformed,
+                ConversationRouteRefusal::GatewayReplyMalformed,
+                ConversationRouteRefusal::GatewayReplyMalformed,
+                ConversationRouteRefusal::GatewayReplyMalformed,
+            ]
+        );
+        let result = refusals[0].tool_result(&binding.module_id);
+        assert_eq!(result.is_error, Some(true));
+        let text = serde_json::to_string(&result).unwrap();
+        assert!(text.contains("unknown_tool_use"), "{text}");
+        assert!(text.contains("magic-context"), "{text}");
+
+        // A call carrying the key with an unusable value is refused too,
+        // without asking the gateway.
+        assert_eq!(
+            router
+                .route_for_call(&binding, ToolUseIdMeta::Malformed)
+                .await,
+            Err(ConversationRouteRefusal::MalformedToolUseId)
+        );
+        assert_eq!(resolver.calls().len(), 8);
+        time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(daemon.events(), Vec::new(), "nothing may reach the daemon");
+    }
+
+    /// A gateway that predates per-call resolution ignores the tool-use id and
+    /// answers the instance-token form. Such an answer keeps the call on the
+    /// attach route, unchanged, and opens no conversation route.
+    #[tokio::test]
+    async fn older_gateway_reply_keeps_the_attach_route() {
+        let resolver = Arc::new(MockPromptRouteClient::new([
+            Ok(serde_json::json!({"result": {
+                "session_id": "80bbd4e4-c5d5\u{241f}agent-7",
+                "last_traffic_ms": 4200,
+            }})),
+            Ok(serde_json::json!({"result": {"session_id": null}})),
+            Ok(serde_json::json!({"session_id": "flat-old-shape"})),
+        ]));
+        let (router, daemon) =
+            conversation_router_with(resolver.clone(), Some(TEST_INSTANCE_TOKEN)).await;
+        let binding = forward_binding(&router, true);
+
+        for id in ["toolu_1", "toolu_2", "toolu_3"] {
+            assert_eq!(
+                router
+                    .route_for_call(&binding, ToolUseIdMeta::Present(id))
+                    .await,
+                Ok(binding.route)
+            );
+        }
+        assert_eq!(
+            resolver.calls(),
+            vec![
+                resolve_call("toolu_1"),
+                resolve_call("toolu_2"),
+                resolve_call("toolu_3"),
+            ]
+        );
+        time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            daemon.events().is_empty(),
+            "no conversation route is opened"
+        );
+    }
+
+    /// A gateway that never answers is a tool error once the resolve wait
+    /// expires, through the real gateway client: its route is closed and no
+    /// route to the module is opened.
+    #[tokio::test]
+    async fn gateway_timeout_refuses_the_call_without_reaching_the_module() {
+        let (client, server) = connected_tcp_stream_pair().await;
+        let subc = SubcClient::start(client);
+        let daemon = FakeDaemon::start(server);
+        let relay_session = Arc::new(RelaySession::new("relay-session".to_owned()));
+        let resolver: Arc<dyn PromptRouteClient> = Arc::new(SubcPromptRouteClient::new(
+            subc.clone(),
+            conversation_test_identity(),
+            Arc::clone(&relay_session),
+        ));
+        let mut router = ConversationRouter::new(
+            subc,
+            conversation_test_identity(),
+            relay_session,
+            Some(TEST_INSTANCE_TOKEN.to_owned()),
+            resolver,
+        );
+        router.resolve_timeout = Duration::from_millis(200);
+        let binding = forward_binding(&router, true);
+
+        let refusal = router
+            .route_for_call(&binding, ToolUseIdMeta::Present("toolu_slow"))
+            .await
+            .expect_err("a gateway that never answers must not yield a route");
+        assert_eq!(refusal, ConversationRouteRefusal::GatewayUnreachable);
+        assert_eq!(refusal.tool_result(&binding.module_id).is_error, Some(true));
+
+        let events = daemon.wait_for_events(3).await;
+        let FakeDaemonEvent::RouteOpen {
+            target, channel, ..
+        } = &events[0]
+        else {
+            panic!("expected the gateway route to open first: {events:?}");
+        };
+        assert_eq!(
+            target,
+            &RouteTarget::ManagementSurface {
+                module_id: "thalamus".to_owned(),
+            }
+        );
+        assert_eq!(
+            events[1..],
+            [
+                FakeDaemonEvent::RouteRequest {
+                    channel: *channel,
+                    body: resolve_call("toolu_slow").2,
+                },
+                FakeDaemonEvent::Goodbye { channel: *channel },
+            ]
+        );
+        time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(daemon.events().len(), 3, "nothing may reach the module");
+    }
+
+    /// Targets that do not opt in, calls without the meta key, and shims
+    /// without an instance token all use the attach route, as before
+    /// conversation binding existed, and never ask the gateway.
+    #[tokio::test]
+    async fn calls_outside_conversation_binding_use_the_attach_route() {
+        let resolver = Arc::new(MockPromptRouteClient::new([]));
+        let (router, daemon) =
+            conversation_router_with(resolver.clone(), Some(TEST_INSTANCE_TOKEN)).await;
+        let not_opted_in = forward_binding(&router, false);
+        let opted_in = forward_binding(&router, true);
+
+        for tool_use_id in [
+            ToolUseIdMeta::Present("toolu_1"),
+            ToolUseIdMeta::Malformed,
+            ToolUseIdMeta::Absent,
+        ] {
+            assert_eq!(
+                router.route_for_call(&not_opted_in, tool_use_id).await,
+                Ok(not_opted_in.route)
+            );
+        }
+        assert_eq!(
+            router
+                .route_for_call(&opted_in, ToolUseIdMeta::Absent)
+                .await,
+            Ok(opted_in.route)
+        );
+
+        let (tokenless, tokenless_daemon) = conversation_router_with(resolver.clone(), None).await;
+        let tokenless_binding = forward_binding(&tokenless, true);
+        assert_eq!(
+            tokenless
+                .route_for_call(&tokenless_binding, ToolUseIdMeta::Present("toolu_2"))
+                .await,
+            Ok(tokenless_binding.route)
+        );
+        let (invalid_token, _invalid_daemon) =
+            conversation_router_with(resolver.clone(), Some("not a valid token")).await;
+        let invalid_binding = forward_binding(&invalid_token, true);
+        assert_eq!(
+            invalid_token
+                .route_for_call(&invalid_binding, ToolUseIdMeta::Present("toolu_3"))
+                .await,
+            Ok(invalid_binding.route)
+        );
+
+        assert!(resolver.calls().is_empty(), "the gateway must not be asked");
+        assert!(daemon.events().is_empty());
+        assert!(tokenless_daemon.events().is_empty());
+    }
+
+    /// One more distinct conversation than the cap is refused with a tool
+    /// error naming the cap; conversations that already have a route keep it.
+    #[tokio::test]
+    async fn conversation_routes_are_capped_per_connection() {
+        let resolver = Arc::new(MockPromptRouteClient::new([
+            Ok(serde_json::json!({"session": "sid-1"})),
+            Ok(serde_json::json!({"session": "sid-1/agent-a"})),
+            Ok(serde_json::json!({"session": "sid-1/agent-b"})),
+            Ok(serde_json::json!({"session": "sid-1"})),
+        ]));
+        let (mut router, daemon) =
+            conversation_router_with(resolver.clone(), Some(TEST_INSTANCE_TOKEN)).await;
+        router.route_limit = 2;
+        let binding = forward_binding(&router, true);
+
+        let head = router
+            .route_for_call(&binding, ToolUseIdMeta::Present("toolu_1"))
+            .await
+            .unwrap();
+        router
+            .route_for_call(&binding, ToolUseIdMeta::Present("toolu_2"))
+            .await
+            .unwrap();
+        let refusal = router
+            .route_for_call(&binding, ToolUseIdMeta::Present("toolu_3"))
+            .await
+            .expect_err("a third conversation exceeds the cap of two");
+        assert_eq!(refusal, ConversationRouteRefusal::RouteLimit(2));
+        let text = serde_json::to_string(&refusal.tool_result(&binding.module_id)).unwrap();
+        assert!(text.contains("maximum of 2"), "{text}");
+        assert_eq!(
+            router
+                .route_for_call(&binding, ToolUseIdMeta::Present("toolu_4"))
+                .await,
+            Ok(head)
+        );
+        assert_eq!(daemon.events().len(), 2, "only two routes were opened");
+    }
+
+    /// Closing the router hands back every conversation route for GOODBYE,
+    /// and the router opens no more routes afterwards.
+    #[tokio::test]
+    async fn conversation_routes_are_closed_when_the_connection_ends() {
+        let resolver = Arc::new(MockPromptRouteClient::new([
+            Ok(serde_json::json!({"session": "sid-1"})),
+            Ok(serde_json::json!({"session": "sid-1/agent-a"})),
+            Ok(serde_json::json!({"session": "sid-1/agent-b"})),
+        ]));
+        let (router, daemon) =
+            conversation_router_with(resolver.clone(), Some(TEST_INSTANCE_TOKEN)).await;
+        let binding = forward_binding(&router, true);
+        let mut opened = Vec::new();
+        for id in ["toolu_1", "toolu_2"] {
+            opened.push(
+                router
+                    .route_for_call(&binding, ToolUseIdMeta::Present(id))
+                    .await
+                    .unwrap(),
+            );
+        }
+
+        let closed = router.close();
+        assert_eq!(closed, opened);
+        send_route_goodbyes(&router.subc, closed).await.unwrap();
+        let events = daemon.wait_for_events(4).await;
+        assert_eq!(
+            events[2..],
+            [
+                FakeDaemonEvent::Goodbye {
+                    channel: opened[0].channel,
+                },
+                FakeDaemonEvent::Goodbye {
+                    channel: opened[1].channel,
+                },
+            ]
+        );
+
+        assert_eq!(
+            router
+                .route_for_call(&binding, ToolUseIdMeta::Present("toolu_3"))
+                .await,
+            Err(ConversationRouteRefusal::Closed)
+        );
+        assert!(router.close().is_empty());
     }
 }

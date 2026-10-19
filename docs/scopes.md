@@ -477,6 +477,115 @@ unsupported combinations: the daemon never reads data-plane request bodies or to
 cannot enforce per-tool modes. The providers' design lives in
 prefrontal's docs/designs/call-modes.md.
 
+## 4b. Codemode runs
+
+A codemode run is one program that a carrier module runs for one agent, calling tools for that
+agent until the program finishes. Each run has its own scope, a *run scope*: a scope carrying
+`attributes.run_id`, on which every bind to a `call-modes/v1` provider is stamped
+`call_mode: codemode` (section 4a). This section is the contract for providers that serve
+those calls.
+
+**Who does what.**
+- The run's owner, a module listed in `scope_authority_owners`, registers and ends run scopes.
+  Only such an owner may set `agent_id` and `run_id` (section 2). A carrier asks the owner for a
+  run under its own module identity, never the agent's, and the owner decides whether the agent
+  may have one.
+- The carrier opens one route per provider on the run scope and calls tools on those routes. It
+  never widens the scope and never calls a provider the run does not include.
+- The daemon admits only the owner and listed carriers, stamps every bind and drains routes as
+  section 5a says. It never reads tool names or request bodies, so it cannot police which tools
+  a run calls.
+- The provider decides each call from its route's bind stamp alone.
+
+**The record.** A run scope is an ordinary scope record. The daemon enforces the attribute rules
+of section 2; the rest is how the owner registers a run:
+- `kind: ephemeral`;
+- `attributes.agent_id`, the agent the run acts for, and `attributes.run_id`, the run. A
+  `run_id` needs an `agent_id` and cannot sit beside a `flow_id`;
+- `carriers`: the carrier module alone, targeted at the run's providers and the module that
+  serves its model calls. A targeted entry lists at most 16 modules;
+- `parent`: the scope of the head that started the run, for attribution only. It grants nothing.
+  The run's owner opens runs only for heads, so a run's parent is always a head scope, and a
+  head scope always carries `attributes.agent_id`. Worker scopes carry none;
+- `expires_at_ms`: the run's deadline, fixed for the epoch and at most 24 hours ahead;
+- `delegates`: either value is accepted. A delegating run binds only to providers declaring
+  `call-modes/v1`, which act as the agent only under the checks in section 7.
+
+**Which tools a run may call.** A provider serves codemode runs by declaring `call-modes/v1`
+and listing `codemode` in the catalog `modes` of each tool that serves them. A tool whose
+catalog entry has no `modes` serves classic calls only. A caller building a codemode program
+offers it only tools whose `modes` contain `codemode`, from providers declaring `call-modes/v1`.
+A provider that declares only the legacy `agent-run-scopes/v1` is treated as serving codemode on
+all its tools until the fleet census retires that capability (section 4a); it receives only
+non-delegating runs and no `call_mode` field. The provider, not the daemon, refuses a call to a
+tool that does not list the bind's mode, with a terminal `call_mode_unsupported` error whose
+detail is `{tool, mode}`.
+
+**Lifetime.** A run scope ends, and the daemon drains its routes with `scope_ended`, at the
+first of:
+- the owner ends it, by leaving it out of a full sync or naming it in `scope.apply`'s `end`,
+  for example when the carrier reports the run finished;
+- its `expires_at_ms` passes (section 2);
+- the owner replaces it with a higher epoch (a parent re-point is not a new run epoch);
+- the owner restarts and leaves it out of its first full sync, which replaces the owner's whole
+  set (section 3).
+
+The daemon never ends a scope because its parent ended. The children stay live, read
+`parent_state: ended`, and their routes drain with `scope_parent_ended` (section 3). The
+owner therefore keeps the link current:
+- When the head's epoch changes, the owner re-points the run scope's `parent` at the new epoch
+  in the same sync that changes the head's epoch, because it builds each sync from the head's
+  current record. The run scope keeps its own epoch. This avoids drains only when the run's
+  owner also owns the head's scope: then the link stays `linked` and no run route drains, and
+  a bind still in flight is refused `scope_changed` and re-opened. When another owner holds the
+  head's scope, the re-point comes in a later sync, after the run's routes have drained; the
+  link then reads `linked` again for new binds. A route bound before the re-point keeps the old
+  parent epoch in its stamp.
+- When the head's scope really ends, the owner ends that head's run scopes.
+
+A transient reconnect of a host, carrier or provider closes routes but never changes a scope
+epoch: epochs come only from the owner's records (section 2). The run scope and its link stay
+as they were, and the carrier re-opens its routes.
+
+A drain does not stop a call already delivered (section 7). The provider answers every
+in-flight call with a terminal frame and stops work the run started once `scope.describe`
+confirms the scope ended.
+
+**What a provider must do,** in addition to section 7:
+1. Declare `call-modes/v1`, list `codemode` only on tools it will serve inside a program, and
+   refuse every other tool with `call_mode_unsupported`.
+2. Take the agent and the run only from the stamp's `attributes.agent_id` and
+   `attributes.run_id`, never from arguments. A project root or session in the bind's identity
+   is configuration, never authority. The stamp does not list carriers: the daemon has already
+   checked that the opener, stamped as the bind's principal, is the owner or a listed carrier.
+3. Grant no more than the agent's own access: the same policy, grants and limits as the agent's
+   direct calls, or narrower.
+4. Refuse new calls on a route whose stamp reads `parent_state: ended`. The daemon still admits
+   binds to a live scope whose parent ended and stamps them that way. A `pending` link is
+   unverified and grants nothing.
+5. Refuse with a typed reason when serving a call needs state about the agent that the provider
+   cannot resolve, never serving from stale state.
+6. Record `agent_id` and `run_id` in its audit for every call.
+
+**Finding the agent's own access.** Obligation 3 needs the agent's access context: its project
+root, policy and grants. Every provider finds it the same way. It uses the run's stamped
+`parent` (owner, ref and epoch, with `parent_state: linked`) only to locate the head's scope.
+It then finds its own live route bound under that head scope at the epoch the link names,
+requires that route's stamp to carry an `attributes.agent_id` equal to the run's stamp's, and
+derives the agent's access from that route. When there is no such live route, `parent_state`
+is not `linked`, that route's stamp has no `agent_id`, or the two `agent_id`s differ, the
+provider refuses the call with a typed, terminal error (obligation 5). A parent without an
+`agent_id` is not a head scope, and a run is never opened under anything else. The parent link
+confers nothing by itself: authority comes only from the agent's own route. Both `agent_id`s
+can be compared because only an owner in `scope_authority_owners` can set one (section 2). A
+run route bound before a re-point names the head's old epoch, so its calls are refused this way
+until the carrier re-opens it and gets a stamp naming the new one.
+
+A provider's own tests pin, each failing by name when its rule is removed: a codemode call to a
+tool without `codemode` in its `modes` is refused `call_mode_unsupported` with `{tool, mode}`;
+an agent named in the arguments never replaces the stamp's `agent_id`; and a route stamped
+`parent_state: ended` serves no new call.
+
 ## 5. Reading: `scope.describe` and `scope.subscribe`
 
 `scope.describe {owner, ref}` answers:
@@ -690,6 +799,13 @@ Each fails by name when its rule is removed:
   when the parent's owner syncs, and is never refused for the order; every restart ordering of
   parent and child owners is tested;
 - a parent ending drains its children's live routes with `scope_parent_ended`;
+- a parent ending never ends its children: a live child whose `parent_state` is `ended` still
+  admits binds, stamped `parent_state: ended`, and its routes drain with `scope_parent_ended`:
+  `a_parent_ending_never_ends_a_child_which_still_admits_binds_stamped_ended` (`crates/subc-daemon/src/scopes.rs`);
+- re-pointing a live child's `parent` at the new epoch in the same sync that replaces its
+  parent's epoch keeps the child's epoch, keeps the link `linked` and drains nothing; a
+  re-point in a later sync, after the link ended, makes it `linked` again for new binds:
+  `a_child_repointed_in_the_same_sync_stays_linked_and_a_later_repoint_relinks_it` (`crates/subc-daemon/src/scopes.rs`);
 - adding a carrier leaves another carrier's in-flight call intact, and a stale pending bind is
   refused at commit;
 - a swap candidate never takes sync authority, including one that fails and is rolled back, and

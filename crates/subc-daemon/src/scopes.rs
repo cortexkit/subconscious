@@ -2980,6 +2980,132 @@ mod tests {
         );
     }
 
+    /// The tag change one sync recorded for `scope_ref`, which carries the
+    /// drain the forwarding table applies to that scope's live routes.
+    fn tag_change<'a>(applied: &'a SyncApplied, scope_ref: &str) -> &'a ScopeTagChange {
+        applied
+            .tag_changes
+            .iter()
+            .find(|change| change.scope_ref == scope_ref)
+            .unwrap_or_else(|| panic!("no tag change for {scope_ref}"))
+    }
+
+    /// Open a route to a provider on `scope_ref` at `scope_epoch`, as the
+    /// scope's owner, and return the stamp the bind would carry.
+    fn admitted_stamp(table: &ScopeTable, scope_ref: &str, scope_epoch: u64) -> ScopeStamp {
+        let selector = ScopeSelector::new(reserved(PREFRONTAL), scope_ref, Some(scope_epoch));
+        table
+            .admit(&reserved(PREFRONTAL), AFT, &selector, true)
+            .unwrap_or_else(|refusal| panic!("open on {scope_ref} refused: {refusal:?}"))
+            .stamp
+    }
+
+    /// The daemon never cascades an end down a parent link. When a head ends,
+    /// a run scope under it stays live at its own epoch: its routes drain with
+    /// `scope_parent_ended`, and a new open is still admitted and stamped
+    /// `parent_state: ended`, so refusing such calls is the provider's job.
+    #[test]
+    fn a_parent_ending_never_ends_a_child_which_still_admits_binds_stamped_ended() {
+        let mut table = table();
+        let child = child_of("run", PREFRONTAL, "h", 3);
+        sync(
+            &mut table,
+            PREFRONTAL,
+            conn(1),
+            1,
+            vec![head("h", 3), child.clone()],
+        );
+        assert_eq!(
+            admitted_stamp(&table, "run", 1).parent_state,
+            Some(ParentState::Linked)
+        );
+
+        // The head leaves the owner's set; the child is re-sent unchanged.
+        let applied = sync(&mut table, PREFRONTAL, conn(1), 2, vec![child]);
+        assert_eq!(live_epoch(&table, PREFRONTAL, "h"), None);
+        assert_eq!(live_epoch(&table, PREFRONTAL, "run"), Some(1));
+        assert_eq!(
+            parent_state(&table, PREFRONTAL, "run"),
+            Some(ParentState::Ended)
+        );
+        assert_eq!(
+            tag_change(&applied, "run").drain,
+            ScopeDrain::All(RouteCloseReason::ScopeParentEnded)
+        );
+        assert_eq!(
+            admitted_stamp(&table, "run", 1).parent_state,
+            Some(ParentState::Ended)
+        );
+    }
+
+    /// When a head moves to a new epoch, the owner re-points its run scopes'
+    /// parent links at the new epoch while each run keeps its own epoch. In the
+    /// same sync as the epoch change the link never ends, so no run route
+    /// drains. A re-point in a later sync, after the link ended and the routes
+    /// drained, makes the link `linked` again for new binds.
+    #[test]
+    fn a_child_repointed_in_the_same_sync_stays_linked_and_a_later_repoint_relinks_it() {
+        let mut table = table();
+        sync(
+            &mut table,
+            PREFRONTAL,
+            conn(1),
+            1,
+            vec![head("h", 3), child_of("run", PREFRONTAL, "h", 3)],
+        );
+
+        // Same sync: the head moves to epoch 4 and the child follows it.
+        let applied = sync(
+            &mut table,
+            PREFRONTAL,
+            conn(1),
+            2,
+            vec![head("h", 4), child_of("run", PREFRONTAL, "h", 4)],
+        );
+        assert_eq!(live_epoch(&table, PREFRONTAL, "run"), Some(1));
+        assert_eq!(
+            parent_state(&table, PREFRONTAL, "run"),
+            Some(ParentState::Linked)
+        );
+        assert_eq!(tag_change(&applied, "run").drain, ScopeDrain::Nothing);
+
+        // The head moves to epoch 5 without a re-point: the link ends.
+        let applied = sync(
+            &mut table,
+            PREFRONTAL,
+            conn(1),
+            3,
+            vec![head("h", 5), child_of("run", PREFRONTAL, "h", 4)],
+        );
+        assert_eq!(
+            parent_state(&table, PREFRONTAL, "run"),
+            Some(ParentState::Ended)
+        );
+        assert_eq!(
+            tag_change(&applied, "run").drain,
+            ScopeDrain::All(RouteCloseReason::ScopeParentEnded)
+        );
+
+        // A later re-point links the child again and drains nothing more.
+        let applied = sync(
+            &mut table,
+            PREFRONTAL,
+            conn(1),
+            4,
+            vec![head("h", 5), child_of("run", PREFRONTAL, "h", 5)],
+        );
+        assert_eq!(live_epoch(&table, PREFRONTAL, "run"), Some(1));
+        assert_eq!(
+            parent_state(&table, PREFRONTAL, "run"),
+            Some(ParentState::Linked)
+        );
+        assert_eq!(tag_change(&applied, "run").drain, ScopeDrain::Nothing);
+        assert_eq!(
+            admitted_stamp(&table, "run", 1).parent_state,
+            Some(ParentState::Linked)
+        );
+    }
+
     // ---- describe -----------------------------------------------------------
 
     /// The answers a reader holding a binding to one session tells apart: live

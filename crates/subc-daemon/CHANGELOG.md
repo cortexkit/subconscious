@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.36.13
+
+- Tests only, no behaviour change. Pin two scope-table rules that codemode run scopes rely on: a parent ending never ends a child, which stays live, drains with `scope_parent_ended`, and still admits binds stamped `parent_state: ended`; and re-pointing a child's `parent` at its parent's new epoch in the same sync keeps the link `linked` and drains nothing, while a re-point in a later sync makes it `linked` again.
+
 ## 0.36.12
 
 - Write an INFO log when an intentional Unix SIGTERM shutdown finishes draining and ending children, so operators can distinguish a completed shutdown from a daemon that disappeared without a final record. Signal handling and the clean exit status are unchanged.

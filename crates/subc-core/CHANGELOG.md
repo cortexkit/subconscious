@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.20.104
+
+- New macOS service definitions restart the daemon after a crash, paced by a 10-second throttle, while clean shutdowns stay stopped. New Windows tasks retry failures every minute (up to 255 times), run without a time limit, and keep running on battery power. Existing service definitions are not replaced by upgrade or by setup while the daemon is running; see the recovery-settings instructions in `docs/operating-the-daemon.md` to apply them during a planned interruption. Linux restart behavior is unchanged.
+- Record Rust panics in the dated daemon log with their payload, source location and thread name, while preserving stderr diagnostics. Log normal daemon exits and require subc-daemon 0.36.12 for an explicit completed-SIGTERM shutdown marker. Log dates and timestamps remain UTC.
+
 ## 0.20.103
 
 - Require subc-daemon 0.36.11. `ck module list` and `ck module status` show the launch-spec dimension of a pending reload, so an `env`, `args` or `protocol` edit applied by rescan reads as pending until the module restarts; a daemon that does not report it shows "not reported".

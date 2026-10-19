@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.36.12
+
+- Write an INFO log when an intentional Unix SIGTERM shutdown finishes draining and ending children, so operators can distinguish a completed shutdown from a daemon that disappeared without a final record. Signal handling and the clean exit status are unchanged.
+
 ## 0.36.11
 
 - At spawn, record a private fingerprint of the module's configured launch inputs (program, ordered arguments, the configured `env` block, protocol), excluding inherited environment and the per-spawn values the daemon injects. `supervisor.list` reports `pending_reload.spec`: `mismatch` after a rescan changes any of them until the module restarts, `unavailable` when no fingerprint was recorded for the running process. The fingerprint itself never leaves the daemon.

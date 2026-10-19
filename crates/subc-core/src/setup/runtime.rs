@@ -233,9 +233,12 @@ fn desired_definition_for_user(
         // daemon started that is not a supervised module, which is a cleanup
         // worth keeping.
         //
-        // ExitTimeOut is the stop timeout, see DAEMON_STOP_TIMEOUT_SECS.
+        // Restart only failed exits: SIGTERM drains and exits 0 on purpose.
+        // Ten seconds between launches bounds a crash loop to six starts/minute
+        // without delaying recovery for long. ExitTimeOut is the stop timeout,
+        // see DAEMON_STOP_TIMEOUT_SECS.
         RuntimePlatform::Macos => format!(
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict><key>Label</key><string>cortexkit.subc</string><key>ProgramArguments</key><array><string>{daemon}</string></array><key>RunAtLoad</key><true/><key>ExitTimeOut</key><integer>{DAEMON_STOP_TIMEOUT_SECS}</integer></dict></plist>\n"
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict><key>Label</key><string>cortexkit.subc</string><key>ProgramArguments</key><array><string>{daemon}</string></array><key>RunAtLoad</key><true/><key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict><key>ThrottleInterval</key><integer>10</integer><key>ExitTimeOut</key><integer>{DAEMON_STOP_TIMEOUT_SECS}</integer></dict></plist>\n"
         ),
         // KillMode=mixed: stopping the unit sends SIGTERM to the daemon only,
         // and SIGKILLs the rest of the cgroup after the daemon has exited.
@@ -256,8 +259,11 @@ fn desired_definition_for_user(
         // real schtasks says so. The fake runner the unit tests drive accepts
         // any bytes, which is how this shipped without it; the test on this
         // template pins the namespace for that reason.
+        // One minute spaces crash retries; 255 attempts is the largest count
+        // allowed by the schema's unsignedByte (over four hours of retries).
+        // Remove runtime/battery limits so power changes do not stop the daemon.
         RuntimePlatform::Windows => format!(
-            "<Task version=\"1.4\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\"><RegistrationInfo><URI>\\CortexKit\\subc-daemon</URI></RegistrationInfo><Triggers><LogonTrigger><Enabled>true</Enabled><UserId>{windows_user}</UserId></LogonTrigger></Triggers><Principals><Principal id=\"Author\"><UserId>{windows_user}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals><Actions Context=\"Author\"><Exec><Command>{daemon}</Command></Exec></Actions></Task>\n"
+            "<Task version=\"1.4\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\"><RegistrationInfo><URI>\\CortexKit\\subc-daemon</URI></RegistrationInfo><Triggers><LogonTrigger><Enabled>true</Enabled><UserId>{windows_user}</UserId></LogonTrigger></Triggers><Principals><Principal id=\"Author\"><UserId>{windows_user}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals><Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><StartWhenAvailable>true</StartWhenAvailable><RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable><WakeToRun>false</WakeToRun><ExecutionTimeLimit>PT0S</ExecutionTimeLimit><RestartOnFailure><Interval>PT1M</Interval><Count>255</Count></RestartOnFailure></Settings><Actions Context=\"Author\"><Exec><Command>{daemon}</Command></Exec></Actions></Task>\n"
         ),
     }
 }
@@ -1481,6 +1487,57 @@ mod tests {
             macos.contains("<key>ExitTimeOut</key><integer>35</integer>"),
             "the launchd plist must set its stop timeout: {macos}"
         );
+    }
+
+    #[test]
+    fn macos_keepalive_restarts_failures_but_not_successful_exits() {
+        let paths = runtime_paths(
+            RuntimePlatform::Macos,
+            Path::new("/Users/test/bin"),
+            Path::new("/Users/test"),
+        );
+        let plist = desired_definition(RuntimePlatform::Macos, &paths);
+        assert!(
+            plist.contains("<key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>"),
+            "KeepAlive must be conditional, not plain true: {plist}"
+        );
+        assert_eq!(plist.matches("<key>KeepAlive</key>").count(), 1);
+        assert!(plist.contains("<key>RunAtLoad</key><true/>"), "{plist}");
+        assert!(
+            plist.contains("<key>ThrottleInterval</key><integer>10</integer>"),
+            "crash loops must be paced: {plist}"
+        );
+    }
+
+    #[test]
+    fn windows_task_settings_support_long_running_crash_recovery() {
+        let paths = runtime_paths(
+            RuntimePlatform::Windows,
+            Path::new("C:\\Users\\test\\bin"),
+            Path::new("C:\\Users\\test"),
+        );
+        let xml = desired_definition_for_user(RuntimePlatform::Windows, &paths, "DOMAIN\\test");
+        let settings_start = xml.find("<Settings>").expect("task settings");
+        let settings_end = xml.find("</Settings>").expect("settings end");
+        let settings = &xml[settings_start..settings_end];
+        for expected in [
+            "<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>",
+            "<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>",
+            "<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>",
+            "<StartWhenAvailable>true</StartWhenAvailable>",
+            "<RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>",
+            "<WakeToRun>false</WakeToRun>",
+            "<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>",
+            "<RestartOnFailure><Interval>PT1M</Interval><Count>255</Count></RestartOnFailure>",
+        ] {
+            assert!(settings.contains(expected), "missing {expected}: {xml}");
+        }
+        // taskType, settingsType and restartType all use xs:all (no required
+        // ordering). Pin a conventional layout and one copy of each container.
+        assert!(xml.find("</Principals>").unwrap() < settings_start);
+        assert!(settings_end < xml.find("<Actions ").unwrap());
+        assert_eq!(xml.matches("<Settings>").count(), 1);
+        assert_eq!(xml.matches("<RestartOnFailure>").count(), 1);
     }
 
     /// `schtasks /Create /XML` accepts the definition only with the Task

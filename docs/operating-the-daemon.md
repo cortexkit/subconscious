@@ -51,6 +51,8 @@ Log files are under `<data home>/cortexkit/run/logs/` (the daemon's own
 each module's own data directory. See [`logging.md`](logging.md) and
 [`data-model.md`](data-model.md).
 
+Log file names and timestamps use UTC (the `Z` suffix), so a file's date can differ from your local date.
+
 ## 3. Restart, stop and start a module
 
 ```sh
@@ -124,6 +126,26 @@ schtasks /Run /TN "\CortexKit\subc-daemon"
 A daemon restart closes every route, re-reads the configuration, writes a new
 connection key, and ends any module process the previous daemon left behind
 before it starts new ones. Clients reconnect by re-reading the connection file.
+
+New macOS LaunchAgents restart after a failed exit or fatal signal, but not a
+clean exit (including the daemon's SIGTERM shutdown), with a 10-second launch
+throttle. New Windows task definitions retry failures once a minute, up to 255
+times, without a runtime limit or battery restrictions. They do not wake a
+sleeping computer or add a resume trigger. Linux keeps `Restart=on-failure`.
+
+An upgrade restarts the existing service definition; it does not replace it.
+Setup also leaves an already-running, registered daemon's definition alone.
+To install the new recovery settings on an existing macOS or Windows install,
+first upgrade the binaries, then schedule a brief interruption and run:
+
+```sh
+# macOS: unload the job, then let setup write and load the new definition
+launchctl bootout "gui/$(id -u)/cortexkit.subc"
+ck setup
+# Windows: end the task, then let setup replace its definition and start it
+schtasks /End /TN "\CortexKit\subc-daemon"
+ck setup
+```
 
 ## 6. Who is connected
 

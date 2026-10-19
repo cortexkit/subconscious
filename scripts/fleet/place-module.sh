@@ -59,29 +59,13 @@
 #                  the staging path, so it must run on the destination before the restart.
 #
 #
-# CUTTING THE DAEMON ON macOS: `bootout` IS A RESTART, NOT A STOP, AND IT REPORTS
-# TWO FAILURES WHILE SUCCEEDING (measured 2026-09-20 on this desk).
-#
-#   plist   KeepAlive = SuccessfulExit, RunAtLoad = true
-#   daemon  the SIGTERM handler exits 0 BY DESIGN, so supervised children observe
-#           EOF on their control socket and run their own teardown instead of
-#           being SIGKILLed by a dropped Tokio runtime
-#
-# So `launchctl bootout gui/<uid>/cortexkit.subc` sends SIGTERM, the daemon exits
-# SUCCESSFULLY, and KeepAlive relaunches it before bootout can finish removing the
-# job. bootout then reports `3: No such process` and a following `bootstrap`
-# reports `5: Input/output error` (already loaded). BOTH ERRORS ARE ARTIFACTS OF
-# RACING launchd'"'"'S OWN RELAUNCH; the cut worked, and the log shows the announced
-# drain followed ~1s later by `subc daemon starting`.
-#
-# WHY THIS IS WORTH WRITING DOWN RATHER THAN REMEMBERING: a command that reports
-# failure while succeeding trains the operator to ignore its output, and the next
-# time it reports failure while FAILING the message will read the same. Verify a
-# cut by the daemon'"'"'s own evidence -- a new pid, inode proc == disk, and the
-# `subc daemon starting` line after the drain -- never by launchctl'"'"'s exit code.
-#
-# To genuinely STOP the daemon (not restart it), the job must be disabled first,
-# because a clean exit is exactly what KeepAlive=SuccessfulExit revives.
+# CUTTING THE DAEMON ON macOS: use cut-daemon.sh to bootout, wait, and bootstrap.
+# bootout unloads the job, so KeepAlive does not apply while it is unloaded.
+# The generated plist uses KeepAlive = { SuccessfulExit = false; }: crashes
+# restart, but the daemon's deliberate SIGTERM shutdown exits 0 and stays down.
+# Bare SIGKILL is therefore not a way to stop a loaded job permanently.
+# Verify a restart by a new pid, inode proc == disk, and a fresh
+# `subc daemon starting` line, not just by launchctl's exit code.
 #
 # Usage:
 #   place-module.sh --module <id> --staged <path> [--dest <path>] [--path-face <name>]

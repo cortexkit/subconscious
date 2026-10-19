@@ -98,6 +98,7 @@ async fn daemon_main(args: Vec<std::ffi::OsString>) {
         eprintln!("ck-subc: failed to initialize logging: {err}");
         process::exit(1);
     }
+    install_panic_hook();
 
     let privacy_trampoline = match std::env::current_exe() {
         Ok(path) => path,
@@ -117,6 +118,7 @@ async fn daemon_main(args: Vec<std::ffi::OsString>) {
         eprintln!("subc-core: {err}");
         process::exit(1);
     }
+    tracing::info!("daemon exiting: bootstrap completed normally");
     // The bounded SIGTERM path has already announced the shutdown, closed every
     // connection so modules saw EOF, and ended any child still running at its
     // own bounded deadline. Exit without dropping the Tokio runtime: tearing down every
@@ -209,6 +211,31 @@ fn install_tracing(config: Config) -> Result<(), cortexkit_log::InitError> {
     cortexkit_log::init(config).map(|_| ())
 }
 
+fn install_panic_hook() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let payload = info
+            .payload()
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| info.payload().downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("<non-string panic payload>");
+        let location = info
+            .location()
+            .map(|location| location.to_string())
+            .unwrap_or_else(|| "<unknown>".to_string());
+        let thread = std::thread::current();
+        tracing::error!(
+            payload,
+            location,
+            thread = thread.name().unwrap_or("<unnamed>"),
+            "daemon panicked"
+        );
+        // Keep Rust's stderr diagnostic (and any earlier hook) as well as the log.
+        previous(info);
+    }));
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -218,6 +245,107 @@ mod tests {
     };
 
     use super::*;
+
+    #[derive(Clone, Default)]
+    struct PanicLog(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for PanicLog {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn panic_hook_probe(
+        test_name: &str,
+        check: impl FnOnce(&str, usize),
+    ) -> Option<std::process::Output> {
+        // Hooks are process-global. A separate test process keeps other tests'
+        // panics and subscribers out of this probe, even in a parallel test run.
+        const CHILD: &str = "SUBC_PANIC_HOOK_TEST_CHILD";
+        if std::env::var(CHILD).as_deref() != Ok(test_name) {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", test_name, "--nocapture"])
+                .env(CHILD, test_name)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "panic hook probe failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return Some(output);
+        }
+
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hook_calls = Arc::clone(&calls);
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            hook_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            previous(info);
+        }));
+        install_panic_hook();
+        let log = PanicLog::default();
+        let writer = log.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(move || writer.clone())
+            .finish();
+        let join = std::thread::Builder::new()
+            .name("panic-hook-probe".to_string())
+            .spawn(move || {
+                tracing::subscriber::with_default(subscriber, || {
+                    panic!("panic hook probe payload");
+                });
+            })
+            .unwrap();
+        assert!(join.join().is_err());
+        // Restore the default before assertions, so a failed assertion cannot
+        // masquerade as a panic observed by the hook under test.
+        drop(std::panic::take_hook());
+        let output = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+        check(&output, calls.load(std::sync::atomic::Ordering::SeqCst));
+        None
+    }
+
+    #[test]
+    fn panic_hook_logs_payload_location_and_thread_at_error() {
+        panic_hook_probe(
+            "tests::panic_hook_logs_payload_location_and_thread_at_error",
+            |output, _| {
+                assert_eq!(output.lines().count(), 1, "{output}");
+                for expected in [
+                    "ERROR",
+                    "daemon panicked",
+                    "payload=\"panic hook probe payload\"",
+                    "location=",
+                    "main.rs:",
+                    "thread=\"panic-hook-probe\"",
+                ] {
+                    assert!(output.contains(expected), "missing {expected:?}: {output}");
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn panic_hook_chains_to_previous_hook() {
+        let output = panic_hook_probe("tests::panic_hook_chains_to_previous_hook", |_, calls| {
+            assert_eq!(calls, 1, "the previous hook must run exactly once");
+        });
+        if let Some(output) = output {
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("panic hook probe payload"),
+                "Rust's default hook must still write to stderr"
+            );
+        }
+    }
 
     #[test]
     fn cgroup_placement_override_requires_exact_disabled_value() {

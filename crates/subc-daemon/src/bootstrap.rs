@@ -1103,6 +1103,7 @@ async fn serve_bound_daemon(
                 terminate.recv().await;
             })
             .await;
+        info!("daemon exiting: SIGTERM shutdown complete");
         Ok(())
     }
     #[cfg(not(unix))]

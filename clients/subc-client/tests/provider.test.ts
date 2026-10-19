@@ -33,6 +33,7 @@ import {
 } from "../src/index.js";
 import { LaunchNonceError, resetLaunchNonceForTests } from "../src/launch-nonce.js";
 import { createRouteHandle, newConnectionToken, type RouteHandle } from "../src/route-handle.js";
+import { rejectionOf, throwerOf } from "./settle.js";
 
 const KEY = Uint8Array.from(Array(32).fill(0x4b));
 const DAEMON_ID = Uint8Array.from(Array(16).fill(0x6d));
@@ -202,7 +203,7 @@ describe("SubcProvider serve loop", () => {
           expect(error!.message).not.toBe("reverse request timed out");
           if (ending !== "fatal drop") expect(error).toMatchObject({ code: ending === "close" ? "provider_closed" : "connection_closed" });
           expect(signal!.aborted).toBe(true);
-          await expect(provider.request(handle!, new Uint8Array(0))).rejects.toThrow();
+          expect(await throwerOf(provider.request(handle!, new Uint8Array(0)))).toThrow();
         }, {
           onBound: (bound) => { handle = bound; },
           handler: async (_handle, body, context) => {
@@ -821,10 +822,10 @@ describe("SubcProvider serve loop", () => {
       );
 
     try {
-      await expect(provider.dispatch(goodbye(first), sock, 1)).resolves.toBe(true);
+      expect(await provider.dispatch(goodbye(first), sock, 1)).toBe(true);
       expect(provider.liveRoutes.has(second.channel)).toBe(true);
       // The loop kept reading: the other route's GOODBYE still dispatches.
-      await expect(provider.dispatch(goodbye(second), sock, 1)).resolves.toBe(true);
+      expect(await provider.dispatch(goodbye(second), sock, 1)).toBe(true);
       expect(gone).toEqual([first.channel, second.channel]);
       expect(warnings).toHaveLength(1);
     } finally {
@@ -879,7 +880,7 @@ describe("SubcProvider serve loop", () => {
 
     await provider.dispatch(routeErrorFrame(handle, "stale_route_epoch"), sock, 1);
 
-    await expect(request).rejects.toMatchObject({
+    expect(await rejectionOf(request)).toMatchObject({
       kind: "not_sent",
       code: "stale_route_epoch",
     });
@@ -890,7 +891,7 @@ describe("SubcProvider serve loop", () => {
 
     await provider.dispatch(routeErrorFrame(handle, "unknown_channel"), sock, 1);
 
-    await expect(request).rejects.toMatchObject({
+    expect(await rejectionOf(request)).toMatchObject({
       kind: "not_sent",
       code: "unknown_channel",
     });
@@ -901,7 +902,7 @@ describe("SubcProvider serve loop", () => {
       const { request, provider, sock, handle, writes, internals } = await reverseRequestHarness();
 
       await provider.dispatch(routeErrorFrame(handle, code), sock, 1);
-      await expect(request).rejects.toMatchObject({ kind: "not_sent", code });
+      expect(await rejectionOf(request)).toMatchObject({ kind: "not_sent", code });
       await Promise.resolve();
 
       expect(writes).toHaveLength(1);
@@ -1138,13 +1139,13 @@ describe("SubcProvider managed reconnect", () => {
     const initialDir = trackedTempDir("subc-provider-initial-dup-");
     const initialConnFile = writeConnectionFile(initialDir, initialDuplicate.port);
 
-    await expect(
-      SubcProvider.connect({
+    expect(
+      await rejectionOf(SubcProvider.connect({
         connectionFile: initialConnFile,
         manifest: managementSurfaceManifest({ moduleId: "initial-dup-provider", operations: ["echo"] }),
         handler: async (_routeChannel, body) => body,
-      }),
-    ).rejects.toMatchObject({ code: "duplicate_module_id" });
+      })),
+    ).toMatchObject({ code: "duplicate_module_id" });
     await initialDuplicate.stop();
 
     const daemon = await ScriptedProviderDaemon.start([

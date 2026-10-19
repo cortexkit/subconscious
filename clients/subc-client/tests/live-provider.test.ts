@@ -49,10 +49,10 @@ describe.skipIf(!LIVE)("SubcProvider live routing against real subc-core", () =>
         identity,
       );
       const request = { method: "echo", params: { text: "hello", n: 7 } };
-      await expect(client.request(routeChannel, request, { timeoutMs: 10_000 })).resolves.toEqual(request);
+      expect(await client.request(routeChannel, request, { timeoutMs: 10_000 })).toEqual(request);
 
       const managedRequest = { method: "echo", params: { text: "managed", n: 8 } };
-      await expect(client.call(moduleId, "echo", managedRequest.params, { timeoutMs: 10_000 })).resolves.toEqual(
+      expect(await client.call<unknown>(moduleId, "echo", managedRequest.params, { timeoutMs: 10_000 })).toEqual(
         managedRequest,
       );
     } finally {
@@ -105,7 +105,7 @@ describe.skipIf(!LIVE)("SubcProvider live managed reconnect against real subc-co
       const identity = { project_root: live.configDir, harness: "opencode", session: "session-reconnect" };
       const client = await SubcClient.connect({ connectionFile: live.connFile, identity });
       try {
-        await expect(client.call(moduleId, "echo", { reconnected: true }, { timeoutMs: 10_000 })).resolves.toEqual({
+        expect(await client.call<unknown>(moduleId, "echo", { reconnected: true }, { timeoutMs: 10_000 })).toEqual({
           method: "echo",
           params: { reconnected: true },
         });

@@ -21,6 +21,7 @@ import {
   type BindIdentity,
   type Frame,
 } from "../src/index.js";
+import { rejectionOf } from "./settle.js";
 
 // closeRoute is the per-route teardown primitive AFT's thin plugin needs: one
 // process serving many OC sessions, each a distinct (target, identity) route, must
@@ -157,7 +158,7 @@ for (const reason of ["scope_ended", "scope_carrier_removed", "scope_delegation_
       await daemon.send(lifecyclePush(reason, [channel]));
       await daemon.send(goodbye(channel));
       expect(await pending).toMatchObject({ code: "route_closed", closeReason: reason, kind: "outcome_unknown" });
-      await expect(client.call("aft", "echo", {}, { scope })).rejects.toMatchObject({ code: "route_closed", closeReason: reason, kind: "terminal" });
+      expect(await rejectionOf(client.call("aft", "echo", {}, { scope }))).toMatchObject({ code: "route_closed", closeReason: reason, kind: "terminal" });
       expect(daemon.state.routeOpens).toBe(1);
       daemon.state.holdRequests = false;
       // An unscoped call is unaffected, and triggers a real reconnect after EOF.
@@ -166,7 +167,7 @@ for (const reason of ["scope_ended", "scope_carrier_removed", "scope_delegation_
       await waitFor(() => internals.closedErr !== null, "client observes connection loss");
       await client.call("aft", "echo", {});
       expect(daemon.state.routeOpens).toBe(2);
-      await expect(client.call("aft", "echo", {}, { scope })).rejects.toMatchObject({ closeReason: reason });
+      expect(await rejectionOf(client.call("aft", "echo", {}, { scope }))).toMatchObject({ closeReason: reason });
       expect(daemon.state.routeOpens).toBe(2);
     } finally { client.close(); }
   });
@@ -194,7 +195,7 @@ for (const [reason, closeReason] of [
       });
 
       daemon.state.holdRequests = false;
-      await expect(client.call("aft", "echo", {})).resolves.toEqual({ method: "echo", params: {} });
+      expect(await client.call<unknown>("aft", "echo", {})).toEqual({ method: "echo", params: {} });
       expect(daemon.state.routeOpens).toBe(2);
     } finally { client.close(); }
   });
@@ -212,7 +213,7 @@ test("restart close still permits a scoped managed reopen", async () => {
     await daemon.send(goodbye(channel));
     expect(await pending).toMatchObject({ closeReason: "restart" });
     daemon.state.holdRequests = false;
-    await expect(client.call("aft", "echo", {}, { scope })).resolves.toEqual({ method: "echo", params: {} });
+    expect(await client.call<unknown>("aft", "echo", {}, { scope })).toEqual({ method: "echo", params: {} });
     expect(daemon.state.routeOpens).toBe(2);
   } finally { client.close(); }
 });
@@ -268,14 +269,14 @@ describe("SubcClient.closeRoute", () => {
   test("is an idempotent no-op when the route was never opened (and when called twice)", async () => {
     const { client, daemon } = await connectClient();
     // Never opened.
-    await expect(client.closeManagedRoute(MGMT_TARGET, IDENTITY)).resolves.toBeUndefined();
+    expect(await client.closeManagedRoute(MGMT_TARGET, IDENTITY)).toBeUndefined();
     expect(daemon.state.goodbyeChannels).toEqual([]);
 
     await client.call("managed-provider", "echo", { n: 1 });
     await client.closeManagedRoute(MGMT_TARGET, IDENTITY);
     await waitFor(() => daemon.state.goodbyeChannels.length >= 1, "the route GOODBYE (one-way, best-effort)");
     // Second close is a no-op (entry already gone) — must not throw or double-GOODBYE.
-    await expect(client.closeManagedRoute(MGMT_TARGET, IDENTITY)).resolves.toBeUndefined();
+    expect(await client.closeManagedRoute(MGMT_TARGET, IDENTITY)).toBeUndefined();
     await new Promise((r) => setTimeout(r, 30)); // give a stray second GOODBYE a chance to (wrongly) arrive.
     expect(daemon.state.goodbyeChannels.length).toBe(1);
     client.close();

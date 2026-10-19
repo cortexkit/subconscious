@@ -27,14 +27,7 @@ import {
   type Frame,
   type RouteScope,
 } from "../src/index.js";
-
-// Bun on Windows crashes the whole test process (a segmentation fault inside
-// the runtime) when the fake daemon closes the client's socket and the client
-// reconnects. Seen on GitHub's windows-latest runner with setup-bun "latest";
-// each of these three tests crashes it when run on its own. A segfault comes
-// from the runtime, not from this library, so they run on Linux and macOS,
-// which cover the reconnect path, and are skipped on Windows only.
-const reconnectTest = test.skipIf(process.platform === "win32");
+import { rejectionOf } from "./settle.js";
 
 const KEY = Uint8Array.from(Array(32).fill(0x4c));
 const DAEMON_ID = Uint8Array.from(Array(16).fill(0x7d));
@@ -204,7 +197,7 @@ describe("daemon-originated control pushes", () => {
 
       // Aliveness after the garbage push: a further control roundtrip works on
       // the same connection (the MUST-ignore clause held, nothing failed).
-      await expect(client.catalogList()).resolves.toEqual([]);
+      expect(await client.catalogList()).toEqual([]);
     } finally {
       client.close();
     }
@@ -226,7 +219,7 @@ describe("daemon-originated control pushes", () => {
     try {
       // The push (and the observer throw) land before this response on the same
       // stream; a resolved reply means the throw was contained.
-      await expect(client.catalogList()).resolves.toEqual([]);
+      expect(await client.catalogList()).toEqual([]);
     } finally {
       client.close();
     }
@@ -276,13 +269,13 @@ describe("SubcClient capability resolution", () => {
 
     const client = await SubcClient.connect({ connectionFile: connFile });
     try {
-      await expect(client.resolveProviders("missing-provider/v1")).resolves.toEqual([]);
-      await expect(client.resolveProvider("missing-provider/v1")).rejects.toMatchObject({
+      expect(await client.resolveProviders("missing-provider/v1")).toEqual([]);
+      expect(await rejectionOf(client.resolveProvider("missing-provider/v1"))).toMatchObject({
         code: "capability_unprovided",
       });
-      await expect(client.resolveProvider("single-provider/v1")).resolves.toBe("single-provider");
-      await expect(client.resolveProviders("many-provider/v1")).resolves.toEqual(["a-provider", "z-provider"]);
-      await expect(client.resolveProvider("many-provider/v1")).rejects.toMatchObject({
+      expect(await client.resolveProvider("single-provider/v1")).toBe("single-provider");
+      expect(await client.resolveProviders("many-provider/v1")).toEqual(["a-provider", "z-provider"]);
+      expect(await rejectionOf(client.resolveProvider("many-provider/v1"))).toMatchObject({
         code: "capability_ambiguous",
       });
     } finally {
@@ -301,8 +294,8 @@ describe("SubcClient capability resolution", () => {
 
     const client = await SubcClient.connect({ connectionFile: connFile });
     try {
-      await expect(client.resolveProviders("fallback-only/v1")).resolves.toEqual([]);
-      await expect(client.resolveProvider("fallback-only/v1")).rejects.toMatchObject({
+      expect(await client.resolveProviders("fallback-only/v1")).toEqual([]);
+      expect(await rejectionOf(client.resolveProvider("fallback-only/v1"))).toMatchObject({
         code: "capability_unprovided",
       });
     } finally {
@@ -318,7 +311,7 @@ describe("SubcClient capability resolution", () => {
 
     const client = await SubcClient.connect({ connectionFile: connFile });
     try {
-      await expect(client.resolveProviders("Bad/v1")).rejects.toMatchObject({
+      expect(await rejectionOf(client.resolveProviders("Bad/v1"))).toMatchObject({
         code: "invalid_capability_identifier",
       });
       expect(stats.requestFrames).toEqual([]);
@@ -378,7 +371,7 @@ describe("reverse-request lane", () => {
 
     const client = await SubcClient.connect({ connectionFile: connFile, identity: IDENTITY });
     try {
-      await expect(client.call("reverse-provider", "echo")).resolves.toEqual({ method: "echo" });
+      expect(await client.call<unknown>("reverse-provider", "echo")).toEqual({ method: "echo" });
       await waitFor(() => stats.reverseReplies.length === 1, "unhandled reverse reply");
       expect(stats.reverseReplies[0]!.header.ty).toBe(FrameType.Error);
       expect(parseJson(stats.reverseReplies[0]!.body)).toMatchObject({ code: "reverse_request_unhandled" });
@@ -410,7 +403,7 @@ describe("reverse-request lane", () => {
 
     const client = await SubcClient.connect({ connectionFile: connFile, identity: IDENTITY });
     try {
-      await expect(client.call("reverse-provider", "echo", undefined, { reverseRequests })).resolves.toEqual({ method: "echo" });
+      expect(await client.call<unknown>("reverse-provider", "echo", undefined, { reverseRequests })).toEqual({ method: "echo" });
       await waitFor(() => stats.reverseReplies.length === 1, "handled reverse reply");
       expect(Array.from(seenBody ?? [])).toEqual(Array.from(reverseBody));
       expect(seenCorr).toBe(901n);
@@ -443,7 +436,7 @@ describe("reverse-request lane", () => {
     try {
       const first = client.call("reverse-provider", "first", undefined, { reverseRequests });
       const sibling = client.call("reverse-provider", "sibling", undefined, { reverseRequests });
-      await expect(Promise.all([first, sibling])).resolves.toEqual([{ method: "first" }, { method: "sibling" }]);
+      expect(await Promise.all([first, sibling])).toEqual([{ method: "first" }, { method: "sibling" }]);
       await waitFor(() => stats.reverseReplies.length === 1, "throwing-handler reverse reply");
       expect(stats.reverseReplies[0]!.header.ty).toBe(FrameType.Error);
       expect(parseJson(stats.reverseReplies[0]!.body)).toEqual({
@@ -466,15 +459,15 @@ describe("SubcClient managed call", () => {
 
     const client = await SubcClient.connect({ connectionFile: connFile, identity: IDENTITY });
     try {
-      await expect(client.call("managed-provider", "echo", { n: 1 })).resolves.toEqual({
+      expect(await client.call<unknown>("managed-provider", "echo", { n: 1 })).toEqual({
         method: "echo",
         params: { n: 1 },
       });
-      await expect(client.call("managed-provider", "echo", { n: 2 })).resolves.toEqual({
+      expect(await client.call<unknown>("managed-provider", "echo", { n: 2 })).toEqual({
         method: "echo",
         params: { n: 2 },
       });
-      await expect(client.call("managed-provider", "echo", { n: 3 })).resolves.toEqual({
+      expect(await client.call<unknown>("managed-provider", "echo", { n: 3 })).toEqual({
         method: "echo",
         params: { n: 3 },
       });
@@ -486,7 +479,7 @@ describe("SubcClient managed call", () => {
     }
   });
 
-  reconnectTest("opens a fresh route for a managed call after reconnect", async () => {
+  test("opens a fresh route for a managed call after reconnect", async () => {
     const { connFile } = tempConnectionFile();
     const sleeps: number[] = [];
     const firstStats = newStats();
@@ -503,7 +496,7 @@ describe("SubcClient managed call", () => {
     });
 
     try {
-      await expect(client.call("managed-provider", "echo", { n: 1 })).resolves.toEqual({
+      expect(await client.call<unknown>("managed-provider", "echo", { n: 1 })).toEqual({
         method: "echo",
         params: { n: 1 },
       });
@@ -514,7 +507,7 @@ describe("SubcClient managed call", () => {
       const second = await startFakeDaemon({ stats: secondStats });
       writeConnectionFile(connFile, second.port);
 
-      await expect(client.call("managed-provider", "echo", { n: 2 })).resolves.toEqual({
+      expect(await client.call<unknown>("managed-provider", "echo", { n: 2 })).toEqual({
         method: "echo",
         params: { n: 2 },
       });
@@ -529,7 +522,7 @@ describe("SubcClient managed call", () => {
     }
   });
 
-  reconnectTest("recovers across a daemon restart that rotates the key (stale-file auth race is transient)", async () => {
+  test("recovers across a daemon restart that rotates the key (stale-file auth race is transient)", async () => {
     // The daemon rotates its key on every restart but keeps its fixed port. A
     // client racing the restart reads the pre-rotation connection file, connects
     // successfully (port unchanged), and fails the HMAC handshake. That proof
@@ -561,7 +554,7 @@ describe("SubcClient managed call", () => {
     });
 
     try {
-      await expect(client.call("managed-provider", "echo", { n: 1 })).resolves.toEqual({
+      expect(await client.call<unknown>("managed-provider", "echo", { n: 1 })).toEqual({
         method: "echo",
         params: { n: 1 },
       });
@@ -576,7 +569,7 @@ describe("SubcClient managed call", () => {
       writeConnectionFile(connFile, second.port); // old KEY, new port: connects, proof mismatch
       staleWindowRemaining = 2;
 
-      await expect(client.call("managed-provider", "echo", { n: 2 })).resolves.toEqual({
+      expect(await client.call<unknown>("managed-provider", "echo", { n: 2 })).toEqual({
         method: "echo",
         params: { n: 2 },
       });
@@ -589,7 +582,7 @@ describe("SubcClient managed call", () => {
     }
   });
 
-  reconnectTest("re-attaches the same consumer_identity when a later call opens after reconnect", async () => {
+  test("re-attaches the same consumer_identity when a later call opens after reconnect", async () => {
     // A route opened with a consumer_identity (principal attestation) must send the
     // SAME consumer_identity when it is reopened on a fresh connection after a
     // reconnect. Dropping it there would let the daemon re-stamp the route with a
@@ -611,9 +604,9 @@ describe("SubcClient managed call", () => {
 
     try {
       // First call installs the cached route on connection 1 (carrying the identity).
-      await expect(
-        client.call("managed-provider", "echo", { n: 1 }, { consumerIdentity }),
-      ).resolves.toEqual({ method: "echo", params: { n: 1 } });
+      expect(
+        await client.call<unknown>("managed-provider", "echo", { n: 1 }, { consumerIdentity }),
+      ).toEqual({ method: "echo", params: { n: 1 } });
       await waitFor(() => clientClosedErr(client) !== null, "client to observe first daemon close");
       await first.stop();
 
@@ -622,9 +615,9 @@ describe("SubcClient managed call", () => {
       writeConnectionFile(connFile, second.port);
 
       // The second call reconnects and opens a fresh route with the same identity.
-      await expect(
-        client.call("managed-provider", "echo", { n: 2 }, { consumerIdentity }),
-      ).resolves.toEqual({ method: "echo", params: { n: 2 } });
+      expect(
+        await client.call<unknown>("managed-provider", "echo", { n: 2 }, { consumerIdentity }),
+      ).toEqual({ method: "echo", params: { n: 2 } });
 
       // The new route on connection 2 must carry the identical consumer_identity.
       expect(firstStats.routeOpenConsumerIdentities).toEqual([consumerIdentity]);
@@ -655,10 +648,10 @@ describe("SubcClient managed call", () => {
       reconnectBackoff: BACKOFF,
     });
     try {
-      await expect(client.call("alpha", "echo", { phase: "cache" })).resolves.toMatchObject({
+      expect(await client.call<unknown>("alpha", "echo", { phase: "cache" })).toMatchObject({
         params: { phase: "cache" },
       });
-      await expect(client.call("beta", "echo", { phase: "cache" })).resolves.toMatchObject({
+      expect(await client.call<unknown>("beta", "echo", { phase: "cache" })).toMatchObject({
         params: { phase: "cache" },
       });
 
@@ -666,18 +659,18 @@ describe("SubcClient managed call", () => {
       // The successful trigger response then closes connection 1; on reconnect,
       // only the route used by the next call is opened.
       daemonOptions.closeAfterDataResponses = 1;
-      await expect(client.call("alpha", "echo", { phase: "drop" })).resolves.toMatchObject({
+      expect(await client.call<unknown>("alpha", "echo", { phase: "drop" })).toMatchObject({
         params: { phase: "drop" },
       });
       daemonOptions.closeAfterDataResponses = undefined;
       await waitFor(() => clientClosedErr(client) !== null, "client to observe the route-isolation drop");
 
-      await expect(client.call("alpha", "echo", { phase: "reconnected" })).resolves.toMatchObject({
+      expect(await client.call<unknown>("alpha", "echo", { phase: "reconnected" })).toMatchObject({
         params: { phase: "reconnected" },
       });
       expect(stats.connections).toBe(2);
 
-      await expect(client.call("beta", "echo", { phase: "caller-owned-refusal" })).rejects.toMatchObject({
+      expect(await rejectionOf(client.call("beta", "echo", { phase: "caller-owned-refusal" }))).toMatchObject({
         kind: "terminal",
         code: "project_origin_unclassifiable",
       });
@@ -718,7 +711,7 @@ describe("SubcClient managed call", () => {
       await waitFor(() => clientClosedErr(client) !== null, "client to observe the retryable-refusal drop");
 
       const reconnectStartedAt = Date.now();
-      await expect(client.call("alpha", "echo", { phase: "reconnected" })).resolves.toMatchObject({
+      expect(await client.call<unknown>("alpha", "echo", { phase: "reconnected" })).toMatchObject({
         params: { phase: "reconnected" },
       });
       expect(Date.now() - reconnectStartedAt).toBeLessThan(2_000);
@@ -726,7 +719,7 @@ describe("SubcClient managed call", () => {
 
       // Beta's old route was discarded with the connection. Its next call owns
       // the bounded module-reload patience and observes the daemon's refusal.
-      await expect(client.call("beta", "echo", { phase: "patient-open" })).rejects.toMatchObject({
+      expect(await rejectionOf(client.call("beta", "echo", { phase: "patient-open" }))).toMatchObject({
         kind: "not_sent",
         code: "module_reloading",
       });
@@ -752,7 +745,7 @@ describe("SubcClient managed call", () => {
     });
 
     try {
-      await expect(client.call("managed-provider", "mutate", { n: 1 })).rejects.toMatchObject({
+      expect(await rejectionOf(client.call("managed-provider", "mutate", { n: 1 }))).toMatchObject({
         kind: "outcome_unknown",
       });
       expect(stats.dataRequests).toBe(1);
@@ -771,7 +764,7 @@ describe("SubcClient managed call", () => {
 
     const client = await SubcClient.connect({ connectionFile: connFile, identity: IDENTITY });
     try {
-      await expect(client.call("managed-provider", "explode", {})).rejects.toMatchObject({
+      expect(await rejectionOf(client.call("managed-provider", "explode", {}))).toMatchObject({
         kind: "terminal",
         code: "module_boom",
         // The wire ErrorBody.detail payload must survive the parse verbatim:
@@ -797,7 +790,7 @@ describe("SubcClient managed call", () => {
       // First call: the daemon router rejects the stale bind with unknown_channel;
       // the client must evict the cached route, re-open, and retry once in place —
       // the caller sees success, not the terminal error.
-      await expect(client.call("managed-provider", "echo", { n: 1 })).resolves.toEqual({
+      expect(await client.call<unknown>("managed-provider", "echo", { n: 1 })).toEqual({
         method: "echo",
         params: { n: 1 },
       });
@@ -823,7 +816,7 @@ describe("SubcClient managed call", () => {
 
     const client = await SubcClient.connect({ connectionFile: connFile, identity: IDENTITY });
     try {
-      await expect(client.call("managed-provider", "echo", { n: 1 })).resolves.toEqual({
+      expect(await client.call<unknown>("managed-provider", "echo", { n: 1 })).toEqual({
         method: "echo",
         params: { n: 1 },
       });
@@ -848,7 +841,7 @@ describe("SubcClient managed call", () => {
 
     const client = await SubcClient.connect({ connectionFile: connFile, identity: IDENTITY });
     try {
-      await expect(client.call("managed-provider", "echo", { n: 1 })).rejects.toMatchObject({
+      expect(await rejectionOf(client.call("managed-provider", "echo", { n: 1 }))).toMatchObject({
         kind: "terminal",
         code: "unknown_channel",
       });
@@ -856,7 +849,7 @@ describe("SubcClient managed call", () => {
       expect(stats.dataRequests).toBe(2);
       expect(stats.routeOpens).toBe(2);
 
-      await expect(client.call("managed-provider", "echo", { n: 2 })).rejects.toMatchObject({
+      expect(await rejectionOf(client.call("managed-provider", "echo", { n: 2 }))).toMatchObject({
         kind: "terminal",
         code: "unknown_channel",
       });
@@ -935,7 +928,7 @@ describe("SubcClient managed call", () => {
       });
       writeConnectionFile(connFile, second.port);
 
-      await expect(client.call("managed-provider", "echo", { n: 2 })).rejects.toMatchObject({
+      expect(await rejectionOf(client.call("managed-provider", "echo", { n: 2 }))).toMatchObject({
         kind: "terminal",
         code: "route_rejected",
       });
@@ -1009,7 +1002,7 @@ describe("SubcClient managed call", () => {
     });
 
     try {
-      await expect(reloadingClient.call("managed-provider", "echo", { n: 1 })).rejects.toMatchObject({
+      expect(await rejectionOf(reloadingClient.call("managed-provider", "echo", { n: 1 }))).toMatchObject({
         kind: "not_sent",
         code: "module_reloading",
       });
@@ -1033,7 +1026,7 @@ describe("SubcClient managed call", () => {
     });
 
     try {
-      await expect(removedClient.call("managed-provider", "echo", { n: 1 })).rejects.toMatchObject({
+      expect(await rejectionOf(removedClient.call("managed-provider", "echo", { n: 1 }))).toMatchObject({
         kind: "terminal",
         code: "module_removed",
       });
@@ -1086,7 +1079,7 @@ describe("SubcClient managed call", () => {
       const sibling = client.call("sibling-provider", "hold", { n: 1 }, { timeoutMs: 2_000 });
       const siblingOutcome = sibling.then(() => "reply", () => "rejected");
       const replyHeld = await heldReady;
-      await expect(client.call("closing-provider", "close", {}, { timeoutMs: 2_000 })).rejects.toMatchObject({
+      expect(await rejectionOf(client.call("closing-provider", "close", {}, { timeoutMs: 2_000 }))).toMatchObject({
         kind: "outcome_unknown", code: "route_closed",
       });
       // Give the asynchronous reconnect a chance to replace the connection before
@@ -1098,7 +1091,7 @@ describe("SubcClient managed call", () => {
         new Promise<string>((resolve) => setTimeout(() => resolve("still pending"), 200)),
       ]);
       expect(settled).toBe("reply");
-      await expect(sibling).resolves.toEqual({ method: "hold", params: { n: 1 } });
+      expect(await sibling).toEqual({ method: "hold", params: { n: 1 } });
       expect(stats.closedConnections).toBe(0);
       expect(stats.connections).toBe(1);
     } finally {
@@ -1128,7 +1121,7 @@ describe("SubcClient managed call", () => {
     });
 
     try {
-      await expect(client.call("managed-provider", "mutate", { n: 1 }, { timeoutMs: 60 })).rejects.toMatchObject({
+      expect(await rejectionOf(client.call("managed-provider", "mutate", { n: 1 }, { timeoutMs: 60 }))).toMatchObject({
         kind: "outcome_unknown",
         code: "deadline_exceeded_no_drop_observed",
       });
@@ -1140,7 +1133,7 @@ describe("SubcClient managed call", () => {
       // despite the answered Ping closes it, and this second call would then
       // reconnect — the connection count fences the keep arm only through a
       // call that exercises the kept socket.
-      await expect(client.call("managed-provider", "mutate", { n: 2 }, { timeoutMs: 60 })).rejects.toMatchObject({
+      expect(await rejectionOf(client.call("managed-provider", "mutate", { n: 2 }, { timeoutMs: 60 }))).toMatchObject({
         code: "deadline_exceeded_no_drop_observed",
       });
       expect(stats.connections).toBe(1);
@@ -1177,13 +1170,13 @@ describe("SubcClient managed call", () => {
       const held = client.catalogList().catch(() => {});
       await new Promise((resolve) => setTimeout(resolve, 20));
 
-      await expect(client.call("managed-provider", "mutate", { n: 1 }, { timeoutMs: 60 })).rejects.toMatchObject({
+      expect(await rejectionOf(client.call("managed-provider", "mutate", { n: 1 }, { timeoutMs: 60 }))).toMatchObject({
         code: "deadline_exceeded_no_drop_observed",
       });
       // Probe window elapses; WITHOUT the gate this convicts and the next call
       // would open a second connection.
       await new Promise((resolve) => setTimeout(resolve, 150));
-      await expect(client.call("managed-provider", "mutate", { n: 2 }, { timeoutMs: 60 })).rejects.toMatchObject({
+      expect(await rejectionOf(client.call("managed-provider", "mutate", { n: 2 }, { timeoutMs: 60 }))).toMatchObject({
         code: "deadline_exceeded_no_drop_observed",
       });
       expect(stats.connections).toBe(1);
@@ -1214,7 +1207,7 @@ describe("SubcClient managed call", () => {
     });
 
     try {
-      await expect(client.call("managed-provider", "mutate", { n: 1 }, { timeoutMs: 60 })).rejects.toMatchObject({
+      expect(await rejectionOf(client.call("managed-provider", "mutate", { n: 1 }, { timeoutMs: 60 }))).toMatchObject({
         kind: "outcome_unknown",
         code: "deadline_exceeded_no_drop_observed",
       });
@@ -1278,7 +1271,7 @@ describe("managed route.open across a module restart", () => {
     const connFile = await restartingDaemon(clock, 60_000);
     const client = await SubcClient.connect({ connectionFile: connFile, identity: IDENTITY, now: clock.now, sleep: clock.sleep });
     try {
-      await expect(client.call("restarting", "echo", { n: 1 })).resolves.toEqual({ method: "echo", params: { n: 1 } });
+      expect(await client.call<unknown>("restarting", "echo", { n: 1 })).toEqual({ method: "echo", params: { n: 1 } });
       expect(clock.now()).toBeGreaterThanOrEqual(60_000);
     } finally {
       client.close();
@@ -1290,7 +1283,7 @@ describe("managed route.open across a module restart", () => {
     const connFile = await restartingDaemon(clock, 60_000);
     const client = await SubcClient.connect({ connectionFile: connFile, identity: IDENTITY, now: clock.now, sleep: clock.sleep });
     try {
-      await expect(client.call("restarting", "echo", { n: 1 }, { timeoutMs: 10_000 })).rejects.toMatchObject({
+      expect(await rejectionOf(client.call("restarting", "echo", { n: 1 }, { timeoutMs: 10_000 }))).toMatchObject({
         kind: "not_sent",
         code: "module_reloading",
       });
@@ -1452,7 +1445,7 @@ describe("scoped route opens", () => {
       writeConnectionFile(connFile, daemon.port);
       const client = await SubcClient.connect({ connectionFile: connFile, identity: IDENTITY });
       try {
-        await expect(client.call("proof-provider", "echo", {}, { scope, consumerIdentity: null })).rejects.toMatchObject({ code, kind: "terminal" });
+        expect(await rejectionOf(client.call("proof-provider", "echo", {}, { scope, consumerIdentity: null }))).toMatchObject({ code, kind: "terminal" });
         expect(stats.routeOpens).toBe(1);
         expect(stats.dataRequests).toBe(0);
       } finally { client.close(); }
@@ -1536,9 +1529,9 @@ describe("scoped route opens", () => {
       for (const selector of invalid) {
         const code = (selector as { scopeEpoch?: unknown }).scopeEpoch === undefined ? "scope_epoch_required" : "invalid_scope";
         const opts = { scope: selector as RouteScope, consumerIdentity: null };
-        await expect(client.routeOpen({ kind: "management_surface", module_id: "invalid" }, IDENTITY, opts)).rejects.toMatchObject({ code });
-        await expect(client.call("invalid", "echo", {}, opts)).rejects.toMatchObject({ code });
-        await expect(client.callBinary("invalid", new Uint8Array(), opts)).rejects.toMatchObject({ code });
+        expect(await rejectionOf(client.routeOpen({ kind: "management_surface", module_id: "invalid" }, IDENTITY, opts))).toMatchObject({ code });
+        expect(await rejectionOf(client.call("invalid", "echo", {}, opts))).toMatchObject({ code });
+        expect(await rejectionOf(client.callBinary("invalid", new Uint8Array(), opts))).toMatchObject({ code });
       }
       expect(stats.routeOpens).toBe(0);
       expect(stats.dataRequests).toBe(0);
@@ -1559,7 +1552,7 @@ describe("scoped route opens", () => {
     const client = await SubcClient.connect({ connectionFile: connFile, identity: IDENTITY });
     try {
       for (const kind of ["direct", "unverified"] as const) {
-        await expect(client.call("policy", "echo", {}, { scope: { ...scope, owner: { kind } }, consumerIdentity: null })).rejects.toMatchObject({ code: "scope_not_live", kind: "terminal" });
+        expect(await rejectionOf(client.call("policy", "echo", {}, { scope: { ...scope, owner: { kind } }, consumerIdentity: null }))).toMatchObject({ code: "scope_not_live", kind: "terminal" });
       }
       expect(stats.routeOpenBodies.map((body) => JSON.parse(body.toString()).scope.owner)).toEqual([{ kind: "direct" }, { kind: "unverified" }]);
     } finally { client.close(); }
@@ -1603,7 +1596,7 @@ describe("scoped route opens", () => {
       writeConnectionFile(connFile, daemon.port);
       const client = await SubcClient.connect({ connectionFile: connFile, identity: IDENTITY, reconnectBackoff: BACKOFF });
       try {
-        await expect(client.call("retry", "echo", {}, { scope, consumerIdentity: null, timeoutMs: 500 })).resolves.toEqual({ method: "echo", params: {} });
+        expect(await client.call<unknown>("retry", "echo", {}, { scope, consumerIdentity: null, timeoutMs: 500 })).toEqual({ method: "echo", params: {} });
         expect(stats.routeOpens).toBe(3);
         expect(stats.routeOpenBodies[1]).toEqual(stats.routeOpenBodies[0]);
         expect(stats.routeOpenBodies[2]).toEqual(stats.routeOpenBodies[0]);
@@ -1619,7 +1612,7 @@ describe("scoped route opens", () => {
       const client = await SubcClient.connect({ connectionFile: connFile, identity: IDENTITY, reconnectBackoff: BACKOFF,
         now: () => clock.now, random: () => 1, sleep: async (ms) => { clock.now += ms; } });
       try {
-        await expect(client.call("retry", "echo", {}, { scope, consumerIdentity: null, timeoutMs: 20 })).rejects.toMatchObject({ code, kind: "not_sent" });
+        expect(await rejectionOf(client.call("retry", "echo", {}, { scope, consumerIdentity: null, timeoutMs: 20 }))).toMatchObject({ code, kind: "not_sent" });
         expect(clock.now).toBe(20);
         expect(stats.routeOpens).toBeGreaterThan(1);
         expect(stats.dataRequests).toBe(0);

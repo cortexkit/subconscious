@@ -231,6 +231,9 @@ pub struct LiveRoot {
 /// subc's channel-0 response body for module-originated control RPCs.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "op")]
+// ScopeDescribe carries a complete stamp. Keep its public fields inline to
+// preserve the response construction API instead of boxing a single variant.
+#[allow(clippy::large_enum_variant)]
 pub enum ModuleControlResponseToModule {
     #[serde(rename = "catalog.update")]
     CatalogUpdate {},

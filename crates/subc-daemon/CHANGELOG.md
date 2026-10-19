@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.36.16
+
+- Support attribution-only `ScopeAttributes.on_behalf_of_agent` from scope-authority owners. Reject conflicting agent/delegation/flow/run attributes, validate the agent token, and close scoped routes when attribution changes. Advertise `scope-on-behalf-of/v1` in HELLO_ACK and `server.describe`; send the attribute in bind stamps only to declaring targets and in `scope.describe` replies only to declaring callers. Legacy readers never receive the field.
+
 ## 0.36.15
 
 - Project registered `ModuleManifest.operation_delivery` maps into typed `catalog.list` entries. Empty maps remain absent on the wire; unknown delivery strings are preserved. Watch hints naming missing or non-query operations do not refuse HELLO and are not subscribable according to the manifest helper. Supervisor replies do not expose manifests and are unchanged.

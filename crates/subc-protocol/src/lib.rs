@@ -178,8 +178,9 @@ pub mod error_codes {
     pub const SCOPE_EXPIRY_TOO_FAR: &str = "scope_expiry_too_far";
     /// The record changes `kind` at the same `scope_epoch`.
     pub const SCOPE_KIND_CHANGED: &str = "scope_kind_changed";
-    /// The record sets `agent_id`, `delegates`, `flow_id` or `run_id` and its
-    /// owner is not listed in the daemon's `scope_authority_owners`.
+    /// The record sets authority-controlled attributes and its owner is not
+    /// listed in `scope_authority_owners`, or combines `on_behalf_of_agent` with
+    /// `agent_id`, `delegates`, `flow_id` or `run_id`.
     pub const SCOPE_ATTRIBUTE_NOT_PERMITTED: &str = "scope_attribute_not_permitted";
     /// The record's parent link is not permitted: the parent's owner has synced
     /// and the parent is not live at the named epoch, the syncing owner is
@@ -295,7 +296,7 @@ pub enum RouteCloseReason {
     /// route's target was removed from that carrier's target list.
     ScopeCarrierRemoved,
     /// The scope's `delegates` went from true to false, or its `agent_id`,
-    /// `flow_id` or `run_id` changed.
+    /// `on_behalf_of_agent`, `flow_id` or `run_id` changed.
     ScopeDelegationChanged,
     /// The scope's parent ended, so its stamp no longer names a live parent.
     ScopeParentEnded,

@@ -81,6 +81,11 @@ Fields:
 - `attributes`, settable only by the owner, anything else refused by name:
   - `agent_id` (string): the head's agent, on every head scope. It is identity, and the value
     today's `agentProjectId` admission fact already carries.
+  - `on_behalf_of_agent` (optional string): attribution only, never authority. A provider may
+    use it to choose identity-scoped presentation (bot choice, read budgets, bound repositories)
+    and for logging. It must never treat it as authority to act as that agent, hand out the
+    agent's per-agent handles or consent on its strength, or treat it as `agent_id`.
+    Worker scopes can name their head agent here without acquiring the head's authority.
   - `delegates` (bool, default false): true lets a provider act as that agent. Refused without
     `agent_id`.
   - `flow_id` (optional string): this scope belongs to the named flow (section 2's
@@ -88,7 +93,7 @@ Fields:
   - `run_id` (optional string): this `ephemeral` scope belongs to one agent run (section 2's
     agent-run identity subsection).
 
-**Authority gate.** `agent_id`, `delegates`, `flow_id` and `run_id` may be set only by an owner listed
+**Authority gate.** `agent_id`, `on_behalf_of_agent`, `delegates`, `flow_id` and `run_id` may be set only by an owner listed
 in the daemon config key `scope_authority_owners` (today `["prefrontal-core"]`, the same module
 as `admission_facts_carrier_module_id`). A scope from any other owner may carry `kind`,
 `parent`, `child_owners`, `carriers` and `expires_at_ms`, with empty attributes; a sync or
@@ -97,6 +102,23 @@ apply that sets a gated attribute from an unlisted owner is refused per record b
 restart-required key: a change takes effect only on a daemon restart, which closes every route, so
 no live route keeps an `owner_authorized` stamp its owner has lost. Providers rely on the stamp's
 `owner_authorized` alone and keep no copy of the list (section 7).
+
+`on_behalf_of_agent` uses the agent token rule: 1–256 printable, non-space ASCII bytes
+(`0x21`–`0x7E`). Malformed tokens refuse the whole sync or apply as `invalid_control_body`.
+It is mutually exclusive with `agent_id`, `delegates: true` and `flow_id`; `run_id` requires
+`agent_id`, so it is excluded too. Conflicting combinations refuse that record in sync or
+apply as `scope_attribute_not_permitted`. Adding, changing or removing attribution within
+an epoch increases the content version and closes routes with `scope_delegation_changed`.
+An unchanged resend does neither.
+
+Owners send this attribute only after the daemon advertises `scope-on-behalf-of/v1` in
+HELLO_ACK `subc_capabilities` or `server.describe`. The daemon sends it in `route.bind`
+stamps only to targets whose captured manifest provides that same capability, stripping it
+for every other target (including one declaring only `call-modes/v1`). Unlike flow or run
+identity, removing attribution cannot grant agent authority: the scope has no `agent_id`
+or delegation. Declaring the capability promises attribution-only handling, not merely
+the ability to decode the field. The same capability gate protects describe readers:
+only a calling module declaring it receives the attribute (section 5).
 
 Bounds: at most 10,000 live scopes per owner and 4 KiB of attributes per scope; past either the
 sync or apply is refused by name and nothing is applied. Tombstones (section 6) are capped at
@@ -243,7 +265,7 @@ restart, is never locked out, and a stale connection can never overwrite a newer
   stamp, each with its own reason so a carrier can tell them apart:
   - `scope_carrier_removed`: the opener is no longer a listed carrier, or the route's target is
     no longer in its entry's `targets` (widening a list changes nothing live);
-  - `scope_delegation_changed`: `delegates` went from true to false, or `agent_id`, `flow_id` or `run_id` changed;
+  - `scope_delegation_changed`: `delegates` went from true to false, or `agent_id`, `on_behalf_of_agent`, `flow_id` or `run_id` changed;
   - `scope_ended`: the scope is gone, expired, or replaced by a higher epoch.
   - `scope_parent_ended`: the scope's parent ended (section 3).
   These are new `route.closed` reasons. Older SDKs map an unknown close reason to "do not
@@ -425,7 +447,9 @@ list.
 
 The stamp includes `attributes.run_id` when set, and `expires_at_ms` when set and the
 captured target declares `call-modes/v1`. Run and flow binds are capability-gated;
-`scope.describe` can return both identities and the deadline to any registered reader.
+`attributes.on_behalf_of_agent` is included only for `scope-on-behalf-of/v1` targets;
+`scope.describe` returns the attribution field only to calling modules declaring that
+capability; other attributes and the deadline keep their existing behavior.
 
 **Commit.** When the module acks the bind, the daemon checks the captured `(scope_epoch,
 version)` against the current record before the route becomes routable. If the scope ended or
@@ -605,6 +629,17 @@ returned without a new reader-first window. Pre-0.30 readers whose `ScopeAttribu
 reject unknown fields cannot decode such a reply; run writers must wait for the rollout
 window in section 8.
 
+`attributes.on_behalf_of_agent` is returned by describe only when the calling module's
+registered manifest provides `scope-on-behalf-of/v1`. The daemon strips it for every
+other reader, including one declaring only `call-modes/v1`, because older Rust nested
+`ScopeAttributes` decoders reject unknown fields. The scope owner's capability does not
+grant the reader support. Unregistered client connections are refused `not_registered`
+and never receive a stamp. Writers need not wait for legacy readers to upgrade.
+The Rust SDK exposes the attribute on both
+`RouteBindRequest.scope.attributes` and `ScopeDescribeReply.scope.attributes`.
+Swift's management decoder preserves unknown stamp fields; the TypeScript provider has
+no typed scope stamp and its client has no describe decoder, so neither needs a new field.
+
 How a reader holding something bound to `(owner, ref, scope_epoch)` decides, in this order:
 1. `live` with the same `scope_epoch`: use it.
 2. `live` with a different `scope_epoch`: a new session under a reused ref. Refuse by name; the
@@ -629,7 +664,7 @@ case 1. The 45 s bound applies to a call waiting now, never to a stored approval
 refusal. It sends a snapshot of live scopes, then events:
 - `{owner, ref, scope_epoch, created}` when a scope is created;
 - `{owner, ref, scope_epoch, ended}` when a scope ends;
-- `{owner, ref, scope_epoch, changed}` when its carriers, `delegates`, `agent_id`, `flow_id`, `run_id` or `parent_state`
+- `{owner, ref, scope_epoch, changed}` when its carriers, `delegates`, `agent_id`, `on_behalf_of_agent`, `flow_id`, `run_id` or `parent_state`
   change;
 - `{owner, synced, scopes: [...]}` when an owner's first sync of this incarnation is accepted,
   carrying that owner's full live set.
@@ -663,7 +698,7 @@ caller may re-open within its own deadline.
 | `scope_live_limit_exceeded` | whole sync or apply | an input list or resulting live set exceeds 10,000 scopes | no |
 | `scope_attributes_too_large` | whole sync or apply | a record's attributes exceed 4 KiB | no |
 | `scope_epoch_regressed` | per upsert in sync or apply | the epoch is lower than the one held | no |
-| `scope_attribute_not_permitted` | per upsert in sync or apply | a gated attribute from an owner not in `scope_authority_owners` | no |
+| `scope_attribute_not_permitted` | per upsert in sync or apply | a gated attribute from an owner not in `scope_authority_owners`, or `on_behalf_of_agent` with agent/delegation/flow/run attributes | no |
 | `scope_carrier_targets_invalid` | per upsert in sync or apply | a carrier's target list is empty or has more than 16 entries | no |
 | `scope_delegates_without_agent` | per upsert in sync or apply | `delegates: true` without `agent_id` | no |
 | `scope_run_id_without_agent` | per upsert in sync or apply | `run_id` without `agent_id` | no |

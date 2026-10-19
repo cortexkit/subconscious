@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.30.2
+
+- Require subc-protocol 0.32.6 and expose attribution-only `on_behalf_of_agent` through the existing `RouteBindRequest.scope.attributes` and `ScopeDescribeReply.scope.attributes` stamps. Bind handlers and describe callers receive it only when their manifest provides `scope-on-behalf-of/v1`; it is never agent authority, consent or a per-agent handle grant.
+
 ## 0.30.1
 
 - Add `Subscription::ended()` and the non-exhaustive `SubscriptionEnd` enum to retain terminal Response bytes, module `ErrorBody`, route close reasons, connection loss, cancellation and event-channel backpressure. The independent, repeatable waiter does not consume the existing one-shot `closed()` future or read frames; `closed()` keeps its existing `Result<(), CallError>` behavior.

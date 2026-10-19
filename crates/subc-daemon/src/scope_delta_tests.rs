@@ -578,6 +578,143 @@ fn scope_apply_checks_parent_links_and_cycles_against_post_delta_set() {
 }
 
 #[test]
+fn on_behalf_of_agent_with_agent_id_is_refused_by_sync_and_apply() {
+    for delta in [false, true] {
+        let (mut table, _) = clocked_table();
+        sync(&mut table, OWNER, 1, vec![]);
+        let invalid = record("s", 1).with_attributes(
+            ScopeAttributes::new()
+                .with_on_behalf_of_agent(Some("head".into()))
+                .with_agent_id(Some("agent".into())),
+        );
+        let reply = if delta {
+            apply(&mut table, 2, vec![invalid], vec![])
+        } else {
+            sync(&mut table, OWNER, 2, vec![invalid])
+        };
+        assert_eq!(
+            code(&reply),
+            Some(error_codes::SCOPE_ATTRIBUTE_NOT_PERMITTED)
+        );
+        assert_eq!(status(&table, OWNER, "s"), ScopeStatus::NotLive);
+    }
+}
+
+#[test]
+fn on_behalf_of_agent_forbids_delegates_flow_and_run_and_requires_authority() {
+    let attribution = ScopeAttributes::new().with_on_behalf_of_agent(Some("head".into()));
+    for delta in [false, true] {
+        for (owner, attributes) in [
+            (OWNER, attribution.clone().with_delegates(true)),
+            (OWNER, attribution.clone().with_flow_id(Some("flow".into()))),
+            (OWNER, attribution.clone().with_run_id(Some("run".into()))),
+            (OTHER, attribution.clone()),
+        ] {
+            let (mut table, _) = clocked_table();
+            sync(&mut table, owner, 1, vec![]);
+            let invalid = record("s", 1).with_attributes(attributes);
+            let reply = if delta {
+                table
+                    .apply(
+                        owner,
+                        ConnectionId::new(1),
+                        |_| true,
+                        2,
+                        vec![invalid],
+                        vec![],
+                    )
+                    .unwrap()
+            } else {
+                sync(&mut table, owner, 2, vec![invalid])
+            };
+            assert_eq!(
+                code(&reply),
+                Some(error_codes::SCOPE_ATTRIBUTE_NOT_PERMITTED)
+            );
+            assert_eq!(status(&table, owner, "s"), ScopeStatus::NotLive);
+        }
+    }
+}
+
+#[test]
+fn on_behalf_of_agent_validates_token_bounds_in_sync_and_apply() {
+    for delta in [false, true] {
+        for token in [
+            "".into(),
+            "bad token".into(),
+            "badé".into(),
+            "x".repeat(257),
+        ] {
+            let (mut table, _) = clocked_table();
+            sync(&mut table, OWNER, 1, vec![]);
+            let invalid = record("s", 1)
+                .with_attributes(ScopeAttributes::new().with_on_behalf_of_agent(Some(token)));
+            let refusal = if delta {
+                table.apply(
+                    OWNER,
+                    ConnectionId::new(1),
+                    |_| true,
+                    2,
+                    vec![invalid],
+                    vec![],
+                )
+            } else {
+                table.sync(OWNER, ConnectionId::new(1), |_| true, 2, vec![invalid])
+            }
+            .unwrap_err();
+            assert_eq!(refusal.code, INVALID_CONTROL_BODY);
+            assert!(refusal.message.contains("on_behalf_of_agent"));
+        }
+        for token in ["!~Agent:7/worker".into(), "x".repeat(256)] {
+            let (mut table, _) = clocked_table();
+            sync(&mut table, OWNER, 1, vec![]);
+            let valid = record("s", 1)
+                .with_attributes(ScopeAttributes::new().with_on_behalf_of_agent(Some(token)));
+            let reply = if delta {
+                apply(&mut table, 2, vec![valid], vec![])
+            } else {
+                sync(&mut table, OWNER, 2, vec![valid])
+            };
+            assert_eq!(reply.results[0].outcome, ScopeRecordOutcome::Created);
+        }
+    }
+}
+
+#[test]
+fn on_behalf_of_agent_changes_move_version_and_drain_but_resends_do_not() {
+    for delta in [false, true] {
+        let (mut table, _) = clocked_table();
+        sync(&mut table, OWNER, 1, vec![record("s", 1)]);
+        let mut previous = table.owners[OWNER].live["s"].version;
+        for (generation, agent) in [(2, Some("head")), (4, Some("other-head")), (6, None)] {
+            let changed = record("s", 1).with_attributes(
+                ScopeAttributes::new().with_on_behalf_of_agent(agent.map(str::to_string)),
+            );
+            let reply = if delta {
+                apply(&mut table, generation, vec![changed.clone()], vec![])
+            } else {
+                sync(&mut table, OWNER, generation, vec![changed.clone()])
+            };
+            let next = reply.results[0].version.unwrap();
+            assert!(next > previous);
+            assert_eq!(
+                reply.tag_changes[0].drain,
+                ScopeDrain::All(RouteCloseReason::ScopeDelegationChanged)
+            );
+            previous = next;
+            let resend = if delta {
+                apply(&mut table, generation + 1, vec![changed], vec![])
+            } else {
+                sync(&mut table, OWNER, generation + 1, vec![changed])
+            };
+            assert_eq!(resend.results[0].outcome, ScopeRecordOutcome::Unchanged);
+            assert_eq!(resend.results[0].version, Some(previous));
+            assert!(resend.tag_changes.is_empty());
+        }
+    }
+}
+
+#[test]
 fn run_id_rules_and_expiry_attribute_authority_are_distinct() {
     let (mut table, _) = clocked_table();
     let run = ScopeAttributes::new().with_run_id(Some("run:7".into()));

@@ -5,6 +5,7 @@ use subc_protocol::{
         validate_run_id, ParentState, ScopeAttributes, ScopeCarrier, ScopeEnd, ScopeEndOutcome,
         ScopeEndResult, ScopeKind, ScopeParent, ScopeRecord, ScopeStamp,
         AGENT_RUN_SCOPES_CAPABILITY, MAX_SCOPE_EXPIRY_AHEAD_MS, SCOPE_APPLY_OP,
+        SCOPE_ON_BEHALF_OF_CAPABILITY,
     },
     session::{ModuleControlRequestFromModule, ModuleControlResponseToModule},
     tool_call::OpaqueFieldError,
@@ -59,6 +60,7 @@ fn scope_construction_api_sets_required_and_optional_fields_from_a_dependent_cra
     }
     assert_eq!(SCOPE_APPLY_OP, "scope.apply");
     assert_eq!(AGENT_RUN_SCOPES_CAPABILITY, "agent-run-scopes/v1");
+    assert_eq!(SCOPE_ON_BEHALF_OF_CAPABILITY, "scope-on-behalf-of/v1");
     assert_eq!(MAX_SCOPE_EXPIRY_AHEAD_MS, 86_400_000);
 }
 
@@ -94,6 +96,8 @@ fn scope_construction_defaults_omit_new_fields_and_builders_can_clear_optionals(
     assert!(ScopeAttributes::new()
         .with_agent_id(Some("agent-7".to_string()))
         .with_agent_id(None)
+        .with_on_behalf_of_agent(Some("agent-7".to_string()))
+        .with_on_behalf_of_agent(None)
         .with_delegates(true)
         .with_delegates(false)
         .with_flow_id(Some("flow:7".to_string()))
@@ -106,6 +110,34 @@ fn scope_construction_defaults_omit_new_fields_and_builders_can_clear_optionals(
             .with_targets(Some(vec!["run-provider".to_string()]))
             .with_targets(None),
         ScopeCarrier::new(Principal::Direct)
+    );
+}
+
+#[test]
+fn on_behalf_of_agent_round_trips_on_records_and_bind_stamps() {
+    let attributes = ScopeAttributes::new().with_on_behalf_of_agent(Some("agent-7".into()));
+    assert!(!attributes.is_empty());
+    let record =
+        ScopeRecord::new("worker", 1, ScopeKind::Ephemeral).with_attributes(attributes.clone());
+    let encoded = serde_json::to_value(&record).unwrap();
+    assert_eq!(
+        encoded["attributes"],
+        json!({"on_behalf_of_agent": "agent-7"})
+    );
+    assert_eq!(
+        serde_json::from_value::<ScopeRecord>(encoded).unwrap(),
+        record
+    );
+    let stamp = ScopeStamp::new(Principal::Direct, "worker", 1, ScopeKind::Ephemeral)
+        .with_attributes(attributes);
+    let encoded = serde_json::to_value(&stamp).unwrap();
+    assert_eq!(
+        encoded["attributes"],
+        json!({"on_behalf_of_agent": "agent-7"})
+    );
+    assert_eq!(
+        serde_json::from_value::<ScopeStamp>(encoded).unwrap(),
+        stamp
     );
 }
 

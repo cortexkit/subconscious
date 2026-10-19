@@ -935,6 +935,7 @@ impl ControlHandler {
                 subc_protocol::manifest::CAP_SCOPE_BIND_PROOF_V1.to_string(),
                 subc_protocol::manifest::CAP_SCOPE_BIND_PROOF_V2.to_string(),
                 subc_protocol::manifest::CAP_SCOPE_REPLACE_IF_IDLE_V1.to_string(),
+                subc_protocol::scope::SCOPE_ON_BEHALF_OF_CAPABILITY.to_string(),
                 subc_control::ACTIVITY_LEDGER_CAPABILITY.to_string(),
             ]),
             route_bind_relay_timeout: DEFAULT_ROUTE_BIND_RELAY_TIMEOUT,
@@ -3244,18 +3245,34 @@ impl ControlHandler {
             .registry
             .get_module_by_connection(connection_id)
             .map_err(|err| RouterError::backend(0, frame.header.corr, err.to_string()))?;
-        if registered.is_none() {
+        let Some(registered) = registered else {
             return Ok(vec![control_error_frame(
                 &frame,
                 "not_registered",
                 "scope.describe requires an active module registration owned by this connection",
             )?]);
-        }
-        let description = self
+        };
+        let mut description = self
             .scopes
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .describe(&owner, &scope_ref);
+        // Describe readers also decode strict ScopeAttributes. Attribution is
+        // safe to omit unless the requesting module declares it understands it.
+        if !registered
+            .manifest
+            .capabilities
+            .as_ref()
+            .is_some_and(|caps| {
+                caps.provides
+                    .iter()
+                    .any(|cap| cap == subc_protocol::scope::SCOPE_ON_BEHALF_OF_CAPABILITY)
+            })
+        {
+            if let Some(stamp) = description.stamp.as_mut() {
+                stamp.attributes.on_behalf_of_agent = None;
+            }
+        }
         let owner_configured = match &owner {
             // Ask whether the owner is configured (`is_configured`), not
             // whether it is on the roster (`get(..).is_some()`): a supervised
@@ -4709,8 +4726,17 @@ impl ControlHandler {
             }
         }
 
-        // Older readers may reject unknown fields. Select both new fields from
+        // Older readers may reject unknown fields. Select optional fields from
         // the captured endpoint's declaration, including on unscoped binds.
+        if !relay_capabilities.is_some_and(|caps| {
+            caps.provides
+                .iter()
+                .any(|cap| cap == subc_protocol::scope::SCOPE_ON_BEHALF_OF_CAPABILITY)
+        }) {
+            if let Some(stamp) = scope_stamp.as_mut() {
+                stamp.attributes.on_behalf_of_agent = None;
+            }
+        }
         let call_mode = if relay_capabilities
             .is_some_and(|caps| caps.provides.iter().any(|cap| cap == CALL_MODES_CAPABILITY))
         {
@@ -11374,6 +11400,40 @@ mod tests {
         assert!(capabilities
             .iter()
             .any(|c| c == subc_protocol::manifest::CAP_SCOPE_BIND_PROOF_V2));
+    }
+
+    #[tokio::test]
+    async fn scope_on_behalf_of_capability_is_advertised_in_hello_ack_and_server_describe() {
+        let handler = ControlHandler::new(Arc::new(Registry::default()));
+        let (module, mut rx) = route_ctx(ConnectionId::new(156));
+        let ack = hello_via_sink(
+            &handler,
+            &module,
+            &mut rx,
+            hello_frame("attribution-owner", PROTOCOL_VERSION, 1),
+        )
+        .await;
+        assert!(parse_ack(&ack)
+            .subc_capabilities
+            .iter()
+            .any(|cap| cap == subc_protocol::scope::SCOPE_ON_BEHALF_OF_CAPABILITY));
+        let (client, _rx) = route_ctx(ConnectionId::new(157));
+        let body = serde_json::to_vec(&ClientControlRequest::ServerDescribe {}).unwrap();
+        let frame = Frame::build(FrameType::Request, control_flags(), 0, 0, 5, body).unwrap();
+        let reply = handler
+            .handle_control_frame(&client, frame)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let ClientControlResponse::ServerDescribe { capabilities, .. } =
+            serde_json::from_slice(&reply.body).unwrap()
+        else {
+            panic!("server.describe reply")
+        };
+        assert!(capabilities
+            .iter()
+            .any(|cap| cap == subc_protocol::scope::SCOPE_ON_BEHALF_OF_CAPABILITY));
     }
 
     #[tokio::test]

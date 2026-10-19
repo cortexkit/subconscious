@@ -248,6 +248,7 @@ fn drain_for_change(before: &LiveScope, after: &LiveScope) -> ScopeDrain {
     let after_attributes = &after.record.attributes;
     if (before_attributes.delegates && !after_attributes.delegates)
         || before_attributes.agent_id != after_attributes.agent_id
+        || before_attributes.on_behalf_of_agent != after_attributes.on_behalf_of_agent
         || before_attributes.flow_id != after_attributes.flow_id
         || before_attributes.run_id != after_attributes.run_id
     {
@@ -1232,6 +1233,14 @@ impl ScopeTable {
                     message: error.to_string(),
                 })?;
             }
+            if let Some(agent) = &record.attributes.on_behalf_of_agent {
+                subc_protocol::scope::validate_on_behalf_of_agent(agent).map_err(|error| {
+                    SyncRefusal {
+                        code: INVALID_CONTROL_BODY,
+                        message: error.to_string(),
+                    }
+                })?;
+            }
             let attribute_bytes = serde_json::to_vec(&record.attributes)
                 .map(|bytes| bytes.len())
                 .unwrap_or(usize::MAX);
@@ -1302,8 +1311,20 @@ impl ScopeTable {
         if !record.attributes.is_empty() && !owner_authorized {
             return Some((
                 error_codes::SCOPE_ATTRIBUTE_NOT_PERMITTED,
-                "agent_id, delegates, flow_id and run_id may be set only by an owner listed in \
+                "agent_id, on_behalf_of_agent, delegates, flow_id and run_id may be set only by an owner listed in \
                  scope_authority_owners"
+                    .to_string(),
+            ));
+        }
+        if record.attributes.on_behalf_of_agent.is_some()
+            && (record.attributes.agent_id.is_some()
+                || record.attributes.delegates
+                || record.attributes.flow_id.is_some()
+                || record.attributes.run_id.is_some())
+        {
+            return Some((
+                error_codes::SCOPE_ATTRIBUTE_NOT_PERMITTED,
+                "on_behalf_of_agent cannot accompany agent_id, delegates, flow_id or run_id"
                     .to_string(),
             ));
         }

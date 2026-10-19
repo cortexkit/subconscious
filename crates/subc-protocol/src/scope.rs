@@ -183,7 +183,13 @@ pub const FLOW_SCOPES_CAPABILITY: &str = "flow-scopes/v1";
 /// [`crate::call_mode::CALL_MODES_CAPABILITY`] instead.
 pub const AGENT_RUN_SCOPES_CAPABILITY: &str = "agent-run-scopes/v1";
 
-/// The authority attributes the daemon copies into scope stamps unchanged.
+/// Declaring this in a manifest's `capabilities.provides` promises that the
+/// module recognises `on_behalf_of_agent` as attribution only, never authority.
+/// The daemon also advertises this capability to scope-authority owners.
+pub const SCOPE_ON_BEHALF_OF_CAPABILITY: &str = "scope-on-behalf-of/v1";
+
+/// The authority-controlled attributes the daemon copies into scope stamps,
+/// subject to each field's target capability gate.
 /// Only an owner module named in the daemon config's `scope_authority_owners`
 /// list (by default the module that owns agent sessions) may set them; a scope
 /// owned by any other module must leave them empty.
@@ -194,6 +200,21 @@ pub struct ScopeAttributes {
     /// The agent the scope's session belongs to. Identity, never permission.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_id: Option<String>,
+    /// Attribution only, never authority. A provider may use this to choose
+    /// identity-scoped presentation (bot choice, read budgets, bound
+    /// repositories) and for logging. It must never treat this as authority to
+    /// act as that agent, hand out the agent's per-agent handles or consent on
+    /// its strength, or treat it as `agent_id`.
+    ///
+    /// Set only by a scope-authority owner and validated with `agent_id`'s
+    /// token rule. Mutually exclusive with `agent_id`, `delegates` and `flow_id`;
+    /// `run_id` requires `agent_id` and is therefore excluded too. Adding,
+    /// changing or removing this within an epoch increments the content version
+    /// and closes routes with `scope_delegation_changed`. Bind stamps include
+    /// it only for targets providing [`SCOPE_ON_BEHALF_OF_CAPABILITY`]; describe
+    /// replies include it only for callers providing that capability.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_behalf_of_agent: Option<String>,
     /// Whether a provider may act as `agent_id`. Refused without `agent_id`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub delegates: bool,
@@ -239,6 +260,12 @@ impl ScopeAttributes {
     }
 
     #[must_use]
+    pub fn with_on_behalf_of_agent(mut self, on_behalf_of_agent: Option<String>) -> Self {
+        self.on_behalf_of_agent = on_behalf_of_agent;
+        self
+    }
+
+    #[must_use]
     pub fn with_delegates(mut self, delegates: bool) -> Self {
         self.delegates = delegates;
         self
@@ -258,6 +285,7 @@ impl ScopeAttributes {
 
     pub fn is_empty(&self) -> bool {
         self.agent_id.is_none()
+            && self.on_behalf_of_agent.is_none()
             && !self.delegates
             && self.flow_id.is_none()
             && self.run_id.is_none()
@@ -275,6 +303,12 @@ pub fn validate_flow_id(flow_id: &str) -> Result<(), crate::tool_call::OpaqueFie
 /// `0x21`–`0x7E`. Errors name `run_id`.
 pub fn validate_run_id(run_id: &str) -> Result<(), crate::tool_call::OpaqueFieldError> {
     crate::tool_call::validate_opaque_field("run_id", run_id)
+}
+
+/// Check attribution using the agent token rule: 1–256 printable, non-space
+/// ASCII bytes. Errors name `on_behalf_of_agent`.
+pub fn validate_on_behalf_of_agent(agent: &str) -> Result<(), crate::tool_call::OpaqueFieldError> {
+    crate::tool_call::validate_opaque_field("on_behalf_of_agent", agent)
 }
 
 /// One scope as its owner registers it in `scope.sync` or `scope.apply`.

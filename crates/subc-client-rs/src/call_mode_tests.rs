@@ -78,6 +78,20 @@ async fn decoded_bind(scope: Option<serde_json::Value>, mode: Option<&str>) -> R
 }
 
 #[tokio::test]
+async fn on_behalf_of_agent_is_exposed_to_bind_handlers_without_agent_authority() {
+    let request = decoded_bind(
+        Some(scope(json!({"on_behalf_of_agent": "head-agent"}))),
+        None,
+    )
+    .await;
+    assert_eq!(request.call_mode, CallMode::Classic);
+    let attributes = request.scope.unwrap().attributes;
+    assert_eq!(attributes.on_behalf_of_agent.as_deref(), Some("head-agent"));
+    assert_eq!(attributes.agent_id, None);
+    assert!(!attributes.delegates);
+}
+
+#[tokio::test]
 async fn absent_call_mode_on_a_run_bind_reads_codemode() {
     let request = decoded_bind(Some(scope(json!({ "run_id": "run-a" }))), None).await;
     assert_eq!(request.call_mode, CallMode::Codemode);

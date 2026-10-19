@@ -300,7 +300,9 @@ pub struct ScopeDescribeReply {
     pub owner_synced: bool,
     /// Whether the owner is a module in the daemon's supervised roster.
     pub owner_configured: bool,
-    /// The stamped fields, present only when `status` is `live`.
+    /// The stamped fields, present only when `status` is `live`. The daemon
+    /// includes `attributes.on_behalf_of_agent` only when this module's manifest
+    /// provides `scope-on-behalf-of/v1`; the field is attribution, never authority.
     pub scope: Option<ScopeStamp>,
 }
 
@@ -1713,7 +1715,9 @@ pub struct RouteBindRequest {
     pub admission_facts: Option<serde_json::Value>,
     /// The daemon's stamp of the scope the route was admitted under (owner,
     /// ref, epoch, kind, attributes), copied from the bind unchanged. It is
-    /// the daemon's, never the opener's, so a provider may act on it, and it
+    /// the daemon's, never the opener's. `attributes.on_behalf_of_agent` is
+    /// attribution only, never authority, consent or access to per-agent handles.
+    /// A target must declare `scope-on-behalf-of/v1` to receive that field. The stamp
     /// is fixed for the route's life: a change that revokes authority closes
     /// the route. `None` means the route was opened without a scope, or by a
     /// daemon that predates scopes.

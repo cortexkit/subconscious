@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.32.6
+
+- Add optional `ScopeAttributes.on_behalf_of_agent` and its builder: attribution only, never authority or `agent_id`. Authority owners may set it using the agent token rule, but not alongside `agent_id`, `delegates`, `flow_id` or `run_id`. Changes rotate the content version and close routes. The daemon advertises `scope::SCOPE_ON_BEHALF_OF_CAPABILITY` (`scope-on-behalf-of/v1`) and includes the field in bind stamps only for targets declaring it, and in describe replies only for callers declaring it.
+
 ## 0.32.5
 
 - Add `ModuleManifest.operation_delivery` and its builder setter: a map from management operation names to open `OperationDelivery` strings. Empty maps are omitted, preserving existing manifest bytes. `OperationDelivery::WATCH` and `is_watch()` recognize exactly `"watch"`; unknown strings round-trip without becoming subscribable.

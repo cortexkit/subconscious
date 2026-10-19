@@ -42,6 +42,154 @@ fn assert_golden(bind: &Frame, golden: &str) {
 }
 
 #[tokio::test]
+async fn on_behalf_of_agent_bind_stamp_bytes_are_gated_by_target_capability() {
+    for provides in [
+        vec![],
+        vec![CALL_MODES_CAPABILITY],
+        vec![subc_protocol::scope::SCOPE_ON_BEHALF_OF_CAPABILITY],
+    ] {
+        let mut rig = call_mode_rig(&provides).await;
+        rig.sync(vec![session(1).with_attributes(
+            ScopeAttributes::new().with_on_behalf_of_agent(Some("head-agent".into())),
+        )])
+        .await;
+        let route = rig
+            .bound(Some(AFT), PLEXUS, Some(rig_selector("s", Some(1))))
+            .await;
+        assert!(rig.live(&route));
+        let body: Value = serde_json::from_slice(&route.bind.body).unwrap();
+        let expected = if provides.contains(&subc_protocol::scope::SCOPE_ON_BEHALF_OF_CAPABILITY) {
+            serde_json::json!({"on_behalf_of_agent": "head-agent"})
+        } else {
+            serde_json::json!({})
+        };
+        assert_eq!(
+            body["scope"]
+                .get("attributes")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({})),
+            expected
+        );
+        assert_eq!(
+            std::str::from_utf8(&route.bind.body)
+                .unwrap()
+                .contains(r#""on_behalf_of_agent":"head-agent""#),
+            provides.contains(&subc_protocol::scope::SCOPE_ON_BEHALF_OF_CAPABILITY),
+        );
+        assert!(body["scope"]["attributes"].get("agent_id").is_none());
+        assert!(body["scope"]["attributes"].get("delegates").is_none());
+    }
+}
+
+#[tokio::test]
+async fn on_behalf_of_agent_describe_reply_bytes_are_gated_by_caller_capability() {
+    for provides in [
+        vec![],
+        vec![CALL_MODES_CAPABILITY],
+        vec![subc_protocol::scope::SCOPE_ON_BEHALF_OF_CAPABILITY],
+    ] {
+        let mut rig = call_mode_rig(&provides).await;
+        rig.sync(vec![ScopeRecord::new("s", 1, ScopeKind::Worker)
+            .with_attributes(
+                ScopeAttributes::new().with_on_behalf_of_agent(Some("head-agent".into())),
+            )])
+        .await;
+        let request = ModuleControlRequestFromModule::ScopeDescribe {
+            owner: Principal::Reserved {
+                module_id: OWNER.into(),
+            },
+            scope_ref: "s".into(),
+        };
+        let reply = call(&rig.handler, &rig.modules[PLEXUS].0, &request).await;
+        assert_eq!(reply.header.ty, FrameType::Response);
+        let body: Value = serde_json::from_slice(&reply.body).unwrap();
+        let supported = provides.contains(&subc_protocol::scope::SCOPE_ON_BEHALF_OF_CAPABILITY);
+        let expected = if supported {
+            serde_json::json!({"on_behalf_of_agent": "head-agent"})
+        } else {
+            serde_json::json!({})
+        };
+        assert_eq!(body["scope"]["kind"], "worker");
+        assert_eq!(
+            body["scope"]
+                .get("attributes")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({})),
+            expected
+        );
+        assert_eq!(
+            std::str::from_utf8(&reply.body)
+                .unwrap()
+                .contains(r#""on_behalf_of_agent":"head-agent""#),
+            supported
+        );
+        let decoded: ModuleControlResponseToModule = serde_json::from_slice(&reply.body).unwrap();
+        let ModuleControlResponseToModule::ScopeDescribe {
+            scope: Some(stamp), ..
+        } = decoded
+        else {
+            panic!("live scope.describe reply");
+        };
+        assert_eq!(
+            stamp.attributes.on_behalf_of_agent.as_deref(),
+            supported.then_some("head-agent")
+        );
+
+        // Even the scope owner must declare reader support; ownership is not a capability.
+        let legacy = call(&rig.handler, &rig.owner, &request).await;
+        assert_eq!(legacy.header.ty, FrameType::Response);
+        assert!(!std::str::from_utf8(&legacy.body)
+            .unwrap()
+            .contains("on_behalf_of_agent"));
+        let (direct, _rx) = wide_ctx(999);
+        let refused = call(&rig.handler, &direct, &request).await;
+        assert_eq!(refused.header.ty, FrameType::Error);
+        assert_eq!(parse_error(&refused)["code"], "not_registered");
+        assert!(!std::str::from_utf8(&refused.body)
+            .unwrap()
+            .contains("on_behalf_of_agent"));
+    }
+}
+
+#[tokio::test]
+async fn on_behalf_of_agent_changes_close_live_routes() {
+    for delta in [false, true] {
+        let mut rig = call_mode_rig(&[subc_protocol::scope::SCOPE_ON_BEHALF_OF_CAPABILITY]).await;
+        rig.sync(vec![session(1)]).await;
+        for (generation, agent) in [(2, Some("head")), (3, Some("other-head")), (4, None)] {
+            let mut route = rig
+                .bound(Some(AFT), PLEXUS, Some(rig_selector("s", Some(1))))
+                .await;
+            let changed = session(1).with_attributes(
+                ScopeAttributes::new().with_on_behalf_of_agent(agent.map(str::to_string)),
+            );
+            if delta {
+                let reply = call(
+                    &rig.handler,
+                    &rig.owner,
+                    &ModuleControlRequestFromModule::ScopeApply {
+                        generation,
+                        upsert: vec![changed],
+                        end: vec![],
+                    },
+                )
+                .await;
+                assert_eq!(reply.header.ty, FrameType::Response);
+            } else {
+                rig.sync(vec![changed]).await;
+            }
+            assert_eq!(
+                route.closed_reason(),
+                RouteCloseReason::ScopeDelegationChanged
+            );
+            assert!(!rig.live(&route));
+            let goodbye = rig.modules.get_mut(PLEXUS).unwrap().1.try_recv().unwrap();
+            assert_eq!(goodbye.frame.header.ty, FrameType::Goodbye);
+        }
+    }
+}
+
+#[tokio::test]
 async fn call_modes_declarer_stamps_classic_codemode_flow_and_deadlines() {
     for (record, mode) in [
         (None, "classic"),

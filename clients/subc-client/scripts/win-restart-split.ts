@@ -60,7 +60,8 @@ function log(role: string, message: string): void {
   console.log(`RESTARTDIAG t=${(performance.now() - started).toFixed(1)}ms role=${role} pid=${process.pid} ${message}`);
 }
 
-// Same layout and permissions as the test's writeConnectionFile (2011-2025).
+// Same layout and permissions as writeConnectionFile in
+// tests/managed-client.test.ts (lines 2011-2025).
 // The pid is the fake daemon's; the client does not check it.
 function writeConnectionFile(path: string, port: number, key: Uint8Array, pid: number): void {
   writeFileSync(path, JSON.stringify({
@@ -230,7 +231,7 @@ async function runServer(scenario: Scenario, connFile: string): Promise<void> {
 
 export type CallCheck = (call: Promise<unknown>, expected: unknown) => Promise<void>;
 
-// Same polling as the test's waitFor (2038-2045).
+// Same polling as waitFor in tests/managed-client.test.ts (lines 2038-2045).
 async function waitFor(predicate: () => boolean, label: string): Promise<void> {
   const deadline = Date.now() + 2_000;
   while (Date.now() < deadline) {

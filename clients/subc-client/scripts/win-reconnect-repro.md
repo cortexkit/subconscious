@@ -231,8 +231,9 @@ Reading the rows: a `client` crash in `split-*-run` means a Bun process running
 only the managed client crashed while its separate fake daemon restarted. A
 `client` crash only in `split-*-test` points at the client running under
 bun:test. A `server` crash concerns the fake daemon's process, which real users
-replace with the Rust daemon. No crash in any split row while the real rows
-still crash in the same job means these sequences crashed only with the fake
+replace with the Rust daemon. No crash in any `split-*` row while the
+`real-*-alone` rows (the original tests, same runner and Bun version) still
+crash means these sequences crashed only with the fake
 daemon and client in one process. Five passes are a non-reproduction, not
 evidence of safety; the real daemon and real backoff timings are not part of
 any row.

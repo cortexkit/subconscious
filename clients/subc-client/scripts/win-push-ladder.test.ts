@@ -88,7 +88,8 @@ interface FakeDaemon { port: number; stop(): Promise<void> }
 const tempDirs: string[] = [];
 const daemons: FakeDaemon[] = [];
 
-// Lines 136-139, with each step logged.
+// The real test's afterEach (managed-client.test.ts:136-139): stop every
+// registered fake daemon and remove the temp dirs, logging each step.
 afterEach(async () => {
   log("hook", `afterEach-start daemons=${daemons.length} tempDirs=${tempDirs.length}`);
   for (const daemon of daemons.splice(0)) await daemon.stop();
@@ -96,7 +97,8 @@ afterEach(async () => {
   log("hook", "afterEach-done");
 });
 
-// The handshake as the real test checks it, with bun:test expect (1855-1880).
+// The handshake as the real test checks it, with bun:test expect
+// (managed-client.test.ts:1855-1880).
 async function authenticateWithExpect(reader: SocketReader, socket: Socket, deadline: number): Promise<void> {
   const hello = await readAuthMessage<{ client_nonce: number[]; role: string }>(reader, deadline);
   expect(hello.role).toBe("client");
@@ -161,7 +163,7 @@ async function writeLogged(socket: Socket, frame: Frame, label: string, deadline
   });
 }
 
-// handleFakeConnection (1616-1673), reduced to the arms this test reaches:
+// managed-client.test.ts handleFakeConnection (lines 1616-1673), reduced to the arms this test reaches:
 // Ping, and catalog.list with controlPushesBeforeCatalogList.
 async function handleFakeConnection(socket: Socket, stats: FakeStats, has: (d: Diff) => boolean): Promise<void> {
   const reader = new SocketReader(socket);
@@ -196,7 +198,8 @@ async function handleFakeConnection(socket: Socket, stats: FakeStats, has: (d: D
   }
 }
 
-// startFakeDaemon (1586-1614), with the stop steps logged.
+// managed-client.test.ts startFakeDaemon (lines 1586-1614), with the stop
+// steps logged.
 async function startFakeDaemon(stats: FakeStats, has: (d: Diff) => boolean, register: boolean): Promise<FakeDaemon> {
   const sockets = new Set<Socket>();
   const server = createServer((socket) => {

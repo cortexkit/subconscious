@@ -42,7 +42,8 @@ is no refused-route/concurrent-call scenario.
 ## Windows matrix and interpretation
 
 Push only to `train/win-bun-*` to run `win-bun-repro.yml`. It installs `latest`,
-runs all four layouts, then installs `1.3.14` and repeats all four, sequentially.
+runs all four layouts plus the two bun:test rows below, then installs `1.3.14`
+and repeats all six rows, sequentially.
 The pinned version is the highest 1.3 release listed on
 <https://bun.com/blog> and has a verified release at
 <https://github.com/oven-sh/bun/releases/tag/bun-v1.3.14>.
@@ -57,6 +58,34 @@ records the observer's native exit code if the observer itself crashes.
 | `split` | Whether a managed client or separate fake daemon can crash without sharing a runtime | Whether that split-process result differs under the older runtime |
 | `raw same-process` | Whether a plain node:net close/reconnect workload can crash without subc-client loaded | Whether that raw shared-runtime result also occurs under the older runtime |
 | `raw split` | Whether plain node:net can crash across process isolation, and on which side | Whether that raw split-process result differs under the older runtime |
+| `under-test` | Whether the same managed/raw loops reproduce inside bun:test, in contrast to standalone execution | Whether the in-runner behavior differs under the older runtime |
+| `managed-baseline-5x` | How many of five fresh runs of the real managed-client suite crash in this same job | The equivalent five-run baseline under the older runtime |
+
+The `under-test` row runs `bun test scripts/win-reconnect-under-test.test.ts`
+with `WIN_BUN_REPRO=1`. Both tests run directly inside the test runner: no
+observer or workload subprocess is involved. Each does 50 iterations, with 100
+echoes/connections and 99 reconnects; the managed test also checks 100 route opens.
+The wrapper requires both tests to pass, so accidentally omitting the opt-in
+cannot report a passing row with skipped workloads. A bare `bun test` discovers
+the file under scripts/ but skips both tests unless the environment opt-in is set.
+For local use from clients/subc-client:
+
+```sh
+WIN_BUN_REPRO=1 bun test scripts/win-reconnect-under-test.test.ts
+```
+
+The two tests share the runner process; the raw test does not call subc-client,
+but the managed test loads the library in that process. The standalone raw rows
+remain the controls with no subc-client imports. A failing in-runner row's log
+identifies the active workload; the row alone does not identify which test died.
+
+The baseline invokes `bun test tests/managed-client.test.ts` five times as fresh
+native processes, continuing after each failure. JSON and the summary record
+crashes out of five, every native exit code, and ordinary failures separately.
+Crash detection uses Bun panic/segfault text or native crash exit codes; each run
+has its own complete log. If the reduced in-runner tests pass but the baseline
+crashes, these loops alone still do not reproduce the full-suite failure. A zero
+out of five baseline is a non-reproduction in this job, not evidence of safety.
 
 A managed split **client** crash would demonstrate exposure in a separate-process
 layout like a plugin connecting to a daemon, but still against this fake daemon,

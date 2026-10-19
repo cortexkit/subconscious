@@ -121,6 +121,19 @@ async function runClient(opts: Options, port: number): Promise<void> {
   }
 }
 
+// Run the same workload in the caller's runtime, without spawning an observer or
+// worker. The bun:test diagnostic must exercise sockets inside the test runner.
+export async function runSameProcess(kind: Options["kind"], iterations: number): Promise<Stats> {
+  const opts: Options = { kind, topology: "same-process", iterations, timeoutMs: 120_000 };
+  const server = await startWorkloadServer(opts);
+  try {
+    await runClient(opts, server.port);
+  } finally {
+    await server.stop();
+  }
+  return server.stats;
+}
+
 async function runWorker(opts: Options): Promise<void> {
   let server: ReproServer | undefined;
   try {
@@ -245,21 +258,23 @@ async function observe(opts: Options): Promise<void> {
   process.exitCode = status === "pass" ? 0 : 1;
 }
 
-try {
-  const opts = optionsFrom(process.argv.slice(2));
-  if (opts.role) {
-    try {
-      await runWorker(opts);
-    } catch (error) {
-      process.send?.({ type: "failure", error: String(error) });
-      throw error;
-    } finally {
-      process.disconnect?.();
+if (import.meta.main) {
+  try {
+    const opts = optionsFrom(process.argv.slice(2));
+    if (opts.role) {
+      try {
+        await runWorker(opts);
+      } catch (error) {
+        process.send?.({ type: "failure", error: String(error) });
+        throw error;
+      } finally {
+        process.disconnect?.();
+      }
+    } else {
+      await observe(opts);
     }
-  } else {
-    await observe(opts);
+  } catch (error) {
+    console.error(error);
+    process.exitCode = 1;
   }
-} catch (error) {
-  console.error(error);
-  process.exitCode = 1;
 }

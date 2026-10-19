@@ -33,8 +33,8 @@
 // Every variant, including the real one, attaches a side handler to each
 // catalog.list promise. It logs the rejection's error class, name, code,
 // kind, message, cause chain and stack, and the client state at that moment,
-// without changing what the test awaits. "real" also logs the client state
-// before each call; "real-silent" does not. The afterEach hook logs when it
+// without changing what the test awaits. Every variant except "real-silent"
+// also logs the client state before each call. The afterEach hook logs when it
 // starts and each step of the fake daemon's stop, so a run that ends in a
 // bun:test timeout shows whether the test body or the cleanup was waiting.
 import { afterEach, describe, expect, test } from "bun:test";

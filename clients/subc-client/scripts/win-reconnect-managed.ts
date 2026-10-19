@@ -5,7 +5,8 @@
 // In particular, preserve await writeFrame(...) followed immediately by
 // socket.destroy(): changing that timing would change the crash experiment.
 // The constants and handshake/frame helpers are exported for reuse by
-// win-push-timeout.test.ts, which needs the same fake-daemon handshake.
+// win-push-timeout.test.ts, win-push-ladder.test.ts and win-restart-split.ts,
+// which need the same fake-daemon handshake and frames.
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, writeFileSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";

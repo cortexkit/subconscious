@@ -105,8 +105,9 @@ An unknown reason retains its opaque body without parsing it as JSON.
   Ordered `steps` refer to frame IDs, or explicitly close the session. Each step
   has an independently authored `expect_event` or `expect_error`. Error strings
   in these files classify reference failures, not public Swift/Rust error APIs.
-- `module_subscribe.body_hex` is the required exact request delivered to the
-  module. Notice events similarly preserve bytes and order across interleaved
+- `module_subscribe.body_hex` is the exact `params` delivered to the module,
+  not the whole request: the module receives `{"method": <op>, "params": <these
+  bytes>}`, and an empty body is delivered as `"params": {}`. Notice events similarly preserve bytes and order across interleaved
   IDs and a unary reply. A refusal completes an opening attempt without an end.
 - A pre-open unsubscribe received by the server requires `fed_cancelled`, not
   open/end. An open already sent before cancellation is the ordinary open/cancel

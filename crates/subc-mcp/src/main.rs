@@ -94,6 +94,8 @@ const SUBC_CONNECTION_LOST_CODE: &str = "subc_connection_lost";
 /// Code carried by an MCP error for a request refused before it was sent
 /// because no daemon connection was available for it.
 const SUBC_CONNECTION_UNAVAILABLE_CODE: &str = "subc_connection_unavailable";
+const DAEMON_UNAVAILABLE_MESSAGE: &str = "CortexKit's daemon is not running or can't be reached on this computer, so this tool call was not sent. Retrying won't start it. Stop calling CortexKit tools and ask the user to start the daemon (run `ck setup`, or restart the CortexKit service), then try again after they confirm it is running.";
+const GATEWAY_UNAVAILABLE_MESSAGE: &str = "CortexKit's gateway is not running or can't be reached on this computer, so no tool call was sent. Retrying won't start it. Stop calling CortexKit tools and ask the user to run `ck setup` or restart the CortexKit service, then try again after they confirm it is running. The daemon's status is unknown.";
 /// Reason health.check gives, in its detail and metrics, while the module has
 /// no live relay connection.
 const RELAY_DISCONNECTED_REASON: &str = "relay_disconnected";
@@ -1461,7 +1463,7 @@ impl SubcConnection {
         {
             let mut pending = self.pending.lock().await;
             if self.is_closed() {
-                return Err(Box::new(RelayNotSent(
+                return Err(Box::new(RelayNotSent::Transient(
                     "the subc connection closed before the request was sent".to_owned(),
                 )));
             }
@@ -1475,7 +1477,7 @@ impl SubcConnection {
 
         if let Err(err) = self.tx.send(frame).await {
             self.pending.lock().await.remove(&key);
-            return Err(Box::new(RelayNotSent(format!(
+            return Err(Box::new(RelayNotSent::Transient(format!(
                 "subc writer is closed: {err}"
             ))));
         }
@@ -1493,14 +1495,22 @@ struct RelayOutage {
     reconnect_attempts: u64,
 }
 
-/// A request that never left this process because the daemon connection it
-/// was meant for had ended. Repeating it cannot repeat a side effect.
+/// A request refused before its bytes left this process. `Unavailable` means
+/// no daemon connection replaced the closed one within `SUBC_RESPONSE_TIMEOUT`.
+/// `Transient` also covers stale route handles, which must be discarded before
+/// opening new routes on the replacement connection.
 #[derive(Debug)]
-struct RelayNotSent(String);
+enum RelayNotSent {
+    Transient(String),
+    Unavailable,
+}
 
 impl std::fmt::Display for RelayNotSent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "subc request not sent: {}", self.0)
+        match self {
+            Self::Transient(reason) => write!(f, "subc request not sent: {reason}"),
+            Self::Unavailable => f.write_str(DAEMON_UNAVAILABLE_MESSAGE),
+        }
     }
 }
 
@@ -1544,7 +1554,7 @@ impl SubcClient {
     /// that rewrote it is found. The module's lifetime is owned by its
     /// supervision connection, not by this one.
     async fn connect(connection_file_path: &Path) -> Result<Self> {
-        let stream = connect_authenticated(connection_file_path).await?;
+        let stream = connect_authenticated(connection_file_path, ConnectionService::Daemon).await?;
         let (events, _events_rx) = broadcast::channel(SUBC_EVENT_BUFFER);
         let (connection, reader) = SubcConnection::start(stream, events.clone(), None);
         let client = Self::with_connection(connection, events);
@@ -1637,11 +1647,7 @@ impl SubcClient {
             }
             match time::timeout_at(deadline, updates.changed()).await {
                 Ok(Ok(())) => continue,
-                Ok(Err(_)) | Err(_) => {
-                    return Err(Box::new(RelayNotSent(format!(
-                        "the subc connection is down and was not replaced within {SUBC_RESPONSE_TIMEOUT:?}"
-                    ))))
-                }
+                Ok(Err(_)) | Err(_) => return Err(Box::new(RelayNotSent::Unavailable)),
             }
         }
     }
@@ -1677,7 +1683,7 @@ impl SubcClient {
     fn connection_for_route(&self, handle: RouteHandle) -> Result<Arc<SubcConnection>> {
         let connection = self.connection();
         if handle.connection_token != connection.connection_token {
-            return Err(Box::new(RelayNotSent(
+            return Err(Box::new(RelayNotSent::Transient(
                 "route handle belongs to a stale subc connection".to_owned(),
             )));
         }
@@ -1868,7 +1874,7 @@ async fn maintain_subc_connection(
         let mut backoff = SUBC_RECONNECT_BACKOFF_INITIAL;
         let stream = loop {
             client.outage().reconnect_attempts += 1;
-            match connect_authenticated(&connection_file_path).await {
+            match connect_authenticated(&connection_file_path, ConnectionService::Daemon).await {
                 Ok(stream) => break stream,
                 Err(error) => {
                     tracing::warn!("subc relay reconnect failed, retrying in {backoff:?}: {error}");
@@ -1991,7 +1997,8 @@ async fn run_shim(args: ShimArgs) -> Result<()> {
     let connection_file_path = args
         .module_connection_file
         .unwrap_or_else(default_module_connection_file_path);
-    let mut stream = connect_authenticated(&connection_file_path).await?;
+    let mut stream =
+        connect_authenticated(&connection_file_path, ConnectionService::Gateway).await?;
 
     let hello = ShimHello {
         schema: SHIM_SCHEMA_VERSION,
@@ -2125,7 +2132,7 @@ async fn start_supervision_connection_if_configured(
         }
     };
 
-    let mut stream = connect_authenticated(connection_file_path).await?;
+    let mut stream = connect_authenticated(connection_file_path, ConnectionService::Daemon).await?;
     send_supervision_hello(&mut stream, &module_id).await?;
     let task_module_id = module_id.clone();
     let task = tokio::spawn(async move {
@@ -5335,18 +5342,19 @@ fn subc_error_to_mcp(prefix: &str, body: &[u8]) -> ErrorData {
     }
 }
 
-/// Maps a relay failure to an MCP error, marking a request that never left
-/// this process as not sent so the host knows a retry cannot repeat it.
+/// Keeps send outcome separate from recovery: hosts should stop issuing tool
+/// calls on `recovery: "user_action_required"` until the user restores service.
 fn relay_error_to_mcp(error: BoxError) -> ErrorData {
-    if error.is::<RelayNotSent>() {
-        return ErrorData::internal_error(
-            format!("{error}; repeating it is safe"),
-            Some(serde_json::json!({
-                "subc_code": SUBC_CONNECTION_UNAVAILABLE_CODE,
-                "send_outcome": "not_sent",
-                "request_dispatched": false,
-            })),
-        );
+    if let Some(not_sent) = error.downcast_ref::<RelayNotSent>() {
+        let mut data = serde_json::json!({
+            "subc_code": SUBC_CONNECTION_UNAVAILABLE_CODE,
+            "send_outcome": "not_sent",
+            "request_dispatched": false,
+        });
+        if matches!(not_sent, RelayNotSent::Unavailable) {
+            data["recovery"] = serde_json::json!("user_action_required");
+        }
+        return ErrorData::internal_error(error.to_string(), Some(data));
     }
     mcp_internal_error(error)
 }
@@ -5753,10 +5761,42 @@ async fn pipe_stdio(stream: TcpStream) -> Result<()> {
     Ok(())
 }
 
-async fn connect_authenticated(connection_file_path: &Path) -> Result<TcpStream> {
+#[derive(Clone, Copy)]
+enum ConnectionService {
+    Gateway,
+    Daemon,
+}
+
+impl ConnectionService {
+    fn unavailable_message(self) -> &'static str {
+        match self {
+            Self::Gateway => GATEWAY_UNAVAILABLE_MESSAGE,
+            Self::Daemon => DAEMON_UNAVAILABLE_MESSAGE,
+        }
+    }
+
+    fn unavailable_diagnostic(self) -> String {
+        let message = self.unavailable_message();
+        if matches!(self, Self::Gateway) {
+            // Shim hosts may only surface stderr, not the gateway's log file.
+            eprintln!("subc-mcp: {message}");
+        }
+        format!("{message} ")
+    }
+}
+
+async fn connect_authenticated(
+    connection_file_path: &Path,
+    service: ConnectionService,
+) -> Result<TcpStream> {
     let conn = connection_file::read_for_client(connection_file_path).map_err(|source| {
+        let recovery = if matches!(&source, connection_file::ConnectionFileError::Io { source, .. } if source.kind() == stdio::ErrorKind::NotFound) {
+            service.unavailable_diagnostic()
+        } else {
+            String::new()
+        };
         other_error(format!(
-            "failed to read connection file {}: {source}",
+            "{recovery}failed to read connection file {}: {source}",
             connection_file_path.display()
         ))
     })?;
@@ -5782,8 +5822,13 @@ async fn connect_authenticated(connection_file_path: &Path) -> Result<TcpStream>
     let mut stream = TcpStream::connect(SocketAddr::new(ip, endpoint.port))
         .await
         .map_err(|source| {
+            let recovery = if source.kind() == stdio::ErrorKind::ConnectionRefused {
+                service.unavailable_diagnostic()
+            } else {
+                String::new()
+            };
             other_error(format!(
-                "failed to connect to {} from {}: {source}",
+                "{recovery}failed to connect to {} from {}: {source}",
                 endpoint_label,
                 connection_file_path.display()
             ))
@@ -8135,7 +8180,101 @@ mod tests {
             .await
             .expect_err("a stale route handle must not reach the new connection");
         assert!(refused.is::<RelayNotSent>(), "{refused}");
+        let mcp_error = relay_error_to_mcp(refused);
+        assert_eq!(
+            mcp_error.message,
+            "subc request not sent: route handle belongs to a stale subc connection"
+        );
+        assert_eq!(
+            mcp_error.data.unwrap(),
+            serde_json::json!({
+                "subc_code": "subc_connection_unavailable",
+                "send_outcome": "not_sent",
+                "request_dispatched": false,
+            })
+        );
         assert!(subc.connection().pending.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn persistent_unavailable_relay_requires_user_action() {
+        let (client_stream, _server_stream) = connected_tcp_stream_pair().await;
+        let subc = SubcClient::start(client_stream);
+        subc.connection().closed.store(true, Ordering::Release);
+        let started = time::Instant::now();
+        let error = match subc.live_connection().await {
+            Ok(_) => panic!("a closed connection without a replacement must fail"),
+            Err(error) => relay_error_to_mcp(error),
+        };
+        assert!(started.elapsed() >= SUBC_RESPONSE_TIMEOUT);
+        assert_eq!(error.message, "CortexKit's daemon is not running or can't be reached on this computer, so this tool call was not sent. Retrying won't start it. Stop calling CortexKit tools and ask the user to start the daemon (run `ck setup`, or restart the CortexKit service), then try again after they confirm it is running.");
+        assert_eq!(
+            error.data.unwrap(),
+            serde_json::json!({
+                "subc_code": "subc_connection_unavailable",
+                "send_outcome": "not_sent",
+                "request_dispatched": false,
+                "recovery": "user_action_required",
+            })
+        );
+        assert!(subc.connection().pending.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn closed_relay_replaced_within_window_remains_usable() {
+        let (first_client, _first_server) = connected_tcp_stream_pair().await;
+        let subc = SubcClient::start(first_client);
+        subc.connection().closed.store(true, Ordering::Release);
+        let (second_client, _second_server) = connected_tcp_stream_pair().await;
+        let waiting = subc.live_connection();
+        let replace = async {
+            tokio::task::yield_now().await;
+            let (replacement, _reader) =
+                SubcConnection::start(second_client, subc.events.clone(), None);
+            subc.current.send_replace(Arc::clone(&replacement));
+            replacement
+        };
+        let (connected, replacement) = tokio::join!(waiting, replace);
+        assert!(Arc::ptr_eq(&connected.unwrap(), &replacement));
+    }
+
+    #[tokio::test]
+    async fn missing_gateway_connection_file_explains_user_action() {
+        let path = env::temp_dir().join(format!(
+            "subc-mcp-missing-{}.json",
+            hex(&generate_daemon_id().unwrap())
+        ));
+        let error = connect_authenticated(&path, ConnectionService::Gateway)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().starts_with(GATEWAY_UNAVAILABLE_MESSAGE));
+        assert!(error.to_string().contains("failed to read connection file"));
+    }
+
+    #[tokio::test]
+    async fn refused_gateway_port_explains_user_action() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let info = ConnectionInfo {
+            schema: SCHEMA_VERSION,
+            wire_version: None,
+            endpoints: vec![Endpoint {
+                host: "127.0.0.1".to_owned(),
+                port: listener.local_addr().unwrap().port(),
+            }],
+            key: vec![0x42; subc_transport::KEY_LEN],
+            daemon_id: generate_daemon_id().unwrap(),
+            pid: process::id(),
+            daemon_ver: "test".to_owned(),
+        };
+        let path = env::temp_dir().join(format!("subc-mcp-refused-{}.json", hex(&info.daemon_id)));
+        connection_file::write_atomic(&path, &info).unwrap();
+        drop(listener);
+        let error = connect_authenticated(&path, ConnectionService::Gateway)
+            .await
+            .unwrap_err();
+        fs::remove_file(path).unwrap();
+        assert!(error.to_string().starts_with(GATEWAY_UNAVAILABLE_MESSAGE));
+        assert!(error.to_string().contains("failed to connect to"));
     }
 
     /// One MCP host that never drains a call's progress must cost only that
@@ -8272,7 +8411,9 @@ mod tests {
         };
 
         connection_file::write_atomic(&path, &info).unwrap();
-        let err = connect_authenticated(&path).await.unwrap_err();
+        let err = connect_authenticated(&path, ConnectionService::Gateway)
+            .await
+            .unwrap_err();
         assert!(
             err.to_string().contains("not a loopback address"),
             "unexpected error: {err}"

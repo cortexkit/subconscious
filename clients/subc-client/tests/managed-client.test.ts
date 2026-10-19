@@ -19,6 +19,7 @@ import {
   SUBSCRIPTION_FLAG,
   SocketClosedError,
   SubcCallError,
+  DaemonUnavailableError,
   SubcClient,
   type BindIdentity,
   type CatalogEntry,
@@ -40,6 +41,7 @@ const DAEMON_ID = Uint8Array.from(Array(16).fill(0x7d));
 const SERVER_NONCE = Uint8Array.from(Array.from({ length: 32 }, (_, i) => 0xa0 + i));
 const IDENTITY: BindIdentity = { project_root: "/tmp/subc-client-test", harness: "bun", session: "managed" };
 const BACKOFF = { baseMs: 5, capMs: 10, maxAttempts: 4 };
+const DAEMON_UNAVAILABLE_MESSAGE = "CortexKit's daemon is not running or can't be reached on this computer, so this tool call was not sent. Retrying won't start it. Stop calling CortexKit tools and ask the user to start the daemon (run `ck setup`, or restart the CortexKit service), then try again after they confirm it is running.";
 
 const tempDirs: string[] = [];
 const daemons: FakeDaemon[] = [];
@@ -144,6 +146,35 @@ function newStats(): FakeStats {
 afterEach(async () => {
   for (const daemon of daemons.splice(0)) await daemon.stop();
   for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+});
+
+describe("daemon unavailable", () => {
+  test("missing connection file requires user action and preserves the cause", async () => {
+    const { connFile } = tempConnectionFile();
+    const error = await SubcClient.connect({ connectionFile: connFile }).catch((err: unknown) => err);
+    expect(error).toBeInstanceOf(DaemonUnavailableError);
+    expect(error).toMatchObject({
+      kind: "not_sent",
+      recovery: "user_action_required",
+      code: "ENOENT",
+      message: DAEMON_UNAVAILABLE_MESSAGE,
+      cause: { code: "ENOENT", path: connFile },
+    });
+  });
+
+  test("refused port requires user action and preserves the cause", async () => {
+    const { connFile } = tempConnectionFile();
+    writeConnectionFile(connFile, await closedPort());
+    const error = await SubcClient.connect({ connectionFile: connFile }).catch((err: unknown) => err);
+    expect(error).toBeInstanceOf(DaemonUnavailableError);
+    expect(error).toMatchObject({
+      kind: "not_sent",
+      recovery: "user_action_required",
+      code: "ECONNREFUSED",
+      message: DAEMON_UNAVAILABLE_MESSAGE,
+      cause: { code: "ECONNREFUSED" },
+    });
+  });
 });
 
 describe("daemon-originated control pushes", () => {
@@ -861,8 +892,14 @@ describe("SubcClient managed call", () => {
       const refusedPort = await closedPort();
       writeConnectionFile(connFile, refusedPort);
 
-      await expect(client.call("managed-provider", "echo", { n: 2 })).rejects.toMatchObject({
+      const error = await client.call("managed-provider", "echo", { n: 2 }).catch((err: unknown) => err);
+      expect(error).toBeInstanceOf(DaemonUnavailableError);
+      expect(error).toMatchObject({
         kind: "not_sent",
+        recovery: "user_action_required",
+        code: "ECONNREFUSED",
+        message: DAEMON_UNAVAILABLE_MESSAGE,
+        cause: { code: "ECONNREFUSED" },
       });
       expect(sleeps).toEqual([5, 10, 10]);
     } finally {

@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.39
+
+- When the daemon connection stays down for the existing 10-second replacement window, tell the host to stop CortexKit tool calls and ask the user to run `ck setup` or restart the CortexKit service. MCP error data adds `recovery: "user_action_required"`; hosts should pause new calls until the user confirms service is restored. `send_outcome: "not_sent"` and `request_dispatched: false` are unchanged. Stale routes and brief connection races retain neutral not-sent diagnostics without the recovery field; already-sent requests retain their unknown-outcome warning.
+- Print a plain stderr diagnostic when the shim's gateway connection file is missing or its port refuses connections, identifying the gateway as unreachable without claiming the daemon is down.
+
 ## 0.1.38
 
 - Move to subc-control 0.32 and subc-client-rs 0.30. No behavior change.

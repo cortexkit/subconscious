@@ -334,6 +334,21 @@ export class SubcCallError extends Error {
   }
 }
 
+/** No connection was restored; hosts should stop calls until the user restores service. */
+export class DaemonUnavailableError extends SubcCallError {
+  readonly recovery = "user_action_required" as const;
+
+  constructor(cause: unknown) {
+    super(
+      "not_sent",
+      "CortexKit's daemon is not running or can't be reached on this computer, so this tool call was not sent. Retrying won't start it. Stop calling CortexKit tools and ask the user to start the daemon (run `ck setup`, or restart the CortexKit service), then try again after they confirm it is running.",
+      errorCode(cause),
+      cause,
+    );
+    this.name = "DaemonUnavailableError";
+  }
+}
+
 /** The first terminal outcome of a subscription. */
 export type SubscriptionEnd =
   | { kind: "response"; body: Uint8Array }
@@ -712,8 +727,15 @@ export class SubcClient {
   /** Read the connection file, connect, authenticate, and start the read loop. */
   static async connect(opts: ConnectOptions): Promise<SubcClient> {
     const normalized = normalizeConnectOptions(opts);
-    const opened = await SubcClient.openConnection(normalized);
-    return new SubcClient(opened.sock, opened.conn, normalized);
+    try {
+      const opened = await SubcClient.openConnection(normalized);
+      return new SubcClient(opened.sock, opened.conn, normalized);
+    } catch (err) {
+      if (errorCode(err) === "ENOENT" || errorCode(err) === "ECONNREFUSED") {
+        throw new DaemonUnavailableError(err);
+      }
+      throw err;
+    }
   }
 
   /** List modules subc knows about (channel-0 catalog.list). */
@@ -1727,6 +1749,9 @@ export class SubcClient {
         return;
       } catch (err) {
         if (!isConsumerReconnectTransient(err) || attempt >= this.opts.reconnectBackoff.maxAttempts) {
+          if (isConsumerReconnectTransient(err) && !(err instanceof AuthError)) {
+            throw new DaemonUnavailableError(err);
+          }
           // An auth failure that survives the whole budget (which re-reads the
           // connection file every attempt) is no longer explainable by key
           // rotation — but the raw "impostor daemon" wording sent a real

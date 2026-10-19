@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.22.3
+
+- Export `DaemonUnavailableError`, a `SubcCallError` with `kind: "not_sent"` and `recovery: "user_action_required"`, for initial missing-file/refused-port failures and exhausted transient transport reconnects. It explains that the daemon is not running or unreachable and asks hosts to stop CortexKit tool calls until the user runs `ck setup` or restarts the service and confirms recovery. The original `cause` and its `code` are retained. Reconnect budgets, authentication/validation errors and already-sent unknown-outcome failures are unchanged.
+
 ## 0.22.2
 
 - Add `Subscription.ended: Promise<SubscriptionEnd>`, which always resolves with the first terminal outcome: Response bytes (including an empty body), STREAM_END, module ERROR code/message/detail, route close reason, connection loss or caller unsubscribe. `closed: Promise<void>` retains its existing resolve/reject behavior.

@@ -78,6 +78,21 @@ fails loud with an `AuthError` rather than connecting insecurely.
 - **Connection-file security.** On unix the file must be owner-only (`0600`); a
   group/world-readable file is rejected, because the key has effectively leaked.
 
+### Unavailable daemon
+
+Initial `ENOENT` or `ECONNREFUSED` failures and exhausted transient transport
+reconnects throw `DaemonUnavailableError` (a `SubcCallError`). Its
+`recovery: "user_action_required"` tells hosts to stop issuing CortexKit tool
+calls and ask the user to run `ck setup` or restart the CortexKit service. Resume
+only after the user confirms it is running. `code` retains the original error
+code when present, and `cause` retains the original error for diagnostics.
+
+The recovery classification is separate from `kind: "not_sent"`, which only
+describes whether request bytes left the process. Stale-route refreshes do not
+require user action, and `outcome_unknown` still means an already-sent request
+may have executed. The existing bounded reconnect budget still handles brief
+daemon restarts before this error is surfaced.
+
 ### Scoped routes
 
 Use a daemon advertising `scopes/v1` and pass a selector to `routeOpen()` or to

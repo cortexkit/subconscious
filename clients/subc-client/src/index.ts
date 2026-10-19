@@ -2,6 +2,7 @@ export {
   SubcClient,
   SubcError,
   SubcCallError,
+  DaemonUnavailableError,
   UNKNOWN_CHANNEL,
   STALE_ROUTE_EPOCH,
   isEstablishedRouteDead,

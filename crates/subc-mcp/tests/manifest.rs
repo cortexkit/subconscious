@@ -196,9 +196,14 @@ fn shim_logs_without_daemon_environment_or_protocol_stdout() {
         .unwrap();
     assert!(!output.status.success());
     assert!(output.stdout.is_empty(), "shim must reserve stdout for MCP");
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        output.stderr.is_empty(),
-        "shim diagnostics must not reach host stderr"
+        stderr.contains("CortexKit's gateway is not running or can't be reached on this computer")
+            && stderr.contains("Retrying won't start it.")
+            && stderr.contains("Stop calling CortexKit tools")
+            && stderr.contains("run `ck setup`")
+            && stderr.contains("The daemon's status is unknown."),
+        "{stderr}"
     );
     let entries: Vec<_> = fs::read_dir(home.join("cortexkit/ck-subc-mcp/logs"))
         .unwrap()

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.4.7
+
+- Create the `m_thalamus` durable reader so the Claude Code gateway can read Magic Context's compaction notices, and widen `m_magic-context`'s filter to also read `event.thalamus.compaction.>`. Bootstrap's create-or-update widens the existing durable in place, so Magic Context keeps its reading position. Takes `cortexkit-bus-naming` 0.2.6.
+
 ## 0.4.6
 
 - Create durable readers for compaction events before modules connect:

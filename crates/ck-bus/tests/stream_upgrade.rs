@@ -466,12 +466,21 @@ async fn a_five_stream_plane_upgrades_in_place_to_six_streams_and_the_module_dur
             "m_magic-context",
             vec![
                 format!("ck.{}.event.thalamus-harness.compaction.>", names.account()),
+                format!("ck.{}.event.thalamus.compaction.>", names.account()),
                 format!("ck.{}.event.broca.compaction.>", names.account()),
             ],
         ),
         (
             streams.event.clone(),
             "m_thalamus-harness",
+            vec![format!(
+                "ck.{}.event.magic-context.compaction.>",
+                names.account()
+            )],
+        ),
+        (
+            streams.event.clone(),
+            "m_thalamus",
             vec![format!(
                 "ck.{}.event.magic-context.compaction.>",
                 names.account()
@@ -744,11 +753,19 @@ async fn bootstrap_creates_every_table_event_durable_with_its_filter_and_setting
                     "ck.{}.event.thalamus-harness.compaction.>",
                     plane.names.account()
                 ),
+                format!("ck.{}.event.thalamus.compaction.>", plane.names.account()),
                 format!("ck.{}.event.broca.compaction.>", plane.names.account()),
             ],
         ),
         (
             "m_thalamus-harness",
+            vec![format!(
+                "ck.{}.event.magic-context.compaction.>",
+                plane.names.account()
+            )],
+        ),
+        (
+            "m_thalamus",
             vec![format!(
                 "ck.{}.event.magic-context.compaction.>",
                 plane.names.account()
@@ -812,6 +829,7 @@ async fn second_bootstrap_keeps_event_durable_creation_times_and_ack_floors() {
         "m_prefrontal-routing",
         "m_magic-context",
         "m_thalamus-harness",
+        "m_thalamus",
         "m_broca",
     ];
     let mut before = Vec::new();
@@ -999,6 +1017,7 @@ async fn prefrontal_event_grant_pulls_and_acks_seven_token_events_but_refuses_ot
         "m_prefrontal-routing",
         "m_magic-context",
         "m_thalamus-harness",
+        "m_thalamus",
         "m_broca",
     ] {
         for verb in ["INFO", "MSG.NEXT"] {

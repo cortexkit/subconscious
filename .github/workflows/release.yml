@@ -7,10 +7,11 @@ on:
   push:
     tags:
       - "*-v*"
-      # Test-vector tags share the `-v<n>` suffix but name no crate; without
-      # this exclusion each one runs the full verify matrix and then fails
-      # at publish.
-      - "!fed-pairing-v*"
+      # Shared test-vector releases (vectors/<name>/, tagged `<name>-v<n>`)
+      # share the suffix but name no crate. The federation vectors are
+      # excluded here; the classify job below skips any other tag whose name
+      # is a folder under vectors/, so a new vector set needs no edit here.
+      - "!fed-*-v*"
 
 concurrency:
   # A retag at a different commit must not wait behind a stale release run.
@@ -24,9 +25,30 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # A tag names a release only when its `<name>` is not a test-vector folder.
+  # Everything else depends on verify, so a vector tag runs nothing further.
+  classify:
+    name: Classify tag
+    runs-on: ubuntu-latest
+    outputs:
+      release: ${{ steps.classify.outputs.release }}
+    steps:
+      - uses: actions/checkout@v5
+      - id: classify
+        run: |
+          name="${GITHUB_REF_NAME%-v*}"
+          if [ -d "vectors/$name" ]; then
+            echo "::notice::$GITHUB_REF_NAME is a test-vector tag (vectors/$name); nothing to release."
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          fi
+
   # Use the same verification matrix as pull requests before publishing any
   # release asset.
   verify:
+    needs: classify
+    if: needs.classify.outputs.release == 'true'
     uses: ./.github/workflows/ci.yml
 
   create-subconscious-release:

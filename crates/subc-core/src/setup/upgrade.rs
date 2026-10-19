@@ -791,15 +791,13 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
         drain_timeout: Duration,
     ) -> Result<String, String> {
         let platform = super::runtime::RuntimePlatform::current();
-        let root = load_current_inventory_root()?;
-        let paths =
-            super::runtime::runtime_paths(platform, &root.join("bin"), &super::apply::user_home()?);
-        let detail = super::runtime::restart_with_definition(
+        let definition = super::runtime::runtime_paths(
             platform,
-            &paths,
-            &mut super::runtime::SystemCommandRunner,
-            &mut self.inventory,
-        )?;
+            &load_current_inventory_root()?.join("bin"),
+            &super::apply::user_home()?,
+        )
+        .definition;
+        let detail = super::runtime::restart_via_service_manager(&definition)?;
         Ok(format!(
             "{detail}; drain budget={}s",
             drain_timeout.as_secs()

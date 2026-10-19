@@ -261,8 +261,6 @@ pub enum ReleaseAvailability {
 pub enum RuntimeState {
     Missing,
     Correct,
-    Outdated { restart: bool },
-    Unowned { reason: String },
 }
 
 // Filesystem configuration probing is supplied by the setup backend. Keeping
@@ -589,9 +587,6 @@ pub enum SetupOperation {
         sections: Vec<String>,
     },
     RegisterRuntime,
-    UpdateRuntimeDefinition {
-        restart: bool,
-    },
     StartRuntime,
     Validate {
         instrument: &'static str,
@@ -621,7 +616,6 @@ impl SetupOperation {
                 | Self::EnableComponent { .. }
                 | Self::RestartRuntime { .. }
                 | Self::RegisterRuntime
-                | Self::UpdateRuntimeDefinition { .. }
                 | Self::StartRuntime
                 | Self::DeregisterRuntime
                 | Self::RemoveManagedComponent { .. }
@@ -645,7 +639,6 @@ impl SetupOperation {
             | Self::AdoptRunningCk { .. }
             | Self::RestartRuntime { .. }
             | Self::RegisterRuntime
-            | Self::UpdateRuntimeDefinition { .. }
             | Self::StartRuntime
             | Self::Validate { .. }
             | Self::DeregisterRuntime
@@ -704,18 +697,6 @@ impl fmt::Display for SetupOperation {
                 sections.join(", ")
             ),
             Self::RegisterRuntime => formatter.write_str("register the per-user daemon runtime"),
-            Self::UpdateRuntimeDefinition { restart } => {
-                formatter.write_str(
-                    "update the daemon service definition (includes restart after a crash)",
-                )?;
-                if *restart {
-                    formatter
-                        .write_str("; reload LaunchAgent: restarts the daemon and every module")?;
-                } else {
-                    formatter.write_str("; update in place without stopping the running daemon")?;
-                }
-                Ok(())
-            }
             Self::StartRuntime => formatter.write_str("start the per-user daemon runtime"),
             Self::Validate { instrument } => write!(formatter, "validate with {instrument}"),
             Self::DeregisterRuntime => {

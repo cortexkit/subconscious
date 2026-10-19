@@ -8,7 +8,7 @@ use serde_json::{Map, Value};
 
 #[cfg(unix)]
 use super::file_modes;
-use super::{definition::canonical, inventory::Inventory, model::RuntimeState};
+use super::inventory::Inventory;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RuntimePlatform {
@@ -400,144 +400,6 @@ pub fn observe<R: CommandRunner>(
     Ok(RuntimeStatus { registered, live })
 }
 
-/// Compare only parsed values; a legacy inventory row is trusted only when its
-/// contents match a previously generated template for this path and account.
-pub fn definition_state<R: CommandRunner>(
-    platform: RuntimePlatform,
-    paths: &RuntimePaths,
-    status: RuntimeStatus,
-    runner: &mut R,
-    inventory: &Inventory,
-) -> Result<RuntimeState, String> {
-    let refusal = |reason: &str| RuntimeState::Unowned {
-        reason: format!(
-            "daemon service definition {}: {reason}; nothing will be overwritten",
-            paths.definition.display()
-        ),
-    };
-    let metadata = match fs::symlink_metadata(&paths.definition) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(if status.registered {
-                refusal("registered service has no owned definition file")
-            } else {
-                RuntimeState::Missing
-            });
-        }
-        Err(error) => {
-            return Err(format!(
-                "could not inspect {}: {error}",
-                paths.definition.display()
-            ))
-        }
-    };
-    if !metadata.is_file() || metadata.file_type().is_symlink() {
-        return Ok(refusal("not a regular setup-owned file"));
-    }
-    let Some(entry) = inventory.entry_for_path("runtime-definition", &paths.definition) else {
-        return Ok(refusal("no inventory ownership"));
-    };
-    let current = fs::read_to_string(&paths.definition).map_err(|e| e.to_string())?;
-    let Ok(parsed) = canonical(platform, &current) else {
-        return Ok(refusal("unrecognized or user-edited contents"));
-    };
-    let desired = desired_definition_checked(platform, paths)?;
-    let trusted = match entry.get("definition_semantics").and_then(Value::as_str) {
-        Some(recorded) => recorded == parsed,
-        None => legacy_definitions(platform, paths, &desired)
-            .iter()
-            .any(|old| canonical(platform, old).ok().as_ref() == Some(&parsed)),
-    };
-    if !trusted {
-        return Ok(refusal(
-            "user-edited contents differ from setup's recorded definition",
-        ));
-    }
-    #[cfg(feature = "test-support")]
-    let query_task = std::env::var_os("CK_TEST_SETUP_CONTROL_OK").is_none();
-    #[cfg(not(feature = "test-support"))]
-    let query_task = true;
-    if platform == RuntimePlatform::Windows && status.registered && query_task {
-        let result = runner.run("powershell.exe", &[
-            "-NoProfile".into(), "-NonInteractive".into(), "-Command".into(),
-            "$ErrorActionPreference='Stop'; [Console]::OutputEncoding=[System.Text.UTF8Encoding]::new(); $x=[xml](Export-ScheduledTask -TaskPath '\\CortexKit\\' -TaskName 'subc-daemon'); foreach($u in $x.SelectNodes('//*[local-name()=\"UserId\"]')) { if($u.InnerText -like 'S-1-*') { $u.InnerText=([System.Security.Principal.SecurityIdentifier]::new($u.InnerText)).Translate([System.Security.Principal.NTAccount]).Value } }; $x.OuterXml".into(),
-        ])?;
-        if !result.success {
-            return Err(format!(
-                "could not read installed task definition: {}",
-                result.explanation()
-            ));
-        }
-        if canonical(platform, &result.stdout).ok().as_ref() != Some(&parsed) {
-            return Ok(refusal(
-                "installed task differs from the setup-owned XML (user-edited task)",
-            ));
-        }
-    }
-    if parsed != canonical(platform, &desired)? {
-        Ok(RuntimeState::Outdated {
-            restart: platform == RuntimePlatform::Macos && status.registered && status.live,
-        })
-    } else if !status.registered || !status.live {
-        Ok(RuntimeState::Missing)
-    } else {
-        Ok(RuntimeState::Correct)
-    }
-}
-
-fn legacy_definitions(
-    platform: RuntimePlatform,
-    paths: &RuntimePaths,
-    desired: &str,
-) -> Vec<String> {
-    let mut definitions = vec![desired.to_string()];
-    match platform {
-        RuntimePlatform::Macos => {
-            let old = desired.replace("<key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict><key>ThrottleInterval</key><integer>10</integer>", "");
-            definitions.push(old.replace(
-                &format!("<key>ExitTimeOut</key><integer>{DAEMON_STOP_TIMEOUT_SECS}</integer>"),
-                "",
-            ));
-            definitions.push(old);
-        }
-        RuntimePlatform::Windows => {
-            if let (Some(start), Some(end)) =
-                (desired.find("<Settings>"), desired.find("</Settings>"))
-            {
-                let mut old = desired.to_string();
-                old.replace_range(start..end + "</Settings>".len(), "");
-                definitions.push(old.clone());
-                let user = xml_text(&current_windows_user().unwrap_or_default());
-                let old = old.replace(&format!("<UserId>{user}</UserId>"), "");
-                definitions.push(old.clone());
-                definitions.push(old.replace(
-                    " xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\"",
-                    "",
-                ));
-            }
-        }
-        RuntimePlatform::Linux => {
-            let mut old =
-                desired.replace(&format!("TimeoutStopSec={DAEMON_STOP_TIMEOUT_SECS}\n"), "");
-            definitions.push(old.clone());
-            old = old.replace("KillMode=mixed\n", "");
-            definitions.push(old.clone());
-            definitions.push(old.replace("Delegate=yes\nDelegateSubgroup=daemon\n", ""));
-        }
-    }
-    if platform == RuntimePlatform::Linux {
-        let raw = paths.daemon.to_string_lossy();
-        let encoded = systemd_argument(&raw);
-        definitions.extend(
-            definitions
-                .clone()
-                .iter()
-                .map(|text| text.replace(&encoded, &raw)),
-        );
-    }
-    definitions
-}
-
 pub fn ensure<R: CommandRunner>(
     platform: RuntimePlatform,
     paths: &RuntimePaths,
@@ -547,10 +409,7 @@ pub fn ensure<R: CommandRunner>(
 ) -> Result<(), String> {
     let desired = desired_definition_checked(platform, paths)?;
     let current = fs::read_to_string(&paths.definition).ok();
-    let needs_definition = current
-        .as_deref()
-        .and_then(|text| canonical(platform, text).ok())
-        != Some(canonical(platform, &desired)?);
+    let needs_definition = current.as_deref() != Some(desired.as_str());
     if needs_definition && platform == RuntimePlatform::Macos && status.registered && status.live {
         let old = current.as_deref().unwrap_or("<missing definition>");
         let (line, before, after) = first_definition_difference(old, &desired);
@@ -560,62 +419,10 @@ pub fn ensure<R: CommandRunner>(
             paths.definition.to_string_lossy().replace('\'', "'\"'\"'")
         );
         return Err(format!(
-            "refusal: live launchd definition {} differs at line {line}: current {before:?}; desired {after:?}. Nothing was written. At a time you choose, stop it with `launchctl bootout {domain}/{}` and re-run `ck setup` to write and load the new definition. The manual load command is `launchctl bootstrap {domain} {quoted_path}`. Setup will not stop a running daemon outside an explicitly planned reload.",
+            "refusal: live launchd definition {} differs at line {line}: current {before:?}; desired {after:?}. Nothing was written. At a time you choose, stop it with `launchctl bootout {domain}/{}` and re-run `ck setup` to write and load the new definition. The manual load command is `launchctl bootstrap {domain} {quoted_path}`. Setup will not stop a running daemon.",
             paths.definition.display(), platform.identifier()
         ));
     }
-    if let RuntimeState::Unowned { reason } =
-        definition_state(platform, paths, status, runner, inventory)?
-    {
-        return Err(format!("refusal: {reason}"));
-    }
-    write_definition(platform, paths, &desired, needs_definition, inventory)?;
-
-    let mut live = status.live;
-    if needs_definition && status.registered {
-        if platform == RuntimePlatform::Macos {
-            let args = vec![
-                "bootout".into(),
-                format!("gui/{}/{}", current_uid(), platform.identifier()),
-            ];
-            let result = runner.run("launchctl", &args)?;
-            if !result.success {
-                return Err(format!(
-                    "could not unload stopped launchd job: {}",
-                    result.explanation()
-                ));
-            }
-        }
-        if platform == RuntimePlatform::Windows {
-            update_windows_task(paths, runner)?;
-        } else {
-            register(platform, paths, runner)?;
-        }
-        live = observe(platform, runner)?.live;
-    }
-    if !status.registered {
-        register(platform, paths, runner)?;
-        let mut fields = Map::new();
-        fields.insert(
-            "identifier".to_string(),
-            Value::String(platform.identifier().to_string()),
-        );
-        inventory.record("runtime-registration", &paths.definition, fields);
-        live = observe(platform, runner)?.live;
-    }
-    if !live {
-        start(platform, paths, runner)?;
-    }
-    Ok(())
-}
-
-fn write_definition(
-    platform: RuntimePlatform,
-    paths: &RuntimePaths,
-    desired: &str,
-    needs_definition: bool,
-    inventory: &mut Inventory,
-) -> Result<(), String> {
     if needs_definition {
         let parent = paths.definition.parent().ok_or_else(|| {
             format!(
@@ -657,13 +464,45 @@ fn write_definition(
     );
     inventory.record("runtime-definition", &paths.definition, fields);
 
-    inventory.update_owned_string(
-        "runtime-definition",
-        &paths.definition,
-        "definition_semantics",
-        canonical(platform, desired)?,
-    )?;
-    inventory.save()
+    let mut live = status.live;
+    if needs_definition && status.registered {
+        if platform == RuntimePlatform::Macos {
+            let args = vec![
+                "bootout".into(),
+                format!("gui/{}/{}", current_uid(), platform.identifier()),
+            ];
+            let result = runner.run("launchctl", &args)?;
+            if !result.success {
+                return Err(format!(
+                    "could not unload stopped launchd job: {}",
+                    result.explanation()
+                ));
+            }
+        }
+        register(platform, paths, runner)?;
+        live = observe(platform, runner)?.live;
+    }
+    if !status.registered {
+        register(platform, paths, runner)?;
+        let mut fields = Map::new();
+        fields.insert(
+            "identifier".to_string(),
+            Value::String(platform.identifier().to_string()),
+        );
+        inventory.record("runtime-registration", &paths.definition, fields);
+        // Registration starts the daemon on every platform (RunAtLoad,
+        // `enable --now`, a logon task with immediate run). The liveness in
+        // `status` was observed BEFORE that, so acting on it here would
+        // start a daemon that is already up — and on macOS the old verb was
+        // `kickstart -k`, which kills the fresh instance and respawns it, so
+        // the validation that followed read the just-killed pid and called
+        // the daemon dead. Re-observe after the mutating step.
+        live = observe(platform, runner)?.live;
+    }
+    if !live {
+        start(platform, paths, runner)?;
+    }
+    Ok(())
 }
 
 fn first_definition_difference<'a>(
@@ -772,101 +611,6 @@ fn is_access_denied(explanation: &str) -> bool {
         || explanation.contains("0x80070005")
 }
 
-fn update_windows_task<R: CommandRunner>(
-    paths: &RuntimePaths,
-    runner: &mut R,
-) -> Result<(), String> {
-    let path = paths.definition.to_string_lossy().replace('\'', "''");
-    // Set-ScheduledTask explicitly leaves the current instance unaffected.
-    // Read settings from the generated XML rather than a second policy template.
-    let script = format!(
-        r#"$ErrorActionPreference='Stop'; $x=[xml](Get-Content -LiteralPath '{path}' -Raw); $v=$x.Task.Settings;
-$s=New-ScheduledTaskSettingsSet -MultipleInstances $v.MultipleInstancesPolicy -AllowStartIfOnBatteries:(!$([bool]::Parse($v.DisallowStartIfOnBatteries))) -DontStopIfGoingOnBatteries:(!$([bool]::Parse($v.StopIfGoingOnBatteries))) -StartWhenAvailable:([bool]::Parse($v.StartWhenAvailable)) -RunOnlyIfNetworkAvailable:([bool]::Parse($v.RunOnlyIfNetworkAvailable)) -WakeToRun:([bool]::Parse($v.WakeToRun)) -ExecutionTimeLimit ([System.Xml.XmlConvert]::ToTimeSpan($v.ExecutionTimeLimit)) -RestartCount ([int]$v.RestartOnFailure.Count) -RestartInterval ([System.Xml.XmlConvert]::ToTimeSpan($v.RestartOnFailure.Interval));
-$a=New-ScheduledTaskAction -Execute ([string]$x.Task.Actions.Exec.Command);
-$t=New-ScheduledTaskTrigger -AtLogOn -User ([string]$x.Task.Triggers.LogonTrigger.UserId);
-$p=New-ScheduledTaskPrincipal -Id 'Author' -UserId ([string]$x.Task.Principals.Principal.UserId) -LogonType Interactive -RunLevel Limited;
-Set-ScheduledTask -TaskPath '\CortexKit\' -TaskName 'subc-daemon' -Action $a -Trigger $t -Principal $p -Settings $s | Out-Null"#
-    );
-    let result = runner.run(
-        "powershell.exe",
-        &[
-            "-NoProfile".into(),
-            "-NonInteractive".into(),
-            "-Command".into(),
-            script,
-        ],
-    )?;
-    if !result.success {
-        return Err(format!(
-            "could not update scheduled task: {}",
-            result.explanation()
-        ));
-    }
-    Ok(())
-}
-
-/// Refresh only owned definitions inside the restart upgrade already authorized.
-/// Ownership is checked before stopping anything and again before writing.
-pub fn restart_with_definition<R: CommandRunner>(
-    platform: RuntimePlatform,
-    paths: &RuntimePaths,
-    runner: &mut R,
-    inventory: &mut Inventory,
-) -> Result<String, String> {
-    let status = observe(platform, runner)?;
-    if let RuntimeState::Unowned { reason } =
-        definition_state(platform, paths, status, runner, inventory)?
-    {
-        return Err(format!("refusal: {reason}"));
-    }
-    let desired = desired_definition_checked(platform, paths)?;
-    let mut details = Vec::new();
-    let commands = restart_commands(platform, &paths.definition);
-    for (index, (program, args)) in commands.into_iter().enumerate() {
-        // macOS/Windows have separate stop/start verbs. Linux reloads the unit
-        // before its single restart; daemon-reload itself never stops a process.
-        if (platform == RuntimePlatform::Linux && index == 0) || index == 1 {
-            let stopped = RuntimeStatus {
-                registered: platform != RuntimePlatform::Macos && status.registered,
-                live: false,
-            };
-            if let RuntimeState::Unowned { reason } =
-                definition_state(platform, paths, stopped, runner, inventory)?
-            {
-                return Err(format!("refusal: {reason}"));
-            }
-            let changed = fs::read_to_string(&paths.definition)
-                .ok()
-                .and_then(|text| canonical(platform, &text).ok())
-                != Some(canonical(platform, &desired)?);
-            write_definition(platform, paths, &desired, changed, inventory)?;
-            if changed && platform == RuntimePlatform::Windows {
-                update_windows_task(paths, runner)?;
-            }
-            if changed && platform == RuntimePlatform::Linux {
-                let reload = runner.run("systemctl", &["--user".into(), "daemon-reload".into()])?;
-                if !reload.success {
-                    return Err(format!("could not reload unit: {}", reload.explanation()));
-                }
-            }
-        }
-        let result = runner.run(&program, &args)?;
-        if !result.success {
-            let is_stop = index == 0 && platform != RuntimePlatform::Linux;
-            if !is_stop || observe(platform, runner)?.live {
-                return Err(format!(
-                    "{program} {} failed: {}",
-                    args.join(" "),
-                    result.explanation()
-                ));
-            }
-        } else {
-            details.push(format!("{program} {} completed", args.join(" ")));
-        }
-    }
-    Ok(details.join("; "))
-}
-
 fn register<R: CommandRunner>(
     platform: RuntimePlatform,
     paths: &RuntimePaths,
@@ -946,8 +690,7 @@ fn start<R: CommandRunner>(
     let (program, args) = match platform {
         // Without `-k`: starts the job if it is not running and is a no-op if
         // it is. `-k` means kill-and-restart, which is an upgrade's verb, not
-        // setup's ordinary start verb. Only an explicitly planned LaunchAgent
-        // reload may stop a running daemon.
+        // setup's — setup must never take a running daemon down.
         RuntimePlatform::Macos => (
             "launchctl",
             vec![
@@ -1125,7 +868,6 @@ mod tests {
     struct RecordingRunner {
         calls: Vec<(String, Vec<String>)>,
         results: VecDeque<bool>,
-        task_xml: Option<String>,
     }
 
     impl CommandRunner for RecordingRunner {
@@ -1133,15 +875,7 @@ mod tests {
             self.calls.push((program.to_string(), args.to_vec()));
             Ok(CommandResult {
                 success: self.results.pop_front().unwrap_or(true),
-                stdout: if program == "powershell.exe"
-                    && args
-                        .last()
-                        .is_some_and(|s| s.contains("Export-ScheduledTask"))
-                {
-                    self.task_xml.clone().unwrap_or_default()
-                } else {
-                    "state = running\nStatus: Running".to_string()
-                },
+                stdout: "state = running\nStatus: Running".to_string(),
                 stderr: String::new(),
             })
         }
@@ -1612,16 +1346,10 @@ mod tests {
             let root = fixture_dir("stopped-definition-drift");
             let paths = runtime_paths(platform, root.path(), root.path());
             fs::create_dir_all(paths.definition.parent().unwrap()).unwrap();
-            let desired = desired_definition(platform, &paths);
-            let old = legacy_definitions(platform, &paths, &desired)[1].clone();
-            fs::write(&paths.definition, &old).unwrap();
+            fs::write(&paths.definition, "old definition\n").unwrap();
             let mut inventory =
                 Inventory::load(root.join("installer-manifest.json"), "test").unwrap();
-            inventory.record("runtime-definition", &paths.definition, Map::new());
-            let mut runner = RecordingRunner {
-                task_xml: Some(old),
-                ..Default::default()
-            };
+            let mut runner = RecordingRunner::default();
             ensure(
                 platform,
                 &paths,
@@ -1641,12 +1369,10 @@ mod tests {
             let expected = match platform {
                 RuntimePlatform::Macos => "bootstrap",
                 RuntimePlatform::Linux => "daemon-reload",
-                RuntimePlatform::Windows => "Set-ScheduledTask",
+                RuntimePlatform::Windows => "/Create",
             };
             assert!(
-                verbs
-                    .iter()
-                    .any(|args| args.iter().any(|arg| arg.contains(expected))),
+                verbs.iter().any(|args| args.contains(&expected)),
                 "{platform:?}: {verbs:?}"
             );
             assert_eq!(
@@ -1654,7 +1380,6 @@ mod tests {
                 desired_definition(platform, &paths)
             );
             runner.calls.clear();
-            runner.task_xml = Some(desired);
             ensure(
                 platform,
                 &paths,
@@ -1666,13 +1391,7 @@ mod tests {
                 &mut inventory,
             )
             .unwrap();
-            assert!(
-                runner.calls.iter().all(|(_, args)| args
-                    .last()
-                    .is_some_and(|s| s.contains("Export-ScheduledTask"))),
-                "{platform:?}: {:?}",
-                runner.calls
-            );
+            assert!(runner.calls.is_empty(), "{platform:?}: {:?}", runner.calls);
         }
     }
 
@@ -1950,346 +1669,5 @@ mod tests {
         let windows = restart_commands(RuntimePlatform::Windows, plist);
         assert_eq!(windows[0].1[0], "/End");
         assert_eq!(windows[1].1[0], "/Run");
-    }
-}
-
-#[cfg(test)]
-mod reconciliation_tests {
-    use super::super::{
-        model::{Component, ComponentState, SetupObserved, SetupOperation, SetupRequest},
-        planner::{execute_setup, plan_setup, ExecutionMode, SetupExecutor},
-    };
-    use super::*;
-    use cortexkit_test_support::ScratchDir;
-
-    struct Manager {
-        calls: Vec<String>,
-        paths: RuntimePaths,
-        task_xml: String,
-    }
-    impl CommandRunner for Manager {
-        fn run(&mut self, program: &str, args: &[String]) -> Result<CommandResult, String> {
-            let command = format!("{program} {}", args.join(" "));
-            self.calls.push(command.clone());
-            if args
-                .first()
-                .is_some_and(|s| s == "bootstrap" || s == "/Run")
-            {
-                let text = fs::read_to_string(&self.paths.definition).unwrap();
-                assert!(
-                    text.contains("RestartOnFailure") || text.contains("SuccessfulExit"),
-                    "definition must be refreshed before start"
-                );
-            }
-            let stdout = if command.contains("Export-ScheduledTask") {
-                self.task_xml.clone()
-            } else {
-                "state = running\nStatus: Running".to_string()
-            };
-            Ok(CommandResult {
-                success: true,
-                stdout,
-                stderr: String::new(),
-            })
-        }
-    }
-    fn fixture(
-        platform: RuntimePlatform,
-        old: bool,
-        owned: bool,
-    ) -> (ScratchDir, RuntimePaths, Inventory, Manager) {
-        let root = ScratchDir::new("definition-reconciliation");
-        let paths = runtime_paths(platform, root.path(), root.path());
-        fs::create_dir_all(paths.definition.parent().unwrap()).unwrap();
-        let desired = desired_definition_checked(platform, &paths).unwrap();
-        let text = if old {
-            legacy_definitions(platform, &paths, &desired)[1].clone()
-        } else {
-            desired
-        };
-        fs::write(&paths.definition, &text).unwrap();
-        let mut inventory = Inventory::load(root.join("inventory.json"), "test").unwrap();
-        if owned {
-            inventory.record("runtime-definition", &paths.definition, Map::new());
-        }
-        let manager = Manager {
-            calls: vec![],
-            paths: paths.clone(),
-            task_xml: text,
-        };
-        (root, paths, inventory, manager)
-    }
-    fn plan(state: RuntimeState) -> super::super::planner::SetupPlan {
-        let mut observed = SetupObserved::unconfigured_current_host();
-        observed.mc_detection = None;
-        observed
-            .components
-            .insert(Component::Core, ComponentState::Correct);
-        observed.runtime = state;
-        plan_setup(&observed, &SetupRequest::install(vec![]))
-    }
-    const LIVE: RuntimeStatus = RuntimeStatus {
-        registered: true,
-        live: true,
-    };
-
-    #[test]
-    fn outdated_owned_definition_plans_update() {
-        for platform in [
-            RuntimePlatform::Macos,
-            RuntimePlatform::Windows,
-            RuntimePlatform::Linux,
-        ] {
-            let (_root, paths, inventory, mut manager) = fixture(platform, true, true);
-            let state = definition_state(platform, &paths, LIVE, &mut manager, &inventory).unwrap();
-            let plan = plan(state);
-            assert!(plan.is_authorized());
-            assert!(
-                plan.operations
-                    .contains(&SetupOperation::UpdateRuntimeDefinition {
-                        restart: platform == RuntimePlatform::Macos
-                    }),
-                "{}",
-                plan.render()
-            );
-            assert!(plan.render().contains("restart after a crash"));
-            if platform == RuntimePlatform::Macos {
-                assert!(plan.render().contains("every module"));
-            }
-        }
-    }
-
-    #[test]
-    fn current_definition_plans_no_update_despite_formatting() {
-        for platform in [
-            RuntimePlatform::Macos,
-            RuntimePlatform::Windows,
-            RuntimePlatform::Linux,
-        ] {
-            let (_root, paths, inventory, mut manager) = fixture(platform, false, true);
-            let text = fs::read_to_string(&paths.definition).unwrap();
-            let formatted = if platform == RuntimePlatform::Linux {
-                text.replace("=", " = ")
-            } else {
-                text.replace("><", ">\n  <")
-            };
-            fs::write(&paths.definition, &formatted).unwrap();
-            manager.task_xml = formatted;
-            let state = definition_state(platform, &paths, LIVE, &mut manager, &inventory).unwrap();
-            assert_eq!(state, RuntimeState::Correct);
-            let plan = plan(state);
-            assert!(!plan.operations.iter().any(|s| matches!(
-                s,
-                SetupOperation::UpdateRuntimeDefinition { .. } | SetupOperation::RegisterRuntime
-            )));
-        }
-    }
-
-    #[test]
-    fn unowned_definition_refused_without_overwrite() {
-        for platform in [
-            RuntimePlatform::Macos,
-            RuntimePlatform::Windows,
-            RuntimePlatform::Linux,
-        ] {
-            for owned_but_edited in [false, true] {
-                let (_root, paths, mut inventory, mut manager) =
-                    fixture(platform, true, owned_but_edited);
-                if owned_but_edited {
-                    let text = fs::read_to_string(&paths.definition)
-                        .unwrap()
-                        .replace("ck-subc", "custom-daemon");
-                    fs::write(&paths.definition, text).unwrap();
-                }
-                let before = fs::read(&paths.definition).unwrap();
-                let state =
-                    definition_state(platform, &paths, LIVE, &mut manager, &inventory).unwrap();
-                let applied = ensure(
-                    platform,
-                    &paths,
-                    RuntimeStatus::default(),
-                    &mut manager,
-                    &mut inventory,
-                );
-                assert_eq!(fs::read(&paths.definition).unwrap(), before);
-                assert!(applied.is_err());
-                assert!(matches!(state, RuntimeState::Unowned { .. }));
-                assert!(!plan(state).is_authorized());
-                assert!(manager.calls.is_empty());
-            }
-        }
-    }
-
-    #[test]
-    fn recorded_definition_edits_and_registered_task_edits_are_refused() {
-        for platform in [
-            RuntimePlatform::Macos,
-            RuntimePlatform::Windows,
-            RuntimePlatform::Linux,
-        ] {
-            let (_root, paths, mut inventory, mut manager) = fixture(platform, false, true);
-            let text = fs::read_to_string(&paths.definition).unwrap();
-            inventory
-                .update_owned_string(
-                    "runtime-definition",
-                    &paths.definition,
-                    "definition_semantics",
-                    canonical(platform, &text).unwrap(),
-                )
-                .unwrap();
-            let old = legacy_definitions(platform, &paths, &text)[1].clone();
-            fs::write(&paths.definition, old).unwrap();
-            assert!(matches!(
-                definition_state(platform, &paths, LIVE, &mut manager, &inventory).unwrap(),
-                RuntimeState::Unowned { .. }
-            ));
-        }
-        let (_root, paths, inventory, mut manager) = fixture(RuntimePlatform::Windows, false, true);
-        manager.task_xml = manager
-            .task_xml
-            .replace("<Count>255</Count>", "<Count>1</Count>");
-        assert!(matches!(
-            definition_state(
-                RuntimePlatform::Windows,
-                &paths,
-                LIVE,
-                &mut manager,
-                &inventory
-            )
-            .unwrap(),
-            RuntimeState::Unowned { .. }
-        ));
-        assert!(manager
-            .calls
-            .iter()
-            .all(|s| s.contains("Export-ScheduledTask")));
-    }
-
-    #[test]
-    fn upgrade_regenerates_definition_between_existing_stop_and_start() {
-        for platform in [
-            RuntimePlatform::Macos,
-            RuntimePlatform::Windows,
-            RuntimePlatform::Linux,
-        ] {
-            let (_root, paths, mut inventory, mut manager) = fixture(platform, true, true);
-            restart_with_definition(platform, &paths, &mut manager, &mut inventory).unwrap();
-            let calls = &manager.calls;
-            let stops = calls
-                .iter()
-                .filter(|s| {
-                    s.contains(" bootout ") || s.contains(" /End ") || s.contains("--user restart ")
-                })
-                .count();
-            let starts = calls
-                .iter()
-                .filter(|s| {
-                    s.contains(" bootstrap ")
-                        || s.contains(" /Run ")
-                        || s.contains("--user restart ")
-                })
-                .count();
-            assert_eq!((stops, starts), (1, 1), "{calls:?}");
-            if platform != RuntimePlatform::Linux {
-                let stop = calls
-                    .iter()
-                    .position(|s| s.contains(" bootout ") || s.contains(" /End "))
-                    .unwrap();
-                let start = calls
-                    .iter()
-                    .position(|s| s.contains(" bootstrap ") || s.contains(" /Run "))
-                    .unwrap();
-                assert!(stop < start, "{calls:?}");
-            }
-            assert_eq!(
-                fs::read_to_string(&paths.definition).unwrap(),
-                desired_definition_checked(platform, &paths).unwrap()
-            );
-            if platform == RuntimePlatform::Linux {
-                assert!(
-                    calls
-                        .iter()
-                        .position(|s| s.contains("daemon-reload"))
-                        .unwrap()
-                        < calls
-                            .iter()
-                            .position(|s| s.contains("--user restart"))
-                            .unwrap()
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn unplanned_live_owned_macos_definition_still_refuses() {
-        let (_root, paths, mut inventory, mut manager) =
-            fixture(RuntimePlatform::Macos, true, true);
-        let before = fs::read(&paths.definition).unwrap();
-        let error = ensure(
-            RuntimePlatform::Macos,
-            &paths,
-            LIVE,
-            &mut manager,
-            &mut inventory,
-        )
-        .unwrap_err();
-        assert!(error.contains("Nothing was written"), "{error}");
-        assert_eq!(fs::read(&paths.definition).unwrap(), before);
-        assert!(manager.calls.is_empty());
-    }
-
-    #[test]
-    fn windows_definition_update_never_stops_or_runs_live_task() {
-        let (_root, paths, mut inventory, mut manager) =
-            fixture(RuntimePlatform::Windows, true, true);
-        ensure(
-            RuntimePlatform::Windows,
-            &paths,
-            LIVE,
-            &mut manager,
-            &mut inventory,
-        )
-        .unwrap();
-        assert!(manager
-            .calls
-            .iter()
-            .any(|s| s.contains("Set-ScheduledTask")));
-        assert!(!manager
-            .calls
-            .iter()
-            .any(|s| s.contains(" /End ") || s.contains(" /Run ") || s.contains(" /Create ")));
-    }
-
-    #[test]
-    fn confirmed_definition_reload_coalesces_config_restart() {
-        struct Executor {
-            calls: Vec<SetupOperation>,
-        }
-        impl SetupExecutor for Executor {
-            type Error = ();
-            fn apply(&mut self, step: &SetupOperation) -> Result<(), ()> {
-                self.calls.push(step.clone());
-                Ok(())
-            }
-            fn runtime_was_live(&self) -> bool {
-                true
-            }
-            fn preview_restart_required(&mut self) -> Result<Vec<String>, ()> {
-                Ok(vec!["env".into()])
-            }
-        }
-        let mut plan = plan(RuntimeState::Outdated { restart: true });
-        plan.operations.insert(
-            0,
-            SetupOperation::ConfigureComponent {
-                component: Component::Core,
-            },
-        );
-        let mut executor = Executor { calls: vec![] };
-        execute_setup(&plan, ExecutionMode::Apply, &mut executor).unwrap();
-        assert!(!executor
-            .calls
-            .iter()
-            .any(|s| matches!(s, SetupOperation::RestartRuntime { .. })));
     }
 }

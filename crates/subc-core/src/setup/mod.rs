@@ -3,7 +3,6 @@ mod bus_monitoring;
 mod components;
 mod config;
 mod conversion;
-mod definition;
 mod detection;
 mod file_modes;
 mod inventory;

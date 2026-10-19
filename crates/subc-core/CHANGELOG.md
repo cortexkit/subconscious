@@ -1,9 +1,8 @@
 # Changelog
 
-## 0.20.106
+## 0.20.107
 
-- Setup detects outdated, setup-owned daemon service definitions and shows the update in its dry run and confirmation. On macOS the confirmed update reloads the LaunchAgent, restarting the daemon and all modules; Windows updates the task in place without stopping it. On Linux it rewrites the changed unit and runs `systemctl --user daemon-reload` without stopping a running daemon, so the new unit applies at the next start. User-edited or unowned definitions are refused rather than overwritten.
-- Upgrade refreshes owned service definitions inside its existing daemon restart, so existing installs gain crash recovery without a second restart. Definition comparisons ignore formatting, not changed settings. See the setup contract and daemon recovery instructions for ownership and platform details.
+- Withdraw 0.20.106's service-definition update for existing installs. On Windows its comparison reported setup's own freshly written task definition as user-edited, so `ck setup` refused and exited with an error. 0.20.106 was never released. The update returns in a later version once it passes on Windows.
 
 ## 0.20.105
 

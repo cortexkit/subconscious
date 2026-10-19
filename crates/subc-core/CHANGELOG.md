@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.20.106
+
+- Setup detects outdated, setup-owned daemon service definitions and shows the update in its dry run and confirmation. On macOS the confirmed update reloads the LaunchAgent, restarting the daemon and all modules; Windows updates the task in place without stopping it. On Linux it rewrites the changed unit and runs `systemctl --user daemon-reload` without stopping a running daemon, so the new unit applies at the next start. User-edited or unowned definitions are refused rather than overwritten.
+- Upgrade refreshes owned service definitions inside its existing daemon restart, so existing installs gain crash recovery without a second restart. Definition comparisons ignore formatting, not changed settings. See the setup contract and daemon recovery instructions for ownership and platform details.
+
 ## 0.20.105
 
 - Setup reads the installed core version from the managed `ck-subc --version`, also while the daemon runs. The connection file's `daemon_ver` is the daemon library's version, which is numbered separately from the core release, so comparing it with a release or a module's core floor was wrong.

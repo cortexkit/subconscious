@@ -16,7 +16,7 @@ use super::{
     inventory::Inventory,
     model::{
         Component, ComponentState, ConfigurationState, PlatformObservation, ReleaseAvailability,
-        RuntimeState, SetupObserved, SetupOperation, SetupRequest,
+        SetupObserved, SetupOperation, SetupRequest,
     },
     planner::{execute_setup, ExecutionMode, SetupExecutor, SetupPlan},
     runtime::{self, CommandRunner, RuntimePlatform, RuntimeStatus, SystemCommandRunner},
@@ -249,16 +249,13 @@ impl SetupBackend {
         if observed.core_binary_present && !request.uninstall {
             observed.installed_core_version = self.observed_core_version();
         }
-        observed.runtime = if self.runtime_status.registered
-            && self.runtime_status.live
-            && self
-                .inventory
-                .owns_path("runtime-definition", &self.paths.runtime_paths.definition)
-        {
-            RuntimeState::Correct
-        } else {
-            RuntimeState::Missing
-        };
+        observed.runtime = runtime::definition_state(
+            self.platform,
+            &self.paths.runtime_paths,
+            self.runtime_status,
+            &mut self.runner,
+            &self.inventory,
+        )?;
         observed.configuration = configuration;
         observed.running_ck_adoption = self.running_ck_adoption();
         if !request.uninstall {
@@ -361,6 +358,9 @@ impl SetupBackend {
                 )),
                 SetupOperation::RegisterRuntime => {
                     steps.push("would register and start the daemon".to_string())
+                }
+                operation @ SetupOperation::UpdateRuntimeDefinition { .. } => {
+                    steps.push(format!("would {operation}"));
                 }
                 SetupOperation::StartRuntime if !registering_runtime => {
                     steps.push("would start the daemon".to_string())
@@ -936,6 +936,34 @@ impl SetupExecutor for SetupBackend {
                     &mut self.inventory,
                 )?;
                 println!("  registered and started the daemon");
+                Ok(())
+            }
+            SetupOperation::UpdateRuntimeDefinition { restart } => {
+                let status = runtime::observe(self.platform, &mut self.runner)?;
+                if self.platform == RuntimePlatform::Macos && status.registered && status.live {
+                    if !restart {
+                        return Err("refusal: daemon became live after planning; re-run ck setup to confirm a LaunchAgent reload".into());
+                    }
+                    runtime::restart_with_definition(
+                        self.platform,
+                        &self.paths.runtime_paths,
+                        &mut self.runner,
+                        &mut self.inventory,
+                    )?;
+                    let mut validator = CkValidator {
+                        executable: &self.executable,
+                    };
+                    validation::wait_for_daemon(&mut validator, &[])?;
+                } else {
+                    runtime::ensure(
+                        self.platform,
+                        &self.paths.runtime_paths,
+                        status,
+                        &mut self.runner,
+                        &mut self.inventory,
+                    )?;
+                }
+                println!("  updated the daemon service definition");
                 Ok(())
             }
             // Registration starts the daemon immediately on every platform. The

@@ -573,13 +573,63 @@ impl SetupFixture {
             .unwrap();
         }
 
-        Self {
+        let fixture = Self {
             _root: root,
             home,
             data_home,
             config_home,
             tools,
+        };
+        if installed {
+            fixture.write_runtime_definition(false);
         }
+        fixture
+    }
+
+    fn write_runtime_definition(&self, outdated: bool) {
+        let path = runtime_definition(&self.home);
+        let daemon = self
+            .data_home
+            .join("cortexkit/bin")
+            .join(platform_binary("ck-subc"));
+        let raw = daemon.to_string_lossy();
+        let xml = raw
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
+            .replace('\'', "&apos;");
+        let definition = if cfg!(target_os = "macos") {
+            let recovery = if outdated {
+                ""
+            } else {
+                "<key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict><key>ThrottleInterval</key><integer>10</integer>"
+            };
+            format!("<plist version=\"1.0\"><dict><key>Label</key><string>cortexkit.subc</string><key>ProgramArguments</key><array><string>{xml}</string></array><key>RunAtLoad</key><true/>{recovery}<key>ExitTimeOut</key><integer>35</integer></dict></plist>")
+        } else if cfg!(windows) {
+            let user = format!(
+                "{}\\{}",
+                std::env::var("USERDOMAIN").unwrap_or_default(),
+                std::env::var("USERNAME").unwrap_or_default()
+            )
+            .replace('&', "&amp;");
+            let recovery = if outdated {
+                ""
+            } else {
+                "<Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><StartWhenAvailable>true</StartWhenAvailable><RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable><WakeToRun>false</WakeToRun><ExecutionTimeLimit>PT0S</ExecutionTimeLimit><RestartOnFailure><Interval>PT1M</Interval><Count>255</Count></RestartOnFailure></Settings>"
+            };
+            format!("<Task version=\"1.4\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\"><RegistrationInfo><URI>\\CortexKit\\subc-daemon</URI></RegistrationInfo><Triggers><LogonTrigger><Enabled>true</Enabled><UserId>{user}</UserId></LogonTrigger></Triggers><Principals><Principal id=\"Author\"><UserId>{user}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>{recovery}<Actions Context=\"Author\"><Exec><Command>{xml}</Command></Exec></Actions></Task>")
+        } else {
+            let daemon = raw
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('%', "%%")
+                .replace('$', "$$");
+            let timeout = if outdated { "" } else { "TimeoutStopSec=35\n" };
+            format!("[Unit]\nDescription=CortexKit subconscious daemon\n[Service]\nExecStart=\"{daemon}\"\nRestart=on-failure\nDelegate=yes\nDelegateSubgroup=daemon\nKillMode=mixed\n{timeout}[Install]\nWantedBy=default.target\n")
+        };
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, definition).unwrap();
     }
 
     fn command(&self, index: &SignedIndex, args: &[&str]) -> Command {
@@ -618,6 +668,9 @@ impl SetupFixture {
             .env("CK_TEST_RELEASE_INDEX_PUBKEY", &index.public_key)
             .env("CK_TEST_SETUP_CONTROL_OK", "1")
             .env("CK_TEST_SETUP_MODULES", "aft,claustrum,insula");
+        if !runtime_definition(&self.home).exists() {
+            command.env("CK_TEST_SETUP_RUNTIME_MISSING", "1");
+        }
         command
     }
 
@@ -1390,6 +1443,36 @@ fn setup_mc_apply_reports_each_completed_change_without_a_plan() {
         !stdout.contains("proposed configuration diff:"),
         "stdout:\n{stdout}"
     );
+}
+
+#[test]
+fn setup_dry_run_shows_owned_service_definition_update_without_writing() {
+    let fixture = SetupFixture::installed("ck-setup-definition-dry-run");
+    fixture.write_runtime_definition(true);
+    let definition = runtime_definition(&fixture.home);
+    let before = fs::read(&definition).unwrap();
+    let inventory = fixture.data_home.join("cortexkit/installer-manifest.json");
+    let inventory_before = fs::read(&inventory).unwrap();
+    let index = serve_signed_index(|base| setup_index(base, None));
+    let output = fixture
+        .command(&index, &["setup", "--dry-run"])
+        .output()
+        .unwrap();
+    assert_exit(&output, 0);
+    let stdout = text(&output.stdout);
+    assert!(
+        stdout.contains("would update the daemon service definition"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("restart after a crash"), "{stdout}");
+    if cfg!(target_os = "macos") {
+        assert!(
+            stdout.contains("restarts the daemon and every module"),
+            "{stdout}"
+        );
+    }
+    assert_eq!(fs::read(&definition).unwrap(), before);
+    assert_eq!(fs::read(&inventory).unwrap(), inventory_before);
 }
 
 #[cfg(not(windows))]

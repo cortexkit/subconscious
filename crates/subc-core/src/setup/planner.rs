@@ -240,19 +240,29 @@ pub fn plan_setup(observed: &SetupObserved, request: &SetupRequest) -> SetupPlan
         });
     }
 
-    if observed.runtime == RuntimeState::Missing {
-        plan.operations.push(SetupOperation::RegisterRuntime);
-        plan.operations.push(SetupOperation::StartRuntime);
-    } else {
-        plan.outcomes.push(PlanOutcome::Noop {
+    match &observed.runtime {
+        RuntimeState::Missing => {
+            plan.operations.push(SetupOperation::RegisterRuntime);
+            plan.operations.push(SetupOperation::StartRuntime);
+        }
+        RuntimeState::Outdated { restart } => {
+            plan.operations
+                .push(SetupOperation::UpdateRuntimeDefinition { restart: *restart });
+        }
+        RuntimeState::Unowned { reason } => plan.outcomes.push(PlanOutcome::Refusal {
+            reason: reason.clone(),
+        }),
+        RuntimeState::Correct => plan.outcomes.push(PlanOutcome::Noop {
             scope: "per-user runtime is already registered and live".to_string(),
-        });
+        }),
     }
 
     if !observed.restart_required.is_empty() {
-        plan.operations.push(SetupOperation::RestartRuntime {
-            sections: observed.restart_required.clone(),
-        });
+        if !matches!(observed.runtime, RuntimeState::Outdated { restart: true }) {
+            plan.operations.push(SetupOperation::RestartRuntime {
+                sections: observed.restart_required.clone(),
+            });
+        }
         plan.outcomes.push(PlanOutcome::CoreRestartRequired {
             sections: observed.restart_required.clone(),
         });
@@ -497,7 +507,11 @@ pub fn execute_setup<E: SetupExecutor>(
                 pending_restart = Some(sections);
             }
         }
-        if matches!(operation, SetupOperation::RestartRuntime { .. }) {
+        if matches!(
+            operation,
+            SetupOperation::RestartRuntime { .. }
+                | SetupOperation::UpdateRuntimeDefinition { restart: true }
+        ) {
             restart_applied = true;
             pending_restart = None;
         }

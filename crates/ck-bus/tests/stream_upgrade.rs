@@ -441,26 +441,54 @@ async fn a_five_stream_plane_upgrades_in_place_to_six_streams_and_the_module_dur
     );
 
     let module_durables = [
-        (streams.event.clone(), "m_basal", names.event_binding()),
+        (
+            streams.event.clone(),
+            "m_basal",
+            vec![names.event_binding()],
+        ),
         (
             streams.event.clone(),
             "m_prefrontal-core",
-            format!("ck.{}.event.broca.>", names.account()),
+            vec![format!("ck.{}.event.broca.>", names.account())],
         ),
         (
             streams.event.clone(),
             "m_astrocyte",
-            format!("ck.{}.event.insula.>", names.account()),
+            vec![format!("ck.{}.event.insula.>", names.account())],
         ),
         (
             streams.event.clone(),
             "m_prefrontal-routing",
-            format!("ck.{}.event.insula.>", names.account()),
+            vec![format!("ck.{}.event.insula.>", names.account())],
+        ),
+        (
+            streams.event.clone(),
+            "m_magic-context",
+            vec![
+                format!("ck.{}.event.thalamus-harness.compaction.>", names.account()),
+                format!("ck.{}.event.broca.compaction.>", names.account()),
+            ],
+        ),
+        (
+            streams.event.clone(),
+            "m_thalamus-harness",
+            vec![format!(
+                "ck.{}.event.magic-context.compaction.>",
+                names.account()
+            )],
+        ),
+        (
+            streams.event.clone(),
+            "m_broca",
+            vec![format!(
+                "ck.{}.event.magic-context.compaction.>",
+                names.account()
+            )],
         ),
         (
             streams.room.clone(),
             "m_prefrontal-core",
-            names.room_binding(),
+            vec![names.room_binding()],
         ),
     ];
     for (stream, durable, filter) in &module_durables {
@@ -469,7 +497,7 @@ async fn a_five_stream_plane_upgrades_in_place_to_six_streams_and_the_module_dur
             Some(Value::Array(filters)) if !filters.is_empty() => Value::Array(filters.clone()),
             _ => serde_json::json!([config["filter_subject"]]),
         };
-        assert_eq!(filters, serde_json::json!([filter]), "{durable}'s filter");
+        assert_eq!(filters, serde_json::json!(filter), "{durable}'s filter");
         assert_eq!(config["durable_name"], *durable);
         assert_eq!(config["ack_policy"], "explicit", "{durable}");
         assert_eq!(config["deliver_policy"], "all", "{durable}");
@@ -696,11 +724,50 @@ async fn bootstrap_creates_every_table_event_durable_with_its_filter_and_setting
         return;
     };
     drop(plane.bootstrap().await);
-    for (durable, module) in [
-        ("m_prefrontal-core", "broca"),
-        ("m_astrocyte", "insula"),
-        ("m_prefrontal-routing", "insula"),
-    ] {
+    let readers = [
+        (
+            "m_prefrontal-core",
+            vec![format!("ck.{}.event.broca.>", plane.names.account())],
+        ),
+        (
+            "m_astrocyte",
+            vec![format!("ck.{}.event.insula.>", plane.names.account())],
+        ),
+        (
+            "m_prefrontal-routing",
+            vec![format!("ck.{}.event.insula.>", plane.names.account())],
+        ),
+        (
+            "m_magic-context",
+            vec![
+                format!(
+                    "ck.{}.event.thalamus-harness.compaction.>",
+                    plane.names.account()
+                ),
+                format!("ck.{}.event.broca.compaction.>", plane.names.account()),
+            ],
+        ),
+        (
+            "m_thalamus-harness",
+            vec![format!(
+                "ck.{}.event.magic-context.compaction.>",
+                plane.names.account()
+            )],
+        ),
+        (
+            "m_broca",
+            vec![format!(
+                "ck.{}.event.magic-context.compaction.>",
+                plane.names.account()
+            )],
+        ),
+    ];
+    assert_eq!(
+        readers.len(),
+        cortexkit_bus_naming::EVENT_CONSUMERS.len(),
+        "the startup expectations cover every event-consumer table entry"
+    );
+    for (durable, expected_filters) in readers {
         let info = plane.consumer(durable).await.get_info().await.unwrap();
         let config = info.config;
         let filters = if config.filter_subjects.is_empty() {
@@ -708,10 +775,7 @@ async fn bootstrap_creates_every_table_event_durable_with_its_filter_and_setting
         } else {
             config.filter_subjects
         };
-        assert_eq!(
-            filters,
-            vec![format!("ck.{}.event.{module}.>", plane.names.account())]
-        );
+        assert_eq!(filters, expected_filters,);
         assert!(config.deliver_subject.is_none(), "{durable} must be pull");
         assert_eq!(config.ack_policy, jetstream::consumer::AckPolicy::Explicit);
         assert_eq!(
@@ -734,11 +798,21 @@ async fn second_bootstrap_keeps_event_durable_creation_times_and_ack_floors() {
     drop(plane.bootstrap().await);
     plane.store_event("broca", "run.started").await;
     plane.store_event("insula", "signal").await;
+    plane
+        .store_event("thalamus-harness", "compaction.started")
+        .await;
+    plane.store_event("broca", "compaction.started").await;
+    plane
+        .store_event("magic-context", "compaction.started")
+        .await;
     let durables = [
         "m_basal",
         "m_prefrontal-core",
         "m_astrocyte",
         "m_prefrontal-routing",
+        "m_magic-context",
+        "m_thalamus-harness",
+        "m_broca",
     ];
     let mut before = Vec::new();
     for durable in durables {
@@ -919,7 +993,14 @@ async fn prefrontal_event_grant_pulls_and_acks_seven_token_events_but_refuses_ot
     );
     // Check each denied subject through the server's permission-violation callback,
     // not merely a timed-out request that could also mean an unavailable broker.
-    for durable in ["m_basal", "m_astrocyte", "m_prefrontal-routing"] {
+    for durable in [
+        "m_basal",
+        "m_astrocyte",
+        "m_prefrontal-routing",
+        "m_magic-context",
+        "m_thalamus-harness",
+        "m_broca",
+    ] {
         for verb in ["INFO", "MSG.NEXT"] {
             let subject = format!(
                 "$JS.API.CONSUMER.{verb}.{}.{durable}",

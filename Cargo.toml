@@ -67,3 +67,6 @@ opt-level = 3
 # only inside this workspace; published crates are unaffected.
 [patch.crates-io]
 subc-os = { path = "crates/subc-os" }
+# async-nats uses tryhard for JetStream reconnects; its commons copy keeps
+# tokio's test-only clock out of normal binaries until upstream removes it.
+tryhard = { git = "https://github.com/cortexkit/commons", rev = "46853185cd2ee6b6bcb684ca7d63663d59d6c8cb" }

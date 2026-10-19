@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.4.6
+
+- Create durable readers for compaction events before modules connect:
+  `m_magic-context` reads thalamus-harness and broca compaction events, while
+  `m_thalamus-harness` and `m_broca` each read magic-context compaction events.
+- Use the commons-maintained tryhard 0.5.2 copy, which omits Tokio's test clock
+  from normal dependencies so production bus binaries do not link test-only time.
+
 ## 0.4.5
 
 - Take cortexkit-bus-naming 0.2.4, whose event-consumer table adds

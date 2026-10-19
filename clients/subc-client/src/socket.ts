@@ -102,16 +102,22 @@ export class SubcSocket {
     sock.on("data", (chunk: Buffer) => {
       this.chunks.push(chunk);
       this.buffered += chunk.length;
-      if (this.waiter) {
+      if (this.waiter && this.waiter.extendOnProgress && this.buffered < this.waiter.need) {
+        // Progress was made on a pending idle-budget read: push the deadline
+        // out by the budget again so a slow but moving stream does not time
+        // out. That replaces any timeout check already in flight.
+        //
+        // An absolute deadline is never cancelled by arriving bytes. If its
+        // timer has fired and the check is waiting in setImmediate, a byte
+        // landing in that gap must not drop the check, or a peer dripping
+        // bytes would hold the read open long past its deadline. tryServe
+        // below settles the read if the bytes complete it; otherwise the
+        // pending check rejects it.
         if (this.waiter.immediate) {
           clearImmediate(this.waiter.immediate);
           this.waiter.immediate = null;
         }
-        if (this.waiter.extendOnProgress && this.buffered < this.waiter.need) {
-          // Progress was made on the pending read: push the deadline out
-          // by the budget again so a slow but moving stream does not time out.
-          this.armWaiterTimer(this.waiter);
-        }
+        this.armWaiterTimer(this.waiter);
       }
       this.tryServe();
     });

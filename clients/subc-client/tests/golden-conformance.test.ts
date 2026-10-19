@@ -218,6 +218,16 @@ describe("Rust golden fixtures", () => {
     expect(typeof removed.message).toBe("string");
   });
 
+  test("operation delivery reaches HELLO with open strings and omits empty maps", () => {
+    const manifest = managementSurfaceManifest({ moduleId: "watch", operations: ["status"] });
+    const operation_delivery = { status: "watch", future: "stream-v2" };
+    const normalized = normalizeManifest({ ...manifest, operation_delivery }, undefined);
+    expect(normalized.operation_delivery).toEqual(operation_delivery);
+    expect(normalized.operation_delivery).not.toBe(operation_delivery);
+    expect(normalizeManifest(manifest, undefined)).not.toHaveProperty("operation_delivery");
+    expect(normalizeManifest({ ...manifest, operation_delivery: {} }, undefined)).not.toHaveProperty("operation_delivery");
+  });
+
   test("route targets keep the discriminator the client switches on", () => {
     // RouteTarget is a tagged union on `kind`; the client builds these and the
     // daemon matches them, so the tag values are a contract rather than a detail.

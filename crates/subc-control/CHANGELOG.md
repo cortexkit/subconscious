@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.32.1
+
+- Add `CatalogEntry.operation_delivery` and `with_operation_delivery` to mirror management delivery hints from the registered manifest. Values use subc-protocol 0.32.5's open `OperationDelivery` type: unknown strings survive, and only `"watch"` on a declared query is subscribable. Empty maps are omitted so existing catalog replies retain their wire bytes. Older readers ignore the additive field.
+
 ## 0.32.0
 
 - `PendingReloadVerdict` gains `spec: Option<LaunchSpecAgreement>`: whether the running process was started with the module's currently configured launch inputs (program, arguments, configured environment and protocol). `Match`, `Mismatch`, `Unavailable { reason }` (`not_running`, `spawned_spec_unavailable`), or `Unknown` for a status a newer daemon sends. `None` means the daemon predates the field, never agreement. Breaking for code that builds `PendingReloadVerdict` with a struct literal: add `spec`.

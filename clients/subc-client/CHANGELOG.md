@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.22.5
+
+- Add optional `operation_delivery` maps to `ManifestInput` and `CatalogEntry`. HELLO normalization preserves open delivery strings and omits absent or empty maps. Only `"watch"` on a declared management query is subscribable; unknown strings are metadata, not watch permission. Catalog discovery requires a daemon that projects the field; older daemons drop it.
+
 ## 0.22.4
 
 - A read with an absolute deadline now fails at that deadline even while the peer keeps sending bytes. Previously a byte arriving just after the deadline timer fired cancelled the pending timeout check, so a slowly dripping peer could hold the read open long past its deadline (seen on Windows: 616 ms against a 60 ms deadline). Reads with an idle budget still extend on progress.

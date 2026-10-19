@@ -3795,6 +3795,7 @@ impl ControlHandler {
                 .with_capabilities(registration.manifest.capabilities)
                 .with_self_signals(registration.manifest.self_signals)
                 .with_events(registration.manifest.events)
+                .with_operation_delivery(registration.manifest.operation_delivery)
             })
             .collect();
         let response = ClientControlResponse::CatalogList {
@@ -8743,6 +8744,70 @@ mod tests {
             body["modules"][0]["roles"][0]["operations"][0]["description"], description,
             "catalog.list must preserve the declared operation description verbatim"
         );
+    }
+
+    #[test]
+    fn catalog_list_mirrors_registered_operation_delivery() {
+        let registry = Arc::new(Registry::default());
+        let handler = ControlHandler::new(Arc::clone(&registry));
+        let delivery =
+            json!({"status": "watch", "future": "stream-v2", "reset": "watch", "missing": "watch"});
+        let mut body = serde_json::to_value(ModuleHelloBody {
+            manifest: manifest("watch-management", PROTOCOL_VERSION),
+            protocol_ver: PROTOCOL_VERSION,
+            control_ops: None,
+            launch_nonce: None,
+        })
+        .unwrap();
+        body["manifest"]["provides"] = json!([{
+            "role": "management_surface",
+            "operations": [
+                {"name": "status", "kind": "query"},
+                {"name": "future", "kind": "query"},
+                {"name": "reset", "kind": "mutate"}
+            ],
+            "config_schema": {}, "observability": [], "identity_scope": []
+        }]);
+        body["manifest"]["operation_delivery"] = delivery.clone();
+        let hello = Frame::build(
+            FrameType::Hello,
+            control_flags(),
+            0,
+            0,
+            99,
+            serde_json::to_vec(&body).unwrap(),
+        )
+        .unwrap();
+        let response = handler
+            .handle_control(ConnectionId::new(99), hello)
+            .unwrap();
+        assert_eq!(response[0].header.ty, FrameType::HelloAck);
+
+        let (_, registrations) = registry.list_modules().unwrap();
+        let registered = &registrations[0].manifest;
+        assert!(registered.is_watch_operation("status"));
+        assert!(!registered.is_watch_operation("future"));
+        assert!(!registered.is_watch_operation("reset"));
+        assert!(!registered.is_watch_operation("missing"));
+
+        let request = Frame::build(
+            FrameType::Request,
+            control_flags(),
+            0,
+            0,
+            100,
+            serde_json::to_vec(&ClientControlRequest::CatalogList { module_id: None }).unwrap(),
+        )
+        .unwrap();
+        let response = handler.handle_catalog_list(request, None).unwrap();
+        let body: Value = serde_json::from_slice(&response[0].body).unwrap();
+        assert_eq!(body["modules"][0]["operation_delivery"], delivery);
+        let ClientControlResponse::CatalogList { modules, .. } =
+            serde_json::from_slice(&response[0].body).unwrap()
+        else {
+            panic!("expected catalog.list");
+        };
+        assert_eq!(modules[0].operation_delivery, registered.operation_delivery);
     }
 
     #[test]

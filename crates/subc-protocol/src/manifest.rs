@@ -6,7 +6,10 @@
 //! (for example, AFT's per-project actor map) remains internal to the singleton
 //! module.
 
-use std::{collections::HashSet, fmt};
+use std::{
+    collections::{BTreeMap, HashSet},
+    fmt,
+};
 
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
 use serde_json::Value;
@@ -102,6 +105,12 @@ pub struct ModuleManifest {
     pub self_signals: Option<Vec<SelfSignalDeclaration>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provenance: Option<ManifestProvenance>,
+    /// Delivery hints keyed by management operation name; absent entries are unary.
+    /// Only `"watch"` on a declared query is subscribable; see [`Self::is_watch_operation`].
+    /// Unknown strings are retained. A malformed map is dropped as a whole rather
+    /// than refusing HELLO. Older daemons silently drop this field.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub operation_delivery: BTreeMap<String, OperationDelivery>,
 }
 
 /// Incrementally constructs a [`ModuleManifest`] without fabricating absent facts.
@@ -119,6 +128,7 @@ pub struct ModuleManifestBuilder {
     events: Option<Vec<EventDeclaration>>,
     self_signals: Option<Vec<SelfSignalDeclaration>>,
     provenance: Option<ManifestProvenance>,
+    operation_delivery: BTreeMap<String, OperationDelivery>,
 }
 
 impl ModuleManifest {
@@ -146,7 +156,24 @@ impl ModuleManifest {
             events: None,
             self_signals: None,
             provenance: None,
+            operation_delivery: BTreeMap::new(),
         }
+    }
+
+    /// Whether a management query explicitly declares watch delivery.
+    ///
+    /// Missing operations, non-query operations and unknown delivery strings are
+    /// not watches. Such declarations are discovery hints, not HELLO refusals.
+    pub fn is_watch_operation(&self, name: &str) -> bool {
+        self.operation_delivery
+            .get(name)
+            .is_some_and(OperationDelivery::is_watch)
+            && self.provides.iter().any(|role| match role {
+                ProviderRole::ManagementSurface { operations, .. } => operations
+                    .iter()
+                    .any(|op| op.name == name && op.kind == ManagementOperationKind::Query),
+                _ => false,
+            })
     }
 }
 
@@ -215,6 +242,15 @@ impl ModuleManifestBuilder {
         self
     }
 
+    /// Sets delivery hints; an empty map preserves the legacy unary wire shape.
+    pub fn operation_delivery(
+        mut self,
+        operation_delivery: BTreeMap<String, OperationDelivery>,
+    ) -> Self {
+        self.operation_delivery = operation_delivery;
+        self
+    }
+
     /// Finishes the manifest.
     pub fn build(self) -> ModuleManifest {
         ModuleManifest {
@@ -230,6 +266,7 @@ impl ModuleManifestBuilder {
             events: self.events,
             self_signals: self.self_signals,
             provenance: self.provenance,
+            operation_delivery: self.operation_delivery,
         }
     }
 }
@@ -273,6 +310,8 @@ struct ModuleManifestWire {
     self_signals: Option<Vec<SelfSignalDeclaration>>,
     #[serde(default)]
     provenance: Option<ManifestProvenance>,
+    #[serde(default)]
+    operation_delivery: Option<Value>,
     // `runtime_computed` belongs to --manifest output rather than the retained
     // manifest model. Deserialize it only long enough to enforce that capability
     // declarations cannot be omitted as runtime-varying data.
@@ -308,6 +347,11 @@ impl<'de> Deserialize<'de> for ModuleManifest {
             .events(events)
             .self_signals(wire.self_signals)
             .provenance(wire.provenance)
+            .operation_delivery(
+                wire.operation_delivery
+                    .and_then(|value| serde_json::from_value(value).ok())
+                    .unwrap_or_default(),
+            )
             .build();
         manifest
             .validate_capability_grammar()
@@ -1888,6 +1932,9 @@ pub struct PipelineAppliesTo {
 }
 
 /// Operation exposed on the management plane.
+///
+/// Delivery hints live in [`ModuleManifest::operation_delivery`] so adding a
+/// delivery mode does not change this exhaustive operation descriptor.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct ManagementOperation {
     pub name: String,
@@ -1901,6 +1948,56 @@ pub struct ManagementOperation {
 pub enum ManagementOperationKind {
     Query,
     Mutate,
+}
+
+/// An open delivery string, like [`SelfSignalKind`]: unknown values survive
+/// decoding and re-encoding but do not grant watch semantics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum OperationDelivery {
+    Watch,
+    Other(String),
+}
+
+impl OperationDelivery {
+    /// The subscribable delivery mode for management queries.
+    pub const WATCH: Self = Self::Watch;
+
+    /// The exact delivery string on the wire.
+    pub fn wire_name(&self) -> &str {
+        match self {
+            Self::Watch => "watch",
+            Self::Other(value) => value,
+        }
+    }
+
+    /// Recognizes only the exact `"watch"` string.
+    pub fn is_watch(&self) -> bool {
+        self.wire_name() == "watch"
+    }
+}
+
+impl Serialize for OperationDelivery {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.wire_name())
+    }
+}
+
+impl<'de> Deserialize<'de> for OperationDelivery {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Ok(if value == "watch" {
+            Self::WATCH
+        } else {
+            Self::Other(value)
+        })
+    }
 }
 
 /// Observable state exposed on the management plane.

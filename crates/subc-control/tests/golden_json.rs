@@ -1,4 +1,4 @@
-use std::{fmt::Debug, fs, path::PathBuf};
+use std::{collections::BTreeMap, fmt::Debug, fs, path::PathBuf};
 
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
@@ -19,9 +19,9 @@ use subc_protocol::{
     manifest::{
         CapabilityDeclarations, CapabilityNeed, CapabilityRequirement, Concurrency, ExecutionMode,
         IdentityScope, InternalTransport, ManagementOperation, ManagementOperationKind,
-        ManifestProvenance, ObservabilityKind, ObservabilitySurface, PipelineAppliesTo,
-        PipelineStageKind, ProviderRole, SelfSignalDeclaration, SelfSignalEffect, SelfSignalKind,
-        SignalAnchor, SignalCadence, Tool,
+        ManifestProvenance, ObservabilityKind, ObservabilitySurface, OperationDelivery,
+        PipelineAppliesTo, PipelineStageKind, ProviderRole, SelfSignalDeclaration,
+        SelfSignalEffect, SelfSignalKind, SignalAnchor, SignalCadence, Tool,
     },
     session::HealthStatus,
     BindIdentity, RouteTarget, PROTOCOL_VERSION,
@@ -185,6 +185,46 @@ fn control_wire_shapes_match_golden_json_and_round_trip() {
     );
     assert_golden("poll_kind_status", &PollKind::Status);
     assert_golden("poll_kind_liveness", &PollKind::Liveness);
+}
+
+#[test]
+fn catalog_empty_operation_delivery_preserves_existing_reply_goldens() {
+    let mut checked = 0;
+    for (name, mut response) in client_control_responses() {
+        if let ClientControlResponse::CatalogList { modules, .. } = &mut response {
+            assert!(!modules.is_empty());
+            for entry in modules {
+                *entry = entry.clone().with_operation_delivery(BTreeMap::new());
+            }
+            assert_golden(name, &response);
+            checked += 1;
+        }
+    }
+    assert!(checked > 0, "catalog reply goldens must be exercised");
+}
+
+#[test]
+fn catalog_operation_delivery_round_trips_open_strings() {
+    let delivery = BTreeMap::from([
+        ("status".to_string(), OperationDelivery::WATCH),
+        (
+            "future".to_string(),
+            OperationDelivery::Other("stream-v2".to_string()),
+        ),
+    ]);
+    let entry = catalog_entry().with_operation_delivery(delivery.clone());
+    let mut encoded = serde_json::to_value(&entry).unwrap();
+    assert_eq!(
+        encoded["operation_delivery"],
+        serde_json::json!({"status": "watch", "future": "stream-v2"})
+    );
+    encoded["future_catalog_field"] = serde_json::json!({"unknown": true});
+    let decoded: CatalogEntry = serde_json::from_value(encoded).unwrap();
+    assert_eq!(decoded, entry);
+    assert!(decoded
+        .with_operation_delivery(BTreeMap::new())
+        .operation_delivery
+        .is_empty());
 }
 
 fn assert_golden<T>(name: &str, value: &T)

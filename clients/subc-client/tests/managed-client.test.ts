@@ -227,6 +227,23 @@ describe("daemon-originated control pushes", () => {
 });
 
 describe("SubcClient capability resolution", () => {
+  test("catalogList preserves open operation delivery and tolerates unknown entry fields", async () => {
+    const { connFile } = tempConnectionFile();
+    const operation_delivery = { status: "watch", future: "stream-v2" };
+    const entry = { ...catalogEntry("watch-provider", undefined), operation_delivery, future_catalog_field: true };
+    const legacy = catalogEntry("unary-provider", undefined);
+    const daemon = await startFakeDaemon({ stats: newStats(), catalogModules: [entry, legacy] });
+    writeConnectionFile(connFile, daemon.port);
+    const client = await SubcClient.connect({ connectionFile: connFile });
+    try {
+      const modules = await client.catalogList();
+      expect(modules.find((module) => module.module_id === "watch-provider")?.operation_delivery).toEqual(operation_delivery);
+      expect(modules.find((module) => module.module_id === "unary-provider")?.operation_delivery).toBeUndefined();
+    } finally {
+      client.close();
+    }
+  });
+
   test("catalogList preserves declared bus events", async () => {
     const { connFile } = tempConnectionFile();
     const stats = newStats();

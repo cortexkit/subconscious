@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.36.15
+
+- Project registered `ModuleManifest.operation_delivery` maps into typed `catalog.list` entries. Empty maps remain absent on the wire; unknown delivery strings are preserved. Watch hints naming missing or non-query operations do not refuse HELLO and are not subscribable according to the manifest helper. Supervisor replies do not expose manifests and are unchanged.
+
 ## 0.36.14
 
 - With `test-support`, in-process harnesses can install the existing scripted operator-confirm provider through `ForwardingTable::configure_operator_script`, including optional event logging and timing limits, without bootstrapping a daemon process. The executable must still be named `ckdev-*`; other names retain the OS provider and log the same refusal as bootstrap. Builds without the feature are unchanged.

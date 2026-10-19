@@ -16,8 +16,8 @@ use serde::{
 };
 use subc_protocol::{
     manifest::{
-        CapabilityDeclarations, EventDeclaration, ManifestProvenance, ProviderRole,
-        SelfSignalDeclaration,
+        CapabilityDeclarations, EventDeclaration, ManifestProvenance, OperationDelivery,
+        ProviderRole, SelfSignalDeclaration,
     },
     scope::ScopeSelector,
     session::HealthStatus,
@@ -1978,6 +1978,10 @@ pub struct CatalogEntry {
     /// declaration that the module publishes no events.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub events: Option<Vec<EventDeclaration>>,
+    /// Open delivery hints mirrored from the module manifest. Empty means unary;
+    /// only `"watch"` on a declared management query is subscribable.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub operation_delivery: BTreeMap<String, OperationDelivery>,
 }
 
 impl CatalogEntry {
@@ -1998,6 +2002,7 @@ impl CatalogEntry {
             capabilities: None,
             self_signals: None,
             events: None,
+            operation_delivery: BTreeMap::new(),
         }
     }
 
@@ -2040,6 +2045,17 @@ impl CatalogEntry {
     #[must_use]
     pub fn with_events(mut self, events: Option<Vec<EventDeclaration>>) -> Self {
         self.events = events;
+        self
+    }
+
+    /// Set delivery hints mirrored from the module manifest.
+    /// Serialization omits this field when the stored map is empty.
+    #[must_use]
+    pub fn with_operation_delivery(
+        mut self,
+        operation_delivery: BTreeMap<String, OperationDelivery>,
+    ) -> Self {
+        self.operation_delivery = operation_delivery;
         self
     }
 }

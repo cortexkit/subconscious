@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.32.5
+
+- Add `ModuleManifest.operation_delivery` and its builder setter: a map from management operation names to open `OperationDelivery` strings. Empty maps are omitted, preserving existing manifest bytes. `OperationDelivery::WATCH` and `is_watch()` recognize exactly `"watch"`; unknown strings round-trip without becoming subscribable.
+- `ModuleManifest::is_watch_operation` requires both watch delivery and a declared management operation of kind `query`. Missing or non-query names are not watches and do not refuse HELLO. Malformed delivery maps (including any non-string value) are dropped as a whole without rejecting the manifest. Older daemons silently drop the new field, so discovery requires a daemon built against this protocol revision.
+
 ## 0.32.4
 
 - Add terminal `error_codes::FRAME_TOO_LARGE` (`frame_too_large`) for a module reply whose header plus body exceeds the client connection's egress budget. It does not mark the established route dead: Rust and TypeScript SDKs return the request error without reopening or retrying; Swift already throws on route ERRORs without retrying. Retrying the same request could repeat module side effects and produce the same oversized reply. No envelope or protocol-version change.

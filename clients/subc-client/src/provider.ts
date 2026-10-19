@@ -90,6 +90,8 @@ export interface ManifestInput {
    * from the launch nonce it sends.
    */
   provenance?: ManifestProvenance;
+  /** Open delivery strings by management operation; only `"watch"` on a query is subscribable. */
+  operation_delivery?: Record<string, string>;
 }
 
 /**
@@ -1673,6 +1675,9 @@ export function normalizeManifest(manifest: ManifestInput, sentNonce: string | u
     ...(manifest.provenance === undefined
       ? {}
       : { provenance: normalizeProvenance(manifest.provenance, sentNonce) }),
+    ...(manifest.operation_delivery === undefined || Object.keys(manifest.operation_delivery).length === 0
+      ? {}
+      : { operation_delivery: { ...manifest.operation_delivery } }),
   };
 }
 

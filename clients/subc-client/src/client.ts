@@ -194,6 +194,8 @@ export interface CatalogEntry {
   self_signals?: CatalogSelfSignalDeclaration[] | null;
   /** Bus events mirrored verbatim from the registered module manifest. */
   events?: CatalogEventDeclaration[] | null;
+  /** Open delivery strings mirrored from the manifest; absent entries are unary. */
+  operation_delivery?: Record<string, string>;
 }
 
 export interface RequestOptions {

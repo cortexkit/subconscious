@@ -1319,7 +1319,10 @@ describe("SubcProvider closed", () => {
   });
 });
 
-describe("SubcProvider launch nonce", () => {
+// The POSIX descriptor launch path (SUBC_LAUNCH_NONCE_FD). On Windows the
+// accessor reads the named pipe in SUBC_LAUNCH_NONCE_PIPE instead, which
+// tests/launch-nonce-pipe.test.ts covers, so this suite runs off Windows only.
+describe.skipIf(process.platform === "win32")("SubcProvider launch nonce", () => {
   const PROVENANCE: ManifestProvenance = { build_git_sha: "0123456789abcdef0123456789abcdef01234567", wire_crate_version: "0.16.0" };
   const NO_NONCE_ENV = { SUBC_MODULE_ID: undefined, SUBC_LAUNCH_NONCE: undefined, SUBC_LAUNCH_NONCE_FD: undefined };
 

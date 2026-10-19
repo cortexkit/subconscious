@@ -58,7 +58,10 @@ function pipeHolding(bytes: string, path = fifoPath()): { fd: number; fdValue: s
   return { fd, fdValue: `${fd}:${BigInt.asUintN(64, fstatSync(fd, { bigint: true }).ino)}` };
 }
 
-describe("SubcClient route.open consumer identity", () => {
+// The POSIX descriptor launch path (SUBC_LAUNCH_NONCE_FD). On Windows the
+// accessor reads the named pipe in SUBC_LAUNCH_NONCE_PIPE instead, which
+// tests/launch-nonce-pipe.test.ts covers, so this suite runs off Windows only.
+describe.skipIf(process.platform === "win32")("SubcClient route.open consumer identity", () => {
   test("omits consumer_identity when either env var is absent", async () => {
     delete process.env[SUBC_MODULE_ID_ENV];
     delete process.env[SUBC_LAUNCH_NONCE_ENV];

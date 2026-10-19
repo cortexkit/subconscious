@@ -27,6 +27,14 @@ import {
   type RouteScope,
 } from "../src/index.js";
 
+// Bun on Windows crashes the whole test process (a segmentation fault inside
+// the runtime) when the fake daemon closes the client's socket and the client
+// reconnects. Seen on GitHub's windows-latest runner with setup-bun "latest";
+// each of these three tests crashes it when run on its own. A segfault comes
+// from the runtime, not from this library, so they run on Linux and macOS,
+// which cover the reconnect path, and are skipped on Windows only.
+const reconnectTest = test.skipIf(process.platform === "win32");
+
 const KEY = Uint8Array.from(Array(32).fill(0x4c));
 const DAEMON_ID = Uint8Array.from(Array(16).fill(0x7d));
 const SERVER_NONCE = Uint8Array.from(Array.from({ length: 32 }, (_, i) => 0xa0 + i));
@@ -447,7 +455,7 @@ describe("SubcClient managed call", () => {
     }
   });
 
-  test("opens a fresh route for a managed call after reconnect", async () => {
+  reconnectTest("opens a fresh route for a managed call after reconnect", async () => {
     const { connFile } = tempConnectionFile();
     const sleeps: number[] = [];
     const firstStats = newStats();
@@ -490,7 +498,7 @@ describe("SubcClient managed call", () => {
     }
   });
 
-  test("recovers across a daemon restart that rotates the key (stale-file auth race is transient)", async () => {
+  reconnectTest("recovers across a daemon restart that rotates the key (stale-file auth race is transient)", async () => {
     // The daemon rotates its key on every restart but keeps its fixed port. A
     // client racing the restart reads the pre-rotation connection file, connects
     // successfully (port unchanged), and fails the HMAC handshake. That proof
@@ -550,7 +558,7 @@ describe("SubcClient managed call", () => {
     }
   });
 
-  test("re-attaches the same consumer_identity when a later call opens after reconnect", async () => {
+  reconnectTest("re-attaches the same consumer_identity when a later call opens after reconnect", async () => {
     // A route opened with a consumer_identity (principal attestation) must send the
     // SAME consumer_identity when it is reopened on a fresh connection after a
     // reconnect. Dropping it there would let the daemon re-stamp the route with a

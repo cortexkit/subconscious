@@ -386,6 +386,79 @@ requires no UAC prompt or elevation. An elevated Windows service is not an
 alpha target. Setup must separately report current liveness and persistent
 registration; logon registration alone is not sufficient acceptance.
 
+### Service-definition reconciliation
+
+Setup observes definitions even when the daemon is healthy. An outdated owned
+definition adds `update the daemon service definition (includes restart after a
+crash)` to both the dry run and interactive confirmation. Current definitions
+add no update step. An unowned or user-edited definition reports a blocking
+refusal before any setup mutation, like an unowned binary; apply checks ownership
+again before writing. A registered service without its owned definition file is
+also refused. Symlinks and non-regular definition files are not overwritten.
+
+Comparison is semantic, not byte-based:
+
+- macOS: parse the plist dictionary, including all keys, typed booleans/integers,
+  strings and ordered arrays. Dictionary order, XML indentation, comments and
+  entity spelling do not matter; string contents and array order do.
+- Windows: parse the submitted XML and export the registered task with
+  `Export-ScheduledTask`. Compare element names/namespaces, attributes, text and
+  children, sorting only unordered schema containers. Resolve exported SID
+  UserIds to account names. Ignore registration Date/Author and known optional
+  schema defaults added by Task Scheduler; non-default settings and extra
+  elements remain visible as edits. The registered task must agree with the
+  inventory-owned XML before it may be updated.
+  Registration comparison additionally accounts for version-1.4 tasks exporting
+  `UseUnifiedSchedulingEngine=true` when omitted at creation, and omitting the
+  default `RunLevel=LeastPrivilege` and logon-trigger `Enabled=true`. This
+  projection is never used to establish file ownership: an explicit engine value,
+  elevation, disabled trigger, command-path change or other setting still
+  participates in comparison. Both explicit engine values remain distinct.
+- Linux: parse section names and directive/value lists, ignoring blank lines,
+  full-line comments and whitespace around `=`. Repeated directives retain their
+  order. All directives, including `ExecStart`, delegation, stop and restart
+  policies, participate. Old units can differ even though this release does not
+  change `Restart=on-failure`.
+
+The `runtime-definition` inventory row records canonical `definition_semantics`
+after a successful write. Later semantic edits invalidate that ownership. Older
+rows have only a path and identifier: accept them only when the file matches a
+known historical generated template for this daemon path and Windows account
+(including the pre-recovery templates). This cannot distinguish a user edit
+that exactly reproduces a historical template. Unknown legacy variants are
+conservatively refused, not adopted merely because their path is recorded.
+
+Application is platform-specific:
+
+- A loaded, live macOS agent requires bootout/bootstrap to read a replacement
+  plist. The update step says it restarts the daemon **and every module** and
+  runs only through the accepted setup plan. Ordinary `ensure` still refuses a
+  changed live definition without writing or issuing commands; a daemon that
+  becomes live after a non-restarting plan requires replanning. Configuration
+  restart requirements coalesce into the same planned reload.
+- Windows updates the existing registration in place with `Set-ScheduledTask`
+  (generated action, logon trigger, principal and settings), never `/End` or
+  `/Run` for a live setup update. Microsoft's [Set-ScheduledTask documentation](https://learn.microsoft.com/en-us/powershell/module/scheduledtasks/set-scheduledtask)
+  states that changes to the definition do not affect its running instance;
+  [New-ScheduledTaskSettingsSet](https://learn.microsoft.com/en-us/powershell/module/scheduledtasks/new-scheduledtasksettingsset)
+  supplies settings usable for an existing registration. New registrations
+  still use `schtasks /Create /XML` and immediate start. The update merges only
+  the generated settings into the existing settings object, preserving other
+  scheduler options such as `UseUnifiedSchedulingEngine`; it reads setup's UTF-8 XML
+  explicitly as UTF-8.
+- Linux writes the owned unit and runs `daemon-reload`; an already live service
+  is not stopped or restarted by setup. Starting an inactive service remains
+  part of setup. Reloaded restart/stop policies apply through systemd; changed
+  process arguments take effect on its next start.
+
+Daemon upgrade activation uses the same ownership checks before stopping and
+regenerates inside its existing restart: macOS bootout → write → bootstrap;
+Windows `/End` → write/update → `/Run`; Linux write → daemon-reload → restart.
+There is exactly one restart, not a setup start followed by another restart.
+An unowned definition refuses activation without overwriting it. No daemon
+activation (for example a module-only or no-op upgrade) means no definition
+refresh; `ck setup` is the explicit reconciliation path in that case.
+
 ## Update checks
 
 Only a user-invoked `ck` process may use or refresh the 24-hour update metadata

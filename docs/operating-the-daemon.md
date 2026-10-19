@@ -133,19 +133,32 @@ throttle. New Windows task definitions retry failures once a minute, up to 255
 times, without a runtime limit or battery restrictions. They do not wake a
 sleeping computer or add a resume trigger. Linux keeps `Restart=on-failure`.
 
-An upgrade restarts the existing service definition; it does not replace it.
-Setup also leaves an already-running, registered daemon's definition alone.
-To install the new recovery settings on an existing macOS or Windows install,
-first upgrade the binaries, then schedule a brief interruption and run:
+With `ck` 0.20.108 or later, existing installs get these settings too. Run
+`ck setup --dry-run` to inspect the service-definition update. Interactive
+`ck setup` shows the same step before `Continue? [y/N]`; `--yes` accepts the
+plan without asking (non-terminal callers also proceed without a question).
+On macOS the step explicitly reloads the LaunchAgent with bootout/bootstrap:
+**the daemon and every module restart**, so choose a time for that interruption.
+An ordinary registration/start still refuses an unplanned live LaunchAgent
+replacement. On Windows, setup updates the registered task with
+`Set-ScheduledTask`, without stopping its current instance. New settings govern
+future instances. Linux reloads changed systemd units without stopping the
+running daemon; its existing `Restart=on-failure` policy is unchanged.
 
-```sh
-# macOS: unload the job, then let setup write and load the new definition
-launchctl bootout "gui/$(id -u)/cortexkit.subc"
-ck setup
-# Windows: end the task, then let setup replace its definition and start it
-schtasks /End /TN "\CortexKit\subc-daemon"
-ck setup
-```
+When `ck upgrade` activates a daemon upgrade, it regenerates an outdated owned
+definition inside that same restart (between stop and start on macOS/Windows,
+before systemd's reload/restart on Linux), not with a second restart. An upgrade
+with no daemon activation does not restart it just to refresh a definition;
+use setup for that case.
+
+Only setup-owned definitions are reconciled. Missing inventory ownership,
+unrecognized legacy contents, or semantic user edits produce a refusal, not an
+overwrite. Formatting alone does not trigger an update: plist keys and typed
+values, task XML elements/attributes, and systemd section/directive values are
+compared after parsing. Windows also reads the registered task rather than
+trusting the XML file alone. See the [setup contract](setup-and-upgrade-contract.md#service-definition-reconciliation)
+for the legacy ownership and comparison rules. Back up and resolve a refused
+definition deliberately; deleting inventory entries does not authorize adoption.
 
 ## 6. Who is connected
 

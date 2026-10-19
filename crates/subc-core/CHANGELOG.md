@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.20.108
+
+- Restore the existing-install service-definition update withdrawn in 0.20.107. Windows setup fixtures now spell the daemon path with native separators, exactly as the managed binary inventory does; the daemon path comparison remains strict.
+- Compare Windows' registered-task defaults separately from the strict file-ownership check, and preserve existing scheduler options when applying the generated recovery settings. Native Windows tests register and update a temporary task; Windows GitHub CI additionally requires its running process to survive that update.
+- Setup detects outdated, setup-owned daemon service definitions and shows the update in its dry run and confirmation. On macOS the confirmed update reloads the LaunchAgent, restarting the daemon and all modules; Windows updates the task in place without stopping it. Linux reconciles changed systemd units too. User-edited or unowned definitions are refused rather than overwritten.
+- Upgrade refreshes owned service definitions inside its existing daemon restart, so existing installs gain crash recovery without a second restart. Definition comparisons ignore formatting, not changed settings. See the setup contract and daemon recovery instructions for ownership and platform details.
+
 ## 0.20.107
 
 - Withdraw 0.20.106's service-definition update for existing installs. On Windows its comparison reported setup's own freshly written task definition as user-edited, so `ck setup` refused and exited with an error. 0.20.106 was never released. The update returns in a later version once it passes on Windows.

@@ -1587,6 +1587,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "roxmltree"
+version = "0.20.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c20b6793b5c2fa6553b250154b78d6d0db37e72700ae35fad9387a46f487c97"
+
+[[package]]
 name = "rusqlite"
 version = "0.32.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1959,7 +1965,7 @@ dependencies = [
 
 [[package]]
 name = "subc-core"
-version = "0.20.107"
+version = "0.20.108"
 dependencies = [
  "base64",
  "cortexkit-log",
@@ -1967,6 +1973,7 @@ dependencies = [
  "cortexkit-test-support",
  "ed25519-dalek",
  "hex-literal",
+ "roxmltree",
  "rusqlite",
  "rustix",
  "semver",

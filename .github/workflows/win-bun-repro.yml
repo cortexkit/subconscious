@@ -1,0 +1,72 @@
+name: Windows Bun reconnect repro
+
+on:
+  push:
+    branches: ['train/win-bun-*']
+
+permissions:
+  contents: read
+
+jobs:
+  reconnect:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - name: Latest Bun - all four layouts
+        continue-on-error: true
+        run: ./clients/subc-client/scripts/win-reconnect-repro.ps1 -Label latest -OutputDirectory "$env:RUNNER_TEMP/win-bun-repro"
+
+      # Highest 1.3 release listed at https://bun.com/blog and
+      # https://github.com/oven-sh/bun/releases/tag/bun-v1.3.14.
+      - uses: oven-sh/setup-bun@v2
+        if: always()
+        with:
+          bun-version: '1.3.14'
+      - name: Bun 1.3.14 - all four layouts
+        if: always()
+        continue-on-error: true
+        run: ./clients/subc-client/scripts/win-reconnect-repro.ps1 -Label 1.3.14 -OutputDirectory "$env:RUNNER_TEMP/win-bun-repro"
+
+      - name: Summary (native codes and signals, including forced cleanup)
+        if: always()
+        run: |
+          $lines = @(
+            '## Windows Bun reconnect experiments',
+            '',
+            '| Requested | Actual Bun | Mode | Result | Workload processes | Observer exit |',
+            '| --- | --- | --- | --- | --- | --- |'
+          )
+          foreach ($label in @('latest', '1.3.14')) {
+            foreach ($mode in @('same-process', 'split', 'raw-same-process', 'raw-split')) {
+              $path = "$env:RUNNER_TEMP/win-bun-repro/$label-$mode.json"
+              if (Test-Path $path) {
+                $result = Get-Content -Raw $path | ConvertFrom-Json
+                $processes = ($result.processes | ForEach-Object {
+                  $signal = if ($null -eq $_.signal) { 'none' } else { $_.signal }
+                  "$($_.role) (pid=$($_.pid)): exit=$($_.exitCode), signal=$signal, forced=$($_.forced)"
+                }) -join '<br>'
+                $lines += "| $label | $($result.bun) | $mode | $($result.status) | $processes | $($result.observerExitCode) |"
+              } else {
+                $lines += "| $label | unavailable | $mode | not run / setup failed | unavailable | unavailable |"
+              }
+            }
+          }
+          $lines += ''
+          $lines += 'crash = abnormal child exit without a reported JS failure; inspect the log for Bun panic text. forced=true is observer cleanup, not an independent crash. timeout and failure are reported separately.'
+          $lines | Tee-Object -FilePath "$env:RUNNER_TEMP/win-bun-repro-summary.md"
+          $lines | Out-File -Append -FilePath $env:GITHUB_STEP_SUMMARY
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: win-bun-reconnect-repro
+          path: |
+            ${{ runner.temp }}/win-bun-repro/
+            ${{ runner.temp }}/win-bun-repro-summary.md

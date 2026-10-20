@@ -1,0 +1,743 @@
+{
+  "answered_get": {
+    "answer": "- Choose the endpoint route [route]: Split the route\n    between two owners (answered)\n- Name the release [codename]: Harbor\n    second line (answered)\n- Pick the platforms to ship [platforms]: (none) (answered)\n- Set the retry window [retry_window]: 15 minutes (recommended default)",
+    "answerKind": "form",
+    "answeredAt": 3000,
+    "answeredAtMs": 3000,
+    "askedAt": 2000,
+    "askerSessionID": "ses_ask_form_v1",
+    "blocking": false,
+    "materialDamage": false,
+    "purpose": "general",
+    "question": "Confirm the release plan",
+    "recipientKind": "user",
+    "renudgeAttempts": 0,
+    "requestID": "ask_form_v1_answered",
+    "reversibility": 0.5,
+    "revision": 1,
+    "round": 1,
+    "rounds": [
+      {
+        "answers": {
+          "codename": {
+            "source": "person",
+            "value": "Harbor\nsecond line"
+          },
+          "platforms": {
+            "source": "person",
+            "value": []
+          },
+          "retry_window": {
+            "source": "recommended",
+            "value": 15.0
+          },
+          "route": {
+            "source": "person",
+            "value": "split"
+          }
+        },
+        "questions": [
+          {
+            "id": "route",
+            "kind": "single",
+            "options": [
+              {
+                "id": "admin",
+                "label": "Use the admin route"
+              },
+              {
+                "id": "split",
+                "label": "Split the route\nbetween two owners"
+              }
+            ],
+            "recommended": "admin",
+            "title": "Choose the endpoint route"
+          },
+          {
+            "id": "codename",
+            "kind": "text",
+            "recommended": "Harbor",
+            "title": "Name the release"
+          },
+          {
+            "id": "platforms",
+            "kind": "multi",
+            "options": [
+              {
+                "id": "ios",
+                "label": "Ship on iOS"
+              },
+              {
+                "id": "mac",
+                "label": "Ship on Mac"
+              }
+            ],
+            "recommended": [
+              "ios"
+            ],
+            "title": "Pick the platforms to ship"
+          },
+          {
+            "id": "retry_window",
+            "kind": "number",
+            "max": 60,
+            "min": 5,
+            "recommended": 15,
+            "step": 5,
+            "title": "Set the retry window",
+            "unit": "minutes"
+          }
+        ],
+        "round": 1
+      }
+    ],
+    "silencePolicy": {
+      "effectiveAutonomy": 0.0,
+      "mode": "block"
+    },
+    "title": "Confirm the release plan",
+    "urgency": "normal",
+    "whyItMatters": "The release plan sets what ships first."
+  },
+  "kinds_get": {
+    "answerKind": "form",
+    "askedAt": 1000,
+    "askerSessionID": "ses_ask_form_v1",
+    "blocking": false,
+    "materialDamage": false,
+    "purpose": "general",
+    "question": "Plan the release",
+    "recipientKind": "user",
+    "renudgeAttempts": 0,
+    "requestID": "ask_form_v1_kinds",
+    "reversibility": 0.5,
+    "revision": 1,
+    "round": 1,
+    "rounds": [
+      {
+        "questions": [
+          {
+            "id": "route",
+            "kind": "single",
+            "options": [
+              {
+                "id": "admin",
+                "label": "Use the admin route"
+              },
+              {
+                "detail": "Keeps the change inside the project scope.",
+                "id": "project",
+                "label": "Use the project route"
+              }
+            ],
+            "recommended": "project",
+            "subtitle": "The route decides who owns the endpoint.",
+            "title": "Choose the endpoint route"
+          },
+          {
+            "id": "platforms",
+            "kind": "multi",
+            "options": [
+              {
+                "id": "ios",
+                "label": "Ship on iOS"
+              },
+              {
+                "id": "mac",
+                "label": "Ship on Mac"
+              },
+              {
+                "id": "web",
+                "label": "Ship on the web"
+              }
+            ],
+            "recommended": [
+              "ios",
+              "mac"
+            ],
+            "title": "Pick the platforms to ship"
+          },
+          {
+            "id": "codename",
+            "kind": "text",
+            "recommended": "Harbor",
+            "title": "Name the release"
+          },
+          {
+            "id": "notes",
+            "kind": "long_text",
+            "recommended": "",
+            "subtitle": "Testers read these before they start.",
+            "title": "Write the tester notes"
+          },
+          {
+            "id": "retry_window",
+            "integer": true,
+            "kind": "number",
+            "max": 60,
+            "min": 5,
+            "recommended": 15,
+            "step": 5,
+            "title": "Set the retry window",
+            "unit": "minutes"
+          },
+          {
+            "id": "rollout",
+            "kind": "number",
+            "max": 1,
+            "min": 0,
+            "recommended": 0.5,
+            "step": 0.25,
+            "title": "Set the first rollout share"
+          }
+        ],
+        "round": 1
+      }
+    ],
+    "silencePolicy": {
+      "effectiveAutonomy": 0.6,
+      "mode": "veto_window",
+      "waitUntil": 601000
+    },
+    "title": "Plan the release",
+    "urgency": "normal",
+    "whyItMatters": "The release plan sets what ships first."
+  },
+  "list_pending_for_user": [
+    {
+      "answerKind": "form",
+      "askedAt": 1000,
+      "askerSessionID": "ses_ask_form_v1",
+      "blocking": false,
+      "materialDamage": false,
+      "purpose": "general",
+      "question": "Plan the release",
+      "recipientKind": "user",
+      "renudgeAttempts": 0,
+      "requestID": "ask_form_v1_kinds",
+      "reversibility": 0.5,
+      "revision": 1,
+      "round": 1,
+      "rounds": [
+        {
+          "questions": [
+            {
+              "id": "route",
+              "kind": "single",
+              "options": [
+                {
+                  "id": "admin",
+                  "label": "Use the admin route"
+                },
+                {
+                  "detail": "Keeps the change inside the project scope.",
+                  "id": "project",
+                  "label": "Use the project route"
+                }
+              ],
+              "recommended": "project",
+              "subtitle": "The route decides who owns the endpoint.",
+              "title": "Choose the endpoint route"
+            },
+            {
+              "id": "platforms",
+              "kind": "multi",
+              "options": [
+                {
+                  "id": "ios",
+                  "label": "Ship on iOS"
+                },
+                {
+                  "id": "mac",
+                  "label": "Ship on Mac"
+                },
+                {
+                  "id": "web",
+                  "label": "Ship on the web"
+                }
+              ],
+              "recommended": [
+                "ios",
+                "mac"
+              ],
+              "title": "Pick the platforms to ship"
+            },
+            {
+              "id": "codename",
+              "kind": "text",
+              "recommended": "Harbor",
+              "title": "Name the release"
+            },
+            {
+              "id": "notes",
+              "kind": "long_text",
+              "recommended": "",
+              "subtitle": "Testers read these before they start.",
+              "title": "Write the tester notes"
+            },
+            {
+              "id": "retry_window",
+              "integer": true,
+              "kind": "number",
+              "max": 60,
+              "min": 5,
+              "recommended": 15,
+              "step": 5,
+              "title": "Set the retry window",
+              "unit": "minutes"
+            },
+            {
+              "id": "rollout",
+              "kind": "number",
+              "max": 1,
+              "min": 0,
+              "recommended": 0.5,
+              "step": 0.25,
+              "title": "Set the first rollout share"
+            }
+          ],
+          "round": 1
+        }
+      ],
+      "silencePolicy": {
+        "effectiveAutonomy": 0.6,
+        "mode": "veto_window",
+        "waitUntil": 601000
+      },
+      "title": "Plan the release",
+      "urgency": "normal",
+      "whyItMatters": "The release plan sets what ships first."
+    }
+  ],
+  "silence_resolved_get": {
+    "answer": "- Choose the endpoint route [route]: Use the project route (recommended default)\n- Set the retry window [retry_window]: 15 minutes (recommended default)",
+    "answerKind": "form",
+    "askedAt": 4000,
+    "askerSessionID": "ses_ask_form_v1",
+    "autoProceededAt": 64000,
+    "blocking": false,
+    "materialDamage": false,
+    "purpose": "general",
+    "question": "Pick the rollout defaults",
+    "recipientKind": "user",
+    "renudgeAttempts": 0,
+    "requestID": "ask_form_v1_silence",
+    "reversibility": 0.5,
+    "revision": 1,
+    "round": 1,
+    "rounds": [
+      {
+        "answers": {
+          "retry_window": {
+            "source": "recommended",
+            "value": 15.0
+          },
+          "route": {
+            "source": "recommended",
+            "value": "project"
+          }
+        },
+        "questions": [
+          {
+            "id": "route",
+            "kind": "single",
+            "options": [
+              {
+                "id": "admin",
+                "label": "Use the admin route"
+              },
+              {
+                "id": "project",
+                "label": "Use the project route"
+              }
+            ],
+            "recommended": "project",
+            "title": "Choose the endpoint route"
+          },
+          {
+            "id": "retry_window",
+            "kind": "number",
+            "max": 60,
+            "min": 5,
+            "recommended": 15,
+            "step": 5,
+            "title": "Set the retry window",
+            "unit": "minutes"
+          }
+        ],
+        "round": 1
+      }
+    ],
+    "silencePolicy": {
+      "effectiveAutonomy": 0.6,
+      "mode": "veto_window",
+      "waitUntil": 64000
+    },
+    "title": "Pick the rollout defaults",
+    "urgency": "normal",
+    "whyItMatters": "The release plan sets what ships first."
+  },
+  "two_round_answered_get": {
+    "answer": "- Name the release [codename]: Lighthouse (answered)\n- Choose the endpoint route [route]: Use the admin route (answered)\n- Pick the launch day [launch_day]: Launch on Friday (answered)\n- Set the beta seat count [beta_seats]: 100 (recommended default)",
+    "answerKind": "form",
+    "answeredAt": 8000,
+    "answeredAtMs": 8000,
+    "answeredRevision": 2,
+    "askedAt": 5000,
+    "askerSessionID": "ses_ask_form_v1",
+    "blocking": false,
+    "materialDamage": false,
+    "purpose": "general",
+    "question": "Schedule the launch",
+    "recipientKind": "user",
+    "renudgeAttempts": 0,
+    "requestID": "ask_form_v1_two_round",
+    "reversibility": 0.5,
+    "revision": 2,
+    "revisions": [
+      {
+        "question": "Schedule the launch",
+        "questions": [
+          {
+            "id": "codename",
+            "kind": "text",
+            "recommended": "Harbor",
+            "title": "Name the release"
+          },
+          {
+            "id": "route",
+            "kind": "single",
+            "options": [
+              {
+                "id": "admin",
+                "label": "Use the admin route"
+              },
+              {
+                "id": "project",
+                "label": "Use the project route"
+              }
+            ],
+            "recommended": "project",
+            "title": "Choose the endpoint route"
+          }
+        ],
+        "revision": 1,
+        "supersededAtMs": 7000,
+        "title": "Schedule the launch"
+      }
+    ],
+    "round": 2,
+    "rounds": [
+      {
+        "answers": {
+          "codename": {
+            "source": "person",
+            "value": "Lighthouse"
+          },
+          "route": {
+            "source": "person",
+            "value": "admin"
+          }
+        },
+        "questions": [
+          {
+            "id": "codename",
+            "kind": "text",
+            "recommended": "Harbor",
+            "title": "Name the release"
+          },
+          {
+            "id": "route",
+            "kind": "single",
+            "options": [
+              {
+                "id": "admin",
+                "label": "Use the admin route"
+              },
+              {
+                "id": "project",
+                "label": "Use the project route"
+              }
+            ],
+            "recommended": "project",
+            "title": "Choose the endpoint route"
+          }
+        ],
+        "round": 1
+      },
+      {
+        "answers": {
+          "beta_seats": {
+            "source": "recommended",
+            "value": 100.0
+          },
+          "launch_day": {
+            "source": "person",
+            "value": "friday"
+          }
+        },
+        "questions": [
+          {
+            "id": "launch_day",
+            "kind": "single",
+            "options": [
+              {
+                "id": "monday",
+                "label": "Launch on Monday"
+              },
+              {
+                "id": "friday",
+                "label": "Launch on Friday"
+              }
+            ],
+            "recommended": "monday",
+            "title": "Pick the launch day"
+          },
+          {
+            "id": "beta_seats",
+            "integer": true,
+            "kind": "number",
+            "max": 500,
+            "min": 10,
+            "recommended": 100,
+            "title": "Set the beta seat count"
+          }
+        ],
+        "round": 2
+      }
+    ],
+    "silencePolicy": {
+      "effectiveAutonomy": 0.0,
+      "mode": "block"
+    },
+    "title": "Schedule the launch",
+    "updatedAtMs": 7000,
+    "urgency": "normal",
+    "whyItMatters": "The release plan sets what ships first."
+  },
+  "two_round_open_get": {
+    "answerKind": "form",
+    "askedAt": 5000,
+    "askerSessionID": "ses_ask_form_v1",
+    "blocking": false,
+    "materialDamage": false,
+    "purpose": "general",
+    "question": "Schedule the launch",
+    "recipientKind": "user",
+    "renudgeAttempts": 0,
+    "requestID": "ask_form_v1_two_round",
+    "reversibility": 0.5,
+    "revision": 2,
+    "revisions": [
+      {
+        "question": "Schedule the launch",
+        "questions": [
+          {
+            "id": "codename",
+            "kind": "text",
+            "recommended": "Harbor",
+            "title": "Name the release"
+          },
+          {
+            "id": "route",
+            "kind": "single",
+            "options": [
+              {
+                "id": "admin",
+                "label": "Use the admin route"
+              },
+              {
+                "id": "project",
+                "label": "Use the project route"
+              }
+            ],
+            "recommended": "project",
+            "title": "Choose the endpoint route"
+          }
+        ],
+        "revision": 1,
+        "supersededAtMs": 7000,
+        "title": "Schedule the launch"
+      }
+    ],
+    "round": 2,
+    "rounds": [
+      {
+        "answers": {
+          "codename": {
+            "source": "person",
+            "value": "Lighthouse"
+          },
+          "route": {
+            "source": "recommended",
+            "value": "project"
+          }
+        },
+        "questions": [
+          {
+            "id": "codename",
+            "kind": "text",
+            "recommended": "Harbor",
+            "title": "Name the release"
+          },
+          {
+            "id": "route",
+            "kind": "single",
+            "options": [
+              {
+                "id": "admin",
+                "label": "Use the admin route"
+              },
+              {
+                "id": "project",
+                "label": "Use the project route"
+              }
+            ],
+            "recommended": "project",
+            "title": "Choose the endpoint route"
+          }
+        ],
+        "round": 1
+      },
+      {
+        "questions": [
+          {
+            "id": "launch_day",
+            "kind": "single",
+            "options": [
+              {
+                "id": "monday",
+                "label": "Launch on Monday"
+              },
+              {
+                "id": "friday",
+                "label": "Launch on Friday"
+              }
+            ],
+            "recommended": "monday",
+            "title": "Pick the launch day"
+          },
+          {
+            "id": "beta_seats",
+            "integer": true,
+            "kind": "number",
+            "max": 500,
+            "min": 10,
+            "recommended": 100,
+            "title": "Set the beta seat count"
+          }
+        ],
+        "round": 2
+      }
+    ],
+    "silencePolicy": {
+      "effectiveAutonomy": 0.0,
+      "mode": "block"
+    },
+    "title": "Schedule the launch",
+    "updatedAtMs": 7000,
+    "urgency": "normal",
+    "whyItMatters": "The release plan sets what ships first."
+  },
+  "unknown_kind_answered_get": {
+    "answer": "- Pick the card colour [shade]: {\"hex\":\"#336699\"} (recommended default)\n- Add a note [note]: Keep it calm (answered)",
+    "answerKind": "form",
+    "answeredAt": 10000,
+    "answeredAtMs": 10000,
+    "askedAt": 9000,
+    "askerSessionID": "ses_ask_form_v1",
+    "blocking": false,
+    "materialDamage": false,
+    "purpose": "general",
+    "question": "Style the release card",
+    "recipientKind": "user",
+    "renudgeAttempts": 0,
+    "requestID": "ask_form_v1_unknown_kind",
+    "reversibility": 0.5,
+    "revision": 1,
+    "round": 1,
+    "rounds": [
+      {
+        "answers": {
+          "note": {
+            "source": "person",
+            "value": "Keep it calm"
+          },
+          "shade": {
+            "source": "recommended",
+            "value": {
+              "hex": "#336699"
+            }
+          }
+        },
+        "questions": [
+          {
+            "id": "shade",
+            "kind": "color",
+            "recommended": {
+              "hex": "#336699"
+            },
+            "title": "Pick the card colour"
+          },
+          {
+            "id": "note",
+            "kind": "text",
+            "recommended": "",
+            "title": "Add a note"
+          }
+        ],
+        "round": 1
+      }
+    ],
+    "silencePolicy": {
+      "effectiveAutonomy": 0.0,
+      "mode": "block"
+    },
+    "title": "Style the release card",
+    "urgency": "normal",
+    "whyItMatters": "The release plan sets what ships first."
+  },
+  "unknown_kind_get": {
+    "answerKind": "form",
+    "askedAt": 9000,
+    "askerSessionID": "ses_ask_form_v1",
+    "blocking": false,
+    "materialDamage": false,
+    "purpose": "general",
+    "question": "Style the release card",
+    "recipientKind": "user",
+    "renudgeAttempts": 0,
+    "requestID": "ask_form_v1_unknown_kind",
+    "reversibility": 0.5,
+    "revision": 1,
+    "round": 1,
+    "rounds": [
+      {
+        "questions": [
+          {
+            "id": "shade",
+            "kind": "color",
+            "recommended": {
+              "hex": "#336699"
+            },
+            "title": "Pick the card colour"
+          },
+          {
+            "id": "note",
+            "kind": "text",
+            "recommended": "",
+            "title": "Add a note"
+          }
+        ],
+        "round": 1
+      }
+    ],
+    "silencePolicy": {
+      "effectiveAutonomy": 0.0,
+      "mode": "block"
+    },
+    "title": "Style the release card",
+    "urgency": "normal",
+    "whyItMatters": "The release plan sets what ships first."
+  }
+}

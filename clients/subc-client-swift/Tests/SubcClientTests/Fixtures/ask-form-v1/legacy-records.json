@@ -1,0 +1,91 @@
+{
+  "answered_get": {
+    "answer": "Use the project route",
+    "answerKind": "single",
+    "answeredAt": 2000,
+    "answeredAtMs": 2000,
+    "askedAt": 1000,
+    "askerSessionID": "ses_ask_form_legacy",
+    "blocking": false,
+    "defaultDecision": "Use the project route",
+    "materialDamage": false,
+    "options": [
+      {
+        "label": "Use the admin route"
+      },
+      {
+        "label": "Use the project route",
+        "recommended": true
+      }
+    ],
+    "purpose": "general",
+    "question": "Which route should I use?",
+    "recipientKind": "user",
+    "renudgeAttempts": 0,
+    "requestID": "ask_form_legacy_single_v1",
+    "silencePolicy": {
+      "effectiveAutonomy": 0.0,
+      "mode": "block"
+    },
+    "urgency": "normal",
+    "whyItMatters": "The route decides who owns the endpoint."
+  },
+  "get": {
+    "answerKind": "single",
+    "askedAt": 1000,
+    "askerSessionID": "ses_ask_form_legacy",
+    "blocking": false,
+    "defaultDecision": "Use the project route",
+    "materialDamage": false,
+    "options": [
+      {
+        "label": "Use the admin route"
+      },
+      {
+        "label": "Use the project route",
+        "recommended": true
+      }
+    ],
+    "purpose": "general",
+    "question": "Which route should I use?",
+    "recipientKind": "user",
+    "renudgeAttempts": 0,
+    "requestID": "ask_form_legacy_single_v1",
+    "silencePolicy": {
+      "effectiveAutonomy": 0.0,
+      "mode": "block"
+    },
+    "urgency": "normal",
+    "whyItMatters": "The route decides who owns the endpoint."
+  },
+  "list_pending_for_user": [
+    {
+      "answerKind": "single",
+      "askedAt": 1000,
+      "askerSessionID": "ses_ask_form_legacy",
+      "blocking": false,
+      "defaultDecision": "Use the project route",
+      "materialDamage": false,
+      "options": [
+        {
+          "label": "Use the admin route"
+        },
+        {
+          "label": "Use the project route",
+          "recommended": true
+        }
+      ],
+      "purpose": "general",
+      "question": "Which route should I use?",
+      "recipientKind": "user",
+      "renudgeAttempts": 0,
+      "requestID": "ask_form_legacy_single_v1",
+      "silencePolicy": {
+        "effectiveAutonomy": 0.0,
+        "mode": "block"
+      },
+      "urgency": "normal",
+      "whyItMatters": "The route decides who owns the endpoint."
+    }
+  ]
+}

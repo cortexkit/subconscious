@@ -3,7 +3,7 @@ import Foundation
 /// A JSON value retained when the management surface adds an unrendered field whose
 /// shape may vary. Keeping the value opaque lets the ask decoder remain compatible
 /// while the app only relies on the fields it displays.
-public enum JSONValue: Codable, Equatable {
+public enum JSONValue: Codable, Equatable, Sendable {
     case string(String)
     case number(Double)
     case bool(Bool)
@@ -73,6 +73,127 @@ public struct AskSilencePolicy: Codable, Equatable {
     public var mode: String?
     public var waitUntil: Int64?
     public var effectiveAutonomy: JSONValue?
+}
+
+/// One answer retained for a question in a particular form round.
+public struct AskFormAnswer: Codable, Equatable, Sendable {
+    public var source: String
+    public var value: JSONValue
+
+    public init(source: String, value: JSONValue) {
+        self.source = source
+        self.value = value
+    }
+}
+
+/// One selectable value for a form question.
+public struct AskFormOption: Codable, Equatable, Sendable {
+    public var id: String
+    public var label: String
+    public var detail: String?
+
+    public init(id: String, label: String, detail: String? = nil) {
+        self.id = id
+        self.label = label
+        self.detail = detail
+    }
+}
+
+/// A question in an ask form. `kind` stays open so future question kinds still decode.
+public struct AskFormQuestion: Codable, Equatable, Sendable {
+    public var id: String
+    public var kind: String
+    public var title: String
+    public var subtitle: String?
+    public var options: [AskFormOption]?
+    public var recommended: JSONValue?
+    public var min: Double?
+    public var max: Double?
+    public var step: Double?
+    public var integer: Bool?
+    public var unit: String?
+
+    public init(
+        id: String,
+        kind: String,
+        title: String,
+        subtitle: String? = nil,
+        options: [AskFormOption]? = nil,
+        recommended: JSONValue? = nil,
+        min: Double? = nil,
+        max: Double? = nil,
+        step: Double? = nil,
+        integer: Bool? = nil,
+        unit: String? = nil
+    ) {
+        self.id = id
+        self.kind = kind
+        self.title = title
+        self.subtitle = subtitle
+        self.options = options
+        self.recommended = recommended
+        self.min = min
+        self.max = max
+        self.step = step
+        self.integer = integer
+        self.unit = unit
+    }
+}
+
+/// A populated set of form questions and any recorded answers for that round.
+public struct AskFormRound: Codable, Equatable, Sendable {
+    public var round: Int
+    public var questions: [AskFormQuestion]
+    public var answers: [String: AskFormAnswer]?
+
+    public init(round: Int, questions: [AskFormQuestion], answers: [String: AskFormAnswer]? = nil) {
+        self.round = round
+        self.questions = questions
+        self.answers = answers
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case round
+        case questions
+        case answers
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        round = try container.decode(Int.self, forKey: .round)
+        let decodedQuestions = try container.decode([AskFormQuestion].self, forKey: .questions)
+        guard !decodedQuestions.isEmpty else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .questions,
+                in: container,
+                debugDescription: "A form round must contain at least one question.")
+        }
+        questions = decodedQuestions
+        answers = try container.decodeIfPresent([String: AskFormAnswer].self, forKey: .answers)
+    }
+}
+
+/// A prior version of the question set, retained when the ask is revised.
+public struct AskFormRevision: Codable, Equatable, Sendable {
+    public var revision: Int
+    public var title: String?
+    public var question: String?
+    public var questions: [AskFormQuestion]
+    public var supersededAtMs: Int64?
+
+    public init(
+        revision: Int,
+        title: String? = nil,
+        question: String? = nil,
+        questions: [AskFormQuestion],
+        supersededAtMs: Int64? = nil
+    ) {
+        self.revision = revision
+        self.title = title
+        self.question = question
+        self.questions = questions
+        self.supersededAtMs = supersededAtMs
+    }
 }
 
 /// A pending user ask from prefrontal-core. Only the identity, question, and timestamp
@@ -145,6 +266,53 @@ public struct AskRequest: Codable, Equatable, Identifiable {
     public var updatedAtMs: Int64?
     public var answeredRevision: Int?
 
+    // Form asks keep these fields optional so records produced before forms still decode.
+    public var title: String?
+    public var round: Int?
+    public var rounds: [AskFormRound]?
+    /// Legacy single-question histories have a different shape. If any entry is not a
+    /// form revision, the entire history is set to nil while the ask remains readable.
+    public var revisions: [AskFormRevision]?
+
+    private enum CodingKeys: String, CodingKey {
+        case requestID
+        case purpose
+        case recipientKind
+        case askerSessionID
+        case headAgentId
+        case taskID
+        case question
+        case context
+        case whyItMatters
+        case reversibility
+        case scope
+        case materialDamage
+        case refs
+        case defaultDecision
+        case options
+        case answerKind
+        case urgency
+        case blocking
+        case askedAt
+        case silencePolicy
+        case state
+        case answer
+        case resolution
+        case answeredAt
+        case resolvedAt
+        case canceledAt
+        case autoProceededAt
+        case attachments
+        case thread
+        case revision
+        case updatedAtMs
+        case answeredRevision
+        case title
+        case round
+        case rounds
+        case revisions
+    }
+
     public var id: String { requestID }
 
     /// Converts the wire's epoch-millisecond timestamp for SwiftUI date formatting.
@@ -169,6 +337,48 @@ public struct AskRequest: Codable, Equatable, Identifiable {
             "answered", "resolved", "canceled", "cancelled", "auto_proceeded",
             "auto-proceeded", "expired",
         ].contains(state)
+    }
+}
+
+extension AskRequest {
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        requestID = try container.decode(String.self, forKey: .requestID)
+        purpose = try container.decodeIfPresent(String.self, forKey: .purpose)
+        recipientKind = try container.decodeIfPresent(String.self, forKey: .recipientKind)
+        askerSessionID = try container.decodeIfPresent(String.self, forKey: .askerSessionID)
+        headAgentId = try container.decodeIfPresent(String.self, forKey: .headAgentId)
+        taskID = try container.decodeIfPresent(String.self, forKey: .taskID)
+        question = try container.decode(String.self, forKey: .question)
+        context = try container.decodeIfPresent(String.self, forKey: .context)
+        whyItMatters = try container.decodeIfPresent(String.self, forKey: .whyItMatters)
+        reversibility = try container.decodeIfPresent(Double.self, forKey: .reversibility)
+        scope = try container.decodeIfPresent(String.self, forKey: .scope)
+        materialDamage = try container.decodeIfPresent(Bool.self, forKey: .materialDamage)
+        refs = try container.decodeIfPresent([String].self, forKey: .refs)
+        defaultDecision = try container.decodeIfPresent(String.self, forKey: .defaultDecision)
+        options = try container.decodeIfPresent([AskOption].self, forKey: .options)
+        answerKind = try container.decodeIfPresent(String.self, forKey: .answerKind)
+        urgency = try container.decodeIfPresent(String.self, forKey: .urgency)
+        blocking = try container.decodeIfPresent(Bool.self, forKey: .blocking)
+        askedAt = try container.decode(Int64.self, forKey: .askedAt)
+        silencePolicy = try container.decodeIfPresent(AskSilencePolicy.self, forKey: .silencePolicy)
+        state = try container.decodeIfPresent(String.self, forKey: .state)
+        answer = try container.decodeIfPresent(String.self, forKey: .answer)
+        resolution = try container.decodeIfPresent(String.self, forKey: .resolution)
+        answeredAt = try container.decodeIfPresent(Int64.self, forKey: .answeredAt)
+        resolvedAt = try container.decodeIfPresent(Int64.self, forKey: .resolvedAt)
+        canceledAt = try container.decodeIfPresent(Int64.self, forKey: .canceledAt)
+        autoProceededAt = try container.decodeIfPresent(Int64.self, forKey: .autoProceededAt)
+        attachments = try container.decodeIfPresent([AskAttachment].self, forKey: .attachments)
+        thread = try container.decodeIfPresent([AskThreadEntry].self, forKey: .thread)
+        revision = try container.decodeIfPresent(Int.self, forKey: .revision)
+        updatedAtMs = try container.decodeIfPresent(Int64.self, forKey: .updatedAtMs)
+        answeredRevision = try container.decodeIfPresent(Int.self, forKey: .answeredRevision)
+        title = try container.decodeIfPresent(String.self, forKey: .title)
+        round = try container.decodeIfPresent(Int.self, forKey: .round)
+        rounds = try container.decodeIfPresent([AskFormRound].self, forKey: .rounds)
+        revisions = try? container.decode([AskFormRevision].self, forKey: .revisions)
     }
 }
 

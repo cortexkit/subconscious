@@ -44,6 +44,7 @@ let package = Package(
                 .copy("Fixtures/board-wire-v3.json"),
                 .copy("Fixtures/scope-describe-legacy.json"),
                 .copy("Fixtures/scope-describe-with-deadline.json"),
+                .copy("Fixtures/ask-form-v1"),
             ]
         ),
     ]

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.32.2
+
+- Add standalone non-exhaustive `scope.served_by` request and reply bodies with an open answer enum, preserving exhaustive enum source compatibility.
+
 ## 0.32.1
 
 - Add `CatalogEntry.operation_delivery` and `with_operation_delivery` to mirror management delivery hints from the registered manifest. Values use subc-protocol 0.32.5's open `OperationDelivery` type: unknown strings survive, and only `"watch"` on a declared query is subscribable. Empty maps are omitted so existing catalog replies retain their wire bytes. Older readers ignore the additive field.

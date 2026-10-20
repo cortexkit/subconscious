@@ -44,6 +44,8 @@ use std::{
 
 pub use async_trait::async_trait;
 pub use subc_control::{CatalogEntry, ConsumerIdentity};
+mod scope_served_by;
+pub use scope_served_by::{ScopeServedByAnswer, ScopeServedByReply};
 /// The one launch-nonce reader for a module process: `launch_nonce()` reads
 /// the inherited Unix descriptor, the Windows named pipe, or, when neither is
 /// named, the `SUBC_LAUNCH_NONCE` environment copy once and caches it. The SDK's
@@ -473,6 +475,7 @@ struct ModuleHandleState {
     pending_catalog_updates: HashMap<u64, CatalogUpdateReply>,
     pending_operator_confirms: HashMap<u64, oneshot::Sender<Frame>>,
     pending_activity_records: HashMap<u64, oneshot::Sender<Frame>>,
+    pending_scope_served_by: HashMap<u64, oneshot::Sender<Frame>>,
     closed: bool,
 }
 
@@ -518,6 +521,7 @@ impl ModuleHandle {
                     pending_catalog_updates: HashMap::new(),
                     pending_operator_confirms: HashMap::new(),
                     pending_activity_records: HashMap::new(),
+                    pending_scope_served_by: HashMap::new(),
                     closed: false,
                 }),
             }),
@@ -1054,6 +1058,15 @@ impl ModuleHandle {
     }
 
     fn handle_control_reply(&self, frame: Frame) -> bool {
+        let served_by_reply = self
+            .shared
+            .lock_inner()
+            .pending_scope_served_by
+            .remove(&frame.header.corr);
+        if let Some(reply) = served_by_reply {
+            let _ = reply.send(frame);
+            return true;
+        }
         let activity_reply = self
             .shared
             .lock_inner()
@@ -1166,6 +1179,7 @@ impl ModuleHandleShared {
             // Dropping these senders wakes raw-frame waiters immediately.
             inner.pending_operator_confirms.clear();
             inner.pending_activity_records.clear();
+            inner.pending_scope_served_by.clear();
             inner
                 .pending_catalog_updates
                 .drain()
@@ -1324,8 +1338,8 @@ impl Error for CatalogUpdateError {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ScopeCallError {
-    /// The daemon's HELLO_ACK did not list `op` in `subc_ops`, so nothing was
-    /// sent.
+    /// HELLO_ACK did not advertise the operation (or its required capability),
+    /// so nothing was sent.
     NotSupported { op: &'static str },
     /// The daemon refused the request with a channel-0 Error frame. `code` is
     /// the daemon's code as sent, to compare against the constants in
@@ -3016,6 +3030,72 @@ mod tests {
 
     fn control_reply(ty: FrameType, corr: u64, body: Vec<u8>) -> Frame {
         Frame::build(ty, control_flags(), 0, 0, corr, body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn scope_served_by_requires_capability_and_decodes_open_replies() {
+        let (unsupported, mut rx) = test_module_handle(&[subc_control::SCOPE_SERVED_BY_OP]);
+        assert_eq!(
+            unsupported
+                .scope_served_by("s".into(), 1, "tool".into())
+                .await,
+            Err(ScopeCallError::NotSupported {
+                op: subc_control::SCOPE_SERVED_BY_OP
+            })
+        );
+        assert!(rx.try_recv().is_err());
+        let (tx, mut rx) = mpsc::channel(4);
+        let ack = ModuleHelloAckBody {
+            negotiated_ver: PROTOCOL_VERSION,
+            subc_ops: vec![],
+            subc_capabilities: vec![subc_protocol::scope::SCOPE_SERVED_BY_CAPABILITY.into()],
+            storage: None,
+            machine_id: None,
+        };
+        let handle = ModuleHandle::new(
+            &ack,
+            tx,
+            1,
+            CancellationToken::new(),
+            tokio::runtime::Handle::current(),
+        );
+        for answer in ["served", "not_served", "unknown", "future"] {
+            let caller = handle.clone();
+            let pending =
+                tokio::spawn(
+                    async move { caller.scope_served_by("s".into(), 7, "tool".into()).await },
+                );
+            let request = rx.recv().await.unwrap();
+            let decoded: subc_control::ScopeServedByRequest =
+                serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(
+                (
+                    decoded.scope_ref.as_str(),
+                    decoded.scope_epoch,
+                    decoded.module_id.as_str()
+                ),
+                ("s", 7, "tool")
+            );
+            assert!(handle.handle_control_reply(control_reply(FrameType::Response, request.header.corr,
+                serde_json::to_vec(&serde_json::json!({"op":"scope.served_by", "answer":answer, "daemon_incarnation":"d"})).unwrap())));
+            let reply = pending.await.unwrap().unwrap();
+            assert_eq!(reply.daemon_incarnation, "d");
+            assert_eq!(serde_json::to_value(reply.answer).unwrap(), answer);
+        }
+        let caller = handle.clone();
+        let pending =
+            tokio::spawn(async move { caller.scope_served_by("s".into(), 7, "tool".into()).await });
+        let request = rx.recv().await.unwrap();
+        assert!(handle.handle_control_reply(control_reply(
+            FrameType::Error,
+            request.header.corr,
+            serde_json::to_vec(&serde_json::json!({"code":"not_registered", "message":"gone"}))
+                .unwrap()
+        )));
+        assert_eq!(
+            pending.await.unwrap().unwrap_err().code(),
+            Some("not_registered")
+        );
     }
 
     fn owner() -> Principal {

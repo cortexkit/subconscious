@@ -753,6 +753,9 @@ where
     if let Some(path) = config.scope_sync_path.clone() {
         spawn_scope_sync_watcher(path, writer.clone(), config.clone());
     }
+    if let Some(path) = env::var_os("FAKE_AFT_CONTROL_PATH") {
+        spawn_control_watcher(PathBuf::from(path), writer.clone());
+    }
 
     if let Some(path) = config.ready_update_path.clone() {
         let update_writer = writer.clone();
@@ -890,6 +893,27 @@ fn write_launch_nonce(path: &Path, nonce: Option<&str>) -> Result<(), StubError>
     fs::write(&staging, nonce)?;
     fs::rename(&staging, path)?;
     Ok(())
+}
+
+// Tests publish a complete request and correlation id atomically, letting the
+// registered fixture exercise standalone control bodies as well as enum bodies.
+fn spawn_control_watcher(path: PathBuf, writer: mpsc::Sender<Frame>) {
+    tokio::spawn(async move {
+        let mut last_sent = String::new();
+        loop {
+            if let Ok(raw) = fs::read_to_string(&path) {
+                if raw != last_sent {
+                    last_sent = raw.clone();
+                    let request: Value = serde_json::from_str(&raw).unwrap();
+                    let frame = Frame::build(FrameType::Request, control_flags(), 0, 0,
+                        request["corr"].as_u64().unwrap(), serde_json::to_vec(&request["body"]).unwrap()).unwrap();
+                    if writer.send(frame).await.is_err() { return; }
+                }
+            }
+            if writer.is_closed() { return; }
+            sleep(Duration::from_millis(10)).await;
+        }
+    });
 }
 
 fn spawn_scope_sync_watcher(path: PathBuf, writer: mpsc::Sender<Frame>, config: StubConfig) {
@@ -1060,6 +1084,11 @@ async fn handle_frame(
                     }
                 }
             }
+            Ok(true)
+        }
+        FrameType::Response if frame.header.channel == 0 && frame.header.corr >= 2_000_000 => {
+            record_event(config, json!({"kind":"control_response", "corr":frame.header.corr,
+                "body_json":serde_json::from_slice::<Value>(&frame.body).ok()}))?;
             Ok(true)
         }
         FrameType::Response

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.20.110
+
+- Exercise scope service history against real daemons, including refused and missing bind acknowledgements and daemon restart; extend the module test fixture with standalone control requests.
+
 ## 0.20.109
 
 - `ck quota` shows a credit pool's expiry (`expires 2026-11-06`) when the provider states one (`expiresAt`, cortexkit-provider-usage 0.12.0), as its own clause beside the reset date. An expiry means unused credit is lost, not refilled, so the two are never merged.

@@ -936,6 +936,7 @@ impl ControlHandler {
                 subc_protocol::manifest::CAP_SCOPE_BIND_PROOF_V2.to_string(),
                 subc_protocol::manifest::CAP_SCOPE_REPLACE_IF_IDLE_V1.to_string(),
                 subc_protocol::scope::SCOPE_ON_BEHALF_OF_CAPABILITY.to_string(),
+                subc_protocol::scope::SCOPE_SERVED_BY_CAPABILITY.to_string(),
                 subc_control::ACTIVITY_LEDGER_CAPABILITY.to_string(),
             ]),
             route_bind_relay_timeout: DEFAULT_ROUTE_BIND_RELAY_TIMEOUT,
@@ -1810,6 +1811,12 @@ impl ControlHandler {
                     .is_some_and(|probe| probe.op == "operator.confirm")
                 {
                     return self.handle_operator_confirm(ctx, frame);
+                }
+                if op
+                    .as_ref()
+                    .is_some_and(|probe| probe.op == subc_control::SCOPE_SERVED_BY_OP)
+                {
+                    return self.handle_scope_served_by(ctx.connection_id, frame);
                 }
                 if self
                     .forwarding
@@ -2985,6 +2992,54 @@ impl ControlHandler {
                 self.handle_scope_describe(connection_id, frame, owner, scope_ref)
             }
         }
+    }
+
+    fn handle_scope_served_by(
+        &self,
+        connection_id: ConnectionId,
+        frame: Frame,
+    ) -> Result<Vec<Frame>, RouterError> {
+        let registered = self
+            .registry
+            .get_module_by_connection(connection_id)
+            .map_err(|err| RouterError::backend(0, frame.header.corr, err.to_string()))?;
+        let Some(registered) = registered else {
+            return Ok(vec![control_error_frame(
+                &frame,
+                "not_registered",
+                "scope.served_by requires an active module registration owned by this connection",
+            )?]);
+        };
+        let request: subc_control::ScopeServedByRequest = match serde_json::from_slice(&frame.body)
+        {
+            Ok(request) => request,
+            Err(err) => {
+                return Ok(vec![control_error_frame(
+                    &frame,
+                    "invalid_control_body",
+                    format!("malformed scope.served_by body: {err}"),
+                )?])
+            }
+        };
+        let answer = self
+            .scopes
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .served_by(
+                &registered.manifest.module_id,
+                &request.scope_ref,
+                request.scope_epoch,
+                &request.module_id,
+            );
+        let reply = subc_control::ScopeServedByReply::new(
+            answer,
+            self.supervisor.spawn_snapshot().cursor.daemon_incarnation,
+        );
+        Ok(vec![control_response_body_frame(
+            &frame,
+            &reply,
+            "ScopeServedByReply",
+        )?])
     }
 
     fn handle_operator_confirm(
@@ -11417,6 +11472,10 @@ mod tests {
             .subc_capabilities
             .iter()
             .any(|cap| cap == subc_protocol::scope::SCOPE_ON_BEHALF_OF_CAPABILITY));
+        assert!(parse_ack(&ack)
+            .subc_capabilities
+            .iter()
+            .any(|cap| cap == subc_protocol::scope::SCOPE_SERVED_BY_CAPABILITY));
         let (client, _rx) = route_ctx(ConnectionId::new(157));
         let body = serde_json::to_vec(&ClientControlRequest::ServerDescribe {}).unwrap();
         let frame = Frame::build(FrameType::Request, control_flags(), 0, 0, 5, body).unwrap();
@@ -11434,6 +11493,9 @@ mod tests {
         assert!(capabilities
             .iter()
             .any(|cap| cap == subc_protocol::scope::SCOPE_ON_BEHALF_OF_CAPABILITY));
+        assert!(capabilities
+            .iter()
+            .any(|cap| cap == subc_protocol::scope::SCOPE_SERVED_BY_CAPABILITY));
     }
 
     #[tokio::test]
@@ -14804,6 +14866,50 @@ mod tests {
         }
         mod call_modes {
             include!("scope_call_mode_tests.rs");
+        }
+        #[tokio::test]
+        async fn served_by_dispatch_bypasses_exhaustive_decoder_and_requires_registration() {
+            let rig = rig().await;
+            let body = serde_json::to_vec(&subc_control::ScopeServedByRequest::new(
+                "s".into(),
+                1,
+                "tool".into(),
+            ))
+            .unwrap();
+            assert!(serde_json::from_slice::<ModuleControlRequestFromModule>(&body).is_err());
+            let (direct, _rx) = wide_ctx(999);
+            for (ctx, expected) in [
+                (&rig.owner, FrameType::Response),
+                (&direct, FrameType::Error),
+            ] {
+                let frame =
+                    Frame::build(FrameType::Request, control_flags(), 0, 0, 90, body.clone())
+                        .unwrap();
+                let replies = rig.handler.handle_control_frame(ctx, frame).await.unwrap();
+                assert_eq!(replies[0].header.ty, expected);
+                if expected == FrameType::Response {
+                    let reply: subc_control::ScopeServedByReply =
+                        serde_json::from_slice(&replies[0].body).unwrap();
+                    assert_eq!(reply.answer, subc_control::ScopeServedByAnswer::Unknown);
+                } else {
+                    assert_eq!(parse_error(&replies[0])["code"], "not_registered");
+                }
+            }
+            let reply = call(
+                &rig.handler,
+                &rig.owner,
+                &ModuleControlRequestFromModule::ScopeDescribe {
+                    owner: Principal::Reserved {
+                        module_id: OWNER.into(),
+                    },
+                    scope_ref: "s".into(),
+                },
+            )
+            .await;
+            assert!(matches!(
+                serde_json::from_slice::<ModuleControlResponseToModule>(&reply.body).unwrap(),
+                ModuleControlResponseToModule::ScopeDescribe { .. }
+            ));
         }
 
         use subc_protocol::scope::{

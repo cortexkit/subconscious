@@ -29,6 +29,9 @@ pub use subc_protocol::RouteCloseReason;
 mod activity;
 pub use activity::*;
 
+mod scope_served_by;
+pub use scope_served_by::*;
+
 macro_rules! open_string_enum {
     (
         $(#[$meta:meta])*

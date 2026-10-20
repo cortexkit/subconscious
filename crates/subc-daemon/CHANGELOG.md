@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.36.18
+
+- Track acknowledged scoped binds per live epoch and expose owner-namespace `scope.served_by`; advertise `scope-served-by/v1`. Refused or unacknowledged binds never count and history is not persisted.
+
 ## 0.36.17
 
 - Upgrade to subc-protocol 0.32.7 so HELLO accepts event names with one to four dot-separated tokens according to bus-naming 0.2.6. Modules must not declare dotted events until the running daemon carries this release; older daemons refuse dotted names at HELLO.

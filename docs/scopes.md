@@ -671,6 +671,40 @@ refusal. It sends a snapshot of live scopes, then events:
 A scope of that owner the reader holds and not in the `synced` set is ended. Before the owner's
 `synced` event, a scope merely missing is held, never treated as ended.
 
+### Service history: `scope.served_by`
+
+The daemon advertises `scope-served-by/v1` in HELLO_ACK `subc_capabilities`
+and `server.describe`. A registered module can ask about its own scope epoch:
+
+```json
+{"op":"scope.served_by","scope_ref":"session-42","scope_epoch":7,"module_id":"aft"}
+```
+
+The reply carries `op: "scope.served_by"`, `answer`, and `daemon_incarnation`
+(the same incarnation as `scope.describe`). `answer` is an open string:
+
+- `served`: the target acknowledged `route.bind` under exactly this owner, ref
+  and epoch. A refused or unacknowledged bind never counts.
+- `not_served`: the epoch is tracked and that module has never acknowledged a bind.
+- `unknown`: the epoch was never registered, ended, expired, was replaced, or
+  has not been re-registered since this daemon started.
+
+Only `served` is affirmative; future answer strings must not grant access.
+History survives route closure and same-epoch updates, but ends with the epoch
+and is never persisted. Re-registering an epoch after daemon restart starts
+with an empty history, not a carried-over `served`.
+
+The owner is implied by the sending module's registration (`reserved:<module>`),
+never supplied in the request. Another module querying the same ref and epoch
+reads only its own namespace and gets `unknown` if absent there, even if another
+owner has a live, served scope. There is no cross-owner existence oracle.
+An unregistered connection is refused `not_registered`.
+
+Rust modules use `ModuleHandle::scope_served_by(scope_ref, scope_epoch, module_id)`.
+The non-exhaustive `ScopeServedByReply` exposes `ScopeServedByAnswer`, including
+`Other(String)` for future values. Without the advertised capability the SDK
+returns `ScopeCallError::NotSupported` without sending anything.
+
 ## 5a. Refusals and drains
 
 Every refusal the scope feature adds, in one place. "Retryable" means nothing was sent; the

@@ -280,6 +280,7 @@ struct ScopeBindLease {
     binds: Arc<std::sync::atomic::AtomicUsize>,
     released: std::sync::atomic::AtomicBool,
     presence: Option<Arc<std::sync::atomic::AtomicBool>>,
+    served_modules: Arc<std::sync::Mutex<BTreeSet<String>>>,
 }
 
 impl PartialEq for ScopeBindLease {
@@ -308,6 +309,16 @@ impl ScopeBindLease {
 }
 
 impl BoundScope {
+    /// Called only after the target acknowledges `route.bind` and the
+    /// acknowledgement is accepted.
+    pub(crate) fn record_served(&self, module_id: &str) {
+        self._lease
+            .served_modules
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(module_id.to_owned());
+    }
+
     pub(crate) fn commit_presence(&self) {
         if let Some(presence) = &self._lease.presence {
             presence.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -452,6 +463,10 @@ struct LiveScope {
     parent_state: Option<ParentState>,
     binds: Arc<std::sync::atomic::AtomicUsize>,
     presence: HashMap<ConnectionId, Arc<std::sync::atomic::AtomicBool>>,
+    // Route-bind acknowledgement handling records history through this shared
+    // set, avoiding the scope-table lock while the forwarding lock is held.
+    // Each new epoch gets a fresh set.
+    served_modules: Arc<std::sync::Mutex<BTreeSet<String>>>,
 }
 
 impl LiveScope {
@@ -1069,6 +1084,9 @@ impl ScopeTable {
                     parent_state,
                     binds: held.map(|held| Arc::clone(&held.binds)).unwrap_or_default(),
                     presence: held.map(|held| held.presence.clone()).unwrap_or_default(),
+                    served_modules: held
+                        .map(|held| held.served_modules.clone())
+                        .unwrap_or_default(),
                 },
             );
         }
@@ -1736,6 +1754,7 @@ impl ScopeTable {
                 binds: Arc::clone(&held.binds),
                 released: std::sync::atomic::AtomicBool::new(!counts_for_idle),
                 presence,
+                served_modules: Arc::clone(&held.served_modules),
             }),
         }
     }
@@ -1875,6 +1894,41 @@ impl ScopeTable {
         })
     }
 
+    /// The caller supplies its registered module id, never another owner's id.
+    pub(crate) fn served_by(
+        &self,
+        owner: &str,
+        scope_ref: &str,
+        scope_epoch: u64,
+        module_id: &str,
+    ) -> subc_control::ScopeServedByAnswer {
+        use subc_control::ScopeServedByAnswer;
+        let Some(scope) = self
+            .owners
+            .get(owner)
+            .and_then(|state| state.live.get(scope_ref))
+        else {
+            return ScopeServedByAnswer::Unknown;
+        };
+        if scope.record.scope_epoch != scope_epoch
+            || scope
+                .record
+                .expires_at_ms
+                .is_some_and(|deadline| deadline <= (self.wall_clock)())
+        {
+            ScopeServedByAnswer::Unknown
+        } else if scope
+            .served_modules
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(module_id)
+        {
+            ScopeServedByAnswer::Served
+        } else {
+            ScopeServedByAnswer::NotServed
+        }
+    }
+
     /// The table's answer about one `(owner, ref)`.
     pub(crate) fn describe(&self, owner: &Principal, scope_ref: &str) -> ScopeDescription {
         let not_live = ScopeDescription {
@@ -1945,6 +1999,30 @@ mod tests {
 
     fn table() -> ScopeTable {
         ScopeTable::new([PREFRONTAL.to_string()])
+    }
+
+    #[test]
+    fn served_history_is_epoch_local_and_late_ack_does_not_resurrect_it() {
+        use subc_control::ScopeServedByAnswer::{NotServed, Served, Unknown};
+        let mut table = table();
+        sync(&mut table, PREFRONTAL, conn(1), 1, vec![head("s", 1)]);
+        let selector = ScopeSelector::new(reserved(PREFRONTAL), "s", Some(1));
+        let admission = table
+            .admit(&reserved(PREFRONTAL), "tool", &selector, true)
+            .unwrap();
+        let bound = table.reserve_bind(&admission, &reserved(PREFRONTAL), conn(1), false);
+        assert_eq!(table.served_by(PREFRONTAL, "s", 1, "tool"), NotServed);
+        bound.record_served("tool");
+        assert_eq!(table.served_by(PREFRONTAL, "s", 1, "tool"), Served);
+        assert_eq!(table.served_by("other", "s", 1, "tool"), Unknown);
+        sync(&mut table, PREFRONTAL, conn(1), 2, vec![head("s", 1)]);
+        assert_eq!(table.served_by(PREFRONTAL, "s", 1, "tool"), Served);
+        sync(&mut table, PREFRONTAL, conn(1), 3, vec![head("s", 2)]);
+        bound.record_served("late-tool");
+        assert_eq!(table.served_by(PREFRONTAL, "s", 1, "tool"), Unknown);
+        assert_eq!(table.served_by(PREFRONTAL, "s", 2, "late-tool"), NotServed);
+        sync(&mut table, PREFRONTAL, conn(1), 4, vec![]);
+        assert_eq!(table.served_by(PREFRONTAL, "s", 2, "tool"), Unknown);
     }
 
     #[test]

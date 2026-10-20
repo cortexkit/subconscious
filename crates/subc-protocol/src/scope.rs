@@ -188,6 +188,9 @@ pub const AGENT_RUN_SCOPES_CAPABILITY: &str = "agent-run-scopes/v1";
 /// The daemon also advertises this capability to scope-authority owners.
 pub const SCOPE_ON_BEHALF_OF_CAPABILITY: &str = "scope-on-behalf-of/v1";
 
+/// The daemon can answer whether a module acknowledged a bind under an owned scope epoch.
+pub const SCOPE_SERVED_BY_CAPABILITY: &str = "scope-served-by/v1";
+
 /// The authority-controlled attributes the daemon copies into scope stamps,
 /// subject to each field's target capability gate.
 /// Only an owner module named in the daemon config's `scope_authority_owners`

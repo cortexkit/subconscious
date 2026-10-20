@@ -3247,6 +3247,13 @@ fn commit_route_locked(
         .last_published_epoch
         .insert(reservation.client_key, reservation.client_epoch);
 
+    // This point is reachable only through an accepted route.bind acknowledgement.
+    // Publish history before notifying the opener, so a subsequent
+    // `scope.served_by` query sees the acknowledged bind.
+    if let Some(scope) = &binding.scope {
+        scope.record_served(&binding.module_id);
+    }
+
     // Sending through the reserved slot cannot fail, but it reports a receiver
     // that closed after reservation and before this locked publication point.
     // The frame is stamped and charged to the queued-byte count here, when it

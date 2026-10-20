@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.30.4
+
+- Expose capability-gated `ModuleHandle::scope_served_by` with an open answer and non-exhaustive reply; queries read only the registered owner namespace.
+
 ## 0.30.3
 
 - `SubcConsumer::call` and `call_cancellable` now resend once after a data-plane ERROR `module_reloading`. The daemon answers a request on an established route with that code only while the module drains for a restart, reload or disable, and before forwarding it, so the module never received the request. The call evicts the cached route, reopens it (the open path already retries the `module_reloading` / `module_warming` refusals it meets until the replacement process registers) and resends, so a call that lands in a drain window succeeds on the new process instead of failing. The resend shares the existing single resend budget with `unknown_channel` and `stale_route_epoch` (a call never resends twice; a second refusal is returned as `CallError::Module`), happens only within the call deadline, and is skipped once the call is cancelled. `error_codes::is_established_route_dead` is unchanged, because other consumers map it to their own verdicts; the client checks `module_reloading` separately, in a private `is_data_plane_drain_refusal`. Subscriptions are unchanged.

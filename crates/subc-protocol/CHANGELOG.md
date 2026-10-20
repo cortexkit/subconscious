@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.32.8
+
+- Add the daemon `scope-served-by/v1` capability constant; existing exhaustive control enums remain unchanged.
+
 ## 0.32.7
 
 - Match `cortexkit-bus-naming` 0.2.6's event-name grammar in manifest validation: event names contain one to four non-empty dot-separated tokens, each 1–63 bytes and starting with a lowercase letter or digit; version-shaped levels (`v` followed by digits) are reserved. Modules must not declare dotted events until the running daemon carries this release; older daemons refuse dotted names at HELLO.

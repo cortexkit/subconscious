@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.22.6
+
+- Managed `call()` / `callBinary()` now resend once after a data-plane ERROR `module_reloading`, matching subc-client-rs 0.30.3. The daemon answers a request on an established route with that code only while the module drains for a restart, reload or disable, and before forwarding it, so the module never received the request. The call evicts the cached route, reopens it (waiting out the drain's `route.open` refusals until the replacement registers) and resends. The resend shares the single resend budget with `unknown_channel` and `stale_route_epoch`, so a second refusal is thrown; it is skipped when the call's `signal` is already aborted, and when the call has a `timeoutMs` it uses only the time left of it. `isEstablishedRouteDead` is unchanged.
+
 ## 0.22.5
 
 - Add optional `operation_delivery` maps to `ManifestInput` and `CatalogEntry`. HELLO normalization preserves open delivery strings and omits absent or empty maps. Only `"watch"` on a declared management query is subscribable; unknown strings are metadata, not watch permission. Catalog discovery requires a daemon that projects the field; older daemons drop it.

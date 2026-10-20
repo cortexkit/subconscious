@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.30.3
+
+- `SubcConsumer::call` and `call_cancellable` now resend once after a data-plane ERROR `module_reloading`. The daemon answers a request on an established route with that code only while the module drains for a restart, reload or disable, and before forwarding it, so the module never received the request. The call evicts the cached route, reopens it (the open path already retries the `module_reloading` / `module_warming` refusals it meets until the replacement process registers) and resends, so a call that lands in a drain window succeeds on the new process instead of failing. The resend shares the existing single resend budget with `unknown_channel` and `stale_route_epoch` (a call never resends twice; a second refusal is returned as `CallError::Module`), happens only within the call deadline, and is skipped once the call is cancelled. `error_codes::is_established_route_dead` is unchanged, because other consumers map it to their own verdicts; the client checks `module_reloading` separately, in a private `is_data_plane_drain_refusal`. Subscriptions are unchanged.
+
 ## 0.30.2
 
 - Require subc-protocol 0.32.6 and expose attribution-only `on_behalf_of_agent` through the existing `RouteBindRequest.scope.attributes` and `ScopeDescribeReply.scope.attributes` stamps. Bind handlers and describe callers receive it only when their manifest provides `scope-on-behalf-of/v1`; it is never agent authority, consent or a per-agent handle grant.

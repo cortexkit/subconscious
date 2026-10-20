@@ -882,6 +882,13 @@ export class SubcClient {
    * Scoped routes are isolated by owner/ref/epoch and require owner or carrier authority.
    * A scope-ending close permanently ends that scoped cache entry; other route
    * closes are evicted so a later call asks the daemon to open a fresh route.
+   * A daemon refusal proving the module never received the request
+   * (`unknown_channel`, `stale_route_epoch`, or `module_reloading` while the
+   * module drains for a restart, reload or disable) evicts the cached route,
+   * reopens it and resends once. A `module_reloading` resend is skipped when
+   * `signal` is aborted or `timeoutMs` has run out, and its reopen waits out the
+   * daemon's route.open refusals so it reaches the replacement process. A second
+   * such refusal is thrown.
    */
   async call<Response = unknown>(
     moduleId: string,
@@ -915,11 +922,16 @@ export class SubcClient {
   }
 
   private async managedCall(moduleId: string, body: unknown, opts: ManagedCallOptions): Promise<unknown> {
+    // One resend per call after a refusal that proves the module never
+    // received the request (route dead, or the module draining).
     let retriedUnknownChannel = false;
+    // Read only when the call has a timeout, which is the only use for it.
+    const startedAt = opts.timeoutMs === undefined ? undefined : this.opts.now();
+    let attemptOpts = opts;
     for (;;) {
-      const routeHandle = await this.cachedRouteHandle(moduleId, opts);
+      const routeHandle = await this.cachedRouteHandle(moduleId, attemptOpts);
       try {
-        return await this.managedRequest(routeHandle, body, opts);
+        return await this.managedRequest(routeHandle, body, attemptOpts);
       } catch (err) {
         if (!(err instanceof SubcCallError)) throw this.terminalCallError("managed call failed", err);
         // unknown_channel is the daemon ROUTER refusing an unrouted channel — the
@@ -940,6 +952,25 @@ export class SubcClient {
           retriedUnknownChannel = true;
           this.evictRouteHandle(routeHandle);
           continue;
+        }
+        // module_reloading answering a request on an established route is the
+        // daemon's drain refusal: see isDataPlaneDrainRefusal. It shares the
+        // single resend above, so a call resends at most once whichever code
+        // arrives. Unlike a dead bind, the reopen waits out route.open refusals
+        // while the old process drains and the new one starts, so the resend
+        // runs on what is left of the call's own timeoutMs, and a call whose
+        // signal was aborted is not resent.
+        if (isDataPlaneDrainRefusal(err.code) && !retriedUnknownChannel && !this.closeStarted && !opts.signal?.aborted) {
+          const remainingMs =
+            opts.timeoutMs === undefined || startedAt === undefined
+              ? undefined
+              : opts.timeoutMs - (this.opts.now() - startedAt);
+          if (remainingMs === undefined || remainingMs > 0) {
+            retriedUnknownChannel = true;
+            this.evictRouteHandle(routeHandle);
+            attemptOpts = remainingMs === undefined ? opts : { ...opts, timeoutMs: remainingMs };
+            continue;
+          }
         }
         if (deadBindCode && retriedUnknownChannel) {
           this.evictRouteHandle(routeHandle);
@@ -2433,6 +2464,25 @@ export const STALE_ROUTE_EPOCH = "stale_route_epoch";
  */
 export function isEstablishedRouteDead(_flags: number, code: string | undefined): boolean {
   return code === UNKNOWN_CHANNEL || code === STALE_ROUTE_EPOCH;
+}
+
+/** Whether an ERROR answering a managed call's request is the daemon's drain
+ * refusal, `module_reloading`, which call() may resend once after reopening.
+ *
+ * On an established route the daemon answers `module_reloading` only when the
+ * module is draining (restart, reload or disable) and the request could not
+ * take a route credit, and it answers BEFORE forwarding, so the module never
+ * received the request and a resend cannot run it twice (the guarantee is
+ * documented on subc-protocol `error_codes::MODULE_RELOADING`).
+ *
+ * Kept apart from isEstablishedRouteDead on purpose: that predicate decides
+ * route DEATH, it mirrors the shared subc-protocol predicate byte for byte,
+ * and other consumers map it to their own verdicts. Adding a drain code there
+ * would change those verdicts. Mirrors subc-client-rs
+ * `is_data_plane_drain_refusal`.
+ */
+function isDataPlaneDrainRefusal(code: string | undefined): boolean {
+  return code === "module_reloading";
 }
 
 export async function connectionFileExists(path: string): Promise<boolean> {

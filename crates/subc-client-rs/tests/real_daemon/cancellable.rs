@@ -365,6 +365,93 @@ async fn cancellable_reply_keeps_original_deadline_after_cancel() {
     assert_no_frame(&mut held.provider).await;
 }
 
+fn module_reloading_body() -> Vec<u8> {
+    serde_json::to_vec(&ErrorBody::new(
+        "module_reloading",
+        "module endpoint is reloading",
+    ))
+    .unwrap()
+}
+
+fn expect_module_reloading(result: Result<Vec<u8>, CallError>) {
+    match result {
+        Err(CallError::Module(body)) => assert_eq!(body.code, "module_reloading"),
+        other => panic!("expected the module_reloading refusal, got {other:?}"),
+    }
+}
+
+// The raw provider answers each request with `module_reloading`, standing in
+// for the daemon's drain refusal: the client reads the code, not who sent it.
+// The first refusal earns one resend on a reopened route; the second must be
+// returned, so the provider sees exactly two requests and nothing after.
+#[tokio::test]
+async fn managed_call_resends_once_after_module_reloading_and_returns_a_second_refusal() {
+    let mut held = HeldCall::start().await;
+    let reply = held.consumer.call(
+        target(),
+        held.identity.clone(),
+        b"hold".to_vec(),
+        CallOptions::default(),
+    );
+    tokio::pin!(reply);
+    let first = held_request(&mut held.provider, reply.as_mut()).await;
+    terminal(
+        &mut held.provider,
+        &first,
+        FrameType::Error,
+        &module_reloading_body(),
+    )
+    .await;
+    // The resend reopens the route, so it arrives on a fresh channel.
+    let resent = held_request(&mut held.provider, reply.as_mut()).await;
+    assert_eq!(resent.body, first.body, "the resend carries the same body");
+    assert_ne!(
+        resent.header.channel, first.header.channel,
+        "the resend must go to a reopened route, not the refused one"
+    );
+    terminal(
+        &mut held.provider,
+        &resent,
+        FrameType::Error,
+        &module_reloading_body(),
+    )
+    .await;
+    let result = timeout(Duration::from_secs(5), reply)
+        .await
+        .expect("a second module_reloading must end the call, not resend again");
+    expect_module_reloading(result);
+    assert_no_frame(&mut held.provider).await;
+}
+
+// A cancelled call must not resend after `module_reloading`: the caller asked
+// for the work to stop, so the refusal is returned as it is.
+#[tokio::test]
+async fn cancelled_managed_call_does_not_resend_after_module_reloading() {
+    let mut held = HeldCall::start().await;
+    let (cancel, reply) = held.consumer.call_cancellable(
+        target(),
+        held.identity.clone(),
+        b"hold".to_vec(),
+        CallOptions::default(),
+    );
+    tokio::pin!(reply);
+    let request = held_request(&mut held.provider, reply.as_mut()).await;
+    assert_eq!(cancel.cancel().await, CancelOutcome::Sent);
+    assert_cancel(&mut held.provider, &request).await;
+    terminal(
+        &mut held.provider,
+        &request,
+        FrameType::Error,
+        &module_reloading_body(),
+    )
+    .await;
+    let result = timeout(Duration::from_secs(5), reply)
+        .await
+        .expect("a cancelled call must return module_reloading without resending");
+    expect_module_reloading(result);
+    assert_no_frame(&mut held.provider).await;
+}
+
 #[tokio::test]
 async fn cancellable_before_dispatch_remembers_cancel_and_unpolled_drop_finishes() {
     let mut held = HeldCall::start().await;

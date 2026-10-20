@@ -116,7 +116,8 @@ running before spawning new ones. The files that make this work are in
 - **A route death mid-request leaves the outcome unknown.** Re-sending a
   mutation after a `GOODBYE` may apply it twice. Only `module_reloading`,
   `unknown_channel` and `stale_route_epoch` guarantee the module never saw the
-  request.
+  request; the SDKs' managed unary calls reopen the route and resend once after
+  any of them.
 - **Absent is not zero.** A field the daemon cannot report is omitted. A
   missing `last_probe_ms` means never probed; a missing `machine_id` means an
   older daemon.

@@ -75,7 +75,11 @@ interface FakeDaemonOptions {
   // "unknown-channel-once": reject the FIRST data request with the daemon
   //   router's unknown_channel ERROR (a stale bind after a module restart), then
   //   serve subsequent requests normally — the re-opened route works.
-  dataMode?: "echo" | "drop" | "error" | "delay-body" | "silent-hold" | "half-open" | "unknown-channel-once" | "unknown-channel-always" | "stale-epoch-once";
+  // "module-reloading-once": reject the FIRST data request with the daemon's
+  //   drain refusal (module_reloading), refuse the next two route.opens with
+  //   module_reloading while the module "restarts", then serve normally.
+  // "module-reloading-always": reject EVERY data request with module_reloading.
+  dataMode?: "echo" | "drop" | "error" | "delay-body" | "silent-hold" | "half-open" | "unknown-channel-once" | "unknown-channel-always" | "stale-epoch-once" | "module-reloading-once" | "module-reloading-always";
   delayBodyMs?: number;
   routeOpenError?: { code: string; message: string };
   // Refuse this module on every connection at or after the selected connection;
@@ -873,6 +877,73 @@ describe("SubcClient managed call", () => {
       // The third data attempt begins a new managed call. It must open a route
       // before sending data, rather than reuse the retry's dead channel.
       expect(stats.requestFrames[4]).toEqual({ channel: 0, controlOp: "route.open" });
+    } finally {
+      client.close();
+    }
+  });
+
+  test("resends once on module_reloading after reopening past the drain's route.open refusals", async () => {
+    const { connFile } = tempConnectionFile();
+    const stats = newStats();
+    // The daemon answers a request on an established route with module_reloading
+    // only before forwarding it, while the module drains for a restart. The
+    // client must evict the route, wait out the reopen refusals until the
+    // module is back, and resend the request once: the caller sees success.
+    const daemon = await startFakeDaemon({ stats, dataMode: "module-reloading-once" });
+    writeConnectionFile(connFile, daemon.port);
+
+    const client = await SubcClient.connect({ connectionFile: connFile, identity: IDENTITY, reconnectBackoff: BACKOFF });
+    try {
+      expect(await client.call<unknown>("managed-provider", "echo", { n: 1 }, { timeoutMs: 5_000 })).toEqual({
+        method: "echo",
+        params: { n: 1 },
+      });
+      // Four route.opens (initial, two refused during the drain, the reopen
+      // that succeeds) and two data requests (refused + resent) on ONE connection.
+      expect(stats.routeOpens).toBe(4);
+      expect(stats.dataRequests).toBe(2);
+      expect(stats.connections).toBe(1);
+    } finally {
+      client.close();
+    }
+  });
+
+  test("throws a second module_reloading instead of resending again", async () => {
+    const { connFile } = tempConnectionFile();
+    const stats = newStats();
+    const daemon = await startFakeDaemon({ stats, dataMode: "module-reloading-always" });
+    writeConnectionFile(connFile, daemon.port);
+
+    const client = await SubcClient.connect({ connectionFile: connFile, identity: IDENTITY });
+    try {
+      expect(await rejectionOf(client.call("managed-provider", "echo", { n: 1 }))).toMatchObject({
+        code: "module_reloading",
+      });
+      // Exactly two attempts: the original and the single resend, which shares
+      // the same one-resend budget as unknown_channel.
+      expect(stats.dataRequests).toBe(2);
+      expect(stats.routeOpens).toBe(2);
+    } finally {
+      client.close();
+    }
+  });
+
+  test("does not resend after module_reloading once the call's signal is aborted", async () => {
+    const { connFile } = tempConnectionFile();
+    const stats = newStats();
+    const daemon = await startFakeDaemon({ stats, dataMode: "module-reloading-once" });
+    writeConnectionFile(connFile, daemon.port);
+
+    const client = await SubcClient.connect({ connectionFile: connFile, identity: IDENTITY, reconnectBackoff: BACKOFF });
+    try {
+      const controller = new AbortController();
+      controller.abort();
+      // The caller asked for the work to stop, so the refusal is returned as it is.
+      expect(
+        await rejectionOf(client.call("managed-provider", "echo", { n: 1 }, { signal: controller.signal })),
+      ).toMatchObject({ code: "module_reloading" });
+      expect(stats.dataRequests).toBe(1);
+      expect(stats.routeOpens).toBe(1);
     } finally {
       client.close();
     }
@@ -1678,6 +1749,9 @@ async function handleFakeConnection(socket: Socket, options: FakeDaemonOptions):
   // NOTHING (Pings included) — TCP stays open, the peer is effectively gone.
   let deaf = false;
   let reverseRequestSent = false;
+  // Set by "module-reloading-once": how many more route.opens to refuse with
+  // module_reloading, as the daemon does while a module drains and restarts.
+  let drainRouteOpenRefusals = 0;
 
   for (;;) {
     const frame = await readFrame(reader, deadline);
@@ -1733,6 +1807,16 @@ async function handleFakeConnection(socket: Socket, options: FakeDaemonOptions):
           (request as { consumer_identity?: unknown }).consumer_identity,
         );
         const moduleId = request.target?.module_id;
+        if (drainRouteOpenRefusals > 0) {
+          // The module is still draining: a reopen is refused until it is back.
+          drainRouteOpenRefusals -= 1;
+          await writeFrame(
+            socket,
+            errorFrame(frame, { code: "module_reloading", message: `module_id '${moduleId}' is reloading` }),
+            deadline,
+          );
+          continue;
+        }
         if (options.onRouteOpen) {
           options.onRouteOpen(moduleId, (error) =>
             writeFrame(
@@ -1858,6 +1942,21 @@ async function handleFakeConnection(socket: Socket, options: FakeDaemonOptions):
         errorFrame(frame, {
           code: "stale_route_epoch",
           message: `stale epoch ${frame.header.epoch} on channel ${frame.header.channel}`,
+        }),
+        deadline,
+      );
+    } else if (
+      options.dataMode === "module-reloading-always" ||
+      (options.dataMode === "module-reloading-once" && options.stats.dataRequests === 1)
+    ) {
+      // The daemon's drain refusal on an established route, answered before
+      // forwarding. The module stays down for the next two reopen attempts.
+      if (options.dataMode === "module-reloading-once") drainRouteOpenRefusals = 2;
+      await writeFrame(
+        socket,
+        errorFrame(frame, {
+          code: "module_reloading",
+          message: `module endpoint for route channel ${frame.header.channel} is reloading`,
         }),
         deadline,
       );

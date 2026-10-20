@@ -4936,6 +4936,105 @@ async fn a_busy_gauge_released_after_on_draining_holds_the_restart_drain_until_i
     daemon.kill_and_wait();
 }
 
+/// A managed call sent on an established route while its module drains for a
+/// restart succeeds on the restarted process.
+///
+/// The daemon answers that request with a data-plane `module_reloading` ERROR
+/// before forwarding it, so the draining process never sees it. The client
+/// then evicts the route, reopens it (waiting out the `route.open` refusals
+/// while the old process drains and the new one starts) and resends once.
+///
+/// The module's busy gauge holds the drain open for `BUSY_AFTER_DRAIN_MS`
+/// after the drain notice, and the call is sent as soon as `route.closing`
+/// arrives, which the daemon pushes only after it has closed route admission.
+/// So the request meets the drain refusal rather than a route that has already
+/// gone away. The `sleep` request kind makes the module record the request
+/// with its pid, which tells the drained process from its replacement.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_call_refused_with_module_reloading_during_a_restart_drain_succeeds_on_the_restarted_module(
+) {
+    const BUSY_AFTER_DRAIN_MS: u64 = 1_500;
+    const DRAIN_BUDGET_MS: u64 = 8_000;
+    let busy_after_drain = BUSY_AFTER_DRAIN_MS.to_string();
+    let (_temp_dir, mut daemon, events_path) = start_drain_harness(
+        "subc-client-rs-drain-resend",
+        &[("SUBC_MODULE_ECHO_BUSY_AFTER_DRAIN_MS", &busy_after_drain)],
+        json!({
+            "drain_timeout_ms": DRAIN_BUDGET_MS,
+            "health": { "cadence_ms": 200, "deadline_ms": 150 },
+        }),
+    )
+    .await;
+    let drained_pid = first_module_pid(&events_path).await;
+
+    let consumer = SubcConsumer::connect(&daemon.connection_file, fast_consumer_options())
+        .await
+        .unwrap();
+    let identity = consumer_identity("drain-resend");
+    // Long enough to wait out the drain and the replacement's startup in one
+    // call, which is what the resend relies on.
+    let opts = CallOptions {
+        timeout: Duration::from_secs(30),
+        route_retry_deadline: Duration::from_secs(30),
+        ..fast_call_options()
+    };
+    // Establish and cache the managed route before the drain starts.
+    consumer
+        .call(
+            tool_target(DRAIN_MODULE_ID),
+            identity.clone(),
+            br#"{"kind":"warmup"}"#.to_vec(),
+            opts.clone(),
+        )
+        .await
+        .expect("the call before the restart must succeed");
+    let mut control = consumer.control_pushes(8);
+
+    restart_drain_module(&daemon.connection_file).await;
+    // Generous: on a loaded runner the push can trail the restart's ACK by
+    // seconds, and this wait only bounds a hang.
+    timeout(Duration::from_secs(30), async {
+        loop {
+            let push = control
+                .recv()
+                .await
+                .expect("control push receiver should remain open");
+            if push.op == "route.closing" {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("route.closing should arrive once the drain begins");
+
+    let reply = consumer
+        .call(
+            tool_target(DRAIN_MODULE_ID),
+            identity,
+            br#"{"kind":"sleep","ms":0}"#.to_vec(),
+            opts,
+        )
+        .await
+        .expect("a call refused with module_reloading must be resent after the restart");
+    assert_eq!(json_body(&reply)["ok"], true, "{}", json_body(&reply));
+
+    let served = read_events(&events_path)
+        .into_iter()
+        .filter(|event| event["kind"] == "sleep_started")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        served.len(),
+        1,
+        "exactly one process must have run the request: {served:#?}"
+    );
+    assert_ne!(
+        served[0]["pid"].as_u64(),
+        Some(drained_pid),
+        "the request must run on the restarted process, not the drained one: {served:#?}"
+    );
+    daemon.kill_and_wait();
+}
+
 // scope.sync and scope.describe through the SDK's ModuleHandle, against a
 // real daemon.
 //

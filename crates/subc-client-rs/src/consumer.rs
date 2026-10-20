@@ -2012,6 +2012,15 @@ impl SubcConsumer {
 
     /// Managed unary call. Route-open failures happen before the body is sent and are
     /// classified as `NotSent`; module handler Error frames are the only `Module` errors.
+    ///
+    /// A daemon refusal that proves the module never received the request
+    /// (`unknown_channel`, `stale_route_epoch`, or `module_reloading` while the
+    /// module drains for a restart, reload or disable) evicts the cached route,
+    /// reopens it and resends the request once, within the call deadline and
+    /// only if the call has not been cancelled. Reopening during a drain waits
+    /// out the daemon's `route.open` refusals until the replacement process
+    /// registers, so the resend reaches the new process. A second such refusal
+    /// is returned as `CallError::Module`.
     pub async fn call(
         &self,
         target: RouteTarget,
@@ -2025,8 +2034,8 @@ impl SubcConsumer {
     /// Managed unary call with explicit cancellation, like [`Self::request_cancellable`].
     ///
     /// Uses the same route opening, options, errors and deadline as [`Self::call`].
-    /// Once cancellation is requested, a dead-route refusal is returned rather than
-    /// retrying work the caller has asked to stop. Cancellation during route opening
+    /// Once cancellation is requested, a dead-route or `module_reloading` refusal is
+    /// returned rather than retrying work the caller has asked to stop. Cancellation during route opening
     /// is remembered and sent after the Request is queued. Dropping either value
     /// sends no Cancel; dropping the future removes its pending registration.
     pub fn call_cancellable(
@@ -2059,7 +2068,9 @@ impl SubcConsumer {
         cancel: Option<Arc<UnaryCancel>>,
     ) -> Result<Vec<u8>, CallError> {
         let call_deadline = Instant::now() + opts.timeout;
-        let mut retried_unknown_channel = false;
+        // One resend per call after a refusal that proves the module never
+        // received the request (route dead, or the module draining).
+        let mut resent_after_unsent_refusal = false;
         let consumer_identity = route_open_consumer_identity(&opts);
         let consumer_capabilities = route_open_consumer_capabilities(&opts);
         let role_versions = route_open_role_versions(opts.role_versions.as_ref());
@@ -2139,14 +2150,18 @@ impl SubcConsumer {
                 // #39): channel known, epoch released mid-flight. Its documented
                 // contract is NOT-FORWARDED (dropped before delivery), so the retry
                 // is safe by construction; the remedy is identical.
+                // module_reloading joins the same single resend: see
+                // `is_data_plane_drain_refusal`. All three codes share one
+                // budget, so a call resends at most once whichever arrives.
                 // Parity with the TS client's retry-once in call().
                 Ok(TerminalFrame::Error { body, flags })
-                    if error_codes::is_established_route_dead(flags, &body.code)
-                        && !retried_unknown_channel
+                    if (error_codes::is_established_route_dead(flags, &body.code)
+                        || is_data_plane_drain_refusal(&body.code))
+                        && !resent_after_unsent_refusal
                         && !cancel.as_ref().is_some_and(|cancel| cancel.requested())
                         && Instant::now() < call_deadline =>
                 {
-                    retried_unknown_channel = true;
+                    resent_after_unsent_refusal = true;
                     self.shared.invalidate_route(&route_key, Some(route.handle));
                     continue;
                 }
@@ -6118,6 +6133,26 @@ fn emit_callbacks(callbacks: Vec<Callback>, state: ConnectionState) {
 /// so consumers with their own connection layer share it rather than copy it.
 pub fn is_retryable_route_open_code(code: &str) -> bool {
     error_codes::is_retryable_route_open(code)
+}
+
+/// Whether a data-plane ERROR answering a managed call's request is the
+/// daemon's drain refusal, `module_reloading`, which the call may resend once
+/// after reopening the route.
+///
+/// On an established route the daemon answers `module_reloading` only when the
+/// module's endpoint is draining and the request could not take a route
+/// credit, and it answers BEFORE forwarding (`ForwardBackend::handle_bound` in
+/// subc-daemon's `router.rs`), so the module never received the request and a
+/// resend cannot run it twice. The protocol documents that guarantee on
+/// `error_codes::MODULE_RELOADING`.
+///
+/// Kept apart from `error_codes::is_established_route_dead` on purpose. That
+/// shared predicate decides route DEATH, and other consumers map it to their
+/// own custody, provider or suspect verdicts; adding a drain code there would
+/// change those verdicts on a protocol bump. Here the code only earns the same
+/// remedy (evict, reopen, resend once) inside this client's unary call path.
+fn is_data_plane_drain_refusal(code: &str) -> bool {
+    code == error_codes::MODULE_RELOADING
 }
 
 /// Whether `handle` names a route installed on the current connection. Channel 0 is the

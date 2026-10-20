@@ -1,0 +1,36 @@
+ ◆ CortexKit    1 Home   2 Modules   3 Activity   4 Usage   5 Agents   6 Devices   7 Settings           This Mac  20:48 
+────────────────────────────────────────────────────────────━━━━━━━━────────────────────────────────────────────────────
+                                                                                                                        
+  Agents 12 · 5 working                                                                                                 
+                                                                                                                        
+    Agent         Project           Doing                                       State         Machine                   
+  ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────  
+  ● ARGUS         web-app           Checkout page redesign                      working       This Mac                  
+  ● IRIS          api-server        Rate limiter review                         working       This Mac                  
+  ● ORION         mobile-app        Offline sync, round 3                       working       This Mac                  
+  ○ NOVA          docs-site         —                                           idle 4m       This Mac                  
+  ● ECHO          data-pipeline     Nightly import retries                      working       This Mac                  
+  ○ KITE          design-system     —                                           idle 12m      This Mac                  
+  ○ MOSS          infra             —                                           idle 31m      This Mac                  
+  ○ PIKE          billing           —                                           idle 1h       This Mac                  
+  ● REED          search            Ranking fix for long queries                working       This Mac                  
+  ○ SAGE          analytics         —                                           idle 22m      This Mac                  
+  ○ WREN          ios-app           —                                           idle 2h       This Mac                  
+  ○ scratch       notes             —                                           idle 3d       CortexKit Mac 2           
+                                                                                                                        
+                                                                                                                        
+  Workspaces                                             2    Machines                                               2  
+  ────────────────────────────────────────────────────────    ────────────────────────────────────────────────────────  
+  CortexKit         31 projects · 29 agents                   ● This Mac        11 agents live here                     
+  Scratch           4 projects · 3 agents                     ● CortexKit Mac 2 1 agent lives here                      
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ↑↓  move    ⏎  open agent    p  projects    /  filter                                                 from entorhinal 

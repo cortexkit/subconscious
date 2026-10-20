@@ -1,0 +1,36 @@
+ ◆ CortexKit    1 Home   2 Modules   3 Activity   4 Usage   5 Agents   6 Devices   7 Settings           This Mac  20:48 
+────────────────━━━━━━──────────────────────────────────────────────────────────────────────────────────────────────────
+                                                                                                                        
+  ▲ 2 things need attention   ·   23 of 25 modules healthy   ·   5 agents working                                       
+                         ╭────────────────────────────────────────────────────────────────────╮                         
+   ▲ engram             C│ : br▏                                                              │    since 18:20      ⏎   
+   ▲ thalamus-harness   O│────────────────────────────────────────────────────────────────────│    since 09:30          
+                         │   Restart broca                                           Modules  │                         
+  Modules               2│   Restart broca without downtime (swap)                   Modules  │               4f1a9c2e  
+  ───────────────────────│   Open broca logs                                         Modules  │───────────────────────  
+  ● aft               ● i│   Edit broca settings                                    Settings  │   0.36.17 · up 9h 15m   
+  ● astrocyte         ● m│   Stop broca                                              Modules  │   366 connected         
+  ● basal             ● m│                                                                    │                         
+  ● broca             ● n│                                                                    │er 80 of 80 busy         
+  ● callosum          ● p│                                                                    │   21 queued · wait 3m   
+  ● cerebellum        ● p│                                                                    │   ▇▇▆▆▇▇▅▇▆▅▄▆▅▃▅▄ 1h   
+  ● cingulate         ● p│                                                                    │                         
+  ● ckbus             ● s│                                                                    │   ▲ last upload 2d ago  
+  ● claustrum         ● s│                                                                    │   uploading now         
+  ● condition-runner  ● t│                                                                    │                         
+  ▲ engram            ▲ t│ ↑↓ choose · ⏎ run · esc close                                      │   ● Mac 2  ● iPhone     
+  ● entorhinal        ● w╰────────────────────────────────────────────────────────────────────╯   none waiting          
+  ● fusiform                                                                                                            
+                                                                                                                        
+  Activity                                                               live   ●    Agents                  5 working  
+  ────────────────────────────────────────────────────────────────────────────────   ─────────────────────────────────  
+  18:20  engram            restarted on build 9d8a178c                          ck   ● ARGUS                   working  
+  18:15  motor             restarted on build 222d833f                          ck   ● IRIS                    working  
+  18:02  cingulate         approved a tool permission for IRIS on iPhone       you   ● ORION                   working  
+  17:54  motor             settings changed: hosted spill off                   ck   ○ NOVA                    idle 4m  
+  17:53  motor             restarted on build 17c0a7d6                          ck   ● ECHO                    working  
+  17:21  prefrontal-core   started worker for llm-runner 0.3.8                IRIS   ○ KITE                   idle 12m  
+  17:02  astrocyte         restarted on build ad21ee36                          ck   ○ MOSS                   idle 31m  
+                                                                                                                        
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏎  open    ↑↓  move    :  commands    ?  help                                                        updated just now 

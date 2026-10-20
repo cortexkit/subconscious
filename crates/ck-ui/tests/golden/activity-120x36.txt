@@ -1,0 +1,36 @@
+ ◆ CortexKit    1 Home   2 Modules   3 Activity   4 Usage   5 Agents   6 Devices   7 Settings           This Mac  20:48 
+─────────────────────────────────────━━━━━━━━━━─────────────────────────────────────────────────────────────────────────
+                                                                                                                        
+  Activity     All   Modules   Agents   Approvals   Settings                                                    live ●  
+  ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────  
+  Today                                                                     │  engram restarted on build 9d8a178c       
+  18:20  engram            restarted on build 9d8a178c                  ck  │  18:20:36 local · UTC+2                   
+  18:15  motor             restarted on build 222d833f                  ck  │                                           
+  18:02  cingulate         approved a tool permission for IRIS on …    you  │  By        ck on this Mac                 
+  17:54  motor             settings changed: hosted spill off           ck  │  Subject   module engram                  
+  17:53  motor             restarted on build 17c0a7d6                  ck  │  Kind      subc.module_restarted          
+  17:21  prefrontal-core   started worker for llm-runner 0.3.8        IRIS  │  Seq       48,213                         
+  17:02  astrocyte         restarted on build ad21ee36                  ck  │  Build     7c3a47b9 → 9d8a178c            
+  16:40  basal             flow ci-router delivered 3 notices        basal  │                                           
+  15:48  entorhinal        restarted on 0.1.39 · store upgraded to…     ck  │  Details                                  
+  14:15  cerebellum        restarted on build b55082b4                  ck  │    {                                      
+  12:59  motor             restarted on build 249f3628                  ck  │      "old_evidence": "7c3a47b9…",         
+  12:36  plexus            restarted on build b40bd6b1                  ck  │      "new_evidence": "9d8a178c…",         
+  11:50  cerebellum        restarted on build f91eb1cf                  ck  │      "drain_ms": 412                      
+  10:27  aft               restarted on build 2e04b432                  ck  │    }                                      
+  09:30  daemon            restarted on 0.36.17 · all 25 modules b…     ck  │                                           
+                                                                            │                                           
+                                                                            │                                           
+                                                                            │                                           
+                                                                            │                                           
+                                                                            │                                           
+                                                                            │                                           
+                                                                            │                                           
+                                                                            │                                           
+                                                                            │                                           
+                                                                            │                                           
+                                                                            │                                           
+                                                                            │                                           
+                                                                                                                        
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ↑↓  move    ⏎  open subject    /  filter    tab  kind                            15 today · ledger and process events 

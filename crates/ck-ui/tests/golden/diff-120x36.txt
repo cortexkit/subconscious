@@ -1,0 +1,36 @@
+ ◆ CortexKit    1 Home   2 Modules   3 Activity   4 Usage   5 Agents   6 Devices   7 Settings           This Mac  20:48 
+───────────────────────────────────────────────────────────────────────────────────━━━━━━━━━━───────────────────────────
+                                                                                                                        
+  Settings            │  Modules subc.jsonc     │  broca                                                enabled  ◉ on   
+  ──────────────────  │  ─────────────────────  │  AI model runner. Edits here save to subc.jsonc and keep its comments.
+  ▸ Modules           │  ◉ aft                  │                                                                       
+    Daemon  ╭─ Save subc.jsonc ────────────────────────────────────────────────────────────────────────────╮            
+    Updates │                                                                                              │            
+    Credenti│  ~/.config/cortexkit/subc.jsonc · 1 change · comments kept · a copy of the old file is kept  │            
+    Permissi│                                                                                              │/broca      
+    About   │   306    // difference.                                                                      │g     new   
+            │   307    "env": {                                                                            │            
+            │   308  -   "BROCA_STATE_ROOT": "/Users/alex/.local/share/cortexkit/broca"                    │            
+            │   308  +   "BROCA_STATE_ROOT": "/Users/alex/.local/share/cortexkit/broca",                   │ster        
+            │   309  +   "CK_LOG": "info,broca.requests=debug"                                             │            
+            │   310    },                                                                                  │            
+            │                                                                                              │            
+            │  After saving                                                                                │            
+            │                                                                                              │ers are not 
+            │  ↻ broca  needs a restart to use the new environment. It has 3 runs in flight;               │ tell the   
+            │           a restart waits up to 30 s for them to finish.                                     │            
+            │                                                                                              │            
+            │                                                                                              │            
+            │                                                                                              │and save    
+            │   ⏎  Save and restart broca     s  Save only     esc  Cancel                                 │            
+            │                                                                                              │            
+            │                                                                                              │            
+            ╰──────────────────────────────────────────────────────────────────────────────────────────────╯            
+                      │  ◉ thalamus-harness     │                                                                       
+                      │  ◉ wernicke             │                                                                       
+                      │                         │                                                                       
+                      │                         │                                                                       
+                      │                         │                                                                       
+                                                                                                                        
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  e  edit    ⏎  toggle    w  save    u  undo    /  filter                                              1 unsaved change 

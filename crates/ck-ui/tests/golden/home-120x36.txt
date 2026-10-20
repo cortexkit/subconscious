@@ -1,0 +1,36 @@
+ ◆ CortexKit    1 Home   2 Modules   3 Activity   4 Usage   5 Agents   6 Devices   7 Settings           This Mac  20:48 
+────────────────━━━━━━──────────────────────────────────────────────────────────────────────────────────────────────────
+                                                                                                                        
+  ▲ 2 things need attention   ·   23 of 25 modules healthy   ·   5 agents working                                       
+                                                                                                                        
+   ▲ engram             Cloud backup 2 days behind · uploading generation 45                       since 18:20      ⏎   
+   ▲ thalamus-harness   OpenCode configuration is missing or unreadable                            since 09:30          
+                                                                                                                        
+  Modules               23 ok · 2 degraded   Usage                       this week   This Mac                 4f1a9c2e  
+  ────────────────────────────────────────   ─────────────────────────────────────   ─────────────────────────────────  
+  ● aft               ● insula               Claude      ███████████████▍██    85%   Daemon       0.36.17 · up 9h 15m   
+  ● astrocyte         ● magic-context                    resets in 9h 25m            Clients      366 connected         
+  ● basal             ● motor                Codex       ██████████████████    56%                                      
+  ● broca             ● nats-server                      resets in 6d 11h            Build server 80 of 80 busy         
+  ● callosum          ● plexus               Antigravity ██████▍███████████    35%                21 queued · wait 3m   
+  ● cerebellum        ● prefrontal-core                  resets in 18h 4m                         ▇▇▆▆▇▇▅▇▆▅▄▆▅▃▅▄ 1h   
+  ● cingulate         ● prefrontal-routing   Grok        ██████████████████   100%                                      
+  ● ckbus             ● subc-mcp                         resets in 1d 21h            Backups      ▲ last upload 2d ago  
+  ● claustrum         ● synapse              Cursor      ██████████████████     0%                uploading now         
+  ● condition-runner  ● thalamus                         resets in 23h 42m                                              
+  ▲ engram            ▲ thalamus-harness                                             Devices      ● Mac 2  ● iPhone     
+  ● entorhinal        ● wernicke                                                     Approvals    none waiting          
+  ● fusiform                                                                                                            
+                                                                                                                        
+  Activity                                                               live   ●    Agents                  5 working  
+  ────────────────────────────────────────────────────────────────────────────────   ─────────────────────────────────  
+  18:20  engram            restarted on build 9d8a178c                          ck   ● ARGUS                   working  
+  18:15  motor             restarted on build 222d833f                          ck   ● IRIS                    working  
+  18:02  cingulate         approved a tool permission for IRIS on iPhone       you   ● ORION                   working  
+  17:54  motor             settings changed: hosted spill off                   ck   ○ NOVA                    idle 4m  
+  17:53  motor             restarted on build 17c0a7d6                          ck   ● ECHO                    working  
+  17:21  prefrontal-core   started worker for llm-runner 0.3.8                IRIS   ○ KITE                   idle 12m  
+  17:02  astrocyte         restarted on build ad21ee36                          ck   ○ MOSS                   idle 31m  
+                                                                                                                        
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏎  open    ↑↓  move    :  commands    ?  help                                                        updated just now 

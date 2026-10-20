@@ -1,0 +1,36 @@
+ ◆ CortexKit    1 Home   2 Modules   3 Activity   4 Usage   5 Agents   6 Devices   7 Settings           This Mac  20:48 
+───────────────────────────────────────────────────────────────────────────────────━━━━━━━━━━───────────────────────────
+                                                                                                                        
+  Settings            │  Modules subc.jsonc     │  broca                                                enabled  ◉ on   
+  ──────────────────  │  ─────────────────────  │  AI model runner. Edits here save to subc.jsonc and keep its comments.
+  ▸ Modules           │  ◉ aft                  │                                                                       
+    Daemon            │  ◉ astrocyte            │  Program       ~/.local/share/cortexkit/bin/ck-broca                  
+    Updates        ●  │  ◉ basal                │  Arguments     none                                                   
+    Credentials       │  ◉ broca             •  │                                                                       
+    Permissions       │  ◉ callosum             │  Environment   BROCA_STATE_ROOT   ~/.local/share/cortexkit/broca      
+    About             │  ◉ cerebellum           │                CK_LOG             info,broca.requests=debug     new   
+                      │  ◉ cingulate            │                + add variable                                         
+                      │  ◉ ckbus                │                                                                       
+                      │  ◉ claustrum            │  Reserved      yes · only a daemon-launched broca may register        
+                      │  ◉ condition-runner     │  Restart       drains up to 30 s · backoff 100 ms to 30 s             
+                      │  ◉ engram               │  Health        checked every 30 s                                     
+                      │  ◉ entorhinal           │                                                                       
+                      │  ◉ fusiform             │  Comment in subc.jsonc                                                
+                      │  ◉ insula               │    // BROCA_STATE_ROOT is the stable data folder. Its ledgers are not 
+                      │  ◉ magic-context        │    // disposable -- anyone writing a cleanup for it cannot tell the   
+                      │  ◉ motor                │    // difference.                                                     
+                      │  ◉ nats-server          │                                                                       
+                      │  ◉ plexus               │                                                                       
+                      │  ◉ prefrontal-core      │  1 unsaved change · needs a restart of broca    w  review and save    
+                      │  ◉ prefrontal-routing   │                                                                       
+                      │  ◉ subc-mcp             │                                                                       
+                      │  ◉ synapse              │                                                                       
+                      │  ◉ thalamus             │                                                                       
+                      │  ◉ thalamus-harness     │                                                                       
+                      │  ◉ wernicke             │                                                                       
+                      │                         │                                                                       
+                      │                         │                                                                       
+                      │                         │                                                                       
+                                                                                                                        
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  e  edit    ⏎  toggle    w  save    u  undo    /  filter                                              1 unsaved change 

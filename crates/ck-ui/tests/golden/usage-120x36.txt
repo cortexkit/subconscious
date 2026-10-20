@@ -1,0 +1,36 @@
+ ◆ CortexKit    1 Home   2 Modules   3 Activity   4 Usage   5 Agents   6 Devices   7 Settings           This Mac  20:48 
+──────────────────────────────────────────────────━━━━━━━───────────────────────────────────────────────────────────────
+                                                                                                                        
+  Providers                   │  Claude · 5 accounts · week                                          refreshed 4s ago   
+  ──────────────────────────  │                                                                                         
+  Claude      ██████▉█   85%  │  ████████████████████████████████████████████▎███████  4.3 of 5 accounts used           
+  5 accounts                  │                                                        soonest reset in 9h 25m          
+  Codex       ████▌███   56%  │  ────────────────────────────────────────────────────────────────────────────────────   
+  3 accounts                  │  alex@example.com                            ▲ refresh failing 2s · last good reading   
+  Antigravity ██▊█████   35%  │    5h                  ██████████████████████████████    0%                             
+  1 account                   │    week                ██████████████████████████████  100%   resets in 19h 25m         
+  Grok        ████████  100%  │                                                                                         
+  1 account                   │  sam@example.org                                                        1 saved reset   
+  Cursor      ████████    0%  │    5h                  ██████████████████████████████    0%                             
+  1 account                   │    week                ██████████████████████████████  100%   resets in 9h 25m          
+                              │                                                                                         
+                              │  robin@example.net                                                      1 saved reset   
+  Models                      │    5h                  ▎█████████████████████████████    1%   resets in 3h 25m          
+  ──────────────────────────  │    week                ███████████▍██████████████████   38%   resets in 2d 23h          
+  10,258 priced               │                                                                                         
+  m opens the catalog         │  kai@example.com                                                                        
+                              │    5h                  ▋█████████████████████████████    2%   resets in 1h 55m          
+                              │    week                ███████████████████████████▋██   92%   resets in 2d 2h           
+                              │                                                                                         
+                              │  jo@example.org                                                                         
+                              │    5h                  ███████████████▋██████████████   52%   resets in 5m              
+                              │    week                ████████████████████████████▊█   96%   resets in 2d 2h           
+                              │                                                                                         
+                              │                                                                                         
+                              │                                                                                         
+                              │                                                                                         
+                              │                                                                                         
+                              │                                                                                         
+                                                                                                                        
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ↑↓  provider    ⏎  account    r  refresh now    x  hide emails                                            from insula 

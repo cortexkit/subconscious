@@ -1,0 +1,24 @@
+ ◆  1 Home  2  3  4  5  6  7                                              20:48 
+────━━━━━━──────────────────────────────────────────────────────────────────────
+                                                                                
+  ▲ 2 things need attention · 23 of 25 healthy                                  
+                                                                                
+   ▲ engram           Cloud backup 2 days behind · uploading generation 45      
+   ▲ thalamus-harness OpenCode configuration is missing or unreadable           
+                                                                                
+  Modules                                                   23 ok · 2 degraded  
+  ────────────────────────────────────────────────────────────────────────────  
+  ● ● ● ● ● ● ● ● ● ● ▲ ● ● ● ● ● ● ● ● ● ● ● ● ▲ ●   ⏎ to list them            
+                                                                                
+  Usage                                                              this week  
+  ────────────────────────────────────────────────────────────────────────────  
+  Claude      █████████████████████████▌████   85%  resets in 9h 25m            
+  Codex       ████████████████▊█████████████   56%  resets in 6d 11h            
+  Antigravity ██████████▌███████████████████   35%  resets in 18h 4m            
+  + 2 more providers on 4 Usage                                                 
+                                                                                
+  Latest  18:20  engram restarted on build 9d8a178c                             
+                                                                                
+                                                                                
+────────────────────────────────────────────────────────────────────────────────
+  ⏎  open    :  commands    ?  help                                        live 

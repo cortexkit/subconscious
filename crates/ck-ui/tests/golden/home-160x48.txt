@@ -1,0 +1,48 @@
+ ◆ CortexKit    1 Home   2 Modules   3 Activity   4 Usage   5 Agents   6 Devices   7 Settings                                                   This Mac  20:48 
+────────────────━━━━━━──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+                                                                                                                                                                
+  ▲ 2 things need attention   ·   23 of 25 modules healthy   ·   5 agents working   ·   2 devices online                                                        
+                                                                                                                                                                
+   ▲ engram             Cloud backup 2 days behind · uploading generation 45                                                          since 18:20 · 2h 28m  ⏎   
+   ▲ thalamus-harness   OpenCode configuration is missing or unreadable                                                              since 09:30 · 11h 18m      
+                                                                                                                                                                
+  Modules                     23 ok · 2 degraded · CPU now   Usage                                  this week   This Mac                              4f1a9c2e  
+  ────────────────────────────────────────────────────────   ────────────────────────────────────────────────   ──────────────────────────────────────────────  
+  ● aft                  9.4%  ● insula               0.5%   Claude      █████████████████████████▌████   85%   Daemon       0.36.17 · up 9h 15m                
+  ● astrocyte            0.6%  ● magic-context        2.1%               4.3 of 5 accounts   resets in 9h 25m   Clients      366 connected                      
+  ● basal                1.1%  ● motor                0.9%   Codex       ████████████████▊█████████████   56%                                                   
+  ● broca                 14%  ● nats-server          0.4%               1.7 of 3 accounts   resets in 6d 11h   Build server 80 of 80 busy · 21 queued          
+  ● callosum             0.4%  ● plexus               1.6%   Antigravity ██████████▌███████████████████   35%                ▇▇▆▆▇▇▅▇▆▅▄▆▅▃▅▄▆▅▇▇ 3h   wait 3m  
+  ● cerebellum           0.8%  ● prefrontal-core      4.8%               1 account           resets in 18h 4m                                                   
+  ● cingulate            0.2%  ● prefrontal-routing   0.9%   Grok        ██████████████████████████████  100%   Backups      ▲ last upload 2d ago               
+  ● ckbus                0.3%  ● subc-mcp             0.1%               1 account           resets in 1d 21h                uploading now                      
+  ● claustrum            0.1%  ● synapse              1.3%   Cursor      ██████████████████████████████    0%   Devices      ● Mac 2  ● iPhone  ○ test-sim      
+  ● condition-runner     0.0%  ● thalamus             0.7%               1 account          resets in 23h 42m   Approvals    none waiting                       
+  ▲ engram               3.2%  ▲ thalamus-harness     0.1%                                                      Memory       ██████████▎█████  41.2 of 64 GB    
+  ● entorhinal           0.7%  ● wernicke             0.2%   Models      10,258 priced · checked 4m ago         Disk         ██████████▌█████  656 of 1,000 GB  
+  ● fusiform             0.2%                                                                                   Load         6.2 · 4.8 · 4.1   1, 5 and 15 min  
+                                                                                                                                                                
+                                                                                                                                                                
+  Activity                                                                                          live   ●    Agents                               5 working  
+  ───────────────────────────────────────────────────────────────────────────────────────────────────────────   ──────────────────────────────────────────────  
+  18:20  engram            restarted on build 9d8a178c                                     module          ck   ● ARGUS     web-app                    working  
+  18:15  motor             restarted on build 222d833f                                     module          ck   ● IRIS      api-server                 working  
+  18:02  cingulate         approved a tool permission for IRIS on iPhone                   approval       you   ● ORION     mobile-app                 working  
+  17:54  motor             settings changed: hosted spill off                              config          ck   ○ NOVA      docs-site                  idle 4m  
+  17:53  motor             restarted on build 17c0a7d6                                     module          ck   ● ECHO      data-pipeline              working  
+  17:21  prefrontal-core   started worker for llm-runner 0.3.8                             agent         IRIS   ○ KITE      design-system             idle 12m  
+  17:02  astrocyte         restarted on build ad21ee36                                     module          ck   ○ MOSS      infra                     idle 31m  
+  16:40  basal             flow ci-router delivered 3 notices                              flow         basal   ○ PIKE      billing                    idle 1h  
+  15:48  entorhinal        restarted on 0.1.39 · store upgraded to schema 14               module          ck   ● REED      search                     working  
+  14:15  cerebellum        restarted on build b55082b4                                     module          ck   ○ SAGE      analytics                 idle 22m  
+  12:59  motor             restarted on build 249f3628                                     module          ck   ○ WREN      ios-app                    idle 2h  
+  12:36  plexus            restarted on build b40bd6b1                                     module          ck   ○ scratch   notes                      idle 3d  
+  11:50  cerebellum        restarted on build f91eb1cf                                     module          ck                                                   
+  10:27  aft               restarted on build 2e04b432                                     module          ck   2 machines · 2 workspaces · 35 projects         
+  09:30  daemon            restarted on 0.36.17 · all 25 modules back in 31 s              module          ck                                                   
+  Yesterday                                                                                                                                                     
+  23:41  magic-context     restarted on 0.49.13 · cache formats unchanged                  module          ck                                                   
+  22:10  engram            restarted on build b5e1730d                                     module          ck                                                   
+                                                                                                                                                                
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏎  open    ↑↓  move    :  commands    ?  help                                                                                                updated just now 

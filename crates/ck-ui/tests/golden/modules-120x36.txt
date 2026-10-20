@@ -1,0 +1,36 @@
+ ◆ CortexKit    1 Home   2 Modules   3 Activity   4 Usage   5 Agents   6 Devices   7 Settings           This Mac  20:48 
+─────────────────────────━━━━━━━━━──────────────────────────────────────────────────────────────────────────────────────
+                                                                                                                        
+  Modules 25                                                 / to filter  │  broca                                ● ok  
+                                                                          │  pid 80810 · up 5h 6m · build 0.3.226       
+    Module              Health      CPU   Memory        Up   Build        │                                             
+  ──────────────────────────────────────────────────────────────────────  │  ↻ New settings wait for a restart      r   
+  ● aft                 ok         9.4%   5.0 GB    8h 18m   0.60.0       │                                             
+  ● astrocyte           ok         0.6%   212 MB    1h 42m   0.1.0        │  Health                     checked 1s ago  
+  ● basal               ok         1.1%   188 MB    9h 12m   f416dc16     │  ─────────────────────────────────────────  
+  ● broca ↻             ok          14%   576 MB     5h 6m   0.3.226      │  3 runs in flight                           
+  ● callosum            ok         0.4%    64 MB    9h 12m   3fd7f72      │  Runs this hour    57                       
+  ● cerebellum          ok         0.8%   140 MB    4h 30m   b55082b4     │  Runs today        1,284                    
+  ● cingulate           ok         0.2%    38 MB    9h 12m   0.10.0       │  Steps today       41,907                   
+  ● ckbus               ok         0.3%    44 MB    9h 12m   0.4.8        │  Catalog           10,258 models · 2m ago   
+  ● claustrum           ok         0.1%    31 MB    9h 12m   6a5603e6     │  Sessions held     212                      
+  ● condition-runner    ok         0.0%    18 MB    9h 12m   0.2.1        │  Restart drains    up to 30 s               
+  ▲ engram              degraded   3.2%   302 MB       24m   9d8a178c     │                                             
+  ● entorhinal          ok         0.7%    96 MB     3h 0m   0.1.39       │  CPU and memory                last 10 min  
+  ● fusiform            ok         0.2%   120 MB     8h 0m   299a69c      │  ─────────────────────────────────────────  
+  ● insula              ok         0.5%    58 MB    9h 12m   0.4.2        │  ▆▄▅▅▃▄▂▄▃▄▄▆▆▅▇▇▆▇▇▆▄▄▆▃▅▆▃▄▃▆▆▆▆     14%  
+  ● magic-context       ok         2.1%   690 MB    9h 12m   0.49.13      │  ▅▄▆▅▄▆▆████▄▅▆▄▅▂▅▄▆▂▅▇▇▆▆▇▆▇█▇▅▃  576 MB  
+  ● motor               ok         0.9%    72 MB       30m   222d833f     │                                             
+  ● nats-server         ok         0.4%    49 MB    9h 12m   2.12.1       │  Log                                live ●  
+  ● plexus              ok         1.6%   137 MB     6h 6m   b40bd6b1     │  ─────────────────────────────────────────  
+  ● prefrontal-core     ok         4.8%   410 MB       42m   70d0d03f     │  18:45   run run-sid-Xg6N… step 2 started   
+  ● prefrontal-routing  ok         0.9%    96 MB       42m   70d0d03f     │  18:45   run run-sid-ArUy… step 15 comple…  
+  ● subc-mcp            ok         0.1%    22 MB    9h 12m   0.1.40       │  18:45   recorded aft.bash call 7 as not …  
+  ● synapse             ok         1.3%   830 MB    9h 12m   3937dbe2     │  18:45 ✕ tool call aft.bash timed out aft…  
+  ● thalamus            ok         0.7%    88 MB    9h 12m   38f67de      │  18:45   run run-sid-Xg6N… step 1 complet…  
+  ▲ thalamus-harness    degraded   0.1%    41 MB    9h 12m   38f67de      │  18:44   run run-sid-ArUy… step 15 started  
+  ● wernicke            ok         0.2%    35 MB    9h 12m   755fe6b      │  18:44   run run-sid-ArUy… step 14 comple…  
+                                                                          │  18:44   session worker:bg_0b1d… sent 2 t…  
+                                                                                                                        
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ↑↓  select    r  restart    s  stop    l  logs    e  settings                                        updated just now 

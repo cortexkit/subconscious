@@ -1,0 +1,36 @@
+ ◆ CortexKit                                                                                  daemon not running  20:48 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                           ○                                                            
+                                                                                                                        
+                                           The CortexKit daemon isn't running                                           
+                                                                                                                        
+                          Nothing is supervising your modules right now, so agents can't reach                          
+                                            AFT, Magic Context or the vault.                                            
+                                                                                                                        
+                                                                                                                        
+                                      Stopped     today 09:29:51 · by launchd, a normal shutdown                        
+                                      Last line   subc daemon stopping: SIGTERM                                         
+                                      Service     loaded · restarts on failure                                          
+                                                                                                                        
+                                                                                                                        
+                                       ⏎  Start it     l  Show the log     q  Quit                                      
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                 ck reconnects by itself as soon as the daemon is back.                                 
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏎  start    l  log    q  quit                                                                                         

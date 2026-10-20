@@ -1,0 +1,36 @@
+ ◆ CortexKit    1 Home   2 Modules   3 Activity   4 Usage   5 Agents   6 Devices   7 Settings           This Mac  20:48 
+───────────────────────────────────────────────────────────────────────────────────━━━━━━━━━━───────────────────────────
+                                                                                                                        
+  Settings            │  CortexKit 0.20.110 is available                                            you have 0.20.108   
+  ──────────────────  │  Released 2026-10-21 · signed by CortexKit · ⏎ release notes                                    
+    Modules           │                                                                                                 
+    Daemon            │  Component             Installed    New          What happens                                   
+  ▸ Updates        ●  │  ────────────────────────────────────────────────────────────────────────────────────────────   
+    Credentials       │  ck                    0.20.108     0.20.110     replace                                        
+    Permissions       │  daemon (ck-subc)      0.36.17      0.36.18      replace · restarts everything                  
+    About             │  MCP gateway           0.1.40       0.1.40       up to date                                     
+                      │  message bus           0.4.8        0.4.8        up to date                                     
+                      │                                                                                                 
+                      │  Upgrading restarts the daemon, which restarts every module. It takes about 40 s.               
+                      │  Running agents pause and pick up where they left off. Nothing is downgraded.                   
+                      │                                                                                                 
+                      │                                                                                                 
+                      │   ⏎  Upgrade now     l  Later                                                                   
+                      │                                                                                                 
+                      │                                                                                                 
+                      │  Checked 12 minutes ago from releases.cortexkit.io · u simulates an upgrade here                
+                      │                                                                                                 
+                      │                                                                                                 
+                      │                                                                                                 
+                      │                                                                                                 
+                      │                                                                                                 
+                      │                                                                                                 
+                      │                                                                                                 
+                      │                                                                                                 
+                      │                                                                                                 
+                      │                                                                                                 
+                      │                                                                                                 
+                      │                                                                                                 
+                                                                                                                        
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏎  upgrade    l  later    n  release notes                                                 from releases.cortexkit.io 

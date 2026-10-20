@@ -1,0 +1,36 @@
+ ◆ CortexKit    1 Home   2 Modules   3 Activity   4 Usage   5 Agents   6 Devices   7 Settings           This Mac  20:48 
+─────────────────────────━━━━━━━━━──────────────────────────────────────────────────────────────────────────────────────
+                                                                                                                        
+  ← broca · log        all levels   warnings   errors                 / 429 2 matches                      following ●  
+  ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────  
+  18:43:02.114  info   run run-sid-Xg6N… step 3 completed in 4.1 s                                                      
+  18:43:05.870  info   session worker:bg_ef6c… sent 1 tool result                                                       
+  18:43:09.002  info   run run-sid-Xg6N… step 4 started (openai/gpt-6.1-sol, 41,220 input tokens, 92% cached)           
+  18:43:15.441  warn   provider returned 429 on account 3 of 5; moved run to account 4                                  
+  18:43:15.990  info   run run-sid-Xg6N… step 4 retried on account 4                                                    
+  18:43:22.618  info   run run-sid-ArUy… step 12 completed in 6.4 s                                                     
+  18:43:31.207  info   run run-sid-DoFQ… completed: 23 steps in 1m 48s, 612,330 input tokens                            
+  18:43:31.209  info   published run.ended for run-sid-DoFQ… (seq 18,442)                                               
+  18:43:40.551  info   run run-sid-ArUy… step 13 started                                                                
+  18:43:58.003  info   catalog refreshed: 10,258 models, no changes                                                     
+  18:44:02.730  info   run run-sid-Xg6N… step 4 completed in 47.3 s                                                     
+  18:44:04.118  info   session worker:bg_0b1d… sent 2 tool results                                                      
+  18:44:09.660  info   run run-sid-Xg6N… step 5 started                                                                 
+  18:44:22.391  warn   provider returned 429 on account 3 of 5; moved run to account 4                                  
+  18:44:31.000  info   run run-sid-ArUy… step 13 completed in 50.4 s                                                    
+  18:44:40.250  info   run run-sid-Xg6N… started (openai/gpt-6.1-sol)                                                   
+  18:44:49.017  info   session worker:bg_0b1d… sent 2 tool results                                                      
+  18:44:51.882  info   run run-sid-ArUy… step 14 completed in 6.2 s                                                     
+  18:44:55.120  info   run run-sid-ArUy… step 15 started                                                                
+  18:45:03.773  info   run run-sid-Xg6N… step 1 completed in 23.5 s                                                     
+  18:45:09.401  error  tool call aft.bash timed out after 120 s (run run-sid-ArUy…, call 7)                             
+  18:45:09.402  info   recorded aft.bash call 7 as not executed                                                         
+  18:45:12.556  info   run run-sid-ArUy… step 15 completed in 17.4 s                                                    
+  18:45:20.030  info   run run-sid-Xg6N… step 2 started                                                                 
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  f  pause    /  search    n  next match    m  module    esc  back                         tail of broca.2026-10-20.log 

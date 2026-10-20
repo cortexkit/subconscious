@@ -1,0 +1,36 @@
+ ◆ CortexKit    1 Home   2 Modules   3 Activity   4 Usage   5 Agents   6 Devices   7 Settings           This Mac  20:48 
+────────────────━━━━━━──────────────────────────────────────────────────────────────────────────────────────────────────
+                                                                                                                        
+  ▲ 2 things need attention   ·   23 of 25 modules healthy   ·   5 agents working                                       
+          ╭─ Keys ───────────────────────────────────────────────────────────────────────────────────────────╮          
+   ▲ engra│                                                                                                  │      ⏎   
+   ▲ thala│   Everywhere                      Lists                         Modules                          │          
+          │                                                                                                  │          
+  Modules │   1 – 7   switch tab              ↑↓ j k  move                  r       restart                  │4f1a9c2e  
+  ────────│   :       commands                ⏎       open                  w       restart, no downtime     │────────  
+  ● aft   │   ?       this help               /       filter                s       stop or start            │ 9h 15m   
+  ● astroc│   esc     back or close           g G     top, bottom           l       logs                     │d         
+  ● basal │   t       light or dark           space   select                e       settings                 │          
+  ● broca │   q       quit                                                                                   │y         
+  ● callos│                                                                                                  │wait 3m   
+  ● cerebe│                                                                                                  │▅▃▅▄ 1h   
+  ● cingul│                                                                                                  │          
+  ● ckbus │   Mouse                                                                                          │d 2d ago  
+  ● claust│                                                                                                  │w         
+  ● condit│   Click to select, double-click to open, scroll anywhere. Nothing needs the mouse.               │          
+  ▲ engram│                                                                                                  │Phone     
+  ● entorh│   Scripts and agents                                                                             │          
+  ● fusifo│                                                                                                  │          
+          │   ckni runs any command without this app: plain text, or --json. Everything here has a           │          
+  Activity│   ckni form, and the palette shows it.                                                           │ working  
+  ────────│                                                                                                  │────────  
+  18:20  e│                                                                                                  │ working  
+  18:15  m│   esc closes                                                                                     │ working  
+  18:02  c│                                                                                                  │ working  
+  17:54  m╰──────────────────────────────────────────────────────────────────────────────────────────────────╯ idle 4m  
+  17:53  motor             restarted on build 17c0a7d6                          ck   ● ECHO                    working  
+  17:21  prefrontal-core   started worker for llm-runner 0.3.8                IRIS   ○ KITE                   idle 12m  
+  17:02  astrocyte         restarted on build ad21ee36                          ck   ○ MOSS                   idle 31m  
+                                                                                                                        
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏎  open    ↑↓  move    :  commands    ?  help                                                        updated just now 

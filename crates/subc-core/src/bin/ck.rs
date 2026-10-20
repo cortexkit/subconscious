@@ -5755,13 +5755,17 @@ fn quota_spend_lines_for_entry(entry: &Value) -> Vec<String> {
         // Each stated fact after the amount is its own clause, so none of them
         // reads as a qualifier on the number (the defect behind issue #132).
         let mut clauses = vec![format!("{label}  {detail}")];
-        if let Some(raw) = pool.get("resetsAt").and_then(Value::as_str) {
-            let date = if parse_rfc3339_to_utc_secs(raw).is_some() {
-                raw.get(..10).unwrap_or(raw)
-            } else {
-                raw
-            };
-            clauses.push(format!("resets {date}"));
+        // A reset refills the pool; an expiry loses whatever is left. Each is
+        // shown only when the provider stated it, never inferred.
+        for (field, verb) in [("resetsAt", "resets"), ("expiresAt", "expires")] {
+            if let Some(raw) = pool.get(field).and_then(Value::as_str) {
+                let date = if parse_rfc3339_to_utc_secs(raw).is_some() {
+                    raw.get(..10).unwrap_or(raw)
+                } else {
+                    raw
+                };
+                clauses.push(format!("{verb} {date}"));
+            }
         }
         if pool.get("spendable").and_then(Value::as_bool) == Some(false) {
             clauses.push("stopped".to_string());
@@ -10226,6 +10230,25 @@ mod tests {
                 "Monthly  1 USD left · resets 2026-10-01",
                 "No date  1 USD left",
                 "Unparsed  1 USD left · resets next billing cycle"
+            ]
+        );
+    }
+
+    #[test]
+    fn spend_expiry_shows_date_apart_from_reset() {
+        let entry = json!({"spend": [
+            {"label": "API credit (Max 20x)", "funding": "subscription",
+             "remaining": {"minor": 19663, "exponent": 2, "unit": "USD"},
+             "total": {"minor": 20000, "exponent": 2, "unit": "USD"},
+             "expiresAt": "2026-11-06T00:00:00Z"},
+            {"label": "Both", "remaining": {"minor": 1, "exponent": 0, "unit": "USD"},
+             "resetsAt": "2026-10-01T00:00:00Z", "expiresAt": "2026-12-31T00:00:00Z"}
+        ]});
+        assert_eq!(
+            quota_spend_lines_for_entry(&entry),
+            vec![
+                "API credit (Max 20x)  196.63 of 200.00 USD left · expires 2026-11-06 · included in subscription",
+                "Both  1 USD left · resets 2026-10-01 · expires 2026-12-31"
             ]
         );
     }

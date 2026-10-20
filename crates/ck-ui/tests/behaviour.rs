@@ -367,13 +367,19 @@ fn the_terminal_guard_restores_the_terminal() {
         let _guard = TerminalGuard::enter(log.clone(), raw.clone()).unwrap();
         let out = written(&log);
         assert!(out.contains("\x1b[?1049h"), "alternate screen on");
-        assert!(out.contains("\x1b[?1000h"), "mouse on");
+        // On Windows crossterm turns mouse reporting on through the console
+        // API rather than an escape sequence, so nothing reaches the writer.
+        if cfg!(not(windows)) {
+            assert!(out.contains("\x1b[?1000h"), "mouse on");
+        }
         assert!(out.contains("\x1b[?25l"), "cursor hidden");
         assert_eq!(*raw.0.borrow(), vec!["enable"]);
     }
     let out = written(&log);
     assert!(out.contains("\x1b[?1049l"), "alternate screen off");
-    assert!(out.contains("\x1b[?1000l"), "mouse off");
+    if cfg!(not(windows)) {
+        assert!(out.contains("\x1b[?1000l"), "mouse off");
+    }
     assert!(out.contains("\x1b[?25h"), "cursor shown");
     assert_eq!(*raw.0.borrow(), vec!["enable", "disable"]);
 

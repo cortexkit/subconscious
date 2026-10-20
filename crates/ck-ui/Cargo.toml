@@ -8,19 +8,18 @@ repository = "https://github.com/cortexkit/subconscious"
 description = "The ck terminal app: theme, drawing helpers, data model and screens."
 
 [features]
-# The built-in fixture (`Snapshot::fixture`), for tests and the demo. Kept out
-# of normal builds: its JSON parser setting would otherwise spread, through
-# feature unification, to every crate built together with this one.
+# The built-in fixture (`Snapshot::fixture`), for tests and the demo; normal
+# builds don't need it.
 fixture = ["dep:serde_json"]
 
 [dependencies]
 crossterm = { version = "0.29", features = ["event-stream"] }
 futures-util = "0.3"
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
-# Parses the fixture. `float_roundtrip` makes every recorded sparkline sample
-# parse to exactly the double the fixture was written from; the default fast
-# parser can land one unit off, which can move a sparkline bar by a step.
-serde_json = { version = "1", features = ["float_roundtrip"], optional = true }
+# Parses the fixture. Don't turn on serde_json features such as
+# `float_roundtrip` here: a workspace test run unifies them into every crate,
+# and other crates' tests depend on the default parser.
+serde_json = { version = "1", optional = true }
 tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
 unicode-width = "0.2"
 

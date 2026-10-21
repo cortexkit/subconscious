@@ -49,6 +49,7 @@ use crate::{
         CapabilityVerdict, DuplicateClaimSource, RegisteredModule, RequirementStatus,
         RuntimeModule,
     },
+    child_roster::DaemonShutdownFlag,
     daemon_config::{PrivilegedOperatorPrompt, RestartRequiredSection},
     forwarding::{
         CloseReason, EndpointRoute, ForwardingError, ForwardingTable, GoodbyeTarget,
@@ -395,6 +396,11 @@ pub struct ControlHandler {
     connected_clients: ConnectedClients,
     counters: DaemonCounters,
     capability_evaluator: Arc<CapabilityRequirementEvaluator>,
+    /// The supervisor's daemon-shutdown flag. Once it is set, requirement
+    /// changes are logged at INFO with `cause=daemon_shutdown` instead of at
+    /// their usual severity (see [`log_requirement_events`]). A handler built
+    /// without one has a flag that is never set.
+    daemon_shutdown: DaemonShutdownFlag,
     daemon_provenance: DaemonProvenanceFacts,
     #[cfg(test)]
     control_dispatch_delay: Option<Duration>,
@@ -965,6 +971,7 @@ impl ControlHandler {
             connected_clients: ConnectedClients::new(),
             counters,
             capability_evaluator: Arc::new(CapabilityRequirementEvaluator::new()),
+            daemon_shutdown: DaemonShutdownFlag::default(),
             daemon_provenance: DaemonProvenanceFacts::default(),
             #[cfg(test)]
             control_dispatch_delay: None,
@@ -1196,6 +1203,14 @@ impl ControlHandler {
         self
     }
 
+    /// Share the supervisor's daemon-shutdown flag with this handler, so
+    /// requirement changes after the daemon has begun its announced shutdown
+    /// are not reported as faults.
+    pub(crate) fn with_daemon_shutdown_flag(mut self, flag: DaemonShutdownFlag) -> Self {
+        self.daemon_shutdown = flag;
+        self
+    }
+
     pub fn with_supervisor_rescan(
         mut self,
         supervisor: Supervisor,
@@ -1396,6 +1411,7 @@ impl ControlHandler {
                 log_requirement_events(
                     self.capability_evaluator
                         .evaluate_now(&runtime, &registrations),
+                    &self.daemon_shutdown,
                 );
             }
             Err(err) => warn!(error = %err, "failed to recompute capability requirements"),
@@ -9176,6 +9192,112 @@ mod tests {
             .as_str()
             .expect("detail string")
             .contains("credentials-provider/v1"));
+    }
+
+    /// Register a consumer that requires `project-identity/v1` and the provider
+    /// of it, optionally mark daemon shutdown as begun, then deregister the
+    /// provider as its connection closes. Returns the `capability.requirement`
+    /// events that deregistration logged and the verdict the evaluator then
+    /// holds for the requirement (the one `route.open` refusals read).
+    fn deregister_required_provider(
+        daemon_shutdown_begun: bool,
+    ) -> (Vec<CapturedEvent>, Option<CapabilityVerdict>) {
+        const CAPABILITY: &str = "project-identity/v1";
+        let registry = Arc::new(Registry::default());
+        let daemon_shutdown = DaemonShutdownFlag::default();
+        let handler = ControlHandler::new(Arc::clone(&registry))
+            .with_capability_config(
+                [
+                    ("consumer".to_string(), true),
+                    ("provider".to_string(), true),
+                ],
+                BTreeMap::new(),
+            )
+            .with_daemon_shutdown_flag(daemon_shutdown.clone());
+        let mut consumer = manifest("consumer", PROTOCOL_VERSION);
+        consumer.capabilities = Some(CapabilityDeclarations {
+            provides: Vec::new(),
+            requires: vec![subc_protocol::manifest::CapabilityRequirement {
+                capability: CAPABILITY.to_string(),
+                need: subc_protocol::manifest::CapabilityNeed::Required,
+            }],
+            must_never_reach: Vec::new(),
+        });
+        let provider = capability_manifest("provider", &[CAPABILITY], &[]);
+        let provider_conn = ConnectionId::new(182);
+        for (conn, manifest, corr) in [
+            (ConnectionId::new(181), consumer, 181),
+            (provider_conn, provider, 182),
+        ] {
+            let hello = handler
+                .handle_control(conn, hello_frame_with_manifest(manifest, corr))
+                .expect("module registers");
+            assert_eq!(hello[0].header.ty, FrameType::HelloAck);
+        }
+        assert_eq!(
+            handler.capability_evaluator.verdict("consumer", CAPABILITY),
+            Some(CapabilityVerdict::Provided),
+            "the registered provider must satisfy the requirement first"
+        );
+        if daemon_shutdown_begun {
+            daemon_shutdown.set_for_test();
+        }
+
+        let capture = EventCapture::default();
+        let _subscriber =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(capture.clone()));
+        handler
+            .cleanup_connection(provider_conn)
+            .expect("provider deregisters");
+        let events = capture
+            .events()
+            .into_iter()
+            .filter(|event| {
+                event.fields.get("message").map(String::as_str) == Some("capability.requirement")
+            })
+            .collect();
+        (
+            events,
+            handler.capability_evaluator.verdict("consumer", CAPABILITY),
+        )
+    }
+
+    #[test]
+    fn required_provider_leaving_during_daemon_shutdown_logs_info_with_shutdown_cause() {
+        let (events, verdict) = deregister_required_provider(true);
+        assert_eq!(
+            verdict,
+            Some(CapabilityVerdict::NeverProvided),
+            "shutdown must not change the verdict route.open refusals read"
+        );
+        assert_eq!(events.len(), 1, "one requirement transition: {events:?}");
+        let event = &events[0];
+        assert_eq!(event.level, tracing::Level::INFO, "{event:?}");
+        assert_eq!(
+            event.fields.get("cause").map(String::as_str),
+            Some("\"daemon_shutdown\""),
+            "{event:?}"
+        );
+        assert_eq!(
+            event.fields.get("verdict").map(String::as_str),
+            Some("\"never_provided\""),
+            "{event:?}"
+        );
+    }
+
+    #[test]
+    fn required_provider_leaving_while_daemon_runs_still_logs_error() {
+        let (events, verdict) = deregister_required_provider(false);
+        assert_eq!(verdict, Some(CapabilityVerdict::NeverProvided));
+        assert_eq!(events.len(), 1, "one requirement transition: {events:?}");
+        let event = &events[0];
+        assert_eq!(event.level, tracing::Level::ERROR, "{event:?}");
+        assert_eq!(event.fields.get("cause"), None, "{event:?}");
+        assert_eq!(
+            event.fields.get("verdict").map(String::as_str),
+            Some("\"never_provided\""),
+            "{event:?}"
+        );
     }
 
     #[test]

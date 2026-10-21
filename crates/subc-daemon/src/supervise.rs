@@ -2751,6 +2751,12 @@ impl Supervisor {
         let _ = path;
         self
     }
+    /// The flag [`Self::begin_daemon_shutdown`] sets, for the control handler's
+    /// capability-requirement log to read.
+    pub(crate) fn daemon_shutdown_flag(&self) -> crate::child_roster::DaemonShutdownFlag {
+        self.child_roster.shutdown_flag()
+    }
+
     /// The first step of an announced daemon shutdown, before the notice and
     /// before any connection is closed.
     ///

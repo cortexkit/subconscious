@@ -930,6 +930,9 @@ async fn serve_bound_daemon(
     let mut control = ControlHandler::with_forwarding(Arc::clone(&registry), forwarding)
         .with_process_liveness(process_liveness)
         .with_supervisor(supervisor_handle)
+        // The same flag `begin_daemon_shutdown` sets below, so requirement
+        // changes while modules exit during the shutdown log at INFO.
+        .with_daemon_shutdown_flag(supervisor.daemon_shutdown_flag())
         .with_connected_clients(connected_clients.clone())
         .with_storage_config(storage_config)
         .with_machine_id(bound.machine_id.clone())

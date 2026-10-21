@@ -8,7 +8,7 @@ use subc_protocol::manifest::{CapabilityDeclarations, CapabilityNeed};
 use tokio::sync::Notify;
 use tracing::{error, info, warn};
 
-use crate::supervise::ModuleState;
+use crate::{child_roster::DaemonShutdownFlag, supervise::ModuleState};
 
 /// A fresh-exec stall must not suppress a real fleet misconfiguration forever.
 /// This fixed v1 ceiling gives each starting candidate time to register while
@@ -607,9 +607,39 @@ impl CapabilityRequirementEvaluator {
     }
 }
 
-pub(crate) fn log_requirement_events(events: impl IntoIterator<Item = RequirementEvent>) {
+/// Log each requirement transition at its severity, unless the daemon has begun
+/// its announced shutdown.
+///
+/// During that shutdown modules exit one by one, so a provider can deregister
+/// before a consumer that requires its capability. The verdict is still
+/// computed and recorded truthfully (`route.open` refusals read it), but the
+/// absence is planned, not a fault: logging it at ERROR would be a false alarm
+/// for operators and for monitors that count ERROR lines. Once the flag is set
+/// every requirement event logs at INFO with `cause=daemon_shutdown`. A
+/// provider that crashes or is stopped while the daemon keeps running still
+/// logs at its usual severity.
+pub(crate) fn log_requirement_events(
+    events: impl IntoIterator<Item = RequirementEvent>,
+    daemon_shutdown: &DaemonShutdownFlag,
+) {
+    let shutting_down = daemon_shutdown.is_set();
     for event in events {
         let status = event.status;
+        if shutting_down {
+            info!(
+                consumer = %status.consumer,
+                capability = %status.capability,
+                need = need_name(status.need),
+                verdict = status.verdict.as_str(),
+                episode_seq = status.episode_seq,
+                config_satisfiable = status.config_satisfiable,
+                runtime_available = status.runtime_available,
+                detail = %status.detail,
+                cause = "daemon_shutdown",
+                "capability.requirement"
+            );
+            continue;
+        }
         match event.severity {
             RequirementSeverity::Error => error!(
                 consumer = %status.consumer,

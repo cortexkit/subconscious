@@ -62,10 +62,11 @@ pub(crate) struct RecordedIdentity {
 
 /// Set once, when the daemon begins its announced shutdown, and never cleared.
 ///
-/// Shared by the roster (which refuses spawns once it is set) and every
-/// module's terminal ring (which records any exit after it as
-/// `daemon_shutdown`), so the reap path, the spawn path and the record all
-/// read the same flag.
+/// Shared by the roster (which refuses spawns once it is set), every module's
+/// terminal ring (which records any exit after it as `daemon_shutdown`) and the
+/// control handler's capability-requirement log (which reports requirement
+/// changes after it at INFO with `cause=daemon_shutdown`), so the reap path,
+/// the spawn path, the record and the log all read the same flag.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct DaemonShutdownFlag(Arc<AtomicBool>);
 
@@ -76,6 +77,13 @@ impl DaemonShutdownFlag {
 
     #[cfg(unix)]
     fn set(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+
+    /// Set the flag without a roster, so a test can stand in for the start of
+    /// daemon shutdown on any platform.
+    #[cfg(test)]
+    pub(crate) fn set_for_test(&self) {
         self.0.store(true, Ordering::SeqCst);
     }
 }

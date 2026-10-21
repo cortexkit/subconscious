@@ -220,7 +220,12 @@ impl Drop for Fixture {
         let _ = self.child.wait();
         // A child that outlived the daemon (the failure these tests exist to
         // catch) must not outlive the test as well.
-        for file in ["observer.pid", "wire-less.pid"] {
+        for file in [
+            "observer.pid",
+            "wire-less.pid",
+            "provider.pid",
+            "consumer.pid",
+        ] {
             if let Some(pid) = fs::read_to_string(self.root.join(file))
                 .ok()
                 .and_then(|pid| pid.trim().parse::<i32>().ok())
@@ -966,6 +971,157 @@ fn module_signalled_while_the_daemon_runs_is_a_crash_and_is_respawned() {
     assert_eq!(records[0]["exit_signal"], 15, "{records:?}");
     assert_eq!(records[0]["exit_kind"], "crash", "{records:?}");
     assert_eq!(records[0]["disposition"], "restarting", "{records:?}");
+}
+
+/// The `capability.requirement` lines in the daemon's log.
+fn requirement_lines(fixture: &Fixture) -> Vec<String> {
+    daemon_log(fixture)
+        .lines()
+        .filter(|line| line.contains("capability.requirement"))
+        .map(str::to_string)
+        .collect()
+}
+
+/// During the daemon's own ordered shutdown modules exit one by one, so a
+/// provider can deregister before a consumer that requires its capability.
+/// The requirement's verdict then becomes `never_provided`, truthfully, but
+/// nothing is missing: the stop was planned. That change must be logged at
+/// INFO with `cause=daemon_shutdown`, never at ERROR, where operators and
+/// monitors counting ERROR lines read it as a fault.
+///
+/// The order has to be made, not hoped for. At the end of the shutdown the
+/// daemon closes every module connection at once, so both modules deregister
+/// together however long either process takes to exit, and the verdict then
+/// depends on whether the provider's process happened to be reaped yet
+/// (`pending` while it still runs, `never_provided` once it is gone). So the
+/// consumer holds the shutdown in its drain instead: it reports a busy gauge,
+/// which keeps the daemon in the drain for its full budget with the consumer
+/// still registered. The provider exits inside that window, and when the
+/// drain ends the consumer's deregistration recomputes the requirement with
+/// the provider gone.
+#[test]
+fn required_provider_leaving_during_daemon_shutdown_is_logged_at_info_not_error() {
+    const CAPABILITY: &str = "shutdown-test-identity/v1";
+    let permit = DAEMON_GATE.lock().unwrap_or_else(|p| p.into_inner());
+    let root = fresh_dir("requirement-shutdown");
+    for dir in ["config/cortexkit", "runtime", "data/cortexkit/run"] {
+        fs::create_dir_all(root.join(dir)).unwrap();
+    }
+    let stub = env!("CARGO_BIN_EXE_fake-aft-stub");
+    let modules = json!({
+        // No SIGTERM handler: the test's signal during the drain ends it.
+        "requirement-provider": {
+            "program": stub,
+            "env": {
+                "FAKE_AFT_MODULE_ID": "requirement-provider",
+                "FAKE_AFT_PID_PATH": root.join("provider.pid"),
+                "FAKE_AFT_CAPABILITIES": json!({ "provides": [CAPABILITY] }).to_string(),
+            }
+        },
+        // Busy, so the shutdown's drain waits its whole budget on it.
+        "requirement-consumer": {
+            "program": stub,
+            "env": {
+                "FAKE_AFT_MODULE_ID": "requirement-consumer",
+                "FAKE_AFT_PID_PATH": root.join("consumer.pid"),
+                "FAKE_AFT_EVENTS_PATH": root.join("events.jsonl"),
+                "FAKE_AFT_BUSY_GAUGES": "work",
+                "FAKE_AFT_HEALTH_METRICS": "{\"work\":1}",
+                "FAKE_AFT_CAPABILITIES": json!({
+                    "requires": [{ "capability": CAPABILITY, "need": "required" }]
+                }).to_string(),
+            }
+        },
+    });
+    fs::write(
+        root.join("config/cortexkit/subc.jsonc"),
+        serde_json::to_vec(&json!({ "version": 1, "modules": modules })).unwrap(),
+    )
+    .unwrap();
+    let child = spawn_daemon(&root);
+    let mut fixture = Fixture {
+        root,
+        child,
+        _permit: permit,
+    };
+
+    let is_consumer_line = |line: &&String| {
+        line.contains("consumer=requirement-consumer") && line.contains(CAPABILITY)
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !requirement_lines(&fixture)
+        .iter()
+        .filter(is_consumer_line)
+        .any(|line| line.contains("verdict=provided"))
+    {
+        assert!(
+            fixture.child.try_wait().unwrap().is_none(),
+            "daemon exited during startup"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "the requirement never read provided:\n{}",
+            daemon_log(&fixture)
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    let provider = fixture.pid_of("provider.pid");
+    let consumer = fixture.pid_of("consumer.pid");
+
+    fixture.term();
+    // The drain notice follows the daemon-shutdown flag, so from here on the
+    // daemon is in its announced shutdown.
+    fixture.wait_event("draining");
+    signal_pid(provider, rustix::process::Signal::TERM);
+    // Gone means reaped by the daemon, not merely dead: a zombie still counts.
+    assert!(
+        wait_until_gone(provider, Duration::from_secs(2)),
+        "the provider did not exit during the drain"
+    );
+    assert!(
+        fixture.child.try_wait().unwrap().is_none() && process_alive(consumer),
+        "the consumer must still be holding the shutdown when the provider has gone"
+    );
+    fixture.wait_exit(Duration::from_secs(8));
+
+    let log = daemon_log(&fixture);
+    let provider_exit = log.lines().position(|line| {
+        line.contains("exited during daemon shutdown")
+            && line.contains("module_id=requirement-provider")
+    });
+    let consumer_deregistered = log.lines().position(|line| {
+        line.contains("module registration ended")
+            && line.contains("module_id=requirement-consumer")
+    });
+    assert!(
+        matches!((provider_exit, consumer_deregistered), (Some(exit), Some(ended)) if exit < ended),
+        "the provider must have exited while the consumer was still registered:\n{log}"
+    );
+
+    let lines = requirement_lines(&fixture);
+    let never_provided: Vec<&String> = lines
+        .iter()
+        .filter(is_consumer_line)
+        .filter(|line| line.contains("verdict=never_provided"))
+        .collect();
+    assert!(
+        !never_provided.is_empty(),
+        "the provider's departure must still change the verdict to never_provided:\n{log}"
+    );
+    for line in &never_provided {
+        assert!(
+            line.contains(" INFO ") && line.contains("cause=daemon_shutdown"),
+            "a requirement change during the shutdown must log at INFO with cause=daemon_shutdown: {line}"
+        );
+    }
+    let errors: Vec<&String> = lines
+        .iter()
+        .filter(|line| line.contains(" ERROR "))
+        .collect();
+    assert!(
+        errors.is_empty(),
+        "no capability.requirement line may log at ERROR during a planned shutdown: {errors:?}"
+    );
 }
 
 #[test]

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.36.27
+
+- A planned daemon shutdown no longer logs a required capability as missing at ERROR (issue #139). During the ordered shutdown modules exit one by one, so a provider can deregister before a consumer that requires its capability; the requirement's verdict then becomes `never_provided`, and that was logged at ERROR although nothing was missing. Once the daemon has begun its announced shutdown (the same flag that stops respawns and records exits as `daemon_shutdown`), every `capability.requirement` event logs at INFO with `cause=daemon_shutdown`. Verdicts are computed exactly as before, so `route.open` refusals during the shutdown stay truthful. A provider that crashes or is stopped while the daemon keeps running still logs at ERROR.
+
 ## 0.36.26
 
 - A restart no longer stalls the whole daemon while the live-children record is written. Admitting a spawned child and releasing a reaped one rewrite that record, syncing the file and its directory to disk, and a busy disk can make that take seconds. The write ran on a tokio worker thread, and the worker that runs a supervisor task woken by a child exit or a timer is the one that was polling the runtime's I/O and timer driver; while it was blocked no other worker took the driver over, so no socket or timer in the daemon moved. A replacement module that connected in that window got no server proof, and the Rust SDK's 2 s handshake deadline made it exit 1 (`Timeout { stage: ServerProof }`). Roster work that writes the record, or waits for the lock the write holds, now runs under `block_in_place` on a multi-threaded runtime, which hands the worker's other tasks to another thread for the duration. The write is still finished before a spawn is admitted, as before.

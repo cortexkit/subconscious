@@ -73,7 +73,9 @@ mints or announces one).
 **Today.** A module declares `capabilities.requires` with `need: required` or
 `need: optional`. The daemon evaluates each requirement as `provided`,
 `pending` or `never_provided` and reports a missing required provider loudly,
-but routing is unaffected.
+but routing is unaffected. During the daemon's own ordered shutdown, when
+providers deregister as their modules exit, requirement changes log at INFO
+with `cause=daemon_shutdown` instead.
 
 **New rule.** A module's effective readiness is its declared readiness (rung 2)
 AND every one of its `required` capabilities being `provided`. While any is

@@ -62,19 +62,18 @@ fn home_attention_list_says_how_many_more() {
     let snap = crowded();
     let app = App::new(Theme::test());
 
-    for (w, h) in [(120, 36), (160, 48)] {
+    // Two rows at every size, so row 7 stays a blank spacer above the
+    // panels: one problem, then a note for the rest.
+    for (w, h) in [(80, 24), (120, 36), (160, 48)] {
         let buf = render(&app, &snap, w, h);
         assert!(row(&buf, 5).contains("aft"), "{w}×{h}");
-        assert!(row(&buf, 6).contains("cerebellum"), "{w}×{h}");
         assert_eq!(
-            text(&buf, 3, 7, 25),
-            "+2 more · ⏎ opens Modules",
+            text(&buf, 3, 6, 25),
+            "+3 more · ⏎ opens Modules",
             "{w}×{h}: the last row stands for the rest"
         );
+        assert!(row(&buf, 7).trim().is_empty(), "{w}×{h}: the spacer stays");
     }
-    let small = render(&app, &snap, 80, 24);
-    assert!(row(&small, 5).contains("aft"));
-    assert_eq!(text(&small, 3, 6, 25), "+3 more · ⏎ opens Modules");
 
     // The note row can be selected, and ⏎ there opens the first problem it
     // stands for.
@@ -83,12 +82,12 @@ fn home_attention_list_says_how_many_more() {
     for _ in 0..5 {
         press(&mut app, &snap, KeyCode::Down);
     }
-    assert_eq!(app.home_sel, 2, "selection stops on the note row");
+    assert_eq!(app.home_sel, 1, "selection stops on the note row");
     let buf = render(&app, &snap, 120, 36);
-    assert!(selected(&buf, 3, 7));
+    assert!(selected(&buf, 3, 6));
     press(&mut app, &snap, KeyCode::Enter);
     assert_eq!(app.tab, Tab::Modules);
-    assert_eq!(snap.modules.data[app.mod_sel].id, "engram");
+    assert_eq!(snap.modules.data[app.mod_sel].id, "cerebellum");
 }
 
 #[test]

@@ -252,6 +252,9 @@ pub struct Module {
     /// Every metric the module reports, flattened to full dotted keys, for
     /// the all-metrics list.
     pub all_metrics: Vec<Metric>,
+    /// Where the module is in its lifecycle, in a word ("Restarting",
+    /// "Starting", "Stopped"), when that says more than its status does.
+    pub lifecycle: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -740,6 +743,7 @@ mod fixture {
                     action: None,
                     drain_limit_secs: None,
                     all_metrics: Vec::new(),
+                    lifecycle: None,
                     metrics,
                     cpu_history: floats(&m["cpu_history"]),
                     memory_history: floats(&m["mem_history"]),

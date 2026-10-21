@@ -1047,3 +1047,116 @@ fn merged_log_lines_keep_their_time_level_and_text() {
     assert_eq!(lines[1].at, None);
     assert_eq!(lines[1].message, "panicked at src/run.rs:12");
 }
+
+// ---- Home from live replies: lifecycle words, usage errors, the spacer ------------------
+
+fn home_rows(snap: &ck_ui::Snapshot, w: u16, h: u16) -> Vec<String> {
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+    let mut buf = Buffer::empty(Rect::new(0, 0, w, h));
+    ck_ui::App::new(ck_ui::Theme::test()).render(&mut buf, snap, now());
+    (0..h)
+        .map(|y| (0..w).map(|x| buf[(x, y)].symbol()).collect())
+        .collect()
+}
+
+fn roster(entries: Value) -> Vec<subc_control::SupervisorEntry> {
+    serde_json::from_value(entries).unwrap()
+}
+
+fn running(id: &str) -> Value {
+    json!({ "module_id": id, "state": "running", "enabled": true, "live": true, "health": "ok" })
+}
+
+#[test]
+fn a_module_starting_up_reads_as_starting_not_unknown() {
+    let mut s = State::empty("This Mac");
+    // insula's new process started 5 s ago and has had no health check.
+    s.processes.insert(
+        "insula".into(),
+        LiveProcess {
+            pid: 4242,
+            generation: 7,
+            spawned_at: now().add_secs(-5.0),
+        },
+    );
+    let mut entries = vec![running("aft"), running("broca")];
+    entries.push(
+        json!({ "module_id": "insula", "state": "running", "enabled": true,
+                         "live": true, "health": "unknown" }),
+    );
+    entries.push(
+        json!({ "module_id": "motor", "state": "restarting", "enabled": true,
+                         "live": false, "health": "unknown" }),
+    );
+    s.record_roster(roster(Value::Array(entries)), now());
+    let snap = assemble(&s, now());
+    let insula = snap.modules.data.iter().find(|m| m.id == "insula").unwrap();
+    assert_eq!(insula.status, Status::Starting);
+    assert_eq!(insula.lifecycle.as_deref(), Some("Starting"));
+    let motor = snap.modules.data.iter().find(|m| m.id == "motor").unwrap();
+    assert_eq!(motor.lifecycle.as_deref(), Some("Restarting"));
+
+    let rows = home_rows(&snap, 120, 36);
+    let problems = rows[5].clone() + &rows[6];
+    assert!(
+        problems.contains("insula") && problems.contains("Starting"),
+        "{problems}"
+    );
+    assert!(rows[8].contains("2 ok · 2 starting"), "{}", rows[8]);
+    assert!(!rows[8].contains("unknown"), "{}", rows[8]);
+
+    // A module that has run for long with no health check anyone can read
+    // is unknown: the app genuinely can't say.
+    s.processes.get_mut("insula").unwrap().spawned_at = now().add_secs(-3600.0);
+    let snap = assemble(&s, now());
+    let insula = snap.modules.data.iter().find(|m| m.id == "insula").unwrap();
+    assert_eq!(insula.status, Status::Unknown);
+}
+
+#[test]
+fn a_usage_code_never_shows_as_the_value() {
+    let mut s = State::empty("This Mac");
+    s.record_roster(roster(json!([running("insula")])), now());
+    let reply = json!({ "result": [
+        { "provider": "claude", "account": "acct-1", "error": "upstream returned 500",
+          "errorClass": "upstream_failed" }
+    ]});
+    s.usage.set(map::usage(&reply, now()).unwrap(), now());
+    let snap = assemble(&s, now());
+    // The code stays in the model for a detail view.
+    assert_eq!(
+        snap.usage.data.providers[0].error.as_deref(),
+        Some("upstream_failed")
+    );
+    let rows = home_rows(&snap, 120, 36);
+    let usage: String = rows[10].chars().skip(45).take(37).collect();
+    assert!(usage.contains("couldn't read usage"), "{usage}");
+    assert!(!usage.contains("upstream_failed"), "{usage}");
+}
+
+#[test]
+fn three_problems_keep_the_spacer_and_give_up_a_row() {
+    let mut s = State::empty("This Mac");
+    let entries = ["aft", "broca", "engram", "motor"]
+        .iter()
+        .map(|id| {
+            let state = if *id == "motor" { "running" } else { "failed" };
+            json!({ "module_id": id, "state": state, "enabled": true, "live": true, "health": "ok" })
+        })
+        .collect::<Vec<_>>();
+    s.record_roster(roster(Value::Array(entries)), now());
+    let snap = assemble(&s, now());
+    assert_eq!(snap.attention().len(), 3);
+    for (w, h) in [(120u16, 36u16), (160, 48)] {
+        let rows = home_rows(&snap, w, h);
+        assert!(rows[5].contains("aft"), "{w}×{h}");
+        assert!(rows[6].contains("+2 more"), "{w}×{h}: {}", rows[6]);
+        assert!(
+            rows[7].trim().is_empty(),
+            "{w}×{h}: the spacer stays: {:?}",
+            rows[7]
+        );
+        assert!(rows[8].contains("Modules"), "{w}×{h}");
+    }
+}

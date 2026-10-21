@@ -111,6 +111,26 @@ fn approvals_text(v: &View) -> (String, St) {
     }
 }
 
+/// An error in a value cell: a machine code (one word, no spaces) never
+/// shows as the value; it reads "couldn't read {what}" instead. A sentence
+/// such as "motor isn't installed" shows as it is.
+pub fn error_words(err: &str, what: &str) -> String {
+    if err.trim().contains(' ') {
+        err.to_string()
+    } else {
+        format!("couldn't read {what}")
+    }
+}
+
+/// An error as a value cell shows it: a machine code becomes a muted
+/// "couldn't read {what}" (the code stays in the model for a detail view); a
+/// sentence shows as it is, in amber.
+fn error_cell(err: &str, what: &str) -> (String, St) {
+    let text = error_words(err, what);
+    let st = if text == err { St::W } else { St::D };
+    (text, st)
+}
+
 /// One fact row of This Mac: its label, then the value, or the source's
 /// error in amber while it is failing without a reading to show. A row
 /// whose source is only a last good reading draws dimmed.
@@ -127,7 +147,8 @@ fn fact_row<T>(
     let room = (w - 13).max(0) as usize;
     match (&panel.error, panel.loaded) {
         (Some(err), false) => {
-            c.put(x + 13, y, &trunc(err, room), St::W);
+            let (text, st) = error_cell(err, &k.to_lowercase());
+            c.put(x + 13, y, &trunc(&text, room), st);
         }
         _ => {
             c.put(x + 13, y, &trunc(value, room), st);
@@ -143,7 +164,8 @@ fn backups(c: &mut Canvas, v: &View, x: i32, y: i32, w: i32) {
     let b = &panel.data;
     c.put(x, y, "Backups", St::D);
     if let (Some(err), false) = (&panel.error, panel.loaded) {
-        c.put(x + 13, y, &trunc(err, (w - 13).max(0) as usize), St::W);
+        let (text, st) = error_cell(err, "backups");
+        c.put(x + 13, y, &trunc(&text, (w - 13).max(0) as usize), st);
         return;
     }
     let (g, st) = status_glyph(b.status);
@@ -188,9 +210,11 @@ fn devices(c: &mut Canvas, v: &View, x: i32, y: i32, end: i32) {
     c.put(x, y, "Devices", St::D);
     let panel = &v.snap.devices;
     if !panel.loaded {
-        let text = panel.error.as_deref().unwrap_or(UNKNOWN);
-        let st = if panel.error.is_some() { St::W } else { St::D };
-        c.put(x + 13, y, &trunc(text, (end - x - 13).max(0) as usize), st);
+        let (text, st) = match panel.error.as_deref() {
+            Some(err) => error_cell(err, "devices"),
+            None => (UNKNOWN.to_string(), St::D),
+        };
+        c.put(x + 13, y, &trunc(&text, (end - x - 13).max(0) as usize), st);
         return;
     }
     // Online devices first, so the row agrees with the online count; chips
@@ -340,10 +364,32 @@ fn layout(w: i32, h: i32) -> Layout {
 /// Selection moves over these rows; the "+N more" row opens the first
 /// problem it stands for.
 pub fn attention_rows(w: i32, h: i32) -> usize {
-    match layout(w, h) {
-        Layout::Small => 2,
-        Layout::Regular | Layout::Large => 3,
+    // Rows 5 and 6, at every size: row 7 stays blank so the panels below
+    // never sit directly under the list.
+    let _ = layout(w, h);
+    2
+}
+
+/// What a problem row says: the module's own sentence, or, when it gave
+/// none, where it is in its lifecycle ("Restarting") or its status, in
+/// muted words.
+fn problem_text(m: &crate::model::Module) -> (String, St) {
+    if !m.summary.is_empty() {
+        return (m.summary.clone(), St::NONE);
     }
+    let words = match (&m.lifecycle, m.status) {
+        (Some(word), _) => word.clone(),
+        (None, Status::Unknown) => "Health unknown".to_string(),
+        (None, status) => {
+            let w = crate::draw::status_word(status);
+            let mut chars = w.chars();
+            chars
+                .next()
+                .map(|f| f.to_uppercase().chain(chars).collect())
+                .unwrap_or_default()
+        }
+    };
+    (words, St::D)
 }
 
 /// The attention list from row 5. When the problems outnumber the rows, the
@@ -364,19 +410,15 @@ fn attention_list(c: &mut Canvas, v: &View, lay: Layout) {
         let y = 5 + i as i32;
         let (g, st) = status_glyph(m.status);
         c.put(3, y, g, st);
+        let (text, text_st) = problem_text(m);
         match lay {
             Layout::Small => {
                 c.put(5, y, &pad_right(&m.id, 17), St::B);
-                c.put(
-                    22,
-                    y,
-                    &trunc(&m.summary, (c.w - 24).max(0) as usize),
-                    St::NONE,
-                );
+                c.put(22, y, &trunc(&text, (c.w - 24).max(0) as usize), text_st);
             }
             Layout::Regular => {
                 c.put(5, y, &pad_right(&m.id, 18), St::B);
-                c.put(24, y, &trunc(&m.summary, 70), St::NONE);
+                c.put(24, y, &trunc(&text, 70), text_st);
                 if let Some(t) = m.status_since {
                     c.right(c.w - 10, y, &format!("since {}", v.civil(t).hm()), St::D);
                 }
@@ -384,12 +426,7 @@ fn attention_list(c: &mut Canvas, v: &View, lay: Layout) {
             Layout::Large => {
                 let r = c.w - 2;
                 c.put(5, y, &pad_right(&m.id, 18), St::B);
-                c.put(
-                    24,
-                    y,
-                    &trunc(&m.summary, (r - 24 - 30).max(0) as usize),
-                    St::NONE,
-                );
+                c.put(24, y, &trunc(&text, (r - 24 - 30).max(0) as usize), text_st);
                 if let Some(t) = m.status_since {
                     let text = format!("since {} · {}", v.civil(t).hm(), ago(v.age(t)));
                     c.right(r - 4, y, &text, St::D);
@@ -466,7 +503,7 @@ fn more_providers(n: usize, usage_tab: bool) -> String {
 fn provider_frac(q: &Provider) -> Result<f64, (String, St)> {
     match (q.used, &q.error, &q.balance) {
         (Some(used), None, _) => Ok(used / f64::from(q.of.max(1))),
-        (_, Some(err), _) => Err((err.clone(), St::W)),
+        (_, Some(err), _) => Err(error_cell(err, "usage")),
         (None, None, Some(left)) => Err((left.clone(), St::NONE)),
         (None, None, None) => Err((UNKNOWN.to_string(), St::D)),
     }

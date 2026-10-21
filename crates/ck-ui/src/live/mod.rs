@@ -281,6 +281,10 @@ pub struct Probe {
     pub metrics: Option<serde_json::Value>,
 }
 
+/// How long after its process starts a running module without a health
+/// check yet reads as starting rather than of unknown health.
+pub const START_GRACE_SECS: f64 = 120.0;
+
 /// How often a module whose cached metrics are over the cache's size cap is
 /// probed directly for the full set, at most.
 pub const TRUNCATED_PROBE_SECS: f64 = 30.0;
@@ -532,7 +536,47 @@ impl State {
             .health_of(&e.module_id)
             .map(|h| h.status)
             .unwrap_or(e.health);
-        map::module_status(&e.state, health)
+        match map::module_status(&e.state, health) {
+            Status::Unknown if self.not_yet_checked(e) => Status::Starting,
+            status => status,
+        }
+    }
+
+    /// A running module whose current process has had no health check yet
+    /// and started within [`START_GRACE_SECS`]: it is starting, not of
+    /// unknown health. Past that grace a module nobody can check stays
+    /// unknown.
+    fn not_yet_checked(&self, e: &SupervisorEntry) -> bool {
+        if e.state != "running" {
+            return false;
+        }
+        let Some(process) = self.processes.get(&e.module_id) else {
+            return false;
+        };
+        let probed = self
+            .health_of(&e.module_id)
+            .and_then(|h| h.last_probe_ms)
+            .or(e.last_probe_ms)
+            .map(|ms| Timestamp::from_unix_millis(ms as i64));
+        let checked_since_start = probed.is_some_and(|p| p >= process.spawned_at);
+        !checked_since_start && self.roster.at.secs_since(process.spawned_at) < START_GRACE_SECS
+    }
+
+    /// The module's lifecycle in a word, from the supervisor's state, when it
+    /// is anything but running and checked.
+    fn lifecycle(&self, e: &SupervisorEntry) -> Option<String> {
+        let word = match e.state.as_str() {
+            "restarting" => "Restarting",
+            "starting" => "Starting",
+            "draining" => "Draining",
+            "stopped" => "Stopped",
+            "disabled" => "Disabled",
+            "failed" => "Failed",
+            "unresponsive" => "Not responding",
+            "running" if self.not_yet_checked(e) => "Starting",
+            _ => return None,
+        };
+        Some(word.to_string())
     }
 }
 
@@ -922,6 +966,7 @@ fn module_view(state: &State, e: &SupervisorEntry) -> Module {
         log,
         action: state.actions.get(id).cloned(),
         drain_limit_secs: e.drain_timeout_ms.map(|ms| ms as f64 / 1000.0),
+        lifecycle: state.lifecycle(e),
         all_metrics,
     }
 }

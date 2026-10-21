@@ -90,7 +90,9 @@ fn a_failing_provider_shows_its_error_never_zero_percent() {
     s.usage.data.providers[0].error = Some("upstream_failed".into());
     let buf = render(&App::new(Theme::test()), &s, 120, 36);
     let line = row(&buf, USAGE_FIRST);
-    assert!(line.contains("upstream_failed"), "{line}");
+    // A machine code never shows as the value: a short sentence does.
+    assert!(line.contains("couldn't read usage"), "{line}");
+    assert!(!line.contains("upstream_failed"), "{line}");
     let usage_cells: String = line.chars().skip(USAGE_X as usize).take(37).collect();
     assert!(!usage_cells.contains('%'), "{usage_cells}");
     assert!(!usage_cells.contains('█'), "no bar for a failing provider");

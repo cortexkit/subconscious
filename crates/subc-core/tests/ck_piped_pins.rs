@@ -629,3 +629,49 @@ async fn piped_ck_daemon_leaves_out_config_path_and_stays_on_its_pins() {
     let report = compare_with_pins(&texts);
     assert!(report.is_empty(), "{report}");
 }
+
+/// The pid the module's current process wrote at start.
+fn module_pid(kit: &Kit) -> u32 {
+    fs::read_to_string(kit.root().join(format!("{MODULE}.pid")))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap()
+}
+
+/// The restart pins rely on the module holding its old process after a
+/// restart; without the hold, ck's read right after the acknowledgement
+/// usually still wins the race, so the pins alone can't show the hold works.
+/// Here the read comes a whole second later, long after an unheld process
+/// would have exited and been replaced.
+#[test]
+fn a_restarted_kit_module_stays_draining_until_the_test_releases_it() {
+    let kit = boot();
+    wait_live(&kit, 1).unwrap_or_else(|error| panic!("{error}\n{}", diagnostics(&kit)));
+    let old_pid = module_pid(&kit);
+    kit.assert_answering();
+    let restart = kit.ck(&["--json", "module", "restart", MODULE]);
+    assert!(
+        restart.status.success(),
+        "{}",
+        String::from_utf8_lossy(&restart.stderr)
+    );
+
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    let list = kit.wait_json("module list", &["--json", "module", "list"], |_| true);
+    let module = &list["modules"][0];
+    assert_eq!(
+        (module["state"].as_str(), module["spawn_generation"].as_u64()),
+        (Some("draining"), Some(1)),
+        "a second after the restart the module should still be draining its first process: {module}"
+    );
+    assert_eq!(module_pid(&kit), old_pid, "no replacement process started");
+    assert!(
+        PathBuf::from(format!("/proc/{old_pid}")).exists(),
+        "the old process {old_pid} still runs"
+    );
+
+    kit.release_exit(MODULE);
+    wait_live(&kit, 2).unwrap_or_else(|error| panic!("{error}\n{}", diagnostics(&kit)));
+    assert_ne!(module_pid(&kit), old_pid);
+}

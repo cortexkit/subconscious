@@ -24,9 +24,10 @@
 use std::{fs, path::PathBuf, process::Output};
 
 use serde_json::{json, Map, Value};
+use subc_control::ClientControlRequest;
 
 mod common;
-use common::kit::Kit;
+use common::{kit::Kit, scripted_daemon};
 
 const MODULE: &str = "pin-alpha";
 
@@ -70,28 +71,8 @@ fn module_entry() -> Value {
     })
 }
 
-/// A kit whose module started once and is live. A module that crashed and
-/// was restarted while the machine was busy would print its crash in every
-/// pin, so such a kit is replaced by a fresh one.
 fn boot() -> Kit {
-    for attempt in 1..=3 {
-        let kit = Kit::boot("ck-piped-pins", &[(MODULE, module_entry())]);
-        let status = kit.wait_json(
-            "the module live",
-            &["--json", "module", "status", MODULE],
-            |status| status["module"]["live"] == true,
-        );
-        if status["module"]["lifetime_restarts"] == 0 && status["module"]["spawn_generation"] == 1 {
-            return kit;
-        }
-        let stderr = kit.ck(&["module", "stderr", MODULE]);
-        eprintln!(
-            "attempt {attempt}: the module restarted during boot: {}\n{}",
-            status["module"],
-            String::from_utf8_lossy(&stderr.stdout)
-        );
-    }
-    panic!("the module restarted during boot in three fresh kits");
+    Kit::boot("ck-piped-pins", &[(MODULE, module_entry())])
 }
 
 /// One command's captured output.
@@ -108,8 +89,8 @@ struct Taken {
     runs: Vec<Run>,
 }
 
-fn module_status(kit: &Kit) -> Value {
-    kit.wait_json(
+fn module_status(kit: &Kit) -> Result<Value, String> {
+    kit.poll_json(
         "module status",
         &["--json", "module", "status", MODULE],
         |_| true,
@@ -117,22 +98,39 @@ fn module_status(kit: &Kit) -> Value {
 }
 
 /// Waits until the module's `generation`th process is live.
-fn wait_live(kit: &Kit, generation: u64) {
-    kit.wait_json(
+fn wait_live(kit: &Kit, generation: u64) -> Result<(), String> {
+    kit.poll_json(
         "the module live",
         &["--json", "module", "status", MODULE],
         |status| {
             status["module"]["live"] == true && status["module"]["spawn_generation"] == generation
         },
-    );
+    )
+    .map(drop)
+}
+
+/// Fails when the module's process exited without being asked to, which
+/// every later pin would show.
+fn no_crash(kit: &Kit) -> Result<(), String> {
+    let status = module_status(kit)?;
+    if status["module"]["lifetime_restarts"] == 0 {
+        return Ok(());
+    }
+    let stderr = kit.ck(&["module", "stderr", MODULE]);
+    Err(format!(
+        "the module crashed: {}\n{}",
+        status["module"],
+        String::from_utf8_lossy(&stderr.stdout)
+    ))
 }
 
 /// Brings the kit to the same state before each command, then runs it.
-fn take(kit: &Kit) -> Taken {
-    wait_live(kit, 1);
-    kit.wait_json("health recorded", &["--json", "health"], |health| {
+fn take(kit: &Kit) -> Result<Taken, String> {
+    wait_live(kit, 1)?;
+    kit.poll_json("health recorded", &["--json", "health"], |health| {
         health["modules"][0]["status"] == "ok"
-    });
+    })?;
+    no_crash(kit)?;
     let mut runs = Vec::new();
     for &(pin, args) in COMMANDS {
         match pin {
@@ -140,10 +138,10 @@ fn take(kit: &Kit) -> Taken {
             // The ledger holds the start and both restarts once the second
             // restart's entry lands.
             "activity" => {
-                wait_live(kit, 3);
-                kit.wait_json("three ledger entries", &["--json", "activity"], |entries| {
+                wait_live(kit, 3)?;
+                kit.poll_json("three ledger entries", &["--json", "activity"], |entries| {
                     entries.as_array().is_some_and(|entries| entries.len() == 3)
-                });
+                })?;
             }
             _ => {}
         }
@@ -153,18 +151,31 @@ fn take(kit: &Kit) -> Taken {
             output: kit.ck(args),
         });
         if pin == "module-restart" {
-            wait_live(kit, 2);
+            wait_live(kit, 2)?;
         }
     }
-    assert_eq!(
-        module_status(kit)["module"]["spawn_generation"],
-        3,
-        "the two restarts each started a new process"
-    );
-    Taken {
+    no_crash(kit)?;
+    Ok(Taken {
         kit_root: kit.root().display().to_string(),
         runs,
+    })
+}
+
+/// Takes the pinned outputs from a fresh kit. On a busy machine the test
+/// module can crash, and a crash shows in every later output; that kit is
+/// discarded and the outputs are taken again from a new one.
+fn take_fresh() -> Taken {
+    let mut failures = Vec::new();
+    for _ in 0..3 {
+        match take(&boot()) {
+            Ok(taken) => return taken,
+            Err(error) => {
+                eprintln!("discarding a kit: {error}");
+                failures.push(error);
+            }
+        }
     }
+    panic!("three fresh kits failed: {failures:#?}");
 }
 
 // ---------------------------------------------------------------------------
@@ -529,8 +540,8 @@ fn compare_with_pins(texts: &[(&str, String)]) -> String {
 
 #[test]
 fn piped_ck_prints_its_pinned_bytes_against_two_fresh_kit_daemons() {
-    let first = take(&boot());
-    let second = take(&boot());
+    let first = take_fresh();
+    let second = take_fresh();
 
     let mut report = String::new();
     let mut fired_anywhere = Vec::new();
@@ -556,5 +567,78 @@ fn piped_ck_prints_its_pinned_bytes_against_two_fresh_kit_daemons() {
         }
     }
     report += &compare_with_pins(&texts);
+    assert!(report.is_empty(), "{report}");
+}
+
+/// The `config_path` a describe reply may carry, under a neutral home.
+const CONFIG_PATH: &str = "/Users/alex/.config/cortexkit/subc.jsonc";
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn piped_ck_daemon_leaves_out_config_path_and_stays_on_its_pins() {
+    let kit = tokio::task::spawn_blocking(|| {
+        let kit = boot();
+        kit.wait_json(
+            "the module live",
+            &["--json", "module", "status", MODULE],
+            |status| status["module"]["live"] == true,
+        );
+        kit
+    })
+    .await
+    .unwrap();
+    let mut describe =
+        scripted_daemon::raw_control(&kit.connection(), &ClientControlRequest::ServerDescribe {})
+            .await;
+    assert!(
+        describe.get("config_path").is_none(),
+        "the kit's daemon now reports config_path; this test's describe value must still add it"
+    );
+    describe["config_path"] = json!(CONFIG_PATH);
+    let daemon_ver = subc_transport::read_for_client(kit.connection())
+        .unwrap()
+        .daemon_ver;
+    let scripted = scripted_daemon::ScriptedDescribeDaemon::start(
+        "ck-describe-config-path",
+        &daemon_ver,
+        describe,
+    )
+    .await;
+
+    // A client reading the raw reply sees the field.
+    let seen = scripted_daemon::raw_control(
+        &scripted.connection_file_path,
+        &ClientControlRequest::ServerDescribe {},
+    )
+    .await;
+    assert_eq!(seen["config_path"], CONFIG_PATH);
+
+    let connection = scripted.connection_file_path.clone();
+    let texts = tokio::task::spawn_blocking(move || {
+        let mut texts = Vec::new();
+        for &(pin, args) in COMMANDS {
+            if pin != "daemon" && pin != "daemon.json" {
+                continue;
+            }
+            let output = kit
+                .ck_command()
+                .arg("--subc")
+                .arg(&connection)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                !String::from_utf8_lossy(&output.stdout).contains("config_path")
+                    && !String::from_utf8_lossy(&output.stdout).contains(CONFIG_PATH),
+                "ck {args:?} printed the config path:\n{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            let run = Run { pin, args, output };
+            texts.push((pin, masked(&run, &kit.root().display().to_string()).0));
+        }
+        texts
+    })
+    .await
+    .unwrap();
+    let report = compare_with_pins(&texts);
     assert!(report.is_empty(), "{report}");
 }

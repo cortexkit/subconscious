@@ -206,22 +206,34 @@ impl Kit {
 
     /// Waits until `ck <args>` succeeds and `ok` holds for its JSON stdout.
     pub fn wait_json(&self, what: &str, args: &[&str], ok: impl Fn(&Value) -> bool) -> Value {
+        self.poll_json(what, args, ok)
+            .unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    /// [`Kit::wait_json`], returning what went wrong instead of failing.
+    pub fn poll_json(
+        &self,
+        what: &str,
+        args: &[&str],
+        ok: impl Fn(&Value) -> bool,
+    ) -> Result<Value, String> {
         let deadline = Instant::now() + BOOT_TIMEOUT;
         loop {
             let output = self.ck(args);
             if output.status.success() {
                 if let Ok(value) = serde_json::from_slice::<Value>(&output.stdout) {
                     if ok(&value) {
-                        return value;
+                        return Ok(value);
                     }
                 }
             }
-            assert!(
-                Instant::now() < deadline,
-                "{what}: last ck {args:?} printed {}{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "{what}: last ck {args:?} printed {}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                ));
+            }
             thread::sleep(Duration::from_millis(50));
         }
     }

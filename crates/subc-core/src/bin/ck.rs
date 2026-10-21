@@ -4410,10 +4410,24 @@ fn triage_string(value: Option<&Value>) -> &str {
     value.and_then(Value::as_str).unwrap_or("-")
 }
 
+/// What `ck daemon` prints of the daemon's `server.describe` reply: every
+/// field except `config_path`. A daemon can report the path of the
+/// configuration file it reads, which the ck app's settings editor needs.
+/// Scripts read `ck daemon`'s output as it was before that field existed, so
+/// only the printed copy leaves it out, never the reply other readers get.
+fn piped_describe(mut describe: Value) -> Value {
+    if let Some(fields) = describe.as_object_mut() {
+        fields.remove("config_path");
+    }
+    describe
+}
+
 async fn daemon(client: &mut CkClient, json_output: bool, verbose: bool) -> Result<(), CkError> {
-    let describe = client
-        .rpc_value(ClientControlRequest::ServerDescribe {})
-        .await?;
+    let describe = piped_describe(
+        client
+            .rpc_value(ClientControlRequest::ServerDescribe {})
+            .await?,
+    );
     if json_output {
         print_json(&describe)?;
         return Ok(());
@@ -8301,6 +8315,26 @@ fn a_successful_command_stays_successful_when_old_image_cleanup_fails() {
 
 #[cfg(test)]
 mod tests {
+    mod piped_daemon_output {
+        use super::super::*;
+
+        #[test]
+        fn piped_describe_leaves_out_config_path_and_keeps_every_other_field() {
+            let reply = json!({
+                "op": "server.describe",
+                "protocol_ver": 2,
+                "capabilities": ["activity-ledger/v1"],
+                "config_path": "/Users/alex/.config/cortexkit/subc.jsonc",
+                "machine_id": "0123456789abcdef0123456789abcdef",
+            });
+            let mut want = reply.clone();
+            want.as_object_mut().unwrap().remove("config_path");
+            assert_eq!(piped_describe(reply), want);
+            let without = json!({ "op": "server.describe", "protocol_ver": 2 });
+            assert_eq!(piped_describe(without.clone()), without);
+        }
+    }
+
     mod metric_rendering {
         use super::super::*;
 

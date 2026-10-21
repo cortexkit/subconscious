@@ -2873,6 +2873,7 @@ impl Supervisor {
                     deadline,
                     &gauges,
                     DrainScope::Endpoint(endpoint),
+                    &mut DrainGaugeTrace::new(&gauges),
                 )
                 .await;
                 // Store the measurement before the task returns: quiescence
@@ -9442,24 +9443,163 @@ enum BusyGaugeObservation {
     Omitted,
 }
 
-fn busy_gauge_observation(metrics: Option<&Value>, gauges: &[String]) -> BusyGaugeObservation {
-    let Some(metrics) = metrics.and_then(Value::as_object) else {
-        return BusyGaugeObservation::Omitted;
-    };
-    let mut sum = 0u128;
-    for gauge in gauges {
-        let Some(value) = metrics.get(gauge) else {
-            return BusyGaugeObservation::Omitted;
-        };
-        let Some(value) = value.as_u64() else {
-            return BusyGaugeObservation::Busy;
-        };
-        sum = sum.saturating_add(u128::from(value));
+/// What one health answer said about one declared busy gauge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GaugeVerdict {
+    /// The gauge read 0: this gauge is not what holds the drain.
+    Zero,
+    /// The gauge read a positive count.
+    NonZero(u64),
+    /// The gauge was present but not a non-negative integer (`0.0`, a string,
+    /// a negative number). It counts as busy, because the daemon cannot tell
+    /// it is idle. Carries the value as JSON text, cut to a short prefix.
+    NotACount(String),
+    /// The health answer had no metrics object, or one without this gauge.
+    Missing,
+    /// The probe produced no health answer to read; carries the probe error's
+    /// evidence label (`no-answer` for a probe that timed out).
+    ProbeFailed(&'static str),
+}
+
+impl GaugeVerdict {
+    fn reads_quiet(&self) -> bool {
+        matches!(self, Self::Zero)
     }
-    if sum == 0 {
+}
+
+impl fmt::Display for GaugeVerdict {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Zero => f.write_str("zero"),
+            Self::NonZero(value) => write!(f, "non_zero({value})"),
+            Self::NotACount(value) => write!(f, "not_a_count({value})"),
+            Self::Missing => f.write_str("missing_from_health_body"),
+            Self::ProbeFailed(kind) => write!(f, "probe_failed({kind})"),
+        }
+    }
+}
+
+/// The longest JSON text kept for a gauge value that is not a count, so a
+/// module reporting a large object as a gauge cannot flood the drain log.
+const GAUGE_VALUE_TEXT_LIMIT: usize = 32;
+
+/// Read each declared gauge out of one health answer's metrics.
+fn gauge_verdicts(metrics: Option<&Value>, gauges: &[String]) -> Vec<GaugeVerdict> {
+    let metrics = metrics.and_then(Value::as_object);
+    gauges
+        .iter()
+        .map(
+            |gauge| match metrics.and_then(|metrics| metrics.get(gauge)) {
+                None => GaugeVerdict::Missing,
+                Some(value) => match value.as_u64() {
+                    Some(0) => GaugeVerdict::Zero,
+                    Some(count) => GaugeVerdict::NonZero(count),
+                    None => {
+                        let mut text = value.to_string();
+                        if text.len() > GAUGE_VALUE_TEXT_LIMIT {
+                            let mut end = GAUGE_VALUE_TEXT_LIMIT;
+                            while !text.is_char_boundary(end) {
+                                end -= 1;
+                            }
+                            text.truncate(end);
+                            text.push_str("...");
+                        }
+                        GaugeVerdict::NotACount(text)
+                    }
+                },
+            },
+        )
+        .collect()
+}
+
+/// The drain's overall reading of one health answer: omitted when any
+/// declared gauge is missing, quiescent only when every gauge reads 0.
+fn busy_gauge_observation(verdicts: &[GaugeVerdict]) -> BusyGaugeObservation {
+    if verdicts
+        .iter()
+        .any(|verdict| matches!(verdict, GaugeVerdict::Missing))
+    {
+        BusyGaugeObservation::Omitted
+    } else if verdicts.iter().all(GaugeVerdict::reads_quiet) {
         BusyGaugeObservation::Quiescent
     } else {
         BusyGaugeObservation::Busy
+    }
+}
+
+/// One declared gauge's history over a drain: the latest verdict on it, and
+/// the latest value actually read for it (which a later failed probe or
+/// missing gauge does not erase). Times are offsets from the start of the
+/// drain's wait.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct GaugeTrace {
+    latest: Option<(GaugeVerdict, Duration)>,
+    last_value: Option<(GaugeVerdict, Duration)>,
+}
+
+/// What a drain's busy-gauge probes saw, kept so that a drain which runs to
+/// its ceiling can say in its timeout line which declared gauge held it and
+/// why. Without it, a gauge that read busy, a gauge the module never
+/// reported, and a probe that never got an answer all looked the same: a
+/// drain that ended at its ceiling with nothing in flight.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct DrainGaugeTrace {
+    /// Health probes the drain sent.
+    probes: u32,
+    /// Each declared gauge, in declaration order.
+    gauges: Vec<(String, GaugeTrace)>,
+}
+
+impl DrainGaugeTrace {
+    fn new(gauges: &[String]) -> Self {
+        Self {
+            probes: 0,
+            gauges: gauges
+                .iter()
+                .map(|gauge| (gauge.clone(), GaugeTrace::default()))
+                .collect(),
+        }
+    }
+
+    /// Record one probe's verdicts, one per declared gauge, `at` into the drain.
+    fn record(&mut self, verdicts: &[GaugeVerdict], at: Duration) {
+        self.probes = self.probes.saturating_add(1);
+        for ((_, trace), verdict) in self.gauges.iter_mut().zip(verdicts) {
+            trace.latest = Some((verdict.clone(), at));
+            if matches!(
+                verdict,
+                GaugeVerdict::Zero | GaugeVerdict::NonZero(_) | GaugeVerdict::NotACount(_)
+            ) {
+                trace.last_value = Some((verdict.clone(), at));
+            }
+        }
+    }
+}
+
+/// Renders as `gauge: latest verdict @ offset; last value @ offset` for each
+/// declared gauge, separated by ` | `. A value is shown as its verdict
+/// (`zero`, `non_zero(n)`, `not_a_count(json)`), so it says both what was read
+/// and whether that counted as busy.
+impl fmt::Display for DrainGaugeTrace {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.gauges.is_empty() {
+            return f.write_str("none declared");
+        }
+        for (index, (name, trace)) in self.gauges.iter().enumerate() {
+            if index > 0 {
+                f.write_str(" | ")?;
+            }
+            write!(f, "{name}: ")?;
+            match &trace.latest {
+                Some((verdict, at)) => write!(f, "{verdict} @{}ms", at.as_millis())?,
+                None => f.write_str("never probed")?,
+            }
+            match &trace.last_value {
+                Some((value, at)) => write!(f, "; last value {value} @{}ms", at.as_millis())?,
+                None => f.write_str("; no value ever read")?,
+            }
+        }
+        Ok(())
     }
 }
 
@@ -9523,6 +9663,9 @@ fn busy_gauges_of(
 /// gauges, and by module id the probe would reach the promoted candidate.
 /// While the gauges read busy, the probe repeats every
 /// [`DRAIN_BUSY_REPROBE_INTERVAL`] until they read quiet or `deadline` passes.
+/// Every probe's reading of each gauge is recorded in `trace`, for the caller's
+/// timeout line.
+#[allow(clippy::too_many_arguments)]
 async fn wait_for_forwarding_quiescence(
     forwarding: &ForwardingTable,
     module_id: &str,
@@ -9531,10 +9674,12 @@ async fn wait_for_forwarding_quiescence(
     deadline: Instant,
     busy_gauges: &[String],
     scope: DrainScope,
+    trace: &mut DrainGaugeTrace,
 ) -> Result<bool, SuperviseError> {
+    let wait_started = Instant::now();
     let mut gauges_quiescent = busy_gauges.is_empty();
-    let mut next_probe_at = Instant::now();
-    let mut omission_counted = false;
+    let mut next_probe_at = wait_started;
+    let mut omission_reported = false;
 
     loop {
         let now = Instant::now();
@@ -9545,16 +9690,35 @@ async fn wait_for_forwarding_quiescence(
                     probe_endpoint_health(endpoint, runtime, Some(deadline)).await
                 }
             };
+            let verdicts = match &report {
+                Ok(report) => gauge_verdicts(report.metrics.as_ref(), busy_gauges),
+                Err(err) => vec![GaugeVerdict::ProbeFailed(err.label()); busy_gauges.len()],
+            };
+            trace.record(&verdicts, wait_started.elapsed());
             gauges_quiescent = match report {
-                Ok(report) => match busy_gauge_observation(report.metrics.as_ref(), busy_gauges) {
+                Ok(_) => match busy_gauge_observation(&verdicts) {
                     BusyGaugeObservation::Quiescent => true,
                     BusyGaugeObservation::Busy => false,
                     BusyGaugeObservation::Omitted => {
-                        if !omission_counted {
+                        // Once per drain: a module that never reports a gauge
+                        // it declared would otherwise say so on every probe.
+                        if !omission_reported {
                             forwarding
                                 .counters()
                                 .increment_drains_with_undeclared_gauge();
-                            omission_counted = true;
+                            let missing = busy_gauges
+                                .iter()
+                                .zip(&verdicts)
+                                .filter(|(_, verdict)| matches!(verdict, GaugeVerdict::Missing))
+                                .map(|(gauge, _)| gauge.as_str())
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            warn!(
+                                module_id,
+                                missing_gauges = %missing,
+                                "drain health.check answer lacks a declared busy gauge; the drain treats the module as busy until it reports it"
+                            );
+                            omission_reported = true;
                         }
                         false
                     }
@@ -9599,6 +9763,49 @@ async fn wait_for_forwarding_quiescence(
 /// drain's own in-flight poll interval.
 fn drain_busy_reprobe_interval() -> Duration {
     DRAIN_BUSY_REPROBE_INTERVAL.max(REGISTRY_RELEASE_POLL)
+}
+
+/// Logs why a drain gave up: the drain waited its full timeout without the
+/// module going quiet, and teardown is being forced.
+///
+/// The line names two kinds of evidence, because a bare "timed out" hides
+/// causes that need different fixes:
+/// - `holdouts`: the requests and routes still open when the timeout hit,
+///   and on which connections. One stuck call is a module bug; a held stream
+///   on every session is a module that should end its streams when it
+///   receives `module.draining`.
+/// - `gauges`: for each busy gauge the module declares, its latest reading
+///   and how many probes ran. This separates a module that kept reporting
+///   itself busy, one whose health answer never contained the gauge, and one
+///   that never answered the probes, which otherwise all look like a timeout
+///   with nothing in flight.
+fn warn_drain_timed_out(
+    module_id: &str,
+    drain_timeout: Duration,
+    reason: RouteCloseReason,
+    holdouts: &crate::forwarding::DrainHoldouts,
+    gauges: &DrainGaugeTrace,
+) {
+    warn!(
+        module_id = %module_id,
+        waited = ?drain_timeout,
+        ?reason,
+        held_requests = holdouts.requests,
+        held_routes = holdouts.routes,
+        total_routes = holdouts.total_routes,
+        top_connections = ?holdouts.top_connections,
+        // `module_channel:corr`, so the module can find each held request
+        // in its own log; capped, so `held_requests` is the full count.
+        held = %holdouts
+            .held
+            .iter()
+            .map(|(channel, corr)| format!("{channel}:{corr}"))
+            .collect::<Vec<_>>()
+            .join(","),
+        gauge_probes = gauges.probes,
+        busy_gauges = %gauges,
+        "route drain timed out before request quiescence; forcing teardown"
+    );
 }
 
 /// The `route.closed` `drained` value implied by a quiescence-wait outcome.
@@ -10045,6 +10252,7 @@ async fn begin_forwarding_drain_with(
         // anything else. A client holds `closing` as a promise that a verdict is
         // coming; leaving early without `closed` strands it waiting forever, since
         // `closing` carries no timeout of its own.
+        let mut gauge_trace = DrainGaugeTrace::new(&busy_gauges);
         let wait_result = wait_for_forwarding_quiescence(
             forwarding,
             &spec.module_id,
@@ -10053,6 +10261,7 @@ async fn begin_forwarding_drain_with(
             drain_deadline,
             &busy_gauges,
             scope,
+            &mut gauge_trace,
         )
         .await;
         let drained = drained_after_quiescence_wait(&wait_result);
@@ -10064,31 +10273,16 @@ async fn begin_forwarding_drain_with(
                 "forwarding quiescence wait failed after route.closing; forcing route.closed(drained: false) so the client is not left waiting on an unfulfilled promise"
             );
         } else if !drained {
-            // Name what the drain waited on. Without it the line says only that
-            // something did not settle, and "one wedged call" and "every
-            // session's held stream" read the same; the first is a module bug,
-            // the second is a module that should end its streams on
-            // module.draining. Read before teardown releases the routes.
+            // Read before teardown releases the routes.
             let holdouts = forwarding
                 .endpoint_drain_holdouts(target.endpoint)
                 .unwrap_or_default();
-            warn!(
-                module_id = %spec.module_id,
-                waited = ?drain_timeout,
-                ?reason,
-                held_requests = holdouts.requests,
-                held_routes = holdouts.routes,
-                total_routes = holdouts.total_routes,
-                top_connections = ?holdouts.top_connections,
-                // `module_channel:corr`, so the module can find each held request
-                // in its own log; capped, so `held_requests` is the full count.
-                held = %holdouts
-                    .held
-                    .iter()
-                    .map(|(channel, corr)| format!("{channel}:{corr}"))
-                    .collect::<Vec<_>>()
-                    .join(","),
-                "route drain timed out before request quiescence; forcing teardown"
+            warn_drain_timed_out(
+                &spec.module_id,
+                drain_timeout,
+                reason,
+                &holdouts,
+                &gauge_trace,
             );
         }
         crate::control::send_route_control_pushes(
@@ -13755,6 +13949,7 @@ mod drain_busy_reprobe_tests {
     //! connection whose health answers the test scripts. Time is paused, so
     //! every elapsed duration below is exact virtual time.
     use super::*;
+    use std::collections::BTreeMap;
     use std::sync::Mutex as StdMutex;
     use subc_protocol::{manifest::Concurrency, session::ModuleControlResponse};
 
@@ -13772,6 +13967,8 @@ mod drain_busy_reprobe_tests {
         /// Report the gauge busy until this instant, quiet from then on, after
         /// taking `latency` to answer.
         BusyUntil { until: Instant, latency: Duration },
+        /// Answer at once, with metrics that leave the declared gauge out.
+        OmitsGauge,
         /// Never answer.
         Silent,
     }
@@ -13816,11 +14013,15 @@ mod drain_busy_reprobe_tests {
                         let body: Value = serde_json::from_slice(&frame.body).unwrap();
                         assert_eq!(body["op"], MODULE_CONTROL_OP_HEALTH_CHECK);
                         probes.lock().unwrap().push(Instant::now());
-                        let Answer::BusyUntil { until, latency } = answer else {
-                            continue;
+                        let metrics = match answer {
+                            Answer::BusyUntil { until, latency } => {
+                                sleep(latency).await;
+                                let busy = u64::from(Instant::now() < until);
+                                serde_json::json!({ GAUGE: busy })
+                            }
+                            Answer::OmitsGauge => serde_json::json!({ "queue_depth": 0 }),
+                            Answer::Silent => continue,
                         };
-                        sleep(latency).await;
-                        let busy = u64::from(Instant::now() < until);
                         // A probe abandoned at its deadline has no RPC left to
                         // complete, so a late answer may be refused.
                         let _ = forwarding.complete_module_control_rpc(
@@ -13830,7 +14031,7 @@ mod drain_busy_reprobe_tests {
                             ModuleControlRpcOutcome::Response(ModuleControlResponse::HealthCheck {
                                 status: HealthStatus::Ok,
                                 detail: None,
-                                metrics: Some(serde_json::json!({ GAUGE: busy })),
+                                metrics: Some(metrics),
                             }),
                         );
                     }
@@ -13848,7 +14049,14 @@ mod drain_busy_reprobe_tests {
         /// Run one by-id drain wait with `ceiling`, returning its verdict and
         /// how long it took.
         async fn run(&self, ceiling: Duration) -> (bool, Duration) {
+            let (drained, elapsed, _) = self.run_traced(ceiling).await;
+            (drained, elapsed)
+        }
+
+        /// [`Self::run`], also returning what the drain's probes read.
+        async fn run_traced(&self, ceiling: Duration) -> (bool, Duration, DrainGaugeTrace) {
             let started = Instant::now();
+            let mut trace = DrainGaugeTrace::new(&[GAUGE.to_string()]);
             let drained = wait_for_forwarding_quiescence(
                 &self.forwarding,
                 MODULE_ID,
@@ -13857,10 +14065,11 @@ mod drain_busy_reprobe_tests {
                 started + ceiling,
                 &[GAUGE.to_string()],
                 DrainScope::Active,
+                &mut trace,
             )
             .await
             .unwrap();
-            (drained, started.elapsed())
+            (drained, started.elapsed(), trace)
         }
 
         fn probes(&self) -> Vec<Instant> {
@@ -13894,6 +14103,29 @@ mod drain_busy_reprobe_tests {
         assert!(
             probes.len() >= 2,
             "the module was busy at the first probe, so a quiet verdict needs a second: {probes:?}"
+        );
+    }
+
+    /// The same shape in real time on a multi-threaded runtime: the first
+    /// probe is answered busy at once, within a millisecond of the drain
+    /// starting, and later probes read idle. The drain must keep probing
+    /// after that first instant answer and end soon after the gauge falls.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_instant_busy_first_answer_does_not_stop_later_probes_in_real_time() {
+        let drain = Drain::start(Answer::BusyUntil {
+            until: Instant::now() + Duration::from_millis(600),
+            latency: Duration::ZERO,
+        });
+        let (drained, elapsed, trace) = drain.run_traced(CEILING).await;
+        assert!(drained, "the gauge fell at 600ms: {trace}");
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "drain took {elapsed:?} after the gauge fell at 600ms: {trace}"
+        );
+        let probes = drain.probes();
+        assert!(
+            probes.len() >= 2 && trace.probes as usize == probes.len(),
+            "the drain must re-probe after the first busy answer: {probes:?}, {trace}"
         );
     }
 
@@ -13965,6 +14197,136 @@ mod drain_busy_reprobe_tests {
             1,
             "the unanswered probe holds the only slot until the ceiling"
         );
+    }
+
+    /// Every event logged while it is installed, as `message` plus fields.
+    #[derive(Clone, Default)]
+    struct LogCapture {
+        events: Arc<StdMutex<Vec<BTreeMap<String, String>>>>,
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for LogCapture {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _context: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct Fields(BTreeMap<String, String>);
+            impl tracing::field::Visit for Fields {
+                fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn fmt::Debug) {
+                    self.0
+                        .insert(field.name().to_string(), format!("{value:?}"));
+                }
+            }
+            let mut fields = Fields(BTreeMap::new());
+            event.record(&mut fields);
+            self.events.lock().unwrap().push(fields.0);
+        }
+    }
+
+    impl LogCapture {
+        fn install(&self) -> tracing::subscriber::DefaultGuard {
+            use tracing_subscriber::layer::SubscriberExt;
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(self.clone()))
+        }
+
+        fn with_message(&self, needle: &str) -> Vec<BTreeMap<String, String>> {
+            self.events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|fields| fields.get("message").is_some_and(|m| m.contains(needle)))
+                .cloned()
+                .collect()
+        }
+    }
+
+    /// A module that declares a busy gauge but leaves it out of its health
+    /// answers holds a drain to its ceiling. The timeout line must say so by
+    /// name, and the drain must warn about the missing gauge once, not on
+    /// every probe.
+    #[tokio::test(start_paused = true)]
+    async fn a_missing_declared_gauge_is_named_on_the_drain_timeout_line() {
+        let capture = LogCapture::default();
+        let _guard = capture.install();
+        let drain = Drain::start(Answer::OmitsGauge);
+        let (drained, _, trace) = drain.run_traced(Duration::from_secs(2)).await;
+        assert!(!drained, "a gauge never reported cannot read quiet");
+        assert!(trace.probes >= 2, "the drain must re-probe: {trace:?}");
+
+        let missing = capture.with_message("lacks a declared busy gauge");
+        assert_eq!(missing.len(), 1, "one warning per drain: {missing:?}");
+        assert_eq!(
+            missing[0].get("missing_gauges").map(String::as_str),
+            Some(GAUGE)
+        );
+
+        warn_drain_timed_out(
+            MODULE_ID,
+            Duration::from_secs(2),
+            RouteCloseReason::Restart,
+            &Default::default(),
+            &trace,
+        );
+        let timeouts = capture.with_message("route drain timed out");
+        assert_eq!(timeouts.len(), 1, "{timeouts:?}");
+        let gauges = &timeouts[0]["busy_gauges"];
+        assert!(
+            gauges.starts_with(&format!("{GAUGE}: missing_from_health_body @")),
+            "the timeout line must name the gauge and why it read busy: {gauges}"
+        );
+        assert!(
+            gauges.ends_with("; no value ever read"),
+            "no value was ever read for the gauge: {gauges}"
+        );
+        assert_eq!(timeouts[0]["gauge_probes"], trace.probes.to_string());
+    }
+
+    /// The trace names a busy value and when it was read. For a probe that
+    /// never got an answer, it names the probe's error kind and says that no
+    /// value was ever read.
+    #[tokio::test(start_paused = true)]
+    async fn the_drain_trace_names_a_busy_value_and_an_unanswered_probe() {
+        let busy = Drain::start(Answer::BusyUntil {
+            until: Instant::now() + Duration::from_secs(3600),
+            latency: Duration::ZERO,
+        });
+        let (_, _, trace) = busy.run_traced(Duration::from_secs(1)).await;
+        let rendered = trace.to_string();
+        assert!(
+            rendered.starts_with(&format!("{GAUGE}: non_zero(1) @"))
+                && rendered.contains("; last value non_zero(1) @"),
+            "{rendered}"
+        );
+
+        let silent = Drain::start(Answer::Silent);
+        let (_, _, trace) = silent.run_traced(Duration::from_secs(1)).await;
+        // The probe is capped at the 1 s ceiling, and its reading is stamped
+        // when it gave up.
+        assert_eq!(
+            trace.to_string(),
+            format!("{GAUGE}: probe_failed(no-answer) @1000ms; no value ever read")
+        );
+        assert_eq!(trace.probes, 1);
+    }
+
+    /// A gauge value that is not a count reads busy and is shown as sent.
+    #[test]
+    fn a_gauge_that_is_not_a_count_is_busy_and_shown_as_sent() {
+        let gauges = [GAUGE.to_string()];
+        let verdicts = gauge_verdicts(Some(&serde_json::json!({ GAUGE: 0.0 })), &gauges);
+        assert_eq!(verdicts, vec![GaugeVerdict::NotACount("0.0".to_string())]);
+        assert_eq!(
+            busy_gauge_observation(&verdicts),
+            BusyGaugeObservation::Busy
+        );
+        let zero = gauge_verdicts(Some(&serde_json::json!({ GAUGE: 0 })), &gauges);
+        assert_eq!(
+            busy_gauge_observation(&zero),
+            BusyGaugeObservation::Quiescent
+        );
+        let none = gauge_verdicts(None, &gauges);
+        assert_eq!(busy_gauge_observation(&none), BusyGaugeObservation::Omitted);
     }
 }
 

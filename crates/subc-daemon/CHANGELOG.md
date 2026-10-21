@@ -1,8 +1,12 @@
 # Changelog
 
+## 0.36.22
+
+- When a restart, reload or swap drain runs to its ceiling, its timeout line now names why: for each declared busy gauge, its latest reading and when it was taken (`zero`, `non_zero(n)`, `not_a_count(value)`, `missing_from_health_body`, or `probe_failed(<kind>)`), the last value actually read, and how many probes ran (`gauge_probes`). A health answer that lacks a declared gauge is warned about once per drain, by gauge name; before, it only moved a counter. Drain behaviour is unchanged.
+
 ## 0.36.21
 
-- Let reading clients drain short module-to-client egress bursts: a full queue waits for at most 250 ms minus the atomic backlog age, closing immediately if it is already older than 250 ms. The age follows the writer's current frame or the frame that made the queue non-empty; between writes it may be one frame older than the true head, avoiding per-frame locking. Apply the same bound to forwarded frames, module GOODBYE and oversized-reply replacement errors, preserving queue bounds and path-specific close reasons. Client teardown wakes pending deliveries; module teardown cancels them. Close warnings add header type/flags and the age/timeout cause, never body bytes.
+- A module frame bound for a client whose 4 MiB egress queue is full no longer closes the client at once. The daemon waits for room for at most 250 ms minus the age of the oldest queued frame, so a reading client that receives a large fan-out burst keeps its connection. A client whose oldest queued frame is already older than 250 ms has stopped reading and is closed at once, as before, so a stuck client still holds a module's frame reader for at most 250 ms. The same rule covers module GOODBYE delivery and the error that replaces an oversized reply, and each keeps its own close reason. The wait ends as soon as the client connection closes. Queue accounting stays lock-free: the age is that of the frame the writer is on, or of the frame that made the queue non-empty. The close warning now names the refused frame's type and flags and the close cause, never body bytes.
 
 ## 0.36.20
 

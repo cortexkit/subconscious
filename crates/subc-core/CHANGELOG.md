@@ -1,8 +1,12 @@
 # Changelog
 
+## 0.20.114
+
+- Ship subc-daemon 0.36.22: a drain that runs to its ceiling now says which declared busy gauge held it and why.
+
 ## 0.20.113
 
-- Ship subc-daemon 0.36.21: full client egress queues get only the unused portion of a 250 ms atomic-backlog-age grace before disconnect, so healthy fanout bursts can drain without losing every route. Backlog accounting stays lock-free. Stopped readers still close within that bound; diagnostics include header-only refusal facts.
+- Ship subc-daemon 0.36.21: a client whose egress queue fills during a burst gets up to 250 ms to drain it instead of being disconnected at once, so a healthy client keeps its routes. A client that has stopped reading is still closed within that bound.
 
 ## 0.20.112
 

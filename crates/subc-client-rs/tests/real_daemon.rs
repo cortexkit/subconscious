@@ -4716,10 +4716,16 @@ async fn start_drain_harness(
 /// ACK can come before the drain has finished, so callers wait for the
 /// drained process's `connection_end` event to know it is over.
 async fn restart_drain_module(connection_file: &Path) {
+    restart_drain_module_with_timeout(connection_file, None).await;
+}
+
+/// [`restart_drain_module`] with the restart's own `drain_timeout_ms`, which
+/// overrides the module's configured drain budget for this one restart.
+async fn restart_drain_module_with_timeout(connection_file: &Path, drain_timeout_ms: Option<u64>) {
     let mut client = connect_authed_client(connection_file).await.unwrap();
     let body = serde_json::to_vec(&ClientControlRequest::SupervisorRestart {
         module_id: DRAIN_MODULE_ID.to_string(),
-        drain_timeout_ms: None,
+        drain_timeout_ms,
     })
     .unwrap();
     write_frame(&mut client, &control_request_frame(77, body))
@@ -5065,6 +5071,253 @@ async fn a_busy_gauge_released_after_on_draining_holds_the_restart_drain_until_i
         "the daemon's drain wait must have seen the gauge at zero: {:?}",
         closed.body
     );
+    daemon.kill_and_wait();
+}
+
+/// Periodic health settings for the slow-cadence drain tests: one periodic
+/// probe an hour, so periodic health can neither evict the module nor stand in
+/// for the drain's own busy-gauge probes. A restart drain must re-probe the
+/// gauge on its own fixed short interval whatever this cadence says.
+fn slow_cadence_health() -> Value {
+    json!({ "cadence_ms": 3_600_000, "deadline_ms": 5_000, "failure_threshold": 3 })
+}
+
+/// The drained process's events, once its connection has ended, checked for a
+/// drain that the busy gauge (not the deadline) ended: the drain probed the
+/// gauge at 1, then read it at 0 before the GOODBYE, and the whole drain took
+/// at least `busy_ms` and well under `budget_ms`.
+fn assert_gauge_ended_the_drain(events: &[Value], busy_ms: u64, budget_ms: u64) {
+    let draining_at = position_of(events, "draining", |event| event["kind"] == "draining");
+    let busy_done_at = position_of(events, "busy_done", |event| event["kind"] == "busy_done");
+    let end_at = position_of(events, "connection_end", |event| {
+        event["kind"] == "connection_end"
+    });
+    assert_eq!(events[end_at]["end"], "goodbye", "{events:#?}");
+    assert!(
+        draining_at < busy_done_at && busy_done_at < end_at,
+        "{events:#?}"
+    );
+    assert!(
+        events[busy_done_at..end_at]
+            .iter()
+            .any(|event| event["kind"] == "health" && event["drain_work"] == 0),
+        "the module must be probed and read 0 before it is torn down: {events:#?}"
+    );
+    let drain_ms =
+        events[end_at]["at_ms"].as_u64().unwrap() - events[draining_at]["at_ms"].as_u64().unwrap();
+    assert!(
+        drain_ms >= busy_ms,
+        "the drain ended before the gauge could fall: {drain_ms}ms"
+    );
+    // The drain re-probes every 250 ms, so a drain the gauge ended finishes
+    // within a few seconds of the gauge falling. One that runs on toward the
+    // budget was ended by its deadline, not by the gauge.
+    assert!(
+        drain_ms < busy_ms + 5_000 && drain_ms < budget_ms,
+        "the drain ran on after the gauge fell instead of ending on it: {drain_ms}ms \
+         (gauge busy for {busy_ms}ms, budget {budget_ms}ms): {events:#?}"
+    );
+}
+
+/// The busy-gauge drain above, with an hour-long periodic health cadence and a
+/// restart sent as soon as the module has registered, carrying its own drain
+/// timeout. That is the shape of a module owner's test whose restart drain ran
+/// to its full timeout on Linux although the gauge had read idle for most of
+/// it: the gauge must still end the drain shortly after it falls.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restart_right_after_registration_ends_its_drain_on_the_gauge_under_a_slow_health_cadence(
+) {
+    restart_right_after_registration_under_a_slow_cadence(
+        "subc-client-rs-drain-slow-cadence",
+        false,
+    )
+    .await;
+}
+
+/// [`a_restart_right_after_registration_ends_its_drain_on_the_gauge_under_a_slow_health_cadence`]
+/// with a fresh daemon connection every 50 ms through the drain, each asking
+/// for the module's health, as a module owner's test does while it polls for
+/// the replacement. That churn must not keep the drain's own probes from
+/// reading the gauge fall.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restart_drain_under_connection_churn_ends_on_the_gauge_under_a_slow_health_cadence() {
+    restart_right_after_registration_under_a_slow_cadence(
+        "subc-client-rs-drain-slow-cadence-churn",
+        true,
+    )
+    .await;
+}
+
+async fn restart_right_after_registration_under_a_slow_cadence(name: &str, churn: bool) {
+    const BUSY_AFTER_DRAIN_MS: u64 = 1_500;
+    const DRAIN_BUDGET_MS: u64 = 30_000;
+    let busy_after_drain = BUSY_AFTER_DRAIN_MS.to_string();
+    let (_temp_dir, mut daemon, events_path) = start_drain_harness(
+        name,
+        &[("SUBC_MODULE_ECHO_BUSY_AFTER_DRAIN_MS", &busy_after_drain)],
+        json!({ "health": slow_cadence_health() }),
+    )
+    .await;
+    let drained_pid = first_module_pid(&events_path).await;
+    let registered_ms = events_of(&events_path, drained_pid)
+        .iter()
+        .find(|event| event["kind"] == "hello_ack")
+        .and_then(|event| event["at_ms"].as_u64())
+        .expect("the hello_ack event carries its time");
+
+    let churn = churn.then(|| {
+        let connection_file = daemon.connection_file.clone();
+        tokio::spawn(async move {
+            let mut corr = 1_000u64;
+            loop {
+                corr += 1;
+                if let Ok(mut client) = connect_authed_client(&connection_file).await {
+                    let body = serde_json::to_vec(&ClientControlRequest::SupervisorHealthProbe {
+                        module_id: DRAIN_MODULE_ID.to_string(),
+                    })
+                    .unwrap();
+                    if write_frame(&mut client, &control_request_frame(corr, body))
+                        .await
+                        .is_ok()
+                        && client.flush().await.is_ok()
+                    {
+                        // The answer is a refusal while the module drains;
+                        // only the connection and request load matter here.
+                        let _ = timeout(Duration::from_secs(2), read_frame(&mut client)).await;
+                    }
+                }
+                sleep(Duration::from_millis(50)).await;
+            }
+        })
+    });
+
+    // No pause: the restart reaches the daemon within moments of the
+    // module's registration.
+    let restart_sent_ms = unix_ms_now();
+    restart_drain_module_with_timeout(&daemon.connection_file, Some(DRAIN_BUDGET_MS)).await;
+    eprintln!(
+        "restart sent {}ms after the module's hello_ack",
+        restart_sent_ms.saturating_sub(registered_ms)
+    );
+    wait_for_drain_event(
+        &events_path,
+        Duration::from_millis(DRAIN_BUDGET_MS) + EVENT_TIMEOUT,
+        |event| event["pid"].as_u64() == Some(drained_pid) && event["kind"] == "connection_end",
+        &[],
+    )
+    .await;
+    if let Some(churn) = churn {
+        churn.abort();
+    }
+
+    assert_gauge_ended_the_drain(
+        &events_of(&events_path, drained_pid),
+        BUSY_AFTER_DRAIN_MS,
+        DRAIN_BUDGET_MS,
+    );
+    daemon.kill_and_wait();
+}
+
+/// The slow-cadence drain with a tool call held across it, as a module owner's
+/// test does: the call is in flight when the restart arrives, finishes on the
+/// draining process, and the busy gauge falls after it. The drain must end on
+/// the gauge, and the route the consumer holds must hear `route.closing` and
+/// then `route.closed` with `drained: true`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restart_drain_with_a_held_call_ends_on_the_gauge_under_a_slow_health_cadence() {
+    const HELD_CALL_MS: u64 = 1_000;
+    const BUSY_AFTER_DRAIN_MS: u64 = 2_000;
+    const DRAIN_BUDGET_MS: u64 = 30_000;
+    let busy_after_drain = BUSY_AFTER_DRAIN_MS.to_string();
+    let (_temp_dir, mut daemon, events_path) = start_drain_harness(
+        "subc-client-rs-drain-slow-cadence-held",
+        &[("SUBC_MODULE_ECHO_BUSY_AFTER_DRAIN_MS", &busy_after_drain)],
+        json!({ "health": slow_cadence_health() }),
+    )
+    .await;
+    let drained_pid = first_module_pid(&events_path).await;
+
+    let consumer = Arc::new(
+        SubcConsumer::connect(&daemon.connection_file, fast_consumer_options())
+            .await
+            .unwrap(),
+    );
+    let mut control = consumer.control_pushes(8);
+    let held = {
+        let consumer = Arc::clone(&consumer);
+        tokio::spawn(async move {
+            consumer
+                .call(
+                    tool_target(DRAIN_MODULE_ID),
+                    consumer_identity("drain-slow-cadence-held"),
+                    json!({ "kind": "sleep", "ms": HELD_CALL_MS })
+                        .to_string()
+                        .into_bytes(),
+                    CallOptions {
+                        timeout: Duration::from_secs(30),
+                        ..fast_call_options()
+                    },
+                )
+                .await
+        })
+    };
+    wait_for_drain_event(
+        &events_path,
+        EVENT_TIMEOUT,
+        |event| event["pid"].as_u64() == Some(drained_pid) && event["kind"] == "sleep_started",
+        &[],
+    )
+    .await;
+
+    restart_drain_module_with_timeout(&daemon.connection_file, Some(DRAIN_BUDGET_MS)).await;
+    let reply = timeout(Duration::from_millis(DRAIN_BUDGET_MS), held)
+        .await
+        .expect("the held call must finish")
+        .unwrap()
+        .expect("the held call must be answered by the draining process");
+    assert_eq!(json_body(&reply)["ok"], true, "{}", json_body(&reply));
+
+    let mut received_pushes = Vec::new();
+    wait_for_drain_event(
+        &events_path,
+        Duration::from_millis(DRAIN_BUDGET_MS) + EVENT_TIMEOUT,
+        |event| event["pid"].as_u64() == Some(drained_pid) && event["kind"] == "connection_end",
+        &received_pushes,
+    )
+    .await;
+    assert_gauge_ended_the_drain(
+        &events_of(&events_path, drained_pid),
+        BUSY_AFTER_DRAIN_MS,
+        DRAIN_BUDGET_MS,
+    );
+
+    let closed = timeout(EVENT_TIMEOUT, async {
+        loop {
+            let push = control
+                .recv()
+                .await
+                .expect("control push receiver should remain open");
+            received_pushes.push(push.clone());
+            if push.op == "route.closed" {
+                return push;
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "timed out waiting for control push `route.closed` within {EVENT_TIMEOUT:?}\n{}",
+            drain_timeout_diagnostics(&events_path, &received_pushes)
+        )
+    });
+    assert!(
+        received_pushes
+            .iter()
+            .any(|push| push.op == "route.closing"),
+        "the held route must be told the drain began: {received_pushes:?}"
+    );
+    assert_eq!(closed.body["reason"], "restart", "{:?}", closed.body);
+    assert_eq!(closed.body["drained"], true, "{:?}", closed.body);
     daemon.kill_and_wait();
 }
 

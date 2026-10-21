@@ -15,6 +15,8 @@ use subc_client_rs::{
 use subc_protocol::manifest::ModuleManifest;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
+mod common;
+
 const AT: u64 = 1_704_067_200_000;
 
 struct Fixture {
@@ -109,6 +111,7 @@ impl Fixture {
 
     fn ck_command(&self) -> Command {
         let mut command = dev_command(ckdev_binary(env!("CARGO_BIN_EXE_ck-under-test")));
+        common::kit::isolate_client(&mut command, &self.root.join("client"));
         command
             .arg("--subc")
             .arg(self.connection())

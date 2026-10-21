@@ -1,0 +1,6 @@
+$ ck --subc <connection file> daemon
+exit: Some(0)
+--- stdout ---
+daemon 0.36.25 · pid <pids> · up <uptimes> · <client_counts> clients · no frame drops in the last 10 minutes
+machine id: <machine_ids>
+--- stderr ---

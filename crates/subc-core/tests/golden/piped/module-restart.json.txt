@@ -1,0 +1,34 @@
+$ ck --subc <connection file> --json module restart pin-alpha
+exit: Some(0)
+--- stdout ---
+{
+  "applied": true,
+  "daemon": "<kit_temp_paths>/daemon/runtime/subc-connection.json",
+  "module": {
+    "drain_timeout_ms": 30000,
+    "enabled": true,
+    "health": "<restart_snapshot>",
+    "last_exit_code": 0,
+    "last_exit_kind": "clean",
+    "last_exit_ms": "<timestamps>",
+    "last_probe_ms": "<timestamps>",
+    "launch_nonce_env": false,
+    "lifetime_restarts": 0,
+    "live": "<restart_snapshot>",
+    "max_restarts": 3,
+    "module_id": "pin-alpha",
+    "pending_reload": "<restart_snapshot>",
+    "protocol": "subc",
+    "resources": "<restart_snapshot>",
+    "restart_backoff_ms": 100,
+    "restart_count": 0,
+    "restart_max_backoff_ms": 30000,
+    "restart_window_secs": 600,
+    "spawn_generation": "<restart_snapshot>",
+    "state": "<restart_snapshot>"
+  },
+  "module_id": "pin-alpha",
+  "op": "supervisor.ack",
+  "state": "<restart_snapshot>"
+}
+--- stderr ---

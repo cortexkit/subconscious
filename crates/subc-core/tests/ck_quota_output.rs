@@ -47,7 +47,9 @@ impl Daemon {
     }
 
     fn ck(&self, args: &[&str]) -> String {
-        let out = dev_command(common::ckdev_ck())
+        let mut command = dev_command(common::ckdev_ck());
+        common::kit::isolate_client(&mut command, &self.root.join("client"));
+        let out = command
             .arg("--subc")
             .arg(self.connection())
             .args(args)
@@ -159,7 +161,9 @@ fn boot() -> Daemon {
     loop {
         assert!(Instant::now() < deadline, "insula never registered");
         if daemon.connection().exists() {
-            let out = dev_command(common::ckdev_ck())
+            let mut command = dev_command(common::ckdev_ck());
+            common::kit::isolate_client(&mut command, &daemon.root.join("client"));
+            let out = command
                 .arg("--subc")
                 .arg(daemon.connection())
                 .args(["module", "status", "insula", "--json"])

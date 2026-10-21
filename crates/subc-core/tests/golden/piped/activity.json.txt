@@ -1,0 +1,67 @@
+$ ck --subc <connection file> --json activity
+exit: Some(0)
+--- stdout ---
+[
+  {
+    "actor": {
+      "principal": {
+        "kind": "direct"
+      }
+    },
+    "at_ms": "<timestamps>",
+    "daemon_incarnation": "<incarnation_ids>",
+    "details": {},
+    "kind": "subc.module_restarted",
+    "module": "subc",
+    "seq": 3,
+    "subject": {
+      "id": "pin-alpha",
+      "type": "module"
+    },
+    "summary": "module restarted"
+  },
+  {
+    "actor": {
+      "principal": {
+        "kind": "direct"
+      }
+    },
+    "at_ms": "<timestamps>",
+    "daemon_incarnation": "<incarnation_ids>",
+    "details": {},
+    "kind": "subc.module_restarted",
+    "module": "subc",
+    "seq": 2,
+    "subject": {
+      "id": "pin-alpha",
+      "type": "module"
+    },
+    "summary": "module restarted"
+  },
+  {
+    "actor": {
+      "principal": {
+        "kind": "reserved",
+        "module_id": "subc"
+      }
+    },
+    "at_ms": "<timestamps>",
+    "daemon_incarnation": "<incarnation_ids>",
+    "details": {
+      "new_evidence": {
+        "digest": "<build_ids>",
+        "method": "linux_proc_sha256"
+      },
+      "old_evidence": null
+    },
+    "kind": "subc.module_started",
+    "module": "subc",
+    "seq": 1,
+    "subject": {
+      "id": "pin-alpha",
+      "type": "module"
+    },
+    "summary": "module started"
+  }
+]
+--- stderr ---

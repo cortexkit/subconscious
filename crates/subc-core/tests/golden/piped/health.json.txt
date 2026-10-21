@@ -1,0 +1,27 @@
+$ ck --subc <connection file> --json health
+exit: Some(0)
+--- stdout ---
+{
+  "generation": 1,
+  "modules": [
+    {
+      "consecutive_failures": 0,
+      "detail": "3 runs in flight",
+      "last_action": null,
+      "last_action_ms": null,
+      "last_probe_ms": "<timestamps>",
+      "late_answer_count": 0,
+      "metrics": {
+        "headline": [
+          "runs_today"
+        ],
+        "queue": 2,
+        "runs_today": 12
+      },
+      "module_id": "pin-alpha",
+      "status": "ok"
+    }
+  ],
+  "op": "supervisor.health"
+}
+--- stderr ---

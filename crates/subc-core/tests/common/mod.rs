@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+pub mod kit;
 pub mod scripted_daemon;
 
 use cortexkit_test_support::{ckdev_binary, dev_command, ScratchDir};

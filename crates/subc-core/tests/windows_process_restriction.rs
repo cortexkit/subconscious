@@ -2,6 +2,8 @@
 
 use cortexkit_test_support::{ckdev_binary, dev_command, ScratchDir};
 use serde_json::{json, Value};
+
+mod common;
 use std::{
     fs::{self, File},
     path::{Path, PathBuf},
@@ -157,6 +159,7 @@ impl Daemon {
     fn ck(&self, args: &[&str]) -> Value {
         let mut command = dev_command(ckdev_binary(env!("CARGO_BIN_EXE_ck")));
         self.isolate(&mut command);
+        common::kit::isolate_client(&mut command, &self.root.join("client"));
         let output = command
             .arg("--subc")
             .arg(self.connection())

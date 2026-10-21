@@ -10,6 +10,8 @@ use std::{
 use cortexkit_test_support::{ckdev_binary, dev_command, ScratchDir};
 use serde_json::{json, Value};
 
+mod common;
+
 /// At most two of this file's daemons run at once.
 ///
 /// Each test here spawns a REAL `ck-subc`, and the file has seven. The harness
@@ -149,7 +151,9 @@ impl Fixture {
 
 /// Run `ck` against the daemon whose fixture root is `root`.
 fn try_ck_at(root: &Path, args: &[&str]) -> Option<String> {
-    let output = dev_command(ckdev_binary(env!("CARGO_BIN_EXE_ck")))
+    let mut command = dev_command(ckdev_binary(env!("CARGO_BIN_EXE_ck")));
+    common::kit::isolate_client(&mut command, &root.join("client"));
+    let output = command
         .arg("--subc")
         .arg(
             root.join("runtime")

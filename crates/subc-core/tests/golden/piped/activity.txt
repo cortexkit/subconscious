@@ -1,0 +1,8 @@
+$ ck --subc <connection file> activity
+exit: Some(0)
+--- stdout ---
+time (UTC)               module  actor          summary         
+<timestamps>  subc    direct         module restarted
+<timestamps>  subc    direct         module restarted
+<timestamps>  subc    reserved:subc  module started  
+--- stderr ---

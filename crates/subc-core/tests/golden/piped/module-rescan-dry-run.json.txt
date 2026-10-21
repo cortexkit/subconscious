@@ -1,0 +1,12 @@
+$ ck --subc <connection file> --json module rescan --dry-run
+exit: Some(0)
+--- stdout ---
+{
+  "added": [],
+  "changed_pending_reload": [],
+  "op": "supervisor.rescan",
+  "preview": true,
+  "removed": [],
+  "unchanged": 1
+}
+--- stderr ---

@@ -119,6 +119,7 @@ impl Home {
 
     fn ck(&self, args: &[&str]) -> Output {
         let mut command = common::ck_under_test_command();
+        common::kit::isolate_client(&mut command, &self.root.join("client"));
         self.isolate(&mut command)
             .arg("--subc")
             .arg(self.connection_file())

@@ -1,0 +1,5 @@
+$ ck --subc <connection file> module rescan --dry-run
+exit: Some(0)
+--- stdout ---
+no changes: 1 modules match subc.jsonc
+--- stderr ---

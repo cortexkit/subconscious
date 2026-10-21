@@ -2,6 +2,9 @@
 // Keep each test's name visible (ignored) on other systems.
 
 #[cfg(target_os = "macos")]
+mod common;
+
+#[cfg(target_os = "macos")]
 mod macos {
     use cortexkit_test_support::{ckdev_binary, dev_command, ScratchDir};
     use serde_json::{json, Value};
@@ -117,7 +120,9 @@ mod macos {
         }
 
         pub fn ck(&self, args: &[&str]) -> std::process::Output {
-            dev_command(ckdev_binary(env!("CARGO_BIN_EXE_ck")))
+            let mut command = dev_command(ckdev_binary(env!("CARGO_BIN_EXE_ck")));
+            super::common::kit::isolate_client(&mut command, &self.root.join("client"));
+            command
                 .arg("--subc")
                 .arg(
                     self.root

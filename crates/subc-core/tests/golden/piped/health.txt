@@ -1,0 +1,5 @@
+$ ck --subc <connection file> health
+exit: Some(0)
+--- stdout ---
+pin-alpha  ok  3 runs in flight
+--- stderr ---

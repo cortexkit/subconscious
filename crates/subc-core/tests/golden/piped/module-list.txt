@@ -1,0 +1,6 @@
+$ ck --subc <connection file> module list
+exit: Some(0)
+--- stdout ---
+module     status   health  reload 
+pin-alpha  running  ok      nothing
+--- stderr ---

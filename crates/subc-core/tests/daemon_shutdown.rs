@@ -108,7 +108,9 @@ impl Fixture {
                 "daemon exited during startup"
             );
             if fixture.connection().exists() {
-                let output = dev_command(common::ckdev_ck())
+                let mut command = dev_command(common::ckdev_ck());
+                common::kit::isolate_client(&mut command, &fixture.root.join("client"));
+                let output = command
                     .arg("--subc")
                     .arg(fixture.connection())
                     .args(["module", "status", "shutdown-observer", "--json"])

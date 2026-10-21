@@ -128,8 +128,8 @@ pub enum QuotaDisconnectKind {
     Inert,
     /// A person can fix this — usually by logging in again.
     UserFixable,
-    /// The quota module itself failed. Real, worth surfacing, and NOT the
-    /// reader's to fix.
+    /// The quota module itself failed. Surface it as a module problem; there
+    /// is nothing the user can do about it, such as logging in again.
     ModuleDefect,
 }
 
@@ -406,8 +406,10 @@ pub struct SpendPool {
     pub expires_at: Option<String>,
 }
 
-/// An entry's spend pools that state an amount, read as
-/// [`quota_spend_lines_for_entry`] reads them.
+/// The pools in an entry's `spend` array that state a remaining or total
+/// amount, with their amounts parsed the same way
+/// [`quota_spend_lines_for_entry`] parses them. Pools that state neither are
+/// left out.
 pub fn spend_pools(entry: &Value) -> Vec<SpendPool> {
     let Some(pools) = entry.get("spend").and_then(Value::as_array) else {
         return Vec::new();

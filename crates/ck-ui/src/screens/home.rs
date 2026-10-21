@@ -829,7 +829,9 @@ fn draw_regular(c: &mut Canvas, v: &View) {
     }
     backups(c, v, cx, 17 + dy, cw);
     devices(c, v, cx, 20 + dy, cx + cw);
-    // Approvals show only once something can say how many are waiting.
+    // The Approvals row appears only when the snapshot has a source for the
+    // number of waiting approvals (`serves.approvals`); the live app has none
+    // yet, so the row stays hidden rather than showing a guess.
     if snap.serves.approvals {
         let (appr, appr_st) = approvals_text(v);
         fact_row(
@@ -1102,7 +1104,9 @@ fn draw_large(c: &mut Canvas, v: &View) {
     }
     backups(c, v, cx, 16 + dy, cw);
     devices(c, v, cx, 18 + dy, cx + cw);
-    // Approvals show only once something can say how many are waiting.
+    // The Approvals row appears only when the snapshot has a source for the
+    // number of waiting approvals (`serves.approvals`); the live app has none
+    // yet, so the row stays hidden rather than showing a guess.
     if snap.serves.approvals {
         let (appr, appr_st) = approvals_text(v);
         fact_row(

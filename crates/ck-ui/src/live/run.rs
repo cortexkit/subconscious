@@ -561,7 +561,9 @@ fn sources(shared: &Arc<Shared>, conn: &Conn) -> Vec<JoinHandle<()>> {
             }
         }));
     }
-    // Each module's retained exits, for the starts and exits list.
+    // Polls each module's recent process exits, as the daemon's terminal
+    // journal retains them, for the "Starts and exits" list on the
+    // Modules screen.
     {
         let sh = Arc::clone(shared);
         let c = conn.clone();

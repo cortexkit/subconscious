@@ -167,8 +167,8 @@ impl SubcConsumer {
         }
     }
 
-    /// The live routes each module serves (`supervisor.routes`), for every
-    /// module or only `module_id`.
+    /// The live routes each module serves (`supervisor.routes`): every
+    /// module's when `module_id` is `None`, otherwise only that module's.
     pub async fn supervisor_routes(
         &self,
         module_id: Option<String>,
@@ -318,9 +318,10 @@ impl SubcConsumer {
         self.lifecycle(&request, "supervisor.restart").await
     }
 
-    /// Enable (start) or disable (stop) one module
-    /// (`supervisor.set_enabled`), the request `ck module start` and `ck
-    /// module stop` send. Sent once, never retried.
+    /// Sends `supervisor.set_enabled` for one module: `enabled: true` starts
+    /// it and `false` stops it, the same request `ck module start` and
+    /// `ck module stop` send. This method sends the request once and never
+    /// retries it.
     pub async fn supervisor_set_enabled(
         &self,
         module_id: impl Into<String>,

@@ -672,7 +672,10 @@ pub fn usage(reply: &Value, now: Timestamp) -> Result<Vec<Provider>, Fault> {
         if accounts.is_empty() {
             continue;
         }
-        // The window closest to its limit, by label.
+        // Pick the one usage window to show for this provider: the label
+        // whose windows are, on average across the provider's accounts, the
+        // most used (closest to 100% of their quota). A tie goes to the
+        // longer window.
         let mut labels: Vec<(&str, i64)> = Vec::new();
         for w in &all_windows {
             if !labels.iter().any(|(l, _)| *l == w.label) {

@@ -752,9 +752,11 @@ impl ck_ui::live::DaemonService for CkDaemonService {
         setup::data_directory().ok()
     }
 
-    /// The newest lines of the module's log, read and merged by `ck module
-    /// logs`' own functions from the same sources, then a follower that
-    /// reads only what is appended, as `ck module logs -f` does.
+    /// Opens a module's log for the app. Returns its newest `max` lines,
+    /// collected and merged from the same sources by the same functions
+    /// `ck module logs` uses, together with a follower positioned at the end
+    /// of every source, which later reads only what is appended, as
+    /// `ck module logs -f` does.
     fn open_module_log(
         &self,
         module_id: &str,

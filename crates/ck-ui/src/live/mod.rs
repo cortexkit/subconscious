@@ -361,8 +361,9 @@ pub struct State {
     /// selected module's, and any whose cached metrics are only the cache's
     /// size marker.
     pub probes: HashMap<String, Probe>,
-    /// Each module's retained exits, as exit rows for the starts and exits
-    /// list.
+    /// Each module's recent process exits, as the daemon's terminal journal
+    /// retains them. They become the exit rows in the "Starts and exits"
+    /// list on the Modules screen.
     pub terminals: HashMap<String, Vec<ProcessEvent>>,
     pub actions: HashMap<String, ModuleAction>,
     pub last_result: Option<ActionResult>,
@@ -460,8 +461,9 @@ impl State {
         }
     }
 
-    /// Modules whose cached metrics are only the cache's size marker and
-    /// that have had no direct probe, or none in [`TRUNCATED_PROBE_SECS`].
+    /// Modules whose cached health metrics were replaced by the cache's size
+    /// marker, and that are due a direct health probe: either they have never
+    /// had one, or the last one is at least [`TRUNCATED_PROBE_SECS`] old.
     pub fn truncated_due(&self, now: Timestamp) -> Vec<String> {
         self.health
             .value
@@ -565,8 +567,11 @@ impl State {
         !checked_since_start && self.roster.at.secs_since(process.spawned_at) < START_GRACE_SECS
     }
 
-    /// The module's lifecycle in a word, from the supervisor's state, unless
-    /// it is running and has had a health check (or can't have one).
+    /// A one-word lifecycle label ("Restarting", "Starting" and so on) taken
+    /// from the supervisor's state, for a module that isn't simply running.
+    /// A running module whose current process hasn't had a health check yet,
+    /// and started under [`START_GRACE_SECS`] ago, is labelled "Starting". A
+    /// running module past that point gets no label (`None`).
     fn lifecycle(&self, e: &SupervisorEntry) -> Option<String> {
         let word = match e.state.as_str() {
             "restarting" => "Restarting",
@@ -1066,10 +1071,11 @@ pub fn starts_and_exits(
 
 // ---- actions -------------------------------------------------------------------
 
-/// Where an action on `module` stands, from what the spawn feed, the roster
-/// and health have said since it began at `started`: its phase, and once
-/// the outcome is known, whether it went well and a line saying what
-/// actually happened (the new pid, the time to a healthy check).
+/// The progress of an action (restart, stop or start) on `module`, judged
+/// from what the spawn feed, the module roster and health checks have
+/// reported since the action began at `started`. Returns its phase and, once
+/// the outcome is known, whether it succeeded plus a line saying what
+/// happened, such as the new pid or the time until the first healthy check.
 pub fn action_progress(
     s: &State,
     kind: ActionKind,

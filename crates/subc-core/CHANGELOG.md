@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.20.112
+
+- Ship subc-daemon 0.36.20: `ck module restart` no longer silently does nothing when a module is already serving before its spawn generation is published; queued restarts still share a replacement created after their requests.
+
 ## 0.20.111
 
 - `ck` adds the daemon's `detail.retry_after_ms` to module operator-confirm backoff refusals as `· try again in N s`, rounded up to seconds. Refusals from older daemons keep the existing message.

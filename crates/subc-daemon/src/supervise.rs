@@ -358,6 +358,9 @@ struct SupervisedChild {
     stdout_pump: Option<JoinHandle<()>>,
     stderr_pump: Option<StderrPump>,
     stderr_ring: Arc<Mutex<StderrRing>>,
+    /// Conservative monotonic bound sampled before `command.spawn()`, not when
+    /// identity recording finishes or the spawn generation is published.
+    spawned_at: Instant,
     spawned_at_ms: u64,
     spawned_from: PathBuf,
     launch_spec_digest: LaunchSpecDigest,
@@ -3887,6 +3890,7 @@ impl SupervisedModule {
         drain_timeout_ms: Option<u64>,
         requester: Option<Principal>,
     ) -> Result<(), SuperviseError> {
+        let queued_at = Instant::now();
         let received_at_generation = lock_snapshot(&self.inner.snapshot)?.spawn_generation;
         let (reply_tx, reply_rx) = oneshot::channel();
         self.inner
@@ -3895,7 +3899,7 @@ impl SupervisedModule {
                 requester,
                 drain_timeout_ms,
                 received_at_generation,
-                queued_at: Instant::now(),
+                queued_at,
                 reply: reply_tx,
             })
             .await
@@ -6970,11 +6974,16 @@ async fn handle_supervisor_command(
             // still supervised, the request is already satisfied. Not when the
             // configuration changed since that spawn: then the newer process
             // predates the spec this restart may exist to apply.
-            let satisfied_by_generation = if initiated && child.is_some() {
+            // Generation publication can lag a child that is already serving
+            // while its identity is recorded. Only process creation after request
+            // receipt satisfies a restart, not publication after receipt.
+            let satisfied_by_generation = if initiated
+                && child
+                    .as_ref()
+                    .is_some_and(|child| child.spawned_at > queued_at)
+            {
                 lock_snapshot(snapshot).ok().and_then(|state| {
-                    (state.spawn_generation > received_at_generation
-                        && !state.configuration_updated_since_spawn)
-                        .then_some(state.spawn_generation)
+                    (!state.configuration_updated_since_spawn).then_some(state.spawn_generation)
                 })
             } else {
                 None
@@ -6982,6 +6991,9 @@ async fn handle_supervisor_command(
             let satisfied_by_pending = initiated
                 && child.is_none()
                 && lock_snapshot(snapshot).ok().is_some_and(|mut state| {
+                    // No child exists yet, so this replacement will necessarily
+                    // be created after the queued request, unlike a published
+                    // generation whose process may already have been serving.
                     let pending = state.respawn_pending && !state.configuration_updated_since_spawn;
                     if pending {
                         state.coalesced_restart_pending = true;
@@ -8413,6 +8425,10 @@ fn spawn_child_in_slot(
         })?;
         subc_jobobject::suspend_on_create_async(&mut command);
     }
+    // Timestamp before the spawn call: on Unix the child can serve before that
+    // call even returns. This conservative bound never labels an older child
+    // as a replacement for a request received during process creation.
+    let spawned_at = Instant::now();
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(source) => {
@@ -8666,6 +8682,7 @@ fn spawn_child_in_slot(
         stdout_pump,
         stderr_pump,
         stderr_ring: Arc::clone(ring),
+        spawned_at,
         spawned_at_ms,
         spawned_from,
         launch_spec_digest: LaunchSpecDigest::from_spec(spec),
@@ -13048,6 +13065,230 @@ mod terminal_history_tests {
 }
 
 #[cfg(all(test, unix))]
+mod restart_ordering_tests {
+    use super::*;
+    use std::io::Write;
+    use tokio::io::AsyncReadExt;
+
+    #[test]
+    #[ignore = "child process fixture"]
+    fn serving_child() {
+        let Ok(address_file) = std::env::var("RESTART_TEST_ADDRESS_FILE") else {
+            return;
+        };
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        std::fs::write(address_file, listener.local_addr().unwrap().to_string()).unwrap();
+        for stream in listener.incoming() {
+            writeln!(stream.unwrap(), "{}", std::process::id()).unwrap();
+        }
+    }
+
+    async fn restart_before_publication(requests: usize) {
+        let home = cortexkit_test_support::ScratchDir::new("restart-before-publication");
+        let address_file = home.path().join("address");
+        let spec = ModuleSpec {
+            module_id: "restart-serving-child".into(),
+            program: std::env::current_exe().unwrap(),
+            args: vec![
+                "--exact".into(),
+                "supervise::restart_ordering_tests::serving_child".into(),
+                "--ignored".into(),
+                "--nocapture".into(),
+            ],
+            env: vec![(
+                "RESTART_TEST_ADDRESS_FILE".into(),
+                address_file.display().to_string(),
+            )],
+            reserved: false,
+            reserved_prefixes: vec![],
+            protocol: ModuleProtocol::None,
+            overlap: Default::default(),
+        };
+        let mut supervisor =
+            Supervisor::new_for_test(Arc::new(Registry::default()), RestartPolicy::default());
+        let (spawned_tx, spawned_rx) = oneshot::channel();
+        let spawned_tx = Mutex::new(Some(spawned_tx));
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        // Hold publication, not the child: it must answer a real request before
+        // the restart enters the queue, even though status still has generation 0.
+        supervisor.test_after_first_spawn = AfterFirstSpawnHook(Some(Arc::new(move |_| {
+            spawned_tx.lock().unwrap().take().unwrap().send(()).unwrap();
+            release_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(20))
+                .unwrap();
+        })));
+        let registered = supervisor
+            .register_configured_with_health(
+                spec.clone(),
+                true,
+                HealthConfig::default(),
+                None,
+                RestartPolicy::new(3, Duration::ZERO),
+            )
+            .unwrap();
+        let module = registered.module.clone();
+        let startup = tokio::task::spawn_blocking(move || {
+            supervisor.start_registered_configured(registered, None)
+        });
+        spawned_rx.await.unwrap();
+        let old_pid = tokio::time::timeout(Duration::from_secs(10), async {
+            let address = loop {
+                if let Ok(address) = std::fs::read_to_string(&address_file) {
+                    if !address.is_empty() {
+                        break address;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            };
+            let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+            let mut reply = String::new();
+            stream.read_to_string(&mut reply).await.unwrap();
+            reply.trim().parse::<u32>().unwrap()
+        })
+        .await
+        .expect("child must serve before generation publication");
+        assert_eq!(
+            lock_snapshot(&module.inner.snapshot)
+                .unwrap()
+                .spawn_generation,
+            0
+        );
+        let mut replies = Vec::new();
+        for _ in 0..requests {
+            let mut restart = Box::pin(module.restart(Some(0)));
+            // Poll the public API through queue admission, leaving only its ACK
+            // pending. The monitor cannot consume the command until released.
+            std::future::poll_fn(|cx| {
+                assert!(std::future::Future::poll(restart.as_mut(), cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            replies.push(restart);
+        }
+        release_tx.send(()).unwrap();
+        startup.await.unwrap().unwrap();
+        for reply in replies {
+            reply.await.unwrap();
+        }
+        // Restart schedules its replacement after completing the handler. Wait
+        // for that separate actor turn before placing the command barrier.
+        let replacement = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if lock_snapshot(&module.inner.snapshot)
+                    .unwrap()
+                    .spawn_generation
+                    > 1
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await;
+        // Commands are handled serially. The update-spec reply proves every
+        // restart handler has finished before we inspect the snapshot; restart's
+        // own ACK only acknowledges initiation, not replacement completion.
+        module.update_spec_for_test(spec).await.unwrap();
+        let (generation, pid) = {
+            let state = lock_snapshot(&module.inner.snapshot).unwrap();
+            (state.spawn_generation, state.pid)
+        };
+        module.stop().await.unwrap();
+        replacement.expect("restart must publish a replacement for the already-serving child");
+        assert_ne!(
+            pid,
+            Some(old_pid),
+            "a serving child predating the restart must be replaced"
+        );
+        assert_eq!(generation, 2, "queued restarts must share one replacement");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restart_received_after_serving_before_generation_publication_replaces_child() {
+        restart_before_publication(1).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restart_queued_behind_restart_does_not_kill_its_replacement() {
+        restart_before_publication(2).await;
+    }
+
+    #[tokio::test]
+    async fn restart_queued_before_replacement_spawn_keeps_the_new_child() {
+        let supervisor =
+            Supervisor::new_for_test(Arc::new(Registry::default()), RestartPolicy::default());
+        let registered = supervisor
+            .register_configured_with_health(
+                ModuleSpec {
+                    module_id: "queued-before-replacement".into(),
+                    program: "/bin/sh".into(),
+                    args: vec!["-c".into(), "exec sleep 600".into()],
+                    env: vec![],
+                    reserved: false,
+                    reserved_prefixes: vec![],
+                    protocol: ModuleProtocol::None,
+                    overlap: Default::default(),
+                },
+                true,
+                HealthConfig::default(),
+                None,
+                RestartPolicy::default(),
+            )
+            .unwrap();
+        let RegisteredConfiguredModule {
+            mut spec,
+            mut runtime,
+            module,
+            mut commands,
+        } = registered;
+        let snapshot = &module.inner.snapshot;
+        let mut restart = Box::pin(module.restart(Some(0)));
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(restart.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        // Drive the actor explicitly so a replacement is definitely spawned
+        // after receipt, but before this queued command is dequeued.
+        let mut child = Some(spawn_and_mark_running(&spec, &runtime, snapshot).unwrap());
+        let replacement_pid = child.as_ref().unwrap().id();
+        let command = commands.recv().await.unwrap();
+        assert!(
+            handle_supervisor_command(
+                command,
+                &mut spec,
+                &mut runtime,
+                &supervisor.registry,
+                &supervisor.process_liveness,
+                snapshot,
+                &mut child,
+                &mut commands,
+                &mut VecDeque::new(),
+            )
+            .await
+        );
+        restart.await.unwrap();
+        let kept_pid = child.as_ref().and_then(SupervisedChild::id);
+        let pending = lock_snapshot(snapshot).unwrap().respawn_pending;
+        if let Some(mut child) = child {
+            child.start_kill().unwrap();
+            child.wait().await.unwrap();
+        }
+        assert_eq!(
+            kept_pid, replacement_pid,
+            "a newer replacement must survive"
+        );
+        assert!(
+            !pending,
+            "a satisfied restart must not schedule another spawn"
+        );
+    }
+}
+
+#[cfg(all(test, unix))]
 mod health_event_tests {
     use super::*;
     use cortexkit_test_support::ScratchDir;
@@ -14749,6 +14990,7 @@ mod cgroup_placement_tests {
             stdout_pump: None,
             stderr_pump: None,
             stderr_ring: Arc::new(Mutex::new(StderrRing::new(StderrTailConfig::default()))),
+            spawned_at: tokio::time::Instant::now(),
             spawned_at_ms: 0,
             spawned_from: PathBuf::from("true"),
             launch_spec_digest: LaunchSpecDigest([0; 32]),

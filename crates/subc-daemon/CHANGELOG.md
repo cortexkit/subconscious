@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.36.20
+
+- Do not drop `supervisor.restart` requests received after a child starts serving but before its spawn generation is published. Coalesce requests only into a child created after the request, or a replacement still waiting to spawn, preserving protection against back-to-back restarts killing the same fresh replacement.
+
 ## 0.36.19
 
 - Module `operator.confirm` refusals caused by the 30-second `(module, principal)` decline backoff include `detail.retry_after_ms`, rounded up to the remaining cooldown. Other refusal details are unchanged.

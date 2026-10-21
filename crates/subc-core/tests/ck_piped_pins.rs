@@ -55,13 +55,19 @@ const COMMANDS: &[(&str, &[&str])] = &[
     ("activity.json", &["--json", "activity"]),
 ];
 
-/// One module with health and metrics.
+/// One module with health and metrics. After the daemon ends its
+/// connection, its process keeps running until the test lets it go
+/// (`Kit::release_exit`). `ck module restart` reads the roster right after
+/// the daemon acknowledges the restart, so it always finds the module
+/// draining with the old process still running, instead of racing that
+/// process's exit and the replacement's start.
 fn module_entry() -> Value {
     json!({
         "program": env!("CARGO_BIN_EXE_fake-aft-stub"),
         "health": { "cadence_ms": 500 },
         "env": {
             "FAKE_AFT_MODULE_ID": MODULE,
+            "FAKE_AFT_HOLD_EXIT_PATH": true,
             "FAKE_AFT_ADVERTISE_HEALTH": "1",
             "FAKE_AFT_HEALTH_STATUS": "ok",
             "FAKE_AFT_HEALTH_DETAIL": "3 runs in flight",
@@ -116,45 +122,65 @@ fn no_crash(kit: &Kit) -> Result<(), String> {
     if status["module"]["lifetime_restarts"] == 0 {
         return Ok(());
     }
-    let stderr = kit.ck(&["module", "stderr", MODULE]);
-    Err(format!(
-        "the module crashed: {}\n{}",
-        status["module"],
-        String::from_utf8_lossy(&stderr.stdout)
-    ))
+    Err("the module exited without being asked to".to_string())
+}
+
+/// What the kit knows about the module, for a failure message: its status,
+/// its retained stderr, its exits and its captured log lines.
+fn diagnostics(kit: &Kit) -> String {
+    let mut text = String::new();
+    for args in [
+        &["--json", "module", "status", MODULE][..],
+        &["module", "stderr", MODULE],
+        &["module", "terminals", MODULE],
+        &["module", "logs", MODULE, "-n", "80"],
+    ] {
+        let output = kit.ck(args);
+        text += &format!(
+            "--- ck {} ---\n{}{}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    text + "--- daemon log ---\n" + &kit.daemon_log()
 }
 
 /// Waits for the module and its health, then runs the commands in order,
 /// waiting before each one for the state the commands before it leave: a
-/// live new process after a restart, and every ledger entry before
+/// live, healthy new process after a restart, and every ledger entry before
 /// `activity`.
 fn take(kit: &Kit) -> Result<Taken, String> {
     wait_live(kit, 1)?;
-    kit.poll_json("health recorded", &["--json", "health"], |health| {
-        health["modules"][0]["status"] == "ok"
-    })?;
+    wait_health(kit)?;
     no_crash(kit)?;
     let mut runs = Vec::new();
+    let mut generation = 1;
     for &(pin, args) in COMMANDS {
-        match pin {
-            "module-restart" | "module-restart.json" => kit.assert_answering(),
-            // The ledger holds the start and both restarts once the second
-            // restart's entry lands.
-            "activity" => {
-                wait_live(kit, 3)?;
-                kit.poll_json("three ledger entries", &["--json", "activity"], |entries| {
-                    entries.as_array().is_some_and(|entries| entries.len() == 3)
-                })?;
-            }
-            _ => {}
+        let restart = matches!(pin, "module-restart" | "module-restart.json");
+        if restart {
+            kit.assert_answering();
+        }
+        // The ledger holds the start and both restarts once the second
+        // restart's entry lands.
+        if pin == "activity" {
+            kit.poll_json("three ledger entries", &["--json", "activity"], |entries| {
+                entries.as_array().is_some_and(|entries| entries.len() == 3)
+            })?;
         }
         runs.push(Run {
             pin,
             args,
             output: kit.ck(args),
         });
-        if pin == "module-restart" {
-            wait_live(kit, 2)?;
+        // The old process is held until ck has printed what it read, then let
+        // go; the next one must be live and healthy before the next command.
+        if restart {
+            kit.release_exit(MODULE);
+            generation += 1;
+            wait_live(kit, generation)?;
+            kit.hold_exit(MODULE);
+            wait_health(kit)?;
         }
     }
     no_crash(kit)?;
@@ -164,21 +190,19 @@ fn take(kit: &Kit) -> Result<Taken, String> {
     })
 }
 
-/// Takes the pinned outputs from a fresh kit. On a busy machine the test
-/// module can crash, and a crash shows in every later output; that kit is
-/// discarded and the outputs are taken again from a new one.
+/// Waits until the daemon has recorded the module's health as `ok`.
+fn wait_health(kit: &Kit) -> Result<(), String> {
+    kit.poll_json("health recorded", &["--json", "health"], |health| {
+        health["modules"][0]["status"] == "ok"
+    })
+    .map(drop)
+}
+
+/// Takes the pinned outputs from a fresh kit, failing with the module's
+/// status and stderr if its process exited without being asked to.
 fn take_fresh() -> Taken {
-    let mut failures = Vec::new();
-    for _ in 0..3 {
-        match take(&boot()) {
-            Ok(taken) => return taken,
-            Err(error) => {
-                eprintln!("discarding a kit: {error}");
-                failures.push(error);
-            }
-        }
-    }
-    panic!("three fresh kits failed: {failures:#?}");
+    let kit = boot();
+    take(&kit).unwrap_or_else(|error| panic!("{error}\n{}", diagnostics(&kit)))
 }
 
 // ---------------------------------------------------------------------------
@@ -299,26 +323,6 @@ const RULES: &[Rule] = &[
         json_kind: Value::is_array,
         pins: &[],
     },
-    // What the module looks like at the moment the daemon acknowledges a
-    // restart. The daemon answers before the restart finishes, so the state
-    // it reports next is `restarting` or `draining` (or `running` once the
-    // new process is up), and whether the old process still runs, and so
-    // whether its health, readings and running image can be read, depends on
-    // timing.
-    Rule {
-        name: "restart_snapshot",
-        text: |text, _| mask_restart_state(text),
-        json_keys: &[
-            "state",
-            "live",
-            "health",
-            "resources",
-            "pending_reload",
-            "spawn_generation",
-        ],
-        json_kind: any,
-        pins: &["module-restart", "module-restart.json"],
-    },
 ];
 
 /// Replaces the text between each `before` and the next `after` on the same
@@ -363,26 +367,6 @@ fn mask_clients(text: &str) -> String {
                 })
                 .collect::<Vec<_>>()
                 .join(" · ")
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// The state cell of plain `ck module restart`'s one-row table. The header
-/// line's trailing padding follows the state's width, so it is trimmed too.
-fn mask_restart_state(text: &str) -> String {
-    text.split('\n')
-        .map(|line| {
-            if line.starts_with("module ") && line.contains(" state") {
-                line.trim_end().to_string()
-            } else if line.starts_with(&format!("{MODULE} ")) {
-                match line.trim_end().rsplit_once(' ') {
-                    Some((row, _state)) => format!("{row} <restart_snapshot>"),
-                    None => line.to_string(),
-                }
-            } else {
-                line.to_string()
-            }
         })
         .collect::<Vec<_>>()
         .join("\n")

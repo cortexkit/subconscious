@@ -7,28 +7,49 @@ exit: Some(0)
   "module": {
     "drain_timeout_ms": 30000,
     "enabled": true,
-    "health": "<restart_snapshot>",
+    "health": "ok",
     "last_exit_code": 0,
     "last_exit_kind": "clean",
     "last_exit_ms": "<timestamps>",
     "last_probe_ms": "<timestamps>",
     "launch_nonce_env": false,
     "lifetime_restarts": 0,
-    "live": "<restart_snapshot>",
+    "live": false,
     "max_restarts": 3,
     "module_id": "pin-alpha",
-    "pending_reload": "<restart_snapshot>",
+    "pending_reload": {
+      "image": {
+        "evidence": {
+          "digest": "<build_ids>",
+          "method": "linux_proc_sha256"
+        },
+        "status": "match"
+      },
+      "path": {
+        "status": "match"
+      },
+      "spec": {
+        "status": "match"
+      }
+    },
     "protocol": "subc",
-    "resources": "<restart_snapshot>",
+    "resources": {
+      "cpu_system_ms": "<resource_counters>",
+      "cpu_user_ms": "<resource_counters>",
+      "memory_bytes": "<resource_counters>",
+      "memory_kind": "resident_set",
+      "status": "measured",
+      "swap_bytes": "<resource_counters>"
+    },
     "restart_backoff_ms": 100,
     "restart_count": 0,
     "restart_max_backoff_ms": 30000,
     "restart_window_secs": 600,
-    "spawn_generation": "<restart_snapshot>",
-    "state": "<restart_snapshot>"
+    "spawn_generation": 2,
+    "state": "draining"
   },
   "module_id": "pin-alpha",
   "op": "supervisor.ack",
-  "state": "<restart_snapshot>"
+  "state": "draining"
 }
 --- stderr ---

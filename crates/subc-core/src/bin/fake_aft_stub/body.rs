@@ -68,6 +68,11 @@ const FAKE_AFT_EVENTS_PATH_ENV: &str = "FAKE_AFT_EVENTS_PATH";
 const FAKE_AFT_READY_FALSE_ENV: &str = "FAKE_AFT_READY_FALSE";
 /// When this path appears, send `catalog.update { ready: true }`.
 const FAKE_AFT_READY_UPDATE_PATH_ENV: &str = "FAKE_AFT_READY_UPDATE_PATH";
+/// When set, the stub keeps its process running after the daemon ends its
+/// connection (GOODBYE or EOF) until a file exists at this path. A test can
+/// then read the module while the daemon is still waiting for the old
+/// process to exit during a drain, and decide when the process goes.
+const FAKE_AFT_HOLD_EXIT_PATH_ENV: &str = "FAKE_AFT_HOLD_EXIT_PATH";
 const FAKE_AFT_EMIT_AFTER_DETACH_ENV: &str = "FAKE_AFT_EMIT_AFTER_DETACH";
 const FAKE_AFT_PUSH_ON_REQUEST_ENV: &str = "FAKE_AFT_PUSH_ON_REQUEST";
 const FAKE_AFT_FANOUT_ON_REQUEST_ENV: &str = "FAKE_AFT_FANOUT_ON_REQUEST";
@@ -792,8 +797,19 @@ where
     loop {
         let frame = read_frame(read_half).await?;
         if !handle_frame(frame, &config, &mut state, &writer).await? {
+            hold_exit_until_released().await;
             return Ok(());
         }
+    }
+}
+
+/// See [`FAKE_AFT_HOLD_EXIT_PATH_ENV`].
+async fn hold_exit_until_released() {
+    let Some(path) = env::var_os(FAKE_AFT_HOLD_EXIT_PATH_ENV).map(PathBuf::from) else {
+        return;
+    };
+    while !path.exists() {
+        sleep(Duration::from_millis(10)).await;
     }
 }
 

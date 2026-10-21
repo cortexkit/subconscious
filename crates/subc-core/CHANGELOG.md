@@ -4,7 +4,8 @@
 
 - `ck daemon` (plain and `--json`) leaves `config_path` out of what it prints of the daemon's `server.describe` reply, so a daemon that starts reporting the configuration file it reads does not change `ck daemon`'s output. Today's daemons don't send the field; the output is unchanged.
 - Tests pin what piped `ck health`, `ck module list`, `ck module restart`, `ck module rescan --dry-run`, `ck activity` and `ck daemon` print (stdout, stderr and exit code, plain and `--json`) against two fresh private daemons, masking only the values that differ between them by named rules.
-- Test harnesses that run `ck` against a private daemon now give it its own HOME and temp directory as well as its own XDG folders. Connection-file discovery's home rung (`~/.local/share/cortexkit/run/subc-connection.json`) ignores `XDG_DATA_HOME`, so a `ck` with only private XDG folders could reach the operator's daemon; a test on every platform proves the kit's `ck` looks nowhere else.
+- The `fake-aft-stub` test module gains `FAKE_AFT_HOLD_EXIT_PATH`: after the daemon ends its connection, the process keeps running until that file exists, so a test can read a module mid-drain deterministically.
+- Test harnesses that run `ck` against a private daemon, and every `ck_cli` test, now give it its own HOME and temp directory as well as its own XDG folders, kept on disk while the command runs. Connection-file discovery's home rung (`~/.local/share/cortexkit/run/subc-connection.json`) ignores `XDG_DATA_HOME`, so a `ck` with only private XDG folders could reach the operator's daemon; a test on every platform proves the kit's `ck` looks nowhere else.
 
 ## 0.20.115
 

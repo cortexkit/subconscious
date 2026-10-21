@@ -1,8 +1,8 @@
 $ ck --subc <connection file> module restart pin-alpha
 exit: Some(0)
 --- stdout ---
-module     applied  state
-pin-alpha  true     <restart_snapshot>
+module     applied  state   
+pin-alpha  true     draining
 daemon: <kit_temp_paths>/daemon/runtime/subc-connection.json
 restart initiated; verify: ck module status pin-alpha
 --- stderr ---

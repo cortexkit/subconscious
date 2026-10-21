@@ -4716,7 +4716,8 @@ fn direct_ck_command() -> Command {
 }
 
 fn isolate_ck_command(command: &mut Command) {
-    let home = unique_temp_dir("ck-home");
+    let home = kept_temp_dir("ck-home");
+    let temp = kept_temp_dir("ck-tmp");
     // Every CLI test gets an isolated update cache and a closed local endpoint.
     // This proves dashboard output without reaching public release infrastructure.
     // Domain discovery checks the managed bin directory and then PATH, so a
@@ -4727,20 +4728,40 @@ fn isolate_ck_command(command: &mut Command) {
     // which wedges that test in `accept()` rather than failing it), while the
     // user-level directories that hold installed `ck-*` binaries are absent.
     // A test that wants a domain builds one in its own directory and prepends it.
+    // The temp directory is ck's own too: connection-file discovery's last
+    // candidate lives there, and it must not name the operator's daemon.
     command
-        .env("HOME", home.path())
-        .env("USERPROFILE", home.path())
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("TMPDIR", &temp)
+        .env("TEMP", &temp)
+        .env("TMP", &temp)
         .env(
             "CK_UPDATE_CACHE_PATH",
-            unique_temp_dir("ck-update-cache").join("update-metadata.json"),
+            kept_temp_dir("ck-update-cache").join("update-metadata.json"),
         )
-        .env("XDG_DATA_HOME", unique_temp_dir("ck-data-home").path())
-        .env("XDG_CONFIG_HOME", unique_temp_dir("ck-config-home").path())
-        .env("XDG_RUNTIME_DIR", unique_temp_dir("ck-runtime-dir").path())
-        .env("LOCALAPPDATA", unique_temp_dir("ck-local-app-data").path())
-        .env("CK_PROFILE_PATH", home.path().join(".profile"))
+        .env("XDG_DATA_HOME", kept_temp_dir("ck-data-home"))
+        .env("XDG_CONFIG_HOME", kept_temp_dir("ck-config-home"))
+        .env("XDG_RUNTIME_DIR", kept_temp_dir("ck-runtime-dir"))
+        .env("LOCALAPPDATA", kept_temp_dir("ck-local-app-data"))
+        .env("CK_PROFILE_PATH", home.join(".profile"))
         .env("CK_RELEASE_INDEX_URL", "http://127.0.0.1:0/index.json")
         .env("PATH", system_path_only());
+}
+
+/// A scratch folder that stays on disk until this test process exits.
+/// `isolate_ck_command` points a command at folders the command uses after
+/// the function returns, so their guards are kept here rather than dropped,
+/// which would delete the folders first. They live under this process's
+/// scratch root, which a later test run removes once this process is gone.
+fn kept_temp_dir(name: &str) -> PathBuf {
+    static KEPT: std::sync::Mutex<Vec<TempDir>> = std::sync::Mutex::new(Vec::new());
+    let dir = unique_temp_dir(name);
+    let path = dir.path().to_path_buf();
+    KEPT.lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(dir);
+    path
 }
 
 /// The platform's system tool directories and nothing else.

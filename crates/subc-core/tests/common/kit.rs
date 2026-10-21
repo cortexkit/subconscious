@@ -86,7 +86,10 @@ impl Kit {
     /// Starts the shipped daemon with `modules` (id, entry) as its
     /// `subc.jsonc` modules and waits for its connection file. Each entry's
     /// `env` gains `FAKE_AFT_PID_PATH`, so the kit can stop the module even
-    /// when the daemon is killed.
+    /// when the daemon is killed. An entry whose `env` has
+    /// `"FAKE_AFT_HOLD_EXIT_PATH": true` gets the kit's release path there:
+    /// that module's process stays running after the daemon lets it go until
+    /// [`Kit::release_exit`].
     pub fn boot(name: &str, modules: &[(&str, Value)]) -> Kit {
         let root = ScratchDir::new(name);
         let daemon = root.join("daemon");
@@ -98,6 +101,10 @@ impl Kit {
             let mut entry = entry.clone();
             entry["env"]["FAKE_AFT_PID_PATH"] =
                 Value::String(root.join(format!("{id}.pid")).display().to_string());
+            if entry["env"]["FAKE_AFT_HOLD_EXIT_PATH"] == true {
+                entry["env"]["FAKE_AFT_HOLD_EXIT_PATH"] =
+                    Value::String(release_path(root.path(), id).display().to_string());
+            }
             entries.insert((*id).to_string(), entry);
         }
         fs::write(
@@ -105,6 +112,7 @@ impl Kit {
             serde_json::to_vec(&serde_json::json!({ "version": 1, "modules": entries })).unwrap(),
         )
         .unwrap();
+        let log = fs::File::create(root.join("daemon.log")).unwrap();
         // The locations are set on the daemon's command only, so this test
         // process and every other test keep their own.
         let child = dev_command(super::ckdev_subc())
@@ -116,8 +124,8 @@ impl Kit {
             .env_remove("CK_LOG")
             .env_remove("SUBC_CONNECTION_FILE")
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stdout(Stdio::from(log.try_clone().unwrap()))
+            .stderr(Stdio::from(log))
             .spawn()
             .unwrap();
         let mut kit = Kit {
@@ -152,6 +160,17 @@ impl Kit {
         self.root
             .join("daemon/runtime")
             .join(subc_transport::CONNECTION_FILE_NAME)
+    }
+
+    /// Lets a module started with `FAKE_AFT_HOLD_EXIT_PATH` exit once the
+    /// daemon has ended its connection.
+    pub fn release_exit(&self, id: &str) {
+        fs::write(release_path(self.root.path(), id), b"").unwrap();
+    }
+
+    /// Makes the module's next process hold its exit again.
+    pub fn hold_exit(&self, id: &str) {
+        let _ = fs::remove_file(release_path(self.root.path(), id));
     }
 
     /// The daemon process the kit started.
@@ -204,6 +223,30 @@ impl Kit {
         );
     }
 
+    /// The daemon's own output and the log files in its run folder, for a
+    /// failure message.
+    pub fn daemon_log(&self) -> String {
+        let mut text = fs::read_to_string(self.root.join("daemon.log")).unwrap_or_default();
+        let mut directories = vec![self.root.join("daemon/data/cortexkit/run/logs")];
+        while let Some(directory) = directories.pop() {
+            let Ok(entries) = fs::read_dir(directory) else {
+                continue;
+            };
+            for entry in entries.filter_map(Result::ok) {
+                if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                    directories.push(entry.path());
+                } else {
+                    text += &format!(
+                        "\n{}:\n{}",
+                        entry.path().display(),
+                        fs::read_to_string(entry.path()).unwrap_or_default()
+                    );
+                }
+            }
+        }
+        text
+    }
+
     /// Waits until `ck <args>` succeeds and `ok` holds for its JSON stdout.
     pub fn wait_json(&self, what: &str, args: &[&str], ok: impl Fn(&Value) -> bool) -> Value {
         self.poll_json(what, args, ok)
@@ -237,6 +280,10 @@ impl Kit {
             thread::sleep(Duration::from_millis(50));
         }
     }
+}
+
+fn release_path(root: &Path, id: &str) -> PathBuf {
+    root.join(format!("{id}.release"))
 }
 
 impl Drop for Kit {

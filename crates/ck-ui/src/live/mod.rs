@@ -85,8 +85,9 @@ pub trait DaemonService: Send + Sync + 'static {
     /// Opens the module's log the way `ck module logs <id>` reads it (its
     /// own log files, the daemon's capture of its stderr, and the daemon's
     /// lines naming it): the newest `max` lines, and a follower for what is
-    /// appended after them. `None` when this program can't read the files,
-    /// and the app falls back to the stderr the daemon keeps in memory.
+    /// appended after them. `None` when this program has no file-log reader,
+    /// and the app falls back to the stderr the daemon keeps in memory; a
+    /// failed read is `Some(Err)` and shows as the log's error.
     fn open_module_log(&self, module_id: &str, max: usize) -> Option<Result<OpenedLog, String>> {
         let _ = (module_id, max);
         None

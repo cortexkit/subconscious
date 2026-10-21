@@ -2382,8 +2382,9 @@ async fn follow_module_logs(
 }
 
 /// Follows a module's active log files from where they end, the way `ck
-/// module logs -f` does: each poll reads only what was appended since the
-/// last, and when a file was rotated (it shrank, was recreated, or its first
+/// module logs -f` does: each poll reads what was appended since the last,
+/// plus each file's first few bytes to notice a rotation, and when a file
+/// was rotated (it shrank, was recreated, or its first
 /// bytes changed) drains the rotated file's unseen tail before starting the
 /// new one from its beginning. The app's log view follows with this too.
 struct LogFollower {
@@ -9298,7 +9299,8 @@ mod tests {
         assert!(tail[9].line.contains("line 49"), "{:?}", tail[9].line);
         assert!(tail[0].line.contains("line 40"), "{:?}", tail[0].line);
 
-        // Each tick reads only what was appended, and never a whole file.
+        // Each tick returns only what was appended, and never re-reads a whole
+        // file (it reads only a short prefix besides, to notice rotations).
         for tick in 0..5u32 {
             append(&log, &r1_line(50 + tick, &format!("tick {tick}")));
             let new = follower.poll().unwrap();

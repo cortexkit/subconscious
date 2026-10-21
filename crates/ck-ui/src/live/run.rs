@@ -461,8 +461,9 @@ fn sources(shared: &Arc<Shared>, conn: &Conn) -> Vec<JoinHandle<()>> {
         }));
     }
     // The log on screen. A module's log files are opened once (their newest
-    // lines) and then followed: each tick reads only what was appended since
-    // the last. A program that can't read the files falls back to the stderr
+    // lines) and then followed: each tick reads what was appended since the
+    // last (and a file's first bytes, to notice a rotation), never a whole
+    // file again. A program with no file-log reader falls back to the stderr
     // the daemon keeps in memory. Ticks every two seconds, and at once when
     // the app switches to another module's log.
     {

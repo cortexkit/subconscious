@@ -4729,7 +4729,7 @@ fn isolate_ck_command(command: &mut Command) {
     // user-level directories that hold installed `ck-*` binaries are absent.
     // A test that wants a domain builds one in its own directory and prepends it.
     // The temp directory is ck's own too: connection-file discovery's last
-    // candidate lives there, and it must not name the operator's daemon.
+    // candidate lives there, and it must not point to a daemon outside the test.
     command
         .env("HOME", &home)
         .env("USERPROFILE", &home)

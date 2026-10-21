@@ -70,8 +70,8 @@ const FAKE_AFT_READY_FALSE_ENV: &str = "FAKE_AFT_READY_FALSE";
 const FAKE_AFT_READY_UPDATE_PATH_ENV: &str = "FAKE_AFT_READY_UPDATE_PATH";
 /// When set, the stub keeps its process running after the daemon ends its
 /// connection (GOODBYE or EOF) until a file exists at this path. A test can
-/// then read the module while the daemon is still waiting for the old
-/// process to exit during a drain, and decide when the process goes.
+/// then inspect the daemon's module roster while the daemon waits for the
+/// old process to exit during a drain, and choose when to let it exit.
 const FAKE_AFT_HOLD_EXIT_PATH_ENV: &str = "FAKE_AFT_HOLD_EXIT_PATH";
 const FAKE_AFT_EMIT_AFTER_DETACH_ENV: &str = "FAKE_AFT_EMIT_AFTER_DETACH";
 const FAKE_AFT_PUSH_ON_REQUEST_ENV: &str = "FAKE_AFT_PUSH_ON_REQUEST";

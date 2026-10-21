@@ -17,9 +17,9 @@ use std::{
 use serde_json::{json, Value};
 use subc_client_rs::{
     async_trait, serve_with_handle, BindDecision, CallError, CallMode, CallOptions,
-    CatalogUpdateError, CloseRouteOptions, ConsumerIdentity, ConsumerOptions, HandlerOutcome,
-    ModuleHandle, ModuleHandler, OutcomeUnknownCause, PolicyResolveError, PolicyResolver,
-    PolicyResolverConfig, PolicyVerdict, ProjectRef, RequestCtx, RetryBackoff,
+    CatalogUpdateError, CloseRouteOptions, ConsumerIdentity, ConsumerOptions, ControlPush,
+    HandlerOutcome, ModuleHandle, ModuleHandler, OutcomeUnknownCause, PolicyResolveError,
+    PolicyResolver, PolicyResolverConfig, PolicyVerdict, ProjectRef, RequestCtx, RetryBackoff,
     ReverseRequestRegistrationError, ReverseRequestRegistry, RouteBindRequest,
     RouteCloseDisposition, RouteCloseReason, RouteEndReason, RouteHandle, ScopeCallError,
     ScopeDescribeReply, ScopeSelector, SubcConsumer, SubcModuleError, Subject, SubscribeOptions,
@@ -4757,6 +4757,128 @@ fn events_of(events_path: &Path, pid: u64) -> Vec<Value> {
         .collect()
 }
 
+fn drain_timeout_diagnostics(events_path: &Path, received_pushes: &[ControlPush]) -> String {
+    const MAX_DUMP_BYTES: usize = 8 * 1024;
+
+    let mut lines = Vec::new();
+    let logs_dir = events_path
+        .parent()
+        .expect("the drain event file is inside the test temp directory")
+        .join("data/cortexkit/run/logs");
+    let mut logs = fs::read_dir(&logs_dir)
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .map(|entry| {
+            let path = entry.path();
+            let modified = entry
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .ok();
+            (path, modified)
+        })
+        .filter(|(path, _)| {
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            name.starts_with("subc.") && name.ends_with(".log")
+        })
+        .collect::<Vec<_>>();
+    logs.sort_by_key(|entry| entry.1);
+    let mut matching_logs = 0;
+    for (path, _) in logs {
+        let Ok(contents) = fs::read_to_string(&path) else {
+            continue;
+        };
+        for line in contents.lines() {
+            let lower = line.to_ascii_lowercase();
+            if line.contains(DRAIN_MODULE_ID)
+                && [
+                    "restart",
+                    "drain",
+                    "health.check probe failed",
+                    "health threshold",
+                    "health-triggered restart",
+                    "noconnection",
+                    "route close",
+                    "route.clos",
+                ]
+                .iter()
+                .any(|needle| lower.contains(needle))
+            {
+                matching_logs += 1;
+                lines.push(format!("daemon log {}: {line}", path.display()));
+            }
+        }
+    }
+    if matching_logs == 0 {
+        lines.push(format!(
+            "no matching daemon log lines under {}",
+            logs_dir.display()
+        ));
+    }
+
+    let starts = read_events(events_path)
+        .into_iter()
+        .filter(|event| event["kind"] == "hello_ack")
+        .filter_map(|event| {
+            event["pid"]
+                .as_u64()
+                .map(|pid| format!("module start (hello_ack): pid={pid}, event={event}"))
+        })
+        .collect::<Vec<_>>();
+    if starts.is_empty() {
+        lines.push("module starts (hello_ack): none recorded".to_string());
+    } else {
+        lines.extend(starts);
+    }
+
+    if received_pushes.is_empty() {
+        lines.push("control pushes received: none".to_string());
+    } else {
+        lines.extend(
+            received_pushes
+                .iter()
+                .map(|push| format!("control push received: {push:?}")),
+        );
+    }
+
+    let mut dump = lines.join("\n");
+    while dump.len() > MAX_DUMP_BYTES {
+        if let Some(newline) = dump.find('\n') {
+            dump.drain(..=newline);
+        } else {
+            let mut start = dump.len() - MAX_DUMP_BYTES;
+            while !dump.is_char_boundary(start) {
+                start += 1;
+            }
+            dump.drain(..start);
+        }
+    }
+    dump
+}
+
+async fn wait_for_drain_event(
+    events_path: &Path,
+    wait: Duration,
+    predicate: impl Fn(&Value) -> bool,
+    received_pushes: &[ControlPush],
+) -> Value {
+    let deadline = Instant::now() + wait;
+    loop {
+        for event in read_events(events_path) {
+            if predicate(&event) {
+                return event;
+            }
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "timed out waiting for a drain event within {wait:?}\n{}",
+                drain_timeout_diagnostics(events_path, received_pushes)
+            );
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+}
+
 fn position_of(events: &[Value], what: &str, predicate: impl Fn(&Value) -> bool) -> usize {
     events
         .iter()
@@ -4789,9 +4911,12 @@ async fn supervisor_restart_calls_on_draining_with_restart_and_a_future_deadline
 
     let restart_sent_ms = unix_ms_now();
     restart_drain_module(&daemon.connection_file).await;
-    wait_for_event(&events_path, EVENT_TIMEOUT, |event| {
-        event["pid"].as_u64() == Some(drained_pid) && event["kind"] == "connection_end"
-    })
+    wait_for_drain_event(
+        &events_path,
+        EVENT_TIMEOUT,
+        |event| event["pid"].as_u64() == Some(drained_pid) && event["kind"] == "connection_end",
+        &[],
+    )
     .await;
 
     let events = events_of(&events_path, drained_pid);
@@ -4844,15 +4969,13 @@ async fn a_busy_gauge_released_after_on_draining_holds_the_restart_drain_until_i
     const BUSY_AFTER_DRAIN_MS: u64 = 1_500;
     const DRAIN_BUDGET_MS: u64 = 8_000;
     let busy_after_drain = BUSY_AFTER_DRAIN_MS.to_string();
+    // Drain probes use a fixed 250 ms interval, independent of periodic health
+    // settings, so the old 200 ms cadence cannot speed drain completion. Its
+    // 150 ms periodic deadline can cause health checks to time out under load.
     let (_temp_dir, mut daemon, events_path) = start_drain_harness(
         "subc-client-rs-drain-busy",
         &[("SUBC_MODULE_ECHO_BUSY_AFTER_DRAIN_MS", &busy_after_drain)],
-        json!({
-            "drain_timeout_ms": DRAIN_BUDGET_MS,
-            // The drain re-probes on the health cadence; keep it short so the
-            // wait ends soon after the gauge falls.
-            "health": { "cadence_ms": 200, "deadline_ms": 150 },
-        }),
+        json!({ "drain_timeout_ms": DRAIN_BUDGET_MS }),
     )
     .await;
     let drained_pid = first_module_pid(&events_path).await;
@@ -4873,10 +4996,12 @@ async fn a_busy_gauge_released_after_on_draining_holds_the_restart_drain_until_i
     restart_drain_module(&daemon.connection_file).await;
     // Wait out the whole budget: a drain that is never released ends at its
     // deadline, and the assertions below should say so rather than this wait.
-    wait_for_event(
+    let mut received_pushes = Vec::new();
+    wait_for_drain_event(
         &events_path,
         Duration::from_millis(DRAIN_BUDGET_MS) + EVENT_TIMEOUT,
         |event| event["pid"].as_u64() == Some(drained_pid) && event["kind"] == "connection_end",
+        &received_pushes,
     )
     .await;
 
@@ -4920,13 +5045,20 @@ async fn a_busy_gauge_released_after_on_draining_holds_the_restart_drain_until_i
                 .recv()
                 .await
                 .expect("control push receiver should remain open");
+            received_pushes.push(push.clone());
             if push.op == "route.closed" {
                 return push;
             }
         }
     })
-    .await
-    .expect("route.closed should arrive after the drain");
+    .await;
+    let closed = match closed {
+        Ok(push) => push,
+        Err(_) => panic!(
+            "timed out waiting for control push `route.closed` within {EVENT_TIMEOUT:?}\n{}",
+            drain_timeout_diagnostics(&events_path, &received_pushes)
+        ),
+    };
     assert_eq!(closed.body["reason"], "restart", "{:?}", closed.body);
     assert_eq!(
         closed.body["drained"], true,
@@ -4959,10 +5091,7 @@ async fn a_call_refused_with_module_reloading_during_a_restart_drain_succeeds_on
     let (_temp_dir, mut daemon, events_path) = start_drain_harness(
         "subc-client-rs-drain-resend",
         &[("SUBC_MODULE_ECHO_BUSY_AFTER_DRAIN_MS", &busy_after_drain)],
-        json!({
-            "drain_timeout_ms": DRAIN_BUDGET_MS,
-            "health": { "cadence_ms": 200, "deadline_ms": 150 },
-        }),
+        json!({ "drain_timeout_ms": DRAIN_BUDGET_MS }),
     )
     .await;
     let drained_pid = first_module_pid(&events_path).await;
@@ -4993,19 +5122,26 @@ async fn a_call_refused_with_module_reloading_during_a_restart_drain_succeeds_on
     restart_drain_module(&daemon.connection_file).await;
     // Generous: on a loaded runner the push can trail the restart's ACK by
     // seconds, and this wait only bounds a hang.
-    timeout(Duration::from_secs(30), async {
+    let mut received_pushes = Vec::new();
+    let closing = timeout(Duration::from_secs(30), async {
         loop {
             let push = control
                 .recv()
                 .await
                 .expect("control push receiver should remain open");
+            received_pushes.push(push.clone());
             if push.op == "route.closing" {
-                return;
+                return push;
             }
         }
     })
-    .await
-    .expect("route.closing should arrive once the drain begins");
+    .await;
+    if closing.is_err() {
+        panic!(
+            "timed out waiting for control push `route.closing` within 30s\n{}",
+            drain_timeout_diagnostics(&events_path, &received_pushes)
+        );
+    }
 
     let reply = consumer
         .call(

@@ -14,9 +14,9 @@
   16:40  basal             flow ci-router delivered 3 notices        basal  │                                           
   15:48  entorhinal        restarted on 0.1.39 · store upgraded to…     ck  │  Details                                  
   14:15  cerebellum        restarted on build b55082b4                  ck  │    {                                      
-  12:59  motor             restarted on build 249f3628                  ck  │      "old_evidence": "7c3a47b9…",         
+  12:59  motor             restarted on build 249f3628                  ck  │      "drain_ms": 412,                     
   12:36  plexus            restarted on build b40bd6b1                  ck  │      "new_evidence": "9d8a178c…",         
-  11:50  cerebellum        restarted on build f91eb1cf                  ck  │      "drain_ms": 412                      
+  11:50  cerebellum        restarted on build f91eb1cf                  ck  │      "old_evidence": "7c3a47b9…"          
   10:27  aft               restarted on build 2e04b432                  ck  │    }                                      
   09:30  daemon            restarted on 0.36.17 · all 25 modules b…     ck  │                                           
                                                                             │                                           

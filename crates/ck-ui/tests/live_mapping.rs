@@ -1124,7 +1124,7 @@ fn a_usage_code_never_shows_as_the_value() {
     ]});
     s.usage.set(map::usage(&reply, now()).unwrap(), now());
     let snap = assemble(&s, now());
-    // The code stays in the model for a detail view.
+    // The code stays in the model, though Home shows a sentence.
     assert_eq!(
         snap.usage.data.providers[0].error.as_deref(),
         Some("upstream_failed")

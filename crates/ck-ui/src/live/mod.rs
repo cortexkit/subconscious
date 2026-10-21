@@ -562,8 +562,8 @@ impl State {
         !checked_since_start && self.roster.at.secs_since(process.spawned_at) < START_GRACE_SECS
     }
 
-    /// The module's lifecycle in a word, from the supervisor's state, when it
-    /// is anything but running and checked.
+    /// The module's lifecycle in a word, from the supervisor's state, unless
+    /// it is running and has had a health check (or can't have one).
     fn lifecycle(&self, e: &SupervisorEntry) -> Option<String> {
         let word = match e.state.as_str() {
             "restarting" => "Restarting",

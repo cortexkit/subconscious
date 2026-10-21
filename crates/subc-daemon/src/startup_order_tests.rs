@@ -118,7 +118,9 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for DaemonLog {
 }
 
 impl DaemonLog {
-    /// Capture this thread's log events until the guard drops.
+    /// Capture this thread's log events until the guard drops. Only the
+    /// Unix-only tests capture, so it is compiled only there.
+    #[cfg(unix)]
     fn install() -> (DaemonLog, impl Drop) {
         use tracing_subscriber::layer::SubscriberExt;
         let log = DaemonLog::default();

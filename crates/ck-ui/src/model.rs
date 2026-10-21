@@ -37,6 +37,67 @@ impl Status {
     }
 }
 
+/// What kind of text an error is, as the source typed it: a machine code
+/// (from a `code`, `reason` or `state` field), a sentence meant for people
+/// (a `message` or `detail`), or a string the source gave no type.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FaultKind {
+    Code,
+    Sentence,
+    #[default]
+    Untyped,
+}
+
+/// A source's error: its text and what kind of text it is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Fault {
+    pub text: String,
+    pub kind: FaultKind,
+}
+
+impl Fault {
+    pub fn code(text: impl Into<String>) -> Fault {
+        Fault {
+            text: text.into(),
+            kind: FaultKind::Code,
+        }
+    }
+
+    pub fn sentence(text: impl Into<String>) -> Fault {
+        Fault {
+            text: text.into(),
+            kind: FaultKind::Sentence,
+        }
+    }
+}
+
+impl From<String> for Fault {
+    fn from(text: String) -> Fault {
+        Fault {
+            text,
+            kind: FaultKind::Untyped,
+        }
+    }
+}
+
+impl From<&str> for Fault {
+    fn from(text: &str) -> Fault {
+        Fault::from(text.to_string())
+    }
+}
+
+impl PartialEq<&str> for Fault {
+    fn eq(&self, other: &&str) -> bool {
+        self.text == *other
+    }
+}
+
+impl std::fmt::Display for Fault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text)
+    }
+}
+
 /// One source's data, when it arrived, and how the source is doing.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Panel<T> {
@@ -50,6 +111,8 @@ pub struct Panel<T> {
     /// Why the source's latest attempt failed, in one line, while it is
     /// failing. The data, if any, is then the last good reading.
     pub error: Option<String>,
+    /// What kind of text `error` is.
+    pub error_kind: FaultKind,
     /// False until the source's first reading arrives. Until then `data`
     /// holds placeholders that renderers must show as unknown.
     pub loaded: bool,
@@ -74,6 +137,7 @@ impl<T> Panel<T> {
             data,
             refresh_secs: None,
             error: None,
+            error_kind: FaultKind::Untyped,
             loaded: true,
         }
     }
@@ -85,6 +149,7 @@ impl<T> Panel<T> {
             data,
             refresh_secs,
             error: None,
+            error_kind: FaultKind::Untyped,
             loaded: false,
         }
     }
@@ -357,6 +422,8 @@ pub struct Provider {
     pub accounts: Vec<Account>,
     /// Why the provider can't be read at all, if it can't.
     pub error: Option<String>,
+    /// What kind of text `error` is.
+    pub error_kind: FaultKind,
     /// What is left of a provider's credit pools, such as "$983.26 of
     /// $1,000.00 left · 5 pools", for a provider whose accounts report credit
     /// instead of usage windows.
@@ -783,6 +850,7 @@ mod fixture {
                 unit: s(&q["unit"]),
                 resets_at: duration_from(now, q["reset"].as_str().unwrap_or("")),
                 error: None,
+                error_kind: FaultKind::Untyped,
                 balance: None,
                 balance_expires: None,
                 accounts: arr(&q["accounts"])

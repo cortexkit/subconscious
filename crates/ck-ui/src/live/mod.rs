@@ -29,8 +29,9 @@ use tokio::sync::{mpsc, watch};
 use crate::app::Request;
 use crate::model::{
     ActionKind, ActionPhase, ActionResult, ActivityEntry, Agents, Approvals, Backups, BuildServer,
-    Daemon, DaemonDown, DaemonRunning, Devices, Host, LogLine, LogView, Module, ModuleAction,
-    PaletteCommand, Panel, ProcessEvent, ProcessEventKind, Provider, Snapshot, Status, Usage,
+    Daemon, DaemonDown, DaemonRunning, Devices, Fault, FaultKind, Host, LogLine, LogView, Module,
+    ModuleAction, PaletteCommand, Panel, ProcessEvent, ProcessEventKind, Provider, Snapshot,
+    Status, Usage,
 };
 use crate::time::{Timestamp, UtcOffset};
 
@@ -222,7 +223,7 @@ pub fn all_reported(s: &Snapshot) -> bool {
 pub struct Part<T> {
     pub value: Option<T>,
     pub at: Timestamp,
-    pub error: Option<String>,
+    pub error: Option<Fault>,
 }
 
 impl<T> Default for Part<T> {
@@ -243,8 +244,8 @@ impl<T> Part<T> {
     }
 
     /// Records a failure. The last good value stays, to be shown as such.
-    pub fn fail(&mut self, error: String) {
-        self.error = Some(error);
+    pub fn fail(&mut self, error: impl Into<Fault>) {
+        self.error = Some(error.into());
     }
 
     fn panel<U>(&self, refresh: Option<f64>, f: impl FnOnce(&T) -> U, placeholder: U) -> Panel<U> {
@@ -253,11 +254,13 @@ impl<T> Part<T> {
                 received_at: self.at,
                 data: f(v),
                 refresh_secs: refresh,
-                error: self.error.clone(),
+                error: self.error.as_ref().map(|f| f.text.clone()),
+                error_kind: self.error.as_ref().map(|f| f.kind).unwrap_or_default(),
                 loaded: true,
             },
             None => Panel {
-                error: self.error.clone(),
+                error: self.error.as_ref().map(|f| f.text.clone()),
+                error_kind: self.error.as_ref().map(|f| f.kind).unwrap_or_default(),
                 ..Panel::waiting(placeholder, refresh)
             },
         }
@@ -629,6 +632,7 @@ pub fn assemble(state: &State, now: Timestamp) -> Snapshot {
     );
     if state.in_roster(modules::USAGE) == Some(false) {
         usage.error = Some(format!("{} isn't installed", modules::USAGE));
+        usage.error_kind = FaultKind::Sentence;
     }
 
     let names = state
@@ -772,6 +776,7 @@ where
     if state.in_roster(module) == Some(false) {
         return Panel {
             error: Some(format!("{module} isn't installed")),
+            error_kind: FaultKind::Sentence,
             ..Panel::waiting(T::placeholder(), refresh)
         };
     }
@@ -839,7 +844,13 @@ fn daemon_panel(state: &State, now: Timestamp) -> Panel<Daemon> {
                     clients,
                 }),
             );
-            p.error = state.describe.error.clone();
+            p.error = state.describe.error.as_ref().map(|f| f.text.clone());
+            p.error_kind = state
+                .describe
+                .error
+                .as_ref()
+                .map(|f| f.kind)
+                .unwrap_or_default();
             if state.describe.value.is_some() {
                 p.received_at = state.describe.at;
                 p.refresh_secs = Some(every::DESCRIBE);
@@ -984,10 +995,10 @@ pub async fn where_many_round<F, Fut>(
     ids: &[String],
     here: &str,
     mut call: F,
-) -> Option<Result<HashMap<String, String>, String>>
+) -> Option<Result<HashMap<String, String>, Fault>>
 where
     F: FnMut(serde_json::Value) -> Fut,
-    Fut: std::future::Future<Output = Result<serde_json::Value, String>>,
+    Fut: std::future::Future<Output = Result<serde_json::Value, Fault>>,
 {
     if ids.is_empty() {
         return None;

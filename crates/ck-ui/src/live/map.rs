@@ -21,7 +21,7 @@ use subc_protocol::Principal;
 
 use crate::metrics::{all_rows, pane_rows};
 use crate::model::{
-    Account, ActivityEntry, Agent, Agents, Backups, BuildServer, Device, Devices, LogLevel,
+    Account, ActivityEntry, Agent, Agents, Backups, BuildServer, Device, Devices, Fault, LogLevel,
     LogLine, Metric, Provider, Status, UsageWindow,
 };
 use crate::quota;
@@ -236,19 +236,23 @@ pub fn unwrap_result(v: &Value) -> &Value {
     v.get("result").unwrap_or(v)
 }
 
-/// An error a module reported inside an otherwise successful reply, as its
-/// code (or message).
-pub fn reply_error(v: &Value) -> Option<String> {
+/// An error a module reported inside an otherwise successful reply: its
+/// `code` when it gives one (a machine code), else its `message` (a
+/// sentence), else the bare string (untyped).
+pub fn reply_error(v: &Value) -> Option<Fault> {
     let e = v.get("error")?;
     if e.is_null() {
         return None;
     }
-    e.get("code")
-        .and_then(Value::as_str)
-        .or_else(|| e.as_str())
-        .or_else(|| e.get("message").and_then(Value::as_str))
-        .map(str::to_string)
-        .or_else(|| Some(e.to_string()))
+    if let Some(code) = e.get("code").and_then(Value::as_str) {
+        return Some(Fault::code(code));
+    }
+    if let Some(message) = e.get("message").and_then(Value::as_str) {
+        return Some(Fault::sentence(message));
+    }
+    Some(Fault::from(
+        e.as_str().map_or_else(|| e.to_string(), str::to_string),
+    ))
 }
 
 /// Looks a dotted path up in a metrics object, accepting both nesting
@@ -445,19 +449,21 @@ fn account_who(entry: &Value) -> String {
 /// Why an account's row can't be read, or `Err(())` for a disconnected row
 /// the quota module classes as nothing to fix (no credential configured, or
 /// no quota on the account), which isn't listed at all.
-fn account_failure(entry: &Value) -> Result<Option<String>, ()> {
+fn account_failure(entry: &Value) -> Result<Option<Fault>, ()> {
     if quota::quota_entry_is_connected(entry) {
         return Ok(None);
     }
     match quota::quota_disconnect_kind(entry) {
         quota::QuotaDisconnectKind::Inert => Err(()),
+        // `errorClass` is the producer's machine code; `error` is its
+        // sentence for people.
         _ => Ok(Some(
             entry
                 .get("errorClass")
                 .and_then(Value::as_str)
-                .map(str::to_string)
-                .or_else(|| quota::entry_error_detail(entry))
-                .unwrap_or_else(|| "failing".into()),
+                .map(Fault::code)
+                .or_else(|| quota::entry_error_detail(entry).map(Fault::sentence))
+                .unwrap_or_else(|| Fault::sentence("failing")),
         )),
     }
 }
@@ -597,13 +603,13 @@ fn money(amount: &str, unit: &str) -> String {
 /// as failing and left out of the sum; a provider with no readable account
 /// carries an error instead of a share; one whose accounts report only
 /// credit shows what is left of it.
-pub fn usage(reply: &Value, now: Timestamp) -> Result<Vec<Provider>, String> {
+pub fn usage(reply: &Value, now: Timestamp) -> Result<Vec<Provider>, Fault> {
     if let Some(err) = reply_error(reply) {
         return Err(err);
     }
     let rows = unwrap_result(reply)
         .as_array()
-        .ok_or_else(|| "unexpected usage.get reply".to_string())?;
+        .ok_or_else(|| Fault::sentence("unexpected usage.get reply"))?;
     let mut order: Vec<String> = Vec::new();
     let mut groups: HashMap<String, Vec<&Value>> = HashMap::new();
     for row in rows {
@@ -618,6 +624,7 @@ pub fn usage(reply: &Value, now: Timestamp) -> Result<Vec<Provider>, String> {
         let mut accounts = Vec::new();
         let mut all_windows: Vec<Window> = Vec::new();
         let mut pools: Vec<quota::SpendPool> = Vec::new();
+        let mut first_failure: Option<Fault> = None;
         for entry in &groups[&id] {
             let failure = match account_failure(entry) {
                 Err(()) => continue,
@@ -633,6 +640,9 @@ pub fn usage(reply: &Value, now: Timestamp) -> Result<Vec<Provider>, String> {
             } else {
                 Vec::new()
             };
+            if first_failure.is_none() {
+                first_failure = failure.clone();
+            }
             let stale = entry.get("stale").is_some_and(|s| !s.is_null());
             let note = if stale {
                 "last good reading".to_string()
@@ -652,7 +662,7 @@ pub fn usage(reply: &Value, now: Timestamp) -> Result<Vec<Provider>, String> {
                     })
                     .collect(),
                 note,
-                error: failure,
+                error: failure.map(|f| f.text),
             });
             if windows.is_empty() {
                 pools.extend(own_pools);
@@ -704,10 +714,9 @@ pub fn usage(reply: &Value, now: Timestamp) -> Result<Vec<Provider>, String> {
             }
             None if summary.is_some() => (String::new(), None, 0, None, None),
             None => {
-                let err = accounts
-                    .iter()
-                    .find_map(|a| a.error.clone())
-                    .unwrap_or_else(|| "no usage reported".into());
+                let err = first_failure
+                    .clone()
+                    .unwrap_or_else(|| Fault::sentence("no usage reported"));
                 (String::new(), None, 0, None, Some(err))
             }
         };
@@ -723,7 +732,8 @@ pub fn usage(reply: &Value, now: Timestamp) -> Result<Vec<Provider>, String> {
             unit: if of == 1 { "account" } else { "accounts" }.into(),
             resets_at,
             accounts,
-            error,
+            error_kind: error.as_ref().map(|f| f.kind).unwrap_or_default(),
+            error: error.map(|f| f.text),
             balance,
             balance_expires,
         });
@@ -735,7 +745,7 @@ pub fn usage(reply: &Value, now: Timestamp) -> Result<Vec<Provider>, String> {
 
 /// Paired devices from callosum's `callosum.devices_read` reply. Online
 /// means an established tunnel.
-pub fn devices(reply: &Value, now: Timestamp) -> Result<Devices, String> {
+pub fn devices(reply: &Value, now: Timestamp) -> Result<Devices, Fault> {
     if let Some(err) = reply_error(reply) {
         return Err(err);
     }
@@ -743,7 +753,7 @@ pub fn devices(reply: &Value, now: Timestamp) -> Result<Devices, String> {
     let list = body
         .get("devices")
         .and_then(Value::as_array)
-        .ok_or_else(|| "unexpected devices_read reply".to_string())?;
+        .ok_or_else(|| Fault::sentence("unexpected devices_read reply"))?;
     let mut out = Vec::new();
     for d in list {
         if d.get("trust").and_then(Value::as_str) == Some("tombstoned") {
@@ -810,7 +820,7 @@ pub struct AgentIdentity {
 }
 
 /// The identities in an `agent.fleet_identity` reply.
-pub fn agent_identities(reply: &Value) -> Result<Vec<AgentIdentity>, String> {
+pub fn agent_identities(reply: &Value) -> Result<Vec<AgentIdentity>, Fault> {
     if let Some(err) = reply_error(reply) {
         return Err(err);
     }
@@ -818,7 +828,7 @@ pub fn agent_identities(reply: &Value) -> Result<Vec<AgentIdentity>, String> {
     let list = body
         .get("agents")
         .and_then(Value::as_array)
-        .ok_or_else(|| "unexpected fleet_identity reply".to_string())?;
+        .ok_or_else(|| Fault::sentence("unexpected fleet_identity reply"))?;
     Ok(list
         .iter()
         .filter_map(|a| {
@@ -849,7 +859,7 @@ pub struct AgentResidence {
     pub doing: Option<String>,
 }
 
-pub fn agent_residences(reply: &Value) -> Result<HashMap<String, AgentResidence>, String> {
+pub fn agent_residences(reply: &Value) -> Result<HashMap<String, AgentResidence>, Fault> {
     if let Some(err) = reply_error(reply) {
         return Err(err);
     }
@@ -857,7 +867,7 @@ pub fn agent_residences(reply: &Value) -> Result<HashMap<String, AgentResidence>
     let list = body
         .get("agents")
         .and_then(Value::as_array)
-        .ok_or_else(|| "unexpected fleet_residence reply".to_string())?;
+        .ok_or_else(|| Fault::sentence("unexpected fleet_residence reply"))?;
     Ok(list
         .iter()
         .filter_map(|a| {
@@ -888,7 +898,7 @@ pub fn agent_residences(reply: &Value) -> Result<HashMap<String, AgentResidence>
 
 /// Where each agent lives, from entorhinal's `agent.where_many`: the holding
 /// machine's name, or `here` (this machine's label) when it is held here.
-pub fn agent_places(reply: &Value, here: &str) -> Result<HashMap<String, String>, String> {
+pub fn agent_places(reply: &Value, here: &str) -> Result<HashMap<String, String>, Fault> {
     if let Some(err) = reply_error(reply) {
         return Err(err);
     }
@@ -929,7 +939,7 @@ pub fn agent_places(reply: &Value, here: &str) -> Result<HashMap<String, String>
 
 /// Workspace and project counts from entorhinal's `enumerate`: each is a
 /// list (counted) or a number.
-pub fn fleet_counts(reply: &Value) -> Result<(Option<u32>, Option<u32>), String> {
+pub fn fleet_counts(reply: &Value) -> Result<(Option<u32>, Option<u32>), Fault> {
     if let Some(err) = reply_error(reply) {
         return Err(err);
     }

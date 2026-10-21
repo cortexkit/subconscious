@@ -24,7 +24,8 @@ use super::{
 };
 use crate::app::Request;
 use crate::model::{
-    ActionKind, ActionPhase, ActionResult, ModuleAction, ProcessEvent, ProcessEventKind, Snapshot,
+    ActionKind, ActionPhase, ActionResult, Fault, ModuleAction, ProcessEvent, ProcessEventKind,
+    Snapshot,
 };
 use crate::time::Timestamp;
 
@@ -235,12 +236,18 @@ where
 /// The text a failed daemon request shows: the refusal code, or that the
 /// daemon isn't answering.
 fn control_error(e: &CallError) -> String {
+    control_fault(e).text
+}
+
+/// A failed daemon request as an error a panel shows: the daemon's refusal
+/// code (a machine code), or a sentence saying the daemon isn't answering.
+fn control_fault(e: &CallError) -> Fault {
     match e {
-        CallError::Module(body) => body.code.clone(),
-        _ => e
-            .code()
-            .map(str::to_string)
-            .unwrap_or_else(|| "daemon unreachable · retrying".into()),
+        CallError::Module(body) => Fault::code(body.code.clone()),
+        _ => match e.code() {
+            Some(code) => Fault::code(code),
+            None => Fault::sentence("daemon unreachable · retrying"),
+        },
     }
 }
 
@@ -281,7 +288,7 @@ fn sources(shared: &Arc<Shared>, conn: &Conn) -> Vec<JoinHandle<()>> {
                     }
                     Err(e) => {
                         sh.raw("supervisor.list", control_error(&e));
-                        sh.update(|s| s.roster.fail(control_error(&e)));
+                        sh.update(|s| s.roster.fail(control_fault(&e)));
                     }
                 }
                 tokio::time::sleep(secs(every::ROSTER)).await;
@@ -297,7 +304,7 @@ fn sources(shared: &Arc<Shared>, conn: &Conn) -> Vec<JoinHandle<()>> {
             }
             Err(e) => {
                 sh.raw("server.describe", control_error(&e));
-                sh.update(|s| s.describe.fail(control_error(&e)))
+                sh.update(|s| s.describe.fail(control_fault(&e)))
             }
         }
     );
@@ -310,7 +317,7 @@ fn sources(shared: &Arc<Shared>, conn: &Conn) -> Vec<JoinHandle<()>> {
             }
             Err(e) => {
                 sh.raw("supervisor.routes", control_error(&e));
-                sh.update(|s| s.routes.fail(control_error(&e)))
+                sh.update(|s| s.routes.fail(control_fault(&e)))
             }
         }
     );
@@ -431,7 +438,7 @@ fn sources(shared: &Arc<Shared>, conn: &Conn) -> Vec<JoinHandle<()>> {
                     }),
                     Err(e) => {
                         sh.raw("supervisor.health", control_error(&e));
-                        sh.update(|s| s.health.fail(control_error(&e)))
+                        sh.update(|s| s.health.fail(control_fault(&e)))
                     }
                 }
                 let busy = sh.read(|s| !s.actions.is_empty());
@@ -452,7 +459,7 @@ fn sources(shared: &Arc<Shared>, conn: &Conn) -> Vec<JoinHandle<()>> {
                     }
                     Err(e) => {
                         sh.raw("supervisor.provenance", control_error(&e));
-                        sh.update(|s| s.provenance.fail(control_error(&e)))
+                        sh.update(|s| s.provenance.fail(control_fault(&e)))
                     }
                 }
                 let _ = tokio::time::timeout(secs(every::PROVENANCE), sh.provenance_due.notified())
@@ -649,7 +656,7 @@ async fn open_log(
                 }
                 Err(e) => sh.update(|s| {
                     s.log = super::Part::default();
-                    s.log.fail(control_error(&e));
+                    s.log.fail(control_fault(&e));
                 }),
             }
             None
@@ -670,7 +677,7 @@ async fn follow_log(
     })
     .await;
     let Ok((follow, new)) = polled else {
-        sh.update(|s| s.log.fail("the log reader stopped".into()));
+        sh.update(|s| s.log.fail("the log reader stopped"));
         return None;
     };
     match new {
@@ -747,12 +754,12 @@ async fn module_call(
     module: &str,
     method: &str,
     params: Value,
-) -> Result<Value, String> {
+) -> Result<Value, Fault> {
     if shared.read(|s| s.in_roster(module)) == Some(false) {
-        return Err(format!("{module} isn't installed"));
+        return Err(Fault::sentence(format!("{module} isn't installed")));
     }
     let body = serde_json::to_vec(&json!({ "method": method, "params": params }))
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| Fault::sentence(e.to_string()))?;
     for attempt in 0..2 {
         let handle = {
             let mut routes = conn.routes.lock().await;
@@ -787,7 +794,7 @@ async fn module_call(
                     String::from_utf8_lossy(&bytes).into_owned(),
                 );
                 return serde_json::from_slice(&bytes)
-                    .map_err(|_| format!("{module} sent an unreadable reply"));
+                    .map_err(|_| Fault::sentence(format!("{module} sent an unreadable reply")));
             }
             Err(e) => {
                 shared.raw(&format!("{module} {method}"), format!("error: {e}"));
@@ -801,16 +808,19 @@ async fn module_call(
             }
         }
     }
-    Err(format!("{module} unreachable · retrying"))
+    Err(Fault::sentence(format!("{module} unreachable · retrying")))
 }
 
-fn module_error(module: &str, e: &CallError) -> String {
+/// A failed module request as an error a panel shows: the module's or the
+/// daemon's refusal code (a machine code), or a sentence saying the module
+/// isn't answering.
+fn module_error(module: &str, e: &CallError) -> Fault {
     match e {
-        CallError::Module(body) => body.code.clone(),
-        _ => e
-            .route_open_refusal()
-            .map(|b| b.code.clone())
-            .unwrap_or_else(|| format!("{module} unreachable · retrying")),
+        CallError::Module(body) => Fault::code(body.code.clone()),
+        _ => match e.route_open_refusal() {
+            Some(body) => Fault::code(body.code.clone()),
+            None => Fault::sentence(format!("{module} unreachable · retrying")),
+        },
     }
 }
 
@@ -847,7 +857,7 @@ async fn spawn_feed(shared: Arc<Shared>, conn: Conn) {
                     cursor = Some(snap.cursor);
                 }
                 Err(e) => {
-                    shared.update(|s| s.spawn_feed.fail(control_error(&e)));
+                    shared.update(|s| s.spawn_feed.fail(control_fault(&e)));
                     tokio::time::sleep(secs(2.0)).await;
                     continue;
                 }
@@ -856,7 +866,7 @@ async fn spawn_feed(shared: Arc<Shared>, conn: Conn) {
         let mut sub = match conn.consumer.spawn_subscribe(cursor.clone()).await {
             Ok(sub) => sub,
             Err(e) => {
-                shared.update(|s| s.spawn_feed.fail(control_error(&e)));
+                shared.update(|s| s.spawn_feed.fail(control_fault(&e)));
                 tokio::time::sleep(secs(2.0)).await;
                 continue;
             }
@@ -956,7 +966,7 @@ async fn activity_feed(shared: Arc<Shared>, conn: Conn) {
                     since = Some(page.head);
                 }
                 Err(e) => {
-                    shared.update(|s| s.activity.fail(control_error(&e)));
+                    shared.update(|s| s.activity.fail(control_fault(&e)));
                     tokio::time::sleep(secs(5.0)).await;
                     continue;
                 }
@@ -965,7 +975,7 @@ async fn activity_feed(shared: Arc<Shared>, conn: Conn) {
         let mut sub = match conn.consumer.subscribe_activity(since.clone()).await {
             Ok(sub) => sub,
             Err(e) => {
-                shared.update(|s| s.activity.fail(control_error(&e)));
+                shared.update(|s| s.activity.fail(control_fault(&e)));
                 tokio::time::sleep(secs(5.0)).await;
                 since = None;
                 continue;

@@ -11,7 +11,7 @@ use crate::draw::{
     bar, chrome, frame_end, heading_st, live_dot, pad_left, pad_right, spark, status_glyph, trunc,
     use_fg, width, Canvas,
 };
-use crate::model::{ActivityEntry, Agent, Daemon, Panel, Provider, Status};
+use crate::model::{ActivityEntry, Agent, Daemon, FaultKind, Panel, Provider, Status};
 use crate::theme::{Bg, Fg, St};
 use crate::time::{ago, ago_short, js_round, locale_number, thousands, to_fixed};
 
@@ -111,24 +111,34 @@ fn approvals_text(v: &View) -> (String, St) {
     }
 }
 
-/// An error in a value cell: a machine code (one word, no spaces) never
-/// shows as the value; it reads "couldn't read {what}" instead. A sentence
-/// such as "motor isn't installed" shows as it is.
-pub fn error_words(err: &str, what: &str) -> String {
-    if err.trim().contains(' ') {
-        err.to_string()
-    } else {
-        format!("couldn't read {what}")
+/// Whether an error is a machine code rather than a sentence for people.
+/// The source's own typing decides when it gave one (a `code`, `reason` or
+/// `state` field against a `message` or `detail`). Only for a string it gave
+/// no type does the fallback guess: one word, no spaces, is a code.
+pub fn is_code(err: &str, kind: FaultKind) -> bool {
+    match kind {
+        FaultKind::Code => true,
+        FaultKind::Sentence => false,
+        FaultKind::Untyped => !err.trim().contains(' '),
     }
 }
 
-/// An error as a value cell shows it: a machine code becomes a muted
-/// "couldn't read {what}" (the code stays in the model for a detail view); a
-/// sentence shows as it is, in amber.
-fn error_cell(err: &str, what: &str) -> (String, St) {
-    let text = error_words(err, what);
-    let st = if text == err { St::W } else { St::D };
-    (text, st)
+/// An error as a value cell `room` columns wide shows it: a machine code
+/// becomes a muted "couldn't read {what}", or just "couldn't read" when
+/// that doesn't fit (the code stays in the model); a sentence shows as it
+/// is, in amber.
+fn error_cell(err: &str, kind: FaultKind, what: &str, room: usize) -> (String, St) {
+    if is_code(err, kind) {
+        let full = format!("couldn't read {what}");
+        let text = if width(&full) <= room {
+            full
+        } else {
+            "couldn't read".to_string()
+        };
+        (text, St::D)
+    } else {
+        (err.to_string(), St::W)
+    }
 }
 
 /// One fact row of This Mac: its label, then the value, or the source's
@@ -147,7 +157,7 @@ fn fact_row<T>(
     let room = (w - 13).max(0) as usize;
     match (&panel.error, panel.loaded) {
         (Some(err), false) => {
-            let (text, st) = error_cell(err, &k.to_lowercase());
+            let (text, st) = error_cell(err, panel.error_kind, &k.to_lowercase(), room);
             c.put(x + 13, y, &trunc(&text, room), st);
         }
         _ => {
@@ -164,7 +174,7 @@ fn backups(c: &mut Canvas, v: &View, x: i32, y: i32, w: i32) {
     let b = &panel.data;
     c.put(x, y, "Backups", St::D);
     if let (Some(err), false) = (&panel.error, panel.loaded) {
-        let (text, st) = error_cell(err, "backups");
+        let (text, st) = error_cell(err, panel.error_kind, "backups", (w - 13).max(0) as usize);
         c.put(x + 13, y, &trunc(&text, (w - 13).max(0) as usize), st);
         return;
     }
@@ -211,7 +221,12 @@ fn devices(c: &mut Canvas, v: &View, x: i32, y: i32, end: i32) {
     let panel = &v.snap.devices;
     if !panel.loaded {
         let (text, st) = match panel.error.as_deref() {
-            Some(err) => error_cell(err, "devices"),
+            Some(err) => error_cell(
+                err,
+                panel.error_kind,
+                "devices",
+                (end - x - 13).max(0) as usize,
+            ),
             None => (UNKNOWN.to_string(), St::D),
         };
         c.put(x + 13, y, &trunc(&text, (end - x - 13).max(0) as usize), st);
@@ -359,15 +374,43 @@ fn layout(w: i32, h: i32) -> Layout {
     }
 }
 
-/// How many rows the attention list has at a window size, counting the
-/// "+N more" row that replaces the last one when there are more problems.
-/// Selection moves over these rows; the "+N more" row opens the first
-/// problem it stands for.
-pub fn attention_rows(w: i32, h: i32) -> usize {
-    // Rows 5 and 6, at every size: row 7 stays blank so the panels below
-    // never sit directly under the list.
-    let _ = layout(w, h);
-    2
+/// The window height from which the attention list grows past two rows.
+pub const TALL_ATTENTION_H: i32 = 44;
+
+/// The most problems the attention list shows in a tall window before a
+/// "+N more" row stands for the rest.
+const TALL_ATTENTION_PROBLEMS: usize = 4;
+
+/// How many problems the attention list shows at a window size, and
+/// whether a "+N more" row follows them. Below [`TALL_ATTENTION_H`] rows
+/// (and in the small layout) the list has two rows: two problems, or one
+/// and the note. In a taller window it grows to four problems, with the note
+/// only past four. Either way a blank row follows it, so the panels below
+/// never sit directly under the list.
+pub fn attention_band(w: i32, h: i32, problems: usize) -> (usize, bool) {
+    let tall = h >= TALL_ATTENTION_H && layout(w, h) != Layout::Small;
+    let cap = if tall { TALL_ATTENTION_PROBLEMS } else { 2 };
+    if problems <= cap {
+        (problems, false)
+    } else if tall {
+        (cap, true)
+    } else {
+        (cap - 1, true)
+    }
+}
+
+/// How many rows the attention list has at a window size for `problems`
+/// problems, counting the "+N more" row. Selection moves over these rows;
+/// the "+N more" row opens the first problem it stands for.
+pub fn attention_rows(w: i32, h: i32, problems: usize) -> usize {
+    let (shown, note) = attention_band(w, h, problems);
+    shown + usize::from(note)
+}
+
+/// How many rows the panels below the attention list move down: the rows
+/// the list takes beyond its usual two.
+fn band_shift(c: &Canvas, v: &View) -> i32 {
+    attention_rows(c.w, c.h, v.snap.attention().len()).saturating_sub(2) as i32
 }
 
 /// What a problem row says: the module's own sentence, or, when it gave
@@ -396,10 +439,9 @@ fn problem_text(m: &crate::model::Module) -> (String, St) {
 /// last row says how many are left out instead of dropping them silently.
 fn attention_list(c: &mut Canvas, v: &View, lay: Layout) {
     let att = v.snap.attention();
-    let rows = attention_rows(c.w, c.h);
-    let overflow = att.len() > rows;
-    let shown = if overflow { rows - 1 } else { att.len() };
-    let sel = v.home_sel.min(rows.min(att.len()).saturating_sub(1));
+    let (shown, overflow) = attention_band(c.w, c.h, att.len());
+    let rows = shown + usize::from(overflow);
+    let sel = v.home_sel.min(rows.saturating_sub(1));
     let mark = |c: &mut Canvas, y: i32| {
         if lay != Layout::Small {
             c.right(c.w - 3, y, "⏎", St::A);
@@ -449,12 +491,12 @@ fn attention_list(c: &mut Canvas, v: &View, lay: Layout) {
 
 /// The module grid: two columns of 13 from row 10. A 27th module or more
 /// turns the last slot into "+N more".
-fn module_grid(c: &mut Canvas, v: &View, x0: i32, col_w: i32, with_cpu: bool) {
+fn module_grid(c: &mut Canvas, v: &View, (x0, top): (i32, i32), col_w: i32, with_cpu: bool) {
     const SLOTS: usize = 26;
     let mods = &v.snap.modules.data;
     let overflow = mods.len() > SLOTS;
     let shown = if overflow { SLOTS - 1 } else { mods.len() };
-    let slot = |i: usize| (x0 + (i as i32 / 13) * col_w, 10 + (i as i32 % 13));
+    let slot = |i: usize| (x0 + (i as i32 / 13) * col_w, top + (i as i32 % 13));
     for (i, m) in mods.iter().take(shown).enumerate() {
         let (x, y) = slot(i);
         let (g, st) = status_glyph(m.status);
@@ -497,13 +539,13 @@ fn more_providers(n: usize, usage_tab: bool) -> String {
     }
 }
 
-/// A provider's share used, or the text that stands in its place: an error
-/// in amber (never a bar at 0%), what is left of a credit pool, or
-/// "unknown".
+/// A provider's share used, or the text that stands in its place: its
+/// error (never a bar at 0%), what is left of a credit pool, or "unknown".
 fn provider_frac(q: &Provider) -> Result<f64, (String, St)> {
     match (q.used, &q.error, &q.balance) {
         (Some(used), None, _) => Ok(used / f64::from(q.of.max(1))),
-        (_, Some(err), _) => Err(error_cell(err, "usage")),
+        // The usage cell always has room for the whole sentence.
+        (_, Some(err), _) => Err(error_cell(err, q.error_kind, "usage", usize::MAX)),
         (None, None, Some(left)) => Err((left.clone(), St::NONE)),
         (None, None, None) => Err((UNKNOWN.to_string(), St::D)),
     }
@@ -554,7 +596,7 @@ fn resets_text(v: &View, q: &Provider) -> String {
 fn usage_list(
     c: &mut Canvas,
     v: &View,
-    (bx, bw, bar_w): (i32, i32, i32),
+    (bx, top, bw, bar_w): (i32, i32, i32, i32),
     max: usize,
     totals: bool,
 ) {
@@ -565,7 +607,7 @@ fn usage_list(
     // A wider name column takes its extra width from the bar.
     let bar_w = bar_w - (col - 12);
     for (i, q) in providers.iter().take(shown).enumerate() {
-        let y = 10 + i as i32 * 2;
+        let y = top + i as i32 * 2;
         c.put(bx, y, &provider_name(&q.name, col), St::NONE);
         let f = match provider_frac(q) {
             Ok(f) => f,
@@ -603,7 +645,7 @@ fn usage_list(
         }
     }
     if overflow {
-        let y = 10 + shown as i32 * 2;
+        let y = top + shown as i32 * 2;
         c.put(
             bx,
             y,
@@ -706,6 +748,9 @@ fn draw_regular(c: &mut Canvas, v: &View) {
         );
     }
     attention_list(c, v, Layout::Regular);
+    // A taller window gives the attention list more rows; the panels below
+    // move down by as many, and Activity and Agents give them up.
+    let dy = band_shift(c, v);
 
     // Modules
     let (ax, aw, bx, bw, cx) = (2, 40, 45, 37, 85);
@@ -713,26 +758,26 @@ fn draw_regular(c: &mut Canvas, v: &View) {
     let dim = panel_heading(
         c,
         v,
-        (ax, 8, aw),
+        (ax, 8 + dy, aw),
         "Modules",
         &snap.modules,
         &module_tally(v),
     );
-    module_grid(c, v, ax, 20, false);
+    module_grid(c, v, (ax, 10 + dy), 20, false);
     if dim {
-        c.dim_rect(ax, 10, aw, 13);
+        c.dim_rect(ax, 10 + dy, aw, 13);
     }
 
     // Usage
-    usage_panel(c, v, (bx, bw, 18), 6, false);
+    usage_panel(c, v, (bx, 8 + dy, bw, 18), 6, false);
 
     // This Mac
-    this_mac_heading(c, v, cx, cw);
+    this_mac_heading(c, v, (cx, 8 + dy), cw);
     let (daemon, clients) = daemon_line(v);
     fact_row(
         c,
         v,
-        (cx, 10, cw),
+        (cx, 10 + dy, cw),
         "Daemon",
         &snap.daemon,
         &daemon,
@@ -741,7 +786,7 @@ fn draw_regular(c: &mut Canvas, v: &View) {
     fact_row(
         c,
         v,
-        (cx, 11, cw),
+        (cx, 11 + dy, cw),
         "Clients",
         &snap.daemon,
         &clients,
@@ -751,7 +796,7 @@ fn draw_regular(c: &mut Canvas, v: &View) {
     fact_row(
         c,
         v,
-        (cx, 13, cw),
+        (cx, 13 + dy, cw),
         "Build server",
         &snap.build_server,
         &busy_text(bs.busy, bs.slots),
@@ -760,7 +805,7 @@ fn draw_regular(c: &mut Canvas, v: &View) {
     if snap.build_server.loaded || snap.build_server.error.is_none() {
         c.put(
             cx + 13,
-            14,
+            14 + dy,
             &trunc(
                 &queue_text(bs.queued, bs.wait_secs),
                 (cw - 13).max(0) as usize,
@@ -770,26 +815,26 @@ fn draw_regular(c: &mut Canvas, v: &View) {
         spark(
             c,
             cx + 13,
-            15,
+            15 + dy,
             spark_window(&bs.load_history, v.spark_offset(), 16),
             Fg::Acc,
             Some(100.0),
             0.0,
         );
-        c.put(cx + 30, 15, "1h", St::D);
+        c.put(cx + 30, 15 + dy, "1h", St::D);
         if v.meta(&snap.build_server, "").dim {
-            c.dim_rect(cx + 13, 14, cw - 13, 2);
+            c.dim_rect(cx + 13, 14 + dy, cw - 13, 2);
         }
     }
-    backups(c, v, cx, 17, cw);
-    devices(c, v, cx, 20, cx + cw);
+    backups(c, v, cx, 17 + dy, cw);
+    devices(c, v, cx, 20 + dy, cx + cw);
     // Approvals show only once something can say how many are waiting.
     if snap.serves.approvals {
         let (appr, appr_st) = approvals_text(v);
         fact_row(
             c,
             v,
-            (cx, 21, cw),
+            (cx, 21 + dy, cw),
             "Approvals",
             &snap.approvals,
             &appr,
@@ -799,16 +844,16 @@ fn draw_regular(c: &mut Canvas, v: &View) {
 
     // Activity
     let dw = 80;
-    activity_heading(c, v, ax, 24, dw);
-    activity_list(c, v, (ax, 26, dw, last), 46, false);
+    activity_heading(c, v, ax, 24 + dy, dw);
+    activity_list(c, v, (ax, 26 + dy, dw, last), 46, false);
 
     // Agents, with each one's project once the panel has room for it.
     let agents = &snap.agents;
     let meta = format!("{} working", agents.data.working);
-    let dim = panel_heading(c, v, (cx, 24, cw), "Agents", agents, &meta);
-    agent_list(c, v, (cx, 26, cw, last), cw >= 44);
+    let dim = panel_heading(c, v, (cx, 24 + dy, cw), "Agents", agents, &meta);
+    agent_list(c, v, (cx, 26 + dy, cw, last), cw >= 44);
     if dim {
-        c.dim_rect(cx, 26, cw, last - 25);
+        c.dim_rect(cx, 26 + dy, cw, last - 25 - dy);
     }
 
     frame_end(c, &HINTS, &v.updated(&snap.modules), St::D);
@@ -854,7 +899,7 @@ fn queue_text(queued: Option<u32>, wait_secs: Option<f64>) -> String {
 /// them is aging or failing, the heading's meta names one of those (a
 /// last good reading first) instead of the machine id, so the panel never
 /// looks current when part of it isn't.
-fn this_mac_heading(c: &mut Canvas, v: &View, cx: i32, cw: i32) {
+fn this_mac_heading(c: &mut Canvas, v: &View, (cx, y): (i32, i32), cw: i32) {
     let snap = v.snap;
     let id = snap
         .host
@@ -877,13 +922,13 @@ fn this_mac_heading(c: &mut Canvas, v: &View, cx: i32, cw: i32) {
         Some((name, m)) => heading_st(
             c,
             cx,
-            8,
+            y,
             cw,
             "This Mac",
             &format!("{name} {}", m.text),
             St::W,
         ),
-        None => heading_st(c, cx, 8, cw, "This Mac", &id, St::D),
+        None => heading_st(c, cx, y, cw, "This Mac", &id, St::D),
     }
 }
 
@@ -902,19 +947,19 @@ fn activity_heading(c: &mut Canvas, v: &View, x: i32, y: i32, w: i32) {
 fn usage_panel(
     c: &mut Canvas,
     v: &View,
-    (bx, bw, bar_w): (i32, i32, i32),
+    (bx, top, bw, bar_w): (i32, i32, i32, i32),
     max: usize,
     totals: bool,
 ) {
     let usage = &v.snap.usage;
-    let dim = panel_heading(c, v, (bx, 8, bw), "Usage", usage, "this week");
+    let dim = panel_heading(c, v, (bx, top, bw), "Usage", usage, "this week");
     if !usage.loaded {
-        c.put(bx, 10, UNKNOWN, St::D);
+        c.put(bx, top + 2, UNKNOWN, St::D);
         return;
     }
-    usage_list(c, v, (bx, bw, bar_w), max, totals);
+    usage_list(c, v, (bx, top + 2, bw, bar_w), max, totals);
     if dim {
-        c.dim_rect(bx, 10, bw, 12);
+        c.dim_rect(bx, top + 2, bw, 12);
     }
 }
 
@@ -953,6 +998,9 @@ fn draw_large(c: &mut Canvas, v: &View) {
         );
     }
     attention_list(c, v, Layout::Large);
+    // A taller window gives the attention list more rows; the panels below
+    // move down by as many, and Activity and Agents give them up.
+    let dy = band_shift(c, v);
 
     // Three panels: modules with CPU, usage with totals, this Mac with host
     // facts. This Mac is at least 46 wide and takes whatever Usage leaves.
@@ -964,19 +1012,19 @@ fn draw_large(c: &mut Canvas, v: &View) {
     let dim = panel_heading(
         c,
         v,
-        (ax, 8, aw),
+        (ax, 8 + dy, aw),
         "Modules",
         &snap.modules,
         &format!("{} · CPU now", module_tally(v)),
     );
-    module_grid(c, v, ax, 29, true);
+    module_grid(c, v, (ax, 10 + dy), 29, true);
     if dim {
-        c.dim_rect(ax, 10, aw, 13);
+        c.dim_rect(ax, 10 + dy, aw, 13);
     }
 
-    usage_panel(c, v, (bx, bw, bw - 18), 5, true);
+    usage_panel(c, v, (bx, 8 + dy, bw, bw - 18), 5, true);
     let usage = &snap.usage.data;
-    c.put(bx, 21, "Models", St::D);
+    c.put(bx, 21 + dy, "Models", St::D);
     let priced = usage
         .models_priced
         .map_or_else(|| UNKNOWN.to_string(), thousands);
@@ -986,19 +1034,19 @@ fn draw_large(c: &mut Canvas, v: &View) {
     let models = format!("{priced} priced · checked {checked}");
     c.put(
         bx + 12,
-        21,
+        21 + dy,
         &trunc(&models, (bw - 12).max(0) as usize),
         St::NONE,
     );
 
     let host_panel = &snap.host;
     let host = &host_panel.data;
-    this_mac_heading(c, v, cx, cw);
+    this_mac_heading(c, v, (cx, 8 + dy), cw);
     let (daemon, clients) = daemon_line(v);
     fact_row(
         c,
         v,
-        (cx, 10, cw),
+        (cx, 10 + dy, cw),
         "Daemon",
         &snap.daemon,
         &daemon,
@@ -1007,7 +1055,7 @@ fn draw_large(c: &mut Canvas, v: &View) {
     fact_row(
         c,
         v,
-        (cx, 11, cw),
+        (cx, 11 + dy, cw),
         "Clients",
         &snap.daemon,
         &clients,
@@ -1017,7 +1065,7 @@ fn draw_large(c: &mut Canvas, v: &View) {
     fact_row(
         c,
         v,
-        (cx, 13, cw),
+        (cx, 13 + dy, cw),
         "Build server",
         &snap.build_server,
         &match (bs.busy, bs.slots, bs.queued) {
@@ -1038,28 +1086,28 @@ fn draw_large(c: &mut Canvas, v: &View) {
         spark(
             c,
             cx + 13,
-            14,
+            14 + dy,
             spark_window(&bs.load_history, v.spark_offset(), n),
             Fg::Acc,
             Some(100.0),
             0.0,
         );
         let end = cx + 13 + n as i32;
-        c.put(end + 1, 14, "3h", St::D);
-        c.put(end + 6, 14, &wait, St::D);
+        c.put(end + 1, 14 + dy, "3h", St::D);
+        c.put(end + 6, 14 + dy, &wait, St::D);
         if v.meta(&snap.build_server, "").dim {
-            c.dim_rect(cx + 13, 14, cw - 13, 1);
+            c.dim_rect(cx + 13, 14 + dy, cw - 13, 1);
         }
     }
-    backups(c, v, cx, 16, cw);
-    devices(c, v, cx, 18, cx + cw);
+    backups(c, v, cx, 16 + dy, cw);
+    devices(c, v, cx, 18 + dy, cx + cw);
     // Approvals show only once something can say how many are waiting.
     if snap.serves.approvals {
         let (appr, appr_st) = approvals_text(v);
         fact_row(
             c,
             v,
-            (cx, 19, cw),
+            (cx, 19 + dy, cw),
             "Approvals",
             &snap.approvals,
             &appr,
@@ -1089,7 +1137,7 @@ fn draw_large(c: &mut Canvas, v: &View) {
     };
     gauge(
         c,
-        20,
+        20 + dy,
         "Memory",
         host.memory_used_gb,
         host.memory_total_gb,
@@ -1097,13 +1145,13 @@ fn draw_large(c: &mut Canvas, v: &View) {
     );
     gauge(
         c,
-        21,
+        21 + dy,
         "Disk",
         host.disk_used_gb,
         host.disk_total_gb,
         disk_gb,
     );
-    c.put(cx, 22, "Load", St::D);
+    c.put(cx, 22 + dy, "Load", St::D);
     match host.load {
         Some(load) => {
             let loads = load
@@ -1113,26 +1161,26 @@ fn draw_large(c: &mut Canvas, v: &View) {
                 .join(" · ");
             let end = c.put(
                 cx + 13,
-                22,
+                22 + dy,
                 &trunc(&loads, (right - cx - 13).max(0) as usize),
                 St::NONE,
             );
             // The label only when it fits whole.
             const SPAN: &str = "1, 5 and 15 min";
             if end + 3 + width(SPAN) as i32 <= right {
-                c.put(end + 3, 22, SPAN, St::F);
+                c.put(end + 3, 22 + dy, SPAN, St::F);
             }
         }
         None => {
-            c.put(cx + 13, 22, UNKNOWN, St::D);
+            c.put(cx + 13, 22 + dy, UNKNOWN, St::D);
         }
     }
     if v.meta(host_panel, "").dim {
-        c.dim_rect(cx + 13, 20, cw - 13, 3);
+        c.dim_rect(cx + 13, 20 + dy, cw - 13, 3);
     }
 
     // Activity fills the height; older entries follow a day divider.
-    let (top, last) = (25, c.h - 4);
+    let (top, last) = (25 + dy, c.h - 4);
     let dw = cx - 3 - ax;
     activity_heading(c, v, ax, top, dw);
     activity_list(c, v, (ax, top + 2, dw, last), dw - 25 - 20, true);

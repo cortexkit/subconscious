@@ -62,9 +62,9 @@ fn home_attention_list_says_how_many_more() {
     let snap = crowded();
     let app = App::new(Theme::test());
 
-    // Two rows at every size, so row 7 stays a blank spacer above the
+    // Two rows below 44 rows, so row 7 stays a blank spacer above the
     // panels: one problem, then a note for the rest.
-    for (w, h) in [(80, 24), (120, 36), (160, 48)] {
+    for (w, h) in [(80, 24), (120, 36)] {
         let buf = render(&app, &snap, w, h);
         assert!(row(&buf, 5).contains("aft"), "{w}×{h}");
         assert_eq!(
@@ -74,6 +74,50 @@ fn home_attention_list_says_how_many_more() {
         );
         assert!(row(&buf, 7).trim().is_empty(), "{w}×{h}: the spacer stays");
     }
+
+    // A taller window shows up to four problems; these four fit, so no
+    // note, and the spacer follows them.
+    let buf = render(&app, &snap, 160, 48);
+    for (y, id) in [
+        (5, "aft"),
+        (6, "cerebellum"),
+        (7, "engram"),
+        (8, "thalamus-harness"),
+    ] {
+        assert!(row(&buf, y).contains(id), "row {y}: {}", row(&buf, y));
+    }
+    assert!(
+        row(&buf, 9).trim().is_empty(),
+        "the spacer: {}",
+        row(&buf, 9)
+    );
+    assert!(row(&buf, 10).contains("Modules"), "{}", row(&buf, 10));
+
+    // Five problems at 160×48: four rows, "+1 more", the spacer kept.
+    let mut five = crowded();
+    let extra = five
+        .modules
+        .data
+        .iter()
+        .position(|m| m.status == Status::Ok)
+        .unwrap();
+    five.modules.data[extra].status = Status::Failed;
+    assert_eq!(five.attention().len(), 5);
+    let buf = render(&app, &five, 160, 48);
+    for y in 5..=8 {
+        assert!(
+            row(&buf, y).contains('✕') || row(&buf, y).contains('▲'),
+            "row {y}: {}",
+            row(&buf, y)
+        );
+    }
+    assert_eq!(text(&buf, 3, 9, 25), "+1 more · ⏎ opens Modules");
+    assert!(
+        row(&buf, 10).trim().is_empty(),
+        "the spacer: {}",
+        row(&buf, 10)
+    );
+    assert!(row(&buf, 11).contains("Modules"), "{}", row(&buf, 11));
 
     // The note row can be selected, and ⏎ there opens the first problem it
     // stands for.
@@ -101,11 +145,13 @@ fn home_module_grid_and_usage_say_how_many_more() {
     assert!(row(&regular, 18).contains("Cursor"));
     assert_eq!(text(&regular, 45, 20, 29), "+ 2 more providers on 4 Usage");
 
+    // At 160×48 the four problems take two more rows, and the panels move
+    // down by two.
     let large = render(&app, &snap, 160, 48);
-    assert!(text(&large, 31, 21, 20).contains("wernicke"));
-    assert_eq!(text(&large, 31, 22, 7), "+5 more");
-    assert!(row(&large, 16).contains("Grok"));
-    assert_eq!(text(&large, 61, 18, 29), "+ 3 more providers on 4 Usage");
+    assert!(text(&large, 31, 23, 20).contains("wernicke"));
+    assert_eq!(text(&large, 31, 24, 7), "+5 more");
+    assert!(row(&large, 18).contains("Grok"));
+    assert_eq!(text(&large, 61, 20, 29), "+ 3 more providers on 4 Usage");
 
     let small = render(&app, &snap, 80, 24);
     assert_eq!(text(&small, 2, 17, 29), "+ 4 more providers on 4 Usage");

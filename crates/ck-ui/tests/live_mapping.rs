@@ -342,7 +342,7 @@ fn a_refused_residence_source_shows_its_code_on_the_agents_panel() {
     let mut s = State::empty("This Mac");
     s.identities
         .set(map::agent_identities(&identity_reply()).unwrap(), now());
-    s.residences.fail("principal_not_permitted".into());
+    s.residences.fail("principal_not_permitted");
     let snap = assemble(&s, now());
     assert!(snap.agents.loaded);
     assert_eq!(
@@ -785,7 +785,7 @@ async fn where_many_waits_for_identity_then_asks_in_batches_of_64() {
                     .iter()
                     .map(|id| json!({ "agent_id": id, "status": "held_elsewhere", "holder_name": "Mac 2" }))
                     .collect();
-                Ok::<Value, String>(json!({ "result": { "agents": rows } }))
+                Ok::<Value, ck_ui::model::Fault>(json!({ "result": { "agents": rows } }))
             }
         }
     };
@@ -1148,15 +1148,55 @@ fn three_problems_keep_the_spacer_and_give_up_a_row() {
     s.record_roster(roster(Value::Array(entries)), now());
     let snap = assemble(&s, now());
     assert_eq!(snap.attention().len(), 3);
-    for (w, h) in [(120u16, 36u16), (160, 48)] {
-        let rows = home_rows(&snap, w, h);
-        assert!(rows[5].contains("aft"), "{w}×{h}");
-        assert!(rows[6].contains("+2 more"), "{w}×{h}: {}", rows[6]);
-        assert!(
-            rows[7].trim().is_empty(),
-            "{w}×{h}: the spacer stays: {:?}",
-            rows[7]
-        );
-        assert!(rows[8].contains("Modules"), "{w}×{h}");
+    // Below 44 rows: one problem, the note, the spacer.
+    let rows = home_rows(&snap, 120, 36);
+    assert!(rows[5].contains("aft"));
+    assert!(rows[6].contains("+2 more"), "{}", rows[6]);
+    assert!(rows[7].trim().is_empty(), "the spacer stays: {:?}", rows[7]);
+    assert!(rows[8].contains("Modules"));
+    // A taller window has room for all three, and the spacer after them.
+    let rows = home_rows(&snap, 160, 48);
+    for (y, id) in [(5, "aft"), (6, "broca"), (7, "engram")] {
+        assert!(rows[y].contains(id), "row {y}: {}", rows[y]);
     }
+    assert!(rows[8].trim().is_empty(), "the spacer stays: {:?}", rows[8]);
+    assert!(rows[9].contains("Modules"));
+}
+
+#[test]
+fn the_sources_own_typing_decides_code_or_sentence() {
+    let devices_row = |reply: Value| -> String {
+        let mut s = State::empty("This Mac");
+        s.record_roster(roster(json!([running("callosum")])), now());
+        match map::devices(&reply, now()) {
+            Ok(d) => s.devices.set(d, now()),
+            Err(e) => s.devices.fail(e),
+        }
+        let rows = home_rows(&assemble(&s, now()), 120, 36);
+        rows[20].chars().skip(85).collect()
+    };
+    // A typed code reads as a sentence about what couldn't be read.
+    let row = devices_row(json!({ "error": { "code": "fed_not_authorized" } }));
+    assert!(row.contains("couldn't read"), "{row}");
+    assert!(!row.contains("fed_not_authorized"), "{row}");
+    // A typed message shows as it is, even as one word with no spaces.
+    let row = devices_row(json!({ "error": { "message": "Forbidden" } }));
+    assert!(row.contains("Forbidden"), "{row}");
+    // An untyped string falls back to the no-space check.
+    let row = devices_row(json!({ "error": "nope" }));
+    assert!(row.contains("couldn't read"), "{row}");
+    let row = devices_row(json!({ "error": "store locked" }));
+    assert!(row.contains("store locked"), "{row}");
+
+    // Usage rows: `errorClass` is the producer's code, whatever its `error`
+    // sentence says.
+    let reply = json!({ "result": [
+        { "provider": "claude", "account": "a", "error": "token expired", "errorClass": "credential_expired" },
+        { "provider": "grok", "account": "b", "error": "Unauthorized", "errorClass": "x_unauthorized" }
+    ]});
+    let providers = map::usage(&reply, now()).unwrap();
+    use ck_ui::model::FaultKind;
+    assert_eq!(providers[0].error.as_deref(), Some("credential_expired"));
+    assert_eq!(providers[0].error_kind, FaultKind::Code);
+    assert_eq!(providers[1].error_kind, FaultKind::Code);
 }

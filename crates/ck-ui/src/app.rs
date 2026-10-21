@@ -613,8 +613,8 @@ impl App {
         let (sel, len) = match self.tab {
             Tab::Home => {
                 let (w, h) = (i32::from(self.size.0), i32::from(self.size.1));
-                let rows = screens::home::attention_rows(w, h);
-                (&mut self.home_sel, snap.attention().len().min(rows))
+                let rows = screens::home::attention_rows(w, h, snap.attention().len());
+                (&mut self.home_sel, rows)
             }
             Tab::Modules => (&mut self.mod_sel, snap.modules.data.len()),
         };

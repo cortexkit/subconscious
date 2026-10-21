@@ -3054,14 +3054,14 @@ impl ControlHandler {
             .map_err(|err| RouterError::backend(0, frame.header.corr, err.to_string()))?;
         let Some(registration) = registration else {
             let outcome = Outcome::refusal("not_registered");
-            audit("", "", "", outcome, Duration::ZERO, Duration::ZERO, false);
+            audit("", "", "", &outcome, Duration::ZERO, Duration::ZERO, false);
             return Ok(vec![outcome.frame(&frame)]);
         };
         let request = match serde_json::from_slice::<OperatorConfirmRequest>(&frame.body) {
             Ok(request) => request,
             Err(_) => {
                 let outcome = Outcome::refusal("invalid_control_body");
-                audit("", "", "", outcome, Duration::ZERO, Duration::ZERO, false);
+                audit("", "", "", &outcome, Duration::ZERO, Duration::ZERO, false);
                 return Ok(vec![outcome.frame(&frame)]);
             }
         };
@@ -4065,7 +4065,13 @@ impl ControlHandler {
     /// distinct live connections presenting one module's `consumer_identity` --
     /// "is anyone else holding this secret" rather than "is this the right
     /// process".
-    fn observe_route_open_accept(&self, ctx: &RouteCtx, module_id: &str, principal: &str) {
+    fn observe_route_open_accept(
+        &self,
+        ctx: &RouteCtx,
+        module_id: &str,
+        principal: &str,
+        scope: &str,
+    ) {
         self.route_outages.record_accepted(module_id);
         self.counters.increment_route_open_accepted(principal);
         info!(
@@ -4073,6 +4079,7 @@ impl ControlHandler {
             principal,
             module_id,
             connection_id = ctx.connection_id.get(),
+            scope = %scope,
             "route.open accepted"
         );
     }
@@ -4813,7 +4820,10 @@ impl ControlHandler {
         );
         // Rendered BEFORE the move into the relay, because the accept arm below
         // is where it is logged and the principal is gone by then.
-        let principal_label = principal_label(&principal);
+        let route_principal_label = principal_label(&principal);
+        let scope_label = scope_stamp
+            .as_ref()
+            .map_or_else(|| "none".to_string(), route_open_scope_label);
         let relay = ModuleControlRequest::RouteBind {
             route_channel: module_channel,
             epoch: module_epoch,
@@ -4898,7 +4908,12 @@ impl ControlHandler {
                         "route.bind breaker closed: the probe was accepted"
                     );
                 }
-                self.observe_route_open_accept(ctx, &target_module_id, &principal_label);
+                self.observe_route_open_accept(
+                    ctx,
+                    &target_module_id,
+                    &route_principal_label,
+                    &scope_label,
+                );
                 Ok(Vec::new())
             }
             Ok(Ok(RouteBindRelayOutcome::Rejected(body))) => {
@@ -7017,6 +7032,30 @@ fn client_control_request_op(request: &ClientControlRequest) -> &'static str {
         ClientControlRequest::SupervisorStderrTail { .. } => ops::SUPERVISOR_STDERR_TAIL,
         ClientControlRequest::SupervisorTerminals { .. } => ops::SUPERVISOR_TERMINALS,
     }
+}
+
+/// The `scope=` field of the `route.open accepted` line, from the stamp that
+/// admission issued: `<kind>/<owner>/<ref>@<epoch>`. The ref is Debug-quoted
+/// so a ref holding control characters cannot forge a log line, and cut to 64
+/// characters with a trailing `…` to bound the line. The bind proof and the
+/// scope's attributes never appear.
+fn route_open_scope_label(stamp: &subc_protocol::scope::ScopeStamp) -> String {
+    use subc_protocol::scope::ScopeKind;
+    const MAX_REF_CHARS: usize = 64;
+    let kind = match stamp.kind {
+        ScopeKind::Head => "head",
+        ScopeKind::Worker => "worker",
+        ScopeKind::Ephemeral => "ephemeral",
+    };
+    let mut scope_ref: String = stamp.scope_ref.chars().take(MAX_REF_CHARS).collect();
+    if stamp.scope_ref.chars().nth(MAX_REF_CHARS).is_some() {
+        scope_ref.push('…');
+    }
+    format!(
+        "{kind}/{}/{scope_ref:?}@{}",
+        principal_label(&stamp.owner),
+        stamp.scope_epoch
+    )
 }
 
 fn principal_label(principal: &Principal) -> String {

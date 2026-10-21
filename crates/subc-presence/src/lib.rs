@@ -13,14 +13,64 @@ mod macos;
 #[cfg(windows)]
 mod windows;
 
-/// Only an explicit successful OS authentication approves a request.
+/// The meaning assigned to an error returned by LocalAuthentication.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalAuthenticationFailure {
+    Declined,
+    NoPresence,
+    ProviderError,
+}
+
+/// Only an explicit successful OS authentication approves a request.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
     Approved,
     Declined,
     ProviderError,
     NoPresence,
     UnsupportedPlatform,
+    LocalAuthenticationError {
+        failure: LocalAuthenticationFailure,
+        domain: String,
+        code: isize,
+    },
+}
+
+/// Convert a LocalAuthentication callback into an outcome without depending on
+/// macOS bindings, so its fail-closed error mapping is exercised on every host.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn local_authentication_outcome(success: bool, error: Option<(&str, isize)>) -> Outcome {
+    let Some((domain, code)) = error else {
+        return if success {
+            Outcome::Approved
+        } else {
+            Outcome::ProviderError
+        };
+    };
+
+    // LAErrorDomain and the LAError codes, written out so the mapping compiles
+    // and is tested on hosts without the macOS bindings.
+    const LA_ERROR_DOMAIN: &str = "com.apple.LocalAuthentication";
+    const AUTHENTICATION_FAILED: isize = -1;
+    const USER_CANCEL: isize = -2;
+    // The system cancelled the prompt, as it does while the screen is locked.
+    const SYSTEM_CANCEL: isize = -4;
+    const NOT_INTERACTIVE: isize = -1004;
+    let failure = if !success && domain == LA_ERROR_DOMAIN {
+        match code {
+            AUTHENTICATION_FAILED | USER_CANCEL => LocalAuthenticationFailure::Declined,
+            SYSTEM_CANCEL | NOT_INTERACTIVE => LocalAuthenticationFailure::NoPresence,
+            _ => LocalAuthenticationFailure::ProviderError,
+        }
+    } else {
+        LocalAuthenticationFailure::ProviderError
+    };
+
+    Outcome::LocalAuthenticationError {
+        failure,
+        domain: domain.to_string(),
+        code,
+    }
 }
 
 /// May be invoked from another blocking thread, including during setup.
@@ -60,6 +110,96 @@ mod tests {
         assert!(!no_presence(false, true));
         assert!(!no_presence(true, false));
         assert!(!no_presence(true, true));
+    }
+
+    #[test]
+    fn local_authentication_error_mapping_is_fail_closed() {
+        let domain = "com.apple.LocalAuthentication";
+        let cases = [
+            ("success", true, None, Outcome::Approved),
+            (
+                "user cancel",
+                false,
+                Some((domain, -2)),
+                Outcome::LocalAuthenticationError {
+                    failure: LocalAuthenticationFailure::Declined,
+                    domain: domain.into(),
+                    code: -2,
+                },
+            ),
+            (
+                "authentication failed",
+                false,
+                Some((domain, -1)),
+                Outcome::LocalAuthenticationError {
+                    failure: LocalAuthenticationFailure::Declined,
+                    domain: domain.into(),
+                    code: -1,
+                },
+            ),
+            (
+                "system cancel",
+                false,
+                Some((domain, -4)),
+                Outcome::LocalAuthenticationError {
+                    failure: LocalAuthenticationFailure::NoPresence,
+                    domain: domain.into(),
+                    code: -4,
+                },
+            ),
+            (
+                "not interactive",
+                false,
+                Some((domain, -1004)),
+                Outcome::LocalAuthenticationError {
+                    failure: LocalAuthenticationFailure::NoPresence,
+                    domain: domain.into(),
+                    code: -1004,
+                },
+            ),
+            (
+                "unknown code",
+                false,
+                Some((domain, 123)),
+                Outcome::LocalAuthenticationError {
+                    failure: LocalAuthenticationFailure::ProviderError,
+                    domain: domain.into(),
+                    code: 123,
+                },
+            ),
+            (
+                "a cancel code from another error domain",
+                false,
+                Some(("NSOSStatusErrorDomain", -2)),
+                Outcome::LocalAuthenticationError {
+                    failure: LocalAuthenticationFailure::ProviderError,
+                    domain: "NSOSStatusErrorDomain".into(),
+                    code: -2,
+                },
+            ),
+        ];
+
+        for (case, success, error, expected) in cases {
+            assert_eq!(
+                local_authentication_outcome(success, error),
+                expected,
+                "{case}"
+            );
+        }
+        assert_eq!(
+            local_authentication_outcome(true, Some((domain, -4))),
+            Outcome::LocalAuthenticationError {
+                failure: LocalAuthenticationFailure::ProviderError,
+                domain: domain.into(),
+                code: -4,
+            },
+            "a success flag paired with an error must not approve"
+        );
+        assert_eq!(
+            local_authentication_outcome(false, None),
+            Outcome::ProviderError,
+            "a failure without an error remains unavailable"
+        );
     }
 
     #[cfg(not(any(target_os = "macos", windows)))]

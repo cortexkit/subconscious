@@ -86,13 +86,25 @@ pub trait OperatorWithdraw: Send + Sync + 'static {
     fn withdraw(&self, reason: &str);
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProviderResult {
     Approved,
     Declined,
     Unavailable,
     UnsupportedPlatform,
     NoPresence,
+    LocalAuthenticationError {
+        failure: OperatorOsErrorKind,
+        domain: String,
+        code: isize,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperatorOsErrorKind {
+    Declined,
+    NoPresence,
+    ProviderError,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -170,6 +182,25 @@ fn os_outcome(outcome: subc_presence::Outcome) -> ProviderResult {
         subc_presence::Outcome::ProviderError => ProviderResult::Unavailable,
         subc_presence::Outcome::NoPresence => ProviderResult::NoPresence,
         subc_presence::Outcome::UnsupportedPlatform => ProviderResult::UnsupportedPlatform,
+        subc_presence::Outcome::LocalAuthenticationError {
+            failure,
+            domain,
+            code,
+        } => ProviderResult::LocalAuthenticationError {
+            failure: match failure {
+                subc_presence::LocalAuthenticationFailure::Declined => {
+                    OperatorOsErrorKind::Declined
+                }
+                subc_presence::LocalAuthenticationFailure::NoPresence => {
+                    OperatorOsErrorKind::NoPresence
+                }
+                subc_presence::LocalAuthenticationFailure::ProviderError => {
+                    OperatorOsErrorKind::ProviderError
+                }
+            },
+            domain,
+            code,
+        },
     }
 }
 
@@ -188,14 +219,28 @@ mod os_outcome_tests {
             os_outcome(Os::UnsupportedPlatform),
             ProviderResult::UnsupportedPlatform
         );
+        assert_eq!(
+            os_outcome(Os::LocalAuthenticationError {
+                failure: subc_presence::LocalAuthenticationFailure::NoPresence,
+                domain: "com.apple.LocalAuthentication".into(),
+                code: -4,
+            }),
+            ProviderResult::LocalAuthenticationError {
+                failure: OperatorOsErrorKind::NoPresence,
+                domain: "com.apple.LocalAuthentication".into(),
+                code: -4,
+            }
+        );
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct Outcome {
     pub code: &'static str,
     pub reason: &'static str,
     retry_after_ms: Option<u64>,
+    os_error_domain: Option<String>,
+    os_error_code: Option<isize>,
 }
 impl Outcome {
     pub(crate) fn unavailable(reason: &'static str) -> Self {
@@ -203,6 +248,8 @@ impl Outcome {
             code: error_codes::OPERATOR_PRESENCE_UNAVAILABLE,
             reason,
             retry_after_ms: None,
+            os_error_domain: None,
+            os_error_code: None,
         }
     }
     fn declined(reason: &'static str) -> Self {
@@ -210,6 +257,8 @@ impl Outcome {
             code: error_codes::OPERATOR_DECLINED,
             reason,
             retry_after_ms: None,
+            os_error_domain: None,
+            os_error_code: None,
         }
     }
     fn with_retry_after_ms(mut self, retry_after_ms: u64) -> Self {
@@ -221,6 +270,8 @@ impl Outcome {
             code,
             reason: "",
             retry_after_ms: None,
+            os_error_domain: None,
+            os_error_code: None,
         }
     }
     fn from_provider(result: ProviderResult) -> Self {
@@ -229,11 +280,27 @@ impl Outcome {
                 code: "confirmed",
                 reason: "",
                 retry_after_ms: None,
+                os_error_domain: None,
+                os_error_code: None,
             },
             ProviderResult::Declined => Self::declined("person"),
             ProviderResult::Unavailable => Self::unavailable("provider_error"),
             ProviderResult::UnsupportedPlatform => Self::unavailable("unsupported_platform"),
             ProviderResult::NoPresence => Self::unavailable("no_presence"),
+            ProviderResult::LocalAuthenticationError {
+                failure,
+                domain,
+                code,
+            } => {
+                let mut outcome = match failure {
+                    OperatorOsErrorKind::Declined => Self::declined("person"),
+                    OperatorOsErrorKind::NoPresence => Self::unavailable("no_presence"),
+                    OperatorOsErrorKind::ProviderError => Self::unavailable("provider_error"),
+                };
+                outcome.os_error_domain = Some(domain);
+                outcome.os_error_code = Some(code);
+                outcome
+            }
         }
     }
     pub(crate) fn frame(self, request: &Frame) -> Frame {
@@ -282,13 +349,14 @@ pub(crate) fn audit(
     module_id: &str,
     summary: &str,
     principal: &str,
-    outcome: Outcome,
+    outcome: &Outcome,
     wait: Duration,
     prompt: Duration,
     prompt_shown: bool,
 ) {
     tracing::info!(target: "subc_daemon::operator_confirm", module_id, summary = ?summary,
         principal, outcome = outcome.code, reason = outcome.reason,
+        os_error_domain = ?outcome.os_error_domain, os_error_code = ?outcome.os_error_code,
         wait_ms = wait.as_millis() as u64, prompt_ms = prompt.as_millis() as u64,
         prompt_shown, "operator_confirm_audit");
 }
@@ -498,7 +566,7 @@ impl OperatorConfirms {
                 &module_id,
                 &request.summary,
                 &principal,
-                outcome,
+                &outcome,
                 Duration::ZERO,
                 Duration::ZERO,
                 false,
@@ -571,7 +639,7 @@ impl OperatorConfirms {
                     operation,
                     &text,
                     &caller,
-                    outcome,
+                    &outcome,
                     Duration::ZERO,
                     Duration::ZERO,
                     false,
@@ -649,16 +717,17 @@ impl OperatorConfirms {
             &request.module_id,
             &request.summary,
             &request.principal,
-            outcome,
+            &outcome,
             wait,
             prompt,
             shown,
         );
         if let RequestKind::Privileged { answer, key } = &request.kind {
+            let person_declined = outcome.reason == "person";
             if let Some(answer) = answer.lock().unwrap_or_else(|p| p.into_inner()).take() {
                 let _ = answer.send(outcome);
             }
-            if outcome.reason == "person" {
+            if person_declined {
                 self.count_person_decline(state, key);
             }
             return;

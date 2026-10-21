@@ -382,6 +382,8 @@ fn audit_fields(line: &str) -> BTreeMap<String, String> {
         fields.keys().map(String::as_str).collect::<Vec<_>>(),
         [
             "module_id",
+            "os_error_code",
+            "os_error_domain",
             "outcome",
             "principal",
             "prompt_ms",

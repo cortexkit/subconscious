@@ -3,7 +3,7 @@ use std::sync::{mpsc, Arc};
 use block2::RcBlock;
 use objc2::runtime::Bool;
 use objc2_foundation::{NSError, NSString};
-use objc2_local_authentication::{LAContext, LAError, LAErrorDomain, LAPolicy};
+use objc2_local_authentication::{LAContext, LAPolicy};
 
 use crate::{Outcome, Withdraw};
 
@@ -16,18 +16,6 @@ struct Handle(mpsc::Sender<Event>);
 impl Withdraw for Handle {
     fn withdraw(&self) {
         let _ = self.0.send(Event::Withdraw);
-    }
-}
-
-fn outcome(success: bool, error: Option<(bool, isize)>) -> Outcome {
-    match (success, error) {
-        (true, None) => Outcome::Approved,
-        (false, Some((true, code)))
-            if code == LAError::UserCancel.0 || code == LAError::AuthenticationFailed.0 =>
-        {
-            Outcome::Declined
-        }
-        _ => Outcome::ProviderError,
     }
 }
 
@@ -51,9 +39,15 @@ pub(super) fn prompt(text: &str, publish: Box<dyn FnOnce(Arc<dyn Withdraw>) + Se
         let error = unsafe {
             error
                 .as_ref()
-                .map(|error| (*error.domain() == *LAErrorDomain, error.code()))
+                .map(|error| (error.domain().to_string(), error.code()))
         };
-        let _ = sender.send(Event::Returned(outcome(success.as_bool(), error)));
+        let outcome = crate::local_authentication_outcome(
+            success.as_bool(),
+            error
+                .as_ref()
+                .map(|(domain, code)| (domain.as_str(), *code)),
+        );
+        let _ = sender.send(Event::Returned(outcome));
     });
     // SAFETY: the nonempty reason and sendable reply block are retained for the
     // entire evaluation. DeviceOwnerAuthentication includes the password fallback.
@@ -77,27 +71,4 @@ pub(super) fn prompt(text: &str, publish: Box<dyn FnOnce(Arc<dyn Withdraw>) + Se
         }
     }
     Outcome::ProviderError
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn macos_only_explicit_success_approves() {
-        assert_eq!(outcome(true, None), Outcome::Approved);
-        assert_eq!(outcome(false, None), Outcome::ProviderError);
-        for code in [LAError::AppCancel.0, LAError::SystemCancel.0, -1004, 123] {
-            assert_eq!(outcome(false, Some((true, code))), Outcome::ProviderError);
-        }
-        assert_eq!(outcome(true, Some((true, -2))), Outcome::ProviderError);
-        assert_eq!(outcome(false, Some((false, -2))), Outcome::ProviderError);
-    }
-
-    #[test]
-    fn macos_cancel_and_bad_credentials_decline() {
-        for code in [LAError::UserCancel.0, LAError::AuthenticationFailed.0] {
-            assert_eq!(outcome(false, Some((true, code))), Outcome::Declined);
-        }
-    }
 }

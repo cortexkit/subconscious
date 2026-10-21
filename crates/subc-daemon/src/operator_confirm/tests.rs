@@ -180,7 +180,7 @@ impl OperatorProvider for Immediate {
         _: &str,
         _: Box<dyn FnOnce(Arc<dyn OperatorWithdraw>) + Send>,
     ) -> ProviderResult {
-        self.0
+        self.0.clone()
     }
 }
 #[derive(Debug, PartialEq)]
@@ -254,7 +254,7 @@ impl OperatorProvider for Arc<Controlled> {
         publish(Arc::new(ControlHandle(self.clone())));
         self.wait();
         self.events.send(Event::Returned).ok();
-        self.result
+        self.result.clone()
     }
 }
 async fn event(rx: &mut mpsc::UnboundedReceiver<Event>) -> Event {
@@ -756,7 +756,7 @@ async fn saturated_egress_bounds_deliveries_and_does_not_block_other_prompts() {
 }
 
 #[test]
-fn refused_audit_has_exact_fields_and_debug_escaped_summary() {
+fn operator_confirm_audit_logs_os_error_details_and_escapes_summary() {
     use tracing::{
         field::{Field, Visit},
         Event, Subscriber,
@@ -792,12 +792,26 @@ fn refused_audit_has_exact_fields_and_debug_escaped_summary() {
                 "m",
                 summary,
                 "direct",
-                Outcome::refusal(error_codes::OPERATOR_SUMMARY_INVALID),
+                &Outcome::refusal(error_codes::OPERATOR_SUMMARY_INVALID),
                 Duration::ZERO,
                 Duration::ZERO,
                 false,
             );
         }
+        let no_presence = Outcome::from_provider(ProviderResult::LocalAuthenticationError {
+            failure: OperatorOsErrorKind::NoPresence,
+            domain: "com.apple.LocalAuthentication".to_string(),
+            code: -4,
+        });
+        audit(
+            "m",
+            "locked screen",
+            "direct",
+            &no_presence,
+            Duration::ZERO,
+            Duration::ZERO,
+            true,
+        );
     });
     for fields in captured.lock().unwrap().iter() {
         let mut keys: Vec<_> = fields.keys().map(String::as_str).collect();
@@ -807,6 +821,8 @@ fn refused_audit_has_exact_fields_and_debug_escaped_summary() {
             [
                 "message",
                 "module_id",
+                "os_error_code",
+                "os_error_domain",
                 "outcome",
                 "principal",
                 "prompt_ms",
@@ -820,7 +836,16 @@ fn refused_audit_has_exact_fields_and_debug_escaped_summary() {
         assert!(!fields["summary"].contains(['\n', '\r', '\t', '\u{202e}']));
         assert!(fields["summary"].starts_with('"'));
     }
-    assert_eq!(captured.lock().unwrap().len(), 5);
+    let captured = captured.lock().unwrap();
+    let fields = &captured[5];
+    assert_eq!(fields["message"], "operator_confirm_audit");
+    assert_eq!(fields["reason"], "no_presence");
+    assert_eq!(
+        fields["os_error_domain"],
+        "Some(\"com.apple.LocalAuthentication\")"
+    );
+    assert_eq!(fields["os_error_code"], "Some(-4)");
+    assert_eq!(captured.len(), 6);
 }
 
 #[cfg(feature = "test-support")]

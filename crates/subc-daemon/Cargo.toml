@@ -1,6 +1,6 @@
 [package]
 name = "subc-daemon"
-version = "0.36.24"
+version = "0.36.25"
 edition = "2021"
 publish = true
 description = "Embeddable subc daemon: bootstrap, module supervision, and opaque-byte splice routing."
@@ -50,7 +50,7 @@ subc-jobobject = { path = "../subc-jobobject", version = "0.2.2" }
 # The OS authentication prompts live only in the daemon. Keeping them in their
 # own crate, depended on here and nowhere else, keeps those platform bindings
 # out of subc-client-rs and the other crates modules build against.
-subc-presence = { path = "../subc-presence", version = "0.1.0" }
+subc-presence = { path = "../subc-presence", version = "0.1.2" }
 
 [target.'cfg(unix)'.dependencies]
 # SIGTERM for `protocol: "none"` teardown. This crate forbids unsafe code, so

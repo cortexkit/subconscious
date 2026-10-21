@@ -2,14 +2,16 @@ use std::future::Future;
 
 use crate::router::test_log::{captured_logs, log_capture};
 
-async fn open_with_ack_delay(delay: Duration) -> String {
+async fn open_with_ack_delay(delay: Duration, scope_ref: Option<&str>) -> String {
     let mut rig = rig().await;
-    let mut record = session(1);
-    record.carriers.push(ScopeCarrier::new(Principal::Direct));
-    rig.sync(vec![record]).await;
+    let scope = scope_ref.map(|scope_ref| rig.selector(scope_ref, Some(1)));
+    if let Some(scope_ref) = scope_ref {
+        let mut record = head(scope_ref, 1);
+        record.carriers.push(ScopeCarrier::new(Principal::Direct));
+        rig.sync(vec![record]).await;
+    }
     let (output, subscriber) = log_capture(tracing::Level::INFO);
-    let (client, mut client_rx, frame) =
-        rig.open_frame(None, PLEXUS, Some(rig.selector("s", Some(1))));
+    let (client, mut client_rx, frame) = rig.open_frame(None, PLEXUS, scope);
     let corr = frame.header.corr;
     let started_at = Instant::now().into_std();
     let mut open = Box::pin(rig.handler.handle_control_frame_timed(
@@ -50,7 +52,7 @@ fn logged_millis(line: &str, field: &str) -> u64 {
 
 #[tokio::test(start_paused = true)]
 async fn slow_route_open_warning_names_target_principal_and_dominant_ack_phase() {
-    let logs = open_with_ack_delay(Duration::from_secs(2)).await;
+    let logs = open_with_ack_delay(Duration::from_secs(2), Some("s")).await;
     let warnings = logs
         .lines()
         .filter(|line| line.contains("slow control dispatch"))
@@ -88,8 +90,44 @@ async fn slow_route_open_warning_names_target_principal_and_dominant_ack_phase()
 
 #[tokio::test(start_paused = true)]
 async fn fast_route_open_emits_no_slow_dispatch_warning() {
-    let logs = open_with_ack_delay(Duration::ZERO).await;
+    let logs = open_with_ack_delay(Duration::ZERO, Some("s")).await;
     assert!(!logs.contains("slow control dispatch"), "{logs}");
     assert!(!logs.contains("bind_ack_wait_ms="), "{logs}");
     assert!(logs.contains("route.open accepted"), "{logs}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn route_open_accept_log_records_scoped_and_unscoped_opens() {
+    let unscoped_logs = open_with_ack_delay(Duration::ZERO, None).await;
+    let unscoped = unscoped_logs
+        .lines()
+        .find(|line| line.contains("route.open accepted"))
+        .expect("accepted route.open log");
+    assert!(unscoped.contains("scope=none"), "{unscoped}");
+
+    let scope_ref = "scope-reference-123456789";
+    let scoped_logs = open_with_ack_delay(Duration::ZERO, Some(scope_ref)).await;
+    let scoped = scoped_logs
+        .lines()
+        .find(|line| line.contains("route.open accepted"))
+        .expect("accepted route.open log");
+    assert!(
+        scoped.contains(r#"scope=head/reserved:prefrontal-core/"scope-reference-123456789"@1"#),
+        "{scoped}"
+    );
+    assert!(!scoped.contains("bind_proof"), "{scoped}");
+    assert!(!scoped.contains("attributes"), "{scoped}");
+
+    // A long ref is cut to 64 characters so one open cannot flood the line.
+    let long_ref = "r".repeat(100);
+    let long_logs = open_with_ack_delay(Duration::ZERO, Some(&long_ref)).await;
+    let long = long_logs
+        .lines()
+        .find(|line| line.contains("route.open accepted"))
+        .expect("accepted route.open log");
+    assert!(
+        long.contains(&format!("/\"{}…\"@1", "r".repeat(64))),
+        "{long}"
+    );
+    assert!(!long.contains(&"r".repeat(65)), "{long}");
 }

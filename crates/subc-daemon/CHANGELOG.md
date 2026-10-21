@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.36.25
+
+- The `route.open accepted` log line now says whether the open carried a scope: `scope=none`, or `scope=<kind>/<owner>/"<ref>"@<epoch>` from the stamp admission issued, with the ref quoted and cut to 64 characters. The bind proof and the scope's attributes are never logged.
+- The operator confirmation audit line now carries the LocalAuthentication error domain and code (`os_error_domain`, `os_error_code`). A locked or non-interactive Mac (system cancel, not interactive) is reported as `no_presence`; a failed authentication or a user cancel is still a decline, any other error is `provider_error`, and nothing but an explicit success approves.
+- Requires subc-presence 0.1.2.
+
 ## 0.36.24
 
 - Test-only release; daemon behaviour is unchanged. 0.36.23 was never published: its Windows lint failed, because a log-capture helper used only by Unix tests was compiled on Windows too. It is now Unix-only. The caller-identity prompt test now holds its connecting socket in a dedicated child process: on Linux and macOS the lookup leaves a caller unresolved when more than one process holds the socket, and on Unix a test process that spawns children in parallel tests lends them copies of its own sockets until they exec. A new test pins an ordering that a client test had wrongly assumed: a configured module reads `starting` in `supervisor.list` until its first process is admitted, although that process may already be registered and listed in `catalog.list`. The startup-order test that waits for a `supervisor.set_enabled` reply now prints the in-process daemon's log when the reply does not arrive.

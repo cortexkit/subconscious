@@ -6,9 +6,9 @@
   ▸ Modules           │  ◉ aft                  │                                                                       
     Daemon  ╭─ Save subc.jsonc ────────────────────────────────────────────────────────────────────────────╮            
     Updates │                                                                                              │            
-    Credenti│  ~/.config/cortexkit/subc.jsonc · 1 change · comments kept · a copy of the old file is kept  │            
-    Permissi│                                                                                              │/broca      
-    About   │   306    // difference.                                                                      │g     new   
+    About   │  ~/.config/cortexkit/subc.jsonc · 1 change · comments kept · a copy of the old file is kept  │            
+            │                                                                                              │/broca      
+            │   306    // difference.                                                                      │g     new   
             │   307    "env": {                                                                            │            
             │   308  -   "BROCA_STATE_ROOT": "/Users/alex/.local/share/cortexkit/broca"                    │            
             │   308  +   "BROCA_STATE_ROOT": "/Users/alex/.local/share/cortexkit/broca",                   │ster        

@@ -51,7 +51,7 @@
 7 51 14 dim - -
 7 65 4 faint - -
 8 2 1 acc - -
-8 4 11 dim - -
+8 4 5 dim - -
 8 22 1 faint - -
 8 24 1 - sel -
 8 25 1 ok sel -
@@ -61,15 +61,11 @@
 8 45 1 warn sel -
 8 46 1 - sel -
 8 48 1 faint - -
-9 2 1 acc - -
-9 4 11 dim - -
 9 22 1 faint - -
 9 25 1 ok - -
 9 48 1 faint - -
 9 51 11 dim - -
 9 84 30 dim - -
-10 2 1 acc - -
-10 4 5 dim - -
 10 22 1 faint - -
 10 25 1 ok - -
 10 48 1 faint - -

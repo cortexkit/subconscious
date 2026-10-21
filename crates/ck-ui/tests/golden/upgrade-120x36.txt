@@ -6,9 +6,9 @@
     Modules           │                                                                                                 
     Daemon            │  Component             Installed    New          What happens                                   
   ▸ Updates        ●  │  ────────────────────────────────────────────────────────────────────────────────────────────   
-    Credentials       │  ck                    0.20.108     0.20.110     replace                                        
-    Permissions       │  daemon (ck-subc)      0.36.17      0.36.18      replace · restarts everything                  
-    About             │  MCP gateway           0.1.40       0.1.40       up to date                                     
+    About             │  ck                    0.20.108     0.20.110     replace                                        
+                      │  daemon (ck-subc)      0.36.17      0.36.18      replace · restarts everything                  
+                      │  MCP gateway           0.1.40       0.1.40       up to date                                     
                       │  message bus           0.4.8        0.4.8        up to date                                     
                       │                                                                                                 
                       │  Upgrading restarts the daemon, which restarts every module. It takes about 40 s.               

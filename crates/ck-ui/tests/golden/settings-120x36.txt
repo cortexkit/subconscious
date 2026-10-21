@@ -6,9 +6,9 @@
   ▸ Modules           │  ◉ aft                  │                                                                       
     Daemon            │  ◉ astrocyte            │  Program       ~/.local/share/cortexkit/bin/ck-broca                  
     Updates        ●  │  ◉ basal                │  Arguments     none                                                   
-    Credentials       │  ◉ broca             •  │                                                                       
-    Permissions       │  ◉ callosum             │  Environment   BROCA_STATE_ROOT   ~/.local/share/cortexkit/broca      
-    About             │  ◉ cerebellum           │                CK_LOG             info,broca.requests=debug     new   
+    About             │  ◉ broca             •  │                                                                       
+                      │  ◉ callosum             │  Environment   BROCA_STATE_ROOT   ~/.local/share/cortexkit/broca      
+                      │  ◉ cerebellum           │                CK_LOG             info,broca.requests=debug     new   
                       │  ◉ cingulate            │                + add variable                                         
                       │  ◉ ckbus                │                                                                       
                       │  ◉ claustrum            │  Reserved      yes · only a daemon-launched broca may register        

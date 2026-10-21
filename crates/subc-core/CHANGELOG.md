@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.20.115
+
+- `ck` with no arguments, when stdin and stdout are both terminals, opens the full-screen app (`ck-ui`) on live data from the daemon and its modules; piped or redirected it prints the dashboard as before. When the daemon is down the app says so, shows the daemon's last log line and the installed service's state, starts the service on ⏎, and reconnects by itself every 2 s.
+- Modules in the app restart (`r`), stop and start (`s`) with the same requests `ck module restart|stop|start` send; restart and stop always ask first, naming the open routes, the work in flight the module reports and its drain limit. Each action shows its live phase and the result says what happened (new pid, time to healthy, or the refusal). `l` opens the module's full log, read from the same sources and merged by the same code as `ck module logs <id>`; `m` lists all its metrics.
+- The setup engine gains `installed_service_facts` (whether the installed service is loaded and restarts on failure) and `start_installed_service` (starts a loaded service the way setup does); `ck setup` is unchanged.
+- The rule for which health metrics `ck health <id>` headlines, and the wording of their values, moved to `ck_ui::metrics` so the app and `ck health` share it; `ck health` output is unchanged.
+- `ck quota`'s reading of the quota module's usage rows (provider and account, every window shape including `extraRateWindows`, spend pools, errors and disconnected-row classes) moved to `ck_ui::quota`, which the app's Usage panel also reads; `ck quota` output is unchanged, pinned by a test over recorded rows.
+
 ## 0.20.114
 
 - Ship subc-daemon 0.36.22: a drain that runs to its ceiling now says which declared busy gauge held it and why.

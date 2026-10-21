@@ -1139,6 +1139,26 @@ pub fn default_claustrum_key_path() -> Result<Option<PathBuf>, String> {
     }
 }
 
+/// The installed daemon service as the service manager sees it, for the
+/// app's daemon-down screen.
+pub fn installed_service_facts() -> Result<runtime::ServiceFacts, String> {
+    let platform = RuntimePlatform::current();
+    let paths = runtime::runtime_paths(platform, &data_directory()?.join("bin"), &user_home()?);
+    Ok(runtime::service_facts(
+        platform,
+        &paths,
+        &mut SystemCommandRunner,
+    ))
+}
+
+/// Starts the installed daemon service through the service manager, the
+/// way setup starts it, without changing the installed definition.
+pub fn start_installed_service() -> Result<(), String> {
+    let platform = RuntimePlatform::current();
+    let paths = runtime::runtime_paths(platform, &data_directory()?.join("bin"), &user_home()?);
+    runtime::start_installed(platform, &paths, &mut SystemCommandRunner)
+}
+
 pub(crate) fn data_directory() -> Result<PathBuf, String> {
     if cfg!(windows) {
         return env::var_os("LOCALAPPDATA")

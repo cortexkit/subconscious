@@ -28,7 +28,7 @@ async fn main() -> std::io::Result<()> {
                 s.modules.received_at = now;
                 if seconds.is_multiple_of(5) {
                     for m in &mut s.modules.data {
-                        m.health_checked_at = now;
+                        m.health_checked_at = Some(now);
                     }
                 }
             });
@@ -42,6 +42,7 @@ async fn main() -> std::io::Result<()> {
         rx,
         RunOptions {
             clock: Arc::new(clock),
+            ..RunOptions::default()
         },
     )
     .await

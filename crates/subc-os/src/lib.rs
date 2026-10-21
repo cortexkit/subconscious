@@ -41,6 +41,9 @@
 //! macOS it is `proc_pid_rusage`, plus `mach_timebase_info` to convert its CPU
 //! times to nanoseconds, the other two unsafe calls in the crate.
 //!
+//! For the machine as a whole, [`host`] reads total and available memory, the
+//! load averages and the space on a filesystem, again for reporting only.
+//!
 //! And it carries the launch nonce from the daemon to each module it spawns
 //! over an inherited Unix pipe or a PID-authenticated Windows named pipe:
 //! [`launch_nonce`] is the one cached reader every module uses. Windows keeps
@@ -51,6 +54,7 @@
 
 #[cfg(all(unix, feature = "test-support"))]
 pub mod fork_exec_test;
+pub mod host;
 pub mod launch_nonce;
 pub mod privacy_identity;
 pub mod process_identity;

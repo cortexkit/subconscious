@@ -11,13 +11,14 @@
 
 use crate::draw::{
     chrome, frame_end, heading, live_dot, pad_right, spark, status_glyph, status_word, trunc,
-    Canvas, Clip,
+    width, Canvas, Clip,
 };
-use crate::model::{LogLevel, ProcessEventKind, Status};
+use crate::model::{LogLevel, Module, ProcessEventKind, Status};
 use crate::theme::{Bg, Fg, St};
 use crate::time::{ago, js_round};
 
-use super::{fmt_cpu, fmt_mem, window, View};
+use super::overlays::wrap;
+use super::{fmt_cpu, fmt_mem, window, View, UNKNOWN};
 
 /// The table's geometry at a window size.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -31,6 +32,21 @@ pub struct Layout {
     /// The last screen row the table, and the lists under it, may draw on:
     /// the row just above the footer.
     pub last: i32,
+}
+
+/// The widths of the table's fixed columns. Health starts at column 24 and
+/// has a space before CPU; CPU, Memory and Up end at columns 39, 48 and 58.
+const HEALTH_W: usize = 9;
+const CPU_W: usize = 5;
+const MEM_W: usize = 8;
+const UP_W: usize = 8;
+
+/// What a numeric cell shows when there is no value.
+pub const MISSING: &str = "–";
+
+/// Right-aligns `text` to end at `end`, cut to `width` columns.
+fn cell(c: &mut Canvas, end: i32, y: i32, width: usize, text: &str, st: St) {
+    c.right(end, y, &trunc(text, width), st);
 }
 
 /// Where the Summary column starts, two columns after Build's ten.
@@ -127,7 +143,7 @@ pub fn module_at(w: i32, h: i32, len: usize, sel: usize, y: i32) -> Option<usize
 
 pub fn draw(c: &mut Canvas, v: &View) {
     let snap = v.snap;
-    chrome(c, 1, &v.clock(), &snap.host.data.label);
+    chrome(c, 1, snap.serves.tabs, &v.clock(), &snap.host.data.label);
     let mods = &snap.modules.data;
     let l = layout(c.w, c.h);
     let (lw, last) = (l.lw, l.last);
@@ -135,7 +151,9 @@ pub fn draw(c: &mut Canvas, v: &View) {
 
     c.put(2, 3, "Modules", St::B);
     c.put(10, 3, &mods.len().to_string(), St::D);
-    c.right(lw, 3, "/ to filter", St::F);
+    if snap.serves.list_filter {
+        c.right(lw, 3, "/ to filter", St::F);
+    }
     c.put(4, 5, "Module", St::D);
     c.put(24, 5, "Health", St::D);
     c.right(39, 5, "CPU", St::D);
@@ -156,25 +174,40 @@ pub fn draw(c: &mut Canvas, v: &View) {
     for (i, m) in mods.iter().enumerate().skip(r.first).take(r.count) {
         let (g, gst) = status_glyph(m.status);
         let ok = m.status == Status::Ok;
+        // An action in flight shows its phase where the health word goes.
+        let (g, gst, word) = match &m.action {
+            Some(a) => ("◐", St::A, action_word(a)),
+            None => (g, gst, status_word(m.status).to_string()),
+        };
         c.put(2, y, g, gst);
         let x = c.put(4, y, &trunc(&m.id, 18), if ok { St::NONE } else { St::B });
         if m.pending_restart.is_some() {
             c.put(x + 1, y, "↻", St::A);
         }
-        c.put(24, y, status_word(m.status), if ok { St::D } else { gst });
-        let cpu_st = if m.cpu_percent >= 10.0 {
-            St::NONE
+        // Every column is cut to its own width, so no value runs into the
+        // next one; a missing number is a dim dash.
+        let word_st = if m.action.is_some() || !ok {
+            gst
         } else {
             St::D
         };
-        c.right(39, y, &fmt_cpu(m.cpu_percent), cpu_st);
-        let mem_st = if m.memory_mb >= 1024.0 {
-            St::NONE
-        } else {
-            St::D
-        };
-        c.right(48, y, &fmt_mem(m.memory_mb), mem_st);
-        c.right(58, y, &ago(v.age(m.started_at)), St::D);
+        c.put(24, y, &trunc(&word, HEALTH_W), word_st);
+        match m.cpu_percent {
+            Some(cpu) => {
+                let cpu_st = if cpu >= 10.0 { St::NONE } else { St::D };
+                cell(c, 39, y, CPU_W, &fmt_cpu(cpu), cpu_st);
+            }
+            None => cell(c, 39, y, CPU_W, MISSING, St::D),
+        }
+        match m.memory_mb {
+            Some(mb) => {
+                let mem_st = if mb >= 1024.0 { St::NONE } else { St::D };
+                cell(c, 48, y, MEM_W, &fmt_mem(mb), mem_st);
+            }
+            None => cell(c, 48, y, MEM_W, MISSING, St::D),
+        }
+        let up = uptime(v, m);
+        cell(c, 58, y, UP_W, up.as_deref().unwrap_or(MISSING), St::D);
         c.put(61, y, &trunc(&m.build, 10), St::D);
         if l.summary {
             let text = trunc(&m.summary, (lw - SUMMARY_X).max(0) as usize);
@@ -196,13 +229,24 @@ pub fn draw(c: &mut Canvas, v: &View) {
     if !r.above && !r.below && last - ev_top >= 4 {
         heading(c, 2, ev_top, lw - 2, "Starts and exits", "today");
         let today = v.civil(v.now).days;
-        let events = snap
+        let todays: Vec<_> = snap
             .process_events
             .data
             .iter()
             .filter(|e| v.civil(e.at).days == today)
-            .take((last - ev_top - 1) as usize);
-        for (i, e) in events.enumerate() {
+            .collect();
+        // With nothing from today, the section says so (or why it can't
+        // tell) instead of leaving a heading over a blank block.
+        if todays.is_empty() {
+            let note = if snap.process_events.loaded {
+                "No starts or exits today"
+            } else {
+                snap.process_events.error.as_deref().unwrap_or(UNKNOWN)
+            };
+            c.put(2, ev_top + 2, &trunc(note, (lw - 2).max(0) as usize), St::D);
+        }
+        let room = (last - ev_top - 1).max(0) as usize;
+        for (i, e) in todays.into_iter().take(room).enumerate() {
             let y = ev_top + 2 + i as i32;
             c.put(2, y, &v.civil(e.at).hms(), St::D);
             c.put(12, y, &pad_right(&e.module, 18), St::B);
@@ -226,18 +270,53 @@ pub fn draw(c: &mut Canvas, v: &View) {
         c.set_clip(prev);
     }
 
-    frame_end(
-        c,
-        &[
-            ("↑↓", "select"),
-            ("r", "restart"),
-            ("s", "stop"),
-            ("l", "logs"),
-            ("e", "settings"),
-        ],
-        &v.updated(&snap.modules),
-        St::D,
-    );
+    // The table is one source; when it is aging or failing the footer says
+    // so in amber, and past five refresh intervals the rows dim.
+    let meta = v.meta(&snap.modules, "");
+    let (status, status_st) = if meta.text.is_empty() {
+        (v.updated(&snap.modules), St::D)
+    } else {
+        (meta.text.clone(), meta.st)
+    };
+    if meta.dim {
+        c.dim_rect(1, 7, lw, last - 6);
+    }
+    let selected = mods.get(sel);
+    let s_label = match selected.map(|m| m.status) {
+        Some(Status::Stopped) => "start",
+        _ => "stop",
+    };
+    // A key is offered only for what exists: no Settings screen, no `e`.
+    let mut hints = vec![
+        ("↑↓", "select"),
+        ("r", "restart"),
+        ("s", s_label),
+        ("l", "logs"),
+    ];
+    if snap.serves.all_metrics {
+        hints.push(("m", "all metrics"));
+    }
+    if snap.serves.settings {
+        hints.push(("e", "settings"));
+    }
+    frame_end(c, &hints, &status, status_st);
+}
+
+/// An action's phase in the table's health column, which is nine columns
+/// wide.
+fn action_word(a: &crate::model::ModuleAction) -> String {
+    use crate::model::ActionPhase;
+    match &a.phase {
+        ActionPhase::Asking => a.kind.verb().to_string(),
+        ActionPhase::Draining => "draining".into(),
+        ActionPhase::Stopped => "stopped".into(),
+        ActionPhase::Starting { .. } => "starting".into(),
+    }
+}
+
+/// How long the module's process has been up, if known.
+fn uptime(v: &View, m: &Module) -> Option<String> {
+    m.started_at.map(|t| ago(v.age(t)))
 }
 
 /// The detail pane for the selected module.
@@ -248,13 +327,24 @@ fn pane(c: &mut Canvas, v: &View, sel: usize, lw: i32) {
     let (g, gst) = status_glyph(m.status);
     c.put(x, 3, &m.id, St::B);
     c.right(x + dw, 3, &format!("{g} {}", status_word(m.status)), gst);
-    let facts = format!(
-        "pid {} · up {} · build {}",
-        m.pid,
-        ago(v.age(m.started_at)),
-        m.build
-    );
-    c.put(x, 4, &facts, St::D);
+    let pid = m.pid.map_or_else(|| UNKNOWN.to_string(), |p| p.to_string());
+    let up = match (uptime(v, m), m.status) {
+        (Some(up), _) => up,
+        (None, Status::Stopped) => "not running".into(),
+        (None, _) => UNKNOWN.into(),
+    };
+    let facts = format!("pid {pid} · up {up} · build {}", m.build);
+    c.put(x, 4, &trunc(&facts, dw.max(0) as usize), St::D);
+    if let Some(a) = &m.action {
+        let line = format!(
+            "{} · {} · {}",
+            a.kind.verb(),
+            a.phase_text(),
+            ago(v.age(a.started_at))
+        );
+        c.put(x, 5, "◐", St::A);
+        c.put(x + 2, 5, &trunc(&line, (dw - 2).max(0) as usize), St::A);
+    }
 
     let mut y = 6;
     if let Some(pending) = &m.pending_restart {
@@ -270,19 +360,74 @@ fn pane(c: &mut Canvas, v: &View, sel: usize, lw: i32) {
         y += 2;
     }
 
-    let checked = format!("checked {} ago", ago(v.age(m.health_checked_at)));
+    let checked = m.health_checked_at.map_or_else(
+        || "never checked".to_string(),
+        |t| format!("checked {} ago", ago(v.age(t))),
+    );
     heading(c, x, y, dw, "Health", &checked);
     y += 2;
-    c.put(x, y, &trunc(&m.summary, dw.max(0) as usize), St::NONE);
-    y += 1;
-    for metric in &m.metrics {
-        c.put(x, y, &pad_right(&metric.label, 18), St::D);
+    // The CPU and memory chart and the log always keep their rows: a blank,
+    // a heading and two sparklines, a blank, a heading and at least two log
+    // lines. The module's sentence and metrics share what is left.
+    let last = c.h - 4;
+    let keep = 10;
+    let mut room = (last + 1 - y - keep).max(1);
+    // The module's own sentence, in full and wrapped, as far as room allows.
+    for line in wrap(&m.summary, dw.max(1) as usize) {
+        if room == 0 {
+            break;
+        }
+        c.put(x, y, &line, St::NONE);
+        y += 1;
+        room -= 1;
+    }
+    if m.summary.is_empty() && m.metrics.is_empty() {
+        // A heading never stands over nothing.
+        c.put(x, y, "No details reported", St::D);
+        y += 1;
+        room -= 1;
+    } else if m.summary.is_empty() {
+        y += 1;
+    }
+    // The metrics the module names as its headline: labels in a column wide
+    // enough for the longest, at least 18 and leaving the value at least 10
+    // columns (a longer label is cut), a gap, then the value.
+    let col = m
+        .metrics
+        .iter()
+        .map(|x| width(&x.label) as i32 + 2)
+        .max()
+        .unwrap_or(0)
+        .clamp(18, (dw - 10).max(18));
+    let fits = (room.max(0) as usize).min(m.metrics.len());
+    let shown = if fits < m.metrics.len() {
+        fits.saturating_sub(1)
+    } else {
+        fits
+    };
+    for metric in m.metrics.iter().take(shown) {
         c.put(
-            x + 18,
+            x,
             y,
-            &trunc(&metric.value, (dw - 18).max(0) as usize),
+            &pad_right(&trunc(&metric.label, (col - 2) as usize), col as usize),
+            St::D,
+        );
+        c.put(
+            x + col,
+            y,
+            &trunc(&metric.value, (dw - col).max(0) as usize),
             St::NONE,
         );
+        y += 1;
+    }
+    if shown < m.metrics.len() {
+        let more = m.metrics.len() - shown;
+        let note = if v.snap.serves.all_metrics {
+            format!("+{more} more · m all metrics")
+        } else {
+            format!("+{more} more")
+        };
+        c.put(x, y, &note, St::D);
         y += 1;
     }
 
@@ -290,12 +435,17 @@ fn pane(c: &mut Canvas, v: &View, sel: usize, lw: i32) {
     heading(c, x, y, dw, "CPU and memory", "last 10 min");
     y += 2;
     let n = (dw - 8).max(0) as usize;
-    if !m.cpu_history.is_empty() {
+    if m.cpu_history.iter().any(|c| c.is_finite()) {
         let max = m.cpu_history.iter().copied().fold(f64::MIN, f64::max) * 1.1;
         let cpu = window(&m.cpu_history, v.spark_offset(), n);
         spark(c, x, y, cpu, Fg::Acc, Some(max), 0.0);
     }
-    c.right(x + dw, y, &fmt_cpu(m.cpu_percent), St::NONE);
+    c.right(
+        x + dw,
+        y,
+        &m.cpu_percent.map_or_else(|| UNKNOWN.to_string(), fmt_cpu),
+        St::NONE,
+    );
     y += 1;
     let mem = window(&m.memory_history, 0, n);
     if !mem.is_empty() {
@@ -303,7 +453,12 @@ fn pane(c: &mut Canvas, v: &View, sel: usize, lw: i32) {
         let min = mem.iter().copied().fold(f64::MAX, f64::min);
         spark(c, x, y, mem, Fg::Dim, Some(max), min * 0.97);
     }
-    c.right(x + dw, y, &fmt_mem(m.memory_mb), St::D);
+    c.right(
+        x + dw,
+        y,
+        &m.memory_mb.map_or_else(|| UNKNOWN.to_string(), fmt_mem),
+        St::D,
+    );
 
     y += 2;
     heading(c, x, y, dw, "Log", "");
@@ -316,7 +471,9 @@ fn pane(c: &mut Canvas, v: &View, sel: usize, lw: i32) {
         if y >= c.h {
             break;
         }
-        c.put(x, y, &v.civil(line.at).hm(), St::D);
+        if let Some(at) = line.at {
+            c.put(x, y, &v.civil(at).hm(), St::D);
+        }
         let (flag, flag_st) = match line.level {
             LogLevel::Warn => ("▲", St::W),
             LogLevel::Error => ("✕", St::E),

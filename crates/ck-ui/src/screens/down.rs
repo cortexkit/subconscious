@@ -1,10 +1,10 @@
 //! The screen shown instead of an error when the daemon isn't running.
 
-use crate::draw::{footer, pad_right, Canvas};
+use crate::draw::{footer, pad_right, trunc, Canvas};
 use crate::model::DaemonDown;
 use crate::theme::{Bg, Fg, St};
 
-use super::View;
+use super::{View, UNKNOWN};
 
 pub fn draw(c: &mut Canvas, v: &View, d: &DaemonDown) {
     c.put(1, 0, "◆", St::A.bold());
@@ -28,18 +28,17 @@ pub fn draw(c: &mut Canvas, v: &View, d: &DaemonDown) {
     c.center(0, c.w, top + 5, "AFT, Magic Context or the vault.", St::D);
 
     let x = ((c.w - 44) / 2).max(0);
-    let stopped = v.civil(d.stopped_at);
+    let when = match d.stopped_at {
+        Some(t) => format!("{} {}", v.day_word(t), v.civil(t).hms()),
+        None => UNKNOWN.to_string(),
+    };
+    let stopped = if d.stopped_by.is_empty() {
+        when
+    } else {
+        format!("{when} · {}", d.stopped_by)
+    };
     let rows = [
-        (
-            "Stopped",
-            format!(
-                "{} {} · {}",
-                v.day_word(d.stopped_at),
-                stopped.hms(),
-                d.stopped_by
-            ),
-            St::NONE,
-        ),
+        ("Stopped", stopped, St::NONE),
         ("Last line", d.last_line.clone(), St::F),
         ("Service", d.service.clone(), St::NONE),
     ];
@@ -53,6 +52,15 @@ pub fn draw(c: &mut Canvas, v: &View, d: &DaemonDown) {
     c.put(x, by, " ⏎  Start it ", St::fg(Fg::OnAcc).on(Bg::Acc).bold());
     c.put(x + 16, by, " l  Show the log ", St::bg(Bg::Key));
     c.put(x + 36, by, " q  Quit ", St::bg(Bg::Key));
+    if let Some(note) = &d.note {
+        c.center(
+            0,
+            c.w,
+            top + 15,
+            &trunc(note, (c.w - 4).max(0) as usize),
+            St::D,
+        );
+    }
     c.center(
         0,
         c.w,

@@ -85,8 +85,13 @@ const ACTIVITY_EVENT_BUFFER: usize = 2048;
 mod activity_consumer_tests;
 
 mod cancellation;
+mod supervisor_ops;
 pub use cancellation::{CancelHandle, CancelOutcome};
 use cancellation::{CancelRegistration, UnaryCancel};
+pub use supervisor_ops::{
+    HealthProbeResponse, ServerDescription, StderrTailResponse, SupervisorAck,
+    SupervisorHealthResponse, SupervisorProvenanceResponse,
+};
 
 /// `supervisor.spawn_subscribe` refused a cursor from another daemon incarnation.
 pub const SPAWN_CURSOR_INCARNATION_MISMATCH: &str = "spawn_cursor_incarnation_mismatch";

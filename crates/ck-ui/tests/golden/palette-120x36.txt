@@ -18,7 +18,7 @@
   ● ckbus             ● s│                                                                    │   ▲ last upload 2d ago  
   ● claustrum         ● s│                                                                    │   uploading now         
   ● condition-runner  ● t│                                                                    │                         
-  ▲ engram            ▲ t│ ↑↓ choose · ⏎ run · esc close                                      │   ● Mac 2  ● iPhone     
+  ▲ engram            ▲ t│ ↑↓ choose · ⏎ run · esc close                                      │   ● Mac 2  ● iPhone +1  
   ● entorhinal        ● w╰────────────────────────────────────────────────────────────────────╯   none waiting          
   ● fusiform                                                                                                            
                                                                                                                         
@@ -30,7 +30,7 @@
   17:54  motor             settings changed: hosted spill off                   ck   ○ NOVA                    idle 4m  
   17:53  motor             restarted on build 17c0a7d6                          ck   ● ECHO                    working  
   17:21  prefrontal-core   started worker for llm-runner 0.3.8                IRIS   ○ KITE                   idle 12m  
-  17:02  astrocyte         restarted on build ad21ee36                          ck   ○ MOSS                   idle 31m  
+  17:02  astrocyte         restarted on build ad21ee36                          ck   +6 more                            
                                                                                                                         
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
   ⏎  open    ↑↓  move    :  commands    ?  help                                                        updated just now 

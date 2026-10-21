@@ -20,10 +20,27 @@ use std::{
     io::{self, IsTerminal, Read, Seek, SeekFrom},
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
-    process, thread,
+    process,
+    sync::Arc,
+    thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+// The health-metric rule and value wording `ck health` shares with the app.
+use ck_ui::metrics::{
+    format_age_from_epoch_ms, format_age_seconds, format_bytes, format_duration,
+    format_milliseconds, headline_metric_entries, scalar_text,
+};
+// How `ck quota` and the app read the quota module's usage rows.
+use ck_ui::quota::{
+    entry_error_detail, format_provider_display_name, parse_rfc3339_to_utc_secs, provider_id,
+    quota_disconnect_kind, quota_entry_is_balance_only, quota_entry_is_connected,
+    quota_spend_lines_for_entry, quota_window_rows_for_entry, quota_window_used_percent,
+    table_account_label, QuotaDisconnectKind,
+};
+// Helpers only the tests below use.
+#[cfg(test)]
+use ck_ui::{metrics::format_minor_amount, quota::shorten_uuid_label};
 use cortexkit_log::{
     parse_line as parse_log_line, segment_day, Config as FleetLogConfig, ParsedLevel,
 };
@@ -496,6 +513,11 @@ async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), CkError> {
         return dispatch_external(domain, tail);
     }
     if matches!(&args.command, Command::Dashboard) {
+        // A bare `ck` typed at a terminal opens the app; piped or redirected,
+        // it prints the dashboard as it always has.
+        if !args.json && io::stdin().is_terminal() && io::stdout().is_terminal() {
+            return run_app(args.subc.as_deref()).await;
+        }
         return dashboard(&args).await;
     }
     if let Command::FleetLint { config, verbose } = &args.command {
@@ -655,6 +677,145 @@ async fn fleet_lint_command(config: Option<&Path>, verbose: bool) -> Result<(), 
         Err(CkError::FleetLintExit {
             exit_code: report.outcome.exit_code(),
         })
+    }
+}
+
+/// The full-screen app, fed by the live layer from the daemon whose
+/// connection file `--subc` gives, or the one discovery finds.
+async fn run_app(subc: Option<&Path>) -> Result<(), CkError> {
+    let service = Arc::new(CkDaemonService {
+        subc: subc.map(Path::to_path_buf),
+    });
+    let live = ck_ui::live::start(ck_ui::live::LiveOptions::new(
+        subc.map(Path::to_path_buf),
+        service,
+    ));
+    ck_ui::run_with(
+        live.snapshots,
+        ck_ui::RunOptions {
+            requests: Some(live.requests),
+            ..ck_ui::RunOptions::default()
+        },
+    )
+    .await
+    .map_err(|error| CkError::Message(format!("the ck app stopped: {error}")))
+}
+
+/// What the app's daemon-down screen asks of `ck`: the setup engine's view
+/// of the installed service, the operation that starts it, the daemon's own log as `ck
+/// daemon triage` reads it, and the data home.
+struct CkDaemonService {
+    subc: Option<PathBuf>,
+}
+
+impl ck_ui::live::DaemonService for CkDaemonService {
+    fn service_status(&self) -> String {
+        setup::installed_service_facts()
+            .map(|facts| facts.summary())
+            .unwrap_or_else(|_| "unknown".to_string())
+    }
+
+    fn start_service(&self) -> Result<String, String> {
+        setup::start_installed_service()
+            .map(|()| "Asked the service manager to start it; waiting for it to answer.".into())
+    }
+
+    fn daemon_log_tail(&self, n: usize) -> Vec<String> {
+        let env_named = env::var_os("SUBC_CONNECTION_FILE").filter(|value| !value.is_empty());
+        let candidates =
+            connection_file::discovery_candidates(self.subc.as_deref(), env_named.as_deref());
+        let Some(run_dir) = candidates
+            .iter()
+            .find(|path| path.exists())
+            .or(candidates.first())
+            .and_then(|path| path.parent())
+            .filter(|path| !path.as_os_str().is_empty())
+        else {
+            return Vec::new();
+        };
+        let fact = triage_log_fact(&triage_daemon_log_path(run_dir));
+        let lines: Vec<String> = fact
+            .get("lines")
+            .and_then(Value::as_array)
+            .map(|lines| {
+                lines
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        lines[lines.len().saturating_sub(n)..].to_vec()
+    }
+
+    fn data_home(&self) -> Option<PathBuf> {
+        setup::data_directory().ok()
+    }
+
+    /// The newest lines of the module's log, read and merged by `ck module
+    /// logs`' own functions from the same sources, then a follower that
+    /// reads only what is appended, as `ck module logs -f` does.
+    fn open_module_log(
+        &self,
+        module_id: &str,
+        max: usize,
+    ) -> Option<Result<ck_ui::live::OpenedLog, String>> {
+        Some(open_app_log(module_id, max).map_err(|error| error.to_string()))
+    }
+}
+
+fn open_app_log(module_id: &str, max: usize) -> Result<ck_ui::live::OpenedLog, CkError> {
+    let (dirs, _) = LogDirs::for_module(module_id);
+    let sources = discover_log_sources_in(&dirs, module_id, false)?;
+    let follower = LogFollower::start(module_id, dirs, &sources)?;
+    let lines = follower.tail(max)?.iter().map(app_log_line).collect();
+    Ok(ck_ui::live::OpenedLog {
+        lines,
+        follow: Box::new(AppLogFollow { follower }),
+    })
+}
+
+/// The app's side of a [`LogFollower`]: appended text, parsed and ordered
+/// the way `ck module logs` does, as log view lines.
+struct AppLogFollow {
+    follower: LogFollower,
+}
+
+impl ck_ui::live::ModuleLogFollow for AppLogFollow {
+    fn poll(&mut self) -> Result<Vec<ck_ui::live::ModuleLogLine>, String> {
+        let module_id = self.follower.module_id.clone();
+        let options = app_log_options(usize::MAX);
+        let mut counts = LogFilterCounts::default();
+        let mut entries = Vec::new();
+        let mut order = 0;
+        for (source, text) in self.follower.poll().map_err(|error| error.to_string())? {
+            collect_log_text(
+                &module_id,
+                &source,
+                &text,
+                &options,
+                &mut counts,
+                &mut entries,
+                &mut order,
+            );
+        }
+        sort_log_entries(&mut entries);
+        Ok(entries.iter().map(app_log_line).collect())
+    }
+}
+
+fn app_log_line(entry: &LogEntry) -> ck_ui::live::ModuleLogLine {
+    ck_ui::live::ModuleLogLine {
+        at_ms: entry
+            .timestamp
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as i64),
+        level: entry.level.map(|level| match level {
+            ParsedLevel::Warn => ck_ui::model::LogLevel::Warn,
+            ParsedLevel::Error => ck_ui::model::LogLevel::Error,
+            _ => ck_ui::model::LogLevel::Info,
+        }),
+        text: entry.line.clone(),
     }
 }
 
@@ -1670,28 +1831,66 @@ fn last_log_timestamp(source: &LogSource) -> String {
         .unwrap_or_else(|| "-".to_string())
 }
 
+/// Where a module's log files are: its own logs directory, and the daemon's
+/// run-directory logs (its capture of the module's output and its own
+/// lines), when that directory can be resolved.
+#[derive(Clone, Debug)]
+struct LogDirs {
+    module_logs: PathBuf,
+    run_logs: Option<PathBuf>,
+}
+
+impl LogDirs {
+    /// The directories for `module_id` on this machine, and why the daemon's
+    /// run directory is left out when it can't be resolved.
+    fn for_module(module_id: &str) -> (LogDirs, Option<String>) {
+        let module_logs = FleetLogConfig::for_module(module_id).logs_dir;
+        // The daemon's capture lane lives in the run directory. When that
+        // cannot be resolved (a relative data home), the module's own logs
+        // are still read rather than capture files relative to the working
+        // directory.
+        match subc_daemon::daemon_config::daemon_run_dir() {
+            Ok(run_dir) => (
+                LogDirs {
+                    module_logs,
+                    run_logs: Some(run_dir.join("logs")),
+                },
+                None,
+            ),
+            Err(error) => (
+                LogDirs {
+                    module_logs,
+                    run_logs: None,
+                },
+                Some(format!("skipping daemon capture logs: {error}")),
+            ),
+        }
+    }
+}
+
 fn discover_log_sources(module_id: &str, include_rotated: bool) -> Result<Vec<LogSource>, CkError> {
-    let module_logs = FleetLogConfig::for_module(module_id).logs_dir;
+    let (dirs, warning) = LogDirs::for_module(module_id);
+    if let Some(warning) = warning {
+        eprintln!("warning: {warning}");
+    }
+    discover_log_sources_in(&dirs, module_id, include_rotated)
+}
+
+fn discover_log_sources_in(
+    dirs: &LogDirs,
+    module_id: &str,
+    include_rotated: bool,
+) -> Result<Vec<LogSource>, CkError> {
     let mut sources = Vec::new();
     collect_sources_in_dir(
-        &module_logs,
+        &dirs.module_logs,
         module_id,
         include_rotated,
         false,
         &mut sources,
     )?;
-    // The daemon's capture lane lives in the run directory. When that cannot be
-    // resolved (a relative data home), say so and still show the module's own
-    // logs rather than reading capture files relative to the working directory.
-    match subc_daemon::daemon_config::daemon_run_dir() {
-        Ok(run_dir) => collect_sources_in_dir(
-            &run_dir.join("logs"),
-            module_id,
-            include_rotated,
-            true,
-            &mut sources,
-        )?,
-        Err(error) => eprintln!("warning: skipping daemon capture logs: {error}"),
+    if let Some(run_logs) = &dirs.run_logs {
+        collect_sources_in_dir(run_logs, module_id, include_rotated, true, &mut sources)?;
     }
     sources.sort_by(|left, right| {
         left.lane
@@ -2168,40 +2367,93 @@ async fn follow_module_logs(
     initial_sources: Vec<LogSource>,
     json_output: bool,
 ) -> Result<(), CkError> {
-    struct Cursor {
-        offset: u64,
-        created: Option<SystemTime>,
-        prefix: Vec<u8>,
-    }
-
-    let mut offsets = HashMap::new();
-    for source in initial_sources
-        .into_iter()
-        .filter(|source| rotation_generation(&source.path) == 0)
-    {
-        if let Ok(metadata) = fs::metadata(&source.path) {
-            offsets.insert(
-                source.path.clone(),
-                Cursor {
-                    offset: metadata.len(),
-                    created: metadata.created().ok(),
-                    prefix: read_log_prefix(&source.path, metadata.len().min(64) as usize)?,
-                },
-            );
-        }
-    }
-
+    let (dirs, _) = LogDirs::for_module(module_id);
+    let mut follower = LogFollower::start(module_id, dirs, &initial_sources)?;
     loop {
         time::sleep(Duration::from_millis(250)).await;
-        for source in discover_log_sources(module_id, false)? {
+        for (source, text) in follower.poll()? {
+            print_follow_text(module_id, options, &source, &text, json_output)?;
+        }
+        use std::io::Write as _;
+        io::stdout()
+            .flush()
+            .map_err(|error| CkError::Message(error.to_string()))?;
+    }
+}
+
+/// Follows a module's active log files from where they end, the way `ck
+/// module logs -f` does: each poll reads only what was appended since the
+/// last, and when a file was rotated (it shrank, was recreated, or its first
+/// bytes changed) drains the rotated file's unseen tail before starting the
+/// new one from its beginning. The app's log view follows with this too.
+struct LogFollower {
+    module_id: String,
+    dirs: LogDirs,
+    cursors: HashMap<PathBuf, LogCursor>,
+    /// How many times a whole file was read, for the test that keeps
+    /// following incremental.
+    #[cfg(test)]
+    whole_reads: usize,
+}
+
+/// Where following one file has got to: the length read so far, the file's
+/// creation time, and its first bytes, which together tell a rotation from
+/// an append.
+struct LogCursor {
+    offset: u64,
+    created: Option<SystemTime>,
+    prefix: Vec<u8>,
+}
+
+impl LogFollower {
+    /// Starts following at the current end of each active (unrotated) file
+    /// among `initial_sources`.
+    fn start(
+        module_id: &str,
+        dirs: LogDirs,
+        initial_sources: &[LogSource],
+    ) -> Result<LogFollower, CkError> {
+        let mut cursors = HashMap::new();
+        for source in initial_sources
+            .iter()
+            .filter(|source| rotation_generation(&source.path) == 0)
+        {
+            if let Ok(metadata) = fs::metadata(&source.path) {
+                cursors.insert(
+                    source.path.clone(),
+                    LogCursor {
+                        offset: metadata.len(),
+                        created: metadata.created().ok(),
+                        prefix: read_log_prefix(&source.path, metadata.len().min(64) as usize)?,
+                    },
+                );
+            }
+        }
+        Ok(LogFollower {
+            module_id: module_id.to_string(),
+            dirs,
+            cursors,
+            #[cfg(test)]
+            whole_reads: 0,
+        })
+    }
+
+    /// The text appended to each active file since the last poll, with the
+    /// file it came from.
+    fn poll(&mut self) -> Result<Vec<(LogSource, String)>, CkError> {
+        let mut out = Vec::new();
+        for source in discover_log_sources_in(&self.dirs, &self.module_id, false)? {
             let metadata =
                 fs::metadata(&source.path).map_err(|error| CkError::Message(error.to_string()))?;
             let length = metadata.len();
-            let cursor = offsets.entry(source.path.clone()).or_insert(Cursor {
-                offset: 0,
-                created: metadata.created().ok(),
-                prefix: Vec::new(),
-            });
+            let cursor = self
+                .cursors
+                .entry(source.path.clone())
+                .or_insert(LogCursor {
+                    offset: 0,
+                    created: metadata.created().ok(),
+                    prefix: Vec::new(),
+                });
             let current_prefix = read_log_prefix(&source.path, cursor.prefix.len())?;
             let rotated = length < cursor.offset
                 || metadata.created().ok() != cursor.created
@@ -2216,7 +2468,7 @@ async fn follow_module_logs(
                 if let Ok(rotated_length) = fs::metadata(&rotated_path).map(|meta| meta.len()) {
                     if rotated_length > cursor.offset {
                         let text = read_log_range(&rotated_path, cursor.offset)?;
-                        print_follow_text(module_id, options, &source, &text, json_output)?;
+                        out.push((source.clone(), text));
                     }
                 }
                 cursor.offset = 0;
@@ -2228,21 +2480,90 @@ async fn follow_module_logs(
             if length == cursor.offset {
                 continue;
             }
+            #[cfg(test)]
+            if cursor.offset == 0 {
+                self.whole_reads += 1;
+            }
             let text = read_log_range(&source.path, cursor.offset)?;
             cursor.offset = length;
-            print_follow_text(module_id, options, &source, &text, json_output)?;
+            out.push((source, text));
         }
-        use std::io::Write as _;
-        io::stdout()
-            .flush()
-            .map_err(|error| CkError::Message(error.to_string()))?;
+        Ok(out)
+    }
+
+    /// The newest lines of the active files up to where following starts,
+    /// at most `max` of them, merged and ordered as `ck module logs` orders
+    /// them. Reads only the end of each file (about `max` lines' worth),
+    /// never the whole set.
+    fn tail(&self, max: usize) -> Result<Vec<LogEntry>, CkError> {
+        const BYTES_PER_LINE: u64 = 400;
+        let options = app_log_options(max);
+        let mut counts = LogFilterCounts::default();
+        let mut entries = Vec::new();
+        let mut order = 0;
+        for source in discover_log_sources_in(&self.dirs, &self.module_id, false)? {
+            let Some(cursor) = self.cursors.get(&source.path) else {
+                continue;
+            };
+            let start = cursor
+                .offset
+                .saturating_sub(BYTES_PER_LINE.saturating_mul(max as u64));
+            let mut text = read_log_slice(&source.path, start, cursor.offset)?;
+            // A read that starts mid-file drops its first, partial line.
+            if start > 0 {
+                text = text
+                    .split_once('\n')
+                    .map_or(String::new(), |(_, rest)| rest.to_string());
+            }
+            collect_log_text(
+                &self.module_id,
+                &source,
+                &text,
+                &options,
+                &mut counts,
+                &mut entries,
+                &mut order,
+            );
+        }
+        sort_log_entries(&mut entries);
+        let from = entries.len().saturating_sub(max);
+        Ok(entries.split_off(from))
     }
 }
 
-fn read_log_prefix(path: &Path, length: usize) -> Result<Vec<u8>, CkError> {
+/// The options the app's log view reads with: every lane, level and tag.
+fn app_log_options(max: usize) -> ModuleLogsOptions {
+    ModuleLogsOptions {
+        lines: max,
+        follow: true,
+        since: None,
+        tag: None,
+        level: None,
+        lane: None,
+    }
+}
+
+/// The bytes of `path` from `start` up to `end`, as text.
+fn read_log_slice(path: &Path, start: u64, end: u64) -> Result<String, CkError> {
     let mut file = fs::File::open(path).map_err(|error| CkError::Message(error.to_string()))?;
-    let mut prefix = vec![0; length];
-    file.read_exact(&mut prefix)
+    file.seek(SeekFrom::Start(start))
+        .map_err(|error| CkError::Message(error.to_string()))?;
+    let mut bytes = Vec::new();
+    file.take(end.saturating_sub(start))
+        .read_to_end(&mut bytes)
+        .map_err(|error| CkError::Message(error.to_string()))?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Up to `length` bytes from the start of `path`. A file shorter than that
+/// gives what it has: a replacement written since the last poll can be
+/// shorter than the prefix kept for the file it replaced, and its differing
+/// prefix is how the rotation is noticed.
+fn read_log_prefix(path: &Path, length: usize) -> Result<Vec<u8>, CkError> {
+    let file = fs::File::open(path).map_err(|error| CkError::Message(error.to_string()))?;
+    let mut prefix = Vec::with_capacity(length);
+    file.take(length as u64)
+        .read_to_end(&mut prefix)
         .map_err(|error| CkError::Message(error.to_string()))?;
     Ok(prefix)
 }
@@ -3427,33 +3748,14 @@ fn print_metrics_array_item(item: &Value, depth: usize) {
     }
 }
 
-fn inline_scalar_object(map: &serde_json::Map<String, Value>) -> Option<String> {
-    if map.is_empty() {
-        return Some("none".to_string());
-    }
-    let mut parts = Vec::with_capacity(map.len());
-    for (key, value) in map {
-        match value {
-            Value::Object(_) | Value::Array(_) => return None,
-            other => parts.push(format!("{key}={}", format_metric_value(key, other))),
-        }
-    }
-    let line = parts.join(" · ");
-    (line.chars().count() <= 88).then_some(line)
+/// A metric value in words, the way `ck health` and the app word it, with
+/// Unix-millisecond values read as ages against this process's clock.
+fn format_metric_value(key: &str, value: &Value) -> String {
+    ck_ui::metrics::format_metric_value(key, value, &format_age_from_epoch_ms_now)
 }
 
-fn scalar_text(value: &Value) -> String {
-    match value {
-        // A null field means the producer could not determine the value, so it
-        // must not read like an empty result: "none" would turn "not measured"
-        // into "measured nothing". Empty strings and arrays stay "none".
-        Value::Null => "unknown".to_string(),
-        Value::String(value) if value.is_empty() => "none".to_string(),
-        Value::String(value) => value.clone(),
-        Value::Bool(true) => "enabled".to_string(),
-        Value::Bool(false) => "disabled".to_string(),
-        other => other.to_string(),
-    }
+fn inline_scalar_object(map: &serde_json::Map<String, Value>) -> Option<String> {
+    ck_ui::metrics::inline_scalar_object(map, &format_age_from_epoch_ms_now)
 }
 
 fn print_headline_metrics(metrics: &Value, depth: usize) {
@@ -3468,26 +3770,6 @@ fn print_headline_metrics(metrics: &Value, depth: usize) {
     for (key, value) in entries {
         print_metrics_entry(key, value, depth);
     }
-}
-
-fn headline_metric_entries(metrics: &Value) -> Option<Vec<(&str, &Value)>> {
-    let map = metrics.as_object()?;
-    let marked = map
-        .get("headline")
-        .or_else(|| map.get("_headline"))
-        .and_then(Value::as_array)
-        .map(|keys| keys.iter().filter_map(Value::as_str).collect::<Vec<_>>());
-    Some(match marked {
-        Some(keys) => keys
-            .into_iter()
-            .filter_map(|key| map.get(key).map(|value| (key, value)))
-            .collect(),
-        None => map
-            .iter()
-            .filter(|(_, value)| !value.is_array() && !value.is_object())
-            .map(|(key, value)| (key.as_str(), value))
-            .collect(),
-    })
 }
 
 fn metrics_have_non_headline_entries(metrics: &Value) -> bool {
@@ -3513,70 +3795,6 @@ fn metrics_have_non_headline_entries(metrics: &Value) -> bool {
     } else {
         map.values()
             .any(|value| value.is_array() || value.is_object())
-    }
-}
-
-fn format_metric_value(key: &str, value: &Value) -> String {
-    match value {
-        Value::Number(number) => {
-            let normalized = key.to_ascii_lowercase();
-            if normalized.contains("bytes") {
-                return number
-                    .as_u64()
-                    .map(format_bytes)
-                    .unwrap_or_else(|| number.to_string());
-            }
-            if normalized.ends_with("age_ms") || normalized.ends_with("agems") {
-                return number
-                    .as_u64()
-                    .map(format_milliseconds)
-                    .unwrap_or_else(|| number.to_string());
-            }
-            if normalized.ends_with("age_secs") || normalized.ends_with("agesecs") {
-                return number
-                    .as_u64()
-                    .map(format_age_seconds)
-                    .unwrap_or_else(|| number.to_string());
-            }
-            if normalized.ends_with("_ms") || normalized.ends_with("ms") {
-                return number.as_u64().map_or_else(
-                    || number.to_string(),
-                    |milliseconds| {
-                        if milliseconds >= 100_000_000_000 {
-                            format_age_from_epoch_ms_now(milliseconds)
-                        } else {
-                            format_milliseconds(milliseconds)
-                        }
-                    },
-                );
-            }
-            number.to_string()
-        }
-        other => scalar_text(other),
-    }
-}
-
-fn format_milliseconds(milliseconds: u64) -> String {
-    if milliseconds < 1_000 {
-        format!("{milliseconds} ms")
-    } else {
-        format_duration(Duration::from_millis(milliseconds))
-    }
-}
-
-fn format_bytes(bytes: u64) -> String {
-    const KIB: f64 = 1024.0;
-    const MIB: f64 = KIB * 1024.0;
-    const GIB: f64 = MIB * 1024.0;
-    let bytes_f64 = bytes as f64;
-    if bytes_f64 >= GIB {
-        format!("{:.1} GiB", bytes_f64 / GIB)
-    } else if bytes_f64 >= MIB {
-        format!("{:.1} MiB", bytes_f64 / MIB)
-    } else if bytes_f64 >= KIB {
-        format!("{:.1} KiB", bytes_f64 / KIB)
-    } else {
-        format!("{bytes} B")
     }
 }
 
@@ -4817,16 +5035,6 @@ fn usage_providers_from_body(body: &Value) -> Result<Vec<Value>, CkError> {
         .ok_or_else(|| CkError::Message(format!("unexpected usage.get reply: {body}")))
 }
 
-fn provider_id(provider: &Value) -> String {
-    provider
-        .get("provider")
-        .or_else(|| provider.get("provider_id"))
-        .or_else(|| provider.get("id"))
-        .and_then(Value::as_str)
-        .unwrap_or("-")
-        .to_string()
-}
-
 fn provider_ids_sorted(providers: &[Value]) -> Vec<String> {
     let mut ids = providers.iter().map(provider_id).collect::<Vec<_>>();
     ids.sort();
@@ -4872,120 +5080,6 @@ fn account_pseudonym(entry: &Value) -> String {
     }
     let digest = Sha256::digest(seed.as_bytes());
     format!("account {:02x}{:02x}", digest[0], digest[1])
-}
-
-fn account_label(entry: &Value) -> String {
-    entry
-        .get("account")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .unwrap_or_default()
-}
-
-fn table_account_label(entry: &Value) -> String {
-    shorten_uuid_label(&account_label(entry))
-}
-
-fn shorten_uuid_label(label: &str) -> String {
-    if is_uuid_shaped(label) {
-        label[..8].to_string()
-    } else {
-        label.to_string()
-    }
-}
-
-fn is_uuid_shaped(label: &str) -> bool {
-    let bytes = label.as_bytes();
-    bytes.len() == 36
-        && bytes.iter().enumerate().all(|(index, byte)| {
-            if matches!(index, 8 | 13 | 18 | 23) {
-                *byte == b'-'
-            } else {
-                byte.is_ascii_hexdigit()
-            }
-        })
-}
-
-fn entry_error_detail(entry: &Value) -> Option<String> {
-    entry
-        .get("error")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-}
-
-fn quota_entry_is_connected(entry: &Value) -> bool {
-    // Connected is signalled by the presence of a usage object on the wire; a
-    // disconnected provider carries an error string and no usage object. The
-    // wire carries no explicit "ok" flag, so usage presence is the signal.
-    entry.get("usage").is_some_and(Value::is_object)
-}
-
-/// A connected entry with money and no rate window: the balance cohort.
-///
-/// `usage.primary` absent + `spend` present identifies these structurally.
-/// Disconnected entries (no usage object) are NOT balance-only — they keep
-/// their own classification and ordering.
-fn quota_entry_is_balance_only(entry: &Value) -> bool {
-    let windowless = entry
-        .get("usage")
-        .and_then(Value::as_object)
-        .is_some_and(|usage| !usage.get("primary").is_some_and(Value::is_object));
-    let has_spend = entry
-        .get("spend")
-        .and_then(Value::as_array)
-        .is_some_and(|pools| !pools.is_empty());
-    windowless && has_spend
-}
-
-/// What, if anything, a reader should do about a disconnected provider.
-///
-/// Not-connected used to be one number covering unrelated situations. A provider
-/// nobody ever configured is a permanent, correct state; a provider whose
-/// credential broke this morning is a login away from working. Counted together,
-/// a provider that STOPPED working moves the total by one and produces no other
-/// signal — which is how a quota exhaustion went unnoticed here before.
-///
-/// The split is three ways rather than two because the middle bucket carries an
-/// implied instruction. "Configured but failing" means go fix your credential,
-/// and that is the wrong thing to tell someone when the fault is in the quota
-/// module itself: nothing they can log into or reconfigure changes the outcome.
-/// A bucket whose implied action cannot work is a worse place to be than an
-/// unlabelled one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum QuotaDisconnectKind {
-    /// Permanent and correct. Never configured, or the account genuinely has no
-    /// quota to report. Nothing to do, and it must never inflate a count that is
-    /// supposed to mean "something needs attention".
-    Inert,
-    /// A person can fix this — usually by logging in again.
-    UserFixable,
-    /// The quota module itself failed. Real, worth surfacing, and NOT the
-    /// reader's to fix.
-    ModuleDefect,
-}
-
-/// Classify a disconnected entry from the producer's `errorClass` (see the
-/// field's docs in `cortexkit-provider-usage`).
-///
-/// An UNRECOGNISED class is [`UserFixable`](QuotaDisconnectKind::UserFixable) on
-/// purpose. The class list is open and grows on the producer's side, so the
-/// choice is between surfacing something we have not heard of and silently
-/// filing it under "nothing to do". On an observability surface the first is a
-/// line someone reads once; the second is the exact blindness this split exists
-/// to remove.
-///
-/// An entry with NO class — any producer predating the field — is `Inert`, so an
-/// older producer renders exactly as it did before rather than turning every
-/// disconnected provider into an alarm.
-fn quota_disconnect_kind(entry: &Value) -> QuotaDisconnectKind {
-    match entry.get("errorClass").and_then(Value::as_str) {
-        None => QuotaDisconnectKind::Inert,
-        Some("credential_absent" | "no_quota_reported") => QuotaDisconnectKind::Inert,
-        Some("internal_error") => QuotaDisconnectKind::ModuleDefect,
-        Some(_) => QuotaDisconnectKind::UserFixable,
-    }
 }
 
 fn quota_entries_for_table<'a>(
@@ -5224,16 +5318,6 @@ fn quota_empty_reason(wire_array_empty: bool, filtered: bool) -> &'static str {
         (false, true) => "no accounts matched that provider",
         (false, false) => "no connected accounts (--verbose to list unavailable providers)",
     }
-}
-
-fn quota_window_used_percent(window: &Value) -> Option<f64> {
-    // rawUsedPercent is the provider's real utilization when a banked-reset
-    // relaxed window is in effect; prefer it so 0% effective pacing never
-    // reads as an idle account.
-    window
-        .get("rawUsedPercent")
-        .and_then(Value::as_f64)
-        .or_else(|| window.get("usedPercent").and_then(Value::as_f64))
 }
 
 fn print_quota_account(
@@ -5681,20 +5765,6 @@ fn quota_provider_window_stats(group: &[&Value]) -> Vec<QuotaWindowStat> {
         .collect()
 }
 
-fn format_provider_display_name(id: &str) -> String {
-    id.split(['-', '_'])
-        .filter(|part| !part.is_empty())
-        .map(|part| {
-            let mut chars = part.chars();
-            match chars.next() {
-                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
-                None => String::new(),
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 fn bold_text(text: &str, color_enabled: bool) -> String {
     color_text(text, "1", color_enabled)
 }
@@ -5704,180 +5774,6 @@ fn color_text(text: &str, code: &str, color_enabled: bool) -> String {
         format!("\x1b[{code}m{text}\x1b[0m")
     } else {
         text.to_string()
-    }
-}
-
-/// Render an entry's `spend` pools as display lines, one per pool.
-///
-/// `spend` is a pool balance or allowance, not a rate window: render each
-/// pool as a labeled amount (remaining of total when stated, or just its
-/// limit), followed by any stated reset, stopped state and funding. Three wire
-/// states are deliberately distinct and must stay so:
-/// - `spend` ABSENT: the producer has nothing to say -> no lines.
-/// - `spend: []`: the producer asked and the provider has no credit
-///   product on this account -> no lines (NOT "0 credit").
-/// - `spend: [...]`: one line per pool with an amount.
-///
-/// Pools are account-scoped; callers must never sum them across sibling
-/// accounts of a provider. `unit` is a free string, not necessarily a
-/// currency code (MiniMax reports "credit"), so render it verbatim.
-fn quota_spend_lines_for_entry(entry: &Value) -> Vec<String> {
-    let mut lines = Vec::new();
-    let Some(pools) = entry.get("spend").and_then(Value::as_array) else {
-        return lines;
-    };
-    for pool in pools {
-        let amount = |key| {
-            let value = pool.get(key)?;
-            let minor = value.get("minor")?.as_i64()?;
-            let exponent = value.get("exponent")?.as_i64()?;
-            let unit = value.get("unit").and_then(Value::as_str).unwrap_or("");
-            Some((format_minor_amount(minor, exponent), unit))
-        };
-        let remaining = amount("remaining");
-        let total = amount("total");
-        let detail = match (remaining, total) {
-            (Some((left, unit)), Some((cap, cap_unit))) if unit == cap_unit => {
-                format!("{left} of {cap} {unit} left")
-            }
-            (Some((left, unit)), Some((cap, cap_unit))) => {
-                format!("{left} {unit} of {cap} {cap_unit} left")
-            }
-            (Some((left, unit)), None) => format!("{left} {unit} left"),
-            (None, Some((cap, unit))) => format!("limit {cap} {unit}"),
-            (None, None) => continue,
-        };
-        let label = pool
-            .get("label")
-            .and_then(Value::as_str)
-            .filter(|label| !label.is_empty())
-            .unwrap_or("credit");
-        // Each stated fact after the amount is its own clause, so none of them
-        // reads as a qualifier on the number (the defect behind issue #132).
-        let mut clauses = vec![format!("{label}  {detail}")];
-        // A reset refills the pool; an expiry loses whatever is left. Each is
-        // shown only when the provider stated it, never inferred.
-        for (field, verb) in [("resetsAt", "resets"), ("expiresAt", "expires")] {
-            if let Some(raw) = pool.get(field).and_then(Value::as_str) {
-                let date = if parse_rfc3339_to_utc_secs(raw).is_some() {
-                    raw.get(..10).unwrap_or(raw)
-                } else {
-                    raw
-                };
-                clauses.push(format!("{verb} {date}"));
-            }
-        }
-        if pool.get("spendable").and_then(Value::as_bool) == Some(false) {
-            clauses.push("stopped".to_string());
-        }
-        match pool.get("funding").and_then(Value::as_str) {
-            Some("granted") => clauses.push("provider grant".to_string()),
-            Some("purchased") => clauses.push("bought credit".to_string()),
-            Some("subscription") => clauses.push("included in subscription".to_string()),
-            _ => {} // Unknown funding cannot justify a claim about who pays.
-        }
-        lines.push(clauses.join(" · "));
-    }
-    lines
-}
-
-/// Render a minor-unit amount at the given decimal exponent without
-/// floating point: 2402 at exponent 2 is "24.02", never "24.019999...".
-/// A negative or zero exponent renders the integer as-is (no known
-/// producer emits one, but a wire value must not panic the renderer).
-fn format_minor_amount(minor: i64, exponent: i64) -> String {
-    if exponent <= 0 {
-        return minor.to_string();
-    }
-    let scale = 10_i64.checked_pow(exponent.min(18) as u32).unwrap_or(1);
-    let sign = if minor < 0 { "-" } else { "" };
-    let magnitude = minor.unsigned_abs();
-    let whole = magnitude / scale as u64;
-    let frac = magnitude % scale as u64;
-    format!(
-        "{sign}{whole}.{frac:0width$}",
-        width = exponent.min(18) as usize
-    )
-}
-
-fn quota_window_rows_for_entry(entry: &Value) -> Vec<(String, Value)> {
-    let mut rows = Vec::new();
-    let usage = entry.get("usage").and_then(Value::as_object);
-    let Some(usage) = usage else {
-        return rows;
-    };
-
-    // THE THREE SLOTS ARE POSITIONS, NOT A RANKING, AND THEY CAN HAVE HOLES: each
-    // is filled from its own optional upstream field, so `secondary` may be absent
-    // while `tertiary` is present. Walk all three unconditionally and never stop at
-    // the first gap -- another consumer of this wire shipped a status bar reading
-    // 25% for an account whose binding constraint was a weekly at 36%, by treating
-    // the first slot as the answer.
-    //
-    // This loop tolerates holes because it is a filter rather than a search, which
-    // was luck rather than intent when it was written. The note exists so that
-    // stays a decision: an "optimisation" that breaks on the first absent slot
-    // compiles, passes these tests (the fixtures are dense), and reproduces that
-    // bug silently.
-    for slot in ["primary", "secondary", "tertiary"] {
-        if let Some(window) = usage.get(slot).filter(|w| !w.is_null()) {
-            rows.push((rate_window_label(window, slot), window.clone()));
-        }
-    }
-
-    if let Some(extras) = usage.get("extraRateWindows").and_then(Value::as_array) {
-        for extra in extras {
-            let label = extra_window_label(extra);
-            if let Some(window) = extra.get("window").filter(|w| !w.is_null()) {
-                rows.push((label, window.clone()));
-            } else {
-                rows.push((label, Value::Null));
-            }
-        }
-    }
-
-    rows.into_iter()
-        .map(|(label, window)| {
-            if window.is_null() {
-                (label, json!({}))
-            } else {
-                (label, window)
-            }
-        })
-        .collect()
-}
-
-fn extra_window_label(extra: &Value) -> String {
-    extra
-        .get("title")
-        .or_else(|| extra.get("id"))
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| "extra".to_string())
-}
-
-fn rate_window_label(window: &Value, slot: &str) -> String {
-    if let Some(minutes) = window.get("windowMinutes").and_then(Value::as_i64) {
-        return label_from_window_minutes(minutes);
-    }
-    slot.to_string()
-}
-
-fn label_from_window_minutes(minutes: i64) -> String {
-    match minutes {
-        m if m >= 1440 && m % 1440 == 0 => {
-            let days = m / 1440;
-            if days == 7 {
-                "week".to_string()
-            } else if days == 1 {
-                "day".to_string()
-            } else {
-                format!("{days}d")
-            }
-        }
-        m if m >= 60 && m % 60 == 0 => format!("{}h", m / 60),
-        _ => format!("{minutes}m"),
     }
 }
 
@@ -5956,97 +5852,6 @@ fn format_reset_timestamp(raw: &str) -> Option<String> {
             utc.minute
         ))
     }
-}
-
-fn parse_rfc3339_to_utc_secs(raw: &str) -> Option<u64> {
-    // RFC 3339 uses ASCII. Establish this before fixed byte slices, including
-    // the offset, so malformed provider text cannot split a UTF-8 character.
-    if raw.len() < 19 || !raw.is_ascii() {
-        return None;
-    }
-    let bytes = raw.as_bytes();
-    if bytes[4] != b'-'
-        || bytes[7] != b'-'
-        || bytes[10] != b'T'
-        || bytes[13] != b':'
-        || bytes[16] != b':'
-    {
-        return None;
-    }
-    let year: i32 = raw[0..4].parse().ok()?;
-    let month: u32 = raw[5..7].parse().ok()?;
-    let day: u32 = raw[8..10].parse().ok()?;
-    let hour: u32 = raw[11..13].parse().ok()?;
-    let minute: u32 = raw[14..16].parse().ok()?;
-    let second: u32 = raw[17..19].parse().ok()?;
-    if !(1..=12).contains(&month)
-        || !(1..=31).contains(&day)
-        || hour > 23
-        || minute > 59
-        || second > 59
-    {
-        return None;
-    }
-
-    // Skip fractional seconds (".466665") — some providers emit them.
-    let mut rest = &raw[19..];
-    if rest.starts_with('.') {
-        let end = rest[1..]
-            .find(|c: char| !c.is_ascii_digit())
-            .map(|i| i + 1)
-            .unwrap_or(rest.len());
-        rest = &rest[end..];
-    }
-    let rest = rest.trim_start();
-    let offset_secs = if rest.is_empty() || rest.starts_with('Z') || rest.starts_with('z') {
-        0
-    } else {
-        let sign = rest.chars().next().filter(|c| *c == '+' || *c == '-')?;
-        let tail = &rest[1..];
-        let (oh, om) = parse_hh_mm_offset(tail)?;
-        let mag = (oh as i64) * 3600 + (om as i64) * 60;
-        if sign == '+' {
-            -mag
-        } else {
-            mag
-        }
-    };
-
-    let days = civil_to_days(year, month, day)?;
-    let secs_of_day = (hour as u64) * 3600 + (minute as u64) * 60 + (second as u64);
-    let utc = (days as i64) * 86_400 + secs_of_day as i64 + offset_secs;
-    if utc < 0 {
-        return None;
-    }
-    Some(utc as u64)
-}
-
-fn parse_hh_mm_offset(tail: &str) -> Option<(u32, u32)> {
-    let (h, m) = if let Some((h, m)) = tail.split_once(':') {
-        (h, m)
-    } else if tail.len() >= 4 {
-        (&tail[..2], &tail[2..])
-    } else {
-        return None;
-    };
-    let oh: u32 = h.parse().ok()?;
-    let om: u32 = m.parse().ok()?;
-    if oh > 23 || om > 59 {
-        return None;
-    }
-    Some((oh, om))
-}
-
-fn civil_to_days(year: i32, month: u32, day: u32) -> Option<i32> {
-    let (y, m) = if month <= 2 {
-        (year - 1, month + 12)
-    } else {
-        (year, month)
-    };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400;
-    let doy = (153 * (m as i32 - 3) + 2) / 5 + day as i32 - 1 + yoe * 365 + yoe / 4 - yoe / 100;
-    Some(era * 146097 + doy - 719468)
 }
 
 struct UtcTimeParts {
@@ -7137,19 +6942,6 @@ fn health_record_age_secs(entry: &Value) -> Option<u64> {
     now_ms.checked_sub(probed_ms).map(|delta| delta / 1000)
 }
 
-fn format_duration(duration: Duration) -> String {
-    let secs = duration.as_secs();
-    if secs < 60 {
-        format!("{secs}s")
-    } else if secs < 60 * 60 {
-        format!("{}m", secs / 60)
-    } else if secs < 60 * 60 * 24 {
-        format!("{}h", secs / (60 * 60))
-    } else {
-        format!("{}d", secs / (60 * 60 * 24))
-    }
-}
-
 fn format_age_from_epoch_ms_now(timestamp_ms: u64) -> String {
     let now_ms = fixed_test_now_ms().unwrap_or_else(|| {
         SystemTime::now()
@@ -7171,27 +6963,6 @@ fn fixed_test_now_ms() -> Option<u64> {
 #[cfg(not(feature = "test-support"))]
 fn fixed_test_now_ms() -> Option<u64> {
     None
-}
-
-fn format_age_from_epoch_ms(timestamp_ms: u64, now_ms: u64) -> String {
-    if timestamp_ms > now_ms {
-        let seconds = (timestamp_ms - now_ms) / 1_000;
-        if seconds == 0 {
-            "just now".to_string()
-        } else {
-            format!("in {}", format_duration(Duration::from_secs(seconds)))
-        }
-    } else {
-        format_age_seconds((now_ms - timestamp_ms) / 1_000)
-    }
-}
-
-fn format_age_seconds(seconds: u64) -> String {
-    if seconds == 0 {
-        "just now".to_string()
-    } else {
-        format!("{} ago", format_duration(Duration::from_secs(seconds)))
-    }
 }
 
 /// `supervisor.rescan { preview: true }` as `ck module rescan --dry-run` uses
@@ -9483,6 +9254,130 @@ mod tests {
     use super::*;
     use cortexkit_test_support::ScratchDir;
     use subc_control::{StderrCaptureState, StderrTail, StderrTailEntry};
+
+    // ---- following a module's log for the app ------------------------------
+
+    fn log_dirs(root: &ScratchDir) -> LogDirs {
+        let dirs = LogDirs {
+            module_logs: root.join("mod-logs"),
+            run_logs: Some(root.join("run-logs")),
+        };
+        fs::create_dir_all(&dirs.module_logs).unwrap();
+        fs::create_dir_all(dirs.run_logs.as_ref().unwrap()).unwrap();
+        dirs
+    }
+
+    fn r1_line(second: u32, message: &str) -> String {
+        format!("2026-10-20T18:43:{second:02}.000Z INFO broca {message}\n")
+    }
+
+    fn append(path: &Path, text: &str) {
+        use std::io::Write as _;
+        fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap()
+            .write_all(text.as_bytes())
+            .unwrap();
+    }
+
+    #[test]
+    fn the_app_log_reads_the_tail_once_then_only_what_is_appended() {
+        let root = ScratchDir::new("app-log-follow");
+        let dirs = log_dirs(&root);
+        let log = dirs.module_logs.join("broca.log");
+        let lines: String = (0..50).map(|i| r1_line(i, &format!("line {i}"))).collect();
+        append(&log, &lines);
+        let sources = discover_log_sources_in(&dirs, "broca", false).unwrap();
+        let mut follower = LogFollower::start("broca", dirs.clone(), &sources).unwrap();
+
+        // The newest lines, at most the number asked for, in order.
+        let tail = follower.tail(10).unwrap();
+        assert_eq!(tail.len(), 10);
+        assert!(tail[9].line.contains("line 49"), "{:?}", tail[9].line);
+        assert!(tail[0].line.contains("line 40"), "{:?}", tail[0].line);
+
+        // Each tick reads only what was appended, and never a whole file.
+        for tick in 0..5u32 {
+            append(&log, &r1_line(50 + tick, &format!("tick {tick}")));
+            let new = follower.poll().unwrap();
+            assert_eq!(new.len(), 1, "tick {tick}: {new:?}");
+            assert_eq!(new[0].1, r1_line(50 + tick, &format!("tick {tick}")));
+        }
+        let quiet = follower.poll().unwrap();
+        assert!(quiet.is_empty(), "nothing new, nothing read: {quiet:?}");
+        assert_eq!(follower.whole_reads, 0, "a tick re-read a whole file");
+
+        // A rotation drains the old file's unseen tail, then reads the new
+        // file from its start.
+        append(&log, &r1_line(58, "before rotation"));
+        fs::rename(&log, root.join("mod-logs").join("broca.log.1")).unwrap();
+        append(&log, &r1_line(59, "after rotation"));
+        let texts: Vec<String> = follower
+            .poll()
+            .unwrap()
+            .into_iter()
+            .map(|(_, t)| t)
+            .collect();
+        assert_eq!(
+            texts,
+            [
+                r1_line(58, "before rotation"),
+                r1_line(59, "after rotation")
+            ]
+        );
+    }
+
+    /// Prints what opening and following a large module log costs. Run with
+    /// `cargo test -p subc-core --bin ck -- --ignored --nocapture
+    /// the_cost_of_following_a_large_log`.
+    #[test]
+    #[ignore]
+    fn the_cost_of_following_a_large_log() {
+        let root = ScratchDir::new("app-log-cost");
+        let dirs = log_dirs(&root);
+        let log = dirs.module_logs.join("broca.log");
+        let line = r1_line(1, &"x".repeat(120));
+        let block: String = std::iter::repeat_n(line.as_str(), 10_000).collect();
+        for _ in 0..50 {
+            append(&log, &block);
+        }
+        append(
+            &dirs.run_logs.as_ref().unwrap().join("broca.stderr.log"),
+            &std::iter::repeat_n("captured stderr line\n", 100_000).collect::<String>(),
+        );
+        let size = fs::metadata(&log).unwrap().len();
+
+        let started = Instant::now();
+        let sources = discover_log_sources(&dirs, "broca");
+        let (all, _) = collect_log_entries("broca", &sources, &app_log_options(1000)).unwrap();
+        let whole = started.elapsed();
+
+        let started = Instant::now();
+        let mut follower = LogFollower::start("broca", dirs.clone(), &sources).unwrap();
+        let tail = follower.tail(1000).unwrap();
+        let open = started.elapsed();
+
+        append(&log, &r1_line(2, "one new line"));
+        let started = Instant::now();
+        let new = follower.poll().unwrap();
+        let tick = started.elapsed();
+        let started = Instant::now();
+        let quiet = follower.poll().unwrap();
+        let idle = started.elapsed();
+        eprintln!(
+            "module log {:.1} MB, {} lines: whole collection {whole:?}; open (tail of {}) {open:?}; tick with one new line {tick:?} ({} text); idle tick {idle:?} ({} texts)",
+            size as f64 / 1e6,
+            all.len(),
+            tail.len(),
+            new.len(),
+            quiet.len()
+        );
+        fn discover_log_sources(dirs: &LogDirs, module: &str) -> Vec<LogSource> {
+            discover_log_sources_in(dirs, module, false).unwrap()
+        }
+    }
 
     #[test]
     fn provenance_value_escapes_terminal_controls() {

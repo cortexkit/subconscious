@@ -235,6 +235,18 @@ impl<'a> Canvas<'a> {
         }
     }
 
+    /// Dims the cells of a rectangle without changing their glyphs or
+    /// colors, for values that are only a last good reading.
+    pub fn dim_rect(&mut self, x: i32, y: i32, w: i32, h: i32) {
+        for j in y..y + h {
+            for i in x..x + w {
+                if let Some(cell) = self.cell_mut(i, j) {
+                    cell.modifier.insert(Modifier::DIM);
+                }
+            }
+        }
+    }
+
     /// Dims everything drawn so far, so an overlay reads as the only live
     /// thing on screen.
     pub fn dim_all(&mut self) {
@@ -312,6 +324,11 @@ pub fn spark(c: &mut Canvas, x: i32, y: i32, values: &[f64], fg: Fg, max: Option
     const TICKS: [&str; 8] = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
     let m = max.unwrap_or_else(|| values.iter().copied().fold(1.0, f64::max));
     for (i, v) in values.iter().enumerate() {
+        // A missing sample is a gap in the line, never a zero.
+        if !v.is_finite() {
+            c.put(x + i as i32, y, " ", St::NONE);
+            continue;
+        }
         let k = crate::time::js_round(((v - min) / (m - min).max(1e-9)) * 7.0).clamp(0.0, 7.0);
         c.put(x + i as i32, y, TICKS[k as usize], St::fg(fg));
     }
@@ -319,9 +336,16 @@ pub fn spark(c: &mut Canvas, x: i32, y: i32, values: &[f64], fg: Fg, max: Option
 
 /// Section heading: bold title, dim meta on the right, a hairline beneath.
 pub fn heading(c: &mut Canvas, x: i32, y: i32, w: i32, title: &str, meta: &str) {
+    heading_st(c, x, y, w, title, meta, St::D);
+}
+
+/// A heading whose meta is drawn in `meta_st`, such as amber for an age
+/// worth noticing. A meta too long for the space beside the title is cut.
+pub fn heading_st(c: &mut Canvas, x: i32, y: i32, w: i32, title: &str, meta: &str, meta_st: St) {
     c.put(x, y, title, St::B);
     if !meta.is_empty() {
-        c.right(x + w, y, meta, St::D);
+        let room = (w - width(title) as i32 - 2).max(0) as usize;
+        c.right(x + w, y, &trunc(meta, room), meta_st);
     }
     c.hline(x, y + 1, w);
 }
@@ -390,22 +414,40 @@ pub const TABS: [&str; 7] = [
     "Home", "Modules", "Activity", "Usage", "Agents", "Devices", "Settings",
 ];
 
-/// Where each tab sits in the top bar: (start column, width, tab index).
-/// Below 120 columns only the active tab shows its name; the rest show just
-/// their number.
-pub fn tab_spans(w: i32, active: usize) -> Vec<(i32, i32, usize)> {
+/// Whether a window below 120 columns must shorten the tab bar to numbers
+/// (the active tab keeps its name): only when the bar with every name
+/// doesn't fit beside the clock.
+fn tabs_shortened(w: i32, tabs: usize) -> bool {
+    if w >= 120 {
+        return false;
+    }
+    let names: i32 = TABS.iter().take(tabs).map(|t| 2 + width(t) as i32).sum();
+    let gaps = 2 * (tabs.saturating_sub(1)) as i32;
+    // The bar starts at column 4; the clock takes the last six columns.
+    4 + names + gaps > w - 7
+}
+
+/// Where each of the first `tabs` tabs sits in the top bar: (start column,
+/// width, tab index). Below 120 columns, when the names don't all fit, only
+/// the active tab shows its name and the rest just their number.
+pub fn tab_spans(w: i32, active: usize, tabs: usize) -> Vec<(i32, i32, usize)> {
     let mut spans = Vec::new();
     if w < 120 {
+        let short = tabs_shortened(w, tabs);
         let mut x = 4;
-        for (i, t) in TABS.iter().enumerate() {
+        for (i, t) in TABS.iter().take(tabs).enumerate() {
             let start = x;
-            x += if i == active { 2 + width(t) as i32 } else { 1 };
+            x += if i == active || !short {
+                2 + width(t) as i32
+            } else {
+                1
+            };
             spans.push((start, x - start, i));
             x += 2;
         }
     } else {
         let mut x = 16;
-        for (i, t) in TABS.iter().enumerate() {
+        for (i, t) in TABS.iter().take(tabs).enumerate() {
             let start = x;
             x += 2 + width(t) as i32;
             spans.push((start, x - start, i));
@@ -415,19 +457,21 @@ pub fn tab_spans(w: i32, active: usize) -> Vec<(i32, i32, usize)> {
     spans
 }
 
-/// The top bar: wordmark, tabs, machine and clock. The active tab carries the
-/// accent and an accent rule beneath it.
-pub fn chrome(c: &mut Canvas, active: usize, clock: &str, machine: &str) {
+/// The top bar: the first `tabs` tabs (only the screens that exist) and the
+/// clock, with the wordmark and the machine's name from 120 columns. The
+/// active tab carries the accent and an accent rule beneath it.
+pub fn chrome(c: &mut Canvas, active: usize, tabs: usize, clock: &str, machine: &str) {
     let compact = c.w < 120;
+    let short = tabs_shortened(c.w, tabs);
     c.put(1, 0, "◆", St::A.bold());
     if !compact {
         c.put(3, 0, "CortexKit", St::B);
     }
-    let spans = tab_spans(c.w, active);
+    let spans = tab_spans(c.w, active, tabs);
     for &(x, _, i) in &spans {
         let on = i == active;
         let num = (i + 1).to_string();
-        if compact && !on {
+        if short && !on {
             c.put(x, 0, &num, St::F);
         } else {
             c.put(x, 0, &num, if on { St::A } else { St::F });

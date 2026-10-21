@@ -2,12 +2,14 @@
 
 pub mod down;
 pub mod home;
+pub mod logs;
+pub mod metrics;
 pub mod modules;
 pub mod overlays;
 
-use crate::draw::Canvas;
-use crate::model::{Panel, Snapshot};
-use crate::theme::St;
+use crate::draw::{trunc, Canvas};
+use crate::model::{Freshness, Panel, Snapshot};
+use crate::theme::{Bg, Fg, St};
 use crate::time::{ago, js_round, to_fixed, Civil, Timestamp};
 
 /// The smallest window the app draws in.
@@ -69,6 +71,64 @@ impl View<'_> {
     }
 }
 
+/// The text shown for a value no source has reported.
+pub const UNKNOWN: &str = "unknown";
+
+/// How a panel's heading describes its data: the usual meta when fresh, the
+/// age in amber past twice the refresh interval, "last good reading" past
+/// five times, or the source's error while it is failing.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Meta {
+    pub text: String,
+    pub st: St,
+    /// Whether the panel's values are a last good reading and draw dimmed.
+    pub dim: bool,
+}
+
+impl Meta {
+    pub fn plain(text: &str) -> Meta {
+        Meta {
+            text: text.to_string(),
+            st: St::D,
+            dim: false,
+        }
+    }
+}
+
+impl View<'_> {
+    /// The heading meta for `panel`, given what it says when all is well.
+    pub fn meta<T>(&self, panel: &Panel<T>, normal: &str) -> Meta {
+        let fresh = panel.freshness(self.now);
+        let stale = fresh == Freshness::Stale;
+        let age = || ago(self.age(panel.received_at));
+        if let Some(err) = &panel.error {
+            let text = if panel.loaded && fresh != Freshness::Fresh {
+                format!("{err} · {} ago", age())
+            } else {
+                err.clone()
+            };
+            return Meta {
+                text,
+                st: St::W,
+                dim: stale,
+            };
+        }
+        match fresh {
+            Freshness::Fresh => Meta::plain(normal),
+            Freshness::Aging => Meta {
+                text: format!("{} ago", age()),
+                st: St::W,
+                dim: false,
+            },
+            Freshness::Stale => Meta {
+                text: format!("last good reading · {} ago", age()),
+                st: St::W,
+                dim: true,
+            },
+        }
+    }
+}
+
 /// CPU percent: one decimal below 10%, none from 10%.
 pub fn fmt_cpu(c: f64) -> String {
     format!("{}%", to_fixed(c, if c >= 10.0 { 0 } else { 1 }))
@@ -81,6 +141,21 @@ pub fn fmt_mem(mb: f64) -> String {
     } else {
         format!("{} MB", js_round(mb))
     }
+}
+
+/// CPU percent, or "unknown".
+pub fn opt_cpu(c: Option<f64>) -> String {
+    c.map_or_else(|| UNKNOWN.to_string(), fmt_cpu)
+}
+
+/// Memory, or "unknown".
+pub fn opt_mem(mb: Option<f64>) -> String {
+    mb.map_or_else(|| UNKNOWN.to_string(), fmt_mem)
+}
+
+/// A count, or "unknown".
+pub fn opt_count(n: Option<u32>) -> String {
+    n.map_or_else(|| UNKNOWN.to_string(), |n| n.to_string())
 }
 
 /// A used fraction as a whole percent.
@@ -106,6 +181,34 @@ pub fn window(values: &[f64], start: usize, n: usize) -> &[f64] {
 pub fn spark_window(values: &[f64], offset: usize, n: usize) -> &[f64] {
     let n = n.min(values.len());
     window(values, offset.min(values.len() - n), n)
+}
+
+/// How long the line reporting an action's result stays on screen.
+pub const RESULT_SECS: f64 = 12.0;
+
+/// The line reporting what the last action actually did, above the footer
+/// at the right, for [`RESULT_SECS`] after it finished.
+pub fn result_toast(c: &mut Canvas, v: &View) {
+    let Some(r) = &v.snap.last_result else {
+        return;
+    };
+    let age = v.age(r.at);
+    if !(0.0..=RESULT_SECS).contains(&age) {
+        return;
+    }
+    let (glyph, gst) = if r.ok {
+        ("✓", St::fg(Fg::Ok).on(Bg::Key))
+    } else {
+        ("✕", St::fg(Fg::Err).on(Bg::Key))
+    };
+    let text = trunc(&r.text, (c.w - 10).max(0) as usize);
+    let start = c.right(
+        c.w - 2,
+        c.h - 3,
+        &format!(" {glyph} {text} "),
+        St::bg(Bg::Key),
+    );
+    c.put(start + 1, c.h - 3, glyph, gst);
 }
 
 /// The note drawn instead of a screen when the window is too small.

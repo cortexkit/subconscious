@@ -29,7 +29,9 @@ mod upgrade_verification;
 mod validation;
 
 pub(crate) use apply::data_directory;
-pub use apply::{default_claustrum_key_path, SetupBackend};
+pub use apply::{
+    default_claustrum_key_path, installed_service_facts, start_installed_service, SetupBackend,
+};
 pub(crate) use components::{component_binaries_for_target, module_program};
 pub use model::{
     version_transition, AlphaTarget, Component, ComponentState, PlanOutcome, PlatformObservation,

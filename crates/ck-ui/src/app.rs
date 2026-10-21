@@ -15,7 +15,8 @@ use ratatui::Terminal;
 use tokio::sync::watch;
 
 use crate::draw::{tab_spans, Canvas};
-use crate::model::{Daemon, Snapshot};
+use crate::model::{ActionKind, Daemon, LogView, Module, Panel, Snapshot, Status};
+use crate::screens::logs::{self, LevelFilter, LogState};
 use crate::screens::{self, overlays, View, MIN_H, MIN_W};
 use crate::theme::{detect_theme, Theme};
 use crate::time::Timestamp;
@@ -30,6 +31,28 @@ pub enum Tab {
 pub enum Overlay {
     Palette,
     Help,
+}
+
+/// What the app asks of whoever feeds it data. The app never waits for an
+/// answer: the effects show up in later snapshots.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Request {
+    /// The `ck module restart`, `stop` and `start` requests.
+    Act { kind: ActionKind, module: String },
+    /// The module whose log the app shows (the Modules pane or the log
+    /// view), or `None` when no log is on screen.
+    WatchLog(Option<String>),
+    /// Start the installed daemon service.
+    StartDaemon,
+}
+
+/// A question waiting for an answer before an action is sent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Confirm {
+    pub kind: ActionKind,
+    pub module: String,
+    /// What the action will do, in a sentence or two.
+    pub consequence: String,
 }
 
 /// Everything the app remembers between frames. The data itself lives in the
@@ -53,6 +76,17 @@ pub struct App {
     pub size: (u16, u16),
     /// Where `esc` returns to after `⏎` opened something.
     back: Option<Tab>,
+    /// The log view's settings while it is open over Modules.
+    pub log: Option<LogState>,
+    /// A confirmation waiting for an answer.
+    pub confirm: Option<Confirm>,
+    /// The all-metrics list's scroll position while it is open over
+    /// Modules.
+    pub metrics: Option<usize>,
+    /// Whether the daemon-down screen shows the daemon's log.
+    pub down_log: bool,
+    /// Requests made since the run loop last collected them.
+    pub requests: Vec<Request>,
 }
 
 impl App {
@@ -69,6 +103,53 @@ impl App {
             quit: false,
             size: (120, 36),
             back: None,
+            log: None,
+            confirm: None,
+            metrics: None,
+            down_log: false,
+            requests: Vec::new(),
+        }
+    }
+
+    /// The module whose log is on screen, if any: the selected module while
+    /// Modules is showing.
+    pub fn log_focus(&self, snap: &Snapshot) -> Option<String> {
+        if matches!(snap.daemon.data, Daemon::Down(_)) || self.tab != Tab::Modules {
+            return None;
+        }
+        self.selected(snap).map(|m| m.id.clone())
+    }
+
+    /// The module whose palette commands list first: the selected one while
+    /// Modules is showing.
+    fn preferred_module<'a>(&self, snap: &'a Snapshot) -> Option<&'a str> {
+        (self.tab == Tab::Modules)
+            .then(|| self.selected(snap).map(|m| m.id.as_str()))
+            .flatten()
+    }
+
+    fn selected<'a>(&self, snap: &'a Snapshot) -> Option<&'a Module> {
+        let mods = &snap.modules.data;
+        mods.get(self.mod_sel.min(mods.len().saturating_sub(1)))
+    }
+
+    /// The log view's data for the selected module, or an empty panel while
+    /// its first reading is on the way.
+    fn log_panel(&self, snap: &Snapshot) -> Panel<LogView> {
+        let id = self
+            .selected(snap)
+            .map(|m| m.id.clone())
+            .unwrap_or_default();
+        match &snap.log_view {
+            Some(p) if p.data.module == id => p.clone(),
+            _ => Panel::waiting(
+                LogView {
+                    module: id,
+                    lines: Vec::new(),
+                    source: String::new(),
+                },
+                None,
+            ),
         }
     }
 
@@ -87,12 +168,45 @@ impl App {
             mod_sel: self.mod_sel,
         };
         if let Daemon::Down(d) = &snap.daemon.data {
-            screens::down::draw(&mut c, &v, d);
+            if self.down_log {
+                let panel = Panel::new(
+                    snap.daemon.received_at,
+                    LogView {
+                        module: "daemon".into(),
+                        lines: d.log_tail.clone(),
+                        source: "the daemon's own log".into(),
+                    },
+                );
+                screens::logs::draw(&mut c, &v, &panel, &LogState::default());
+            } else {
+                screens::down::draw(&mut c, &v, d);
+            }
             return;
         }
-        match self.tab {
-            Tab::Home => screens::home::draw(&mut c, &v),
-            Tab::Modules => screens::modules::draw(&mut c, &v),
+        match (self.tab, &self.log, self.metrics, self.selected(snap)) {
+            (Tab::Home, ..) => screens::home::draw(&mut c, &v),
+            (Tab::Modules, Some(state), ..) => {
+                screens::logs::draw(&mut c, &v, &self.log_panel(snap), state)
+            }
+            (Tab::Modules, None, Some(scroll), Some(m)) => {
+                screens::metrics::draw(&mut c, &v, m, scroll)
+            }
+            (Tab::Modules, ..) => screens::modules::draw(&mut c, &v),
+        }
+        screens::result_toast(&mut c, &v);
+        if let Some(q) = &self.confirm {
+            let title = match q.kind {
+                ActionKind::Restart => format!("Restart {}?", q.module),
+                ActionKind::Stop => format!("Stop {}?", q.module),
+                ActionKind::Start => format!("Start {}?", q.module),
+            };
+            let yes = match q.kind {
+                ActionKind::Restart => "Restart",
+                ActionKind::Stop => "Stop",
+                ActionKind::Start => "Start",
+            };
+            overlays::confirm(&mut c, &title, std::slice::from_ref(&q.consequence), yes);
+            return;
         }
         match self.overlay {
             Some(Overlay::Palette) => overlays::palette(
@@ -100,8 +214,9 @@ impl App {
                 &snap.commands,
                 &self.palette_query,
                 self.palette_sel,
+                self.preferred_module(snap),
             ),
-            Some(Overlay::Help) => overlays::help(&mut c),
+            Some(Overlay::Help) => overlays::help(&mut c, snap.serves),
             None => {}
         }
     }
@@ -132,12 +247,28 @@ impl App {
             match key.code {
                 KeyCode::Char('q') => self.quit = true,
                 KeyCode::Char('t') => self.theme = self.theme.toggled(),
+                KeyCode::Enter if !self.down_log => self.requests.push(Request::StartDaemon),
+                KeyCode::Char('l') => self.down_log = !self.down_log,
+                KeyCode::Esc if self.down_log => self.down_log = false,
                 _ => return false,
             }
             return true;
         }
+        if self.confirm.is_some() {
+            return self.confirm_key(key);
+        }
         if self.overlay == Some(Overlay::Palette) {
             return self.palette_key(key, snap);
+        }
+        if self.overlay.is_none() && self.tab == Tab::Modules && self.metrics.is_some() {
+            if let Some(handled) = self.metrics_key(key, snap) {
+                return handled;
+            }
+        }
+        if self.overlay.is_none() && self.tab == Tab::Modules && self.log.is_some() {
+            if let Some(handled) = self.log_key(key, snap) {
+                return handled;
+            }
         }
         if key
             .modifiers
@@ -169,7 +300,24 @@ impl App {
             }
             _ if self.overlay.is_some() => return false,
             KeyCode::Up | KeyCode::Char('k') => return self.move_by(-1, snap),
+            // Top and bottom of the list.
+            KeyCode::Char('g') => return self.move_by(-1_000_000, snap),
+            KeyCode::Char('G') => return self.move_by(1_000_000, snap),
             KeyCode::Down | KeyCode::Char('j') => return self.move_by(1, snap),
+            KeyCode::Char('r') if self.tab == Tab::Modules => return self.restart(snap),
+            KeyCode::Char('s') if self.tab == Tab::Modules => return self.stop_or_start(snap),
+            KeyCode::Char('m') if self.tab == Tab::Modules && snap.serves.all_metrics => {
+                if snap.modules.data.is_empty() {
+                    return false;
+                }
+                self.metrics = Some(0);
+            }
+            KeyCode::Char('l') if self.tab == Tab::Modules => {
+                if snap.modules.data.is_empty() {
+                    return false;
+                }
+                self.log = Some(LogState::default());
+            }
             KeyCode::Enter if self.tab == Tab::Home => {
                 let att = snap.attention();
                 let Some(m) = att.get(self.home_sel) else {
@@ -186,6 +334,190 @@ impl App {
         true
     }
 
+    /// `r` on Modules: always asks first, naming what the restart
+    /// interrupts (see [`interruption`]). A restart cuts off whatever the
+    /// module is doing once its drain limit runs out, so even a healthy
+    /// module's restart can lose work once confirmed.
+    fn restart(&mut self, snap: &Snapshot) -> bool {
+        let Some(m) = self.selected(snap) else {
+            return false;
+        };
+        if m.action.is_some() {
+            return false;
+        }
+        let id = &m.id;
+        let state = match m.status {
+            Status::Ok => String::new(),
+            Status::Stopped => format!("{id} is stopped; a restart starts it. "),
+            Status::Degraded => format!("{id} is degraded; a restart stops it mid-recovery. "),
+            Status::Failed => format!(
+                "{id} has failed; a restart resets its crash budget, and if the cause is still there it fails again. "
+            ),
+            Status::Starting => {
+                format!("{id} is still starting; a restart throws that start away. ")
+            }
+            Status::Unknown => format!("Nothing has confirmed {id}'s health yet. "),
+        };
+        let consequence = format!("{state}{}", interruption(m, ActionKind::Restart));
+        self.confirm = Some(Confirm {
+            kind: ActionKind::Restart,
+            module: id.clone(),
+            consequence,
+        });
+        true
+    }
+
+    /// `s` on Modules: a stopped module starts at once; any other is stopped
+    /// after asking first, naming what stopping interrupts.
+    fn stop_or_start(&mut self, snap: &Snapshot) -> bool {
+        let Some(m) = self.selected(snap) else {
+            return false;
+        };
+        if m.action.is_some() {
+            return false;
+        }
+        let id = m.id.clone();
+        if m.status == Status::Stopped {
+            self.requests.push(Request::Act {
+                kind: ActionKind::Start,
+                module: id,
+            });
+            return true;
+        }
+        self.confirm = Some(Confirm {
+            kind: ActionKind::Stop,
+            module: id.clone(),
+            consequence: format!(
+                "{} {id} stays stopped until you start it again.",
+                interruption(m, ActionKind::Stop)
+            ),
+        });
+        true
+    }
+
+    fn confirm_key(&mut self, key: KeyEvent) -> bool {
+        match key.code {
+            KeyCode::Enter | KeyCode::Char('y') => {
+                if let Some(q) = self.confirm.take() {
+                    self.requests.push(Request::Act {
+                        kind: q.kind,
+                        module: q.module,
+                    });
+                }
+            }
+            KeyCode::Esc | KeyCode::Char('n') => self.confirm = None,
+            _ => return false,
+        }
+        true
+    }
+
+    /// Keys for the log view. `None` lets the key fall through to the
+    /// app-wide keys (tabs, palette, help, quit).
+    fn log_key(&mut self, key: KeyEvent, snap: &Snapshot) -> Option<bool> {
+        let panel = self.log_panel(snap);
+        let rows = logs::rows(i32::from(self.size.1));
+        let state = self.log.as_mut()?;
+        if state.typing {
+            match key.code {
+                KeyCode::Esc => {
+                    state.typing = false;
+                    state.query.clear();
+                }
+                KeyCode::Enter => state.typing = false,
+                KeyCode::Backspace => {
+                    state.query.pop();
+                }
+                KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    state.query.push(ch)
+                }
+                _ => return Some(false),
+            }
+            return Some(true);
+        }
+        let lines = logs::visible(&panel.data, state);
+        let len = lines.len();
+        match key.code {
+            KeyCode::Esc => {
+                if state.query.is_empty() {
+                    self.log = None;
+                } else {
+                    state.query.clear();
+                }
+            }
+            KeyCode::Char('/') => {
+                state.typing = true;
+                state.query.clear();
+            }
+            KeyCode::Char('f') => {
+                state.paused = !state.paused;
+                if !state.paused {
+                    state.scroll = 0;
+                }
+            }
+            KeyCode::Tab => {
+                state.levels = state.levels.next();
+                state.scroll = 0;
+            }
+            KeyCode::Char('n') => {
+                // The next match below the top row shown, wrapping to the
+                // first; the view scrolls to put it on the top row.
+                let hits = logs::matches(&lines, &state.query);
+                let first = logs::first_shown(len, rows, state.scroll);
+                let Some(&next) = hits.iter().find(|&&i| i > first).or(hits.first()) else {
+                    return Some(false);
+                };
+                state.paused = true;
+                state.scroll = len.saturating_sub(rows).saturating_sub(next);
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                state.paused = true;
+                state.scroll = (state.scroll + 1).min(len.saturating_sub(rows));
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                state.scroll = state.scroll.saturating_sub(1);
+            }
+            // The oldest line kept, and back to following the newest.
+            KeyCode::Char('g') => {
+                state.paused = true;
+                state.scroll = len.saturating_sub(rows);
+            }
+            KeyCode::Char('G') => {
+                state.paused = false;
+                state.scroll = 0;
+            }
+            KeyCode::Char('m') => {
+                let n = snap.modules.data.len();
+                if n > 0 {
+                    self.mod_sel = (self.mod_sel + 1) % n;
+                    *state = LogState {
+                        levels: state.levels,
+                        ..LogState::default()
+                    };
+                }
+            }
+            _ => return None,
+        }
+        Some(true)
+    }
+
+    /// Keys for the all-metrics list. `None` lets the key fall through to
+    /// the app-wide keys.
+    fn metrics_key(&mut self, key: KeyEvent, snap: &Snapshot) -> Option<bool> {
+        let len = self.selected(snap).map_or(0, |m| m.all_metrics.len());
+        let rows = screens::metrics::rows(i32::from(self.size.1));
+        let bottom = len.saturating_sub(rows);
+        let scroll = self.metrics.as_mut()?;
+        match key.code {
+            KeyCode::Esc => self.metrics = None,
+            KeyCode::Up | KeyCode::Char('k') => *scroll = scroll.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => *scroll = (*scroll + 1).min(bottom),
+            KeyCode::Char('g') => *scroll = 0,
+            KeyCode::Char('G') => *scroll = bottom,
+            _ => return None,
+        }
+        Some(true)
+    }
+
     fn open_palette(&mut self) {
         self.overlay = Some(Overlay::Palette);
         self.palette_query.clear();
@@ -196,6 +528,8 @@ impl App {
         self.tab = tab;
         self.overlay = None;
         self.back = None;
+        self.log = None;
+        self.metrics = None;
     }
 
     fn palette_key(&mut self, key: KeyEvent, snap: &Snapshot) -> bool {
@@ -204,7 +538,12 @@ impl App {
             KeyCode::Esc => self.overlay = None,
             KeyCode::Up => self.palette_sel = self.palette_sel.saturating_sub(1),
             KeyCode::Down => {
-                let n = overlays::matches(&snap.commands, &self.palette_query).len();
+                let n = overlays::matches(
+                    &snap.commands,
+                    &self.palette_query,
+                    self.preferred_module(snap),
+                )
+                .len();
                 self.palette_sel = (self.palette_sel + 1).min(n.saturating_sub(1));
             }
             KeyCode::Backspace => {
@@ -212,7 +551,11 @@ impl App {
                 self.palette_sel = 0;
             }
             KeyCode::Enter => {
-                let list = overlays::matches(&snap.commands, &self.palette_query);
+                let list = overlays::matches(
+                    &snap.commands,
+                    &self.palette_query,
+                    self.preferred_module(snap),
+                );
                 let Some(cmd) = list.get(self.palette_sel.min(list.len().saturating_sub(1))) else {
                     return false;
                 };
@@ -222,16 +565,39 @@ impl App {
                 // other areas have no screen in this app yet, so the palette
                 // just closes.
                 if area == "Modules" {
-                    if let Some(i) = snap
+                    let named = snap
                         .modules
                         .data
                         .iter()
-                        .position(|m| title.split_whitespace().any(|w| w == m.id))
-                    {
+                        .position(|m| title.split_whitespace().any(|w| w == m.id));
+                    if let Some(i) = named {
                         self.mod_sel = i;
                     }
                     self.tab = Tab::Modules;
                     self.back = None;
+                    // A command naming a module and a verb does what it
+                    // says, through the same path as the key for it.
+                    if named.is_some() {
+                        if title.starts_with("Restart ") {
+                            self.restart(snap);
+                        } else if title.starts_with("Stop ") || title.starts_with("Start ") {
+                            self.stop_or_start(snap);
+                        } else if title.contains(" logs") {
+                            self.log = Some(LogState::default());
+                        } else if title.starts_with("All metrics") {
+                            self.metrics = Some(0);
+                        }
+                    }
+                } else if area == "App" {
+                    // The app's own commands, each what its key does.
+                    match title.as_str() {
+                        "Home" => self.switch(Tab::Home),
+                        "Modules" => self.switch(Tab::Modules),
+                        "Keys" => self.overlay = Some(Overlay::Help),
+                        "Light or dark" => self.theme = self.theme.toggled(),
+                        "Quit" => self.quit = true,
+                        _ => {}
+                    }
                 }
             }
             KeyCode::Char(ch) if !ctrl && !key.modifiers.contains(KeyModifiers::ALT) => {
@@ -263,7 +629,10 @@ impl App {
 
     /// Clicks on a tab or a Modules row, and scrolling to move the selection.
     pub fn handle_mouse(&mut self, mouse: MouseEvent, snap: &Snapshot, size: (u16, u16)) -> bool {
-        if self.overlay.is_some() || matches!(snap.daemon.data, Daemon::Down(_)) {
+        if self.overlay.is_some()
+            || self.confirm.is_some()
+            || matches!(snap.daemon.data, Daemon::Down(_))
+        {
             return false;
         }
         let (w, h) = (i32::from(size.0), i32::from(size.1));
@@ -278,7 +647,7 @@ impl App {
                         Tab::Home => 0,
                         Tab::Modules => 1,
                     };
-                    for (sx, sw, i) in tab_spans(w, active) {
+                    for (sx, sw, i) in tab_spans(w, active, snap.serves.tabs) {
                         if x >= sx && x < sx + sw {
                             let tab = match i {
                                 0 => Tab::Home,
@@ -286,6 +655,24 @@ impl App {
                                 _ => return false,
                             };
                             self.switch(tab);
+                            return true;
+                        }
+                    }
+                    return false;
+                }
+                if let (Tab::Modules, Some(state)) = (self.tab, self.log.as_mut()) {
+                    // The level chips on the log view's top row.
+                    if y == 3 {
+                        let chips = [
+                            (22, 12, LevelFilter::All),
+                            (35, 10, LevelFilter::Warnings),
+                            (46, 8, LevelFilter::Errors),
+                        ];
+                        if let Some((_, _, f)) =
+                            chips.iter().find(|(cx, cw, _)| x >= *cx && x < cx + cw)
+                        {
+                            state.levels = *f;
+                            state.scroll = 0;
                             return true;
                         }
                     }
@@ -308,6 +695,59 @@ impl App {
             _ => false,
         }
     }
+}
+
+/// What a restart or stop of `m` interrupts, from what the snapshot knows:
+/// the routes open to it (and who holds them), the work in flight it
+/// reports (when it reports any), and how long it gets to finish that work.
+/// Unknown routes and an unknown drain limit are said to be unknown.
+pub fn interruption(m: &Module, kind: ActionKind) -> String {
+    let close = if kind == ActionKind::Restart {
+        "close and reopen"
+    } else {
+        "close"
+    };
+    let routes = match &m.serving {
+        None => "Its open routes are unknown.".to_string(),
+        Some(list) if list.is_empty() => "It has no open routes.".to_string(),
+        Some(list) => {
+            let mut names: Vec<&str> = list.iter().map(String::as_str).collect();
+            names.sort_unstable();
+            names.dedup();
+            format!(
+                "Its {} open {} {close} ({}).",
+                list.len(),
+                if list.len() == 1 { "route" } else { "routes" },
+                names.join(", ")
+            )
+        }
+    };
+    // In-flight work as the module itself reports it: a metric that says so
+    // (among its headline metrics, else among all it reports, a top-level
+    // key before a nested one), else its own health sentence.
+    let mut all: Vec<&crate::model::Metric> = m.all_metrics.iter().collect();
+    all.sort_by_key(|x| x.label.contains('.') || x.label.contains('['));
+    let in_flight = m
+        .metrics
+        .iter()
+        .chain(all)
+        .find(|x| {
+            let l = x.label.to_ascii_lowercase();
+            l.contains("in_flight") || l.contains("inflight") || l.contains("in flight")
+        })
+        .map(|x| format!(" It reports {} {}.", x.label, x.value))
+        .or_else(|| {
+            (!m.summary.is_empty()).then(|| format!(" It reports: \u{201c}{}\u{201d}.", m.summary))
+        })
+        .unwrap_or_default();
+    let drain = match m.drain_limit_secs {
+        Some(d) => format!(
+            " Work in flight gets up to {} to finish; whatever is left then is cut off.",
+            crate::time::ago(d)
+        ),
+        None => " How long work in flight gets to finish is unknown.".to_string(),
+    };
+    format!("{routes}{in_flight}{drain}")
 }
 
 // ---- terminal setup ----------------------------------------------------------
@@ -414,12 +854,36 @@ pub type Clock = Arc<dyn Fn() -> Timestamp + Send + Sync>;
 
 pub struct RunOptions {
     pub clock: Clock,
+    /// Where the app's requests go (actions, the log it shows, starting the
+    /// daemon). Without it the app only looks.
+    pub requests: Option<tokio::sync::mpsc::UnboundedSender<Request>>,
 }
 
 impl Default for RunOptions {
     fn default() -> Self {
         RunOptions {
             clock: Arc::new(Timestamp::system_now),
+            requests: None,
+        }
+    }
+}
+
+/// Hands the app's queued requests to `out`, and tells it when the log on
+/// screen changes. `watching` is the last log focus sent.
+fn forward_requests(
+    app: &mut App,
+    snap: &Snapshot,
+    out: Option<&tokio::sync::mpsc::UnboundedSender<Request>>,
+    watching: &mut Option<Option<String>>,
+) {
+    let focus = app.log_focus(snap);
+    if watching.as_ref() != Some(&focus) {
+        app.requests.push(Request::WatchLog(focus.clone()));
+        *watching = Some(focus);
+    }
+    for request in app.requests.drain(..) {
+        if let Some(out) = out {
+            let _ = out.send(request);
         }
     }
 }
@@ -465,6 +929,13 @@ async fn event_loop(mut rx: watch::Receiver<Snapshot>, options: RunOptions) -> i
     let mut dirty = true;
     let mut source_open = true;
     let mut last_draw = tokio::time::Instant::now() - FRAME;
+    let mut watching = None;
+    forward_requests(
+        &mut app,
+        &rx.borrow(),
+        options.requests.as_ref(),
+        &mut watching,
+    );
 
     loop {
         if app.quit {
@@ -483,10 +954,11 @@ async fn event_loop(mut rx: watch::Receiver<Snapshot>, options: RunOptions) -> i
             event = events.next() => match event {
                 Some(Ok(event)) => {
                     let size = terminal.size()?;
-                    let snap = rx.borrow();
+                    let snap = rx.borrow().clone();
                     if app.handle_event(&event, &snap, (size.width, size.height)) {
                         dirty = true;
                     }
+                    forward_requests(&mut app, &snap, options.requests.as_ref(), &mut watching);
                 }
                 Some(Err(e)) => return Err(e),
                 None => return Ok(()),
@@ -501,6 +973,8 @@ async fn event_loop(mut rx: watch::Receiver<Snapshot>, options: RunOptions) -> i
                     source_open = false;
                 } else {
                     dirty = true;
+                    let snap = rx.borrow().clone();
+                    forward_requests(&mut app, &snap, options.requests.as_ref(), &mut watching);
                 }
             }
         }

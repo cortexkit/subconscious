@@ -4,6 +4,7 @@
 //! switch to rewrite them from the app's output.
 
 use ck_ui::app::{App, Overlay, Tab};
+use ck_ui::screens::logs::LogState;
 use ck_ui::{Snapshot, Theme};
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
@@ -157,4 +158,15 @@ fn help_120x36() {
 #[test]
 fn down_120x36() {
     check("down-120x36", &app(), &Snapshot::fixture_daemon_down());
+}
+
+#[test]
+fn logs_120x36() {
+    let mut app = app();
+    app.tab = Tab::Modules;
+    app.log = Some(LogState {
+        query: "429".to_string(),
+        ..LogState::default()
+    });
+    check("logs-120x36", &app, &Snapshot::fixture_logs());
 }

@@ -981,6 +981,95 @@ fn register<R: CommandRunner>(
     Ok(())
 }
 
+/// The installed daemon service as the service manager and its definition
+/// describe it, for the app's daemon-down screen.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServiceFacts {
+    /// The definition file is on disk.
+    pub installed: bool,
+    /// The service manager has the service registered: loaded by launchd,
+    /// enabled for systemd, a registered task for Task Scheduler. The
+    /// screen calls this "loaded".
+    pub loaded: bool,
+    /// Whether the definition asks for a restart when the daemon fails;
+    /// `None` when there is no definition to read.
+    pub restarts_on_failure: Option<bool>,
+}
+
+impl ServiceFacts {
+    /// One line, such as "loaded · restarts on failure".
+    pub fn summary(&self) -> String {
+        if !self.installed {
+            return "not installed · ck setup installs it".to_string();
+        }
+        let loaded = if self.loaded {
+            "loaded"
+        } else {
+            "installed, not loaded"
+        };
+        match self.restarts_on_failure {
+            Some(true) => format!("{loaded} · restarts on failure"),
+            Some(false) => format!("{loaded} · doesn't restart on failure"),
+            None => loaded.to_string(),
+        }
+    }
+}
+
+/// Reads the installed service's definition and asks the service manager
+/// whether it is registered (see [`ServiceFacts::loaded`]). A failed query
+/// counts as not registered.
+pub fn service_facts<R: CommandRunner>(
+    platform: RuntimePlatform,
+    paths: &RuntimePaths,
+    runner: &mut R,
+) -> ServiceFacts {
+    let definition = fs::read_to_string(&paths.definition).ok();
+    let loaded =
+        definition.is_some() && observe(platform, runner).is_ok_and(|status| status.registered);
+    ServiceFacts {
+        installed: definition.is_some(),
+        loaded,
+        restarts_on_failure: definition
+            .as_deref()
+            .map(|text| definition_restarts_on_failure(platform, text)),
+    }
+}
+
+/// Whether a service definition restarts the daemon after a failed exit:
+/// launchd `KeepAlive`, systemd `Restart=on-failure`, `on-abnormal` or
+/// `always`, Task
+/// Scheduler `RestartOnFailure`.
+fn definition_restarts_on_failure(platform: RuntimePlatform, text: &str) -> bool {
+    match platform {
+        RuntimePlatform::Macos => text.contains("<key>KeepAlive</key>"),
+        RuntimePlatform::Linux => text.lines().any(|line| {
+            matches!(
+                line.trim(),
+                "Restart=on-failure" | "Restart=always" | "Restart=on-abnormal"
+            )
+        }),
+        RuntimePlatform::Windows => text.contains("<RestartOnFailure>"),
+    }
+}
+
+/// Starts the installed, loaded service now, the way setup starts it. It
+/// refuses a service the manager doesn't report as registered: registering
+/// one is `ck setup`'s work, since it also writes and records the
+/// definition.
+pub fn start_installed<R: CommandRunner>(
+    platform: RuntimePlatform,
+    paths: &RuntimePaths,
+    runner: &mut R,
+) -> Result<(), String> {
+    if !paths.definition.exists() {
+        return Err("the daemon service isn't installed; run ck setup".to_string());
+    }
+    if !observe(platform, runner)?.registered {
+        return Err("the daemon service isn't loaded; run ck setup".to_string());
+    }
+    start(platform, paths, runner)
+}
+
 fn start<R: CommandRunner>(
     platform: RuntimePlatform,
     _paths: &RuntimePaths,
@@ -1192,6 +1281,90 @@ mod tests {
 
     fn fixture_dir(name: &str) -> ScratchDir {
         ScratchDir::new(name)
+    }
+
+    #[test]
+    fn service_facts_read_the_definition_and_the_manager() {
+        let root = fixture_dir("service-facts");
+        for platform in [
+            RuntimePlatform::Macos,
+            RuntimePlatform::Linux,
+            RuntimePlatform::Windows,
+        ] {
+            let paths = runtime_paths(platform, root.path(), root.path());
+            let mut runner = RecordingRunner::default();
+            let missing = service_facts(platform, &paths, &mut runner);
+            assert_eq!(missing.summary(), "not installed · ck setup installs it");
+            assert!(runner.calls.is_empty(), "no definition, no manager query");
+
+            fs::create_dir_all(paths.definition.parent().unwrap()).unwrap();
+            fs::write(
+                &paths.definition,
+                desired_definition_for_user(platform, &paths, "user"),
+            )
+            .unwrap();
+            let facts = service_facts(platform, &paths, &mut RecordingRunner::default());
+            assert_eq!(
+                facts.summary(),
+                "loaded · restarts on failure",
+                "{platform:?}"
+            );
+            let mut refused = RecordingRunner {
+                results: VecDeque::from([false]),
+                ..RecordingRunner::default()
+            };
+            let facts = service_facts(platform, &paths, &mut refused);
+            assert_eq!(
+                facts.summary(),
+                "installed, not loaded · restarts on failure"
+            );
+            fs::remove_file(&paths.definition).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_definition_without_a_restart_rule_says_so() {
+        assert!(!definition_restarts_on_failure(
+            RuntimePlatform::Linux,
+            "[Service]\nExecStart=/x\n"
+        ));
+        assert!(definition_restarts_on_failure(
+            RuntimePlatform::Linux,
+            "[Service]\nRestart=on-failure\n"
+        ));
+    }
+
+    #[test]
+    fn start_installed_starts_a_loaded_service_and_refuses_otherwise() {
+        let root = fixture_dir("start-installed");
+        let platform = RuntimePlatform::Linux;
+        let paths = runtime_paths(platform, root.path(), root.path());
+        let err = start_installed(platform, &paths, &mut RecordingRunner::default()).unwrap_err();
+        assert!(err.contains("isn't installed"), "{err}");
+
+        fs::create_dir_all(paths.definition.parent().unwrap()).unwrap();
+        fs::write(
+            &paths.definition,
+            desired_definition_for_user(platform, &paths, "user"),
+        )
+        .unwrap();
+        let mut runner = RecordingRunner::default();
+        start_installed(platform, &paths, &mut runner).unwrap();
+        let last = runner.calls.last().unwrap();
+        assert_eq!(last.0, "systemctl");
+        assert_eq!(last.1, ["--user", "start", "cortexkit-subc.service"]);
+
+        // is-enabled fails: not registered, so nothing is started.
+        let mut refused = RecordingRunner {
+            results: VecDeque::from([false]),
+            ..RecordingRunner::default()
+        };
+        let err = start_installed(platform, &paths, &mut refused).unwrap_err();
+        assert!(err.contains("isn't loaded"), "{err}");
+        assert!(!refused
+            .calls
+            .iter()
+            .any(|(_, a)| a.contains(&"start".to_string())));
     }
 
     struct LingerRunner {

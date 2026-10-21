@@ -18,7 +18,7 @@
   ● ckbus │   Mouse                                                                                          │d 2d ago  
   ● claust│                                                                                                  │w         
   ● condit│   Click to select, double-click to open, scroll anywhere. Nothing needs the mouse.               │          
-  ▲ engram│                                                                                                  │Phone     
+  ▲ engram│                                                                                                  │Phone +1  
   ● entorh│   Scripts and agents                                                                             │          
   ● fusifo│                                                                                                  │          
           │   ckni runs any command without this app: plain text, or --json. Everything here has a           │          
@@ -30,7 +30,7 @@
   17:54  m╰──────────────────────────────────────────────────────────────────────────────────────────────────╯ idle 4m  
   17:53  motor             restarted on build 17c0a7d6                          ck   ● ECHO                    working  
   17:21  prefrontal-core   started worker for llm-runner 0.3.8                IRIS   ○ KITE                   idle 12m  
-  17:02  astrocyte         restarted on build ad21ee36                          ck   ○ MOSS                   idle 31m  
+  17:02  astrocyte         restarted on build ad21ee36                          ck   +6 more                            
                                                                                                                         
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
   ⏎  open    ↑↓  move    :  commands    ?  help                                                        updated just now 

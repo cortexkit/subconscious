@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.18
+
+- Add the `host` module: total and available memory (`host::memory`), the 1, 5 and 15 minute load averages (`host::load_average`, `None` on Windows) and the total and free space of the filesystem holding a path (`host::disk_space`), for macOS, Linux and Windows. Each returns `None` when the value can't be read, never zeros.
+
 ## 0.1.17
 
 - Add `socket_peer::loopback_socket_peer`, a best-effort lookup of the connecting process's PID and executable for an accepted loopback TCP connection. Match the peer's full socket tuple using libproc on macOS, socket inodes in Linux procfs, and the Windows extended TCP owner table. Unavailable or unreadable identities return `None`; this information is for caller descriptions, not authentication.

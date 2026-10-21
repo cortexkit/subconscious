@@ -1,0 +1,1129 @@
+//! The live data layer: one daemon connection, a task per source, and the
+//! snapshot the app draws.
+//!
+//! [`start`] connects through the same discovery `ck` uses (an explicit
+//! connection file, then `SUBC_CONNECTION_FILE`, then the default
+//! locations) and runs every source as its own task at its own refresh
+//! rate. Each source writes its latest reply (or its error) into [`State`];
+//! after every write the whole [`Snapshot`] is rebuilt by [`assemble`], a
+//! pure function, and sent on the watch channel the app reads. The app never
+//! waits on the network.
+//!
+//! When the connection fails or drops, the snapshot switches to the
+//! daemon-down screen and the layer tries again every two seconds.
+
+pub mod map;
+mod run;
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use subc_client_rs::{ServerDescription, SupervisorProvenanceResponse};
+use subc_control::{
+    ActivityEntry as WireActivity, SupervisorEntry, SupervisorHealthEntry, SupervisorHealthStatus,
+    SupervisorRouteModule,
+};
+use tokio::sync::{mpsc, watch};
+
+use crate::app::Request;
+use crate::model::{
+    ActionKind, ActionPhase, ActionResult, ActivityEntry, Agents, Approvals, Backups, BuildServer,
+    Daemon, DaemonDown, DaemonRunning, Devices, Host, LogLine, LogView, Module, ModuleAction,
+    PaletteCommand, Panel, ProcessEvent, ProcessEventKind, Provider, Snapshot, Status, Usage,
+};
+use crate::time::{Timestamp, UtcOffset};
+
+use map::{AgentIdentity, AgentResidence, CpuTracker};
+
+/// The modules whose replies feed panels, by the id the daemon knows them
+/// by.
+pub mod modules {
+    pub const USAGE: &str = "insula";
+    pub const DEVICES: &str = "callosum";
+    pub const IDENTITY: &str = "entorhinal";
+    pub const RESIDENCE: &str = "prefrontal-core";
+    pub const BUILD_SERVER: &str = "motor";
+    pub const BACKUPS: &str = "engram";
+    pub const MODELS: &str = "fusiform";
+}
+
+/// Refresh intervals, in seconds. A panel past twice its interval shows its
+/// age; past five times it reads as a last good reading.
+pub mod every {
+    pub const ROSTER: f64 = 2.0;
+    pub const HEALTH: f64 = 5.0;
+    pub const DESCRIBE: f64 = 10.0;
+    pub const ROUTES: f64 = 10.0;
+    pub const HOST: f64 = 10.0;
+    pub const USAGE: f64 = 30.0;
+    pub const DEVICES: f64 = 15.0;
+    pub const AGENTS: f64 = 15.0;
+    pub const PLACES: f64 = 60.0;
+    pub const COUNTS: f64 = 300.0;
+    pub const LOG: f64 = 2.0;
+    pub const PROVENANCE: f64 = 60.0;
+    pub const TERMINALS: f64 = 30.0;
+    /// How often a down daemon is looked for again.
+    pub const RECONNECT: f64 = 2.0;
+}
+
+/// What only the program embedding the app can answer about the daemon's
+/// installed service: the setup engine's view of it, how to start it, and
+/// where the daemon's own log is. Methods may block (they run service
+/// manager commands); the live layer calls them off the async runtime.
+pub trait DaemonService: Send + Sync + 'static {
+    /// The service manager's view, such as "loaded · restarts on failure".
+    fn service_status(&self) -> String;
+    /// Starts the installed service. `Ok` carries what happened, `Err` why
+    /// it couldn't.
+    fn start_service(&self) -> Result<String, String>;
+    /// The last `n` lines of the daemon's own log, oldest first.
+    fn daemon_log_tail(&self, n: usize) -> Vec<String>;
+    /// The CortexKit data home, whose volume Home's disk gauge shows.
+    fn data_home(&self) -> Option<PathBuf>;
+    /// Opens the module's log the way `ck module logs <id>` reads it (its
+    /// own log files, the daemon's capture of its stderr, and the daemon's
+    /// lines naming it): the newest `max` lines, and a follower for what is
+    /// appended after them. `None` when this program can't read the files,
+    /// and the app falls back to the stderr the daemon keeps in memory.
+    fn open_module_log(&self, module_id: &str, max: usize) -> Option<Result<OpenedLog, String>> {
+        let _ = (module_id, max);
+        None
+    }
+}
+
+/// A module's log as first opened: its newest lines, oldest first, and how
+/// to follow it from there.
+pub struct OpenedLog {
+    pub lines: Vec<ModuleLogLine>,
+    pub follow: Box<dyn ModuleLogFollow>,
+}
+
+/// Follows an open module log: each poll returns only the lines appended
+/// since the one before, never a re-read of what was already returned.
+pub trait ModuleLogFollow: Send {
+    fn poll(&mut self) -> Result<Vec<ModuleLogLine>, String>;
+}
+
+/// One line of a module's merged log.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModuleLogLine {
+    /// When the line was written (or, for an unstamped capture line, the
+    /// nearest stamp before it), in Unix milliseconds.
+    pub at_ms: Option<i64>,
+    /// The level the line states, if it states one.
+    pub level: Option<crate::model::LogLevel>,
+    /// The whole line as written.
+    pub text: String,
+}
+
+/// A [`DaemonService`] that knows nothing: service "unknown", no start, no
+/// log.
+pub struct NoService;
+
+impl DaemonService for NoService {
+    fn service_status(&self) -> String {
+        "unknown".into()
+    }
+    fn start_service(&self) -> Result<String, String> {
+        Err("this program can't start the daemon".into())
+    }
+    fn daemon_log_tail(&self, _n: usize) -> Vec<String> {
+        Vec::new()
+    }
+    fn data_home(&self) -> Option<PathBuf> {
+        None
+    }
+}
+
+pub struct LiveOptions {
+    /// An explicit connection file (`ck --subc`); otherwise discovery.
+    pub connection_file: Option<PathBuf>,
+    pub service: Arc<dyn DaemonService>,
+    /// How the top bar names this machine.
+    pub host_label: String,
+    /// The host's offset from UTC, for clock times.
+    pub utc_offset: UtcOffset,
+}
+
+impl LiveOptions {
+    pub fn new(connection_file: Option<PathBuf>, service: Arc<dyn DaemonService>) -> LiveOptions {
+        LiveOptions {
+            connection_file,
+            service,
+            host_label: if cfg!(target_os = "macos") {
+                "This Mac".into()
+            } else {
+                "This computer".into()
+            },
+            utc_offset: local_utc_offset(),
+        }
+    }
+}
+
+/// The local offset from UTC right now.
+pub fn local_utc_offset() -> UtcOffset {
+    use chrono::Offset;
+    UtcOffset(chrono::Local::now().offset().fix().local_minus_utc())
+}
+
+/// A running live layer: the snapshots it produces and where the app's
+/// requests go.
+pub struct Live {
+    pub snapshots: watch::Receiver<Snapshot>,
+    pub requests: mpsc::UnboundedSender<Request>,
+    /// The latest reply (JSON, or debug text for replies with no JSON form)
+    /// or error recorded for each daemon and module request, by name
+    /// ("supervisor.list", "insula usage.get", …), for diagnosing a reply
+    /// the mapping doesn't understand.
+    pub raw: Arc<std::sync::Mutex<std::collections::BTreeMap<String, String>>>,
+}
+
+/// Starts the live layer on the current tokio runtime.
+pub fn start(options: LiveOptions) -> Live {
+    let state = State::new(&options);
+    let (tx, rx) = watch::channel(assemble(&state, Timestamp::system_now()));
+    let (req_tx, req_rx) = mpsc::unbounded_channel();
+    let raw = Arc::default();
+    run::spawn(options, state, tx, req_rx, Arc::clone(&raw));
+    Live {
+        snapshots: rx,
+        requests: req_tx,
+        raw,
+    }
+}
+
+/// Whether every source has reported once (data or an error), or the
+/// daemon is down. The text frame waits for this before printing.
+pub fn all_reported(s: &Snapshot) -> bool {
+    fn done<T>(p: &Panel<T>) -> bool {
+        p.loaded || p.error.is_some()
+    }
+    if matches!(s.daemon.data, Daemon::Down(_)) && s.daemon.loaded {
+        return true;
+    }
+    done(&s.host)
+        && done(&s.daemon)
+        && done(&s.modules)
+        && done(&s.build_server)
+        && done(&s.backups)
+        && done(&s.usage)
+        && done(&s.activity)
+        && done(&s.agents)
+        && done(&s.devices)
+}
+
+// ---- state ---------------------------------------------------------------------
+
+/// One source's latest reading, when it arrived, and its latest error.
+#[derive(Clone, Debug)]
+pub struct Part<T> {
+    pub value: Option<T>,
+    pub at: Timestamp,
+    pub error: Option<String>,
+}
+
+impl<T> Default for Part<T> {
+    fn default() -> Self {
+        Part {
+            value: None,
+            at: Timestamp::from_unix_millis(0),
+            error: None,
+        }
+    }
+}
+
+impl<T> Part<T> {
+    pub fn set(&mut self, value: T, at: Timestamp) {
+        self.value = Some(value);
+        self.at = at;
+        self.error = None;
+    }
+
+    /// Records a failure. The last good value stays, to be shown as such.
+    pub fn fail(&mut self, error: String) {
+        self.error = Some(error);
+    }
+
+    fn panel<U>(&self, refresh: Option<f64>, f: impl FnOnce(&T) -> U, placeholder: U) -> Panel<U> {
+        match &self.value {
+            Some(v) => Panel {
+                received_at: self.at,
+                data: f(v),
+                refresh_secs: refresh,
+                error: self.error.clone(),
+                loaded: true,
+            },
+            None => Panel {
+                error: self.error.clone(),
+                ..Panel::waiting(placeholder, refresh)
+            },
+        }
+    }
+}
+
+/// The host's own facts, read locally.
+#[derive(Clone, Debug, Default)]
+pub struct HostFacts {
+    pub memory: Option<subc_os::host::MemoryInfo>,
+    pub load: Option<[f64; 3]>,
+    pub disk: Option<subc_os::host::DiskSpace>,
+}
+
+/// One direct health probe: when it was taken, and the module's detail and
+/// complete metrics.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Probe {
+    pub at: Timestamp,
+    pub detail: Option<String>,
+    pub metrics: Option<serde_json::Value>,
+}
+
+/// How often a module whose cached metrics are over the cache's size cap is
+/// probed directly for the full set, at most.
+pub const TRUNCATED_PROBE_SECS: f64 = 30.0;
+
+/// The connection as the live layer last saw it.
+#[derive(Clone, Debug)]
+pub enum Connection {
+    /// The first attempt hasn't finished.
+    Connecting,
+    Up {
+        daemon_ver: String,
+    },
+    Down {
+        /// When ck lost a connection it had; `None` if it never had one.
+        lost_at: Option<Timestamp>,
+        /// Why the last attempt failed.
+        reason: String,
+    },
+}
+
+/// The process a module runs now, from the spawn feed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LiveProcess {
+    pub pid: u32,
+    pub generation: u64,
+    pub spawned_at: Timestamp,
+}
+
+/// Everything the sources have said, from which [`assemble`] builds a
+/// snapshot.
+#[derive(Clone, Debug)]
+pub struct State {
+    pub host_label: String,
+    pub utc_offset: UtcOffset,
+    pub connection: Connection,
+    pub connected_at: Part<()>,
+    pub roster: Part<Vec<SupervisorEntry>>,
+    pub health: Part<Vec<SupervisorHealthEntry>>,
+    pub provenance: Part<SupervisorProvenanceResponse>,
+    pub describe: Part<ServerDescription>,
+    pub routes: Part<Vec<SupervisorRouteModule>>,
+    /// Live processes by module, from the spawn snapshot and events.
+    pub processes: HashMap<String, LiveProcess>,
+    /// When each module's process last exited, as ck saw it.
+    pub exits: HashMap<String, Timestamp>,
+    pub spawn_feed: Part<()>,
+    /// Starts and exits, newest first.
+    pub process_events: Vec<ProcessEvent>,
+    pub cpu: CpuTracker,
+    /// ck's own build-server load samples, for motor builds that send no
+    /// history.
+    pub build_samples: Vec<f64>,
+    /// When the last of `build_samples` was taken.
+    pub build_sample_at: Option<Timestamp>,
+    pub usage: Part<Vec<Provider>>,
+    pub devices: Part<Devices>,
+    pub identities: Part<Vec<AgentIdentity>>,
+    pub residences: Part<HashMap<String, AgentResidence>>,
+    pub places: Part<HashMap<String, String>>,
+    pub counts: Part<(Option<u32>, Option<u32>)>,
+    /// Newest first.
+    pub activity: Part<Vec<WireActivity>>,
+    pub host: Part<HostFacts>,
+    /// The module whose log is on screen.
+    pub focus: Option<String>,
+    pub log: Part<(String, Vec<LogLine>)>,
+    /// Where the log's lines come from, for the log view's footer, with
+    /// `{module}` standing for the module's id.
+    pub log_source: String,
+    /// The latest direct health probe of each module that has had one: the
+    /// selected module's, and any whose cached metrics are only the cache's
+    /// size marker.
+    pub probes: HashMap<String, Probe>,
+    /// Each module's retained exits, as exit rows for the starts and exits
+    /// list.
+    pub terminals: HashMap<String, Vec<ProcessEvent>>,
+    pub actions: HashMap<String, ModuleAction>,
+    pub last_result: Option<ActionResult>,
+    /// The status each module had when ck last looked, and since when.
+    pub status_since: HashMap<String, (Status, Option<Timestamp>)>,
+    pub service: String,
+    pub daemon_log: Vec<String>,
+    pub down_note: Option<String>,
+}
+
+impl State {
+    fn new(options: &LiveOptions) -> State {
+        State {
+            host_label: options.host_label.clone(),
+            utc_offset: options.utc_offset,
+            connection: Connection::Connecting,
+            connected_at: Part::default(),
+            roster: Part::default(),
+            health: Part::default(),
+            provenance: Part::default(),
+            describe: Part::default(),
+            routes: Part::default(),
+            processes: HashMap::new(),
+            exits: HashMap::new(),
+            spawn_feed: Part::default(),
+            process_events: Vec::new(),
+            cpu: CpuTracker::default(),
+            build_samples: Vec::new(),
+            build_sample_at: None,
+            usage: Part::default(),
+            devices: Part::default(),
+            identities: Part::default(),
+            residences: Part::default(),
+            places: Part::default(),
+            counts: Part::default(),
+            activity: Part::default(),
+            host: Part::default(),
+            focus: None,
+            log: Part::default(),
+            log_source: String::new(),
+            probes: HashMap::new(),
+            terminals: HashMap::new(),
+            actions: HashMap::new(),
+            last_result: None,
+            status_since: HashMap::new(),
+            service: "unknown".into(),
+            daemon_log: Vec::new(),
+            down_note: None,
+        }
+    }
+
+    /// For tests: a state with nothing read yet.
+    pub fn empty(host_label: &str) -> State {
+        State::new(&LiveOptions {
+            connection_file: None,
+            service: Arc::new(NoService),
+            host_label: host_label.into(),
+            utc_offset: UtcOffset::UTC,
+        })
+    }
+
+    pub fn health_of(&self, module: &str) -> Option<&SupervisorHealthEntry> {
+        self.health
+            .value
+            .as_ref()?
+            .iter()
+            .find(|h| h.module_id == module)
+    }
+
+    /// A module's metrics as the app should read them: the cached ones,
+    /// unless the cache holds only its size marker (or the module is
+    /// selected), when the latest direct probe's are used.
+    pub fn metrics_of(&self, module: &str) -> Option<&serde_json::Value> {
+        let cached = self.health_of(module).and_then(|h| h.metrics.as_ref());
+        let probe = self.probes.get(module);
+        let prefer_probe =
+            self.focus.as_deref() == Some(module) || cached.is_some_and(map::is_truncation_marker);
+        match (prefer_probe, probe) {
+            (true, Some(p)) => p.metrics.as_ref(),
+            _ => cached,
+        }
+    }
+
+    /// A module's health detail, from the same source as [`State::metrics_of`].
+    pub fn detail_of(&self, module: &str) -> Option<&str> {
+        let cached = self.health_of(module);
+        let probe = self.probes.get(module);
+        let prefer_probe = self.focus.as_deref() == Some(module)
+            || cached
+                .and_then(|h| h.metrics.as_ref())
+                .is_some_and(map::is_truncation_marker);
+        match (prefer_probe, probe) {
+            (true, Some(p)) => p.detail.as_deref(),
+            _ => cached.and_then(|h| h.detail.as_deref()),
+        }
+    }
+
+    /// Modules whose cached metrics are only the cache's size marker and
+    /// that have had no direct probe, or none in [`TRUNCATED_PROBE_SECS`].
+    pub fn truncated_due(&self, now: Timestamp) -> Vec<String> {
+        self.health
+            .value
+            .iter()
+            .flatten()
+            .filter(|h| h.metrics.as_ref().is_some_and(map::is_truncation_marker))
+            .filter(|h| {
+                self.probes
+                    .get(&h.module_id)
+                    .is_none_or(|p| now.secs_since(p.at) >= TRUNCATED_PROBE_SECS)
+            })
+            .map(|h| h.module_id.clone())
+            .collect()
+    }
+
+    pub fn in_roster(&self, module: &str) -> Option<bool> {
+        self.roster
+            .value
+            .as_ref()
+            .map(|r| r.iter().any(|e| e.module_id == module))
+    }
+
+    /// Records a new roster: the CPU and memory readings it carries, and
+    /// when each module's status changed.
+    pub fn record_roster(&mut self, roster: Vec<SupervisorEntry>, at: Timestamp) {
+        self.record_cpu(&roster, at);
+        self.roster.set(roster, at);
+        self.note_statuses(at);
+    }
+
+    /// Records the CPU and memory readings a roster carries, without
+    /// publishing the roster. A CPU percent needs two readings of the same
+    /// process, so the first roster at startup goes only here.
+    pub fn record_cpu(&mut self, roster: &[SupervisorEntry], at: Timestamp) {
+        for e in roster {
+            let pid = self.processes.get(&e.module_id).map(|p| p.pid);
+            match map::resource_reading(e) {
+                Some((cpu_ms, mem)) if e.state != "stopped" && e.state != "disabled" => self
+                    .cpu
+                    .record(&e.module_id, pid, at.unix_millis(), cpu_ms, mem),
+                _ => {
+                    if pid.is_none() {
+                        self.cpu.forget(&e.module_id);
+                    }
+                }
+            }
+        }
+    }
+
+    fn note_statuses(&mut self, at: Timestamp) {
+        let ids: Vec<(String, Status)> = self
+            .roster
+            .value
+            .iter()
+            .flatten()
+            .map(|e| (e.module_id.clone(), self.status(e)))
+            .collect();
+        for (id, status) in ids {
+            match self.status_since.get(&id) {
+                Some((s, _)) if *s == status => {}
+                // A change ck saw happen: it started now. The first look
+                // can't say when the status began.
+                Some(_) => {
+                    self.status_since.insert(id, (status, Some(at)));
+                }
+                None => {
+                    self.status_since.insert(id, (status, None));
+                }
+            }
+        }
+    }
+
+    fn status(&self, e: &SupervisorEntry) -> Status {
+        let health = self
+            .health_of(&e.module_id)
+            .map(|h| h.status)
+            .unwrap_or(e.health);
+        map::module_status(&e.state, health)
+    }
+}
+
+// ---- assembly ------------------------------------------------------------------
+
+/// The snapshot the sources' latest readings describe, as of `now`.
+pub fn assemble(state: &State, now: Timestamp) -> Snapshot {
+    let host = state.host.panel(
+        Some(every::HOST),
+        |h| host_view(state, h),
+        host_view(state, &HostFacts::default()),
+    );
+    let daemon = daemon_panel(state, now);
+    let modules = state.roster.panel(
+        Some(every::ROSTER),
+        |r| r.iter().map(|e| module_view(state, e)).collect(),
+        Vec::new(),
+    );
+    let commands = palette_commands(&modules.data);
+
+    let health_metrics = |id: &str| state.metrics_of(id);
+    let build_server = module_backed(state, modules::BUILD_SERVER, Some(every::HEALTH), || {
+        map::build_server(health_metrics(modules::BUILD_SERVER), &state.build_samples)
+    });
+    let backups = module_backed(state, modules::BACKUPS, Some(every::HEALTH), || {
+        map::backups(
+            health_metrics(modules::BACKUPS),
+            state.detail_of(modules::BACKUPS),
+        )
+    });
+    let (models_priced, models_checked_at) = map::models(
+        health_metrics(modules::MODELS),
+        state
+            .health_of(modules::MODELS)
+            .and_then(|h| h.last_probe_ms)
+            .map(|ms| Timestamp::from_unix_millis(ms as i64)),
+    );
+    let mut usage = state.usage.panel(
+        Some(every::USAGE),
+        |p| Usage {
+            providers: p.clone(),
+            models_priced,
+            models_checked_at,
+        },
+        Usage {
+            providers: Vec::new(),
+            models_priced,
+            models_checked_at,
+        },
+    );
+    if state.in_roster(modules::USAGE) == Some(false) {
+        usage.error = Some(format!("{} isn't installed", modules::USAGE));
+    }
+
+    let names = state
+        .identities
+        .value
+        .as_deref()
+        .map(map::agent_names)
+        .unwrap_or_default();
+    let activity = state
+        .activity
+        .panel(None, |list| map::activity_rows(list, &names), Vec::new());
+    let terminal_exits: Vec<ProcessEvent> = state.terminals.values().flatten().cloned().collect();
+    let process_events = {
+        let events = starts_and_exits(&state.process_events, &activity.data, &terminal_exits);
+        let mut p = if state.spawn_feed.value.is_some() {
+            state.spawn_feed.panel(None, |_| Vec::new(), Vec::new())
+        } else {
+            state.activity.panel(None, |_| Vec::new(), Vec::new())
+        };
+        p.data = events;
+        p
+    };
+
+    let mut agents = state.identities.panel(
+        Some(every::AGENTS),
+        |ids| {
+            map::agents(
+                ids,
+                state.residences.value.as_ref(),
+                state.places.value.as_ref(),
+                state.counts.value.unwrap_or((None, None)),
+                now,
+            )
+        },
+        Agents {
+            list: Vec::new(),
+            working: 0,
+            machines: None,
+            workspaces: None,
+            projects: None,
+        },
+    );
+    // Without state the agents still list, each "unknown"; the refusal (or
+    // failure) shows in the panel's heading.
+    if agents.error.is_none() {
+        if let Some(err) = &state.residences.error {
+            agents.error = Some(format!("state {err}"));
+        }
+    }
+    let devices = state.devices.panel(
+        Some(every::DEVICES),
+        Devices::clone,
+        Devices {
+            list: Vec::new(),
+            online: 0,
+        },
+    );
+    let log_view = state.focus.as_ref().map(|id| {
+        let mut p = state.log.panel(
+            Some(every::LOG),
+            |(m, lines)| LogView {
+                module: m.clone(),
+                lines: lines.clone(),
+                source: state.log_source.replace("{module}", m),
+            },
+            LogView {
+                module: id.clone(),
+                lines: Vec::new(),
+                source: String::new(),
+            },
+        );
+        if p.data.module != *id {
+            p = Panel::waiting(
+                LogView {
+                    module: id.clone(),
+                    lines: Vec::new(),
+                    source: String::new(),
+                },
+                Some(every::LOG),
+            );
+        }
+        p
+    });
+
+    Snapshot {
+        host,
+        daemon,
+        modules,
+        build_server,
+        backups,
+        usage,
+        activity,
+        process_events,
+        agents,
+        devices,
+        approvals: Panel::new(now, Approvals { waiting: None }),
+        commands,
+        log_view,
+        last_result: state.last_result.clone(),
+        serves: crate::model::Serves::LIVE,
+    }
+}
+
+/// The palette's commands: the app's own (its screens, the keys page, the
+/// theme, quitting), then for each module what the app can do with it:
+/// restart, stop or start, its log and its metrics. Nothing it can't do.
+pub fn palette_commands(modules: &[Module]) -> Vec<PaletteCommand> {
+    let cmd = |title: String, area: &str| PaletteCommand {
+        title,
+        area: area.into(),
+    };
+    let mut out: Vec<PaletteCommand> = ["Home", "Modules", "Keys", "Light or dark", "Quit"]
+        .into_iter()
+        .map(|t| cmd(t.to_string(), "App"))
+        .collect();
+    for m in modules {
+        out.push(cmd(format!("Restart {}", m.id), "Modules"));
+        let stop_or_start = if m.status == Status::Stopped {
+            "Start"
+        } else {
+            "Stop"
+        };
+        out.push(cmd(format!("{stop_or_start} {}", m.id), "Modules"));
+        out.push(cmd(format!("Open {} logs", m.id), "Modules"));
+        out.push(cmd(format!("All metrics for {}", m.id), "Modules"));
+    }
+    out
+}
+
+/// A panel fed by one module's health: an error while that module isn't
+/// installed or health can't be read, else the mapped value.
+fn module_backed<T>(
+    state: &State,
+    module: &str,
+    refresh: Option<f64>,
+    f: impl FnOnce() -> T,
+) -> Panel<T>
+where
+    T: Placeholder,
+{
+    if state.in_roster(module) == Some(false) {
+        return Panel {
+            error: Some(format!("{module} isn't installed")),
+            ..Panel::waiting(T::placeholder(), refresh)
+        };
+    }
+    state.health.panel(refresh, |_| f(), T::placeholder())
+}
+
+/// The value a panel holds before its first reading.
+pub trait Placeholder {
+    fn placeholder() -> Self;
+}
+
+impl Placeholder for BuildServer {
+    fn placeholder() -> Self {
+        map::build_server(None, &[])
+    }
+}
+
+impl Placeholder for Backups {
+    fn placeholder() -> Self {
+        map::backups(None, None)
+    }
+}
+
+fn host_view(state: &State, h: &HostFacts) -> Host {
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    Host {
+        label: state.host_label.clone(),
+        machine_id: state
+            .describe
+            .value
+            .as_ref()
+            .and_then(|d| d.machine_id.clone()),
+        utc_offset: state.utc_offset,
+        memory_used_gb: h
+            .memory
+            .map(|m| m.total_bytes.saturating_sub(m.available_bytes) as f64 / GIB),
+        memory_total_gb: h.memory.map(|m| m.total_bytes as f64 / GIB),
+        disk_used_gb: h
+            .disk
+            .map(|d| d.total_bytes.saturating_sub(d.free_bytes) as f64 / 1e9),
+        disk_total_gb: h.disk.map(|d| d.total_bytes as f64 / 1e9),
+        load: h.load,
+    }
+}
+
+fn daemon_panel(state: &State, now: Timestamp) -> Panel<Daemon> {
+    match &state.connection {
+        Connection::Up { daemon_ver } => {
+            let started_at = state
+                .provenance
+                .value
+                .as_ref()
+                .and_then(|p| p.daemon.daemon_observed.started_at_ms)
+                .map(|ms| Timestamp::from_unix_millis(ms as i64));
+            let clients = state
+                .describe
+                .value
+                .as_ref()
+                .map(|d| d.connected_clients.min(u64::from(u32::MAX)) as u32);
+            let mut p = Panel::new(
+                state.connected_at.at,
+                Daemon::Running(DaemonRunning {
+                    version: daemon_ver.clone(),
+                    started_at,
+                    clients,
+                }),
+            );
+            p.error = state.describe.error.clone();
+            if state.describe.value.is_some() {
+                p.received_at = state.describe.at;
+                p.refresh_secs = Some(every::DESCRIBE);
+            }
+            p
+        }
+        Connection::Down { lost_at, .. } => {
+            let log_tail: Vec<LogLine> = state
+                .daemon_log
+                .iter()
+                .map(|l| {
+                    let (at, level, message) = map::parse_log_line(l);
+                    LogLine { at, level, message }
+                })
+                .collect();
+            let last_line = state
+                .daemon_log
+                .iter()
+                .rev()
+                .find(|l| !l.trim().is_empty())
+                .cloned()
+                .unwrap_or_else(|| "unknown".into());
+            Panel::new(
+                now,
+                Daemon::Down(DaemonDown {
+                    stopped_at: *lost_at,
+                    stopped_by: if lost_at.is_some() {
+                        "when ck lost its connection".into()
+                    } else {
+                        String::new()
+                    },
+                    last_line,
+                    service: state.service.clone(),
+                    note: Some(
+                        state
+                            .down_note
+                            .clone()
+                            .unwrap_or_else(|| "Checking for the daemon every 2 s.".into()),
+                    ),
+                    log_tail,
+                }),
+            )
+        }
+        Connection::Connecting => Panel::waiting(
+            Daemon::Running(DaemonRunning {
+                version: "unknown".into(),
+                started_at: None,
+                clients: None,
+            }),
+            None,
+        ),
+    }
+}
+
+fn module_view(state: &State, e: &SupervisorEntry) -> Module {
+    let id = &e.module_id;
+    let status = state.status(e);
+    let running = !matches!(e.state.as_str(), "stopped" | "disabled");
+    let provenance = state
+        .provenance
+        .value
+        .as_ref()
+        .and_then(|p| p.modules.iter().find(|m| &m.module_id == id));
+    let process = state.processes.get(id).copied();
+    let (pid, started_at) = match process {
+        Some(p) => (Some(p.pid), Some(p.spawned_at)),
+        None if running => (
+            provenance.and_then(|p| p.daemon_observed.pid),
+            provenance
+                .and_then(|p| p.daemon_observed.spawned_at_ms)
+                .map(|ms| Timestamp::from_unix_millis(ms as i64)),
+        ),
+        None => (None, None),
+    };
+    let (build, commit) = map::module_build(provenance);
+    let (cpu, mem) = if running {
+        state.cpu.current(id)
+    } else {
+        (None, None)
+    };
+    let (cpu_history, memory_history) = if running {
+        state.cpu.history(id)
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    let health = state.health_of(id);
+    // The selected module's pane, and any module whose cached metrics are
+    // over the cache's size cap, read the latest direct probe.
+    let (summary, metrics) =
+        map::detail_and_metrics(state.detail_of(id), state.metrics_of(id), state.utc_offset);
+    let all_metrics = map::every_metric(state.metrics_of(id), state.utc_offset);
+    let route_module = state
+        .routes
+        .value
+        .as_ref()
+        .map(|r| r.iter().find(|m| &m.module_id == id));
+    let serving = route_module.map(|m| m.map(map::route_consumers).unwrap_or_default());
+    let log = match (&state.focus, &state.log.value) {
+        (Some(f), Some((m, lines))) if f == id && m == id => lines.clone(),
+        _ => Vec::new(),
+    };
+    Module {
+        id: id.clone(),
+        status,
+        status_since: state.status_since.get(id).and_then(|(_, t)| *t),
+        pid,
+        started_at,
+        restarts: e.lifetime_restarts.or(e.restart_count),
+        build,
+        commit,
+        cpu_percent: cpu,
+        memory_mb: mem,
+        summary,
+        routes: serving.as_ref().map(|s| s.len() as u32),
+        serving,
+        pending_restart: map::pending_restart(e.pending_reload.as_ref()),
+        health_checked_at: health
+            .and_then(|h| h.last_probe_ms)
+            .or(e.last_probe_ms)
+            .map(|ms| Timestamp::from_unix_millis(ms as i64)),
+        metrics,
+        cpu_history,
+        memory_history,
+        log,
+        action: state.actions.get(id).cloned(),
+        drain_limit_secs: e.drain_timeout_ms.map(|ms| ms as f64 / 1000.0),
+        all_metrics,
+    }
+}
+
+// ---- agents' places ------------------------------------------------------------
+
+/// The most agent ids one `agent.where_many` request may carry.
+pub const WHERE_MANY_BATCH: usize = 64;
+
+/// One round of the agents-place source: nothing (`None`) until there are
+/// identity rows; then one `agent.where_many` call through `call` per batch
+/// of up to [`WHERE_MANY_BATCH`] ids, merged. The first failing batch's error
+/// is the round's.
+pub async fn where_many_round<F, Fut>(
+    ids: &[String],
+    here: &str,
+    mut call: F,
+) -> Option<Result<HashMap<String, String>, String>>
+where
+    F: FnMut(serde_json::Value) -> Fut,
+    Fut: std::future::Future<Output = Result<serde_json::Value, String>>,
+{
+    if ids.is_empty() {
+        return None;
+    }
+    let mut places = HashMap::new();
+    for batch in ids.chunks(WHERE_MANY_BATCH) {
+        let reply = match call(serde_json::json!({ "agentIds": batch })).await {
+            Ok(reply) => reply,
+            Err(e) => return Some(Err(e)),
+        };
+        match map::agent_places(&reply, here) {
+            Ok(p) => places.extend(p),
+            Err(e) => return Some(Err(e)),
+        }
+    }
+    Some(Ok(places))
+}
+
+// ---- starts and exits ----------------------------------------------------------
+
+/// Starts and exits for the Modules screen (which shows today's), newest
+/// first: the spawn
+/// feed's events (which carry pids) since ck connected, module starts and
+/// restarts from the activity ledger, and exits the daemon retained. The same
+/// start seen in the spawn feed and the ledger, or the same exit in the feed
+/// and the retained exits, is listed once.
+pub fn starts_and_exits(
+    spawn: &[ProcessEvent],
+    activity: &[ActivityEntry],
+    exits: &[ProcessEvent],
+) -> Vec<ProcessEvent> {
+    const SAME_MS: i64 = 10_000;
+    let near = |a: &ProcessEvent, b: &ProcessEvent| {
+        a.module == b.module
+            && a.kind == b.kind
+            && (a.at.unix_millis() - b.at.unix_millis()).abs() <= SAME_MS
+    };
+    let ledger_starts: Vec<ProcessEvent> = activity
+        .iter()
+        .filter(|a| {
+            a.kind == "module" && (a.what.starts_with("restarted") || a.what.starts_with("started"))
+        })
+        .map(|a| ProcessEvent {
+            at: a.at,
+            module: a.subject.clone(),
+            what: a.what.clone(),
+            kind: ProcessEventKind::Started,
+        })
+        .collect();
+    let mut out: Vec<ProcessEvent> = Vec::new();
+    for e in spawn {
+        let covered = e.kind == ProcessEventKind::Exited && exits.iter().any(|x| near(x, e));
+        if !covered {
+            out.push(e.clone());
+        }
+    }
+    for e in ledger_starts.iter().chain(exits) {
+        if !out.iter().any(|x| near(x, e)) {
+            out.push(e.clone());
+        }
+    }
+    out.sort_by_key(|e| std::cmp::Reverse(e.at));
+    out
+}
+
+// ---- actions -------------------------------------------------------------------
+
+/// Where an action on `module` stands, from what the spawn feed, the roster
+/// and health have said since it began at `started`: its phase, and once
+/// the outcome is known, whether it went well and a line saying what
+/// actually happened (the new pid, the time to a healthy check).
+pub fn action_progress(
+    s: &State,
+    kind: ActionKind,
+    module: &str,
+    before: Option<LiveProcess>,
+    started: Timestamp,
+    now: Timestamp,
+) -> (ActionPhase, Option<(bool, String)>) {
+    let exited = s.exits.get(module).is_some_and(|t| *t >= started);
+    let current = s.processes.get(module).copied();
+    let fresh =
+        current.filter(|p| p.spawned_at >= started && before.is_none_or(|b| b.pid != p.pid));
+    let roster_state = s
+        .roster
+        .value
+        .iter()
+        .flatten()
+        .find(|e| e.module_id == module)
+        .map(|e| e.state.as_str());
+    let since = |t: Timestamp| crate::time::to_fixed(now.secs_since(t).max(0.0), 1);
+    match kind {
+        ActionKind::Stop => {
+            let stopped = matches!(roster_state, Some("stopped" | "disabled")) && current.is_none();
+            if stopped || (exited && current.is_none()) {
+                let pid = before.map_or_else(String::new, |b| format!(" · pid {} exited", b.pid));
+                return (
+                    ActionPhase::Stopped,
+                    Some((
+                        true,
+                        format!("{module} stopped{pid} after {} s", since(started)),
+                    )),
+                );
+            }
+            let phase = if exited {
+                ActionPhase::Stopped
+            } else {
+                ActionPhase::Draining
+            };
+            (phase, None)
+        }
+        ActionKind::Restart | ActionKind::Start => {
+            let verb = if kind == ActionKind::Restart {
+                "restarted"
+            } else {
+                "started"
+            };
+            let Some(p) = fresh else {
+                let phase = match (kind, exited) {
+                    (ActionKind::Start, _) => ActionPhase::Asking,
+                    (_, true) => ActionPhase::Stopped,
+                    (_, false) => ActionPhase::Draining,
+                };
+                return (phase, None);
+            };
+            let health = s.health_of(module);
+            let probed_after = health
+                .and_then(|h| h.last_probe_ms)
+                .map(|ms| Timestamp::from_unix_millis(ms as i64))
+                .filter(|t| *t >= p.spawned_at);
+            let starting = ActionPhase::Starting { pid: p.pid };
+            match (health.map(|h| h.status), probed_after) {
+                (Some(SupervisorHealthStatus::Ok), Some(t)) => (
+                    starting,
+                    Some((
+                        true,
+                        format!(
+                            "{module} {verb} · pid {} · healthy after {} s",
+                            p.pid,
+                            crate::time::to_fixed(t.secs_since(p.spawned_at).max(0.0), 1)
+                        ),
+                    )),
+                ),
+                (Some(status), Some(_)) if status != SupervisorHealthStatus::Unknown => {
+                    let word = match status {
+                        SupervisorHealthStatus::Degraded => "degraded",
+                        SupervisorHealthStatus::Failing => "failing",
+                        _ => "unresponsive",
+                    };
+                    let detail = health
+                        .and_then(|h| h.detail.as_deref())
+                        .map(|d| format!(": {d}"))
+                        .unwrap_or_default();
+                    (
+                        starting,
+                        Some((
+                            false,
+                            format!("{module} {verb} · pid {} · {word}{detail}", p.pid),
+                        )),
+                    )
+                }
+                // A module with no health check: once it has run for a while
+                // the result says so rather than waiting for a check that
+                // will never come.
+                _ if now.secs_since(p.spawned_at) >= NO_HEALTH_GRACE_SECS
+                    && roster_state == Some("running")
+                    && health.is_none_or(|h| h.last_probe_ms.is_none()) =>
+                {
+                    (
+                        starting,
+                        Some((
+                            true,
+                            format!("{module} {verb} · pid {} · running, health unknown", p.pid),
+                        )),
+                    )
+                }
+                _ => (starting, None),
+            }
+        }
+    }
+}
+
+/// How long a started or restarted module with no health check runs before
+/// the action is reported as done with its health unknown.
+pub const NO_HEALTH_GRACE_SECS: f64 = 15.0;

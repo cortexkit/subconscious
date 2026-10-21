@@ -18,7 +18,7 @@
   ● ckbus             ● subc-mcp                         resets in 1d 21h            Backups      ▲ last upload 2d ago  
   ● claustrum         ● synapse              Cursor      ██████████████████     0%                uploading now         
   ● condition-runner  ● thalamus                         resets in 23h 42m                                              
-  ▲ engram            ▲ thalamus-harness                                             Devices      ● Mac 2  ● iPhone     
+  ▲ engram            ▲ thalamus-harness                                             Devices      ● Mac 2  ● iPhone +1  
   ● entorhinal        ● wernicke                                                     Approvals    none waiting          
   ● fusiform                                                                                                            
                                                                                                                         
@@ -30,7 +30,7 @@
   17:54  motor             settings changed: hosted spill off                   ck   ○ NOVA                    idle 4m  
   17:53  motor             restarted on build 17c0a7d6                          ck   ● ECHO                    working  
   17:21  prefrontal-core   started worker for llm-runner 0.3.8                IRIS   ○ KITE                   idle 12m  
-  17:02  astrocyte         restarted on build ad21ee36                          ck   ○ MOSS                   idle 31m  
+  17:02  astrocyte         restarted on build ad21ee36                          ck   +6 more                            
                                                                                                                         
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
   ⏎  open    ↑↓  move    :  commands    ?  help                                                        updated just now 

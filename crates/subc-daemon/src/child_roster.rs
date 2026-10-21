@@ -98,8 +98,11 @@ struct RosterInner {
 }
 
 #[cfg(test)]
+type RecordWriteFn = dyn Fn(&HashMap<u64, RosterEntry>) + Send + Sync;
+
+#[cfg(test)]
 #[derive(Clone)]
-struct RecordWriteHook(Arc<dyn Fn(&HashMap<u64, RosterEntry>) + Send + Sync>);
+struct RecordWriteHook(Arc<RecordWriteFn>);
 
 #[cfg(test)]
 impl std::fmt::Debug for RecordWriteHook {
@@ -427,8 +430,8 @@ impl ChildRoster {
 
     /// Run `hook` at every record write from now on (when a record path is
     /// set), before the roster is serialized and written, with the roster
-    /// being written.
-    #[cfg(test)]
+    /// being written. Only the Unix restart test uses it.
+    #[cfg(all(test, unix))]
     pub(crate) fn set_record_write_hook_for_test(
         &self,
         hook: impl Fn(&HashMap<u64, RosterEntry>) + Send + Sync + 'static,

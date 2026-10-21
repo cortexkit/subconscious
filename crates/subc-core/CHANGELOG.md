@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.20.113
+
+- Ship subc-daemon 0.36.21: full client egress queues get only the unused portion of a 250 ms atomic-backlog-age grace before disconnect, so healthy fanout bursts can drain without losing every route. Backlog accounting stays lock-free. Stopped readers still close within that bound; diagnostics include header-only refusal facts.
+
 ## 0.20.112
 
 - Ship subc-daemon 0.36.20: `ck module restart` no longer silently does nothing when a module is already serving before its spawn generation is published; queued restarts still share a replacement created after their requests.

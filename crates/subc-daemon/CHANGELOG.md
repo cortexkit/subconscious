@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.36.21
+
+- Let reading clients drain short module-to-client egress bursts: a full queue waits for at most 250 ms minus the atomic backlog age, closing immediately if it is already older than 250 ms. The age follows the writer's current frame or the frame that made the queue non-empty; between writes it may be one frame older than the true head, avoiding per-frame locking. Apply the same bound to forwarded frames, module GOODBYE and oversized-reply replacement errors, preserving queue bounds and path-specific close reasons. Client teardown wakes pending deliveries; module teardown cancels them. Close warnings add header type/flags and the age/timeout cause, never body bytes.
+
 ## 0.36.20
 
 - Do not drop `supervisor.restart` requests received after a child starts serving but before its spawn generation is published. Coalesce requests only into a child created after the request, or a replacement still waiting to spawn, preserving protection against back-to-back restarts killing the same fresh replacement.

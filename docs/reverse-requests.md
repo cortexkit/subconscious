@@ -13,7 +13,15 @@ forwards these like any other frame. Tests:
 
 1. A module MAY send a `Request` frame on a bound route channel (module→client
    direction). The daemon forwards it like any data frame: channel-rewrite,
-   best-effort `try_send`, zero body inspection.
+   best-effort delivery with zero body inspection. If the client's queue is full,
+   an atomic backlog age older than 250 ms closes the whole client connection
+   immediately; otherwise delivery awaits room for at most 250 ms minus that
+   backlog's age (250 ms if no age is recorded), closing on expiry. The marker
+   follows the writer's current frame, or the frame that made the queue non-empty;
+   it can be one frame older than the true head between writes. A draining burst
+   can therefore survive, but delivery is not guaranteed. See
+   [client connection limits](concurrency-and-time-limits.md#12-client-connections)
+   for the shared byte/frame bounds and oversized-frame rule.
 2. Corr namespaces are **per-originator**: each endpoint mints corrs for its own
    requests and matches incoming `Response` frames against its own outstanding
    table. Direction is disambiguated by frame TYPE (an incoming `Request` means

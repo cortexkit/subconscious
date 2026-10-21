@@ -31,7 +31,7 @@ use crate::{
 };
 
 /// Bytes (envelope header plus body) one connection's egress queue may hold
-/// before a non-waiting enqueue is refused, which closes that connection.
+/// before a module-to-client enqueue must wait for room.
 ///
 /// Sized for a client that is slow but still reading: one connection can
 /// multiplex many token streams, and at roughly 200-byte frames (21-byte header
@@ -42,6 +42,13 @@ use crate::{
 /// bound. A single frame larger than the whole budget is still admitted into an
 /// empty queue so it can be sent at all.
 pub const CONNECTION_EGRESS_BYTE_BUDGET: usize = 4 * 1024 * 1024;
+/// Let a reading client drain a short fanout burst, but never park a module's
+/// frame reader for more than 250 ms. The atomic backlog age is measured from
+/// the enqueue time of the frame the writer is on, or of the frame that made
+/// the queue non-empty. A blocked writer makes that age the stopped-reader
+/// signal; between frames it may be one frame older than the true head, which
+/// is acceptable for this bounded grace and avoids a lock on every frame.
+pub const CONNECTION_EGRESS_STALL_GRACE: Duration = Duration::from_millis(250);
 /// Frame-count backstop for the same queue (the tokio channel's capacity).
 /// The byte budget is the real bound; this one only matters for floods of tiny
 /// or empty frames, which cost bookkeeping per frame rather than bytes. 32,768
@@ -70,6 +77,16 @@ pub const DEFAULT_AUTH_DEADLINE: Duration = Duration::from_secs(2);
 pub const DEFAULT_MAX_UNAUTHENTICATED_CONNECTIONS: usize = 256;
 const CLOSE_DRAIN_GRACE: Duration = Duration::from_secs(2);
 const PRE_AUTH_REJECT_LOG_INTERVAL: Duration = Duration::from_secs(1);
+
+/// A connection's writer can outlive its reader while draining. Wake module
+/// deliveries when the reader exits, including task cancellation or a panic.
+struct ClientDeliveryGuard(FrameSink);
+
+impl Drop for ClientDeliveryGuard {
+    fn drop(&mut self) {
+        self.0.close_client_delivery();
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 enum PreAuthRejectStage {
@@ -551,6 +568,7 @@ where
     // happens only when a frame finishes or the connection ends.
     let mut read_half = BufReader::new(read_half);
     let (egress, rx) = connection_egress();
+    let delivery_guard = ClientDeliveryGuard(egress.clone());
     let writer = tokio::spawn(drain_writer(write_half, rx));
 
     let ctx = RouteCtx {
@@ -570,6 +588,7 @@ where
     )
     .await;
 
+    drop(delivery_guard);
     // Every in-flight route.open must have FINISHED before `connection` drops,
     // because that drop runs the forwarding cleanup for this id, and cleanup is
     // also where the id's closing mark is lifted. Dropping a JoinSet only

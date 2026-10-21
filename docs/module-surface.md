@@ -173,6 +173,16 @@ principal's full contract.
 A module may send requests to the client on a bound route; see
 [`reverse-requests.md`](reverse-requests.md).
 
+Module-to-client delivery shares a bounded queue across the client's routes.
+If it is full, an atomic backlog age older than 250 ms closes the client
+immediately; otherwise the daemon waits only for the remaining part of that
+250 ms grace, closing if no room frees up. Keep pushes and replies small and
+expect disconnects from stopped readers. GOODBYE and oversized-reply replacement
+errors use the same grace; frames too large to fit alone have separate handling.
+See [client connection limits](concurrency-and-time-limits.md#12-client-connections).
+The age follows the writer's current frame (or the frame that made the queue
+non-empty); it can be one frame older than the true head between writes.
+
 ## 5. Health
 
 The daemon probes only modules that list `health.check` in `control_ops`;

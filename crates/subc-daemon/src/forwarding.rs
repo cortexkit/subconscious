@@ -2734,6 +2734,25 @@ impl ForwardingTable {
         reason: CloseReason,
         undelivered: UndeliveredFrame<'_>,
     ) -> Result<bool, ForwardingError> {
+        self.escalate_client_delivery_failure_diagnosed(
+            connection_id,
+            channel,
+            expected_epoch,
+            reason,
+            undelivered,
+            None,
+        )
+    }
+
+    pub(crate) fn escalate_client_delivery_failure_diagnosed(
+        &self,
+        connection_id: ConnectionId,
+        channel: u16,
+        expected_epoch: u32,
+        reason: CloseReason,
+        undelivered: UndeliveredFrame<'_>,
+        diagnosis: Option<&crate::router::ClientDeliveryDiagnosis>,
+    ) -> Result<bool, ForwardingError> {
         let principals = {
             let mut inner = self.write_inner()?;
             let key = ClientRouteKey {
@@ -2760,6 +2779,9 @@ impl ForwardingTable {
                 client_channel = channel,
                 queued_bytes = backlog.queued_bytes,
                 queued_frames = backlog.queued_frames,
+                frame_type = ?diagnosis.map(|failure| failure.frame_type),
+                frame_flags = ?diagnosis.map(|failure| failure.flags.0),
+                close_cause = diagnosis.map(|failure| failure.cause).unwrap_or("delivery_failed"),
                 oldest_queued_ms = backlog
                     .oldest_age
                     .map(|age| age.as_millis() as u64)

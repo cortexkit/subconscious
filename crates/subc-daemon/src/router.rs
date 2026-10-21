@@ -3,7 +3,7 @@ use std::{
     error::Error,
     fmt,
     sync::{
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex,
     },
     time::{Duration, Instant},
@@ -76,9 +76,9 @@ pub(crate) struct EgressBacklog {
 }
 
 /// Queued-byte accounting shared by every clone of one connection's
-/// [`FrameSink`] and by every frame that sink has admitted. Everything here is
-/// an atomic: this is on the path of every frame a module sends to a client,
-/// so it takes no lock per frame.
+/// [`FrameSink`] and by every frame that sink has admitted. Its per-frame
+/// accounting uses atomics: this is on the path of every frame a module sends
+/// to a client, so it takes no lock per frame.
 #[derive(Debug)]
 struct EgressAccounting {
     byte_budget: usize,
@@ -95,6 +95,8 @@ struct EgressAccounting {
     /// Woken when a charged frame releases its bytes while a sender waits, so
     /// the awaited send can re-check for room.
     freed: Notify,
+    client_delivery_closed: AtomicBool,
+    client_delivery_stopped: Notify,
 }
 
 impl EgressAccounting {
@@ -103,10 +105,12 @@ impl EgressAccounting {
             byte_budget,
             queued_bytes: AtomicUsize::new(0),
             queued_frames: AtomicUsize::new(0),
-            time_base: Instant::now(),
+            time_base: tokio::time::Instant::now().into_std(),
             oldest_enqueued_nanos: AtomicU64::new(0),
             waiters: AtomicUsize::new(0),
             freed: Notify::new(),
+            client_delivery_closed: AtomicBool::new(false),
+            client_delivery_stopped: Notify::new(),
         }
     }
 
@@ -146,7 +150,7 @@ impl EgressAccounting {
     }
 
     fn record(self: &Arc<Self>, bytes: usize) -> EgressCharge {
-        let enqueued_at = Instant::now();
+        let enqueued_at = tokio::time::Instant::now().into_std();
         let stamp = self.stamp(enqueued_at);
         if self.queued_frames.fetch_add(1, Ordering::AcqRel) == 0 {
             // This frame made the queue non-empty, so it is the head until the
@@ -188,7 +192,7 @@ impl EgressAccounting {
         let stamp = self.oldest_enqueued_nanos.load(Ordering::Acquire);
         let oldest_age = (queued_frames != 0 && stamp != 0).then(|| {
             let enqueued = self.time_base + Duration::from_nanos(stamp - 1);
-            enqueued.elapsed()
+            tokio::time::Instant::from_std(enqueued).elapsed()
         });
         EgressBacklog {
             queued_bytes: self.queued_bytes.load(Ordering::Acquire),
@@ -477,10 +481,78 @@ impl FrameSink {
         self.accounting.backlog()
     }
 
+    /// Stop module deliveries as soon as the client reader exits, without
+    /// waiting for the socket writer's separate teardown drain grace.
+    pub(crate) fn close_client_delivery(&self) {
+        self.accounting
+            .client_delivery_closed
+            .store(true, Ordering::Release);
+        self.accounting.client_delivery_stopped.notify_waiters();
+    }
+
+    /// A full queue can be a short fanout burst rather than a stopped reader.
+    /// Spend only the grace the atomic backlog age has not already used.
+    async fn send_to_client(&self, frame: Frame) -> Result<(), ClientDeliveryFailure> {
+        let frame_type = frame.header.ty;
+        let flags = frame.header.flags;
+        let stopped = self.accounting.client_delivery_stopped.notified();
+        tokio::pin!(stopped);
+        stopped.as_mut().enable();
+        let failure = |cause, error| ClientDeliveryFailure {
+            diagnosis: ClientDeliveryDiagnosis {
+                frame_type,
+                flags,
+                cause,
+            },
+            error,
+        };
+        let closed = || {
+            RouterError::backend_with_epoch(
+                frame.header.channel,
+                frame.header.epoch,
+                frame.header.corr,
+                "client connection closed",
+            )
+        };
+        if self
+            .accounting
+            .client_delivery_closed
+            .load(Ordering::Acquire)
+        {
+            return Err(failure("client_closed", closed()));
+        }
+        let (frame, error) = match self.try_send_owned(frame) {
+            Ok(()) => return Ok(()),
+            Err(refused) => refused,
+        };
+        if self.is_closed() {
+            return Err(failure("client_closed", error));
+        }
+        let grace = crate::server::CONNECTION_EGRESS_STALL_GRACE;
+        let age = self.backlog().oldest_age.unwrap_or_default();
+        if age > grace {
+            return Err(failure("oldest_frame_older_than_250_ms", error));
+        }
+        let result = tokio::select! {
+            biased;
+            _ = &mut stopped => return Err(failure("client_closed", error)),
+            result = tokio::time::timeout(grace.saturating_sub(age), self.send(frame)) => result,
+        };
+        match result {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(failure("client_closed", error)),
+            Err(_) => Err(failure("waited_250_ms_without_room", error)),
+        }
+    }
+
     /// Enqueue without waiting. Fails when the frame's bytes would take the
     /// queue past its byte budget, when the channel's frame-count backstop is
     /// full, or when the writer is gone.
     pub(crate) fn try_send(&self, frame: Frame) -> Result<(), RouterError> {
+        self.try_send_owned(frame).map_err(|(_, error)| error)
+    }
+
+    fn try_send_owned(&self, frame: Frame) -> Result<(), (Frame, RouterError)> {
         let channel = frame.header.channel;
         let epoch = frame.header.epoch;
         let corr = frame.header.corr;
@@ -495,18 +567,45 @@ impl FrameSink {
         let bytes = queued_frame_bytes(&frame);
         let Some(charge) = self.accounting.try_charge(bytes) else {
             if self.tx.is_closed() {
-                return Err(unavailable("channel closed".to_string()));
+                return Err((frame, unavailable("channel closed".to_string())));
             }
-            return Err(unavailable(format!(
-                "egress byte budget exhausted ({} queued bytes, frame of {bytes} bytes, budget {})",
-                self.accounting.queued_bytes.load(Ordering::Acquire),
-                self.accounting.byte_budget
-            )));
+            return Err((
+                frame,
+                unavailable(format!(
+                    "egress byte budget exhausted ({} queued bytes, frame of {bytes} bytes, budget {})",
+                    self.accounting.queued_bytes.load(Ordering::Acquire),
+                    self.accounting.byte_budget
+                )),
+            ));
         };
-        // A refused frame is dropped inside the error, which returns its charge.
+        // Return the refused frame for a bounded retry; dropping the rest of
+        // the outbound wrapper returns its charge.
         self.tx
             .try_send(OutboundFrame::charged(frame, charge))
-            .map_err(|err| unavailable(err.to_string()))
+            .map_err(|err| {
+                let error = unavailable(err.to_string());
+                (err.into_inner().frame, error)
+            })
+    }
+}
+
+#[derive(Debug)]
+struct ClientDeliveryFailure {
+    diagnosis: ClientDeliveryDiagnosis,
+    error: RouterError,
+}
+
+/// Header facts only: payloads can contain secrets and must never enter logs.
+#[derive(Debug)]
+pub(crate) struct ClientDeliveryDiagnosis {
+    pub frame_type: FrameType,
+    pub flags: Flags,
+    pub cause: &'static str,
+}
+
+impl fmt::Display for ClientDeliveryFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.error.fmt(f)
     }
 }
 
@@ -929,11 +1028,11 @@ impl Router {
                         let mut goodbye = frame;
                         goodbye.header.channel = target.channel;
                         goodbye.header.epoch = target.epoch;
-                        if let Err(err) = target.sink.try_send(goodbye) {
+                        if let Err(err) = target.sink.send_to_client(goodbye).await {
                             if target.close_on_delivery_failure()
                                 && self
                                     .forwarding
-                                    .escalate_client_delivery_failure(
+                                    .escalate_client_delivery_failure_diagnosed(
                                         target.connection_id,
                                         target.channel,
                                         target.epoch,
@@ -948,6 +1047,7 @@ impl Router {
                                             module_id: Some(&route.module_id),
                                             sink: &target.sink,
                                         },
+                                        Some(&err.diagnosis),
                                     )
                                     .map_err(RouterError::Forwarding)?
                             {
@@ -965,9 +1065,10 @@ impl Router {
                 let limit = route.client_sink.accounting.byte_budget;
                 if bytes > limit {
                     let ty = frame.header.ty;
+                    let flags = frame.header.flags;
                     drop(frame);
                     return self
-                        .refuse_oversized_module_frame(ctx, &route, ty, corr, bytes)
+                        .refuse_oversized_module_frame(ctx, &route, (ty, flags), corr, bytes)
                         .await;
                 }
 
@@ -983,10 +1084,10 @@ impl Router {
                 let mut frame = frame;
                 frame.header.channel = route.client_channel;
                 frame.header.epoch = route.client_epoch;
-                if let Err(err) = route.client_sink.try_send(frame) {
+                if let Err(err) = route.client_sink.send_to_client(frame).await {
                     if self
                         .forwarding
-                        .escalate_client_delivery_failure(
+                        .escalate_client_delivery_failure_diagnosed(
                             route.client_connection_id,
                             route.client_channel,
                             route.client_epoch,
@@ -1001,6 +1102,7 @@ impl Router {
                                 module_id: Some(&route.module_id),
                                 sink: &route.client_sink,
                             },
+                            Some(&err.diagnosis),
                         )
                         .map_err(RouterError::Forwarding)?
                     {
@@ -1075,18 +1177,24 @@ impl Router {
         &self,
         ctx: &RouteCtx,
         route: &RouteBinding,
-        ty: FrameType,
+        header: (FrameType, Flags),
         corr: u64,
         bytes: usize,
     ) -> Result<(), RouterError> {
+        let (ty, flags) = header;
         let limit = route.client_sink.accounting.byte_budget;
         if ty == FrameType::Push {
             // Deployed Rust clients cannot decode a new route.closed reason.
             // Until that vocabulary can be extended compatibly, an oversized
             // unsolicited push still closes the connection, with its cause named.
+            let diagnosis = ClientDeliveryDiagnosis {
+                frame_type: ty,
+                flags,
+                cause: "frame_too_large",
+            };
             if self
                 .forwarding
-                .escalate_client_delivery_failure(
+                .escalate_client_delivery_failure_diagnosed(
                     route.client_connection_id,
                     route.client_channel,
                     route.client_epoch,
@@ -1100,6 +1208,7 @@ impl Router {
                         module_id: Some(&route.module_id),
                         sink: &route.client_sink,
                     },
+                    Some(&diagnosis),
                 )
                 .map_err(RouterError::Forwarding)?
             {
@@ -1142,14 +1251,12 @@ impl Router {
                 bytes,
                 limit,
             )?;
-            // This runs on the module connection's frame reader, so it must not
-            // wait for client egress: a stuck client would stall every route of
-            // the module. Enqueue it like the reply it replaces, and treat a full
-            // queue exactly as ordinary backpressure.
-            if let Err(err) = route.client_sink.try_send(error) {
+            // The replacement shares the reply's bounded burst grace, so a
+            // stopped client cannot indefinitely stall the module frame reader.
+            if let Err(err) = route.client_sink.send_to_client(error).await {
                 if self
                     .forwarding
-                    .escalate_client_delivery_failure(
+                    .escalate_client_delivery_failure_diagnosed(
                         route.client_connection_id,
                         route.client_channel,
                         route.client_epoch,
@@ -1164,6 +1271,7 @@ impl Router {
                             module_id: Some(&route.module_id),
                             sink: &route.client_sink,
                         },
+                        Some(&err.diagnosis),
                     )
                     .map_err(RouterError::Forwarding)?
                 {
@@ -2276,8 +2384,294 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn module_egress_response_that_fits_empty_queue_still_closes_full_client() {
+    async fn poll_once<F: std::future::Future>(
+        mut future: std::pin::Pin<&mut F>,
+    ) -> std::task::Poll<F::Output> {
+        std::future::poll_fn(|cx| std::task::Poll::Ready(future.as_mut().poll(cx))).await
+    }
+
+    fn fill_client_budget(sink: &FrameSink, route: &crate::forwarding::PendingRouteBindRelay) {
+        sink.try_send(
+            Frame::build(
+                FrameType::Response,
+                Flags::new(false, Priority::Interactive, true),
+                route.client_channel,
+                route.client_epoch,
+                100,
+                vec![
+                    b'x';
+                    crate::server::CONNECTION_EGRESS_BYTE_BUDGET - subc_protocol::HEADER_LEN
+                ],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            sink.backlog().queued_bytes,
+            crate::server::CONNECTION_EGRESS_BYTE_BUDGET
+        );
+    }
+
+    async fn assert_full_client_burst_survives(ty: FrameType, oversized: bool) {
+        let (router, sink, mut rx, ctx, routes, mut close) = multi_route_client(
+            "draining-burst",
+            ConnectionId::new(92),
+            ConnectionId::new(93),
+            2,
+        )
+        .await;
+        fill_client_budget(&sink, &routes[0]);
+        let frame = if oversized {
+            Frame::build(
+                ty,
+                Flags::new(false, Priority::Interactive, false),
+                routes[1].module_channel,
+                routes[1].module_epoch,
+                101,
+                vec![b's'; crate::server::CONNECTION_EGRESS_BYTE_BUDGET],
+            )
+            .unwrap()
+        } else {
+            route_frame(ty, routes[1].module_channel, routes[1].module_epoch, 101)
+        };
+        let mut delivery = Box::pin(router.route_for_connection(&ctx, frame));
+        assert!(poll_once(delivery.as_mut()).await.is_pending());
+        assert!(
+            close.try_recv().is_err(),
+            "fresh bursts must not close: {ty:?}"
+        );
+        tokio::time::advance(Duration::from_millis(50)).await;
+        let queued = rx.try_recv().unwrap();
+        queued.charge.as_ref().unwrap().taken_by_writer();
+        drop(queued);
+        assert!(matches!(
+            poll_once(delivery.as_mut()).await,
+            std::task::Poll::Ready(Ok(()))
+        ));
+        let delivered = rx
+            .try_recv()
+            .expect("the burst frame must be delivered after draining");
+        assert_eq!(delivered.header.channel, routes[1].client_channel);
+        assert_eq!(delivered.header.epoch, routes[1].client_epoch);
+        assert_eq!(delivered.header.corr, 101);
+        if oversized {
+            assert_frame_size_error(
+                &delivered,
+                routes[1].client_channel,
+                routes[1].client_epoch,
+                101,
+                crate::server::CONNECTION_EGRESS_BYTE_BUDGET + subc_protocol::HEADER_LEN,
+            );
+        } else {
+            assert_eq!(delivered.header.ty, ty);
+        }
+        assert!(rx.try_recv().is_err());
+        assert!(close.try_recv().is_err());
+        assert_eq!(
+            router.counters.snapshot()["client_egress_close_delivery_failed"],
+            0
+        );
+        assert_eq!(router.counters.snapshot()["goodbye_relay_client_failed"], 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn module_egress_fresh_full_queue_burst_survives() {
+        for ty in [
+            FrameType::Response,
+            FrameType::StreamData,
+            FrameType::Request,
+            FrameType::Push,
+        ] {
+            assert_full_client_burst_survives(ty, false).await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn module_goodbye_fresh_full_queue_burst_survives() {
+        assert_full_client_burst_survives(FrameType::Goodbye, false).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn frame_count_backstop_also_allows_a_draining_burst() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let sink = FrameSink::with_byte_budget(tx, 2_000);
+        sink.try_send(stream_frame(1, 1, 1, vec![b'x'; 100]))
+            .unwrap();
+        let mut delivery = Box::pin(sink.send_to_client(stream_frame(1, 1, 2, vec![b'y'; 100])));
+        assert!(poll_once(delivery.as_mut()).await.is_pending());
+        assert!(
+            sink.backlog().queued_bytes < 2_000,
+            "only frame capacity is exhausted"
+        );
+        tokio::time::advance(Duration::from_millis(50)).await;
+        drop(rx.try_recv().unwrap());
+        assert!(matches!(
+            poll_once(delivery.as_mut()).await,
+            std::task::Poll::Ready(Ok(()))
+        ));
+        assert_eq!(rx.try_recv().unwrap().header.corr, 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn oversized_reply_replacement_fresh_full_queue_burst_survives() {
+        for ty in [FrameType::Response, FrameType::StreamData] {
+            assert_full_client_burst_survives(ty, true).await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn module_egress_stopped_reader_closes_without_waiting() {
+        let (logs, _guard) = test_log::log_capture(tracing::Level::WARN);
+        let (router, sink, mut rx, ctx, routes, mut close) = multi_route_client(
+            "oldest-stopped-reader",
+            ConnectionId::new(94),
+            ConnectionId::new(95),
+            2,
+        )
+        .await;
+        fill_client_budget(&sink, &routes[0]);
+        // The writer has taken the head but cannot finish writing it. Its
+        // bytes stay charged, and the atomic age still diagnoses that stall.
+        let writing = rx.try_recv().unwrap();
+        writing.charge.as_ref().unwrap().taken_by_writer();
+        tokio::time::advance(Duration::from_millis(251)).await;
+        assert_eq!(sink.backlog().oldest_age, Some(Duration::from_millis(251)));
+        assert_eq!(sink.backlog().queued_bytes, queued_frame_bytes(&writing));
+        let started = tokio::time::Instant::now();
+        let frame = stream_frame(
+            routes[0].module_channel,
+            routes[0].module_epoch,
+            101,
+            b"secret-body-never-log".to_vec(),
+        );
+        let flags = frame.header.flags.0;
+        let mut delivery = Box::pin(router.route_for_connection(&ctx, frame));
+        assert!(
+            matches!(
+                poll_once(delivery.as_mut()).await,
+                std::task::Poll::Ready(Ok(()))
+            ),
+            "an oldest frame older than 250 ms must close immediately, without a new wait"
+        );
+        assert_eq!(started.elapsed(), Duration::ZERO);
+        assert!(close
+            .try_recv()
+            .unwrap()
+            .to_string()
+            .contains("module_to_client_delivery_failed"));
+        let captured = test_log::captured_logs(&logs);
+        for expected in [
+            "frame_type=Some(StreamData)".to_string(),
+            format!("frame_flags=Some({flags})"),
+            "oldest_queued_ms=251".to_string(),
+            "close_cause=\"oldest_frame_older_than_250_ms\"".to_string(),
+        ] {
+            assert!(
+                captured.contains(&expected),
+                "missing {expected}: {captured}"
+            );
+        }
+        assert!(!captured.contains("secret-body-never-log"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn client_gone_mid_wait_resumes_module_reader_immediately() {
+        for writer_gone in [false, true] {
+            let (router, sink, mut rx, ctx, routes, _close) = multi_route_client(
+                "gone-during-burst",
+                ConnectionId::new(96),
+                ConnectionId::new(97),
+                1,
+            )
+            .await;
+            fill_client_budget(&sink, &routes[0]);
+            let frame = route_frame(
+                FrameType::Response,
+                routes[0].module_channel,
+                routes[0].module_epoch,
+                101,
+            );
+            let mut delivery = Box::pin(router.route_for_connection(&ctx, frame));
+            assert!(poll_once(delivery.as_mut()).await.is_pending());
+            tokio::time::advance(Duration::from_millis(50)).await;
+            let started = tokio::time::Instant::now();
+            if writer_gone {
+                rx.close();
+            } else {
+                sink.close_client_delivery();
+            }
+            assert!(
+                matches!(
+                    poll_once(delivery.as_mut()).await,
+                    std::task::Poll::Ready(Ok(()))
+                ),
+                "client teardown must wake the module reader before the writer drains"
+            );
+            assert_eq!(started.elapsed(), Duration::ZERO);
+            assert_eq!(sink.accounting.waiters.load(Ordering::SeqCst), 0);
+            assert_eq!(rx.try_recv().unwrap().header.corr, 100);
+            assert!(rx.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_module_delivery_releases_waiter_without_closing_client() {
+        let (router, sink, mut rx, ctx, routes, mut close) = multi_route_client(
+            "cancelled-burst",
+            ConnectionId::new(98),
+            ConnectionId::new(99),
+            1,
+        )
+        .await;
+        fill_client_budget(&sink, &routes[0]);
+        let frame = route_frame(
+            FrameType::Response,
+            routes[0].module_channel,
+            routes[0].module_epoch,
+            101,
+        );
+        let mut delivery = Box::pin(router.route_for_connection(&ctx, frame));
+        assert!(poll_once(delivery.as_mut()).await.is_pending());
+        assert_eq!(sink.accounting.waiters.load(Ordering::SeqCst), 1);
+        drop(delivery);
+        assert_eq!(sink.accounting.waiters.load(Ordering::SeqCst), 0);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(close.try_recv().is_err());
+        drop(rx.try_recv().unwrap());
+        assert_eq!(sink.backlog().queued_bytes, 0);
+        assert!(sink.backlog().oldest_age.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn egress_atomic_age_follows_writer_and_clears_when_drained() {
+        let (sink, mut rx) = crate::server::connection_egress();
+        sink.try_send(stream_frame(1, 1, 1, vec![b'x'; 100]))
+            .unwrap();
+        tokio::time::advance(Duration::from_millis(200)).await;
+        sink.try_send(stream_frame(2, 1, 2, vec![b'y'; 100]))
+            .unwrap();
+        let writing = rx.try_recv().unwrap();
+        writing.charge.as_ref().unwrap().taken_by_writer();
+        assert_eq!(sink.backlog().oldest_age, Some(Duration::from_millis(200)));
+        drop(writing);
+        // Between frames the lock-free marker can still name the previous
+        // head. The next writer take advances it without scanning the queue.
+        assert_eq!(sink.backlog().oldest_age, Some(Duration::from_millis(200)));
+        tokio::time::advance(Duration::from_millis(50)).await;
+        let next = rx.try_recv().unwrap();
+        next.charge.as_ref().unwrap().taken_by_writer();
+        assert_eq!(sink.backlog().oldest_age, Some(Duration::from_millis(50)));
+        assert!(
+            sink.backlog().queued_bytes > 0,
+            "in-flight bytes remain charged until written"
+        );
+        drop(next);
+        assert_eq!(sink.backlog().queued_bytes, 0);
+        assert_eq!(sink.backlog().oldest_age, None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn module_egress_response_full_client_waits_only_remaining_grace() {
         let (router, sink, mut rx, ctx, routes, mut close) = multi_route_client(
             "backpressure-provider",
             ConnectionId::new(82),
@@ -2312,17 +2706,20 @@ mod tests {
             202,
         );
         assert!(queued_frame_bytes(&ordinary) < limit);
+        // A fitting reply gets only the unused portion of the oldest frame's
+        // 250 ms grace, not an immediate close or a fresh 250 ms wait.
+        tokio::time::advance(Duration::from_millis(100)).await;
         let mut delivery = Box::pin(router.route_for_connection(&ctx, ordinary));
-        // Backpressure closes immediately rather than parking a replacement
-        // ERROR behind a full queue. Poll once; no clock or timeout is involved.
-        let result = std::future::poll_fn(|cx| {
-            std::task::Poll::Ready(std::future::Future::poll(delivery.as_mut(), cx))
-        })
-        .await;
-        assert!(
-            matches!(result, std::task::Poll::Ready(Ok(()))),
-            "full-queue delivery must close, not wait for an oversized-frame ERROR"
-        );
+        assert!(poll_once(delivery.as_mut()).await.is_pending());
+        assert!(close.try_recv().is_err());
+        tokio::time::advance(Duration::from_millis(149)).await;
+        assert!(poll_once(delivery.as_mut()).await.is_pending());
+        assert!(close.try_recv().is_err());
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(matches!(
+            poll_once(delivery.as_mut()).await,
+            std::task::Poll::Ready(Ok(()))
+        ));
         drop(delivery);
         let reason = close.try_recv().expect("the full client must close");
         assert!(reason
@@ -2342,8 +2739,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn oversized_reply_to_a_full_client_closes_it_without_waiting() {
+    #[tokio::test(start_paused = true)]
+    async fn oversized_reply_to_a_full_client_waits_only_remaining_grace() {
         let (router, sink, _rx, ctx, routes, mut close) = multi_route_client(
             "full-oversize-provider",
             ConnectionId::new(90),
@@ -2378,17 +2775,20 @@ mod tests {
             vec![b'y'; limit - subc_protocol::HEADER_LEN + 1],
         )
         .unwrap();
+        // The replacement ERROR gets the same bounded burst grace as the
+        // ordinary reply; oversized payloads themselves are never queued.
+        tokio::time::advance(Duration::from_millis(80)).await;
         let mut delivery = Box::pin(router.route_for_connection(&ctx, oversized));
-        // The module's frame reader must never park on a stuck client: one poll
-        // completes, and the full client is closed as ordinary backpressure.
-        let result = std::future::poll_fn(|cx| {
-            std::task::Poll::Ready(std::future::Future::poll(delivery.as_mut(), cx))
-        })
-        .await;
-        assert!(
-            matches!(result, std::task::Poll::Ready(Ok(()))),
-            "the replacement ERROR must not wait for a full client queue"
-        );
+        assert!(poll_once(delivery.as_mut()).await.is_pending());
+        assert!(close.try_recv().is_err());
+        tokio::time::advance(Duration::from_millis(169)).await;
+        assert!(poll_once(delivery.as_mut()).await.is_pending());
+        assert!(close.try_recv().is_err());
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(matches!(
+            poll_once(delivery.as_mut()).await,
+            std::task::Poll::Ready(Ok(()))
+        ));
         drop(delivery);
         let reason = close.try_recv().expect("the full client must close");
         assert!(reason
@@ -2679,10 +3079,9 @@ mod tests {
         assert_eq!(client_sink.backlog().queued_bytes, 0);
     }
 
-    /// A client that never reads is closed once the module's frames exceed
-    /// the byte budget, and that close is reported once at WARN with what an
-    /// operator needs to find the stuck reader.
-    #[tokio::test]
+    /// A client that never reads exhausts its byte budget and the oldest
+    /// frame's 250 ms grace, then closes with one header-only diagnosis.
+    #[tokio::test(start_paused = true)]
     async fn never_reading_client_is_closed_at_byte_budget_with_warn_diagnosis() {
         let (logs, _guard) = test_log::log_capture(tracing::Level::WARN);
         const BODY: usize = 16 * 1024;
@@ -2697,6 +3096,7 @@ mod tests {
 
         let mut admitted = 0usize;
         let mut sent = 0u64;
+        let started = tokio::time::Instant::now();
         while router.counters.snapshot()["client_egress_close_delivery_failed"] == 0 {
             assert!(sent < 1_000, "the byte budget never refused a frame");
             let route = &routes[(sent % 2) as usize];
@@ -2715,6 +3115,10 @@ mod tests {
             sent += 1;
             admitted = client_sink.backlog().queued_frames;
         }
+        assert_eq!(
+            started.elapsed(),
+            crate::server::CONNECTION_EGRESS_STALL_GRACE
+        );
         // The budget, not the frame-count backstop, did the refusing.
         let frame_bytes = subc_protocol::HEADER_LEN + BODY;
         assert_eq!(
@@ -2771,6 +3175,23 @@ mod tests {
             "{line}"
         );
         assert!(line.contains("oldest_queued_ms="), "{line}");
+        assert!(line.contains("oldest_queued_ms=250"), "{line}");
+        assert!(line.contains("frame_type=Some(StreamData)"), "{line}");
+        assert!(
+            line.contains(&format!(
+                "frame_flags=Some({})",
+                Flags::new(false, Priority::Interactive, false).0
+            )),
+            "{line}"
+        );
+        assert!(
+            line.contains("close_cause=\"waited_250_ms_without_room\""),
+            "{line}"
+        );
+        assert!(
+            !line.contains(&"z".repeat(20)),
+            "body bytes must never be logged: {line}"
+        );
     }
 
     fn route_frame(ty: FrameType, channel: u16, epoch: u32, corr: u64) -> Frame {

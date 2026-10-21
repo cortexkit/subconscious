@@ -57,12 +57,36 @@ subc-protocol tests/golden/decision_tables.json.
 | Limit | Value | Source |
 |---|---|---|
 | Egress bytes queued per client connection | 4 MiB | `CONNECTION_EGRESS_BYTE_BUDGET`, server.rs:38 |
-| Largest single frame counted against it | 32 KiB | `CONNECTION_EGRESS_FRAME_CAP`, server.rs:47 |
+| Egress frame-count backstop | 32,768 frames | `CONNECTION_EGRESS_FRAME_CAP`, server.rs |
+| Full module→client queue: oldest-frame grace | 250 ms | `CONNECTION_EGRESS_STALL_GRACE`, server.rs |
 | Unauthenticated connections | 256 | `DEFAULT_MAX_UNAUTHENTICATED_CONNECTIONS`, server.rs:64 |
 | Handshake deadline | 2 s | `DEFAULT_AUTH_DEADLINE`, server.rs:59 |
 
-A client that lets 4 MiB of replies queue up unread is disconnected with a logged warning that
-names the connection, its routes and the module whose reply overflowed. Clients must keep reading.
+When a module→client frame fits the byte budget on its own but cannot enter the connection's
+queue (byte budget or frame-count backstop), the daemon checks its atomic backlog age: time since
+enqueue of the frame the writer most recently took, or the frame that made the queue non-empty
+if none has been taken. A blocked writer makes that age the stopped-reader signal. Between
+frames the marker may be one frame older than the true head; that approximation avoids a lock
+per frame and is acceptable for the bounded grace. If that age is **older than 250 ms**, the client
+is closed immediately. Otherwise the daemon awaits room for at most **250 ms minus that backlog age**
+(250 ms if no age is recorded). Delivery within that remaining grace keeps the connection;
+expiry closes it. This applies to ordinary forwarded frames, module GOODBYE, and replacement
+ERRORs for oversized replies or streams. A failed GOODBYE closes with
+`route_goodbye_delivery_failed`; ordinary frames and replacement ERRORs close with
+`module_to_client_delivery_failed`.
+
+The queue is shared by every route on the connection, so a close ends all of them. The WARN
+names the connection, principals, module and client channel, queue bytes/frames and oldest age,
+refused frame type and flags, and whether the backlog was already too old or the remaining grace
+expired. It never includes body bytes.
+Clients must keep reading; a fresh fanout burst is not by itself evidence of a stopped reader.
+
+No forwarding-table or route-table lock is held while awaiting room; egress accounting is lock-free.
+A client reader's exit wakes the wait even if its socket writer is still draining; loss of the
+writer also wakes it.
+Module connection teardown or a daemon close request drops the in-progress route future cleanly.
+One module frame reader is never parked on a client enqueue for more than 250 ms, and the byte
+budget and frame-count backstop remain bounded during the wait.
 
 A module→client frame whose header plus body alone exceeds that connection's egress byte
 budget is refused before enqueue, even when the queue is empty. Replies (including stream
@@ -74,9 +98,9 @@ produce the same oversized reply. An oversized reverse Request is answered with 
 ERROR on the module's channel, without reaching the client or closing the route. An
 oversized Push still closes the client connection: deployed Rust clients cannot decode
 a new `route.closed` reason, so route-local Push recovery needs a decoder-first rollout.
-A frame that would fit an empty queue but meets a full one is a different case: the client has
-stopped reading, so it is disconnected as a slow client, as described above. The replacement ERROR
-follows the same rule, because the daemon never makes a module's frame reader wait on one stuck client.
+A frame that would fit an empty queue but meets a full one is a different case: it receives the
+bounded burst grace above, as does a replacement ERROR. Frames that can never fit are not left
+waiting for impossible room.
 
 
 ### 1.3 Modules

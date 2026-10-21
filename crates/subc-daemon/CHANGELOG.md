@@ -2,7 +2,7 @@
 
 ## 0.36.23
 
-- Test-only release; daemon behaviour is unchanged. The caller-identity prompt test now holds its connecting socket in a dedicated child process: on Linux and macOS the lookup leaves a caller unresolved when more than one process holds the socket, and on Unix a test process that spawns children in parallel tests lends them copies of its own sockets until they exec. New tests pin two orderings that clients had wrongly assumed: a configured module reads `starting` in `supervisor.list` until its first process is admitted, although that process may already be registered and listed in `catalog.list`; and a client can hold its `route.open` acknowledgement before `route_open_accepted_by_principal` counts it. The startup-order test that waits for a `supervisor.set_enabled` reply now prints the in-process daemon's log when the reply does not arrive.
+- Test-only release; daemon behaviour is unchanged. The caller-identity prompt test now holds its connecting socket in a dedicated child process: on Linux and macOS the lookup leaves a caller unresolved when more than one process holds the socket, and on Unix a test process that spawns children in parallel tests lends them copies of its own sockets until they exec. A new test pins an ordering that a client test had wrongly assumed: a configured module reads `starting` in `supervisor.list` until its first process is admitted, although that process may already be registered and listed in `catalog.list`. The startup-order test that waits for a `supervisor.set_enabled` reply now prints the in-process daemon's log when the reply does not arrive.
 
 ## 0.36.22
 

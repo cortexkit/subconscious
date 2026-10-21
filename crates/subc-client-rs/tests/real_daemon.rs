@@ -634,7 +634,29 @@ async fn subc_consumer_supervisor_list_includes_enabled_and_disabled_modules_fro
     let consumer = SubcConsumer::connect(&daemon.connection_file, fast_consumer_options())
         .await
         .unwrap();
-    let response = consumer.supervisor_list().await.unwrap();
+    // A module can register, and so appear in catalog.list, before the
+    // supervisor has finished admitting the process it launched: on Unix the
+    // child runs while spawn bookkeeping (exec confirmation, the durable
+    // live-children record) is still under way, and only then does the
+    // supervisor mark it running. So the catalog is not a fence for the
+    // supervisor state; wait for that state itself, within a deadline.
+    let deadline = Instant::now() + START_TIMEOUT;
+    let response = loop {
+        let response = consumer.supervisor_list().await.unwrap();
+        let running = response
+            .modules
+            .iter()
+            .any(|module| module.module_id == ENABLED_MODULE_ID && module.state == "running");
+        if running {
+            break response;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the enabled module never reached running within {START_TIMEOUT:?}: {:?}",
+            response.modules
+        );
+        sleep(Duration::from_millis(10)).await;
+    };
     assert_eq!(response.modules.len(), 2);
 
     let enabled = response
@@ -4899,6 +4921,50 @@ fn unix_ms_now() -> u64 {
         .as_millis() as u64
 }
 
+/// Whether a `module.draining` deadline is the drain budget added to the
+/// moment the daemon began the drain. That moment is not observed directly,
+/// but it lies between the test sending the restart and the module's hook
+/// running, so the deadline must lie between those two instants plus the
+/// budget. Both ends are causal: neither assumes how quickly a loaded daemon
+/// gets from receiving the restart to beginning the drain.
+fn deadline_from_drain_budget(
+    restart_sent_ms: u64,
+    deadline_ms: u64,
+    hook_at_ms: u64,
+    budget_ms: u64,
+) -> bool {
+    restart_sent_ms + budget_ms <= deadline_ms && deadline_ms <= hook_at_ms + budget_ms
+}
+
+/// A daemon that begins the drain well over a second after the restart was
+/// sent still sets its deadline from the budget. The bound used to allow only
+/// one second for that latency, which a loaded build server exceeded.
+#[test]
+fn a_drain_that_began_late_still_has_a_deadline_from_the_budget() {
+    let sent = 1_000_000;
+    let began = sent + 1_500;
+    let hook = began + 20;
+    assert!(deadline_from_drain_budget(
+        sent,
+        began + 10_000,
+        hook,
+        10_000
+    ));
+    // A deadline outside the budget is still refused at either end.
+    assert!(!deadline_from_drain_budget(
+        sent,
+        sent + 9_999,
+        hook,
+        10_000
+    ));
+    assert!(!deadline_from_drain_budget(
+        sent,
+        hook + 10_001,
+        hook,
+        10_000
+    ));
+}
+
 /// `supervisor.restart` drains the module before stopping it. The daemon
 /// tells the module so with `module.draining`, and a module built on `serve`
 /// must hear it through `on_draining`: reason `restart`, a deadline still in
@@ -4939,8 +5005,8 @@ async fn supervisor_restart_calls_on_draining_with_restart_and_a_future_deadline
         "the drain deadline must still be ahead when the hook runs: {draining}"
     );
     assert!(
-        deadline_ms <= restart_sent_ms + DRAIN_BUDGET_MS + 1_000,
-        "the deadline must come from the configured drain budget: {draining}"
+        deadline_from_drain_budget(restart_sent_ms, deadline_ms, now_ms, DRAIN_BUDGET_MS),
+        "the deadline must come from the configured drain budget: sent at {restart_sent_ms}: {draining}"
     );
     assert_eq!(events[end_at]["end"], "goodbye", "{:#?}", events);
     assert!(

@@ -54,6 +54,7 @@ async fn client(path: &Path) -> TcpStream {
 }
 
 async fn rpc(stream: &mut TcpStream, request: ClientControlRequest) -> ClientControlResponse {
+    let described = format!("{request:?}");
     let frame = Frame::build(
         FrameType::Request,
         Flags::new(false, Priority::Passive, false),
@@ -65,11 +66,13 @@ async fn rpc(stream: &mut TcpStream, request: ClientControlRequest) -> ClientCon
     .unwrap();
     write_frame(stream, &frame).await.unwrap();
     stream.flush().await.unwrap();
-    let reply = timeout(Duration::from_secs(5), read_frame(stream))
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
+    let reply = match timeout(Duration::from_secs(5), read_frame(stream)).await {
+        Ok(reply) => reply.unwrap().unwrap(),
+        Err(_) => panic!(
+            "no daemon reply within 5s to {described}\n{}",
+            DaemonLog::dump_current()
+        ),
+    };
     assert_eq!(reply.header.channel, 0);
     assert_eq!(reply.header.corr, 1);
     assert_eq!(
@@ -79,6 +82,69 @@ async fn rpc(stream: &mut TcpStream, request: ClientControlRequest) -> ClientCon
         String::from_utf8_lossy(&reply.body)
     );
     serde_json::from_slice(&reply.body).unwrap()
+}
+
+/// The in-process daemon's log lines, kept so a test that times out waiting
+/// for the daemon can print what the daemon was doing. These tests run on a
+/// current-thread runtime, so every daemon task logs on the test's own thread
+/// and a thread-local subscriber sees it; work the daemon hands to other
+/// threads (blocking lookups, child reaping) is not captured.
+#[derive(Clone, Default)]
+struct DaemonLog(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+thread_local! {
+    static CURRENT_DAEMON_LOG: std::cell::RefCell<Option<DaemonLog>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for DaemonLog {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _context: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        struct Line(String);
+        impl tracing::field::Visit for Line {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                use std::fmt::Write;
+                let _ = write!(self.0, " {}={value:?}", field.name());
+            }
+        }
+        let metadata = event.metadata();
+        let mut line = Line(format!("{} {}:", metadata.level(), metadata.target()));
+        event.record(&mut line);
+        self.0.lock().unwrap().push(line.0);
+    }
+}
+
+impl DaemonLog {
+    /// Capture this thread's log events until the guard drops.
+    fn install() -> (DaemonLog, impl Drop) {
+        use tracing_subscriber::layer::SubscriberExt;
+        let log = DaemonLog::default();
+        CURRENT_DAEMON_LOG.with(|current| *current.borrow_mut() = Some(log.clone()));
+        let guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(log.clone()));
+        (log, guard)
+    }
+
+    /// The last lines captured on this thread, for a timeout message.
+    fn dump_current() -> String {
+        const LAST_LINES: usize = 200;
+        CURRENT_DAEMON_LOG.with(|current| match current.borrow().as_ref() {
+            None => "(no daemon log captured for this test)".to_string(),
+            Some(log) => {
+                let lines = log.0.lock().unwrap();
+                let start = lines.len().saturating_sub(LAST_LINES);
+                format!(
+                    "daemon log, last {} of {} lines:\n{}",
+                    lines.len() - start,
+                    lines.len(),
+                    lines[start..].join("\n")
+                )
+            }
+        })
+    }
 }
 
 async fn roster(stream: &mut TcpStream) -> Vec<SupervisorEntry> {
@@ -291,6 +357,7 @@ async fn invalid_configured_module_is_skipped_while_sibling_is_listed_at_publica
 #[cfg(unix)]
 #[tokio::test(flavor = "current_thread")]
 async fn configured_protocol_none_first_spawn_persists_its_identity() {
+    let (_daemon_log, _log_guard) = DaemonLog::install();
     let (dir, path) = temp_connection_file_path("configured-none-record");
     let record = crate::live_children::record_path(dir.path());
     let pid_path = dir.path().join("child.pid");

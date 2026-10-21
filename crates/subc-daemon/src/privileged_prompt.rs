@@ -182,23 +182,100 @@ mod tests {
         );
     }
 
+    /// Holds the connecting end of the caller socket in its own process. On
+    /// Linux and macOS the lookup leaves a caller unresolved when it finds
+    /// more than one process holding the socket, and on Unix a test process
+    /// running other tests in parallel lends copies of its descriptors to
+    /// every child it spawns until that child execs. A connecting socket that
+    /// lives in the test process can therefore read as unidentified whenever
+    /// another test happens to be spawning; one that lives here cannot.
+    #[test]
+    #[ignore = "re-exec socket owner fixture"]
+    fn prompt_caller_child_holds_socket() {
+        use std::io::{Read, Write};
+        let address = std::env::var("SUBC_TEST_PROMPT_CALLER_ADDRESS").unwrap();
+        let mut socket = std::net::TcpStream::connect(address).unwrap();
+        socket.write_all(b"R").unwrap();
+        let mut byte = [0];
+        assert_eq!(socket.read(&mut byte).unwrap(), 0);
+    }
+
+    struct KilledOnDrop(std::process::Child);
+
+    impl Drop for KilledOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
     #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     #[tokio::test]
     async fn resolved_connection_identity_flows_into_the_public_prompt_builder() {
+        use tokio::io::AsyncReadExt;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let _client = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
-            .await
-            .unwrap();
-        let (accepted, _) = listener.accept().await.unwrap();
-        let caller = CallerIdentity::lookup(&accepted);
-        let summary = prompt_text(PrivilegedOperation::Restart { module_id: "aft" }, &caller);
-        assert!(summary.starts_with(&format!(
-            "Restart module aft — requested by pid {} (",
-            std::process::id()
-        )));
+        let caller = KilledOnDrop(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "privileged_prompt::tests::prompt_caller_child_holds_socket",
+                    "--ignored",
+                ])
+                .env(
+                    "SUBC_TEST_PROMPT_CALLER_ADDRESS",
+                    listener.local_addr().unwrap().to_string(),
+                )
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let (mut accepted, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), listener.accept())
+                .await
+                .expect("socket owner child connects")
+                .unwrap();
+        let mut ready = [0];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            accepted.read_exact(&mut ready),
+        )
+        .await
+        .expect("socket owner child signals readiness")
+        .unwrap();
+        assert_eq!(&ready, b"R");
+        let accepted = accepted.into_std().unwrap();
+
+        // Another process holding a copy of everything this test process
+        // holds, as a child mid-spawn does. It must not make the caller
+        // ambiguous, because the caller's socket is not among those copies.
+        #[cfg(unix)]
+        let _mid_spawn_copy = KilledOnDrop(
+            std::process::Command::new("/bin/sleep")
+                .arg("30")
+                .stdin(std::process::Stdio::from(std::os::fd::OwnedFd::from(
+                    accepted.try_clone().unwrap(),
+                )))
+                .spawn()
+                .unwrap(),
+        );
+
+        let accepted = tokio::net::TcpStream::from_std(accepted).unwrap();
+        let caller_identity = CallerIdentity::lookup(&accepted);
+        let summary = prompt_text(
+            PrivilegedOperation::Restart { module_id: "aft" },
+            &caller_identity,
+        );
+        assert!(
+            summary.starts_with(&format!(
+                "Restart module aft — requested by pid {} (",
+                caller.0.id()
+            )),
+            "{summary}"
+        );
         let executable = std::env::current_exe().unwrap();
         let filename = executable.file_name().unwrap().to_string_lossy();
-        assert!(summary.ends_with(&format!("{filename})")));
+        assert!(summary.ends_with(&format!("{filename})")), "{summary}");
+        drop(accepted);
     }
 
     #[test]

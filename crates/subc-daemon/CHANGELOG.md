@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.36.23
+
+- Test-only release; daemon behaviour is unchanged. The caller-identity prompt test now holds its connecting socket in a dedicated child process: on Linux and macOS the lookup leaves a caller unresolved when more than one process holds the socket, and on Unix a test process that spawns children in parallel tests lends them copies of its own sockets until they exec. New tests pin two orderings that clients had wrongly assumed: a configured module reads `starting` in `supervisor.list` until its first process is admitted, although that process may already be registered and listed in `catalog.list`; and a client can hold its `route.open` acknowledgement before `route_open_accepted_by_principal` counts it. The startup-order test that waits for a `supervisor.set_enabled` reply now prints the in-process daemon's log when the reply does not arrive.
+
 ## 0.36.22
 
 - When a restart, reload or swap drain runs to its ceiling, its timeout line now names why: for each declared busy gauge, its latest reading and when it was taken (`zero`, `non_zero(n)`, `not_a_count(value)`, `missing_from_health_body`, or `probe_failed(<kind>)`), the last value actually read, and how many probes ran (`gauge_probes`). A health answer that lacks a declared gauge is warned about once per drain, by gauge name; before, it only moved a counter. Drain behaviour is unchanged.

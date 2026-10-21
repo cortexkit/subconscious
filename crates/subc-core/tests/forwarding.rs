@@ -8251,13 +8251,26 @@ async fn an_accepted_route_open_is_counted_under_the_stamped_principal() {
     let project = TestProject::new();
     let (_client, _ack) = attach_client(&server, &project, 901, "ses-accept-trace").await;
 
-    let after = server_counter_key(
-        &mut diagnostic_client,
-        902,
-        "route_open_accepted_by_principal",
-        "direct",
-    )
-    .await;
+    // The acknowledgement reaches the client from the module's reply, and the
+    // daemon counts the accept afterwards, when the route.open task resumes.
+    // So the count can trail the acknowledgement; wait for it, within a
+    // deadline, rather than reading it once.
+    let deadline = tokio::time::Instant::now() + SETUP_TIMEOUT;
+    let mut corr = 902;
+    let after = loop {
+        let after = server_counter_key(
+            &mut diagnostic_client,
+            corr,
+            "route_open_accepted_by_principal",
+            "direct",
+        )
+        .await;
+        if after > before || tokio::time::Instant::now() >= deadline {
+            break after;
+        }
+        corr += 1;
+        sleep(Duration::from_millis(10)).await;
+    };
     module.stop().await.unwrap();
 
     assert_eq!(

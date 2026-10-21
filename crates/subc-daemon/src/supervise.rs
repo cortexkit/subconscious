@@ -5712,6 +5712,55 @@ mod tests {
         drop(failed);
     }
 
+    /// A configured module reads as starting until the supervisor has admitted
+    /// its first process (exec confirmed, identity durably recorded), even
+    /// though that process is already running by then and can register over
+    /// HELLO, which is what lists it in catalog.list. So a client that needs
+    /// the supervisor state must wait for that state; seeing the module in
+    /// the catalog does not mean supervisor.list already says running.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_configured_module_reads_starting_while_its_first_process_already_runs() {
+        let dir = cortexkit_test_support::ScratchDir::new("starting-while-spawned");
+        let spec = ModuleSpec {
+            module_id: "spawned-not-admitted".to_string(),
+            program: super::terminal_history_tests::fake_aft_stub_path(),
+            args: Vec::new(),
+            env: ["XDG_DATA_HOME", "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME"]
+                .into_iter()
+                .map(|key| (key.to_string(), dir.path().display().to_string()))
+                .chain([("FAKE_AFT_NEVER_CONNECT".to_string(), "1".to_string())])
+                .collect(),
+            reserved: false,
+            reserved_prefixes: Vec::new(),
+            protocol: ModuleProtocol::Subc,
+            overlap: Default::default(),
+        };
+        let handle = SupervisorHandle::new();
+        let mut supervisor =
+            Supervisor::new_for_test(Arc::new(Registry::default()), RestartPolicy::default())
+                .with_handle(handle.clone());
+        let observed = Arc::new(Mutex::new(None));
+        let hook_handle = handle.clone();
+        let hook_observed = Arc::clone(&observed);
+        supervisor.test_after_first_spawn = AfterFirstSpawnHook(Some(Arc::new(move |module_id| {
+            let state = hook_handle
+                .get(module_id)
+                .expect("a configured module is on the roster before it is spawned")
+                .state()
+                .unwrap();
+            *hook_observed.lock().unwrap() = Some(state);
+        })));
+
+        let module = supervisor.supervise_configured(spec, true).unwrap();
+        assert_eq!(
+            *observed.lock().unwrap(),
+            Some(ModuleState::Starting),
+            "between the spawn and its admission the supervisor still reports starting"
+        );
+        assert_eq!(module.state().unwrap(), ModuleState::Running);
+        module.stop().await.unwrap();
+    }
+
     fn stale_process_snapshot(state: ModuleState, enabled: bool) -> SharedSnapshot {
         let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::new(state, enabled)));
         update_snapshot(&snapshot, Some("stale-process-facts"), |snapshot| {

@@ -1,5 +1,5 @@
 use std::{
-    io,
+    fs, io,
     net::Ipv4Addr,
     path::{Path, PathBuf},
     process,
@@ -31,7 +31,14 @@ mod common;
 use common::connect_authed_client;
 
 const LOG_TIMEOUT: Duration = Duration::from_secs(2);
-const START_TIMEOUT: Duration = Duration::from_secs(2);
+// How long a daemon may take to publish and answer before a test gives up.
+// No test here measures startup: they assert on watchdog ticks after it. An
+// in-process daemon's startup fsyncs the connection file it publishes and
+// prepares cgroup placement, and on a build server running the
+// whole workspace's tests that took longer than two seconds. Ten matches the
+// other in-process daemon suites in this crate; a daemon that never comes up
+// still fails, now with its own log.
+const START_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[tokio::test(flavor = "current_thread")]
 async fn watchdog_tick_against_live_daemon_succeeds_silently() {
@@ -112,6 +119,7 @@ async fn bootstrap_watchdog_logs_connection_file_divergence() {
         DaemonSelfWatchdogConfig::default()
             .with_interval(Duration::from_millis(25))
             .with_deadline(Duration::from_millis(250)),
+        &capture,
     )
     .await;
 
@@ -212,7 +220,10 @@ async fn watchdog_failed_tick_logs_stage_and_recovery_streak() {
     .await;
 
     let server_task = start_fixed_port_server(port, &live_info).await;
-    wait_for_responsive_daemon(&connection_file_path, START_TIMEOUT).await;
+    wait_for_responsive_daemon(&connection_file_path, START_TIMEOUT, || {
+        format!("fixture server finished: {}", server_task.is_finished())
+    })
+    .await;
 
     wait_for_log(&capture, LOG_TIMEOUT, |line| {
         line.contains("daemon self-watchdog recovered") && line.contains("failure_streak=")
@@ -233,7 +244,11 @@ struct RunningDaemon {
 }
 
 impl RunningDaemon {
-    async fn start(name: &str, watchdog_config: DaemonSelfWatchdogConfig) -> Self {
+    async fn start(
+        name: &str,
+        watchdog_config: DaemonSelfWatchdogConfig,
+        capture: &LogCapture,
+    ) -> Self {
         let temp_dir = unique_temp_dir(name);
         let connection_file_path = temp_dir.join("subc-conn.json");
         let task = tokio::spawn(run_with_config(
@@ -243,7 +258,18 @@ impl RunningDaemon {
                 .with_capture_logs_dir(temp_dir.join("run").join("logs"))
                 .with_watchdog_config(watchdog_config),
         ));
-        wait_for_responsive_daemon(&connection_file_path, START_TIMEOUT).await;
+        wait_for_responsive_daemon(&connection_file_path, START_TIMEOUT, || {
+            let connection_file = match fs::metadata(&connection_file_path) {
+                Ok(_) => "present",
+                Err(_) => "absent",
+            };
+            format!(
+                "daemon task finished: {}; connection file {connection_file}; daemon log:\n{}",
+                task.is_finished(),
+                capture.entries().join("\n")
+            )
+        })
+        .await;
 
         Self {
             connection_file_path,
@@ -326,7 +352,11 @@ impl Drop for CaptureWriter {
     }
 }
 
-async fn wait_for_responsive_daemon(connection_file_path: &Path, timeout: Duration) {
+async fn wait_for_responsive_daemon(
+    connection_file_path: &Path,
+    timeout: Duration,
+    diagnose: impl Fn() -> String,
+) {
     let deadline = Instant::now() + timeout;
     loop {
         if let Ok(mut stream) = connect_authed_client(connection_file_path).await {
@@ -342,7 +372,11 @@ async fn wait_for_responsive_daemon(connection_file_path: &Path, timeout: Durati
                 return;
             }
         }
-        assert!(Instant::now() < deadline, "daemon never became responsive");
+        assert!(
+            Instant::now() < deadline,
+            "daemon never became responsive within {timeout:?}: {}",
+            diagnose()
+        );
         sleep(Duration::from_millis(10)).await;
     }
 }

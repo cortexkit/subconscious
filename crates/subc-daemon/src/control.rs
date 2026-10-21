@@ -9967,6 +9967,54 @@ mod tests {
         assert_eq!(delivered.body, b"first request");
     }
 
+    /// A client holds its route.open acknowledgement before the daemon has
+    /// counted the accept. The module's reply commits the route and queues
+    /// the acknowledgement to the client from the module's reader, while the
+    /// accept is counted by the `route.open` task once it wakes on the
+    /// outcome. So a caller that reads `route_open_accepted_by_principal` as
+    /// soon as its acknowledgement arrives can see the count before this
+    /// accept; it must wait for the count, not assume it.
+    #[tokio::test]
+    async fn a_route_open_ack_can_reach_the_client_before_the_accept_is_counted() {
+        let accepted = |handler: &ControlHandler| {
+            handler.counters().snapshot()["route_open_accepted_by_principal"]
+                .as_object()
+                .map(|by_principal| by_principal.values().filter_map(Value::as_u64).sum::<u64>())
+                .unwrap_or(0)
+        };
+        let (handler, hold, module_ctx, mut module_rx) = route_open_held_after_bind_send().await;
+        let client = ConnectionId::new(43);
+        let (client_ctx, mut client_rx) = route_ctx(client);
+
+        let (open_task, bind) = relay_route_open(
+            &handler,
+            client,
+            &client_ctx.egress,
+            &mut module_rx,
+            400,
+            "aft",
+            "ack-before-count",
+        )
+        .await;
+        hold.wait().await;
+        assert!(handler
+            .handle_control_frame(&module_ctx, route_bind_ack(bind.header.corr))
+            .await
+            .unwrap()
+            .is_empty());
+        // The client already has its acknowledgement here.
+        published_route(&client_rx.try_recv().unwrap().frame);
+        assert_eq!(
+            accepted(&handler),
+            0,
+            "the accept is not counted until the route.open task runs again"
+        );
+
+        hold.wait().await;
+        assert!(open_task.await.unwrap().is_empty());
+        assert_eq!(accepted(&handler), 1);
+    }
+
     /// The client goes away while `route.open` is still queueing the bind, so
     /// the relay is dropped with no module reply. The teardown cannot send the
     /// GOODBYE itself (it could reach the module ahead of the bind), so

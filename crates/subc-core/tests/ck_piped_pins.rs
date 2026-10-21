@@ -124,7 +124,10 @@ fn no_crash(kit: &Kit) -> Result<(), String> {
     ))
 }
 
-/// Brings the kit to the same state before each command, then runs it.
+/// Waits for the module and its health, then runs the commands in order,
+/// waiting before each one for the state the commands before it leave: a
+/// live new process after a restart, and every ledger entry before
+/// `activity`.
 fn take(kit: &Kit) -> Result<Taken, String> {
     wait_live(kit, 1)?;
     kit.poll_json("health recorded", &["--json", "health"], |health| {

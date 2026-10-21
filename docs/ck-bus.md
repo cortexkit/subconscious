@@ -1373,3 +1373,15 @@ The index summarizes normative requirements; where an index line and a section d
   `ckbus.credential`. ck-bus renews its own users' JWTs the same way, handing each to its
   own connection's auth callback. Jitter is per process only (a few seconds); reconnects
   are already spread by each connection's own issue time.
+- One credential holder per process. ck-bus keeps exactly one current key per module,
+  and every `ckbus.credential` call issues the next epoch and revokes the previous key,
+  kicking every connection still using it. So a participant process holds one current
+  credential and shares it across every NATS connection it opens: each connection's auth
+  callback names that key in `ckbus.nonce_sign`, and renewals go through the same holder.
+  Re-issuing is single-flight: on `ckbus_credential_superseded` or
+  `ckbus_credential_revoked`, one `ckbus.credential` call serves every connection, and a
+  connection the re-issue kicked reconnects naming the new key. On
+  `ckbus_generation_not_live`, don't re-issue at all: the process itself is no longer the
+  live generation. A process whose connections each fetch their own credential makes
+  them revoke each other: each fetch revokes the key the other connections hold, and
+  they never recover without a re-issue.

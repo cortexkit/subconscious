@@ -173,7 +173,7 @@ Refusals:
 
 | Code | Meaning |
 | --- | --- |
-| `operator_declined` | Declined or withdrawn. `detail.reason`: `person`, `backoff`, `route_closed`, `module_closed`, `caller_cancelled`. |
+| `operator_declined` | Declined or withdrawn. `detail.reason`: `person`, `backoff`, `route_closed`, `module_closed`, `caller_cancelled`. A module `backoff` refusal also includes `detail.retry_after_ms`, the rounded-up milliseconds until its 30-second `(module, principal)` cooldown ends; older daemons may omit it. |
 | `operator_presence_unavailable` | The prompt could not be shown or completed. `detail.reason`: `no_presence`, `timeout`, `module_limit`, `queue_full`, `queue_wait`, `provider_stuck`, `unsupported_platform`, `provider_error`. |
 | `operator_summary_invalid` | The summary breaks the daemon's summary rules. |
 | `operator_request_not_permitted` | The asking connection is not a nonce-proven module serving an open route with a verified opener. |

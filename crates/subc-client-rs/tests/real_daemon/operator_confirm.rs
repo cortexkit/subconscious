@@ -580,7 +580,12 @@ async fn summary_before_backoff() {
 async fn backoff_on_new_client_route() {
     let h = Harness::start("decline\napprove").await;
     assert_eq!(h.confirm("first").await["result"], "declined");
-    assert_eq!(h.confirm("again").await["result"], "declined");
+    let retry = h.confirm("again").await;
+    assert_eq!(retry["result"], "backoff");
+    let retry_after_ms = retry["retry_after_ms"]
+        .as_u64()
+        .expect("typed backoff includes retry_after_ms");
+    assert!((1..=30_000).contains(&retry_after_ms));
     h.audit("operator_declined", "backoff", Some("again")).await;
     assert_eq!(
         h.events()
@@ -916,7 +921,7 @@ async fn backoff_before_provider_stuck() {
         Some("queued"),
     )
     .await;
-    assert_eq!(h.confirm("backoff").await["result"], "declined");
+    assert_eq!(h.confirm("backoff").await["result"], "backoff");
     h.audit("operator_declined", "backoff", Some("backoff"))
         .await;
     h.gate();

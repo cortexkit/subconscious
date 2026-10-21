@@ -195,28 +195,40 @@ mod os_outcome_tests {
 pub(crate) struct Outcome {
     pub code: &'static str,
     pub reason: &'static str,
+    retry_after_ms: Option<u64>,
 }
 impl Outcome {
     pub(crate) fn unavailable(reason: &'static str) -> Self {
         Self {
             code: error_codes::OPERATOR_PRESENCE_UNAVAILABLE,
             reason,
+            retry_after_ms: None,
         }
     }
     fn declined(reason: &'static str) -> Self {
         Self {
             code: error_codes::OPERATOR_DECLINED,
             reason,
+            retry_after_ms: None,
         }
     }
+    fn with_retry_after_ms(mut self, retry_after_ms: u64) -> Self {
+        self.retry_after_ms = Some(retry_after_ms);
+        self
+    }
     pub(crate) fn refusal(code: &'static str) -> Self {
-        Self { code, reason: "" }
+        Self {
+            code,
+            reason: "",
+            retry_after_ms: None,
+        }
     }
     fn from_provider(result: ProviderResult) -> Self {
         match result {
             ProviderResult::Approved => Self {
                 code: "confirmed",
                 reason: "",
+                retry_after_ms: None,
             },
             ProviderResult::Declined => Self::declined("person"),
             ProviderResult::Unavailable => Self::unavailable("provider_error"),
@@ -233,7 +245,13 @@ impl Outcome {
         } else {
             let mut error = ErrorBody::new(self.code, "operator confirmation refused");
             if !self.reason.is_empty() {
-                error = error.with_detail(serde_json::json!({"reason": self.reason}));
+                let detail = match self.retry_after_ms {
+                    Some(retry_after_ms) => {
+                        serde_json::json!({"reason": self.reason, "retry_after_ms": retry_after_ms})
+                    }
+                    None => serde_json::json!({"reason": self.reason}),
+                };
+                error = error.with_detail(detail);
             }
             (
                 FrameType::Error,
@@ -251,6 +269,13 @@ impl Outcome {
         )
         .expect("bounded control reply")
     }
+}
+
+fn retry_after_ms(remaining: Duration) -> u64 {
+    let whole_milliseconds = remaining.as_millis();
+    let rounded_milliseconds =
+        whole_milliseconds + u128::from(!remaining.subsec_nanos().is_multiple_of(1_000_000));
+    u64::try_from(rounded_milliseconds).expect("operator confirmation backoff fits in u64")
 }
 
 pub(crate) fn audit(
@@ -453,11 +478,12 @@ impl OperatorConfirms {
             ))
         } else if !valid_summary(&request.summary) {
             Some(Outcome::refusal(error_codes::OPERATOR_SUMMARY_INVALID))
-        } else if state
+        } else if let Some(until) = state
             .backoff
-            .contains_key(&(module_id.clone(), principal.clone()))
+            .get(&(module_id.clone(), principal.clone()))
+            .copied()
         {
-            Some(Outcome::declined("backoff"))
+            Some(Outcome::declined("backoff").with_retry_after_ms(retry_after_ms(until - now)))
         } else if state.stuck {
             Some(Outcome::unavailable("provider_stuck"))
         } else if state.modules.contains_key(&module_id) {

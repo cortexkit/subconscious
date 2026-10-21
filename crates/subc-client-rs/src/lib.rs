@@ -899,7 +899,22 @@ impl ModuleHandle {
             }
             FrameType::Error => match serde_json::from_slice::<ErrorBody>(&reply.body) {
                 Ok(body) => Err(match body.code.as_str() {
-                    error_codes::OPERATOR_DECLINED => OperatorConfirmError::Declined,
+                    error_codes::OPERATOR_DECLINED => {
+                        let detail = body.detail.as_ref();
+                        if detail
+                            .and_then(|detail| detail.get("reason"))
+                            .and_then(serde_json::Value::as_str)
+                            == Some("backoff")
+                        {
+                            OperatorConfirmError::Backoff {
+                                retry_after_ms: detail
+                                    .and_then(|detail| detail.get("retry_after_ms"))
+                                    .and_then(serde_json::Value::as_u64),
+                            }
+                        } else {
+                            OperatorConfirmError::Declined
+                        }
+                    }
                     error_codes::OPERATOR_SUMMARY_INVALID => OperatorConfirmError::SummaryInvalid,
                     error_codes::OPERATOR_REQUEST_NOT_PERMITTED | "not_registered" => {
                         OperatorConfirmError::NotPermitted
@@ -1264,6 +1279,11 @@ impl Drop for OperatorConfirmGuard {
 #[non_exhaustive]
 pub enum OperatorConfirmError {
     Declined,
+    /// The daemon did not ask because a recent decline is still in effect.
+    /// Older daemons omit the remaining cooldown, so `retry_after_ms` may be absent.
+    Backoff {
+        retry_after_ms: Option<u64>,
+    },
     PresenceUnavailable,
     SummaryInvalid,
     NotPermitted,
@@ -1274,11 +1294,32 @@ impl fmt::Display for OperatorConfirmError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::Declined => "operator declined the write",
+            Self::Backoff { retry_after_ms: None } => {
+                "operator confirmation refused without asking: a recent decline holds new prompts for a short time"
+            }
             Self::PresenceUnavailable => "operator confirmation is unavailable",
             Self::SummaryInvalid => "operator confirmation summary is invalid",
             Self::NotPermitted => "operator confirmation is not permitted for this route",
             Self::Unsupported => "daemon does not support operator confirmation",
+            Self::Backoff {
+                retry_after_ms: Some(_),
+            } => return write!(
+                f,
+                "operator confirmation refused without asking: a recent decline holds new prompts for {} s",
+                self.backoff_seconds().expect("backoff retry duration is present")
+            ),
         })
+    }
+}
+
+impl OperatorConfirmError {
+    fn backoff_seconds(&self) -> Option<u64> {
+        match self {
+            Self::Backoff {
+                retry_after_ms: Some(milliseconds),
+            } => Some(milliseconds / 1_000 + u64::from(!milliseconds.is_multiple_of(1_000))),
+            _ => None,
+        }
     }
 }
 

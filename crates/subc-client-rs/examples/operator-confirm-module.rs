@@ -165,6 +165,15 @@ impl ModuleHandler for Harness {
 }
 
 fn answer(result: Result<(), OperatorConfirmError>) -> HandlerOutcome {
+    if let Err(OperatorConfirmError::Backoff { retry_after_ms }) = result {
+        return HandlerOutcome::Response(
+            serde_json::to_vec(&json!({
+                "result": "backoff",
+                "retry_after_ms": retry_after_ms
+            }))
+            .unwrap(),
+        );
+    }
     let name = match result {
         Ok(()) => "confirmed",
         Err(OperatorConfirmError::Declined) => "declined",

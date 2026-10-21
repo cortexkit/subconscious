@@ -612,13 +612,34 @@ async fn backoff_uses_module_and_principal_not_route() {
     );
     let mut first = f.module("m", 1, "nonce").await;
     f.request(&first, 4, "valid").await;
-    assert_reason(&receive(&mut first.rx).await, "person");
+    let person_decline = receive(&mut first.rx).await;
+    assert_reason(&person_decline, "person");
+    assert_eq!(
+        body(&person_decline)["detail"],
+        serde_json::json!({"reason": "person"})
+    );
     f.handler
         .cleanup_connection(first.ctx.connection_id)
         .unwrap();
     let new_route = f.module("m", 2, "nonce").await;
-    assert_reason(&f.request(&new_route, 5, "valid").await[0], "backoff");
+    let backoff = f.request(&new_route, 5, "valid").await.remove(0);
+    assert_reason(&backoff, "backoff");
+    let retry_after_ms = body(&backoff)["detail"]["retry_after_ms"]
+        .as_u64()
+        .expect("backoff refusal includes retry_after_ms");
+    assert!((1..=30_000).contains(&retry_after_ms));
 }
+
+#[test]
+fn retry_after_milliseconds_round_up_fractional_milliseconds() {
+    assert_eq!(retry_after_ms(Duration::from_nanos(1)), 1);
+    assert_eq!(retry_after_ms(Duration::from_millis(1)), 1);
+    assert_eq!(
+        retry_after_ms(Duration::from_millis(1) + Duration::from_nanos(1)),
+        2
+    );
+}
+
 #[tokio::test]
 async fn delayed_withdraw_handle_does_not_delay_timeout_or_routing() {
     let (provider, mut events) =

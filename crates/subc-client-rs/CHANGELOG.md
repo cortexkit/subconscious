@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.30.5
+
+- `ModuleHandle::confirm_operator` distinguishes a daemon `detail.reason` of `backoff` as `OperatorConfirmError::Backoff { retry_after_ms }`, preserving the remaining cooldown when supplied. Other operator declines remain `Declined`.
+
 ## 0.30.4
 
 - Expose capability-gated `ModuleHandle::scope_served_by` with an open answer and non-exhaustive reply; queries read only the registered owner namespace.

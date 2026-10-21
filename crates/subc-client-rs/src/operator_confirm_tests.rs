@@ -223,6 +223,62 @@ async fn operator_confirm_daemon_errors_map_to_unit_variants() {
 }
 
 #[tokio::test]
+async fn operator_confirm_daemon_errors_map_backoff_detail() {
+    let cases = [
+        (
+            serde_json::json!({"reason": "backoff", "retry_after_ms": 2_001}),
+            OperatorConfirmError::Backoff {
+                retry_after_ms: Some(2_001),
+            },
+        ),
+        (
+            serde_json::json!({"reason": "backoff"}),
+            OperatorConfirmError::Backoff {
+                retry_after_ms: None,
+            },
+        ),
+        (
+            serde_json::json!({"reason": "person"}),
+            OperatorConfirmError::Declined,
+        ),
+    ];
+
+    for (detail, expected) in cases {
+        let (handle, mut rx) = handle();
+        let route = handle.route_handle(7, 3);
+        let mut call = Box::pin(handle.confirm_operator("Replace identity", &route));
+        still_pending(call.as_mut()).await;
+        let request = rx.recv().await.unwrap();
+        assert!(handle.handle_control_reply(reply(
+            FrameType::Error,
+            request.header.corr,
+            serde_json::json!({
+                "code": "operator_declined",
+                "message": "refused",
+                "detail": detail
+            })
+        )));
+        assert_eq!(call.await, Err(expected));
+        assert_eq!(pending_count(&handle), 0);
+    }
+
+    assert_eq!(
+        OperatorConfirmError::Backoff {
+            retry_after_ms: Some(2_001)
+        }
+        .to_string(),
+        "operator confirmation refused without asking: a recent decline holds new prompts for 3 s"
+    );
+    assert_eq!(
+        OperatorConfirmError::Backoff {
+            retry_after_ms: None
+        }
+        .to_string(),
+        "operator confirmation refused without asking: a recent decline holds new prompts for a short time"
+    );
+}
+
+#[tokio::test]
 async fn operator_confirm_only_well_formed_confirmed_reply_succeeds() {
     let cases = [
         (

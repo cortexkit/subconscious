@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.36.19
+
+- Module `operator.confirm` refusals caused by the 30-second `(module, principal)` decline backoff include `detail.retry_after_ms`, rounded up to the remaining cooldown. Other refusal details are unchanged.
+
 ## 0.36.18
 
 - Track acknowledged scoped binds per live epoch and expose owner-namespace `scope.served_by`; advertise `scope-served-by/v1`. Refused or unacknowledged binds never count and history is not persisted.

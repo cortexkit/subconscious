@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.20.111
+
+- `ck` adds the daemon's `detail.retry_after_ms` to module operator-confirm backoff refusals as `· try again in N s`, rounded up to seconds. Refusals from older daemons keep the existing message.
+
 ## 0.20.110
 
 - Exercise scope service history against real daemons, including refused and missing bind acknowledgements and daemon restart; extend the module test fixture with standalone control requests.

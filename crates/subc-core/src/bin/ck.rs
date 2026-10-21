@@ -8286,32 +8286,45 @@ fn decode_error_body(body: &[u8]) -> String {
                 .as_ref()
                 .and_then(|detail| detail.get("reason"))
                 .and_then(Value::as_str);
+            let retry_after_ms = error
+                .detail
+                .as_ref()
+                .and_then(|detail| detail.get("retry_after_ms"))
+                .and_then(Value::as_u64);
             let message = match error.code.as_str() {
                 subc_protocol::error_codes::OPERATOR_DECLINED
                 | subc_protocol::error_codes::OPERATOR_PRESENCE_UNAVAILABLE
                     if reason == Some("backoff") =>
                 {
-                    "refused without asking: too many recent declines"
+                    match retry_after_ms {
+                        Some(milliseconds) => format!(
+                            "refused without asking: too many recent declines · try again in {} s",
+                            milliseconds / 1_000 + u64::from(!milliseconds.is_multiple_of(1_000))
+                        ),
+                        None => "refused without asking: too many recent declines".to_string(),
+                    }
                 }
                 subc_protocol::error_codes::OPERATOR_DECLINED => match reason {
-                    Some("person") => "declined at the operator prompt",
-                    _ => "operator approval cancelled or withdrawn",
+                    Some("person") => "declined at the operator prompt".to_string(),
+                    _ => "operator approval cancelled or withdrawn".to_string(),
                 },
                 subc_protocol::error_codes::OPERATOR_PRESENCE_UNAVAILABLE => match reason {
-                    Some("timeout") => "operator prompt timed out without approval",
+                    Some("timeout") => "operator prompt timed out without approval".to_string(),
                     Some("queue_wait") => {
-                        "refused without asking: operator prompt queue wait expired"
+                        "refused without asking: operator prompt queue wait expired".to_string()
                     }
-                    Some("queue_full") => "refused without asking: operator prompt queue is full",
+                    Some("queue_full") => {
+                        "refused without asking: operator prompt queue is full".to_string()
+                    }
                     Some("module_limit") => {
-                        "refused without asking: too many pending operator requests"
+                        "refused without asking: too many pending operator requests".to_string()
                     }
                     Some("provider_stuck") => {
-                        "no way to ask the operator: confirmation provider is stuck"
+                        "no way to ask the operator: confirmation provider is stuck".to_string()
                     }
-                    _ => "no way to ask the operator on this machine",
+                    _ => "no way to ask the operator on this machine".to_string(),
                 },
-                _ => &error.message,
+                _ => error.message,
             };
             format!("{} — {message}", error.code)
         }
@@ -8551,9 +8564,24 @@ mod tests {
         use tokio::{net::TcpListener, task::JoinHandle};
 
         fn operator_error(code: &str, reason: Option<&str>) -> CkError {
+            operator_error_with_retry(code, reason, None)
+        }
+
+        fn operator_error_with_retry(
+            code: &str,
+            reason: Option<&str>,
+            retry_after_ms: Option<u64>,
+        ) -> CkError {
             let mut body = ErrorBody::new(code, "operator confirmation refused");
-            if let Some(reason) = reason {
-                body = body.with_detail(json!({"reason": reason}));
+            if reason.is_some() || retry_after_ms.is_some() {
+                let mut detail = serde_json::Map::new();
+                if let Some(reason) = reason {
+                    detail.insert("reason".into(), json!(reason));
+                }
+                if let Some(retry_after_ms) = retry_after_ms {
+                    detail.insert("retry_after_ms".into(), json!(retry_after_ms));
+                }
+                body = body.with_detail(Value::Object(detail));
             }
             CkError::Rejected(decode_error_body(&serde_json::to_vec(&body).unwrap()))
         }
@@ -8633,6 +8661,16 @@ mod tests {
                 assert!(!error.to_string().contains("prompt"));
                 assert_eq!(error.exit_code(), 1);
             }
+            let error = operator_error_with_retry(
+                error_codes::OPERATOR_DECLINED,
+                Some("backoff"),
+                Some(2_001),
+            );
+            assert_eq!(
+                error.to_string(),
+                "operator_declined — refused without asking: too many recent declines · try again in 3 s"
+            );
+            assert_eq!(error.exit_code(), 1);
         }
 
         #[test]
@@ -8921,10 +8959,14 @@ mod tests {
 
         #[tokio::test(start_paused = true)]
         async fn restart_handles_operator_error_replies_without_outcome_unknown() {
-            for (code, reason) in [
-                (error_codes::OPERATOR_DECLINED, "person"),
-                (error_codes::OPERATOR_DECLINED, "backoff"),
-                (error_codes::OPERATOR_PRESENCE_UNAVAILABLE, "no_presence"),
+            for (code, reason, retry_after_ms) in [
+                (error_codes::OPERATOR_DECLINED, "person", None),
+                (error_codes::OPERATOR_DECLINED, "backoff", Some(2_001)),
+                (
+                    error_codes::OPERATOR_PRESENCE_UNAVAILABLE,
+                    "no_presence",
+                    None,
+                ),
             ] {
                 let (task, mut server, frame) = begin_command(
                     ClientControlRequest::SupervisorRestart {
@@ -8939,7 +8981,7 @@ mod tests {
                     &mut server,
                     &frame,
                     FrameType::Error,
-                    json!({"code": code, "message": "operator confirmation refused", "detail": {"reason": reason}}),
+                    json!({"code": code, "message": "operator confirmation refused", "detail": {"reason": reason, "retry_after_ms": retry_after_ms}}),
                 )
                 .await;
                 let error = task.await.unwrap().unwrap_err();
@@ -8947,7 +8989,7 @@ mod tests {
                 assert!(matches!(error, CkError::Rejected(_)));
                 assert_eq!(
                     error.to_string(),
-                    operator_error(code, Some(reason)).to_string()
+                    operator_error_with_retry(code, Some(reason), retry_after_ms).to_string()
                 );
                 assert_eq!(error.exit_code(), 1);
                 assert!(read_frame(&mut server).await.unwrap().is_none());

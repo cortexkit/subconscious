@@ -383,10 +383,11 @@ const TALL_ATTENTION_PROBLEMS: usize = 4;
 
 /// How many problems the attention list shows at a window size, and
 /// whether a "+N more" row follows them. Below [`TALL_ATTENTION_H`] rows
-/// (and in the small layout) the list has two rows: two problems, or one
-/// and the note. In a taller window it grows to four problems, with the note
-/// only past four. Either way a blank row follows it, so the panels below
-/// never sit directly under the list.
+/// (and in the small layout) the list takes at most two rows: up to two
+/// problems, or one problem and the note when there are more. In a taller
+/// window it takes up to four problems, with the note only past four.
+/// Either way a blank row follows it, so the panels below never sit
+/// directly under the list.
 pub fn attention_band(w: i32, h: i32, problems: usize) -> (usize, bool) {
     let tall = h >= TALL_ATTENTION_H && layout(w, h) != Layout::Small;
     let cap = if tall { TALL_ATTENTION_PROBLEMS } else { 2 };

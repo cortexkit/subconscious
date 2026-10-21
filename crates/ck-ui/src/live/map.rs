@@ -238,7 +238,7 @@ pub fn unwrap_result(v: &Value) -> &Value {
 
 /// An error a module reported inside an otherwise successful reply: its
 /// `code` when it gives one (a machine code), else its `message` (a
-/// sentence), else the bare string (untyped).
+/// sentence), else the error value itself as text (untyped).
 pub fn reply_error(v: &Value) -> Option<Fault> {
     let e = v.get("error")?;
     if e.is_null() {

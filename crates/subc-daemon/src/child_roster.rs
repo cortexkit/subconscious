@@ -91,9 +91,59 @@ struct RosterInner {
     retained: Mutex<Vec<(LiveChild, crate::live_children::RetainedReason)>>,
     #[cfg(target_os = "macos")]
     privacy_trampoline: OnceLock<Result<PathBuf, String>>,
+    /// Test-only: called before the record is serialized and written, so a
+    /// test can block there to stand in for a slow write.
+    #[cfg(test)]
+    record_write_hook: Mutex<Option<RecordWriteHook>>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct RecordWriteHook(Arc<dyn Fn(&HashMap<u64, RosterEntry>) + Send + Sync>);
+
+#[cfg(test)]
+impl std::fmt::Debug for RecordWriteHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RecordWriteHook")
+    }
 }
 
 impl RosterInner {
+    /// Run roster work that may wait on the record write without holding up
+    /// the rest of the async runtime.
+    ///
+    /// Rewriting the live-children record syncs the new file and then its
+    /// directory to disk, and on a busy disk each sync can take seconds. The
+    /// roster is called synchronously from async tasks: a module's supervisor
+    /// admits each child it spawns and releases each child it reaps. Blocking
+    /// a tokio worker thread for that long stalls more than the calling task.
+    /// A task woken by I/O or a timer normally runs on the worker that was
+    /// polling the runtime's I/O and timer driver, and while that worker is
+    /// blocked no other worker takes the driver over, so every timer and
+    /// socket in the daemon waits. That includes the authentication handshake
+    /// of the module just spawned, and the Rust SDK gives up on that handshake
+    /// after 2 seconds, so a restart on a busy machine crashed its own
+    /// replacement.
+    ///
+    /// The wait covers taking the `live` lock as well as the write: the lock
+    /// is held for the whole write, so a caller waiting for it waits as long.
+    ///
+    /// On a multi-threaded runtime `block_in_place` hands this worker's queued
+    /// tasks to another thread for the duration. A current-thread runtime
+    /// (some in-process test daemons) cannot do that, so the work runs inline
+    /// there. Without a record path nothing slow happens under the lock, and
+    /// the work also runs inline.
+    fn without_stalling_runtime<T>(&self, work: impl FnOnce() -> T) -> T {
+        let multi_threaded = tokio::runtime::Handle::try_current().is_ok_and(|handle| {
+            handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
+        });
+        if multi_threaded && self.record_path.get().is_some() {
+            tokio::task::block_in_place(work)
+        } else {
+            work()
+        }
+    }
+
     /// Rewrite the record from `live`. Called with the `live` lock held, so
     /// concurrent admits and releases write their snapshots in the order they
     /// changed the roster and the last write on disk is the current roster.
@@ -101,6 +151,13 @@ impl RosterInner {
         let Some(path) = self.record_path.get() else {
             return Ok(());
         };
+        #[cfg(test)]
+        {
+            let hook = lock(&self.record_write_hook).clone();
+            if let Some(hook) = hook {
+                (hook.0)(live);
+            }
+        }
         let mut entries: Vec<(&u64, &RosterEntry)> = live.iter().collect();
         entries.sort_by_key(|(key, _)| **key);
         let children: Vec<LiveChild> = entries
@@ -136,6 +193,10 @@ impl RosterInner {
     }
 
     fn recheck_retained(&self) {
+        self.without_stalling_runtime(|| self.recheck_retained_now());
+    }
+
+    fn recheck_retained_now(&self) {
         // Take `live` before `retained`, matching record writes made when a
         // newly spawned child joins the roster. This prevents pruning from
         // racing a write that must preserve a previous instance.
@@ -208,10 +269,12 @@ pub(crate) struct RosterGuard {
 
 impl Drop for RosterGuard {
     fn drop(&mut self) {
-        let mut live = lock(&self.inner.live);
-        if live.remove(&self.key).is_some() {
-            let _ = self.inner.write_record(&live);
-        }
+        self.inner.without_stalling_runtime(|| {
+            let mut live = lock(&self.inner.live);
+            if live.remove(&self.key).is_some() {
+                let _ = self.inner.write_record(&live);
+            }
+        });
     }
 }
 
@@ -224,13 +287,15 @@ impl RosterGuard {
         &self,
         observation: subc_os::Observation,
     ) -> std::io::Result<()> {
-        let mut live = lock(&self.inner.live);
-        if let Some(entry) = live.get_mut(&self.key) {
-            entry.recorded.start_time = Some(observation.start_time);
-            entry.recorded.executable = observation.executable.map(ExecutableIdentity::from);
-            self.inner.write_record(&live)?;
-        }
-        Ok(())
+        self.inner.without_stalling_runtime(|| {
+            let mut live = lock(&self.inner.live);
+            if let Some(entry) = live.get_mut(&self.key) {
+                entry.recorded.start_time = Some(observation.start_time);
+                entry.recorded.executable = observation.executable.map(ExecutableIdentity::from);
+                self.inner.write_record(&live)?;
+            }
+            Ok(())
+        })
     }
 }
 
@@ -325,23 +390,25 @@ impl ChildRoster {
         recorded: RecordedIdentity,
     ) -> std::io::Result<RosterGuard> {
         let key = self.inner.next_key.fetch_add(1, Ordering::Relaxed);
-        let mut live = lock(&self.inner.live);
-        live.insert(
-            key,
-            RosterEntry {
-                module_id,
-                pid,
-                protocol,
-                start_time,
-                recorded,
-                drain_budget: Arc::clone(&self.drain_budget),
-            },
-        );
-        if let Err(error) = self.inner.write_record(&live) {
-            live.remove(&key);
-            return Err(error);
-        }
-        drop(live);
+        self.inner.without_stalling_runtime(|| {
+            let mut live = lock(&self.inner.live);
+            live.insert(
+                key,
+                RosterEntry {
+                    module_id,
+                    pid,
+                    protocol,
+                    start_time,
+                    recorded,
+                    drain_budget: Arc::clone(&self.drain_budget),
+                },
+            );
+            if let Err(error) = self.inner.write_record(&live) {
+                live.remove(&key);
+                return Err(error);
+            }
+            Ok(())
+        })?;
         Ok(RosterGuard {
             inner: Arc::clone(&self.inner),
             key,
@@ -350,10 +417,23 @@ impl ChildRoster {
 
     #[cfg(unix)]
     fn live(&self) -> Vec<(u64, RosterEntry)> {
-        lock(&self.inner.live)
-            .iter()
-            .map(|(key, entry)| (*key, entry.clone()))
-            .collect()
+        self.inner.without_stalling_runtime(|| {
+            lock(&self.inner.live)
+                .iter()
+                .map(|(key, entry)| (*key, entry.clone()))
+                .collect()
+        })
+    }
+
+    /// Run `hook` at every record write from now on (when a record path is
+    /// set), before the roster is serialized and written, with the roster
+    /// being written.
+    #[cfg(test)]
+    pub(crate) fn set_record_write_hook_for_test(
+        &self,
+        hook: impl Fn(&HashMap<u64, RosterEntry>) + Send + Sync + 'static,
+    ) {
+        *lock(&self.inner.record_write_hook) = Some(RecordWriteHook(Arc::new(hook)));
     }
 
     /// Mark daemon shutdown as begun. Idempotent.

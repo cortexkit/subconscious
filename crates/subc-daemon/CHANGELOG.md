@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.36.26
+
+- A restart no longer stalls the whole daemon while the live-children record is written. Admitting a spawned child and releasing a reaped one rewrite that record, syncing the file and its directory to disk, and a busy disk can make that take seconds. The write ran on a tokio worker thread, and the worker that runs a supervisor task woken by a child exit or a timer is the one that was polling the runtime's I/O and timer driver; while it was blocked no other worker took the driver over, so no socket or timer in the daemon moved. A replacement module that connected in that window got no server proof, and the Rust SDK's 2 s handshake deadline made it exit 1 (`Timeout { stage: ServerProof }`). Roster work that writes the record, or waits for the lock the write holds, now runs under `block_in_place` on a multi-threaded runtime, which hands the worker's other tasks to another thread for the duration. The write is still finished before a spawn is admitted, as before.
+
 ## 0.36.25
 
 - The `route.open accepted` log line now says whether the open carried a scope: `scope=none`, or `scope=<kind>/<owner>/"<ref>"@<epoch>` from the stamp admission issued, with the ref quoted and cut to 64 characters. The bind proof and the scope's attributes are never logged.

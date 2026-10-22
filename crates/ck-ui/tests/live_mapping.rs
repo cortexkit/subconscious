@@ -7,10 +7,16 @@ use std::collections::HashMap;
 
 use ck_ui::live::map::{self, CpuTracker};
 use ck_ui::live::{action_progress, assemble, LiveProcess, State};
-use ck_ui::model::{ActionKind, ActionPhase, LogLevel, Status};
+use ck_ui::model::{
+    ActionKind, ActionPhase, ActivityLog, ActivityRowKind, Fault, LogLevel, ProcessEvent,
+    ProcessEventKind, Status,
+};
 use ck_ui::time::Timestamp;
 use serde_json::{json, Value};
-use subc_control::{SupervisorHealthEntry, SupervisorHealthStatus};
+use subc_control::{
+    ActivityCursor, ActivityEntry as WireActivity, ActivityQueryResponse, SupervisorHealthEntry,
+    SupervisorHealthStatus,
+};
 
 const NOW: i64 = 1_800_000_000_000;
 
@@ -381,11 +387,17 @@ fn activity_names_its_subject_and_actor() {
     .unwrap_or_else(|e| panic!("activity entry shape: {e}"));
     let names = HashMap::new();
     let a = map::activity_entry(&entry, &names);
-    // A direct connection names nobody.
-    assert_eq!((a.subject.as_str(), a.who.as_str()), ("engram", ""));
+    // A direct connection reads "direct": the daemon can't tell a person
+    // from a script, so it is never "you" and never blank.
+    assert_eq!((a.subject.as_str(), a.who.as_str()), ("engram", "direct"));
     // A module subject's summary loses its leading "module ".
     assert_eq!(a.what, "restarted");
     assert_eq!(a.kind, "module");
+
+    // An unverified caller reads "unverified", as plain `ck activity` says.
+    let mut unverified = entry.clone();
+    unverified.actor.principal = subc_protocol::Principal::Unverified;
+    assert_eq!(map::activity_entry(&unverified, &names).who, "unverified");
 }
 
 #[test]
@@ -566,7 +578,7 @@ fn a_restart_and_its_start_read_as_one_row() {
             r.kind.as_str(),
             r.who.as_str()
         ),
-        ("plexus", "restarted · new binary", "module", "")
+        ("plexus", "restarted · new binary", "module", "direct")
     );
     assert_eq!(r.at, Timestamp::from_unix_millis(NOW));
 
@@ -667,7 +679,7 @@ fn starts_and_exits_merge_the_feed_the_ledger_and_retained_exits() {
 fn where_many_maps_the_wrapped_reply_and_counts_machines() {
     let ids = map::agent_identities(&identity_reply()).unwrap();
     let reply = json!({ "result": { "agents": [
-        { "agent_id": "a1", "status": "held_here", "holder": "m-here", "holder_name": "ufuk-mac", "epoch": 3, "known": true, "stale": false },
+        { "agent_id": "a1", "status": "held_here", "holder": "m-here", "holder_name": "alex-mac", "epoch": 3, "known": true, "stale": false },
         { "agent_id": "a2", "status": "held_elsewhere", "holder": "m-2", "holder_name": "Mac 2", "epoch": 9, "known": true, "stale": false },
         { "agent_id": "a3", "status": "unclaimed", "holder": null, "holder_name": null, "epoch": 0, "known": true, "stale": false }
     ]}});
@@ -683,13 +695,13 @@ fn where_many_maps_the_wrapped_reply_and_counts_machines() {
 #[test]
 fn devices_list_online_first() {
     let reply = json!({ "devices": [
-        { "name": "ufuk-iphone-sim", "device_class": "sim", "trust": "verified", "tunnel": "closed:idle", "subscriptions_live": 0 },
+        { "name": "alex-iphone-sim", "device_class": "sim", "trust": "verified", "tunnel": "closed:idle", "subscriptions_live": 0 },
         { "name": "CortexKit Mac 2", "device_class": "mac", "trust": "verified", "tunnel": "established", "subscriptions_live": 0 },
         { "name": "iPhone", "device_class": "phone", "trust": "verified", "tunnel": "established", "subscriptions_live": 1 }
     ]});
     let d = map::devices(&reply, now()).unwrap();
     let names: Vec<&str> = d.list.iter().map(|x| x.short_name.as_str()).collect();
-    assert_eq!(names, ["Mac 2", "iPhone", "ufuk-iphone-sim"]);
+    assert_eq!(names, ["Mac 2", "iPhone", "alex-iphone-sim"]);
     assert_eq!(d.online, 2);
 }
 
@@ -1199,4 +1211,539 @@ fn the_sources_own_typing_decides_code_or_sentence() {
     assert_eq!(providers[0].error.as_deref(), Some("credential_expired"));
     assert_eq!(providers[0].error_kind, FaultKind::Code);
     assert_eq!(providers[1].error_kind, FaultKind::Code);
+}
+
+// ---- the Activity list: ledger and exits, pairs, paging, actors, freshness -----------
+
+/// A module lifecycle entry the daemon records, by kind ("restarted",
+/// "started", ...), with `details` as recorded.
+fn lifecycle(seq: u64, at_ms: u64, kind: &str, module: &str, details: Value) -> WireActivity {
+    activity(
+        seq,
+        at_ms,
+        json!({
+            "kind": format!("subc.module_{kind}"), "summary": format!("module {kind}"),
+            "subject": {"type": "module", "id": module}, "details": details,
+            "actor": {"principal": {"kind": "direct"}}, "module": "subc"
+        }),
+    )
+}
+
+/// A page of `activity.query`, newest first, with the cursor of the next
+/// page (`None`: the start of retained history).
+fn page(entries: Vec<WireActivity>, cursor: Option<u64>) -> ActivityQueryResponse {
+    let top = entries.first().map_or(0, |e| e.seq);
+    ActivityQueryResponse {
+        entries,
+        cursor,
+        head: ActivityCursor {
+            daemon_incarnation: "i".into(),
+            seq: top,
+        },
+    }
+}
+
+/// Loads `first` as the ledger's newest page, as the feed does on start.
+fn first_page(s: &mut State, first: ActivityQueryResponse) {
+    let mut refill = s.ledger.begin_refill(true);
+    assert_eq!(s.record_refill_page(&mut refill, first, now()), None);
+}
+
+/// The Activity rows as the snapshot shows them.
+fn log(s: &State) -> ActivityLog {
+    assemble(s, now()).activity_log.data
+}
+
+fn exit(at_ms: i64, module: &str, what: &str) -> ProcessEvent {
+    ProcessEvent {
+        at: Timestamp::from_unix_millis(at_ms),
+        module: module.into(),
+        what: what.into(),
+        kind: ProcessEventKind::Exited,
+    }
+}
+
+fn retained_exit(module: &str, at_ms: i64) -> Vec<ProcessEvent> {
+    map::terminal_events(
+        module,
+        &serde_json::from_value(json!({
+            "daemon_started_at_ms": 0,
+            "entries": [{"exit_code": 1, "at_ms": at_ms, "disposition": "restarting"}]
+        }))
+        .unwrap(),
+    )
+}
+
+#[test]
+fn an_exit_from_both_feeds_renders_once() {
+    let mut s = State::empty("This Mac");
+    first_page(&mut s, page(vec![], None));
+    // The spawn feed saw the exit (with its pid) 2 s after the daemon's
+    // journal stamped it; the journal keeps it too.
+    s.process_events = vec![exit(NOW - 3_000, "broca", "exited with code 1 · pid 6")];
+    s.terminals
+        .insert("broca".into(), retained_exit("broca", NOW - 5_000));
+    let rows = log(&s).rows;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].row, ActivityRowKind::Exit);
+    assert_eq!(rows[0].what, "exited with code 1 · restarting");
+
+    // Further apart than 10 s they are two exits.
+    s.process_events = vec![exit(NOW + 6_000, "broca", "exited with code 1 · pid 6")];
+    assert_eq!(log(&s).rows.len(), 2);
+}
+
+#[test]
+fn a_ledger_restart_renders_once() {
+    let mut s = State::empty("This Mac");
+    let started = lifecycle(11, NOW as u64 + 2_000, "started", "plexus", json!({}));
+    let restarted = lifecycle(10, NOW as u64, "restarted", "plexus", json!({}));
+    first_page(&mut s, page(vec![started, restarted], None));
+    // The spawn feed saw the same restart: the old process exit and the new
+    // one start. The ledger has the start, so the feed's isn't listed.
+    s.process_events = vec![
+        ProcessEvent {
+            at: Timestamp::from_unix_millis(NOW + 1_900),
+            module: "plexus".into(),
+            what: "started · pid 8".into(),
+            kind: ProcessEventKind::Started,
+        },
+        exit(NOW + 500, "plexus", "exited cleanly · pid 7"),
+    ];
+    let rows = log(&s).rows;
+    let got: Vec<(ActivityRowKind, &str, &str)> = rows
+        .iter()
+        .map(|r| (r.row, r.subject.as_str(), r.what.as_str()))
+        .collect();
+    assert_eq!(
+        got,
+        [
+            (ActivityRowKind::Exit, "plexus", "exited cleanly · pid 7"),
+            (ActivityRowKind::Entry, "plexus", "restarted"),
+        ]
+    );
+    assert_eq!(rows[1].seq, Some(10));
+}
+
+/// One restart pair whose start carries `old` and `new` evidence, as the
+/// Activity list and Home read it: the summary after the subject, the Build
+/// row, and Home's row.
+fn restart_reads(old: Value, new: Value) -> (String, Option<String>, String) {
+    let mut s = State::empty("This Mac");
+    first_page(
+        &mut s,
+        page(
+            vec![
+                lifecycle(
+                    21,
+                    NOW as u64 + 3_000,
+                    "started",
+                    "engram",
+                    json!({ "old_evidence": old, "new_evidence": new }),
+                ),
+                lifecycle(
+                    20,
+                    NOW as u64,
+                    "restarted",
+                    "engram",
+                    json!({ "drain_ms": 412 }),
+                ),
+            ],
+            None,
+        ),
+    );
+    let snap = assemble(&s, now());
+    let rows = &snap.activity_log.data.rows;
+    assert_eq!(rows.len(), 1, "one row for the pair: {rows:?}");
+    let r = &rows[0];
+    // The row is the restart's: its seq, kind, time and details.
+    assert_eq!(r.seq, Some(20));
+    assert_eq!(r.kind.as_deref(), Some("subc.module_restarted"));
+    assert_eq!(r.at, now());
+    assert_eq!(
+        r.details.as_ref().map(|d| Value::Object(d.clone())),
+        Some(json!({ "drain_ms": 412 }))
+    );
+    assert_eq!(snap.activity.data.len(), 1);
+    (
+        r.what.clone(),
+        r.build.clone(),
+        snap.activity.data[0].what.clone(),
+    )
+}
+
+#[test]
+fn restart_evidence_reads_on_every_platform() {
+    let linux = |d: &str| json!({ "method": "linux_proc_sha256", "digest": d });
+    let macos =
+        |inode: u64| json!({ "method": "macos_spawn_inode", "device": 16777233, "inode": inode });
+    let windows = |id: &str| json!({ "method": "windows_spawn_file_id", "volume_serial_number": 2864434397u64, "file_id": id });
+    let other = |n: u64| json!({ "method": "plan9_qid", "path": n });
+    let new_binary = || "restarted · new binary".to_string();
+    let r = |s: &str| s.to_string();
+
+    // Linux: only its evidence has a digest, so only it names a build.
+    assert_eq!(
+        restart_reads(linux("7c3a47b9aaaa"), linux("9d8a178cbbbb")),
+        (
+            r("restarted on build 9d8a178c"),
+            Some(r("7c3a47b9 → 9d8a178c")),
+            new_binary()
+        )
+    );
+    // The first start has no old evidence: the new build alone, and Home
+    // can't say the executable changed.
+    assert_eq!(
+        restart_reads(Value::Null, linux("9d8a178cbbbb")),
+        (
+            r("restarted on build 9d8a178c"),
+            Some(r("9d8a178c")),
+            r("restarted")
+        )
+    );
+    assert_eq!(
+        restart_reads(macos(3_293_687_992), macos(3_296_734_041)),
+        (new_binary(), None, new_binary())
+    );
+    assert_eq!(
+        restart_reads(windows("0x0001"), windows("0x0002")),
+        (new_binary(), None, new_binary())
+    );
+    // A method this build doesn't know still compares whole.
+    assert_eq!(
+        restart_reads(other(1), other(2)),
+        (new_binary(), None, new_binary())
+    );
+    assert_eq!(
+        restart_reads(other(1), other(1)),
+        (r("restarted"), None, r("restarted"))
+    );
+    // The method changed: different evidence, so a new binary; a build only
+    // when the new evidence has a digest, and then the new one alone.
+    assert_eq!(
+        restart_reads(macos(5), linux("9d8a178cbbbb")),
+        (
+            r("restarted on build 9d8a178c"),
+            Some(r("9d8a178c")),
+            new_binary()
+        )
+    );
+    assert_eq!(
+        restart_reads(linux("7c3a47b9aaaa"), macos(5)),
+        (new_binary(), None, new_binary())
+    );
+}
+
+#[test]
+fn an_actor_reads_its_agent_id_until_identity_names_it() {
+    use ck_ui::live::schedule::Source;
+    let mut s = State::empty("This Mac");
+    let by_agent = activity(
+        5,
+        NOW as u64,
+        json!({
+            "kind": "broca.run_ended", "summary": "run ended", "details": {},
+            "actor": {"principal": {"kind": "direct"}, "agent_id": "a2"}, "module": "broca"
+        }),
+    );
+    first_page(&mut s, page(vec![by_agent], None));
+    // Only Activity shows, and identity hasn't answered: the id, never an
+    // invented name.
+    let snap = assemble(&s, now());
+    assert_eq!(snap.activity_log.data.rows[0].who.as_deref(), Some("a2"));
+    assert_eq!(snap.activity.data[0].who, "a2");
+
+    assert!(s.record_module_reply(Source::Identity, Ok(identity_reply()), now()));
+    let snap = assemble(&s, now());
+    assert_eq!(snap.activity_log.data.rows[0].who.as_deref(), Some("IRIS"));
+    assert_eq!(snap.activity.data[0].who, "IRIS");
+}
+
+#[test]
+fn a_restart_pair_split_across_a_page_boundary_merges_after_paging_and_keeps_the_selection() {
+    let digest = |d: &str| json!({ "method": "linux_proc_sha256", "digest": d });
+    let mut s = State::empty("This Mac");
+    // The first page ends with the start; its restart is the first entry of
+    // the next page.
+    let started = lifecycle(
+        101,
+        NOW as u64 + 2_000,
+        "started",
+        "motor",
+        json!({ "old_evidence": digest("17c0a7d6ffff"), "new_evidence": digest("222d833feeee") }),
+    );
+    let mut first: Vec<WireActivity> = (102..=200)
+        .rev()
+        .map(|seq| {
+            lifecycle(
+                seq,
+                NOW as u64 + seq * 60_000,
+                "directed",
+                "broca",
+                json!({}),
+            )
+        })
+        .collect();
+    first.push(started);
+    first_page(&mut s, page(first, Some(101)));
+    let before = log(&s);
+    let lone = before.rows.last().unwrap();
+    assert_eq!((lone.seq, lone.what.as_str()), (Some(101), "started"));
+    // The person selects the start.
+    let selected = lone.key.clone();
+
+    let restarted = lifecycle(100, NOW as u64, "restarted", "motor", json!({}));
+    let older: Vec<WireActivity> = std::iter::once(restarted)
+        .chain((1..100).rev().map(|seq| {
+            lifecycle(
+                seq,
+                NOW as u64 - 1_000 * (100 - seq),
+                "directed",
+                "broca",
+                json!({}),
+            )
+        }))
+        .collect();
+    s.set_activity_view(Some(selected.clone()), true);
+    assert_eq!(
+        s.take_older_wanted(),
+        Some(101),
+        "the previous reply's cursor"
+    );
+    s.record_older_page(page(older, None), now());
+
+    let after = log(&s);
+    assert_eq!(after.counted(), 199, "the pair is one row");
+    let at = after
+        .position(&selected)
+        .expect("the selection stays on a row");
+    let merged = &after.rows[at];
+    assert_eq!(merged.seq, Some(100));
+    assert_eq!(merged.kind.as_deref(), Some("subc.module_restarted"));
+    assert_eq!(merged.what, "restarted on build 222d833f");
+    assert_eq!(merged.build.as_deref(), Some("17c0a7d6 → 222d833f"));
+    assert_eq!(after.rows[at - 1].seq, Some(102));
+    assert!(after.history_exhausted);
+}
+
+#[test]
+fn an_empty_ledger_with_one_retained_exit_shows_it_and_counts_it() {
+    let mut s = State::empty("This Mac");
+    s.terminals
+        .insert("motor".into(), retained_exit("motor", NOW - 60_000));
+    // Before the first page answers, the exit waits: it can't be placed
+    // among entries not yet read. (The rows are read from the state, since
+    // the snapshot's panel holds nothing at all before its first reading.)
+    assert_eq!(s.activity_log(&HashMap::new()).counted(), 0);
+    first_page(&mut s, page(vec![], None));
+    let l = log(&s);
+    assert!(l.history_exhausted);
+    assert_eq!(l.counted(), 1);
+    let r = &l.rows[0];
+    assert_eq!(r.row, ActivityRowKind::Exit);
+    assert_eq!(
+        (r.seq, r.who.as_deref(), r.kind.as_deref()),
+        (None, None, None)
+    );
+    assert!(r.details.is_none() && r.build.is_none());
+    assert_eq!(r.subject, "motor");
+    assert_eq!(l.position(&r.key), Some(0), "the exit is selectable");
+}
+
+#[test]
+fn an_exit_older_than_the_oldest_retained_entry_shows_once_history_is_exhausted() {
+    let mut s = State::empty("This Mac");
+    let newer: Vec<WireActivity> = (2..=3)
+        .rev()
+        .map(|seq| {
+            lifecycle(
+                seq,
+                NOW as u64 + seq * 1_000,
+                "directed",
+                "broca",
+                json!({}),
+            )
+        })
+        .collect();
+    first_page(&mut s, page(newer, Some(2)));
+    s.terminals
+        .insert("motor".into(), retained_exit("motor", NOW - 3_600_000));
+    assert_eq!(log(&s).counted(), 2, "held until paging reaches its time");
+
+    s.set_activity_view(None, true);
+    let cursor = s.take_older_wanted().unwrap();
+    assert_eq!(cursor, 2);
+    let oldest = lifecycle(1, NOW as u64, "directed", "broca", json!({}));
+    s.record_older_page(page(vec![oldest], None), now());
+    let l = log(&s);
+    let kinds: Vec<(ActivityRowKind, Option<u64>)> =
+        l.rows.iter().map(|r| (r.row, r.seq)).collect();
+    assert_eq!(
+        kinds,
+        [
+            (ActivityRowKind::Entry, Some(3)),
+            (ActivityRowKind::Entry, Some(2)),
+            (ActivityRowKind::Entry, Some(1)),
+            (ActivityRowKind::Exit, None),
+        ]
+    );
+    // With history exhausted no older page is asked for.
+    s.set_activity_view(None, true);
+    assert_eq!(s.take_older_wanted(), None);
+}
+
+#[test]
+fn when_history_ends_before_a_loaded_entry_a_label_separates_the_ranges() {
+    let entries = |range: std::ops::RangeInclusive<u64>| -> Vec<WireActivity> {
+        range
+            .rev()
+            .map(|seq| {
+                lifecycle(
+                    seq,
+                    NOW as u64 + seq * 1_000,
+                    "directed",
+                    "broca",
+                    json!({}),
+                )
+            })
+            .collect()
+    };
+    let mut s = State::empty("This Mac");
+    first_page(&mut s, page(entries(1..=100), None));
+    // The feed's head was refused, and the daemon now keeps seq 301 onward:
+    // seqs 101 to 300 are gone.
+    let mut refill = s.ledger.begin_refill(true);
+    assert_eq!(
+        s.record_refill_page(&mut refill, page(entries(401..=500), Some(401)), now()),
+        Some(401)
+    );
+    assert_eq!(
+        s.record_refill_page(&mut refill, page(entries(301..=400), None), now()),
+        None
+    );
+    let l = log(&s);
+    assert_eq!(l.counted(), 300, "the label counts toward nothing");
+    assert_eq!(l.rows.len(), 301);
+    let gap = &l.rows[200];
+    assert_eq!(gap.row, ActivityRowKind::Gap);
+    assert_eq!(gap.what, "Entries here are no longer kept");
+    assert_eq!((l.rows[199].seq, l.rows[201].seq), (Some(301), Some(100)));
+}
+
+#[test]
+fn a_live_entry_waits_while_the_newest_entries_are_dropped() {
+    let entries = |range: std::ops::RangeInclusive<u64>| -> Vec<WireActivity> {
+        range
+            .rev()
+            .map(|seq| {
+                lifecycle(
+                    seq,
+                    NOW as u64 + seq * 1_000,
+                    "directed",
+                    "broca",
+                    json!({}),
+                )
+            })
+            .collect()
+    };
+    let mut s = State::empty("This Mac");
+    first_page(&mut s, page(entries(2_001..=2_100), Some(2_001)));
+    // Paging down to the start of history, the view on the oldest row: the
+    // newest 100 are dropped to keep 2,000 loaded.
+    let mut cursor = 2_001;
+    while cursor > 1 {
+        let oldest = s
+            .activity_log(&HashMap::new())
+            .rows
+            .last()
+            .unwrap()
+            .key
+            .clone();
+        s.set_activity_view(Some(oldest), true);
+        assert_eq!(s.take_older_wanted(), Some(cursor));
+        let next = cursor.saturating_sub(100).max(1);
+        let more = (next > 1).then_some(next);
+        s.record_older_page(page(entries(next..=cursor - 1), more), now());
+        cursor = next;
+    }
+    let l = s.activity_log(&HashMap::new());
+    assert!(l.newer_unloaded && l.history_exhausted);
+    assert_eq!(l.rows[0].seq, Some(2_000));
+
+    // The person moves up to the first loaded row, and an entry arrives
+    // before the newest are read again. Shown now, it would sit above
+    // entries 2,001 to 2,100 that aren't loaded, with nothing marking them.
+    let top = l.rows[0].key.clone();
+    s.set_activity_view(Some(top), false);
+    s.record_live_activity(entries(2_101..=2_101).remove(0), now());
+    let l = s.activity_log(&HashMap::new());
+    assert_eq!(l.rows[0].seq, Some(2_000), "the entry waits");
+    assert_eq!(l.counted(), 2_000);
+    assert!(l.newer_unloaded);
+    assert_eq!(s.ledger.head.as_ref().map(|h| h.seq), Some(2_101));
+    assert!(s.top_refill_wanted(), "the newest are due to be read again");
+}
+
+#[test]
+fn a_quiet_open_feed_stays_live_and_a_closed_one_ages_against_15_s() {
+    use ck_ui::model::Freshness;
+    use ck_ui::screens::View;
+    let mut s = State::empty("This Mac");
+    first_page(&mut s, page(vec![], None));
+    s.record_feed_open(now());
+    s.spawn_feed.set((), now());
+    s.spawn_open = true;
+    let at = |secs: i64| Timestamp::from_unix_millis(NOW + secs * 1_000);
+    let meta = |s: &State, secs: i64| {
+        let snap = assemble(s, at(secs));
+        let v = View {
+            snap: &snap,
+            now: at(secs),
+            tick: 0,
+            home_sel: 0,
+            mod_sel: 0,
+        };
+        (
+            v.meta(&snap.activity, ""),
+            v.meta(&snap.activity_log, ""),
+            v.meta(&snap.process_events, ""),
+            snap.activity.freshness(at(secs)),
+        )
+    };
+    // Open and quiet for two minutes: still "live" (Home draws the live dot
+    // when the meta is empty).
+    let (home, list, events, fresh) = meta(&s, 120);
+    assert_eq!(fresh, Freshness::Fresh);
+    for m in [&home, &list, &events] {
+        assert_eq!(m.text, "", "{m:?}");
+        assert!(!m.dim);
+    }
+
+    // Closed with an error: it keeps the error, and ages from its last
+    // message against 15 s.
+    s.ledger.open = false;
+    s.activity
+        .fail(Fault::sentence("daemon unreachable · retrying"));
+    s.spawn_open = false;
+    s.spawn_feed
+        .fail(Fault::sentence("daemon unreachable · retrying"));
+    let (home, _, _, fresh) = meta(&s, 29);
+    assert_eq!(fresh, Freshness::Fresh);
+    assert_eq!(home.text, "daemon unreachable · retrying");
+    let (home, list_31, events_31, fresh) = meta(&s, 31);
+    assert_eq!(fresh, Freshness::Aging);
+    for m in [&home, &list_31, &events_31] {
+        assert_eq!(m.text, "daemon unreachable · retrying · 31s ago", "{m:?}");
+        assert_eq!(m.st, ck_ui::theme::St::W, "amber");
+        assert!(!m.dim);
+    }
+    let (home, list_76, events_76, fresh) = meta(&s, 76);
+    assert_eq!(fresh, Freshness::Stale);
+    for m in [&home, &list_76, &events_76] {
+        assert!(m.dim, "dimmed: {m:?}");
+        assert_eq!(
+            m.text,
+            "daemon unreachable · retrying · last good reading · 1m ago"
+        );
+    }
 }

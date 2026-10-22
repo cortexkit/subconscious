@@ -81,7 +81,8 @@ pub const UNKNOWN: &str = "unknown";
 
 /// How a panel's heading describes its data: the usual meta when fresh, the
 /// age in amber past twice the refresh interval, "last good reading" past
-/// five times, or the source's error while it is failing.
+/// five times, or the source's error while it is failing (with the age and
+/// "last good reading" as the data behind it grows old).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Meta {
     pub text: String,
@@ -107,10 +108,10 @@ impl View<'_> {
         let stale = fresh == Freshness::Stale;
         let age = || ago(self.age(panel.received_at));
         if let Some(err) = &panel.error {
-            let text = if panel.loaded && fresh != Freshness::Fresh {
-                format!("{err} · {} ago", age())
-            } else {
-                err.clone()
+            let text = match (panel.loaded, fresh) {
+                (true, Freshness::Stale) => format!("{err} · last good reading · {} ago", age()),
+                (true, Freshness::Aging) => format!("{err} · {} ago", age()),
+                _ => err.clone(),
             };
             return Meta {
                 text,

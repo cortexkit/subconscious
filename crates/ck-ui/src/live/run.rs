@@ -6,16 +6,19 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use futures_util::future::BoxFuture;
 use serde_json::{json, Value};
 use subc_client_rs::{
-    ActivityCursor, ActivityQueryRequest, CallError, CallOptions, ConnectionState, ConsumerOptions,
-    RouteHandle, SpawnStreamError, SubcConsumer,
+    ActivityCursor, ActivityQueryRequest, ActivityQueryResponse, ActivitySubscription, CallError,
+    CallOptions, ConnectionState, ConsumerOptions, RouteHandle, SpawnStreamError, SubcConsumer,
 };
+use subc_control::ActivityEntry as WireActivity;
 use subc_protocol::{BindIdentity, RouteTarget};
 use subc_transport::connection_file;
 use tokio::sync::{mpsc, watch, Notify};
 use tokio::task::JoinHandle;
 
+use super::activity::{self, FeedEnd, LedgerFeed, LedgerSource};
 use super::map;
 use super::schedule::{self, Gate, Source, Sources};
 use super::{
@@ -48,6 +51,9 @@ struct Shared {
     provenance_due: Notify,
     log_due: Notify,
     probe_due: Notify,
+    /// Wakes the activity feed when the Activity view moves: an older page
+    /// is wanted, or the view is back at the top.
+    activity_due: Notify,
     /// Which sources are wanted, from what the app shows.
     demand: watch::Sender<Sources>,
     /// Wakes the agents-place source once identity rows have arrived.
@@ -114,6 +120,7 @@ pub(super) fn spawn(
         provenance_due: Notify::new(),
         log_due: Notify::new(),
         probe_due: Notify::new(),
+        activity_due: Notify::new(),
         demand: watch::Sender::new(schedule::wanted(&schedule::Showing::default())),
         identity_ready: Notify::new(),
         raw,
@@ -562,14 +569,15 @@ fn sources(shared: &Arc<Shared>, conn: &Conn) -> Vec<JoinHandle<()>> {
         ));
     }
     {
-        let (sh, c) = (Arc::clone(shared), conn.clone());
-        // Where the ledger was last followed to, kept across sessions so a
-        // feed paused while no screen shows it resumes from there.
-        let since: Arc<Mutex<Option<ActivityCursor>>> = Arc::default();
+        let sh = Arc::clone(shared);
+        let ledger: Arc<dyn LedgerSource> = Arc::new(DaemonLedger(Arc::clone(&conn.consumer)));
+        // Where the feed resumes is kept in the state, across sessions and
+        // connections, so a feed paused while no screen shows it resumes
+        // from its last head.
         tasks.push(schedule::gated_session(
             &gate,
             Source::Activity,
-            move || activity_session(Arc::clone(&sh), c.clone(), Arc::clone(&since)),
+            move || activity_session(Arc::clone(&sh), Arc::clone(&ledger)),
         ));
     }
     tasks
@@ -806,10 +814,28 @@ fn module_error(module: &str, e: &CallError) -> Fault {
 
 // ---- subscriptions ---------------------------------------------------------------
 
+/// Marks a subscription closed when its task ends, however it ends: a
+/// session dropped because no screen shows its feed, or aborted with the
+/// connection, never ran the code after its last await.
+struct MarkClosedOnDrop {
+    shared: Arc<Shared>,
+    close: fn(&mut State),
+}
+
+impl Drop for MarkClosedOnDrop {
+    fn drop(&mut self) {
+        self.shared.update(self.close);
+    }
+}
+
 /// Live processes: seeded from the spawn snapshot, then followed. After a
 /// lag the feed resubscribes from the last cursor it saw; a cursor the
 /// daemon no longer accepts reseeds from a fresh snapshot.
 async fn spawn_feed(shared: Arc<Shared>, conn: Conn) {
+    let _closed = MarkClosedOnDrop {
+        shared: Arc::clone(&shared),
+        close: |s| s.spawn_open = false,
+    };
     let mut cursor = None;
     loop {
         if cursor.is_none() {
@@ -851,6 +877,13 @@ async fn spawn_feed(shared: Arc<Shared>, conn: Conn) {
                 continue;
             }
         };
+        // The subscription opening counts as hearing from the feed: an open
+        // feed has nothing to report until something happens.
+        shared.update(|s| {
+            s.spawn_open = true;
+            s.spawn_feed.at = now();
+            s.spawn_feed.error = None;
+        });
         loop {
             match sub.next().await {
                 Ok(Some(ev)) => {
@@ -870,12 +903,16 @@ async fn spawn_feed(shared: Arc<Shared>, conn: Conn) {
                     break;
                 }
                 Err(e) => {
-                    shared.update(|s| s.spawn_feed.fail(e.to_string()));
+                    shared.update(|s| {
+                        s.spawn_open = false;
+                        s.spawn_feed.fail(e.to_string());
+                    });
                     tokio::time::sleep(secs(2.0)).await;
                     break;
                 }
             }
         }
+        shared.update(|s| s.spawn_open = false);
     }
 }
 
@@ -923,80 +960,172 @@ pub(super) fn on_spawn_event(s: &mut State, ev: &subc_control::SpawnEvent, at: T
     s.process_events.truncate(200);
 }
 
-/// One session of the activity ledger: the newest hundred entries when
-/// there is nowhere to resume from, then the subscription from the last
-/// entry seen, until it ends. A lag ends the session with `since` kept, so
-/// the next one resumes from the last entry; a refused cursor or a failure
-/// clears it, so the next one reseeds with a new query. The session is
-/// dropped while no screen shows the ledger, and `since` is where the next
-/// one resumes.
-async fn activity_session(
-    shared: Arc<Shared>,
-    conn: Conn,
-    since: Arc<Mutex<Option<ActivityCursor>>>,
-) {
-    let get = || since.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    let put = |c: Option<ActivityCursor>| *since.lock().unwrap_or_else(|e| e.into_inner()) = c;
-    if get().is_none() {
-        let query = ActivityQueryRequest {
-            agent: None,
-            project: None,
-            module: None,
-            kind: None,
-            since_ms: None,
-            until_ms: None,
-            limit: 100,
-            cursor: None,
-        };
-        match conn.consumer.query_activity(query).await {
-            Ok(page) => {
-                shared.update(|s| s.activity.set(page.entries, now()));
-                put(Some(page.head));
-            }
-            Err(e) => {
-                shared.update(|s| s.activity.fail(control_fault(&e)));
+/// One session of the activity ledger, run while a screen shows it.
+///
+/// With nowhere to resume from it reads the newest page, then subscribes from
+/// that page's head. Otherwise it subscribes from the last head the feed
+/// reached, so entries recorded while no screen showed the ledger replay in
+/// order. When the daemon refuses that head (another daemon incarnation, or
+/// entries after it have left the replay ring), it reads the newest pages
+/// down to what is loaded, then subscribes from the newest page's head. A
+/// lag resubscribes from the last head. While subscribed it also reads what
+/// the Activity view asks for: an older page, or the newest entries again
+/// once the view is back at the top.
+async fn activity_session(shared: Arc<Shared>, ledger: Arc<dyn LedgerSource>) {
+    let _closed = MarkClosedOnDrop {
+        shared: Arc::clone(&shared),
+        close: |s| s.ledger.open = false,
+    };
+    let mut refill = shared.read(|s| s.ledger.head.is_none());
+    loop {
+        if refill {
+            if let Err(e) = refill_top(&shared, &*ledger, true).await {
+                shared.update(|s| s.activity.fail(e));
                 tokio::time::sleep(secs(5.0)).await;
                 return;
             }
         }
-    }
-    let mut sub = match conn.consumer.subscribe_activity(get()).await {
-        Ok(sub) => sub,
-        Err(e) => {
-            shared.update(|s| s.activity.fail(control_fault(&e)));
-            put(None);
-            tokio::time::sleep(secs(5.0)).await;
-            return;
-        }
-    };
-    loop {
-        match sub.next().await {
-            Ok(Some(entry)) => {
-                put(Some(ActivityCursor {
-                    daemon_incarnation: entry.daemon_incarnation.clone(),
-                    seq: entry.seq,
-                }));
-                shared.update(|s| {
-                    let list = s.activity.value.get_or_insert_with(Vec::new);
-                    if !list.iter().any(|e| e.seq == entry.seq) {
-                        list.insert(0, entry);
-                        list.truncate(200);
-                    }
-                    s.activity.at = now();
-                    s.activity.error = None;
-                });
+        let since = shared.read(|s| s.ledger.head.clone());
+        let mut feed = match ledger.subscribe(since).await {
+            Ok(feed) => feed,
+            Err(FeedEnd::CursorRefused) => {
+                refill = true;
+                continue;
             }
-            Ok(None) => return,
-            Err(e) => {
-                let lagged = e.code().is_some_and(|c| c.contains("lag"));
-                if !lagged {
-                    shared.update(|s| s.activity.fail(e.to_string()));
-                    put(None);
-                    tokio::time::sleep(secs(2.0)).await;
+            Err(FeedEnd::Failed(e)) => {
+                shared.update(|s| s.activity.fail(e));
+                tokio::time::sleep(secs(5.0)).await;
+                return;
+            }
+            Err(FeedEnd::Ended | FeedEnd::Lagged) => {
+                tokio::time::sleep(secs(1.0)).await;
+                return;
+            }
+        };
+        shared.update(|s| s.record_feed_open(now()));
+        refill = false;
+        let end = loop {
+            tokio::select! {
+                next = feed.next() => match next {
+                    Ok(entry) => shared.update(|s| s.record_live_activity(entry, now())),
+                    Err(end) => break end,
+                },
+                _ = shared.activity_due.notified() => {
+                    if let Err(e) = serve_activity_view(&shared, &*ledger).await {
+                        shared.update(|s| s.activity.fail(e));
+                    }
                 }
+            }
+        };
+        shared.update(|s| s.ledger.open = false);
+        match end {
+            FeedEnd::Lagged => {}
+            FeedEnd::CursorRefused => refill = true,
+            FeedEnd::Ended => {
+                tokio::time::sleep(secs(1.0)).await;
+                return;
+            }
+            FeedEnd::Failed(e) => {
+                shared.update(|s| s.activity.fail(e));
+                tokio::time::sleep(secs(2.0)).await;
                 return;
             }
         }
+    }
+}
+
+/// Reads the newest pages until they reach an entry already loaded, or
+/// history ends (a label then marks the entries no longer kept). With
+/// nothing loaded that is one page. `take_head` makes the newest page's head
+/// the feed's head, for a feed that must subscribe again from it.
+async fn refill_top(
+    shared: &Shared,
+    ledger: &dyn LedgerSource,
+    take_head: bool,
+) -> Result<(), Fault> {
+    let mut refill = shared.read(|s| s.ledger.begin_refill(take_head));
+    let mut cursor = None;
+    loop {
+        let page = ledger.query(cursor).await?;
+        let mut next = None;
+        shared.update(|s| next = s.record_refill_page(&mut refill, page, now()));
+        match next {
+            Some(c) => cursor = Some(c),
+            None => return Ok(()),
+        }
+    }
+}
+
+/// Reads what the Activity view asked for: the newest entries again when
+/// they were dropped and the view is back at the top, and the next older
+/// page when the view reached the oldest loaded row.
+async fn serve_activity_view(shared: &Shared, ledger: &dyn LedgerSource) -> Result<(), Fault> {
+    if shared.read(State::top_refill_wanted) {
+        refill_top(shared, ledger, false).await?;
+    }
+    let mut older = None;
+    shared.update(|s| older = s.take_older_wanted());
+    if let Some(cursor) = older {
+        let page = ledger.query(Some(cursor)).await?;
+        shared.update(|s| s.record_older_page(page, now()));
+    }
+    Ok(())
+}
+
+/// The daemon's activity ledger.
+struct DaemonLedger(Arc<SubcConsumer>);
+
+impl LedgerSource for DaemonLedger {
+    fn query(&self, cursor: Option<u64>) -> BoxFuture<'_, Result<ActivityQueryResponse, Fault>> {
+        Box::pin(async move {
+            let query = ActivityQueryRequest {
+                agent: None,
+                project: None,
+                module: None,
+                kind: None,
+                since_ms: None,
+                until_ms: None,
+                limit: activity::PAGE,
+                cursor,
+            };
+            self.0
+                .query_activity(query)
+                .await
+                .map_err(|e| control_fault(&e))
+        })
+    }
+
+    fn subscribe(
+        &self,
+        since: Option<ActivityCursor>,
+    ) -> BoxFuture<'_, Result<Box<dyn LedgerFeed>, FeedEnd>> {
+        Box::pin(async move {
+            match self.0.subscribe_activity(since).await {
+                Ok(sub) => Ok(Box::new(DaemonFeed(sub)) as Box<dyn LedgerFeed>),
+                Err(e) => Err(FeedEnd::from_code(e.code(), control_fault(&e))),
+            }
+        })
+    }
+}
+
+/// The daemon's activity subscription.
+struct DaemonFeed(ActivitySubscription);
+
+impl LedgerFeed for DaemonFeed {
+    fn next(&mut self) -> BoxFuture<'_, Result<WireActivity, FeedEnd>> {
+        Box::pin(async move {
+            match self.0.next().await {
+                Ok(Some(entry)) => Ok(entry),
+                Ok(None) => Err(FeedEnd::Ended),
+                Err(e) => {
+                    let fault = match e.code() {
+                        Some(code) => Fault::code(code),
+                        None => Fault::sentence(e.to_string()),
+                    };
+                    Err(FeedEnd::from_code(e.code(), fault))
+                }
+            }
+        })
     }
 }
 
@@ -1047,6 +1176,16 @@ async fn handle_requests(shared: Arc<Shared>, mut rx: mpsc::UnboundedReceiver<Re
                     *d = wanted;
                     changed
                 });
+                // Away from Activity the ledger is read from the top, as
+                // Home and Modules show it.
+                if showing.tab != crate::model::Tab::Activity {
+                    shared.update(|s| s.ledger.anchor = None);
+                    shared.activity_due.notify_one();
+                }
+            }
+            Request::ActivityView { anchor, older } => {
+                shared.update(|s| s.set_activity_view(anchor, older));
+                shared.activity_due.notify_one();
             }
             Request::WatchLog(module) => {
                 shared.update(|s| s.focus = module);
@@ -1168,6 +1307,10 @@ async fn run_action(shared: Arc<Shared>, kind: ActionKind, module: String) {
 }
 
 #[cfg(test)]
+#[path = "activity_session_tests.rs"]
+mod activity_session_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::live::schedule::Showing;
@@ -1186,6 +1329,7 @@ mod tests {
             provenance_due: Notify::new(),
             log_due: Notify::new(),
             probe_due: Notify::new(),
+            activity_due: Notify::new(),
             demand: watch::Sender::new(schedule::wanted(&Showing::default())),
             identity_ready: Notify::new(),
             raw: Arc::default(),

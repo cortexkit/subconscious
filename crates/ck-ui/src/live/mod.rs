@@ -12,6 +12,7 @@
 //! When the connection fails or drops, the snapshot switches to the
 //! daemon-down screen and the layer tries again every two seconds.
 
+pub mod activity;
 pub mod map;
 mod run;
 pub mod schedule;
@@ -22,8 +23,7 @@ use std::sync::Arc;
 
 use subc_client_rs::{ServerDescription, SupervisorProvenanceResponse};
 use subc_control::{
-    ActivityEntry as WireActivity, SupervisorEntry, SupervisorHealthEntry, SupervisorHealthStatus,
-    SupervisorRouteModule,
+    SupervisorEntry, SupervisorHealthEntry, SupervisorHealthStatus, SupervisorRouteModule,
 };
 use tokio::sync::{mpsc, watch};
 
@@ -67,6 +67,10 @@ pub mod every {
     pub const LOG: f64 = 2.0;
     pub const PROVENANCE: f64 = 60.0;
     pub const TERMINALS: f64 = 30.0;
+    /// What a subscription-fed panel (the activity ledger, the spawn feed)
+    /// ages against once its subscription has closed. While it is open it
+    /// never ages, however quiet.
+    pub const CLOSED_FEED: f64 = 15.0;
     /// How often a down daemon is looked for again.
     pub const RECONNECT: f64 = 2.0;
 }
@@ -336,6 +340,8 @@ pub struct State {
     /// When each module's process last exited, as ck saw it.
     pub exits: HashMap<String, Timestamp>,
     pub spawn_feed: Part<()>,
+    /// Whether the spawn subscription is open now.
+    pub spawn_open: bool,
     /// Starts and exits, newest first.
     pub process_events: Vec<ProcessEvent>,
     pub cpu: CpuTracker,
@@ -350,8 +356,11 @@ pub struct State {
     pub residences: Part<HashMap<String, AgentResidence>>,
     pub places: Part<HashMap<String, String>>,
     pub counts: Part<(Option<u32>, Option<u32>)>,
-    /// Newest first.
-    pub activity: Part<Vec<WireActivity>>,
+    /// When the activity ledger was last heard from (a page, an entry, or
+    /// its subscription opening), and its latest error.
+    pub activity: Part<()>,
+    /// The activity ledger as loaded, and where its feed resumes.
+    pub ledger: activity::ActivityLedger,
     pub host: Part<HostFacts>,
     /// The module whose log is on screen.
     pub focus: Option<String>,
@@ -391,6 +400,7 @@ impl State {
             processes: HashMap::new(),
             exits: HashMap::new(),
             spawn_feed: Part::default(),
+            spawn_open: false,
             process_events: Vec::new(),
             cpu: CpuTracker::default(),
             build_samples: Vec::new(),
@@ -402,6 +412,7 @@ impl State {
             places: Part::default(),
             counts: Part::default(),
             activity: Part::default(),
+            ledger: activity::ActivityLedger::default(),
             host: Part::default(),
             focus: None,
             log: Part::default(),
@@ -695,19 +706,26 @@ pub fn assemble(state: &State, now: Timestamp) -> Snapshot {
         .as_deref()
         .map(map::agent_names)
         .unwrap_or_default();
-    let activity = state
-        .activity
-        .panel(None, |list| map::activity_rows(list, &names), Vec::new());
+    let activity = feed_panel(
+        &state.activity,
+        state.ledger.open,
+        state.home_activity(&names),
+        Vec::new(),
+    );
+    let activity_log = feed_panel(
+        &state.activity,
+        state.ledger.open,
+        state.activity_log(&names),
+        crate::model::ActivityLog::default(),
+    );
     let terminal_exits: Vec<ProcessEvent> = state.terminals.values().flatten().cloned().collect();
     let process_events = {
         let events = starts_and_exits(&state.process_events, &activity.data, &terminal_exits);
-        let mut p = if state.spawn_feed.value.is_some() {
-            state.spawn_feed.panel(None, |_| Vec::new(), Vec::new())
+        if state.spawn_feed.value.is_some() {
+            feed_panel(&state.spawn_feed, state.spawn_open, events, Vec::new())
         } else {
-            state.activity.panel(None, |_| Vec::new(), Vec::new())
-        };
-        p.data = events;
-        p
+            feed_panel(&state.activity, state.ledger.open, events, Vec::new())
+        }
     };
 
     let mut agents = state.identities.panel(
@@ -779,6 +797,7 @@ pub fn assemble(state: &State, now: Timestamp) -> Snapshot {
         backups,
         usage,
         activity,
+        activity_log,
         process_events,
         agents,
         devices,
@@ -818,6 +837,15 @@ pub fn palette_commands(modules: &[Module]) -> Vec<PaletteCommand> {
         out.push(cmd(format!("All metrics for {}", m.id), "Modules"));
     }
     out
+}
+
+/// A panel fed by a subscription: "live" while it is open, however quiet,
+/// since an open subscription would have said if anything happened. Once
+/// closed it keeps its error, if any, and ages from its last message
+/// against [`every::CLOSED_FEED`].
+fn feed_panel<U>(part: &Part<()>, open: bool, data: U, placeholder: U) -> Panel<U> {
+    let refresh = if open { None } else { Some(every::CLOSED_FEED) };
+    part.panel(refresh, |_| data, placeholder)
 }
 
 /// A panel fed by one module's health: an error while that module isn't
@@ -1088,12 +1116,7 @@ pub fn starts_and_exits(
     activity: &[ActivityEntry],
     exits: &[ProcessEvent],
 ) -> Vec<ProcessEvent> {
-    const SAME_MS: i64 = 10_000;
-    let near = |a: &ProcessEvent, b: &ProcessEvent| {
-        a.module == b.module
-            && a.kind == b.kind
-            && (a.at.unix_millis() - b.at.unix_millis()).abs() <= SAME_MS
-    };
+    let near = map::same_event;
     let ledger_starts: Vec<ProcessEvent> = activity
         .iter()
         .filter(|a| {

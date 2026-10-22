@@ -462,6 +462,99 @@ pub struct ProcessEvent {
     pub kind: ProcessEventKind,
 }
 
+/// Which row of the Activity list something is, stable while rows are
+/// added and dropped around it, so a selection can follow its row.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ActivityKey {
+    /// A ledger entry, by the identity the daemon gives it.
+    Entry { incarnation: String, seq: u64 },
+    /// A process exit, by its module and time.
+    Exit { module: String, at: Timestamp },
+    /// The "Entries here are no longer kept" label below the entry with
+    /// this seq.
+    Gap { below_seq: u64 },
+}
+
+/// What an Activity row is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActivityRowKind {
+    /// One ledger entry, or a restart and its start read as one.
+    Entry,
+    /// A process exit from the spawn feed or the daemon's retained exits.
+    Exit,
+    /// A dim label where entries between two loaded ranges are no longer
+    /// kept. It counts toward no total.
+    Gap,
+}
+
+/// One row of the Activity list.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ActivityRow {
+    pub key: ActivityKey,
+    /// The other entry a merged restart row stands for (its start), so a
+    /// selection on either finds the row.
+    pub partner: Option<ActivityKey>,
+    pub row: ActivityRowKind,
+    pub at: Timestamp,
+    /// The module the row is about.
+    pub subject: String,
+    /// What happened, without the subject: "restarted on build 9d8a178c".
+    pub what: String,
+    /// Who asked for it; `None` for exits and labels.
+    pub who: Option<String>,
+    /// The entry's kind as recorded ("subc.module_restarted"); `None` for
+    /// exits and labels.
+    pub kind: Option<String>,
+    pub seq: Option<u64>,
+    /// The build the row's start entry names: "<old 8> → <new 8>" when both
+    /// its evidences have a digest, else the new digest's 8 alone. Only when
+    /// the new evidence has a digest; a merged restart row takes it from
+    /// its start.
+    pub build: Option<String>,
+    /// The entry's details as recorded; `None` for exits and labels.
+    pub details: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+impl ActivityRow {
+    /// Whether `key` is this row: its own entry or the one merged into it.
+    pub fn is(&self, key: &ActivityKey) -> bool {
+        self.key == *key || self.partner.as_ref() == Some(key)
+    }
+
+    /// Whether the row counts toward the list's totals and the loaded cap:
+    /// every entry and exit row, never a label.
+    pub fn counts(&self) -> bool {
+        self.row != ActivityRowKind::Gap
+    }
+}
+
+/// The Activity list as loaded: the ledger merged with process exits,
+/// newest first.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ActivityLog {
+    pub rows: Vec<ActivityRow>,
+    /// Whether there is nothing older to load: the last page read was the
+    /// start of retained history (an empty ledger included).
+    pub history_exhausted: bool,
+    /// Whether newer entries exist than the first loaded row, dropped while
+    /// older pages were read; they are read again when the view returns to
+    /// the top.
+    pub newer_unloaded: bool,
+}
+
+impl ActivityLog {
+    /// The position of the row `key` names, whether it is the row's own
+    /// entry or the one merged into it.
+    pub fn position(&self, key: &ActivityKey) -> Option<usize> {
+        self.rows.iter().position(|r| r.is(key))
+    }
+
+    /// How many rows count toward totals: entries and exits, not labels.
+    pub fn counted(&self) -> usize {
+        self.rows.iter().filter(|r| r.counts()).count()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Agent {
     pub name: String,
@@ -542,6 +635,9 @@ pub struct Snapshot {
     pub backups: Panel<Backups>,
     pub usage: Panel<Usage>,
     pub activity: Panel<Vec<ActivityEntry>>,
+    /// The Activity screen's list: the ledger as loaded, merged with process
+    /// exits.
+    pub activity_log: Panel<ActivityLog>,
     pub process_events: Panel<Vec<ProcessEvent>>,
     pub agents: Panel<Agents>,
     pub devices: Panel<Devices>,
@@ -1143,6 +1239,8 @@ mod fixture {
                 },
             ),
             activity: Panel::new(now, activity),
+            // The Activity screen's own rows are not in the fixture yet.
+            activity_log: Panel::new(now, ActivityLog::default()),
             process_events: Panel::new(now, process_events),
             agents: Panel::new(now, agents),
             devices: Panel::new(now, devices),

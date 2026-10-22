@@ -21,8 +21,9 @@ use subc_protocol::Principal;
 
 use crate::metrics::{all_rows, pane_rows};
 use crate::model::{
-    Account, ActivityEntry, Agent, Agents, Backups, BuildServer, Device, Devices, Fault, LogLevel,
-    LogLine, Metric, Provider, Status, UsageWindow,
+    Account, ActivityEntry, ActivityKey, ActivityRow, ActivityRowKind, Agent, Agents, Backups,
+    BuildServer, Device, Devices, Fault, LogLevel, LogLine, Metric, ProcessEvent, ProcessEventKind,
+    Provider, Status, UsageWindow,
 };
 use crate::quota;
 use crate::time::{ago, Timestamp, UtcOffset};
@@ -1015,22 +1016,27 @@ pub fn agents(
 
 // ---- activity ------------------------------------------------------------------
 
+/// Who asked for an entry: the agent's display name when the actor carries
+/// an agent id, or the id itself while identity has no name for it; the
+/// module that acted; "direct" for a direct connection; "unverified" for an
+/// unverified one. Never "you": the daemon can't tell a person from a
+/// script.
+pub fn actor(e: &WireActivity, names: &HashMap<String, String>) -> String {
+    match (&e.actor.agent_id, &e.actor.principal) {
+        (Some(id), _) => names.get(id).cloned().unwrap_or_else(|| id.clone()),
+        (None, Principal::Reserved { module_id }) => module_id.clone(),
+        (None, Principal::Direct) => "direct".into(),
+        (None, Principal::Unverified) => "unverified".into(),
+    }
+}
+
 /// An activity entry as Home lists it: the subject it names (the module a
 /// lifecycle entry is about, else the module that recorded it), what
-/// happened, and who asked for it when the record says.
+/// happened, and who asked for it ([`actor`]).
 pub fn activity_entry(e: &WireActivity, names: &HashMap<String, String>) -> ActivityEntry {
     let subject = match &e.subject {
         Some(s) if s.subject_type == "module" => s.id.clone(),
         _ => e.module.clone(),
-    };
-    // Who asked, when the record names it: an agent (by its name, else its
-    // id), or the
-    // module that acted. A direct connection names nobody, so it shows
-    // nothing rather than the principal's kind.
-    let who = match (&e.actor.agent_id, &e.actor.principal) {
-        (Some(id), _) => names.get(id).cloned().unwrap_or_else(|| id.clone()),
-        (None, Principal::Reserved { module_id }) => module_id.clone(),
-        (None, Principal::Direct | Principal::Unverified) => String::new(),
     };
     let module_subject = e
         .subject
@@ -1042,7 +1048,7 @@ pub fn activity_entry(e: &WireActivity, names: &HashMap<String, String>) -> Acti
     };
     ActivityEntry {
         at: Timestamp::from_unix_millis(e.at_ms as i64),
-        who,
+        who: actor(e, names),
         subject,
         what,
         kind: kind_label(&e.kind),
@@ -1072,29 +1078,60 @@ fn module_id_of(e: &WireActivity) -> Option<&str> {
         .map(|s| s.id.as_str())
 }
 
-/// Whether a start entry's details say the process runs a different
-/// executable than before: the spawn evidence's inode changed.
-fn new_binary(started: &WireActivity) -> bool {
-    let inode = |k: &str| {
-        started
-            .details
-            .get(k)
-            .and_then(|e| e.get("inode"))
-            .and_then(Value::as_u64)
-    };
-    matches!((inode("new_evidence"), inode("old_evidence")), (Some(a), Some(b)) if a != b)
+/// A start entry's spawn evidence: the executable it runs now and the one
+/// before, each `None` when absent or `null`.
+fn evidence(started: &WireActivity) -> (Option<&Value>, Option<&Value>) {
+    let get = |k: &str| started.details.get(k).filter(|v| !v.is_null());
+    (get("new_evidence"), get("old_evidence"))
 }
 
-/// Home's activity rows from ledger entries, newest first. The daemon
-/// records a restart as `subc.module_restarted` and then, seconds later,
-/// `subc.module_started` for the same module; the pair reads as one
-/// "restarted" row, with " · new binary" when the start ran a different
-/// executable.
-pub fn activity_rows(
-    entries: &[WireActivity],
-    names: &HashMap<String, String>,
-) -> Vec<ActivityEntry> {
-    // Newest first, so the start that follows a restart sits before it.
+/// The first 8 characters of an evidence's `digest`, when it has a string
+/// one. Only Linux evidence (`linux_proc_sha256`) carries a digest.
+fn digest8(evidence: &Value) -> Option<String> {
+    evidence
+        .get("digest")
+        .and_then(Value::as_str)
+        .map(|d| d.chars().take(8).collect())
+}
+
+/// Whether a start entry's details say the process runs a different
+/// executable than before: both evidences are present and differ, whatever
+/// their method (a digest, a device and inode, a volume and file id, or a
+/// method this build doesn't know).
+pub fn new_binary(started: &WireActivity) -> bool {
+    matches!(evidence(started), (Some(new), Some(old)) if new != old)
+}
+
+/// What a restart did, as the Activity list says it after the subject:
+/// "restarted on build <first 8 of the new digest>" when the start's new
+/// evidence has a digest, else "restarted · new binary" when the executable
+/// changed ([`new_binary`]), else "restarted".
+pub fn restart_what(started: &WireActivity) -> String {
+    let (new, _) = evidence(started);
+    match new.and_then(digest8) {
+        Some(d) => format!("restarted on build {d}"),
+        None if new_binary(started) => "restarted · new binary".into(),
+        None => "restarted".into(),
+    }
+}
+
+/// The Build row for a start entry: "<old 8> → <new 8>" when both evidences
+/// have a digest, the new digest's 8 alone when only it does, and nothing
+/// when the new evidence has none.
+pub fn restart_build(started: &WireActivity) -> Option<String> {
+    let (new, old) = evidence(started);
+    let new = new.and_then(digest8)?;
+    Some(match old.and_then(digest8) {
+        Some(old) => format!("{old} → {new}"),
+        None => new,
+    })
+}
+
+/// Pairs each restart entry with the start entry the daemon recorded for the
+/// same module up to two minutes later. `entries` run newest first, so a
+/// restart's start sits before it. Returns the start paired with each
+/// restart, by index, and which entries were taken as a start.
+fn restart_pairs(entries: &[WireActivity]) -> (HashMap<usize, usize>, Vec<bool>) {
     let mut partner: HashMap<usize, usize> = HashMap::new();
     let mut taken = vec![false; entries.len()];
     for (i, e) in entries.iter().enumerate() {
@@ -1115,6 +1152,19 @@ pub fn activity_rows(
             partner.insert(i, j);
         }
     }
+    (partner, taken)
+}
+
+/// Home's activity rows from ledger entries, newest first. The daemon
+/// records a restart as `subc.module_restarted` and then, seconds later,
+/// `subc.module_started` for the same module; the pair reads as one
+/// "restarted" row, with " · new binary" when the start ran a different
+/// executable.
+pub fn activity_rows(
+    entries: &[WireActivity],
+    names: &HashMap<String, String>,
+) -> Vec<ActivityEntry> {
+    let (partner, taken) = restart_pairs(entries);
     entries
         .iter()
         .enumerate()
@@ -1131,6 +1181,114 @@ pub fn activity_rows(
             row
         })
         .collect()
+}
+
+/// The Activity list's rows for one contiguous run of ledger entries, newest
+/// first, with each restart and its start read as one row. A merged row is
+/// the restart's (its seq, kind, time and details) and takes its summary and
+/// Build row from the start's evidence. A start whose restart isn't loaded
+/// reads alone, with the Build row its own evidence gives.
+pub fn ledger_rows(entries: &[WireActivity], names: &HashMap<String, String>) -> Vec<ActivityRow> {
+    let (partner, taken) = restart_pairs(entries);
+    entries
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !taken[*i])
+        .map(|(i, e)| {
+            let base = activity_entry(e, names);
+            let started = partner.get(&i).map(|&j| &entries[j]);
+            let (what, build) = match started {
+                Some(s) => (restart_what(s), restart_build(s)),
+                None if e.kind == STARTED => (base.what, restart_build(e)),
+                None => (base.what, None),
+            };
+            ActivityRow {
+                key: entry_key(e),
+                partner: started.map(entry_key),
+                row: ActivityRowKind::Entry,
+                at: base.at,
+                subject: base.subject,
+                what,
+                who: Some(base.who),
+                kind: Some(e.kind.clone()),
+                seq: Some(e.seq),
+                build,
+                details: Some(e.details.clone()),
+            }
+        })
+        .collect()
+}
+
+/// A ledger entry's identity: its daemon incarnation and seq.
+pub fn entry_key(e: &WireActivity) -> ActivityKey {
+    ActivityKey::Entry {
+        incarnation: e.daemon_incarnation.clone(),
+        seq: e.seq,
+    }
+}
+
+/// A process exit as an Activity row: no seq, actor or details.
+pub fn exit_row(e: &ProcessEvent) -> ActivityRow {
+    ActivityRow {
+        key: ActivityKey::Exit {
+            module: e.module.clone(),
+            at: e.at,
+        },
+        partner: None,
+        row: ActivityRowKind::Exit,
+        at: e.at,
+        subject: e.module.clone(),
+        what: e.what.clone(),
+        who: None,
+        kind: None,
+        seq: None,
+        build: None,
+        details: None,
+    }
+}
+
+/// The label row between two loaded ranges whose entries in between are no
+/// longer kept, below the entry with `below_seq`.
+pub fn gap_row(below_seq: u64, at: Timestamp) -> ActivityRow {
+    ActivityRow {
+        key: ActivityKey::Gap { below_seq },
+        partner: None,
+        row: ActivityRowKind::Gap,
+        at,
+        subject: String::new(),
+        what: "Entries here are no longer kept".into(),
+        who: None,
+        kind: None,
+        seq: None,
+        build: None,
+        details: None,
+    }
+}
+
+/// Process exits, newest first: the spawn feed's exits and the ones the
+/// daemon retained (`supervisor.terminals`). The same exit in both (same
+/// module, within 10 s) is listed once, as the retained one, which says
+/// what the supervisor did next.
+pub fn process_exits(spawn: &[ProcessEvent], retained: &[ProcessEvent]) -> Vec<ProcessEvent> {
+    let exited = |e: &&ProcessEvent| e.kind == ProcessEventKind::Exited;
+    let mut out: Vec<ProcessEvent> = retained.iter().filter(exited).cloned().collect();
+    for e in spawn.iter().filter(exited) {
+        if !out.iter().any(|x| same_event(x, e)) {
+            out.push(e.clone());
+        }
+    }
+    out.sort_by_key(|e| std::cmp::Reverse(e.at));
+    out
+}
+
+/// Whether two process events are one event seen by two sources: the same
+/// module and kind, within 10 s of each other. Spawn events carry a pid and
+/// retained exits don't, so the time is what ties them.
+pub fn same_event(a: &ProcessEvent, b: &ProcessEvent) -> bool {
+    const SAME_MS: i64 = 10_000;
+    a.module == b.module
+        && a.kind == b.kind
+        && (a.at.unix_millis() - b.at.unix_millis()).abs() <= SAME_MS
 }
 
 // ---- logs ----------------------------------------------------------------------

@@ -52,6 +52,15 @@ pub enum Request {
     /// What is on screen now, which decides the sources that run: a module
     /// source runs only while a screen that shows its data is on screen.
     Show(crate::live::schedule::Showing),
+    /// Where the Activity list's view is: the row it is on (its selection,
+    /// `None` at the top), and whether it reached the oldest loaded row and
+    /// wants the next older page. The live layer keeps the rows nearest
+    /// that row loaded and reads the newest entries again when the view
+    /// returns to the top.
+    ActivityView {
+        anchor: Option<crate::model::ActivityKey>,
+        older: bool,
+    },
 }
 
 /// A question waiting for an answer before an action is sent.

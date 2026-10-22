@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.36.28
+
+- `server::CONNECTION_EGRESS_BYTE_BUDGET` is now defined as `subc_protocol::MAX_DELIVERED_FRAME_LEN`. The router refuses any module-to-client frame larger than the client connection's egress budget, so the budget is the delivered-frame limit modules size their replies against; deriving it from the protocol constant keeps the two from drifting. The value is unchanged (4 MiB), so behaviour is unchanged. Requires subc-protocol 0.32.9.
+
 ## 0.36.27
 
 - A planned daemon shutdown no longer logs a required capability as missing at ERROR (issue #139). During the ordered shutdown modules exit one by one, so a provider can deregister before a consumer that requires its capability; the requirement's verdict then becomes `never_provided`, and that was logged at ERROR although nothing was missing. Once the daemon has begun its announced shutdown (the same flag that stops respawns and records exits as `daemon_shutdown`), every `capability.requirement` event logs at INFO with `cause=daemon_shutdown`. Verdicts are computed exactly as before, so `route.open` refusals during the shutdown stay truthful. A provider that crashes or is stopped while the daemon keeps running still logs at ERROR.

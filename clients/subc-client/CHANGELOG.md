@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.22.7
+
+- Export `MAX_DELIVERED_FRAME_LEN` (4,194,304 bytes, header included), mirroring subc-protocol 0.32.9: the largest frame the daemon delivers from a module to a client. A module should keep each reply, stream frame, error, reverse request and push within it; a larger one is never forwarded. The golden conformance test checks it against the Rust fixture.
+
 ## 0.22.6
 
 - Managed `call()` / `callBinary()` now resend once after a data-plane ERROR `module_reloading`, matching subc-client-rs 0.30.3. The daemon answers a request on an established route with that code only while the module drains for a restart, reload or disable, and before forwarding it, so the module never received the request. The call evicts the cached route, reopens it (waiting out the drain's `route.open` refusals until the replacement registers) and resends. The resend shares the single resend budget with `unknown_channel` and `stale_route_epoch`, so a second refusal is thrown; it is skipped when the call's `signal` is already aborted, and when the call has a `timeoutMs` it uses only the time left of it. `isEstablishedRouteDead` is unchanged.

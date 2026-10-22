@@ -25,6 +25,7 @@ final class ProtocolConstantsTests: XCTestCase {
         let headerLen: Int
         let frozenPrefixLen: Int
         let maxFrameBodyLen: Int
+        let maxDeliveredFrameLen: Int
         let subscriptionFlag: Int
     }
 
@@ -59,6 +60,7 @@ final class ProtocolConstantsTests: XCTestCase {
         XCTAssertEqual(HEADER_LEN, rust.headerLen)
         XCTAssertEqual(FROZEN_PREFIX_LEN, rust.frozenPrefixLen)
         XCTAssertEqual(MAX_FRAME_BODY_LEN, rust.maxFrameBodyLen)
+        XCTAssertEqual(MAX_DELIVERED_FRAME_LEN, rust.maxDeliveredFrameLen)
         XCTAssertEqual(Int(SUBSCRIPTION_FLAG), rust.subscriptionFlag)
     }
 }

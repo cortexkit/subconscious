@@ -8,6 +8,13 @@ public let PROTOCOL_VERSION: UInt8 = 2
 public let HEADER_LEN = 21
 public let FROZEN_PREFIX_LEN = 5
 public let MAX_FRAME_BODY_LEN = 64 * 1024 * 1024
+/// Largest frame, `HEADER_LEN` included, that the daemon delivers from a module
+/// to a client (reply, stream frame, error, reverse request or push). A larger
+/// module frame is never forwarded: a reply, stream frame or error ends its
+/// request with `frame_too_large`, a reverse request is answered with an error
+/// to the module, and an unsolicited push closes the client connection.
+/// Client-to-module requests are bounded only by `MAX_FRAME_BODY_LEN`.
+public let MAX_DELIVERED_FRAME_LEN = 4 * 1024 * 1024
 public let DAEMON_ORIGIN_FLAG: UInt8 = 0x40
 public let SUBSCRIPTION_FLAG: UInt8 = 0x80
 

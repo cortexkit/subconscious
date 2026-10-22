@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.32.9
+
+- Add `MAX_DELIVERED_FRAME_LEN` (4,194,304 bytes, the 21-byte header included): the largest frame the daemon delivers from a module to a client, whether a reply, stream frame, error, reverse request or push. A larger module frame is never forwarded: a reply, stream frame or error ends its request with `frame_too_large`, a reverse request is answered with an error to the module, and an unsolicited push closes the client connection. Client-to-module requests are still bounded only by `MAX_FRAME_BODY_LEN`. The value is published in `tests/golden/protocol_constants.json` as `max_delivered_frame_len` for the TypeScript and Swift clients to compare against.
+
 ## 0.32.8
 
 - Add the daemon `scope-served-by/v1` capability constant; existing exhaustive control enums remain unchanged.

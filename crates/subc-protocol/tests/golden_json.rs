@@ -884,17 +884,19 @@ fn deployed_management_surface_manifest_without_concurrency_defaults_to_module_m
 }
 
 /// The wire constants are transcribed into all three client languages, and only
-/// three of the four are protected by anything.
+/// the byte-encoded ones were protected by anything.
 ///
 /// PROTOCOL_VERSION, HEADER_LEN and FROZEN_PREFIX_LEN all APPEAR IN ENCODED
 /// BYTES, so a value drifting in one language changes that language's output and
-/// the committed frame vectors catch it. MAX_FRAME_BODY_LEN is a THRESHOLD: it
-/// appears in no byte of any frame, so no byte-parity fixture can observe it.
+/// the committed frame vectors catch it. MAX_FRAME_BODY_LEN and
+/// MAX_DELIVERED_FRAME_LEN (the daemon's module-to-client frame limit) are
+/// THRESHOLDS: they appear in no byte of any frame, so no byte-parity fixture
+/// can observe them.
 ///
 /// What each language had instead was a test importing its OWN constant and
 /// asserting against itself -- true by construction in every language
 /// independently, and therefore silent if one of them changed. Rust referenced
-/// the constant in no test at all. A cap that drifted low would refuse frames a
+/// MAX_FRAME_BODY_LEN in no test at all. A cap that drifted low would refuse frames a
 /// peer considers legal; one that drifted high would accept an allocation the
 /// daemon refuses, and both surface as a live wire failure rather than a build
 /// one.
@@ -909,6 +911,7 @@ fn protocol_constants_are_published_for_cross_language_comparison() {
         "header_len": subc_protocol::HEADER_LEN,
         "frozen_prefix_len": subc_protocol::FROZEN_PREFIX_LEN,
         "max_frame_body_len": subc_protocol::MAX_FRAME_BODY_LEN,
+        "max_delivered_frame_len": subc_protocol::MAX_DELIVERED_FRAME_LEN,
         "subscription_flag": FLAG_SUBSCRIPTION,
     });
     let path = golden_path("protocol_constants");

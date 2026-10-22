@@ -40,8 +40,15 @@ use crate::{
 /// most a stuck client can make the daemon hold for it: 4 MiB per connection,
 /// so even 128 stuck connections stay near 512 MiB rather than growing without
 /// bound. A single frame larger than the whole budget is still admitted into an
-/// empty queue so it can be sent at all.
-pub const CONNECTION_EGRESS_BYTE_BUDGET: usize = 4 * 1024 * 1024;
+/// empty queue on send paths that do not check its size first.
+///
+/// The router, however, refuses a module-to-client frame whose header-plus-body
+/// size exceeds the client connection's budget before queueing it, so the budget
+/// is also the largest module-to-client frame the daemon delivers. Modules read
+/// that limit from `subc_protocol::MAX_DELIVERED_FRAME_LEN`, so the budget is
+/// defined as that constant; giving it a different value would make the
+/// published limit wrong.
+pub const CONNECTION_EGRESS_BYTE_BUDGET: usize = subc_protocol::MAX_DELIVERED_FRAME_LEN;
 /// Let a reading client drain a short fanout burst, but never park a module's
 /// frame reader for more than 250 ms. The atomic backlog age is measured from
 /// the enqueue time of the frame the writer is on, or of the frame that made

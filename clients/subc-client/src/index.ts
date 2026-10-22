@@ -66,6 +66,7 @@ export {
   SUBSCRIPTION_FLAG,
   PROTOCOL_VERSION,
   HEADER_LEN,
+  MAX_DELIVERED_FRAME_LEN,
   buildFrame,
   buildFrameWithVersion,
   buildFlags,

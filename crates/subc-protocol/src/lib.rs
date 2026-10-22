@@ -448,6 +448,20 @@ pub const FROZEN_PREFIX_LEN: usize = 5;
 /// different cap while preserving the frozen prefix.
 pub const MAX_FRAME_BODY_LEN: u32 = 64 * 1024 * 1024;
 
+/// Largest frame, `HEADER_LEN` included, that the daemon delivers from a module
+/// to a client: a reply, stream frame, error, reverse request or push. A module
+/// sizes what it sends to a client against this, not against
+/// `MAX_FRAME_BODY_LEN`.
+///
+/// A larger module frame is never forwarded to the client. A reply, stream
+/// frame or error that is too large ends its request with a `frame_too_large`
+/// error; a reverse request that is too large is answered with an error to the
+/// module; an unsolicited push that is too large closes the client connection.
+///
+/// Requests from a client to a module are not held to this limit; they are
+/// bounded only by `MAX_FRAME_BODY_LEN`.
+pub const MAX_DELIVERED_FRAME_LEN: usize = 4 * 1024 * 1024;
+
 /// Canonical JSON body for all subc-generated `ERROR` frames.
 ///
 /// `detail` is an optional machine-parsable surface for refusals whose remedy
@@ -907,6 +921,14 @@ mod tests {
             epoch,
             corr,
         }
+    }
+
+    /// Modules size their replies against this limit and the TypeScript and
+    /// Swift clients mirror it, so changing it must be a deliberate edit here
+    /// as well as in the constant.
+    #[test]
+    fn max_delivered_frame_len_is_four_mebibytes_including_the_header() {
+        assert_eq!(MAX_DELIVERED_FRAME_LEN, 4_194_304);
     }
 
     #[test]

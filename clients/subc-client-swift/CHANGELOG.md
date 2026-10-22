@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Add `MAX_DELIVERED_FRAME_LEN` (4,194,304 bytes, header included), mirroring subc-protocol 0.32.9: the largest frame the daemon delivers from a module to a client. A larger module frame is never forwarded. `ProtocolConstantsTests` checks it against the Rust fixture.
 - Decode the optional registry-row `capabilities` list only when it contains at most eight unique, byte-sorted tokens matching `^[a-z][a-z0-9-]{0,31}$`; expose the list on `RdvRegistryRow`. `servesFed` is true when the list contains `fed-serve`, meaning the computer says it accepts direct connections from paired devices. It is a routing hint only: it does not authenticate a peer or grant access, and a device still connects only to computers it has paired with.
 
 - Add test-only coverage verifying that two live clients for different peers can share one SQLite store without mixing peer state, and that concurrent store instances assign unique, durable sequence numbers to every mutation.

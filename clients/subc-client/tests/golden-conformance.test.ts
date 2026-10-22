@@ -19,6 +19,7 @@ import {
   FrameType,
   FROZEN_PREFIX_LEN,
   HEADER_LEN,
+  MAX_DELIVERED_FRAME_LEN,
   MAX_FRAME_BODY_LEN,
   PROTOCOL_VERSION,
   DAEMON_ORIGIN_FLAG,
@@ -416,6 +417,7 @@ describe("Rust golden fixtures", () => {
     expect(constants.header_len).toBe(HEADER_LEN);
     expect(constants.frozen_prefix_len).toBe(FROZEN_PREFIX_LEN);
     expect(constants.max_frame_body_len).toBe(MAX_FRAME_BODY_LEN);
+    expect(constants.max_delivered_frame_len).toBe(MAX_DELIVERED_FRAME_LEN);
     expect(constants.subscription_flag).toBe(SUBSCRIPTION_FLAG);
   });
 

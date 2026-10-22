@@ -1,6 +1,7 @@
 {
   "frozen_prefix_len": 5,
   "header_len": 21,
+  "max_delivered_frame_len": 4194304,
   "max_frame_body_len": 67108864,
   "min_supported_version": 2,
   "protocol_version": 2,

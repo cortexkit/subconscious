@@ -14,6 +14,7 @@ use super::{
     conversion::selected_components,
     file_modes,
     inventory::Inventory,
+    managed_replace,
     model::{
         Component, ComponentState, ConfigurationState, PlatformObservation, ReleaseAvailability,
         SetupObserved, SetupOperation, SetupRequest,
@@ -669,51 +670,18 @@ impl SetupBackend {
         } else {
             "ck-auth"
         });
-        #[cfg(unix)]
-        if let Some(key_path) = key_path {
-            if let Some(parent) = key_path.parent() {
-                if key_path.starts_with(&self.paths.data_dir) {
-                    file_modes::ensure_owned_directory(parent, 0o700)?;
-                } else {
-                    file_modes::ensure_private_parents(parent)?;
-                }
+        run_auth_bootstrap(&auth, key_path, &self.paths.data_dir, |mut command| {
+            let status = command
+                .status()
+                .map_err(|error| format!("could not run ck auth bootstrap: {error}"))?;
+            if status.success() {
+                Ok(())
+            } else {
+                Err(format!("ck auth bootstrap failed with {status}"))
             }
-        }
-        #[cfg(unix)]
-        let mut command = {
-            let mut command = Command::new("/bin/sh");
-            command
-                .args(["-c", "umask 077; exec \"$@\"", "ck-auth-bootstrap"])
-                .arg(auth);
-            command
-        };
-        #[cfg(not(unix))]
-        let mut command = Command::new(auth);
-        command.arg("bootstrap");
-        if let Some(key_path) = key_path {
-            command.arg("--key-path").arg(key_path);
-        }
-        let status = command
-            .status()
-            .map_err(|error| format!("could not run ck auth bootstrap: {error}"))?;
-        if status.success() {
-            if let Some(key_path) = key_path {
-                #[cfg(unix)]
-                if !fs::symlink_metadata(key_path)
-                    .is_ok_and(|metadata| metadata.file_type().is_file())
-                {
-                    return Err(format!(
-                        "claustrum key {} is not a regular file",
-                        key_path.display()
-                    ));
-                }
-                file_modes::tighten_owned_file(key_path, 0o600)?;
-            }
-            println!("  initialized claustrum credentials");
-            Ok(())
-        } else {
-            Err(format!("ck auth bootstrap failed with {status}"))
-        }
+        })?;
+        println!("  initialized claustrum credentials");
+        Ok(())
     }
 
     fn tighten_existing_permissions(&self) -> Result<(), String> {
@@ -831,10 +799,65 @@ impl SetupBackend {
     }
 }
 
+/// Runs `ck-auth bootstrap` through `run`, which executes the command and
+/// reports whether it succeeded. ck-auth refuses a key path whose folder does
+/// not exist, so any missing folders on the key path are created first, on
+/// every platform. On Unix, folders created here are owner-only (an existing
+/// key folder inside the CortexKit data folder is also narrowed to
+/// owner-only), and the command runs under umask 077 so the key it writes is
+/// private from the start. Windows creates the folders without changing their
+/// access: the default key lives under the per-user `%LOCALAPPDATA%`, whose
+/// inherited access already limits it to that user.
+fn run_auth_bootstrap(
+    auth: &Path,
+    key_path: Option<&Path>,
+    data_dir: &Path,
+    run: impl FnOnce(Command) -> Result<(), String>,
+) -> Result<(), String> {
+    if let Some(key_path) = key_path {
+        if let Some(parent) = key_path.parent() {
+            if key_path.starts_with(data_dir) {
+                file_modes::ensure_owned_directory(parent, 0o700)?;
+            } else {
+                file_modes::ensure_private_parents(parent)?;
+            }
+        }
+    }
+    #[cfg(unix)]
+    let mut command = {
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "umask 077; exec \"$@\"", "ck-auth-bootstrap"])
+            .arg(auth);
+        command
+    };
+    #[cfg(not(unix))]
+    let mut command = Command::new(auth);
+    command.arg("bootstrap");
+    if let Some(key_path) = key_path {
+        command.arg("--key-path").arg(key_path);
+    }
+    run(command)?;
+    if let Some(key_path) = key_path {
+        #[cfg(unix)]
+        if !fs::symlink_metadata(key_path).is_ok_and(|metadata| metadata.file_type().is_file()) {
+            return Err(format!(
+                "claustrum key {} is not a regular file",
+                key_path.display()
+            ));
+        }
+        file_modes::tighten_owned_file(key_path, 0o600)?;
+    }
+    Ok(())
+}
+
 impl SetupExecutor for SetupBackend {
     type Error = String;
 
     fn prepare_apply(&mut self, plan: &SetupPlan) -> Result<(), Self::Error> {
+        // An earlier upgrade on Windows may have left a previous binary image
+        // behind because its process was still running; it is free by now.
+        managed_replace::sweep_replaced_images(&mut self.inventory);
         if plan
             .operations
             .iter()
@@ -1299,6 +1322,50 @@ mod tests {
             runtime_status: RuntimeStatus::default(),
             uninstall_report: None,
             component_steps: BTreeMap::new(),
+        }
+    }
+
+    /// ck-auth refuses a key path whose directory is missing, so the directory
+    /// must exist by the time the command runs: the default one under the data
+    /// directory, and a custom one elsewhere.
+    #[test]
+    fn auth_bootstrap_creates_the_key_directory_before_ck_auth_runs() {
+        let root = ScratchDir::new("setup-auth-key-directory");
+        let data_dir = root.join("cortexkit");
+        fs::create_dir(&data_dir).unwrap();
+        let auth = data_dir.join("bin").join("ck-auth");
+        for key_path in [
+            data_dir.join("claustrum").join("master.key"),
+            root.join("custom").join("keys").join("master.key"),
+        ] {
+            let mut directory_existed = None;
+            let result = run_auth_bootstrap(&auth, Some(&key_path), &data_dir, |command| {
+                let args = command.get_args().collect::<Vec<_>>();
+                let flag = args
+                    .iter()
+                    .position(|arg| *arg == "--key-path")
+                    .expect("the command names the key path");
+                let commanded = Path::new(args[flag + 1]);
+                directory_existed = Some(commanded.parent().unwrap().is_dir());
+                // Stand in for ck-auth: write the key it was asked for, and
+                // refuse a key path whose directory is missing, as it does.
+                fs::write(commanded, "secret").map_err(|error| error.to_string())
+            });
+            assert_eq!(
+                directory_existed,
+                Some(true),
+                "{} must exist when ck-auth runs",
+                key_path.parent().unwrap().display()
+            );
+            result.unwrap();
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |path: PathBuf| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(data_dir.join("claustrum")), 0o700);
+            assert_eq!(mode(root.join("custom")), 0o700);
+            assert_eq!(mode(root.join("custom").join("keys")), 0o700);
         }
     }
 }

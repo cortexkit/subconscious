@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.20.118
+
+- `ck setup claustrum` creates the folder for the claustrum key before running `ck-auth bootstrap` on every platform. On a clean Windows machine the folder (`%LOCALAPPDATA%\cortexkit\claustrum`) did not exist yet, ck-auth refused the key path, and setup rolled back the changes it had made. Unix keeps creating it owner-only.
+- `ck upgrade` on Windows can replace a daemon or module binary while it is running. Windows refuses to overwrite the file of a running program but lets it be renamed, so the upgrade first renames the running binary to a temporary name beside it (`.ck-subc.exe.replaced-<pid>-<time>`), puts the new binary in its place, and lets the old process keep running until the restart the upgrade already does. The old file is deleted once the restarted binary is verified; if Windows still holds it then, the next `ck setup` or `ck upgrade` deletes it. If the new binary cannot be put in place, the old one is renamed back. An accepted rollback (`CK_UPGRADE_ROLLBACK=accept`) after a failed restart or verification uses the same step, so it works while the new binary is running: the new binary is renamed aside, the previous one is put back, and the next `ck setup` or `ck upgrade` deletes the renamed file once its process has exited. Unix replacement is unchanged.
+- A `ck upgrade` that fails before a binary was replaced no longer leaves its staging file (`.ck-subc.upgrade`) or its rollback copy (`ck-subc.exe.rollback` on Windows) in the bin folder; the folder is left as the upgrade found it. A failure after replacement still keeps the rollback copy, as before.
+
 ## 0.20.117
 
 - On Unix, `ck <domain>` replaces itself with the domain binary so signals reach the work being done and signal exits are preserved. Windows keeps spawning and waiting because console Ctrl-C and process-tree termination cover the child.

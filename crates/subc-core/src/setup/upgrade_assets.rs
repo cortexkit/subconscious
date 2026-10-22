@@ -92,7 +92,7 @@ pub struct PreparedUpgradeAsset {
 }
 
 impl PreparedUpgradeAsset {
-    #[cfg(all(test, unix))]
+    #[cfg(test)]
     pub(super) fn test_candidate(candidate: PathBuf, target: UpgradeTarget) -> Self {
         Self {
             names: convention_asset_names(target, AlphaTarget::LinuxX64),

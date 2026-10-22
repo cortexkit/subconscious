@@ -14,6 +14,7 @@ use super::{
     components::{installed_components, upgrade_roster},
     file_modes,
     inventory::Inventory,
+    managed_replace,
     model::{AlphaTarget, Component, UpgradeObserved, UpgradeTarget},
     release_index::ReleaseIndex,
     self_update,
@@ -325,6 +326,10 @@ pub struct SystemUpgradeBackend {
     activated_inodes: BTreeMap<String, String>,
     rollback_paths: BTreeMap<String, PathBuf>,
     rollback_archive_sha256: BTreeMap<String, Option<String>>,
+    /// Per target, where Windows replacement moved the previous image while
+    /// its process kept running. The image is deleted once the upgrade of
+    /// that target is verified.
+    replaced_images: BTreeMap<String, PathBuf>,
     expected_versions: BTreeMap<String, String>,
     /// The planner's `from` per target, empty for a binary that prints its own
     /// crate version (see `version_transition`). The completion line renders
@@ -352,8 +357,9 @@ impl SystemUpgradeBackend {
             }
         };
         let data_dir = load_current_inventory_root()?;
-        let inventory = load_current_inventory()?;
+        let mut inventory = load_current_inventory()?;
         tighten_upgrade_permissions(&data_dir, &inventory)?;
+        managed_replace::sweep_replaced_images(&mut inventory);
         let expected_versions = targets
             .iter()
             .map(|item| {
@@ -377,6 +383,7 @@ impl SystemUpgradeBackend {
             activated_inodes: BTreeMap::new(),
             rollback_paths: BTreeMap::new(),
             rollback_archive_sha256: BTreeMap::new(),
+            replaced_images: BTreeMap::new(),
             expected_versions,
             planned_from: BTreeMap::new(),
             supervised_modules: BTreeSet::new(),
@@ -637,6 +644,81 @@ impl SystemUpgradeBackend {
         self.inventory.save()
     }
 
+    fn place_candidate(
+        &mut self,
+        target: UpgradeTarget,
+        destination: &Path,
+        prepared: &PreparedUpgradeAsset,
+    ) -> Result<String, String> {
+        if target.is_self_replacing() {
+            let version = self.expected_version(target)?.to_string();
+            let evidence = self_update::replace_verified_candidate(
+                destination,
+                &prepared.candidate,
+                &prepared.archive_sha256,
+                &version,
+                &mut self.inventory,
+            )?;
+            self.activated_inodes
+                .insert(target.label().into(), destination_inode(destination)?);
+            return Ok(evidence.to_string());
+        }
+
+        let parent = destination.parent().ok_or_else(|| {
+            format!(
+                "managed destination {} has no parent",
+                destination.display()
+            )
+        })?;
+        file_modes::ensure_owned_directory(parent, 0o755)?;
+        let temporary = parent.join(format!(".{}.upgrade", target.label()));
+        file_modes::copy_file_with_mode(&prepared.candidate, &temporary, 0o755).map_err(
+            |error| {
+                format!(
+                    "could not place verified candidate at {}: {error}",
+                    temporary.display()
+                )
+            },
+        )?;
+        let aside = match managed_replace::place_staged_binary(
+            &temporary,
+            destination,
+            &mut self.inventory,
+        ) {
+            Ok(aside) => aside,
+            Err(error) => {
+                let _ = fs::remove_file(&temporary);
+                return Err(error);
+            }
+        };
+        let aside_note = aside
+            .as_ref()
+            .map(|aside| format!("; previous image moved aside to {}", aside.display()))
+            .unwrap_or_default();
+        if let Some(aside) = aside {
+            self.replaced_images.insert(target.label().into(), aside);
+        }
+        self.activated_inodes
+            .insert(target.label().into(), destination_inode(destination)?);
+        self.record_replacement_digest(target, destination, Some(&prepared.archive_sha256))?;
+        Ok(format!(
+            "destination replaced; inode={}{aside_note}",
+            destination_inode(destination)?
+        ))
+    }
+
+    fn discard_rollback_copy(&mut self, target: UpgradeTarget) {
+        if let Some(rollback) = self.rollback_paths.remove(target.label()) {
+            self.rollback_archive_sha256.remove(target.label());
+            if let Err(error) = fs::remove_file(&rollback) {
+                eprintln!(
+                    "warning: could not remove unused rollback copy {}: {error}",
+                    rollback.display()
+                );
+            }
+        }
+    }
+
     fn expected_version(&self, target: UpgradeTarget) -> Result<&str, String> {
         self.expected_versions
             .get(target.label())
@@ -679,53 +761,19 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
             .prepared
             .remove(target.label())
             .ok_or_else(|| format!("no verified candidate was prepared for {target}"))?;
-        if target.is_self_replacing() {
-            let version = self.expected_version(target)?.to_string();
-            let result = self_update::replace_verified_candidate(
-                &destination,
-                &prepared.candidate,
-                &prepared.archive_sha256,
-                &version,
-                &mut self.inventory,
-            );
-            prepared.cleanup();
-            let evidence = result?;
-            self.activated_inodes
-                .insert(target.label().into(), destination_inode(&destination)?);
-            return Ok(evidence.to_string());
-        }
-
-        let parent = destination.parent().ok_or_else(|| {
-            format!(
-                "managed destination {} has no parent",
-                destination.display()
-            )
-        })?;
-        file_modes::ensure_owned_directory(parent, 0o755)?;
-        let temporary = parent.join(format!(".{}.upgrade", target.label()));
-        file_modes::copy_file_with_mode(&prepared.candidate, &temporary, 0o755).map_err(
-            |error| {
-                format!(
-                    "could not place verified candidate at {}: {error}",
-                    temporary.display()
-                )
-            },
-        )?;
-        fs::rename(&temporary, &destination).map_err(|error| {
-            format!(
-                "could not replace managed destination {}: {error}",
-                destination.display()
-            )
-        })?;
-        let archive_sha256 = prepared.archive_sha256.clone();
-        self.activated_inodes
-            .insert(target.label().into(), destination_inode(&destination)?);
+        let prior_identity = destination_inode(&destination).ok();
+        let result = self.place_candidate(target, &destination, &prepared);
         prepared.cleanup();
-        self.record_replacement_digest(target, &destination, Some(&archive_sha256))?;
-        Ok(format!(
-            "destination replaced; inode={}",
-            destination_inode(&destination)?
-        ))
+        if result.is_err()
+            && prior_identity.is_some()
+            && destination_inode(&destination).ok() == prior_identity
+        {
+            // The destination still holds the binary it held before, so the
+            // rollback copy this run made of it is not needed. Removing it
+            // leaves the bin directory exactly as this run found it.
+            self.discard_rollback_copy(target);
+        }
+        result
     }
 
     fn warm_execute(&mut self, target: UpgradeTarget) -> Result<String, String> {
@@ -914,6 +962,18 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
                 ),
             }
         }
+        // By now the restarted process runs the new image, so the previous
+        // one is normally free to delete. If its process is still exiting,
+        // the inventory row stays and the next ck setup or ck upgrade
+        // deletes it.
+        if let Some(aside) = self.replaced_images.remove(target.label()) {
+            if let Err(error) = managed_replace::remove_replaced_image(&mut self.inventory, &aside)
+            {
+                eprintln!(
+                    "warning: upgrade completed but {error}; a later ck setup or ck upgrade removes it"
+                );
+            }
+        }
         println!("{}", self.completion_line(target));
     }
 
@@ -934,14 +994,24 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
             .ok_or_else(|| format!("no rollback copy exists for {target}"))?
             .clone();
         #[cfg(unix)]
-        if target.is_self_replacing() {
+        let moved_aside = if target.is_self_replacing() {
             super::self_update_unix::replace_verified_candidate(&destination, &rollback)?;
             file_modes::set_new_file_mode(&destination, 0o755)?;
+            None
         } else {
-            restore_rollback_by_rename(&rollback, &destination)?;
-        }
+            restore_rollback_by_rename(&rollback, &destination, &mut self.inventory, false)?
+        };
+        // Windows refuses to rename over the image of a running process, and
+        // a rollback usually follows a new image that did start, so the new
+        // image is moved aside first. Its process keeps running from there;
+        // the next ck setup or ck upgrade deletes the file once it is free.
         #[cfg(not(unix))]
-        restore_rollback_by_rename(&rollback, &destination)?;
+        let moved_aside = restore_rollback_by_rename(
+            &rollback,
+            &destination,
+            &mut self.inventory,
+            cfg!(windows),
+        )?;
         let previous_archive = self
             .rollback_archive_sha256
             .remove(target.label())
@@ -955,14 +1025,32 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
             )
         })?;
         self.rollback_paths.remove(target.label());
+        let aside_note = moved_aside
+            .map(|aside| {
+                format!(
+                    "; the replaced image was moved aside to {} until its process exits",
+                    aside.display()
+                )
+            })
+            .unwrap_or_default();
         Ok(format!(
-            "accepted; restored prior binary at inode={}",
+            "accepted; restored prior binary at inode={}{aside_note}",
             destination_inode(&destination)?
         ))
     }
 }
 
-fn restore_rollback_by_rename(rollback: &Path, destination: &Path) -> Result<(), String> {
+/// Copies the rollback copy beside `destination` and renames it into place,
+/// through the same step as a forward replacement: with `move_previous_aside`
+/// (Windows) the image at the destination is first moved aside and recorded
+/// for a later sweep, and the aside path is returned. The rollback copy itself
+/// is left for the caller to remove.
+fn restore_rollback_by_rename(
+    rollback: &Path,
+    destination: &Path,
+    inventory: &mut Inventory,
+    move_previous_aside: bool,
+) -> Result<Option<PathBuf>, String> {
     let parent = destination
         .parent()
         .ok_or_else(|| format!("{} has no parent", destination.display()))?;
@@ -993,12 +1081,8 @@ fn restore_rollback_by_rename(rollback: &Path, destination: &Path) -> Result<(),
             fs::set_permissions(&temporary, permissions)
                 .map_err(|error| format!("could not restore rollback mode: {error}"))?;
         }
-        fs::rename(&temporary, destination).map_err(|error| {
-            format!(
-                "could not rename rollback over {}: {error}",
-                destination.display()
-            )
-        })
+        managed_replace::place_with(&temporary, destination, inventory, move_previous_aside)
+            .map_err(|error| format!("could not put the rollback copy in place: {error}"))
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temporary);
@@ -1071,14 +1155,14 @@ fn process_id() -> u32 {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::Map;
     #[cfg(unix)]
-    use serde_json::{Map, Value};
+    use serde_json::Value;
 
     use super::*;
     #[cfg(unix)]
     use crate::setup::test_exec::{copy_executable, write_executable};
     use crate::setup::{components::ReleaseArtifactSource, planner::plan_upgrade};
-    #[cfg(unix)]
     use cortexkit_test_support::ScratchDir;
 
     fn upgrade_target(binary: &str) -> UpgradeTarget {
@@ -1199,6 +1283,7 @@ mod tests {
             .collect(),
             rollback_paths: BTreeMap::new(),
             rollback_archive_sha256: BTreeMap::new(),
+            replaced_images: BTreeMap::new(),
             expected_versions: [(target.label().to_string(), "0.1.0".into())]
                 .into_iter()
                 .collect(),
@@ -1378,6 +1463,319 @@ mod tests {
         assert!(error.contains("destination inode mismatch"), "{error}");
     }
 
+    /// A backend that owns one managed binary at `destination`, with the
+    /// inventory kept outside the binary's directory so tests can compare that
+    /// directory's whole listing. Builds on every platform: the destination
+    /// need not be executable until something runs it.
+    fn managed_backend(
+        root: &Path,
+        target: UpgradeTarget,
+        destination: &Path,
+    ) -> SystemUpgradeBackend {
+        let mut inventory =
+            Inventory::load(root.join("installer-manifest.json"), "linux-x64").unwrap();
+        inventory.record("managed-binary", destination, Map::new());
+        inventory.save().unwrap();
+        SystemUpgradeBackend {
+            platform: AlphaTarget::LinuxX64,
+            targets: BTreeMap::from([(
+                target.label().to_string(),
+                ManagedUpgradeTarget {
+                    target,
+                    destination: destination.to_path_buf(),
+                    installed_version: "0.1.0".into(),
+                    installed_archive_sha256: None,
+                },
+            )]),
+            executable: root.join("ck"),
+            subc: None,
+            assets: ReleaseUpgradeAssetFetcher::from_index(ReleaseIndex {
+                schema: 1,
+                channel: "alpha".into(),
+                generated_at_ms: 0,
+                components: BTreeMap::new(),
+            }),
+            inventory,
+            prepared: BTreeMap::new(),
+            activated_inodes: BTreeMap::new(),
+            rollback_paths: BTreeMap::new(),
+            rollback_archive_sha256: BTreeMap::new(),
+            replaced_images: BTreeMap::new(),
+            expected_versions: BTreeMap::from([(target.label().to_string(), "0.2.0".into())]),
+            planned_from: BTreeMap::new(),
+            supervised_modules: BTreeSet::new(),
+        }
+    }
+
+    /// Hands the backend a verified candidate with `bytes`, in its own
+    /// workspace outside the binary's directory, as `download_and_verify` would.
+    fn stage_candidate(
+        backend: &mut SystemUpgradeBackend,
+        root: &Path,
+        target: UpgradeTarget,
+        bytes: &[u8],
+    ) {
+        let workspace = root.join("candidate-workspace");
+        fs::create_dir(&workspace).unwrap();
+        let candidate = workspace.join("candidate");
+        fs::write(&candidate, bytes).unwrap();
+        backend.prepared.insert(
+            target.label().into(),
+            PreparedUpgradeAsset::test_candidate(candidate, target),
+        );
+    }
+
+    fn directory_entries(directory: &Path) -> Vec<String> {
+        let mut names = fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn a_replacement_refused_before_the_destination_changed_leaves_the_bin_directory_as_found() {
+        let root = ScratchDir::new("upgrade-refused-replacement");
+        let bin = root.join("bin");
+        fs::create_dir(&bin).unwrap();
+        let target = upgrade_target("ck-aft");
+        let destination = bin.join("ckdev-aft.exe");
+        fs::write(&destination, "original image").unwrap();
+        let mut backend = managed_backend(&root, target, &destination);
+        stage_candidate(&mut backend, &root, target, b"verified candidate");
+        let found = directory_entries(&bin);
+
+        backend.create_rollback_copy(target).unwrap();
+        let rollback = backend.rollback_paths[target.label()].clone();
+        assert!(rollback.is_file(), "{}", rollback.display());
+        // The staged candidate is the file whose rename is refused, the way
+        // Windows refuses to replace the image of a running process.
+        let _refusal = managed_replace::test_seam::refuse_rename_from(&bin.join(".ck-aft.upgrade"));
+        let error = backend
+            .replace_destination(target)
+            .expect_err("the refused rename fails the replacement");
+
+        assert!(error.contains("rename refused by test"), "{error}");
+        assert_eq!(fs::read(&destination).unwrap(), b"original image");
+        assert_eq!(
+            directory_entries(&bin),
+            found,
+            "no staging file, rollback copy or moved-aside image may remain"
+        );
+        assert!(!backend.rollback_paths.contains_key(target.label()));
+        assert!(backend
+            .inventory
+            .paths_for_kind(managed_replace::REPLACED_IMAGE_KIND)
+            .is_empty());
+    }
+
+    /// Starts a copy of this test binary at `destination` that keeps running,
+    /// standing in for a daemon or module the upgrade has not restarted yet.
+    #[cfg(windows)]
+    fn start_running_image(destination: &Path) -> std::process::Child {
+        fs::copy(std::env::current_exe().unwrap(), destination).unwrap();
+        let mut child = cortexkit_test_support::dev_command(destination)
+            .args([
+                "--exact",
+                "setup::upgrade::tests::rollback_stand_in_holds_until_killed",
+                "--test-threads=1",
+            ])
+            .env(ROLLBACK_HOLD_ENV, "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        // A stand-in that exited at once would prove nothing about replacing a
+        // running image, so fail loudly instead.
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "the stand-in for the running managed binary exited before the replacement"
+        );
+        child
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_replacement_moves_a_running_image_aside() {
+        let root = ScratchDir::new("upgrade-running-image");
+        let bin = root.join("bin");
+        fs::create_dir(&bin).unwrap();
+        let target = upgrade_target("ck-aft");
+        let destination = bin.join("ckdev-aft.exe");
+        let mut child = start_running_image(&destination);
+        let mut backend = managed_backend(&root, target, &destination);
+        stage_candidate(&mut backend, &root, target, b"verified candidate");
+        backend.create_rollback_copy(target).unwrap();
+
+        let result = backend.replace_destination(target);
+        let still_running = child.try_wait().unwrap().is_none();
+        let destination_bytes = fs::read(&destination);
+        let staging_left = bin.join(".ck-aft.upgrade").exists();
+        child.kill().unwrap();
+        child.wait().unwrap();
+
+        result.expect("replacing a running image succeeds");
+        assert!(
+            still_running,
+            "the old process keeps running from the aside file"
+        );
+        assert_eq!(destination_bytes.unwrap(), b"verified candidate");
+        assert!(
+            !staging_left,
+            "the staging file was renamed onto the destination"
+        );
+        let aside = backend.replaced_images[target.label()].clone();
+        assert!(aside.is_file(), "{}", aside.display());
+
+        // With the old process gone, completion deletes the aside image and
+        // the rollback copy. Windows can release an exited image a moment
+        // late; the sweep a later ck setup or ck upgrade runs covers that.
+        backend.completed(target);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while aside.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+            managed_replace::sweep_replaced_images(&mut backend.inventory);
+        }
+        assert_eq!(directory_entries(&bin), ["ckdev-aft.exe"]);
+        assert!(backend
+            .inventory
+            .paths_for_kind(managed_replace::REPLACED_IMAGE_KIND)
+            .is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_refused_replacement_moves_the_running_image_back() {
+        let root = ScratchDir::new("upgrade-running-image-restored");
+        let bin = root.join("bin");
+        fs::create_dir(&bin).unwrap();
+        let target = upgrade_target("ck-aft");
+        let destination = bin.join("ckdev-aft.exe");
+        let mut child = start_running_image(&destination);
+        let original = fs::read(&destination).unwrap();
+        let mut backend = managed_backend(&root, target, &destination);
+        stage_candidate(&mut backend, &root, target, b"verified candidate");
+        backend.create_rollback_copy(target).unwrap();
+
+        let _refusal = managed_replace::test_seam::refuse_rename_from(&bin.join(".ck-aft.upgrade"));
+        let result = backend.replace_destination(target);
+        let still_running = child.try_wait().unwrap().is_none();
+        let destination_bytes = fs::read(&destination);
+        let entries = directory_entries(&bin);
+        child.kill().unwrap();
+        child.wait().unwrap();
+
+        let error = result.expect_err("the refused rename fails the replacement");
+        assert!(error.contains("rename refused by test"), "{error}");
+        assert!(!error.contains("additionally"), "{error}");
+        assert!(still_running, "the running process is left alone");
+        assert_eq!(destination_bytes.unwrap(), original);
+        assert_eq!(
+            entries,
+            ["ckdev-aft.exe"],
+            "the image is back under its name and nothing else is left"
+        );
+        assert!(backend
+            .inventory
+            .paths_for_kind(managed_replace::REPLACED_IMAGE_KIND)
+            .is_empty());
+    }
+
+    /// The rollback goes through the same aside step as the forward
+    /// replacement. Forced on here so it runs on every platform; Windows takes
+    /// this path for real.
+    #[test]
+    fn rollback_restore_moves_the_replaced_image_aside_and_records_it() {
+        let root = ScratchDir::new("rollback-restore-aside");
+        let bin = root.join("bin");
+        fs::create_dir(&bin).unwrap();
+        let destination = bin.join("ckdev-aft.exe");
+        let rollback = bin.join("ckdev-aft.exe.rollback");
+        fs::write(&destination, "new image").unwrap();
+        fs::write(&rollback, "previous image").unwrap();
+        let mut inventory =
+            Inventory::load(root.join("installer-manifest.json"), "windows-x64").unwrap();
+
+        let aside = restore_rollback_by_rename(&rollback, &destination, &mut inventory, true)
+            .unwrap()
+            .expect("the replaced image is moved aside");
+
+        assert_eq!(fs::read(&destination).unwrap(), b"previous image");
+        assert_eq!(fs::read(&aside).unwrap(), b"new image");
+        assert!(inventory.owns_path(managed_replace::REPLACED_IMAGE_KIND, &aside));
+        let mut expected = vec![
+            aside.file_name().unwrap().to_string_lossy().into_owned(),
+            "ckdev-aft.exe".to_string(),
+            "ckdev-aft.exe.rollback".to_string(),
+        ];
+        expected.sort();
+        assert_eq!(
+            directory_entries(&bin),
+            expected,
+            "the staged copy was renamed into place; the rollback copy is the caller's to remove"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_rollback_moves_the_running_new_image_aside() {
+        let root = ScratchDir::new("rollback-running-image");
+        let bin = root.join("bin");
+        fs::create_dir(&bin).unwrap();
+        let target = upgrade_target("ck-aft");
+        let destination = bin.join("ckdev-aft.exe");
+        // The new image is running: the restarted module started but failed
+        // verification, and the operator accepted the rollback.
+        let mut child = start_running_image(&destination);
+        let mut backend = managed_backend(&root, target, &destination);
+        let rollback = bin.join("ckdev-aft.exe.rollback");
+        fs::write(&rollback, "previous release").unwrap();
+        backend
+            .rollback_paths
+            .insert(target.label().into(), rollback.clone());
+
+        let result = backend.rollback(target);
+        let still_running = child.try_wait().unwrap().is_none();
+        let destination_bytes = fs::read(&destination);
+        let recorded = backend
+            .inventory
+            .paths_for_kind(managed_replace::REPLACED_IMAGE_KIND);
+        child.kill().unwrap();
+        child.wait().unwrap();
+
+        let detail = result.expect("rolling back over a running image succeeds");
+        assert!(detail.contains("moved aside"), "{detail}");
+        assert!(
+            still_running,
+            "the new process keeps running from the aside file"
+        );
+        assert_eq!(destination_bytes.unwrap(), b"previous release");
+        assert!(!rollback.exists(), "a completed rollback removes its copy");
+        let [aside] = recorded.as_slice() else {
+            panic!("exactly one moved-aside image is recorded: {recorded:?}");
+        };
+        assert!(aside.is_file(), "{}", aside.display());
+
+        // With its process gone, the sweep a later ck setup or ck upgrade
+        // runs deletes the moved-aside image. Windows can release an exited
+        // image a moment late, so the sweep is retried briefly.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while aside.exists() && Instant::now() < deadline {
+            managed_replace::sweep_replaced_images(&mut backend.inventory);
+            if aside.exists() {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+        assert!(!aside.exists(), "{}", aside.display());
+        assert_eq!(directory_entries(&bin), ["ckdev-aft.exe"]);
+        assert!(backend
+            .inventory
+            .paths_for_kind(managed_replace::REPLACED_IMAGE_KIND)
+            .is_empty());
+    }
+
     #[cfg(unix)]
     #[test]
     fn train_release_post_verifies_the_binarys_own_version() {
@@ -1396,13 +1794,12 @@ mod tests {
 
     /// Environment variable that turns [`rollback_stand_in_holds_until_killed`]
     /// from an instant pass into a process that stays alive.
-    #[cfg(unix)]
     const ROLLBACK_HOLD_ENV: &str = "CK_ROLLBACK_TEST_HOLD";
 
     /// Run normally, this passes at once. Run from a copy of this test binary
-    /// with [`ROLLBACK_HOLD_ENV`] set, it keeps that copy running so the
-    /// rollback test below has a live executable to rename over.
-    #[cfg(unix)]
+    /// with [`ROLLBACK_HOLD_ENV`] set, it keeps that copy running so the tests
+    /// that replace or roll back a managed binary have a live executable at
+    /// the destination.
     #[test]
     fn rollback_stand_in_holds_until_killed() {
         if std::env::var_os(ROLLBACK_HOLD_ENV).is_some() {
@@ -1475,6 +1872,7 @@ mod tests {
             activated_inodes: BTreeMap::new(),
             rollback_paths: BTreeMap::from([(aft.label().to_string(), rollback)]),
             rollback_archive_sha256: BTreeMap::new(),
+            replaced_images: BTreeMap::new(),
             expected_versions: BTreeMap::new(),
             planned_from: BTreeMap::new(),
             supervised_modules: BTreeSet::new(),
@@ -1827,6 +2225,7 @@ exit 1
             activated_inodes: BTreeMap::new(),
             rollback_paths: BTreeMap::new(),
             rollback_archive_sha256: BTreeMap::new(),
+            replaced_images: BTreeMap::new(),
             expected_versions: [(aft.label().to_string(), "2.0.0".to_string())]
                 .into_iter()
                 .collect(),
@@ -1876,6 +2275,7 @@ exit 1
             activated_inodes: BTreeMap::new(),
             rollback_paths: BTreeMap::new(),
             rollback_archive_sha256: BTreeMap::new(),
+            replaced_images: BTreeMap::new(),
             expected_versions: [(mcp.label().to_string(), "0.17.36".to_string())]
                 .into_iter()
                 .collect(),

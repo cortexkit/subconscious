@@ -7,6 +7,7 @@ mod definition;
 mod detection;
 mod file_modes;
 mod inventory;
+mod managed_replace;
 mod mc_detection;
 mod model;
 mod planner;

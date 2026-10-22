@@ -98,6 +98,11 @@ pub struct TestDaemon {
     pub connection_file_path: PathBuf,
     pub temp_dir: ScratchDir,
     pub task: JoinHandle<Result<(), subc_daemon::ServerError>>,
+    /// The daemon's count of authenticated connections, the number
+    /// `server.describe` reports as `connected_clients`. Reading it here does
+    /// not open a connection, so a test can wait for an earlier connection's
+    /// close to land without changing the count it is waiting on.
+    pub connected_clients: ConnectedClients,
 }
 
 impl TestDaemon {
@@ -269,7 +274,7 @@ async fn start_test_daemon_inner(
     let forwarding = control.forwarding();
     let router = Arc::new(Router::with_control_handler(control));
     let auth = ServerAuth::new(conn.key, conn.daemon_id, conn.daemon_ver)
-        .with_connected_clients(connected_clients);
+        .with_connected_clients(connected_clients.clone());
     let task = tokio::spawn(serve_listener(listener, router, auth));
 
     TestDaemon {
@@ -278,6 +283,7 @@ async fn start_test_daemon_inner(
         connection_file_path,
         temp_dir,
         task,
+        connected_clients,
     }
 }
 

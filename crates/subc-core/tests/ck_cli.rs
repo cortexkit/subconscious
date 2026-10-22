@@ -87,6 +87,9 @@ async fn daemon_reports_and_renders_route_counters() {
     assert_eq!(response["counters"]["module_frames_dropped_no_route"], 0);
     assert_eq!(response["counters"]["route_release_stale_skipped"], 0);
 
+    // The `ck daemon --json` above has exited, but its connection counts until
+    // the daemon reads the close. The line below prints the count.
+    wait_for_connected_clients(&server, 0).await;
     let uptime_before = connection_file_elapsed(&server.connection_file_path);
     let output = ck_with_subc(&server.connection_file_path, ["daemon"]);
     assert_exit(&output, 0);
@@ -201,6 +204,10 @@ async fn bare_ck_renders_degraded_module_and_no_updates_byte_for_byte() {
         SupervisorHealthStatus::Degraded,
     )
     .await;
+    // Only the module's own connection may remain: the health wait's last
+    // connection counts until the daemon reads its close, and the summary
+    // below prints the count.
+    wait_for_connected_clients(&server, 1).await;
 
     let cache_dir = TempDir::new("ck-dashboard-current-cache");
     let cache = cache_dir.path().join("update-metadata.json");
@@ -5274,6 +5281,27 @@ async fn wait_for_supervisor_entry(
         }
         corr += 1;
         sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Waits until the daemon counts exactly `expected` authenticated connections.
+/// A connection that was just closed still counts until the daemon reads its
+/// end of stream, so a test that prints `connected_clients` waits here first;
+/// otherwise a slow runner reports one client too many. Reads the count
+/// in-process, so waiting opens no connection of its own.
+async fn wait_for_connected_clients(server: &TestServer, expected: u64) {
+    let deadline = Instant::now() + SETUP_TIMEOUT;
+    loop {
+        let count = server.connected_clients.count();
+        if count == expected {
+            return;
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "the daemon still counts {count} connections after {SETUP_TIMEOUT:?}; expected {expected}"
+            );
+        }
+        sleep(Duration::from_millis(10)).await;
     }
 }
 

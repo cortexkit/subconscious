@@ -114,7 +114,13 @@ no live route keeps an `owner_authorized` stamp its owner has lost. Providers re
 `owner_authorized` alone and keep no copy of the list (section 7).
 
 `workdir` and `project_id` are attribution, never authority. Owners send them after
-the daemon advertises `scope-workdir/v1` in `server.describe`. The daemon includes
+the daemon advertises `scope-workdir/v1` in `server.describe`. An owner sets
+`project_id` only to the `projectId` that Entorhinal's `resolve {path: workdir}`
+returns for the same folder, and leaves it out when Entorhinal has no project for
+that folder. It never invents an id or copies one from another session, because
+every reader groups the session under that project. The daemon can't check this:
+it treats the id as opaque and never calls Entorhinal, which it supervises. A reader
+that needs certainty resolves the `workdir` itself. The daemon includes
 them in a `route.bind` scope stamp only when the target manifest's
 `capabilities.provides` declares `scope-workdir/v1`; all other targets receive the
 same bind bytes as before. Bound scoped routes contribute their workdir to

@@ -1199,6 +1199,17 @@ mod tests {
     const TEST_DEADLINE: Duration = Duration::from_secs(2);
     const TEST_DAEMON_VER: &str = "test-subc-server";
 
+    /// Modules size their replies against the published limit, and the router
+    /// refuses any module frame over the egress budget, so the two must be the
+    /// same number. This fails if the budget is ever given its own value.
+    #[test]
+    fn egress_budget_is_the_published_delivered_frame_limit() {
+        assert_eq!(
+            CONNECTION_EGRESS_BYTE_BUDGET,
+            subc_protocol::MAX_DELIVERED_FRAME_LEN
+        );
+    }
+
     struct ObservedStream {
         inner: tokio::io::DuplexStream,
         write_blocked: Arc<tokio::sync::Notify>,

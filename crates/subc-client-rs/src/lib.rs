@@ -47,6 +47,9 @@ pub use async_trait::async_trait;
 pub use subc_control::{CatalogEntry, ConsumerIdentity};
 mod scope_served_by;
 pub use scope_served_by::{ScopeServedByAnswer, ScopeServedByReply};
+mod request_pools;
+use request_pools::{wait_for_permit, DispatchPools, PermitWaitOutcome, WaitingRequest};
+pub use request_pools::{RequestClass, RequestPool, RequestPoolSnapshot, RequestPools};
 /// The one launch-nonce reader for a module process: `launch_nonce()` reads
 /// the inherited Unix descriptor, the Windows named pipe, or, when neither is
 /// named, the `SUBC_LAUNCH_NONCE` environment copy once and caches it. The SDK's
@@ -91,7 +94,7 @@ use subc_transport::{
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufWriter},
     net::TcpStream,
-    sync::{mpsc, oneshot, Semaphore},
+    sync::{mpsc, oneshot},
     time::{timeout, timeout_at, Instant},
 };
 use tokio_util::sync::{CancellationToken, WaitForCancellationFuture};
@@ -322,11 +325,9 @@ pub type ModuleServeFuture = Pin<Box<dyn Future<Output = Result<(), SubcModuleEr
 #[derive(Clone)]
 struct RequestDispatcher {
     in_flight: InFlight,
-    permits: Arc<Semaphore>,
-    /// Stamped by data dispatch before spawning a task, cleared on acquisition
-    /// or task exit. This lock is never held over an await or handler work, so
-    /// health can read it without queueing behind the work it is measuring.
-    waiting: Arc<Mutex<HashMap<RequestKey, Instant>>>,
+    /// The connection's handler-slot pools, shared with its [`ModuleHandle`]
+    /// so the module can read their figures.
+    pools: Arc<DispatchPools>,
     /// One receiver per `on_draining` hook spawned on this connection, resolved
     /// once that hook has started running. The connection waits on them before
     /// acting on its end, so a hook is always called before the GOODBYE that
@@ -338,47 +339,27 @@ struct RequestDispatcher {
 }
 
 impl RequestDispatcher {
+    /// A dispatcher with the default pool only, as a module that declares no
+    /// classifier gets.
+    #[cfg(test)]
     fn new() -> Self {
+        Self::with_pools(Arc::new(DispatchPools::new(RequestPools::new())))
+    }
+
+    fn with_pools(pools: Arc<DispatchPools>) -> Self {
         Self {
             in_flight: Arc::new(Mutex::new(HashMap::new())),
-            permits: Arc::new(Semaphore::new(HANDLER_TASK_CAPACITY)),
-            waiting: Arc::new(Mutex::new(HashMap::new())),
+            pools,
             draining_hooks: Arc::new(Mutex::new(Vec::new())),
             undecodable_push_logged: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    fn start_waiting(&self, key: RequestKey) -> PermitWait {
-        self.waiting
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(key, Instant::now());
-        PermitWait {
-            waiting: Arc::clone(&self.waiting),
-            key,
-        }
-    }
-
     fn fold_health(&self, mut report: HealthReport) -> HealthReport {
-        let waiting = self
-            .waiting
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let available = self.permits.available_permits();
-        let oldest_wait = waiting.values().min().map(Instant::elapsed);
-        drop(waiting);
-        if let Some(age) =
-            oldest_wait.filter(|age| available == 0 && *age > DISPATCH_SATURATION_WAIT)
-        {
+        if let Some(saturation) = self.pools.saturation() {
             if report.status == HealthStatus::Ok {
                 report.status = HealthStatus::Degraded;
             }
-            let saturation = format!(
-                "request dispatch saturated: {}/{} in use, oldest waiting {:.1} s",
-                HANDLER_TASK_CAPACITY - available,
-                HANDLER_TASK_CAPACITY,
-                age.as_secs_f64(),
-            );
             report.detail = Some(match report.detail {
                 Some(detail) => format!("{saturation}; {detail}"),
                 None => saturation,
@@ -412,7 +393,7 @@ impl RequestDispatcher {
     /// when the connection ends: each request task holds a sender to the egress
     /// channel, so until they finish the writer never sees the channel close.
     fn cancel_all(&self) {
-        self.permits.close();
+        self.pools.close();
         let cancelled = match self.in_flight.lock() {
             Ok(mut guard) => guard.drain().map(|(_, token)| token).collect::<Vec<_>>(),
             Err(poisoned) => poisoned
@@ -424,24 +405,6 @@ impl RequestDispatcher {
         for cancellation in cancelled {
             cancellation.cancel();
         }
-    }
-}
-
-/// Holds this request's entry in the dispatcher's `waiting` map (when it started
-/// waiting for a handler slot, which health reports as the oldest wait) and removes
-/// it on drop, so the entry goes even if the queued task exits on connection close
-/// or panics.
-struct PermitWait {
-    waiting: Arc<Mutex<HashMap<RequestKey, Instant>>>,
-    key: RequestKey,
-}
-
-impl Drop for PermitWait {
-    fn drop(&mut self) {
-        self.waiting
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(&self.key);
     }
 }
 
@@ -467,6 +430,9 @@ struct ModuleHandleShared {
     live_routes: Mutex<HashMap<u16, RouteHandle>>,
     dropped_route_frames: AtomicU64,
     close_token: CancellationToken,
+    /// The handler-slot pools this connection's dispatcher uses. Replaced once,
+    /// with the pools the module's handler declares, before serving starts.
+    dispatch_pools: Mutex<Arc<DispatchPools>>,
     inner: Mutex<ModuleHandleState>,
 }
 
@@ -516,6 +482,7 @@ impl ModuleHandle {
                 live_routes: Mutex::new(HashMap::new()),
                 dropped_route_frames: AtomicU64::new(0),
                 close_token,
+                dispatch_pools: Mutex::new(Arc::new(DispatchPools::new(RequestPools::new()))),
                 inner: Mutex::new(ModuleHandleState {
                     writer: Some(writer),
                     next_corr: Some(HELLO_CORR + 1),
@@ -1530,12 +1497,14 @@ pub trait ModuleHandler: Send + Sync + 'static {
     /// saturation check.
     ///
     /// The serve helper calls this when the daemon sends `health.check`, on a
-    /// task of its own rather than one of the 64 data-request slots, so a health
-    /// check never waits behind the requests it reports on. It then folds in
-    /// dispatch saturation: if all 64 slots are in use and a request has waited
-    /// more than two seconds for one, an `Ok` reply becomes `Degraded`, and the
-    /// slot count and oldest wait are prepended to `detail`. A `Degraded` or
-    /// `Failing` status, the module's own detail and its metrics are kept.
+    /// task of its own rather than in a handler-slot pool, so a health check
+    /// never waits behind the requests it reports on. It then folds in
+    /// dispatch saturation: if every slot of a pool is in use and a request
+    /// has waited more than two seconds for one, an `Ok` reply becomes
+    /// `Degraded`, and the pool's slot count and oldest wait are prepended to
+    /// `detail` (naming the pool when the module declared a long-held pool in
+    /// [`ModuleHandler::request_pools`]). A `Degraded` or `Failing` status,
+    /// the module's own detail and its metrics are kept.
     ///
     /// An implementation must not block: no blocking lock, no disk access and
     /// no subprocess on this path. Derive the status from signals the dispatch
@@ -1564,6 +1533,41 @@ pub trait ModuleHandler: Send + Sync + 'static {
 
     /// A route was torn down, rejected, or abandoned before its bind ACK was queued.
     async fn on_route_gone(&self, _handle: &RouteHandle) {}
+
+    /// How this module's data requests share handler slots. Called once per
+    /// connection, before the serve loop reads its first frame after HELLO_ACK.
+    ///
+    /// Each data request waits for a slot before [`ModuleHandler::handle`]
+    /// runs and holds it until `handle` returns. The default is one pool of
+    /// 64 slots for every request, waited for in arrival order. A module whose
+    /// requests can be held for minutes should declare a long-held pool for
+    /// them, so they cannot take every slot and leave short requests queued
+    /// behind them where the daemon cannot see:
+    ///
+    /// ```
+    /// use subc_client_rs::{RequestClass, RequestPools};
+    ///
+    /// fn request_pools() -> RequestPools {
+    ///     RequestPools::new().with_long_held(16, |body| {
+    ///         if body.starts_with(br#"{"op":"research.run""#) {
+    ///             RequestClass::long_held().with_op("research.run")
+    ///         } else {
+    ///             RequestClass::default_pool()
+    ///         }
+    ///     })
+    /// }
+    /// # let _ = request_pools();
+    /// ```
+    ///
+    /// A request that waits two seconds for a slot is logged once at WARN
+    /// while it is still waiting. While the connection is open, a request
+    /// cancelled while waiting is answered `cancelled` at once; when the
+    /// connection ends, waiting requests end without a reply, as before.
+    /// [`ModuleHandle::request_pool_snapshots`]
+    /// reports each pool's figures. Health checks never use a pool.
+    fn request_pools(&self) -> RequestPools {
+        RequestPools::new()
+    }
 
     /// The daemon has started draining this module: it will stop it for
     /// `reason` (a restart, reload, disable, or the daemon's own shutdown), and
@@ -1977,6 +1981,10 @@ where
     H: ModuleHandler,
 {
     let serve_handle = handle.clone();
+    // Before the caller gets the future (and before the serve loop reads its
+    // first frame after HELLO_ACK), so the
+    // handle's pool figures describe the pools the dispatcher will use.
+    handle.install_dispatch_pools(handler.request_pools());
     Box::pin(async move {
         // Connection loss ends this serve future. Module serving retains no
         // reconnect task or in-flight reconnect gate; a supervisor that needs
@@ -2039,7 +2047,7 @@ where
     R: AsyncRead + Unpin,
     H: ModuleHandler,
 {
-    let dispatcher = RequestDispatcher::new();
+    let dispatcher = RequestDispatcher::with_pools(module_handle.dispatch_pools());
     let result = serve_frames(&mut reader, &egress, &handler, &module_handle, &dispatcher).await;
     // A drain notice is followed shortly by the daemon's GOODBYE, and the two
     // can arrive in one read. Let every drain hook start before the
@@ -2286,32 +2294,40 @@ where
     };
     let body = frame.body;
     let in_flight = Arc::clone(&dispatcher.in_flight);
-    let permits = Arc::clone(&dispatcher.permits);
-    let waiting = dispatcher.start_waiting((handle.channel, handle.epoch, corr));
+    // The module's classifier picks the pool from the raw body before the
+    // request takes a slot; the SDK passes the body on without interpreting it.
+    let (pool, op) = dispatcher.pools.classify(&body);
+    let pool = pool.clone();
+    let wait = pool.start_waiting((handle.channel, handle.epoch, corr));
     tokio::spawn(async move {
-        let Ok(_permit) = permits.acquire_owned().await else {
-            // A closed dispatcher means connection teardown will release every route credit.
-            if let Ok(mut guard) = in_flight.lock() {
-                guard.remove(&(handle.channel, handle.epoch, corr));
-            }
-            return;
+        let waiting = WaitingRequest {
+            op,
+            channel: handle.channel,
+            corr,
         };
-        drop(waiting);
-        if ctx.cancelled.is_cancelled() {
-            let _ = send_handler_outcome(
-                &ctx,
-                HandlerOutcome::Error {
-                    code: "cancelled".to_string(),
-                    message: "request cancelled".to_string(),
-                },
-            )
-            .await;
-            if let Ok(mut guard) = in_flight.lock() {
-                guard.remove(&(handle.channel, handle.epoch, corr));
+        let permit = match wait_for_permit(&pool, wait, waiting, &ctx.cancelled).await {
+            PermitWaitOutcome::Acquired(permit) => Some(permit),
+            // Cancelled while waiting: answered below at once, without a
+            // slot, rather than after one frees.
+            PermitWaitOutcome::Cancelled => None,
+            PermitWaitOutcome::Closed => {
+                // A closed dispatcher means connection teardown will release every route credit.
+                if let Ok(mut guard) = in_flight.lock() {
+                    guard.remove(&(handle.channel, handle.epoch, corr));
+                }
+                return;
             }
-            return;
-        }
-        let outcome = handler.handle(ctx.clone(), body).await;
+        };
+        // A slot and the cancellation can become ready together and the slot
+        // is taken first, so check again before running the handler.
+        let outcome = if permit.is_none() || ctx.cancelled.is_cancelled() {
+            HandlerOutcome::Error {
+                code: "cancelled".to_string(),
+                message: "request cancelled".to_string(),
+            }
+        } else {
+            handler.handle(ctx.clone(), body).await
+        };
         let _ = send_handler_outcome(&ctx, outcome).await;
         if let Ok(mut guard) = in_flight.lock() {
             guard.remove(&(handle.channel, handle.epoch, corr));
@@ -2884,6 +2900,7 @@ mod tests {
     use serde_json::json;
 
     use subc_protocol::manifest::{Concurrency, ExecutionMode, IdentityScope, Tool};
+    use tokio::sync::Semaphore;
     use tokio::time::{advance, timeout};
 
     use super::*;
@@ -3593,8 +3610,11 @@ mod tests {
             self.wait_for_entered(HANDLER_TASK_CAPACITY).await;
             self.request(HANDLER_TASK_CAPACITY as u64 + 1).await;
             tokio::task::yield_now().await;
-            assert_eq!(self.dispatcher.permits.available_permits(), 0);
-            assert_eq!(self.dispatcher.waiting.lock().unwrap().len(), 1);
+            assert_eq!(self.dispatcher.pools.default.permits.available_permits(), 0);
+            assert_eq!(
+                self.dispatcher.pools.default.waiting.lock().unwrap().len(),
+                1
+            );
             assert_eq!(
                 self.handler.entered.load(Ordering::SeqCst),
                 HANDLER_TASK_CAPACITY
@@ -3634,10 +3654,17 @@ mod tests {
                 assert_eq!(frame.header.ty, FrameType::StreamEnd);
                 assert_eq!(frame.header.channel, 7);
             }
-            assert!(self.dispatcher.waiting.lock().unwrap().is_empty());
+            assert!(self
+                .dispatcher
+                .pools
+                .default
+                .waiting
+                .lock()
+                .unwrap()
+                .is_empty());
             assert!(self.dispatcher.in_flight.lock().unwrap().is_empty());
             assert_eq!(
-                self.dispatcher.permits.available_permits(),
+                self.dispatcher.pools.default.permits.available_permits(),
                 HANDLER_TASK_CAPACITY
             );
         }
@@ -3726,8 +3753,11 @@ mod tests {
         }
     }
 
+    /// A request cancelled while it waits for a handler slot is answered
+    /// `cancelled` at once: it does not wait for a slot to free just to say
+    /// so, it never takes one, and its handler never runs.
     #[tokio::test]
-    async fn cancelled_capacity_queued_data_request_emits_terminal_and_skips_handler() {
+    async fn cancelled_capacity_queued_data_request_is_answered_without_waiting_for_a_slot() {
         let (tx, mut rx) = mpsc::channel(4);
         let entered = Arc::new(Mutex::new(Vec::new()));
         let release_first = Arc::new(Semaphore::new(0));
@@ -3735,10 +3765,9 @@ mod tests {
             entered: Arc::clone(&entered),
             release_first: Arc::clone(&release_first),
         });
-        let dispatcher = RequestDispatcher {
-            permits: Arc::new(Semaphore::new(1)),
-            ..RequestDispatcher::new()
-        };
+        let dispatcher = RequestDispatcher::with_pools(Arc::new(
+            DispatchPools::with_default_limit(1, RequestPools::new()),
+        ));
         let (module_handle, _unused_rx) = test_module_handle(&[]);
         module_handle
             .install_route(RouteHandle::new(7, 1, 1))
@@ -3802,27 +3831,11 @@ mod tests {
             "cancel must land while the second request waits for handler capacity"
         );
 
-        release_first.add_permits(1);
-        timeout(Duration::from_secs(1), async {
-            while !dispatcher.in_flight.lock().unwrap().is_empty() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-
-        assert_eq!(*entered.lock().unwrap(), vec![1]);
-        assert!(dispatcher.waiting.lock().unwrap().is_empty());
-        let response = timeout(Duration::from_secs(1), rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(response.header.ty, FrameType::Response);
-        assert_eq!(response.header.corr, 1);
-
+        // The first request still holds the only slot, so the answer below
+        // cannot have come from a slot freeing.
         let cancelled = timeout(Duration::from_secs(1), rx.recv())
             .await
-            .unwrap()
+            .expect("a request cancelled while waiting must be answered without waiting for a slot")
             .unwrap();
         assert_eq!(cancelled.header.ty, FrameType::Error);
         assert_eq!(cancelled.header.channel, 7);
@@ -3836,6 +3849,38 @@ mod tests {
                 detail: None,
             }
         );
+        timeout(Duration::from_secs(1), async {
+            while dispatcher
+                .in_flight
+                .lock()
+                .unwrap()
+                .contains_key(&(7, 1, 2))
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(dispatcher.pools.default.permits.available_permits(), 0);
+        assert!(dispatcher.pools.default.waiting.lock().unwrap().is_empty());
+        assert_eq!(*entered.lock().unwrap(), vec![1]);
+
+        release_first.add_permits(1);
+        let response = timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.header.ty, FrameType::Response);
+        assert_eq!(response.header.corr, 1);
+        timeout(Duration::from_secs(1), async {
+            while !dispatcher.in_flight.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(*entered.lock().unwrap(), vec![1]);
+        assert_eq!(dispatcher.pools.default.permits.available_permits(), 1);
         assert!(timeout(Duration::from_millis(50), rx.recv()).await.is_err());
     }
 
@@ -4608,6 +4653,9 @@ mod module_close_tests {
 
 #[cfg(test)]
 mod operator_confirm_tests;
+
+#[cfg(test)]
+mod request_pool_tests;
 
 #[cfg(test)]
 mod detailed_error_body_tests {

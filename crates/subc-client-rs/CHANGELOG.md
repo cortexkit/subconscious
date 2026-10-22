@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.30.9
+
+- A served module can keep requests that are held for minutes from taking every handler slot. Until now every data request waited, in arrival order, for one of 64 slots and held it until its handler returned, so a burst of long requests left short ones queued behind them where the daemon could not see them. Implement the new `ModuleHandler::request_pools` and return `RequestPools::new().with_long_held(limit, classifier)`: the classifier gets each request's raw body before the request takes a slot and returns a `RequestClass` (`RequestClass::long_held()` or `RequestClass::default_pool()`, optionally `.with_op("label")`). Long-held requests then wait only for one of `limit` slots of their own, and the default pool's 64 slots stay free for everything else. The classifier runs on the connection's frame reader, so keep it a cheap peek at the operation name; a panic sends the request to the default pool. A module that does not implement `request_pools` keeps the single default pool of 64 slots.
+- For every module: a request that has waited two seconds for a slot is logged once at WARN while it is still waiting, with its operation label (`<none>` when it has none), pool, the pool's slots in use and limit, and its route channel and corr; never its body. While the connection is open, a request cancelled while it waits for a slot is now answered `cancelled` at once, without running its handler, instead of after a slot frees. When the connection ends, waiting requests still end without a reply.
+- `ModuleHandle::request_pool_snapshots` returns each pool's slots in use, limit, waiting requests and oldest wait (`RequestPoolSnapshot`). Health saturation is reported per pool; with a long-held pool declared each sentence names its pool (`request dispatch saturated in the long_held pool: ...`), and without one the wording is unchanged. Health checks still never wait for a slot.
+- `RequestPool`, `RequestClass`, `RequestPools` and `RequestPoolSnapshot` are `#[non_exhaustive]`.
+
 ## 0.30.8
 
 - Mark every held subscription request with `FLAG_SUBSCRIPTION` so module drains exclude it from their quiescence wait; ordinary requests remain unmarked.

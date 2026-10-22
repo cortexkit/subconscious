@@ -2,7 +2,7 @@
 //! and confirmations.
 
 use crate::draw::{pad_right, trunc, width, Canvas, Clip};
-use crate::model::{PaletteCommand, Serves};
+use crate::model::{PaletteCommand, Serves, Tab, TabSet};
 use crate::theme::{Bg, Fg, St};
 
 /// Whether every character of `query` (spaces ignored) appears in `text` in
@@ -107,14 +107,49 @@ pub fn palette(
     c.put(x + 2, y + hd - 2, "↑↓ choose · ⏎ run · esc close", St::F);
 }
 
+/// The palette commands that apply to the tabs that show: a command that
+/// switches to a tab, or that belongs to a tab's area, is left out while
+/// that tab is hidden. Other commands (the keys page, the theme, quitting,
+/// the daemon) always apply.
+pub fn shown_commands(commands: &[PaletteCommand], visible: TabSet) -> Vec<PaletteCommand> {
+    let hidden = |name: &str| Tab::from_name(name).is_some_and(|t| !visible.contains(t));
+    commands
+        .iter()
+        .filter(|c| !hidden(&c.area) && !(c.area == "App" && hidden(&c.title)))
+        .cloned()
+        .collect()
+}
+
+/// The number keys of the tabs that show, runs of neighbours joined: "1 –
+/// 3, 7" while tabs 4 to 6 are hidden. Numbers never shift, so the gaps say
+/// which keys do nothing.
+pub fn tab_keys(visible: TabSet) -> String {
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    for n in visible.iter().map(Tab::number) {
+        match runs.last_mut() {
+            Some((_, end)) if *end + 1 == n => *end = n,
+            _ => runs.push((n, n)),
+        }
+    }
+    runs.iter()
+        .map(|&(a, b)| {
+            if a == b {
+                a.to_string()
+            } else {
+                format!("{a} – {b}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// The keys page's three columns: (title, rows of key and action). Only
-/// keys the app serves are listed.
-pub fn help_columns(serves: Serves) -> [(&'static str, Vec<(String, &'static str)>); 3] {
-    let tabs = if serves.tabs > 1 {
-        format!("1 – {}", serves.tabs)
-    } else {
-        "1".to_string()
-    };
+/// keys the app serves are listed, and only the tab keys of `visible`.
+pub fn help_columns(
+    serves: Serves,
+    visible: TabSet,
+) -> [(&'static str, Vec<(String, &'static str)>); 3] {
+    let tabs = tab_keys(visible);
     let everywhere = vec![
         (tabs, "switch tab"),
         (":".into(), "commands"),
@@ -124,7 +159,7 @@ pub fn help_columns(serves: Serves) -> [(&'static str, Vec<(String, &'static str
         ("q".into(), "quit"),
     ];
     let mut lists = vec![("↑↓ j k".into(), "move"), ("⏎".into(), "open")];
-    if serves.list_filter {
+    if !serves.list_filter.and(visible).is_empty() {
         lists.push(("/".into(), "filter"));
     }
     lists.push(("g G".into(), "top, bottom"));
@@ -152,8 +187,9 @@ pub fn help_columns(serves: Serves) -> [(&'static str, Vec<(String, &'static str
 
 /// The keys page. In a window too small for the whole page, the box shrinks
 /// to the window and its contents are cut at the box's edges. Keys for
-/// features `serves` doesn't have are left out.
-pub fn help(c: &mut Canvas, serves: Serves) {
+/// features `serves` doesn't have, and of tabs not in `visible`, are left
+/// out.
+pub fn help(c: &mut Canvas, serves: Serves, visible: TabSet) {
     c.dim_all();
     let wd = 100.min(c.w - 4);
     let hd = 26.min(c.h - 2);
@@ -166,11 +202,17 @@ pub fn help(c: &mut Canvas, serves: Serves) {
         x1: x + wd - 1,
         y1: y + hd - 1,
     });
-    for ((title, rows), cx) in help_columns(serves).iter().zip([x + 4, x + 36, x + 66]) {
+    for ((title, rows), cx) in help_columns(serves, visible)
+        .iter()
+        .zip([x + 4, x + 36, x + 66])
+    {
         c.put(cx, y + 2, title, St::B);
         for (i, (k, t)) in rows.iter().enumerate() {
-            c.put(cx, y + 4 + i as i32, &pad_right(k, 8), St::A);
-            c.put(cx + 8, y + 4 + i as i32, t, St::NONE);
+            // A key wider than its column, such as tab numbers with several
+            // gaps, pushes its action right rather than running into it.
+            let kw = 8.max(width(k) as i32 + 2);
+            c.put(cx, y + 4 + i as i32, &pad_right(k, kw as usize), St::A);
+            c.put(cx + kw, y + 4 + i as i32, t, St::NONE);
         }
     }
     c.put(x + 4, y + 13, "Mouse", St::B);

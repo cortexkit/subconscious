@@ -7,7 +7,7 @@ use std::cell::RefCell;
 use std::io::{self, Write};
 use std::rc::Rc;
 
-use ck_ui::app::{App, Overlay, RawMode, Tab, TerminalGuard};
+use ck_ui::app::{App, Overlay, RawMode, Tab, TerminalGuard, TextField};
 use ck_ui::draw::{footer, Canvas};
 use ck_ui::theme::{choose_mode, parse_osc11, theme_for, Bg, Mode, Osc11Collector, St, Theme};
 use ck_ui::Snapshot;
@@ -153,6 +153,11 @@ fn every_size_renders_without_panicking() {
         (Tab::Modules, None),
         (Tab::Home, Some(Overlay::Palette)),
         (Tab::Modules, Some(Overlay::Help)),
+        (Tab::Activity, None),
+        (Tab::Usage, None),
+        (Tab::Agents, None),
+        (Tab::Devices, None),
+        (Tab::Settings, None),
     ] {
         let mut app = App::new(Theme::test());
         app.tab = tab;
@@ -162,7 +167,7 @@ fn every_size_renders_without_panicking() {
         apps.push((app, &snap));
     }
     apps.push((App::new(Theme::test()), &down));
-    // 15,400 sizes for each of five screens: spread the widths over threads.
+    // 15,400 sizes for each screen: spread the widths over threads.
     let threads = std::thread::available_parallelism().map_or(2, |n| n.get()) as u16;
     std::thread::scope(|scope| {
         for t in 0..threads {
@@ -300,21 +305,41 @@ fn mouse_clicks_tabs_and_rows_and_scrolls_the_selection() {
     app.handle_event(&scroll(MouseEventKind::ScrollUp), &snap, (120, 36));
     app.handle_event(&scroll(MouseEventKind::ScrollUp), &snap, (120, 36));
     assert_eq!(app.mod_sel, 4);
-    // A later screen's tab does nothing yet.
-    assert!(!app.handle_event(&click(41, 0), &snap, (120, 36)));
-    assert_eq!(app.tab, Tab::Modules);
     assert!(app.handle_event(&click(18, 0), &snap, (120, 36)));
+    assert_eq!(app.tab, Tab::Home);
+    // The fixture serves every tab, so each one the bar draws opens.
+    assert!(app.handle_event(&click(41, 0), &snap, (120, 36)));
+    assert_eq!(app.tab, Tab::Activity);
+    // The live app's bar has no Activity, so the same place does nothing.
+    let mut live = Snapshot::fixture();
+    live.serves = ck_ui::model::Serves::LIVE;
+    let mut app = App::new(Theme::test());
+    assert!(!app.handle_event(&click(41, 0), &live, (120, 36)));
     assert_eq!(app.tab, Tab::Home);
 }
 
 #[test]
 fn quit_keys_and_later_screens_keys() {
+    // Every number key reaches its own tab while that tab shows: the
+    // fixture serves them all and its roster has every module they need.
     let snap = Snapshot::fixture();
     let mut app = App::new(Theme::light());
+    for tab in Tab::ALL {
+        assert!(app.handle_key(key(KeyCode::Char(tab.key())), &snap));
+        assert_eq!(app.tab, tab);
+    }
+    // The live app serves Home and Modules: the later screens' keys do
+    // nothing there.
+    let mut live = Snapshot::fixture();
+    live.serves = ck_ui::model::Serves::LIVE;
+    let mut app = App::new(Theme::light());
     for k in '3'..='7' {
-        assert!(!app.handle_key(key(KeyCode::Char(k)), &snap));
+        assert!(!app.handle_key(key(KeyCode::Char(k)), &live));
         assert_eq!(app.tab, Tab::Home);
     }
+    assert!(app.handle_key(key(KeyCode::Char('2')), &live));
+    assert_eq!(app.tab, Tab::Modules);
+    app.tab = Tab::Home;
     press(&mut app, &snap, KeyCode::Char('t'));
     assert_eq!(app.theme.mode(), Mode::Dark);
     press(&mut app, &snap, KeyCode::Char('q'));
@@ -475,4 +500,46 @@ fn the_reply_is_rebuilt_from_crossterm_key_events() {
     let mut collector = Osc11Collector::default();
     collector.feed(&Event::Key(key(KeyCode::Char('x'))));
     assert_eq!(collector.reply(), None);
+}
+
+#[test]
+fn a_text_field_takes_printable_keys_before_any_app_key() {
+    let snap = Snapshot::fixture();
+    let mut app = App::new(Theme::light());
+    app.field = Some(TextField::default());
+    for ch in "quit".chars() {
+        assert!(app.handle_key(key(KeyCode::Char(ch)), &snap));
+    }
+    assert!(!app.quit, "q typed into the field doesn't quit");
+    assert!(app.requests.is_empty(), "typing sends nothing");
+    // Digits, the theme key, help and the palette key type too.
+    for ch in "2t?:Q".chars() {
+        assert!(app.handle_key(key(KeyCode::Char(ch)), &snap));
+    }
+    assert_eq!(app.field.as_ref().unwrap().text, "quit2t?:Q");
+    assert_eq!(app.tab, Tab::Home);
+    assert_eq!(app.overlay, None);
+    assert_eq!(app.theme.mode(), Mode::Light);
+    assert!(!app.quit);
+    // Ctrl with a letter is swallowed rather than opening the palette.
+    app.handle_key(
+        KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
+        &snap,
+    );
+    assert_eq!(app.overlay, None);
+    press(&mut app, &snap, KeyCode::Backspace);
+    assert_eq!(app.field.as_ref().unwrap().text, "quit2t?:");
+    assert!(app.requests.is_empty());
+    // Esc closes the field, and then the keys act again.
+    press(&mut app, &snap, KeyCode::Esc);
+    assert!(app.field.is_none());
+    press(&mut app, &snap, KeyCode::Char('2'));
+    assert_eq!(app.tab, Tab::Modules);
+    // Ctrl-c always quits.
+    app.field = Some(TextField::default());
+    app.handle_key(
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        &snap,
+    );
+    assert!(app.quit);
 }

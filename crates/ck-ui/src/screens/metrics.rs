@@ -3,7 +3,7 @@
 //! shows only the few the module names as its headline; this is the rest.
 
 use crate::draw::{chrome, frame_end, pad_right, trunc, width, Canvas};
-use crate::model::Module;
+use crate::model::{Module, Tab};
 use crate::theme::St;
 use crate::time::ago;
 
@@ -17,8 +17,8 @@ pub fn rows(h: i32) -> usize {
 pub fn draw(c: &mut Canvas, v: &View, m: &Module, scroll: usize) {
     chrome(
         c,
-        1,
-        v.snap.serves.tabs,
+        Tab::Modules,
+        v.snap.visible_tabs(),
         &v.clock(),
         &v.snap.host.data.label,
     );

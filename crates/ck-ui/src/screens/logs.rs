@@ -6,7 +6,7 @@
 //! and `n` moves to the next of them. The level chips do hide lines.
 
 use crate::draw::{chrome, frame_end, live_dot, trunc, width, Canvas};
-use crate::model::{LogLevel, LogLine, LogView, Panel};
+use crate::model::{LogLevel, LogLine, LogView, Panel, Tab};
 use crate::theme::{Bg, St};
 
 use super::View;
@@ -89,8 +89,8 @@ pub fn draw(c: &mut Canvas, v: &View, panel: &Panel<LogView>, state: &LogState) 
     let view = &panel.data;
     chrome(
         c,
-        1,
-        v.snap.serves.tabs,
+        Tab::Modules,
+        v.snap.visible_tabs(),
         &v.clock(),
         &v.snap.host.data.label,
     );

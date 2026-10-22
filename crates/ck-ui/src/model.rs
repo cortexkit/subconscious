@@ -555,20 +555,154 @@ pub struct Snapshot {
     pub serves: Serves,
 }
 
+/// The app's tabs, in the order the tab bar draws them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Tab {
+    Home,
+    Modules,
+    Activity,
+    Usage,
+    Agents,
+    Devices,
+    Settings,
+}
+
+impl Tab {
+    /// Every tab, in bar order.
+    pub const ALL: [Tab; 7] = [
+        Tab::Home,
+        Tab::Modules,
+        Tab::Activity,
+        Tab::Usage,
+        Tab::Agents,
+        Tab::Devices,
+        Tab::Settings,
+    ];
+
+    /// The tab's number, which is also its key: Home 1 through Settings 7.
+    /// A tab keeps its number while others are hidden, so a key always
+    /// means the same tab.
+    pub const fn number(self) -> usize {
+        self as usize + 1
+    }
+
+    /// The key that switches to the tab.
+    pub fn key(self) -> char {
+        char::from(b'0' + self.number() as u8)
+    }
+
+    /// The tab a number key names, whether or not that tab is showing.
+    pub fn from_key(ch: char) -> Option<Tab> {
+        let n = ch.to_digit(10)? as usize;
+        Tab::ALL.get(n.checked_sub(1)?).copied()
+    }
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Tab::Home => "Home",
+            Tab::Modules => "Modules",
+            Tab::Activity => "Activity",
+            Tab::Usage => "Usage",
+            Tab::Agents => "Agents",
+            Tab::Devices => "Devices",
+            Tab::Settings => "Settings",
+        }
+    }
+
+    /// The tab with this name, as the palette and the bar spell it.
+    pub fn from_name(name: &str) -> Option<Tab> {
+        Tab::ALL.into_iter().find(|t| t.name() == name)
+    }
+
+    /// The module whose data the tab shows, when the tab has nothing to show
+    /// without it: the tab is hidden while that module isn't in the
+    /// supervisor's roster. Home, Modules, Activity and Settings come from
+    /// the daemon itself and need none.
+    pub fn needs_module(self) -> Option<&'static str> {
+        use crate::live::modules;
+        match self {
+            Tab::Usage => Some(modules::USAGE),
+            Tab::Agents => Some(modules::IDENTITY),
+            Tab::Devices => Some(modules::DEVICES),
+            Tab::Home | Tab::Modules | Tab::Activity | Tab::Settings => None,
+        }
+    }
+
+    const fn bit(self) -> u8 {
+        1 << self as u8
+    }
+}
+
+/// A set of tabs, iterated in bar order.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct TabSet(u8);
+
+impl TabSet {
+    pub const EMPTY: TabSet = TabSet(0);
+    pub const ALL: TabSet = TabSet::of(&Tab::ALL);
+
+    pub const fn of(tabs: &[Tab]) -> TabSet {
+        let mut bits = 0;
+        let mut i = 0;
+        while i < tabs.len() {
+            bits |= tabs[i].bit();
+            i += 1;
+        }
+        TabSet(bits)
+    }
+
+    pub const fn contains(self, tab: Tab) -> bool {
+        self.0 & tab.bit() != 0
+    }
+
+    pub const fn with(self, tab: Tab) -> TabSet {
+        TabSet(self.0 | tab.bit())
+    }
+
+    pub const fn without(self, tab: Tab) -> TabSet {
+        TabSet(self.0 & !tab.bit())
+    }
+
+    /// The tabs in both sets.
+    pub const fn and(self, other: TabSet) -> TabSet {
+        TabSet(self.0 & other.0)
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    pub fn len(self) -> usize {
+        self.0.count_ones() as usize
+    }
+
+    pub fn iter(self) -> impl Iterator<Item = Tab> {
+        Tab::ALL.into_iter().filter(move |t| self.contains(*t))
+    }
+}
+
+impl FromIterator<Tab> for TabSet {
+    fn from_iter<I: IntoIterator<Item = Tab>>(iter: I) -> TabSet {
+        iter.into_iter().fold(TabSet::EMPTY, TabSet::with)
+    }
+}
+
 /// The keys and screens a build of the app serves. Hints, the keys page and
 /// the tab bar list only these, so nothing on screen offers an action the
 /// app can't take. The fixture serves the whole design; the live app
 /// serves what has been built so far.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Serves {
-    /// How many of the tabs, in order, have a screen.
-    pub tabs: usize,
+    /// The tabs that have a screen. Whether a served tab shows also depends
+    /// on the roster: see [`Snapshot::visible_tabs`].
+    pub tabs: TabSet,
     /// `e`: the Settings screen.
     pub settings: bool,
     /// `w`: restart without downtime (a blue/green swap).
     pub swap: bool,
-    /// `/`: filtering a list.
-    pub list_filter: bool,
+    /// The tabs whose list `/` filters. Each tab's filter is served on its
+    /// own, so serving one tab's filter never advertises another's.
+    pub list_filter: TabSet,
     /// Space: selecting several list rows.
     pub multi_select: bool,
     /// Double-click to open.
@@ -584,10 +718,12 @@ pub struct Serves {
 impl Serves {
     /// Everything the design draws.
     pub const DESIGN: Serves = Serves {
-        tabs: 7,
+        tabs: TabSet::ALL,
         settings: true,
         swap: true,
-        list_filter: true,
+        // The design draws a filter on these lists, and none on Home,
+        // Usage or Devices.
+        list_filter: TabSet::of(&[Tab::Modules, Tab::Activity, Tab::Agents, Tab::Settings]),
         multi_select: true,
         double_click: true,
         ckni: true,
@@ -598,10 +734,10 @@ impl Serves {
 
     /// What the live app does today: Home and Modules.
     pub const LIVE: Serves = Serves {
-        tabs: 2,
+        tabs: TabSet::of(&[Tab::Home, Tab::Modules]),
         settings: false,
         swap: false,
-        list_filter: false,
+        list_filter: TabSet::EMPTY,
         multi_select: false,
         double_click: false,
         ckni: false,
@@ -611,6 +747,22 @@ impl Serves {
 }
 
 impl Snapshot {
+    /// The tabs that show: the served tabs whose module, if they need one
+    /// (see [`Tab::needs_module`]), is in the supervisor's roster, enabled
+    /// or not, running or not. Until the first roster arrives, no tab that
+    /// needs a module shows. The tab bar, the number keys, the palette and
+    /// the keys page all follow this one set.
+    pub fn visible_tabs(&self) -> TabSet {
+        self.serves
+            .tabs
+            .iter()
+            .filter(|t| match t.needs_module() {
+                None => true,
+                Some(id) => self.modules.loaded && self.modules.data.iter().any(|m| m.id == id),
+            })
+            .collect()
+    }
+
     /// Modules whose status isn't ok, in roster order.
     pub fn attention(&self) -> Vec<&Module> {
         self.modules

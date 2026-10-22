@@ -9,9 +9,9 @@
 
 use crate::draw::{
     bar, chrome, frame_end, heading_st, live_dot, pad_left, pad_right, spark, status_glyph, trunc,
-    use_fg, width, Canvas,
+    use_fg, width, Canvas, USAGE_MAX_W,
 };
-use crate::model::{ActivityEntry, Agent, Daemon, FaultKind, Panel, Provider, Status};
+use crate::model::{ActivityEntry, Agent, Daemon, FaultKind, Panel, Provider, Status, Tab};
 use crate::theme::{Bg, Fg, St};
 use crate::time::{ago, ago_short, js_round, locale_number, thousands, to_fixed};
 
@@ -650,7 +650,10 @@ fn usage_list(
         c.put(
             bx,
             y,
-            &more_providers(providers.len() - shown, v.snap.serves.tabs >= 4),
+            &more_providers(
+                providers.len() - shown,
+                v.snap.visible_tabs().contains(Tab::Usage),
+            ),
             St::F,
         );
     }
@@ -731,7 +734,13 @@ fn agent_list(c: &mut Canvas, v: &View, (cx, top, cw, last): (i32, i32, i32, i32
 
 fn draw_regular(c: &mut Canvas, v: &View) {
     let snap = v.snap;
-    chrome(c, 0, snap.serves.tabs, &v.clock(), &snap.host.data.label);
+    chrome(
+        c,
+        Tab::Home,
+        snap.visible_tabs(),
+        &v.clock(),
+        &snap.host.data.label,
+    );
     let total = snap.modules.data.len();
     let last = c.h - 4;
 
@@ -972,13 +981,15 @@ fn short_id(id: &str) -> String {
 
 // ---- 150 columns and up ------------------------------------------------------
 
-/// The widest the large layout's Usage panel gets. Past it the bars would
-/// stretch without saying more; This Mac takes the extra width instead.
-const USAGE_MAX_W: i32 = 64;
-
 fn draw_large(c: &mut Canvas, v: &View) {
     let snap = v.snap;
-    chrome(c, 0, snap.serves.tabs, &v.clock(), &snap.host.data.label);
+    chrome(
+        c,
+        Tab::Home,
+        snap.visible_tabs(),
+        &v.clock(),
+        &snap.host.data.label,
+    );
     let total = snap.modules.data.len();
     let r = c.w - 2; // right edge of content
 
@@ -1220,7 +1231,13 @@ fn draw_large(c: &mut Canvas, v: &View) {
 
 fn draw_small(c: &mut Canvas, v: &View) {
     let snap = v.snap;
-    chrome(c, 0, snap.serves.tabs, &v.clock(), &snap.host.data.label);
+    chrome(
+        c,
+        Tab::Home,
+        snap.visible_tabs(),
+        &v.clock(),
+        &snap.host.data.label,
+    );
     let total = snap.modules.data.len();
     let last = c.h - 4;
 
@@ -1315,7 +1332,10 @@ fn draw_small(c: &mut Canvas, v: &View) {
         c.put(
             2,
             usage_end,
-            &more_providers(providers.len() - shown, v.snap.serves.tabs >= 4),
+            &more_providers(
+                providers.len() - shown,
+                v.snap.visible_tabs().contains(Tab::Usage),
+            ),
             St::F,
         );
     }

@@ -1,14 +1,19 @@
 //! The app's screens, each drawn cell by cell from a [`View`].
 
+pub mod activity;
+pub mod agents;
+pub mod devices;
 pub mod down;
 pub mod home;
 pub mod logs;
 pub mod metrics;
 pub mod modules;
 pub mod overlays;
+pub mod settings;
+pub mod usage;
 
-use crate::draw::{trunc, Canvas};
-use crate::model::{Freshness, Panel, Snapshot};
+use crate::draw::{chrome, frame_end, trunc, Canvas};
+use crate::model::{Freshness, Panel, Snapshot, Tab};
 use crate::theme::{Bg, Fg, St};
 use crate::time::{ago, js_round, to_fixed, Civil, Timestamp};
 
@@ -215,4 +220,19 @@ pub fn result_toast(c: &mut Canvas, v: &View) {
 pub fn too_small(c: &mut Canvas) {
     let y = c.h / 2;
     c.center(0, c.w, y, "Make the window at least 80×24", St::D);
+}
+
+/// A tab whose screen isn't built yet: the tab bar, a note saying so, and
+/// the footer rule with no hints, so it offers no key it can't take.
+pub fn unbuilt(c: &mut Canvas, v: &View, tab: Tab) {
+    chrome(
+        c,
+        tab,
+        v.snap.visible_tabs(),
+        &v.clock(),
+        &v.snap.host.data.label,
+    );
+    let note = format!("{} has no screen in this build", tab.name());
+    c.center(0, c.w, c.h / 2, &note, St::D);
+    frame_end(c, &[], "", St::D);
 }

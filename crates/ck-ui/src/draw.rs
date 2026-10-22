@@ -11,7 +11,7 @@ use ratatui::style::Modifier;
 use unicode_width::UnicodeWidthChar;
 use unicode_width::UnicodeWidthStr;
 
-use crate::model::Status;
+use crate::model::{Status, Tab, TabSet};
 use crate::theme::{Bg, Fg, St, Theme};
 
 /// Display width of a string in terminal columns.
@@ -409,58 +409,58 @@ pub fn frame_end(c: &mut Canvas, items: &[(&str, &str)], right: &str, right_st: 
     footer(c, items, right, right_st);
 }
 
-/// The tabs, in order. Their numbers are their keys.
-pub const TABS: [&str; 7] = [
-    "Home", "Modules", "Activity", "Usage", "Agents", "Devices", "Settings",
-];
+/// The widest a usage bar or sparkline gets. Past it a bar would stretch
+/// without saying more, so the width beyond goes to text columns instead.
+pub const USAGE_MAX_W: i32 = 64;
 
 /// Whether a window below 120 columns must shorten the tab bar to numbers
 /// (the active tab keeps its name): only when the bar with every name
 /// doesn't fit beside the clock.
-fn tabs_shortened(w: i32, tabs: usize) -> bool {
+fn tabs_shortened(w: i32, tabs: TabSet) -> bool {
     if w >= 120 {
         return false;
     }
-    let names: i32 = TABS.iter().take(tabs).map(|t| 2 + width(t) as i32).sum();
-    let gaps = 2 * (tabs.saturating_sub(1)) as i32;
+    let names: i32 = tabs.iter().map(|t| 2 + width(t.name()) as i32).sum();
+    let gaps = 2 * (tabs.len().saturating_sub(1)) as i32;
     // The bar starts at column 4; the clock takes the last six columns.
     4 + names + gaps > w - 7
 }
 
-/// Where each of the first `tabs` tabs sits in the top bar: (start column,
-/// width, tab index). Below 120 columns, when the names don't all fit, only
-/// the active tab shows its name and the rest just their number.
-pub fn tab_spans(w: i32, active: usize, tabs: usize) -> Vec<(i32, i32, usize)> {
+/// Where each tab of `tabs` sits in the top bar: (start column, width,
+/// tab), in bar order. Each tab keeps its own number, so a hidden tab's
+/// number is simply missing. Below 120 columns, when the names don't all
+/// fit, only the active tab shows its name and the rest just their number.
+pub fn tab_spans(w: i32, active: Tab, tabs: TabSet) -> Vec<(i32, i32, Tab)> {
     let mut spans = Vec::new();
     if w < 120 {
         let short = tabs_shortened(w, tabs);
         let mut x = 4;
-        for (i, t) in TABS.iter().take(tabs).enumerate() {
+        for t in tabs.iter() {
             let start = x;
-            x += if i == active || !short {
-                2 + width(t) as i32
+            x += if t == active || !short {
+                2 + width(t.name()) as i32
             } else {
                 1
             };
-            spans.push((start, x - start, i));
+            spans.push((start, x - start, t));
             x += 2;
         }
     } else {
         let mut x = 16;
-        for (i, t) in TABS.iter().take(tabs).enumerate() {
+        for t in tabs.iter() {
             let start = x;
-            x += 2 + width(t) as i32;
-            spans.push((start, x - start, i));
+            x += 2 + width(t.name()) as i32;
+            spans.push((start, x - start, t));
             x += 3;
         }
     }
     spans
 }
 
-/// The top bar: the first `tabs` tabs (only the screens that exist) and the
-/// clock, with the wordmark and the machine's name from 120 columns. The
-/// active tab carries the accent and an accent rule beneath it.
-pub fn chrome(c: &mut Canvas, active: usize, tabs: usize, clock: &str, machine: &str) {
+/// The top bar: the tabs that show and the clock, with the wordmark and the
+/// machine's name from 120 columns. The active tab carries the accent and
+/// an accent rule beneath it.
+pub fn chrome(c: &mut Canvas, active: Tab, tabs: TabSet, clock: &str, machine: &str) {
     let compact = c.w < 120;
     let short = tabs_shortened(c.w, tabs);
     c.put(1, 0, "◆", St::A.bold());
@@ -468,14 +468,14 @@ pub fn chrome(c: &mut Canvas, active: usize, tabs: usize, clock: &str, machine: 
         c.put(3, 0, "CortexKit", St::B);
     }
     let spans = tab_spans(c.w, active, tabs);
-    for &(x, _, i) in &spans {
-        let on = i == active;
-        let num = (i + 1).to_string();
+    for &(x, _, t) in &spans {
+        let on = t == active;
+        let num = t.number().to_string();
         if short && !on {
             c.put(x, 0, &num, St::F);
         } else {
             c.put(x, 0, &num, if on { St::A } else { St::F });
-            c.put(x + 2, 0, TABS[i], if on { St::B } else { St::D });
+            c.put(x + 2, 0, t.name(), if on { St::B } else { St::D });
         }
     }
     c.right(c.w - 1, 0, clock, St::D);
@@ -483,8 +483,8 @@ pub fn chrome(c: &mut Canvas, active: usize, tabs: usize, clock: &str, machine: 
         c.right(c.w - 8, 0, machine, St::D);
     }
     c.hline(0, 1, c.w);
-    for &(x, w, i) in &spans {
-        if i == active {
+    for &(x, w, t) in &spans {
+        if t == active {
             c.hline_with(x, 1, w, '━', St::A);
         }
     }

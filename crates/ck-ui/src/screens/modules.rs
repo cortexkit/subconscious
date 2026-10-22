@@ -13,7 +13,7 @@ use crate::draw::{
     chrome, frame_end, heading, live_dot, pad_right, spark, status_glyph, status_word, trunc,
     width, Canvas, Clip,
 };
-use crate::model::{LogLevel, Module, ProcessEventKind, Status};
+use crate::model::{LogLevel, Module, ProcessEventKind, Status, Tab};
 use crate::theme::{Bg, Fg, St};
 use crate::time::{ago, js_round};
 
@@ -143,7 +143,13 @@ pub fn module_at(w: i32, h: i32, len: usize, sel: usize, y: i32) -> Option<usize
 
 pub fn draw(c: &mut Canvas, v: &View) {
     let snap = v.snap;
-    chrome(c, 1, snap.serves.tabs, &v.clock(), &snap.host.data.label);
+    chrome(
+        c,
+        Tab::Modules,
+        snap.visible_tabs(),
+        &v.clock(),
+        &snap.host.data.label,
+    );
     let mods = &snap.modules.data;
     let l = layout(c.w, c.h);
     let (lw, last) = (l.lw, l.last);
@@ -151,7 +157,7 @@ pub fn draw(c: &mut Canvas, v: &View) {
 
     c.put(2, 3, "Modules", St::B);
     c.put(10, 3, &mods.len().to_string(), St::D);
-    if snap.serves.list_filter {
+    if snap.serves.list_filter.contains(Tab::Modules) {
         c.right(lw, 3, "/ to filter", St::F);
     }
     c.put(4, 5, "Module", St::D);

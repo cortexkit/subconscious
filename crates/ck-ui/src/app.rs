@@ -15,22 +15,27 @@ use ratatui::Terminal;
 use tokio::sync::watch;
 
 use crate::draw::{tab_spans, Canvas};
-use crate::model::{ActionKind, Daemon, LogView, Module, Panel, Snapshot, Status};
+use crate::model::{ActionKind, Daemon, LogView, Module, PaletteCommand, Panel, Snapshot, Status};
 use crate::screens::logs::{self, LevelFilter, LogState};
 use crate::screens::{self, overlays, View, MIN_H, MIN_W};
 use crate::theme::{detect_theme, Theme};
 use crate::time::Timestamp;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Tab {
-    Home,
-    Modules,
-}
+pub use crate::model::Tab;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Overlay {
     Palette,
     Help,
+}
+
+/// A one-line text field that has the keyboard, such as a list filter, a
+/// settings value or a word the person types. While one is open, printable
+/// keys go to it ahead of every app-wide key, so typing "q" or "1" into it
+/// neither quits nor switches tabs. The screen that opened it reads `text`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TextField {
+    pub text: String,
 }
 
 /// What the app asks of whoever feeds it data. The app never waits for an
@@ -85,6 +90,8 @@ pub struct App {
     pub metrics: Option<usize>,
     /// Whether the daemon-down screen shows the daemon's log.
     pub down_log: bool,
+    /// The text field that has the keyboard, if any.
+    pub field: Option<TextField>,
     /// Requests made since the run loop last collected them.
     pub requests: Vec<Request>,
 }
@@ -107,6 +114,7 @@ impl App {
             confirm: None,
             metrics: None,
             down_log: false,
+            field: None,
             requests: Vec::new(),
         }
     }
@@ -126,6 +134,35 @@ impl App {
         (self.tab == Tab::Modules)
             .then(|| self.selected(snap).map(|m| m.id.as_str()))
             .flatten()
+    }
+
+    /// The tab on screen: the chosen one while it shows, else Home. A tab
+    /// stops showing when the module behind it leaves the roster.
+    fn shown_tab(&self, snap: &Snapshot) -> Tab {
+        if snap.visible_tabs().contains(self.tab) {
+            self.tab
+        } else {
+            Tab::Home
+        }
+    }
+
+    /// Returns to Home when the chosen tab no longer shows, because the
+    /// module behind it left the roster. Returns true when it moved.
+    pub fn follow_roster(&mut self, snap: &Snapshot) -> bool {
+        if self.shown_tab(snap) == self.tab {
+            return false;
+        }
+        self.tab = Tab::Home;
+        self.back = None;
+        self.log = None;
+        self.metrics = None;
+        self.field = None;
+        true
+    }
+
+    /// The palette's commands for the tabs that show.
+    fn palette_commands(&self, snap: &Snapshot) -> Vec<PaletteCommand> {
+        overlays::shown_commands(&snap.commands, snap.visible_tabs())
     }
 
     fn selected<'a>(&self, snap: &'a Snapshot) -> Option<&'a Module> {
@@ -183,7 +220,12 @@ impl App {
             }
             return;
         }
-        match (self.tab, &self.log, self.metrics, self.selected(snap)) {
+        match (
+            self.shown_tab(snap),
+            &self.log,
+            self.metrics,
+            self.selected(snap),
+        ) {
             (Tab::Home, ..) => screens::home::draw(&mut c, &v),
             (Tab::Modules, Some(state), ..) => {
                 screens::logs::draw(&mut c, &v, &self.log_panel(snap), state)
@@ -192,6 +234,11 @@ impl App {
                 screens::metrics::draw(&mut c, &v, m, scroll)
             }
             (Tab::Modules, ..) => screens::modules::draw(&mut c, &v),
+            (Tab::Activity, ..) => screens::activity::draw(&mut c, &v),
+            (Tab::Usage, ..) => screens::usage::draw(&mut c, &v),
+            (Tab::Agents, ..) => screens::agents::draw(&mut c, &v),
+            (Tab::Devices, ..) => screens::devices::draw(&mut c, &v),
+            (Tab::Settings, ..) => screens::settings::draw(&mut c, &v),
         }
         screens::result_toast(&mut c, &v);
         if let Some(q) = &self.confirm {
@@ -211,12 +258,12 @@ impl App {
         match self.overlay {
             Some(Overlay::Palette) => overlays::palette(
                 &mut c,
-                &snap.commands,
+                &self.palette_commands(snap),
                 &self.palette_query,
                 self.palette_sel,
                 self.preferred_module(snap),
             ),
-            Some(Overlay::Help) => overlays::help(&mut c, snap.serves),
+            Some(Overlay::Help) => overlays::help(&mut c, snap.serves, snap.visible_tabs()),
             None => {}
         }
     }
@@ -238,6 +285,7 @@ impl App {
         if key.kind == KeyEventKind::Release {
             return false;
         }
+        self.follow_roster(snap);
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         if ctrl && key.code == KeyCode::Char('c') {
             self.quit = true;
@@ -256,6 +304,9 @@ impl App {
         }
         if self.confirm.is_some() {
             return self.confirm_key(key);
+        }
+        if let Some(handled) = self.field_key(key) {
+            return handled;
         }
         if self.overlay == Some(Overlay::Palette) {
             return self.palette_key(key, snap);
@@ -287,8 +338,14 @@ impl App {
             }
             KeyCode::Char('q') => self.quit = true,
             KeyCode::Char('t') => self.theme = self.theme.toggled(),
-            KeyCode::Char('1') => self.switch(Tab::Home),
-            KeyCode::Char('2') => self.switch(Tab::Modules),
+            // Each tab keeps its number while others are hidden, so a hidden
+            // tab's key does nothing rather than reaching another tab.
+            KeyCode::Char(ch) if Tab::from_key(ch).is_some() => {
+                match Tab::from_key(ch).filter(|t| snap.visible_tabs().contains(*t)) {
+                    Some(tab) => self.switch(tab),
+                    None => return false,
+                }
+            }
             KeyCode::Esc => {
                 if self.overlay.is_some() {
                     self.overlay = None;
@@ -393,6 +450,37 @@ impl App {
             ),
         });
         true
+    }
+
+    /// Keys for the open text field, ahead of every app-wide key. Printable
+    /// keys type and backspace deletes; esc closes the field. ⏎, tab,
+    /// shift-tab and the arrows are left to the screen that opened the field
+    /// (`None`), and every other key is swallowed so it can't act behind
+    /// the field. Ctrl-c is handled before this and still quits.
+    fn field_key(&mut self, key: KeyEvent) -> Option<bool> {
+        let field = self.field.as_mut()?;
+        match key.code {
+            KeyCode::Char(ch)
+                if !key.modifiers.intersects(
+                    KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                ) =>
+            {
+                field.text.push(ch)
+            }
+            KeyCode::Backspace => {
+                field.text.pop();
+            }
+            KeyCode::Esc => self.field = None,
+            KeyCode::Enter
+            | KeyCode::Tab
+            | KeyCode::BackTab
+            | KeyCode::Up
+            | KeyCode::Down
+            | KeyCode::Left
+            | KeyCode::Right => return None,
+            _ => return Some(false),
+        }
+        Some(true)
     }
 
     fn confirm_key(&mut self, key: KeyEvent) -> bool {
@@ -530,6 +618,7 @@ impl App {
         self.back = None;
         self.log = None;
         self.metrics = None;
+        self.field = None;
     }
 
     fn palette_key(&mut self, key: KeyEvent, snap: &Snapshot) -> bool {
@@ -539,7 +628,7 @@ impl App {
             KeyCode::Up => self.palette_sel = self.palette_sel.saturating_sub(1),
             KeyCode::Down => {
                 let n = overlays::matches(
-                    &snap.commands,
+                    &self.palette_commands(snap),
                     &self.palette_query,
                     self.preferred_module(snap),
                 )
@@ -551,19 +640,17 @@ impl App {
                 self.palette_sel = 0;
             }
             KeyCode::Enter => {
-                let list = overlays::matches(
-                    &snap.commands,
-                    &self.palette_query,
-                    self.preferred_module(snap),
-                );
+                let commands = self.palette_commands(snap);
+                let list =
+                    overlays::matches(&commands, &self.palette_query, self.preferred_module(snap));
                 let Some(cmd) = list.get(self.palette_sel.min(list.len().saturating_sub(1))) else {
                     return false;
                 };
                 let (area, title) = (cmd.area.clone(), cmd.title.clone());
                 self.overlay = None;
                 // Commands for Modules open it on the module they name. The
-                // other areas have no screen in this app yet, so the palette
-                // just closes.
+                // other areas' commands have no action in this app yet, so
+                // the palette just closes.
                 if area == "Modules" {
                     let named = snap
                         .modules
@@ -591,12 +678,16 @@ impl App {
                 } else if area == "App" {
                     // The app's own commands, each what its key does.
                     match title.as_str() {
-                        "Home" => self.switch(Tab::Home),
-                        "Modules" => self.switch(Tab::Modules),
                         "Keys" => self.overlay = Some(Overlay::Help),
                         "Light or dark" => self.theme = self.theme.toggled(),
                         "Quit" => self.quit = true,
-                        _ => {}
+                        // A tab's name switches to it; the list holds only
+                        // the tabs that show.
+                        name => {
+                            if let Some(tab) = Tab::from_name(name) {
+                                self.switch(tab);
+                            }
+                        }
                     }
                 }
             }
@@ -617,6 +708,8 @@ impl App {
                 (&mut self.home_sel, rows)
             }
             Tab::Modules => (&mut self.mod_sel, snap.modules.data.len()),
+            // The other tabs' screens keep no selection here yet.
+            _ => return false,
         };
         if len == 0 {
             return false;
@@ -629,6 +722,7 @@ impl App {
 
     /// Clicks on a tab or a Modules row, and scrolling to move the selection.
     pub fn handle_mouse(&mut self, mouse: MouseEvent, snap: &Snapshot, size: (u16, u16)) -> bool {
+        self.follow_roster(snap);
         if self.overlay.is_some()
             || self.confirm.is_some()
             || matches!(snap.daemon.data, Daemon::Down(_))
@@ -643,17 +737,8 @@ impl App {
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 if y == 0 {
-                    let active = match self.tab {
-                        Tab::Home => 0,
-                        Tab::Modules => 1,
-                    };
-                    for (sx, sw, i) in tab_spans(w, active, snap.serves.tabs) {
+                    for (sx, sw, tab) in tab_spans(w, self.tab, snap.visible_tabs()) {
                         if x >= sx && x < sx + sw {
-                            let tab = match i {
-                                0 => Tab::Home,
-                                1 => Tab::Modules,
-                                _ => return false,
-                            };
                             self.switch(tab);
                             return true;
                         }
@@ -974,6 +1059,7 @@ async fn event_loop(mut rx: watch::Receiver<Snapshot>, options: RunOptions) -> i
                 } else {
                     dirty = true;
                     let snap = rx.borrow().clone();
+                    app.follow_roster(&snap);
                     forward_requests(&mut app, &snap, options.requests.as_ref(), &mut watching);
                 }
             }

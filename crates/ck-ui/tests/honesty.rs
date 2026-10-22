@@ -580,14 +580,19 @@ fn an_empty_day_says_so_under_starts_and_exits() {
 #[test]
 fn the_live_app_advertises_only_what_it_serves() {
     use ck_ui::app::Overlay;
-    use ck_ui::model::Serves;
-    use ck_ui::screens::overlays::help_columns;
+    use ck_ui::model::{Serves, TabSet};
+    use ck_ui::screens::overlays::{help_columns, shown_commands};
     let mut s = Snapshot::fixture();
     s.serves = Serves::LIVE;
     s.commands = ck_ui::live::palette_commands(&s.modules.data);
+    // The fixture's roster has every module a tab needs, so what shows is
+    // exactly what the live app serves.
+    let served = TabSet::of(&[Tab::Home, Tab::Modules]);
+    assert_eq!(s.serves.tabs, served);
+    assert_eq!(s.visible_tabs(), served);
 
     // The keys page lists the live app's keys, each of them handled below.
-    let listed: Vec<String> = help_columns(s.serves)
+    let listed: Vec<String> = help_columns(s.serves, s.visible_tabs())
         .iter()
         .flat_map(|(_, rows)| rows.iter().map(|(k, _)| k.clone()))
         .collect();
@@ -668,6 +673,12 @@ fn the_live_app_advertises_only_what_it_serves() {
     assert!(served(&mut app, KeyCode::Char('l')));
     assert!(app.log.is_some());
     assert!(served(&mut App::new(Theme::test()), KeyCode::Char('q')));
+    // The number keys of tabs it doesn't serve do nothing.
+    for k in '3'..='7' {
+        let mut app = App::new(Theme::test());
+        assert!(!served(&mut app, KeyCode::Char(k)), "{k}");
+        assert_eq!(app.tab, Tab::Home, "{k}");
+    }
 
     // The Modules view shows no filter or settings hint, and only the two
     // tabs that have screens.
@@ -677,9 +688,24 @@ fn the_live_app_advertises_only_what_it_serves() {
     assert!(!row(&buf, 35).contains("settings"));
     assert!(!row(&buf, 0).contains("3 Activity"), "{}", row(&buf, 0));
     assert!(row(&buf, 0).contains("2 Modules"));
+    // Each tab's filter is served on its own: serving it on the other lists
+    // never puts a filter hint on Modules.
+    let mut other_filters = s.clone();
+    other_filters.serves.list_filter = TabSet::of(&[Tab::Activity, Tab::Agents, Tab::Settings]);
+    let buf = render(&app, &other_filters, 120, 36);
+    assert!(!row(&buf, 3).contains("/ to filter"), "{}", row(&buf, 3));
+
+    // The palette offers only the tabs that show.
+    let palette = shown_commands(&s.commands, s.visible_tabs());
+    let tabs_offered: Vec<&str> = palette
+        .iter()
+        .filter(|c| c.area == "App" && Tab::from_name(&c.title).is_some())
+        .map(|c| c.title.as_str())
+        .collect();
+    assert_eq!(tabs_offered, ["Home", "Modules"]);
 
     // Every palette command runs: a restart request or the log view.
-    for cmd in s.commands.clone() {
+    for cmd in palette {
         app = App::new(Theme::test());
         app.overlay = Some(Overlay::Palette);
         app.palette_query = cmd.title.clone();
@@ -695,6 +721,180 @@ fn the_live_app_advertises_only_what_it_serves() {
             || cmd.title == "Home";
         assert!(did, "{:?} did nothing", cmd.title);
     }
+}
+
+/// The fixture without `module` in its roster.
+fn without_module(module: &str) -> Snapshot {
+    let mut s = Snapshot::fixture();
+    s.modules.data.retain(|m| m.id != module);
+    s
+}
+
+fn screen_text(buf: &Buffer) -> String {
+    (0..buf.area.height).map(|y| row(buf, y) + "\n").collect()
+}
+
+#[test]
+fn a_tab_whose_module_is_missing_is_skipped_everywhere() {
+    use ck_ui::app::Overlay;
+    use ck_ui::model::TabSet;
+    use ck_ui::screens::overlays::{help_columns, shown_commands};
+    // Usage shows insula's data; without insula in the roster the tab
+    // hides, and every place that lists tabs follows.
+    let s = without_module("insula");
+    assert_eq!(s.visible_tabs(), TabSet::ALL.without(Tab::Usage));
+
+    // The bar skips 4 and keeps every other number.
+    let home = render(&App::new(Theme::test()), &s, 120, 36);
+    assert!(
+        row(&home, 0).contains("3 Activity   5 Agents   6 Devices   7 Settings"),
+        "{}",
+        row(&home, 0)
+    );
+    assert!(!row(&home, 0).contains("Usage"), "{}", row(&home, 0));
+    let short = render(&App::new(Theme::test()), &s, 80, 24);
+    assert!(
+        row(&short, 0).contains("3 Activity  5 Agents"),
+        "{}",
+        row(&short, 0)
+    );
+
+    // The keys page lists exactly the numbers that show.
+    let columns = help_columns(s.serves, s.visible_tabs());
+    assert_eq!(columns[0].1[0], ("1 – 3, 5 – 7".to_string(), "switch tab"));
+    let mut app = App::new(Theme::test());
+    app.overlay = Some(Overlay::Help);
+    let page = screen_text(&render(&app, &s, 120, 36));
+    assert!(page.contains("1 – 3, 5 – 7  switch tab"), "{page}");
+
+    // Key 4 does nothing; the others still reach their own tab.
+    let mut app = App::new(Theme::test());
+    assert!(!press(&mut app, &s, KeyCode::Char('4')));
+    assert_eq!(app.tab, Tab::Home);
+    assert!(press(&mut app, &s, KeyCode::Char('5')));
+    assert_eq!(app.tab, Tab::Agents);
+
+    // Home's pointer to the rest of the providers names no tab.
+    let text = screen_text(&short);
+    assert!(text.contains("+ 2 more providers"), "{text}");
+    assert!(!text.contains("on 4 Usage"), "{text}");
+    // With insula back, the same frame points at tab 4.
+    let full = screen_text(&render(
+        &App::new(Theme::test()),
+        &Snapshot::fixture(),
+        80,
+        24,
+    ));
+    assert!(full.contains("+ 2 more providers on 4 Usage"), "{full}");
+
+    // The palette leaves out Usage's commands.
+    let palette = shown_commands(&s.commands, s.visible_tabs());
+    assert!(palette.iter().all(|c| c.area != "Usage"), "{palette:?}");
+    assert!(shown_commands(&Snapshot::fixture().commands, TabSet::ALL)
+        .iter()
+        .any(|c| c.area == "Usage"));
+}
+
+#[test]
+fn before_the_first_roster_only_the_daemons_own_tabs_show() {
+    use ck_ui::model::TabSet;
+    use ck_ui::screens::overlays::help_columns;
+    let mut s = Snapshot::fixture();
+    let shown = TabSet::of(&[Tab::Home, Tab::Modules, Tab::Activity, Tab::Settings]);
+    // A panel still waiting holds placeholders, never a roster: even
+    // placeholder entries for insula, entorhinal and callosum show no tab.
+    s.modules.loaded = false;
+    assert_eq!(s.visible_tabs(), shown);
+    s.modules = Panel::waiting(Vec::new(), Some(2.0));
+    assert_eq!(s.visible_tabs(), shown);
+    let buf = render(&App::new(Theme::test()), &s, 120, 36);
+    assert!(
+        row(&buf, 0).contains("2 Modules   3 Activity   7 Settings"),
+        "{}",
+        row(&buf, 0)
+    );
+    assert_eq!(
+        help_columns(s.serves, s.visible_tabs())[0].1[0].0,
+        "1 – 3, 7"
+    );
+    for k in ['4', '5', '6'] {
+        let mut app = App::new(Theme::test());
+        assert!(!press(&mut app, &s, KeyCode::Char(k)), "{k}");
+        assert_eq!(app.tab, Tab::Home);
+    }
+}
+
+#[test]
+fn a_roster_entry_counts_whether_or_not_it_runs() {
+    use ck_ui::live::{assemble, State};
+    use ck_ui::model::Serves;
+    let now = Snapshot::fixture_now();
+    let mut state = State::empty("This Mac");
+    let roster: Vec<subc_control::SupervisorEntry> = serde_json::from_value(serde_json::json!([
+        { "module_id": "insula", "state": "disabled", "enabled": false, "live": false,
+          "health": "unknown" },
+        { "module_id": "callosum", "state": "stopped", "enabled": true, "live": false,
+          "health": "unknown" }
+    ]))
+    .unwrap();
+    state.record_roster(roster, now);
+    let mut snap = assemble(&state, now);
+    snap.serves = Serves::DESIGN;
+    let shown = snap.visible_tabs();
+    assert!(shown.contains(Tab::Usage), "a disabled insula still counts");
+    assert!(
+        shown.contains(Tab::Devices),
+        "a stopped callosum still counts"
+    );
+    assert!(
+        !shown.contains(Tab::Agents),
+        "entorhinal isn't in the roster"
+    );
+}
+
+#[test]
+fn the_app_returns_home_when_its_tabs_module_leaves_the_roster() {
+    let full = Snapshot::fixture();
+    for (tab, module) in [
+        (Tab::Usage, "insula"),
+        (Tab::Agents, "entorhinal"),
+        (Tab::Devices, "callosum"),
+    ] {
+        let mut app = App::new(Theme::test());
+        assert!(press(&mut app, &full, KeyCode::Char(tab.key())));
+        assert_eq!(app.tab, tab);
+        let gone = without_module(module);
+        // The frame drawn before anything else happens is already Home's.
+        let buf = render(&app, &gone, 120, 36);
+        assert_eq!(
+            screen_text(&buf),
+            screen_text(&render(&App::new(Theme::test()), &gone, 120, 36)),
+            "{tab:?}"
+        );
+        // The next snapshot or key moves the app itself.
+        assert!(app.follow_roster(&gone), "{tab:?}");
+        assert_eq!(app.tab, Tab::Home);
+        assert!(!app.follow_roster(&gone));
+        let mut app = App::new(Theme::test());
+        app.tab = tab;
+        press(&mut app, &gone, KeyCode::Char('j'));
+        assert_eq!(app.tab, Tab::Home, "{tab:?}");
+    }
+}
+
+#[test]
+fn the_keys_page_joins_neighbouring_tab_numbers() {
+    use ck_ui::model::TabSet;
+    use ck_ui::screens::overlays::tab_keys;
+    let keys = |tabs: &[Tab]| tab_keys(TabSet::of(tabs));
+    assert_eq!(keys(&[Tab::Home]), "1");
+    assert_eq!(keys(&[Tab::Home, Tab::Modules]), "1 – 2");
+    assert_eq!(
+        keys(&[Tab::Home, Tab::Modules, Tab::Activity, Tab::Settings]),
+        "1 – 3, 7"
+    );
+    assert_eq!(keys(&[Tab::Home, Tab::Activity, Tab::Agents]), "1, 3, 5");
+    assert_eq!(tab_keys(TabSet::ALL), "1 – 7");
 }
 
 #[test]

@@ -741,16 +741,20 @@ pub fn assemble(state: &State, now: Timestamp) -> Snapshot {
     }
 }
 
-/// The palette's commands: the app's own (its screens, the keys page, the
+/// The palette's commands: the app's own (each tab, the keys page, the
 /// theme, quitting), then for each module what the app can do with it:
-/// restart, stop or start, its log and its metrics. Nothing it can't do.
+/// restart, stop or start, its log and its metrics. Nothing it can't do:
+/// the palette leaves out the tabs that don't show
+/// ([`crate::screens::overlays::shown_commands`]).
 pub fn palette_commands(modules: &[Module]) -> Vec<PaletteCommand> {
     let cmd = |title: String, area: &str| PaletteCommand {
         title,
         area: area.into(),
     };
-    let mut out: Vec<PaletteCommand> = ["Home", "Modules", "Keys", "Light or dark", "Quit"]
+    let tabs = crate::model::Tab::ALL.map(crate::model::Tab::name);
+    let mut out: Vec<PaletteCommand> = tabs
         .into_iter()
+        .chain(["Keys", "Light or dark", "Quit"])
         .map(|t| cmd(t.to_string(), "App"))
         .collect();
     for m in modules {

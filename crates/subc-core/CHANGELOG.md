@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.20.117
+
+- On Unix, `ck <domain>` replaces itself with the domain binary so signals reach the work being done and signal exits are preserved. Windows keeps spawning and waiting because console Ctrl-C and process-tree termination cover the child.
+
 ## 0.20.116
 
 - `ck daemon` (plain and `--json`) leaves `config_path` out of what it prints of the daemon's `server.describe` reply, so a daemon that starts reporting the configuration file it reads does not change `ck daemon`'s output. Today's daemons don't send the field; the output is unchanged.

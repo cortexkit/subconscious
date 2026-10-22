@@ -2826,6 +2826,154 @@ fn mcp_gateway_domain_is_listed_and_invoked_through_ck() {
 
 #[cfg(unix)]
 #[test]
+fn external_domain_replaces_ck_and_preserves_signal_behavior() {
+    use std::os::unix::process::ExitStatusExt;
+
+    fn wait_for_path(path: &Path, duration: Duration) -> bool {
+        let deadline = std::time::Instant::now() + duration;
+        while std::time::Instant::now() < deadline {
+            if path.exists() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        path.exists()
+    }
+
+    fn wait_for_child(
+        child: &mut std::process::Child,
+        duration: Duration,
+    ) -> Option<std::process::ExitStatus> {
+        let deadline = std::time::Instant::now() + duration;
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => return Some(status),
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Ok(None) | Err(_) => return None,
+            }
+        }
+    }
+
+    fn signal_pid(pid: u32, signal: &str) {
+        let status = Command::new("kill")
+            .args([format!("-{signal}"), pid.to_string()])
+            .status()
+            .expect("send a signal to the domain process");
+        assert!(status.success(), "kill -{signal} {pid} failed: {status}");
+    }
+
+    fn pid_is_running(pid: u32) -> bool {
+        Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    fn wait_for_pid_exit(pid: u32, duration: Duration) -> bool {
+        let deadline = std::time::Instant::now() + duration;
+        while std::time::Instant::now() < deadline {
+            if !pid_is_running(pid) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        !pid_is_running(pid)
+    }
+
+    let temp = TempDir::new("ck-domain-signals");
+    let data_home = temp.path().join("data-home");
+    let domain_bin = data_home.join("cortexkit").join("bin");
+    write_domain_program(
+        &domain_bin,
+        "ck-signal-probe",
+        "if [ \"$1\" = \"--ck-domain\" ]; then printf '%s\\n' 'Signal fixture'; exit 0; fi\n\
+         trap 'printf \"term\\n\" > \"$CK_DOMAIN_TERM_MARKER\"; exit 7' TERM\n\
+         printf '%s\\n' \"$$\" > \"$CK_DOMAIN_STARTED_MARKER\"\n\
+         while :; do sleep 0.05; done",
+    );
+
+    let started = temp.path().join("term-started");
+    let term_marker = temp.path().join("term-received");
+    let mut ck = ck_command()
+        .arg("signal-probe")
+        .env("XDG_DATA_HOME", &data_home)
+        .env("CK_DOMAIN_STARTED_MARKER", &started)
+        .env("CK_DOMAIN_TERM_MARKER", &term_marker)
+        .spawn()
+        .expect("start ck with the signal fixture");
+    let started_in_time = wait_for_path(&started, Duration::from_secs(5));
+    if !started_in_time {
+        let _ = ck.kill();
+        let _ = ck.wait();
+    }
+    assert!(started_in_time, "domain fixture did not start");
+    let domain_pid: u32 = fs::read_to_string(&started)
+        .expect("read domain process pid")
+        .trim()
+        .parse()
+        .expect("domain process pid is numeric");
+    signal_pid(ck.id(), "TERM");
+    let term_status = wait_for_child(&mut ck, Duration::from_secs(5));
+    let term_marker_written = wait_for_path(&term_marker, Duration::from_secs(3));
+    if !term_marker_written {
+        // Send SIGTERM directly so a failed test never leaves the fixture running.
+        signal_pid(domain_pid, "TERM");
+        let _ = wait_for_path(&term_marker, Duration::from_secs(3));
+    }
+    let domain_stopped = wait_for_pid_exit(domain_pid, Duration::from_secs(3));
+    let term_status = term_status.unwrap_or_else(|| {
+        let _ = ck.kill();
+        ck.wait().expect("reap ck after the bounded wait")
+    });
+    assert!(
+        domain_stopped,
+        "domain script remained running after SIGTERM"
+    );
+    assert!(
+        term_marker_written,
+        "the domain process did not handle SIGTERM"
+    );
+    assert_eq!(term_status.code(), Some(7));
+
+    let started = temp.path().join("sigkill-started");
+    let mut ck = ck_command()
+        .arg("signal-probe")
+        .env("XDG_DATA_HOME", &data_home)
+        .env("CK_DOMAIN_STARTED_MARKER", &started)
+        .env(
+            "CK_DOMAIN_TERM_MARKER",
+            temp.path().join("sigkill-term-received"),
+        )
+        .spawn()
+        .expect("start ck for the SIGKILL fixture");
+    let started_in_time = wait_for_path(&started, Duration::from_secs(5));
+    if !started_in_time {
+        let _ = ck.kill();
+        let _ = ck.wait();
+    }
+    assert!(started_in_time, "domain fixture did not start for SIGKILL");
+    let domain_pid: u32 = fs::read_to_string(&started)
+        .expect("read domain process pid")
+        .trim()
+        .parse()
+        .expect("domain process pid is numeric");
+    signal_pid(domain_pid, "KILL");
+    let status = wait_for_child(&mut ck, Duration::from_secs(5)).unwrap_or_else(|| {
+        let _ = ck.kill();
+        ck.wait().expect("reap ck after the bounded SIGKILL wait")
+    });
+    assert_eq!(status.signal(), Some(9));
+    assert!(
+        wait_for_pid_exit(domain_pid, Duration::from_secs(3)),
+        "domain script remained running after SIGKILL"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn external_domains_opt_in_dispatch_and_cache_their_probe() {
     use std::os::unix::fs::PermissionsExt;
 

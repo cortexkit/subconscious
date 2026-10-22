@@ -1197,6 +1197,39 @@ fn unknown_external_command_error(domain: &str) -> String {
     format!("unknown command '{domain}'. {search_hint} Run ck --help.")
 }
 
+/// Runs a discovered domain binary so that stopping `ck` stops the domain's
+/// work too. On Unix, `ck` replaces itself with the binary: the binary keeps
+/// `ck`'s PID, so a signal sent to `ck` (by `kill`, `timeout` or a supervisor)
+/// reaches it, and its exit status, including death by a signal, becomes
+/// `ck`'s. Other platforms have no `exec`, so `ck` waits for the child; on
+/// Windows a console Ctrl-C reaches every process on the console and a tree
+/// kill (`taskkill /T`) ends the child with `ck`.
+fn run_external_domain(path: &Path, tail: &[OsString]) -> Result<(), CkError> {
+    let mut command = process::Command::new(path);
+    command.args(tail);
+    #[cfg(unix)]
+    {
+        use std::io::Write as _;
+        use std::os::unix::process::CommandExt;
+
+        let _ = io::stdout().flush();
+        let _ = io::stderr().flush();
+        Err(CkError::Message(format!(
+            "failed to run {}: {}",
+            path.display(),
+            command.exec()
+        )))
+    }
+    #[cfg(not(unix))]
+    {
+        // Console Ctrl-C reaches both processes, and taskkill /T ends the child tree.
+        let status = command.status().map_err(|error| {
+            CkError::Message(format!("failed to run {}: {error}", path.display()))
+        })?;
+        process::exit(status.code().unwrap_or(1));
+    }
+}
+
 /// Dispatch only a binary that completed the domain handshake. The handshake
 /// result is cached, but a changed executable gets a new stamp and is probed
 /// again before it can receive operator input.
@@ -1214,16 +1247,7 @@ fn dispatch_external(domain: &str, tail: &[OsString]) -> Result<(), CkError> {
         };
     };
     if probe_external_domain(&candidate).is_some() {
-        let status = process::Command::new(&candidate.path)
-            .args(tail)
-            .status()
-            .map_err(|error| {
-                CkError::Message(format!(
-                    "failed to run {}: {error}",
-                    candidate.path.display()
-                ))
-            })?;
-        process::exit(status.code().unwrap_or(1));
+        return run_external_domain(&candidate.path, tail);
     }
     if let Some(module_id) = module_ids.get(domain) {
         return Err(CkError::ModuleNotCommand {

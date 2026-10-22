@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.20.119
+
+- The `ck quota --redact` rule (the pseudonym that replaces an account's email and id, and dropping its organization name) and the quota module's id, operation and reply rows moved to `ck_ui::quota`, so the app reads and names accounts the way `ck quota` does. `ck quota` output is unchanged.
+- Tests pin what piped `ck quota` prints (the default table, `--verbose`, `--redact` and `--json`: stdout, stderr and exit code) against two fresh private daemons, masking only the countdowns and ages that move with the clock, each by a named rule.
+
 ## 0.20.118
 
 - `ck setup claustrum` creates the folder for the claustrum key before running `ck-auth bootstrap` on every platform. On a clean Windows machine the folder (`%LOCALAPPDATA%\cortexkit\claustrum`) did not exist yet, ck-auth refused the key path, and setup rolled back the changes it had made. Unix keeps creating it owner-only.

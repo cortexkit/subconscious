@@ -1,6 +1,6 @@
 [package]
 name = "ck-ui"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2021"
 license = "MIT"
 publish = false
@@ -24,6 +24,9 @@ ratatui = { version = "0.30.2", default-features = false, features = ["crossterm
 # default parser.
 serde = "1"
 serde_json = "1"
+# The account pseudonym `ck quota --redact` and the app show instead of an
+# account's email or id.
+sha2 = "0.10"
 subc-client-rs = { path = "../subc-client-rs", version = "0.30.6" }
 subc-control = { path = "../subc-control", version = "0.32.2" }
 subc-os = { path = "../subc-os", version = "0.1.18" }

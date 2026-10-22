@@ -343,7 +343,7 @@ pub const POLLED: [Polled; 5] = [
     Polled {
         source: Source::Usage,
         module: modules::USAGE,
-        method: "usage.get",
+        method: crate::quota::USAGE_METHOD,
         every: every::USAGE,
     },
     Polled {

@@ -1,0 +1,194 @@
+$ ck --subc <connection file> --json quota
+exit: Some(0)
+--- stdout ---
+{
+  "result": [
+    {
+      "account": "acct-ops",
+      "accountInfo": {
+        "email": "ops@example.test",
+        "orgName": "Ops Example Org",
+        "planType": "max"
+      },
+      "fetchedAt": "2020-01-01T00:00:00Z",
+      "provider": "claude",
+      "savedResets": {
+        "availableCount": 2,
+        "soonestExpiresAt": "2099-01-01T00:00:00Z"
+      },
+      "usage": {
+        "extraRateWindows": [
+          {
+            "id": "opus-weekly",
+            "title": "Opus weekly",
+            "window": {
+              "resetsAt": "2020-01-07T00:00:00Z",
+              "usedPercent": 70.0,
+              "windowKind": "weekly",
+              "windowMinutes": 10080
+            }
+          }
+        ],
+        "primary": {
+          "resetsAt": "2099-01-01T05:00:00Z",
+          "usedPercent": 25.0,
+          "windowMinutes": 300
+        },
+        "secondary": {
+          "rawUsedPercent": 60.0,
+          "resetsAt": "2020-01-07T00:00:00Z",
+          "totalCount": 40000,
+          "usedCount": 10336,
+          "usedPercent": 40.0,
+          "windowMinutes": 10080
+        }
+      }
+    },
+    {
+      "account": "acct-team",
+      "accountInfo": {
+        "email": "team@example.test",
+        "orgName": "Team Example Org"
+      },
+      "error": "weekly probe failed",
+      "provider": "claude",
+      "stale": {
+        "class": "upstream_timeout",
+        "since": "2020-01-02T00:00:00Z"
+      },
+      "usage": {
+        "primary": {
+          "resetsAt": "2020-01-01T05:00:00Z",
+          "usedPercent": 90.0,
+          "windowMinutes": 300
+        }
+      }
+    },
+    {
+      "account": "acct-dev",
+      "accountInfo": {
+        "email": "dev@example.test",
+        "orgName": "Dev Example Org"
+      },
+      "error": "token expired",
+      "errorClass": "credential_expired",
+      "provider": "claude"
+    },
+    {
+      "provider": "codex",
+      "source": "oauth",
+      "usage": {
+        "primary": {
+          "resetsAt": "2020-01-01T05:00:00Z",
+          "usedPercent": 12.5,
+          "windowMinutes": 300
+        },
+        "tertiary": {
+          "windowMinutes": 43200
+        }
+      }
+    },
+    {
+      "account": "acct-ag",
+      "accountInfo": {
+        "email": "ag@example.test"
+      },
+      "provider": "antigravity",
+      "usage": {
+        "extraRateWindows": [
+          {
+            "id": "gemini-weekly",
+            "title": "Gemini Models weekly",
+            "window": {
+              "resetsAt": "2020-01-03T22:00:53Z",
+              "usedPercent": 100.0,
+              "windowKind": "weekly",
+              "windowMinutes": 10080
+            }
+          },
+          {
+            "id": "3p-weekly",
+            "title": "Claude and GPT models weekly",
+            "window": {
+              "resetsAt": "2020-01-01T21:23:30Z",
+              "usedPercent": 100.0,
+              "windowKind": "weekly",
+              "windowMinutes": 10080
+            }
+          }
+        ]
+      }
+    },
+    {
+      "account": "acct-ws",
+      "error": "no local provider process",
+      "errorClass": "local_source_unavailable",
+      "provider": "windsurf"
+    },
+    {
+      "account": "0f1e2d3c-aaaa-bbbb-cccc-000000000001",
+      "provider": "claude-console",
+      "spend": [
+        {
+          "basis": "reported",
+          "expiresAt": "2020-01-25T00:00:00Z",
+          "funding": "subscription",
+          "id": "pool-1",
+          "label": "API credit (Max 20x)",
+          "remaining": {
+            "exponent": 2,
+            "minor": 19663,
+            "unit": "USD"
+          },
+          "total": {
+            "exponent": 2,
+            "minor": 20000,
+            "unit": "USD"
+          }
+        },
+        {
+          "basis": "reported",
+          "funding": "purchased",
+          "id": "pool-2",
+          "label": "Bought credit",
+          "remaining": {
+            "exponent": 2,
+            "minor": 500,
+            "unit": "USD"
+          }
+        }
+      ],
+      "usage": {}
+    },
+    {
+      "provider": "deepseek",
+      "spend": [
+        {
+          "label": "Balance",
+          "remaining": {
+            "exponent": 2,
+            "minor": 2402,
+            "unit": "CNY"
+          }
+        }
+      ],
+      "usage": {}
+    },
+    {
+      "error": "no session",
+      "errorClass": "credential_absent",
+      "provider": "codebuff"
+    },
+    {
+      "error": "no quota reported",
+      "errorClass": "no_quota_reported",
+      "provider": "jetbrains"
+    },
+    {
+      "error": "the quota module crashed",
+      "errorClass": "internal_error",
+      "provider": "kimi"
+    }
+  ]
+}
+--- stderr ---

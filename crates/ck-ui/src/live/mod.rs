@@ -42,7 +42,7 @@ use schedule::Source;
 /// The modules whose replies feed panels, by the id the daemon knows them
 /// by.
 pub mod modules {
-    pub const USAGE: &str = "insula";
+    pub const USAGE: &str = crate::quota::USAGE_MODULE;
     pub const DEVICES: &str = "callosum";
     pub const IDENTITY: &str = "entorhinal";
     pub const RESIDENCE: &str = "prefrontal-core";

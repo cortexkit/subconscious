@@ -1,0 +1,46 @@
+$ ck --subc <connection file> quota --verbose
+exit: Some(0)
+--- stdout ---
+Antigravity — 1 account
+  ● ag@example.test
+      ● Gemini Models weekly          ████████████████  100% used · resets Jan 03 22:00 UTC
+      ● Claude and GPT models weekly  ████████████████  100% used · resets Jan 01 21:23 UTC
+
+Claude — 3 accounts
+  ● ops@example.test · Ops Example Org · plan: max · ✦ 2 saved resets · soonest expires in <saved_reset_expiries> · fetched <reading_ages> ago
+      ● 5h           ████░░░░░░░░░░░░  25% used · resets in <reset_countdowns>
+      ● week         ██████████░░░░░░  60% used (40% eff · resets banked) · 10,336 / 40,000 · resets Jan 07 00:00 UTC
+      ● Opus weekly  ███████████░░░░░  70% used · resets Jan 07 00:00 UTC
+  ● team@example.test · Team Example Org · ⚠ last good reading · refresh failing for <refresh_failure_ages> (upstream_timeout)
+      ⚠ weekly probe failed
+      ● 5h           ██████████████░░  90% used · resets Jan 01 05:00 UTC
+      ○ week         ················  not reported
+      ○ Opus weekly  ················  not reported
+  ○ dev@example.test [credential_expired] — token expired
+  capacity: 5h → 1.15/2 accounts used (0.85× quota left)
+
+Codebuff — 1 account
+  ○ account — no session
+
+Codex — 1 account
+  ● oauth account
+      ● 5h   ██░░░░░░░░░░░░░░  12.5% used · resets Jan 01 05:00 UTC
+      ○ 30d  ················  no data
+
+Jetbrains — 1 account
+  ○ account — no quota reported
+
+Kimi — 1 account
+  ○ account [quota-module defect] — the quota module crashed
+
+Windsurf — not running locally
+
+Claude Console — 1 account
+  ● 0f1e2d3c
+      API credit (Max 20x)  196.63 of 200.00 USD left · expires 2020-01-25 · included in subscription
+      Bought credit  5.00 USD left · bought credit
+
+Deepseek — 1 account
+  ● account
+      Balance  24.02 CNY left
+--- stderr ---

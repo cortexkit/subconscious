@@ -141,6 +141,35 @@ fn a_usage_refusal_is_its_code() {
     assert!(map::usage(&json!({ "result": {} }), now()).is_err());
 }
 
+/// Each account carries the name `ck quota --redact` prints for it, from
+/// the same rule, so hiding identifiers in the app shows what a redacted
+/// `ck quota` shows.
+#[test]
+fn usage_accounts_carry_the_ck_quota_redact_pseudonym() {
+    let reply = usage_reply();
+    let rows = reply["result"].as_array().unwrap();
+    let providers = map::usage(&reply, now()).unwrap();
+    let claude = &providers[0].accounts;
+    assert_eq!(
+        claude[0].redacted,
+        ck_ui::quota::account_name(&rows[0], true)
+    );
+    assert_eq!(
+        claude[1].redacted,
+        ck_ui::quota::account_name(&rows[1], true)
+    );
+    assert_eq!(
+        providers[1].accounts[0].redacted,
+        ck_ui::quota::account_name(&rows[2], true)
+    );
+    for account in claude.iter().chain(&providers[1].accounts) {
+        assert!(
+            account.redacted.starts_with("account ") && account.redacted != account.who,
+            "{account:?}"
+        );
+    }
+}
+
 // ---- build server, backups, models -------------------------------------------------
 
 #[test]

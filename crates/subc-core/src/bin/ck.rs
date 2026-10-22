@@ -31,12 +31,13 @@ use ck_ui::metrics::{
     format_age_from_epoch_ms, format_age_seconds, format_bytes, format_duration,
     format_milliseconds, headline_metric_entries, scalar_text,
 };
-// How `ck quota` and the app read the quota module's usage rows.
+// How `ck quota` and the app read the quota module's usage rows and name
+// its accounts.
 use ck_ui::quota::{
-    entry_error_detail, format_provider_display_name, parse_rfc3339_to_utc_secs, provider_id,
-    quota_disconnect_kind, quota_entry_is_balance_only, quota_entry_is_connected,
-    quota_spend_lines_for_entry, quota_window_rows_for_entry, quota_window_used_percent,
-    table_account_label, QuotaDisconnectKind,
+    account_name, account_org, entry_error_detail, format_provider_display_name,
+    parse_rfc3339_to_utc_secs, provider_id, quota_disconnect_kind, quota_entry_is_balance_only,
+    quota_entry_is_connected, quota_spend_lines_for_entry, quota_window_rows_for_entry,
+    quota_window_used_percent, usage_rows, QuotaDisconnectKind, USAGE_METHOD, USAGE_MODULE,
 };
 // Helpers only the tests below use.
 #[cfg(test)]
@@ -46,7 +47,6 @@ use cortexkit_log::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use subc_control::{CatalogEntry, ClientControlRequest, ClientControlResponse, NotReadyReason};
 use subc_daemon::stderr_tail::{format_capture_stamp, split_capture_stamp, CAPTURE_STAMP_LEN};
 use subc_daemon::{fleet_lint, machine_id, read_frame, write_frame, Frame, DEFAULT_DRAIN_TIMEOUT};
@@ -72,7 +72,6 @@ use subc_transport::CONNECTION_FILE_NAME;
 const TRIAGE_LOG_MAX_BYTES: u64 = 64 * 1024;
 const TRIAGE_LOG_TAIL_LINES: usize = 20;
 const EXPECTED_DAEMON_BINARY: &str = "ck-subc";
-const QUOTA_MODULE_ID: &str = "insula";
 const CK_HARNESS: &str = "ck";
 const BUILTIN_DOMAINS: &[&str] = &[
     "activity",
@@ -4762,14 +4761,16 @@ async fn quota(
     let project_root = env::current_dir()
         .map_err(|source| CkError::Message(format!("current directory: {source}")))?;
     let route = client
-        .route_open_management(QUOTA_MODULE_ID, project_root)
+        .route_open_management(USAGE_MODULE, project_root)
         .await?;
     let body = client
-        .route_request_value(route, json!({ "method": "usage.get", "params": {} }))
+        .route_request_value(route, json!({ "method": USAGE_METHOD, "params": {} }))
         .await?;
     client.route_goodbye(route).await;
 
-    let providers = usage_providers_from_body(&body)?;
+    let providers = usage_rows(&body)
+        .cloned()
+        .ok_or_else(|| CkError::Message(format!("unexpected usage.get reply: {body}")))?;
     if let Some(filter) = provider_filter {
         if !providers.iter().any(|p| provider_id(p) == filter) {
             let ids = provider_ids_sorted(&providers);
@@ -5058,22 +5059,13 @@ fn compact_token_count(tokens: i64) -> String {
 
 async fn ensure_quota_module_registered(client: &mut CkClient) -> Result<(), CkError> {
     let catalog = client.catalog_list().await?;
-    if catalog
-        .iter()
-        .any(|entry| entry.module_id == QUOTA_MODULE_ID)
-    {
+    if catalog.iter().any(|entry| entry.module_id == USAGE_MODULE) {
         return Ok(());
     }
     Err(CkError::Rejected(format!(
-        "module '{QUOTA_MODULE_ID}' is not registered — is it enabled in subc.jsonc?"
+        "module '{}' is not registered — is it enabled in subc.jsonc?",
+        USAGE_MODULE
     )))
-}
-
-fn usage_providers_from_body(body: &Value) -> Result<Vec<Value>, CkError> {
-    body.get("result")
-        .and_then(Value::as_array)
-        .cloned()
-        .ok_or_else(|| CkError::Message(format!("unexpected usage.get reply: {body}")))
 }
 
 fn provider_ids_sorted(providers: &[Value]) -> Vec<String> {
@@ -5084,44 +5076,6 @@ fn provider_ids_sorted(providers: &[Value]) -> Vec<String> {
 }
 
 const QUOTA_PROGRESS_BAR_WIDTH: usize = 16;
-
-/// Stable four-hex pseudonym standing in for an account's human identity under
-/// `--redact`.
-///
-/// A BLANK WOULD BE WRONG, not merely less pretty. Three providers on a typical
-/// host serve several accounts each, so removing the email makes those rows
-/// visually identical and a reader can no longer tell which 5h window belongs
-/// with which weekly, or that four distinct accounts exist at all -- losing
-/// exactly the dimension that makes a multi-account screenshot worth taking.
-///
-/// DERIVED RATHER THAN POSITIONAL ("account 1 of 4") because the number moves
-/// when ordering changes, so two screenshots taken a minute apart disagree and
-/// the pair becomes unreadable. A hash of the account id renders the same in
-/// both, which is the property that matters when someone posts a before and an
-/// after.
-///
-/// Derived from the vault account id, falling back to the email only when no id
-/// is carried -- the id is the more stable of the two and is what a reader is
-/// matching across images.
-fn account_pseudonym(entry: &Value) -> String {
-    let seed = entry
-        .get("account")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-        .or_else(|| {
-            entry
-                .get("accountInfo")
-                .and_then(|i| i.get("email"))
-                .and_then(Value::as_str)
-                .filter(|s| !s.is_empty())
-        })
-        .unwrap_or("");
-    if seed.is_empty() {
-        return "account".to_string();
-    }
-    let digest = Sha256::digest(seed.as_bytes());
-    format!("account {:02x}{:02x}", digest[0], digest[1])
-}
 
 fn quota_entries_for_table<'a>(
     providers: &'a [Value],
@@ -5369,32 +5323,9 @@ fn print_quota_account(
     verbose: bool,
     redact: bool,
 ) {
-    // The email is the human identity when the wire carries it; the vault
-    // account id (shortened) is the fallback, and the credential source is
-    // the last resort so a row is never label-less.
-    //
-    // Under --redact all three are replaced by a derived pseudonym, including
-    // the account id: a UUID identifies no person but is a stable
-    // cross-session identifier and reads as a secret in a screenshot.
-    let mut label = if redact {
-        account_pseudonym(entry)
-    } else {
-        entry
-            .get("accountInfo")
-            .and_then(|i| i.get("email"))
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-            .unwrap_or_else(|| table_account_label(entry))
-    };
-    if label.is_empty() {
-        label = entry
-            .get("source")
-            .and_then(Value::as_str)
-            .map(|source| format!("{source} account"))
-            .unwrap_or_else(|| "account".to_string());
-    }
-
+    // The account's name, or its pseudonym under --redact; the rule is
+    // `ck_ui::quota::account_name`, which the app's Usage panel uses too.
+    let label = account_name(entry, redact);
     if !quota_entry_is_connected(entry) {
         let reason = entry_error_detail(entry).unwrap_or_else(|| "no usage data".to_string());
         // "Which ones" is the first question after seeing the failing count, so
@@ -5633,21 +5564,12 @@ fn format_duration_two_units(secs: u64) -> String {
 fn quota_account_header_extras(entry: &Value, redact: bool) -> Vec<String> {
     let mut extras = Vec::new();
     let info = entry.get("accountInfo");
-    // The email is consumed as the primary label upstream; extras start at
-    // the org.
-    //
-    // THE ORG NAME IS THE ONE A NAIVE REDACTION MISSES. A personal Anthropic
-    // org is named after its owner ("Ufuk's Organization"), so blanking the
-    // email and leaving this renders the name in plain sight one column over.
-    // Measured by QTA on a live payload: 4 distinct emails and 4 distinct org
-    // names across the same accounts.
-    if let Some(org) = info
-        .and_then(|i| i.get("orgName"))
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-        .filter(|_| !redact)
-    {
-        extras.push(org.to_string());
+    // The account's name (its email, id or source, or a pseudonym under
+    // `--redact`) is printed before these extras, so they start at the
+    // organization, which `--redact` hides too (see
+    // `ck_ui::quota::account_org`).
+    if let Some(org) = account_org(entry, redact) {
+        extras.push(org);
     }
     if let Some(plan) = info
         .and_then(|i| i.get("planType"))
@@ -10594,48 +10516,21 @@ mod tests {
         assert!(QUOTA_HELP.contains("--verbose"));
     }
 
-    /// `--redact` replaces every identifying field with one derived pseudonym,
-    /// and the pseudonym must be STABLE -- two screenshots of the same account
-    /// taken minutes apart have to render identically or the pair is unreadable.
-    ///
-    /// The org-name arm is the one a naive redaction misses: a personal org is
-    /// named after its owner, so blanking the email and leaving the org renders
-    /// the name in plain sight one column over.
+    /// Under `--redact` the account header drops the organization name, which
+    /// often names the account's owner, and keeps the plan type, which names
+    /// nobody. The pseudonym that replaces the email is tested with its rule
+    /// in `ck_ui::quota`.
     #[test]
-    fn redact_replaces_email_and_org_with_a_stable_derived_pseudonym() {
+    fn redact_drops_the_org_from_the_account_header_and_keeps_the_plan() {
         let entry = json!({
             "account": "11111111-2222-3333-4444-555555555555",
             "accountInfo": {
-                "email": "ufuk@example.com",
-                "orgName": "Ufuk's Organization",
+                "email": "alex@example.com",
+                "orgName": "Alex's Organization",
                 "planType": "max",
             },
         });
 
-        let plain = account_pseudonym(&entry);
-        assert_eq!(
-            plain,
-            account_pseudonym(&entry),
-            "the pseudonym must be derived, not positional: an unstable label makes a \
-             before/after screenshot pair unmatchable"
-        );
-        assert!(
-            plain.starts_with("account ") && plain.len() == "account ".len() + 4,
-            "expected `account <4 hex>`, got {plain}"
-        );
-        assert!(
-            !plain.contains("ufuk") && !plain.contains("Organization"),
-            "the pseudonym must reveal nothing: {plain}"
-        );
-
-        // A DIFFERENT account must render differently, or the whole point --
-        // telling multiple accounts apart in one screenshot -- is lost.
-        let other = json!({ "account": "99999999-8888-7777-6666-555555555555" });
-        assert_ne!(plain, account_pseudonym(&other));
-
-        // The org name is dropped under redaction and kept without it; the plan
-        // type survives both, because it identifies nobody and is the point of
-        // the screenshot.
         let redacted = quota_account_header_extras(&entry, true);
         assert!(
             !redacted.iter().any(|e| e.contains("Organization")),
@@ -10644,51 +10539,46 @@ mod tests {
         assert!(redacted.iter().any(|e| e == "plan: max"));
 
         let visible = quota_account_header_extras(&entry, false);
-        assert!(visible.iter().any(|e| e == "Ufuk's Organization"));
+        assert!(visible.iter().any(|e| e == "Alex's Organization"));
     }
 
-    /// A FIELD NOBODY CLASSIFIED MUST NOT REACH A REDACTED SCREENSHOT.
+    /// An identifying field that `--redact` doesn't know about must not reach
+    /// redacted output.
     ///
-    /// `--redact` is written as a deny-list -- it names what to remove -- so
-    /// every NEW identifying field on `accountInfo` defaults to VISIBLE, which
-    /// is the wrong direction for this particular flag. QTA raised it with a
-    /// live instance an hour out: a subscription-tier slice reads Anthropic's
-    /// `/api/oauth/profile`, whose response also carries `account.full_name`,
-    /// `account.display_name` and `organization.name`. If any of those are
-    /// served alongside the tier, the existing filter keeps passing, the org
-    /// test keeps going green, and the screenshot has a name in it again.
+    /// `--redact` hides the fields it names. A new identifying field on
+    /// `accountInfo` reaches output only if the header starts printing it,
+    /// and then it would show under `--redact` too unless the header also
+    /// hides it there. A provider profile can carry a person's full name,
+    /// display name and organization name, and the quota module may start
+    /// passing them on.
     ///
-    /// Today the renderer reads NAMED fields rather than iterating the map, so
-    /// an unclassified field is invisible until someone adds it to the render
-    /// path. THIS TEST IS THE TRIPWIRE ON THAT MOMENT: it puts a plausible
-    /// future identity field in the fixture and requires it absent from
-    /// redacted output, so adding the field to the renderer without classifying
-    /// it fails here rather than in a published screenshot.
+    /// The header reads only the fields it names rather than every field in
+    /// the map, so an unknown field stays hidden until someone adds it to the
+    /// header. This test catches that moment: the fixture carries such fields,
+    /// and redacted output must not contain them, so adding one to the header
+    /// without hiding it under `--redact` fails here.
     ///
-    /// WHAT IT CANNOT CATCH, stated so nobody trusts it further than it goes:
-    /// a field added under a name this fixture does not carry. The fixture is a
-    /// sample of the hazard, not a proof of its absence -- the structural
-    /// answer is deny-by-default over `accountInfo`, and QTA's notice
-    /// obligation is what makes the sample stay current.
+    /// It can't catch a field under a name the fixture doesn't carry. Hiding
+    /// every `accountInfo` field unless it is known to be safe would.
     #[test]
     fn an_unclassified_identity_field_does_not_reach_redacted_output() {
         let entry = json!({
             "account": "11111111-2222-3333-4444-555555555555",
             "accountInfo": {
-                "email": "ufuk@example.com",
-                "orgName": "Ufuk's Organization",
+                "email": "alex@example.com",
+                "orgName": "Alex's Organization",
                 "planType": "max",
-                // The fields QTA measured on the profile response that the
-                // tier slice reads. None is rendered today; each is the shape
-                // that would leak if it were added without classification.
-                "fullName": "Ufuk Altinok",
-                "displayName": "Ufuk",
-                "organizationName": "Ufuk's Organization",
+                // Identity fields a provider profile carries. None is shown
+                // today; each would leak if it were added to the header
+                // without being hidden under --redact.
+                "fullName": "Alex Example",
+                "displayName": "Alex",
+                "organizationName": "Alex's Organization",
             },
         });
 
         let redacted = quota_account_header_extras(&entry, true).join(" | ");
-        for leaked in ["Ufuk", "Altinok", "Organization", "ufuk@example.com"] {
+        for leaked in ["Alex", "Example", "Organization", "alex@example.com"] {
             assert!(
                 !redacted.contains(leaked),
                 "an identifying value reached redacted output: {leaked:?} in {redacted:?}"

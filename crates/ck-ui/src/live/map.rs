@@ -426,27 +426,6 @@ pub fn models(
 
 // ---- usage ---------------------------------------------------------------------
 
-/// Who an account is: its email, else its account label (a UUID cut to its
-/// first eight characters, as `ck quota` prints it).
-fn account_who(entry: &Value) -> String {
-    let email = entry
-        .get("accountInfo")
-        .and_then(|i| i.get("email"))
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty());
-    match email {
-        Some(e) => e.to_string(),
-        None => {
-            let label = quota::table_account_label(entry);
-            if label.is_empty() {
-                "account".into()
-            } else {
-                label
-            }
-        }
-    }
-}
-
 /// Why an account's row can't be read, or `Err(())` for a disconnected row
 /// the quota module classes as nothing to fix (no credential configured, or
 /// no quota on the account), which isn't listed at all.
@@ -608,9 +587,8 @@ pub fn usage(reply: &Value, now: Timestamp) -> Result<Vec<Provider>, Fault> {
     if let Some(err) = reply_error(reply) {
         return Err(err);
     }
-    let rows = unwrap_result(reply)
-        .as_array()
-        .ok_or_else(|| Fault::sentence("unexpected usage.get reply"))?;
+    let rows =
+        quota::usage_rows(reply).ok_or_else(|| Fault::sentence("unexpected usage.get reply"))?;
     let mut order: Vec<String> = Vec::new();
     let mut groups: HashMap<String, Vec<&Value>> = HashMap::new();
     for row in rows {
@@ -653,7 +631,8 @@ pub fn usage(reply: &Value, now: Timestamp) -> Result<Vec<Provider>, Fault> {
                 String::new()
             };
             accounts.push(Account {
-                who: account_who(entry),
+                who: quota::account_name(entry, false),
+                redacted: quota::account_name(entry, true),
                 windows: windows
                     .iter()
                     .map(|w| UsageWindow {

@@ -3,11 +3,27 @@
 //! and `tertiary` slots and the `extraRateWindows` list, whose numbers sit
 //! under `window`), spend pools, errors and how disconnected rows are
 //! classed. `ck quota` prints from these and the app's Usage panel reads
-//! them, so the two never disagree about what a row says.
+//! them, so the two never disagree about what a row says. The names accounts
+//! are shown under, with and without `ck quota --redact`, are here for the
+//! same reason.
 
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use crate::metrics::format_minor_amount;
+
+/// The quota module, as the daemon knows it.
+pub const USAGE_MODULE: &str = "insula";
+
+/// The quota module's operation that returns one row per provider account.
+/// It takes no parameters.
+pub const USAGE_METHOD: &str = "usage.get";
+
+/// The rows of a `usage.get` reply: the array under `result`. Any other
+/// shape, an error reply included, is `None`.
+pub fn usage_rows(reply: &Value) -> Option<&Vec<Value>> {
+    reply.get("result").and_then(Value::as_array)
+}
 
 pub fn provider_id(provider: &Value) -> String {
     provider
@@ -30,6 +46,90 @@ pub fn account_label(entry: &Value) -> String {
 
 pub fn table_account_label(entry: &Value) -> String {
     shorten_uuid_label(&account_label(entry))
+}
+
+/// The name an account row is shown under.
+///
+/// Without `redact` it is the account's email when the row carries one, else
+/// its account id (a UUID cut to its first eight characters), else
+/// "<credential source> account", else "account", so a row is never
+/// nameless.
+///
+/// With `redact` it is [`account_pseudonym`] instead, for every row. The
+/// account id is replaced too: a UUID names no person, but it is the same in
+/// every reading, so it identifies the account to anyone who sees two
+/// screenshots.
+pub fn account_name(entry: &Value, redact: bool) -> String {
+    if redact {
+        return account_pseudonym(entry);
+    }
+    let name = entry
+        .get("accountInfo")
+        .and_then(|info| info.get("email"))
+        .and_then(Value::as_str)
+        .filter(|email| !email.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| table_account_label(entry));
+    if !name.is_empty() {
+        return name;
+    }
+    entry
+        .get("source")
+        .and_then(Value::as_str)
+        .map(|source| format!("{source} account"))
+        .unwrap_or_else(|| "account".to_string())
+}
+
+/// The account's organization name, or `None` when the row has none or
+/// `redact` is set.
+///
+/// Redaction must hide this as well as the email: a personal organization is
+/// usually named after its owner ("Alex's Organization"), so hiding only the
+/// email would still show the owner's name next to the account.
+pub fn account_org(entry: &Value, redact: bool) -> Option<String> {
+    if redact {
+        return None;
+    }
+    entry
+        .get("accountInfo")
+        .and_then(|info| info.get("orgName"))
+        .and_then(Value::as_str)
+        .filter(|org| !org.is_empty())
+        .map(str::to_string)
+}
+
+/// The name an account is shown under while account identifiers are hidden
+/// (`ck quota --redact`): "account " and four hex digits taken from a
+/// SHA-256 of the account id, or of the email when the row has no id.
+/// "account" alone when the row has neither.
+///
+/// It is not blank, because one provider often has several accounts, and
+/// without a name per account a reader can't tell which windows belong
+/// together or how many accounts there are. Four hex digits keep the name
+/// short; two accounts can still share one, rarely.
+///
+/// It is derived from the account rather than numbered by position, because
+/// a position changes when rows are reordered, and the same account must
+/// read the same in two screenshots taken minutes apart. The account id comes
+/// first because it changes less often than the email.
+pub fn account_pseudonym(entry: &Value) -> String {
+    let seed = entry
+        .get("account")
+        .and_then(Value::as_str)
+        .filter(|account| !account.is_empty())
+        .or_else(|| {
+            entry
+                .get("accountInfo")
+                .and_then(|info| info.get("email"))
+                .and_then(Value::as_str)
+                .filter(|email| !email.is_empty())
+        })
+        .unwrap_or("");
+    if seed.is_empty() {
+        return "account".to_string();
+    }
+    let digest = Sha256::digest(seed.as_bytes());
+    format!("account {:02x}{:02x}", digest[0], digest[1])
 }
 
 pub fn shorten_uuid_label(label: &str) -> String {
@@ -448,4 +548,91 @@ pub fn format_provider_display_name(id: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Redaction replaces the email and the account id with a pseudonym taken
+    /// from the account id, the same on every call, and different for the two
+    /// sample ids here; it also drops the organization name, which often
+    /// names the owner.
+    #[test]
+    fn redaction_names_each_account_by_a_stable_pseudonym_and_drops_its_org() {
+        let entry = json!({
+            "account": "11111111-2222-3333-4444-555555555555",
+            "accountInfo": {
+                "email": "alex@example.com",
+                "orgName": "Alex's Organization",
+                "planType": "max",
+            },
+        });
+
+        let name = account_name(&entry, true);
+        assert_eq!(name, account_name(&entry, true));
+        assert!(
+            name.starts_with("account ")
+                && name.len() == "account ".len() + 4
+                && name["account ".len()..]
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit()),
+            "expected `account <4 hex digits>`, got {name}"
+        );
+        assert!(!name.contains("alex") && !name.contains("11111111"));
+
+        let other = json!({ "account": "99999999-8888-7777-6666-555555555555" });
+        assert_ne!(name, account_name(&other, true));
+
+        assert_eq!(account_org(&entry, true), None);
+        assert_eq!(
+            account_org(&entry, false).as_deref(),
+            Some("Alex's Organization")
+        );
+    }
+
+    /// The pseudonym comes from the account id when there is one, so a row
+    /// whose email changes keeps its name; from the email otherwise.
+    #[test]
+    fn the_pseudonym_is_seeded_by_the_account_id_before_the_email() {
+        let with_id =
+            |email: &str| json!({ "account": "acct-1", "accountInfo": { "email": email } });
+        assert_eq!(
+            account_name(&with_id("one@example.com"), true),
+            account_name(&with_id("two@example.com"), true)
+        );
+        let email_only = |email: &str| json!({ "accountInfo": { "email": email } });
+        assert_ne!(
+            account_name(&email_only("one@example.com"), true),
+            account_name(&email_only("two@example.com"), true)
+        );
+        assert_eq!(account_name(&json!({ "source": "oauth" }), true), "account");
+    }
+
+    /// Unredacted, a row is named by its email, its shortened account id,
+    /// its credential source, or "account", in that order.
+    #[test]
+    fn an_account_is_named_by_email_then_id_then_source() {
+        let both = json!({
+            "account": "0f1e2d3c-aaaa-bbbb-cccc-000000000001",
+            "accountInfo": { "email": "alex@example.com" },
+        });
+        assert_eq!(account_name(&both, false), "alex@example.com");
+        let id_only = json!({ "account": "0f1e2d3c-aaaa-bbbb-cccc-000000000001" });
+        assert_eq!(account_name(&id_only, false), "0f1e2d3c");
+        assert_eq!(
+            account_name(&json!({ "source": "oauth" }), false),
+            "oauth account"
+        );
+        assert_eq!(account_name(&json!({}), false), "account");
+    }
+
+    #[test]
+    fn usage_rows_are_the_array_under_result() {
+        let reply = json!({ "result": [{ "provider": "claude" }] });
+        assert_eq!(usage_rows(&reply).map(Vec::len), Some(1));
+        assert_eq!(usage_rows(&json!({ "result": {} })), None);
+        assert_eq!(usage_rows(&json!([{ "provider": "claude" }])), None);
+        assert_eq!(usage_rows(&json!({ "error": { "code": "x" } })), None);
+    }
 }

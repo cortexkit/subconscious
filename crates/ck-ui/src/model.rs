@@ -7,7 +7,7 @@
 //! offset.
 
 #[cfg(feature = "fixture")]
-use serde_json::Value;
+use serde_json::{json, Value};
 
 #[cfg(feature = "fixture")]
 use crate::time::parse_duration;
@@ -400,7 +400,13 @@ pub struct UsageWindow {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Account {
+    /// The account's name: its email, else its account id (cut to eight
+    /// characters when it is a UUID), else its credential source, else
+    /// "account" (`ck_ui::quota::account_name`).
     pub who: String,
+    /// The name shown instead of `who` while account identifiers are hidden:
+    /// the pseudonym `ck quota --redact` prints.
+    pub redacted: String,
     pub windows: Vec<UsageWindow>,
     pub note: String,
     /// Why this account's reading failed, if it did. A failing account has
@@ -1171,6 +1177,13 @@ mod fixture {
                     .iter()
                     .map(|a| Account {
                         who: s(&a["who"]),
+                        // The fixture names accounts only by email, so the
+                        // pseudonym is the one `ck quota --redact` derives
+                        // from an email.
+                        redacted: crate::quota::account_name(
+                            &json!({ "accountInfo": { "email": s(&a["who"]) } }),
+                            true,
+                        ),
                         note: s(&a["note"]),
                         error: None,
                         windows: arr(&a["windows"])

@@ -327,7 +327,7 @@ dependencies = [
 
 [[package]]
 name = "ck-ui"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "chrono",
  "ck-ui",
@@ -336,6 +336,7 @@ dependencies = [
  "ratatui",
  "serde",
  "serde_json",
+ "sha2",
  "subc-client-rs",
  "subc-control",
  "subc-os",
@@ -2444,7 +2445,7 @@ dependencies = [
 
 [[package]]
 name = "subc-core"
-version = "0.20.118"
+version = "0.20.119"
 dependencies = [
  "base64",
  "ck-ui",

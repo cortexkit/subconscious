@@ -801,8 +801,9 @@ fn before_the_first_roster_only_the_daemons_own_tabs_show() {
     use ck_ui::screens::overlays::help_columns;
     let mut s = Snapshot::fixture();
     let shown = TabSet::of(&[Tab::Home, Tab::Modules, Tab::Activity, Tab::Settings]);
-    // A panel still waiting holds placeholders, never a roster: even
-    // placeholder entries for insula, entorhinal and callosum show no tab.
+    // While the modules panel hasn't loaded, its entries are placeholders,
+    // not a roster: even entries named insula, entorhinal and callosum
+    // show no tab.
     s.modules.loaded = false;
     assert_eq!(s.visible_tabs(), shown);
     s.modules = Panel::waiting(Vec::new(), Some(2.0));

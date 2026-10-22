@@ -648,9 +648,10 @@ impl App {
                 };
                 let (area, title) = (cmd.area.clone(), cmd.title.clone());
                 self.overlay = None;
-                // Commands for Modules open it on the module they name. The
-                // other areas' commands have no action in this app yet, so
-                // the palette just closes.
+                // Commands for Modules open it on the module they name, and
+                // the app's own commands do what their keys do. Commands for
+                // the other areas have no action yet, so the palette just
+                // closes.
                 if area == "Modules" {
                     let named = snap
                         .modules

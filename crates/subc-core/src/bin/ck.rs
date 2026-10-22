@@ -849,11 +849,27 @@ async fn dashboard(args: &CkArgs) -> Result<(), CkError> {
     Ok(())
 }
 
+/// Test-support builds may give local-index integration tests more time than
+/// the dashboard's production refresh budget. Shipped `ck` always uses the
+/// production constant.
+fn bare_refresh_budget() -> Duration {
+    #[cfg(feature = "test-support")]
+    if let Some(milliseconds) = env::var("CK_TEST_BARE_REFRESH_BUDGET_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        return Duration::from_millis(milliseconds);
+    }
+
+    setup::BARE_REFRESH_BUDGET
+}
+
 async fn bare_update_line() -> DashboardUpdateLines {
     let cache = setup::UpdateCache::from_environment();
-    let source = setup::IndexReleaseSource::from_environment(setup::BARE_REFRESH_BUDGET);
+    let budget = bare_refresh_budget();
+    let source = setup::IndexReleaseSource::from_environment(budget);
     let installed = setup::dashboard_installed_binaries().unwrap_or_default();
-    let rendered = setup::dashboard_update(&cache, &source, &installed)
+    let rendered = setup::dashboard_update(&cache, &source, &installed, budget)
         .await
         .render();
     let (without_cache, cache_detail) = rendered

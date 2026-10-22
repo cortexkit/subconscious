@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.20.120
+
+- Keep bare `ck`'s 800 ms refresh limit in production while allowing the local-index CLI integration test to use a longer test-only budget, so scheduler load does not decide whether its refresh assertion passes.
+
 ## 0.20.119
 
 - The `ck quota --redact` rule (the pseudonym that replaces an account's email and id, and dropping its organization name) and the quota module's id, operation and reply rows moved to `ck_ui::quota`, so the app reads and names accounts the way `ck quota` does. `ck quota` output is unchanged.

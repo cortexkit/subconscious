@@ -339,21 +339,16 @@ pub fn not_checked_from_cache(cache: &UpdateCache) -> DashboardUpdate {
 }
 
 /// Reads fresh metadata without a request; otherwise attempts one complete
-/// refresh within the shared bare-ck budget. Any failure returns normally with
-/// the stale `not checked` form rather than blocking dashboard completion.
+/// refresh within `budget`, which is [`BARE_REFRESH_BUDGET`] for shipped bare
+/// `ck`. Any failure returns normally with the stale `not checked` form rather
+/// than blocking dashboard completion.
 pub async fn dashboard_update<S: ReleaseSource>(
     cache: &UpdateCache,
     source: &S,
     installed: &BTreeMap<String, InstalledBinary>,
+    budget: Duration,
 ) -> DashboardUpdate {
-    dashboard_update_at(
-        cache,
-        source,
-        installed,
-        unix_now_secs(),
-        BARE_REFRESH_BUDGET,
-    )
-    .await
+    dashboard_update_at(cache, source, installed, unix_now_secs(), budget).await
 }
 
 pub async fn dashboard_update_at<S: ReleaseSource>(
@@ -1075,7 +1070,7 @@ mod tests {
         assert_eq!(update.render(), "updates: index stale");
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn hanging_bare_refresh_returns_stale_output_inside_its_budget() {
         assert_eq!(BARE_REFRESH_BUDGET, Duration::from_millis(800));
         let (_dir, cache) = cache("hanging-bare");
@@ -1083,21 +1078,18 @@ mod tests {
         let source = HangingSource {
             immediate_before: upgrade_roster(Component::ALL)[0],
         };
-        let now = 100 + super::super::update_cache::UPDATE_CACHE_TTL.as_secs();
-        let budget = Duration::from_millis(20);
-        let started = std::time::Instant::now();
+        let started = time::Instant::now();
 
-        let update = dashboard_update_at(&cache, &source, &installed("0.12.0"), now, budget).await;
+        let update = time::timeout(
+            Duration::from_secs(1),
+            dashboard_update(&cache, &source, &installed("0.12.0"), BARE_REFRESH_BUDGET),
+        )
+        .await
+        .expect("bare refresh must finish within its 800 ms budget");
 
-        assert!(started.elapsed() < Duration::from_millis(200));
-        assert_eq!(
-            update,
-            DashboardUpdate::NotChecked {
-                cache_age: Some(Duration::from_secs(
-                    super::super::update_cache::UPDATE_CACHE_TTL.as_secs()
-                )),
-            }
-        );
+        assert_eq!(started.elapsed(), BARE_REFRESH_BUDGET);
+        assert!(matches!(update, DashboardUpdate::NotChecked { .. }));
+        assert!(update.render().starts_with("updates: not checked (cache "));
     }
 
     #[tokio::test(start_paused = true)]

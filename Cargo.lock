@@ -2445,7 +2445,7 @@ dependencies = [
 
 [[package]]
 name = "subc-core"
-version = "0.20.119"
+version = "0.20.120"
 dependencies = [
  "base64",
  "ck-ui",

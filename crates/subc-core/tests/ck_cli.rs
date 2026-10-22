@@ -2196,12 +2196,14 @@ fn upgrade_noops_when_0_20_83_is_installed_and_cache_and_index_offer_0_20_41() {
         &["upgrade", "--dry-run"][..],
         &[][..],
     ] {
-        let output = fixture
-            .command(&index, args)
+        let mut command = fixture.command(&index, args);
+        command
             .env("CK_TEST_CK_VERSION", "0.20.83")
-            .env("CK_TEST_SUBC_MCP_VERSION", "0.1.0")
-            .output()
-            .unwrap();
+            .env("CK_TEST_SUBC_MCP_VERSION", "0.1.0");
+        if args.is_empty() {
+            command.env("CK_TEST_BARE_REFRESH_BUDGET_MS", "30000");
+        }
+        let output = command.output().unwrap();
         assert_exit(&output, 0);
         assert!(output.stderr.is_empty(), "stderr: {}", text(&output.stderr));
         let stdout = text(&output.stdout);

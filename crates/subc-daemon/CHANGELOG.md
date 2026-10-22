@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.36.31
+
+- Successful rescans that add, remove or change modules append one `subc.config_changed` activity entry with sorted module ids and the caller's actor. No-op rescans, previews and refused checked applies remain silent; per-module rescan entries are unchanged.
+
 ## 0.36.30
 
 - Serve `supervisor.rescan_checked`. A preview parses the candidate text with the loader used for the config file, compares it with the staged module specs under the supervisor operation lock, and reports each module's action (a launch-input edit on an enabled module is `restart`, a health edit or an edit to a module that stays disabled is `reload`, enable changes and enabled additions or removals are `start` or `stop`), the drain budget and declared busy gauges' cached readings for `restart` and `stop`, the modules still waiting for a restart from an earlier rescan, `restart_required`, `capability_warnings` (which also name a provider the candidate disables), and the `expect` to apply with. The apply reads the config file once under the lock and refuses `config_changed_since_preview` unless its SHA-256 and the staged generation match, then rescans those bytes exactly as `supervisor.rescan` does; only the apply asks for privileged-operation approval. Candidates over 1 MiB are refused `candidate_too_large`. The staged generation counter moves when an executed rescan's plan changes any module, before the first change is made, so it stays moved if that rescan fails partway.

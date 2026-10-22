@@ -238,6 +238,36 @@ impl ActivityLedger {
         );
     }
 
+    pub(crate) fn config_changed(
+        &self,
+        added: &[String],
+        removed: &[String],
+        changed: &[String],
+        requester: Principal,
+    ) {
+        if added.is_empty() && removed.is_empty() && changed.is_empty() {
+            return;
+        }
+        let mut details = serde_json::Map::new();
+        if !added.is_empty() {
+            details.insert("added".into(), serde_json::json!(added));
+        }
+        if !removed.is_empty() {
+            details.insert("removed".into(), serde_json::json!(removed));
+        }
+        if !changed.is_empty() {
+            details.insert("changed".into(), serde_json::json!(changed));
+        }
+        self.enqueue_lifecycle_with_summary(
+            "subc.config_changed",
+            None,
+            requester,
+            details,
+            None,
+            Some("settings changed"),
+        );
+    }
+
     fn enqueue_lifecycle(
         &self,
         kind: &str,
@@ -246,11 +276,25 @@ impl ActivityLedger {
         details: serde_json::Map<String, serde_json::Value>,
         evidence: Option<RunningImageEvidence>,
     ) {
+        self.enqueue_lifecycle_with_summary(kind, module_id, principal, details, evidence, None);
+    }
+
+    fn enqueue_lifecycle_with_summary(
+        &self,
+        kind: &str,
+        module_id: Option<&str>,
+        principal: Principal,
+        details: serde_json::Map<String, serde_json::Value>,
+        evidence: Option<RunningImageEvidence>,
+        summary: Option<&str>,
+    ) {
         // try_send is the entire supervision-side append. The writer owns both
         // retained-build comparison and I/O, and shutdown never joins it.
-        let _ = self
-            .sender
-            .try_send(self.lifecycle_append(kind, module_id, principal, details, evidence));
+        let mut append = self.lifecycle_append(kind, module_id, principal, details, evidence);
+        if let Some(summary) = summary {
+            append.request.summary = summary.into();
+        }
+        let _ = self.sender.try_send(append);
     }
 
     fn lifecycle_append(

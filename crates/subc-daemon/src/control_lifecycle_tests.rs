@@ -311,7 +311,7 @@ async fn lifecycle_rescan_preview_noop_and_changes_record_only_applied_roster() 
     // Disabled modules exercise roster changes without platform-specific processes.
     std::fs::write(
         &config,
-        r#"{"version":1,"modules":{"old":{"program":"unused", "enabled":false}}}"#,
+        r#"{"version":1,"modules":{"old":{"program":"unused", "enabled":false},"keep":{"program":"unused", "enabled":false}}}"#,
     )
     .unwrap();
     let preview = request(
@@ -345,11 +345,63 @@ async fn lifecycle_rescan_preview_noop_and_changes_record_only_applied_roster() 
         ClientControlRequest::SupervisorRescan { preview: false },
     )
     .await;
+    flush(&handler).await;
+    let entries = handler
+        .activity
+        .as_ref()
+        .unwrap()
+        .query(query())
+        .await
+        .unwrap()
+        .entries;
+    let config_changes = entries
+        .iter()
+        .filter(|entry| entry.kind == "subc.config_changed")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        config_changes.len(),
+        1,
+        "a no-change rescan adds no config activity entry"
+    );
+    assert_eq!(config_changes[0].summary, "settings changed");
+    assert_eq!(
+        config_changes[0].details,
+        serde_json::json!({"added":["keep", "old"]})
+            .as_object()
+            .unwrap()
+            .clone()
+    );
+    assert_eq!(config_changes[0].actor.principal, Principal::Direct);
+
     std::fs::write(
         &config,
-        r#"{"version":1,"modules":{"new":{"program":"unused", "enabled":false}}}"#,
+        r#"{"version":1,"modules":{"keep":{"program":"changed", "enabled":false},"new":{"program":"unused", "enabled":false}}}"#,
     )
     .unwrap();
+    request(
+        &handler,
+        &ctx,
+        ClientControlRequest::SupervisorRescan { preview: true },
+    )
+    .await;
+    flush(&handler).await;
+    let preview_entries = handler
+        .activity
+        .as_ref()
+        .unwrap()
+        .query(query())
+        .await
+        .unwrap()
+        .entries;
+    assert_eq!(
+        preview_entries
+            .iter()
+            .filter(|entry| entry.kind == "subc.config_changed")
+            .count(),
+        1,
+        "a preview is silent"
+    );
+
     request(
         &handler,
         &ctx,
@@ -365,6 +417,23 @@ async fn lifecycle_rescan_preview_noop_and_changes_record_only_applied_roster() 
         .await
         .unwrap()
         .entries;
+    let config_changes = entries
+        .iter()
+        .filter(|entry| entry.kind == "subc.config_changed")
+        .collect::<Vec<_>>();
+    assert_eq!(config_changes.len(), 2);
+    assert_eq!(config_changes[0].summary, "settings changed");
+    assert_eq!(
+        config_changes[0].details,
+        serde_json::json!({"added":["new"], "removed":["old"], "changed":["keep"]})
+            .as_object()
+            .unwrap()
+            .clone()
+    );
+    assert!(config_changes
+        .iter()
+        .all(|entry| entry.actor.principal == Principal::Direct));
+
     let rescans = entries
         .iter()
         .filter(|entry| entry.kind == "subc.module_rescanned")
@@ -379,7 +448,7 @@ async fn lifecycle_rescan_preview_noop_and_changes_record_only_applied_roster() 
     );
     assert_eq!(
         rescans[1].details,
-        serde_json::json!({"added":["old"], "removed":[]})
+        serde_json::json!({"added":["keep", "old"], "removed":[]})
             .as_object()
             .unwrap()
             .clone()

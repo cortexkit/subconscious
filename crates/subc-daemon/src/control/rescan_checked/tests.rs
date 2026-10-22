@@ -7,13 +7,13 @@ use std::{
 use cortexkit_test_support::ScratchDir;
 use serde_json::{json, Value};
 use subc_control::{
-    ClientControlRequest, ClientControlResponse, RescanExpect, RescanModuleActionKind,
-    SupervisorRescanResult, CONFIG_CHANGED_SINCE_PREVIEW, RESCAN_CANDIDATE_MAX_BYTES,
-    RESCAN_CANDIDATE_PREVIEW_CAPABILITY,
+    ActivityActor, ActivityQueryRequest, ActivityRecordRequest, ClientControlRequest,
+    ClientControlResponse, RescanExpect, RescanModuleActionKind, SupervisorRescanResult,
+    CONFIG_CHANGED_SINCE_PREVIEW, RESCAN_CANDIDATE_MAX_BYTES, RESCAN_CANDIDATE_PREVIEW_CAPABILITY,
 };
 use subc_protocol::{
     manifest::{CapabilityDeclarations, CapabilityNeed, CapabilityRequirement, ModuleManifest},
-    FrameType, ModuleHelloBody, PROTOCOL_VERSION,
+    FrameType, ModuleHelloBody, Principal, PROTOCOL_VERSION,
 };
 use tokio::sync::mpsc;
 
@@ -46,6 +46,7 @@ impl Rig {
             .with_daemon_incarnation(incarnation.to_string());
         let handler = ControlHandler::new(registry)
             .with_supervisor(handle)
+            .with_activity_ledger(config.parent().unwrap(), incarnation.to_string())
             .with_supervisor_rescan(supervisor, config, None);
         let (tx, rx) = mpsc::channel(8);
         Self {
@@ -143,6 +144,40 @@ impl Rig {
         let frame = Frame::build(FrameType::Request, control_flags(), 0, 0, 1, Vec::new()).unwrap();
         let reply = self.handler.handle_server_describe(frame).unwrap();
         serde_json::from_slice(&reply[0].body).unwrap()
+    }
+
+    async fn config_change_count(&self) -> usize {
+        let ledger = self.handler.activity.as_ref().unwrap();
+        let barrier: ActivityRecordRequest = serde_json::from_value(
+            json!({"op":"activity.record", "kind":"barrier.flushed", "summary":"Queue flushed"}),
+        )
+        .unwrap();
+        ledger
+            .record(
+                "barrier".into(),
+                barrier,
+                ActivityActor {
+                    principal: Principal::Direct,
+                    scope_owner: None,
+                    agent_id: None,
+                    run_id: None,
+                    flow_id: None,
+                    project_root: None,
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        let query: ActivityQueryRequest =
+            serde_json::from_value(json!({"op":"activity.query", "limit":1000})).unwrap();
+        ledger
+            .query(query)
+            .await
+            .unwrap()
+            .entries
+            .iter()
+            .filter(|entry| entry.kind == "subc.config_changed")
+            .count()
     }
 }
 
@@ -405,11 +440,16 @@ async fn another_writer_between_the_write_and_the_apply_is_refused_and_the_modul
     rig.write(&doc(json!({"x": entry(true)})));
     rig.apply_file().await;
     assert!(rig.enabled("x"));
+    let config_changes_before_preview = rig.config_change_count().await;
 
     let mut edited = entry(true);
     edited["args"] = json!(["--edited"]);
     let candidate = doc(json!({"x": edited}));
     let preview = rig.preview(&candidate).await.unwrap();
+    assert_eq!(
+        rig.config_change_count().await,
+        config_changes_before_preview
+    );
     rig.write(&candidate);
     let other_writer = doc(json!({"x": entry(false)}));
     rig.write(&other_writer);
@@ -418,11 +458,20 @@ async fn another_writer_between_the_write_and_the_apply_is_refused_and_the_modul
 
     assert_eq!(refused.unwrap_err(), CONFIG_CHANGED_SINCE_PREVIEW);
     assert!(rig.enabled("x"), "x was not stopped");
+    assert_eq!(
+        rig.config_change_count().await,
+        config_changes_before_preview,
+        "a refused checked rescan has no config activity entry"
+    );
     // The same file previewed afresh does apply, so the refusal above is what
     // kept x running and not an apply that could never stop it.
     let fresh = rig.preview(&other_writer).await.unwrap();
     rig.apply(fresh.expect.unwrap()).await.unwrap();
     assert!(!rig.enabled("x"));
+    assert_eq!(
+        rig.config_change_count().await,
+        config_changes_before_preview + 1
+    );
 }
 
 #[tokio::test]

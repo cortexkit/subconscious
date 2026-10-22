@@ -5820,9 +5820,9 @@ impl ControlHandler {
             Vec::new()
         };
         let reconciled = match &mode {
-            RescanMode::Candidate(candidate) => {
-                self.preview_candidate(&context, modules, candidate)
-            }
+            RescanMode::Candidate(candidate) => self
+                .preview_candidate(&context, modules, candidate)
+                .map(|result| (result, Vec::new())),
             _ => {
                 self.reconcile_supervised_modules(
                     &context.supervisor,
@@ -5833,7 +5833,7 @@ impl ControlHandler {
                 .await
             }
         };
-        let result = match reconciled {
+        let (result, changed) = match reconciled {
             Ok(result) => result,
             Err(message) => {
                 return Ok(vec![control_error_frame(&frame, "rescan_failed", message)?])
@@ -5841,7 +5841,8 @@ impl ControlHandler {
         };
         if !preview {
             if let Some(ledger) = &self.activity {
-                ledger.module_rescanned(&result.added, &result.removed, requester);
+                ledger.module_rescanned(&result.added, &result.removed, requester.clone());
+                ledger.config_changed(&result.added, &result.removed, &changed, requester);
             }
             if let Err(code) = self.configure_activity(activity_config).await {
                 warn!(
@@ -6033,7 +6034,7 @@ impl ControlHandler {
         configured_modules: Vec<crate::daemon_config::ConfiguredModule>,
         preview: bool,
         requester: Principal,
-    ) -> Result<SupervisorRescanResult, String> {
+    ) -> Result<(SupervisorRescanResult, Vec<String>), String> {
         let plan = self.plan_rescan(configured_modules)?;
 
         // Everything above this point is pure computation over two snapshots.
@@ -6042,8 +6043,13 @@ impl ControlHandler {
         // site, where one missed guard would apply part of a change the caller was
         // told would not happen.
         if preview {
-            return Ok(plan.preview_result());
+            return Ok((plan.preview_result(), Vec::new()));
         }
+        let changed = plan
+            .configuration_changes
+            .union(&plan.enabled_changes)
+            .cloned()
+            .collect::<Vec<_>>();
         let RescanPlan {
             current,
             configured,
@@ -6175,21 +6181,24 @@ impl ControlHandler {
                 })?;
         }
 
-        Ok(SupervisorRescanResult {
-            added,
-            removed,
-            changed_pending_reload,
-            enabled_changes: enabled_changes.iter().cloned().collect(),
-            unchanged,
-            preview: false,
-            // Filled by the caller, which is the only layer that can see the
-            // previous config to diff against.
-            restart_required: Vec::new(),
-            capability_warnings: Vec::new(),
-            module_actions: Vec::new(),
-            earlier_pending: Vec::new(),
-            expect: None,
-        })
+        Ok((
+            SupervisorRescanResult {
+                added,
+                removed,
+                changed_pending_reload,
+                enabled_changes: enabled_changes.iter().cloned().collect(),
+                unchanged,
+                preview: false,
+                // Filled by the caller, which is the only layer that can see the
+                // previous config to diff against.
+                restart_required: Vec::new(),
+                capability_warnings: Vec::new(),
+                module_actions: Vec::new(),
+                earlier_pending: Vec::new(),
+                expect: None,
+            },
+            changed,
+        ))
     }
 
     async fn handle_supervisor_set_enabled(
@@ -7780,7 +7789,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            health_only.changed_pending_reload.is_empty(),
+            health_only.0.changed_pending_reload.is_empty(),
             "health policy is already applied live"
         );
         assert_eq!(module.status().unwrap().pid, before);
@@ -7793,7 +7802,7 @@ mod tests {
             .reconcile_supervised_modules(&supervisor, vec![configured], false, Principal::Direct)
             .await
             .unwrap();
-        assert_eq!(launch.changed_pending_reload, ["stock"]);
+        assert_eq!(launch.0.changed_pending_reload, ["stock"]);
         assert_eq!(
             module.status().unwrap().pid,
             before,

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.36.35
+
+- Test-only release; daemon behaviour is unchanged from 0.36.34, which was never
+  published. Five new scope tests now build their expected folder the way the
+  daemon stores it, in the plain Windows spelling rather than the verbatim
+  `\\?\` form `std::fs::canonicalize` returns.
+
 ## 0.36.34
 
 - Accept and canonicalize scope workdirs, validate opaque project ids and keep both fixed per epoch. Advertise `scope-workdir/v1` and stamp these fields only to declaring targets. Bound scoped workdirs join legacy live roots; activity copies scope folder/project without changing legacy fields.

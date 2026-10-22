@@ -569,8 +569,7 @@ async fn scope_workdir_bind_is_exactly_opt_in() {
         let mut rig =
             rig_with_target_capabilities(if declares { &["scope-workdir/v1"] } else { &[] }).await;
         let dir = ScratchDir::new("scope-bind-workdir");
-        let workdir = std::fs::canonicalize(dir.path())
-            .unwrap()
+        let workdir = daemon_canonical(dir.path())
             .to_str()
             .unwrap()
             .to_owned();
@@ -605,7 +604,7 @@ async fn scope_workdir_bind_is_exactly_opt_in() {
 async fn scope_workdir_live_roots_include_bound_scope_and_keep_legacy_roots() {
     let mut rig = rig_with_target_capabilities(&[]).await;
     let dir = ScratchDir::new("scope-live-root");
-    let workdir = std::fs::canonicalize(dir.path()).unwrap();
+    let workdir = daemon_canonical(dir.path());
     rig.sync(vec![
         session(1).with_workdir(Some(workdir.to_str().unwrap().into()))
     ])
@@ -660,7 +659,7 @@ async fn scope_workdir_live_roots_include_bound_scope_and_keep_legacy_roots() {
 async fn scope_workdir_live_roots_deduplicate_equal_bind_roots_and_only_count_bound_workdirs() {
     let mut rig = rig_with_target_capabilities(&[]).await;
     let dir = ScratchDir::new("scope-equal-live-root");
-    let workdir = std::fs::canonicalize(dir.path()).unwrap();
+    let workdir = daemon_canonical(dir.path());
     rig.sync(vec![
         session(1).with_workdir(Some(workdir.to_str().unwrap().into()))
     ])
@@ -780,4 +779,14 @@ async fn scope_workdir_handler_prepares_canonical_records_and_keeps_path_refusal
         assert_eq!(stamp.workdir.as_deref(), canonical.join("missing").to_str());
         assert_eq!(stamp.project_id.as_deref(), Some("project:1"));
     }
+}
+
+/// A folder as the daemon stores it: canonical, and on Windows in the plain
+/// spelling. `std::fs::canonicalize` returns the verbatim `\\?\` form there,
+/// which the daemon never stores (docs/path-canonicalization.md).
+fn daemon_canonical(path: &std::path::Path) -> std::path::PathBuf {
+    crate::ProjectRootId::from_path_allowing_missing(path)
+        .unwrap()
+        .as_path()
+        .to_path_buf()
 }

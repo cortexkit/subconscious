@@ -838,7 +838,7 @@ async fn activity_real_daemon_restart_head_and_query_do_not_block_reader() {
 #[tokio::test]
 async fn activity_route_project_fields_come_from_scope_even_for_legacy_target() {
     let scratch = ScratchDir::new("activity-scope-project");
-    let workdir = std::fs::canonicalize(scratch.path()).unwrap();
+    let workdir = daemon_canonical(scratch.path());
     let mut rig = rig_with_target_capabilities(&[]).await;
     rig.handler = rig
         .handler
@@ -876,4 +876,14 @@ async fn activity_route_project_fields_come_from_scope_even_for_legacy_target() 
     assert!(entries[1].actor.workdir.is_none());
     assert!(entries[1].actor.project_id.is_none());
     assert!(entries[1].actor.project_root.is_some());
+}
+
+/// A folder as the daemon stores it: canonical, and on Windows in the plain
+/// spelling. `std::fs::canonicalize` returns the verbatim `\\?\` form there,
+/// which the daemon never stores (docs/path-canonicalization.md).
+fn daemon_canonical(path: &std::path::Path) -> std::path::PathBuf {
+    crate::ProjectRootId::from_path_allowing_missing(path)
+        .unwrap()
+        .as_path()
+        .to_path_buf()
 }

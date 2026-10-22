@@ -872,11 +872,7 @@ fn scope_workdir_refuses_relative_and_unresolvable_paths_without_replacing_state
 #[test]
 fn scope_workdir_and_project_are_immutable_including_absence_until_a_new_epoch() {
     let dir = cortexkit_test_support::ScratchDir::new("scope-workdir");
-    let folder = std::fs::canonicalize(dir.path())
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .to_owned();
+    let folder = daemon_canonical(dir.path()).to_str().unwrap().to_owned();
     for delta in [false, true] {
         for populated in [false, true] {
             let mut table = ScopeTable::new([]);
@@ -900,7 +896,13 @@ fn scope_workdir_and_project_are_immutable_including_absence_until_a_new_epoch()
                     error_codes::SCOPE_WORKDIR_CHANGED,
                 ),
                 (
-                    Some(format!("{folder}/other")),
+                    Some(
+                        std::path::Path::new(&folder)
+                            .join("other")
+                            .to_str()
+                            .unwrap()
+                            .to_owned(),
+                    ),
                     original.project_id.clone(),
                     error_codes::SCOPE_WORKDIR_CHANGED,
                 ),
@@ -1046,4 +1048,14 @@ fn scope_workdir_table_stores_input_verbatim_without_filesystem_resolution() {
             .as_deref(),
         Some(unresolvable.as_str())
     );
+}
+
+/// A folder as the daemon stores it: canonical, and on Windows in the plain
+/// spelling. `std::fs::canonicalize` returns the verbatim `\\?\` form there,
+/// which the daemon never stores (docs/path-canonicalization.md).
+fn daemon_canonical(path: &std::path::Path) -> std::path::PathBuf {
+    crate::ProjectRootId::from_path_allowing_missing(path)
+        .unwrap()
+        .as_path()
+        .to_path_buf()
 }

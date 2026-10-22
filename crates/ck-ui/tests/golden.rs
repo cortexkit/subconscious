@@ -5,6 +5,7 @@
 
 use ck_ui::app::{App, Overlay, Tab};
 use ck_ui::screens::logs::LogState;
+use ck_ui::time::{Timestamp, UtcOffset};
 use ck_ui::{Snapshot, Theme};
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
@@ -21,9 +22,8 @@ fn app() -> App {
     app
 }
 
-fn render(app: &App, snap: &Snapshot, w: u16, h: u16) -> Buffer {
+fn render_at(app: &App, snap: &Snapshot, w: u16, h: u16, now: Timestamp) -> Buffer {
     let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
-    let now = Snapshot::fixture_now();
     terminal
         .draw(|f| app.render(f.buffer_mut(), snap, now))
         .unwrap();
@@ -65,12 +65,16 @@ fn style_runs(buf: &Buffer) -> Vec<String> {
 }
 
 fn check(name: &str, app: &App, snap: &Snapshot) {
+    check_at(name, app, snap, Snapshot::fixture_now());
+}
+
+fn check_at(name: &str, app: &App, snap: &Snapshot, now: Timestamp) {
     let (w, h) = {
         let size = name.rsplit('-').next().unwrap();
         let (w, h) = size.split_once('x').unwrap();
         (w.parse().unwrap(), h.parse().unwrap())
     };
-    let buf = render(app, snap, w, h);
+    let buf = render_at(app, snap, w, h, now);
     let want_txt = std::fs::read_to_string(format!("{GOLDEN}/{name}.txt")).unwrap();
     let want_styles = std::fs::read_to_string(format!("{GOLDEN}/{name}.styles")).unwrap();
     let want_rows: Vec<&str> = want_txt.lines().collect();
@@ -169,4 +173,27 @@ fn logs_120x36() {
         ..LogState::default()
     });
     check("logs-120x36", &app, &Snapshot::fixture_logs());
+}
+
+/// The Activity frame's machine is two hours east of UTC: its pane reads
+/// "18:20:36 local · UTC+2" while its clock and list read the fixture's
+/// times. The fixture holds those times as UTC, so here the host gets the
+/// frame's offset, and the entries and the moment drawn move two hours
+/// earlier, which leaves every wall-clock reading the frame shows as it is.
+fn east_of_utc(mut snap: Snapshot) -> (Snapshot, Timestamp) {
+    const OFFSET_SECS: i32 = 2 * 3600;
+    let shift = -i64::from(OFFSET_SECS) * 1000;
+    snap.host.data.utc_offset = UtcOffset(OFFSET_SECS);
+    for row in &mut snap.activity_log.data.rows {
+        row.at = row.at.add_millis(shift);
+    }
+    (snap, Snapshot::fixture_now().add_millis(shift))
+}
+
+#[test]
+fn activity_120x36() {
+    let mut app = app();
+    app.tab = Tab::Activity;
+    let (snap, now) = east_of_utc(Snapshot::fixture());
+    check_at("activity-120x36", &app, &snap, now);
 }

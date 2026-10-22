@@ -310,12 +310,16 @@ fn mouse_clicks_tabs_and_rows_and_scrolls_the_selection() {
     // The fixture serves every tab, so each one the bar draws opens.
     assert!(app.handle_event(&click(41, 0), &snap, (120, 36)));
     assert_eq!(app.tab, Tab::Activity);
-    // The live app's bar has no Activity, so the same place does nothing.
+    // The live app's bar has no Usage, so the place it has in the full bar
+    // does nothing.
     let mut live = Snapshot::fixture();
     live.serves = ck_ui::model::Serves::LIVE;
     let mut app = App::new(Theme::test());
-    assert!(!app.handle_event(&click(41, 0), &live, (120, 36)));
+    assert!(!app.handle_event(&click(54, 0), &live, (120, 36)));
     assert_eq!(app.tab, Tab::Home);
+    // Activity is served live, at the same place as in the full bar.
+    assert!(app.handle_event(&click(41, 0), &live, (120, 36)));
+    assert_eq!(app.tab, Tab::Activity);
 }
 
 #[test]
@@ -328,15 +332,17 @@ fn quit_keys_and_later_screens_keys() {
         assert!(app.handle_key(key(KeyCode::Char(tab.key())), &snap));
         assert_eq!(app.tab, tab);
     }
-    // The live app serves Home and Modules: the later screens' keys do
-    // nothing there.
+    // The live app serves Home, Modules and Activity: the later screens'
+    // keys do nothing there.
     let mut live = Snapshot::fixture();
     live.serves = ck_ui::model::Serves::LIVE;
     let mut app = App::new(Theme::light());
-    for k in '3'..='7' {
+    for k in '4'..='7' {
         assert!(!app.handle_key(key(KeyCode::Char(k)), &live));
         assert_eq!(app.tab, Tab::Home);
     }
+    assert!(app.handle_key(key(KeyCode::Char('3')), &live));
+    assert_eq!(app.tab, Tab::Activity);
     assert!(app.handle_key(key(KeyCode::Char('2')), &live));
     assert_eq!(app.tab, Tab::Modules);
     app.tab = Tab::Home;

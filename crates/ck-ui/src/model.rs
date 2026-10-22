@@ -502,6 +502,13 @@ pub struct ActivityRow {
     pub what: String,
     /// Who asked for it; `None` for exits and labels.
     pub who: Option<String>,
+    /// Who asked for it as the detail pane's By row words it, when that
+    /// says more than `who`. Only the design fixture has such wording (its
+    /// "ck on this Mac"); the live app leaves it `None`, and the pane reads
+    /// `who`.
+    pub by: Option<String>,
+    /// Whether the actor carries an agent id: the Agents chip lists these.
+    pub by_agent: bool,
     /// The entry's kind as recorded ("subc.module_restarted"); `None` for
     /// exits and labels.
     pub kind: Option<String>,
@@ -828,12 +835,13 @@ impl Serves {
         all_metrics: false,
     };
 
-    /// What the live app does today: Home and Modules.
+    /// What the live app does today: Home, Modules and Activity, with
+    /// Activity's `/` filter.
     pub const LIVE: Serves = Serves {
-        tabs: TabSet::of(&[Tab::Home, Tab::Modules]),
+        tabs: TabSet::of(&[Tab::Home, Tab::Modules, Tab::Activity]),
         settings: false,
         swap: false,
-        list_filter: TabSet::EMPTY,
+        list_filter: TabSet::of(&[Tab::Activity]),
         multi_select: false,
         double_click: false,
         ckni: false,
@@ -981,6 +989,64 @@ mod fixture {
         Timestamp::from_unix_millis(
             day_start - days_back * 86_400_000 + ((h * 60 + m) * 60 + sec) * 1000 + ms,
         )
+    }
+
+    /// The Activity screen's rows: today's entries, the ones the Activity
+    /// frame draws. The file gives each a clock time, a module, what
+    /// happened, who did it and a short kind word ("module", "approval",
+    /// "config", "agent", "flow"). The rest is the frame's: every entry
+    /// recorded at 36 seconds past its minute, seqs counting down from
+    /// 48,213, the ledger kind each kind word stands for, "ck on this Mac"
+    /// as the By row for ck, and for a restart on a build the old build
+    /// 7c3a47b9 with the frame's details.
+    fn activity_log(v: &Value, now: Timestamp) -> ActivityLog {
+        let rows = arr(&v["activity"])
+            .iter()
+            .enumerate()
+            .map(|(i, a)| {
+                let subject = s(&a["mod"]);
+                let what = s(&a["what"]);
+                let who = s(&a["who"]);
+                let word = s(&a["kind"]);
+                let kind = match word.as_str() {
+                    "module" => "subc.module_restarted".to_string(),
+                    "approval" => "cingulate.consent_answered".to_string(),
+                    "config" => "subc.config_changed".to_string(),
+                    other => format!("{subject}.{other}"),
+                };
+                let digest = what.strip_prefix("restarted on build ").map(str::to_string);
+                let mut details = serde_json::Map::new();
+                if let Some(d) = &digest {
+                    details.insert("old_evidence".into(), Value::from("7c3a47b9…"));
+                    details.insert("new_evidence".into(), Value::from(format!("{d}…")));
+                    details.insert("drain_ms".into(), Value::from(412));
+                }
+                let seq = 48_213 - i as u64;
+                ActivityRow {
+                    key: ActivityKey::Entry {
+                        incarnation: "fixture".into(),
+                        seq,
+                    },
+                    partner: None,
+                    row: ActivityRowKind::Entry,
+                    at: today(now, &format!("{}:36", a["t"].as_str().unwrap_or("00:00"))),
+                    by: (who == "ck").then(|| "ck on this Mac".to_string()),
+                    by_agent: word == "agent",
+                    who: Some(who),
+                    kind: Some(kind),
+                    seq: Some(seq),
+                    build: digest.map(|d| format!("7c3a47b9 → {d}")),
+                    details: Some(details),
+                    subject,
+                    what,
+                }
+            })
+            .collect();
+        ActivityLog {
+            rows,
+            history_exhausted: false,
+            newer_unloaded: false,
+        }
     }
 
     fn duration_from(now: Timestamp, text: &str) -> Option<Timestamp> {
@@ -1239,8 +1305,7 @@ mod fixture {
                 },
             ),
             activity: Panel::new(now, activity),
-            // The Activity screen's own rows are not in the fixture yet.
-            activity_log: Panel::new(now, ActivityLog::default()),
+            activity_log: Panel::new(now, activity_log(&v, now)),
             process_events: Panel::new(now, process_events),
             agents: Panel::new(now, agents),
             devices: Panel::new(now, devices),

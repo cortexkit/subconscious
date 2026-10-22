@@ -16,6 +16,7 @@ use tokio::sync::watch;
 
 use crate::draw::{tab_spans, Canvas};
 use crate::model::{ActionKind, Daemon, LogView, Module, PaletteCommand, Panel, Snapshot, Status};
+use crate::screens::activity::ActivityState;
 use crate::screens::logs::{self, LevelFilter, LogState};
 use crate::screens::{self, overlays, View, MIN_H, MIN_W};
 use crate::theme::{detect_theme, Theme};
@@ -104,6 +105,8 @@ pub struct App {
     pub down_log: bool,
     /// The text field that has the keyboard, if any.
     pub field: Option<TextField>,
+    /// The Activity screen's selection, kind chip and filter.
+    pub activity: ActivityState,
     /// Requests made since the run loop last collected them.
     pub requests: Vec<Request>,
 }
@@ -127,6 +130,7 @@ impl App {
             metrics: None,
             down_log: false,
             field: None,
+            activity: ActivityState::default(),
             requests: Vec::new(),
         }
     }
@@ -252,7 +256,9 @@ impl App {
                 screens::metrics::draw(&mut c, &v, m, scroll)
             }
             (Tab::Modules, ..) => screens::modules::draw(&mut c, &v),
-            (Tab::Activity, ..) => screens::activity::draw(&mut c, &v),
+            (Tab::Activity, ..) => {
+                screens::activity::draw(&mut c, &v, &self.activity, self.field.is_some())
+            }
             (Tab::Usage, ..) => screens::usage::draw(&mut c, &v),
             (Tab::Agents, ..) => screens::agents::draw(&mut c, &v),
             (Tab::Devices, ..) => screens::devices::draw(&mut c, &v),
@@ -324,6 +330,15 @@ impl App {
             return self.confirm_key(key);
         }
         if let Some(handled) = self.field_key(key) {
+            // Activity's list follows its filter as it is typed; esc closes
+            // the field and clears the filter with it.
+            if self.tab == Tab::Activity {
+                self.activity.filter = self
+                    .field
+                    .as_ref()
+                    .map(|f| f.text.clone())
+                    .unwrap_or_default();
+            }
             return handled;
         }
         if self.overlay == Some(Overlay::Palette) {
@@ -344,6 +359,11 @@ impl App {
             .intersects(KeyModifiers::ALT | KeyModifiers::SUPER)
         {
             return false;
+        }
+        if self.overlay.is_none() && self.tab == Tab::Activity {
+            if let Some(handled) = self.activity_key(key, snap) {
+                return handled;
+            }
         }
         match key.code {
             KeyCode::Char('k') if ctrl => self.open_palette(),
@@ -369,6 +389,11 @@ impl App {
                     self.overlay = None;
                 } else if let Some(tab) = self.back.take() {
                     self.tab = tab;
+                    // Away from Activity the live layer reads from the top;
+                    // back on it, the list's view is where it was left.
+                    if tab == Tab::Activity {
+                        self.activity_view(false);
+                    }
                 } else {
                     return false;
                 }
@@ -637,6 +662,92 @@ impl App {
         self.log = None;
         self.metrics = None;
         self.field = None;
+        // The live layer reads the Activity list from the top whenever
+        // another tab shows, so the list opens at the top.
+        self.activity.sel = None;
+    }
+
+    /// Keys for the Activity screen ahead of the app-wide ones. `None` lets
+    /// the key fall through to them (tabs, palette, help, quit, moving).
+    fn activity_key(&mut self, key: KeyEvent, snap: &Snapshot) -> Option<bool> {
+        match key.code {
+            // ⏎ in the filter field ends typing and keeps the filter.
+            KeyCode::Enter if self.field.is_some() => self.field = None,
+            KeyCode::Enter => return Some(self.open_activity_subject(snap)),
+            KeyCode::Tab => {
+                self.activity.chip = self.activity.chip.next();
+                self.activity.sel = None;
+                self.activity_view(false);
+            }
+            KeyCode::BackTab => {
+                self.activity.chip = self.activity.chip.prev();
+                self.activity.sel = None;
+                self.activity_view(false);
+            }
+            KeyCode::Char('/') if snap.serves.list_filter.contains(Tab::Activity) => {
+                self.field = Some(TextField {
+                    text: self.activity.filter.clone(),
+                });
+            }
+            KeyCode::Esc if !self.activity.filter.is_empty() && self.overlay.is_none() => {
+                self.activity.filter.clear();
+            }
+            _ => return None,
+        }
+        Some(true)
+    }
+
+    /// `⏎` on Activity: a row whose subject is a module in the roster opens
+    /// Modules with that module selected; `esc` comes back.
+    fn open_activity_subject(&mut self, snap: &Snapshot) -> bool {
+        let rows = screens::activity::selectable(&snap.activity_log.data, &self.activity);
+        let Some(row) = rows
+            .get(screens::activity::selected_pos(
+                &rows,
+                self.activity.sel.as_ref(),
+            ))
+            .copied()
+        else {
+            return false;
+        };
+        let Some(i) = snap.modules.data.iter().position(|m| m.id == row.subject) else {
+            return false;
+        };
+        self.mod_sel = i;
+        self.tab = Tab::Modules;
+        self.back = Some(Tab::Activity);
+        true
+    }
+
+    /// Tells the live layer where the Activity list's view is: the selected
+    /// row, and with `older`, that it reached the oldest loaded row and
+    /// wants the next older page.
+    fn activity_view(&mut self, older: bool) {
+        self.requests.push(Request::ActivityView {
+            anchor: self.activity.sel.clone(),
+            older,
+        });
+    }
+
+    /// Moves the Activity selection by `delta` rows. Reaching the last row
+    /// shown, or pressing on past it, asks for the next older page while
+    /// older entries are kept.
+    fn move_activity(&mut self, delta: i32, snap: &Snapshot) -> bool {
+        let log = &snap.activity_log.data;
+        let rows = screens::activity::selectable(log, &self.activity);
+        if rows.is_empty() {
+            return false;
+        }
+        let at = screens::activity::selected_pos(&rows, self.activity.sel.as_ref());
+        let next = (at as i64 + i64::from(delta)).clamp(0, rows.len() as i64 - 1) as usize;
+        let at_bottom = next + 1 == rows.len();
+        let older = at_bottom && delta > 0 && !log.history_exhausted;
+        if next == at && !older {
+            return false;
+        }
+        self.activity.sel = (next > 0).then(|| rows[next].key.clone());
+        self.activity_view(older);
+        true
     }
 
     fn palette_key(&mut self, key: KeyEvent, snap: &Snapshot) -> bool {
@@ -727,6 +838,7 @@ impl App {
                 (&mut self.home_sel, rows)
             }
             Tab::Modules => (&mut self.mod_sel, snap.modules.data.len()),
+            Tab::Activity => return self.move_activity(delta, snap),
             // The other tabs' screens keep no selection here yet.
             _ => return false,
         };

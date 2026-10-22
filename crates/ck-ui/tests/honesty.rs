@@ -587,9 +587,11 @@ fn the_live_app_advertises_only_what_it_serves() {
     s.commands = ck_ui::live::palette_commands(&s.modules.data);
     // The fixture's roster has every module a tab needs, so what shows is
     // exactly what the live app serves.
-    let served = TabSet::of(&[Tab::Home, Tab::Modules]);
+    let served = TabSet::of(&[Tab::Home, Tab::Modules, Tab::Activity]);
     assert_eq!(s.serves.tabs, served);
     assert_eq!(s.visible_tabs(), served);
+    // Activity's filter is the only one served.
+    assert_eq!(s.serves.list_filter, TabSet::of(&[Tab::Activity]));
 
     // The keys page lists the live app's keys, each of them handled below.
     let listed: Vec<String> = help_columns(s.serves, s.visible_tabs())
@@ -599,7 +601,7 @@ fn the_live_app_advertises_only_what_it_serves() {
     assert_eq!(
         listed,
         [
-            "1 – 2",
+            "1 – 3",
             ":",
             "?",
             "esc",
@@ -607,6 +609,7 @@ fn the_live_app_advertises_only_what_it_serves() {
             "q",
             "↑↓ j k",
             "⏎",
+            "/",
             "g G",
             "r",
             "s",
@@ -622,10 +625,9 @@ fn the_live_app_advertises_only_what_it_serves() {
         "restart, no downtime",
         "settings",
         "space",
-        "filter",
         "double-click",
         "ckni",
-        "3 Activity",
+        "4 Usage",
     ] {
         assert!(
             !page.contains(gone),
@@ -673,20 +675,39 @@ fn the_live_app_advertises_only_what_it_serves() {
     assert!(served(&mut app, KeyCode::Char('l')));
     assert!(app.log.is_some());
     assert!(served(&mut App::new(Theme::test()), KeyCode::Char('q')));
+    // On Activity: `/` opens the filter, typing narrows the list, ⏎ keeps
+    // it, esc clears it, tab moves to the next kind chip, and ⏎ opens the
+    // selected row's module on Modules.
+    let mut app = App::new(Theme::test());
+    assert!(served(&mut app, KeyCode::Char('3')));
+    assert_eq!(app.tab, Tab::Activity);
+    assert!(served(&mut app, KeyCode::Char('/')));
+    assert!(served(&mut app, KeyCode::Char('m')));
+    assert_eq!(app.activity.filter, "m");
+    assert!(served(&mut app, KeyCode::Enter));
+    assert!(app.field.is_none() && app.activity.filter == "m");
+    assert!(served(&mut app, KeyCode::Esc));
+    assert!(app.activity.filter.is_empty());
+    assert!(served(&mut app, KeyCode::Tab));
+    assert_eq!(app.activity.chip, ck_ui::screens::activity::Chip::Modules);
+    assert!(served(&mut app, KeyCode::Down) && served(&mut app, KeyCode::Up));
+    assert!(served(&mut app, KeyCode::Enter), "open the subject");
+    assert_eq!(app.tab, Tab::Modules);
     // The number keys of tabs it doesn't serve do nothing.
-    for k in '3'..='7' {
+    for k in '4'..='7' {
         let mut app = App::new(Theme::test());
         assert!(!served(&mut app, KeyCode::Char(k)), "{k}");
         assert_eq!(app.tab, Tab::Home, "{k}");
     }
 
-    // The Modules view shows no filter or settings hint, and only the two
+    // The Modules view shows no filter or settings hint, and only the
     // tabs that have screens.
     let mut app = modules_app(&s, "broca");
     let buf = render(&app, &s, 120, 36);
     assert!(!row(&buf, 3).contains("/ to filter"), "{}", row(&buf, 3));
     assert!(!row(&buf, 35).contains("settings"));
-    assert!(!row(&buf, 0).contains("3 Activity"), "{}", row(&buf, 0));
+    assert!(row(&buf, 0).contains("3 Activity"), "{}", row(&buf, 0));
+    assert!(!row(&buf, 0).contains("4 Usage"), "{}", row(&buf, 0));
     assert!(row(&buf, 0).contains("2 Modules"));
     // Each tab's filter is served on its own: serving it on the other lists
     // never puts a filter hint on Modules.
@@ -702,7 +723,7 @@ fn the_live_app_advertises_only_what_it_serves() {
         .filter(|c| c.area == "App" && Tab::from_name(&c.title).is_some())
         .map(|c| c.title.as_str())
         .collect();
-    assert_eq!(tabs_offered, ["Home", "Modules"]);
+    assert_eq!(tabs_offered, ["Home", "Modules", "Activity"]);
 
     // Every palette command runs: a restart request or the log view.
     for cmd in palette {
@@ -718,6 +739,7 @@ fn the_live_app_advertises_only_what_it_serves() {
             || app.quit
             || app.theme.mode() != Theme::test().mode()
             || app.tab == Tab::Modules
+            || app.tab == Tab::Activity
             || cmd.title == "Home";
         assert!(did, "{:?} did nothing", cmd.title);
     }

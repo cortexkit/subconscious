@@ -1,0 +1,11 @@
+{
+  "expect": {
+    "config_sha256": "5f2b9c8e0d1a7f3e4b6c2d9a8e7f1b0c3d5e6f7a8b9c0d1e2f3a4b5c6d7e8f90",
+    "staged_generation": {
+      "counter": 4,
+      "incarnation": "0123456789abcdef0123456789abcdef"
+    }
+  },
+  "op": "supervisor.rescan_checked",
+  "preview": false
+}

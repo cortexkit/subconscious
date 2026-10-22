@@ -115,6 +115,17 @@ const SUBC_CONTROL_OPS: &[&str] = &[
     ops::SUPERVISOR_SPAWN_SUBSCRIBE,
 ];
 
+/// Client ops the daemon serves but leaves out of `subc_ops`. Each is
+/// announced by a capability in `server.describe` instead, and clients check
+/// that capability before sending it. `ck daemon --json` prints `subc_ops`
+/// verbatim and scripts read that output, so a new name there would change it.
+/// A malformed body for one of these is still refused `invalid_control_body`
+/// rather than as an unknown op.
+const SUBC_UNADVERTISED_CONTROL_OPS: &[&str] = &[ops::SUPERVISOR_RESCAN_CHECKED];
+
+mod rescan_checked;
+use rescan_checked::{RescanMode, RescanPlan};
+
 const MODULE_TO_SUBC_CONTROL_OPS: &[&str] = &[
     MODULE_TO_SUBC_OP_CATALOG_UPDATE,
     "supervisor.live_roots",
@@ -298,6 +309,12 @@ struct SupervisorRescanContext {
     admission_facts_targets: Option<Vec<String>>,
     scope_authority_owners: Vec<String>,
     privileged_operator_prompt: PrivilegedOperatorPrompt,
+    /// Counts executed rescans that set out to change the supervised modules'
+    /// staged or applied configuration, counted before the first change so a
+    /// rescan that fails partway still counts. With the daemon incarnation it
+    /// names the state a `supervisor.rescan_checked` preview was computed
+    /// against.
+    generation: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// Refusal labels passed to `observe_route_open_refusal` that mean the target
@@ -1226,6 +1243,7 @@ impl ControlHandler {
             admission_facts_targets: self.admission_facts_targets.clone(),
             scope_authority_owners: self.scope_authority_owners.clone(),
             privileged_operator_prompt: self.privileged_operator_prompt,
+            generation: Arc::default(),
         });
         self
     }
@@ -2884,7 +2902,23 @@ impl ControlHandler {
                     )?;
                 }
                 let requester = self.supervisor_requester(ctx, frame.header.corr)?;
-                self.handle_supervisor_rescan(frame, preview, requester)
+                self.handle_supervisor_rescan(
+                    frame,
+                    if preview {
+                        RescanMode::Preview
+                    } else {
+                        RescanMode::Execute
+                    },
+                    requester,
+                )
+                .await
+            }
+            ClientControlRequest::SupervisorRescanChecked {
+                preview,
+                candidate,
+                expect,
+            } => {
+                self.handle_supervisor_rescan_checked(ctx, frame, preview, candidate, expect)
                     .await
             }
             ClientControlRequest::SupervisorReleaseReserved { module_id } => {
@@ -3838,13 +3872,17 @@ impl ControlHandler {
         let response = ClientControlResponse::ServerDescribe {
             protocol_ver: PROTOCOL_VERSION,
             subc_ops: subc_ops(),
-            capabilities: self.subc_capabilities.as_ref().to_vec(),
+            capabilities: self.describe_capabilities(),
             connected_clients: self.connected_clients.count(),
             counters: Some(counters),
             build_git_sha: Some(env!("SUBC_BUILD_GIT_SHA").to_string()),
             build_lock_digest: Some(env!("SUBC_BUILD_LOCK_DIGEST").to_string()),
             capability_requirements: self.capability_requirement_statuses(),
             machine_id: self.machine_id.as_ref().map(|id| id.as_str().to_owned()),
+            config_path: self
+                .rescan
+                .as_ref()
+                .and_then(|context| rescan_checked::reported_config_path(&context.config_path)),
         };
         Ok(vec![control_response_body_frame(
             &frame,
@@ -5628,12 +5666,16 @@ impl ControlHandler {
         )?])
     }
 
+    /// `supervisor.rescan` and `supervisor.rescan_checked`. `mode` says where
+    /// the configuration comes from and whether to apply it; every mode then
+    /// runs the same comparison, so a preview describes the apply it previews.
     async fn handle_supervisor_rescan(
         &self,
         frame: Frame,
-        preview: bool,
+        mode: RescanMode,
         requester: Principal,
     ) -> Result<Vec<Frame>, RouterError> {
+        let preview = mode.previews();
         let Some(context) = self.rescan.clone() else {
             return Ok(vec![control_error_frame(
                 &frame,
@@ -5644,15 +5686,12 @@ impl ControlHandler {
 
         let operation_lock = self.supervisor.operation_lock();
         let _operation_guard = operation_lock.lock().await;
-        let loaded = match crate::daemon_config::load_with_activity(&context.config_path) {
+        // Loaded under the operation lock, so no other rescan can change the
+        // staged configuration between a checked apply's comparison and the
+        // apply itself.
+        let loaded = match self.load_rescan_config(&mode, &context) {
             Ok(config) => config,
-            Err(err) => {
-                return Ok(vec![control_error_frame(
-                    &frame,
-                    "invalid_daemon_config",
-                    format!("supervisor rescan rejected daemon config: {err}"),
-                )?])
-            }
+            Err((code, message)) => return Ok(vec![control_error_frame(&frame, code, message)?]),
         };
         // `load` reports a missing file as Ok(None), which is correct at boot
         // (no config, nothing to supervise) and catastrophic here: rescan treats
@@ -5761,18 +5800,40 @@ impl ControlHandler {
                         .any(|(configured_id, _)| configured_id == module_id)
                 })
                 .collect::<Vec<_>>();
-            self.capability_evaluator.preview_removal_warnings(
+            // A candidate preview also names providers the candidate disables.
+            // `supervisor.rescan`'s own preview keeps its removal-only warnings.
+            let disabled = match &mode {
+                RescanMode::Candidate(_) => resulting_modules
+                    .iter()
+                    .filter(|(_, enabled)| !enabled)
+                    .map(|(module_id, _)| module_id.clone())
+                    .collect::<Vec<_>>(),
+                _ => Vec::new(),
+            };
+            self.capability_evaluator.preview_warnings(
                 resulting_modules,
                 &removed,
+                &disabled,
                 &registrations,
             )
         } else {
             Vec::new()
         };
-        let result = match self
-            .reconcile_supervised_modules(&context.supervisor, modules, preview, requester.clone())
-            .await
-        {
+        let reconciled = match &mode {
+            RescanMode::Candidate(candidate) => {
+                self.preview_candidate(&context, modules, candidate)
+            }
+            _ => {
+                self.reconcile_supervised_modules(
+                    &context.supervisor,
+                    modules,
+                    preview,
+                    requester.clone(),
+                )
+                .await
+            }
+        };
+        let result = match reconciled {
             Ok(result) => result,
             Err(message) => {
                 return Ok(vec![control_error_frame(&frame, "rescan_failed", message)?])
@@ -5872,21 +5933,13 @@ impl ControlHandler {
         )?])
     }
 
-    /// Reconcile the running module set against the configured one.
-    ///
-    /// With `preview` set, the diff is computed and returned WITHOUT applying any
-    /// of it: nothing is retired, reconfigured, enabled or spawned. The preview
-    /// deliberately shares this function with the executing path rather than
-    /// computing the same diff somewhere else -- two implementations of one
-    /// decision agree until they do not, and the whole value of a preview is that
-    /// it describes the operation that will actually run.
-    async fn reconcile_supervised_modules(
+    /// Compare the configured module set with the supervised one, changing
+    /// nothing. The staged spec each supervised module holds is what the
+    /// configured entry is compared with.
+    fn plan_rescan(
         &self,
-        supervisor: &Supervisor,
         configured_modules: Vec<crate::daemon_config::ConfiguredModule>,
-        preview: bool,
-        requester: Principal,
-    ) -> Result<SupervisorRescanResult, String> {
+    ) -> Result<RescanPlan, String> {
         let mut current = BTreeMap::new();
         for module in self.supervisor.list() {
             let (spec, health) = module.configuration().map_err(|err| {
@@ -5954,6 +6007,34 @@ impl ControlHandler {
                 unchanged = unchanged.saturating_add(1);
             }
         }
+        Ok(RescanPlan {
+            current,
+            configured,
+            added,
+            removed,
+            changed_pending_reload,
+            configuration_changes,
+            enabled_changes,
+            unchanged,
+        })
+    }
+
+    /// Reconcile the running module set against the configured one.
+    ///
+    /// With `preview` set, the diff is computed and returned WITHOUT applying any
+    /// of it: nothing is retired, reconfigured, enabled or spawned. The preview
+    /// deliberately shares this function with the executing path rather than
+    /// computing the same diff somewhere else -- two implementations of one
+    /// decision agree until they do not, and the whole value of a preview is that
+    /// it describes the operation that will actually run.
+    async fn reconcile_supervised_modules(
+        &self,
+        supervisor: &Supervisor,
+        configured_modules: Vec<crate::daemon_config::ConfiguredModule>,
+        preview: bool,
+        requester: Principal,
+    ) -> Result<SupervisorRescanResult, String> {
+        let plan = self.plan_rescan(configured_modules)?;
 
         // Everything above this point is pure computation over two snapshots.
         // Everything below MUTATES. The preview returns here so the boundary is a
@@ -5961,19 +6042,32 @@ impl ControlHandler {
         // site, where one missed guard would apply part of a change the caller was
         // told would not happen.
         if preview {
-            return Ok(SupervisorRescanResult {
-                added,
-                removed,
-                changed_pending_reload,
-                enabled_changes: enabled_changes.iter().cloned().collect(),
-                unchanged,
-                preview: true,
-                // Filled by the caller on both paths, so the preview reports
-                // restart-required sections identically to an executed rescan --
-                // the preview is where an operator is most likely to be looking.
-                restart_required: Vec::new(),
-                capability_warnings: Vec::new(),
-            });
+            return Ok(plan.preview_result());
+        }
+        let RescanPlan {
+            current,
+            configured,
+            added,
+            removed,
+            changed_pending_reload,
+            configuration_changes,
+            enabled_changes,
+            unchanged,
+        } = plan;
+        // The staged generation moves before the first change rather than
+        // after the last, so a rescan that fails partway still invalidates
+        // every earlier `supervisor.rescan_checked` preview: part of its diff
+        // may have run.
+        if !(added.is_empty()
+            && removed.is_empty()
+            && configuration_changes.is_empty()
+            && enabled_changes.is_empty())
+        {
+            if let Some(context) = &self.rescan {
+                context
+                    .generation
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
         }
 
         for module_id in &removed {
@@ -6092,6 +6186,9 @@ impl ControlHandler {
             // previous config to diff against.
             restart_required: Vec::new(),
             capability_warnings: Vec::new(),
+            module_actions: Vec::new(),
+            earlier_pending: Vec::new(),
+            expect: None,
         })
     }
 
@@ -7001,6 +7098,16 @@ fn privileged_operation(request: &ClientControlRequest) -> Option<PrivilegedOper
                 Some(PrivilegedOperation::Rescan)
             }
         }
+        // Only the well-formed apply asks for approval. A preview changes
+        // nothing, and any other combination is refused before it touches
+        // anything, so prompting the operator for it would ask about a request
+        // that cannot run.
+        ClientControlRequest::SupervisorRescanChecked {
+            preview,
+            candidate,
+            expect,
+        } => (!*preview && candidate.is_none() && expect.is_some())
+            .then_some(PrivilegedOperation::Rescan),
         ClientControlRequest::SupervisorSetEnabled { module_id, enabled } => {
             Some(PrivilegedOperation::SetEnabled {
                 module_id,
@@ -7040,6 +7147,7 @@ fn client_control_request_op(request: &ClientControlRequest) -> &'static str {
         ClientControlRequest::SupervisorSwap { .. } => ops::SUPERVISOR_SWAP,
         ClientControlRequest::SupervisorReload { .. } => ops::SUPERVISOR_RELOAD,
         ClientControlRequest::SupervisorRescan { .. } => ops::SUPERVISOR_RESCAN,
+        ClientControlRequest::SupervisorRescanChecked { .. } => ops::SUPERVISOR_RESCAN_CHECKED,
         ClientControlRequest::SupervisorReleaseReserved { .. } => ops::SUPERVISOR_RELEASE_RESERVED,
         ClientControlRequest::SupervisorSetEnabled { .. } => ops::SUPERVISOR_SET_ENABLED,
         ClientControlRequest::SupervisorHealthProbe { .. } => ops::SUPERVISOR_HEALTH_PROBE,
@@ -7097,7 +7205,10 @@ fn parse_client_control_request(
 ) -> Result<ClientControlRequest, (serde_json::Error, ControlRequestBodyError)> {
     serde_json::from_slice::<ClientControlRequest>(body).map_err(|err| {
         let classification = match serde_json::from_slice::<ControlOpProbe>(body) {
-            Ok(probe) if SUBC_CONTROL_OPS.contains(&probe.op.as_str()) => {
+            Ok(probe)
+                if SUBC_CONTROL_OPS.contains(&probe.op.as_str())
+                    || SUBC_UNADVERTISED_CONTROL_OPS.contains(&probe.op.as_str()) =>
+            {
                 ControlRequestBodyError::InvalidBody
             }
             Ok(_) => ControlRequestBodyError::UnknownOp,

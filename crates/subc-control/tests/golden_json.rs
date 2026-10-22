@@ -3,14 +3,15 @@ use std::{collections::BTreeMap, fmt::Debug, fs, path::PathBuf};
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
 use subc_control::{
-    CatalogEntry, ChildMemoryKind, ChildResourceReading, ChildResourceUnavailableReason,
-    ChildResourceUsage, ClientControlPush, ClientControlRequest, ClientControlResponse,
-    ConsumerIdentity, DaemonBuildProvenance, DaemonObservedProcess, LaunchSpecAgreement,
-    LaunchSpecUnavailableReason, LiveSpawn, ModuleDeclaredProvenance, ModuleProtocol,
-    NotReadyReason, PendingReloadVerdict, PollKind, ReloadPathAgreement,
-    ReloadPathUnavailableReason, RouteCloseReason, RunningImageAgreement, RunningImageEvidence,
-    RunningImageUnavailableReason, SpawnCursor, SpawnEvent, SpawnEventKind, SpawnSnapshot,
-    StderrCaptureState, StderrTail, StderrTailEntry, SupervisorDaemonProvenance, SupervisorEntry,
+    BusyGaugeReading, CatalogEntry, ChildMemoryKind, ChildResourceReading,
+    ChildResourceUnavailableReason, ChildResourceUsage, ClientControlPush, ClientControlRequest,
+    ClientControlResponse, ConsumerIdentity, DaemonBuildProvenance, DaemonObservedProcess,
+    LaunchSpecAgreement, LaunchSpecUnavailableReason, LiveSpawn, ModuleDeclaredProvenance,
+    ModuleProtocol, NotReadyReason, PendingReloadVerdict, PollKind, ReloadPathAgreement,
+    ReloadPathUnavailableReason, RescanExpect, RescanModuleAction, RescanModuleActionKind,
+    RouteCloseReason, RunningImageAgreement, RunningImageEvidence, RunningImageUnavailableReason,
+    SpawnCursor, SpawnEvent, SpawnEventKind, SpawnSnapshot, StagedGeneration, StderrCaptureState,
+    StderrTail, StderrTailEntry, SupervisorDaemonProvenance, SupervisorEntry,
     SupervisorHealthEntry, SupervisorHealthStatus, SupervisorModuleProvenance,
     SupervisorObservedProcess, SupervisorRescanResult, SupervisorRoute, SupervisorRouteConsumer,
     SupervisorRouteModule,
@@ -439,6 +440,30 @@ fn client_control_requests() -> Vec<(&'static str, ClientControlRequest)> {
             ClientControlRequest::SupervisorRescan { preview: true },
         ),
         (
+            "client_control_request_supervisor_rescan_checked_preview",
+            ClientControlRequest::SupervisorRescanChecked {
+                preview: true,
+                candidate: Some("{\"version\":1,\"modules\":{}}\n".to_string()),
+                expect: None,
+            },
+        ),
+        (
+            "client_control_request_supervisor_rescan_checked_apply",
+            ClientControlRequest::SupervisorRescanChecked {
+                preview: false,
+                candidate: None,
+                expect: Some(RescanExpect {
+                    config_sha256:
+                        "5f2b9c8e0d1a7f3e4b6c2d9a8e7f1b0c3d5e6f7a8b9c0d1e2f3a4b5c6d7e8f90"
+                            .to_string(),
+                    staged_generation: StagedGeneration {
+                        incarnation: "0123456789abcdef0123456789abcdef".to_string(),
+                        counter: 4,
+                    },
+                }),
+            },
+        ),
+        (
             "client_control_request_supervisor_release_reserved",
             ClientControlRequest::SupervisorReleaseReserved {
                 module_id: "vault".to_string(),
@@ -489,6 +514,9 @@ fn client_control_responses() -> Vec<(&'static str, ClientControlResponse)> {
                 // Absent for the same reason: a daemon predating the machine
                 // id sends no key.
                 machine_id: None,
+                // Absent for the same reason: a daemon predating the config
+                // path sends no key.
+                config_path: None,
             },
         ),
         (
@@ -520,6 +548,25 @@ fn client_control_responses() -> Vec<(&'static str, ClientControlResponse)> {
                 ),
                 capability_requirements: Vec::new(),
                 machine_id: Some("fedcba9876543210fedcba9876543210".to_string()),
+                config_path: None,
+            },
+        ),
+        (
+            "client_control_response_server_describe_with_config_path",
+            ClientControlResponse::ServerDescribe {
+                protocol_ver: PROTOCOL_VERSION,
+                subc_ops: thin_core_ops(),
+                capabilities: vec![
+                    "manifest_registration_v1".to_string(),
+                    subc_control::RESCAN_CANDIDATE_PREVIEW_CAPABILITY.to_string(),
+                ],
+                connected_clients: 1,
+                counters: None,
+                build_git_sha: None,
+                build_lock_digest: None,
+                capability_requirements: Vec::new(),
+                machine_id: None,
+                config_path: Some("/Users/alex/.config/cortexkit/subc.jsonc".into()),
             },
         ),
         (
@@ -587,6 +634,78 @@ fn client_control_responses() -> Vec<(&'static str, ClientControlResponse)> {
                     preview: false,
                     restart_required: vec!["storage".to_string()],
                     capability_warnings: Vec::new(),
+                    module_actions: Vec::new(),
+                    earlier_pending: Vec::new(),
+                    expect: None,
+                },
+            },
+        ),
+        (
+            // A candidate preview: every field the plain rescan leaves out is
+            // filled, so this pins their names and shapes.
+            "client_control_response_supervisor_rescan_candidate_preview",
+            ClientControlResponse::SupervisorRescan {
+                result: SupervisorRescanResult {
+                    added: vec!["new-tools".to_string()],
+                    removed: Vec::new(),
+                    changed_pending_reload: vec!["aft-tools".to_string()],
+                    enabled_changes: vec!["paused-tools".to_string()],
+                    unchanged: 2,
+                    preview: true,
+                    restart_required: vec!["port".to_string()],
+                    capability_warnings: vec![
+                        "disabling vault leaves aft-tools requires:credentials-provider/v1 unprovided"
+                            .to_string(),
+                    ],
+                    module_actions: vec![
+                        RescanModuleAction {
+                            module_id: "aft-tools".to_string(),
+                            action: RescanModuleActionKind::Restart,
+                            changed: vec!["environment".to_string()],
+                            drain_timeout_ms: Some(30_000),
+                            busy_gauges: vec![
+                                BusyGaugeReading {
+                                    gauge: "in_flight".to_string(),
+                                    value: Some(serde_json::json!(2)),
+                                },
+                                BusyGaugeReading {
+                                    gauge: "queued".to_string(),
+                                    value: None,
+                                },
+                            ],
+                        },
+                        RescanModuleAction {
+                            module_id: "new-tools".to_string(),
+                            action: RescanModuleActionKind::Start,
+                            changed: Vec::new(),
+                            drain_timeout_ms: None,
+                            busy_gauges: Vec::new(),
+                        },
+                        RescanModuleAction {
+                            module_id: "paused-tools".to_string(),
+                            action: RescanModuleActionKind::Stop,
+                            changed: Vec::new(),
+                            drain_timeout_ms: Some(0),
+                            busy_gauges: Vec::new(),
+                        },
+                        RescanModuleAction {
+                            module_id: "probe-tools".to_string(),
+                            action: RescanModuleActionKind::Reload,
+                            changed: vec!["health".to_string()],
+                            drain_timeout_ms: None,
+                            busy_gauges: Vec::new(),
+                        },
+                    ],
+                    earlier_pending: vec!["vault".to_string()],
+                    expect: Some(RescanExpect {
+                        config_sha256:
+                            "5f2b9c8e0d1a7f3e4b6c2d9a8e7f1b0c3d5e6f7a8b9c0d1e2f3a4b5c6d7e8f90"
+                                .to_string(),
+                        staged_generation: StagedGeneration {
+                            incarnation: "0123456789abcdef0123456789abcdef".to_string(),
+                            counter: 4,
+                        },
+                    }),
                 },
             },
         ),

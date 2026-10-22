@@ -1,0 +1,66 @@
+{
+  "added": [
+    "new-tools"
+  ],
+  "capability_warnings": [
+    "disabling vault leaves aft-tools requires:credentials-provider/v1 unprovided"
+  ],
+  "changed_pending_reload": [
+    "aft-tools"
+  ],
+  "earlier_pending": [
+    "vault"
+  ],
+  "enabled_changes": [
+    "paused-tools"
+  ],
+  "expect": {
+    "config_sha256": "5f2b9c8e0d1a7f3e4b6c2d9a8e7f1b0c3d5e6f7a8b9c0d1e2f3a4b5c6d7e8f90",
+    "staged_generation": {
+      "counter": 4,
+      "incarnation": "0123456789abcdef0123456789abcdef"
+    }
+  },
+  "module_actions": [
+    {
+      "action": "restart",
+      "busy_gauges": [
+        {
+          "gauge": "in_flight",
+          "value": 2
+        },
+        {
+          "gauge": "queued"
+        }
+      ],
+      "changed": [
+        "environment"
+      ],
+      "drain_timeout_ms": 30000,
+      "module_id": "aft-tools"
+    },
+    {
+      "action": "start",
+      "module_id": "new-tools"
+    },
+    {
+      "action": "stop",
+      "drain_timeout_ms": 0,
+      "module_id": "paused-tools"
+    },
+    {
+      "action": "reload",
+      "changed": [
+        "health"
+      ],
+      "module_id": "probe-tools"
+    }
+  ],
+  "op": "supervisor.rescan",
+  "preview": true,
+  "removed": [],
+  "restart_required": [
+    "port"
+  ],
+  "unchanged": 2
+}

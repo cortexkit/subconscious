@@ -567,9 +567,11 @@ fn piped_ck_prints_its_pinned_bytes_against_two_fresh_kit_daemons() {
     assert!(report.is_empty(), "{report}");
 }
 
-/// The `config_path` a describe reply may carry, under a neutral home.
-const CONFIG_PATH: &str = "/Users/alex/.config/cortexkit/subc.jsonc";
-
+/// `server.describe` names the config file the daemon reads, which the ck app's
+/// settings editor needs. Piped `ck daemon` leaves that field out so its plain
+/// and `--json` output stay on their pins, which scripts read. The check runs
+/// against the kit daemon's own reply, and first proves that the reply carries
+/// the field, so the omission below cannot pass because nothing was sent.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn piped_ck_daemon_leaves_out_config_path_and_stays_on_its_pins() {
     let kit = tokio::task::spawn_blocking(|| {
@@ -583,33 +585,19 @@ async fn piped_ck_daemon_leaves_out_config_path_and_stays_on_its_pins() {
     })
     .await
     .unwrap();
-    let mut describe =
+    let describe =
         scripted_daemon::raw_control(&kit.connection(), &ClientControlRequest::ServerDescribe {})
             .await;
+    let config_path = describe["config_path"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the kit daemon's describe carries config_path: {describe}"))
+        .to_string();
     assert!(
-        describe.get("config_path").is_none(),
-        "the kit's daemon now reports config_path; this test's describe value must still add it"
+        std::path::Path::new(&config_path).is_absolute(),
+        "the kit daemon reports an absolute config path: {config_path}"
     );
-    describe["config_path"] = json!(CONFIG_PATH);
-    let daemon_ver = subc_transport::read_for_client(kit.connection())
-        .unwrap()
-        .daemon_ver;
-    let scripted = scripted_daemon::ScriptedDescribeDaemon::start(
-        "ck-describe-config-path",
-        &daemon_ver,
-        describe,
-    )
-    .await;
 
-    // A client reading the raw reply sees the field.
-    let seen = scripted_daemon::raw_control(
-        &scripted.connection_file_path,
-        &ClientControlRequest::ServerDescribe {},
-    )
-    .await;
-    assert_eq!(seen["config_path"], CONFIG_PATH);
-
-    let connection = scripted.connection_file_path.clone();
+    let connection = kit.connection().to_path_buf();
     let texts = tokio::task::spawn_blocking(move || {
         let mut texts = Vec::new();
         for &(pin, args) in COMMANDS {
@@ -623,11 +611,10 @@ async fn piped_ck_daemon_leaves_out_config_path_and_stays_on_its_pins() {
                 .args(args)
                 .output()
                 .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
             assert!(
-                !String::from_utf8_lossy(&output.stdout).contains("config_path")
-                    && !String::from_utf8_lossy(&output.stdout).contains(CONFIG_PATH),
-                "ck {args:?} printed the config path:\n{}",
-                String::from_utf8_lossy(&output.stdout)
+                !stdout.contains("config_path") && !stdout.contains(&config_path),
+                "ck {args:?} printed the config path:\n{stdout}"
             );
             let run = Run { pin, args, output };
             texts.push((pin, masked(&run, &kit.root().display().to_string()).0));

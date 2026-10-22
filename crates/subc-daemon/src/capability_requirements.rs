@@ -516,11 +516,15 @@ impl CapabilityRequirementEvaluator {
     }
 
     /// Evaluate a rescan preview against its resulting enabled module set without
-    /// mutating caches, episode counters, tombstones, or deadline state.
-    pub(crate) fn preview_removal_warnings(
+    /// mutating caches, episode counters, tombstones, or deadline state. Warns,
+    /// naming each registered provider in `removed` or in `disabled` (left
+    /// configured but disabled), when taking those providers away leaves a
+    /// capability that an enabled consumer requires with no enabled provider.
+    pub(crate) fn preview_warnings(
         &self,
         resulting_modules: impl IntoIterator<Item = (String, bool)>,
         removed: &[String],
+        disabled: &[String],
         registered: &[RegisteredModule],
     ) -> Vec<String> {
         let enabled = resulting_modules
@@ -528,6 +532,7 @@ impl CapabilityRequirementEvaluator {
             .filter_map(|(module_id, enabled)| enabled.then_some(module_id))
             .collect::<BTreeSet<_>>();
         let removed = removed.iter().cloned().collect::<BTreeSet<_>>();
+        let disabled = disabled.iter().cloned().collect::<BTreeSet<_>>();
         let provided_claims = registered
             .iter()
             .filter(|module| enabled.contains(&module.module_id))
@@ -564,11 +569,16 @@ impl CapabilityRequirementEvaluator {
                     continue;
                 }
                 for removed_module in registered.iter().filter(|module| {
-                    removed.contains(&module.module_id)
+                    (removed.contains(&module.module_id) || disabled.contains(&module.module_id))
                         && provides(module.capabilities.as_ref(), &requirement.capability)
                 }) {
+                    let verb = if removed.contains(&removed_module.module_id) {
+                        "removing"
+                    } else {
+                        "disabling"
+                    };
                     warnings.insert(format!(
-                        "removing {} leaves {} requires:{} unprovided",
+                        "{verb} {} leaves {} requires:{} unprovided",
                         removed_module.module_id, consumer.module_id, requirement.capability
                     ));
                 }

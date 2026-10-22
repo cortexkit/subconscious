@@ -79,6 +79,9 @@ macro_rules! open_string_enum {
     };
 }
 
+mod rescan_checked;
+pub use rescan_checked::*;
+
 /// Daemon-spawned consumer identity presented on route.open.
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct ConsumerIdentity {
@@ -130,6 +133,7 @@ pub mod ops {
     pub const SUPERVISOR_SWAP: &str = "supervisor.swap";
     pub const SUPERVISOR_RELOAD: &str = "supervisor.reload";
     pub const SUPERVISOR_RESCAN: &str = "supervisor.rescan";
+    pub const SUPERVISOR_RESCAN_CHECKED: &str = "supervisor.rescan_checked";
     pub const SUPERVISOR_RELEASE_RESERVED: &str = "supervisor.release_reserved";
     pub const SUPERVISOR_SET_ENABLED: &str = "supervisor.set_enabled";
     pub const SUPERVISOR_HEALTH_PROBE: &str = "supervisor.health_probe";
@@ -304,6 +308,37 @@ pub enum ClientControlRequest {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         preview: bool,
     },
+    /// A rescan whose preview is computed on configuration text the caller
+    /// supplies, and whose apply runs only if the daemon still matches that
+    /// preview. Served by daemons advertising
+    /// [`RESCAN_CANDIDATE_PREVIEW_CAPABILITY`].
+    ///
+    /// Exactly two forms are accepted; any other combination is refused
+    /// `invalid_control_body`:
+    /// - `preview: true` with `candidate`: parse and validate the candidate
+    ///   (at most [`RESCAN_CANDIDATE_MAX_BYTES`]) with the loader the daemon
+    ///   uses for its file, compare it with the staged module specs, and
+    ///   report what applying it would do. Nothing is written or applied.
+    ///   The reply carries the `expect` an apply must send.
+    /// - `preview: false` with `expect`: refuse
+    ///   [`CONFIG_CHANGED_SINCE_PREVIEW`] when the daemon's config file no
+    ///   longer hashes to `expect.config_sha256` or the staged generation has
+    ///   moved; otherwise apply the file exactly as `supervisor.rescan` does.
+    ///
+    /// Both reply with `supervisor.rescan`'s result shape.
+    ///
+    /// A new op rather than fields on `supervisor.rescan`: a daemon that
+    /// predates it refuses the unknown op, whereas unknown fields would be
+    /// dropped and the preview would describe the file on disk instead of the
+    /// candidate.
+    #[serde(rename = "supervisor.rescan_checked")]
+    SupervisorRescanChecked {
+        preview: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        candidate: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expect: Option<RescanExpect>,
+    },
     /// Retire the retained exact-id reservation after its configuration entry has
     /// been removed. This is intentionally separate from rescan so deleting
     /// configuration never silently opens a protected module id to registration.
@@ -408,6 +443,16 @@ pub enum ClientControlResponse {
         /// same value. Absent from daemons predating the field.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         machine_id: Option<String>,
+        /// The configuration file the daemon reads and `supervisor.rescan`
+        /// rescans, exactly as the daemon names it: never canonicalized, so a
+        /// symlinked file is reported as the link. Sent only when that path is
+        /// absolute; a relative one (no home variable set, or a relative
+        /// `XDG_CONFIG_HOME`) depends on the daemon's working directory and
+        /// would name a different file for the reader. Absent from daemons
+        /// predating the field and from daemons started without a reloadable
+        /// config file.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        config_path: Option<PathBuf>,
     },
     #[serde(rename = "catalog.list")]
     CatalogList {
@@ -2147,6 +2192,23 @@ pub struct SupervisorRescanResult {
     /// explanation, not a second manifest schema.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capability_warnings: Vec<String>,
+    /// What applying the previewed candidate would do to each module, in
+    /// module id order. Filled only by a `supervisor.rescan_checked` preview;
+    /// a module whose launch spec, health policy and enabled flag all stay as
+    /// staged has no entry, and neither has a disabled module that is added
+    /// or removed. Empty is skipped, so `supervisor.rescan` replies keep their
+    /// shape.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub module_actions: Vec<RescanModuleAction>,
+    /// Modules whose running process still uses launch inputs from an earlier
+    /// rescan: their staged spec waits for a restart that this candidate
+    /// does not cause. Filled only by a `supervisor.rescan_checked` preview.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub earlier_pending: Vec<String>,
+    /// The value an apply of this preview must send. Present only on a
+    /// `supervisor.rescan_checked` preview.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expect: Option<RescanExpect>,
 }
 
 /// Which wire protocol a supervised module speaks to subc, as DECLARED in

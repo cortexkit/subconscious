@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.30.7
+
+- `ServerDescription` gains `config_path`, the config file the daemon reads as `server.describe` reports it (absent from older daemons and when the daemon's path is relative). Requires subc-control 0.32.3.
+
 ## 0.30.6
 
 - Add typed `SubcConsumer` calls for the supervisor operations that had none: `supervisor_health`, `supervisor_health_probe` (complete metrics, which the cached view may replace with a size marker), `supervisor_provenance`, `supervisor_routes`, `supervisor_stderr_tail`, `supervisor_terminals`, `server_describe`, and the lifecycle requests `supervisor_restart` and `supervisor_set_enabled` (what `ck module restart|stop|start` send). Reads retry transport failures until the call deadline like `supervisor_list`; the lifecycle requests are sent once and never retried, since a request with an unknown outcome may already have acted. Refusals keep the daemon's code in `CallError::code`.

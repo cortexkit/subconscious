@@ -2990,6 +2990,11 @@ impl Supervisor {
         self
     }
 
+    /// The drain budget a module gets when its config entry sets none.
+    pub(crate) fn default_drain_timeout(&self) -> Duration {
+        self.drain_timeout
+    }
+
     pub fn with_process_liveness(
         mut self,
         process_liveness: Arc<SupervisorProcessLiveness>,
@@ -9658,7 +9663,7 @@ impl fmt::Display for DrainGaugeTrace {
     }
 }
 
-fn declared_busy_gauges(
+pub(crate) fn declared_busy_gauges(
     registry: &Registry,
     module_id: &str,
 ) -> Result<Vec<String>, SuperviseError> {

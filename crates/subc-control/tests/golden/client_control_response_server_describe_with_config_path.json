@@ -1,0 +1,30 @@
+{
+  "capabilities": [
+    "manifest_registration_v1",
+    "rescan-candidate-preview/v1"
+  ],
+  "config_path": "/Users/alex/.config/cortexkit/subc.jsonc",
+  "connected_clients": 1,
+  "op": "server.describe",
+  "protocol_ver": 2,
+  "subc_ops": [
+    "server.describe",
+    "catalog.list",
+    "route.open",
+    "route.poll",
+    "route.closing",
+    "route.closed",
+    "supervisor.list",
+    "supervisor.restart",
+    "supervisor.reload",
+    "supervisor.rescan",
+    "supervisor.release_reserved",
+    "supervisor.set_enabled",
+    "supervisor.health_probe",
+    "supervisor.health",
+    "supervisor.stderr_tail",
+    "supervisor.terminals",
+    "supervisor.routes",
+    "supervisor.provenance"
+  ]
+}

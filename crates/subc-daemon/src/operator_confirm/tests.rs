@@ -1971,6 +1971,165 @@ async fn privileged_scripted_unavailable_refuses_restart() {
     .await;
 }
 
+/// Answers each prompt with the next queued result, and fails closed once the
+/// queue is empty.
+struct Queued(Mutex<std::collections::VecDeque<ProviderResult>>);
+impl OperatorProvider for Queued {
+    fn prompt(
+        &self,
+        _: &str,
+        _: Box<dyn FnOnce(Arc<dyn OperatorWithdraw>) + Send>,
+    ) -> ProviderResult {
+        self.0
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or(ProviderResult::Unavailable)
+    }
+}
+
+async fn send_control(
+    handler: &ControlHandler,
+    client: &RouteCtx,
+    corr: u64,
+    request: serde_json::Value,
+) -> Frame {
+    let mut replies = tokio::time::timeout(
+        Duration::from_secs(10),
+        handler.handle_control_frame(client, frame(FrameType::Request, corr, request)),
+    )
+    .await
+    .expect("the control request answers")
+    .unwrap();
+    assert_eq!(replies.len(), 1, "{replies:?}");
+    replies.remove(0)
+}
+
+/// A direct caller's `supervisor.rescan_checked` apply against a daemon that
+/// enforces operator approval, on a handler whose operator declines the first
+/// prompt and approves the second. The preview must not prompt at all; were it
+/// to, it would take the decline and fail here.
+async fn checked_rescan_apply_waits_for_the_operator(f: Fixture, dir: &std::path::Path) {
+    let path = dir.join("subc.jsonc");
+    let doc = |enabled: bool| {
+        serde_json::json!({"version": 1, "modules": {"x": {
+            "program": "subc-checked-rescan-missing-program",
+            "protocol": "none",
+            "enabled": enabled,
+        }}})
+        .to_string()
+    };
+    std::fs::write(&path, doc(true)).unwrap();
+    let supervisor = crate::Supervisor::new(
+        Arc::new(Registry::default()),
+        crate::RestartPolicy::new(0, Duration::ZERO),
+    )
+    .with_handle(f.supervisor.clone());
+    // Set up under the default policy, which logs instead of prompting, so the
+    // operator's answers are spent only on the checked apply below. The
+    // enforcing handler is a clone: it shares the supervisor and the staged
+    // generation.
+    let logging = (*f.handler)
+        .clone()
+        .with_supervisor_rescan(supervisor, &path, None);
+    let enforcing = logging
+        .clone()
+        .with_privileged_operator_prompt(crate::daemon_config::PrivilegedOperatorPrompt::Enforce);
+    let (client, _rx) = ctx_fn(870);
+    let setup = send_control(
+        &logging,
+        &client,
+        1,
+        serde_json::json!({"op": "supervisor.rescan"}),
+    )
+    .await;
+    assert_eq!(setup.header.ty, FrameType::Response, "{}", body(&setup));
+    let x_enabled = || f.supervisor.get("x").unwrap().status().unwrap().enabled;
+    assert!(x_enabled());
+
+    let candidate = doc(false);
+    let preview = |corr| {
+        send_control(
+            &enforcing,
+            &client,
+            corr,
+            serde_json::json!({"op": "supervisor.rescan_checked", "preview": true, "candidate": candidate}),
+        )
+    };
+    let previewed = preview(2).await;
+    assert_eq!(
+        previewed.header.ty,
+        FrameType::Response,
+        "{}",
+        body(&previewed)
+    );
+    let expect = body(&previewed)["expect"].clone();
+    std::fs::write(&path, &candidate).unwrap();
+    let apply =
+        serde_json::json!({"op": "supervisor.rescan_checked", "preview": false, "expect": expect});
+
+    let declined = send_control(&enforcing, &client, 3, apply.clone()).await;
+    assert_eq!(declined.header.ty, FrameType::Error);
+    assert_eq!(body(&declined)["code"], error_codes::OPERATOR_DECLINED);
+    assert_reason(&declined, "person");
+    assert!(x_enabled(), "a declined apply leaves x running");
+    let unchanged = preview(4).await;
+    assert_eq!(
+        body(&unchanged)["expect"],
+        expect,
+        "a declined apply does not move the staged generation"
+    );
+
+    let approved = send_control(&enforcing, &client, 5, apply).await;
+    assert_eq!(
+        approved.header.ty,
+        FrameType::Response,
+        "{}",
+        body(&approved)
+    );
+    assert_eq!(body(&approved)["enabled_changes"], serde_json::json!(["x"]));
+    assert!(!x_enabled(), "the approved apply stops x");
+}
+
+#[tokio::test]
+async fn privileged_checked_rescan_apply_runs_only_when_the_operator_approves() {
+    let dir = cortexkit_test_support::ScratchDir::new("privileged-checked-rescan");
+    let provider = Queued(Mutex::new(
+        [ProviderResult::Declined, ProviderResult::Approved].into(),
+    ));
+    let f = Fixture::new(Arc::new(provider), OperatorLimits::default());
+    checked_rescan_apply_waits_for_the_operator(f, dir.path()).await;
+}
+
+/// The same, through the scripted provider an in-process harness installs
+/// with `ForwardingTable::configure_operator_script`.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn privileged_scripted_checked_rescan_apply_runs_only_when_the_script_approves() {
+    let dir = cortexkit_test_support::ScratchDir::new("privileged-scripted-checked-rescan");
+    let script = dir.join("script");
+    std::fs::write(&script, "decline\napprove\n").unwrap();
+    let forwarding = Arc::new(ForwardingTable::default());
+    configure_script_as(
+        &forwarding,
+        "ckdev-in-process-harness",
+        &script,
+        None,
+        Some(short_limits()),
+    );
+    let supervisor = SupervisorHandle::new();
+    let handler = Arc::new(
+        ControlHandler::with_forwarding(Arc::new(Registry::default()), forwarding.clone())
+            .with_supervisor(supervisor.clone()),
+    );
+    let f = Fixture {
+        forwarding,
+        handler,
+        supervisor,
+    };
+    checked_rescan_apply_waits_for_the_operator(f, dir.path()).await;
+}
+
 /// A provider whose every prompt waits until the test chooses its result.
 struct Stepped {
     events: mpsc::UnboundedSender<Event>,

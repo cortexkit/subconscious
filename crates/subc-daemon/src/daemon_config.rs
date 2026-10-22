@@ -581,6 +581,17 @@ pub fn load_with_activity(
     parse_doc_with_activity(&doc, path).map(Some)
 }
 
+/// Parse configuration text with the loader [`load_with_activity`] uses, as if
+/// it had been read from `path`. `path` only names the file in errors. Used to
+/// check text that has not been written yet, so the check and the later read
+/// of the file cannot apply different rules.
+pub fn parse_with_activity(
+    doc: &str,
+    path: impl AsRef<Path>,
+) -> Result<(DaemonConfig, ActivityConfig), DaemonConfigError> {
+    parse_doc_with_activity(doc, path.as_ref())
+}
+
 /// Loads only the daemon-wide logging block for tracing initialization.
 ///
 /// The daemon installs its global subscriber before bootstrap parses the full

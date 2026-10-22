@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.32.3
+
+- Add `ClientControlRequest::SupervisorRescanChecked { preview, candidate, expect }` (op `supervisor.rescan_checked`). `preview: true` with `candidate` parses and previews caller-supplied configuration text without writing or applying it (at most `RESCAN_CANDIDATE_MAX_BYTES`, 1 MiB) and applies nothing; `preview: false` with `expect` applies the daemon's config file as `supervisor.rescan` does, after refusing `config_changed_since_preview` when the file's SHA-256 or the staged generation (daemon incarnation and counter) no longer matches. Any other combination is refused `invalid_control_body`. Send it only to a daemon advertising `rescan-candidate-preview/v1` (`RESCAN_CANDIDATE_PREVIEW_CAPABILITY`). `SupervisorRescan { preview }` is unchanged.
+- `SupervisorRescanResult` gains `module_actions` (per module `restart`, `reload`, `start` or `stop`, with the changed parts, drain budget and busy-gauge readings), `earlier_pending` and `expect`, filled only by a candidate preview. Empty and absent values are skipped, so `supervisor.rescan` replies keep their bytes. New types: `RescanExpect`, `StagedGeneration`, `RescanModuleAction`, `RescanModuleActionKind` (an open string enum), `BusyGaugeReading`.
+- `ClientControlResponse::ServerDescribe` gains optional `config_path`: the config file the daemon reads, never canonicalized, sent only when absolute. Older readers ignore it.
+- Code that builds `SupervisorRescanResult` or `ServerDescribe` with a struct literal, or matches `ClientControlRequest` exhaustively, must add the new fields or arm.
+
 ## 0.32.2
 
 - Add standalone non-exhaustive `scope.served_by` request and reply bodies with an open answer enum, preserving exhaustive enum source compatibility.

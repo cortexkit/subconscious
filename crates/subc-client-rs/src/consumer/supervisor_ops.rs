@@ -48,6 +48,10 @@ pub struct ServerDescription {
     pub capability_requirements: Vec<CapabilityRequirementStatus>,
     /// Absent from daemons that predate the field.
     pub machine_id: Option<String>,
+    /// The configuration file the daemon reads, as the daemon names it (never
+    /// canonicalized). Absent when the daemon predates the field, was started
+    /// without a reloadable config file, or reads a relative path.
+    pub config_path: Option<std::path::PathBuf>,
 }
 
 /// A module's retained stderr from `supervisor.stderr_tail`.
@@ -287,6 +291,7 @@ impl SubcConsumer {
                 build_lock_digest,
                 capability_requirements,
                 machine_id,
+                config_path,
             } => Ok(ServerDescription {
                 protocol_ver,
                 subc_ops,
@@ -297,6 +302,7 @@ impl SubcConsumer {
                 build_lock_digest,
                 capability_requirements,
                 machine_id,
+                config_path,
             }),
             _ => Err(unexpected(OP)),
         }
@@ -465,6 +471,29 @@ mod tests {
         let described = call.await.unwrap().unwrap();
         assert_eq!(described.connected_clients, 12);
         assert_eq!(described.machine_id.as_deref(), Some("4f1a9c2e7b3d40c8"));
+        assert_eq!(described.config_path, None, "an older daemon sends no path");
+
+        let c = Arc::clone(&consumer);
+        let call = tokio::spawn(async move { c.server_describe().await });
+        let command = rx.recv().await.unwrap();
+        let reply = serde_json::json!({
+            "op": "server.describe",
+            "protocol_ver": 1,
+            "subc_ops": [],
+            "capabilities": ["rescan-candidate-preview/v1"],
+            "connected_clients": 1,
+            "config_path": "/Users/alex/.config/cortexkit/subc.jsonc"
+        });
+        let corr = command.frame.header.corr;
+        let reply = serde_json::to_vec(&reply).unwrap();
+        assert!(dispatch_frame(&shared, 1, frame(FrameType::Response, corr, reply)).await);
+        let described = call.await.unwrap().unwrap();
+        assert_eq!(
+            described.config_path.as_deref(),
+            Some(std::path::Path::new(
+                "/Users/alex/.config/cortexkit/subc.jsonc"
+            ))
+        );
     }
 
     #[tokio::test]

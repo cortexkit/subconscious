@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.4.9
+
+- Test-only: make the activity mirror backoff test independent of real time before Tokio time is paused, and verify the configured retry delay.
+
 ## 0.4.8
 
 - Fixed: the daemon's activity ledger never reached the bus. The bus module's grant did not allow publishing `ck.{acct}.event.subc.activity.v1`, so the server refused every copy and the mirror retried every 15 s without storing anything. The grant (from `cortexkit-bus-naming` 0.2.7) now allows exactly that subject, and a live-server test checks that the copy is stored and that publishing another module's events is still refused.

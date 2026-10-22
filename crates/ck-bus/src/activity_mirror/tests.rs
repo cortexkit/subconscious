@@ -299,15 +299,16 @@ async fn activity_publish_failure_then_restart_loses_nothing_and_backs_off() {
     let bus = Arc::new(Bus::default());
     *bus.fail.lock().unwrap() = Some(2);
     let events = Arc::new(Events::default());
-    let mut first = mirror(ledger.clone(), bus.clone(), &root);
+    let retry = Duration::from_secs(60 * 60);
+    let mut first = Mirror::new(ledger.clone(), bus.clone(), &root, retry);
     first.journal = events.clone();
     let task = tokio::spawn(first.run());
     until(|| !events.0.lock().unwrap().is_empty()).await;
-    // All file I/O has finished before paused time checks the retry boundary.
+    // Finish file I/O before pausing, while leaving ample time before the retry.
     tokio::time::pause();
     assert_eq!(store.read(), CursorRead::Present(cursor("current", 1)));
     assert_eq!(*bus.attempts.lock().unwrap(), [2]);
-    tokio::time::advance(Duration::from_millis(999)).await;
+    tokio::time::advance(retry - Duration::from_secs(60)).await;
     tokio::task::yield_now().await;
     assert!(
         events
@@ -323,6 +324,28 @@ async fn activity_publish_failure_then_restart_loses_nothing_and_backs_off() {
         [2],
         "publish failure must not spin"
     );
+    tokio::time::advance(Duration::from_secs(61)).await;
+    // Paused time cannot bound this wait, so a real-time deadline makes a
+    // mirror that never retries fail instead of hanging. It is generous because
+    // it only ever runs out when the test is failing.
+    let retry_deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let retrying = events
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(name, _)| name == "ckbus.activity.retrying");
+        if retrying && bus.attempts.lock().unwrap().len() == 2 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < retry_deadline,
+            "configured backoff must eventually retry the failed publish"
+        );
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(*bus.attempts.lock().unwrap(), [2, 2]);
     stop(task).await;
     tokio::time::resume();
     *bus.fail.lock().unwrap() = None;
@@ -334,7 +357,11 @@ async fn activity_publish_failure_then_restart_loses_nothing_and_backs_off() {
     );
     assert_eq!(
         *ledger.subscriptions.lock().unwrap(),
-        [cursor("current", 1), cursor("current", 1)]
+        [
+            cursor("current", 1),
+            cursor("current", 1),
+            cursor("current", 1),
+        ]
     );
     stop(task).await;
     assert_eq!(store.read(), CursorRead::Present(cursor("current", 3)));

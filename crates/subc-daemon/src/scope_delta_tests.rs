@@ -23,6 +23,7 @@ fn sync(
     generation: u64,
     records: Vec<ScopeRecord>,
 ) -> SyncApplied {
+    let records = crate::control::ControlHandler::prepare_scope_records(records);
     table
         .sync(owner, ConnectionId::new(1), |_| true, generation, records)
         .unwrap()
@@ -34,6 +35,7 @@ fn apply(
     records: Vec<ScopeRecord>,
     end: Vec<ScopeEnd>,
 ) -> SyncApplied {
+    let records = crate::control::ControlHandler::prepare_scope_records(records);
     table
         .apply(
             OWNER,
@@ -821,4 +823,227 @@ fn run_id_changes_move_version_and_drain_delegation_but_resends_do_not() {
         assert_eq!(reply.results[0].outcome, ScopeRecordOutcome::Unchanged);
         assert!(reply.tag_changes.is_empty());
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn scope_workdir_canonicalizes_symlinks_and_missing_tail_for_any_owner() {
+    let dir = cortexkit_test_support::ScratchDir::new("scope-workdir");
+    let real = dir.path().join("real");
+    std::fs::create_dir(&real).unwrap();
+    let alias = dir.path().join("alias");
+    std::os::unix::fs::symlink(&real, &alias).unwrap();
+    let expected = std::fs::canonicalize(&real).unwrap().join("missing");
+    let mut table = ScopeTable::new([]);
+    let scope = record("s", 1)
+        .with_workdir(Some(alias.join("missing").to_str().unwrap().into()))
+        .with_project_id(Some("project:1".into()));
+    let result = sync(&mut table, OTHER, 1, vec![scope.clone()]);
+    assert_eq!(code(&result), None);
+    let stamp = table.describe(&reserved(OTHER), "s").stamp.unwrap();
+    assert!(!stamp.owner_authorized);
+    assert_eq!(stamp.workdir.as_deref(), expected.to_str());
+    assert_eq!(stamp.project_id.as_deref(), Some("project:1"));
+    let same = scope.with_workdir(Some(expected.to_str().unwrap().into()));
+    let result = sync(&mut table, OTHER, 2, vec![same]);
+    assert_eq!(result.results[0].outcome, ScopeRecordOutcome::Unchanged);
+}
+
+#[cfg(unix)]
+#[test]
+fn scope_workdir_refuses_relative_and_unresolvable_paths_without_replacing_state() {
+    let dir = cortexkit_test_support::ScratchDir::new("scope-workdir");
+    let loop_path = dir.path().join("loop");
+    std::os::unix::fs::symlink(&loop_path, &loop_path).unwrap();
+    let mut table = ScopeTable::new([]);
+    sync(&mut table, OWNER, 1, vec![record("s", 1)]);
+    for (generation, path) in [(2, "relative"), (3, loop_path.to_str().unwrap())] {
+        let result = sync(
+            &mut table,
+            OWNER,
+            generation,
+            vec![record("s", 2).with_workdir(Some(path.into()))],
+        );
+        assert_eq!(code(&result), Some(error_codes::INVALID_WORKDIR));
+        assert_eq!(table.describe(&reserved(OWNER), "s").scope_epoch, Some(1));
+    }
+}
+
+#[test]
+fn scope_workdir_and_project_are_immutable_including_absence_until_a_new_epoch() {
+    let dir = cortexkit_test_support::ScratchDir::new("scope-workdir");
+    let folder = std::fs::canonicalize(dir.path())
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+    for delta in [false, true] {
+        for populated in [false, true] {
+            let mut table = ScopeTable::new([]);
+            let empty = record("s", 1);
+            let filled = empty
+                .clone()
+                .with_workdir(Some(folder.clone()))
+                .with_project_id(Some("project:1".into()));
+            let original = if populated {
+                filled.clone()
+            } else {
+                empty.clone()
+            };
+            let other = if populated { empty } else { filled };
+            sync(&mut table, OWNER, 1, vec![original.clone()]);
+            let mut generation = 1;
+            for (workdir, project_id, expected) in [
+                (
+                    other.workdir.clone(),
+                    original.project_id.clone(),
+                    error_codes::SCOPE_WORKDIR_CHANGED,
+                ),
+                (
+                    Some(format!("{folder}/other")),
+                    original.project_id.clone(),
+                    error_codes::SCOPE_WORKDIR_CHANGED,
+                ),
+                (
+                    original.workdir.clone(),
+                    other.project_id.clone(),
+                    error_codes::SCOPE_PROJECT_CHANGED,
+                ),
+                (
+                    original.workdir.clone(),
+                    Some("project:2".into()),
+                    error_codes::SCOPE_PROJECT_CHANGED,
+                ),
+            ] {
+                generation += 1;
+                let proposed = original
+                    .clone()
+                    .with_workdir(workdir)
+                    .with_project_id(project_id);
+                let result = if delta {
+                    apply(&mut table, generation, vec![proposed], vec![])
+                } else {
+                    sync(&mut table, OWNER, generation, vec![proposed])
+                };
+                assert_eq!(code(&result), Some(expected));
+                let held = table.describe(&reserved(OWNER), "s").stamp.unwrap();
+                assert_eq!(held.workdir, original.workdir);
+                assert_eq!(held.project_id, original.project_id);
+            }
+            let mut next = other;
+            next.scope_epoch = 2;
+            let result = if delta {
+                apply(&mut table, generation + 1, vec![next.clone()], vec![])
+            } else {
+                sync(&mut table, OWNER, generation + 1, vec![next.clone()])
+            };
+            assert_eq!(code(&result), None);
+            let stamp = table.describe(&reserved(OWNER), "s").stamp.unwrap();
+            assert_eq!(stamp.workdir, next.workdir);
+            assert_eq!(stamp.project_id, next.project_id);
+        }
+    }
+}
+
+#[test]
+fn scope_project_id_validation_refuses_sync_and_apply() {
+    let mut table = ScopeTable::new([]);
+    sync(&mut table, OWNER, 1, vec![record("s", 1)]);
+    for id in ["", "a b", "a\t", "é", &"p".repeat(129)] {
+        let scope = record("s", 2).with_project_id(Some(id.into()));
+        assert_eq!(
+            table
+                .sync(
+                    OWNER,
+                    ConnectionId::new(1),
+                    |_| true,
+                    2,
+                    vec![scope.clone()]
+                )
+                .unwrap_err()
+                .code,
+            INVALID_CONTROL_BODY
+        );
+        assert_eq!(
+            table
+                .apply(
+                    OWNER,
+                    ConnectionId::new(1),
+                    |_| true,
+                    2,
+                    vec![scope],
+                    vec![]
+                )
+                .unwrap_err()
+                .code,
+            INVALID_CONTROL_BODY
+        );
+        assert_eq!(table.describe(&reserved(OWNER), "s").scope_epoch, Some(1));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn scope_workdir_table_stores_input_verbatim_without_filesystem_resolution() {
+    let dir = cortexkit_test_support::ScratchDir::new("scope-table-workdir");
+    let real = dir.path().join("real");
+    std::fs::create_dir(&real).unwrap();
+    let alias = dir.path().join("alias");
+    std::os::unix::fs::symlink(&real, &alias).unwrap();
+    let workdir = alias.join("missing").to_str().unwrap().to_owned();
+    let mut table = ScopeTable::new([]);
+    let scope = record("s", 1).with_workdir(Some(workdir.clone()));
+    let result = table
+        .sync(
+            OWNER,
+            ConnectionId::new(1),
+            |_| true,
+            1,
+            vec![scope.clone()],
+        )
+        .unwrap();
+    assert_eq!(code(&result), None);
+    assert_eq!(
+        table
+            .describe(&reserved(OWNER), "s")
+            .stamp
+            .unwrap()
+            .workdir
+            .as_deref(),
+        Some(workdir.as_str())
+    );
+    let result = table
+        .apply(
+            OWNER,
+            ConnectionId::new(1),
+            |_| true,
+            2,
+            vec![scope],
+            vec![],
+        )
+        .unwrap();
+    assert_eq!(result.results[0].outcome, ScopeRecordOutcome::Unchanged);
+    let loop_path = dir.path().join("loop");
+    std::os::unix::fs::symlink(&loop_path, &loop_path).unwrap();
+    let unresolvable = loop_path.to_str().unwrap().to_owned();
+    let result = table
+        .apply(
+            OWNER,
+            ConnectionId::new(1),
+            |_| true,
+            3,
+            vec![record("s", 2).with_workdir(Some(unresolvable.clone()))],
+            vec![],
+        )
+        .unwrap();
+    assert_eq!(code(&result), None);
+    assert_eq!(
+        table
+            .describe(&reserved(OWNER), "s")
+            .stamp
+            .unwrap()
+            .workdir
+            .as_deref(),
+        Some(unresolvable.as_str())
+    );
 }

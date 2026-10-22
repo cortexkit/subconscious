@@ -159,7 +159,7 @@ to a module that lists it.
 | --- | --- | --- |
 | `route.status` | Push | Report a status string for one of the module's routes, read back by `route.poll`. |
 | `catalog.update` | Request | Replace the module's `provides` roles, optionally its capability declaration, and optionally its readiness, without re-registering. Test: `catalog_update_refreshes_catalog_without_disrupting_bound_routes` (`crates/subc-core/tests/catalog_update.rs`). |
-| `supervisor.live_roots` | Request | Count live and pending routes per canonical project root. |
+| `supervisor.live_roots` | Request | Count live and pending routes per canonical project root, also including the workdir of each bound scoped route. A route contributes once when both paths match. |
 | `scope.sync`, `scope.apply`, `scope.describe` | Request | Register, change and read scopes. See [`scopes.md`](scopes.md). |
 | `operator.confirm` | Request | Ask the person at the machine to confirm one in-flight write (section 5.1). |
 
@@ -191,6 +191,7 @@ in `server.describe.capabilities` (`subc_capabilities` in
 | --- | --- |
 | `manifest_registration_v1`, `channel_lifecycle_v1`, `ping_pong_v1`, `session_attach_v1`, `admission_facts_relay_v1` | Baseline features every current daemon has: module registration by `HELLO`, the route lifecycle, `PING`/`PONG`, `BindIdentity` on `route.open`, and the admission-facts relay. They carry no further contract; a client does not need to check them. |
 | `scopes/v1` | `route.open` accepts `scope`, and `scope.*` ops exist. |
+| `scope-workdir/v1` | Scope records accept optional `workdir` and `project_id`, fixed per epoch and not authority-gated. Binds carry them only to targets whose manifest `capabilities.provides` declares this capability; older targets' bind bytes stay unchanged. Scoped activity entries include them, and bound scoped workdirs contribute to live roots alongside bind roots. See [`scopes.md`](scopes.md) for validation and epoch refusal codes. |
 | `route-role-versions/v1` | `route.open` accepts `role_versions` and copies it to the bind. |
 | `catalog-events/v1` | `catalog.list` carries each module's declared `events`, so an entry without them means the module declares none. |
 | `scope-bind-proof/v1` | Scope records may carry `bind_proof_sha256`, and scoped opens must present the proof. |

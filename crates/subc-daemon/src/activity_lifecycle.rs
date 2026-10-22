@@ -324,6 +324,8 @@ impl ActivityLedger {
                 run_id: None,
                 flow_id: None,
                 project_root: None,
+                workdir: None,
+                project_id: None,
             },
             at_ms: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

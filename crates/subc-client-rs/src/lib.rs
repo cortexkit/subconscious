@@ -667,6 +667,10 @@ impl ModuleHandle {
 
     /// Register this module's full scope set with the daemon (`scope.sync`).
     ///
+    /// Owners can set [`ScopeRecord::workdir`] and [`ScopeRecord::project_id`] with
+    /// the record builders after discovering `scope-workdir/v1`. These fields
+    /// attribute the session and grant no authority.
+    ///
     /// The owner is this module; nothing in the request names it. `scopes` is
     /// the whole set: a live scope left out ends. `generation` must be larger
     /// than the last one the daemon accepted from this owner's sync authority,
@@ -3230,7 +3234,9 @@ mod tests {
                             1,
                             subc_protocol::scope::ScopeKind::Ephemeral,
                         )
-                        .with_expires_at_ms(Some(12345))],
+                        .with_expires_at_ms(Some(12345))
+                        .with_workdir(Some("/session/folder".into()))
+                        .with_project_id(Some("project:1".into()))],
                         vec![ScopeEnd::new("old", 3), ScopeEnd::new("missing", 1)],
                     )
                     .await
@@ -3246,7 +3252,8 @@ mod tests {
             serde_json::from_slice::<serde_json::Value>(&request.body).unwrap(),
             serde_json::json!({
                 "op": "scope.apply", "generation": 2,
-                "upsert": [{"ref": "run", "scope_epoch": 1, "kind": "ephemeral", "expires_at_ms": 12345}],
+                "upsert": [{"ref": "run", "scope_epoch": 1, "kind": "ephemeral", "expires_at_ms": 12345,
+                    "workdir": "/session/folder", "project_id": "project:1"}],
                 "end": [{"ref": "old", "scope_epoch": 3}, {"ref": "missing", "scope_epoch": 1}]
             })
         );

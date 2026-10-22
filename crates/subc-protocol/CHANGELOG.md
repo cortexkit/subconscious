@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.32.11
+
+- Add optional epoch-fixed `ScopeRecord` and `ScopeStamp` workdir/project_id fields and builders, project-id validation, `scope-workdir/v1`, and named workdir/project refusals. Absent fields preserve existing JSON bytes.
+
 ## 0.32.10
 
 - Add optional `ModuleManifest.rich_ui` and `RichUiDescriptor`, with bounded schema, digest, byte-size and chunk-count validation inputs. The field is omitted when absent, preserving existing manifest bytes; the daemon validates its shape at HELLO and relays it opaquely through `catalog.list`.

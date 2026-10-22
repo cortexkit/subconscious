@@ -270,6 +270,7 @@ pub(crate) struct BoundScope {
     pub(crate) owner: String,
     pub(crate) scope_ref: String,
     pub(crate) tag: ScopeTag,
+    pub(crate) workdir: Option<String>,
     // Shared by pending and committed forwarding entries, so moving a bind
     // into a route never creates an idle window.
     _lease: Arc<ScopeBindLease>,
@@ -433,8 +434,24 @@ pub(crate) struct ExpirySwept {
 /// one `scope.apply` (`end` is `Some`: the records and ends are a delta).
 struct ScopeChange {
     generation: u64,
-    scopes: Vec<ScopeRecord>,
+    scopes: ScopeRecords,
     end: Option<Vec<ScopeEnd>>,
+}
+
+/// Records prepared before the scope-table lock is taken. Filesystem failures
+/// travel with their record index so a refused upsert can retain its live state.
+pub(crate) struct ScopeRecords {
+    pub(crate) records: Vec<ScopeRecord>,
+    pub(crate) refusals: HashMap<usize, RecordRefusal>,
+}
+
+impl From<Vec<ScopeRecord>> for ScopeRecords {
+    fn from(records: Vec<ScopeRecord>) -> Self {
+        Self {
+            records,
+            refusals: HashMap::new(),
+        }
+    }
 }
 
 /// A refused sync or apply leaves the table unchanged, including sync authority.
@@ -581,7 +598,7 @@ fn reserved(module_id: &str) -> Principal {
 }
 
 /// A per-record refusal: the code and a message naming what was wrong.
-type RecordRefusal = (&'static str, String);
+pub(crate) type RecordRefusal = (&'static str, String);
 
 /// The owner whose sync is in progress, and its set as it will stand.
 type Overlay<'a> = Option<(&'a str, &'a BTreeMap<String, ScopeRecord>)>;
@@ -725,14 +742,14 @@ impl ScopeTable {
         connection_id: ConnectionId,
         is_current_launch: impl Fn(ConnectionId) -> bool,
         generation: u64,
-        scopes: Vec<ScopeRecord>,
+        scopes: impl Into<ScopeRecords>,
     ) -> Result<SyncApplied, SyncRefusal> {
         self.change(
             owner,
             connection_id,
             is_current_launch,
             generation,
-            scopes,
+            scopes.into(),
             None,
         )
     }
@@ -743,7 +760,7 @@ impl ScopeTable {
         connection_id: ConnectionId,
         is_current_launch: impl Fn(ConnectionId) -> bool,
         generation: u64,
-        upsert: Vec<ScopeRecord>,
+        upsert: impl Into<ScopeRecords>,
         end: Vec<ScopeEnd>,
     ) -> Result<SyncApplied, SyncRefusal> {
         self.change(
@@ -751,7 +768,7 @@ impl ScopeTable {
             connection_id,
             is_current_launch,
             generation,
-            upsert,
+            upsert.into(),
             Some(end),
         )
     }
@@ -762,7 +779,7 @@ impl ScopeTable {
         connection_id: ConnectionId,
         is_current_launch: impl Fn(ConnectionId) -> bool,
         generation: u64,
-        scopes: Vec<ScopeRecord>,
+        scopes: ScopeRecords,
         end: Option<Vec<ScopeEnd>>,
     ) -> Result<SyncApplied, SyncRefusal> {
         // Taken out of the map for the duration so the other owners' scopes can
@@ -825,6 +842,10 @@ impl ScopeTable {
             scopes,
             end,
         } = change;
+        let ScopeRecords {
+            records: scopes,
+            mut refusals,
+        } = scopes;
         let taking_authority = Self::check_authority(state, connection_id, is_current_launch)?;
         if end.is_some() && (taking_authority || !state.synced) {
             return Err(SyncRefusal {
@@ -880,7 +901,6 @@ impl ScopeTable {
             .collect();
 
         let owner_authorized = self.owner_authorized(owner);
-        let mut refusals: HashMap<usize, RecordRefusal> = HashMap::new();
         // The set as it will stand after this call. A refused record keeps its
         // previous state, so its held record (if any) stays in the set.
         let mut next: BTreeMap<String, ScopeRecord> = if end.is_some() {
@@ -899,31 +919,34 @@ impl ScopeTable {
         }
         for (index, record) in scopes.iter().enumerate() {
             let held = state.live.get(&record.scope_ref);
-            let refusal =
-                Self::record_refusal(record, held, &state.tombstones, owner_authorized, now)
-                    .or_else(|| {
-                        #[cfg(test)]
-                        if record.replace_only_if_idle {
-                            if let Some(hook) = &self.idle_check_hook {
-                                hook();
-                            }
+            let refusal = refusals
+                .remove(&index)
+                .or_else(|| {
+                    Self::record_refusal(record, held, &state.tombstones, owner_authorized, now)
+                })
+                .or_else(|| {
+                    #[cfg(test)]
+                    if record.replace_only_if_idle {
+                        if let Some(hook) = &self.idle_check_hook {
+                            hook();
                         }
-                        held.filter(|held| {
-                            record.replace_only_if_idle
-                                && (record.scope_epoch > held.record.scope_epoch
-                                    || record.bind_proof_sha256 != held.record.bind_proof_sha256)
-                                && (held.binds.load(std::sync::atomic::Ordering::SeqCst) != 0
-                                    || held.presence.values().any(|present| {
-                                        present.load(std::sync::atomic::Ordering::SeqCst)
-                                    }))
-                        })
-                        .map(|_| {
-                            (
-                                error_codes::SCOPE_EPOCH_IN_USE,
-                                "routes are still bound to the live scope epoch".to_string(),
-                            )
-                        })
-                    });
+                    }
+                    held.filter(|held| {
+                        record.replace_only_if_idle
+                            && (record.scope_epoch > held.record.scope_epoch
+                                || record.bind_proof_sha256 != held.record.bind_proof_sha256)
+                            && (held.binds.load(std::sync::atomic::Ordering::SeqCst) != 0
+                                || held.presence.values().any(|present| {
+                                    present.load(std::sync::atomic::Ordering::SeqCst)
+                                }))
+                    })
+                    .map(|_| {
+                        (
+                            error_codes::SCOPE_EPOCH_IN_USE,
+                            "routes are still bound to the live scope epoch".to_string(),
+                        )
+                    })
+                });
             match refusal {
                 Some(refusal) => {
                     refusals.insert(index, refusal);
@@ -1219,6 +1242,14 @@ impl ScopeTable {
         }
         let mut seen = HashSet::new();
         for record in scopes {
+            if let Some(project_id) = &record.project_id {
+                subc_protocol::scope::validate_project_id(project_id).map_err(|message| {
+                    SyncRefusal {
+                        code: INVALID_CONTROL_BODY,
+                        message: message.to_string(),
+                    }
+                })?;
+            }
             if let Some(hash) = &record.bind_proof_sha256 {
                 subc_protocol::scope::validate_bind_proof_sha256(hash).map_err(|message| {
                     SyncRefusal {
@@ -1391,6 +1422,22 @@ impl ScopeTable {
                     format!(
                         "kind is fixed for scope_epoch {epoch}; use a higher epoch to change it"
                     ),
+                ))
+            }
+            Some(held)
+                if epoch == held.record.scope_epoch && record.workdir != held.record.workdir =>
+            {
+                Some((
+                    error_codes::SCOPE_WORKDIR_CHANGED,
+                    format!("workdir is fixed for scope_epoch {epoch}; use a higher epoch to change it"),
+                ))
+            }
+            Some(held)
+                if epoch == held.record.scope_epoch && record.project_id != held.record.project_id =>
+            {
+                Some((
+                    error_codes::SCOPE_PROJECT_CHANGED,
+                    format!("project_id is fixed for scope_epoch {epoch}; use a higher epoch to change it"),
                 ))
             }
             Some(_) => None,
@@ -1750,6 +1797,7 @@ impl ScopeTable {
             owner: admission.owner.clone(),
             scope_ref: admission.stamp.scope_ref.clone(),
             tag: admission.tag,
+            workdir: admission.stamp.workdir.clone(),
             _lease: Arc::new(ScopeBindLease {
                 binds: Arc::clone(&held.binds),
                 released: std::sync::atomic::AtomicBool::new(!counts_for_idle),
@@ -1885,6 +1933,8 @@ impl ScopeTable {
                 scope_epoch,
                 scope.record.kind,
             )
+            .with_workdir(scope.record.workdir.clone())
+            .with_project_id(scope.record.project_id.clone())
             .with_parent(scope.record.parent.clone())
             .with_parent_state(scope.parent_state)
             .with_attributes(scope.record.attributes.clone())
@@ -1955,6 +2005,8 @@ impl ScopeTable {
                         scope.record.scope_epoch,
                         scope.record.kind,
                     )
+                    .with_workdir(scope.record.workdir.clone())
+                    .with_project_id(scope.record.project_id.clone())
                     .with_parent(scope.record.parent.clone())
                     .with_parent_state(scope.parent_state)
                     .with_attributes(scope.record.attributes.clone())
@@ -3250,7 +3302,7 @@ mod tests {
     fn the_live_scope_bound_refuses_the_whole_sync() {
         let mut table = table();
         sync(&mut table, BROCA, conn(1), 1, vec![head("keep", 1)]);
-        let too_many = (0..=MAX_LIVE_SCOPES_PER_OWNER)
+        let too_many: Vec<_> = (0..=MAX_LIVE_SCOPES_PER_OWNER)
             .map(|i| head(&format!("s{i}"), 1))
             .collect();
         let refusal = table

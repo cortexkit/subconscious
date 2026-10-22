@@ -28,6 +28,8 @@ fn entry(incarnation: &str, seq: u64) -> ActivityEntry {
             run_id: None,
             flow_id: None,
             project_root: None,
+            workdir: None,
+            project_id: None,
         },
     }
 }

@@ -294,7 +294,7 @@ dependencies = [
 
 [[package]]
 name = "ck-bus"
-version = "0.4.9"
+version = "0.4.10"
 dependencies = [
  "async-nats",
  "async-trait",
@@ -2417,7 +2417,7 @@ dependencies = [
 
 [[package]]
 name = "subc-client-rs"
-version = "0.30.10"
+version = "0.30.11"
 dependencies = [
  "async-trait",
  "cortexkit-test-support",
@@ -2436,7 +2436,7 @@ dependencies = [
 
 [[package]]
 name = "subc-control"
-version = "0.32.4"
+version = "0.32.5"
 dependencies = [
  "serde",
  "serde_json",
@@ -2478,7 +2478,7 @@ dependencies = [
 
 [[package]]
 name = "subc-daemon"
-version = "0.36.33"
+version = "0.36.34"
 dependencies = [
  "base64",
  "cortexkit-log",
@@ -2584,7 +2584,7 @@ dependencies = [
 
 [[package]]
 name = "subc-protocol"
-version = "0.32.10"
+version = "0.32.11"
 dependencies = [
  "serde",
  "serde_json",

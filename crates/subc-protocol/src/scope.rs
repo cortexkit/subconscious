@@ -314,6 +314,20 @@ pub fn validate_on_behalf_of_agent(agent: &str) -> Result<(), crate::tool_call::
     crate::tool_call::validate_opaque_field("on_behalf_of_agent", agent)
 }
 
+/// Capability declaring that a provider accepts session folder and project stamps.
+pub const SCOPE_WORKDIR_CAPABILITY: &str = "scope-workdir/v1";
+
+/// Check an Entorhinal project id without interpreting its opaque contents.
+pub fn validate_project_id(value: &str) -> Result<(), &'static str> {
+    if value.is_empty() || value.len() > 128 {
+        return Err("project_id must contain 1 to 128 bytes");
+    }
+    if !value.bytes().all(|byte| (0x21..=0x7e).contains(&byte)) {
+        return Err("project_id must be printable ASCII without whitespace");
+    }
+    Ok(())
+}
+
 /// One scope as its owner registers it in `scope.sync` or `scope.apply`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -326,6 +340,13 @@ pub struct ScopeRecord {
     /// restart, and uses a higher one when it reuses the ref for a new session.
     pub scope_epoch: u64,
     pub kind: ScopeKind,
+    /// Absolute session folder, canonicalized by the daemon and fixed per epoch.
+    /// Attribution only: this grants no authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workdir: Option<String>,
+    /// Opaque Entorhinal project id, fixed per epoch and never authority-gated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
     /// Only the holder of the scope's bind proof can bind it when this hash is
     /// present. Without a hash, admission is unchanged and proofs are ignored.
     #[serde(
@@ -367,6 +388,8 @@ impl ScopeRecord {
             scope_ref: scope_ref.into(),
             scope_epoch,
             kind,
+            workdir: None,
+            project_id: None,
             bind_proof_sha256: None,
             replace_only_if_idle: false,
             expires_at_ms: None,
@@ -375,6 +398,18 @@ impl ScopeRecord {
             carriers: Vec::new(),
             attributes: ScopeAttributes::default(),
         }
+    }
+
+    #[must_use]
+    pub fn with_workdir(mut self, workdir: Option<String>) -> Self {
+        self.workdir = workdir;
+        self
+    }
+
+    #[must_use]
+    pub fn with_project_id(mut self, project_id: Option<String>) -> Self {
+        self.project_id = project_id;
+        self
     }
 
     #[must_use]
@@ -630,6 +665,13 @@ pub struct ScopeStamp {
     pub scope_ref: String,
     pub scope_epoch: u64,
     pub kind: ScopeKind,
+    /// Canonical session folder. Sent on binds only to providers declaring
+    /// [`SCOPE_WORKDIR_CAPABILITY`]; absent fields keep older binds unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workdir: Option<String>,
+    /// Entorhinal project id for attribution, never authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<ScopeParent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -660,12 +702,26 @@ impl ScopeStamp {
             scope_ref: scope_ref.into(),
             scope_epoch,
             kind,
+            workdir: None,
+            project_id: None,
             parent: None,
             parent_state: None,
             attributes: ScopeAttributes::new(),
             owner_authorized: false,
             expires_at_ms: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_workdir(mut self, workdir: Option<String>) -> Self {
+        self.workdir = workdir;
+        self
+    }
+
+    #[must_use]
+    pub fn with_project_id(mut self, project_id: Option<String>) -> Self {
+        self.project_id = project_id;
+        self
     }
 
     #[must_use]
@@ -703,6 +759,43 @@ impl ScopeStamp {
 mod tests {
     use super::*;
     use crate::tool_call::OpaqueFieldError;
+
+    #[test]
+    fn project_id_is_an_opaque_non_space_ascii_token_of_at_most_128_bytes() {
+        for valid in ["p", "!~Project:7/path", &"p".repeat(128)] {
+            assert_eq!(validate_project_id(valid), Ok(()));
+        }
+        for invalid in ["", "p p", "p\t", "pé", "p\u{7f}", &"p".repeat(129)] {
+            assert!(validate_project_id(invalid).is_err(), "{invalid:?}");
+        }
+    }
+
+    #[test]
+    fn scope_project_fields_round_trip_and_absence_keeps_exact_bytes() {
+        let record = ScopeRecord::new("session", 1, ScopeKind::Head);
+        assert_eq!(
+            serde_json::to_string(&record).unwrap(),
+            r#"{"ref":"session","scope_epoch":1,"kind":"head"}"#
+        );
+        let record = record
+            .with_workdir(Some("/folder".into()))
+            .with_project_id(Some("project:1".into()));
+        let encoded = serde_json::to_string(&record).unwrap();
+        assert_eq!(
+            serde_json::from_str::<ScopeRecord>(&encoded).unwrap(),
+            record
+        );
+        let stamp = ScopeStamp::new(Principal::Direct, "session", 1, ScopeKind::Head);
+        assert_eq!(
+            serde_json::to_string(&stamp).unwrap(),
+            r#"{"owner":{"kind":"direct"},"ref":"session","scope_epoch":1,"kind":"head","owner_authorized":false}"#
+        );
+        let stamp = stamp
+            .with_workdir(record.workdir)
+            .with_project_id(record.project_id);
+        let encoded = serde_json::to_string(&stamp).unwrap();
+        assert_eq!(serde_json::from_str::<ScopeStamp>(&encoded).unwrap(), stamp);
+    }
 
     #[test]
     fn flow_id_uses_the_shared_opaque_token_bounds_and_names_its_field() {

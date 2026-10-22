@@ -53,6 +53,12 @@ pub struct ActivityActor {
     pub flow_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_root: Option<PathBuf>,
+    /// Canonical folder from the route's scope, not the caller's bind identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workdir: Option<PathBuf>,
+    /// Entorhinal project id from the scope; attribution only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
 }
 
 /// One durably appended event. `prev` is reserved for a future hash chain and is

@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.36.34
+
+- Accept and canonicalize scope workdirs, validate opaque project ids and keep both fixed per epoch. Advertise `scope-workdir/v1` and stamp these fields only to declaring targets. Bound scoped workdirs join legacy live roots; activity copies scope folder/project without changing legacy fields.
+- Workdirs are resolved before the scope table's write lock is taken, so a slow filesystem never holds up unrelated scoped route opens.
+
 ## 0.36.33
 
 - Validate rich-UI descriptors during HELLO and recheck the registered descriptor before applying catalog updates; catalog updates preserve it. The daemon copies the descriptor from the registered manifest into `catalog.list`, and refusals identify malformed fields by name. Catalog entries expose `nonce_verified` only when HELLO passes the launch-nonce check required for a reserved module or blue/green swap candidate; registrations without a verified nonce keep their previous wire bytes.

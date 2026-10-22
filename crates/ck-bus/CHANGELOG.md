@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.4.10
+
+- Test-only: initialize the new optional scope folder/project activity fields in mirror fixtures. Runtime behavior is unchanged.
+
 ## 0.4.9
 
 - Test-only: make the activity mirror backoff test independent of real time before Tokio time is paused, and verify the configured retry delay.

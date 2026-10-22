@@ -66,7 +66,7 @@ use crate::{
     },
     registry::{ChannelState, ConnectionId, RegistrationEndReason, Registry, RegistryError},
     router::{RouteCtx, RouterError},
-    scopes::{HelloLaunchNonces, ScopeTable},
+    scopes::{HelloLaunchNonces, ScopeRecords, ScopeTable},
     server::MAX_PENDING_ROUTE_BINDS_PER_TARGET,
     stderr_tail::{CaptureState, TailEntry},
     supervise::{
@@ -960,6 +960,7 @@ impl ControlHandler {
                 subc_protocol::manifest::CAP_SCOPE_BIND_PROOF_V2.to_string(),
                 subc_protocol::manifest::CAP_SCOPE_REPLACE_IF_IDLE_V1.to_string(),
                 subc_protocol::scope::SCOPE_ON_BEHALF_OF_CAPABILITY.to_string(),
+                subc_protocol::scope::SCOPE_WORKDIR_CAPABILITY.to_string(),
                 subc_protocol::scope::SCOPE_SERVED_BY_CAPABILITY.to_string(),
                 subc_control::ACTIVITY_LEDGER_CAPABILITY.to_string(),
             ]),
@@ -3150,6 +3151,42 @@ impl ControlHandler {
             .map_err(RouterError::Forwarding)
     }
 
+    /// Resolve folders before taking the scope-table lock: a slow filesystem
+    /// must not hold up admissions for unrelated scoped routes.
+    pub(crate) fn prepare_scope_records(scopes: Vec<ScopeRecord>) -> ScopeRecords {
+        let mut scopes = ScopeRecords::from(scopes);
+        for (index, record) in scopes.records.iter_mut().enumerate() {
+            if let Some(refusal) = Self::canonicalize_workdir(record) {
+                scopes.refusals.insert(index, refusal);
+            }
+        }
+        scopes
+    }
+
+    fn canonicalize_workdir(record: &mut ScopeRecord) -> Option<crate::scopes::RecordRefusal> {
+        let workdir = record.workdir.as_mut()?;
+        let path = std::path::Path::new(workdir);
+        if !path.is_absolute() {
+            return Some((
+                error_codes::INVALID_WORKDIR,
+                "workdir must be absolute".to_string(),
+            ));
+        }
+        match ProjectRootId::from_path_allowing_missing(path) {
+            Ok(root) => match root.as_path().to_str() {
+                Some(canonical) => {
+                    *workdir = canonical.to_string();
+                    None
+                }
+                None => Some((
+                    error_codes::INVALID_WORKDIR,
+                    "canonical workdir is not UTF-8".to_string(),
+                )),
+            },
+            Err(error) => Some((error_codes::INVALID_WORKDIR, error.to_string())),
+        }
+    }
+
     /// `scope.sync`: the owner is the module registered on this connection.
     /// A connection with no registration (every client connection, `direct`
     /// included) is refused `not_registered` before the table is consulted.
@@ -3184,6 +3221,7 @@ impl ControlHandler {
             )?]);
         };
         let owner = registration.manifest.module_id;
+        let scopes = Self::prepare_scope_records(scopes);
         let current_nonce = self.supervisor.spawn_launch_nonce_for(&owner);
         let is_current_launch = |connection: ConnectionId| {
             self.hello_launch_nonces
@@ -3786,6 +3824,8 @@ impl ControlHandler {
             run_id: None,
             flow_id: None,
             project_root: None,
+            workdir: None,
+            project_id: None,
         };
         let scope = match on {
             None => return Ok(actor),
@@ -3842,6 +3882,8 @@ impl ControlHandler {
         actor.agent_id = scope.stamp.attributes.agent_id;
         actor.run_id = scope.stamp.attributes.run_id;
         actor.flow_id = scope.stamp.attributes.flow_id;
+        actor.workdir = scope.stamp.workdir.map(std::path::PathBuf::from);
+        actor.project_id = scope.stamp.project_id;
         Ok(actor)
     }
 
@@ -4868,6 +4910,16 @@ impl ControlHandler {
 
         // Older readers may reject unknown fields. Select optional fields from
         // the captured endpoint's declaration, including on unscoped binds.
+        if !relay_capabilities.is_some_and(|caps| {
+            caps.provides
+                .iter()
+                .any(|cap| cap == subc_protocol::scope::SCOPE_WORKDIR_CAPABILITY)
+        }) {
+            if let Some(stamp) = scope_stamp.as_mut() {
+                stamp.workdir = None;
+                stamp.project_id = None;
+            }
+        }
         if !relay_capabilities.is_some_and(|caps| {
             caps.provides
                 .iter()
@@ -12062,6 +12114,44 @@ mod tests {
         assert!(capabilities
             .iter()
             .any(|cap| cap == subc_protocol::scope::SCOPE_SERVED_BY_CAPABILITY));
+    }
+
+    #[tokio::test]
+    async fn scope_workdir_capability_is_advertised_in_hello_ack_and_server_describe() {
+        let handler = ControlHandler::new(Arc::new(Registry::default()));
+        let (module, mut rx) = route_ctx(ConnectionId::new(158));
+        let ack = hello_via_sink(
+            &handler,
+            &module,
+            &mut rx,
+            hello_frame("project-scope-owner", PROTOCOL_VERSION, 1),
+        )
+        .await;
+        assert!(parse_ack(&ack)
+            .subc_capabilities
+            .iter()
+            .any(|cap| cap == "scope-workdir/v1"));
+        let (client, _rx) = route_ctx(ConnectionId::new(159));
+        let frame = Frame::build(
+            FrameType::Request,
+            control_flags(),
+            0,
+            0,
+            5,
+            serde_json::to_vec(&ClientControlRequest::ServerDescribe {}).unwrap(),
+        )
+        .unwrap();
+        let reply = handler
+            .handle_control_frame(&client, frame)
+            .await
+            .unwrap()
+            .remove(0);
+        let ClientControlResponse::ServerDescribe { capabilities, .. } =
+            serde_json::from_slice(&reply.body).unwrap()
+        else {
+            panic!("server.describe reply")
+        };
+        assert!(capabilities.iter().any(|cap| cap == "scope-workdir/v1"));
     }
 
     #[tokio::test]

@@ -2560,11 +2560,21 @@ impl ForwardingTable {
                 .filter(|binding| binding.module_endpoint == endpoint)
             {
                 total_bindings += 1;
+                let workdir = binding
+                    .scope
+                    .as_ref()
+                    .and_then(|scope| scope.workdir.as_deref())
+                    .map(std::path::Path::new);
                 if let Some(root) = &binding.project_root {
                     let entry = roots.entry(root.as_path().to_path_buf()).or_insert((0, 0));
                     entry.0 += 1;
-                } else {
+                } else if workdir.is_none() {
                     unknown_root_bindings += 1;
+                }
+                if let Some(workdir) = workdir.filter(|workdir| {
+                    binding.project_root.as_ref().map(ProjectRootId::as_path) != Some(*workdir)
+                }) {
+                    roots.entry(workdir.to_path_buf()).or_insert((0, 0)).0 += 1;
                 }
             }
             for pending in inner

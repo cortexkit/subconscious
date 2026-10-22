@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.30.11
+
+- Expose session folder/project through the re-exported scope record builders for scope sync/apply and scope stamps for bind readers. Requires subc-protocol 0.32.11 and subc-control 0.32.5.
+
 ## 0.30.10
 
 - Use subc-control 0.32.4 and subc-protocol 0.32.10 so typed `catalog.list` responses decode the optional rich-UI descriptor and nonce-verification fact carried by the newer daemon. Older catalog replies remain valid with both fields absent.

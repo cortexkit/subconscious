@@ -562,3 +562,222 @@ async fn idle_scope_expiry_loop_wakes_when_a_deadline_is_added() {
     assert!(!rig.live(&route));
     assert_eq!(route.closed_reason(), RouteCloseReason::ScopeEnded);
 }
+
+#[tokio::test]
+async fn scope_workdir_bind_is_exactly_opt_in() {
+    for declares in [false, true] {
+        let mut rig =
+            rig_with_target_capabilities(if declares { &["scope-workdir/v1"] } else { &[] }).await;
+        let dir = ScratchDir::new("scope-bind-workdir");
+        let workdir = std::fs::canonicalize(dir.path())
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        rig.sync(vec![head("s", 1)
+            .with_workdir(Some(workdir.clone()))
+            .with_project_id(Some("project:1".into()))])
+            .await;
+        let bound = rig
+            .bound(Some(OWNER), PLEXUS, Some(rig_selector("s", Some(1))))
+            .await;
+        let body: Value = serde_json::from_slice(&bound.bind.body).unwrap();
+        let identity = format!(
+            "{{\"project_root\":{},\"harness\":\"unit\",\"session\":\"session\"}}",
+            body["identity"]["project_root"]
+        );
+        // Only the temporary identity path and allocated handles vary between runs.
+        let project_fields = if declares {
+            format!(
+                ",\"workdir\":{},\"project_id\":\"project:1\"",
+                serde_json::to_string(&workdir).unwrap()
+            )
+        } else {
+            String::new()
+        };
+        let expected_scope = format!("{{\"owner\":{{\"kind\":\"reserved\",\"module_id\":\"{OWNER}\"}},\"ref\":\"s\",\"scope_epoch\":1,\"kind\":\"head\"{project_fields},\"owner_authorized\":true}}");
+        let expected = format!("{{\"op\":\"route.bind\",\"route_channel\":{},\"epoch\":{},\"target\":{{\"kind\":\"tool_provider\",\"module_id\":\"{PLEXUS}\"}},\"identity\":{identity},\"principal\":{{\"kind\":\"reserved\",\"module_id\":\"{OWNER}\"}},\"scope\":{expected_scope}}}", body["route_channel"], body["epoch"]);
+        assert_eq!(bound.bind.body, expected.as_bytes());
+    }
+}
+
+#[tokio::test]
+async fn scope_workdir_live_roots_include_bound_scope_and_keep_legacy_roots() {
+    let mut rig = rig_with_target_capabilities(&[]).await;
+    let dir = ScratchDir::new("scope-live-root");
+    let workdir = std::fs::canonicalize(dir.path()).unwrap();
+    rig.sync(vec![
+        session(1).with_workdir(Some(workdir.to_str().unwrap().into()))
+    ])
+    .await;
+    let bound = rig
+        .bound(Some(AFT), PLEXUS, Some(rig_selector("s", Some(1))))
+        .await;
+    let legacy: Value = serde_json::from_slice(&bound.bind.body).unwrap();
+    let legacy = PathBuf::from(legacy["identity"]["project_root"].as_str().unwrap());
+    let ModuleControlResponseToModule::LiveRoots {
+        roots,
+        total_bindings,
+        unknown_root_bindings,
+    } = rig.forwarding.live_roots(PLEXUS).unwrap()
+    else {
+        panic!("live roots");
+    };
+    assert_eq!(total_bindings, 1);
+    assert_eq!(unknown_root_bindings, 0);
+    assert_eq!(roots.len(), 2);
+    for path in [&workdir, &legacy] {
+        let root = roots
+            .iter()
+            .find(|root| &root.project_root == path)
+            .unwrap();
+        assert_eq!((root.bound, root.pending), (1, 0));
+    }
+    assert!(bound.stamp().unwrap().workdir.is_none());
+    let pending = rig
+        .relayed(Some(AFT), PLEXUS, Some(rig_selector("s", Some(1))))
+        .await;
+    let ModuleControlResponseToModule::LiveRoots {
+        roots,
+        total_bindings,
+        ..
+    } = rig.forwarding.live_roots(PLEXUS).unwrap()
+    else {
+        panic!("live roots");
+    };
+    assert_eq!(total_bindings, 2);
+    assert_eq!(roots.len(), 3);
+    let scope_root = roots
+        .iter()
+        .find(|root| root.project_root == workdir)
+        .unwrap();
+    assert_eq!((scope_root.bound, scope_root.pending), (1, 0));
+    rig.ack(&pending).await;
+    assert!(pending.task.await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn scope_workdir_live_roots_deduplicate_equal_bind_roots_and_only_count_bound_workdirs() {
+    let mut rig = rig_with_target_capabilities(&[]).await;
+    let dir = ScratchDir::new("scope-equal-live-root");
+    let workdir = std::fs::canonicalize(dir.path()).unwrap();
+    rig.sync(vec![
+        session(1).with_workdir(Some(workdir.to_str().unwrap().into()))
+    ])
+    .await;
+    let (client, mut client_rx, mut frame) =
+        rig.open_frame(Some(AFT), PLEXUS, Some(rig_selector("s", Some(1))));
+    let mut body: Value = serde_json::from_slice(&frame.body).unwrap();
+    body["identity"]["project_root"] = serde_json::to_value(&workdir).unwrap();
+    frame.body = serde_json::to_vec(&body).unwrap();
+    let handler = rig.handler.clone();
+    let task =
+        tokio::spawn(async move { handler.handle_control_frame(&client, frame).await.unwrap() });
+    let (module, module_rx) = rig.modules.get_mut(PLEXUS).unwrap();
+    let bind = tokio::time::timeout(Duration::from_secs(2), module_rx.recv())
+        .await
+        .unwrap()
+        .unwrap()
+        .frame;
+    let ModuleControlResponseToModule::LiveRoots {
+        roots,
+        total_bindings,
+        ..
+    } = rig.forwarding.live_roots(PLEXUS).unwrap()
+    else {
+        panic!("live roots");
+    };
+    assert_eq!(total_bindings, 1);
+    assert_eq!(roots.len(), 1);
+    assert_eq!(roots[0].project_root, workdir);
+    assert_eq!((roots[0].bound, roots[0].pending), (0, 1));
+    rig.handler
+        .handle_control_frame(module, route_bind_ack(bind.header.corr))
+        .await
+        .unwrap();
+    assert!(task.await.unwrap().is_empty());
+    client_rx.recv().await.unwrap();
+    let ModuleControlResponseToModule::LiveRoots {
+        roots,
+        total_bindings,
+        ..
+    } = rig.forwarding.live_roots(PLEXUS).unwrap()
+    else {
+        panic!("live roots");
+    };
+    assert_eq!(total_bindings, 1);
+    assert_eq!(roots.len(), 1);
+    assert_eq!(roots[0].project_root, workdir);
+    assert_eq!((roots[0].bound, roots[0].pending), (1, 0));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn scope_workdir_handler_prepares_canonical_records_and_keeps_path_refusals_per_record() {
+    let dir = ScratchDir::new("scope-handler-workdir");
+    let real = dir.path().join("real");
+    std::fs::create_dir(&real).unwrap();
+    let canonical = std::fs::canonicalize(&real).unwrap();
+    let alias = dir.path().join("alias");
+    std::os::unix::fs::symlink(&real, &alias).unwrap();
+    let loop_path = dir.path().join("loop");
+    std::os::unix::fs::symlink(&loop_path, &loop_path).unwrap();
+    let loop_message = ProjectRootId::from_path_allowing_missing(&loop_path)
+        .unwrap_err()
+        .to_string();
+    for delta in [false, true] {
+        let mut rig = rig_with_target_capabilities(&["scope-workdir/v1"]).await;
+        rig.sync(vec![
+            head("held", 1).with_workdir(Some(canonical.to_str().unwrap().into()))
+        ])
+        .await;
+        let records = vec![
+            head("held", 2).with_workdir(Some("relative".into())),
+            head("loop", 1).with_workdir(Some(loop_path.to_str().unwrap().into())),
+            head("s", 1)
+                .with_workdir(Some(alias.join("missing").to_str().unwrap().into()))
+                .with_project_id(Some("project:1".into())),
+        ];
+        let reply = if delta {
+            serde_json::from_slice(&apply_call(&rig, 2, records, vec![]).await.body).unwrap()
+        } else {
+            sync(&rig.handler, &rig.owner, 2, records).await.unwrap()
+        };
+        let (ModuleControlResponseToModule::ScopeSync { results, .. }
+        | ModuleControlResponseToModule::ScopeApply { results, .. }) = reply
+        else {
+            panic!("scope change reply");
+        };
+        assert_eq!(results.len(), 3);
+        assert_eq!(
+            results[0].code.as_deref(),
+            Some(error_codes::INVALID_WORKDIR)
+        );
+        assert_eq!(
+            results[0].message.as_deref(),
+            Some("workdir must be absolute")
+        );
+        assert_eq!(
+            results[1].code.as_deref(),
+            Some(error_codes::INVALID_WORKDIR)
+        );
+        assert_eq!(results[1].message.as_deref(), Some(loop_message.as_str()));
+        assert_eq!(results[2].outcome, ScopeRecordOutcome::Created);
+        let ModuleControlResponseToModule::ScopeDescribe {
+            scope_epoch,
+            scope: Some(held),
+            ..
+        } = describe(&rig.handler, &rig.owner, OWNER, "held").await
+        else {
+            panic!("held scope");
+        };
+        assert_eq!(scope_epoch, Some(1));
+        assert_eq!(held.workdir.as_deref(), canonical.to_str());
+        let bound = rig
+            .bound(Some(OWNER), PLEXUS, Some(rig_selector("s", Some(1))))
+            .await;
+        let stamp = bound.stamp().unwrap();
+        assert_eq!(stamp.workdir.as_deref(), canonical.join("missing").to_str());
+        assert_eq!(stamp.project_id.as_deref(), Some("project:1"));
+    }
+}

@@ -55,6 +55,16 @@ Fields:
 - `kind`: a closed enum, `head | worker | ephemeral`, fixed for the life of an epoch. A sync that
   changes it at the same epoch refuses that record `scope_kind_changed`; the owner uses a higher
   epoch, which ends the old scope.
+- `workdir`: optional absolute session folder (the checkout or worktree root for git).
+  The daemon canonicalizes it like `route.open`'s `project_root`, resolving symlinks
+  and allowing a missing tail. Relative or unresolvable paths refuse that record
+  as `invalid_workdir`.
+- `project_id`: optional opaque Entorhinal project id, 1–128 printable non-space ASCII
+  bytes (`0x21`–`0x7E`). Malformed ids refuse the whole sync or apply as
+  `invalid_control_body`. A folder with no registered project needs only `workdir`.
+  Both fields are fixed for the epoch: adding, changing or removing either is
+  `scope_workdir_changed` or `scope_project_changed`, respectively. Canonical spellings
+  of the same folder compare equal. Use a higher epoch to change them.
 - `expires_at_ms`: optional absolute Unix wall-clock milliseconds, fixed for the life of an
   epoch. Omitted means no daemon-enforced expiry. It is a record field, not an attribute;
   any owner may set it, for any kind (see the expiry subsection).
@@ -96,12 +106,20 @@ Fields:
 **Authority gate.** `agent_id`, `on_behalf_of_agent`, `delegates`, `flow_id` and `run_id` may be set only by an owner listed
 in the daemon config key `scope_authority_owners` (today `["prefrontal-core"]`, the same module
 as `admission_facts_carrier_module_id`). A scope from any other owner may carry `kind`,
-`parent`, `child_owners`, `carriers` and `expires_at_ms`, with empty attributes; a sync or
+`parent`, `child_owners`, `carriers`, `expires_at_ms`, `workdir` and `project_id`, with empty attributes; a sync or
 apply that sets a gated attribute from an unlisted owner is refused per record by name
 (`scope_attribute_not_permitted`). `expires_at_ms` is not gated by this list. `scope_authority_owners` is a
 restart-required key: a change takes effect only on a daemon restart, which closes every route, so
 no live route keeps an `owner_authorized` stamp its owner has lost. Providers rely on the stamp's
 `owner_authorized` alone and keep no copy of the list (section 7).
+
+`workdir` and `project_id` are attribution, never authority. Owners send them after
+the daemon advertises `scope-workdir/v1` in `server.describe`. The daemon includes
+them in a `route.bind` scope stamp only when the target manifest's
+`capabilities.provides` declares `scope-workdir/v1`; all other targets receive the
+same bind bytes as before. Bound scoped routes contribute their workdir to
+`supervisor.live_roots` alongside the legacy bind roots. Their activity entries
+carry the scope's `workdir` and `project_id`; existing activity fields are unchanged.
 
 `on_behalf_of_agent` uses the agent token rule: 1–256 printable, non-space ASCII bytes
 (`0x21`–`0x7E`). Malformed tokens refuse the whole sync or apply as `invalid_control_body`.
@@ -777,6 +795,13 @@ State, all in memory:
   `owner_ended`. All tombstones share the same bounded oldest-first eviction;
 - in the forwarding table: each pending bind's and each route's scope tag `(owner, ref,
   scope_epoch, version)`, and the index from a scope to its routes.
+
+For `scope.sync` and `scope.apply`, the control handler resolves workdir paths
+before taking the scope write lock. It passes canonical records and per-record
+`invalid_workdir` refusals to the table, which performs no filesystem work.
+Slow path resolution therefore cannot hold the lock needed by unrelated scoped
+route admissions. Refused records retain their previous state while valid
+siblings apply, just as for the table's other per-record refusals.
 
 Lock order is scope table, then forwarding table, always. Commit already holds the forwarding
 write lock and never takes the scope lock: it compares the pending bind's captured tag with the

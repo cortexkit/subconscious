@@ -834,3 +834,46 @@ async fn activity_real_daemon_restart_head_and_query_do_not_block_reader() {
     serving.abort();
     drop(preexisting_connections);
 }
+
+#[tokio::test]
+async fn activity_route_project_fields_come_from_scope_even_for_legacy_target() {
+    let scratch = ScratchDir::new("activity-scope-project");
+    let workdir = std::fs::canonicalize(scratch.path()).unwrap();
+    let mut rig = rig_with_target_capabilities(&[]).await;
+    rig.handler = rig
+        .handler
+        .with_activity_ledger(scratch.path(), "daemon".into());
+    rig.sync(vec![session(1)
+        .with_workdir(Some(workdir.to_str().unwrap().into()))
+        .with_project_id(Some("project:scope".into()))])
+        .await;
+    let bound = rig
+        .bound(Some(AFT), PLEXUS, Some(rig.selector("s", Some(1))))
+        .await;
+    assert!(bound.stamp().unwrap().project_id.is_none());
+    assert_eq!(
+        record_on(&rig, PLEXUS, citation(&bound)).await.header.ty,
+        FrameType::Response
+    );
+    let unscoped = rig.bound(Some(AFT), PLEXUS, None).await;
+    assert_eq!(
+        record_on(&rig, PLEXUS, citation(&unscoped)).await.header.ty,
+        FrameType::Response
+    );
+    let entries: Vec<ActivityEntry> =
+        std::fs::read_to_string(scratch.path().join("activity.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].actor.workdir.as_ref(), Some(&workdir));
+    assert_eq!(
+        entries[0].actor.project_id.as_deref(),
+        Some("project:scope")
+    );
+    assert_ne!(entries[0].actor.project_root.as_ref(), Some(&workdir));
+    assert!(entries[1].actor.workdir.is_none());
+    assert!(entries[1].actor.project_id.is_none());
+    assert!(entries[1].actor.project_root.is_some());
+}

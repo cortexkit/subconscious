@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.32.5
+
+- Add optional `ActivityActor.workdir` and `project_id` from the route scope. Absent values preserve existing activity bytes. Code that builds `ActivityActor` with a struct literal must add the two fields.
+
 ## 0.32.4
 
 - Add optional `CatalogEntry.rich_ui` and `nonce_verified`. Both are omitted when absent/false, preserving legacy catalog bytes. The daemon copies rich-UI metadata from the registered manifest and sets `nonce_verified` only when HELLO passes the launch-nonce check required for a reserved module or swap candidate.

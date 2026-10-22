@@ -19,7 +19,7 @@ fn query() -> ActivityQueryRequest {
 }
 
 async fn flush(ledger: &ActivityLedger) {
-    ledger.record("barrier".into(), serde_json::from_value(serde_json::json!({"op":"activity.record", "kind":"barrier.flushed", "summary":"Queue flushed"})).unwrap(), ActivityActor { principal: Principal::Direct, scope_owner: None, agent_id: None, run_id: None, flow_id: None, project_root: None }, 1).await.unwrap();
+    ledger.record("barrier".into(), serde_json::from_value(serde_json::json!({"op":"activity.record", "kind":"barrier.flushed", "summary":"Queue flushed"})).unwrap(), ActivityActor { principal: Principal::Direct, scope_owner: None, agent_id: None, run_id: None, flow_id: None, project_root: None, workdir: None, project_id: None }, 1).await.unwrap();
 }
 
 async fn starts(ledger: &ActivityLedger) -> Vec<ActivityEntry> {
@@ -142,6 +142,8 @@ async fn lifecycle_is_rate_exempt_after_subc_bucket_is_exhausted() {
         run_id: None,
         flow_id: None,
         project_root: None,
+        workdir: None,
+        project_id: None,
     };
     for _ in 0..60 {
         ledger
@@ -219,6 +221,8 @@ async fn lifecycle_open_write_and_queue_drops_increment_failure_count() {
             run_id: None,
             flow_id: None,
             project_root: None,
+            workdir: None,
+            project_id: None,
         };
         assert_eq!(
             ledger.record("barrier".into(), request, actor, 1).await,

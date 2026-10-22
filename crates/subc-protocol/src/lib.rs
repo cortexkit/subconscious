@@ -178,6 +178,9 @@ pub mod error_codes {
     pub const SCOPE_EXPIRY_TOO_FAR: &str = "scope_expiry_too_far";
     /// The record changes `kind` at the same `scope_epoch`.
     pub const SCOPE_KIND_CHANGED: &str = "scope_kind_changed";
+    pub const INVALID_WORKDIR: &str = "invalid_workdir";
+    pub const SCOPE_WORKDIR_CHANGED: &str = "scope_workdir_changed";
+    pub const SCOPE_PROJECT_CHANGED: &str = "scope_project_changed";
     /// The record sets authority-controlled attributes and its owner is not
     /// listed in `scope_authority_owners`, or combines `on_behalf_of_agent` with
     /// `agent_id`, `delegates`, `flow_id` or `run_id`.

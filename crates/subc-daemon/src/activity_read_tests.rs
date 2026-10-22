@@ -40,7 +40,7 @@ fn setup(
 async fn append(handler: &ControlHandler, at_ms: u64) {
     handler.activity.as_ref().unwrap().record("worker".into(),
         serde_json::from_value(serde_json::json!({"op":"activity.record","kind":"worker.settled","summary":"Worker settled"})).unwrap(),
-        subc_control::ActivityActor { principal: Principal::Direct, scope_owner: None, agent_id: None, run_id: None, flow_id: None, project_root: None }, at_ms).await.unwrap();
+        subc_control::ActivityActor { principal: Principal::Direct, scope_owner: None, agent_id: None, run_id: None, flow_id: None, project_root: None, workdir: None, project_id: None }, at_ms).await.unwrap();
 }
 
 #[tokio::test]

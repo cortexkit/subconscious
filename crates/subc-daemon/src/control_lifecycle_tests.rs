@@ -25,6 +25,8 @@ async fn flush(handler: &ControlHandler) {
                 run_id: None,
                 flow_id: None,
                 project_root: None,
+                workdir: None,
+                project_id: None,
             },
             1,
         )

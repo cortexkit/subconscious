@@ -214,12 +214,6 @@ final class SubcFedClientPublicAPITests: XCTestCase {
 
         try await client.acknowledgeReenrollment(enrollmentID: "enroll-2026-08")
 
-        let reopened = FedSQLiteStateStore(directoryURL: directory)
-        let reopenedDocument = try await reopened.open(localPublicKey: localPublicKey).document
-        let marker = try XCTUnwrap(reopenedDocument.reenrollmentAcknowledgment)
-        XCTAssertEqual(marker.enrollmentID, "enroll-2026-08")
-        XCTAssertGreaterThan(marker.atMs, 0)
-
         do {
             try await client.connect()
             XCTFail("expected the recording factory's ordinary dial refusal")
@@ -232,6 +226,13 @@ final class SubcFedClientPublicAPITests: XCTestCase {
         XCTAssertNotNil(attempt)
         XCTAssertEqual(carriers, 1)
         XCTAssertEqual(dials, 1)
+        await client.disconnect()
+        try await stateStore.close()
+        let reopened = FedSQLiteStateStore(directoryURL: directory)
+        let reopenedDocument = try await reopened.open(localPublicKey: localPublicKey).document
+        let marker = try XCTUnwrap(reopenedDocument.reenrollmentAcknowledgment)
+        XCTAssertEqual(marker.enrollmentID, "enroll-2026-08")
+        XCTAssertGreaterThan(marker.atMs, 0)
     }
 
     func testUnverifiedLANRejectedWithoutCarrierAndAttemptID() async throws {

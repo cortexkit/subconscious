@@ -31,6 +31,7 @@ final class FedSQLiteLegacyCleanupTests: XCTestCase {
         let before = try await first.snapshot()
         try writeLeftovers(in: dir)
 
+        try await first.close()
         let later = FedSQLiteStateStore(directoryURL: dir)
         let opened = try await later.open(localPublicKey: localKey)
         XCTAssertFalse(opened.created)

@@ -138,6 +138,7 @@ class FedStateStoreTests: XCTestCase {
         let incarnation = first.document.global.localIncarnation
         let epoch = first.document.global.localLedgerEpoch
         let reserved = try await store1.reserveEffectSequence()
+        try await store1.close()
 
         let store2 = Self.storeUnderTest.durableStore(in: dir)
         let second = try await store2.open(localPublicKey: localKey)
@@ -154,6 +155,7 @@ class FedStateStoreTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: dir) }
         let store1 = Self.storeUnderTest.durableStore(in: dir)
         _ = try await store1.open(localPublicKey: localKey)
+        try await store1.close()
 
         let store2 = Self.storeUnderTest.durableStore(in: dir)
         do {
@@ -266,21 +268,27 @@ class FedStateStoreTests: XCTestCase {
     }
 
 
-    func testConcurrentWriterLockSerializesWithoutDuplicateSeq() async throws {
+    func testExclusiveWritersHandOffWithoutDuplicateSeq() async throws {
         let dir = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: dir) }
 
         let writerA = Self.storeUnderTest.durableStore(in: dir)
         _ = try await writerA.open(localPublicKey: localKey)
         let writerB = Self.storeUnderTest.durableStore(in: dir)
+        do {
+            _ = try await writerB.open(localPublicKey: localKey)
+            XCTFail("a second writer must be refused until close")
+        } catch is FedStateStoreInUse {}
+
+        let a = try await writerA.reserveEffectSequence()
+        try await writerA.close()
         _ = try await writerB.open(localPublicKey: localKey)
 
-        // SQLite serializes reservation transactions across connections, so
-        // successful reservations never hand out the same sequence.
-        let a = try await writerA.reserveEffectSequence()
+        // Ownership changes must not reuse a reservation from the previous owner.
         let b = try await writerB.reserveEffectSequence()
         XCTAssertNotEqual(a.value, b.value)
         XCTAssertEqual(Set([a.value, b.value]).count, 2)
+        try await writerB.close()
 
         let writerB2 = Self.storeUnderTest.durableStore(in: dir)
         _ = try await writerB2.open(localPublicKey: localKey)
@@ -294,6 +302,7 @@ class FedStateStoreTests: XCTestCase {
         let store1 = Self.storeUnderTest.durableStore(in: dir)
         _ = try await store1.open(localPublicKey: localKey)
         let g1 = try await store1.reserveCatalogGeneration()
+        try await store1.close()
         let store2 = Self.storeUnderTest.durableStore(in: dir)
         _ = try await store2.open(localPublicKey: localKey)
         let g2 = try await store2.reserveCatalogGeneration()

@@ -28,6 +28,18 @@ import SQLite3
 ///
 /// Legacy JSON files are discarded on open. Only the SQLite database carries
 /// saved state; a missing database starts a fresh send log.
+///
+/// Ownership. From `open` until `close`, an exclusive non-blocking flock on
+/// `fed-state.lock` prevents any other instance or process from opening this
+/// directory. Contention throws `FedStateStoreInUse` without touching SQLite.
+/// Share this actor among clients, not multiple actors for the same directory.
+///
+/// Shutdown. End every session, disconnect and tear down every `SubcFedClient`
+/// sharing this store, then call `close`. Do this before iOS suspends an App
+/// Group owner: even an idle store holds a file lock. Deinit is only a backstop.
+/// Close is terminal for this actor. On return, create a new store and new
+/// clients; they reload the same disk state and incarnation. Clients retaining
+/// a closed actor fail with `FedStateStoreClosed`, not ownership contention.
 public actor FedSQLiteStateStore: FedStateStore {
     public static let databaseFileName = "fed-state.sqlite"
     private static let documentFileName = "fed-state.json"
@@ -80,6 +92,8 @@ public actor FedSQLiteStateStore: FedStateStore {
         }
     }
     private var connection: FedSQLiteConnection?
+    private var storeLock: FedSQLiteStoreLock?
+    private var isClosed = false
     private var commitBarrier: (@Sendable (CommitBarrier) throws -> Void)?
     private var machineIDChangeLogger: @Sendable (String) -> Void = { message in
         Logger(subsystem: "io.cortexkit.subcfed", category: "store")
@@ -156,9 +170,18 @@ public actor FedSQLiteStateStore: FedStateStore {
 
     // MARK: - Open
 
+    /// Opens and reads the store under exclusive ownership. Throws
+    /// `FedStateStoreInUse` immediately if another opener owns the directory;
+    /// leave the files alone and retry after that owner closes. Calling this
+    /// on an already-open actor reads its current state without reacquiring.
+    /// After `close`, throws `FedStateStoreClosed` without touching any files.
     public func open(localPublicKey: Data) async throws -> FedStateOpenResult {
-        try withOpenLock {
+        try checkNotClosed()
+        if storeLock == nil {
             try ensureDirectory()
+            storeLock = try FedSQLiteStoreLock(url: lockURL)
+        }
+        do {
             removeLegacyFiles()
             removeBuildingFiles()
             var created = false
@@ -172,23 +195,47 @@ public actor FedSQLiteStateStore: FedStateStore {
                 }
                 connection = try openExistingDatabase()
             }
-            do {
-                var document = try readForOpen()
-                guard document.localIdentityDigest == FedStateDocument.identityDigest(forPublicKey: localPublicKey) else {
-                    throw FedFailure.storeCorrupt
-                }
-                if document.localPublicKey == nil {
-                    _ = try write { db in try FedSQLiteStoreRows.setLocalPublicKey(localPublicKey, in: db) }
-                    document = try readForOpen()
-                }
-                try applyBackupExclusion()
-                return FedStateOpenResult(document: withPendingSentPhases(document), created: created)
-            } catch {
-                // Drop the connection so the next open starts from the file again.
-                connection = nil
-                throw error
+            var document = try readForOpen()
+            guard document.localIdentityDigest == FedStateDocument.identityDigest(forPublicKey: localPublicKey) else {
+                throw FedFailure.storeCorrupt
             }
+            if document.localPublicKey == nil {
+                _ = try write { db in try FedSQLiteStoreRows.setLocalPublicKey(localPublicKey, in: db) }
+                document = try readForOpen()
+            }
+            try applyBackupExclusion()
+            return FedStateOpenResult(document: withPendingSentPhases(document), created: created)
+        } catch {
+            // Close SQLite before relinquishing ownership, including failed opens.
+            connection = nil
+            sentNotYetDurable.removeAll()
+            storeLock = nil
+            throw error
         }
+    }
+
+    /// Closes SQLite, discards transient state, then releases the lock and its
+    /// descriptor. Terminal for this actor, and idempotent. If SQLite cannot
+    /// close, ownership is retained and the error is thrown; callers must not
+    /// treat that as a successful close.
+    public func close() throws {
+        try connection?.close()
+        isClosed = true
+        connection = nil
+        sentNotYetDurable.removeAll()
+        durableCommitCount = 0
+        storeLock = nil
+    }
+
+    /// A non-opening lifetime check for clients with cached session state.
+    func checkNotClosed() throws {
+        if isClosed { throw FedStateStoreClosed() }
+    }
+
+    deinit {
+        // No statement escapes the actor's synchronous transactions.
+        connection = nil
+        storeLock = nil
     }
 
     private func createDatabase(localPublicKey: Data) throws {
@@ -319,6 +366,7 @@ public actor FedSQLiteStateStore: FedStateStore {
         peerLedgerEpoch: String?,
         peerIncarnation: String?
     ) async throws -> FedEffectID {
+        _ = try requireConnection()
         do {
             return try write { db in
                 let effect = try Self.reserveEffectSequence(in: db)
@@ -363,6 +411,7 @@ public actor FedSQLiteStateStore: FedStateStore {
         terminalKind: String?,
         terminalCode: String?
     ) async throws {
+        _ = try requireConnection()
         guard disposition != .unknown else { throw FedFailure.persistenceFailed }
         let fp = FedStateDocument.destinationKey(forResponderPublicKey: responderStaticPublicKey)
         let recorded = disposition == .recorded
@@ -619,6 +668,7 @@ public actor FedSQLiteStateStore: FedStateStore {
         do {
             return try readUnmapped(body)
         } catch {
+            if error is FedStateStoreClosed { throw error }
             if let failure = error as? FedFailure { throw failure }
             if let sqlite = error as? FedSQLiteError, sqlite.isCorruption { throw FedFailure.storeCorrupt }
             throw FedFailure.storeUnavailable
@@ -641,16 +691,10 @@ public actor FedSQLiteStateStore: FedStateStore {
         }
     }
 
-    /// The open connection, or one opened now when the database exists.
-    /// An instance can read a store another instance opened.
+    /// Only explicit open may acquire a connection and its lifetime lock.
     private func requireConnection() throws -> FedSQLiteConnection {
         if let connection { return connection }
-        guard fileManager.fileExists(atPath: databaseURL.path) else {
-            throw FedFailure.storeUnavailable
-        }
-        let opened = try openExistingDatabase()
-        connection = opened
-        return opened
+        throw FedStateStoreClosed()
     }
 
     private func withPendingSentPhases(_ document: FedStateDocument) -> FedStateDocument {
@@ -695,18 +739,6 @@ public actor FedSQLiteStateStore: FedStateStore {
 
     // MARK: - Files
 
-    /// Serialises `open` across store instances so two opens cannot both
-    /// build a database.
-    private func withOpenLock<T>(_ body: () throws -> T) throws -> T {
-        try ensureDirectory()
-        let fd = Darwin.open(lockURL.path, O_RDWR | O_CREAT, 0o600)
-        guard fd >= 0 else { throw FedFailure.storeUnavailable }
-        defer { Darwin.close(fd) }
-        guard flock(fd, LOCK_EX) == 0 else { throw FedFailure.storeUnavailable }
-        defer { _ = flock(fd, LOCK_UN) }
-        return try body()
-    }
-
     private func ensureDirectory() throws {
         do {
             try fileManager.createDirectory(at: directoryURL, withIntermediateDirectories: true)
@@ -732,7 +764,7 @@ public actor FedSQLiteStateStore: FedStateStore {
     }
 
     /// Removes what an interrupted build left behind. Only `open` builds, and
-    /// it holds the open lock while it does, so under that lock no build is in
+    /// it holds the lifetime lock while it does, so under that lock no build is in
     /// progress and every such file is residue.
     private func removeBuildingFiles() {
         for suffix in ["", "-journal", "-wal", "-shm"] {

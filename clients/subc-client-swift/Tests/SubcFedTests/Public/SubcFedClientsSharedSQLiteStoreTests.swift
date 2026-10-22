@@ -5,6 +5,51 @@ import XCTest
 final class SubcFedClientsSharedSQLiteStoreTests: XCTestCase {
     private let features: Set<String> = ["mgmt-v1", "effects-v1", FedEffectsV2Codec.feature]
 
+    func testClientRetainingClosedStoreFailsClearlyWhileAnotherActorOwnsIt() async throws {
+        let directory = try FedStoreUnderTest.temporaryDirectory(removedAfter: self)
+        let store = FedSQLiteStateStore(directoryURL: directory)
+        let fixture = try makeClient(store: store, responderPrivateKey: Data(repeating: 0x22, count: 32))
+        addTeardownBlock { await fixture.client.disconnect() }
+        let connecting = Task { try await fixture.client.connect() }
+        try await driveHandshake(fixture, peer: .computerA)
+        try await connecting.value
+        let call = mutation(fixture.client, barrier: StartBarrier(parties: 1), value: "interrupted")
+        let timeout = Task {
+            try await Task.sleep(nanoseconds: 2_000_000_000)
+            call.cancel()
+        }
+        defer { timeout.cancel() }
+        let request = try await fixture.transport.nextOutboundFrame(features: features)
+
+        // Deliberately violate shutdown order to test the fail-closed backstop.
+        try await store.close()
+        let owner = FedSQLiteStateStore(directoryURL: directory)
+        _ = try await owner.open(localPublicKey: FedPublicTestSupport.localPublicKey())
+        let before = try await owner.snapshot()
+        await fixture.transport.enqueueInbound(try terminalResponse(for: request, body: "too late"))
+        try await assertStoreClosed { _ = try await call.value }
+        try await assertStoreClosed { try await fixture.client.connect() }
+        try await assertStoreClosed { _ = try await fixture.client.lookupOperation(moduleID: "shared-store", method: "store.mutate") }
+        try await assertStoreClosed {
+            _ = try await fixture.client.callManagement(
+                target: FedManagementTarget(moduleID: "shared-store"), method: "store.mutate", params: FedJSONObject()
+            )
+        }
+        try await assertStoreClosed { _ = try await fixture.client.subscribe(module: "shared-store", op: "watch", body: Data()) }
+        let carriers = await fixture.client.carrierOperationsStarted
+        XCTAssertEqual(carriers, 1, "a closed-store client must never redial")
+        let after = try await owner.snapshot()
+        XCTAssertEqual(after, before, "old client must not settle an effect in the new owner's store")
+        try await owner.close()
+    }
+
+    private func assertStoreClosed(_ operation: () async throws -> Void, line: UInt = #line) async throws {
+        do {
+            try await operation()
+            XCTFail("a client retaining a closed actor must throw FedStateStoreClosed", line: line)
+        } catch is FedStateStoreClosed {}
+    }
+
     func testTwoLiveClientsShareOneSQLiteStoreAcrossConcurrentSends() async throws {
         let directory = try temporaryDirectory()
         let localKey = try FedPublicTestSupport.localPublicKey()
@@ -14,6 +59,7 @@ final class SubcFedClientsSharedSQLiteStoreTests: XCTestCase {
         addTeardownBlock {
             await clientA.client.disconnect()
             await clientB.client.disconnect()
+            try await store.close()
             try? FileManager.default.removeItem(at: directory)
         }
 
@@ -115,6 +161,9 @@ final class SubcFedClientsSharedSQLiteStoreTests: XCTestCase {
         XCTAssertEqual(secondReplyA, Data("a-2".utf8))
         XCTAssertEqual(secondReplyB, Data("b-2".utf8))
 
+        await clientA.client.disconnect()
+        await clientB.client.disconnect()
+        try await store.close()
         let reopened = FedSQLiteStateStore(directoryURL: directory)
         _ = try await reopened.open(localPublicKey: localKey)
         let reopenedA = try await reopened.destination(forResponderPublicKey: clientA.responderPublicKey)
@@ -153,25 +202,25 @@ final class SubcFedClientsSharedSQLiteStoreTests: XCTestCase {
         XCTAssertEqual(reopenedSnapshot.global.nextEffectSequence, 5)
     }
 
-    func testConcurrentReservationsAcrossTwoStoresAreDistinctAndUnlost() async throws {
+    func testConcurrentReservationsOnSharedStoreAreDistinctAndUnlost() async throws {
         let directory = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
         let localKey = try FedPublicTestSupport.localPublicKey()
-        let bootstrap = FedSQLiteStateStore(directoryURL: directory)
-        _ = try await bootstrap.open(localPublicKey: localKey)
         let storeA = FedSQLiteStateStore(directoryURL: directory)
         let storeB = FedSQLiteStateStore(directoryURL: directory)
         _ = try await storeA.open(localPublicKey: localKey)
-        _ = try await storeB.open(localPublicKey: localKey)
+        do {
+            _ = try await storeB.open(localPublicKey: localKey)
+            XCTFail("clients must share an actor, not open the same directory twice")
+        } catch is FedStateStoreInUse {}
 
         let reservationCount = 32
         let start = StartBarrier(parties: reservationCount)
-        let tasks = (0..<reservationCount).map { index in
+        let tasks = (0..<reservationCount).map { _ in
             Task { () -> Result<FedReservation, Error> in
                 await start.arriveAndWait()
                 do {
-                    let store = index.isMultiple(of: 2) ? storeA : storeB
-                    return .success(try await store.reserveEffectSequence())
+                    return .success(try await storeA.reserveEffectSequence())
                 } catch {
                     return .failure(error)
                 }
@@ -182,10 +231,11 @@ final class SubcFedClientsSharedSQLiteStoreTests: XCTestCase {
         let reservations = try results.map { try $0.get() }
         let sequences = reservations.map(\.value)
         XCTAssertEqual(reservations.count, reservationCount)
-        XCTAssertEqual(Set(sequences).count, reservationCount, "two SQLite connections returned a duplicate")
+        XCTAssertEqual(Set(sequences).count, reservationCount, "shared SQLite actor returned a duplicate")
         XCTAssertEqual(sequences.sorted(), (1...reservationCount).map { UInt64($0) })
         XCTAssertEqual(Set(reservations.map(\.revision)).count, reservationCount)
 
+        try await storeA.close()
         let reopened = FedSQLiteStateStore(directoryURL: directory)
         _ = try await reopened.open(localPublicKey: localKey)
         let next = try await reopened.reserveEffectSequence()
@@ -200,6 +250,7 @@ final class SubcFedClientsSharedSQLiteStoreTests: XCTestCase {
         addTeardownBlock {
             await clientA.client.disconnect()
             await clientB.client.disconnect()
+            try await store.close()
             try? FileManager.default.removeItem(at: directory)
         }
 

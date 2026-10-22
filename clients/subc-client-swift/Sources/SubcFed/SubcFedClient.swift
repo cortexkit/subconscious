@@ -211,6 +211,7 @@ public actor SubcFedClient {
     }
 
     public func connect() async throws {
+        try await checkStateStoreLifetime()
         explicitlyDisconnected = false
         try await beginDialCycle(reason: .explicitConnect)
     }
@@ -220,6 +221,7 @@ public actor SubcFedClient {
     /// A grant is not a saved pin: the app must still ask for acknowledgement.
     /// The result deadline is injectable but cannot shorten the 130-second minimum.
     public func pair(qr: FedPairingQR, resultTimeout: Duration = .seconds(130)) async throws -> FedPendingPairing {
+        try await checkStateStoreLifetime()
         let resultTimeout = max(resultTimeout, .seconds(130))
         pairingGeneration &+= 1
         let generation = pairingGeneration
@@ -279,6 +281,7 @@ public actor SubcFedClient {
     /// federation state was lost. The enrollment identifier is retained for audit;
     /// it is not matched against a remote value by this client.
     public func acknowledgeReenrollment(enrollmentID: String) async throws {
+        try await checkStateStoreLifetime()
         guard !enrollmentID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw FedFailure.invalidProfile(field: "enrollmentID")
         }
@@ -314,6 +317,7 @@ public actor SubcFedClient {
     }
 
     public func resume() async throws {
+        try await checkStateStoreLifetime()
         // Explicit disconnect leaves idle; resume must not dial from that state.
         if case .idle = connectionState {
             return
@@ -328,6 +332,7 @@ public actor SubcFedClient {
     }
 
     public func updateProfile(_ profile: FedPeerProfile) async throws {
+        try await checkStateStoreLifetime()
         guard activeProfile.isSamePeer(as: profile) else {
             throw FedFailure.invalidProfile(field: "peerIdentity")
         }
@@ -348,6 +353,7 @@ public actor SubcFedClient {
 
     /// Looks up a management operation in the authenticated remote catalog.
     public func lookupOperation(moduleID: String, method: String) async throws -> FedCatalogOperation {
+        try await checkStateStoreLifetime()
         guard let session = activeSession else { throw FedFailure.disconnected }
         return try await session.engine.lookupOperation(moduleID: moduleID, method: method)
     }
@@ -355,6 +361,7 @@ public actor SubcFedClient {
     /// Issues one management call. Params must already be a strict FedJSONObject;
     /// invalid values never reach this method from the worker adapter.
     public func callManagement(method: String, params: FedJSONObject) async throws -> Data {
+        try await checkStateStoreLifetime()
         guard let target = defaultManagementTarget else {
             throw FedFailure.catalogTargetUnavailable
         }
@@ -367,6 +374,7 @@ public actor SubcFedClient {
         method: String,
         params: FedJSONObject
     ) async throws -> Data {
+        try await checkStateStoreLifetime()
         guard let session = activeSession else { throw FedFailure.disconnected }
         guard case .ready = connectionState else { throw FedFailure.disconnected }
 
@@ -437,6 +445,7 @@ public actor SubcFedClient {
     /// Opens a catalog-advertised management watch. Payloads and cursors are opaque;
     /// no handle escapes until the peer accepts with `open`.
     public func subscribe(module: String, op: String, body: Data) async throws -> FedSubscription {
+        try await checkStateStoreLifetime()
         try Task.checkCancellation()
         guard let session = activeSession ?? establishingSession else {
             throw FedSubscriptionFailure(reason: .sessionLost, underlying: .disconnected)
@@ -666,10 +675,21 @@ public actor SubcFedClient {
     }
 
     private func openStateDocumentIfNeeded(localPublicKey: Data) async throws {
+        try await checkStateStoreLifetime()
         guard stateDocumentCreatedInClientLifetime == nil else { return }
         let result = try await stateStore.open(localPublicKey: localPublicKey)
         stateDocumentCreatedInClientLifetime = result.created
         reenrollmentAcknowledgment = result.document.reenrollmentAcknowledgment
+    }
+
+    private func checkStateStoreLifetime() async throws {
+        guard let sqlite = stateStore as? FedSQLiteStateStore else { return }
+        do {
+            try await sqlite.checkNotClosed()
+        } catch let error as FedStateStoreClosed {
+            await handleSessionLoss(error)
+            throw error
+        }
     }
 
     private func evaluateEligibility(
@@ -833,7 +853,13 @@ public actor SubcFedClient {
                 defer {
                     if establishingSession?.engine === dialed.engine { establishingSession = nil }
                 }
-                try await dialed.engine.establish()
+                do {
+                    try await dialed.engine.establish()
+                } catch let error as FedStateStoreClosed {
+                    await dialed.engine.disconnect()
+                    await dialed.transport.close()
+                    throw error
+                }
                 // Re-validate after the establish await: a concurrent disconnect or
                 // a newer dial generation must not be resurrected into a ready
                 // session. Tear the just-established session down and abort.
@@ -852,6 +878,9 @@ public actor SubcFedClient {
                 return
             } catch is CancellationError {
                 throw FedFailure.cancelled
+            } catch let error as FedStateStoreClosed {
+                await handleSessionLoss(error)
+                throw error
             } catch let failure as FedFailure {
                 if failure == .cancelled {
                     // Stale-dial abort: the invalidating event owns the published
@@ -1037,6 +1066,13 @@ public actor SubcFedClient {
     }
 
     private func handleSessionLoss(_ error: Error) async {
+        if error is FedStateStoreClosed {
+            // Store closure is a local lifetime boundary, not a retryable network
+            // loss. Preserve the typed error for calls already awaiting replies.
+            await resolvePendingCall { _ in .failure(error) }
+            await disconnect()
+            return
+        }
         let failure = (error as? FedFailure) ?? .disconnected
         await completePendingCalls(with: failure)
         await tearDownSession(reason: failure)

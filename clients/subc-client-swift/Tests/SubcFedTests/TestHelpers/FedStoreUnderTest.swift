@@ -20,7 +20,7 @@ enum FedStoreUnderTest: Equatable {
     }
 
     /// A store over `directory` that a test may reopen with a second call.
-    func durableStore(in directory: URL) -> any FedStateStore {
+    func durableStore(in directory: URL) -> FedSQLiteStateStore {
         FedSQLiteStateStore(directoryURL: directory)
     }
 

@@ -73,6 +73,7 @@ class FedConfirmedRangeStoreTests: XCTestCase {
         let before = try await store.destination(forResponderPublicKey: responder)?.confirmedEffectRanges
         XCTAssertEqual(before?.count, 1)
 
+        try await store.close()
         let reopened = Self.storeUnderTest.durableStore(in: dir)
         _ = try await reopened.open(localPublicKey: localKey)
         let after = try await reopened.destination(forResponderPublicKey: responder)?.confirmedEffectRanges
@@ -95,6 +96,7 @@ class FedConfirmedRangeStoreTests: XCTestCase {
             let next = try await store.reserveEffectSequence().value
             XCTAssertGreaterThan(next, e[2].seq, label)
 
+            try await (store as? FedSQLiteStateStore)?.close()
             let reopened = make()
             _ = try await reopened.open(localPublicKey: localKey)
             let afterRestart = try await reopened.reserveEffectSequence().value

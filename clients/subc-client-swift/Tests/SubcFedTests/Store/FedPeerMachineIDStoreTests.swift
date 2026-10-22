@@ -16,6 +16,7 @@ final class FedPeerMachineIDStoreTests: XCTestCase {
         XCTAssertNil(absent)
         try await observe(store, key: responder, id: firstID)
         try await observe(store, key: otherResponder, id: secondID)
+        try await store.close()
         let reopened = FedSQLiteStateStore(directoryURL: directory)
         _ = try await reopened.open(localPublicKey: localKey)
         let first = try await reopened.peerMachineID(forResponderPublicKey: responder)
@@ -32,6 +33,7 @@ final class FedPeerMachineIDStoreTests: XCTestCase {
         try await store.observePeerHello(
             responderStaticPublicKey: responder, peerIncarnation: "new-incarnation", peerLedgerEpoch: "new-epoch"
         )
+        try await store.close()
         let reopened = FedSQLiteStateStore(directoryURL: directory)
         _ = try await reopened.open(localPublicKey: localKey)
         let saved = try await reopened.peerMachineID(forResponderPublicKey: responder)
@@ -70,6 +72,7 @@ final class FedPeerMachineIDStoreTests: XCTestCase {
         try await store.forgetPeerMachineID(forResponderPublicKey: responder)
         // The app may repeat unpin cleanup; it is harmless.
         try await store.forgetPeerMachineID(forResponderPublicKey: responder)
+        try await store.close()
         let reopened = FedSQLiteStateStore(directoryURL: directory)
         _ = try await reopened.open(localPublicKey: localKey)
         let removed = try await reopened.peerMachineID(forResponderPublicKey: responder)
@@ -128,6 +131,7 @@ final class FedPeerMachineIDStoreTests: XCTestCase {
         try await observe(store, key: responder, id: firstID)
         let saved = try await store.peerMachineID(forResponderPublicKey: responder)
         XCTAssertEqual(saved, firstID)
+        try await store.close()
         let reopened = FedSQLiteStateStore(directoryURL: directory)
         _ = try await reopened.open(localPublicKey: localKey)
         let persisted = try await reopened.peerMachineID(forResponderPublicKey: responder)

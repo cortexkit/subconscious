@@ -245,6 +245,8 @@ class FedOriginReconciliationTests: XCTestCase {
 
         // Poison survives a restart: a fresh store instance over the same durable
         // file still carries it, and a subsequent miss at that epoch is ambiguous.
+        await engine.disconnect()
+        try await store.close()
         let reopened = Self.storeUnderTest.durableStore(in: dir)
         _ = try await reopened.open(localPublicKey: localKey)
         let reopenedDest = try await reopened.destination(forResponderPublicKey: responderKey)

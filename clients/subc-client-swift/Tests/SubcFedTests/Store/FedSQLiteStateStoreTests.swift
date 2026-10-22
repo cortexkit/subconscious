@@ -298,6 +298,7 @@ final class FedSQLiteStateStoreTests: XCTestCase {
     func testUnopenableDatabaseIsStoreLockedAndRetryable() async throws {
         let (first, dir) = try await openStore()
         let incarnation = try await first.snapshot().global.localIncarnation
+        try await first.close()
         let database = dir.appendingPathComponent(FedSQLiteStateStore.databaseFileName)
         let bytesBefore = try Data(contentsOf: database)
 
@@ -472,11 +473,20 @@ final class FedSQLiteStateStoreTests: XCTestCase {
         return (store, dir)
     }
 
-    /// Phases as a new instance reads them from disk, i.e. after a crash.
+    /// Inspect committed phases directly, without opening a second store or
+    /// folding the live store's in-memory sent phases into a commit.
     private func phasesOnDisk(_ dir: URL) async throws -> [FedUnresolvedEffectRecord.Phase] {
-        let reopened = FedSQLiteStateStore(directoryURL: dir)
-        _ = try await reopened.open(localPublicKey: localKey)
-        return try await reopened.unsettledEffects(forResponderPublicKey: responder).map(\.phase)
+        let db = try FedSQLiteConnection.open(
+            path: dir.appendingPathComponent(FedSQLiteStateStore.databaseFileName).path,
+            flags: SQLITE_OPEN_READONLY
+        )
+        defer { try? db.close() }
+        let statement = try db.prepare("SELECT phase FROM effect ORDER BY seq")
+        var phases: [FedUnresolvedEffectRecord.Phase] = []
+        while try statement.step() {
+            phases.append(try XCTUnwrap(FedUnresolvedEffectRecord.Phase(rawValue: try XCTUnwrap(statement.text(0)))))
+        }
+        return phases
     }
 
     private func storeFiles(_ dir: URL) throws -> [URL] {

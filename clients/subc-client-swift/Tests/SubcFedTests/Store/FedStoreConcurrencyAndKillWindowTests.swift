@@ -2,24 +2,24 @@ import Foundation
 import XCTest
 @testable import SubcFed
 
-/// SQLite writer serialization; the subclass adds transaction kill windows.
+/// SQLite ownership and shared-actor serialization; the subclass adds kill windows.
 class FedStoreConcurrencyAndKillWindowTests: XCTestCase {
     class var storeUnderTest: FedStoreUnderTest { .asWritten }
 
     fileprivate let localKey = Data(repeating: 0x11, count: 32)
 
 
-    func testSimultaneousTwoWritersExactlyOneSeqWins() async throws {
+    func testSharedActorReservationsAreUniqueAndSecondOpenerIsRefused() async throws {
         let dir = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: dir) }
-
-        let bootstrap = Self.storeUnderTest.durableStore(in: dir)
-        _ = try await bootstrap.open(localPublicKey: localKey)
 
         let writerA = Self.storeUnderTest.durableStore(in: dir)
         let writerB = Self.storeUnderTest.durableStore(in: dir)
         _ = try await writerA.open(localPublicKey: localKey)
-        _ = try await writerB.open(localPublicKey: localKey)
+        do {
+            _ = try await writerB.open(localPublicKey: localKey)
+            XCTFail("a second opener must be refused")
+        } catch is FedStateStoreInUse {}
 
         let barrier = Barrier(count: 2)
         async let a: Result<UInt64, Error> = {
@@ -34,7 +34,7 @@ class FedStoreConcurrencyAndKillWindowTests: XCTestCase {
         async let b: Result<UInt64, Error> = {
             await barrier.arriveAndWait()
             do {
-                let r = try await writerB.reserveEffectSequence()
+                let r = try await writerA.reserveEffectSequence()
                 return .success(r.value)
             } catch {
                 return .failure(error)
@@ -44,10 +44,11 @@ class FedStoreConcurrencyAndKillWindowTests: XCTestCase {
         let results = await [a, b]
         let successes = results.compactMap { try? $0.get() }
         // Concurrent reservations must never hand out the same sequence.
-        XCTAssertFalse(successes.isEmpty)
+        XCTAssertEqual(successes.count, 2)
         XCTAssertEqual(Set(successes).count, successes.count, "duplicate reserved seq")
 
         // Reopen and reserve: next value must exceed every handed-out seq.
+        try await writerA.close()
         let reopened = Self.storeUnderTest.durableStore(in: dir)
         _ = try await reopened.open(localPublicKey: localKey)
         let next = try await reopened.reserveEffectSequence()
@@ -70,8 +71,8 @@ class FedStoreConcurrencyAndKillWindowTests: XCTestCase {
 /// caller sees the reply. A process can die on either side of each commit.
 /// Every test drives the change through `FedOriginEffectLog`, as the session
 /// engine does, and then reads the state through a NEW store instance opened
-/// from disk while the first one is still alive and has closed nothing, which
-/// is what the next launch after a kill sees.
+/// from disk after closing the first connection and discarding its transient
+/// state. The barriers preserve the durable state on either side of a kill.
 final class FedStoreConcurrencyAndKillWindowSQLiteTests: FedStoreConcurrencyAndKillWindowTests {
     override class var storeUnderTest: FedStoreUnderTest { .sqlite }
 
@@ -89,6 +90,7 @@ final class FedStoreConcurrencyAndKillWindowSQLiteTests: FedStoreConcurrencyAndK
 
         let effect = try await log.beginMutation(peerIncarnation: peerIncarnation, peerLedgerEpoch: epoch)
 
+        try await store.close()
         let afterKill = try await openStore(dir)
         let unsettled = try await afterKill.unsettledEffects(forResponderPublicKey: responder)
         XCTAssertEqual(unsettled.map(\.effect), [effect], "the intent must be durable before the send")
@@ -114,6 +116,7 @@ final class FedStoreConcurrencyAndKillWindowSQLiteTests: FedStoreConcurrencyAndK
             XCTFail("the intent commit was interrupted, so the mutation must not start")
         } catch {}
 
+        try await store.close()
         let afterKill = try await openStore(dir)
         let after = try await afterKill.snapshot()
         XCTAssertEqual(after, before, "an uncommitted intent leaves the store exactly as it was")
@@ -140,6 +143,7 @@ final class FedStoreConcurrencyAndKillWindowSQLiteTests: FedStoreConcurrencyAndK
             XCTFail("the caller must not see the reply in this window")
         } catch {}
 
+        try await store.close()
         let afterKill = try await openStore(dir)
         let destination = try await afterKill.destination(forResponderPublicKey: responder)
         let row = destination?.unresolvedEffects.first { $0.effect == effect }
@@ -171,6 +175,7 @@ final class FedStoreConcurrencyAndKillWindowSQLiteTests: FedStoreConcurrencyAndK
             XCTFail("the outcome commit was interrupted")
         } catch {}
 
+        try await store.close()
         let afterKill = try await openStore(dir)
         let unsettled = try await afterKill.unsettledEffects(forResponderPublicKey: responder)
         XCTAssertEqual(unsettled.map(\.effect), [effect])

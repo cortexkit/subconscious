@@ -98,6 +98,7 @@ class FedSettledRecordPruningTests: XCTestCase {
         assertScenarioTrace(trace)
 
         // What was pruned is gone from disk too, not just from memory.
+        try await store.close()
         let reopened = Self.storeUnderTest.durableStore(in: dir)
         _ = try await reopened.open(localPublicKey: localKey)
         let onDisk = try await reopened.destination(forResponderPublicKey: responder)

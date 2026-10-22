@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.22.8
+
+- Mark every held subscription request with `SUBSCRIPTION_FLAG` so module drains exclude it from their quiescence wait; ordinary calls remain unmarked.
+
 ## 0.22.7
 
 - Export `MAX_DELIVERED_FRAME_LEN` (4,194,304 bytes, header included), mirroring subc-protocol 0.32.9: the largest frame the daemon delivers from a module to a client. A module should keep each reply, stream frame, error, reverse request and push within it; a larger one is never forwarded. The golden conformance test checks it against the Rust fixture.

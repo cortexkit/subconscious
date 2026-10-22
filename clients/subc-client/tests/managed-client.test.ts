@@ -343,16 +343,8 @@ describe("SubcClient capability resolution", () => {
 });
 
 describe("subscription request flag", () => {
-  // NEITHER a call NOR a subscribe emits bit 7 yet, and the subscribe arm is the
-  // load-bearing one. This asserted the OPPOSITE for subscribes until the
-  // emission retreated: a decoder built against subc-protocol <= 0.20.0 REFUSES
-  // bit 7 outright, and the splice forwards the flags byte verbatim into a module
-  // that never opted in. Emission is Phase 2 of a two-phase fleet operation and
-  // the census has not happened.
-  //
-  // This test EXISTS TO RED when someone restores `| SUBSCRIPTION_FLAG` without
-  // doing Phase 1 first. Do not "fix" it by flipping the assertion back.
-  test("neither call nor subscribe emits bit 7 until the fleet tolerates it", async () => {
+  // The daemon excludes marked held subscriptions from module-drain quiescence waits.
+  test("marks held subscriptions but not ordinary calls", async () => {
     const { connFile } = tempConnectionFile();
     const stats = newStats();
     const daemon = await startFakeDaemon({ stats });
@@ -370,9 +362,7 @@ describe("subscription request flag", () => {
 
       expect(stats.dataFlags).toHaveLength(2);
       expect(stats.dataFlags[0]! & SUBSCRIPTION_FLAG).toBe(0);
-      // The subscribe arm: 0, not SUBSCRIPTION_FLAG. Restoring emission is Phase 2
-      // and needs a fleet census that every module's decoder accepts bit 7.
-      expect(stats.dataFlags[1]! & SUBSCRIPTION_FLAG).toBe(0);
+      expect(stats.dataFlags[1]! & SUBSCRIPTION_FLAG).toBe(SUBSCRIPTION_FLAG);
     } finally {
       client.close();
     }

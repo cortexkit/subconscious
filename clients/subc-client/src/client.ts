@@ -1058,23 +1058,10 @@ export class SubcClient {
         subscription: true,
       };
       this.pending.set(key, subscriptionPending);
-      // BIT 7 IS NOT EMITTED YET, DELIBERATELY. `SUBSCRIPTION_FLAG` is allocated
-      // and the daemon reads it, but every decoder built against subc-protocol
-      // <= 0.20.0 treats bit 7 as a RESERVED-BIT TRIPWIRE and REFUSES the frame
-      // rather than ignoring a bit it does not know. The splice forwards the
-      // flags byte verbatim, so the rejection lands at the far end, inside a
-      // module whose author opted into nothing, as a decode error on a frame the
-      // daemon considered well-formed.
-      //
-      // Restoring this line is PHASE 2 of a two-phase fleet operation and must
-      // not happen until Phase 1 is done and CENSUSED: every module linking a
-      // subc-protocol whose decoder ACCEPTS bit 7. Bit 6 (DAEMON_ORIGIN) was
-      // done exactly this way, in separate PRs, for exactly this reason.
-      //
-      //   ... | SUBSCRIPTION_FLAG,   <- Phase 2, not before the census
+      // Mark held subscriptions so module drains leave them out of the quiescence wait.
       const frame = buildFrame(
         FrameType.Request,
-        buildFlags(false, priority, false, admission),
+        buildFlags(false, priority, false, admission) | SUBSCRIPTION_FLAG,
         handle.channel,
         handle.epoch,
         corr,

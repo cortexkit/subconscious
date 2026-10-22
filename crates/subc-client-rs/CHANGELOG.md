@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.30.8
+
+- Mark every held subscription request with `FLAG_SUBSCRIPTION` so module drains exclude it from their quiescence wait; ordinary requests remain unmarked.
+
 ## 0.30.7
 
 - `ServerDescription` gains `config_path`, the config file the daemon reads as `server.describe` reports it (absent from older daemons and when the daemon's path is relative). Requires subc-control 0.32.3.

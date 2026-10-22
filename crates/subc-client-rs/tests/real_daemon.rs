@@ -5387,6 +5387,78 @@ async fn a_restart_drain_with_a_held_call_ends_on_the_gauge_under_a_slow_health_
     daemon.kill_and_wait();
 }
 
+/// A held subscription is reported as excluded and does not consume the restart
+/// drain budget. The subscription stays open across the whole drain, so an
+/// unmarked one would hold the drain until its budget ran out and report
+/// `drained: false`; `drained: true` is the proof, without a wall-clock bound
+/// that a loaded runner could miss.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restart_drain_excludes_a_held_subscription_before_its_budget() {
+    const DRAIN_BUDGET_MS: u64 = 3_000;
+    let (_temp_dir, mut daemon, events_path) =
+        start_drain_harness("subc-client-rs-drain-held-subscription", &[], Value::Null).await;
+    let consumer = SubcConsumer::connect(&daemon.connection_file, fast_consumer_options())
+        .await
+        .unwrap();
+    let mut control = consumer.control_pushes(8);
+    let _subscription = consumer
+        .subscribe(
+            tool_target(DRAIN_MODULE_ID),
+            consumer_identity("drain-held-subscription"),
+            br#"{"kind":"cancel","tag":"held-subscription"}"#.to_vec(),
+            fast_subscribe_options(),
+        )
+        .await
+        .unwrap();
+    wait_for_event(&events_path, EVENT_TIMEOUT, |event| {
+        event["kind"] == "cancel_waiting" && event["tag"] == "held-subscription"
+    })
+    .await;
+
+    restart_drain_module_with_timeout(&daemon.connection_file, Some(DRAIN_BUDGET_MS)).await;
+    let mut received_pushes = Vec::new();
+    let closed = timeout(
+        Duration::from_millis(DRAIN_BUDGET_MS) + EVENT_TIMEOUT,
+        async {
+            loop {
+                let push = control
+                    .recv()
+                    .await
+                    .expect("control push receiver should remain open");
+                received_pushes.push(push.clone());
+                if push.op == "route.closed" {
+                    return push;
+                }
+            }
+        },
+    )
+    .await
+    .expect("route.closed should arrive within the drain budget plus event timeout");
+
+    assert_eq!(closed.body["reason"], "restart", "{:?}", closed.body);
+    assert_eq!(
+        closed.body["drained"], true,
+        "the held subscription must not hold the drain to its budget: {:?}",
+        closed.body
+    );
+    assert!(
+        closed.body["excluded_subscriptions"]
+            .as_u64()
+            .unwrap_or_default()
+            >= 1,
+        "route.closed must report the held subscription: {:?}",
+        closed.body
+    );
+    assert!(
+        received_pushes
+            .iter()
+            .any(|push| push.op == "route.closing"),
+        "the held route must be told the drain began: {received_pushes:?}"
+    );
+    drop(_subscription);
+    daemon.kill_and_wait();
+}
+
 /// A managed call sent on an established route while its module drains for a
 /// restart succeeds on the restarted process.
 ///

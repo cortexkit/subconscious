@@ -5,7 +5,9 @@ use std::{
 };
 
 use serde_json::{Map, Value};
-use subc_jsonc::{jsonc_member_span, jsonc_object_span, jsonc_to_json};
+use subc_jsonc::{
+    insert_member_with, jsonc_member_span, jsonc_to_json, read_document, to_string_pretty_sorted,
+};
 
 use super::{file_modes, model::Component};
 
@@ -193,10 +195,7 @@ pub fn plan_component_with_key(
         }
     }
     if before.is_empty() {
-        after = format!(
-            "{}\n",
-            serde_json::to_string_pretty(&document).expect("JSON values always serialize")
-        );
+        after = format!("{}\n", to_string_pretty_sorted(&document));
         if component == Component::Claustrum {
             insert_claustrum_reserved_comment(&mut after, "\n");
         }
@@ -516,8 +515,8 @@ fn insert_claustrum_reserved_comment(rendered: &mut String, newline: &str) {
 }
 
 /// Inserts a missing dotted value at the closest existing parent object. The
-/// parser gives byte offsets in the original JSONC so comments and user layout
-/// survive rather than being reconstructed from a serde value.
+/// editor works on byte offsets in the original JSONC, so comments and the
+/// operator's layout survive rather than being rebuilt from a serde value.
 fn insert_textual_value(
     document: &mut String,
     dotted_key: &str,
@@ -525,138 +524,12 @@ fn insert_textual_value(
     add_claustrum_comment: bool,
 ) -> Result<(), String> {
     let keys = dotted_key.split('.').collect::<Vec<_>>();
-    let mut existing_depth = 0;
-    for depth in 1..keys.len() {
-        match jsonc_object_span(document, &keys[..depth]).map_err(|_| dotted_key.to_string())? {
-            Some(_) => existing_depth = depth,
-            None => break,
+    insert_member_with(document, &keys, &desired, |member, newline| {
+        if add_claustrum_comment {
+            insert_claustrum_reserved_comment(member, newline);
         }
-    }
-
-    let key = keys
-        .get(existing_depth)
-        .ok_or_else(|| dotted_key.to_string())?;
-    let mut value = desired;
-    for parent in keys[existing_depth + 1..].iter().rev() {
-        let mut nested = Map::new();
-        nested.insert((*parent).to_string(), value);
-        value = Value::Object(nested);
-    }
-    insert_object_member(
-        document,
-        &keys[..existing_depth],
-        key,
-        &value,
-        add_claustrum_comment,
-    )
+    })
     .map_err(|_| dotted_key.to_string())
-}
-
-fn insert_object_member(
-    document: &mut String,
-    parent_path: &[&str],
-    key: &str,
-    value: &Value,
-    add_claustrum_comment: bool,
-) -> Result<(), String> {
-    let mut object = jsonc_object_span(document, parent_path)?
-        .ok_or_else(|| "parent object is absent".to_string())?;
-    if !object.is_empty && !object.has_trailing_comma {
-        let last_value_end = object
-            .last_member_end
-            .ok_or_else(|| "non-empty object has no final member".to_string())?;
-        // A line comment may follow the value. Put the separator before that
-        // comment so the comment continues to describe the existing member.
-        document.insert(last_value_end, ',');
-        object = jsonc_object_span(document, parent_path)?
-            .ok_or_else(|| "parent object disappeared".to_string())?;
-    }
-
-    let newline = if document.contains("\r\n") {
-        "\r\n"
-    } else {
-        "\n"
-    };
-    let indentation = indentation_unit(document);
-    let closing_line_start = document[..object.closing_brace]
-        .rfind('\n')
-        .map_or(0, |index| index + 1);
-    let closing_indent = &document[closing_line_start..object.closing_brace];
-    let closing_has_only_indent = closing_indent
-        .chars()
-        .all(|character| matches!(character, ' ' | '\t' | '\r'));
-    let member_indent = if closing_has_only_indent {
-        format!("{closing_indent}{indentation}")
-    } else {
-        indentation.repeat(parent_path.len() + 1)
-    };
-    let mut member = render_member(key, value, &member_indent, &indentation, newline);
-    if add_claustrum_comment {
-        insert_claustrum_reserved_comment(&mut member, newline);
-    }
-
-    if closing_has_only_indent {
-        document.insert_str(
-            closing_line_start,
-            &format!("{member_indent}{member}{newline}"),
-        );
-    } else {
-        let closing_indent = indentation.repeat(parent_path.len());
-        document.insert_str(
-            object.closing_brace,
-            &format!("{newline}{member_indent}{member}{newline}{closing_indent}"),
-        );
-    }
-    Ok(())
-}
-
-fn indentation_unit(document: &str) -> String {
-    document
-        .lines()
-        .find_map(|line| {
-            let indent = line
-                .chars()
-                .take_while(|character| matches!(character, ' ' | '\t'))
-                .collect::<String>();
-            (!indent.is_empty()
-                && line[indent.len()..]
-                    .chars()
-                    .any(|character| !character.is_whitespace()))
-            .then_some(indent)
-        })
-        .unwrap_or_else(|| "  ".to_string())
-}
-
-fn render_member(
-    key: &str,
-    value: &Value,
-    member_indent: &str,
-    indentation: &str,
-    newline: &str,
-) -> String {
-    let rendered = serde_json::to_string_pretty(value).expect("JSON values always serialize");
-    let mut lines = rendered.lines();
-    let first = lines.next().expect("serialized JSON has a first line");
-    if lines.next().is_none() {
-        return format!(
-            "{}: {first}",
-            serde_json::to_string(key).expect("key encodes")
-        );
-    }
-
-    let mut output = format!(
-        "{}: {first}",
-        serde_json::to_string(key).expect("key encodes")
-    );
-    for line in rendered.lines().skip(1) {
-        let spaces = line.bytes().take_while(|byte| *byte == b' ').count();
-        let depth = spaces / 2;
-        output.push_str(newline);
-        output.push_str(member_indent);
-        output.push_str(&indentation.repeat(depth));
-        output.push_str(line.trim_start());
-    }
-    output
 }
 
 /// The binary the daemon spawns for a module, read from the components
@@ -677,18 +550,6 @@ fn platform_binary(name: &str) -> String {
     } else {
         name.to_string()
     }
-}
-
-/// Reads and parses an existing JSONC configuration. A missing file is an error
-/// here: callers that use this edit a configuration the operator already has.
-pub fn read_document(path: &Path) -> Result<(String, Value), String> {
-    let text = fs::read_to_string(path)
-        .map_err(|error| format!("could not read {}: {error}", path.display()))?;
-    let strict = jsonc_to_json(&text)
-        .map_err(|error| format!("could not parse {}: {error}", path.display()))?;
-    let document = serde_json::from_str::<Value>(&strict)
-        .map_err(|error| format!("could not parse {}: {error}", path.display()))?;
-    Ok((text, document))
 }
 
 /// Plans adding `value` at `dotted_key` in an existing configuration, keeping
@@ -736,6 +597,9 @@ fn insert_value(document: &mut Value, dotted_key: &str, desired: Value) -> Resul
     }
     unreachable!("a desired configuration key always has a segment")
 }
+
+#[cfg(test)]
+mod byte_pins;
 
 #[cfg(test)]
 mod tests {

@@ -2445,7 +2445,7 @@ dependencies = [
 
 [[package]]
 name = "subc-core"
-version = "0.20.120"
+version = "0.20.121"
 dependencies = [
  "base64",
  "ck-ui",
@@ -2531,8 +2531,9 @@ dependencies = [
 
 [[package]]
 name = "subc-jsonc"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
+ "cortexkit-test-support",
  "serde_json",
 ]
 

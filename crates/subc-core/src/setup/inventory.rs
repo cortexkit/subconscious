@@ -269,12 +269,9 @@ impl Inventory {
             .parent()
             .ok_or_else(|| format!("inventory {} has no parent directory", self.path.display()))?;
         file_modes::ensure_owned_directory(parent, 0o700)?;
-        let serialized = serde_json::to_string_pretty(&self.document).map_err(|error| {
-            format!(
-                "could not serialize inventory {}: {error}",
-                self.path.display()
-            )
-        })?;
+        // Sorted keys, so the file's bytes don't depend on whether the build
+        // turned on serde_json's `preserve_order`.
+        let serialized = subc_jsonc::to_string_pretty_sorted(&self.document);
         file_modes::write_atomic(
             &self.path,
             format!("{serialized}\n").as_bytes(),

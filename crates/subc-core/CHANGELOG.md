@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.20.121
+
+- The span-preserving JSONC editor that setup uses to add its entries to `subc.jsonc`, and the reader that loads the file with its text, moved to `subc-jsonc` (0.1.3), which also gains the edits a settings screen needs: setting a member's value (adding the key when absent), removing a member, and replacing, appending or removing an array element. Setup writes exactly the bytes it wrote before; tests pin them for every setup fixture, including a CRLF file and the nats-server health check. Adding a value under a parent that exists but is not an object is now refused instead of adding a second member with the parent's name. Setup writes `subc.jsonc` and its inventory file with sorted keys however `ck` was built; before, a build with serde_json's `preserve_order` feature on wrote some keys in a different order. Release builds already wrote sorted keys, so their output is unchanged.
+
 ## 0.20.120
 
 - Keep bare `ck`'s 800 ms refresh limit in production while allowing the local-index CLI integration test to use a longer test-only budget, so scheduler load does not decide whether its refresh assertion passes.

@@ -326,7 +326,7 @@ pub fn observe(config_path: &Path, tool: &mut impl ConfTool) -> BusMonitoring {
     if !config_path.is_file() {
         return BusMonitoring::NotDeclared;
     }
-    let document = match config::read_document(config_path) {
+    let document = match subc_jsonc::read_document(config_path) {
         Ok((_, document)) => document,
         // An unreadable configuration is reported by the components that need it.
         Err(_) => return BusMonitoring::NotDeclared,
@@ -403,7 +403,7 @@ pub fn apply(
             true
         }
         None => {
-            let (_, document) = config::read_document(config_path)?;
+            let (_, document) = subc_jsonc::read_document(config_path)?;
             if health_state(&document, &report.health_url) == HealthState::Kept {
                 lines.push(format!(
                     "kept your setting: {HEALTH_KEY} in {} is left as it is",
@@ -528,7 +528,7 @@ mod tests {
     }
 
     fn health(install: &Install) -> Option<Value> {
-        let (_, document) = config::read_document(&install.config_path).unwrap();
+        let (_, document) = subc_jsonc::read_document(&install.config_path).unwrap();
         config::existing_value(&document, HEALTH_KEY).cloned()
     }
 

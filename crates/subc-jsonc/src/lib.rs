@@ -1,5 +1,13 @@
 #![forbid(unsafe_code)]
 
+mod edit;
+
+pub use edit::{
+    insert_member, insert_member_with, insert_object_member, insert_object_member_with,
+    push_element, read_document, remove_element, remove_member, set_element, set_member,
+    to_string_pretty_sorted,
+};
+
 /// Normalize a JSONC document into strict JSON by stripping comments and
 /// trailing commas while preserving string literals verbatim.
 pub fn jsonc_to_json(doc: &str) -> Result<String, String> {
@@ -326,8 +334,10 @@ fn tokenize(doc: &str) -> Result<Vec<Token>, String> {
 
 #[derive(Clone, Debug)]
 struct ParsedValue {
+    start: usize,
     end: usize,
     object: Option<ParsedObject>,
+    array: Option<ParsedArray>,
 }
 
 #[derive(Clone, Debug)]
@@ -341,10 +351,32 @@ struct ParsedObject {
 struct ParsedMember {
     key: String,
     key_start: usize,
+    value_start: usize,
     value_end: usize,
     comma_before: Option<usize>,
     comma_after: Option<usize>,
     object: Option<ParsedObject>,
+    array: Option<ParsedArray>,
+}
+
+/// An array's elements by byte offset, recorded so an editor can replace,
+/// append or remove one element without reformatting the rest of the
+/// document.
+#[derive(Clone, Debug)]
+struct ParsedArray {
+    opening_bracket: usize,
+    closing_bracket: usize,
+    elements: Vec<ParsedElement>,
+    has_trailing_comma: bool,
+}
+
+/// One array element. Each comma offset points at the comma itself.
+#[derive(Clone, Debug)]
+struct ParsedElement {
+    start: usize,
+    end: usize,
+    comma_before: Option<usize>,
+    comma_after: Option<usize>,
 }
 
 struct Parser<'a> {
@@ -372,17 +404,19 @@ impl<'a> Parser<'a> {
             .next()
             .ok_or_else(|| "expected a JSON value".to_string())?;
         match &token.kind {
-            TokenKind::LeftBrace => self.parse_object(),
-            TokenKind::LeftBracket => self.parse_array(),
+            TokenKind::LeftBrace => self.parse_object(token.start),
+            TokenKind::LeftBracket => self.parse_array(token.start),
             TokenKind::String(_) | TokenKind::Atom => Ok(ParsedValue {
+                start: token.start,
                 end: token.end,
                 object: None,
+                array: None,
             }),
             _ => Err(format!("expected a JSON value at byte {}", token.start)),
         }
     }
 
-    fn parse_object(&mut self) -> Result<ParsedValue, String> {
+    fn parse_object(&mut self, start: usize) -> Result<ParsedValue, String> {
         let mut members = Vec::new();
         let mut has_trailing_comma = false;
         let mut previous_comma = None;
@@ -392,12 +426,14 @@ impl<'a> Parser<'a> {
         ) {
             let close = self.next().expect("peeked token is present");
             return Ok(ParsedValue {
+                start,
                 end: close.end,
                 object: Some(ParsedObject {
                     closing_brace: close.start,
                     members,
                     has_trailing_comma,
                 }),
+                array: None,
             });
         }
         loop {
@@ -422,36 +458,40 @@ impl<'a> Parser<'a> {
             members.push(ParsedMember {
                 key,
                 key_start,
+                value_start: value.start,
                 value_end: value.end,
                 comma_before: previous_comma,
                 comma_after: None,
                 object: value.object,
+                array: value.array,
             });
             match self.next() {
                 Some(Token {
                     kind: TokenKind::RightBrace,
-                    start,
+                    start: close_start,
                     end,
                 }) => {
                     return Ok(ParsedValue {
+                        start,
                         end: *end,
                         object: Some(ParsedObject {
-                            closing_brace: *start,
+                            closing_brace: *close_start,
                             members,
                             has_trailing_comma,
                         }),
+                        array: None,
                     })
                 }
                 Some(Token {
                     kind: TokenKind::Comma,
-                    start,
+                    start: comma_start,
                     end,
                 }) => {
                     members
                         .last_mut()
                         .expect("member was just appended")
                         .comma_after = Some(*end);
-                    previous_comma = Some(*start);
+                    previous_comma = Some(*comma_start);
                     if matches!(
                         self.peek().map(|token| &token.kind),
                         Some(TokenKind::RightBrace)
@@ -459,12 +499,14 @@ impl<'a> Parser<'a> {
                         has_trailing_comma = true;
                         let close = self.next().expect("peeked token is present");
                         return Ok(ParsedValue {
+                            start,
                             end: close.end,
                             object: Some(ParsedObject {
                                 closing_brace: close.start,
                                 members,
                                 has_trailing_comma,
                             }),
+                            array: None,
                         });
                     }
                 }
@@ -479,48 +521,73 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_array(&mut self) -> Result<ParsedValue, String> {
+    fn parse_array(&mut self, start: usize) -> Result<ParsedValue, String> {
+        let mut elements: Vec<ParsedElement> = Vec::new();
+        let array = |closing_bracket: usize, elements, has_trailing_comma| {
+            Some(ParsedArray {
+                opening_bracket: start,
+                closing_bracket,
+                elements,
+                has_trailing_comma,
+            })
+        };
         if matches!(
             self.peek().map(|token| &token.kind),
             Some(TokenKind::RightBracket)
         ) {
             let close = self.next().expect("peeked token is present");
             return Ok(ParsedValue {
+                start,
                 end: close.end,
                 object: None,
+                array: array(close.start, elements, false),
             });
         }
+        let mut previous_comma = None;
         loop {
-            self.parse_value()?;
+            let value = self.parse_value()?;
+            elements.push(ParsedElement {
+                start: value.start,
+                end: value.end,
+                comma_before: previous_comma,
+                comma_after: None,
+            });
             match self.next() {
                 Some(Token {
                     kind: TokenKind::RightBracket,
+                    start: close_start,
                     end,
-                    ..
                 }) => {
                     return Ok(ParsedValue {
+                        start,
                         end: *end,
                         object: None,
+                        array: array(*close_start, elements, false),
                     })
                 }
                 Some(Token {
                     kind: TokenKind::Comma,
+                    start: comma_start,
                     ..
-                }) if matches!(
-                    self.peek().map(|token| &token.kind),
-                    Some(TokenKind::RightBracket)
-                ) =>
-                {
-                    let close = self.next().expect("peeked token is present");
-                    return Ok(ParsedValue {
-                        end: close.end,
-                        object: None,
-                    });
+                }) => {
+                    elements
+                        .last_mut()
+                        .expect("element was just appended")
+                        .comma_after = Some(*comma_start);
+                    previous_comma = Some(*comma_start);
+                    if matches!(
+                        self.peek().map(|token| &token.kind),
+                        Some(TokenKind::RightBracket)
+                    ) {
+                        let close = self.next().expect("peeked token is present");
+                        return Ok(ParsedValue {
+                            start,
+                            end: close.end,
+                            object: None,
+                            array: array(close.start, elements, true),
+                        });
+                    }
                 }
-                Some(Token {
-                    kind: TokenKind::Comma,
-                    ..
-                }) => {}
                 Some(token) => {
                     return Err(format!(
                         "expected a comma or closing bracket at byte {}",

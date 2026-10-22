@@ -543,3 +543,28 @@ fn a_text_field_takes_printable_keys_before_any_app_key() {
     );
     assert!(app.quit);
 }
+
+#[test]
+fn the_sources_follow_the_tab_on_screen() {
+    use ck_ui::live::schedule::Showing;
+    let snap = Snapshot::fixture();
+    let mut app = App::new(Theme::test());
+    assert_eq!(app.showing(&snap), Showing::tab(Tab::Home));
+    press(&mut app, &snap, KeyCode::Char('4'));
+    assert_eq!(app.showing(&snap), Showing::tab(Tab::Usage));
+
+    // A tab that doesn't show (its module left the roster) runs nothing of
+    // its own: Home is what shows.
+    let mut no_insula = snap.clone();
+    no_insula.modules.data.retain(|m| m.id != "insula");
+    assert_eq!(app.showing(&no_insula), Showing::tab(Tab::Home));
+
+    // The live app doesn't serve Usage yet, so key 4 leaves Home on screen.
+    let mut live = snap.clone();
+    live.serves = ck_ui::model::Serves::LIVE;
+    let mut app = App::new(Theme::test());
+    press(&mut app, &live, KeyCode::Char('4'));
+    assert_eq!(app.showing(&live), Showing::tab(Tab::Home));
+    press(&mut app, &live, KeyCode::Char('2'));
+    assert_eq!(app.showing(&live), Showing::tab(Tab::Modules));
+}

@@ -49,6 +49,9 @@ pub enum Request {
     WatchLog(Option<String>),
     /// Start the installed daemon service.
     StartDaemon,
+    /// What is on screen now, which decides the sources that run: a module
+    /// source runs only while a screen that shows its data is on screen.
+    Show(crate::live::schedule::Showing),
 }
 
 /// A question waiting for an answer before an action is sent.
@@ -126,6 +129,12 @@ impl App {
             return None;
         }
         self.selected(snap).map(|m| m.id.clone())
+    }
+
+    /// What is on screen, for the sources it needs: the tab that shows.
+    /// No screen yet opens the Add a phone overlay or Settings → Updates.
+    pub fn showing(&self, snap: &Snapshot) -> crate::live::schedule::Showing {
+        crate::live::schedule::Showing::tab(self.shown_tab(snap))
     }
 
     /// The module whose palette commands list first: the selected one while
@@ -954,18 +963,32 @@ impl Default for RunOptions {
     }
 }
 
-/// Hands the app's queued requests to `out`, and tells it when the log on
-/// screen changes. `watching` is the last log focus sent.
+/// What the run loop last told the data source about the screen.
+#[derive(Default)]
+struct Told {
+    /// The log focus last sent.
+    log: Option<Option<String>>,
+    /// What was on screen when last sent.
+    showing: Option<crate::live::schedule::Showing>,
+}
+
+/// Hands the app's queued requests to `out`, and tells it when what is on
+/// screen, or the log on screen, changes.
 fn forward_requests(
     app: &mut App,
     snap: &Snapshot,
     out: Option<&tokio::sync::mpsc::UnboundedSender<Request>>,
-    watching: &mut Option<Option<String>>,
+    told: &mut Told,
 ) {
+    let showing = app.showing(snap);
+    if told.showing != Some(showing) {
+        app.requests.push(Request::Show(showing));
+        told.showing = Some(showing);
+    }
     let focus = app.log_focus(snap);
-    if watching.as_ref() != Some(&focus) {
+    if told.log.as_ref() != Some(&focus) {
         app.requests.push(Request::WatchLog(focus.clone()));
-        *watching = Some(focus);
+        told.log = Some(focus);
     }
     for request in app.requests.drain(..) {
         if let Some(out) = out {
@@ -1015,13 +1038,8 @@ async fn event_loop(mut rx: watch::Receiver<Snapshot>, options: RunOptions) -> i
     let mut dirty = true;
     let mut source_open = true;
     let mut last_draw = tokio::time::Instant::now() - FRAME;
-    let mut watching = None;
-    forward_requests(
-        &mut app,
-        &rx.borrow(),
-        options.requests.as_ref(),
-        &mut watching,
-    );
+    let mut told = Told::default();
+    forward_requests(&mut app, &rx.borrow(), options.requests.as_ref(), &mut told);
 
     loop {
         if app.quit {
@@ -1044,7 +1062,7 @@ async fn event_loop(mut rx: watch::Receiver<Snapshot>, options: RunOptions) -> i
                     if app.handle_event(&event, &snap, (size.width, size.height)) {
                         dirty = true;
                     }
-                    forward_requests(&mut app, &snap, options.requests.as_ref(), &mut watching);
+                    forward_requests(&mut app, &snap, options.requests.as_ref(), &mut told);
                 }
                 Some(Err(e)) => return Err(e),
                 None => return Ok(()),
@@ -1061,9 +1079,45 @@ async fn event_loop(mut rx: watch::Receiver<Snapshot>, options: RunOptions) -> i
                     dirty = true;
                     let snap = rx.borrow().clone();
                     app.follow_roster(&snap);
-                    forward_requests(&mut app, &snap, options.requests.as_ref(), &mut watching);
+                    forward_requests(&mut app, &snap, options.requests.as_ref(), &mut told);
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::live::schedule::Showing;
+    use crate::live::{assemble, State};
+
+    #[test]
+    fn the_run_loop_tells_the_live_layer_what_shows_each_time_it_changes() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let snap = assemble(&State::empty("This Mac"), Timestamp::from_unix_millis(0));
+        let mut app = App::new(Theme::test());
+        let mut told = Told::default();
+        let mut sent = || {
+            let mut out = Vec::new();
+            while let Ok(r) = rx.try_recv() {
+                out.push(r);
+            }
+            out
+        };
+        forward_requests(&mut app, &snap, Some(&tx), &mut told);
+        assert_eq!(
+            sent(),
+            [
+                Request::Show(Showing::tab(Tab::Home)),
+                Request::WatchLog(None)
+            ]
+        );
+        forward_requests(&mut app, &snap, Some(&tx), &mut told);
+        assert_eq!(sent(), [], "nothing changed, nothing sent");
+
+        app.tab = Tab::Modules;
+        forward_requests(&mut app, &snap, Some(&tx), &mut told);
+        assert_eq!(sent(), [Request::Show(Showing::tab(Tab::Modules))]);
     }
 }

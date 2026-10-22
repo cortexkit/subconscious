@@ -2,7 +2,6 @@
 //! source, the request handler and the action monitor.
 
 use std::collections::{BTreeMap, HashMap};
-use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -18,6 +17,7 @@ use tokio::sync::{mpsc, watch, Notify};
 use tokio::task::JoinHandle;
 
 use super::map;
+use super::schedule::{self, Gate, Source, Sources};
 use super::{
     action_progress, assemble, every, modules, Connection, DaemonService, HostFacts, LiveOptions,
     LiveProcess, State,
@@ -48,6 +48,8 @@ struct Shared {
     provenance_due: Notify,
     log_due: Notify,
     probe_due: Notify,
+    /// Which sources are wanted, from what the app shows.
+    demand: watch::Sender<Sources>,
     /// Wakes the agents-place source once identity rows have arrived.
     identity_ready: Notify,
     /// The latest reply or error recorded for each daemon and module
@@ -88,6 +90,10 @@ impl Shared {
             .insert(source.to_string(), text);
     }
 
+    fn gate(&self) -> Gate {
+        Gate::new(self.demand.subscribe())
+    }
+
     fn conn(&self) -> Option<Conn> {
         self.conn.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
@@ -108,12 +114,14 @@ pub(super) fn spawn(
         provenance_due: Notify::new(),
         log_due: Notify::new(),
         probe_due: Notify::new(),
+        demand: watch::Sender::new(schedule::wanted(&schedule::Showing::default())),
         identity_ready: Notify::new(),
         raw,
     });
     tokio::spawn(supervise(Arc::clone(&shared), options.connection_file));
     tokio::spawn(handle_requests(Arc::clone(&shared), requests));
-    tokio::spawn(host_facts(shared));
+    let gate = shared.gate();
+    tokio::spawn(host_facts(shared, gate));
 }
 
 /// A reply as JSON text, for the raw view.
@@ -217,22 +225,6 @@ async fn supervise(shared: Arc<Shared>, file: Option<PathBuf>) {
     }
 }
 
-/// Runs `f` every `period`, starting now.
-fn poll<F, Fut>(period: f64, mut f: F) -> JoinHandle<()>
-where
-    F: FnMut() -> Fut + Send + 'static,
-    Fut: Future<Output = ()> + Send,
-{
-    tokio::spawn(async move {
-        let mut tick = tokio::time::interval(secs(period));
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            tick.tick().await;
-            f().await;
-        }
-    })
-}
-
 /// The text a failed daemon request shows: the refusal code, or that the
 /// daemon isn't answering.
 fn control_error(e: &CallError) -> String {
@@ -253,15 +245,21 @@ fn control_fault(e: &CallError) -> Fault {
 
 fn sources(shared: &Arc<Shared>, conn: &Conn) -> Vec<JoinHandle<()>> {
     let mut tasks = Vec::new();
+    let gate = shared.gate();
     macro_rules! every {
-        ($period:expr, |$sh:ident, $c:ident| $body:expr) => {{
+        ($source:expr, $period:expr, |$sh:ident, $c:ident| $body:expr) => {{
             let sh = Arc::clone(shared);
             let cn = conn.clone();
-            tasks.push(poll($period, move || {
-                let $sh = Arc::clone(&sh);
-                let $c = cn.clone();
-                async move { $body }
-            }));
+            tasks.push(schedule::gated_poll(
+                &gate,
+                $source,
+                secs($period),
+                move || {
+                    let $sh = Arc::clone(&sh);
+                    let $c = cn.clone();
+                    async move { $body }
+                },
+            ));
         }};
     }
 
@@ -271,9 +269,11 @@ fn sources(shared: &Arc<Shared>, conn: &Conn) -> Vec<JoinHandle<()>> {
     {
         let sh = Arc::clone(shared);
         let c = conn.clone();
+        let mut gate = gate.clone();
         tasks.push(tokio::spawn(async move {
             let mut seeded = false;
             loop {
+                gate.until_wanted(Source::Roster).await;
                 match c.consumer.supervisor_list().await {
                     Ok(list) => {
                         sh.raw("supervisor.list", json_text(&list.modules));
@@ -296,6 +296,7 @@ fn sources(shared: &Arc<Shared>, conn: &Conn) -> Vec<JoinHandle<()>> {
         }));
     }
     every!(
+        Source::Describe,
         every::DESCRIBE,
         |sh, c| match c.consumer.server_describe().await {
             Ok(d) => {
@@ -309,6 +310,7 @@ fn sources(shared: &Arc<Shared>, conn: &Conn) -> Vec<JoinHandle<()>> {
         }
     );
     every!(
+        Source::Routes,
         every::ROUTES,
         |sh, c| match c.consumer.supervisor_routes(None).await {
             Ok(r) => {
@@ -321,68 +323,33 @@ fn sources(shared: &Arc<Shared>, conn: &Conn) -> Vec<JoinHandle<()>> {
             }
         }
     );
-    every!(every::USAGE, |sh, c| {
-        let reply = module_call(&sh, &c, modules::USAGE, "usage.get", json!({})).await;
-        let mapped = reply.and_then(|v| map::usage(&v, now()));
-        sh.update(|s| match mapped {
-            Ok(p) => s.usage.set(p, now()),
-            Err(e) => s.usage.fail(e),
-        });
-    });
-    every!(every::DEVICES, |sh, c| {
-        let reply = module_call(
-            &sh,
-            &c,
-            modules::DEVICES,
-            "callosum.devices_read",
-            json!({}),
-        )
-        .await;
-        let mapped = reply.and_then(|v| map::devices(&v, now()));
-        sh.update(|s| match mapped {
-            Ok(d) => s.devices.set(d, now()),
-            Err(e) => s.devices.fail(e),
-        });
-    });
-    every!(every::AGENTS, |sh, c| {
-        let reply = module_call(
-            &sh,
-            &c,
-            modules::IDENTITY,
-            "agent.fleet_identity",
-            json!({}),
-        )
-        .await;
-        let mapped = reply.and_then(|v| map::agent_identities(&v));
-        sh.update(|s| match mapped {
-            Ok(a) => {
-                s.identities.set(a, now());
+    // Usage, devices, agents' identity and state, and the fleet's counts:
+    // one request each, only while a screen that shows them is on screen.
+    {
+        let (sh, c) = (Arc::clone(shared), conn.clone());
+        let call = move |module: &'static str, method: &'static str, params: Value| {
+            let (sh, c) = (Arc::clone(&sh), c.clone());
+            async move { module_call(&sh, &c, module, method, params).await }
+        };
+        let sh = Arc::clone(shared);
+        let apply = move |source: Source, reply: Result<Value, Fault>| {
+            let mut good = false;
+            sh.update(|s| good = s.record_module_reply(source, reply, now()));
+            if good && source == Source::Identity {
                 sh.identity_ready.notify_one();
             }
-            Err(e) => s.identities.fail(e),
-        });
-    });
-    every!(every::AGENTS, |sh, c| {
-        let reply = module_call(
-            &sh,
-            &c,
-            modules::RESIDENCE,
-            "agent.fleet_residence",
-            json!({}),
-        )
-        .await;
-        let mapped = reply.and_then(|v| map::agent_residences(&v));
-        sh.update(|s| match mapped {
-            Ok(r) => s.residences.set(r, now()),
-            Err(e) => s.residences.fail(e),
-        });
-    });
-    // Where agents live: as soon as identity rows exist, then every minute.
+        };
+        tasks.extend(schedule::module_sources(&gate, call, apply));
+    }
+    // Where agents live: as soon as identity rows exist, then every minute,
+    // while a screen that shows it is on screen.
     {
         let sh = Arc::clone(shared);
         let c = conn.clone();
+        let mut gate = gate.clone();
         tasks.push(tokio::spawn(async move {
             loop {
+                gate.until_wanted(Source::Places).await;
                 let ids: Vec<String> = sh.read(|s| {
                     s.identities
                         .value
@@ -410,26 +377,23 @@ fn sources(shared: &Arc<Shared>, conn: &Conn) -> Vec<JoinHandle<()>> {
                         Err(e) => s.places.fail(e),
                     }),
                 }
-                tokio::time::sleep(secs(every::PLACES)).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(secs(every::PLACES)) => {}
+                    _ = gate.until_resumed(Source::Places) => {}
+                }
             }
         }));
     }
-    every!(every::COUNTS, |sh, c| {
-        let reply = module_call(&sh, &c, modules::IDENTITY, "enumerate", json!({})).await;
-        let mapped = reply.and_then(|v| map::fleet_counts(&v));
-        sh.update(|s| match mapped {
-            Ok(n) => s.counts.set(n, now()),
-            Err(e) => s.counts.fail(e),
-        });
-    });
 
     // Health: every five seconds, every second while any action is in
     // flight, so a restart's first healthy check shows promptly.
     {
         let sh = Arc::clone(shared);
         let c = conn.clone();
+        let mut gate = gate.clone();
         tasks.push(tokio::spawn(async move {
             loop {
+                gate.until_wanted(Source::Health).await;
                 match c.consumer.supervisor_health().await {
                     Ok(h) => sh.update(|s| {
                         sh.raw("supervisor.health", json_text(&h.modules));
@@ -450,8 +414,10 @@ fn sources(shared: &Arc<Shared>, conn: &Conn) -> Vec<JoinHandle<()>> {
     {
         let sh = Arc::clone(shared);
         let c = conn.clone();
+        let mut gate = gate.clone();
         tasks.push(tokio::spawn(async move {
             loop {
+                gate.until_wanted(Source::Provenance).await;
                 match c.consumer.supervisor_provenance(None).await {
                     Ok(p) => {
                         sh.raw("supervisor.provenance", json_text(&p.modules));
@@ -476,9 +442,11 @@ fn sources(shared: &Arc<Shared>, conn: &Conn) -> Vec<JoinHandle<()>> {
     {
         let sh = Arc::clone(shared);
         let c = conn.clone();
+        let mut gate = gate.clone();
         tasks.push(tokio::spawn(async move {
             let mut open: Option<(String, Box<dyn super::ModuleLogFollow>)> = None;
             loop {
+                gate.until_wanted(Source::Log).await;
                 match sh.read(|s| s.focus.clone()) {
                     None => open = None,
                     Some(module) => {
@@ -502,8 +470,10 @@ fn sources(shared: &Arc<Shared>, conn: &Conn) -> Vec<JoinHandle<()>> {
     {
         let sh = Arc::clone(shared);
         let c = conn.clone();
+        let mut gate = gate.clone();
         tasks.push(tokio::spawn(async move {
             loop {
+                gate.until_wanted(Source::Health).await;
                 if let Some(module) = sh.read(|s| s.focus.clone()) {
                     match c.consumer.supervisor_health_probe(module.clone()).await {
                         Ok(p) => {
@@ -525,8 +495,10 @@ fn sources(shared: &Arc<Shared>, conn: &Conn) -> Vec<JoinHandle<()>> {
     {
         let sh = Arc::clone(shared);
         let c = conn.clone();
+        let mut gate = gate.clone();
         tasks.push(tokio::spawn(async move {
             loop {
+                gate.until_wanted(Source::Health).await;
                 for module in sh.read(|s| s.truncated_due(now())) {
                     match c.consumer.supervisor_health_probe(module.clone()).await {
                         Ok(p) => {
@@ -561,39 +533,45 @@ fn sources(shared: &Arc<Shared>, conn: &Conn) -> Vec<JoinHandle<()>> {
             }
         }));
     }
-    // Polls each module's recent process exits, as the daemon's terminal
-    // journal retains them, for the "Starts and exits" list on the
-    // Modules screen.
-    {
-        let sh = Arc::clone(shared);
-        let c = conn.clone();
-        tasks.push(tokio::spawn(async move {
-            loop {
-                let ids: Vec<String> = sh.read(|s| {
-                    s.roster
-                        .value
-                        .iter()
-                        .flatten()
-                        .map(|e| e.module_id.clone())
-                        .collect()
+    // Each module's recent process exits, as the daemon's terminal journal
+    // retains them, for the "Starts and exits" list on the Modules screen.
+    every!(Source::Terminals, every::TERMINALS, |sh, c| {
+        let ids: Vec<String> = sh.read(|s| {
+            s.roster
+                .value
+                .iter()
+                .flatten()
+                .map(|e| e.module_id.clone())
+                .collect()
+        });
+        for id in ids {
+            if let Ok(history) = c.consumer.supervisor_terminals(id.clone()).await {
+                let events = map::terminal_events(&id, &history);
+                sh.update(|s| {
+                    s.terminals.insert(id, events);
                 });
-                for id in ids {
-                    if let Ok(history) = c.consumer.supervisor_terminals(id.clone()).await {
-                        let events = map::terminal_events(&id, &history);
-                        sh.update(|s| {
-                            s.terminals.insert(id, events);
-                        });
-                    }
-                }
-                tokio::time::sleep(secs(every::TERMINALS)).await;
             }
-        }));
+        }
+    });
+    {
+        let (sh, c) = (Arc::clone(shared), conn.clone());
+        tasks.push(schedule::gated_session(
+            &gate,
+            Source::SpawnFeed,
+            move || spawn_feed(Arc::clone(&sh), c.clone()),
+        ));
     }
-    tasks.push(tokio::spawn(spawn_feed(Arc::clone(shared), conn.clone())));
-    tasks.push(tokio::spawn(activity_feed(
-        Arc::clone(shared),
-        conn.clone(),
-    )));
+    {
+        let (sh, c) = (Arc::clone(shared), conn.clone());
+        // Where the ledger was last followed to, kept across sessions so a
+        // feed paused while no screen shows it resumes from there.
+        let since: Arc<Mutex<Option<ActivityCursor>>> = Arc::default();
+        tasks.push(schedule::gated_session(
+            &gate,
+            Source::Activity,
+            move || activity_session(Arc::clone(&sh), c.clone(), Arc::clone(&since)),
+        ));
+    }
     tasks
 }
 
@@ -945,71 +923,78 @@ pub(super) fn on_spawn_event(s: &mut State, ev: &subc_control::SpawnEvent, at: T
     s.process_events.truncate(200);
 }
 
-/// The activity ledger: the newest hundred entries, then followed live from
-/// the query's head. After a lag it resubscribes from the last entry it
-/// has; a refused cursor reseeds with a new query.
-async fn activity_feed(shared: Arc<Shared>, conn: Conn) {
-    let mut since: Option<ActivityCursor> = None;
-    loop {
-        if since.is_none() {
-            let query = ActivityQueryRequest {
-                agent: None,
-                project: None,
-                module: None,
-                kind: None,
-                since_ms: None,
-                until_ms: None,
-                limit: 100,
-                cursor: None,
-            };
-            match conn.consumer.query_activity(query).await {
-                Ok(page) => {
-                    shared.update(|s| s.activity.set(page.entries, now()));
-                    since = Some(page.head);
-                }
-                Err(e) => {
-                    shared.update(|s| s.activity.fail(control_fault(&e)));
-                    tokio::time::sleep(secs(5.0)).await;
-                    continue;
-                }
+/// One session of the activity ledger: the newest hundred entries when
+/// there is nowhere to resume from, then the subscription from the last
+/// entry seen, until it ends. A lag ends the session with `since` kept, so
+/// the next one resumes from the last entry; a refused cursor or a failure
+/// clears it, so the next one reseeds with a new query. The session is
+/// dropped while no screen shows the ledger, and `since` is where the next
+/// one resumes.
+async fn activity_session(
+    shared: Arc<Shared>,
+    conn: Conn,
+    since: Arc<Mutex<Option<ActivityCursor>>>,
+) {
+    let get = || since.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let put = |c: Option<ActivityCursor>| *since.lock().unwrap_or_else(|e| e.into_inner()) = c;
+    if get().is_none() {
+        let query = ActivityQueryRequest {
+            agent: None,
+            project: None,
+            module: None,
+            kind: None,
+            since_ms: None,
+            until_ms: None,
+            limit: 100,
+            cursor: None,
+        };
+        match conn.consumer.query_activity(query).await {
+            Ok(page) => {
+                shared.update(|s| s.activity.set(page.entries, now()));
+                put(Some(page.head));
             }
-        }
-        let mut sub = match conn.consumer.subscribe_activity(since.clone()).await {
-            Ok(sub) => sub,
             Err(e) => {
                 shared.update(|s| s.activity.fail(control_fault(&e)));
                 tokio::time::sleep(secs(5.0)).await;
-                since = None;
-                continue;
+                return;
             }
-        };
-        loop {
-            match sub.next().await {
-                Ok(Some(entry)) => {
-                    since = Some(ActivityCursor {
-                        daemon_incarnation: entry.daemon_incarnation.clone(),
-                        seq: entry.seq,
-                    });
-                    shared.update(|s| {
-                        let list = s.activity.value.get_or_insert_with(Vec::new);
-                        if !list.iter().any(|e| e.seq == entry.seq) {
-                            list.insert(0, entry);
-                            list.truncate(200);
-                        }
-                        s.activity.at = now();
-                        s.activity.error = None;
-                    });
-                }
-                Ok(None) => break,
-                Err(e) => {
-                    let lagged = e.code().is_some_and(|c| c.contains("lag"));
-                    if !lagged {
-                        shared.update(|s| s.activity.fail(e.to_string()));
-                        since = None;
-                        tokio::time::sleep(secs(2.0)).await;
+        }
+    }
+    let mut sub = match conn.consumer.subscribe_activity(get()).await {
+        Ok(sub) => sub,
+        Err(e) => {
+            shared.update(|s| s.activity.fail(control_fault(&e)));
+            put(None);
+            tokio::time::sleep(secs(5.0)).await;
+            return;
+        }
+    };
+    loop {
+        match sub.next().await {
+            Ok(Some(entry)) => {
+                put(Some(ActivityCursor {
+                    daemon_incarnation: entry.daemon_incarnation.clone(),
+                    seq: entry.seq,
+                }));
+                shared.update(|s| {
+                    let list = s.activity.value.get_or_insert_with(Vec::new);
+                    if !list.iter().any(|e| e.seq == entry.seq) {
+                        list.insert(0, entry);
+                        list.truncate(200);
                     }
-                    break;
+                    s.activity.at = now();
+                    s.activity.error = None;
+                });
+            }
+            Ok(None) => return,
+            Err(e) => {
+                let lagged = e.code().is_some_and(|c| c.contains("lag"));
+                if !lagged {
+                    shared.update(|s| s.activity.fail(e.to_string()));
+                    put(None);
+                    tokio::time::sleep(secs(2.0)).await;
                 }
+                return;
             }
         }
     }
@@ -1019,11 +1004,12 @@ async fn activity_feed(shared: Arc<Shared>, conn: Conn) {
 
 /// The machine's memory, load and data-home volume, read locally every ten
 /// seconds whether or not the daemon is up.
-async fn host_facts(shared: Arc<Shared>) {
+async fn host_facts(shared: Arc<Shared>, mut gate: Gate) {
     let service = Arc::clone(&shared.service);
     let mut tick = tokio::time::interval(secs(every::HOST));
     loop {
         tick.tick().await;
+        gate.until_wanted(Source::Host).await;
         let service = Arc::clone(&service);
         let read = tokio::task::spawn_blocking(move || {
             let home = service.data_home();
@@ -1054,6 +1040,14 @@ fn existing_ancestor(path: &Path) -> Option<PathBuf> {
 async fn handle_requests(shared: Arc<Shared>, mut rx: mpsc::UnboundedReceiver<Request>) {
     while let Some(req) = rx.recv().await {
         match req {
+            Request::Show(showing) => {
+                let wanted = schedule::wanted(&showing);
+                shared.demand.send_if_modified(|d| {
+                    let changed = *d != wanted;
+                    *d = wanted;
+                    changed
+                });
+            }
             Request::WatchLog(module) => {
                 shared.update(|s| s.focus = module);
                 shared.log_due.notify_one();
@@ -1170,5 +1164,50 @@ async fn run_action(shared: Arc<Shared>, kind: ActionKind, module: String) {
             );
             return;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::live::schedule::Showing;
+    use crate::live::NoService;
+    use crate::model::Tab;
+
+    #[tokio::test]
+    async fn what_the_app_shows_decides_the_sources_wanted() {
+        let state = State::empty("This Mac");
+        let (tx, _rx) = watch::channel(assemble(&state, now()));
+        let shared = Arc::new(Shared {
+            state: Mutex::new(state),
+            tx,
+            service: Arc::new(NoService),
+            conn: Mutex::new(None),
+            provenance_due: Notify::new(),
+            log_due: Notify::new(),
+            probe_due: Notify::new(),
+            demand: watch::Sender::new(schedule::wanted(&Showing::default())),
+            identity_ready: Notify::new(),
+            raw: Arc::default(),
+        });
+        let mut gate = shared.gate();
+        assert!(
+            gate.wanted(Source::Devices),
+            "Home, before the app says anything"
+        );
+        let (req_tx, req_rx) = mpsc::unbounded_channel();
+        let task = tokio::spawn(handle_requests(Arc::clone(&shared), req_rx));
+
+        req_tx
+            .send(Request::Show(Showing::tab(Tab::Usage)))
+            .unwrap();
+        tokio::time::timeout(secs(5.0), gate.until_unwanted(Source::Devices))
+            .await
+            .expect("devices stop being wanted on Usage");
+        assert_eq!(
+            *shared.demand.borrow(),
+            schedule::wanted(&Showing::tab(Tab::Usage))
+        );
+        task.abort();
     }
 }

@@ -14,6 +14,7 @@
 
 pub mod map;
 mod run;
+pub mod schedule;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -36,6 +37,7 @@ use crate::model::{
 use crate::time::{Timestamp, UtcOffset};
 
 use map::{AgentIdentity, AgentResidence, CpuTracker};
+use schedule::Source;
 
 /// The modules whose replies feed panels, by the id the daemon knows them
 /// by.
@@ -477,6 +479,53 @@ impl State {
             })
             .map(|h| h.module_id.clone())
             .collect()
+    }
+
+    /// Records a reply (or failure) from one of the module sources in
+    /// [`schedule::POLLED`], read at `at`. Returns whether it was a good
+    /// reading. A failure keeps the source's last good reading.
+    pub fn record_module_reply(
+        &mut self,
+        source: Source,
+        reply: Result<serde_json::Value, Fault>,
+        at: Timestamp,
+    ) -> bool {
+        fn put<T>(part: &mut Part<T>, mapped: Result<T, Fault>, at: Timestamp) -> bool {
+            match mapped {
+                Ok(v) => {
+                    part.set(v, at);
+                    true
+                }
+                Err(e) => {
+                    part.fail(e);
+                    false
+                }
+            }
+        }
+        match source {
+            Source::Usage => put(&mut self.usage, reply.and_then(|v| map::usage(&v, at)), at),
+            Source::Devices => put(
+                &mut self.devices,
+                reply.and_then(|v| map::devices(&v, at)),
+                at,
+            ),
+            Source::Identity => put(
+                &mut self.identities,
+                reply.and_then(|v| map::agent_identities(&v)),
+                at,
+            ),
+            Source::Residence => put(
+                &mut self.residences,
+                reply.and_then(|v| map::agent_residences(&v)),
+                at,
+            ),
+            Source::Counts => put(
+                &mut self.counts,
+                reply.and_then(|v| map::fleet_counts(&v)),
+                at,
+            ),
+            _ => false,
+        }
     }
 
     pub fn in_roster(&self, module: &str) -> Option<bool> {

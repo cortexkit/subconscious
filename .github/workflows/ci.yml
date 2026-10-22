@@ -421,8 +421,9 @@ jobs:
         if: ${{ matrix.pkg == 'store' || matrix.pkg == 'log' }}
         working-directory: clients/private-files
         run: bun install --frozen-lockfile && bun run build
-      # Log's locked local dependency exports compiled files. Build them before
-      # installing log so a fresh checkout has both JavaScript and declarations.
+      # Log installs the published store from npm, but its package test packs
+      # the sibling store and private-files tarballs, which need their compiled
+      # JavaScript and declarations.
       - name: Build sibling store for log
         if: ${{ matrix.pkg == 'log' }}
         working-directory: clients/store

@@ -184,6 +184,14 @@ export interface CatalogEventDeclaration {
   summary?: string | null;
 }
 
+/** Opaque descriptor for a provider's rich-UI manifest. */
+export interface CatalogRichUiDescriptor {
+  schema: string;
+  manifest_digest: string;
+  bytes: number;
+  chunks: number;
+}
+
 export interface CatalogEntry {
   module_id: string;
   roles: unknown[];
@@ -196,6 +204,10 @@ export interface CatalogEntry {
   events?: CatalogEventDeclaration[] | null;
   /** Open delivery strings mirrored from the manifest; absent entries are unary. */
   operation_delivery?: Record<string, string>;
+  /** Opaque rich-UI descriptor for the provider's manifest, mirrored from HELLO. */
+  rich_ui?: CatalogRichUiDescriptor;
+  /** True only when HELLO passes the launch-nonce check required for a reserved module or swap candidate. */
+  nonce_verified?: true;
 }
 
 export interface RequestOptions {

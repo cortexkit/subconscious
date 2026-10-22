@@ -17,7 +17,7 @@ use serde::{
 use subc_protocol::{
     manifest::{
         CapabilityDeclarations, EventDeclaration, ManifestProvenance, OperationDelivery,
-        ProviderRole, SelfSignalDeclaration,
+        ProviderRole, RichUiDescriptor, SelfSignalDeclaration,
     },
     scope::ScopeSelector,
     session::HealthStatus,
@@ -2030,6 +2030,14 @@ pub struct CatalogEntry {
     /// only `"watch"` on a declared management query is subscribable.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub operation_delivery: BTreeMap<String, OperationDelivery>,
+    /// Rich-UI descriptor mirrored verbatim from the registering manifest.
+    /// The daemon does not fetch or interpret the manifest described here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rich_ui: Option<RichUiDescriptor>,
+    /// True only when HELLO passes the launch-nonce check required for a reserved
+    /// module or swap candidate.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub nonce_verified: bool,
 }
 
 impl CatalogEntry {
@@ -2051,6 +2059,8 @@ impl CatalogEntry {
             self_signals: None,
             events: None,
             operation_delivery: BTreeMap::new(),
+            rich_ui: None,
+            nonce_verified: false,
         }
     }
 
@@ -2106,6 +2116,25 @@ impl CatalogEntry {
         self.operation_delivery = operation_delivery;
         self
     }
+
+    /// Set the descriptor mirrored from the module's HELLO manifest.
+    #[must_use]
+    pub fn with_rich_ui(mut self, rich_ui: Option<RichUiDescriptor>) -> Self {
+        self.rich_ui = rich_ui;
+        self
+    }
+
+    /// Mark a registration as nonce-verified when HELLO passes the launch-nonce
+    /// check required for a reserved module or swap candidate.
+    #[must_use]
+    pub fn with_nonce_verified(mut self, nonce_verified: bool) -> Self {
+        self.nonce_verified = nonce_verified;
+        self
+    }
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
 }
 
 /// Why a registered module is not accepting new route binds.

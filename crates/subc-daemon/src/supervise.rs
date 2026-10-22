@@ -2209,15 +2209,17 @@ impl SupervisorHandle {
     /// is authorized by the owner module's current spawn nonce. Non-reserved ids
     /// with no matching prefix are always authorized.
     pub fn reserved_hello_authorized(&self, module_id: &str, presented: Option<&str>) -> bool {
-        self.reserved_hello_rejection(module_id, presented)
-            .is_none()
+        self.reserved_hello_verification(module_id, presented)
+            .is_ok()
     }
 
-    pub(crate) fn reserved_hello_rejection(
+    /// Whether HELLO passed a nonce check that was actually required by reserved
+    /// module policy, or the refusal explaining why a required check failed.
+    pub(crate) fn reserved_hello_verification(
         &self,
         module_id: &str,
         presented: Option<&str>,
-    ) -> Option<ReservedHelloRejection> {
+    ) -> Result<bool, ReservedHelloRejection> {
         let nonces = self
             .reserved_nonces
             .lock()
@@ -2233,9 +2235,9 @@ impl SupervisorHandle {
                 None => false,
             };
             if authorized {
-                return None;
+                return Ok(true);
             }
-            return Some(ReservedHelloRejection::Exact {
+            return Err(ReservedHelloRejection::Exact {
                 module_id: module_id.to_string(),
             });
         }
@@ -2249,7 +2251,9 @@ impl SupervisorHandle {
             .filter(|(prefix, _)| module_id.starts_with(prefix.as_str()))
             .max_by_key(|(prefix, _)| prefix.len())
             .map(|(prefix, owner)| (prefix.clone(), owner.clone()));
-        let (prefix, owner_module_id) = matched_prefix?;
+        let Some((prefix, owner_module_id)) = matched_prefix else {
+            return Ok(false);
+        };
 
         let authorized = presented.is_some_and(|presented| {
             self.spawn_nonces
@@ -2262,9 +2266,9 @@ impl SupervisorHandle {
                 || self.swap_nonce_matches(&owner_module_id, presented)
         });
         if authorized {
-            None
+            Ok(true)
         } else {
-            Some(ReservedHelloRejection::Prefix {
+            Err(ReservedHelloRejection::Prefix {
                 prefix,
                 owner_module_id,
             })
@@ -11404,14 +11408,14 @@ mod terminal_history_tests {
         });
         assert!(
             supervisor
-                .reserved_hello_rejection("never-spawned", Some("any-forged-nonce"))
-                .is_some(),
+                .reserved_hello_verification("never-spawned", Some("any-forged-nonce"))
+                .is_err(),
             "forged nonce must refuse on a reserved never-spawned id"
         );
         assert!(
             supervisor
-                .reserved_hello_rejection("never-spawned", None)
-                .is_some(),
+                .reserved_hello_verification("never-spawned", None)
+                .is_err(),
             "absent nonce must refuse on a reserved never-spawned id"
         );
         // And a real spawn nonce minted later admits exactly that nonce.
@@ -11427,11 +11431,11 @@ mod terminal_history_tests {
             overlap: Default::default(),
         });
         assert!(supervisor
-            .reserved_hello_rejection("never-spawned", Some("minted"))
-            .is_none());
+            .reserved_hello_verification("never-spawned", Some("minted"))
+            .is_ok());
         assert!(supervisor
-            .reserved_hello_rejection("never-spawned", Some("forged"))
-            .is_some());
+            .reserved_hello_verification("never-spawned", Some("forged"))
+            .is_err());
     }
 
     /// Put `count` crash restarts on a snapshot's ring as if they had all just

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.22.9
+
+- Add optional `rich_ui` metadata to provider manifests and catalog entries, and the optional `nonce_verified` catalog fact. Both fields are additive and absent from legacy HELLO/catalog bytes; TypeScript catalog decoding remains permissive.
+
 ## 0.22.8
 
 - Mark every held subscription request with `SUBSCRIPTION_FLAG` so module drains exclude it from their quiescence wait; ordinary calls remain unmarked.

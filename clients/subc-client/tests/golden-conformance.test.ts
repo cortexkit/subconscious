@@ -229,6 +229,20 @@ describe("Rust golden fixtures", () => {
     expect(normalizeManifest({ ...manifest, operation_delivery: {} }, undefined)).not.toHaveProperty("operation_delivery");
   });
 
+  test("rich-UI descriptors reach HELLO and are omitted when absent", () => {
+    const manifest = managementSurfaceManifest({ moduleId: "rich-ui", operations: ["describe"] });
+    const rich_ui = {
+      schema: "ckios.richui.manifest/1",
+      manifest_digest: `sha256:${"a".repeat(64)}`,
+      bytes: 4096,
+      chunks: 4,
+    };
+    const normalized = normalizeManifest({ ...manifest, rich_ui }, undefined);
+    expect(normalized.rich_ui).toEqual(rich_ui);
+    expect(normalized.rich_ui).not.toBe(rich_ui);
+    expect(normalizeManifest(manifest, undefined)).not.toHaveProperty("rich_ui");
+  });
+
   test("route targets keep the discriminator the client switches on", () => {
     // RouteTarget is a tagged union on `kind`; the client builds these and the
     // daemon matches them, so the tag values are a contract rather than a detail.

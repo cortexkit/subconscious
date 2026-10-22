@@ -99,7 +99,7 @@ The daemon refuses the `HELLO` with an `ERROR` when
 | Code | Cause |
 | --- | --- |
 | `invalid_hello` | The body does not parse, the connection is already registered, or the connection has already opened client routes (a connection is either a client or a module, never both). |
-| `invalid_manifest` | `protocol_ver` differs between body and manifest, the id is empty, or the provenance or self-signal declarations are malformed. |
+| `invalid_manifest` | `protocol_ver` differs between body and manifest, the id is empty, or provenance, self-signal, or rich-UI descriptor data is malformed. Rich-UI refusals name the malformed `rich_ui` field. |
 | `invalid_capability_grammar` | The capability declaration breaks [`capability-grammar.md`](capability-grammar.md). |
 | `invalid_event_declaration` | An event declaration is malformed. |
 | `version_unsupported` | `protocol_ver` is not `2`. |
@@ -142,6 +142,13 @@ the daemon predates it, never that the machine has none.
 - `events`, `self_signals`, `provenance` (build commit, lock digest, wire crate
   version, launch-nonce source) and `trust_tier`: descriptive, relayed to
   readers, and not used for routing.
+- Optional `rich_ui`: an opaque descriptor with `schema` (1–64 bytes from
+  `[a-z0-9._/-]`), `manifest_digest` (`sha256:` plus 64 lowercase hex digits),
+  `bytes` (1–16,777,216), and `chunks` (1–1,024). The daemon checks these
+  bounds and lexical forms at HELLO and rechecks the descriptor stored for the
+  registration before applying `catalog.update`. It does not fetch or interpret
+  the described manifest. The descriptor remains fixed for the registration's
+  lifetime: `catalog.update` cannot accept or change it.
 
 ## 4. Routes: `route.bind`
 

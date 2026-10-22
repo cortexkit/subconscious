@@ -22,8 +22,9 @@ use subc_protocol::{
     error_codes,
     manifest::{
         validate_hello_capability_grammar, validate_hello_event_declarations,
-        validate_hello_self_signal_declarations, CapabilityDeclarations, CapabilityNeed,
-        Concurrency, ManifestProvenance, ModuleManifest, ProviderRole,
+        validate_hello_rich_ui_descriptor, validate_hello_self_signal_declarations,
+        CapabilityDeclarations, CapabilityNeed, Concurrency, ManifestProvenance, ModuleManifest,
+        ProviderRole,
     },
     scope::{
         ScopeEnd, ScopeRecord, ScopeRecordOutcome, ScopeRecordResult, ScopeSelector,
@@ -2311,6 +2312,13 @@ impl ControlHandler {
                 err.to_string(),
             )?]);
         }
+        if let Err(err) = validate_hello_rich_ui_descriptor(&hello_value) {
+            return Ok(vec![control_error_frame(
+                &frame,
+                "invalid_manifest",
+                err.to_string(),
+            )?]);
+        }
         if let Some(provenance) = hello_value
             .get("manifest")
             .and_then(|manifest| manifest.get("provenance"))
@@ -2391,40 +2399,39 @@ impl ControlHandler {
         }
         let swap_candidate = swap_admission == SwapHelloAdmission::Candidate;
 
-        // Reserved-module identity gate: a module_id configured `reserved` may be
-        // registered ONLY by the process subc spawned for it, proven by echoing the
-        // one-time launch nonce subc injected. A non-reserved id has no recorded
-        // nonce and always passes. This blocks a key-holder from impersonating a
-        // security-boundary module (e.g. the credential vault) while the real one is
-        // down/restarting and its registration slot is momentarily free. A swap
-        // candidate has already proven the same thing with its own nonce above.
-        if let Some(rejection) = (!swap_candidate)
-            .then(|| {
-                self.supervisor.reserved_hello_rejection(
-                    &hello.manifest.module_id,
-                    hello.launch_nonce.as_deref(),
-                )
-            })
-            .flatten()
-        {
-            let message = match rejection {
-                ReservedHelloRejection::Exact { module_id } => format!(
-                    "module_id '{module_id}' is reserved; HELLO without a valid launch nonce is rejected"
-                ),
-                ReservedHelloRejection::Prefix {
-                    prefix,
-                    owner_module_id,
-                } => format!(
-                    "module_id '{}' matches reserved prefix '{prefix}' owned by '{owner_module_id}'; HELLO without the owner launch nonce is rejected",
-                    hello.manifest.module_id
-                ),
-            };
-            return Ok(vec![control_error_frame(
-                &frame,
-                "reserved_module",
-                message,
-            )?]);
-        }
+        // A swap candidate proves its identity with the candidate nonce above.
+        // Other registrations receive this catalog fact only when reserved-module
+        // policy required and accepted a nonce; unreserved registrations require
+        // no nonce check.
+        let nonce_verified = if swap_candidate {
+            true
+        } else {
+            match self.supervisor.reserved_hello_verification(
+                &hello.manifest.module_id,
+                hello.launch_nonce.as_deref(),
+            ) {
+                Ok(verified) => verified,
+                Err(rejection) => {
+                    let message = match rejection {
+                        ReservedHelloRejection::Exact { module_id } => format!(
+                            "module_id '{module_id}' is reserved; HELLO without a valid launch nonce is rejected"
+                        ),
+                        ReservedHelloRejection::Prefix {
+                            prefix,
+                            owner_module_id,
+                        } => format!(
+                            "module_id '{}' matches reserved prefix '{prefix}' owned by '{owner_module_id}'; HELLO without the owner launch nonce is rejected",
+                            hello.manifest.module_id
+                        ),
+                    };
+                    return Ok(vec![control_error_frame(
+                        &frame,
+                        "reserved_module",
+                        message,
+                    )?]);
+                }
+            }
+        };
 
         let reserved_capability_refusals = self.capability_evaluator.reserved_hello_refusals(
             &hello.manifest.module_id,
@@ -2487,12 +2494,15 @@ impl ControlHandler {
         // its forwarding endpoint exists. Listing it now would advertise a
         // module that `route.open` still refuses for having no forwarding
         // connection.
-        let registration = match self.registry.register_unpublished_with_control_ops(
-            hello.manifest,
-            negotiated_ver,
-            connection_id,
-            control_ops,
-        ) {
+        let registration = match self
+            .registry
+            .register_unpublished_verified_with_control_ops(
+                hello.manifest,
+                negotiated_ver,
+                connection_id,
+                control_ops,
+                nonce_verified,
+            ) {
             Ok(registration) => registration,
             Err(RegistryError::DuplicateModuleId { module_id }) => {
                 return Ok(vec![control_error_frame(
@@ -2652,7 +2662,7 @@ impl ControlHandler {
         hello_ack: Frame,
     ) -> Result<Vec<Frame>, RouterError> {
         let module_id = manifest.module_id.clone();
-        let registration = match self.registry.register_unpublished_candidate_with_control_ops(
+        let registration = match self.registry.register_unpublished_verified_candidate_with_control_ops(
             manifest,
             negotiated_ver,
             connection_id,
@@ -3437,6 +3447,15 @@ impl ControlHandler {
         candidate.capabilities = capabilities
             .clone()
             .or_else(|| registration.manifest.capabilities.clone());
+        if let Some(rich_ui) = &candidate.rich_ui {
+            if let Err(err) = rich_ui.validate() {
+                return Ok(vec![control_error_frame(
+                    &frame,
+                    "invalid_manifest",
+                    err.to_string(),
+                )?]);
+            }
+        }
         if let Err(err) = candidate.validate_capability_grammar() {
             return Ok(vec![control_error_frame(
                 &frame,
@@ -3896,18 +3915,21 @@ impl ControlHandler {
         frame: Frame,
         module_id: Option<String>,
     ) -> Result<Vec<Frame>, RouterError> {
-        let (generation, modules) = self.registry.list_modules().map_err(|err| {
-            RouterError::backend(0, frame.header.corr, format!("registry error: {err}"))
-        })?;
+        let (generation, modules) = self
+            .registry
+            .list_modules_with_nonce_verification()
+            .map_err(|err| {
+                RouterError::backend(0, frame.header.corr, format!("registry error: {err}"))
+            })?;
         let entries = modules
             .into_iter()
-            .filter(|registration| {
+            .filter(|(registration, _)| {
                 module_id
                     .as_deref()
                     .map(|wanted| registration.manifest.module_id == wanted)
                     .unwrap_or(true)
             })
-            .map(|registration| {
+            .map(|(registration, nonce_verified)| {
                 let not_ready = self.not_ready_reason(&registration);
                 let roles = registration.manifest.provides;
                 CatalogEntry::new(
@@ -3922,6 +3944,8 @@ impl ControlHandler {
                 .with_self_signals(registration.manifest.self_signals)
                 .with_events(registration.manifest.events)
                 .with_operation_delivery(registration.manifest.operation_delivery)
+                .with_rich_ui(registration.manifest.rich_ui)
+                .with_nonce_verified(nonce_verified)
             })
             .collect();
         let response = ClientControlResponse::CatalogList {
@@ -8123,6 +8147,32 @@ mod tests {
         Frame::build(FrameType::Hello, control_flags(), 0, 0, corr, body).unwrap()
     }
 
+    fn hello_frame_with_rich_ui(
+        module_id: &str,
+        protocol_ver: u8,
+        corr: u64,
+        launch_nonce: Option<&str>,
+        rich_ui: Value,
+    ) -> Frame {
+        let mut body = serde_json::to_value(ModuleHelloBody {
+            manifest: manifest(module_id, protocol_ver),
+            protocol_ver,
+            control_ops: None,
+            launch_nonce: launch_nonce.map(str::to_string),
+        })
+        .unwrap();
+        body["manifest"]["rich_ui"] = rich_ui;
+        Frame::build(
+            FrameType::Hello,
+            control_flags(),
+            0,
+            0,
+            corr,
+            serde_json::to_vec(&body).unwrap(),
+        )
+        .unwrap()
+    }
+
     fn non_routable_hello_frame_with_control_ops(
         module_id: &str,
         corr: u64,
@@ -9064,6 +9114,241 @@ mod tests {
             panic!("expected catalog.list");
         };
         assert_eq!(modules[0].operation_delivery, registered.operation_delivery);
+    }
+
+    #[test]
+    fn catalog_list_mirrors_rich_ui_through_hello_and_catalog_update() {
+        let registry = Arc::new(Registry::default());
+        let supervisor = SupervisorHandle::new();
+        supervisor.set_reserved_nonce("vault", "the-real-nonce".to_string());
+        let handler = ControlHandler::new(Arc::clone(&registry)).with_supervisor(supervisor);
+        let descriptor = json!({
+            "schema": "ckios.richui.manifest/1",
+            "manifest_digest": format!("sha256:{}", "a".repeat(64)),
+            "bytes": 4096,
+            "chunks": 4
+        });
+        let connection = ConnectionId::new(201);
+        let hello = handler
+            .handle_control(
+                connection,
+                hello_frame_with_rich_ui(
+                    "vault",
+                    PROTOCOL_VERSION,
+                    201,
+                    Some("the-real-nonce"),
+                    descriptor.clone(),
+                ),
+            )
+            .unwrap();
+        assert_eq!(hello[0].header.ty, FrameType::HelloAck);
+
+        let request =
+            Frame::build(FrameType::Request, control_flags(), 0, 0, 202, Vec::new()).unwrap();
+        let provides = registry
+            .get_module_by_connection(connection)
+            .unwrap()
+            .unwrap()
+            .manifest
+            .provides;
+        handler
+            .handle_catalog_update(connection, request, provides, None, Some(false))
+            .unwrap();
+
+        let request = Frame::build(
+            FrameType::Request,
+            control_flags(),
+            0,
+            0,
+            203,
+            serde_json::to_vec(&ClientControlRequest::CatalogList { module_id: None }).unwrap(),
+        )
+        .unwrap();
+        let response = handler.handle_catalog_list(request, None).unwrap();
+        let ClientControlResponse::CatalogList { modules, .. } =
+            serde_json::from_slice(&response[0].body).unwrap()
+        else {
+            panic!("expected catalog.list");
+        };
+        assert_eq!(
+            serde_json::to_value(&modules[0]).unwrap()["rich_ui"],
+            descriptor
+        );
+        assert!(modules[0].nonce_verified);
+    }
+
+    #[test]
+    fn rich_ui_descriptor_malformed_fields_are_refused_by_name() {
+        let registry = Arc::new(Registry::default());
+        let handler = ControlHandler::new(registry.clone());
+        let descriptor = json!({
+            "schema": "ckios.richui.manifest/1",
+            "manifest_digest": format!("sha256:{}", "a".repeat(64)),
+            "bytes": 128,
+            "chunks": 2
+        });
+        let malformed = [
+            ("schema", json!("")),
+            ("schema", json!("a".repeat(65))),
+            ("schema", json!("Bad schema")),
+            (
+                "manifest_digest",
+                json!(format!("sha256:{}", "A".repeat(64))),
+            ),
+            ("manifest_digest", json!("sha256:abc")),
+            ("bytes", json!(0)),
+            ("bytes", json!(16_777_217)),
+            ("bytes", json!("128")),
+            ("chunks", json!(0)),
+            ("chunks", json!(1025)),
+            ("chunks", json!("2")),
+        ];
+        for (index, (field, invalid_value)) in malformed.into_iter().enumerate() {
+            let mut invalid = descriptor.clone();
+            invalid[field] = invalid_value;
+            let response = handler
+                .handle_control(
+                    ConnectionId::new(210 + index as u64),
+                    hello_frame_with_rich_ui(
+                        &format!("bad-rich-ui-{index}"),
+                        PROTOCOL_VERSION,
+                        210 + index as u64,
+                        None,
+                        invalid,
+                    ),
+                )
+                .unwrap();
+            assert_eq!(response[0].header.ty, FrameType::Error);
+            let error = parse_error(&response[0]);
+            assert_eq!(error["code"], "invalid_manifest");
+            assert!(error["message"]
+                .as_str()
+                .unwrap()
+                .contains(&format!("rich_ui.{field}")));
+            assert!(registry
+                .get_module(&format!("bad-rich-ui-{index}"))
+                .unwrap()
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn catalog_update_refuses_malformed_rich_ui_by_field_name() {
+        let registry = Arc::new(Registry::default());
+        let handler = ControlHandler::new(Arc::clone(&registry));
+        let connection = ConnectionId::new(219);
+        registry
+            .register_with_control_ops(
+                ModuleManifest::builder("invalid-rich-ui", "0.1.0")
+                    .rich_ui(Some(subc_protocol::manifest::RichUiDescriptor::new(
+                        "bad schema",
+                        format!("sha256:{}", "a".repeat(64)),
+                        128,
+                        2,
+                    )))
+                    .build(),
+                PROTOCOL_VERSION,
+                connection,
+                Vec::new(),
+            )
+            .unwrap();
+        let request =
+            Frame::build(FrameType::Request, control_flags(), 0, 0, 219, Vec::new()).unwrap();
+        let response = handler
+            .handle_catalog_update(connection, request, Vec::new(), None, None)
+            .unwrap();
+        assert_eq!(response[0].header.ty, FrameType::Error);
+        let error = parse_error(&response[0]);
+        assert_eq!(error["code"], "invalid_manifest");
+        assert!(error["message"]
+            .as_str()
+            .unwrap()
+            .contains("rich_ui.schema"));
+    }
+
+    #[test]
+    fn swap_candidate_hello_is_nonce_verified_after_promotion() {
+        let registry = Arc::new(Registry::default());
+        let supervisor = SupervisorHandle::new();
+        supervisor.open_swap("provider", "candidate-nonce".to_string());
+        let handler = ControlHandler::new(Arc::clone(&registry)).with_supervisor(supervisor);
+        let connection = ConnectionId::new(218);
+        let hello = handler
+            .handle_control(
+                connection,
+                hello_frame_with_nonce("provider", PROTOCOL_VERSION, 218, Some("candidate-nonce")),
+            )
+            .unwrap();
+        assert_eq!(hello[0].header.ty, FrameType::HelloAck);
+        assert!(registry.list_modules().unwrap().1.is_empty());
+
+        registry.promote_candidate("provider").unwrap().unwrap();
+        let request = Frame::build(
+            FrameType::Request,
+            control_flags(),
+            0,
+            0,
+            219,
+            serde_json::to_vec(&ClientControlRequest::CatalogList { module_id: None }).unwrap(),
+        )
+        .unwrap();
+        let response = handler.handle_catalog_list(request, None).unwrap();
+        let ClientControlResponse::CatalogList { modules, .. } =
+            serde_json::from_slice(&response[0].body).unwrap()
+        else {
+            panic!("expected catalog.list");
+        };
+        assert_eq!(modules.len(), 1);
+        assert!(modules[0].nonce_verified);
+    }
+
+    #[test]
+    fn catalog_list_without_rich_ui_or_nonce_keeps_legacy_entry_bytes() {
+        let registry = Arc::new(Registry::default());
+        let handler = ControlHandler::new(Arc::clone(&registry));
+        let hello = Frame::build(
+            FrameType::Hello,
+            control_flags(),
+            0,
+            0,
+            220,
+            serde_json::to_vec(&ModuleHelloBody {
+                manifest: ModuleManifest::builder("plain", "0.1.0").build(),
+                protocol_ver: PROTOCOL_VERSION,
+                control_ops: None,
+                launch_nonce: Some("unverified".to_string()),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            handler
+                .handle_control(ConnectionId::new(220), hello)
+                .unwrap()[0]
+                .header
+                .ty,
+            FrameType::HelloAck
+        );
+        let request = Frame::build(
+            FrameType::Request,
+            control_flags(),
+            0,
+            0,
+            221,
+            serde_json::to_vec(&ClientControlRequest::CatalogList { module_id: None }).unwrap(),
+        )
+        .unwrap();
+        let response = handler.handle_catalog_list(request, None).unwrap();
+        let ClientControlResponse::CatalogList { modules, .. } =
+            serde_json::from_slice(&response[0].body).unwrap()
+        else {
+            panic!("expected catalog.list");
+        };
+        assert_eq!(
+            serde_json::to_vec(&modules[0]).unwrap(),
+            br#"{"module_id":"plain","ready":true,"module_version":"0.1.0","roles":[],"control_ops":["route.bind","route.status"]}"#
+        );
+        assert!(!modules[0].nonce_verified);
     }
 
     #[test]

@@ -129,6 +129,11 @@ struct RegistryInner {
     /// Former incumbents demoted by a promotion, kept only so their own
     /// connection can still find and remove them. Never routable, never listed.
     superseded: Vec<ModuleRegistration>,
+    /// Connections whose HELLO passed the launch-nonce check required for a
+    /// reserved module or swap candidate. Kept outside ModuleRegistration so
+    /// adding this catalog fact does not break callers that construct the public
+    /// registration struct.
+    nonce_verified: HashSet<ConnectionId>,
     /// The active connection that displaced each superseded registration.
     superseded_by: HashMap<ConnectionId, ConnectionId>,
     /// Connections whose registration is reserved but not yet published.
@@ -180,7 +185,14 @@ impl Registry {
         connection_id: ConnectionId,
         control_ops: Vec<String>,
     ) -> Result<ModuleRegistration, RegistryError> {
-        self.register_active(manifest, negotiated_ver, connection_id, control_ops, true)
+        self.register_active(
+            manifest,
+            negotiated_ver,
+            connection_id,
+            control_ops,
+            true,
+            false,
+        )
     }
 
     /// Register a module manifest without listing it yet.
@@ -198,7 +210,33 @@ impl Registry {
         connection_id: ConnectionId,
         control_ops: Vec<String>,
     ) -> Result<ModuleRegistration, RegistryError> {
-        self.register_active(manifest, negotiated_ver, connection_id, control_ops, false)
+        self.register_active(
+            manifest,
+            negotiated_ver,
+            connection_id,
+            control_ops,
+            false,
+            false,
+        )
+    }
+
+    /// Register a module after its HELLO is accepted, without listing it before forwarding is installed.
+    pub(crate) fn register_unpublished_verified_with_control_ops(
+        &self,
+        manifest: ModuleManifest,
+        negotiated_ver: u8,
+        connection_id: ConnectionId,
+        control_ops: Vec<String>,
+        nonce_verified: bool,
+    ) -> Result<ModuleRegistration, RegistryError> {
+        self.register_active(
+            manifest,
+            negotiated_ver,
+            connection_id,
+            control_ops,
+            false,
+            nonce_verified,
+        )
     }
 
     fn register_active(
@@ -208,6 +246,7 @@ impl Registry {
         connection_id: ConnectionId,
         control_ops: Vec<String>,
         publish: bool,
+        nonce_verified: bool,
     ) -> Result<ModuleRegistration, RegistryError> {
         let module_id = manifest.module_id.clone();
         if let Err(reason) = module_id_path_hazard(&module_id) {
@@ -229,6 +268,11 @@ impl Registry {
         };
 
         inner.modules.insert(module_id, registration.clone());
+        if nonce_verified {
+            inner.nonce_verified.insert(connection_id);
+        } else {
+            inner.nonce_verified.remove(&connection_id);
+        }
         if publish {
             inner.bump_generation();
         } else {
@@ -258,7 +302,14 @@ impl Registry {
         connection_id: ConnectionId,
         control_ops: Vec<String>,
     ) -> Result<ModuleRegistration, RegistryError> {
-        self.register_candidate(manifest, negotiated_ver, connection_id, control_ops, true)
+        self.register_candidate(
+            manifest,
+            negotiated_ver,
+            connection_id,
+            control_ops,
+            true,
+            false,
+        )
     }
 
     /// Register a swap candidate that [`Self::published_registration`] does not
@@ -274,7 +325,32 @@ impl Registry {
         connection_id: ConnectionId,
         control_ops: Vec<String>,
     ) -> Result<ModuleRegistration, RegistryError> {
-        self.register_candidate(manifest, negotiated_ver, connection_id, control_ops, false)
+        self.register_candidate(
+            manifest,
+            negotiated_ver,
+            connection_id,
+            control_ops,
+            false,
+            false,
+        )
+    }
+
+    /// Register a blue/green swap candidate after its required launch nonce has been verified.
+    pub(crate) fn register_unpublished_verified_candidate_with_control_ops(
+        &self,
+        manifest: ModuleManifest,
+        negotiated_ver: u8,
+        connection_id: ConnectionId,
+        control_ops: Vec<String>,
+    ) -> Result<ModuleRegistration, RegistryError> {
+        self.register_candidate(
+            manifest,
+            negotiated_ver,
+            connection_id,
+            control_ops,
+            false,
+            true,
+        )
     }
 
     fn register_candidate(
@@ -284,6 +360,7 @@ impl Registry {
         connection_id: ConnectionId,
         control_ops: Vec<String>,
         publish: bool,
+        nonce_verified: bool,
     ) -> Result<ModuleRegistration, RegistryError> {
         let module_id = manifest.module_id.clone();
         if let Err(reason) = module_id_path_hazard(&module_id) {
@@ -303,6 +380,11 @@ impl Registry {
             control_ops,
         };
         inner.candidates.insert(module_id, registration.clone());
+        if nonce_verified {
+            inner.nonce_verified.insert(connection_id);
+        } else {
+            inner.nonce_verified.remove(&connection_id);
+        }
         if !publish {
             inner.unpublished.insert(connection_id);
         }
@@ -421,6 +503,31 @@ impl Registry {
             .cloned()
             .collect::<Vec<_>>();
         modules.sort_by(|left, right| left.manifest.module_id.cmp(&right.manifest.module_id));
+        Ok((inner.generation, modules))
+    }
+
+    /// List published active registrations together with their HELLO nonce-verification status.
+    /// Both values are captured under the registry lock so a concurrent swap or
+    /// disconnect cannot separate a registration from its verification fact.
+    pub fn list_modules_with_nonce_verification(
+        &self,
+    ) -> Result<(u64, Vec<(ModuleRegistration, bool)>), RegistryError> {
+        let inner = self.lock_inner()?;
+        let mut registrations = inner
+            .modules
+            .values()
+            .filter(|registration| !inner.unpublished.contains(&registration.connection_id))
+            .collect::<Vec<_>>();
+        registrations.sort_by(|left, right| left.manifest.module_id.cmp(&right.manifest.module_id));
+        let modules = registrations
+            .into_iter()
+            .map(|registration| {
+                (
+                    registration.clone(),
+                    inner.nonce_verified.contains(&registration.connection_id),
+                )
+            })
+            .collect();
         Ok((inner.generation, modules))
     }
 
@@ -582,6 +689,7 @@ impl Registry {
             registration
         }));
         for registration in &closed {
+            inner.nonce_verified.remove(&registration.connection_id);
             inner.notify_module_changed(&registration.manifest.module_id);
             let replaced = superseded_connections.contains(&registration.connection_id);
             let end_reason = if replaced {
@@ -1089,6 +1197,30 @@ mod swap_slot_tests {
                 module_id: "m".to_string()
             }
         );
+    }
+
+    #[test]
+    fn promoted_candidate_keeps_its_verified_nonce_fact() {
+        let registry = Registry::default();
+        registry
+            .register_unpublished_verified_candidate_with_control_ops(
+                manifest("m", Some(true)),
+                1,
+                CANDIDATE,
+                Vec::new(),
+            )
+            .unwrap();
+        assert!(registry.publish_registration(CANDIDATE).unwrap());
+        assert!(registry
+            .list_modules_with_nonce_verification()
+            .unwrap()
+            .1
+            .is_empty());
+
+        registry.promote_candidate("m").unwrap().unwrap();
+        let (_, modules) = registry.list_modules_with_nonce_verification().unwrap();
+        assert_eq!(modules.len(), 1);
+        assert!(modules[0].1);
     }
 
     /// Without the candidate slot in the connection-keyed search, this update

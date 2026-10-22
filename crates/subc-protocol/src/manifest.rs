@@ -111,6 +111,12 @@ pub struct ModuleManifest {
     /// than refusing HELLO. Older daemons silently drop this field.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub operation_delivery: BTreeMap<String, OperationDelivery>,
+    /// An opaque rich-UI manifest descriptor discoverable from `catalog.list`.
+    ///
+    /// The daemon validates the descriptor's shape at HELLO and relays it without
+    /// interpreting its schema or content. Absence preserves existing manifest bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rich_ui: Option<RichUiDescriptor>,
 }
 
 /// Incrementally constructs a [`ModuleManifest`] without fabricating absent facts.
@@ -129,6 +135,7 @@ pub struct ModuleManifestBuilder {
     self_signals: Option<Vec<SelfSignalDeclaration>>,
     provenance: Option<ManifestProvenance>,
     operation_delivery: BTreeMap<String, OperationDelivery>,
+    rich_ui: Option<RichUiDescriptor>,
 }
 
 impl ModuleManifest {
@@ -157,6 +164,7 @@ impl ModuleManifest {
             self_signals: None,
             provenance: None,
             operation_delivery: BTreeMap::new(),
+            rich_ui: None,
         }
     }
 
@@ -251,6 +259,12 @@ impl ModuleManifestBuilder {
         self
     }
 
+    /// Adds an opaque rich-UI manifest descriptor to this module's manifest.
+    pub fn rich_ui(mut self, rich_ui: Option<RichUiDescriptor>) -> Self {
+        self.rich_ui = rich_ui;
+        self
+    }
+
     /// Finishes the manifest.
     pub fn build(self) -> ModuleManifest {
         ModuleManifest {
@@ -267,6 +281,7 @@ impl ModuleManifestBuilder {
             self_signals: self.self_signals,
             provenance: self.provenance,
             operation_delivery: self.operation_delivery,
+            rich_ui: self.rich_ui,
         }
     }
 }
@@ -312,6 +327,8 @@ struct ModuleManifestWire {
     provenance: Option<ManifestProvenance>,
     #[serde(default)]
     operation_delivery: Option<Value>,
+    #[serde(default)]
+    rich_ui: Option<RichUiDescriptor>,
     // `runtime_computed` belongs to --manifest output rather than the retained
     // manifest model. Deserialize it only long enough to enforce that capability
     // declarations cannot be omitted as runtime-varying data.
@@ -352,12 +369,177 @@ impl<'de> Deserialize<'de> for ModuleManifest {
                     .and_then(|value| serde_json::from_value(value).ok())
                     .unwrap_or_default(),
             )
+            .rich_ui(wire.rich_ui)
             .build();
         manifest
             .validate_capability_grammar()
             .map_err(D::Error::custom)?;
+        if let Some(rich_ui) = &manifest.rich_ui {
+            rich_ui.validate().map_err(D::Error::custom)?;
+        }
         Ok(manifest)
     }
+}
+
+/// Opaque metadata locating a provider's rich-UI manifest.
+///
+/// The daemon validates the bounds and lexical shape of each field, then copies
+/// this value unchanged into its catalog. It does not fetch or interpret the
+/// referenced manifest.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RichUiDescriptor {
+    /// Versioned media/schema identifier, such as `ckios.richui.manifest/1`.
+    pub schema: String,
+    /// SHA-256 digest of the provider's encoded rich-UI manifest.
+    pub manifest_digest: String,
+    /// Exact encoded manifest size in bytes.
+    pub bytes: u64,
+    /// Number of chunks required to retrieve the encoded manifest.
+    pub chunks: u32,
+}
+
+impl RichUiDescriptor {
+    /// Constructs a descriptor. The daemon validates it when admitting HELLO.
+    pub fn new(
+        schema: impl Into<String>,
+        manifest_digest: impl Into<String>,
+        bytes: u64,
+        chunks: u32,
+    ) -> Self {
+        Self {
+            schema: schema.into(),
+            manifest_digest: manifest_digest.into(),
+            bytes,
+            chunks,
+        }
+    }
+
+    /// Validate the descriptor's lexical forms and size bounds before relay.
+    pub fn validate(&self) -> Result<(), RichUiDescriptorError> {
+        validate_rich_ui_fields(
+            &self.schema,
+            &self.manifest_digest,
+            self.bytes,
+            u64::from(self.chunks),
+        )
+    }
+}
+
+/// A safe-to-report rich-UI descriptor failure, without echoing untrusted values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RichUiDescriptorError {
+    field: String,
+    reason: &'static str,
+}
+
+impl RichUiDescriptorError {
+    fn new(field: impl Into<String>, reason: &'static str) -> Self {
+        Self {
+            field: field.into(),
+            reason,
+        }
+    }
+
+    /// The precise malformed field path, relative to the manifest.
+    pub fn field(&self) -> &str {
+        &self.field
+    }
+}
+
+impl fmt::Display for RichUiDescriptorError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "invalid rich_ui descriptor: field {} {}",
+            self.field, self.reason
+        )
+    }
+}
+
+impl std::error::Error for RichUiDescriptorError {}
+
+/// Validates the descriptor in a raw HELLO before serde loses field context.
+pub fn validate_hello_rich_ui_descriptor(hello: &Value) -> Result<(), RichUiDescriptorError> {
+    let Some(manifest) = hello.get("manifest").and_then(Value::as_object) else {
+        return Ok(());
+    };
+    let Some(value) = manifest.get("rich_ui") else {
+        return Ok(());
+    };
+    validate_rich_ui_descriptor_value(value)
+}
+
+fn validate_rich_ui_descriptor_value(value: &Value) -> Result<(), RichUiDescriptorError> {
+    let descriptor = value
+        .as_object()
+        .ok_or_else(|| RichUiDescriptorError::new("rich_ui", "must be an object"))?;
+    let schema = descriptor
+        .get("schema")
+        .and_then(Value::as_str)
+        .ok_or_else(|| RichUiDescriptorError::new("rich_ui.schema", "must be a string"))?;
+    let digest = descriptor
+        .get("manifest_digest")
+        .and_then(Value::as_str)
+        .ok_or_else(|| RichUiDescriptorError::new("rich_ui.manifest_digest", "must be a string"))?;
+    let bytes = descriptor
+        .get("bytes")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            RichUiDescriptorError::new("rich_ui.bytes", "must be an integer from 1 to 16777216")
+        })?;
+    let chunks = descriptor
+        .get("chunks")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            RichUiDescriptorError::new("rich_ui.chunks", "must be an integer from 1 to 1024")
+        })?;
+    validate_rich_ui_fields(schema, digest, bytes, chunks)
+}
+
+fn validate_rich_ui_fields(
+    schema: &str,
+    digest: &str,
+    bytes: u64,
+    chunks: u64,
+) -> Result<(), RichUiDescriptorError> {
+    if !(1..=64).contains(&schema.len())
+        || !schema.bytes().all(|byte| {
+            byte.is_ascii_lowercase()
+                || byte.is_ascii_digit()
+                || matches!(byte, b'.' | b'_' | b'/' | b'-')
+        })
+    {
+        return Err(RichUiDescriptorError::new(
+            "rich_ui.schema",
+            "must be 1 to 64 bytes of [a-z0-9._/-]",
+        ));
+    }
+    if !digest.strip_prefix("sha256:").is_some_and(|hex| {
+        hex.len() == 64
+            && hex
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }) {
+        return Err(RichUiDescriptorError::new(
+            "rich_ui.manifest_digest",
+            "must be sha256: followed by 64 lowercase hexadecimal characters",
+        ));
+    }
+    if !(1..=16_777_216).contains(&bytes) {
+        return Err(RichUiDescriptorError::new(
+            "rich_ui.bytes",
+            "must be an integer from 1 to 16777216",
+        ));
+    }
+    if !(1..=1_024).contains(&chunks) {
+        return Err(RichUiDescriptorError::new(
+            "rich_ui.chunks",
+            "must be an integer from 1 to 1024",
+        ));
+    }
+    Ok(())
 }
 
 /// The `server.describe` capability a daemon advertises when `catalog.list`
@@ -2738,5 +2920,77 @@ mod tests {
         assert!(error.to_string().contains(
             "build_git_sha_absence_reason has must be omitted when build_git_sha is present"
         ));
+    }
+
+    #[test]
+    fn rich_ui_descriptor_is_optional_and_round_trips_when_present() {
+        let manifest = ModuleManifest::builder("provider", "1.0.0").build();
+        assert_eq!(
+            serde_json::to_string(&manifest).unwrap(),
+            r#"{"module_id":"provider","module_version":"1.0.0","protocol_ver":2,"provides":[]}"#
+        );
+
+        let descriptor = RichUiDescriptor::new(
+            "ckios.richui.manifest/1",
+            format!("sha256:{}", "a".repeat(64)),
+            128,
+            2,
+        );
+        let manifest = ModuleManifest::builder("provider", "1.0.0")
+            .rich_ui(Some(descriptor.clone()))
+            .build();
+        let wire = serde_json::to_string(&manifest).unwrap();
+        assert!(wire.contains("\"rich_ui\":{\"schema\":\"ckios.richui.manifest/1\""));
+        assert_eq!(
+            serde_json::from_str::<ModuleManifest>(&wire)
+                .unwrap()
+                .rich_ui,
+            Some(descriptor)
+        );
+    }
+
+    #[test]
+    fn rich_ui_descriptor_validation_names_each_invalid_field() {
+        let good = json!({
+            "schema": "ckios.richui.manifest/1",
+            "manifest_digest": format!("sha256:{}", "a".repeat(64)),
+            "bytes": 1,
+            "chunks": 1
+        });
+        let hello = json!({"manifest": {"rich_ui": good.clone()}});
+        assert!(validate_hello_rich_ui_descriptor(&hello).is_ok());
+
+        for (field, value) in [
+            ("schema", json!("bad schema")),
+            (
+                "manifest_digest",
+                json!(format!("sha256:{}", "A".repeat(64))),
+            ),
+            ("bytes", json!(0)),
+            ("chunks", json!(1025)),
+        ] {
+            let mut invalid = hello.clone();
+            invalid["manifest"]["rich_ui"][field] = value;
+            let error = validate_hello_rich_ui_descriptor(&invalid)
+                .expect_err("an invalid descriptor field must be refused");
+            assert_eq!(error.field(), format!("rich_ui.{field}"));
+        }
+
+        let mut hello = hello;
+        hello["manifest"]["rich_ui"] = Value::Null;
+        let error = validate_hello_rich_ui_descriptor(&hello)
+            .expect_err("null is not an absent descriptor");
+        assert_eq!(error.field(), "rich_ui");
+    }
+
+    #[test]
+    fn rich_ui_descriptor_validation_accepts_inclusive_bounds() {
+        let hello = json!({"manifest": {"rich_ui": {
+            "schema": "a".repeat(64),
+            "manifest_digest": format!("sha256:{}", "f".repeat(64)),
+            "bytes": 16_777_216,
+            "chunks": 1024
+        }}});
+        assert!(validate_hello_rich_ui_descriptor(&hello).is_ok());
     }
 }

@@ -424,6 +424,38 @@ final class ClientWireRevisionTests: XCTestCase {
         XCTAssertEqual(modules[0].events?[0].summary, "A task completed")
         XCTAssertEqual(modules[0].events?[1].name, "task_failed")
         XCTAssertEqual(modules[0].events?[1].summary, nil)
+        XCTAssertNil(modules[0].richUi)
+        XCTAssertNil(modules[0].nonceVerified)
+    }
+
+    func testCatalogListDecodesRichUiAndNonceVerificationFacts() throws {
+        let transport = ScriptedTransport()
+        try transport.append(makeFrame(
+            ty: .response,
+            channel: 0,
+            epoch: 0,
+            corr: 1,
+            json: ["modules": [[
+                "module_id": "provider",
+                "roles": [],
+                "control_ops": [],
+                "rich_ui": [
+                    "schema": "ckios.richui.manifest/1",
+                    "manifest_digest": "sha256:\(String(repeating: "a", count: 64))",
+                    "bytes": 4096,
+                    "chunks": 4,
+                ],
+                "nonce_verified": true,
+            ]]]
+        ))
+
+        let modules = try SubcClient(transport: transport).catalogList()
+        XCTAssertEqual(modules.count, 1)
+        XCTAssertEqual(modules[0].richUi?.schema, "ckios.richui.manifest/1")
+        XCTAssertEqual(modules[0].richUi?.manifestDigest, "sha256:\(String(repeating: "a", count: 64))")
+        XCTAssertEqual(modules[0].richUi?.bytes, 4096)
+        XCTAssertEqual(modules[0].richUi?.chunks, 4)
+        XCTAssertEqual(modules[0].nonceVerified, true)
     }
 
     func testStaleEpochIngressIsDroppedWithoutSettlingCurrentRequest() throws {

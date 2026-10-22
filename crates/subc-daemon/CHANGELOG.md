@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.36.33
+
+- Validate rich-UI descriptors during HELLO and recheck the registered descriptor before applying catalog updates; catalog updates preserve it. The daemon copies the descriptor from the registered manifest into `catalog.list`, and refusals identify malformed fields by name. Catalog entries expose `nonce_verified` only when HELLO passes the launch-nonce check required for a reserved module or blue/green swap candidate; registrations without a verified nonce keep their previous wire bytes.
+
 ## 0.36.32
 
 - Successful rescans that add, remove or change modules append one `subc.config_changed` activity entry with sorted module ids and the caller's actor. No-op rescans, previews and refused checked applies remain silent; per-module rescan entries are unchanged.

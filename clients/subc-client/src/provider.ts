@@ -76,6 +76,13 @@ export interface HealthReport {
   metrics?: unknown;
 }
 
+export interface RichUiDescriptor {
+  schema: string;
+  manifest_digest: string;
+  bytes: number;
+  chunks: number;
+}
+
 export interface ManifestInput {
   module_id: string;
   module_version: string;
@@ -92,6 +99,8 @@ export interface ManifestInput {
   provenance?: ManifestProvenance;
   /** Open delivery strings by management operation; only `"watch"` on a query is subscribable. */
   operation_delivery?: Record<string, string>;
+  /** Opaque rich-UI manifest descriptor relayed to `catalog.list`. */
+  rich_ui?: RichUiDescriptor;
 }
 
 /**
@@ -1678,6 +1687,7 @@ export function normalizeManifest(manifest: ManifestInput, sentNonce: string | u
     ...(manifest.operation_delivery === undefined || Object.keys(manifest.operation_delivery).length === 0
       ? {}
       : { operation_delivery: { ...manifest.operation_delivery } }),
+    ...(manifest.rich_ui === undefined ? {} : { rich_ui: { ...manifest.rich_ui } }),
   };
 }
 

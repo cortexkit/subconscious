@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.30.10
+
+- Use subc-control 0.32.4 and subc-protocol 0.32.10 so typed `catalog.list` responses decode the optional rich-UI descriptor and nonce-verification fact carried by the newer daemon. Older catalog replies remain valid with both fields absent.
+
 ## 0.30.9
 
 - A served module can keep requests that are held for minutes from taking every handler slot. Until now every data request waited, in arrival order, for one of 64 slots and held it until its handler returned, so a burst of long requests left short ones queued behind them where the daemon could not see them. Implement the new `ModuleHandler::request_pools` and return `RequestPools::new().with_long_held(limit, classifier)`: the classifier gets each request's raw body before the request takes a slot and returns a `RequestClass` (`RequestClass::long_held()` or `RequestClass::default_pool()`, optionally `.with_op("label")`). Long-held requests then wait only for one of `limit` slots of their own, and the default pool's 64 slots stay free for everything else. The classifier runs on the connection's frame reader, so keep it a cheap peek at the operation name; a panic sends the request to the default pool. A module that does not implement `request_pools` keeps the single default pool of 64 slots.

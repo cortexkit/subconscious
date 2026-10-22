@@ -12,11 +12,20 @@ public struct CatalogEventDeclaration {
     public let summary: String?
 }
 
+public struct CatalogRichUiDescriptor {
+    public let schema: String
+    public let manifestDigest: String
+    public let bytes: UInt64
+    public let chunks: UInt32
+}
+
 public struct CatalogEntry {
     public let moduleId: String
     public let roles: [String]
     public let controlOps: [String]
     public let events: [CatalogEventDeclaration]?
+    public let richUi: CatalogRichUiDescriptor?
+    public let nonceVerified: Bool?
 }
 
 /// One decoded subscribe-stream control event (the chat-renderable unit).
@@ -136,7 +145,9 @@ public final class SubcClient {
                 moduleId: module["module_id"] as? String ?? "?",
                 roles: rolesOf(module["roles"]),
                 controlOps: module["control_ops"] as? [String] ?? [],
-                events: eventsOf(module["events"])
+                events: eventsOf(module["events"]),
+                richUi: richUiOf(module["rich_ui"]),
+                nonceVerified: module["nonce_verified"] as? Bool
             )
         }
     }
@@ -780,6 +791,21 @@ private func extractText(type: String, unit: [String: Any]) -> String? {
     default:
         return nil
     }
+}
+
+private func richUiOf(_ value: Any?) -> CatalogRichUiDescriptor? {
+    guard let descriptor = value as? [String: Any],
+          let schema = descriptor["schema"] as? String,
+          let manifestDigest = descriptor["manifest_digest"] as? String,
+          let bytes = descriptor["bytes"] as? UInt64,
+          let chunks = descriptor["chunks"] as? UInt32
+    else { return nil }
+    return CatalogRichUiDescriptor(
+        schema: schema,
+        manifestDigest: manifestDigest,
+        bytes: bytes,
+        chunks: chunks
+    )
 }
 
 private func eventsOf(_ value: Any?) -> [CatalogEventDeclaration]? {

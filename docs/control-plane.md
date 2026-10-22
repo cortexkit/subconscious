@@ -60,7 +60,7 @@ so over a second, client connection. Test:
 | Op | Purpose | Notes |
 | --- | --- | --- |
 | `server.describe` | Protocol version, advertised ops and capabilities, connected client count, counters, build commit and lock digest, capability-requirement status, machine id. | `build_git_sha`, `build_lock_digest` and `machine_id` are absent from daemons that predate them. The daemon's version is in the connection file and the handshake, not here. |
-| `catalog.list` | Registered modules with their manifests' roles, capabilities and readiness. Optional `module_id` narrows the list. | An unregistered id gives an empty list, not an error. This is the wire registry, not the supervised roster. |
+| `catalog.list` | Registered modules with their manifests' roles, capabilities, readiness and optional `rich_ui` descriptor. Optional `module_id` narrows the list. | An unregistered id gives an empty list, not an error. This is the wire registry, not the supervised roster. `rich_ui` is opaque and fixed for the registration's lifetime; `nonce_verified: true` appears only when HELLO passes the launch-nonce check required for a reserved module or swap candidate. Both fields are omitted when absent/unverified, preserving legacy entry bytes. |
 | `route.open` | Open a route to a target (section 2.1). | Reply: `route_channel`, `route_epoch`. |
 | `route.poll` | Read a bound route's last status (`kind: "status"`) or whether its module process is live (`kind: "liveness"`). | Answered from the daemon's own state; the module is never asked. |
 | `supervisor.list` | Supervised modules with state, health, restart counts and policy. | |

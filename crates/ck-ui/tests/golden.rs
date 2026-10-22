@@ -197,3 +197,15 @@ fn activity_120x36() {
     let (snap, now) = east_of_utc(Snapshot::fixture());
     check_at("activity-120x36", &app, &snap, now);
 }
+
+/// The Usage frame's heading reads "refreshed 4s ago": the mock draws the
+/// reading four seconds old at clock tick 0, a time `fixture.json` doesn't
+/// carry, so it is set here. Claude, the first provider, is selected.
+#[test]
+fn usage_120x36() {
+    let mut app = app();
+    app.tab = Tab::Usage;
+    let mut snap = Snapshot::fixture();
+    snap.usage.received_at = Snapshot::fixture_now().add_millis(-4_000);
+    check("usage-120x36", &app, &snap);
+}

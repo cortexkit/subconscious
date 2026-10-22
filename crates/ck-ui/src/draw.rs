@@ -298,13 +298,19 @@ pub fn use_fg(frac: f64) -> Fg {
     }
 }
 
+/// How [`bar`] fills a gauge `w` cells wide at `frac`: the cells filled
+/// whole, and the eighths (1 to 7) of the partial cell after them, or 0 when
+/// there is none.
+pub fn bar_fill(w: i32, frac: f64) -> (i32, i32) {
+    let frac = frac.clamp(0.0, 1.0);
+    let eighths = crate::time::js_round(frac * f64::from(w) * 8.0) as i32;
+    (eighths / 8, eighths % 8)
+}
+
 /// A horizontal gauge with eighth-block resolution: filled cells in the fill
 /// color, a quiet track behind, and one partial cell that blends the two.
 pub fn bar(c: &mut Canvas, x: i32, y: i32, w: i32, frac: f64, fill: Fg) {
-    let frac = frac.clamp(0.0, 1.0);
-    let eighths = crate::time::js_round(frac * f64::from(w) * 8.0) as i32;
-    let full = eighths / 8;
-    let rem = eighths % 8;
+    let (full, rem) = bar_fill(w, frac);
     const PARTS: [&str; 8] = ["", "▏", "▎", "▍", "▌", "▋", "▊", "▉"];
     for i in 0..w {
         if i < full {

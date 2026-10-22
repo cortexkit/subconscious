@@ -407,6 +407,12 @@ pub struct Account {
     /// The name shown instead of `who` while account identifiers are hidden:
     /// the pseudonym `ck quota --redact` prints.
     pub redacted: String,
+    /// The values `ck quota --redact` hides for this account: its email, its
+    /// account id (whole, and as `who` shortens it) and its organization's
+    /// name. While account identifiers are hidden, any of them that appears
+    /// in an error sentence is replaced with `redacted`
+    /// (`crate::quota::mask_identifiers`).
+    pub identifiers: Vec<String>,
     pub windows: Vec<UsageWindow>,
     pub note: String,
     /// Why this account's reading failed, if it did. A failing account has
@@ -442,6 +448,8 @@ pub struct Provider {
 pub struct Usage {
     pub providers: Vec<Provider>,
     pub models_priced: Option<u64>,
+    /// How many models the pricing module knows of, priced or not.
+    pub models_counted: Option<u64>,
     pub models_checked_at: Option<Timestamp>,
 }
 
@@ -822,6 +830,12 @@ pub struct Serves {
     pub approvals: bool,
     /// `m`: the selected module's full metrics.
     pub all_metrics: bool,
+    /// `⏎` on Usage, an account's detail, and `m` there, the model catalog.
+    /// The design draws both keys but no layout for either.
+    pub usage_detail: bool,
+    /// `r` on Usage: refresh now. The quota module offers no refresh
+    /// operation the app could call.
+    pub usage_refresh: bool,
 }
 
 impl Serves {
@@ -839,12 +853,14 @@ impl Serves {
         approvals: true,
         // The design draws no all-metrics list; the live app has one.
         all_metrics: false,
+        usage_detail: true,
+        usage_refresh: true,
     };
 
-    /// What the live app does today: Home, Modules and Activity, with
+    /// What the live app does today: Home, Modules, Activity and Usage, with
     /// Activity's `/` filter.
     pub const LIVE: Serves = Serves {
-        tabs: TabSet::of(&[Tab::Home, Tab::Modules, Tab::Activity]),
+        tabs: TabSet::of(&[Tab::Home, Tab::Modules, Tab::Activity, Tab::Usage]),
         settings: false,
         swap: false,
         list_filter: TabSet::of(&[Tab::Activity]),
@@ -853,6 +869,8 @@ impl Serves {
         ckni: false,
         approvals: false,
         all_metrics: true,
+        usage_detail: false,
+        usage_refresh: false,
     };
 }
 
@@ -1184,6 +1202,7 @@ mod fixture {
                             &json!({ "accountInfo": { "email": s(&a["who"]) } }),
                             true,
                         ),
+                        identifiers: vec![s(&a["who"])],
                         note: s(&a["note"]),
                         error: None,
                         windows: arr(&a["windows"])
@@ -1314,6 +1333,9 @@ mod fixture {
                 Usage {
                     providers,
                     models_priced: Some(10_258),
+                    // The fixture has no count of every model; the frame
+                    // draws the catalog key where the count would go.
+                    models_counted: None,
                     models_checked_at: Some(now.add_secs(-4.0 * 60.0)),
                 },
             ),

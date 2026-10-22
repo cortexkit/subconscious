@@ -132,6 +132,44 @@ pub fn account_pseudonym(entry: &Value) -> String {
     format!("account {:02x}{:02x}", digest[0], digest[1])
 }
 
+/// The values `--redact` hides for one row: its email, its account id
+/// (whole, and shortened as [`account_name`] shows it) and its organization's
+/// name. Empty values are left out.
+pub fn account_identifiers(entry: &Value) -> Vec<String> {
+    let email = entry
+        .get("accountInfo")
+        .and_then(|info| info.get("email"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let id = account_label(entry);
+    let short = shorten_uuid_label(&id);
+    let org = account_org(entry, false).unwrap_or_default();
+    let mut out: Vec<String> = Vec::new();
+    for value in [email, id, short, org] {
+        if !value.is_empty() && !out.contains(&value) {
+            out.push(value);
+        }
+    }
+    out
+}
+
+/// `text` with every occurrence of each of `identifiers` replaced by
+/// `pseudonym`. A provider's error sentence can quote the account it is
+/// about, so hiding account names must reach that text too. The longest
+/// identifier goes first, so a shortened id never leaves the rest of its
+/// whole id behind. Only the identifiers given are replaced; nothing else in
+/// the text is guessed at.
+pub fn mask_identifiers(text: &str, identifiers: &[String], pseudonym: &str) -> String {
+    let mut ordered: Vec<&String> = identifiers.iter().filter(|i| !i.is_empty()).collect();
+    ordered.sort_by_key(|i| std::cmp::Reverse(i.len()));
+    let mut out = text.to_string();
+    for identifier in ordered {
+        out = out.replace(identifier.as_str(), pseudonym);
+    }
+    out
+}
+
 pub fn shorten_uuid_label(label: &str) -> String {
     if is_uuid_shaped(label) {
         label[..8].to_string()
@@ -625,6 +663,42 @@ mod tests {
             "oauth account"
         );
         assert_eq!(account_name(&json!({}), false), "account");
+    }
+
+    /// The identifiers an account row carries are exactly what `--redact`
+    /// hides, and masking a sentence replaces each of them, the whole id
+    /// before its shortened form.
+    #[test]
+    fn identifiers_in_a_sentence_are_replaced_by_the_pseudonym() {
+        let entry = json!({
+            "account": "0f1e2d3c-aaaa-bbbb-cccc-000000000001",
+            "accountInfo": { "email": "alex@example.com", "orgName": "Alex's Organization" },
+        });
+        let ids = account_identifiers(&entry);
+        assert_eq!(
+            ids,
+            [
+                "alex@example.com",
+                "0f1e2d3c-aaaa-bbbb-cccc-000000000001",
+                "0f1e2d3c",
+                "Alex's Organization"
+            ]
+        );
+        let pseudonym = account_name(&entry, true);
+        let masked = mask_identifiers(
+            "token for alex@example.com (0f1e2d3c-aaaa-bbbb-cccc-000000000001, 0f1e2d3c) in Alex's Organization expired",
+            &ids,
+            &pseudonym,
+        );
+        assert_eq!(
+            masked,
+            format!("token for {pseudonym} ({pseudonym}, {pseudonym}) in {pseudonym} expired")
+        );
+        assert_eq!(
+            mask_identifiers("upstream returned 500", &ids, &pseudonym),
+            "upstream returned 500"
+        );
+        assert!(account_identifiers(&json!({ "source": "oauth" })).is_empty());
     }
 
     #[test]

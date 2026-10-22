@@ -587,7 +587,7 @@ fn the_live_app_advertises_only_what_it_serves() {
     s.commands = ck_ui::live::palette_commands(&s.modules.data);
     // The fixture's roster has every module a tab needs, so what shows is
     // exactly what the live app serves.
-    let served = TabSet::of(&[Tab::Home, Tab::Modules, Tab::Activity]);
+    let served = TabSet::of(&[Tab::Home, Tab::Modules, Tab::Activity, Tab::Usage]);
     assert_eq!(s.serves.tabs, served);
     assert_eq!(s.visible_tabs(), served);
     // Activity's filter is the only one served.
@@ -601,7 +601,7 @@ fn the_live_app_advertises_only_what_it_serves() {
     assert_eq!(
         listed,
         [
-            "1 – 3",
+            "1 – 4",
             ":",
             "?",
             "esc",
@@ -627,7 +627,7 @@ fn the_live_app_advertises_only_what_it_serves() {
         "space",
         "double-click",
         "ckni",
-        "4 Usage",
+        "5 Agents",
     ] {
         assert!(
             !page.contains(gone),
@@ -693,8 +693,49 @@ fn the_live_app_advertises_only_what_it_serves() {
     assert!(served(&mut app, KeyCode::Down) && served(&mut app, KeyCode::Up));
     assert!(served(&mut app, KeyCode::Enter), "open the subject");
     assert_eq!(app.tab, Tab::Modules);
+    // On Usage: ↑↓ move through the providers, tab moves to the selected
+    // provider's accounts and back, ←→ scroll an account's windows when
+    // they don't all fit, and x hides account identifiers and shows them
+    // again. There is no refresh (`r`), account detail (⏎) or model
+    // catalog (`m`): those keys do nothing, and no hint offers them.
+    let mut app = App::new(Theme::test());
+    assert!(served(&mut app, KeyCode::Char('4')));
+    assert_eq!(app.tab, Tab::Usage);
+    assert!(served(&mut app, KeyCode::Down) && served(&mut app, KeyCode::Up));
+    assert!(served(&mut app, KeyCode::Tab));
+    assert_eq!(app.usage.focus, ck_ui::screens::usage::Focus::Accounts);
+    assert!(served(&mut app, KeyCode::Down) && served(&mut app, KeyCode::Up));
+    assert!(served(&mut app, KeyCode::Tab));
+    assert_eq!(app.usage.focus, ck_ui::screens::usage::Focus::Providers);
+    assert!(served(&mut app, KeyCode::Char('x')));
+    assert!(app.redact);
+    assert!(served(&mut app, KeyCode::Char('x')));
+    assert!(!app.redact);
+    let before = (app.tab, app.usage.clone(), app.overlay, app.redact);
+    for code in [KeyCode::Char('r'), KeyCode::Enter, KeyCode::Char('m')] {
+        assert!(!served(&mut app, code), "{code:?} acts on Usage");
+        assert!(app.requests.is_empty() && app.confirm.is_none(), "{code:?}");
+        assert_eq!(
+            (app.tab, app.usage.clone(), app.overlay, app.redact),
+            before,
+            "{code:?} changed the screen"
+        );
+    }
+    let buf = render(&app, &s, 120, 36);
+    let footer = row(&buf, 35);
+    for shown in ["provider", "tab", "hide emails", "from insula"] {
+        assert!(footer.contains(shown), "{shown:?} missing: {footer}");
+    }
+    for gone in ["refresh", "⏎", " r "] {
+        assert!(
+            !footer.contains(gone),
+            "the live footer offers {gone:?}: {footer}"
+        );
+    }
+    let screen: String = (0..36).map(|y| row(&buf, y) + "\n").collect();
+    assert!(!screen.contains("catalog"), "{screen}");
     // The number keys of tabs it doesn't serve do nothing.
-    for k in '4'..='7' {
+    for k in '5'..='7' {
         let mut app = App::new(Theme::test());
         assert!(!served(&mut app, KeyCode::Char(k)), "{k}");
         assert_eq!(app.tab, Tab::Home, "{k}");
@@ -707,7 +748,8 @@ fn the_live_app_advertises_only_what_it_serves() {
     assert!(!row(&buf, 3).contains("/ to filter"), "{}", row(&buf, 3));
     assert!(!row(&buf, 35).contains("settings"));
     assert!(row(&buf, 0).contains("3 Activity"), "{}", row(&buf, 0));
-    assert!(!row(&buf, 0).contains("4 Usage"), "{}", row(&buf, 0));
+    assert!(row(&buf, 0).contains("4 Usage"), "{}", row(&buf, 0));
+    assert!(!row(&buf, 0).contains("5 Agents"), "{}", row(&buf, 0));
     assert!(row(&buf, 0).contains("2 Modules"));
     // Each tab's filter is served on its own: serving it on the other lists
     // never puts a filter hint on Modules.
@@ -723,7 +765,7 @@ fn the_live_app_advertises_only_what_it_serves() {
         .filter(|c| c.area == "App" && Tab::from_name(&c.title).is_some())
         .map(|c| c.title.as_str())
         .collect();
-    assert_eq!(tabs_offered, ["Home", "Modules", "Activity"]);
+    assert_eq!(tabs_offered, ["Home", "Modules", "Activity", "Usage"]);
 
     // Every palette command runs: a restart request or the log view.
     for cmd in palette {
@@ -740,6 +782,7 @@ fn the_live_app_advertises_only_what_it_serves() {
             || app.theme.mode() != Theme::test().mode()
             || app.tab == Tab::Modules
             || app.tab == Tab::Activity
+            || app.tab == Tab::Usage
             || cmd.title == "Home";
         assert!(did, "{:?} did nothing", cmd.title);
     }
@@ -1108,12 +1151,21 @@ fn the_usage_name_column_fits_the_longest_name_shown() {
 #[test]
 fn no_pointer_to_a_screen_the_app_does_not_have() {
     use ck_ui::model::Serves;
+    // A build that doesn't serve Usage never points at it.
     let mut s = Snapshot::fixture();
-    s.serves = Serves::LIVE;
+    s.serves = Serves {
+        tabs: Serves::LIVE.tabs.without(Tab::Usage),
+        ..Serves::LIVE
+    };
     let buf = render(&App::new(Theme::test()), &s, 80, 24);
     let text: String = (0..24).map(|y| row(&buf, y) + "\n").collect();
     assert!(text.contains("more providers"), "{text}");
     assert!(!text.contains("on 4 Usage"), "{text}");
+    // The live app serves Usage, so the same line points at it.
+    s.serves = Serves::LIVE;
+    let buf = render(&App::new(Theme::test()), &s, 80, 24);
+    let text: String = (0..24).map(|y| row(&buf, y) + "\n").collect();
+    assert!(text.contains("more providers on 4 Usage"), "{text}");
     let buf = render(&App::new(Theme::test()), &s, 160, 48);
     let text: String = (0..48).map(|y| row(&buf, y) + "\n").collect();
     assert!(!text.contains("Approvals"), "{text}");

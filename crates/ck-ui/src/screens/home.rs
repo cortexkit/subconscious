@@ -127,7 +127,7 @@ pub fn is_code(err: &str, kind: FaultKind) -> bool {
 /// becomes a muted "couldn't read {what}", or just "couldn't read" when
 /// that doesn't fit (the code stays in the model); a sentence shows as it
 /// is, in amber.
-fn error_cell(err: &str, kind: FaultKind, what: &str, room: usize) -> (String, St) {
+pub(super) fn error_cell(err: &str, kind: FaultKind, what: &str, room: usize) -> (String, St) {
     if is_code(err, kind) {
         let full = format!("couldn't read {what}");
         let text = if width(&full) <= room {
@@ -542,11 +542,18 @@ fn more_providers(n: usize, usage_tab: bool) -> String {
 
 /// A provider's share used, or the text that stands in its place: its
 /// error (never a bar at 0%), what is left of a credit pool, or "unknown".
-fn provider_frac(q: &Provider) -> Result<f64, (String, St)> {
+/// While account identifiers are hidden, any identifier in the error is
+/// replaced with its account's pseudonym.
+fn provider_frac(v: &View, q: &Provider) -> Result<f64, (String, St)> {
     match (q.used, &q.error, &q.balance) {
         (Some(used), None, _) => Ok(used / f64::from(q.of.max(1))),
         // The usage cell always has room for the whole sentence.
-        (_, Some(err), _) => Err(error_cell(err, q.error_kind, "usage", usize::MAX)),
+        (_, Some(err), _) => Err(error_cell(
+            &super::usage::provider_text(v, q, err),
+            q.error_kind,
+            "usage",
+            usize::MAX,
+        )),
         (None, None, Some(left)) => Err((left.clone(), St::NONE)),
         (None, None, None) => Err((UNKNOWN.to_string(), St::D)),
     }
@@ -554,7 +561,7 @@ fn provider_frac(q: &Provider) -> Result<f64, (String, St)> {
 
 /// A credit balance with its soonest expiry, " · expires Oct 25", when the
 /// whole of it fits in `room` columns.
-fn with_expiry(v: &View, q: &Provider, text: String, room: usize) -> String {
+pub(super) fn with_expiry(v: &View, q: &Provider, text: String, room: usize) -> String {
     const MONTHS: [&str; 12] = [
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
     ];
@@ -584,7 +591,7 @@ fn provider_name(name: &str, col: i32) -> String {
     pad_right(&trunc(name, (col - 1).max(0) as usize), col.max(0) as usize)
 }
 
-fn resets_text(v: &View, q: &Provider) -> String {
+pub(super) fn resets_text(v: &View, q: &Provider) -> String {
     q.resets_at.map_or_else(
         || format!("resets {UNKNOWN}"),
         |t| format!("resets in {}", ago(-v.age(t))),
@@ -610,7 +617,7 @@ fn usage_list(
     for (i, q) in providers.iter().take(shown).enumerate() {
         let y = top + i as i32 * 2;
         c.put(bx, y, &provider_name(&q.name, col), St::NONE);
-        let f = match provider_frac(q) {
+        let f = match provider_frac(v, q) {
             Ok(f) => f,
             Err((text, st)) => {
                 let room = (bw - col).max(0) as usize;
@@ -1308,7 +1315,7 @@ fn draw_small(c: &mut Canvas, v: &View) {
     for (i, q) in providers.iter().take(shown).enumerate() {
         let y = 14 + i as i32;
         c.put(2, y, &provider_name(&q.name, col), St::NONE);
-        let f = match provider_frac(q) {
+        let f = match provider_frac(v, q) {
             Ok(f) => f,
             Err((text, st)) => {
                 let room = (c.w - 4 - col).max(0) as usize;

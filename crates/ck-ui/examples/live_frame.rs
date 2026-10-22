@@ -1,10 +1,11 @@
-//! Prints the live app's Home and Modules screens as plain text, for checking
-//! them against the real fleet without a terminal:
+//! Prints the live app's Home, Modules and Usage screens as plain text, for
+//! checking them against the real fleet without a terminal:
 //!
 //! ```text
 //! cargo run -p ck-ui --example live_frame -- 160x48
 //! cargo run -p ck-ui --example live_frame -- 120x36 --subc /path/to/subc-connection.json
 //! cargo run -p ck-ui --example live_frame -- 160x48 --raw
+//! cargo run -p ck-ui --example live_frame -- 120x36 --redact
 //! ```
 //!
 //! It connects with the same discovery `ck` uses and waits until every panel
@@ -12,7 +13,8 @@
 //! modules, one has a CPU reading, or ten seconds pass. Then it prints both
 //! screens. `--raw` first prints the latest reply (as JSON, or as debug text
 //! for replies with no JSON form) or error ck recorded for each daemon and
-//! module request.
+//! module request. `--redact` hides account identifiers the way `x` does on
+//! Usage, for a capture that can be shared.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -55,7 +57,7 @@ impl DaemonService for LookOnly {
 }
 
 fn usage() -> ! {
-    eprintln!("usage: live_frame [WxH] [--subc PATH] [--raw]   (default 160x48)");
+    eprintln!("usage: live_frame [WxH] [--subc PATH] [--raw] [--redact]   (default 160x48)");
     std::process::exit(2);
 }
 
@@ -71,10 +73,13 @@ async fn main() {
     let mut size = (160u16, 48u16);
     let mut subc = None;
     let mut raw = false;
+    let mut redact = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         if arg == "--raw" {
             raw = true;
+        } else if arg == "--redact" {
+            redact = true;
         } else if arg == "--subc" {
             subc = Some(PathBuf::from(args.next().unwrap_or_else(|| usage())));
         } else if let Some((w, h)) = arg.split_once('x') {
@@ -143,7 +148,12 @@ async fn main() {
     let now = Timestamp::system_now();
     let mut app = App::new(Theme::light());
     app.size = size;
-    for (tab, title) in [(Tab::Home, "Home"), (Tab::Modules, "Modules")] {
+    app.redact = redact;
+    for (tab, title) in [
+        (Tab::Home, "Home"),
+        (Tab::Modules, "Modules"),
+        (Tab::Usage, "Usage"),
+    ] {
         app.tab = tab;
         let mut buf = Buffer::empty(Rect::new(0, 0, size.0, size.1));
         app.render(&mut buf, &snap, now);

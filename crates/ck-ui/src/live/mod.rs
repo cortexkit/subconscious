@@ -682,16 +682,19 @@ pub fn assemble(state: &State, now: Timestamp) -> Snapshot {
             .and_then(|h| h.last_probe_ms)
             .map(|ms| Timestamp::from_unix_millis(ms as i64)),
     );
+    let models_counted = map::model_count(health_metrics(modules::MODELS));
     let mut usage = state.usage.panel(
         Some(every::USAGE),
         |p| Usage {
             providers: p.clone(),
             models_priced,
+            models_counted,
             models_checked_at,
         },
         Usage {
             providers: Vec::new(),
             models_priced,
+            models_counted,
             models_checked_at,
         },
     );

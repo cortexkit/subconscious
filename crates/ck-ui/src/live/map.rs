@@ -424,6 +424,12 @@ pub fn models(
     (priced, checked)
 }
 
+/// How many models the fusiform module knows of, priced or not: `None`
+/// before it has counted (null) or from a build that doesn't send the count.
+pub fn model_count(metrics: Option<&Value>) -> Option<u64> {
+    metrics.and_then(|m| metric_u64(m, "model_count"))
+}
+
 // ---- usage ---------------------------------------------------------------------
 
 /// Why an account's row can't be read, or `Err(())` for a disconnected row
@@ -633,6 +639,7 @@ pub fn usage(reply: &Value, now: Timestamp) -> Result<Vec<Provider>, Fault> {
             accounts.push(Account {
                 who: quota::account_name(entry, false),
                 redacted: quota::account_name(entry, true),
+                identifiers: quota::account_identifiers(entry),
                 windows: windows
                     .iter()
                     .map(|w| UsageWindow {

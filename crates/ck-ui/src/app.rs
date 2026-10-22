@@ -18,6 +18,7 @@ use crate::draw::{tab_spans, Canvas};
 use crate::model::{ActionKind, Daemon, LogView, Module, PaletteCommand, Panel, Snapshot, Status};
 use crate::screens::activity::ActivityState;
 use crate::screens::logs::{self, LevelFilter, LogState};
+use crate::screens::usage::{Focus, UsageState};
 use crate::screens::{self, overlays, View, MIN_H, MIN_W};
 use crate::theme::{detect_theme, Theme};
 use crate::time::Timestamp;
@@ -107,6 +108,13 @@ pub struct App {
     pub field: Option<TextField>,
     /// The Activity screen's selection, kind chip and filter.
     pub activity: ActivityState,
+    /// The Usage screen's selected provider, account and windows.
+    pub usage: UsageState,
+    /// Whether account identifiers are hidden, on Usage and in Home's usage
+    /// panel alike: each account's email, id and organization, wherever the
+    /// app shows them, read as that account's pseudonym. `x` on Usage
+    /// toggles it; it lasts as long as the app runs.
+    pub redact: bool,
     /// Requests made since the run loop last collected them.
     pub requests: Vec<Request>,
 }
@@ -131,6 +139,8 @@ impl App {
             down_log: false,
             field: None,
             activity: ActivityState::default(),
+            usage: UsageState::default(),
+            redact: false,
             requests: Vec::new(),
         }
     }
@@ -225,6 +235,7 @@ impl App {
             tick: self.tick,
             home_sel: self.home_sel,
             mod_sel: self.mod_sel,
+            redact: self.redact,
         };
         if let Daemon::Down(d) = &snap.daemon.data {
             if self.down_log {
@@ -259,7 +270,7 @@ impl App {
             (Tab::Activity, ..) => {
                 screens::activity::draw(&mut c, &v, &self.activity, self.field.is_some())
             }
-            (Tab::Usage, ..) => screens::usage::draw(&mut c, &v),
+            (Tab::Usage, ..) => screens::usage::draw(&mut c, &v, &self.usage),
             (Tab::Agents, ..) => screens::agents::draw(&mut c, &v),
             (Tab::Devices, ..) => screens::devices::draw(&mut c, &v),
             (Tab::Settings, ..) => screens::settings::draw(&mut c, &v),
@@ -362,6 +373,11 @@ impl App {
         }
         if self.overlay.is_none() && self.tab == Tab::Activity {
             if let Some(handled) = self.activity_key(key, snap) {
+                return handled;
+            }
+        }
+        if self.overlay.is_none() && self.tab == Tab::Usage {
+            if let Some(handled) = self.usage_key(key, snap) {
                 return handled;
             }
         }
@@ -750,6 +766,89 @@ impl App {
         true
     }
 
+    /// Keys for the Usage screen ahead of the app-wide ones. `None` lets the
+    /// key fall through to them (tabs, palette, help, quit, moving). There
+    /// is no `r`: the quota module offers no refresh operation, and no `⏎`
+    /// or `m`: an account's detail and the model catalog have no screen.
+    fn usage_key(&mut self, key: KeyEvent, snap: &Snapshot) -> Option<bool> {
+        match key.code {
+            KeyCode::Char('x') => self.redact = !self.redact,
+            KeyCode::Tab | KeyCode::BackTab => match self.usage.focus {
+                Focus::Accounts => self.usage.focus = Focus::Providers,
+                Focus::Providers => {
+                    let has_accounts = screens::usage::selected_provider(snap, &self.usage)
+                        .is_some_and(|(_, q)| !q.accounts.is_empty());
+                    if !has_accounts {
+                        return Some(false);
+                    }
+                    self.usage.focus = Focus::Accounts;
+                }
+            },
+            KeyCode::Left if self.usage.focus == Focus::Accounts => {
+                return Some(self.scroll_windows(-1, snap))
+            }
+            KeyCode::Right if self.usage.focus == Focus::Accounts => {
+                return Some(self.scroll_windows(1, snap))
+            }
+            _ => return None,
+        }
+        Some(true)
+    }
+
+    /// Moves the Usage selection by `delta`: the provider, or the account
+    /// while the accounts have the focus. A new provider starts at its first
+    /// account, and a new account at its first window.
+    fn move_usage(&mut self, delta: i32, snap: &Snapshot) -> bool {
+        let Some((at, q)) = screens::usage::selected_provider(snap, &self.usage) else {
+            return false;
+        };
+        let (current, len) = match self.usage.focus {
+            Focus::Accounts if !q.accounts.is_empty() => (
+                self.usage.account.min(q.accounts.len() - 1),
+                q.accounts.len(),
+            ),
+            _ => (at, screens::usage::providers(snap).len()),
+        };
+        let next = (current as i64 + i64::from(delta)).clamp(0, len as i64 - 1) as usize;
+        if next == current {
+            return false;
+        }
+        match self.usage.focus {
+            Focus::Accounts if !q.accounts.is_empty() => self.usage.account = next,
+            _ => {
+                self.usage.provider = next;
+                self.usage.account = 0;
+                self.usage.focus = Focus::Providers;
+            }
+        }
+        self.usage.scroll = 0;
+        true
+    }
+
+    /// Scrolls the selected account's windows by `delta`, as far as its
+    /// last window, for an account with more windows than the window shows.
+    fn scroll_windows(&mut self, delta: i32, snap: &Snapshot) -> bool {
+        let Some((_, q)) = screens::usage::selected_provider(snap, &self.usage) else {
+            return false;
+        };
+        let Some(a) = q
+            .accounts
+            .get(self.usage.account.min(q.accounts.len().saturating_sub(1)))
+        else {
+            return false;
+        };
+        if a.error.is_some() {
+            return false;
+        }
+        let n = a.windows.len();
+        let shown = screens::usage::windows_shown(i32::from(self.size.0), n);
+        let end = n - shown;
+        let current = self.usage.scroll.min(end);
+        let next = (current as i64 + i64::from(delta)).clamp(0, end as i64) as usize;
+        self.usage.scroll = next;
+        next != current
+    }
+
     fn palette_key(&mut self, key: KeyEvent, snap: &Snapshot) -> bool {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
@@ -839,6 +938,7 @@ impl App {
             }
             Tab::Modules => (&mut self.mod_sel, snap.modules.data.len()),
             Tab::Activity => return self.move_activity(delta, snap),
+            Tab::Usage => return self.move_usage(delta, snap),
             // The other tabs' screens keep no selection here yet.
             _ => return false,
         };

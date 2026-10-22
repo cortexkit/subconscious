@@ -170,6 +170,22 @@ fn usage_accounts_carry_the_ck_quota_redact_pseudonym() {
     }
 }
 
+/// Each account carries what `--redact` hides for it, so a sentence that
+/// quotes the account can be masked too.
+#[test]
+fn usage_accounts_carry_the_identifiers_redaction_hides() {
+    let providers = map::usage(&usage_reply(), now()).unwrap();
+    assert_eq!(
+        providers[0].accounts[0].identifiers,
+        ["alex@example.com", "acct-1"]
+    );
+    assert_eq!(providers[0].accounts[1].identifiers, ["sam@example.org"]);
+    assert_eq!(
+        providers[1].accounts[0].identifiers,
+        ["0f1e2d3c-aaaa-bbbb-cccc-000000000000", "0f1e2d3c"]
+    );
+}
+
 // ---- build server, backups, models -------------------------------------------------
 
 #[test]
@@ -252,6 +268,20 @@ fn fusiform_counts_are_unknown_until_counted() {
     let older = json!({ "observation_age_ms": 5 });
     assert_eq!(map::models(Some(&older), probed).0, None);
     assert_eq!(map::models(None, probed), (None, None));
+}
+
+/// The Usage screen's "of N models" is fusiform's `model_count`, unknown
+/// until counted and from builds that don't send it.
+#[test]
+fn fusiform_model_count_is_unknown_until_counted() {
+    let counted = json!({ "models_priced": 10_258, "model_count": 10_400 });
+    assert_eq!(map::model_count(Some(&counted)), Some(10_400));
+    assert_eq!(
+        map::model_count(Some(&json!({ "model_count": null }))),
+        None
+    );
+    assert_eq!(map::model_count(Some(&json!({ "models_priced": 3 }))), None);
+    assert_eq!(map::model_count(None), None);
 }
 
 // ---- devices -----------------------------------------------------------------------
@@ -1731,6 +1761,7 @@ fn a_quiet_open_feed_stays_live_and_a_closed_one_ages_against_15_s() {
             tick: 0,
             home_sel: 0,
             mod_sel: 0,
+            redact: false,
         };
         (
             v.meta(&snap.activity, ""),

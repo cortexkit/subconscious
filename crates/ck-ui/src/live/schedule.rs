@@ -642,6 +642,42 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn usage_is_read_every_30_s_only_while_usage_or_home_shows() {
+        let run = Scripted::start(Showing::tab(Tab::Usage), Duration::ZERO);
+        let usage_reads = || -> Vec<f64> {
+            run.sent
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(m, _)| *m == crate::quota::USAGE_METHOD)
+                .map(|(_, t)| *t)
+                .collect()
+        };
+        run_for(65.0).await;
+        // The interval the design gives insula `usage.get`.
+        assert_eq!(every::USAGE, 30.0);
+        assert_eq!(usage_reads(), [0.0, 30.0, 60.0]);
+
+        // Off Usage and Home, nothing is read however long it shows.
+        for tab in [
+            Tab::Modules,
+            Tab::Activity,
+            Tab::Agents,
+            Tab::Devices,
+            Tab::Settings,
+        ] {
+            run.show(Showing::tab(tab));
+            run_for(100.0).await;
+        }
+        assert_eq!(usage_reads(), [0.0, 30.0, 60.0], "read off Usage and Home");
+
+        // Home reads at once, then every 30 s.
+        run.show(Showing::tab(Tab::Home));
+        run_for(31.0).await;
+        assert_eq!(usage_reads(), [0.0, 30.0, 60.0, 565.0, 595.0]);
+    }
+
     #[test]
     fn each_module_source_runs_only_on_the_screens_that_show_it() {
         use Source::*;

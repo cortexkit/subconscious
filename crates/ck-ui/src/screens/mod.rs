@@ -32,6 +32,10 @@ pub struct View<'a> {
     pub tick: u64,
     pub home_sel: usize,
     pub mod_sel: usize,
+    /// Account identifiers are hidden: Usage names each account by the
+    /// pseudonym `ck quota --redact` prints, and Home's usage panel masks
+    /// any identifier quoted in a provider's error.
+    pub redact: bool,
 }
 
 impl View<'_> {

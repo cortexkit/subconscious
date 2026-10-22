@@ -310,16 +310,19 @@ fn mouse_clicks_tabs_and_rows_and_scrolls_the_selection() {
     // The fixture serves every tab, so each one the bar draws opens.
     assert!(app.handle_event(&click(41, 0), &snap, (120, 36)));
     assert_eq!(app.tab, Tab::Activity);
-    // The live app's bar has no Usage, so the place it has in the full bar
+    // The live app's bar has no Agents, so the place it has in the full bar
     // does nothing.
     let mut live = Snapshot::fixture();
     live.serves = ck_ui::model::Serves::LIVE;
     let mut app = App::new(Theme::test());
-    assert!(!app.handle_event(&click(54, 0), &live, (120, 36)));
+    assert!(!app.handle_event(&click(64, 0), &live, (120, 36)));
     assert_eq!(app.tab, Tab::Home);
-    // Activity is served live, at the same place as in the full bar.
+    // Activity and Usage are served live, at the same places as in the full
+    // bar.
     assert!(app.handle_event(&click(41, 0), &live, (120, 36)));
     assert_eq!(app.tab, Tab::Activity);
+    assert!(app.handle_event(&click(54, 0), &live, (120, 36)));
+    assert_eq!(app.tab, Tab::Usage);
 }
 
 #[test]
@@ -332,15 +335,17 @@ fn quit_keys_and_later_screens_keys() {
         assert!(app.handle_key(key(KeyCode::Char(tab.key())), &snap));
         assert_eq!(app.tab, tab);
     }
-    // The live app serves Home, Modules and Activity: the later screens'
-    // keys do nothing there.
+    // The live app serves Home, Modules, Activity and Usage: the later
+    // screens' keys do nothing there.
     let mut live = Snapshot::fixture();
     live.serves = ck_ui::model::Serves::LIVE;
     let mut app = App::new(Theme::light());
-    for k in '4'..='7' {
+    for k in '5'..='7' {
         assert!(!app.handle_key(key(KeyCode::Char(k)), &live));
         assert_eq!(app.tab, Tab::Home);
     }
+    assert!(app.handle_key(key(KeyCode::Char('4')), &live));
+    assert_eq!(app.tab, Tab::Usage);
     assert!(app.handle_key(key(KeyCode::Char('3')), &live));
     assert_eq!(app.tab, Tab::Activity);
     assert!(app.handle_key(key(KeyCode::Char('2')), &live));
@@ -565,12 +570,15 @@ fn the_sources_follow_the_tab_on_screen() {
     no_insula.modules.data.retain(|m| m.id != "insula");
     assert_eq!(app.showing(&no_insula), Showing::tab(Tab::Home));
 
-    // The live app doesn't serve Usage yet, so key 4 leaves Home on screen.
+    // The live app serves Usage but not Agents: key 4 shows Usage, and key
+    // 5 leaves it on screen.
     let mut live = snap.clone();
     live.serves = ck_ui::model::Serves::LIVE;
     let mut app = App::new(Theme::test());
     press(&mut app, &live, KeyCode::Char('4'));
-    assert_eq!(app.showing(&live), Showing::tab(Tab::Home));
+    assert_eq!(app.showing(&live), Showing::tab(Tab::Usage));
+    press(&mut app, &live, KeyCode::Char('5'));
+    assert_eq!(app.showing(&live), Showing::tab(Tab::Usage));
     press(&mut app, &live, KeyCode::Char('2'));
     assert_eq!(app.showing(&live), Showing::tab(Tab::Modules));
 }

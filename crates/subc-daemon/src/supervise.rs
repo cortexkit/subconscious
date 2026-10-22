@@ -13473,8 +13473,12 @@ mod restart_ordering_tests {
             .register_configured_with_health(
                 ModuleSpec {
                     module_id: "queued-before-replacement".into(),
-                    program: "/bin/sh".into(),
-                    args: vec!["-c".into(), "exec sleep 600".into()],
+                    // `/bin/sleep` itself, not `/bin/sh -c "exec sleep"`: on
+                    // macOS a module whose running image is not the configured
+                    // program is refused once its exec is confirmed (see
+                    // `record_write_stall_tests::sleeping_spec`).
+                    program: "/bin/sleep".into(),
+                    args: vec!["600".into()],
                     env: vec![],
                     reserved: false,
                     reserved_prefixes: vec![],
@@ -13588,10 +13592,17 @@ mod health_event_tests {
                     .with_health_config(health.clone());
             let spec = ModuleSpec {
                 module_id: "event-health-child".into(),
-                program: PathBuf::from("/bin/sh"),
+                // `/bin/sleep` itself, not `/bin/sh -c "exec sleep"`: on macOS
+                // the privacy trampoline refuses a module whose running image
+                // is not the configured program, and `start` below waits for
+                // the process to be confirmed (`reported_pid`). The shell form
+                // passed only while the image check ran before the shell had
+                // replaced itself with `sleep` (see
+                // `record_write_stall_tests::sleeping_spec`).
+                program: PathBuf::from("/bin/sleep"),
                 // The process stays alive but has no real bus peer. Registrations
                 // below exercise the same registry writes as accepted HELLOs.
-                args: vec!["-c".into(), "exec sleep 600".into()],
+                args: vec!["600".into()],
                 env: ["XDG_DATA_HOME", "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME"]
                     .into_iter()
                     .map(|key| (key.into(), home.path().display().to_string()))
@@ -16715,11 +16726,13 @@ mod record_write_stall_tests {
     /// On macOS every module is launched through the privacy trampoline, and
     /// a module that is not a `#!` script is admitted only if its running
     /// image is the configured program. With `/bin/sh -c "exec sleep 600"`
-    /// the shell replaces itself with `/bin/sleep`, which does not match the
-    /// configured `/bin/sh`, so the process is refused and killed right after
-    /// spawn, and the supervisor crash-loops it with backoff until its
-    /// restart budget runs out. The restart this test measures would then
-    /// never produce a module at all.
+    /// the shell soon replaces itself with `/bin/sleep`, which does not match
+    /// the configured `/bin/sh`. The image is read only after the spawn's
+    /// live-children record write, and here that write lasted long enough for
+    /// the shell to have exec'd every time, so each process was refused and
+    /// killed right after spawn, and the supervisor crash-looped it with
+    /// backoff until its restart budget ran out. The restart this test
+    /// measures would then never produce a module at all.
     fn sleeping_spec() -> ModuleSpec {
         ModuleSpec {
             module_id: "record-write-stall".into(),

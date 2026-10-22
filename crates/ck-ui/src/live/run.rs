@@ -339,6 +339,8 @@ fn sources(shared: &Arc<Shared>, conn: &Conn) -> Vec<JoinHandle<()>> {
             async move { module_call(&sh, &c, module, method, params).await }
         };
         let sh = Arc::clone(shared);
+        let params = move |source: Source| sh.read(|s| s.poll_params(source));
+        let sh = Arc::clone(shared);
         let apply = move |source: Source, reply: Result<Value, Fault>| {
             let mut good = false;
             sh.update(|s| good = s.record_module_reply(source, reply, now()));
@@ -346,7 +348,7 @@ fn sources(shared: &Arc<Shared>, conn: &Conn) -> Vec<JoinHandle<()>> {
                 sh.identity_ready.notify_one();
             }
         };
-        tasks.extend(schedule::module_sources(&gate, call, apply));
+        tasks.extend(schedule::module_sources(&gate, call, params, apply));
     }
     // Where agents live: as soon as identity rows exist, then every minute,
     // while a screen that shows it is on screen.

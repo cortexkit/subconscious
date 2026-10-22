@@ -584,6 +584,12 @@ pub struct Agent {
     pub state: String,
     pub machine: String,
     pub doing: Option<String>,
+    /// The role the identity source gives the agent; `None` when it gives
+    /// none.
+    pub role: Option<String>,
+    /// How many of the agent's questions wait for an answer, as the state
+    /// source counts them; `None` when it doesn't say.
+    pub pending_asks: Option<u32>,
 }
 
 impl Agent {
@@ -596,6 +602,66 @@ impl Agent {
     }
 }
 
+/// A workspace and how many of the listed agents belong to it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Workspace {
+    pub name: String,
+    pub agents: u32,
+    /// How many projects the workspace holds. No live source counts them
+    /// per workspace, so the live app leaves this `None` and draws nothing
+    /// for it.
+    pub projects: Option<u32>,
+}
+
+/// A machine that holds agents, and how many of the listed agents it holds.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Machine {
+    pub name: String,
+    pub agents: u32,
+    /// Whether the machine is reachable now. No live source reports it, so
+    /// the live app leaves this `None` and draws no dot for it.
+    pub online: Option<bool>,
+}
+
+/// When each source joined into the agents list last reported, and how it
+/// is doing, so each column can age and dim by its own source: a fresh
+/// identity reply never makes an old state or place look current.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AgentSources {
+    /// Names, projects, roles and workspaces.
+    pub identity: Panel<()>,
+    /// Working or idle, what each agent is doing, its waiting questions.
+    pub state: Panel<()>,
+    /// Which machine holds each agent.
+    pub places: Panel<()>,
+    /// The fleet's workspace and project totals.
+    pub counts: Panel<()>,
+}
+
+impl AgentSources {
+    /// Every source read at `at`, on no schedule.
+    pub fn read_at(at: Timestamp) -> AgentSources {
+        AgentSources {
+            identity: Panel::new(at, ()),
+            state: Panel::new(at, ()),
+            places: Panel::new(at, ()),
+            counts: Panel::new(at, ()),
+        }
+    }
+}
+
+impl Default for AgentSources {
+    /// No source has reported yet.
+    fn default() -> AgentSources {
+        AgentSources {
+            identity: Panel::waiting((), None),
+            state: Panel::waiting((), None),
+            places: Panel::waiting((), None),
+            counts: Panel::waiting((), None),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Agents {
     pub list: Vec<Agent>,
@@ -603,6 +669,11 @@ pub struct Agents {
     pub machines: Option<u32>,
     pub workspaces: Option<u32>,
     pub projects: Option<u32>,
+    /// One row per workspace the listed agents belong to.
+    pub workspace_list: Vec<Workspace>,
+    /// One row per machine holding any of the listed agents.
+    pub machine_list: Vec<Machine>,
+    pub sources: AgentSources,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -836,6 +907,12 @@ pub struct Serves {
     /// `r` on Usage: refresh now. The quota module offers no refresh
     /// operation the app could call.
     pub usage_refresh: bool,
+    /// `⏎` on Agents: an agent's detail. The design draws the key but no
+    /// layout for it.
+    pub agent_detail: bool,
+    /// `p` on Agents: the projects view. The design draws the key but no
+    /// layout for it.
+    pub agent_projects: bool,
 }
 
 impl Serves {
@@ -855,15 +932,23 @@ impl Serves {
         all_metrics: false,
         usage_detail: true,
         usage_refresh: true,
+        agent_detail: true,
+        agent_projects: true,
     };
 
-    /// What the live app does today: Home, Modules, Activity and Usage, with
-    /// Activity's `/` filter.
+    /// What the live app does today: Home, Modules, Activity, Usage and
+    /// Agents, with the `/` filter on Activity and Agents.
     pub const LIVE: Serves = Serves {
-        tabs: TabSet::of(&[Tab::Home, Tab::Modules, Tab::Activity, Tab::Usage]),
+        tabs: TabSet::of(&[
+            Tab::Home,
+            Tab::Modules,
+            Tab::Activity,
+            Tab::Usage,
+            Tab::Agents,
+        ]),
         settings: false,
         swap: false,
-        list_filter: TabSet::of(&[Tab::Activity]),
+        list_filter: TabSet::of(&[Tab::Activity, Tab::Agents]),
         multi_select: false,
         double_click: false,
         ckni: false,
@@ -871,6 +956,8 @@ impl Serves {
         all_metrics: true,
         usage_detail: false,
         usage_refresh: false,
+        agent_detail: false,
+        agent_projects: false,
     };
 }
 
@@ -1248,27 +1335,64 @@ mod fixture {
             .collect();
 
         let doing = &v["doing"];
+        let list: Vec<Agent> = arr(&v["agents"])
+            .iter()
+            .map(|a| {
+                let name = s(&a[0]);
+                Agent {
+                    project: s(&a[1]),
+                    state: s(&a[2]),
+                    machine: s(&a[3]),
+                    doing: match doing[name.as_str()].as_str() {
+                        Some("—") => None,
+                        Some(d) => Some(d.to_string()),
+                        // The design draws an agent its doing table leaves
+                        // out with a plain "—" as text, not the quiet
+                        // mark for doing nothing.
+                        None => Some("—".to_string()),
+                    },
+                    name,
+                    role: None,
+                    pending_asks: None,
+                }
+            })
+            .collect();
+        // The machines the listed agents live on, most agents first, each
+        // drawn online as the design shows them.
+        let mut machine_list: Vec<Machine> = Vec::new();
+        for a in &list {
+            match machine_list.iter_mut().find(|m| m.name == a.machine) {
+                Some(m) => m.agents += 1,
+                None => machine_list.push(Machine {
+                    name: a.machine.clone(),
+                    agents: 1,
+                    online: Some(true),
+                }),
+            }
+        }
+        machine_list.sort_by(|a, b| b.agents.cmp(&a.agents).then(a.name.cmp(&b.name)));
         let agents = Agents {
-            list: arr(&v["agents"])
-                .iter()
-                .map(|a| {
-                    let name = s(&a[0]);
-                    Agent {
-                        project: s(&a[1]),
-                        state: s(&a[2]),
-                        machine: s(&a[3]),
-                        doing: doing[name.as_str()]
-                            .as_str()
-                            .filter(|d| *d != "—")
-                            .map(str::to_string),
-                        name,
-                    }
-                })
-                .collect(),
+            list,
             working: 5,
             machines: Some(2),
             workspaces: Some(2),
             projects: Some(35),
+            // The design's workspace rows, which the fixture file doesn't
+            // carry: they count the whole fleet, not only the agents listed.
+            workspace_list: vec![
+                Workspace {
+                    name: "CortexKit".into(),
+                    agents: 29,
+                    projects: Some(31),
+                },
+                Workspace {
+                    name: "Scratch".into(),
+                    agents: 3,
+                    projects: Some(4),
+                },
+            ],
+            machine_list,
+            sources: AgentSources::read_at(now),
         };
 
         let devices = Devices {

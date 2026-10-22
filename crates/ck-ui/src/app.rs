@@ -17,6 +17,7 @@ use tokio::sync::watch;
 use crate::draw::{tab_spans, Canvas};
 use crate::model::{ActionKind, Daemon, LogView, Module, PaletteCommand, Panel, Snapshot, Status};
 use crate::screens::activity::ActivityState;
+use crate::screens::agents::AgentsState;
 use crate::screens::logs::{self, LevelFilter, LogState};
 use crate::screens::usage::{Focus, UsageState};
 use crate::screens::{self, overlays, View, MIN_H, MIN_W};
@@ -110,6 +111,8 @@ pub struct App {
     pub activity: ActivityState,
     /// The Usage screen's selected provider, account and windows.
     pub usage: UsageState,
+    /// The Agents screen's selection and filter.
+    pub agents: AgentsState,
     /// Whether account identifiers are hidden, on Usage and in Home's usage
     /// panel alike: each account's email, id and organization, wherever the
     /// app shows them, read as that account's pseudonym. `x` on Usage
@@ -140,6 +143,7 @@ impl App {
             field: None,
             activity: ActivityState::default(),
             usage: UsageState::default(),
+            agents: AgentsState::default(),
             redact: false,
             requests: Vec::new(),
         }
@@ -271,7 +275,9 @@ impl App {
                 screens::activity::draw(&mut c, &v, &self.activity, self.field.is_some())
             }
             (Tab::Usage, ..) => screens::usage::draw(&mut c, &v, &self.usage),
-            (Tab::Agents, ..) => screens::agents::draw(&mut c, &v),
+            (Tab::Agents, ..) => {
+                screens::agents::draw(&mut c, &v, &self.agents, self.field.is_some())
+            }
             (Tab::Devices, ..) => screens::devices::draw(&mut c, &v),
             (Tab::Settings, ..) => screens::settings::draw(&mut c, &v),
         }
@@ -341,14 +347,18 @@ impl App {
             return self.confirm_key(key);
         }
         if let Some(handled) = self.field_key(key) {
-            // Activity's list follows its filter as it is typed; esc closes
-            // the field and clears the filter with it.
+            // Activity's and Agents' lists follow their filter as it is
+            // typed; esc closes the field and clears the filter with it.
+            let typed = self
+                .field
+                .as_ref()
+                .map(|f| f.text.clone())
+                .unwrap_or_default();
             if self.tab == Tab::Activity {
-                self.activity.filter = self
-                    .field
-                    .as_ref()
-                    .map(|f| f.text.clone())
-                    .unwrap_or_default();
+                self.activity.filter = typed;
+            } else if self.tab == Tab::Agents && self.agents.filter != typed {
+                self.agents.filter = typed;
+                self.agents.sel = None;
             }
             return handled;
         }
@@ -378,6 +388,11 @@ impl App {
         }
         if self.overlay.is_none() && self.tab == Tab::Usage {
             if let Some(handled) = self.usage_key(key, snap) {
+                return handled;
+            }
+        }
+        if self.overlay.is_none() && self.tab == Tab::Agents {
+            if let Some(handled) = self.agents_key(key, snap) {
                 return handled;
             }
         }
@@ -849,6 +864,45 @@ impl App {
         next != current
     }
 
+    /// Keys for the Agents screen ahead of the app-wide ones. `None` lets
+    /// the key fall through to them (tabs, palette, help, quit, moving).
+    /// An agent's detail and the projects view have no screen, so `⏎`
+    /// opens nothing (it only ends typing in the filter field) and `p` is
+    /// not handled.
+    fn agents_key(&mut self, key: KeyEvent, snap: &Snapshot) -> Option<bool> {
+        match key.code {
+            // ⏎ in the filter field ends typing and keeps the filter.
+            KeyCode::Enter if self.field.is_some() => self.field = None,
+            KeyCode::Char('/') if snap.serves.list_filter.contains(Tab::Agents) => {
+                self.field = Some(TextField {
+                    text: self.agents.filter.clone(),
+                });
+            }
+            KeyCode::Esc if !self.agents.filter.is_empty() && self.overlay.is_none() => {
+                self.agents.filter.clear();
+                self.agents.sel = None;
+            }
+            _ => return None,
+        }
+        Some(true)
+    }
+
+    /// Moves the Agents selection by `delta` rows among the agents shown.
+    /// The first move from no selection selects the first row.
+    fn move_agents(&mut self, delta: i32, snap: &Snapshot) -> bool {
+        let len = screens::agents::shown(snap, &self.agents).len();
+        if len == 0 {
+            return false;
+        }
+        let current = self.agents.sel.map_or(-1, |i| i.min(len - 1) as i64);
+        let next = (current + i64::from(delta)).clamp(0, len as i64 - 1) as usize;
+        if self.agents.sel == Some(next) {
+            return false;
+        }
+        self.agents.sel = Some(next);
+        true
+    }
+
     fn palette_key(&mut self, key: KeyEvent, snap: &Snapshot) -> bool {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
@@ -939,6 +993,7 @@ impl App {
             Tab::Modules => (&mut self.mod_sel, snap.modules.data.len()),
             Tab::Activity => return self.move_activity(delta, snap),
             Tab::Usage => return self.move_usage(delta, snap),
+            Tab::Agents => return self.move_agents(delta, snap),
             // The other tabs' screens keep no selection here yet.
             _ => return false,
         };

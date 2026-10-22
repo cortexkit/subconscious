@@ -19,7 +19,7 @@
 use std::future::Future;
 use std::time::Duration;
 
-use serde_json::{json, Value};
+use serde_json::Value;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
@@ -373,11 +373,19 @@ pub const POLLED: [Polled; 5] = [
 ];
 
 /// Starts one [`gated_poll`] task per [`POLLED`] source. Each reading sends
-/// `call(module, method, params)` and hands the reply to `apply`.
-pub fn module_sources<C, CFut, A>(gate: &Gate, call: C, apply: A) -> Vec<JoinHandle<()>>
+/// `call(module, method, params(source))` and hands the reply to `apply`;
+/// `params` is asked afresh for every reading, so a poll can carry the
+/// token the previous reply gave.
+pub fn module_sources<C, CFut, P, A>(
+    gate: &Gate,
+    call: C,
+    params: P,
+    apply: A,
+) -> Vec<JoinHandle<()>>
 where
     C: Fn(&'static str, &'static str, Value) -> CFut + Clone + Send + 'static,
     CFut: Future<Output = Result<Value, crate::model::Fault>> + Send,
+    P: Fn(Source) -> Value + Clone + Send + 'static,
     A: Fn(Source, Result<Value, crate::model::Fault>) + Clone + Send + 'static,
 {
     POLLED
@@ -385,13 +393,14 @@ where
         .map(|p| {
             let p = *p;
             let call = call.clone();
+            let params = params.clone();
             let apply = apply.clone();
             gated_poll(
                 gate,
                 p.source,
                 Duration::from_secs_f64(p.every),
                 move || {
-                    let reply = call(p.module, p.method, json!({}));
+                    let reply = call(p.module, p.method, params(p.source));
                     let apply = apply.clone();
                     async move {
                         let reply = reply.await;
@@ -408,6 +417,8 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
+    use serde_json::json;
+
     use super::*;
     use crate::live::{assemble, State};
     use crate::model::{Fault, Freshness};
@@ -417,14 +428,21 @@ mod tests {
     /// the run began.
     type Sent = Arc<Mutex<Vec<(&'static str, f64)>>>;
 
+    /// How a scripted run answers a module request: by method and params.
+    type Answer = fn(&'static str, &Value) -> Result<Value, Fault>;
+
     /// A scripted live layer on tokio's paused clock: the module sources
-    /// [`module_sources`] starts, answering `callosum.devices_read` with a
-    /// device list after `reply_after` and refusing everything else, with
-    /// every reply recorded into one [`State`] at the scripted time.
+    /// [`module_sources`] starts, each request answered after `reply_after`
+    /// by an [`Answer`] (by default a device list for
+    /// `callosum.devices_read` and a refusal for everything else), with the
+    /// params each poll takes from the [`State`] and every reply recorded
+    /// into that state at the scripted time.
     struct Scripted {
         demand: watch::Sender<Sources>,
         gate: Gate,
         sent: Sent,
+        /// The params each request carried, by method, in order.
+        params: Arc<Mutex<Vec<(&'static str, Value)>>>,
         state: Arc<Mutex<State>>,
         began: tokio::time::Instant,
         tasks: Vec<JoinHandle<()>>,
@@ -445,28 +463,43 @@ mod tests {
         })
     }
 
+    fn devices_only(method: &'static str, _params: &Value) -> Result<Value, Fault> {
+        if method == "callosum.devices_read" {
+            Ok(devices_reply())
+        } else {
+            Err(Fault::code("not_scripted"))
+        }
+    }
+
     impl Scripted {
         fn start(showing: Showing, reply_after: Duration) -> Scripted {
+            Scripted::answering(showing, reply_after, devices_only)
+        }
+
+        fn answering(showing: Showing, reply_after: Duration, answer: Answer) -> Scripted {
             let demand = watch::Sender::new(wanted(&showing));
             let gate = Gate::new(demand.subscribe());
             let sent: Sent = Arc::default();
+            let params_sent: Arc<Mutex<Vec<(&'static str, Value)>>> = Arc::default();
             let state = Arc::new(Mutex::new(State::empty("This Mac")));
             let began = tokio::time::Instant::now();
             let call = {
                 let sent = Arc::clone(&sent);
-                move |_module: &'static str, method: &'static str, _params: Value| {
+                let params_sent = Arc::clone(&params_sent);
+                move |_module: &'static str, method: &'static str, params: Value| {
                     sent.lock()
                         .unwrap()
                         .push((method, began.elapsed().as_secs_f64()));
+                    params_sent.lock().unwrap().push((method, params.clone()));
                     async move {
                         tokio::time::sleep(reply_after).await;
-                        if method == "callosum.devices_read" {
-                            Ok(devices_reply())
-                        } else {
-                            Err(Fault::code("not_scripted"))
-                        }
+                        answer(method, &params)
                     }
                 }
+            };
+            let params = {
+                let state = Arc::clone(&state);
+                move |source: Source| state.lock().unwrap().poll_params(source)
             };
             let apply = {
                 let state = Arc::clone(&state);
@@ -475,11 +508,12 @@ mod tests {
                     state.lock().unwrap().record_module_reply(source, reply, at);
                 }
             };
-            let tasks = module_sources(&gate, call, apply);
+            let tasks = module_sources(&gate, call, params, apply);
             Scripted {
                 demand,
                 gate,
                 sent,
+                params: params_sent,
                 state,
                 began,
                 tasks,
@@ -676,6 +710,151 @@ mod tests {
         run.show(Showing::tab(Tab::Home));
         run_for(31.0).await;
         assert_eq!(usage_reads(), [0.0, 30.0, 60.0, 565.0, 595.0]);
+    }
+
+    /// Answers the fleet polls the way entorhinal and prefrontal-core do: a
+    /// poll without a token gets every row and a token; a poll carrying the
+    /// token gets `unchanged: true` and no rows. `enumerate` gets the
+    /// fleet's counts.
+    fn fleet_unchanged(method: &'static str, params: &Value) -> Result<Value, Fault> {
+        let tokened = params.get("token").is_some();
+        match method {
+            "agent.fleet_identity" if tokened => Ok(json!({ "result": {
+                "agents": [], "token": "t1", "generation": 1, "incarnation": "i",
+                "logPosition": 4, "unchanged": true
+            }})),
+            "agent.fleet_identity" => Ok(json!({ "result": {
+                "agents": [
+                    { "agentId": "a1", "displayName": "ARGUS", "role": "builder", "tag": "",
+                      "labels": [], "project": { "id": "p1", "name": "web-app" },
+                      "workspace": { "id": "w1", "name": "Main" } },
+                    { "agentId": "a2", "displayName": "IRIS", "role": "reviewer", "tag": "",
+                      "labels": [], "project": { "id": "p2", "name": "api-server" },
+                      "workspace": { "id": "w1", "name": "Main" } }
+                ],
+                "token": "t1", "generation": 1, "incarnation": "i", "logPosition": 4,
+                "unchanged": false
+            }})),
+            "agent.fleet_residence" if tokened => {
+                Ok(json!({ "token": "r1", "unchanged": true, "agents": [] }))
+            }
+            "agent.fleet_residence" => Ok(json!({
+                "token": "r1", "unchanged": false,
+                "agents": [
+                    { "agentId": "a1", "residence": null, "activity": "busy",
+                      "board": { "statusText": "Checkout page" }, "pendingAskCount": 1 },
+                    { "agentId": "a2", "residence": null, "activity": "idle",
+                      "activityAtMs": BASE_MS - 160_000 }
+                ]
+            })),
+            "enumerate" => Ok(json!({ "result": {
+                "workspaces": 1, "projects": 2, "generation": 1, "incarnation": "i"
+            }})),
+            _ => Err(Fault::code("not_scripted")),
+        }
+    }
+
+    /// Whether drawing the Agents screen of `snap` at `now` dims any cell.
+    fn agents_dimmed(snap: &crate::model::Snapshot, now: Timestamp) -> bool {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        use ratatui::style::Modifier;
+        let mut buf = Buffer::empty(Rect::new(0, 0, 120, 36));
+        let mut c = crate::draw::Canvas::new(&mut buf, crate::theme::Theme::test());
+        let v = crate::screens::View {
+            snap,
+            now,
+            tick: 0,
+            home_sel: 0,
+            mod_sel: 0,
+            redact: false,
+        };
+        crate::screens::agents::draw(&mut c, &v, &Default::default(), false);
+        buf.content()
+            .iter()
+            .any(|cell| cell.modifier.contains(Modifier::DIM))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn with_every_poll_answering_unchanged_no_agents_column_is_dimmed_after_75_s() {
+        let run = Scripted::answering(Showing::tab(Tab::Agents), Duration::ZERO, fleet_unchanged);
+        // Where agents live is read once, at the start; it ages against a
+        // minute, so it stays fresh throughout.
+        {
+            let mut st = run.state.lock().unwrap();
+            let places = [("a1", "This Mac"), ("a2", "Mac 2")]
+                .map(|(id, m)| (id.to_string(), m.to_string()));
+            st.places
+                .set(places.into_iter().collect(), clock(run.began));
+        }
+        run_for(80.0).await;
+
+        // Identity and state are polled every 15 s, each poll after the
+        // first carrying the token the first reply gave.
+        let polls = |method: &str| -> Vec<Value> {
+            run.params
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(m, _)| *m == method)
+                .map(|(_, p)| p.clone())
+                .collect()
+        };
+        let reads = |method: &str| -> Vec<f64> {
+            run.sent
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(m, _)| *m == method)
+                .map(|(_, t)| *t)
+                .collect()
+        };
+        for (method, token) in [
+            ("agent.fleet_identity", "t1"),
+            ("agent.fleet_residence", "r1"),
+        ] {
+            assert_eq!(
+                reads(method),
+                [0.0, 15.0, 30.0, 45.0, 60.0, 75.0],
+                "{method}"
+            );
+            let sent = polls(method);
+            assert_eq!(sent[0], json!({}), "{method}");
+            assert!(
+                sent[1..].iter().all(|p| *p == json!({ "token": token })),
+                "{method}: {sent:?}"
+            );
+        }
+
+        // Every unchanged reply kept the rows and started their age again,
+        // so 80 s in, five seconds after the last reply, nothing is dimmed.
+        let now = run.now();
+        let snap = assemble(&run.state.lock().unwrap(), now);
+        let rows: Vec<(&str, &str)> = snap
+            .agents
+            .data
+            .list
+            .iter()
+            .map(|a| (a.name.as_str(), a.state.as_str()))
+            .collect();
+        assert_eq!(rows, [("ARGUS", "working"), ("IRIS", "idle 4m")]);
+        let s = &snap.agents.data.sources;
+        for (name, p) in [
+            ("identity", &s.identity),
+            ("state", &s.state),
+            ("places", &s.places),
+            ("counts", &s.counts),
+        ] {
+            assert!(p.loaded, "{name}");
+            assert_eq!(p.freshness(now), Freshness::Fresh, "{name}");
+        }
+        assert!(!agents_dimmed(&snap, now), "a column is dimmed");
+
+        // The same rows read only once, 80 s ago, would be dimmed: the check
+        // above can fail.
+        let mut old = run.state.lock().unwrap().clone();
+        old.identities.at = clock(run.began).add_millis(-80_000);
+        assert!(agents_dimmed(&assemble(&old, now), now));
     }
 
     #[test]

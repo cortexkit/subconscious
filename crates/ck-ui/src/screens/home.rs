@@ -346,7 +346,7 @@ fn live(c: &mut Canvas, v: &View, x: i32, y: i32, w: i32) {
     c.put(x + w - 2, y, g, st);
 }
 
-fn agent_glyph(a: &Agent) -> (&'static str, St) {
+pub(crate) fn agent_glyph(a: &Agent) -> (&'static str, St) {
     if a.working() {
         ("●", St::A)
     } else if !a.state_known() {

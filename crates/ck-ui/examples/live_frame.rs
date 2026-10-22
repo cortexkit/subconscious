@@ -1,5 +1,5 @@
-//! Prints the live app's Home, Modules and Usage screens as plain text, for
-//! checking them against the real fleet without a terminal:
+//! Prints the live app's Home, Modules, Usage and Agents screens as plain
+//! text, for checking them against the real fleet without a terminal:
 //!
 //! ```text
 //! cargo run -p ck-ui --example live_frame -- 160x48
@@ -10,7 +10,7 @@
 //!
 //! It connects with the same discovery `ck` uses and waits until every panel
 //! has reported data or an error (or the daemon is down) and, if there are
-//! modules, one has a CPU reading, or ten seconds pass. Then it prints both
+//! modules, one has a CPU reading, or ten seconds pass. Then it prints the
 //! screens. `--raw` first prints the latest reply (as JSON, or as debug text
 //! for replies with no JSON form) or error ck recorded for each daemon and
 //! module request. `--redact` hides account identifiers the way `x` does on
@@ -113,6 +113,24 @@ async fn main() {
     };
     let _ = tokio::time::timeout(Duration::from_secs(10), ready).await;
 
+    // Where agents live is read once identity rows are in; give it a moment
+    // so the Agents screen shows machines rather than "unknown".
+    let _ = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            {
+                let snap = rx.borrow_and_update();
+                let places = &snap.agents.data.sources.places;
+                if places.loaded || places.error.is_some() || snap.agents.error.is_some() {
+                    return;
+                }
+            }
+            if rx.changed().await.is_err() {
+                return;
+            }
+        }
+    })
+    .await;
+
     // The Modules pane shows the selected module's log; ask for the first
     // module's and give it a moment to arrive.
     let first = rx.borrow().modules.data.first().map(|m| m.id.clone());
@@ -153,6 +171,7 @@ async fn main() {
         (Tab::Home, "Home"),
         (Tab::Modules, "Modules"),
         (Tab::Usage, "Usage"),
+        (Tab::Agents, "Agents"),
     ] {
         app.tab = tab;
         let mut buf = Buffer::empty(Rect::new(0, 0, size.0, size.1));

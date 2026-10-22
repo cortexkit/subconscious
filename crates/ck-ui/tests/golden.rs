@@ -209,3 +209,11 @@ fn usage_120x36() {
     snap.usage.received_at = Snapshot::fixture_now().add_millis(-4_000);
     check("usage-120x36", &app, &snap);
 }
+
+/// The Agents frame: nothing selected, so no row is highlighted.
+#[test]
+fn agents_120x36() {
+    let mut app = app();
+    app.tab = Tab::Agents;
+    check("agents-120x36", &app, &Snapshot::fixture());
+}

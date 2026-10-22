@@ -29,10 +29,10 @@ use tokio::sync::{mpsc, watch};
 
 use crate::app::Request;
 use crate::model::{
-    ActionKind, ActionPhase, ActionResult, ActivityEntry, Agents, Approvals, Backups, BuildServer,
-    Daemon, DaemonDown, DaemonRunning, Devices, Fault, FaultKind, Host, LogLine, LogView, Module,
-    ModuleAction, PaletteCommand, Panel, ProcessEvent, ProcessEventKind, Provider, Snapshot,
-    Status, Usage,
+    ActionKind, ActionPhase, ActionResult, ActivityEntry, AgentSources, Agents, Approvals, Backups,
+    BuildServer, Daemon, DaemonDown, DaemonRunning, Devices, Fault, FaultKind, Host, LogLine,
+    LogView, Module, ModuleAction, PaletteCommand, Panel, ProcessEvent, ProcessEventKind, Provider,
+    Snapshot, Status, Usage,
 };
 use crate::time::{Timestamp, UtcOffset};
 
@@ -354,6 +354,11 @@ pub struct State {
     pub devices: Part<Devices>,
     pub identities: Part<Vec<AgentIdentity>>,
     pub residences: Part<HashMap<String, AgentResidence>>,
+    /// The token the last full `agent.fleet_identity` reply gave, sent with
+    /// the next poll so an unchanged fleet answers without its rows.
+    pub identity_token: Option<serde_json::Value>,
+    /// The same for `agent.fleet_residence`.
+    pub residence_token: Option<serde_json::Value>,
     pub places: Part<HashMap<String, String>>,
     pub counts: Part<(Option<u32>, Option<u32>)>,
     /// When the activity ledger was last heard from (a page, an entry, or
@@ -409,6 +414,8 @@ impl State {
             devices: Part::default(),
             identities: Part::default(),
             residences: Part::default(),
+            identity_token: None,
+            residence_token: None,
             places: Part::default(),
             counts: Part::default(),
             activity: Part::default(),
@@ -492,6 +499,21 @@ impl State {
             .collect()
     }
 
+    /// The params for the next poll of a module source in
+    /// [`schedule::POLLED`]: the fleet polls carry the last token their
+    /// source gave; every other source takes none.
+    pub fn poll_params(&self, source: Source) -> serde_json::Value {
+        let token = match source {
+            Source::Identity => self.identity_token.as_ref(),
+            Source::Residence => self.residence_token.as_ref(),
+            _ => None,
+        };
+        match token {
+            Some(t) => serde_json::json!({ "token": t }),
+            None => serde_json::json!({}),
+        }
+    }
+
     /// Records a reply (or failure) from one of the module sources in
     /// [`schedule::POLLED`], read at `at`. Returns whether it was a good
     /// reading. A failure keeps the source's last good reading.
@@ -513,6 +535,49 @@ impl State {
                 }
             }
         }
+        // A fleet poll sent with a token is answered `unchanged: true`, with
+        // no rows, while nothing changed: the rows on hand are then current
+        // as of this reply, so they stay and their age starts again. A full
+        // reply replaces them and gives the token for the next poll.
+        fn fleet<T>(
+            part: &mut Part<T>,
+            token: &mut Option<serde_json::Value>,
+            reply: Result<serde_json::Value, Fault>,
+            rows: impl FnOnce(&serde_json::Value) -> Result<T, Fault>,
+            at: Timestamp,
+        ) -> bool {
+            let reply = match reply {
+                Ok(v) => v,
+                Err(e) => {
+                    part.fail(e);
+                    return false;
+                }
+            };
+            if let Some(e) = map::reply_error(&reply) {
+                part.fail(e);
+                return false;
+            }
+            let (unchanged, next) = map::fleet_change(&reply);
+            if !unchanged {
+                let good = put(part, rows(&reply), at);
+                if good {
+                    *token = next;
+                }
+                return good;
+            }
+            if part.value.is_none() {
+                // Nothing to keep: forget the token, so the next poll asks
+                // for every row.
+                *token = None;
+                return false;
+            }
+            part.at = at;
+            part.error = None;
+            if next.is_some() {
+                *token = next;
+            }
+            true
+        }
         match source {
             Source::Usage => put(&mut self.usage, reply.and_then(|v| map::usage(&v, at)), at),
             Source::Devices => put(
@@ -520,14 +585,18 @@ impl State {
                 reply.and_then(|v| map::devices(&v, at)),
                 at,
             ),
-            Source::Identity => put(
+            Source::Identity => fleet(
                 &mut self.identities,
-                reply.and_then(|v| map::agent_identities(&v)),
+                &mut self.identity_token,
+                reply,
+                map::agent_identities,
                 at,
             ),
-            Source::Residence => put(
+            Source::Residence => fleet(
                 &mut self.residences,
-                reply.and_then(|v| map::agent_residences(&v)),
+                &mut self.residence_token,
+                reply,
+                map::agent_residences,
                 at,
             ),
             Source::Counts => put(
@@ -748,8 +817,19 @@ pub fn assemble(state: &State, now: Timestamp) -> Snapshot {
             machines: None,
             workspaces: None,
             projects: None,
+            workspace_list: Vec::new(),
+            machine_list: Vec::new(),
+            sources: AgentSources::default(),
         },
     );
+    // Each column of the Agents screen ages and dims by the source it comes
+    // from.
+    agents.data.sources = AgentSources {
+        identity: state.identities.panel(Some(every::AGENTS), |_| (), ()),
+        state: state.residences.panel(Some(every::AGENTS), |_| (), ()),
+        places: state.places.panel(Some(every::PLACES), |_| (), ()),
+        counts: state.counts.panel(Some(every::COUNTS), |_| (), ()),
+    };
     // Without state the agents still list, each "unknown"; the refusal (or
     // failure) shows in the panel's heading.
     if agents.error.is_none() {

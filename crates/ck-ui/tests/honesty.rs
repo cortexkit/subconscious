@@ -587,11 +587,20 @@ fn the_live_app_advertises_only_what_it_serves() {
     s.commands = ck_ui::live::palette_commands(&s.modules.data);
     // The fixture's roster has every module a tab needs, so what shows is
     // exactly what the live app serves.
-    let served = TabSet::of(&[Tab::Home, Tab::Modules, Tab::Activity, Tab::Usage]);
+    let served = TabSet::of(&[
+        Tab::Home,
+        Tab::Modules,
+        Tab::Activity,
+        Tab::Usage,
+        Tab::Agents,
+    ]);
     assert_eq!(s.serves.tabs, served);
     assert_eq!(s.visible_tabs(), served);
-    // Activity's filter is the only one served.
-    assert_eq!(s.serves.list_filter, TabSet::of(&[Tab::Activity]));
+    // Activity's and Agents' filters are the only ones served.
+    assert_eq!(
+        s.serves.list_filter,
+        TabSet::of(&[Tab::Activity, Tab::Agents])
+    );
 
     // The keys page lists the live app's keys, each of them handled below.
     let listed: Vec<String> = help_columns(s.serves, s.visible_tabs())
@@ -601,7 +610,7 @@ fn the_live_app_advertises_only_what_it_serves() {
     assert_eq!(
         listed,
         [
-            "1 – 4",
+            "1 – 5",
             ":",
             "?",
             "esc",
@@ -627,7 +636,7 @@ fn the_live_app_advertises_only_what_it_serves() {
         "space",
         "double-click",
         "ckni",
-        "5 Agents",
+        "6 Devices",
     ] {
         assert!(
             !page.contains(gone),
@@ -734,8 +743,46 @@ fn the_live_app_advertises_only_what_it_serves() {
     }
     let screen: String = (0..36).map(|y| row(&buf, y) + "\n").collect();
     assert!(!screen.contains("catalog"), "{screen}");
+    // On Agents: ↑↓ move through the list, `/` opens the filter, typing
+    // narrows it, ⏎ keeps it and esc clears it. An agent's detail (⏎) and
+    // the projects view (`p`) have no screen: those keys do nothing, and no
+    // hint offers them.
+    let mut app = App::new(Theme::test());
+    assert!(served(&mut app, KeyCode::Char('5')));
+    assert_eq!(app.tab, Tab::Agents);
+    assert!(served(&mut app, KeyCode::Down) && served(&mut app, KeyCode::Down));
+    assert!(served(&mut app, KeyCode::Up));
+    assert_eq!(app.agents.sel, Some(0));
+    let before = (app.tab, app.agents.clone(), app.overlay);
+    for code in [KeyCode::Enter, KeyCode::Char('p')] {
+        assert!(!served(&mut app, code), "{code:?} acts on Agents");
+        assert!(app.requests.is_empty() && app.confirm.is_none(), "{code:?}");
+        assert_eq!(
+            (app.tab, app.agents.clone(), app.overlay),
+            before,
+            "{code:?} changed the screen"
+        );
+    }
+    assert!(served(&mut app, KeyCode::Char('/')));
+    assert!(served(&mut app, KeyCode::Char('n')));
+    assert_eq!(app.agents.filter, "n");
+    assert!(served(&mut app, KeyCode::Enter));
+    assert!(app.field.is_none() && app.agents.filter == "n");
+    assert!(served(&mut app, KeyCode::Esc));
+    assert!(app.agents.filter.is_empty());
+    let buf = render(&app, &s, 120, 36);
+    let footer = row(&buf, 35);
+    for shown in ["move", "/  filter", "from entorhinal"] {
+        assert!(footer.contains(shown), "{shown:?} missing: {footer}");
+    }
+    for gone in ["open agent", "projects", "⏎"] {
+        assert!(
+            !footer.contains(gone),
+            "the live footer offers {gone:?}: {footer}"
+        );
+    }
     // The number keys of tabs it doesn't serve do nothing.
-    for k in '5'..='7' {
+    for k in '6'..='7' {
         let mut app = App::new(Theme::test());
         assert!(!served(&mut app, KeyCode::Char(k)), "{k}");
         assert_eq!(app.tab, Tab::Home, "{k}");
@@ -749,7 +796,8 @@ fn the_live_app_advertises_only_what_it_serves() {
     assert!(!row(&buf, 35).contains("settings"));
     assert!(row(&buf, 0).contains("3 Activity"), "{}", row(&buf, 0));
     assert!(row(&buf, 0).contains("4 Usage"), "{}", row(&buf, 0));
-    assert!(!row(&buf, 0).contains("5 Agents"), "{}", row(&buf, 0));
+    assert!(row(&buf, 0).contains("5 Agents"), "{}", row(&buf, 0));
+    assert!(!row(&buf, 0).contains("6 Devices"), "{}", row(&buf, 0));
     assert!(row(&buf, 0).contains("2 Modules"));
     // Each tab's filter is served on its own: serving it on the other lists
     // never puts a filter hint on Modules.
@@ -765,7 +813,10 @@ fn the_live_app_advertises_only_what_it_serves() {
         .filter(|c| c.area == "App" && Tab::from_name(&c.title).is_some())
         .map(|c| c.title.as_str())
         .collect();
-    assert_eq!(tabs_offered, ["Home", "Modules", "Activity", "Usage"]);
+    assert_eq!(
+        tabs_offered,
+        ["Home", "Modules", "Activity", "Usage", "Agents"]
+    );
 
     // Every palette command runs: a restart request or the log view.
     for cmd in palette {
@@ -783,6 +834,7 @@ fn the_live_app_advertises_only_what_it_serves() {
             || app.tab == Tab::Modules
             || app.tab == Tab::Activity
             || app.tab == Tab::Usage
+            || app.tab == Tab::Agents
             || cmd.title == "Home";
         assert!(did, "{:?} did nothing", cmd.title);
     }

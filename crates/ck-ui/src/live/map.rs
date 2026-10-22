@@ -21,9 +21,9 @@ use subc_protocol::Principal;
 
 use crate::metrics::{all_rows, pane_rows};
 use crate::model::{
-    Account, ActivityEntry, ActivityKey, ActivityRow, ActivityRowKind, Agent, Agents, Backups,
-    BuildServer, Device, Devices, Fault, LogLevel, LogLine, Metric, ProcessEvent, ProcessEventKind,
-    Provider, Status, UsageWindow,
+    Account, ActivityEntry, ActivityKey, ActivityRow, ActivityRowKind, Agent, AgentSources, Agents,
+    Backups, BuildServer, Device, Devices, Fault, LogLevel, LogLine, Machine, Metric, ProcessEvent,
+    ProcessEventKind, Provider, Status, UsageWindow, Workspace,
 };
 use crate::quota;
 use crate::time::{ago, Timestamp, UtcOffset};
@@ -807,6 +807,20 @@ pub struct AgentIdentity {
     pub id: String,
     pub name: String,
     pub project: String,
+    pub role: Option<String>,
+    /// The name of the workspace the agent belongs to.
+    pub workspace: Option<String>,
+}
+
+/// Whether a reply to a fleet poll sent with a token says nothing changed
+/// since that token (`unchanged: true`, carrying no rows), and the token to
+/// send next time, if it gives one. Entorhinal wraps its reply in `result`;
+/// prefrontal-core doesn't.
+pub fn fleet_change(reply: &Value) -> (bool, Option<Value>) {
+    let body = unwrap_result(reply);
+    let unchanged = body.get("unchanged").and_then(Value::as_bool) == Some(true);
+    let token = body.get("token").filter(|t| !t.is_null()).cloned();
+    (unchanged, token)
 }
 
 /// The identities in an `agent.fleet_identity` reply.
@@ -829,13 +843,19 @@ pub fn agent_identities(reply: &Value) -> Result<Vec<AgentIdentity>, Fault> {
                 .filter(|s| !s.is_empty())
                 .unwrap_or(&id)
                 .to_string();
-            let project = a
-                .get("project")
-                .and_then(|p| p.get("name"))
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
-            Some(AgentIdentity { id, name, project })
+            let text = |v: Option<&Value>| {
+                v.and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+            };
+            let project = text(a.get("project").and_then(|p| p.get("name"))).unwrap_or_default();
+            Some(AgentIdentity {
+                id,
+                name,
+                project,
+                role: text(a.get("role")),
+                workspace: text(a.get("workspace").and_then(|w| w.get("name"))),
+            })
         })
         .collect())
 }
@@ -847,6 +867,7 @@ pub struct AgentResidence {
     pub activity: String,
     pub activity_at: Option<Timestamp>,
     pub doing: Option<String>,
+    pub pending_asks: Option<u32>,
 }
 
 pub fn agent_residences(reply: &Value) -> Result<HashMap<String, AgentResidence>, Fault> {
@@ -880,6 +901,10 @@ pub fn agent_residences(reply: &Value) -> Result<HashMap<String, AgentResidence>
                         .and_then(Value::as_str)
                         .filter(|s| !s.is_empty())
                         .map(str::to_string),
+                    pending_asks: a
+                        .get("pendingAskCount")
+                        .and_then(Value::as_u64)
+                        .map(|n| n.min(u64::from(u32::MAX)) as u32),
                 },
             ))
         })
@@ -947,6 +972,13 @@ pub fn fleet_counts(reply: &Value) -> Result<(Option<u32>, Option<u32>), Fault> 
 /// state and place. With no state for an agent (none read yet, a refused
 /// source, or an agent the reply leaves out), its state is "unknown",
 /// never idle.
+///
+/// The Workspaces rows count the listed agents by their identity's
+/// workspace name; the Machines rows count them by the machine that holds
+/// them, leaving out unclaimed agents and those whose place isn't known.
+/// Both list the most agents first. No source counts projects per workspace
+/// or says whether a machine is reachable, so those stay `None`. The
+/// returned [`Agents::sources`] are placeholders for the caller to fill.
 pub fn agents(
     identities: &[AgentIdentity],
     residences: Option<&HashMap<String, AgentResidence>>,
@@ -975,29 +1007,61 @@ pub fn agents(
                     .cloned()
                     .unwrap_or_else(|| "unknown".into()),
                 doing: r.and_then(|r| r.doing.clone()),
+                role: i.role.clone(),
+                pending_asks: r.and_then(|r| r.pending_asks),
             }
         })
         .collect();
     // Working agents first, then idle, then unknown; by name within each.
     list.sort_by_key(|a| (!a.working(), !a.state_known(), a.name.clone()));
     let working = list.iter().filter(|a| a.working()).count() as u32;
-    let machines = places.map(|p| {
-        let mut held: Vec<&String> = identities
-            .iter()
-            .filter_map(|i| p.get(&i.id))
-            .filter(|m| m.as_str() != "unclaimed")
-            .collect();
-        held.sort();
-        held.dedup();
-        held.len() as u32
-    });
+    let machine_list: Vec<Machine> = match places {
+        Some(_) => tally(
+            list.iter()
+                .map(|a| a.machine.as_str())
+                .filter(|m| !matches!(*m, "unclaimed" | "unknown")),
+        )
+        .into_iter()
+        .map(|(name, agents)| Machine {
+            name,
+            agents,
+            online: None,
+        })
+        .collect(),
+        None => Vec::new(),
+    };
+    let workspace_list = tally(identities.iter().filter_map(|i| i.workspace.as_deref()))
+        .into_iter()
+        .map(|(name, agents)| Workspace {
+            name,
+            agents,
+            projects: None,
+        })
+        .collect();
     Agents {
         list,
         working,
-        machines,
+        machines: places.map(|_| machine_list.len() as u32),
         workspaces: counts.0,
         projects: counts.1,
+        workspace_list,
+        machine_list,
+        sources: AgentSources::default(),
     }
+}
+
+/// How many times each name occurs, most first, then by name.
+fn tally<'a>(names: impl Iterator<Item = &'a str>) -> Vec<(String, u32)> {
+    let mut counts: HashMap<&str, u32> = HashMap::new();
+    for name in names {
+        *counts.entry(name).or_default() += 1;
+    }
+    let mut out: Vec<(String, u32)> = counts
+        .into_iter()
+        .map(|(name, n)| (name.to_string(), n))
+        .collect();
+    out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    out
 }
 
 // ---- activity ------------------------------------------------------------------

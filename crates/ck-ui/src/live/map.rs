@@ -767,7 +767,13 @@ pub fn devices(reply: &Value, now: Timestamp) -> Result<Devices, Fault> {
                     format!("{} ago", ago(age))
                 }
             })
-            .unwrap_or_else(|| "unknown".into());
+            .unwrap_or_else(|| {
+                if d.get("last_seen_unix_ms") == Some(&Value::Null) {
+                    "not since callosum started".into()
+                } else {
+                    "unknown".into()
+                }
+            });
         let feeds = match d.get("subscriptions_live").and_then(Value::as_u64) {
             Some(0) => "—".to_string(),
             Some(1) => "1 live feed".to_string(),
@@ -776,19 +782,31 @@ pub fn devices(reply: &Value, now: Timestamp) -> Result<Devices, Fault> {
         };
         out.push(Device {
             short_name: name.strip_prefix("CortexKit ").unwrap_or(&name).to_string(),
-            kind: d
-                .get("device_class")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown")
-                .to_string(),
+            kind: match d.get("device_class").and_then(Value::as_str) {
+                Some("mac") => "computer",
+                Some("sim") => "simulator",
+                Some("phone") => "phone",
+                _ => "unknown",
+            }
+            .to_string(),
             status: if online { Status::Ok } else { Status::Stopped },
-            path: d
-                .get("carrier")
-                .and_then(Value::as_str)
-                .unwrap_or(if online { "unknown" } else { "offline" })
-                .to_string(),
+            path: if online {
+                match d.get("carrier").and_then(Value::as_str) {
+                    Some("direct") => "direct",
+                    Some("relay") => "relay",
+                    _ => "unknown",
+                }
+            } else {
+                "—"
+            }
+            .to_string(),
             seen,
             feeds,
+            fingerprint: d
+                .get("fingerprint")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            trust: d.get("trust").and_then(Value::as_str).map(str::to_string),
             name,
         });
     }
@@ -796,7 +814,24 @@ pub fn devices(reply: &Value, now: Timestamp) -> Result<Devices, Fault> {
     // the online ones.
     out.sort_by_key(|d| d.status != Status::Ok);
     let online = out.iter().filter(|d| d.status == Status::Ok).count() as u32;
-    Ok(Devices { list: out, online })
+    let this = &body["self"];
+    let strings = |value: &Value| -> Option<Vec<String>> {
+        value
+            .as_array()?
+            .iter()
+            .map(|v| v.as_str().map(str::to_string))
+            .collect()
+    };
+    Ok(Devices {
+        list: out,
+        online,
+        lan_addrs: strings(&this["lan_addrs"]),
+        rendezvous: this
+            .get("rendezvous")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        watch_ops_offered: this.get("watch_ops_offered").and_then(Value::as_u64),
+    })
 }
 
 // ---- agents --------------------------------------------------------------------

@@ -593,6 +593,7 @@ fn the_live_app_advertises_only_what_it_serves() {
         Tab::Activity,
         Tab::Usage,
         Tab::Agents,
+        Tab::Devices,
     ]);
     assert_eq!(s.serves.tabs, served);
     assert_eq!(s.visible_tabs(), served);
@@ -610,7 +611,7 @@ fn the_live_app_advertises_only_what_it_serves() {
     assert_eq!(
         listed,
         [
-            "1 – 5",
+            "1 – 6",
             ":",
             "?",
             "esc",
@@ -636,7 +637,7 @@ fn the_live_app_advertises_only_what_it_serves() {
         "space",
         "double-click",
         "ckni",
-        "6 Devices",
+        "7 Settings",
     ] {
         assert!(
             !page.contains(gone),
@@ -781,12 +782,10 @@ fn the_live_app_advertises_only_what_it_serves() {
             "the live footer offers {gone:?}: {footer}"
         );
     }
-    // The number keys of tabs it doesn't serve do nothing.
-    for k in '6'..='7' {
-        let mut app = App::new(Theme::test());
-        assert!(!served(&mut app, KeyCode::Char(k)), "{k}");
-        assert_eq!(app.tab, Tab::Home, "{k}");
-    }
+    // Settings is not served; its number key does nothing.
+    let mut app = App::new(Theme::test());
+    assert!(!served(&mut app, KeyCode::Char('7')));
+    assert_eq!(app.tab, Tab::Home);
 
     // The Modules view shows no filter or settings hint, and only the
     // tabs that have screens.
@@ -797,7 +796,7 @@ fn the_live_app_advertises_only_what_it_serves() {
     assert!(row(&buf, 0).contains("3 Activity"), "{}", row(&buf, 0));
     assert!(row(&buf, 0).contains("4 Usage"), "{}", row(&buf, 0));
     assert!(row(&buf, 0).contains("5 Agents"), "{}", row(&buf, 0));
-    assert!(!row(&buf, 0).contains("6 Devices"), "{}", row(&buf, 0));
+    assert!(row(&buf, 0).contains("6 Devices"), "{}", row(&buf, 0));
     assert!(row(&buf, 0).contains("2 Modules"));
     // Each tab's filter is served on its own: serving it on the other lists
     // never puts a filter hint on Modules.
@@ -815,7 +814,7 @@ fn the_live_app_advertises_only_what_it_serves() {
         .collect();
     assert_eq!(
         tabs_offered,
-        ["Home", "Modules", "Activity", "Usage", "Agents"]
+        ["Home", "Modules", "Activity", "Usage", "Agents", "Devices"]
     );
 
     // Every palette command runs: a restart request or the log view.
@@ -835,6 +834,7 @@ fn the_live_app_advertises_only_what_it_serves() {
             || app.tab == Tab::Activity
             || app.tab == Tab::Usage
             || app.tab == Tab::Agents
+            || app.tab == Tab::Devices
             || cmd.title == "Home";
         assert!(did, "{:?} did nothing", cmd.title);
     }

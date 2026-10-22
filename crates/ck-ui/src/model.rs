@@ -686,12 +686,17 @@ pub struct Device {
     pub path: String,
     pub seen: String,
     pub feeds: String,
+    pub fingerprint: Option<String>,
+    pub trust: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Devices {
     pub list: Vec<Device>,
     pub online: u32,
+    pub lan_addrs: Option<Vec<String>>,
+    pub rendezvous: Option<String>,
+    pub watch_ops_offered: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -936,8 +941,8 @@ impl Serves {
         agent_projects: true,
     };
 
-    /// What the live app does today: Home, Modules, Activity, Usage and
-    /// Agents, with the `/` filter on Activity and Agents.
+    /// What the live app does today: Home, Modules, Activity, Usage, Agents
+    /// and Devices, with the `/` filter on Activity and Agents.
     pub const LIVE: Serves = Serves {
         tabs: TabSet::of(&[
             Tab::Home,
@@ -945,6 +950,7 @@ impl Serves {
             Tab::Activity,
             Tab::Usage,
             Tab::Agents,
+            Tab::Devices,
         ]),
         settings: false,
         swap: false,
@@ -1407,11 +1413,16 @@ mod fixture {
                         path: s(&d["path"]),
                         seen: s(&d["seen"]),
                         feeds: s(&d["feeds"]),
+                        fingerprint: None,
+                        trust: None,
                         name,
                     }
                 })
                 .collect(),
             online: 2,
+            lan_addrs: Some(vec!["192.168.1.20:7841".into()]),
+            rendezvous: Some("rdv.cortexkit.io".into()),
+            watch_ops_offered: Some(10),
         };
 
         let commands = arr(&v["commands"])

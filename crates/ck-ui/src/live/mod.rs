@@ -837,14 +837,9 @@ pub fn assemble(state: &State, now: Timestamp) -> Snapshot {
             agents.error = Some(format!("state {err}"));
         }
     }
-    let devices = state.devices.panel(
-        Some(every::DEVICES),
-        Devices::clone,
-        Devices {
-            list: Vec::new(),
-            online: 0,
-        },
-    );
+    let devices = state
+        .devices
+        .panel(Some(every::DEVICES), Devices::clone, Devices::default());
     let log_view = state.focus.as_ref().map(|id| {
         let mut p = state.log.panel(
             Some(every::LOG),

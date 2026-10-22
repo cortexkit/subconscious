@@ -300,7 +300,7 @@ fn devices_online_means_an_established_tunnel_and_refusals_keep_their_code() {
               "tunnel": "closed:revoked", "since_unix_ms": 0, "subscriptions_live": 0 }
         ],
         "self": { "listen_addr": "0.0.0.0:1", "lan_addrs": [], "rendezvous": null,
-                  "wan_reachability": "unknown", "wan_port_mapping": null, "watch_ops_offered": [] }
+                  "wan_reachability": "unknown", "wan_port_mapping": null, "watch_ops_offered": 0 }
     });
     let d = map::devices(&reply, now()).unwrap();
     assert_eq!(d.online, 1);
@@ -309,7 +309,7 @@ fn devices_online_means_an_established_tunnel_and_refusals_keep_their_code() {
     assert_eq!(d.list[0].status, Status::Ok);
     assert_eq!(d.list[0].seen, "now");
     assert_eq!(d.list[1].status, Status::Stopped);
-    assert_eq!(d.list[1].seen, "unknown");
+    assert_eq!(d.list[1].seen, "not since callosum started");
     assert_eq!(d.list[1].feeds, "3 live feeds");
     for code in [
         "fed_not_authorized",

@@ -139,6 +139,14 @@ fn modules_120x36() {
 }
 
 #[test]
+fn devices_120x36() {
+    let mut app = app();
+    app.tab = Tab::Devices;
+    app.devices.sel = Some(1);
+    check("devices-120x36", &app, &Snapshot::fixture());
+}
+
+#[test]
 fn modules_160x48() {
     let mut app = app();
     app.tab = Tab::Modules;

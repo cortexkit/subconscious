@@ -459,7 +459,7 @@ mod tests {
             ],
             "self": { "listen_addr": "0.0.0.0:1", "lan_addrs": [], "rendezvous": null,
                       "wan_reachability": "unknown", "wan_port_mapping": null,
-                      "watch_ops_offered": [] }
+                      "watch_ops_offered": 0 }
         })
     }
 
@@ -580,6 +580,13 @@ mod tests {
 
     async fn run_for(secs: f64) {
         tokio::time::sleep(Duration::from_secs_f64(secs)).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn devices_are_read_every_15_s_while_devices_shows() {
+        let run = Scripted::start(Showing::tab(Tab::Devices), Duration::ZERO);
+        run_for(46.0).await;
+        assert_eq!(run.devices_reads(), [0.0, 15.0, 30.0, 45.0]);
     }
 
     #[tokio::test(start_paused = true)]

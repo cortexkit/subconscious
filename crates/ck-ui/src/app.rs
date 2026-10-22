@@ -18,6 +18,7 @@ use crate::draw::{tab_spans, Canvas};
 use crate::model::{ActionKind, Daemon, LogView, Module, PaletteCommand, Panel, Snapshot, Status};
 use crate::screens::activity::ActivityState;
 use crate::screens::agents::AgentsState;
+use crate::screens::devices::DevicesState;
 use crate::screens::logs::{self, LevelFilter, LogState};
 use crate::screens::usage::{Focus, UsageState};
 use crate::screens::{self, overlays, View, MIN_H, MIN_W};
@@ -113,6 +114,8 @@ pub struct App {
     pub usage: UsageState,
     /// The Agents screen's selection and filter.
     pub agents: AgentsState,
+    /// The Devices screen's selected row.
+    pub devices: DevicesState,
     /// Whether account identifiers are hidden, on Usage and in Home's usage
     /// panel alike: each account's email, id and organization, wherever the
     /// app shows them, read as that account's pseudonym. `x` on Usage
@@ -144,6 +147,7 @@ impl App {
             activity: ActivityState::default(),
             usage: UsageState::default(),
             agents: AgentsState::default(),
+            devices: DevicesState::default(),
             redact: false,
             requests: Vec::new(),
         }
@@ -278,7 +282,7 @@ impl App {
             (Tab::Agents, ..) => {
                 screens::agents::draw(&mut c, &v, &self.agents, self.field.is_some())
             }
-            (Tab::Devices, ..) => screens::devices::draw(&mut c, &v),
+            (Tab::Devices, ..) => screens::devices::draw(&mut c, &v, &self.devices),
             (Tab::Settings, ..) => screens::settings::draw(&mut c, &v),
         }
         screens::result_toast(&mut c, &v);
@@ -994,6 +998,17 @@ impl App {
             Tab::Activity => return self.move_activity(delta, snap),
             Tab::Usage => return self.move_usage(delta, snap),
             Tab::Agents => return self.move_agents(delta, snap),
+            Tab::Devices => {
+                let len = snap.devices.data.list.len();
+                if !snap.devices.loaded || len == 0 {
+                    return false;
+                }
+                let current = self.devices.sel.map_or(-1, |i| i.min(len - 1) as i64);
+                let next = (current + i64::from(delta)).clamp(0, len as i64 - 1) as usize;
+                let changed = self.devices.sel != Some(next);
+                self.devices.sel = Some(next);
+                return changed;
+            }
             // The other tabs' screens keep no selection here yet.
             _ => return false,
         };

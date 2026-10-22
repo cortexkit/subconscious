@@ -33,6 +33,10 @@ struct Rig {
     handler: ControlHandler,
     ctx: RouteCtx,
     _egress: mpsc::Receiver<OutboundFrame>,
+    /// Holds the activity ledger. It is a scratch directory of its own, never
+    /// `config`'s parent: some tests pass a relative config path, and a ledger
+    /// beside it would be created inside the crate's folder.
+    _ledger: ScratchDir,
 }
 
 impl Rig {
@@ -44,9 +48,10 @@ impl Rig {
         let supervisor = Supervisor::new(registry.clone(), RestartPolicy::new(0, Duration::ZERO))
             .with_handle(handle.clone())
             .with_daemon_incarnation(incarnation.to_string());
+        let ledger = ScratchDir::new("rescan-checked-ledger");
         let handler = ControlHandler::new(registry)
             .with_supervisor(handle)
-            .with_activity_ledger(config.parent().unwrap(), incarnation.to_string())
+            .with_activity_ledger(ledger.path(), incarnation.to_string())
             .with_supervisor_rescan(supervisor, config, None);
         let (tx, rx) = mpsc::channel(8);
         Self {
@@ -57,6 +62,7 @@ impl Rig {
                 egress: FrameSink::new(tx),
             },
             _egress: rx,
+            _ledger: ledger,
         }
     }
 

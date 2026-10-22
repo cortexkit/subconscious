@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.36.31
+## 0.36.32
 
 - Successful rescans that add, remove or change modules append one `subc.config_changed` activity entry with sorted module ids and the caller's actor. No-op rescans, previews and refused checked applies remain silent; per-module rescan entries are unchanged.
 

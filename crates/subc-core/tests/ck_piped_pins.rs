@@ -247,6 +247,16 @@ const RULES: &[Rule] = &[
         json_kind: any,
         pins: &[],
     },
+    // The daemon library's version, at the start of plain `ck daemon`. It
+    // changes with every daemon release, so the pin holds the field's place,
+    // never one release's number.
+    Rule {
+        name: "daemon_versions",
+        text: |text, _| mask_between(text, "daemon ", " · pid ", "daemon_versions"),
+        json_keys: &[],
+        json_kind: any,
+        pins: &[],
+    },
     // The daemon's process id, in plain `ck daemon`.
     Rule {
         name: "pids",

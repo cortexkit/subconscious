@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.36.29
+
+- Test-only release; daemon behaviour is unchanged. The test that holds a restart's live-children record write while a module authenticates spawned its module as `/bin/sh -c "exec sleep 600"`. On macOS every module goes through the privacy trampoline, which admits a module that is not a `#!` script only when its running image is the configured program; the shell replaces itself with `/bin/sleep`, which is not `/bin/sh`, so every process was refused and killed right after spawn and crash-looped with 100 ms, 1 s and 10 s backoff until the restart budget ran out. The test read the raw pid, which is published before that check, so it passed only when its 10 ms poll happened to see a replacement that was about to be refused; on a Mac it took 3 s, 14 s, or failed at its 20 s limit. The module is now `/bin/sleep 600`, and the test waits for `reported_pid`, which names a process only once it is confirmed as the module. With the module admitted the test passes in about 3.2 s, of which 3 s is the held write.
+
 ## 0.36.28
 
 - `server::CONNECTION_EGRESS_BYTE_BUDGET` is now defined as `subc_protocol::MAX_DELIVERED_FRAME_LEN`. The router refuses any module-to-client frame larger than the client connection's egress budget, so the budget is the delivered-frame limit modules size their replies against; deriving it from the protocol constant keeps the two from drifting. The value is unchanged (4 MiB), so behaviour is unchanged. Requires subc-protocol 0.32.9.

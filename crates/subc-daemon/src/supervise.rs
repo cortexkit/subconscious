@@ -16711,11 +16711,20 @@ mod record_write_stall_tests {
     /// across the two syncs in that write.
     const HELD_RECORD_WRITE: Duration = Duration::from_secs(3);
 
+    /// A module that runs `/bin/sleep` directly, not through `/bin/sh -c`.
+    /// On macOS every module is launched through the privacy trampoline, and
+    /// a module that is not a `#!` script is admitted only if its running
+    /// image is the configured program. With `/bin/sh -c "exec sleep 600"`
+    /// the shell replaces itself with `/bin/sleep`, which does not match the
+    /// configured `/bin/sh`, so the process is refused and killed right after
+    /// spawn, and the supervisor crash-loops it with backoff until its
+    /// restart budget runs out. The restart this test measures would then
+    /// never produce a module at all.
     fn sleeping_spec() -> ModuleSpec {
         ModuleSpec {
             module_id: "record-write-stall".into(),
-            program: "/bin/sh".into(),
-            args: vec!["-c".into(), "exec sleep 600".into()],
+            program: "/bin/sleep".into(),
+            args: vec!["600".into()],
             env: vec![],
             reserved: false,
             reserved_prefixes: vec![],
@@ -16731,10 +16740,23 @@ mod record_write_stall_tests {
             Supervisor::new_for_test(Arc::new(Registry::default()), RestartPolicy::default())
                 .with_live_children_record(home.join("live-children.json"));
         let module = supervisor.spawn(sleeping_spec()).unwrap();
-        let old_pid = lock_snapshot(&module.inner.snapshot)
-            .unwrap()
-            .pid
-            .expect("the first process is running");
+        // `reported_pid` names a process only once it is confirmed as the
+        // module (on macOS, once the trampoline's image check has passed), so
+        // a process the daemon is about to refuse and kill never counts as
+        // the running module, here or in the final wait below.
+        let old_pid = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(pid) = lock_snapshot(&module.inner.snapshot)
+                    .unwrap()
+                    .reported_pid()
+                {
+                    return pid;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the first process was admitted as the module");
 
         // The daemon's listener, served by this runtime's workers like the
         // supervisor's own tasks.
@@ -16814,7 +16836,7 @@ mod record_write_stall_tests {
         tokio::time::timeout(Duration::from_secs(20), async {
             while lock_snapshot(&module.inner.snapshot)
                 .unwrap()
-                .pid
+                .reported_pid()
                 .is_none_or(|pid| pid == old_pid)
             {
                 tokio::time::sleep(Duration::from_millis(10)).await;

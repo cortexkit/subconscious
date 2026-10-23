@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.20.123
+
+- Daemon restarts on Windows and macOS wait for the previous daemon process to exit before starting its replacement, including after replacing a running Windows executable. A stop that exceeds 40 seconds refuses with the old PID instead of racing another instance. Linux continues to use systemd's synchronous restart.
+- Upgrade retries a start once when the service manager reports a finished task or job with no daemon process. If that retry also ends, it reports "the daemon did not stay running" with process presence, service state and last result instead of waiting the full health budget. Slow starts with a process or a pending job retain their health budget.
+
 ## 0.20.122
 
 - `ck module start` and `stop` explain when the result differs from `subc.jsonc`, including that any rescan or daemon restart reapplies the file and how to make the change persistent. They read `configured_enabled` from the target's post-acknowledgement list entry, not the unchanged lifecycle acknowledgement. Matching, unconfigured or missing entries keep their plain output unchanged; JSON passes through `configured_enabled` in the nested module entry only.

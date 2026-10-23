@@ -791,7 +791,7 @@ impl SetupBackend {
     }
 
     fn restart_runtime(&mut self, sections: &[String]) -> Result<(), String> {
-        runtime::restart_via_service_manager(&self.paths.runtime_paths.definition)?;
+        runtime::restart_via_service_manager(&self.paths.runtime_paths)?;
         let mut validator = CkValidator {
             executable: &self.executable,
         };

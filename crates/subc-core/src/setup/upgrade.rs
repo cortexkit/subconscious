@@ -533,8 +533,9 @@ impl SystemUpgradeBackend {
         // Polled from the moment the service manager returns, which on macOS
         // is before the new daemon has bound its port or rewritten the
         // connection file. An unreadable file, a stale pid, or a refused
-        // connection are all "not yet" while the completion budget runs;
-        // only the budget turns them into the refusal.
+        // connection are "not yet" here. The completion loop separately checks
+        // for an ended service with no daemon, so a failed start need not spend
+        // the entire health budget.
         let Ok(connection) = connection_file::read_for_client(subc) else {
             return Ok(false);
         };
@@ -842,11 +843,12 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
         let root = load_current_inventory_root()?;
         let paths =
             super::runtime::runtime_paths(platform, &root.join("bin"), &super::apply::user_home()?);
-        let detail = super::runtime::restart_with_definition(
+        let detail = super::runtime::restart_with_definition_at(
             platform,
             &paths,
             &mut super::runtime::SystemCommandRunner,
             &mut self.inventory,
+            self.subc.as_deref(),
         )?;
         Ok(format!(
             "{detail}; drain budget={}s",
@@ -859,7 +861,17 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
         completion_timeout: Duration,
     ) -> Result<String, String> {
         let started = Instant::now();
-        self.wait_until(completion_timeout, || self.daemon_ready())?;
+        let platform = super::runtime::RuntimePlatform::current();
+        let root = load_current_inventory_root()?;
+        let paths =
+            super::runtime::runtime_paths(platform, &root.join("bin"), &super::apply::user_home()?);
+        super::runtime::wait_for_service_ready(
+            platform,
+            &paths,
+            &mut super::runtime::SystemCommandRunner,
+            completion_timeout,
+            || self.daemon_ready(),
+        )?;
         Ok(format!(
             "daemon service is live and healthy {:.0}s after restart (budget {}s)",
             started.elapsed().as_secs_f64(),

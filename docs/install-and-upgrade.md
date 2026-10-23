@@ -132,6 +132,14 @@ the new version. If that check fails, it offers to roll back to the copy it
 kept.
 
 - The daemon restarts through the service manager, with a 30-second drain.
+  Windows and macOS wait for the old daemon PID (checked against the daemon
+  executable and process start time) to exit before starting the replacement.
+  If it remains after 40 seconds, the restart refuses with `daemon-stop-timeout`
+  and the PID. Linux's `systemctl --user restart` already waits for the stop.
+  While checking health, an ended task or job with no daemon process triggers
+  one start retry. If it ends again, upgrade reports "the daemon did not stay
+  running", including process presence, task/job state and last result, rather
+  than spending the 180-second health budget on a start that has already ended.
 - Modules restart through `supervisor.restart`; the upgrade waits up to 180
   seconds for each to report healthy.
 - `ck` replaces itself last. On Windows the old binary is left as

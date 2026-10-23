@@ -1,0 +1,15 @@
+{
+  "arguments": {
+    "view": "diff"
+  },
+  "call_key": "run-7:call-3",
+  "name": "show_ui",
+  "output_refs": {
+    "call_key": "run-7:call-3",
+    "count": 2,
+    "dialect": "anthropic",
+    "digest": "sha256:4bb06f8e4e3a7715d201d573d0aa4237",
+    "mid": "msg_01AbC",
+    "set_id": "ors_01J9Z8"
+  }
+}

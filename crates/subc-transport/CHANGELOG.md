@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.14.0
+
+- **Breaking dependency upgrade.** Re-export subc-protocol 0.33, whose `ToolCallRequest` gains the optional `output_refs` member (breaking for struct literals). A consumer that also depends on subc-protocol directly must move both together. No other change.
+
 ## 0.13.0
 
 - **Breaking dependency upgrade.** Re-export subc-protocol 0.32; scope selectors now use a constructor and an optional bind-proof builder.

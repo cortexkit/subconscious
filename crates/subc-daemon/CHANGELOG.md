@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.37.0
+
+- Minor bump because this crate's public API carries subc-protocol types, and subc-protocol moves to 0.33.0 (`ToolCallRequest` gains the optional `output_refs` member). Also takes subc-control 0.33 and subc-transport 0.14. Tool-call bodies, including `output_refs`, stay opaque to the daemon. No other change.
+
 ## 0.36.38
 
 - Project manifest `operation_payload` declarations through `catalog.list` alongside `operation_delivery`. Empty declarations preserve the existing catalog response bytes; gateways can join declared limits onto negotiated federation catalog operations. Requires subc-control 0.32.7 and subc-protocol 0.32.12.

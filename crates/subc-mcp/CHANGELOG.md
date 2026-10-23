@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.43
+
+- Takes subc-protocol 0.33 and the matching daemon, control and transport releases. The gateway sends no `output_refs`: only an llm-runner resolves an agent's references to earlier tool output. No behavior change.
+
 ## 0.1.42
 
 - The session record's working folder, and the root sent to Entorhinal's `resolve`, use the canonical spelling the daemon stores. On Windows, `std::fs::canonicalize` returned the verbatim `\\?\C:\` form, so Entorhinal was asked to resolve a root string no project was registered under.

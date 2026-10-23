@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.4.11
+
+- Takes subc-protocol 0.33 and the matching SDK, daemon, control, transport and bus-testkit releases (`ToolCallRequest` gains the optional `output_refs` member). No behavior change.
+
 ## 0.4.10
 
 - Test-only: initialize the new optional scope folder/project activity fields in mirror fixtures. Runtime behavior is unchanged.

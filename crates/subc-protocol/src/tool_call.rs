@@ -14,9 +14,15 @@
 //! the wire, so a body carrying no optionals serializes exactly as the
 //! two-field shape older consumers already send — this type is drop-in for
 //! them without a wire change.
+//!
+//! Since 0.33.0 a call may also carry `output_refs`, the llm-runner's
+//! descriptor of the stored tool-output snapshots an agent's references
+//! resolved to. It is a top-level member beside the arguments, carried as an
+//! opaque JSON object of at most [`MAX_OUTPUT_REFS_BYTES`] bytes; see
+//! [`OutputRefs`].
 
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde_json::{Map, Value};
 
 use crate::Principal;
 
@@ -162,11 +168,24 @@ pub struct ToolCallRequest {
     /// [`validate_call_origin`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<CallOrigin>,
+    /// The llm-runner's output-refs descriptor for this call: which stored set
+    /// of tool-output snapshots the agent's references resolved to, so the
+    /// provider can read those snapshots back from the runner. See
+    /// [`OutputRefs`] for what this crate checks and what it leaves to the
+    /// llm-runner contract.
+    ///
+    /// It sits beside the arguments, never inside them, so the model cannot
+    /// write it. A runner attaches it only to a call whose provider declares
+    /// `output_refs: true`; `None` means the runner sent no descriptor, and the
+    /// member is then left out of the encoding. The daemon never reads it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_refs: Option<OutputRefs>,
 }
 
 impl ToolCallRequest {
     /// A call with no consumer id, no progress token, no call key, no schema
-    /// pin, no preset and no origin — the shape older two-field consumers send.
+    /// pin, no preset, no origin and no output refs — the shape older
+    /// two-field consumers send.
     pub fn new(name: impl Into<String>, arguments: Value) -> Self {
         Self {
             name: name.into(),
@@ -177,6 +196,7 @@ impl ToolCallRequest {
             schema_pin: None,
             preset: None,
             origin: None,
+            output_refs: None,
         }
     }
 }
@@ -373,6 +393,118 @@ pub fn validate_call_origin(origin: &CallOrigin) -> Result<(), OpaqueFieldError>
     Ok(())
 }
 
+/// The wire name of [`ToolCallRequest::output_refs`], for the `field` of the
+/// `invalid_request` error a provider returns when the descriptor is refused.
+pub const OUTPUT_REFS_FIELD: &str = "output_refs";
+
+/// The most bytes an [`OutputRefs`] descriptor may take, measured as compact
+/// JSON. The llm-runner contract bounds its descriptor to the same 4,096
+/// bytes; the check is repeated here so decoding refuses a larger one.
+pub const MAX_OUTPUT_REFS_BYTES: usize = 4 * 1024;
+
+/// The llm-runner's output-refs descriptor, carried opaquely.
+///
+/// When an agent refers to earlier tool output, the llm-runner resolves those
+/// references into a stored set of snapshots and describes that set with a
+/// descriptor. The descriptor's schema belongs to the llm-runner contract (the
+/// `cortexkit-role-llm-runner` crate in the CortexKit commons repository), and
+/// a provider decodes it with that crate's type. This crate does not copy the
+/// schema, so the two cannot drift: it checks only that the value is a JSON
+/// object of at most [`MAX_OUTPUT_REFS_BYTES`] bytes, and refuses anything
+/// else, both when building one with [`OutputRefs::new`] and when decoding.
+/// The daemon relays route bodies without reading them, so it never reads
+/// this.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OutputRefs(Map<String, Value>);
+
+impl OutputRefs {
+    /// Accept `value` as a descriptor if it is a JSON object whose compact
+    /// encoding is at most [`MAX_OUTPUT_REFS_BYTES`] bytes.
+    pub fn new(value: Value) -> Result<Self, OutputRefsError> {
+        let Value::Object(map) = value else {
+            return Err(OutputRefsError::NotAnObject);
+        };
+        // Encoding a map of JSON values cannot fail: every key is a string.
+        let length = serde_json::to_vec(&map).map_or(usize::MAX, |bytes| bytes.len());
+        if length > MAX_OUTPUT_REFS_BYTES {
+            return Err(OutputRefsError::TooLarge { length });
+        }
+        Ok(Self(map))
+    }
+
+    /// The descriptor's members, for a provider to decode with the llm-runner
+    /// contract's type.
+    pub fn as_map(&self) -> &Map<String, Value> {
+        &self.0
+    }
+
+    /// The descriptor as a JSON object value.
+    pub fn into_value(self) -> Value {
+        Value::Object(self.0)
+    }
+}
+
+impl TryFrom<Value> for OutputRefs {
+    type Error = OutputRefsError;
+
+    fn try_from(value: Value) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl From<OutputRefs> for Value {
+    fn from(refs: OutputRefs) -> Self {
+        refs.into_value()
+    }
+}
+
+impl Serialize for OutputRefs {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.0.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for OutputRefs {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = Value::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Why a value was refused as an [`OutputRefs`] descriptor. Every variant is
+/// about [`OUTPUT_REFS_FIELD`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum OutputRefsError {
+    /// The value was not a JSON object.
+    NotAnObject,
+    /// The object's compact JSON encoding was `length` bytes, more than
+    /// [`MAX_OUTPUT_REFS_BYTES`].
+    TooLarge { length: usize },
+}
+
+impl OutputRefsError {
+    /// The request field the error is about.
+    pub fn field(&self) -> &'static str {
+        OUTPUT_REFS_FIELD
+    }
+}
+
+impl std::fmt::Display for OutputRefsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotAnObject => write!(f, "{OUTPUT_REFS_FIELD} must be a JSON object"),
+            Self::TooLarge { length } => write!(
+                f,
+                "{OUTPUT_REFS_FIELD} is {length} bytes as compact JSON; at most \
+                 {MAX_OUTPUT_REFS_BYTES} are allowed"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for OutputRefsError {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -402,6 +534,7 @@ mod tests {
             schema_pin: None,
             preset: None,
             origin: None,
+            output_refs: None,
         };
         let encoded = serde_json::to_value(&request).expect("encode");
         assert_eq!(
@@ -545,6 +678,7 @@ mod tests {
             schema_pin: None,
             preset: None,
             origin: None,
+            output_refs: None,
         };
         let encoded = serde_json::to_value(&request).expect("encode");
         assert_eq!(encoded["tool_call_id"], json!("wal-intent-42"));

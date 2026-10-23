@@ -86,6 +86,7 @@ fn protocol_wire_shapes_match_golden_json_and_round_trip() {
             schema_pin: None,
             preset: None,
             origin: None,
+            output_refs: None,
         },
     );
     assert_golden(
@@ -99,6 +100,7 @@ fn protocol_wire_shapes_match_golden_json_and_round_trip() {
             schema_pin: None,
             preset: None,
             origin: None,
+            output_refs: None,
         },
     );
     // A call relayed for another caller: the relay's own key, and the caller
@@ -111,6 +113,30 @@ fn protocol_wire_shapes_match_golden_json_and_round_trip() {
             ..subc_protocol::tool_call::ToolCallRequest::new(
                 "grep",
                 serde_json::json!({ "pattern": "needle" }),
+            )
+        },
+    );
+    // A call carrying the llm-runner's output-refs descriptor beside its
+    // arguments. The descriptor's members are the llm-runner contract's; this
+    // crate carries them as an opaque object.
+    assert_golden(
+        "tool_call_request_with_output_refs",
+        &subc_protocol::tool_call::ToolCallRequest {
+            call_key: Some("run-7:call-3".to_string()),
+            output_refs: Some(
+                subc_protocol::tool_call::OutputRefs::new(serde_json::json!({
+                    "set_id": "ors_01J9Z8",
+                    "mid": "msg_01AbC",
+                    "call_key": "run-7:call-3",
+                    "dialect": "anthropic",
+                    "count": 2,
+                    "digest": "sha256:4bb06f8e4e3a7715d201d573d0aa4237"
+                }))
+                .unwrap(),
+            ),
+            ..subc_protocol::tool_call::ToolCallRequest::new(
+                "show_ui",
+                serde_json::json!({ "view": "diff" }),
             )
         },
     );
@@ -1145,6 +1171,7 @@ fn relayed_tool_call(with_origin: bool) -> subc_protocol::tool_call::ToolCallReq
                 "broca:run-7/call-3",
             )
         }),
+        output_refs: None,
     }
 }
 

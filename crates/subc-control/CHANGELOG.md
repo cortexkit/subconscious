@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.33.0
+
+- Minor bump because this crate's public types come from subc-protocol, which moves to 0.33.0 (`ToolCallRequest` gains the optional `output_refs` member). A consumer that also depends on subc-protocol directly must move both together, or two incompatible copies of the protocol types would meet. No other change.
+
 ## 0.32.7
 
 - Add `CatalogEntry::operation_payload` and `with_operation_payload`, mirroring the manifest's operation-name-to-limit map so federation gateways can discover accepted request payloads. Empty maps are omitted and preserve existing catalog bytes. Requires subc-protocol 0.32.12.

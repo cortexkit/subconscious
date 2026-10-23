@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.31.0
+
+- Minor bump because this crate re-exports subc-protocol types, and subc-protocol moves to 0.33.0 (`ToolCallRequest` gains the optional `output_refs` member, breaking for struct literals). Also takes subc-control 0.33 and subc-transport 0.14, which moved for the same reason. Move direct protocol dependencies together with the SDK. No other change.
+
 ## 0.30.13
 
 - Add `SubcConsumer::call_framed_with_reply` and `call_framed_cancellable_with_reply`, taking an object head plus raw payload and returning `CallReply` with existing cancellation, deadline and retry semantics. Requests carry `FLAG_BINARY`; existing methods are unchanged.

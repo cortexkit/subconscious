@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.33.0
+
+- **Breaking for Rust struct literals.** `ToolCallRequest` gains `output_refs: Option<OutputRefs>`, the llm-runner's output-refs descriptor: which stored set of tool-output snapshots an agent's references resolved to, so a provider can read them back from the runner. It is a top-level member beside the arguments, so the model cannot write it; a runner attaches it only to a call whose provider declares `output_refs: true`. The struct stays exhaustive, so every module that builds one with a literal must decide what to send (`ToolCallRequest::new` sets `None`). The member is omitted when `None`, so every request without it keeps its exact bytes, and the struct still accepts unknown members, so providers on 0.32 ignore it.
+- New `OutputRefs`, carried opaquely: the descriptor's schema belongs to the llm-runner contract (`cortexkit-role-llm-runner` in the commons repository), and providers decode it with that crate's type. This crate checks only that it is a JSON object whose compact encoding is at most `MAX_OUTPUT_REFS_BYTES` (4,096) bytes, in `OutputRefs::new` and when decoding; refusals are `OutputRefsError` naming `OUTPUT_REFS_FIELD` (`output_refs`). The daemon never reads it.
+
 ## 0.32.12
 
 - Add `framed_body::{encode, decode, FramedBodyError, MAX_FRAMED_HEAD_BYTES, MAX_DECLARED_PAYLOAD_BYTES}` for a bounded JSON object head and unchanged raw payload, with shared Rust/Swift vectors.

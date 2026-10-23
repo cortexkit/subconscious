@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.20.125
+
+- Takes subc-daemon 0.37, subc-protocol 0.33, subc-control 0.33, subc-transport 0.14 and subc-client-rs 0.31 (`ToolCallRequest` gains the optional `output_refs` member). No behavior change.
+
 ## 0.20.124
 
 - Setup compares registered Windows task behavior with its inventory-verified previous definition, treating the registering account's SID and name as the same principal and applying Task Scheduler defaults. Registration metadata no longer looks like a user edit; a real edit refuses with the differing field. A trusted older definition still upgrades to this release's desired definition, including its restart and power policies.

@@ -196,6 +196,7 @@ public enum FedHelloCodec {
         return FedNegotiatedSession(
             version: version,
             features: negotiated,
+            peerAdvertisedFeatures: parsed.features,
             peerMaxBodyBytes: parsed.maxBodyBytes,
             peerMaxInFlight: parsed.maxInFlight,
             peerMaxSubscriptions: maxSubscriptions,

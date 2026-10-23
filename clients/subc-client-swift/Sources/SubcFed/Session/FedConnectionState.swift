@@ -101,6 +101,11 @@ public struct FedHelloPolicy: Sendable, Equatable {
 public struct FedNegotiatedSession: Sendable, Equatable {
     public let version: UInt64
     public let features: Set<String>
+    /// Every feature the peer's own hello listed, before intersecting with
+    /// ours. Use it to learn what the peer can serve on other session kinds:
+    /// a computer lists `share-v1` here although an ordinary session never
+    /// negotiates it, because share frames belong only on a share session.
+    public var peerAdvertisedFeatures: Set<String> = []
     public let peerMaxBodyBytes: UInt64
     public let peerMaxInFlight: UInt64
     public var peerMaxSubscriptions: UInt64? = nil

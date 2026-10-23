@@ -148,6 +148,14 @@ public actor SubcFedClient {
     /// ready. It is the only place the device can see which effect wire a
     /// session uses; the Mac-side log does not record it either.
     public private(set) var negotiatedFeatures: [String] = []
+    /// Every feature the computer listed in the current session's
+    /// authenticated hello, sorted, before intersecting with this device's
+    /// own list. Empty while no session is ready. Check this, not
+    /// `negotiatedFeatures`, for capabilities served on a separate session
+    /// kind: a computer that serves share sessions lists `share-v1` here, but
+    /// the ordinary session never negotiates it because this device's
+    /// ordinary hello must not offer it.
+    public private(set) var peerAdvertisedFeatures: [String] = []
     /// The current authenticated session's announced machine name. Nil while no
     /// session is ready or when the peer omitted it; never a pinning authority.
     public private(set) var peerMachineID: String?
@@ -891,6 +899,7 @@ public actor SubcFedClient {
                 }
                 activeSession = dialed
                 negotiatedFeatures = await dialed.engine.negotiatedFeatures
+                peerAdvertisedFeatures = await dialed.engine.peerAdvertisedFeatures
                 peerMachineID = await dialed.engine.peerMachineID
                 startReceiveLoop(session: dialed)
                 planner.resetBackoff()
@@ -1289,6 +1298,7 @@ public actor SubcFedClient {
             await session.transport.close()
         }
         negotiatedFeatures = []
+        peerAdvertisedFeatures = []
         peerMachineID = nil
     }
 

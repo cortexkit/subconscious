@@ -243,6 +243,10 @@ public actor FedSessionEngine {
     /// exchange completes. Whether `effects-v2` is in it decides which effect
     /// wire this session uses, and nothing else on the device records that.
     public var negotiatedFeatures: [String] { (negotiation?.features ?? []).sorted() }
+    /// The features the peer's hello listed, sorted, before intersecting with
+    /// ours; empty until the hello exchange completes. Frame checks never read
+    /// it: only `negotiatedFeatures` decides what this session may carry.
+    public var peerAdvertisedFeatures: [String] { (negotiation?.peerAdvertisedFeatures ?? []).sorted() }
     public var peerMachineID: String? { negotiation?.peerMachineID }
     public var negotiated: FedNegotiatedSession? { negotiation }
     public var remoteCatalog: FedRemoteCatalog? { catalogTracker.applied }

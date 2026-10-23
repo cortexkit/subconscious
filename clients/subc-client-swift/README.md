@@ -89,19 +89,23 @@ If the snapshot does not advertise `share-v1`, `send` returns
 without dialing or sending a hello. This is distinct from a failed connection;
 per-call outcomes still honor any earlier durable marks.
 
-Adopt two library-owned files in the same App Group directory in both targets:
+Adopt two library-owned files in the same App Group directory in both targets.
+Read `share-v1` from `SubcFedClient.peerAdvertisedFeatures`, the computer's
+own hello list, not from `negotiatedFeatures`: the phone's ordinary hello never
+offers `share-v1`, so the negotiated intersection never contains it.
 
 ```swift
 let directory = FedShareDirectory(directoryURL: appGroupURL)
 let ledger = FedShareLedger(directoryURL: appGroupURL)
 
-// In the app, using its already-open shared FedStateStore:
+// In the app, using its already-open shared FedStateStore and its ready
+// SubcFedClient (`fedClient`) for this computer:
 try await directory.update(
     computers: [FedShareComputer(
         publicKey: pairedComputerKey,
         lanCandidates: learnedLAN,
         publicCandidates: learnedPublic,
-        advertisedShareV1: negotiatedFeatures.contains("share-v1"))],
+        advertisedShareV1: fedClient.peerAdvertisedFeatures.contains("share-v1"))],
     ownPublicKey: phonePublicKey,
     stateStore: store)
 

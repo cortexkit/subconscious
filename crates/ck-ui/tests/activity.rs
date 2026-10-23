@@ -659,12 +659,94 @@ fn long_values_wrap_under_the_value_column_and_are_never_cut() {
     assert_eq!(
         drawn,
         [
-            "  path  ~/Library/Application",
-            "        Support/cortexkit/modules/engra",
-            "        m/bin",
+            "  path  ~/Library/Application Support/",
+            "        cortexkit/modules/engram/bin",
         ]
     );
     assert!(drawn.iter().all(|l| !l.contains('…')), "{drawn:?}");
+}
+
+/// `value` wrapped `value_w` columns wide, as the pane lays it out.
+fn wrapped(value: &str, value_w: usize) -> Vec<String> {
+    let view = details_view(&[row_of("k", Some(value))], value_w + 3);
+    assert_eq!(view.value_col, 3);
+    view.rows[0].iter().map(|l| l.value.clone()).collect()
+}
+
+#[test]
+fn a_wrapped_value_breaks_after_its_last_separator_that_fits() {
+    let path = "~/Work/Projects/CortexKit/thalamus";
+    // 24 columns, as at 120 columns with "model_route" the longest key:
+    // breaking at 24 would split "CortexKit".
+    assert_eq!(
+        wrapped(path, 24),
+        ["~/Work/Projects/", "CortexKit/thalamus"]
+    );
+    // 30 columns: breaking at 30 would split "thalamus".
+    assert_eq!(
+        wrapped(path, 30),
+        ["~/Work/Projects/CortexKit/", "thalamus"]
+    );
+    // Windows paths break after a backslash the same way.
+    assert_eq!(
+        wrapped("C:\\Work\\Projects\\CortexKit\\thalamus", 24),
+        ["C:\\Work\\Projects\\", "CortexKit\\thalamus"]
+    );
+    // Without a path separator: after a "-", "_" or ".", or after a space,
+    // which the break takes.
+    assert_eq!(
+        wrapped("release-candidate-build-number-twelve", 24),
+        ["release-candidate-build-", "number-twelve"]
+    );
+    assert_eq!(
+        wrapped("model_route_for_the_build_server", 24),
+        ["model_route_for_the_", "build_server"]
+    );
+    assert_eq!(
+        wrapped("alpha beta gamma delta epsilon zeta", 24),
+        ["alpha beta gamma delta", "epsilon zeta"]
+    );
+    // A separator only counts while the line keeps at least half the
+    // columns; one earlier than that gives way to a break at the edge.
+    assert_eq!(
+        wrapped("a/d74d793677582c05d74d793677582c05", 24),
+        ["a/d74d793677582c05d74d79", "3677582c05"]
+    );
+
+    // In the pane at 120 columns.
+    let mut r = entry(9, 60.0, "engram", "restarted", "subc.module_restarted");
+    r.details = Some(
+        json!({
+            "execution": "bg_d74d793677582c05",
+            "model_route": "openai/gpt-6.1-sol",
+            "project": "/Users/alex/Work/Projects/CortexKit/thalamus",
+        })
+        .as_object()
+        .unwrap()
+        .clone(),
+    );
+    let mut snap = with_rows(vec![r], true);
+    snap.host.data.home = Some("/Users/alex".into());
+    let buf = render(&activity_app(), &snap, 120, 36);
+    assert_eq!(
+        details_drawn(&buf, 36),
+        [
+            "  execution    bg_d74d793677582c05",
+            "  model_route  openai/gpt-6.1-sol",
+            "  project      ~/Work/Projects/",
+            "               CortexKit/thalamus",
+        ]
+    );
+}
+
+#[test]
+fn a_token_with_no_separators_breaks_at_the_edge() {
+    let id = "d74d793677582c05d74d793677582c05d74d793677582c05";
+    let view = details_view(&[row_of("id", Some(id))], 37);
+    assert_eq!(view.value_col, 4);
+    let lines: Vec<&str> = view.rows[0].iter().map(|l| l.value.as_str()).collect();
+    assert_eq!(lines, [&id[..33], &id[33..]]);
+    assert_eq!(lines.concat(), id);
 }
 
 #[test]

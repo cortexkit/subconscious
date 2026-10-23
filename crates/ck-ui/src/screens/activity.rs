@@ -481,47 +481,71 @@ pub struct DetailsView {
 /// line of its own above its value.
 pub const DETAIL_KEY_MAX: usize = 20;
 
-/// Splits `text` into lines of at most `n` columns (at least 1), at spaces
-/// where it can and inside a word longer than a line, so that no character
-/// is dropped; a character wider than the limit still takes a line of its
-/// own. A line break in `text` starts a new line.
+/// The characters a line that has to break may end after, best first: a
+/// path separator, then a space, `-`, `_` or `.`.
+const BREAK_AFTER: [&[char]; 2] = [&['/', '\\'], &[' ', '-', '_', '.']];
+
+/// Splits `text` into lines of at most `n` columns (at least 1), so that no
+/// character is dropped except the space a line breaks at. A line that has
+/// to break ends after the last path separator that fits, or failing that
+/// after the last space, `-`, `_` or `.`, provided the line keeps at least
+/// half of the `n` columns; otherwise it breaks at `n` columns. A character
+/// wider than `n` still takes a line of its own. A line break in `text`
+/// starts a new line.
 fn wrap_whole(text: &str, n: usize) -> Vec<String> {
     let n = n.max(1);
     let mut out = Vec::new();
     for part in text.split('\n') {
-        let first = out.len();
-        let mut line = String::new();
-        let mut used = 0;
-        for (i, word) in part.split(' ').enumerate() {
-            // The space before a word, except where the word starts a line
-            // that a break began.
-            let gap = usize::from(i > 0 && !(used == 0 && out.len() > first));
-            let ww = width(word);
-            if used + gap + ww <= n {
-                if gap == 1 {
-                    line.push(' ');
-                }
-                line.push_str(word);
-                used += gap + ww;
-                continue;
-            }
-            if used > 0 {
-                out.push(std::mem::take(&mut line));
-                used = 0;
-            }
-            for ch in word.chars() {
-                let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
-                if used + cw > n && used > 0 {
-                    out.push(std::mem::take(&mut line));
-                    used = 0;
-                }
-                line.push(ch);
-                used += cw;
-            }
+        let mut rest = part;
+        while width(rest) > n {
+            let (line_end, next) = break_at(rest, n);
+            out.push(rest[..line_end].to_string());
+            rest = &rest[next..];
         }
-        out.push(line);
+        out.push(rest.to_string());
     }
     out
+}
+
+/// Where the first line of `text`, which is wider than `n` columns, ends:
+/// the byte offset its text ends at, and the one the next line starts at.
+/// They differ by the space a line breaks at.
+fn break_at(text: &str, n: usize) -> (usize, usize) {
+    // Each character that fits on the line: the byte offset after it, the
+    // line's width up to it, and the character.
+    let mut fits = Vec::new();
+    let mut used = 0;
+    for (i, ch) in text.char_indices() {
+        let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + cw > n {
+            break;
+        }
+        used += cw;
+        fits.push((i + ch.len_utf8(), used, ch));
+    }
+    let Some(&(fit, _, _)) = fits.last() else {
+        let first = text.chars().next().map_or(text.len(), char::len_utf8);
+        return (first, first);
+    };
+    let space_next = text[fit..].starts_with(' ');
+    for class in BREAK_AFTER {
+        // A space just past the line is the latest space break there is.
+        if space_next && class.contains(&' ') {
+            return (fit, fit + 1);
+        }
+        let at = fits
+            .iter()
+            .rev()
+            .find(|(_, w, ch)| class.contains(ch) && w * 2 >= n);
+        if let Some(&(end, _, ch)) = at {
+            return if ch == ' ' {
+                (end - 1, end)
+            } else {
+                (end, end)
+            };
+        }
+    }
+    (fit, fit)
 }
 
 /// Lays `rows` out on lines `line_w` columns wide. Values start in one

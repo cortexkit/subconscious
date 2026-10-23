@@ -91,9 +91,17 @@ fn claimed_with_a_null_name_has_no_name() {
 }
 
 #[test]
-fn granted_declined_and_expired_are_read() {
+fn granted_is_read() {
     assert_eq!(read("valid/granted.json"), Some(WatchEvent::Granted));
+}
+
+#[test]
+fn declined_is_read() {
     assert_eq!(read("valid/declined.json"), Some(WatchEvent::Declined));
+}
+
+#[test]
+fn expired_is_read() {
     assert_eq!(read("valid/expired.json"), Some(WatchEvent::Expired));
 }
 

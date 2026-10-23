@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.37.1
+
+- The `route.open refused` log line now names who asked, so a refusal can be attributed without matching connection ids, which restart with the daemon and belong to different modules before and after a restart. It gains `principal=` (the attested principal as on the `route.open accepted` line: `direct`, `reserved:<module>`, or `unattested` when a consumer identity's launch nonce did not verify; the claimed module id is never printed as a principal), `scope=` (`none`; the admitted stamp's label as on the accepted line once scope admission issued one; before that `requested/"<owner>"/"<ref>"@<epoch>`), and `harness=` (quoted). Every caller-chosen string is escaped and cut to 64 characters, so a refusal cannot forge a log line. Bodies, bind proofs and scope attributes are never logged. The launch nonce is now checked once at the start of a `route.open` instead of just before principal enforcement; which check refuses an open, and with which code, is unchanged.
+
 ## 0.37.0
 
 - Minor bump because this crate's public API carries subc-protocol types, and subc-protocol moves to 0.33.0 (`ToolCallRequest` gains the optional `output_refs` member). Also takes subc-control 0.33 and subc-transport 0.14. Tool-call bodies, including `output_refs`, stay opaque to the daemon. No other change.

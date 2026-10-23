@@ -1643,8 +1643,12 @@ impl ControlHandler {
         in_flight: usize,
         limit: usize,
     ) -> Result<Frame, RouterError> {
+        // Sent before the request reaches `handle_route_open`, so the caller
+        // fields come from the raw frame here.
+        let caller = self.route_open_caller_from_frame(frame);
         self.route_open_admission_refusal_frame(
             ctx,
+            &caller,
             frame,
             target_module_id,
             "open_admission_full",
@@ -1658,12 +1662,14 @@ impl ControlHandler {
     fn route_open_target_capacity_refusal(
         &self,
         ctx: &RouteCtx,
+        caller: &RouteOpenCaller,
         frame: &Frame,
         target_module_id: &str,
         in_flight: usize,
     ) -> Result<Frame, RouterError> {
         self.route_open_admission_refusal_frame(
             ctx,
+            caller,
             frame,
             target_module_id,
             "target_binds_full",
@@ -1681,9 +1687,11 @@ impl ControlHandler {
     /// cannot currently reach its target; `module_timeout` would falsely claim
     /// that a wait expired. A new, cleaner code would be terminal to deployed
     /// clients, so it requires a client-tolerance rollout before daemon emission.
+    #[allow(clippy::too_many_arguments)]
     fn route_open_admission_refusal_frame(
         &self,
         ctx: &RouteCtx,
+        caller: &RouteOpenCaller,
         frame: &Frame,
         target_module_id: &str,
         reason: &'static str,
@@ -1698,6 +1706,9 @@ impl ControlHandler {
             reason,
             module_id = ?target_module_id,
             connection_id = ctx.connection_id.get(),
+            principal = %caller.principal,
+            scope = %caller.scope,
+            harness = %caller.harness,
             in_flight,
             limit,
             "route.open refused"
@@ -4003,23 +4014,68 @@ impl ControlHandler {
         )?])
     }
 
+    /// The principal a route.open's `consumer_identity` attests: `Direct`
+    /// when it presents none, `Reserved` when its launch nonce verifies, and
+    /// `None` when it does not. Only a read of the supervisor's nonces, so it
+    /// can run before any refusal check without changing which check refuses.
+    fn attest_route_open_consumer(
+        &self,
+        consumer_identity: Option<&ConsumerIdentity>,
+    ) -> Option<Principal> {
+        let Some(consumer_identity) = consumer_identity else {
+            return Some(Principal::Direct);
+        };
+        self.supervisor
+            .spawned_consumer_authorized(
+                &consumer_identity.module_id,
+                &consumer_identity.launch_nonce,
+            )
+            .then(|| Principal::Reserved {
+                module_id: consumer_identity.module_id.clone(),
+            })
+    }
+
+    /// The caller fields for a refusal that only has the raw request frame,
+    /// such as the connection-level admission refusal sent before the request
+    /// reaches [`Self::handle_route_open`].
+    fn route_open_caller_from_frame(&self, frame: &Frame) -> RouteOpenCaller {
+        let Ok(ClientControlRequest::RouteOpen {
+            identity,
+            consumer_identity,
+            scope,
+            ..
+        }) = parse_client_control_request(&frame.body)
+        else {
+            return RouteOpenCaller::unknown();
+        };
+        let principal = self.attest_route_open_consumer(consumer_identity.as_ref());
+        RouteOpenCaller::new(principal.as_ref(), scope.as_ref(), &identity)
+    }
+
     fn route_open_principal(
         &self,
         frame: &Frame,
         consumer_identity: Option<ConsumerIdentity>,
     ) -> Result<Result<Principal, Frame>, RouterError> {
+        let attested = self.attest_route_open_consumer(consumer_identity.as_ref());
+        self.route_open_principal_attested(frame, consumer_identity, attested)
+    }
+
+    /// [`Self::route_open_principal`] with `attested` already taken by
+    /// [`Self::attest_route_open_consumer`] for `consumer_identity`, so one
+    /// open checks the launch nonce once.
+    fn route_open_principal_attested(
+        &self,
+        frame: &Frame,
+        consumer_identity: Option<ConsumerIdentity>,
+        attested: Option<Principal>,
+    ) -> Result<Result<Principal, Frame>, RouterError> {
+        if let Some(principal) = attested {
+            return Ok(Ok(principal));
+        }
         let Some(consumer_identity) = consumer_identity else {
             return Ok(Ok(Principal::Direct));
         };
-
-        if self.supervisor.spawned_consumer_authorized(
-            &consumer_identity.module_id,
-            &consumer_identity.launch_nonce,
-        ) {
-            return Ok(Ok(Principal::Reserved {
-                module_id: consumer_identity.module_id,
-            }));
-        }
 
         Ok(Err(control_error_frame(
             frame,
@@ -4037,16 +4093,18 @@ impl ControlHandler {
     /// refused me" and the daemon's own view could only be reconciled by
     /// argument. Malformed input (`invalid_project_root`) does not come here;
     /// rejecting a request that was never a valid open is not a refusal of one.
+    #[allow(clippy::too_many_arguments)]
     fn route_open_refusal_frame(
         &self,
         ctx: &RouteCtx,
+        caller: &RouteOpenCaller,
         frame: &Frame,
         module_id: &str,
         reason: &'static str,
         code: &'static str,
         message: impl Into<String>,
     ) -> Result<Frame, RouterError> {
-        self.observe_route_open_refusal(ctx, module_id, reason, code);
+        self.observe_route_open_refusal(ctx, caller, module_id, reason, code);
         control_error_frame(frame, code, message.into())
     }
 
@@ -4067,9 +4125,11 @@ impl ControlHandler {
     /// is carried by the counter, so the evidence survives without the flood.
     /// The debug line keeps a per-refusal record reachable for whoever turns
     /// the level up.
+    #[allow(clippy::too_many_arguments)]
     fn route_open_breaker_refusal_frame(
         &self,
         ctx: &RouteCtx,
+        caller: &RouteOpenCaller,
         frame: &Frame,
         module_id: &str,
         consecutive_timeouts: u32,
@@ -4083,6 +4143,9 @@ impl ControlHandler {
             code = "module_timeout",
             module_id = ?module_id,
             connection_id = ctx.connection_id.get(),
+            principal = %caller.principal,
+            scope = %caller.scope,
+            harness = %caller.harness,
             consecutive_timeouts,
             retry_in_ms = retry_in.as_millis() as u64,
             probe_in_flight,
@@ -4124,6 +4187,7 @@ impl ControlHandler {
     fn observe_route_open_refusal(
         &self,
         ctx: &RouteCtx,
+        caller: &RouteOpenCaller,
         module_id: &str,
         reason: &'static str,
         code: &'static str,
@@ -4135,6 +4199,9 @@ impl ControlHandler {
             reason,
             module_id = ?module_id,
             connection_id = ctx.connection_id.get(),
+            principal = %caller.principal,
+            scope = %caller.scope,
+            harness = %caller.harness,
             "route.open refused"
         );
         if ROUTE_OPEN_NOT_SERVING_REASONS.contains(&reason) {
@@ -4208,6 +4275,7 @@ impl ControlHandler {
     fn supervised_absent_route_open_refusal_frame(
         &self,
         ctx: &RouteCtx,
+        caller: &RouteOpenCaller,
         frame: &Frame,
         module_id: &str,
         code: &'static str,
@@ -4220,6 +4288,9 @@ impl ControlHandler {
             reason = "supervised_not_registered",
             module_id = ?module_id,
             connection_id = ctx.connection_id.get(),
+            principal = %caller.principal,
+            scope = %caller.scope,
+            harness = %caller.harness,
             state = %status.state,
             enabled = status.enabled,
             live = status.live,
@@ -4280,6 +4351,13 @@ impl ControlHandler {
             "handling route.open"
         );
 
+        // The caller's attested principal, requested scope and harness, for
+        // every `route.open refused` line below. The launch nonce is checked
+        // here, once, and the answer is reused where the principal is
+        // enforced further down, so the order of refusals is unchanged.
+        let attested = self.attest_route_open_consumer(consumer_identity.as_ref());
+        let mut caller = RouteOpenCaller::new(attested.as_ref(), scope.as_ref(), &identity);
+
         // A malformed declaration is refused first, before anything about the
         // target is looked up: the same body would be refused against any
         // module, so the caller learns nothing by retrying or waiting. An empty
@@ -4289,6 +4367,7 @@ impl ControlHandler {
         if let Some(Err(error)) = role_versions.as_ref().map(validate_role_versions) {
             self.observe_route_open_refusal(
                 ctx,
+                &caller,
                 &target_module_id,
                 "invalid_role_versions",
                 error_codes::INVALID_REQUEST,
@@ -4307,6 +4386,7 @@ impl ControlHandler {
             if status.waiting_for_previous_pid.is_some() {
                 return Ok(vec![self.supervised_absent_route_open_refusal_frame(
                     ctx,
+                    &caller,
                     &frame,
                     &target_module_id,
                     "module_warming",
@@ -4350,6 +4430,7 @@ impl ControlHandler {
                 if status.protocol == ModuleProtocol::None {
                     return Ok(vec![self.route_open_refusal_frame(
                         ctx,
+                        &caller,
                         &frame,
                         &target_module_id,
                         "protocol_none",
@@ -4367,6 +4448,7 @@ impl ControlHandler {
                 };
                 return Ok(vec![self.supervised_absent_route_open_refusal_frame(
                     ctx,
+                    &caller,
                     &frame,
                     &target_module_id,
                     code,
@@ -4378,6 +4460,7 @@ impl ControlHandler {
             {
                 return Ok(vec![self.route_open_refusal_frame(
                     ctx,
+                    &caller,
                     &frame,
                     &target_module_id,
                     "removed",
@@ -4387,6 +4470,7 @@ impl ControlHandler {
             }
             return Ok(vec![self.route_open_refusal_frame(
                 ctx,
+                &caller,
                 &frame,
                 &target_module_id,
                 "not_registered",
@@ -4406,6 +4490,9 @@ impl ControlHandler {
                 code = error_codes::MODULE_WARMING,
                 module_id = ?target_module_id,
                 connection_id = ctx.connection_id.get(),
+                principal = %caller.principal,
+                scope = %caller.scope,
+                harness = %caller.harness,
                 reason = "declared_not_ready",
                 "route.open refused"
             );
@@ -4453,6 +4540,9 @@ impl ControlHandler {
                 code = error_codes::MODULE_WARMING,
                 module_id = ?target_module_id,
                 connection_id = ctx.connection_id.get(),
+                principal = %caller.principal,
+                scope = %caller.scope,
+                harness = %caller.harness,
                 reason = NotReadyReason::REQUIRED_CAPABILITY_UNPROVIDED,
                 capability = %capability,
                 "route.open refused"
@@ -4476,6 +4566,7 @@ impl ControlHandler {
         if !target_has_required_role(&target, &registration.manifest.provides) {
             return Ok(vec![self.route_open_refusal_frame(
                 ctx,
+                &caller,
                 &frame,
                 &target_module_id,
                 "role_not_provided",
@@ -4487,6 +4578,7 @@ impl ControlHandler {
         if registration.state != ChannelState::Active {
             return Ok(vec![self.route_open_refusal_frame(
                 ctx,
+                &caller,
                 &frame,
                 &target_module_id,
                 "registration_not_active",
@@ -4502,6 +4594,7 @@ impl ControlHandler {
         {
             return Ok(vec![self.route_open_refusal_frame(
                 ctx,
+                &caller,
                 &frame,
                 &target_module_id,
                 "reloading",
@@ -4522,6 +4615,7 @@ impl ControlHandler {
             if process_liveness.process_replacing(&target_module_id) {
                 return Ok(vec![self.route_open_refusal_frame(
                     ctx,
+                    &caller,
                     &frame,
                     &target_module_id,
                     "reloading",
@@ -4531,6 +4625,7 @@ impl ControlHandler {
             }
             return Ok(vec![self.route_open_refusal_frame(
                 ctx,
+                &caller,
                 &frame,
                 &target_module_id,
                 "supervisor_not_live",
@@ -4546,6 +4641,7 @@ impl ControlHandler {
         {
             return Ok(vec![self.route_open_refusal_frame(
                 ctx,
+                &caller,
                 &frame,
                 &target_module_id,
                 "no_forwarding_connection",
@@ -4559,6 +4655,7 @@ impl ControlHandler {
         {
             self.observe_route_open_refusal(
                 ctx,
+                &caller,
                 &target_module_id,
                 "op_not_allowed",
                 "op_not_allowed",
@@ -4566,18 +4663,20 @@ impl ControlHandler {
             return Ok(vec![error]);
         }
 
-        let principal = match self.route_open_principal(&frame, consumer_identity)? {
-            Ok(principal) => principal,
-            Err(error) => {
-                self.observe_route_open_refusal(
-                    ctx,
-                    &target_module_id,
-                    "bad_consumer_identity",
-                    "bad_consumer_identity",
-                );
-                return Ok(vec![error]);
-            }
-        };
+        let principal =
+            match self.route_open_principal_attested(&frame, consumer_identity, attested)? {
+                Ok(principal) => principal,
+                Err(error) => {
+                    self.observe_route_open_refusal(
+                        ctx,
+                        &caller,
+                        &target_module_id,
+                        "bad_consumer_identity",
+                        "bad_consumer_identity",
+                    );
+                    return Ok(vec![error]);
+                }
+            };
         timings.principal = principal_label(&principal);
 
         // This is attested, control-plane policy for supervised module origins.
@@ -4601,8 +4700,7 @@ impl ControlHandler {
                         capability,
                         "refusing route.open because an attested capability deny edge matches"
                     );
-                    return Ok(vec![self.route_open_refusal_frame(
-                        ctx,
+                    return Ok(vec![self.route_open_refusal_frame(ctx, &caller,
                         &frame,
                         &target_module_id,
                         "capability_deny_edge",
@@ -4624,6 +4722,7 @@ impl ControlHandler {
             if !carrier_matches {
                 return Ok(vec![self.route_open_refusal_frame(
                     ctx,
+                    &caller,
                     &frame,
                     &target_module_id,
                     "admission_facts_carrier_not_permitted",
@@ -4637,8 +4736,7 @@ impl ControlHandler {
                 .as_ref()
                 .is_some_and(|targets| targets.iter().any(|id| id == &target_module_id));
             if !target_allowed {
-                return Ok(vec![self.route_open_refusal_frame(
-                    ctx,
+                return Ok(vec![self.route_open_refusal_frame(ctx, &caller,
                     &frame,
                     &target_module_id,
                     "admission_facts_target_not_listed",
@@ -4701,6 +4799,7 @@ impl ControlHandler {
                     Err(refusal) => {
                         return Ok(vec![self.route_open_refusal_frame(
                             ctx,
+                            &caller,
                             &frame,
                             &target_module_id,
                             refusal.code,
@@ -4711,6 +4810,11 @@ impl ControlHandler {
                 }
             }
         };
+        // From here on a refusal names the scope by the stamp admission
+        // issued, exactly as the `route.open accepted` line does.
+        if let Some(stamp) = &scope_stamp {
+            caller.scope = route_open_scope_label(stamp);
+        }
 
         // Bind admits a root that no longer exists on disk, because refusing here
         // closes the only exit from a paused run: cancel needs a bound route, and a
@@ -4765,6 +4869,7 @@ impl ControlHandler {
             Err(in_flight) => {
                 return Ok(vec![self.route_open_target_capacity_refusal(
                     ctx,
+                    &caller,
                     &frame,
                     &target_module_id,
                     in_flight,
@@ -4792,6 +4897,7 @@ impl ControlHandler {
             } => {
                 return Ok(vec![self.route_open_breaker_refusal_frame(
                     ctx,
+                    &caller,
                     &frame,
                     &target_module_id,
                     consecutive_timeouts,
@@ -4827,6 +4933,7 @@ impl ControlHandler {
             Err(err) => {
                 return Ok(vec![self.route_open_refusal_frame(
                     ctx,
+                    &caller,
                     &frame,
                     &target_module_id,
                     "relay_reservation_failed",
@@ -4873,6 +4980,7 @@ impl ControlHandler {
                 reservation.release_and_disarm();
                 return Ok(vec![self.route_open_refusal_frame(
                     ctx,
+                    &caller,
                     &frame,
                     &target_module_id,
                     refusal.code,
@@ -4900,6 +5008,7 @@ impl ControlHandler {
                 reservation.release_and_disarm();
                 return Ok(vec![self.route_open_refusal_frame(
                     ctx,
+                    &caller,
                     &frame,
                     &target_module_id,
                     refusal.code,
@@ -4952,9 +5061,6 @@ impl ControlHandler {
         // Rendered BEFORE the move into the relay, because the accept arm below
         // is where it is logged and the principal is gone by then.
         let route_principal_label = principal_label(&principal);
-        let scope_label = scope_stamp
-            .as_ref()
-            .map_or_else(|| "none".to_string(), route_open_scope_label);
         let relay = ModuleControlRequest::RouteBind {
             route_channel: module_channel,
             epoch: module_epoch,
@@ -4992,6 +5098,7 @@ impl ControlHandler {
             reservation.release_and_disarm();
             return Ok(vec![self.route_open_refusal_frame(
                 ctx,
+                &caller,
                 &frame,
                 &target_module_id,
                 "relay_send_failed",
@@ -5043,7 +5150,7 @@ impl ControlHandler {
                     ctx,
                     &target_module_id,
                     &route_principal_label,
-                    &scope_label,
+                    &caller.scope,
                 );
                 Ok(Vec::new())
             }
@@ -5064,6 +5171,7 @@ impl ControlHandler {
                 if let Some(code) = scope_code {
                     self.observe_route_open_refusal(
                         ctx,
+                        &caller,
                         &target_module_id,
                         "scope_changed_before_commit",
                         code,
@@ -5078,6 +5186,9 @@ impl ControlHandler {
                     module_code = ?body.code,
                     module_id = ?target_module_id,
                     connection_id = ctx.connection_id.get(),
+                    principal = %caller.principal,
+                    scope = %caller.scope,
+                    harness = %caller.harness,
                     "route.open refused"
                 );
                 Ok(vec![control_error_body_frame(&frame, body)?])
@@ -5097,6 +5208,7 @@ impl ControlHandler {
                 );
                 Ok(vec![self.route_open_refusal_frame(
                     ctx,
+                    &caller,
                     &frame,
                     &target_module_id,
                     "relay_abandoned",
@@ -5109,6 +5221,7 @@ impl ControlHandler {
                 breaker.record_inconclusive();
                 Ok(vec![self.route_open_refusal_frame(
                     ctx,
+                    &caller,
                     &frame,
                     &target_module_id,
                     "relay_waiter_canceled",
@@ -5147,6 +5260,7 @@ impl ControlHandler {
                 );
                 Ok(vec![self.route_open_refusal_frame(
                     ctx,
+                    &caller,
                     &frame,
                     &target_module_id,
                     "relay_timed_out",
@@ -7248,6 +7362,65 @@ fn client_control_request_op(request: &ClientControlRequest) -> &'static str {
     }
 }
 
+/// The caller of one `route.open`, as its `route.open refused` line names it.
+///
+/// A connection id alone cannot name a caller after the fact: ids restart at
+/// every daemon restart, so the same number belongs to different modules
+/// before and after one. These three fields are what the refused line needs
+/// to be attributable on its own, and they are rendered with the same helpers
+/// as the `route.open accepted` line so both directions grep alike.
+struct RouteOpenCaller {
+    /// The attested principal (`direct`, `reserved:<module>`), or `unattested`
+    /// when the request presented a consumer identity whose launch nonce did
+    /// not verify. The claimed module id is never printed as a principal.
+    principal: String,
+    /// `none` for an unscoped open; the admitted stamp's label once scope
+    /// admission issued one; before that, the requested selector's label.
+    scope: String,
+    /// The bind identity's harness, Debug-quoted and bounded like a scope ref,
+    /// because it is a string the caller chose.
+    harness: String,
+}
+
+impl RouteOpenCaller {
+    fn new(
+        principal: Option<&Principal>,
+        scope: Option<&ScopeSelector>,
+        identity: &BindIdentity,
+    ) -> Self {
+        Self {
+            principal: principal.map_or_else(|| "unattested".to_string(), principal_label),
+            scope: scope.map_or_else(|| "none".to_string(), route_open_requested_scope_label),
+            harness: bounded_log_text(&identity.harness),
+        }
+    }
+
+    /// For a refusal that has no parsed request at hand: names whatever the
+    /// frame still says, and `unknown` where it says nothing parseable.
+    fn unknown() -> Self {
+        Self {
+            principal: "unknown".to_string(),
+            scope: "unknown".to_string(),
+            harness: "unknown".to_string(),
+        }
+    }
+}
+
+/// Longest client-chosen text (a scope ref, a harness) a route.open log line
+/// prints before cutting it.
+const MAX_LOGGED_TEXT_CHARS: usize = 64;
+
+/// `value` Debug-quoted, so control characters land escaped and cannot forge
+/// a log line, and cut to [`MAX_LOGGED_TEXT_CHARS`] characters with a trailing
+/// `…` inside the quotes so one request cannot flood the line.
+fn bounded_log_text(value: &str) -> String {
+    let mut bounded: String = value.chars().take(MAX_LOGGED_TEXT_CHARS).collect();
+    if value.chars().nth(MAX_LOGGED_TEXT_CHARS).is_some() {
+        bounded.push('…');
+    }
+    format!("{bounded:?}")
+}
+
 /// The `scope=` field of the `route.open accepted` line, from the stamp that
 /// admission issued: `<kind>/<owner>/<ref>@<epoch>`. The ref is Debug-quoted
 /// so a ref holding control characters cannot forge a log line, and cut to 64
@@ -7255,20 +7428,33 @@ fn client_control_request_op(request: &ClientControlRequest) -> &'static str {
 /// scope's attributes never appear.
 fn route_open_scope_label(stamp: &subc_protocol::scope::ScopeStamp) -> String {
     use subc_protocol::scope::ScopeKind;
-    const MAX_REF_CHARS: usize = 64;
     let kind = match stamp.kind {
         ScopeKind::Head => "head",
         ScopeKind::Worker => "worker",
         ScopeKind::Ephemeral => "ephemeral",
     };
-    let mut scope_ref: String = stamp.scope_ref.chars().take(MAX_REF_CHARS).collect();
-    if stamp.scope_ref.chars().nth(MAX_REF_CHARS).is_some() {
-        scope_ref.push('…');
-    }
     format!(
-        "{kind}/{}/{scope_ref:?}@{}",
+        "{kind}/{}/{}@{}",
         principal_label(&stamp.owner),
+        bounded_log_text(&stamp.scope_ref),
         stamp.scope_epoch
+    )
+}
+
+/// The `scope=` field of a `route.open refused` line for an open refused
+/// before scope admission issued a stamp: `requested/<owner>/<ref>@<epoch>`.
+/// The kind is not known yet, so the literal `requested` stands in its place.
+/// The owner is Debug-quoted as well as the ref, because unlike a stamp's
+/// owner it has not been checked against the configured modules: a quoted
+/// owner means the value was never validated. The bind proof never appears.
+fn route_open_requested_scope_label(selector: &ScopeSelector) -> String {
+    let epoch = selector
+        .scope_epoch
+        .map_or_else(|| "none".to_string(), |epoch| epoch.to_string());
+    format!(
+        "requested/{}/{}@{epoch}",
+        bounded_log_text(&principal_label(&selector.owner)),
+        bounded_log_text(&selector.scope_ref),
     )
 }
 
@@ -12387,6 +12573,10 @@ mod tests {
             .expect("connection admission refusal event");
         assert_eq!(event.fields.get("in_flight"), Some(&limit.to_string()));
         assert_eq!(event.fields.get("limit"), Some(&limit.to_string()));
+        // Refused before `handle_route_open` parses the request, so the caller
+        // fields are read from the frame itself.
+        assert_eq!(event.fields.get("principal"), Some(&"direct".to_string()));
+        assert_eq!(event.fields.get("scope"), Some(&"none".to_string()));
     }
 
     #[test]
@@ -12412,6 +12602,7 @@ mod tests {
         let response = handler
             .route_open_target_capacity_refusal(
                 &ctx,
+                &RouteOpenCaller::unknown(),
                 &route_open_frame(397, "busy", unique_project_root("target-cap")),
                 "busy",
                 in_flight,
@@ -12851,6 +13042,9 @@ mod tests {
         assert_eq!(event.fields.get("state"), Some(&"running".to_string()));
         assert_eq!(event.fields.get("enabled"), Some(&"true".to_string()));
         assert_eq!(event.fields.get("live"), Some(&"false".to_string()));
+        assert_eq!(event.fields.get("principal"), Some(&"direct".to_string()));
+        assert_eq!(event.fields.get("scope"), Some(&"none".to_string()));
+        assert_eq!(event.fields.get("harness"), Some(&"\"unit\"".to_string()));
         assert_eq!(
             handler.counters().snapshot()["route_open_refused_by_code"],
             json!({ "module_warming": 1 })
@@ -15565,6 +15759,10 @@ mod tests {
         mod route_open_timings {
             use super::*;
             include!("route_open_timing_tests.rs");
+        }
+        mod route_open_refusal_log {
+            use super::*;
+            include!("route_open_refusal_log_tests.rs");
         }
         mod activity {
             include!("activity_scope_tests.rs");

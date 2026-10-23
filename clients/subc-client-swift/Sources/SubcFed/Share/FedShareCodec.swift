@@ -8,7 +8,7 @@ public enum FedShareCodec {
     public static let maximumRequestBytes: UInt32 = 65_536
     public static let maximumOutcomeBytes: UInt32 = 4_096
     private static let nonProofErrors: Set<String> = [
-        "fed_dispatch_ambiguous", "fed_share_id_conflict", "fed_share_expired_id", "fed_share_outcome_withheld",
+        "fed_dispatch_ambiguous", "fed_share_id_conflict", "fed_share_expired_id", "fed_share_outcome_withheld", "fed_bad_call",
     ]
 
     public static func isCanonicalShareID(_ value: String) -> Bool {
@@ -40,8 +40,6 @@ public enum FedShareCodec {
     }
 
     public static func hello(policy: FedHelloPolicy, incarnation: String, ledgerEpoch: String) -> FedFrame {
-        var policy = policy
-        if !policy.features.contains(feature) { policy.features.append(feature) }
         let ordinary = FedHelloCodec.buildLocalHello(policy: policy, incarnation: incarnation,
                                                      ledgerEpoch: ledgerEpoch, connectionAttemptID: nil)
         var fields = ordinary.header.dictionary
@@ -59,7 +57,8 @@ public enum FedShareCodec {
             guard case .string(let id) = header["share_id"], isCanonicalShareID(id) else { throw FedShareError.invalidFrame }
             if type == "share_call" {
                 guard keys == ["type", "share_id", "module"],
-                      case .string(let module) = header["module"], !module.isEmpty else { throw FedShareError.invalidFrame }
+                      case .string(let module) = header["module"],
+                      FedCatalogCodec.isValidIdentifier(module), !module.contains(".") else { throw FedShareError.invalidFrame }
             } else {
                 guard keys == ["type", "share_id", "k"] || keys == ["type", "share_id", "k", "never_ran"],
                       case .string(let kind) = header["k"], ["response", "error", "in_progress"].contains(kind)
@@ -78,18 +77,16 @@ public enum FedShareCodec {
         if type == "share_ready" || (type == "share_result" && header["k"] == .string("in_progress")) {
             guard body.isEmpty else { throw FedShareError.invalidFrame }
         }
-        if type == "share_call" {
-            let object = try FedJSONObject(jsonData: body)
-            guard Set(object.keys) == ["method", "params"],
-                  case .string(let method) = object["method"], !method.isEmpty else { throw FedShareError.invalidRequest }
-        }
         if type == "share_result" && header["k"] == .string("error") {
             let object = try FedJSONObject(jsonData: body)
             guard case .string(let code) = object["code"], !code.isEmpty else { throw FedShareError.invalidFrame }
+            if let message = object["message"] {
+                guard case .string = message else { throw FedShareError.invalidFrame }
+            }
             if header["never_ran"] == .boolean(true), !code.hasPrefix("fed_") || nonProofErrors.contains(code) {
                 // A module terminal or an ambiguous/conflicting id cannot also
                 // prove non-execution. Malformed proofs must not license outbox.
-                throw FedShareError.invalidFrame
+                throw FedFailure.protocolViolation(byeCode: "fed_protocol_violation")
             }
         }
     }
@@ -98,7 +95,13 @@ public enum FedShareCodec {
     /// New federation errors fail closed as unknown, never as module terminals.
     public static func outcome(_ frame: FedFrame) throws -> FedShareOutcome {
         try validateHeader(frame.header, type: "share_result", complete: true, features: [feature])
-        try validateBody(frame.body, type: "share_result", header: frame.header)
+        do {
+            try validateBody(frame.body, type: "share_result", header: frame.header)
+        } catch FedFailure.protocolViolation(let code) {
+            // Preserve the offending body for diagnostics, but do not trust the
+            // invalid never_ran header as proof that the call did not run.
+            return FedShareOutcome(.unknown, kind: frame.terminalKind, code: code, body: frame.body)
+        }
         let kind = frame.terminalKind!
         let code = frame.terminalCode
         if kind == "response" { return FedShareOutcome(.sent, kind: kind, body: frame.body) }
@@ -122,6 +125,11 @@ public struct FedShareRequest: Sendable, Equatable {
         let frame = FedFrame(type: "share_call", fields: ["share_id": .string(shareID), "module": .string(module)], body: body)
         try FedShareCodec.validateHeader(frame.header, type: "share_call", complete: true, features: [FedShareCodec.feature])
         try FedShareCodec.validateBody(body, type: "share_call", header: frame.header)
+        // A malformed management request is a valid wire frame (fed_bad_call),
+        // but local callers must supply the management envelope before dialing.
+        let object = try FedJSONObject(jsonData: body)
+        guard Set(object.keys) == ["method", "params"],
+              case .string(let method) = object["method"], !method.isEmpty else { throw FedShareError.invalidRequest }
         guard body.count <= Int(FedShareCodec.maximumRequestBytes) else { throw FedShareError.invalidRequest }
         self.shareID = shareID
         self.module = module

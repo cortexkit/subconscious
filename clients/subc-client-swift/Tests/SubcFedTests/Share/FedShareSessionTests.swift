@@ -3,29 +3,10 @@ import CryptoKit
 @testable import SubcFed
 
 extension FedShareTests {
-    func testShareWireShapesByteForByte() throws {
-        let ready = Data([22, 0, 0, 0]) + Data(#"{"type":"share_ready"}"#.utf8) + Data([0, 0, 0, 0])
-        XCTAssertEqual(try FedFrameCodec.encode(FedFrame(type: "share_ready"), negotiatedFeatures: ["share-v1"]), ready)
-        var shapes: [(FedFrame, String)] = [
-            (try request().frame, "{\"module\":\"messages\",\"share_id\":\"\(id)\",\"type\":\"share_call\"}"),
-            (frame("response"), "{\"k\":\"response\",\"share_id\":\"\(id)\",\"type\":\"share_result\"}"),
-            (frame("in_progress"), "{\"k\":\"in_progress\",\"share_id\":\"\(id)\",\"type\":\"share_result\"}"),
-            (frame(code: "fed_busy", neverRan: true), "{\"k\":\"error\",\"never_ran\":true,\"share_id\":\"\(id)\",\"type\":\"share_result\"}"),
-        ]
-        for code in FedShareByeCode.allCases {
-            shapes.append((FedFrame(type: "bye", fields: ["code": .string(code.rawValue)]), "{\"code\":\"\(code.rawValue)\",\"type\":\"bye\"}"))
-        }
-        for (frame, json) in shapes {
-            let header = Data(json.utf8)
-            var expected = Data(withUnsafeBytes(of: UInt32(header.count).littleEndian, Array.init))
-            expected += header
-            expected += Data(withUnsafeBytes(of: UInt32(frame.body.count).littleEndian, Array.init))
-            expected += frame.body
-            XCTAssertEqual(try FedFrameCodec.encode(frame, negotiatedFeatures: ["share-v1"]), expected)
-        }
+    func testShareHelloAddsSessionKindWithoutAttemptID() throws {
         let hello = FedShareCodec.hello(policy: try FedHelloPolicy(deviceName: "Phone", features: []),
             incarnation: "11111111-1111-4111-8111-111111111111", ledgerEpoch: "phone-epoch")
-        XCTAssertEqual(try hello.header.jsonData(), Data(#"{"device_name":"Phone","features":["share-v1"],"incarnation":"11111111-1111-4111-8111-111111111111","keepalive_interval_ms":15000,"ledger_epoch":"phone-epoch","max_body_bytes":16777216,"max_in_flight":64,"session_kind":"share","type":"hello","versions":[1]}"#.utf8))
+        XCTAssertEqual(try hello.header.jsonData(), Data(#"{"device_name":"Phone","features":[],"incarnation":"11111111-1111-4111-8111-111111111111","keepalive_interval_ms":15000,"ledger_epoch":"phone-epoch","max_body_bytes":16777216,"max_in_flight":64,"session_kind":"share","type":"hello","versions":[1]}"#.utf8))
     }
 
     func testSessionReadyHelloSerialEightAndDone() async throws {
@@ -37,6 +18,7 @@ extension FedShareTests {
         XCTAssertEqual(report.calls.count, 9)
         XCTAssertEqual(report.calls.prefix(8).map(\.outcome.disposition), Array(repeating: .sent, count: 8))
         XCTAssertEqual(report.calls.last?.outcome.disposition, .outbox)
+        XCTAssertFalse(report.notSupportedByComputer)
         let count = await server.callCount
         let outstanding = await server.maximumOutstanding
         let done = await server.lastBye
@@ -77,7 +59,26 @@ extension FedShareTests {
         let report = try await client(ledger: ledger, server: server).send([request()], to: entry(at: dir, support: false))
         let dials = await server.dialIDs
         XCTAssertTrue(dials.isEmpty)
+        let sent = await server.sentTypes
+        XCTAssertTrue(sent.isEmpty)
+        XCTAssertTrue(report.notSupportedByComputer)
         XCTAssertEqual(report.calls.first?.outcome.disposition, .outbox)
+    }
+
+    func testUnsupportedComputerKeepsMarkedCallShareOnly() async throws {
+        let dir = try directory(), ledger = shareTestLedger(directoryURL: dir)
+        let entry = try await entry(at: dir, support: false)
+        try ledger.markIfAbsent(id, mark: mark(request(), entry: entry))
+        let server = ShareTestServer()
+        let report = try await client(ledger: ledger, server: server).send([request()], to: entry)
+        XCTAssertTrue(report.notSupportedByComputer)
+        XCTAssertEqual(report.calls.first?.outcome.disposition, .unknown)
+        let claim = try XCTUnwrap(report.calls.first?.claim)
+        XCTAssertFalse(try ledger.withLedgerLock { try $0.mayMoveToOutbox(id, claim: claim) })
+        let dials = await server.dialIDs
+        let sent = await server.sentTypes
+        XCTAssertTrue(dials.isEmpty)
+        XCTAssertTrue(sent.isEmpty)
     }
 
     func testSessionAllByeCodesBeforeAndAfterMark() async throws {
@@ -120,33 +121,8 @@ extension FedShareTests {
         XCTAssertEqual(ids, ["lan", "public"])
     }
 
-    func testShareFrameClosedHeadersCanonicalIDAndBodyCaps() throws {
-        let valid = try request().frame
-        var header = valid.header.dictionary
-        header["extra"] = .integer(1)
-        XCTAssertThrowsError(try FedFrameCodec.encode(FedFrame(header: FedJSONObject(header), body: valid.body), negotiatedFeatures: ["share-v1"]))
-        XCTAssertFalse(FedShareCodec.isCanonicalShareID(id.uppercased()))
-        XCTAssertFalse(FedShareCodec.isCanonicalShareID("019a0f00-1234-4000-8000-000000000001"))
+    func testMintedShareIDIsCanonical() throws {
         XCTAssertTrue(FedShareCodec.isCanonicalShareID(FedShareCodec.mintShareID()))
-        XCTAssertThrowsError(try FedFrameCodec.encode(valid))
-        let headerBytes = try valid.header.jsonData()
-        var declaration = Data()
-        for length in [UInt32(headerBytes.count)] { declaration.append(contentsOf: withUnsafeBytes(of: length.littleEndian, Array.init)) }
-        declaration.append(headerBytes)
-        let length: UInt32 = 65_537
-        declaration.append(contentsOf: withUnsafeBytes(of: length.littleEndian, Array.init))
-        var decoder = FedFrameStreamDecoder(negotiationComplete: true, negotiatedFeatures: ["share-v1"])
-        XCTAssertThrowsError(try decoder.append(declaration)) { error in
-            XCTAssertEqual(error as? FedFrameError, .bodyTooLarge(declared: 65_537, maximum: 65_536))
-        }
-        let encoded = try FedFrameCodec.encode(valid, negotiatedFeatures: ["share-v1"])
-        XCTAssertEqual(try FedFrameCodec.decode(encoded, negotiationComplete: true, negotiatedFeatures: ["share-v1"]), valid)
-        XCTAssertThrowsError(try FedFrameCodec.encode(FedFrame(type: "share_ready", body: Data([1])), negotiatedFeatures: ["share-v1"]))
-        let oversizedResult = FedFrame(type: "share_result", fields: ["share_id": .string(id), "k": .string("response")], body: Data(repeating: 1, count: 4_097))
-        XCTAssertThrowsError(try FedFrameCodec.encode(oversizedResult, negotiatedFeatures: ["share-v1"])) { error in
-            XCTAssertEqual(error as? FedFrameError, .bodyTooLarge(declared: 4_097, maximum: 4_096))
-        }
-        XCTAssertThrowsError(try FedFrameCodec.encode(frame("response"), negotiatedMaximumBodyLength: 4_096, negotiatedFeatures: []))
     }
 }
 
@@ -156,6 +132,7 @@ actor ShareTestServer: FedSessionByteTransport {
     let epoch: String
     let ledger: FedShareLedger?
     let resultBody: Data
+    let rawResult: Data?
     let advanceAfterResult: (@Sendable () -> Void)?
     var queue: [Data] = []
     var hello: FedFrame?
@@ -171,9 +148,9 @@ actor ShareTestServer: FedSessionByteTransport {
     var responseQueued = false
 
     init(mode: Mode = .normal, epoch: String = "computer-epoch", ledger: FedShareLedger? = nil,
-         advanceAfterResult: (@Sendable () -> Void)? = nil, resultBody: Data = Data()) {
+         advanceAfterResult: (@Sendable () -> Void)? = nil, resultBody: Data = Data(), rawResult: Data? = nil) {
         self.mode = mode; self.epoch = epoch; self.ledger = ledger; self.advanceAfterResult = advanceAfterResult
-        self.resultBody = resultBody
+        self.resultBody = resultBody; self.rawResult = rawResult
     }
 
     func dialed(_ candidate: FedPeerCandidate) { dialIDs.append(candidate.candidateID) }
@@ -204,7 +181,8 @@ actor ShareTestServer: FedSessionByteTransport {
             case .closeAfterCall: queue.append(Data())
             case .byeAfterCall(let code): try enqueue(FedFrame(type: "bye", fields: ["code": .string(code)]))
             default:
-                try enqueue(FedFrame(type: "share_result", fields: ["share_id": frame.header["share_id"]!, "k": .string("response")], body: resultBody))
+                if let rawResult { queue.append(rawResult) }
+                else { try enqueue(FedFrame(type: "share_result", fields: ["share_id": frame.header["share_id"]!, "k": .string("response")], body: resultBody)) }
                 responseQueued = true
             }
         case "bye": lastBye = frame.byeCode

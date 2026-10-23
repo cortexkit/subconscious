@@ -50,30 +50,11 @@ final class FedShareTests: XCTestCase {
                         body: code.map { Data("{\"code\":\"\($0)\",\"message\":\"reason\"}".utf8) } ?? Data())
     }
 
-    func testDispositionResponse() throws { XCTAssertEqual(try FedShareCodec.outcome(frame("response")).disposition, .sent) }
-    func testDispositionModuleError() throws {
-        XCTAssertEqual(try FedShareCodec.outcome(frame(code: "module_error")).disposition, .sent)
-        let wrapped = FedFrame(type: "share_result", fields: ["share_id": .string(id), "k": .string("error")],
-            body: Data(#"{"code":"executor_error","message":"module failed","detail":{"code":"fed_busy"}}"#.utf8))
-        let outcome = try FedShareCodec.outcome(wrapped)
-        XCTAssertEqual(outcome.disposition, .sent)
-        XCTAssertEqual(outcome.body, wrapped.body)
-    }
-    func testInvalidNeverRanCannotLicenseOutbox() throws {
-        for code in ["executor_error", "fed_dispatch_ambiguous", "fed_share_id_conflict", "fed_share_expired_id", "fed_share_outcome_withheld"] {
-            XCTAssertThrowsError(try FedShareCodec.outcome(frame(code: code, neverRan: true)))
-        }
-    }
-    func testDispositionWithheld() throws { XCTAssertEqual(try FedShareCodec.outcome(frame(code: "fed_share_outcome_withheld")).disposition, .sent) }
-    func testDispositionNeverRanNewest() throws {
-        let ledger = shareTestLedger(directoryURL: try directory())
-        let claim = try ledger.claim(id)
-        let answer = try ledger.record(FedShareCodec.outcome(frame(code: "fed_busy", neverRan: true)), shareID: id, claim: claim)
-        XCTAssertEqual(answer.disposition, .refused)
-        XCTAssertTrue(answer.neverRan)
-        for code in ["fed_not_exposed", "fed_target_unavailable", "fed_unknown_module", "fed_share_clock", "fed_future_refusal"] {
-            XCTAssertEqual(try FedShareCodec.outcome(frame(code: code, neverRan: true)).disposition, .refused)
-        }
+    func testFutureFederationErrorDisposition() throws {
+        XCTAssertEqual(try FedShareCodec.outcome(frame(code: "fed_future_error")).disposition, .unknown)
+        let refusal = try FedShareCodec.outcome(frame(code: "fed_future_refusal", neverRan: true))
+        XCTAssertEqual(refusal.disposition, .refused)
+        XCTAssertTrue(refusal.neverRan)
     }
     func testDispositionSupersededDiscarded() throws {
         let ledger = shareTestLedger(directoryURL: try directory())
@@ -83,16 +64,6 @@ final class FedShareTests: XCTestCase {
         XCTAssertEqual(try ledger.record(FedShareCodec.outcome(frame(code: "fed_busy", neverRan: true)), shareID: id, claim: old).disposition, .discarded)
         XCTAssertEqual(try ledger.entry(shareID: id)?.lastOutcome?.disposition, .sent)
     }
-    func testDispositionRefusalWithoutProof() throws {
-        for code in ["fed_busy", "fed_not_exposed", "fed_target_unavailable", "fed_unknown_module", "fed_share_expired_id", "fed_share_clock"] {
-            let outcome = try FedShareCodec.outcome(frame(code: code))
-            XCTAssertEqual(outcome.disposition, .unknown, code)
-            XCTAssertTrue(outcome.sent)
-        }
-    }
-    func testDispositionConflict() throws { XCTAssertEqual(try FedShareCodec.outcome(frame(code: "fed_share_id_conflict")).disposition, .unknown) }
-    func testDispositionAmbiguous() throws { XCTAssertEqual(try FedShareCodec.outcome(frame(code: "fed_dispatch_ambiguous")).disposition, .unknown) }
-    func testDispositionInProgress() throws { XCTAssertEqual(try FedShareCodec.outcome(frame("in_progress")).disposition, .unknown) }
 
     func mark(_ request: FedShareRequest, entry: FedShareDirectoryEntry, epoch: String = "computer-epoch") throws -> FedShareMark {
         FedShareMark(destinationKey: entry.publicKey, ownKey: entry.ownPublicKey,

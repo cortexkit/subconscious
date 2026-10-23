@@ -11,6 +11,14 @@ public struct FedShareSessionReport: Sendable, Equatable {
     /// Includes unrecognized bye codes verbatim, without granting fallback.
     public let byeCode: String?
     public var knownByeCode: FedShareByeCode? { byeCode.flatMap(FedShareByeCode.init(rawValue:)) }
+    /// The computer did not advertise share-v1; no connection was attempted.
+    public let notSupportedByComputer: Bool
+
+    init(calls: [FedShareCallResult], byeCode: String?, notSupportedByComputer: Bool = false) {
+        self.calls = calls
+        self.byeCode = byeCode
+        self.notSupportedByComputer = notSupportedByComputer
+    }
 }
 
 /// Short-lived direct-only share origin. This never touches SubcFedClient's
@@ -70,7 +78,7 @@ public struct FedShareClient: Sendable {
         let recent = Dictionary(uniqueKeysWithValues: report.calls.map { ($0.shareID, $0) })
         return FedShareSessionReport(calls: requests.map {
             recent[$0.shareID] ?? FedShareCallResult(shareID: $0.shareID, claim: nil, outcome: FedShareOutcome(.unknown))
-        }, byeCode: report.byeCode)
+        }, byeCode: report.byeCode, notSupportedByComputer: report.notSupportedByComputer)
     }
 
     private func sendRecent(_ requests: [FedShareRequest], to computer: FedShareDirectoryEntry) async throws -> FedShareSessionReport {
@@ -80,7 +88,7 @@ public struct FedShareClient: Sendable {
         guard computer.advertisedShareV1, ownKey == computer.ownPublicKey else {
             return FedShareSessionReport(calls: try requests.map {
                 try unattempted($0, code: nil, bindingChanged: ownKey != computer.ownPublicKey)
-            }, byeCode: nil)
+            }, byeCode: nil, notSupportedByComputer: !computer.advertisedShareV1)
         }
         // There is no relay candidate in the directory's schema. LAN always
         // precedes public, and a failed dial never opens a rendezvous socket.
@@ -146,7 +154,10 @@ public struct FedShareClient: Sendable {
                 return (parsed.ledgerEpoch, UInt32(min(parsed.maxBodyBytes, policy.maxBodyBytes)), clock.nowNanoseconds())
             }
         } catch {
-            byeCode = (error as? ShareClose)?.code
+            byeCode = shareCloseCode(error)
+            if byeCode == "fed_protocol_violation" {
+                try? await connection.send(FedFrame(type: "bye", fields: ["code": .string("fed_protocol_violation")]), maximum: UInt32(policy.maxBodyBytes))
+            }
             return FedShareSessionReport(calls: try requests.map { try unattempted($0, code: byeCode) }, byeCode: byeCode)
         }
         let readyAt = remote.readyAt
@@ -196,7 +207,10 @@ public struct FedShareClient: Sendable {
                 }
                 outcome = try FedShareCodec.outcome(result)
             } catch {
-                byeCode = (error as? ShareClose)?.code
+                byeCode = shareCloseCode(error)
+                if byeCode == "fed_protocol_violation" {
+                    try? await connection.send(FedFrame(type: "bye", fields: ["code": .string("fed_protocol_violation")]), maximum: remote.maximum)
+                }
                 let unknown = try ledger.record(FedShareOutcome(.unknown, code: byeCode), shareID: request.shareID, claim: claim)
                 calls.append(FedShareCallResult(shareID: request.shareID, claim: claim, outcome: unknown))
                 for rest in requests.dropFirst(calls.count) { calls.append(try unattempted(rest, code: byeCode)) }
@@ -212,6 +226,15 @@ public struct FedShareClient: Sendable {
 }
 
 private struct ShareClose: Error { let code: String? }
+
+private func shareCloseCode(_ error: any Error) -> String? {
+    if let close = error as? ShareClose { return close.code }
+    if case FedFailure.protocolViolation(let code) = error { return code }
+    if error is FedFrameError || error is FedJSONError || error as? FedShareError == .invalidFrame {
+        return "fed_protocol_violation"
+    }
+    return nil
+}
 
 private actor FedShareConnection {
     let transport: any FedSessionByteTransport

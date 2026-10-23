@@ -1,0 +1,280 @@
+{
+  "cases": [
+    {
+      "expect": "accepted",
+      "frame_hex": "2d0100007b226465766963655f6e616d65223a22766563746f722d70686f6e65222c226665617475726573223a5b226d676d742d7631222c22656666656374732d7631225d2c22696e6361726e6174696f6e223a2231633536636636632d366433642d346139652d396433612d326636653961316434623432222c226b656570616c6976655f696e74657276616c5f6d73223a31353030302c226c65646765725f65706f6368223a2239623164356332652d306633612d346537622d386336642d316132623363346435653666222c226d61785f626f64795f6279746573223a31363737373231362c226d61785f696e5f666c69676874223a36342c2273657373696f6e5f6b696e64223a227368617265222c2274797065223a2268656c6c6f222c2276657273696f6e73223a5b315d7d00000000",
+      "header": {
+        "device_name": "vector-phone",
+        "features": [
+          "mgmt-v1",
+          "effects-v1"
+        ],
+        "incarnation": "1c56cf6c-6d3d-4a9e-9d3a-2f6e9a1d4b42",
+        "keepalive_interval_ms": 15000,
+        "ledger_epoch": "9b1d5c2e-0f3a-4e7b-8c6d-1a2b3c4d5e6f",
+        "max_body_bytes": 16777216,
+        "max_in_flight": 64,
+        "session_kind": "share",
+        "type": "hello",
+        "versions": [
+          1
+        ]
+      },
+      "id": "share_hello",
+      "note": "the phone's share hello: an ordinary hello plus session_kind \"share\", with no connection_attempt_id",
+      "receiver": "noise_responder",
+      "session_kind": "share"
+    },
+    {
+      "expect": "accepted",
+      "frame_hex": "160100007b226465766963655f6e616d65223a22766563746f722d70686f6e65222c226665617475726573223a5b226d676d742d7631222c22656666656374732d7631225d2c22696e6361726e6174696f6e223a2231633536636636632d366433642d346139652d396433612d326636653961316434623432222c226b656570616c6976655f696e74657276616c5f6d73223a31353030302c226c65646765725f65706f6368223a2239623164356332652d306633612d346537622d386336642d316132623363346435653666222c226d61785f626f64795f6279746573223a31363737373231362c226d61785f696e5f666c69676874223a36342c2274797065223a2268656c6c6f222c2276657273696f6e73223a5b315d7d00000000",
+      "header": {
+        "device_name": "vector-phone",
+        "features": [
+          "mgmt-v1",
+          "effects-v1"
+        ],
+        "incarnation": "1c56cf6c-6d3d-4a9e-9d3a-2f6e9a1d4b42",
+        "keepalive_interval_ms": 15000,
+        "ledger_epoch": "9b1d5c2e-0f3a-4e7b-8c6d-1a2b3c4d5e6f",
+        "max_body_bytes": 16777216,
+        "max_in_flight": 64,
+        "type": "hello",
+        "versions": [
+          1
+        ]
+      },
+      "id": "ordinary_hello_without_session_kind",
+      "note": "an absent session_kind means an ordinary session, exactly as before the member existed",
+      "receiver": "noise_responder",
+      "session_kind": "ordinary"
+    },
+    {
+      "expect": "accepted",
+      "frame_hex": "240100007b226465766963655f6e616d65223a22766563746f722d636f6d7075746572222c226665617475726573223a5b226d676d742d7631222c22656666656374732d7631222c2273686172652d7631225d2c22696e6361726e6174696f6e223a2231633536636636632d366433642d346139652d396433612d326636653961316434623432222c226b656570616c6976655f696e74657276616c5f6d73223a31353030302c226c65646765725f65706f6368223a2239623164356332652d306633612d346537622d386336642d316132623363346435653666222c226d61785f626f64795f6279746573223a31363737373231362c226d61785f696e5f666c69676874223a36342c2274797065223a2268656c6c6f222c2276657273696f6e73223a5b315d7d00000000",
+      "header": {
+        "device_name": "vector-computer",
+        "features": [
+          "mgmt-v1",
+          "effects-v1",
+          "share-v1"
+        ],
+        "incarnation": "1c56cf6c-6d3d-4a9e-9d3a-2f6e9a1d4b42",
+        "keepalive_interval_ms": 15000,
+        "ledger_epoch": "9b1d5c2e-0f3a-4e7b-8c6d-1a2b3c4d5e6f",
+        "max_body_bytes": 16777216,
+        "max_in_flight": 64,
+        "type": "hello",
+        "versions": [
+          1
+        ]
+      },
+      "id": "computer_hello_advertising_share_v1",
+      "note": "a computer that serves share sessions lists share-v1 in every hello it sends; its own hello has no session_kind",
+      "receiver": "noise_initiator",
+      "session_kind": "ordinary"
+    },
+    {
+      "bye": "fed_limits_unsupported",
+      "expect": "refused",
+      "frame_hex": "680100007b22636f6e6e656374696f6e5f617474656d70745f6964223a223031323334353637383961626364656630313233343536373839616263646566222c226465766963655f6e616d65223a22766563746f722d70686f6e65222c226665617475726573223a5b226d676d742d7631222c22656666656374732d7631225d2c22696e6361726e6174696f6e223a2231633536636636632d366433642d346139652d396433612d326636653961316434623432222c226b656570616c6976655f696e74657276616c5f6d73223a31353030302c226c65646765725f65706f6368223a2239623164356332652d306633612d346537622d386336642d316132623363346435653666222c226d61785f626f64795f6279746573223a31363737373231362c226d61785f696e5f666c69676874223a36342c2273657373696f6e5f6b696e64223a227368617265222c2274797065223a2268656c6c6f222c2276657273696f6e73223a5b315d7d00000000",
+      "header": {
+        "connection_attempt_id": "0123456789abcdef0123456789abcdef",
+        "device_name": "vector-phone",
+        "features": [
+          "mgmt-v1",
+          "effects-v1"
+        ],
+        "incarnation": "1c56cf6c-6d3d-4a9e-9d3a-2f6e9a1d4b42",
+        "keepalive_interval_ms": 15000,
+        "ledger_epoch": "9b1d5c2e-0f3a-4e7b-8c6d-1a2b3c4d5e6f",
+        "max_body_bytes": 16777216,
+        "max_in_flight": 64,
+        "session_kind": "share",
+        "type": "hello",
+        "versions": [
+          1
+        ]
+      },
+      "id": "share_hello_with_connection_attempt_id",
+      "note": "a share hello must not carry connection_attempt_id: share sessions are never arbitrated",
+      "receiver": "noise_responder"
+    },
+    {
+      "bye": "fed_limits_unsupported",
+      "expect": "refused",
+      "frame_hex": "2f0100007b226465766963655f6e616d65223a22766563746f722d70686f6e65222c226665617475726573223a5b226d676d742d7631222c22656666656374732d7631225d2c22696e6361726e6174696f6e223a2231633536636636632d366433642d346139652d396433612d326636653961316434623432222c226b656570616c6976655f696e74657276616c5f6d73223a31353030302c226c65646765725f65706f6368223a2239623164356332652d306633612d346537622d386336642d316132623363346435653666222c226d61785f626f64795f6279746573223a31363737373231362c226d61785f696e5f666c69676874223a36342c2273657373696f6e5f6b696e64223a2273686172696e67222c2274797065223a2268656c6c6f222c2276657273696f6e73223a5b315d7d00000000",
+      "header": {
+        "device_name": "vector-phone",
+        "features": [
+          "mgmt-v1",
+          "effects-v1"
+        ],
+        "incarnation": "1c56cf6c-6d3d-4a9e-9d3a-2f6e9a1d4b42",
+        "keepalive_interval_ms": 15000,
+        "ledger_epoch": "9b1d5c2e-0f3a-4e7b-8c6d-1a2b3c4d5e6f",
+        "max_body_bytes": 16777216,
+        "max_in_flight": 64,
+        "session_kind": "sharing",
+        "type": "hello",
+        "versions": [
+          1
+        ]
+      },
+      "id": "session_kind_unknown",
+      "note": "any session_kind other than \"share\" is refused",
+      "receiver": "noise_responder"
+    },
+    {
+      "bye": "fed_limits_unsupported",
+      "expect": "refused",
+      "frame_hex": "2d0100007b226465766963655f6e616d65223a22766563746f722d70686f6e65222c226665617475726573223a5b226d676d742d7631222c22656666656374732d7631225d2c22696e6361726e6174696f6e223a2231633536636636632d366433642d346139652d396433612d326636653961316434623432222c226b656570616c6976655f696e74657276616c5f6d73223a31353030302c226c65646765725f65706f6368223a2239623164356332652d306633612d346537622d386336642d316132623363346435653666222c226d61785f626f64795f6279746573223a31363737373231362c226d61785f696e5f666c69676874223a36342c2273657373696f6e5f6b696e64223a225368617265222c2274797065223a2268656c6c6f222c2276657273696f6e73223a5b315d7d00000000",
+      "header": {
+        "device_name": "vector-phone",
+        "features": [
+          "mgmt-v1",
+          "effects-v1"
+        ],
+        "incarnation": "1c56cf6c-6d3d-4a9e-9d3a-2f6e9a1d4b42",
+        "keepalive_interval_ms": 15000,
+        "ledger_epoch": "9b1d5c2e-0f3a-4e7b-8c6d-1a2b3c4d5e6f",
+        "max_body_bytes": 16777216,
+        "max_in_flight": 64,
+        "session_kind": "Share",
+        "type": "hello",
+        "versions": [
+          1
+        ]
+      },
+      "id": "session_kind_wrong_case",
+      "note": "the value is case-sensitive",
+      "receiver": "noise_responder"
+    },
+    {
+      "bye": "fed_limits_unsupported",
+      "expect": "refused",
+      "frame_hex": "300100007b226465766963655f6e616d65223a22766563746f722d70686f6e65222c226665617475726573223a5b226d676d742d7631222c22656666656374732d7631225d2c22696e6361726e6174696f6e223a2231633536636636632d366433642d346139652d396433612d326636653961316434623432222c226b656570616c6976655f696e74657276616c5f6d73223a31353030302c226c65646765725f65706f6368223a2239623164356332652d306633612d346537622d386336642d316132623363346435653666222c226d61785f626f64795f6279746573223a31363737373231362c226d61785f696e5f666c69676874223a36342c2273657373696f6e5f6b696e64223a226f7264696e617279222c2274797065223a2268656c6c6f222c2276657273696f6e73223a5b315d7d00000000",
+      "header": {
+        "device_name": "vector-phone",
+        "features": [
+          "mgmt-v1",
+          "effects-v1"
+        ],
+        "incarnation": "1c56cf6c-6d3d-4a9e-9d3a-2f6e9a1d4b42",
+        "keepalive_interval_ms": 15000,
+        "ledger_epoch": "9b1d5c2e-0f3a-4e7b-8c6d-1a2b3c4d5e6f",
+        "max_body_bytes": 16777216,
+        "max_in_flight": 64,
+        "session_kind": "ordinary",
+        "type": "hello",
+        "versions": [
+          1
+        ]
+      },
+      "id": "session_kind_ordinary_spelled_out",
+      "note": "only an absent member means ordinary",
+      "receiver": "noise_responder"
+    },
+    {
+      "bye": "fed_limits_unsupported",
+      "expect": "refused",
+      "frame_hex": "280100007b226465766963655f6e616d65223a22766563746f722d70686f6e65222c226665617475726573223a5b226d676d742d7631222c22656666656374732d7631225d2c22696e6361726e6174696f6e223a2231633536636636632d366433642d346139652d396433612d326636653961316434623432222c226b656570616c6976655f696e74657276616c5f6d73223a31353030302c226c65646765725f65706f6368223a2239623164356332652d306633612d346537622d386336642d316132623363346435653666222c226d61785f626f64795f6279746573223a31363737373231362c226d61785f696e5f666c69676874223a36342c2273657373696f6e5f6b696e64223a22222c2274797065223a2268656c6c6f222c2276657273696f6e73223a5b315d7d00000000",
+      "header": {
+        "device_name": "vector-phone",
+        "features": [
+          "mgmt-v1",
+          "effects-v1"
+        ],
+        "incarnation": "1c56cf6c-6d3d-4a9e-9d3a-2f6e9a1d4b42",
+        "keepalive_interval_ms": 15000,
+        "ledger_epoch": "9b1d5c2e-0f3a-4e7b-8c6d-1a2b3c4d5e6f",
+        "max_body_bytes": 16777216,
+        "max_in_flight": 64,
+        "session_kind": "",
+        "type": "hello",
+        "versions": [
+          1
+        ]
+      },
+      "id": "session_kind_empty",
+      "note": "an empty string is not a kind",
+      "receiver": "noise_responder"
+    },
+    {
+      "bye": "fed_limits_unsupported",
+      "expect": "refused",
+      "frame_hex": "270100007b226465766963655f6e616d65223a22766563746f722d70686f6e65222c226665617475726573223a5b226d676d742d7631222c22656666656374732d7631225d2c22696e6361726e6174696f6e223a2231633536636636632d366433642d346139652d396433612d326636653961316434623432222c226b656570616c6976655f696e74657276616c5f6d73223a31353030302c226c65646765725f65706f6368223a2239623164356332652d306633612d346537622d386336642d316132623363346435653666222c226d61785f626f64795f6279746573223a31363737373231362c226d61785f696e5f666c69676874223a36342c2273657373696f6e5f6b696e64223a312c2274797065223a2268656c6c6f222c2276657273696f6e73223a5b315d7d00000000",
+      "header": {
+        "device_name": "vector-phone",
+        "features": [
+          "mgmt-v1",
+          "effects-v1"
+        ],
+        "incarnation": "1c56cf6c-6d3d-4a9e-9d3a-2f6e9a1d4b42",
+        "keepalive_interval_ms": 15000,
+        "ledger_epoch": "9b1d5c2e-0f3a-4e7b-8c6d-1a2b3c4d5e6f",
+        "max_body_bytes": 16777216,
+        "max_in_flight": 64,
+        "session_kind": 1,
+        "type": "hello",
+        "versions": [
+          1
+        ]
+      },
+      "id": "session_kind_not_a_string",
+      "note": "a non-string value is refused like an unknown one",
+      "receiver": "noise_responder"
+    },
+    {
+      "bye": "fed_limits_unsupported",
+      "expect": "refused",
+      "frame_hex": "2a0100007b226465766963655f6e616d65223a22766563746f722d70686f6e65222c226665617475726573223a5b226d676d742d7631222c22656666656374732d7631225d2c22696e6361726e6174696f6e223a2231633536636636632d366433642d346139652d396433612d326636653961316434623432222c226b656570616c6976655f696e74657276616c5f6d73223a31353030302c226c65646765725f65706f6368223a2239623164356332652d306633612d346537622d386336642d316132623363346435653666222c226d61785f626f64795f6279746573223a31363737373231362c226d61785f696e5f666c69676874223a36342c2273657373696f6e5f6b696e64223a6e756c6c2c2274797065223a2268656c6c6f222c2276657273696f6e73223a5b315d7d00000000",
+      "header": {
+        "device_name": "vector-phone",
+        "features": [
+          "mgmt-v1",
+          "effects-v1"
+        ],
+        "incarnation": "1c56cf6c-6d3d-4a9e-9d3a-2f6e9a1d4b42",
+        "keepalive_interval_ms": 15000,
+        "ledger_epoch": "9b1d5c2e-0f3a-4e7b-8c6d-1a2b3c4d5e6f",
+        "max_body_bytes": 16777216,
+        "max_in_flight": 64,
+        "session_kind": null,
+        "type": "hello",
+        "versions": [
+          1
+        ]
+      },
+      "id": "session_kind_null",
+      "note": "null is not absence",
+      "receiver": "noise_responder"
+    },
+    {
+      "bye": "fed_protocol_violation",
+      "expect": "refused",
+      "frame_hex": "2d0100007b226465766963655f6e616d65223a22766563746f722d70686f6e65222c226665617475726573223a5b226d676d742d7631222c22656666656374732d7631225d2c22696e6361726e6174696f6e223a2231633536636636632d366433642d346139652d396433612d326636653961316434623432222c226b656570616c6976655f696e74657276616c5f6d73223a31353030302c226c65646765725f65706f6368223a2239623164356332652d306633612d346537622d386336642d316132623363346435653666222c226d61785f626f64795f6279746573223a31363737373231362c226d61785f696e5f666c69676874223a36342c2273657373696f6e5f6b696e64223a227368617265222c2274797065223a2268656c6c6f222c2276657273696f6e73223a5b315d7d00000000",
+      "header": {
+        "device_name": "vector-phone",
+        "features": [
+          "mgmt-v1",
+          "effects-v1"
+        ],
+        "incarnation": "1c56cf6c-6d3d-4a9e-9d3a-2f6e9a1d4b42",
+        "keepalive_interval_ms": 15000,
+        "ledger_epoch": "9b1d5c2e-0f3a-4e7b-8c6d-1a2b3c4d5e6f",
+        "max_body_bytes": 16777216,
+        "max_in_flight": 64,
+        "session_kind": "share",
+        "type": "hello",
+        "versions": [
+          1
+        ]
+      },
+      "id": "share_hello_from_noise_responder",
+      "note": "only the Noise initiator (the phone, which dials) may send a share hello",
+      "receiver": "noise_initiator"
+    }
+  ],
+  "description": "share-v1 hello shapes (fed-wire §3.7, §6). Rows with expect \"accepted\" must be accepted and read as the named session_kind; rows with expect \"refused\" must be answered with the named bye and closed. receiver names the receiving side's Noise role."
+}

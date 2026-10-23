@@ -84,6 +84,10 @@ store, arbitrates an ordinary session, or opens a rendezvous control socket.
 It dials **LAN, then public direct candidates only**, never relay. The app may
 keep its ordinary session open. Refresh the snapshot below when the app learns
 new authenticated feature facts or candidates, or changes its origin identity.
+If the snapshot does not advertise `share-v1`, `send` returns
+`report.notSupportedByComputer == true` ("not supported by this computer")
+without dialing or sending a hello. This is distinct from a failed connection;
+per-call outcomes still honor any earlier durable marks.
 
 Adopt two library-owned files in the same App Group directory in both targets:
 
@@ -119,6 +123,12 @@ The extension carries them in its hello with `session_kind: "share"` and no
 `connection_attempt_id`. By contrast, the epoch pinned in each ledger mark is
 the **computer's `ledger_epoch` from the authenticated share-session hello**.
 Never substitute the directory's origin epoch for that serving epoch.
+
+The shared wire fixtures live in `vectors/fed-share-v1/`, pinned to the
+`share-v1-vectors-v1.0` release. Share tests check every hello, frame, code and
+disposition row, plus the release's SHA-256 digests. An illegal `never_ran`
+proof is reported as `fed_protocol_violation` with an unknown outcome, never
+as permission to move a marked id to the outbox.
 
 `send` waits for `share_ready`, sends at most eight calls, one outstanding at a
 time, stops starting calls after 60 seconds, and closes with `fed_share_done`.

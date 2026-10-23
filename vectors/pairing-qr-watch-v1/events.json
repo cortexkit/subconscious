@@ -1,0 +1,44 @@
+{
+  "cases": [
+    {
+      "event_json": "{\"state\":\"open\"}",
+      "id": "open"
+    },
+    {
+      "event_json": "{\"state\":\"granted\"}",
+      "id": "granted"
+    },
+    {
+      "event_json": "{\"state\":\"declined\"}",
+      "id": "declined"
+    },
+    {
+      "event_json": "{\"state\":\"expired\"}",
+      "id": "expired"
+    },
+    {
+      "event_json": "{\"state\":\"foreign_attempt\",\"source_addr\":\"192.0.2.9\"}",
+      "id": "foreign_attempt"
+    },
+    {
+      "event_json": "{\"state\":\"foreign_attempt\",\"source_addr\":\"2001:db8::9\"}",
+      "id": "foreign_attempt_ipv6"
+    },
+    {
+      "event_json": "{\"state\":\"claimed\",\"device_name\":\"iPhone\",\"source_addr\":\"192.0.2.8\",\"fingerprint\":\"4bb06f8e4e3a7715d201d573d0aa4237\"}",
+      "id": "claimed_name_present"
+    },
+    {
+      "event_json": "{\"state\":\"claimed\",\"device_name\":null,\"source_addr\":\"192.0.2.8\",\"fingerprint\":\"4bb06f8e4e3a7715d201d573d0aa4237\"}",
+      "id": "claimed_name_null"
+    },
+    {
+      "event_json": "{\"state\":\"claimed\",\"device_name\":\"iPhone[31m \\\"\\\\\",\"source_addr\":\"192.0.2.8\",\"fingerprint\":\"4bb06f8e4e3a7715d201d573d0aa4237\"}",
+      "id": "claimed_display_safe"
+    },
+    {
+      "event_json": "{\"state\":\"claimed\",\"device_name\":\"iPhone\",\"source_addr\":\"2001:db8::8\",\"fingerprint\":\"4bb06f8e4e3a7715d201d573d0aa4237\"}",
+      "id": "claimed_ipv6"
+    }
+  ]
+}

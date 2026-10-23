@@ -43,6 +43,48 @@ fn files(folder: &str) -> Vec<String> {
     names
 }
 
+/// Callosum's published watch vectors (tag `pairing-qr-watch-vectors-v1.0`),
+/// copied byte for byte into `vectors/pairing-qr-watch-v1/`. Each case is the
+/// exact notice body callosum sends.
+const CALLOSUM_EVENTS: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../vectors/pairing-qr-watch-v1/events.json"
+);
+
+/// Every notice callosum can send is read, and read as what it says: the state
+/// it names, and for a claim the exact name, address and fingerprint it
+/// carries. A null name stays absent rather than becoming a stand-in.
+#[test]
+fn every_callosum_watch_vector_is_read_as_sent() {
+    let text = std::fs::read_to_string(CALLOSUM_EVENTS)
+        .unwrap_or_else(|e| panic!("{CALLOSUM_EVENTS}: {e}"));
+    let file: Value = serde_json::from_str(&text).unwrap();
+    let cases = file["cases"].as_array().expect("cases");
+    assert_eq!(cases.len(), 10, "callosum's v1.0 set has ten cases");
+    for case in cases {
+        let id = case["id"].as_str().unwrap();
+        let body: Value = serde_json::from_str(case["event_json"].as_str().unwrap()).unwrap();
+        let event = watch_event(&body)
+            .unwrap_or_else(|e| panic!("{id} is unreadable: {e:?}"))
+            .unwrap_or_else(|| panic!("{id} was skipped"));
+        let text = |key: &str| body[key].as_str().unwrap().to_string();
+        let expected = match body["state"].as_str().unwrap() {
+            "open" => WatchEvent::Open,
+            "granted" => WatchEvent::Granted,
+            "declined" => WatchEvent::Declined,
+            "expired" => WatchEvent::Expired,
+            "foreign_attempt" => WatchEvent::ForeignAttempt(text("source_addr")),
+            "claimed" => WatchEvent::Claimed(Claim {
+                device_name: body["device_name"].as_str().map(str::to_owned),
+                source_addr: text("source_addr"),
+                fingerprint: text("fingerprint"),
+            }),
+            other => panic!("{id}: state {other} is new to this test"),
+        };
+        assert_eq!(event, expected, "{id}");
+    }
+}
+
 // ---- one test per state ----------------------------------------------------------
 
 #[test]

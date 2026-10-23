@@ -32,9 +32,10 @@ const BACKOFF_MS: i64 = 30_000;
 
 /// How long a confirm call may run. Callosum asks for Touch ID and only then
 /// re-checks the claim, whose own 120 s limit a pending prompt doesn't
-/// extend, so the call can outlive both the claim and the window. The
-/// operator-confirm deadline in the subc SDK is 290 s; this leaves room past
-/// it for callosum's answer to arrive.
+/// extend, so the call can outlive both the claim and the window. Callosum
+/// waits up to 290 s for Touch ID (`operator.confirm`'s deadline in
+/// subc-client-rs, the module SDK it is built on); this leaves room past it
+/// for callosum's answer to arrive.
 pub const CONFIRM_TIMEOUT_MS: u64 = 300_000;
 
 /// How ck shows a phone callosum's registry has no name for.

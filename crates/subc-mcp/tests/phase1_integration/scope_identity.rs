@@ -263,6 +263,17 @@ impl IdentityHarness {
     }
 }
 
+/// A folder as the daemon stores it and the gateway sends it: canonical, and
+/// on Windows in the plain spelling. `std::fs::canonicalize` returns the
+/// verbatim `\\?\` form there, which neither ever sends
+/// (docs/path-canonicalization.md).
+fn daemon_canonical(path: &Path) -> PathBuf {
+    subc_daemon::ProjectRootId::from_path_allowing_missing(path)
+        .unwrap()
+        .as_path()
+        .to_path_buf()
+}
+
 fn explicit() -> Value {
     json!({"result":{"projectId":"project-test", "via":"root"}})
 }
@@ -273,7 +284,7 @@ async fn scope_identity_roots_stamp_has_workdir_and_project() {
     let bind = h.provider.bound().await;
     assert_eq!(
         bind.pointer("/scope/workdir"),
-        Some(&json!(fs::canonicalize(&h.root).unwrap()))
+        Some(&json!(daemon_canonical(&h.root)))
     );
     assert_eq!(
         bind.pointer("/scope/project_id"),
@@ -285,9 +296,7 @@ async fn scope_identity_roots_stamp_has_workdir_and_project() {
     );
     assert_eq!(
         *h.entorhinal.requests.lock().await,
-        vec![
-            json!({"method":"resolve","params":{"canonicalRoot":fs::canonicalize(&h.root).unwrap()}})
-        ]
+        vec![json!({"method":"resolve","params":{"canonicalRoot":daemon_canonical(&h.root)}})]
     );
     h.shutdown().await;
 }
@@ -298,7 +307,7 @@ async fn scope_identity_no_roots_uses_fallback() {
     let bind = h.provider.bound().await;
     assert_eq!(
         bind.pointer("/scope/workdir"),
-        Some(&json!(fs::canonicalize(h.project.path.as_ref()).unwrap()))
+        Some(&json!(daemon_canonical(h.project.path.as_ref())))
     );
     h.shutdown().await;
 }
@@ -315,7 +324,7 @@ async fn scope_identity_entorhinal_refusal_leaves_project_unset() {
     let bind = h.provider.bound().await;
     assert_eq!(
         bind.pointer("/scope/workdir"),
-        Some(&json!(fs::canonicalize(&h.root).unwrap()))
+        Some(&json!(daemon_canonical(&h.root)))
     );
     assert!(bind.pointer("/scope/project_id").is_none());
     h.shutdown().await;
@@ -451,7 +460,7 @@ async fn scope_identity_implicit_project_is_not_attribution() {
     let bind = h.provider.bound().await;
     assert_eq!(
         bind.pointer("/scope/workdir"),
-        Some(&json!(fs::canonicalize(&h.root).unwrap()))
+        Some(&json!(daemon_canonical(&h.root)))
     );
     assert!(bind.pointer("/scope/project_id").is_none());
     h.shutdown().await;
@@ -463,7 +472,7 @@ async fn scope_identity_empty_roots_uses_fallback() {
     let bind = h.provider.bound().await;
     assert_eq!(
         bind.pointer("/scope/workdir"),
-        Some(&json!(fs::canonicalize(h.project.path.as_ref()).unwrap()))
+        Some(&json!(daemon_canonical(h.project.path.as_ref())))
     );
     h.shutdown().await;
 }
@@ -532,7 +541,7 @@ async fn scope_fallback_unreserved_supervised_module_creates_record() {
     let bind = h.provider.bound().await;
     assert_eq!(
         bind.pointer("/scope/workdir"),
-        Some(&json!(fs::canonicalize(&h.root).unwrap()))
+        Some(&json!(daemon_canonical(&h.root)))
     );
     assert_eq!(
         bind.pointer("/scope/project_id"),
@@ -617,12 +626,12 @@ async fn scope_fallback_non_file_root_uses_shim_root() {
     let bind = h.provider.bound().await;
     assert_eq!(
         bind.pointer("/scope/workdir"),
-        Some(&json!(fs::canonicalize(h.project.path.as_ref()).unwrap()))
+        Some(&json!(daemon_canonical(h.project.path.as_ref())))
     );
     assert_eq!(
         *h.entorhinal.requests.lock().await,
         vec![
-            json!({"method":"resolve", "params":{"canonicalRoot":fs::canonicalize(h.project.path.as_ref()).unwrap()}})
+            json!({"method":"resolve", "params":{"canonicalRoot":daemon_canonical(h.project.path.as_ref())}})
         ]
     );
     h.shutdown().await;
@@ -635,7 +644,7 @@ async fn scope_fallback_roots_error_uses_shim_root() {
     let bind = h.provider.bound().await;
     assert_eq!(
         bind.pointer("/scope/workdir"),
-        Some(&json!(fs::canonicalize(h.project.path.as_ref()).unwrap()))
+        Some(&json!(daemon_canonical(h.project.path.as_ref())))
     );
     h.shutdown().await;
 }

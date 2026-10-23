@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.42
+
+- The session record's working folder, and the root sent to Entorhinal's `resolve`, use the canonical spelling the daemon stores. On Windows, `std::fs::canonicalize` returned the verbatim `\\?\C:\` form, so Entorhinal was asked to resolve a root string no project was registered under.
+
 ## 0.1.41
 
 - Own a minimal session scope for MCP connections without a valid `CK_INSTANCE_TOKEN`. After initialization, request the client's roots and normalize the first root to its enclosing git checkout or worktree. With no roots capability or an empty roots list, use the shim's project root and log the fallback; invalid/non-local roots, roots errors and timeouts also fall back to that root with a warning. Resolve the folder once through Entorhinal before registering the record; implicit, refused and unavailable answers leave `project_id` unset. The folder and project remain fixed for the session, and disconnect ends the record. Attribution uses current supervised-launch scope authority, independent of `reserved`, and is attempted only when `server.describe` advertises workdir support. Unsupported daemons, scope refusals and attribution failures leave routes unscoped without losing tools or stopping catalog refresh. Startup route-attestation requirements are unchanged.

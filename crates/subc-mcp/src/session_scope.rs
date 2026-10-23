@@ -347,6 +347,16 @@ async fn daemon_supports_workdir(subc: &SubcClient) -> Result<bool> {
     }
 }
 
+/// The folder in the spelling the daemon stores and Entorhinal keys on:
+/// canonical, and on Windows without the verbatim `\\?\` prefix that
+/// `std::fs::canonicalize` returns there. Sending the verbatim form would make
+/// Entorhinal's `resolve` look up a root string no project was registered under.
+fn canonical_dir(path: &Path) -> Result<PathBuf> {
+    cortexkit_paths::ProjectRootId::from_path(path)
+        .map(cortexkit_paths::ProjectRootId::into_path_buf)
+        .map_err(|error| other_error(format!("session workdir {}: {error}", path.display())))
+}
+
 async fn session_workdir(peer: &Peer<RoleServer>, fallback: &Path) -> Result<String> {
     let supports_roots = peer
         .peer_info()
@@ -363,18 +373,18 @@ async fn session_workdir(peer: &Peer<RoleServer>, fallback: &Path) -> Result<Str
             .first()
             .map(|root| file_uri_path(&root.uri))
             .transpose()?;
-        root.map(fs::canonicalize).transpose().map_err(Into::into)
+        root.map(|root| canonical_dir(&root)).transpose()
     }
     .await;
     let (path, normalize) = match root {
         Ok(Some(path)) => (path, true),
         Ok(None) => {
             tracing::info!(fallback = %fallback.display(), "MCP client has no roots; using shim project root for session workdir");
-            (fs::canonicalize(fallback)?, false)
+            (canonical_dir(fallback)?, false)
         }
         Err(error) => {
             tracing::warn!(fallback = %fallback.display(), "MCP roots unavailable; using shim project root for session workdir: {error}");
-            (fs::canonicalize(fallback)?, false)
+            (canonical_dir(fallback)?, false)
         }
     };
     let canonical = path;

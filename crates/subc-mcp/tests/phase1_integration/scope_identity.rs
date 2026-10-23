@@ -292,7 +292,7 @@ async fn scope_identity_roots_stamp_has_workdir_and_project() {
     );
     assert_eq!(
         bind.pointer("/identity/project_root"),
-        Some(&json!(h.project.path.as_ref()))
+        Some(&json!(daemon_canonical(h.project.path.as_ref())))
     );
     assert_eq!(
         *h.entorhinal.requests.lock().await,
@@ -335,7 +335,7 @@ async fn scope_identity_legacy_bind_bytes_are_unchanged() {
     let mut h = IdentityHarness::start(false, RootsMode::Folder, explicit(), false).await;
     let (bind, bytes) = h.provider.bound_raw().await;
     let expected = json!({"op":"route.bind", "route_channel":bind["route_channel"], "epoch":bind["epoch"],
-        "identity":{"project_root":h.project.path.as_ref(), "harness":"mcp:generic", "session":bind["identity"]["session"]},
+        "identity":{"project_root":daemon_canonical(h.project.path.as_ref()), "harness":"mcp:generic", "session":bind["identity"]["session"]},
         "principal":{"kind":"reserved","module_id":"subc-mcp"},
         "target":{"kind":"tool_provider", "module_id":"scope-probe"}});
     // Compare the complete bind object, not a projection of its legacy keys.
@@ -343,7 +343,7 @@ async fn scope_identity_legacy_bind_bytes_are_unchanged() {
     let expected_bytes = format!(
         "{{\"op\":\"route.bind\",\"route_channel\":{},\"epoch\":{},\"target\":{{\"kind\":\"tool_provider\",\"module_id\":\"scope-probe\"}},\"identity\":{{\"project_root\":{},\"harness\":\"mcp:generic\",\"session\":{}}},\"principal\":{{\"kind\":\"reserved\",\"module_id\":\"subc-mcp\"}}}}",
         bind["route_channel"], bind["epoch"],
-        serde_json::to_string(h.project.path.as_ref()).unwrap(),
+        serde_json::to_string(&daemon_canonical(h.project.path.as_ref())).unwrap(),
         bind["identity"]["session"],
     );
     assert_eq!(bytes, expected_bytes.as_bytes());

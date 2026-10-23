@@ -700,6 +700,38 @@ pub struct Devices {
     pub lan_addrs: Option<Vec<String>>,
     pub rendezvous: Option<String>,
     pub watch_ops_offered: Option<u64>,
+    /// The access groups a new phone can be paired with.
+    pub access_groups: AccessGroups,
+}
+
+/// A group of operations a paired device may call: one key of the
+/// `expose_profiles` map in this Mac's `fed-profile.json`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AccessGroup {
+    pub name: String,
+    /// How many operations the group allows; `None` when callosum doesn't
+    /// say.
+    pub operation_count: Option<u64>,
+}
+
+/// What `callosum.devices_read` says about the access groups
+/// (`self.expose_profiles`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AccessGroups {
+    /// The groups, in callosum's order.
+    Listed(Vec<AccessGroup>),
+    /// The reply has no list: callosum predates it.
+    Unlisted,
+    /// The list is there but not in a shape ck can read, so ck offers no
+    /// group rather than guess one.
+    Malformed,
+}
+
+impl Default for AccessGroups {
+    /// Nothing read: no group can be offered.
+    fn default() -> AccessGroups {
+        AccessGroups::Malformed
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -749,6 +781,11 @@ pub struct Snapshot {
     pub last_result: Option<ActionResult>,
     /// Which keys and screens the app serves; it advertises nothing else.
     pub serves: Serves,
+    /// The latest results of the Add a phone exchange, each with its
+    /// sequence number, oldest first. The app applies those newer than the
+    /// last it applied, so a result is never lost when snapshots come
+    /// faster than frames.
+    pub pairing: Vec<(u64, crate::pairing::flow::Event)>,
 }
 
 /// The app's tabs, in the order the tab bar draws them.
@@ -1427,6 +1464,15 @@ mod fixture {
             lan_addrs: Some(vec!["192.168.1.20:7841".into()]),
             rendezvous: Some("rdv.cortexkit.io".into()),
             watch_ops_offered: Some(10),
+            access_groups: AccessGroups::Listed(
+                arr(&v["pairing"]["groups"])
+                    .iter()
+                    .map(|g| AccessGroup {
+                        name: s(&g[0]),
+                        operation_count: g[1].as_u64(),
+                    })
+                    .collect(),
+            ),
         };
 
         let commands = arr(&v["commands"])
@@ -1488,6 +1534,7 @@ mod fixture {
             log_view: None,
             last_result: None,
             serves: Serves::DESIGN,
+            pairing: Vec::new(),
         })
     }
 }

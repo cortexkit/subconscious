@@ -18,7 +18,7 @@ fn app() -> App {
     app.tab = Tab::Devices;
     app.overlay = Some(Overlay::Pairing);
     let now = Snapshot::fixture_now();
-    app.pairing = Some(
+    app.pairing.window = Some(
         PairingState::new(
             &payload(),
             "phone".into(),
@@ -56,7 +56,7 @@ fn text(buf: &Buffer) -> String {
 }
 
 fn claim(app: &mut App) {
-    let s = app.pairing.as_mut().unwrap();
+    let s = app.pairing.window.as_mut().unwrap();
     s.claim = Some(Claim {
         device_name: "iPhone".into(),
         source_addr: "192.168.1.41".into(),
@@ -70,7 +70,7 @@ fn claim(app: &mut App) {
 fn maximum_payload_keeps_the_whole_code_and_countdown_inside_chrome() {
     assert_eq!(payload().len(), 221);
     let app = app();
-    let code = app.pairing.as_ref().unwrap().code();
+    let code = app.pairing.window.as_ref().unwrap().code();
     assert_eq!(code.size(), 53);
     let buf = render(&app, 120, 36);
     assert_eq!(buf[(2, 2)].symbol(), "╭");
@@ -129,7 +129,7 @@ fn half_blocks_and_quiet_zone_use_explicit_dark_on_light_in_both_themes() {
     for theme in [Theme::light(), Theme::dark()] {
         let mut app = app();
         app.theme = theme;
-        let code = app.pairing.as_ref().unwrap().code();
+        let code = app.pairing.window.as_ref().unwrap().code();
         let buf = render(&app, 120, 36);
         for y in 0..29 {
             for x in 0..57 {
@@ -156,8 +156,8 @@ fn half_blocks_and_quiet_zone_use_explicit_dark_on_light_in_both_themes() {
 fn small_window_names_the_computed_minimum_and_resize_keeps_words() {
     let mut app = app();
     claim(&mut app);
-    app.pairing.as_mut().unwrap().word_sel = 0;
-    app.pairing.as_mut().unwrap().words = std::array::from_fn(|_| String::new());
+    app.pairing.window.as_mut().unwrap().word_sel = 0;
+    app.pairing.window.as_mut().unwrap().words = std::array::from_fn(|_| String::new());
     for word in ["quit", "t1?:", "candle", "river"] {
         for ch in word.chars() {
             app.handle_key(
@@ -173,13 +173,13 @@ fn small_window_names_the_computed_minimum_and_resize_keeps_words() {
     assert!(!app.quit);
     assert_eq!(app.tab, Tab::Devices);
     assert!(app.requests.is_empty());
-    let saved = app.pairing.as_ref().unwrap().words.clone();
+    let saved = app.pairing.window.as_ref().unwrap().words.clone();
     app.handle_event(&Event::Resize(80, 24), &Snapshot::fixture(), (80, 24));
     let small = render(&app, 80, 24);
     assert!(text(&small).contains("Make the window at least 116×35 to show the code"));
     assert!(!text(&small).contains("⏎  Pair"));
     app.handle_event(&Event::Resize(120, 36), &Snapshot::fixture(), (120, 36));
-    assert_eq!(app.pairing.as_ref().unwrap().words, saved);
+    assert_eq!(app.pairing.window.as_ref().unwrap().words, saved);
     let large = text(&render(&app, 120, 36));
     for word in saved {
         assert!(large.contains(&word));
@@ -195,14 +195,14 @@ fn esc_closes_the_overlay_and_forgets_the_code_and_the_words() {
         &Snapshot::fixture(),
     );
     assert_eq!(app.overlay, None);
-    assert!(app.pairing.is_none());
+    assert!(app.pairing.window.is_none());
 }
 
 #[test]
 fn debug_output_shows_neither_the_payload_nor_the_typed_words() {
     let mut app = app();
     claim(&mut app);
-    let shown = format!("{:?}", app.pairing.as_ref().unwrap());
+    let shown = format!("{:?}", app.pairing.window.as_ref().unwrap());
     assert!(!shown.contains("ckpair:"), "{shown}");
     for word in ["maple", "orbit", "candle", "river"] {
         assert!(!shown.contains(word), "{shown}");
@@ -231,7 +231,7 @@ fn layout_removes_padding_in_order_and_reserves_all_four_chrome_rows() {
 fn long_claim_metadata_wraps_in_the_right_column_at_every_size() {
     let mut app = app();
     claim(&mut app);
-    let s = app.pairing.as_mut().unwrap();
+    let s = app.pairing.window.as_mut().unwrap();
     s.claim.as_mut().unwrap().fingerprint = "abcd ".repeat(20).trim().into();
     s.foreign_attempt = Some("192.0.2.123:45678".into());
     s.group = "access-group-".repeat(5);
@@ -249,7 +249,7 @@ fn long_claim_metadata_wraps_in_the_right_column_at_every_size() {
             continue;
         }
         assert!(body.contains("⏎  Pair"));
-        assert!(body.contains("Another phone tried from"));
+        assert!(body.contains("Someone at 192.0.2.123:45678 tried this code"));
         let left = (i32::from(w) - 116) / 2;
         let steps = left + 64;
         let top = (2..h - 2)
@@ -273,7 +273,7 @@ fn long_claim_metadata_wraps_in_the_right_column_at_every_size() {
 #[test]
 fn validity_minutes_round_to_the_nearest_minute_and_never_zero() {
     let mut app = app();
-    let s = app.pairing.as_mut().unwrap();
+    let s = app.pairing.window.as_mut().unwrap();
     assert_eq!(s.minutes(), 10);
     s.expires_at = s.opened_at.add_millis(1);
     assert_eq!(s.minutes(), 1);

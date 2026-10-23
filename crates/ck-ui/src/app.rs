@@ -16,6 +16,7 @@ use tokio::sync::watch;
 
 use crate::draw::{tab_spans, Canvas};
 use crate::model::{ActionKind, Daemon, LogView, Module, PaletteCommand, Panel, Snapshot, Status};
+use crate::pairing::flow::{Flow, Reading};
 use crate::screens::activity::ActivityState;
 use crate::screens::agents::AgentsState;
 use crate::screens::devices::DevicesState;
@@ -66,6 +67,8 @@ pub enum Request {
         anchor: Option<crate::model::ActivityKey>,
         older: bool,
     },
+    /// A call the Add a phone exchange asks for.
+    Pairing(crate::pairing::flow::Command),
 }
 
 /// A question waiting for an answer before an action is sent.
@@ -117,7 +120,12 @@ pub struct App {
     pub agents: AgentsState,
     /// The Devices screen's selected row.
     pub devices: DevicesState,
-    pub pairing: Option<crate::pairing::PairingState>,
+    /// The Add a phone exchange: what its overlay shows, and every pairing
+    /// window ck still watches.
+    pub pairing: Flow,
+    /// The last pairing result applied from a snapshot (see
+    /// [`Snapshot::pairing`]).
+    pairing_seen: u64,
     /// Whether account identifiers are hidden, on Usage and in Home's usage
     /// panel alike: each account's email, id and organization, wherever the
     /// app shows them, read as that account's pseudonym. `x` on Usage
@@ -150,7 +158,8 @@ impl App {
             usage: UsageState::default(),
             agents: AgentsState::default(),
             devices: DevicesState::default(),
-            pairing: None,
+            pairing: Flow::default(),
+            pairing_seen: 0,
             redact: false,
             requests: Vec::new(),
         }
@@ -169,6 +178,7 @@ impl App {
     pub fn showing(&self, snap: &Snapshot) -> crate::live::schedule::Showing {
         let mut showing = crate::live::schedule::Showing::tab(self.shown_tab(snap));
         showing.add_phone = self.overlay == Some(Overlay::Pairing);
+        showing.pairing_window = showing.add_phone && self.pairing.window.is_some();
         showing
     }
 
@@ -201,6 +211,9 @@ impl App {
         self.log = None;
         self.metrics = None;
         self.field = None;
+        if self.overlay == Some(Overlay::Pairing) {
+            self.close_pairing();
+        }
         true
     }
 
@@ -313,11 +326,7 @@ impl App {
                 self.preferred_module(snap),
             ),
             Some(Overlay::Help) => overlays::help(&mut c, snap.serves, snap.visible_tabs()),
-            Some(Overlay::Pairing) => {
-                if let Some(state) = &self.pairing {
-                    screens::pairing::draw(&mut c, state, now);
-                }
-            }
+            Some(Overlay::Pairing) => screens::pairing::draw(&mut c, &self.pairing, now),
             None => {}
         }
     }
@@ -360,7 +369,7 @@ impl App {
             return self.confirm_key(key);
         }
         if self.overlay == Some(Overlay::Pairing) {
-            return self.pairing_key(key);
+            return self.pairing_key(key, snap);
         }
         if let Some(handled) = self.field_key(key) {
             // Activity's and Agents' lists follow their filter as it is
@@ -411,6 +420,13 @@ impl App {
             if let Some(handled) = self.agents_key(key, snap) {
                 return handled;
             }
+        }
+        if self.overlay.is_none() && self.tab == Tab::Devices && key.code == KeyCode::Char('a') {
+            self.overlay = Some(Overlay::Pairing);
+            self.pairing.observe(Reading::of(&snap.devices));
+            self.pairing.open();
+            self.pump_pairing();
+            return true;
         }
         match key.code {
             KeyCode::Char('k') if ctrl => self.open_palette(),
@@ -542,32 +558,67 @@ impl App {
         true
     }
 
-    fn pairing_key(&mut self, key: KeyEvent) -> bool {
-        if key.code == KeyCode::Esc {
-            self.overlay = None;
-            self.field = None;
-            self.pairing = None;
-            return true;
-        }
-        let Some(state) = &self.pairing else {
-            return false;
+    /// Keys while the Add a phone overlay shows. It takes every key but
+    /// ctrl-c, so a word typed with "q" or "1" in it neither quits nor
+    /// switches tabs.
+    fn pairing_key(&mut self, key: KeyEvent, snap: &Snapshot) -> bool {
+        self.pairing.observe(Reading::of(&snap.devices));
+        let plain = !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER);
+        let handled = match key.code {
+            KeyCode::Esc => {
+                self.close_pairing();
+                true
+            }
+            KeyCode::Enter => self.pairing.enter(),
+            KeyCode::Tab => self.pairing.tab(),
+            KeyCode::BackTab | KeyCode::Left | KeyCode::Up => self.pairing.move_word(-1),
+            KeyCode::Right | KeyCode::Down => self.pairing.move_word(1),
+            KeyCode::Backspace => self.pairing.backspace(),
+            KeyCode::Char(ch) if plain => self.pairing.type_char(ch),
+            _ => false,
         };
-        if state.claim.is_none() {
-            return false;
+        // `⏎ Done` after a pairing closes the exchange's screen.
+        if !self.pairing.visible() && self.pairing.window.is_none() {
+            self.overlay = None;
         }
-        let i = state.word_sel % 4;
-        self.field = Some(TextField {
-            text: state.words[i].clone(),
-        });
-        let handled = self.field_key(key);
-        let state = self.pairing.as_mut().unwrap();
-        state.words[i] = self.field.take().unwrap().text;
-        match key.code {
-            KeyCode::Tab | KeyCode::Right | KeyCode::Down => state.word_sel = (i + 1) % 4,
-            KeyCode::BackTab | KeyCode::Left | KeyCode::Up => state.word_sel = (i + 3) % 4,
-            _ => return handled.unwrap_or(false),
+        self.pump_pairing();
+        handled
+    }
+
+    /// `esc` on the overlay: it closes, claiming no cancellation.
+    fn close_pairing(&mut self) {
+        self.overlay = None;
+        self.field = None;
+        self.pairing.close();
+        self.pump_pairing();
+    }
+
+    /// Hands the exchange's queued calls to whoever feeds the app.
+    fn pump_pairing(&mut self) {
+        for command in self.pairing.outbox.drain(..) {
+            self.requests.push(Request::Pairing(command));
         }
-        true
+    }
+
+    /// Takes in a snapshot and the time: the access groups it lists, the
+    /// pairing results not yet applied, and the exchange's timeouts.
+    /// Returns whether the frame needs redrawing.
+    pub fn on_snapshot(&mut self, snap: &Snapshot, now: Timestamp) -> bool {
+        let before = self.pairing.stage.clone();
+        let mut applied = false;
+        self.pairing.tick(now);
+        self.pairing.observe(Reading::of(&snap.devices));
+        for (seq, event) in &snap.pairing {
+            if *seq > self.pairing_seen {
+                self.pairing_seen = *seq;
+                self.pairing.absorb(event.clone());
+                applied = true;
+            }
+        }
+        self.pump_pairing();
+        applied || before != self.pairing.stage
     }
 
     /// Keys for the open text field, ahead of every app-wide key. Printable
@@ -1370,7 +1421,11 @@ async fn event_loop(mut rx: watch::Receiver<Snapshot>, options: RunOptions) -> i
     let mut source_open = true;
     let mut last_draw = tokio::time::Instant::now() - FRAME;
     let mut told = Told::default();
-    forward_requests(&mut app, &rx.borrow(), options.requests.as_ref(), &mut told);
+    {
+        let snap = rx.borrow().clone();
+        app.on_snapshot(&snap, (options.clock)());
+        forward_requests(&mut app, &snap, options.requests.as_ref(), &mut told);
+    }
 
     loop {
         if app.quit {
@@ -1401,6 +1456,10 @@ async fn event_loop(mut rx: watch::Receiver<Snapshot>, options: RunOptions) -> i
             _ = ticker.tick() => {
                 app.tick += 1;
                 dirty = true;
+                // The pairing exchange's timeouts run on this clock.
+                let snap = rx.borrow().clone();
+                app.on_snapshot(&snap, (options.clock)());
+                forward_requests(&mut app, &snap, options.requests.as_ref(), &mut told);
             }
             changed = rx.changed(), if source_open => {
                 // A closed source keeps its last snapshot on screen.
@@ -1410,6 +1469,7 @@ async fn event_loop(mut rx: watch::Receiver<Snapshot>, options: RunOptions) -> i
                     dirty = true;
                     let snap = rx.borrow().clone();
                     app.follow_roster(&snap);
+                    app.on_snapshot(&snap, (options.clock)());
                     forward_requests(&mut app, &snap, options.requests.as_ref(), &mut told);
                 }
             }

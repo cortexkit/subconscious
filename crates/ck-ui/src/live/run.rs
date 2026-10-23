@@ -10,7 +10,8 @@ use futures_util::future::BoxFuture;
 use serde_json::{json, Value};
 use subc_client_rs::{
     ActivityCursor, ActivityQueryRequest, ActivityQueryResponse, ActivitySubscription, CallError,
-    CallOptions, ConnectionState, ConsumerOptions, RouteHandle, SpawnStreamError, SubcConsumer,
+    CallOptions, CloseRouteOptions, ConnectionState, ConsumerOptions, RouteHandle,
+    SpawnStreamError, SubcConsumer, SubscribeOptions, Subscription, SubscriptionEnd,
 };
 use subc_control::ActivityEntry as WireActivity;
 use subc_protocol::{BindIdentity, RouteTarget};
@@ -20,6 +21,7 @@ use tokio::task::JoinHandle;
 
 use super::activity::{self, FeedEnd, LedgerFeed, LedgerSource};
 use super::map;
+use super::pairing::{self, CallFailure, WatchStream};
 use super::schedule::{self, Gate, Source, Sources};
 use super::{
     action_progress, assemble, every, modules, Connection, DaemonService, HostFacts, LiveOptions,
@@ -30,6 +32,7 @@ use crate::model::{
     ActionKind, ActionPhase, ActionResult, Fault, ModuleAction, ProcessEvent, ProcessEventKind,
     Snapshot,
 };
+use crate::pairing::flow::{Command, Refusal};
 use crate::time::Timestamp;
 
 /// The longest any one daemon or module request may take before its source
@@ -745,11 +748,43 @@ async fn module_call(
     method: &str,
     params: Value,
 ) -> Result<Value, Fault> {
+    match module_request(shared, conn, module, method, params, call_options(), true).await {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map_err(|_| Fault::sentence(format!("{module} sent an unreadable reply"))),
+        Err(ModuleFailure::NotInstalled) => {
+            Err(Fault::sentence(format!("{module} isn't installed")))
+        }
+        Err(ModuleFailure::Call(e)) => Err(module_error(module, &e)),
+        Err(ModuleFailure::Unreachable) => {
+            Err(Fault::sentence(format!("{module} unreachable · retrying")))
+        }
+    }
+}
+
+/// Why a module request got no reply.
+enum ModuleFailure {
+    NotInstalled,
+    Call(CallError),
+    Unreachable,
+}
+
+/// The request behind [`module_call`], returning the reply's bytes or the
+/// call's own error. With `keep_raw` the reply is kept for diagnosis; a
+/// reply that carries a secret, such as a pairing code, is not.
+async fn module_request(
+    shared: &Shared,
+    conn: &Conn,
+    module: &str,
+    method: &str,
+    params: Value,
+    options: CallOptions,
+    keep_raw: bool,
+) -> Result<Vec<u8>, ModuleFailure> {
     if shared.read(|s| s.in_roster(module)) == Some(false) {
-        return Err(Fault::sentence(format!("{module} isn't installed")));
+        return Err(ModuleFailure::NotInstalled);
     }
     let body = serde_json::to_vec(&json!({ "method": method, "params": params }))
-        .map_err(|e| Fault::sentence(e.to_string()))?;
+        .map_err(|_| ModuleFailure::Unreachable)?;
     for attempt in 0..2 {
         let handle = {
             let mut routes = conn.routes.lock().await;
@@ -767,7 +802,7 @@ async fn module_call(
                             call_options(),
                         )
                         .await
-                        .map_err(|e| module_error(module, &e))?;
+                        .map_err(ModuleFailure::Call)?;
                     routes.insert(module.to_string(), h);
                     h
                 }
@@ -775,16 +810,17 @@ async fn module_call(
         };
         match conn
             .consumer
-            .request(&handle, body.clone(), call_options())
+            .request(&handle, body.clone(), options.clone())
             .await
         {
             Ok(bytes) => {
-                shared.raw(
-                    &format!("{module} {method}"),
-                    String::from_utf8_lossy(&bytes).into_owned(),
-                );
-                return serde_json::from_slice(&bytes)
-                    .map_err(|_| Fault::sentence(format!("{module} sent an unreadable reply")));
+                if keep_raw {
+                    shared.raw(
+                        &format!("{module} {method}"),
+                        String::from_utf8_lossy(&bytes).into_owned(),
+                    );
+                }
+                return Ok(bytes);
             }
             Err(e) => {
                 shared.raw(&format!("{module} {method}"), format!("error: {e}"));
@@ -794,11 +830,11 @@ async fn module_call(
                         continue;
                     }
                 }
-                return Err(module_error(module, &e));
+                return Err(ModuleFailure::Call(e));
             }
         }
     }
-    Err(Fault::sentence(format!("{module} unreachable · retrying")))
+    Err(ModuleFailure::Unreachable)
 }
 
 /// A failed module request as an error a panel shows: the module's or the
@@ -1169,8 +1205,27 @@ fn existing_ancestor(path: &Path) -> Option<PathBuf> {
 // ---- requests --------------------------------------------------------------------
 
 async fn handle_requests(shared: Arc<Shared>, mut rx: mpsc::UnboundedReceiver<Request>) {
+    let pairing = {
+        let sink = Arc::clone(&shared);
+        pairing::Pairing::new(
+            Arc::new(DaemonCallosum(Arc::clone(&shared))),
+            Arc::new(move |event| sink.update(|s| s.record_pairing(event))),
+            now,
+        )
+    };
     while let Some(req) = rx.recv().await {
         match req {
+            Request::Pairing(Command::ReadGroups) => {
+                tokio::spawn(read_groups(Arc::clone(&shared)));
+            }
+            Request::Pairing(Command::Record { text, ok }) => shared.update(|s| {
+                s.last_result = Some(ActionResult {
+                    at: now(),
+                    text,
+                    ok,
+                })
+            }),
+            Request::Pairing(command) => pairing.run(command),
             Request::Show(showing) => {
                 let wanted = schedule::wanted(&showing);
                 shared.demand.send_if_modified(|d| {
@@ -1201,6 +1256,195 @@ async fn handle_requests(shared: Arc<Shared>, mut rx: mpsc::UnboundedReceiver<Re
                 tokio::spawn(run_action(Arc::clone(&shared), kind, module));
             }
         }
+    }
+}
+
+/// Reads `callosum.devices_read` now, for the Add a phone overlay's access
+/// groups, whatever the devices source's schedule.
+async fn read_groups(shared: Arc<Shared>) {
+    let reply = match shared.conn() {
+        Some(conn) => {
+            module_call(
+                &shared,
+                &conn,
+                modules::DEVICES,
+                "callosum.devices_read",
+                json!({}),
+            )
+            .await
+        }
+        None => Err(Fault::sentence("daemon unreachable · retrying")),
+    };
+    shared.update(|s| {
+        s.record_module_reply(Source::Devices, reply, now());
+    });
+}
+
+// ---- pairing ---------------------------------------------------------------------
+
+/// Callosum on the connected daemon, for the Add a phone exchange.
+struct DaemonCallosum(Arc<Shared>);
+
+/// A failed callosum call as the exchange reads it: a refusal keeps its code,
+/// message and named wait; anything else leaves the outcome unknown.
+fn call_failure(e: &CallError) -> CallFailure {
+    let body = match e {
+        CallError::Module(body) => Some(body),
+        _ => e.route_open_refusal(),
+    };
+    match body {
+        Some(body) => CallFailure::Refused(Refusal {
+            code: body.code.clone(),
+            message: body.message.clone(),
+            retry_after_ms: body
+                .detail
+                .as_ref()
+                .and_then(|d| d.get("retry_after_ms"))
+                .and_then(Value::as_u64),
+        }),
+        None => CallFailure::Lost,
+    }
+}
+
+impl pairing::Callosum for DaemonCallosum {
+    fn call(
+        &self,
+        method: &'static str,
+        params: Value,
+        timeout: Duration,
+    ) -> BoxFuture<'static, Result<Value, CallFailure>> {
+        let shared = Arc::clone(&self.0);
+        Box::pin(async move {
+            let Some(conn) = shared.conn() else {
+                return Err(CallFailure::Lost);
+            };
+            let options = CallOptions {
+                timeout,
+                ..call_options()
+            };
+            // The open's reply carries the pairing secret, so no pairing
+            // reply is kept for diagnosis.
+            let reply = module_request(
+                &shared,
+                &conn,
+                modules::DEVICES,
+                method,
+                params,
+                options,
+                false,
+            )
+            .await;
+            match reply {
+                // A reply that isn't JSON reads as one without the expected
+                // fields.
+                Ok(bytes) => Ok(serde_json::from_slice(&bytes).unwrap_or(Value::Null)),
+                Err(ModuleFailure::NotInstalled) => Err(CallFailure::Refused(Refusal::code(
+                    "callosum isn't installed",
+                ))),
+                Err(ModuleFailure::Call(e)) => Err(call_failure(&e)),
+                Err(ModuleFailure::Unreachable) => Err(CallFailure::Lost),
+            }
+        })
+    }
+
+    fn watch(
+        &self,
+        window_id: String,
+    ) -> BoxFuture<'static, Result<Box<dyn WatchStream>, CallFailure>> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let shared = Arc::clone(&self.0);
+        Box::pin(async move {
+            let Some(conn) = shared.conn() else {
+                return Err(CallFailure::Lost);
+            };
+            let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+            // A session name of its own gives the watch a route of its own,
+            // apart from the shared route opens and confirms use.
+            let session = format!(
+                "pairing-watch-{}",
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            );
+            let handle = conn
+                .consumer
+                .open_route(
+                    RouteTarget::ManagementSurface {
+                        module_id: modules::DEVICES.to_string(),
+                    },
+                    BindIdentity::new(root, "ck", session),
+                    call_options(),
+                )
+                .await
+                .map_err(|e| call_failure(&e))?;
+            let body = serde_json::to_vec(&json!({
+                "method": "callosum.pairing_qr_watch",
+                "params": { "window_id": window_id },
+            }))
+            .map_err(|_| CallFailure::Lost)?;
+            match conn
+                .consumer
+                .subscribe_route(&handle, body, SubscribeOptions::default())
+                .await
+            {
+                Ok(sub) => Ok(Box::new(DaemonWatch {
+                    consumer: Arc::clone(&conn.consumer),
+                    handle,
+                    sub,
+                    ended: false,
+                }) as Box<dyn WatchStream>),
+                Err(e) => {
+                    let _ = conn
+                        .consumer
+                        .close_handle(&handle, CloseRouteOptions::default())
+                        .await;
+                    Err(call_failure(&e))
+                }
+            }
+        })
+    }
+}
+
+/// One window's watch subscription and the route it alone uses.
+struct DaemonWatch {
+    consumer: Arc<SubcConsumer>,
+    handle: RouteHandle,
+    sub: Subscription,
+    ended: bool,
+}
+
+impl WatchStream for DaemonWatch {
+    fn next(&mut self) -> BoxFuture<'_, Option<Value>> {
+        Box::pin(async move {
+            while !self.ended {
+                match self.sub.events().recv().await {
+                    Some(bytes) => {
+                        if let Ok(value) = serde_json::from_slice(&bytes) {
+                            return Some(value);
+                        }
+                    }
+                    None => {
+                        self.ended = true;
+                        // The terminal state may come as the subscription's
+                        // final reply rather than as a stream event.
+                        if let SubscriptionEnd::Response(bytes) = self.sub.ended().await {
+                            if let Ok(value) = serde_json::from_slice(&bytes) {
+                                return Some(value);
+                            }
+                        }
+                    }
+                }
+            }
+            None
+        })
+    }
+
+    fn close(self: Box<Self>) -> BoxFuture<'static, ()> {
+        Box::pin(async move {
+            let _ = self.sub.unsubscribe();
+            let _ = self
+                .consumer
+                .close_handle(&self.handle, CloseRouteOptions::default())
+                .await;
+        })
     }
 }
 

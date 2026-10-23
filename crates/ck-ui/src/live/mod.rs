@@ -14,6 +14,7 @@
 
 pub mod activity;
 pub mod map;
+pub mod pairing;
 mod run;
 pub mod schedule;
 
@@ -399,7 +400,16 @@ pub struct State {
     pub service: String,
     pub daemon_log: Vec<String>,
     pub down_note: Option<String>,
+    /// The latest results of the Add a phone exchange, numbered in arrival
+    /// order (see [`State::record_pairing`]).
+    pub pairing: std::collections::VecDeque<(u64, crate::pairing::flow::Event)>,
+    /// The number the next pairing result gets.
+    pub pairing_seq: u64,
 }
+
+/// How many pairing results the snapshot keeps. The app applies them as
+/// each snapshot arrives, so it falls this far behind only if it stops.
+const PAIRING_KEPT: usize = 64;
 
 impl State {
     fn new(options: &LiveOptions) -> State {
@@ -444,6 +454,17 @@ impl State {
             service: "unknown".into(),
             daemon_log: Vec::new(),
             down_note: None,
+            pairing: std::collections::VecDeque::new(),
+            pairing_seq: 1,
+        }
+    }
+
+    /// Queues a pairing result for the app, under the next number.
+    pub fn record_pairing(&mut self, event: crate::pairing::flow::Event) {
+        self.pairing.push_back((self.pairing_seq, event));
+        self.pairing_seq += 1;
+        while self.pairing.len() > PAIRING_KEPT {
+            self.pairing.pop_front();
         }
     }
 
@@ -897,6 +918,7 @@ pub fn assemble(state: &State, now: Timestamp) -> Snapshot {
         log_view,
         last_result: state.last_result.clone(),
         serves: crate::model::Serves::LIVE,
+        pairing: state.pairing.iter().cloned().collect(),
     }
 }
 

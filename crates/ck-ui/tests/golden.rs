@@ -156,7 +156,7 @@ fn pair_120x36() {
         serde_json::from_str(include_str!("golden/fixture.json")).unwrap();
     let group = &fixture["pairing"]["groups"][0];
     let now = Snapshot::fixture_now();
-    app.pairing = Some(
+    app.pairing.window = Some(
         ck_ui::pairing::PairingState::new(
             fixture["pairing"]["payload"].as_str().unwrap(),
             group[0].as_str().unwrap().into(),

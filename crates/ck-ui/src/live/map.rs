@@ -21,9 +21,9 @@ use subc_protocol::Principal;
 
 use crate::metrics::{all_rows, pane_rows};
 use crate::model::{
-    Account, ActivityEntry, ActivityKey, ActivityRow, ActivityRowKind, Agent, AgentSources, Agents,
-    Backups, BuildServer, Device, Devices, Fault, LogLevel, LogLine, Machine, Metric, ProcessEvent,
-    ProcessEventKind, Provider, Status, UsageWindow, Workspace,
+    AccessGroup, AccessGroups, Account, ActivityEntry, ActivityKey, ActivityRow, ActivityRowKind,
+    Agent, AgentSources, Agents, Backups, BuildServer, Device, Devices, Fault, LogLevel, LogLine,
+    Machine, Metric, ProcessEvent, ProcessEventKind, Provider, Status, UsageWindow, Workspace,
 };
 use crate::quota;
 use crate::time::{ago, Timestamp, UtcOffset};
@@ -831,7 +831,36 @@ pub fn devices(reply: &Value, now: Timestamp) -> Result<Devices, Fault> {
             .and_then(Value::as_str)
             .map(str::to_string),
         watch_ops_offered: this.get("watch_ops_offered").and_then(Value::as_u64),
+        access_groups: access_groups(this.get("expose_profiles")),
     })
+}
+
+/// The access groups from `self.expose_profiles`: a list of
+/// `{name, operation_count, peers_using}` objects, kept in callosum's order.
+/// Missing means a callosum from before the list. Anything else that isn't
+/// that list, or any entry without a string name and integer counts, makes
+/// the whole list unreadable: ck never guesses a group's name.
+pub fn access_groups(field: Option<&Value>) -> AccessGroups {
+    let Some(field) = field else {
+        return AccessGroups::Unlisted;
+    };
+    let Some(list) = field.as_array() else {
+        return AccessGroups::Malformed;
+    };
+    let mut groups = Vec::with_capacity(list.len());
+    for entry in list {
+        let name = entry.get("name").and_then(Value::as_str);
+        let ops = entry.get("operation_count").and_then(Value::as_u64);
+        let peers = entry.get("peers_using").and_then(Value::as_u64);
+        match (name, ops, peers) {
+            (Some(name), Some(ops), Some(_)) => groups.push(AccessGroup {
+                name: name.to_string(),
+                operation_count: Some(ops),
+            }),
+            _ => return AccessGroups::Malformed,
+        }
+    }
+    AccessGroups::Listed(groups)
 }
 
 // ---- agents --------------------------------------------------------------------

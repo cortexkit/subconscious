@@ -4,10 +4,12 @@ use qrcodegen::{DataTooLong, QrCode, QrCodeEcc};
 
 use crate::time::Timestamp;
 
+pub mod flow;
+
 pub const QUIET: i32 = 2;
 pub const STEPS_W: i32 = 48;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Claim {
     pub device_name: String,
     pub source_addr: String,
@@ -19,6 +21,11 @@ pub struct Claim {
 #[derive(Clone)]
 pub struct PairingState {
     code: QrCode,
+    /// The window callosum opened for this code; empty for a code drawn
+    /// without one.
+    pub window_id: String,
+    /// The access group the window was opened with. A refreshed list never
+    /// changes it.
     pub group: String,
     pub operation_count: Option<u64>,
     pub opened_at: Timestamp,
@@ -50,6 +57,7 @@ impl PairingState {
     ) -> Result<Self, DataTooLong> {
         Ok(Self {
             code: encode(payload)?,
+            window_id: String::new(),
             group,
             operation_count,
             opened_at,
@@ -81,14 +89,28 @@ pub struct Layout {
     pub steps_x: i32,
 }
 
+/// The modules across a version 6 symbol, the size of a typical pairing
+/// code. The overlay keeps this much room for the code until a code arrives.
+pub const TYPICAL_MODULES: i32 = 41;
+
 /// The minimum excludes vertical padding, but always reserves the four chrome rows.
 pub fn minimum(code: &QrCode, steps_height: i32) -> (i32, i32) {
-    let symbol = code.size() + 2 * QUIET;
+    minimum_for(code.size(), steps_height)
+}
+
+/// [`minimum`] for a symbol `modules` across.
+pub fn minimum_for(modules: i32, steps_height: i32) -> (i32, i32) {
+    let symbol = modules + 2 * QUIET;
     (symbol + 59, ((symbol + 1) / 2).max(steps_height) + 6)
 }
 
 pub fn layout(w: i32, h: i32, code: &QrCode, steps_height: i32) -> Option<Layout> {
-    let (width, min_h) = minimum(code, steps_height);
+    layout_for(w, h, code.size(), steps_height)
+}
+
+/// [`layout`] for a symbol `modules` across.
+pub fn layout_for(w: i32, h: i32, modules: i32, steps_height: i32) -> Option<Layout> {
+    let (width, min_h) = minimum_for(modules, steps_height);
     if w < width || h < min_h {
         return None;
     }
@@ -104,7 +126,7 @@ pub fn layout(w: i32, h: i32, code: &QrCode, steps_height: i32) -> Option<Layout
                 height,
                 code_x: x + 3,
                 content_y: y + 1 + top,
-                steps_x: x + 3 + code.size() + 2 * QUIET + 4,
+                steps_x: x + 3 + modules + 2 * QUIET + 4,
             });
         }
     }
